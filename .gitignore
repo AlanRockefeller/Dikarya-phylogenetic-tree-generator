@@ -1,0 +1,45 @@
+# ---- Secrets / local env ----
+.env
+.env.*
+*.pem
+*.key
+
+# ---- Python bytecode / caches ----
+__pycache__/
+*.py[cod]
+*$py.class
+
+# ---- Virtual environments ----
+.venv/
+venv/
+ENV/
+env/
+
+# ---- Test / tooling caches ----
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# ---- Logs ----
+*.log
+
+# ---- App runtime data (jobs, logs, outputs) ----
+var/
+# If you want to keep var/ directory but ignore its contents, use instead:
+# var/*
+# !var/.gitkeep
+
+# ---- Database / backups ----
+*.sqlite3
+*.db
+*.bak
+
+# ---- Editors ----
+.vscode/
+.idea/
+*.swp
+*~
+.DS_Store
+Thumbs.db

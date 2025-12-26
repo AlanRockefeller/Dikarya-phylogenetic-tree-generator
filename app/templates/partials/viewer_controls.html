@@ -1,0 +1,38 @@
+<div class="d-flex justify-content-between align-items-center flex-wrap">
+    <div class="mb-2">
+        <label for="viewer-select" class="me-2">Viewer:</label>
+        <select id="viewer-select" class="form-select d-inline-block w-auto">
+            <option value="phylotree">phylotree.js</option>
+            <option value="jsphylosvg">jsPhyloSVG</option>
+            <option value="d3">D3 Viewer</option>
+        </select>
+    </div>
+
+    <div class="mb-2">
+        <div class="btn-group me-2" role="group" aria-label="Edit Actions">
+            <button id="btn-prune" class="btn btn-outline-danger" disabled>Prune Selected</button>
+            <button id="btn-rename" class="btn btn-outline-secondary" disabled>Rename Selected</button>
+            <button id="btn-reroot" class="btn btn-outline-secondary" disabled>Reroot Here</button>
+        </div>
+
+        <button id="btn-recompute" class="btn btn-primary me-2">Recompute Tree</button>
+
+        <div class="btn-group" role="group" aria-label="Downloads">
+            <button type="button" class="btn btn-outline-info dropdown-toggle" data-bs-toggle="dropdown"
+                aria-expanded="false">
+                Download
+            </button>
+            <ul class="dropdown-menu">
+                <li><a class="dropdown-item" href="#" id="btn-download-newick">Newick Tree</a></li>
+                <li><a class="dropdown-item" href="#" id="btn-download-nexus">NEXUS Tree</a></li>
+                <li>
+                    <hr class="dropdown-divider">
+                </li>
+                <li><a class="dropdown-item" href="#" id="btn-download-fasta">Pruned FASTA</a></li>
+                <li><a class="dropdown-item" href="#" id="btn-download-original">Original FASTA</a></li>
+            </ul>
+        </div>
+    </div>
+</div>
+
+<div id="status-message" class="alert alert-info mt-2 d-none"></div>

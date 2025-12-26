@@ -1,0 +1,37 @@
+#tree-container {
+    overflow: auto;
+    position: relative;
+}
+
+.node circle {
+    fill: #fff;
+    stroke: steelblue;
+    stroke-width: 1.5px;
+    cursor: pointer;
+}
+
+.node text {
+    font: 12px sans-serif;
+    cursor: pointer;
+}
+
+.link {
+    fill: none;
+    stroke: #ccc;
+    stroke-width: 1.5px;
+}
+
+.node.selected circle {
+    fill: orange;
+    stroke: darkorange;
+}
+
+.node.selected text {
+    font-weight: bold;
+    fill: darkorange;
+}
+
+/* Phylotree specific overrides if needed */
+.phylotree-node circle {
+    fill: #999;
+}

@@ -1,0 +1,42 @@
+{% extends "base.html" %}
+
+{% block content %}
+<div class="container-fluid">
+    <div class="row">
+        <div class="col-md-12">
+            <h1>Tree Viewer for Job: {{ job_id }}</h1>
+            <div id="viewer-controls-container">
+                {% include "partials/viewer_controls.html" %}
+            </div>
+        </div>
+    </div>
+    <div class="row mt-3">
+        <div class="col-md-12">
+            <div id="tree-container" class="border rounded p-3" style="min-height: 600px; background-color: #fff;">
+                <!-- Tree will be rendered here -->
+                <div class="text-center text-muted mt-5">Loading tree...</div>
+            </div>
+        </div>
+    </div>
+</div>
+
+<!-- Metadata for JS -->
+<script>
+    const JOB_ID = "{{ job_id }}";
+</script>
+
+<!-- Viewer Libraries -->
+<!-- In a real app, these would be local or CDN links. For now, we assume they are available or we mock them if needed. -->
+<!-- Phylotree.js dependencies often include D3 v3/v4/v5. We need to be careful with versions. -->
+<!-- For this exercise, we'll assume we have the JS files in static/js or we'll create adapters that load them. -->
+
+<!-- Custom Controller -->
+<script src="{{ url_for('static', filename='js/tree_edit_actions.js') }}"></script>
+<script src="{{ url_for('static', filename='js/tree_viewer_phylotree.js') }}"></script>
+<script src="{{ url_for('static', filename='js/tree_viewer_jsphylosvg.js') }}"></script>
+<script src="{{ url_for('static', filename='js/tree_viewer_d3.js') }}"></script>
+<script src="{{ url_for('static', filename='js/tree_viewer_controller.js') }}"></script>
+
+<!-- Styles -->
+<link rel="stylesheet" href="{{ url_for('static', filename='css/tree_viewer.css') }}">
+{% endblock %}

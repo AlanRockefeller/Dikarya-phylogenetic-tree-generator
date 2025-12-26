@@ -1,0 +1,66 @@
+{% extends "base.html" %}
+
+{% block title %}Dikarya - Job Status{% endblock %}
+
+{% block content %}
+<h1>Job Status</h1>
+<div id="status-container">
+    <p><strong>Job ID:</strong> <span id="job-id">{{ job_id }}</span></p>
+    <p><strong>Status:</strong> <span id="job-status">{{ status }}</span></p>
+    <div id="blast-section" style="display: none;">
+        <h3>BLAST Results</h3>
+        <p><strong>Status:</strong> <span id="blast-status">Running...</span></p>
+        <p><strong>Hits Found:</strong> <span id="blast-hits">-</span></p>
+    </div>
+    <div id="result-section" style="display: none;">
+        <h3>Result</h3>
+        <pre id="job-result"></pre>
+    </div>
+    <div id="error-section" style="display: none; color: red;">
+        <h3>Error</h3>
+        <pre id="job-error"></pre>
+    </div>
+</div>
+
+<script>
+    const jobId = "{{ job_id }}";
+    const statusSpan = document.getElementById('job-status');
+    const resultSection = document.getElementById('result-section');
+    const resultPre = document.getElementById('job-result');
+    const errorSection = document.getElementById('error-section');
+    const errorPre = document.getElementById('job-error');
+
+    function checkStatus() {
+        fetch(`/api/job/${jobId}/status`)
+            .then(response => response.json())
+            .then(data => {
+                statusSpan.textContent = data.status;
+
+                if (data.result && data.result.blast_result) {
+                    document.getElementById('blast-section').style.display = 'block';
+                    document.getElementById('blast-status').textContent = data.result.blast_result.cached ? "Cached" : "Completed";
+                    document.getElementById('blast-hits').textContent = data.result.blast_result.sequence_count;
+                }
+
+                if (data.status === 'finished' || data.status === 'completed') {
+                    resultSection.style.display = 'block';
+                    resultPre.textContent = JSON.stringify(data.result, null, 2);
+                } else if (data.status === 'failed' || data.status === 'error') {
+                    errorSection.style.display = 'block';
+                    errorPre.textContent = JSON.stringify(data.error, null, 2);
+                } else {
+                    // Poll again in 2 seconds
+                    setTimeout(checkStatus, 2000);
+                }
+            })
+            .catch(err => {
+                console.error('Error polling status:', err);
+            });
+    }
+
+    // Start polling if not already done
+    if (statusSpan.textContent !== 'finished' && statusSpan.textContent !== 'failed') {
+        setTimeout(checkStatus, 2000);
+    }
+</script>
+{% endblock %}
