@@ -1,6 +1,5 @@
 import json
 import logging
-from pathlib import Path
 
 from rq import get_current_job
 
@@ -10,29 +9,38 @@ from app.config import Config
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+
 def parse_fasta_records(fasta_text: str) -> list[tuple[str, str]]:
     """
     Returns list of (header_without_gt, sequence_string_no_whitespace).
-    Very small parser: assumes headers start with '>'.
+    Assumes FASTA headers start with '>'.
     """
     records: list[tuple[str, str]] = []
     header: str | None = None
     seq_chunks: list[str] = []
 
-    for line in fasta_text.splitlines():
-        line = line.strip()
+    for raw_line in fasta_text.splitlines():
+        line = raw_line.strip()
         if not line:
             continue
+
         if line.startswith(">"):
+            # flush previous record
             if header is not None:
-                records.append((header, "".join(seq_chunks).replace(" ", "")))
+                seq = "".join(seq_chunks)
+                seq = "".join(seq.split())  # remove ALL whitespace
+                records.append((header, seq))
+
             header = line[1:].strip()
             seq_chunks = []
         else:
             seq_chunks.append(line)
 
+    # flush final record
     if header is not None:
-        records.append((header, "".join(seq_chunks).replace(" ", "")))
+        seq = "".join(seq_chunks)
+        seq = "".join(seq.split())
+        records.append((header, seq))
 
     return records
 
