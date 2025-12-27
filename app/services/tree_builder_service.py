@@ -234,10 +234,54 @@ def _convert_nexus_to_newick(nexus_path: Path, newick_path: Path):
             # which BioPython's Nexus parser sometimes fails on.
             # We strip them out for simple conversion.
             import re
+            
+            # Helper definitions for robust matching
+            _NUM_CORE = r"[0-9]+(?:\.[0-9]+)?(?:[eE][+\-]?[0-9]+)?"
+            
+            # We want to capture the number *inside* the branch length part
+            # so we define the pattern for the whole branch part but capture the number.
+            # However, f-strings with regex groups are tricky if we reuse them.
+            # Simpler to write the full regex out or use non-capturing groups for the colon/spaces.
+
+            def _fmt_prob(s: str) -> str:
+                try:
+                    x = float(s)
+                    # choose 2 or 3 decimals; 3 is often nicer for PP
+                    return f"{x:.3f}".rstrip("0").rstrip(".")
+                except (ValueError, TypeError):
+                    return s
+
             content = nexus_path.read_text()
-            # Remove comments in square brackets that start with & (metadata)
-            # This is a bit aggressive but safer for Biopython
-            clean_content = re.sub(r'\[&[^\]]+\]', '', content)
+            
+            # Case A: branch length comes first:  ): 0.05 [&prob=...]
+            # Matches: ) : 0.05 [ ... prob= 1.0 ... ]
+            pat_a = re.compile(
+                rf"\)(?:\s*:\s*(?P<branch>{_NUM_CORE}))\s*\[[^\]]*?\bprob=\s*(?P<prob>{_NUM_CORE})\s*[^\]]*?\]",
+                re.IGNORECASE
+            )
+
+            # Case B: prob comes first:  )[&prob=...]:0.05
+            # Matches: ) [ ... prob= 1.0 ... ] : 0.05
+            pat_b = re.compile(
+                rf"\)\s*\[[^\]]*?\bprob=\s*(?P<prob>{_NUM_CORE})\s*[^\]]*?\](?:\s*:\s*(?P<branch>{_NUM_CORE}))?",
+                re.IGNORECASE
+            )
+
+            def repl(m: re.Match) -> str:
+                # prob is clean number now (regex ensures it matches _NUM_CORE)
+                prob_val = _fmt_prob(m.group('prob'))
+                
+                # branch is also just the number if it matched
+                branch_val = m.group('branch')
+                branch_str = f":{branch_val}" if branch_val else ""
+                
+                return f"){prob_val}{branch_str}"
+
+            clean_content = pat_a.sub(repl, content)
+            clean_content = pat_b.sub(repl, clean_content)
+
+            # Now remove any remaining [&...], [length_mean...], etc.
+            clean_content = re.sub(r"\[[^\]]*\]", "", clean_content)
             
             from io import StringIO
             tree = Phylo.read(StringIO(clean_content), "nexus")

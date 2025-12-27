@@ -4,10 +4,10 @@
  */
 document.addEventListener('DOMContentLoaded', async () => {
     const JOB_ID = window.JOB_ID || "unknown"; // Safety fallback
-    
+
     // 1. Safe Element Getter
     const getEl = (id) => document.getElementById(id);
-    
+
     // 2. Elements
     const container = getEl('tree-container');
     const viewerSelect = getEl('viewer-select');
@@ -35,6 +35,7 @@ document.addEventListener('DOMContentLoaded', async () => {
     // 4. State
     let currentTreeState = null;
     let selectedNode = null;
+    let showSupport = true;
 
     // 5. Helper: Status Message
     function showStatus(msg, type, timeout = 0) {
@@ -61,7 +62,7 @@ document.addEventListener('DOMContentLoaded', async () => {
     async function renderTree() {
         console.log("renderTree called");
         if (container) container.innerHTML = '';
-        
+
         const viewerType = viewerSelect ? viewerSelect.value : 'phylotree';
 
         // Shared Callbacks
@@ -80,7 +81,9 @@ document.addEventListener('DOMContentLoaded', async () => {
                     if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
                     const newick = await resp.text();
                     // Call the v2 renderer
-                    renderPhylotree(newick, 'tree-container', callbacks);
+                    renderPhylotree(newick, 'tree-container', callbacks, {
+                        showSupport: showSupport
+                    });
                 } catch (err) {
                     if (container) container.textContent = `Failed to load Newick: ${err.message}`;
                 }
@@ -91,6 +94,16 @@ document.addEventListener('DOMContentLoaded', async () => {
     }
 
     // 8. Event Listeners (Only if elements exist)
+    const btnToggleSupport = getEl('btn-toggle-support');
+    if (btnToggleSupport) {
+        btnToggleSupport.addEventListener('click', () => {
+            showSupport = !showSupport;
+            renderTree();
+            // Simple UI feedback
+            btnToggleSupport.textContent = showSupport ? "Hide Node Support" : "Show Node Support";
+        });
+    }
+
     if (viewerSelect) viewerSelect.addEventListener('change', () => renderTree());
 
     if (btnPrune) btnPrune.addEventListener('click', async () => {

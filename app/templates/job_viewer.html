@@ -11,96 +11,110 @@
     <div class="row">
         <div class="col-md-12">
             <h1>Tree Viewer for Job: {{ job_id }}</h1>
-<div class="card mb-3">
-    <div class="card-header bg-light">
-        <div class="d-flex justify-content-between align-items-center flex-wrap gap-2">
-            
-            <div class="d-flex gap-2">
-                <div class="btn-group btn-group-sm" role="group">
-                    <button type="button" class="btn btn-outline-secondary" id="btn-layout-linear" title="Linear Layout">
-                        <i class="fa fa-align-left"></i> Linear
-                    </button>
-                    <button type="button" class="btn btn-outline-secondary" id="btn-layout-radial" title="Radial Layout">
-                        <i class="fa fa-circle-notch"></i> Radial
-                    </button>
+            <div class="card mb-3">
+                <div class="card-header bg-light">
+                    <div class="d-flex justify-content-between align-items-center flex-wrap gap-2">
+
+                        <div class="d-flex gap-2">
+                            <div class="btn-group btn-group-sm" role="group">
+                                <button type="button" class="btn btn-outline-secondary" id="btn-layout-linear"
+                                    title="Linear Layout">
+                                    <i class="fa fa-align-left"></i> Linear
+                                </button>
+                                <button type="button" class="btn btn-outline-secondary" id="btn-layout-radial"
+                                    title="Radial Layout">
+                                    <i class="fa fa-circle-notch"></i> Radial
+                                </button>
+                            </div>
+
+                            <div class="btn-group btn-group-sm" role="group">
+                                <button type="button" class="btn btn-outline-secondary active" id="btn-align-tips"
+                                    title="Align Tips">
+                                    <i class="fa fa-indent"></i> Align
+                                </button>
+                                <button type="button" class="btn btn-outline-secondary" id="btn-ladderize"
+                                    title="Sort Nodes">
+                                    <i class="fa fa-sort-amount-down"></i> Sort
+                                </button>
+                                <button type="button" class="btn btn-outline-secondary" id="btn-toggle-support"
+                                    title="Toggle Support Values">Hide Node Support</button>
+                            </div>
+
+                            <div class="btn-group btn-group-sm" role="group">
+                                <button type="button" class="btn btn-outline-secondary" id="btn-select-all">All</button>
+                                <button type="button" class="btn btn-outline-secondary"
+                                    id="btn-select-none">None</button>
+                            </div>
+                        </div>
+
+                        <div class="btn-group btn-group-sm" role="group">
+                            <button type="button" class="btn btn-warning" id="btn-prune" disabled>
+                                <i class="fa fa-cut"></i> Prune
+                            </button>
+                            <button type="button" class="btn btn-info" id="btn-rename" disabled>
+                                <i class="fa fa-edit"></i> Rename
+                            </button>
+                            <button type="button" class="btn btn-success" id="btn-reroot" disabled>
+                                <i class="fa fa-map-pin"></i> Reroot
+                            </button>
+                            <button type="button" class="btn btn-danger" id="btn-recompute">
+                                <i class="fa fa-sync"></i> Recompute
+                            </button>
+                        </div>
+
+                        <div class="btn-group btn-group-sm" role="group">
+                            <div class="btn-group btn-group-sm" role="group">
+                                <button id="btnGroupDrop1" type="button" class="btn btn-outline-primary dropdown-toggle"
+                                    data-bs-toggle="dropdown" aria-expanded="false">
+                                    <i class="fa fa-download"></i> Data
+                                </button>
+                                <ul class="dropdown-menu" aria-labelledby="btnGroupDrop1">
+                                    <li><a class="dropdown-item" id="newick-link" href="#" target="_blank">Newick
+                                            Tree</a></li>
+                                    <li><a class="dropdown-item" id="nexus-link" href="#" target="_blank">NEXUS Tree</a>
+                                    </li>
+                                    <li>
+                                        <hr class="dropdown-divider">
+                                    </li>
+                                    <li><a class="dropdown-item" id="fasta-pruned" href="#" target="_blank">Pruned
+                                            FASTA</a></li>
+                                    <li><a class="dropdown-item" id="fasta-original" href="#" target="_blank">Original
+                                            FASTA</a></li>
+                                </ul>
+                            </div>
+                            <button type="button" class="btn btn-primary" id="btn-save-svg">
+                                <i class="fa fa-camera"></i> SVG
+                            </button>
+                        </div>
+
+                    </div>
+
+                    <div class="d-flex justify-content-between align-items-center mt-2">
+                        <div class="col-auto">
+                            <select id="viewer-select" class="form-select form-select-sm" style="display:none;">
+                                <option value="phylotree" selected>Phylotree v2</option>
+                                <option value="d3">D3 Standard</option>
+                            </select>
+                        </div>
+
+                        <div class="col">
+                            <div id="status-message" class="alert alert-info py-1 px-3 mb-0 d-none" role="alert"></div>
+                        </div>
+                    </div>
                 </div>
-
-                <div class="btn-group btn-group-sm" role="group">
-                    <button type="button" class="btn btn-outline-secondary active" id="btn-align-tips" title="Align Tips">
-                        <i class="fa fa-indent"></i> Align
-                    </button>
-                    <button type="button" class="btn btn-outline-secondary" id="btn-ladderize" title="Sort Nodes">
-                        <i class="fa fa-sort-amount-down"></i> Sort
-                    </button>
-                </div>
-                
-                <div class="btn-group btn-group-sm" role="group">
-                     <button type="button" class="btn btn-outline-secondary" id="btn-select-all">All</button>
-                     <button type="button" class="btn btn-outline-secondary" id="btn-select-none">None</button>
-                </div>
-            </div>
-
-            <div class="btn-group btn-group-sm" role="group">
-                <button type="button" class="btn btn-warning" id="btn-prune" disabled>
-                    <i class="fa fa-cut"></i> Prune
-                </button>
-                <button type="button" class="btn btn-info" id="btn-rename" disabled>
-                    <i class="fa fa-edit"></i> Rename
-                </button>
-                <button type="button" class="btn btn-success" id="btn-reroot" disabled>
-                    <i class="fa fa-map-pin"></i> Reroot
-                </button>
-                <button type="button" class="btn btn-danger" id="btn-recompute">
-                    <i class="fa fa-sync"></i> Recompute
-                </button>
-            </div>
-
-            <div class="btn-group btn-group-sm" role="group">
-                <div class="btn-group btn-group-sm" role="group">
-                    <button id="btnGroupDrop1" type="button" class="btn btn-outline-primary dropdown-toggle" data-bs-toggle="dropdown" aria-expanded="false">
-                        <i class="fa fa-download"></i> Data
-                    </button>
-                    <ul class="dropdown-menu" aria-labelledby="btnGroupDrop1">
-                        <li><a class="dropdown-item" id="newick-link" href="#" target="_blank">Newick Tree</a></li>
-                        <li><a class="dropdown-item" id="nexus-link" href="#" target="_blank">NEXUS Tree</a></li>
-                        <li><hr class="dropdown-divider"></li>
-                        <li><a class="dropdown-item" id="fasta-pruned" href="#" target="_blank">Pruned FASTA</a></li>
-                        <li><a class="dropdown-item" id="fasta-original" href="#" target="_blank">Original FASTA</a></li>
-                    </ul>
-                </div>
-                <button type="button" class="btn btn-primary" id="btn-save-svg">
-                    <i class="fa fa-camera"></i> SVG
-                </button>
-            </div>
-
-        </div>
-
-        <div class="d-flex justify-content-between align-items-center mt-2">
-            <div class="col-auto">
-                <select id="viewer-select" class="form-select form-select-sm" style="display:none;">
-                    <option value="phylotree" selected>Phylotree v2</option>
-                    <option value="d3">D3 Standard</option>
-                </select>
-            </div>
-            
-            <div class="col">
-                <div id="status-message" class="alert alert-info py-1 px-3 mb-0 d-none" role="alert"></div>
             </div>
         </div>
     </div>
 </div>
+</div>
+</div>
+<div class="row mt-3">
+    <div class="col-md-12">
+        <div id="tree-container" class="border rounded p-3" style="min-height: 600px; background-color: #fff;">
+            <div class="text-center text-muted mt-5">Loading tree...</div>
         </div>
     </div>
 </div>
-        </div>
-    </div>
-    <div class="row mt-3">
-        <div class="col-md-12">
-            <div id="tree-container" class="border rounded p-3" style="min-height: 600px; background-color: #fff;">
-                <div class="text-center text-muted mt-5">Loading tree...</div>
-            </div>
-        </div>
-    </div>
 </div>
 
 {% endblock %}
