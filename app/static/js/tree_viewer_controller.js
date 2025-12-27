@@ -32,6 +32,7 @@ document.addEventListener('DOMContentLoaded', async () => {
         setupLink('fasta-original', `/api/job/${JOB_ID}/download/fasta/original`);
     }
 
+
     // 4. State
     let currentTreeState = null;
     let selectedNode = null;

@@ -264,7 +264,8 @@
             draw();
         });
 
-        bindBtn('btn-save-svg', () => {
+        bindBtn('btn-save-svg', (e) => {
+            if (e) e.preventDefault();
             const svg = container.querySelector('svg');
             if (!svg) return;
             const data = (new XMLSerializer()).serializeToString(svg);
