@@ -21,7 +21,7 @@ def create_job():
         "alignment_options": data.get("alignment_options", {}),
         "tree_method": data.get("tree_method", "nj"),
         "tree_model": data.get("tree_model", "GTR+G"),
-        "bootstrap": data.get("bootstrap", 100),
+        "bootstrap": data.get("bootstrap", 1000),
         "mcmc_generations": data.get("mcmc_generations", 50000),
         # Add other params as needed
     }

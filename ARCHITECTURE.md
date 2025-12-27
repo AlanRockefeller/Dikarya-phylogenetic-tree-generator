@@ -59,20 +59,68 @@ The application also defines several `dataclass` structures for handling job par
 - `JobParams`
 
 ## Application Structure (`app/`)
-The application follows a modular factory pattern:
+The application follows a modular factory pattern. Below is a detailed breakdown of the file structure:
 
-- **Blueprints**:
-    - `api/`: REST API endpoints
-    - `auth/`: Authentication routes
-    - `main/`: Core application logic/UI
-    - `user/`: User profile management
-    - `monitoring/`: System and job monitoring
-- **Core Components**:
-    - `__init__.py`: Application factory (`create_app`) and blueprint registration.
-    - `models.py`: SQLAlchemy models and dataclasses.
-    - `workers/`: RQ worker configurations.
-    - `services/`: Business logic isolation.
-    - `extensions.py`: Flask extension initialization (db, login_manager, migrate).
+### 1. Configuration & Core
+- `app/__init__.py`: **Application Factory**. Initializes the Flask app, registers extensions and blueprints.
+- `app/config.py`: Configuration classes (Development, Production) loading settings from environment variables.
+- `app/extensions.py`: Initialization of Flask extensions (`db`, `login_manager`, `migrate`, `redis_client`).
+- `app/cli.py`: Custom Flask CLI commands (e.g., `flask run-worker`, `flask run-metrics`).
+- `app/models.py`: Database models (`User`, `Job`) and data classes (`AlignmentParams`, etc.).
+
+### 2. Blueprints (Route Logic)
+Each blueprint encapsulates a domain of the application:
+- **`app/main/`**: Core application logic.
+    - `routes.py`: General routes (landing page, static pages).
+- **`app/auth/`**: Authentication.
+    - `routes.py`: Login, logout, registration flows.
+- **`app/user/`**: User-centric views.
+    - `routes.py`: User dashboard, job list (`/user/jobs`).
+- **`app/api/`**: REST API for frontend interactions.
+    - `routes.py`: Endpoints for job status, data download, and tree operations.
+- **`app/monitoring/`**: System health.
+    - `services.py`: Logic for collecting system metrics (`psutil`).
+    - `routes.py`: Dashboard for viewing system load.
+
+### 3. Services (Business Logic)
+Encapsulates complex logic, separated from route handlers:
+- `app/services/alignment_service.py`: Handles sequence alignment (MAFFT, MUSCLE, etc.).
+- `app/services/tree_builder_service.py`: Handles phylogenetic tree inference (RAxML, IQ-TREE).
+- `app/services/trimming_service.py`: Sequence trimming (trimAl).
+- `app/services/tree_edit_service.py`: Tree manipulation logic (rerooting, pruning, node renaming).
+- `app/services/blast_service.py`: Integration with BLAST tools.
+- `app/services/subprocess_utils.py`: Utilities for safely execution shell commands.
+
+### 4. Background Workers (`app/workers/`)
+Handles asynchronous task processing using Redis Queue (RQ):
+- `tasks.py`: Entry points for background jobs (e.g., `run_alignment`, `run_tree_building`).
+- `queue.py`: Helper functions to enqueue jobs.
+- `worker_monitor.py`: Logic to monitor worker health and heartbeat.
+
+### 5. Frontend (`app/templates/` & `app/static/`)
+#### Templates (Jinja2)
+- **Base Layouts**:
+    - `base.html`: Main layout wrapper.
+    - `index.html`: Home page.
+- **Job Views**:
+    - `user_jobs.html`: List of user's submitted jobs.
+    - `job_viewer.html`: Detailed view of a specific job (results).
+    - `job_status.html`: Current status of a running job.
+- **Partials**:
+    - `partials/viewer_controls.html`: Control panel for tree viewers.
+    - `partials/phylotree_viewer.html`: Container for Phylotree.js.
+- **Admin**:
+    - `admin/monitoring.html`: System metrics dashboard.
+
+#### Static Assets
+- **CSS** (`app/static/css/`):
+    - `style.css`: Global styles.
+    - `tree_viewer.css`: Specific styles for the tree visualization.
+- **JavaScript** (`app/static/js/`):
+    - `tree_viewer_controller.js`: **Main Controller**. Orchestrates the tree viewer UI.
+    - `tree_viewer_api.js`: Handles AJAX requests to module API.
+    - `tree_edit_actions.js`: Bridges UI actions to API calls (prune, reroot).
+    - `phylotree.js` / `tree_viewer_phylotree_v2.js`: D3-based tree rendering logic.
 
 ## Runtime & Deployment
 - **Environment**: Remote Linux Server

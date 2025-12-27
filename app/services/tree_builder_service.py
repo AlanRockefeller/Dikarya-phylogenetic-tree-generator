@@ -204,7 +204,10 @@ def _run_mrbayes(alignment_fasta: Path, output_newick: Path, output_nexus: Path,
     returncode, stdout, stderr = run_command(cmd, log_file=log_file)
     
     if returncode != 0:
-        raise RuntimeError(f"MrBayes failed with return code {returncode}. See logs.")
+        logger.error(f"MrBayes failed. RC={returncode}")
+        logger.error(f"STDOUT: {stdout}")
+        logger.error(f"STDERR: {stderr}")
+        raise RuntimeError(f"MrBayes failed with return code {returncode}. Error: {stderr}")
         
     # 4. Output: <input>.con.tre (Consensus tree)
     con_tree = Path(f"{nexus_input}.con.tre")
@@ -227,14 +230,50 @@ def _convert_newick_to_nexus(newick_path: Path, nexus_path: Path):
 def _convert_nexus_to_newick(nexus_path: Path, newick_path: Path):
     if HAS_BIOPYTHON:
         try:
-            tree = Phylo.read(str(nexus_path), "nexus")
+            # MrBayes produces annotations like [&prob=...] inside the newick string
+            # which BioPython's Nexus parser sometimes fails on.
+            # We strip them out for simple conversion.
+            import re
+            content = nexus_path.read_text()
+            # Remove comments in square brackets that start with & (metadata)
+            # This is a bit aggressive but safer for Biopython
+            clean_content = re.sub(r'\[&[^\]]+\]', '', content)
+            
+            from io import StringIO
+            tree = Phylo.read(StringIO(clean_content), "nexus")
             Phylo.write(tree, str(newick_path), "newick")
-        except Exception:
-            pass
+        except Exception as e:
+            # Log this instead of silent swallow
+            logger.error(f"Failed to convert Nexus to Newick: {e}")
+            raise
 
 def _convert_fasta_to_nexus(fasta_path: Path, nexus_path: Path):
     if HAS_BIOPYTHON:
-        AlignIO.convert(str(fasta_path), "fasta", str(nexus_path), "nexus", alphabet=None)
+        # Read alignment
+        aln = AlignIO.read(str(fasta_path), "fasta")
+        
+        # Simple heuristic to detect molecule type
+        if len(aln) > 0:
+            seq_str = str(aln[0].seq).upper()
+            dna_chars = set("ACGTN-")
+            match_count = sum(1 for c in seq_str if c in dna_chars)
+            is_dna = (match_count / len(seq_str)) > 0.8
+            
+            mol_type = "DNA" if is_dna else "protein"
+            
+            # Annotate records and sanitize IDs
+            for record in aln:
+                record.annotations["molecule_type"] = mol_type
+                # Sanitize ID to avoid Biopython quoting (which MrBayes hates)
+                # Replace common problematic chars with underscore
+                clean_id = record.id.replace("|", "_").replace(":", "_").replace("-", "_").replace("'", "").replace(" ", "_")
+                # Keep only alphanumeric and underscore
+                clean_id = "".join(c for c in clean_id if c.isalnum() or c == "_")
+                record.id = clean_id
+                # Clear description to prevent extra info causing issues
+                record.description = ""
+                
+        AlignIO.write(aln, str(nexus_path), "nexus")
     else:
         # Simple fallback if needed, but BioPython is standard
         raise RuntimeError("BioPython required for format conversion.")

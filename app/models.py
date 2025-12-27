@@ -47,7 +47,7 @@ class TrimmingParams:
 class TreeBuilderParams:
     method: str            # "nj", "raxml", "iqtree", "mrbayes"
     model: str = "GTR+G"   # default model for ML
-    bootstrap: int = 100   # ML bootstrap replicates (ignored for NJ if not applicable)
+    bootstrap: int = 1000   # ML bootstrap replicates (ignored for NJ if not applicable)
     mcmc_generations: int = 50000   # for MrBayes defaults
     mcmc_nruns: int = 2
     mcmc_nchains: int = 4
