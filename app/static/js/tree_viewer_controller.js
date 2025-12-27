@@ -26,10 +26,10 @@ document.addEventListener('DOMContentLoaded', async () => {
     };
 
     if (JOB_ID !== "unknown") {
-        setupLink('newick-link', `/api/job/${JOB_ID}/newick`);
-        setupLink('nexus-link', `/api/job/${JOB_ID}/nexus`);
-        setupLink('fasta-pruned', `/api/job/${JOB_ID}/fasta/pruned`);
-        setupLink('fasta-original', `/api/job/${JOB_ID}/fasta/original`);
+        setupLink('newick-link', `/api/job/${JOB_ID}/download/tree/newick`);
+        setupLink('nexus-link', `/api/job/${JOB_ID}/download/tree/nexus`);
+        setupLink('fasta-pruned', `/api/job/${JOB_ID}/download/fasta/pruned`);
+        setupLink('fasta-original', `/api/job/${JOB_ID}/download/fasta/original`);
     }
 
     // 4. State

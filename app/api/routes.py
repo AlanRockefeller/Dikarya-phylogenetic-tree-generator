@@ -139,7 +139,7 @@ def recompute_tree_job(job_id):
                 params_dict = json.load(f)
         
         # Merge with request data
-        req_data = request.get_json() or {}
+        req_data = request.get_json(silent=True) or {}
         params_dict.update(req_data)
         
         # Construct JobParams object
@@ -176,6 +176,8 @@ def recompute_tree_job(job_id):
         return jsonify(result)
         
     except Exception as e:
+        import traceback
+        logging.error(f"Recompute error: {e}\n{traceback.format_exc()}")
         return jsonify({"status": "error", "error": str(e)}), 500
 
 @bp.route('/job/<job_id>/download/tree/newick', methods=['GET'])

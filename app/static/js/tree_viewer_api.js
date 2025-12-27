@@ -50,7 +50,9 @@ const TreeEditActions = {
 
     async recomputeTree(jobId) {
         const response = await fetch(`/api/job/${jobId}/tree/recompute`, {
-            method: 'POST'
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({})
         });
         if (!response.ok) {
             throw new Error(`Failed to recompute: ${response.status}`);

@@ -17,6 +17,13 @@ def run_command(args: List[str], cwd: Optional[Path] = None, log_file: Optional[
     Raises no exceptions; caller decides what to do.
     """
     try:
+        import os
+        # Augment PATH if it's too restricted (e.g. in some systemd environments)
+        env = os.environ.copy()
+        current_path = env.get("PATH", "")
+        if "/usr/bin" not in current_path:
+            env["PATH"] = f"{current_path}:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+            
         logger.info(f"Running command: {' '.join(args)}")
         
         # Ensure cwd exists if provided
@@ -26,6 +33,7 @@ def run_command(args: List[str], cwd: Optional[Path] = None, log_file: Optional[
         result = subprocess.run(
             args,
             cwd=cwd,
+            env=env,
             capture_output=True,
             text=True,
             check=False
