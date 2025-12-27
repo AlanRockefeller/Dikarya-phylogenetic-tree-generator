@@ -173,11 +173,17 @@
             nodeGroups.each(function (d) {
                 const group = window.d3v7.select(this);
                 // Support values are effectively the "name" of the internal node in Newick
-                const label = d.data?.name || d.data?.bootstrap_values;
+                // Check various fields just in case the parser put it elsewhere
+                const label = d.data?.name || d.data?.bootstrap_values || d.data?.bootstrap || d.data?.support || d.data?.confidence;
+
+                // Debug logging to help identify where the value is
+                if (window.location.search.includes("debug=true") || !label) {
+                    console.log("Internal Node Data:", d.data, "Label candidate:", label);
+                }
 
                 if (!label) return;
                 const numValue = parseFloat(label);
-                if (isNaN(numValue) || numValue < 0 || numValue > 1.1) return;
+                if (isNaN(numValue) || numValue < 0 || numValue > 100) return;
 
                 let text = group.select("text.node-support-value");
                 if (text.empty()) {
@@ -191,7 +197,7 @@
                     .style("font-weight", "bold")
                     .style("fill", "#c00")
                     .style("pointer-events", "none")
-                    .text(numValue.toFixed(2))
+                    .text(numValue > 1 ? Math.round(numValue) : numValue.toFixed(2))
                     .style("display", "block");
             });
         }
