@@ -14,6 +14,11 @@
     </div>
     <div id="result-section" style="display: none;">
         <h3>Result</h3>
+        <p>
+            <a id="view-tree-btn" href="#"
+                style="display: inline-block; padding: 10px 20px; background-color: #2e7d32; color: white; text-decoration: none; border-radius: 4px;">View
+                Tree</a>
+        </p>
         <pre id="job-result"></pre>
     </div>
     <div id="error-section" style="display: none; color: red;">
@@ -44,6 +49,7 @@
 
                 if (data.status === 'finished' || data.status === 'completed') {
                     resultSection.style.display = 'block';
+                    document.getElementById('view-tree-btn').href = `/job/${jobId}/view`;
                     resultPre.textContent = JSON.stringify(data.result, null, 2);
                 } else if (data.status === 'failed' || data.status === 'error') {
                     errorSection.style.display = 'block';
