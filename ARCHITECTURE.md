@@ -100,3 +100,15 @@ To run the worker in development mode:
 ```bash
 rq worker -u redis://localhost:6379 dikarya-tasks
 ```
+
+## Debugging & Logging
+
+### Logs
+- **Error Log**: `/var/www/dikarya/var/logs/error.log`
+- **Access Log**: `/var/www/dikarya/var/logs/access.log`
+
+### Troubleshooting
+- **500 Server Errors**: Check the error log for stack traces.
+- **Route Changes**: If you add or modify routes (e.g., adding `user.clear_jobs`), you **MUST** reload the Gunicorn server for changes to take effect.
+    - Find the Master PID: `ps aux | grep gunicorn`
+    - Send HUP signal: `kill -HUP <MASTER_PID>`
