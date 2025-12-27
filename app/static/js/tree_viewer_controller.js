@@ -1,170 +1,44 @@
 /**
  * Main controller for the tree viewer.
+ * Robust Version: Handles missing elements gracefully.
  */
 document.addEventListener('DOMContentLoaded', async () => {
-    const container = document.getElementById('tree-container');
-    const viewerSelect = document.getElementById('viewer-select');
-    const statusMsg = document.getElementById('status-message');
+    const JOB_ID = window.JOB_ID || "unknown"; // Safety fallback
+    
+    // 1. Safe Element Getter
+    const getEl = (id) => document.getElementById(id);
+    
+    // 2. Elements
+    const container = getEl('tree-container');
+    const viewerSelect = getEl('viewer-select');
+    const statusMsg = getEl('status-message');
 
-    // Buttons
-    const btnPrune = document.getElementById('btn-prune');
-    const btnRename = document.getElementById('btn-rename');
-    const btnReroot = document.getElementById('btn-reroot');
-    const btnRecompute = document.getElementById('btn-recompute');
+    // Buttons (Action Group)
+    const btnPrune = getEl('btn-prune');
+    const btnRename = getEl('btn-rename');
+    const btnReroot = getEl('btn-reroot');
+    const btnRecompute = getEl('btn-recompute');
 
-    // Download links
-    const linkNewick = document.getElementById('btn-download-newick');
-    const linkNexus = document.getElementById('btn-download-nexus');
-    const linkFasta = document.getElementById('btn-download-fasta');
-    const linkOriginal = document.getElementById('btn-download-original');
+    // 3. Setup Download Links (Safe Mode)
+    const setupLink = (id, url) => {
+        const el = getEl(id);
+        if (el) el.href = url;
+    };
 
+    if (JOB_ID !== "unknown") {
+        setupLink('newick-link', `/api/job/${JOB_ID}/newick`);
+        setupLink('nexus-link', `/api/job/${JOB_ID}/nexus`);
+        setupLink('fasta-pruned', `/api/job/${JOB_ID}/fasta/pruned`);
+        setupLink('fasta-original', `/api/job/${JOB_ID}/fasta/original`);
+    }
+
+    // 4. State
     let currentTreeState = null;
     let selectedNode = null;
 
-    // Initialize download links
-    linkNewick.href = `/api/job/${JOB_ID}/download/tree/newick`;
-    linkNexus.href = `/api/job/${JOB_ID}/download/tree/nexus`;
-    linkFasta.href = `/api/job/${JOB_ID}/download/fasta/pruned`;
-    linkOriginal.href = `/api/job/${JOB_ID}/download/fasta/original`;
-
-    // Load initial tree
-    try {
-        showStatus("Loading tree...", "info");
-        currentTreeState = await TreeEditActions.getTreeState(JOB_ID);
-        await renderTree();
-        showStatus("Tree loaded.", "success", 2000);
-    } catch (e) {
-        showStatus(`Error loading tree: ${e.message}`, "danger");
-    }
-
-    // Viewer Switch
-    viewerSelect.addEventListener('change', () => {
-        renderTree().catch(e => showStatus(`Render failed: ${e.message}`, "danger"));
-    });
-
-    // Actions
-    btnPrune.addEventListener('click', async () => {
-        if (!selectedNode) return;
-        if (!confirm(`Prune ${selectedNode.name}?`)) return;
-
-        try {
-            showStatus("Pruning...", "info");
-            currentTreeState = await TreeEditActions.pruneTip(JOB_ID, selectedNode.name);
-            selectedNode = null;
-            updateButtons();
-            await renderTree();
-            showStatus("Pruned successfully.", "success", 2000);
-        } catch (e) {
-            showStatus(`Prune failed: ${e.message}`, "danger");
-        }
-    });
-
-    btnRename.addEventListener('click', async () => {
-        if (!selectedNode) return;
-        const newName = prompt("Enter new name:", selectedNode.display_name || selectedNode.name);
-        if (!newName) return;
-
-        try {
-            showStatus("Renaming...", "info");
-            currentTreeState = await TreeEditActions.renameTip(JOB_ID, selectedNode.name, newName);
-            selectedNode = null; // Or keep selected?
-            updateButtons();
-            await renderTree();
-            showStatus("Renamed successfully.", "success", 2000);
-        } catch (e) {
-            showStatus(`Rename failed: ${e.message}`, "danger");
-        }
-    });
-
-    btnReroot.addEventListener('click', async () => {
-        if (!selectedNode) return;
-        if (!confirm(`Reroot at ${selectedNode.name}?`)) return;
-
-        try {
-            showStatus("Rerooting...", "info");
-            currentTreeState = await TreeEditActions.reroot(JOB_ID, selectedNode.name);
-            selectedNode = null;
-            updateButtons();
-            await renderTree();
-            showStatus("Rerooted successfully.", "success", 2000);
-        } catch (e) {
-            showStatus(`Reroot failed: ${e.message}`, "danger");
-        }
-    });
-
-    btnRecompute.addEventListener('click', async () => {
-        if (!confirm("Recompute tree? This may take some time.")) return;
-
-        try {
-            showStatus("Recomputing... please wait.", "info");
-            const result = await TreeEditActions.recomputeTree(JOB_ID);
-            // Reload state after recompute
-            currentTreeState = await TreeEditActions.getTreeState(JOB_ID);
-            selectedNode = null;
-            updateButtons();
-            await renderTree();
-            showStatus("Recompute complete.", "success", 3000);
-        } catch (e) {
-            showStatus(`Recompute failed: ${e.message}`, "danger");
-        }
-    });
-
-
-	async function renderTree() {
-	  console.log("renderTree called, viewerType=", viewerSelect.value);
-	  container.innerHTML = '';
-	  const viewerType = viewerSelect.value;
-
-	  const callbacks = {
-	    onTipClick: (node) => {
-	      selectedNode = node;
-	      updateButtons();
-	      console.log("Selected:", node);
-	    }
-	  };
-
-	  if (viewerType === 'd3') {
-	    if (typeof renderD3Tree === 'function') {
-	      renderD3Tree(currentTreeState, 'tree-container', callbacks);
-	    } else {
-	      container.innerHTML = 'D3 Viewer not loaded.';
-	    }
-	    return;
-	  } else if (viewerType === 'phylotree') {
-	    if (typeof renderPhylotree === 'function') {
-	      const resp = await fetch(`/api/job/${JOB_ID}/download/tree/newick`, { cache: "no-store" });
-	      if (!resp.ok) {
-		container.textContent = `Failed to load Newick (${resp.status})`;
-		return;
-	      }
-	      const newick = await resp.text();
-	      renderPhylotree(newick, 'tree-container', callbacks);
-	    } else {
-	      container.innerHTML = 'Phylotree.js Viewer not loaded.';
-	    }
-	    return;
-	  } else if (viewerType === 'jsphylosvg') {
-	    if (typeof renderJsPhyloSVG === 'function') {
-	      renderJsPhyloSVG(currentTreeState, 'tree-container', callbacks);
-	    } else {
-	      container.innerHTML = 'jsPhyloSVG Viewer not loaded.';
-	    }
-	    return;
-	  }
-	}
-
-
-
-
-
-    function updateButtons() {
-        const hasSelection = !!selectedNode;
-        btnPrune.disabled = !hasSelection;
-        btnRename.disabled = !hasSelection;
-        btnReroot.disabled = !hasSelection;
-    }
-
+    // 5. Helper: Status Message
     function showStatus(msg, type, timeout = 0) {
+        if (!statusMsg) return; // Prevent crash if missing
         statusMsg.className = `alert alert-${type} mt-2`;
         statusMsg.textContent = msg;
         statusMsg.classList.remove('d-none');
@@ -174,4 +48,101 @@ document.addEventListener('DOMContentLoaded', async () => {
             }, timeout);
         }
     }
+
+    // 6. Helper: Button Updates
+    function updateButtons() {
+        const hasSelection = !!selectedNode;
+        if (btnPrune) btnPrune.disabled = !hasSelection;
+        if (btnRename) btnRename.disabled = !hasSelection;
+        if (btnReroot) btnReroot.disabled = !hasSelection;
+    }
+
+    // 7. Main Render Logic
+    async function renderTree() {
+        console.log("renderTree called");
+        if (container) container.innerHTML = '';
+        
+        const viewerType = viewerSelect ? viewerSelect.value : 'phylotree';
+
+        // Shared Callbacks
+        const callbacks = {
+            onTipClick: (node) => {
+                selectedNode = node;
+                updateButtons();
+                console.log("Selected:", node);
+            }
+        };
+
+        if (viewerType === 'phylotree') {
+            if (typeof renderPhylotree === 'function') {
+                try {
+                    const resp = await fetch(`/api/job/${JOB_ID}/download/tree/newick`, { cache: "no-store" });
+                    if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+                    const newick = await resp.text();
+                    // Call the v2 renderer
+                    renderPhylotree(newick, 'tree-container', callbacks);
+                } catch (err) {
+                    if (container) container.textContent = `Failed to load Newick: ${err.message}`;
+                }
+            } else {
+                if (container) container.innerHTML = 'Phylotree library not loaded.';
+            }
+        }
+    }
+
+    // 8. Event Listeners (Only if elements exist)
+    if (viewerSelect) viewerSelect.addEventListener('change', () => renderTree());
+
+    if (btnPrune) btnPrune.addEventListener('click', async () => {
+        if (!selectedNode || !confirm(`Prune ${selectedNode.name}?`)) return;
+        try {
+            showStatus("Pruning...", "info");
+            currentTreeState = await TreeEditActions.pruneTip(JOB_ID, selectedNode.name);
+            selectedNode = null;
+            updateButtons();
+            await renderTree();
+            showStatus("Pruned successfully.", "success", 2000);
+        } catch (e) { showStatus(`Prune failed: ${e.message}`, "danger"); }
+    });
+
+    if (btnRename) btnRename.addEventListener('click', async () => {
+        if (!selectedNode) return;
+        const newName = prompt("Enter new name:", selectedNode.display_name || selectedNode.name);
+        if (!newName) return;
+        try {
+            showStatus("Renaming...", "info");
+            await TreeEditActions.renameTip(JOB_ID, selectedNode.name, newName);
+            selectedNode = null;
+            updateButtons();
+            await renderTree();
+            showStatus("Renamed successfully.", "success", 2000);
+        } catch (e) { showStatus(`Rename failed: ${e.message}`, "danger"); }
+    });
+
+    if (btnReroot) btnReroot.addEventListener('click', async () => {
+        if (!selectedNode || !confirm(`Reroot at ${selectedNode.name}?`)) return;
+        try {
+            showStatus("Rerooting...", "info");
+            await TreeEditActions.reroot(JOB_ID, selectedNode.name);
+            selectedNode = null;
+            updateButtons();
+            await renderTree();
+            showStatus("Rerooted successfully.", "success", 2000);
+        } catch (e) { showStatus(`Reroot failed: ${e.message}`, "danger"); }
+    });
+
+    if (btnRecompute) btnRecompute.addEventListener('click', async () => {
+        if (!confirm("Recompute tree?")) return;
+        try {
+            showStatus("Recomputing...", "info");
+            await TreeEditActions.recomputeTree(JOB_ID);
+            selectedNode = null;
+            updateButtons();
+            await renderTree();
+            showStatus("Done.", "success", 3000);
+        } catch (e) { showStatus(`Failed: ${e.message}`, "danger"); }
+    });
+
+    // 9. Initial Load
+    renderTree().catch(e => console.error(e));
 });
