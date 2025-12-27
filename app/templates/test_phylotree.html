@@ -1,0 +1,55 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Phylotree Test</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='css/phylotree.css') }}">
+</head>
+<body>
+    <h1>Phylotree v2 Test</h1>
+    <div id="test-tree" style="width: 800px; height: 600px; border: 1px solid black;"></div>
+    
+    <script src="https://cdn.jsdelivr.net/npm/d3@7"></script>
+	<script>
+	    // Map d3 to d3v7 so your controller can find it
+	    window.d3v7 = window.d3;
+	</script>
+
+	<script src="https://cdn.jsdelivr.net/npm/lodash@4/lodash.min.js"></script>
+
+	<script src="{{ url_for('static', filename='js/phylotree.js') }}"></script>
+
+	<script src="{{ url_for('static', filename='js/tree_viewer_phylotree_v2.js') }}"></script>
+
+
+    <script>
+        console.log('D3 version:', d3.version);
+        console.log('Phylotree loaded:', typeof phylotree);
+        
+        const testNewick = "((A:0.1,B:0.2):0.3,(C:0.4,D:0.5):0.6);";
+        
+        const tree = new phylotree.phylotree(testNewick);
+        console.log('Tree created:', tree);
+        console.log('Tree has json:', tree.json !== undefined);
+        console.log('Tree json:', tree.json);
+        
+        if (tree.json) {
+            tree.render({
+                container: "#test-tree",
+                width: 800,
+                height: 600
+            });
+            console.log('Render called');
+            
+            setTimeout(() => {
+                const svg = document.querySelector('#test-tree svg');
+                console.log('SVG exists:', svg !== null);
+                if (svg) {
+                    console.log('SVG children:', svg.children.length);
+                }
+            }, 500);
+        } else {
+            console.error('Tree parsing failed!');
+        }
+    </script>
+</body>
+</html>

@@ -31,7 +31,7 @@ document.addEventListener('DOMContentLoaded', async () => {
     try {
         showStatus("Loading tree...", "info");
         currentTreeState = await TreeEditActions.getTreeState(JOB_ID);
-        renderTree();
+        await renderTree();
         showStatus("Tree loaded.", "success", 2000);
     } catch (e) {
         showStatus(`Error loading tree: ${e.message}`, "danger");
@@ -39,7 +39,7 @@ document.addEventListener('DOMContentLoaded', async () => {
 
     // Viewer Switch
     viewerSelect.addEventListener('change', () => {
-        renderTree();
+        renderTree().catch(e => showStatus(`Render failed: ${e.message}`, "danger"));
     });
 
     // Actions
@@ -52,7 +52,7 @@ document.addEventListener('DOMContentLoaded', async () => {
             currentTreeState = await TreeEditActions.pruneTip(JOB_ID, selectedNode.name);
             selectedNode = null;
             updateButtons();
-            renderTree();
+            await renderTree();
             showStatus("Pruned successfully.", "success", 2000);
         } catch (e) {
             showStatus(`Prune failed: ${e.message}`, "danger");
@@ -69,7 +69,7 @@ document.addEventListener('DOMContentLoaded', async () => {
             currentTreeState = await TreeEditActions.renameTip(JOB_ID, selectedNode.name, newName);
             selectedNode = null; // Or keep selected?
             updateButtons();
-            renderTree();
+            await renderTree();
             showStatus("Renamed successfully.", "success", 2000);
         } catch (e) {
             showStatus(`Rename failed: ${e.message}`, "danger");
@@ -85,7 +85,7 @@ document.addEventListener('DOMContentLoaded', async () => {
             currentTreeState = await TreeEditActions.reroot(JOB_ID, selectedNode.name);
             selectedNode = null;
             updateButtons();
-            renderTree();
+            await renderTree();
             showStatus("Rerooted successfully.", "success", 2000);
         } catch (e) {
             showStatus(`Reroot failed: ${e.message}`, "danger");
@@ -102,47 +102,60 @@ document.addEventListener('DOMContentLoaded', async () => {
             currentTreeState = await TreeEditActions.getTreeState(JOB_ID);
             selectedNode = null;
             updateButtons();
-            renderTree();
+            await renderTree();
             showStatus("Recompute complete.", "success", 3000);
         } catch (e) {
             showStatus(`Recompute failed: ${e.message}`, "danger");
         }
     });
 
-    function renderTree() {
-        container.innerHTML = ''; // Clear
-        const viewerType = viewerSelect.value;
-        const callbacks = {
-            onTipClick: (node) => {
-                selectedNode = node;
-                updateButtons();
-                // Visual feedback handled by specific viewer or shared logic?
-                // For D3, we might need to re-render or highlight.
-                // Let's assume the viewer highlights it.
-                console.log("Selected:", node);
-            }
-        };
 
-        if (viewerType === 'd3') {
-            if (typeof renderD3Tree === 'function') {
-                renderD3Tree(currentTreeState, 'tree-container', callbacks);
-            } else {
-                container.innerHTML = 'D3 Viewer not loaded.';
-            }
-        } else if (viewerType === 'phylotree') {
-            if (typeof renderPhylotree === 'function') {
-                renderPhylotree(currentTreeState, 'tree-container', callbacks);
-            } else {
-                container.innerHTML = 'Phylotree.js Viewer not loaded.';
-            }
-        } else if (viewerType === 'jsphylosvg') {
-            if (typeof renderJsPhyloSVG === 'function') {
-                renderJsPhyloSVG(currentTreeState, 'tree-container', callbacks);
-            } else {
-                container.innerHTML = 'jsPhyloSVG Viewer not loaded.';
-            }
-        }
-    }
+	async function renderTree() {
+	  console.log("renderTree called, viewerType=", viewerSelect.value);
+	  container.innerHTML = '';
+	  const viewerType = viewerSelect.value;
+
+	  const callbacks = {
+	    onTipClick: (node) => {
+	      selectedNode = node;
+	      updateButtons();
+	      console.log("Selected:", node);
+	    }
+	  };
+
+	  if (viewerType === 'd3') {
+	    if (typeof renderD3Tree === 'function') {
+	      renderD3Tree(currentTreeState, 'tree-container', callbacks);
+	    } else {
+	      container.innerHTML = 'D3 Viewer not loaded.';
+	    }
+	    return;
+	  } else if (viewerType === 'phylotree') {
+	    if (typeof renderPhylotree === 'function') {
+	      const resp = await fetch(`/api/job/${JOB_ID}/download/tree/newick`, { cache: "no-store" });
+	      if (!resp.ok) {
+		container.textContent = `Failed to load Newick (${resp.status})`;
+		return;
+	      }
+	      const newick = await resp.text();
+	      renderPhylotree(newick, 'tree-container', callbacks);
+	    } else {
+	      container.innerHTML = 'Phylotree.js Viewer not loaded.';
+	    }
+	    return;
+	  } else if (viewerType === 'jsphylosvg') {
+	    if (typeof renderJsPhyloSVG === 'function') {
+	      renderJsPhyloSVG(currentTreeState, 'tree-container', callbacks);
+	    } else {
+	      container.innerHTML = 'jsPhyloSVG Viewer not loaded.';
+	    }
+	    return;
+	  }
+	}
+
+
+
+
 
     function updateButtons() {
         const hasSelection = !!selectedNode;

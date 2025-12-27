@@ -5,6 +5,7 @@
  */
 
 function renderD3Tree(treeJson, elementId, callbacks) {
+    const d3 = window.d3v5 || window.d3;
     const container = document.getElementById(elementId);
     const width = container.offsetWidth || 800;
     const height = 600;

@@ -27,3 +27,8 @@ def job_viewer(job_id):
 @bp.route('/health')
 def health():
     return {"ok": True}
+
+
+@bp.route("/test/phylotree")
+def test_phylotree():
+    return render_template("test_phylotree.html")

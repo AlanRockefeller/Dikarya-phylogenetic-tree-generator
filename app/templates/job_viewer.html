@@ -2,8 +2,9 @@
 
 {% block head %}
 <link rel="stylesheet" href="{{ url_for('static', filename='css/tree_viewer.css') }}">
+<link rel="stylesheet" href="{{ url_for('static', filename='css/phylotree.css') }}">
+<link rel="stylesheet" href="{{ url_for('static', filename='css/phylotree-menus.css') }}">
 {% endblock %}
-
 
 {% block content %}
 <div class="container-fluid">
@@ -18,7 +19,6 @@
     <div class="row mt-3">
         <div class="col-md-12">
             <div id="tree-container" class="border rounded p-3" style="min-height: 600px; background-color: #fff;">
-                <!-- Tree will be rendered here -->
                 <div class="text-center text-muted mt-5">Loading tree...</div>
             </div>
         </div>
@@ -27,25 +27,26 @@
 
 {% endblock %}
 
+
+
 {% block scripts %}
 
-<!-- Metadata for JS -->
 <script>
     const JOB_ID = "{{ job_id }}";
 </script>
 
-<!-- Viewer Libraries -->
-<!-- D3 (must come before phylotree and before any of your scripts that call d3) -->
-<script src="https://cdn.jsdelivr.net/npm/d3@5/dist/d3.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/d3@7"></script>
+<script>
+    window.d3v7 = window.d3; // Critical for your v2 renderer
+</script>
+<script src="https://cdn.jsdelivr.net/npm/lodash@4/lodash.min.js"></script>
 
-<!-- Phylotree (depends on D3) -->
-<script src="https://cdn.jsdelivr.net/npm/phylotree@1/phylotree.js"></script>
+<script src="{{ url_for('static', filename='js/phylotree.js') }}"></script>
 
-<!-- viewer adapters -->
-<script src="{{ url_for('static', filename='js/tree_viewer_phylotree.js') }}"></script>
-<script src="{{ url_for('static', filename='js/tree_viewer_jsphylosvg.js') }}"></script>
-<script src="{{ url_for('static', filename='js/tree_viewer_d3.js') }}"></script>
+<script src="{{ url_for('static', filename='js/tree_viewer_phylotree_v2.js') }}"></script>
+
+<script src="{{ url_for('static', filename='js/tree_viewer_api.js') }}"></script>
+
 <script src="{{ url_for('static', filename='js/tree_viewer_controller.js') }}"></script>
-<script src="{{ url_for('static', filename='js/tree_edit_actions.js') }}"></script>
 
 {% endblock %}
