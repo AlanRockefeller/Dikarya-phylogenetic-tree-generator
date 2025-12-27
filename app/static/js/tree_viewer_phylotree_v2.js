@@ -36,7 +36,7 @@
         // 3. STATE
         let state = {
             layout: 'linear',
-            alignTips: true,
+            alignTips: false,
             width: 800,
             height: 600,
             showSupport: (renderOptions && renderOptions.showSupport !== undefined) ? renderOptions.showSupport : true
@@ -177,7 +177,7 @@
                 const label = d.data?.name || d.data?.bootstrap_values || d.data?.bootstrap || d.data?.support || d.data?.confidence;
 
                 // Debug logging to help identify where the value is
-                if (window.location.search.includes("debug=true") || !label) {
+                if (window.location.search.includes("debug=true")) {
                     console.log("Internal Node Data:", d.data, "Label candidate:", label);
                 }
 
@@ -205,6 +205,22 @@
         // INITIAL DRAW
         draw();
 
+        // UI Update for Align Button
+        function updateAlignButton() {
+            const btn = document.getElementById('btn-align-tips');
+            if (!btn) return;
+            if (state.alignTips) {
+                btn.innerHTML = '<i class="fa fa-outdent"></i> Unalign';
+                btn.title = "Unalign Tips";
+                btn.classList.add('active');
+            } else {
+                btn.innerHTML = '<i class="fa fa-indent"></i> Align';
+                btn.title = "Align Tips";
+                btn.classList.remove('active');
+            }
+        }
+        updateAlignButton();
+
         // ---------------------------------------------------------
         // 5. TOOLBAR
         // ---------------------------------------------------------
@@ -219,7 +235,11 @@
 
         bindBtn('btn-layout-linear', () => { state.layout = 'linear'; draw(); });
         bindBtn('btn-layout-radial', () => { state.layout = 'radial'; draw(); });
-        bindBtn('btn-align-tips', () => { state.alignTips = !state.alignTips; draw(); });
+        bindBtn('btn-align-tips', () => {
+            state.alignTips = !state.alignTips;
+            draw();
+            updateAlignButton();
+        });
 
         bindBtn('btn-ladderize', () => {
             tree.traverse_and_compute((node) => {
