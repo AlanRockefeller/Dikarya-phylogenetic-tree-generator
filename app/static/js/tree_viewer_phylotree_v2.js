@@ -179,7 +179,42 @@
                 const group = window.d3v7.select(this);
                 // Support values are effectively the "name" of the internal node in Newick
                 // Check various fields just in case the parser put it elsewhere
-                const label = d.data?.name || d.data?.bootstrap_values || d.data?.bootstrap || d.data?.support || d.data?.confidence;
+                // Priority 1: Check explicit confidence field which BioPython sometimes parses
+                let rawLabel = d.data?.confidence;
+
+                // Priority 2: Fallback to name/bootstrap/support
+                if (rawLabel === undefined || rawLabel === null || rawLabel === "") {
+                    rawLabel = d.data?.name || d.data?.bootstrap_values || d.data?.bootstrap || d.data?.support;
+                }
+
+                let label = rawLabel;
+
+                // Handle Hybrid Labels (e.g., Node_12_100, Node_21.00)
+                // Strict check: Must follow pattern Node_{ID}_{Value} to avoid confusing ID with Value
+                if (label && typeof label === 'string' && label.startsWith("Node_")) {
+                    const match = label.match(/^Node_\d+_(\d+(?:\.\d+)?)$/);
+                    if (match) {
+                        label = match[1];
+                    } else if (label.match(/^Node_\d+$/)) {
+                        // This is just a bare Node ID (e.g. Node_12) with no support value
+                        // Treat as no label
+                        label = null;
+                    } else {
+                        // Fallback for other formats? 
+                        // If it doesn't match the strict ID_Value pattern but starts with Node_, 
+                        // it might be complex. Safest to try extracting last number IF it has an underscore separator.
+                        // But let's stick to the strict generation pattern we created in backend: Node_{counter}_{original}
+                        // So Node_1_100 -> 100. Node_1 -> null.
+                        // What if original was Node_1_Support_100? Backend: f"Node_{counter}_{original}" -> Node_1_Node_1_Support_100.
+                        // New regex matches last number: `_(\d+(?:\.\d+)?)$`.
+                        const looseMatch = label.match(/_(\d+(?:\.\d+)?)$/);
+                        if (looseMatch) {
+                            label = looseMatch[1];
+                        } else {
+                            label = null;
+                        }
+                    }
+                }
 
                 // Debug logging to help identify where the value is
                 if (window.location.search.includes("debug=true")) {
@@ -188,7 +223,7 @@
 
                 if (!label) return;
                 const numValue = parseFloat(label);
-                if (isNaN(numValue) || numValue < 0 || numValue > 100) return;
+                if (isNaN(numValue) || numValue < 0) return; // Allow > 100? Some tools output counts. Standard is 0-100 or 0-1.
 
                 let text = group.select("text.node-support-value");
                 if (text.empty()) {

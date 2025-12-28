@@ -2,7 +2,7 @@ import json
 import logging
 import shutil
 from pathlib import Path
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, List, Optional, Set
 from app.config import Config
 from app.models import JobParams, AlignmentParams, TrimmingParams, TreeBuilderParams
 from app.services.subprocess_utils import run_command
@@ -109,6 +109,24 @@ def rename_tip(tree_json: Dict, old_name: str, new_name: str) -> Dict:
         
     return tree_json
 
+def apply_state_to_structure(node: Dict, renames: Dict, pruned_taxa: Set[str]):
+    """
+    Recursively apply metadata (renames, prune status) to the tree structure.
+    """
+    original_name = node.get("original_name")
+    if original_name:
+        # Apply Rename
+        if original_name in renames:
+            node["display_name"] = renames[original_name]
+        
+        # Apply Prune
+        if original_name in pruned_taxa:
+            node["pruned"] = True
+            
+    if "children" in node:
+        for child in node["children"]:
+            apply_state_to_structure(child, renames, pruned_taxa)
+
 def reroot_tree(job_dir: Path, tree_json: Dict, root_target: str) -> Dict:
     """
     Reroot using any valid node (tip or internal). 
@@ -129,73 +147,52 @@ def reroot_tree(job_dir: Path, tree_json: Dict, root_target: str) -> Dict:
         # Load the tree
         tree = Phylo.read(str(input_path), "newick")
         
+        # Validate target
+        if not root_target:
+             raise ValueError("Reroot target cannot be empty")
+             
         # Find the target clade
-        target_clade = None
-        # Check root first
-        if tree.root.name == root_target:
-            # Already rooted here? Or user wants to re-assert?
-            target_clade = tree.root
-        else:
-            # Search all clades
-            cls = list(tree.find_clades(name=root_target))
-            if cls:
-                target_clade = cls[0]
+        matches = list(tree.find_clades(name=root_target))
         
-        if target_clade:
-            # Reroot
-            tree.root_with_outgroup(target_clade)
+        if len(matches) == 0:
+            raise ValueError(f"Target node '{root_target}' not found")
+        elif len(matches) > 1:
+            raise ValueError(f"Target node '{root_target}' is ambiguous ({len(matches)} matches)")
             
-            # Save results to 'pruned' filenames to indicate modification
-            # This ensures download_newick serves this files
-            out_newick = job_dir / "tree" / "tree_pruned.newick"
-            out_nexus = job_dir / "tree" / "tree_pruned.nexus"
-            
-            Phylo.write(tree, str(out_newick), "newick")
-            logger.info(f"Successfully wrote rerooted tree to {out_newick}")
-            
-            # Also try to write Nexus for consistency
-            try:
-                Phylo.write(tree, str(out_nexus), "nexus")
-            except Exception as ex:
-                logger.warning(f"Failed to write Nexus rerooted tree: {ex}")
-
-            # Update state
-            tree_json["root"] = root_target
-            tree_json["current_tree"] = "pruned"
-            
-            # Update the cached JSON structure to match the new topology
-            new_structure = _clade_to_json(tree.root)
-            
-            # Re-apply metadata (renames and pruned status)
-            renames = tree_json.get("renames", {})
-            pruned_taxa = set(tree_json.get("pruned_taxa", []))
-            
-            def reapply_metadata(node):
-                original_name = node.get("original_name")
-                # Name might be None for internal nodes
-                if original_name:
-                    # Apply Rename
-                    if original_name in renames:
-                        node["display_name"] = renames[original_name]
-                    
-                    # Apply Prune
-                    if original_name in pruned_taxa:
-                        node["pruned"] = True
-                        
-                if "children" in node:
-                    for child in node["children"]:
-                        reapply_metadata(child)
-                        
-            reapply_metadata(new_structure)
-            tree_json["tree_structure"] = new_structure
-            
-        else:
-            logger.warning(f"Reroot target '{root_target}' not found in tree")
-            # We don't error out, just don't reroot? Or should we error?
-            # If the user clicked it, it should exist.
-            
+        target_clade = matches[0]
+        
+        # Check numeric safety ONLY for internal nodes
+        # If it's a Tip, numeric names (e.g. identifiers) are allowed.
+        import re
+        if not target_clade.is_terminal() and re.match(r'^\d+(\.\d+)?$', root_target):
+             raise ValueError(f"Target '{root_target}' looks like a numeric support value/internal node. Please use a stable identifier.")
+        
+        # Reroot
+        tree.root_with_outgroup(target_clade)
+        
+        # Build structure
+        new_structure = _clade_to_json(tree.root)
+        
+        # Update state
+        tree_json["root"] = root_target
+        tree_json["current_tree"] = "pruned"
+        tree_json["tree_structure"] = new_structure
+        
+        # Re-apply metadata
+        renames = tree_json.get("renames", {})
+        pruned_taxa = set(tree_json.get("pruned_taxa", []))
+        apply_state_to_structure(new_structure, renames, pruned_taxa)
+        
+        # Save physical file
+        valid_path = job_dir / "tree"
+        valid_path.mkdir(parents=True, exist_ok=True)
+        Phylo.write(tree, str(valid_path / "tree_pruned.newick"), "newick")
+        logging.info(f"Successfully wrote rerooted tree to {valid_path / 'tree_pruned.newick'}")
+        
+        return tree_json
+        
     except Exception as e:
-        logger.error(f"Failed to reroot tree: {e}")
+        logger.error(f"Reroot failed: {e}")
         raise e
 
     return tree_json
@@ -315,6 +312,165 @@ def _clade_to_json(clade):
         node["children"] = [_clade_to_json(c) for c in clade.clades]
     return node
 
+def _drop_confidence_when_named(tree) -> None:
+    """
+    Biopython Newick writer concatenates clade.name + clade.confidence.
+    If we set name (e.g., Node_12_100), confidence must be None to prevent 
+    outputting Node_12_100100.
+    """
+    for clade in tree.get_nonterminals():
+        if clade.name and clade.confidence is not None:
+            clade.confidence = None
+
+def ensure_unique_labels(tree) -> bool:
+    """
+    Traverse the tree and ensure every internal node has a unique name.
+    Tips are PROTECTED: Duplicate tip names will raise ValueError.
+    Internal nodes with no name or duplicate/numeric names will be assigned 'Node_{i}'.
+    Returns True if changes were made.
+    """
+    seen_names = set()
+    changes_made = False
+    counter = 1
+    
+    # Pass 1: Collect tip names and validate uniqueness
+    for clade in tree.get_terminals():
+        if not clade.name:
+             # Should practically never happen for a valid Newick tip, but strict check
+             raise ValueError("Tip node missing name")
+        if clade.name in seen_names:
+             raise ValueError(f"Duplicate tip name found: '{clade.name}'. Tips must be unique.")
+        seen_names.add(clade.name)
+        
+    # Pass 2: Handle Internal Nodes
+    # We want to preserve existing unique non-numeric internal names if possible
+    
+    # Collect existing internal names to avoid collisions
+    existing_internal_names = set()
+    for clade in tree.get_nonterminals():
+        if clade.name:
+            existing_internal_names.add(clade.name)
+
+    # Assign/Sanitize
+    seen_in_pass = set()
+    import re
+    numeric_pattern = re.compile(r'^\d+(\.\d+)?$')
+
+    for clade in tree.get_nonterminals():
+        original_name = clade.name
+        needs_rename = False
+        
+        # Check original numeric value (Name or Confidence)
+        original_numeric_match = None
+        if clade.name:
+            if numeric_pattern.match(clade.name):
+                # Filter out likely IDs (e.g. 6100)
+                try:
+                    val = float(clade.name)
+                    if val <= 100:
+                        original_numeric_match = clade.name
+                except ValueError:
+                    pass
+        elif clade.confidence is not None:
+             # Check confidence if name missing
+             conf_str = str(clade.confidence)
+             if numeric_pattern.match(conf_str):
+                 # Filter out likely IDs
+                 try:
+                    val = float(conf_str)
+                    if val <= 100:
+                        original_numeric_match = conf_str
+                 except ValueError:
+                    pass
+
+        # Criteria for renaming internal node:
+        # 1. Empty name
+        # 2. Duplicate of matched Tip (cannot clash with tips)
+        # 3. Duplicate of already seen internal name
+        # 4. Numeric name (often confused with support) OR we found a confidence value to merge
+        
+        if not clade.name:
+            needs_rename = True
+        elif clade.name in seen_names: # Clash with tip
+            needs_rename = True
+        elif clade.name in seen_in_pass: # Clash with other internal
+            needs_rename = True
+        elif original_numeric_match: # Numeric safety / preservation
+            needs_rename = True
+            
+        if needs_rename:
+            changes_made = True
+            # Generate unique name
+            while True:
+                candidate = f"Node_{counter}"
+                
+                # Hybrid Logic: If we are renaming a numeric node, preserve value
+                if original_numeric_match:
+                    candidate = f"{candidate}_{original_numeric_match}"
+                
+                # Must be unique globally (not in Tips, not in Existing Internal, not in Newly Assigned)
+                if (candidate not in seen_names and 
+                    candidate not in existing_internal_names and 
+                    candidate not in seen_in_pass):
+                    clade.name = candidate
+                    # Add to "existing" so we don't re-generate it
+                    existing_internal_names.add(candidate) 
+                    break
+                counter += 1
+        
+        if clade.name:
+            seen_in_pass.add(clade.name)
+            
+    # CRITICAL FIX: Prevent BioPython from doubling up (Name + Confidence)
+    _drop_confidence_when_named(tree)
+            
+    return changes_made
+
+def initialize_tree(job_dir: Path) -> Path:
+    """
+    Ensure tree_pruned.newick exists and has unique node labels.
+    If missing, copy original -> pruned, sanitize labels, and save.
+    Returns path to pruned tree.
+    """
+    pruned_path = job_dir / "tree" / "tree_pruned.newick"
+    original_path = job_dir / "tree" / "tree_original.newick"
+    
+    if pruned_path.exists():
+        return pruned_path
+        
+    if not original_path.exists():
+        raise FileNotFoundError("Original tree not found")
+        
+    if not HAS_BIOPYTHON:
+        # Just copy if we can't sanitize
+        shutil.copy(original_path, pruned_path)
+        return pruned_path
+        
+    try:
+        tree = Phylo.read(str(original_path), "newick")
+        ensure_unique_labels(tree)
+        
+        # Save to pruned
+        Phylo.write(tree, str(pruned_path), "newick")
+        
+        # Initialize basic state JSON too
+        tree_json = _clade_to_json(tree.root)
+        state = {
+            "current_tree": "pruned",
+            "tree_structure": tree_json,
+            "pruned_taxa": [],
+            "renames": {},
+            "root": None
+        }
+        save_tree_state(job_dir, state)
+        
+    except Exception as e:
+        logger.error(f"Failed to initialize tree: {e}")
+        # Fallback copy
+        shutil.copy(original_path, pruned_path)
+        
+    return pruned_path
+
 def json_to_newick(tree_json: Dict) -> str:
     """
     Serialize JSON tree back to Newick.
@@ -324,14 +480,6 @@ def json_to_newick(tree_json: Dict) -> str:
     
     def _node_to_newick(n):
         name = n.get("name", "")
-        # Use display_name if available and different? 
-        # Usually Newick uses the identifier. 
-        # If we renamed, we might want to output the new name?
-        # The prompt says "Change display_name of a tip. Preserve original_name."
-        # But for recomputation, we might need the original names if they match the FASTA.
-        # However, if we pruned, we are generating a new tree.
-        # Let's stick to 'name' which should be the identifier.
-        
         length = n.get("branch_length")
         length_str = f":{length}" if length is not None else ""
         

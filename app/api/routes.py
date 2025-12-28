@@ -117,6 +117,8 @@ def reroot_tree_endpoint(job_id):
         state = reroot_tree(job_dir, state, target)
         save_tree_state(job_dir, state)
         return jsonify(state)
+    except ValueError as e:
+        return jsonify({"status": "error", "error": str(e)}), 400
     except Exception as e:
         return jsonify({"status": "error", "error": str(e)}), 500
 
@@ -186,11 +188,19 @@ def download_newick(job_id):
     if not job_dir.exists():
         return jsonify({"status": "error", "error": "Job not found"}), 404
         
-    # Prefer pruned tree if available, else original
+    # Prefer pruned tree if available, else initialize from original
     pruned_path = job_dir / "tree" / "tree_pruned.newick"
-    original_path = job_dir / "tree" / "tree_original.newick"
     
-    path = pruned_path if pruned_path.exists() else original_path
+    if not pruned_path.exists():
+        try:
+            from app.services.tree_edit_service import initialize_tree
+            pruned_path = initialize_tree(job_dir)
+        except Exception as e:
+            logging.error(f"Failed to auto-init tree: {e}")
+            # Fallback to original if initialization fails
+            pruned_path = job_dir / "tree" / "tree_original.newick"
+    
+    path = pruned_path
     if not path.exists():
         return jsonify({"status": "error", "error": "Tree file not found"}), 404
         
@@ -221,17 +231,6 @@ def download_newick_pruned(job_id):
         return jsonify({"status": "error", "error": "Job not found"}), 404
         
     path = job_dir / "tree" / "tree_pruned.newick"
-    if not path.exists():
-        # Fallback to original if no pruned exists? 
-        # Or return 404 to indicate no edits yet?
-        # User requested specific "pruned" link. 
-        # Let's fallback to original but maybe warn? 
-        # Actually better to just return original if checking "current" state in UI 
-        # but here we want EXPLICIT. 
-        # Let's return 404 if not pruned to be strict, causing UI to potentially disable link? 
-        # Or just fallback.
-        # Let's fallback for safety but name it correctly.
-        path = job_dir / "tree" / "tree_original.newick"
     
     if not path.exists():
          return jsonify({"status": "error", "error": "Tree file not found"}), 404
