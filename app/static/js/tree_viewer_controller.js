@@ -68,10 +68,21 @@ document.addEventListener('DOMContentLoaded', async () => {
 
         const viewerType = viewerSelect ? viewerSelect.value : 'phylotree';
 
-        // Read thresholds
-        const ppThreshold = parseFloat(document.getElementById('input-pp-threshold')?.value || 0.9);
-        const bsThreshold = parseFloat(document.getElementById('input-bs-threshold')?.value || 70);
+        // Read thresholds & Filter Low Checkbox
+        const filterLow = document.getElementById('cb-hide-low-support')?.checked;
+
+        let ppThreshold = 0;
+        let bsThreshold = 0;
+
+        if (filterLow) {
+            ppThreshold = parseFloat(document.getElementById('input-pp-threshold')?.value || 0.9);
+            bsThreshold = parseFloat(document.getElementById('input-bs-threshold')?.value || 70);
+        }
         const minTips = parseInt(document.getElementById('input-min-tips')?.value || 0);
+
+        // Read Font Sizing
+        const supportBase = parseInt(document.getElementById('input-support-font')?.value || 9);
+        const tipBase = parseInt(document.getElementById('input-tip-font')?.value || 12);
 
         // Shared Callbacks
         const callbacks = {
@@ -93,7 +104,9 @@ document.addEventListener('DOMContentLoaded', async () => {
                         showSupport: showSupport,
                         ppThreshold: ppThreshold,
                         bootstrapThreshold: bsThreshold,
-                        minTips: minTips
+                        minTips: minTips,
+                        supportBasePx: supportBase,
+                        tipBasePx: tipBase
                     });
                 } catch (err) {
                     if (container) container.textContent = `Failed to load Newick: ${err.message}`;
@@ -128,7 +141,21 @@ document.addEventListener('DOMContentLoaded', async () => {
         inputMinTips.addEventListener('change', () => renderTree());
     }
 
-    if (viewerSelect) viewerSelect.addEventListener('change', () => renderTree());
+    // Font Listeners (Trigger re-render for simplicity, or could trigger sizing if we exposed it)
+    function applyTextSizingOnlyOrRender() {
+        if (container && typeof container.__applyTextSizingFromZoom === "function") {
+            container.__applyTextSizingFromZoom();
+        } else {
+            renderTree();
+        }
+    }
+
+    const inputSupportFont = getEl('input-support-font');
+    if (inputSupportFont) inputSupportFont.addEventListener('input', applyTextSizingOnlyOrRender);
+
+    const inputTipFont = getEl('input-tip-font');
+    if (inputTipFont) inputTipFont.addEventListener('input', applyTextSizingOnlyOrRender);
+
 
     if (btnPrune) btnPrune.addEventListener('click', async () => {
         if (!selectedNode || !confirm(`Prune ${selectedNode.name}?`)) return;

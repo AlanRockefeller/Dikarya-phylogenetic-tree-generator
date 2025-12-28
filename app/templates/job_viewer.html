@@ -48,10 +48,23 @@
                                 <span class="input-group-text">BS ></span>
                                 <input type="number" id="input-bs-threshold" class="form-control" value="70" step="5"
                                     min="0" max="100" style="width: 60px;" title="Bootstrap Support Threshold">
-                                <span class="input-group-text"
-                                    title="Only show support for nodes with >= N descendant tips">Tips >=</span>
+                                <div class="input-group-text">
+                                    <input class="form-check-input mt-0" type="checkbox" id="cb-hide-low-support"
+                                        aria-label="Hide low support">
+                                    <span class="ms-1">Filter Low</span>
+                                </div>
+                            </div>
+
+                            <div class="input-group input-group-sm ms-2" style="width: auto;">
+                                <span class="input-group-text">Tips >=</span>
                                 <input type="number" id="input-min-tips" class="form-control" value="0" step="1" min="0"
-                                    style="width: 60px;" title="Min Descendant Tips">
+                                    style="width: 50px;" title="Min Descendant Tips">
+                                <span class="input-group-text">Support Font</span>
+                                <input type="number" id="input-support-font" class="form-control" value="9" step="1"
+                                    min="6" max="24" style="width: 50px;">
+                                <span class="input-group-text">Tip Font</span>
+                                <input type="number" id="input-tip-font" class="form-control" value="12" step="1"
+                                    min="8" max="24" style="width: 50px;">
                             </div>
 
                             <div class="btn-group btn-group-sm" role="group">
