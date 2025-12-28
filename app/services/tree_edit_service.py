@@ -109,17 +109,95 @@ def rename_tip(tree_json: Dict, old_name: str, new_name: str) -> Dict:
         
     return tree_json
 
-def reroot_tree(tree_json: Dict, root_target: str) -> Dict:
+def reroot_tree(job_dir: Path, tree_json: Dict, root_target: str) -> Dict:
     """
     Reroot using any valid node (tip or internal). 
-    Update tree_json's root.
+    Update tree_json's root and save the modified tree to tree_pruned.newick.
     """
-    # For Part 7, we might just store the root target in metadata
-    # Actual rerooting requires tree manipulation logic (BioPython)
-    # If we have BioPython, we can try to reroot the structure.
-    # But re-serializing to JSON structure is complex.
-    # For now, let's store the intent.
-    tree_json["root"] = root_target
+    if not HAS_BIOPYTHON:
+        return tree_json # Return unchanged if no library
+
+    # Determine input path: prefer existing modified tree
+    pruned_newick = job_dir / "tree" / "tree_pruned.newick"
+    original_newick = job_dir / "tree" / "tree_original.newick"
+    
+    input_path = pruned_newick if pruned_newick.exists() else original_newick
+    if not input_path.exists():
+        raise FileNotFoundError("No tree file found to reroot")
+
+    try:
+        # Load the tree
+        tree = Phylo.read(str(input_path), "newick")
+        
+        # Find the target clade
+        target_clade = None
+        # Check root first
+        if tree.root.name == root_target:
+            # Already rooted here? Or user wants to re-assert?
+            target_clade = tree.root
+        else:
+            # Search all clades
+            cls = list(tree.find_clades(name=root_target))
+            if cls:
+                target_clade = cls[0]
+        
+        if target_clade:
+            # Reroot
+            tree.root_with_outgroup(target_clade)
+            
+            # Save results to 'pruned' filenames to indicate modification
+            # This ensures download_newick serves this files
+            out_newick = job_dir / "tree" / "tree_pruned.newick"
+            out_nexus = job_dir / "tree" / "tree_pruned.nexus"
+            
+            Phylo.write(tree, str(out_newick), "newick")
+            logger.info(f"Successfully wrote rerooted tree to {out_newick}")
+            
+            # Also try to write Nexus for consistency
+            try:
+                Phylo.write(tree, str(out_nexus), "nexus")
+            except Exception as ex:
+                logger.warning(f"Failed to write Nexus rerooted tree: {ex}")
+
+            # Update state
+            tree_json["root"] = root_target
+            tree_json["current_tree"] = "pruned"
+            
+            # Update the cached JSON structure to match the new topology
+            new_structure = _clade_to_json(tree.root)
+            
+            # Re-apply metadata (renames and pruned status)
+            renames = tree_json.get("renames", {})
+            pruned_taxa = set(tree_json.get("pruned_taxa", []))
+            
+            def reapply_metadata(node):
+                original_name = node.get("original_name")
+                # Name might be None for internal nodes
+                if original_name:
+                    # Apply Rename
+                    if original_name in renames:
+                        node["display_name"] = renames[original_name]
+                    
+                    # Apply Prune
+                    if original_name in pruned_taxa:
+                        node["pruned"] = True
+                        
+                if "children" in node:
+                    for child in node["children"]:
+                        reapply_metadata(child)
+                        
+            reapply_metadata(new_structure)
+            tree_json["tree_structure"] = new_structure
+            
+        else:
+            logger.warning(f"Reroot target '{root_target}' not found in tree")
+            # We don't error out, just don't reroot? Or should we error?
+            # If the user clicked it, it should exist.
+            
+    except Exception as e:
+        logger.error(f"Failed to reroot tree: {e}")
+        raise e
+
     return tree_json
 
 def extract_pruned_fasta(original_fasta: Path, tree_json: Dict, output_fasta: Path) -> None:

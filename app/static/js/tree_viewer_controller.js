@@ -26,7 +26,8 @@ document.addEventListener('DOMContentLoaded', async () => {
     };
 
     if (JOB_ID !== "unknown") {
-        setupLink('newick-link', `/api/job/${JOB_ID}/download/tree/newick`);
+        setupLink('newick-link-original', `/api/job/${JOB_ID}/download/tree/newick/original`);
+        setupLink('newick-link-pruned', `/api/job/${JOB_ID}/download/tree/newick/pruned`);
         setupLink('nexus-link', `/api/job/${JOB_ID}/download/tree/nexus`);
         setupLink('fasta-pruned', `/api/job/${JOB_ID}/download/fasta/pruned`);
         setupLink('fasta-original', `/api/job/${JOB_ID}/download/fasta/original`);
@@ -56,7 +57,8 @@ document.addEventListener('DOMContentLoaded', async () => {
         const hasSelection = !!selectedNode;
         if (btnPrune) btnPrune.disabled = !hasSelection;
         if (btnRename) btnRename.disabled = !hasSelection;
-        if (btnReroot) btnReroot.disabled = !hasSelection;
+        // Reroot safe only on tips for now
+        if (btnReroot) btnReroot.disabled = !hasSelection || !selectedNode.is_leaf;
     }
 
     // 7. Main Render Logic

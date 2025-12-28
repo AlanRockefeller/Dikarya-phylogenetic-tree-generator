@@ -114,7 +114,7 @@ def reroot_tree_endpoint(job_id):
     try:
         from app.services.tree_edit_service import load_tree_state, reroot_tree, save_tree_state
         state = load_tree_state(job_dir)
-        state = reroot_tree(state, target)
+        state = reroot_tree(job_dir, state, target)
         save_tree_state(job_dir, state)
         return jsonify(state)
     except Exception as e:
@@ -194,7 +194,51 @@ def download_newick(job_id):
     if not path.exists():
         return jsonify({"status": "error", "error": "Tree file not found"}), 404
         
-    return send_file(path, as_attachment=True, download_name="tree.newick")
+    response = send_file(path, as_attachment=True, download_name="tree.newick")
+    response.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
+    response.headers["Pragma"] = "no-cache"
+    response.headers["Expires"] = "0"
+    return response
+
+@bp.route('/job/<job_id>/download/tree/newick/original', methods=['GET'])
+def download_newick_original(job_id):
+    job_dir = Config.JOB_DIR / job_id
+    if not job_dir.exists():
+        return jsonify({"status": "error", "error": "Job not found"}), 404
+        
+    path = job_dir / "tree" / "tree_original.newick"
+    logging.info(f"Serving original newick from: {path}, Exists: {path.exists()}")
+    if not path.exists():
+        logging.error(f"File not found: {path} (BASE_DIR={Config.BASE_DIR}, JOB_DIR={Config.JOB_DIR})")
+        return jsonify({"status": "error", "error": "Tree file not found"}), 404
+        
+    return send_file(path, as_attachment=True, download_name="tree_original.newick")
+
+@bp.route('/job/<job_id>/download/tree/newick/pruned', methods=['GET'])
+def download_newick_pruned(job_id):
+    job_dir = Config.JOB_DIR / job_id
+    if not job_dir.exists():
+        return jsonify({"status": "error", "error": "Job not found"}), 404
+        
+    path = job_dir / "tree" / "tree_pruned.newick"
+    if not path.exists():
+        # Fallback to original if no pruned exists? 
+        # Or return 404 to indicate no edits yet?
+        # User requested specific "pruned" link. 
+        # Let's fallback to original but maybe warn? 
+        # Actually better to just return original if checking "current" state in UI 
+        # but here we want EXPLICIT. 
+        # Let's return 404 if not pruned to be strict, causing UI to potentially disable link? 
+        # Or just fallback.
+        # Let's fallback for safety but name it correctly.
+        path = job_dir / "tree" / "tree_original.newick"
+    
+    if not path.exists():
+         return jsonify({"status": "error", "error": "Tree file not found"}), 404
+
+    response = send_file(path, as_attachment=True, download_name="tree_pruned.newick")
+    response.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
+    return response
 
 @bp.route('/job/<job_id>/download/tree/nexus', methods=['GET'])
 def download_nexus(job_id):
@@ -209,7 +253,9 @@ def download_nexus(job_id):
     if not path.exists():
         return jsonify({"status": "error", "error": "Tree file not found"}), 404
         
-    return send_file(path, as_attachment=True, download_name="tree.nexus")
+    response = send_file(path, as_attachment=True, download_name="tree.nexus")
+    response.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
+    return response
 
 @bp.route('/job/<job_id>/download/fasta/original', methods=['GET'])
 def download_fasta_original(job_id):

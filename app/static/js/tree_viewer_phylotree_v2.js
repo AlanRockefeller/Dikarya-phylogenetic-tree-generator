@@ -143,7 +143,12 @@
 
                         // Callback
                         const nodeName = d.data.name;
-                        if (nodeName) callbacks.onTipClick({ name: nodeName, display_name: nodeName });
+                        const isLeaf = !d.children || d.children.length === 0;
+                        if (nodeName) callbacks.onTipClick({
+                            name: nodeName,
+                            display_name: nodeName,
+                            is_leaf: isLeaf
+                        });
                     });
                 }
 
