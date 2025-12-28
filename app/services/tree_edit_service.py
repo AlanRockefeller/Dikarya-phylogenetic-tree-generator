@@ -161,12 +161,6 @@ def reroot_tree(job_dir: Path, tree_json: Dict, root_target: str) -> Dict:
             
         target_clade = matches[0]
         
-        # Check numeric safety ONLY for internal nodes
-        # If it's a Tip, numeric names (e.g. identifiers) are allowed.
-        import re
-        if not target_clade.is_terminal() and re.match(r'^\d+(\.\d+)?$', root_target):
-             raise ValueError(f"Target '{root_target}' looks like a numeric support value/internal node. Please use a stable identifier.")
-        
         # Reroot
         tree.root_with_outgroup(target_clade)
         
@@ -322,6 +316,16 @@ def _drop_confidence_when_named(tree) -> None:
         if clade.name and clade.confidence is not None:
             clade.confidence = None
 
+def _drop_confidence_when_named(tree) -> None:
+    """
+    Biopython Newick writer concatenates clade.name + clade.confidence.
+    If we set name (e.g., Node_12_100), confidence must be None to prevent 
+    outputting Node_12_100100.
+    """
+    for clade in tree.get_nonterminals():
+        if clade.name and clade.confidence is not None:
+            clade.confidence = None
+
 def ensure_unique_labels(tree) -> bool:
     """
     Traverse the tree and ensure every internal node has a unique name.
@@ -357,13 +361,15 @@ def ensure_unique_labels(tree) -> bool:
     numeric_pattern = re.compile(r'^\d+(\.\d+)?$')
 
     for clade in tree.get_nonterminals():
-        original_name = clade.name
         needs_rename = False
         
         # Check original numeric value (Name or Confidence)
         original_numeric_match = None
+        is_numeric_name = False
+        
         if clade.name:
             if numeric_pattern.match(clade.name):
+                is_numeric_name = True
                 # Filter out likely IDs (e.g. 6100)
                 try:
                     val = float(clade.name)
@@ -387,7 +393,7 @@ def ensure_unique_labels(tree) -> bool:
         # 1. Empty name
         # 2. Duplicate of matched Tip (cannot clash with tips)
         # 3. Duplicate of already seen internal name
-        # 4. Numeric name (often confused with support) OR we found a confidence value to merge
+        # 4. Numeric name (matches regex) - sanitize to avoid confusion
         
         if not clade.name:
             needs_rename = True
@@ -395,7 +401,7 @@ def ensure_unique_labels(tree) -> bool:
             needs_rename = True
         elif clade.name in seen_in_pass: # Clash with other internal
             needs_rename = True
-        elif original_numeric_match: # Numeric safety / preservation
+        elif is_numeric_name: # Numeric safety
             needs_rename = True
             
         if needs_rename:
@@ -404,9 +410,11 @@ def ensure_unique_labels(tree) -> bool:
             while True:
                 candidate = f"Node_{counter}"
                 
-                # Hybrid Logic: If we are renaming a numeric node, preserve value
+                # Hybrid Logic: If we are renaming, preserve value if we found one
                 if original_numeric_match:
                     candidate = f"{candidate}_{original_numeric_match}"
+                    
+                counter += 1
                 
                 # Must be unique globally (not in Tips, not in Existing Internal, not in Newly Assigned)
                 if (candidate not in seen_names and 
@@ -414,14 +422,18 @@ def ensure_unique_labels(tree) -> bool:
                     candidate not in seen_in_pass):
                     clade.name = candidate
                     # Add to "existing" so we don't re-generate it
-                    existing_internal_names.add(candidate) 
+                    existing_internal_names.add(candidate)
+                    
+                    # CRITICAL: Since we renamed (and potentially baked value into name),
+                    # clear confidence to prevent duplication by BioPython
+                    clade.confidence = None
                     break
-                counter += 1
         
         if clade.name:
             seen_in_pass.add(clade.name)
             
     # CRITICAL FIX: Prevent BioPython from doubling up (Name + Confidence)
+    # This applies to ALL named internal nodes, whether we renamed them or they came named.
     _drop_confidence_when_named(tree)
             
     return changes_made

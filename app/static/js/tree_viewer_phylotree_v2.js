@@ -223,7 +223,22 @@
 
                 if (!label) return;
                 const numValue = parseFloat(label);
-                if (isNaN(numValue) || numValue < 0) return; // Allow > 100? Some tools output counts. Standard is 0-100 or 0-1.
+
+                // Sanity Check & Formatting Domain
+                let displayValue = "";
+
+                if (isNaN(numValue)) {
+                    return;
+                } else if (numValue >= 0 && numValue <= 1) {
+                    // Posterior Probability: 0.0 - 1.0 -> Show 2 decimals (e.g. 0.95)
+                    displayValue = numValue.toFixed(2);
+                } else if (numValue > 1 && numValue <= 100) {
+                    // Bootstrap: 1 - 100 -> Show integer (e.g. 85)
+                    displayValue = Math.round(numValue).toString();
+                } else {
+                    // Out of sane range (e.g. < 0 or > 100) -> Ignore (likely garbage or ID)
+                    return;
+                }
 
                 let text = group.select("text.node-support-value");
                 if (text.empty()) {
@@ -237,7 +252,7 @@
                     .style("font-weight", "bold")
                     .style("fill", "#c00")
                     .style("pointer-events", "none")
-                    .text(numValue > 1 ? Math.round(numValue) : numValue.toFixed(2))
+                    .text(displayValue)
                     .style("display", "block");
             });
         }

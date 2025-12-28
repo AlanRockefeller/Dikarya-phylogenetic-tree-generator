@@ -89,28 +89,6 @@ document.addEventListener('DOMContentLoaded', async () => {
                     renderPhylotree(newick, 'tree-container', callbacks, {
                         showSupport: showSupport
                     });
-
-                    // Update Pruned Link Status (After main fetch ensures initialization)
-                    const prunedLink = getEl('newick-link-pruned');
-                    if (prunedLink) {
-                        try {
-                            const resp = await fetch(`/api/job/${JOB_ID}/download/tree/newick/pruned`, {
-                                method: 'GET',
-                                headers: { 'Range': 'bytes=0-0' }
-                            });
-                            if (resp.ok || resp.status === 206) {
-                                prunedLink.classList.remove('disabled');
-                                prunedLink.style.pointerEvents = 'auto';
-                                prunedLink.style.color = '';
-                            } else {
-                                prunedLink.classList.add('disabled');
-                                prunedLink.style.pointerEvents = 'none';
-                                prunedLink.style.color = 'gray';
-                            }
-                        } catch (e) {
-                            console.warn("Failed to check pruned tree status", e);
-                        }
-                    }
                 } catch (err) {
                     if (container) container.textContent = `Failed to load Newick: ${err.message}`;
                 }
