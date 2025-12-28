@@ -18,10 +18,11 @@ const TreeEditActions = {
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ tip_name: tipName })
         });
+        const data = await response.json().catch(() => ({}));
         if (!response.ok) {
-            throw new Error(`Failed to prune: ${response.status}`);
+            throw new Error(data.error || `Failed to prune: ${response.status}`);
         }
-        return await response.json();
+        return data;
     },
 
     async renameTip(jobId, oldName, newName) {
@@ -30,22 +31,36 @@ const TreeEditActions = {
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ old_name: oldName, new_name: newName })
         });
+        const data = await response.json().catch(() => ({}));
         if (!response.ok) {
-            throw new Error(`Failed to rename: ${response.status}`);
+            throw new Error(data.error || `Failed to rename: ${response.status}`);
         }
-        return await response.json();
+        return data;
     },
 
     async reroot(jobId, nodeName) {
         const response = await fetch(`/api/job/${jobId}/tree/reroot`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ node_name: nodeName })
+            // Send the field the backend expects; include legacy names for compatibility
+            body: JSON.stringify({ root_target: nodeName, target: nodeName, node_name: nodeName })
         });
+        const data = await response.json().catch(() => ({}));
         if (!response.ok) {
-            throw new Error(`Failed to reroot: ${response.status}`);
+            throw new Error(data.error || `Failed to reroot: ${response.status}`);
         }
-        return await response.json();
+        return data;
+    },
+
+    async midpointRoot(jobId) {
+        const response = await fetch(`/api/job/${jobId}/tree/midpoint_root`, {
+            method: 'POST'
+        });
+        const data = await response.json().catch(() => ({}));
+        if (!response.ok) {
+            throw new Error(data.error || "Midpoint root failed");
+        }
+        return data;
     },
 
     async recomputeTree(jobId) {
@@ -54,9 +69,10 @@ const TreeEditActions = {
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({})
         });
+        const data = await response.json().catch(() => ({}));
         if (!response.ok) {
-            throw new Error(`Failed to recompute: ${response.status}`);
+            throw new Error(data.error || `Failed to recompute: ${response.status}`);
         }
-        return await response.json();
+        return data;
     }
 };

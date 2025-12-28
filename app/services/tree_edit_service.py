@@ -151,24 +151,38 @@ def reroot_tree(job_dir: Path, tree_json: Dict, root_target: str) -> Dict:
         if not root_target:
              raise ValueError("Reroot target cannot be empty")
              
-        # Find the target clade
-        matches = list(tree.find_clades(name=root_target))
+        # Find the target clade (search ANY clade, not just terminals)
+        target_clade = None
+        for clade in tree.find_clades():
+            if clade.name == root_target:
+                target_clade = clade
+                break
         
-        if len(matches) == 0:
-            raise ValueError(f"Target node '{root_target}' not found")
-        elif len(matches) > 1:
-            raise ValueError(f"Target node '{root_target}' is ambiguous ({len(matches)} matches)")
-            
-        target_clade = matches[0]
+        if target_clade is None:
+             # Useful debug info in the error
+             internal = [c.name for c in tree.get_nonterminals() if c.name][:15]
+             tips = [c.name for c in tree.get_terminals() if c.name][:15]
+             raise ValueError(
+                f"Root target not found: {root_target}. "
+                f"Example internal names: {internal}. Example tip names: {tips}"
+             )
         
         # Reroot
         tree.root_with_outgroup(target_clade)
         
+        # Ladderize (Deterministic)
+        ladderize_tree(tree)
+
+        # FIX: Ensure confidence is dropped for named nodes before saving/returning
+        _drop_confidence_when_named(tree)
+
         # Build structure
         new_structure = _clade_to_json(tree.root)
         
         # Update state
         tree_json["root"] = root_target
+        tree_json["root_mode"] = "TIP"
+        tree_json["root_target"] = root_target
         tree_json["current_tree"] = "pruned"
         tree_json["tree_structure"] = new_structure
         
@@ -187,9 +201,76 @@ def reroot_tree(job_dir: Path, tree_json: Dict, root_target: str) -> Dict:
         
     except Exception as e:
         logger.error(f"Reroot failed: {e}")
-        raise e
+        raise
 
     return tree_json
+
+def midpoint_root(job_dir: Path, tree_json: Dict) -> Dict:
+    """
+    Reroot tree at midpoint.
+    Requires branch lengths.
+    """
+    if not HAS_BIOPYTHON:
+        raise RuntimeError("Biopython not installed; midpoint rooting unavailable")
+
+    # Determine input path
+    pruned_newick = job_dir / "tree" / "tree_pruned.newick"
+    original_newick = job_dir / "tree" / "tree_original.newick"
+    
+    input_path = pruned_newick if pruned_newick.exists() else original_newick
+    if not input_path.exists():
+        raise FileNotFoundError("No tree file found to reroot")
+
+    try:
+        tree = Phylo.read(str(input_path), "newick")
+        
+        # Check for branch lengths
+        # Heuristic: Verify we have at least one positive branch length.
+        has_lengths = any((c.branch_length or 0) > 0 for c in tree.find_clades())
+        if not has_lengths:
+             raise ValueError("Cannot perform midpoint rooting: Tree has no valid branch lengths.")
+
+        # Attempt BioPython midpoint rooting
+        # This modifies the tree in-place usually, but sometimes returns new tree depending on version.
+        # Phylo.NewickIO check: root_at_midpoint modifies in place.
+        try:
+            tree.root_at_midpoint()
+        except Exception as e:
+            logger.warning(f"Midpoint rooting failed (Math domain or topology?): {e}")
+            raise ValueError(f"Midpoint rooting failed: {e}") from e
+
+        # Ladderize (Deterministic)
+        ladderize_tree(tree)
+
+        # FIX: Ensure confidence is dropped for named nodes before saving/returning
+        _drop_confidence_when_named(tree)
+
+        # Build structure
+        new_structure = _clade_to_json(tree.root)
+        
+        # Update state
+        tree_json["root"] = None
+        tree_json["root_mode"] = "MIDPOINT"
+        tree_json["root_target"] = None
+        tree_json["current_tree"] = "pruned"
+        tree_json["tree_structure"] = new_structure
+        
+        # Re-apply metadata
+        renames = tree_json.get("renames", {})
+        pruned_taxa = set(tree_json.get("pruned_taxa", []))
+        apply_state_to_structure(new_structure, renames, pruned_taxa)
+        
+        # Save physical file
+        valid_path = job_dir / "tree"
+        valid_path.mkdir(parents=True, exist_ok=True)
+        Phylo.write(tree, str(valid_path / "tree_pruned.newick"), "newick")
+        
+        return tree_json
+        
+    except Exception as e:
+        logger.error(f"Midpoint root failed: {e}")
+        raise
+
 
 def extract_pruned_fasta(original_fasta: Path, tree_json: Dict, output_fasta: Path) -> None:
     """
@@ -306,15 +387,6 @@ def _clade_to_json(clade):
         node["children"] = [_clade_to_json(c) for c in clade.clades]
     return node
 
-def _drop_confidence_when_named(tree) -> None:
-    """
-    Biopython Newick writer concatenates clade.name + clade.confidence.
-    If we set name (e.g., Node_12_100), confidence must be None to prevent 
-    outputting Node_12_100100.
-    """
-    for clade in tree.get_nonterminals():
-        if clade.name and clade.confidence is not None:
-            clade.confidence = None
 
 def _drop_confidence_when_named(tree) -> None:
     """
@@ -424,8 +496,7 @@ def ensure_unique_labels(tree) -> bool:
                     # Add to "existing" so we don't re-generate it
                     existing_internal_names.add(candidate)
                     
-                    # CRITICAL: Since we renamed (and potentially baked value into name),
-                    # clear confidence to prevent duplication by BioPython
+                    # Probably not needed, but just in case
                     clade.confidence = None
                     break
         
@@ -435,8 +506,64 @@ def ensure_unique_labels(tree) -> bool:
     # CRITICAL FIX: Prevent BioPython from doubling up (Name + Confidence)
     # This applies to ALL named internal nodes, whether we renamed them or they came named.
     _drop_confidence_when_named(tree)
-            
+    
     return changes_made
+
+def ladderize_tree(tree, ascending: bool = False):
+    """
+    Sorts clades in-place to ensure deterministic visual output.
+    Sort keys:
+      1. Number of descendant tips (size).
+      2. Lexicographically smallest tip name (min_leaf_name).
+    """
+    
+    # Pre-calculate metrics to avoid re-traversing constantly
+    # We'll attach temp attributes to nodes
+    
+    def get_metrics(clade):
+        if hasattr(clade, "_ladder_metrics"):
+            return clade._ladder_metrics
+            
+        if clade.is_terminal():
+            count = 1
+            min_name = clade.name or ""
+        else:
+            count = 0
+            min_name = None
+            for c in clade.clades:
+                c_metrics = get_metrics(c)
+                count += c_metrics[0]
+                c_min = c_metrics[1]
+                if min_name is None or (c_min is not None and c_min < min_name):
+                    min_name = c_min
+                    
+            if min_name is None: min_name = "" # Should not happen if tips named
+            
+        clade._ladder_metrics = (count, min_name)
+        return (count, min_name)
+
+    # Calculate all metrics from root
+    get_metrics(tree.root)
+    
+    # Sort recursively
+    def sort_clade(clade):
+        if not clade.is_terminal():
+            # Sort children
+            # Python's sort is stable.
+            # We want primary: count, secondary: min_name
+            # If ascending=True: Small counts first.
+            
+            clade.clades.sort(key=lambda c: (c._ladder_metrics[0], c._ladder_metrics[1]), reverse=not ascending)
+            
+            for c in clade.clades:
+                sort_clade(c)
+
+    sort_clade(tree.root)
+    
+    # Cleanup
+    for clade in tree.find_clades():
+        if hasattr(clade, "_ladder_metrics"):
+            del clade._ladder_metrics
 
 def initialize_tree(job_dir: Path) -> Path:
     """

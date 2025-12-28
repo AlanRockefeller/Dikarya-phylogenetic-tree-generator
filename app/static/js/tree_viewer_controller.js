@@ -17,6 +17,7 @@ document.addEventListener('DOMContentLoaded', async () => {
     const btnPrune = getEl('btn-prune');
     const btnRename = getEl('btn-rename');
     const btnReroot = getEl('btn-reroot');
+    const btnMidpoint = getEl('btn-midpoint');
     const btnRecompute = getEl('btn-recompute');
 
     // 3. Setup Download Links (Safe Mode)
@@ -38,6 +39,8 @@ document.addEventListener('DOMContentLoaded', async () => {
     let currentTreeState = null;
     let selectedNode = null;
     let showSupport = true;
+    let rerootMode = false;
+    let isProcessing = false;
 
     // 5. Helper: Status Message
     function showStatus(msg, type, timeout = 0) {
@@ -57,8 +60,93 @@ document.addEventListener('DOMContentLoaded', async () => {
         const hasSelection = !!selectedNode;
         if (btnPrune) btnPrune.disabled = !hasSelection;
         if (btnRename) btnRename.disabled = !hasSelection;
-        // Enable reroot if selected AND has a name (identifier)
-        if (btnReroot) btnReroot.disabled = !hasSelection || !selectedNode.name;
+
+        // Reroot Logic: 
+        // Always enabled if tree is loaded (we assume tree is loaded if buttons are visible/active)
+        // If in rerootMode, maybe show it as "Cancel Reroot"? 
+        // For now, we handle toggle in click.
+        if (btnReroot) {
+            btnReroot.disabled = false; // Always enabled to enter mode
+            if (rerootMode) {
+                btnReroot.classList.add("active");
+                btnReroot.innerHTML = '<i class="fa fa-times"></i> Cancel Reroot';
+            } else {
+                btnReroot.classList.remove("active");
+                btnReroot.innerHTML = '<i class="fa fa-map-pin"></i> Reroot';
+            }
+        }
+    }
+
+    // --- REROOT CAPTURE LOGIC START ---
+    let rerootCaptureHandler = null;
+
+    function installRerootCapture() {
+        if (!container || rerootCaptureHandler) return;
+
+        rerootCaptureHandler = async (e) => {
+            if (!rerootMode) return;
+
+            // Only care about nodes
+            const g = e.target.closest('g.node, g.internal-node');
+            if (!g) return;
+
+            // Kill phylotree's menu/click handlers
+            e.preventDefault();
+            e.stopPropagation();
+            if (e.stopImmediatePropagation) e.stopImmediatePropagation();
+
+            // Pull the bound D3 datum from the node group
+            let d = null;
+            try {
+                d = window.d3v7.select(g).datum();
+            } catch (_) { }
+
+            const nodeName = d?.data?.name || d?.data?.id || d?.name;
+            if (!nodeName) {
+                showStatus("Can't reroot: clicked node has no stable identifier.", "warning", 2500);
+                return;
+            }
+
+            try {
+                isProcessing = true;
+                updateButtons();
+                console.log("reroot click datum:", d, "nodeName:", nodeName);
+                showStatus(`Rerooting at ${nodeName}...`, "info");
+                currentTreeState = await TreeEditActions.reroot(JOB_ID, nodeName);
+
+                // Success: exit mode and refresh
+                rerootMode = false;
+                selectedNode = null;
+                removeRerootCapture(); // Important: cleanup
+                await renderTree();
+                showStatus("Rerooted successfully.", "success", 2000);
+            } catch (err) {
+                rerootMode = false;
+                removeRerootCapture();
+                showStatus(`Reroot failed: ${err.message}`, "danger");
+            } finally {
+                isProcessing = false;
+                updateButtons();
+            }
+        };
+
+        // Capture-phase listeners so we beat phylotree's handlers
+        container.addEventListener("click", rerootCaptureHandler, true);
+        container.addEventListener("contextmenu", rerootCaptureHandler, true); // extra: suppress menu
+    }
+
+    function removeRerootCapture() {
+        if (!container || !rerootCaptureHandler) return;
+        container.removeEventListener("click", rerootCaptureHandler, true);
+        container.removeEventListener("contextmenu", rerootCaptureHandler, true);
+        rerootCaptureHandler = null;
+    }
+
+    function exitRerootMode() {
+        rerootMode = false;
+        removeRerootCapture();
+        showStatus("Reroot cancelled.", "info", 1000);
+        updateButtons();
     }
 
     // 7. Main Render Logic
@@ -193,15 +281,35 @@ document.addEventListener('DOMContentLoaded', async () => {
     });
 
     if (btnReroot) btnReroot.addEventListener('click', async () => {
-        if (!selectedNode || !confirm(`Reroot at ${selectedNode.name}?`)) return;
+        if (rerootMode) {
+            exitRerootMode();
+        } else {
+            rerootMode = true;
+            selectedNode = null; // Clear selection to avoid confusion
+            installRerootCapture();
+            updateButtons();
+            showStatus("Click a node to reroot the tree (Esc to cancel).", "info", 0);
+        }
+    });
+
+    // Midpoint Button
+    if (btnMidpoint) btnMidpoint.addEventListener('click', async () => {
+        if (isProcessing) return;
         try {
-            showStatus("Rerooting...", "info");
-            await TreeEditActions.reroot(JOB_ID, selectedNode.name);
+            showStatus("Midpoint rooting... (Server calculating)", "info");
+            currentTreeState = await TreeEditActions.midpointRoot(JOB_ID);
+            // Midpoint might invalidate previous selection, so clear it
             selectedNode = null;
+            rerootMode = false;
             updateButtons();
             await renderTree();
-            showStatus("Rerooted successfully.", "success", 2000);
-        } catch (e) { showStatus(`Reroot failed: ${e.message}`, "danger"); }
+            showStatus("Tree midpoint rooted.", "success", 3000);
+        } catch (e) {
+            showStatus(`Midpoint root failed: ${e.message}`, "danger");
+        } finally {
+            isProcessing = false;
+            updateButtons();
+        }
     });
 
     if (btnRecompute) btnRecompute.addEventListener('click', async () => {
@@ -214,6 +322,13 @@ document.addEventListener('DOMContentLoaded', async () => {
             await renderTree();
             showStatus("Done.", "success", 3000);
         } catch (e) { showStatus(`Failed: ${e.message}`, "danger"); }
+    });
+
+    // Global ESC handler to cancel mode
+    document.addEventListener('keydown', (e) => {
+        if (e.key === "Escape" && rerootMode) {
+            exitRerootMode();
+        }
     });
 
     // 9. Initial Load

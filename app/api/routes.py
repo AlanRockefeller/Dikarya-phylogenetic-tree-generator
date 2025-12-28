@@ -108,13 +108,33 @@ def reroot_tree_endpoint(job_id):
     if not job_dir.exists():
         return jsonify({"status": "error", "error": "Job not found"}), 404
         
-    data = request.get_json()
-    target = data.get("target")
+    data = request.get_json(silent=True) or {}
+    target = data.get("root_target") or data.get("target") or data.get("node_name")
+
+    if not target:
+        return jsonify({"status": "error", "error": "Missing root_target"}), 400
     
     try:
         from app.services.tree_edit_service import load_tree_state, reroot_tree, save_tree_state
         state = load_tree_state(job_dir)
         state = reroot_tree(job_dir, state, target)
+        save_tree_state(job_dir, state)
+        return jsonify(state)
+    except ValueError as e:
+        return jsonify({"status": "error", "error": str(e)}), 400
+    except Exception as e:
+        return jsonify({"status": "error", "error": str(e)}), 500
+
+@bp.route('/job/<job_id>/tree/midpoint_root', methods=['POST'])
+def midpoint_root_endpoint(job_id):
+    job_dir = Config.JOB_DIR / job_id
+    if not job_dir.exists():
+        return jsonify({"status": "error", "error": "Job not found"}), 404
+        
+    try:
+        from app.services.tree_edit_service import load_tree_state, midpoint_root, save_tree_state
+        state = load_tree_state(job_dir)
+        state = midpoint_root(job_dir, state)
         save_tree_state(job_dir, state)
         return jsonify(state)
     except ValueError as e:
