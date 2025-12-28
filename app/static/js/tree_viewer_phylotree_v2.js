@@ -351,19 +351,23 @@
         }
 
         function addSupportLabels() {
-            if (!state.showSupport) {
-                window.d3v7.select(container)
-                    .selectAll("text.node-support-value")
-                    .remove();
-                return;
-            }
-
             const svg = window.d3v7.select(container).select("svg");
             if (svg.empty()) return;
 
             // Find zoom group and cache it; attach observer to it.
             const zoomGroup = findZoomGroup(svg);
             cachedZoomNode = zoomGroup.node() || svg.node();
+
+            if (!state.showSupport) {
+                window.d3v7.select(container)
+                    .selectAll("text.node-support-value")
+                    .remove();
+
+                // FIXED: Ensure tip labels still resize and zoom observer attaches
+                applyTextSizingFromZoom();
+                attachZoomObserverTo(cachedZoomNode);
+                return;
+            }
 
             const ppThreshold = (renderOptions.ppThreshold !== undefined) ? renderOptions.ppThreshold : 0.9;
             const bootThreshold = (renderOptions.bootstrapThreshold !== undefined) ? renderOptions.bootstrapThreshold : 70;

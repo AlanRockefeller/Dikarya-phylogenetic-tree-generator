@@ -141,20 +141,29 @@ document.addEventListener('DOMContentLoaded', async () => {
         inputMinTips.addEventListener('change', () => renderTree());
     }
 
-    // Font Listeners (Trigger re-render for simplicity, or could trigger sizing if we exposed it)
-    function applyTextSizingOnlyOrRender() {
+    // --- Font Listeners (Live update without full re-render) ---
+    function applySizing() {
         if (container && typeof container.__applyTextSizingFromZoom === "function") {
             container.__applyTextSizingFromZoom();
-        } else {
-            renderTree();
         }
     }
 
-    const inputSupportFont = getEl('input-support-font');
-    if (inputSupportFont) inputSupportFont.addEventListener('input', applyTextSizingOnlyOrRender);
+    let sizingRAF = null;
+    function applySizingRAF() {
+        if (sizingRAF) return;
+        sizingRAF = requestAnimationFrame(() => {
+            sizingRAF = null;
+            applySizing();
+        });
+    }
 
-    const inputTipFont = getEl('input-tip-font');
-    if (inputTipFont) inputTipFont.addEventListener('input', applyTextSizingOnlyOrRender);
+    ["input-support-font", "input-tip-font"].forEach(id => {
+        const el = getEl(id);
+        if (el) {
+            el.addEventListener("input", applySizingRAF);
+            el.addEventListener("change", applySizingRAF);
+        }
+    });
 
 
     if (btnPrune) btnPrune.addEventListener('click', async () => {
