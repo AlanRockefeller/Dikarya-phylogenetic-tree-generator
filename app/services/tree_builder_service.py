@@ -1,10 +1,24 @@
+"""
+Tree builder service module.
+
+Provides functions for phylogenetic tree inference:
+- Neighbor Joining (BioPython)
+- RAxML-NG
+- IQ-TREE
+- MrBayes
+
+When job_id is provided, streams log output to Redis for real-time SSE updates.
+"""
+
 import os
 import shutil
+import logging
 from pathlib import Path
 from typing import Dict, Any, Optional
+
 from app.config import Config
 from app.models import TreeBuilderParams
-from app.services.subprocess_utils import run_command
+from app.services.subprocess_utils import run_command, run_command_streaming
 
 # Try to import Bio.Phylo for NJ, or implement simple fallback
 try:
@@ -14,20 +28,37 @@ try:
 except ImportError:
     HAS_BIOPYTHON = False
 
+logger = logging.getLogger(__name__)
+
+
 def run_tree_builder(
     alignment_fasta: Path,
     output_newick: Path,
     output_nexus: Path,
     params: TreeBuilderParams,
     config: Config,
-    logger
+    task_logger,
+    job_id: Optional[str] = None
 ) -> Dict[str, Any]:
     """
     Run the selected tree building algorithm.
+    
     Methods: "nj", "raxml", "iqtree", "mrbayes"
+    
+    Args:
+        alignment_fasta: Path to aligned FASTA file
+        output_newick: Path for output Newick tree
+        output_nexus: Path for output NEXUS tree
+        params: Tree builder parameters
+        config: Application config
+        task_logger: Logger instance
+        job_id: Optional job ID for real-time event streaming
+    
+    Returns:
+        Metadata dict with method, model, etc.
     """
     method = params.method.lower()
-    logger.info(f"Starting tree building with method: {method}")
+    task_logger.info(f"Starting tree building with method: {method}")
     
     metadata = {
         "method": method,
@@ -38,53 +69,90 @@ def run_tree_builder(
 
     try:
         if method == "nj":
-            _run_neighbor_joining(alignment_fasta, output_newick, output_nexus, logger)
+            _run_neighbor_joining(alignment_fasta, output_newick, output_nexus, task_logger, job_id)
         elif method == "raxml":
-            _run_raxml(alignment_fasta, output_newick, output_nexus, params, config, logger)
+            _run_raxml(alignment_fasta, output_newick, output_nexus, params, config, task_logger, job_id)
         elif method == "iqtree":
-            _run_iqtree(alignment_fasta, output_newick, output_nexus, params, config, logger)
+            _run_iqtree(alignment_fasta, output_newick, output_nexus, params, config, task_logger, job_id)
         elif method == "mrbayes":
-            _run_mrbayes(alignment_fasta, output_newick, output_nexus, params, config, logger)
+            _run_mrbayes(alignment_fasta, output_newick, output_nexus, params, config, task_logger, job_id)
         else:
             raise ValueError(f"Unsupported tree building method: {method}")
 
         if not output_newick.exists() or output_newick.stat().st_size == 0:
-             # MrBayes might produce nexus only, check logic below
-             # But generally we want newick.
-             # If method is mrbayes, we try to convert.
              raise RuntimeError(f"Tree building failed: Output file {output_newick} is missing or empty.")
 
-        logger.info(f"Tree building completed successfully. Output: {output_newick}")
+        task_logger.info(f"Tree building completed successfully. Output: {output_newick}")
         return metadata
 
     except Exception as e:
-        logger.error(f"Tree building failed: {e}")
+        task_logger.error(f"Tree building failed: {e}")
         raise
+
 
 def _get_thread_count(params: TreeBuilderParams) -> int:
     if params.threads:
         return params.threads
     return min(8, os.cpu_count() or 1)
 
-def _run_neighbor_joining(alignment_fasta: Path, output_newick: Path, output_nexus: Path, logger):
+
+def _make_log_callback(job_id: Optional[str], step: str):
+    """Create a callback function for streaming stderr to Redis."""
+    if not job_id:
+        return None
+    
+    from app.workers.events import publish_log
+    
+    def callback(line: str):
+        publish_log(job_id, step, "stderr", line)
+    
+    return callback
+
+
+def _run_neighbor_joining(
+    alignment_fasta: Path,
+    output_newick: Path,
+    output_nexus: Path,
+    task_logger,
+    job_id: Optional[str] = None
+):
     """
-    Build a fast NJ tree using BioPython if available.
+    Build a fast NJ tree using BioPython.
+    
+    NJ is fast and runs in-process, so no streaming needed.
     """
     if not HAS_BIOPYTHON:
         raise RuntimeError("BioPython is required for NJ but not installed.")
         
-    logger.info("Running Neighbor Joining using BioPython...")
+    task_logger.info("Running Neighbor Joining using BioPython...")
+    
+    # Publish progress if job_id provided
+    if job_id:
+        from app.workers.events import publish_log
+        publish_log(job_id, "tree", "stderr", "Reading alignment...")
     
     # Read alignment
     aln = AlignIO.read(str(alignment_fasta), "fasta")
+    
+    if job_id:
+        from app.workers.events import publish_log
+        publish_log(job_id, "tree", "stderr", "Calculating distance matrix...")
     
     # Calculate distance matrix
     calculator = DistanceCalculator('identity')
     dm = calculator.get_distance(aln)
     
+    if job_id:
+        from app.workers.events import publish_log
+        publish_log(job_id, "tree", "stderr", "Building tree...")
+    
     # Build tree
     constructor = DistanceTreeConstructor()
     tree = constructor.nj(dm)
+    
+    if job_id:
+        from app.workers.events import publish_log
+        publish_log(job_id, "tree", "stderr", "Writing output files...")
     
     # Write Newick
     Phylo.write(tree, str(output_newick), "newick")
@@ -92,9 +160,17 @@ def _run_neighbor_joining(alignment_fasta: Path, output_newick: Path, output_nex
     # Write Nexus
     Phylo.write(tree, str(output_nexus), "nexus")
 
-def _run_raxml(alignment_fasta: Path, output_newick: Path, output_nexus: Path, params: TreeBuilderParams, config: Config, logger):
-    # RAxML-NG: raxml-ng --msa input.fa --model GTR+G --prefix job --threads N --bs-trees 100 --all
-    
+
+def _run_raxml(
+    alignment_fasta: Path,
+    output_newick: Path,
+    output_nexus: Path,
+    params: TreeBuilderParams,
+    config: Config,
+    task_logger,
+    job_id: Optional[str] = None
+):
+    """Run RAxML-NG tree inference."""
     prefix = str(output_newick.parent / "raxml_run")
     threads = _get_thread_count(params)
     
@@ -104,7 +180,7 @@ def _run_raxml(alignment_fasta: Path, output_newick: Path, output_nexus: Path, p
         "--model", params.model,
         "--prefix", prefix,
         "--threads", str(threads),
-        "--seed", "12345" # Reproducibility
+        "--seed", "12345"  # Reproducibility
     ]
     
     if params.bootstrap and params.bootstrap > 0:
@@ -114,15 +190,24 @@ def _run_raxml(alignment_fasta: Path, output_newick: Path, output_nexus: Path, p
         cmd.append("--search")
         
     log_file = output_newick.parent.parent / "logs" / "tree_builder.log"
-    returncode, stdout, stderr = run_command(cmd, log_file=log_file)
     
-    if returncode != 0:
-        raise RuntimeError(f"RAxML failed with return code {returncode}. See logs.")
+    if job_id:
+        exit_code, stats = run_command_streaming(
+            cmd,
+            stderr_path=log_file,
+            on_stdout_line=_make_log_callback(job_id, "tree"),  # RAxML writes progress to stdout
+            on_stderr_line=_make_log_callback(job_id, "tree"),
+        )
+        
+        if exit_code != 0:
+            raise RuntimeError(f"RAxML failed with exit code {exit_code}")
+    else:
+        returncode, stdout, stderr = run_command(cmd, log_file=log_file)
+        
+        if returncode != 0:
+            raise RuntimeError(f"RAxML failed with return code {returncode}. See logs.")
         
     # Output handling
-    # RAxML-NG outputs: <prefix>.raxml.bestTree (if no BS) or <prefix>.raxml.support (if BS)
-    # We prefer support tree if available.
-    
     best_tree = Path(f"{prefix}.raxml.bestTree")
     support_tree = Path(f"{prefix}.raxml.support")
     
@@ -130,14 +215,21 @@ def _run_raxml(alignment_fasta: Path, output_newick: Path, output_nexus: Path, p
     
     if source_tree.exists():
         shutil.copy(source_tree, output_newick)
-        # Convert to Nexus
         _convert_newick_to_nexus(output_newick, output_nexus)
     else:
         raise RuntimeError("RAxML output tree not found.")
 
-def _run_iqtree(alignment_fasta: Path, output_newick: Path, output_nexus: Path, params: TreeBuilderParams, config: Config, logger):
-    # iqtree2 -s input.fa -m GTR+G -B 100 -nt AUTO -pre job
-    
+
+def _run_iqtree(
+    alignment_fasta: Path,
+    output_newick: Path,
+    output_nexus: Path,
+    params: TreeBuilderParams,
+    config: Config,
+    task_logger,
+    job_id: Optional[str] = None
+):
+    """Run IQ-TREE maximum likelihood tree inference."""
     prefix = str(output_newick.parent / "iqtree_run")
     threads = _get_thread_count(params)
     
@@ -154,16 +246,24 @@ def _run_iqtree(alignment_fasta: Path, output_newick: Path, output_nexus: Path, 
         cmd.extend(["-B", str(params.bootstrap)])
         
     log_file = output_newick.parent.parent / "logs" / "tree_builder.log"
-    returncode, stdout, stderr = run_command(cmd, log_file=log_file)
     
-    if returncode != 0:
-        raise RuntimeError(f"IQ-TREE failed with return code {returncode}. See logs.")
+    if job_id:
+        exit_code, stats = run_command_streaming(
+            cmd,
+            stderr_path=log_file,
+            on_stdout_line=_make_log_callback(job_id, "tree"),  # IQ-TREE writes progress to stdout
+            on_stderr_line=_make_log_callback(job_id, "tree"),
+        )
         
-    # Output: <prefix>.treefile (Newick)
-    # <prefix>.contree (Consensus if BS) -> usually .treefile is the ML tree, .contree is consensus
-    # If -B is used, .treefile is the ML tree, .contree is the consensus tree with support values.
-    # We usually want the tree with support values.
-    
+        if exit_code != 0:
+            raise RuntimeError(f"IQ-TREE failed with exit code {exit_code}")
+    else:
+        returncode, stdout, stderr = run_command(cmd, log_file=log_file)
+        
+        if returncode != 0:
+            raise RuntimeError(f"IQ-TREE failed with return code {returncode}. See logs.")
+        
+    # Output handling
     treefile = Path(f"{prefix}.treefile")
     contree = Path(f"{prefix}.contree")
     
@@ -175,78 +275,92 @@ def _run_iqtree(alignment_fasta: Path, output_newick: Path, output_nexus: Path, 
     else:
         raise RuntimeError("IQ-TREE output tree not found.")
 
-def _run_mrbayes(alignment_fasta: Path, output_newick: Path, output_nexus: Path, params: TreeBuilderParams, config: Config, logger):
-    # MrBayes requires Nexus input with a block.
-    # 1. Convert FASTA to Nexus
+
+def _run_mrbayes(
+    alignment_fasta: Path,
+    output_newick: Path,
+    output_nexus: Path,
+    params: TreeBuilderParams,
+    config: Config,
+    task_logger,
+    job_id: Optional[str] = None
+):
+    """Run MrBayes Bayesian tree inference."""
+    # MrBayes requires Nexus input with a block
     nexus_input = output_newick.parent / "mrbayes_input.nex"
     _convert_fasta_to_nexus(alignment_fasta, nexus_input)
     
-    # 2. Append MrBayes block
+    # Append MrBayes block
     with open(nexus_input, "a") as f:
         f.write("\nbegin mrbayes;\n")
         f.write(f"   set autoclose=yes;\n")
-        f.write(f"   lset nst=6 rates=gamma;\n") # GTR+G equivalent
+        f.write(f"   lset nst=6 rates=gamma;\n")  # GTR+G equivalent
         f.write(f"   mcmc ngen={params.mcmc_generations} nchains={params.mcmc_nchains} nruns={params.mcmc_nruns} burninfrac=0.25;\n")
         f.write(f"   sump;\n")
         f.write(f"   sumt;\n")
         f.write("end;\n")
         
-    # 3. Run MrBayes
-    # mb input.nex
-    # MrBayes is interactive by default, but with input file it should run.
-    # We might need to pipe "quit" or ensure it exits? 
-    # Usually "set autoclose=yes" helps.
-    
     cmd = [config.MRBAYES_BINARY, str(nexus_input)]
     
     log_file = output_newick.parent.parent / "logs" / "tree_builder.log"
-    # MrBayes prints to stdout
-    returncode, stdout, stderr = run_command(cmd, log_file=log_file)
     
-    if returncode != 0:
-        logger.error(f"MrBayes failed. RC={returncode}")
-        logger.error(f"STDOUT: {stdout}")
-        logger.error(f"STDERR: {stderr}")
-        raise RuntimeError(f"MrBayes failed with return code {returncode}. Error: {stderr}")
+    if job_id:
+        # MrBayes prints progress to stdout
+        exit_code, stats = run_command_streaming(
+            cmd,
+            stderr_path=log_file,
+            on_stdout_line=_make_log_callback(job_id, "tree"),  # MrBayes uses stdout
+            on_stderr_line=_make_log_callback(job_id, "tree"),
+        )
         
-    # 4. Output: <input>.con.tre (Consensus tree)
+        if exit_code != 0:
+            raise RuntimeError(f"MrBayes failed with exit code {exit_code}")
+    else:
+        returncode, stdout, stderr = run_command(cmd, log_file=log_file)
+        
+        if returncode != 0:
+            task_logger.error(f"MrBayes failed. RC={returncode}")
+            task_logger.error(f"STDOUT: {stdout}")
+            task_logger.error(f"STDERR: {stderr}")
+            raise RuntimeError(f"MrBayes failed with return code {returncode}. Error: {stderr}")
+        
+    # Output: <input>.con.tre (Consensus tree)
     con_tree = Path(f"{nexus_input}.con.tre")
     
     if con_tree.exists():
         shutil.copy(con_tree, output_nexus)
-        # Convert Nexus tree to Newick
         _convert_nexus_to_newick(output_nexus, output_newick)
     else:
         raise RuntimeError("MrBayes consensus tree not found.")
 
+
 def _convert_newick_to_nexus(newick_path: Path, nexus_path: Path):
+    """Convert Newick tree to NEXUS format."""
     if HAS_BIOPYTHON:
         try:
             tree = Phylo.read(str(newick_path), "newick")
             Phylo.write(tree, str(nexus_path), "nexus")
         except Exception:
-            pass # Best effort
+            pass  # Best effort
+
 
 def _convert_nexus_to_newick(nexus_path: Path, newick_path: Path):
+    """
+    Convert NEXUS tree to Newick format.
+    
+    Handles MrBayes annotations like [&prob=...] by extracting
+    posterior probabilities as node labels.
+    """
     if HAS_BIOPYTHON:
         try:
-            # MrBayes produces annotations like [&prob=...] inside the newick string
-            # which BioPython's Nexus parser sometimes fails on.
-            # We strip them out for simple conversion.
             import re
             
             # Helper definitions for robust matching
             _NUM_CORE = r"[0-9]+(?:\.[0-9]+)?(?:[eE][+\-]?[0-9]+)?"
             
-            # We want to capture the number *inside* the branch length part
-            # so we define the pattern for the whole branch part but capture the number.
-            # However, f-strings with regex groups are tricky if we reuse them.
-            # Simpler to write the full regex out or use non-capturing groups for the colon/spaces.
-
             def _fmt_prob(s: str) -> str:
                 try:
                     x = float(s)
-                    # choose 2 or 3 decimals; 3 is often nicer for PP
                     return f"{x:.3f}".rstrip("0").rstrip(".")
                 except (ValueError, TypeError):
                     return s
@@ -254,49 +368,44 @@ def _convert_nexus_to_newick(nexus_path: Path, newick_path: Path):
             content = nexus_path.read_text()
             
             # Case A: branch length comes first:  ): 0.05 [&prob=...]
-            # Matches: ) : 0.05 [ ... prob= 1.0 ... ]
             pat_a = re.compile(
                 rf"\)(?:\s*:\s*(?P<branch>{_NUM_CORE}))\s*\[[^\]]*?\bprob=\s*(?P<prob>{_NUM_CORE})\s*[^\]]*?\]",
                 re.IGNORECASE
             )
 
             # Case B: prob comes first:  )[&prob=...]:0.05
-            # Matches: ) [ ... prob= 1.0 ... ] : 0.05
             pat_b = re.compile(
                 rf"\)\s*\[[^\]]*?\bprob=\s*(?P<prob>{_NUM_CORE})\s*[^\]]*?\](?:\s*:\s*(?P<branch>{_NUM_CORE}))?",
                 re.IGNORECASE
             )
 
             def repl(m: re.Match) -> str:
-                # prob is clean number now (regex ensures it matches _NUM_CORE)
                 prob_val = _fmt_prob(m.group('prob'))
-                
-                # branch is also just the number if it matched
                 branch_val = m.group('branch')
                 branch_str = f":{branch_val}" if branch_val else ""
-                
                 return f"){prob_val}{branch_str}"
 
             clean_content = pat_a.sub(repl, content)
             clean_content = pat_b.sub(repl, clean_content)
 
-            # Now remove any remaining [&...], [length_mean...], etc.
+            # Remove any remaining [...] annotations
             clean_content = re.sub(r"\[[^\]]*\]", "", clean_content)
             
             from io import StringIO
             tree = Phylo.read(StringIO(clean_content), "nexus")
             Phylo.write(tree, str(newick_path), "newick")
         except Exception as e:
-            # Log this instead of silent swallow
             logger.error(f"Failed to convert Nexus to Newick: {e}")
             raise
 
+
 def _convert_fasta_to_nexus(fasta_path: Path, nexus_path: Path):
+    """Convert aligned FASTA to NEXUS format for MrBayes."""
     if HAS_BIOPYTHON:
         # Read alignment
         aln = AlignIO.read(str(fasta_path), "fasta")
         
-        # Simple heuristic to detect molecule type
+        # Detect molecule type
         if len(aln) > 0:
             seq_str = str(aln[0].seq).upper()
             dna_chars = set("ACGTN-")
@@ -308,16 +417,12 @@ def _convert_fasta_to_nexus(fasta_path: Path, nexus_path: Path):
             # Annotate records and sanitize IDs
             for record in aln:
                 record.annotations["molecule_type"] = mol_type
-                # Sanitize ID to avoid Biopython quoting (which MrBayes hates)
-                # Replace common problematic chars with underscore
+                # Sanitize ID for MrBayes
                 clean_id = record.id.replace("|", "_").replace(":", "_").replace("-", "_").replace("'", "").replace(" ", "_")
-                # Keep only alphanumeric and underscore
                 clean_id = "".join(c for c in clean_id if c.isalnum() or c == "_")
                 record.id = clean_id
-                # Clear description to prevent extra info causing issues
                 record.description = ""
                 
         AlignIO.write(aln, str(nexus_path), "nexus")
     else:
-        # Simple fallback if needed, but BioPython is standard
         raise RuntimeError("BioPython required for format conversion.")

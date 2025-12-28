@@ -299,3 +299,283 @@ def download_fasta_pruned(job_id):
         return jsonify({"status": "error", "error": "Pruned FASTA not found"}), 404
         
     return send_file(path, as_attachment=True, download_name="sequences_pruned.fasta")
+
+
+# =============================================================================
+# SSE Real-Time Events Endpoint
+# =============================================================================
+
+def _read_log_tail(log_path, max_bytes=65536, max_lines=200):
+    """
+    Read the last N lines from a log file efficiently.
+    
+    Reads last max_bytes of file, splits into lines, returns last max_lines.
+    """
+    try:
+        if not log_path.exists():
+            return []
+        
+        file_size = log_path.stat().st_size
+        
+        with open(log_path, 'r', encoding='utf-8', errors='replace') as f:
+            if file_size > max_bytes:
+                f.seek(file_size - max_bytes)
+                # Skip partial first line
+                f.readline()
+            
+            lines = f.readlines()
+        
+        # Strip and return last max_lines
+        return [line.rstrip() for line in lines[-max_lines:]]
+    
+    except Exception as e:
+        logging.warning(f"Failed to read log tail from {log_path}: {e}")
+        return []
+
+
+def _build_snapshot(job_id: str) -> dict:
+    """
+    Build initial snapshot for SSE connection.
+    
+    Includes job status, meta, and log tails.
+    """
+    import time
+    from datetime import datetime
+    
+    job_dir = Config.JOB_DIR / job_id
+    
+    # Get RQ job status
+    from app.workers.queue import get_job_status
+    rq_status = get_job_status(job_id)
+    
+    # Get DB job for additional info
+    db_job = Job.query.get(job_id)
+    
+    # Determine status
+    status = rq_status.get('status', 'unknown')
+    if db_job and db_job.status:
+        # DB status is authoritative for completed/failed
+        if db_job.status in ('completed', 'failed'):
+            status = db_job.status
+    
+    # Build job info
+    job_info = {
+        "id": job_id,
+        "status": status,
+        "started_at": rq_status.get('started_at'),
+        "ended_at": rq_status.get('ended_at'),
+        "elapsed_seconds": None,
+        "error_summary": None,
+        "failed_step": None,
+        "failed_step_label": None,
+        "tool": None,
+        "exit_code": None,
+        "result_files": None,
+        "meta": {},
+    }
+    
+    # Calculate elapsed time
+    if rq_status.get('started_at'):
+        try:
+            started = datetime.fromisoformat(rq_status['started_at'].replace('Z', '+00:00'))
+            if rq_status.get('ended_at'):
+                ended = datetime.fromisoformat(rq_status['ended_at'].replace('Z', '+00:00'))
+                job_info["elapsed_seconds"] = (ended - started).total_seconds()
+            else:
+                from datetime import timezone
+                now = datetime.now(timezone.utc)
+                job_info["elapsed_seconds"] = (now - started).total_seconds()
+        except Exception:
+            pass
+    
+    # Get RQ job meta
+    try:
+        from app.workers.queue import get_queue
+        q = get_queue()
+        rq_job = q.fetch_job(job_id)
+        if rq_job and rq_job.meta:
+            job_info["meta"] = rq_job.meta
+    except Exception:
+        pass
+    
+    # If job failed, extract failure info
+    if status == 'failed':
+        if db_job and db_job.metrics:
+            job_info["error_summary"] = db_job.metrics.get('error')
+            job_info["failed_step"] = db_job.metrics.get('failed_step')
+        
+        # Try to get more from RQ result
+        result = rq_status.get('result', {})
+        if isinstance(result, dict):
+            job_info["error_summary"] = job_info["error_summary"] or result.get('error')
+            
+        # Get failed step label from meta
+        failed_step = job_info.get("failed_step")
+        if failed_step and "steps" in job_info["meta"]:
+            step_info = job_info["meta"]["steps"].get(failed_step, {})
+            job_info["failed_step_label"] = step_info.get("label", failed_step)
+            job_info["tool"] = step_info.get("tool")
+    
+    # If job completed, include result files
+    if status == 'completed':
+        job_info["result_files"] = {
+            "tree_newick": f"/api/job/{job_id}/download/tree/newick",
+            "tree_nexus": f"/api/job/{job_id}/download/tree/nexus",
+            "fasta_original": f"/api/job/{job_id}/download/fasta/original",
+        }
+    
+    # Read log tails
+    logs_dir = job_dir / "logs"
+    log_tails = {
+        "pipeline": _read_log_tail(logs_dir / "pipeline.log", max_lines=200),
+        "alignment": _read_log_tail(logs_dir / "alignment.log", max_lines=100),
+        "tree_builder": _read_log_tail(logs_dir / "tree_builder.log", max_lines=100),
+    }
+    
+    return {
+        "job": job_info,
+        "log_tails": log_tails,
+    }
+
+
+@bp.route('/job/<job_id>/events', methods=['GET'])
+def job_events_stream(job_id):
+    """
+    SSE endpoint for real-time job status updates.
+    
+    Protocol:
+    - Emits `event: snapshot` with initial job state and log tails
+    - Emits plain `data:` lines for all subsequent live events
+    - Emits `event: ping` with `data: {}` every 15s as keepalive
+    
+    On disconnect/reconnect, server sends fresh snapshot.
+    """
+    import json
+    import time
+    import redis
+    from flask import Response, stream_with_context
+    
+    job_dir = Config.JOB_DIR / job_id
+    
+    # Validate job exists (either in DB or as directory)
+    db_job = Job.query.get(job_id)
+    if not db_job and not job_dir.exists():
+        return jsonify({"status": "error", "error": "Job not found"}), 404
+    
+    def generate():
+        # Connect to Redis for PubSub
+        redis_url = Config.REDIS_URL
+        r = redis.from_url(redis_url)
+        pubsub = r.pubsub()
+        
+        channel = f"job:{job_id}:events"
+        pubsub.subscribe(channel)
+        
+        try:
+            # Send initial snapshot
+            snapshot = _build_snapshot(job_id)
+            yield f"event: snapshot\ndata: {json.dumps(snapshot)}\n\n"
+            
+            # Check if job is already terminal
+            job_status = snapshot["job"]["status"]
+            if job_status in ('completed', 'failed', 'finished'):
+                # Still keep connection open briefly for any final events
+                pass
+            
+            last_ping = time.time()
+            
+            while True:
+                # Check for PubSub messages (non-blocking with timeout)
+                message = pubsub.get_message(timeout=1.0)
+                
+                if message and message['type'] == 'message':
+                    data = message['data']
+                    if isinstance(data, bytes):
+                        data = data.decode('utf-8')
+                    yield f"data: {data}\n\n"
+                    
+                    # Check if this is a terminal event
+                    try:
+                        event = json.loads(data)
+                        if event.get('type') == 'job_state' and event.get('status') in ('completed', 'failed'):
+                            # Send final event and close after brief delay
+                            time.sleep(0.5)
+                            break
+                    except json.JSONDecodeError:
+                        pass
+                
+                # Send keepalive ping every 15 seconds
+                now = time.time()
+                if now - last_ping >= 15:
+                    yield "event: ping\ndata: {}\n\n"
+                    last_ping = now
+                
+                # Check if job is terminal (poll DB periodically)
+                if job_status not in ('completed', 'failed', 'finished'):
+                    # Refresh status every 5 seconds
+                    if int(now) % 5 == 0:
+                        db.session.expire_all()
+                        db_job_check = Job.query.get(job_id)
+                        if db_job_check and db_job_check.status in ('completed', 'failed'):
+                            job_status = db_job_check.status
+                            # Give a moment for final events
+                            time.sleep(1)
+                            break
+        
+        finally:
+            pubsub.unsubscribe()
+            pubsub.close()
+    
+    response = Response(
+        stream_with_context(generate()),
+        mimetype='text/event-stream',
+        headers={
+            'Cache-Control': 'no-cache',
+            'X-Accel-Buffering': 'no',  # Disable nginx buffering
+            'Connection': 'keep-alive',
+        }
+    )
+    return response
+
+
+# =============================================================================
+# Log Download Endpoints
+# =============================================================================
+
+@bp.route('/job/<job_id>/logs/<log_name>', methods=['GET'])
+def download_log(job_id, log_name):
+    """
+    Download job log files.
+    
+    Valid log_name values:
+    - pipeline: pipeline.log
+    - alignment: alignment.log  
+    - tree_builder: tree_builder.log
+    """
+    job_dir = Config.JOB_DIR / job_id
+    if not job_dir.exists():
+        return jsonify({"status": "error", "error": "Job not found"}), 404
+    
+    # Map log names to files
+    log_files = {
+        "pipeline": "pipeline.log",
+        "alignment": "alignment.log",
+        "tree_builder": "tree_builder.log",
+    }
+    
+    if log_name not in log_files:
+        return jsonify({
+            "status": "error", 
+            "error": f"Invalid log name. Valid options: {', '.join(log_files.keys())}"
+        }), 400
+    
+    log_path = job_dir / "logs" / log_files[log_name]
+    
+    if not log_path.exists():
+        return jsonify({"status": "error", "error": "Log file not found"}), 404
+    
+    return send_file(
+        log_path,
+        as_attachment=True,
+        download_name=f"{job_id}_{log_files[log_name]}"
+    )

@@ -1,72 +1,167 @@
 {% extends "base.html" %}
+{% block title %}Job Status - {{ job_id }}{% endblock %}
 
-{% block title %}Dikarya - Job Status{% endblock %}
+{% block head %}
+<link rel="stylesheet" href="{{ url_for('static', filename='css/job_status.css') }}">
+{% endblock %}
 
 {% block content %}
-<h1>Job Status</h1>
-<div id="status-container">
-    <p><strong>Job ID:</strong> <span id="job-id">{{ job_id }}</span></p>
-    <p><strong>Status:</strong> <span id="job-status">{{ status }}</span></p>
-    <div id="blast-section" style="display: none;">
-        <h3>BLAST Results</h3>
-        <p><strong>Status:</strong> <span id="blast-status">Running...</span></p>
-        <p><strong>Hits Found:</strong> <span id="blast-hits">-</span></p>
+<div id="job-status-container" class="job-status-page" data-job-id="{{ job_id }}">
+
+    <!-- Header -->
+    <header class="job-header">
+        <div class="job-header-left">
+            <h1>Job Status</h1>
+            <div class="job-header-meta">
+                <span>Job ID: <code>{{ job_id }}</code></span>
+                <span>Elapsed: <span id="elapsed-time">--</span></span>
+            </div>
+        </div>
+        <div class="job-header-right">
+            <span id="job-status-badge" class="status-badge queued">Queued</span>
+            <div id="connection-indicator" class="connection-indicator">
+                <span class="connection-dot"></span>
+                <span id="connection-text">Connecting...</span>
+            </div>
+        </div>
+    </header>
+
+    <!-- Pipeline Timeline -->
+    <section class="pipeline-card">
+        <h2>Pipeline</h2>
+        <div class="pipeline-timeline">
+            <div id="step-input" class="pipeline-step">
+                <div class="step-indicator queued">○</div>
+                <span class="step-label">Input</span>
+            </div>
+            <div id="step-blast" class="pipeline-step">
+                <div class="step-indicator queued">○</div>
+                <span class="step-label">BLAST</span>
+            </div>
+            <div id="step-align" class="pipeline-step">
+                <div class="step-indicator queued">○</div>
+                <span class="step-label">Alignment</span>
+            </div>
+            <div id="step-trim" class="pipeline-step">
+                <div class="step-indicator queued">○</div>
+                <span class="step-label">Trimming</span>
+            </div>
+            <div id="step-tree" class="pipeline-step">
+                <div class="step-indicator queued">○</div>
+                <span class="step-label">Tree</span>
+            </div>
+            <div id="step-post" class="pipeline-step">
+                <div class="step-indicator queued">○</div>
+                <span class="step-label">Post</span>
+            </div>
+        </div>
+    </section>
+
+    <!-- Current Step Card -->
+    <section id="current-step-card" class="current-step-card" style="display: none;">
+        <div class="current-step-header">
+            <div class="current-step-indicator"></div>
+            <span id="current-step-name" class="current-step-name">Processing...</span>
+        </div>
+        <div id="current-step-detail" class="current-step-detail"></div>
+        <div id="current-step-time" class="current-step-time"></div>
+    </section>
+
+    <!-- Error Panel (hidden by default) -->
+    <section id="error-panel" class="error-panel" style="display: none;">
+        <h2><span>✗</span> <span class="error-title">Step Failed</span></h2>
+
+        <div class="error-section">
+            <h3>What happened</h3>
+            <p class="error-what">An error occurred during processing.</p>
+        </div>
+
+        <div class="error-section">
+            <h3>Why</h3>
+            <p class="error-why">Unable to determine the cause.</p>
+        </div>
+
+        <div class="error-section">
+            <h3>What to do</h3>
+            <ul>
+                <li>Check that your input is valid FASTA format</li>
+                <li>Ensure you have at least 2 sequences for alignment</li>
+                <li>Try enabling BLAST if you have a single sequence</li>
+            </ul>
+        </div>
+
+        <details class="error-details">
+            <summary>▶ Relevant output (last 30 lines)</summary>
+            <pre class="error-stderr"></pre>
+        </details>
+
+        <details class="error-details">
+            <summary>▶ Technical details</summary>
+            <pre class="error-traceback"></pre>
+        </details>
+
+        <div class="action-buttons">
+            <div class="dropdown">
+                <button class="btn-secondary">Download Logs ▼</button>
+                <div class="dropdown-content">
+                    <a href="/api/job/{{ job_id }}/logs/pipeline" download>Pipeline Log</a>
+                    <a href="/api/job/{{ job_id }}/logs/alignment" download>Alignment Log</a>
+                    <a href="/api/job/{{ job_id }}/logs/tree_builder" download>Tree Builder Log</a>
+                </div>
+            </div>
+        </div>
+    </section>
+
+    <!-- Main Content Grid -->
+    <div class="content-grid">
+
+        <!-- Overview Feed -->
+        <section class="overview-card">
+            <h3>Overview</h3>
+            <div id="overview-feed" class="overview-feed">
+                <div class="overview-item">
+                    <span class="overview-icon running">⋯</span>
+                    <span>Waiting for job to start...</span>
+                </div>
+            </div>
+        </section>
+
+        <!-- Terminal Pane -->
+        <section class="terminal-card">
+            <div class="terminal-header">
+                <span class="terminal-title">Terminal</span>
+                <div class="terminal-controls">
+                    <label>
+                        <input type="checkbox" id="autoscroll-checkbox" checked>
+                        Autoscroll
+                    </label>
+                    <button id="clear-terminal-btn">Clear</button>
+                </div>
+            </div>
+            <div id="terminal-content" class="terminal-content">
+                <!-- Log lines will be appended here -->
+            </div>
+        </section>
+
     </div>
-    <div id="result-section" style="display: none;">
-        <h3>Result</h3>
-        <p>
-            <a id="view-tree-btn" href="#"
-                style="display: inline-block; padding: 10px 20px; background-color: #2e7d32; color: white; text-decoration: none; border-radius: 4px;">View
-                Tree</a>
-        </p>
-        <pre id="job-result"></pre>
+
+    <!-- Action Buttons -->
+    <div class="action-buttons">
+        <a id="view-tree-btn" href="/job/{{ job_id }}/view" class="btn-primary" disabled>
+            View Tree
+        </a>
+
+        <div class="dropdown">
+            <button class="btn-secondary">Download Logs ▼</button>
+            <div class="dropdown-content">
+                <a href="/api/job/{{ job_id }}/logs/pipeline" download>Pipeline Log</a>
+                <a href="/api/job/{{ job_id }}/logs/alignment" download>Alignment Log</a>
+                <a href="/api/job/{{ job_id }}/logs/tree_builder" download>Tree Builder Log</a>
+            </div>
+        </div>
     </div>
-    <div id="error-section" style="display: none; color: red;">
-        <h3>Error</h3>
-        <pre id="job-error"></pre>
-    </div>
+
 </div>
 
-<script>
-    const jobId = "{{ job_id }}";
-    const statusSpan = document.getElementById('job-status');
-    const resultSection = document.getElementById('result-section');
-    const resultPre = document.getElementById('job-result');
-    const errorSection = document.getElementById('error-section');
-    const errorPre = document.getElementById('job-error');
-
-    function checkStatus() {
-        fetch(`/api/job/${jobId}/status`)
-            .then(response => response.json())
-            .then(data => {
-                statusSpan.textContent = data.status;
-
-                if (data.result && data.result.blast_result) {
-                    document.getElementById('blast-section').style.display = 'block';
-                    document.getElementById('blast-status').textContent = data.result.blast_result.cached ? "Cached" : "Completed";
-                    document.getElementById('blast-hits').textContent = data.result.blast_result.sequence_count;
-                }
-
-                if (data.status === 'finished' || data.status === 'completed') {
-                    resultSection.style.display = 'block';
-                    document.getElementById('view-tree-btn').href = `/job/${jobId}/view`;
-                    resultPre.textContent = JSON.stringify(data.result, null, 2);
-                } else if (data.status === 'failed' || data.status === 'error') {
-                    errorSection.style.display = 'block';
-                    errorPre.textContent = JSON.stringify(data.error, null, 2);
-                } else {
-                    // Poll again in 2 seconds
-                    setTimeout(checkStatus, 2000);
-                }
-            })
-            .catch(err => {
-                console.error('Error polling status:', err);
-            });
-    }
-
-    // Start polling if not already done
-    if (statusSpan.textContent !== 'finished' && statusSpan.textContent !== 'failed') {
-        setTimeout(checkStatus, 2000);
-    }
-</script>
+<script src="{{ url_for('static', filename='js/job_status.js') }}"></script>
 {% endblock %}

@@ -1,15 +1,44 @@
+"""
+Trimming service module.
+
+Provides functions for trimming multiple sequence alignments:
+- trimAl
+- BMGE
+
+When job_id is provided, streams log output to Redis for real-time SSE updates.
+"""
+
 import shutil
 from pathlib import Path
-from app.config import Config
-from app.services.subprocess_utils import run_command
+from typing import Optional
 
-def run_trimming(input_alignment: Path, output_alignment: Path, trim_method: str, config: Config, logger) -> None:
+from app.config import Config
+from app.services.subprocess_utils import run_command, run_command_streaming
+
+
+def run_trimming(
+    input_alignment: Path,
+    output_alignment: Path,
+    trim_method: str,
+    config: Config,
+    logger,
+    job_id: Optional[str] = None
+) -> None:
     """
     Apply gap trimming to an alignment.
+    
     trim_method options:
-        - "none"
-        - "trimal"      -> trimAl default settings
-        - "bmge"        -> BMGE default settings
+        - "none" - No trimming (copy input to output)
+        - "trimal" - trimAl default settings
+        - "bmge" - BMGE default settings
+    
+    Args:
+        input_alignment: Path to input aligned FASTA
+        output_alignment: Path for output trimmed FASTA
+        trim_method: Trimming method name
+        config: Application config
+        logger: Logger instance
+        job_id: Optional job ID for real-time event streaming
     """
     method = trim_method.lower()
     
@@ -22,9 +51,9 @@ def run_trimming(input_alignment: Path, output_alignment: Path, trim_method: str
             return
 
         if method == "trimal":
-            _run_trimal(input_alignment, output_alignment, config, logger)
+            _run_trimal(input_alignment, output_alignment, config, logger, job_id)
         elif method == "bmge":
-            _run_bmge(input_alignment, output_alignment, config, logger)
+            _run_bmge(input_alignment, output_alignment, config, logger, job_id)
         else:
             # Fallback to none if unknown, or raise? 
             # Let's raise to be strict.
@@ -39,8 +68,28 @@ def run_trimming(input_alignment: Path, output_alignment: Path, trim_method: str
         logger.error(f"Trimming failed: {e}")
         raise
 
-def _run_trimal(input_alignment: Path, output_alignment: Path, config: Config, logger):
-    # trimal -in alignment_raw.fasta -out alignment_trimmed.fasta -automated1
+
+def _make_log_callback(job_id: Optional[str], step: str):
+    """Create a callback function for streaming stderr to Redis."""
+    if not job_id:
+        return None
+    
+    from app.workers.events import publish_log
+    
+    def callback(line: str):
+        publish_log(job_id, step, "stderr", line)
+    
+    return callback
+
+
+def _run_trimal(
+    input_alignment: Path,
+    output_alignment: Path,
+    config: Config,
+    logger,
+    job_id: Optional[str] = None
+):
+    """Run trimAl alignment trimming."""
     cmd = [
         config.TRIMAL_BINARY,
         "-in", str(input_alignment),
@@ -48,22 +97,37 @@ def _run_trimal(input_alignment: Path, output_alignment: Path, config: Config, l
         "-automated1"
     ]
     
-    log_file = output_alignment.parent.parent / "logs" / "alignment.log" # Log to alignment log
-    returncode, stdout, stderr = run_command(cmd, log_file=log_file)
+    log_file = output_alignment.parent.parent / "logs" / "alignment.log"
     
-    if returncode != 0:
-        raise RuntimeError(f"trimAl failed with return code {returncode}. See logs.")
+    if job_id:
+        exit_code, stats = run_command_streaming(
+            cmd,
+            stderr_path=log_file,
+            on_stdout_line=_make_log_callback(job_id, "trim"),
+            on_stderr_line=_make_log_callback(job_id, "trim"),
+        )
+        
+        if exit_code != 0:
+            raise RuntimeError(f"trimAl failed with exit code {exit_code}")
+    else:
+        returncode, stdout, stderr = run_command(cmd, log_file=log_file)
+        
+        if returncode != 0:
+            raise RuntimeError(f"trimAl failed with return code {returncode}. See logs.")
 
-def _run_bmge(input_alignment: Path, output_alignment: Path, config: Config, logger):
-    # java -jar BMGE.jar -i alignment_raw.fasta -t DNA -of alignment_trimmed.fasta
-    # Assuming config.BMGE_BINARY is the path to the jar or a wrapper script.
-    # If it's a jar, we need "java", "-jar", config.BMGE_BINARY
-    # If it's a wrapper, just config.BMGE_BINARY
+
+def _run_bmge(
+    input_alignment: Path,
+    output_alignment: Path,
+    config: Config,
+    logger,
+    job_id: Optional[str] = None
+):
+    """
+    Run BMGE alignment trimming.
     
-    # Let's assume it's a wrapper or executable for now as per prompt "You may assume BMGE is installed as a binary".
-    # But prompt also says "java -jar BMGE.jar ...".
-    # I'll try to detect if it ends in .jar
-    
+    Handles both JAR file and binary executable configurations.
+    """
     bmge_bin = config.BMGE_BINARY
     cmd = []
     
@@ -79,7 +143,19 @@ def _run_bmge(input_alignment: Path, output_alignment: Path, config: Config, log
     ])
     
     log_file = output_alignment.parent.parent / "logs" / "alignment.log"
-    returncode, stdout, stderr = run_command(cmd, log_file=log_file)
     
-    if returncode != 0:
-        raise RuntimeError(f"BMGE failed with return code {returncode}. See logs.")
+    if job_id:
+        exit_code, stats = run_command_streaming(
+            cmd,
+            stderr_path=log_file,
+            on_stdout_line=_make_log_callback(job_id, "trim"),
+            on_stderr_line=_make_log_callback(job_id, "trim"),
+        )
+        
+        if exit_code != 0:
+            raise RuntimeError(f"BMGE failed with exit code {exit_code}")
+    else:
+        returncode, stdout, stderr = run_command(cmd, log_file=log_file)
+        
+        if returncode != 0:
+            raise RuntimeError(f"BMGE failed with return code {returncode}. See logs.")

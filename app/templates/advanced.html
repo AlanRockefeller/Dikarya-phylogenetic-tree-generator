@@ -109,7 +109,10 @@
             </div>
         </div>
 
-        <button id="submit_btn" class="btn btn-primary btn-lg">Start Analysis</button>
+        <div class="d-flex justify-content-center my-4">
+            <button id="submit_btn" class="btn btn-success btn-lg px-5 py-3"
+                style="font-size: 1.25rem; font-weight: 600; min-width: 250px;">Start Analysis</button>
+        </div>
         <div id="status_alert" class="alert mt-3 d-none" role="alert"></div>
 
     </div>
@@ -237,9 +240,8 @@
             statusAlert.classList.remove('alert-info');
             statusAlert.classList.add('alert-success');
 
-            setTimeout(() => {
-                window.location.href = "/user/jobs";
-            }, 1000);
+            // Redirect immediately to the job status dashboard
+            window.location.href = "/job/" + data.job_id;
 
         } catch (e) {
             statusAlert.textContent = "Submission Failed: " + e.message;
