@@ -68,7 +68,10 @@ document.addEventListener('DOMContentLoaded', async () => {
 
         const viewerType = viewerSelect ? viewerSelect.value : 'phylotree';
 
-
+        // Read thresholds
+        const ppThreshold = parseFloat(document.getElementById('input-pp-threshold')?.value || 0.9);
+        const bsThreshold = parseFloat(document.getElementById('input-bs-threshold')?.value || 70);
+        const minTips = parseInt(document.getElementById('input-min-tips')?.value || 0);
 
         // Shared Callbacks
         const callbacks = {
@@ -87,7 +90,10 @@ document.addEventListener('DOMContentLoaded', async () => {
                     const newick = await resp.text();
                     // Call the v2 renderer
                     renderPhylotree(newick, 'tree-container', callbacks, {
-                        showSupport: showSupport
+                        showSupport: showSupport,
+                        ppThreshold: ppThreshold,
+                        bootstrapThreshold: bsThreshold,
+                        minTips: minTips
                     });
                 } catch (err) {
                     if (container) container.textContent = `Failed to load Newick: ${err.message}`;
@@ -107,6 +113,19 @@ document.addEventListener('DOMContentLoaded', async () => {
             // Simple UI feedback
             btnToggleSupport.textContent = showSupport ? "Hide Node Support" : "Show Node Support";
         });
+    }
+
+    const inputPP = getEl('input-pp-threshold');
+    if (inputPP) {
+        inputPP.addEventListener('change', () => renderTree());
+    }
+    const inputBS = getEl('input-bs-threshold');
+    if (inputBS) {
+        inputBS.addEventListener('change', () => renderTree());
+    }
+    const inputMinTips = getEl('input-min-tips');
+    if (inputMinTips) {
+        inputMinTips.addEventListener('change', () => renderTree());
     }
 
     if (viewerSelect) viewerSelect.addEventListener('change', () => renderTree());

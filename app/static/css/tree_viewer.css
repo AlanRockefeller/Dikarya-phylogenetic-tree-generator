@@ -35,3 +35,14 @@
 .phylotree-node circle {
     fill: #999;
 }
+
+.node-support-value {
+    font-family: sans-serif;
+    font-weight: 500;
+    fill: #b30000;
+    pointer-events: none;
+    paint-order: stroke;
+    stroke: rgba(255, 255, 255, 0.85);
+    stroke-width: 3px;
+    stroke-linejoin: round;
+}

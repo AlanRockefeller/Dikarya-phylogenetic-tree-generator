@@ -163,97 +163,228 @@
             if (!state.showSupport) {
                 window.d3v7.select(container)
                     .selectAll("text.node-support-value")
-                    .style("display", "none");
+                    .remove(); // Idempotent: remove if toggled off
                 return;
             }
 
             const svg = window.d3v7.select(container).select("svg");
 
+            // Robust Zoom Group Detection for Scale
+            // 1. Try finding group with specific transform
+            let zoomGroup = svg.select("g[transform]");
+            // 2. Fallback: looking for group containing nodes
+            if (zoomGroup.empty()) {
+                zoomGroup = svg.select("g.node").node() ? window.d3v7.select(svg.select("g.node").node().parentNode) : svg;
+            }
+
+            const zoomTransform = window.d3v7.zoomTransform(zoomGroup.node() || svg.node());
+            const k = zoomTransform.k || 1;
+
+            // Font size: clamp 6px - 9px based on zoom
+            // k=1 -> 9px. k=2 -> 4.5px (clamped to 6). k=0.5 -> 18px (clamped to 9).
+            let fontPx = Math.max(6, Math.min(9, 9 / k));
+
+            const ppThreshold = (renderOptions && renderOptions.ppThreshold !== undefined) ? renderOptions.ppThreshold : 0.9;
+            const bootThreshold = (renderOptions && renderOptions.bootstrapThreshold !== undefined) ? renderOptions.bootstrapThreshold : 70;
+            const minDescendants = (renderOptions && renderOptions.minTips !== undefined) ? renderOptions.minTips : 0;
+
             // Robust selection: Select all 'g' elements, then filter by data to find internal nodes
-            // (Internal nodes in D3 hierarchy have 'children' property)
-            const nodeGroups = svg.selectAll("g").filter(function (d) {
+            const nodeGroups = svg.selectAll("g.node, g.internal-node").filter(function (d) {
+                // Must be internal (have children)
                 return d && d.children && d.children.length > 0;
             });
 
+            // Calculate maxY for Tip Zone Heuristic (Relative to tree height)
+            // d.y corresponds to the horizontal position (distance from root) usually
+            let maxY = 0;
+            svg.selectAll("g.node").each(d => { if (d.y > maxY) maxY = d.y; });
+            const tipZoneStart = 0.85 * maxY;
+
             nodeGroups.each(function (d) {
                 const group = window.d3v7.select(this);
-                // Support values are effectively the "name" of the internal node in Newick
-                // Check various fields just in case the parser put it elsewhere
-                // Priority 1: Check explicit confidence field which BioPython sometimes parses
-                let rawLabel = d.data?.confidence;
 
-                // Priority 2: Fallback to name/bootstrap/support
+                // --- 0. Min Tips Filter ---
+                if (minDescendants > 0) {
+                    let count = 0;
+                    if (d.leaves) {
+                        // Standard D3 hierarchy
+                        count = d.leaves().length;
+                    } else if (d.value !== undefined) {
+                        // often 'value' is leaf count if .count() was called
+                        count = d.value;
+                    } else {
+                        // Manual count fallback
+                        const stack = [d];
+                        while (stack.length) {
+                            const n = stack.pop();
+                            if (n.children && n.children.length > 0) {
+                                for (const c of n.children) stack.push(c);
+                            } else {
+                                count++;
+                            }
+                        }
+                    }
+
+                    if (count < minDescendants) {
+                        group.select("text.node-support-value").remove();
+                        return;
+                    }
+                }
+
+                // --- 1. Label Extraction (Same as before) ---
+                let rawLabel = d.data?.confidence;
                 if (rawLabel === undefined || rawLabel === null || rawLabel === "") {
                     rawLabel = d.data?.name || d.data?.bootstrap_values || d.data?.bootstrap || d.data?.support;
                 }
 
                 let label = rawLabel;
-
-                // Handle Hybrid Labels (e.g., Node_12_100, Node_21.00)
-                // Strict check: Must follow pattern Node_{ID}_{Value} to avoid confusing ID with Value
+                // Basic cleanup for "Node_12_100" or "Node_12"
                 if (label && typeof label === 'string' && label.startsWith("Node_")) {
                     const match = label.match(/^Node_\d+_(\d+(?:\.\d+)?)$/);
                     if (match) {
                         label = match[1];
                     } else if (label.match(/^Node_\d+$/)) {
-                        // This is just a bare Node ID (e.g. Node_12) with no support value
-                        // Treat as no label
                         label = null;
                     } else {
-                        // Fallback for other formats? 
-                        // If it doesn't match the strict ID_Value pattern but starts with Node_, 
-                        // it might be complex. Safest to try extracting last number IF it has an underscore separator.
-                        // But let's stick to the strict generation pattern we created in backend: Node_{counter}_{original}
-                        // So Node_1_100 -> 100. Node_1 -> null.
-                        // What if original was Node_1_Support_100? Backend: f"Node_{counter}_{original}" -> Node_1_Node_1_Support_100.
-                        // New regex matches last number: `_(\d+(?:\.\d+)?)$`.
                         const looseMatch = label.match(/_(\d+(?:\.\d+)?)$/);
-                        if (looseMatch) {
-                            label = looseMatch[1];
-                        } else {
-                            label = null;
-                        }
+                        if (looseMatch) label = looseMatch[1];
+                        else label = null;
                     }
                 }
 
-                // Debug logging to help identify where the value is
-                if (window.location.search.includes("debug=true")) {
-                    console.log("Internal Node Data:", d.data, "Label candidate:", label);
+                if (!label) {
+                    group.select("text.node-support-value").remove();
+                    return;
                 }
-
-                if (!label) return;
                 const numValue = parseFloat(label);
 
-                // Sanity Check & Formatting Domain
-                let displayValue = "";
-
+                // --- 2. Filtering (Semantic + Epsilon) ---
                 if (isNaN(numValue)) {
-                    return;
-                } else if (numValue >= 0 && numValue <= 1) {
-                    // Posterior Probability: 0.0 - 1.0 -> Show 2 decimals (e.g. 0.95)
-                    displayValue = numValue.toFixed(2);
-                } else if (numValue > 1 && numValue <= 100) {
-                    // Bootstrap: 1 - 100 -> Show integer (e.g. 85)
-                    displayValue = Math.round(numValue).toString();
-                } else {
-                    // Out of sane range (e.g. < 0 or > 100) -> Ignore (likely garbage or ID)
+                    group.select("text.node-support-value").remove();
                     return;
                 }
 
+                let displayValue = "";
+                // small epsilon for float comparison safety
+                const EPS = 1e-9;
+
+                if (numValue <= 1.0) {
+                    // Posterior Probability logic
+                    if (numValue + EPS < ppThreshold) {
+                        group.select("text.node-support-value").remove();
+                        return; // Hidden by threshold
+                    }
+                    displayValue = numValue.toFixed(2);
+                } else if (numValue <= 100) {
+                    // Bootstrap logic
+                    if (numValue + EPS < bootThreshold) {
+                        group.select("text.node-support-value").remove();
+                        return; // Hidden by threshold
+                    }
+                    displayValue = Math.round(numValue).toString();
+                } else {
+                    // Out of range? Remove.
+                    group.select("text.node-support-value").remove();
+                    return;
+                }
+
+                // --- 3. Vector Positioning ---
+                // d.x = vertical, d.y = horizontal in standard cluster layout
+                // Vector pointing FROM node TO parent
+                let xOff = 0, yOff = 0;
+                let textAnchor = "middle";
+
+                if (d.parent) {
+                    let vx = d.parent.y - d.y; // Horizontal component
+                    let vy = d.parent.x - d.x; // Vertical component
+                    const len = Math.hypot(vx, vy) || 1;
+                    const ux = vx / len;
+                    const uy = vy / len;
+
+                    // Perpendicular: (-uy, ux)
+                    let px = -uy;
+                    let py = ux;
+
+                    // Deterministic Flip: Ensure 'py' is positive leads to "down" on screen?
+                    // typically y increases downwards in SVG.
+                    // If we want labels BELOW the branch:
+                    // If branch is horizontal (uy ~ 0), we want py positive (down).
+                    // If branch is vertical (ux ~ 0), perpendicular is horizontal.
+                    // Helper Rule: Force py > 0 (downwards)
+                    if (py < 0) {
+                        px = -px;
+                        py = -py;
+                    }
+
+                    // Base offset: push along unit vector (away from parent! wait, "vx" is TO parent)
+                    // We want label slightly towards root? No, usually towards middle of branch.
+                    // d is the node. d.parent is header.
+                    // Label is usually placed at the node (d), or distinct from node?
+                    // Code logic: d corresponds to the Split.
+                    // phylotree draws lines from d.parent to d.
+                    // We are at d.
+
+                    // Position:
+                    // "Pull toward root": Move slightly along +vx (towards parent)
+                    // "Nudge below": Move along perpendicular
+
+                    xOff = (ux * 10) + (px * 6);
+                    yOff = (uy * 10) + (py * 6);
+
+                    // Anchoring
+                    if (ux < -0.2) textAnchor = "end";
+                    else if (ux > 0.2) textAnchor = "start";
+                    else textAnchor = "middle";
+
+                    // --- 4. Tip Zone Heuristic ---
+                    if (d.y > tipZoneStart) {
+                        // Near tips: push further towards root (away from tip)
+                        // vx points to parent (root-ward). So add more vx.
+                        xOff += (ux * 20);
+                        yOff += (uy * 20);
+
+                        // Also shrink font slightly
+                        fontPx = Math.max(6, fontPx - 1);
+                    }
+
+                    // Safe Fallback for tiny vectors
+                    if (len < 1e-6) {
+                        xOff = -8; yOff = 8; textAnchor = "end";
+                    }
+
+                } else {
+                    // Root node or weird state
+                    xOff = -10; yOff = 10; textAnchor = "end";
+                }
+
+
+                // --- 5. Draw / Update ---
+
+                // Idempotent: Select specific class
                 let text = group.select("text.node-support-value");
                 if (text.empty()) {
                     text = group.append("text").attr("class", "node-support-value");
                 }
 
                 text
-                    .attr("x", 8).attr("y", -8)
-                    .attr("text-anchor", "start")
-                    .style("font-size", "12px")
-                    .style("font-weight", "bold")
-                    .style("fill", "#c00")
+                    .attr("x", xOff)
+                    .attr("y", yOff)
+                    .attr("text-anchor", textAnchor)
+                    .attr("dominant-baseline", "hanging") // Good for "below" text
+                    // Inline styles for SVG Export
+                    .attr("fill", "#b30000")
+                    .attr("font-family", "sans-serif")
+                    .attr("font-weight", "500")
+                    .style("font-size", `${fontPx}px`) // Dynamic Zoom
+                    .style("fill", "#b30000") // Red
+                    // Painted Stroke Halo
+                    .style("paint-order", "stroke")
+                    .style("stroke", "rgba(255,255,255,0.85)")
+                    .style("stroke-width", "3px")
+                    .style("stroke-linejoin", "round")
                     .style("pointer-events", "none")
-                    .text(displayValue)
-                    .style("display", "block");
+                    .style("display", "block")
+                    .text(displayValue);
             });
         }
 
