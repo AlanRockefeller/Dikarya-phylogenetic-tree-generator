@@ -80,15 +80,15 @@ def _get_thread_count():
     return min(8, os.cpu_count() or 1)
 
 
-def _make_log_callback(job_id: Optional[str], step: str):
-    """Create a callback function for streaming stderr to Redis."""
+def _make_log_callback(job_id: Optional[str], step: str, stream: str):
+    """Create a callback function for streaming output to Redis."""
     if not job_id:
         return None
     
     from app.workers.events import publish_log
     
     def callback(line: str):
-        publish_log(job_id, step, "stderr", line)
+        publish_log(job_id, step, stream, line)
     
     return callback
 
@@ -135,7 +135,7 @@ def _run_mafft(
             cmd,
             stdout_path=output_fasta,  # MAFFT writes alignment to stdout
             stderr_path=log_file,
-            on_stderr_line=_make_log_callback(job_id, "align"),
+            on_stderr_line=_make_log_callback(job_id, "align", "stderr"),
         )
         
         if exit_code != 0:
@@ -173,7 +173,7 @@ def _run_muscle(
         exit_code, stats = run_command_streaming(
             cmd,
             stderr_path=log_file,
-            on_stderr_line=_make_log_callback(job_id, "align"),
+            on_stderr_line=_make_log_callback(job_id, "align", "stderr"),
         )
         
         if exit_code != 0:
@@ -206,7 +206,7 @@ def _run_clustalo(
         exit_code, stats = run_command_streaming(
             cmd,
             stderr_path=log_file,
-            on_stderr_line=_make_log_callback(job_id, "align"),
+            on_stderr_line=_make_log_callback(job_id, "align", "stderr"),
         )
         
         if exit_code != 0:
@@ -249,7 +249,7 @@ def _run_iqtree_builtin(
         exit_code, stats = run_command_streaming(
             cmd,
             stderr_path=log_file,
-            on_stderr_line=_make_log_callback(job_id, "align"),
+            on_stderr_line=_make_log_callback(job_id, "align", "stderr"),
         )
         
         if exit_code != 0:

@@ -69,15 +69,15 @@ def run_trimming(
         raise
 
 
-def _make_log_callback(job_id: Optional[str], step: str):
-    """Create a callback function for streaming stderr to Redis."""
+def _make_log_callback(job_id: Optional[str], step: str, stream: str):
+    """Create a callback function for streaming output to Redis."""
     if not job_id:
         return None
     
     from app.workers.events import publish_log
     
     def callback(line: str):
-        publish_log(job_id, step, "stderr", line)
+        publish_log(job_id, step, stream, line)
     
     return callback
 
@@ -103,8 +103,8 @@ def _run_trimal(
         exit_code, stats = run_command_streaming(
             cmd,
             stderr_path=log_file,
-            on_stdout_line=_make_log_callback(job_id, "trim"),
-            on_stderr_line=_make_log_callback(job_id, "trim"),
+            on_stdout_line=_make_log_callback(job_id, "trim", "stdout"),
+            on_stderr_line=_make_log_callback(job_id, "trim", "stderr"),
         )
         
         if exit_code != 0:
@@ -148,8 +148,8 @@ def _run_bmge(
         exit_code, stats = run_command_streaming(
             cmd,
             stderr_path=log_file,
-            on_stdout_line=_make_log_callback(job_id, "trim"),
-            on_stderr_line=_make_log_callback(job_id, "trim"),
+            on_stdout_line=_make_log_callback(job_id, "trim", "stdout"),
+            on_stderr_line=_make_log_callback(job_id, "trim", "stderr"),
         )
         
         if exit_code != 0:

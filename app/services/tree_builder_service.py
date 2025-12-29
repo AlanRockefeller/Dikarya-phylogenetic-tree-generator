@@ -96,15 +96,15 @@ def _get_thread_count(params: TreeBuilderParams) -> int:
     return min(8, os.cpu_count() or 1)
 
 
-def _make_log_callback(job_id: Optional[str], step: str):
-    """Create a callback function for streaming stderr to Redis."""
+def _make_log_callback(job_id: Optional[str], step: str, stream: str):
+    """Create a callback function for streaming output to Redis."""
     if not job_id:
         return None
     
     from app.workers.events import publish_log
     
     def callback(line: str):
-        publish_log(job_id, step, "stderr", line)
+        publish_log(job_id, step, stream, line)
     
     return callback
 
@@ -195,8 +195,8 @@ def _run_raxml(
         exit_code, stats = run_command_streaming(
             cmd,
             stderr_path=log_file,
-            on_stdout_line=_make_log_callback(job_id, "tree"),  # RAxML writes progress to stdout
-            on_stderr_line=_make_log_callback(job_id, "tree"),
+            on_stdout_line=_make_log_callback(job_id, "tree", "stdout"),  # RAxML writes progress to stdout
+            on_stderr_line=_make_log_callback(job_id, "tree", "stderr"),
         )
         
         if exit_code != 0:
@@ -251,8 +251,8 @@ def _run_iqtree(
         exit_code, stats = run_command_streaming(
             cmd,
             stderr_path=log_file,
-            on_stdout_line=_make_log_callback(job_id, "tree"),  # IQ-TREE writes progress to stdout
-            on_stderr_line=_make_log_callback(job_id, "tree"),
+            on_stdout_line=_make_log_callback(job_id, "tree", "stdout"),  # IQ-TREE writes progress to stdout
+            on_stderr_line=_make_log_callback(job_id, "tree", "stderr"),
         )
         
         if exit_code != 0:
@@ -309,8 +309,8 @@ def _run_mrbayes(
         exit_code, stats = run_command_streaming(
             cmd,
             stderr_path=log_file,
-            on_stdout_line=_make_log_callback(job_id, "tree"),  # MrBayes uses stdout
-            on_stderr_line=_make_log_callback(job_id, "tree"),
+            on_stdout_line=_make_log_callback(job_id, "tree", "stdout"),  # MrBayes uses stdout
+            on_stderr_line=_make_log_callback(job_id, "tree", "stderr"),
         )
         
         if exit_code != 0:

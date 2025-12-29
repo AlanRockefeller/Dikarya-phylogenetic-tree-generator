@@ -482,11 +482,17 @@ def job_events_stream(job_id):
                 # Still keep connection open briefly for any final events
                 pass
             
+            # Throttle timers
             last_ping = time.time()
+            last_db_poll = 0.0  # Start at 0 to trigger immediate first poll
+            
+            # Tunable interval for DB polling (seconds)
+            DB_POLL_INTERVAL = 1.0
             
             while True:
-                # Check for PubSub messages (non-blocking with timeout)
-                message = pubsub.get_message(timeout=1.0)
+                # Check for PubSub messages (non-blocking with short timeout)
+                # Use shorter timeout to allow responsive loop with brief sleep
+                message = pubsub.get_message(timeout=0.1)
                 
                 if message and message['type'] == 'message':
                     data = message['data']
@@ -504,23 +510,28 @@ def job_events_stream(job_id):
                     except json.JSONDecodeError:
                         pass
                 
-                # Send keepalive ping every 15 seconds
                 now = time.time()
+                
+                # Send keepalive ping every 15 seconds
                 if now - last_ping >= 15:
                     yield "event: ping\ndata: {}\n\n"
                     last_ping = now
                 
-                # Check if job is terminal (poll DB periodically)
+                # Poll DB for job status at most once per DB_POLL_INTERVAL
                 if job_status not in ('completed', 'failed', 'finished'):
-                    # Refresh status every 5 seconds
-                    if int(now) % 5 == 0:
+                    if now - last_db_poll >= DB_POLL_INTERVAL:
+                        last_db_poll = now
                         db.session.expire_all()
                         db_job_check = Job.query.get(job_id)
+                        logging.debug(f"SSE DB poll for job {job_id}: status={db_job_check.status if db_job_check else 'None'}")
                         if db_job_check and db_job_check.status in ('completed', 'failed'):
                             job_status = db_job_check.status
-                            # Give a moment for final events
+                            # Give a moment for final events from Redis
                             time.sleep(1)
                             break
+                
+                # Brief sleep to prevent CPU spin (50-100ms effective with pubsub timeout)
+                time.sleep(0.05)
         
         finally:
             pubsub.unsubscribe()
