@@ -141,6 +141,17 @@ class JobStatusClient {
         // Update pipeline timeline
         if (job.meta && job.meta.steps) {
             this.updateTimeline(job.meta.steps);
+
+            // Show/hide trimmed FASTA download based on whether trimming was performed
+            const trimStep = job.meta.steps.trim;
+            const trimmedLink = document.getElementById('dl-trimmed');
+            if (trimmedLink) {
+                if (trimStep && trimStep.state && trimStep.state !== 'skipped') {
+                    trimmedLink.style.display = '';
+                } else {
+                    trimmedLink.style.display = 'none';
+                }
+            }
         }
 
         // Update current step
@@ -213,6 +224,15 @@ class JobStatusClient {
     }
 
     handleStepStart(event) {
+        // Show optional steps when they start (blast, trim)
+        const optionalSteps = ['blast', 'trim'];
+        if (optionalSteps.includes(event.step)) {
+            const stepEl = this.stepElements[event.step];
+            if (stepEl) {
+                stepEl.style.display = '';
+            }
+        }
+
         // Update timeline
         this.updateStepState(event.step, 'running');
 
@@ -260,7 +280,23 @@ class JobStatusClient {
     }
 
     updateTimeline(steps) {
+        // Optional steps that should only be shown if they're actually being used
+        const optionalSteps = ['blast', 'trim'];
+
         for (const [stepKey, stepInfo] of Object.entries(steps)) {
+            const stepEl = this.stepElements[stepKey];
+            if (!stepEl) continue;
+
+            // Show optional steps only if they have a non-skipped state
+            // (i.e., they're actually part of this job's pipeline)
+            if (optionalSteps.includes(stepKey)) {
+                if (stepInfo.state && stepInfo.state !== 'skipped') {
+                    stepEl.style.display = '';  // Show
+                } else {
+                    stepEl.style.display = 'none';  // Keep hidden
+                }
+            }
+
             this.updateStepState(stepKey, stepInfo.state, stepInfo.label);
         }
     }
@@ -381,7 +417,8 @@ class JobStatusClient {
         // Enable View Tree button
         const btn = this.elements.viewTreeBtn;
         if (btn && resultFiles) {
-            btn.disabled = false;
+            btn.classList.remove('disabled');
+            btn.setAttribute('aria-disabled', 'false');
             btn.href = resultFiles.tree_newick?.replace('/api/job', '/job').replace('/download/tree/newick', '/view')
                 || `/job/${this.jobId}/view`;
         }
@@ -504,6 +541,152 @@ document.addEventListener('DOMContentLoaded', () => {
         clearBtn.addEventListener('click', () => {
             window.jobStatusClient.clearTerminal();
         });
+    }
+
+    // Setup tab switching
+    const tabBtns = document.querySelectorAll('.tab-btn');
+    console.log('Found tab buttons:', tabBtns.length);
+    tabBtns.forEach(btn => {
+        btn.addEventListener('click', () => {
+            const tabName = btn.dataset.tab;
+            console.log('Tab clicked:', tabName);
+
+            // Update button active states
+            tabBtns.forEach(b => b.classList.remove('active'));
+            btn.classList.add('active');
+
+            // Update content visibility
+            document.querySelectorAll('.tab-content').forEach(pane => {
+                pane.classList.remove('active');
+                pane.style.display = 'none';
+            });
+
+            const targetPane = document.getElementById(`pane-${tabName}`);
+            console.log('Target pane:', targetPane);
+            if (targetPane) {
+                targetPane.classList.add('active');
+                targetPane.style.display = 'block';
+            }
+
+            // Load content on first switch to each tab
+            if (tabName === 'sequences' && !window.sequencesLoaded) {
+                loadSequences();
+            }
+            if (tabName === 'aligned' && !window.alignedLoaded) {
+                loadAligned();
+            }
+            if (tabName === 'pipeline-log' && !window.pipelineLogLoaded) {
+                loadLog('pipeline', 'pipeline-log-content');
+            }
+            if (tabName === 'alignment-log' && !window.alignmentLogLoaded) {
+                loadLog('alignment', 'alignment-log-content');
+            }
+            if (tabName === 'tree-log' && !window.treeLogLoaded) {
+                loadLog('tree_builder', 'tree-log-content');
+            }
+        });
+    });
+
+    // Generic function to load log files
+    async function loadLog(logName, elementId) {
+        const content = document.getElementById(elementId);
+        content.textContent = 'Loading log...';
+
+        try {
+            const response = await fetch(`/api/job/${jobId}/logs/${logName}`);
+
+            if (!response.ok) {
+                content.textContent = `Log not available yet. (Status: ${response.status})`;
+                return;
+            }
+
+            const logText = await response.text();
+            content.textContent = logText || '(Empty log)';
+
+            // Mark as loaded
+            if (logName === 'pipeline') window.pipelineLogLoaded = true;
+            if (logName === 'alignment') window.alignmentLogLoaded = true;
+            if (logName === 'tree_builder') window.treeLogLoaded = true;
+
+        } catch (err) {
+            console.error(`Failed to load ${logName} log:`, err);
+            content.textContent = 'Failed to load log.';
+        }
+    }
+
+    // Function to load input sequences
+    async function loadSequences() {
+        const content = document.getElementById('sequence-content');
+        const title = document.getElementById('sequence-title');
+        const count = document.getElementById('sequence-count');
+
+        try {
+            const response = await fetch(`/api/job/${jobId}/download/fasta/original`);
+
+            if (!response.ok) {
+                content.textContent = 'Sequences not available yet.';
+                return;
+            }
+
+            const fastaText = await response.text();
+            content.textContent = fastaText;
+
+            // Count sequences (lines starting with >)
+            const seqCount = (fastaText.match(/^>/gm) || []).length;
+            count.textContent = `${seqCount} sequence${seqCount !== 1 ? 's' : ''}`;
+
+            title.textContent = 'Input Sequences';
+
+            window.sequencesLoaded = true;
+        } catch (err) {
+            console.error('Failed to load sequences:', err);
+            content.textContent = 'Failed to load sequences.';
+        }
+    }
+
+    // Function to load aligned sequences
+    async function loadAligned() {
+        const content = document.getElementById('aligned-content');
+        const title = document.getElementById('aligned-title');
+        const count = document.getElementById('aligned-count');
+
+        console.log('Loading aligned sequences for job:', jobId);
+        content.textContent = 'Loading aligned sequences...';
+
+        try {
+            const response = await fetch(`/api/job/${jobId}/download/fasta/aligned`);
+            console.log('Aligned response status:', response.status);
+
+            if (!response.ok) {
+                const errorText = await response.text();
+                console.error('Aligned fetch failed:', response.status, errorText);
+                content.textContent = `Aligned sequences not available yet.\n(Status: ${response.status})`;
+                return;
+            }
+
+            const fastaText = await response.text();
+
+            // Check if it looks like FASTA (starts with >)
+            if (!fastaText.startsWith('>')) {
+                console.error('Response does not look like FASTA:', fastaText.substring(0, 100));
+                content.textContent = 'Aligned sequences not available yet.';
+                return;
+            }
+
+            content.textContent = fastaText;
+
+            // Count sequences (lines starting with >)
+            const seqCount = (fastaText.match(/^>/gm) || []).length;
+            count.textContent = `${seqCount} sequence${seqCount !== 1 ? 's' : ''}`;
+
+            title.textContent = 'Aligned Sequences';
+
+            window.alignedLoaded = true;
+            console.log('Aligned sequences loaded successfully');
+        } catch (err) {
+            console.error('Failed to load aligned sequences:', err);
+            content.textContent = 'Failed to load aligned sequences.';
+        }
     }
 });
 

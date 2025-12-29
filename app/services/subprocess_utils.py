@@ -99,7 +99,6 @@ def run_command_streaming(
     """
     import os
     import time
-    import select
     from collections import deque
     
     start_time = time.time()
@@ -131,7 +130,7 @@ def run_command_streaming(
         # Open stdout file if specified
         stdout_file = None
         if stdout_path:
-            stdout_file = open(stdout_path, 'w')
+            stdout_file = open(stdout_path, 'w', encoding='utf-8', newline='\n')
         
         # Open stderr file if specified
         stderr_file = None
@@ -141,6 +140,7 @@ def run_command_streaming(
             stderr_file.write(f"CMD: {' '.join(args)}\n")
             stderr_file.write("-" * 40 + "\n")
         
+        process = None
         try:
             # Start process
             process = subprocess.Popen(
@@ -235,7 +235,8 @@ def run_command_streaming(
         
     except subprocess.TimeoutExpired:
         logger.error(f"Command timed out after {timeout}s: {args}")
-        process.kill()
+        if process:
+            process.kill()
         stats["duration_seconds"] = time.time() - start_time
         stats["stderr_tail"] = list(stderr_tail_buffer)
         stats["stderr_tail"].append(f"[TIMEOUT] Command killed after {timeout}s")

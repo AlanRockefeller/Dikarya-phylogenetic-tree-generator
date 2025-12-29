@@ -249,6 +249,26 @@ def run_phylo_job(job_params: dict) -> dict:
                 job.meta["current_step"] = None
                 job.meta["current_tool"] = None
                 job.meta["started_at"] = time.time()
+                
+                # Pre-mark optional steps as skipped based on job parameters
+                # This ensures the UI shows correct pipeline from the start
+                input_type = _normalize_input_type(job_params.get("input_type"))
+                blast_mode = _normalize_blast_mode(job_params.get("blast_mode"))
+                trim_method = job_params.get("trimming_method", "none")
+                if trim_method == "default":
+                    trim_method = Config.BEGINNER_DEFAULT_TRIMMING
+                
+                # BLAST is only used for single accession with optional blast
+                will_do_blast = (input_type == "accession" and blast_mode == "optional")
+                if not will_do_blast:
+                    job.meta["steps"][STEP_BLAST]["state"] = STATE_SKIPPED
+                    job.meta["steps"][STEP_BLAST]["label"] = "BLAST Search (skipped)"
+                
+                # Trim is skipped if method is none
+                if not trim_method or trim_method.lower() == "none":
+                    job.meta["steps"][STEP_TRIM]["state"] = STATE_SKIPPED
+                    job.meta["steps"][STEP_TRIM]["label"] = "Trimming (skipped)"
+                
                 job.save_meta()
             
             # Publish job running

@@ -192,6 +192,10 @@ def _run_raxml(
     log_file = output_newick.parent.parent / "logs" / "tree_builder.log"
     
     if job_id:
+        # Publish command line (displayed in green)
+        from app.workers.events import publish_command
+        publish_command(job_id, "tree", cmd)
+        
         exit_code, stats = run_command_streaming(
             cmd,
             stderr_path=log_file,
@@ -248,6 +252,10 @@ def _run_iqtree(
     log_file = output_newick.parent.parent / "logs" / "tree_builder.log"
     
     if job_id:
+        # Publish command line (displayed in green)
+        from app.workers.events import publish_command
+        publish_command(job_id, "tree", cmd)
+        
         exit_code, stats = run_command_streaming(
             cmd,
             stderr_path=log_file,
@@ -305,6 +313,10 @@ def _run_mrbayes(
     log_file = output_newick.parent.parent / "logs" / "tree_builder.log"
     
     if job_id:
+        # Publish command line (displayed in green)
+        from app.workers.events import publish_command
+        publish_command(job_id, "tree", cmd)
+        
         # MrBayes prints progress to stdout
         exit_code, stats = run_command_streaming(
             cmd,

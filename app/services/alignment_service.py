@@ -130,6 +130,10 @@ def _run_mafft(
     log_file = output_fasta.parent.parent / "logs" / "alignment.log"
     
     if job_id:
+        # Publish command line (displayed in green)
+        from app.workers.events import publish_command
+        publish_command(job_id, "align", cmd)
+        
         # Use streaming runner: stdout → file, stderr → Redis + log
         exit_code, stats = run_command_streaming(
             cmd,
@@ -170,6 +174,10 @@ def _run_muscle(
     log_file = output_fasta.parent.parent / "logs" / "alignment.log"
     
     if job_id:
+        # Publish command line (displayed in green)
+        from app.workers.events import publish_command
+        publish_command(job_id, "align", cmd)
+        
         exit_code, stats = run_command_streaming(
             cmd,
             stderr_path=log_file,
@@ -203,6 +211,10 @@ def _run_clustalo(
     log_file = output_fasta.parent.parent / "logs" / "alignment.log"
     
     if job_id:
+        # Publish command line (displayed in green)
+        from app.workers.events import publish_command
+        publish_command(job_id, "align", cmd)
+        
         exit_code, stats = run_command_streaming(
             cmd,
             stderr_path=log_file,
@@ -246,6 +258,10 @@ def _run_iqtree_builtin(
     log_file = output_fasta.parent.parent / "logs" / "alignment.log"
     
     if job_id:
+        # Publish command line (displayed in green)
+        from app.workers.events import publish_command
+        publish_command(job_id, "align", cmd)
+        
         exit_code, stats = run_command_streaming(
             cmd,
             stderr_path=log_file,

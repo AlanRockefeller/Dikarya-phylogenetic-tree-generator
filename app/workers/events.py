@@ -229,6 +229,25 @@ def publish_log(job_id: str, step: str, stream: str, line: str) -> None:
     })
 
 
+def publish_command(job_id: str, step: str, args: list) -> None:
+    """
+    Publish a command line event (displayed in green in the terminal).
+    
+    Args:
+        job_id: Job identifier
+        step: Pipeline step key (align, tree, etc.)
+        args: Command arguments list (will be joined with spaces)
+    """
+    cmd_line = " ".join(str(arg) for arg in args)
+    
+    publish_event(job_id, {
+        "type": EVENT_LOG,
+        "step": step,
+        "stream": "cmd",
+        "line": f"$ {cmd_line}",
+    })
+
+
 def publish_step_start(
     job_id: str,
     step: str,

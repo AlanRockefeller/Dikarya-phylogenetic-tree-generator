@@ -7,6 +7,30 @@ from app.extensions import db
 from app.models import Job
 import logging
 
+
+def _check_job_access(job_id):
+    """
+    Check if current user can access the given job.
+    
+    Returns:
+        (db_job, error_response) - If error_response is not None, return it immediately.
+    """
+    db_job = Job.query.get(job_id)
+    job_dir = Config.JOB_DIR / job_id
+    
+    # Check if job exists
+    if not db_job and not job_dir.exists():
+        return None, (jsonify({"status": "error", "error": "Job not found"}), 404)
+    
+    # If job has an owner, verify the current user is that owner
+    if db_job and db_job.user_id is not None:
+        if not current_user.is_authenticated:
+            return None, (jsonify({"status": "error", "error": "Authentication required"}), 401)
+        if current_user.id != db_job.user_id:
+            return None, (jsonify({"status": "error", "error": "Access denied"}), 403)
+    
+    return db_job, None
+
 @bp.route('/job', methods=['POST'])
 def create_job():
     data = request.get_json() or {}
@@ -278,10 +302,12 @@ def download_nexus(job_id):
 
 @bp.route('/job/<job_id>/download/fasta/original', methods=['GET'])
 def download_fasta_original(job_id):
+    # Check authorization
+    _, error_response = _check_job_access(job_id)
+    if error_response:
+        return error_response
+    
     job_dir = Config.JOB_DIR / job_id
-    if not job_dir.exists():
-        return jsonify({"status": "error", "error": "Job not found"}), 404
-        
     path = job_dir / "input" / "input_raw.fasta"
     if not path.exists():
         return jsonify({"status": "error", "error": "FASTA file not found"}), 404
@@ -290,15 +316,53 @@ def download_fasta_original(job_id):
 
 @bp.route('/job/<job_id>/download/fasta/pruned', methods=['GET'])
 def download_fasta_pruned(job_id):
+    # Check authorization
+    _, error_response = _check_job_access(job_id)
+    if error_response:
+        return error_response
+    
     job_dir = Config.JOB_DIR / job_id
-    if not job_dir.exists():
-        return jsonify({"status": "error", "error": "Job not found"}), 404
-        
     path = job_dir / "alignment" / "alignment_pruned.fasta"
     if not path.exists():
         return jsonify({"status": "error", "error": "Pruned FASTA not found"}), 404
         
     return send_file(path, as_attachment=True, download_name="sequences_pruned.fasta")
+
+@bp.route('/job/<job_id>/download/fasta/aligned', methods=['GET'])
+def download_fasta_aligned(job_id):
+    """Download the aligned (but not trimmed) FASTA file."""
+    # Check authorization
+    _, error_response = _check_job_access(job_id)
+    if error_response:
+        return error_response
+    
+    job_dir = Config.JOB_DIR / job_id
+    
+    # Return the raw alignment (before trimming)
+    path = job_dir / "alignment" / "alignment_raw.fasta"
+    if not path.exists():
+        path = job_dir / "alignment" / "aligned.fasta"
+    
+    if not path.exists():
+        return jsonify({"status": "error", "error": "Aligned FASTA not found"}), 404
+        
+    return send_file(path, as_attachment=True, download_name="sequences_aligned.fasta")
+
+@bp.route('/job/<job_id>/download/fasta/trimmed', methods=['GET'])
+def download_fasta_trimmed(job_id):
+    """Download the trimmed FASTA file (only available if trimming was performed)."""
+    # Check authorization
+    _, error_response = _check_job_access(job_id)
+    if error_response:
+        return error_response
+    
+    job_dir = Config.JOB_DIR / job_id
+    path = job_dir / "alignment" / "alignment_trimmed.fasta"
+    
+    if not path.exists():
+        return jsonify({"status": "error", "error": "Trimmed FASTA not found (trimming may not have been performed)"}), 404
+        
+    return send_file(path, as_attachment=True, download_name="sequences_trimmed.fasta")
 
 
 # =============================================================================
@@ -357,6 +421,10 @@ def _build_snapshot(job_id: str) -> dict:
         # DB status is authoritative for completed/failed
         if db_job.status in ('completed', 'failed'):
             status = db_job.status
+    
+    # Normalize: RQ uses 'finished', we use 'completed'
+    if status == 'finished':
+        status = 'completed'
     
     # Build job info
     job_info = {
@@ -424,12 +492,12 @@ def _build_snapshot(job_id: str) -> dict:
             "fasta_original": f"/api/job/{job_id}/download/fasta/original",
         }
     
-    # Read log tails
+    # Read log tails (generous limits to capture most output for completed jobs)
     logs_dir = job_dir / "logs"
     log_tails = {
-        "pipeline": _read_log_tail(logs_dir / "pipeline.log", max_lines=200),
-        "alignment": _read_log_tail(logs_dir / "alignment.log", max_lines=100),
-        "tree_builder": _read_log_tail(logs_dir / "tree_builder.log", max_lines=100),
+        "pipeline": _read_log_tail(logs_dir / "pipeline.log", max_lines=500),
+        "alignment": _read_log_tail(logs_dir / "alignment.log", max_lines=500),
+        "tree_builder": _read_log_tail(logs_dir / "tree_builder.log", max_lines=1000),
     }
     
     return {
@@ -455,12 +523,12 @@ def job_events_stream(job_id):
     import redis
     from flask import Response, stream_with_context
     
-    job_dir = Config.JOB_DIR / job_id
+    # Check authorization
+    db_job, error_response = _check_job_access(job_id)
+    if error_response:
+        return error_response
     
-    # Validate job exists (either in DB or as directory)
-    db_job = Job.query.get(job_id)
-    if not db_job and not job_dir.exists():
-        return jsonify({"status": "error", "error": "Job not found"}), 404
+    job_dir = Config.JOB_DIR / job_id
     
     def generate():
         # Connect to Redis for PubSub
@@ -478,7 +546,7 @@ def job_events_stream(job_id):
             
             # Check if job is already terminal
             job_status = snapshot["job"]["status"]
-            if job_status in ('completed', 'failed', 'finished'):
+            if job_status in ('completed', 'failed'):
                 # Still keep connection open briefly for any final events
                 pass
             
@@ -518,7 +586,7 @@ def job_events_stream(job_id):
                     last_ping = now
                 
                 # Poll DB for job status at most once per DB_POLL_INTERVAL
-                if job_status not in ('completed', 'failed', 'finished'):
+                if job_status not in ('completed', 'failed'):
                     if now - last_db_poll >= DB_POLL_INTERVAL:
                         last_db_poll = now
                         db.session.expire_all()
@@ -563,9 +631,12 @@ def download_log(job_id, log_name):
     - alignment: alignment.log  
     - tree_builder: tree_builder.log
     """
+    # Check authorization
+    _, error_response = _check_job_access(job_id)
+    if error_response:
+        return error_response
+    
     job_dir = Config.JOB_DIR / job_id
-    if not job_dir.exists():
-        return jsonify({"status": "error", "error": "Job not found"}), 404
     
     # Map log names to files
     log_files = {

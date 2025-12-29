@@ -100,6 +100,10 @@ def _run_trimal(
     log_file = output_alignment.parent.parent / "logs" / "alignment.log"
     
     if job_id:
+        # Publish command line (displayed in green)
+        from app.workers.events import publish_command
+        publish_command(job_id, "trim", cmd)
+        
         exit_code, stats = run_command_streaming(
             cmd,
             stderr_path=log_file,
@@ -145,6 +149,10 @@ def _run_bmge(
     log_file = output_alignment.parent.parent / "logs" / "alignment.log"
     
     if job_id:
+        # Publish command line (displayed in green)
+        from app.workers.events import publish_command
+        publish_command(job_id, "trim", cmd)
+        
         exit_code, stats = run_command_streaming(
             cmd,
             stderr_path=log_file,
