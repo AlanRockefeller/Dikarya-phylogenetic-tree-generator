@@ -19,6 +19,10 @@ def create_app(config_name='default'):
     login_manager.init_app(app)
 
     # Register Blueprints
+    # Journal blueprint handles the root route and static pages
+    from app.journal import bp as journal_bp
+    app.register_blueprint(journal_bp)
+
     from app.main import bp as main_bp
     app.register_blueprint(main_bp)
 

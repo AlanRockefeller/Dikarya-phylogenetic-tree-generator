@@ -1,0 +1,67 @@
+{% extends "journal/base_journal.html" %}
+
+{% block title %}Support the Journal - Dikarya{% endblock %}
+
+{% block content %}
+<div class="journal-page-header">
+    <h1>Subscription & Support</h1>
+</div>
+
+<section class="journal-section">
+    <h2>Open Access Commitment</h2>
+    <div class="journal-content" style="max-width: 100%;">
+        <p>Dikarya is fully open access with no subscription fees. All articles are freely available to readers
+            worldwide. We believe scientific knowledge should be accessible to everyone.</p>
+        <p>To sustain this model, we rely on author fees, institutional support, and generous donations from the
+            mycological community.</p>
+    </div>
+</section>
+
+<section class="journal-section">
+    <h2>Support Options</h2>
+    <div class="journal-card-grid">
+        <div class="journal-card">
+            <h3>💚 Individual Donation</h3>
+            <p>Support Dikarya with a one-time or recurring donation. Every contribution helps maintain our open-access
+                mission.</p>
+            <p style="font-size: 0.9rem; color: var(--text-muted);">Coming soon: Online donation portal</p>
+        </div>
+        <div class="journal-card">
+            <h3>🏛️ Institutional Sponsorship</h3>
+            <p>Universities, research institutes, and societies can become sponsors. Sponsors receive recognition and
+                help reduce author fees.</p>
+            <a href="mailto:sponsor@dikarya.us">Contact for details →</a>
+        </div>
+        <div class="journal-card">
+            <h3>🤝 In-Kind Support</h3>
+            <p>Contribute server resources, editorial time, or technical expertise to help run the journal.</p>
+            <a href="{{ url_for('journal.contact') }}">Get in touch →</a>
+        </div>
+    </div>
+</section>
+
+<section class="journal-section">
+    <h2>Author Fees</h2>
+    <div class="journal-content" style="max-width: 100%;">
+        <p>To support publication costs, we charge a modest article processing charge (APC) upon acceptance:</p>
+        <ul>
+            <li><strong>Research Articles:</strong> $400 USD</li>
+            <li><strong>Short Communications:</strong> $200 USD</li>
+            <li><strong>Reviews:</strong> By invitation (no fee)</li>
+        </ul>
+        <h2>Fee Waivers</h2>
+        <p>We offer full or partial fee waivers based on financial need. Authors from low-income countries or without
+            institutional funding are encouraged to request waivers during submission. No author will be turned away for
+            inability to pay.</p>
+    </div>
+</section>
+
+<section class="journal-section">
+    <h2>Current Sponsors</h2>
+    <div class="journal-announcement">
+        <h4>Become Our First Sponsor</h4>
+        <p>Your institution could be listed here as a founding supporter of Dikarya. <a
+                href="mailto:sponsor@dikarya.us">Contact us</a> to discuss sponsorship opportunities.</p>
+    </div>
+</section>
+{% endblock %}

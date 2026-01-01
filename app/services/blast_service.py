@@ -31,13 +31,15 @@ def blast_from_sequence(seq: str, config: Config, logger=logger) -> Dict:
         
         _poll_blast(rid, rtoe, logger)
         
-        hit_accessions = _fetch_blast_results(rid)
+        blast_result = _fetch_blast_results(rid)
+        hit_accessions = blast_result.get("accessions", [])
+        hit_details = blast_result.get("hit_details", [])
         logger.info(f"BLAST finished. Found {len(hit_accessions)} hits.")
         
         fasta_content = _fetch_fasta_for_accessions(hit_accessions)
         logger.info(f"Downloaded FASTA for {len(hit_accessions)} accessions.")
         
-        return _save_cache(query_hash, hit_accessions, fasta_content, config)
+        return _save_cache(query_hash, hit_accessions, hit_details, fasta_content, config)
         
     except Exception as e:
         logger.error(f"BLAST failed: {e}")
@@ -75,16 +77,24 @@ def blast_from_accessions(accessions: List[str], config: Config, logger=logger) 
         
         _poll_blast(rid, rtoe, logger)
         
-        hit_accessions = _fetch_blast_results(rid)
+        blast_result = _fetch_blast_results(rid)
+        hit_accessions = blast_result.get("accessions", [])
+        hit_details = blast_result.get("hit_details", [])
         logger.info(f"BLAST finished. Found {len(hit_accessions)} hits.")
         
         # Combine original accessions with hits to ensure we have everything
         all_accessions = list(set(sorted_accessions + hit_accessions))
         
+        # Also add original accessions to hit_details if not present
+        existing_accs = {h["accession"] for h in hit_details}
+        for acc in sorted_accessions:
+            if acc not in existing_accs:
+                hit_details.insert(0, {"accession": acc, "organism": "(query)"})
+        
         fasta_content = _fetch_fasta_for_accessions(all_accessions)
         logger.info(f"Downloaded FASTA for {len(all_accessions)} accessions.")
         
-        return _save_cache(query_hash, all_accessions, fasta_content, config)
+        return _save_cache(query_hash, all_accessions, hit_details, fasta_content, config)
 
     except Exception as e:
         logger.error(f"BLAST from accessions failed: {e}")
@@ -106,6 +116,7 @@ def _check_cache(query_hash: str, config: Config) -> Optional[Dict]:
                 "cached": True,
                 "sequence_count": metadata["sequence_count"],
                 "hit_accessions": metadata["hit_accessions"],
+                "hit_details": metadata.get("hit_details", []),  # Include organism info
                 "fasta_path": str(fasta_path),
                 "metadata_path": str(json_path)
             }
@@ -113,7 +124,7 @@ def _check_cache(query_hash: str, config: Config) -> Optional[Dict]:
             return None
     return None
 
-def _save_cache(query_hash: str, hit_accessions: List[str], fasta_content: str, config: Config) -> Dict:
+def _save_cache(query_hash: str, hit_accessions: List[str], hit_details: List[Dict], fasta_content: str, config: Config) -> Dict:
     cache_dir = config.BLAST_CACHE_DIR
     cache_dir.mkdir(parents=True, exist_ok=True)
     
@@ -124,6 +135,7 @@ def _save_cache(query_hash: str, hit_accessions: List[str], fasta_content: str, 
         "query_hash": query_hash,
         "sequence_count": len(hit_accessions),
         "hit_accessions": hit_accessions,
+        "hit_details": hit_details,  # Include organism info
         "timestamp": time.time()
     }
     
@@ -137,23 +149,31 @@ def _save_cache(query_hash: str, hit_accessions: List[str], fasta_content: str, 
         "cached": False,
         "sequence_count": len(hit_accessions),
         "hit_accessions": hit_accessions,
+        "hit_details": hit_details,
         "fasta_path": str(fasta_path),
         "metadata_path": str(json_path)
     }
 
 def _submit_blast_request(seq: str) -> Tuple[str, int]:
+    """Submit a BLAST request to NCBI and return RID and estimated wait time."""
+    # Log sequence info
+    seq_preview = seq[:100] + "..." if len(seq) > 100 else seq
+    logger.info(f"Submitting BLAST request, sequence preview: {seq_preview}")
+    
     params = {
         "CMD": "Put",
         "PROGRAM": "blastn",
         "DATABASE": "nt",
         "QUERY": seq,
-        "HITLIST_SIZE": 100,
-        "FORMAT_TYPE": "JSON2", # Request JSON for easier parsing if possible, though standard is often XML/Text
-        # We'll stick to standard and poll for JSON/XML later
-        "EMAIL": "blast_user@example.com" # Placeholder
+        "HITLIST_SIZE": 50,  # Request 50 hits
+        "ALIGNMENTS": 50,    # Return alignments for 50 hits
+        "FORMAT_TYPE": "JSON2",
+        "EMAIL": "dikarya@dikarya.us"
     }
     response = requests.post(NCBI_BLAST_URL, data=params)
     response.raise_for_status()
+    
+    logger.debug(f"BLAST submission response: {response.text[:500]}")
     
     # Parse RID and RTOE from response text
     # Response usually contains: "    RID = ...\n    RTOE = ..."
@@ -170,17 +190,19 @@ def _submit_blast_request(seq: str) -> Tuple[str, int]:
                 pass
                 
     if not rid:
-        raise ValueError("Could not retrieve RID from NCBI BLAST submission")
-        
+        raise ValueError(f"Could not retrieve RID from NCBI BLAST submission. Response: {response.text[:500]}")
+    
+    logger.info(f"BLAST submission successful. RID={rid}, RTOE={rtoe}")
     return rid, rtoe
 
 def _poll_blast(rid: str, rtoe: int, logger) -> None:
+    """Poll NCBI for BLAST job completion."""
     # Wait initial RTOE
     logger.info(f"Waiting {rtoe} seconds for RTOE...")
     time.sleep(rtoe)
     
     start_time = time.time()
-    max_wait = 600 # 10 minutes max
+    max_wait = 600  # 10 minutes max
     
     while (time.time() - start_time) < max_wait:
         params = {
@@ -190,6 +212,9 @@ def _poll_blast(rid: str, rtoe: int, logger) -> None:
         }
         response = requests.get(NCBI_BLAST_URL, params=params)
         content = response.text
+        
+        # Log full poll response for debugging
+        logger.debug(f"Poll response for RID {rid}: {content[:500]}")
         
         if "Status=WAITING" in content:
             logger.info("BLAST Status: WAITING. Sleeping 10s...")
@@ -205,15 +230,18 @@ def _poll_blast(rid: str, rtoe: int, logger) -> None:
         if "Status=READY" in content:
             if "ThereAreHits=yes" in content:
                 logger.info("BLAST Status: READY with hits.")
-                return
             else:
-                logger.warning("BLAST Status: READY but NO hits found.")
-                return
+                # Still try to fetch - sometimes this flag is wrong
+                logger.warning("BLAST Status: READY but ThereAreHits=no (will still attempt to fetch results).")
+            return
 
     raise TimeoutError("BLAST timed out waiting for results")
 
 def _fetch_blast_results(rid: str) -> List[str]:
-    # Fetch results in JSON format
+    """Fetch BLAST results from NCBI. Handle both raw JSON and ZIP-compressed responses."""
+    import io
+    import zipfile
+    
     params = {
         "CMD": "Get",
         "FORMAT_TYPE": "JSON2",
@@ -222,35 +250,125 @@ def _fetch_blast_results(rid: str) -> List[str]:
     response = requests.get(NCBI_BLAST_URL, params=params)
     response.raise_for_status()
     
-    try:
-        data = response.json()
-        # Navigate JSON structure to find hits
-        # Structure: BlastOutput2 -> report -> results -> search -> hits -> [ ... ]
-        hits = data.get("BlastOutput2", [])
-        if not hits:
+    content_type = response.headers.get('content-type', '')
+    logger.info(f"BLAST result content-type: {content_type}, length: {len(response.content)} bytes")
+    
+    # Handle ZIP-compressed response (NCBI sometimes returns JSON in a ZIP)
+    if 'application/zip' in content_type or response.content[:2] == b'PK':
+        logger.info("Detected ZIP-compressed BLAST response, extracting...")
+        try:
+            with zipfile.ZipFile(io.BytesIO(response.content)) as zf:
+                # Find the JSON file in the archive
+                json_files = [f for f in zf.namelist() if f.endswith('.json')]
+                logger.info(f"ZIP contains files: {zf.namelist()}")
+                
+                if not json_files:
+                    logger.error("No JSON files found in ZIP archive")
+                    return []
+                
+                # Read the main JSON file (or first JSON ending with _1.json)
+                main_json = None
+                for jf in json_files:
+                    if '_1.json' in jf:
+                        main_json = jf
+                        break
+                if not main_json:
+                    main_json = json_files[0]
+                
+                logger.info(f"Reading JSON from ZIP: {main_json}")
+                content = zf.read(main_json).decode('utf-8')
+        except Exception as e:
+            logger.error(f"Failed to extract ZIP: {e}")
             return []
-            
-        search_results = hits[0].get("report", {}).get("results", {}).get("search", {})
+    else:
+        content = response.text
+    
+    logger.debug(f"BLAST JSON content length: {len(content)} chars")
+    
+    # Check if response looks like JSON
+    if not content.strip().startswith('{') and not content.strip().startswith('['):
+        logger.warning(f"BLAST response doesn't look like JSON, first 500 chars: {content[:500]}")
+        # Try to extract accessions from text-based format as fallback
+        import re
+        accession_pattern = r'\b([A-Z]{1,2}_?\d{6,}(?:\.\d+)?)\b'
+        matches = re.findall(accession_pattern, content)
+        if matches:
+            unique_accessions = list(dict.fromkeys(matches))[:50]
+            logger.info(f"Extracted {len(unique_accessions)} accessions from text response")
+            return unique_accessions
+        logger.warning("Could not extract accessions from non-JSON response")
+        return []
+    
+    try:
+        data = json.loads(content)
+        
+        # Log top-level keys for debugging
+        logger.info(f"BLAST JSON top-level keys: {list(data.keys())}")
+        
+        # Navigate JSON structure to find hits
+        # BlastOutput2 can be either a dict (with 'report' key) or a list of dicts
+        blast_output = data.get("BlastOutput2", {})
+        
+        if not blast_output:
+            logger.warning(f"No BlastOutput2 in response. Full response keys: {list(data.keys())}")
+            debug_path = Path("/tmp/blast_debug_response.json")
+            debug_path.write_text(json.dumps(data, indent=2)[:10000])
+            logger.info(f"Saved debug response to {debug_path}")
+            return []
+        
+        # Handle both dict and list formats
+        if isinstance(blast_output, dict):
+            # Direct structure: BlastOutput2 -> report -> results -> search -> hits
+            report = blast_output.get("report", {})
+        elif isinstance(blast_output, list) and len(blast_output) > 0:
+            # List structure: BlastOutput2[0] -> report -> results -> search -> hits
+            report = blast_output[0].get("report", {})
+        else:
+            logger.warning(f"Unexpected BlastOutput2 type: {type(blast_output)}")
+            return []
+        
+        logger.debug(f"Report keys: {list(report.keys())}")
+        
+        results = report.get("results", {})
+        logger.debug(f"Results keys: {list(results.keys())}")
+        
+        search_results = results.get("search", {})
+        logger.debug(f"Search results keys: {list(search_results.keys())}")
+        
         hit_list = search_results.get("hits", [])
         
+        logger.info(f"Found {len(hit_list)} hits in JSON response")
+        
+        if len(hit_list) == 0:
+            message = search_results.get("message", "No message")
+            logger.warning(f"No hits found. Search message: {message}")
+        
         accessions = []
+        hit_details = []  # List of {accession, organism} dicts
         for hit in hit_list:
-            # description -> [ { "accession": "..." } ]
+            # description -> [ { "accession": "...", "sciname": "..." } ]
             descs = hit.get("description", [])
             if descs:
-                acc = descs[0].get("accession")
+                desc = descs[0]
+                acc = desc.get("accession")
+                organism = desc.get("sciname", "")
                 if acc:
                     accessions.append(acc)
+                    hit_details.append({"accession": acc, "organism": organism})
                     
-        return accessions[:100] # Ensure max 100
+        logger.info(f"Extracted {len(accessions)} accessions from hits")
+        return {"accessions": accessions[:50], "hit_details": hit_details[:50]}
         
-    except json.JSONDecodeError:
-        # Fallback or error if not JSON
-        raise ValueError("Failed to parse BLAST JSON response")
+    except json.JSONDecodeError as e:
+        logger.error(f"JSON decode error: {e}, response preview: {content[:500]}")
+        raise ValueError(f"Failed to parse BLAST JSON response: {e}")
 
 def _fetch_fasta_for_accessions(accessions: List[str]) -> str:
+    """Fetch FASTA sequences from NCBI for the given accessions."""
     if not accessions:
         return ""
+    
+    logger.info(f"Fetching FASTA for {len(accessions)} accessions: {accessions[:5]}...")
         
     ids = ",".join(accessions)
     params = {
@@ -261,4 +379,7 @@ def _fetch_fasta_for_accessions(accessions: List[str]) -> str:
     }
     response = requests.post(NCBI_EFETCH_URL, data=params)
     response.raise_for_status()
-    return response.text
+    
+    fasta_text = response.text
+    logger.info(f"Fetched FASTA response: {len(fasta_text)} chars, preview: {fasta_text[:200]}")
+    return fasta_text

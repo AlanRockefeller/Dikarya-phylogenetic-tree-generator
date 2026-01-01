@@ -12,37 +12,36 @@
 
 
 <body>
-    <header>
-        <nav>
-            <a href="{{ url_for('main.index') }}">Home</a>
-            <a href="{{ url_for('main.beginner') }}">Beginner</a>
-            <a href="{{ url_for('main.advanced') }}">Advanced</a>
-            {% if current_user.is_authenticated %}
-            <a href="{{ url_for('user.user_jobs') }}">My Jobs</a>
-            <a href="{{ url_for('auth.logout') }}">Logout</a>
-            {% else %}
-            <a href="{{ url_for('auth.login') }}">Login</a>
-            <a href="{{ url_for('auth.register') }}">Register</a>
-            {% endif %}
-        </nav>
-    </header>
-    <main>
-	  {% with messages = get_flashed_messages(with_categories=true) %}
-        	  {% if messages %}
-	    <div class="flashes">
-	      {% for category, message in messages %}
-		<div class="flash flash-{{ category }}">{{ message }}</div>
-	      {% endfor %}
-	    </div>
-	  {% endif %}
-	{% endwith %}
+  <header>
+    <nav>
+      <a href="{{ url_for('journal.home') }}">Journal Home</a>
+      <a href="{{ url_for('main.sequence_entry') }}">Tree Builder</a>
+      {% if current_user.is_authenticated %}
+      <a href="{{ url_for('user.user_jobs') }}">My Jobs</a>
+      <a href="{{ url_for('auth.logout') }}">Logout</a>
+      {% else %}
+      <a href="{{ url_for('auth.login') }}">Login</a>
+      <a href="{{ url_for('auth.register') }}">Register</a>
+      {% endif %}
+    </nav>
+  </header>
+  <main>
+    {% with messages = get_flashed_messages(with_categories=true) %}
+    {% if messages %}
+    <div class="flashes">
+      {% for category, message in messages %}
+      <div class="flash flash-{{ category }}">{{ message }}</div>
+      {% endfor %}
+    </div>
+    {% endif %}
+    {% endwith %}
 
-        {% block content %}{% endblock %}
-    </main>
-    <footer>
-        <p>&copy; 2026 Dikarya Project</p>
-    </footer>
-    {% block scripts %}{% endblock %}
+    {% block content %}{% endblock %}
+  </main>
+  <footer>
+    <p>&copy; 2026 Dikarya Project</p>
+  </footer>
+  {% block scripts %}{% endblock %}
 </body>
 
 </html>

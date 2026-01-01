@@ -1,0 +1,103 @@
+{% extends "journal/base_journal.html" %}
+
+{% block title %}Dikarya - Mycological Scientific Journal{% endblock %}
+{% block meta_description %}Dikarya is a peer-reviewed journal dedicated to advances in fungal taxonomy, systematics,
+phylogenetics, and the discovery of new species.{% endblock %}
+
+{% block content %}
+<section class="journal-hero">
+    <h1>Dikarya</h1>
+    <p class="lead">A peer-reviewed journal advancing the science of fungal taxonomy, systematics, and phylogenetics</p>
+    <a href="{{ url_for('journal.submit_manuscript') }}" class="journal-btn journal-btn-primary journal-btn-large">
+        Submit Your Research
+    </a>
+</section>
+
+<section class="journal-section">
+    <h2>Latest Announcements</h2>
+
+    <div class="journal-announcement">
+        <h4>🔬 Call for Papers: Special Issue on Fungal Dark Matter</h4>
+        <p>We invite submissions exploring understudied fungal lineages and environmental sequences. Deadline: March 31,
+            2026.</p>
+    </div>
+
+    <div class="journal-announcement">
+        <h4>📢 Open Access Initiative</h4>
+        <p>Dikarya is committed to making mycological research accessible. All articles are now freely available upon
+            publication.</p>
+    </div>
+</section>
+
+<section class="journal-section">
+    <h2>Recent Research</h2>
+
+    <div class="journal-card-grid">
+        <article class="journal-card">
+            <span class="journal-card-meta">Research Article</span>
+            <h3>Novel species of <em>Cortinarius</em> from temperate rainforests</h3>
+            <p>Molecular phylogenetic analysis reveals cryptic diversity in subgenus <em>Phlegmacium</em> across three
+                continents.</p>
+            <a href="#" class="journal-btn journal-btn-outline"
+                style="color: var(--primary); border-color: var(--primary);">Read More →</a>
+        </article>
+
+        <article class="journal-card">
+            <span class="journal-card-meta">Short Communication</span>
+            <h3>First report of <em>Amanita</em> sect. <em>Phalloideae</em> in Southeast Asia</h3>
+            <p>Morphological and ITS-based identification confirms presence of potentially toxic species in regional
+                forests.</p>
+            <a href="#" class="journal-btn journal-btn-outline"
+                style="color: var(--primary); border-color: var(--primary);">Read More →</a>
+        </article>
+
+        <article class="journal-card">
+            <span class="journal-card-meta">Review</span>
+            <h3>Advances in fungal phylogenomics: A decade in review</h3>
+            <p>Comprehensive overview of methodological developments and their impact on our understanding of fungal
+                evolution.</p>
+            <a href="#" class="journal-btn journal-btn-outline"
+                style="color: var(--primary); border-color: var(--primary);">Read More →</a>
+        </article>
+    </div>
+
+    <div style="text-align: center; margin-top: 2rem;">
+        <a href="{{ url_for('journal.current_issue') }}" class="journal-btn journal-btn-primary">
+            View Current Issue →
+        </a>
+    </div>
+</section>
+
+<section class="journal-app-promo">
+    <h2>🧬 Phylogenetic Tree Builder</h2>
+    <p>Build publication-quality phylogenetic trees directly from your sequences. Supports MAFFT, RAxML, IQ-TREE,
+        MrBayes, and more.</p>
+    <a href="{{ url_for('main.sequence_entry') }}" class="journal-btn journal-btn-primary journal-btn-large">
+        Launch Tree Builder →
+    </a>
+</section>
+
+<section class="journal-section">
+    <h2>Quick Links</h2>
+
+    <div class="journal-card-grid">
+        <div class="journal-card">
+            <h3>📄 Submit a Manuscript</h3>
+            <p>Learn about our submission process, formatting requirements, and peer review timeline.</p>
+            <a href="{{ url_for('journal.submit_manuscript') }}">Author Guidelines →</a>
+        </div>
+
+        <div class="journal-card">
+            <h3>🔬 Taxonomy & New Species</h3>
+            <p>Browse recent fungal discoveries, type specimen data, and sequence deposits.</p>
+            <a href="{{ url_for('journal.taxonomy') }}">Explore →</a>
+        </div>
+
+        <div class="journal-card">
+            <h3>📚 Archive</h3>
+            <p>Access our complete collection of past issues and search published articles.</p>
+            <a href="{{ url_for('journal.archive') }}">Browse Archive →</a>
+        </div>
+    </div>
+</section>
+{% endblock %}

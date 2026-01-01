@@ -6,6 +6,105 @@ from app.config import Config
 from app.extensions import db
 from app.models import Job
 import logging
+import re
+
+
+# =============================================================================
+# BLAST API Endpoint
+# =============================================================================
+
+def _is_genbank_accession(text):
+    """Check if text looks like a GenBank accession number."""
+    # Common patterns: NC_012345, NM_001234567, AB123456, etc.
+    pattern = r'^[A-Z]{1,2}_?\d{5,}(\.\d+)?$'
+    return bool(re.match(pattern, text.strip(), re.IGNORECASE))
+
+
+def _parse_fasta_sequences(text):
+    """Parse FASTA text into list of {name, sequence} dicts."""
+    sequences = []
+    current_name = None
+    current_seq = []
+    
+    for line in text.strip().split('\n'):
+        line = line.strip()
+        if line.startswith('>'):
+            if current_name is not None:
+                sequences.append({
+                    'name': current_name,
+                    'sequence': ''.join(current_seq)
+                })
+            current_name = line[1:].split()[0]  # Take first word after >
+            current_seq = []
+        elif line and current_name is not None:
+            current_seq.append(line)
+    
+    # Don't forget the last sequence
+    if current_name is not None:
+        sequences.append({
+            'name': current_name,
+            'sequence': ''.join(current_seq)
+        })
+    
+    return sequences
+
+
+@bp.route('/blast', methods=['POST'])
+def run_blast():
+    """
+    Run BLAST on a single sequence or accession.
+    
+    Request: { "query": "<sequence or accession>" }
+    Response: { "status": "success", "sequences": [...], "message": "..." }
+    """
+    data = request.get_json() or {}
+    query = data.get('query', '').strip()
+    
+    if not query:
+        return jsonify({"status": "error", "error": "No query provided"}), 400
+    
+    try:
+        from app.services.blast_service import blast_from_sequence, blast_from_accessions
+        from pathlib import Path
+        
+        # Determine if query is an accession or a sequence
+        if _is_genbank_accession(query):
+            logging.info(f"BLAST API: Detected accession: {query}")
+            result = blast_from_accessions([query], Config)
+        else:
+            # Assume it's a raw sequence
+            logging.info(f"BLAST API: Using sequence query ({len(query)} chars)")
+            result = blast_from_sequence(query, Config)
+        
+        # Read FASTA content from the file path returned by blast service
+        fasta_path = result.get('fasta_path', '')
+        fasta_content = ''
+        if fasta_path:
+            path = Path(fasta_path)
+            if path.exists():
+                fasta_content = path.read_text()
+        
+        sequences = _parse_fasta_sequences(fasta_content)
+        
+        # Merge organism info from hit_details into sequences
+        hit_details = result.get('hit_details', [])
+        organism_map = {h['accession']: h.get('organism', '') for h in hit_details}
+        
+        for seq in sequences:
+            # Try to match accession (with or without version)
+            acc = seq['name'].split('.')[0]  # Remove version if present
+            seq['organism'] = organism_map.get(acc, organism_map.get(seq['name'], ''))
+        
+        return jsonify({
+            "status": "success",
+            "sequences": sequences,
+            "accessions": result.get('hit_accessions', []),
+            "message": f"Found {len(sequences)} related sequences"
+        })
+        
+    except Exception as e:
+        logging.error(f"BLAST API error: {e}", exc_info=True)
+        return jsonify({"status": "error", "error": str(e)}), 500
 
 
 def _check_job_access(job_id):

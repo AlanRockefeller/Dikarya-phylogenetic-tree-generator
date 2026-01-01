@@ -1,17 +1,10 @@
 from flask import render_template
 from app.main import bp
 
-@bp.route('/')
-def index():
-    return render_template('index.html')
 
-@bp.route('/beginner')
-def beginner():
-    return render_template('beginner.html')
-
-@bp.route('/advanced')
-def advanced():
-    return render_template('advanced.html')
+@bp.route('/app')
+def sequence_entry():
+    return render_template('sequence_entry.html')
 
 @bp.route('/job/<job_id>')
 def job_status(job_id):
