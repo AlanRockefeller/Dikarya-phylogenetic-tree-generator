@@ -26,7 +26,7 @@ def blast_from_sequence(seq: str, config: Config, logger=logger) -> Dict:
     logger.info(f"BLAST cache miss for hash {query_hash}. Submitting to NCBI.")
     
     try:
-        rid, rtoe = _submit_blast_request(seq)
+        rid, rtoe = _submit_blast_request(seq, config)
         logger.info(f"BLAST submitted. RID: {rid}, RTOE: {rtoe}")
         
         _poll_blast(rid, rtoe, logger)
@@ -72,7 +72,7 @@ def blast_from_accessions(accessions: List[str], config: Config, logger=logger) 
         # include the original sequences in the final result too. 
         # For now, let's just BLAST them.
         
-        rid, rtoe = _submit_blast_request(query_fasta)
+        rid, rtoe = _submit_blast_request(query_fasta, config)
         logger.info(f"BLAST submitted. RID: {rid}, RTOE: {rtoe}")
         
         _poll_blast(rid, rtoe, logger)
@@ -154,8 +154,16 @@ def _save_cache(query_hash: str, hit_accessions: List[str], hit_details: List[Di
         "metadata_path": str(json_path)
     }
 
-def _submit_blast_request(seq: str) -> Tuple[str, int]:
+def _submit_blast_request(seq: str, config: Config = None) -> Tuple[str, int]:
     """Submit a BLAST request to NCBI and return RID and estimated wait time."""
+    from app.config import Config as DefaultConfig
+    if config is None:
+        config = DefaultConfig
+    
+    # Validate query length
+    if len(seq) > config.BLAST_MAX_QUERY_LENGTH:
+        raise ValueError(f"Query too long: {len(seq)} chars (max: {config.BLAST_MAX_QUERY_LENGTH})")
+    
     # Log sequence info
     seq_preview = seq[:100] + "..." if len(seq) > 100 else seq
     logger.info(f"Submitting BLAST request, sequence preview: {seq_preview}")
@@ -165,12 +173,12 @@ def _submit_blast_request(seq: str) -> Tuple[str, int]:
         "PROGRAM": "blastn",
         "DATABASE": "nt",
         "QUERY": seq,
-        "HITLIST_SIZE": 50,  # Request 50 hits
-        "ALIGNMENTS": 50,    # Return alignments for 50 hits
+        "HITLIST_SIZE": 50,
+        "ALIGNMENTS": 50,
         "FORMAT_TYPE": "JSON2",
-        "EMAIL": "dikarya@dikarya.us"
+        "EMAIL": config.BLAST_EMAIL
     }
-    response = requests.post(NCBI_BLAST_URL, data=params)
+    response = requests.post(NCBI_BLAST_URL, data=params, timeout=(10, 60))
     response.raise_for_status()
     
     logger.debug(f"BLAST submission response: {response.text[:500]}")
@@ -210,7 +218,7 @@ def _poll_blast(rid: str, rtoe: int, logger) -> None:
             "FORMAT_OBJECT": "SearchInfo",
             "RID": rid
         }
-        response = requests.get(NCBI_BLAST_URL, params=params)
+        response = requests.get(NCBI_BLAST_URL, params=params, timeout=(5, 30))
         content = response.text
         
         # Log full poll response for debugging
@@ -251,7 +259,7 @@ def _fetch_blast_results(rid: str) -> Dict[str, List]:
         "FORMAT_TYPE": "JSON2",
         "RID": rid
     }
-    response = requests.get(NCBI_BLAST_URL, params=params)
+    response = requests.get(NCBI_BLAST_URL, params=params, timeout=(10, 120))
     response.raise_for_status()
     
     content_type = response.headers.get('content-type', '')
@@ -381,7 +389,7 @@ def _fetch_fasta_for_accessions(accessions: List[str]) -> str:
         "rettype": "fasta",
         "retmode": "text"
     }
-    response = requests.post(NCBI_EFETCH_URL, data=params)
+    response = requests.post(NCBI_EFETCH_URL, data=params, timeout=(10, 60))
     response.raise_for_status()
     
     fasta_text = response.text
