@@ -27,6 +27,7 @@ htmlcov/
 
 # ---- App runtime data (jobs, logs, outputs) ----
 var/
+cache/
 # If you want to keep var/ directory but ignore its contents, use instead:
 # var/*
 # !var/.gitkeep

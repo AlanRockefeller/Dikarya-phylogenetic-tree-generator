@@ -237,8 +237,12 @@ def _poll_blast(rid: str, rtoe: int, logger) -> None:
 
     raise TimeoutError("BLAST timed out waiting for results")
 
-def _fetch_blast_results(rid: str) -> List[str]:
-    """Fetch BLAST results from NCBI. Handle both raw JSON and ZIP-compressed responses."""
+def _fetch_blast_results(rid: str) -> Dict[str, List]:
+    """Fetch BLAST results from NCBI. Handle both raw JSON and ZIP-compressed responses.
+    
+    Returns:
+        Dict with 'accessions' (list of str) and 'hit_details' (list of dicts with accession/organism)
+    """
     import io
     import zipfile
     
@@ -264,7 +268,7 @@ def _fetch_blast_results(rid: str) -> List[str]:
                 
                 if not json_files:
                     logger.error("No JSON files found in ZIP archive")
-                    return []
+                    return {"accessions": [], "hit_details": []}
                 
                 # Read the main JSON file (or first JSON ending with _1.json)
                 main_json = None
@@ -279,7 +283,7 @@ def _fetch_blast_results(rid: str) -> List[str]:
                 content = zf.read(main_json).decode('utf-8')
         except Exception as e:
             logger.error(f"Failed to extract ZIP: {e}")
-            return []
+            return {"accessions": [], "hit_details": []}
     else:
         content = response.text
     
@@ -295,9 +299,9 @@ def _fetch_blast_results(rid: str) -> List[str]:
         if matches:
             unique_accessions = list(dict.fromkeys(matches))[:50]
             logger.info(f"Extracted {len(unique_accessions)} accessions from text response")
-            return unique_accessions
+            return {"accessions": unique_accessions, "hit_details": []}
         logger.warning("Could not extract accessions from non-JSON response")
-        return []
+        return {"accessions": [], "hit_details": []}
     
     try:
         data = json.loads(content)
@@ -314,7 +318,7 @@ def _fetch_blast_results(rid: str) -> List[str]:
             debug_path = Path("/tmp/blast_debug_response.json")
             debug_path.write_text(json.dumps(data, indent=2)[:10000])
             logger.info(f"Saved debug response to {debug_path}")
-            return []
+            return {"accessions": [], "hit_details": []}
         
         # Handle both dict and list formats
         if isinstance(blast_output, dict):
@@ -325,7 +329,7 @@ def _fetch_blast_results(rid: str) -> List[str]:
             report = blast_output[0].get("report", {})
         else:
             logger.warning(f"Unexpected BlastOutput2 type: {type(blast_output)}")
-            return []
+            return {"accessions": [], "hit_details": []}
         
         logger.debug(f"Report keys: {list(report.keys())}")
         
