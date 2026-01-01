@@ -550,8 +550,8 @@ def job_events_stream(job_id):
                 # Still keep connection open briefly for any final events
                 pass
             
-            # Throttle timers
-            last_ping = time.time()
+            # Throttle timers (use monotonic clock for reliable intervals)
+            last_ping = time.monotonic()
             last_db_poll = 0.0  # Start at 0 to trigger immediate first poll
             
             # Tunable interval for DB polling (seconds)
@@ -578,7 +578,7 @@ def job_events_stream(job_id):
                     except json.JSONDecodeError:
                         pass
                 
-                now = time.time()
+                now = time.monotonic()
                 
                 # Send keepalive ping every 15 seconds
                 if now - last_ping >= 15:
