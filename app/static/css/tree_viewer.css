@@ -39,10 +39,80 @@
 .node-support-value {
     font-family: sans-serif;
     font-weight: 500;
-    fill: #b30000;
+    fill: #c0392b;
+    /* Distinct Red for visibility */
     pointer-events: none;
     paint-order: stroke;
-    stroke: rgba(255, 255, 255, 0.85);
+    stroke: #ffffff;
+    /* White halo for light mode */
     stroke-width: 3px;
     stroke-linejoin: round;
+}
+
+.dark .node-support-value {
+    fill: #ff6b6b;
+    /* Brighter Red for dark mode */
+    stroke: #000000;
+    /* Black halo for dark mode */
+}
+
+#tree-container .branch {
+    stroke: #000000;
+    fill: none;
+}
+
+#tree-container .node text,
+#tree-container .phylotree-node-text,
+#tree-container text.phylotree-node-text {
+    fill: #000000;
+}
+
+/* Dark mode support for tree labels */
+/* Dark mode support - Scoped to avoid global conflicts */
+/* We rely on the .dark class (Tailwind strategy) rather than raw media queries 
+   to ensure the toggle works correctly regardless of OS preference. */
+
+/* Combined rules for dark mode under .dark class */
+.dark #tree-container .node text,
+.dark #tree-container .phylotree-node-text,
+.dark #tree-container text.phylotree-node-text {
+    fill: #ffffff !important;
+}
+
+.dark #tree-container .tree-scale-bar text {
+    fill: #ffffff !important;
+}
+
+.dark #tree-container .tree-scale-bar line,
+.dark #tree-container .tree-scale-bar path {
+    stroke: #ffffff !important;
+}
+
+.dark #tree-container .branch {
+    stroke: #ccc !important;
+    /* Brighter than #999 for better visibility in dark mode */
+}
+
+
+
+/* Also support explicit dark class on container or parent */
+/* Also support explicit dark class on container or parent */
+.dark #tree-container .node text,
+.dark #tree-container .phylotree-node-text,
+.dark #tree-container text.phylotree-node-text {
+    fill: #ffffff !important;
+}
+
+.dark #tree-container .tree-scale-bar text {
+    fill: #ffffff !important;
+}
+
+.dark #tree-container .tree-scale-bar line,
+.dark #tree-container .tree-scale-bar path {
+    stroke: #ffffff !important;
+}
+
+.dark #tree-container .branch {
+    stroke: #ccc !important;
+    /* Brighter for dark mode */
 }

@@ -1,10 +1,14 @@
-from flask import render_template
+from flask import render_template, redirect, url_for
 from app.main import bp
 
 
 @bp.route('/tree')
 def sequence_entry():
     return render_template('sequence_entry.html')
+
+@bp.route('/job')
+def job_redirect():
+    return redirect(url_for('user.user_jobs'))
 
 @bp.route('/job/<job_id>')
 def job_status(job_id):

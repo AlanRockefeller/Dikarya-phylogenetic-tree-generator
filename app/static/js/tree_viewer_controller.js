@@ -43,14 +43,30 @@ document.addEventListener('DOMContentLoaded', async () => {
     let isProcessing = false;
 
     // 5. Helper: Status Message
+    // 5. Helper: Status Message
+    let currentStatusType = null;
     function showStatus(msg, type, timeout = 0) {
         if (!statusMsg) return; // Prevent crash if missing
-        statusMsg.className = `alert alert-${type} mt-2`;
+
+        const colorMap = {
+            'info': ['bg-blue-50', 'text-blue-800', 'dark:bg-blue-900/30', 'dark:text-blue-200'],
+            'success': ['bg-green-50', 'text-green-800', 'dark:bg-green-900/30', 'dark:text-green-200'],
+            'warning': ['bg-yellow-50', 'text-yellow-800', 'dark:bg-yellow-900/30', 'dark:text-yellow-200'],
+            'danger': ['bg-red-50', 'text-red-800', 'dark:bg-red-900/30', 'dark:text-red-200']
+        };
+
+        if (currentStatusType && currentStatusType !== type) {
+            statusMsg.classList.remove(...colorMap[currentStatusType]);
+        }
+
+        statusMsg.classList.add(...(colorMap[type] || colorMap['info']));
+        currentStatusType = type;
+
         statusMsg.textContent = msg;
-        statusMsg.classList.remove('d-none');
+        statusMsg.classList.remove('hidden');
         if (timeout > 0) {
             setTimeout(() => {
-                statusMsg.classList.add('d-none');
+                statusMsg.classList.add('hidden');
             }, timeout);
         }
     }
@@ -196,6 +212,11 @@ document.addEventListener('DOMContentLoaded', async () => {
                         supportBasePx: supportBase,
                         tipBasePx: tipBase
                     });
+
+                    // Post-render UI sync
+                    updateSupportUI();
+                    syncFilterControls();
+
                 } catch (err) {
                     if (container) container.textContent = `Failed to load Newick: ${err.message}`;
                 }
@@ -205,28 +226,132 @@ document.addEventListener('DOMContentLoaded', async () => {
         }
     }
 
-    // 8. Event Listeners (Only if elements exist)
+    // --- Support Analysis & UI Sync ---
+    function updateSupportUI() {
+        // Safe access if container or stats missing
+        const stats = (container && container.__treeStats) ? container.__treeStats : { supportType: 'none' };
+
+        const badge = getEl('support-type-badge');
+        const ppInput = getEl('input-pp-threshold');
+        const bsInput = getEl('input-bs-threshold');
+
+        if (badge) {
+            const labels = {
+                'PP': 'Support: PP',
+                'BS': 'Support: BS',
+                'mixed': 'Support: Mixed',
+                'none': 'Support: None'
+            };
+            badge.textContent = labels[stats.supportType] || 'Support: --';
+
+            // Visual tweak for badge color
+            const colors = {
+                'PP': ['text-purple-800', 'bg-purple-100', 'dark:text-purple-200', 'dark:bg-purple-900/40'],
+                'BS': ['text-blue-800', 'bg-blue-100', 'dark:text-blue-200', 'dark:bg-blue-900/40'],
+                'mixed': ['text-amber-800', 'bg-amber-100', 'dark:text-amber-200', 'dark:bg-amber-900/40'],
+                'none': ['text-gray-800', 'bg-gray-100', 'dark:text-gray-200', 'dark:bg-gray-700/40']
+            };
+            // Reset colors
+            badge.className = "px-2 py-0.5 text-xs font-semibold rounded shrink-0 transition-colors";
+            const c = colors[stats.supportType] || colors['none'];
+            badge.classList.add(...c);
+        }
+
+        if (!ppInput || !bsInput) return;
+
+        const setInputState = (input, enabled, msg) => {
+            input.disabled = !enabled;
+            if (enabled) {
+                input.classList.remove('opacity-40', 'cursor-not-allowed', 'ring-gray-200', 'dark:ring-gray-700');
+                input.classList.add('hover:bg-gray-50', 'dark:hover:bg-journal-dark/80', 'focus:ring-2');
+                input.title = "";
+            } else {
+                input.classList.add('opacity-40', 'cursor-not-allowed', 'ring-gray-200', 'dark:ring-gray-700');
+                input.classList.remove('hover:bg-gray-50', 'dark:hover:bg-journal-dark/80', 'focus:ring-2');
+                input.title = msg;
+            }
+        };
+
+        if (stats.supportType === 'PP') {
+            setInputState(ppInput, true);
+            setInputState(bsInput, false, 'Tree has Posterior Probability support only');
+        } else if (stats.supportType === 'BS') {
+            setInputState(ppInput, false, 'Tree has Bootstrap support only');
+            setInputState(bsInput, true);
+        } else if (stats.supportType === 'mixed') {
+            setInputState(ppInput, true);
+            setInputState(bsInput, true);
+        } else {
+            setInputState(ppInput, false, 'No support values detected');
+            setInputState(bsInput, false, 'No support values detected');
+        }
+    }
+
+    // Filter Low Checkbox Sync
+    function syncFilterControls() {
+        const filterLow = getEl('cb-hide-low-support')?.checked;
+        const ppInput = getEl('input-pp-threshold');
+        const bsInput = getEl('input-bs-threshold');
+
+        if (!ppInput || !bsInput) return;
+
+        // If filter is OFF, disable both regardless of support type
+        if (!filterLow) {
+            const msg = 'Enable "Filter Low" to adjust threshold';
+            ppInput.disabled = true;
+            ppInput.classList.add('opacity-50', 'cursor-not-allowed');
+            ppInput.title = msg;
+
+            bsInput.disabled = true;
+            bsInput.classList.add('opacity-50', 'cursor-not-allowed');
+            bsInput.title = msg;
+        } else {
+            // Re-apply logic based on support type
+            updateSupportUI();
+        }
+    }
+
+    // 8. Event Listeners
     const btnToggleSupport = getEl('btn-toggle-support');
     if (btnToggleSupport) {
         btnToggleSupport.addEventListener('click', () => {
             showSupport = !showSupport;
-            renderTree();
-            // Simple UI feedback
+            renderTree(); // Will trigger updateSupportUI -> syncFilterControls
             btnToggleSupport.textContent = showSupport ? "Hide Node Support" : "Show Node Support";
         });
     }
 
+    // Debounce Utility
+    function debounce(func, wait) {
+        let timeout;
+        return function (...args) {
+            clearTimeout(timeout);
+            timeout = setTimeout(() => func.apply(this, args), wait);
+        };
+    }
+    const debouncedRender = debounce(renderTree, 300);
+
     const inputPP = getEl('input-pp-threshold');
     if (inputPP) {
-        inputPP.addEventListener('change', () => renderTree());
+        inputPP.addEventListener('input', debouncedRender);
+        inputPP.addEventListener('change', renderTree); // Immediate update on commit
     }
+
     const inputBS = getEl('input-bs-threshold');
     if (inputBS) {
-        inputBS.addEventListener('change', () => renderTree());
+        inputBS.addEventListener('input', debouncedRender);
+        inputBS.addEventListener('change', renderTree);
     }
+
     const inputMinTips = getEl('input-min-tips');
-    if (inputMinTips) {
-        inputMinTips.addEventListener('change', () => renderTree());
+    if (inputMinTips) inputMinTips.addEventListener('input', debouncedRender);
+
+    const cbFilterLow = getEl('cb-hide-low-support');
+    if (cbFilterLow) {
+        cbFilterLow.addEventListener('change', () => {
+            syncFilterControls();
+            renderTree();
+        });
     }
 
     // --- Font Listeners (Live update without full re-render) ---

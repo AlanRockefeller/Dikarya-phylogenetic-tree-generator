@@ -34,12 +34,12 @@
         // 2. PARSE
         const tree = new phylotreeLib.phylotree(newick);
 
-        // 2b. PRE-PROCESS NAMES (Underscore -> Space)
-        // We traverse to replace underscores with spaces for display, 
-        // but back up the original name so logic (reroot/prune) works.
-        // 2b. PRE-PROCESS NAMES (Underscore -> Space)
-        // We traverse to replace underscores with spaces for display, 
-        // but back up the original name so logic (reroot/prune) works.
+        // 2b. PRE-PROCESS NAMES (No-op)
+        // We do NOT replace underscores with spaces anymore, because we want to 
+        // "Preserve original for display" as per the canonical data policy.
+        // The backend restores the original name (which might have spaces) 
+        // so we just display what we get.
+        /*
         tree.traverse_and_compute((node) => {
             if (node.data && node.data.name) {
                 // If it's a string, we process it
@@ -53,6 +53,7 @@
                 node.name = node.name.replace(/_/g, " ");
             }
         });
+        */
 
         // 3. STATE
         let state = {
@@ -203,7 +204,7 @@
 
                 el.style("font-size", `${fontSvgPx}px`)
                     .style("paint-order", "stroke")
-                    .style("stroke", haloColor)
+                    // .style("stroke", haloColor) // let CSS handle color for light/dark correctness
                     .style("stroke-width", `${haloSvgPx}px`)
                     .style("stroke-linejoin", "round");
             });
@@ -542,10 +543,8 @@
                 text
                     .attr("text-anchor", textAnchor)
                     .attr("dominant-baseline", "hanging")
-                    .attr("fill", "#b30000")
                     .attr("font-family", "sans-serif")
                     .attr("font-weight", "500")
-                    .style("fill", "#b30000")
                     .style("paint-order", "stroke")
                     .style("pointer-events", "none")
                     .style("display", "block")
@@ -597,17 +596,71 @@
         });
 
         bindBtn('btn-ladderize', () => {
-            tree.traverse_and_compute((node) => {
-                if (node.children) {
-                    node.children.sort((a, b) => {
-                        const countA = (a.msg && a.msg.count) ? a.msg.count : 0;
-                        const countB = (b.msg && b.msg.count) ? b.msg.count : 0;
-                        return countA - countB;
-                    });
-                }
-            });
+            state.ladderize = !state.ladderize;
             draw();
         });
+
+        // Zoom/Fit Controls - ROBUST IMPLEMENTATION via Synthetic Events
+        // Because accessing the internal D3 zoom behavior of the library is brittle.
+        bindBtn('btn-zoom-in', () => {
+            const svg = document.querySelector("#" + elementId + " svg");
+            if (svg) {
+                // Simulate wheel up (zoom in)
+                // Need to target the center of the svg
+                const rect = svg.getBoundingClientRect();
+                const cx = rect.left + rect.width / 2;
+                const cy = rect.top + rect.height / 2;
+
+                svg.dispatchEvent(new WheelEvent('wheel', {
+                    clientX: cx,
+                    clientY: cy,
+                    deltaY: -300, // Negative for zoom in
+                    bubbles: true, cancelable: true,
+                    view: window
+                }));
+            }
+        });
+
+        bindBtn('btn-zoom-out', () => {
+            const svg = document.querySelector("#" + elementId + " svg");
+            if (svg) {
+                // Simulate wheel down (zoom out)
+                const rect = svg.getBoundingClientRect();
+                const cx = rect.left + rect.width / 2;
+                const cy = rect.top + rect.height / 2;
+
+                svg.dispatchEvent(new WheelEvent('wheel', {
+                    clientX: cx,
+                    clientY: cy,
+                    deltaY: 300, // Positive for zoom out
+                    bubbles: true, cancelable: true,
+                    view: window
+                }));
+            }
+        });
+
+        bindBtn('btn-fit', () => {
+            // Re-drawing is the cleanest "Fit" for phylotree as it resets transform
+            draw();
+        });
+
+        bindBtn('btn-toggle-support', () => {
+            options.showSupport = !options.showSupport;
+            const btn = document.getElementById('btn-toggle-support');
+            if (btn) btn.textContent = options.showSupport ? "Hide Node Support" : "Show Node Support";
+            draw();
+        });
+        tree.traverse_and_compute((node) => {
+            if (node.children) {
+                node.children.sort((a, b) => {
+                    const countA = (a.msg && a.msg.count) ? a.msg.count : 0;
+                    const countB = (b.msg && b.msg.count) ? b.msg.count : 0;
+                    return countA - countB;
+                });
+            }
+        });
+        draw();
+
 
         bindBtn('btn-select-all', () => {
             tree.traverse_and_compute((node) => { node.selected = true; });
@@ -667,6 +720,59 @@
             link.click();
             document.body.removeChild(link);
         });
+        // --- 6. Stats & Return ---
+        function computeSupportStats(tree) {
+            let maxSupport = 0;
+            let minSupport = Infinity;
+            let supportValues = [];
+
+            tree.traverse_and_compute((node) => {
+                if (!node.children || node.children.length === 0) return;
+
+                const support = node.data?.confidence || node.data?.bootstrap_values ||
+                    node.data?.bootstrap || node.data?.support;
+
+                if (support !== undefined && support !== null && support !== "") {
+                    const val = parseFloat(support);
+                    if (!isNaN(val)) {
+                        supportValues.push(val);
+                        maxSupport = Math.max(maxSupport, val);
+                        minSupport = Math.min(minSupport, val);
+                    }
+                }
+            });
+
+            let supportType = 'none';
+            if (supportValues.length === 0) {
+                supportType = 'none';
+            } else {
+                // Heuristic:
+                // If ANY value > 1, it's likely Bootstrap/Percent (0-100)
+                // If ALL values <= 1, it's likely Posterior Probability (0-1)
+                // If both ranges exist cleanly (e.g. some 0.9 and some 90), mixed?
+                // But usually 0.95 is valid in both. 
+                // We'll trust the checked max value.
+
+                // Check if we have values that are clearly > 1
+                const hasLargeValues = maxSupport > 1.0;
+
+                // Check if we have values that are clearly <= 1 (but could be part of 0-100)
+                // This is hard to disambiguate. 1.0 could be 100% scaled or 1.0 probability.
+
+                // Simple robust rule:
+                if (maxSupport > 1.0) {
+                    supportType = 'BS';
+                } else {
+                    supportType = 'PP';
+                }
+            }
+
+            return { maxSupport, supportType };
+        }
+
+        const stats = computeSupportStats(tree);
+        container.__treeStats = stats;
+
     }
 
     window.renderPhylotree = renderPhylotree;

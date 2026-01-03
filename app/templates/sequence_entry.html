@@ -9,12 +9,17 @@
 
 {% block content %}
 <!-- Page Header -->
+<!-- Page Header -->
 <div class="mb-8">
-    <h2 class="text-2xl font-bold text-journal-dark dark:text-gray-100">
-        <i class="fas fa-dna text-journal-gold mr-2"></i>Phylogenetic Tree Builder
-    </h2>
-    <p class="text-gray-600 dark:text-gray-300 mt-1">Add sequences to build a phylogenetic tree with advanced analysis
-        options.</p>
+    <div class="flex flex-col md:flex-row justify-between items-center gap-4">
+        <div>
+            <h2 class="text-2xl font-bold text-journal-dark dark:text-gray-100 flex items-center">
+                <i class="fas fa-dna text-journal-gold mr-3"></i>Phylogenetic Tree Builder
+            </h2>
+            <p class="text-gray-600 dark:text-gray-300 mt-1">Add sequences to build a phylogenetic tree with advanced
+                analysis options.</p>
+        </div>
+    </div>
 </div>
 
 <!-- 3-Column Grid Layout -->
@@ -118,14 +123,16 @@
 
             <!-- Queue Body -->
             <div class="p-4 max-h-96 overflow-y-auto">
-                <div id="sequence_queue_empty" class="text-center py-8">
-                    <i class="fas fa-inbox text-4xl text-gray-300 dark:text-gray-600 mb-3"></i>
-                    <p class="text-gray-500 dark:text-gray-400 text-sm">No sequences added yet.</p>
+                <div id="sequence_queue_empty" class="text-center py-10 px-4">
+                    <div class="inline-flex items-center justify-center w-12 h-12 rounded-full bg-journal-gold/20 mb-3">
+                        <i class="fas fa-inbox text-xl text-journal-gold"></i>
+                    </div>
+                    <p class="text-gray-500 dark:text-gray-400 text-sm font-medium">No sequences added yet.</p>
                     <p class="text-gray-400 dark:text-gray-500 text-xs mt-1">
                         Paste FASTA sequences and click "Add Sequences"
                     </p>
                 </div>
-                <ul id="sequence_queue_list" class="space-y-2 hidden">
+                <ul id="sequence_queue_list" class="divide-y divide-gray-100 dark:divide-journal-dark hidden">
                     <!-- Sequences will be added here dynamically -->
                 </ul>
             </div>
@@ -343,17 +350,16 @@
             clearBtn.disabled = false;
 
             listEl.innerHTML = sequenceQueue.map((seq, idx) => `
-                <li class="bg-gray-50 dark:bg-journal-dark rounded-lg px-4 py-3 flex justify-between items-center
-                           border border-gray-200 dark:border-journal-dark transition-colors">
+                <li class="px-4 py-3 flex justify-between items-center hover:bg-gray-50 dark:hover:bg-journal-dark/50 transition-colors">
                     <div class="overflow-hidden">
                         <span class="font-mono text-sm font-medium text-journal-dark dark:text-gray-100">${escapeHtml(seq.name)}</span>
                         ${seq.organism ? `<span class="text-gray-500 dark:text-gray-400 text-xs italic ml-2">${escapeHtml(seq.organism)}</span>` : ''}
                     </div>
                     <button onclick="removeSequence(${idx})" 
-                            class="text-red-500 hover:text-red-700 dark:text-red-400 dark:hover:text-red-300 
-                                   font-bold text-lg transition-colors ml-4"
+                            class="text-gray-400 hover:text-red-500 dark:text-gray-500 dark:hover:text-red-400 
+                                   transition-colors ml-4 p-1"
                             title="Remove">
-                        ×
+                        <i class="fas fa-times"></i>
                     </button>
                 </li>
             `).join('');
@@ -628,12 +634,9 @@
     function buildFastaFromQueue() {
         return sequenceQueue.map(seq => {
             let header = seq.name;
-            if (seq.organism) {
-                // Sanitize organism name: replace spaces and unsafe chars with underscores
-                // This creates a single-word ID (e.g., Accession_Genus_species)
-                const safeOrganism = seq.organism.replace(/[\s\(\):,;]/g, '_').replace(/_+/g, '_');
-                header = `${header}_${safeOrganism}`;
-            }
+            // if (seq.organism) {
+            //    header = `${header} ${seq.organism}`;
+            // }
             return `>${header}\n${seq.sequence}`;
         }).join('\n');
     }

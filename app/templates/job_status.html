@@ -6,45 +6,158 @@
 {% block nav_my_jobs %}text-journal-gold{% endblock %}
 
 {% block head %}
-<style type="text/tailwindcss">
+<style>
     /* 
      * Bridge styles to support job_status.js state toggling 
+     * Scoped to #job-status-page to prevent global leakage
      */
-    
-    /* Button Styles */
-    .btn-primary {
-        @apply inline-flex items-center justify-center gap-2 bg-gradient-to-r from-journal-gold to-journal-gold-light text-journal-dark py-4 px-6 rounded-xl font-bold text-lg shadow-lg hover:shadow-xl hover:brightness-110 transition-all transform hover:-translate-y-1;
+
+    /* Keyframes for animations - Global is fine or scope if needed */
+    @keyframes pulse-opacity {
+
+        0%,
+        100% {
+            opacity: 1;
+        }
+
+        50% {
+            opacity: .5;
+        }
     }
-    .btn-primary.disabled, .btn-primary:disabled {
-        @apply opacity-50 cursor-not-allowed shadow-none transform-none pointer-events-none bg-gray-300 text-gray-500 from-transparent to-transparent;
+
+    /* Button Styles */
+    #job-status-page .btn-primary {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        gap: 0.5rem;
+        background-image: linear-gradient(to right, #c9a962, #e5d4a1);
+        color: #1a2f23;
+        padding: 1rem 1.5rem;
+        border-radius: 0.75rem;
+        font-weight: 700;
+        font-size: 1.125rem;
+        line-height: 1.75rem;
+        box-shadow: 0 10px 15px -3px rgba(0, 0, 0, 0.1), 0 4px 6px -2px rgba(0, 0, 0, 0.05);
+        transition: all 150ms cubic-bezier(0.4, 0, 0.2, 1);
+        transform: translateZ(0);
+    }
+
+    #job-status-page .btn-primary:hover {
+        box-shadow: 0 20px 25px -5px rgba(0, 0, 0, 0.1), 0 10px 10px -5px rgba(0, 0, 0, 0.04);
+        filter: brightness(1.1);
+        transform: translateY(-0.25rem);
+    }
+
+    #job-status-page .btn-primary.disabled,
+    #job-status-page .btn-primary:disabled {
+        opacity: 0.5;
+        cursor: not-allowed;
+        box-shadow: none;
+        transform: none;
+        pointer-events: none;
+        background-color: #d1d5db;
+        color: #6b7280;
+        background-image: none;
     }
 
     /* Status Badges */
-    .status-badge {
-        @apply inline-flex items-center px-2 py-0.5 rounded-full text-xs font-medium uppercase tracking-wider;
+    #job-status-page .status-badge {
+        display: inline-flex;
+        align-items: center;
+        padding: 0.125rem 0.5rem;
+        border-radius: 9999px;
+        font-size: 0.75rem;
+        font-weight: 500;
+        text-transform: uppercase;
+        letter-spacing: 0.05em;
     }
-    .status-badge.queued { background-color: #f3f4f6; color: #6b7280; }
-    .status-badge.running { background-color: #eff6ff; color: #3b82f6; }
-    .status-badge.completed, .status-badge.done { background-color: #ecfdf5; color: #10b981; }
-    .status-badge.failed { background-color: #fef2f2; color: #ef4444; }
-    .status-badge.skipped { background-color: #f3f4f6; color: #9ca3af; font-style: italic; }
+
+    #job-status-page .status-badge.queued {
+        background-color: #f3f4f6;
+        color: #6b7280;
+    }
+
+    #job-status-page .status-badge.running {
+        background-color: #eff6ff;
+        color: #3b82f6;
+    }
+
+    #job-status-page .status-badge.completed,
+    #job-status-page .status-badge.done {
+        background-color: #ecfdf5;
+        color: #10b981;
+    }
+
+    #job-status-page .status-badge.failed {
+        background-color: #fef2f2;
+        color: #ef4444;
+    }
+
+    #job-status-page .status-badge.skipped {
+        background-color: #f3f4f6;
+        color: #9ca3af;
+        font-style: italic;
+    }
 
     /* Dark mode overrides */
-    .dark .status-badge.queued { background-color: #374151; color: #9ca3af; }
-    .dark .status-badge.running { background-color: #1e3a8a; color: #93c5fd; }
-    .dark .status-badge.completed, .dark .status-badge.done { background-color: #064e3b; color: #6ee7b7; }
-    .dark .status-badge.failed { background-color: #7f1d1d; color: #fca5a5; }
-    .dark .status-badge.skipped { background-color: #374151; color: #6b7280; }
+    .dark #job-status-page .status-badge.queued {
+        background-color: #374151;
+        color: #9ca3af;
+    }
+
+    .dark #job-status-page .status-badge.running {
+        background-color: #1e3a8a;
+        color: #93c5fd;
+    }
+
+    .dark #job-status-page .status-badge.completed,
+    .dark #job-status-page .status-badge.done {
+        background-color: #064e3b;
+        color: #6ee7b7;
+    }
+
+    .dark #job-status-page .status-badge.failed {
+        background-color: #7f1d1d;
+        color: #fca5a5;
+    }
+
+    .dark #job-status-page .status-badge.skipped {
+        background-color: #374151;
+        color: #6b7280;
+    }
 
     /* Connection Indicator */
-    .connection-indicator { @apply flex items-center gap-2 text-sm text-gray-500 dark:text-gray-400; }
-    .connection-dot { @apply w-2 h-2 rounded-full bg-gray-400; }
-    .connected .connection-dot { @apply bg-green-500; }
-    .disconnected .connection-dot { @apply bg-red-500 animate-pulse; }
+    #job-status-page .connection-indicator {
+        display: flex;
+        align-items: center;
+        gap: 0.5rem;
+        font-size: 0.875rem;
+        color: #6b7280;
+    }
 
-    /* Step Indicators - FORCE STANDARD CSS FOR RELIABILITY */
-    /* Using standard CSS ensures border-radius works even if @apply has issues */
-    .step-indicator {
+    .dark #job-status-page .connection-indicator {
+        color: #9ca3af;
+    }
+
+    #job-status-page .connection-dot {
+        width: 0.5rem;
+        height: 0.5rem;
+        border-radius: 9999px;
+        background-color: #9ca3af;
+    }
+
+    #job-status-page .connected .connection-dot {
+        background-color: #22c55e;
+    }
+
+    #job-status-page .disconnected .connection-dot {
+        background-color: #ef4444;
+        animation: pulse-opacity 2s cubic-bezier(0.4, 0, 0.6, 1) infinite;
+    }
+
+    /* Step Indicators */
+    #job-status-page .step-indicator {
         width: 32px;
         height: 32px;
         border-radius: 50%;
@@ -54,377 +167,495 @@
         border: 2px solid #e5e7eb;
         background-color: transparent;
         color: #9ca3af;
-        font-size: 0.875rem; 
+        font-size: 0.875rem;
         font-weight: 500;
         transition: all 0.3s;
     }
-    .dark .step-indicator { border-color: #374151; color: #6b7280; }
 
-    .step-indicator.running {
-        border-color: #3b82f6; background-color: #3b82f6; color: white;
+    .dark #job-status-page .step-indicator {
+        border-color: #374151;
+        color: #6b7280;
+    }
+
+    #job-status-page .step-indicator.running {
+        border-color: #3b82f6;
+        background-color: #3b82f6;
+        color: white;
         box-shadow: 0 0 0 4px rgba(59, 130, 246, 0.2);
     }
-    .step-indicator.done {
-        border-color: #10b981; background-color: #10b981; color: white;
+
+    #job-status-page .step-indicator.done {
+        border-color: #10b981;
+        background-color: #10b981;
+        color: white;
     }
-    .step-indicator.failed {
-        border-color: #ef4444; background-color: #ef4444; color: white;
+
+    #job-status-page .step-indicator.failed {
+        border-color: #ef4444;
+        background-color: #ef4444;
+        color: white;
     }
-    .step-indicator.skipped {
-        border-color: #d1d5db; color: #9ca3af; border-style: dashed;
+
+    #job-status-page .step-indicator.skipped {
+        border-color: #d1d5db;
+        color: #9ca3af;
+        border-style: dashed;
     }
-    .dark .step-indicator.skipped { border-color: #4b5563; color: #6b7280; }
+
+    .dark #job-status-page .step-indicator.skipped {
+        border-color: #4b5563;
+        color: #6b7280;
+    }
 
     /* Step Labels */
-    .step-label { @apply text-xs mt-2 font-medium text-gray-500 dark:text-gray-400 hidden sm:block; }
-    .step-label.running { @apply text-blue-600 dark:text-blue-400 font-bold; }
-    .step-label.done { @apply text-gray-900 dark:text-gray-100; }
-    .step-label.failed { @apply text-red-600 dark:text-red-400; }
-    .step-label.skipped { @apply italic text-gray-400 dark:text-gray-600; }
-
-    /* Current Step Card */
-    .current-step-card {
-        @apply border-l-4;
-        border-left-color: #3b82f6; 
-    }
-    .current-step-card.completed { border-left-color: #10b981; }
-    .current-step-card.failed { border-left-color: #ef4444; }
-
-    /* Tabs */
-    .tab-btn.active {
-        @apply bg-gray-900 text-white border-b-2 border-journal-gold;
+    #job-status-page .step-label {
+        font-size: 0.75rem;
+        margin-top: 0.5rem;
+        font-weight: 500;
+        color: #6b7280;
+        display: none;
     }
 
-    /* Terminal/Logs */
-    .log-line { @apply font-mono text-xs leading-5 whitespace-pre-wrap break-all text-gray-300; }
-    .log-line.stderr { @apply text-red-300; }
-    .log-line.cmd { @apply text-green-400 font-bold; }
-    .log-tag { @apply text-gray-500 mr-2 font-bold; }
+    @media (min-width: 640px) {
+        #job-status-page .step-label {
+            display: block;
+        }
+    }
 
-    /* Overview Icons */
-    .overview-icon.done { @apply text-green-500; }
-    .overview-icon.running { @apply text-blue-500; }
-    .overview-icon.failed { @apply text-red-500; }
-    .overview-icon.skipped { @apply text-gray-400; }
-    
-    /* Skeleton */
-    .skeleton {
-        @apply animate-pulse bg-gray-200 dark:bg-gray-700 rounded;
+    .dark #job-status-page .step-label {
+        color: #9ca3af;
+    }
+
+    #job-status-page .step-label.running {
+        color: #2563eb;
+        font-weight: 700;
+    }
+
+    .dark #job-status-page .step-label.running {
+        color: #60a5fa;
+    }
+
+    #job-status-page .step-label.done {
+        color: #111827;
+    }
+
+    .dark #job-status-page .step-label.done {
+        color: #f3f4f6;
+    }
+
+    #job-status-page .step-label.failed {
+        color: #dc2626;
+    }
+
+    .dark #job-status-page .step-label.failed {
+        color: #f87171;
+    }
+
+    #job-status-page .step-label.skipped {
+        font-style: italic;
+        color: #9ca3af;
+    }
+
+    .dark #job-status-page .step-label.skipped {
+        color: #4b5563;
+    }
+
+    /* Current Step Card & Others */
+    #job-status-page .current-step-card {
+        border-left-width: 4px;
+        border-left-style: solid;
+        border-left-color: #3b82f6;
+    }
+
+    #job-status-page .current-step-card.completed {
+        border-left-color: #10b981;
+    }
+
+    #job-status-page .current-step-card.failed {
+        border-left-color: #ef4444;
+    }
+
+    #job-status-page .tab-btn.active {
+        background-color: #111827;
+        color: white;
+        border-bottom: 2px solid #c9a962;
+    }
+
+    #job-status-page .log-line {
+        font-family: monospace;
+        font-size: 0.75rem;
+        line-height: 1.25rem;
+        white-space: pre-wrap;
+        word-break: break-all;
+        color: #d1d5db;
+    }
+
+    #job-status-page .log-line.stderr {
+        color: #fca5a5;
+    }
+
+    #job-status-page .log-line.cmd {
+        color: #4ade80;
+        font-weight: 700;
+    }
+
+    #job-status-page .log-tag {
+        color: #6b7280;
+        margin-right: 0.5rem;
+        font-weight: 700;
+    }
+
+    #job-status-page .overview-icon.done {
+        color: #22c55e;
+    }
+
+    #job-status-page .overview-icon.running {
+        color: #3b82f6;
+    }
+
+    #job-status-page .overview-icon.failed {
+        color: #ef4444;
+    }
+
+    #job-status-page .overview-icon.skipped {
+        color: #9ca3af;
+    }
+
+    #job-status-page .skeleton {
+        animation: pulse-opacity 2s cubic-bezier(0.4, 0, 0.6, 1) infinite;
+        background-color: #e5e7eb;
+        border-radius: 0.25rem;
         color: transparent !important;
+    }
+
+    .dark #job-status-page .skeleton {
+        background-color: #374151;
     }
 </style>
 {% endblock %}
 
 {% block content %}
-<div id="job-status-container" data-job-id="{{ job_id }}" class="max-w-7xl mx-auto space-y-6">
+<div id="job-status-page">
+    <div id="job-status-container" data-job-id="{{ job_id }}" class="max-w-7xl mx-auto space-y-6">
 
-    <!-- Header Section -->
-    <div
-        class="flex flex-col md:flex-row justify-between items-start md:items-center gap-4 bg-white dark:bg-journal-green p-6 rounded-xl shadow-lg transition-colors">
-        <div>
-            <h1 class="text-2xl font-bold text-journal-dark dark:text-white flex items-center gap-3">
-                Job Status
-                <span id="job-status-badge"
-                    class="px-3 py-1 bg-gray-100 text-gray-600 rounded-full text-xs uppercase tracking-wider font-semibold">
-                    Loading...
-                </span>
-            </h1>
-            <div class="flex items-center gap-6 mt-2 text-sm text-gray-500 dark:text-gray-300">
-                <span class="font-mono bg-gray-100 dark:bg-journal-dark px-2 py-1 rounded">ID: {{ job_id }}</span>
-                <span>Elapsed: <span id="elapsed-time" class="font-mono font-bold">--</span></span>
-            </div>
-        </div>
-
-        <div class="flex flex-col items-end gap-2">
-            <div id="connection-indicator" class="flex items-center gap-2 text-sm text-gray-500 dark:text-gray-400">
-                <div class="w-2 h-2 rounded-full bg-gray-400 connection-dot"></div>
-                <span id="connection-text">Connecting...</span>
-            </div>
-            <div class="flex gap-2">
-                <a href="{{ url_for('user.user_jobs') }}" class="text-sm text-journal-gold hover:underline">
-                    <i class="fas fa-arrow-left mr-1"></i> Back to Jobs
-                </a>
-            </div>
-        </div>
-    </div>
-
-    <!-- Pipeline Visualizer -->
-    <div class="bg-white dark:bg-journal-green p-6 rounded-xl shadow-lg overflow-hidden transition-colors relative">
-        <h2 class="text-sm font-semibold text-gray-500 dark:text-gray-400 uppercase tracking-wider mb-6">Pipeline
-            Progress</h2>
-
-        <!-- Connector Line -->
-        <div class="absolute top-[5.25rem] left-[4rem] right-[4rem] h-0.5 bg-gray-200 dark:bg-journal-dark z-0"></div>
-
-        <div class="flex justify-between relative z-10">
-            <!-- Step: Input -->
-            <div id="step-input" class="flex flex-col items-center flex-1">
-                <div class="step-indicator bg-white dark:bg-journal-green">○</div>
-                <span class="step-label">Input</span>
-            </div>
-
-            <!-- Step: BLAST (Optional) -->
-            <div id="step-blast" class="flex flex-col items-center flex-1" style="display: none;">
-                <div class="step-indicator bg-white dark:bg-journal-green">○</div>
-                <span class="step-label">BLAST</span>
-            </div>
-
-            <!-- Step: Align -->
-            <div id="step-align" class="flex flex-col items-center flex-1">
-                <div class="step-indicator bg-white dark:bg-journal-green">○</div>
-                <span class="step-label">Alignment</span>
-            </div>
-
-            <!-- Step: Trim (Optional) -->
-            <div id="step-trim" class="flex flex-col items-center flex-1" style="display: none;">
-                <div class="step-indicator bg-white dark:bg-journal-green">○</div>
-                <span class="step-label">Trimming</span>
-            </div>
-
-            <!-- Step: Tree -->
-            <div id="step-tree" class="flex flex-col items-center flex-1">
-                <div class="step-indicator bg-white dark:bg-journal-green">○</div>
-                <span class="step-label">Tree</span>
-            </div>
-
-            <!-- Step: Post -->
-            <div id="step-post" class="flex flex-col items-center flex-1">
-                <div class="step-indicator bg-white dark:bg-journal-green">○</div>
-                <span class="step-label">Finish</span>
-            </div>
-        </div>
-    </div>
-
-    <!-- Current Step & Error Layout -->
-    <div class="space-y-6">
-
-        <!-- Current Step Card -->
-        <div id="current-step-card"
-            class="bg-white dark:bg-journal-green border-l-4 border-blue-500 p-6 rounded-r-xl shadow-lg transition-colors"
-            style="display: none;">
-            <div class="flex items-center gap-3 mb-2">
-                <div class="w-3 h-3 rounded-full bg-blue-500 animate-pulse"></div>
-                <h3 id="current-step-name" class="text-lg font-bold text-gray-900 dark:text-white skeleton">
-                    Processing...</h3>
-            </div>
-            <p id="current-step-detail" class="text-gray-600 dark:text-gray-300 text-sm skeleton">Initializing...</p>
-            <p id="current-step-time" class="text-xs text-gray-400 mt-2 font-mono"></p>
-        </div>
-
-        <!-- Error Panel -->
-        <div id="error-panel"
-            class="bg-white dark:bg-journal-green border border-red-200 dark:border-red-900 p-6 rounded-xl shadow-lg hidden">
-            <h2 class="text-xl font-bold text-red-600 dark:text-red-400 flex items-center gap-2 mb-4">
-                <i class="fas fa-exclamation-circle"></i> <span class="error-title">Step Failed</span>
-            </h2>
-
-            <div class="grid grid-cols-1 md:grid-cols-2 gap-6 mb-6">
-                <div>
-                    <h3 class="text-sm font-semibold text-gray-500 uppercase">What happened</h3>
-                    <p class="error-what text-gray-900 dark:text-gray-100 mt-1">An error occurred.</p>
-                </div>
-                <div>
-                    <h3 class="text-sm font-semibold text-gray-500 uppercase">Why</h3>
-                    <p class="error-why text-gray-900 dark:text-gray-100 mt-1">Unknown cause.</p>
+        <!-- Header Section -->
+        <div
+            class="flex flex-col md:flex-row justify-between items-start md:items-center gap-4 bg-white dark:bg-journal-green p-6 rounded-xl shadow-lg transition-colors">
+            <div>
+                <h1 class="text-2xl font-bold text-journal-dark dark:text-white flex items-center gap-3">
+                    Job Status
+                    <span id="job-status-badge"
+                        class="px-3 py-1 bg-gray-100 text-gray-600 rounded-full text-xs uppercase tracking-wider font-semibold">
+                        Loading...
+                    </span>
+                </h1>
+                <div class="flex items-center gap-6 mt-2 text-sm text-gray-500 dark:text-gray-300">
+                    <span class="font-mono bg-gray-100 dark:bg-journal-dark px-2 py-1 rounded">ID: {{ job_id }}</span>
+                    <span>Elapsed: <span id="elapsed-time" class="font-mono font-bold">--</span></span>
                 </div>
             </div>
 
-            <div class="space-y-4">
-                <details class="bg-gray-50 dark:bg-journal-dark rounded-lg p-3">
-                    <summary class="cursor-pointer text-sm font-medium text-gray-700 dark:text-gray-300">Relevant Output
-                        (stderr)</summary>
-                    <pre
-                        class="error-stderr mt-2 text-xs font-mono text-gray-600 dark:text-gray-400 overflow-x-auto p-2"></pre>
-                </details>
-
-                <div class="pt-4 border-t border-gray-100 dark:border-gray-700 flex flex-wrap gap-3">
-                    <a href="#"
-                        class="btn-secondary px-4 py-2 bg-gray-100 dark:bg-gray-700 rounded text-sm font-medium hover:bg-gray-200 dark:hover:bg-gray-600 transition-colors">
-                        <i class="fas fa-download mr-1"></i> Download Logs
+            <div class="flex flex-col items-end gap-2">
+                <div id="connection-indicator" class="flex items-center gap-2 text-sm text-gray-500 dark:text-gray-400">
+                    <div class="w-2 h-2 rounded-full bg-gray-400 connection-dot"></div>
+                    <span id="connection-text">Connecting...</span>
+                </div>
+                <div class="flex gap-2">
+                    <a href="{{ url_for('user.user_jobs') }}" class="text-sm text-journal-gold hover:underline">
+                        <i class="fas fa-arrow-left mr-1"></i> Back to Jobs
                     </a>
                 </div>
             </div>
         </div>
 
-    </div>
+        <!-- Pipeline Visualizer -->
+        <div class="bg-white dark:bg-journal-green p-6 rounded-xl shadow-lg overflow-hidden transition-colors relative">
+            <h2 class="text-sm font-semibold text-gray-500 dark:text-gray-400 uppercase tracking-wider mb-6">Pipeline
+                Progress</h2>
 
-    <!-- Main Content Grid -->
-    <div class="grid grid-cols-1 lg:grid-cols-3 gap-6">
+            <!-- Connector Line -->
+            <div class="absolute top-[5.25rem] left-[4rem] right-[4rem] h-0.5 bg-gray-200 dark:bg-journal-dark z-0">
+            </div>
 
-        <!-- Left Column: Overview Feed -->
-        <div class="lg:col-span-1">
-            <div class="bg-white dark:bg-journal-green rounded-xl shadow-lg p-4 transition-colors sticky top-24">
-                <h3
-                    class="text-sm font-semibold text-gray-500 dark:text-gray-400 uppercase tracking-wider mb-4 border-b border-gray-100 dark:border-journal-dark pb-2">
-                    Activity Feed
-                </h3>
-                <div id="overview-feed" class="space-y-3 max-h-[300px] overflow-y-auto pr-2 custom-scrollbar text-sm">
-                    <div class="overview-item flex gap-3 text-gray-600 dark:text-gray-300">
-                        <span class="overview-icon text-blue-500">⋯</span>
-                        <span>Waiting for job to start...</span>
-                    </div>
+            <div class="flex justify-between relative z-10">
+                <!-- Step: Input -->
+                <div id="step-input" class="flex flex-col items-center flex-1">
+                    <div class="step-indicator bg-white dark:bg-journal-green">○</div>
+                    <span class="step-label">Input</span>
+                </div>
+
+                <!-- Step: BLAST (Optional) -->
+                <div id="step-blast" class="flex flex-col items-center flex-1" style="display: none;">
+                    <div class="step-indicator bg-white dark:bg-journal-green">○</div>
+                    <span class="step-label">BLAST</span>
+                </div>
+
+                <!-- Step: Align -->
+                <div id="step-align" class="flex flex-col items-center flex-1">
+                    <div class="step-indicator bg-white dark:bg-journal-green">○</div>
+                    <span class="step-label">Alignment</span>
+                </div>
+
+                <!-- Step: Trim (Optional) -->
+                <div id="step-trim" class="flex flex-col items-center flex-1" style="display: none;">
+                    <div class="step-indicator bg-white dark:bg-journal-green">○</div>
+                    <span class="step-label">Trimming</span>
+                </div>
+
+                <!-- Step: Tree -->
+                <div id="step-tree" class="flex flex-col items-center flex-1">
+                    <div class="step-indicator bg-white dark:bg-journal-green">○</div>
+                    <span class="step-label">Tree</span>
+                </div>
+
+                <!-- Step: Post -->
+                <div id="step-post" class="flex flex-col items-center flex-1">
+                    <div class="step-indicator bg-white dark:bg-journal-green">○</div>
+                    <span class="step-label">Finish</span>
                 </div>
             </div>
         </div>
 
-        <!-- Right Column: Tabs & Terminal -->
-        <div class="lg:col-span-2 space-y-4">
+        <!-- Current Step & Error Layout -->
+        <div class="space-y-6">
 
-            <!-- Log Tabs -->
-            <div class="bg-gray-800 rounded-t-xl overflow-hidden shadow-lg border-b border-gray-700 flex flex-wrap">
-                <button type="button" id="tab-terminal"
-                    class="tab-btn active px-4 py-3 text-sm font-medium text-gray-300 hover:text-white hover:bg-gray-700 transition"
-                    data-tab="terminal">Terminal</button>
-                <button type="button" id="tab-sequences"
-                    class="tab-btn px-4 py-3 text-sm font-medium text-gray-300 hover:text-white hover:bg-gray-700 transition"
-                    data-tab="sequences">Input</button>
-                <button type="button" id="tab-aligned"
-                    class="tab-btn px-4 py-3 text-sm font-medium text-gray-300 hover:text-white hover:bg-gray-700 transition"
-                    data-tab="aligned">Aligned</button>
-                <div class="hidden sm:flex border-l border-gray-700 h-6 my-auto mx-2"></div>
-                <button type="button" id="tab-pipeline-log"
-                    class="tab-btn px-4 py-3 text-xs uppercase tracking-wider text-gray-400 hover:text-white hover:bg-gray-700 transition"
-                    data-tab="pipeline-log">Pipeline</button>
-                <button type="button" id="tab-alignment-log"
-                    class="tab-btn px-4 py-3 text-xs uppercase tracking-wider text-gray-400 hover:text-white hover:bg-gray-700 transition"
-                    data-tab="alignment-log">Align</button>
-                <button type="button" id="tab-tree-log"
-                    class="tab-btn px-4 py-3 text-xs uppercase tracking-wider text-gray-400 hover:text-white hover:bg-gray-700 transition"
-                    data-tab="tree-log">Tree</button>
+            <!-- Current Step Card -->
+            <div id="current-step-card"
+                class="bg-white dark:bg-journal-green border-l-4 border-blue-500 p-6 rounded-r-xl shadow-lg transition-colors"
+                style="display: none;">
+                <div class="flex items-center gap-3 mb-2">
+                    <div class="w-3 h-3 rounded-full bg-blue-500 animate-pulse"></div>
+                    <h3 id="current-step-name" class="text-lg font-bold text-gray-900 dark:text-white skeleton">
+                        Processing...</h3>
+                </div>
+                <p id="current-step-detail" class="text-gray-600 dark:text-gray-300 text-sm skeleton">Initializing...
+                </p>
+                <p id="current-step-time" class="text-xs text-gray-400 mt-2 font-mono"></p>
             </div>
 
-            <!-- Tab Contents -->
-            <div
-                class="bg-gray-900 rounded-b-xl shadow-lg border border-gray-800 -mt-4 min-h-[400px] text-gray-300 font-mono text-sm relative">
+            <!-- Error Panel -->
+            <div id="error-panel"
+                class="bg-white dark:bg-journal-green border border-red-200 dark:border-red-900 p-6 rounded-xl shadow-lg hidden">
+                <h2 class="text-xl font-bold text-red-600 dark:text-red-400 flex items-center gap-2 mb-4">
+                    <i class="fas fa-exclamation-circle"></i> <span class="error-title">Step Failed</span>
+                </h2>
 
-                <!-- Terminal Pane -->
-                <div id="pane-terminal" class="tab-content active p-0 h-full flex flex-col">
-                    <div
-                        class="flex justify-between items-center p-2 bg-gray-800/50 border-b border-gray-700/50 text-xs">
-                        <span class="text-gray-500 font-semibold uppercase tracking-wider ml-2">Live Output</span>
-                        <div class="flex items-center gap-3 mr-2">
-                            <label class="flex items-center gap-1 cursor-pointer hover:text-white transition">
-                                <input type="checkbox" id="autoscroll-checkbox" checked
-                                    class="rounded bg-gray-700 border-gray-600 text-journal-gold focus:ring-0">
-                                Autoscroll
-                            </label>
-                            <button id="clear-terminal-btn" class="hover:text-red-400 transition">Clear</button>
+                <div class="grid grid-cols-1 md:grid-cols-2 gap-6 mb-6">
+                    <div>
+                        <h3 class="text-sm font-semibold text-gray-500 uppercase">What happened</h3>
+                        <p class="error-what text-gray-900 dark:text-gray-100 mt-1">An error occurred.</p>
+                    </div>
+                    <div>
+                        <h3 class="text-sm font-semibold text-gray-500 uppercase">Why</h3>
+                        <p class="error-why text-gray-900 dark:text-gray-100 mt-1">Unknown cause.</p>
+                    </div>
+                </div>
+
+                <div class="space-y-4">
+                    <details class="bg-gray-50 dark:bg-journal-dark rounded-lg p-3">
+                        <summary class="cursor-pointer text-sm font-medium text-gray-700 dark:text-gray-300">Relevant
+                            Output
+                            (stderr)</summary>
+                        <pre
+                            class="error-stderr mt-2 text-xs font-mono text-gray-600 dark:text-gray-400 overflow-x-auto p-2"></pre>
+                    </details>
+
+                    <div class="pt-4 border-t border-gray-100 dark:border-gray-700 flex flex-wrap gap-3">
+                        <a href="#"
+                            class="btn-secondary px-4 py-2 bg-gray-100 dark:bg-gray-700 rounded text-sm font-medium hover:bg-gray-200 dark:hover:bg-gray-600 transition-colors">
+                            <i class="fas fa-download mr-1"></i> Download Logs
+                        </a>
+                    </div>
+                </div>
+            </div>
+
+        </div>
+
+        <!-- Main Content Grid -->
+        <div class="grid grid-cols-1 lg:grid-cols-3 gap-6">
+
+            <!-- Left Column: Overview Feed -->
+            <div class="lg:col-span-1">
+                <div class="bg-white dark:bg-journal-green rounded-xl shadow-lg p-4 transition-colors sticky top-24">
+                    <h3
+                        class="text-sm font-semibold text-gray-500 dark:text-gray-400 uppercase tracking-wider mb-4 border-b border-gray-100 dark:border-journal-dark pb-2">
+                        Activity Feed
+                    </h3>
+                    <div id="overview-feed"
+                        class="space-y-3 max-h-[300px] overflow-y-auto pr-2 custom-scrollbar text-sm">
+                        <div class="overview-item flex gap-3 text-gray-600 dark:text-gray-300">
+                            <span class="overview-icon text-blue-500">⋯</span>
+                            <span>Waiting for job to start...</span>
                         </div>
                     </div>
-                    <div id="terminal-content"
-                        class="p-4 h-[400px] overflow-y-auto custom-scrollbar font-mono text-xs leading-5">
-                        <!-- Logs go here -->
-                        <div class="text-gray-600 italic">Connecting to output stream...</div>
-                    </div>
-                </div>
-
-                <!-- Input Sequences Pane -->
-                <div id="pane-sequences" class="tab-content hidden h-full flex flex-col" style="display: none;">
-                    <div class="p-3 bg-gray-800/50 border-b border-gray-700 flex justify-between items-center">
-                        <span id="sequence-title" class="text-sm font-semibold text-white">Input Sequences</span>
-                        <span id="sequence-count"
-                            class="text-xs text-gray-400 bg-gray-800 px-2 py-1 rounded-full"></span>
-                    </div>
-                    <pre id="sequence-content"
-                        class="p-4 h-[400px] overflow-auto text-xs text-gray-300 custom-scrollbar">Loading sequences...</pre>
-                </div>
-
-                <!-- Aligned Sequences Pane -->
-                <div id="pane-aligned" class="tab-content hidden h-full flex flex-col" style="display: none;">
-                    <div class="p-3 bg-gray-800/50 border-b border-gray-700 flex justify-between items-center">
-                        <span id="aligned-title" class="text-sm font-semibold text-white">Aligned Sequences</span>
-                        <span id="aligned-count"
-                            class="text-xs text-gray-400 bg-gray-800 px-2 py-1 rounded-full"></span>
-                    </div>
-                    <pre id="aligned-content"
-                        class="p-4 h-[400px] overflow-auto text-xs text-gray-300 custom-scrollbar">Loading aligned sequences...</pre>
-                </div>
-
-                <!-- Log Panes -->
-                <div id="pane-pipeline-log" class="tab-content hidden h-full" style="display: none;">
-                    <pre id="pipeline-log-content"
-                        class="p-4 h-[400px] overflow-auto text-xs text-gray-300 custom-scrollbar">Loading pipeline log...</pre>
-                </div>
-                <div id="pane-alignment-log" class="tab-content hidden h-full" style="display: none;">
-                    <pre id="alignment-log-content"
-                        class="p-4 h-[400px] overflow-auto text-xs text-gray-300 custom-scrollbar">Loading alignment log...</pre>
-                </div>
-                <div id="pane-tree-log" class="tab-content hidden h-full" style="display: none;">
-                    <pre id="tree-log-content"
-                        class="p-4 h-[400px] overflow-auto text-xs text-gray-300 custom-scrollbar">Loading tree builder log...</pre>
                 </div>
             </div>
 
-            <!-- Action Buttons Footer -->
-            <div class="flex flex-wrap gap-4 mt-6">
-                <!-- View Tree Button (Primary) -->
-                <a id="view-tree-btn" href="#" class="btn-primary disabled">
-                    <i class="fas fa-tree"></i> View Phylogenetic Tree
-                </a>
+            <!-- Right Column: Tabs & Terminal -->
+            <div class="lg:col-span-2 space-y-4">
 
-                <!-- Downloads Dropdown -->
-                <div class="relative group">
-                    <button
-                        class="bg-white dark:bg-journal-dark border-2 border-gray-200 dark:border-gray-600 text-gray-700 dark:text-gray-200 py-4 px-8 rounded-xl font-semibold text-lg shadow-md flex items-center gap-2 hover:border-journal-gold transition-colors">
-                        <i class="fas fa-download"></i> Downloads <i class="fas fa-chevron-up text-xs ml-1"></i>
-                    </button>
-                    <!-- Dropdown Menu -->
-                    <div
-                        class="absolute bottom-full right-0 mb-2 w-64 bg-white dark:bg-gray-800 border border-gray-200 dark:border-gray-700 rounded-xl shadow-2xl overflow-hidden hidden group-hover:block z-50">
-                        <div
-                            class="px-4 py-2 bg-gray-50 dark:bg-gray-900 text-xs font-bold uppercase text-gray-500 border-b dark:border-gray-700">
-                            Logs</div>
-                        <a href="/api/job/{{ job_id }}/logs/pipeline" download
-                            class="block px-4 py-2 text-sm text-gray-700 dark:text-gray-300 hover:bg-gray-100 dark:hover:bg-gray-700">Pipeline
-                            Log</a>
-                        <a href="/api/job/{{ job_id }}/logs/alignment" download
-                            class="block px-4 py-2 text-sm text-gray-700 dark:text-gray-300 hover:bg-gray-100 dark:hover:bg-gray-700">Alignment
-                            Log</a>
-                        <a href="/api/job/{{ job_id }}/logs/tree_builder" download
-                            class="block px-4 py-2 text-sm text-gray-700 dark:text-gray-300 hover:bg-gray-100 dark:hover:bg-gray-700">Tree
-                            Log</a>
+                <!-- Log Tabs -->
+                <!-- Log Tabs & Terminal Wrapper -->
+                <div class="bg-gray-900 rounded-xl shadow-lg border border-gray-800 overflow-hidden flex flex-col">
+                    <!-- Log Tabs -->
+                    <div class="bg-gray-800 border-b border-gray-700 flex flex-wrap">
+                        <button type="button" id="tab-terminal"
+                            class="tab-btn active px-4 py-3 text-sm font-medium text-gray-300 hover:text-white hover:bg-gray-700 transition"
+                            data-tab="terminal">Terminal</button>
+                        <button type="button" id="tab-sequences"
+                            class="tab-btn px-4 py-3 text-sm font-medium text-gray-300 hover:text-white hover:bg-gray-700 transition"
+                            data-tab="sequences">Input</button>
+                        <button type="button" id="tab-aligned"
+                            class="tab-btn px-4 py-3 text-sm font-medium text-gray-300 hover:text-white hover:bg-gray-700 transition"
+                            data-tab="aligned">Aligned</button>
+                        <div class="hidden sm:flex border-l border-gray-700 h-6 my-auto mx-2"></div>
+                        <button type="button" id="tab-pipeline-log"
+                            class="tab-btn px-4 py-3 text-xs uppercase tracking-wider text-gray-400 hover:text-white hover:bg-gray-700 transition"
+                            data-tab="pipeline-log">Pipeline</button>
+                        <button type="button" id="tab-alignment-log"
+                            class="tab-btn px-4 py-3 text-xs uppercase tracking-wider text-gray-400 hover:text-white hover:bg-gray-700 transition"
+                            data-tab="alignment-log">Align</button>
+                        <button type="button" id="tab-tree-log"
+                            class="tab-btn px-4 py-3 text-xs uppercase tracking-wider text-gray-400 hover:text-white hover:bg-gray-700 transition"
+                            data-tab="tree-log">Tree</button>
+                    </div>
 
-                        <div
-                            class="px-4 py-2 bg-gray-50 dark:bg-gray-900 text-xs font-bold uppercase text-gray-500 border-t border-b dark:border-gray-700">
-                            Sequences</div>
-                        <a id="dl-original" href="/api/job/{{ job_id }}/download/fasta/original" download
-                            class="block px-4 py-2 text-sm text-gray-700 dark:text-gray-300 hover:bg-gray-100 dark:hover:bg-gray-700">Original
-                            FASTA</a>
-                        <a id="dl-aligned" href="/api/job/{{ job_id }}/download/fasta/aligned" download
-                            class="block px-4 py-2 text-sm text-gray-700 dark:text-gray-300 hover:bg-gray-100 dark:hover:bg-gray-700">Aligned
-                            FASTA</a>
-                        <a id="dl-trimmed" href="/api/job/{{ job_id }}/download/fasta/trimmed" download
-                            style="display: none;"
-                            class="block px-4 py-2 text-sm text-gray-700 dark:text-gray-300 hover:bg-gray-100 dark:hover:bg-gray-700">Trimmed
-                            FASTA</a>
+                    <!-- Tab Contents -->
+                    <div class="min-h-[400px] text-gray-300 font-mono text-sm relative">
+
+                        <!-- Terminal Pane -->
+                        <div id="pane-terminal" class="tab-content active p-0 h-full flex flex-col">
+                            <div
+                                class="flex justify-between items-center p-2 bg-gray-800/50 border-b border-gray-700/50 text-xs">
+                                <span class="text-gray-500 font-semibold uppercase tracking-wider ml-2">Live
+                                    Output</span>
+                                <div class="flex items-center gap-3 mr-2">
+                                    <label class="flex items-center gap-1 cursor-pointer hover:text-white transition">
+                                        <input type="checkbox" id="autoscroll-checkbox" checked
+                                            class="rounded bg-gray-700 border-gray-600 text-journal-gold focus:ring-0">
+                                        Autoscroll
+                                    </label>
+                                    <button id="clear-terminal-btn" class="hover:text-red-400 transition">Clear</button>
+                                </div>
+                            </div>
+                            <div id="terminal-content"
+                                class="p-4 h-[400px] overflow-y-auto custom-scrollbar font-mono text-xs leading-5">
+                                <!-- Logs go here -->
+                                <div class="text-gray-600 italic">Connecting to output stream...</div>
+                            </div>
+                        </div>
+
+                        <!-- Input Sequences Pane -->
+                        <div id="pane-sequences" class="tab-content hidden h-full flex flex-col" style="display: none;">
+                            <div class="p-3 bg-gray-800/50 border-b border-gray-700 flex justify-between items-center">
+                                <span id="sequence-title" class="text-sm font-semibold text-white">Input
+                                    Sequences</span>
+                                <span id="sequence-count"
+                                    class="text-xs text-gray-400 bg-gray-800 px-2 py-1 rounded-full"></span>
+                            </div>
+                            <pre id="sequence-content"
+                                class="p-4 h-[400px] overflow-auto text-xs text-gray-300 custom-scrollbar">Loading sequences...</pre>
+                        </div>
+
+                        <!-- Aligned Sequences Pane -->
+                        <div id="pane-aligned" class="tab-content hidden h-full flex flex-col" style="display: none;">
+                            <div class="p-3 bg-gray-800/50 border-b border-gray-700 flex justify-between items-center">
+                                <span id="aligned-title" class="text-sm font-semibold text-white">Aligned
+                                    Sequences</span>
+                                <span id="aligned-count"
+                                    class="text-xs text-gray-400 bg-gray-800 px-2 py-1 rounded-full"></span>
+                            </div>
+                            <pre id="aligned-content"
+                                class="p-4 h-[400px] overflow-auto text-xs text-gray-300 custom-scrollbar">Loading aligned sequences...</pre>
+                        </div>
+
+                        <!-- Log Panes -->
+                        <div id="pane-pipeline-log" class="tab-content hidden h-full" style="display: none;">
+                            <pre id="pipeline-log-content"
+                                class="p-4 h-[400px] overflow-auto text-xs text-gray-300 custom-scrollbar">Loading pipeline log...</pre>
+                        </div>
+                        <div id="pane-alignment-log" class="tab-content hidden h-full" style="display: none;">
+                            <pre id="alignment-log-content"
+                                class="p-4 h-[400px] overflow-auto text-xs text-gray-300 custom-scrollbar">Loading alignment log...</pre>
+                        </div>
+                        <div id="pane-tree-log" class="tab-content hidden h-full" style="display: none;">
+                            <pre id="tree-log-content"
+                                class="p-4 h-[400px] overflow-auto text-xs text-gray-300 custom-scrollbar">Loading tree builder log...</pre>
+                        </div>
                     </div>
                 </div>
-            </div>
 
+                <!-- Action Buttons Footer -->
+                <div class="flex flex-wrap gap-4 mt-6">
+                    <!-- View Tree Button (Primary) -->
+                    <a id="view-tree-btn" href="#" class="btn-primary disabled">
+                        <i class="fas fa-tree"></i> View Phylogenetic Tree
+                    </a>
+
+                    <!-- Downloads Dropdown -->
+                    <div class="relative group">
+                        <button
+                            class="bg-white dark:bg-journal-dark border-2 border-gray-200 dark:border-gray-600 text-gray-700 dark:text-gray-200 py-4 px-8 rounded-xl font-semibold text-lg shadow-md flex items-center gap-2 hover:border-journal-gold transition-colors">
+                            <i class="fas fa-download"></i> Downloads <i class="fas fa-chevron-up text-xs ml-1"></i>
+                        </button>
+                        <!-- Dropdown Menu -->
+                        <div
+                            class="absolute bottom-full right-0 mb-2 w-64 bg-white dark:bg-gray-800 border border-gray-200 dark:border-gray-700 rounded-xl shadow-2xl overflow-hidden hidden group-hover:block z-50">
+                            <div
+                                class="px-4 py-2 bg-gray-50 dark:bg-gray-900 text-xs font-bold uppercase text-gray-500 border-b dark:border-gray-700">
+                                Logs</div>
+                            <a href="/api/job/{{ job_id }}/logs/pipeline" download
+                                class="block px-4 py-2 text-sm text-gray-700 dark:text-gray-300 hover:bg-gray-100 dark:hover:bg-gray-700">Pipeline
+                                Log</a>
+                            <a href="/api/job/{{ job_id }}/logs/alignment" download
+                                class="block px-4 py-2 text-sm text-gray-700 dark:text-gray-300 hover:bg-gray-100 dark:hover:bg-gray-700">Alignment
+                                Log</a>
+                            <a href="/api/job/{{ job_id }}/logs/tree_builder" download
+                                class="block px-4 py-2 text-sm text-gray-700 dark:text-gray-300 hover:bg-gray-100 dark:hover:bg-gray-700">Tree
+                                Log</a>
+
+                            <div
+                                class="px-4 py-2 bg-gray-50 dark:bg-gray-900 text-xs font-bold uppercase text-gray-500 border-t border-b dark:border-gray-700">
+                                Sequences</div>
+                            <a id="dl-original" href="/api/job/{{ job_id }}/download/fasta/original" download
+                                class="block px-4 py-2 text-sm text-gray-700 dark:text-gray-300 hover:bg-gray-100 dark:hover:bg-gray-700">Original
+                                FASTA</a>
+                            <a id="dl-aligned" href="/api/job/{{ job_id }}/download/fasta/aligned" download
+                                class="block px-4 py-2 text-sm text-gray-700 dark:text-gray-300 hover:bg-gray-100 dark:hover:bg-gray-700">Aligned
+                                FASTA</a>
+                            <a id="dl-trimmed" href="/api/job/{{ job_id }}/download/fasta/trimmed" download
+                                style="display: none;"
+                                class="block px-4 py-2 text-sm text-gray-700 dark:text-gray-300 hover:bg-gray-100 dark:hover:bg-gray-700">Trimmed
+                                FASTA</a>
+                        </div>
+                    </div>
+                </div>
+
+            </div>
         </div>
     </div>
+
+    <!-- Custom Scrollbar Style for Terminals -->
+    <style>
+        .custom-scrollbar::-webkit-scrollbar {
+            width: 8px;
+            height: 8px;
+        }
+
+        .custom-scrollbar::-webkit-scrollbar-track {
+            background: rgba(0, 0, 0, 0.1);
+        }
+
+        .custom-scrollbar::-webkit-scrollbar-thumb {
+            background: rgba(255, 255, 255, 0.2);
+            border-radius: 4px;
+        }
+
+        .custom-scrollbar::-webkit-scrollbar-thumb:hover {
+            background: rgba(255, 255, 255, 0.3);
+        }
+    </style>
 </div>
-
-<!-- Custom Scrollbar Style for Terminals -->
-<style>
-    .custom-scrollbar::-webkit-scrollbar {
-        width: 8px;
-        height: 8px;
-    }
-
-    .custom-scrollbar::-webkit-scrollbar-track {
-        background: rgba(0, 0, 0, 0.1);
-    }
-
-    .custom-scrollbar::-webkit-scrollbar-thumb {
-        background: rgba(255, 255, 255, 0.2);
-        border-radius: 4px;
-    }
-
-    .custom-scrollbar::-webkit-scrollbar-thumb:hover {
-        background: rgba(255, 255, 255, 0.3);
-    }
-</style>
 {% endblock %}
 
 {% block scripts %}

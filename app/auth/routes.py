@@ -56,4 +56,4 @@ def login():
 def logout():
     logout_user()
     flash('Logged out.', 'info')
-    return redirect(url_for('main.index'))
+    return redirect(url_for('journal.home'))
