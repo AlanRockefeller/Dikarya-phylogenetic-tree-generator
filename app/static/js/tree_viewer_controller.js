@@ -101,7 +101,7 @@ document.addEventListener('DOMContentLoaded', async () => {
                 d = window.d3v7.select(g).datum();
             } catch (_) { }
 
-            const nodeName = d?.data?.name || d?.data?.id || d?.name;
+            const nodeName = d?.data?.__original_name || d?.data?.name || d?.data?.id || d?.name;
             if (!nodeName) {
                 showStatus("Can't reroot: clicked node has no stable identifier.", "warning", 2500);
                 return;

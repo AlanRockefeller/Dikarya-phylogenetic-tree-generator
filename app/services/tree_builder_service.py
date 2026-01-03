@@ -19,6 +19,7 @@ from typing import Dict, Any, Optional
 from app.config import Config
 from app.models import TreeBuilderParams
 from app.services.subprocess_utils import run_command, run_command_streaming
+from app.services.fasta_utils import sanitize_fasta_headers, restore_tree_names
 
 # Try to import Bio.Phylo for NJ, or implement simple fallback
 try:
@@ -174,9 +175,13 @@ def _run_raxml(
     prefix = str(output_newick.parent / "raxml_run")
     threads = _get_thread_count(params)
     
+    # Sanitize FASTA to avoid RAxML invalid character errors
+    sanitized_fasta = output_newick.parent / "raxml_input_sanitized.fasta"
+    name_mapping = sanitize_fasta_headers(alignment_fasta, sanitized_fasta)
+    
     cmd = [
         config.RAXML_BINARY,
-        "--msa", str(alignment_fasta),
+        "--msa", str(sanitized_fasta),
         "--model", params.model,
         "--prefix", prefix,
         "--threads", str(threads),
@@ -219,6 +224,10 @@ def _run_raxml(
     
     if source_tree.exists():
         shutil.copy(source_tree, output_newick)
+        
+        # Restore original names in the Newick tree
+        restore_tree_names(output_newick, name_mapping)
+        
         _convert_newick_to_nexus(output_newick, output_nexus)
     else:
         raise RuntimeError("RAxML output tree not found.")

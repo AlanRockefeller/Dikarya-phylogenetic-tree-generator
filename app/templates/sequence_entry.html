@@ -39,7 +39,7 @@
                                bg-white dark:bg-journal-dark text-gray-900 dark:text-gray-100
                                focus:ring-2 focus:ring-journal-gold focus:border-transparent 
                                transition-all resize-none"
-                        placeholder=">seq1&#10;ATGCGATCGATCGATCG...&#10;&#10;Or enter a GenBank accession like: NC_012345"></textarea>
+                        placeholder=">seq1&#10;ATGCGATCGATCGATCG...&#10;&#10;Or enter a GenBank accession like: OP973765"></textarea>
                     <p class="text-xs text-gray-500 dark:text-gray-400 mt-1">
                         Enter sequences in FASTA format or a single GenBank accession number.
                     </p>
@@ -323,6 +323,7 @@
     // Sequence Queue State
     // =========================================================================
     let sequenceQueue = [];
+    let lastBlastQuery = null; // Track the query used for the last successful BLAST
 
     function updateQueueDisplay() {
         const listEl = document.getElementById('sequence_queue_list');
@@ -387,6 +388,7 @@
 
     function clearQueue() {
         sequenceQueue = [];
+        lastBlastQuery = null; // Reset BLAST context
         updateQueueDisplay();
     }
 
@@ -396,15 +398,32 @@
     function parseFasta(text) {
         const sequences = [];
         let currentName = null;
+        let currentOrganism = "";
         let currentSeq = [];
 
         for (const line of text.split('\n')) {
             const trimmed = line.trim();
             if (trimmed.startsWith('>')) {
                 if (currentName !== null) {
-                    sequences.push({ name: currentName, sequence: currentSeq.join('') });
+                    sequences.push({
+                        name: currentName,
+                        organism: currentOrganism,
+                        sequence: currentSeq.join('')
+                    });
                 }
-                currentName = trimmed.substring(1).split(/\s+/)[0];
+
+                // Parse header: ">ID Description..."
+                const headerContent = trimmed.substring(1);
+                // Split on first whitespace
+                const match = headerContent.match(/^(\S+)(.*)$/);
+                if (match) {
+                    currentName = match[1];
+                    currentOrganism = match[2].trim();
+                } else {
+                    currentName = headerContent;
+                    currentOrganism = "";
+                }
+
                 currentSeq = [];
             } else if (trimmed && currentName !== null) {
                 currentSeq.push(trimmed);
@@ -412,7 +431,11 @@
         }
 
         if (currentName !== null) {
-            sequences.push({ name: currentName, sequence: currentSeq.join('') });
+            sequences.push({
+                name: currentName,
+                organism: currentOrganism,
+                sequence: currentSeq.join('')
+            });
         }
 
         return sequences;
@@ -481,6 +504,9 @@
 
             const added = addSequences(data.sequences);
             showStatus(`BLAST complete! Added ${added} new sequences to queue.`, 'success');
+
+            // Save the query for later use in notes
+            lastBlastQuery = query;
 
             seqTextArea.value = '';
             updateBlastButtonState();
@@ -578,11 +604,17 @@
 
     function updateForm() {
         const method = treeMethodSelect.value;
+        const bootstrapInput = document.getElementById('bootstrap');
         mlOptions.classList.add('hidden');
         mbOptions.classList.add('hidden');
 
         if (method === 'raxml' || method === 'iqtree') {
             mlOptions.classList.remove('hidden');
+            if (method === 'raxml') {
+                bootstrapInput.value = 100;
+            } else if (method === 'iqtree') {
+                bootstrapInput.value = 1000;
+            }
         } else if (method === 'mrbayes') {
             mbOptions.classList.remove('hidden');
         }
@@ -594,7 +626,16 @@
     // Build FASTA from Queue
     // =========================================================================
     function buildFastaFromQueue() {
-        return sequenceQueue.map(seq => `>${seq.name}\n${seq.sequence}`).join('\n');
+        return sequenceQueue.map(seq => {
+            let header = seq.name;
+            if (seq.organism) {
+                // Sanitize organism name: replace spaces and unsafe chars with underscores
+                // This creates a single-word ID (e.g., Accession_Genus_species)
+                const safeOrganism = seq.organism.replace(/[\s\(\):,;]/g, '_').replace(/_+/g, '_');
+                header = `${header}_${safeOrganism}`;
+            }
+            return `>${header}\n${seq.sequence}`;
+        }).join('\n');
     }
 
     // =========================================================================
@@ -612,10 +653,24 @@
         btn.innerHTML = '<i class="fas fa-spinner fa-spin mr-3"></i> Submitting...';
         showStatus('Running Quick Tree analysis...', 'info');
 
+        // Default notes logic
+        let notes = document.getElementById('job_notes').value.trim();
+        if (!notes) {
+            if (lastBlastQuery && sequenceQueue.length > 0) {
+                if (isGenBankAccession(lastBlastQuery)) {
+                    notes = `BLAST ${lastBlastQuery}`;
+                } else {
+                    notes = 'BLAST';
+                }
+            } else {
+                notes = 'Quick Tree';
+            }
+        }
+
         const payload = {
             input_type: 'sequence',
             sequence: buildFastaFromQueue(),
-            notes: document.getElementById('job_notes').value.trim() || 'Quick Tree',
+            notes: notes,
             alignment_method: 'mafft',
             trimming_method: 'none',
             tree_method: 'nj',
@@ -661,10 +716,22 @@
         btn.innerHTML = '<i class="fas fa-spinner fa-spin mr-2"></i> Submitting...';
         showStatus('Validating and submitting job...', 'info');
 
+        // Default notes logic
+        let notes = document.getElementById('job_notes').value.trim();
+        if (!notes) {
+            if (lastBlastQuery && sequenceQueue.length > 0) {
+                if (isGenBankAccession(lastBlastQuery)) {
+                    notes = `BLAST ${lastBlastQuery}`;
+                } else {
+                    notes = 'BLAST';
+                }
+            }
+        }
+
         const payload = {
             input_type: 'sequence',
             sequence: buildFastaFromQueue(),
-            notes: document.getElementById('job_notes').value.trim(),
+            notes: notes,
             alignment_method: document.getElementById('alignment_method').value,
             trimming_method: document.getElementById('trimming_method').value,
             tree_method: treeMethodSelect.value,

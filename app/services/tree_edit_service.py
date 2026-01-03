@@ -40,6 +40,15 @@ def load_tree_state(job_dir: Path) -> Dict:
             "renames": {},
             "root": None # Default
         }
+        
+        # Default policy: Midpoint root the tree
+        try:
+            # We must pass the state as we just created it
+            state = midpoint_root(job_dir, state)
+            logging.info("Applied default midpoint rooting.")
+        except Exception as e:
+            logging.warning(f"Default midpoint rooting skipped/failed: {e}")
+
         save_tree_state(job_dir, state)
         return state
         

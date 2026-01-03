@@ -10,7 +10,7 @@ import json
 import logging
 import time
 import traceback
-from datetime import datetime
+from datetime import datetime, timezone
 
 from rq import get_current_job
 
@@ -238,7 +238,7 @@ def run_phylo_job(job_params: dict) -> dict:
             db_job = Job.query.get(job_id)
             if db_job:
                 metrics = db_job.metrics or {}
-                metrics["started_at"] = datetime.utcnow().isoformat()
+                metrics["started_at"] = datetime.now(timezone.utc).isoformat()
                 db_job.metrics = metrics
                 db_job.status = "running"
                 db.session.commit()
@@ -596,7 +596,7 @@ def run_phylo_job(job_params: dict) -> dict:
             db_job = Job.query.get(job_id)
             if db_job:
                 metrics = db_job.metrics or {}
-                metrics["completed_at"] = datetime.utcnow().isoformat()
+                metrics["completed_at"] = datetime.now(timezone.utc).isoformat()
                 db_job.metrics = metrics
                 db_job.status = "completed"
                 db.session.commit()
@@ -670,7 +670,7 @@ def run_phylo_job(job_params: dict) -> dict:
                 db_job = Job.query.get(job_id)
                 if db_job:
                     metrics = db_job.metrics or {}
-                    metrics["failed_at"] = datetime.utcnow().isoformat()
+                    metrics["failed_at"] = datetime.now(timezone.utc).isoformat()
                     metrics["error"] = error_msg
                     metrics["failed_step"] = current_step
                     db_job.metrics = metrics

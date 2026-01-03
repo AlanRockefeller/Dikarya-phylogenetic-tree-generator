@@ -34,6 +34,26 @@
         // 2. PARSE
         const tree = new phylotreeLib.phylotree(newick);
 
+        // 2b. PRE-PROCESS NAMES (Underscore -> Space)
+        // We traverse to replace underscores with spaces for display, 
+        // but back up the original name so logic (reroot/prune) works.
+        // 2b. PRE-PROCESS NAMES (Underscore -> Space)
+        // We traverse to replace underscores with spaces for display, 
+        // but back up the original name so logic (reroot/prune) works.
+        tree.traverse_and_compute((node) => {
+            if (node.data && node.data.name) {
+                // If it's a string, we process it
+                if (typeof node.data.name === 'string') {
+                    node.data.__original_name = node.data.name;
+                    node.data.name = node.data.name.replace(/_/g, " ");
+                }
+            } else if (node.name) {
+                // Fallback: sometimes phylotree puts name directly on node?
+                node.__original_name = node.name;
+                node.name = node.name.replace(/_/g, " ");
+            }
+        });
+
         // 3. STATE
         let state = {
             layout: 'linear',
@@ -333,7 +353,7 @@
                         const circle = window.d3v7.select(this).select("circle");
                         updateNodeStyle(circle, d);
 
-                        const nodeName = d.data.name;
+                        const nodeName = d.data.__original_name || d.data.name;
                         const isLeaf = !d.children || d.children.length === 0;
                         if (nodeName) callbacks.onTipClick({
                             name: nodeName,

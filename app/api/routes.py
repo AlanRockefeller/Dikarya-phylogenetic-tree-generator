@@ -7,6 +7,7 @@ from app.extensions import db
 from app.models import Job
 import logging
 import re
+from datetime import datetime
 
 
 # =============================================================================
@@ -157,7 +158,13 @@ def create_job():
             id=job_id,
             status="queued",
             job_dir=str(Config.JOB_DIR / job_id),
-            input_type=job_params["input_type"]
+            input_type=job_params["input_type"],
+            metrics={
+                "tree_method": job_params["tree_method"],
+                "notes": job_params["notes"],
+                "alignment_method": job_params["alignment_method"],
+                "trimming_method": job_params["trimming_method"]
+            }
         )
         
         if current_user.is_authenticated:

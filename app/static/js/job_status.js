@@ -13,6 +13,8 @@ class JobStatusClient {
         this.autoscroll = true;
         this.startTime = null;
         this.elapsedTimer = null;
+        this.lastStatus = null;
+        this.isRedirecting = false;
 
         // DOM elements
         this.elements = {
@@ -164,15 +166,56 @@ class JobStatusClient {
             );
         }
 
-        // Populate log tails
+        // Populate logs
         this.populateLogTails(logTails);
 
-        // Handle terminal states
+        // Sync Overview Feed with historical steps
+        // 1. Clear default "Waiting..." message
+        this.elements.overviewFeed.innerHTML = '';
+
+        // 2. Add "Job started" if applicable
+        if (job.started_at) {
+            this.appendOverview({ message: 'Job started', icon: 'running' });
+        }
+
+        // 3. Backfill step events
+        // We iterate through a logical order of steps to reconstruct the feed
+        const stepOrder = ['input', 'blast', 'align', 'trim', 'tree', 'post'];
+        stepOrder.forEach(stepKey => {
+            const step = job.meta.steps?.[stepKey];
+            if (!step) return;
+
+            // Skipping 'skipped' steps in the feed to avoid clutter, or maybe show them as skipped?
+            // Let's show done/running/failed
+            if (step.state === 'done') {
+                this.appendOverview({ message: `${step.label || stepKey} complete`, icon: 'done' });
+            } else if (step.state === 'running') {
+                this.appendOverview({ message: `Starting ${step.label || stepKey}...`, icon: 'running' });
+            } else if (step.state === 'failed') {
+                this.appendOverview({ message: `${step.label || stepKey} failed`, icon: 'failed' }); // using 'failed' icon class
+            }
+        });
+
+        // 4. Handle terminal states
         if (job.status === 'completed') {
             this.showSuccessState(job.result_files);
+
+            // Check for transition from running -> completed via snapshot (missed event case)
+            // OR if the job finished very recently (e.g. user refreshed page within 1 minute of completion)
+            const oldStatus = this.lastStatus;
+            const isTransition = oldStatus && oldStatus !== job.status;
+            const endedAt = job.ended_at ? new Date(job.ended_at) : null;
+            const isRecent = endedAt ? ((Date.now() - endedAt.getTime()) / 1000) < 60 : false;
+
+            if ((isTransition || isRecent) && !this.isRedirecting) {
+                const targetUrl = `/job/${this.jobId}/view`;
+                this.triggerRedirect(targetUrl);
+            }
         } else if (job.status === 'failed') {
             this.showErrorPanel(job);
         }
+
+        this.lastStatus = job.status;
 
         // Hide skeleton loading
         document.querySelectorAll('.skeleton').forEach(el => {
@@ -208,19 +251,44 @@ class JobStatusClient {
     }
 
     handleJobState(event) {
+        console.log('Job State Event:', event.status, event);
         this.updateStatusBadge(event.status);
 
+        // Update lastStatus tracking
+        const oldStatus = this.lastStatus;
+        this.lastStatus = event.status;
+
         if (event.status === 'completed') {
+            console.log('Job Completed Event. Redirecting?', { isRedirecting: this.isRedirecting, url: event.view_url });
             this.showSuccessState(event.result_files);
 
             // Auto-redirect after delay
-            setTimeout(() => {
-                window.location.href = event.view_url;
-            }, 1500);
+            if (!this.isRedirecting) {
+                try {
+                    const targetUrl = event.view_url || `/job/${this.jobId}/view`;
+                    this.triggerRedirect(targetUrl);
+                } catch (err) {
+                    console.error('Error calling triggerRedirect:', err);
+                }
+            }
 
         } else if (event.status === 'failed') {
             this.showErrorPanel(event);
         }
+    }
+
+    triggerRedirect(url) {
+        if (this.isRedirecting) return;
+        this.isRedirecting = true;
+
+        this.appendOverview({
+            message: 'Redirecting to tree viewer...',
+            icon: 'running'
+        });
+
+        setTimeout(() => {
+            window.location.replace(url);
+        }, 500);
     }
 
     handleStepStart(event) {
@@ -412,7 +480,7 @@ class JobStatusClient {
         const card = this.elements.currentStepCard;
         card.className = 'current-step-card completed';
         this.elements.currentStepName.textContent = 'Pipeline Complete';
-        this.elements.currentStepDetail.textContent = 'Redirecting to tree viewer...';
+        this.elements.currentStepDetail.textContent = 'Ready to view results';
 
         // Enable View Tree button
         const btn = this.elements.viewTreeBtn;
@@ -425,7 +493,7 @@ class JobStatusClient {
 
         // Add success to overview
         this.appendOverview({
-            message: 'Pipeline complete! Redirecting to tree viewer...',
+            message: 'Pipeline complete! View your tree below.',
             icon: 'done'
         });
     }
