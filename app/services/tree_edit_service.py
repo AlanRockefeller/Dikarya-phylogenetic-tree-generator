@@ -43,10 +43,18 @@ def load_tree_state(job_dir: Path) -> Dict:
         
         # Default policy: Midpoint root the tree
         try:
+            # Store original tree before midpoint rooting for toggle functionality
+            original_newick_path = job_dir / "tree" / "tree_original.newick"
+            if original_newick_path.exists():
+                with open(original_newick_path, "r") as f:
+                    state["pre_midpoint_newick"] = f.read().strip()
+            
             # We must pass the state as we just created it
             state = midpoint_root(job_dir, state)
+            state["is_midpoint_rooted"] = True
             logging.info("Applied default midpoint rooting.")
         except Exception as e:
+            state["is_midpoint_rooted"] = False
             logging.warning(f"Default midpoint rooting skipped/failed: {e}")
 
         save_tree_state(job_dir, state)
@@ -263,6 +271,7 @@ def midpoint_root(job_dir: Path, tree_json: Dict) -> Dict:
         tree_json["root_target"] = None
         tree_json["current_tree"] = "pruned"
         tree_json["tree_structure"] = new_structure
+        tree_json["is_midpoint_rooted"] = True
         
         # Re-apply metadata
         renames = tree_json.get("renames", {})
@@ -280,6 +289,58 @@ def midpoint_root(job_dir: Path, tree_json: Dict) -> Dict:
         logger.error(f"Midpoint root failed: {e}")
         raise
 
+
+def undo_midpoint_root(job_dir: Path, tree_json: Dict) -> Dict:
+    """
+    Restore tree to pre-midpoint rooted state.
+    Uses the stored pre_midpoint_newick from tree state.
+    """
+    if not HAS_BIOPYTHON:
+        raise RuntimeError("Biopython not installed; cannot restore tree")
+
+    pre_midpoint_newick = tree_json.get("pre_midpoint_newick")
+    if not pre_midpoint_newick:
+        raise ValueError("No pre-midpoint tree backup found. Cannot undo midpoint rooting.")
+
+    try:
+        # Parse the stored original newick
+        tree = Phylo.read(StringIO(pre_midpoint_newick), "newick")
+        
+        # Ensure unique labels
+        ensure_unique_labels(tree)
+        
+        # Ladderize for consistent display
+        ladderize_tree(tree)
+        
+        # FIX: Ensure confidence is dropped for named nodes
+        _drop_confidence_when_named(tree)
+
+        # Build structure
+        new_structure = _clade_to_json(tree.root)
+        
+        # Update state
+        tree_json["root"] = None
+        tree_json["root_mode"] = "ORIGINAL"
+        tree_json["root_target"] = None
+        tree_json["current_tree"] = "pruned"
+        tree_json["tree_structure"] = new_structure
+        tree_json["is_midpoint_rooted"] = False
+        
+        # Re-apply metadata
+        renames = tree_json.get("renames", {})
+        pruned_taxa = set(tree_json.get("pruned_taxa", []))
+        apply_state_to_structure(new_structure, renames, pruned_taxa)
+        
+        # Save physical file
+        valid_path = job_dir / "tree"
+        valid_path.mkdir(parents=True, exist_ok=True)
+        Phylo.write(tree, str(valid_path / "tree_pruned.newick"), "newick")
+        
+        return tree_json
+        
+    except Exception as e:
+        logger.error(f"Undo midpoint root failed: {e}")
+        raise
 
 def extract_pruned_fasta(original_fasta: Path, tree_json: Dict, output_fasta: Path) -> None:
     """

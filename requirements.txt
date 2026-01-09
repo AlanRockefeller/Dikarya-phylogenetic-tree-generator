@@ -12,3 +12,4 @@ flask-migrate
 psycopg2-binary
 psutil
 biopython
+Flask-WTF

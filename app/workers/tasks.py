@@ -447,6 +447,8 @@ def run_phylo_job(job_params: dict) -> dict:
             })
 
             align_opts = job_params.get("alignment_options", {})
+            # Pass tree_method so MAFFT can use faster settings for NJ
+            align_opts["tree_method"] = job_params.get("tree_method", "nj")
             from app.models import AlignmentParams
             from app.services.alignment_service import run_alignment
 

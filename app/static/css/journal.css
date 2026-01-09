@@ -30,6 +30,82 @@
     --space-3xl: 4rem;
 }
 
+/* Dark Theme */
+[data-theme="dark"] {
+    --primary-dark: #0d1a14;
+    --primary: #1a2f23;
+    --primary-light: #2d4a3e;
+    --accent: #8b9a6d;
+    --accent-light: #6b7a4d;
+    --gold: #c9a962;
+    --gold-light: #a08942;
+    --cream: #1a1f1a;
+    --white: #232823;
+    --text-dark: #e8e8e8;
+    --text-muted: #b0b0b0;
+    --border: #3a4a3a;
+    --shadow: rgba(0, 0, 0, 0.3);
+}
+
+[data-theme="dark"] .journal-card,
+[data-theme="dark"] .journal-content {
+    background: #1e251e;
+}
+
+[data-theme="dark"] .journal-section h2 {
+    color: var(--accent-light);
+}
+
+[data-theme="dark"] .journal-card h3,
+[data-theme="dark"] .journal-content h2 {
+    color: var(--accent);
+}
+
+[data-theme="dark"] .journal-announcement {
+    background: #2a3528;
+    border-left-color: var(--gold);
+}
+
+[data-theme="dark"] .journal-page-header {
+    background: var(--primary-dark);
+}
+
+[data-theme="dark"] .journal-hero {
+    color: #f8f6f0;
+}
+
+[data-theme="dark"] .journal-hero h1 {
+    color: #f8f6f0;
+}
+
+[data-theme="dark"] .journal-hero .lead {
+    color: rgba(248, 246, 240, 0.9);
+}
+
+/* Theme Toggle Button */
+.theme-toggle {
+    background: transparent;
+    border: 1px solid rgba(255, 255, 255, 0.4);
+    border-radius: 50%;
+    width: 40px;
+    height: 40px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    cursor: pointer;
+    font-size: 1rem;
+    color: rgba(255, 255, 255, 0.85);
+    transition: all 0.3s ease;
+    padding: 0;
+}
+
+.theme-toggle:hover {
+    background: rgba(255, 255, 255, 0.1);
+    border-color: var(--white);
+    color: var(--white);
+    transform: rotate(15deg);
+}
+
 /* Base Reset */
 *,
 *::before,
@@ -363,6 +439,10 @@ body.journal-page {
     border-top: 1px solid rgba(255, 255, 255, 0.1);
     text-align: center;
     font-size: 0.85rem;
+}
+
+[data-theme="dark"] .journal-footer h4 {
+    color: #f8f6f0;
 }
 
 /* Page-specific Styles */

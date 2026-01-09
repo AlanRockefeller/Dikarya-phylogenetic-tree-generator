@@ -127,13 +127,17 @@ def _run_neighbor_joining(
         
     task_logger.info("Running Neighbor Joining using BioPython...")
     
+    # Sanitize input FASTA to create safe IDs
+    sanitized_fasta = output_newick.parent / "nj_input_sanitized.fasta"
+    name_mapping = sanitize_fasta_headers(alignment_fasta, sanitized_fasta)
+    
     # Publish progress if job_id provided
     if job_id:
         from app.workers.events import publish_log
         publish_log(job_id, "tree", "stderr", "Reading alignment...")
     
-    # Read alignment
-    aln = AlignIO.read(str(alignment_fasta), "fasta")
+    # Read alignment (use sanitized version)
+    aln = AlignIO.read(str(sanitized_fasta), "fasta")
     
     if job_id:
         from app.workers.events import publish_log
@@ -160,6 +164,10 @@ def _run_neighbor_joining(
     
     # Write Nexus
     Phylo.write(tree, str(output_nexus), "nexus")
+    
+    # Restore original names in output files
+    restore_tree_names(output_newick, name_mapping)
+    restore_tree_names(output_nexus, name_mapping)
 
 
 def _run_raxml(
@@ -246,9 +254,13 @@ def _run_iqtree(
     prefix = str(output_newick.parent / "iqtree_run")
     threads = _get_thread_count(params)
     
+    # Sanitize FASTA to create safe IDs
+    sanitized_fasta = output_newick.parent / "iqtree_input_sanitized.fasta"
+    name_mapping = sanitize_fasta_headers(alignment_fasta, sanitized_fasta)
+    
     cmd = [
         config.IQTREE_BINARY,
-        "-s", str(alignment_fasta),
+        "-s", str(sanitized_fasta),
         "-m", params.model,
         "-nt", str(threads),
         "-pre", prefix,
@@ -288,6 +300,10 @@ def _run_iqtree(
     
     if source_tree.exists():
         shutil.copy(source_tree, output_newick)
+        
+        # Restore original names in the Newick tree
+        restore_tree_names(output_newick, name_mapping)
+        
         _convert_newick_to_nexus(output_newick, output_nexus)
     else:
         raise RuntimeError("IQ-TREE output tree not found.")
@@ -303,9 +319,13 @@ def _run_mrbayes(
     job_id: Optional[str] = None
 ):
     """Run MrBayes Bayesian tree inference."""
+    # Sanitize FASTA to create safe IDs before converting to NEXUS
+    sanitized_fasta = output_newick.parent / "mrbayes_input_sanitized.fasta"
+    name_mapping = sanitize_fasta_headers(alignment_fasta, sanitized_fasta)
+    
     # MrBayes requires Nexus input with a block
     nexus_input = output_newick.parent / "mrbayes_input.nex"
-    _convert_fasta_to_nexus(alignment_fasta, nexus_input)
+    _convert_fasta_to_nexus(sanitized_fasta, nexus_input)
     
     # Append MrBayes block
     with open(nexus_input, "a") as f:
@@ -351,6 +371,10 @@ def _run_mrbayes(
     if con_tree.exists():
         shutil.copy(con_tree, output_nexus)
         _convert_nexus_to_newick(output_nexus, output_newick)
+        
+        # Restore original names in output files
+        restore_tree_names(output_newick, name_mapping)
+        restore_tree_names(output_nexus, name_mapping)
     else:
         raise RuntimeError("MrBayes consensus tree not found.")
 

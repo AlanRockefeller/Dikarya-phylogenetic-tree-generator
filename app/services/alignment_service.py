@@ -108,7 +108,10 @@ def _run_mafft(
     and stream stderr to Redis for progress updates.
     """
     threads = _get_thread_count()
-    cmd = [config.MAFFT_BINARY, "--thread", str(threads)]
+    cmd = [config.MAFFT_BINARY, "--thread", "-1"]  # Use all available threads
+    
+    # Check if this is a fast NJ tree build
+    tree_method = params.advanced_options.get("tree_method", "").lower()
     
     # Add advanced options if any
     if params.advanced_options.get("auto", False):
@@ -121,8 +124,11 @@ def _run_mafft(
          cmd.append("--globalpair")
          cmd.append("--maxiterate")
          cmd.append("1000")
+    elif tree_method == "nj":
+         # Fast settings for Neighbor-Joining quick tree
+         cmd.extend(["--retree", "2", "--maxiterate", "2"])
     else:
-         # Default reasonable fast option if nothing specified
+         # Default reasonable option for ML/Bayesian trees
          cmd.append("--auto")
 
     cmd.append(str(input_fasta))
@@ -166,10 +172,10 @@ def _run_muscle(
     """
     Run MUSCLE alignment.
     
-    Using classic -in/-out syntax for v3/v5 compatibility.
+    Uses MUSCLE v5 syntax (-align/-output).
     """
-    # Using -in -out syntax which is widely supported
-    cmd = [config.MUSCLE_BINARY, "-in", str(input_fasta), "-out", str(output_fasta)]
+    # MUSCLE v5 uses -align and -output (v3 used -in/-out)
+    cmd = [config.MUSCLE_BINARY, "-align", str(input_fasta), "-output", str(output_fasta)]
     
     log_file = output_fasta.parent.parent / "logs" / "alignment.log"
     

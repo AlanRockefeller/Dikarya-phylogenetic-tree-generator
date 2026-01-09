@@ -155,18 +155,113 @@
                 </div>
             </div>
 
-            <!-- Selection Controls -->
+            <!-- Row 3: Advanced Visuals (Spacing & Filter) -->
             <div class="flex flex-col gap-1">
-                <span
-                    class="text-xs font-bold uppercase tracking-wide text-gray-600 dark:text-gray-400">Selection</span>
+                <span class="text-xs font-bold uppercase tracking-wide text-gray-600 dark:text-gray-400">Spacing</span>
                 <div
-                    class="flex gap-1 border border-gray-300 dark:border-journal-dark rounded-lg overflow-hidden h-[34px]">
+                    class="flex items-center gap-2 border border-gray-300 dark:border-journal-dark rounded-lg overflow-hidden bg-white dark:bg-journal-dark px-2 py-1 h-[34px]">
+                    <div class="flex items-center gap-1" title="Horizontal Spacing">
+                        <i class="fas fa-arrows-alt-h text-gray-400 text-xs"></i>
+                        <button type="button" id="btn-spacing-x-dec"
+                            class="px-1.5 hover:text-journal-gold transition-colors"><i
+                                class="fas fa-minus text-[10px]"></i></button>
+                        <button type="button" id="btn-spacing-x-inc"
+                            class="px-1.5 hover:text-journal-gold transition-colors"><i
+                                class="fas fa-plus text-[10px]"></i></button>
+                    </div>
+                    <div class="h-4 w-px bg-gray-300 dark:bg-gray-700 mx-0.5"></div>
+                    <div class="flex items-center gap-1" title="Vertical Spacing">
+                        <i class="fas fa-arrows-alt-v text-gray-400 text-xs"></i>
+                        <button type="button" id="btn-spacing-y-dec"
+                            class="px-1.5 hover:text-journal-gold transition-colors"><i
+                                class="fas fa-minus text-[10px]"></i></button>
+                        <button type="button" id="btn-spacing-y-inc"
+                            class="px-1.5 hover:text-journal-gold transition-colors"><i
+                                class="fas fa-plus text-[10px]"></i></button>
+                    </div>
+                </div>
+            </div>
+
+            <div class="flex flex-col gap-1">
+                <span class="text-xs font-bold uppercase tracking-wide text-gray-600 dark:text-gray-400">Search
+                    Branches</span>
+                <div
+                    class="flex items-center gap-2 border border-gray-300 dark:border-journal-dark rounded-lg overflow-hidden bg-white dark:bg-journal-dark px-2 py-1 h-[34px]">
+                    <input type="text" id="input-branch-filter" placeholder="Filter branches..."
+                        class="w-32 px-1 py-0.5 text-xs bg-transparent border-none focus:ring-0 text-gray-900 dark:text-gray-100 placeholder-gray-400">
+                    <button id="btn-filter-clear" class="text-gray-400 hover:text-red-500 hidden"><i
+                            class="fas fa-times"></i></button>
+                </div>
+            </div>
+
+            <!-- Selection Controls (Enhanced) -->
+            <div class="flex flex-col gap-1">
+                <span class="text-xs font-bold uppercase tracking-wide text-gray-600 dark:text-gray-400">Selection
+                    Sets</span>
+                <div
+                    class="flex gap-1 border border-gray-300 dark:border-journal-dark rounded-lg overflow-hidden h-[34px] items-center bg-white dark:bg-journal-dark px-1">
+                    <!-- Color swatch indicator -->
+                    <span id="selection-set-color" class="w-4 h-4 rounded shrink-0 border border-gray-300/50"
+                        style="background: #1f77b4" title="Set color"></span>
+
+                    <select id="select-selection-set"
+                        class="text-xs border-none bg-transparent focus:ring-0 py-0 pr-6 pl-1 max-w-[90px]">
+                        <option value="Default">Default</option>
+                    </select>
+
+                    <!-- New Set button -->
+                    <button type="button" id="btn-new-selection-set"
+                        class="px-1.5 py-1 text-xs hover:bg-green-100 dark:hover:bg-green-900/30 rounded text-green-600 dark:text-green-400"
+                        title="Create New Selection Set">
+                        <i class="fas fa-plus"></i>
+                    </button>
+
+                    <!-- Delete Set button -->
+                    <button type="button" id="btn-delete-selection-set"
+                        class="px-1.5 py-1 text-xs hover:bg-red-100 dark:hover:bg-red-900/30 rounded text-red-500 dark:text-red-400 disabled:opacity-30 disabled:cursor-not-allowed"
+                        title="Delete Current Set" disabled>
+                        <i class="fas fa-trash"></i>
+                    </button>
+
+                    <div class="h-4 w-px bg-gray-300 dark:bg-gray-700 mx-0.5"></div>
+
                     <button type="button"
-                        class="px-3 py-2 text-sm font-medium text-gray-700 dark:text-gray-200 bg-white dark:bg-journal-dark hover:bg-journal-gold hover:text-journal-dark transition-colors"
-                        id="btn-select-all">All</button>
+                        class="btn-selection-action px-2 py-1 text-xs hover:bg-gray-100 dark:hover:bg-gray-800 rounded text-gray-600 dark:text-gray-300"
+                        data-action="all" title="Select All">All</button>
                     <button type="button"
-                        class="px-3 py-2 text-sm font-medium text-gray-700 dark:text-gray-200 bg-white dark:bg-journal-dark hover:bg-journal-gold hover:text-journal-dark transition-colors border-l border-gray-300 dark:border-journal-dark"
-                        id="btn-select-none">None</button>
+                        class="btn-selection-action px-2 py-1 text-xs hover:bg-gray-100 dark:hover:bg-gray-800 rounded text-gray-600 dark:text-gray-300"
+                        data-action="none" title="Select None">None</button>
+
+                    <div class="relative group">
+                        <button type="button"
+                            class="px-2 py-1 text-xs hover:bg-gray-100 dark:hover:bg-gray-800 rounded text-gray-600 dark:text-gray-300">
+                            <i class="fas fa-ellipsis-v"></i>
+                        </button>
+                        <!-- Dropdown Menu -->
+                        <div
+                            class="absolute right-0 top-full mt-1 hidden group-hover:block w-40 bg-white dark:bg-gray-900 border border-gray-200 dark:border-gray-700 rounded shadow-lg z-50 py-1">
+                            <button type="button"
+                                class="btn-selection-action block w-full text-left px-3 py-1.5 text-xs hover:bg-gray-100 dark:hover:bg-gray-800"
+                                data-action="all-internal">All Internal Nodes</button>
+                            <button type="button"
+                                class="btn-selection-action block w-full text-left px-3 py-1.5 text-xs hover:bg-gray-100 dark:hover:bg-gray-800"
+                                data-action="all-leaves">All Leaves</button>
+                            <div class="border-t border-gray-200 dark:border-gray-700 my-1"></div>
+                            <button type="button"
+                                class="btn-selection-action block w-full text-left px-3 py-1.5 text-xs hover:bg-gray-100 dark:hover:bg-gray-800"
+                                data-action="select-filtered">Select Filtered</button>
+                            <button type="button"
+                                class="btn-selection-action block w-full text-left px-3 py-1.5 text-xs hover:bg-gray-100 dark:hover:bg-gray-800"
+                                data-action="inverse">Invert Selection</button>
+                            <div class="border-t border-gray-200 dark:border-gray-700 my-1"></div>
+                            <button type="button"
+                                class="btn-selection-action block w-full text-left px-3 py-1.5 text-xs hover:bg-gray-100 dark:hover:bg-gray-800"
+                                data-action="select-ancestors">Select Ancestors (Max Parsimony)</button>
+                            <button type="button"
+                                class="btn-selection-action block w-full text-left px-3 py-1.5 text-xs hover:bg-gray-100 dark:hover:bg-gray-800"
+                                data-action="select-descendants">Select All Descendants</button>
+                        </div>
+                    </div>
                 </div>
             </div>
         </div>
@@ -210,7 +305,7 @@
             </a>
             <a id="newick-link-pruned" href="#" target="_blank"
                 class="text-journal-gold hover:text-journal-gold-light transition-colors flex items-center gap-1">
-                <i class="fas fa-download text-xs"></i> Pruned/Rerooted Newick
+                <i class="fas fa-download text-xs"></i> Current Newick
             </a>
             <a id="nexus-link" href="#" target="_blank"
                 class="text-journal-gold hover:text-journal-gold-light transition-colors flex items-center gap-1">
@@ -270,7 +365,7 @@
 
 <script src="{{ url_for('static', filename='js/phylotree.js') }}"></script>
 
-<script src="{{ url_for('static', filename='js/tree_viewer_phylotree_v2.js') }}?v=11"></script>
+<script src="{{ url_for('static', filename='js/tree_viewer_phylotree_v2.js') }}?v=17"></script>
 
 <script src="{{ url_for('static', filename='js/tree_viewer_api.js') }}"></script>
 

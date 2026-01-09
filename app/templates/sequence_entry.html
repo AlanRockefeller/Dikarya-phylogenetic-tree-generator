@@ -103,6 +103,55 @@
             </div>
         </div>
 
+        <!-- Mycomap URL Card -->
+        <div class="bg-white dark:bg-journal-green rounded-xl shadow-lg p-6 transition-colors">
+            <h3 class="text-xl font-semibold text-journal-dark dark:text-gray-100 mb-4 flex items-center">
+                <i class="fas fa-link text-journal-gold mr-2"></i>
+                Or Enter Mycomap URL...
+            </h3>
+
+            <div class="space-y-4">
+                <div>
+                    <label for="mycomap_url" class="block text-sm font-medium text-gray-700 dark:text-gray-200 mb-2">
+                        Mycomap BLAST Results URL
+                    </label>
+                    <input type="url" id="mycomap_url" class="w-full px-4 py-3 border border-gray-300 dark:border-journal-dark rounded-lg 
+                                  bg-white dark:bg-journal-dark text-gray-900 dark:text-gray-100
+                                  focus:ring-2 focus:ring-journal-gold focus:border-transparent transition-all"
+                        placeholder="https://mycomap.com/...r12345...">
+                    <p class="text-xs text-gray-500 dark:text-gray-400 mt-1">
+                        Paste a Mycomap BLAST result URL to import sequences.
+                    </p>
+                </div>
+
+                <!-- Checkboxes -->
+                <div class="flex flex-wrap gap-4">
+                    <label class="flex items-center space-x-2 cursor-pointer">
+                        <input type="checkbox" id="mycomap_ncbi" checked class="w-4 h-4 text-journal-gold bg-gray-100 border-gray-300 rounded 
+                                      focus:ring-journal-gold dark:bg-journal-dark dark:border-gray-600">
+                        <span class="text-sm text-gray-700 dark:text-gray-200">NCBI Results</span>
+                    </label>
+                    <label class="flex items-center space-x-2 cursor-pointer">
+                        <input type="checkbox" id="mycomap_local" checked class="w-4 h-4 text-journal-gold bg-gray-100 border-gray-300 rounded 
+                                      focus:ring-journal-gold dark:bg-journal-dark dark:border-gray-600">
+                        <span class="text-sm text-gray-700 dark:text-gray-200">Local Results</span>
+                    </label>
+                    <label class="flex items-center space-x-2 cursor-pointer">
+                        <input type="checkbox" id="mycomap_dedup" checked class="w-4 h-4 text-journal-gold bg-gray-100 border-gray-300 rounded 
+                                      focus:ring-journal-gold dark:bg-journal-dark dark:border-gray-600">
+                        <span class="text-sm text-gray-700 dark:text-gray-200">Remove Duplicates</span>
+                    </label>
+                </div>
+
+                <!-- Fetch Button -->
+                <button id="fetch_mycomap_btn" class="w-full bg-journal-dark hover:bg-journal-green text-white 
+                               py-3 px-4 rounded-lg font-semibold shadow-md hover:shadow-lg 
+                               transition-all flex items-center justify-center">
+                    <i class="fas fa-download mr-2"></i> Fetch Sequences
+                </button>
+            </div>
+        </div>
+
     </div>
 
     <!-- Right Section: 1 column - Sequence Queue -->
@@ -373,11 +422,11 @@
         return div.innerHTML;
     }
 
-    function addSequences(sequences) {
+    function addSequences(sequences, removeDuplicates = true) {
         const existingNames = new Set(sequenceQueue.map(s => s.name));
         let added = 0;
         for (const seq of sequences) {
-            if (!existingNames.has(seq.name)) {
+            if (!removeDuplicates || !existingNames.has(seq.name)) {
                 sequenceQueue.push(seq);
                 existingNames.add(seq.name);
                 added++;
@@ -496,9 +545,13 @@
                 }
             }
 
+            const csrfToken = document.querySelector('meta[name="csrf-token"]').getAttribute('content');
             const resp = await fetch('/api/blast', {
                 method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
+                headers: {
+                    'Content-Type': 'application/json',
+                    'X-CSRFToken': csrfToken
+                },
                 body: JSON.stringify({ query })
             });
 
@@ -587,6 +640,93 @@
     });
 
     // =========================================================================
+    // Mycomap URL Fetch
+    // =========================================================================
+    const mycomapUrlInput = document.getElementById('mycomap_url');
+    const mycomapNcbiCheckbox = document.getElementById('mycomap_ncbi');
+    const mycomapLocalCheckbox = document.getElementById('mycomap_local');
+    const mycomapDedupCheckbox = document.getElementById('mycomap_dedup');
+    const fetchMycomapBtn = document.getElementById('fetch_mycomap_btn');
+
+    function isValidMycomapUrl(url) {
+        // Must be from mycomap.com and contain r<digits> pattern
+        if (!url) return false;
+        const lowerUrl = url.toLowerCase();
+        if (!lowerUrl.includes('mycomap.com')) return false;
+        return /r\d+/.test(url);
+    }
+
+    fetchMycomapBtn.addEventListener('click', async () => {
+        const url = mycomapUrlInput.value.trim();
+        const includeNcbi = mycomapNcbiCheckbox.checked;
+        const includeLocal = mycomapLocalCheckbox.checked;
+
+        // Client-side validation
+        if (!url) {
+            showStatus('Please enter a Mycomap URL.', 'error');
+            return;
+        }
+
+        if (!isValidMycomapUrl(url)) {
+            showStatus('Invalid Mycomap URL. URL must be from mycomap.com and contain a result ID (e.g., r12345).', 'error');
+            return;
+        }
+
+        if (!includeNcbi && !includeLocal) {
+            showStatus('Please select at least one result type (NCBI or Local).', 'error');
+            return;
+        }
+
+        // Disable button and show loading state
+        fetchMycomapBtn.disabled = true;
+        fetchMycomapBtn.innerHTML = '<i class="fas fa-spinner fa-spin mr-2"></i> Fetching...';
+        showStatus('Fetching sequences from Mycomap...', 'info');
+
+        try {
+            const csrfToken = document.querySelector('meta[name="csrf-token"]').getAttribute('content');
+            const resp = await fetch('/api/mycomap', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                    'X-CSRFToken': csrfToken
+                },
+                body: JSON.stringify({
+                    url: url,
+                    include_ncbi: includeNcbi,
+                    include_local: includeLocal
+                })
+            });
+
+            const data = await resp.json();
+
+            if (!resp.ok) {
+                throw new Error(data.error || 'Failed to fetch from Mycomap');
+            }
+
+            const fetched = data.sequences.length;
+            const removeDuplicates = mycomapDedupCheckbox.checked;
+            const added = addSequences(data.sequences, removeDuplicates);
+            const skipped = fetched - added;
+
+            let statusMsg = `${data.message}. Added ${added} new sequences to queue.`;
+            if (skipped > 0 && removeDuplicates) {
+                statusMsg += ` (${skipped} duplicate${skipped !== 1 ? 's' : ''} already in queue)`;
+            }
+            showStatus(statusMsg, 'success');
+
+            // Clear the URL input on success
+            mycomapUrlInput.value = '';
+
+        } catch (e) {
+            showStatus('Mycomap error: ' + e.message, 'error');
+        }
+
+        // Restore button state
+        fetchMycomapBtn.disabled = false;
+        fetchMycomapBtn.innerHTML = '<i class="fas fa-download mr-2"></i> Fetch Sequences';
+    });
+
+    // =========================================================================
     // Toggle Advanced Panel
     // =========================================================================
     const advancedPanel = document.getElementById('advanced_panel');
@@ -634,9 +774,9 @@
     function buildFastaFromQueue() {
         return sequenceQueue.map(seq => {
             let header = seq.name;
-            // if (seq.organism) {
-            //    header = `${header} ${seq.organism}`;
-            // }
+            if (seq.organism) {
+                header = `${header} ${seq.organism}`;
+            }
             return `>${header}\n${seq.sequence}`;
         }).join('\n');
     }
@@ -682,9 +822,13 @@
         };
 
         try {
+            const csrfToken = document.querySelector('meta[name="csrf-token"]').getAttribute('content');
             const resp = await fetch('/api/job', {
                 method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
+                headers: {
+                    'Content-Type': 'application/json',
+                    'X-CSRFToken': csrfToken
+                },
                 body: JSON.stringify(payload)
             });
 
@@ -746,9 +890,13 @@
         };
 
         try {
+            const csrfToken = document.querySelector('meta[name="csrf-token"]').getAttribute('content');
             const resp = await fetch('/api/job', {
                 method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
+                headers: {
+                    'Content-Type': 'application/json',
+                    'X-CSRFToken': csrfToken
+                },
                 body: JSON.stringify(payload)
             });
 

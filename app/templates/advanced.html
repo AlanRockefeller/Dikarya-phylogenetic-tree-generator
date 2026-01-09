@@ -224,9 +224,13 @@
 
         // 4. Send API Request
         try {
+            const csrfToken = document.querySelector('meta[name="csrf-token"]')?.getAttribute('content');
+            const headers = { "Content-Type": "application/json" };
+            if (csrfToken) headers["X-CSRFToken"] = csrfToken;
+
             const resp = await fetch("/api/job", {
                 method: "POST",
-                headers: { "Content-Type": "application/json" },
+                headers: headers,
                 body: JSON.stringify(payload)
             });
 

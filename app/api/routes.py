@@ -9,6 +9,8 @@ import logging
 import re
 from datetime import datetime
 
+logger = logging.getLogger(__name__)
+
 
 # =============================================================================
 # BLAST API Endpoint
@@ -22,7 +24,10 @@ def _is_genbank_accession(text):
 
 
 def _parse_fasta_sequences(text):
-    """Parse FASTA text into list of {name, sequence} dicts."""
+    """Parse FASTA text into list of {name, sequence} dicts.
+    
+    Preserves the full header (after >) for display in tree tips.
+    """
     sequences = []
     current_name = None
     current_seq = []
@@ -35,7 +40,8 @@ def _parse_fasta_sequences(text):
                     'name': current_name,
                     'sequence': ''.join(current_seq)
                 })
-            current_name = line[1:].split()[0]  # Take first word after >
+            # Keep the full header (everything after >) for tree tip labels
+            current_name = line[1:].strip()
             current_seq = []
         elif line and current_name is not None:
             current_seq.append(line)
@@ -48,6 +54,7 @@ def _parse_fasta_sequences(text):
         })
     
     return sequences
+
 
 
 @bp.route('/blast', methods=['POST'])
@@ -70,11 +77,11 @@ def run_blast():
         
         # Determine if query is an accession or a sequence
         if _is_genbank_accession(query):
-            logging.info(f"BLAST API: Detected accession: {query}")
+            logger.info(f"BLAST API: Detected accession: {query}")
             result = blast_from_accessions([query], Config)
         else:
             # Assume it's a raw sequence
-            logging.info(f"BLAST API: Using sequence query ({len(query)} chars)")
+            logger.info(f"BLAST API: Using sequence query ({len(query)} chars)")
             result = blast_from_sequence(query, Config)
         
         # Read FASTA content from the file path returned by blast service
@@ -92,9 +99,11 @@ def run_blast():
         organism_map = {h['accession']: h.get('organism', '') for h in hit_details}
         
         for seq in sequences:
-            # Try to match accession (with or without version)
-            acc = seq['name'].split('.')[0]  # Remove version if present
-            seq['organism'] = organism_map.get(acc, organism_map.get(seq['name'], ''))
+            # Extract accession from the full name (first word, without version)
+            # Full name could be "AY702745.1 Mycena amicta..." - we need "AY702745" for lookup
+            first_word = seq['name'].split()[0] if seq['name'] else ''
+            acc_no_version = first_word.split('.')[0]
+            seq['organism'] = organism_map.get(acc_no_version, organism_map.get(first_word, ''))
         
         return jsonify({
             "status": "success",
@@ -104,7 +113,85 @@ def run_blast():
         })
         
     except Exception as e:
-        logging.error(f"BLAST API error: {e}", exc_info=True)
+        logger.error(f"BLAST API error: {e}", exc_info=True)
+        return jsonify({"status": "error", "error": str(e)}), 500
+
+
+@bp.route('/mycomap', methods=['POST'])
+def fetch_mycomap():
+    """
+    Fetch sequences from a Mycomap BLAST results URL.
+    
+    Request: { 
+        "url": "<mycomap URL>", 
+        "include_ncbi": true,
+        "include_local": true 
+    }
+    Response: { "status": "success", "sequences": [...], "message": "..." }
+    """
+    data = request.get_json() or {}
+    url = data.get('url', '').strip()
+    include_ncbi = data.get('include_ncbi', True)
+    include_local = data.get('include_local', True)
+    
+    if not url:
+        return jsonify({"status": "error", "error": "No URL provided"}), 400
+    
+    # Validate at least one checkbox is selected
+    if not include_ncbi and not include_local:
+        return jsonify({
+            "status": "error", 
+            "error": "Select at least one result type (NCBI or Local)"
+        }), 400
+    
+    try:
+        from app.services.mycomap_service import validate_mycomap_url, fetch_mycomap_fasta
+        
+        # Validate and extract blast_id
+        blast_id = validate_mycomap_url(url)
+        if not blast_id:
+            return jsonify({
+                "status": "error",
+                "error": "Invalid Mycomap URL. URL must be from mycomap.com and contain a result ID (e.g., r12345)"
+            }), 400
+        
+        logger.info(f"Mycomap API: Fetching sequences for blast_id={blast_id} (ncbi={include_ncbi}, local={include_local})")
+        
+        # Fetch FASTA from Mycomap
+        result = fetch_mycomap_fasta(blast_id, include_ncbi, include_local)
+        
+        # Check for errors
+        if result['errors'] and not result['fasta_content']:
+            return jsonify({
+                "status": "error",
+                "error": "; ".join(result['errors'])
+            }), 502
+        
+        # Parse FASTA into sequences
+        sequences = _parse_fasta_sequences(result['fasta_content'])
+        
+        # Build success message
+        parts = []
+        if include_ncbi:
+            parts.append(f"{result['ncbi_count']} NCBI")
+        if include_local:
+            parts.append(f"{result['local_count']} local")
+        msg = f"Fetched {' + '.join(parts)} sequences from Mycomap"
+        
+        # Include warnings if there were non-fatal errors
+        if result['errors']:
+            msg += f" (warnings: {'; '.join(result['errors'])})"
+        
+        return jsonify({
+            "status": "success",
+            "sequences": sequences,
+            "ncbi_count": result['ncbi_count'],
+            "local_count": result['local_count'],
+            "message": msg
+        })
+        
+    except Exception as e:
+        logger.error(f"Mycomap API error: {e}", exc_info=True)
         return jsonify({"status": "error", "error": str(e)}), 500
 
 
@@ -272,6 +359,34 @@ def midpoint_root_endpoint(job_id):
     except Exception as e:
         return jsonify({"status": "error", "error": str(e)}), 500
 
+@bp.route('/job/<job_id>/tree/midpoint_root_toggle', methods=['POST'])
+def midpoint_root_toggle_endpoint(job_id):
+    """Toggle midpoint rooting on/off."""
+    job_dir = Config.JOB_DIR / job_id
+    if not job_dir.exists():
+        return jsonify({"status": "error", "error": "Job not found"}), 404
+        
+    try:
+        from app.services.tree_edit_service import (
+            load_tree_state, midpoint_root, undo_midpoint_root, save_tree_state
+        )
+        state = load_tree_state(job_dir)
+        
+        # Check current state and toggle
+        if state.get("is_midpoint_rooted", False):
+            # Currently midpoint rooted - undo it
+            state = undo_midpoint_root(job_dir, state)
+        else:
+            # Not midpoint rooted - apply it
+            state = midpoint_root(job_dir, state)
+        
+        save_tree_state(job_dir, state)
+        return jsonify(state)
+    except ValueError as e:
+        return jsonify({"status": "error", "error": str(e)}), 400
+    except Exception as e:
+        return jsonify({"status": "error", "error": str(e)}), 500
+
 @bp.route('/job/<job_id>/tree/recompute', methods=['POST'])
 def recompute_tree_job(job_id):
     job_dir = Config.JOB_DIR / job_id
@@ -324,12 +439,12 @@ def recompute_tree_job(job_id):
             allow_recompute=True
         )
         
-        result = recompute_tree(job_dir, job_params, Config, logging.getLogger(__name__))
+        result = recompute_tree(job_dir, job_params, Config, logger)
         return jsonify(result)
         
     except Exception as e:
         import traceback
-        logging.error(f"Recompute error: {e}\n{traceback.format_exc()}")
+        logger.error(f"Recompute error: {e}\n{traceback.format_exc()}")
         return jsonify({"status": "error", "error": str(e)}), 500
 
 @bp.route('/job/<job_id>/download/tree/newick', methods=['GET'])
@@ -346,7 +461,7 @@ def download_newick(job_id):
             from app.services.tree_edit_service import initialize_tree
             pruned_path = initialize_tree(job_dir)
         except Exception as e:
-            logging.error(f"Failed to auto-init tree: {e}")
+            logger.error(f"Failed to auto-init tree: {e}")
             # Fallback to original if initialization fails
             pruned_path = job_dir / "tree" / "tree_original.newick"
     
@@ -367,9 +482,9 @@ def download_newick_original(job_id):
         return jsonify({"status": "error", "error": "Job not found"}), 404
         
     path = job_dir / "tree" / "tree_original.newick"
-    logging.info(f"Serving original newick from: {path}, Exists: {path.exists()}")
+    logger.info(f"Serving original newick from: {path}, Exists: {path.exists()}")
     if not path.exists():
-        logging.error(f"File not found: {path} (BASE_DIR={Config.BASE_DIR}, JOB_DIR={Config.JOB_DIR})")
+        logger.error(f"File not found: {path} (BASE_DIR={Config.BASE_DIR}, JOB_DIR={Config.JOB_DIR})")
         return jsonify({"status": "error", "error": "Tree file not found"}), 404
         
     return send_file(path, as_attachment=True, download_name="tree_original.newick")
@@ -499,7 +614,7 @@ def _read_log_tail(log_path, max_bytes=65536, max_lines=200):
         return [line.rstrip() for line in lines[-max_lines:]]
     
     except Exception as e:
-        logging.warning(f"Failed to read log tail from {log_path}: {e}")
+        logger.warning(f"Failed to read log tail from {log_path}: {e}")
         return []
 
 
@@ -697,7 +812,7 @@ def job_events_stream(job_id):
                         last_db_poll = now
                         db.session.expire_all()
                         db_job_check = Job.query.get(job_id)
-                        logging.debug(f"SSE DB poll for job {job_id}: status={db_job_check.status if db_job_check else 'None'}")
+                        logger.debug(f"SSE DB poll for job {job_id}: status={db_job_check.status if db_job_check else 'None'}")
                         if db_job_check and db_job_check.status in ('completed', 'failed'):
                             job_status = db_job_check.status
                             # Give a moment for final events from Redis
@@ -767,3 +882,37 @@ def download_log(job_id, log_name):
         as_attachment=True,
         download_name=f"{job_id}_{log_files[log_name]}"
     )
+
+@bp.route('/log/client', methods=['POST'])
+def log_client_error():
+    """
+    Log client-side errors to the server log.
+    Expected JSON: { "message": "...", "stack": "...", "url": "...", "context": "..." }
+    """
+    from flask import current_app
+    
+    data = request.get_json(silent=True) or {}
+    # Apply size limits to prevent log spam
+    msg = (data.get("message") or "Unknown client error")[:2000]
+    stack = (data.get("stack") or "")[:20000]
+    context = (data.get("context") or "")[:1000]
+    url = (data.get("url") or "")[:500]
+    
+    # Request metadata for debugging
+    client_ip = request.headers.get("X-Forwarded-For", request.remote_addr) or "unknown"
+    user_agent = (request.headers.get("User-Agent") or "")[:200]
+    
+    # Format log message with metadata
+    log_msg = f"Client Error: {msg}"
+    log_msg += f" [IP: {client_ip}]"
+    if url:
+        log_msg += f" [URL: {url}]"
+    if context:
+        log_msg += f" [Context: {context}]"
+    if user_agent:
+        log_msg += f" [UA: {user_agent}]"
+    if stack:
+        log_msg += f"\nStack: {stack}"
+        
+    current_app.logger.error(log_msg)
+    return jsonify({"status": "logged"}), 200

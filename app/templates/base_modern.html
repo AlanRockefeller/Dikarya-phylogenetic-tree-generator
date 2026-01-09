@@ -4,6 +4,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="csrf-token" content="{{ csrf_token() }}">
     <title>{% block title %}Dikarya{% endblock %}</title>
     <meta name="description" content="{% block description %}Dikarya - Mycological Research Tools{% endblock %}">
 
@@ -177,7 +178,8 @@
     <!-- Footer -->
     <footer class="bg-journal-dark text-gray-400 py-8 mt-12">
         <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 text-center">
-            <p>&copy; 2026 Dikarya Project. All rights reserved.</p>
+            <p>&copy; 2026 Dikarya Project. <a href="https://creativecommons.org/licenses/by/4.0/" target="_blank"
+                    rel="noopener">CC BY 4.0.</a></p>
         </div>
     </footer>
 

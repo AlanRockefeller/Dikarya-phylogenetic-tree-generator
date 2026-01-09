@@ -116,3 +116,15 @@
     stroke: #ccc !important;
     /* Brighter for dark mode */
 }
+
+/* Active state for toggle buttons (e.g., midpoint rooting) */
+#btn-midpoint.active {
+    background-color: #6366f1 !important;
+    /* indigo-500 */
+    box-shadow: inset 0 2px 4px rgba(0, 0, 0, 0.2);
+}
+
+#btn-midpoint.active:hover {
+    background-color: #4f46e5 !important;
+    /* indigo-600 */
+}

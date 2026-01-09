@@ -2,25 +2,48 @@
  * API helper for tree editing actions
  */
 const TreeEditActions = {
+    _getCsrfToken() {
+        return document.querySelector('meta[name="csrf-token"]')?.getAttribute('content');
+    },
+
+    _buildHeaders(includeContentType = true) {
+        const headers = {};
+        if (includeContentType) headers['Content-Type'] = 'application/json';
+        const token = this._getCsrfToken();
+        if (token) headers['X-CSRFToken'] = token;
+        return headers;
+    },
+
     async getTreeState(jobId) {
         const response = await fetch(`/api/job/${jobId}/tree/state`, {
-            cache: "no-store"
+            cache: "no-store",
+            credentials: "same-origin"
         });
+        const text = await response.text();
+        let data = {};
+        try { data = JSON.parse(text); } catch (_) { /* non-JSON */ }
+
         if (!response.ok) {
-            throw new Error(`Failed to get tree state: ${response.status}`);
+            const err = new Error(data.error || data.message || `Failed to get tree state: ${response.status}`);
+            err.details = data;
+            err.raw = text;
+            throw err;
         }
-        return await response.json();
+        return data;
     },
 
     async pruneTip(jobId, tipName) {
         const response = await fetch(`/api/job/${jobId}/tree/prune`, {
             method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
+            headers: this._buildHeaders(),
+            credentials: "same-origin",
             body: JSON.stringify({ tip_name: tipName })
         });
         const data = await response.json().catch(() => ({}));
         if (!response.ok) {
-            throw new Error(data.error || `Failed to prune: ${response.status}`);
+            const err = new Error(data.error || data.message || `Failed to prune: ${response.status}`);
+            err.details = data;
+            throw err;
         }
         return data;
     },
@@ -28,12 +51,15 @@ const TreeEditActions = {
     async renameTip(jobId, oldName, newName) {
         const response = await fetch(`/api/job/${jobId}/tree/rename`, {
             method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
+            headers: this._buildHeaders(),
+            credentials: "same-origin",
             body: JSON.stringify({ old_name: oldName, new_name: newName })
         });
         const data = await response.json().catch(() => ({}));
         if (!response.ok) {
-            throw new Error(data.error || `Failed to rename: ${response.status}`);
+            const err = new Error(data.error || data.message || `Failed to rename: ${response.status}`);
+            err.details = data;
+            throw err;
         }
         return data;
     },
@@ -41,24 +67,46 @@ const TreeEditActions = {
     async reroot(jobId, nodeName) {
         const response = await fetch(`/api/job/${jobId}/tree/reroot`, {
             method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
+            headers: this._buildHeaders(),
+            credentials: "same-origin",
             // Send the field the backend expects; include legacy names for compatibility
             body: JSON.stringify({ root_target: nodeName, target: nodeName, node_name: nodeName })
         });
         const data = await response.json().catch(() => ({}));
         if (!response.ok) {
-            throw new Error(data.error || `Failed to reroot: ${response.status}`);
+            const err = new Error(data.error || data.message || `Failed to reroot: ${response.status}`);
+            err.details = data;
+            throw err;
         }
         return data;
     },
 
     async midpointRoot(jobId) {
         const response = await fetch(`/api/job/${jobId}/tree/midpoint_root`, {
-            method: 'POST'
+            method: 'POST',
+            headers: this._buildHeaders(false),
+            credentials: "same-origin"
         });
         const data = await response.json().catch(() => ({}));
         if (!response.ok) {
-            throw new Error(data.error || "Midpoint root failed");
+            const err = new Error(data.error || data.message || "Midpoint root failed");
+            err.details = data;
+            throw err;
+        }
+        return data;
+    },
+
+    async midpointRootToggle(jobId) {
+        const response = await fetch(`/api/job/${jobId}/tree/midpoint_root_toggle`, {
+            method: 'POST',
+            headers: this._buildHeaders(false),
+            credentials: "same-origin"
+        });
+        const data = await response.json().catch(() => ({}));
+        if (!response.ok) {
+            const err = new Error(data.error || data.message || "Midpoint root toggle failed");
+            err.details = data;
+            throw err;
         }
         return data;
     },
@@ -66,13 +114,30 @@ const TreeEditActions = {
     async recomputeTree(jobId) {
         const response = await fetch(`/api/job/${jobId}/tree/recompute`, {
             method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
+            headers: this._buildHeaders(),
+            credentials: "same-origin",
             body: JSON.stringify({})
         });
         const data = await response.json().catch(() => ({}));
         if (!response.ok) {
-            throw new Error(data.error || `Failed to recompute: ${response.status}`);
+            const err = new Error(data.error || data.message || `Failed to recompute: ${response.status}`);
+            err.details = data;
+            throw err;
         }
         return data;
+    },
+
+    async logClientError(message, context = null) {
+        try {
+            await fetch('/api/log/client', {
+                method: 'POST',
+                headers: this._buildHeaders(),
+                credentials: "same-origin",
+                body: JSON.stringify({ message, context, url: window.location.href, stack: new Error().stack }),
+                keepalive: true
+            });
+        } catch (e) {
+            console.error("Failed to log client error:", e);
+        }
     }
 };

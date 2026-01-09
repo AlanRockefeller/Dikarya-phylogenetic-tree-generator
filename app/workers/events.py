@@ -21,6 +21,7 @@ Pipeline Steps (stable keys):
 """
 
 import json
+import logging
 import time
 import threading
 from typing import Optional, List, Dict, Any
@@ -28,6 +29,8 @@ from typing import Optional, List, Dict, Any
 import redis
 
 from app.config import Config
+
+logger = logging.getLogger(__name__)
 
 # -----------------------------------------------------------------------------
 # Constants
@@ -179,8 +182,7 @@ def publish_event(job_id: str, payload: dict) -> None:
         _get_redis().publish(channel, message)
     except Exception as e:
         # Log but don't fail the job
-        import logging
-        logging.getLogger(__name__).warning(f"Failed to publish event: {e}")
+        logger.warning(f"Failed to publish event: {e}")
 
 
 def publish_log(job_id: str, step: str, stream: str, line: str) -> None:

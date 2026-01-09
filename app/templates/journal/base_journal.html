@@ -8,6 +8,8 @@
     <meta name="description"
         content="{% block meta_description %}Dikarya: A peer-reviewed journal dedicated to fungal taxonomy, systematics, and phylogenetics.{% endblock %}">
     <link rel="stylesheet" href="{{ url_for('static', filename='css/journal.css') }}">
+    <!-- Font Awesome for icons -->
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
     {% block head %}{% endblock %}
 </head>
 
@@ -22,6 +24,10 @@
                 </div>
             </a>
             <div class="journal-header-actions">
+                <button class="theme-toggle" id="dark-mode-toggle" aria-label="Toggle dark mode"
+                    title="Toggle light/dark mode">
+                    <i id="dark-mode-icon" class="fas fa-moon"></i>
+                </button>
                 <a href="{{ url_for('main.sequence_entry') }}" class="journal-btn journal-btn-primary">
                     🧬 Tree Builder App
                 </a>
@@ -105,11 +111,47 @@
             </div>
         </div>
         <div class="journal-footer-bottom">
-            <p>&copy; 2026 Dikarya Mycological Journal. All rights reserved.</p>
+            <p>&copy; 2026 Dikarya Mycological Journal. <a href="https://creativecommons.org/licenses/by/4.0/"
+                    target="_blank" rel="noopener">CC BY 4.0.</a></p>
         </div>
     </footer>
 
     {% block scripts %}{% endblock %}
+
+    <script>
+        // Theme toggle functionality (synced with base_modern.html)
+        (function () {
+            const toggle = document.getElementById('dark-mode-toggle');
+            const icon = document.getElementById('dark-mode-icon');
+            const html = document.documentElement;
+
+            function applyTheme(theme) {
+                if (theme === 'dark') {
+                    html.setAttribute('data-theme', 'dark');
+                    icon.classList.remove('fa-moon');
+                    icon.classList.add('fa-sun');
+                } else {
+                    html.removeAttribute('data-theme');
+                    icon.classList.remove('fa-sun');
+                    icon.classList.add('fa-moon');
+                }
+            }
+
+            // Load saved theme or detect preference
+            const savedTheme = localStorage.getItem('theme');
+            if (savedTheme === 'dark' || (!savedTheme && window.matchMedia('(prefers-color-scheme: dark)').matches)) {
+                applyTheme('dark');
+            }
+
+            // Toggle theme on click
+            toggle.addEventListener('click', function () {
+                const isDark = html.getAttribute('data-theme') === 'dark';
+                const newTheme = isDark ? 'light' : 'dark';
+                applyTheme(newTheme);
+                localStorage.setItem('theme', newTheme);
+            });
+        })();
+    </script>
 </body>
 
 </html>
