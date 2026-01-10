@@ -69,6 +69,10 @@ def _fetch_fasta(blast_id: str, endpoint: str) -> Tuple[bytes, Optional[str]]:
     Returns:
         Tuple of (fasta_bytes, error_message). If error, fasta_bytes will be empty.
     """
+    # Double-check blast_id is only digits
+    if not blast_id.isdigit():
+        return b'', "Invalid blast_id format"
+
     params = urllib.parse.urlencode({
         'app': 'genbank',
         'module': 'genbank',

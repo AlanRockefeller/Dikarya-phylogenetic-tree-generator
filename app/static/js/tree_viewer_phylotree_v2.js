@@ -375,6 +375,9 @@
                 // Hook into phylotree's native selection system
                 this._hookPhylotreeSelection();
 
+                // Override click behavior: left-click = select, shift/right = menu
+                this._overrideClickBehavior();
+
             } catch (e) {
                 console.error("Render error:", e);
                 this.container.innerHTML = `<div class="p-4 bg-red-50 text-red-800 dark:bg-red-900/30 dark:text-red-200 rounded">Render Error: ${e.message}</div>`;
@@ -738,12 +741,19 @@
 
         // --- INTERNAL HELPERS ---
 
-        _updateNodeStylesOnly() {
+        _updateNodeStylesOnly(source = null) {
             if (!this.tree) return;
             const svg = window.d3v7.select(this.container).select("svg");
+            if (svg.empty()) return;
             const self = this;
 
             const DEBUG_MODE = new URLSearchParams(window.location.search).has('debug');
+
+            if (DEBUG_MODE && source) {
+                console.log(`_updateNodeStylesOnly triggered by: ${source}`);
+            }
+
+            const DEBUG_MODE_FULL = DEBUG_MODE && source === 'click'; // Only full debug on click to avoid spam
             let nodeCount = 0;
             let styledCount = 0;
             let sampleDomIds = [];
@@ -1117,6 +1127,74 @@
                     self._updateStats();
                 });
             }
+        }
+
+        /**
+         * Robust click handling using Native DOM Capture Phase.
+         * Intercepts clicks BEFORE phylotree sees them.
+         */
+        _overrideClickBehavior() {
+            const self = this;
+
+            // Remove any existing listeners to prevent duplicates
+            if (this._clickListener) {
+                this.container.removeEventListener('click', this._clickListener, true);
+            }
+            if (this._contextMenuListener) {
+                this.container.removeEventListener('contextmenu', this._contextMenuListener);
+            }
+
+            // Define click listener (for selection)
+            this._clickListener = function (event) {
+                // Only intercept Left Click without modifiers (simple select)
+                const isSimpleClick = event.button === 0 && !event.shiftKey && !event.ctrlKey && !event.metaKey && !event.altKey;
+
+                if (!isSimpleClick) return; // Let phylotree handle shift+click, etc.
+
+                // Check if target is a node text or part of a node
+                const target = event.target;
+                if (target.classList.contains('phylotree-node-text') || target.tagName === 'circle') {
+
+                    // Stop phylotree directly!
+                    event.stopPropagation();
+                    event.preventDefault();
+
+                    // Get D3 data
+                    const d = window.d3v7.select(target).datum();
+
+                    if (DEBUG_MODE) console.log('Capture-phase click intercepted:', d);
+
+                    const id = self._getNodeId(d);
+                    if (id) {
+                        if (self.selectedIds.has(id)) {
+                            self.selectedIds.delete(id);
+                        } else {
+                            self.selectedIds.add(id);
+                        }
+                        self._updateNodeStylesOnly('click');
+                        self._updateStats();
+                    }
+                }
+            };
+
+            // Define context menu listener (for Right Click)
+            this._contextMenuListener = function (event) {
+                const target = event.target;
+                if (target.classList.contains('phylotree-node-text') || target.tagName === 'circle' || target.closest('.node')) {
+                    event.preventDefault(); // Stop Chrome menu
+                    event.stopPropagation();
+
+                    const d = window.d3v7.select(target).datum() || window.d3v7.select(target.closest('.node')).datum();
+
+                    if (self.tree && self.tree.display) {
+                        self.tree.display.handle_node_click(d, event);
+                    }
+                }
+            };
+
+            // Attach listeners
+            this.container.addEventListener('click', this._clickListener, true);
+            this.container.addEventListener('contextmenu', this._contextMenuListener);
         }
 
         // --- SELECTION STATE MANAGEMENT ---

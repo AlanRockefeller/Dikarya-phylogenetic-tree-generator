@@ -152,6 +152,72 @@
             </div>
         </div>
 
+        <!-- iNaturalist URL Card -->
+        <div class="bg-white dark:bg-journal-green rounded-xl shadow-lg p-6 transition-colors">
+            <h3 class="text-xl font-semibold text-journal-dark dark:text-gray-100 mb-4 flex items-center">
+                <i class="fas fa-leaf text-journal-gold mr-2"></i>
+                Or Enter iNaturalist URL...
+            </h3>
+
+            <div class="space-y-4">
+                <div>
+                    <label for="inaturalist_url"
+                        class="block text-sm font-medium text-gray-700 dark:text-gray-200 mb-2">
+                        iNaturalist Observation URL
+                    </label>
+                    <input type="url" id="inaturalist_url" class="w-full px-4 py-3 border border-gray-300 dark:border-journal-dark rounded-lg 
+                                  bg-white dark:bg-journal-dark text-gray-900 dark:text-gray-100
+                                  focus:ring-2 focus:ring-journal-gold focus:border-transparent transition-all"
+                        placeholder="https://www.inaturalist.org/observations/12345">
+                    <p class="text-xs text-gray-500 dark:text-gray-400 mt-1">
+                        Paste an iNaturalist observation URL to import DNA Barcode ITS sequences.
+                    </p>
+                </div>
+
+                <!-- Submit Button -->
+                <button id="fetch_inaturalist_btn" class="w-full bg-journal-dark hover:bg-journal-green text-white 
+                               py-3 px-4 rounded-lg font-semibold shadow-md hover:shadow-lg 
+                               transition-all flex items-center justify-center">
+                    <i class="fas fa-search mr-2"></i> Submit
+                </button>
+
+                <!-- Results Display Area (initially hidden) -->
+                <div id="inaturalist_results" class="hidden space-y-4">
+                    <!-- Summary -->
+                    <div id="inaturalist_summary" class="p-4 bg-gray-50 dark:bg-journal-dark rounded-lg">
+                        <p class="text-sm text-gray-700 dark:text-gray-200"></p>
+                    </div>
+
+                    <!-- Provisional Species List (for multiple observations) -->
+                    <div id="inaturalist_species_list" class="hidden">
+                        <h4 class="text-sm font-semibold text-gray-700 dark:text-gray-200 mb-2">
+                            Provisional Species Names:
+                        </h4>
+                        <ul id="inaturalist_species_items"
+                            class="text-sm text-gray-600 dark:text-gray-300 space-y-1 max-h-40 overflow-y-auto">
+                        </ul>
+                    </div>
+
+                    <!-- Action Buttons -->
+                    <div id="inaturalist_actions" class="flex flex-wrap gap-3">
+                        <!-- BLAST Button (single observation) -->
+                        <button id="inaturalist_blast_btn" class="hidden flex-1 min-w-[140px] bg-journal-gold hover:bg-journal-gold-light text-journal-dark 
+                                       py-3 px-4 rounded-lg font-semibold shadow-md hover:shadow-lg 
+                                       transition-all flex items-center justify-center">
+                            <i class="fas fa-search mr-2"></i> BLAST Sequence
+                        </button>
+
+                        <!-- Add to Queue Button (multiple observations) -->
+                        <button id="inaturalist_add_btn" class="hidden flex-1 min-w-[140px] bg-journal-gold hover:bg-journal-gold-light text-journal-dark 
+                                       py-3 px-4 rounded-lg font-semibold shadow-md hover:shadow-lg 
+                                       transition-all flex items-center justify-center">
+                            <i class="fas fa-plus mr-2"></i> Add to Queue
+                        </button>
+                    </div>
+                </div>
+            </div>
+        </div>
+
     </div>
 
     <!-- Right Section: 1 column - Sequence Queue -->
@@ -724,6 +790,280 @@
         // Restore button state
         fetchMycomapBtn.disabled = false;
         fetchMycomapBtn.innerHTML = '<i class="fas fa-download mr-2"></i> Fetch Sequences';
+    });
+
+    // =========================================================================
+    // iNaturalist URL Fetch
+    // =========================================================================
+    const inaturalistUrlInput = document.getElementById('inaturalist_url');
+    const fetchInaturalistBtn = document.getElementById('fetch_inaturalist_btn');
+    const inaturalistResults = document.getElementById('inaturalist_results');
+    const inaturalistSummary = document.getElementById('inaturalist_summary');
+    const inaturalistSpeciesList = document.getElementById('inaturalist_species_list');
+    const inaturalistSpeciesItems = document.getElementById('inaturalist_species_items');
+    const inaturalistBlastBtn = document.getElementById('inaturalist_blast_btn');
+    const inaturalistAddBtn = document.getElementById('inaturalist_add_btn');
+
+    // Store the current iNaturalist analysis result for use by action buttons
+    let currentInaturalistResult = null;
+    let currentInaturalistUrl = null;
+
+    function isValidInaturalistUrl(url) {
+        if (!url) return false;
+        try {
+            const parsed = new URL(url);
+            // Strict hostname check - must be exactly inaturalist.org or www.inaturalist.org
+            const validHostnames = ['inaturalist.org', 'www.inaturalist.org'];
+            if (!validHostnames.includes(parsed.hostname.toLowerCase())) {
+                return false;
+            }
+            // Allow /observations or /projects paths (both can reference observations)
+            const path = parsed.pathname.toLowerCase();
+            if (path.includes('/observations')) {
+                return true;
+            }
+            return false;
+        } catch (e) { return false; }
+    }
+
+    function resetInaturalistUI() {
+        inaturalistResults.classList.add('hidden');
+        inaturalistSpeciesList.classList.add('hidden');
+        inaturalistBlastBtn.classList.add('hidden');
+        inaturalistAddBtn.classList.add('hidden');
+        inaturalistSummary.querySelector('p').textContent = '';
+        inaturalistSpeciesItems.innerHTML = '';
+        currentInaturalistResult = null;
+        currentInaturalistUrl = null;
+    }
+
+    fetchInaturalistBtn.addEventListener('click', async () => {
+        const url = inaturalistUrlInput.value.trim();
+
+        // Client-side validation
+        if (!url) {
+            showStatus('Please enter an iNaturalist URL.', 'error');
+            return;
+        }
+
+        if (!isValidInaturalistUrl(url)) {
+            showStatus('Invalid iNaturalist URL. URL must be from inaturalist.org and contain /observations.', 'error');
+            return;
+        }
+
+        // Reset UI and show loading state
+        resetInaturalistUI();
+        fetchInaturalistBtn.disabled = true;
+        fetchInaturalistBtn.innerHTML = '<i class="fas fa-spinner fa-spin mr-2"></i> Analyzing...';
+        showStatus('Fetching observation data from iNaturalist...', 'info');
+
+        try {
+            const csrfToken = document.querySelector('meta[name="csrf-token"]').getAttribute('content');
+            const resp = await fetch('/api/inaturalist', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                    'X-CSRFToken': csrfToken
+                },
+                body: JSON.stringify({
+                    url: url,
+                    action: 'analyze'
+                })
+            });
+
+            const data = await resp.json();
+
+            if (!resp.ok) {
+                throw new Error(data.error || 'Failed to fetch from iNaturalist');
+            }
+
+            currentInaturalistResult = data;
+            currentInaturalistUrl = url;
+
+            // Display results
+            inaturalistResults.classList.remove('hidden');
+
+            // Build summary message
+            let summaryText = '';
+            if (data.total_observations === 0) {
+                summaryText = 'No observations found matching this URL.';
+            } else if (data.is_single) {
+                // Handling for single observation URL
+                if (data.dna_count > 0 && data.sequence) {
+                    const bpCount = data.sequence.length;
+                    summaryText = `1 observation with DNA Barcode ITS found. (${bpCount} bp)`;
+                } else {
+                    summaryText = '1 observation found, but it has no DNA Barcode ITS data.';
+                }
+            } else if (data.dna_count === 0) {
+                // Formatting for search results where candidates exist but no valid DNA found
+                summaryText = `Found ${data.total_observations} observation(s) with a "DNA Barcode ITS" field, but none contained valid DNA data (minimum length > 100bp).`;
+            } else {
+                // Formatting for search results
+                summaryText = `Found ${data.dna_count} observation(s) with DNA Barcode ITS`;
+
+                // Add total search count context if available
+                if (data.total_its_observations && data.total_its_observations > data.dna_count) {
+                    const scanned = data.fetched_its_count || data.total_its_observations;
+                    summaryText += ` (scanned ${scanned} ITS-candidate observations`;
+
+                    if (data.truncated && data.fetched_its_count < data.total_its_observations) {
+                        summaryText += `, truncated from ${data.total_its_observations}`;
+                    }
+                    summaryText += ')';
+                }
+                summaryText += '.';
+            }
+
+            // Count observations with provisional species names
+            // Use total_psn_observations if available (from separate query), otherwise derive from species list
+            let psnCount = data.total_psn_observations || 0;
+            if (!psnCount && data.provisional_species) {
+                psnCount = data.provisional_species.reduce((sum, s) => sum + s.count, 0);
+            }
+
+            if (psnCount > 0) {
+                summaryText += ` ${psnCount} have Provisional Species Name`;
+                if (data.truncated && data.fetched_psn_count < data.total_psn_observations) {
+                    summaryText += ` (scanned ${data.fetched_psn_count} of ${data.total_psn_observations})`;
+                }
+                summaryText += '.';
+            }
+
+            // Warn if results were truncated
+            if (data.truncated) {
+                summaryText += ` ⚠️ Results limited to MAX_OBSERVATIONS.`;
+            }
+
+            inaturalistSummary.querySelector('p').textContent = summaryText;
+
+            // Display provisional species if present
+            if (data.provisional_species && data.provisional_species.length > 0) {
+                inaturalistSpeciesList.classList.remove('hidden');
+                inaturalistSpeciesItems.innerHTML = data.provisional_species.map(species => {
+                    // Escape name and coerce count to number to prevent XSS
+                    const safeName = escapeHtml(String(species.name || ''));
+                    const safeCount = Number(species.count) || 0;
+                    return `<li class="flex justify-between items-center px-2 py-1 bg-gray-100 dark:bg-journal-dark/50 rounded">
+                        <span class="italic">${safeName}</span>
+                        <span class="font-mono text-xs bg-journal-gold/20 px-2 py-0.5 rounded">${safeCount}</span>
+                    </li>`;
+                }).join('');
+            }
+
+            // Show appropriate action buttons
+            if (data.can_blast && data.sequence) {
+                inaturalistBlastBtn.classList.remove('hidden');
+                showStatus('Single observation found with DNA sequence. Click BLAST to find related sequences.', 'success');
+            } else if (data.dna_count > 0) {
+                inaturalistAddBtn.classList.remove('hidden');
+                inaturalistAddBtn.textContent = `Add ${data.dna_count} Sequence${data.dna_count > 1 ? 's' : ''} to Queue`;
+                inaturalistAddBtn.innerHTML = `<i class="fas fa-plus mr-2"></i> Add ${data.dna_count} Sequence${data.dna_count > 1 ? 's' : ''} to Queue`;
+                showStatus(data.message, 'success');
+            } else {
+                showStatus('No DNA Barcode ITS sequences found in this observation.', 'info');
+            }
+
+        } catch (e) {
+            showStatus('iNaturalist error: ' + e.message, 'error');
+            resetInaturalistUI();
+        }
+
+        // Restore button state
+        fetchInaturalistBtn.disabled = false;
+        fetchInaturalistBtn.innerHTML = '<i class="fas fa-search mr-2"></i> Submit';
+    });
+
+    // BLAST button for single observation
+    inaturalistBlastBtn.addEventListener('click', async () => {
+        if (!currentInaturalistResult || !currentInaturalistResult.sequence) {
+            showStatus('No sequence available to BLAST.', 'error');
+            return;
+        }
+
+        inaturalistBlastBtn.disabled = true;
+        inaturalistBlastBtn.innerHTML = '<i class="fas fa-spinner fa-spin mr-2"></i> BLASTing...';
+        showStatus('Running BLAST search... This may take a minute.', 'info');
+
+        try {
+            const csrfToken = document.querySelector('meta[name="csrf-token"]').getAttribute('content');
+            const resp = await fetch('/api/blast', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                    'X-CSRFToken': csrfToken
+                },
+                body: JSON.stringify({ query: currentInaturalistResult.sequence })
+            });
+
+            const data = await resp.json();
+
+            if (!resp.ok) {
+                throw new Error(data.error || 'BLAST failed');
+            }
+
+            const added = addSequences(data.sequences);
+            showStatus(`BLAST complete! Added ${added} new sequences to queue.`, 'success');
+
+            // Save the query for later use in notes
+            lastBlastQuery = 'iNaturalist';
+
+            // Clear the URL input on success
+            inaturalistUrlInput.value = '';
+            resetInaturalistUI();
+
+        } catch (e) {
+            showStatus('BLAST error: ' + e.message, 'error');
+        }
+
+        inaturalistBlastBtn.disabled = false;
+        inaturalistBlastBtn.innerHTML = '<i class="fas fa-search mr-2"></i> BLAST Sequence';
+    });
+
+    // Add to Queue button for multiple observations
+    inaturalistAddBtn.addEventListener('click', async () => {
+        if (!currentInaturalistUrl) {
+            showStatus('No URL to fetch sequences from.', 'error');
+            return;
+        }
+
+        inaturalistAddBtn.disabled = true;
+        inaturalistAddBtn.innerHTML = '<i class="fas fa-spinner fa-spin mr-2"></i> Fetching...';
+        showStatus('Fetching DNA sequences from iNaturalist...', 'info');
+
+        try {
+            const csrfToken = document.querySelector('meta[name="csrf-token"]').getAttribute('content');
+            const resp = await fetch('/api/inaturalist', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                    'X-CSRFToken': csrfToken
+                },
+                body: JSON.stringify({
+                    url: currentInaturalistUrl,
+                    action: 'fetch_sequences'
+                })
+            });
+
+            const data = await resp.json();
+
+            if (!resp.ok) {
+                throw new Error(data.error || 'Failed to fetch sequences');
+            }
+
+            const added = addSequences(data.sequences);
+            showStatus(`${data.message}. Added ${added} new sequences to queue.`, 'success');
+
+            // Clear the URL input on success
+            inaturalistUrlInput.value = '';
+            resetInaturalistUI();
+
+        } catch (e) {
+            showStatus('iNaturalist error: ' + e.message, 'error');
+        }
+
+        inaturalistAddBtn.disabled = false;
+        inaturalistAddBtn.innerHTML = '<i class="fas fa-plus mr-2"></i> Add to Queue';
     });
 
     // =========================================================================

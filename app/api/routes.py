@@ -9,6 +9,8 @@ import logging
 import re
 from datetime import datetime
 
+from app.services.security_utils import validate_job_id, validate_blast_query
+
 logger = logging.getLogger(__name__)
 
 
@@ -70,6 +72,10 @@ def run_blast():
     
     if not query:
         return jsonify({"status": "error", "error": "No query provided"}), 400
+    
+    is_valid_query, error_msg = validate_blast_query(query)
+    if not is_valid_query:
+         return jsonify({"status": "error", "error": f"Invalid query: {error_msg}"}), 400
     
     try:
         from app.services.blast_service import blast_from_sequence, blast_from_accessions
@@ -195,6 +201,122 @@ def fetch_mycomap():
         return jsonify({"status": "error", "error": str(e)}), 500
 
 
+@bp.route('/inaturalist', methods=['POST'])
+def fetch_inaturalist():
+    """
+    Fetch DNA sequences from iNaturalist observations.
+    
+    Request: { 
+        "url": "<iNaturalist URL>",
+        "action": "analyze" | "fetch_sequences"
+    }
+    
+    Response (analyze): {
+        "status": "success",
+        "total_observations": int,
+        "dna_count": int,
+        "provisional_species": [{"name": "...", "count": int}, ...],
+        "is_single": bool,
+        "can_blast": bool
+    }
+    
+    Response (fetch_sequences): {
+        "status": "success", 
+        "sequences": [...],
+        "message": "..."
+    }
+    """
+    data = request.get_json() or {}
+    url = data.get('url', '').strip()
+    action = data.get('action', 'analyze').strip()
+    
+    # Input sanitization
+    if not url:
+        return jsonify({"status": "error", "error": "No URL provided"}), 400
+    
+    # Limit URL length to prevent abuse
+    if len(url) > 2000:
+        return jsonify({"status": "error", "error": "URL too long"}), 400
+    
+    # Validate action
+    if action not in ('analyze', 'fetch_sequences'):
+        return jsonify({"status": "error", "error": "Invalid action"}), 400
+    
+    try:
+        from app.services.inaturalist_service import (
+            validate_inaturalist_url,
+            fetch_inaturalist_data
+        )
+        
+        # Validate URL format first
+        url_info = validate_inaturalist_url(url)
+        if not url_info:
+            return jsonify({
+                "status": "error",
+                "error": "Invalid iNaturalist URL. Please enter a valid observation URL "
+                         "(e.g., https://www.inaturalist.org/observations/12345) or "
+                         "observations search URL."
+            }), 400
+        
+        logger.info(f"iNaturalist API: Processing URL type={url_info['type']}, action={action}")
+        
+        if action == 'analyze':
+            # Fetch and analyze observations (default mode='all' gets both ITS and PSN stats)
+            result = fetch_inaturalist_data(url, mode='all')
+
+            # Return analysis without full sequences
+            # Defensive: check sequences list exists and has items before accessing
+            sequences = result.get('sequences', [])
+            seq = sequences[0]['sequence'] if sequences else None
+            
+            # Determine if this is a single result based on actual ITS data
+            # Use total_its_observations if available, falling back to total_observations
+            total_its = result.get('total_its_observations', result['total_observations'])
+            
+            # is_single reflects the URL type (single observation URL)
+            is_single_url = result.get('is_single', False)
+            
+            # can_blast requires exactly one usable ITS sequence found
+            can_blast = bool(total_its == 1 and result['dna_count'] == 1 and len(sequences) == 1 and seq)
+            
+            return jsonify({
+                "status": "success",
+                "total_observations": result['total_observations'],
+                "total_its_observations": result.get('total_its_observations', 0),
+                "total_psn_observations": result.get('total_psn_observations', 0),
+                "fetched_its_count": result.get('fetched_its_count', 0),
+                "fetched_psn_count": result.get('fetched_psn_count', 0),
+                "dna_count": result['dna_count'],
+                "provisional_species": result['provisional_species'],
+                "is_single": is_single_url,
+                "can_blast": can_blast,
+                # For single obs with DNA, include the sequence for BLAST
+                "sequence": seq if can_blast else None,
+                "truncated": result.get('truncated', False),
+                "total_available": result.get('total_available', 0),
+                "message": f"Found {result['dna_count']} observation(s) with DNA Barcode ITS"
+            })
+        else:
+            # Optimize: Only fetch ITS sequences for queue adding (skip PSN stats)
+            result = fetch_inaturalist_data(url, mode='its_only')
+            
+            # Return full sequences for queue
+            return jsonify({
+                "status": "success",
+                "sequences": result['sequences'],
+                "truncated": result.get('truncated', False),
+                "total_available": result.get('total_available', 0),
+                "message": f"Fetched {len(result['sequences'])} DNA sequences from iNaturalist"
+            })
+        
+    except ValueError as e:
+        logger.warning(f"iNaturalist API validation error: {e}")
+        return jsonify({"status": "error", "error": str(e)}), 400
+    except Exception as e:
+        logger.error(f"iNaturalist API error: {e}", exc_info=True)
+        return jsonify({"status": "error", "error": str(e)}), 500
+
+
 def _check_job_access(job_id):
     """
     Check if current user can access the given job.
@@ -202,6 +324,9 @@ def _check_job_access(job_id):
     Returns:
         (db_job, error_response) - If error_response is not None, return it immediately.
     """
+    if not validate_job_id(job_id):
+        return None, (jsonify({"status": "error", "error": "Invalid job ID format"}), 400)
+
     db_job = Job.query.get(job_id)
     job_dir = Config.JOB_DIR / job_id
     
@@ -266,11 +391,21 @@ def create_job():
 
 @bp.route('/job/<job_id>/status', methods=['GET'])
 def get_job_status_route(job_id):
+    if not validate_job_id(job_id):
+        return jsonify({"status": "error", "error": "Invalid job ID format"}), 400
+        
     status_info = get_job_status(job_id)
     return jsonify(status_info)
 
 @bp.route('/job/<job_id>/tree/state', methods=['GET'])
 def get_tree_state(job_id):
+    if not validate_job_id(job_id):
+        return jsonify({"status": "error", "error": "Invalid job ID format"}), 400
+        
+    _, error_response = _check_job_access(job_id)
+    if error_response:
+        return error_response
+
     job_dir = Config.JOB_DIR / job_id
     if not job_dir.exists():
         return jsonify({"status": "error", "error": "Job not found"}), 404
@@ -284,6 +419,9 @@ def get_tree_state(job_id):
 
 @bp.route('/job/<job_id>/tree/prune', methods=['POST'])
 def prune_tree(job_id):
+    if not validate_job_id(job_id):
+        return jsonify({"status": "error", "error": "Invalid job ID format"}), 400
+
     job_dir = Config.JOB_DIR / job_id
     if not job_dir.exists():
         return jsonify({"status": "error", "error": "Job not found"}), 404
@@ -302,6 +440,9 @@ def prune_tree(job_id):
 
 @bp.route('/job/<job_id>/tree/rename', methods=['POST'])
 def rename_tree_tip(job_id):
+    if not validate_job_id(job_id):
+        return jsonify({"status": "error", "error": "Invalid job ID format"}), 400
+
     job_dir = Config.JOB_DIR / job_id
     if not job_dir.exists():
         return jsonify({"status": "error", "error": "Job not found"}), 404
@@ -321,6 +462,9 @@ def rename_tree_tip(job_id):
 
 @bp.route('/job/<job_id>/tree/reroot', methods=['POST'])
 def reroot_tree_endpoint(job_id):
+    if not validate_job_id(job_id):
+        return jsonify({"status": "error", "error": "Invalid job ID format"}), 400
+
     job_dir = Config.JOB_DIR / job_id
     if not job_dir.exists():
         return jsonify({"status": "error", "error": "Job not found"}), 404
@@ -344,6 +488,9 @@ def reroot_tree_endpoint(job_id):
 
 @bp.route('/job/<job_id>/tree/midpoint_root', methods=['POST'])
 def midpoint_root_endpoint(job_id):
+    if not validate_job_id(job_id):
+        return jsonify({"status": "error", "error": "Invalid job ID format"}), 400
+
     job_dir = Config.JOB_DIR / job_id
     if not job_dir.exists():
         return jsonify({"status": "error", "error": "Job not found"}), 404
@@ -362,6 +509,9 @@ def midpoint_root_endpoint(job_id):
 @bp.route('/job/<job_id>/tree/midpoint_root_toggle', methods=['POST'])
 def midpoint_root_toggle_endpoint(job_id):
     """Toggle midpoint rooting on/off."""
+    if not validate_job_id(job_id):
+        return jsonify({"status": "error", "error": "Invalid job ID format"}), 400
+
     job_dir = Config.JOB_DIR / job_id
     if not job_dir.exists():
         return jsonify({"status": "error", "error": "Job not found"}), 404
@@ -389,6 +539,9 @@ def midpoint_root_toggle_endpoint(job_id):
 
 @bp.route('/job/<job_id>/tree/recompute', methods=['POST'])
 def recompute_tree_job(job_id):
+    if not validate_job_id(job_id):
+        return jsonify({"status": "error", "error": "Invalid job ID format"}), 400
+
     job_dir = Config.JOB_DIR / job_id
     if not job_dir.exists():
         return jsonify({"status": "error", "error": "Job not found"}), 404
@@ -449,6 +602,9 @@ def recompute_tree_job(job_id):
 
 @bp.route('/job/<job_id>/download/tree/newick', methods=['GET'])
 def download_newick(job_id):
+    if not validate_job_id(job_id):
+        return jsonify({"status": "error", "error": "Invalid job ID format"}), 400
+
     job_dir = Config.JOB_DIR / job_id
     if not job_dir.exists():
         return jsonify({"status": "error", "error": "Job not found"}), 404
@@ -477,6 +633,9 @@ def download_newick(job_id):
 
 @bp.route('/job/<job_id>/download/tree/newick/original', methods=['GET'])
 def download_newick_original(job_id):
+    if not validate_job_id(job_id):
+        return jsonify({"status": "error", "error": "Invalid job ID format"}), 400
+
     job_dir = Config.JOB_DIR / job_id
     if not job_dir.exists():
         return jsonify({"status": "error", "error": "Job not found"}), 404
@@ -491,6 +650,9 @@ def download_newick_original(job_id):
 
 @bp.route('/job/<job_id>/download/tree/newick/pruned', methods=['GET'])
 def download_newick_pruned(job_id):
+    if not validate_job_id(job_id):
+        return jsonify({"status": "error", "error": "Invalid job ID format"}), 400
+
     job_dir = Config.JOB_DIR / job_id
     if not job_dir.exists():
         return jsonify({"status": "error", "error": "Job not found"}), 404
@@ -506,6 +668,9 @@ def download_newick_pruned(job_id):
 
 @bp.route('/job/<job_id>/download/tree/nexus', methods=['GET'])
 def download_nexus(job_id):
+    if not validate_job_id(job_id):
+        return jsonify({"status": "error", "error": "Invalid job ID format"}), 400
+
     job_dir = Config.JOB_DIR / job_id
     if not job_dir.exists():
         return jsonify({"status": "error", "error": "Job not found"}), 404
@@ -745,6 +910,9 @@ def job_events_stream(job_id):
     from flask import Response, stream_with_context
     
     # Check authorization
+    if not validate_job_id(job_id):
+        return jsonify({"status": "error", "error": "Invalid job ID format"}), 400
+
     db_job, error_response = _check_job_access(job_id)
     if error_response:
         return error_response
@@ -852,6 +1020,9 @@ def download_log(job_id, log_name):
     - alignment: alignment.log  
     - tree_builder: tree_builder.log
     """
+    if not validate_job_id(job_id):
+        return jsonify({"status": "error", "error": "Invalid job ID format"}), 400
+
     # Check authorization
     _, error_response = _check_job_access(job_id)
     if error_response:
@@ -896,7 +1067,9 @@ def log_client_error():
     msg = (data.get("message") or "Unknown client error")[:2000]
     stack = (data.get("stack") or "")[:20000]
     context = (data.get("context") or "")[:1000]
-    url = (data.get("url") or "")[:500]
+    context = (data.get("context") or "")[:1000]
+    # Sanitize URL to prevent log injection
+    url = (data.get("url") or "")[:500].replace('\n', '').replace('\r', '')
     
     # Request metadata for debugging
     client_ip = request.headers.get("X-Forwarded-For", request.remote_addr) or "unknown"
@@ -916,3 +1089,95 @@ def log_client_error():
         
     current_app.logger.error(log_msg)
     return jsonify({"status": "logged"}), 200
+
+@bp.route('/job/<job_id>/sequences/add', methods=['POST'])
+def add_sequences_to_job(job_id):
+    """
+    Add sequences to an existing job's input file.
+    
+    Request: { "input": "<fasta or accession list>" }
+    Response: { "status": "success", "count": int, "message": "..." }
+    """
+    # Check authorization
+    _, error_response = _check_job_access(job_id)
+    if error_response:
+        return error_response
+    
+    job_dir = Config.JOB_DIR / job_id
+    if not job_dir.exists():
+        return jsonify({"status": "error", "error": "Job not found"}), 404
+        
+    data = request.get_json() or {}
+    input_text = data.get("input", "").strip()
+    
+    if not input_text:
+        return jsonify({"status": "error", "error": "No input provided"}), 400
+        
+    try:
+        from app.services.blast_service import fetch_fasta_for_accessions
+        
+        sequences_to_add = []
+        is_accession_input = False
+        
+        # Heuristic: Check if input looks like a list of accessions (no > at start, short lines)
+        first_line = input_text.splitlines()[0].strip()
+        if not first_line.startswith(">"):
+            # Assume accessions
+            is_accession_input = True
+            
+            # Split by commas, spaces, newlines
+            import re
+            tokens = re.split(r'[,\s]+', input_text)
+            accessions = [t.strip() for t in tokens if t.strip()]
+            
+            if accessions:
+                logger.info(f"Adding sequences from accessions: {accessions}")
+                fasta_content = fetch_fasta_for_accessions(accessions)
+                sequences_to_add = _parse_fasta_sequences(fasta_content)
+        else:
+            # Assume FASTA
+            sequences_to_add = _parse_fasta_sequences(input_text)
+            
+        if not sequences_to_add:
+             return jsonify({"status": "error", "error": "No valid sequences found in input"}), 400
+             
+        # Append to input_raw.fasta
+        input_path = job_dir / "input" / "input_raw.fasta"
+        
+        # Read existing to check for duplicates (by name)
+        existing_names = set()
+        if input_path.exists():
+            existing_seqs = _parse_fasta_sequences(input_path.read_text())
+            existing_names = {s['name'] for s in existing_seqs}
+            
+        added_count = 0
+        with open(input_path, "a") as f:
+            # Ensure newline at end of file before appending
+            if input_path.stat().st_size > 0:
+                 f.write("\n")
+                 
+            for seq in sequences_to_add:
+                # Limit name length if needed, but for now allow typical
+                # Basic duplicate check - logic can be refined
+                if seq['name'] not in existing_names:
+                    f.write(f">{seq['name']}\n{seq['sequence']}\n")
+                    added_count += 1
+                else:
+                    # Optional: Rename duplicate? For now, skip or append as is?
+                    # Let's append with suffix to allow user to see it
+                    # But actually keying is by name, so maybe skip.
+                    # User asked to "Add", so let's add. But strictly unique IDs needed for tree?
+                    # Unique IDs are enforced by tree service during recompute/init.
+                    # Best to append.
+                    f.write(f">{seq['name']}_added\n{seq['sequence']}\n")
+                    added_count += 1
+                    
+        return jsonify({
+            "status": "success", 
+            "count": added_count,
+            "message": f"Added {added_count} sequences."
+        })
+        
+    except Exception as e:
+        logger.error(f"Failed to add sequences: {e}", exc_info=True)
+        return jsonify({"status": "error", "error": str(e)}), 500

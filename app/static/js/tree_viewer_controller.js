@@ -570,6 +570,57 @@ document.addEventListener('DOMContentLoaded', async () => {
             });
         });
 
+        // Add Sequences Modal Wiring
+        const btnAddSeq = getEl('btn-add-sequences');
+        const modalAddSeq = getEl('modal-add-sequences');
+        const btnModalConfirm = getEl('btn-modal-add-confirm');
+        const btnModalCancel = getEl('btn-modal-add-cancel');
+        const textareaAddSeq = getEl('textarea-add-sequences');
+
+        if (btnAddSeq && modalAddSeq) {
+            const closeModal = () => {
+                modalAddSeq.classList.add('hidden');
+                if (textareaAddSeq) textareaAddSeq.value = ''; // Reset
+            };
+            const openModal = () => {
+                modalAddSeq.classList.remove('hidden');
+                if (textareaAddSeq) textareaAddSeq.focus();
+            };
+
+            btnAddSeq.addEventListener('click', openModal);
+
+            btnModalCancel?.addEventListener('click', closeModal);
+
+            // Close on backdrop click (optional)
+            modalAddSeq.addEventListener('click', (e) => {
+                if (e.target === modalAddSeq || e.target.hasAttribute('data-backdrop')) {
+                    closeModal();
+                }
+            });
+
+            btnModalConfirm?.addEventListener('click', () => {
+                const input = textareaAddSeq?.value.trim();
+                if (!input) {
+                    alert("Please enter sequences or accessions.");
+                    return;
+                }
+
+                closeModal();
+
+                // Chain actions: Add -> Recompute
+                runBackendAction("Adding Sequences & Recomputing", async () => {
+                    showStatus("Adding sequences...", "info");
+                    const addResult = await TreeEditActions.addSequences(JOB_ID, input);
+
+                    showStatus(`Added ${addResult.count} sequences. Recomputing tree...`, "info", 5000);
+
+                    // Recompute
+                    await TreeEditActions.recomputeTree(JOB_ID);
+                });
+            });
+        }
+
+
         document.addEventListener('keydown', (e) => {
             if (e.key === "Escape" && rerootMode) {
                 rerootMode = false; removeRerootCapture();

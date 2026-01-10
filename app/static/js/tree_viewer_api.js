@@ -127,6 +127,22 @@ const TreeEditActions = {
         return data;
     },
 
+    async addSequences(jobId, input) {
+        const response = await fetch(`/api/job/${jobId}/sequences/add`, {
+            method: 'POST',
+            headers: this._buildHeaders(),
+            credentials: "same-origin",
+            body: JSON.stringify({ input: input })
+        });
+        const data = await response.json().catch(() => ({}));
+        if (!response.ok) {
+            const err = new Error(data.error || data.message || `Failed to add sequences: ${response.status}`);
+            err.details = data;
+            throw err;
+        }
+        return data;
+    },
+
     async logClientError(message, context = null) {
         try {
             await fetch('/api/log/client', {

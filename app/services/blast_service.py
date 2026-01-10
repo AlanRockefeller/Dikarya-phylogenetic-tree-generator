@@ -36,7 +36,7 @@ def blast_from_sequence(seq: str, config: Config, logger=logger) -> Dict:
         hit_details = blast_result.get("hit_details", [])
         logger.info(f"BLAST finished. Found {len(hit_accessions)} hits.")
         
-        fasta_content = _fetch_fasta_for_accessions(hit_accessions)
+        fasta_content = fetch_fasta_for_accessions(hit_accessions)
         logger.info(f"Downloaded FASTA for {len(hit_accessions)} accessions.")
         
         return _save_cache(query_hash, hit_accessions, hit_details, fasta_content, config)
@@ -65,7 +65,7 @@ def blast_from_accessions(accessions: List[str], config: Config, logger=logger) 
     
     try:
         # 1. Fetch initial sequences to use as query
-        query_fasta = _fetch_fasta_for_accessions(sorted_accessions)
+        query_fasta = fetch_fasta_for_accessions(sorted_accessions)
         
         # 2. Run BLAST with these sequences
         # Note: We use the same flow as blast_from_sequence, but we might want to 
@@ -91,7 +91,7 @@ def blast_from_accessions(accessions: List[str], config: Config, logger=logger) 
             if acc not in existing_accs:
                 hit_details.insert(0, {"accession": acc, "organism": "(query)"})
         
-        fasta_content = _fetch_fasta_for_accessions(all_accessions)
+        fasta_content = fetch_fasta_for_accessions(all_accessions)
         logger.info(f"Downloaded FASTA for {len(all_accessions)} accessions.")
         
         return _save_cache(query_hash, all_accessions, hit_details, fasta_content, config)
@@ -104,6 +104,10 @@ def _hash_query(query_str: str) -> str:
     return hashlib.sha256(query_str.encode('utf-8')).hexdigest()
 
 def _check_cache(query_hash: str, config: Config) -> Optional[Dict]:
+    # Validate hash format (SHA-256 = 64 hex chars)
+    if not re.match(r'^[0-9a-f]{64}$', query_hash):
+        return None
+        
     cache_dir = config.BLAST_CACHE_DIR
     json_path = cache_dir / f"{query_hash}.json"
     fasta_path = cache_dir / f"{query_hash}.fasta"
@@ -375,14 +379,23 @@ def _fetch_blast_results(rid: str) -> Dict[str, List]:
         logger.error(f"JSON decode error: {e}, response preview: {content[:500]}")
         raise ValueError(f"Failed to parse BLAST JSON response: {e}")
 
-def _fetch_fasta_for_accessions(accessions: List[str]) -> str:
+def fetch_fasta_for_accessions(accessions: List[str]) -> str:
     """Fetch FASTA sequences from NCBI for the given accessions."""
     if not accessions:
         return ""
     
-    logger.info(f"Fetching FASTA for {len(accessions)} accessions: {accessions[:5]}...")
+    # Validate accession format
+    import re
+    valid_pattern = re.compile(r'^[A-Z]{1,2}_?\d{5,}(?:\.\d+)?$', re.IGNORECASE)
+    validated = [a for a in accessions if valid_pattern.match(a)]
+    
+    if not validated:
+        logger.warning(f"No valid accessions found in list of {len(accessions)}")
+        return ""
+
+    logger.info(f"Fetching FASTA for {len(validated)} accessions: {validated[:5]}...")
         
-    ids = ",".join(accessions)
+    ids = ",".join(validated)
     params = {
         "db": "nuccore",
         "id": ids,
