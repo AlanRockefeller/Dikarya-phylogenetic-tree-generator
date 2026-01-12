@@ -25,6 +25,10 @@ def validate_mycomap_url(url: str) -> Optional[str]:
     """
     Validate a Mycomap URL and extract the blast_id.
     
+    Uses strict hostname checking to prevent bypass attacks like:
+    - https://evil.com/?q=mycomap.com/r12345
+    - https://mycomap.com.evil.com/r12345
+    
     Args:
         url: The URL to validate (e.g., "https://mycomap.com/...r12345...")
         
@@ -34,16 +38,28 @@ def validate_mycomap_url(url: str) -> Optional[str]:
     if not url:
         return None
     
-    # Must be from mycomap.com domain (strict check - not a substring of another domain)
-    # Matches: mycomap.com, www.mycomap.com, subdomain.mycomap.com
-    # Rejects: notmycomap.com, mycomap.com.fake.com
-    domain_pattern = r'(?:^|[/.])(mycomap\.com)(?:[/:]|$)'
-    if not re.search(domain_pattern, url, re.IGNORECASE):
-        logger.warning(f"URL validation failed: not a mycomap.com URL: {url}")
+    try:
+        parsed = urllib.parse.urlparse(url)
+    except Exception:
+        logger.warning(f"URL validation failed: could not parse URL: {url}")
         return None
     
-    # Extract the r<digits> pattern
-    match = re.search(r'r(\d+)', url)
+    # Strict hostname check - must be exactly mycomap.com or www.mycomap.com
+    hostname = (parsed.hostname or '').lower()
+    valid_hostnames = ['mycomap.com', 'www.mycomap.com']
+    if hostname not in valid_hostnames:
+        logger.warning(f"URL validation failed: invalid hostname '{hostname}' (expected mycomap.com): {url}")
+        return None
+    
+    # Enforce http or https protocol
+    if parsed.scheme not in ('http', 'https'):
+        logger.warning(f"URL validation failed: invalid scheme '{parsed.scheme}' (expected http/https): {url}")
+        return None
+    
+    # Extract the r<digits> pattern from path or query
+    # Use word boundary to avoid matching middle of other tokens
+    search_text = parsed.path + '?' + (parsed.query or '')
+    match = re.search(r'(?:^|[^a-zA-Z0-9])r(\d+)', search_text)
     if not match:
         logger.warning(f"URL validation failed: no r<digits> pattern found in: {url}")
         return None

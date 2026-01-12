@@ -23,6 +23,7 @@ This is a Flask-based bioinformatics application designed to handle sequence ana
 ### Bioinformatics
 - **Library**: Biopython
 - **Job Types**:
+    - Sequence Orientation (auto-fix reversed ITS sequences)
     - Sequence Alignment (supported methods: MAFFT, MUSCLE, ClustalO, etc.)
     - Tree Building (supported methods: NJ, RAxML, IQ-TREE, MrBayes)
     - Trimming (supported methods: trimAl, BMGE)

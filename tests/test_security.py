@@ -4,11 +4,12 @@ import unittest
 import sys
 import importlib.util
 
-# Load security_utils directly
-spec = importlib.util.spec_from_file_location(
-    "security_utils", 
-    "/var/www/dikarya/app/services/security_utils.py"
-)
+# Load security_utils relative to this test file
+import os
+current_dir = os.path.dirname(os.path.abspath(__file__))
+module_path = os.path.join(current_dir, '../app/services/security_utils.py')
+
+spec = importlib.util.spec_from_file_location("security_utils", module_path)
 security_utils = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(security_utils)
 
@@ -48,10 +49,18 @@ class TestBlastQueryValidation(unittest.TestCase):
     
     def test_shell_injection_rejected(self):
         """Shell metacharacters should be rejected."""
-        patterns = ['; rm -rf /', '| cat /etc/passwd', '`whoami`', '$(id)']
+        # Note: | is now allowed (common in FASTA headers), preventing shell injection 
+        # relies on how the query is used (passed as file/arg, not raw shell string).
+        patterns = ['; rm -rf /', '`whoami`', '$(id)']
         for pattern in patterns:
             is_valid, _ = security_utils.validate_blast_query(pattern)
             self.assertFalse(is_valid, f"Should reject: {pattern}")
+
+    def test_fasta_header_allowed(self):
+        """Standard FASTA headers with pipes should be allowed."""
+        valid_query = ">gi|12345|ref|NC_000000| Some Organism\nATCG..."
+        is_valid, _ = security_utils.validate_blast_query(valid_query)
+        self.assertTrue(is_valid, "Should allow FASTA headers with pipes")
 
 
 if __name__ == '__main__':

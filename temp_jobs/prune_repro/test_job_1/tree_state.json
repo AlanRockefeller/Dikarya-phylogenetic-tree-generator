@@ -1,0 +1,58 @@
+{
+  "current_tree": "pruned",
+  "tree_structure": {
+    "name": null,
+    "original_name": null,
+    "branch_length": null,
+    "confidence": null,
+    "children": [
+      {
+        "name": "D",
+        "original_name": "D",
+        "branch_length": 0.5,
+        "confidence": null,
+        "children": [
+          {
+            "name": "C",
+            "original_name": "C",
+            "branch_length": 1.0,
+            "confidence": null
+          },
+          {
+            "name": "B",
+            "original_name": "B",
+            "branch_length": 1.0,
+            "confidence": null
+          }
+        ]
+      },
+      {
+        "name": "F",
+        "original_name": "F",
+        "branch_length": 0.5,
+        "confidence": null,
+        "children": [
+          {
+            "name": "E",
+            "original_name": "E",
+            "branch_length": 1.0,
+            "confidence": null
+          },
+          {
+            "name": "A",
+            "original_name": "A",
+            "branch_length": 1.0,
+            "confidence": null
+          }
+        ]
+      }
+    ]
+  },
+  "pruned_taxa": [],
+  "renames": {},
+  "root": null,
+  "pre_midpoint_newick": "(A:1.0,(B:1.0,C:1.0)D:1.0,E:1.0)F;",
+  "root_mode": "MIDPOINT",
+  "root_target": null,
+  "is_midpoint_rooted": true
+}

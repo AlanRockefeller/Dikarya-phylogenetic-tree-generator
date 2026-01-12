@@ -369,7 +369,10 @@
                               bg-white dark:bg-journal-dark text-gray-900 dark:text-gray-100
                               focus:ring-2 focus:ring-journal-gold focus:border-transparent transition-all">
                 <p class="text-xs text-gray-500 dark:text-gray-400 mt-1">
-                    Number of bootstrap trees. IQ-TREE requires >= 1000 for Ultrafast Bootstrap.
+                    Number of bootstrap trees.
+                </p>
+                <p id="iqtree_bootstrap_note" class="text-xs text-gray-500 dark:text-gray-400 mt-1 hidden">
+                    IQ-TREE requires >= 1000 for Ultrafast Bootstrap.
                 </p>
             </div>
         </div>
@@ -717,9 +720,22 @@
     function isValidMycomapUrl(url) {
         // Must be from mycomap.com and contain r<digits> pattern
         if (!url) return false;
-        const lowerUrl = url.toLowerCase();
-        if (!lowerUrl.includes('mycomap.com')) return false;
-        return /r\d+/.test(url);
+        try {
+            const parsed = new URL(url);
+            const host = parsed.hostname.toLowerCase();
+            // Strict hostname check - must be exactly mycomap.com or www.mycomap.com
+            const validHostnames = ['mycomap.com', 'www.mycomap.com'];
+            if (!validHostnames.includes(host)) return false;
+
+            // Enforce https or http protocol
+            if (parsed.protocol !== 'https:' && parsed.protocol !== 'http:') return false;
+
+            // Accept r<digits> pattern in path or query
+            const hay = (parsed.pathname + parsed.search).toLowerCase();
+            return /(^|[^a-z0-9])r\d+/.test(hay);
+        } catch (e) {
+            return false;
+        }
     }
 
     fetchMycomapBtn.addEventListener('click', async () => {
@@ -1091,8 +1107,10 @@
     function updateForm() {
         const method = treeMethodSelect.value;
         const bootstrapInput = document.getElementById('bootstrap');
+        const iqtreeNote = document.getElementById('iqtree_bootstrap_note');
         mlOptions.classList.add('hidden');
         mbOptions.classList.add('hidden');
+        iqtreeNote.classList.add('hidden');
 
         if (method === 'raxml' || method === 'iqtree') {
             mlOptions.classList.remove('hidden');
@@ -1100,6 +1118,7 @@
                 bootstrapInput.value = 100;
             } else if (method === 'iqtree') {
                 bootstrapInput.value = 1000;
+                iqtreeNote.classList.remove('hidden');
             }
         } else if (method === 'mrbayes') {
             mbOptions.classList.remove('hidden');
@@ -1257,8 +1276,118 @@
     });
 
     // =========================================================================
-    // Initialize
     // =========================================================================
+    // Initialize & "Add Sequences" Mode Logic
+    // =========================================================================
+    const urlParams = new URLSearchParams(window.location.search);
+    const EDIT_JOB_ID = urlParams.get('edit_job_id');
+    const submitBtn = document.getElementById('submit_btn');
+
+    if (EDIT_JOB_ID) {
+        // --- MODIFY UI FOR "ADD SEQ" MODE ---
+        document.querySelector('h2').innerHTML = `<i class="fas fa-plus-circle text-journal-gold mr-3"></i>Add Sequences to Job&nbsp;<span class="font-mono text-gray-500">${EDIT_JOB_ID}</span>`;
+        document.title = `Add Sequences - Job ${EDIT_JOB_ID}`;
+
+        // Hide "Beginner/Advanced" toggles at top
+        const actionRow = document.querySelector('.mt-8.flex.flex-wrap.gap-4');
+        if (actionRow) actionRow.style.display = 'none';
+
+        // Hide "Advanced Configuration" panel toggle entirely
+        // We only want to add sequences, not change pipeline params
+        const toggleBtn = document.getElementById('toggle_advanced_btn');
+        if (toggleBtn) toggleBtn.closest('div').style.display = 'none';
+        // Or if it shares container
+
+        // Change Submit Button
+        submitBtn.innerHTML = '<i class="fas fa-plus-circle mr-2"></i> Add & Recompute';
+        submitBtn.classList.remove('bg-journal-gold', 'text-journal-dark');
+        submitBtn.classList.add('bg-green-600', 'text-white', 'hover:bg-green-700');
+
+        // Also show the button immediately, no need to toggle advanced
+        // Actually, submit_btn is inside advanced_panel which is hidden by default.
+        // We should move it out or ensure it's visible. 
+        // Better: Clone the button to the main area or show the panel simplified.
+        // Let's just append a new specific submission button to the main area for clarity
+        // and hide the advanced options panel.
+
+        // Let's create a dedicated "Add & Recompute" button container below the queue
+        const queueContainer = document.querySelector('.lg\\:col-span-1 > div'); // The queue card
+        if (queueContainer) {
+            const footer = queueContainer.querySelector('.border-t');
+            // Insert a new primary action button in the queue footer or below it
+            const actionDiv = document.createElement('div');
+            actionDiv.className = "p-4 border-t border-gray-200 dark:border-journal-dark";
+            actionDiv.innerHTML = `
+                <button id="btn_add_recompute_job" class="w-full bg-green-600 hover:bg-green-700 text-white 
+                               py-3 px-4 rounded-lg font-bold shadow-md hover:shadow-lg 
+                               transition-all flex items-center justify-center">
+                    <i class="fas fa-sync mr-2"></i> Add & Recompute
+                </button>
+            `;
+            // Insert before the existing footer (Clear All) or append
+            queueContainer.appendChild(actionDiv);
+
+            // Wire up the new button
+            document.getElementById('btn_add_recompute_job').addEventListener('click', async () => {
+                const btn = document.getElementById('btn_add_recompute_job');
+
+                if (sequenceQueue.length === 0) {
+                    showStatus('Please add at least one sequence to the queue.', 'error');
+                    return;
+                }
+
+                btn.disabled = true;
+                btn.innerHTML = '<i class="fas fa-spinner fa-spin mr-2"></i> Processing...';
+                showStatus('Adding sequences and recomputing tree...', 'info');
+
+                try {
+                    const combinedFasta = buildFastaFromQueue();
+
+                    // 1. Add Sequences
+                    const csrfToken = document.querySelector('meta[name="csrf-token"]').getAttribute('content');
+                    const addResp = await fetch(`/api/job/${EDIT_JOB_ID}/sequences/add`, {
+                        method: 'POST',
+                        headers: {
+                            'Content-Type': 'application/json',
+                            'X-CSRFToken': csrfToken
+                        },
+                        body: JSON.stringify({ input: combinedFasta })
+                    });
+
+                    const addData = await addResp.json();
+                    if (!addResp.ok) throw new Error(addData.error || 'Failed to add sequences');
+
+                    showStatus(`Added ${addData.count} sequences. Recomputing...`, 'success');
+
+                    // 2. Recompute
+                    const recomputeResp = await fetch(`/api/job/${EDIT_JOB_ID}/tree/recompute`, {
+                        method: 'POST',
+                        headers: {
+                            'Content-Type': 'application/json',
+                            'X-CSRFToken': csrfToken
+                        },
+                        body: JSON.stringify({})
+                    });
+                    const recompData = await recomputeResp.json();
+                    if (!recomputeResp.ok) throw new Error(recompData.error || 'Failed to trigger recompute');
+
+                    showStatus('Recompute started! Redirecting to viewer...', 'success');
+
+                    // 3. Redirect back to viewer
+                    setTimeout(() => {
+                        window.location.href = `/job/${EDIT_JOB_ID}/view`;
+                    }, 1000);
+
+                } catch (e) {
+                    showStatus('Error: ' + e.message, 'error');
+                    btn.disabled = false;
+                    btn.innerHTML = '<i class="fas fa-sync mr-2"></i> Add & Recompute';
+                }
+            });
+        }
+
+    }
+
     updateQueueDisplay();
 </script>
 {% endblock %}

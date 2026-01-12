@@ -80,6 +80,20 @@ def validate_inaturalist_url(url: str) -> Optional[Dict[str, Any]]:
     if '/observations' in parsed.path:
         # Parse query parameters, keeping blank values (e.g. field:DNA Barcode ITS=)
         query_params = parse_qs(parsed.query, keep_blank_values=True)
+        
+        # Security: Require at least one meaningful filter param to prevent massive/broad queries
+        # We don't want users scraping *all* observations or causing backend abuse.
+        meaningful_filters = {
+            'taxon_id', 'place_id', 'user_id', 'project_id', 'list_id', 'id', 
+            'identified_by', 'q'
+        }
+        has_meaningful_filter = any(k in meaningful_filters for k in query_params.keys())
+        has_field_filter = any(k.startswith('field:') for k in query_params.keys())
+        
+        if not (has_meaningful_filter or has_field_filter):
+            logger.warning(f"URL validation failed: Search URL missing required filter params (taxon_id, user_id, etc.): {url}")
+            return None
+            
         logger.info(f"Validated observations search URL with params: {list(query_params.keys())}")
         return {
             'type': 'observations_search',
@@ -91,88 +105,7 @@ def validate_inaturalist_url(url: str) -> Optional[Dict[str, Any]]:
     return None
 
 
-def clean_dna_sequence(raw_sequence: str, min_length: int = 100) -> str:
-    """
-    Clean a DNA sequence by extracting the longest contiguous run of valid nucleotides.
-    
-    This handles cases where:
-    - The sequence has a FASTA header (>description...) on a separate line or same line
-    - The sequence has garbage text at the start or end (species name, collection number, notes)
-    - The sequence has whitespace/newlines
-    
-    Algorithm:
-    1. Strip FASTA header markers (>) but keep remainder of line
-    2. Remove all whitespace
-    3. Find the longest contiguous run of valid IUPAC nucleotide characters
-    4. Return that run if it meets minimum length, otherwise empty string
-    
-    Args:
-        raw_sequence: Raw DNA sequence string that may contain non-DNA text
-        min_length: Minimum length for a valid barcode (default 100bp for ITS)
-        
-    Returns:
-        Cleaned DNA sequence containing only valid IUPAC nucleotide characters,
-        or empty string if no valid run of sufficient length is found
-    """
-    if not raw_sequence:
-        return ""
-    
-    # Valid IUPAC nucleotide characters (DNA + ambiguity codes + gap)
-    valid_chars = set('ATGCYRWSKMNatgcyrwskmn-')
-    
-    # Process lines: strip > marker but keep rest of each line
-    lines = raw_sequence.strip().split('\n')
-    processed_lines = []
-    
-    for line in lines:
-        line = line.strip()
-        if not line:
-            continue
-        
-        # Strip FASTA header marker but keep the rest (may contain sequence)
-        if line.startswith('>'):
-            line = line[1:]
-        
-        processed_lines.append(line)
-    
-    # Join all lines and remove whitespace
-    combined = ''.join(''.join(line.split()) for line in processed_lines)
-    
-    if not combined:
-        return ""
-    
-    # Find the longest contiguous run of valid DNA characters
-    # This handles both prefix AND suffix garbage efficiently in O(n)
-    best_start = 0
-    best_length = 0
-    current_start = None
-    
-    for i, c in enumerate(combined):
-        if c in valid_chars:
-            if current_start is None:
-                current_start = i
-        else:
-            if current_start is not None:
-                run_length = i - current_start
-                if run_length > best_length:
-                    best_start = current_start
-                    best_length = run_length
-                current_start = None
-    
-    # Check final run (if string ends with valid chars)
-    if current_start is not None:
-        run_length = len(combined) - current_start
-        if run_length > best_length:
-            best_start = current_start
-            best_length = run_length
-    
-    # Extract the best run if it meets minimum length
-    if best_length >= min_length:
-        cleaned = combined[best_start:best_start + best_length]
-        return cleaned.upper()
-    
-    # No valid run of sufficient length found
-    return ""
+from app.services.fasta_utils import clean_dna_sequence
 
 
 def get_field_value(observation_data: Dict, field_name: str) -> Optional[str]:
@@ -296,11 +229,70 @@ def build_base_params(query_params: Dict[str, List[str]]) -> Dict[str, Any]:
     base_params = {}
     
     # Copy relevant params from the URL, sanitizing as we go
+    # Comprehensive whitelist based on https://www.inaturalist.org/pages/search+urls
     allowed_params = {
-        'taxon_id', 'place_id', 'user_id', 'project_id',
-        'quality_grade', 'identified', 'captive',
-        'd1', 'd2', 'month', 'year',
-        # Do not automatically include field: params here, we handle them explicitly
+        # Taxon filters
+        'taxon_id', 'taxon_ids', 'taxon_name', 'exact_taxon_id',
+        'without_taxon_id', 'without_direct_taxon_id',
+        'ident_taxon_id', 'ident_taxon_id_exclusive',
+        'iconic_taxa', 'list_id',
+        
+        # Taxon status
+        'native', 'introduced', 'threatened',
+        
+        # Place/geographic filters
+        'place_id', 'not_in_place',
+        'nelat', 'nelng', 'swlat', 'swlng',  # Bounding box
+        'lat', 'lng', 'radius',  # Circle
+        'geo', 'mappable',
+        
+        # Accuracy and geoprivacy
+        'acc', 'acc_above', 'acc_below',
+        'geoprivacy', 'taxon_geoprivacy',
+        
+        # Date and time filters
+        'd1', 'd2', 'month', 'day', 'year', 'hour',
+        
+        # Observer filters
+        'user_id', 'not_user_id',
+        'user_after', 'user_before',
+        
+        # Identification filters
+        'identified', 'ident_user_id', 'without_ident_user_id',
+        'disagreements',
+        
+        # Project filters
+        'project_id', 'not_in_project',
+        'apply_project_rules_for', 'not_matching_project_rules_for',
+        'members_of_project',
+        
+        # Quality and verification
+        'quality_grade', 'captive', 'verifiable',
+        
+        # Media and license filters
+        'photos', 'sounds',
+        'photo_license', 'photo_licensed',
+        'sound_license', 'license', 'licensed',
+        
+        # Observation ID filters
+        'id', 'not_id',
+        
+        # Description/tag search
+        'q', 'search_on',
+        
+        # Annotation filters
+        'term_id', 'term_value_id',
+        'without_term_id', 'without_term_value_id',
+        
+        # Observation field filters
+        'without_field',
+        
+        # App source (read-only info)
+        'oauth_application_id',
+        
+        # NOTE: We intentionally EXCLUDE pagination/ordering params (per_page, page, 
+        # order, order_by) to prevent abuse - we control these ourselves.
+        # We also exclude 'reviewed' as it's user-session-specific.
     }
     
     # Also allow any field: prefixed params (preserve user intent if they added them)

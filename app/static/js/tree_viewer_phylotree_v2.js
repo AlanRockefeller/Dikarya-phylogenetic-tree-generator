@@ -741,26 +741,13 @@
 
         // --- INTERNAL HELPERS ---
 
-        _updateNodeStylesOnly(source = null) {
+        _updateNodeStylesOnly() {
             if (!this.tree) return;
             const svg = window.d3v7.select(this.container).select("svg");
             if (svg.empty()) return;
             const self = this;
 
-            const DEBUG_MODE = new URLSearchParams(window.location.search).has('debug');
-
-            if (DEBUG_MODE && source) {
-                console.log(`_updateNodeStylesOnly triggered by: ${source}`);
-            }
-
-            const DEBUG_MODE_FULL = DEBUG_MODE && source === 'click'; // Only full debug on click to avoid spam
-            let nodeCount = 0;
-            let styledCount = 0;
-            let sampleDomIds = [];
-            let shapeFoundCount = 0;
-
             svg.selectAll(".node").each(function (d) {
-                nodeCount++;
                 const el = window.d3v7.select(this);
 
                 // Try to find a styleable element (phylotree uses text for tip labels)
@@ -769,39 +756,12 @@
                 if (shape.empty()) shape = el.select("rect");
                 if (shape.empty()) shape = el.select("text"); // Add text element support
 
-                // Always collect sample IDs regardless of shape
                 const id = self._getNodeId(d);
-                if (DEBUG_MODE && sampleDomIds.length < 3 && id) sampleDomIds.push(id);
 
                 if (!shape.empty()) {
-                    shapeFoundCount++;
                     self._styleNode(shape, d);
-                    if (id && self.selectedIds.has(id)) styledCount++;
                 }
             });
-
-            if (DEBUG_MODE) {
-                console.log('_updateNodeStylesOnly: found', nodeCount, 'nodes,', shapeFoundCount, 'with shapes,', styledCount, 'selected');
-                console.log('Sample DOM IDs:', sampleDomIds);
-                console.log('Sample stored IDs:', [...self.selectedIds].slice(0, 3));
-                // Check if any of the sample DOM IDs are in selectedIds
-                if (sampleDomIds.length > 0) {
-                    console.log('Is first DOM ID in selectedIds?', self.selectedIds.has(sampleDomIds[0]));
-                }
-                // Show what the actual D3 datum structure looks like
-                svg.selectAll(".node").each(function (d, i) {
-                    if (i === 0) {
-                        console.log('First DOM node datum structure:', d);
-                        console.log('d.data:', d?.data);
-                        console.log('d.name:', d?.name);
-                        console.log('_getNodeId(d) returns:', self._getNodeId(d));
-                        // Show what child elements exist
-                        const children = Array.from(this.childNodes).map(c => c.nodeName);
-                        console.log('Child elements of .node:', children);
-                        console.log('.node innerHTML:', this.innerHTML.substring(0, 200));
-                    }
-                });
-            }
         }
 
         _styleNode(element, node) {
@@ -1162,8 +1122,6 @@
                     // Get D3 data
                     const d = window.d3v7.select(target).datum();
 
-                    if (DEBUG_MODE) console.log('Capture-phase click intercepted:', d);
-
                     const id = self._getNodeId(d);
                     if (id) {
                         if (self.selectedIds.has(id)) {
@@ -1171,7 +1129,7 @@
                         } else {
                             self.selectedIds.add(id);
                         }
-                        self._updateNodeStylesOnly('click');
+                        self._updateNodeStylesOnly();
                         self._updateStats();
                     }
                 }

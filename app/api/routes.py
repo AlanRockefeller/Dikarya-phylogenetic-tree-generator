@@ -9,7 +9,8 @@ import logging
 import re
 from datetime import datetime
 
-from app.services.security_utils import validate_job_id, validate_blast_query
+from app.services.security_utils import validate_job_id, validate_blast_query, validate_safe_file_path
+from app.services.access_control import check_job_access
 
 logger = logging.getLogger(__name__)
 
@@ -24,6 +25,46 @@ def _is_genbank_accession(text):
     pattern = r'^[A-Z]{1,2}_?\d{5,}(\.\d+)?$'
     return bool(re.match(pattern, text.strip(), re.IGNORECASE))
 
+
+def _split_fasta_header(header):
+    """Split FASTA header into ID (first token) and description."""
+    header = (header or "").strip()
+    if not header:
+        return "", ""
+    parts = header.split(None, 1)
+    seq_id = parts[0]
+    rest = parts[1] if len(parts) > 1 else ""
+    return seq_id, rest
+
+def _make_unique_id(base_id, used_ids):
+    """Make ID unique by appending suffix if needed."""
+    if base_id not in used_ids:
+        used_ids.add(base_id)
+        return base_id
+    # Start with simple _added suffix first if not present?
+    # User logic: _added{i} starting at 2?
+    # Or just _added, then _added2?
+    # Let's follow user example: {base_id}_added{i}
+    
+    # Check simple _added first?
+    candidate = f"{base_id}_added"
+    if candidate not in used_ids:
+        used_ids.add(candidate)
+        return candidate
+        
+    i = 2
+    MAX_SUFFIX = 10000  # Prevent infinite loops
+    while f"{base_id}_added{i}" in used_ids:
+        if i > MAX_SUFFIX:
+            # Fallback: use timestamp or random suffix
+            import time
+            new_id = f"{base_id}_added_{int(time.time()*1000) % 1000000}"
+            used_ids.add(new_id)
+            return new_id
+        i += 1
+    new_id = f"{base_id}_added{i}"
+    used_ids.add(new_id)
+    return new_id
 
 def _parse_fasta_sequences(text):
     """Parse FASTA text into list of {name, sequence} dicts.
@@ -75,7 +116,7 @@ def run_blast():
     
     is_valid_query, error_msg = validate_blast_query(query)
     if not is_valid_query:
-         return jsonify({"status": "error", "error": f"Invalid query: {error_msg}"}), 400
+        return jsonify({"status": "error", "error": f"Invalid query: {error_msg}"}), 400
     
     try:
         from app.services.blast_service import blast_from_sequence, blast_from_accessions
@@ -152,6 +193,7 @@ def fetch_mycomap():
     
     try:
         from app.services.mycomap_service import validate_mycomap_url, fetch_mycomap_fasta
+        from app.services.fasta_utils import clean_dna_sequence
         
         # Validate and extract blast_id
         blast_id = validate_mycomap_url(url)
@@ -176,6 +218,13 @@ def fetch_mycomap():
         # Parse FASTA into sequences
         sequences = _parse_fasta_sequences(result['fasta_content'])
         
+        # Apply cleaning to all sequences and filter out empty results
+        original_count = len(sequences)
+        for seq in sequences:
+            seq['sequence'] = clean_dna_sequence(seq['sequence'])
+        sequences = [s for s in sequences if s['sequence']]
+        dropped_count = original_count - len(sequences)
+        
         # Build success message
         parts = []
         if include_ncbi:
@@ -183,6 +232,10 @@ def fetch_mycomap():
         if include_local:
             parts.append(f"{result['local_count']} local")
         msg = f"Fetched {' + '.join(parts)} sequences from Mycomap"
+        
+        # Report dropped sequences due to cleaning
+        if dropped_count > 0:
+            msg += f" ({dropped_count} dropped due to invalid/short sequences)"
         
         # Include warnings if there were non-fatal errors
         if result['errors']:
@@ -317,31 +370,7 @@ def fetch_inaturalist():
         return jsonify({"status": "error", "error": str(e)}), 500
 
 
-def _check_job_access(job_id):
-    """
-    Check if current user can access the given job.
-    
-    Returns:
-        (db_job, error_response) - If error_response is not None, return it immediately.
-    """
-    if not validate_job_id(job_id):
-        return None, (jsonify({"status": "error", "error": "Invalid job ID format"}), 400)
 
-    db_job = Job.query.get(job_id)
-    job_dir = Config.JOB_DIR / job_id
-    
-    # Check if job exists
-    if not db_job and not job_dir.exists():
-        return None, (jsonify({"status": "error", "error": "Job not found"}), 404)
-    
-    # If job has an owner, verify the current user is that owner
-    if db_job and db_job.user_id is not None:
-        if not current_user.is_authenticated:
-            return None, (jsonify({"status": "error", "error": "Authentication required"}), 401)
-        if current_user.id != db_job.user_id:
-            return None, (jsonify({"status": "error", "error": "Access denied"}), 403)
-    
-    return db_job, None
 
 @bp.route('/job', methods=['POST'])
 def create_job():
@@ -402,9 +431,9 @@ def get_tree_state(job_id):
     if not validate_job_id(job_id):
         return jsonify({"status": "error", "error": "Invalid job ID format"}), 400
         
-    _, error_response = _check_job_access(job_id)
-    if error_response:
-        return error_response
+    _, error_msg, status_code = check_job_access(job_id)
+    if error_msg:
+        return jsonify({"status": "error", "error": error_msg}), status_code
 
     job_dir = Config.JOB_DIR / job_id
     if not job_dir.exists():
@@ -419,20 +448,26 @@ def get_tree_state(job_id):
 
 @bp.route('/job/<job_id>/tree/prune', methods=['POST'])
 def prune_tree(job_id):
-    if not validate_job_id(job_id):
-        return jsonify({"status": "error", "error": "Invalid job ID format"}), 400
+    _, error_msg, status_code = check_job_access(job_id)
+    if error_msg:
+        return jsonify({"status": "error", "error": error_msg}), status_code
 
     job_dir = Config.JOB_DIR / job_id
-    if not job_dir.exists():
-        return jsonify({"status": "error", "error": "Job not found"}), 404
         
-    data = request.get_json()
-    tip_name = data.get("tip_name")
+    data = request.get_json(silent=True) or {}
+    
+    # Support both single and multiple
+    tip_names = data.get("tip_names")
+    if not tip_names and data.get("tip_name"):
+        tip_names = [data.get("tip_name")]
+        
+    if not tip_names:
+        return jsonify({"status": "error", "error": "No tips specified"}), 400
     
     try:
-        from app.services.tree_edit_service import load_tree_state, prune_tip, save_tree_state
+        from app.services.tree_edit_service import load_tree_state, prune_taxa, save_tree_state
         state = load_tree_state(job_dir)
-        state = prune_tip(state, tip_name)
+        state = prune_taxa(job_dir, state, tip_names)
         save_tree_state(job_dir, state)
         return jsonify(state)
     except Exception as e:
@@ -440,14 +475,13 @@ def prune_tree(job_id):
 
 @bp.route('/job/<job_id>/tree/rename', methods=['POST'])
 def rename_tree_tip(job_id):
-    if not validate_job_id(job_id):
-        return jsonify({"status": "error", "error": "Invalid job ID format"}), 400
+    _, error_msg, status_code = check_job_access(job_id)
+    if error_msg:
+        return jsonify({"status": "error", "error": error_msg}), status_code
 
     job_dir = Config.JOB_DIR / job_id
-    if not job_dir.exists():
-        return jsonify({"status": "error", "error": "Job not found"}), 404
         
-    data = request.get_json()
+    data = request.get_json(silent=True) or {}
     old_name = data.get("old_name")
     new_name = data.get("new_name")
     
@@ -462,12 +496,11 @@ def rename_tree_tip(job_id):
 
 @bp.route('/job/<job_id>/tree/reroot', methods=['POST'])
 def reroot_tree_endpoint(job_id):
-    if not validate_job_id(job_id):
-        return jsonify({"status": "error", "error": "Invalid job ID format"}), 400
+    _, error_msg, status_code = check_job_access(job_id)
+    if error_msg:
+        return jsonify({"status": "error", "error": error_msg}), status_code
 
     job_dir = Config.JOB_DIR / job_id
-    if not job_dir.exists():
-        return jsonify({"status": "error", "error": "Job not found"}), 404
         
     data = request.get_json(silent=True) or {}
     target = data.get("root_target") or data.get("target") or data.get("node_name")
@@ -488,12 +521,11 @@ def reroot_tree_endpoint(job_id):
 
 @bp.route('/job/<job_id>/tree/midpoint_root', methods=['POST'])
 def midpoint_root_endpoint(job_id):
-    if not validate_job_id(job_id):
-        return jsonify({"status": "error", "error": "Invalid job ID format"}), 400
+    _, error_msg, status_code = check_job_access(job_id)
+    if error_msg:
+        return jsonify({"status": "error", "error": error_msg}), status_code
 
     job_dir = Config.JOB_DIR / job_id
-    if not job_dir.exists():
-        return jsonify({"status": "error", "error": "Job not found"}), 404
         
     try:
         from app.services.tree_edit_service import load_tree_state, midpoint_root, save_tree_state
@@ -509,12 +541,11 @@ def midpoint_root_endpoint(job_id):
 @bp.route('/job/<job_id>/tree/midpoint_root_toggle', methods=['POST'])
 def midpoint_root_toggle_endpoint(job_id):
     """Toggle midpoint rooting on/off."""
-    if not validate_job_id(job_id):
-        return jsonify({"status": "error", "error": "Invalid job ID format"}), 400
+    _, error_msg, status_code = check_job_access(job_id)
+    if error_msg:
+        return jsonify({"status": "error", "error": error_msg}), status_code
 
     job_dir = Config.JOB_DIR / job_id
-    if not job_dir.exists():
-        return jsonify({"status": "error", "error": "Job not found"}), 404
         
     try:
         from app.services.tree_edit_service import (
@@ -539,12 +570,11 @@ def midpoint_root_toggle_endpoint(job_id):
 
 @bp.route('/job/<job_id>/tree/recompute', methods=['POST'])
 def recompute_tree_job(job_id):
-    if not validate_job_id(job_id):
-        return jsonify({"status": "error", "error": "Invalid job ID format"}), 400
+    _, error_msg, status_code = check_job_access(job_id)
+    if error_msg:
+        return jsonify({"status": "error", "error": error_msg}), status_code
 
     job_dir = Config.JOB_DIR / job_id
-    if not job_dir.exists():
-        return jsonify({"status": "error", "error": "Job not found"}), 404
         
     try:
         import json
@@ -602,12 +632,11 @@ def recompute_tree_job(job_id):
 
 @bp.route('/job/<job_id>/download/tree/newick', methods=['GET'])
 def download_newick(job_id):
-    if not validate_job_id(job_id):
-        return jsonify({"status": "error", "error": "Invalid job ID format"}), 400
+    _, error_msg, status_code = check_job_access(job_id)
+    if error_msg:
+        return jsonify({"status": "error", "error": error_msg}), status_code
 
     job_dir = Config.JOB_DIR / job_id
-    if not job_dir.exists():
-        return jsonify({"status": "error", "error": "Job not found"}), 404
         
     # Prefer pruned tree if available, else initialize from original
     pruned_path = job_dir / "tree" / "tree_pruned.newick"
@@ -622,8 +651,8 @@ def download_newick(job_id):
             pruned_path = job_dir / "tree" / "tree_original.newick"
     
     path = pruned_path
-    if not path.exists():
-        return jsonify({"status": "error", "error": "Tree file not found"}), 404
+    if not validate_safe_file_path(path, job_dir):
+        return jsonify({"status": "error", "error": "Tree file not found or invalid"}), 404
         
     response = send_file(path, as_attachment=True, download_name="tree.newick")
     response.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
@@ -633,34 +662,32 @@ def download_newick(job_id):
 
 @bp.route('/job/<job_id>/download/tree/newick/original', methods=['GET'])
 def download_newick_original(job_id):
-    if not validate_job_id(job_id):
-        return jsonify({"status": "error", "error": "Invalid job ID format"}), 400
+    _, error_msg, status_code = check_job_access(job_id)
+    if error_msg:
+        return jsonify({"status": "error", "error": error_msg}), status_code
 
     job_dir = Config.JOB_DIR / job_id
-    if not job_dir.exists():
-        return jsonify({"status": "error", "error": "Job not found"}), 404
         
     path = job_dir / "tree" / "tree_original.newick"
     logger.info(f"Serving original newick from: {path}, Exists: {path.exists()}")
-    if not path.exists():
-        logger.error(f"File not found: {path} (BASE_DIR={Config.BASE_DIR}, JOB_DIR={Config.JOB_DIR})")
-        return jsonify({"status": "error", "error": "Tree file not found"}), 404
+    if not validate_safe_file_path(path, job_dir):
+        logger.error(f"File not found or unsafe: {path}")
+        return jsonify({"status": "error", "error": "Tree file not found or invalid"}), 404
         
     return send_file(path, as_attachment=True, download_name="tree_original.newick")
 
 @bp.route('/job/<job_id>/download/tree/newick/pruned', methods=['GET'])
 def download_newick_pruned(job_id):
-    if not validate_job_id(job_id):
-        return jsonify({"status": "error", "error": "Invalid job ID format"}), 400
+    _, error_msg, status_code = check_job_access(job_id)
+    if error_msg:
+        return jsonify({"status": "error", "error": error_msg}), status_code
 
     job_dir = Config.JOB_DIR / job_id
-    if not job_dir.exists():
-        return jsonify({"status": "error", "error": "Job not found"}), 404
         
     path = job_dir / "tree" / "tree_pruned.newick"
     
-    if not path.exists():
-         return jsonify({"status": "error", "error": "Tree file not found"}), 404
+    if not validate_safe_file_path(path, job_dir):
+         return jsonify({"status": "error", "error": "Tree file not found or invalid"}), 404
 
     response = send_file(path, as_attachment=True, download_name="tree_pruned.newick")
     response.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
@@ -668,19 +695,18 @@ def download_newick_pruned(job_id):
 
 @bp.route('/job/<job_id>/download/tree/nexus', methods=['GET'])
 def download_nexus(job_id):
-    if not validate_job_id(job_id):
-        return jsonify({"status": "error", "error": "Invalid job ID format"}), 400
+    _, error_msg, status_code = check_job_access(job_id)
+    if error_msg:
+        return jsonify({"status": "error", "error": error_msg}), status_code
 
     job_dir = Config.JOB_DIR / job_id
-    if not job_dir.exists():
-        return jsonify({"status": "error", "error": "Job not found"}), 404
         
     pruned_path = job_dir / "tree" / "tree_pruned.nexus"
     original_path = job_dir / "tree" / "tree_original.nexus"
     
     path = pruned_path if pruned_path.exists() else original_path
-    if not path.exists():
-        return jsonify({"status": "error", "error": "Tree file not found"}), 404
+    if not validate_safe_file_path(path, job_dir):
+        return jsonify({"status": "error", "error": "Tree file not found or invalid"}), 404
         
     response = send_file(path, as_attachment=True, download_name="tree.nexus")
     response.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
@@ -689,28 +715,28 @@ def download_nexus(job_id):
 @bp.route('/job/<job_id>/download/fasta/original', methods=['GET'])
 def download_fasta_original(job_id):
     # Check authorization
-    _, error_response = _check_job_access(job_id)
-    if error_response:
-        return error_response
+    _, error_msg, status_code = check_job_access(job_id)
+    if error_msg:
+        return jsonify({"status": "error", "error": error_msg}), status_code
     
     job_dir = Config.JOB_DIR / job_id
     path = job_dir / "input" / "input_raw.fasta"
-    if not path.exists():
-        return jsonify({"status": "error", "error": "FASTA file not found"}), 404
+    if not validate_safe_file_path(path, job_dir):
+        return jsonify({"status": "error", "error": "FASTA file not found or invalid"}), 404
         
     return send_file(path, as_attachment=True, download_name="sequences_original.fasta")
 
 @bp.route('/job/<job_id>/download/fasta/pruned', methods=['GET'])
 def download_fasta_pruned(job_id):
     # Check authorization
-    _, error_response = _check_job_access(job_id)
-    if error_response:
-        return error_response
+    _, error_msg, status_code = check_job_access(job_id)
+    if error_msg:
+        return jsonify({"status": "error", "error": error_msg}), status_code
     
     job_dir = Config.JOB_DIR / job_id
     path = job_dir / "alignment" / "alignment_pruned.fasta"
-    if not path.exists():
-        return jsonify({"status": "error", "error": "Pruned FASTA not found"}), 404
+    if not validate_safe_file_path(path, job_dir):
+        return jsonify({"status": "error", "error": "Pruned FASTA not found or invalid"}), 404
         
     return send_file(path, as_attachment=True, download_name="sequences_pruned.fasta")
 
@@ -718,9 +744,9 @@ def download_fasta_pruned(job_id):
 def download_fasta_aligned(job_id):
     """Download the aligned (but not trimmed) FASTA file."""
     # Check authorization
-    _, error_response = _check_job_access(job_id)
-    if error_response:
-        return error_response
+    _, error_msg, status_code = check_job_access(job_id)
+    if error_msg:
+        return jsonify({"status": "error", "error": error_msg}), status_code
     
     job_dir = Config.JOB_DIR / job_id
     
@@ -729,8 +755,8 @@ def download_fasta_aligned(job_id):
     if not path.exists():
         path = job_dir / "alignment" / "aligned.fasta"
     
-    if not path.exists():
-        return jsonify({"status": "error", "error": "Aligned FASTA not found"}), 404
+    if not validate_safe_file_path(path, job_dir):
+        return jsonify({"status": "error", "error": "Aligned FASTA not found or invalid"}), 404
         
     return send_file(path, as_attachment=True, download_name="sequences_aligned.fasta")
 
@@ -738,15 +764,15 @@ def download_fasta_aligned(job_id):
 def download_fasta_trimmed(job_id):
     """Download the trimmed FASTA file (only available if trimming was performed)."""
     # Check authorization
-    _, error_response = _check_job_access(job_id)
-    if error_response:
-        return error_response
+    _, error_msg, status_code = check_job_access(job_id)
+    if error_msg:
+        return jsonify({"status": "error", "error": error_msg}), status_code
     
     job_dir = Config.JOB_DIR / job_id
     path = job_dir / "alignment" / "alignment_trimmed.fasta"
     
-    if not path.exists():
-        return jsonify({"status": "error", "error": "Trimmed FASTA not found (trimming may not have been performed)"}), 404
+    if not validate_safe_file_path(path, job_dir):
+        return jsonify({"status": "error", "error": "Trimmed FASTA not found or invalid"}), 404
         
     return send_file(path, as_attachment=True, download_name="sequences_trimmed.fasta")
 
@@ -913,9 +939,9 @@ def job_events_stream(job_id):
     if not validate_job_id(job_id):
         return jsonify({"status": "error", "error": "Invalid job ID format"}), 400
 
-    db_job, error_response = _check_job_access(job_id)
-    if error_response:
-        return error_response
+    db_job, error_msg, status_code = check_job_access(job_id)
+    if error_msg:
+        return jsonify({"status": "error", "error": error_msg}), status_code
     
     job_dir = Config.JOB_DIR / job_id
     
@@ -1024,9 +1050,9 @@ def download_log(job_id, log_name):
         return jsonify({"status": "error", "error": "Invalid job ID format"}), 400
 
     # Check authorization
-    _, error_response = _check_job_access(job_id)
-    if error_response:
-        return error_response
+    _, error_msg, status_code = check_job_access(job_id)
+    if error_msg:
+        return jsonify({"status": "error", "error": error_msg}), status_code
     
     job_dir = Config.JOB_DIR / job_id
     
@@ -1045,8 +1071,8 @@ def download_log(job_id, log_name):
     
     log_path = job_dir / "logs" / log_files[log_name]
     
-    if not log_path.exists():
-        return jsonify({"status": "error", "error": "Log file not found"}), 404
+    if not validate_safe_file_path(log_path, job_dir / "logs"):
+        return jsonify({"status": "error", "error": "Log file not found or invalid"}), 404
     
     return send_file(
         log_path,
@@ -1067,8 +1093,10 @@ def log_client_error():
     msg = (data.get("message") or "Unknown client error")[:2000]
     stack = (data.get("stack") or "")[:20000]
     context = (data.get("context") or "")[:1000]
-    context = (data.get("context") or "")[:1000]
-    # Sanitize URL to prevent log injection
+    # Sanitize inputs to prevent log injection
+    msg = msg.replace('\n', ' ').replace('\r', ' ')
+    stack = stack.replace('\n', ' ').replace('\r', ' ')
+    context = context.replace('\n', ' ').replace('\r', ' ')
     url = (data.get("url") or "")[:500].replace('\n', '').replace('\r', '')
     
     # Request metadata for debugging
@@ -1099,19 +1127,24 @@ def add_sequences_to_job(job_id):
     Response: { "status": "success", "count": int, "message": "..." }
     """
     # Check authorization
-    _, error_response = _check_job_access(job_id)
-    if error_response:
-        return error_response
+    _, error_msg, status_code = check_job_access(job_id)
+    if error_msg:
+        return jsonify({"status": "error", "error": error_msg}), status_code
     
     job_dir = Config.JOB_DIR / job_id
     if not job_dir.exists():
         return jsonify({"status": "error", "error": "Job not found"}), 404
         
-    data = request.get_json() or {}
+    data = request.get_json(silent=True) or {}
     input_text = data.get("input", "").strip()
     
     if not input_text:
         return jsonify({"status": "error", "error": "No input provided"}), 400
+
+    # 1. Raw Input Limit (e.g. 200KB characters)
+    MAX_INPUT_CHARS = 200_000
+    if len(input_text) > MAX_INPUT_CHARS:
+        return jsonify({"status": "error", "error": f"Input too large (max {MAX_INPUT_CHARS} chars)"}), 400
         
     try:
         from app.services.blast_service import fetch_fasta_for_accessions
@@ -1126,9 +1159,13 @@ def add_sequences_to_job(job_id):
             is_accession_input = True
             
             # Split by commas, spaces, newlines
-            import re
             tokens = re.split(r'[,\s]+', input_text)
             accessions = [t.strip() for t in tokens if t.strip()]
+            
+            # Security: Limit number of accessions to prevent abuse
+            MAX_ACCESSIONS = 200
+            if len(accessions) > MAX_ACCESSIONS:
+                 return jsonify({"status": "error", "error": f"Too many accessions (max {MAX_ACCESSIONS})"}), 400
             
             if accessions:
                 logger.info(f"Adding sequences from accessions: {accessions}")
@@ -1138,39 +1175,72 @@ def add_sequences_to_job(job_id):
             # Assume FASTA
             sequences_to_add = _parse_fasta_sequences(input_text)
             
+        # Filter out sequences with empty sequence data
+        sequences_to_add = [s for s in sequences_to_add if s.get('sequence', '').strip()]
+        
         if not sequences_to_add:
-             return jsonify({"status": "error", "error": "No valid sequences found in input"}), 400
+            return jsonify({"status": "error", "error": "No valid sequences found in input"}), 400
+
+        # 2. Sequence Count Limit
+        MAX_SEQUENCES_TO_ADD = 500
+        if len(sequences_to_add) > MAX_SEQUENCES_TO_ADD:
+            return jsonify({"status": "error", "error": f"Too many sequences (max {MAX_SEQUENCES_TO_ADD})"}), 400
+            
+        # 3. Total Base Pair Limit
+        MAX_TOTAL_BP_TO_ADD = 2_000_000
+        total_bp = sum(len(s['sequence']) for s in sequences_to_add)
+        if total_bp > MAX_TOTAL_BP_TO_ADD:
+             return jsonify({"status": "error", "error": f"Total sequence length too large (max {MAX_TOTAL_BP_TO_ADD} bp)"}), 400
              
         # Append to input_raw.fasta
         input_path = job_dir / "input" / "input_raw.fasta"
         
-        # Read existing to check for duplicates (by name)
-        existing_names = set()
+        # Read existing IDs to check for duplicates
+        existing_ids = set()
         if input_path.exists():
-            existing_seqs = _parse_fasta_sequences(input_path.read_text())
-            existing_names = {s['name'] for s in existing_seqs}
+            try:
+                existing_seqs = _parse_fasta_sequences(input_path.read_text())
+                for s in existing_seqs:
+                    sid, _ = _split_fasta_header(s['name'])
+                    if sid:
+                        existing_ids.add(sid)
+            except Exception as e:
+                logger.warning(f"Failed to parse existing FASTA for deduplication: {e}")
+                pass # Continue anyway - will allow duplicates but won't crash
             
         added_count = 0
         with open(input_path, "a") as f:
             # Ensure newline at end of file before appending
             if input_path.stat().st_size > 0:
-                 f.write("\n")
+                f.write("\n")
                  
             for seq in sequences_to_add:
-                # Limit name length if needed, but for now allow typical
-                # Basic duplicate check - logic can be refined
-                if seq['name'] not in existing_names:
-                    f.write(f">{seq['name']}\n{seq['sequence']}\n")
-                    added_count += 1
-                else:
-                    # Optional: Rename duplicate? For now, skip or append as is?
-                    # Let's append with suffix to allow user to see it
-                    # But actually keying is by name, so maybe skip.
-                    # User asked to "Add", so let's add. But strictly unique IDs needed for tree?
-                    # Unique IDs are enforced by tree service during recompute/init.
-                    # Best to append.
-                    f.write(f">{seq['name']}_added\n{seq['sequence']}\n")
-                    added_count += 1
+                # Sanitize header: remove control chars including \0
+                raw_header = seq.get('name', '')
+                # Keep only printable chars and tab
+                sanitized_header = "".join(ch for ch in raw_header if ord(ch) >= 32 or ch == '\t')
+                
+                # Split header to dedupe by ID properly
+                seq_id, rest = _split_fasta_header(sanitized_header)
+                
+                # Cap header lengths to prevent abuse (e.g., 200KB pasted headers)
+                MAX_SEQ_ID_LEN = 100
+                MAX_DESC_LEN = 300
+                seq_id = seq_id[:MAX_SEQ_ID_LEN]
+                rest = rest[:MAX_DESC_LEN]
+                
+                if not seq_id:
+                    # Generate a unique ID if header is missing
+                    seq_id = f"Sequence_{added_count + 1}"
+                    
+                # Make unique ID
+                new_id = _make_unique_id(seq_id, existing_ids)
+                
+                # Reconstruct header
+                new_header = f"{new_id} {rest}".strip()
+                
+                f.write(f">{new_header}\n{seq['sequence']}\n")
+                added_count += 1
                     
         return jsonify({
             "status": "success", 

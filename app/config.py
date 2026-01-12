@@ -6,6 +6,7 @@ load_dotenv()
 
 class Config:
     SECRET_KEY = os.environ.get('SECRET_KEY') or 'dev-key-please-change'
+    WTF_CSRF_TIME_LIMIT = None  # No expiration; tokens remain valid for session lifetime
     
     # External Tools
     RAXML_BINARY = os.environ.get('RAXML_BINARY', 'raxml-ng')

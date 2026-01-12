@@ -384,6 +384,12 @@
                     <span class="step-label">Input</span>
                 </div>
 
+                <!-- Step: Orient -->
+                <div id="step-orient" class="flex flex-col items-center flex-1">
+                    <div class="step-indicator bg-white dark:bg-journal-green">○</div>
+                    <span class="step-label">Orient</span>
+                </div>
+
                 <!-- Step: BLAST (Optional) -->
                 <div id="step-blast" class="flex flex-col items-center flex-1" style="display: none;">
                     <div class="step-indicator bg-white dark:bg-journal-green">○</div>
@@ -659,5 +665,5 @@
 {% endblock %}
 
 {% block scripts %}
-<script src="{{ url_for('static', filename='js/job_status.js') }}?v=9"></script>
+<script src="{{ url_for('static', filename='js/job_status.js') }}?v=11"></script>
 {% endblock %}

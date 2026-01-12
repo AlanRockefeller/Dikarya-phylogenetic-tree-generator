@@ -35,6 +35,7 @@ class JobStatusClient {
         // Step timeline elements
         this.stepElements = {
             input: document.getElementById('step-input'),
+            orient: document.getElementById('step-orient'),
             blast: document.getElementById('step-blast'),
             align: document.getElementById('step-align'),
             trim: document.getElementById('step-trim'),
@@ -180,7 +181,7 @@ class JobStatusClient {
 
         // 3. Backfill step events
         // We iterate through a logical order of steps to reconstruct the feed
-        const stepOrder = ['input', 'blast', 'align', 'trim', 'tree', 'post'];
+        const stepOrder = ['input', 'orient', 'blast', 'align', 'trim', 'tree', 'post'];
         stepOrder.forEach(stepKey => {
             const step = job.meta.steps?.[stepKey];
             if (!step) return;
@@ -188,7 +189,9 @@ class JobStatusClient {
             // Skipping 'skipped' steps in the feed to avoid clutter, or maybe show them as skipped?
             // Let's show done/running/failed
             if (step.state === 'done') {
-                this.appendOverview({ message: `${step.label || stepKey} complete`, icon: 'done' });
+                // Use step.detail if available (e.g., "2 sequence(s) reverse complemented")
+                const doneMessage = step.detail || `${step.label || stepKey} complete`;
+                this.appendOverview({ message: doneMessage, icon: 'done' });
             } else if (step.state === 'running') {
                 this.appendOverview({ message: `Starting ${step.label || stepKey}...`, icon: 'running' });
             } else if (step.state === 'failed') {

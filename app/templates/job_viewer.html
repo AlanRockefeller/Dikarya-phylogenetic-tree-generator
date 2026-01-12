@@ -17,8 +17,32 @@
             <h2 class="text-2xl font-bold text-journal-dark dark:text-gray-100 flex items-center">
                 <i class="fas fa-tree text-journal-gold mr-3"></i>Tree Viewer
             </h2>
-            <p class="text-gray-600 dark:text-gray-300 mt-1 font-mono text-sm" title="{{ job_id }}">Job: {{ job_id[:16]
-                }}...</p>
+            {% set align_raw = job_details.get('alignment_method', 'mafft') %}
+            {% set tree_raw = job_details.get('tree_method', 'nj') %}
+            {% set trim_raw = job_details.get('trimming_method', 'none') %}
+
+            {% set align = align_raw|upper %}
+            {% set tree = tree_raw|upper %}
+
+            {% set is_quick_defaults = (tree_raw == 'nj' and align_raw == 'mafft') %}
+
+            {% if trim_raw == 'none' or not trim_raw %}
+            {% if is_quick_defaults %}
+            {% set trim_display = '' %}
+            {% else %}
+            {% set trim_display = 'No Trimming' %}
+            {% endif %}
+            {% else %}
+            {% set trim_display = 'Trimming: ' + trim_raw|upper %}
+            {% endif %}
+
+            <p class="text-gray-600 dark:text-gray-300 mt-1 font-mono text-sm" title="{{ job_id }}">
+                Job: {{ job_id[:16] }}... <span class="mx-2 opacity-50">|</span>
+                {{ align }} <i class="fas fa-arrow-right mx-1 text-xs opacity-50"></i> {{ tree }}
+                {% if trim_display %}
+                <span class="mx-2 opacity-50">|</span> {{ trim_display }}
+                {% endif %}
+            </p>
         </div>
     </div>
 </div>
@@ -277,11 +301,11 @@
                 id="btn-recompute">
                 <i class="fa fa-sync"></i> Recompute
             </button>
-            <button type="button"
+            <a href="/tree?edit_job_id={{ job_id }}"
                 class="px-4 py-2 text-sm font-semibold rounded-lg bg-green-500 hover:bg-green-600 text-white transition-colors shadow-sm flex items-center gap-2"
-                id="btn-add-sequences">
+                id="btn-add-sequences-link">
                 <i class="fa fa-plus-circle"></i> Add Seq
-            </button>
+            </a>
             <button type="button"
                 class="px-4 py-2 text-sm font-semibold rounded-lg bg-yellow-500 hover:bg-yellow-600 text-white transition-colors shadow-sm flex items-center gap-2"
                 id="btn-prune">
@@ -357,7 +381,74 @@
     </div>
 </div>
 
-{% include "partials/add_sequences_modal.html" %}
+<!-- Job Details Section -->
+<div class="bg-white dark:bg-journal-green rounded-xl shadow-lg p-6 mt-6 mb-6 transition-colors">
+    <h3 class="text-lg font-bold text-journal-dark dark:text-gray-100 mb-4 flex items-center gap-2">
+        <i class="fas fa-info-circle text-journal-gold"></i> Generation Details
+    </h3>
+
+    <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6 text-sm text-gray-700 dark:text-gray-300">
+        <!-- Column 1: Core Methods -->
+        <div>
+            <h4 class="font-semibold text-journal-gold mb-2 uppercase text-xs tracking-wider">Methods</h4>
+            <div class="space-y-1">
+                <p><span class="opacity-70 w-24 inline-block">Alignment:</span> <span class="font-medium">{{
+                        job_details.get('alignment_method', 'Unknown')|upper }}</span></p>
+                <p><span class="opacity-70 w-24 inline-block">Trimming:</span> <span class="font-medium">{{
+                        job_details.get('trimming_method', 'None')|title }}</span></p>
+                <p><span class="opacity-70 w-24 inline-block">Tree Builder:</span> <span class="font-medium">{{
+                        job_details.get('tree_method', 'Unknown')|upper }}</span></p>
+            </div>
+        </div>
+
+        <!-- Column 2: Parameters -->
+        <div>
+            <h4 class="font-semibold text-journal-gold mb-2 uppercase text-xs tracking-wider">Parameters</h4>
+            <div class="space-y-1">
+                {% if job_details.get('tree_model') %}
+                <p><span class="opacity-70 w-32 inline-block">Substitution Model:</span> <span class="font-medium">{{
+                        job_details.get('tree_model') }}</span></p>
+                {% endif %}
+                {% if job_details.get('bootstrap') %}
+                <p><span class="opacity-70 w-32 inline-block">Bootstraps:</span> <span class="font-medium">{{
+                        job_details.get('bootstrap') }}</span></p>
+                {% endif %}
+                {% if job_details.get('mcmc_generations') %}
+                <p><span class="opacity-70 w-32 inline-block">MCMC Generations:</span> <span class="font-medium">{{
+                        job_details.get('mcmc_generations') }}</span></p>
+                {% endif %}
+            </div>
+        </div>
+
+        <!-- Column 3: Advanced / Extra -->
+        <div>
+            <h4 class="font-semibold text-journal-gold mb-2 uppercase text-xs tracking-wider">Configuration</h4>
+            <div class="space-y-1">
+                {% if job_details.get('alignment_options') %}
+                <p><span class="opacity-70">Alignment Options:</span> <span class="font-mono text-xs">{{
+                        job_details.get('alignment_options') }}</span></p>
+                {% endif %}
+
+                {% for key, value in job_details.items() %}
+                {% if key not in ['alignment_method', 'tree_method', 'trimming_method', 'tree_model', 'bootstrap',
+                'mcmc_generations', 'sequences', 'accessions', 'sequence', 'notes', 'alignment_options', 'input_type']
+                and value %}
+                {% if key == 'blast_mode' %}
+                <p><span class="opacity-70 w-24 inline-block">BLAST:</span> {{ value|upper }}</p>
+                {% endif %}
+                {% endif %}
+                {% endfor %}
+            </div>
+        </div>
+    </div>
+
+    <div
+        class="mt-6 pt-4 border-t border-gray-200 dark:border-gray-700 flex justify-between items-center text-xs text-gray-500 dark:text-gray-400">
+        <span class="font-mono">Job ID: {{ job_id }}</span>
+        <span>© 2026 Dikarya Project. CC BY 4.0.</span>
+    </div>
+</div>
+
 {% endblock %}
 
 {% block scripts %}
@@ -375,7 +466,7 @@
 
 <script src="{{ url_for('static', filename='js/phylotree.js') }}"></script>
 
-<script src="{{ url_for('static', filename='js/tree_viewer_phylotree_v2.js') }}?v=23"></script>
+<script src="{{ url_for('static', filename='js/tree_viewer_phylotree_v2.js') }}?v=24"></script>
 
 <script src="{{ url_for('static', filename='js/tree_viewer_api.js') }}"></script>
 

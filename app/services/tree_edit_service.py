@@ -70,37 +70,117 @@ def save_tree_state(job_dir: Path, tree_json: Dict) -> None:
     with open(state_path, "w") as f:
         json.dump(tree_json, f, indent=2)
 
-def prune_tip(tree_json: Dict, tip_name: str) -> Dict:
+def prune_taxa(job_dir: Path, tree_json: Dict, taxa_names: List[str]) -> Dict:
     """
-    Remove a tip (or subtree if internal node selected).
-    Return modified tree_json.
+    Remove one or more tips (or subtrees if internal nodes selected).
+    Physically updates tree_pruned.newick and returns modified tree_json.
     """
-    # We mark it as pruned in the list, and also flag the node in the structure
-    if "pruned_taxa" not in tree_json:
-        tree_json["pruned_taxa"] = []
-        
-    if tip_name not in tree_json["pruned_taxa"]:
-        tree_json["pruned_taxa"].append(tip_name)
-        
-    # Helper to traverse and mark
-    def mark_pruned(node):
-        if node.get("name") == tip_name or node.get("original_name") == tip_name:
-            node["pruned"] = True
-            return True
-        
-        if "children" in node:
-            for child in node["children"]:
-                if mark_pruned(child):
-                    # If a child is pruned, do we prune the parent? 
-                    # Usually no, unless all children are pruned.
-                    # For now, just mark the specific target.
-                    pass
-        return False
+    if not taxa_names:
+        return tree_json
 
-    if "tree_structure" in tree_json:
-        mark_pruned(tree_json["tree_structure"])
+    if not HAS_BIOPYTHON:
+        logger.error("BioPython not installed; cannot prune tree")
+        raise RuntimeError("BioPython not installed; cannot prune tree")
+
+    # Physical Pruning logic
+    # Determine input path
+    pruned_newick = job_dir / "tree" / "tree_pruned.newick"
+    original_newick = job_dir / "tree" / "tree_original.newick"
+    
+    input_path = pruned_newick if pruned_newick.exists() else original_newick
+    if not input_path.exists():
+        raise FileNotFoundError("No tree file found to prune")
+
+    try:
+        tree = Phylo.read(str(input_path), "newick")
         
-    return tree_json
+        # We need to prune multiple nodes. 
+        targets = set(taxa_names)
+        
+        to_prune = []
+        for clade in tree.find_clades():
+            if clade.name in targets:
+                to_prune.append(clade)
+                
+        if not to_prune:
+             # Gather some available names for debugging
+             available_tips = [t.name for t in tree.get_terminals() if t.name][:5]
+             available_internal = [n.name for n in tree.get_nonterminals() if n.name][:5]
+             msg = f"Targets {list(targets)[:3]}... not found in tree. " \
+                   f"Sample tips: {available_tips}. Sample nodes: {available_internal}."
+             logger.warning(msg)
+             # Raise error to inform user in UI instead of silent failure
+             raise ValueError(msg)
+        
+        # Only update metadata AFTER confirming targets exist in tree
+        if "pruned_taxa" not in tree_json:
+            tree_json["pruned_taxa"] = []
+        
+        for name in taxa_names:
+            if name not in tree_json["pruned_taxa"]:
+                tree_json["pruned_taxa"].append(name)
+             
+        # Map parents for manual removal
+        parents = {c: p for p in tree.find_clades() for c in p.clades}
+        
+        
+        # Iterative Pruning with Cleanup
+        # 1. Start with explicit targets
+        queue = to_prune[:]
+        processed = set()
+        
+        while queue:
+            current = queue.pop(0)
+            if current in processed:
+                continue
+            processed.add(current)
+            
+            parent = parents.get(current)
+            if not parent:
+                # Root - cannot prune? Or if distinct root node, maybe?
+                # Usually we don't prune root unless tree is empty
+                continue
+                
+            # Remove from parent
+            if current in parent.clades:
+                parent.clades.remove(current)
+                
+            # Check status of parent
+            # If parent now has 0 children, it has become a tip.
+            # If parent was an original internal node (had children initially),
+            # it is now an "artifact" tip. We should remove it too.
+            # Exception: If parent is the Root, we might leave it or empty the tree.
+            if len(parent.clades) == 0:
+                 # It's empty. Is it the root?
+                 if parent == tree.root:
+                     # Attempt to leave empty root or handle gracefully
+                     pass
+                 else:
+                     # Recursively prune this parent
+                     queue.append(parent)
+            
+        # Post-pass: Collapse unifurcations (single-child internal nodes)
+        # After pruning, internal nodes can end up with exactly one child,
+        # creating visually odd "pass-through" nodes. We splice them out.
+        _collapse_unifurcations(tree)
+
+        # Save
+        valid_path = job_dir / "tree"
+        valid_path.mkdir(parents=True, exist_ok=True)
+        Phylo.write(tree, str(valid_path / "tree_pruned.newick"), "newick")
+        
+        # Update JSON structure to match
+        new_structure = _clade_to_json(tree.root)
+        tree_json["tree_structure"] = new_structure
+        
+        renames = tree_json.get("renames", {})
+        apply_state_to_structure(new_structure, renames, set()) 
+        
+        return tree_json
+        
+    except Exception as e:
+        logger.error(f"Prune failed: {e}")
+        raise
 
 def rename_tip(tree_json: Dict, old_name: str, new_name: str) -> Dict:
     """
@@ -456,6 +536,76 @@ def _clade_to_json(clade):
     if clade.clades:
         node["children"] = [_clade_to_json(c) for c in clade.clades]
     return node
+
+
+def _collapse_unifurcations(tree) -> None:
+    """
+    Collapse internal nodes that have exactly one child (unifurcations).
+    
+    After pruning, you can end up with internal nodes that only have one child,
+    which is structurally redundant and looks odd in visualizations.
+    This function splices out such nodes by promoting the child to replace
+    the single-child parent.
+    
+    Branch lengths are summed when collapsing: if parent has length 0.1 and
+    child has length 0.2, the surviving child gets length 0.3.
+    
+    Modifies tree in-place.
+    """
+    # Handle root unifurcation first
+    # If root has exactly one child, promote that child to be the new root
+    while tree.root.clades and len(tree.root.clades) == 1:
+        only_child = tree.root.clades[0]
+        # Sum branch lengths (root typically has no length, but be safe)
+        if tree.root.branch_length and only_child.branch_length:
+            only_child.branch_length += tree.root.branch_length
+        elif tree.root.branch_length:
+            only_child.branch_length = tree.root.branch_length
+        # Promote child to root
+        tree.root = only_child
+        # Continue loop in case the new root is also a unifurcation
+    
+    # Build parent map for non-root collapses
+    parents = {c: p for p in tree.find_clades() for c in p.clades}
+    
+    # Iteratively collapse until no unifurcations remain
+    # We need to iterate because collapsing one node might create another
+    changed = True
+    while changed:
+        changed = False
+        # Get fresh list of non-terminals each iteration
+        for clade in list(tree.get_nonterminals()):
+            # Skip if it's the root or doesn't have exactly one child
+            if clade == tree.root or len(clade.clades) != 1:
+                continue
+                
+            only_child = clade.clades[0]
+            parent = parents.get(clade)
+            
+            if parent is None:
+                # This shouldn't happen if we handled root above, but be safe
+                continue
+            
+            # Sum branch lengths
+            new_length = only_child.branch_length
+            if clade.branch_length is not None:
+                if new_length is not None:
+                    new_length += clade.branch_length
+                else:
+                    new_length = clade.branch_length
+            only_child.branch_length = new_length
+            
+            # Replace clade with only_child in parent's children list
+            idx = parent.clades.index(clade)
+            parent.clades[idx] = only_child
+            
+            # Update parent map for the promoted child
+            parents[only_child] = parent
+            
+            changed = True
+            # Rebuild parent map since tree structure changed
+            parents = {c: p for p in tree.find_clades() for c in p.clades}
+            break  # Restart iteration with fresh non-terminal list
 
 
 def _drop_confidence_when_named(tree) -> None:

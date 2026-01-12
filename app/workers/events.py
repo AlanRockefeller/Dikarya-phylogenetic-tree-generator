@@ -13,6 +13,7 @@ Event Types:
 
 Pipeline Steps (stable keys):
 - input: Input Processing
+- orient: Orientation Check (auto-fix reversed ITS sequences)
 - blast: BLAST Search
 - align: Alignment (MAFFT/MUSCLE/ClustalO)
 - trim: Trimming (trimAl/BMGE)
@@ -38,13 +39,14 @@ logger = logging.getLogger(__name__)
 
 # Stable pipeline step keys
 STEP_INPUT = "input"
+STEP_ORIENT = "orient"
 STEP_BLAST = "blast"
 STEP_ALIGN = "align"
 STEP_TRIM = "trim"
 STEP_TREE = "tree"
 STEP_POST = "post"
 
-PIPELINE_STEPS = [STEP_INPUT, STEP_BLAST, STEP_ALIGN, STEP_TRIM, STEP_TREE, STEP_POST]
+PIPELINE_STEPS = [STEP_INPUT, STEP_ORIENT, STEP_BLAST, STEP_ALIGN, STEP_TRIM, STEP_TREE, STEP_POST]
 
 # Step states
 STATE_QUEUED = "queued"
@@ -450,6 +452,7 @@ def get_initial_steps_meta() -> Dict[str, dict]:
     """
     return {
         STEP_INPUT: {"label": "Input Processing", "state": STATE_QUEUED},
+        STEP_ORIENT: {"label": "Orientation Check", "state": STATE_QUEUED},
         STEP_BLAST: {"label": "BLAST Search", "state": STATE_QUEUED},
         STEP_ALIGN: {"label": "Alignment", "state": STATE_QUEUED},
         STEP_TRIM: {"label": "Trimming", "state": STATE_QUEUED},

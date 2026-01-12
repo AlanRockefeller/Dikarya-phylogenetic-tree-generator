@@ -8,10 +8,13 @@ import sys
 import unittest
 import importlib.util
 
+import os
 # Load inaturalist_service directly to avoid Flask dependency from app/__init__.py
+# Use relative path for portability
+SERVICE_PATH = os.path.join(os.path.dirname(__file__), '../app/services/inaturalist_service.py')
 spec = importlib.util.spec_from_file_location(
     "inaturalist_service", 
-    "/var/www/dikarya/app/services/inaturalist_service.py"
+    SERVICE_PATH
 )
 inaturalist_service = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(inaturalist_service)
@@ -198,7 +201,8 @@ class TestSecurityInputSanitization(unittest.TestCase):
 
     def test_url_path_traversal(self):
         """Path traversal attempts should not affect validation."""
-        url = "https://inaturalist.org/observations/../../../etc/passwd"
+        # Add required filter to satisfy new security check
+        url = "https://inaturalist.org/observations/../../../etc/passwd?taxon_id=123"
         result = validate_inaturalist_url(url)
         # Should be parsed as observations_search but we don't use path for file access
         self.assertIsNotNone(result)

@@ -16,7 +16,7 @@ from rq import get_current_job
 
 from app.config import Config
 from app.workers.events import (
-    STEP_INPUT, STEP_BLAST, STEP_ALIGN, STEP_TRIM, STEP_TREE, STEP_POST,
+    STEP_INPUT, STEP_ORIENT, STEP_BLAST, STEP_ALIGN, STEP_TRIM, STEP_TREE, STEP_POST,
     STATE_QUEUED, STATE_RUNNING, STATE_DONE, STATE_SKIPPED, STATE_FAILED,
     get_initial_steps_meta,
     publish_job_running, publish_job_completed, publish_job_failed,
@@ -95,6 +95,12 @@ def dedupe_and_uniquify_fasta(fasta_text: str) -> tuple[str, dict]:
         else:
             rec_id = "seq"
             desc = ""
+        
+        # Cap header lengths to prevent abuse (e.g., 200KB pasted headers)
+        MAX_SEQ_ID_LEN = 100
+        MAX_DESC_LEN = 300
+        rec_id = rec_id[:MAX_SEQ_ID_LEN]
+        desc = desc[:MAX_DESC_LEN]
 
         # make ID unique
         id_counts[rec_id] = id_counts.get(rec_id, 0) + 1
@@ -418,6 +424,52 @@ def run_phylo_job(job_params: dict) -> dict:
             logger.info(f"Final FASTA records going into alignment: {final_n}")
             if final_n < 2:
                 raise ValueError("Need at least 2 sequences to build an alignment/tree")
+
+            # =========================================================
+            # STEP: ORIENTATION CHECK
+            # =========================================================
+            current_step = STEP_ORIENT
+            current_step_label = "Orientation Check"
+            current_tool = None
+            
+            if job:
+                job.meta["current_step"] = current_step
+                job.save_meta()
+            
+            publish_step_start(job_id, STEP_ORIENT, "Orientation Check", "Checking sequence orientations")
+            update_step_meta(job, STEP_ORIENT, {"state": STATE_RUNNING})
+            
+            from app.services.orientation_service import fix_sequence_orientation
+            
+            orient_fasta = input_raw_path.read_text(encoding="utf-8", errors="replace")
+            fixed_fasta, orient_stats = fix_sequence_orientation(orient_fasta)
+            input_raw_path.write_text(fixed_fasta, encoding="utf-8")
+            
+            reversed_count = orient_stats.get("reverse", 0)
+            uncertain_count = orient_stats.get("uncertain", 0)
+            
+            if reversed_count > 0:
+                orient_detail = f"{reversed_count} sequence(s) reverse complemented"
+                if uncertain_count > 0:
+                    orient_detail += f", {uncertain_count} uncertain"
+            elif uncertain_count > 0:
+                orient_detail = f"All forward, {uncertain_count} uncertain orientation"
+            else:
+                orient_detail = "All sequences correctly oriented"
+            
+            logger.info(
+                "Orientation check: total=%s forward=%s reverse=%s uncertain=%s",
+                orient_stats.get("total", 0),
+                orient_stats.get("forward", 0),
+                reversed_count,
+                uncertain_count,
+            )
+            
+            publish_step_done(job_id, STEP_ORIENT, orient_detail)
+            update_step_meta(job, STEP_ORIENT, {"state": STATE_DONE, "detail": orient_detail})
+            
+            if reversed_count > 0:
+                publish_metric(job_id, STEP_ORIENT, "reversed", reversed_count)
 
             # =========================================================
             # STEP: ALIGNMENT

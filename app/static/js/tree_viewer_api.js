@@ -33,11 +33,16 @@ const TreeEditActions = {
     },
 
     async pruneTip(jobId, tipName) {
+        // Legacy wrapper
+        return this.pruneTaxa(jobId, [tipName]);
+    },
+
+    async pruneTaxa(jobId, tipNames) {
         const response = await fetch(`/api/job/${jobId}/tree/prune`, {
             method: 'POST',
             headers: this._buildHeaders(),
             credentials: "same-origin",
-            body: JSON.stringify({ tip_name: tipName })
+            body: JSON.stringify({ tip_names: tipNames })
         });
         const data = await response.json().catch(() => ({}));
         if (!response.ok) {

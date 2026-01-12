@@ -514,13 +514,14 @@ document.addEventListener('DOMContentLoaded', async () => {
         if (btnPrune) btnPrune.addEventListener('click', () => {
             if (!viewer) return;
             const nodes = viewer.getSelectedNodes();
-            if (nodes.length !== 1) return;
-            const node = nodes[0];
-            const name = node.data.__original_name || node.data.name; // Use stable name
+            if (nodes.length === 0) return;
 
-            if (!confirm(`Prune ${node.data.name}?`)) return;
-            runBackendAction("Pruning", async () => {
-                await TreeEditActions.pruneTip(JOB_ID, name);
+            const names = nodes.map(n => n.data.__original_name || n.data.name);
+            const displayNames = nodes.map(n => n.data.name).join(", ");
+            // No confirmation requested
+
+            runBackendAction(`Pruning ${nodes.length} nodes`, async () => {
+                await TreeEditActions.pruneTaxa(JOB_ID, names);
             });
         });
 
@@ -570,55 +571,7 @@ document.addEventListener('DOMContentLoaded', async () => {
             });
         });
 
-        // Add Sequences Modal Wiring
-        const btnAddSeq = getEl('btn-add-sequences');
-        const modalAddSeq = getEl('modal-add-sequences');
-        const btnModalConfirm = getEl('btn-modal-add-confirm');
-        const btnModalCancel = getEl('btn-modal-add-cancel');
-        const textareaAddSeq = getEl('textarea-add-sequences');
 
-        if (btnAddSeq && modalAddSeq) {
-            const closeModal = () => {
-                modalAddSeq.classList.add('hidden');
-                if (textareaAddSeq) textareaAddSeq.value = ''; // Reset
-            };
-            const openModal = () => {
-                modalAddSeq.classList.remove('hidden');
-                if (textareaAddSeq) textareaAddSeq.focus();
-            };
-
-            btnAddSeq.addEventListener('click', openModal);
-
-            btnModalCancel?.addEventListener('click', closeModal);
-
-            // Close on backdrop click (optional)
-            modalAddSeq.addEventListener('click', (e) => {
-                if (e.target === modalAddSeq || e.target.hasAttribute('data-backdrop')) {
-                    closeModal();
-                }
-            });
-
-            btnModalConfirm?.addEventListener('click', () => {
-                const input = textareaAddSeq?.value.trim();
-                if (!input) {
-                    alert("Please enter sequences or accessions.");
-                    return;
-                }
-
-                closeModal();
-
-                // Chain actions: Add -> Recompute
-                runBackendAction("Adding Sequences & Recomputing", async () => {
-                    showStatus("Adding sequences...", "info");
-                    const addResult = await TreeEditActions.addSequences(JOB_ID, input);
-
-                    showStatus(`Added ${addResult.count} sequences. Recomputing tree...`, "info", 5000);
-
-                    // Recompute
-                    await TreeEditActions.recomputeTree(JOB_ID);
-                });
-            });
-        }
 
 
         document.addEventListener('keydown', (e) => {
@@ -693,8 +646,13 @@ document.addEventListener('DOMContentLoaded', async () => {
 
         // Normal state
         if (btnPrune) {
-            btnPrune.disabled = !hasSelection;
-            btnPrune.title = isMulti ? "Select only one node to prune" : "";
+            btnPrune.disabled = !hasSelection && !isMulti;
+            btnPrune.title = (hasSelection || isMulti) ? `Prune ${selCount} node${selCount > 1 ? 's' : ''}` : "Select nodes to prune";
+            if (isMulti) {
+                btnPrune.innerHTML = "Prune Selected (" + selCount + ")";
+            } else {
+                btnPrune.innerHTML = "Prune Selected";
+            }
         }
         if (btnRename) {
             btnRename.disabled = !hasSelection;

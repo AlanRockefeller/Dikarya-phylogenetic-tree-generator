@@ -8,15 +8,103 @@ like RAxML, and restoring original headers in output files.
 import logging
 import re
 from pathlib import Path
-from typing import Dict, Tuple
+from typing import Dict
 
 try:
-    from Bio import AlignIO, SeqIO
+    from Bio import SeqIO
     HAS_BIOPYTHON = True
 except ImportError:
     HAS_BIOPYTHON = False
 
 logger = logging.getLogger(__name__)
+
+
+def clean_dna_sequence(raw_sequence: str, min_length: int = 100) -> str:
+    """
+    Clean a DNA sequence by extracting the longest contiguous run of valid nucleotides.
+    
+    This handles cases where:
+    - The sequence has a FASTA header (>description...) on a separate line or same line
+    - The sequence has garbage text at the start or end (species name, collection number, notes)
+    - The sequence has whitespace/newlines
+    
+    Algorithm:
+    1. Strip FASTA header markers (>) but keep remainder of line
+    2. Remove all whitespace
+    3. Find the longest contiguous run of valid IUPAC nucleotide characters
+    4. Return that run if it meets minimum length, otherwise empty string
+    
+    Args:
+        raw_sequence: Raw DNA sequence string that may contain non-DNA text
+        min_length: Minimum length for a valid barcode (default 100bp for ITS)
+        
+    Returns:
+        Cleaned DNA sequence containing only valid IUPAC nucleotide characters,
+        or empty string if no valid run of sufficient length is found
+    """
+    if not raw_sequence:
+        return ""
+    
+    # Valid IUPAC nucleotide characters (DNA + ambiguity codes + gap)
+    valid_chars = set("ACGTRYSWKMBDHVNacgtryswkmbdhvn-")
+    
+    # Process lines: strip > marker but keep rest of each line
+    lines = raw_sequence.strip().split('\n')
+    processed_lines = []
+    
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+        
+        # Strip FASTA header marker but keep the rest (may contain sequence)
+        if line.startswith(">"):
+            # keep only content after first whitespace (if any)
+            line = line[1:]
+            parts = line.split(None, 1)
+            line = parts[1] if len(parts) == 2 else ""
+
+        
+        processed_lines.append(line)
+    
+    # Join all lines and remove whitespace
+    combined = ''.join(''.join(line.split()) for line in processed_lines)
+    
+    if not combined:
+        return ""
+    
+    # Find the longest contiguous run of valid DNA characters
+    # This handles both prefix AND suffix garbage efficiently in O(n)
+    best_start = 0
+    best_length = 0
+    current_start = None
+    
+    for i, c in enumerate(combined):
+        if c in valid_chars:
+            if current_start is None:
+                current_start = i
+        else:
+            if current_start is not None:
+                run_length = i - current_start
+                if run_length > best_length:
+                    best_start = current_start
+                    best_length = run_length
+                current_start = None
+    
+    # Check final run (if string ends with valid chars)
+    if current_start is not None:
+        run_length = len(combined) - current_start
+        if run_length > best_length:
+            best_start = current_start
+            best_length = run_length
+    
+    # Extract the best run if it meets minimum length
+    if best_length >= min_length:
+        cleaned = combined[best_start:best_start + best_length]
+        return cleaned.upper()
+    
+    # No valid run of sufficient length found
+    return ""
 
 
 def sanitize_fasta_headers(input_path: Path, output_path: Path) -> Dict[str, str]:
@@ -116,7 +204,7 @@ def restore_tree_names(tree_path: Path, mapping: Dict[str, str]) -> None:
         # Replace all occurrences of SEQxxxxxx using a regex
         # We match word boundaries (\b) to ensure we don't partial-match
         # Pattern matches SEQ followed by one or more digits
-        new_content = re.sub(r'\bSEQ\d+\b', replace_match, content)
+        new_content = re.sub(r"\bSEQ\d+\b", replace_match, content)
             
         tree_path.write_text(new_content)
         logger.info(f"Restored names in {tree_path}")

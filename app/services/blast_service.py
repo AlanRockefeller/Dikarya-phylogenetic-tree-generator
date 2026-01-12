@@ -1,6 +1,7 @@
 import hashlib
 import json
 import logging
+import re
 import time
 import requests
 from pathlib import Path
@@ -386,7 +387,8 @@ def fetch_fasta_for_accessions(accessions: List[str]) -> str:
     
     # Validate accession format
     import re
-    valid_pattern = re.compile(r'^[A-Z]{1,2}_?\d{5,}(?:\.\d+)?$', re.IGNORECASE)
+    # CHANGE TO (SECURE): Enforces GenBank format (1-6 letters, optional _, 5-9 digits, optional version)
+    valid_pattern = re.compile(r'^[A-Z]{1,6}_?\d{5,9}(?:\.\d+)?$', re.IGNORECASE)
     validated = [a for a in accessions if valid_pattern.match(a)]
     
     if not validated:
