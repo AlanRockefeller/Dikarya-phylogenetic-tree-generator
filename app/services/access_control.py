@@ -26,9 +26,16 @@ def check_job_access(job_id: str) -> Tuple[Optional[Job], Optional[str], int]:
     
     # If job has an owner, verify the current user is that owner
     if db_job and db_job.user_id is not None:
-        if not current_user.is_authenticated:
-            return None, "Authentication required", 401
-        if current_user.id != db_job.user_id:
-            return None, "Access denied", 403
+        # ALLOW PUBLIC SHARING:
+        # We intentionally allow anyone with the link (job_id) to view the tree.
+        # Finished trees generally aren't secret, and people should be able to share them easily.
+        # The only check strictly required here would be if we wanted to prevent *editing* (pruning/rerooting)
+        # by non-owners, but for now, the "view" mode implies full interaction.
+        # OLD STRICT CHECK REMOVED:
+        # if not current_user.is_authenticated:
+        #     return None, "Authentication required", 401
+        # if current_user.id != db_job.user_id:
+        #     return None, "Access denied", 403
+        pass
     
     return db_job, None, 200

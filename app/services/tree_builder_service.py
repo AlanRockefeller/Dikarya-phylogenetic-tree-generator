@@ -77,6 +77,8 @@ def run_tree_builder(
             _run_iqtree(alignment_fasta, output_newick, output_nexus, params, config, task_logger, job_id)
         elif method == "mrbayes":
             _run_mrbayes(alignment_fasta, output_newick, output_nexus, params, config, task_logger, job_id)
+        elif method == "fasttree":
+            _run_fasttree(alignment_fasta, output_newick, output_nexus, params, config, task_logger, job_id)
         else:
             raise ValueError(f"Unsupported tree building method: {method}")
 
@@ -471,3 +473,91 @@ def _convert_fasta_to_nexus(fasta_path: Path, nexus_path: Path):
         AlignIO.write(aln, str(nexus_path), "nexus")
     else:
         raise RuntimeError("BioPython required for format conversion.")
+
+
+def _run_fasttree(
+    alignment_fasta: Path,
+    output_newick: Path,
+    output_nexus: Path,
+    params: TreeBuilderParams,
+    config: Config,
+    task_logger,
+    job_id: Optional[str] = None
+):
+    """
+    Run FastTree 2.2.0 tree inference.
+    
+    FastTree writes the tree to stdout.
+    Command: fasttree -gtr -nt -gamma -boot 1000 alignment.fasta > tree.newick
+    """
+    
+    # Check binary existence
+    binary_path = Path(config.FASTTREE_BINARY)
+    if not binary_path.exists() and not shutil.which(config.FASTTREE_BINARY):
+        raise RuntimeError(f"FastTree binary not found at {config.FASTTREE_BINARY}")
+
+    # Sanitize FASTA
+    sanitized_fasta = output_newick.parent / "fasttree_input_sanitized.fasta"
+    name_mapping = sanitize_fasta_headers(alignment_fasta, sanitized_fasta)
+    
+    # Build command
+    cmd = [
+        config.FASTTREE_BINARY,
+        "-gtr",
+        "-nt", 
+        "-gamma",
+        "-boot", str(1000) # Fixed 1000 bootstraps as per requirement
+    ]
+    
+    # Check if alignment is valid (not empty)
+    if sanitized_fasta.stat().st_size == 0:
+         raise RuntimeError("Input alignment is empty.")
+
+    cmd.append(str(sanitized_fasta))
+    
+    log_file = output_newick.parent.parent / "logs" / "tree_builder.log"
+    
+    task_logger.info(f"Running FastTree: {' '.join(cmd)}")
+    
+    if job_id:
+        from app.workers.events import publish_command
+        # We perform the redirect manually, but show it in the command event
+        display_cmd = cmd + [">", str(output_newick)]
+        publish_command(job_id, "tree", display_cmd)
+        
+        # FastTree writes progress to stderr, tree to stdout
+        # stdout_path will automatically be opened by run_command_streaming
+        exit_code, stats = run_command_streaming(
+            cmd,
+            stderr_path=log_file,
+            stdout_path=output_newick, 
+            on_stderr_line=_make_log_callback(job_id, "tree", "stderr")
+        )
+            
+        if exit_code != 0:
+             raise RuntimeError(f"FastTree failed with exit code {exit_code}")
+
+    else:
+        # specific handling if we assume run_command captures stdout
+        # run_command returns (returncode, stdout, stderr)
+        returncode, stdout, stderr = run_command(cmd, log_file=log_file)
+        
+        if returncode != 0:
+            task_logger.error(f"FastTree failed. RC={returncode}")
+            task_logger.error(f"STDERR: {stderr}")
+            raise RuntimeError(f"FastTree failed with return code {returncode}. See logs.")
+            
+        # Write stdout to newick file
+        with open(output_newick, "w") as f:
+            f.write(stdout)
+
+    # Check output
+    if not output_newick.exists() or output_newick.stat().st_size == 0:
+        raise RuntimeError("FastTree produced no output.")
+
+    # Restore original names
+    restore_tree_names(output_newick, name_mapping)
+    
+    # Convert to Nexus
+    _convert_newick_to_nexus(output_newick, output_nexus)
+

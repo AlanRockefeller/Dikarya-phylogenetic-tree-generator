@@ -17,6 +17,8 @@ class Config:
     CLUSTALO_BINARY = os.environ.get('CLUSTALO_BINARY', 'clustalo')
     TRIMAL_BINARY = os.environ.get('TRIMAL_BINARY', 'trimal')
     BMGE_BINARY = os.environ.get('BMGE_BINARY', 'bmge')
+    FASTTREE_BINARY = os.environ.get('FASTTREE_BINARY', '/usr/local/bin/FastTree')
+
     
     # Paths
     BASE_DIR = Path(__file__).resolve().parent.parent

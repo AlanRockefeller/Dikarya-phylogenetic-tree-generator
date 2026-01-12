@@ -707,11 +707,23 @@ document.addEventListener('DOMContentLoaded', async () => {
                 stats.supportType === 'PP' ? 'Posterior' :
                     stats.supportType === 'mixed' ? 'Mixed' : 'None';
 
+            // Override for FastTree
+            if (window.TREE_METHOD === 'fasttree' && stats.supportType === 'PP') {
+                label = 'FastTree SH-like';
+            }
+
             badge.textContent = `Support: ${label}`;
             badge.className = "px-2 py-0.5 text-xs font-semibold rounded shrink-0 transition-colors";
 
             if (stats.supportType === 'BS') badge.classList.add('text-blue-800', 'bg-blue-100', 'dark:text-blue-200', 'dark:bg-blue-900/40');
-            else if (stats.supportType === 'PP') badge.classList.add('text-purple-800', 'bg-purple-100', 'dark:text-purple-200', 'dark:bg-purple-900/40');
+            else if (stats.supportType === 'PP') {
+                if (window.TREE_METHOD === 'fasttree') {
+                    // Use a distinct color for SH-like, or keep purple but change text
+                    badge.classList.add('text-teal-800', 'bg-teal-100', 'dark:text-teal-200', 'dark:bg-teal-900/40');
+                } else {
+                    badge.classList.add('text-purple-800', 'bg-purple-100', 'dark:text-purple-200', 'dark:bg-purple-900/40');
+                }
+            }
             else if (stats.supportType === 'mixed') badge.classList.add('text-amber-800', 'bg-amber-100', 'dark:text-amber-200', 'dark:bg-amber-900/40');
             else badge.classList.add('text-gray-800', 'bg-gray-100', 'dark:text-gray-200', 'dark:bg-gray-700/40');
         }

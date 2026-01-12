@@ -24,7 +24,7 @@
             {% set align = align_raw|upper %}
             {% set tree = tree_raw|upper %}
 
-            {% set is_quick_defaults = (tree_raw == 'nj' and align_raw == 'mafft') %}
+            {% set is_quick_defaults = ((tree_raw == 'nj' or tree_raw == 'fasttree') and align_raw == 'mafft') %}
 
             {% if trim_raw == 'none' or not trim_raw %}
             {% if is_quick_defaults %}
@@ -438,6 +438,21 @@
                 {% endif %}
                 {% endif %}
                 {% endfor %}
+                {% if job_details.get('tree_method') == 'fasttree' %}
+                <div class="mt-4 pt-4 border-t border-gray-100 dark:border-gray-800">
+                    <p class="font-mono text-xs text-gray-500 dark:text-gray-400 break-all">
+                        <span class="font-bold text-journal-gold">Command:</span> fasttree -gtr -nt -gamma -boot 1000
+                        alignment.fasta > tree.newick
+                    </p>
+                    <p class="text-xs text-gray-500 dark:text-gray-400 mt-1">
+                        <strong>FastTree 2.2.0</strong> infers approximately-maximum-likelihood phylogenetic trees.
+                        Arguments: <code>-gtr</code> (Generalized Time Reversible model), <code>-nt</code> (Nucleotide
+                        alignment),
+                        <code>-gamma</code> (Rescale branch lengths to optimize Gamma20 likelihood),
+                        <code>-boot 1000</code> (1000 bootstrap replicates).
+                    </p>
+                </div>
+                {% endif %}
             </div>
         </div>
     </div>
@@ -455,6 +470,7 @@
 
 <script>
     window.JOB_ID = "{{ job_id }}";
+    window.TREE_METHOD = "{{ job_details.get('tree_method', '') }}";
 </script>
 
 <script src="https://cdn.jsdelivr.net/npm/d3@7"></script>
