@@ -256,6 +256,14 @@ def reroot_tree(job_dir: Path, tree_json: Dict, root_target: str) -> Dict:
                 break
         
         if target_clade is None:
+             # Fallback: check confidence converted to string
+             # This handles cases where Newick I/O converted numeric name -> confidence
+             for clade in tree.find_clades():
+                 if clade.confidence is not None and str(clade.confidence) == root_target:
+                     target_clade = clade
+                     break
+
+        if target_clade is None:
              # Useful debug info in the error
              internal = [c.name for c in tree.get_nonterminals() if c.name][:15]
              tips = [c.name for c in tree.get_terminals() if c.name][:15]
@@ -338,6 +346,9 @@ def midpoint_root(job_dir: Path, tree_json: Dict) -> Dict:
 
         # Ladderize (Deterministic)
         ladderize_tree(tree)
+
+        # Ensure unique labels for stable IDs
+        ensure_unique_labels(tree)
 
         # FIX: Ensure confidence is dropped for named nodes before saving/returning
         _drop_confidence_when_named(tree)
@@ -531,7 +542,7 @@ def _clade_to_json(clade):
         "name": clade.name,
         "original_name": clade.name,
         "branch_length": clade.branch_length,
-        "confidence": clade.confidence
+        "confidence": clade.confidence if clade.confidence is not None else getattr(clade, '_poly_confidence', None)
     }
     if clade.clades:
         node["children"] = [_clade_to_json(c) for c in clade.clades]
@@ -616,6 +627,8 @@ def _drop_confidence_when_named(tree) -> None:
     """
     for clade in tree.get_nonterminals():
         if clade.name and clade.confidence is not None:
+            # Stash confidence so it's not lost when we clear it for Newick write safety
+            clade._poly_confidence = clade.confidence
             clade.confidence = None
 
 def ensure_unique_labels(tree) -> bool:
@@ -717,6 +730,8 @@ def ensure_unique_labels(tree) -> bool:
                     existing_internal_names.add(candidate)
                     
                     # Probably not needed, but just in case
+                    if clade.confidence is not None:
+                         clade._poly_confidence = clade.confidence
                     clade.confidence = None
                     break
         

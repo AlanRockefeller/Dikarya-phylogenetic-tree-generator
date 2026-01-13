@@ -1,4 +1,4 @@
-from flask import jsonify, request, send_file
+from flask import jsonify, request, send_file, url_for
 from flask_login import current_user
 from app.api import bp
 from app.workers.queue import enqueue_job, get_job_status
@@ -418,6 +418,84 @@ def create_job():
     except Exception as e:
         return jsonify({"status": "error", "message": str(e)}), 500
 
+@bp.route('/job/<job_id>/make_editable_copy', methods=['POST'])
+def make_editable_copy(job_id):
+    """
+    Create a new owned job from an existing job's input.
+    """
+    # 1. Check view access to source (anyone can copy if they can view)
+    db_job, error_msg, status_code = check_job_access(job_id, mode="view")
+    if error_msg:
+        return jsonify({"status": "error", "error": error_msg}), status_code
+        
+    # 2. (Authentication Removed) - Anonymous copies allowed
+    # if not current_user.is_authenticated:
+    #     return jsonify({"status": "error", "error": "Login required to create a copy."}), 401
+    
+    job_dir = Config.JOB_DIR / job_id
+    
+    # 3. Locate source FASTA
+    # Try raw input first
+    source_fasta = job_dir / "input" / "input_raw.fasta"
+    if not source_fasta.exists():
+        # Fallback? Maybe aligned?
+        # Let's try grabbing from sequences (unlikely to be reconstituted easily if just alignment exists)
+        return jsonify({"status": "error", "error": "Source FASTA (input_raw.fasta) not found."}), 404
+    
+    try:
+        fasta_content = source_fasta.read_text()
+        
+        # 4. Create new job params (Rapid defaults)
+        # Replicating "Quick Tree" defaults: MAFFT + FastTree + GTR+G
+        job_params = {
+            "input_type": "fasta",
+            "notes": f"Copy of Job {job_id}",
+            "sequence": fasta_content,
+            "accessions": [],
+            "alignment_method": "mafft",
+            "trimming_method": "none",
+            "alignment_options": {},
+            "tree_method": "fasttree",
+            "tree_model": "GTR+G",
+            "bootstrap": 1000,
+            "mcmc_generations": 50000
+        }
+        
+        # 5. Enqueue
+        new_job_id = enqueue_job(job_params)
+        
+        # 6. Create DB Record
+        new_job = Job(
+            id=new_job_id,
+            status="queued",
+            job_dir=str(Config.JOB_DIR / new_job_id),
+            input_type="fasta",
+            # user_id assigned below
+            metrics={
+                "tree_method": job_params["tree_method"],
+                "notes": job_params["notes"],
+                "alignment_method": job_params["alignment_method"],
+                "trimming_method": job_params["trimming_method"],
+                "copied_from": job_id
+            }
+        )
+        
+        if current_user.is_authenticated:
+            new_job.user_id = current_user.id
+        
+        db.session.add(new_job)
+        db.session.commit()
+        
+        return jsonify({
+            "status": "success", 
+            "new_job_id": new_job_id, 
+            "redirect_url": url_for('main.job_status', job_id=new_job_id)
+        })
+        
+    except Exception as e:
+        logger.error(f"Copy job failed: {e}", exc_info=True)
+        return jsonify({"status": "error", "error": str(e)}), 500
+
 @bp.route('/job/<job_id>/status', methods=['GET'])
 def get_job_status_route(job_id):
     if not validate_job_id(job_id):
@@ -448,7 +526,7 @@ def get_tree_state(job_id):
 
 @bp.route('/job/<job_id>/tree/prune', methods=['POST'])
 def prune_tree(job_id):
-    _, error_msg, status_code = check_job_access(job_id)
+    _, error_msg, status_code = check_job_access(job_id, mode="edit")
     if error_msg:
         return jsonify({"status": "error", "error": error_msg}), status_code
 
@@ -475,7 +553,7 @@ def prune_tree(job_id):
 
 @bp.route('/job/<job_id>/tree/rename', methods=['POST'])
 def rename_tree_tip(job_id):
-    _, error_msg, status_code = check_job_access(job_id)
+    _, error_msg, status_code = check_job_access(job_id, mode="edit")
     if error_msg:
         return jsonify({"status": "error", "error": error_msg}), status_code
 
@@ -496,7 +574,7 @@ def rename_tree_tip(job_id):
 
 @bp.route('/job/<job_id>/tree/reroot', methods=['POST'])
 def reroot_tree_endpoint(job_id):
-    _, error_msg, status_code = check_job_access(job_id)
+    _, error_msg, status_code = check_job_access(job_id, mode="edit")
     if error_msg:
         return jsonify({"status": "error", "error": error_msg}), status_code
 
@@ -521,7 +599,7 @@ def reroot_tree_endpoint(job_id):
 
 @bp.route('/job/<job_id>/tree/midpoint_root', methods=['POST'])
 def midpoint_root_endpoint(job_id):
-    _, error_msg, status_code = check_job_access(job_id)
+    _, error_msg, status_code = check_job_access(job_id, mode="edit")
     if error_msg:
         return jsonify({"status": "error", "error": error_msg}), status_code
 
@@ -541,7 +619,7 @@ def midpoint_root_endpoint(job_id):
 @bp.route('/job/<job_id>/tree/midpoint_root_toggle', methods=['POST'])
 def midpoint_root_toggle_endpoint(job_id):
     """Toggle midpoint rooting on/off."""
-    _, error_msg, status_code = check_job_access(job_id)
+    _, error_msg, status_code = check_job_access(job_id, mode="edit")
     if error_msg:
         return jsonify({"status": "error", "error": error_msg}), status_code
 
@@ -570,7 +648,7 @@ def midpoint_root_toggle_endpoint(job_id):
 
 @bp.route('/job/<job_id>/tree/recompute', methods=['POST'])
 def recompute_tree_job(job_id):
-    _, error_msg, status_code = check_job_access(job_id)
+    _, error_msg, status_code = check_job_access(job_id, mode="edit")
     if error_msg:
         return jsonify({"status": "error", "error": error_msg}), status_code
 

@@ -1,4 +1,5 @@
 from flask import render_template, redirect, url_for, abort
+from flask_login import current_user
 from app.main import bp
 from app.services.security_utils import validate_safe_file_path
 from app.services.access_control import check_job_access
@@ -24,8 +25,8 @@ import json
 
 @bp.route('/job/<job_id>/view')
 def job_viewer(job_id):
-    # Check access control
-    _, error_msg, status_code = check_job_access(job_id)
+    # Check access control (View Mode)
+    db_job, error_msg, status_code = check_job_access(job_id, mode="view")
     if error_msg:
         # Check specific status codes to provide better UX/privacy
         if status_code in (401, 403):
@@ -33,6 +34,14 @@ def job_viewer(job_id):
             abort(404)
         # Default abort for other errors (e.g. 400)
         abort(status_code)
+
+    # Determine View-Only status logic
+    # view_only = True if the job has an owner and the current user is NOT that owner.
+    # Legacy/Anonymous jobs (user_id=None) remain mutable by public (view_only=False).
+    view_only = False
+    if db_job and db_job.user_id is not None:
+        if not current_user.is_authenticated or current_user.id != db_job.user_id:
+            view_only = True
 
     # Fetch job details for display
     job_dir = Config.JOB_DIR / job_id
@@ -46,7 +55,7 @@ def job_viewer(job_id):
         except Exception:
             pass
             
-    return render_template('job_viewer.html', job_id=job_id, job_details=job_details)
+    return render_template('job_viewer.html', job_id=job_id, job_details=job_details, view_only=view_only)
 
 @bp.route('/health')
 def health():

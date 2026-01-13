@@ -15,6 +15,7 @@ document.addEventListener('DOMContentLoaded', async () => {
     const btnReroot = getEl('btn-reroot');
     const btnMidpoint = getEl('btn-midpoint');
     const btnRecompute = getEl('btn-recompute');
+    const btnMakeCopy = getEl('btn-make-copy');
 
     // --- HELPER: STATUS MESSAGE ---
     let currentStatusType = null;
@@ -116,13 +117,17 @@ document.addEventListener('DOMContentLoaded', async () => {
             // grab initial DOM values
             minTips: parseInt(getEl('input-min-tips')?.value || 0),
             ppThreshold: parseFloat(getEl('input-pp-threshold')?.value || 0.9),
-            bootstrapThreshold: parseInt(getEl('input-bs-threshold')?.value || 70)
+            bootstrapThreshold: parseInt(getEl('input-bs-threshold')?.value || 70),
+            treeMethod: window.TREE_METHOD || ''
         };
 
         viewer = new DikaryaTreeViewer('tree-container', callbacks, initialOptions);
 
         // One-time UI wiring
         wireUI();
+
+        // Initial button check (for view-only mode etc calling updateButtons)
+        updateButtons();
     }
 
     async function loadTree() {
@@ -573,7 +578,6 @@ document.addEventListener('DOMContentLoaded', async () => {
 
 
 
-
         document.addEventListener('keydown', (e) => {
             if (e.key === "Escape" && rerootMode) {
                 rerootMode = false; removeRerootCapture();
@@ -625,6 +629,24 @@ document.addEventListener('DOMContentLoaded', async () => {
     function updateButtons() {
         if (!viewer) return;
 
+        // View Only Mode Logic
+        if (window.VIEW_ONLY) {
+            const disableBtn = (btn) => {
+                if (btn) {
+                    btn.disabled = true;
+                    btn.classList.add('opacity-50', 'cursor-not-allowed');
+                    btn.title = "View Only - Make an editable copy to use this feature";
+                }
+            };
+            disableBtn(btnPrune);
+            disableBtn(btnRename);
+            disableBtn(btnReroot);
+            disableBtn(btnMidpoint);
+            disableBtn(btnRecompute);
+            // btnMakeCopy remains enabled
+            return;
+        }
+
         // Multi-select check
         let selCount = 0;
         if (typeof viewer.getSelectionCount === 'function') {
@@ -641,6 +663,7 @@ document.addEventListener('DOMContentLoaded', async () => {
             if (btnReroot) btnReroot.disabled = true;
             if (btnMidpoint) btnMidpoint.disabled = true;
             if (btnRecompute) btnRecompute.disabled = true;
+            if (btnMakeCopy) btnMakeCopy.disabled = true;
             return;
         }
 
@@ -703,29 +726,31 @@ document.addEventListener('DOMContentLoaded', async () => {
         const showSupport = viewer ? viewer.options.showSupport : true;
 
         if (badge) {
-            let label = stats.supportType === 'BS' ? 'Bootstrap' :
-                stats.supportType === 'PP' ? 'Posterior' :
-                    stats.supportType === 'mixed' ? 'Mixed' : 'None';
-
-            // Override for FastTree
-            if (window.TREE_METHOD === 'fasttree' && stats.supportType === 'PP') {
-                label = 'FastTree SH-like';
-            }
+            let label = 'None';
+            if (stats.supportType === 'BS') label = 'Bootstrap';
+            else if (stats.supportType === 'PP') label = 'Posterior';
+            else if (stats.supportType === 'SH') label = 'FastTree SH-like';
+            else if (stats.supportType === 'mixed') label = 'Mixed';
 
             badge.textContent = `Support: ${label}`;
             badge.className = "px-2 py-0.5 text-xs font-semibold rounded shrink-0 transition-colors";
 
-            if (stats.supportType === 'BS') badge.classList.add('text-blue-800', 'bg-blue-100', 'dark:text-blue-200', 'dark:bg-blue-900/40');
-            else if (stats.supportType === 'PP') {
-                if (window.TREE_METHOD === 'fasttree') {
-                    // Use a distinct color for SH-like, or keep purple but change text
-                    badge.classList.add('text-teal-800', 'bg-teal-100', 'dark:text-teal-200', 'dark:bg-teal-900/40');
-                } else {
-                    badge.classList.add('text-purple-800', 'bg-purple-100', 'dark:text-purple-200', 'dark:bg-purple-900/40');
-                }
+            if (stats.supportType === 'BS') {
+                badge.classList.add('text-blue-800', 'bg-blue-100', 'dark:text-blue-200', 'dark:bg-blue-900/40');
             }
-            else if (stats.supportType === 'mixed') badge.classList.add('text-amber-800', 'bg-amber-100', 'dark:text-amber-200', 'dark:bg-amber-900/40');
-            else badge.classList.add('text-gray-800', 'bg-gray-100', 'dark:text-gray-200', 'dark:bg-gray-700/40');
+            else if (stats.supportType === 'PP') {
+                badge.classList.add('text-purple-800', 'bg-purple-100', 'dark:text-purple-200', 'dark:bg-purple-900/40');
+            }
+            else if (stats.supportType === 'SH') {
+                // Teal for FastTree SH
+                badge.classList.add('text-teal-800', 'bg-teal-100', 'dark:text-teal-200', 'dark:bg-teal-900/40');
+            }
+            else if (stats.supportType === 'mixed') {
+                badge.classList.add('text-amber-800', 'bg-amber-100', 'dark:text-amber-200', 'dark:bg-amber-900/40');
+            }
+            else {
+                badge.classList.add('text-gray-800', 'bg-gray-100', 'dark:text-gray-200', 'dark:bg-gray-700/40');
+            }
         }
 
         const setInput = (inp, en) => {
@@ -738,11 +763,20 @@ document.addEventListener('DOMContentLoaded', async () => {
         const globalEnable = showSupport && filterEnabled;
         const s = stats.supportType;
 
-        if (ppInput) setInput(ppInput, globalEnable && (s === 'PP' || s === 'mixed'));
+        // Dynamic Label for PP/SH input
+        if (ppInput) {
+            const container = ppInput.parentElement;
+            const labelSpan = container.querySelector('span');
+            if (labelSpan) {
+                if (s === 'SH') labelSpan.textContent = "SH >";
+                else labelSpan.textContent = "PP >";
+            }
+            setInput(ppInput, globalEnable && (s === 'PP' || s === 'mixed' || s === 'SH'));
+        }
+
         if (bsInput) setInput(bsInput, globalEnable && (s === 'BS' || s === 'mixed'));
     }
 
     // START
     loadTree();
 });
-

@@ -794,6 +794,40 @@
             }
         }
 
+        _extractSupportValue(node) {
+            // 1) Direct numeric fields (preferred)
+            const direct = [
+                node?.data?.confidence, node?.data?.bootstrap, node?.data?.support,
+                node?.confidence, node?.bootstrap, node?.support,
+            ];
+
+            for (const v of direct) {
+                if (v === 0) return 0;
+                if (v === undefined || v === null || v === "") continue;
+                const num = Number(v);
+                if (!Number.isNaN(num)) return num;
+            }
+
+            // 2) bootstrap_values ONLY if it is numeric (FastTree/phylotree often puts "Node_..." here)
+            const bv = node?.data?.bootstrap_values ?? node?.bootstrap_values;
+            if (bv !== undefined && bv !== null) {
+                const s = String(bv).trim();
+                if (/^\d+(\.\d+)?$/.test(s)) return Number(s);
+            }
+
+            // 3) Fallback: parse from name ("0.97" OR "Node_12_0.97")
+            const name = node?.data?.name ?? node?.name;
+            if (name !== undefined && name !== null) {
+                const s = String(name).trim();
+                if (/^\d+(\.\d+)?$/.test(s)) return Number(s);
+
+                const m = s.match(/^Node_\d+_(\d+(?:\.\d+)?)$/);
+                if (m) return Number(m[1]);
+            }
+
+            return null;
+        }
+
         _computeSupportStats() {
             if (!this.allNodes || !this.allNodes.length) return { maxSupport: 0, supportType: 'none' };
 
@@ -806,20 +840,23 @@
             // Support value extraction
             for (const node of this.allNodes) {
                 if (!node.children || node.children.length === 0) continue; // Skip tips for support
-                const support = node.data?.confidence || node.data?.bootstrap_values ||
-                    node.data?.bootstrap || node.data?.support; // check standard fields
 
-                if (support !== undefined && support !== null && support !== "") {
-                    const val = parseFloat(support);
-                    if (!isNaN(val)) {
-                        supportValues.push(val);
-                        maxSupport = Math.max(maxSupport, val);
-                    }
+                const val = this._extractSupportValue(node);
+                if (val !== null) {
+                    supportValues.push(val);
+                    maxSupport = Math.max(maxSupport, val);
                 }
             }
 
             let supportType = 'none';
-            if (supportValues.length > 0) {
+
+            // Explicit FastTree Override
+            // FastTree support values are SH-like local supports (0-1).
+            // They are NOT Bayesian Posteriors (PP), though they look similar.
+            if (this.options.treeMethod === 'fasttree' && supportValues.length > 0) {
+                supportType = 'SH';
+            }
+            else if (supportValues.length > 0) {
                 const hasLarge = supportValues.some(v => v > 1.0);
                 // If we have large values (Bootstrap), we only consider it 'mixed' if we see values <= 1.0
                 // that are NOT 1.0 (or 0).
@@ -886,37 +923,22 @@
                         }
                     }
 
-                    // Label Extract - Prioritize explicit fields
-                    // Only check name if it definitely looks like support (not just a generated node name)
-                    let rawLabel = d.data?.confidence || d.data?.bootstrap_values || d.data?.bootstrap || d.data?.support;
-
-                    // Fallback to name only if specifically formatted as support-like (numeric) and NOT the default Node_X
-                    if ((rawLabel === undefined || rawLabel === null || rawLabel === "") && d.data?.name) {
-                        const n = d.data.name;
-                        // Logic: if purely numeric, treat as support. 
-                        // Or if matches internal node pattern with support suffix specifically: Node_X_Support
-                        if (/^\d+(\.\d+)?$/.test(n)) {
-                            rawLabel = n;
-                        } else {
-                            // STRICTER CHECK: Only extract if it looks like the default internal node naming scheme
-                            // e.g. Node_5_100 or Node_5_0.95
-                            // Reject "Sample_123"
-                            const match = n.match(/^Node_\d+_(\d+(?:\.\d+)?)$/);
-                            if (match) {
-                                rawLabel = match[1];
-                            }
-                        }
-                    }
-
-                    if (!rawLabel || isNaN(parseFloat(rawLabel))) {
+                    const numVal = self._extractSupportValue(d);
+                    if (numVal === null) {
                         group.select("text.node-support-value").remove();
                         return;
                     }
-                    const numVal = parseFloat(rawLabel);
+                    let rawLabel = "";
 
-                    // Threshold Filter - decide PP vs bootstrap by value magnitude
+                    // Threshold Filter - decide PP vs bootstrap vs SH by value magnitude / type
                     const EPS = 1e-9;
-                    if (numVal <= 1.0) {
+
+                    if (supportType === 'SH') {
+                        // SH-like supports are 0-1, so use ppThreshold
+                        if (numVal + EPS < ppThreshold) { group.select("text.node-support-value").remove(); return; }
+                        rawLabel = numVal.toFixed(2);
+                    }
+                    else if (numVal <= 1.0) {
                         if (numVal + EPS < ppThreshold) { group.select("text.node-support-value").remove(); return; }
                         rawLabel = numVal.toFixed(2);
                     } else {

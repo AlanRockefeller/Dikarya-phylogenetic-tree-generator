@@ -28,6 +28,9 @@
     --space-xl: 2rem;
     --space-2xl: 3rem;
     --space-3xl: 4rem;
+
+    /* Semantic Colors */
+    --text-white: #ffffff;
 }
 
 /* Dark Theme */
@@ -35,8 +38,8 @@
     --primary-dark: #0d1a14;
     --primary: #1a2f23;
     --primary-light: #2d4a3e;
-    --accent: #8b9a6d;
-    --accent-light: #6b7a4d;
+    --accent: #a3b088;
+    --accent-light: #c0d68f;
     --gold: #c9a962;
     --gold-light: #a08942;
     --cream: #1a1f1a;
@@ -101,8 +104,8 @@
 
 .theme-toggle:hover {
     background: rgba(255, 255, 255, 0.1);
-    border-color: var(--white);
-    color: var(--white);
+    border-color: var(--text-white);
+    color: var(--text-white);
     transform: rotate(15deg);
 }
 
@@ -129,7 +132,7 @@ body.journal-page {
 /* Journal Header */
 .journal-header {
     background: linear-gradient(135deg, var(--primary-dark) 0%, var(--primary) 50%, var(--primary-light) 100%);
-    color: var(--white);
+    color: var(--text-white);
     padding: 0;
     position: sticky;
     top: 0;
@@ -151,7 +154,7 @@ body.journal-page {
     align-items: center;
     gap: var(--space-md);
     text-decoration: none;
-    color: var(--white);
+    color: var(--text-white);
 }
 
 .journal-logo-icon {
@@ -213,13 +216,41 @@ body.journal-page {
 
 .journal-btn-outline {
     background: transparent;
-    color: var(--white);
+    color: var(--text-white);
     border: 1px solid rgba(255, 255, 255, 0.4);
 }
 
 .journal-btn-outline:hover {
     background: rgba(255, 255, 255, 0.1);
     border-color: var(--white);
+}
+
+.journal-btn-text {
+    background: transparent;
+    color: var(--primary);
+    border: 1px solid var(--primary);
+}
+
+.journal-btn-text:hover {
+    background: var(--primary);
+    color: var(--white);
+}
+
+.journal-input {
+    width: 100%;
+    padding: 0.75rem;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    font-size: 1rem;
+    background: var(--white);
+    color: var(--text-dark);
+    font-family: inherit;
+}
+
+.journal-input:focus {
+    outline: none;
+    border-color: var(--primary);
+    box-shadow: 0 0 0 2px rgba(45, 74, 62, 0.2);
 }
 
 /* Navigation */
@@ -250,7 +281,7 @@ body.journal-page {
 
 .journal-nav a:hover,
 .journal-nav a.active {
-    color: var(--white);
+    color: var(--text-white);
     background: rgba(255, 255, 255, 0.1);
     border-bottom-color: var(--gold);
 }
@@ -263,7 +294,7 @@ body.journal-page {
 /* Hero Section */
 .journal-hero {
     background: linear-gradient(135deg, var(--primary) 0%, var(--primary-dark) 100%);
-    color: var(--white);
+    color: var(--text-white);
     padding: var(--space-3xl) var(--space-xl);
     text-align: center;
 }
@@ -343,7 +374,7 @@ body.journal-page {
 /* App Promo Section */
 .journal-app-promo {
     background: linear-gradient(135deg, var(--accent) 0%, var(--primary-light) 100%);
-    color: var(--white);
+    color: var(--text-white);
     padding: var(--space-3xl) var(--space-xl);
     text-align: center;
     margin: var(--space-3xl) 0;
@@ -352,7 +383,7 @@ body.journal-page {
 .journal-app-promo h2 {
     font-family: var(--font-serif);
     font-size: 2rem;
-    color: var(--white);
+    color: var(--text-white);
     border: none;
     margin-bottom: var(--space-md);
 }
@@ -405,7 +436,7 @@ body.journal-page {
 }
 
 .journal-footer h4 {
-    color: var(--white);
+    color: var(--text-white);
     font-size: 1rem;
     margin: 0 0 var(--space-md);
     font-weight: 600;
@@ -448,7 +479,7 @@ body.journal-page {
 /* Page-specific Styles */
 .journal-page-header {
     background: var(--primary);
-    color: var(--white);
+    color: var(--text-white);
     padding: var(--space-2xl) var(--space-xl);
     text-align: center;
 }
@@ -520,4 +551,25 @@ body.journal-page {
     .journal-section {
         padding: var(--space-xl) var(--space-md);
     }
+}
+
+[data-theme="dark"] .journal-btn-text {
+    color: var(--accent-light);
+    border-color: var(--accent-light);
+}
+
+[data-theme="dark"] .journal-btn-text:hover {
+    background: var(--accent-light);
+    color: var(--primary-dark);
+}
+
+[data-theme="dark"] .journal-input {
+    background: rgba(255, 255, 255, 0.05);
+    border-color: var(--border);
+    color: var(--text-dark);
+}
+
+[data-theme="dark"] .journal-input:focus {
+    border-color: var(--accent);
+    box-shadow: 0 0 0 2px rgba(163, 176, 136, 0.2);
 }

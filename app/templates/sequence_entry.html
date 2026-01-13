@@ -1121,8 +1121,18 @@
                 bootstrapInput.value = 1000;
                 iqtreeNote.classList.remove('hidden');
             }
+        } else if (method === 'fasttree') {
+            // FastTree uses hardcoded 1000 in backend, so ensure UI matches
+            bootstrapInput.value = 1000;
+            // Set GTR+CAT model
+            document.getElementById('tree_model').value = 'GTR+CAT';
         } else if (method === 'mrbayes') {
             mbOptions.classList.remove('hidden');
+        }
+
+        // Reset model if switching away from FastTree
+        if (method !== 'fasttree' && document.getElementById('tree_model').value === 'GTR+CAT') {
+            document.getElementById('tree_model').value = 'GTR+G';
         }
     }
 
@@ -1282,12 +1292,68 @@
     // =========================================================================
     const urlParams = new URLSearchParams(window.location.search);
     const EDIT_JOB_ID = urlParams.get('edit_job_id');
+    const CLONE_JOB_ID = urlParams.get('clone_job_id');
     const submitBtn = document.getElementById('submit_btn');
 
+    // --- HANDLE CLONE JOB (Load sequences from another job) ---
+    if (CLONE_JOB_ID) {
+        (async () => {
+            showStatus(`Loading sequences from Job ${CLONE_JOB_ID}...`, 'info');
+            try {
+                // Fetch original FASTA from the source job
+                const resp = await fetch(`/api/job/${CLONE_JOB_ID}/download/fasta/original`);
+                if (!resp.ok) throw new Error(`Failed to fetch source data (Status ${resp.status})`);
+
+                const text = await resp.text();
+                if (!text || !text.trim()) throw new Error("Source job has no sequence data.");
+
+                const sequences = parseFasta(text);
+                if (sequences.length === 0) throw new Error("No valid sequences found in source job.");
+
+                const added = addSequences(sequences);
+                showStatus(`Loaded ${added} sequences from Job ${CLONE_JOB_ID}. You can now run a new analysis.`, 'success');
+
+                // Pre-fill notes to indicate source
+                const notesField = document.getElementById('job_notes');
+                if (notesField) {
+                    notesField.value = `Clone of Job ${CLONE_JOB_ID}`;
+                }
+
+            } catch (e) {
+                console.error(e);
+                showStatus(`Failed to clone job: ${e.message}`, 'error', 5000);
+            }
+        })();
+    }
+
     if (EDIT_JOB_ID) {
+        // --- LOAD EXISTING SEQUENCES ---
+        (async () => {
+            // Only load if we haven't already loaded (e.g. via clone, though they shouldn't coexist)
+            if (sequenceQueue.length === 0) {
+                showStatus(`Loading existing sequences from Job ${EDIT_JOB_ID}...`, 'info');
+                try {
+                    const resp = await fetch(`/api/job/${EDIT_JOB_ID}/download/fasta/original`);
+                    if (!resp.ok) throw new Error(`Failed to fetch job data (Status ${resp.status})`);
+
+                    const text = await resp.text();
+                    if (!text || !text.trim()) throw new Error("Job has no sequence data.");
+
+                    const sequences = parseFasta(text);
+                    const added = addSequences(sequences);
+                    showStatus(`Loaded ${added} existing sequences from Job ${EDIT_JOB_ID}.`, 'success');
+                } catch (e) {
+                    console.error(e);
+                    showStatus(`Failed to load existing sequences: ${e.message}`, 'error', 5000);
+                }
+            }
+        })();
+
         // --- MODIFY UI FOR "ADD SEQ" MODE ---
         document.querySelector('h2').innerHTML = `<i class="fas fa-plus-circle text-journal-gold mr-3"></i>Add Sequences to Job&nbsp;<span class="font-mono text-gray-500">${EDIT_JOB_ID}</span>`;
         document.title = `Add Sequences - Job ${EDIT_JOB_ID}`;
+
+        // Disable clone loading if both are present (Edit takes precedence technically, but they shouldn't occur together)
 
         // Hide "Beginner/Advanced" toggles at top
         const actionRow = document.querySelector('.mt-8.flex.flex-wrap.gap-4');
@@ -1297,19 +1363,11 @@
         // We only want to add sequences, not change pipeline params
         const toggleBtn = document.getElementById('toggle_advanced_btn');
         if (toggleBtn) toggleBtn.closest('div').style.display = 'none';
-        // Or if it shares container
 
         // Change Submit Button
         submitBtn.innerHTML = '<i class="fas fa-plus-circle mr-2"></i> Add & Recompute';
         submitBtn.classList.remove('bg-journal-gold', 'text-journal-dark');
         submitBtn.classList.add('bg-green-600', 'text-white', 'hover:bg-green-700');
-
-        // Also show the button immediately, no need to toggle advanced
-        // Actually, submit_btn is inside advanced_panel which is hidden by default.
-        // We should move it out or ensure it's visible. 
-        // Better: Clone the button to the main area or show the panel simplified.
-        // Let's just append a new specific submission button to the main area for clarity
-        // and hide the advanced options panel.
 
         // Let's create a dedicated "Add & Recompute" button container below the queue
         const queueContainer = document.querySelector('.lg\\:col-span-1 > div'); // The queue card

@@ -15,7 +15,13 @@
     <div class="flex flex-col md:flex-row justify-between items-center gap-4">
         <div>
             <h2 class="text-2xl font-bold text-journal-dark dark:text-gray-100 flex items-center">
-                <i class="fas fa-tree text-journal-gold mr-3"></i>Tree Viewer
+                <i class="fas fa-tree text-journal-gold mr-3"></i>
+                {% if view_only %}
+                Tree Viewer <span class="ml-3 text-lg font-normal text-gray-400 dark:text-gray-500">— Viewing
+                    Only</span>
+                {% else %}
+                Tree Viewer
+                {% endif %}
             </h2>
             {% set align_raw = job_details.get('alignment_method', 'mafft') %}
             {% set tree_raw = job_details.get('tree_method', 'nj') %}
@@ -37,7 +43,15 @@
             {% endif %}
 
             <p class="text-gray-600 dark:text-gray-300 mt-1 font-mono text-sm" title="{{ job_id }}">
-                Job: {{ job_id[:16] }}... <span class="mx-2 opacity-50">|</span>
+                {% if view_only %}
+                <span class="text-gray-500 mr-2"><i class="fas fa-lock text-xs"></i> You can explore and download this
+                    tree, but editing is disabled. Make an editable copy to modify it.</span>
+                <span class="mx-2 opacity-50">|</span>
+                {% endif %}
+                <a href="/tree?clone_job_id={{ job_id }}"
+                    class="hover:text-journal-gold underline decoration-dotted transition-colors"
+                    title="Click to clone sequences to a new job">Job: {{ job_id[:16] }}...</a> <span
+                    class="mx-2 opacity-50">|</span>
                 {{ align }} <i class="fas fa-arrow-right mx-1 text-xs opacity-50"></i> {{ tree }}
                 {% if trim_display %}
                 <span class="mx-2 opacity-50">|</span> {{ trim_display }}
@@ -128,7 +142,7 @@
                         <span class="text-xs font-bold text-gray-600 dark:text-gray-300">PP &gt;</span>
                         <input type="number" id="input-pp-threshold"
                             class="w-14 px-1 py-1 text-xs bg-transparent text-gray-900 dark:text-gray-100 ring-1 ring-gray-300/50 dark:ring-gray-600/50 rounded hover:bg-gray-50 dark:hover:bg-journal-dark/80 focus:ring-2 focus:ring-journal-gold transition-colors"
-                            value="0.95" step="0.05" min="0" max="1">
+                            value="0.80" step="0.05" min="0" max="1">
                     </div>
 
                     <div class="flex items-center gap-1 ml-2">
@@ -296,6 +310,13 @@
 
         <!-- Right Side: Action Buttons -->
         <div class="flex flex-wrap gap-2 items-center">
+            {% if view_only %}
+            <a href="{{ url_for('main.sequence_entry', clone_job_id=job_id) }}"
+                class="px-4 py-2 text-sm font-semibold rounded-lg bg-teal-600 hover:bg-teal-700 text-white transition-colors shadow-sm flex items-center gap-2 ring-2 ring-teal-500/50"
+                title="Create a new submission with these sequences.">
+                <i class="fa fa-clone"></i> Make Editable Copy
+            </a>
+            {% endif %}
             <button type="button"
                 class="px-4 py-2 text-sm font-semibold rounded-lg bg-gray-500 hover:bg-gray-600 text-white transition-colors shadow-sm flex items-center gap-2"
                 id="btn-recompute">
@@ -446,10 +467,11 @@
                     </p>
                     <p class="text-xs text-gray-500 dark:text-gray-400 mt-1">
                         <strong>FastTree 2.2.0</strong> infers approximately-maximum-likelihood phylogenetic trees.
-                        Arguments: <code>-gtr</code> (Generalized Time Reversible model), <code>-nt</code> (Nucleotide
+                        Arguments: <code>-gtr</code> (Generalized Time Reversible model, CAT approximation),
+                        <code>-nt</code> (Nucleotide
                         alignment),
                         <code>-gamma</code> (Rescale branch lengths to optimize Gamma20 likelihood),
-                        <code>-boot 1000</code> (1000 bootstrap replicates).
+                        <code>-boot 1000</code> (1000 SH-like local supports).
                     </p>
                 </div>
                 {% endif %}
@@ -471,6 +493,7 @@
 <script>
     window.JOB_ID = "{{ job_id }}";
     window.TREE_METHOD = "{{ job_details.get('tree_method', '') }}";
+    window.VIEW_ONLY = {{ 'true' if view_only else 'false' }};
 </script>
 
 <script src="https://cdn.jsdelivr.net/npm/d3@7"></script>

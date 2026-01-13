@@ -159,8 +159,15 @@
 
         if (method === 'raxml' || method === 'iqtree') {
             mlOptions.classList.remove('d-none');
+            // Reset to standard if switching back to these
+            if (document.getElementById("tree_model").value === "GTR+CAT") {
+                document.getElementById("tree_model").value = "GTR+G";
+            }
         } else if (method === 'mrbayes') {
             mbOptions.classList.remove('d-none');
+        } else if (method === 'fasttree') {
+            // FastTree uses CAT approx for GTR
+            document.getElementById("tree_model").value = "GTR+CAT";
         }
     }
 
