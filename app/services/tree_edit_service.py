@@ -41,21 +41,45 @@ def load_tree_state(job_dir: Path) -> Dict:
             "root": None # Default
         }
         
-        # Default policy: Midpoint root the tree
-        try:
-            # Store original tree before midpoint rooting for toggle functionality
-            original_newick_path = job_dir / "tree" / "tree_original.newick"
-            if original_newick_path.exists():
-                with open(original_newick_path, "r") as f:
-                    state["pre_midpoint_newick"] = f.read().strip()
-            
-            # We must pass the state as we just created it
-            state = midpoint_root(job_dir, state)
-            state["is_midpoint_rooted"] = True
-            logging.info("Applied default midpoint rooting.")
-        except Exception as e:
-            state["is_midpoint_rooted"] = False
-            logging.warning(f"Default midpoint rooting skipped/failed: {e}")
+        # Determine rooting policy
+        should_midpoint = True
+        
+        # Check if outgroup was specified in job params
+        input_info_path = job_dir / "input_info.json"
+        if input_info_path.exists():
+            try:
+                with open(input_info_path, "r") as f:
+                    info = json.load(f)
+                    # Check metrics or raw params
+                    # job params might be flattening, but 'outgroup' should be in tree_builder_params or metrics
+                    # Let's check typical locations
+                    metrics = info.get("metrics", {})
+                    outgroup = info.get("outgroup") or metrics.get("outgroup")
+                    
+                    if outgroup:
+                        should_midpoint = False
+                        state["root"] = outgroup
+                        state["root_mode"] = "OUTGROUP"
+                        logging.info(f"Outgroup '{outgroup}' detected. Skipping default midpoint rooting.")
+            except Exception as e:
+                logging.warning(f"Failed to check input_info for outgroup: {e}")
+
+        # Default policy: Midpoint root the tree (if not outgroup rooted)
+        if should_midpoint:
+            try:
+                # Store original tree before midpoint rooting for toggle functionality
+                original_newick_path = job_dir / "tree" / "tree_original.newick"
+                if original_newick_path.exists():
+                    with open(original_newick_path, "r") as f:
+                        state["pre_midpoint_newick"] = f.read().strip()
+                
+                # We must pass the state as we just created it
+                state = midpoint_root(job_dir, state)
+                state["is_midpoint_rooted"] = True
+                logging.info("Applied default midpoint rooting.")
+            except Exception as e:
+                state["is_midpoint_rooted"] = False
+                logging.warning(f"Default midpoint rooting skipped/failed: {e}")
 
         save_tree_state(job_dir, state)
         return state

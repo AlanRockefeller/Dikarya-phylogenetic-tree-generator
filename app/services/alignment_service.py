@@ -108,7 +108,7 @@ def _run_mafft(
     and stream stderr to Redis for progress updates.
     """
     threads = _get_thread_count()
-    cmd = [config.MAFFT_BINARY, "--thread", "-1"]  # Use all available threads
+    cmd = [config.MAFFT_BINARY, "--thread", "2", "--adjustdirectionaccurately"]
     
     # Check if this is a fast NJ tree build
     tree_method = params.advanced_options.get("tree_method", "").lower()

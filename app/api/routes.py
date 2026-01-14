@@ -375,7 +375,11 @@ def fetch_inaturalist():
 @bp.route('/job', methods=['POST'])
 def create_job():
     data = request.get_json() or {}
-    # Basic validation or default params could go here
+    
+    # Extract Tree Params for Validation
+    tree_method = data.get("tree_method", "nj")
+    
+    # Basic params
     job_params = {
         "input_type": data.get("input_type", "unknown"),
         "notes": data.get("notes", ""),
@@ -384,13 +388,53 @@ def create_job():
         "alignment_method": data.get("alignment_method", "default"),
         "trimming_method": data.get("trimming_method", "none"),
         "alignment_options": data.get("alignment_options", {}),
-        "tree_method": data.get("tree_method", "nj"),
+        "tree_method": tree_method,
         "tree_model": data.get("tree_model", "GTR+G"),
-        "bootstrap": data.get("bootstrap", 1000),
+        "bootstrap": data.get("bootstrap", 1000), # Legacy field
         "mcmc_generations": data.get("mcmc_generations", 50000),
-        # Add other params as needed
+        "mcmc_nruns": data.get("mcmc_nruns", 2),
+        "mcmc_nchains": data.get("mcmc_nchains", 4),
+        
+        # New RAxML-NG params - Extract raw first
+        "run_preset": data.get("run_preset", "fast_good"),
+        "bootstrap_preset": data.get("bootstrap_preset", "standard"),
+        "bootstrap_cap": data.get("bootstrap_cap"),
+        "enable_bootstrap": data.get("enable_bootstrap", True),
+        "start_tree_override": data.get("start_tree_override"),
+        "moose_enabled": data.get("moose_enabled", False),
+        "early_stopping": data.get("early_stopping", False),
+        "seed": data.get("seed"),
+        "outgroup": data.get("outgroup")
     }
-    
+
+    # Validate/Clamp RAxML params if method is raxml
+    if tree_method == 'raxml':
+        try:
+            from app.services.raxml_validator import validate_and_resolve_raxml_params
+            
+            # Use data_type assumption (can't fully detect here without MSA, assume DNA for initial clamp or check sequence?)
+            # For now default to DNA validation rules, the worker does final check.
+            # But the validator mainly checks Integers which are agnostic.
+            resolved = validate_and_resolve_raxml_params(job_params, data_type="DNA")
+            
+            # overwrite with safe values to ensure what is stored/shown matches execution
+            job_params.update({
+                "bootstrap_cap": resolved.bootstrap_cap,
+                "enable_bootstrap": resolved.enable_bootstrap,
+                "seed": resolved.seed,
+                "outgroup": resolved.outgroup,
+                "moose_enabled": resolved.enable_moose, 
+                "early_stopping": resolved.enable_early_stopping
+            })
+            
+            # Store validation warnings separately
+            if resolved.warnings:
+                job_params['validation_warnings'] = resolved.warnings
+                
+        except Exception as e:
+            logger.error(f"Validation error: {e}")
+            # Continue but verify in worker
+            
     try:
         job_id = enqueue_job(job_params)
         
@@ -404,7 +448,9 @@ def create_job():
                 "tree_method": job_params["tree_method"],
                 "notes": job_params["notes"],
                 "alignment_method": job_params["alignment_method"],
-                "trimming_method": job_params["trimming_method"]
+                "trimming_method": job_params["trimming_method"],
+                "run_preset": job_params.get("run_preset"),
+                "bootstrap_cap": job_params.get("bootstrap_cap")
             }
         )
         
@@ -686,7 +732,17 @@ def recompute_tree_job(job_id):
             bootstrap=int(params_dict.get("bootstrap", 100)),
             mcmc_generations=int(params_dict.get("mcmc_generations", 50000)),
             mcmc_nruns=int(params_dict.get("mcmc_nruns", 2)),
-            mcmc_nchains=int(params_dict.get("mcmc_nchains", 4))
+            mcmc_nchains=int(params_dict.get("mcmc_nchains", 4)),
+            # RAxML Params
+            run_preset=params_dict.get("run_preset", "fast_good"),
+            bootstrap_preset=params_dict.get("bootstrap_preset", "standard"),
+            bootstrap_cap=params_dict.get("bootstrap_cap"),
+            enable_bootstrap=params_dict.get("enable_bootstrap", True),
+            start_tree_override=params_dict.get("start_tree_override"),
+            moose_enabled=params_dict.get("moose_enabled", False),
+            early_stopping=params_dict.get("early_stopping", False),
+            seed=params_dict.get("seed"),
+            outgroup=params_dict.get("outgroup")
         )
         
         job_params = JobParams(

@@ -47,11 +47,23 @@ class TrimmingParams:
 class TreeBuilderParams:
     method: str            # "nj", "raxml", "iqtree", "mrbayes", "fasttree"
     model: str = "GTR+G"   # default model for ML
-    bootstrap: int = 1000   # ML bootstrap replicates (ignored for NJ if not applicable)
+    bootstrap: int = 1000   # ML bootstrap replicates (Ignored for new RAxML workflow in favor of bootstrap_cap/p)
     mcmc_generations: int = 50000   # for MrBayes defaults
     mcmc_nruns: int = 2
     mcmc_nchains: int = 4
     threads: Optional[int] = None   # autodetect if None
+    
+    # New RAxML-NG specific fields
+    run_preset: str = "fast_good"          # fast_good, standard, publication, maximum
+    bootstrap_preset: str = "standard"     # standard, publication, maximum
+    bootstrap_cap: Optional[int] = None    # User override for caps
+    enable_bootstrap: bool = True          # New explicit toggle
+    start_tree_override: Optional[str] = None
+    moose_enabled: bool = False
+    early_stopping: bool = False
+    seed: Optional[int] = None
+    outgroup: Optional[str] = None
+    
     advanced_options: Dict[str, Any] = field(default_factory=dict)
 
 @dataclass
@@ -64,3 +76,4 @@ class JobParams:
     trimming_params: Optional[TrimmingParams] = None
     tree_builder_params: Optional[TreeBuilderParams] = None
     allow_recompute: bool = True
+    validation_warnings: list = field(default_factory=list)

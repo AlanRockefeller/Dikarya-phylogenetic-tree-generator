@@ -338,43 +338,124 @@
                 <select id="tree_method" class="w-full px-4 py-3 border border-gray-300 dark:border-journal-dark rounded-lg 
                                bg-white dark:bg-journal-dark text-gray-900 dark:text-gray-100
                                focus:ring-2 focus:ring-journal-gold focus:border-transparent transition-all">
-                    <option value="fasttree" selected>FastTree 2.2.0 (Maximum Likelihood)</option>
-                    <option value="raxml">RAxML-NG (Maximum Likelihood)</option>
+                    <option value="fasttree" selected>FastTree 2.2.0 (Fast ML)</option>
+                    <option value="raxml">RAxML-NG (High Quality ML)</option>
                     <option value="iqtree">IQ-TREE (Maximum Likelihood)</option>
                     <option value="mrbayes">MrBayes (Bayesian)</option>
                     <option value="nj">Neighbor Joining (Fast)</option>
                 </select>
             </div>
 
+            <!-- Run Quality Preset (RAxML Only) -->
+            <div id="raxml_preset_container" class="hidden">
+                <label for="run_preset" class="block text-sm font-medium text-gray-700 dark:text-gray-200 mb-2">
+                    Run Quality Preset
+                </label>
+                <select id="run_preset" class="w-full px-4 py-3 border border-gray-300 dark:border-journal-dark rounded-lg 
+                               bg-white dark:bg-journal-dark text-gray-900 dark:text-gray-100
+                               focus:ring-2 focus:ring-journal-gold focus:border-transparent transition-all">
+                    <option value="fast_good" selected>Fast but Good (2 Start Trees, Early Stopping OK)</option>
+                    <option value="standard">Standard (5 Start Trees, Early Stopping OK)</option>
+                    <option value="publication">Publication (10 Start Trees, No Early Stop)</option>
+                    <option value="maximum">Maximum (20 Start Trees, No Early Stop)</option>
+                </select>
+                <p class="text-xs text-gray-500 dark:text-gray-400 mt-1">
+                    Controls starting trees and early stopping logic.
+                </p>
+            </div>
+
             <!-- Substitution Model -->
-            <div>
+            <div id="model_container">
                 <label for="tree_model" class="block text-sm font-medium text-gray-700 dark:text-gray-200 mb-2">
                     Substitution Model
                 </label>
+
+                <!-- Standard Text Input -->
                 <input type="text" id="tree_model" value="GTR+G" class="w-full px-4 py-3 border border-gray-300 dark:border-journal-dark rounded-lg 
                               bg-white dark:bg-journal-dark text-gray-900 dark:text-gray-100
                               focus:ring-2 focus:ring-journal-gold focus:border-transparent transition-all">
-                <p class="text-xs text-gray-500 dark:text-gray-400 mt-1">
+
+                <!-- RAxML Dropdown (Hidden initially) -->
+                <select id="raxml_model_select" class="w-full px-4 py-3 border border-gray-300 dark:border-journal-dark rounded-lg 
+                               bg-white dark:bg-journal-dark text-gray-900 dark:text-gray-100
+                               focus:ring-2 focus:ring-journal-gold focus:border-transparent transition-all hidden">
+                    <option value="GTR+G">GTR+G (DNA Default)</option>
+                    <option value="LG+G">LG+G (Protein Default)</option>
+                    <option value="HKY+G">HKY+G</option>
+                    <option value="JC">JC</option>
+                    <option value="K80">K80</option>
+                    <option value="WAG+G">WAG+G</option>
+                    <option value="JTT+G">JTT+G</option>
+                    <option value="AUTO">Auto (MOOSE)</option>
+                    <option value="custom">Custom...</option>
+                </select>
+
+                <p class="text-xs text-gray-500 dark:text-gray-400 mt-1" id="model_help_text">
                     E.g., GTR+G, JC69, HKY.
                 </p>
             </div>
         </div>
 
-        <!-- ML Options (Hidden by default) -->
+        <!-- Outgroup Selection (RAxML Only) -->
+        <div id="outgroup_container" class="mt-6 hidden">
+            <label for="outgroup_select" class="block text-sm font-medium text-gray-700 dark:text-gray-200 mb-2">
+                Outgroup (Optional)
+            </label>
+            <select id="outgroup_select" class="w-full px-4 py-3 border border-gray-300 dark:border-journal-dark rounded-lg 
+                           bg-white dark:bg-journal-dark text-gray-900 dark:text-gray-100
+                           focus:ring-2 focus:ring-journal-gold focus:border-transparent transition-all">
+                <option value="">None (Auto / Midpoint)</option>
+                <!-- Populated by JS -->
+            </select>
+            <p class="text-xs text-gray-500 dark:text-gray-400 mt-1">
+                Select a sequence to root the tree. If selected, tree will NOT be midpoint rooted.
+            </p>
+        </div>
+
+        <!-- ML/Bootstrap Options -->
         <div id="ml_options" class="mt-6 hidden">
-            <div>
+
+            <!-- Standard Bootstrap (IQ-TREE/Generic) -->
+            <div id="standard_bootstrap_options">
                 <label for="bootstrap" class="block text-sm font-medium text-gray-700 dark:text-gray-200 mb-2">
                     Bootstrap Replicates
                 </label>
                 <input type="number" id="bootstrap" value="1000" min="0" max="10000" class="w-full md:w-1/2 px-4 py-3 border border-gray-300 dark:border-journal-dark rounded-lg 
                               bg-white dark:bg-journal-dark text-gray-900 dark:text-gray-100
                               focus:ring-2 focus:ring-journal-gold focus:border-transparent transition-all">
-                <p class="text-xs text-gray-500 dark:text-gray-400 mt-1">
-                    Number of bootstrap trees.
-                </p>
                 <p id="iqtree_bootstrap_note" class="text-xs text-gray-500 dark:text-gray-400 mt-1 hidden">
                     IQ-TREE requires >= 1000 for Ultrafast Bootstrap.
                 </p>
+            </div>
+
+            <!-- RAxML Bootstrap Options -->
+            <div id="raxml_bootstrap_options" class="hidden">
+                <div class="flex items-center mb-3">
+                    <input type="checkbox" id="enable_bootstrap" checked
+                        class="w-4 h-4 text-journal-gold border-gray-300 rounded focus:ring-journal-gold">
+                    <label for="enable_bootstrap"
+                        class="ml-2 block text-sm font-medium text-gray-700 dark:text-gray-200">
+                        Enable Bootstrapping (AutoMRE)
+                    </label>
+                </div>
+
+                <div id="raxml_bs_details" class="ml-6 pl-4 border-l-2 border-gray-200 dark:border-gray-700">
+                    <label class="block text-sm font-medium text-gray-700 dark:text-gray-200 mb-2">
+                        Bootstrap Quality (Replicate Cap)
+                    </label>
+                    <div class="flex gap-4">
+                        <select id="bootstrap_preset" class="w-full md:w-2/3 px-4 py-3 border border-gray-300 dark:border-journal-dark rounded-lg 
+                                       bg-white dark:bg-journal-dark text-gray-900 dark:text-gray-100
+                                       focus:ring-2 focus:ring-journal-gold focus:border-transparent transition-all">
+                            <option value="standard" selected>Standard (Max 500)</option>
+                            <option value="publication">Publication (Max 1000)</option>
+                            <option value="maximum">Maximum (Max 2000)</option>
+                            <option value="custom">Custom Cap...</option>
+                        </select>
+                        <input type="number" id="bootstrap_cap_custom" placeholder="Cap" min="50" max="2000" class="w-1/3 px-4 py-3 border border-gray-300 dark:border-journal-dark rounded-lg 
+                                       bg-white dark:bg-journal-dark text-gray-900 dark:text-gray-100 hidden">
+                    </div>
+                </div>
             </div>
         </div>
 
@@ -404,6 +485,35 @@
                     <input type="number" id="mb_chains" value="4" class="w-full px-4 py-3 border border-gray-300 dark:border-journal-dark rounded-lg 
                                   bg-white dark:bg-journal-dark text-gray-900 dark:text-gray-100
                                   focus:ring-2 focus:ring-journal-gold focus:border-transparent transition-all">
+                </div>
+            </div>
+        </div>
+
+        <!-- RAxML Advanced (Hidden by default) -->
+        <!-- RAxML Advanced (Visible when RAxML selected) -->
+        <div id="raxml_advanced_options" class="mt-6 pt-4 border-t border-gray-200 dark:border-gray-700 hidden">
+            <div class="mb-3 text-sm font-medium text-journal-gold">
+                Advanced RAxML Settings
+            </div>
+            <div id="raxml_adv_panel" class="mt-4 grid grid-cols-1 md:grid-cols-2 gap-4">
+                <div>
+                    <label class="block text-sm font-medium text-gray-700 dark:text-gray-200 mb-2">Seed</label>
+                    <input type="number" id="raxml_seed" placeholder="Random" class="w-full px-4 py-3 border border-gray-300 dark:border-journal-dark rounded-lg 
+                               bg-white dark:bg-journal-dark text-gray-900 dark:text-gray-100">
+                </div>
+                <div>
+                    <label class="block text-sm font-medium text-gray-700 dark:text-gray-200 mb-2">Start Trees
+                        Override</label>
+                    <input type="text" id="start_tree_override" placeholder="e.g. pars{10},rand{10}" class="w-full px-4 py-3 border border-gray-300 dark:border-journal-dark rounded-lg 
+                               bg-white dark:bg-journal-dark text-gray-900 dark:text-gray-100">
+                </div>
+                <div class="col-span-1 md:col-span-2">
+                    <label class="flex items-center">
+                        <input type="checkbox" id="early_stopping" checked
+                            class="w-4 h-4 text-journal-gold border-gray-300 rounded focus:ring-journal-gold">
+                        <span class="ml-2 text-sm text-gray-700 dark:text-gray-200">Enable Early Stopping (BS
+                            convergence)</span>
+                    </label>
                 </div>
             </div>
         </div>
@@ -483,6 +593,13 @@
                 </li>
             `).join('');
         }
+
+        // Auto-update outgroup dropdown if RAxML is selected and function exists
+        if (typeof populateOutgroupDropdown === 'function' &&
+            document.getElementById('tree_method') &&
+            document.getElementById('tree_method').value === 'raxml') {
+            populateOutgroupDropdown();
+        }
     }
 
     function escapeHtml(text) {
@@ -493,9 +610,12 @@
     }
 
     function addSequences(sequences, removeDuplicates = true) {
-        const existingNames = new Set(sequenceQueue.map(s => s.name));
+        const existingNames = new Set(sequenceQueue.map(s => String(s.name)));
         let added = 0;
         for (const seq of sequences) {
+            // Normalize inputs
+            seq.name = String(seq.name);
+
             if (!removeDuplicates || !existingNames.has(seq.name)) {
                 sequenceQueue.push(seq);
                 existingNames.add(seq.name);
@@ -1098,58 +1218,6 @@
             : '<i class="fas fa-sliders-h mr-3"></i> Advanced Options';
     });
 
-    // =========================================================================
-    // Dynamic Form Logic for Tree Method Options
-    // =========================================================================
-    const treeMethodSelect = document.getElementById('tree_method');
-    const mlOptions = document.getElementById('ml_options');
-    const mbOptions = document.getElementById('mrbayes_options');
-
-    function updateForm() {
-        const method = treeMethodSelect.value;
-        const bootstrapInput = document.getElementById('bootstrap');
-        const iqtreeNote = document.getElementById('iqtree_bootstrap_note');
-        mlOptions.classList.add('hidden');
-        mbOptions.classList.add('hidden');
-        iqtreeNote.classList.add('hidden');
-
-        if (method === 'raxml' || method === 'iqtree') {
-            mlOptions.classList.remove('hidden');
-            if (method === 'raxml') {
-                bootstrapInput.value = 100;
-            } else if (method === 'iqtree') {
-                bootstrapInput.value = 1000;
-                iqtreeNote.classList.remove('hidden');
-            }
-        } else if (method === 'fasttree') {
-            // FastTree uses hardcoded 1000 in backend, so ensure UI matches
-            bootstrapInput.value = 1000;
-            // Set GTR+CAT model
-            document.getElementById('tree_model').value = 'GTR+CAT';
-        } else if (method === 'mrbayes') {
-            mbOptions.classList.remove('hidden');
-        }
-
-        // Reset model if switching away from FastTree
-        if (method !== 'fasttree' && document.getElementById('tree_model').value === 'GTR+CAT') {
-            document.getElementById('tree_model').value = 'GTR+G';
-        }
-    }
-
-    treeMethodSelect.addEventListener('change', updateForm);
-
-    // =========================================================================
-    // Build FASTA from Queue
-    // =========================================================================
-    function buildFastaFromQueue() {
-        return sequenceQueue.map(seq => {
-            let header = seq.name;
-            if (seq.organism) {
-                header = `${header} ${seq.organism}`;
-            }
-            return `>${header}\n${seq.sequence}`;
-        }).join('\n');
-    }
 
     // =========================================================================
     // Quick Tree Submit
@@ -1219,7 +1287,190 @@
     });
 
     // =========================================================================
-    // Advanced Submit Logic
+    // Tree Method Form Logic
+    // =========================================================================
+    const treeMethodSelect = document.getElementById('tree_method');
+    const mlOptions = document.getElementById('ml_options');
+    const mbOptions = document.getElementById('mrbayes_options');
+
+    // RAxML Specifics
+    const raxmlPresetContainer = document.getElementById('raxml_preset_container');
+    const raxmlModelSelect = document.getElementById('raxml_model_select');
+    const treeModelText = document.getElementById('tree_model');
+    const outgroupContainer = document.getElementById('outgroup_container');
+    const standardBootstrapOptions = document.getElementById('standard_bootstrap_options');
+    const raxmlBootstrapOptions = document.getElementById('raxml_bootstrap_options');
+    const raxmlAdvancedOptions = document.getElementById('raxml_advanced_options');
+
+    function updateForm() {
+        const method = treeMethodSelect.value;
+        const bootstrapInput = document.getElementById('bootstrap');
+        const iqtreeNote = document.getElementById('iqtree_bootstrap_note');
+
+        // Reset Visibilities
+        mlOptions.classList.add('hidden');
+        mbOptions.classList.add('hidden');
+        iqtreeNote.classList.add('hidden');
+        raxmlPresetContainer.classList.add('hidden');
+        outgroupContainer.classList.add('hidden');
+        raxmlAdvancedOptions.classList.add('hidden');
+
+        // Model Input Logic
+        // If RAxML: Show Dropdown, Hide Text
+        // Else: Show Text, Hide Dropdown
+        if (method === 'raxml') {
+            raxmlModelSelect.classList.remove('hidden');
+            treeModelText.classList.add('hidden');
+            document.getElementById('model_help_text').classList.add('hidden');
+        } else {
+            raxmlModelSelect.classList.add('hidden');
+            treeModelText.classList.remove('hidden');
+            document.getElementById('model_help_text').classList.remove('hidden');
+        }
+
+        if (method === 'raxml' || method === 'iqtree') {
+            mlOptions.classList.remove('hidden');
+
+            if (method === 'raxml') {
+                // RAxML Mode
+                raxmlPresetContainer.classList.remove('hidden');
+                outgroupContainer.classList.remove('hidden');
+                standardBootstrapOptions.classList.add('hidden');
+                raxmlBootstrapOptions.classList.remove('hidden');
+                raxmlAdvancedOptions.classList.remove('hidden');
+
+                populateOutgroupDropdown();
+
+                // Defaults for RAxML model if unset or generic (Switch to AUTO)
+                // We default to AUTO (MOOSE) for new selects
+                if (raxmlModelSelect.value === 'GTR+G' || raxmlModelSelect.value === 'LG+G') {
+                    raxmlModelSelect.value = 'AUTO';
+                }
+
+            } else if (method === 'iqtree') {
+                // IQ-TREE Mode
+                bootstrapInput.value = 1000;
+                iqtreeNote.classList.remove('hidden');
+                standardBootstrapOptions.classList.remove('hidden');
+                raxmlBootstrapOptions.classList.add('hidden');
+
+                if (treeModelText.value === 'GTR+CAT') {
+                    // Reset if coming from FastTree
+                    treeModelText.value = 'GTR+G';
+                }
+            }
+        } else if (method === 'fasttree') {
+            // FastTree uses hardcoded 1000 in backend, but we might want to show options?
+            // Existing logic enforced checks.
+            // Hide specific ML options used for custom inputs, 
+            // but effectively it IS ML. But maybe we assume defaults.
+            // Existing code didn't show ml_options for fasttree except technically it checked 'raxml' or 'iqtree'.
+            // Wait, previous code: if (method === 'raxml' || method === 'iqtree') { show ML }
+            // FastTree was separate.
+
+            bootstrapInput.value = 1000;
+            treeModelText.value = 'GTR+CAT';
+        } else if (method === 'mrbayes') {
+            mbOptions.classList.remove('hidden');
+            if (treeModelText.value === 'GTR+CAT') {
+                treeModelText.value = 'GTR+G';
+            }
+        } else {
+            if (treeModelText.value === 'GTR+CAT') {
+                treeModelText.value = 'GTR+G';
+            }
+        }
+    }
+
+    // Listeners
+    treeMethodSelect.addEventListener('change', updateForm);
+
+    // RAxML Model Dropdown Sync
+    // When dropdown changes (custom or preset), logic is handled at submit time or here?
+    // We can just read the correct input at submit time.
+
+    raxmlModelSelect.addEventListener('change', () => {
+        if (raxmlModelSelect.value === 'custom') {
+            const custom = prompt("Enter custom model (e.g. GTR+F+I+G4):");
+            if (custom) {
+                // Add temporary option
+                const opt = document.createElement('option');
+                opt.value = custom;
+                opt.text = custom + " (Custom)";
+                opt.selected = true;
+                raxmlModelSelect.add(opt);
+                raxmlModelSelect.value = custom;
+            } else {
+                raxmlModelSelect.value = "GTR+G";
+            }
+        }
+    });
+
+    // RAxML Bootstrap Cap Toggle
+    const bsPreset = document.getElementById('bootstrap_preset');
+    const bsCustomInput = document.getElementById('bootstrap_cap_custom');
+
+    bsPreset.addEventListener('change', () => {
+        if (bsPreset.value === 'custom') {
+            bsCustomInput.classList.remove('hidden');
+        } else {
+            bsCustomInput.classList.add('hidden');
+        }
+    });
+
+    // Toggle RAxML Advanced (Button Removed)
+    // const toggleRaxmlAdv = document.getElementById('toggle_raxml_adv');
+    // const raxmlAdvPanel = document.getElementById('raxml_adv_panel');
+    // const raxmlAdvIcon = document.getElementById('raxml_adv_icon');
+    // 
+    // if(toggleRaxmlAdv) {
+    //      toggleRaxmlAdv.addEventListener('click', () => {
+    //          raxmlAdvPanel.classList.toggle('hidden');
+    //          raxmlAdvIcon.classList.toggle('rotate-90');
+    //      });
+    // }
+
+    // Outgroup Population
+    function populateOutgroupDropdown() {
+        const select = document.getElementById('outgroup_select');
+        const currentSelection = select.value;
+
+        // Clear except first
+        while (select.options.length > 1) {
+            select.remove(1);
+        }
+
+        // Populate
+        let defaultFound = false;
+        sequenceQueue.forEach(seq => {
+            const opt = document.createElement('option');
+            opt.value = seq.name;
+            opt.text = seq.name + (seq.organism ? ` (${seq.organism})` : '');
+
+            select.add(opt);
+
+            // Auto-select "outgroup"
+            if (!defaultFound && seq.name.toLowerCase().includes('outgroup')) {
+                opt.selected = true;
+                defaultFound = true;
+            }
+        });
+
+        // Restore selection if valid
+        if (currentSelection && [...select.options].some(o => o.value === currentSelection)) {
+            select.value = currentSelection;
+        } else if (!defaultFound) {
+            select.value = "";
+        }
+    }
+
+    // Init initial state
+    updateForm();
+    // Re-run population when queue changes?
+    // Hooked into updateQueueDisplay directly now.
+
+    // =========================================================================
+    // Submit Logic
     // =========================================================================
     document.getElementById('submit_btn').addEventListener('click', async () => {
         const btn = document.getElementById('submit_btn');
@@ -1245,6 +1496,17 @@
             }
         }
 
+        // Determine Model
+        let model = document.getElementById('tree_model').value; // Default
+        if (treeMethodSelect.value === 'raxml') {
+            model = document.getElementById('raxml_model_select').value;
+            // Handle AUTO -> enable feature flag?
+            // Backend handles AUTO value? Or we should toggle moose_enabled here?
+            // The params let us send "moose_enabled".
+        }
+
+        const isRaxml = treeMethodSelect.value === 'raxml';
+
         const payload = {
             input_type: 'sequence',
             sequence: buildFastaFromQueue(),
@@ -1252,11 +1514,26 @@
             alignment_method: document.getElementById('alignment_method').value,
             trimming_method: document.getElementById('trimming_method').value,
             tree_method: treeMethodSelect.value,
-            tree_model: document.getElementById('tree_model').value,
+            tree_model: isRaxml && model === 'AUTO' ? 'GTR+G' : model, // Fallback model if AUTO triggers moose
+
+            // Standard ML params
             bootstrap: parseInt(document.getElementById('bootstrap').value) || 100,
+
+            // Bayes params
             mcmc_generations: parseInt(document.getElementById('mb_gen').value) || 50000,
             mcmc_nruns: parseInt(document.getElementById('mb_runs').value) || 2,
-            mcmc_nchains: parseInt(document.getElementById('mb_chains').value) || 4
+            mcmc_nchains: parseInt(document.getElementById('mb_chains').value) || 4,
+
+            // RAxML Params
+            run_preset: document.getElementById('run_preset').value,
+            bootstrap_preset: document.getElementById('bootstrap_preset').value,
+            bootstrap_cap: document.getElementById('bootstrap_cap_custom').value ? parseInt(document.getElementById('bootstrap_cap_custom').value) : null,
+            enable_bootstrap: document.getElementById('enable_bootstrap').checked,
+            start_tree_override: document.getElementById('start_tree_override').value,
+            moose_enabled: isRaxml && model === 'AUTO',
+            early_stopping: document.getElementById('early_stopping').checked,
+            seed: document.getElementById('raxml_seed').value ? parseInt(document.getElementById('raxml_seed').value) : null,
+            outgroup: document.getElementById('outgroup_select').value || null
         };
 
         try {
@@ -1285,6 +1562,17 @@
             btn.innerHTML = '<i class="fas fa-play mr-2"></i> Start Analysis';
         }
     });
+
+    // Helper to build FASTA
+    function buildFastaFromQueue() {
+        return sequenceQueue.map(seq => {
+            let header = seq.name;
+            if (seq.organism) {
+                header = `${header} ${seq.organism}`;
+            }
+            return `>${header}\n${seq.sequence}`;
+        }).join('\n');
+    }
 
     // =========================================================================
     // =========================================================================

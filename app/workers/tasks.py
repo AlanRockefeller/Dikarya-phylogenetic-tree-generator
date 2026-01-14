@@ -245,6 +245,13 @@ def run_phylo_job(job_params: dict) -> dict:
             if db_job:
                 metrics = db_job.metrics or {}
                 metrics["started_at"] = datetime.now(timezone.utc).isoformat()
+                
+                # Check for validation warnings passed from API
+                validation_warnings = job_params.get("validation_warnings", [])
+                if validation_warnings:
+                    metrics["validation_warnings"] = validation_warnings
+                    logger.warning(f"Job started with params warnings: {validation_warnings}")
+
                 db_job.metrics = metrics
                 db_job.status = "running"
                 db.session.commit()
@@ -600,6 +607,16 @@ def run_phylo_job(job_params: dict) -> dict:
                 model=tree_model,
                 bootstrap=bootstrap,
                 mcmc_generations=mcmc_gens,
+                # RAxML Params
+                run_preset=job_params.get("run_preset", "fast_good"),
+                bootstrap_preset=job_params.get("bootstrap_preset", "standard"),
+                bootstrap_cap=job_params.get("bootstrap_cap"),
+                enable_bootstrap=job_params.get("enable_bootstrap", True),
+                start_tree_override=job_params.get("start_tree_override"),
+                moose_enabled=job_params.get("moose_enabled", False),
+                early_stopping=job_params.get("early_stopping", False),
+                seed=job_params.get("seed"),
+                outgroup=job_params.get("outgroup")
             )
 
             metadata = run_tree_builder(
