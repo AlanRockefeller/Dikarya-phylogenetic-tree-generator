@@ -11,6 +11,7 @@ When job_id is provided, streams log output to Redis for real-time SSE updates.
 """
 
 import os
+import shutil
 from pathlib import Path
 from typing import Optional
 
@@ -55,7 +56,10 @@ def run_alignment(
     logger.info(f"Starting alignment with method: {method}")
     
     try:
-        if method == "mafft":
+        if method == "none":
+            logger.info("Skipping alignment (method='none'). Copying input to output.")
+            shutil.copy(input_fasta, output_fasta)
+        elif method == "mafft":
             _run_mafft(input_fasta, output_fasta, params, config, logger, job_id)
         elif method == "muscle":
             _run_muscle(input_fasta, output_fasta, params, config, logger, job_id)

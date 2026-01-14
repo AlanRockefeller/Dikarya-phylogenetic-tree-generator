@@ -4,8 +4,9 @@ import logging
 import re
 import time
 import requests
+import threading
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Any
 from app.config import Config
 
 logger = logging.getLogger(__name__)
@@ -13,12 +14,90 @@ logger = logging.getLogger(__name__)
 NCBI_BLAST_URL = "https://blast.ncbi.nlm.nih.gov/Blast.cgi"
 NCBI_EFETCH_URL = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi"
 
-def blast_from_sequence(seq: str, config: Config, logger=logger) -> Dict:
+# Global rate limiter state
+_ncbi_lock = threading.Lock()
+_last_request_time = 0.0
+_MIN_REQUEST_GAP = 1.0 / 3.0  # At least 0.34s between requests (~3 req/s)
+
+def _ncbi_request(method: str, url: str, **kwargs) -> requests.Response:
+    """
+    Helper to perform NCBI requests with:
+    - Global rate limiting (min gap between requests)
+    - User-Agent header
+    - Retries with exponential backoff for suitable errors
+    - Respect for Retry-After headers
+    """
+    global _last_request_time
+    
+    # 1. Apply Rate Limit
+    with _ncbi_lock:
+        now = time.monotonic()
+        elapsed = now - _last_request_time
+        if elapsed < _MIN_REQUEST_GAP:
+            sleep_time = _MIN_REQUEST_GAP - elapsed
+            time.sleep(sleep_time)
+        _last_request_time = time.monotonic()
+
+    # 2. Prepare headers
+    headers = kwargs.get("headers", {})
+    # Use a descriptive User-Agent
+    if "User-Agent" not in headers:
+        headers["User-Agent"] = f"Dikarya/1.0 ({Config.BLAST_EMAIL})"
+    kwargs["headers"] = headers
+    
+    # 3. Execute with Retries
+    # Retry on: Connection errors, Timeouts, HTTP 429, HTTP 5xx
+    # Do NOT retry on: HTTP 4xx (except 429)
+    max_retries = 5
+    backoff = 1.0  # Start with 1s
+    
+    for attempt in range(max_retries):
+        try:
+            response = requests.request(method, url, **kwargs)
+            
+            # Check for 429 Too Many Requests
+            if response.status_code == 429:
+                retry_after = response.headers.get("Retry-After")
+                if retry_after:
+                    try:
+                        wait_time = int(retry_after)
+                    except ValueError:
+                        wait_time = backoff
+                else:
+                    wait_time = backoff
+                
+                logger.warning(f"NCBI 429 (Too Many Requests). Waiting {wait_time}s before retry {attempt + 1}/{max_retries}")
+                time.sleep(wait_time)
+                backoff *= 2 # Exponential backoff for next time if needed
+                continue
+                
+            # Check for 5xx Server Errors
+            if 500 <= response.status_code < 600:
+                logger.warning(f"NCBI {response.status_code} Error. Waiting {backoff}s before retry {attempt + 1}/{max_retries}")
+                time.sleep(backoff)
+                backoff *= 2
+                continue
+            
+            # For other statuses, letting raise_for_status handle or return response
+            # Note: We return response here and let caller decide to raise for 4xx
+            return response
+            
+        except (requests.ConnectionError, requests.Timeout) as e:
+            logger.warning(f"NCBI Connection/Timeout error: {e}. Waiting {backoff}s before retry {attempt + 1}/{max_retries}")
+            time.sleep(backoff)
+            backoff *= 2
+            
+    # Final attempt (or if we ran out of retries)
+    # If we exited loop, try one last time or re-raise
+    raise requests.exceptions.RetryError(f"Max retries ({max_retries}) exceeded for NCBI request to {url}")
+
+
+def blast_from_sequence(seq: str, config: Config, min_identity: float = 90.0, max_sequences: int = 50, logger=logger) -> Dict:
     """
     Perform remote BLAST using the given nucleotide sequence.
     Use caching if available.
     """
-    query_hash = _hash_query(seq)
+    query_hash = _hash_query(seq, min_identity, max_sequences)
     cached_result = _check_cache(query_hash, config)
     if cached_result:
         logger.info(f"BLAST cache hit for hash {query_hash}")
@@ -27,10 +106,10 @@ def blast_from_sequence(seq: str, config: Config, logger=logger) -> Dict:
     logger.info(f"BLAST cache miss for hash {query_hash}. Submitting to NCBI.")
     
     try:
-        rid, rtoe = _submit_blast_request(seq, config)
+        rid, rtoe = _submit_blast_request(seq, config, min_identity, max_sequences)
         logger.info(f"BLAST submitted. RID: {rid}, RTOE: {rtoe}")
         
-        _poll_blast(rid, rtoe, logger)
+        _poll_blast(rid, rtoe, config, logger)
         
         blast_result = _fetch_blast_results(rid)
         hit_accessions = blast_result.get("accessions", [])
@@ -44,9 +123,10 @@ def blast_from_sequence(seq: str, config: Config, logger=logger) -> Dict:
         
     except Exception as e:
         logger.error(f"BLAST failed: {e}")
+        # Re-raise to let caller handle failure (e.g. show user error)
         raise
 
-def blast_from_accessions(accessions: List[str], config: Config, logger=logger) -> Dict:
+def blast_from_accessions(accessions: List[str], config: Config, min_identity: float = 90.0, max_sequences: int = 50, logger=logger) -> Dict:
     """
     Retrieve sequences for the provided accessions.
     Then run remote BLAST using the combined sequence.
@@ -55,7 +135,7 @@ def blast_from_accessions(accessions: List[str], config: Config, logger=logger) 
     # Sort to ensure stable hash
     sorted_accessions = sorted(accessions)
     query_str = ",".join(sorted_accessions)
-    query_hash = _hash_query(query_str)
+    query_hash = _hash_query(query_str, min_identity, max_sequences)
     
     cached_result = _check_cache(query_hash, config)
     if cached_result:
@@ -69,14 +149,10 @@ def blast_from_accessions(accessions: List[str], config: Config, logger=logger) 
         query_fasta = fetch_fasta_for_accessions(sorted_accessions)
         
         # 2. Run BLAST with these sequences
-        # Note: We use the same flow as blast_from_sequence, but we might want to 
-        # include the original sequences in the final result too. 
-        # For now, let's just BLAST them.
-        
-        rid, rtoe = _submit_blast_request(query_fasta, config)
+        rid, rtoe = _submit_blast_request(query_fasta, config, min_identity, max_sequences)
         logger.info(f"BLAST submitted. RID: {rid}, RTOE: {rtoe}")
         
-        _poll_blast(rid, rtoe, logger)
+        _poll_blast(rid, rtoe, config, logger)
         
         blast_result = _fetch_blast_results(rid)
         hit_accessions = blast_result.get("accessions", [])
@@ -101,8 +177,9 @@ def blast_from_accessions(accessions: List[str], config: Config, logger=logger) 
         logger.error(f"BLAST from accessions failed: {e}")
         raise
 
-def _hash_query(query_str: str) -> str:
-    return hashlib.sha256(query_str.encode('utf-8')).hexdigest()
+def _hash_query(query_str: str, min_identity: float = 90.0, max_sequences: int = 50) -> str:
+    raw = f"{query_str}|{min_identity}|{max_sequences}"
+    return hashlib.sha256(raw.encode('utf-8')).hexdigest()
 
 def _check_cache(query_hash: str, config: Config) -> Optional[Dict]:
     # Validate hash format (SHA-256 = 64 hex chars)
@@ -159,7 +236,7 @@ def _save_cache(query_hash: str, hit_accessions: List[str], hit_details: List[Di
         "metadata_path": str(json_path)
     }
 
-def _submit_blast_request(seq: str, config: Config = None) -> Tuple[str, int]:
+def _submit_blast_request(seq: str, config: Config = None, min_identity: float = 90.0, max_sequences: int = 50) -> Tuple[str, int]:
     """Submit a BLAST request to NCBI and return RID and estimated wait time."""
     from app.config import Config as DefaultConfig
     if config is None:
@@ -171,19 +248,23 @@ def _submit_blast_request(seq: str, config: Config = None) -> Tuple[str, int]:
     
     # Log sequence info
     seq_preview = seq[:100] + "..." if len(seq) > 100 else seq
-    logger.info(f"Submitting BLAST request, sequence preview: {seq_preview}")
+    logger.info(f"Submitting BLAST request (ident={min_identity}%, max={max_sequences}), sequence preview: {seq_preview}")
     
     params = {
         "CMD": "Put",
         "PROGRAM": "blastn",
         "DATABASE": "nt",
         "QUERY": seq,
-        "HITLIST_SIZE": 50,
-        "ALIGNMENTS": 50,
+        "HITLIST_SIZE": max_sequences,
+        "ALIGNMENTS": max_sequences,
+        "PERC_IDENT": min_identity,
         "FORMAT_TYPE": "JSON2",
         "EMAIL": config.BLAST_EMAIL
     }
-    response = requests.post(NCBI_BLAST_URL, data=params, timeout=(10, 60))
+    
+    # Use _ncbi_request helper
+    response = _ncbi_request("POST", NCBI_BLAST_URL, data=params, timeout=(10, 60))
+    # Raise if 4xx/5xx (though 5xx handled by retry, final attempt might fail)
     response.raise_for_status()
     
     logger.debug(f"BLAST submission response: {response.text[:500]}")
@@ -208,45 +289,64 @@ def _submit_blast_request(seq: str, config: Config = None) -> Tuple[str, int]:
     logger.info(f"BLAST submission successful. RID={rid}, RTOE={rtoe}")
     return rid, rtoe
 
-def _poll_blast(rid: str, rtoe: int, logger) -> None:
+def _poll_blast(rid: str, rtoe: int, config: Config, logger) -> None:
     """Poll NCBI for BLAST job completion."""
-    # Wait initial RTOE
+    # 1. Wait initial RTOE
     logger.info(f"Waiting {rtoe} seconds for RTOE...")
     time.sleep(rtoe)
     
     start_time = time.time()
     max_wait = 600  # 10 minutes max
     
+    # Use configured poll interval, but MINIMUM 60 seconds
+    configured_interval = getattr(config, 'BLAST_POLL_INTERVAL_SECONDS', 60)
+    poll_interval = max(60, configured_interval)
+    
+    # 2. Poll Loop
     while (time.time() - start_time) < max_wait:
         params = {
             "CMD": "Get",
             "FORMAT_OBJECT": "SearchInfo",
             "RID": rid
         }
-        response = requests.get(NCBI_BLAST_URL, params=params, timeout=(5, 30))
-        content = response.text
         
-        # Log full poll response for debugging
-        logger.debug(f"Poll response for RID {rid}: {content[:500]}")
-        
-        if "Status=WAITING" in content:
-            logger.info("BLAST Status: WAITING. Sleeping 10s...")
-            time.sleep(10)
-            continue
-        
-        if "Status=FAILED" in content:
-            raise RuntimeError(f"BLAST failed for RID {rid}")
+        # Use helper
+        try:
+            response = _ncbi_request("GET", NCBI_BLAST_URL, params=params, timeout=(5, 30))
+            # Don't strictly raise on 404/etc inside poll loop? Actually SearchInfo should exist.
+            # If 404, maybe RID expired.
+            if response.status_code != 200:
+                logger.warning(f"Poll got status {response.status_code}. Retrying next cycle.")
+                time.sleep(poll_interval)
+                continue
+                
+            content = response.text
+             # Log full poll response for debugging
+            logger.debug(f"Poll response for RID {rid}: {content[:500]}")
             
-        if "Status=UNKNOWN" in content:
-            raise RuntimeError(f"BLAST RID {rid} expired or unknown")
+            if "Status=WAITING" in content:
+                logger.info(f"BLAST Status: WAITING. Sleeping {poll_interval}s...")
+                time.sleep(poll_interval)
+                continue
             
-        if "Status=READY" in content:
-            if "ThereAreHits=yes" in content:
-                logger.info("BLAST Status: READY with hits.")
-            else:
-                # Still try to fetch - sometimes this flag is wrong
-                logger.warning("BLAST Status: READY but ThereAreHits=no (will still attempt to fetch results).")
-            return
+            if "Status=FAILED" in content:
+                raise RuntimeError(f"BLAST failed for RID {rid}")
+                
+            if "Status=UNKNOWN" in content:
+                raise RuntimeError(f"BLAST RID {rid} expired or unknown")
+                
+            if "Status=READY" in content:
+                if "ThereAreHits=yes" in content:
+                    logger.info("BLAST Status: READY with hits.")
+                else:
+                    # Still try to fetch - sometimes this flag is wrong
+                    logger.warning("BLAST Status: READY but ThereAreHits=no (will still attempt to fetch results).")
+                return
+                
+        except Exception as e:
+             logger.warning(f"Poll exception: {e}. Retrying next cycle.")
+             time.sleep(poll_interval)
+             continue
 
     raise TimeoutError("BLAST timed out waiting for results")
 
@@ -264,7 +364,8 @@ def _fetch_blast_results(rid: str) -> Dict[str, List]:
         "FORMAT_TYPE": "JSON2",
         "RID": rid
     }
-    response = requests.get(NCBI_BLAST_URL, params=params, timeout=(10, 120))
+    
+    response = _ncbi_request("GET", NCBI_BLAST_URL, params=params, timeout=(10, 120))
     response.raise_for_status()
     
     content_type = response.headers.get('content-type', '')
@@ -404,7 +505,8 @@ def fetch_fasta_for_accessions(accessions: List[str]) -> str:
         "rettype": "fasta",
         "retmode": "text"
     }
-    response = requests.post(NCBI_EFETCH_URL, data=params, timeout=(10, 60))
+    
+    response = _ncbi_request("POST", NCBI_EFETCH_URL, data=params, timeout=(10, 60))
     response.raise_for_status()
     
     fasta_text = response.text

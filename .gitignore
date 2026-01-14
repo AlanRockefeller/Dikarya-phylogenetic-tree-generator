@@ -47,3 +47,5 @@ Thumbs.db
 
 # ---- Misc ----
 test_input.fasta
+test_sanitized.fasta
+test_tree.newick

@@ -121,15 +121,19 @@ def run_blast():
     try:
         from app.services.blast_service import blast_from_sequence, blast_from_accessions
         from pathlib import Path
+
+        # Extract parameters
+        min_identity = float(data.get('min_identity', 90.0))
+        max_sequences = int(data.get('max_sequences', 50))
         
         # Determine if query is an accession or a sequence
         if _is_genbank_accession(query):
             logger.info(f"BLAST API: Detected accession: {query}")
-            result = blast_from_accessions([query], Config)
+            result = blast_from_accessions([query], Config, min_identity=min_identity, max_sequences=max_sequences)
         else:
             # Assume it's a raw sequence
             logger.info(f"BLAST API: Using sequence query ({len(query)} chars)")
-            result = blast_from_sequence(query, Config)
+            result = blast_from_sequence(query, Config, min_identity=min_identity, max_sequences=max_sequences)
         
         # Read FASTA content from the file path returned by blast service
         fasta_path = result.get('fasta_path', '')

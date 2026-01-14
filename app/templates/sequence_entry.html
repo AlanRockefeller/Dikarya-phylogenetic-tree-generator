@@ -28,135 +28,11 @@
     <!-- Left Section: 2 columns -->
     <div class="lg:col-span-2 space-y-6">
 
-        <!-- Sequence Input Card -->
-        <div class="bg-white dark:bg-journal-green rounded-xl shadow-lg p-6 transition-colors">
-            <h3 class="text-xl font-semibold text-journal-dark dark:text-gray-100 mb-4 flex items-center">
-                <i class="fas fa-edit text-journal-gold mr-2"></i>
-                1. Add Sequences
-            </h3>
-
-            <div class="space-y-4">
-                <div>
-                    <label for="sequence_text" class="block text-sm font-medium text-gray-700 dark:text-gray-200 mb-2">
-                        Paste FASTA Sequences or GenBank Accession
-                    </label>
-                    <textarea id="sequence_text" rows="8" class="w-full font-mono text-sm px-4 py-3 border border-gray-300 dark:border-journal-dark rounded-lg 
-                               bg-white dark:bg-journal-dark text-gray-900 dark:text-gray-100
-                               focus:ring-2 focus:ring-journal-gold focus:border-transparent 
-                               transition-all resize-none"
-                        placeholder=">seq1&#10;ATGCGATCGATCGATCG...&#10;&#10;Or enter a GenBank accession like: OP973765"></textarea>
-                    <p class="text-xs text-gray-500 dark:text-gray-400 mt-1">
-                        Enter sequences in FASTA format or a single GenBank accession number.
-                    </p>
-                </div>
-
-                <!-- Action Buttons for Input -->
-                <div class="flex flex-wrap gap-3">
-                    <button id="add_sequences_btn" class="flex-1 min-w-[140px] bg-journal-gold hover:bg-journal-gold-light text-journal-dark 
-                                   py-3 px-4 rounded-lg font-semibold shadow-md hover:shadow-lg 
-                                   transition-all flex items-center justify-center">
-                        <i class="fas fa-plus mr-2"></i> Add Sequences
-                    </button>
-                    <button id="blast_btn"
-                        class="flex-1 min-w-[140px] bg-journal-dark hover:bg-journal-green text-white 
-                                   py-3 px-4 rounded-lg font-semibold shadow-md hover:shadow-lg 
-                                   transition-all flex items-center justify-center disabled:opacity-50 disabled:cursor-not-allowed"
-                        disabled>
-                        <i class="fas fa-search mr-2"></i> BLAST for Related
-                    </button>
-                </div>
-            </div>
-        </div>
-
-        <!-- File Upload Card -->
-        <div class="bg-white dark:bg-journal-green rounded-xl shadow-lg p-6 transition-colors">
-            <h3 class="text-xl font-semibold text-journal-dark dark:text-gray-100 mb-4 flex items-center">
-                <i class="fas fa-file-upload text-journal-gold mr-2"></i>
-                Or Upload a File
-            </h3>
-
-            <div class="space-y-4">
-                <label for="sequence_file" class="block w-full border-2 border-dashed border-gray-300 dark:border-gray-600 
-                              rounded-lg p-8 text-center cursor-pointer
-                              hover:border-journal-gold dark:hover:border-journal-gold
-                              transition-colors bg-gray-50 dark:bg-journal-dark">
-                    <i class="fas fa-cloud-upload-alt text-4xl text-gray-400 dark:text-gray-500 mb-3"></i>
-                    <p class="text-sm text-gray-600 dark:text-gray-300">
-                        <span class="font-semibold text-journal-gold">Click to upload</span> or drag and drop
-                    </p>
-                    <p class="text-xs text-gray-500 dark:text-gray-400 mt-1">
-                        FASTA files (.fa, .fasta, .fna, .txt)
-                    </p>
-                    <input type="file" id="sequence_file" class="hidden" accept=".fa,.fasta,.fna,.txt">
-                </label>
-
-                <!-- Job Notes -->
-                <div>
-                    <label for="job_notes" class="block text-sm font-medium text-gray-700 dark:text-gray-200 mb-2">
-                        Job Name / Notes
-                    </label>
-                    <input type="text" id="job_notes" class="w-full px-4 py-3 border border-gray-300 dark:border-journal-dark rounded-lg 
-                                  bg-white dark:bg-journal-dark text-gray-900 dark:text-gray-100
-                                  focus:ring-2 focus:ring-journal-gold focus:border-transparent transition-all"
-                        placeholder="e.g. Fungal ITS Analysis">
-                </div>
-            </div>
-        </div>
-
-        <!-- Mycomap URL Card -->
-        <div class="bg-white dark:bg-journal-green rounded-xl shadow-lg p-6 transition-colors">
-            <h3 class="text-xl font-semibold text-journal-dark dark:text-gray-100 mb-4 flex items-center">
-                <i class="fas fa-link text-journal-gold mr-2"></i>
-                Or Enter Mycomap URL...
-            </h3>
-
-            <div class="space-y-4">
-                <div>
-                    <label for="mycomap_url" class="block text-sm font-medium text-gray-700 dark:text-gray-200 mb-2">
-                        Mycomap BLAST Results URL
-                    </label>
-                    <input type="url" id="mycomap_url" class="w-full px-4 py-3 border border-gray-300 dark:border-journal-dark rounded-lg 
-                                  bg-white dark:bg-journal-dark text-gray-900 dark:text-gray-100
-                                  focus:ring-2 focus:ring-journal-gold focus:border-transparent transition-all"
-                        placeholder="https://mycomap.com/...r12345...">
-                    <p class="text-xs text-gray-500 dark:text-gray-400 mt-1">
-                        Paste a Mycomap BLAST result URL to import sequences.
-                    </p>
-                </div>
-
-                <!-- Checkboxes -->
-                <div class="flex flex-wrap gap-4">
-                    <label class="flex items-center space-x-2 cursor-pointer">
-                        <input type="checkbox" id="mycomap_ncbi" checked class="w-4 h-4 text-journal-gold bg-gray-100 border-gray-300 rounded 
-                                      focus:ring-journal-gold dark:bg-journal-dark dark:border-gray-600">
-                        <span class="text-sm text-gray-700 dark:text-gray-200">NCBI Results</span>
-                    </label>
-                    <label class="flex items-center space-x-2 cursor-pointer">
-                        <input type="checkbox" id="mycomap_local" checked class="w-4 h-4 text-journal-gold bg-gray-100 border-gray-300 rounded 
-                                      focus:ring-journal-gold dark:bg-journal-dark dark:border-gray-600">
-                        <span class="text-sm text-gray-700 dark:text-gray-200">Local Results</span>
-                    </label>
-                    <label class="flex items-center space-x-2 cursor-pointer">
-                        <input type="checkbox" id="mycomap_dedup" checked class="w-4 h-4 text-journal-gold bg-gray-100 border-gray-300 rounded 
-                                      focus:ring-journal-gold dark:bg-journal-dark dark:border-gray-600">
-                        <span class="text-sm text-gray-700 dark:text-gray-200">Remove Duplicates</span>
-                    </label>
-                </div>
-
-                <!-- Fetch Button -->
-                <button id="fetch_mycomap_btn" class="w-full bg-journal-dark hover:bg-journal-green text-white 
-                               py-3 px-4 rounded-lg font-semibold shadow-md hover:shadow-lg 
-                               transition-all flex items-center justify-center">
-                    <i class="fas fa-download mr-2"></i> Fetch Sequences
-                </button>
-            </div>
-        </div>
-
-        <!-- iNaturalist URL Card -->
+        <!-- 1. iNaturalist URL Card -->
         <div class="bg-white dark:bg-journal-green rounded-xl shadow-lg p-6 transition-colors">
             <h3 class="text-xl font-semibold text-journal-dark dark:text-gray-100 mb-4 flex items-center">
                 <i class="fas fa-leaf text-journal-gold mr-2"></i>
-                Or Enter iNaturalist URL...
+                Import from iNaturalist
             </h3>
 
             <div class="space-y-4">
@@ -214,6 +90,190 @@
                             <i class="fas fa-plus mr-2"></i> Add to Queue
                         </button>
                     </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- 2. Mycomap URL Card -->
+        <div class="bg-white dark:bg-journal-green rounded-xl shadow-lg p-6 transition-colors">
+            <h3 class="text-xl font-semibold text-journal-dark dark:text-gray-100 mb-4 flex items-center">
+                <i class="fas fa-link text-journal-gold mr-2"></i>
+                Import from Mycomap
+            </h3>
+
+            <div class="space-y-4">
+                <div>
+                    <label for="mycomap_url" class="block text-sm font-medium text-gray-700 dark:text-gray-200 mb-2">
+                        Mycomap BLAST Results URL
+                    </label>
+                    <input type="url" id="mycomap_url" class="w-full px-4 py-3 border border-gray-300 dark:border-journal-dark rounded-lg 
+                                  bg-white dark:bg-journal-dark text-gray-900 dark:text-gray-100
+                                  focus:ring-2 focus:ring-journal-gold focus:border-transparent transition-all"
+                        placeholder="https://mycomap.com/...r12345...">
+                    <p class="text-xs text-gray-500 dark:text-gray-400 mt-1">
+                        Paste a Mycomap BLAST result URL to import sequences.
+                    </p>
+                </div>
+
+                <!-- Checkboxes -->
+                <div class="flex flex-wrap gap-4">
+                    <label class="flex items-center space-x-2 cursor-pointer">
+                        <input type="checkbox" id="mycomap_ncbi" checked class="w-4 h-4 text-journal-gold bg-gray-100 border-gray-300 rounded 
+                                      focus:ring-journal-gold dark:bg-journal-dark dark:border-gray-600">
+                        <span class="text-sm text-gray-700 dark:text-gray-200">NCBI Results</span>
+                    </label>
+                    <label class="flex items-center space-x-2 cursor-pointer">
+                        <input type="checkbox" id="mycomap_local" checked class="w-4 h-4 text-journal-gold bg-gray-100 border-gray-300 rounded 
+                                      focus:ring-journal-gold dark:bg-journal-dark dark:border-gray-600">
+                        <span class="text-sm text-gray-700 dark:text-gray-200">Local Results</span>
+                    </label>
+                    <label class="flex items-center space-x-2 cursor-pointer">
+                        <input type="checkbox" id="mycomap_dedup" checked class="w-4 h-4 text-journal-gold bg-gray-100 border-gray-300 rounded 
+                                      focus:ring-journal-gold dark:bg-journal-dark dark:border-gray-600">
+                        <span class="text-sm text-gray-700 dark:text-gray-200">Remove Duplicates</span>
+                    </label>
+                </div>
+
+                <!-- Fetch Button -->
+                <button id="fetch_mycomap_btn" class="w-full bg-journal-dark hover:bg-journal-green text-white 
+                               py-3 px-4 rounded-lg font-semibold shadow-md hover:shadow-lg 
+                               transition-all flex items-center justify-center">
+                    <i class="fas fa-download mr-2"></i> Fetch Sequences
+                </button>
+            </div>
+        </div>
+
+        <!-- 3. BLAST Card -->
+        <div class="bg-white dark:bg-journal-green rounded-xl shadow-lg p-6 transition-colors">
+            <h3 class="text-xl font-semibold text-journal-dark dark:text-gray-100 mb-4 flex items-center">
+                <i class="fas fa-search text-journal-gold mr-2"></i>
+                BLAST for Related Sequences
+            </h3>
+
+            <div class="space-y-4">
+                <div>
+                    <label for="blast_query" class="block text-sm font-medium text-gray-700 dark:text-gray-200 mb-2">
+                        Enter Single Sequence or Accession
+                    </label>
+                    <textarea id="blast_query" rows="4" class="w-full font-mono text-sm px-4 py-3 border border-gray-300 dark:border-journal-dark rounded-lg 
+                               bg-white dark:bg-journal-dark text-gray-900 dark:text-gray-100
+                               focus:ring-2 focus:ring-journal-gold focus:border-transparent 
+                               transition-all resize-none"
+                        placeholder=">seq1&#10;ATGCGATCG...&#10;&#10;Or GenBank Accession (e.g., OP973765)"></textarea>
+                    <p class="text-xs text-gray-500 dark:text-gray-400 mt-1">
+                        Find related sequences on NCBI GenBank.
+                    </p>
+                </div>
+
+                <div class="grid grid-cols-2 gap-4">
+                    <div>
+                        <label for="blast_min_identity"
+                            class="block text-sm font-medium text-gray-700 dark:text-gray-200 mb-2">
+                            Min Identity (%)
+                        </label>
+                        <input type="number" id="blast_min_identity" value="90" min="50" max="100"
+                            class="w-full px-4 py-3 border border-gray-300 dark:border-journal-dark rounded-lg 
+                                      bg-white dark:bg-journal-dark text-gray-900 dark:text-gray-100 focus:ring-2 focus:ring-journal-gold">
+                    </div>
+                    <div>
+                        <label for="blast_max_sequences"
+                            class="block text-sm font-medium text-gray-700 dark:text-gray-200 mb-2">
+                            Max Results
+                        </label>
+                        <select id="blast_max_sequences"
+                            class="w-full px-4 py-3 border border-gray-300 dark:border-journal-dark rounded-lg 
+                                      bg-white dark:bg-journal-dark text-gray-900 dark:text-gray-100 focus:ring-2 focus:ring-journal-gold">
+                            <option value="10">10</option>
+                            <option value="50" selected>50</option>
+                            <option value="100">100</option>
+                            <option value="200">200</option>
+                        </select>
+                    </div>
+                </div>
+
+                <div class="flex flex-wrap gap-3">
+                    <button id="blast_btn"
+                        class="w-full bg-journal-dark hover:bg-journal-green text-white 
+                                   py-3 px-4 rounded-lg font-semibold shadow-md hover:shadow-lg 
+                                   transition-all flex items-center justify-center disabled:opacity-50 disabled:cursor-not-allowed"
+                        disabled>
+                        <i class="fas fa-search mr-2"></i> BLAST Sequence
+                    </button>
+                </div>
+            </div>
+        </div>
+
+        <!-- 4. File Upload Card -->
+        <div class="bg-white dark:bg-journal-green rounded-xl shadow-lg p-6 transition-colors">
+            <h3 class="text-xl font-semibold text-journal-dark dark:text-gray-100 mb-4 flex items-center">
+                <i class="fas fa-file-upload text-journal-gold mr-2"></i>
+                Or Upload a File
+            </h3>
+
+            <div class="space-y-4">
+                <label for="sequence_file" class="block w-full border-2 border-dashed border-gray-300 dark:border-gray-600 
+                              rounded-lg p-8 text-center cursor-pointer
+                              hover:border-journal-gold dark:hover:border-journal-gold
+                              transition-colors bg-gray-50 dark:bg-journal-dark">
+                    <i class="fas fa-cloud-upload-alt text-4xl text-gray-400 dark:text-gray-500 mb-3"></i>
+                    <p class="text-sm text-gray-600 dark:text-gray-300">
+                        <span class="font-semibold text-journal-gold">Click to upload</span> or drag and drop
+                    </p>
+                    <p class="text-xs text-gray-500 dark:text-gray-400 mt-1">
+                        FASTA files (.fa, .fasta, .fna, .txt)
+                    </p>
+                    <input type="file" id="sequence_file" class="hidden" accept=".fa,.fasta,.fna,.txt">
+                </label>
+
+                <!-- Job Notes -->
+                <div>
+                    <label for="job_notes" class="block text-sm font-medium text-gray-700 dark:text-gray-200 mb-2">
+                        Job Name / Notes
+                    </label>
+                    <input type="text" id="job_notes" class="w-full px-4 py-3 border border-gray-300 dark:border-journal-dark rounded-lg 
+                                  bg-white dark:bg-journal-dark text-gray-900 dark:text-gray-100
+                                  focus:ring-2 focus:ring-journal-gold focus:border-transparent transition-all"
+                        placeholder="e.g. Fungal ITS Analysis">
+                </div>
+
+                <!-- Hidden Add Button for File -->
+                <button id="add_file_btn" class="hidden w-full bg-journal-gold hover:bg-journal-gold-light text-journal-dark 
+                               py-3 px-4 rounded-lg font-semibold shadow-md hover:shadow-lg 
+                               transition-all flex items-center justify-center">
+                    <i class="fas fa-plus mr-2"></i> Add Sequences from File
+                </button>
+            </div>
+        </div>
+
+        <!-- 5. Paste Sequences Card -->
+        <div class="bg-white dark:bg-journal-green rounded-xl shadow-lg p-6 transition-colors">
+            <h3 class="text-xl font-semibold text-journal-dark dark:text-gray-100 mb-4 flex items-center">
+                <i class="fas fa-edit text-journal-gold mr-2"></i>
+                Add Custom Sequences
+            </h3>
+
+            <div class="space-y-4">
+                <div>
+                    <label for="sequence_text" class="block text-sm font-medium text-gray-700 dark:text-gray-200 mb-2">
+                        Paste FASTA Sequences
+                    </label>
+                    <textarea id="sequence_text" rows="8" class="w-full font-mono text-sm px-4 py-3 border border-gray-300 dark:border-journal-dark rounded-lg 
+                               bg-white dark:bg-journal-dark text-gray-900 dark:text-gray-100
+                               focus:ring-2 focus:ring-journal-gold focus:border-transparent 
+                               transition-all resize-none" placeholder=">seq1&#10;ATGCGATCGATCGATCG..."></textarea>
+                    <p class="text-xs text-gray-500 dark:text-gray-400 mt-1">
+                        Enter sequences in FASTA format.
+                    </p>
+                </div>
+
+                <!-- Action Buttons for Input -->
+                <div class="flex flex-wrap gap-3">
+                    <button id="add_sequences_btn" class="flex-1 min-w-[140px] bg-journal-gold hover:bg-journal-gold-light text-journal-dark 
+                                   py-3 px-4 rounded-lg font-semibold shadow-md hover:shadow-lg 
+                                   transition-all flex items-center justify-center">
+                        <i class="fas fa-plus mr-2"></i> Add Sequences
+                    </button>
+                    <!-- BLAST button removed from here -->
                 </div>
             </div>
         </div>
@@ -299,6 +359,7 @@
                 <option value="mafft" selected>MAFFT (Default)</option>
                 <option value="muscle">MUSCLE</option>
                 <option value="clustalo">Clustal Omega</option>
+                <option value="none">None - Skip Alignment (Use as-is)</option>
             </select>
             <p class="text-xs text-gray-500 dark:text-gray-400 mt-1">
                 Choose the algorithm for multiple sequence alignment.
@@ -602,6 +663,17 @@
         }
     }
 
+    function updateButtonVisuals(btn, isValid) {
+        if (!btn) return;
+        if (isValid) {
+            btn.classList.remove('bg-journal-dark', 'text-white', 'hover:bg-journal-green');
+            btn.classList.add('bg-journal-gold', 'text-journal-dark', 'hover:bg-journal-gold-light');
+        } else {
+            btn.classList.add('bg-journal-dark', 'text-white', 'hover:bg-journal-green');
+            btn.classList.remove('bg-journal-gold', 'text-journal-dark', 'hover:bg-journal-gold-light');
+        }
+    }
+
     function escapeHtml(text) {
         if (!text) return '';
         const div = document.createElement('div');
@@ -693,33 +765,45 @@
     // =========================================================================
     // BLAST Button Logic
     // =========================================================================
+    // =========================================================================
+    // BLAST Button Logic
+    // =========================================================================
     const blastBtn = document.getElementById('blast_btn');
-    const seqTextArea = document.getElementById('sequence_text');
+    const blastQueryInput = document.getElementById('blast_query');
 
     function updateBlastButtonState() {
-        const text = seqTextArea.value.trim();
+        const text = blastQueryInput.value.trim();
+        let isValid = false;
 
         if (isGenBankAccession(text)) {
-            blastBtn.disabled = false;
-            blastBtn.title = "BLAST this accession to find related sequences";
-            return;
+            isValid = true;
+        } else if (text.length >= 20) {
+            // Basic DNA char check (allow some noise/formatting)
+            const dnaChars = (text.match(/[ACGTURYSWKMBDHVN]/gi) || []).length;
+            if (dnaChars >= 20) isValid = true;
+        } else {
+            const sequences = parseFasta(text);
+            if (sequences.length === 1 && sequences[0].sequence.length >= 20) {
+                isValid = true;
+            }
         }
 
-        const sequences = parseFasta(text);
-        if (sequences.length === 1) {
-            blastBtn.disabled = false;
-            blastBtn.title = "BLAST this sequence to find related sequences";
-            return;
-        }
+        blastBtn.disabled = !isValid;
+        updateButtonVisuals(blastBtn, isValid);
 
-        blastBtn.disabled = true;
-        blastBtn.title = "Enter a single sequence or GenBank accession to use BLAST";
+        if (isValid) {
+            blastBtn.title = "BLAST this sequence/accession to find related sequences";
+        } else {
+            blastBtn.title = "Enter a GenBank accession or sequence (>20bp) to BLAST";
+        }
     }
 
-    seqTextArea.addEventListener('input', updateBlastButtonState);
+    blastQueryInput.addEventListener('input', updateBlastButtonState);
 
     blastBtn.addEventListener('click', async () => {
-        const text = seqTextArea.value.trim();
+        const text = blastQueryInput.value.trim();
+        const minIdentity = document.getElementById('blast_min_identity').value;
+        const maxSequences = document.getElementById('blast_max_sequences').value;
 
         blastBtn.disabled = true;
         blastBtn.innerHTML = '<i class="fas fa-spinner fa-spin mr-2"></i> BLASTing...';
@@ -742,7 +826,11 @@
                     'Content-Type': 'application/json',
                     'X-CSRFToken': csrfToken
                 },
-                body: JSON.stringify({ query })
+                body: JSON.stringify({
+                    query: query,
+                    min_identity: minIdentity,
+                    max_sequences: maxSequences
+                })
             });
 
             const data = await resp.json();
@@ -757,14 +845,17 @@
             // Save the query for later use in notes
             lastBlastQuery = query;
 
-            seqTextArea.value = '';
+            // Optional: Clear input or keep it? 
+            // Often nice to keep it to see what was run, but maybe clear to indicate success.
+            // Let's clear it as per original behavior.
+            blastQueryInput.value = '';
             updateBlastButtonState();
 
         } catch (e) {
             showStatus('BLAST error: ' + e.message, 'error');
         }
 
-        blastBtn.innerHTML = '<i class="fas fa-search mr-2"></i> BLAST for Related';
+        blastBtn.innerHTML = '<i class="fas fa-search mr-2"></i> BLAST Sequence';
         updateBlastButtonState();
     });
 
@@ -772,6 +863,7 @@
     // Add Sequences Button
     // =========================================================================
     document.getElementById('add_sequences_btn').addEventListener('click', () => {
+        const seqTextArea = document.getElementById('sequence_text');
         const text = seqTextArea.value.trim();
 
         if (!text) {
@@ -796,27 +888,52 @@
     // =========================================================================
     // File Upload Handler
     // =========================================================================
+    // =========================================================================
+    // File Upload Handler
+    // =========================================================================
+    let fileSequences = [];
+
     document.getElementById('sequence_file').addEventListener('change', async (e) => {
         const file = e.target.files[0];
-        if (!file) return;
+        const addBtn = document.getElementById('add_file_btn');
+
+        if (!file) {
+            addBtn.classList.add('hidden');
+            return;
+        }
 
         try {
             const text = await file.text();
-            const sequences = parseFasta(text);
+            fileSequences = parseFasta(text);
 
-            if (sequences.length === 0) {
+            if (fileSequences.length === 0) {
                 showStatus('No valid FASTA sequences found in file.', 'error');
+                addBtn.classList.add('hidden');
                 return;
             }
 
-            const added = addSequences(sequences);
-            showStatus(`Loaded ${added} sequence${added !== 1 ? 's' : ''} from file.`, 'success');
+            showStatus(`File ready: ${fileSequences.length} sequence${fileSequences.length !== 1 ? 's' : ''} found. Click Add to queue.`, 'info');
 
+            // Show button and make it gold
+            addBtn.classList.remove('hidden');
+            // Since it's valid, it should be gold (it is bg-journal-gold by default in HTML)
+            // But let's enforce active look if we had different styles
         } catch (err) {
             showStatus('Error reading file: ' + err.message, 'error');
+            addBtn.classList.add('hidden');
         }
+    });
 
-        e.target.value = '';
+    document.getElementById('add_file_btn').addEventListener('click', () => {
+        if (fileSequences.length > 0) {
+            const added = addSequences(fileSequences);
+            showStatus(`Added ${added} sequence${added !== 1 ? 's' : ''} from file.`, 'success');
+
+            // Reset
+            document.getElementById('sequence_file').value = '';
+            document.getElementById('add_file_btn').classList.add('hidden');
+            fileSequences = [];
+        }
     });
 
     // =========================================================================
@@ -838,25 +955,22 @@
     const mycomapDedupCheckbox = document.getElementById('mycomap_dedup');
     const fetchMycomapBtn = document.getElementById('fetch_mycomap_btn');
 
+    function checkMycomapState() {
+        const isValid = isValidMycomapUrl(mycomapUrlInput.value.trim());
+        updateButtonVisuals(fetchMycomapBtn, isValid);
+    }
+
+    mycomapUrlInput.addEventListener('input', checkMycomapState);
+
     function isValidMycomapUrl(url) {
-        // Must be from mycomap.com and contain r<digits> pattern
         if (!url) return false;
-        try {
-            const parsed = new URL(url);
-            const host = parsed.hostname.toLowerCase();
-            // Strict hostname check - must be exactly mycomap.com or www.mycomap.com
-            const validHostnames = ['mycomap.com', 'www.mycomap.com'];
-            if (!validHostnames.includes(host)) return false;
-
-            // Enforce https or http protocol
-            if (parsed.protocol !== 'https:' && parsed.protocol !== 'http:') return false;
-
-            // Accept r<digits> pattern in path or query
-            const hay = (parsed.pathname + parsed.search).toLowerCase();
-            return /(^|[^a-z0-9])r\d+/.test(hay);
-        } catch (e) {
+        const trimmed = url.trim();
+        // Must start with the specific BLAST search path
+        if (!trimmed.startsWith('https://mycomap.com/genetics/blast-search')) {
             return false;
         }
+        // Should also contain the r-number (usually attached or query param)
+        return /r\d+/.test(trimmed);
     }
 
     fetchMycomapBtn.addEventListener('click', async () => {
@@ -871,7 +985,11 @@
         }
 
         if (!isValidMycomapUrl(url)) {
-            showStatus('Invalid Mycomap URL. URL must be from mycomap.com and contain a result ID (e.g., r12345).', 'error');
+            if (url.includes('mycomap.com')) {
+                showStatus('Invalid Mycomap URL. Please use the URL from the BLAST Search page (starts with https://mycomap.com/genetics/blast-search).', 'error');
+            } else {
+                showStatus('Invalid Mycomap URL. URL must be from mycomap.com and contain a result ID.', 'error');
+            }
             return;
         }
 
@@ -940,6 +1058,15 @@
     const inaturalistSpeciesItems = document.getElementById('inaturalist_species_items');
     const inaturalistBlastBtn = document.getElementById('inaturalist_blast_btn');
     const inaturalistAddBtn = document.getElementById('inaturalist_add_btn');
+
+    function checkInatState() {
+        // Simple check: contains inaturalist.org
+        const val = inaturalistUrlInput.value.trim();
+        const seemsValid = val && val.includes('inaturalist.org');
+        updateButtonVisuals(fetchInaturalistBtn, seemsValid);
+    }
+
+    inaturalistUrlInput.addEventListener('input', checkInatState);
 
     // Store the current iNaturalist analysis result for use by action buttons
     let currentInaturalistResult = null;
