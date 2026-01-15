@@ -5,6 +5,7 @@ import re
 import time
 import requests
 import threading
+import xml.etree.ElementTree as ET
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Any
 from app.config import Config
@@ -481,14 +482,289 @@ def _fetch_blast_results(rid: str) -> Dict[str, List]:
         logger.error(f"JSON decode error: {e}, response preview: {content[:500]}")
         raise ValueError(f"Failed to parse BLAST JSON response: {e}")
 
+def _fetch_genbank_xml_batch(accessions: List[str]) -> Optional[str]:
+    """
+    Fetch GenBank XML for a single batch of accessions.
+    Returns XML string or None on failure.
+    """
+    if not accessions:
+        return None
+        
+    ids = ",".join(accessions)
+    params = {
+        "db": "nuccore",
+        "id": ids,
+        "rettype": "gb",
+        "retmode": "xml"
+    }
+    
+    try:
+        # Use existing helper with retries
+        response = _ncbi_request("POST", NCBI_EFETCH_URL, data=params, timeout=(15, 90))
+        response.raise_for_status()
+        return response.text
+    except Exception as e:
+        logger.error(f"Failed to fetch GenBank XML for batch {accessions[:3]}...: {e}")
+        return None
+
+def _parse_genbank_xml(xml_text: str) -> Dict[str, Dict]:
+    """
+    Parse GenBank XML string.
+    Returns a dict with 'by_acc' and 'by_ver' lookups mapping to parsed records.
+    
+    ParsedRecord schema:
+    {
+        "accession": str,
+        "version": str,  # "Accession.Version"
+        "organism": str,
+        "sequence": str, # Uppercase, clean
+        "raw_record": str, # Blob for keyword scanning
+        "source_features": Dict[str, str], # qualifier_name -> value
+        "type_material": Optional[str] # If found in source qualifiers
+    }
+    """
+    result = {"by_acc": {}, "by_ver": {}}
+    
+    try:
+        # Remove namespace prefixes if present to simplify parsing
+        xml_text = re.sub(r'\sxmlns="[^"]+"', '', xml_text, count=1)
+        root = ET.fromstring(xml_text)
+        
+        for gb_seq in root.findall(".//GBSeq"):
+            # 1. Basic Info
+            acc = gb_seq.findtext("GBSeq_primary-accession", "")
+            ver = gb_seq.findtext("GBSeq_accession-version", "")
+            organism = gb_seq.findtext("GBSeq_organism", "").strip()
+            definition = gb_seq.findtext("GBSeq_definition", "").strip()
+            
+            # 2. Sequence
+            raw_seq = gb_seq.findtext("GBSeq_sequence", "")
+            # Clean sequence: strip whitespace, remove - and ., keep IUPAC, uppercase
+            if raw_seq:
+                # Remove whitespace (newlines, spaces)
+                clean_seq = "".join(raw_seq.split())
+                # Remove gaps/align chars
+                clean_seq = re.sub(r'[-.]', '', clean_seq)
+                clean_seq = clean_seq.upper()
+            else:
+                clean_seq = None
+                
+            # 3. Source Features & Qualifiers
+            source_quals = {}
+            type_material = None
+            
+            features = gb_seq.find("GBSeq_feature-table")
+            all_quals_text = [] # For blob scanning
+            
+            if features is not None:
+                for feature in features.findall("GBFeature"):
+                    key = feature.findtext("GBFeature_key", "")
+                    quals = feature.find("GBFeature_quals")
+                    
+                    if quals is not None:
+                        for qual in quals.findall("GBQualifier"):
+                            q_name = qual.findtext("GBQualifier_name", "")
+                            q_val = qual.findtext("GBQualifier_value", "")
+                            
+                            all_quals_text.append(f"{q_name}={q_val}")
+                            
+                            if key == "source":
+                                # Keep all source qualifiers
+                                source_quals[q_name] = q_val
+                                if q_name == "type_material":
+                                    type_material = q_val
+
+            # 4. Blob for keyword scanning (Definition + Organism + All Qualifiers + Comments + Refs)
+            # Add comments and refs if needed, for now def + org + quals is usually sufficient for types
+            blob_parts = [definition, organism] + all_quals_text
+            
+            # Add comments
+            comment = gb_seq.findtext("GBSeq_comment", "")
+            if comment:
+                blob_parts.append(comment)
+                
+            record = {
+                "accession": acc,
+                "version": ver,
+                "organism": organism,
+                "sequence": clean_seq,
+                "source_features": source_quals,
+                "type_material": type_material,
+                "blob": " ".join(blob_parts)
+            }
+            
+            if acc:
+                result["by_acc"][acc] = record
+            if ver:
+                result["by_ver"][ver] = record
+                
+    except ET.ParseError as e:
+        logger.error(f"XML Parse Error: {e}")
+    except Exception as e:
+        logger.error(f"Error parsing GenBank XML: {e}")
+        
+    return result
+
+def _build_header(record: Dict) -> str:
+    """
+    Construct FASTA header from parsed record.
+    Format: >{acc_ver} {organism} {sample_id} {extras} {type_status}
+    """
+    # 1. Base
+    # Use version if available, else accession
+    acc_ver = record.get("version") or record.get("accession")
+    organism = record.get("organism") or "(unknown organism)"
+    
+    parts = [acc_ver, organism]
+    
+    # Helper to clean redundant organism name from values
+    def _strip_organism(val: str, org_name: str) -> str:
+        if not val:
+            return val
+
+        val = " ".join(str(val).split())
+
+        org_name = " ".join(str(org_name or "").split())
+        org_tokens = org_name.split()
+        org_binomial = " ".join(org_tokens[:2]) if len(org_tokens) >= 2 else ""
+
+        # Try stripping both the full organism string and the binomial.
+        variants = [v for v in [org_name, org_binomial] if v]
+
+        for v in variants:
+            # Remove occurrences anywhere (case-insensitive)
+            val = re.sub(re.escape(v), "", val, flags=re.IGNORECASE)
+
+        # Clean up punctuation/separators left behind
+        val = re.sub(r"\s*[:;,()\[\]{}]\s*", " ", val)
+        val = re.sub(r"\bof\b", "", val, flags=re.IGNORECASE)
+        val = " ".join(val.split()).strip()
+
+        # Also remove trailing organism variants (repeated)
+        for v in variants:
+            val = re.sub(rf"(?:\s+{re.escape(v)})+\s*$", "", val, flags=re.IGNORECASE).strip()
+
+        return val
+
+
+
+
+    # If the assembled header accidentally ends with the organism repeated,
+    # drop that suffix (token-aware).
+    def _drop_trailing_organism_tokens(tokens: List[str], org_name: str) -> List[str]:
+        if not tokens or not org_name:
+            return tokens
+        org_tokens = org_name.split()
+        n = len(org_tokens)
+        
+        # Check if it ends with organism
+        if len(tokens) >= n and [t.lower() for t in tokens[-n:]] == [t.lower() for t in org_tokens]:
+            # Ensure we don't strip the PRIMARY organism (at index 1)
+            # We assume index 0 is Accession, index 1 is Organism.
+            # If the stripped range overlaps with index 1, don't strip (or stripped part is the primary one).
+            # Indices of stripped part: len(tokens)-n to len(tokens)
+            # Primary organism indices: 1 to 1+n (roughly, if split?) 
+            # Actually, 'parts' list has strict slots. parts[1] is the Organism string.
+            # If org_name is "Psilocybe cyanescens", parts[1] is "Psilocybe cyanescens".
+            # If parts = [Acc, Org], then parts[-1] is Org.
+            # logical check: Is the detected suffix the SAME element as parts[1]?
+            
+            # Simple heuristic: Don't strip if the result would have fewer than 2 elements (Acc + Org)?
+            # Or if the match starts at index 1.
+            start_index_of_match = len(tokens) - n
+            if start_index_of_match <= 1:
+                return tokens
+                
+            return tokens[:-n]
+            
+        return tokens
+
+    # Extract type status so we can append it at the end without the "type_material" label.
+    # Prefer structured /type_material, but reduce it to just known statuses when possible.
+    TYPE_KEYWORDS = ["holotype", "isotype", "epitype", "lectotype", "neotype", "paratype", "syntype", "topotype"]
+
+    def _extract_type_status(rec: Dict) -> List[str]:
+        # 1) Structured
+        t_val = rec.get("type_material")
+        if t_val:
+            t_val_norm = " ".join(str(t_val).split())
+            t_val_norm = _strip_organism(t_val_norm, organism)
+            low = t_val_norm.lower()
+            found = [kw for kw in TYPE_KEYWORDS if re.search(rf"\b{re.escape(kw)}\b", low)]
+            # If we found recognizable statuses, return those only (in stable order).
+            if found:
+                return found
+            # Otherwise return the cleaned structured value as-is (still appended at end)
+            return [t_val_norm] if t_val_norm else []
+
+        # 2) Fallback keyword scan
+        blob = (rec.get("blob") or "").lower()
+        found = [kw for kw in TYPE_KEYWORDS if re.search(rf"\b{re.escape(kw)}\b", blob)]
+        return found
+
+    # 2. Sample ID Priority
+    # specimen_voucher > culture_collection > bio_material > isolate > strain
+    quals = record.get("source_features", {})
+    sample_id = None
+    for key in ["specimen_voucher", "culture_collection", "bio_material", "isolate", "strain"]:
+        if val := quals.get(key):
+            # Clean redundant organism from sample ID value
+            val = _strip_organism(val, organism)
+            if val:
+                sample_id = f"{key} {val}"
+                break
+            
+    if sample_id:
+        parts.append(sample_id)
+        
+    # 3. Extras (Location first; we want type status at the very end)
+    # geo_loc_name, country
+    extras = []
+    current_len = sum(len(p) for p in parts) + len(parts) # approx
+    MAX_LEN = 120 # Cap for extras
+    
+    for key in ["geo_loc_name", "country"]:
+        if val := quals.get(key):
+            val = " ".join(val.split())
+            
+            # Clean redundant organism from value
+            val = _strip_organism(val, organism)
+            if not val:
+                 continue
+            
+            # Formating: just value for location fields, else key="val"
+            if key in ["geo_loc_name", "country"]:
+                token = f"{val}"
+            else:
+                token = f"{key}=\"{val}\""
+            
+            if len(extras) < 3 and (current_len + len(token)) < (current_len + 120): # Soft cap
+                extras.append(token)
+                current_len += len(token) + 1
+                
+    if extras:
+        parts.extend(extras)
+        
+    # 4. Type status LAST (no "type_material" label, and not in the middle)
+    type_status = _extract_type_status(record)
+    if type_status:
+        parts.extend(type_status)
+        
+    # 5. Final cleanup: remove trailing organism if it still sneaks in
+    parts = _drop_trailing_organism_tokens(parts, organism)
+        
+    return ">" + " ".join(parts)
+
 def fetch_fasta_for_accessions(accessions: List[str]) -> str:
-    """Fetch FASTA sequences from NCBI for the given accessions."""
+    """
+    Fetch FASTA sequences from NCBI for the given accessions using GenBank XML
+    fetching to rebuild detailed headers with type material info.
+    """
     if not accessions:
         return ""
     
     # Validate accession format
     import re
-    # CHANGE TO (SECURE): Enforces GenBank format (1-6 letters, optional _, 5-9 digits, optional version)
     valid_pattern = re.compile(r'^[A-Z]{1,6}_?\d{5,9}(?:\.\d+)?$', re.IGNORECASE)
     validated = [a for a in accessions if valid_pattern.match(a)]
     
@@ -496,19 +772,93 @@ def fetch_fasta_for_accessions(accessions: List[str]) -> str:
         logger.warning(f"No valid accessions found in list of {len(accessions)}")
         return ""
 
-    logger.info(f"Fetching FASTA for {len(validated)} accessions: {validated[:5]}...")
-        
-    ids = ",".join(validated)
-    params = {
-        "db": "nuccore",
-        "id": ids,
-        "rettype": "fasta",
-        "retmode": "text"
+    logger.info(f"Fetching sequences for {len(validated)} accessions via GenBank XML...")
+    
+    # 1. Fetch and Parse
+    BATCH_SIZE = 50
+    records_by_acc = {}
+    records_by_ver = {}
+    
+    counters = {
+        "xml_ok": 0,
+        "type_structured": 0,
+        "type_keyword": 0,
+        "xml_missing_seq": 0,
+        "batch_fail": 0
     }
     
-    response = _ncbi_request("POST", NCBI_EFETCH_URL, data=params, timeout=(10, 60))
-    response.raise_for_status()
+    for i in range(0, len(validated), BATCH_SIZE):
+        batch = validated[i : i + BATCH_SIZE]
+        xml_text = _fetch_genbank_xml_batch(batch)
+        
+        if xml_text:
+            parsed = _parse_genbank_xml(xml_text)
+            records_by_acc.update(parsed["by_acc"])
+            records_by_ver.update(parsed["by_ver"])
+            
+            # counting stats
+            for r in parsed["by_acc"].values():
+                if r.get("type_material"): counters["type_structured"] += 1
+                elif "holotype" in r.get("blob", "").lower(): counters["type_keyword"] += 1 # approx check
+        else:
+            counters["batch_fail"] += 1
+            
+    # 2. Reassemble deterministically
+    final_lines = []
+    missing_for_fallback = []
     
-    fasta_text = response.text
-    logger.info(f"Fetched FASTA response: {len(fasta_text)} chars, preview: {fasta_text[:200]}")
-    return fasta_text
+    for acc in validated:
+        # Try finding record
+        record = records_by_ver.get(acc) or records_by_acc.get(acc)
+        
+        if record and record.get("sequence"):
+            counters["xml_ok"] += 1
+            
+            header = _build_header(record)
+            seq = record["sequence"]
+            
+            # Wrap sequence at 60 chars
+            wrapped_seq = "\n".join(seq[i:i+60] for i in range(0, len(seq), 60))
+            final_lines.append(f"{header}\n{wrapped_seq}")
+        else:
+            if record:
+                counters["xml_missing_seq"] += 1
+            missing_for_fallback.append(acc)
+
+    logger.info(f"XML Fetch Stats: OK={counters['xml_ok']}, TypeStruct={counters['type_structured']}, "
+                f"TypeKey={counters['type_keyword']}, MissingSeq={counters['xml_missing_seq']}, "
+                f"BatchFail={counters['batch_fail']}")
+
+    # 3. Fallback for missing
+    if missing_for_fallback:
+        logger.warning(f"Falling back to legacy FASTA fetch for {len(missing_for_fallback)} accessions")
+        
+        # We can implement a simple fallback here using the OLD method (efetch fasta)
+        # Construct parameters for fallback
+        try:
+            ids = ",".join(missing_for_fallback)
+            params = {
+                "db": "nuccore",
+                "id": ids,
+                "rettype": "fasta",
+                "retmode": "text"
+            }
+            # Use same batching logic? Or just dump all if small?
+            # Safe to assume fallback list might be small, but if batch fail, it could be large.
+            # Let's just do one call if small, or reuse verify logic? 
+            # Simple approach: Just request. If it's huge, requests might fail, but existing code didn't batch FASTA fetch anyway.
+            # Wait, existing code did NOT batch FASTA fetch (it sent all IDs).
+            
+            response = _ncbi_request("POST", NCBI_EFETCH_URL, data=params, timeout=(10, 60))
+            if response.status_code == 200:
+                final_lines.append(response.text.strip())
+            else:
+                logger.error(f"Fallback FASTA fetch failed: {response.status_code}")
+                # Ultimate fallback: Simple headers with empty sequences? Or just omit?
+                # If we omit, the alignment step might fail. 
+                # Better to include barebones if possible, but we don't have sequence.
+                pass
+        except Exception as e:
+            logger.error(f"Fallback FASTA fetch exception: {e}")
+            
+    return "\n".join(final_lines)

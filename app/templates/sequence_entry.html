@@ -268,9 +268,10 @@
 
                 <!-- Action Buttons for Input -->
                 <div class="flex flex-wrap gap-3">
-                    <button id="add_sequences_btn" class="flex-1 min-w-[140px] bg-journal-gold hover:bg-journal-gold-light text-journal-dark 
+                    <button id="add_sequences_btn"
+                        class="flex-1 min-w-[140px] bg-journal-dark hover:bg-journal-green text-white 
                                    py-3 px-4 rounded-lg font-semibold shadow-md hover:shadow-lg 
-                                   transition-all flex items-center justify-center">
+                                   transition-all flex items-center justify-center disabled:opacity-50 disabled:cursor-not-allowed" disabled>
                         <i class="fas fa-plus mr-2"></i> Add Sequences
                     </button>
                     <!-- BLAST button removed from here -->
@@ -860,11 +861,27 @@
     });
 
     // =========================================================================
-    // Add Sequences Button
+    // Add Sequences Button Logic (Visuals & Validation)
     // =========================================================================
+    const addSequencesBtn = document.getElementById('add_sequences_btn');
+    const sequenceTextInput = document.getElementById('sequence_text');
+
+    function updateAddSequencesButtonState() {
+        const text = sequenceTextInput.value.trim();
+        const sequences = parseFasta(text);
+        const isValid = sequences.length > 0;
+
+        addSequencesBtn.disabled = !isValid;
+        updateButtonVisuals(addSequencesBtn, isValid);
+    }
+
+    sequenceTextInput.addEventListener('input', updateAddSequencesButtonState);
+
+    // Initial check
+    updateAddSequencesButtonState();
+
     document.getElementById('add_sequences_btn').addEventListener('click', () => {
-        const seqTextArea = document.getElementById('sequence_text');
-        const text = seqTextArea.value.trim();
+        const text = sequenceTextInput.value.trim();
 
         if (!text) {
             showStatus('Please paste FASTA sequences first.', 'error');
@@ -881,8 +898,8 @@
         const added = addSequences(sequences);
         showStatus(`Added ${added} sequence${added !== 1 ? 's' : ''} to queue.`, 'success');
 
-        seqTextArea.value = '';
-        updateBlastButtonState();
+        sequenceTextInput.value = '';
+        updateAddSequencesButtonState();
     });
 
     // =========================================================================
