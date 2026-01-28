@@ -1,0 +1,94 @@
+{% extends "base_modern.html" %}
+
+{% block title %}Development To-Do List - Dikarya{% endblock %}
+{% block subtitle %}Feedback & Suggestions{% endblock %}
+
+{% block content %}
+<div class="max-w-4xl mx-auto">
+    <!-- Header Section -->
+    <div class="mb-10 text-center">
+        <h2 class="text-3xl font-bold text-journal-dark dark:text-journal-gold mb-2">Development To-Do List</h2>
+        <p class="text-gray-600 dark:text-gray-400">Help improve Dikarya by sharing your suggestions and feedback.
+        </p>
+    </div>
+
+    <div class="grid grid-cols-1 lg:grid-cols-3 gap-8">
+        <!-- Suggestions List -->
+        <div class="lg:col-span-2 space-y-4">
+            <h3 class="text-xl font-semibold text-journal-dark dark:text-white mb-4 flex items-center">
+                <i class="fas fa-list-ul mr-2 text-journal-gold"></i>
+                Recent Suggestions
+            </h3>
+
+            {% if todos %}
+            <div class="space-y-3">
+                {% for todo in todos %}
+                {% set parts = todo.split(': ', 1) %}
+                <div
+                    class="bg-white dark:bg-journal-green/20 border border-gray-200 dark:border-journal-green/30 p-4 rounded-xl shadow-sm hover:shadow-md transition-shadow">
+                    {% if parts|length > 1 %}
+                    <div class="flex flex-col">
+                        <span class="text-journal-gold font-bold text-sm uppercase tracking-wider mb-1">{{ parts[0]
+                            }}</span>
+                        <p class="text-gray-800 dark:text-gray-200">{{ parts[1] }}</p>
+                    </div>
+                    {% else %}
+                    <p class="text-gray-800 dark:text-gray-200">{{ todo }}</p>
+                    {% endif %}
+                </div>
+                {% endfor %}
+            </div>
+            {% else %}
+            <div
+                class="bg-gray-50 dark:bg-journal-dark/50 border-2 border-dashed border-gray-200 dark:border-journal-green/30 p-12 rounded-2xl text-center">
+                <i class="fas fa-clipboard-list text-4xl text-gray-300 dark:text-journal-green/50 mb-4"></i>
+                <p class="text-gray-500 dark:text-gray-400">No suggestions yet. Be the first to add one!</p>
+            </div>
+            {% endif %}
+        </div>
+
+        <!-- Add Suggestion Form -->
+        <div class="lg:col-span-1">
+            <div
+                class="bg-white dark:bg-journal-dark border border-gray-200 dark:border-journal-green/50 p-6 rounded-2xl shadow-xl sticky top-24">
+                <h3 class="text-xl font-semibold text-journal-dark dark:text-journal-gold mb-6 flex items-center">
+                    <i class="fas fa-plus-circle mr-2"></i>
+                    Add Suggestion
+                </h3>
+
+                <form action="{{ url_for('main.todo') }}" method="post" class="space-y-4">
+                    <div>
+                        <label for="name" class="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">Your
+                            Name</label>
+                        <input type="text" name="name" id="name" required
+                            class="w-full px-4 py-2 bg-gray-50 dark:bg-journal-green/10 border border-gray-300 dark:border-journal-green/30 rounded-lg focus:ring-2 focus:ring-journal-gold focus:border-journal-gold dark:text-white transition-all outline-none"
+                            placeholder="e.g. Rolf Singer">
+                    </div>
+
+                    <div>
+                        <label for="suggestion"
+                            class="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">Your
+                            Suggestion</label>
+                        <textarea name="suggestion" id="suggestion" rows="4" required
+                            class="w-full px-4 py-2 bg-gray-50 dark:bg-journal-green/10 border border-gray-300 dark:border-journal-green/30 rounded-lg focus:ring-2 focus:ring-journal-gold focus:border-journal-gold dark:text-white transition-all outline-none resize-none"
+                            placeholder="What can be improved?"></textarea>
+                    </div>
+
+                    <button type="submit"
+                        class="w-full bg-journal-gold hover:bg-journal-gold-light text-journal-dark font-bold py-3 rounded-lg shadow-lg transform hover:-translate-y-0.5 transition-all duration-200 flex items-center justify-center">
+                        <i class="fas fa-paper-plane mr-2"></i>
+                        Post Suggestion
+                    </button>
+                </form>
+
+                <div class="mt-6 pt-6 border-t border-gray-100 dark:border-journal-green/30">
+                    <p class="text-xs text-gray-500 dark:text-gray-400 text-center">
+                        <i class="fas fa-shield-alt mr-1"></i>
+                        Suggestions are publicly visible.
+                    </p>
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+{% endblock %}

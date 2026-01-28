@@ -1,0 +1,1 @@
+Alan: Have the option to add type sequences to the BLAST results / FASTA files that users upload.

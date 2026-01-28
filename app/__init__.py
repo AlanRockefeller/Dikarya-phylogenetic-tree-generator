@@ -20,12 +20,17 @@ def create_app(config_name='default'):
             app.logger.handlers = gunicorn_logger.handlers
             app.logger.setLevel(gunicorn_logger.level)
     # Initialize extensions
-    # Initialize extensions
-    from app.extensions import db, login_manager, migrate, csrf
+    from app.extensions import db, login_manager, migrate, csrf, limiter
     db.init_app(app)
     migrate.init_app(app, db)
     csrf.init_app(app)
     login_manager.init_app(app)
+    
+    # Configure Limiter storage from config
+    app.config.setdefault("RATELIMIT_STORAGE_URI", "memory://")
+    if app.config.get('REDIS_URL'):
+        app.config["RATELIMIT_STORAGE_URI"] = app.config['REDIS_URL']
+    limiter.init_app(app)
 
     # CSRF error handler - return JSON for API routes
     from flask_wtf.csrf import CSRFError
