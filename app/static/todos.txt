@@ -1,1 +1,3 @@
 Alan: Have the option to add type sequences to the BLAST results / FASTA files that users upload.
+Alan: Import sequences from a list of Genbank accessions, for recreating trees from papers.
+Alan: Implement adjusted identity from https//github.com/joshuaowalker/adjusted-identity

@@ -93,9 +93,9 @@ def todo():
         name = name[:60]
         suggestion = suggestion[:1000]
 
-        # Sanitize input: allow only alphanumeric, spaces, and some punctuation, including Spanish characters and /
-        name = re.sub(r'[^a-zA-Z0-9 ./,!?\'\-áéíóúüÁÉÍÓÚÜñÑ]', '', name)
-        suggestion = re.sub(r'[^a-zA-Z0-9 ./,!?\'\-áéíóúüÁÉÍÓÚÜñÑ]', '', suggestion)
+        # Sanitize input: allow only alphanumeric, spaces, and some punctuation, including Spanish characters, /, and :
+        name = re.sub(r'[^a-zA-Z0-9 ./,:!?\'\-áéíóúüÁÉÍÓÚÜñÑ]', '', name)
+        suggestion = re.sub(r'[^a-zA-Z0-9 ./,:!?\'\-áéíóúüÁÉÍÓÚÜñÑ]', '', suggestion)
 
         # Collapse repeated whitespace inside the string to single spaces
         name = re.sub(r'\s+', ' ', name)
