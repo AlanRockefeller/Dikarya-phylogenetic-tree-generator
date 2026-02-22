@@ -596,135 +596,9 @@
 
         exportSVG() {
             const svg = this.container.querySelector('svg');
-            if (!svg) return;
+            if (!svg) throw new Error('No SVG found in tree container.');
 
-            // Clone
-            const clone = svg.cloneNode(true);
-
-            // 1. Clean Dark Reader artifacts
-            const removeDarkReader = (el) => {
-                if (!el || !el.getAttribute) return;
-                [...el.attributes].forEach(attr => {
-                    if (attr.name.startsWith("data-darkreader")) el.removeAttribute(attr.name);
-                });
-                const style = el.getAttribute("style");
-                if (style) {
-                    const cleanStyle = style.replace(/--darkreader-[^;]+;?/g, "").trim();
-                    if (cleanStyle) el.setAttribute("style", cleanStyle);
-                    else el.removeAttribute("style");
-                }
-                for (const child of el.children) removeDarkReader(child);
-            };
-            removeDarkReader(clone);
-            clone.querySelectorAll("style").forEach(s => {
-                if ((s.textContent || "").toLowerCase().includes("darkreader")) s.remove();
-            });
-
-            // 2. Extract relevant CSS rules from document.styleSheets
-            const extractRelevantStyles = () => {
-                // Selectors that are relevant for the tree SVG
-                const relevantPatterns = [
-                    /\.node\b/, /\.branch\b/, /\.phylotree/, /\.internal-node/,
-                    /\.tree-/, /circle/, /path/, /text/, /line/,
-                    /\.node-support-value/, /\.selected/
-                ];
-
-                let cssText = '';
-                try {
-                    for (const sheet of document.styleSheets) {
-                        // Skip cross-origin stylesheets (cssRules will throw)
-                        let rules;
-                        try {
-                            rules = sheet.cssRules || sheet.rules;
-                        } catch (e) {
-                            continue; // CORS-blocked stylesheet
-                        }
-                        if (!rules) continue;
-
-                        for (const rule of rules) {
-                            if (rule.type !== CSSRule.STYLE_RULE) continue;
-                            const selector = rule.selectorText || '';
-                            // Check if selector is relevant to tree elements
-                            const isRelevant = relevantPatterns.some(pattern => pattern.test(selector));
-                            if (isRelevant) {
-                                // Clean dark reader variables from the rule
-                                let ruleText = rule.cssText.replace(/--darkreader-[^;:]+:[^;]+;?/g, '');
-                                cssText += ruleText + '\n';
-                            }
-                        }
-                    }
-                } catch (e) {
-                    console.warn('Could not extract all stylesheets:', e);
-                }
-                return cssText;
-            };
-
-            const extractedCSS = extractRelevantStyles();
-
-            // 3. Embed extracted styles in <defs><style>
-            if (extractedCSS) {
-                let defs = clone.querySelector('defs');
-                if (!defs) {
-                    defs = document.createElementNS('http://www.w3.org/2000/svg', 'defs');
-                    clone.insertBefore(defs, clone.firstChild);
-                }
-                const styleEl = document.createElementNS('http://www.w3.org/2000/svg', 'style');
-                styleEl.setAttribute('type', 'text/css');
-                styleEl.textContent = extractedCSS;
-                defs.appendChild(styleEl);
-            }
-
-            // 4. Apply minimal inline overrides for selection/search highlighting only
-            // This replaces the expensive per-node getComputedStyle loop
-            const origNodes = svg.querySelectorAll('.node circle, .node path, .node rect');
-            const cloneNodes = clone.querySelectorAll('.node circle, .node path, .node rect');
-            const n = Math.min(origNodes.length, cloneNodes.length);
-
-            for (let i = 0; i < n; i++) {
-                const origEl = origNodes[i];
-                const cloneEl = cloneNodes[i];
-
-                // Check if this node has inline selection/highlight styles applied by _styleNode
-                const origStyle = origEl.getAttribute('style') || '';
-                // Only copy fill/stroke if they indicate selection (orange) or search match (blue)
-                if (origStyle.includes('fill') || origStyle.includes('stroke')) {
-                    // Extract just fill and stroke from inline style
-                    const fillMatch = origStyle.match(/fill\s*:\s*([^;]+)/);
-                    const strokeMatch = origStyle.match(/stroke\s*:\s*([^;]+)/);
-                    let overrideStyle = '';
-                    if (fillMatch) overrideStyle += `fill:${fillMatch[1].trim()};`;
-                    if (strokeMatch) overrideStyle += `stroke:${strokeMatch[1].trim()};`;
-                    if (overrideStyle) {
-                        cloneEl.setAttribute('style', overrideStyle);
-                    }
-                }
-            }
-
-            // Also handle text elements that might have special styling
-            const origTexts = svg.querySelectorAll('text.node-support-value');
-            const cloneTexts = clone.querySelectorAll('text.node-support-value');
-            const tn = Math.min(origTexts.length, cloneTexts.length);
-
-            for (let i = 0; i < tn; i++) {
-                const origEl = origTexts[i];
-                const cloneEl = cloneTexts[i];
-                // Copy positioning and sizing attributes that are dynamically applied
-                ['x', 'y', 'text-anchor', 'dominant-baseline'].forEach(attr => {
-                    const val = origEl.getAttribute(attr);
-                    if (val) cloneEl.setAttribute(attr, val);
-                });
-                // Copy essential inline styles for support labels
-                const origStyle = origEl.getAttribute('style') || '';
-                const fontSize = origStyle.match(/font-size\s*:\s*([^;]+)/);
-                const strokeWidth = origStyle.match(/stroke-width\s*:\s*([^;]+)/);
-                let essentialStyle = '';
-                if (fontSize) essentialStyle += `font-size:${fontSize[1].trim()};`;
-                if (strokeWidth) essentialStyle += `stroke-width:${strokeWidth[1].trim()};`;
-                if (essentialStyle) {
-                    const existing = cloneEl.getAttribute('style') || '';
-                    cloneEl.setAttribute('style', essentialStyle + existing);
-                }
-            }
+            const { clone } = this._buildExportClone(svg);
 
             // Serialize and download
             const data = (new XMLSerializer()).serializeToString(clone);
@@ -737,6 +611,227 @@
             link.click();
             document.body.removeChild(link);
             URL.revokeObjectURL(url);
+        }
+
+        /**
+         * Shared helper: clones the live SVG and prepares it for export.
+         *
+         * Handles:
+         *  - Dark Reader artifact removal
+         *  - Embedding relevant document CSS
+         *  - Merging selection/search inline styles (preserving existing)
+         *  - Copying support-label positioning attributes
+         *  - Resolving pixel dimensions via getBoundingClientRect (% attrs ignored)
+         *  - Preserving / synthesising the viewBox
+         *
+         * @param {SVGSVGElement} svg
+         * @returns {{ clone: SVGSVGElement, width: number, height: number }}
+         */
+        _buildExportClone(svg) {
+            const clone = svg.cloneNode(true);
+
+            // 1. Strip Dark Reader artifacts (recursive)
+            const removeDarkReader = (el) => {
+                if (!el || !el.getAttribute) return;
+                [...el.attributes].forEach(attr => {
+                    if (attr.name.startsWith('data-darkreader')) el.removeAttribute(attr.name);
+                });
+                const style = el.getAttribute('style');
+                if (style) {
+                    const clean = style.replace(/--darkreader-[^;]+;?/g, '').trim();
+                    if (clean) el.setAttribute('style', clean);
+                    else el.removeAttribute('style');
+                }
+                for (const child of el.children) removeDarkReader(child);
+            };
+            removeDarkReader(clone);
+            clone.querySelectorAll('style').forEach(s => {
+                if ((s.textContent || '').toLowerCase().includes('darkreader')) s.remove();
+            });
+
+            // 2. Extract and embed relevant CSS rules
+            const relevantPatterns = [
+                /\.node\b/, /\.branch\b/, /\.phylotree/, /\.internal-node/,
+                /\.tree-/, /circle/, /path/, /text/, /line/,
+                /\.node-support-value/, /\.selected/
+            ];
+            let cssText = '';
+            try {
+                for (const sheet of document.styleSheets) {
+                    let rules;
+                    try { rules = sheet.cssRules || sheet.rules; } catch (_) { continue; }
+                    if (!rules) continue;
+                    for (const rule of rules) {
+                        if (rule.type !== CSSRule.STYLE_RULE) continue;
+                        const sel = rule.selectorText || '';
+                        if (relevantPatterns.some(p => p.test(sel))) {
+                            cssText += rule.cssText.replace(/--darkreader-[^;:]+:[^;]+;?/g, '') + '\n';
+                        }
+                    }
+                }
+            } catch (e) {
+                if (typeof DEBUG_MODE !== 'undefined' && DEBUG_MODE)
+                    console.warn('Could not extract all stylesheets:', e);
+            }
+            if (cssText) {
+                let defs = clone.querySelector('defs');
+                if (!defs) {
+                    defs = document.createElementNS('http://www.w3.org/2000/svg', 'defs');
+                    clone.insertBefore(defs, clone.firstChild);
+                }
+                const styleEl = document.createElementNS('http://www.w3.org/2000/svg', 'style');
+                styleEl.setAttribute('type', 'text/css');
+                styleEl.textContent = cssText;
+                defs.appendChild(styleEl);
+            }
+
+            // 3. Merge selection/search inline styles (prepend so they win; preserve rest)
+            const origShapes = svg.querySelectorAll('.node circle, .node path, .node rect');
+            const cloneShapes = clone.querySelectorAll('.node circle, .node path, .node rect');
+            const sn = Math.min(origShapes.length, cloneShapes.length);
+            for (let i = 0; i < sn; i++) {
+                const os = origShapes[i].getAttribute('style') || '';
+                if (os.includes('fill') || os.includes('stroke')) {
+                    const fm = os.match(/fill\s*:\s*([^;]+)/);
+                    const sm = os.match(/stroke\s*:\s*([^;]+)/);
+                    let ov = '';
+                    if (fm) ov += `fill:${fm[1].trim()};`;
+                    if (sm) ov += `stroke:${sm[1].trim()};`;
+                    if (ov) {
+                        const existing = cloneShapes[i].getAttribute('style') || '';
+                        cloneShapes[i].setAttribute('style', ov + existing);
+                    }
+                }
+            }
+
+            // 4. Copy support-label positioning + essential styles
+            const origTexts = svg.querySelectorAll('text.node-support-value');
+            const cloneTexts = clone.querySelectorAll('text.node-support-value');
+            const tn = Math.min(origTexts.length, cloneTexts.length);
+            for (let i = 0; i < tn; i++) {
+                ['x', 'y', 'text-anchor', 'dominant-baseline'].forEach(attr => {
+                    const val = origTexts[i].getAttribute(attr);
+                    if (val) cloneTexts[i].setAttribute(attr, val);
+                });
+                const os = origTexts[i].getAttribute('style') || '';
+                const fsm = os.match(/font-size\s*:\s*([^;]+)/);
+                const swm = os.match(/stroke-width\s*:\s*([^;]+)/);
+                let es = '';
+                if (fsm) es += `font-size:${fsm[1].trim()};`;
+                if (swm) es += `stroke-width:${swm[1].trim()};`;
+                if (es) {
+                    const existing = cloneTexts[i].getAttribute('style') || '';
+                    cloneTexts[i].setAttribute('style', es + existing);
+                }
+            }
+
+            // 5. Resolve pixel dimensions.
+            //    Prefer getBoundingClientRect — reliable even when SVG attrs use "%" or are unset.
+            //    Only fall back to attribute value if it parses as a plain number (no % unit).
+            const rect = svg.getBoundingClientRect();
+            let width = rect.width || 0;
+            let height = rect.height || 0;
+            if (!width) {
+                const raw = svg.getAttribute('width') || '';
+                if (/^\d+(\.\d+)?(px)?$/.test(raw.trim())) width = parseFloat(raw);
+            }
+            if (!height) {
+                const raw = svg.getAttribute('height') || '';
+                if (/^\d+(\.\d+)?(px)?$/.test(raw.trim())) height = parseFloat(raw);
+            }
+            if (!width) width = 1200;
+            if (!height) height = 800;
+
+            clone.setAttribute('width', width);
+            clone.setAttribute('height', height);
+
+            // 6. Preserve viewBox (ensures correct scaling in rasterisers)
+            const vb = svg.getAttribute('viewBox');
+            if (vb) clone.setAttribute('viewBox', vb);
+            else clone.setAttribute('viewBox', `0 0 ${width} ${height}`);
+
+            return { clone, width, height };
+        }
+
+        /**
+         * Export the current tree visualization as a JPG image.
+         * Returns a Promise that resolves when the download is triggered, or
+         * rejects with a descriptive Error on any failure.
+         *
+         * @param {number} [quality=0.95] - JPEG quality (0–1)
+         * @returns {Promise<void>}
+         */
+        exportJPG(quality = 0.95) {
+            return new Promise((resolve, reject) => {
+                const svg = this.container.querySelector('svg');
+                if (!svg) { reject(new Error('No SVG found in tree container.')); return; }
+
+                let clone, width, height;
+                try {
+                    ({ clone, width, height } = this._buildExportClone(svg));
+                } catch (err) { reject(err); return; }
+
+                let svgUrl;
+                try {
+                    const svgData = (new XMLSerializer()).serializeToString(clone);
+                    const svgBlob = new Blob([svgData], { type: 'image/svg+xml;charset=utf-8' });
+                    svgUrl = URL.createObjectURL(svgBlob);
+                } catch (err) { reject(err); return; }
+
+                const img = new Image();
+
+                img.onerror = () => {
+                    URL.revokeObjectURL(svgUrl);
+                    reject(new Error('Failed to render SVG as image (check for unsupported CSS or external resources).'));
+                };
+
+                img.onload = () => {
+                    URL.revokeObjectURL(svgUrl);
+                    try {
+                        const scale = window.devicePixelRatio || 1;
+                        const canvas = document.createElement('canvas');
+                        canvas.width = Math.round(width * scale);
+                        canvas.height = Math.round(height * scale);
+
+                        const ctx = canvas.getContext('2d');
+                        if (!ctx) {
+                            reject(new Error('Could not obtain 2D canvas context.'));
+                            return;
+                        }
+
+                        // White background — JPEG has no alpha channel
+                        ctx.fillStyle = '#ffffff';
+                        ctx.fillRect(0, 0, canvas.width, canvas.height);
+                        ctx.scale(scale, scale);
+                        ctx.drawImage(img, 0, 0, width, height);
+
+                        canvas.toBlob(jpgBlob => {
+                            if (!jpgBlob) {
+                                reject(new Error('canvas.toBlob() returned null — JPEG encoding failed.'));
+                                return;
+                            }
+                            let jpgUrl;
+                            try {
+                                jpgUrl = URL.createObjectURL(jpgBlob);
+                                const link = document.createElement('a');
+                                link.href = jpgUrl;
+                                link.download = `tree_${Date.now()}.jpg`;
+                                document.body.appendChild(link);
+                                link.click();
+                                document.body.removeChild(link);
+                                resolve();
+                            } catch (err) {
+                                reject(err);
+                            } finally {
+                                if (jpgUrl) URL.revokeObjectURL(jpgUrl);
+                            }
+                        }, 'image/jpeg', quality);
+
+                    } catch (err) { reject(err); }
+                };
+
+                img.src = svgUrl;
+            });
         }
 
         // --- INTERNAL HELPERS ---

@@ -1,3 +1,5 @@
 Alan: Have the option to add type sequences to the BLAST results / FASTA files that users upload.
 Alan: Import sequences from a list of Genbank accessions, for recreating trees from papers.
 Alan: Implement adjusted identity from https//github.com/joshuaowalker/adjusted-identity
+Alan: Make it easy to embed tree in iNaturalist observation
+Mathias Rocheleau-Duplain: The phylotree viewer shows some responsiveness issues during user interaction.Clicking on the black screen causes flickering effects.I suggest optimizing the UX for smoother user experience.

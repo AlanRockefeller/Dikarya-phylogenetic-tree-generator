@@ -496,7 +496,31 @@ document.addEventListener('DOMContentLoaded', async () => {
         // SVG Save
         getEl('btn-save-svg')?.addEventListener('click', (e) => {
             e.preventDefault();
-            viewer?.exportSVG();
+            if (!viewer) { showStatus("Tree not loaded yet.", "warning", 2000); return; }
+            showStatus("Preparing SVG download\u2026", "info");
+            try {
+                viewer.exportSVG();
+                showStatus("SVG downloaded.", "success", 2500);
+            } catch (err) {
+                console.error("SVG export error:", err);
+                const msg = err instanceof Error ? err.message : String(err);
+                showStatus("SVG export failed: " + msg, "danger", 5000);
+            }
+        });
+
+        // JPG Save
+        getEl('btn-save-jpg')?.addEventListener('click', async (e) => {
+            e.preventDefault();
+            if (!viewer) { showStatus("Tree not loaded yet.", "warning", 2000); return; }
+            showStatus("Preparing JPG download\u2026", "info");
+            try {
+                await viewer.exportJPG();
+                showStatus("JPG downloaded.", "success", 2500);
+            } catch (err) {
+                console.error("JPG export error:", err);
+                const msg = err instanceof Error ? err.message : String(err);
+                showStatus("JPG export failed: " + msg, "danger", 5000);
+            }
         });
 
         // Tree Edit Actions (Backend)
