@@ -222,6 +222,34 @@ def fetch_mycomap():
         # Parse FASTA into sequences
         sequences = _parse_fasta_sequences(result['fasta_content'])
         
+        # Identify NCBI accessions that are missing meaningful descriptions
+        # (MyCoMap often returns NCBI records as just '>ACCESSION' without metadata)
+        from app.services.blast_service import _is_genbank_accession, fetch_fasta_for_accessions
+        
+        accessions_to_enrich = []
+        for seq in sequences:
+            # Check if name is a pure accession with no or few spaces
+            parts = seq['name'].split()
+            if len(parts) == 1 and _is_genbank_accession(parts[0].split('.')[0]):
+                accessions_to_enrich.append(parts[0].split('.')[0])
+                
+        if accessions_to_enrich:
+            logger.info(f"Mycomap API: Enriching {len(accessions_to_enrich)} sparse NCBI accessions...")
+            enriched_fasta = fetch_fasta_for_accessions(accessions_to_enrich)
+            if enriched_fasta:
+                enriched_seqs = _parse_fasta_sequences(enriched_fasta)
+                # Create a lookup table using the base accession (no version)
+                enriched_map = { s['name'].split()[0].split('.')[0]: s for s in enriched_seqs if s['name'].strip() }
+                
+                # Replace sparse Mycomap sequences with our highly-detailed XML headers and sequences
+                for seq in sequences:
+                    parts = seq['name'].split()
+                    if len(parts) == 1:
+                        base_acc = parts[0].split('.')[0]
+                        if base_acc in enriched_map:
+                            seq['name'] = enriched_map[base_acc]['name']
+                            seq['sequence'] = enriched_map[base_acc]['sequence']
+                            
         # Apply cleaning to all sequences and filter out empty results
         original_count = len(sequences)
         for seq in sequences:
