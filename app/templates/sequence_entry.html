@@ -262,14 +262,14 @@
             <div class="space-y-4">
                 <div>
                     <label for="sequence_text" class="block text-sm font-medium text-gray-700 dark:text-gray-200 mb-2">
-                        Paste FASTA Sequences
+                        Paste FASTA Sequences or GenBank Accessions
                     </label>
                     <textarea id="sequence_text" rows="8" class="w-full font-mono text-sm px-4 py-3 border border-gray-300 dark:border-journal-dark rounded-lg 
                                bg-white dark:bg-journal-dark text-gray-900 dark:text-gray-100
                                focus:ring-2 focus:ring-journal-gold focus:border-transparent 
-                               transition-all resize-none" placeholder=">seq1&#10;ATGCGATCGATCGATCG..."></textarea>
+                               transition-all resize-none" placeholder=">seq1&#10;ATGCGATCGATCGATCG...&#10;&#10;OR807397, OR807397.1"></textarea>
                     <p class="text-xs text-gray-500 dark:text-gray-400 mt-1">
-                        Enter sequences in FASTA format.
+                        Enter FASTA sequences or one or more GenBank accessions.
                     </p>
                 </div>
 
@@ -889,7 +889,14 @@
     }
 
     function isGenBankAccession(text) {
-        return /^[A-Z]{1,2}_?\d{5,}(\.\d+)?$/i.test(text.trim());
+        return /^[A-Z]{1,6}_?\d{5,9}(\.\d+)?$/i.test(text.trim());
+    }
+
+    function parseGenBankAccessions(text) {
+        if (!text || text.trim().startsWith('>')) return [];
+        const tokens = text.split(/[\s,;]+/).map(token => token.trim()).filter(Boolean);
+        if (tokens.length === 0 || !tokens.every(isGenBankAccession)) return [];
+        return [...new Set(tokens.map(token => token.toUpperCase()))];
     }
 
     // =========================================================================
@@ -998,7 +1005,8 @@
     function updateAddSequencesButtonState() {
         const text = sequenceTextInput.value.trim();
         const sequences = parseFasta(text);
-        const isValid = sequences.length > 0;
+        const accessions = parseGenBankAccessions(text);
+        const isValid = sequences.some(seq => seq.sequence.length > 0) || accessions.length > 0;
 
         addSequencesBtn.disabled = !isValid;
         updateButtonVisuals(addSequencesBtn, isValid);
@@ -1009,25 +1017,62 @@
     // Initial check
     updateAddSequencesButtonState();
 
-    document.getElementById('add_sequences_btn').addEventListener('click', () => {
+    document.getElementById('add_sequences_btn').addEventListener('click', async () => {
         const text = sequenceTextInput.value.trim();
 
         if (!text) {
-            showStatus('Please paste FASTA sequences first.', 'error');
+            showStatus('Please paste FASTA sequences or GenBank accessions first.', 'error');
             return;
         }
 
-        const sequences = parseFasta(text);
+        const sequences = parseFasta(text).filter(seq => seq.sequence.length > 0);
 
-        if (sequences.length === 0) {
-            showStatus('No valid FASTA sequences found. Format: >name\\nSEQUENCE', 'error');
+        if (sequences.length > 0) {
+            const added = addSequences(sequences);
+            showStatus(`Added ${added} sequence${added !== 1 ? 's' : ''} to queue.`, 'success');
+
+            sequenceTextInput.value = '';
+            updateAddSequencesButtonState();
             return;
         }
 
-        const added = addSequences(sequences);
-        showStatus(`Added ${added} sequence${added !== 1 ? 's' : ''} to queue.`, 'success');
+        const accessions = parseGenBankAccessions(text);
+        if (accessions.length === 0) {
+            showStatus('No valid FASTA sequences or GenBank accessions found.', 'error');
+            return;
+        }
 
-        sequenceTextInput.value = '';
+        addSequencesBtn.disabled = true;
+        addSequencesBtn.innerHTML = '<i class="fas fa-spinner fa-spin mr-2"></i> Fetching...';
+        showStatus(`Fetching ${accessions.length} sequence${accessions.length !== 1 ? 's' : ''} from GenBank...`, 'info');
+
+        try {
+            const csrfToken = document.querySelector('meta[name="csrf-token"]').getAttribute('content');
+            const resp = await fetch('/api/genbank/accessions', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                    'X-CSRFToken': csrfToken
+                },
+                body: JSON.stringify({ accessions })
+            });
+
+            const data = await resp.json();
+            if (!resp.ok) {
+                throw new Error(data.error || 'GenBank lookup failed');
+            }
+
+            const added = addSequences(data.sequences || []);
+            const skipped = Array.isArray(data.skipped) ? data.skipped.length : 0;
+            const skippedNote = skipped ? ` ${skipped} accession${skipped !== 1 ? 's' : ''} skipped.` : '';
+            showStatus(`Added ${added} GenBank sequence${added !== 1 ? 's' : ''} to queue.${skippedNote}`, skipped ? 'info' : 'success');
+
+            sequenceTextInput.value = '';
+        } catch (e) {
+            showStatus('GenBank lookup error: ' + e.message, 'error');
+        }
+
+        addSequencesBtn.innerHTML = '<i class="fas fa-plus mr-2"></i> Add Sequences';
         updateAddSequencesButtonState();
     });
 

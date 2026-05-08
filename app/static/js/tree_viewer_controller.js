@@ -46,6 +46,57 @@ document.addEventListener('DOMContentLoaded', async () => {
     // Reroot Capture State (Moved top-level to fix reference errors)
     let rerootCaptureHandler = null;
     let filterDebounce = null;
+    let selectionSaveDebounce = null;
+    let updateSelectionSetUI = () => {}; // assigned in wireUI()
+
+    async function saveSelectionSets() {
+        if (!viewer || JOB_ID === 'unknown') return;
+        try {
+            const payload = viewer.getSelectionSetsData();
+            await fetch(`/api/job/${JOB_ID}/tree/selection_sets`, {
+                method: 'POST',
+                headers: TreeEditActions._buildHeaders(),
+                body: JSON.stringify(payload)
+            });
+        } catch (e) {
+            console.warn('Could not save selection sets:', e);
+        }
+    }
+
+    function debouncedSaveSelectionSets() {
+        if (selectionSaveDebounce) clearTimeout(selectionSaveDebounce);
+        selectionSaveDebounce = setTimeout(saveSelectionSets, 800);
+    }
+
+    function saveDisplayPrefs() {
+        if (JOB_ID === 'unknown') return;
+        try {
+            localStorage.setItem(`dikarya_tree_${JOB_ID}`, JSON.stringify({
+                supportFont: Number(getEl('input-support-font')?.value) || 9,
+                tipFont: Number(getEl('input-tip-font')?.value) || 12,
+                spacingX: viewer?.spacingState?.x || 0,
+                spacingY: viewer?.spacingState?.y || 0,
+            }));
+        } catch (e) {}
+    }
+
+    function restoreDisplayPrefs() {
+        if (JOB_ID === 'unknown' || !viewer) return;
+        try {
+            const raw = localStorage.getItem(`dikarya_tree_${JOB_ID}`);
+            if (!raw) return;
+            const prefs = JSON.parse(raw);
+            const sIn = getEl('input-support-font');
+            const tIn = getEl('input-tip-font');
+            if (sIn && prefs.supportFont) sIn.value = prefs.supportFont;
+            if (tIn && prefs.tipFont) tIn.value = prefs.tipFont;
+            viewer.applyTextSizing();
+            if (prefs.spacingX || prefs.spacingY) {
+                viewer.updateSpacing(prefs.spacingX || 0, prefs.spacingY || 0);
+            }
+        } catch (e) {}
+    }
+
     function removeRerootCapture() {
         if (!container || !rerootCaptureHandler) return;
         container.removeEventListener("click", rerootCaptureHandler, true);
@@ -107,6 +158,7 @@ document.addEventListener('DOMContentLoaded', async () => {
             },
             onSelectionChange: (count) => {
                 updateButtons();
+                debouncedSaveSelectionSets();
             }
         };
 
@@ -148,14 +200,24 @@ document.addEventListener('DOMContentLoaded', async () => {
 
             await viewer.render(newick);
 
-            // Fetch tree state to get midpoint rooting status
+            // Fetch tree state to get midpoint rooting status and restore selection sets
             try {
                 const treeState = await TreeEditActions.getTreeState(JOB_ID);
                 isMidpointRooted = treeState.is_midpoint_rooted ?? true;
                 updateMidpointButton();
+                if (treeState.selection_sets && viewer) {
+                    viewer.restoreSelectionSets({
+                        sets: treeState.selection_sets,
+                        active: treeState.active_selection_set || 'Default'
+                    });
+                    updateSelectionSetUI();
+                }
             } catch (stateErr) {
                 console.warn("Could not fetch tree state:", stateErr);
             }
+
+            // Restore display preferences (font sizes, spacing) from localStorage
+            restoreDisplayPrefs();
 
             // Post-render sync
             updateSupportUI(viewer.getStats());
@@ -262,29 +324,33 @@ document.addEventListener('DOMContentLoaded', async () => {
             if (DEBUG_MODE) console.log('X-Inc clicked: adding 5 to X');
             viewer?.updateSpacing(5, 0);
             showSpacingFeedback();
+            saveDisplayPrefs();
         });
         getEl('btn-spacing-x-dec')?.addEventListener('click', () => {
             if (DEBUG_MODE) console.log('X-Dec clicked: subtracting 5 from X');
             viewer?.updateSpacing(-5, 0);
             showSpacingFeedback();
+            saveDisplayPrefs();
         });
         getEl('btn-spacing-y-inc')?.addEventListener('click', () => {
             if (DEBUG_MODE) console.log('Y-Inc clicked: adding 5 to Y');
             viewer?.updateSpacing(0, 5);
             showSpacingFeedback();
+            saveDisplayPrefs();
         });
         getEl('btn-spacing-y-dec')?.addEventListener('click', () => {
             if (DEBUG_MODE) console.log('Y-Dec clicked: subtracting 5 from Y');
             viewer?.updateSpacing(0, -5);
             showSpacingFeedback();
+            saveDisplayPrefs();
         });
 
         // Font Size Controls
         ['input-support-font', 'input-tip-font'].forEach(id => {
             const el = getEl(id);
             if (el) {
-                el.addEventListener('input', () => viewer?.applyTextSizing());
-                el.addEventListener('change', () => viewer?.applyTextSizing());
+                el.addEventListener('input', () => { viewer?.applyTextSizing(); saveDisplayPrefs(); });
+                el.addEventListener('change', () => { viewer?.applyTextSizing(); saveDisplayPrefs(); });
             }
         });
 
@@ -372,8 +438,8 @@ document.addEventListener('DOMContentLoaded', async () => {
         const btnNewSet = getEl('btn-new-selection-set');
         const btnDeleteSet = getEl('btn-delete-selection-set');
 
-        // Helper to sync UI with viewer selection set state
-        function updateSelectionSetUI() {
+        // Helper to sync UI with viewer selection set state (also assigned to outer scope for loadTree access)
+        updateSelectionSetUI = function updateSelectionSetUI() {
             if (!viewer || !selectSet) return;
 
             const names = viewer.getSelectionSetNames();
@@ -423,6 +489,7 @@ document.addEventListener('DOMContentLoaded', async () => {
             if (viewer.createSelectionSet(name.trim())) {
                 viewer.setActiveSelectionSet(name.trim());
                 updateSelectionSetUI();
+                saveSelectionSets();
                 showStatus(`Created selection set "${name.trim()}".`, "success", 2000);
             } else {
                 showStatus(`Set "${name.trim()}" already exists or is invalid.`, "warning", 2500);
@@ -441,6 +508,7 @@ document.addEventListener('DOMContentLoaded', async () => {
 
             if (viewer.deleteSelectionSet(active)) {
                 updateSelectionSetUI();
+                saveSelectionSets();
                 showStatus(`Deleted selection set "${active}".`, "success", 2000);
             }
         });

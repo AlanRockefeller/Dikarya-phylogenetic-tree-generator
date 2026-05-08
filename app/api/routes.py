@@ -21,9 +21,37 @@ logger = logging.getLogger(__name__)
 
 def _is_genbank_accession(text):
     """Check if text looks like a GenBank accession number."""
-    # Common patterns: NC_012345, NM_001234567, AB123456, etc.
-    pattern = r'^[A-Z]{1,2}_?\d{5,}(\.\d+)?$'
+    # Common nucleotide patterns: NC_012345, NM_001234567, OR807397.1, etc.
+    pattern = r'^[A-Z]{1,6}_?\d{5,9}(?:\.\d+)?$'
     return bool(re.match(pattern, text.strip(), re.IGNORECASE))
+
+
+MAX_CUSTOM_GENBANK_ACCESSIONS = 200
+MAX_CUSTOM_GENBANK_SEQUENCE_BP = 5000
+
+
+def _parse_genbank_accession_tokens(value):
+    """Parse comma/whitespace-separated GenBank accessions."""
+    if isinstance(value, list):
+        raw_text = " ".join(str(item) for item in value)
+    else:
+        raw_text = str(value or "")
+
+    tokens = [token.strip() for token in re.split(r'[\s,;]+', raw_text) if token.strip()]
+    accessions = []
+    invalid = []
+    seen = set()
+
+    for token in tokens:
+        normalized = token.upper()
+        if not _is_genbank_accession(normalized):
+            invalid.append(token)
+            continue
+        if normalized not in seen:
+            accessions.append(normalized)
+            seen.add(normalized)
+
+    return accessions, invalid
 
 
 def _split_fasta_header(header):
@@ -99,6 +127,67 @@ def _parse_fasta_sequences(text):
     return sequences
 
 
+def _fetch_genbank_sequences_for_queue(accessions, max_sequence_bp=MAX_CUSTOM_GENBANK_SEQUENCE_BP):
+    """Fetch GenBank accessions and shape them for frontend queue entries."""
+    from app.services.blast_service import fetch_fasta_for_accessions
+    from app.services.fasta_utils import clean_dna_sequence
+
+    fasta_content = fetch_fasta_for_accessions(accessions)
+    parsed_sequences = _parse_fasta_sequences(fasta_content)
+
+    sequences = []
+    skipped = []
+    found_versions = set()
+    found_bases = set()
+
+    for seq in parsed_sequences:
+        raw_header = (seq.get("name") or "").strip()
+        seq_id, description = _split_fasta_header(raw_header)
+
+        if seq_id:
+            found_versions.add(seq_id.upper())
+            found_bases.add(seq_id.split(".")[0].upper())
+
+        sequence = clean_dna_sequence(seq.get("sequence", ""), min_length=1)
+        if not sequence:
+            skipped.append({
+                "accession": seq_id or raw_header or "unknown",
+                "reason": "empty_sequence"
+            })
+            continue
+
+        if len(sequence) > max_sequence_bp:
+            skipped.append({
+                "accession": seq_id or raw_header or "unknown",
+                "reason": "too_long",
+                "length": len(sequence),
+                "max_length": max_sequence_bp
+            })
+            continue
+
+        sequences.append({
+            "name": seq_id or raw_header,
+            "organism": description,
+            "sequence": sequence,
+            "source": "genbank"
+        })
+
+    for accession in accessions:
+        requested = accession.upper()
+        if "." in requested:
+            found = requested in found_versions
+        else:
+            found = requested in found_bases
+
+        if not found:
+            skipped.append({
+                "accession": accession,
+                "reason": "not_found"
+            })
+
+    return sequences, skipped
+
+
 
 @bp.route('/blast', methods=['POST'])
 def run_blast():
@@ -165,6 +254,72 @@ def run_blast():
         
     except Exception as e:
         logger.error(f"BLAST API error: {e}", exc_info=True)
+        return jsonify({"status": "error", "error": str(e)}), 500
+
+
+@bp.route('/genbank/accessions', methods=['POST'])
+def fetch_genbank_accessions():
+    """
+    Fetch one or more GenBank accessions for direct queue insertion.
+
+    Request: { "accessions": ["OR807397", "OR807397.1"] }
+    Response: { "status": "success", "sequences": [...], "skipped": [...] }
+    """
+    data = request.get_json(silent=True) or {}
+    raw_accessions = data.get("accessions", data.get("input", ""))
+
+    accessions, invalid = _parse_genbank_accession_tokens(raw_accessions)
+    if invalid:
+        return jsonify({
+            "status": "error",
+            "error": f"Invalid GenBank accession(s): {', '.join(invalid[:10])}"
+        }), 400
+
+    if not accessions:
+        return jsonify({"status": "error", "error": "No GenBank accessions provided"}), 400
+
+    if len(accessions) > MAX_CUSTOM_GENBANK_ACCESSIONS:
+        return jsonify({
+            "status": "error",
+            "error": f"Too many accessions (max {MAX_CUSTOM_GENBANK_ACCESSIONS})"
+        }), 400
+
+    try:
+        sequences, skipped = _fetch_genbank_sequences_for_queue(
+            accessions,
+            max_sequence_bp=MAX_CUSTOM_GENBANK_SEQUENCE_BP
+        )
+
+        if not sequences:
+            too_long = [item for item in skipped if item.get("reason") == "too_long"]
+            if too_long:
+                return jsonify({
+                    "status": "error",
+                    "error": f"No sequences were added. GenBank sequences must be {MAX_CUSTOM_GENBANK_SEQUENCE_BP:,} bp or shorter.",
+                    "skipped": skipped,
+                    "max_sequence_bp": MAX_CUSTOM_GENBANK_SEQUENCE_BP
+                }), 400
+
+            return jsonify({
+                "status": "error",
+                "error": "No GenBank sequences found for the provided accession(s).",
+                "skipped": skipped,
+                "max_sequence_bp": MAX_CUSTOM_GENBANK_SEQUENCE_BP
+            }), 404
+
+        message = f"Fetched {len(sequences)} GenBank sequence{'s' if len(sequences) != 1 else ''}"
+        if skipped:
+            message += f" ({len(skipped)} skipped)"
+
+        return jsonify({
+            "status": "success",
+            "sequences": sequences,
+            "skipped": skipped,
+            "max_sequence_bp": MAX_CUSTOM_GENBANK_SEQUENCE_BP,
+            "message": message
+        })
+    except Exception as e:
+        logger.error(f"GenBank accession API error: {e}", exc_info=True)
         return jsonify({"status": "error", "error": str(e)}), 500
 
 
@@ -732,6 +887,35 @@ def midpoint_root_toggle_endpoint(job_id):
         return jsonify(state)
     except ValueError as e:
         return jsonify({"status": "error", "error": str(e)}), 400
+    except Exception as e:
+        return jsonify({"status": "error", "error": str(e)}), 500
+
+@bp.route('/job/<job_id>/tree/selection_sets', methods=['POST'])
+def save_selection_sets(job_id):
+    if not validate_job_id(job_id):
+        return jsonify({"status": "error", "error": "Invalid job ID format"}), 400
+
+    _, error_msg, status_code = check_job_access(job_id)
+    if error_msg:
+        return jsonify({"status": "error", "error": error_msg}), status_code
+
+    job_dir = Config.JOB_DIR / job_id
+    if not job_dir.exists():
+        return jsonify({"status": "error", "error": "Job not found"}), 404
+
+    data = request.get_json(silent=True) or {}
+    sets = data.get("sets")
+    active = data.get("active", "Default")
+    if sets is None or not isinstance(sets, dict):
+        return jsonify({"status": "error", "error": "Missing or invalid 'sets' field"}), 400
+
+    try:
+        from app.services.tree_edit_service import load_tree_state, save_tree_state
+        state = load_tree_state(job_dir)
+        state["selection_sets"] = sets
+        state["active_selection_set"] = active
+        save_tree_state(job_dir, state)
+        return jsonify({"status": "ok"})
     except Exception as e:
         return jsonify({"status": "error", "error": str(e)}), 500
 

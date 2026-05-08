@@ -378,6 +378,17 @@
                 // Override click behavior: left-click = select, shift/right = menu
                 this._overrideClickBehavior();
 
+                // Alan 5/8/26 - Disable wheel-to-zoom so mouse wheel scrolls the page instead of zooming the tree.
+                // Intercept wheel events before D3 and let the page scroll instead.
+                const svgEl = this.container.querySelector('svg');
+                if (svgEl) {
+                    svgEl.addEventListener('wheel', (e) => {
+                        if (!e.ctrlKey) {
+                            e.stopImmediatePropagation();
+                        }
+                    }, { capture: true, passive: true });
+                }
+
             } catch (e) {
                 console.error("Render error:", e);
                 this.container.innerHTML = `<div class="p-4 bg-red-50 text-red-800 dark:bg-red-900/30 dark:text-red-200 rounded">Render Error: ${e.message}</div>`;
@@ -1573,6 +1584,35 @@
          */
         getActiveSelectionSet() {
             return this.activeSelectionSet;
+        }
+
+        // Alan 5/8/26 - Serialize/restore selection sets for persistence across page reloads.
+        getSelectionSetsData() {
+            const sets = {};
+            for (const [name, memberSet] of Object.entries(this.selectionSets)) {
+                sets[name] = Array.from(memberSet);
+            }
+            return { sets, active: this.activeSelectionSet };
+        }
+
+        restoreSelectionSets(data) {
+            if (!data || !data.sets) return;
+            for (const name of Object.keys(this.selectionSets)) {
+                if (name !== 'Default') delete this.selectionSets[name];
+            }
+            this.selectionSets['Default'].clear();
+            for (const [name, ids] of Object.entries(data.sets)) {
+                if (name === 'Default') {
+                    this.selectionSets['Default'] = new Set(ids);
+                } else {
+                    this.selectionSets[name] = new Set(ids);
+                }
+            }
+            if (data.active && this.selectionSets[data.active]) {
+                this.activeSelectionSet = data.active;
+            }
+            this._updateNodeStylesOnly();
+            this._updateStats();
         }
 
         /**
