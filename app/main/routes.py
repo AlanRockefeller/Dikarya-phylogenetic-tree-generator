@@ -3,15 +3,45 @@ from flask_login import current_user
 from app.main import bp
 from app.services.security_utils import validate_safe_file_path
 from app.services.access_control import check_job_access
-from app.extensions import csrf, limiter
+from app.extensions import csrf, limiter, db
 import os
 import re
 from collections import deque
+from datetime import datetime
 
 
 @bp.route('/tree')
 def sequence_entry():
     return render_template('sequence_entry.html')
+
+
+@bp.route('/whats-new')
+def whats_new():
+    from app.models import WhatsNewEntry, WhatsNewView
+
+    entries = WhatsNewEntry.query.order_by(WhatsNewEntry.published_at.desc()).all()
+
+    last_viewed = None
+    if current_user.is_authenticated:
+        view_record = WhatsNewView.query.filter_by(user_id=current_user.id).first()
+    else:
+        view_record = WhatsNewView.query.filter_by(ip_address=request.remote_addr).first()
+
+    if view_record:
+        last_viewed = view_record.last_viewed_at
+
+    now = datetime.utcnow()
+    if view_record:
+        view_record.last_viewed_at = now
+    else:
+        if current_user.is_authenticated:
+            view_record = WhatsNewView(user_id=current_user.id, last_viewed_at=now)
+        else:
+            view_record = WhatsNewView(ip_address=request.remote_addr, last_viewed_at=now)
+        db.session.add(view_record)
+    db.session.commit()
+
+    return render_template('whats_new.html', entries=entries, last_viewed=last_viewed)
 
 @bp.route('/job')
 def job_redirect():

@@ -33,6 +33,25 @@ class Job(db.Model):
     
     user = db.relationship("User", backref=db.backref("jobs", lazy=True))
 
+class WhatsNewEntry(db.Model):
+    __tablename__ = 'whats_new_entry'
+    id = db.Column(db.Integer, primary_key=True)
+    title = db.Column(db.String(255), nullable=False)
+    body = db.Column(db.Text, nullable=False)
+    category = db.Column(db.String(64), nullable=False, default='update')
+    published_at = db.Column(db.DateTime, default=datetime.utcnow, nullable=False)
+
+
+class WhatsNewView(db.Model):
+    __tablename__ = 'whats_new_view'
+    id = db.Column(db.Integer, primary_key=True)
+    user_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=True, unique=True)
+    ip_address = db.Column(db.String(45), nullable=True, unique=True)
+    last_viewed_at = db.Column(db.DateTime, default=datetime.utcnow, nullable=False)
+
+    user = db.relationship('User', backref=db.backref('whats_new_view', uselist=False))
+
+
 @dataclass
 class AlignmentParams:
     method: str  # "mafft", "muscle", "clustalo", "iqtree_builtin", "default"

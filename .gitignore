@@ -49,3 +49,5 @@ Thumbs.db
 test_input.fasta
 test_sanitized.fasta
 test_tree.newick
+.claude/
+CLAUDE.md

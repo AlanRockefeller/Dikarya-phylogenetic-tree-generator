@@ -72,6 +72,13 @@
                         class="text-gray-300 hover:text-journal-gold transition-colors text-sm font-medium">
                         <i class="fas fa-book mr-1"></i> Journal Home
                     </a>
+                    <a href="{{ url_for('main.whats_new') }}"
+                        class="text-gray-300 hover:text-journal-gold transition-colors text-sm font-medium relative {% block nav_whats_new %}{% endblock %}">
+                        <i class="fas fa-star mr-1"></i> What's New
+                        {% if whats_new_has_new %}
+                        <span class="absolute -top-1.5 -right-2 w-2.5 h-2.5 bg-journal-gold rounded-full border border-journal-dark" title="New updates available"></span>
+                        {% endif %}
+                    </a>
                     <a href="{{ url_for('main.sequence_entry') }}"
                         class="text-gray-300 hover:text-journal-gold transition-colors text-sm font-medium {% block nav_tree_builder %}{% endblock %}">
                         <i class="fas fa-tree mr-1"></i> Tree Builder
@@ -124,6 +131,13 @@
                 <a href="{{ url_for('journal.home') }}"
                     class="block text-gray-200 hover:text-journal-gold transition-colors font-medium py-2">
                     <i class="fas fa-book mr-2 w-5"></i> Journal Home
+                </a>
+                <a href="{{ url_for('main.whats_new') }}"
+                    class="flex items-center text-gray-200 hover:text-journal-gold transition-colors font-medium py-2">
+                    <i class="fas fa-star mr-2 w-5"></i> What's New
+                    {% if whats_new_has_new %}
+                    <span class="ml-2 w-2 h-2 bg-journal-gold rounded-full flex-shrink-0"></span>
+                    {% endif %}
                 </a>
                 <a href="{{ url_for('main.sequence_entry') }}"
                     class="block text-gray-200 hover:text-journal-gold transition-colors font-medium py-2">

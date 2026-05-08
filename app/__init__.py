@@ -61,7 +61,27 @@ def create_app(config_name='default'):
 
     from app.monitoring import bp as monitoring_bp
     app.register_blueprint(monitoring_bp)
-    
+
+    # Inject What's New badge indicator into all templates
+    @app.context_processor
+    def inject_whats_new_badge():
+        try:
+            from app.models import WhatsNewEntry, WhatsNewView
+            from flask_login import current_user
+            from flask import request as req
+            latest = WhatsNewEntry.query.order_by(WhatsNewEntry.published_at.desc()).first()
+            if not latest:
+                return {'whats_new_has_new': False}
+            view_record = None
+            if current_user.is_authenticated:
+                view_record = WhatsNewView.query.filter_by(user_id=current_user.id).first()
+            else:
+                view_record = WhatsNewView.query.filter_by(ip_address=req.remote_addr).first()
+            has_new = view_record is None or latest.published_at > view_record.last_viewed_at
+            return {'whats_new_has_new': has_new}
+        except Exception:
+            return {'whats_new_has_new': False}
+
     # Register CLI commands
     from app import cli
     cli.register(app)

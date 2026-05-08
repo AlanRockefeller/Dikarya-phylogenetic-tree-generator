@@ -134,12 +134,19 @@
                     </label>
                 </div>
 
-                <!-- Fetch Button -->
-                <button id="fetch_mycomap_btn" class="w-full bg-journal-dark hover:bg-journal-green text-white 
-                               py-3 px-4 rounded-lg font-semibold shadow-md hover:shadow-lg 
-                               transition-all flex items-center justify-center">
-                    <i class="fas fa-download mr-2"></i> Fetch Sequences
-                </button>
+                <!-- Fetch / One-Click Tree Buttons -->
+                <div class="flex gap-3">
+                    <button id="fetch_mycomap_btn" class="flex-1 bg-journal-dark hover:bg-journal-green text-white
+                                   py-3 px-4 rounded-lg font-semibold shadow-md hover:shadow-lg
+                                   transition-all flex items-center justify-center">
+                        <i class="fas fa-download mr-2"></i> Fetch Sequences
+                    </button>
+                    <button id="mycomap_quick_tree_btn" class="flex-1 bg-journal-dark hover:bg-journal-green text-white
+                                   py-3 px-4 rounded-lg font-semibold shadow-md hover:shadow-lg
+                                   transition-all flex items-center justify-center">
+                        <i class="fas fa-magic mr-2"></i> One-Click Tree
+                    </button>
+                </div>
             </div>
         </div>
 
@@ -315,11 +322,19 @@
 
             <!-- Queue Footer -->
             <div class="p-4 border-t border-gray-200 dark:border-journal-dark flex justify-between items-center">
-                <button id="clear_queue_btn" class="text-red-500 hover:text-red-700 dark:text-red-400 dark:hover:text-red-300 
-                               text-sm font-medium transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
-                    disabled>
-                    <i class="fas fa-trash-alt mr-1"></i> Clear All
-                </button>
+                <div class="flex items-center gap-3">
+                    <button id="clear_queue_btn" class="text-red-500 hover:text-red-700 dark:text-red-400 dark:hover:text-red-300
+                                   text-sm font-medium transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+                        disabled>
+                        <i class="fas fa-trash-alt mr-1"></i> Clear All
+                    </button>
+                    <button id="btn-filter-results"
+                        class="text-journal-gold hover:text-journal-gold-light dark:text-journal-gold
+                               text-sm font-medium transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
+                        disabled title="Open filter panel (requires MycoMap sequences with metrics)">
+                        <i class="fas fa-filter mr-1"></i> Filter Results
+                    </button>
+                </div>
                 <span class="text-xs text-gray-500 dark:text-gray-400">Click × to remove</span>
             </div>
         </div>
@@ -613,6 +628,116 @@
         </li>
     </ul>
 </div>
+<!-- Filter Results Modal -->
+<div id="filter-modal" class="hidden fixed inset-0 z-50 flex items-center justify-center p-4">
+    <!-- Backdrop -->
+    <div id="filter-modal-backdrop" class="absolute inset-0 bg-black/50 dark:bg-black/70"></div>
+    <!-- Panel -->
+    <div class="relative bg-white dark:bg-journal-green rounded-xl shadow-2xl w-full sm:max-w-4xl max-h-[90vh] flex flex-col">
+        <!-- Header -->
+        <div class="flex items-center justify-between px-6 py-4 border-b border-gray-200 dark:border-journal-dark">
+            <h3 class="text-lg font-semibold text-journal-dark dark:text-gray-100 flex items-center">
+                <i class="fas fa-filter text-journal-gold mr-2"></i>
+                Filter Results by BLAST Metrics
+            </h3>
+            <button id="filter-modal-close-x" class="text-gray-400 hover:text-gray-600 dark:text-gray-500 dark:hover:text-gray-300 transition-colors p-1">
+                <i class="fas fa-times text-lg"></i>
+            </button>
+        </div>
+        <!-- Body -->
+        <div class="flex-1 overflow-y-auto px-6 py-5 space-y-5">
+            <!-- Sliders -->
+            <div class="grid grid-cols-1 sm:grid-cols-3 gap-6">
+                <!-- Query Coverage -->
+                <div class="space-y-2">
+                    <div class="flex items-center justify-between">
+                        <label class="text-sm font-medium text-gray-700 dark:text-gray-300">Query Coverage %</label>
+                        <span id="filter-qcov-val" class="text-sm font-bold text-blue-600 dark:text-blue-400 bg-blue-50 dark:bg-blue-900/30 px-2 py-0.5 rounded">80</span>
+                    </div>
+                    <input id="filter-slider-qcov" type="range" min="0" max="100" value="80" step="1"
+                        class="w-full h-2 rounded-lg appearance-none cursor-pointer accent-blue-500">
+                    <div class="flex justify-between text-xs text-gray-400">
+                        <span>0%</span><span>100%</span>
+                    </div>
+                </div>
+                <!-- Subject Coverage -->
+                <div class="space-y-2">
+                    <div class="flex items-center justify-between">
+                        <label class="text-sm font-medium text-gray-700 dark:text-gray-300">Subject Coverage %</label>
+                        <span id="filter-scov-val" class="text-sm font-bold text-green-600 dark:text-green-400 bg-green-50 dark:bg-green-900/30 px-2 py-0.5 rounded">80</span>
+                    </div>
+                    <input id="filter-slider-scov" type="range" min="0" max="100" value="80" step="1"
+                        class="w-full h-2 rounded-lg appearance-none cursor-pointer accent-green-500">
+                    <div class="flex justify-between text-xs text-gray-400">
+                        <span>0%</span><span>100%</span>
+                    </div>
+                </div>
+                <!-- Identity -->
+                <div class="space-y-2">
+                    <div class="flex items-center justify-between">
+                        <label class="text-sm font-medium text-gray-700 dark:text-gray-300">Identity %</label>
+                        <span id="filter-ident-val" class="text-sm font-bold text-purple-600 dark:text-purple-400 bg-purple-50 dark:bg-purple-900/30 px-2 py-0.5 rounded">95</span>
+                    </div>
+                    <input id="filter-slider-ident" type="range" min="0" max="100" value="95" step="1"
+                        class="w-full h-2 rounded-lg appearance-none cursor-pointer accent-purple-500">
+                    <div class="flex justify-between text-xs text-gray-400">
+                        <span>0%</span><span>100%</span>
+                    </div>
+                </div>
+            </div>
+            <!-- Preset buttons -->
+            <div class="flex items-center gap-2 flex-wrap">
+                <span class="text-xs text-gray-500 dark:text-gray-400 mr-1">Presets:</span>
+                <button type="button" onclick="setFilterPreset('loose')"
+                    class="text-xs px-3 py-1.5 rounded-md border border-gray-300 dark:border-journal-dark text-gray-600 dark:text-gray-300 hover:bg-gray-100 dark:hover:bg-journal-dark transition-colors">
+                    Loose
+                </button>
+                <button type="button" onclick="setFilterPreset('typical')"
+                    class="text-xs px-3 py-1.5 rounded-md border border-gray-300 dark:border-journal-dark text-gray-600 dark:text-gray-300 hover:bg-gray-100 dark:hover:bg-journal-dark transition-colors">
+                    Typical
+                </button>
+                <button type="button" onclick="setFilterPreset('strict')"
+                    class="text-xs px-3 py-1.5 rounded-md border border-gray-300 dark:border-journal-dark text-gray-600 dark:text-gray-300 hover:bg-gray-100 dark:hover:bg-journal-dark transition-colors">
+                    Strict
+                </button>
+                <button type="button" onclick="resetFilterSliders()"
+                    class="text-xs px-3 py-1.5 rounded-md border border-gray-300 dark:border-journal-dark text-gray-600 dark:text-gray-300 hover:bg-gray-100 dark:hover:bg-journal-dark transition-colors">
+                    Reset
+                </button>
+            </div>
+            <!-- Preview -->
+            <div class="grid grid-cols-2 gap-4">
+                <div class="space-y-2">
+                    <h4 class="text-sm font-semibold text-gray-700 dark:text-gray-300">
+                        Included (<span id="filter-included-count">0</span>)
+                    </h4>
+                    <ul id="filter-included-list"
+                        class="max-h-56 overflow-y-auto divide-y divide-gray-100 dark:divide-journal-dark rounded-lg border border-gray-200 dark:border-journal-dark bg-gray-50 dark:bg-journal-dark/40 text-xs">
+                    </ul>
+                </div>
+                <div class="space-y-2">
+                    <h4 class="text-sm font-semibold text-red-600 dark:text-red-400">
+                        Excluded (<span id="filter-excluded-count">0</span>)
+                    </h4>
+                    <ul id="filter-excluded-list"
+                        class="max-h-56 overflow-y-auto divide-y divide-gray-100 dark:divide-journal-dark rounded-lg border border-gray-200 dark:border-journal-dark bg-gray-50 dark:bg-journal-dark/40 text-xs">
+                    </ul>
+                </div>
+            </div>
+        </div>
+        <!-- Footer -->
+        <div class="flex items-center justify-end gap-3 px-6 py-4 border-t border-gray-200 dark:border-journal-dark">
+            <button id="filter-modal-cancel"
+                class="px-4 py-2 text-sm rounded-lg border border-gray-300 dark:border-journal-dark text-gray-700 dark:text-gray-300 hover:bg-gray-100 dark:hover:bg-journal-dark transition-colors">
+                Cancel
+            </button>
+            <button id="filter-modal-apply"
+                class="px-4 py-2 text-sm rounded-lg bg-journal-gold hover:bg-journal-gold-light text-journal-dark font-semibold transition-colors">
+                Apply Filter
+            </button>
+        </div>
+    </div>
+</div>
 {% endblock %}
 
 {% block scripts %}
@@ -662,6 +787,10 @@
             document.getElementById('tree_method').value === 'raxml') {
             populateOutgroupDropdown();
         }
+
+        // Enable/disable the filter button based on whether any sequences have metrics
+        const filterBtn = document.getElementById('btn-filter-results');
+        if (filterBtn) filterBtn.disabled = !hasFilterableSequences();
     }
 
     function updateButtonVisuals(btn, isValid) {
@@ -971,10 +1100,12 @@
     const mycomapLocalCheckbox = document.getElementById('mycomap_local');
     const mycomapDedupCheckbox = document.getElementById('mycomap_dedup');
     const fetchMycomapBtn = document.getElementById('fetch_mycomap_btn');
+    const mycomapQuickTreeBtn = document.getElementById('mycomap_quick_tree_btn');
 
     function checkMycomapState() {
         const isValid = isValidMycomapUrl(mycomapUrlInput.value.trim());
         updateButtonVisuals(fetchMycomapBtn, isValid);
+        updateButtonVisuals(mycomapQuickTreeBtn, isValid);
     }
 
     mycomapUrlInput.addEventListener('input', checkMycomapState);
@@ -990,15 +1121,15 @@
         return /r\d+/.test(trimmed);
     }
 
-    fetchMycomapBtn.addEventListener('click', async () => {
+    // Shared fetch logic — returns true on success, false on error.
+    async function doFetchMycomap() {
         const url = mycomapUrlInput.value.trim();
         const includeNcbi = mycomapNcbiCheckbox.checked;
         const includeLocal = mycomapLocalCheckbox.checked;
 
-        // Client-side validation
         if (!url) {
             showStatus('Please enter a Mycomap URL.', 'error');
-            return;
+            return false;
         }
 
         if (!isValidMycomapUrl(url)) {
@@ -1007,17 +1138,14 @@
             } else {
                 showStatus('Invalid Mycomap URL. URL must be from mycomap.com and contain a result ID.', 'error');
             }
-            return;
+            return false;
         }
 
         if (!includeNcbi && !includeLocal) {
             showStatus('Please select at least one result type (NCBI or Local).', 'error');
-            return;
+            return false;
         }
 
-        // Disable button and show loading state
-        fetchMycomapBtn.disabled = true;
-        fetchMycomapBtn.innerHTML = '<i class="fas fa-spinner fa-spin mr-2"></i> Fetching...';
         showStatus('Fetching sequences from Mycomap...', 'info');
 
         try {
@@ -1052,16 +1180,86 @@
             }
             showStatus(statusMsg, 'success');
 
-            // Clear the URL input on success
             mycomapUrlInput.value = '';
+            checkMycomapState();
+            return true;
 
         } catch (e) {
             showStatus('Mycomap error: ' + e.message, 'error');
+            return false;
         }
+    }
 
-        // Restore button state
+    fetchMycomapBtn.addEventListener('click', async () => {
+        fetchMycomapBtn.disabled = true;
+        fetchMycomapBtn.innerHTML = '<i class="fas fa-spinner fa-spin mr-2"></i> Fetching...';
+        await doFetchMycomap();
         fetchMycomapBtn.disabled = false;
         fetchMycomapBtn.innerHTML = '<i class="fas fa-download mr-2"></i> Fetch Sequences';
+    });
+
+    mycomapQuickTreeBtn.addEventListener('click', async () => {
+        mycomapQuickTreeBtn.disabled = true;
+        fetchMycomapBtn.disabled = true;
+        mycomapQuickTreeBtn.innerHTML = '<i class="fas fa-spinner fa-spin mr-2"></i> Fetching...';
+
+        const ok = await doFetchMycomap();
+
+        if (!ok) {
+            mycomapQuickTreeBtn.disabled = false;
+            fetchMycomapBtn.disabled = false;
+            mycomapQuickTreeBtn.innerHTML = '<i class="fas fa-magic mr-2"></i> One-Click Tree';
+            return;
+        }
+
+        if (sequenceQueue.length < 2) {
+            showStatus('Need at least 2 sequences to build a tree.', 'error');
+            mycomapQuickTreeBtn.disabled = false;
+            fetchMycomapBtn.disabled = false;
+            mycomapQuickTreeBtn.innerHTML = '<i class="fas fa-magic mr-2"></i> One-Click Tree';
+            return;
+        }
+
+        mycomapQuickTreeBtn.innerHTML = '<i class="fas fa-spinner fa-spin mr-2"></i> Submitting...';
+        showStatus('Building tree from Mycomap sequences...', 'info');
+
+        const payload = {
+            input_type: 'sequence',
+            sequence: buildFastaFromQueue(),
+            notes: 'Mycomap Quick Tree',
+            alignment_method: 'mafft',
+            trimming_method: 'none',
+            tree_method: 'fasttree',
+            tree_model: 'GTR+G',
+            bootstrap: 100
+        };
+
+        try {
+            const csrfToken = document.querySelector('meta[name="csrf-token"]').getAttribute('content');
+            const resp = await fetch('/api/job', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                    'X-CSRFToken': csrfToken
+                },
+                body: JSON.stringify(payload)
+            });
+
+            const data = await resp.json();
+
+            if (!resp.ok) {
+                throw new Error(data.message || data.error || 'Server error');
+            }
+
+            showStatus('Job submitted! Redirecting...', 'success');
+            window.location.href = '/job/' + data.job_id;
+
+        } catch (e) {
+            showStatus('Submission failed: ' + e.message, 'error');
+            mycomapQuickTreeBtn.disabled = false;
+            fetchMycomapBtn.disabled = false;
+            mycomapQuickTreeBtn.innerHTML = '<i class="fas fa-magic mr-2"></i> One-Click Tree';
+        }
     });
 
     // =========================================================================
@@ -1880,5 +2078,166 @@
     }
 
     updateQueueDisplay();
+
+    // =========================================================================
+    // Filter Results Modal
+    // =========================================================================
+    const FILTER_DEFAULTS = { queryCover: 80, subjectCover: 80, identity: 95 };
+    const FILTER_PRESETS = {
+        loose:   { queryCover: 60, subjectCover: 60, identity: 90 },
+        typical: { queryCover: 80, subjectCover: 80, identity: 95 },
+        strict:  { queryCover: 90, subjectCover: 90, identity: 98 },
+    };
+    let filterSliders = { ...FILTER_DEFAULTS };
+    let _filterKeydownHandler = null;
+
+    function hasFilterableSequences() {
+        return sequenceQueue.some(s => s.blast_metrics_available === true);
+    }
+
+    function computeFilterPreview() {
+        const included = [];
+        const excluded = [];
+        for (const seq of sequenceQueue) {
+            if (!seq.blast_metrics_available) {
+                included.push(seq);
+                continue;
+            }
+            const qcPass = seq.query_cover == null   || seq.query_cover   >= filterSliders.queryCover;
+            const scPass = seq.subject_cover == null || seq.subject_cover >= filterSliders.subjectCover;
+            const idPass = seq.identity == null      || seq.identity      >= filterSliders.identity;
+            if (qcPass && scPass && idPass) {
+                included.push(seq);
+            } else {
+                excluded.push(seq);
+            }
+        }
+        return { included, excluded };
+    }
+
+    function renderFilterRow(seq) {
+        const name = seq.name || '';
+        const truncated = name.length > 50 ? name.slice(0, 50) + '…' : name;
+        const esc = s => escapeHtml(String(s));
+        let badges = '';
+        if (seq.blast_metrics_available) {
+            const fmtN = v => v != null ? v.toFixed(1) + '%' : '—';
+            badges = `
+                <span class="ml-2 px-1.5 py-0.5 rounded text-blue-700 dark:text-blue-300 bg-blue-50 dark:bg-blue-900/30">Q:${fmtN(seq.query_cover)}</span>
+                <span class="ml-1 px-1.5 py-0.5 rounded text-green-700 dark:text-green-300 bg-green-50 dark:bg-green-900/30">S:${fmtN(seq.subject_cover)}</span>
+                <span class="ml-1 px-1.5 py-0.5 rounded text-purple-700 dark:text-purple-300 bg-purple-50 dark:bg-purple-900/30">I:${fmtN(seq.identity)}</span>
+            `;
+        } else {
+            badges = `<span class="ml-2 text-gray-400 dark:text-gray-500 italic">no metrics</span>`;
+        }
+        return `<li class="flex items-center flex-wrap gap-1 px-3 py-2">
+            <span class="font-mono text-gray-800 dark:text-gray-200" title="${esc(name)}">${esc(truncated)}</span>
+            ${badges}
+        </li>`;
+    }
+
+    function updateFilterPreview() {
+        const { included, excluded } = computeFilterPreview();
+        document.getElementById('filter-included-count').textContent = included.length;
+        document.getElementById('filter-excluded-count').textContent = excluded.length;
+
+        const MAX_PREVIEW = 50;
+        const buildList = (items, listEl) => {
+            const shown = items.slice(0, MAX_PREVIEW);
+            let html = shown.map(renderFilterRow).join('');
+            if (items.length > MAX_PREVIEW) {
+                html += `<li class="px-3 py-2 text-gray-400 dark:text-gray-500 italic">+${items.length - MAX_PREVIEW} more not shown</li>`;
+            }
+            listEl.innerHTML = html || '<li class="px-3 py-2 text-gray-400 dark:text-gray-500 italic">None</li>';
+        };
+        buildList(included, document.getElementById('filter-included-list'));
+        buildList(excluded, document.getElementById('filter-excluded-list'));
+    }
+
+    function updateSliderDisplays() {
+        document.getElementById('filter-slider-qcov').value = filterSliders.queryCover;
+        document.getElementById('filter-slider-scov').value = filterSliders.subjectCover;
+        document.getElementById('filter-slider-ident').value = filterSliders.identity;
+        document.getElementById('filter-qcov-val').textContent = filterSliders.queryCover;
+        document.getElementById('filter-scov-val').textContent = filterSliders.subjectCover;
+        document.getElementById('filter-ident-val').textContent = filterSliders.identity;
+    }
+
+    function setFilterPreset(name) {
+        const preset = FILTER_PRESETS[name];
+        if (!preset) return;
+        filterSliders = { ...preset };
+        updateSliderDisplays();
+        updateFilterPreview();
+    }
+
+    function resetFilterSliders() {
+        filterSliders = { ...FILTER_DEFAULTS };
+        updateSliderDisplays();
+        updateFilterPreview();
+    }
+
+    function openFilterModal() {
+        if (!hasFilterableSequences()) {
+            showStatus('No MycoMap sequences with BLAST metrics in the queue. Import from MycoMap first.', 'warning');
+            return;
+        }
+        resetFilterSliders();
+        document.getElementById('filter-modal').classList.remove('hidden');
+
+        // Escape key handler
+        _filterKeydownHandler = function(e) {
+            if (e.key === 'Escape') closeFilterModal();
+        };
+        document.addEventListener('keydown', _filterKeydownHandler);
+
+        updateFilterPreview();
+    }
+
+    function closeFilterModal() {
+        document.getElementById('filter-modal').classList.add('hidden');
+        if (_filterKeydownHandler) {
+            document.removeEventListener('keydown', _filterKeydownHandler);
+            _filterKeydownHandler = null;
+        }
+    }
+
+    // Slider event listeners
+    document.getElementById('filter-slider-qcov').addEventListener('input', function() {
+        filterSliders.queryCover = parseInt(this.value, 10);
+        document.getElementById('filter-qcov-val').textContent = filterSliders.queryCover;
+        updateFilterPreview();
+    });
+    document.getElementById('filter-slider-scov').addEventListener('input', function() {
+        filterSliders.subjectCover = parseInt(this.value, 10);
+        document.getElementById('filter-scov-val').textContent = filterSliders.subjectCover;
+        updateFilterPreview();
+    });
+    document.getElementById('filter-slider-ident').addEventListener('input', function() {
+        filterSliders.identity = parseInt(this.value, 10);
+        document.getElementById('filter-ident-val').textContent = filterSliders.identity;
+        updateFilterPreview();
+    });
+
+    // Apply button
+    document.getElementById('filter-modal-apply').addEventListener('click', function() {
+        const { included, excluded } = computeFilterPreview();
+        sequenceQueue = included;
+        closeFilterModal();
+        updateQueueDisplay();
+        if (excluded.length === 0) {
+            showStatus('No sequences excluded — all sequences pass the filter.', 'success');
+        } else {
+            showStatus(`Removed ${excluded.length} filtered sequence(s) from queue.`, 'success');
+        }
+    });
+
+    // Cancel / backdrop / close-X
+    document.getElementById('filter-modal-cancel').addEventListener('click', closeFilterModal);
+    document.getElementById('filter-modal-close-x').addEventListener('click', closeFilterModal);
+    document.getElementById('filter-modal-backdrop').addEventListener('click', closeFilterModal);
+
+    // Open button
+    document.getElementById('btn-filter-results').addEventListener('click', openFilterModal);
 </script>
 {% endblock %}

@@ -5,6 +5,7 @@ Fetches BLAST result sequences from Mycomap URLs for use in the tree builder.
 Based on standalone script by Alan Rockefeller - June 30, 2025.
 """
 
+import html.parser
 import logging
 import re
 import urllib.request
@@ -181,5 +182,164 @@ def fetch_mycomap_fasta(
     
     # Combine FASTA content
     result['fasta_content'] = '\n'.join(fasta_parts)
-    
+
     return result
+
+
+# =============================================================================
+# BLAST Metrics Fetcher
+# =============================================================================
+
+class _BlastTableParser(html.parser.HTMLParser):
+    """Stdlib HTML table extractor. Collects all tables as lists of rows of cell strings."""
+
+    def __init__(self):
+        super().__init__()
+        self.tables = []       # list of tables
+        self._cur_table = None  # list of rows while inside <table>
+        self._cur_row = None    # list of cells while inside <tr>
+        self._cur_cell = None   # str accumulator while inside <td>/<th>
+        self._depth = 0         # table nesting depth
+
+    def handle_starttag(self, tag, attrs):
+        if tag == 'table':
+            self._depth += 1
+            if self._depth == 1:
+                self._cur_table = []
+        elif tag == 'tr' and self._cur_table is not None:
+            self._cur_row = []
+        elif tag in ('td', 'th') and self._cur_row is not None:
+            self._cur_cell = []
+
+    def handle_endtag(self, tag):
+        if tag == 'table':
+            if self._depth == 1 and self._cur_table is not None:
+                self.tables.append(self._cur_table)
+                self._cur_table = None
+            self._depth = max(0, self._depth - 1)
+        elif tag == 'tr' and self._cur_table is not None and self._cur_row is not None:
+            self._cur_table.append(self._cur_row)
+            self._cur_row = None
+        elif tag in ('td', 'th') and self._cur_row is not None and self._cur_cell is not None:
+            self._cur_row.append(' '.join(''.join(self._cur_cell).split()))
+            self._cur_cell = None
+
+    def handle_data(self, data):
+        if self._cur_cell is not None:
+            self._cur_cell.append(data)
+
+
+def _parse_blast_metrics_table(rows: list) -> dict:
+    """
+    Given raw table rows, find the header row and parse per-accession metrics.
+
+    Returns dict[bare_accession -> {identity, query_cover, subject_cover}].
+    Returns {} if no usable header found or identity column missing.
+    """
+    if not rows:
+        return {}
+
+    header_idx = None
+    header = []
+    for i, row in enumerate(rows[:5]):
+        lower = [c.lower() for c in row]
+        if any('identity' in c or 'ident' in c or 'coverage' in c or 'cover' in c for c in lower):
+            header_idx = i
+            header = lower
+            break
+
+    if header_idx is None or not header:
+        return {}
+
+    # Detect column indices
+    def find_col(*keywords):
+        for j, h in enumerate(header):
+            if any(kw in h for kw in keywords):
+                return j
+        return None
+
+    acc_col = find_col('accession', 'subject id', 'subject', 'id')
+    if acc_col is None:
+        acc_col = 0
+    ident_col = find_col('identity', 'ident')
+    qcov_col = find_col('query cov', 'query cover', 'q. cov', 'qcov')
+    scov_col = find_col('subject cov', 'subj cov', 's. cov', 'scov')
+
+    if ident_col is None:
+        return {}
+
+    def _to_float(val):
+        if val is None:
+            return None
+        try:
+            return float(val.strip().rstrip('%').strip())
+        except (ValueError, AttributeError):
+            return None
+
+    result = {}
+    for row in rows[header_idx + 1:]:
+        if len(row) <= max(acc_col, ident_col):
+            continue
+        raw_acc = row[acc_col].split()[0] if row[acc_col] else ''
+        if not raw_acc:
+            continue
+        bare_acc = raw_acc.split('.')[0]
+        identity = _to_float(row[ident_col] if len(row) > ident_col else None)
+        query_cover = _to_float(row[qcov_col] if qcov_col is not None and len(row) > qcov_col else None)
+        subject_cover = _to_float(row[scov_col] if scov_col is not None and len(row) > scov_col else None)
+        result[bare_acc] = {
+            'identity': identity,
+            'query_cover': query_cover,
+            'subject_cover': subject_cover,
+        }
+        # Also store with version suffix as a fallback key
+        if raw_acc != bare_acc:
+            result.setdefault(raw_acc, result[bare_acc])
+
+    return result
+
+
+def fetch_mycomap_blast_metrics(blast_id: str) -> dict:
+    """
+    Fetch BLAST metrics from the MycoMap user-facing BLAST results page.
+
+    Args:
+        blast_id: Digits-only blast ID string.
+
+    Returns:
+        dict[bare_accession -> {identity, query_cover, subject_cover}]
+        Returns {} on any error (non-fatal).
+    """
+    if not blast_id.isdigit():
+        logger.warning(f"fetch_mycomap_blast_metrics: invalid blast_id '{blast_id}'")
+        return {}
+
+    url = f"https://mycomap.com/genetics/blast-search/r{blast_id}"
+
+    opener = urllib.request.build_opener()
+    opener.addheaders = [
+        ('User-Agent', 'Dikarya-TreeBuilder/1.0'),
+        ('Accept', 'text/html,*/*')
+    ]
+
+    try:
+        with opener.open(url, timeout=REQUEST_TIMEOUT) as resp:
+            content = resp.read().decode('utf-8', errors='replace')
+    except Exception as e:
+        logger.warning(f"fetch_mycomap_blast_metrics: could not fetch page: {e}")
+        return {}
+
+    try:
+        parser = _BlastTableParser()
+        parser.feed(content)
+        combined = {}
+        for table_rows in parser.tables:
+            metrics = _parse_blast_metrics_table(table_rows)
+            # Later tables don't overwrite earlier ones (prefer first match)
+            for acc, m in metrics.items():
+                combined.setdefault(acc, m)
+        logger.info(f"fetch_mycomap_blast_metrics: parsed {len(combined)} accession(s) from {len(parser.tables)} table(s)")
+        return combined
+    except Exception as e:
+        logger.warning(f"fetch_mycomap_blast_metrics: parse error: {e}", exc_info=True)
+        return {}

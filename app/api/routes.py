@@ -221,10 +221,21 @@ def fetch_mycomap():
         
         # Parse FASTA into sequences
         sequences = _parse_fasta_sequences(result['fasta_content'])
-        
+
+        # Tag hit_source based on position (NCBI sequences come first in combined FASTA)
+        ncbi_count = result['ncbi_count']
+        for i, seq in enumerate(sequences):
+            seq['source'] = 'mycomap'
+            if include_ncbi and include_local:
+                seq['hit_source'] = 'ncbi' if i < ncbi_count else 'local'
+            elif include_ncbi:
+                seq['hit_source'] = 'ncbi'
+            else:
+                seq['hit_source'] = 'local'
+
         # Identify NCBI accessions that are missing meaningful descriptions
         # (MyCoMap often returns NCBI records as just '>ACCESSION' without metadata)
-        from app.services.blast_service import _is_genbank_accession, fetch_fasta_for_accessions
+        from app.services.blast_service import fetch_fasta_for_accessions
         
         accessions_to_enrich = []
         for seq in sequences:
@@ -256,7 +267,7 @@ def fetch_mycomap():
             seq['sequence'] = clean_dna_sequence(seq['sequence'])
         sequences = [s for s in sequences if s['sequence']]
         dropped_count = original_count - len(sequences)
-        
+
         # Build success message
         parts = []
         if include_ncbi:
