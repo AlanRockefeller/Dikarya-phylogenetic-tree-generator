@@ -5,12 +5,16 @@ try:
 except ImportError:
     pass
 
-from flask import Flask
+from flask import Flask, send_from_directory
 from app.config import config
 
 def create_app(config_name='default'):
     app = Flask(__name__)
     app.config.from_object(config[config_name])
+
+    @app.route('/favicon.ico/<path:filename>')
+    def favicon_asset(filename):
+        return send_from_directory(app.static_folder + '/favicon.ico', filename)
 
     # Configure Logging for Gunicorn
     import logging

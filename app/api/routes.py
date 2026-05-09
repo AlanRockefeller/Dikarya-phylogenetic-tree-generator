@@ -295,7 +295,7 @@ def fetch_genbank_accessions():
             if too_long:
                 return jsonify({
                     "status": "error",
-                    "error": f"No sequences were added. GenBank sequences must be {MAX_CUSTOM_GENBANK_SEQUENCE_BP:,} bp or shorter.",
+                    "error": "No sequences were added because all fetched GenBank records exceeded the size limit.",
                     "skipped": skipped,
                     "max_sequence_bp": MAX_CUSTOM_GENBANK_SEQUENCE_BP
                 }), 400
@@ -351,7 +351,12 @@ def fetch_mycomap():
         }), 400
     
     try:
-        from app.services.mycomap_service import validate_mycomap_url, fetch_mycomap_fasta
+        from app.services.mycomap_service import (
+            build_blast_metric_keys,
+            fetch_mycomap_blast_metrics,
+            fetch_mycomap_fasta,
+            validate_mycomap_url,
+        )
         from app.services.fasta_utils import clean_dna_sequence
         
         # Validate and extract blast_id
@@ -376,6 +381,8 @@ def fetch_mycomap():
         
         # Parse FASTA into sequences
         sequences = _parse_fasta_sequences(result['fasta_content'])
+        for seq in sequences:
+            seq['_mycomap_original_name'] = seq.get('name', '')
 
         # Tag hit_source based on position (NCBI sequences come first in combined FASTA)
         ncbi_count = result['ncbi_count']
@@ -423,6 +430,37 @@ def fetch_mycomap():
         sequences = [s for s in sequences if s['sequence']]
         dropped_count = original_count - len(sequences)
 
+        metrics_by_key = fetch_mycomap_blast_metrics(blast_id, source_url=url)
+        metrics_attached_count = 0
+        for seq in sequences:
+            metric = None
+            lookup_names = [seq.get('name', ''), seq.get('_mycomap_original_name', '')]
+            for lookup_name in lookup_names:
+                for key in build_blast_metric_keys(lookup_name):
+                    metric = metrics_by_key.get(key)
+                    if metric:
+                        break
+                if metric:
+                    break
+
+            if metric:
+                seq['identity'] = metric.get('identity')
+                seq['query_cover'] = metric.get('query_cover')
+                seq['subject_cover'] = metric.get('subject_cover')
+                seq['blast_metrics_available'] = any(
+                    seq[field] is not None
+                    for field in ('identity', 'query_cover', 'subject_cover')
+                )
+                if seq['blast_metrics_available']:
+                    metrics_attached_count += 1
+            else:
+                seq['identity'] = None
+                seq['query_cover'] = None
+                seq['subject_cover'] = None
+                seq['blast_metrics_available'] = False
+
+            seq.pop('_mycomap_original_name', None)
+
         # Build success message
         parts = []
         if include_ncbi:
@@ -444,6 +482,7 @@ def fetch_mycomap():
             "sequences": sequences,
             "ncbi_count": result['ncbi_count'],
             "local_count": result['local_count'],
+            "blast_metrics_count": metrics_attached_count,
             "message": msg
         })
         
@@ -1508,10 +1547,9 @@ def add_sequences_to_job(job_id):
         return jsonify({"status": "error", "error": f"Input too large (max {MAX_INPUT_CHARS} chars)"}), 400
         
     try:
-        from app.services.blast_service import fetch_fasta_for_accessions
-        
         sequences_to_add = []
         is_accession_input = False
+        skipped = []
         
         # Heuristic: Check if input looks like a list of accessions (no > at start, short lines)
         first_line = input_text.splitlines()[0].strip()
@@ -1519,19 +1557,23 @@ def add_sequences_to_job(job_id):
             # Assume accessions
             is_accession_input = True
             
-            # Split by commas, spaces, newlines
-            tokens = re.split(r'[,\s]+', input_text)
-            accessions = [t.strip() for t in tokens if t.strip()]
+            accessions, invalid = _parse_genbank_accession_tokens(input_text)
+            if invalid:
+                return jsonify({
+                    "status": "error",
+                    "error": f"Invalid GenBank accession(s): {', '.join(invalid[:10])}"
+                }), 400
             
             # Security: Limit number of accessions to prevent abuse
-            MAX_ACCESSIONS = 200
-            if len(accessions) > MAX_ACCESSIONS:
-                 return jsonify({"status": "error", "error": f"Too many accessions (max {MAX_ACCESSIONS})"}), 400
+            if len(accessions) > MAX_CUSTOM_GENBANK_ACCESSIONS:
+                 return jsonify({"status": "error", "error": f"Too many accessions (max {MAX_CUSTOM_GENBANK_ACCESSIONS})"}), 400
             
             if accessions:
                 logger.info(f"Adding sequences from accessions: {accessions}")
-                fasta_content = fetch_fasta_for_accessions(accessions)
-                sequences_to_add = _parse_fasta_sequences(fasta_content)
+                sequences_to_add, skipped = _fetch_genbank_sequences_for_queue(
+                    accessions,
+                    max_sequence_bp=MAX_CUSTOM_GENBANK_SEQUENCE_BP
+                )
         else:
             # Assume FASTA
             sequences_to_add = _parse_fasta_sequences(input_text)
@@ -1540,6 +1582,12 @@ def add_sequences_to_job(job_id):
         sequences_to_add = [s for s in sequences_to_add if s.get('sequence', '').strip()]
         
         if not sequences_to_add:
+            if is_accession_input and any(item.get("reason") == "too_long" for item in skipped):
+                return jsonify({
+                    "status": "error",
+                    "error": "No sequences were added because all fetched GenBank records exceeded the size limit.",
+                    "skipped": skipped
+                }), 400
             return jsonify({"status": "error", "error": "No valid sequences found in input"}), 400
 
         # 2. Sequence Count Limit
@@ -1603,10 +1651,15 @@ def add_sequences_to_job(job_id):
                 f.write(f">{new_header}\n{seq['sequence']}\n")
                 added_count += 1
                     
+        message = f"Added {added_count} sequences."
+        if skipped:
+            message += f" {len(skipped)} accession{'s' if len(skipped) != 1 else ''} skipped."
+
         return jsonify({
             "status": "success", 
             "count": added_count,
-            "message": f"Added {added_count} sequences."
+            "skipped": skipped,
+            "message": message
         })
         
     except Exception as e:

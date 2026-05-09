@@ -5,6 +5,7 @@ Fetches BLAST result sequences from Mycomap URLs for use in the tree builder.
 Based on standalone script by Alan Rockefeller - June 30, 2025.
 """
 
+import html
 import html.parser
 import logging
 import re
@@ -202,6 +203,7 @@ class _BlastTableParser(html.parser.HTMLParser):
         self._depth = 0         # table nesting depth
 
     def handle_starttag(self, tag, attrs):
+        tag = tag.lower()
         if tag == 'table':
             self._depth += 1
             if self._depth == 1:
@@ -212,6 +214,7 @@ class _BlastTableParser(html.parser.HTMLParser):
             self._cur_cell = []
 
     def handle_endtag(self, tag):
+        tag = tag.lower()
         if tag == 'table':
             if self._depth == 1 and self._cur_table is not None:
                 self.tables.append(self._cur_table)
@@ -241,9 +244,13 @@ def _parse_blast_metrics_table(rows: list) -> dict:
 
     header_idx = None
     header = []
-    for i, row in enumerate(rows[:5]):
-        lower = [c.lower() for c in row]
-        if any('identity' in c or 'ident' in c or 'coverage' in c or 'cover' in c for c in lower):
+    for i, row in enumerate(rows[:10]):
+        lower = [_normalize_header_cell(c) for c in row]
+        has_identity = any('identity' in c or c in ('ident', 'identities') for c in lower)
+        has_coverage = any(('query' in c and 'cover' in c) or ('subject' in c and 'cover' in c)
+                           or ('q' in c and 'cov' in c) or ('s' in c and 'cov' in c)
+                           or c in ('qcov', 'qcovs', 'scov', 'scovs') for c in lower)
+        if has_identity and has_coverage:
             header_idx = i
             header = lower
             break
@@ -251,19 +258,27 @@ def _parse_blast_metrics_table(rows: list) -> dict:
     if header_idx is None or not header:
         return {}
 
-    # Detect column indices
-    def find_col(*keywords):
-        for j, h in enumerate(header):
-            if any(kw in h for kw in keywords):
-                return j
+    def find_col(*keyword_groups):
+        for group in keyword_groups:
+            if isinstance(group, str):
+                group = (group,)
+            for j, h in enumerate(header):
+                if all(kw in h for kw in group):
+                    return j
         return None
 
-    acc_col = find_col('accession', 'subject id', 'subject', 'id')
+    acc_col = find_col(
+        'accession',
+        ('subject', 'id'),
+        ('subject', 'acc'),
+        ('hit', 'id'),
+        ('sequence', 'id'),
+    )
     if acc_col is None:
         acc_col = 0
     ident_col = find_col('identity', 'ident')
-    qcov_col = find_col('query cov', 'query cover', 'q. cov', 'qcov')
-    scov_col = find_col('subject cov', 'subj cov', 's. cov', 'scov')
+    qcov_col = find_col(('query', 'cover'), ('q', 'cov'), 'qcov')
+    scov_col = find_col(('subject', 'cover'), ('subj', 'cover'), ('s', 'cov'), 'scov')
 
     if ident_col is None:
         return {}
@@ -271,35 +286,90 @@ def _parse_blast_metrics_table(rows: list) -> dict:
     def _to_float(val):
         if val is None:
             return None
-        try:
-            return float(val.strip().rstrip('%').strip())
-        except (ValueError, AttributeError):
+        match = re.search(r'-?\d+(?:\.\d+)?', str(val))
+        if not match:
             return None
+        return float(match.group(0))
 
     result = {}
     for row in rows[header_idx + 1:]:
         if len(row) <= max(acc_col, ident_col):
             continue
-        raw_acc = row[acc_col].split()[0] if row[acc_col] else ''
-        if not raw_acc:
+        raw_hit = row[acc_col] if row[acc_col] else ''
+        metric_keys = build_blast_metric_keys(raw_hit)
+        if not metric_keys:
             continue
-        bare_acc = raw_acc.split('.')[0]
         identity = _to_float(row[ident_col] if len(row) > ident_col else None)
         query_cover = _to_float(row[qcov_col] if qcov_col is not None and len(row) > qcov_col else None)
         subject_cover = _to_float(row[scov_col] if scov_col is not None and len(row) > scov_col else None)
-        result[bare_acc] = {
+        metric = {
             'identity': identity,
             'query_cover': query_cover,
             'subject_cover': subject_cover,
         }
-        # Also store with version suffix as a fallback key
-        if raw_acc != bare_acc:
-            result.setdefault(raw_acc, result[bare_acc])
+        for key in metric_keys:
+            result.setdefault(key, metric)
 
     return result
 
 
-def fetch_mycomap_blast_metrics(blast_id: str) -> dict:
+def _normalize_header_cell(value: str) -> str:
+    """Normalize a table header cell for flexible BLAST column matching."""
+    value = html.unescape(str(value or '')).lower()
+    value = re.sub(r'[%_.-]+', ' ', value)
+    return ' '.join(value.split())
+
+
+def build_blast_metric_keys(label: str) -> list:
+    """Return stable lookup keys for a BLAST table hit label or FASTA header."""
+    text = html.unescape(str(label or '')).strip()
+    if not text:
+        return []
+
+    text = text.lstrip('>').strip()
+    first_token = text.split()[0] if text.split() else text
+    candidates = [text, first_token]
+
+    # Many BLAST identifiers use pipe-delimited prefixes such as gb|ACCESSION.1|.
+    for part in re.split(r'[|;,]', first_token):
+        part = part.strip()
+        if part and part.lower() not in {'gb', 'emb', 'dbj', 'ref', 'gi', 'lcl'}:
+            candidates.append(part)
+
+    # Capture accession-like tokens anywhere in the label without indexing every
+    # species-name word, which would create noisy matches.
+    candidates.extend(re.findall(r'\b[A-Z]{1,6}_?\d{3,12}(?:\.\d+)?\b', text, flags=re.IGNORECASE))
+
+    keys = []
+    seen = set()
+    for candidate in candidates:
+        cleaned = candidate.strip().strip('>,;()[]{}')
+        if not cleaned:
+            continue
+        variants = [cleaned]
+        if '.' in cleaned:
+            variants.append(cleaned.split('.')[0])
+        for variant in variants:
+            if variant and variant not in seen:
+                keys.append(variant)
+                seen.add(variant)
+
+    return keys
+
+
+def _metrics_page_urls(blast_id: str, source_url: Optional[str] = None) -> list:
+    urls = []
+    if source_url:
+        source_blast_id = validate_mycomap_url(source_url)
+        if source_blast_id == blast_id:
+            urls.append(source_url)
+        else:
+            logger.warning("fetch_mycomap_blast_metrics: ignored source_url with mismatched or invalid blast_id")
+    urls.append(f"https://mycomap.com/genetics/blast-search/r{blast_id}/")
+    return list(dict.fromkeys(urls))
+
+
+def fetch_mycomap_blast_metrics(blast_id: str, source_url: Optional[str] = None) -> dict:
     """
     Fetch BLAST metrics from the MycoMap user-facing BLAST results page.
 
@@ -314,19 +384,22 @@ def fetch_mycomap_blast_metrics(blast_id: str) -> dict:
         logger.warning(f"fetch_mycomap_blast_metrics: invalid blast_id '{blast_id}'")
         return {}
 
-    url = f"https://mycomap.com/genetics/blast-search/r{blast_id}"
-
     opener = urllib.request.build_opener()
     opener.addheaders = [
         ('User-Agent', 'Dikarya-TreeBuilder/1.0'),
         ('Accept', 'text/html,*/*')
     ]
 
-    try:
-        with opener.open(url, timeout=REQUEST_TIMEOUT) as resp:
-            content = resp.read().decode('utf-8', errors='replace')
-    except Exception as e:
-        logger.warning(f"fetch_mycomap_blast_metrics: could not fetch page: {e}")
+    content = ''
+    for url in _metrics_page_urls(blast_id, source_url):
+        try:
+            with opener.open(url, timeout=REQUEST_TIMEOUT) as resp:
+                content = resp.read().decode('utf-8', errors='replace')
+            break
+        except Exception as e:
+            logger.warning(f"fetch_mycomap_blast_metrics: could not fetch page {url}: {e}")
+
+    if not content:
         return {}
 
     try:

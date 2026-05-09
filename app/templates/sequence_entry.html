@@ -279,7 +279,7 @@
                         class="flex-1 min-w-[140px] bg-journal-dark hover:bg-journal-green text-white 
                                    py-3 px-4 rounded-lg font-semibold shadow-md hover:shadow-lg 
                                    transition-all flex items-center justify-center disabled:opacity-50 disabled:cursor-not-allowed" disabled>
-                        <i class="fas fa-plus mr-2"></i> Add Sequences
+                        <i class="fas fa-plus mr-2"></i> Add / Remove Sequences
                     </button>
                     <!-- BLAST button removed from here -->
                 </div>
@@ -312,7 +312,7 @@
                     </div>
                     <p class="text-gray-500 dark:text-gray-400 text-sm font-medium">No sequences added yet.</p>
                     <p class="text-gray-400 dark:text-gray-500 text-xs mt-1">
-                        Paste FASTA sequences and click "Add Sequences"
+                        Paste FASTA sequences and click "Add / Remove Sequences"
                     </p>
                 </div>
                 <ul id="sequence_queue_list" class="divide-y divide-gray-100 dark:divide-journal-dark hidden">
@@ -322,18 +322,22 @@
 
             <!-- Queue Footer -->
             <div class="p-4 border-t border-gray-200 dark:border-journal-dark flex justify-between items-center">
-                <div class="flex items-center gap-3">
-                    <button id="clear_queue_btn" class="text-red-500 hover:text-red-700 dark:text-red-400 dark:hover:text-red-300
-                                   text-sm font-medium transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
-                        disabled>
-                        <i class="fas fa-trash-alt mr-1"></i> Clear All
-                    </button>
-                    <button id="btn-filter-results"
-                        class="text-journal-gold hover:text-journal-gold-light dark:text-journal-gold
-                               text-sm font-medium transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
-                        disabled title="Open filter panel (requires MycoMap sequences with metrics)">
-                        <i class="fas fa-filter mr-1"></i> Filter Results
-                    </button>
+                <div class="flex flex-col gap-1">
+                    <div class="flex items-center gap-3">
+                        <button id="clear_queue_btn" class="text-red-500 hover:text-red-700 dark:text-red-400 dark:hover:text-red-300
+                                       text-sm font-medium transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+                            disabled>
+                            <i class="fas fa-trash-alt mr-1"></i> Clear All
+                        </button>
+                        <button id="btn-filter-results"
+                            class="text-sm font-medium transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
+                            disabled title="Open filter panel (requires MycoMap sequences with metrics)">
+                            <i class="fas fa-filter mr-1"></i> Filter Results
+                        </button>
+                    </div>
+                    <p id="filter-hint" class="text-xs text-gray-500 dark:text-gray-400">
+                        Import MycoMap results to enable filtering by query coverage, subject coverage, and identity.
+                    </p>
                 </div>
                 <span class="text-xs text-gray-500 dark:text-gray-400">Click × to remove</span>
             </div>
@@ -753,6 +757,9 @@
         const emptyEl = document.getElementById('sequence_queue_empty');
         const countEl = document.getElementById('sequence_count');
         const clearBtn = document.getElementById('clear_queue_btn');
+        const filterHintEl = document.getElementById('filter-hint');
+        const filterBtn = document.getElementById('btn-filter-results');
+        const metricCount = sequenceQueue.filter(s => s.blast_metrics_available === true).length;
 
         countEl.textContent = `${sequenceQueue.length} sequence${sequenceQueue.length !== 1 ? 's' : ''}`;
 
@@ -788,9 +795,22 @@
             populateOutgroupDropdown();
         }
 
-        // Enable/disable the filter button based on whether any sequences have metrics
-        const filterBtn = document.getElementById('btn-filter-results');
-        if (filterBtn) filterBtn.disabled = !hasFilterableSequences();
+        // Alan 5/8/26 - Make the MycoMap filter discoverable by surfacing when it can be used.
+        // Update the footer hint and button state so users can see how many metric-bearing hits are in the queue.
+        const filterEnabled = hasFilterableSequences();
+        if (filterBtn) {
+            filterBtn.disabled = !filterEnabled;
+            updateFilterButtonVisuals(filterBtn, filterEnabled);
+        }
+        if (filterHintEl) {
+            if (metricCount > 0) {
+                filterHintEl.textContent = `${metricCount} sequence${metricCount !== 1 ? 's' : ''} in the queue have BLAST metrics. Use Filter Results to exclude low-confidence hits.`;
+            } else if (sequenceQueue.length > 0) {
+                filterHintEl.textContent = 'Import MycoMap results to enable filtering by query coverage, subject coverage, and identity.';
+            } else {
+                filterHintEl.textContent = 'Import MycoMap results to enable filtering by query coverage, subject coverage, and identity.';
+            }
+        }
     }
 
     function updateButtonVisuals(btn, isValid) {
@@ -804,6 +824,18 @@
         }
     }
 
+    // Alan 5/8/26 - Make the filter button visibly active only when the queue contains MycoMap metrics.
+    function updateFilterButtonVisuals(btn, enabled) {
+        if (!btn) return;
+        if (enabled) {
+            btn.classList.remove('text-gray-400', 'dark:text-gray-500', 'disabled:opacity-40');
+            btn.classList.add('bg-journal-gold', 'hover:bg-journal-gold-light', 'text-journal-dark', 'px-3', 'py-2', 'rounded-lg', 'shadow-sm');
+        } else {
+            btn.classList.add('text-gray-400', 'dark:text-gray-500', 'disabled:opacity-40');
+            btn.classList.remove('bg-journal-gold', 'hover:bg-journal-gold-light', 'text-journal-dark', 'px-3', 'py-2', 'rounded-lg', 'shadow-sm');
+        }
+    }
+
     function escapeHtml(text) {
         if (!text) return '';
         const div = document.createElement('div');
@@ -811,16 +843,24 @@
         return div.innerHTML;
     }
 
+    // Alan 5/8/26 - Treat queue entries as duplicates only when both the name and sequence match.
+    // This lets users re-run add/remove workflows without creating repeated copies of the same record.
+    function sequenceDedupKey(seq) {
+        return `${String(seq?.name || '')}\u0000${String(seq?.sequence || '')}`;
+    }
+
     function addSequences(sequences, removeDuplicates = true) {
-        const existingNames = new Set(sequenceQueue.map(s => String(s.name)));
+        const existingKeys = new Set(sequenceQueue.map(sequenceDedupKey));
         let added = 0;
         for (const seq of sequences) {
             // Normalize inputs
             seq.name = String(seq.name);
+            seq.sequence = String(seq.sequence || '');
+            const dedupKey = sequenceDedupKey(seq);
 
-            if (!removeDuplicates || !existingNames.has(seq.name)) {
+            if (!removeDuplicates || !existingKeys.has(dedupKey)) {
                 sequenceQueue.push(seq);
-                existingNames.add(seq.name);
+                existingKeys.add(dedupKey);
                 added++;
             }
         }
@@ -1072,7 +1112,8 @@
             showStatus('GenBank lookup error: ' + e.message, 'error');
         }
 
-        addSequencesBtn.innerHTML = '<i class="fas fa-plus mr-2"></i> Add Sequences';
+        // Alan 5/8/26 - Keep the add button wording aligned with the queue workflow it now supports.
+        addSequencesBtn.innerHTML = '<i class="fas fa-plus mr-2"></i> Add / Remove Sequences';
         updateAddSequencesButtonState();
     });
 
@@ -1222,6 +1263,10 @@
             let statusMsg = `${data.message}. Added ${added} new sequences to queue.`;
             if (skipped > 0 && removeDuplicates) {
                 statusMsg += ` (${skipped} duplicate${skipped !== 1 ? 's' : ''} already in queue)`;
+            }
+            // Alan 5/8/26 - Tell users when imported MycoMap hits carry metrics so they can use the filter right away.
+            if (data.blast_metrics_count > 0) {
+                statusMsg += ` ${data.blast_metrics_count} sequence${data.blast_metrics_count !== 1 ? 's' : ''} include BLAST metrics and can be filtered from the queue.`;
             }
             showStatus(statusMsg, 'success');
 
