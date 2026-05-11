@@ -94,6 +94,73 @@ def save_tree_state(job_dir: Path, tree_json: Dict) -> None:
     with open(state_path, "w") as f:
         json.dump(tree_json, f, indent=2)
 
+
+def _int_param(value, default: int) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def build_recompute_job_params(params_dict: Dict[str, Any]) -> JobParams:
+    """Build the dataclass params used by tree recomputation from stored job JSON."""
+    align_params = AlignmentParams(
+        method=params_dict.get("alignment_method", "default"),
+        advanced_options=params_dict.get("alignment_options", {}) or {}
+    )
+
+    trim_params = TrimmingParams(
+        method=params_dict.get("trimming_method", "none")
+    )
+
+    tree_params = TreeBuilderParams(
+        method=params_dict.get("tree_method", "nj"),
+        model=params_dict.get("tree_model", "GTR+G"),
+        bootstrap=_int_param(params_dict.get("bootstrap", 100), 100),
+        mcmc_generations=_int_param(params_dict.get("mcmc_generations", 50000), 50000),
+        mcmc_nruns=_int_param(params_dict.get("mcmc_nruns", 2), 2),
+        mcmc_nchains=_int_param(params_dict.get("mcmc_nchains", 4), 4),
+        run_preset=params_dict.get("run_preset", "fast_good"),
+        bootstrap_preset=params_dict.get("bootstrap_preset", "standard"),
+        bootstrap_cap=params_dict.get("bootstrap_cap"),
+        enable_bootstrap=params_dict.get("enable_bootstrap", True),
+        start_tree_override=params_dict.get("start_tree_override"),
+        moose_enabled=params_dict.get("moose_enabled", False),
+        early_stopping=params_dict.get("early_stopping", False),
+        seed=params_dict.get("seed"),
+        outgroup=params_dict.get("outgroup")
+    )
+
+    return JobParams(
+        input_type="recompute",
+        notes=params_dict.get("notes", ""),
+        sequence=params_dict.get("sequence", ""),
+        accessions=params_dict.get("accessions", []),
+        alignment_params=align_params,
+        trimming_params=trim_params,
+        tree_builder_params=tree_params,
+        allow_recompute=True
+    )
+
+
+def _selection_sets_without_names(tree_json: Dict, removed_names: Set[str]) -> None:
+    """Remove pruned node IDs from persisted selection sets in-place."""
+    if not removed_names:
+        return
+
+    selection_sets = tree_json.get("selection_sets")
+    if not isinstance(selection_sets, dict):
+        return
+
+    for set_name, member_ids in list(selection_sets.items()):
+        if not isinstance(member_ids, list):
+            continue
+        selection_sets[set_name] = [
+            member_id for member_id in member_ids
+            if member_id not in removed_names
+        ]
+
+
 def prune_taxa(job_dir: Path, tree_json: Dict, taxa_names: List[str]) -> Dict:
     """
     Remove one or more tips (or subtrees if internal nodes selected).
@@ -135,14 +202,23 @@ def prune_taxa(job_dir: Path, tree_json: Dict, taxa_names: List[str]) -> Dict:
              logger.warning(msg)
              # Raise error to inform user in UI instead of silent failure
              raise ValueError(msg)
+
+        pruned_names = {name for name in taxa_names if name}
+        for clade in to_prune:
+            if clade.name:
+                pruned_names.add(clade.name)
+            for terminal in clade.get_terminals():
+                if terminal.name:
+                    pruned_names.add(terminal.name)
         
         # Only update metadata AFTER confirming targets exist in tree
         if "pruned_taxa" not in tree_json:
             tree_json["pruned_taxa"] = []
         
-        for name in taxa_names:
+        for name in sorted(pruned_names):
             if name not in tree_json["pruned_taxa"]:
                 tree_json["pruned_taxa"].append(name)
+        _selection_sets_without_names(tree_json, pruned_names)
              
         # Map parents for manual removal
         parents = {c: p for p in tree.find_clades() for c in p.clades}
@@ -195,6 +271,7 @@ def prune_taxa(job_dir: Path, tree_json: Dict, taxa_names: List[str]) -> Dict:
         
         # Update JSON structure to match
         new_structure = _clade_to_json(tree.root)
+        tree_json["current_tree"] = "pruned"
         tree_json["tree_structure"] = new_structure
         
         renames = tree_json.get("renames", {})
@@ -476,12 +553,66 @@ def extract_pruned_fasta(original_fasta: Path, tree_json: Dict, output_fasta: Pa
     with open(output_fasta, "w") as f:
         SeqIO.write(sequences, f, "fasta")
 
-def recompute_tree(job_dir: Path, job_params: JobParams, config: Config, logger) -> Dict[str, Any]:
+def _count_fasta_records(path: Path) -> int:
+    try:
+        with open(path, "r") as f:
+            return sum(1 for line in f if line.startswith(">"))
+    except Exception:
+        return 0
+
+
+def recompute_tree(
+    job_dir: Path,
+    job_params: JobParams,
+    config: Config,
+    logger,
+    event_job_id: Optional[str] = None,
+    rq_job=None,
+    use_current_input: bool = False
+) -> Dict[str, Any]:
     """
     Re-run the alignment, trimming, and tree inference pipeline 
-    using only sequences present in the pruned tree.
+    using only sequences present in the pruned tree, or the current input FASTA
+    when use_current_input is true.
     """
     logger.info("Starting tree recomputation...")
+
+    if event_job_id:
+        from app.workers.events import (
+            STEP_INPUT, STEP_ORIENT, STEP_BLAST, STEP_ALIGN, STEP_TRIM, STEP_TREE, STEP_POST,
+            STATE_RUNNING, STATE_DONE, STATE_SKIPPED,
+            publish_step_start, publish_step_done, publish_overview, update_step_meta,
+        )
+
+        def start_step(step, label, detail="", tool=""):
+            if rq_job:
+                rq_job.meta["current_step"] = step
+                rq_job.meta["current_tool"] = tool or None
+                rq_job.save_meta()
+            publish_step_start(event_job_id, step, label, detail, tool=tool)
+            update_step_meta(rq_job, step, {"state": STATE_RUNNING, "label": label, "detail": detail, "tool": tool})
+
+        def finish_step(step, detail=""):
+            publish_step_done(event_job_id, step, detail)
+            update_step_meta(rq_job, step, {"state": STATE_DONE, "detail": detail})
+
+        def skip_step(step, label):
+            update_step_meta(rq_job, step, {"state": STATE_SKIPPED, "label": label})
+
+        def overview(message):
+            publish_overview(event_job_id, message)
+    else:
+        def start_step(step, label, detail="", tool=""):
+            return None
+
+        def finish_step(step, detail=""):
+            return None
+
+        def skip_step(step, label):
+            return None
+
+        def overview(message):
+            return None
     
     # 1. Load state
     tree_json = load_tree_state(job_dir)
@@ -490,8 +621,22 @@ def recompute_tree(job_dir: Path, job_params: JobParams, config: Config, logger)
     # We need the original input (unaligned)
     input_raw = job_dir / "input" / "input_raw.fasta"
     alignment_pruned_path = job_dir / "alignment" / "alignment_pruned.fasta" # Unaligned input for re-run
-    
-    extract_pruned_fasta(input_raw, tree_json, alignment_pruned_path)
+
+    start_step("input", "Sequence Queue", "Preparing queued sequences")
+    if use_current_input:
+        if tree_json.get("pruned_taxa"):
+            extract_pruned_fasta(input_raw, tree_json, alignment_pruned_path)
+            input_detail = f"{_count_fasta_records(alignment_pruned_path)} queued unpruned sequence(s)"
+        else:
+            shutil.copy(input_raw, alignment_pruned_path)
+            input_detail = f"{_count_fasta_records(alignment_pruned_path)} queued sequence(s)"
+    else:
+        extract_pruned_fasta(input_raw, tree_json, alignment_pruned_path)
+        input_detail = f"{_count_fasta_records(alignment_pruned_path)} selected sequence(s)"
+    finish_step("input", input_detail)
+    overview(f"Recompute input ready: {input_detail}")
+    skip_step("orient", "Orientation Check (skipped)")
+    skip_step("blast", "BLAST Search (skipped)")
     
     # 3. Re-align
     # We need alignment params. Assuming they are in job_params or we use defaults.
@@ -504,14 +649,31 @@ def recompute_tree(job_dir: Path, job_params: JobParams, config: Config, logger)
     alignment_pruned_aligned_path = job_dir / "alignment" / "alignment_pruned_aligned.fasta" # Result of alignment
     
     from app.services.alignment_service import run_alignment
-    run_alignment(alignment_pruned_path, alignment_pruned_aligned_path, align_params, config, logger)
+    align_method = (align_params.method or "default").lower()
+    align_label = f"Alignment ({align_method.upper()})" if align_method != "default" else "Alignment"
+    start_step("align", align_label, "", tool=align_method)
+    run_alignment(alignment_pruned_path, alignment_pruned_aligned_path, align_params, config, logger, job_id=event_job_id)
+    align_detail = f"{_count_fasta_records(alignment_pruned_aligned_path)} sequence(s) aligned"
+    finish_step("align", align_detail)
+    overview(align_detail)
     
     # 4. Re-trim
     trim_params = job_params.trimming_params or TrimmingParams(method="none")
     alignment_pruned_trimmed_path = job_dir / "alignment" / "alignment_pruned_trimmed.fasta"
     
     from app.services.trimming_service import run_trimming
-    run_trimming(alignment_pruned_aligned_path, alignment_pruned_trimmed_path, trim_params.method, config, logger)
+    trim_method = (trim_params.method or "none").lower()
+    if trim_method == "none":
+        run_trimming(alignment_pruned_aligned_path, alignment_pruned_trimmed_path, trim_method, config, logger, job_id=event_job_id)
+        skip_step("trim", "Trimming (skipped)")
+        overview("Trimming skipped (method: none)")
+    else:
+        trim_label = f"Trimming ({trim_method})"
+        start_step("trim", trim_label, "", tool=trim_method)
+        run_trimming(alignment_pruned_aligned_path, alignment_pruned_trimmed_path, trim_method, config, logger, job_id=event_job_id)
+        trim_detail = f"{_count_fasta_records(alignment_pruned_trimmed_path)} sequence(s) retained"
+        finish_step("trim", trim_detail)
+        overview(trim_detail)
     
     # 5. Re-build Tree
     tree_params = job_params.tree_builder_params or TreeBuilderParams(method="nj")
@@ -519,16 +681,22 @@ def recompute_tree(job_dir: Path, job_params: JobParams, config: Config, logger)
     tree_pruned_nexus = job_dir / "tree" / "tree_pruned.nexus"
     
     from app.services.tree_builder_service import run_tree_builder
+    tree_method = (tree_params.method or "nj").lower()
+    start_step("tree", f"Tree Building ({tree_method.upper()})", tree_params.model or "", tool=tree_method)
     metadata = run_tree_builder(
         alignment_pruned_trimmed_path,
         tree_pruned_newick,
         tree_pruned_nexus,
         tree_params,
         config,
-        logger
+        logger,
+        job_id=event_job_id
     )
+    finish_step("tree", "Tree generated")
+    overview(f"Tree rebuilt using {tree_method.upper()}")
     
     # 6. Update State
+    start_step("post", "Post-Processing", "Saving recomputed tree")
     tree_json["current_tree"] = "pruned"
     # We might want to update the tree structure in JSON too?
     # Yes, parse the new tree
@@ -539,6 +707,8 @@ def recompute_tree(job_dir: Path, job_params: JobParams, config: Config, logger)
     # Save metadata
     with open(job_dir / "tree" / "tree_pruned_metadata.json", "w") as f:
         json.dump(metadata, f, indent=2)
+    finish_step("post", "All files ready")
+    overview("Recompute complete")
         
     return {
         "status": "completed",

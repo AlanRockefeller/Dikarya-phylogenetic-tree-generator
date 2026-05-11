@@ -355,8 +355,12 @@ def validate_and_resolve_raxml_params(params: Dict[str, Any], data_type: str = '
         if any(ch.isspace() for ch in outgroup) or '"' in outgroup or "'" in outgroup:
              warnings.append("Outgroup contained whitespace or quotes; ignored.")
              outgroup = None
-        # Strict char check
-        elif not re.match(r"^[A-Za-z0-9_\.\-\|:@]+$", outgroup):
+        # Strict char check. Narrowed from a previous regex that allowed
+        # `|`, `:`, and `@` -- none of those appear in real FASTA tip IDs
+        # for our pipeline, and removing them reduces the surface for any
+        # taxa-name confusion attempts. Argv passing already prevents shell
+        # injection; this is hygiene.
+        elif not re.match(r"^[A-Za-z0-9_.\-]+$", outgroup):
              warnings.append(f"Outgroup '{outgroup}' contains invalid characters; ignored.")
              outgroup = None
 

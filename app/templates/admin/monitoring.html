@@ -1,106 +1,178 @@
-{% extends "base.html" %}
+{% extends "base_modern.html" %}
+
+{% block title %}Dikarya - System Monitoring{% endblock %}
+{% block subtitle %}System Monitoring{% endblock %}
 
 {% block content %}
-<div class="container mt-4">
-    <h1 class="mb-4">System Monitoring</h1>
+<div class="max-w-7xl mx-auto space-y-6">
 
-    <div class="row mb-4">
+    <!-- Header -->
+    <div class="flex items-center justify-between flex-wrap gap-3">
+        <h2 class="text-2xl font-bold text-journal-dark dark:text-gray-100 flex items-center">
+            <i class="fas fa-gauge-high text-journal-gold mr-3"></i>System Monitoring
+        </h2>
+        <button onclick="window.location.reload()"
+            class="bg-journal-gold hover:bg-journal-gold-light text-journal-dark px-4 py-2 rounded-lg text-sm font-semibold transition-colors flex items-center">
+            <i class="fas fa-arrows-rotate mr-2"></i>Refresh
+        </button>
+    </div>
+
+    <!-- Top row: three summary cards -->
+    <div class="grid grid-cols-1 md:grid-cols-3 gap-6">
+
         <!-- System Health -->
-        <div class="col-md-4">
-            <div class="card h-100">
-                <div class="card-header">System Health</div>
-                <div class="card-body">
-                    <h5 class="card-title">Status: <span class="badge {% if health.status == 'ok' %}bg-success{% else %}bg-danger{% endif %}">{{ health.status|upper }}</span></h5>
-                    <ul class="list-group list-group-flush">
-                        <li class="list-group-item">Database: {{ health.components.database }}</li>
-                        <li class="list-group-item">Filesystem: {{ health.components.filesystem }}</li>
-                    </ul>
-                    <p class="card-text mt-2"><small class="text-muted">Last check: {{ health.timestamp }}</small></p>
+        <div class="bg-white dark:bg-journal-green rounded-xl shadow-lg overflow-hidden transition-colors">
+            <div class="bg-journal-dark px-5 py-3 border-b border-journal-green">
+                <h3 class="text-white font-semibold flex items-center">
+                    <i class="fas fa-heart-pulse text-journal-gold mr-2"></i>System Health
+                </h3>
+            </div>
+            <div class="p-5 space-y-3">
+                <div class="flex items-center justify-between">
+                    <span class="text-sm text-gray-600 dark:text-gray-300">Status</span>
+                    {% if health.status == 'ok' %}
+                    <span class="px-3 py-1 rounded-full text-xs font-bold bg-green-100 text-green-800 dark:bg-green-900 dark:text-green-200">OK</span>
+                    {% else %}
+                    <span class="px-3 py-1 rounded-full text-xs font-bold bg-red-100 text-red-800 dark:bg-red-900 dark:text-red-200">{{ health.status|upper }}</span>
+                    {% endif %}
                 </div>
+                <div class="flex items-center justify-between border-t border-gray-100 dark:border-journal-dark pt-3">
+                    <span class="text-sm text-gray-600 dark:text-gray-300"><i class="fas fa-database mr-2 opacity-70"></i>Database</span>
+                    {% if health.components.database == 'ok' %}
+                    <span class="text-sm font-mono text-green-700 dark:text-green-300">ok</span>
+                    {% else %}
+                    <span class="text-sm font-mono text-red-700 dark:text-red-300">{{ health.components.database }}</span>
+                    {% endif %}
+                </div>
+                <div class="flex items-center justify-between border-t border-gray-100 dark:border-journal-dark pt-3">
+                    <span class="text-sm text-gray-600 dark:text-gray-300"><i class="fas fa-hard-drive mr-2 opacity-70"></i>Filesystem</span>
+                    {% if health.components.filesystem == 'ok' %}
+                    <span class="text-sm font-mono text-green-700 dark:text-green-300">ok</span>
+                    {% else %}
+                    <span class="text-sm font-mono text-red-700 dark:text-red-300">{{ health.components.filesystem }}</span>
+                    {% endif %}
+                </div>
+                <p class="text-xs text-gray-500 dark:text-gray-400 pt-2 italic">Last check: {{ health.timestamp }}</p>
             </div>
         </div>
 
-        <!-- System Metrics -->
-        <div class="col-md-4">
-            <div class="card h-100">
-                <div class="card-header">Resources</div>
-                <div class="card-body">
-                    <ul class="list-group list-group-flush">
-                        <li class="list-group-item d-flex justify-content-between align-items-center">
-                            CPU Usage
-                            <span class="badge bg-primary rounded-pill">{{ system.cpu_percent }}%</span>
-                        </li>
-                        <li class="list-group-item d-flex justify-content-between align-items-center">
-                            Memory Usage
-                            <span class="badge bg-primary rounded-pill">{{ system.memory_percent }}%</span>
-                        </li>
-                        <li class="list-group-item d-flex justify-content-between align-items-center">
-                            Disk Usage (Jobs)
-                            <span class="badge bg-primary rounded-pill">{{ system.disk_usage }}%</span>
-                        </li>
-                    </ul>
+        <!-- Resources -->
+        <div class="bg-white dark:bg-journal-green rounded-xl shadow-lg overflow-hidden transition-colors">
+            <div class="bg-journal-dark px-5 py-3 border-b border-journal-green">
+                <h3 class="text-white font-semibold flex items-center">
+                    <i class="fas fa-microchip text-journal-gold mr-2"></i>Resources
+                </h3>
+            </div>
+            <div class="p-5 space-y-4">
+                {% for label, icon, value in [
+                    ('CPU', 'fa-microchip', system.cpu_percent),
+                    ('Memory', 'fa-memory', system.memory_percent),
+                    ('Disk (JOB_DIR)', 'fa-hard-drive', system.disk_usage)
+                ] %}
+                <div>
+                    <div class="flex items-center justify-between text-sm mb-1">
+                        <span class="text-gray-600 dark:text-gray-300"><i class="fas {{ icon }} mr-2 opacity-70"></i>{{ label }}</span>
+                        <span class="font-mono text-journal-dark dark:text-gray-100">{{ value }}%</span>
+                    </div>
+                    <div class="w-full bg-gray-200 dark:bg-journal-dark rounded-full h-2">
+                        {% set bar_color = 'bg-green-500' if value < 60 else ('bg-yellow-500' if value < 85 else 'bg-red-500') %}
+                        <div class="{{ bar_color }} h-2 rounded-full transition-all" style="width: {{ value }}%"></div>
+                    </div>
                 </div>
+                {% endfor %}
             </div>
         </div>
 
-        <!-- Global Metrics -->
-        <div class="col-md-4">
-            <div class="card h-100">
-                <div class="card-header">Job Stats (Global)</div>
-                <div class="card-body">
-                    <ul class="list-group list-group-flush">
-                        <li class="list-group-item">Total Jobs: {{ metrics.total_jobs }}</li>
-                        <li class="list-group-item">Failed (24h): <span class="text-danger">{{ metrics.recent_failed_24h }}</span></li>
-                    </ul>
-                    <hr>
-                    <h6>By Status:</h6>
-                    <ul class="list-unstyled">
-                        {% for status, count in metrics.status_counts.items() %}
-                        <li>{{ status|title }}: {{ count }}</li>
-                        {% endfor %}
-                    </ul>
+        <!-- Job Stats -->
+        <div class="bg-white dark:bg-journal-green rounded-xl shadow-lg overflow-hidden transition-colors">
+            <div class="bg-journal-dark px-5 py-3 border-b border-journal-green">
+                <h3 class="text-white font-semibold flex items-center">
+                    <i class="fas fa-chart-bar text-journal-gold mr-2"></i>Job Stats
+                </h3>
+            </div>
+            <div class="p-5">
+                <div class="flex items-baseline justify-between mb-2">
+                    <span class="text-sm text-gray-600 dark:text-gray-300">Total Jobs</span>
+                    <span class="text-2xl font-bold text-journal-dark dark:text-gray-100">{{ metrics.total_jobs }}</span>
                 </div>
+                <div class="flex items-baseline justify-between border-t border-gray-100 dark:border-journal-dark pt-2 mb-3">
+                    <span class="text-sm text-gray-600 dark:text-gray-300">Failed (24h)</span>
+                    <span class="text-lg font-bold {% if metrics.recent_failed_24h > 0 %}text-red-600 dark:text-red-400{% else %}text-gray-400{% endif %}">{{ metrics.recent_failed_24h }}</span>
+                </div>
+                <h4 class="text-xs uppercase tracking-wide text-gray-500 dark:text-gray-400 font-semibold mb-2">By Status</h4>
+                <ul class="space-y-1 text-sm">
+                    {% for status, count in metrics.status_counts.items() %}
+                    <li class="flex justify-between font-mono">
+                        <span class="text-gray-600 dark:text-gray-300">{{ status }}</span>
+                        <span class="text-journal-dark dark:text-gray-100">{{ count }}</span>
+                    </li>
+                    {% else %}
+                    <li class="text-gray-500 italic">No jobs yet</li>
+                    {% endfor %}
+                </ul>
             </div>
         </div>
+
     </div>
 
     <!-- Workers Table -->
-    <div class="card">
-        <div class="card-header">Worker Nodes</div>
-        <div class="card-body">
+    <div class="bg-white dark:bg-journal-green rounded-xl shadow-lg overflow-hidden transition-colors">
+        <div class="bg-journal-dark px-5 py-3 border-b border-journal-green">
+            <h3 class="text-white font-semibold flex items-center">
+                <i class="fas fa-users-gear text-journal-gold mr-2"></i>Worker Nodes
+                <span class="ml-2 text-xs text-gray-400">({{ workers.workers|length }} found)</span>
+            </h3>
+        </div>
+        <div class="p-5">
             {% if workers.workers %}
-            <table class="table table-striped">
-                <thead>
-                    <tr>
-                        <th>ID</th>
-                        <th>Status</th>
-                        <th>Last Heartbeat</th>
-                        <th>Age (s)</th>
-                    </tr>
-                </thead>
-                <tbody>
-                    {% for worker in workers.workers %}
-                    <tr>
-                        <td>{{ worker.id }}</td>
-                        <td>
-                            {% if worker.status == 'healthy' %}
-                            <span class="badge bg-success">Healthy</span>
-                            {% elif worker.status == 'stale' %}
-                            <span class="badge bg-warning text-dark">Stale</span>
-                            {% else %}
-                            <span class="badge bg-danger">Dead</span>
-                            {% endif %}
-                        </td>
-                        <td>{{ worker.last_heartbeat }}</td>
-                        <td>{{ worker.age_seconds }}</td>
-                    </tr>
-                    {% endfor %}
-                </tbody>
-            </table>
+            <div class="overflow-x-auto">
+                <table class="w-full text-sm">
+                    <thead>
+                        <tr class="border-b border-gray-200 dark:border-journal-dark text-left">
+                            <th class="py-2 pr-4 font-semibold text-gray-700 dark:text-gray-200">Worker ID</th>
+                            <th class="py-2 pr-4 font-semibold text-gray-700 dark:text-gray-200">Status</th>
+                            <th class="py-2 pr-4 font-semibold text-gray-700 dark:text-gray-200">Last Heartbeat</th>
+                            <th class="py-2 pr-4 font-semibold text-gray-700 dark:text-gray-200 text-right">Age (s)</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        {% for worker in workers.workers %}
+                        <tr class="border-b border-gray-100 dark:border-journal-dark last:border-0 hover:bg-gray-50 dark:hover:bg-journal-dark/40 transition-colors">
+                            <td class="py-2 pr-4 font-mono text-xs text-gray-700 dark:text-gray-200">{{ worker.id }}</td>
+                            <td class="py-2 pr-4">
+                                {% if worker.status == 'healthy' %}
+                                <span class="px-2 py-0.5 rounded-full text-xs font-bold bg-green-100 text-green-800 dark:bg-green-900 dark:text-green-200">Healthy</span>
+                                {% elif worker.status == 'stale' %}
+                                <span class="px-2 py-0.5 rounded-full text-xs font-bold bg-yellow-100 text-yellow-800 dark:bg-yellow-900 dark:text-yellow-200">Stale</span>
+                                {% else %}
+                                <span class="px-2 py-0.5 rounded-full text-xs font-bold bg-red-100 text-red-800 dark:bg-red-900 dark:text-red-200">Dead</span>
+                                {% endif %}
+                            </td>
+                            <td class="py-2 pr-4 font-mono text-xs text-gray-600 dark:text-gray-300">{{ worker.last_heartbeat }}</td>
+                            <td class="py-2 pr-4 font-mono text-right text-gray-700 dark:text-gray-200">{{ worker.age_seconds }}</td>
+                        </tr>
+                        {% endfor %}
+                    </tbody>
+                </table>
+            </div>
             {% else %}
-            <p class="text-muted">No workers detected.</p>
+            <p class="text-gray-500 dark:text-gray-400 italic">
+                {% if workers.status == 'no_workers_dir' %}
+                Worker directory not found. Is the worker service running?
+                {% else %}
+                No worker heartbeats detected.
+                {% endif %}
+            </p>
             {% endif %}
         </div>
+    </div>
+
+    <!-- JSON endpoint links -->
+    <div class="bg-white dark:bg-journal-green rounded-xl shadow p-4 text-xs text-gray-500 dark:text-gray-400">
+        JSON endpoints:
+        <a href="{{ url_for('monitoring.health_check') }}" class="font-mono hover:text-journal-gold mx-2">/health</a> |
+        <a href="{{ url_for('monitoring.worker_health') }}" class="font-mono hover:text-journal-gold mx-2">/health/workers</a> |
+        <a href="{{ url_for('monitoring.metrics') }}" class="font-mono hover:text-journal-gold mx-2">/metrics</a>
     </div>
 </div>
 {% endblock %}

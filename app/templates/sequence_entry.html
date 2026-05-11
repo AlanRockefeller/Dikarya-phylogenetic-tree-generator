@@ -1316,6 +1316,7 @@
         const payload = {
             input_type: 'sequence',
             sequence: buildFastaFromQueue(),
+            sequence_metadata: buildSequenceMetadataFromQueue(),
             notes: 'Mycomap Quick Tree',
             alignment_method: 'mafft',
             trimming_method: 'none',
@@ -1683,6 +1684,7 @@
         const payload = {
             input_type: 'sequence',
             sequence: buildFastaFromQueue(),
+            sequence_metadata: buildSequenceMetadataFromQueue(),
             notes: notes,
             alignment_method: 'mafft',
             trimming_method: 'none',
@@ -1942,6 +1944,7 @@
         const payload = {
             input_type: 'sequence',
             sequence: buildFastaFromQueue(),
+            sequence_metadata: buildSequenceMetadataFromQueue(),
             notes: notes,
             alignment_method: document.getElementById('alignment_method').value,
             trimming_method: document.getElementById('trimming_method').value,
@@ -1996,14 +1999,41 @@
     });
 
     // Helper to build FASTA
+    function buildFastaHeaderFromQueueItem(seq) {
+        let header = seq.name;
+        if (seq.organism) {
+            header = `${header} ${seq.organism}`;
+        }
+        return header;
+    }
+
     function buildFastaFromQueue() {
         return sequenceQueue.map(seq => {
-            let header = seq.name;
-            if (seq.organism) {
-                header = `${header} ${seq.organism}`;
-            }
+            const header = buildFastaHeaderFromQueueItem(seq);
             return `>${header}\n${seq.sequence}`;
         }).join('\n');
+    }
+
+    // Alan 5/9/26 - Preserve queue BLAST metrics with the job so the Tree Viewer can filter rendered tips.
+    function buildSequenceMetadataFromQueue() {
+        return sequenceQueue.map(seq => {
+            const header = buildFastaHeaderFromQueueItem(seq);
+            const hasMetrics = seq.blast_metrics_available === true ||
+                seq.query_cover != null ||
+                seq.subject_cover != null ||
+                seq.identity != null;
+            return {
+                name: seq.name || '',
+                fasta_header: header,
+                organism: seq.organism || '',
+                source: seq.source || '',
+                hit_source: seq.hit_source || '',
+                query_cover: seq.query_cover ?? null,
+                subject_cover: seq.subject_cover ?? null,
+                identity: seq.identity ?? null,
+                blast_metrics_available: hasMetrics
+            };
+        }).filter(item => item.blast_metrics_available || item.source || item.hit_source);
     }
 
     // =========================================================================
@@ -2011,8 +2041,16 @@
     // Initialize & "Add Sequences" Mode Logic
     // =========================================================================
     const urlParams = new URLSearchParams(window.location.search);
-    const EDIT_JOB_ID = urlParams.get('edit_job_id');
-    const CLONE_JOB_ID = urlParams.get('clone_job_id');
+    // Alan 5/10/26 - Strict UUIDv4 validation of edit_job_id/clone_job_id from the URL
+    // before using them. These values flow into innerHTML and into fetch() URLs,
+    // so an attacker-crafted link could otherwise inject markup or hit arbitrary
+    // backend paths via the victim's session. Drop the value entirely if it
+    // doesn't match the UUID shape.
+    const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+    const rawEditId = urlParams.get('edit_job_id');
+    const rawCloneId = urlParams.get('clone_job_id');
+    const EDIT_JOB_ID = (rawEditId && UUID_RE.test(rawEditId)) ? rawEditId : null;
+    const CLONE_JOB_ID = (rawCloneId && UUID_RE.test(rawCloneId)) ? rawCloneId : null;
     const submitBtn = document.getElementById('submit_btn');
 
     // --- HANDLE CLONE JOB (Load sequences from another job) ---
@@ -2053,7 +2091,13 @@
             if (sequenceQueue.length === 0) {
                 showStatus(`Loading existing sequences from Job ${EDIT_JOB_ID}...`, 'info');
                 try {
-                    const resp = await fetch(`/api/job/${EDIT_JOB_ID}/download/fasta/original`);
+                    // Alan 5/10/26 - Prefer the current unpruned FASTA so add-and-recompute keeps prior prunes.
+                    let resp = await fetch(`/api/job/${EDIT_JOB_ID}/download/fasta/pruned`);
+                    let loadedCurrentFasta = resp.ok;
+                    if (!resp.ok) {
+                        resp = await fetch(`/api/job/${EDIT_JOB_ID}/download/fasta/original`);
+                        loadedCurrentFasta = false;
+                    }
                     if (!resp.ok) throw new Error(`Failed to fetch job data (Status ${resp.status})`);
 
                     const text = await resp.text();
@@ -2061,7 +2105,8 @@
 
                     const sequences = parseFasta(text);
                     const added = addSequences(sequences);
-                    showStatus(`Loaded ${added} existing sequences from Job ${EDIT_JOB_ID}.`, 'success');
+                    const sourceLabel = loadedCurrentFasta ? 'current unpruned' : 'existing';
+                    showStatus(`Loaded ${added} ${sourceLabel} sequences from Job ${EDIT_JOB_ID}.`, 'success');
                 } catch (e) {
                     console.error(e);
                     showStatus(`Failed to load existing sequences: ${e.message}`, 'error', 5000);
@@ -2070,7 +2115,21 @@
         })();
 
         // --- MODIFY UI FOR "ADD SEQ" MODE ---
-        document.querySelector('h2').innerHTML = `<i class="fas fa-plus-circle text-journal-gold mr-3"></i>Add Sequences to Job&nbsp;<span class="font-mono text-gray-500">${EDIT_JOB_ID}</span>`;
+        // Alan 5/10/26 - Build the heading via DOM APIs + textContent instead of
+        // innerHTML so EDIT_JOB_ID (URL-supplied) can never be parsed as markup.
+        // Defense in depth on top of the UUID regex check above.
+        const headingEl = document.querySelector('h2');
+        if (headingEl) {
+            headingEl.textContent = '';
+            const icon = document.createElement('i');
+            icon.className = 'fas fa-plus-circle text-journal-gold mr-3';
+            const idSpan = document.createElement('span');
+            idSpan.className = 'font-mono text-gray-500';
+            idSpan.textContent = EDIT_JOB_ID;
+            headingEl.appendChild(icon);
+            headingEl.appendChild(document.createTextNode('Add Sequences to Job '));
+            headingEl.appendChild(idSpan);
+        }
         document.title = `Add Sequences - Job ${EDIT_JOB_ID}`;
 
         // Disable clone loading if both are present (Edit takes precedence technically, but they shouldn't occur together)
@@ -2110,19 +2169,19 @@
             document.getElementById('btn_add_recompute_job').addEventListener('click', async () => {
                 const btn = document.getElementById('btn_add_recompute_job');
 
-                if (sequenceQueue.length === 0) {
-                    showStatus('Please add at least one sequence to the queue.', 'error');
+                if (sequenceQueue.length < 2) {
+                    showStatus('Please keep at least 2 sequences in the queue.', 'error');
                     return;
                 }
 
                 btn.disabled = true;
                 btn.innerHTML = '<i class="fas fa-spinner fa-spin mr-2"></i> Processing...';
-                showStatus('Adding sequences and recomputing tree...', 'info');
+                showStatus('Saving queue and starting recompute...', 'info');
 
                 try {
                     const combinedFasta = buildFastaFromQueue();
 
-                    // 1. Add Sequences
+                    // 1. Save the queue as the recompute input
                     const csrfToken = document.querySelector('meta[name="csrf-token"]').getAttribute('content');
                     const addResp = await fetch(`/api/job/${EDIT_JOB_ID}/sequences/add`, {
                         method: 'POST',
@@ -2130,32 +2189,31 @@
                             'Content-Type': 'application/json',
                             'X-CSRFToken': csrfToken
                         },
-                        body: JSON.stringify({ input: combinedFasta })
+                        body: JSON.stringify({ input: combinedFasta, replace: true })
                     });
 
                     const addData = await addResp.json();
                     if (!addResp.ok) throw new Error(addData.error || 'Failed to add sequences');
 
-                    showStatus(`Added ${addData.count} sequences. Recomputing...`, 'success');
+                    const savedMessage = addData.message || `Saved ${addData.count} queued sequences.`;
+                    showStatus(`${savedMessage} Starting recompute...`, 'success');
 
-                    // 2. Recompute
+                    // 2. Start recompute in the background
                     const recomputeResp = await fetch(`/api/job/${EDIT_JOB_ID}/tree/recompute`, {
                         method: 'POST',
                         headers: {
                             'Content-Type': 'application/json',
                             'X-CSRFToken': csrfToken
                         },
-                        body: JSON.stringify({})
+                        body: JSON.stringify({ async: true, use_current_input: true })
                     });
                     const recompData = await recomputeResp.json();
                     if (!recomputeResp.ok) throw new Error(recompData.error || 'Failed to trigger recompute');
 
-                    showStatus('Recompute started! Redirecting to viewer...', 'success');
+                    showStatus('Recompute started. Opening job status...', 'success');
 
-                    // 3. Redirect back to viewer
-                    setTimeout(() => {
-                        window.location.href = `/job/${EDIT_JOB_ID}/view`;
-                    }, 1000);
+                    // 3. Redirect to the status page so progress is visible
+                    window.location.href = recompData.redirect_url || `/job/${EDIT_JOB_ID}`;
 
                 } catch (e) {
                     showStatus('Error: ' + e.message, 'error');

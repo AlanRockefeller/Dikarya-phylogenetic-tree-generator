@@ -18,21 +18,6 @@ def sanitize_fasta_sequence(seq: str) -> str:
     allowed = set('ACGTUNRYKMSWBDHVacgtunrykmsv-')
     return ''.join(c for c in seq if c in allowed)
 
-def validate_blast_query(query: str) -> Tuple[bool, Optional[str]]:
-    """Validate BLAST query for dangerous patterns."""
-    if not query:
-        return False, "Empty query"
-    
-    # Check for suspicious shell-like patterns
-    # Check for suspicious shell-like patterns
-    # Allow newlines (\n, \r) as they are common in FASTA/sequences
-    dangerous_patterns = [';', '`', '$', '&&']
-    for pattern in dangerous_patterns:
-        if pattern in query:
-            return False, f"Query contains invalid character: {pattern}"
-    
-    return True, None
-
 def validate_safe_file_path(path: Path, base_dir: Path) -> bool:
     """
     Ensure path is a real file inside base_dir and not a symlink.

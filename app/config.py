@@ -34,6 +34,14 @@ class Config:
     # Database
     SQLALCHEMY_DATABASE_URI = os.environ.get('DATABASE_URL') or 'sqlite:///' + str(BASE_DIR / 'app.db')
     SQLALCHEMY_TRACK_MODIFICATIONS = False
+    # Validate pooled connections on checkout (cheap SELECT 1) and recycle
+    # them every 30 minutes. Eliminates the "SSL connection has been closed
+    # unexpectedly" tracebacks we saw when Postgres or the network dropped
+    # an idle connection between requests.
+    SQLALCHEMY_ENGINE_OPTIONS = {
+        "pool_pre_ping": True,
+        "pool_recycle": 1800,
+    }
     
     # Defaults
     BEGINNER_DEFAULT_ALIGNER = os.environ.get('BEGINNER_DEFAULT_ALIGNER', 'mafft')
@@ -50,6 +58,21 @@ class DevelopmentConfig(Config):
 
 class ProductionConfig(Config):
     DEBUG = False
+
+    # Cookie hardening. Only in ProductionConfig so dev (which may run over
+    # plain HTTP on localhost) is unaffected.
+    #   SECURE   : browser only sends the cookie over HTTPS.
+    #   HTTPONLY : JS cannot read the cookie via document.cookie (mitigates
+    #              session theft if an XSS bug slips through).
+    #   SAMESITE : 'Lax' blocks cross-site POST/AJAX from carrying the cookie,
+    #              providing a second line of defense against CSRF while still
+    #              allowing normal top-level link navigation.
+    SESSION_COOKIE_SECURE = True
+    SESSION_COOKIE_HTTPONLY = True
+    SESSION_COOKIE_SAMESITE = 'Lax'
+    REMEMBER_COOKIE_SECURE = True
+    REMEMBER_COOKIE_HTTPONLY = True
+    REMEMBER_COOKIE_SAMESITE = 'Lax'
 
 config = {
     'development': DevelopmentConfig,

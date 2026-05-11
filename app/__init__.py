@@ -12,6 +12,19 @@ def create_app(config_name='default'):
     app = Flask(__name__)
     app.config.from_object(config[config_name])
 
+    # Fail loud if SECRET_KEY is missing or still the dev fallback in production.
+    # SECRET_KEY signs session cookies, CSRF tokens, and remember-me cookies; a
+    # weak or known value lets attackers forge any user's session. Refuse to
+    # boot rather than silently run insecure.
+    if not app.debug and not app.testing:
+        secret = app.config.get('SECRET_KEY')
+        if not secret or secret == 'dev-key-please-change':
+            raise RuntimeError(
+                "SECRET_KEY is not set to a strong random value. "
+                "Generate one with `python -c \"import secrets; print(secrets.token_urlsafe(64))\"` "
+                "and set it in the environment before starting the app."
+            )
+
     @app.route('/favicon.ico/<path:filename>')
     def favicon_asset(filename):
         return send_from_directory(app.static_folder + '/favicon.ico', filename)
@@ -89,5 +102,26 @@ def create_app(config_name='default'):
     # Register CLI commands
     from app import cli
     cli.register(app)
+
+    # Security headers. CSP is intentionally NOT set here because templates
+    # use inline scripts that would need nonces — that's a bigger task. The
+    # four below are free wins:
+    #   X-Content-Type-Options: stops MIME-sniffing-based XSS
+    #   X-Frame-Options       : blocks clickjacking via iframes
+    #   Referrer-Policy       : strips referer on cross-origin nav
+    #   Strict-Transport-Security: forces HTTPS for a year on all subdomains
+    @app.after_request
+    def _set_security_headers(response):
+        response.headers.setdefault("X-Content-Type-Options", "nosniff")
+        response.headers.setdefault("X-Frame-Options", "DENY")
+        response.headers.setdefault("Referrer-Policy", "same-origin")
+        # Only assert HSTS in production (HTTPS); avoid trapping dev users
+        # on http://localhost into an HTTPS-only state.
+        if not app.debug and not app.testing:
+            response.headers.setdefault(
+                "Strict-Transport-Security",
+                "max-age=31536000; includeSubDomains"
+            )
+        return response
 
     return app

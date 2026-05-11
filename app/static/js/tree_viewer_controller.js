@@ -14,8 +14,18 @@ document.addEventListener('DOMContentLoaded', async () => {
     const btnRename = getEl('btn-rename');
     const btnReroot = getEl('btn-reroot');
     const btnMidpoint = getEl('btn-midpoint');
+    // Alan 5/11/26 - Track the viewer-only deselect control separately from persistent selection-set actions.
+    const btnDeselect = getEl('btn-deselect');
     const btnRecompute = getEl('btn-recompute');
     const btnMakeCopy = getEl('btn-make-copy');
+    // Alan 5/11/26 - Cache rename modal elements for editing the current visible selection.
+    const renameModal = getEl('modal-rename-sequences');
+    const renameModalRows = getEl('rename-modal-rows');
+    const renameModalSubtitle = getEl('rename-modal-subtitle');
+    const btnRenameModalSave = getEl('btn-rename-modal-save');
+    const btnRenameModalCancel = getEl('btn-rename-modal-cancel');
+    const btnRenameModalClose = getEl('btn-rename-modal-close');
+    const renameModalBackdrop = getEl('rename-modal-backdrop');
 
     // --- HELPER: STATUS MESSAGE ---
     let currentStatusType = null;
@@ -47,6 +57,10 @@ document.addEventListener('DOMContentLoaded', async () => {
     let rerootCaptureHandler = null;
     let filterDebounce = null;
     let selectionSaveDebounce = null;
+    // Alan 5/9/26 - Throttle live sequence metric filter redraws to one frame while the user drags.
+    let sequenceFilterFrame = null;
+    // Alan 5/11/26 - Hold only the clicked/current selection being edited in the rename modal.
+    let pendingRenameItems = [];
     let updateSelectionSetUI = () => {}; // assigned in wireUI()
 
     async function saveSelectionSets() {
@@ -104,8 +118,98 @@ document.addEventListener('DOMContentLoaded', async () => {
         rerootCaptureHandler = null;
     }
 
+    // Alan 5/11/26 - Open a modal for renaming the current visible clicked selections only.
+    function openRenameModal(nodes) {
+        if (!renameModal || !renameModalRows || !Array.isArray(nodes) || nodes.length === 0) return;
+        pendingRenameItems = nodes.map((node, index) => {
+            const data = node?.data || node || {};
+            const originalName = data.__original_name || data.original_name || data.name || node?.name || "";
+            const displayName = data.name || data.display_name || originalName;
+            return { index, originalName, displayName };
+        }).filter(item => item.originalName);
+        if (pendingRenameItems.length === 0) return;
+
+        renameModalRows.innerHTML = "";
+        pendingRenameItems.forEach(item => {
+            const row = document.createElement('div');
+            row.className = 'rounded-lg border border-gray-200 dark:border-journal-dark p-3 bg-gray-50 dark:bg-journal-dark/40';
+
+            const label = document.createElement('label');
+            label.className = 'block text-xs font-semibold text-gray-500 dark:text-gray-300 mb-1';
+            label.htmlFor = `rename-input-${item.index}`;
+            label.textContent = `Current name ${item.index + 1}`;
+
+            const input = document.createElement('input');
+            input.type = 'text';
+            input.id = `rename-input-${item.index}`;
+            input.dataset.renameIndex = String(item.index);
+            input.value = item.displayName;
+            input.className = 'w-full px-3 py-2 rounded-lg border border-gray-300 dark:border-gray-600 bg-white dark:bg-journal-dark text-gray-900 dark:text-gray-100 focus:ring-2 focus:ring-blue-500 focus:border-blue-500 text-sm';
+            input.autocomplete = 'off';
+
+            const original = document.createElement('p');
+            original.className = 'mt-1 text-xs text-gray-500 dark:text-gray-400 break-all';
+            original.textContent = item.originalName === item.displayName ? 'Original ID preserved for tree edits.' : `Original ID: ${item.originalName}`;
+
+            row.appendChild(label);
+            row.appendChild(input);
+            row.appendChild(original);
+            renameModalRows.appendChild(row);
+        });
+
+        if (renameModalSubtitle) {
+            const count = pendingRenameItems.length;
+            renameModalSubtitle.textContent = `Editing ${count} selected sequence${count === 1 ? '' : 's'}.`;
+        }
+        renameModal.classList.remove('hidden');
+        document.body.classList.add('overflow-hidden');
+        renameModalRows.querySelector('input')?.focus();
+    }
+
+    // Alan 5/11/26 - Close the rename modal without changing any saved selection-set state.
+    function closeRenameModal() {
+        if (!renameModal) return;
+        renameModal.classList.add('hidden');
+        document.body.classList.remove('overflow-hidden');
+        pendingRenameItems = [];
+    }
+
+    // Alan 5/11/26 - Submit only changed names from the current visible selection rename modal.
+    async function submitRenameModal() {
+        if (!renameModalRows || pendingRenameItems.length === 0 || isProcessing) return;
+        const changes = [];
+        for (const item of pendingRenameItems) {
+            const input = renameModalRows.querySelector(`input[data-rename-index="${item.index}"]`);
+            const newName = input?.value.trim() || "";
+            if (!newName) {
+                showStatus("Names cannot be blank.", "warning", 2500);
+                input?.focus();
+                return;
+            }
+            if (newName !== item.displayName) {
+                changes.push({ oldName: item.originalName, newName });
+            }
+        }
+
+        if (changes.length === 0) {
+            closeRenameModal();
+            showStatus("No rename changes.", "info", 1500);
+            return;
+        }
+
+        closeRenameModal();
+        const count = changes.length;
+        runBackendAction(`Renaming ${count} sequence${count === 1 ? '' : 's'}`, async () => {
+            for (const change of changes) {
+                await TreeEditActions.renameTip(JOB_ID, change.oldName, change.newName);
+            }
+        // Alan 5/11/26 - Renaming changes labels only, so saved selection sets should not be cleared.
+        }, { clearSelections: false });
+    }
+
     // --- HELPER: BACKEND ACTION WRAPPER ---
-    async function runBackendAction(name, actionFn) {
+    // Alan 5/11/26 - Let non-structural actions such as rename reload without clearing saved selection sets.
+    async function runBackendAction(name, actionFn, options = {}) {
         if (isProcessing) return;
         isProcessing = true;
         updateButtons(); // Disable
@@ -115,7 +219,16 @@ document.addEventListener('DOMContentLoaded', async () => {
             showStatus(name + " completed.", "success", 2000);
 
             // Post-action cleanup
-            if (viewer) viewer.clearSelection();
+            if (viewer && options.clearSelections !== false) {
+                // Alan 5/10/26 - Persist cleared selections before reload so pruned nodes cannot reappear as selected.
+                viewer.clearSelection();
+                // Alan 5/10/26 - Cancel pending selection saves that may still contain pre-prune IDs.
+                if (selectionSaveDebounce) {
+                    selectionSaveDebounce = clearTimeout(selectionSaveDebounce);
+                }
+                // Alan 5/10/26 - Save the empty selection state before fetching tree_state again.
+                await saveSelectionSets();
+            }
             rerootMode = false;
             if (rerootCaptureHandler) removeRerootCapture();
 
@@ -170,6 +283,8 @@ document.addEventListener('DOMContentLoaded', async () => {
             minTips: parseInt(getEl('input-min-tips')?.value || 0),
             ppThreshold: parseFloat(getEl('input-pp-threshold')?.value || 0.9),
             bootstrapThreshold: parseInt(getEl('input-bs-threshold')?.value || 70),
+            // Alan 5/9/26 - Pass stored per-sequence BLAST metrics into the viewer for tip filtering.
+            sequenceMetrics: Array.isArray(window.SEQUENCE_METRICS) ? window.SEQUENCE_METRICS : [],
             treeMethod: window.TREE_METHOD || ''
         };
 
@@ -205,6 +320,10 @@ document.addEventListener('DOMContentLoaded', async () => {
                 const treeState = await TreeEditActions.getTreeState(JOB_ID);
                 isMidpointRooted = treeState.is_midpoint_rooted ?? true;
                 updateMidpointButton();
+                // Alan 5/11/26 - Reapply saved rename labels after loading the raw Newick tree.
+                if (treeState.renames && viewer && typeof viewer.applyRenames === 'function') {
+                    viewer.applyRenames(treeState.renames);
+                }
                 if (treeState.selection_sets && viewer) {
                     viewer.restoreSelectionSets({
                         sets: treeState.selection_sets,
@@ -221,6 +340,8 @@ document.addEventListener('DOMContentLoaded', async () => {
 
             // Post-render sync
             updateSupportUI(viewer.getStats());
+            // Alan 5/9/26 - Size and label the sequence metric sliders after the tree has loaded.
+            syncSequenceFilterUI(viewer.getSequenceFilterStats());
 
         } catch (err) {
             console.error("Tree Load Error:", err);
@@ -278,6 +399,17 @@ document.addEventListener('DOMContentLoaded', async () => {
     function wireUI() {
         if (uiWired) return;
         uiWired = true;
+
+        // Alan 5/11/26 - Wire rename modal controls for current clicked selections.
+        btnRenameModalSave?.addEventListener('click', submitRenameModal);
+        btnRenameModalCancel?.addEventListener('click', closeRenameModal);
+        btnRenameModalClose?.addEventListener('click', closeRenameModal);
+        renameModalBackdrop?.addEventListener('click', closeRenameModal);
+        renameModalRows?.addEventListener('keydown', (e) => {
+            if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) {
+                submitRenameModal();
+            }
+        });
 
         // Layout
         getEl('btn-layout-linear')?.addEventListener('click', () => viewer?.updateLayout('linear'));
@@ -352,6 +484,17 @@ document.addEventListener('DOMContentLoaded', async () => {
                 el.addEventListener('input', () => { viewer?.applyTextSizing(); saveDisplayPrefs(); });
                 el.addEventListener('change', () => { viewer?.applyTextSizing(); saveDisplayPrefs(); });
             }
+        });
+
+        // Alan 5/9/26 - Wire live sequence metric sliders so dragging them hides matching tips in the rendered tree.
+        ['slider-query-cover', 'slider-subject-cover', 'slider-identity'].forEach(id => {
+            getEl(id)?.addEventListener('input', scheduleSequenceFilterUpdate);
+        });
+        getEl('btn-sequence-filter-reset')?.addEventListener('click', () => {
+            if (!viewer) return;
+            const stats = viewer.resetSequenceFilters();
+            syncSequenceFilterUI(stats);
+            showStatus("Sequence filters reset.", "info", 1200);
         });
 
         // Filter / Search
@@ -625,16 +768,9 @@ document.addEventListener('DOMContentLoaded', async () => {
         if (btnRename) btnRename.addEventListener('click', () => {
             if (!viewer) return;
             const nodes = viewer.getSelectedNodes();
-            if (nodes.length !== 1) return;
-            const node = nodes[0];
-            const name = node.data.__original_name || node.data.name;
-            const displayName = node.data.name;
-
-            const newName = prompt("Enter new name:", displayName);
-            if (!newName) return;
-            runBackendAction("Renaming", async () => {
-                await TreeEditActions.renameTip(JOB_ID, name, newName);
-            });
+            // Alan 5/11/26 - Rename every currently visible clicked selection, independent of selection sets.
+            if (nodes.length === 0) return;
+            openRenameModal(nodes);
         });
 
         if (btnReroot) btnReroot.addEventListener('click', () => {
@@ -661,6 +797,17 @@ document.addEventListener('DOMContentLoaded', async () => {
             });
         });
 
+        // Alan 5/11/26 - Clear the currently visible selection without deleting saved selection-set membership.
+        if (btnDeselect) btnDeselect.addEventListener('click', () => {
+            if (!viewer || typeof viewer.deselectCurrentSelection !== 'function') return;
+            const cleared = viewer.deselectCurrentSelection();
+            updateButtons();
+            if (cleared > 0) {
+                // Alan 5/11/26 - Report deselected sequences using the same visible-selection count shown on the button.
+                showStatus(`Deselected ${cleared} sequence${cleared === 1 ? '' : 's'}.`, "info", 1500);
+            }
+        });
+
         if (btnRecompute) btnRecompute.addEventListener('click', () => {
             if (!confirm("Recompute tree?")) return;
             runBackendAction("Recomputing", async () => {
@@ -671,6 +818,11 @@ document.addEventListener('DOMContentLoaded', async () => {
 
 
         document.addEventListener('keydown', (e) => {
+            // Alan 5/11/26 - Escape closes the rename modal before handling reroot cancellation.
+            if (e.key === "Escape" && renameModal && !renameModal.classList.contains('hidden')) {
+                closeRenameModal();
+                return;
+            }
             if (e.key === "Escape" && rerootMode) {
                 rerootMode = false; removeRerootCapture();
                 showStatus("Reroot cancelled.", "info", 1000); updateButtons();
@@ -721,6 +873,24 @@ document.addEventListener('DOMContentLoaded', async () => {
     function updateButtons() {
         if (!viewer) return;
 
+        // Multi-select check
+        let selCount = 0;
+        if (typeof viewer.getSelectionCount === 'function') {
+            selCount = viewer.getSelectionCount();
+        }
+
+        // Alan 5/11/26 - Keep Deselect tied to visible active selections, not saved selection sets.
+        const updateDeselectButton = (forceDisabled = false) => {
+            if (!btnDeselect) return;
+            const disabled = forceDisabled || selCount === 0;
+            btnDeselect.disabled = disabled;
+            btnDeselect.title = selCount > 0 ? `Deselect ${selCount} sequence${selCount === 1 ? '' : 's'}` : "No current selection";
+            // Alan 5/11/26 - Show the Deselect count directly on the button like Prune does.
+            btnDeselect.innerHTML = selCount > 0 ? '<i class="fa fa-mouse-pointer"></i> Deselect (' + selCount + ')' : '<i class="fa fa-mouse-pointer"></i> Deselect';
+            btnDeselect.classList.toggle('opacity-50', disabled);
+            btnDeselect.classList.toggle('cursor-not-allowed', disabled);
+        };
+
         // View Only Mode Logic
         if (window.VIEW_ONLY) {
             const disableBtn = (btn) => {
@@ -736,13 +906,9 @@ document.addEventListener('DOMContentLoaded', async () => {
             disableBtn(btnMidpoint);
             disableBtn(btnRecompute);
             // btnMakeCopy remains enabled
+            // Alan 5/11/26 - Leave Deselect available in view-only mode because it only changes local highlighting.
+            updateDeselectButton(false);
             return;
-        }
-
-        // Multi-select check
-        let selCount = 0;
-        if (typeof viewer.getSelectionCount === 'function') {
-            selCount = viewer.getSelectionCount();
         }
 
         const isMulti = selCount > 1;
@@ -756,22 +922,25 @@ document.addEventListener('DOMContentLoaded', async () => {
             if (btnMidpoint) btnMidpoint.disabled = true;
             if (btnRecompute) btnRecompute.disabled = true;
             if (btnMakeCopy) btnMakeCopy.disabled = true;
+            // Alan 5/11/26 - Freeze Deselect while backend actions are refreshing the tree.
+            updateDeselectButton(true);
             return;
         }
 
         // Normal state
+        // Alan 5/11/26 - Refresh Deselect whenever normal edit buttons are refreshed.
+        updateDeselectButton(false);
         if (btnPrune) {
             btnPrune.disabled = !hasSelection && !isMulti;
             btnPrune.title = (hasSelection || isMulti) ? `Prune ${selCount} node${selCount > 1 ? 's' : ''}` : "Select nodes to prune";
-            if (isMulti) {
-                btnPrune.innerHTML = "Prune Selected (" + selCount + ")";
-            } else {
-                btnPrune.innerHTML = "Prune Selected";
-            }
+            // Alan 5/10/26 - Always show the active prune count, including a single selected sequence.
+            btnPrune.innerHTML = selCount > 0 ? '<i class="fa fa-cut"></i> Prune (' + selCount + ')' : '<i class="fa fa-cut"></i> Prune';
         }
         if (btnRename) {
-            btnRename.disabled = !hasSelection;
-            btnRename.title = isMulti ? "Select only one node to rename" : "";
+            // Alan 5/11/26 - Allow multi-rename and show the active visible selection count.
+            btnRename.disabled = selCount === 0;
+            btnRename.title = selCount > 0 ? `Rename ${selCount} sequence${selCount === 1 ? '' : 's'}` : "Select sequences to rename";
+            btnRename.innerHTML = selCount > 0 ? '<i class="fa fa-edit"></i> Rename (' + selCount + ')' : '<i class="fa fa-edit"></i> Rename';
         }
 
         if (btnReroot) {
@@ -799,6 +968,71 @@ document.addEventListener('DOMContentLoaded', async () => {
             btnMidpoint.innerHTML = '<i class="fa fa-balance-scale"></i> Midpoint';
             btnMidpoint.title = 'Click to enable midpoint rooting';
         }
+    }
+
+    // Alan 5/9/26 - Keep sequence metric sliders and labels synced to the loaded tree.
+    function syncSequenceFilterUI(stats) {
+        const sliderConfig = [
+            ['slider-query-cover', 'query-cover-value', 'queryCoverThreshold'],
+            ['slider-subject-cover', 'subject-cover-value', 'subjectCoverThreshold'],
+            ['slider-identity', 'identity-value', 'identityThreshold']
+        ];
+        const metricsAvailable = Boolean(stats?.metricsAvailable);
+        const countBadge = getEl('sequence-filter-count');
+
+        if (countBadge) {
+            const visibleTips = Math.max(0, Number(stats?.visibleTips) || 0);
+            const totalTips = Math.max(0, Number(stats?.totalTips) || 0);
+            const metricTips = Math.max(0, Number(stats?.metricTips) || 0);
+            countBadge.textContent = metricsAvailable
+                ? `Metrics: ${visibleTips}/${totalTips} tips (${metricTips})`
+                : 'Metrics: none';
+        }
+
+        sliderConfig.forEach(([sliderId, valueId, statKey]) => {
+            const slider = getEl(sliderId);
+            const valueEl = getEl(valueId);
+            const rawValue = Number(stats?.[statKey]);
+            const value = Number.isFinite(rawValue) ? Math.max(0, Math.min(100, Math.round(rawValue))) : 0;
+            // Alan 5/9/26 - Flip only the visible slider label/position so 0% is on the left while leftward dragging still raises the hidden threshold.
+            const displayValue = 100 - value;
+            if (slider) {
+                // Alan 5/9/26 - Use the display value for the thumb position; the renderer still receives the inverted threshold.
+                slider.value = String(displayValue);
+                slider.disabled = !metricsAvailable;
+                slider.classList.toggle('opacity-40', !metricsAvailable);
+                slider.classList.toggle('cursor-not-allowed', !metricsAvailable);
+            }
+            if (valueEl) {
+                // Alan 5/9/26 - Show the visual percentage scale rather than the inverted filtering threshold.
+                valueEl.textContent = metricsAvailable ? `${displayValue}%` : '--';
+            }
+        });
+    }
+
+    // Alan 5/9/26 - Read current metric slider values into renderer filter options.
+    function getSequenceFilterSliderOptions() {
+        const readSlider = (id) => {
+            const slider = getEl(id);
+            // Alan 5/9/26 - Invert the visual scale so dragging left still increases the filter threshold.
+            return slider && !slider.disabled ? 100 - parseInt(slider.value, 10) : 0;
+        };
+        return {
+            queryCoverThreshold: readSlider('slider-query-cover'),
+            subjectCoverThreshold: readSlider('slider-subject-cover'),
+            identityThreshold: readSlider('slider-identity')
+        };
+    }
+
+    // Alan 5/9/26 - Apply metric slider changes on animation frames for responsive tree filtering.
+    function scheduleSequenceFilterUpdate() {
+        if (!viewer) return;
+        if (sequenceFilterFrame) cancelAnimationFrame(sequenceFilterFrame);
+        sequenceFilterFrame = requestAnimationFrame(() => {
+            sequenceFilterFrame = null;
+            const stats = viewer.setSequenceFilterOptions(getSequenceFilterSliderOptions());
+            syncSequenceFilterUI(stats);
+        });
     }
 
     function updateSupportUI(stats) {

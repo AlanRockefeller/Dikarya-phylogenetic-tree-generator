@@ -1,13 +1,27 @@
-from flask import render_template, redirect, url_for, abort, request, current_app
+from flask import render_template, redirect, url_for, abort, request, current_app, flash
 from flask_login import current_user
 from app.main import bp
-from app.services.security_utils import validate_safe_file_path
+from app.services.security_utils import validate_safe_file_path, validate_job_id
 from app.services.access_control import check_job_access
 from app.extensions import csrf, limiter, db
 import os
 import re
 from collections import deque
 from datetime import datetime
+
+WHATS_NEW_EDITOR_EMAIL = "alaner@gmail.com"
+
+
+def can_edit_whats_new():
+    return (
+        current_user.is_authenticated
+        and (current_user.email or "").strip().lower() == WHATS_NEW_EDITOR_EMAIL
+    )
+
+
+def require_whats_new_editor():
+    if not can_edit_whats_new():
+        abort(404)
 
 
 @bp.route('/tree')
@@ -41,7 +55,68 @@ def whats_new():
         db.session.add(view_record)
     db.session.commit()
 
-    return render_template('whats_new.html', entries=entries, last_viewed=last_viewed)
+    return render_template(
+        'whats_new.html',
+        entries=entries,
+        last_viewed=last_viewed,
+        can_edit_whats_new=can_edit_whats_new(),
+        edit_mode=False
+    )
+
+
+@bp.route('/whats-new/edit')
+def whats_new_edit():
+    require_whats_new_editor()
+
+    from app.models import WhatsNewEntry
+
+    entries = WhatsNewEntry.query.order_by(WhatsNewEntry.published_at.desc()).all()
+    return render_template(
+        'whats_new.html',
+        entries=entries,
+        last_viewed=None,
+        can_edit_whats_new=True,
+        edit_mode=True
+    )
+
+
+@bp.route('/whats-new/<int:entry_id>/edit', methods=['POST'])
+def whats_new_update(entry_id):
+    require_whats_new_editor()
+
+    from app.models import WhatsNewEntry
+
+    entry = WhatsNewEntry.query.get_or_404(entry_id)
+    title = (request.form.get("title") or "").strip()
+    body = (request.form.get("body") or "").strip()
+    category = (request.form.get("category") or "update").strip().lower()
+
+    if category not in {"feature", "fix", "improvement", "update"}:
+        category = "update"
+
+    if not title or not body:
+        flash("Title and body are required.", "error")
+        return redirect(url_for("main.whats_new_edit"))
+
+    entry.title = title[:255]
+    entry.body = body
+    entry.category = category
+    db.session.commit()
+    flash("What's New item updated.", "success")
+    return redirect(url_for("main.whats_new_edit"))
+
+
+@bp.route('/whats-new/<int:entry_id>/delete', methods=['POST'])
+def whats_new_delete(entry_id):
+    require_whats_new_editor()
+
+    from app.models import WhatsNewEntry
+
+    entry = WhatsNewEntry.query.get_or_404(entry_id)
+    db.session.delete(entry)
+    db.session.commit()
+    flash("What's New item deleted.", "success")
+    return redirect(url_for("main.whats_new_edit"))
 
 @bp.route('/job')
 def job_redirect():
@@ -49,6 +124,12 @@ def job_redirect():
 
 @bp.route('/job/<job_id>')
 def job_status(job_id):
+    # Reject malformed job_ids early so the template never renders a bogus
+    # UUID into the page (defense in depth; Jinja autoescape already covers
+    # the HTML contexts, but this avoids wasted API calls and gives a clean
+    # 400 instead of a status page that 404s on every backend call).
+    if not validate_job_id(job_id):
+        abort(400)
     # Initial status check (optional, could just render template)
     from app.workers.queue import get_job_status
     status_info = get_job_status(job_id)
@@ -91,9 +172,9 @@ def job_viewer(job_id):
             
     return render_template('job_viewer.html', job_id=job_id, job_details=job_details, view_only=view_only)
 
-@bp.route('/health')
-def health():
-    return {"ok": True}
+# /health moved to the monitoring blueprint (app/monitoring/routes.py) where
+# it does an actual DB + filesystem check. Keeping just one /health avoids
+# shadowing it with the trivial {"ok": True} stub that used to live here.
 
 
 @bp.route("/test/phylotree")

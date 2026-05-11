@@ -220,6 +220,52 @@
                 </div>
             </div>
 
+            <!-- Sequence Filters -->
+            <div class="flex flex-col gap-1">
+                <span class="text-xs font-bold uppercase tracking-wide text-gray-600 dark:text-gray-400">Sequence
+                    Filters</span>
+                <div
+                    class="flex flex-wrap items-center gap-3 border border-gray-300 dark:border-journal-dark rounded-lg overflow-hidden bg-white dark:bg-journal-dark px-2 py-1 min-h-[34px]">
+                    <span id="sequence-filter-count"
+                        class="px-2 py-0.5 text-xs font-semibold rounded bg-gray-100 text-gray-700 dark:bg-gray-700/40 dark:text-gray-200 shrink-0">Metrics:
+                        --</span>
+
+                    <div class="flex items-center gap-2" title="Minimum query coverage">
+                        <span class="text-xs font-bold text-blue-700 dark:text-blue-300">Query Coverage</span>
+                        <input type="range" id="slider-query-cover" min="0" max="100" value="100" step="1"
+                            class="w-24 h-2 rounded-lg appearance-none cursor-pointer accent-blue-500" disabled>
+                        <span id="query-cover-value"
+                            class="w-12 text-right text-xs font-mono text-gray-600 dark:text-gray-300">--</span>
+                    </div>
+
+                    <div class="h-4 w-px bg-gray-300 dark:bg-gray-700 mx-0.5"></div>
+
+                    <div class="flex items-center gap-2" title="Minimum subject coverage">
+                        <span class="text-xs font-bold text-green-700 dark:text-green-300">Subject Coverage</span>
+                        <input type="range" id="slider-subject-cover" min="0" max="100" value="100" step="1"
+                            class="w-24 h-2 rounded-lg appearance-none cursor-pointer accent-green-500" disabled>
+                        <span id="subject-cover-value"
+                            class="w-12 text-right text-xs font-mono text-gray-600 dark:text-gray-300">--</span>
+                    </div>
+
+                    <div class="h-4 w-px bg-gray-300 dark:bg-gray-700 mx-0.5"></div>
+
+                    <div class="flex items-center gap-2" title="Minimum identity">
+                        <span class="text-xs font-bold text-purple-700 dark:text-purple-300">Identity %</span>
+                        <input type="range" id="slider-identity" min="0" max="100" value="100" step="1"
+                            class="w-24 h-2 rounded-lg appearance-none cursor-pointer accent-purple-500" disabled>
+                        <span id="identity-value"
+                            class="w-12 text-right text-xs font-mono text-gray-600 dark:text-gray-300">--</span>
+                    </div>
+
+                    <button type="button" id="btn-sequence-filter-reset"
+                        class="px-1.5 py-1 text-xs hover:bg-gray-100 dark:hover:bg-gray-800 rounded text-gray-500 dark:text-gray-300"
+                        title="Reset sequence filters">
+                        <i class="fas fa-undo"></i>
+                    </button>
+                </div>
+            </div>
+
             <!-- Force new row for Selection Sets & Search Branches -->
             <div style="width: 100%; height: 0; flex-basis: 100%;"></div>
 
@@ -347,6 +393,11 @@
                 id="btn-midpoint">
                 <i class="fa fa-balance-scale"></i> Midpoint
             </button>
+            <button type="button"
+                class="px-4 py-2 text-sm font-semibold rounded-lg bg-gray-600 hover:bg-gray-700 text-white transition-colors shadow-sm flex items-center gap-2"
+                id="btn-deselect">
+                <i class="fa fa-mouse-pointer"></i> Deselect
+            </button>
         </div>
     </div>
 
@@ -394,6 +445,48 @@
         <option value="phylotree" selected>Phylotree v2</option>
         <option value="d3">D3 Standard</option>
     </select>
+</div>
+
+<!-- Rename Modal -->
+<div id="modal-rename-sequences" class="fixed inset-0 z-50 hidden" aria-labelledby="rename-modal-title" role="dialog"
+    aria-modal="true">
+    <div class="fixed inset-0 bg-black/50 dark:bg-black/70" id="rename-modal-backdrop"></div>
+    <div class="fixed inset-0 z-10 overflow-y-auto">
+        <div class="flex min-h-full items-center justify-center p-4">
+            <div
+                class="relative w-full max-w-3xl rounded-xl bg-white dark:bg-journal-green shadow-2xl border border-gray-200 dark:border-journal-dark overflow-hidden">
+                <div class="px-5 py-4 border-b border-gray-200 dark:border-journal-dark flex items-center justify-between">
+                    <div>
+                        <h3 id="rename-modal-title" class="text-lg font-bold text-journal-dark dark:text-gray-100">
+                            Rename Sequences
+                        </h3>
+                        <p id="rename-modal-subtitle" class="text-sm text-gray-600 dark:text-gray-300 mt-1"></p>
+                    </div>
+                    <button type="button" id="btn-rename-modal-close"
+                        class="p-2 rounded-lg text-gray-500 hover:text-gray-800 hover:bg-gray-100 dark:text-gray-300 dark:hover:text-white dark:hover:bg-journal-dark"
+                        title="Close">
+                        <i class="fas fa-times"></i>
+                    </button>
+                </div>
+
+                <div class="p-5">
+                    <div id="rename-modal-rows" class="space-y-3 max-h-[50vh] overflow-y-auto pr-1"></div>
+                </div>
+
+                <div
+                    class="px-5 py-4 border-t border-gray-200 dark:border-journal-dark bg-gray-50 dark:bg-journal-dark/50 flex flex-wrap justify-end gap-3">
+                    <button type="button" id="btn-rename-modal-cancel"
+                        class="px-4 py-2 text-sm font-semibold rounded-lg border border-gray-300 dark:border-gray-600 text-gray-700 dark:text-gray-200 hover:bg-gray-100 dark:hover:bg-journal-dark transition-colors">
+                        Cancel
+                    </button>
+                    <button type="button" id="btn-rename-modal-save"
+                        class="px-4 py-2 text-sm font-semibold rounded-lg bg-blue-500 hover:bg-blue-600 text-white transition-colors shadow-sm flex items-center gap-2">
+                        <i class="fas fa-save"></i> Save Names
+                    </button>
+                </div>
+            </div>
+        </div>
+    </div>
 </div>
 
 <!-- Tree Container -->
@@ -498,22 +591,23 @@
     window.JOB_ID = "{{ job_id }}";
     window.TREE_METHOD = "{{ job_details.get('tree_method', '') }}";
     window.VIEW_ONLY = {{ 'true' if view_only else 'false' }};
+    window.SEQUENCE_METRICS = {{ job_details.get('sequence_metadata', [])|tojson }};
 </script>
 
-<script src="https://cdn.jsdelivr.net/npm/d3@7"></script>
+<script src="{{ url_for('static', filename='vendor/d3.v7.min.js') }}"></script>
 <script>
     window.d3v7 = window.d3; // Critical for your v2 renderer
 </script>
 
-<script src="https://cdn.jsdelivr.net/npm/underscore@1.13.6/underscore-min.js"></script>
+<script src="{{ url_for('static', filename='vendor/underscore-1.13.6-min.js') }}"></script>
 
 <script src="{{ url_for('static', filename='js/phylotree.js') }}"></script>
 
-<script src="{{ url_for('static', filename='js/tree_viewer_phylotree_v2.js') }}?v=24"></script>
+<script src="{{ url_for('static', filename='js/tree_viewer_phylotree_v2.js') }}?v=30"></script>
 
 <script src="{{ url_for('static', filename='js/tree_viewer_api.js') }}"></script>
 
-<script src="{{ url_for('static', filename='js/tree_viewer_controller.js') }}"></script>
+<script src="{{ url_for('static', filename='js/tree_viewer_controller.js') }}?v=29"></script>
 
 
 

@@ -9,8 +9,8 @@
     <meta name="description" content="{% block description %}Dikarya - Mycological Research Tools{% endblock %}">
     {% include "partials/favicon_links.html" %}
 
-    <!-- Tailwind CSS via CDN with custom config -->
-    <script src="https://cdn.tailwindcss.com"></script>
+    <!-- Tailwind CSS (vendored from cdn.tailwindcss.com 2026-05-11; SHA-256 in static/vendor/VENDORED_HASHES.txt) -->
+    <script src="{{ url_for('static', filename='vendor/tailwind.js') }}"></script>
     <script>
         tailwind.config = {
             darkMode: 'class',
@@ -28,13 +28,11 @@
         }
     </script>
 
-    <!-- Font Awesome for icons -->
-    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+    <!-- Font Awesome (vendored from cdnjs 6.4.0; SHA-256 in static/vendor/VENDORED_HASHES.txt) -->
+    <link rel="stylesheet" href="{{ url_for('static', filename='vendor/fontawesome.min.css') }}">
 
-    <!-- Google Fonts -->
-    <link rel="preconnect" href="https://fonts.googleapis.com">
-    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+    <!-- Inter font (vendored from fonts.gstatic.com; SHA-256 in static/vendor/VENDORED_HASHES.txt) -->
+    <link rel="stylesheet" href="{{ url_for('static', filename='vendor/inter.css') }}">
 
     <style>
         body {
@@ -85,6 +83,9 @@
                         <i class="fas fa-tree mr-1"></i> Tree Builder
                     </a>
                     {% if current_user.is_authenticated %}
+                    <span class="text-xs text-gray-400 italic" title="You are signed in">
+                        <i class="fas fa-user-check mr-1"></i>{{ current_user.email }}
+                    </span>
                     <a href="{{ url_for('user.user_jobs') }}"
                         class="text-gray-300 hover:text-journal-gold transition-colors text-sm font-medium {% block nav_my_jobs %}{% endblock %}">
                         <i class="fas fa-tasks mr-1"></i> My Jobs
@@ -94,6 +95,9 @@
                         <i class="fas fa-sign-out-alt mr-1"></i> Logout
                     </a>
                     {% else %}
+                    <span class="text-xs text-gray-400 italic" title="Not signed in — anyone with a job link can edit that job. Log in for exclusive edit access.">
+                        <i class="fas fa-user-secret mr-1"></i>Anonymous
+                    </span>
                     <a href="{{ url_for('auth.login') }}"
                         class="text-gray-300 hover:text-journal-gold transition-colors text-sm font-medium">
                         <i class="fas fa-sign-in-alt mr-1"></i> Login
@@ -145,6 +149,9 @@
                     <i class="fas fa-tree mr-2 w-5"></i> Tree Builder
                 </a>
                 {% if current_user.is_authenticated %}
+                <div class="text-xs text-gray-400 italic py-2 border-t border-journal-dark">
+                    <i class="fas fa-user-check mr-2 w-5"></i>Signed in as {{ current_user.email }}
+                </div>
                 <a href="{{ url_for('user.user_jobs') }}"
                     class="block text-gray-200 hover:text-journal-gold transition-colors font-medium py-2">
                     <i class="fas fa-tasks mr-2 w-5"></i> My Jobs
@@ -156,6 +163,9 @@
                     </a>
                 </div>
                 {% else %}
+                <div class="text-xs text-gray-400 italic py-2 border-t border-journal-dark">
+                    <i class="fas fa-user-secret mr-2 w-5"></i>Anonymous &mdash; anyone with a job link can edit it
+                </div>
                 <div class="border-t border-journal-dark pt-3 mt-3">
                     <a href="{{ url_for('auth.login') }}"
                         class="block text-gray-200 hover:text-journal-gold transition-colors font-medium py-2">

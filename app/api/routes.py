@@ -1,7 +1,7 @@
 from flask import jsonify, request, send_file, url_for
 from flask_login import current_user
 from app.api import bp
-from app.workers.queue import enqueue_job, get_job_status
+from app.workers.queue import enqueue_job, enqueue_recompute_job, get_job_status
 from app.config import Config
 from app.extensions import db
 from app.models import Job
@@ -9,10 +9,37 @@ import logging
 import re
 from datetime import datetime
 
-from app.services.security_utils import validate_job_id, validate_blast_query, validate_safe_file_path
+from app.services.security_utils import validate_job_id, validate_safe_file_path
 from app.services.access_control import check_job_access
+from app.extensions import limiter
 
 logger = logging.getLogger(__name__)
+
+
+def _server_error(exc, *, where=""):
+    """Return a generic 500 JSON response without leaking internals.
+
+    The full exception (including traceback) is logged server-side under a
+    short request_id, which is echoed back to the client so support requests
+    can be correlated to the log without exposing file paths, library
+    versions, or message text from the underlying error.
+    """
+    import uuid as _uuid
+    import traceback as _tb
+    request_id = _uuid.uuid4().hex[:12]
+    logger.error(
+        "[%s] %s%s: %s\n%s",
+        request_id,
+        where + " " if where else "",
+        type(exc).__name__,
+        exc,
+        _tb.format_exc(),
+    )
+    return jsonify({
+        "status": "error",
+        "error": "Internal server error",
+        "request_id": request_id,
+    }), 500
 
 
 # =============================================================================
@@ -28,6 +55,54 @@ def _is_genbank_accession(text):
 
 MAX_CUSTOM_GENBANK_ACCESSIONS = 200
 MAX_CUSTOM_GENBANK_SEQUENCE_BP = 5000
+MAX_SEQUENCE_METADATA_ITEMS = 5000
+
+
+def _optional_float(value):
+    """Return a finite float for JSON numeric fields, or None for empty/invalid values."""
+    if value is None or value == "":
+        return None
+    try:
+        result = float(value)
+    except (TypeError, ValueError):
+        return None
+    if result != result or result in (float("inf"), float("-inf")):
+        return None
+    return result
+
+
+def _normalize_sequence_metadata(raw_items):
+    """Keep only bounded, frontend-facing per-sequence metric metadata."""
+    if not isinstance(raw_items, list):
+        return []
+
+    normalized = []
+    for raw in raw_items[:MAX_SEQUENCE_METADATA_ITEMS]:
+        if not isinstance(raw, dict):
+            continue
+
+        name = str(raw.get("name") or "")[:500]
+        fasta_header = str(raw.get("fasta_header") or name)[:500]
+        if not name and not fasta_header:
+            continue
+
+        row = {
+            "name": name,
+            "fasta_header": fasta_header,
+            "organism": str(raw.get("organism") or "")[:300],
+            "source": str(raw.get("source") or "")[:50],
+            "hit_source": str(raw.get("hit_source") or "")[:50],
+            "identity": _optional_float(raw.get("identity")),
+            "query_cover": _optional_float(raw.get("query_cover")),
+            "subject_cover": _optional_float(raw.get("subject_cover")),
+        }
+        row["blast_metrics_available"] = bool(raw.get("blast_metrics_available")) or any(
+            row[field] is not None
+            for field in ("identity", "query_cover", "subject_cover")
+        )
+        normalized.append(row)
+
+    return normalized
 
 
 def _parse_genbank_accession_tokens(value):
@@ -127,6 +202,35 @@ def _parse_fasta_sequences(text):
     return sequences
 
 
+def _sequence_exact_key(seq):
+    header = (seq.get('name') or '').strip()
+    sequence = ''.join(str(seq.get('sequence') or '').split())
+    return header, sequence
+
+
+def _format_fasta_record_for_job(seq, used_ids, fallback_index):
+    # Sanitize header: remove control chars including \0
+    raw_header = seq.get('name', '')
+    sanitized_header = "".join(ch for ch in raw_header if ord(ch) >= 32 or ch == '\t')
+
+    # Split header to dedupe by ID properly
+    seq_id, rest = _split_fasta_header(sanitized_header)
+
+    # Cap header lengths to prevent abuse (e.g., 200KB pasted headers)
+    MAX_SEQ_ID_LEN = 100
+    MAX_DESC_LEN = 300
+    seq_id = seq_id[:MAX_SEQ_ID_LEN]
+    rest = rest[:MAX_DESC_LEN]
+
+    if not seq_id:
+        seq_id = f"Sequence_{fallback_index}"
+
+    new_id = _make_unique_id(seq_id, used_ids)
+    new_header = f"{new_id} {rest}".strip()
+    sequence = ''.join(str(seq.get('sequence') or '').split())
+    return f">{new_header}\n{sequence}\n"
+
+
 def _fetch_genbank_sequences_for_queue(accessions, max_sequence_bp=MAX_CUSTOM_GENBANK_SEQUENCE_BP):
     """Fetch GenBank accessions and shape them for frontend queue entries."""
     from app.services.blast_service import fetch_fasta_for_accessions
@@ -190,6 +294,7 @@ def _fetch_genbank_sequences_for_queue(accessions, max_sequence_bp=MAX_CUSTOM_GE
 
 
 @bp.route('/blast', methods=['POST'])
+@limiter.limit("10 per minute; 200 per hour")
 def run_blast():
     """
     Run BLAST on a single sequence or accession.
@@ -202,18 +307,24 @@ def run_blast():
     
     if not query:
         return jsonify({"status": "error", "error": "No query provided"}), 400
-    
-    is_valid_query, error_msg = validate_blast_query(query)
-    if not is_valid_query:
-        return jsonify({"status": "error", "error": f"Invalid query: {error_msg}"}), 400
-    
+
     try:
         from app.services.blast_service import blast_from_sequence, blast_from_accessions
         from pathlib import Path
 
-        # Extract parameters
-        min_identity = float(data.get('min_identity', 90.0))
-        max_sequences = int(data.get('max_sequences', 50))
+        # Extract + clamp parameters. Bad/missing values fall back to the
+        # defaults; out-of-range values are pulled into the safe band.
+        try:
+            min_identity = float(data.get('min_identity', 90.0))
+        except (TypeError, ValueError):
+            min_identity = 90.0
+        min_identity = max(50.0, min(100.0, min_identity))
+
+        try:
+            max_sequences = int(data.get('max_sequences', 50))
+        except (TypeError, ValueError):
+            max_sequences = 50
+        max_sequences = max(1, min(500, max_sequences))
         
         # Determine if query is an accession or a sequence
         if _is_genbank_accession(query):
@@ -254,10 +365,11 @@ def run_blast():
         
     except Exception as e:
         logger.error(f"BLAST API error: {e}", exc_info=True)
-        return jsonify({"status": "error", "error": str(e)}), 500
+        return _server_error(e)
 
 
 @bp.route('/genbank/accessions', methods=['POST'])
+@limiter.limit("10 per minute; 200 per hour")
 def fetch_genbank_accessions():
     """
     Fetch one or more GenBank accessions for direct queue insertion.
@@ -320,10 +432,11 @@ def fetch_genbank_accessions():
         })
     except Exception as e:
         logger.error(f"GenBank accession API error: {e}", exc_info=True)
-        return jsonify({"status": "error", "error": str(e)}), 500
+        return _server_error(e)
 
 
 @bp.route('/mycomap', methods=['POST'])
+@limiter.limit("10 per minute; 200 per hour")
 def fetch_mycomap():
     """
     Fetch sequences from a Mycomap BLAST results URL.
@@ -488,10 +601,11 @@ def fetch_mycomap():
         
     except Exception as e:
         logger.error(f"Mycomap API error: {e}", exc_info=True)
-        return jsonify({"status": "error", "error": str(e)}), 500
+        return _server_error(e)
 
 
 @bp.route('/inaturalist', methods=['POST'])
+@limiter.limit("10 per minute; 200 per hour")
 def fetch_inaturalist():
     """
     Fetch DNA sequences from iNaturalist observations.
@@ -604,12 +718,13 @@ def fetch_inaturalist():
         return jsonify({"status": "error", "error": str(e)}), 400
     except Exception as e:
         logger.error(f"iNaturalist API error: {e}", exc_info=True)
-        return jsonify({"status": "error", "error": str(e)}), 500
+        return _server_error(e)
 
 
 
 
 @bp.route('/job', methods=['POST'])
+@limiter.limit("20 per hour; 100 per day")
 def create_job():
     data = request.get_json() or {}
     
@@ -621,6 +736,7 @@ def create_job():
         "input_type": data.get("input_type", "unknown"),
         "notes": data.get("notes", ""),
         "sequence": data.get("sequence", ""),
+        "sequence_metadata": _normalize_sequence_metadata(data.get("sequence_metadata", [])),
         "accessions": data.get("accessions", []),
         "alignment_method": data.get("alignment_method", "default"),
         "trimming_method": data.get("trimming_method", "none"),
@@ -671,7 +787,25 @@ def create_job():
         except Exception as e:
             logger.error(f"Validation error: {e}")
             # Continue but verify in worker
-            
+
+    # Clamp generic numeric tree params for all methods (iqtree/mrbayes/etc.)
+    # so a malicious or careless caller can't pin a worker forever with e.g.
+    # mcmc_generations=999_999_999_999. Limits are intentionally generous --
+    # larger than any legitimate run we expect.
+    def _clamp_int(value, default, lo, hi):
+        try:
+            n = int(value)
+        except (TypeError, ValueError):
+            return default
+        return max(lo, min(hi, n))
+
+    job_params["bootstrap"] = _clamp_int(job_params.get("bootstrap"), 1000, 0, 10_000)
+    job_params["mcmc_generations"] = _clamp_int(
+        job_params.get("mcmc_generations"), 50_000, 1_000, 100_000_000
+    )
+    job_params["mcmc_nruns"] = _clamp_int(job_params.get("mcmc_nruns"), 2, 1, 8)
+    job_params["mcmc_nchains"] = _clamp_int(job_params.get("mcmc_nchains"), 4, 1, 16)
+
     try:
         job_id = enqueue_job(job_params)
         
@@ -699,85 +833,7 @@ def create_job():
         
         return jsonify({"status": "queued", "job_id": job_id}), 202
     except Exception as e:
-        return jsonify({"status": "error", "message": str(e)}), 500
-
-@bp.route('/job/<job_id>/make_editable_copy', methods=['POST'])
-def make_editable_copy(job_id):
-    """
-    Create a new owned job from an existing job's input.
-    """
-    # 1. Check view access to source (anyone can copy if they can view)
-    db_job, error_msg, status_code = check_job_access(job_id, mode="view")
-    if error_msg:
-        return jsonify({"status": "error", "error": error_msg}), status_code
-        
-    # 2. (Authentication Removed) - Anonymous copies allowed
-    # if not current_user.is_authenticated:
-    #     return jsonify({"status": "error", "error": "Login required to create a copy."}), 401
-    
-    job_dir = Config.JOB_DIR / job_id
-    
-    # 3. Locate source FASTA
-    # Try raw input first
-    source_fasta = job_dir / "input" / "input_raw.fasta"
-    if not source_fasta.exists():
-        # Fallback? Maybe aligned?
-        # Let's try grabbing from sequences (unlikely to be reconstituted easily if just alignment exists)
-        return jsonify({"status": "error", "error": "Source FASTA (input_raw.fasta) not found."}), 404
-    
-    try:
-        fasta_content = source_fasta.read_text()
-        
-        # 4. Create new job params (Rapid defaults)
-        # Replicating "Quick Tree" defaults: MAFFT + FastTree + GTR+G
-        job_params = {
-            "input_type": "fasta",
-            "notes": f"Copy of Job {job_id}",
-            "sequence": fasta_content,
-            "accessions": [],
-            "alignment_method": "mafft",
-            "trimming_method": "none",
-            "alignment_options": {},
-            "tree_method": "fasttree",
-            "tree_model": "GTR+G",
-            "bootstrap": 1000,
-            "mcmc_generations": 50000
-        }
-        
-        # 5. Enqueue
-        new_job_id = enqueue_job(job_params)
-        
-        # 6. Create DB Record
-        new_job = Job(
-            id=new_job_id,
-            status="queued",
-            job_dir=str(Config.JOB_DIR / new_job_id),
-            input_type="fasta",
-            # user_id assigned below
-            metrics={
-                "tree_method": job_params["tree_method"],
-                "notes": job_params["notes"],
-                "alignment_method": job_params["alignment_method"],
-                "trimming_method": job_params["trimming_method"],
-                "copied_from": job_id
-            }
-        )
-        
-        if current_user.is_authenticated:
-            new_job.user_id = current_user.id
-        
-        db.session.add(new_job)
-        db.session.commit()
-        
-        return jsonify({
-            "status": "success", 
-            "new_job_id": new_job_id, 
-            "redirect_url": url_for('main.job_status', job_id=new_job_id)
-        })
-        
-    except Exception as e:
-        logger.error(f"Copy job failed: {e}", exc_info=True)
-        return jsonify({"status": "error", "error": str(e)}), 500
+        return _server_error(e)
 
 @bp.route('/job/<job_id>/status', methods=['GET'])
 def get_job_status_route(job_id):
@@ -805,7 +861,7 @@ def get_tree_state(job_id):
         state = load_tree_state(job_dir)
         return jsonify(state)
     except Exception as e:
-        return jsonify({"status": "error", "error": str(e)}), 500
+        return _server_error(e)
 
 @bp.route('/job/<job_id>/tree/prune', methods=['POST'])
 def prune_tree(job_id):
@@ -832,7 +888,7 @@ def prune_tree(job_id):
         save_tree_state(job_dir, state)
         return jsonify(state)
     except Exception as e:
-        return jsonify({"status": "error", "error": str(e)}), 500
+        return _server_error(e)
 
 @bp.route('/job/<job_id>/tree/rename', methods=['POST'])
 def rename_tree_tip(job_id):
@@ -853,7 +909,7 @@ def rename_tree_tip(job_id):
         save_tree_state(job_dir, state)
         return jsonify(state)
     except Exception as e:
-        return jsonify({"status": "error", "error": str(e)}), 500
+        return _server_error(e)
 
 @bp.route('/job/<job_id>/tree/reroot', methods=['POST'])
 def reroot_tree_endpoint(job_id):
@@ -878,7 +934,7 @@ def reroot_tree_endpoint(job_id):
     except ValueError as e:
         return jsonify({"status": "error", "error": str(e)}), 400
     except Exception as e:
-        return jsonify({"status": "error", "error": str(e)}), 500
+        return _server_error(e)
 
 @bp.route('/job/<job_id>/tree/midpoint_root', methods=['POST'])
 def midpoint_root_endpoint(job_id):
@@ -897,7 +953,7 @@ def midpoint_root_endpoint(job_id):
     except ValueError as e:
         return jsonify({"status": "error", "error": str(e)}), 400
     except Exception as e:
-        return jsonify({"status": "error", "error": str(e)}), 500
+        return _server_error(e)
 
 @bp.route('/job/<job_id>/tree/midpoint_root_toggle', methods=['POST'])
 def midpoint_root_toggle_endpoint(job_id):
@@ -927,14 +983,14 @@ def midpoint_root_toggle_endpoint(job_id):
     except ValueError as e:
         return jsonify({"status": "error", "error": str(e)}), 400
     except Exception as e:
-        return jsonify({"status": "error", "error": str(e)}), 500
+        return _server_error(e)
 
 @bp.route('/job/<job_id>/tree/selection_sets', methods=['POST'])
 def save_selection_sets(job_id):
     if not validate_job_id(job_id):
         return jsonify({"status": "error", "error": "Invalid job ID format"}), 400
 
-    _, error_msg, status_code = check_job_access(job_id)
+    _, error_msg, status_code = check_job_access(job_id, mode="edit")
     if error_msg:
         return jsonify({"status": "error", "error": error_msg}), status_code
 
@@ -956,11 +1012,12 @@ def save_selection_sets(job_id):
         save_tree_state(job_dir, state)
         return jsonify({"status": "ok"})
     except Exception as e:
-        return jsonify({"status": "error", "error": str(e)}), 500
+        return _server_error(e)
 
 @bp.route('/job/<job_id>/tree/recompute', methods=['POST'])
+@limiter.limit("1 per minute")
 def recompute_tree_job(job_id):
-    _, error_msg, status_code = check_job_access(job_id, mode="edit")
+    db_job, error_msg, status_code = check_job_access(job_id, mode="edit")
     if error_msg:
         return jsonify({"status": "error", "error": error_msg}), status_code
 
@@ -968,8 +1025,7 @@ def recompute_tree_job(job_id):
         
     try:
         import json
-        from app.models import JobParams, AlignmentParams, TrimmingParams, TreeBuilderParams
-        from app.services.tree_edit_service import recompute_tree
+        from app.services.tree_edit_service import build_recompute_job_params, recompute_tree
         
         # Load original params
         input_info_path = job_dir / "input_info.json"
@@ -981,54 +1037,36 @@ def recompute_tree_job(job_id):
         # Merge with request data
         req_data = request.get_json(silent=True) or {}
         params_dict.update(req_data)
-        
-        # Construct JobParams object
-        align_params = AlignmentParams(
-            method=params_dict.get("alignment_method", "default"),
-            advanced_options=params_dict.get("alignment_options", {})
+
+        if req_data.get("async"):
+            recompute_job_id = enqueue_recompute_job(job_id, params_dict)
+            if db_job:
+                metrics = db_job.metrics or {}
+                metrics["recompute_requested_at"] = datetime.utcnow().isoformat()
+                db_job.metrics = metrics
+                db_job.status = "queued"
+                db.session.commit()
+            return jsonify({
+                "status": "queued",
+                "job_id": job_id,
+                "rq_job_id": recompute_job_id,
+                "redirect_url": url_for('main.job_status', job_id=job_id)
+            }), 202
+
+        job_params = build_recompute_job_params(params_dict)
+        result = recompute_tree(
+            job_dir,
+            job_params,
+            Config,
+            logger,
+            use_current_input=bool(params_dict.get("use_current_input"))
         )
-        
-        trim_params = TrimmingParams(
-            method=params_dict.get("trimming_method", "none")
-        )
-        
-        tree_params = TreeBuilderParams(
-            method=params_dict.get("tree_method", "nj"),
-            model=params_dict.get("tree_model", "GTR+G"),
-            bootstrap=int(params_dict.get("bootstrap", 100)),
-            mcmc_generations=int(params_dict.get("mcmc_generations", 50000)),
-            mcmc_nruns=int(params_dict.get("mcmc_nruns", 2)),
-            mcmc_nchains=int(params_dict.get("mcmc_nchains", 4)),
-            # RAxML Params
-            run_preset=params_dict.get("run_preset", "fast_good"),
-            bootstrap_preset=params_dict.get("bootstrap_preset", "standard"),
-            bootstrap_cap=params_dict.get("bootstrap_cap"),
-            enable_bootstrap=params_dict.get("enable_bootstrap", True),
-            start_tree_override=params_dict.get("start_tree_override"),
-            moose_enabled=params_dict.get("moose_enabled", False),
-            early_stopping=params_dict.get("early_stopping", False),
-            seed=params_dict.get("seed"),
-            outgroup=params_dict.get("outgroup")
-        )
-        
-        job_params = JobParams(
-            input_type="recompute",
-            notes=params_dict.get("notes", ""),
-            sequence=params_dict.get("sequence", ""),
-            accessions=params_dict.get("accessions", []),
-            alignment_params=align_params,
-            trimming_params=trim_params,
-            tree_builder_params=tree_params,
-            allow_recompute=True
-        )
-        
-        result = recompute_tree(job_dir, job_params, Config, logger)
         return jsonify(result)
         
     except Exception as e:
         import traceback
         logger.error(f"Recompute error: {e}\n{traceback.format_exc()}")
-        return jsonify({"status": "error", "error": str(e)}), 500
+        return _server_error(e)
 
 @bp.route('/job/<job_id>/download/tree/newick', methods=['GET'])
 def download_newick(job_id):
@@ -1135,6 +1173,20 @@ def download_fasta_pruned(job_id):
     
     job_dir = Config.JOB_DIR / job_id
     path = job_dir / "alignment" / "alignment_pruned.fasta"
+    try:
+        from app.services.tree_edit_service import load_tree_state, extract_pruned_fasta
+        state = load_tree_state(job_dir)
+        input_path = job_dir / "input" / "input_raw.fasta"
+        if state.get("pruned_taxa") and validate_safe_file_path(input_path, job_dir):
+            if path.parent.exists() and (path.parent.is_symlink() or not path.parent.is_dir()):
+                raise RuntimeError("Pruned FASTA directory is unsafe")
+            if path.exists() and (path.is_symlink() or not path.is_file()):
+                raise RuntimeError("Pruned FASTA path is unsafe")
+            path.parent.mkdir(parents=True, exist_ok=True)
+            extract_pruned_fasta(input_path, state, path)
+    except Exception as e:
+        logger.warning(f"Failed to refresh pruned FASTA for job {job_id}: {e}")
+
     if not validate_safe_file_path(path, job_dir):
         return jsonify({"status": "error", "error": "Pruned FASTA not found or invalid"}), 404
         
@@ -1481,6 +1533,7 @@ def download_log(job_id, log_name):
     )
 
 @bp.route('/log/client', methods=['POST'])
+@limiter.limit("30 per minute; 500 per day")
 def log_client_error():
     """
     Log client-side errors to the server log.
@@ -1523,11 +1576,11 @@ def add_sequences_to_job(job_id):
     """
     Add sequences to an existing job's input file.
     
-    Request: { "input": "<fasta or accession list>" }
+    Request: { "input": "<fasta or accession list>", "replace": false }
     Response: { "status": "success", "count": int, "message": "..." }
     """
     # Check authorization
-    _, error_msg, status_code = check_job_access(job_id)
+    _, error_msg, status_code = check_job_access(job_id, mode="edit")
     if error_msg:
         return jsonify({"status": "error", "error": error_msg}), status_code
     
@@ -1537,6 +1590,7 @@ def add_sequences_to_job(job_id):
         
     data = request.get_json(silent=True) or {}
     input_text = data.get("input", "").strip()
+    replace_existing = bool(data.get("replace"))
     
     if not input_text:
         return jsonify({"status": "error", "error": "No input provided"}), 400
@@ -1601,11 +1655,41 @@ def add_sequences_to_job(job_id):
         if total_bp > MAX_TOTAL_BP_TO_ADD:
              return jsonify({"status": "error", "error": f"Total sequence length too large (max {MAX_TOTAL_BP_TO_ADD} bp)"}), 400
              
-        # Append to input_raw.fasta
+        # Append to input_raw.fasta, or replace it when the queue is the desired final set.
         input_path = job_dir / "input" / "input_raw.fasta"
+        input_path.parent.mkdir(parents=True, exist_ok=True)
+
+        if replace_existing:
+            used_ids = set()
+            seen_records = set()
+            added_count = 0
+            output_records = []
+
+            for seq in sequences_to_add:
+                exact_key = _sequence_exact_key(seq)
+                if exact_key in seen_records:
+                    continue
+                seen_records.add(exact_key)
+                output_records.append(_format_fasta_record_for_job(seq, used_ids, added_count + 1))
+                added_count += 1
+
+            input_path.write_text("\n".join(record.rstrip() for record in output_records) + "\n")
+
+            message = f"Saved {added_count} queued sequence{'s' if added_count != 1 else ''}."
+            if skipped:
+                message += f" {len(skipped)} accession{'s' if len(skipped) != 1 else ''} skipped."
+
+            return jsonify({
+                "status": "success",
+                "count": added_count,
+                "skipped": skipped,
+                "mode": "replace",
+                "message": message
+            })
         
         # Read existing IDs to check for duplicates
         existing_ids = set()
+        existing_records = set()
         if input_path.exists():
             try:
                 existing_seqs = _parse_fasta_sequences(input_path.read_text())
@@ -1613,6 +1697,7 @@ def add_sequences_to_job(job_id):
                     sid, _ = _split_fasta_header(s['name'])
                     if sid:
                         existing_ids.add(sid)
+                    existing_records.add(_sequence_exact_key(s))
             except Exception as e:
                 logger.warning(f"Failed to parse existing FASTA for deduplication: {e}")
                 pass # Continue anyway - will allow duplicates but won't crash
@@ -1624,31 +1709,11 @@ def add_sequences_to_job(job_id):
                 f.write("\n")
                  
             for seq in sequences_to_add:
-                # Sanitize header: remove control chars including \0
-                raw_header = seq.get('name', '')
-                # Keep only printable chars and tab
-                sanitized_header = "".join(ch for ch in raw_header if ord(ch) >= 32 or ch == '\t')
-                
-                # Split header to dedupe by ID properly
-                seq_id, rest = _split_fasta_header(sanitized_header)
-                
-                # Cap header lengths to prevent abuse (e.g., 200KB pasted headers)
-                MAX_SEQ_ID_LEN = 100
-                MAX_DESC_LEN = 300
-                seq_id = seq_id[:MAX_SEQ_ID_LEN]
-                rest = rest[:MAX_DESC_LEN]
-                
-                if not seq_id:
-                    # Generate a unique ID if header is missing
-                    seq_id = f"Sequence_{added_count + 1}"
-                    
-                # Make unique ID
-                new_id = _make_unique_id(seq_id, existing_ids)
-                
-                # Reconstruct header
-                new_header = f"{new_id} {rest}".strip()
-                
-                f.write(f">{new_header}\n{seq['sequence']}\n")
+                exact_key = _sequence_exact_key(seq)
+                if exact_key in existing_records:
+                    continue
+                f.write(_format_fasta_record_for_job(seq, existing_ids, added_count + 1))
+                existing_records.add(exact_key)
                 added_count += 1
                     
         message = f"Added {added_count} sequences."
@@ -1664,4 +1729,4 @@ def add_sequences_to_job(job_id):
         
     except Exception as e:
         logger.error(f"Failed to add sequences: {e}", exc_info=True)
-        return jsonify({"status": "error", "error": str(e)}), 500
+        return _server_error(e)

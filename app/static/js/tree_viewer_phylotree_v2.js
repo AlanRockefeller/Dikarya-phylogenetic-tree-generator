@@ -54,6 +54,9 @@
          */
         clearActiveSelection() { }
 
+        // Alan 5/11/26 - Clear visible active selections without mutating saved selection sets.
+        deselectCurrentSelection() { return 0; }
+
         /**
          * Perform a bulk selection action.
          * @param {string} action - One of: 'all', 'none', 'inverse', 'all-leaves', 'all-internal', 'select-filtered'
@@ -138,6 +141,15 @@
          */
         getStats() { return { supportType: 'none', maxSupport: 0 }; }
 
+        // Alan 5/9/26 - Add a public metric-filter stats hook so the controller can size sequence filter sliders from the loaded tree.
+        getSequenceFilterStats() { return { totalTips: 0, visibleTips: 0, hiddenTips: 0, metricTips: 0, metricsAvailable: false }; }
+
+        // Alan 5/9/26 - Add a public metric-filter setter so toolbar sliders can hide tips without mutating the saved tree.
+        setSequenceFilterOptions(newOpts) { return this.getSequenceFilterStats(); }
+
+        // Alan 5/9/26 - Add a public reset hook for restoring all metric-filtered tips in the viewer.
+        resetSequenceFilters() { return this.getSequenceFilterStats(); }
+
         /**
          * Fit the tree to the viewport.
          */
@@ -199,11 +211,21 @@
                 ppThreshold: 0.9,
                 bootstrapThreshold: 70,
                 minTips: 0,
+                // Alan 5/9/26 - Track view-only MycoMap metric filters separately from destructive prune actions.
+                queryCoverThreshold: 0,
+                // Alan 5/9/26 - Track view-only MycoMap subject coverage filters separately from destructive prune actions.
+                subjectCoverThreshold: 0,
+                // Alan 5/9/26 - Track view-only MycoMap identity filters separately from destructive prune actions.
+                identityThreshold: 0,
+                // Alan 5/9/26 - Store per-sequence BLAST metrics passed from the job metadata.
+                sequenceMetrics: [],
                 supportBasePx: 9,
                 tipBasePx: 12,
                 layout: 'linear',
                 alignTips: false
             }, initialOptions);
+            // Alan 5/9/26 - Build a lookup once so tree tips can be matched to stored BLAST metrics quickly.
+            this.sequenceMetricMap = this._buildSequenceMetricMap(this.options.sequenceMetrics);
 
             this.tree = null;
             this.newick = null;
@@ -213,6 +235,8 @@
             // selectionSets is the primary data structure: { 'Default': Set(), 'Edible': Set(), ... }
             this.selectionSets = { 'Default': new Set() };
             this.activeSelectionSet = 'Default';
+            // Alan 5/11/26 - Track locally hidden active selections so Deselect leaves selection sets unchanged.
+            this.hiddenSelectionIds = new Set();
             // Color palette from d3.schemeCategory10 for selection sets
             this._selectionColors = [
                 '#1f77b4', '#ff7f0e', '#2ca02c', '#d62728', '#9467bd',
@@ -278,6 +302,9 @@
             this.lastStats = this._computeSupportStats();
             if (this.container) this.container.__treeStats = this.lastStats;
 
+            // Alan 5/9/26 - Apply any existing sequence metric filter state before the first draw.
+            this._applySequenceFilters({ updateDisplay: false });
+
             // 4. DRAW
             this._draw();
         }
@@ -324,6 +351,8 @@
             } else {
                 roots.forEach(r => compute(r));
             }
+            // Alan 5/9/26 - Attach stored BLAST metrics to leaf nodes after names are available.
+            this._attachSequenceMetricsToLeaves();
         }
 
         _draw() {
@@ -532,6 +561,8 @@
 
                 // Incremental update if possible
                 if (this.tree.display && typeof this.tree.display.update === 'function') {
+                    // Alan 5/9/26 - Reapply sequence metric filters after ladderizing so hidden tips stay hidden.
+                    this._applySequenceFilters({ updateDisplay: false });
                     this.tree.display.update();
                     this._addSupportLabels(); // Re-position labels
                 } else {
@@ -546,6 +577,32 @@
             // Ideally: manipulate zoom transform.
             // Phylotree v2 usually resets zoom on redraw.
             this._draw();
+        }
+
+        // Alan 5/11/26 - Apply persisted tip renames after loading Newick while preserving original IDs for edit actions.
+        applyRenames(renames = {}) {
+            if (!this.tree || !renames || typeof renames !== 'object') return;
+            let changed = false;
+            this.tree.traverse_and_compute(node => {
+                const data = node.data || node;
+                const originalName = data.__original_name || node.__original_name || data.name || node.name;
+                if (!originalName) return;
+                if (!data.__original_name) data.__original_name = originalName;
+                if (!node.__original_name) node.__original_name = originalName;
+                if (Object.prototype.hasOwnProperty.call(renames, originalName)) {
+                    const displayName = renames[originalName];
+                    if (data.name !== displayName) {
+                        data.name = displayName;
+                        if (node.name !== undefined) node.name = displayName;
+                        changed = true;
+                    }
+                }
+            });
+            if (changed) {
+                this._cacheNodes();
+                this._applySequenceFilters({ updateDisplay: false });
+                this._draw();
+            }
         }
 
         toggleSupport(show) {
@@ -587,6 +644,32 @@
             return this.lastStats;
         }
 
+        // Alan 5/9/26 - Let the controller update sequence metric filters from live slider input.
+        setSequenceFilterOptions(newOpts = {}) {
+            ['queryCoverThreshold', 'subjectCoverThreshold', 'identityThreshold'].forEach(key => {
+                if (Object.prototype.hasOwnProperty.call(newOpts, key)) {
+                    const nextValue = Number(newOpts[key]);
+                    this.options[key] = Number.isFinite(nextValue)
+                        ? Math.max(0, Math.min(100, nextValue))
+                        : 0;
+                }
+            });
+            return this._applySequenceFilters({ updateDisplay: true });
+        }
+
+        // Alan 5/9/26 - Restore all tips by clearing view-only sequence metric filters.
+        resetSequenceFilters() {
+            this.options.queryCoverThreshold = 0;
+            this.options.subjectCoverThreshold = 0;
+            this.options.identityThreshold = 0;
+            return this._applySequenceFilters({ updateDisplay: true });
+        }
+
+        // Alan 5/9/26 - Expose current sequence metric filter values and counts for slider labels.
+        getSequenceFilterStats() {
+            return this._getSequenceFilterStats();
+        }
+
         /**
          * Export the current tree as a Newick string with selected nodes annotated.
          * Selected nodes receive a {Selected} tag comment.
@@ -597,7 +680,8 @@
             return this.tree.getNewick((node) => {
                 // The callback determines what annotation gets appended to the node name
                 const id = this._getNodeId(node);
-                if (id && this.selectedIds.has(id)) {
+                // Alan 5/11/26 - Export only visible active selections after local Deselect has been used.
+                if (id && this._isVisibleSelection(id)) {
                     // Appends {Selected} to the node, recognized as a comment/tag by most tree viewers
                     return "{Selected}";
                 }
@@ -847,26 +931,237 @@
 
         // --- INTERNAL HELPERS ---
 
+        // Alan 5/9/26 - Normalize names from FASTA headers and Newick tips for metric lookups.
+        _normalizeMetricKey(value) {
+            return String(value || '')
+                .replace(/^>/, '')
+                .trim()
+                .replace(/\s+/g, ' ')
+                .toLowerCase();
+        }
+
+        // Alan 5/9/26 - Generate forgiving lookup keys for full labels and accession-like first tokens.
+        _metricKeysForName(value) {
+            const full = this._normalizeMetricKey(value);
+            if (!full) return [];
+            const firstToken = full.split(' ')[0] || '';
+            const accessionRoot = firstToken.split('.')[0] || '';
+            return Array.from(new Set([full, firstToken, accessionRoot].filter(Boolean)));
+        }
+
+        // Alan 5/9/26 - Parse optional metric numbers from stored job metadata.
+        _metricNumber(value) {
+            if (value === null || value === undefined || value === '') return null;
+            const num = Number(value);
+            return Number.isFinite(num) ? num : null;
+        }
+
+        // Alan 5/9/26 - Build a name-keyed lookup from saved sequence metadata for fast tip matching.
+        _buildSequenceMetricMap(records) {
+            const map = new Map();
+            if (!Array.isArray(records)) return map;
+            for (const record of records) {
+                if (!record || typeof record !== 'object') continue;
+                const metric = {
+                    query_cover: this._metricNumber(record.query_cover),
+                    subject_cover: this._metricNumber(record.subject_cover),
+                    identity: this._metricNumber(record.identity),
+                    blast_metrics_available: Boolean(record.blast_metrics_available)
+                };
+                metric.blast_metrics_available = metric.blast_metrics_available ||
+                    metric.query_cover !== null ||
+                    metric.subject_cover !== null ||
+                    metric.identity !== null;
+                if (!metric.blast_metrics_available) continue;
+
+                [record.fasta_header, record.name].forEach(name => {
+                    this._metricKeysForName(name).forEach(key => map.set(key, metric));
+                });
+            }
+            return map;
+        }
+
+        // Alan 5/9/26 - Attach stored BLAST metrics to matching tips in the phylotree node cache.
+        _attachSequenceMetricsToLeaves() {
+            for (const node of this.allNodes) {
+                node.__sequenceMetrics = null;
+                if (node.children && node.children.length) continue;
+                const names = [
+                    node?.data?.__original_name,
+                    node?.data?.name,
+                    node?.name
+                ];
+                for (const name of names) {
+                    const metric = this._metricKeysForName(name)
+                        .map(key => this.sequenceMetricMap.get(key))
+                        .find(Boolean);
+                    if (metric) {
+                        node.__sequenceMetrics = metric;
+                        break;
+                    }
+                }
+            }
+        }
+
+        // Alan 5/9/26 - Return leaf nodes so sequence metric filters only hide terminal tips.
+        _getLeafNodes() {
+            return (this.allNodes || []).filter(node => !node.children || !node.children.length);
+        }
+
+        // Alan 5/9/26 - Compare one metric against its current threshold while allowing missing metric fields.
+        _passesMetricThreshold(metric, field, threshold) {
+            if (!metric || metric[field] === null || metric[field] === undefined) return true;
+            return Number(metric[field]) + 1e-9 >= threshold;
+        }
+
+        // Alan 5/9/26 - Decide whether a leaf should remain visible under the active MycoMap metric sliders.
+        _passesSequenceFilters(node) {
+            const metric = node.__sequenceMetrics;
+            if (!metric || !metric.blast_metrics_available) return true;
+            return this._passesMetricThreshold(metric, 'query_cover', this.options.queryCoverThreshold || 0) &&
+                this._passesMetricThreshold(metric, 'subject_cover', this.options.subjectCoverThreshold || 0) &&
+                this._passesMetricThreshold(metric, 'identity', this.options.identityThreshold || 0);
+        }
+
+        // Alan 5/9/26 - Compute counts and current thresholds for the sequence metric filter UI.
+        _getSequenceFilterStats(leaves = null) {
+            const leafNodes = leaves || this._getLeafNodes();
+            const totalTips = leafNodes.length;
+            const hiddenTips = leafNodes.filter(node => node.notshown).length;
+            const metricTips = leafNodes.filter(node => node.__sequenceMetrics?.blast_metrics_available).length;
+
+            return {
+                totalTips,
+                visibleTips: Math.max(0, totalTips - hiddenTips),
+                hiddenTips,
+                metricTips,
+                metricsAvailable: metricTips > 0,
+                queryCoverThreshold: this.options.queryCoverThreshold || 0,
+                subjectCoverThreshold: this.options.subjectCoverThreshold || 0,
+                identityThreshold: this.options.identityThreshold || 0
+            };
+        }
+
+        // Alan 5/9/26 - Apply the active MycoMap metric sliders to phylotree visibility.
+        _applySequenceFilters({ updateDisplay = true } = {}) {
+            if (!this.tree) return this._getSequenceFilterStats([]);
+
+            const leaves = this._getLeafNodes();
+            for (const node of this.allNodes) {
+                node.notshown = false;
+            }
+            leaves.forEach(leaf => {
+                leaf.notshown = !this._passesSequenceFilters(leaf);
+            });
+
+            const stats = this._getSequenceFilterStats(leaves);
+            if (updateDisplay) {
+                this._refreshSequenceFilterDisplay();
+            }
+            return stats;
+        }
+
+        // Alan 5/9/26 - Refresh the rendered SVG after sequence metric filters change.
+        _refreshSequenceFilterDisplay() {
+            const display = this.tree?.display;
+            if (display && typeof display.update === 'function') {
+                display.update();
+                this._addSupportLabels();
+                this._attachEventHandlers();
+                this._updateNodeStylesOnly();
+                this._applyTextSizingFromZoom();
+            } else {
+                this._draw();
+            }
+        }
+
+        // Alan 5/11/26 - Treat hidden active-set members as currently deselected while preserving saved sets.
+        _isVisibleSelection(id) {
+            return Boolean(id && this.selectedIds.has(id) && !this.hiddenSelectionIds.has(id));
+        }
+
+        // Alan 5/11/26 - Toggle clicks through the transient hidden-selection layer before changing set membership.
+        _toggleVisibleSelection(id) {
+            if (!id) return false;
+            if (this.hiddenSelectionIds.has(id)) {
+                this.hiddenSelectionIds.delete(id);
+                return true;
+            }
+            if (this.selectedIds.has(id)) {
+                this.selectedIds.delete(id);
+                return false;
+            }
+            this.selectedIds.add(id);
+            return true;
+        }
+
+        // Alan 5/11/26 - Return visible active selections for action buttons and local Deselect behavior.
+        _getVisibleSelectionIds() {
+            this._trimSelectionSetsToCurrentTree();
+            return Array.from(this.selectedIds).filter(id => !this.hiddenSelectionIds.has(id));
+        }
+
+        // Alan 5/11/26 - Hide current active selections locally without deleting selection-set membership.
+        deselectCurrentSelection() {
+            const visibleIds = this._getVisibleSelectionIds();
+            visibleIds.forEach(id => this.hiddenSelectionIds.add(id));
+            // Alan 5/11/26 - Clear phylotree's native selected styling so deselected labels stop looking selected.
+            this._clearNativeSelectionForIds(visibleIds);
+            this._updateStats();
+            this._updateNodeStylesOnly();
+            return visibleIds.length;
+        }
+
+        // Alan 5/11/26 - Remove native phylotree selected flags/classes for locally deselected nodes only.
+        _clearNativeSelectionForIds(ids) {
+            const hiddenIds = new Set(ids || []);
+            if (!this.tree || hiddenIds.size === 0) return;
+            // Alan 5/11/26 - Use phylotree's active selection attribute instead of assuming one fixed property.
+            const selectionAttr = this.tree.display?.selection_attribute_name || 'selected';
+
+            this.tree.traverse_and_compute(node => {
+                const id = this._getNodeId(node);
+                if (!hiddenIds.has(id)) return;
+                node[selectionAttr] = false;
+                if (node.data) node.data[selectionAttr] = false;
+            });
+
+            const links = this.tree.display?.links || [];
+            links.forEach(edge => {
+                const id = this._getNodeId(edge?.target);
+                if (hiddenIds.has(id)) edge[selectionAttr] = false;
+            });
+
+            const svg = window.d3v7.select(this.container).select("svg");
+            if (svg.empty()) return;
+            const self = this;
+            svg.selectAll("g.node, g.internal-node").each(function (d) {
+                const id = self._getNodeId(d);
+                if (hiddenIds.has(id)) window.d3v7.select(this).classed("node-selected", false);
+            });
+            svg.selectAll(".branch-selected").each(function (d) {
+                const id = self._getNodeId(d?.target || d);
+                if (hiddenIds.has(id)) window.d3v7.select(this).classed("branch-selected", false);
+            });
+        }
+
         _updateNodeStylesOnly() {
             if (!this.tree) return;
             const svg = window.d3v7.select(this.container).select("svg");
             if (svg.empty()) return;
             const self = this;
 
-            svg.selectAll(".node").each(function (d) {
+            svg.selectAll("g.node, g.internal-node").each(function (d) {
                 const el = window.d3v7.select(this);
-
-                // Try to find a styleable element (phylotree uses text for tip labels)
-                let shape = el.select("circle");
-                if (shape.empty()) shape = el.select("path");
-                if (shape.empty()) shape = el.select("rect");
-                if (shape.empty()) shape = el.select("text"); // Add text element support
-
                 const id = self._getNodeId(d);
-
-                if (!shape.empty()) {
-                    self._styleNode(shape, d);
-                }
+                // Alan 5/11/26 - Restyle the group itself because tip label text inherits stale selected fill from it.
+                self._styleNode(el, d);
+                if (id && self.hiddenSelectionIds.has(id)) el.classed("node-selected", false);
+                // Alan 5/11/26 - Restyle node shapes but clear label inline color so text follows the refreshed group state.
+                el.selectAll("circle,path,rect").each(function () {
+                    self._styleNode(window.d3v7.select(this), d);
+                });
+                el.selectAll("text.phylotree-node-text").style("fill", "").style("stroke", "");
             });
         }
 
@@ -884,6 +1179,8 @@
             let matchingSetIndex = -1;
 
             for (let i = 0; i < setNames.length; i++) {
+                // Alan 5/11/26 - Skip hidden active-set entries so Deselect clears highlights without editing sets.
+                if (setNames[i] === this.activeSelectionSet && this.hiddenSelectionIds.has(id)) continue;
                 if (this.selectionSets[setNames[i]].has(id)) {
                     matchingSetIndex = i;
                     break; // Use first matching set's color
@@ -1149,11 +1446,8 @@
                 const id = self._getNodeId(d);
                 if (!id) return;
 
-                if (self.selectedIds.has(id)) {
-                    self.selectedIds.delete(id);
-                } else {
-                    self.selectedIds.add(id);
-                }
+                // Alan 5/11/26 - Toggle visible selection state without treating hidden Deselect state as set deletion.
+                const selected = self._toggleVisibleSelection(id);
 
                 self._updateNodeStylesOnly();
                 // Fire callback with full node details, but state is now in Viewer
@@ -1162,7 +1456,7 @@
                         name: id,
                         display_name: d.data.name || id,
                         is_leaf: !d.children || !d.children.length,
-                        selected: self.selectedIds.has(id)
+                        selected
                     });
                 }
                 self._updateStats();
@@ -1170,7 +1464,8 @@
         }
 
         _updateStats() {
-            const selCount = this.selectedIds.size;
+            // Alan 5/11/26 - Report only visible active selections so Deselect disables edit actions.
+            const selCount = this._getVisibleSelectionIds().length;
             if (this.callbacks.onSelectionChange) this.callbacks.onSelectionChange(selCount);
         }
 
@@ -1192,6 +1487,8 @@
                     selectedNodes.forEach(node => {
                         const id = self._getNodeId(node);
                         if (id) {
+                            // Alan 5/11/26 - Native phylotree selections should make locally hidden nodes visible again.
+                            self.hiddenSelectionIds.delete(id);
                             self.selectedIds.add(id);
                         }
                     });
@@ -1208,6 +1505,8 @@
                     selectedNodes.forEach(node => {
                         const id = self._getNodeId(node);
                         if (id) {
+                            // Alan 5/11/26 - Native selection-change events should reveal nodes hidden by Deselect.
+                            self.hiddenSelectionIds.delete(id);
                             self.selectedIds.add(id);
                         }
                     });
@@ -1252,11 +1551,8 @@
 
                     const id = self._getNodeId(d);
                     if (id) {
-                        if (self.selectedIds.has(id)) {
-                            self.selectedIds.delete(id);
-                        } else {
-                            self.selectedIds.add(id);
-                        }
+                        // Alan 5/11/26 - Toggle visible selection state while preserving Deselect-hidden set membership.
+                        self._toggleVisibleSelection(id);
                         self._updateNodeStylesOnly();
                         self._updateStats();
                     }
@@ -1305,6 +1601,40 @@
             return null;
         }
 
+        // Alan 5/10/26 - Build the rendered node ID set so restored selections can drop pruned nodes.
+        _getCurrentNodeIdSet() {
+            const ids = new Set();
+            if (!this.tree) return ids;
+            this.tree.traverse_and_compute(n => {
+                const id = this._getNodeId(n);
+                if (id) ids.add(id);
+            });
+            return ids;
+        }
+
+        // Alan 5/10/26 - Remove selection IDs that no longer exist after prune or recompute reloads.
+        _trimSelectionSetsToCurrentTree() {
+            const currentIds = this._getCurrentNodeIdSet();
+            if (currentIds.size === 0) return false;
+            let changed = false;
+            for (const memberSet of Object.values(this.selectionSets)) {
+                if (!(memberSet instanceof Set)) continue;
+                for (const id of Array.from(memberSet)) {
+                    if (!currentIds.has(id)) {
+                        memberSet.delete(id);
+                        changed = true;
+                    }
+                }
+            }
+            // Alan 5/11/26 - Keep transient hidden selections limited to active IDs still present in the tree.
+            for (const id of Array.from(this.hiddenSelectionIds)) {
+                if (!currentIds.has(id) || !this.selectedIds.has(id)) {
+                    this.hiddenSelectionIds.delete(id);
+                }
+            }
+            return changed;
+        }
+
         /**
          * Clear ALL selections across ALL selection sets.
          * Use after backend mutations when node references become stale.
@@ -1314,6 +1644,8 @@
             for (const setName of Object.keys(this.selectionSets)) {
                 this.selectionSets[setName].clear();
             }
+            // Alan 5/11/26 - Clear transient Deselect state when all selection-set membership is removed.
+            this.hiddenSelectionIds.clear();
             this._updateStats();
             this._updateNodeStylesOnly();
         }
@@ -1323,6 +1655,9 @@
 
             const DEBUG_MODE = new URLSearchParams(window.location.search).has('debug');
             if (DEBUG_MODE) console.log('selectionAction called:', action, 'active set:', this.activeSelectionSet);
+
+            // Alan 5/11/26 - Bulk selection actions intentionally replace local Deselect state.
+            this.hiddenSelectionIds.clear();
 
             if (action === 'all') {
                 let firstNode = true;
@@ -1445,6 +1780,8 @@
 
             // Step 4: Select MRCA and all nodes on paths from MRCA to selected nodes
             const mrcaId = this._getNodeId(mrca);
+            // Alan 5/11/26 - Nodes explicitly added by derived selection should be visible after Deselect.
+            this.hiddenSelectionIds.delete(mrcaId);
             this.selectedIds.add(mrcaId);
 
             // For each selected node, walk up to MRCA and select the path
@@ -1453,6 +1790,8 @@
                 while (current) {
                     const id = this._getNodeId(current);
                     if (id) {
+                        // Alan 5/11/26 - Reveal path nodes that this action explicitly selects.
+                        this.hiddenSelectionIds.delete(id);
                         this.selectedIds.add(id);
                         if (id === mrcaId) break; // Stop at MRCA
                     }
@@ -1477,7 +1816,11 @@
             // Recursive helper to add all descendants
             const addDescendants = (node) => {
                 const id = this._getNodeId(node);
-                if (id) this.selectedIds.add(id);
+                if (id) {
+                    // Alan 5/11/26 - Reveal descendants that this action explicitly selects.
+                    this.hiddenSelectionIds.delete(id);
+                    this.selectedIds.add(id);
+                }
 
                 if (node.children && node.children.length) {
                     for (const child of node.children) {
@@ -1500,13 +1843,15 @@
             const selected = [];
             this.tree.traverse_and_compute(n => {
                 const id = this._getNodeId(n);
-                if (id && this.selectedIds.has(id)) selected.push(n);
+                // Alan 5/11/26 - Backend actions should only use visible active selections after Deselect.
+                if (id && this._isVisibleSelection(id)) selected.push(n);
             });
             return selected;
         }
 
         getSelectionCount() {
-            return this.selectedIds.size;
+            // Alan 5/11/26 - Count only visible active selections that still exist in the rendered tree.
+            return this._getVisibleSelectionIds().length;
         }
 
         // --- SELECTION SET MANAGEMENT (CRUD) ---
@@ -1541,6 +1886,8 @@
                 this.activeSelectionSet = 'Default';
             }
 
+            // Alan 5/11/26 - Drop transient Deselect state when deleting selection-set membership.
+            this.hiddenSelectionIds.clear();
             this._updateNodeStylesOnly();
             this._updateStats();
             return true;
@@ -1554,6 +1901,8 @@
         setActiveSelectionSet(name) {
             if (!this.selectionSets[name]) return false;
             this.activeSelectionSet = name;
+            // Alan 5/11/26 - Switching sets should show that set's saved selections normally.
+            this.hiddenSelectionIds.clear();
             this._updateStats();
             return true;
         }
@@ -1611,6 +1960,10 @@
             if (data.active && this.selectionSets[data.active]) {
                 this.activeSelectionSet = data.active;
             }
+            // Alan 5/11/26 - Restored selection sets should not inherit a prior local Deselect state.
+            this.hiddenSelectionIds.clear();
+            // Alan 5/10/26 - Do not restore saved selections for nodes removed by pruning.
+            this._trimSelectionSetsToCurrentTree();
             this._updateNodeStylesOnly();
             this._updateStats();
         }
@@ -1621,6 +1974,8 @@
          */
         clearActiveSelection() {
             this.selectedIds.clear(); // selectedIds getter returns the active set
+            // Alan 5/11/26 - Clear transient hidden IDs when the active selection set is emptied.
+            this.hiddenSelectionIds.clear();
             this._updateStats();
             this._updateNodeStylesOnly();
         }

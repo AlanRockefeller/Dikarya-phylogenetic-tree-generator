@@ -185,6 +185,138 @@ def _count_alignment_stats(fasta_path) -> tuple[int, int]:
         return 0, 0
 
 
+def run_recompute_job(job_id: str, params_dict: dict) -> dict:
+    """Background task for recomputing an existing tree while streaming status events."""
+    job = get_current_job()
+    job_dir = Config.JOB_DIR / job_id
+    job_dir.mkdir(parents=True, exist_ok=True)
+    (job_dir / "logs").mkdir(exist_ok=True)
+
+    log_file = job_dir / "logs" / "pipeline.log"
+    file_handler = logging.FileHandler(log_file)
+    file_handler.setFormatter(logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s"))
+    logger.addHandler(file_handler)
+
+    try:
+        from app import create_app
+        from app.extensions import db
+        from app.models import Job
+        from app.services.tree_edit_service import build_recompute_job_params, recompute_tree
+
+        _app = create_app()
+
+        if job:
+            job.meta.setdefault("steps", get_initial_steps_meta())
+            job.meta["current_step"] = None
+            job.meta["current_tool"] = None
+            job.meta["started_at"] = time.time()
+            job.save_meta()
+
+        with _app.app_context():
+            db_job = Job.query.get(job_id)
+            if db_job:
+                metrics = db_job.metrics or {}
+                metrics["recompute_started_at"] = datetime.now(timezone.utc).isoformat()
+                db_job.metrics = metrics
+                db_job.status = "running"
+                db.session.commit()
+
+        publish_job_running(job_id)
+        publish_overview(job_id, "Starting tree recompute...")
+
+        job_params = build_recompute_job_params(params_dict)
+        result = recompute_tree(
+            job_dir,
+            job_params,
+            Config,
+            logger,
+            event_job_id=job_id,
+            rq_job=job,
+            use_current_input=bool(params_dict.get("use_current_input"))
+        )
+
+        with _app.app_context():
+            db_job = Job.query.get(job_id)
+            if db_job:
+                metrics = db_job.metrics or {}
+                metrics["recompute_completed_at"] = datetime.now(timezone.utc).isoformat()
+                db_job.metrics = metrics
+                db_job.status = "completed"
+                db.session.commit()
+
+        publish_job_completed(
+            job_id,
+            view_url=f"/job/{job_id}/view",
+            result_files={
+                "tree_newick": f"/api/job/{job_id}/download/tree/newick",
+                "tree_nexus": f"/api/job/{job_id}/download/tree/nexus",
+                "fasta_original": f"/api/job/{job_id}/download/fasta/original",
+            }
+        )
+        publish_overview(job_id, "Recompute complete! Redirecting to tree viewer...")
+
+        return {
+            "job_id": job_id,
+            "status": "completed",
+            "message": "Tree recompute finished successfully",
+            "result": result,
+        }
+
+    except Exception as e:
+        error_msg = str(e)
+        tb = traceback.format_exc()
+        logger.error(f"Recompute job {job_id} failed: {error_msg}")
+        logger.error(tb)
+
+        failed_step = "unknown"
+        failed_step_label = "Recompute"
+        current_tool = None
+        if job:
+            failed_step = job.meta.get("current_step") or failed_step
+            current_tool = job.meta.get("current_tool")
+            step_info = (job.meta.get("steps") or {}).get(failed_step, {})
+            failed_step_label = step_info.get("label") or failed_step_label
+            if failed_step != "unknown":
+                publish_step_failed(job_id, failed_step, error_msg, tool=current_tool)
+                update_step_meta(job, failed_step, {"state": STATE_FAILED, "error": error_msg})
+
+        publish_job_failed(
+            job_id,
+            failed_step=failed_step,
+            failed_step_label=failed_step_label,
+            error_summary=error_msg,
+            tool=current_tool or ""
+        )
+
+        try:
+            from app import create_app
+            from app.extensions import db
+            from app.models import Job
+
+            _app = create_app()
+            with _app.app_context():
+                db_job = Job.query.get(job_id)
+                if db_job:
+                    metrics = db_job.metrics or {}
+                    metrics["recompute_failed_at"] = datetime.now(timezone.utc).isoformat()
+                    metrics["error"] = error_msg
+                    metrics["failed_step"] = failed_step
+                    db_job.metrics = metrics
+                    db_job.status = "failed"
+                    db.session.commit()
+        except Exception as db_err:
+            logger.error(f"Failed to update DB on recompute error: {db_err}")
+
+        raise
+
+    finally:
+        try:
+            logger.removeHandler(file_handler)
+            file_handler.close()
+        except Exception:
+            pass
+
+
 def run_phylo_job(job_params: dict) -> dict:
     """
     Main phylogenetic analysis job.
