@@ -299,7 +299,7 @@
                     Sequence Queue
                 </h3>
                 <span id="sequence_count"
-                    class="bg-journal-gold text-journal-dark text-xs font-bold px-3 py-1 rounded-full">
+                    class="bg-journal-gold text-journal-dark text-xs font-bold px-3 py-1 rounded-full hidden">
                     0 sequences
                 </span>
             </div>
@@ -339,7 +339,7 @@
                         Import MycoMap results to enable filtering by query coverage, subject coverage, and identity.
                     </p>
                 </div>
-                <span class="text-xs text-gray-500 dark:text-gray-400">Click × to remove</span>
+                <span id="queue-remove-hint" class="text-xs text-gray-500 dark:text-gray-400 hidden">Click × to remove</span>
             </div>
         </div>
     </div>
@@ -759,18 +759,28 @@
         const clearBtn = document.getElementById('clear_queue_btn');
         const filterHintEl = document.getElementById('filter-hint');
         const filterBtn = document.getElementById('btn-filter-results');
+        // Alan 5/11/26 - Hide the remove hint until the queue has removable entries.
+        const removeHintEl = document.getElementById('queue-remove-hint');
         const metricCount = sequenceQueue.filter(s => s.blast_metrics_available === true).length;
 
         countEl.textContent = `${sequenceQueue.length} sequence${sequenceQueue.length !== 1 ? 's' : ''}`;
+        // Alan 5/11/26 - Keep the count pill hidden until at least one sequence is queued.
+        countEl.classList.toggle('hidden', sequenceQueue.length === 0);
 
         if (sequenceQueue.length === 0) {
             listEl.classList.add('hidden');
             emptyEl.classList.remove('hidden');
             clearBtn.disabled = true;
+            if (removeHintEl) {
+                removeHintEl.classList.add('hidden');
+            }
         } else {
             listEl.classList.remove('hidden');
             emptyEl.classList.add('hidden');
             clearBtn.disabled = false;
+            if (removeHintEl) {
+                removeHintEl.classList.remove('hidden');
+            }
 
             listEl.innerHTML = sequenceQueue.map((seq, idx) => `
                 <li class="px-4 py-3 flex justify-between items-center hover:bg-gray-50 dark:hover:bg-journal-dark/50 transition-colors">

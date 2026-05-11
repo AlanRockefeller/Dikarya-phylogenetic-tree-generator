@@ -79,6 +79,13 @@ def create_app(config_name='default'):
     from app.monitoring import bp as monitoring_bp
     app.register_blueprint(monitoring_bp)
 
+    # Public token-authenticated API. CSRF-exempt as a whole -- protection
+    # comes from the bearer token requirement, not from CSRF cookies. The
+    # internal /api/ blueprint above stays CSRF-protected for the browser UI.
+    from app.api_v1 import bp as api_v1_bp
+    csrf.exempt(api_v1_bp)
+    app.register_blueprint(api_v1_bp, url_prefix='/api/v1')
+
     # Inject What's New badge indicator into all templates
     @app.context_processor
     def inject_whats_new_badge():

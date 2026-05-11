@@ -15,16 +15,22 @@
             <p class="text-gray-600 dark:text-gray-300 mt-1">Manage and view your phylogenetic analysis jobs.</p>
         </div>
 
-        {% if jobs %}
-        <form action="{{ url_for('user.clear_jobs') }}" method="POST"
-            onsubmit="return confirm('Are you sure you want to clear all your jobs? This action cannot be undone.');">
-            <input type="hidden" name="csrf_token" value="{{ csrf_token() }}" />
-            <button type="submit" class="bg-red-500 hover:bg-red-600 text-white px-5 py-2.5 rounded-lg font-medium 
-                       shadow-md hover:shadow-lg transition-all flex items-center text-sm">
-                <i class="fas fa-trash-alt mr-2"></i> Clear All Jobs
-            </button>
-        </form>
-        {% endif %}
+        <div class="flex flex-wrap gap-3">
+            <a href="{{ url_for('user.api_tokens') }}"
+                class="bg-journal-dark hover:bg-journal-green dark:bg-journal-green dark:hover:bg-journal-dark text-white px-5 py-2.5 rounded-lg font-medium shadow-md hover:shadow-lg transition-all flex items-center text-sm">
+                <i class="fas fa-key mr-2"></i> API Tokens
+            </a>
+            {% if jobs %}
+            <form action="{{ url_for('user.clear_jobs') }}" method="POST"
+                onsubmit="return confirm('Are you sure you want to clear all your jobs? This action cannot be undone.');">
+                <input type="hidden" name="csrf_token" value="{{ csrf_token() }}" />
+                <button type="submit" class="bg-red-500 hover:bg-red-600 text-white px-5 py-2.5 rounded-lg font-medium
+                           shadow-md hover:shadow-lg transition-all flex items-center text-sm">
+                    <i class="fas fa-trash-alt mr-2"></i> Clear All Jobs
+                </button>
+            </form>
+            {% endif %}
+        </div>
     </div>
 
     <!-- Jobs Table Card -->

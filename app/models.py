@@ -33,6 +33,36 @@ class Job(db.Model):
     
     user = db.relationship("User", backref=db.backref("jobs", lazy=True))
 
+class ApiToken(db.Model):
+    """A revocable, scoped bearer token tied to a User.
+
+    The plaintext secret is never stored — only its SHA-256 hash. The token
+    `prefix` (first 12 chars of the secret) is stored separately so the UI
+    can show users which token is which without exposing the secret again
+    after creation.
+    """
+    __tablename__ = 'api_token'
+    id = db.Column(db.Integer, primary_key=True)
+    user_id = db.Column(db.Integer, db.ForeignKey('user.id', ondelete='CASCADE'), nullable=False)
+    name = db.Column(db.String(80), nullable=False)
+    token_hash = db.Column(db.String(64), nullable=False, unique=True, index=True)
+    token_prefix = db.Column(db.String(20), nullable=False)
+    # JSON list of scope strings, e.g. ["jobs:read","jobs:write","tools:read","account:read"]
+    scopes = db.Column(db.JSON, nullable=False, default=list)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow, nullable=False)
+    last_used_at = db.Column(db.DateTime, nullable=True)
+    revoked_at = db.Column(db.DateTime, nullable=True)
+
+    user = db.relationship('User', backref=db.backref('api_tokens', lazy=True, cascade='all, delete-orphan'))
+
+    @property
+    def is_active(self):
+        return self.revoked_at is None
+
+    def has_scope(self, scope):
+        return scope in (self.scopes or [])
+
+
 class WhatsNewEntry(db.Model):
     __tablename__ = 'whats_new_entry'
     id = db.Column(db.Integer, primary_key=True)
