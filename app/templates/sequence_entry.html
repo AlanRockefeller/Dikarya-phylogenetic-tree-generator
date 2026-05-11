@@ -7,17 +7,503 @@
 
 {% block nav_tree_builder %}text-journal-gold{% endblock %}
 
+{% block head %}
+<style>
+    .tree-builder-page {
+        background: var(--bg);
+        box-shadow: 0 0 0 100vmax var(--bg);
+        clip-path: inset(0 -100vmax);
+        color: var(--text);
+        margin-bottom: -2rem;
+        padding-bottom: 3rem;
+    }
+
+    .tree-page-title {
+        color: var(--text);
+        font-family: var(--serif);
+        font-size: 34px;
+        font-weight: 500;
+        line-height: 1.05;
+        letter-spacing: 0;
+    }
+
+    .tree-page-subtitle,
+    .tree-builder-page p {
+        color: var(--text-dim);
+    }
+
+    .tree-card,
+    .queue-card,
+    .tree-modal {
+        background: linear-gradient(180deg, #213829 0%, #1c3025 100%);
+        border: 1px solid var(--line);
+        border-radius: 4px;
+        box-shadow:
+            inset 0 1px 0 rgba(255, 239, 194, .06),
+            inset 0 -1px 0 rgba(0, 0, 0, .25);
+        color: var(--text);
+    }
+
+    .queue-card {
+        border-color: var(--journal-gold);
+    }
+
+    .tree-builder-page h2,
+    .tree-builder-page h3:not(.queue-title),
+    .tree-builder-page h4 {
+        color: var(--text);
+        font-family: var(--sans);
+        font-size: 15px;
+        font-weight: 600;
+        letter-spacing: 0;
+    }
+
+    .tree-card > h3 > i,
+    .tree-modal h3 > i {
+        display: none;
+    }
+
+    .tree-card > h3 {
+        color: #f7faf8;
+        font-size: 28px;
+        line-height: 1.1;
+    }
+
+    .eyebrow {
+        color: var(--text-mute);
+        font-family: var(--mono);
+        font-size: 11px;
+        font-weight: 500;
+        letter-spacing: .18em;
+        text-transform: uppercase;
+    }
+
+    .tree-builder-page label,
+    .tree-builder-page .field-help {
+        color: var(--text-dim);
+    }
+
+    .tree-builder-page input[type="url"],
+    .tree-builder-page input[type="text"],
+    .tree-builder-page input[type="number"],
+    .tree-builder-page select {
+        background: #17291f;
+        border: 1px solid var(--line);
+        border-radius: 4px;
+        color: var(--text);
+        box-shadow: none;
+    }
+
+    .tree-builder-page input[type="url"]:focus,
+    .tree-builder-page input[type="text"]:focus,
+    .tree-builder-page input[type="number"]:focus,
+    .tree-builder-page select:focus {
+        border-color: var(--journal-gold);
+        outline: none;
+        box-shadow: 0 0 0 1px rgba(201, 169, 98, .28);
+    }
+
+    .tree-builder-page input[type="checkbox"] {
+        accent-color: var(--journal-gold);
+    }
+
+    .tree-builder-page input::placeholder,
+    .tree-builder-page textarea::placeholder {
+        color: #5d6b62;
+        font-style: italic;
+    }
+
+    .sequence-input-box {
+        background: #17291f;
+        border: 1px solid var(--line);
+        border-radius: 4px;
+        overflow: hidden;
+        transition: border-color .2s ease, box-shadow .2s ease;
+    }
+
+    .sequence-input-box:focus-within {
+        border-color: var(--journal-gold);
+        box-shadow: 0 0 0 1px rgba(201, 169, 98, .24);
+    }
+
+    .sequence-input-toolbar,
+    .sequence-input-footer {
+        align-items: center;
+        display: flex;
+        justify-content: space-between;
+        min-height: 34px;
+        padding: 0 12px;
+    }
+
+    .sequence-input-toolbar {
+        border-bottom: 1px solid rgba(53, 82, 69, .72);
+    }
+
+    .sequence-input-footer {
+        border-top: 1px solid rgba(53, 82, 69, .72);
+        color: var(--text-mute);
+        font-family: var(--mono);
+        font-size: 10px;
+        letter-spacing: .08em;
+        text-transform: uppercase;
+    }
+
+    .input-chip-group {
+        display: flex;
+        gap: 6px;
+    }
+
+    .input-chip {
+        background: transparent;
+        border: 1px solid transparent;
+        border-radius: 999px;
+        color: var(--text-mute);
+        cursor: pointer;
+        font-family: var(--mono);
+        font-size: 10px;
+        letter-spacing: .12em;
+        padding: 4px 8px;
+        text-transform: uppercase;
+    }
+
+    .input-chip.is-active {
+        border-color: var(--journal-gold);
+        color: var(--gold-soft);
+    }
+
+    .detected-counter {
+        color: var(--text-mute);
+        font-family: var(--mono);
+        font-size: 10px;
+        letter-spacing: .12em;
+        text-transform: uppercase;
+    }
+
+    .sequence-textarea {
+        background: transparent;
+        border: 0;
+        border-radius: 0;
+        color: var(--text);
+        display: block;
+        font-family: var(--mono);
+        font-size: 13px;
+        line-height: 1.5;
+        min-height: 128px;
+        padding: 12px;
+        resize: vertical;
+        width: 100%;
+    }
+
+    .sequence-textarea:focus {
+        outline: none;
+        box-shadow: none;
+    }
+
+    .paste-example-link {
+        background: transparent;
+        border: 0;
+        color: var(--gold-soft);
+        cursor: pointer;
+        font: inherit;
+        text-decoration: none;
+    }
+
+    .paste-example-link:hover {
+        color: var(--journal-gold);
+    }
+
+    .btn {
+        align-items: center;
+        background: transparent;
+        border: 1px solid var(--line);
+        border-radius: 4px;
+        box-shadow: none;
+        color: var(--text);
+        display: inline-flex;
+        font-weight: 600;
+        justify-content: center;
+        min-height: 42px;
+        padding: 10px 14px;
+        transition: border-color .2s ease, color .2s ease, background-color .2s ease, opacity .2s ease;
+    }
+
+    .btn:hover:not(:disabled) {
+        border-color: var(--journal-gold);
+        color: var(--journal-gold);
+    }
+
+    .btn-primary {
+        background: var(--journal-gold);
+        border-color: var(--journal-gold);
+        color: #1a2f23;
+        font-weight: 600;
+    }
+
+    .btn-primary:hover:not(:disabled) {
+        background: var(--journal-gold-light);
+        color: #1a2f23;
+    }
+
+    .btn-outline-gold {
+        background: transparent;
+        border-color: var(--journal-gold);
+        color: var(--journal-gold);
+    }
+
+    .btn-small {
+        font-size: 12px;
+        min-height: 34px;
+        padding: 7px 10px;
+    }
+
+    .tree-builder-page button:disabled,
+    .tree-builder-page .btn:disabled {
+        border-color: var(--line);
+        cursor: not-allowed;
+        opacity: .45;
+    }
+
+    .upload-dropzone {
+        background: rgba(20, 36, 27, .62);
+        border-color: var(--line);
+        border-radius: 4px;
+    }
+
+    .upload-dropzone:hover {
+        border-color: var(--journal-gold);
+    }
+
+    .queue-title {
+        color: var(--text);
+        font-family: var(--serif);
+        font-size: 24px;
+        font-style: normal;
+        font-weight: 500;
+        line-height: 1;
+    }
+
+    .queue-count-number {
+        color: var(--journal-gold);
+        display: block;
+        font-family: var(--serif);
+        font-size: 34px;
+        font-weight: 500;
+        line-height: .9;
+        text-align: right;
+    }
+
+    .queue-count-label {
+        color: var(--text-mute);
+        display: block;
+        font-family: var(--mono);
+        font-size: 10px;
+        letter-spacing: .16em;
+        line-height: 1.2;
+        margin-top: 4px;
+        text-align: right;
+    }
+
+    .queue-body {
+        max-height: 24rem;
+        overflow-y: auto;
+        padding: 8px 0;
+    }
+
+    .queue-empty {
+        color: var(--text-dim);
+        padding: 40px 24px;
+        text-align: center;
+    }
+
+    .queue-row {
+        align-items: center;
+        display: grid;
+        gap: 12px;
+        grid-template-columns: 26px 22px minmax(0, 1fr) auto 22px;
+        padding: 7px 28px;
+        transition: background-color .2s ease;
+    }
+
+    .queue-row:hover {
+        background: rgba(236, 228, 207, .035);
+    }
+
+    .queue-row.is-outgroup {
+        background: rgba(201, 169, 98, .05);
+    }
+
+    .queue-index {
+        color: var(--text-mute);
+        font-family: var(--mono);
+        font-size: 10px;
+    }
+
+    .queue-name {
+        min-width: 0;
+        overflow: hidden;
+        white-space: nowrap;
+    }
+
+    .queue-accession {
+        color: var(--text);
+        display: inline-block;
+        font-family: var(--mono);
+        font-size: 12px;
+        max-width: 100%;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        vertical-align: bottom;
+    }
+
+    .queue-row.is-outgroup .queue-accession::before {
+        color: var(--journal-gold);
+        content: "★";
+        font-family: var(--sans);
+        margin-right: 5px;
+    }
+
+    .queue-species {
+        color: var(--text-dim);
+        font-family: var(--serif);
+        font-size: 13px;
+        font-style: italic;
+        margin-left: 8px;
+    }
+
+    .queue-length {
+        color: var(--gold-soft);
+        font-family: var(--mono);
+        font-size: 11px;
+        white-space: nowrap;
+    }
+
+    .queue-length span {
+        color: var(--text-mute);
+        font-size: 10px;
+        margin-left: 2px;
+    }
+
+    .outgroup-checkbox {
+        appearance: none;
+        border: 1px solid var(--line);
+        border-radius: 2px;
+        height: 14px;
+        position: relative;
+        width: 14px;
+    }
+
+    .outgroup-checkbox:checked {
+        background: var(--journal-gold);
+        border-color: var(--journal-gold);
+    }
+
+    .outgroup-checkbox:checked::after {
+        color: #1a2f23;
+        content: "★";
+        font-size: 9px;
+        left: 50%;
+        line-height: 1;
+        position: absolute;
+        top: 50%;
+        transform: translate(-50%, -50%);
+    }
+
+    .queue-remove {
+        color: var(--text-mute);
+        font-size: 16px;
+        line-height: 1;
+        transition: color .2s ease;
+    }
+
+    .queue-remove:hover {
+        color: #e36c5a;
+    }
+
+    .queue-footer {
+        border-top: 1px solid var(--line-gold);
+        padding: 16px;
+    }
+
+    .queue-run-row {
+        display: flex;
+        gap: 10px;
+    }
+
+    .queue-run-row #quick_tree_btn {
+        flex: 1;
+    }
+
+    .pipeline-summary {
+        border-top: 1px dashed var(--line-gold);
+        color: var(--text-mute);
+        font-family: var(--mono);
+        font-size: 10px;
+        letter-spacing: .04em;
+        margin-top: 14px;
+        padding-top: 12px;
+        text-transform: uppercase;
+    }
+
+    .pipeline-summary strong {
+        color: var(--gold-soft);
+        font-weight: 500;
+    }
+
+    .queue-tools {
+        align-items: center;
+        display: flex;
+        flex-wrap: wrap;
+        gap: 8px;
+        justify-content: space-between;
+        margin-top: 12px;
+    }
+
+    .advanced-summary {
+        align-items: center;
+        border-top: 1px solid var(--line-gold);
+        color: var(--text-dim);
+        display: flex;
+        flex-wrap: wrap;
+        gap: 12px;
+        justify-content: space-between;
+        margin-top: 14px;
+        padding-top: 14px;
+    }
+
+    .advanced-form-body {
+        margin-top: 22px;
+    }
+
+    .filter-slider {
+        accent-color: var(--journal-gold);
+    }
+
+    .metric-value {
+        background: rgba(201, 169, 98, .12);
+        color: var(--gold-soft);
+    }
+
+    @media (max-width: 640px) {
+        .queue-row {
+            gap: 8px;
+            grid-template-columns: 22px 20px minmax(0, 1fr) auto 22px;
+            padding: 7px 12px;
+        }
+
+        .queue-run-row {
+            flex-direction: column;
+        }
+    }
+</style>
+{% endblock %}
+
 {% block content %}
-<!-- Page Header -->
+<div class="tree-builder-page">
 <!-- Page Header -->
 <div class="mb-8">
-    <div class="flex flex-col md:flex-row justify-between items-center gap-4">
+    <div class="flex flex-col md:flex-row justify-between items-start gap-4">
         <div>
-            <h2 class="text-2xl font-bold text-journal-dark dark:text-gray-100 flex items-center">
-                <i class="fas fa-dna text-journal-gold mr-3"></i>Phylogenetic Tree Builder
-            </h2>
-            <p class="text-gray-600 dark:text-gray-300 mt-1">Add sequences to build a phylogenetic tree with advanced
-                analysis options.</p>
+            <h1 class="tree-page-title">Phylogenetic Tree Builder</h1>
         </div>
     </div>
 </div>
@@ -29,7 +515,7 @@
     <div class="lg:col-span-2 space-y-6">
 
         <!-- 1. iNaturalist URL Card -->
-        <div class="bg-white dark:bg-journal-green rounded-xl shadow-lg p-6 transition-colors">
+        <div class="tree-card p-6 transition-colors">
             <h3 class="text-xl font-semibold text-journal-dark dark:text-gray-100 mb-4 flex items-center">
                 <i class="fas fa-leaf text-journal-gold mr-2"></i>
                 Import from iNaturalist
@@ -51,9 +537,7 @@
                 </div>
 
                 <!-- Submit Button -->
-                <button id="fetch_inaturalist_btn" class="w-full bg-journal-dark hover:bg-journal-green text-white 
-                               py-3 px-4 rounded-lg font-semibold shadow-md hover:shadow-lg 
-                               transition-all flex items-center justify-center">
+                <button id="fetch_inaturalist_btn" data-active-style="outline" class="btn w-full">
                     <i class="fas fa-search mr-2"></i> Submit
                 </button>
 
@@ -77,16 +561,12 @@
                     <!-- Action Buttons -->
                     <div id="inaturalist_actions" class="flex flex-wrap gap-3">
                         <!-- BLAST Button (single observation) -->
-                        <button id="inaturalist_blast_btn" class="hidden flex-1 min-w-[140px] bg-journal-gold hover:bg-journal-gold-light text-journal-dark 
-                                       py-3 px-4 rounded-lg font-semibold shadow-md hover:shadow-lg 
-                                       transition-all flex items-center justify-center">
+                        <button id="inaturalist_blast_btn" class="hidden btn btn-outline-gold flex-1 min-w-[140px]">
                             <i class="fas fa-search mr-2"></i> BLAST Sequence
                         </button>
 
                         <!-- Add to Queue Button (multiple observations) -->
-                        <button id="inaturalist_add_btn" class="hidden flex-1 min-w-[140px] bg-journal-gold hover:bg-journal-gold-light text-journal-dark 
-                                       py-3 px-4 rounded-lg font-semibold shadow-md hover:shadow-lg 
-                                       transition-all flex items-center justify-center">
+                        <button id="inaturalist_add_btn" class="hidden btn btn-outline-gold flex-1 min-w-[140px]">
                             <i class="fas fa-plus mr-2"></i> Add to Queue
                         </button>
                     </div>
@@ -95,7 +575,7 @@
         </div>
 
         <!-- 2. Mycomap URL Card -->
-        <div class="bg-white dark:bg-journal-green rounded-xl shadow-lg p-6 transition-colors">
+        <div class="tree-card p-6 transition-colors">
             <h3 class="text-xl font-semibold text-journal-dark dark:text-gray-100 mb-4 flex items-center">
                 <i class="fas fa-link text-journal-gold mr-2"></i>
                 Import from Mycomap
@@ -136,14 +616,10 @@
 
                 <!-- Fetch / One-Click Tree Buttons -->
                 <div class="flex gap-3">
-                    <button id="fetch_mycomap_btn" class="flex-1 bg-journal-dark hover:bg-journal-green text-white
-                                   py-3 px-4 rounded-lg font-semibold shadow-md hover:shadow-lg
-                                   transition-all flex items-center justify-center">
-                        <i class="fas fa-download mr-2"></i> Fetch Sequences
+                    <button id="fetch_mycomap_btn" data-active-style="outline" class="btn flex-1">
+                        <i class="fas fa-download mr-2"></i> Fetch sequences only
                     </button>
-                    <button id="mycomap_quick_tree_btn" class="flex-1 bg-journal-dark hover:bg-journal-green text-white
-                                   py-3 px-4 rounded-lg font-semibold shadow-md hover:shadow-lg
-                                   transition-all flex items-center justify-center">
+                    <button id="mycomap_quick_tree_btn" data-active-style="primary" class="btn flex-1">
                         <i class="fas fa-magic mr-2"></i> One-Click Tree
                     </button>
                 </div>
@@ -151,7 +627,7 @@
         </div>
 
         <!-- 3. BLAST Card -->
-        <div class="bg-white dark:bg-journal-green rounded-xl shadow-lg p-6 transition-colors">
+        <div class="tree-card p-6 transition-colors">
             <h3 class="text-xl font-semibold text-journal-dark dark:text-gray-100 mb-4 flex items-center">
                 <i class="fas fa-search text-journal-gold mr-2"></i>
                 BLAST for Related Sequences
@@ -162,12 +638,22 @@
                     <label for="blast_query" class="block text-sm font-medium text-gray-700 dark:text-gray-200 mb-2">
                         Enter Single Sequence or Accession
                     </label>
-                    <textarea id="blast_query" rows="4" class="w-full font-mono text-sm px-4 py-3 border border-gray-300 dark:border-journal-dark rounded-lg 
-                               bg-white dark:bg-journal-dark text-gray-900 dark:text-gray-100
-                               focus:ring-2 focus:ring-journal-gold focus:border-transparent 
-                               transition-all resize-none"
-                        placeholder=">seq1&#10;ATGCGATCG...&#10;&#10;Or GenBank Accession (e.g., OP973765)"></textarea>
-                    <p class="text-xs text-gray-500 dark:text-gray-400 mt-1">
+                    <div class="sequence-input-box" data-sequence-input-box="blast_query">
+                        <div class="sequence-input-toolbar">
+                            <div class="input-chip-group">
+                                <button type="button" class="input-chip is-active" data-input-chip="blast_query" data-chip-mode="fasta">FASTA</button>
+                                <button type="button" class="input-chip" data-input-chip="blast_query" data-chip-mode="accessions">Accessions</button>
+                            </div>
+                            <span id="blast_query_counter" class="detected-counter">0 sequences detected</span>
+                        </div>
+                        <textarea id="blast_query" rows="4" class="sequence-textarea"
+                            placeholder="Paste a FASTA record or a list of accession numbers…"></textarea>
+                        <div class="sequence-input-footer">
+                            <span>UTF-8 · plain text</span>
+                            <button type="button" class="paste-example-link" data-paste-example="blast_query">↳ Paste example</button>
+                        </div>
+                    </div>
+                    <p class="field-help text-xs mt-2">
                         Find related sequences on NCBI GenBank.
                     </p>
                 </div>
@@ -199,11 +685,7 @@
                 </div>
 
                 <div class="flex flex-wrap gap-3">
-                    <button id="blast_btn"
-                        class="w-full bg-journal-dark hover:bg-journal-green text-white 
-                                   py-3 px-4 rounded-lg font-semibold shadow-md hover:shadow-lg 
-                                   transition-all flex items-center justify-center disabled:opacity-50 disabled:cursor-not-allowed"
-                        disabled>
+                    <button id="blast_btn" data-active-style="outline" class="btn w-full" disabled>
                         <i class="fas fa-search mr-2"></i> BLAST Sequence
                     </button>
                 </div>
@@ -211,14 +693,14 @@
         </div>
 
         <!-- 4. File Upload Card -->
-        <div class="bg-white dark:bg-journal-green rounded-xl shadow-lg p-6 transition-colors">
+        <div class="tree-card p-6 transition-colors">
             <h3 class="text-xl font-semibold text-journal-dark dark:text-gray-100 mb-4 flex items-center">
                 <i class="fas fa-file-upload text-journal-gold mr-2"></i>
                 Or Upload a File
             </h3>
 
             <div class="space-y-4">
-                <label for="sequence_file" class="block w-full border-2 border-dashed border-gray-300 dark:border-gray-600 
+                <label for="sequence_file" class="upload-dropzone block w-full border-2 border-dashed border-gray-300 dark:border-gray-600
                               rounded-lg p-8 text-center cursor-pointer
                               hover:border-journal-gold dark:hover:border-journal-gold
                               transition-colors bg-gray-50 dark:bg-journal-dark">
@@ -244,16 +726,14 @@
                 </div>
 
                 <!-- Hidden Add Button for File -->
-                <button id="add_file_btn" class="hidden w-full bg-journal-gold hover:bg-journal-gold-light text-journal-dark 
-                               py-3 px-4 rounded-lg font-semibold shadow-md hover:shadow-lg 
-                               transition-all flex items-center justify-center">
+                <button id="add_file_btn" class="hidden btn btn-outline-gold w-full">
                     <i class="fas fa-plus mr-2"></i> Add Sequences from File
                 </button>
             </div>
         </div>
 
         <!-- 5. Paste Sequences Card -->
-        <div class="bg-white dark:bg-journal-green rounded-xl shadow-lg p-6 transition-colors">
+        <div class="tree-card p-6 transition-colors">
             <h3 class="text-xl font-semibold text-journal-dark dark:text-gray-100 mb-4 flex items-center">
                 <i class="fas fa-edit text-journal-gold mr-2"></i>
                 Add Custom Sequences
@@ -264,21 +744,30 @@
                     <label for="sequence_text" class="block text-sm font-medium text-gray-700 dark:text-gray-200 mb-2">
                         Paste FASTA Sequences or GenBank Accessions
                     </label>
-                    <textarea id="sequence_text" rows="8" class="w-full font-mono text-sm px-4 py-3 border border-gray-300 dark:border-journal-dark rounded-lg 
-                               bg-white dark:bg-journal-dark text-gray-900 dark:text-gray-100
-                               focus:ring-2 focus:ring-journal-gold focus:border-transparent 
-                               transition-all resize-none" placeholder=">seq1&#10;ATGCGATCGATCGATCG...&#10;&#10;OR807397, OR807397.1"></textarea>
-                    <p class="text-xs text-gray-500 dark:text-gray-400 mt-1">
+                    <div class="sequence-input-box" data-sequence-input-box="sequence_text">
+                        <div class="sequence-input-toolbar">
+                            <div class="input-chip-group">
+                                <button type="button" class="input-chip is-active" data-input-chip="sequence_text" data-chip-mode="fasta">FASTA</button>
+                                <button type="button" class="input-chip" data-input-chip="sequence_text" data-chip-mode="accessions">Accessions</button>
+                            </div>
+                            <span id="sequence_text_counter" class="detected-counter">0 sequences detected</span>
+                        </div>
+                        <textarea id="sequence_text" rows="8" class="sequence-textarea"
+                            placeholder="Paste a FASTA record or a list of accession numbers…"></textarea>
+                        <div class="sequence-input-footer">
+                            <span>UTF-8 · plain text</span>
+                            <button type="button" class="paste-example-link" data-paste-example="sequence_text">↳ Paste example</button>
+                        </div>
+                    </div>
+                    <p class="field-help text-xs mt-2">
                         Enter FASTA sequences or one or more GenBank accessions.
                     </p>
                 </div>
 
                 <!-- Action Buttons for Input -->
                 <div class="flex flex-wrap gap-3">
-                    <button id="add_sequences_btn"
-                        class="flex-1 min-w-[140px] bg-journal-dark hover:bg-journal-green text-white 
-                                   py-3 px-4 rounded-lg font-semibold shadow-md hover:shadow-lg 
-                                   transition-all flex items-center justify-center disabled:opacity-50 disabled:cursor-not-allowed" disabled>
+                    <button id="add_sequences_btn" data-active-style="outline"
+                        class="btn flex-1 min-w-[140px]" disabled>
                         <i class="fas fa-plus mr-2"></i> Add / Remove Sequences
                     </button>
                     <!-- BLAST button removed from here -->
@@ -290,83 +779,74 @@
 
     <!-- Right Section: 1 column - Sequence Queue -->
     <div class="lg:col-span-1">
-        <div class="bg-white dark:bg-journal-green rounded-xl shadow-lg transition-colors sticky top-24">
+        <div class="queue-card transition-colors sticky top-24">
 
             <!-- Queue Header -->
-            <div class="p-4 border-b border-gray-200 dark:border-journal-dark flex justify-between items-center">
-                <h3 class="text-xl font-semibold text-journal-dark dark:text-gray-100 flex items-center">
-                    <i class="fas fa-list text-journal-gold mr-2"></i>
-                    Sequence Queue
-                </h3>
-                <span id="sequence_count"
-                    class="bg-journal-gold text-journal-dark text-xs font-bold px-3 py-1 rounded-full hidden">
-                    0 sequences
-                </span>
+            <div class="p-4 border-b border-[var(--line-gold)] flex justify-between items-start gap-4">
+                <h3 class="queue-title">Sequence queue</h3>
+                <div id="sequence_count_block" class="hidden" aria-live="polite">
+                    <span id="sequence_count" class="queue-count-number">0</span>
+                    <span class="queue-count-label">SEQUENCES</span>
+                </div>
             </div>
 
             <!-- Queue Body -->
-            <div class="p-4 max-h-96 overflow-y-auto">
-                <div id="sequence_queue_empty" class="text-center py-10 px-4">
-                    <div class="inline-flex items-center justify-center w-12 h-12 rounded-full bg-journal-gold/20 mb-3">
-                        <i class="fas fa-inbox text-xl text-journal-gold"></i>
-                    </div>
-                    <p class="text-gray-500 dark:text-gray-400 text-sm font-medium">No sequences added yet.</p>
-                    <p class="text-gray-400 dark:text-gray-500 text-xs mt-1">
+            <div class="queue-body">
+                <div id="sequence_queue_empty" class="queue-empty">
+                    <p class="text-sm font-medium">No sequences added yet.</p>
+                    <p class="text-xs mt-1">
                         Paste FASTA sequences and click "Add / Remove Sequences"
                     </p>
                 </div>
-                <ul id="sequence_queue_list" class="divide-y divide-gray-100 dark:divide-journal-dark hidden">
+                <ul id="sequence_queue_list" class="hidden">
                     <!-- Sequences will be added here dynamically -->
                 </ul>
             </div>
 
             <!-- Queue Footer -->
-            <div class="p-4 border-t border-gray-200 dark:border-journal-dark flex justify-between items-center">
-                <div class="flex flex-col gap-1">
-                    <div class="flex items-center gap-3">
-                        <button id="clear_queue_btn" class="text-red-500 hover:text-red-700 dark:text-red-400 dark:hover:text-red-300
-                                       text-sm font-medium transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
-                            disabled>
-                            <i class="fas fa-trash-alt mr-1"></i> Clear All
-                        </button>
-                        <button id="btn-filter-results"
-                            class="text-sm font-medium transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
-                            disabled title="Open filter panel (requires MycoMap sequences with metrics)">
-                            <i class="fas fa-filter mr-1"></i> Filter Results
-                        </button>
-                    </div>
-                    <p id="filter-hint" class="text-xs text-gray-500 dark:text-gray-400">
-                        Import MycoMap results to enable filtering by query coverage, subject coverage, and identity.
-                    </p>
+            <div class="queue-footer">
+                <div class="queue-run-row">
+                    <button id="quick_tree_btn" class="btn btn-primary">
+                        ▶ Run Quick Tree
+                    </button>
+                    <button id="toggle_advanced_btn" class="btn btn-outline-gold">
+                        Advanced…
+                    </button>
                 </div>
-                <span id="queue-remove-hint" class="text-xs text-gray-500 dark:text-gray-400 hidden">Click × to remove</span>
+                <div class="pipeline-summary">
+                    Pipeline: <strong>MAFFT</strong> → <strong>FastTree</strong> · <strong>GTR+CAT</strong> · <strong>1000 BS</strong> · midpoint root
+                </div>
+                <div class="queue-tools">
+                    <button id="clear_queue_btn" class="btn btn-small" disabled>
+                        <i class="fas fa-trash-alt mr-1"></i> Clear All
+                    </button>
+                    <button id="btn-filter-results" class="btn btn-small" disabled
+                        title="Open filter panel (requires MycoMap sequences with metrics)">
+                        <i class="fas fa-filter mr-1"></i> Filter
+                    </button>
+                    <span id="queue-remove-hint" class="text-xs hidden">Click × to remove</span>
+                </div>
+                <p id="filter-hint" class="text-xs mt-3">
+                        Import MycoMap results to enable filtering by query coverage, subject coverage, and identity.
+                </p>
             </div>
         </div>
     </div>
 
 </div>
 
-<!-- Action Buttons Row -->
-<div class="mt-8 flex flex-wrap gap-4">
-    <button id="quick_tree_btn" class="bg-gradient-to-r from-journal-green to-journal-dark hover:from-journal-dark hover:to-journal-green
-                   text-white py-4 px-8 rounded-xl font-bold text-lg shadow-lg hover:shadow-xl
-                   transition-all transform hover:-translate-y-1 flex items-center">
-        <i class="fas fa-magic mr-3"></i> One-Click Quick Tree
-    </button>
-    <button id="toggle_advanced_btn" class="bg-white dark:bg-journal-green border-2 border-gray-300 dark:border-journal-dark
-                   text-gray-700 dark:text-gray-200 py-4 px-8 rounded-xl font-semibold text-lg
-                   shadow-md hover:shadow-lg hover:border-journal-gold transition-all flex items-center">
-        <i class="fas fa-sliders-h mr-3"></i> Advanced Options
-    </button>
-</div>
-
 <!-- Advanced Configuration Panel (Hidden by default) -->
-<div id="advanced_panel" class="mt-6 bg-white dark:bg-journal-green rounded-xl shadow-lg p-6 transition-colors hidden">
-    <h3 class="text-xl font-semibold text-journal-dark dark:text-gray-100 mb-6 flex items-center">
-        <i class="fas fa-cogs text-journal-gold mr-2"></i>
-        2. Pipeline Configuration
-    </h3>
+<div id="advanced_panel" class="mt-6 tree-card p-6 transition-colors hidden">
+    <div class="flex flex-col gap-2">
+        <p class="eyebrow">Advanced</p>
+        <h3 class="mb-1">Pipeline Configuration</h3>
+        <div class="advanced-summary">
+            <p id="advanced_current_summary" class="text-sm">Currently: MAFFT + FastTree 2.2.0, midpoint-rooted, 1000 bootstrap.</p>
+            <button id="advanced_customize_btn" type="button" class="btn btn-small btn-outline-gold">▾ Customize</button>
+        </div>
+    </div>
 
+    <div id="advanced_form_body" class="advanced-form-body hidden">
     <div class="grid grid-cols-1 md:grid-cols-2 gap-6">
         <!-- Alignment Method -->
         <div>
@@ -602,47 +1082,24 @@
 
     <!-- Advanced Submit Button -->
     <div class="mt-8 text-center">
-        <button id="submit_btn" class="bg-journal-gold hover:bg-journal-gold-light text-journal-dark 
-                       py-4 px-12 rounded-xl font-bold text-lg shadow-lg hover:shadow-xl
-                       transition-all transform hover:-translate-y-1">
+        <button id="submit_btn" class="btn btn-outline-gold px-12">
             <i class="fas fa-play mr-2"></i> Start Analysis
         </button>
     </div>
+    </div>
 </div>
 
-<!-- Tips Panel -->
-<div class="mt-8 bg-gradient-to-r from-journal-gold/10 to-journal-gold/5 dark:from-journal-dark dark:to-journal-green/50 
-            rounded-xl p-6 border border-journal-gold/30 dark:border-journal-dark">
-    <h4 class="text-lg font-semibold text-journal-dark dark:text-gray-100 mb-3 flex items-center">
-        <i class="fas fa-lightbulb text-journal-gold mr-2"></i>
-        Quick Tips
-    </h4>
-    <ul class="space-y-2 text-sm text-gray-700 dark:text-gray-300">
-        <li class="flex items-start">
-            <i class="fas fa-search text-journal-gold mr-2 mt-0.5"></i>
-            <span><strong>BLAST:</strong> Enter a single sequence or GenBank accession to find related sequences</span>
-        </li>
-        <li class="flex items-start">
-            <i class="fas fa-magic text-journal-gold mr-2 mt-0.5"></i>
-            <span><strong>Quick Tree:</strong> Uses MAFFT + FastTree 2.2.0 (Maximum Likelihood)</span>
-        </li>
-        <li class="flex items-start">
-            <i class="fas fa-sliders-h text-journal-gold mr-2 mt-0.5"></i>
-            <span><strong>Advanced:</strong> Choose alignment, trimming, and tree methods</span>
-        </li>
-    </ul>
-</div>
-<!-- Filter Results Modal -->
+<!-- Filter Modal -->
 <div id="filter-modal" class="hidden fixed inset-0 z-50 flex items-center justify-center p-4">
     <!-- Backdrop -->
     <div id="filter-modal-backdrop" class="absolute inset-0 bg-black/50 dark:bg-black/70"></div>
     <!-- Panel -->
-    <div class="relative bg-white dark:bg-journal-green rounded-xl shadow-2xl w-full sm:max-w-4xl max-h-[90vh] flex flex-col">
+    <div class="tree-modal relative w-full sm:max-w-4xl max-h-[90vh] flex flex-col">
         <!-- Header -->
-        <div class="flex items-center justify-between px-6 py-4 border-b border-gray-200 dark:border-journal-dark">
-            <h3 class="text-lg font-semibold text-journal-dark dark:text-gray-100 flex items-center">
+        <div class="flex items-center justify-between px-6 py-4 border-b border-[var(--line)]">
+            <h3 class="flex items-center">
                 <i class="fas fa-filter text-journal-gold mr-2"></i>
-                Filter Results by BLAST Metrics
+                Filter by BLAST Metrics
             </h3>
             <button id="filter-modal-close-x" class="text-gray-400 hover:text-gray-600 dark:text-gray-500 dark:hover:text-gray-300 transition-colors p-1">
                 <i class="fas fa-times text-lg"></i>
@@ -656,10 +1113,10 @@
                 <div class="space-y-2">
                     <div class="flex items-center justify-between">
                         <label class="text-sm font-medium text-gray-700 dark:text-gray-300">Query Coverage %</label>
-                        <span id="filter-qcov-val" class="text-sm font-bold text-blue-600 dark:text-blue-400 bg-blue-50 dark:bg-blue-900/30 px-2 py-0.5 rounded">80</span>
+                        <span id="filter-qcov-val" class="metric-value text-sm font-bold px-2 py-0.5 rounded">80</span>
                     </div>
                     <input id="filter-slider-qcov" type="range" min="0" max="100" value="80" step="1"
-                        class="w-full h-2 rounded-lg appearance-none cursor-pointer accent-blue-500">
+                        class="filter-slider w-full h-2 rounded-lg appearance-none cursor-pointer">
                     <div class="flex justify-between text-xs text-gray-400">
                         <span>0%</span><span>100%</span>
                     </div>
@@ -668,10 +1125,10 @@
                 <div class="space-y-2">
                     <div class="flex items-center justify-between">
                         <label class="text-sm font-medium text-gray-700 dark:text-gray-300">Subject Coverage %</label>
-                        <span id="filter-scov-val" class="text-sm font-bold text-green-600 dark:text-green-400 bg-green-50 dark:bg-green-900/30 px-2 py-0.5 rounded">80</span>
+                        <span id="filter-scov-val" class="metric-value text-sm font-bold px-2 py-0.5 rounded">80</span>
                     </div>
                     <input id="filter-slider-scov" type="range" min="0" max="100" value="80" step="1"
-                        class="w-full h-2 rounded-lg appearance-none cursor-pointer accent-green-500">
+                        class="filter-slider w-full h-2 rounded-lg appearance-none cursor-pointer">
                     <div class="flex justify-between text-xs text-gray-400">
                         <span>0%</span><span>100%</span>
                     </div>
@@ -680,10 +1137,10 @@
                 <div class="space-y-2">
                     <div class="flex items-center justify-between">
                         <label class="text-sm font-medium text-gray-700 dark:text-gray-300">Identity %</label>
-                        <span id="filter-ident-val" class="text-sm font-bold text-purple-600 dark:text-purple-400 bg-purple-50 dark:bg-purple-900/30 px-2 py-0.5 rounded">95</span>
+                        <span id="filter-ident-val" class="metric-value text-sm font-bold px-2 py-0.5 rounded">95</span>
                     </div>
                     <input id="filter-slider-ident" type="range" min="0" max="100" value="95" step="1"
-                        class="w-full h-2 rounded-lg appearance-none cursor-pointer accent-purple-500">
+                        class="filter-slider w-full h-2 rounded-lg appearance-none cursor-pointer">
                     <div class="flex justify-between text-xs text-gray-400">
                         <span>0%</span><span>100%</span>
                     </div>
@@ -693,19 +1150,19 @@
             <div class="flex items-center gap-2 flex-wrap">
                 <span class="text-xs text-gray-500 dark:text-gray-400 mr-1">Presets:</span>
                 <button type="button" onclick="setFilterPreset('loose')"
-                    class="text-xs px-3 py-1.5 rounded-md border border-gray-300 dark:border-journal-dark text-gray-600 dark:text-gray-300 hover:bg-gray-100 dark:hover:bg-journal-dark transition-colors">
+                    class="btn btn-small">
                     Loose
                 </button>
                 <button type="button" onclick="setFilterPreset('typical')"
-                    class="text-xs px-3 py-1.5 rounded-md border border-gray-300 dark:border-journal-dark text-gray-600 dark:text-gray-300 hover:bg-gray-100 dark:hover:bg-journal-dark transition-colors">
+                    class="btn btn-small">
                     Typical
                 </button>
                 <button type="button" onclick="setFilterPreset('strict')"
-                    class="text-xs px-3 py-1.5 rounded-md border border-gray-300 dark:border-journal-dark text-gray-600 dark:text-gray-300 hover:bg-gray-100 dark:hover:bg-journal-dark transition-colors">
+                    class="btn btn-small">
                     Strict
                 </button>
                 <button type="button" onclick="resetFilterSliders()"
-                    class="text-xs px-3 py-1.5 rounded-md border border-gray-300 dark:border-journal-dark text-gray-600 dark:text-gray-300 hover:bg-gray-100 dark:hover:bg-journal-dark transition-colors">
+                    class="btn btn-small">
                     Reset
                 </button>
             </div>
@@ -730,17 +1187,16 @@
             </div>
         </div>
         <!-- Footer -->
-        <div class="flex items-center justify-end gap-3 px-6 py-4 border-t border-gray-200 dark:border-journal-dark">
-            <button id="filter-modal-cancel"
-                class="px-4 py-2 text-sm rounded-lg border border-gray-300 dark:border-journal-dark text-gray-700 dark:text-gray-300 hover:bg-gray-100 dark:hover:bg-journal-dark transition-colors">
+        <div class="flex items-center justify-end gap-3 px-6 py-4 border-t border-[var(--line)]">
+            <button id="filter-modal-cancel" class="btn">
                 Cancel
             </button>
-            <button id="filter-modal-apply"
-                class="px-4 py-2 text-sm rounded-lg bg-journal-gold hover:bg-journal-gold-light text-journal-dark font-semibold transition-colors">
+            <button id="filter-modal-apply" class="btn btn-outline-gold">
                 Apply Filter
             </button>
         </div>
     </div>
+</div>
 </div>
 {% endblock %}
 
@@ -751,11 +1207,13 @@
     // =========================================================================
     let sequenceQueue = [];
     let lastBlastQuery = null; // Track the query used for the last successful BLAST
+    let selectedQueueOutgroup = '';
 
     function updateQueueDisplay() {
         const listEl = document.getElementById('sequence_queue_list');
         const emptyEl = document.getElementById('sequence_queue_empty');
         const countEl = document.getElementById('sequence_count');
+        const countBlockEl = document.getElementById('sequence_count_block');
         const clearBtn = document.getElementById('clear_queue_btn');
         const filterHintEl = document.getElementById('filter-hint');
         const filterBtn = document.getElementById('btn-filter-results');
@@ -763,9 +1221,10 @@
         const removeHintEl = document.getElementById('queue-remove-hint');
         const metricCount = sequenceQueue.filter(s => s.blast_metrics_available === true).length;
 
-        countEl.textContent = `${sequenceQueue.length} sequence${sequenceQueue.length !== 1 ? 's' : ''}`;
-        // Alan 5/11/26 - Keep the count pill hidden until at least one sequence is queued.
-        countEl.classList.toggle('hidden', sequenceQueue.length === 0);
+        countEl.textContent = sequenceQueue.length;
+        if (countBlockEl) {
+            countBlockEl.classList.toggle('hidden', sequenceQueue.length === 0);
+        }
 
         if (sequenceQueue.length === 0) {
             listEl.classList.add('hidden');
@@ -782,20 +1241,33 @@
                 removeHintEl.classList.remove('hidden');
             }
 
-            listEl.innerHTML = sequenceQueue.map((seq, idx) => `
-                <li class="px-4 py-3 flex justify-between items-center hover:bg-gray-50 dark:hover:bg-journal-dark/50 transition-colors">
-                    <div class="overflow-hidden">
-                        <span class="font-mono text-sm font-medium text-journal-dark dark:text-gray-100">${escapeHtml(seq.name)}</span>
-                        ${seq.organism ? `<span class="text-gray-500 dark:text-gray-400 text-xs italic ml-2">${escapeHtml(seq.organism)}</span>` : ''}
-                    </div>
-                    <button onclick="removeSequence(${idx})" 
-                            class="text-gray-400 hover:text-red-500 dark:text-gray-500 dark:hover:text-red-400 
-                                   transition-colors ml-4 p-1"
-                            title="Remove">
-                        <i class="fas fa-times"></i>
-                    </button>
-                </li>
-            `).join('');
+            let selectedOutgroup = getSelectedOutgroupName();
+            if (selectedOutgroup && !sequenceQueue.some(seq => seq.name === selectedOutgroup)) {
+                selectedQueueOutgroup = '';
+                const select = document.getElementById('outgroup_select');
+                if (select) select.value = '';
+                selectedOutgroup = '';
+            }
+            listEl.innerHTML = sequenceQueue.map((seq, idx) => {
+                const name = seq.name || '';
+                const organism = seq.organism || '';
+                const length = String(seq.sequence || '').length;
+                const isOutgroup = selectedOutgroup && selectedOutgroup === name;
+                return `
+                    <li class="queue-row${isOutgroup ? ' is-outgroup' : ''}">
+                        <span class="queue-index">${String(idx + 1).padStart(2, '0')}</span>
+                        <input type="checkbox" class="outgroup-checkbox" ${isOutgroup ? 'checked' : ''}
+                            onchange="setOutgroupFromQueue(${idx}, this.checked)"
+                            title="Use as outgroup">
+                        <div class="queue-name">
+                            <span class="queue-accession" title="${escapeHtml(name)}">${escapeHtml(name)}</span>
+                            ${organism ? `<span class="queue-species">${escapeHtml(organism)}</span>` : ''}
+                        </div>
+                        <span class="queue-length">${length}<span>bp</span></span>
+                        <button onclick="removeSequence(${idx})" class="queue-remove" title="Remove">×</button>
+                    </li>
+                `;
+            }).join('');
         }
 
         // Auto-update outgroup dropdown if RAxML is selected and function exists
@@ -814,7 +1286,7 @@
         }
         if (filterHintEl) {
             if (metricCount > 0) {
-                filterHintEl.textContent = `${metricCount} sequence${metricCount !== 1 ? 's' : ''} in the queue have BLAST metrics. Use Filter Results to exclude low-confidence hits.`;
+                filterHintEl.textContent = `${metricCount} sequence${metricCount !== 1 ? 's' : ''} in the queue have BLAST metrics. Use Filter to exclude low-confidence hits.`;
             } else if (sequenceQueue.length > 0) {
                 filterHintEl.textContent = 'Import MycoMap results to enable filtering by query coverage, subject coverage, and identity.';
             } else {
@@ -825,24 +1297,21 @@
 
     function updateButtonVisuals(btn, isValid) {
         if (!btn) return;
+        btn.classList.remove('btn-primary', 'btn-outline-gold');
+        btn.classList.add('btn');
         if (isValid) {
-            btn.classList.remove('bg-journal-dark', 'text-white', 'hover:bg-journal-green');
-            btn.classList.add('bg-journal-gold', 'text-journal-dark', 'hover:bg-journal-gold-light');
-        } else {
-            btn.classList.add('bg-journal-dark', 'text-white', 'hover:bg-journal-green');
-            btn.classList.remove('bg-journal-gold', 'text-journal-dark', 'hover:bg-journal-gold-light');
+            const activeStyle = btn.dataset.activeStyle || 'outline';
+            btn.classList.add(activeStyle === 'primary' ? 'btn-primary' : 'btn-outline-gold');
         }
     }
 
     // Alan 5/8/26 - Make the filter button visibly active only when the queue contains MycoMap metrics.
     function updateFilterButtonVisuals(btn, enabled) {
         if (!btn) return;
+        btn.classList.remove('btn-outline-gold');
+        btn.classList.add('btn', 'btn-small');
         if (enabled) {
-            btn.classList.remove('text-gray-400', 'dark:text-gray-500', 'disabled:opacity-40');
-            btn.classList.add('bg-journal-gold', 'hover:bg-journal-gold-light', 'text-journal-dark', 'px-3', 'py-2', 'rounded-lg', 'shadow-sm');
-        } else {
-            btn.classList.add('text-gray-400', 'dark:text-gray-500', 'disabled:opacity-40');
-            btn.classList.remove('bg-journal-gold', 'hover:bg-journal-gold-light', 'text-journal-dark', 'px-3', 'py-2', 'rounded-lg', 'shadow-sm');
+            btn.classList.add('btn-outline-gold');
         }
     }
 
@@ -886,6 +1355,28 @@
     function clearQueue() {
         sequenceQueue = [];
         lastBlastQuery = null; // Reset BLAST context
+        selectedQueueOutgroup = '';
+        updateQueueDisplay();
+    }
+
+    function getSelectedOutgroupName() {
+        const select = document.getElementById('outgroup_select');
+        return (select && select.value) || selectedQueueOutgroup || '';
+    }
+
+    function setOutgroupFromQueue(index, checked) {
+        const seq = sequenceQueue[index];
+        selectedQueueOutgroup = checked && seq ? seq.name : '';
+        const select = document.getElementById('outgroup_select');
+        if (select) {
+            if (selectedQueueOutgroup && ![...select.options].some(o => o.value === selectedQueueOutgroup)) {
+                const opt = document.createElement('option');
+                opt.value = selectedQueueOutgroup;
+                opt.text = selectedQueueOutgroup;
+                select.add(opt);
+            }
+            select.value = selectedQueueOutgroup;
+        }
         updateQueueDisplay();
     }
 
@@ -949,6 +1440,51 @@
         return [...new Set(tokens.map(token => token.toUpperCase()))];
     }
 
+    function countDetectedInputItems(text) {
+        const fastaCount = parseFasta(text).filter(seq => seq.sequence.length > 0).length;
+        if (fastaCount > 0) {
+            return { count: fastaCount, mode: 'fasta' };
+        }
+        const accessionCount = parseGenBankAccessions(text).length;
+        return { count: accessionCount, mode: accessionCount > 0 ? 'accessions' : 'fasta' };
+    }
+
+    function updateSequenceInputMeta(inputId) {
+        const input = document.getElementById(inputId);
+        const counter = document.getElementById(`${inputId}_counter`);
+        if (!input || !counter) return;
+        const detected = countDetectedInputItems(input.value.trim());
+        counter.textContent = `${detected.count} sequence${detected.count === 1 ? '' : 's'} detected`;
+        document.querySelectorAll(`[data-input-chip="${inputId}"]`).forEach(chip => {
+            chip.classList.toggle('is-active', chip.dataset.chipMode === detected.mode);
+        });
+    }
+
+    function insertSequenceExample(inputId) {
+        const input = document.getElementById(inputId);
+        if (!input) return;
+        const activeMode = document.querySelector(`[data-input-chip="${inputId}"].is-active`)?.dataset.chipMode || 'fasta';
+        input.value = activeMode === 'accessions'
+            ? (inputId === 'blast_query' ? 'OR807397' : 'OR807397\nOR807398')
+            : '>OP973765 Amanita muscaria ITS\nATGCGTACGTAGCTAGCTAGCTAGCTAGCTAGCTAGCTA';
+        input.dispatchEvent(new Event('input', { bubbles: true }));
+        input.focus();
+    }
+
+    document.querySelectorAll('[data-input-chip]').forEach(chip => {
+        chip.addEventListener('click', () => {
+            const inputId = chip.dataset.inputChip;
+            document.querySelectorAll(`[data-input-chip="${inputId}"]`).forEach(peer => {
+                peer.classList.toggle('is-active', peer === chip);
+            });
+            document.getElementById(inputId)?.focus();
+        });
+    });
+
+    document.querySelectorAll('[data-paste-example]').forEach(link => {
+        link.addEventListener('click', () => insertSequenceExample(link.dataset.pasteExample));
+    });
+
     // =========================================================================
     // BLAST Button Logic
     // =========================================================================
@@ -961,6 +1497,7 @@
     function updateBlastButtonState() {
         const text = blastQueryInput.value.trim();
         let isValid = false;
+        updateSequenceInputMeta('blast_query');
 
         if (isGenBankAccession(text)) {
             isValid = true;
@@ -986,6 +1523,7 @@
     }
 
     blastQueryInput.addEventListener('input', updateBlastButtonState);
+    updateBlastButtonState();
 
     blastBtn.addEventListener('click', async () => {
         const text = blastQueryInput.value.trim();
@@ -1057,6 +1595,7 @@
         const sequences = parseFasta(text);
         const accessions = parseGenBankAccessions(text);
         const isValid = sequences.some(seq => seq.sequence.length > 0) || accessions.length > 0;
+        updateSequenceInputMeta('sequence_text');
 
         addSequencesBtn.disabled = !isValid;
         updateButtonVisuals(addSequencesBtn, isValid);
@@ -1156,10 +1695,8 @@
 
             showStatus(`File ready: ${fileSequences.length} sequence${fileSequences.length !== 1 ? 's' : ''} found. Click Add to queue.`, 'info');
 
-            // Show button and make it gold
+            // Show the file add action once a valid FASTA file has been parsed.
             addBtn.classList.remove('hidden');
-            // Since it's valid, it should be gold (it is bg-journal-gold by default in HTML)
-            // But let's enforce active look if we had different styles
         } catch (err) {
             showStatus('Error reading file: ' + err.message, 'error');
             addBtn.classList.add('hidden');
@@ -1202,9 +1739,15 @@
         const isValid = isValidMycomapUrl(mycomapUrlInput.value.trim());
         updateButtonVisuals(fetchMycomapBtn, isValid);
         updateButtonVisuals(mycomapQuickTreeBtn, isValid);
+        const queueQuickTreeBtn = document.getElementById('quick_tree_btn');
+        if (queueQuickTreeBtn) {
+            queueQuickTreeBtn.classList.toggle('btn-primary', !isValid);
+            queueQuickTreeBtn.classList.toggle('btn-outline-gold', isValid);
+        }
     }
 
     mycomapUrlInput.addEventListener('input', checkMycomapState);
+    checkMycomapState();
 
     function isValidMycomapUrl(url) {
         if (!url) return false;
@@ -1295,7 +1838,7 @@
         fetchMycomapBtn.innerHTML = '<i class="fas fa-spinner fa-spin mr-2"></i> Fetching...';
         await doFetchMycomap();
         fetchMycomapBtn.disabled = false;
-        fetchMycomapBtn.innerHTML = '<i class="fas fa-download mr-2"></i> Fetch Sequences';
+        fetchMycomapBtn.innerHTML = '<i class="fas fa-download mr-2"></i> Fetch sequences only';
     });
 
     mycomapQuickTreeBtn.addEventListener('click', async () => {
@@ -1651,16 +2194,22 @@
     // =========================================================================
     const advancedPanel = document.getElementById('advanced_panel');
     const toggleBtn = document.getElementById('toggle_advanced_btn');
+    const advancedFormBody = document.getElementById('advanced_form_body');
+    const advancedCustomizeBtn = document.getElementById('advanced_customize_btn');
     let advancedVisible = false;
+    let advancedCustomizeVisible = false;
 
     toggleBtn.addEventListener('click', () => {
         advancedVisible = !advancedVisible;
         advancedPanel.classList.toggle('hidden', !advancedVisible);
-        toggleBtn.innerHTML = advancedVisible
-            ? '<i class="fas fa-times mr-3"></i> Hide Advanced Options'
-            : '<i class="fas fa-sliders-h mr-3"></i> Advanced Options';
+        toggleBtn.textContent = advancedVisible ? 'Hide advanced' : 'Advanced…';
     });
 
+    advancedCustomizeBtn.addEventListener('click', () => {
+        advancedCustomizeVisible = !advancedCustomizeVisible;
+        advancedFormBody.classList.toggle('hidden', !advancedCustomizeVisible);
+        advancedCustomizeBtn.textContent = advancedCustomizeVisible ? '▴ Hide' : '▾ Customize';
+    });
 
     // =========================================================================
     // Quick Tree Submit
@@ -1674,7 +2223,7 @@
         }
 
         btn.disabled = true;
-        btn.innerHTML = '<i class="fas fa-spinner fa-spin mr-3"></i> Submitting...';
+        btn.innerHTML = '<i class="fas fa-spinner fa-spin mr-2"></i> Submitting...';
         showStatus('Running Quick Tree analysis...', 'info');
 
         // Default notes logic
@@ -1726,7 +2275,7 @@
         } catch (e) {
             showStatus('Submission Failed: ' + e.message, 'error');
             btn.disabled = false;
-            btn.innerHTML = '<i class="fas fa-magic mr-3"></i> One-Click Quick Tree';
+            btn.innerHTML = '▶ Run Quick Tree';
         }
     });
 
@@ -1736,6 +2285,7 @@
     const treeMethodSelect = document.getElementById('tree_method');
     const mlOptions = document.getElementById('ml_options');
     const mbOptions = document.getElementById('mrbayes_options');
+    const advancedCurrentSummary = document.getElementById('advanced_current_summary');
 
     // RAxML Specifics
     const raxmlPresetContainer = document.getElementById('raxml_preset_container');
@@ -1745,6 +2295,23 @@
     const standardBootstrapOptions = document.getElementById('standard_bootstrap_options');
     const raxmlBootstrapOptions = document.getElementById('raxml_bootstrap_options');
     const raxmlAdvancedOptions = document.getElementById('raxml_advanced_options');
+
+    function selectedText(id) {
+        const el = document.getElementById(id);
+        return el?.selectedOptions?.[0]?.textContent?.replace(/\s*\([^)]*\)/g, '').trim() || '';
+    }
+
+    function refreshAdvancedSummary() {
+        if (!advancedCurrentSummary) return;
+        const alignment = selectedText('alignment_method') || 'MAFFT';
+        const treeMethod = treeMethodSelect.value === 'fasttree' ? 'FastTree 2.2.0' : selectedText('tree_method');
+        const bootstrap = treeMethodSelect.value === 'fasttree'
+            ? 1000
+            : (parseInt(document.getElementById('bootstrap')?.value, 10) || 100);
+        const outgroup = document.getElementById('outgroup_select')?.value;
+        const rooting = outgroup ? `outgroup: ${outgroup}` : 'midpoint-rooted';
+        advancedCurrentSummary.textContent = `Currently: ${alignment} + ${treeMethod}, ${rooting}, ${bootstrap} bootstrap.`;
+    }
 
     function updateForm() {
         const method = treeMethodSelect.value;
@@ -1824,10 +2391,16 @@
                 treeModelText.value = 'GTR+G';
             }
         }
+
+        refreshAdvancedSummary();
     }
 
     // Listeners
     treeMethodSelect.addEventListener('change', updateForm);
+    ['alignment_method', 'trimming_method', 'tree_model', 'bootstrap', 'outgroup_select'].forEach(id => {
+        document.getElementById(id)?.addEventListener('input', refreshAdvancedSummary);
+        document.getElementById(id)?.addEventListener('change', refreshAdvancedSummary);
+    });
 
     // RAxML Model Dropdown Sync
     // When dropdown changes (custom or preset), logic is handled at submit time or here?
@@ -1877,7 +2450,7 @@
     // Outgroup Population
     function populateOutgroupDropdown() {
         const select = document.getElementById('outgroup_select');
-        const currentSelection = select.value;
+        const currentSelection = selectedQueueOutgroup || select.value;
 
         // Clear except first
         while (select.options.length > 1) {
@@ -1894,8 +2467,9 @@
             select.add(opt);
 
             // Auto-select "outgroup"
-            if (!defaultFound && seq.name.toLowerCase().includes('outgroup')) {
+            if (!currentSelection && !defaultFound && seq.name.toLowerCase().includes('outgroup')) {
                 opt.selected = true;
+                selectedQueueOutgroup = seq.name;
                 defaultFound = true;
             }
         });
@@ -1903,10 +2477,19 @@
         // Restore selection if valid
         if (currentSelection && [...select.options].some(o => o.value === currentSelection)) {
             select.value = currentSelection;
+            selectedQueueOutgroup = currentSelection;
         } else if (!defaultFound) {
             select.value = "";
+            selectedQueueOutgroup = "";
         }
+        refreshAdvancedSummary();
     }
+
+    document.getElementById('outgroup_select')?.addEventListener('change', function() {
+        selectedQueueOutgroup = this.value;
+        updateQueueDisplay();
+        refreshAdvancedSummary();
+    });
 
     // Init initial state
     updateForm();
@@ -2128,16 +2711,13 @@
         // Alan 5/10/26 - Build the heading via DOM APIs + textContent instead of
         // innerHTML so EDIT_JOB_ID (URL-supplied) can never be parsed as markup.
         // Defense in depth on top of the UUID regex check above.
-        const headingEl = document.querySelector('h2');
+        const headingEl = document.querySelector('.tree-page-title');
         if (headingEl) {
             headingEl.textContent = '';
-            const icon = document.createElement('i');
-            icon.className = 'fas fa-plus-circle text-journal-gold mr-3';
             const idSpan = document.createElement('span');
-            idSpan.className = 'font-mono text-gray-500';
+            idSpan.className = 'font-mono';
             idSpan.textContent = EDIT_JOB_ID;
-            headingEl.appendChild(icon);
-            headingEl.appendChild(document.createTextNode('Add Sequences to Job '));
+            headingEl.appendChild(document.createTextNode('Add Sequences to Job '));
             headingEl.appendChild(idSpan);
         }
         document.title = `Add Sequences - Job ${EDIT_JOB_ID}`;
@@ -2155,8 +2735,6 @@
 
         // Change Submit Button
         submitBtn.innerHTML = '<i class="fas fa-plus-circle mr-2"></i> Add & Recompute';
-        submitBtn.classList.remove('bg-journal-gold', 'text-journal-dark');
-        submitBtn.classList.add('bg-green-600', 'text-white', 'hover:bg-green-700');
 
         // Let's create a dedicated "Add & Recompute" button container below the queue
         const queueContainer = document.querySelector('.lg\\:col-span-1 > div'); // The queue card
@@ -2164,11 +2742,9 @@
             const footer = queueContainer.querySelector('.border-t');
             // Insert a new primary action button in the queue footer or below it
             const actionDiv = document.createElement('div');
-            actionDiv.className = "p-4 border-t border-gray-200 dark:border-journal-dark";
+            actionDiv.className = "queue-footer";
             actionDiv.innerHTML = `
-                <button id="btn_add_recompute_job" class="w-full bg-green-600 hover:bg-green-700 text-white 
-                               py-3 px-4 rounded-lg font-bold shadow-md hover:shadow-lg 
-                               transition-all flex items-center justify-center">
+                <button id="btn_add_recompute_job" class="btn btn-primary w-full">
                     <i class="fas fa-sync mr-2"></i> Add & Recompute
                 </button>
             `;
@@ -2238,7 +2814,7 @@
     updateQueueDisplay();
 
     // =========================================================================
-    // Filter Results Modal
+    // Filter Modal
     // =========================================================================
     const FILTER_DEFAULTS = { queryCover: 80, subjectCover: 80, identity: 95 };
     const FILTER_PRESETS = {

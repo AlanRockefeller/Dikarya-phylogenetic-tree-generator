@@ -468,6 +468,7 @@ def fetch_mycomap():
             build_blast_metric_keys,
             fetch_mycomap_blast_metrics,
             fetch_mycomap_fasta,
+            improve_mycomap_sequence_name,
             validate_mycomap_url,
         )
         from app.services.fasta_utils import clean_dna_sequence
@@ -557,6 +558,11 @@ def fetch_mycomap():
                     break
 
             if metric:
+                seq['name'] = improve_mycomap_sequence_name(
+                    seq.get('name', ''),
+                    metric,
+                    seq.get('hit_source', ''),
+                )
                 seq['identity'] = metric.get('identity')
                 seq['query_cover'] = metric.get('query_cover')
                 seq['subject_cover'] = metric.get('subject_cover')

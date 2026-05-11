@@ -57,6 +57,12 @@
         // Alan 5/11/26 - Clear visible active selections without mutating saved selection sets.
         deselectCurrentSelection() { return 0; }
 
+        // Alan 5/11/26 - Expose box-select mode so the controller can toggle background drag selection.
+        setBoxSelectMode(enabled) { return false; }
+
+        // Alan 5/11/26 - Expose box-select mode state so the toolbar button can stay in sync.
+        getBoxSelectMode() { return false; }
+
         /**
          * Perform a bulk selection action.
          * @param {string} action - One of: 'all', 'none', 'inverse', 'all-leaves', 'all-internal', 'select-filtered'
@@ -260,6 +266,8 @@
             this.supportLabelsTimer = null;
             this.lastStats = { supportType: 'none', maxSupport: 0 };
             this.baseSpacing = { x: 20, y: 20 }; // Phylotree fixed_width values (per-node/per-level)
+            // Alan 5/11/26 - Track box-select mode, active drag state, and removable listeners in one place.
+            this.boxSelectState = { enabled: false, drag: null, pointerDownListener: null, contextMenuListener: null, suppressContextMenuUntil: 0 };
         }
 
         async render(newick) {
@@ -406,6 +414,8 @@
 
                 // Override click behavior: left-click = select, shift/right = menu
                 this._overrideClickBehavior();
+                // Alan 5/11/26 - Attach background box-select after phylotree handlers so it can suppress pan only for box gestures.
+                this._attachBoxSelectHandlers();
 
                 // Alan 5/8/26 - Disable wheel-to-zoom so mouse wheel scrolls the page instead of zooming the tree.
                 // Intercept wheel events before D3 and let the page scroll instead.
@@ -466,6 +476,26 @@
             // For thresholds, we can just re-run support labels
             this._addSupportLabels();
             this._updateNodeStylesOnly(); // in case filter logic uses options
+        }
+
+        // Alan 5/11/26 - Toggle toolbar-driven box selection while preserving normal right-drag shortcut behavior.
+        setBoxSelectMode(enabled) {
+            // Alan 5/11/26 - Store the mode as a strict boolean so button state and gestures agree.
+            this.boxSelectState.enabled = Boolean(enabled);
+            // Alan 5/11/26 - Cancel an in-progress box if the toolbar disables the mode mid-drag.
+            if (!this.boxSelectState.enabled) this._cancelBoxSelectDrag();
+            // Alan 5/11/26 - Give the tree surface a selection cursor only while box-select mode is active.
+            if (this.container) this.container.style.cursor = this.boxSelectState.enabled ? 'crosshair' : '';
+            // Alan 5/11/26 - Notify the controller so the toolbar button can mirror Esc and programmatic changes.
+            if (this.callbacks.onBoxSelectModeChange) this.callbacks.onBoxSelectModeChange(this.boxSelectState.enabled);
+            // Alan 5/11/26 - Return the normalized state for callers that immediately update UI.
+            return this.boxSelectState.enabled;
+        }
+
+        // Alan 5/11/26 - Let the controller read whether box-select mode is currently enabled.
+        getBoxSelectMode() {
+            // Alan 5/11/26 - Coerce through Boolean to avoid leaking internal state shape.
+            return Boolean(this.boxSelectState.enabled);
         }
 
         updateLayout(layout, alignTips) {
@@ -1577,6 +1607,343 @@
             // Attach listeners
             this.container.addEventListener('click', this._clickListener, true);
             this.container.addEventListener('contextmenu', this._contextMenuListener);
+        }
+
+        // Alan 5/11/26 - Attach background pointer handlers for toolbar box-select and right-drag box-select.
+        _attachBoxSelectHandlers() {
+            // Alan 5/11/26 - Keep box-select inert until an SVG has rendered.
+            if (!this.container || !window.d3v7) return;
+            // Alan 5/11/26 - Remove stale handlers before redraws attach fresh ones.
+            if (this.boxSelectState.pointerDownListener) this.container.removeEventListener('pointerdown', this.boxSelectState.pointerDownListener, true);
+            // Alan 5/11/26 - Remove stale context-menu suppression before redraws attach fresh ones.
+            if (this.boxSelectState.contextMenuListener) this.container.removeEventListener('contextmenu', this.boxSelectState.contextMenuListener, true);
+            // Alan 5/11/26 - Keep the overlay positioned relative to the tree container.
+            if (getComputedStyle(this.container).position === 'static') this.container.style.position = 'relative';
+            // Alan 5/11/26 - Capture pointerdown early so background box-select does not trigger phylotree pan.
+            this.boxSelectState.pointerDownListener = (event) => this._handleBoxSelectPointerDown(event);
+            // Alan 5/11/26 - Suppress the browser context menu only after a right-drag selection gesture.
+            this.boxSelectState.contextMenuListener = (event) => this._handleBoxSelectContextMenu(event);
+            // Alan 5/11/26 - Use capture so background box-select wins before D3 zoom handlers.
+            this.container.addEventListener('pointerdown', this.boxSelectState.pointerDownListener, true);
+            // Alan 5/11/26 - Use capture so right-drag cleanup can block the native context menu.
+            this.container.addEventListener('contextmenu', this.boxSelectState.contextMenuListener, true);
+        }
+
+        // Alan 5/11/26 - Start box-select only from empty tree background or toolbar mode.
+        _handleBoxSelectPointerDown(event) {
+            // Alan 5/11/26 - Leave node right-click and normal node selection behavior untouched.
+            if (!this._isBoxSelectBackgroundTarget(event.target)) return;
+            // Alan 5/11/26 - Enable left-drag only when the visible toolbar mode is active.
+            const toolbarDrag = this.boxSelectState.enabled && event.button === 0;
+            // Alan 5/11/26 - Always allow right-drag on empty background as the power-user shortcut.
+            const rightDrag = event.button === 2;
+            // Alan 5/11/26 - Ignore middle-click and other pointer starts.
+            if (!toolbarDrag && !rightDrag) return;
+            // Alan 5/11/26 - Stop D3 pan/zoom from seeing the selection gesture.
+            event.preventDefault();
+            // Alan 5/11/26 - Stop downstream SVG handlers while the rectangle gesture starts.
+            event.stopPropagation();
+            // Alan 5/11/26 - Begin the rectangle drag using viewport coordinates so zoomed trees work.
+            this._startBoxSelectDrag(event, rightDrag);
+        }
+
+        // Alan 5/11/26 - Prevent browser menus for background right-drag box-select gestures.
+        _handleBoxSelectContextMenu(event) {
+            // Alan 5/11/26 - Preserve node context menus because they are handled by phylotree.
+            if (event.target?.closest?.('.node, .internal-node')) return;
+            // Alan 5/11/26 - Suppress background context menus during or just after a right-drag gesture.
+            if (this.boxSelectState.drag?.rightButton || Date.now() < (this.boxSelectState.suppressContextMenuUntil || 0)) {
+                // Alan 5/11/26 - Keep the browser context menu from covering the selected box.
+                event.preventDefault();
+                // Alan 5/11/26 - Stop later context-menu listeners from reopening background menus.
+                event.stopPropagation();
+            }
+        }
+
+        // Alan 5/11/26 - Treat non-node SVG/container areas as valid box-select start targets.
+        _isBoxSelectBackgroundTarget(target) {
+            // Alan 5/11/26 - Defensive guard for non-element event targets.
+            if (!target || typeof target.closest !== 'function') return false;
+            // Alan 5/11/26 - Keep tip and internal-node click/right-click behavior unchanged.
+            if (target.closest('.node, .internal-node')) return false;
+            // Alan 5/11/26 - Avoid hijacking toolbar or form controls if they bubble through the container.
+            if (target.closest('button, a, input, select, textarea, label')) return false;
+            // Alan 5/11/26 - Allow empty SVG background and the surrounding tree container.
+            return Boolean(target.closest('svg') || target === this.container || this.container.contains(target));
+        }
+
+        // Alan 5/11/26 - Create the drag state and overlay for a box-select gesture.
+        _startBoxSelectDrag(event, rightButton) {
+            // Alan 5/11/26 - Cancel any previous incomplete drag before starting a new one.
+            this._cancelBoxSelectDrag();
+            // Alan 5/11/26 - Create a lightweight DOM overlay rather than changing the SVG scene.
+            const overlay = this._createBoxSelectOverlay();
+            // Alan 5/11/26 - Store viewport coordinates so DOM hit testing stays correct under zoom/pan.
+            const drag = {
+                pointerId: event.pointerId,
+                startX: event.clientX,
+                startY: event.clientY,
+                currentX: event.clientX,
+                currentY: event.clientY,
+                moved: false,
+                rightButton,
+                mode: this._boxSelectModeFromEvent(event),
+                overlay,
+                moveListener: null,
+                upListener: null,
+                keyListener: null
+            };
+            // Alan 5/11/26 - Store the active drag so movement, release, and Esc can coordinate.
+            this.boxSelectState.drag = drag;
+            // Alan 5/11/26 - Update the overlay immediately so slow drags feel responsive.
+            this._positionBoxSelectOverlay(drag);
+            // Alan 5/11/26 - Track movement on window so the pointer can leave the SVG during drag.
+            drag.moveListener = (moveEvent) => this._updateBoxSelectDrag(moveEvent);
+            // Alan 5/11/26 - Finish on pointerup anywhere in the viewport.
+            drag.upListener = (upEvent) => this._finishBoxSelectDrag(upEvent);
+            // Alan 5/11/26 - Let Escape cancel a rectangle before it changes selection.
+            drag.keyListener = (keyEvent) => {
+                // Alan 5/11/26 - Cancel only the active box-select drag on Escape.
+                if (keyEvent.key === 'Escape') this._cancelBoxSelectDrag();
+            };
+            // Alan 5/11/26 - Register temporary drag listeners for the gesture lifetime only.
+            window.addEventListener('pointermove', drag.moveListener, true);
+            // Alan 5/11/26 - Register temporary pointerup listener for cleanup and selection.
+            window.addEventListener('pointerup', drag.upListener, true);
+            // Alan 5/11/26 - Register temporary Escape listener for keyboard cancellation.
+            window.addEventListener('keydown', drag.keyListener, true);
+            // Alan 5/11/26 - Capture the pointer when possible to keep drag updates steady.
+            try { this.container.setPointerCapture(event.pointerId); } catch (_) { }
+        }
+
+        // Alan 5/11/26 - Update drag bounds and reveal the rectangle once the user moves far enough.
+        _updateBoxSelectDrag(event) {
+            // Alan 5/11/26 - Ignore movement if no box-select gesture is active.
+            const drag = this.boxSelectState.drag;
+            // Alan 5/11/26 - Ignore unrelated pointer streams.
+            if (!drag || event.pointerId !== drag.pointerId) return;
+            // Alan 5/11/26 - Stop D3 pan/zoom while resizing the box.
+            event.preventDefault();
+            // Alan 5/11/26 - Stop downstream handlers while resizing the box.
+            event.stopPropagation();
+            // Alan 5/11/26 - Track the latest viewport pointer position.
+            drag.currentX = event.clientX;
+            // Alan 5/11/26 - Track the latest viewport pointer position.
+            drag.currentY = event.clientY;
+            // Alan 5/11/26 - Treat tiny pointer drift as a click, not a selection rectangle.
+            drag.moved = drag.moved || Math.hypot(drag.currentX - drag.startX, drag.currentY - drag.startY) >= 5;
+            // Alan 5/11/26 - Keep the visual rectangle synced with the pointer.
+            this._positionBoxSelectOverlay(drag);
+        }
+
+        // Alan 5/11/26 - Finalize a box-select drag and apply membership changes.
+        _finishBoxSelectDrag(event) {
+            // Alan 5/11/26 - Ignore pointerup if no box-select gesture is active.
+            const drag = this.boxSelectState.drag;
+            // Alan 5/11/26 - Ignore unrelated pointer streams.
+            if (!drag || event.pointerId !== drag.pointerId) return;
+            // Alan 5/11/26 - Stop the release from triggering phylotree pan or browser context behavior.
+            event.preventDefault();
+            // Alan 5/11/26 - Stop downstream handlers on selection release.
+            event.stopPropagation();
+            // Alan 5/11/26 - Use the release coordinates for the final rectangle.
+            drag.currentX = event.clientX;
+            // Alan 5/11/26 - Use the release coordinates for the final rectangle.
+            drag.currentY = event.clientY;
+            // Alan 5/11/26 - Compute before cleanup because cleanup removes the overlay state.
+            const rect = this._boxSelectViewportRect(drag);
+            // Alan 5/11/26 - Record whether the gesture was large enough to select nodes.
+            const shouldSelect = drag.moved && rect.width >= 3 && rect.height >= 3;
+            // Alan 5/11/26 - Suppress the upcoming browser context menu after any background right-drag gesture.
+            if (drag.rightButton) this.boxSelectState.suppressContextMenuUntil = Date.now() + 500;
+            // Alan 5/11/26 - Remove overlay and temporary listeners before applying selection.
+            this._cancelBoxSelectDrag();
+            // Alan 5/11/26 - Avoid changing selection on accidental taps or tiny drags.
+            if (!shouldSelect) return;
+            // Alan 5/11/26 - Apply the rectangle to visible leaf sequences only.
+            const result = this._applyBoxSelection(rect, drag.mode);
+            // Alan 5/11/26 - Notify the controller for optional status feedback.
+            if (this.callbacks.onBoxSelect) this.callbacks.onBoxSelect(result);
+        }
+
+        // Alan 5/11/26 - Cancel active drag visuals and temporary listeners without changing selection.
+        _cancelBoxSelectDrag() {
+            // Alan 5/11/26 - Read the active drag once so cleanup can be idempotent.
+            const drag = this.boxSelectState.drag;
+            // Alan 5/11/26 - Clear active state even if no drag existed.
+            this.boxSelectState.drag = null;
+            // Alan 5/11/26 - Nothing else to remove when there is no active drag.
+            if (!drag) return;
+            // Alan 5/11/26 - Remove the visual rectangle from the tree container.
+            if (drag.overlay?.parentNode) drag.overlay.parentNode.removeChild(drag.overlay);
+            // Alan 5/11/26 - Remove the temporary pointermove listener.
+            if (drag.moveListener) window.removeEventListener('pointermove', drag.moveListener, true);
+            // Alan 5/11/26 - Remove the temporary pointerup listener.
+            if (drag.upListener) window.removeEventListener('pointerup', drag.upListener, true);
+            // Alan 5/11/26 - Remove the temporary Escape listener.
+            if (drag.keyListener) window.removeEventListener('keydown', drag.keyListener, true);
+            // Alan 5/11/26 - Release pointer capture if the browser accepted it.
+            try { this.container.releasePointerCapture(drag.pointerId); } catch (_) { }
+        }
+
+        // Alan 5/11/26 - Build the translucent rectangle that follows the box-select drag.
+        _createBoxSelectOverlay() {
+            // Alan 5/11/26 - Use HTML overlay styling so it stays readable above any SVG theme.
+            const overlay = document.createElement('div');
+            // Alan 5/11/26 - Keep the overlay non-interactive so pointer events stay with the drag.
+            overlay.style.pointerEvents = 'none';
+            // Alan 5/11/26 - Position the overlay relative to the tree container.
+            overlay.style.position = 'absolute';
+            // Alan 5/11/26 - Place the selection box above the SVG.
+            overlay.style.zIndex = '20';
+            // Alan 5/11/26 - Use the journal gold selection color for consistency.
+            overlay.style.border = '1px solid rgba(201,169,98,.95)';
+            // Alan 5/11/26 - Use a faint fill so selected area is visible without hiding labels.
+            overlay.style.background = 'rgba(201,169,98,.16)';
+            // Alan 5/11/26 - Add a subtle inset to make the box visible on light and dark backgrounds.
+            overlay.style.boxShadow = 'inset 0 0 0 1px rgba(255,255,255,.18)';
+            // Alan 5/11/26 - Hide until movement passes the drag threshold.
+            overlay.style.display = 'none';
+            // Alan 5/11/26 - Append to the container so the overlay follows container scroll/position.
+            this.container.appendChild(overlay);
+            // Alan 5/11/26 - Return the overlay so drag state can update and remove it.
+            return overlay;
+        }
+
+        // Alan 5/11/26 - Position the visual rectangle inside the tree container.
+        _positionBoxSelectOverlay(drag) {
+            // Alan 5/11/26 - Bail if cleanup already removed the overlay.
+            if (!drag?.overlay || !this.container) return;
+            // Alan 5/11/26 - Keep tiny click drift invisible until it becomes a real drag.
+            drag.overlay.style.display = drag.moved ? 'block' : 'none';
+            // Alan 5/11/26 - Convert viewport coordinates to container-relative overlay coordinates.
+            const containerRect = this.container.getBoundingClientRect();
+            // Alan 5/11/26 - Normalize left/top regardless of drag direction.
+            const left = Math.min(drag.startX, drag.currentX) - containerRect.left + this.container.scrollLeft;
+            // Alan 5/11/26 - Normalize left/top regardless of drag direction.
+            const top = Math.min(drag.startY, drag.currentY) - containerRect.top + this.container.scrollTop;
+            // Alan 5/11/26 - Normalize width regardless of drag direction.
+            const width = Math.abs(drag.currentX - drag.startX);
+            // Alan 5/11/26 - Normalize height regardless of drag direction.
+            const height = Math.abs(drag.currentY - drag.startY);
+            // Alan 5/11/26 - Apply pixel geometry directly for smooth drag updates.
+            drag.overlay.style.left = `${left}px`;
+            // Alan 5/11/26 - Apply pixel geometry directly for smooth drag updates.
+            drag.overlay.style.top = `${top}px`;
+            // Alan 5/11/26 - Apply pixel geometry directly for smooth drag updates.
+            drag.overlay.style.width = `${width}px`;
+            // Alan 5/11/26 - Apply pixel geometry directly for smooth drag updates.
+            drag.overlay.style.height = `${height}px`;
+        }
+
+        // Alan 5/11/26 - Convert drag state to a viewport rectangle for DOM hit testing.
+        _boxSelectViewportRect(drag) {
+            // Alan 5/11/26 - Normalize viewport bounds regardless of drag direction.
+            const left = Math.min(drag.startX, drag.currentX);
+            // Alan 5/11/26 - Normalize viewport bounds regardless of drag direction.
+            const right = Math.max(drag.startX, drag.currentX);
+            // Alan 5/11/26 - Normalize viewport bounds regardless of drag direction.
+            const top = Math.min(drag.startY, drag.currentY);
+            // Alan 5/11/26 - Normalize viewport bounds regardless of drag direction.
+            const bottom = Math.max(drag.startY, drag.currentY);
+            // Alan 5/11/26 - Return both edges and dimensions for selection thresholds.
+            return { left, right, top, bottom, width: right - left, height: bottom - top };
+        }
+
+        // Alan 5/11/26 - Decide whether box-select adds, removes, or toggles selected sequences.
+        _boxSelectModeFromEvent(event) {
+            // Alan 5/11/26 - Alt/Option drag removes sequences from the active set.
+            if (event.altKey) return 'remove';
+            // Alan 5/11/26 - Ctrl/Cmd drag toggles sequence membership.
+            if (event.ctrlKey || event.metaKey) return 'toggle';
+            // Alan 5/11/26 - Plain drag adds sequences to the active set.
+            return 'add';
+        }
+
+        // Alan 5/11/26 - Apply a viewport rectangle to visible terminal labels/sequences.
+        _applyBoxSelection(rect, mode) {
+            // Alan 5/11/26 - Collect visible leaf IDs whose rendered labels or markers intersect the box.
+            const ids = this._leafIdsIntersectingViewportRect(rect);
+            // Alan 5/11/26 - Track actual membership changes for status feedback.
+            let changed = 0;
+            // Alan 5/11/26 - Update active selection-set membership according to the gesture mode.
+            ids.forEach(id => { if (this._applyBoxSelectionToId(id, mode)) changed += 1; });
+            // Alan 5/11/26 - Refresh action buttons and persist via the existing selection-change callback.
+            this._updateStats();
+            // Alan 5/11/26 - Repaint selected labels after the bulk update.
+            this._updateNodeStylesOnly();
+            // Alan 5/11/26 - Return useful counts for controller status messages.
+            return { matched: ids.length, changed, mode };
+        }
+
+        // Alan 5/11/26 - Update one sequence ID for a box-select gesture.
+        _applyBoxSelectionToId(id, mode) {
+            // Alan 5/11/26 - Guard against empty DOM IDs from unexpected nodes.
+            if (!id) return false;
+            // Alan 5/11/26 - Remove mode deletes active-set membership and any local Deselect mask.
+            if (mode === 'remove') {
+                // Alan 5/11/26 - Delete from the active set without short-circuiting hidden-mask cleanup.
+                const removedSelected = this.selectedIds.delete(id);
+                // Alan 5/11/26 - Also clear any transient Deselect mask for the same sequence.
+                const removedHidden = this.hiddenSelectionIds.delete(id);
+                // Alan 5/11/26 - Return whether membership changed for status counts.
+                return removedSelected || removedHidden;
+            }
+            // Alan 5/11/26 - Toggle mode uses the same visible-selection semantics as single clicks.
+            if (mode === 'toggle') {
+                // Alan 5/11/26 - Toggle mode always changes visible membership for a valid ID.
+                this._toggleVisibleSelection(id);
+                // Alan 5/11/26 - Report the toggle as a change.
+                return true;
+            }
+            // Alan 5/11/26 - Add mode should also reveal IDs hidden by the Deselect button.
+            const wasVisible = this._isVisibleSelection(id);
+            // Alan 5/11/26 - Remove transient Deselect masking before adding the ID.
+            this.hiddenSelectionIds.delete(id);
+            // Alan 5/11/26 - Add the ID to the active selection set.
+            this.selectedIds.add(id);
+            // Alan 5/11/26 - Report a change only when the sequence was not already visible.
+            return !wasVisible;
+        }
+
+        // Alan 5/11/26 - Return visible leaf node IDs intersecting a viewport rectangle.
+        _leafIdsIntersectingViewportRect(rect) {
+            // Alan 5/11/26 - Locate the rendered SVG each time because phylotree redraws it.
+            const svg = window.d3v7.select(this.container).select("svg");
+            // Alan 5/11/26 - No rendered SVG means there is nothing to select.
+            if (svg.empty()) return [];
+            // Alan 5/11/26 - Preserve DOM order while avoiding duplicate IDs.
+            const ids = [];
+            // Alan 5/11/26 - Track duplicate IDs so repeated labels do not double-count.
+            const seen = new Set();
+            // Alan 5/11/26 - Use the viewer instance inside the D3 each callback.
+            const self = this;
+            // Alan 5/11/26 - Inspect only rendered tip groups, not internal nodes.
+            svg.selectAll("g.node").each(function (d) {
+                // Alan 5/11/26 - Skip internal nodes so box select targets sequences only.
+                if (d?.children && d.children.length) return;
+                // Alan 5/11/26 - Skip tips hidden by metric filters or phylotree display rules.
+                if (d?.notshown) return;
+                // Alan 5/11/26 - Skip DOM nodes with no rendered footprint.
+                const bounds = this.getBoundingClientRect();
+                // Alan 5/11/26 - Ignore invisible or collapsed groups.
+                if (!bounds.width && !bounds.height) return;
+                // Alan 5/11/26 - Use rectangle intersection in viewport coordinates.
+                const intersects = bounds.right >= rect.left && bounds.left <= rect.right && bounds.bottom >= rect.top && bounds.top <= rect.bottom;
+                // Alan 5/11/26 - Ignore labels outside the selection rectangle.
+                if (!intersects) return;
+                // Alan 5/11/26 - Convert the datum to the stable original sequence ID.
+                const id = self._getNodeId(d);
+                // Alan 5/11/26 - Add each ID once in DOM order.
+                if (id && !seen.has(id)) {
+                    // Alan 5/11/26 - Mark the ID seen before storing it.
+                    seen.add(id);
+                    // Alan 5/11/26 - Store the selectable leaf ID.
+                    ids.push(id);
+                }
+            });
+            // Alan 5/11/26 - Return the matching leaf IDs to the bulk selection operation.
+            return ids;
         }
 
         // --- SELECTION STATE MANAGEMENT ---

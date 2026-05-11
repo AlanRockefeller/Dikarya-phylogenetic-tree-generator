@@ -100,14 +100,19 @@ def _fetch_fasta(blast_id: str, endpoint: str) -> Tuple[bytes, Optional[str]]:
     })
     url = f"{MYCOMAP_BASE_URL}?{params}"
     
-    opener = urllib.request.build_opener()
-    opener.addheaders = [
-        ('User-Agent', 'Dikarya-TreeBuilder/1.0'),
-        ('Accept', '*/*')
-    ]
+    post_data = urllib.parse.urlencode({'delimiter': 's'}).encode('utf-8')
+    request = urllib.request.Request(
+        url,
+        data=post_data,
+        headers={
+            'User-Agent': 'Dikarya-TreeBuilder/1.0',
+            'Accept': '*/*',
+            'Content-Type': 'application/x-www-form-urlencoded',
+        },
+    )
     
     try:
-        with opener.open(url, timeout=REQUEST_TIMEOUT) as resp:
+        with urllib.request.urlopen(request, timeout=REQUEST_TIMEOUT) as resp:
             content = resp.read()
         return content, None
     except urllib.error.URLError as e:
@@ -246,7 +251,10 @@ def _parse_blast_metrics_table(rows: list) -> dict:
     header = []
     for i, row in enumerate(rows[:10]):
         lower = [_normalize_header_cell(c) for c in row]
-        has_identity = any('identity' in c or c in ('ident', 'identities') for c in lower)
+        has_identity = any(
+            re.search(r'\bident(?:ity|ities)?\b', c) or 'percent identity' in c
+            for c in lower
+        )
         has_coverage = any(('query' in c and 'cover' in c) or ('subject' in c and 'cover' in c)
                            or ('q' in c and 'cov' in c) or ('s' in c and 'cov' in c)
                            or c in ('qcov', 'qcovs', 'scov', 'scovs') for c in lower)
@@ -267,21 +275,51 @@ def _parse_blast_metrics_table(rows: list) -> dict:
                     return j
         return None
 
-    acc_col = find_col(
+    direct_hit_cols = []
+    for group in (
         'accession',
         ('subject', 'id'),
         ('subject', 'acc'),
         ('hit', 'id'),
         ('sequence', 'id'),
-    )
-    if acc_col is None:
-        acc_col = 0
+        ('record', 'id'),
+        ('result', 'id'),
+    ):
+        col = find_col(group)
+        if col is not None and col not in direct_hit_cols:
+            direct_hit_cols.append(col)
+
+    desc_col = find_col('description', ('hit', 'name'), ('sequence', 'name'), 'name', 'title')
     ident_col = find_col('identity', 'ident')
     qcov_col = find_col(('query', 'cover'), ('q', 'cov'), 'qcov')
     scov_col = find_col(('subject', 'cover'), ('subj', 'cover'), ('s', 'cov'), 'scov')
 
     if ident_col is None:
         return {}
+
+    metric_cols = {col for col in (ident_col, qcov_col, scov_col) if col is not None}
+    if direct_hit_cols:
+        hit_cols = direct_hit_cols
+    else:
+        hit_cols = []
+        for group in (
+            ('hit', 'name'),
+            ('sequence', 'name'),
+            'observation',
+            'voucher',
+            'specimen',
+            'source',
+            'record',
+            'name',
+            'title',
+            'description',
+            'taxon',
+        ):
+            col = find_col(group)
+            if col is not None and col not in metric_cols and col not in hit_cols:
+                hit_cols.append(col)
+        if not hit_cols:
+            hit_cols = [0]
 
     def _to_float(val):
         if val is None:
@@ -291,22 +329,51 @@ def _parse_blast_metrics_table(rows: list) -> dict:
             return None
         return float(match.group(0))
 
+    def _cover_values(row):
+        query_cover = _to_float(row[qcov_col] if qcov_col is not None and len(row) > qcov_col else None)
+        subject_cover = _to_float(row[scov_col] if scov_col is not None and len(row) > scov_col else None)
+        if qcov_col is not None and qcov_col == scov_col and len(row) > qcov_col:
+            matches = re.findall(r'-?\d+(?:\.\d+)?', str(row[qcov_col]))
+            if len(matches) >= 2:
+                query_cover = float(matches[0])
+                subject_cover = float(matches[1])
+        return query_cover, subject_cover
+
     result = {}
     for row in rows[header_idx + 1:]:
-        if len(row) <= max(acc_col, ident_col):
+        if len(row) <= ident_col:
             continue
-        raw_hit = row[acc_col] if row[acc_col] else ''
-        metric_keys = build_blast_metric_keys(raw_hit)
+        metric_keys = []
+        primary_identifier = ''
+        for hit_col in hit_cols:
+            if len(row) <= hit_col:
+                continue
+            raw_hit = row[hit_col] if row[hit_col] else ''
+            if not direct_hit_cols and not _looks_like_hit_identifier(raw_hit):
+                continue
+            if not primary_identifier:
+                primary_identifier = raw_hit
+            metric_keys.extend(build_blast_metric_keys(raw_hit))
+        if not direct_hit_cols:
+            for idx, cell in enumerate(row):
+                if idx in metric_cols or idx in hit_cols or not _looks_like_hit_identifier(cell):
+                    continue
+                metric_keys.extend(build_blast_metric_keys(cell))
+        metric_keys = _unique_metric_keys(metric_keys)
         if not metric_keys:
             continue
         identity = _to_float(row[ident_col] if len(row) > ident_col else None)
-        query_cover = _to_float(row[qcov_col] if qcov_col is not None and len(row) > qcov_col else None)
-        subject_cover = _to_float(row[scov_col] if scov_col is not None and len(row) > scov_col else None)
+        query_cover, subject_cover = _cover_values(row)
+        display_info = _build_result_display_info(
+            row[desc_col] if desc_col is not None and len(row) > desc_col else '',
+            primary_identifier,
+        )
         metric = {
             'identity': identity,
             'query_cover': query_cover,
             'subject_cover': subject_cover,
         }
+        metric.update(display_info)
         for key in metric_keys:
             result.setdefault(key, metric)
 
@@ -320,6 +387,167 @@ def _normalize_header_cell(value: str) -> str:
     return ' '.join(value.split())
 
 
+def _unique_metric_keys(candidates: list) -> list:
+    """Return unique non-empty metric lookup keys while preserving order."""
+    keys = []
+    seen = set()
+    for candidate in candidates:
+        if not candidate or candidate in seen:
+            continue
+        keys.append(candidate)
+        seen.add(candidate)
+    return keys
+
+
+def _append_metric_candidate(candidates: list, value: str):
+    value = str(value or '').strip()
+    if value:
+        candidates.append(value)
+
+
+def _clean_label_fragment(value: str) -> str:
+    """Collapse whitespace and trim punctuation from a display-name fragment."""
+    value = html.unescape(str(value or ''))
+    value = ' '.join(value.split())
+    return value.strip(' ,;')
+
+
+def _first_identifier_token(value: str) -> str:
+    """Return a normalized first token for accession/display-name comparison."""
+    token = str(value or '').lstrip('>').strip().split()
+    if not token:
+        return ''
+    return token[0].strip('>,;()[]{}').split('.')[0].lower()
+
+
+def _species_tokens(value: str) -> list:
+    """Return alphanumeric tokens used to decide whether a species name is present."""
+    return re.findall(r'[a-z0-9]+', html.unescape(str(value or '')).lower())
+
+
+def _contains_species_name(label: str, species_name: str) -> bool:
+    """Return True when all species-name tokens already appear in label order."""
+    label_tokens = _species_tokens(label)
+    species_tokens = _species_tokens(species_name)
+    if not species_tokens:
+        return False
+
+    pos = 0
+    for species_token in species_tokens:
+        try:
+            pos = label_tokens.index(species_token, pos) + 1
+        except ValueError:
+            return False
+    return True
+
+
+def _build_result_display_info(description: str, identifier: str = '') -> dict:
+    """Extract compact display-name metadata from a MycoMap BLAST result row."""
+    text = _clean_label_fragment(description)
+    identifier = str(identifier or '').strip()
+    if not text:
+        return {}
+
+    species_name = ''
+    location = ''
+
+    species_match = re.search(
+        r'\bSpecies Name:\s*(.*?)(?=\s+Location:|$)',
+        text,
+        flags=re.IGNORECASE,
+    )
+    if species_match:
+        species_name = _clean_label_fragment(species_match.group(1))
+
+    location_match = re.search(r'\bLocation:\s*(.*)$', text, flags=re.IGNORECASE)
+    if location_match:
+        location = _clean_label_fragment(location_match.group(1))
+
+    if not species_name:
+        return {}
+
+    display_parts = [identifier, species_name, location]
+    display_name = _clean_label_fragment(' '.join(part for part in display_parts if part))
+    result = {
+        'species_name': species_name,
+        'mycomap_location': location,
+    }
+    if display_name:
+        result['display_name'] = display_name
+    return result
+
+
+def improve_mycomap_sequence_name(current_name: str, metric: Optional[dict], hit_source: str = '') -> str:
+    """
+    Use MycoMap table metadata to repair sparse NCBI FASTA headers.
+
+    MycoMap's FASTA export can emit headers such as "MH855376 England GB" even
+    when the BLAST results table has "Species Name: Ascobolus equinus".
+    """
+    if hit_source and hit_source != 'ncbi':
+        return current_name
+    if not metric:
+        return current_name
+
+    display_name = metric.get('display_name') or ''
+    species_name = metric.get('species_name') or ''
+    if not display_name or not species_name:
+        return current_name
+    if _first_identifier_token(current_name) != _first_identifier_token(display_name):
+        return current_name
+    if _contains_species_name(current_name, species_name):
+        return current_name
+    return display_name
+
+
+def _local_observation_candidates(text: str) -> list:
+    """Return normalized MycoMap-local observation keys from a hit label."""
+    candidates = []
+    local_patterns = [
+        (
+            r'\bi\s*nat(?:uralist)?(?:\.org)?'
+            r'(?:\s*/\s*observations?)?[\s#:/-]*(\d{5,12})\b',
+            'iNat'
+        ),
+        (
+            r'\binaturalist(?:\.org)?'
+            r'(?:\s*/\s*observations?)?[\s#:/-]*(\d{5,12})\b',
+            'iNat'
+        ),
+        (
+            r'\bmushroom\s*observer(?:\.org)?[\s#:/-]*(\d{3,12})\b',
+            'MO'
+        ),
+        (
+            r'\bmushroomobserver\.org[\s#/:-]*(\d{3,12})\b',
+            'MO'
+        ),
+        (
+            r'\bMO[\s#:/-]*(\d{3,12})\b',
+            'MO'
+        ),
+    ]
+    for pattern, prefix in local_patterns:
+        for match in re.finditer(pattern, text, flags=re.IGNORECASE):
+            digits = match.group(1)
+            candidates.append(f"{prefix}{digits}")
+            candidates.append(digits)
+    return candidates
+
+
+def _looks_like_hit_identifier(value: str) -> bool:
+    """Return True when a table cell is likely to contain a hit identifier."""
+    text = html.unescape(str(value or '')).strip()
+    if not text:
+        return False
+    if _local_observation_candidates(text):
+        return True
+    if re.search(r'\b[A-Z]{1,6}_?\d{3,12}(?:\.\d+)?\b', text, flags=re.IGNORECASE):
+        return True
+    first_token = text.split()[0] if text.split() else text
+    return bool(re.search(r'[A-Za-z]', first_token) and re.search(r'\d', first_token))
+
+
 def build_blast_metric_keys(label: str) -> list:
     """Return stable lookup keys for a BLAST table hit label or FASTA header."""
     text = html.unescape(str(label or '')).strip()
@@ -328,17 +556,20 @@ def build_blast_metric_keys(label: str) -> list:
 
     text = text.lstrip('>').strip()
     first_token = text.split()[0] if text.split() else text
-    candidates = [text, first_token]
+    candidates = []
+    _append_metric_candidate(candidates, text)
+    _append_metric_candidate(candidates, first_token)
 
     # Many BLAST identifiers use pipe-delimited prefixes such as gb|ACCESSION.1|.
     for part in re.split(r'[|;,]', first_token):
         part = part.strip()
         if part and part.lower() not in {'gb', 'emb', 'dbj', 'ref', 'gi', 'lcl'}:
-            candidates.append(part)
+            _append_metric_candidate(candidates, part)
 
     # Capture accession-like tokens anywhere in the label without indexing every
     # species-name word, which would create noisy matches.
     candidates.extend(re.findall(r'\b[A-Z]{1,6}_?\d{3,12}(?:\.\d+)?\b', text, flags=re.IGNORECASE))
+    candidates.extend(_local_observation_candidates(text))
 
     keys = []
     seen = set()

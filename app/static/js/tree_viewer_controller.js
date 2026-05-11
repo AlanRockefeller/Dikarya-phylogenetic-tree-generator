@@ -82,6 +82,38 @@ document.addEventListener('DOMContentLoaded', async () => {
         selectionSaveDebounce = setTimeout(saveSelectionSets, 800);
     }
 
+    // Alan 5/11/26 - Keep the Box Select toolbar button visually synchronized with viewer mode.
+    function updateBoxSelectButton() {
+        // Alan 5/11/26 - Look up lazily so the helper can run before UI wiring finishes.
+        const btnBoxSelect = getEl('btn-box-select');
+        // Alan 5/11/26 - Nothing to update when the toolbar button is absent.
+        if (!btnBoxSelect) return;
+        // Alan 5/11/26 - Read the viewer mode through its public API.
+        const active = Boolean(viewer?.getBoxSelectMode?.());
+        // Alan 5/11/26 - Use active styling to make the persistent drag mode discoverable.
+        btnBoxSelect.classList.toggle('active', active);
+        // Alan 5/11/26 - Add gold active styling without relying on a separate CSS build step.
+        btnBoxSelect.classList.toggle('bg-journal-gold/20', active);
+        // Alan 5/11/26 - Add gold active styling without relying on a separate CSS build step.
+        btnBoxSelect.classList.toggle('text-journal-dark', active);
+        // Alan 5/11/26 - Add gold active styling without relying on a separate CSS build step.
+        btnBoxSelect.classList.toggle('dark:text-journal-gold-light', active);
+        // Alan 5/11/26 - Add gold active styling without relying on a separate CSS build step.
+        btnBoxSelect.classList.toggle('border-journal-gold', active);
+        // Alan 5/11/26 - Apply active styling inline because Tailwind CDN may not see classes added from JS.
+        btnBoxSelect.style.backgroundColor = active ? 'rgba(201,169,98,.18)' : '';
+        // Alan 5/11/26 - Apply active styling inline because Tailwind CDN may not see classes added from JS.
+        btnBoxSelect.style.borderColor = active ? '#c9a962' : '';
+        // Alan 5/11/26 - Apply active styling inline because Tailwind CDN may not see classes added from JS.
+        btnBoxSelect.style.color = active ? '#c9a962' : '';
+        // Alan 5/11/26 - Mirror the mode for assistive technology and CSS hooks.
+        btnBoxSelect.setAttribute('aria-pressed', active ? 'true' : 'false');
+        // Alan 5/11/26 - Explain modifier behavior in the tooltip without adding in-app instruction text.
+        btnBoxSelect.title = active
+            ? 'Box Select is on. Drag empty tree background to select tips; Alt removes; Ctrl/Cmd toggles; Esc cancels.'
+            : 'Box Select. Right-drag empty tree background anytime, or turn this on for left-drag selection.';
+    }
+
     function saveDisplayPrefs() {
         if (JOB_ID === 'unknown') return;
         try {
@@ -272,6 +304,25 @@ document.addEventListener('DOMContentLoaded', async () => {
             onSelectionChange: (count) => {
                 updateButtons();
                 debouncedSaveSelectionSets();
+            },
+            // Alan 5/11/26 - Let the viewer report completed box-select gestures for concise feedback.
+            onBoxSelect: (result) => {
+                // Alan 5/11/26 - Refresh buttons immediately after a rectangle selection.
+                updateButtons();
+                // Alan 5/11/26 - Avoid noisy messages when the rectangle missed every tip.
+                if (!result || result.matched === 0) {
+                    showStatus("No sequences in box.", "info", 1500);
+                    return;
+                }
+                // Alan 5/11/26 - Use action-specific wording so modifier drags are clear.
+                const verb = result.mode === 'remove' ? 'removed' : (result.mode === 'toggle' ? 'toggled' : 'selected');
+                // Alan 5/11/26 - Report matched tips rather than only changed tips so users know what the box covered.
+                showStatus(`Box ${verb} ${result.matched} sequence${result.matched === 1 ? '' : 's'}.`, "success", 1800);
+            },
+            // Alan 5/11/26 - Keep the toolbar button synchronized when Esc or code changes box-select mode.
+            onBoxSelectModeChange: () => {
+                // Alan 5/11/26 - Refresh only the box-select button state for mode changes.
+                updateBoxSelectButton();
             }
         };
 
@@ -414,6 +465,22 @@ document.addEventListener('DOMContentLoaded', async () => {
         // Layout
         getEl('btn-layout-linear')?.addEventListener('click', () => viewer?.updateLayout('linear'));
         getEl('btn-layout-radial')?.addEventListener('click', () => viewer?.updateLayout('radial'));
+
+        // Alan 5/11/26 - Wire the visible Box Select toggle for trackpads and discoverability.
+        const btnBoxSelect = getEl('btn-box-select');
+        // Alan 5/11/26 - Toggle persistent left-drag box selection from the toolbar.
+        btnBoxSelect?.addEventListener('click', () => {
+            // Alan 5/11/26 - Ignore clicks before the viewer is available.
+            if (!viewer?.setBoxSelectMode) return;
+            // Alan 5/11/26 - Flip the mode through the viewer so cursor and callbacks stay centralized.
+            const enabled = viewer.setBoxSelectMode(!viewer.getBoxSelectMode());
+            // Alan 5/11/26 - Keep the toolbar synchronized immediately after toggling.
+            updateBoxSelectButton();
+            // Alan 5/11/26 - Give brief feedback without adding persistent explanatory text.
+            showStatus(enabled ? "Box Select on. Drag empty tree background." : "Box Select off.", "info", 1500);
+        });
+        // Alan 5/11/26 - Initialize button state after wiring.
+        updateBoxSelectButton();
 
         // Align
         const btnAlign = getEl('btn-align-tips');
@@ -823,6 +890,14 @@ document.addEventListener('DOMContentLoaded', async () => {
                 closeRenameModal();
                 return;
             }
+            // Alan 5/11/26 - Escape turns off persistent Box Select mode when no modal has focus.
+            if (e.key === "Escape" && viewer?.getBoxSelectMode?.()) {
+                // Alan 5/11/26 - Route through the viewer so cursor and button callbacks reset together.
+                viewer.setBoxSelectMode(false);
+                // Alan 5/11/26 - Confirm the mode change without interrupting other viewer state.
+                showStatus("Box Select off.", "info", 1000);
+                return;
+            }
             if (e.key === "Escape" && rerootMode) {
                 rerootMode = false; removeRerootCapture();
                 showStatus("Reroot cancelled.", "info", 1000); updateButtons();
@@ -872,6 +947,8 @@ document.addEventListener('DOMContentLoaded', async () => {
 
     function updateButtons() {
         if (!viewer) return;
+        // Alan 5/11/26 - Keep Box Select styling current whenever broader toolbar state refreshes.
+        updateBoxSelectButton();
 
         // Multi-select check
         let selCount = 0;

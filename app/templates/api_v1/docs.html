@@ -1,0 +1,150 @@
+{% extends "base_modern.html" %}
+
+{% block title %}Dikarya - API Docs{% endblock %}
+{% block subtitle %}API v1 Documentation{% endblock %}
+
+{% block head %}
+<link rel="stylesheet" href="{{ url_for('static', filename='vendor/swagger-ui.css') }}">
+<style>
+    /* Keep Swagger UI from blowing out the journal-themed page chrome */
+    .swagger-ui .topbar { display: none; }
+    #swagger-ui .info { margin: 30px 0; }
+    .swagger-card { background: white; border-radius: 12px; box-shadow: 0 4px 12px rgba(0,0,0,.08); }
+    .dark .swagger-card { background: #2d4a3e; }
+</style>
+{% endblock %}
+
+{% block content %}
+<div class="max-w-7xl mx-auto space-y-6">
+
+    <!-- Header -->
+    <div class="bg-white dark:bg-journal-green rounded-xl shadow-lg p-6 transition-colors">
+        <div class="flex items-start justify-between flex-wrap gap-4">
+            <div>
+                <h2 class="text-2xl font-bold text-journal-dark dark:text-gray-100 flex items-center">
+                    <i class="fas fa-book text-journal-gold mr-3"></i>Dikarya API v1
+                </h2>
+                <p class="text-sm text-gray-600 dark:text-gray-300 mt-1">
+                    Programmatic access for scripts and tools. All endpoints require a bearer token.
+                </p>
+            </div>
+            <div class="flex flex-wrap gap-3 text-sm">
+                {% if current_user.is_authenticated %}
+                <a href="{{ url_for('user.api_tokens') }}"
+                   class="bg-journal-gold hover:bg-journal-gold-light text-journal-dark px-4 py-2 rounded-lg font-semibold transition-colors flex items-center">
+                    <i class="fas fa-key mr-2"></i>Manage tokens
+                </a>
+                {% else %}
+                <a href="{{ url_for('auth.login') }}"
+                   class="bg-journal-gold hover:bg-journal-gold-light text-journal-dark px-4 py-2 rounded-lg font-semibold transition-colors flex items-center">
+                    <i class="fas fa-sign-in-alt mr-2"></i>Log in to mint a token
+                </a>
+                {% endif %}
+                <a href="{{ url_for('api_v1.openapi_json') }}"
+                   class="bg-journal-dark hover:bg-journal-green text-white px-4 py-2 rounded-lg font-semibold transition-colors flex items-center">
+                    <i class="fas fa-file-code mr-2"></i>OpenAPI JSON
+                </a>
+            </div>
+        </div>
+    </div>
+
+    <!-- Quick start examples -->
+    <div class="bg-white dark:bg-journal-green rounded-xl shadow-lg overflow-hidden transition-colors">
+        <div class="bg-journal-dark px-5 py-3 border-b border-journal-green">
+            <h3 class="text-white font-semibold flex items-center">
+                <i class="fas fa-rocket text-journal-gold mr-2"></i>Quick start
+            </h3>
+        </div>
+        <div class="p-5 space-y-4 text-sm">
+            <p class="text-gray-700 dark:text-gray-200">
+                1. Mint a token at <a href="{{ url_for('user.api_tokens') }}" class="text-journal-gold hover:underline">/user/tokens</a>.
+                2. Send it in the <code class="font-mono text-xs bg-gray-100 dark:bg-journal-dark px-1.5 py-0.5 rounded">Authorization</code> header.
+            </p>
+
+            <div>
+                <h4 class="font-semibold text-journal-dark dark:text-gray-100 mb-2">curl</h4>
+                <pre class="bg-gray-100 dark:bg-journal-dark text-xs p-3 rounded overflow-x-auto"><code>TOKEN="dikarya_..."
+
+# Identity check
+curl -H "Authorization: Bearer $TOKEN" https://dikarya.us/api/v1/me
+
+# Create a job
+curl -X POST https://dikarya.us/api/v1/jobs \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+        "input_type": "fasta",
+        "sequence": ">A\nACGT...\n>B\nACGT...",
+        "tree_method": "fasttree",
+        "alignment_method": "mafft",
+        "notes": "remote run"
+      }'
+
+# Poll
+curl -H "Authorization: Bearer $TOKEN" https://dikarya.us/api/v1/jobs/&lt;id&gt;
+
+# Download the tree
+curl -H "Authorization: Bearer $TOKEN" \
+  https://dikarya.us/api/v1/jobs/&lt;id&gt;/files/tree.newick -o tree.newick</code></pre>
+            </div>
+
+            <div>
+                <h4 class="font-semibold text-journal-dark dark:text-gray-100 mb-2">Python</h4>
+                <pre class="bg-gray-100 dark:bg-journal-dark text-xs p-3 rounded overflow-x-auto"><code>import requests, time
+
+API = "https://dikarya.us/api/v1"
+HEADERS = {"Authorization": "Bearer dikarya_..."}
+
+r = requests.post(f"{API}/jobs",
+    headers={**HEADERS, "Idempotency-Key": "my-run-2026-05-11"},
+    json={"input_type": "fasta", "sequence": open("seqs.fasta").read(),
+          "tree_method": "fasttree"})
+r.raise_for_status()
+job_id = r.json()["data"]["id"]
+
+while True:
+    job = requests.get(f"{API}/jobs/{job_id}", headers=HEADERS).json()["data"]
+    if job["status"] in ("completed", "failed", "error"):
+        break
+    time.sleep(5)
+
+tree = requests.get(f"{API}/jobs/{job_id}/files/tree.newick", headers=HEADERS).text
+print(tree)</code></pre>
+            </div>
+
+            <p class="text-xs text-gray-500 dark:text-gray-400 italic">
+                Use the <code class="font-mono">Authorize</code> button below to plug in your token,
+                then any endpoint can be tried directly from this page.
+            </p>
+        </div>
+    </div>
+
+    <!-- Swagger UI mount -->
+    <div class="swagger-card p-2">
+        <div id="swagger-ui"></div>
+    </div>
+
+</div>
+
+<script src="{{ url_for('static', filename='vendor/swagger-ui-bundle.js') }}"></script>
+<script src="{{ url_for('static', filename='vendor/swagger-ui-standalone-preset.js') }}"></script>
+<script>
+    window.onload = function() {
+        window.ui = SwaggerUIBundle({
+            url: "{{ url_for('api_v1.openapi_json') }}",
+            dom_id: '#swagger-ui',
+            deepLinking: true,
+            presets: [
+                SwaggerUIBundle.presets.apis,
+                SwaggerUIStandalonePreset
+            ],
+            plugins: [SwaggerUIBundle.plugins.DownloadUrl],
+            layout: "BaseLayout",
+            persistAuthorization: true,
+            tryItOutEnabled: true,
+            displayRequestDuration: true,
+            defaultModelsExpandDepth: -1,
+        });
+    };
+</script>
+{% endblock %}
