@@ -441,6 +441,31 @@ def _contains_species_name(label: str, species_name: str) -> bool:
     return True
 
 
+def _compact_ncbi_description(description: str) -> str:
+    """Return the organism/voucher part of an NCBI BLAST description."""
+    text = _clean_label_fragment(description)
+    if not text:
+        return ''
+
+    marker_pattern = (
+        r'\s+(?:small subunit|internal transcribed spacer|large subunit|'
+        r'5\.8S|18S|28S|ribosomal RNA|rRNA|ITS\b|isolate\b.*?\bITS\b)'
+    )
+    match = re.search(marker_pattern, text, flags=re.IGNORECASE)
+    if match:
+        text = text[:match.start()]
+    return _clean_label_fragment(text)
+
+
+def _infer_species_name(description: str) -> str:
+    """Infer a binomial-style species name from a BLAST description."""
+    text = _compact_ncbi_description(description)
+    match = re.match(r'^([A-Z][a-zA-Z-]+)\s+([a-z][a-zA-Z-]+|["\'][^"\']+["\'])\b', text)
+    if not match:
+        return ''
+    return _clean_label_fragment(' '.join(match.groups()))
+
+
 def _build_result_display_info(description: str, identifier: str = '') -> dict:
     """Extract compact display-name metadata from a MycoMap BLAST result row."""
     text = _clean_label_fragment(description)
@@ -464,6 +489,14 @@ def _build_result_display_info(description: str, identifier: str = '') -> dict:
         location = _clean_label_fragment(location_match.group(1))
 
     if not species_name:
+        species_name = _infer_species_name(text)
+        compact_description = _compact_ncbi_description(text)
+        if species_name and compact_description:
+            display_name = _clean_label_fragment(' '.join(part for part in (identifier, compact_description) if part))
+            return {
+                'species_name': species_name,
+                'display_name': display_name,
+            }
         return {}
 
     display_parts = [identifier, species_name, location]
