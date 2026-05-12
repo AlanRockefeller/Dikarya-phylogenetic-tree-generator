@@ -266,8 +266,8 @@
             this.supportLabelsTimer = null;
             this.lastStats = { supportType: 'none', maxSupport: 0 };
             this.baseSpacing = { x: 20, y: 20 }; // Phylotree fixed_width values (per-node/per-level)
-            // Alan 5/11/26 - Track box-select mode, active drag state, and removable listeners in one place.
-            this.boxSelectState = { enabled: false, drag: null, pointerDownListener: null, contextMenuListener: null, suppressContextMenuUntil: 0 };
+            // Alan 5/12/26 - Track box-select mode, active drag state, modifier memory, and removable listeners in one place.
+            this.boxSelectState = { enabled: false, drag: null, pointerDownListener: null, contextMenuListener: null, modifierKeyDownListener: null, modifierKeyUpListener: null, modifiers: { alt: false, ctrl: false, meta: false, lastAltDownAt: 0, lastCtrlDownAt: 0, lastMetaDownAt: 0 }, suppressContextMenuUntil: 0 };
         }
 
         async render(newick) {
@@ -384,6 +384,8 @@
                 'align-tips': this.options.alignTips,
                 'draw-size-bubbles': false,
                 'zoom': true,
+                // Alan 5/12/26 - Disable phylotree's built-in left-drag brush so left-drag pans the tree.
+                'brush': false,
                 'left-right-spacing': 'fixed-step',
                 'top-bottom-spacing': 'fixed-step',
                 'node-styler': (element, node) => this._styleNode(element, node)
@@ -1617,24 +1619,36 @@
             if (this.boxSelectState.pointerDownListener) this.container.removeEventListener('pointerdown', this.boxSelectState.pointerDownListener, true);
             // Alan 5/11/26 - Remove stale context-menu suppression before redraws attach fresh ones.
             if (this.boxSelectState.contextMenuListener) this.container.removeEventListener('contextmenu', this.boxSelectState.contextMenuListener, true);
+            // Alan 5/11/26 - Remove stale keydown tracking before redraws attach fresh modifier listeners.
+            if (this.boxSelectState.modifierKeyDownListener) window.removeEventListener('keydown', this.boxSelectState.modifierKeyDownListener, true);
+            // Alan 5/11/26 - Remove stale keyup tracking before redraws attach fresh modifier listeners.
+            if (this.boxSelectState.modifierKeyUpListener) window.removeEventListener('keyup', this.boxSelectState.modifierKeyUpListener, true);
             // Alan 5/11/26 - Keep the overlay positioned relative to the tree container.
             if (getComputedStyle(this.container).position === 'static') this.container.style.position = 'relative';
             // Alan 5/11/26 - Capture pointerdown early so background box-select does not trigger phylotree pan.
             this.boxSelectState.pointerDownListener = (event) => this._handleBoxSelectPointerDown(event);
             // Alan 5/11/26 - Suppress the browser context menu only after a right-drag selection gesture.
             this.boxSelectState.contextMenuListener = (event) => this._handleBoxSelectContextMenu(event);
+            // Alan 5/11/26 - Track Alt/Ctrl/Cmd directly because some right-button pointer events omit modifier state.
+            this.boxSelectState.modifierKeyDownListener = (event) => this._syncBoxSelectModifiers(event);
+            // Alan 5/11/26 - Clear modifier state when keys are released after or during a drag.
+            this.boxSelectState.modifierKeyUpListener = (event) => this._syncBoxSelectModifiers(event);
             // Alan 5/11/26 - Use capture so background box-select wins before D3 zoom handlers.
             this.container.addEventListener('pointerdown', this.boxSelectState.pointerDownListener, true);
             // Alan 5/11/26 - Use capture so right-drag cleanup can block the native context menu.
             this.container.addEventListener('contextmenu', this.boxSelectState.contextMenuListener, true);
+            // Alan 5/11/26 - Listen on window so modifier state is available before the pointer gesture starts.
+            window.addEventListener('keydown', this.boxSelectState.modifierKeyDownListener, true);
+            // Alan 5/11/26 - Listen on window so Alt/Ctrl/Cmd release state stays current.
+            window.addEventListener('keyup', this.boxSelectState.modifierKeyUpListener, true);
         }
 
         // Alan 5/11/26 - Start box-select only from empty tree background or toolbar mode.
         _handleBoxSelectPointerDown(event) {
             // Alan 5/11/26 - Leave node right-click and normal node selection behavior untouched.
             if (!this._isBoxSelectBackgroundTarget(event.target)) return;
-            // Alan 5/11/26 - Enable left-drag only when the visible toolbar mode is active.
-            const toolbarDrag = this.boxSelectState.enabled && event.button === 0;
+            // Alan 5/12/26 - Reserve left-button drag for tree panning; box select is right-drag only.
+            const toolbarDrag = false;
             // Alan 5/11/26 - Always allow right-drag on empty background as the power-user shortcut.
             const rightDrag = event.button === 2;
             // Alan 5/11/26 - Ignore middle-click and other pointer starts.
@@ -1649,15 +1663,51 @@
 
         // Alan 5/11/26 - Prevent browser menus for background right-drag box-select gestures.
         _handleBoxSelectContextMenu(event) {
+            // Alan 5/11/26 - Suppress context menus during or just after any right-drag box gesture, even over nodes.
+            if (this.boxSelectState.drag?.rightButton || Date.now() < (this.boxSelectState.suppressContextMenuUntil || 0)) {
+                // Alan 5/11/26 - Keep the browser or phylotree menu from covering a completed box gesture.
+                event.preventDefault();
+                // Alan 5/11/26 - Stop later context-menu listeners on the same container from opening node menus.
+                event.stopImmediatePropagation();
+                // Alan 5/11/26 - Context menu handling is complete for suppressed box gestures.
+                return;
+            }
             // Alan 5/11/26 - Preserve node context menus because they are handled by phylotree.
             if (event.target?.closest?.('.node, .internal-node')) return;
-            // Alan 5/11/26 - Suppress background context menus during or just after a right-drag gesture.
-            if (this.boxSelectState.drag?.rightButton || Date.now() < (this.boxSelectState.suppressContextMenuUntil || 0)) {
-                // Alan 5/11/26 - Keep the browser context menu from covering the selected box.
-                event.preventDefault();
-                // Alan 5/11/26 - Stop later context-menu listeners from reopening background menus.
-                event.stopPropagation();
-            }
+            // Alan 5/11/26 - Prevent plain background right-click from opening the browser menu.
+            event.preventDefault();
+            // Alan 5/11/26 - Keep background context clicks from bubbling into unrelated handlers.
+            event.stopPropagation();
+        }
+
+        // Alan 5/11/26 - Keep a direct modifier snapshot for browsers that omit Alt on right-button pointer events.
+        _syncBoxSelectModifiers(event) {
+            // Alan 5/12/26 - Normalize key identity because Option/Alt can vary across browsers and platforms.
+            const isAltKey = event.key === 'Alt' || event.key === 'Option' || event.code === 'AltLeft' || event.code === 'AltRight';
+            // Alan 5/12/26 - Normalize Ctrl identity for the same reason as Alt.
+            const isCtrlKey = event.key === 'Control' || event.code === 'ControlLeft' || event.code === 'ControlRight';
+            // Alan 5/12/26 - Normalize Cmd/Meta identity for macOS keyboard events.
+            const isMetaKey = event.key === 'Meta' || event.code === 'MetaLeft' || event.code === 'MetaRight';
+            // Alan 5/12/26 - Store whether this key event is a press rather than a release.
+            const isKeyDown = event.type === 'keydown';
+            // Alan 5/12/26 - Store Alt/Option state from both explicit key events and aggregate modifier flags.
+            this.boxSelectState.modifiers.alt = Boolean(event.altKey || (isAltKey && isKeyDown));
+            // Alan 5/12/26 - Store Ctrl state from both explicit key events and aggregate modifier flags.
+            this.boxSelectState.modifiers.ctrl = Boolean(event.ctrlKey || (isCtrlKey && isKeyDown));
+            // Alan 5/12/26 - Store Cmd/Meta state from both explicit key events and aggregate modifier flags.
+            this.boxSelectState.modifiers.meta = Boolean(event.metaKey || (isMetaKey && isKeyDown));
+            // Alan 5/12/26 - Remember recent Alt presses so right-button events that omit altKey still remove.
+            if (isAltKey && isKeyDown) this.boxSelectState.modifiers.lastAltDownAt = Date.now();
+            // Alan 5/12/26 - Clear recent Alt memory immediately when the browser does deliver keyup.
+            if (isAltKey && !isKeyDown) this.boxSelectState.modifiers.lastAltDownAt = 0;
+            // Alan 5/12/26 - Remember recent Ctrl presses for toggle mode on browsers that omit ctrlKey.
+            if (isCtrlKey && isKeyDown) this.boxSelectState.modifiers.lastCtrlDownAt = Date.now();
+            // Alan 5/12/26 - Clear recent Ctrl memory immediately when keyup is delivered.
+            if (isCtrlKey && !isKeyDown) this.boxSelectState.modifiers.lastCtrlDownAt = 0;
+            // Alan 5/12/26 - Remember recent Meta presses for toggle mode on browsers that omit metaKey.
+            if (isMetaKey && isKeyDown) this.boxSelectState.modifiers.lastMetaDownAt = Date.now();
+            // Alan 5/12/26 - Clear recent Meta memory immediately when keyup is delivered.
+            if (isMetaKey && !isKeyDown) this.boxSelectState.modifiers.lastMetaDownAt = 0;
         }
 
         // Alan 5/11/26 - Treat non-node SVG/container areas as valid box-select start targets.
@@ -1695,6 +1745,8 @@
             };
             // Alan 5/11/26 - Store the active drag so movement, release, and Esc can coordinate.
             this.boxSelectState.drag = drag;
+            // Alan 5/12/26 - Color the rectangle according to add/remove/toggle mode before first paint.
+            this._styleBoxSelectOverlay(drag);
             // Alan 5/11/26 - Update the overlay immediately so slow drags feel responsive.
             this._positionBoxSelectOverlay(drag);
             // Alan 5/11/26 - Track movement on window so the pointer can leave the SVG during drag.
@@ -1730,6 +1782,10 @@
             drag.currentX = event.clientX;
             // Alan 5/11/26 - Track the latest viewport pointer position.
             drag.currentY = event.clientY;
+            // Alan 5/12/26 - Preserve remove/toggle once seen so pointerup cannot downgrade the gesture to add.
+            drag.mode = this._mergeBoxSelectMode(drag.mode, this._boxSelectModeFromEvent(event));
+            // Alan 5/12/26 - Recolor the rectangle if the user presses Alt/Ctrl during the drag.
+            this._styleBoxSelectOverlay(drag);
             // Alan 5/11/26 - Treat tiny pointer drift as a click, not a selection rectangle.
             drag.moved = drag.moved || Math.hypot(drag.currentX - drag.startX, drag.currentY - drag.startY) >= 5;
             // Alan 5/11/26 - Keep the visual rectangle synced with the pointer.
@@ -1750,6 +1806,8 @@
             drag.currentX = event.clientX;
             // Alan 5/11/26 - Use the release coordinates for the final rectangle.
             drag.currentY = event.clientY;
+            // Alan 5/12/26 - Merge final modifiers without losing an earlier Alt/Ctrl/Cmd drag mode.
+            drag.mode = this._mergeBoxSelectMode(drag.mode, this._boxSelectModeFromEvent(event));
             // Alan 5/11/26 - Compute before cleanup because cleanup removes the overlay state.
             const rect = this._boxSelectViewportRect(drag);
             // Alan 5/11/26 - Record whether the gesture was large enough to select nodes.
@@ -1759,9 +1817,16 @@
             // Alan 5/11/26 - Remove overlay and temporary listeners before applying selection.
             this._cancelBoxSelectDrag();
             // Alan 5/11/26 - Avoid changing selection on accidental taps or tiny drags.
-            if (!shouldSelect) return;
+            if (!shouldSelect) {
+                // Alan 5/12/26 - Clear modifier memory after tiny right-drags so Alt cannot stick.
+                this._resetBoxSelectModifierMemory();
+                // Alan 5/12/26 - Finish without changing selection for accidental tiny drags.
+                return;
+            }
             // Alan 5/11/26 - Apply the rectangle to visible leaf sequences only.
             const result = this._applyBoxSelection(rect, drag.mode);
+            // Alan 5/12/26 - Clear modifier memory after every completed gesture so plain right-drag keeps adding.
+            this._resetBoxSelectModifierMemory();
             // Alan 5/11/26 - Notify the controller for optional status feedback.
             if (this.callbacks.onBoxSelect) this.callbacks.onBoxSelect(result);
         }
@@ -1810,6 +1875,24 @@
             return overlay;
         }
 
+        // Alan 5/12/26 - Color box-select rectangles so delete mode is clearly distinct from add mode.
+        _styleBoxSelectOverlay(drag) {
+            // Alan 5/12/26 - Skip styling if cleanup already removed the overlay.
+            if (!drag?.overlay) return;
+            // Alan 5/12/26 - Use red for Alt/remove mode so deletion gestures are visually explicit.
+            const palette = drag.mode === 'remove'
+                ? { border: 'rgba(220,38,38,.95)', background: 'rgba(220,38,38,.14)', inset: 'rgba(254,202,202,.35)' }
+                : drag.mode === 'toggle'
+                    ? { border: 'rgba(59,130,246,.95)', background: 'rgba(59,130,246,.14)', inset: 'rgba(191,219,254,.35)' }
+                    : { border: 'rgba(201,169,98,.95)', background: 'rgba(201,169,98,.16)', inset: 'rgba(255,255,255,.18)' };
+            // Alan 5/12/26 - Apply the mode-specific rectangle border.
+            drag.overlay.style.border = `1px solid ${palette.border}`;
+            // Alan 5/12/26 - Apply the mode-specific translucent fill.
+            drag.overlay.style.background = palette.background;
+            // Alan 5/12/26 - Apply a subtle inset that matches the current mode color.
+            drag.overlay.style.boxShadow = `inset 0 0 0 1px ${palette.inset}`;
+        }
+
         // Alan 5/11/26 - Position the visual rectangle inside the tree container.
         _positionBoxSelectOverlay(drag) {
             // Alan 5/11/26 - Bail if cleanup already removed the overlay.
@@ -1852,11 +1935,45 @@
 
         // Alan 5/11/26 - Decide whether box-select adds, removes, or toggles selected sequences.
         _boxSelectModeFromEvent(event) {
+            // Alan 5/12/26 - Read modifier memory once so right-button gestures can use recent keydown fallback.
+            const modifiers = this.boxSelectState.modifiers || {};
+            // Alan 5/12/26 - Restrict recent-key fallback to right-button gestures where mouse events often omit modifiers.
+            const rightButtonGesture = event.button === 2 || (event.buttons & 2) === 2 || this.boxSelectState.drag?.rightButton;
+            // Alan 5/12/26 - Treat only a currently remembered recent Alt keydown as right-drag remove mode.
+            const recentAlt = rightButtonGesture && modifiers.alt && Date.now() - (modifiers.lastAltDownAt || 0) < 1500;
+            // Alan 5/12/26 - Treat only currently remembered recent Ctrl/Cmd keydowns as right-drag toggle mode.
+            const recentToggle = rightButtonGesture && (modifiers.ctrl && Date.now() - (modifiers.lastCtrlDownAt || 0) < 1500 || modifiers.meta && Date.now() - (modifiers.lastMetaDownAt || 0) < 1500);
             // Alan 5/11/26 - Alt/Option drag removes sequences from the active set.
-            if (event.altKey) return 'remove';
+            if (event.altKey || event.getModifierState?.('Alt') || event.getModifierState?.('AltGraph') || recentAlt) return 'remove';
             // Alan 5/11/26 - Ctrl/Cmd drag toggles sequence membership.
-            if (event.ctrlKey || event.metaKey) return 'toggle';
+            if (event.ctrlKey || event.metaKey || event.getModifierState?.('Control') || event.getModifierState?.('Meta') || recentToggle) return 'toggle';
             // Alan 5/11/26 - Plain drag adds sequences to the active set.
+            return 'add';
+        }
+
+        // Alan 5/12/26 - Clear remembered modifier keys after a box gesture so later right-drags select normally.
+        _resetBoxSelectModifierMemory() {
+            // Alan 5/12/26 - Clear remembered Alt state that browsers may fail to keyup after right-button drags.
+            this.boxSelectState.modifiers.alt = false;
+            // Alan 5/12/26 - Clear remembered Ctrl state for the same reason.
+            this.boxSelectState.modifiers.ctrl = false;
+            // Alan 5/12/26 - Clear remembered Meta state for the same reason.
+            this.boxSelectState.modifiers.meta = false;
+            // Alan 5/12/26 - Clear recent Alt timestamp so it cannot affect a later plain drag.
+            this.boxSelectState.modifiers.lastAltDownAt = 0;
+            // Alan 5/12/26 - Clear recent Ctrl timestamp so it cannot affect a later plain drag.
+            this.boxSelectState.modifiers.lastCtrlDownAt = 0;
+            // Alan 5/12/26 - Clear recent Meta timestamp so it cannot affect a later plain drag.
+            this.boxSelectState.modifiers.lastMetaDownAt = 0;
+        }
+
+        // Alan 5/12/26 - Keep destructive modifier modes sticky for the life of one box-select drag.
+        _mergeBoxSelectMode(currentMode, eventMode) {
+            // Alan 5/12/26 - Remove has highest priority because Alt-drag should never become add on mouse release.
+            if (currentMode === 'remove' || eventMode === 'remove') return 'remove';
+            // Alan 5/12/26 - Toggle stays sticky unless Alt/remove appears later in the gesture.
+            if (currentMode === 'toggle' || eventMode === 'toggle') return 'toggle';
+            // Alan 5/12/26 - Fall back to normal add mode when no modifier was observed.
             return 'add';
         }
 
@@ -1864,26 +1981,35 @@
         _applyBoxSelection(rect, mode) {
             // Alan 5/11/26 - Collect visible leaf IDs whose rendered labels or markers intersect the box.
             const ids = this._leafIdsIntersectingViewportRect(rect);
+            // Alan 5/12/26 - Alt/right-drag is a prune request; let the controller run the backend prune action.
+            if (mode === 'remove') return { matched: ids.length, changed: ids.length, mode, ids };
             // Alan 5/11/26 - Track actual membership changes for status feedback.
             let changed = 0;
             // Alan 5/11/26 - Update active selection-set membership according to the gesture mode.
             ids.forEach(id => { if (this._applyBoxSelectionToId(id, mode)) changed += 1; });
+            // Alan 5/11/26 - Clear native phylotree selection flags when box gestures remove or toggle tips.
+            if (mode === 'remove' || mode === 'toggle') this._clearNativeSelectionForIds(ids);
             // Alan 5/11/26 - Refresh action buttons and persist via the existing selection-change callback.
             this._updateStats();
             // Alan 5/11/26 - Repaint selected labels after the bulk update.
             this._updateNodeStylesOnly();
-            // Alan 5/11/26 - Return useful counts for controller status messages.
-            return { matched: ids.length, changed, mode };
+            // Alan 5/12/26 - Return useful counts and IDs for controller status messages and future actions.
+            return { matched: ids.length, changed, mode, ids };
         }
 
         // Alan 5/11/26 - Update one sequence ID for a box-select gesture.
         _applyBoxSelectionToId(id, mode) {
             // Alan 5/11/26 - Guard against empty DOM IDs from unexpected nodes.
             if (!id) return false;
-            // Alan 5/11/26 - Remove mode deletes active-set membership and any local Deselect mask.
+            // Alan 5/12/26 - Remove mode clears visible selection membership, including saved-set highlights.
             if (mode === 'remove') {
-                // Alan 5/11/26 - Delete from the active set without short-circuiting hidden-mask cleanup.
-                const removedSelected = this.selectedIds.delete(id);
+                // Alan 5/12/26 - Track whether any selection set contained this tip.
+                let removedSelected = false;
+                // Alan 5/12/26 - Remove the tip from every set so visibly selected labels actually clear.
+                for (const memberSet of Object.values(this.selectionSets)) {
+                    // Alan 5/12/26 - Delete from each set without assuming the active set owns the highlight.
+                    if (memberSet?.delete?.(id)) removedSelected = true;
+                }
                 // Alan 5/11/26 - Also clear any transient Deselect mask for the same sequence.
                 const removedHidden = this.hiddenSelectionIds.delete(id);
                 // Alan 5/11/26 - Return whether membership changed for status counts.

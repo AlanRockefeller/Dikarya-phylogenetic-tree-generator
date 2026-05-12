@@ -314,6 +314,20 @@ document.addEventListener('DOMContentLoaded', async () => {
                     showStatus("No sequences in box.", "info", 1500);
                     return;
                 }
+                // Alan 5/12/26 - Treat Alt/right-drag boxes as direct prune requests, matching Select + Prune.
+                if (result.mode === 'remove') {
+                    // Alan 5/12/26 - Copy the boxed tip IDs defensively before the tree reloads.
+                    const names = Array.isArray(result.ids) ? result.ids.slice() : [];
+                    // Alan 5/12/26 - Ignore an impossible empty prune payload even if matched was nonzero.
+                    if (names.length === 0) return;
+                    // Alan 5/12/26 - Run the same backend prune flow used by the Prune button.
+                    runBackendAction(`Pruning ${names.length} sequence${names.length === 1 ? '' : 's'}`, async () => {
+                        // Alan 5/12/26 - Prune the boxed terminal names through the existing API contract.
+                        await TreeEditActions.pruneTaxa(JOB_ID, names);
+                    });
+                    // Alan 5/12/26 - Do not also show a selection-set remove toast for prune boxes.
+                    return;
+                }
                 // Alan 5/11/26 - Use action-specific wording so modifier drags are clear.
                 const verb = result.mode === 'remove' ? 'removed' : (result.mode === 'toggle' ? 'toggled' : 'selected');
                 // Alan 5/11/26 - Report matched tips rather than only changed tips so users know what the box covered.

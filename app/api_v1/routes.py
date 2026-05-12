@@ -138,10 +138,41 @@ def create_job():
             details={"field": "trimming_method", "value": trimmer},
         )
 
+    # Normalize input_type. The public JSON API only supports inline data:
+    # FASTA text in `sequence`, or accessions in `accessions`. Server-side
+    # FASTA uploads (the worker's `fasta_upload` mode, which expects a file
+    # already staged on disk) are not reachable via this endpoint and would
+    # produce a job that's guaranteed to fail at worker time. We map any
+    # "fasta"/"sequence"/missing variant to `pasted_sequence` when a sequence
+    # body is present, and reject up-front otherwise.
+    raw_input_type = (data.get("input_type") or "").strip().lower() or None
+    sequence_text = data.get("sequence") or ""
+
+    if raw_input_type in ("fasta", "fasta_upload") and not sequence_text:
+        return error_response(
+            code="validation_failed",
+            message=(
+                "The public API does not support server-side FASTA file "
+                "uploads here. Send FASTA text in the 'sequence' field with "
+                "input_type='pasted_sequence'."
+            ),
+            status=422,
+            details={"field": "input_type", "value": raw_input_type},
+        )
+
+    if sequence_text and raw_input_type in (None, "fasta", "sequence", "pasted_sequence"):
+        input_type = "pasted_sequence"
+    elif raw_input_type:
+        # Accession-list and any future modes pass through unchanged so the
+        # worker can apply its own routing.
+        input_type = raw_input_type
+    else:
+        input_type = "pasted_sequence"
+
     job_params = {
-        "input_type": str(data.get("input_type", "fasta"))[:64],
+        "input_type": input_type[:64],
         "notes": str(data.get("notes", ""))[:2000],
-        "sequence": data.get("sequence", ""),
+        "sequence": sequence_text,
         "accessions": data.get("accessions", []) or [],
         "alignment_method": aligner,
         "trimming_method": trimmer,
@@ -558,7 +589,11 @@ def tools_blast():
 @require_api_token(scope='tools:read')
 @limiter.limit("10 per minute; 200 per hour", key_func=api_token_key_func)
 def tools_genbank():
-    from app.api.routes import _parse_genbank_accession_tokens, _fetch_genbank_sequences_for_queue
+    from app.api.routes import (
+        MAX_CUSTOM_GENBANK_ACCESSIONS,
+        _fetch_genbank_sequences_for_queue,
+        _parse_genbank_accession_tokens,
+    )
     body = request.get_json(silent=True) or {}
     raw = body.get("accessions") or body.get("query") or ""
     accessions, invalid = _parse_genbank_accession_tokens(raw)
@@ -568,6 +603,13 @@ def tools_genbank():
             message="No valid GenBank accessions found.",
             status=422,
             details={"invalid": invalid},
+        )
+    if len(accessions) > MAX_CUSTOM_GENBANK_ACCESSIONS:
+        return error_response(
+            code="validation_failed",
+            message=f"Too many accessions. Maximum is {MAX_CUSTOM_GENBANK_ACCESSIONS}.",
+            status=422,
+            details={"count": len(accessions), "max": MAX_CUSTOM_GENBANK_ACCESSIONS},
         )
     try:
         sequences, skipped = _fetch_genbank_sequences_for_queue(accessions)

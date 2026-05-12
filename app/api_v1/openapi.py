@@ -59,9 +59,43 @@ def _schemas():
         "CreateJobRequest": {
             "type": "object",
             "required": ["tree_method"],
+            "example": {
+                "input_type": "pasted_sequence",
+                "sequence": (
+                    ">Sample_A\nATGCGTACGTAGCTAGCTAGCTAGCTAGCTAACGATCGATCGATCGATCGATCGATCGATCGATCGATCGATCGATCGATCGATCGATCGATCGATCG\n"
+                    ">Sample_B\nATGCGTACGTAGCTAGCTAGCTAGCTAGCTAACGATCGATCGATCGATCGATCGATCGATCGATCGATCGATCGATCGTTTGATCGATCGATCG\n"
+                    ">Sample_C\nATGCGTACGTAGCTAGCTAGCTAGCTAGCTAACGATCGATCGATCGATCGATCGATCGATCGATCGATCGATCGATCGATCGATCGTTTGATCG\n"
+                    ">Sample_D\nATGCGTACGTAGCTAGCTAGCTAGCTAGCTAACGATCGATCGATCGATCGATCGATCGATCGATCGATCGTTTGATCGATCGATCGATCGATCG"
+                ),
+                "tree_method": "fasttree",
+                "alignment_method": "mafft",
+                "trimming_method": "none",
+                "notes": "API test with valid pasted FASTA",
+            },
             "properties": {
-                "input_type": {"type": "string", "default": "fasta"},
-                "sequence": {"type": "string", "description": "FASTA-formatted sequence text. Max 5 MB."},
+                "input_type": {
+                    "type": "string",
+                    "default": "pasted_sequence",
+                    "enum": ["pasted_sequence", "accession_list"],
+                    "description": (
+                        "How sequence data is provided. Use `pasted_sequence` "
+                        "with FASTA text in the `sequence` field, or "
+                        "`accession_list` with GenBank IDs in `accessions`. "
+                        "If `sequence` is non-empty and `input_type` is omitted, "
+                        "it defaults to `pasted_sequence`. Server-side FASTA "
+                        "file uploads are not supported via this endpoint."
+                    ),
+                },
+                "sequence": {
+                    "type": "string",
+                    "description": (
+                        "FASTA-formatted sequence text for `pasted_sequence` jobs. "
+                        "One or more `>header\\nbases` records pasted directly "
+                        "into the request body. Use real DNA bases, not "
+                        "placeholders. Max 5 MB."
+                    ),
+                    "example": ">Sample_A\nATGCGTACGTAGCTAGCTAGCTA\n>Sample_B\nATGCGTACGTAGCTAGCTAGCTA",
+                },
                 "accessions": {
                     "type": "array",
                     "items": {"type": "string"},
