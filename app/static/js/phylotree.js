@@ -10809,8 +10809,8 @@
 
   let d3_layout_phylotree_context_menu_id = "d3_layout_phylotree_context_menu";
 
-  // Alan 5/12/26 - Resolve record URLs from node labels so the menu can jump to the source record.
-  function extractRecordUrl(node) {
+  // Alan 5/12/26 - Resolve record targets from node labels so the menu can jump to the source record.
+  function extractRecordTarget(node) {
     const raw = String(
       node?.data?.__original_name ||
       node?.data?.original_name ||
@@ -10831,7 +10831,16 @@
     ];
     for (const pattern of moPatterns) {
       const match = normalized.match(pattern);
-      if (match) return `https://mushroomobserver.org/obs/${match[1]}`;
+      if (match) {
+        return {
+          kind: "mushroom-observer",
+          id: match[1],
+          label: "Open observation in Mushroom Observer",
+          urls: {
+            primary: `https://mushroomobserver.org/obs/${match[1]}`
+          }
+        };
+      }
     }
 
     const iNatPatterns = [
@@ -10846,7 +10855,34 @@
     ];
     for (const pattern of iNatPatterns) {
       const match = normalized.match(pattern);
-      if (match) return `https://inaturalist.org/observations/${match[1]}`;
+      if (match) {
+        return {
+          kind: "inaturalist",
+          id: match[1],
+          label: "Open observation in iNaturalist",
+          urls: {
+            primary: `https://inaturalist.org/observations/${match[1]}`
+          }
+        };
+      }
+    }
+
+    // Alan 5/12/26 - Recognize Mycoportal occurrence IDs before falling back to GenBank accessions.
+    const mycoportalPatterns = [
+      /\bMP\s*([0-9]{7})\b/i
+    ];
+    for (const pattern of mycoportalPatterns) {
+      const match = normalized.match(pattern);
+      if (match) {
+        return {
+          kind: "mycoportal",
+          id: match[1],
+          label: "Open in Mycoportal",
+          urls: {
+            primary: `https://mycoportal.org/portal/collections/individual/index.php?occid=${match[1]}`
+          }
+        };
+      }
     }
 
     // Alan 5/12/26 - Fall back to a GenBank accession only after checking for local record IDs.
@@ -10857,7 +10893,17 @@
     ];
     for (const pattern of genbankPatterns) {
       const match = normalized.match(pattern);
-      if (match) return `https://www.ncbi.nlm.nih.gov/nuccore/${match[1]}`;
+      if (match) {
+        return {
+          kind: "genbank",
+          id: match[1],
+          label: "Open Sequence in GenBank",
+          urls: {
+            genbank: `https://www.ncbi.nlm.nih.gov/nuccore/${match[1]}`,
+            mycomap: `https://mycomap.com/genbank/accession/lookup/${match[1]}`
+          }
+        };
+      }
     }
 
     return null;
@@ -11028,18 +11074,49 @@
 
         // Alan 5/12/26 - Add a source-link action for tip labels that carry a recognizable record ID.
         if (isLeafNode(node)) {
-          const recordUrl = extractRecordUrl(node);
-          if (recordUrl) {
+          const recordTarget = extractRecordTarget(node);
+          if (recordTarget) {
             menu_object.append("div").attr("class", "phylotree-menu-divider dropdown-divider");
-            menu_object
-              .append("a")
-              .attr("class", "phylotree-menu-item dropdown-item")
-              .attr("tabindex", "-1")
-              .text("Open record in new tab")
-              .on("click", () => {
-                menu_object.style("display", "none");
-                window.open(recordUrl, "_blank", "noopener,noreferrer");
-              });
+            if (recordTarget.kind === "genbank") {
+              menu_object
+                .append("a")
+                .attr("class", "phylotree-menu-item dropdown-item")
+                .attr("tabindex", "-1")
+                .text("Open Sequence in GenBank")
+                .on("click", () => {
+                  menu_object.style("display", "none");
+                  window.open(recordTarget.urls.genbank, "_blank", "noopener,noreferrer");
+                });
+              menu_object
+                .append("a")
+                .attr("class", "phylotree-menu-item dropdown-item")
+                .attr("tabindex", "-1")
+                .text("Open sequence in Mycomap")
+                .on("click", () => {
+                  menu_object.style("display", "none");
+                  window.open(recordTarget.urls.mycomap, "_blank", "noopener,noreferrer");
+                });
+            } else if (recordTarget.kind === "mycoportal") {
+              menu_object
+                .append("a")
+                .attr("class", "phylotree-menu-item dropdown-item")
+                .attr("tabindex", "-1")
+                .text(recordTarget.label)
+                .on("click", () => {
+                  menu_object.style("display", "none");
+                  window.open(recordTarget.urls.primary, "_blank", "noopener,noreferrer");
+                });
+            } else {
+              menu_object
+                .append("a")
+                .attr("class", "phylotree-menu-item dropdown-item")
+                .attr("tabindex", "-1")
+                .text(recordTarget.label)
+                .on("click", () => {
+                  menu_object.style("display", "none");
+                  window.open(recordTarget.urls.primary, "_blank", "noopener,noreferrer");
+                });
+            }
           }
         }
       }
