@@ -10809,6 +10809,60 @@
 
   let d3_layout_phylotree_context_menu_id = "d3_layout_phylotree_context_menu";
 
+  // Alan 5/12/26 - Resolve record URLs from node labels so the menu can jump to the source record.
+  function extractRecordUrl(node) {
+    const raw = String(
+      node?.data?.__original_name ||
+      node?.data?.original_name ||
+      node?.data?.name ||
+      node?.name ||
+      ""
+    );
+    if (!raw) return null;
+
+    const normalized = raw.replace(/\s+/g, " ").trim();
+
+    // Alan 5/12/26 - Prefer observational record IDs over GenBank accessions when both are present.
+    const moPatterns = [
+      /\bMO\s*#?\s*([0-9]{5,6})\b/i,
+      /\bMushroom\s*Observer\s*#?\s*([0-9]{5,6})\b/i,
+      /\bhttps?:\/\/(?:www\.)?mushroomobserver\.org\/(?:obs\/)?([0-9]{5,6})\b/i,
+      /\bmushroomobserver\.org\/(?:obs\/)?([0-9]{5,6})\b/i
+    ];
+    for (const pattern of moPatterns) {
+      const match = normalized.match(pattern);
+      if (match) return `https://mushroomobserver.org/obs/${match[1]}`;
+    }
+
+    const iNatPatterns = [
+      /\biNaturalist[_\s]*#\s*([0-9]{6,10})\b/i,
+      /\biNaturalist\s*#\s*([0-9]{6,10})\b/i,
+      /\biNaturalist\s*[:#]?\s*([0-9]{6,10})\b/i,
+      /\biNat[_\s]*#\s*([0-9]{6,10})\b/i,
+      /\biNat\s*#\s*([0-9]{6,10})\b/i,
+      /\biNat\s*[:#]?\s*([0-9]{6,10})\b/i,
+      /\biNat[_\s]*[:#]?\s*([0-9]{6,10})(?:_[0-9]+)?\b/i,
+      /\biNAT\s*[:#]?\s*([0-9]{6,10})\b/i
+    ];
+    for (const pattern of iNatPatterns) {
+      const match = normalized.match(pattern);
+      if (match) return `https://inaturalist.org/observations/${match[1]}`;
+    }
+
+    // Alan 5/12/26 - Fall back to a GenBank accession only after checking for local record IDs.
+    const genbankPatterns = [
+      /\b([A-Z]{1,2}_[0-9]{5,8}(?:\.[0-9]+)?)\b/,
+      /\b([A-Z]{1,2}[0-9]{5,8}(?:\.[0-9]+)?)\b/,
+      /\b([A-Z]{3,4}[0-9]{6,9}(?:\.[0-9]+)?)\b/
+    ];
+    for (const pattern of genbankPatterns) {
+      const match = normalized.match(pattern);
+      if (match) return `https://www.ncbi.nlm.nih.gov/nuccore/${match[1]}`;
+    }
+
+    return null;
+  }
+
   function nodeDropdownMenu(node, container, phylotree, options, event) {
     let menu_object = select(container)
       .select("#" + d3_layout_phylotree_context_menu_id);
@@ -10970,6 +11024,23 @@
                 .updateHasHiddenNodes()
                 .update();
             });
+        }
+
+        // Alan 5/12/26 - Add a source-link action for tip labels that carry a recognizable record ID.
+        if (isLeafNode(node)) {
+          const recordUrl = extractRecordUrl(node);
+          if (recordUrl) {
+            menu_object.append("div").attr("class", "phylotree-menu-divider dropdown-divider");
+            menu_object
+              .append("a")
+              .attr("class", "phylotree-menu-item dropdown-item")
+              .attr("tabindex", "-1")
+              .text("Open record in new tab")
+              .on("click", () => {
+                menu_object.style("display", "none");
+                window.open(recordUrl, "_blank", "noopener,noreferrer");
+              });
+          }
         }
       }
 
