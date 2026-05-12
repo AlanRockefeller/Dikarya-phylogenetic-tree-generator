@@ -59,6 +59,29 @@ def create_app(config_name='default'):
             return jsonify(error="CSRF token missing or invalid", message=e.description), 400
         return "CSRF error", 400
 
+    # 413 handler: return JSON envelope for /api/v1 callers so they don't see
+    # a generic HTML "Request Entity Too Large" page. MAX_CONTENT_LENGTH is
+    # enforced before routing, so we register on the app, not the blueprint.
+    from werkzeug.exceptions import RequestEntityTooLarge
+
+    @app.errorhandler(RequestEntityTooLarge)
+    def handle_request_too_large(e):
+        if request.path.startswith("/api/v1/"):
+            limit_bytes = app.config.get("MAX_CONTENT_LENGTH") or 0
+            limit_mb = limit_bytes / (1024 * 1024)
+            return jsonify({
+                "error": {
+                    "code": "payload_too_large",
+                    "message": (
+                        f"Request body exceeds the maximum allowed size of "
+                        f"{limit_mb:.1f} MB. If you are submitting a FASTA "
+                        f"`sequence`, note that the per-field cap is 5 MB; "
+                        f"larger inputs should be split into multiple jobs."
+                    ),
+                }
+            }), 413
+        return "Request entity too large", 413
+
     # Register Blueprints
     # Journal blueprint handles the root route and static pages
     from app.journal import bp as journal_bp

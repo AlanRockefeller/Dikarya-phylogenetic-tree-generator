@@ -82,6 +82,29 @@ document.addEventListener('DOMContentLoaded', async () => {
         selectionSaveDebounce = setTimeout(saveSelectionSets, 800);
     }
 
+    // Alan 5/12/26 - Save selection/color sets immediately after destructive prune cleanup.
+    async function saveSelectionSetsNow() {
+        // Alan 5/12/26 - Cancel pending debounced saves so stale pre-prune colors cannot overwrite cleanup.
+        if (selectionSaveDebounce) {
+            // Alan 5/12/26 - Clear the pending save timer before forcing a fresh save.
+            clearTimeout(selectionSaveDebounce);
+            // Alan 5/12/26 - Reset the timer handle after cancellation.
+            selectionSaveDebounce = null;
+        }
+        // Alan 5/12/26 - Persist the viewer's current selection/color state.
+        await saveSelectionSets();
+    }
+
+    // Alan 5/12/26 - Prune taxa while preserving unrelated selection-set color annotations.
+    async function pruneTaxaPreservingSelectionColors(names) {
+        // Alan 5/12/26 - Run the existing backend prune action first so failed prunes do not mutate saved colors.
+        await TreeEditActions.pruneTaxa(JOB_ID, names);
+        // Alan 5/12/26 - Remove only the pruned tips from saved selection sets; keep other colored labels.
+        if (viewer?.removeIdsFromSelectionSets) viewer.removeIdsFromSelectionSets(names);
+        // Alan 5/12/26 - Persist the pruned selection-set cleanup before the tree reloads.
+        await saveSelectionSetsNow();
+    }
+
     // Alan 5/11/26 - Keep the Box Select toolbar button visually synchronized with viewer mode.
     function updateBoxSelectButton() {
         // Alan 5/11/26 - Look up lazily so the helper can run before UI wiring finishes.
@@ -322,9 +345,10 @@ document.addEventListener('DOMContentLoaded', async () => {
                     if (names.length === 0) return;
                     // Alan 5/12/26 - Run the same backend prune flow used by the Prune button.
                     runBackendAction(`Pruning ${names.length} sequence${names.length === 1 ? '' : 's'}`, async () => {
-                        // Alan 5/12/26 - Prune the boxed terminal names through the existing API contract.
-                        await TreeEditActions.pruneTaxa(JOB_ID, names);
-                    });
+                        // Alan 5/12/26 - Prune boxed names without clearing unrelated selection-set colors.
+                        await pruneTaxaPreservingSelectionColors(names);
+                    // Alan 5/12/26 - Selection-set cleanup is handled inside pruneTaxaPreservingSelectionColors.
+                    }, { clearSelections: false });
                     // Alan 5/12/26 - Do not also show a selection-set remove toast for prune boxes.
                     return;
                 }
@@ -842,8 +866,10 @@ document.addEventListener('DOMContentLoaded', async () => {
             // No confirmation requested
 
             runBackendAction(`Pruning ${nodes.length} nodes`, async () => {
-                await TreeEditActions.pruneTaxa(JOB_ID, names);
-            });
+                // Alan 5/12/26 - Prune selected names without clearing unrelated selection-set colors.
+                await pruneTaxaPreservingSelectionColors(names);
+            // Alan 5/12/26 - Selection-set cleanup is handled inside pruneTaxaPreservingSelectionColors.
+            }, { clearSelections: false });
         });
 
         if (btnRename) btnRename.addEventListener('click', () => {

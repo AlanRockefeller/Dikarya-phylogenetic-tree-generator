@@ -4,7 +4,7 @@
 {% block subtitle %}Tree Viewer{% endblock %}
 
 {% block head %}
-<link rel="stylesheet" href="{{ url_for('static', filename='css/tree_viewer.css') }}">
+<link rel="stylesheet" href="{{ url_for('static', filename='css/tree_viewer.css') }}?v=3">
 <link rel="stylesheet" href="{{ url_for('static', filename='css/phylotree.css') }}">
 <link rel="stylesheet" href="{{ url_for('static', filename='css/phylotree-menus.css') }}">
 {% endblock %}
@@ -602,11 +602,11 @@
 
 <script src="{{ url_for('static', filename='js/phylotree.js') }}"></script>
 
-<script src="{{ url_for('static', filename='js/tree_viewer_phylotree_v2.js') }}?v=36"></script>
+<script src="{{ url_for('static', filename='js/tree_viewer_phylotree_v2.js') }}?v=39"></script>
 
 <script src="{{ url_for('static', filename='js/tree_viewer_api.js') }}"></script>
 
-<script src="{{ url_for('static', filename='js/tree_viewer_controller.js') }}?v=31"></script>
+<script src="{{ url_for('static', filename='js/tree_viewer_controller.js') }}?v=32"></script>
 
 
 

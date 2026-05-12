@@ -98,6 +98,172 @@ VALID_TREE_METHODS = {"nj", "raxml", "iqtree", "mrbayes", "fasttree"}
 VALID_ALIGNERS    = {"mafft", "muscle", "clustalo", "iqtree_builtin", "default"}
 VALID_TRIMMERS    = {"none", "trimal", "bmge"}
 
+# Per-field limits used in both create and recompute paths. Kept in one place
+# so validation errors and the OpenAPI schema can quote the same numbers.
+LIMITS = {
+    "sequence_max_bytes":  5_000_000,
+    "accessions_max":      500,
+    "accession_str_max":   64,
+    "notes_max":           2000,
+    "tree_model_max":      64,
+    "outgroup_max":        256,
+    "bootstrap":           (0,     10_000),
+    "mcmc_generations":    (1_000, 100_000_000),
+    "mcmc_nruns":          (1,     8),
+    "mcmc_nchains":        (1,     16),
+}
+
+# Fields a recompute may override. Sequence/accessions are intentionally
+# excluded -- recompute is "re-run with different parameters on the same
+# input data," not "submit a new dataset." Use POST /jobs for that.
+RECOMPUTE_ALLOWED_FIELDS = frozenset({
+    "tree_method", "tree_model",
+    "alignment_method", "trimming_method",
+    "bootstrap", "mcmc_generations", "mcmc_nruns", "mcmc_nchains",
+    "outgroup", "notes",
+})
+
+
+def _validate_categorical(field, value, allowed):
+    """Return (clean_value, None) or (None, error_response). `allowed` is a set."""
+    if value not in allowed:
+        return None, error_response(
+            code="validation_failed",
+            message=(
+                f"`{field}` must be one of {sorted(allowed)}; got "
+                f"{value!r}. See /api/v1/openapi.json for the full schema."
+            ),
+            status=422,
+            details={"field": field, "value": value, "allowed": sorted(allowed)},
+        )
+    return value, None
+
+
+def _validate_clamped_int(field, value, *, default):
+    """Validate-and-clamp; reject non-numeric values with a clear 422.
+
+    If the value is missing (None) we substitute the default. If present
+    but not coercible to int, we 422 instead of silently substituting --
+    silent substitution hides typos like `"bootstrap": "many"`.
+    """
+    lo, hi = LIMITS[field]
+    if value is None:
+        return default, None
+    try:
+        n = int(value)
+    except (TypeError, ValueError):
+        return None, error_response(
+            code="validation_failed",
+            message=(
+                f"`{field}` must be an integer between {lo:,} and {hi:,}. "
+                f"Received {value!r} ({type(value).__name__})."
+            ),
+            status=422,
+            details={"field": field, "value": value, "min": lo, "max": hi},
+        )
+    if n < lo or n > hi:
+        return None, error_response(
+            code="validation_failed",
+            message=(
+                f"`{field}` is {n:,}, outside the allowed range "
+                f"{lo:,}..{hi:,}."
+            ),
+            status=422,
+            details={"field": field, "value": n, "min": lo, "max": hi},
+        )
+    return n, None
+
+
+def _validate_string(field, value, *, max_len, allow_empty=True):
+    if value is None:
+        if allow_empty:
+            return "", None
+        return None, error_response(
+            code="validation_failed",
+            message=f"`{field}` is required.",
+            status=422,
+            details={"field": field},
+        )
+    if not isinstance(value, str):
+        return None, error_response(
+            code="validation_failed",
+            message=f"`{field}` must be a string; got {type(value).__name__}.",
+            status=422,
+            details={"field": field, "type": type(value).__name__},
+        )
+    if not allow_empty and not value.strip():
+        return None, error_response(
+            code="validation_failed",
+            message=f"`{field}` must be a non-empty string.",
+            status=422,
+            details={"field": field},
+        )
+    if len(value) > max_len:
+        return None, error_response(
+            code="validation_failed",
+            message=(
+                f"`{field}` is {len(value):,} characters; the maximum is "
+                f"{max_len:,}."
+            ),
+            status=422,
+            details={"field": field, "length": len(value), "max_length": max_len},
+        )
+    return value, None
+
+
+def _validate_accessions(value):
+    """Accessions must be a list of short strings, capped at LIMITS['accessions_max']."""
+    if value is None:
+        return [], None
+    if not isinstance(value, list):
+        return None, error_response(
+            code="validation_failed",
+            message=(
+                "`accessions` must be a JSON array of GenBank accession "
+                "strings (e.g. [\"MK564475\", \"OL123456\"])."
+            ),
+            status=422,
+            details={"field": "accessions", "type": type(value).__name__},
+        )
+    if len(value) > LIMITS["accessions_max"]:
+        return None, error_response(
+            code="validation_failed",
+            message=(
+                f"`accessions` has {len(value):,} entries; the maximum is "
+                f"{LIMITS['accessions_max']:,}. Split your dataset across "
+                f"multiple jobs."
+            ),
+            status=422,
+            details={"field": "accessions", "count": len(value),
+                     "max": LIMITS["accessions_max"]},
+        )
+    cleaned = []
+    for i, a in enumerate(value):
+        if not isinstance(a, str):
+            return None, error_response(
+                code="validation_failed",
+                message=(
+                    f"`accessions[{i}]` must be a string; got "
+                    f"{type(a).__name__}."
+                ),
+                status=422,
+                details={"field": "accessions", "index": i,
+                         "type": type(a).__name__},
+            )
+        if len(a) > LIMITS["accession_str_max"]:
+            return None, error_response(
+                code="validation_failed",
+                message=(
+                    f"`accessions[{i}]` is {len(a):,} characters; max is "
+                    f"{LIMITS['accession_str_max']:,}."
+                ),
+                status=422,
+                details={"field": "accessions", "index": i, "length": len(a),
+                         "max_length": LIMITS["accession_str_max"]},
+            )
+        cleaned.append(a)
+    return cleaned, None
+
 
 @bp.route('/jobs', methods=['POST'])
 @require_api_token(scope='jobs:write')
@@ -108,96 +274,143 @@ def create_job():
     alignment_method, trimming_method, tree_method, tree_model, bootstrap,
     mcmc_generations, mcmc_nruns, mcmc_nchains, notes}.
     """
-    data = request.get_json(silent=True) or {}
-
-    # Validation of categorical params (allowlist).
-    tree_method = data.get("tree_method", "fasttree")
-    if tree_method not in VALID_TREE_METHODS:
+    data = request.get_json(silent=True)
+    if data is None:
         return error_response(
-            code="validation_failed",
-            message=f"tree_method must be one of: {sorted(VALID_TREE_METHODS)}",
-            status=422,
-            details={"field": "tree_method", "value": tree_method},
+            code="bad_request",
+            message=(
+                "Request body must be valid JSON with `Content-Type: "
+                "application/json`. See /api/v1/openapi.json for the "
+                "CreateJobRequest schema."
+            ),
+            status=400,
+        )
+    if not isinstance(data, dict):
+        return error_response(
+            code="bad_request",
+            message="Request body must be a JSON object.",
+            status=400,
         )
 
-    aligner = data.get("alignment_method", "mafft")
-    if aligner not in VALID_ALIGNERS:
+    # Allowlisted categorical params.
+    tree_method, err = _validate_categorical(
+        "tree_method", data.get("tree_method", "fasttree"), VALID_TREE_METHODS)
+    if err: return err
+    aligner, err = _validate_categorical(
+        "alignment_method", data.get("alignment_method", "mafft"), VALID_ALIGNERS)
+    if err: return err
+    trimmer, err = _validate_categorical(
+        "trimming_method", data.get("trimming_method", "none"), VALID_TRIMMERS)
+    if err: return err
+
+    # Clamped integers.
+    bootstrap, err = _validate_clamped_int("bootstrap", data.get("bootstrap"), default=1000)
+    if err: return err
+    mcmc_generations, err = _validate_clamped_int(
+        "mcmc_generations", data.get("mcmc_generations"), default=50_000)
+    if err: return err
+    mcmc_nruns, err = _validate_clamped_int(
+        "mcmc_nruns", data.get("mcmc_nruns"), default=2)
+    if err: return err
+    mcmc_nchains, err = _validate_clamped_int(
+        "mcmc_nchains", data.get("mcmc_nchains"), default=4)
+    if err: return err
+
+    # Strings.
+    notes, err = _validate_string("notes", data.get("notes"),
+                                  max_len=LIMITS["notes_max"])
+    if err: return err
+    tree_model, err = _validate_string(
+        "tree_model", data.get("tree_model", "GTR+G"),
+        max_len=LIMITS["tree_model_max"], allow_empty=False)
+    if err: return err
+
+    # Sequence + accessions.
+    sequence_text, err = _validate_string(
+        "sequence", data.get("sequence"),
+        max_len=LIMITS["sequence_max_bytes"], allow_empty=True)
+    if err: return err
+    accessions, err = _validate_accessions(data.get("accessions"))
+    if err: return err
+    if not sequence_text and not accessions:
         return error_response(
             code="validation_failed",
-            message=f"alignment_method must be one of: {sorted(VALID_ALIGNERS)}",
+            message=(
+                "Provide either `sequence` (FASTA text) or `accessions` "
+                "(list of GenBank IDs). Both cannot be empty."
+            ),
             status=422,
-            details={"field": "alignment_method", "value": aligner},
+            details={"fields": ["sequence", "accessions"]},
         )
 
-    trimmer = data.get("trimming_method", "none")
-    if trimmer not in VALID_TRIMMERS:
+    # `alignment_options` is a free-form dict consumed by the worker; we cap
+    # only its shape and a rough byte size to keep it from being abused as
+    # an exfiltration channel into stored job params.
+    alignment_options = data.get("alignment_options")
+    if alignment_options is None:
+        alignment_options = {}
+    if not isinstance(alignment_options, dict):
         return error_response(
             code="validation_failed",
-            message=f"trimming_method must be one of: {sorted(VALID_TRIMMERS)}",
+            message="`alignment_options` must be a JSON object.",
             status=422,
-            details={"field": "trimming_method", "value": trimmer},
+            details={"field": "alignment_options",
+                     "type": type(alignment_options).__name__},
+        )
+    if len(json.dumps(alignment_options)) > 4096:
+        return error_response(
+            code="validation_failed",
+            message=(
+                "`alignment_options` serializes to more than 4 KB; reduce "
+                "the number of options or use shorter values."
+            ),
+            status=422,
+            details={"field": "alignment_options", "max_serialized_bytes": 4096},
         )
 
     # Normalize input_type. The public JSON API only supports inline data:
     # FASTA text in `sequence`, or accessions in `accessions`. Server-side
     # FASTA uploads (the worker's `fasta_upload` mode, which expects a file
-    # already staged on disk) are not reachable via this endpoint and would
-    # produce a job that's guaranteed to fail at worker time. We map any
-    # "fasta"/"sequence"/missing variant to `pasted_sequence` when a sequence
-    # body is present, and reject up-front otherwise.
+    # already staged on disk) are not reachable via this endpoint.
     raw_input_type = (data.get("input_type") or "").strip().lower() or None
-    sequence_text = data.get("sequence") or ""
-
     if raw_input_type in ("fasta", "fasta_upload") and not sequence_text:
         return error_response(
             code="validation_failed",
             message=(
                 "The public API does not support server-side FASTA file "
-                "uploads here. Send FASTA text in the 'sequence' field with "
-                "input_type='pasted_sequence'."
+                "uploads. Send FASTA text in the `sequence` field with "
+                "`input_type=\"pasted_sequence\"`, or use `accession_list` "
+                "with GenBank IDs in `accessions`."
             ),
             status=422,
             details={"field": "input_type", "value": raw_input_type},
         )
-
     if sequence_text and raw_input_type in (None, "fasta", "sequence", "pasted_sequence"):
         input_type = "pasted_sequence"
+    elif accessions and raw_input_type in (None, "accession_list", "accessions"):
+        input_type = "accession_list"
     elif raw_input_type:
-        # Accession-list and any future modes pass through unchanged so the
-        # worker can apply its own routing.
         input_type = raw_input_type
-    else:
+    elif sequence_text:
         input_type = "pasted_sequence"
+    else:
+        input_type = "accession_list"
 
     job_params = {
-        "input_type": input_type[:64],
-        "notes": str(data.get("notes", ""))[:2000],
-        "sequence": sequence_text,
-        "accessions": data.get("accessions", []) or [],
-        "alignment_method": aligner,
-        "trimming_method": trimmer,
-        "alignment_options": data.get("alignment_options", {}) or {},
-        "tree_method": tree_method,
-        "tree_model": str(data.get("tree_model", "GTR+G"))[:64],
-        "bootstrap":         _clamp_int(data.get("bootstrap"),         1000,     0,        10_000),
-        "mcmc_generations":  _clamp_int(data.get("mcmc_generations"),  50_000,   1_000,    100_000_000),
-        "mcmc_nruns":        _clamp_int(data.get("mcmc_nruns"),        2,        1,        8),
-        "mcmc_nchains":      _clamp_int(data.get("mcmc_nchains"),      4,        1,        16),
+        "input_type":        input_type[:64],
+        "notes":             notes,
+        "sequence":          sequence_text,
+        "accessions":        accessions,
+        "alignment_method":  aligner,
+        "trimming_method":   trimmer,
+        "alignment_options": alignment_options,
+        "tree_method":       tree_method,
+        "tree_model":        tree_model,
+        "bootstrap":         bootstrap,
+        "mcmc_generations":  mcmc_generations,
+        "mcmc_nruns":        mcmc_nruns,
+        "mcmc_nchains":      mcmc_nchains,
     }
-
-    # Sequence + accession sanity caps.
-    if isinstance(job_params["sequence"], str) and len(job_params["sequence"]) > 5_000_000:
-        return error_response(
-            code="validation_failed",
-            message="sequence payload exceeds 5 MB.",
-            status=422,
-        )
-    if isinstance(job_params["accessions"], list) and len(job_params["accessions"]) > 500:
-        return error_response(
-            code="validation_failed",
-            message="accessions list exceeds 500 entries.",
-            status=422,
-        )
 
     try:
         job_id = enqueue_job(job_params)
@@ -300,14 +513,85 @@ def recompute_job(job_id):
         return error_response(code="not_found", message="Job not found.", status=404)
     job_dir = Config.JOB_DIR / job_id
     try:
-        # Merge stored params with request overrides, same as the UI route.
+        # Start from stored params and merge in *only* allowlisted overrides
+        # from the request body. Unknown keys are rejected so the caller
+        # gets a clear error rather than a silently ignored override.
         params_path = job_dir / "input_info.json"
         params = {}
         if params_path.exists():
             with open(params_path, "r") as f:
                 params = json.load(f)
-        body = request.get_json(silent=True) or {}
-        params.update(body)
+        body = request.get_json(silent=True)
+        if body is None:
+            body = {}
+        if not isinstance(body, dict):
+            return error_response(
+                code="bad_request",
+                message="Request body must be a JSON object of overrides.",
+                status=400,
+            )
+
+        unknown = sorted(k for k in body.keys() if k not in RECOMPUTE_ALLOWED_FIELDS)
+        if unknown:
+            return error_response(
+                code="validation_failed",
+                message=(
+                    "The recompute endpoint only accepts a fixed set of "
+                    "parameter overrides on the same input data. The "
+                    "following field(s) are not allowed here: "
+                    f"{unknown}. Allowed fields: "
+                    f"{sorted(RECOMPUTE_ALLOWED_FIELDS)}. To submit different "
+                    "input data, create a new job with POST /jobs."
+                ),
+                status=422,
+                details={"unknown_fields": unknown,
+                         "allowed_fields": sorted(RECOMPUTE_ALLOWED_FIELDS)},
+            )
+
+        # Validate each override using the same helpers as POST /jobs. Only
+        # fields actually present in the body are touched; everything else
+        # falls back to the stored value.
+        overrides = {}
+        if "tree_method" in body:
+            v, err = _validate_categorical(
+                "tree_method", body["tree_method"], VALID_TREE_METHODS)
+            if err: return err
+            overrides["tree_method"] = v
+        if "alignment_method" in body:
+            v, err = _validate_categorical(
+                "alignment_method", body["alignment_method"], VALID_ALIGNERS)
+            if err: return err
+            overrides["alignment_method"] = v
+        if "trimming_method" in body:
+            v, err = _validate_categorical(
+                "trimming_method", body["trimming_method"], VALID_TRIMMERS)
+            if err: return err
+            overrides["trimming_method"] = v
+        for field, default in (("bootstrap", 1000), ("mcmc_generations", 50_000),
+                               ("mcmc_nruns", 2), ("mcmc_nchains", 4)):
+            if field in body:
+                v, err = _validate_clamped_int(field, body[field], default=default)
+                if err: return err
+                overrides[field] = v
+        if "tree_model" in body:
+            v, err = _validate_string(
+                "tree_model", body["tree_model"],
+                max_len=LIMITS["tree_model_max"], allow_empty=False)
+            if err: return err
+            overrides["tree_model"] = v
+        if "outgroup" in body:
+            v, err = _validate_string(
+                "outgroup", body["outgroup"],
+                max_len=LIMITS["outgroup_max"], allow_empty=True)
+            if err: return err
+            overrides["outgroup"] = v
+        if "notes" in body:
+            v, err = _validate_string(
+                "notes", body["notes"], max_len=LIMITS["notes_max"])
+            if err: return err
+            overrides["notes"] = v
+
+        params.update(overrides)
         # Always async for the public API.
         rq_job_id = enqueue_recompute_job(job_id, params)
         job.status = "queued"
@@ -394,11 +678,18 @@ def get_job_log(job_id, log_name):
 # Job events (SSE)
 # ============================================================================
 
+SSE_MAX_DURATION_SECONDS = 30 * 60       # hard cap per connection
+SSE_MAX_CONCURRENT_PER_TOKEN = 5          # max simultaneous streams per token
+SSE_HEARTBEAT_SECONDS = 15                # ping interval
+
+
 @bp.route('/jobs/<job_id>/events', methods=['GET'])
 @require_api_token(scope='jobs:read')
+@limiter.limit("30 per minute", key_func=api_token_key_func)
 def job_events(job_id):
     """SSE stream of pipeline progress events. Mirrors the internal /api/job/<id>/events
-    stream but enforces strict ownership."""
+    stream but enforces strict ownership, a per-token concurrent-connection cap,
+    a max stream duration, and mid-stream revocation checks."""
     import time
     import redis as _redis
     from app.api.routes import _build_snapshot  # reuse existing snapshot builder
@@ -407,7 +698,50 @@ def job_events(job_id):
     if not job:
         return error_response(code="not_found", message="Job not found.", status=404)
 
+    # Per-token concurrent connection cap. We use a Redis counter that's
+    # INCR'd on connect and DECR'd in the generator's finally block. A short
+    # TTL on the counter prevents permanently-stuck counters if a worker
+    # is killed before the finally runs.
+    token_id = g.api_token.id
+    conn_key = f"sse:conn:{token_id}"
+    try:
+        r_gate = _redis.from_url(Config.REDIS_URL)
+        current = r_gate.incr(conn_key)
+        r_gate.expire(conn_key, SSE_MAX_DURATION_SECONDS + 60)
+    except Exception:
+        # If Redis is unreachable we fall back to enforcing only the per-token
+        # rate limit -- which is itself sufficient to bound abuse.
+        current = 1
+        r_gate = None
+
+    if current > SSE_MAX_CONCURRENT_PER_TOKEN:
+        if r_gate is not None:
+            try:
+                r_gate.decr(conn_key)
+            except Exception:
+                pass
+        return error_response(
+            code="too_many_streams",
+            message=(
+                f"This API token already has {SSE_MAX_CONCURRENT_PER_TOKEN} "
+                f"open event streams (the per-token maximum). Close an "
+                f"existing stream before opening a new one, or mint a "
+                f"separate token if your workload genuinely needs more "
+                f"concurrent streams."
+            ),
+            status=429,
+            details={"max_concurrent": SSE_MAX_CONCURRENT_PER_TOKEN,
+                     "current": current},
+        )
+
+    # Snapshot the bits of state we'll need inside the generator. Once the
+    # generator yields, Flask's request context is gone, so we can't touch
+    # `g`, `request`, etc. from within `generate()`.
+    api_token_id = token_id
+
     def generate():
+        from app.models import ApiToken as _ApiToken
+        started = time.monotonic()
         r = _redis.from_url(Config.REDIS_URL)
         pubsub = r.pubsub()
         channel = f"job:{job_id}:events"
@@ -418,7 +752,17 @@ def job_events(job_id):
             job_status = snapshot["job"]["status"]
             last_ping = time.monotonic()
             last_db_poll = 0.0
+            last_token_check = time.monotonic()
             while True:
+                # Hard duration cap. Clients should reconnect.
+                if time.monotonic() - started > SSE_MAX_DURATION_SECONDS:
+                    yield (
+                        "event: timeout\n"
+                        "data: {\"reason\": \"max_duration_reached\", "
+                        f"\"max_seconds\": {SSE_MAX_DURATION_SECONDS}}}\n\n"
+                    )
+                    break
+
                 message = pubsub.get_message(timeout=0.1)
                 if message and message['type'] == 'message':
                     data = message['data']
@@ -433,9 +777,23 @@ def job_events(job_id):
                     except json.JSONDecodeError:
                         pass
                 now = time.monotonic()
-                if now - last_ping >= 15:
+                if now - last_ping >= SSE_HEARTBEAT_SECONDS:
                     yield "event: ping\ndata: {}\n\n"
                     last_ping = now
+                    # Re-check token validity on each heartbeat so a revoked
+                    # token can't keep streaming indefinitely.
+                    if now - last_token_check >= SSE_HEARTBEAT_SECONDS:
+                        last_token_check = now
+                        try:
+                            tok = _ApiToken.query.get(api_token_id)
+                            if tok is None or not tok.is_active:
+                                yield (
+                                    "event: revoked\n"
+                                    "data: {\"reason\": \"token_revoked\"}\n\n"
+                                )
+                                break
+                        except Exception:
+                            db.session.rollback()
                 if job_status not in ('completed', 'failed'):
                     if now - last_db_poll >= 1.0:
                         last_db_poll = now
@@ -447,8 +805,16 @@ def job_events(job_id):
                             break
                 time.sleep(0.05)
         finally:
-            pubsub.unsubscribe()
-            pubsub.close()
+            try:
+                pubsub.unsubscribe()
+                pubsub.close()
+            except Exception:
+                pass
+            if r_gate is not None:
+                try:
+                    r_gate.decr(conn_key)
+                except Exception:
+                    pass
 
     return Response(
         stream_with_context(generate()),
@@ -464,6 +830,54 @@ def job_events(job_id):
 # ============================================================================
 # Tree mutations
 # ============================================================================
+
+# Tree mutation input bounds. Real fungal trees in this codebase rarely have
+# more than a few thousand tips; 10 000 is generous headroom. Per-name length
+# is bounded both to prevent memory abuse and to keep Newick/Nexus files
+# downstream a reasonable size.
+TREE_MUTATION_LIMITS = {
+    "max_tips":      10_000,
+    "max_name_len":  256,
+}
+
+# Characters that would corrupt Newick syntax if written verbatim as a tip
+# name. Reject these in *new* tip names (rename target, prune target list)
+# so a malformed name can't break tree exports.
+_NEWICK_UNSAFE = set("()[];,:'\"\t\n\r")
+
+
+def _validate_tip_name(field, value, *, allow_newick_unsafe=False):
+    """Validate a single tip / taxon name string.
+
+    `allow_newick_unsafe=True` is used for `old_name` and `tips` inputs that
+    must match what already exists in the tree (those values came from the
+    pipeline itself, not from the caller, so we only length-bound them).
+    For new names introduced by the caller (`new_name`), we additionally
+    reject Newick-unsafe characters.
+    """
+    s, err = _validate_string(
+        field, value,
+        max_len=TREE_MUTATION_LIMITS["max_name_len"],
+        allow_empty=False,
+    )
+    if err:
+        return None, err
+    if not allow_newick_unsafe:
+        bad = sorted({c for c in s if c in _NEWICK_UNSAFE})
+        if bad:
+            return None, error_response(
+                code="validation_failed",
+                message=(
+                    f"`{field}` contains characters that are invalid in "
+                    f"Newick tip names: {bad}. Avoid parentheses, brackets, "
+                    f"commas, colons, semicolons, quotes, and whitespace "
+                    f"other than spaces."
+                ),
+                status=422,
+                details={"field": field, "invalid_chars": bad},
+            )
+    return s, None
+
 
 def _mutation(handler, job_id, *, where, scope="jobs:write"):
     """Common wrapper for prune/rename/reroot/midpoint endpoints. Performs
@@ -489,9 +903,34 @@ def _mutation(handler, job_id, *, where, scope="jobs:write"):
 def prune_tree_v1(job_id):
     def handler(job_dir, body):
         from app.services.tree_edit_service import load_tree_state, prune_taxa, save_tree_state
-        tips = body.get("tips", [])
-        if not isinstance(tips, list) or not all(isinstance(t, str) for t in tips):
-            raise ValueError("`tips` must be a list of strings.")
+        tips = body.get("tips")
+        if not isinstance(tips, list):
+            raise ValueError(
+                "`tips` must be a JSON array of tip-name strings, e.g. "
+                "{\"tips\": [\"Sample_A\", \"Sample_B\"]}."
+            )
+        if not tips:
+            raise ValueError("`tips` must contain at least one tip name to prune.")
+        max_tips = TREE_MUTATION_LIMITS["max_tips"]
+        if len(tips) > max_tips:
+            raise ValueError(
+                f"`tips` has {len(tips):,} entries; the per-request maximum "
+                f"is {max_tips:,}. Split large prune operations across "
+                f"multiple requests."
+            )
+        max_len = TREE_MUTATION_LIMITS["max_name_len"]
+        for i, t in enumerate(tips):
+            if not isinstance(t, str):
+                raise ValueError(
+                    f"`tips[{i}]` must be a string; got {type(t).__name__}."
+                )
+            if not t:
+                raise ValueError(f"`tips[{i}]` is an empty string.")
+            if len(t) > max_len:
+                raise ValueError(
+                    f"`tips[{i}]` is {len(t):,} characters; tip names are "
+                    f"capped at {max_len:,}."
+                )
         state = load_tree_state(job_dir)
         state = prune_taxa(job_dir, state, tips)
         save_tree_state(job_dir, state)
@@ -505,10 +944,30 @@ def prune_tree_v1(job_id):
 def rename_tip_v1(job_id):
     def handler(job_dir, body):
         from app.services.tree_edit_service import load_tree_state, rename_tip, save_tree_state
+        max_len = TREE_MUTATION_LIMITS["max_name_len"]
         old_name = body.get("old_name")
         new_name = body.get("new_name")
-        if not isinstance(old_name, str) or not isinstance(new_name, str):
-            raise ValueError("`old_name` and `new_name` must be strings.")
+        if not isinstance(old_name, str) or not old_name:
+            raise ValueError(
+                "`old_name` must be a non-empty string matching an existing "
+                "tip in the tree."
+            )
+        if not isinstance(new_name, str) or not new_name:
+            raise ValueError(
+                "`new_name` must be a non-empty string."
+            )
+        if len(old_name) > max_len or len(new_name) > max_len:
+            raise ValueError(
+                f"Tip names are limited to {max_len:,} characters "
+                f"(old_name={len(old_name)}, new_name={len(new_name)})."
+            )
+        bad = sorted({c for c in new_name if c in _NEWICK_UNSAFE})
+        if bad:
+            raise ValueError(
+                f"`new_name` contains characters that are invalid in Newick "
+                f"tip names: {bad}. Avoid parentheses, brackets, commas, "
+                f"colons, semicolons, quotes, and whitespace other than spaces."
+            )
         state = load_tree_state(job_dir)
         state = rename_tip(state, old_name, new_name)
         save_tree_state(job_dir, state)
@@ -523,8 +982,17 @@ def reroot_v1(job_id):
     def handler(job_dir, body):
         from app.services.tree_edit_service import load_tree_state, reroot_tree, save_tree_state
         outgroup = body.get("outgroup")
+        max_len = TREE_MUTATION_LIMITS["max_name_len"]
         if not isinstance(outgroup, str) or not outgroup.strip():
-            raise ValueError("`outgroup` must be a non-empty string (tip or internal node name).")
+            raise ValueError(
+                "`outgroup` must be a non-empty string naming a tip or "
+                "internal node in the tree."
+            )
+        if len(outgroup) > max_len:
+            raise ValueError(
+                f"`outgroup` is {len(outgroup):,} characters; the limit is "
+                f"{max_len:,}."
+            )
         state = load_tree_state(job_dir)
         state = reroot_tree(job_dir, state, outgroup)
         save_tree_state(job_dir, state)
@@ -557,7 +1025,28 @@ def tools_blast():
     body = request.get_json(silent=True) or {}
     query = (body.get("query") or "").strip()
     if not query:
-        return error_response(code="bad_request", message="`query` is required.", status=400)
+        return error_response(
+            code="bad_request",
+            message=(
+                "`query` is required. Provide either a FASTA-formatted "
+                "nucleotide sequence (e.g. '>name\\nACGT...') or a single "
+                "GenBank accession (e.g. 'MK564475')."
+            ),
+            status=400,
+        )
+    max_query_len = Config.BLAST_MAX_QUERY_LENGTH
+    if len(query) > max_query_len:
+        return error_response(
+            code="validation_failed",
+            message=(
+                f"`query` is {len(query):,} characters, which exceeds the "
+                f"BLAST query limit of {max_query_len:,} characters. NCBI "
+                f"rejects very long queries; please trim the sequence or "
+                f"BLAST individual records separately."
+            ),
+            status=422,
+            details={"field": "query", "length": len(query), "max_length": max_query_len},
+        )
 
     try:
         min_identity = float(body.get("min_identity", 90.0))

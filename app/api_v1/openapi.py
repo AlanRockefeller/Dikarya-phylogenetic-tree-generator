@@ -56,9 +56,40 @@ def _schemas():
                 },
             },
         },
+        "HealthStatus": {
+            "type": "object",
+            "properties": {
+                "status": {"type": "string", "example": "ok"},
+                "api_version": {"type": "string", "example": "v1"},
+            },
+        },
+        "RecomputeRequest": {
+            "type": "object",
+            "description": (
+                "Override stored job parameters and re-run the pipeline on "
+                "the same input data. Only the fields listed here may be "
+                "overridden; unknown keys are rejected with 422. To submit "
+                "different input data, create a new job with POST /jobs."
+            ),
+            "additionalProperties": False,
+            "properties": {
+                "tree_method": {"type": "string",
+                                 "enum": ["nj", "raxml", "iqtree", "mrbayes", "fasttree"]},
+                "tree_model": {"type": "string", "maxLength": 64},
+                "alignment_method": {"type": "string",
+                                      "enum": ["mafft", "muscle", "clustalo", "iqtree_builtin", "default"]},
+                "trimming_method": {"type": "string",
+                                     "enum": ["none", "trimal", "bmge"]},
+                "bootstrap": {"type": "integer", "minimum": 0, "maximum": 10000},
+                "mcmc_generations": {"type": "integer", "minimum": 1000, "maximum": 100000000},
+                "mcmc_nruns": {"type": "integer", "minimum": 1, "maximum": 8},
+                "mcmc_nchains": {"type": "integer", "minimum": 1, "maximum": 16},
+                "outgroup": {"type": "string", "maxLength": 256},
+                "notes": {"type": "string", "maxLength": 2000},
+            },
+        },
         "CreateJobRequest": {
             "type": "object",
-            "required": ["tree_method"],
             "example": {
                 "input_type": "pasted_sequence",
                 "sequence": (
@@ -88,18 +119,21 @@ def _schemas():
                 },
                 "sequence": {
                     "type": "string",
+                    "maxLength": 5000000,
                     "description": (
                         "FASTA-formatted sequence text for `pasted_sequence` jobs. "
                         "One or more `>header\\nbases` records pasted directly "
                         "into the request body. Use real DNA bases, not "
-                        "placeholders. Max 5 MB."
+                        "placeholders. Max 5 MB; the overall request body is "
+                        "capped at 16 MB (413 returned beyond that)."
                     ),
                     "example": ">Sample_A\nATGCGTACGTAGCTAGCTAGCTA\n>Sample_B\nATGCGTACGTAGCTAGCTAGCTA",
                 },
                 "accessions": {
                     "type": "array",
-                    "items": {"type": "string"},
-                    "description": "List of GenBank accession numbers. Max 500.",
+                    "items": {"type": "string", "maxLength": 64},
+                    "maxItems": 500,
+                    "description": "List of GenBank accession numbers. Max 500 entries, 64 chars each.",
                 },
                 "alignment_method": {
                     "type": "string",
@@ -198,8 +232,13 @@ COMMON_ERRORS = {
     "401": {"description": "Missing or invalid token", "content": _error_response()},
     "403": {"description": "Insufficient scope", "content": _error_response()},
     "404": {"description": "Not found", "content": _error_response()},
+    "409": {"description": "Conflict (Idempotency-Key reused with different body, or request still in flight)",
+            "content": _error_response()},
+    "413": {"description": "Request body exceeds the 16 MB global limit",
+            "content": _error_response()},
     "422": {"description": "Validation failed", "content": _error_response()},
-    "429": {"description": "Rate limited", "content": _error_response()},
+    "429": {"description": "Rate limited (including per-token concurrent SSE cap)",
+            "content": _error_response()},
     "500": {"description": "Internal server error", "content": _error_response()},
 }
 
@@ -281,9 +320,9 @@ def build_spec():
                 "get": {
                     "tags": ["Health"],
                     "summary": "Liveness ping",
-                    "description": "No authentication required.",
+                    "description": "No authentication required. Returns `{status, api_version}`.",
                     "security": [],
-                    "responses": {"200": {"description": "OK", "content": _data_response("User")}},
+                    "responses": {"200": {"description": "OK", "content": _data_response("HealthStatus")}},
                 }
             },
             "/me": {
@@ -340,8 +379,7 @@ def build_spec():
                     },
                     "responses": {
                         "202": {"description": "Queued", "content": _data_response("Job")},
-                        "409": {"description": "Idempotency-Key reused with different body", "content": _error_response()},
-                        **{k: v for k, v in COMMON_ERRORS.items() if k in ("401", "403", "422", "429", "500")},
+                        **{k: v for k, v in COMMON_ERRORS.items() if k in ("400", "401", "403", "409", "413", "422", "429", "500")},
                     },
                 },
             },
@@ -377,11 +415,11 @@ def build_spec():
                     ],
                     "requestBody": {
                         "required": False,
-                        "content": {"application/json": {"schema": {"type": "object"}}},
+                        "content": {"application/json": {"schema": {"$ref": "#/components/schemas/RecomputeRequest"}}},
                     },
                     "responses": {
                         "202": {"description": "Queued"},
-                        **{k: v for k, v in COMMON_ERRORS.items() if k in ("401", "403", "404", "429", "500")},
+                        **{k: v for k, v in COMMON_ERRORS.items() if k in ("400", "401", "403", "404", "409", "413", "422", "429", "500")},
                     },
                 }
             },
@@ -389,7 +427,16 @@ def build_spec():
                 "get": {
                     "tags": ["Jobs"],
                     "summary": "SSE stream of pipeline progress",
-                    "description": "Returns `text/event-stream`. Emits a snapshot event first, then live updates, plus 15s pings.",
+                    "description": (
+                        "Returns `text/event-stream`. Emits a `snapshot` event "
+                        "first, then live `data:` updates, with 15-second pings. "
+                        "A single token may hold at most 5 concurrent streams "
+                        "(429 `too_many_streams` beyond that). Each connection "
+                        "is hard-capped at 30 minutes; on timeout the server "
+                        "emits `event: timeout` and closes — clients should "
+                        "reconnect. If the token is revoked mid-stream, the "
+                        "server emits `event: revoked` and closes."
+                    ),
                     "security": [{"bearerAuth": ["jobs:read"]}],
                     "parameters": [{"$ref": "#/components/parameters/JobId"}],
                     "responses": {
@@ -460,12 +507,18 @@ def build_spec():
                         "content": {"application/json": {"schema": {
                             "type": "object",
                             "required": ["tips"],
-                            "properties": {"tips": {"type": "array", "items": {"type": "string"}}},
+                            "properties": {"tips": {
+                                "type": "array",
+                                "minItems": 1,
+                                "maxItems": 10000,
+                                "items": {"type": "string", "minLength": 1, "maxLength": 256},
+                                "description": "Tip names (or internal-node names) to remove. Max 10 000 entries; each name max 256 chars.",
+                            }},
                         }}},
                     },
                     "responses": {
                         "200": {"description": "Updated tree state"},
-                        **{k: v for k, v in COMMON_ERRORS.items() if k in ("401", "403", "404", "422")},
+                        **{k: v for k, v in COMMON_ERRORS.items() if k in ("401", "403", "404", "413", "422")},
                     },
                 }
             },
@@ -481,14 +534,15 @@ def build_spec():
                             "type": "object",
                             "required": ["old_name", "new_name"],
                             "properties": {
-                                "old_name": {"type": "string"},
-                                "new_name": {"type": "string"},
+                                "old_name": {"type": "string", "minLength": 1, "maxLength": 256},
+                                "new_name": {"type": "string", "minLength": 1, "maxLength": 256,
+                                              "description": "May not contain Newick-unsafe characters: ()[],:;'\"\\t\\n\\r"},
                             },
                         }}},
                     },
                     "responses": {
                         "200": {"description": "Updated tree state"},
-                        **{k: v for k, v in COMMON_ERRORS.items() if k in ("401", "403", "404", "422")},
+                        **{k: v for k, v in COMMON_ERRORS.items() if k in ("401", "403", "404", "413", "422")},
                     },
                 }
             },
@@ -503,12 +557,12 @@ def build_spec():
                         "content": {"application/json": {"schema": {
                             "type": "object",
                             "required": ["outgroup"],
-                            "properties": {"outgroup": {"type": "string"}},
+                            "properties": {"outgroup": {"type": "string", "minLength": 1, "maxLength": 256}},
                         }}},
                     },
                     "responses": {
                         "200": {"description": "Updated tree state"},
-                        **{k: v for k, v in COMMON_ERRORS.items() if k in ("401", "403", "404", "422")},
+                        **{k: v for k, v in COMMON_ERRORS.items() if k in ("401", "403", "404", "413", "422")},
                     },
                 }
             },
@@ -535,15 +589,18 @@ def build_spec():
                             "type": "object",
                             "required": ["query"],
                             "properties": {
-                                "query": {"type": "string", "description": "FASTA sequence or GenBank accession"},
-                                "min_identity": {"type": "number", "minimum": 50, "maximum": 100, "default": 90.0},
-                                "max_sequences": {"type": "integer", "minimum": 1, "maximum": 500, "default": 50},
+                                "query": {"type": "string", "maxLength": 50000,
+                                           "description": "FASTA sequence or GenBank accession. NCBI rejects very long queries; the per-call cap is 50 000 chars."},
+                                "min_identity": {"type": "number", "minimum": 50, "maximum": 100, "default": 90.0,
+                                                  "description": "Values outside this range are clamped, not rejected."},
+                                "max_sequences": {"type": "integer", "minimum": 1, "maximum": 500, "default": 50,
+                                                   "description": "Values outside this range are clamped, not rejected."},
                             },
                         }}},
                     },
                     "responses": {
                         "200": {"description": "BLAST results"},
-                        **{k: v for k, v in COMMON_ERRORS.items() if k in ("400", "401", "403", "429", "500")},
+                        **{k: v for k, v in COMMON_ERRORS.items() if k in ("400", "401", "403", "413", "422", "429", "500")},
                     },
                 }
             },
@@ -559,10 +616,10 @@ def build_spec():
                             "properties": {
                                 "accessions": {
                                     "oneOf": [
-                                        {"type": "string"},
-                                        {"type": "array", "items": {"type": "string"}},
+                                        {"type": "string", "maxLength": 64000},
+                                        {"type": "array", "items": {"type": "string", "maxLength": 64}, "maxItems": 200},
                                     ],
-                                    "description": "Comma/space-separated list, or array of accession strings.",
+                                    "description": "Comma/space-separated list, or array of accession strings. Max 200 accessions per call.",
                                 }
                             },
                         }}},

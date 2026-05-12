@@ -27,8 +27,19 @@
 }
 
 .node.selected text {
-    font-weight: bold;
+    font-weight: normal;
     fill: darkorange;
+}
+
+/* Keep selected tip labels readable: color indicates selection without bolding. */
+#tree-container .node-selected text,
+#tree-container .node.node-selected text,
+#tree-container .node.selected text,
+#tree-container text.phylotree-node-text.node-selected {
+    font-weight: 400 !important;
+    stroke: none !important;
+    stroke-width: 0 !important;
+    paint-order: normal !important;
 }
 
 /* Phylotree specific overrides if needed */
@@ -65,6 +76,10 @@
 #tree-container .phylotree-node-text,
 #tree-container text.phylotree-node-text {
     fill: #000000;
+    font-weight: 400;
+    stroke: none;
+    stroke-width: 0;
+    paint-order: normal;
 }
 
 /* Dark mode support for tree labels */

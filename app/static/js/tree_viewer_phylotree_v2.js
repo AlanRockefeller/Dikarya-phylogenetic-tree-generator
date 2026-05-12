@@ -57,6 +57,9 @@
         // Alan 5/11/26 - Clear visible active selections without mutating saved selection sets.
         deselectCurrentSelection() { return 0; }
 
+        // Alan 5/12/26 - Remove pruned IDs from saved selection sets without clearing unrelated colors.
+        removeIdsFromSelectionSets(ids) { return 0; }
+
         // Alan 5/11/26 - Expose box-select mode so the controller can toggle background drag selection.
         setBoxSelectMode(enabled) { return false; }
 
@@ -418,6 +421,8 @@
                 this._overrideClickBehavior();
                 // Alan 5/11/26 - Attach background box-select after phylotree handlers so it can suppress pan only for box gestures.
                 this._attachBoxSelectHandlers();
+                // Alan 5/12/26 - Repaint labels immediately so selection-set colors beat base light/dark label CSS.
+                this._updateNodeStylesOnly();
 
                 // Alan 5/8/26 - Disable wheel-to-zoom so mouse wheel scrolls the page instead of zooming the tree.
                 // Intercept wheel events before D3 and let the page scroll instead.
@@ -1193,8 +1198,55 @@
                 el.selectAll("circle,path,rect").each(function () {
                     self._styleNode(window.d3v7.select(this), d);
                 });
-                el.selectAll("text.phylotree-node-text").style("fill", "").style("stroke", "");
+                // Alan 5/12/26 - Compute label color explicitly because base CSS no longer lets text inherit group fill.
+                const labelColor = self._getNodeDisplayColor(id, d);
+                // Alan 5/12/26 - Keep selected labels colored without adding weight or SVG stroke.
+                const labelText = el.selectAll("text.phylotree-node-text")
+                    .style("font-weight", "400", "important")
+                    .style("stroke", "none", "important")
+                    .style("stroke-width", "0", "important")
+                    .style("paint-order", "normal", "important");
+                // Alan 5/12/26 - Use important inline fill so selection colors beat dark-mode base label CSS.
+                if (labelColor) labelText.style("fill", labelColor, "important");
+                // Alan 5/12/26 - Remove inline fill for ordinary labels so light/dark base CSS controls them.
+                else labelText.style("fill", null);
             });
+        }
+
+        // Alan 5/12/26 - Resolve the display color for selected/search-matched nodes without changing text weight.
+        _getNodeDisplayColor(id, node) {
+            // Alan 5/12/26 - Missing IDs cannot belong to selection sets.
+            if (!id) return null;
+            // Alan 5/12/26 - Find which set(s) this node belongs to.
+            const setNames = Object.keys(this.selectionSets);
+            // Alan 5/12/26 - Track the palette index for the set that should control the visible color.
+            let matchingSetIndex = -1;
+            // Alan 5/12/26 - Prefer the active set's color so adding a previously selected tip visibly changes color.
+            const activeSetIndex = setNames.indexOf(this.activeSelectionSet);
+            // Alan 5/12/26 - Use active-set membership first unless Deselect is hiding it locally.
+            if (activeSetIndex >= 0 && !this.hiddenSelectionIds.has(id) && this.selectionSets[this.activeSelectionSet]?.has(id)) {
+                // Alan 5/12/26 - Store the active set index for palette lookup.
+                matchingSetIndex = activeSetIndex;
+            }
+            // Alan 5/12/26 - Fall back to the first non-active saved set containing this node.
+            for (let i = 0; i < setNames.length; i++) {
+                // Alan 5/12/26 - Stop scanning if the active set already supplied the display color.
+                if (matchingSetIndex >= 0) break;
+                // Alan 5/12/26 - Active set was already considered before lower-priority saved sets.
+                if (setNames[i] === this.activeSelectionSet) continue;
+                // Alan 5/12/26 - Use the first saved-set membership as the fallback color.
+                if (this.selectionSets[setNames[i]].has(id)) {
+                    // Alan 5/12/26 - Store the fallback set index for palette lookup.
+                    matchingSetIndex = i;
+                    break;
+                }
+            }
+            // Alan 5/12/26 - Return selection-set color when membership is visible.
+            if (matchingSetIndex >= 0) return this._selectionColors[matchingSetIndex % this._selectionColors.length];
+            // Alan 5/12/26 - Search matches remain blue when no selection set controls the color.
+            if (node?.__search_match) return "#0EA5E9";
+            // Alan 5/12/26 - Ordinary labels should use CSS light/dark colors.
+            return null;
         }
 
         _styleNode(element, node) {
@@ -1206,24 +1258,11 @@
                 return;
             }
 
-            // Find which set(s) this node belongs to
-            const setNames = Object.keys(this.selectionSets);
-            let matchingSetIndex = -1;
-
-            for (let i = 0; i < setNames.length; i++) {
-                // Alan 5/11/26 - Skip hidden active-set entries so Deselect clears highlights without editing sets.
-                if (setNames[i] === this.activeSelectionSet && this.hiddenSelectionIds.has(id)) continue;
-                if (this.selectionSets[setNames[i]].has(id)) {
-                    matchingSetIndex = i;
-                    break; // Use first matching set's color
-                }
-            }
-
-            if (matchingSetIndex >= 0) {
-                const color = this._selectionColors[matchingSetIndex % this._selectionColors.length];
+            // Alan 5/12/26 - Use one shared color resolver for node marks and label text.
+            const color = this._getNodeDisplayColor(id, node);
+            // Alan 5/12/26 - Apply selected/search colors to node marks and groups.
+            if (color) {
                 element.style("fill", color).style("stroke", color);
-            } else if (node.__search_match) {
-                element.style("fill", "#0EA5E9").style("stroke", "#0EA5E9");
             } else {
                 element.style("fill", "").style("stroke", "");
             }
@@ -2143,6 +2182,34 @@
             this._updateNodeStylesOnly();
         }
 
+        // Alan 5/12/26 - Remove only pruned tips from selection sets so unrelated color annotations survive pruning.
+        removeIdsFromSelectionSets(ids) {
+            // Alan 5/12/26 - Normalize the input once so callers can pass arrays safely.
+            const removedIds = new Set(Array.isArray(ids) ? ids.filter(Boolean) : []);
+            // Alan 5/12/26 - Nothing to remove when the prune action had no boxed names.
+            if (removedIds.size === 0) return 0;
+            // Alan 5/12/26 - Track membership removals for callers that want diagnostics.
+            let removedCount = 0;
+            // Alan 5/12/26 - Remove each pruned tip from every saved selection/color set.
+            for (const memberSet of Object.values(this.selectionSets)) {
+                // Alan 5/12/26 - Ignore malformed persisted set values defensively.
+                if (!(memberSet instanceof Set)) continue;
+                // Alan 5/12/26 - Delete every pruned ID from this set without touching other members.
+                for (const id of removedIds) {
+                    // Alan 5/12/26 - Count actual membership changes.
+                    if (memberSet.delete(id)) removedCount += 1;
+                }
+            }
+            // Alan 5/12/26 - Clear transient hidden-selection masks for pruned tips only.
+            for (const id of removedIds) this.hiddenSelectionIds.delete(id);
+            // Alan 5/12/26 - Refresh labels so remaining set colors stay visible.
+            this._updateNodeStylesOnly();
+            // Alan 5/12/26 - Refresh toolbar counts after pruning selection memberships.
+            this._updateStats();
+            // Alan 5/12/26 - Return how many saved set memberships were removed.
+            return removedCount;
+        }
+
         selectionAction(action, filteredNodesPredicate = null) {
             if (!this.tree) return;
 
@@ -2396,6 +2463,8 @@
             this.activeSelectionSet = name;
             // Alan 5/11/26 - Switching sets should show that set's saved selections normally.
             this.hiddenSelectionIds.clear();
+            // Alan 5/12/26 - Repaint immediately because active set membership now controls color priority.
+            this._updateNodeStylesOnly();
             this._updateStats();
             return true;
         }

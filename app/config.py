@@ -26,6 +26,11 @@ class Config:
     BLAST_CACHE_DIR = Path(os.environ.get('BLAST_CACHE_DIR') or BASE_DIR / 'cache' / 'blast')
     BLAST_EMAIL = os.environ.get('BLAST_EMAIL', 'dikarya@dikarya.us')
     BLAST_MAX_QUERY_LENGTH = int(os.environ.get('BLAST_MAX_QUERY_LENGTH', '50000'))  # 50KB max
+
+    # Global request body cap. Sequences via /api/v1/jobs can be up to 5 MB;
+    # 16 MB leaves headroom for JSON overhead and other fields. Requests
+    # larger than this are rejected by Flask with 413 before the route runs.
+    MAX_CONTENT_LENGTH = int(os.environ.get('MAX_CONTENT_LENGTH', str(16 * 1024 * 1024)))
     BLAST_POLL_INTERVAL_SECONDS = int(os.environ.get('BLAST_POLL_INTERVAL_SECONDS', '60'))
     REDIS_URL = os.environ.get('REDIS_URL', 'redis://localhost:6379/0')
     WORKER_DIR = Path(os.environ.get('WORKER_DIR') or BASE_DIR / 'var' / 'workers')
