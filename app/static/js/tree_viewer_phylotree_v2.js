@@ -48,9 +48,9 @@
         clearSelection() { }
 
         /**
-         * Clear only the currently ACTIVE selection set.
+         * Clear only the current temporary action selection.
          * Use before applying a new selection action to replace (not append)
-         * selections in the current working set.
+         * current action selections.
          */
         clearActiveSelection() { }
 
@@ -59,6 +59,15 @@
 
         // Alan 5/12/26 - Remove pruned IDs from saved selection sets without clearing unrelated colors.
         removeIdsFromSelectionSets(ids) { return 0; }
+
+        // Alan 5/12/26 - Apply current temporary selections to the active persistent color group.
+        addCurrentSelectionToActiveColorGroup() { return 0; }
+
+        // Alan 5/12/26 - Remove current temporary selections from the active persistent color group.
+        removeCurrentSelectionFromActiveColorGroup() { return 0; }
+
+        // Alan 5/12/26 - Clear current temporary selections from every persistent color group.
+        clearCurrentSelectionColorGroups() { return 0; }
 
         // Alan 5/11/26 - Expose box-select mode so the controller can toggle background drag selection.
         setBoxSelectMode(enabled) { return false; }
@@ -115,6 +124,12 @@
          * @returns {string|null} CSS color or null
          */
         getSelectionSetColor(name) { return null; }
+
+        // Alan 5/12/26 - Let callers persist user-chosen colors for color groups.
+        setSelectionSetColor(name, color) { return false; }
+
+        // Alan 5/12/26 - Let the toolbar suggest a distinct default color for new groups.
+        suggestSelectionSetColor() { return '#1f77b4'; }
 
         // =========== RENDERING & LAYOUT ===========
 
@@ -240,21 +255,25 @@
             this.newick = null;
             this.allNodes = []; // Node Cache
 
-            // State - Multiple Selection Sets
-            // selectionSets is the primary data structure: { 'Default': Set(), 'Edible': Set(), ... }
+            // State - Persistent Color Groups
+            // Alan 5/12/26 - selectionSets is retained as the saved storage name, but now means color groups.
             this.selectionSets = { 'Default': new Set() };
+            // Alan 5/12/26 - Persist user-selected colors separately from group membership.
+            this.selectionSetColors = { 'Default': '#1f77b4' };
             this.activeSelectionSet = 'Default';
-            // Alan 5/11/26 - Track locally hidden active selections so Deselect leaves selection sets unchanged.
+            // Alan 5/12/26 - Track temporary action selection separately from persistent color groups.
+            this.currentSelectionIds = new Set();
+            // Alan 5/11/26 - Track locally hidden current selections so Deselect does not mutate color groups.
             this.hiddenSelectionIds = new Set();
-            // Color palette from d3.schemeCategory10 for selection sets
+            // Color palette from d3.schemeCategory10 for persistent color groups
             this._selectionColors = [
                 '#1f77b4', '#ff7f0e', '#2ca02c', '#d62728', '#9467bd',
                 '#8c564b', '#e377c2', '#7f7f7f', '#bcbd22', '#17becf'
             ];
-            // Getter for backward compatibility - returns the currently active set
+            // Alan 5/12/26 - Backward-compatible selectedIds now means temporary action selection.
             Object.defineProperty(this, 'selectedIds', {
-                get: () => this.selectionSets[this.activeSelectionSet] || new Set(),
-                set: (val) => { this.selectionSets[this.activeSelectionSet] = val; }
+                get: () => this.currentSelectionIds,
+                set: (val) => { this.currentSelectionIds = val instanceof Set ? val : new Set(val || []); }
             });
 
             // Spacing State (relative to default)
@@ -304,10 +323,10 @@
             this._cacheNodes();
 
             // 2c. Initial Selection Processing
-            // Clear all selection sets on full tree reload
-            for (const setName of Object.keys(this.selectionSets)) {
-                this.selectionSets[setName].clear();
-            }
+            // Alan 5/12/26 - Full tree reload clears only temporary action selection; color groups restore below.
+            this.currentSelectionIds.clear();
+            // Alan 5/12/26 - Reset transient hidden state tied to temporary action selection.
+            this.hiddenSelectionIds.clear();
 
             // 3. COMPUTE STATS
             this.lastStats = this._computeSupportStats();
@@ -1112,36 +1131,37 @@
             }
         }
 
-        // Alan 5/11/26 - Treat hidden active-set members as currently deselected while preserving saved sets.
+        // Alan 5/12/26 - Treat hidden current-selection members as deselected without touching color groups.
         _isVisibleSelection(id) {
-            return Boolean(id && this.selectedIds.has(id) && !this.hiddenSelectionIds.has(id));
+            return Boolean(id && this.currentSelectionIds.has(id) && !this.hiddenSelectionIds.has(id));
         }
 
-        // Alan 5/11/26 - Toggle clicks through the transient hidden-selection layer before changing set membership.
+        // Alan 5/12/26 - Toggle clicks through temporary action selection without changing color groups.
         _toggleVisibleSelection(id) {
             if (!id) return false;
             if (this.hiddenSelectionIds.has(id)) {
                 this.hiddenSelectionIds.delete(id);
                 return true;
             }
-            if (this.selectedIds.has(id)) {
-                this.selectedIds.delete(id);
+            if (this.currentSelectionIds.has(id)) {
+                this.currentSelectionIds.delete(id);
                 return false;
             }
-            this.selectedIds.add(id);
+            this.currentSelectionIds.add(id);
             return true;
         }
 
-        // Alan 5/11/26 - Return visible active selections for action buttons and local Deselect behavior.
+        // Alan 5/12/26 - Return visible temporary selections for action buttons and local Deselect behavior.
         _getVisibleSelectionIds() {
             this._trimSelectionSetsToCurrentTree();
-            return Array.from(this.selectedIds).filter(id => !this.hiddenSelectionIds.has(id));
+            return Array.from(this.currentSelectionIds).filter(id => !this.hiddenSelectionIds.has(id));
         }
 
-        // Alan 5/11/26 - Hide current active selections locally without deleting selection-set membership.
+        // Alan 5/12/26 - Clear temporary current selection without changing persistent color groups.
         deselectCurrentSelection() {
             const visibleIds = this._getVisibleSelectionIds();
-            visibleIds.forEach(id => this.hiddenSelectionIds.add(id));
+            this.currentSelectionIds.clear();
+            this.hiddenSelectionIds.clear();
             // Alan 5/11/26 - Clear phylotree's native selected styling so deselected labels stop looking selected.
             this._clearNativeSelectionForIds(visibleIds);
             this._updateStats();
@@ -1198,19 +1218,98 @@
                 el.selectAll("circle,path,rect").each(function () {
                     self._styleNode(window.d3v7.select(this), d);
                 });
+                // Alan 5/12/26 - Track temporary action selection separately from persistent color groups.
+                const isCurrentSelection = self._isVisibleSelection(id);
+                // Alan 5/12/26 - Mark current action selection on the node group for CSS/debug hooks.
+                el.classed("node-current-selected", isCurrentSelection);
                 // Alan 5/12/26 - Compute label color explicitly because base CSS no longer lets text inherit group fill.
-                const labelColor = self._getNodeDisplayColor(id, d);
+                const labelColor = self._getNodeDisplayColor(id, d) || (isCurrentSelection ? "#c9a962" : null);
                 // Alan 5/12/26 - Keep selected labels colored without adding weight or SVG stroke.
                 const labelText = el.selectAll("text.phylotree-node-text")
                     .style("font-weight", "400", "important")
                     .style("stroke", "none", "important")
                     .style("stroke-width", "0", "important")
                     .style("paint-order", "normal", "important");
+                // Alan 5/12/26 - Underline temporary selection so actions are visible without changing color groups.
+                labelText.style("text-decoration", isCurrentSelection ? "underline" : null);
                 // Alan 5/12/26 - Use important inline fill so selection colors beat dark-mode base label CSS.
                 if (labelColor) labelText.style("fill", labelColor, "important");
                 // Alan 5/12/26 - Remove inline fill for ordinary labels so light/dark base CSS controls them.
                 else labelText.style("fill", null);
             });
+        }
+
+        // Alan 5/12/26 - Normalize user-provided group colors before saving them.
+        _normalizeColor(color, fallback = '#1f77b4') {
+            // Alan 5/12/26 - Lowercase string colors so persisted values compare predictably.
+            const raw = typeof color === 'string' ? color.trim().toLowerCase() : '';
+            // Alan 5/12/26 - Expand shorthand colors accepted by native color inputs in some browsers.
+            if (/^#[0-9a-f]{3}$/.test(raw)) return `#${raw[1]}${raw[1]}${raw[2]}${raw[2]}${raw[3]}${raw[3]}`;
+            // Alan 5/12/26 - Accept only full hex colors for safe inline SVG styling.
+            if (/^#[0-9a-f]{6}$/.test(raw)) return raw;
+            // Alan 5/12/26 - Fall back to a known-safe color when restored state is malformed.
+            return fallback;
+        }
+
+        // Alan 5/12/26 - Ensure every restored color group has a stable editable color.
+        _ensureSelectionSetColors() {
+            // Alan 5/12/26 - Iterate current groups so old saved states get palette-backed colors.
+            Object.keys(this.selectionSets).forEach((name, index) => {
+                // Alan 5/12/26 - Pick the saved color first, otherwise use the old deterministic palette.
+                const fallback = this._selectionColors[index % this._selectionColors.length] || '#1f77b4';
+                // Alan 5/12/26 - Store normalized colors for every known group.
+                this.selectionSetColors[name] = this._normalizeColor(this.selectionSetColors[name], fallback);
+            });
+            // Alan 5/12/26 - Drop colors for deleted groups so the payload stays compact.
+            Object.keys(this.selectionSetColors).forEach(name => {
+                // Alan 5/12/26 - Remove stale color metadata when its group no longer exists.
+                if (!this.selectionSets[name]) delete this.selectionSetColors[name];
+            });
+        }
+
+        // Alan 5/12/26 - Keep each tip in at most one persistent color group.
+        _enforceSingleColorMembership() {
+            // Alan 5/12/26 - Prefer the active group, then existing object order, when old data has duplicates.
+            const orderedNames = [this.activeSelectionSet, ...Object.keys(this.selectionSets).filter(name => name !== this.activeSelectionSet)];
+            // Alan 5/12/26 - Track the first group that claims each tip.
+            const ownerById = new Map();
+            // Alan 5/12/26 - Remove duplicate memberships from lower-priority groups.
+            orderedNames.forEach(name => {
+                // Alan 5/12/26 - Skip missing or malformed groups defensively.
+                const memberSet = this.selectionSets[name];
+                // Alan 5/12/26 - Ignore invalid restored values that are not Sets.
+                if (!(memberSet instanceof Set)) return;
+                // Alan 5/12/26 - Review a copy so deletion during iteration stays predictable.
+                Array.from(memberSet).forEach(id => {
+                    // Alan 5/12/26 - First owner keeps the visible color.
+                    if (!ownerById.has(id)) {
+                        ownerById.set(id, name);
+                        return;
+                    }
+                    // Alan 5/12/26 - Later duplicate owners are removed.
+                    memberSet.delete(id);
+                });
+            });
+        }
+
+        // Alan 5/12/26 - Remove selected IDs from all color groups before assigning or clearing color.
+        _removeIdsFromAllColorGroups(ids) {
+            // Alan 5/12/26 - Normalize the caller's IDs once for consistent membership cleanup.
+            const targetIds = new Set(Array.isArray(ids) ? ids.filter(Boolean) : []);
+            // Alan 5/12/26 - Track how many actual memberships were removed.
+            let removed = 0;
+            // Alan 5/12/26 - Visit every persistent color group.
+            for (const memberSet of Object.values(this.selectionSets)) {
+                // Alan 5/12/26 - Ignore malformed restored groups defensively.
+                if (!(memberSet instanceof Set)) continue;
+                // Alan 5/12/26 - Delete each selected tip from this group.
+                for (const id of targetIds) {
+                    // Alan 5/12/26 - Count real removals for status messaging.
+                    if (memberSet.delete(id)) removed += 1;
+                }
+            }
+            // Alan 5/12/26 - Return the number of removed memberships.
+            return removed;
         }
 
         // Alan 5/12/26 - Resolve the display color for selected/search-matched nodes without changing text weight.
@@ -1219,30 +1318,30 @@
             if (!id) return null;
             // Alan 5/12/26 - Find which set(s) this node belongs to.
             const setNames = Object.keys(this.selectionSets);
-            // Alan 5/12/26 - Track the palette index for the set that should control the visible color.
-            let matchingSetIndex = -1;
+            // Alan 5/12/26 - Track which one-color group controls this label.
+            let matchingSetName = null;
             // Alan 5/12/26 - Prefer the active set's color so adding a previously selected tip visibly changes color.
             const activeSetIndex = setNames.indexOf(this.activeSelectionSet);
-            // Alan 5/12/26 - Use active-set membership first unless Deselect is hiding it locally.
-            if (activeSetIndex >= 0 && !this.hiddenSelectionIds.has(id) && this.selectionSets[this.activeSelectionSet]?.has(id)) {
+            // Alan 5/12/26 - Use active color-group membership first; temporary Deselect no longer hides colors.
+            if (activeSetIndex >= 0 && this.selectionSets[this.activeSelectionSet]?.has(id)) {
                 // Alan 5/12/26 - Store the active set index for palette lookup.
-                matchingSetIndex = activeSetIndex;
+                matchingSetName = this.activeSelectionSet;
             }
             // Alan 5/12/26 - Fall back to the first non-active saved set containing this node.
             for (let i = 0; i < setNames.length; i++) {
                 // Alan 5/12/26 - Stop scanning if the active set already supplied the display color.
-                if (matchingSetIndex >= 0) break;
+                if (matchingSetName) break;
                 // Alan 5/12/26 - Active set was already considered before lower-priority saved sets.
                 if (setNames[i] === this.activeSelectionSet) continue;
                 // Alan 5/12/26 - Use the first saved-set membership as the fallback color.
                 if (this.selectionSets[setNames[i]].has(id)) {
                     // Alan 5/12/26 - Store the fallback set index for palette lookup.
-                    matchingSetIndex = i;
+                    matchingSetName = setNames[i];
                     break;
                 }
             }
             // Alan 5/12/26 - Return selection-set color when membership is visible.
-            if (matchingSetIndex >= 0) return this._selectionColors[matchingSetIndex % this._selectionColors.length];
+            if (matchingSetName) return this.getSelectionSetColor(matchingSetName);
             // Alan 5/12/26 - Search matches remain blue when no selection set controls the color.
             if (node?.__search_match) return "#0EA5E9";
             // Alan 5/12/26 - Ordinary labels should use CSS light/dark colors.
@@ -2024,7 +2123,7 @@
             if (mode === 'remove') return { matched: ids.length, changed: ids.length, mode, ids };
             // Alan 5/11/26 - Track actual membership changes for status feedback.
             let changed = 0;
-            // Alan 5/11/26 - Update active selection-set membership according to the gesture mode.
+            // Alan 5/12/26 - Update temporary action selection according to the gesture mode.
             ids.forEach(id => { if (this._applyBoxSelectionToId(id, mode)) changed += 1; });
             // Alan 5/11/26 - Clear native phylotree selection flags when box gestures remove or toggle tips.
             if (mode === 'remove' || mode === 'toggle') this._clearNativeSelectionForIds(ids);
@@ -2040,15 +2139,10 @@
         _applyBoxSelectionToId(id, mode) {
             // Alan 5/11/26 - Guard against empty DOM IDs from unexpected nodes.
             if (!id) return false;
-            // Alan 5/12/26 - Remove mode clears visible selection membership, including saved-set highlights.
+            // Alan 5/12/26 - Remove mode clears temporary action selection without editing color groups.
             if (mode === 'remove') {
-                // Alan 5/12/26 - Track whether any selection set contained this tip.
-                let removedSelected = false;
-                // Alan 5/12/26 - Remove the tip from every set so visibly selected labels actually clear.
-                for (const memberSet of Object.values(this.selectionSets)) {
-                    // Alan 5/12/26 - Delete from each set without assuming the active set owns the highlight.
-                    if (memberSet?.delete?.(id)) removedSelected = true;
-                }
+                // Alan 5/12/26 - Delete from temporary current selection.
+                const removedSelected = this.currentSelectionIds.delete(id);
                 // Alan 5/11/26 - Also clear any transient Deselect mask for the same sequence.
                 const removedHidden = this.hiddenSelectionIds.delete(id);
                 // Alan 5/11/26 - Return whether membership changed for status counts.
@@ -2065,7 +2159,7 @@
             const wasVisible = this._isVisibleSelection(id);
             // Alan 5/11/26 - Remove transient Deselect masking before adding the ID.
             this.hiddenSelectionIds.delete(id);
-            // Alan 5/11/26 - Add the ID to the active selection set.
+            // Alan 5/12/26 - Add the ID to temporary action selection, not a color group.
             this.selectedIds.add(id);
             // Alan 5/11/26 - Report a change only when the sequence was not already visible.
             return !wasVisible;
@@ -2158,9 +2252,18 @@
                     }
                 }
             }
+            // Alan 5/12/26 - Drop temporary action selections for nodes no longer present after pruning/reload.
+            for (const id of Array.from(this.currentSelectionIds)) {
+                if (!currentIds.has(id)) {
+                    // Alan 5/12/26 - Remove stale temporary selection IDs after structural tree changes.
+                    this.currentSelectionIds.delete(id);
+                    // Alan 5/12/26 - Mark state changed when temporary selection was trimmed.
+                    changed = true;
+                }
+            }
             // Alan 5/11/26 - Keep transient hidden selections limited to active IDs still present in the tree.
             for (const id of Array.from(this.hiddenSelectionIds)) {
-                if (!currentIds.has(id) || !this.selectedIds.has(id)) {
+                if (!currentIds.has(id) || !this.currentSelectionIds.has(id)) {
                     this.hiddenSelectionIds.delete(id);
                 }
             }
@@ -2168,15 +2271,13 @@
         }
 
         /**
-         * Clear ALL selections across ALL selection sets.
+         * Clear temporary action selection while preserving persistent color groups.
          * Use after backend mutations when node references become stale.
          */
         clearSelection() {
-            // Clear every selection set, not just the active one
-            for (const setName of Object.keys(this.selectionSets)) {
-                this.selectionSets[setName].clear();
-            }
-            // Alan 5/11/26 - Clear transient Deselect state when all selection-set membership is removed.
+            // Alan 5/12/26 - Clear only temporary action selection, not saved color-group membership.
+            this.currentSelectionIds.clear();
+            // Alan 5/12/26 - Clear transient Deselect state when current selection is removed.
             this.hiddenSelectionIds.clear();
             this._updateStats();
             this._updateNodeStylesOnly();
@@ -2202,12 +2303,61 @@
             }
             // Alan 5/12/26 - Clear transient hidden-selection masks for pruned tips only.
             for (const id of removedIds) this.hiddenSelectionIds.delete(id);
+            // Alan 5/12/26 - Clear temporary action selections for pruned tips only.
+            for (const id of removedIds) this.currentSelectionIds.delete(id);
             // Alan 5/12/26 - Refresh labels so remaining set colors stay visible.
             this._updateNodeStylesOnly();
             // Alan 5/12/26 - Refresh toolbar counts after pruning selection memberships.
             this._updateStats();
             // Alan 5/12/26 - Return how many saved set memberships were removed.
             return removedCount;
+        }
+
+        // Alan 5/12/26 - Apply the active color group to the current temporary selection.
+        addCurrentSelectionToActiveColorGroup() {
+            // Alan 5/12/26 - Resolve the active persistent color group defensively.
+            const group = this.selectionSets[this.activeSelectionSet];
+            // Alan 5/12/26 - No active group means no color can be applied.
+            if (!(group instanceof Set)) return 0;
+            // Alan 5/12/26 - Use visible temporary action selections as the color target.
+            const ids = this._getVisibleSelectionIds();
+            // Alan 5/12/26 - Remove selected tips from every other group so each tip has one color.
+            this._removeIdsFromAllColorGroups(ids);
+            // Alan 5/12/26 - Track how many selected tips receive this group color.
+            let changed = 0;
+            // Alan 5/12/26 - Add each currently selected node to the active color group.
+            ids.forEach(id => {
+                // Alan 5/12/26 - Add after clearing previous color ownership.
+                group.add(id);
+                // Alan 5/12/26 - Count selected tips colored by this action.
+                changed += 1;
+            });
+            // Alan 5/12/26 - Repaint labels so applied color is visible immediately.
+            this._updateNodeStylesOnly();
+            // Alan 5/12/26 - Keep action button counts synchronized.
+            this._updateStats();
+            // Alan 5/12/26 - Return new membership count for status text.
+            return changed;
+        }
+
+        // Alan 5/12/26 - Clear current temporary selections from every color group.
+        clearCurrentSelectionColorGroups() {
+            // Alan 5/12/26 - Use visible temporary action selections as the clear-color target.
+            const ids = this._getVisibleSelectionIds();
+            // Alan 5/12/26 - Remove selected tips from all groups because colors are mutually exclusive.
+            const changed = this._removeIdsFromAllColorGroups(ids);
+            // Alan 5/12/26 - Repaint labels so cleared colors disappear immediately.
+            this._updateNodeStylesOnly();
+            // Alan 5/12/26 - Keep action button counts synchronized.
+            this._updateStats();
+            // Alan 5/12/26 - Return removed membership count for status text.
+            return changed;
+        }
+
+        // Alan 5/12/26 - Keep legacy callers working by treating active uncolor as clear-color.
+        removeCurrentSelectionFromActiveColorGroup() {
+            // Alan 5/12/26 - Delegate to the one-color-per-tip clear operation.
+            return this.clearCurrentSelectionColorGroups();
         }
 
         selectionAction(action, filteredNodesPredicate = null) {
@@ -2421,12 +2571,15 @@
          * @param {string} name - Name for the new set
          * @returns {boolean} - True if created, false if name already exists or invalid
          */
-        createSelectionSet(name) {
+        createSelectionSet(name, color = null) {
             if (!name || typeof name !== 'string') return false;
             const trimmed = name.trim();
             if (!trimmed || this.selectionSets[trimmed]) return false;
 
+            // Alan 5/12/26 - Create the persistent color group membership bucket.
             this.selectionSets[trimmed] = new Set();
+            // Alan 5/12/26 - Store the user-chosen group color or a suggested fallback.
+            this.selectionSetColors[trimmed] = this._normalizeColor(color, this.suggestSelectionSetColor());
             return true;
         }
 
@@ -2440,14 +2593,15 @@
             if (!this.selectionSets[name]) return false;
 
             delete this.selectionSets[name];
+            // Alan 5/12/26 - Remove deleted group color metadata with the group.
+            delete this.selectionSetColors[name];
 
             // If we deleted the active set, switch back to Default
             if (this.activeSelectionSet === name) {
                 this.activeSelectionSet = 'Default';
             }
 
-            // Alan 5/11/26 - Drop transient Deselect state when deleting selection-set membership.
-            this.hiddenSelectionIds.clear();
+            // Alan 5/12/26 - Deleting a color group should preserve temporary action selection.
             this._updateNodeStylesOnly();
             this._updateStats();
             return true;
@@ -2461,8 +2615,7 @@
         setActiveSelectionSet(name) {
             if (!this.selectionSets[name]) return false;
             this.activeSelectionSet = name;
-            // Alan 5/11/26 - Switching sets should show that set's saved selections normally.
-            this.hiddenSelectionIds.clear();
+            // Alan 5/12/26 - Switching color groups should not clear temporary action selection.
             // Alan 5/12/26 - Repaint immediately because active set membership now controls color priority.
             this._updateNodeStylesOnly();
             this._updateStats();
@@ -2483,10 +2636,34 @@
          * @returns {string|null} - CSS color or null if set doesn't exist
          */
         getSelectionSetColor(name) {
+            // Alan 5/12/26 - Ensure old saved groups have color metadata before returning.
+            this._ensureSelectionSetColors();
+            // Alan 5/12/26 - Return user-selected color metadata when available.
+            if (this.selectionSetColors[name]) return this.selectionSetColors[name];
             const names = Object.keys(this.selectionSets);
             const index = names.indexOf(name);
             if (index < 0) return null;
             return this._selectionColors[index % this._selectionColors.length];
+        }
+
+        // Alan 5/12/26 - Update a persistent color group's user-selected color.
+        setSelectionSetColor(name, color) {
+            // Alan 5/12/26 - Reject color changes for missing groups.
+            if (!this.selectionSets[name]) return false;
+            // Alan 5/12/26 - Normalize before storing so inline styles stay safe.
+            this.selectionSetColors[name] = this._normalizeColor(color, this.getSelectionSetColor(name) || '#1f77b4');
+            // Alan 5/12/26 - Repaint labels immediately after a color edit.
+            this._updateNodeStylesOnly();
+            // Alan 5/12/26 - Report a successful color edit.
+            return true;
+        }
+
+        // Alan 5/12/26 - Suggest the next palette color for newly created groups.
+        suggestSelectionSetColor() {
+            // Alan 5/12/26 - Use group count to rotate through the existing palette.
+            const index = Object.keys(this.selectionSets).length % this._selectionColors.length;
+            // Alan 5/12/26 - Return a normalized palette color for native color inputs.
+            return this._normalizeColor(this._selectionColors[index], '#1f77b4');
         }
 
         /**
@@ -2503,7 +2680,10 @@
             for (const [name, memberSet] of Object.entries(this.selectionSets)) {
                 sets[name] = Array.from(memberSet);
             }
-            return { sets, active: this.activeSelectionSet };
+            // Alan 5/12/26 - Ensure color metadata exists before serializing color groups.
+            this._ensureSelectionSetColors();
+            // Alan 5/12/26 - Persist colors additively while keeping the old sets/active payload shape.
+            return { sets, active: this.activeSelectionSet, colors: { ...this.selectionSetColors } };
         }
 
         restoreSelectionSets(data) {
@@ -2512,6 +2692,8 @@
                 if (name !== 'Default') delete this.selectionSets[name];
             }
             this.selectionSets['Default'].clear();
+            // Alan 5/12/26 - Reset color metadata before restoring saved colors.
+            this.selectionSetColors = { 'Default': '#1f77b4' };
             for (const [name, ids] of Object.entries(data.sets)) {
                 if (name === 'Default') {
                     this.selectionSets['Default'] = new Set(ids);
@@ -2522,6 +2704,20 @@
             if (data.active && this.selectionSets[data.active]) {
                 this.activeSelectionSet = data.active;
             }
+            // Alan 5/12/26 - Restore user-selected colors when newer tree states include them.
+            if (data.colors && typeof data.colors === 'object') {
+                // Alan 5/12/26 - Copy only colors for groups that still exist.
+                Object.entries(data.colors).forEach(([name, color]) => {
+                    // Alan 5/12/26 - Ignore color metadata for missing groups.
+                    if (!this.selectionSets[name]) return;
+                    // Alan 5/12/26 - Normalize restored colors before using them in SVG styles.
+                    this.selectionSetColors[name] = this._normalizeColor(color, this.selectionSetColors[name]);
+                });
+            }
+            // Alan 5/12/26 - Backfill colors for old jobs and remove stale color metadata.
+            this._ensureSelectionSetColors();
+            // Alan 5/12/26 - Normalize old multi-group data to one persistent color per tip.
+            this._enforceSingleColorMembership();
             // Alan 5/11/26 - Restored selection sets should not inherit a prior local Deselect state.
             this.hiddenSelectionIds.clear();
             // Alan 5/10/26 - Do not restore saved selections for nodes removed by pruning.
@@ -2531,12 +2727,12 @@
         }
 
         /**
-         * Clear only the ACTIVE selection set (not all sets).
-         * Uses the selectedIds getter which references this.selectionSets[this.activeSelectionSet].
+         * Clear only the temporary action selection, not persistent color groups.
          */
         clearActiveSelection() {
-            this.selectedIds.clear(); // selectedIds getter returns the active set
-            // Alan 5/11/26 - Clear transient hidden IDs when the active selection set is emptied.
+            // Alan 5/12/26 - selectedIds getter now references temporary action selection.
+            this.selectedIds.clear();
+            // Alan 5/12/26 - Clear transient hidden IDs when temporary selection is emptied.
             this.hiddenSelectionIds.clear();
             this._updateStats();
             this._updateNodeStylesOnly();

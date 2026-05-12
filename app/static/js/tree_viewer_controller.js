@@ -18,6 +18,8 @@ document.addEventListener('DOMContentLoaded', async () => {
     const btnDeselect = getEl('btn-deselect');
     const btnRecompute = getEl('btn-recompute');
     const btnMakeCopy = getEl('btn-make-copy');
+    // Alan 5/12/26 - Cache clear-color control for selected tips.
+    const btnUncolorSelection = getEl('btn-uncolor-selection');
     // Alan 5/11/26 - Cache rename modal elements for editing the current visible selection.
     const renameModal = getEl('modal-rename-sequences');
     const renameModalRows = getEl('rename-modal-rows');
@@ -325,8 +327,8 @@ document.addEventListener('DOMContentLoaded', async () => {
                 updateButtons();
             },
             onSelectionChange: (count) => {
+                // Alan 5/12/26 - Current selection is transient, so selection changes only refresh action controls.
                 updateButtons();
-                debouncedSaveSelectionSets();
             },
             // Alan 5/11/26 - Let the viewer report completed box-select gestures for concise feedback.
             onBoxSelect: (result) => {
@@ -416,7 +418,10 @@ document.addEventListener('DOMContentLoaded', async () => {
                 if (treeState.selection_sets && viewer) {
                     viewer.restoreSelectionSets({
                         sets: treeState.selection_sets,
-                        active: treeState.active_selection_set || 'Default'
+                        // Alan 5/12/26 - Restore the last active color group for compatibility with saved states.
+                        active: treeState.active_selection_set || 'Default',
+                        // Alan 5/12/26 - Restore user-selected color metadata when present.
+                        colors: treeState.selection_set_colors || {}
                     });
                     updateSelectionSetUI();
                 }
@@ -672,7 +677,8 @@ document.addEventListener('DOMContentLoaded', async () => {
                 viewer.selectionAction(action, predicate);
 
                 // Visual feedback (optional)
-                const setEl = getEl('select-selection-set');
+                // Alan 5/12/26 - Flash the color-chip strip now that the dropdown is gone.
+                const setEl = getEl('color-group-chips');
                 if (setEl) {
                     setEl.classList.add('ring-2', 'ring-green-400');
                     setTimeout(() => setEl.classList.remove('ring-2', 'ring-green-400'), 400);
@@ -681,84 +687,256 @@ document.addEventListener('DOMContentLoaded', async () => {
         });
 
         // --- SELECTION SET MANAGEMENT ---
-        const selectSet = getEl('select-selection-set');
-        const colorSwatch = getEl('selection-set-color');
+        // Alan 5/12/26 - Render color groups as direct action chips instead of an indirect dropdown.
+        const colorGroupChips = getEl('color-group-chips');
         const btnNewSet = getEl('btn-new-selection-set');
         const btnDeleteSet = getEl('btn-delete-selection-set');
+        // Alan 5/12/26 - Cache color editing controls for user-chosen group colors.
+        const btnEditSetColor = getEl('btn-edit-selection-set-color');
+        const colorInput = getEl('input-selection-set-color');
+        const colorGroupPopover = getEl('color-group-popover');
+        const groupNameInput = getEl('input-color-group-name');
+        const groupNewColorInput = getEl('input-color-group-new-color');
+        const btnCreateColorGroup = getEl('btn-create-color-group');
+        const btnCancelColorGroup = getEl('btn-cancel-color-group');
+
+        // Alan 5/12/26 - Read the current transient selection count defensively for chip actions.
+        const getCurrentSelectionCount = () => viewer?.getSelectionCount?.() || 0;
+
+        // Alan 5/12/26 - Hide the new-color-group popover after create/cancel.
+        const hideColorGroupPopover = () => {
+            // Alan 5/12/26 - Guard because older templates may not have the popover during cache transitions.
+            if (colorGroupPopover) colorGroupPopover.classList.add('hidden');
+        };
+
+        // Alan 5/12/26 - Apply the active color group and consume the temporary action selection.
+        const applyActiveColorGroupToSelection = async (createdName = null) => {
+            // Alan 5/12/26 - Ignore color application before the viewer is initialized.
+            if (!viewer?.addCurrentSelectionToActiveColorGroup) return 0;
+            // Alan 5/12/26 - Do not persist color edits from view-only copies.
+            if (window.VIEW_ONLY || isProcessing) return 0;
+            // Alan 5/12/26 - Capture the active group name before selection is cleared.
+            const activeName = viewer.getActiveSelectionSet();
+            // Alan 5/12/26 - Move selected tips into the active group, replacing prior colors.
+            const changed = viewer.addCurrentSelectionToActiveColorGroup();
+            // Alan 5/12/26 - Color application consumes the temporary selection so later colors start fresh.
+            viewer.clearActiveSelection();
+            // Alan 5/12/26 - Re-render chips and action buttons after consuming selection.
+            updateSelectionSetUI();
+            // Alan 5/12/26 - Refresh edit buttons after consuming selection.
+            updateButtons();
+            // Alan 5/12/26 - Persist user color assignments immediately.
+            await saveSelectionSetsNow();
+            // Alan 5/12/26 - Mention creation and coloring together when a new group was just made.
+            const prefix = createdName ? `Created "${createdName}" and colored` : 'Colored';
+            // Alan 5/12/26 - Report the number of selected sequences handled by the color chip.
+            showStatus(`${prefix} ${changed} sequence${changed === 1 ? '' : 's'} in "${activeName}".`, "success", 1800);
+            // Alan 5/12/26 - Return count for callers that need no-op handling.
+            return changed;
+        };
 
         // Helper to sync UI with viewer selection set state (also assigned to outer scope for loadTree access)
         updateSelectionSetUI = function updateSelectionSetUI() {
-            if (!viewer || !selectSet) return;
+            // Alan 5/12/26 - Skip chip rendering until the viewer and template controls both exist.
+            if (!viewer || !colorGroupChips) return;
 
+            // Alan 5/12/26 - Read current group names from the backward-compatible selection-set API.
             const names = viewer.getSelectionSetNames();
+            // Alan 5/12/26 - Read the currently active color group.
             const active = viewer.getActiveSelectionSet();
-
-            // Rebuild dropdown options
-            selectSet.innerHTML = '';
+            // Alan 5/12/26 - Clear old chip DOM before rebuilding.
+            colorGroupChips.innerHTML = '';
             names.forEach(name => {
-                const opt = document.createElement('option');
-                opt.value = name;
-                opt.textContent = name;
-                if (name === active) opt.selected = true;
-                selectSet.appendChild(opt);
+                // Alan 5/12/26 - Resolve each group's editable color.
+                const color = viewer.getSelectionSetColor(name) || '#1f77b4';
+                // Alan 5/12/26 - Build a chip that both selects and applies a color group.
+                const chip = document.createElement('button');
+                // Alan 5/12/26 - Keep chips compact and horizontally scrollable in the toolbar.
+                chip.type = 'button';
+                // Alan 5/12/26 - Mark chips for direct color-group application.
+                chip.className = 'color-group-chip inline-flex items-center gap-1 rounded px-2 py-1 text-xs font-medium border whitespace-nowrap text-gray-700 dark:text-gray-200 disabled:opacity-40 disabled:cursor-not-allowed';
+                // Alan 5/12/26 - Highlight the active group with its chosen color.
+                chip.style.borderColor = name === active ? color : 'rgba(107, 114, 128, .45)';
+                // Alan 5/12/26 - Add a subtle color wash to make the chip read as the color itself.
+                chip.style.background = `${color}22`;
+                // Alan 5/12/26 - Explain direct chip behavior in the tooltip.
+                chip.title = getCurrentSelectionCount() > 0 ? `Color current selection as ${name}` : `Set active color group: ${name}`;
+                // Alan 5/12/26 - Create a visible color dot without injecting group names as HTML.
+                const dot = document.createElement('span');
+                // Alan 5/12/26 - Size the dot consistently inside compact chips.
+                dot.className = 'inline-block h-2.5 w-2.5 rounded-full border border-black/20';
+                // Alan 5/12/26 - Fill the dot with the user's chosen color.
+                dot.style.background = color;
+                // Alan 5/12/26 - Create the group label as text content for safety.
+                const label = document.createElement('span');
+                // Alan 5/12/26 - Keep long group names from stretching the toolbar.
+                label.className = 'max-w-[90px] truncate';
+                // Alan 5/12/26 - Assign text content so custom group names are not interpreted as markup.
+                label.textContent = name;
+                // Alan 5/12/26 - Add dot and label to the chip.
+                chip.append(dot, label);
+                // Alan 5/12/26 - Clicking a chip selects it, and colors current tips when any are selected.
+                chip.addEventListener('click', async () => {
+                    // Alan 5/12/26 - Ignore chip actions before the viewer is ready.
+                    if (!viewer) return;
+                    // Alan 5/12/26 - Switch active color group first so color application uses this chip.
+                    if (!viewer.setActiveSelectionSet(name)) return;
+                    // Alan 5/12/26 - Refresh chip active state immediately.
+                    updateSelectionSetUI();
+                    // Alan 5/12/26 - Apply color directly when there is a current selection.
+                    if (getCurrentSelectionCount() > 0 && !window.VIEW_ONLY && !isProcessing) {
+                        // Alan 5/12/26 - Persist the one-color-per-tip assignment.
+                        await applyActiveColorGroupToSelection();
+                        return;
+                    }
+                    // Alan 5/12/26 - Otherwise just switch the active edit group.
+                    showStatus(`Active color group: "${name}".`, "info", 1500);
+                });
+                // Alan 5/12/26 - Add the chip to the toolbar.
+                colorGroupChips.appendChild(chip);
             });
 
-            // Update color swatch
-            if (colorSwatch) {
+            // Alan 5/12/26 - Keep the hidden native color picker synchronized with the active group.
+            if (colorInput) {
+                // Alan 5/12/26 - Use active group color as the edit starting point.
                 const color = viewer.getSelectionSetColor(active);
-                colorSwatch.style.background = color || '#1f77b4';
+                // Alan 5/12/26 - Assign a valid fallback for native color inputs.
+                colorInput.value = color || '#1f77b4';
             }
 
+            // Alan 5/12/26 - New/edit/delete are persisted color-group edits, so lock them in view-only mode.
+            const disableGroupEdits = Boolean(window.VIEW_ONLY || isProcessing);
+            // Alan 5/12/26 - Disable creation when color groups cannot be persisted.
+            if (btnNewSet) btnNewSet.disabled = disableGroupEdits;
+            // Alan 5/12/26 - Disable color editing when color groups cannot be persisted.
+            if (btnEditSetColor) btnEditSetColor.disabled = disableGroupEdits || !active;
             // Enable/disable delete button (always disable for 'Default')
             if (btnDeleteSet) {
-                btnDeleteSet.disabled = (active === 'Default');
+                // Alan 5/12/26 - Default remains protected and all group edits lock in view-only/processing states.
+                btnDeleteSet.disabled = disableGroupEdits || (active === 'Default');
             }
         }
 
         // Initial sync after viewer is ready
         if (viewer) updateSelectionSetUI();
 
-        // Dropdown change: switch active set
-        selectSet?.addEventListener('change', () => {
-            if (!viewer) return;
-            const name = selectSet.value;
-            if (viewer.setActiveSelectionSet(name)) {
-                updateSelectionSetUI();
-                showStatus(`Switched to "${name}" selection set.`, "info", 1500);
-            }
-        });
-
         // New Set button
         btnNewSet?.addEventListener('click', () => {
-            if (!viewer) return;
-            const name = prompt("Enter a name for the new selection set:");
-            if (!name) return;
+            // Alan 5/12/26 - Do not open creation UI before the viewer is ready.
+            if (!viewer || !colorGroupPopover) return;
+            // Alan 5/12/26 - Persisted color-group creation is not available in view-only mode.
+            if (window.VIEW_ONLY || isProcessing) return;
+            // Alan 5/12/26 - Start with a blank group name for each creation.
+            if (groupNameInput) groupNameInput.value = '';
+            // Alan 5/12/26 - Suggest the next palette color while still allowing any native color choice.
+            if (groupNewColorInput) groupNewColorInput.value = viewer.suggestSelectionSetColor?.() || '#1f77b4';
+            // Alan 5/12/26 - Show the compact creation popover.
+            colorGroupPopover.classList.remove('hidden');
+            // Alan 5/12/26 - Focus the name field for keyboard flow.
+            groupNameInput?.focus();
+        });
 
-            if (viewer.createSelectionSet(name.trim())) {
-                viewer.setActiveSelectionSet(name.trim());
-                updateSelectionSetUI();
-                saveSelectionSets();
-                showStatus(`Created selection set "${name.trim()}".`, "success", 2000);
-            } else {
-                showStatus(`Set "${name.trim()}" already exists or is invalid.`, "warning", 2500);
+        // Alan 5/12/26 - Cancel color-group creation without changing selections.
+        btnCancelColorGroup?.addEventListener('click', hideColorGroupPopover);
+
+        // Alan 5/12/26 - Create a user-named color group with the chosen color.
+        btnCreateColorGroup?.addEventListener('click', async () => {
+            // Alan 5/12/26 - Guard against missing viewer/popover state.
+            if (!viewer || window.VIEW_ONLY || isProcessing) return;
+            // Alan 5/12/26 - Read and trim the requested group name.
+            const name = groupNameInput?.value.trim() || '';
+            // Alan 5/12/26 - Read the native color picker value.
+            const color = groupNewColorInput?.value || '#1f77b4';
+            // Alan 5/12/26 - Require a usable group name.
+            if (!name) {
+                showStatus("Enter a color group name.", "warning", 2000);
+                groupNameInput?.focus();
+                return;
             }
+            // Alan 5/12/26 - Create the group with the user's chosen color.
+            if (!viewer.createSelectionSet(name, color)) {
+                showStatus(`Color group "${name}" already exists or is invalid.`, "warning", 2500);
+                return;
+            }
+            // Alan 5/12/26 - Make the new group active so selected tips apply to it.
+            viewer.setActiveSelectionSet(name);
+            // Alan 5/12/26 - Close the popover after a successful create.
+            hideColorGroupPopover();
+            // Alan 5/12/26 - Creating a group while tips are selected applies it immediately.
+            if (getCurrentSelectionCount() > 0) {
+                await applyActiveColorGroupToSelection(name);
+                return;
+            }
+            // Alan 5/12/26 - Refresh chips for the new group.
+            updateSelectionSetUI();
+            // Alan 5/12/26 - Persist new group metadata even when no tips are colored yet.
+            await saveSelectionSetsNow();
+            // Alan 5/12/26 - Report group creation.
+            showStatus(`Created color group "${name}".`, "success", 2000);
+        });
+
+        // Alan 5/12/26 - Let users change the active color group's color with a native color picker.
+        btnEditSetColor?.addEventListener('click', () => {
+            // Alan 5/12/26 - Ignore color edits before the viewer is ready.
+            if (!viewer || !colorInput || window.VIEW_ONLY || isProcessing) return;
+            // Alan 5/12/26 - Sync the picker to the active group before opening it.
+            colorInput.value = viewer.getSelectionSetColor(viewer.getActiveSelectionSet()) || '#1f77b4';
+            // Alan 5/12/26 - Open the browser-native color picker.
+            colorInput.click();
+        });
+
+        // Alan 5/12/26 - Persist native color picker changes to the active group.
+        colorInput?.addEventListener('change', async () => {
+            // Alan 5/12/26 - Guard against stale input events.
+            if (!viewer || window.VIEW_ONLY || isProcessing) return;
+            // Alan 5/12/26 - Resolve the active group at the time of color edit.
+            const active = viewer.getActiveSelectionSet();
+            // Alan 5/12/26 - Save the chosen color to the active group.
+            if (!viewer.setSelectionSetColor(active, colorInput.value)) return;
+            // Alan 5/12/26 - Re-render chips with the new color.
+            updateSelectionSetUI();
+            // Alan 5/12/26 - Persist color metadata.
+            await saveSelectionSetsNow();
+            // Alan 5/12/26 - Confirm the color edit.
+            showStatus(`Updated "${active}" color.`, "success", 1500);
         });
 
         // Delete Set button
         btnDeleteSet?.addEventListener('click', () => {
+            // Alan 5/12/26 - Do not delete persisted color groups while edits are unavailable.
+            if (window.VIEW_ONLY || isProcessing) return;
             if (!viewer) return;
             const active = viewer.getActiveSelectionSet();
             if (active === 'Default') {
-                showStatus("Cannot delete the Default set.", "warning", 2000);
+                // Alan 5/12/26 - Explain why the protected default color group cannot be deleted.
+                showStatus("Cannot delete the Default color group.", "warning", 2000);
                 return;
             }
-            if (!confirm(`Delete selection set "${active}"? This will clear its selections.`)) return;
+            // Alan 5/12/26 - Confirm color-group deletion without implying it controls current action selection.
+            if (!confirm(`Delete color group "${active}"? This will clear its colors.`)) return;
 
             if (viewer.deleteSelectionSet(active)) {
                 updateSelectionSetUI();
                 saveSelectionSets();
-                showStatus(`Deleted selection set "${active}".`, "success", 2000);
+                // Alan 5/12/26 - Report color-group deletion using the new user-facing terminology.
+                showStatus(`Deleted color group "${active}".`, "success", 2000);
             }
+        });
+
+        // Alan 5/12/26 - Clear color from the current temporary selection across all color groups.
+        btnUncolorSelection?.addEventListener('click', async () => {
+            // Alan 5/12/26 - Ignore uncolor actions before the viewer is ready.
+            if (!viewer?.clearCurrentSelectionColorGroups || window.VIEW_ONLY || isProcessing) return;
+            // Alan 5/12/26 - Remove persistent color membership from every color group.
+            const changed = viewer.clearCurrentSelectionColorGroups();
+            // Alan 5/12/26 - Clear-color consumes the temporary selection for the same reason color application does.
+            viewer.clearActiveSelection();
+            // Alan 5/12/26 - Refresh buttons after clearing the consumed temporary selection.
+            updateButtons();
+            // Alan 5/12/26 - Persist color groups after deliberate color removal.
+            await saveSelectionSetsNow();
+            // Alan 5/12/26 - Report both no-op and changed color removal clearly.
+            showStatus(changed > 0 ? `Cleared color from ${changed} sequence${changed === 1 ? '' : 's'}.` : "Selected sequences had no color.", changed > 0 ? "success" : "info", 1800);
         });
 
         // Display Options (Incremental)
@@ -995,6 +1173,8 @@ document.addEventListener('DOMContentLoaded', async () => {
         if (typeof viewer.getSelectionCount === 'function') {
             selCount = viewer.getSelectionCount();
         }
+        // Alan 5/12/26 - Keep color chips, tooltips, and edit disabled states in sync with selection state.
+        updateSelectionSetUI();
 
         // Alan 5/11/26 - Keep Deselect tied to visible active selections, not saved selection sets.
         const updateDeselectButton = (forceDisabled = false) => {
@@ -1022,6 +1202,8 @@ document.addEventListener('DOMContentLoaded', async () => {
             disableBtn(btnReroot);
             disableBtn(btnMidpoint);
             disableBtn(btnRecompute);
+            // Alan 5/12/26 - Color clearing is a persisted edit, so disable it in view-only mode.
+            disableBtn(btnUncolorSelection);
             // btnMakeCopy remains enabled
             // Alan 5/11/26 - Leave Deselect available in view-only mode because it only changes local highlighting.
             updateDeselectButton(false);
@@ -1039,6 +1221,8 @@ document.addEventListener('DOMContentLoaded', async () => {
             if (btnMidpoint) btnMidpoint.disabled = true;
             if (btnRecompute) btnRecompute.disabled = true;
             if (btnMakeCopy) btnMakeCopy.disabled = true;
+            // Alan 5/12/26 - Prevent color clearing while backend actions are refreshing the tree.
+            if (btnUncolorSelection) btnUncolorSelection.disabled = true;
             // Alan 5/11/26 - Freeze Deselect while backend actions are refreshing the tree.
             updateDeselectButton(true);
             return;
@@ -1072,6 +1256,8 @@ document.addEventListener('DOMContentLoaded', async () => {
         }
         if (btnMidpoint) btnMidpoint.disabled = false;
         if (btnRecompute) btnRecompute.disabled = false;
+        // Alan 5/12/26 - Enable clear color only when there is a temporary current selection.
+        if (btnUncolorSelection) btnUncolorSelection.disabled = selCount === 0;
     }
 
     function updateMidpointButton() {

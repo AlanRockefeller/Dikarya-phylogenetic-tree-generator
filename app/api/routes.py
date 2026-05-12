@@ -1007,14 +1007,18 @@ def save_selection_sets(job_id):
     data = request.get_json(silent=True) or {}
     sets = data.get("sets")
     active = data.get("active", "Default")
+    colors = data.get("colors", {})
     if sets is None or not isinstance(sets, dict):
         return jsonify({"status": "error", "error": "Missing or invalid 'sets' field"}), 400
+    if colors is not None and not isinstance(colors, dict):
+        return jsonify({"status": "error", "error": "Invalid 'colors' field"}), 400
 
     try:
         from app.services.tree_edit_service import load_tree_state, save_tree_state
         state = load_tree_state(job_dir)
         state["selection_sets"] = sets
         state["active_selection_set"] = active
+        state["selection_set_colors"] = colors or {}
         save_tree_state(job_dir, state)
         return jsonify({"status": "ok"})
     except Exception as e:
