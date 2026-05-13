@@ -135,6 +135,18 @@
                 {% endif %}">
                 {{ entry.body | safe }}
             </div>
+            {% if can_edit_whats_new %}
+            <div class="mt-4 pt-4 border-t border-gray-200 dark:border-journal-green/20 flex justify-end">
+                <form method="post" action="{{ url_for('main.whats_new_delete', entry_id=entry.id) }}">
+                    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+                    <input type="hidden" name="next" value="{{ url_for('main.whats_new') }}">
+                    <button type="submit" onclick="return confirm('Delete this item?')"
+                        class="inline-flex items-center gap-2 px-3 py-1.5 rounded-lg bg-red-600 hover:bg-red-700 text-white text-xs font-semibold shadow-sm transition-colors">
+                        <i class="fas fa-trash"></i> Delete
+                    </button>
+                </form>
+            </div>
+            {% endif %}
             {% endif %}
         </div>
         {% endfor %}

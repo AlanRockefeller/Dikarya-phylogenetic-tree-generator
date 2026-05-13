@@ -182,6 +182,9 @@ def whats_new_delete(entry_id):
     db.session.delete(entry)
     db.session.commit()
     flash("What's New item deleted.", "success")
+    next_url = request.form.get("next")
+    if next_url and next_url.startswith("/"):
+        return redirect(next_url)
     return redirect(url_for("main.whats_new_edit"))
 
 @bp.route('/job')
@@ -235,6 +238,21 @@ def job_viewer(job_id):
                 job_details = json.load(f)
         except Exception:
             pass
+
+    mycomap_blast_url = job_details.get("mycomap_blast_url")
+    if not mycomap_blast_url and db_job and isinstance(db_job.metrics, dict):
+        mycomap_blast_url = db_job.metrics.get("mycomap_blast_url")
+    if mycomap_blast_url:
+        try:
+            from app.services.mycomap_service import validate_mycomap_url
+            mycomap_blast_url = str(mycomap_blast_url).strip()
+            blast_id = validate_mycomap_url(mycomap_blast_url)
+            if blast_id:
+                job_details["mycomap_blast_url"] = mycomap_blast_url
+            else:
+                job_details.pop("mycomap_blast_url", None)
+        except Exception:
+            job_details.pop("mycomap_blast_url", None)
             
     return render_template('job_viewer.html', job_id=job_id, job_details=job_details, view_only=view_only)
 
@@ -388,6 +406,24 @@ def todo_status(suggestion_id):
         suggestion.completed_at = None
         suggestion.completed_by_id = None
     db.session.commit()
+
+    return_status = (request.form.get('return_status') or 'open').strip().lower()
+    if return_status not in {'open', 'done', 'all'}:
+        return_status = 'open'
+    return redirect(url_for('main.todo', status=return_status))
+
+
+@bp.route('/todo/<int:suggestion_id>/delete', methods=['POST'])
+def todo_delete(suggestion_id):
+    from app.models import TodoSuggestion
+
+    if not is_todo_admin():
+        abort(404)
+
+    suggestion = TodoSuggestion.query.get_or_404(suggestion_id)
+    db.session.delete(suggestion)
+    db.session.commit()
+    flash("ToDo suggestion deleted.", "success")
 
     return_status = (request.form.get('return_status') or 'open').strip().lower()
     if return_status not in {'open', 'done', 'all'}:

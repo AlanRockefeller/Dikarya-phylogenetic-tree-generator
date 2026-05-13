@@ -461,6 +461,19 @@ def gather_mycomap_sequences_for_queue(url, include_ncbi=True, include_local=Tru
     )
     from app.services.fasta_utils import clean_dna_sequence
 
+    def is_contaminant_sequence(seq, metric=None):
+        if metric and metric.get('is_contaminant'):
+            return True
+        labels = (
+            seq.get('name', ''),
+            seq.get('_mycomap_original_name', ''),
+        )
+        return any(re.search(r'\bcontaminant\b', str(label or ''), flags=re.IGNORECASE) for label in labels)
+
+    def remove_lowquality_label(name):
+        cleaned = re.sub(r'\bLOWQUALITY\b', '', str(name or ''))
+        return re.sub(r'\s+', ' ', cleaned).strip(' ,;:-_')
+
     blast_id = validate_mycomap_url(url)
     if not blast_id:
         return None, ({
@@ -516,6 +529,8 @@ def gather_mycomap_sequences_for_queue(url, include_ncbi=True, include_local=Tru
 
     metrics_by_key = fetch_mycomap_blast_metrics(blast_id, source_url=url)
     metrics_attached_count = 0
+    contaminant_dropped_count = 0
+    filtered_sequences = []
     for seq in sequences:
         metric = None
         lookup_names = [seq.get('name', ''), seq.get('_mycomap_original_name', '')]
@@ -526,6 +541,9 @@ def gather_mycomap_sequences_for_queue(url, include_ncbi=True, include_local=Tru
                     break
             if metric:
                 break
+        if is_contaminant_sequence(seq, metric):
+            contaminant_dropped_count += 1
+            continue
         if metric:
             seq['name'] = improve_mycomap_sequence_name(
                 seq.get('name', ''), metric, seq.get('hit_source', ''),
@@ -543,7 +561,10 @@ def gather_mycomap_sequences_for_queue(url, include_ncbi=True, include_local=Tru
             seq['query_cover'] = None
             seq['subject_cover'] = None
             seq['blast_metrics_available'] = False
+        seq['name'] = remove_lowquality_label(seq.get('name', ''))
         seq.pop('_mycomap_original_name', None)
+        filtered_sequences.append(seq)
+    sequences = filtered_sequences
 
     parts = []
     if include_ncbi:
@@ -553,6 +574,8 @@ def gather_mycomap_sequences_for_queue(url, include_ncbi=True, include_local=Tru
     msg = f"Fetched {' + '.join(parts)} sequences from Mycomap"
     if dropped_count > 0:
         msg += f" ({dropped_count} dropped due to invalid/short sequences)"
+    if contaminant_dropped_count > 0:
+        msg += f" ({contaminant_dropped_count} contaminant sequence{'s' if contaminant_dropped_count != 1 else ''} filtered)"
     if result['errors']:
         msg += f" (warnings: {'; '.join(result['errors'])})"
 
@@ -694,8 +717,8 @@ def fetch_inaturalist():
         if not url_info:
             return jsonify({
                 "status": "error",
-                "error": "Invalid iNaturalist URL. Please enter a valid observation URL "
-                         "(e.g., https://www.inaturalist.org/observations/12345) or "
+                "error": "Invalid iNaturalist input. Please enter a 7 to 9 digit observation ID, "
+                         "a valid observation URL (e.g., https://www.inaturalist.org/observations/1234567), or "
                          "observations search URL."
             }), 400
         
@@ -774,6 +797,7 @@ def create_job():
         "notes": data.get("notes", ""),
         "sequence": data.get("sequence", ""),
         "sequence_metadata": _normalize_sequence_metadata(data.get("sequence_metadata", [])),
+        "mycomap_blast_url": data.get("mycomap_blast_url") or "",
         "accessions": data.get("accessions", []),
         "alignment_method": data.get("alignment_method", "default"),
         "trimming_method": data.get("trimming_method", "none"),
@@ -1252,6 +1276,195 @@ def download_fasta_aligned(job_id):
         return jsonify({"status": "error", "error": "Aligned FASTA not found or invalid"}), 404
         
     return send_file(path, as_attachment=True, download_name="sequences_aligned.fasta")
+
+@bp.route('/job/<job_id>/alignment/view', methods=['POST'])
+def alignment_view(job_id):
+    """Return parsed aligned FASTA contents for the in-page Alignment Viewer.
+
+    Inputs (JSON): tip_names, tree_order, include_pruned, pruned_tip_names.
+    Returns sequence rows constrained to selected/visible tree tips, with the
+    option to include pruned sequences from the underlying alignment file.
+    """
+    if not validate_job_id(job_id):
+        return jsonify({"status": "error", "error": "Invalid job id"}), 400
+
+    _, error_msg, status_code = check_job_access(job_id)
+    if error_msg:
+        return jsonify({"status": "error", "error": error_msg}), status_code
+
+    try:
+        from Bio import SeqIO  # local import keeps cold-path cheap
+    except ImportError:
+        return jsonify({"status": "error", "error": "BioPython unavailable"}), 500
+
+    data = request.get_json(silent=True) or {}
+    tip_names = data.get("tip_names") or []
+    tree_order = data.get("tree_order") or []
+    include_pruned = bool(data.get("include_pruned"))
+    if not isinstance(tip_names, list) or not isinstance(tree_order, list):
+        return jsonify({"status": "error", "error": "Malformed request"}), 400
+
+    # Soft caps so a runaway payload can't blow up the server.
+    MAX_NAMES = 5000
+    MAX_RETURN = 2000
+    MAX_TOTAL_CHARS = 5_000_000
+    tip_names = [str(n) for n in tip_names[:MAX_NAMES] if n]
+    tree_order = [str(n) for n in tree_order[:MAX_NAMES] if n]
+
+    job_dir = Config.JOB_DIR / job_id
+    path = job_dir / "alignment" / "alignment_raw.fasta"
+    if not path.exists():
+        path = job_dir / "alignment" / "aligned.fasta"
+    if not validate_safe_file_path(path, job_dir):
+        return jsonify({"status": "error", "error": "Aligned FASTA not found"}), 404
+
+    try:
+        records = list(SeqIO.parse(str(path), "fasta"))
+    except Exception as exc:  # pragma: no cover - defensive
+        return _server_error(exc, where="alignment_view parse")
+
+    if not records:
+        return jsonify({"status": "error", "error": "Alignment is empty"}), 404
+
+    # Build lookup tables for robust name matching.
+    by_full = {}
+    by_trimmed = {}
+    by_token = {}
+    fasta_rows = []
+    for rec in records:
+        header = rec.description or rec.id
+        sequence = str(rec.seq)
+        row = {"name": header, "sequence": sequence}
+        fasta_rows.append(row)
+        by_full.setdefault(header, row)
+        trimmed = header.strip()
+        by_trimmed.setdefault(trimmed, row)
+        first_token = trimmed.split(None, 1)[0] if trimmed else ""
+        if first_token:
+            by_token.setdefault(first_token, []).append(row)
+
+    def match(name):
+        if not name:
+            return None
+        if name in by_full:
+            return by_full[name]
+        t = name.strip()
+        if t in by_trimmed:
+            return by_trimmed[t]
+        tok = t.split(None, 1)[0] if t else ""
+        hits = by_token.get(tok, [])
+        if len(hits) == 1:
+            return hits[0]
+        return None
+
+    warnings = []
+    alignment_length = max((len(r["sequence"]) for r in fasta_rows), default=0)
+    total_alignment_count = len(fasta_rows)
+
+    # Determine which alignment rows correspond to current tree tips.
+    tree_set_rows = []
+    tree_seen = set()
+    for name in tree_order:
+        row = match(name)
+        if row is None or id(row) in tree_seen:
+            continue
+        tree_seen.add(id(row))
+        tree_set_rows.append(row)
+
+    pruned_rows = [r for r in fasta_rows if id(r) not in tree_seen]
+    available_pruned_count = len(pruned_rows)
+
+    # Build the ordered selection of rows to return.
+    selected_rows = []
+    seen_ids = set()
+
+    def push(row):
+        if row is None or id(row) in seen_ids:
+            return
+        seen_ids.add(id(row))
+        selected_rows.append(row)
+
+    if include_pruned:
+        # Start with tree order (or selected subset if provided), then append remaining.
+        if tip_names:
+            for name in tip_names:
+                row = match(name)
+                if row is None:
+                    warnings.append(f"Not found in alignment: {name}")
+                    continue
+                push(row)
+            for r in tree_set_rows:
+                push(r)
+        else:
+            for r in tree_set_rows:
+                push(r)
+        for r in pruned_rows:
+            push(r)
+        # Also include any record not yet covered (e.g., tree_order empty).
+        for r in fasta_rows:
+            push(r)
+        included_pruned_count = sum(1 for r in selected_rows if id(r) not in tree_seen)
+    else:
+        if tip_names:
+            for name in tip_names:
+                row = match(name)
+                if row is None:
+                    warnings.append(f"Not found in alignment: {name}")
+                    continue
+                # exclude pruned by default
+                if id(row) not in tree_seen and tree_seen:
+                    continue
+                push(row)
+        else:
+            for r in tree_set_rows:
+                push(r)
+            if not selected_rows and not tree_order:
+                # No tree order provided: fall back to whole alignment.
+                for r in fasta_rows:
+                    push(r)
+        included_pruned_count = 0
+
+    # Apply defensive caps.
+    capped_warning = None
+    if len(selected_rows) > MAX_RETURN:
+        capped_warning = f"Truncated to {MAX_RETURN} sequences for display."
+        selected_rows = selected_rows[:MAX_RETURN]
+
+    total_chars = sum(len(r["sequence"]) for r in selected_rows)
+    if total_chars > MAX_TOTAL_CHARS:
+        # Trim rows until under the cap.
+        running = 0
+        trimmed = []
+        for r in selected_rows:
+            running += len(r["sequence"])
+            if running > MAX_TOTAL_CHARS:
+                break
+            trimmed.append(r)
+        capped_warning = f"Truncated to {len(trimmed)} sequences to stay within size limits."
+        selected_rows = trimmed
+
+    if capped_warning:
+        warnings.append(capped_warning)
+
+    if not selected_rows:
+        return jsonify({
+            "status": "error",
+            "error": "No sequences matched the requested tips.",
+            "warnings": warnings,
+        }), 404
+
+    return jsonify({
+        "status": "success",
+        "source": "aligned",
+        "total_alignment_count": total_alignment_count,
+        "returned_count": len(selected_rows),
+        "alignment_length": alignment_length,
+        "included_pruned_count": included_pruned_count,
+        "available_pruned_count": available_pruned_count,
+        "sequences": selected_rows,
+        "warnings": warnings,
+    })
+
 
 @bp.route('/job/<job_id>/download/fasta/trimmed', methods=['GET'])
 def download_fasta_trimmed(job_id):

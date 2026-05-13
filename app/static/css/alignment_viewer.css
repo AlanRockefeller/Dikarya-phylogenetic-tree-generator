@@ -1,0 +1,188 @@
+/* Dikarya Alignment Viewer styles */
+
+.alignment-viewer {
+    display: flex;
+    flex-direction: column;
+    background: #ffffff;
+    color: #1f2937;
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+
+.dark .alignment-viewer {
+    background: #0a1716;
+    color: #e5e7eb;
+}
+
+.alignment-viewer-grid {
+    display: grid;
+    grid-template-columns: minmax(180px, 22rem) 1fr;
+    grid-template-rows: auto 1fr;
+    overflow: hidden;
+}
+
+.alignment-viewer .av-ruler-corner,
+.alignment-viewer .av-names-header {
+    background: #f3f4f6;
+    border-bottom: 1px solid #e5e7eb;
+    border-right: 1px solid #e5e7eb;
+    font-size: 11px;
+    padding: 4px 8px;
+    color: #374151;
+    position: sticky;
+    top: 0;
+    z-index: 3;
+}
+
+.dark .alignment-viewer .av-ruler-corner,
+.dark .alignment-viewer .av-names-header {
+    background: #122322;
+    border-color: #1f3a36;
+    color: #d1d5db;
+}
+
+.alignment-viewer .av-ruler {
+    overflow: hidden;
+    border-bottom: 1px solid #e5e7eb;
+    background: #f9fafb;
+    position: sticky;
+    top: 0;
+    z-index: 2;
+    white-space: nowrap;
+    font-size: 10px;
+    color: #6b7280;
+}
+
+.dark .alignment-viewer .av-ruler {
+    background: #0e1d1c;
+    border-color: #1f3a36;
+    color: #9ca3af;
+}
+
+.alignment-viewer .av-names {
+    overflow-y: auto;
+    overflow-x: hidden;
+    background: #ffffff;
+    border-right: 1px solid #e5e7eb;
+    font-size: 12px;
+}
+
+.dark .alignment-viewer .av-names {
+    background: #0a1716;
+    border-color: #1f3a36;
+}
+
+.alignment-viewer .av-cells {
+    overflow: auto;
+    background: #ffffff;
+    position: relative;
+}
+
+.dark .alignment-viewer .av-cells {
+    background: #0a1716;
+}
+
+.alignment-viewer .av-name-row,
+.alignment-viewer .av-cell-row {
+    display: flex;
+    align-items: center;
+    height: 18px;
+    line-height: 18px;
+    white-space: pre;
+}
+
+.alignment-viewer .av-name-row {
+    padding: 0 8px;
+    gap: 6px;
+    border-bottom: 1px solid transparent;
+    cursor: default;
+}
+
+.alignment-viewer .av-name-row:hover,
+.alignment-viewer .av-cell-row:hover {
+    background: rgba(245, 158, 11, 0.08);
+}
+
+.alignment-viewer .av-name-text {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    flex: 1;
+}
+
+.alignment-viewer .av-name-score {
+    font-size: 10px;
+    color: #6b7280;
+    font-variant-numeric: tabular-nums;
+}
+
+.dark .alignment-viewer .av-name-score {
+    color: #9ca3af;
+}
+
+.alignment-viewer .av-consensus-row .av-name-text {
+    font-weight: 600;
+    color: #b45309;
+}
+
+.dark .alignment-viewer .av-consensus-row .av-name-text {
+    color: #f3c969;
+}
+
+.alignment-viewer .av-cell {
+    display: inline-block;
+    width: 12px;
+    text-align: center;
+    font-size: 11px;
+    font-weight: 600;
+    color: #1f2937;
+}
+
+.dark .alignment-viewer .av-cell {
+    color: #f3f4f6;
+}
+
+.alignment-viewer .av-cell.av-a { background: #d1fae5; }
+.alignment-viewer .av-cell.av-c { background: #bfdbfe; }
+.alignment-viewer .av-cell.av-g { background: #fde68a; }
+.alignment-viewer .av-cell.av-t { background: #fecaca; }
+.alignment-viewer .av-cell.av-u { background: #fecaca; }
+.alignment-viewer .av-cell.av-gap { background: transparent; color: #9ca3af; }
+.alignment-viewer .av-cell.av-amb { background: #e5e7eb; color: #4b5563; }
+
+.dark .alignment-viewer .av-cell.av-a { background: #064e3b; color: #d1fae5; }
+.dark .alignment-viewer .av-cell.av-c { background: #1e3a8a; color: #dbeafe; }
+.dark .alignment-viewer .av-cell.av-g { background: #78350f; color: #fde68a; }
+.dark .alignment-viewer .av-cell.av-t { background: #7f1d1d; color: #fecaca; }
+.dark .alignment-viewer .av-cell.av-u { background: #7f1d1d; color: #fecaca; }
+.dark .alignment-viewer .av-cell.av-gap { background: transparent; color: #4b5563; }
+.dark .alignment-viewer .av-cell.av-amb { background: #1f2937; color: #9ca3af; }
+
+/* Difference highlighting — dim cells that match consensus */
+.alignment-viewer.av-highlight-diffs .av-cell.av-match {
+    opacity: 0.18;
+}
+
+.alignment-viewer .av-ruler-tick {
+    display: inline-block;
+    width: 12px;
+    text-align: center;
+    font-size: 9px;
+    color: inherit;
+    border-left: 1px solid transparent;
+}
+
+.alignment-viewer .av-ruler-tick.av-major {
+    border-left-color: #d1d5db;
+    color: #374151;
+    font-weight: 600;
+}
+
+.dark .alignment-viewer .av-ruler-tick.av-major {
+    border-left-color: #1f3a36;
+    color: #e5e7eb;
+}
+
+.alignment-viewer .av-cell.av-hidden-col,
+.alignment-viewer .av-ruler-tick.av-hidden-col {
+    display: none;
+}

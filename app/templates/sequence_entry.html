@@ -594,14 +594,14 @@
                 <div>
                     <label for="inaturalist_url"
                         class="block text-sm font-medium text-gray-700 dark:text-gray-200 mb-2">
-                        iNaturalist Observation URL
+                        iNaturalist Observation URL or ID
                     </label>
-                    <input type="url" id="inaturalist_url" class="w-full px-4 py-3 border border-gray-300 dark:border-journal-dark rounded-lg 
+                    <input type="text" id="inaturalist_url" class="w-full px-4 py-3 border border-gray-300 dark:border-journal-dark rounded-lg 
                                   bg-white dark:bg-journal-dark text-gray-900 dark:text-gray-100
                                   focus:ring-2 focus:ring-journal-gold focus:border-transparent transition-all"
-                        placeholder="https://www.inaturalist.org/observations/12345">
+                        placeholder="1234567 or https://www.inaturalist.org/observations/1234567">
                     <p class="text-xs text-gray-500 dark:text-gray-400 mt-1">
-                        Paste an iNaturalist observation URL to import DNA Barcode ITS sequences.
+                        Enter a 7 to 9 digit iNaturalist observation number or paste a full observation URL.
                     </p>
                 </div>
 
@@ -1811,6 +1811,10 @@
     const mycomapDedupCheckbox = document.getElementById('mycomap_dedup');
     const fetchMycomapBtn = document.getElementById('fetch_mycomap_btn');
     const mycomapQuickTreeBtn = document.getElementById('mycomap_quick_tree_btn');
+    let lastMycomapBlastUrl = '';
+    function getMycomapBlastUrlForPayload() {
+        return sequenceQueue.some(seq => seq && seq.source === 'mycomap') ? lastMycomapBlastUrl : '';
+    }
 
     function checkMycomapState() {
         const isValid = isValidMycomapUrl(mycomapUrlInput.value.trim());
@@ -1900,6 +1904,7 @@
             }
             showStatus(statusMsg, 'success');
 
+            lastMycomapBlastUrl = url;
             mycomapUrlInput.value = '';
             checkMycomapState();
             return true;
@@ -1952,7 +1957,8 @@
             trimming_method: 'none',
             tree_method: 'fasttree',
             tree_model: 'GTR+G',
-            bootstrap: 100
+            bootstrap: 100,
+            mycomap_blast_url: getMycomapBlastUrlForPayload()
         };
 
         try {
@@ -1998,9 +2004,8 @@
     const inaturalistTreeBtn = document.getElementById('inaturalist_tree_btn');
 
     function checkInatState() {
-        // Simple check: contains inaturalist.org
         const val = inaturalistUrlInput.value.trim();
-        const seemsValid = val && val.includes('inaturalist.org');
+        const seemsValid = isValidInaturalistInput(val);
         updateButtonVisuals(fetchInaturalistBtn, seemsValid);
     }
 
@@ -2010,10 +2015,11 @@
     let currentInaturalistResult = null;
     let currentInaturalistUrl = null;
 
-    function isValidInaturalistUrl(url) {
-        if (!url) return false;
+    function isValidInaturalistInput(value) {
+        if (!value) return false;
+        if (/^\d{7,9}$/.test(value)) return true;
         try {
-            const parsed = new URL(url);
+            const parsed = new URL(value);
             // Strict hostname check - must be exactly inaturalist.org or www.inaturalist.org
             const validHostnames = ['inaturalist.org', 'www.inaturalist.org'];
             if (!validHostnames.includes(parsed.hostname.toLowerCase())) {
@@ -2046,12 +2052,12 @@
 
         // Client-side validation
         if (!url) {
-            showStatus('Please enter an iNaturalist URL.', 'error');
+            showStatus('Please enter an iNaturalist observation URL or 7 to 9 digit ID.', 'error');
             return;
         }
 
-        if (!isValidInaturalistUrl(url)) {
-            showStatus('Invalid iNaturalist URL. URL must be from inaturalist.org and contain /observations.', 'error');
+        if (!isValidInaturalistInput(url)) {
+            showStatus('Invalid iNaturalist input. Enter a 7 to 9 digit observation ID or an inaturalist.org /observations URL.', 'error');
             return;
         }
 
@@ -2382,7 +2388,8 @@
             trimming_method: 'none',
             tree_method: 'fasttree',
             tree_model: 'GTR+G',
-            bootstrap: 100
+            bootstrap: 100,
+            mycomap_blast_url: getMycomapBlastUrlForPayload()
         };
 
         try {
@@ -2694,7 +2701,8 @@
             moose_enabled: isRaxml && model === 'AUTO',
             early_stopping: document.getElementById('early_stopping').checked,
             seed: document.getElementById('raxml_seed').value ? parseInt(document.getElementById('raxml_seed').value) : null,
-            outgroup: document.getElementById('outgroup_select').value || null
+            outgroup: document.getElementById('outgroup_select').value || null,
+            mycomap_blast_url: getMycomapBlastUrlForPayload()
         };
 
         try {

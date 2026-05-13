@@ -389,6 +389,7 @@ def create_job_from_inat_observation(raw_input: str, user=None,
         "mcmc_generations": DEFAULT_TREE_PARAMS["mcmc_generations"],
         "mcmc_nruns": 2,
         "mcmc_nchains": 4,
+        "mycomap_blast_url": mycomap_url,
     }
 
     job_id = enqueue_job(job_params)

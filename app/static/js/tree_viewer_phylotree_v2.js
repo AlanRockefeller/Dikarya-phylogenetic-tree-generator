@@ -2564,6 +2564,40 @@
             return this._getVisibleSelectionIds().length;
         }
 
+        // Alan 5/13/26 - Expose rendered, unpruned tip order so the Alignment Viewer can default to tree order.
+        getVisibleTipOrder() {
+            if (!this.tree) return [];
+            const names = [];
+            const seen = new Set();
+            this.tree.traverse_and_compute(n => {
+                if (n.children && n.children.length) return;
+                if (n.notshown) return;
+                const id = this._getNodeId(n);
+                if (id && !seen.has(id)) {
+                    seen.add(id);
+                    names.push(id);
+                }
+            });
+            return names;
+        }
+
+        // Alan 5/13/26 - Expose visible selected tip names so the Alignment Viewer can default to selection.
+        getSelectedTipNames() {
+            const selected = this.getSelectedNodes();
+            const names = [];
+            const seen = new Set();
+            for (const node of selected) {
+                if (node.children && node.children.length) continue;
+                if (node.notshown) continue;
+                const id = this._getNodeId(node);
+                if (id && !seen.has(id)) {
+                    seen.add(id);
+                    names.push(id);
+                }
+            }
+            return names;
+        }
+
         // --- SELECTION SET MANAGEMENT (CRUD) ---
 
         /**

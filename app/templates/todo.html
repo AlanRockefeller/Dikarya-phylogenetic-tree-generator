@@ -45,7 +45,7 @@
                             {% endif %}
                         </div>
                         {% if todo.status == 'done' %}
-                            <div class="flex items-center gap-2 shrink-0">
+                            <div class="flex flex-wrap items-center justify-end gap-2 shrink-0">
                                 <span class="px-3 py-1 rounded-full bg-journal-gold text-journal-dark border border-journal-gold text-xs font-bold uppercase tracking-wider shadow-sm">
                                     <i class="fas fa-check-circle mr-1"></i>Done
                                 </span>
@@ -59,18 +59,36 @@
                                         Reopen
                                     </button>
                                 </form>
+                                <form action="{{ url_for('main.todo_delete', suggestion_id=todo.id) }}" method="post">
+                                    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+                                    <input type="hidden" name="return_status" value="{{ status_filter }}">
+                                    <button type="submit" onclick="return confirm('Delete this suggestion?')"
+                                        class="px-2 py-1 rounded-full bg-red-600 hover:bg-red-700 text-white text-xs font-semibold transition-colors">
+                                        <i class="fas fa-trash mr-1"></i>Delete
+                                    </button>
+                                </form>
                                 {% endif %}
                             </div>
                         {% elif is_todo_admin %}
-                            <form action="{{ url_for('main.todo_status', suggestion_id=todo.id) }}" method="post" class="shrink-0">
-                                <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
-                                <input type="hidden" name="status" value="done">
-                                <input type="hidden" name="return_status" value="{{ status_filter }}">
-                                <button type="submit"
-                                    class="px-2 py-1 rounded-full bg-journal-gold/15 hover:bg-journal-gold text-journal-dark dark:text-journal-gold dark:hover:text-journal-dark border border-journal-gold/50 text-xs font-semibold transition-colors">
-                                    <i class="fas fa-check mr-1"></i>Mark done
-                                </button>
-                            </form>
+                            <div class="flex flex-wrap items-center justify-end gap-2 shrink-0">
+                                <form action="{{ url_for('main.todo_status', suggestion_id=todo.id) }}" method="post">
+                                    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+                                    <input type="hidden" name="status" value="done">
+                                    <input type="hidden" name="return_status" value="{{ status_filter }}">
+                                    <button type="submit"
+                                        class="px-2 py-1 rounded-full bg-journal-gold/15 hover:bg-journal-gold text-journal-dark dark:text-journal-gold dark:hover:text-journal-dark border border-journal-gold/50 text-xs font-semibold transition-colors">
+                                        <i class="fas fa-check mr-1"></i>Mark done
+                                    </button>
+                                </form>
+                                <form action="{{ url_for('main.todo_delete', suggestion_id=todo.id) }}" method="post">
+                                    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+                                    <input type="hidden" name="return_status" value="{{ status_filter }}">
+                                    <button type="submit" onclick="return confirm('Delete this suggestion?')"
+                                        class="px-2 py-1 rounded-full bg-red-600 hover:bg-red-700 text-white text-xs font-semibold transition-colors">
+                                        <i class="fas fa-trash mr-1"></i>Delete
+                                    </button>
+                                </form>
+                            </div>
                         {% endif %}
                     </div>
                     <p class="{{ 'text-gray-600 dark:text-gray-300' if todo.status == 'done' else 'text-gray-800 dark:text-gray-200' }} mt-1">{{ todo.suggestion }}</p>

@@ -16,6 +16,8 @@ document.addEventListener('DOMContentLoaded', async () => {
     const btnMidpoint = getEl('btn-midpoint');
     // Alan 5/11/26 - Track the viewer-only deselect control separately from persistent selection-set actions.
     const btnDeselect = getEl('btn-deselect');
+    // Alan 5/13/26 - Cache the Alignment Viewer launcher so its count stays synced to tree state.
+    const btnAlignmentViewer = getEl('btn-alignment-viewer');
     const btnRecompute = getEl('btn-recompute');
     const btnMakeCopy = getEl('btn-make-copy');
     // Alan 5/12/26 - Cache clear-color control for selected tips.
@@ -1100,6 +1102,31 @@ document.addEventListener('DOMContentLoaded', async () => {
             });
         });
 
+        // Alan 5/13/26 - Open the full-screen Alignment Viewer for selected/visible tree tips.
+        if (btnAlignmentViewer) btnAlignmentViewer.addEventListener('click', () => {
+            if (!viewer || typeof viewer.getVisibleTipOrder !== 'function') {
+                showStatus("Alignment is not available yet.", "warning", 2500);
+                return;
+            }
+            const visible = viewer.getVisibleTipOrder();
+            const selected = typeof viewer.getSelectedTipNames === 'function' ? viewer.getSelectedTipNames() : [];
+            if (visible.length === 0 && selected.length === 0) {
+                showStatus("No visible sequences to display in the Alignment Viewer.", "warning", 2500);
+                return;
+            }
+            if (!window.DikaryaAlignmentViewer || typeof window.DikaryaAlignmentViewer.open !== 'function') {
+                showStatus("Alignment Viewer is not available on this page.", "danger", 3000);
+                return;
+            }
+            // Alan 5/13/26 - Expose the viewer instance so the alignment viewer can read tree state during refresh.
+            window.dikaryaViewer = viewer;
+            window.DikaryaAlignmentViewer.open({
+                jobId: JOB_ID,
+                treeOrder: visible,
+                selectedNames: selected,
+            });
+        });
+
 
 
         document.addEventListener('keydown', (e) => {
@@ -1258,6 +1285,32 @@ document.addEventListener('DOMContentLoaded', async () => {
         if (btnRecompute) btnRecompute.disabled = false;
         // Alan 5/12/26 - Enable clear color only when there is a temporary current selection.
         if (btnUncolorSelection) btnUncolorSelection.disabled = selCount === 0;
+        // Alan 5/13/26 - Keep the Alignment Viewer count and disabled state in sync with the tree.
+        updateAlignmentViewerButton();
+    }
+
+    // Alan 5/13/26 - Refresh the Alignment Viewer button label/state based on the current tree.
+    function updateAlignmentViewerButton() {
+        if (!btnAlignmentViewer) return;
+        if (!viewer || typeof viewer.getVisibleTipOrder !== 'function') {
+            btnAlignmentViewer.disabled = true;
+            btnAlignmentViewer.classList.add('opacity-50', 'cursor-not-allowed');
+            btnAlignmentViewer.innerHTML = '<i class="fa fa-stream"></i> Alignment Viewer';
+            return;
+        }
+        const visible = viewer.getVisibleTipOrder();
+        const selected = typeof viewer.getSelectedTipNames === 'function' ? viewer.getSelectedTipNames() : [];
+        const count = selected.length > 0 ? selected.length : visible.length;
+        const disabled = count === 0;
+        btnAlignmentViewer.disabled = disabled;
+        btnAlignmentViewer.classList.toggle('opacity-50', disabled);
+        btnAlignmentViewer.classList.toggle('cursor-not-allowed', disabled);
+        btnAlignmentViewer.title = selected.length > 0
+            ? `Open Alignment Viewer for ${selected.length} selected sequence${selected.length === 1 ? '' : 's'}`
+            : `Open Alignment Viewer for ${visible.length} visible sequence${visible.length === 1 ? '' : 's'}`;
+        btnAlignmentViewer.innerHTML = count > 0
+            ? `<i class="fa fa-stream"></i> Alignment Viewer (${count})`
+            : '<i class="fa fa-stream"></i> Alignment Viewer';
     }
 
     function updateMidpointButton() {

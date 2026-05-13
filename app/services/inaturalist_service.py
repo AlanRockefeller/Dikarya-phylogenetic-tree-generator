@@ -49,6 +49,12 @@ def validate_inaturalist_url(url: str) -> Optional[Dict[str, Any]]:
         return None
     
     url = url.strip()
+    if re.fullmatch(r'\d{7,9}', url):
+        logger.info(f"Validated bare iNaturalist observation ID: {url}")
+        return {
+            'type': 'single_observation',
+            'observation_id': url
+        }
     
     # Must be from inaturalist.org domain (strict check)
     # Matches: inaturalist.org, www.inaturalist.org
@@ -525,8 +531,8 @@ def fetch_inaturalist_data(url: str, mode: str = 'all') -> Dict:
     url_info = validate_inaturalist_url(url)
     if not url_info:
         raise ValueError(
-            "Invalid iNaturalist URL. Please enter a valid observation URL "
-            "(e.g., https://www.inaturalist.org/observations/12345) or "
+            "Invalid iNaturalist input. Please enter a 7 to 9 digit observation ID, "
+            "a valid observation URL (e.g., https://www.inaturalist.org/observations/1234567), or "
             "observations search URL."
         )
     

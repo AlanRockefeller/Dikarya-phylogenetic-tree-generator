@@ -7,6 +7,7 @@
 <link rel="stylesheet" href="{{ url_for('static', filename='css/tree_viewer.css') }}?v=3">
 <link rel="stylesheet" href="{{ url_for('static', filename='css/phylotree.css') }}">
 <link rel="stylesheet" href="{{ url_for('static', filename='css/phylotree-menus.css') }}">
+<link rel="stylesheet" href="{{ url_for('static', filename='css/alignment_viewer.css') }}?v=1">
 {% endblock %}
 
 {% block content %}
@@ -421,6 +422,11 @@
                 id="btn-deselect">
                 <i class="fa fa-mouse-pointer"></i> Deselect
             </button>
+            <button type="button"
+                class="px-4 py-2 text-sm font-semibold rounded-lg bg-purple-600 hover:bg-purple-700 text-white transition-colors shadow-sm flex items-center gap-2 disabled:opacity-50 disabled:cursor-not-allowed"
+                id="btn-alignment-viewer" title="Open the Alignment Viewer for visible/selected tree sequences">
+                <i class="fa fa-stream"></i> Alignment Viewer
+            </button>
         </div>
     </div>
 
@@ -600,8 +606,17 @@
     </div>
 
     <div
-        class="mt-6 pt-4 border-t border-gray-200 dark:border-gray-700 flex justify-between items-center text-xs text-gray-500 dark:text-gray-400">
-        <span class="font-mono">Job ID: {{ job_id }}</span>
+        class="mt-6 pt-4 border-t border-gray-200 dark:border-gray-700 flex flex-col gap-3 text-xs text-gray-500 dark:text-gray-400">
+        <div class="min-w-0">
+            <span class="font-mono block">Job ID: {{ job_id }}</span>
+            {% if job_details.get('mycomap_blast_url') %}
+            <a href="{{ job_details.get('mycomap_blast_url') }}" target="_blank" rel="noopener noreferrer"
+                class="font-mono block mt-2 text-journal-gold hover:text-journal-gold-light underline underline-offset-2 break-all">
+                MycoMap BLAST results: {{ job_details.get('mycomap_blast_url') }}
+                <i class="fas fa-external-link-alt ml-1 text-xs"></i>
+            </a>
+            {% endif %}
+        </div>
         <span>© 2026 Dikarya Project. CC BY 4.0.</span>
     </div>
 </div>
@@ -630,7 +645,11 @@
 
 <script src="{{ url_for('static', filename='js/tree_viewer_api.js') }}"></script>
 
-<script src="{{ url_for('static', filename='js/tree_viewer_controller.js') }}?v=35"></script>
+<script src="{{ url_for('static', filename='js/tree_viewer_controller.js') }}?v=36"></script>
+
+{% include 'partials/alignment_viewer_modal.html' %}
+
+<script src="{{ url_for('static', filename='js/alignment_viewer.js') }}?v=2"></script>
 
 
 

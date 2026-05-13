@@ -372,6 +372,10 @@ def _parse_blast_metrics_table(rows: list) -> dict:
             'identity': identity,
             'query_cover': query_cover,
             'subject_cover': subject_cover,
+            'is_contaminant': any(
+                re.search(r'\bcontaminant\b', str(cell or ''), flags=re.IGNORECASE)
+                for cell in row
+            ),
         }
         metric.update(display_info)
         for key in metric_keys:
