@@ -3,16 +3,21 @@
  *
  * Loads aligned FASTA from the backend and renders an interactive, polished
  * alignment grid in a full-screen modal, driven by the current tree viewer
- * selection / visible tip order. Phase 1 implementation.
+ * selection / visible tip order.
  */
 (function () {
     'use strict';
 
-    // Alan 5/13/26 - Bail if the modal partial is not present (e.g., non-viewer page).
+    // Alan 5/12/26 - Bail if the modal partial is not present (e.g., non-viewer page).
     const modal = document.getElementById('modal-alignment-viewer');
     if (!modal) return;
 
-    // Alan 5/13/26 - Cache controls so callbacks don't repeatedly query the DOM.
+    // Alan 5/12/26 - Optional perf instrumentation for Highlight Differences toggling.
+    const DEBUG_ALIGNMENT_PERF = false;
+    // Alan 5/12/26 - Threshold above which we switch to the cheapest .is-diff styling.
+    const LARGE_GRID_CELLS = 50000;
+
+    // Alan 5/12/26 - Cache controls so callbacks don't repeatedly query the DOM.
     const $ = (id) => document.getElementById(id);
     const backdrop = $('alignment-viewer-backdrop');
     const closeBtn = $('alignment-viewer-close');
@@ -29,6 +34,8 @@
     const filterInp = $('alignment-filter');
     const diffsChk = $('alignment-highlight-diffs');
     const variableChk = $('alignment-variable-only');
+    // Alan 5/12/26 - Cache the new gap-compaction control (default ON).
+    const compactChk = $('alignment-compact-gaps');
     const copyBtn = $('alignment-copy-fasta');
     const downloadBtn = $('alignment-download-fasta');
 
@@ -38,10 +45,10 @@
     };
     const AMBIG = new Set(['N', 'R', 'Y', 'S', 'W', 'K', 'M', 'B', 'D', 'H', 'V']);
 
-    // Alan 5/13/26 - Persistent state for the currently open viewer session.
+    // Alan 5/12/26 - Persistent state for the currently open viewer session.
     const state = {
         jobId: null,
-        sequences: [],          // [{name, sequence}]
+        sequences: [],          // [{name, sequence}] (server order = tree order)
         allCount: 0,
         availablePruned: 0,
         includedPruned: 0,
@@ -55,9 +62,14 @@
         filterText: '',
         highlightDiffs: false,
         variableOnly: false,
-        consensus: '',
+        compactGaps: true,      // Alan 5/12/26 - Default-on gap compaction.
         displayedRows: [],      // sorted/filtered rows actually rendered
-        visibleColumns: null,   // null = all
+        visibleColumnIndexes: null, // null = all original columns
+        gapOnlyHidden: 0,       // count of gap-only columns hidden
+        consensus: '',          // consensus over displayedRows (full length)
+        // Alan 5/12/26 - Cache the row set fingerprint so we know when to recompute consensus/diffs.
+        _rowFingerprint: '',
+        _diffComputedFor: '',   // fingerprint last used for consensus/diff masks
     };
 
     function showStatusMsg(msg, type, timeout = 0) {
@@ -88,41 +100,55 @@
         warningsEl.textContent = state.warnings.join(' • ');
     }
 
-    function computeConsensus(rows) {
-        if (!rows.length) return '';
+    // Alan 5/12/26 - Treat both '-' and '.' as gap so dot-gap alignments compact too.
+    function isGap(ch) { return ch === '-' || ch === '.'; }
+
+    // Alan 5/12/26 - Build the list of original alignment indexes to render, applying compaction then variable-only.
+    function buildVisibleColumnIndexes(rows) {
         const len = state.alignmentLength;
-        const out = new Array(len);
+        const indexes = [];
+        let gapOnly = 0;
         for (let i = 0; i < len; i++) {
+            let hasNonGap = false;
+            let firstChar = null;
+            let varied = false;
+            for (let r = 0; r < rows.length; r++) {
+                const ch = rows[r].sequence[i] || '-';
+                if (!hasNonGap && !isGap(ch)) hasNonGap = true;
+                if (state.variableOnly) {
+                    const up = ch.toUpperCase();
+                    if (firstChar === null) firstChar = up;
+                    else if (up !== firstChar) varied = true;
+                }
+            }
+            if (state.compactGaps && !hasNonGap) { gapOnly++; continue; }
+            if (state.variableOnly && !varied) continue;
+            indexes.push(i);
+        }
+        state.gapOnlyHidden = gapOnly;
+        return indexes;
+    }
+
+    // Alan 5/12/26 - Compute consensus across displayed rows for the visible columns only.
+    function computeConsensus(rows, visibleIdx) {
+        if (!rows.length) return '';
+        const out = new Array(state.alignmentLength).fill('-');
+        for (let k = 0; k < visibleIdx.length; k++) {
+            const i = visibleIdx[k];
             const counts = {};
-            for (const r of rows) {
-                const c = (r.sequence[i] || '-').toUpperCase();
+            for (let r = 0; r < rows.length; r++) {
+                const c = (rows[r].sequence[i] || '-').toUpperCase();
                 if (c === '-' || c === '.' || c === 'N') continue;
                 counts[c] = (counts[c] || 0) + 1;
             }
             let best = '-';
             let bestN = 0;
-            for (const k in counts) {
-                if (counts[k] > bestN) { best = k; bestN = counts[k]; }
+            for (const k2 in counts) {
+                if (counts[k2] > bestN) { best = k2; bestN = counts[k2]; }
             }
             out[i] = best;
         }
         return out.join('');
-    }
-
-    function computeVariableColumns(rows) {
-        const len = state.alignmentLength;
-        const visible = new Uint8Array(len);
-        for (let i = 0; i < len; i++) {
-            let firstChar = null;
-            let varied = false;
-            for (const r of rows) {
-                const c = (r.sequence[i] || '-').toUpperCase();
-                if (firstChar === null) firstChar = c;
-                else if (c !== firstChar) { varied = true; break; }
-            }
-            visible[i] = varied ? 1 : 0;
-        }
-        return visible;
     }
 
     function percentIdentity(seqA, seqB) {
@@ -132,9 +158,7 @@
         for (let i = 0; i < len; i++) {
             const a = seqA.charCodeAt(i);
             const b = seqB.charCodeAt(i);
-            // Skip gaps in either sequence (45 = '-', 46 = '.')
             if (a === 45 || a === 46 || b === 45 || b === 46) continue;
-            // Skip N/ambiguous on either side when convenient (78 = 'N')
             const ac = String.fromCharCode(a).toUpperCase();
             const bc = String.fromCharCode(b).toUpperCase();
             if (ac === 'N' || bc === 'N') continue;
@@ -147,14 +171,13 @@
 
     function leadingGapCount(seq) {
         let i = 0;
-        while (i < seq.length && (seq[i] === '-' || seq[i] === '.')) i++;
+        while (i < seq.length && isGap(seq[i])) i++;
         return i;
     }
 
     function sortRows(rows) {
         const mode = state.sortMode;
         if (mode === 'tree') {
-            // Preserve the order provided by the server (which matches tree order).
             const indexMap = new Map(state.sequences.map((r, i) => [r, i]));
             return rows.slice().sort((a, b) => (indexMap.get(a) ?? 0) - (indexMap.get(b) ?? 0));
         }
@@ -175,7 +198,6 @@
             if (!ref) return rows.slice();
             const scored = rows.map(r => ({ row: r, score: r === ref ? 1 : percentIdentity(ref.sequence, r.sequence) }));
             scored.sort((a, b) => (mode === 'similar' ? b.score - a.score : a.score - b.score));
-            // Attach computed score for display
             for (const s of scored) s.row.__score = s.score;
             return scored.map(s => s.row);
         }
@@ -203,7 +225,6 @@
     }
 
     function pickInitialReference() {
-        // Default: exactly one selected sequence → use it; otherwise first displayed.
         if (state.selectedNames.length === 1) {
             state.referenceName = state.selectedNames[0];
         } else if (state.sequences.length) {
@@ -213,91 +234,107 @@
         }
     }
 
-    function buildRuler(length, visibleMask) {
+    function cellClass(ch, consensusCh) {
+        const up = ch.toUpperCase();
+        let cls = 'av-cell ';
+        cls += NUC_CLASS[up] || (AMBIG.has(up) ? 'av-amb' : 'av-amb');
+        if (consensusCh) {
+            const consUp = consensusCh.toUpperCase();
+            // Alan 5/12/26 - Distinguish "matches consensus" from "differs from consensus" so the root class can toggle styles cheaply.
+            if (up === consUp && up !== '-') cls += ' av-match';
+            else if (up !== consUp && !isGap(ch)) cls += ' is-diff';
+        }
+        return cls;
+    }
+
+    // Alan 5/12/26 - Build only the visible columns (compacted), letting toggles render orders of magnitude fewer cells.
+    function buildCellRow(seq, consensus, visibleIdx) {
         const frag = document.createDocumentFragment();
-        for (let i = 0; i < length; i++) {
+        for (let k = 0; k < visibleIdx.length; k++) {
+            const i = visibleIdx[k];
+            const ch = seq[i] || '-';
+            const span = document.createElement('span');
+            span.className = cellClass(ch, consensus ? consensus[i] : null);
+            span.textContent = ch;
+            frag.appendChild(span);
+        }
+        return frag;
+    }
+
+    // Alan 5/12/26 - Build ruler ticks only for visible columns; labels still show original alignment coordinates.
+    function buildRuler(visibleIdx) {
+        const frag = document.createDocumentFragment();
+        for (let k = 0; k < visibleIdx.length; k++) {
+            const i = visibleIdx[k];
+            const pos = i + 1;
             const span = document.createElement('span');
             span.className = 'av-ruler-tick';
-            const pos = i + 1;
             if (pos === 1 || pos % 10 === 0) {
                 span.classList.add('av-major');
                 span.textContent = String(pos);
             } else {
                 span.textContent = '';
             }
-            if (visibleMask && !visibleMask[i]) span.classList.add('av-hidden-col');
+            span.title = `Original alignment position ${pos}`;
             frag.appendChild(span);
         }
         return frag;
     }
 
-    function cellClass(ch, consensusCh) {
-        const up = ch.toUpperCase();
-        let cls = 'av-cell ';
-        cls += NUC_CLASS[up] || (AMBIG.has(up) ? 'av-amb' : 'av-amb');
-        if (consensusCh && up === consensusCh.toUpperCase() && up !== '-') cls += ' av-match';
-        return cls;
+    // Alan 5/12/26 - Stable fingerprint identifying the displayed row set plus column-affecting toggles.
+    function rowSetFingerprint(rows) {
+        return rows.map(r => r.name).join('')
+            + '|cg=' + (state.compactGaps ? 1 : 0)
+            + '|vo=' + (state.variableOnly ? 1 : 0)
+            + '|ip=' + (state.includePruned ? 1 : 0);
     }
 
-    function buildCellRow(seq, consensus, visibleMask) {
-        const frag = document.createDocumentFragment();
-        for (let i = 0; i < seq.length; i++) {
-            const ch = seq[i] || '-';
-            const span = document.createElement('span');
-            span.className = cellClass(ch, consensus ? consensus[i] : null);
-            span.textContent = ch;
-            if (visibleMask && !visibleMask[i]) span.classList.add('av-hidden-col');
-            frag.appendChild(span);
-        }
-        return frag;
-    }
-
-    function renderGrid() {
+    function renderAlignmentGrid() {
         gridEl.innerHTML = '';
-        bodyEl.classList.toggle('av-highlight-diffs', state.highlightDiffs);
         emptyEl.classList.add('hidden');
 
         let rows = state.sequences.slice();
         const filter = (state.filterText || '').trim().toLowerCase();
         if (filter) rows = rows.filter(r => r.name.toLowerCase().includes(filter));
 
-        // Score handling: clear stale scores before sort
         for (const r of rows) r.__score = undefined;
         rows = sortRows(rows);
         state.displayedRows = rows;
 
         if (rows.length === 0) {
+            state.visibleColumnIndexes = [];
+            state.gapOnlyHidden = 0;
+            state.consensus = '';
             emptyEl.textContent = 'No sequences match the current filter.';
             emptyEl.classList.remove('hidden');
             updateStats();
             return;
         }
 
-        const consensus = computeConsensus(rows);
-        state.consensus = consensus;
-
-        let visibleMask = null;
-        if (state.variableOnly) {
-            visibleMask = computeVariableColumns(rows);
+        // Alan 5/12/26 - Recompute visible columns + consensus only when the row set or column toggles change.
+        const fp = rowSetFingerprint(rows);
+        if (fp !== state._diffComputedFor) {
+            state.visibleColumnIndexes = buildVisibleColumnIndexes(rows);
+            state.consensus = computeConsensus(rows, state.visibleColumnIndexes);
+            state._diffComputedFor = fp;
         }
-        state.visibleColumns = visibleMask;
+        const visibleIdx = state.visibleColumnIndexes;
+        const consensus = state.consensus;
 
-        // Build DOM: 2 columns (names | cells) × 2 rows (ruler/header | content)
         // Header corner + ruler
         const corner = document.createElement('div');
         corner.className = 'av-names-header';
-        corner.textContent = `${rows.length} sequences × ${state.alignmentLength} bp`;
+        corner.textContent = `${rows.length} sequences · ${visibleIdx.length}/${state.alignmentLength} cols`;
         gridEl.appendChild(corner);
 
         const ruler = document.createElement('div');
         ruler.className = 'av-ruler';
         const rulerInner = document.createElement('div');
         rulerInner.style.whiteSpace = 'nowrap';
-        rulerInner.appendChild(buildRuler(state.alignmentLength, visibleMask));
+        rulerInner.appendChild(buildRuler(visibleIdx));
         ruler.appendChild(rulerInner);
         gridEl.appendChild(ruler);
 
-        // Names column (with consensus row pinned at top)
         const namesCol = document.createElement('div');
         namesCol.className = 'av-names';
         const cellsCol = document.createElement('div');
@@ -314,10 +351,9 @@
 
         const consCellRow = document.createElement('div');
         consCellRow.className = 'av-cell-row av-consensus-row';
-        consCellRow.appendChild(buildCellRow(consensus, null, visibleMask));
+        consCellRow.appendChild(buildCellRow(consensus, null, visibleIdx));
         cellsCol.appendChild(consCellRow);
 
-        // Sync vertical scroll between names and cells.
         cellsCol.addEventListener('scroll', () => {
             namesCol.scrollTop = cellsCol.scrollTop;
             ruler.scrollLeft = cellsCol.scrollLeft;
@@ -325,6 +361,9 @@
 
         const showScores = state.sortMode === 'similar' || state.sortMode === 'different';
 
+        // Alan 5/12/26 - Batch all rows into one fragment so the browser does a single layout pass.
+        const namesFrag = document.createDocumentFragment();
+        const cellsFrag = document.createDocumentFragment();
         for (const row of rows) {
             const nameRow = document.createElement('div');
             nameRow.className = 'av-name-row';
@@ -339,25 +378,51 @@
                 score.textContent = (row.__score * 100).toFixed(1) + '%';
                 nameRow.appendChild(score);
             }
-            namesCol.appendChild(nameRow);
+            namesFrag.appendChild(nameRow);
 
             const cellRow = document.createElement('div');
             cellRow.className = 'av-cell-row';
-            cellRow.appendChild(buildCellRow(row.sequence, consensus, visibleMask));
-            cellsCol.appendChild(cellRow);
+            cellRow.appendChild(buildCellRow(row.sequence, consensus, visibleIdx));
+            cellsFrag.appendChild(cellRow);
         }
+        namesCol.appendChild(namesFrag);
+        cellsCol.appendChild(cellsFrag);
 
         gridEl.appendChild(namesCol);
         gridEl.appendChild(cellsCol);
 
+        // Alan 5/12/26 - Apply the highlight state via the root class only — never per-cell on toggle.
+        bodyEl.classList.toggle('alignment-highlight-differences', state.highlightDiffs);
+        // Alan 5/12/26 - Mark big grids so CSS can drop to the cheapest .is-diff styling.
+        const cellCount = rows.length * visibleIdx.length;
+        bodyEl.classList.toggle('alignment-large-grid', cellCount > LARGE_GRID_CELLS);
+        if (DEBUG_ALIGNMENT_PERF) {
+            console.log(`[alignment-viewer] rendered cells=${cellCount} rows=${rows.length} cols=${visibleIdx.length}`);
+        }
+
         updateStats();
+    }
+
+    // Alan 5/12/26 - Toggle differences purely via a root class. No DOM rebuild, no per-cell touches.
+    function setHighlightDifferences(enabled) {
+        // Alan 5/12/26 - Guarded timing so we can confirm the toggle itself is cheap.
+        const t0 = DEBUG_ALIGNMENT_PERF ? performance.now() : 0;
+        state.highlightDiffs = !!enabled;
+        bodyEl.classList.toggle('alignment-highlight-differences', state.highlightDiffs);
+        if (DEBUG_ALIGNMENT_PERF) {
+            console.log(`[alignment-viewer] setHighlightDifferences(${enabled}) took ${(performance.now() - t0).toFixed(2)}ms`);
+        }
     }
 
     function updateStats() {
         if (!statsEl) return;
         const shown = state.displayedRows.length;
         const total = state.sequences.length;
-        let txt = `${shown}/${total} sequences · ${state.alignmentLength} bp`;
+        const visibleCols = state.visibleColumnIndexes ? state.visibleColumnIndexes.length : state.alignmentLength;
+        let txt = `${shown}/${total} sequences · ${visibleCols}/${state.alignmentLength} columns`;
+        if (state.compactGaps && state.gapOnlyHidden > 0) {
+            txt += ` · ${state.gapOnlyHidden} gap-only columns hidden`;
+        }
         if (state.includedPruned > 0) {
             txt += ` · ${state.includedPruned} pruned included`;
         }
@@ -376,7 +441,6 @@
     }
 
     async function fetchAlignment() {
-        const viewer = window.dikaryaViewer;
         const treeOrder = state.treeOrder;
         const tipNames = state.selectedNames.length ? state.selectedNames : [];
 
@@ -388,7 +452,6 @@
         };
 
         const headers = { 'Content-Type': 'application/json' };
-        // Alan 5/13/26 - Send the CSRF token directly so the POST isn't rejected by Flask-WTF.
         const csrfToken = document.querySelector('meta[name="csrf-token"]')?.getAttribute('content');
         if (csrfToken) headers['X-CSRFToken'] = csrfToken;
 
@@ -414,10 +477,12 @@
             state.includedPruned = data.included_pruned_count || 0;
             state.alignmentLength = data.alignment_length || (state.sequences[0]?.sequence.length || 0);
             state.warnings = data.warnings || [];
+            // Alan 5/12/26 - Force recompute of consensus/diff masks when row set or include-pruned changes.
+            state._diffComputedFor = '';
             renderWarnings();
             pickInitialReference();
             populateReferenceSelector();
-            renderGrid();
+            renderAlignmentGrid();
         } catch (e) {
             console.error('Alignment Viewer failed:', e);
             showStatusMsg(`Alignment Viewer failed: ${e.message}`, 'danger', 4000);
@@ -437,14 +502,19 @@
         state.filterText = '';
         state.highlightDiffs = false;
         state.variableOnly = false;
+        // Alan 5/12/26 - Reset gap compaction to default-on on every open.
+        state.compactGaps = true;
         state.referenceName = null;
+        state._diffComputedFor = '';
 
-        // Reset controls
         if (sortSel) sortSel.value = 'tree';
         if (filterInp) filterInp.value = '';
         if (diffsChk) diffsChk.checked = false;
         if (variableChk) variableChk.checked = false;
+        if (compactChk) compactChk.checked = true;
         if (includeChk) includeChk.checked = false;
+        // Alan 5/12/26 - Clear the highlight class so reopening doesn't carry over the previous state.
+        bodyEl.classList.remove('alignment-highlight-differences');
 
         statsEl.textContent = 'Loading alignment…';
         warningsEl.classList.add('hidden');
@@ -454,23 +524,40 @@
         await refresh();
     }
 
+    // Alan 5/12/26 - FASTA export uses the currently displayed rows; if compacted, uses compacted columns.
+    function exportFastaText() {
+        const rows = state.displayedRows;
+        const idx = state.visibleColumnIndexes;
+        const useCompact = state.compactGaps || state.variableOnly;
+        const lines = [];
+        for (const r of rows) {
+            const safeHeader = (r.name || 'sequence').replace(/[\r\n]/g, ' ');
+            lines.push(`>${safeHeader}`);
+            if (useCompact && idx && idx.length !== state.alignmentLength) {
+                let out = '';
+                for (let k = 0; k < idx.length; k++) out += (r.sequence[idx[k]] || '-');
+                lines.push(out);
+            } else {
+                lines.push(r.sequence);
+            }
+        }
+        return { text: lines.join('\n') + '\n', compact: useCompact && idx && idx.length !== state.alignmentLength };
+    }
+
     function downloadFasta() {
         const rows = state.displayedRows;
         if (!rows || rows.length === 0) {
             showStatusMsg('No sequences to download.', 'warning', 2500);
             return;
         }
-        const lines = [];
-        for (const r of rows) {
-            const safeHeader = (r.name || 'sequence').replace(/[\r\n]/g, ' ');
-            lines.push(`>${safeHeader}`);
-            lines.push(r.sequence);
-        }
-        const blob = new Blob([lines.join('\n') + '\n'], { type: 'text/plain' });
+        const { text, compact } = exportFastaText();
+        const blob = new Blob([text], { type: 'text/plain' });
         const url = URL.createObjectURL(blob);
         const a = document.createElement('a');
         a.href = url;
-        a.download = `alignment_view_${state.jobId || 'job'}.fasta`;
+        // Alan 5/12/26 - Suffix the filename so users can tell compacted exports apart from full ones.
+        const suffix = compact ? '_compact' : '';
+        a.download = `alignment_view_${state.jobId || 'job'}${suffix}.fasta`;
         document.body.appendChild(a);
         a.click();
         document.body.removeChild(a);
@@ -483,10 +570,11 @@
             showStatusMsg('No sequences to copy.', 'warning', 2500);
             return;
         }
-        const text = rows.map(r => `>${(r.name || '').replace(/[\r\n]/g, ' ')}\n${r.sequence}`).join('\n') + '\n';
+        const { text, compact } = exportFastaText();
         try {
             await navigator.clipboard.writeText(text);
-            showStatusMsg(`Copied ${rows.length} sequence${rows.length === 1 ? '' : 's'} as FASTA.`, 'success', 2000);
+            const note = compact ? ' (compacted columns)' : '';
+            showStatusMsg(`Copied ${rows.length} sequence${rows.length === 1 ? '' : 's'} as FASTA${note}.`, 'success', 2000);
         } catch (e) {
             showStatusMsg('Copy failed: ' + e.message, 'danger', 3000);
         }
@@ -504,27 +592,34 @@
         refresh();
     });
     sortSel.addEventListener('change', () => {
+        // Alan 5/12/26 - Sorting only re-orders the same row set, so we can skip consensus/diff recompute.
         state.sortMode = sortSel.value;
         populateReferenceSelector();
-        renderGrid();
+        renderAlignmentGrid();
     });
     refSel.addEventListener('change', () => {
         state.referenceName = refSel.value;
-        renderGrid();
+        renderAlignmentGrid();
     });
     let filterDeb = null;
     filterInp.addEventListener('input', () => {
         state.filterText = filterInp.value;
         clearTimeout(filterDeb);
-        filterDeb = setTimeout(renderGrid, 80);
+        // Alan 5/12/26 - Filter changes the displayed row set, so let the fingerprint trigger recompute.
+        filterDeb = setTimeout(renderAlignmentGrid, 80);
     });
     diffsChk.addEventListener('change', () => {
-        state.highlightDiffs = diffsChk.checked;
-        bodyEl.classList.toggle('av-highlight-diffs', state.highlightDiffs);
+        // Alan 5/12/26 - Highlight Differences toggle now only flips a root class — no rebuild, no recompute.
+        setHighlightDifferences(diffsChk.checked);
     });
     variableChk.addEventListener('change', () => {
         state.variableOnly = variableChk.checked;
-        renderGrid();
+        renderAlignmentGrid();
+    });
+    if (compactChk) compactChk.addEventListener('change', () => {
+        // Alan 5/12/26 - Toggle gap-only compaction and rebuild the visible columns.
+        state.compactGaps = compactChk.checked;
+        renderAlignmentGrid();
     });
     copyBtn.addEventListener('click', copyFasta);
     downloadBtn.addEventListener('click', downloadFasta);
@@ -533,5 +628,6 @@
     window.DikaryaAlignmentViewer = {
         open,
         close: closeModal,
+        setHighlightDifferences,
     };
 })();

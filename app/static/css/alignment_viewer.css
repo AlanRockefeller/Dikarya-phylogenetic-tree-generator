@@ -141,25 +141,64 @@
     color: #f3f4f6;
 }
 
-.alignment-viewer .av-cell.av-a { background: #d1fae5; }
-.alignment-viewer .av-cell.av-c { background: #bfdbfe; }
-.alignment-viewer .av-cell.av-g { background: #fde68a; }
-.alignment-viewer .av-cell.av-t { background: #fecaca; }
-.alignment-viewer .av-cell.av-u { background: #fecaca; }
+/* Calmer base palette so `.is-diff` cells can pop against it. */
+.alignment-viewer .av-cell.av-a { background: #ecfdf5; color: #1f2937; }
+.alignment-viewer .av-cell.av-c { background: #eff6ff; color: #1f2937; }
+.alignment-viewer .av-cell.av-g { background: #fffbeb; color: #1f2937; }
+.alignment-viewer .av-cell.av-t { background: #fef2f2; color: #1f2937; }
+.alignment-viewer .av-cell.av-u { background: #fef2f2; color: #1f2937; }
 .alignment-viewer .av-cell.av-gap { background: transparent; color: #9ca3af; }
-.alignment-viewer .av-cell.av-amb { background: #e5e7eb; color: #4b5563; }
+.alignment-viewer .av-cell.av-amb { background: #f3f4f6; color: #4b5563; }
 
-.dark .alignment-viewer .av-cell.av-a { background: #064e3b; color: #d1fae5; }
-.dark .alignment-viewer .av-cell.av-c { background: #1e3a8a; color: #dbeafe; }
-.dark .alignment-viewer .av-cell.av-g { background: #78350f; color: #fde68a; }
-.dark .alignment-viewer .av-cell.av-t { background: #7f1d1d; color: #fecaca; }
-.dark .alignment-viewer .av-cell.av-u { background: #7f1d1d; color: #fecaca; }
+.dark .alignment-viewer .av-cell.av-a { background: #0f2a22; color: #a7f3d0; }
+.dark .alignment-viewer .av-cell.av-c { background: #16223b; color: #bfdbfe; }
+.dark .alignment-viewer .av-cell.av-g { background: #2a200f; color: #fcd34d; }
+.dark .alignment-viewer .av-cell.av-t { background: #2a1212; color: #fecaca; }
+.dark .alignment-viewer .av-cell.av-u { background: #2a1212; color: #fecaca; }
 .dark .alignment-viewer .av-cell.av-gap { background: transparent; color: #4b5563; }
-.dark .alignment-viewer .av-cell.av-amb { background: #1f2937; color: #9ca3af; }
+.dark .alignment-viewer .av-cell.av-amb { background: #161f1d; color: #9ca3af; }
 
-/* Difference highlighting — dim cells that match consensus */
-.alignment-viewer.av-highlight-diffs .av-cell.av-match {
-    opacity: 0.18;
+/* Difference highlighting.
+   Only `.is-diff` cells (a minority) get touched when the root class flips,
+   so style/paint cost stays proportional to differences, not to total cells.
+   Avoid opacity/filter/box-shadow/transitions on `.av-match` — those force
+   the browser to restyle/recomposite most of the grid on toggle. */
+.alignment-viewer .av-cell.av-match { /* default: no special style */ }
+.alignment-viewer .av-cell.is-diff { /* default: no special style */ }
+
+.alignment-viewer.alignment-highlight-differences .av-cell.is-diff {
+    background: #d97706;
+    color: #1f2937;
+    font-weight: 800;
+    box-shadow: inset 0 0 0 1px #92400e;
+}
+.dark .alignment-viewer.alignment-highlight-differences .av-cell.is-diff {
+    background: #f59e0b;
+    color: #111827;
+    font-weight: 800;
+    box-shadow: inset 0 0 0 1px #b45309;
+}
+
+/* Match dimming is only safe on small/medium grids. Skipped in large-grid mode. */
+.alignment-viewer.alignment-highlight-differences:not(.alignment-large-grid) .av-cell.av-match {
+    color: #9ca3af;
+}
+.dark .alignment-viewer.alignment-highlight-differences:not(.alignment-large-grid) .av-cell.av-match {
+    color: #6b7280;
+}
+
+/* Large-grid fallback: cheapest possible diff style — no inset shadow, no bold. */
+.alignment-viewer.alignment-highlight-differences.alignment-large-grid .av-cell.is-diff {
+    background: #f59e0b;
+    color: #111827;
+    box-shadow: none;
+    font-weight: 700;
+}
+.dark .alignment-viewer.alignment-highlight-differences.alignment-large-grid .av-cell.is-diff {
+    background: #b45309;
+    color: #fde68a;
+    box-shadow: none;
+    font-weight: 700;
 }
 
 .alignment-viewer .av-ruler-tick {
