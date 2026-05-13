@@ -268,6 +268,7 @@ def prune_taxa(job_dir: Path, tree_json: Dict, taxa_names: List[str]) -> Dict:
         valid_path = job_dir / "tree"
         valid_path.mkdir(parents=True, exist_ok=True)
         Phylo.write(tree, str(valid_path / "tree_pruned.newick"), "newick")
+        Phylo.write(tree, str(valid_path / "tree_pruned.nexus"), "nexus")
         
         # Update JSON structure to match
         new_structure = _clade_to_json(tree.root)
@@ -539,7 +540,18 @@ def extract_pruned_fasta(original_fasta: Path, tree_json: Dict, output_fasta: Pa
     Write a new FASTA file containing only sequences corresponding to non-pruned tips.
     Use original_name to map FASTA headers.
     """
-    pruned_taxa = set(tree_json.get("pruned_taxa", []))
+    def clean_label(label) -> Optional[str]:
+        if label is None:
+            return None
+        cleaned = str(label).strip()
+        return cleaned or None
+
+    pruned_taxa = {
+        cleaned
+        for name in tree_json.get("pruned_taxa", [])
+        for cleaned in [clean_label(name)]
+        if cleaned
+    }
     
     if not HAS_BIOPYTHON:
         raise RuntimeError("BioPython required for FASTA manipulation")
@@ -547,7 +559,13 @@ def extract_pruned_fasta(original_fasta: Path, tree_json: Dict, output_fasta: Pa
     sequences = []
     with open(original_fasta, "r") as f:
         for record in SeqIO.parse(f, "fasta"):
-            if record.id not in pruned_taxa:
+            record_labels = {
+                cleaned
+                for label in (record.id, record.name, record.description)
+                for cleaned in [clean_label(label)]
+                if cleaned
+            }
+            if record_labels.isdisjoint(pruned_taxa):
                 sequences.append(record)
                 
     with open(output_fasta, "w") as f:

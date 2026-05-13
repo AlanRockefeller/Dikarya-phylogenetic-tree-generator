@@ -461,6 +461,9 @@ def gather_mycomap_sequences_for_queue(url, include_ncbi=True, include_local=Tru
     )
     from app.services.fasta_utils import clean_dna_sequence
 
+    contaminant_re = re.compile(r'contamin(?:a|e)nt', flags=re.IGNORECASE)
+    lowquality_re = re.compile(r'low\s*quality|lowquality', flags=re.IGNORECASE)
+
     def is_contaminant_sequence(seq, metric=None):
         if metric and metric.get('is_contaminant'):
             return True
@@ -468,10 +471,10 @@ def gather_mycomap_sequences_for_queue(url, include_ncbi=True, include_local=Tru
             seq.get('name', ''),
             seq.get('_mycomap_original_name', ''),
         )
-        return any(re.search(r'\bcontaminant\b', str(label or ''), flags=re.IGNORECASE) for label in labels)
+        return any(contaminant_re.search(str(label or '')) for label in labels)
 
     def remove_lowquality_label(name):
-        cleaned = re.sub(r'\bLOWQUALITY\b', '', str(name or ''))
+        cleaned = lowquality_re.sub('', str(name or ''))
         return re.sub(r'\s+', ' ', cleaned).strip(' ,;:-_')
 
     blast_id = validate_mycomap_url(url)

@@ -247,6 +247,7 @@ def _parse_blast_metrics_table(rows: list) -> dict:
     if not rows:
         return {}
 
+    contaminant_re = re.compile(r'contamin(?:a|e)nt', flags=re.IGNORECASE)
     header_idx = None
     header = []
     for i, row in enumerate(rows[:10]):
@@ -373,7 +374,7 @@ def _parse_blast_metrics_table(rows: list) -> dict:
             'query_cover': query_cover,
             'subject_cover': subject_cover,
             'is_contaminant': any(
-                re.search(r'\bcontaminant\b', str(cell or ''), flags=re.IGNORECASE)
+                contaminant_re.search(str(cell or ''))
                 for cell in row
             ),
         }

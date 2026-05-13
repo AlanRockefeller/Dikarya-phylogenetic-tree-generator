@@ -264,6 +264,8 @@ def _maybe_add_inat_its_sequence(observation: Dict[str, Any], observation_id: in
     if not its_norm:
         return None, None
     for s in sequences:
+        if _CONTAMINANT_LABEL_RE.search(str(s.get("name") or "")):
+            continue
         if _normalize_dna_for_match(s.get("sequence") or "") == its_norm:
             # Rename the matching tip so the iNaturalist observation # is
             # visible directly in the tree label. The first token (usually
@@ -454,6 +456,7 @@ def create_job_from_inat_observation(raw_input: str, user=None,
 # ---------------------------------------------------------------------------
 
 _INAT_TIP_TOKEN_RE_TMPL = r"(?<![A-Za-z0-9]){tok}(?![0-9])"
+_CONTAMINANT_LABEL_RE = re.compile(r"contamin(?:a|e)nt", re.IGNORECASE)
 
 
 def _iter_tree_tip_names(node):
@@ -482,10 +485,18 @@ def _find_source_observation_tip(tree_structure: Dict[str, Any], observation_id:
         return None
     tok = f"iNat{int(observation_id)}"
     pat = re.compile(_INAT_TIP_TOKEN_RE_TMPL.format(tok=re.escape(tok)), re.IGNORECASE)
-    for name in _iter_tree_tip_names(tree_structure):
-        if pat.search(name):
-            return name
-    return None
+    matches = [name for name in _iter_tree_tip_names(tree_structure) if pat.search(name)]
+    if not matches:
+        return None
+    exact_token = tok.casefold()
+
+    def score(name: str) -> Tuple[int, int]:
+        first = name.split()[0].casefold() if name.split() else ""
+        contaminant_penalty = 1 if _CONTAMINANT_LABEL_RE.search(name) else 0
+        exact_first_token_penalty = 0 if first == exact_token else 1
+        return contaminant_penalty, exact_first_token_penalty
+
+    return sorted(matches, key=score)[0]
 
 
 def highlight_source_observation_tip(job_id: str, observation_id: int,
@@ -513,10 +524,6 @@ def highlight_source_observation_tip(job_id: str, observation_id: int,
         all_tip_names = list(_iter_tree_tip_names(state["tree_structure"]))
         targets: List[str] = []
 
-        pattern_tip = _find_source_observation_tip(state["tree_structure"], observation_id)
-        if pattern_tip:
-            targets.append(pattern_tip)
-
         for raw in (extra_tip_names or []):
             if not raw:
                 continue
@@ -533,6 +540,10 @@ def highlight_source_observation_tip(job_id: str, observation_id: int,
                         if tn not in targets:
                             targets.append(tn)
                         break
+
+        pattern_tip = _find_source_observation_tip(state["tree_structure"], observation_id)
+        if pattern_tip and pattern_tip not in targets:
+            targets.append(pattern_tip)
 
         if not targets:
             return []

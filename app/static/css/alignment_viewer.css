@@ -171,62 +171,78 @@
     color: #f3f4f6;
 }
 
-/* Calmer base palette so `.is-diff` cells can pop against it. */
-.alignment-viewer .av-cell.av-a { background: #ecfdf5; color: #1f2937; }
-.alignment-viewer .av-cell.av-c { background: #eff6ff; color: #1f2937; }
-.alignment-viewer .av-cell.av-g { background: #fffbeb; color: #1f2937; }
-.alignment-viewer .av-cell.av-t { background: #fef2f2; color: #1f2937; }
-.alignment-viewer .av-cell.av-u { background: #fef2f2; color: #1f2937; }
-.alignment-viewer .av-cell.av-gap { background: transparent; color: #9ca3af; }
-.alignment-viewer .av-cell.av-amb { background: #f3f4f6; color: #4b5563; }
+/* Base nucleotide palette.
+   Muted on purpose so dense alignments are easy on the eyes and `.is-diff`
+   highlights can dominate without competing against saturated base colors.
+   Dark mode is the primary target; light mode mirrors the same hierarchy. */
+.alignment-viewer .av-cell.av-a { background: #edf7f1; color: #1f2937; }
+.alignment-viewer .av-cell.av-c { background: #eef3fa; color: #1f2937; }
+.alignment-viewer .av-cell.av-g { background: #f7f3e8; color: #3f3a2a; }
+.alignment-viewer .av-cell.av-t { background: #f8eeec; color: #1f2937; }
+.alignment-viewer .av-cell.av-u { background: #f8eeec; color: #1f2937; }
+.alignment-viewer .av-cell.av-gap { background: transparent; color: #c7cdd3; }
+.alignment-viewer .av-cell.av-amb { background: #f1f3f5; color: #6b7280; }
 
-.dark .alignment-viewer .av-cell.av-a { background: #0f2a22; color: #a7f3d0; }
-.dark .alignment-viewer .av-cell.av-c { background: #16223b; color: #bfdbfe; }
-.dark .alignment-viewer .av-cell.av-g { background: #2a200f; color: #fcd34d; }
-.dark .alignment-viewer .av-cell.av-t { background: #2a1212; color: #fecaca; }
-.dark .alignment-viewer .av-cell.av-u { background: #2a1212; color: #fecaca; }
-.dark .alignment-viewer .av-cell.av-gap { background: transparent; color: #4b5563; }
-.dark .alignment-viewer .av-cell.av-amb { background: #161f1d; color: #9ca3af; }
+.dark .alignment-viewer .av-cell.av-a { background: #112a25; color: #95d3b8; }
+.dark .alignment-viewer .av-cell.av-c { background: #14233a; color: #a7c0e6; }
+.dark .alignment-viewer .av-cell.av-g { background: #2a2410; color: #d8c277; }
+.dark .alignment-viewer .av-cell.av-t { background: #2a1818; color: #e4a8a8; }
+.dark .alignment-viewer .av-cell.av-u { background: #2a1818; color: #e4a8a8; }
+.dark .alignment-viewer .av-cell.av-gap { background: transparent; color: #2f3a37; }
+.dark .alignment-viewer .av-cell.av-amb { background: #161f1d; color: #7c8a86; }
 
-/* Difference highlighting.
-   Only `.is-diff` cells (a minority) get touched when the root class flips,
-   so style/paint cost stays proportional to differences, not to total cells.
-   Avoid opacity/filter/box-shadow/transitions on `.av-match` — those force
-   the browser to restyle/recomposite most of the grid on toggle. */
+/* Highlight Differences architecture:
+   - The root class `alignment-highlight-differences` flips highlight on/off.
+   - Only `.is-diff` cells (the minority) get styled in either mode, so paint
+     cost is bounded by the number of differences, not by total cells.
+   - `alignment-large-grid` (set from the LIVE rendered cell count) avoids
+     box-shadow / font-weight changes that re-reshape text or composite many
+     cells. Small/medium windows can afford the richer treatment with match
+     dimming + an inset border on differences.
+   - Never use opacity/filter/transition/animation on most cells. */
+
 .alignment-viewer .av-cell.av-match { /* default: no special style */ }
 .alignment-viewer .av-cell.is-diff { /* default: no special style */ }
 
-/* Small/medium grid: richer highlight with bold + inset border on .is-diff cells. */
+/* Small/medium live window: rich highlight.
+   Warm amber background with a subtle inset border so individual diffs read
+   crisply. Match cells fade their TEXT only (no background change) so the
+   row structure / base palette stays visible without washing out the grid. */
 .alignment-viewer.alignment-highlight-differences:not(.alignment-large-grid) .av-cell.is-diff {
-    background: #d97706;
-    color: #1f2937;
+    background: #f0b34a;
+    color: #1f1306;
     font-weight: 800;
-    box-shadow: inset 0 0 0 1px #92400e;
+    box-shadow: inset 0 0 0 1px rgba(120, 60, 6, 0.55);
 }
 .dark .alignment-viewer.alignment-highlight-differences:not(.alignment-large-grid) .av-cell.is-diff {
-    background: #f59e0b;
-    color: #111827;
+    background: #e8a23b;
+    color: #1a1208;
     font-weight: 800;
-    box-shadow: inset 0 0 0 1px #b45309;
+    box-shadow: inset 0 0 0 1px rgba(254, 215, 170, 0.45);
 }
 
-/* Match dimming is only safe on small/medium grids. Skipped in large-grid mode. */
-.alignment-viewer.alignment-highlight-differences:not(.alignment-large-grid) .av-cell.av-match {
-    color: #9ca3af;
+/* Match dimming is text-color only and stays active in BOTH small/medium and
+   large live windows — virtualization keeps the rendered set bounded, so this
+   no longer risks the old full-grid restyle freeze. Keeping it unconditional
+   prevents the dimming from flickering on/off when scrolling crosses the
+   LARGE_LIVE_CELLS threshold. */
+.alignment-viewer.alignment-highlight-differences .av-cell.av-match {
+    color: #b6bcc4;
 }
-.dark .alignment-viewer.alignment-highlight-differences:not(.alignment-large-grid) .av-cell.av-match {
-    color: #6b7280;
+.dark .alignment-viewer.alignment-highlight-differences .av-cell.av-match {
+    color: #58615f;
 }
 
-/* Large-window mode: cheapest possible .is-diff style — only background + text color.
-   No box-shadow (expensive on many cells), no font-weight changes (forces text reshape). */
+/* Large live window: cheapest possible highlight.
+   Background + text color only on `.is-diff`. No box-shadow (expensive on
+   many cells), no font-weight (forces text reshape), no match dimming. */
 .alignment-viewer.alignment-highlight-differences.alignment-large-grid .av-cell.is-diff {
-    background: #f59e0b;
-    color: #111827;
+    background: #e8a93a;
+    color: #1a1208;
 }
 .dark .alignment-viewer.alignment-highlight-differences.alignment-large-grid .av-cell.is-diff {
-    background: #b45309;
-    color: #fde68a;
+    background: #c9892a;
+    color: #1a1208;
 }
 
 .alignment-viewer .av-ruler-tick {
