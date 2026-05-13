@@ -10,6 +10,7 @@ from collections import deque
 from datetime import datetime
 
 WHATS_NEW_EDITOR_EMAIL = "alaner@gmail.com"
+TODO_ADMIN_DEFAULT_EMAILS = {"alaner@gmail.com", "mycology@dikarya.llc"}
 
 
 def can_edit_whats_new():
@@ -22,6 +23,71 @@ def can_edit_whats_new():
 def require_whats_new_editor():
     if not can_edit_whats_new():
         abort(404)
+
+
+def is_todo_admin():
+    if not current_user.is_authenticated:
+        return False
+    email = (getattr(current_user, "email", "") or "").strip().lower()
+    raw_admins = os.environ.get("TODO_ADMIN_EMAILS")
+    if raw_admins:
+        admin_emails = {
+            item.strip().lower()
+            for item in raw_admins.split(",")
+            if item.strip()
+        }
+    else:
+        admin_emails = TODO_ADMIN_DEFAULT_EMAILS
+    return email in admin_emails
+
+
+def _sanitize_todo_input(name, suggestion):
+    name = (name or "").strip()[:60]
+    suggestion = (suggestion or "").strip()[:1000]
+
+    # Preserve the original public todo character allowlist.
+    name = re.sub(r'[^a-zA-Z0-9 ./,:!?\'\-áéíóúüÁÉÍÓÚÜñÑ]', '', name)
+    suggestion = re.sub(r'[^a-zA-Z0-9 ./,:!?\'\-áéíóúüÁÉÍÓÚÜñÑ]', '', suggestion)
+
+    name = re.sub(r'\s+', ' ', name).strip()[:60]
+    suggestion = re.sub(r'\s+', ' ', suggestion).strip()[:1000]
+    return name, suggestion
+
+
+def _import_legacy_todos_if_needed():
+    from app.models import TodoSuggestion
+
+    if TodoSuggestion.query.first():
+        return
+
+    todo_file = os.path.join(current_app.root_path, 'static', 'todos.txt')
+    if not os.path.exists(todo_file):
+        return
+
+    legacy_entries = []
+    try:
+        with open(todo_file, 'r', encoding='utf-8', errors='replace') as f:
+            legacy_lines = list(deque((line.strip() for line in f), maxlen=200))
+    except OSError:
+        return
+
+    for line in legacy_lines:
+        if not line:
+            continue
+        if ': ' in line:
+            raw_name, raw_suggestion = line.split(': ', 1)
+        elif ':' in line:
+            raw_name, raw_suggestion = line.split(':', 1)
+        else:
+            raw_name, raw_suggestion = "Anonymous", line
+        name, suggestion = _sanitize_todo_input(raw_name or "Anonymous", raw_suggestion)
+        if not suggestion:
+            continue
+        legacy_entries.append(TodoSuggestion(name=name or "Anonymous", suggestion=suggestion))
+
+    if legacy_entries:
+        db.session.add_all(legacy_entries)
+        db.session.commit()
 
 
 @bp.route('/tree')
@@ -182,67 +248,148 @@ def test_phylotree():
     return render_template("test_phylotree.html")
 
 
+# ---------------------------------------------------------------------------
+# iNaturalist OAuth (site-wide authorized account). Restricted to admin
+# emails because there is only one site-wide token. Tokens are stored
+# server-side and never echoed back; only generic status is returned.
+# ---------------------------------------------------------------------------
+
+INAT_OAUTH_ADMIN_EMAILS = {"mycology@dikarya.llc", "alaner@gmail.com"}
+
+
+def _require_inat_oauth_admin():
+    """Return None if the current user is an iNat OAuth admin, else abort(404).
+
+    404 (not 403) so unauthorized callers cannot tell whether the route
+    exists.
+    """
+    if not current_user.is_authenticated:
+        abort(404)
+    email = (getattr(current_user, "email", "") or "").strip().lower()
+    admins = set(current_app.config.get("INAT_OAUTH_ADMIN_EMAILS")
+                 or INAT_OAUTH_ADMIN_EMAILS)
+    if email not in admins:
+        abort(404)
+
+
+@bp.route("/tree/oauth/connect")
+def inat_oauth_connect():
+    from flask import session, redirect as _redirect
+    from app.services.inaturalist_oauth_service import (
+        InatAuthError, authorize_url, new_oauth_state,
+    )
+    _require_inat_oauth_admin()
+    try:
+        state = new_oauth_state()
+        session["inat_oauth_state"] = state
+        return _redirect(authorize_url(state))
+    except InatAuthError as e:
+        flash(f"iNaturalist OAuth not configured: {e}", "error")
+        return _redirect(url_for("main.sequence_entry"))
+
+
+@bp.route("/tree/oauth/callback")
+def inat_oauth_callback():
+    from flask import session, redirect as _redirect
+    from app.services.inaturalist_oauth_service import (
+        InatAuthError, exchange_code_for_token,
+    )
+    _require_inat_oauth_admin()
+    expected_state = session.pop("inat_oauth_state", None)
+    state = request.args.get("state")
+    code = request.args.get("code")
+    if not expected_state or not state or state != expected_state:
+        flash("OAuth state mismatch — please retry.", "error")
+        return _redirect(url_for("main.sequence_entry"))
+    if not code:
+        flash(
+            "iNaturalist did not return an authorization code.",
+            "error",
+        )
+        return _redirect(url_for("main.sequence_entry"))
+    try:
+        exchange_code_for_token(code)
+    except InatAuthError as e:
+        flash(f"iNaturalist authorization failed: {e}", "error")
+        return _redirect(url_for("main.sequence_entry"))
+    flash(
+        "iNaturalist authorization succeeded. The site can now post "
+        "Phylogenetic Tree links back to observations.",
+        "success",
+    )
+    return _redirect(url_for("main.sequence_entry"))
+
+
+@bp.route("/tree/oauth/status")
+def inat_oauth_status():
+    from flask import jsonify as _jsonify
+    from app.services.inaturalist_oauth_service import is_authorized
+    _require_inat_oauth_admin()
+    return _jsonify({"authorized": bool(is_authorized())})
+
+
 @bp.route('/todo', methods=['GET', 'POST'])
 @csrf.exempt
 @limiter.limit("10 per minute")
 def todo():
-    todo_file = os.path.join(current_app.root_path, 'static', 'todos.txt')
-    MAX_FILE_SIZE = 5 * 1024 * 1024  # 5 MB
+    from app.models import TodoSuggestion
     
     if request.method == 'POST':
-        # Ensure static directory exists only on POST
-        os.makedirs(os.path.dirname(todo_file), exist_ok=True)
-        
         name = request.form.get('name', '')
         suggestion = request.form.get('suggestion', '')
-
-        # Trim leading/trailing whitespace
-        name = name.strip()
-        suggestion = suggestion.strip()
-
-        # Input caps BEFORE sanitizing
-        name = name[:60]
-        suggestion = suggestion[:1000]
-
-        # Sanitize input: allow only alphanumeric, spaces, and some punctuation, including Spanish characters, /, and :
-        name = re.sub(r'[^a-zA-Z0-9 ./,:!?\'\-áéíóúüÁÉÍÓÚÜñÑ]', '', name)
-        suggestion = re.sub(r'[^a-zA-Z0-9 ./,:!?\'\-áéíóúüÁÉÍÓÚÜñÑ]', '', suggestion)
-
-        # Collapse repeated whitespace inside the string to single spaces
-        name = re.sub(r'\s+', ' ', name)
-        suggestion = re.sub(r'\s+', ' ', suggestion)
-        
-        # Trim again
-        name = name.strip()
-        suggestion = suggestion.strip()
-
-        # Re-apply final caps
-        name = name[:60]
-        suggestion = suggestion[:1000]
+        name, suggestion = _sanitize_todo_input(name, suggestion)
 
         # Only append if both are non-empty after sanitization
         if name and suggestion:
-            try:
-                # File-size cap (5 MB)
-                if os.path.exists(todo_file) and os.path.getsize(todo_file) > MAX_FILE_SIZE:
-                    # Fail closed: don't append if file is too large
-                    pass
-                else:
-                    with open(todo_file, 'a', encoding='utf-8', newline='\n') as f:
-                        f.write(f'{name}: {suggestion}\n')
-            except OSError:
-                # Handle OSError safely (fail closed)
-                pass
+            db.session.add(TodoSuggestion(name=name, suggestion=suggestion, status='open'))
+            db.session.commit()
                 
         return redirect(url_for('main.todo'))
 
-    todos = []
-    if os.path.exists(todo_file):
-        try:
-            # Defense-in-depth: errors='replace' to avoid breaking on malformed byte sequences
-            with open(todo_file, 'r', encoding='utf-8', errors='replace') as f:
-                # Read only last 200 lines to optimize memory usage
-                todos = list(deque((line.strip() for line in f), maxlen=200))
-        except Exception:
-            pass
-    return render_template('todo.html', todos=todos)
+    _import_legacy_todos_if_needed()
+
+    todo_admin = is_todo_admin()
+    default_status_filter = 'open' if todo_admin else 'all'
+    status_filter = (request.args.get('status') or default_status_filter).strip().lower()
+    if status_filter not in {'open', 'done', 'all'}:
+        status_filter = default_status_filter
+
+    query = TodoSuggestion.query
+    if status_filter != 'all':
+        query = query.filter_by(status=status_filter)
+    todos = query.order_by(TodoSuggestion.created_at.desc(), TodoSuggestion.id.desc()).limit(200).all()
+    return render_template(
+        'todo.html',
+        todos=todos,
+        status_filter=status_filter,
+        is_todo_admin=todo_admin,
+    )
+
+
+@bp.route('/todo/<int:suggestion_id>/status', methods=['POST'])
+def todo_status(suggestion_id):
+    from app.models import TodoSuggestion
+
+    if not is_todo_admin():
+        abort(404)
+
+    next_status = (request.form.get('status') or '').strip().lower()
+    if next_status not in {'open', 'done'}:
+        abort(400)
+
+    suggestion = TodoSuggestion.query.get_or_404(suggestion_id)
+    now = datetime.utcnow()
+    suggestion.status = next_status
+    suggestion.updated_at = now
+    if next_status == 'done':
+        suggestion.completed_at = now
+        suggestion.completed_by_id = current_user.id
+    else:
+        suggestion.completed_at = None
+        suggestion.completed_by_id = None
+    db.session.commit()
+
+    return_status = (request.form.get('return_status') or 'open').strip().lower()
+    if return_status not in {'open', 'done', 'all'}:
+        return_status = 'open'
+    return redirect(url_for('main.todo', status=return_status))

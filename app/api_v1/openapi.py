@@ -604,6 +604,46 @@ def build_spec():
                     },
                 }
             },
+            "/tools/inaturalist-tree": {
+                "post": {
+                    "tags": ["Tools"],
+                    "summary": "Build a tree from a single iNaturalist observation",
+                    "description": (
+                        "Reads the observation's `Mycomap BLAST Results` "
+                        "observation field, builds a one-click Dikarya tree "
+                        "from that URL, and when the job completes writes a "
+                        "`Phylogenetic Tree` field back to the observation "
+                        "with the public tree viewer URL. The write uses "
+                        "the site-wide authorized iNaturalist account."
+                    ),
+                    "security": [{"bearerAuth": ["jobs:write"]}],
+                    "requestBody": {
+                        "required": True,
+                        "content": {"application/json": {"schema": {
+                            "type": "object",
+                            "required": ["observation"],
+                            "properties": {
+                                "observation": {
+                                    "type": "string",
+                                    "maxLength": 300,
+                                    "description": (
+                                        "Either a numeric observation ID "
+                                        "(e.g. `360934883`) or a single-"
+                                        "observation URL "
+                                        "(`https://www.inaturalist.org/observations/<id>`). "
+                                        "Search URLs and multiple IDs are rejected."
+                                    ),
+                                    "example": "360934883",
+                                }
+                            },
+                        }}},
+                    },
+                    "responses": {
+                        "202": {"description": "Job queued; iNaturalist field will be updated when the tree completes."},
+                        **{k: v for k, v in COMMON_ERRORS.items() if k in ("400", "401", "403", "422", "429", "500")},
+                    },
+                }
+            },
             "/tools/genbank": {
                 "post": {
                     "tags": ["Tools"],

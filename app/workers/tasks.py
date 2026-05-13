@@ -803,7 +803,77 @@ def run_phylo_job(job_params: dict) -> dict:
                 db_job.metrics = metrics
                 db_job.status = "completed"
                 db.session.commit()
-            
+
+            # iNaturalist post-completion hook: if this job came from the
+            # /api/inaturalist/tree flow, write the public tree URL back to
+            # the source observation. Failures here MUST NOT fail the job.
+            try:
+                if db_job and (db_job.metrics or {}).get("via") == "inat_phylogenetic_tree":
+                    from sqlalchemy.orm.attributes import flag_modified
+                    from app.services.inaturalist_tree_service import (
+                        highlight_source_observation_tip,
+                        post_completed_tree_to_inaturalist,
+                    )
+                    # Highlight the source observation's tip(s) in the tree
+                    # viewer's default (blue) selection set before posting.
+                    try:
+                        _m = db_job.metrics or {}
+                        extras = []
+                        if _m.get("inat_matched_its_tip"):
+                            extras.append(_m["inat_matched_its_tip"])
+                        highlighted_tip = highlight_source_observation_tip(
+                            job_id,
+                            int(_m.get("inat_observation_id") or 0),
+                            extra_tip_names=extras,
+                        )
+                    except Exception:
+                        highlighted_tip = None
+                    inat_result = post_completed_tree_to_inaturalist(
+                        job_id, db_job.metrics or {}
+                    )
+                    # Build a fresh dict so SQLAlchemy reliably persists the
+                    # change. The JSON column is not wrapped in MutableDict,
+                    # so in-place mutation of the existing dict is not
+                    # detected as dirty.
+                    metrics = dict(db_job.metrics or {})
+                    metrics["inat_update_status"] = inat_result.get("status", "failed")
+                    metrics["inat_updated_at"] = datetime.now(timezone.utc).isoformat()
+                    if inat_result.get("inat_tree_url"):
+                        metrics["inat_tree_url"] = inat_result["inat_tree_url"]
+                    if inat_result.get("inat_observation_field_value_id"):
+                        metrics["inat_observation_field_value_id"] = (
+                            inat_result["inat_observation_field_value_id"]
+                        )
+                    if inat_result.get("error"):
+                        metrics["inat_update_error"] = inat_result["error"][:300]
+                    if highlighted_tip:
+                        # highlight_source_observation_tip returns a list of names.
+                        if isinstance(highlighted_tip, list):
+                            metrics["inat_highlighted_tips"] = [
+                                str(t)[:300] for t in highlighted_tip
+                            ]
+                        else:
+                            metrics["inat_highlighted_tips"] = [str(highlighted_tip)[:300]]
+                    db_job.metrics = metrics
+                    flag_modified(db_job, "metrics")
+                    db.session.commit()
+                    if inat_result.get("status") == "success":
+                        publish_overview(
+                            job_id,
+                            "Posted Phylogenetic Tree link to iNaturalist observation."
+                        )
+                    else:
+                        publish_overview(
+                            job_id,
+                            "Tree built; iNaturalist update did not succeed "
+                            "(tree is still available)."
+                        )
+            except Exception as _inat_err:
+                logger.warning(
+                    "iNat post-completion hook failed for job %s: %s",
+                    job_id, type(_inat_err).__name__,
+                )
+
             # Publish completion
             publish_job_completed(
                 job_id,

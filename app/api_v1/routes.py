@@ -1109,3 +1109,55 @@ def tools_genbank():
         })
     except Exception as e:
         return server_error(e, where="tools_genbank")
+
+
+def _inat_tree_v1_rate_key():
+    """Token-id-bucketed key, with admin token-owners getting an exempt bucket."""
+    token = getattr(g, "api_token", None)
+    user = getattr(g, "api_user", None)
+    if user and (user.email or "").strip().lower() in Config.INAT_OAUTH_ADMIN_EMAILS:
+        return f"admin:{user.id}"
+    if token is not None:
+        return f"token:{token.id}"
+    return api_token_key_func()
+
+
+def _inat_tree_v1_rate_limit():
+    user = getattr(g, "api_user", None)
+    if user and (user.email or "").strip().lower() in Config.INAT_OAUTH_ADMIN_EMAILS:
+        return "10000 per minute"
+    return "10 per 5 minutes"
+
+
+@bp.route('/tools/inaturalist-tree', methods=['POST'])
+@require_api_token(scope='jobs:write')
+@limiter.limit(_inat_tree_v1_rate_limit, key_func=_inat_tree_v1_rate_key)
+@idempotent
+def tools_inaturalist_tree():
+    """Build a Dikarya tree from a single iNaturalist observation.
+
+    Body: { "observation": "<id or single-observation URL>" }
+    Requires scope ``jobs:write`` (the call creates a tree job and later
+    writes back to the iNaturalist observation field).
+    """
+    from app.services.inaturalist_tree_service import (
+        InatTreeError, create_job_from_inat_observation,
+    )
+    body = request.get_json(silent=True) or {}
+    raw = body.get("observation") or body.get("url") or ""
+    try:
+        result = create_job_from_inat_observation(raw, user=g.api_user)
+        # Tag metrics with the originating API token id for traceability.
+        job = Job.query.get(result["job_id"])
+        if job is not None:
+            m = job.metrics or {}
+            m["api_token_id"] = g.api_token.id
+            job.metrics = m
+            db.session.commit()
+        return ok(result, status=202)
+    except InatTreeError as e:
+        code = "validation_failed" if e.status in (400, 422) else "upstream_error"
+        return error_response(code=code, message=str(e), status=e.status)
+    except Exception as e:
+        db.session.rollback()
+        return server_error(e, where="tools_inaturalist_tree")

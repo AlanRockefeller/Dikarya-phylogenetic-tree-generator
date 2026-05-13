@@ -435,16 +435,147 @@ def fetch_genbank_accessions():
         return _server_error(e)
 
 
+def gather_mycomap_sequences_for_queue(url, include_ncbi=True, include_local=True):
+    """Reusable helper for fetching MycoMap BLAST result sequences.
+
+    Returns a tuple ``(payload, error_response)`` where ``payload`` is the
+    dict normally returned by /api/mycomap on success (sequences,
+    ncbi_count, local_count, blast_metrics_count, message) and
+    ``error_response`` is a ``(json_dict, http_status)`` tuple on failure.
+    Exactly one of the two will be non-None.
+    """
+    if not url:
+        return None, ({"status": "error", "error": "No URL provided"}, 400)
+    if not include_ncbi and not include_local:
+        return None, ({
+            "status": "error",
+            "error": "Select at least one result type (NCBI or Local)",
+        }, 400)
+
+    from app.services.mycomap_service import (
+        build_blast_metric_keys,
+        fetch_mycomap_blast_metrics,
+        fetch_mycomap_fasta,
+        improve_mycomap_sequence_name,
+        validate_mycomap_url,
+    )
+    from app.services.fasta_utils import clean_dna_sequence
+
+    blast_id = validate_mycomap_url(url)
+    if not blast_id:
+        return None, ({
+            "status": "error",
+            "error": "Invalid Mycomap URL. URL must be from mycomap.com and contain a result ID (e.g., r12345)",
+        }, 400)
+
+    logger.info(f"Mycomap helper: blast_id={blast_id} (ncbi={include_ncbi}, local={include_local})")
+    result = fetch_mycomap_fasta(blast_id, include_ncbi, include_local)
+
+    if result['errors'] and not result['fasta_content']:
+        return None, ({"status": "error", "error": "; ".join(result['errors'])}, 502)
+
+    sequences = _parse_fasta_sequences(result['fasta_content'])
+    for seq in sequences:
+        seq['_mycomap_original_name'] = seq.get('name', '')
+
+    ncbi_count = result['ncbi_count']
+    for i, seq in enumerate(sequences):
+        seq['source'] = 'mycomap'
+        if include_ncbi and include_local:
+            seq['hit_source'] = 'ncbi' if i < ncbi_count else 'local'
+        elif include_ncbi:
+            seq['hit_source'] = 'ncbi'
+        else:
+            seq['hit_source'] = 'local'
+
+    from app.services.blast_service import fetch_fasta_for_accessions
+    accessions_to_enrich = []
+    for seq in sequences:
+        parts = seq['name'].split()
+        if len(parts) == 1 and _is_genbank_accession(parts[0].split('.')[0]):
+            accessions_to_enrich.append(parts[0].split('.')[0])
+
+    if accessions_to_enrich:
+        enriched_fasta = fetch_fasta_for_accessions(accessions_to_enrich)
+        if enriched_fasta:
+            enriched_seqs = _parse_fasta_sequences(enriched_fasta)
+            enriched_map = {s['name'].split()[0].split('.')[0]: s for s in enriched_seqs if s['name'].strip()}
+            for seq in sequences:
+                parts = seq['name'].split()
+                if len(parts) == 1:
+                    base_acc = parts[0].split('.')[0]
+                    if base_acc in enriched_map:
+                        seq['name'] = enriched_map[base_acc]['name']
+                        seq['sequence'] = enriched_map[base_acc]['sequence']
+
+    original_count = len(sequences)
+    for seq in sequences:
+        seq['sequence'] = clean_dna_sequence(seq['sequence'])
+    sequences = [s for s in sequences if s['sequence']]
+    dropped_count = original_count - len(sequences)
+
+    metrics_by_key = fetch_mycomap_blast_metrics(blast_id, source_url=url)
+    metrics_attached_count = 0
+    for seq in sequences:
+        metric = None
+        lookup_names = [seq.get('name', ''), seq.get('_mycomap_original_name', '')]
+        for lookup_name in lookup_names:
+            for key in build_blast_metric_keys(lookup_name):
+                metric = metrics_by_key.get(key)
+                if metric:
+                    break
+            if metric:
+                break
+        if metric:
+            seq['name'] = improve_mycomap_sequence_name(
+                seq.get('name', ''), metric, seq.get('hit_source', ''),
+            )
+            seq['identity'] = metric.get('identity')
+            seq['query_cover'] = metric.get('query_cover')
+            seq['subject_cover'] = metric.get('subject_cover')
+            seq['blast_metrics_available'] = any(
+                seq[field] is not None for field in ('identity', 'query_cover', 'subject_cover')
+            )
+            if seq['blast_metrics_available']:
+                metrics_attached_count += 1
+        else:
+            seq['identity'] = None
+            seq['query_cover'] = None
+            seq['subject_cover'] = None
+            seq['blast_metrics_available'] = False
+        seq.pop('_mycomap_original_name', None)
+
+    parts = []
+    if include_ncbi:
+        parts.append(f"{result['ncbi_count']} NCBI")
+    if include_local:
+        parts.append(f"{result['local_count']} local")
+    msg = f"Fetched {' + '.join(parts)} sequences from Mycomap"
+    if dropped_count > 0:
+        msg += f" ({dropped_count} dropped due to invalid/short sequences)"
+    if result['errors']:
+        msg += f" (warnings: {'; '.join(result['errors'])})"
+
+    return {
+        "status": "success",
+        "sequences": sequences,
+        "ncbi_count": result['ncbi_count'],
+        "local_count": result['local_count'],
+        "blast_metrics_count": metrics_attached_count,
+        "message": msg,
+    }, None
+
+
 @bp.route('/mycomap', methods=['POST'])
 @limiter.limit("10 per minute; 200 per hour")
 def fetch_mycomap():
     """
     Fetch sequences from a Mycomap BLAST results URL.
-    
-    Request: { 
-        "url": "<mycomap URL>", 
+
+    Request: {
+        "url": "<mycomap URL>",
         "include_ncbi": true,
-        "include_local": true 
+        "include_local": true
     }
     Response: { "status": "success", "sequences": [...], "message": "..." }
     """
@@ -452,161 +583,61 @@ def fetch_mycomap():
     url = data.get('url', '').strip()
     include_ncbi = data.get('include_ncbi', True)
     include_local = data.get('include_local', True)
-    
-    if not url:
-        return jsonify({"status": "error", "error": "No URL provided"}), 400
-    
-    # Validate at least one checkbox is selected
-    if not include_ncbi and not include_local:
-        return jsonify({
-            "status": "error", 
-            "error": "Select at least one result type (NCBI or Local)"
-        }), 400
-    
+
     try:
-        from app.services.mycomap_service import (
-            build_blast_metric_keys,
-            fetch_mycomap_blast_metrics,
-            fetch_mycomap_fasta,
-            improve_mycomap_sequence_name,
-            validate_mycomap_url,
-        )
-        from app.services.fasta_utils import clean_dna_sequence
-        
-        # Validate and extract blast_id
-        blast_id = validate_mycomap_url(url)
-        if not blast_id:
-            return jsonify({
-                "status": "error",
-                "error": "Invalid Mycomap URL. URL must be from mycomap.com and contain a result ID (e.g., r12345)"
-            }), 400
-        
-        logger.info(f"Mycomap API: Fetching sequences for blast_id={blast_id} (ncbi={include_ncbi}, local={include_local})")
-        
-        # Fetch FASTA from Mycomap
-        result = fetch_mycomap_fasta(blast_id, include_ncbi, include_local)
-        
-        # Check for errors
-        if result['errors'] and not result['fasta_content']:
-            return jsonify({
-                "status": "error",
-                "error": "; ".join(result['errors'])
-            }), 502
-        
-        # Parse FASTA into sequences
-        sequences = _parse_fasta_sequences(result['fasta_content'])
-        for seq in sequences:
-            seq['_mycomap_original_name'] = seq.get('name', '')
-
-        # Tag hit_source based on position (NCBI sequences come first in combined FASTA)
-        ncbi_count = result['ncbi_count']
-        for i, seq in enumerate(sequences):
-            seq['source'] = 'mycomap'
-            if include_ncbi and include_local:
-                seq['hit_source'] = 'ncbi' if i < ncbi_count else 'local'
-            elif include_ncbi:
-                seq['hit_source'] = 'ncbi'
-            else:
-                seq['hit_source'] = 'local'
-
-        # Identify NCBI accessions that are missing meaningful descriptions
-        # (MyCoMap often returns NCBI records as just '>ACCESSION' without metadata)
-        from app.services.blast_service import fetch_fasta_for_accessions
-        
-        accessions_to_enrich = []
-        for seq in sequences:
-            # Check if name is a pure accession with no or few spaces
-            parts = seq['name'].split()
-            if len(parts) == 1 and _is_genbank_accession(parts[0].split('.')[0]):
-                accessions_to_enrich.append(parts[0].split('.')[0])
-                
-        if accessions_to_enrich:
-            logger.info(f"Mycomap API: Enriching {len(accessions_to_enrich)} sparse NCBI accessions...")
-            enriched_fasta = fetch_fasta_for_accessions(accessions_to_enrich)
-            if enriched_fasta:
-                enriched_seqs = _parse_fasta_sequences(enriched_fasta)
-                # Create a lookup table using the base accession (no version)
-                enriched_map = { s['name'].split()[0].split('.')[0]: s for s in enriched_seqs if s['name'].strip() }
-                
-                # Replace sparse Mycomap sequences with our highly-detailed XML headers and sequences
-                for seq in sequences:
-                    parts = seq['name'].split()
-                    if len(parts) == 1:
-                        base_acc = parts[0].split('.')[0]
-                        if base_acc in enriched_map:
-                            seq['name'] = enriched_map[base_acc]['name']
-                            seq['sequence'] = enriched_map[base_acc]['sequence']
-                            
-        # Apply cleaning to all sequences and filter out empty results
-        original_count = len(sequences)
-        for seq in sequences:
-            seq['sequence'] = clean_dna_sequence(seq['sequence'])
-        sequences = [s for s in sequences if s['sequence']]
-        dropped_count = original_count - len(sequences)
-
-        metrics_by_key = fetch_mycomap_blast_metrics(blast_id, source_url=url)
-        metrics_attached_count = 0
-        for seq in sequences:
-            metric = None
-            lookup_names = [seq.get('name', ''), seq.get('_mycomap_original_name', '')]
-            for lookup_name in lookup_names:
-                for key in build_blast_metric_keys(lookup_name):
-                    metric = metrics_by_key.get(key)
-                    if metric:
-                        break
-                if metric:
-                    break
-
-            if metric:
-                seq['name'] = improve_mycomap_sequence_name(
-                    seq.get('name', ''),
-                    metric,
-                    seq.get('hit_source', ''),
-                )
-                seq['identity'] = metric.get('identity')
-                seq['query_cover'] = metric.get('query_cover')
-                seq['subject_cover'] = metric.get('subject_cover')
-                seq['blast_metrics_available'] = any(
-                    seq[field] is not None
-                    for field in ('identity', 'query_cover', 'subject_cover')
-                )
-                if seq['blast_metrics_available']:
-                    metrics_attached_count += 1
-            else:
-                seq['identity'] = None
-                seq['query_cover'] = None
-                seq['subject_cover'] = None
-                seq['blast_metrics_available'] = False
-
-            seq.pop('_mycomap_original_name', None)
-
-        # Build success message
-        parts = []
-        if include_ncbi:
-            parts.append(f"{result['ncbi_count']} NCBI")
-        if include_local:
-            parts.append(f"{result['local_count']} local")
-        msg = f"Fetched {' + '.join(parts)} sequences from Mycomap"
-        
-        # Report dropped sequences due to cleaning
-        if dropped_count > 0:
-            msg += f" ({dropped_count} dropped due to invalid/short sequences)"
-        
-        # Include warnings if there were non-fatal errors
-        if result['errors']:
-            msg += f" (warnings: {'; '.join(result['errors'])})"
-        
-        return jsonify({
-            "status": "success",
-            "sequences": sequences,
-            "ncbi_count": result['ncbi_count'],
-            "local_count": result['local_count'],
-            "blast_metrics_count": metrics_attached_count,
-            "message": msg
-        })
-        
+        payload, err = gather_mycomap_sequences_for_queue(url, include_ncbi, include_local)
+        if err is not None:
+            body, status = err
+            return jsonify(body), status
+        return jsonify(payload)
     except Exception as e:
         logger.error(f"Mycomap API error: {e}", exc_info=True)
+        return _server_error(e)
+
+
+def _inat_tree_rate_key():
+    """Rate-limit key for /api/inaturalist/tree.
+
+    Logged-in admin emails are exempt (the limit string handles that via a
+    short-circuit). Logged-in users get bucketed by user id; anonymous
+    callers fall back to remote IP.
+    """
+    from flask_limiter.util import get_remote_address
+    if current_user.is_authenticated:
+        return f"user:{current_user.id}"
+    return f"ip:{get_remote_address()}"
+
+
+def _inat_tree_rate_limit():
+    """Per-call rate string. Admin emails get an effectively unlimited bucket."""
+    if current_user.is_authenticated:
+        email = (current_user.email or "").strip().lower()
+        admins = Config.INAT_OAUTH_ADMIN_EMAILS
+        if email in admins:
+            return "10000 per minute"
+        return "10 per 5 minutes"
+    return "20 per hour"
+
+
+@bp.route('/inaturalist/tree', methods=['POST'])
+@limiter.limit(_inat_tree_rate_limit, key_func=_inat_tree_rate_key)
+def inaturalist_tree():
+    """Create a one-click Dikarya tree from a single iNaturalist observation.
+
+    Request: { "observation": "<id-or-single-observation-url>" }
+    """
+    from app.services.inaturalist_tree_service import (
+        InatTreeError, create_job_from_inat_observation,
+    )
+    data = request.get_json(silent=True) or {}
+    raw = data.get('observation') or data.get('url') or ''
+    try:
+        result = create_job_from_inat_observation(raw, user=current_user)
+        return jsonify(result), 202
+    except InatTreeError as e:
+        return jsonify({"status": "error", "error": str(e)}), e.status
+    except Exception as e:
+        logger.error("iNaturalist tree endpoint error: %s", e, exc_info=True)
         return _server_error(e)
 
 

@@ -82,6 +82,23 @@ class WhatsNewView(db.Model):
     user = db.relationship('User', backref=db.backref('whats_new_view', uselist=False))
 
 
+class TodoSuggestion(db.Model):
+    __tablename__ = 'todo_suggestion'
+    __table_args__ = (
+        db.CheckConstraint("status in ('open', 'done')", name='ck_todo_suggestion_status'),
+    )
+    id = db.Column(db.Integer, primary_key=True)
+    name = db.Column(db.String(60), nullable=False)
+    suggestion = db.Column(db.Text, nullable=False)
+    status = db.Column(db.String(16), nullable=False, default='open', index=True)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow, nullable=False)
+    updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
+    completed_at = db.Column(db.DateTime, nullable=True)
+    completed_by_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=True)
+
+    completed_by = db.relationship('User', backref=db.backref('completed_todo_suggestions', lazy=True))
+
+
 @dataclass
 class AlignmentParams:
     method: str  # "mafft", "muscle", "clustalo", "iqtree_builtin", "default"

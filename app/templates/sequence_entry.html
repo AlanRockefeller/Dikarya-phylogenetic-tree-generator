@@ -494,6 +494,75 @@
             flex-direction: column;
         }
     }
+
+    /* Light-mode overrides for the Tree Builder page.
+       The redesigned dark-green theme lives in :root and in hardcoded
+       hex values above; when the global `.dark` class on <html> is
+       absent, we re-scope those variables and override the hardcoded
+       card/input backgrounds so the page reads as light. */
+    html:not(.dark) .tree-builder-page {
+        --bg: #f8f6f0;
+        --panel: #ffffff;
+        --line: #d8cfb6;
+        --line-gold: #c9a962;
+        --text: #1a2f23;
+        --text-dim: #4a5a52;
+        --text-mute: #7a8a82;
+        --gold-soft: #8a6f2e;
+    }
+
+    html:not(.dark) .tree-builder-page .tree-card,
+    html:not(.dark) .tree-builder-page .queue-card,
+    html:not(.dark) .tree-builder-page .tree-modal,
+    html:not(.dark) .tree-modal {
+        background: linear-gradient(180deg, #ffffff 0%, #f3eedf 100%);
+        box-shadow:
+            inset 0 1px 0 rgba(255, 255, 255, .9),
+            inset 0 -1px 0 rgba(26, 47, 35, .06),
+            0 1px 2px rgba(26, 47, 35, .04);
+    }
+
+    html:not(.dark) .tree-builder-page .tree-card > h3 {
+        color: #1a2f23;
+    }
+
+    html:not(.dark) .tree-builder-page input[type="url"],
+    html:not(.dark) .tree-builder-page input[type="text"],
+    html:not(.dark) .tree-builder-page input[type="number"],
+    html:not(.dark) .tree-builder-page select,
+    html:not(.dark) .tree-builder-page .sequence-input-box {
+        background: #ffffff;
+    }
+
+    html:not(.dark) .tree-builder-page input::placeholder,
+    html:not(.dark) .tree-builder-page textarea::placeholder {
+        color: #9aa19a;
+    }
+
+    html:not(.dark) .tree-builder-page .sequence-input-toolbar {
+        border-bottom-color: rgba(53, 82, 69, .18);
+    }
+
+    html:not(.dark) .tree-builder-page .sequence-input-footer {
+        border-top-color: rgba(53, 82, 69, .18);
+    }
+
+    html:not(.dark) .tree-builder-page .upload-dropzone {
+        background: rgba(255, 255, 255, .7);
+    }
+
+    html:not(.dark) .tree-builder-page .queue-row:hover {
+        background: rgba(26, 47, 35, .04);
+    }
+
+    html:not(.dark) .tree-builder-page .queue-row.is-outgroup {
+        background: rgba(201, 169, 98, .12);
+    }
+
+    html:not(.dark) .tree-builder-page .metric-value {
+        background: rgba(201, 169, 98, .18);
+        color: #6f5824;
+    }
 </style>
 {% endblock %}
 
@@ -568,6 +637,14 @@
                         <!-- Add to Queue Button (multiple observations) -->
                         <button id="inaturalist_add_btn" class="hidden btn btn-outline-gold flex-1 min-w-[140px]">
                             <i class="fas fa-plus mr-2"></i> Add to Queue
+                        </button>
+
+                        <!-- iNat → MycoMap → One-Click Tree Button (single observation only) -->
+                        <button id="inaturalist_tree_btn"
+                                class="hidden btn btn-outline-gold flex-1 min-w-[180px]"
+                                title="Build a tree from this observation's Mycomap BLAST Results field and post the link back to iNaturalist when finished.">
+                            <i class="fas fa-tree mr-2"></i>
+                            Generate tree and add iNaturalist Phylogenetic Tree field
                         </button>
                     </div>
                 </div>
@@ -1917,6 +1994,8 @@
     const inaturalistSpeciesItems = document.getElementById('inaturalist_species_items');
     const inaturalistBlastBtn = document.getElementById('inaturalist_blast_btn');
     const inaturalistAddBtn = document.getElementById('inaturalist_add_btn');
+    // Alan 5/12/26 - Hook up the "Generate tree and add iNaturalist Phylogenetic Tree field" action.
+    const inaturalistTreeBtn = document.getElementById('inaturalist_tree_btn');
 
     function checkInatState() {
         // Simple check: contains inaturalist.org
@@ -1954,6 +2033,8 @@
         inaturalistSpeciesList.classList.add('hidden');
         inaturalistBlastBtn.classList.add('hidden');
         inaturalistAddBtn.classList.add('hidden');
+        // Alan 5/12/26 - Reset the iNat-tree action visibility on each analyze.
+        if (inaturalistTreeBtn) inaturalistTreeBtn.classList.add('hidden');
         inaturalistSummary.querySelector('p').textContent = '';
         inaturalistSpeciesItems.innerHTML = '';
         currentInaturalistResult = null;
@@ -2075,6 +2156,14 @@
             }
 
             // Show appropriate action buttons
+            // Alan 5/12/26 - For single-observation URLs, expose the new
+            // "Generate tree and add iNaturalist Phylogenetic Tree field"
+            // action whenever the URL looks like a single observation.
+            // The button reads the observation's `Mycomap BLAST Results`
+            // field server-side; it does not require an ITS sequence.
+            if (data.is_single && inaturalistTreeBtn) {
+                inaturalistTreeBtn.classList.remove('hidden');
+            }
             if (data.can_blast && data.sequence) {
                 inaturalistBlastBtn.classList.remove('hidden');
                 showStatus('Single observation found with DNA sequence. Click BLAST to find related sequences.', 'success');
@@ -2188,6 +2277,50 @@
         inaturalistAddBtn.disabled = false;
         inaturalistAddBtn.innerHTML = '<i class="fas fa-plus mr-2"></i> Add to Queue';
     });
+
+    // Alan 5/12/26 - One-click: build a tree from the observation's MycoMap
+    // BLAST Results field, then post the resulting tree URL back to
+    // iNaturalist when the job completes. Backed by /api/inaturalist/tree.
+    if (inaturalistTreeBtn) {
+        inaturalistTreeBtn.addEventListener('click', async () => {
+            if (!currentInaturalistUrl) {
+                showStatus('No iNaturalist observation selected.', 'error');
+                return;
+            }
+            inaturalistTreeBtn.disabled = true;
+            const origHtml = inaturalistTreeBtn.innerHTML;
+            inaturalistTreeBtn.innerHTML =
+                '<i class="fas fa-spinner fa-spin mr-2"></i> Building tree...';
+            showStatus('Reading MycoMap BLAST Results field and queueing tree job...', 'info');
+            try {
+                const csrfToken = document.querySelector('meta[name="csrf-token"]')
+                    .getAttribute('content');
+                const resp = await fetch('/api/inaturalist/tree', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                        'X-CSRFToken': csrfToken
+                    },
+                    body: JSON.stringify({ observation: currentInaturalistUrl })
+                });
+                const data = await resp.json();
+                if (!resp.ok) {
+                    throw new Error(data.error || data.message || 'Server error');
+                }
+                showStatus(
+                    data.message ||
+                    'Tree job queued. The Phylogenetic Tree iNaturalist field ' +
+                    'will be added when the job completes.',
+                    'success'
+                );
+                window.location.href = data.tree_status_url || ('/job/' + data.job_id);
+            } catch (e) {
+                showStatus('iNaturalist tree error: ' + e.message, 'error');
+                inaturalistTreeBtn.disabled = false;
+                inaturalistTreeBtn.innerHTML = origHtml;
+            }
+        });
+    }
 
     // =========================================================================
     // Toggle Advanced Panel

@@ -10909,6 +10909,41 @@
     return null;
   }
 
+  // Alan 5/13/26 - Keep source-record actions reusable so they can render before tree editing actions.
+  function appendRecordTargetMenu(menu_object, recordTarget) {
+    if (recordTarget.kind === "genbank") {
+      menu_object
+        .append("a")
+        .attr("class", "phylotree-menu-item dropdown-item")
+        .attr("tabindex", "-1")
+        .text("Open Sequence in GenBank")
+        .on("click", () => {
+          menu_object.style("display", "none");
+          window.open(recordTarget.urls.genbank, "_blank", "noopener,noreferrer");
+        });
+      menu_object
+        .append("a")
+        .attr("class", "phylotree-menu-item dropdown-item")
+        .attr("tabindex", "-1")
+        .text("Open sequence in Mycomap")
+        .on("click", () => {
+          menu_object.style("display", "none");
+          window.open(recordTarget.urls.mycomap, "_blank", "noopener,noreferrer");
+        });
+      return;
+    }
+
+    menu_object
+      .append("a")
+      .attr("class", "phylotree-menu-item dropdown-item")
+      .attr("tabindex", "-1")
+      .text(recordTarget.label)
+      .on("click", () => {
+        menu_object.style("display", "none");
+        window.open(recordTarget.urls.primary, "_blank", "noopener,noreferrer");
+      });
+  }
+
   function nodeDropdownMenu(node, container, phylotree, options, event) {
     let menu_object = select(container)
       .select("#" + d3_layout_phylotree_context_menu_id);
@@ -10936,6 +10971,13 @@
         !options["show-menu"]
       )
         return;
+      const recordTarget = isLeafNode(node) ? extractRecordTarget(node) : null;
+      // Alan 5/13/26 - Put external source-record links at the top of sequence context menus.
+      if (recordTarget) {
+        appendRecordTargetMenu(menu_object, recordTarget);
+        menu_object.append("div").attr("class", "phylotree-menu-divider dropdown-divider");
+      }
+
       if (!isLeafNode(node)) {
         if (options["collapsible"]) {
           menu_object
@@ -11072,53 +11114,6 @@
             });
         }
 
-        // Alan 5/12/26 - Add a source-link action for tip labels that carry a recognizable record ID.
-        if (isLeafNode(node)) {
-          const recordTarget = extractRecordTarget(node);
-          if (recordTarget) {
-            menu_object.append("div").attr("class", "phylotree-menu-divider dropdown-divider");
-            if (recordTarget.kind === "genbank") {
-              menu_object
-                .append("a")
-                .attr("class", "phylotree-menu-item dropdown-item")
-                .attr("tabindex", "-1")
-                .text("Open Sequence in GenBank")
-                .on("click", () => {
-                  menu_object.style("display", "none");
-                  window.open(recordTarget.urls.genbank, "_blank", "noopener,noreferrer");
-                });
-              menu_object
-                .append("a")
-                .attr("class", "phylotree-menu-item dropdown-item")
-                .attr("tabindex", "-1")
-                .text("Open sequence in Mycomap")
-                .on("click", () => {
-                  menu_object.style("display", "none");
-                  window.open(recordTarget.urls.mycomap, "_blank", "noopener,noreferrer");
-                });
-            } else if (recordTarget.kind === "mycoportal") {
-              menu_object
-                .append("a")
-                .attr("class", "phylotree-menu-item dropdown-item")
-                .attr("tabindex", "-1")
-                .text(recordTarget.label)
-                .on("click", () => {
-                  menu_object.style("display", "none");
-                  window.open(recordTarget.urls.primary, "_blank", "noopener,noreferrer");
-                });
-            } else {
-              menu_object
-                .append("a")
-                .attr("class", "phylotree-menu-item dropdown-item")
-                .attr("tabindex", "-1")
-                .text(recordTarget.label)
-                .on("click", () => {
-                  menu_object.style("display", "none");
-                  window.open(recordTarget.urls.primary, "_blank", "noopener,noreferrer");
-                });
-            }
-          }
-        }
       }
 
       if (hasHiddenNodes(node)) {

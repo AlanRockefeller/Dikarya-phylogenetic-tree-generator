@@ -58,6 +58,31 @@ class Config:
     DEFAULT_MCMC_NRNS = int(os.environ.get("DEFAULT_MCMC_NRNS", "2"))
     DEFAULT_MCMC_CHAINS = int(os.environ.get("DEFAULT_MCMC_CHAINS", "4"))
 
+    # iNaturalist OAuth. The site-wide authorized account writes the
+    # "Phylogenetic Tree" observation field back when a tree job finishes.
+    INAT_CLIENT_ID = os.environ.get(
+        'INAT_CLIENT_ID',
+        'ezG6aK0gWH27q0rylEt_MFuPewHKX5jSMSVHgz1cEtQ',
+    )
+    INAT_CLIENT_SECRET = os.environ.get('INAT_CLIENT_SECRET')
+    INAT_CREDENTIALS_FILE = os.environ.get(
+        'INAT_CREDENTIALS_FILE', '/home/tree/.inat-app'
+    )
+    INAT_TOKEN_FILE = Path(
+        os.environ.get('INAT_TOKEN_FILE')
+        or (BASE_DIR / 'var' / 'private' / 'inaturalist_token.json')
+    )
+    INAT_OAUTH_REDIRECT_URI = os.environ.get(
+        'INAT_OAUTH_REDIRECT_URI', 'https://dikarya.us/tree/oauth/callback'
+    )
+    INAT_PUBLIC_BASE_URL = os.environ.get('INAT_PUBLIC_BASE_URL', 'https://dikarya.us')
+    INAT_OAUTH_ADMIN_EMAILS = [
+        e.strip().lower() for e in os.environ.get(
+            'INAT_OAUTH_ADMIN_EMAILS',
+            'mycology@dikarya.llc,alaner@gmail.com',
+        ).split(',') if e.strip()
+    ]
+
 class DevelopmentConfig(Config):
     DEBUG = True
 

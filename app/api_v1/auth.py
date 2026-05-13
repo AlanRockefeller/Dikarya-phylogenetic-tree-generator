@@ -45,12 +45,29 @@ def hash_token(plaintext):
 
 
 def _extract_token():
-    """Pull the bearer token from the Authorization header."""
+    """Pull the bearer token from the Authorization header.
+
+    Per RFC 7235 the auth-scheme is case-insensitive ("Bearer", "bearer",
+    "BEARER" all mean the same thing). The credential value that follows
+    is *not* case-folded -- we leave it exactly as the client sent it so
+    the hash compare downstream is byte-accurate.
+    """
     header = request.headers.get("Authorization", "")
-    if not header.startswith("Bearer "):
+    if not header:
         return None
-    token = header[len("Bearer "):].strip()
-    if not token.startswith(TOKEN_PREFIX):
+    # Split into at most two parts so a token containing whitespace would
+    # be rejected explicitly rather than silently truncated.
+    parts = header.split(None, 1)
+    if len(parts) != 2:
+        return None
+    scheme, credentials = parts
+    if scheme.lower() != "bearer":
+        return None
+    token = credentials.strip()
+    # Reject prefix-only / empty-secret strings before they cost us a DB
+    # lookup. A well-formed token is the prefix plus at least a few chars
+    # of base64url secret.
+    if not token.startswith(TOKEN_PREFIX) or len(token) <= len(TOKEN_PREFIX):
         return None
     return token
 
@@ -110,14 +127,25 @@ def require_api_token(scope=None):
             g.api_token = token
             g.api_user = token.user
 
-            # Update last_used_at lazily -- once per minute is plenty.
+            # Update last_used_at lazily -- once per minute is plenty. We
+            # run this through a fresh engine-level connection rather than
+            # the request-bound session so we don't flush any other pending
+            # ORM changes as a side effect of an auth bookkeeping write.
             now = datetime.utcnow()
             if token.last_used_at is None or (now - token.last_used_at).total_seconds() > 60:
-                token.last_used_at = now
                 try:
-                    db.session.commit()
+                    with db.engine.begin() as conn:
+                        conn.execute(
+                            ApiToken.__table__.update()
+                            .where(ApiToken.id == token.id)
+                            .values(last_used_at=now)
+                        )
+                    # Keep the in-memory object in sync so downstream code
+                    # sees the new timestamp without a re-fetch.
+                    token.last_used_at = now
                 except Exception:
-                    db.session.rollback()
+                    # Best-effort: a failure here must never block auth.
+                    pass
 
             return fn(*args, **kwargs)
         return wrapper
