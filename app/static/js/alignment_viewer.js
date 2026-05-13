@@ -4,6 +4,11 @@
  * Loads aligned FASTA from the backend and renders an interactive, polished
  * alignment grid in a full-screen modal, driven by the current tree viewer
  * selection / visible tip order.
+ *
+ * Phase 2: viewport virtualization. Only the visible row × column window
+ * (plus a small buffer) is kept in the DOM; everything else is sizers + a
+ * translated inner layer per strip (ruler, consensus, names) so scrolling
+ * the cells viewport keeps every strip aligned.
  */
 (function () {
     'use strict';
@@ -12,10 +17,20 @@
     const modal = document.getElementById('modal-alignment-viewer');
     if (!modal) return;
 
-    // Alan 5/12/26 - Optional perf instrumentation for Highlight Differences toggling.
+    // Alan 5/12/26 - Optional perf instrumentation; flip locally when triaging.
     const DEBUG_ALIGNMENT_PERF = false;
-    // Alan 5/12/26 - Threshold above which we switch to the cheapest .is-diff styling.
-    const LARGE_GRID_CELLS = 50000;
+
+    // Alan 5/12/26 - Fixed geometry: must match CSS .av-cell width and row heights.
+    const CELL_WIDTH = 12;
+    const ROW_HEIGHT = 18;
+    // Alan 5/12/26 - Overscan around the visible viewport when (re)building the window.
+    const ROW_BUFFER = 12;
+    const COL_BUFFER = 40;
+    // Alan 5/12/26 - Hysteresis: keep the current rendered window while the viewport stays this far inside it.
+    const ROW_REBUILD_MARGIN = 4;
+    const COL_REBUILD_MARGIN = 18;
+    // Alan 5/12/26 - Switch to the cheapest .is-diff styling once the LIVE rendered cell count exceeds this.
+    const LARGE_LIVE_CELLS = 8000;
 
     // Alan 5/12/26 - Cache controls so callbacks don't repeatedly query the DOM.
     const $ = (id) => document.getElementById(id);
@@ -34,7 +49,6 @@
     const filterInp = $('alignment-filter');
     const diffsChk = $('alignment-highlight-diffs');
     const variableChk = $('alignment-variable-only');
-    // Alan 5/12/26 - Cache the new gap-compaction control (default ON).
     const compactChk = $('alignment-compact-gaps');
     const copyBtn = $('alignment-copy-fasta');
     const downloadBtn = $('alignment-download-fasta');
@@ -48,7 +62,7 @@
     // Alan 5/12/26 - Persistent state for the currently open viewer session.
     const state = {
         jobId: null,
-        sequences: [],          // [{name, sequence}] (server order = tree order)
+        sequences: [],
         allCount: 0,
         availablePruned: 0,
         includedPruned: 0,
@@ -62,14 +76,22 @@
         filterText: '',
         highlightDiffs: false,
         variableOnly: false,
-        compactGaps: true,      // Alan 5/12/26 - Default-on gap compaction.
-        displayedRows: [],      // sorted/filtered rows actually rendered
-        visibleColumnIndexes: null, // null = all original columns
-        gapOnlyHidden: 0,       // count of gap-only columns hidden
-        consensus: '',          // consensus over displayedRows (full length)
-        // Alan 5/12/26 - Cache the row set fingerprint so we know when to recompute consensus/diffs.
-        _rowFingerprint: '',
-        _diffComputedFor: '',   // fingerprint last used for consensus/diff masks
+        compactGaps: true,
+        displayedRows: [],
+        visibleColumnIndexes: null,
+        gapOnlyHidden: 0,
+        consensus: '',
+        // Alan 5/12/26 - Fingerprint identifies the row SET + column-affecting toggles, not row order.
+        _diffComputedFor: '',
+        // Alan 5/12/26 - Virtualization scroll/window cache.
+        _scrollTop: 0,
+        _scrollLeft: 0,
+        _frame: null,
+        // Alan 5/12/26 - Split window cache so row-only and column-only changes can rebuild independently.
+        _rowWindow: { rs: -1, re: -1 },
+        _colWindow: { cs: -1, ce: -1 },
+        _dom: null,
+        _resizeObs: null,
     };
 
     function showStatusMsg(msg, type, timeout = 0) {
@@ -100,10 +122,8 @@
         warningsEl.textContent = state.warnings.join(' • ');
     }
 
-    // Alan 5/12/26 - Treat both '-' and '.' as gap so dot-gap alignments compact too.
     function isGap(ch) { return ch === '-' || ch === '.'; }
 
-    // Alan 5/12/26 - Build the list of original alignment indexes to render, applying compaction then variable-only.
     function buildVisibleColumnIndexes(rows) {
         const len = state.alignmentLength;
         const indexes = [];
@@ -129,7 +149,6 @@
         return indexes;
     }
 
-    // Alan 5/12/26 - Compute consensus across displayed rows for the visible columns only.
     function computeConsensus(rows, visibleIdx) {
         if (!rows.length) return '';
         const out = new Array(state.alignmentLength).fill('-');
@@ -240,63 +259,282 @@
         cls += NUC_CLASS[up] || (AMBIG.has(up) ? 'av-amb' : 'av-amb');
         if (consensusCh) {
             const consUp = consensusCh.toUpperCase();
-            // Alan 5/12/26 - Distinguish "matches consensus" from "differs from consensus" so the root class can toggle styles cheaply.
             if (up === consUp && up !== '-') cls += ' av-match';
             else if (up !== consUp && !isGap(ch)) cls += ' is-diff';
         }
         return cls;
     }
 
-    // Alan 5/12/26 - Build only the visible columns (compacted), letting toggles render orders of magnitude fewer cells.
-    function buildCellRow(seq, consensus, visibleIdx) {
-        const frag = document.createDocumentFragment();
-        for (let k = 0; k < visibleIdx.length; k++) {
-            const i = visibleIdx[k];
-            const ch = seq[i] || '-';
-            const span = document.createElement('span');
-            span.className = cellClass(ch, consensus ? consensus[i] : null);
-            span.textContent = ch;
-            frag.appendChild(span);
-        }
-        return frag;
-    }
-
-    // Alan 5/12/26 - Build ruler ticks only for visible columns; labels still show original alignment coordinates.
-    function buildRuler(visibleIdx) {
-        const frag = document.createDocumentFragment();
-        for (let k = 0; k < visibleIdx.length; k++) {
-            const i = visibleIdx[k];
-            const pos = i + 1;
-            const span = document.createElement('span');
-            span.className = 'av-ruler-tick';
-            if (pos === 1 || pos % 10 === 0) {
-                span.classList.add('av-major');
-                span.textContent = String(pos);
-            } else {
-                span.textContent = '';
-            }
-            span.title = `Original alignment position ${pos}`;
-            frag.appendChild(span);
-        }
-        return frag;
-    }
-
-    // Alan 5/12/26 - Stable fingerprint identifying the displayed row set plus column-affecting toggles.
+    // Alan 5/12/26 - Sorted-name fingerprint so sort-only changes don't invalidate consensus/diff caches.
     function rowSetFingerprint(rows) {
-        return rows.map(r => r.name).join('')
+        const names = rows.map(r => r.name).slice().sort();
+        return names.join('\x1f')
             + '|cg=' + (state.compactGaps ? 1 : 0)
             + '|vo=' + (state.variableOnly ? 1 : 0)
             + '|ip=' + (state.includePruned ? 1 : 0);
     }
 
-    function renderAlignmentGrid() {
+    // ============================================================
+    // Virtualized rendering
+    // ============================================================
+
+    // Alan 5/12/26 - Build the persistent skeleton (sizers + strips); only rerun when the row/column set changes.
+    function buildSkeleton(rows, visibleIdx) {
         gridEl.innerHTML = '';
+        gridEl.style.gridTemplateRows = 'auto auto 1fr';
+        const totalW = visibleIdx.length * CELL_WIDTH;
+        const totalH = rows.length * ROW_HEIGHT;
+
+        const corner = document.createElement('div');
+        corner.className = 'av-names-header';
+        corner.textContent = `${rows.length} seq · ${visibleIdx.length}/${state.alignmentLength} cols`;
+
+        const ruler = document.createElement('div');
+        ruler.className = 'av-ruler';
+        const rulerInner = document.createElement('div');
+        rulerInner.className = 'av-ruler-inner';
+        rulerInner.style.cssText = `position:relative;width:${totalW}px;height:${ROW_HEIGHT}px;will-change:transform;`;
+        ruler.appendChild(rulerInner);
+
+        const consensusName = document.createElement('div');
+        consensusName.className = 'av-consensus-name';
+        consensusName.textContent = 'Consensus';
+
+        const consensusStrip = document.createElement('div');
+        consensusStrip.className = 'av-consensus-strip';
+        const consensusInner = document.createElement('div');
+        consensusInner.className = 'av-consensus-inner';
+        consensusInner.style.cssText = `position:relative;width:${totalW}px;height:${ROW_HEIGHT}px;will-change:transform;`;
+        consensusStrip.appendChild(consensusInner);
+
+        const namesCol = document.createElement('div');
+        namesCol.className = 'av-names';
+        const namesInner = document.createElement('div');
+        namesInner.className = 'av-names-inner';
+        namesInner.style.cssText = `position:relative;width:100%;height:${totalH}px;will-change:transform;`;
+        namesCol.appendChild(namesInner);
+
+        const cellsCol = document.createElement('div');
+        cellsCol.className = 'av-cells';
+        const cellsSizer = document.createElement('div');
+        cellsSizer.className = 'av-cells-sizer';
+        cellsSizer.style.cssText = `position:relative;width:${totalW}px;height:${totalH}px;`;
+        cellsCol.appendChild(cellsSizer);
+
+        gridEl.appendChild(corner);
+        gridEl.appendChild(ruler);
+        gridEl.appendChild(consensusName);
+        gridEl.appendChild(consensusStrip);
+        gridEl.appendChild(namesCol);
+        gridEl.appendChild(cellsCol);
+
+        // Alan 5/12/26 - Detach the previous resize observer so it doesn't fire on torn-down DOM.
+        if (state._resizeObs) { state._resizeObs.disconnect(); state._resizeObs = null; }
+        if (window.ResizeObserver) {
+            state._resizeObs = new ResizeObserver(() => scheduleRender());
+            state._resizeObs.observe(cellsCol);
+        }
+
+        // Alan 5/12/26 - Single scroll listener on cells viewport; everything else follows via transform.
+        cellsCol.addEventListener('scroll', onScroll, { passive: true });
+
+        state._dom = { corner, ruler, rulerInner, consensusName, consensusStrip, consensusInner, namesCol, namesInner, cellsCol, cellsSizer };
+    }
+
+    function onScroll() {
+        const dom = state._dom;
+        if (!dom) return;
+        state._scrollTop = dom.cellsCol.scrollTop;
+        state._scrollLeft = dom.cellsCol.scrollLeft;
+        scheduleRender();
+    }
+
+    function scheduleRender() {
+        // Alan 5/12/26 - Coalesce scroll/resize triggers into a single rAF.
+        if (state._frame) return;
+        state._frame = requestAnimationFrame(() => {
+            state._frame = null;
+            renderWindow(false);
+        });
+    }
+
+    // Alan 5/12/26 - Decide whether the row window must rebuild based on hysteresis margins.
+    function rowsNeedRebuild(force, visRowStart, visRowEnd, rowCount) {
+        if (force) return true;
+        const rw = state._rowWindow;
+        if (rw.rs < 0) return true;
+        if (rw.rs > 0 && visRowStart < rw.rs + ROW_REBUILD_MARGIN) return true;
+        if (rw.re < rowCount && visRowEnd > rw.re - ROW_REBUILD_MARGIN) return true;
+        return false;
+    }
+
+    // Alan 5/12/26 - Decide whether the column window must rebuild based on hysteresis margins.
+    function colsNeedRebuild(force, visColStart, visColEnd, colCount) {
+        if (force) return true;
+        const cw = state._colWindow;
+        if (cw.cs < 0) return true;
+        if (cw.cs > 0 && visColStart < cw.cs + COL_REBUILD_MARGIN) return true;
+        if (cw.ce < colCount && visColEnd > cw.ce - COL_REBUILD_MARGIN) return true;
+        return false;
+    }
+
+    function renderWindow(force) {
+        const dom = state._dom;
+        if (!dom) return;
+        const t0 = DEBUG_ALIGNMENT_PERF ? performance.now() : 0;
+        // Alan 5/12/26 - Translate follower strips first; this is the cheap path used on every scroll frame.
+        dom.namesInner.style.transform = `translateY(${-state._scrollTop}px)`;
+        dom.rulerInner.style.transform = `translateX(${-state._scrollLeft}px)`;
+        dom.consensusInner.style.transform = `translateX(${-state._scrollLeft}px)`;
+
+        const rows = state.displayedRows;
+        const cols = state.visibleColumnIndexes || [];
+        const vh = Math.max(0, dom.cellsCol.clientHeight);
+        const vw = Math.max(0, dom.cellsCol.clientWidth);
+        const visRowStart = Math.floor(state._scrollTop / ROW_HEIGHT);
+        const visRowEnd = Math.ceil((state._scrollTop + vh) / ROW_HEIGHT);
+        const visColStart = Math.floor(state._scrollLeft / CELL_WIDTH);
+        const visColEnd = Math.ceil((state._scrollLeft + vw) / CELL_WIDTH);
+
+        const rowsRebuild = rowsNeedRebuild(force, visRowStart, visRowEnd, rows.length);
+        const colsRebuild = colsNeedRebuild(force, visColStart, visColEnd, cols.length);
+
+        if (!rowsRebuild && !colsRebuild) {
+            if (DEBUG_ALIGNMENT_PERF) {
+                console.log(`[alignment-viewer] transform-only frame (no rebuild) took ${(performance.now() - t0).toFixed(2)}ms`);
+            }
+            return;
+        }
+
+        if (rowsRebuild) {
+            const rs = Math.max(0, visRowStart - ROW_BUFFER);
+            const re = Math.min(rows.length, visRowEnd + ROW_BUFFER);
+            state._rowWindow = { rs, re };
+        }
+        if (colsRebuild) {
+            const cs = Math.max(0, visColStart - COL_BUFFER);
+            const ce = Math.min(cols.length, visColEnd + COL_BUFFER);
+            state._colWindow = { cs, ce };
+        }
+        const { rs, re } = state._rowWindow;
+        const { cs, ce } = state._colWindow;
+
+        // Alan 5/12/26 - Names only need to rebuild when the row window changes.
+        if (rowsRebuild) renderNamesWindow(rs, re);
+        // Alan 5/12/26 - Ruler/consensus only need to rebuild when the column window changes.
+        if (colsRebuild) {
+            renderRulerWindow(cs, ce);
+            renderConsensusWindow(cs, ce);
+        }
+        // Alan 5/12/26 - Cells rebuild if either dimension changed; uses the union of both windows.
+        renderCellsWindow(rs, re, cs, ce);
+
+        // Alan 5/12/26 - Large-window class is based on LIVE rendered cell count, not logical alignment size.
+        const liveCellCount = (re - rs) * (ce - cs);
+        bodyEl.classList.toggle('alignment-large-grid', liveCellCount > LARGE_LIVE_CELLS);
+
+        if (DEBUG_ALIGNMENT_PERF) {
+            const liveCells = bodyEl.querySelectorAll('.av-cell').length;
+            console.log(`[alignment-viewer] rebuild rows=${rowsRebuild} cols=${colsRebuild} window rows=[${rs},${re}) cols=[${cs},${ce}) liveCells=${liveCells} (computed=${liveCellCount}) took ${(performance.now() - t0).toFixed(2)}ms`);
+        }
+    }
+
+    function renderRulerWindow(cs, ce) {
+        const idx = state.visibleColumnIndexes;
+        const inner = state._dom.rulerInner;
+        const frag = document.createDocumentFragment();
+        for (let k = cs; k < ce; k++) {
+            const orig = idx[k] + 1;
+            const tick = document.createElement('span');
+            tick.className = 'av-ruler-tick';
+            tick.style.cssText = `position:absolute;left:${k * CELL_WIDTH}px;width:${CELL_WIDTH}px;`;
+            if (orig === 1 || orig % 10 === 0) {
+                tick.classList.add('av-major');
+                tick.textContent = String(orig);
+            }
+            tick.title = `Original alignment position ${orig}`;
+            frag.appendChild(tick);
+        }
+        inner.replaceChildren(frag);
+    }
+
+    function renderConsensusWindow(cs, ce) {
+        const idx = state.visibleColumnIndexes;
+        const consensus = state.consensus;
+        const inner = state._dom.consensusInner;
+        const frag = document.createDocumentFragment();
+        for (let k = cs; k < ce; k++) {
+            const i = idx[k];
+            const ch = consensus[i] || '-';
+            const span = document.createElement('span');
+            span.className = cellClass(ch, null) + ' av-consensus-cell';
+            span.style.cssText = `position:absolute;left:${k * CELL_WIDTH}px;width:${CELL_WIDTH}px;`;
+            span.textContent = ch;
+            frag.appendChild(span);
+        }
+        inner.replaceChildren(frag);
+    }
+
+    function renderNamesWindow(rs, re) {
+        const rows = state.displayedRows;
+        const inner = state._dom.namesInner;
+        const frag = document.createDocumentFragment();
+        const showScores = state.sortMode === 'similar' || state.sortMode === 'different';
+        for (let r = rs; r < re; r++) {
+            const row = rows[r];
+            const div = document.createElement('div');
+            div.className = 'av-name-row';
+            div.style.cssText = `position:absolute;top:${r * ROW_HEIGHT}px;left:0;right:0;height:${ROW_HEIGHT}px;`;
+            const nameText = document.createElement('span');
+            nameText.className = 'av-name-text';
+            nameText.textContent = row.name;
+            nameText.title = row.name;
+            div.appendChild(nameText);
+            if (showScores && typeof row.__score === 'number') {
+                const score = document.createElement('span');
+                score.className = 'av-name-score';
+                score.textContent = (row.__score * 100).toFixed(1) + '%';
+                div.appendChild(score);
+            }
+            frag.appendChild(div);
+        }
+        inner.replaceChildren(frag);
+    }
+
+    function renderCellsWindow(rs, re, cs, ce) {
+        const rows = state.displayedRows;
+        const idx = state.visibleColumnIndexes;
+        const consensus = state.consensus;
+        const sizer = state._dom.cellsSizer;
+        const frag = document.createDocumentFragment();
+        for (let r = rs; r < re; r++) {
+            const rowDiv = document.createElement('div');
+            rowDiv.className = 'av-cell-row';
+            rowDiv.style.cssText = `position:absolute;top:${r * ROW_HEIGHT}px;left:${cs * CELL_WIDTH}px;height:${ROW_HEIGHT}px;`;
+            const seq = rows[r].sequence;
+            for (let k = cs; k < ce; k++) {
+                const i = idx[k];
+                const ch = seq[i] || '-';
+                const span = document.createElement('span');
+                span.className = cellClass(ch, consensus[i]);
+                span.textContent = ch;
+                rowDiv.appendChild(span);
+            }
+            frag.appendChild(rowDiv);
+        }
+        sizer.replaceChildren(frag);
+    }
+
+    // ============================================================
+    // Public render entry point — preserves all pre-virtualization behavior.
+    // ============================================================
+
+    function renderAlignmentGrid() {
         emptyEl.classList.add('hidden');
 
         let rows = state.sequences.slice();
         const filter = (state.filterText || '').trim().toLowerCase();
         if (filter) rows = rows.filter(r => r.name.toLowerCase().includes(filter));
-
         for (const r of rows) r.__score = undefined;
         rows = sortRows(rows);
         state.displayedRows = rows;
@@ -305,107 +543,56 @@
             state.visibleColumnIndexes = [];
             state.gapOnlyHidden = 0;
             state.consensus = '';
+            gridEl.innerHTML = '';
+            state._dom = null;
             emptyEl.textContent = 'No sequences match the current filter.';
             emptyEl.classList.remove('hidden');
             updateStats();
             return;
         }
 
-        // Alan 5/12/26 - Recompute visible columns + consensus only when the row set or column toggles change.
+        // Alan 5/12/26 - Recompute visible columns + consensus only when the row SET or column toggles change.
         const fp = rowSetFingerprint(rows);
-        if (fp !== state._diffComputedFor) {
+        const rowSetChanged = fp !== state._diffComputedFor;
+        if (rowSetChanged) {
             state.visibleColumnIndexes = buildVisibleColumnIndexes(rows);
             state.consensus = computeConsensus(rows, state.visibleColumnIndexes);
             state._diffComputedFor = fp;
         }
         const visibleIdx = state.visibleColumnIndexes;
-        const consensus = state.consensus;
 
-        // Header corner + ruler
-        const corner = document.createElement('div');
-        corner.className = 'av-names-header';
-        corner.textContent = `${rows.length} sequences · ${visibleIdx.length}/${state.alignmentLength} cols`;
-        gridEl.appendChild(corner);
-
-        const ruler = document.createElement('div');
-        ruler.className = 'av-ruler';
-        const rulerInner = document.createElement('div');
-        rulerInner.style.whiteSpace = 'nowrap';
-        rulerInner.appendChild(buildRuler(visibleIdx));
-        ruler.appendChild(rulerInner);
-        gridEl.appendChild(ruler);
-
-        const namesCol = document.createElement('div');
-        namesCol.className = 'av-names';
-        const cellsCol = document.createElement('div');
-        cellsCol.className = 'av-cells';
-
-        // Consensus row
-        const consNameRow = document.createElement('div');
-        consNameRow.className = 'av-name-row av-consensus-row';
-        const consName = document.createElement('span');
-        consName.className = 'av-name-text';
-        consName.textContent = 'Consensus';
-        consNameRow.appendChild(consName);
-        namesCol.appendChild(consNameRow);
-
-        const consCellRow = document.createElement('div');
-        consCellRow.className = 'av-cell-row av-consensus-row';
-        consCellRow.appendChild(buildCellRow(consensus, null, visibleIdx));
-        cellsCol.appendChild(consCellRow);
-
-        cellsCol.addEventListener('scroll', () => {
-            namesCol.scrollTop = cellsCol.scrollTop;
-            ruler.scrollLeft = cellsCol.scrollLeft;
-        });
-
-        const showScores = state.sortMode === 'similar' || state.sortMode === 'different';
-
-        // Alan 5/12/26 - Batch all rows into one fragment so the browser does a single layout pass.
-        const namesFrag = document.createDocumentFragment();
-        const cellsFrag = document.createDocumentFragment();
-        for (const row of rows) {
-            const nameRow = document.createElement('div');
-            nameRow.className = 'av-name-row';
-            const nameText = document.createElement('span');
-            nameText.className = 'av-name-text';
-            nameText.textContent = row.name;
-            nameText.title = row.name;
-            nameRow.appendChild(nameText);
-            if (showScores && typeof row.__score === 'number') {
-                const score = document.createElement('span');
-                score.className = 'av-name-score';
-                score.textContent = (row.__score * 100).toFixed(1) + '%';
-                nameRow.appendChild(score);
-            }
-            namesFrag.appendChild(nameRow);
-
-            const cellRow = document.createElement('div');
-            cellRow.className = 'av-cell-row';
-            cellRow.appendChild(buildCellRow(row.sequence, consensus, visibleIdx));
-            cellsFrag.appendChild(cellRow);
+        // Alan 5/12/26 - Rebuild the skeleton when row count or column count changes; otherwise just rerender the window.
+        const needSkeleton = !state._dom
+            || state._dom.cellsSizer.style.width !== (visibleIdx.length * CELL_WIDTH) + 'px'
+            || state._dom.cellsSizer.style.height !== (rows.length * ROW_HEIGHT) + 'px';
+        if (needSkeleton) {
+            buildSkeleton(rows, visibleIdx);
+            state._scrollTop = 0;
+            state._scrollLeft = 0;
+            state._dom.cellsCol.scrollTop = 0;
+            state._dom.cellsCol.scrollLeft = 0;
+            // Alan 5/12/26 - Invalidate split window cache so the next render rebuilds both axes.
+            state._rowWindow = { rs: -1, re: -1 };
+            state._colWindow = { cs: -1, ce: -1 };
+        } else {
+            // Alan 5/12/26 - Same skeleton, but row order/window contents may have changed; force a window rerender.
+            // Alan 5/12/26 - Invalidate split window cache so the next render rebuilds both axes.
+            state._rowWindow = { rs: -1, re: -1 };
+            state._colWindow = { cs: -1, ce: -1 };
+            // Update header text in case col/row counts displayed there changed.
+            state._dom.corner.textContent = `${rows.length} seq · ${visibleIdx.length}/${state.alignmentLength} cols`;
         }
-        namesCol.appendChild(namesFrag);
-        cellsCol.appendChild(cellsFrag);
 
-        gridEl.appendChild(namesCol);
-        gridEl.appendChild(cellsCol);
-
-        // Alan 5/12/26 - Apply the highlight state via the root class only — never per-cell on toggle.
         bodyEl.classList.toggle('alignment-highlight-differences', state.highlightDiffs);
-        // Alan 5/12/26 - Mark big grids so CSS can drop to the cheapest .is-diff styling.
-        const cellCount = rows.length * visibleIdx.length;
-        bodyEl.classList.toggle('alignment-large-grid', cellCount > LARGE_GRID_CELLS);
-        if (DEBUG_ALIGNMENT_PERF) {
-            console.log(`[alignment-viewer] rendered cells=${cellCount} rows=${rows.length} cols=${visibleIdx.length}`);
-        }
+        // Alan 5/12/26 - The large-grid class is now decided inside renderWindow based on live rendered cells.
 
+        // Alan 5/12/26 - Defer the initial render one frame so clientWidth/clientHeight are known after layout.
+        requestAnimationFrame(() => renderWindow(true));
         updateStats();
     }
 
-    // Alan 5/12/26 - Toggle differences purely via a root class. No DOM rebuild, no per-cell touches.
     function setHighlightDifferences(enabled) {
-        // Alan 5/12/26 - Guarded timing so we can confirm the toggle itself is cheap.
+        // Alan 5/12/26 - Toggle differences purely via the root class. No window rebuild, no per-cell touches.
         const t0 = DEBUG_ALIGNMENT_PERF ? performance.now() : 0;
         state.highlightDiffs = !!enabled;
         bodyEl.classList.toggle('alignment-highlight-differences', state.highlightDiffs);
@@ -477,8 +664,10 @@
             state.includedPruned = data.included_pruned_count || 0;
             state.alignmentLength = data.alignment_length || (state.sequences[0]?.sequence.length || 0);
             state.warnings = data.warnings || [];
-            // Alan 5/12/26 - Force recompute of consensus/diff masks when row set or include-pruned changes.
+            // Alan 5/12/26 - Row set changed; force consensus/visible-column recompute.
             state._diffComputedFor = '';
+            // Alan 5/12/26 - Reset skeleton so dimensions match the new data.
+            state._dom = null;
             renderWarnings();
             pickInitialReference();
             populateReferenceSelector();
@@ -489,6 +678,7 @@
             emptyEl.textContent = `Could not load alignment: ${e.message}`;
             emptyEl.classList.remove('hidden');
             gridEl.innerHTML = '';
+            state._dom = null;
         }
     }
 
@@ -502,10 +692,10 @@
         state.filterText = '';
         state.highlightDiffs = false;
         state.variableOnly = false;
-        // Alan 5/12/26 - Reset gap compaction to default-on on every open.
         state.compactGaps = true;
         state.referenceName = null;
         state._diffComputedFor = '';
+        state._dom = null;
 
         if (sortSel) sortSel.value = 'tree';
         if (filterInp) filterInp.value = '';
@@ -513,8 +703,8 @@
         if (variableChk) variableChk.checked = false;
         if (compactChk) compactChk.checked = true;
         if (includeChk) includeChk.checked = false;
-        // Alan 5/12/26 - Clear the highlight class so reopening doesn't carry over the previous state.
         bodyEl.classList.remove('alignment-highlight-differences');
+        bodyEl.classList.remove('alignment-large-grid');
 
         statsEl.textContent = 'Loading alignment…';
         warningsEl.classList.add('hidden');
@@ -524,7 +714,7 @@
         await refresh();
     }
 
-    // Alan 5/12/26 - FASTA export uses the currently displayed rows; if compacted, uses compacted columns.
+    // Alan 5/12/26 - Copy/download still export the FULL displayed rows × visibleColumns, not the screen window.
     function exportFastaText() {
         const rows = state.displayedRows;
         const idx = state.visibleColumnIndexes;
@@ -555,7 +745,6 @@
         const url = URL.createObjectURL(blob);
         const a = document.createElement('a');
         a.href = url;
-        // Alan 5/12/26 - Suffix the filename so users can tell compacted exports apart from full ones.
         const suffix = compact ? '_compact' : '';
         a.download = `alignment_view_${state.jobId || 'job'}${suffix}.fasta`;
         document.body.appendChild(a);
@@ -592,7 +781,7 @@
         refresh();
     });
     sortSel.addEventListener('change', () => {
-        // Alan 5/12/26 - Sorting only re-orders the same row set, so we can skip consensus/diff recompute.
+        // Alan 5/12/26 - Sorting only reorders rows; row set fingerprint stays the same so consensus is reused.
         state.sortMode = sortSel.value;
         populateReferenceSelector();
         renderAlignmentGrid();
@@ -605,29 +794,56 @@
     filterInp.addEventListener('input', () => {
         state.filterText = filterInp.value;
         clearTimeout(filterDeb);
-        // Alan 5/12/26 - Filter changes the displayed row set, so let the fingerprint trigger recompute.
         filterDeb = setTimeout(renderAlignmentGrid, 80);
     });
     diffsChk.addEventListener('change', () => {
-        // Alan 5/12/26 - Highlight Differences toggle now only flips a root class — no rebuild, no recompute.
         setHighlightDifferences(diffsChk.checked);
     });
     variableChk.addEventListener('change', () => {
         state.variableOnly = variableChk.checked;
+        // Alan 5/12/26 - Column set changed; force consensus/visible-column recompute.
+        state._diffComputedFor = '';
         renderAlignmentGrid();
     });
     if (compactChk) compactChk.addEventListener('change', () => {
-        // Alan 5/12/26 - Toggle gap-only compaction and rebuild the visible columns.
         state.compactGaps = compactChk.checked;
+        // Alan 5/12/26 - Column set changed; force consensus/visible-column recompute.
+        state._diffComputedFor = '';
         renderAlignmentGrid();
     });
     copyBtn.addEventListener('click', copyFasta);
     downloadBtn.addEventListener('click', downloadFasta);
 
-    // Expose a minimal public API for the controller to drive.
+    // Alan 5/12/26 - Re-render the visible window on window resize as a fallback for browsers without ResizeObserver.
+    window.addEventListener('resize', () => {
+        if (modal.classList.contains('hidden')) return;
+        scheduleRender();
+    });
+
     window.DikaryaAlignmentViewer = {
         open,
         close: closeModal,
         setHighlightDifferences,
+    };
+
+    // Alan 5/12/26 - Lightweight debug surface for triaging perf in the console.
+    window.DikaryaAlignmentViewerDebug = {
+        cellCount() { return bodyEl.querySelectorAll('.av-cell').length; },
+        windowInfo() {
+            return {
+                rowWindow: { ...state._rowWindow },
+                colWindow: { ...state._colWindow },
+                displayedRows: state.displayedRows.length,
+                visibleColumns: (state.visibleColumnIndexes || []).length,
+                scrollTop: state._scrollTop,
+                scrollLeft: state._scrollLeft,
+                largeGrid: bodyEl.classList.contains('alignment-large-grid'),
+            };
+        },
+        timeHighlightToggle() {
+            const t0 = performance.now();
+            setHighlightDifferences(!state.highlightDiffs);
+            return performance.now() - t0;
+        },
     };
 })();
