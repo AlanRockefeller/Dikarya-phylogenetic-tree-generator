@@ -1,0 +1,16 @@
+Flask
+python-dotenv
+gunicorn
+flask-login
+markupsafe
+jinja2
+redis
+rq
+requests
+flask-sqlalchemy
+flask-migrate
+psycopg2-binary
+psutil
+biopython
+Flask-WTF
+Flask-Limiter

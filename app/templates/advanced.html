@@ -1,0 +1,266 @@
+{% extends "base.html" %}
+
+{% block title %}Dikarya - Advanced Mode{% endblock %}
+
+{% block content %}
+<div class="row">
+    <div class="col-md-12">
+        <h1>Advanced Analysis</h1>
+        <p class="lead">Configure your phylogenetic analysis pipeline with fine-grained control.</p>
+        <hr>
+    </div>
+</div>
+
+<div class="row">
+    <div class="col-lg-8">
+        <div class="card mb-4">
+            <div class="card-header">
+                <h5 class="mb-0">1. Input Sequences</h5>
+            </div>
+            <div class="card-body">
+                <div class="mb-3">
+                    <label for="sequence_text" class="form-label">Paste FASTA Sequences</label>
+                    <textarea class="form-control" id="sequence_text" rows="10"
+                        placeholder=">seq1&#10;ATGC..."></textarea>
+                </div>
+                <div class="mb-3">
+                    <label for="sequence_file" class="form-label">Or Upload File</label>
+                    <input class="form-control" type="file" id="sequence_file" accept=".fa,.fasta,.fna,.txt">
+                </div>
+                <div class="mb-3">
+                    <label for="job_notes" class="form-label">Job Name / Notes</label>
+                    <input type="text" class="form-control" id="job_notes" placeholder="e.g. Fungal ITS Analysis">
+                </div>
+            </div>
+        </div>
+
+        <div class="card mb-4">
+            <div class="card-header">
+                <h5 class="mb-0">2. Pipeline Configuration</h5>
+            </div>
+            <div class="card-body">
+                <!-- Alignment -->
+                <div class="row mb-4">
+                    <div class="col-md-6">
+                        <label for="alignment_method" class="form-label">Alignment Method</label>
+                        <select class="form-select" id="alignment_method">
+                            <option value="mafft" selected>MAFFT (Default)</option>
+                            <option value="muscle">MUSCLE</option>
+                            <option value="clustalo">Clustal Omega</option>
+                        </select>
+                        <div class="form-text">Choose the algorithm for multiple sequence alignment.</div>
+                    </div>
+                    <div class="col-md-6">
+                        <label for="trimming_method" class="form-label">Trimming Method</label>
+                        <select class="form-select" id="trimming_method">
+                            <option value="none" selected>None</option>
+                            <option value="trimal">trimAl</option>
+                            <option value="bmge">BMGE</option>
+                        </select>
+                        <div class="form-text">Remove poorly aligned regions to improve signal.</div>
+                    </div>
+                </div>
+
+                <!-- Tree Building -->
+                <h6 class="border-bottom pb-2">Tree Inference</h6>
+                <div class="row mb-3">
+                    <div class="col-md-6">
+                        <label for="tree_method" class="form-label">Method</label>
+                        <select class="form-select" id="tree_method">
+                            <option value="nj" selected>Neighbor Joining (Fast)</option>
+                            <option value="raxml">RAxML-NG (Maximum Likelihood)</option>
+                            <option value="iqtree">IQ-TREE (Maximum Likelihood)</option>
+                            <option value="mrbayes">MrBayes (Bayesian)</option>
+                        </select>
+                    </div>
+                    <div class="col-md-6">
+                        <label for="tree_model" class="form-label">Substitution Model</label>
+                        <input type="text" class="form-control" id="tree_model" value="GTR+G">
+                        <div class="form-text">E.g., GTR+G, JC69, HKY.</div>
+                    </div>
+                </div>
+
+                <!-- Dynamic Options -->
+                <div id="ml_options" class="d-none">
+                    <div class="mb-3">
+                        <label for="bootstrap" class="form-label">Bootstrap Replicates</label>
+                        <input type="number" class="form-control" id="bootstrap" value="1000" min="0" max="10000">
+                        <div class="form-text">Number of bootstrap trees. IQ-TREE requires >= 1000 for Ultrafast
+                            Bootstrap.</div>
+                    </div>
+                </div>
+
+                <div id="mrbayes_options" class="d-none">
+                    <div class="row">
+                        <div class="col-md-4 mb-3">
+                            <label for="mb_gen" class="form-label">Generations</label>
+                            <input type="number" class="form-control" id="mb_gen" value="50000" step="1000">
+                        </div>
+                        <div class="col-md-4 mb-3">
+                            <label for="mb_runs" class="form-label">Runs</label>
+                            <input type="number" class="form-control" id="mb_runs" value="2">
+                        </div>
+                        <div class="col-md-4 mb-3">
+                            <label for="mb_chains" class="form-label">Chains</label>
+                            <input type="number" class="form-control" id="mb_chains" value="4">
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <div class="d-flex justify-content-center my-4">
+            <button id="submit_btn" class="btn btn-success btn-lg px-5 py-3"
+                style="font-size: 1.25rem; font-weight: 600; min-width: 250px;">Start Analysis</button>
+        </div>
+        <div id="status_alert" class="alert mt-3 d-none" role="alert"></div>
+
+    </div>
+
+    <div class="col-lg-4">
+        <div class="card bg-light">
+            <div class="card-body">
+                <h5>Help</h5>
+                <p>Not sure what to choose?</p>
+                <ul>
+                    <li><strong>MAFFT</strong> is generally accurate and fast for most datasets.</li>
+                    <li><strong>Neighbor Joining</strong> is very fast but less accurate for distant relationships.</li>
+                    <li><strong>RAxML & IQ-TREE</strong> provide rigorous Maximum Likelihood inference but take longer.
+                    </li>
+                    <li><strong>MrBayes</strong> uses Bayesian inference and estimates posterior probabilities.</li>
+                </ul>
+            </div>
+        </div>
+    </div>
+</div>
+
+<script>
+    // Helper to read file
+    function readFileAsText(file) {
+        return new Promise((resolve, reject) => {
+            const r = new FileReader();
+            r.onload = () => resolve(r.result);
+            r.onerror = reject;
+            r.readAsText(file);
+        });
+    }
+
+    // Dynamic Form Logic
+    const treeMethodSelect = document.getElementById('tree_method');
+    const mlOptions = document.getElementById('ml_options');
+    const mbOptions = document.getElementById('mrbayes_options');
+
+    function updateForm() {
+        const method = treeMethodSelect.value;
+
+        // Reset visibility
+        mlOptions.classList.add('d-none');
+        mbOptions.classList.add('d-none');
+
+        if (method === 'raxml' || method === 'iqtree') {
+            mlOptions.classList.remove('d-none');
+            // Reset to standard if switching back to these
+            if (document.getElementById("tree_model").value === "GTR+CAT") {
+                document.getElementById("tree_model").value = "GTR+G";
+            }
+        } else if (method === 'mrbayes') {
+            mbOptions.classList.remove('d-none');
+        } else if (method === 'fasttree') {
+            // FastTree uses CAT approx for GTR
+            document.getElementById("tree_model").value = "GTR+CAT";
+        }
+    }
+
+    treeMethodSelect.addEventListener('change', updateForm);
+
+    // Submit Logic
+    document.getElementById("submit_btn").addEventListener("click", async () => {
+        const statusAlert = document.getElementById("status_alert");
+        const btn = document.getElementById("submit_btn");
+
+        statusAlert.classList.add('d-none');
+        statusAlert.classList.remove('alert-danger', 'alert-info', 'alert-success');
+
+        // 1. Get Sequence
+        let seq = document.getElementById("sequence_text").value.trim();
+        const file = document.getElementById("sequence_file").files[0];
+
+        if (!seq && file) {
+            try {
+                seq = (await readFileAsText(file)).trim();
+            } catch (e) {
+                statusAlert.textContent = "Error reading file.";
+                statusAlert.classList.add('allow-danger');
+                statusAlert.classList.remove('d-none');
+                return;
+            }
+        }
+
+        if (!seq) {
+            statusAlert.textContent = "Please provide sequence data (paste text or upload file).";
+            statusAlert.classList.add('alert-danger');
+            statusAlert.classList.remove('d-none');
+            return;
+        }
+
+        // 2. Prepare UI
+        btn.disabled = true;
+        btn.textContent = "Submitting...";
+        statusAlert.textContent = "Validating and submitting job...";
+        statusAlert.classList.add('alert-info');
+        statusAlert.classList.remove('d-none');
+
+        // 3. Construct Payload
+        const payload = {
+            input_type: "sequence", // Use "sequence" (pasted_sequence) because we send content in JSON, not a file upload
+            sequence: seq,
+            notes: document.getElementById("job_notes").value.trim(),
+
+            alignment_method: document.getElementById("alignment_method").value,
+            trimming_method: document.getElementById("trimming_method").value,
+
+            tree_method: treeMethodSelect.value,
+            tree_model: document.getElementById("tree_model").value,
+
+            // Conditionals
+            bootstrap: parseInt(document.getElementById("bootstrap").value) || 100,
+            mcmc_generations: parseInt(document.getElementById("mb_gen").value) || 50000,
+            mcmc_nruns: parseInt(document.getElementById("mb_runs").value) || 2,
+            mcmc_nchains: parseInt(document.getElementById("mb_chains").value) || 4
+        };
+
+        // 4. Send API Request
+        try {
+            const csrfToken = document.querySelector('meta[name="csrf-token"]')?.getAttribute('content');
+            const headers = { "Content-Type": "application/json" };
+            if (csrfToken) headers["X-CSRFToken"] = csrfToken;
+
+            const resp = await fetch("/api/job", {
+                method: "POST",
+                headers: headers,
+                body: JSON.stringify(payload)
+            });
+
+            const data = await resp.json();
+
+            if (!resp.ok) {
+                throw new Error(data.message || data.error || "Server error");
+            }
+
+            statusAlert.textContent = "Job submitted successfully! Redirecting...";
+            statusAlert.classList.remove('alert-info');
+            statusAlert.classList.add('alert-success');
+
+            // Redirect immediately to the job status dashboard
+            window.location.href = "/job/" + data.job_id;
+
+        } catch (e) {
+            statusAlert.textContent = "Submission Failed: " + e.message;
+            statusAlert.classList.remove('alert-info');
+            statusAlert.classList.add('alert-danger');
+            btn.disabled = false;
+            btn.textContent = "Start Analysis";
+        }
+    });
+</script>
+{% endblock %}

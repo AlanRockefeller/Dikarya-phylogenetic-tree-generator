@@ -1,0 +1,194 @@
+{% extends "base_modern.html" %}
+
+{% block title %}Dikarya - API Tokens{% endblock %}
+{% block subtitle %}API Tokens{% endblock %}
+
+{% block content %}
+<div class="max-w-5xl mx-auto space-y-6">
+
+    <!-- Header -->
+    <div class="flex flex-col md:flex-row justify-between items-start md:items-center gap-4">
+        <div>
+            <h2 class="text-2xl font-bold text-journal-dark dark:text-gray-100 flex items-center">
+                <i class="fas fa-key text-journal-gold mr-3"></i>API Tokens
+            </h2>
+            <p class="text-gray-600 dark:text-gray-300 mt-1 text-sm">
+                Tokens let scripts call the Dikarya API on your behalf. Each token can be scoped and revoked independently.
+                <a href="{{ url_for('api_v1.api_docs') }}" class="text-journal-gold hover:underline">API docs →</a>
+            </p>
+        </div>
+        <div class="flex gap-3">
+            <a href="{{ url_for('api_v1.api_docs') }}"
+               class="text-sm bg-journal-gold hover:bg-journal-gold-light text-journal-dark px-3 py-1.5 rounded-lg font-semibold transition-colors flex items-center">
+                <i class="fas fa-book mr-2"></i> API Docs
+            </a>
+            <a href="{{ url_for('user.user_jobs') }}"
+               class="text-sm text-gray-600 dark:text-gray-300 hover:text-journal-gold transition-colors flex items-center">
+                <i class="fas fa-arrow-left mr-1"></i> Back to My Jobs
+            </a>
+        </div>
+    </div>
+
+    {# One-time secret reveal #}
+    {% if new_secret %}
+    <div class="bg-yellow-50 dark:bg-yellow-900/30 border-l-4 border-journal-gold rounded-r-lg p-5 shadow">
+        <h3 class="font-bold text-journal-dark dark:text-gray-100 flex items-center mb-2">
+            <i class="fas fa-circle-exclamation text-journal-gold mr-2"></i>
+            New token created: <span class="ml-2 font-mono text-sm">{{ new_token_name }}</span>
+        </h3>
+        <p class="text-sm text-gray-700 dark:text-gray-200 mb-3">
+            <strong>Copy this token now.</strong> It will not be shown again. If you lose it, revoke this entry and create a new one.
+        </p>
+        <div class="flex items-center gap-2">
+            <input type="text" readonly value="{{ new_secret }}"
+                   id="new-token-secret"
+                   class="flex-1 px-3 py-2 font-mono text-sm rounded-lg border border-gray-300 dark:border-journal-dark bg-white dark:bg-journal-dark text-journal-dark dark:text-gray-100 select-all">
+            <button type="button" onclick="copyNewToken()"
+                    class="bg-journal-gold hover:bg-journal-gold-light text-journal-dark px-4 py-2 rounded-lg font-semibold text-sm flex items-center">
+                <i class="fas fa-copy mr-2"></i>Copy
+            </button>
+        </div>
+        <script>
+            function copyNewToken() {
+                const el = document.getElementById('new-token-secret');
+                el.select();
+                navigator.clipboard.writeText(el.value);
+                event.target.closest('button').innerHTML = '<i class="fas fa-check mr-2"></i>Copied';
+            }
+        </script>
+    </div>
+    {% endif %}
+
+    {# Create new token #}
+    <div class="bg-white dark:bg-journal-green rounded-xl shadow-lg overflow-hidden transition-colors">
+        <div class="bg-journal-dark px-5 py-3 border-b border-journal-green">
+            <h3 class="text-white font-semibold flex items-center">
+                <i class="fas fa-plus-circle text-journal-gold mr-2"></i>Create New Token
+            </h3>
+        </div>
+        <form action="{{ url_for('user.api_tokens_create') }}" method="POST" class="p-5 space-y-4">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token() }}" />
+            <div>
+                <label for="name" class="block text-sm font-semibold text-journal-dark dark:text-gray-200 mb-2">
+                    Token name
+                </label>
+                <input type="text" name="name" id="name" required maxlength="80"
+                       placeholder="e.g. laptop-script"
+                       class="w-full px-4 py-2 rounded-lg border border-gray-300 dark:border-journal-dark bg-white dark:bg-journal-dark text-journal-dark dark:text-gray-100 focus:ring-2 focus:ring-journal-gold focus:border-transparent">
+                <p class="text-xs text-gray-500 dark:text-gray-400 mt-1">Used only to help you identify this token later.</p>
+            </div>
+            <div>
+                <label class="block text-sm font-semibold text-journal-dark dark:text-gray-200 mb-2">Scopes</label>
+                <div class="space-y-2">
+                    {% for scope in all_scopes %}
+                    <label class="flex items-start gap-2 cursor-pointer">
+                        <input type="checkbox" name="scopes" value="{{ scope }}" checked
+                               class="mt-1 rounded border-gray-300 text-journal-gold focus:ring-journal-gold">
+                        <span class="text-sm">
+                            <span class="font-mono text-journal-dark dark:text-gray-100">{{ scope }}</span>
+                            <span class="text-gray-500 dark:text-gray-400 ml-2">
+                                {% if scope == 'jobs:read' %}List/get jobs, read events, download files & logs.
+                                {% elif scope == 'jobs:write' %}Create, recompute, mutate, delete jobs.
+                                {% elif scope == 'tools:read' %}BLAST, GenBank, MycoMap, iNaturalist lookups.
+                                {% elif scope == 'account:read' %}Read /me and list own tokens.
+                                {% endif %}
+                            </span>
+                        </span>
+                    </label>
+                    {% endfor %}
+                </div>
+            </div>
+            <button type="submit"
+                    class="bg-journal-gold hover:bg-journal-gold-light text-journal-dark px-5 py-2 rounded-lg font-semibold transition-colors flex items-center">
+                <i class="fas fa-key mr-2"></i>Generate Token
+            </button>
+        </form>
+    </div>
+
+    {# Existing tokens #}
+    <div class="bg-white dark:bg-journal-green rounded-xl shadow-lg overflow-hidden transition-colors">
+        <div class="bg-journal-dark px-5 py-3 border-b border-journal-green">
+            <h3 class="text-white font-semibold flex items-center">
+                <i class="fas fa-list text-journal-gold mr-2"></i>Your Tokens
+                <span class="ml-2 text-xs text-gray-400">({{ tokens|length }})</span>
+            </h3>
+        </div>
+        <div class="p-5">
+            {% if tokens %}
+            <div class="overflow-x-auto">
+                <table class="w-full text-sm">
+                    <thead>
+                        <tr class="border-b border-gray-200 dark:border-journal-dark text-left">
+                            <th class="py-2 pr-4 font-semibold text-gray-700 dark:text-gray-200">Name</th>
+                            <th class="py-2 pr-4 font-semibold text-gray-700 dark:text-gray-200">Prefix</th>
+                            <th class="py-2 pr-4 font-semibold text-gray-700 dark:text-gray-200">Scopes</th>
+                            <th class="py-2 pr-4 font-semibold text-gray-700 dark:text-gray-200">Created</th>
+                            <th class="py-2 pr-4 font-semibold text-gray-700 dark:text-gray-200">Last used</th>
+                            <th class="py-2 pr-4 font-semibold text-gray-700 dark:text-gray-200">Status</th>
+                            <th class="py-2 pr-4 font-semibold text-gray-700 dark:text-gray-200 text-right">Actions</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        {% for t in tokens %}
+                        <tr class="border-b border-gray-100 dark:border-journal-dark last:border-0">
+                            <td class="py-3 pr-4 text-journal-dark dark:text-gray-100">{{ t.name }}</td>
+                            <td class="py-3 pr-4 font-mono text-xs text-gray-600 dark:text-gray-300">{{ t.token_prefix }}…</td>
+                            <td class="py-3 pr-4 font-mono text-xs text-gray-600 dark:text-gray-300">
+                                {{ (t.scopes or []) | join(', ') }}
+                            </td>
+                            <td class="py-3 pr-4 text-xs text-gray-600 dark:text-gray-300">
+                                {{ t.created_at.strftime('%Y-%m-%d') if t.created_at else '—' }}
+                            </td>
+                            <td class="py-3 pr-4 text-xs text-gray-600 dark:text-gray-300">
+                                {{ t.last_used_at.strftime('%Y-%m-%d %H:%M') if t.last_used_at else 'never' }}
+                            </td>
+                            <td class="py-3 pr-4">
+                                {% if t.revoked_at %}
+                                <span class="px-2 py-0.5 rounded-full text-xs font-bold bg-gray-200 text-gray-700 dark:bg-gray-700 dark:text-gray-200">Revoked</span>
+                                {% else %}
+                                <span class="px-2 py-0.5 rounded-full text-xs font-bold bg-green-100 text-green-800 dark:bg-green-900 dark:text-green-200">Active</span>
+                                {% endif %}
+                            </td>
+                            <td class="py-3 pr-4 text-right space-x-2 whitespace-nowrap">
+                                {% if not t.revoked_at %}
+                                <form action="{{ url_for('user.api_tokens_revoke', token_id=t.id) }}" method="POST" class="inline"
+                                      onsubmit="return confirm('Revoke this token? Any scripts using it will stop working immediately.');">
+                                    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}" />
+                                    <button type="submit" class="text-yellow-700 dark:text-yellow-300 hover:underline text-xs font-semibold">
+                                        Revoke
+                                    </button>
+                                </form>
+                                {% endif %}
+                                <form action="{{ url_for('user.api_tokens_delete', token_id=t.id) }}" method="POST" class="inline"
+                                      onsubmit="return confirm('Permanently delete this token record?');">
+                                    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}" />
+                                    <button type="submit" class="text-red-700 dark:text-red-300 hover:underline text-xs font-semibold">
+                                        Delete
+                                    </button>
+                                </form>
+                            </td>
+                        </tr>
+                        {% endfor %}
+                    </tbody>
+                </table>
+            </div>
+            {% else %}
+            <p class="text-gray-500 dark:text-gray-400 italic">No tokens yet. Create one above to get started.</p>
+            {% endif %}
+        </div>
+    </div>
+
+    {# Docs #}
+    <div id="docs" class="bg-white dark:bg-journal-green rounded-xl shadow p-5 text-sm text-gray-700 dark:text-gray-200">
+        <h3 class="font-bold text-journal-dark dark:text-gray-100 mb-2">Using your token</h3>
+        <p class="mb-2">Send the token in the <code class="font-mono text-xs bg-gray-100 dark:bg-journal-dark px-1 py-0.5 rounded">Authorization</code> header:</p>
+        <pre class="bg-gray-100 dark:bg-journal-dark text-xs p-3 rounded overflow-x-auto"><code>curl https://dikarya.us/api/v1/me \
+  -H "Authorization: Bearer dikarya_..."</code></pre>
+        <p class="text-xs text-gray-500 dark:text-gray-400 mt-2">
+            Phase 1 endpoints: <code>/api/v1/me</code>, <code>/api/v1/tokens</code>, <code>/api/v1/health</code>.
+            Job and tool endpoints land next.
+        </p>
+    </div>
+
+</div>
+{% endblock %}

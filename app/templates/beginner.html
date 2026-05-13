@@ -1,0 +1,94 @@
+{% extends "base.html" %}
+
+{% block title %}Dikarya - Beginner Mode{% endblock %}
+
+{% block content %}
+<h1>Beginner Quick Tree</h1>
+<p>Upload your sequences or paste them here.</p>
+
+<div style="max-width: 900px; margin-top: 1rem;">
+  <label for="sequence_text"><b>Paste FASTA:</b></label><br>
+  <textarea id="sequence_text" rows="14" style="width: 100%;"></textarea>
+
+  <div style="margin-top: 1rem;">
+    <label for="sequence_file"><b>Or choose a FASTA file:</b></label><br>
+    <input type="file" id="sequence_file" accept=".fa,.fasta,.fna,.txt">
+  </div>
+
+  <div style="margin-top: 1rem;">
+    <button id="submit_btn">Run Quick Tree</button>
+    <span id="status" style="margin-left: 1rem;"></span>
+  </div>
+
+  <div id="result" style="margin-top: 1rem;"></div>
+</div>
+
+<script>
+  async function readFileAsText(file) {
+    return new Promise((resolve, reject) => {
+      const r = new FileReader();
+      r.onload = () => resolve(r.result);
+      r.onerror = reject;
+      r.readAsText(file);
+    });
+  }
+
+  document.getElementById("submit_btn").addEventListener("click", async () => {
+    const statusEl = document.getElementById("status");
+    const resultEl = document.getElementById("result");
+    statusEl.textContent = "";
+    resultEl.textContent = "";
+
+    let seq = document.getElementById("sequence_text").value.trim();
+    const file = document.getElementById("sequence_file").files[0];
+
+    if (!seq && file) {
+      statusEl.textContent = "Reading file…";
+      seq = (await readFileAsText(file)).trim();
+    }
+
+    if (!seq) {
+      statusEl.textContent = "Please paste FASTA or choose a file.";
+      return;
+    }
+
+    statusEl.textContent = "Submitting job…";
+
+    const payload = {
+      input_type: "beginner",
+      sequence: seq,
+      notes: "Beginner Quick Tree",
+      alignment_method: "mafft",
+      trimming_method: "none",
+      tree_method: "nj",
+      tree_model: "GTR+G",
+      bootstrap: 100
+    };
+
+    const csrfToken = document.querySelector('meta[name="csrf-token"]')?.getAttribute('content');
+    const headers = { "Content-Type": "application/json" };
+    if (csrfToken) headers["X-CSRFToken"] = csrfToken;
+
+    const resp = await fetch("/api/job", {
+      method: "POST",
+      headers: headers,
+      body: JSON.stringify(payload)
+    });
+
+    let data = null;
+    try { data = await resp.json(); } catch (e) { }
+
+    if (!resp.ok) {
+      statusEl.textContent = "Error submitting job (" + resp.status + ")";
+      resultEl.textContent = data ? JSON.stringify(data, null, 2) : "";
+      return;
+    }
+
+    const jobId = data && data.job_id;
+    statusEl.textContent = "Queued: " + jobId;
+
+    // Simple next step: send them to My Jobs
+    setTimeout(() => { window.location.href = "/user/jobs"; }, 400);
+  });
+</script>
+{% endblock %}

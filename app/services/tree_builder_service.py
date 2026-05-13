@@ -1,0 +1,828 @@
+"""
+Tree builder service module.
+
+Provides functions for phylogenetic tree inference:
+- Neighbor Joining (BioPython)
+- RAxML-NG
+- IQ-TREE
+- MrBayes
+
+When job_id is provided, streams log output to Redis for real-time SSE updates.
+"""
+
+import os
+import shutil
+import logging
+from pathlib import Path
+from typing import Dict, Any, Optional, Tuple
+
+from app.config import Config
+from app.models import TreeBuilderParams
+
+_RAXML_HELP_CACHE = None
+from app.services.subprocess_utils import run_command, run_command_streaming
+from app.services.fasta_utils import sanitize_fasta_headers, restore_tree_names
+
+# Try to import Bio.Phylo for NJ, or implement simple fallback
+try:
+    from Bio import Phylo, AlignIO, SeqIO
+    from Bio.Phylo.TreeConstruction import DistanceCalculator, DistanceTreeConstructor
+    HAS_BIOPYTHON = True
+except ImportError:
+    HAS_BIOPYTHON = False
+
+logger = logging.getLogger(__name__)
+
+
+def run_tree_builder(
+    alignment_fasta: Path,
+    output_newick: Path,
+    output_nexus: Path,
+    params: TreeBuilderParams,
+    config: Config,
+    task_logger,
+    job_id: Optional[str] = None
+) -> Dict[str, Any]:
+    """
+    Run the selected tree building algorithm.
+    
+    Methods: "nj", "raxml", "iqtree", "mrbayes"
+    
+    Args:
+        alignment_fasta: Path to aligned FASTA file
+        output_newick: Path for output Newick tree
+        output_nexus: Path for output NEXUS tree
+        params: Tree builder parameters
+        config: Application config
+        task_logger: Logger instance
+        job_id: Optional job ID for real-time event streaming
+    
+    Returns:
+        Metadata dict with method, model, etc.
+    """
+    method = params.method.lower()
+    task_logger.info(f"Starting tree building with method: {method}")
+    
+    metadata = {
+        "method": method,
+        "model": params.model,
+        "bootstrap": params.bootstrap,
+        "run_dir": str(output_newick.parent)
+    }
+
+    try:
+        if method == "nj":
+            _run_neighbor_joining(alignment_fasta, output_newick, output_nexus, task_logger, job_id)
+        elif method == "raxml":
+            _run_raxml(alignment_fasta, output_newick, output_nexus, params, config, task_logger, job_id)
+        elif method == "iqtree":
+            _run_iqtree(alignment_fasta, output_newick, output_nexus, params, config, task_logger, job_id)
+        elif method == "mrbayes":
+            _run_mrbayes(alignment_fasta, output_newick, output_nexus, params, config, task_logger, job_id)
+        elif method == "fasttree":
+            _run_fasttree(alignment_fasta, output_newick, output_nexus, params, config, task_logger, job_id)
+        else:
+            raise ValueError(f"Unsupported tree building method: {method}")
+
+        if not output_newick.exists() or output_newick.stat().st_size == 0:
+             raise RuntimeError(f"Tree building failed: Output file {output_newick} is missing or empty.")
+
+        task_logger.info(f"Tree building completed successfully. Output: {output_newick}")
+        return metadata
+
+    except Exception as e:
+        task_logger.error(f"Tree building failed: {e}")
+        raise
+
+
+def _get_thread_count(params: TreeBuilderParams) -> int:
+    if params.threads:
+        return params.threads
+    return min(8, os.cpu_count() or 1)
+
+
+def _make_log_callback(job_id: Optional[str], step: str, stream: str):
+    """Create a callback function for streaming output to Redis."""
+    if not job_id:
+        return None
+    
+    from app.workers.events import publish_log
+    
+    def callback(line: str):
+        publish_log(job_id, step, stream, line)
+    
+    return callback
+
+
+def _run_neighbor_joining(
+    alignment_fasta: Path,
+    output_newick: Path,
+    output_nexus: Path,
+    task_logger,
+    job_id: Optional[str] = None
+):
+    """
+    Build a fast NJ tree using BioPython.
+    
+    NJ is fast and runs in-process, so no streaming needed.
+    """
+    if not HAS_BIOPYTHON:
+        raise RuntimeError("BioPython is required for NJ but not installed.")
+        
+    task_logger.info("Running Neighbor Joining using BioPython...")
+    
+    # Sanitize input FASTA to create safe IDs
+    sanitized_fasta = output_newick.parent / "nj_input_sanitized.fasta"
+    name_mapping = sanitize_fasta_headers(alignment_fasta, sanitized_fasta)
+    
+    # Publish progress if job_id provided
+    if job_id:
+        from app.workers.events import publish_log
+        publish_log(job_id, "tree", "stderr", "Reading alignment...")
+    
+    # Read alignment (use sanitized version)
+    aln = AlignIO.read(str(sanitized_fasta), "fasta")
+    
+    if job_id:
+        from app.workers.events import publish_log
+        publish_log(job_id, "tree", "stderr", "Calculating distance matrix...")
+    
+    # Calculate distance matrix
+    calculator = DistanceCalculator('identity')
+    dm = calculator.get_distance(aln)
+    
+    if job_id:
+        from app.workers.events import publish_log
+        publish_log(job_id, "tree", "stderr", "Building tree...")
+    
+    # Build tree
+    constructor = DistanceTreeConstructor()
+    tree = constructor.nj(dm)
+    
+    if job_id:
+        from app.workers.events import publish_log
+        publish_log(job_id, "tree", "stderr", "Writing output files...")
+    
+    # Write Newick
+    Phylo.write(tree, str(output_newick), "newick")
+    
+    # Write Nexus
+    Phylo.write(tree, str(output_nexus), "nexus")
+    
+    # Restore original names in output files
+    restore_tree_names(output_newick, name_mapping)
+    restore_tree_names(output_nexus, name_mapping)
+
+
+
+def _check_raxml_feature(config: Config, feature_flag: str) -> bool:
+    """Check if the installed RAxML-NG binary supports a specific flag/feature."""
+    global _RAXML_HELP_CACHE
+    
+    if _RAXML_HELP_CACHE is not None:
+         return feature_flag in _RAXML_HELP_CACHE
+
+    from app.services.subprocess_utils import run_command
+    try:
+        cmd = [config.RAXML_BINARY, "--help"]
+        _, stdout, _ = run_command(cmd)
+        _RAXML_HELP_CACHE = stdout
+        return feature_flag in stdout
+    except Exception:
+        return False
+
+
+
+
+def _get_raxml_cmd(
+    params: Any, # ResolvedRaxmlParams
+    config: Config,
+    sanitized_fasta: Path,
+    prefix: str,
+    threads: int
+) -> list[str]:
+    """Construct the main RAxML-NG command from resolved parameters."""
+    
+    cmd = [
+        config.RAXML_BINARY,
+        "--msa", str(sanitized_fasta),
+        "--model", params.model,
+        "--prefix", prefix,
+        "--threads", str(threads),
+        "--seed", str(params.seed)
+    ]
+    
+    # Starting Trees
+    # raxml-ng --tree pars{N},rand{M} 
+    cmd.extend(["--tree", params.start_tree_spec])
+    
+    # Bootstrapping vs ML-only
+    if params.enable_bootstrap:
+        # --all includes ML search + Bootstrap
+        cmd.append("--all")
+        # --bs-trees autoMRE{cap}
+        cmd.extend(["--bs-trees", f"autoMRE{{{params.bootstrap_cap}}}"])
+    else:
+        # ML check only
+        # Verified ML-only mode: --search
+        cmd.append("--search")
+        
+    # Early Stopping (KH)
+    # Only add if enabled AND supported (checked by caller or we assume caller checked)
+    if params.enable_early_stopping:
+        cmd.extend(["--stop-rule", "kh-mult"]) # or kh, but kh-mult often safer/standard
+
+    # Outgroup (Drawing option in RAxML, but useful for logs)
+    if params.outgroup:
+        cmd.extend(["--outgroup", params.outgroup])
+
+    return cmd
+
+def _run_moose(
+    alignment_fasta: Path,
+    params: Any, # ResolvedRaxmlParams
+    config: Config,
+    task_logger,
+    job_id: str
+) -> Tuple[Optional[str], Path]:
+    """
+    Run MOOSE model selection.
+    Returns (best_model, alignment_path_to_use).
+    alignment_path_to_use is either the original input or a reduced alignment if MOOSE produced one.
+    """
+    task_logger.info("Running MOOSE model selection...")
+    from app.services.subprocess_utils import run_command
+    
+    prefix = str(alignment_fasta.parent / "moose_run")
+    
+    # Constrained search space
+    # DNA: GTR, HKY, TN93. RHAS: G, I+G
+    # AA: LG, JTT, WAG. RHAS: G, I+G
+    if params.data_type == "DNA":
+        moose_opts = "criterion=bic/rhas=G,R,I+G,I+R/freerate-categories=2-5"
+
+    else:
+        moose_opts = "criterion=bic/rhas=G,R,I+G,I+R/freerate-categories=2-5/substitution-models=LG,JTT,WAG"
+        
+    cmd = [
+        config.RAXML_BINARY,
+        "--moose",
+        "--msa", str(alignment_fasta),
+        "--data-type", params.data_type,
+        "--moose-options", moose_opts,
+        "--prefix", prefix,
+        "--threads", "auto", 
+        "--seed", str(params.seed)
+    ]
+    
+    if job_id:
+        from app.workers.events import publish_command
+        publish_command(job_id, "tree", cmd)
+    
+    log_file = alignment_fasta.parent.parent / "logs" / "moose.log"
+    rc, stdout, stderr = run_command(cmd, log_file=log_file)
+    
+    if rc != 0:
+        task_logger.warning(f"MOOSE failed (RC={rc}). See moose.log. Falling back to default model.")
+        return None, alignment_fasta
+        
+    # Check for reduced alignment
+    # Wiki says: <prefix>.raxml.reduced.phy
+    reduced_aln = Path(f"{prefix}.raxml.reduced.phy")
+    final_aln = reduced_aln if reduced_aln.exists() else alignment_fasta
+    
+    if reduced_aln.exists():
+        task_logger.info("MOOSE produced reduced alignment. Using it for inference.")
+
+    # Parse output .bestModel
+    # Wiki says .moose.bestModel
+    best_model_file = Path(f"{prefix}.raxml.moose.bestModel")
+    if not best_model_file.exists():
+        # Fallback to old check just in case
+        best_model_file = Path(f"{prefix}.raxml.bestModel")
+
+    if best_model_file.exists():
+        # Return the path to the bestModel file directly
+        # RAxML-NG supports reading model from file: --model /path/to/file
+        task_logger.info(f"Using MOOSE model file: {best_model_file}")
+        
+        # We still want to log what it found for the user
+        try:
+             raw_model = best_model_file.read_text().strip()
+             task_logger.info(f"MOOSE selected model configuration: {raw_model}")
+        except Exception:
+             pass
+             
+        return str(best_model_file.absolute()), final_aln
+    
+    task_logger.warning("MOOSE output file not found. Falling back.")
+    return None, alignment_fasta
+
+def _run_raxml(
+    alignment_fasta: Path,
+    output_newick: Path,
+    output_nexus: Path,
+    params: TreeBuilderParams,
+    config: Config,
+    task_logger,
+    job_id: Optional[str] = None
+):
+    """Run RAxML-NG tree inference with upgraded workflow."""
+    from app.services.raxml_validator import validate_and_resolve_raxml_params
+    
+    # 1. Detect Data Type
+    # Simple heuristic or check BioPython
+    mol_type = "DNA"
+    if HAS_BIOPYTHON:
+        try:
+             # Fast check first record using SeqIO.parse (stops lazy iterator after 1)
+             # Avoids loading full alignment into memory
+             # Fast heuristic check using first few records
+             dna_votes = 0
+             total_checked = 0
+             
+             for i, record in enumerate(SeqIO.parse(str(alignment_fasta), "fasta")):
+                 if i >= 10: break # Check max 10 records
+                 
+                 seq = str(record.seq).upper().replace("-", "").replace("?", "")
+                 if not seq: continue
+                 
+                 # Strong protein indicators: E, F, I, L, P, Q, Z
+                 # If we see these, it is almost certainly Protein (or bad data, but assume Protein)
+                 if any(c in seq for c in "EFILPQZ"):
+                     # Found protein-specific char
+                     total_checked += 1
+                     continue # Counts as non-DNA (AA)
+                     
+                 # DNA heuristic: Count ACGTU + N
+                 # Ambiguous DNA (R, Y, etc) exists, but high % of canonical bases implies DNA
+                 dna_chars = sum(1 for c in seq if c in "ACGTUN")
+                 if dna_chars / len(seq) > 0.85:
+                     dna_votes += 1
+                 total_checked += 1
+                 
+             # If majority of checked sequences look like AA, switch to AA.
+             # (Default is DNA, so we only switch if evidence suggests AA)
+             if total_checked > 0 and (dna_votes / total_checked) < 0.5:
+                 mol_type = "AA"
+                 
+        except Exception:
+            pass # Default DNA
+
+    # 2. Validate & Resolve Parameters
+    # We resolve again to sure we have the ResolvedRaxmlParams object and handle defaults robustly
+    # Convert TreeBuilderParams to dict for validator
+    params_dict = {
+        "run_preset": params.run_preset,
+        "bootstrap_preset": params.bootstrap_preset,
+        "bootstrap_cap": params.bootstrap_cap,
+        "enable_bootstrap": params.enable_bootstrap,
+        "start_tree_override": params.start_tree_override,
+        "moose_enabled": params.moose_enabled,
+        "enable_early_stopping": params.early_stopping,
+        "seed": params.seed,
+        "outgroup": params.outgroup,
+        "model": params.model
+    }
+    
+    resolved = validate_and_resolve_raxml_params(params_dict, data_type=mol_type)
+    
+    # Check Support for Features
+    has_moose_support = _check_raxml_feature(config, "--moose")
+    has_early_stop_support = _check_raxml_feature(config, "--stop-rule")
+
+    # 3. Handle MOOSE
+    moose_mapping = None
+    reduced_msa_path = None
+    
+    if resolved.enable_moose:
+        if has_moose_support:
+            sanitized_fasta_moose = output_newick.parent / "raxml_input_moose_sanitized.fasta"
+            moose_mapping = sanitize_fasta_headers(alignment_fasta, sanitized_fasta_moose)
+            
+            best_model, best_msa = _run_moose(sanitized_fasta_moose, resolved, config, task_logger, job_id)
+            if best_model:
+                resolved.model = best_model
+            
+            if best_msa != sanitized_fasta_moose and best_msa.exists():
+                 reduced_msa_path = best_msa
+                 # Note: reduced MSA retains simpler sanitized IDs, so moose_mapping is still valid for name restoration
+                 
+        else:
+            task_logger.warning("MOOSE requested but not supported by installed RAxML-NG. Using default model.")
+            
+    # 4. Handle Early Stopping Flag
+    if resolved.enable_early_stopping and not has_early_stop_support:
+        task_logger.warning("Early stopping requested but not supported/found in help. Disabling.")
+        resolved.enable_early_stopping = False
+
+    # 5. Prepare Main Run
+    prefix = str(output_newick.parent / "raxml_run")
+    threads = _get_thread_count(params)
+    
+    if reduced_msa_path and moose_mapping:
+         sanitized_fasta = reduced_msa_path
+         name_mapping = moose_mapping
+    else:
+         sanitized_fasta = output_newick.parent / "raxml_input_sanitized.fasta"
+         name_mapping = sanitize_fasta_headers(alignment_fasta, sanitized_fasta)
+    
+    cmd = _get_raxml_cmd(resolved, config, sanitized_fasta, prefix, threads)
+    
+    log_file = output_newick.parent.parent / "logs" / "tree_builder.log"
+    
+    if job_id:
+        from app.workers.events import publish_command
+        publish_command(job_id, "tree", cmd)
+        
+        exit_code, stats = run_command_streaming(
+            cmd,
+            stderr_path=log_file,
+            on_stdout_line=_make_log_callback(job_id, "tree", "stdout"),
+            on_stderr_line=_make_log_callback(job_id, "tree", "stderr"),
+        )
+        
+        if exit_code != 0:
+            raise RuntimeError(f"RAxML failed with exit code {exit_code}")
+    else:
+        returncode, stdout, stderr = run_command(cmd, log_file=log_file)
+        if returncode != 0:
+            raise RuntimeError(f"RAxML failed with return code {returncode}. See logs.")
+            
+    # 6. Output Handling
+    best_tree = Path(f"{prefix}.raxml.bestTree")
+    support_tree = Path(f"{prefix}.raxml.support")
+    
+    # Prefer supported tree if available (BS run), else best ML tree
+    source_tree = support_tree if support_tree.exists() else best_tree
+    
+    if not source_tree.exists():
+        raise RuntimeError("RAxML output tree not found.")
+        
+    # Copy to final internal location
+    shutil.copy(source_tree, output_newick)
+    
+    # 7. Post-Processing: Outgroup Rerooting
+    if resolved.outgroup and HAS_BIOPYTHON:
+        try:
+            task_logger.info(f"Rerooting tree on outgroup: {resolved.outgroup}")
+            tree = Phylo.read(str(output_newick), "newick")
+            
+            # Find target (account for sanitization if needed, but resolved.outgroup should match original name)
+            # But name_mapping keys are Original, Values are Sanitized.
+            # RAxML output has Sanitized names.
+            # resolved.outgroup is likely Original name (from UI).
+            # So we need to look up sanitized name.
+            target_name = resolved.outgroup
+            
+            # If name mapping used, find sanitized equivalent
+            # Mapping: {SanitizedID: OriginalHeader}
+            # We need to find the SanitizedID that corresponds to resolved.outgroup
+            target_name = resolved.outgroup
+            
+            # Simple reverse lookup
+            for safe_id, original_header in name_mapping.items():
+                if resolved.outgroup in original_header:
+                     # Heuristic match: if selected outgroup name is substring of header
+                     # This helps if outgroup param is "SeqA" but header is "SeqA SpeciesX"
+                     target_name = safe_id
+                     break
+                if original_header == resolved.outgroup:
+                    target_name = safe_id
+                    break
+                
+            # Find clade
+            target_clade = next((c for c in tree.find_clades() if c.name == target_name), None)
+            
+            if target_clade:
+                tree.root_with_outgroup(target_clade)
+                # Overwrite output_newick with rooted version
+                Phylo.write(tree, str(output_newick), "newick")
+            else:
+                task_logger.warning(f"Outgroup {target_name} not found in tree. Skipping reroot.")
+        except Exception as e:
+            task_logger.error(f"Outgroup rerooting failed: {e}")
+
+    # 8. Final Name Restoration & Nexus Conversion
+    restore_tree_names(output_newick, name_mapping)
+    _convert_newick_to_nexus(output_newick, output_nexus)
+
+
+def _run_iqtree(
+    alignment_fasta: Path,
+    output_newick: Path,
+    output_nexus: Path,
+    params: TreeBuilderParams,
+    config: Config,
+    task_logger,
+    job_id: Optional[str] = None
+):
+    """Run IQ-TREE maximum likelihood tree inference."""
+    prefix = str(output_newick.parent / "iqtree_run")
+    threads = _get_thread_count(params)
+    
+    # Sanitize FASTA to create safe IDs
+    sanitized_fasta = output_newick.parent / "iqtree_input_sanitized.fasta"
+    name_mapping = sanitize_fasta_headers(alignment_fasta, sanitized_fasta)
+    
+    cmd = [
+        config.IQTREE_BINARY,
+        "-s", str(sanitized_fasta),
+        "-m", params.model,
+        "-nt", str(threads),
+        "-pre", prefix,
+        "-redo"
+    ]
+    
+    if params.bootstrap and params.bootstrap > 0:
+        cmd.extend(["-B", str(params.bootstrap)])
+        
+    log_file = output_newick.parent.parent / "logs" / "tree_builder.log"
+    
+    if job_id:
+        # Publish command line (displayed in green)
+        from app.workers.events import publish_command
+        publish_command(job_id, "tree", cmd)
+        
+        exit_code, stats = run_command_streaming(
+            cmd,
+            stderr_path=log_file,
+            on_stdout_line=_make_log_callback(job_id, "tree", "stdout"),  # IQ-TREE writes progress to stdout
+            on_stderr_line=_make_log_callback(job_id, "tree", "stderr"),
+        )
+        
+        if exit_code != 0:
+            raise RuntimeError(f"IQ-TREE failed with exit code {exit_code}")
+    else:
+        returncode, stdout, stderr = run_command(cmd, log_file=log_file)
+        
+        if returncode != 0:
+            raise RuntimeError(f"IQ-TREE failed with return code {returncode}. See logs.")
+        
+    # Output handling
+    treefile = Path(f"{prefix}.treefile")
+    contree = Path(f"{prefix}.contree")
+    
+    source_tree = contree if contree.exists() else treefile
+    
+    if source_tree.exists():
+        shutil.copy(source_tree, output_newick)
+        
+        # Restore original names in the Newick tree
+        restore_tree_names(output_newick, name_mapping)
+        
+        _convert_newick_to_nexus(output_newick, output_nexus)
+    else:
+        raise RuntimeError("IQ-TREE output tree not found.")
+
+
+def _run_mrbayes(
+    alignment_fasta: Path,
+    output_newick: Path,
+    output_nexus: Path,
+    params: TreeBuilderParams,
+    config: Config,
+    task_logger,
+    job_id: Optional[str] = None
+):
+    """Run MrBayes Bayesian tree inference."""
+    # Sanitize FASTA to create safe IDs before converting to NEXUS
+    sanitized_fasta = output_newick.parent / "mrbayes_input_sanitized.fasta"
+    name_mapping = sanitize_fasta_headers(alignment_fasta, sanitized_fasta)
+    
+    # MrBayes requires Nexus input with a block
+    nexus_input = output_newick.parent / "mrbayes_input.nex"
+    _convert_fasta_to_nexus(sanitized_fasta, nexus_input)
+    
+    # Append MrBayes block
+    with open(nexus_input, "a") as f:
+        f.write("\nbegin mrbayes;\n")
+        f.write(f"   set autoclose=yes;\n")
+        f.write(f"   lset nst=6 rates=gamma;\n")  # GTR+G equivalent
+        f.write(f"   mcmc ngen={params.mcmc_generations} nchains={params.mcmc_nchains} nruns={params.mcmc_nruns} burninfrac=0.25;\n")
+        f.write(f"   sump;\n")
+        f.write(f"   sumt;\n")
+        f.write("end;\n")
+        
+    cmd = [config.MRBAYES_BINARY, str(nexus_input)]
+    
+    log_file = output_newick.parent.parent / "logs" / "tree_builder.log"
+    
+    if job_id:
+        # Publish command line (displayed in green)
+        from app.workers.events import publish_command
+        publish_command(job_id, "tree", cmd)
+        
+        # MrBayes prints progress to stdout
+        exit_code, stats = run_command_streaming(
+            cmd,
+            stderr_path=log_file,
+            on_stdout_line=_make_log_callback(job_id, "tree", "stdout"),  # MrBayes uses stdout
+            on_stderr_line=_make_log_callback(job_id, "tree", "stderr"),
+        )
+        
+        if exit_code != 0:
+            raise RuntimeError(f"MrBayes failed with exit code {exit_code}")
+    else:
+        returncode, stdout, stderr = run_command(cmd, log_file=log_file)
+        
+        if returncode != 0:
+            task_logger.error(f"MrBayes failed. RC={returncode}")
+            task_logger.error(f"STDOUT: {stdout}")
+            task_logger.error(f"STDERR: {stderr}")
+            raise RuntimeError(f"MrBayes failed with return code {returncode}. Error: {stderr}")
+        
+    # Output: <input>.con.tre (Consensus tree)
+    con_tree = Path(f"{nexus_input}.con.tre")
+    
+    if con_tree.exists():
+        shutil.copy(con_tree, output_nexus)
+        _convert_nexus_to_newick(output_nexus, output_newick)
+        
+        # Restore original names in output files
+        restore_tree_names(output_newick, name_mapping)
+        restore_tree_names(output_nexus, name_mapping)
+    else:
+        raise RuntimeError("MrBayes consensus tree not found.")
+
+
+def _convert_newick_to_nexus(newick_path: Path, nexus_path: Path):
+    """Convert Newick tree to NEXUS format."""
+    if HAS_BIOPYTHON:
+        try:
+            tree = Phylo.read(str(newick_path), "newick")
+            Phylo.write(tree, str(nexus_path), "nexus")
+        except Exception:
+            pass  # Best effort
+
+
+def _convert_nexus_to_newick(nexus_path: Path, newick_path: Path):
+    """
+    Convert NEXUS tree to Newick format.
+    
+    Handles MrBayes annotations like [&prob=...] by extracting
+    posterior probabilities as node labels.
+    """
+    if HAS_BIOPYTHON:
+        try:
+            import re
+            
+            # Helper definitions for robust matching
+            _NUM_CORE = r"[0-9]+(?:\.[0-9]+)?(?:[eE][+\-]?[0-9]+)?"
+            
+            def _fmt_prob(s: str) -> str:
+                try:
+                    x = float(s)
+                    return f"{x:.3f}".rstrip("0").rstrip(".")
+                except (ValueError, TypeError):
+                    return s
+
+            content = nexus_path.read_text()
+            
+            # Case A: branch length comes first:  ): 0.05 [&prob=...]
+            pat_a = re.compile(
+                rf"\)(?:\s*:\s*(?P<branch>{_NUM_CORE}))\s*\[[^\]]*?\bprob=\s*(?P<prob>{_NUM_CORE})\s*[^\]]*?\]",
+                re.IGNORECASE
+            )
+
+            # Case B: prob comes first:  )[&prob=...]:0.05
+            pat_b = re.compile(
+                rf"\)\s*\[[^\]]*?\bprob=\s*(?P<prob>{_NUM_CORE})\s*[^\]]*?\](?:\s*:\s*(?P<branch>{_NUM_CORE}))?",
+                re.IGNORECASE
+            )
+
+            def repl(m: re.Match) -> str:
+                prob_val = _fmt_prob(m.group('prob'))
+                branch_val = m.group('branch')
+                branch_str = f":{branch_val}" if branch_val else ""
+                return f"){prob_val}{branch_str}"
+
+            clean_content = pat_a.sub(repl, content)
+            clean_content = pat_b.sub(repl, clean_content)
+
+            # Remove any remaining [...] annotations
+            clean_content = re.sub(r"\[[^\]]*\]", "", clean_content)
+            
+            from io import StringIO
+            tree = Phylo.read(StringIO(clean_content), "nexus")
+            Phylo.write(tree, str(newick_path), "newick")
+        except Exception as e:
+            logger.error(f"Failed to convert Nexus to Newick: {e}")
+            raise
+
+
+def _convert_fasta_to_nexus(fasta_path: Path, nexus_path: Path):
+    """Convert aligned FASTA to NEXUS format for MrBayes."""
+    if HAS_BIOPYTHON:
+        # Read alignment
+        aln = AlignIO.read(str(fasta_path), "fasta")
+        
+        # Detect molecule type
+        if len(aln) > 0:
+            seq_str = str(aln[0].seq).upper()
+            dna_chars = set("ACGTN-")
+            match_count = sum(1 for c in seq_str if c in dna_chars)
+            is_dna = (match_count / len(seq_str)) > 0.8
+            
+            mol_type = "DNA" if is_dna else "protein"
+            
+            # Annotate records and sanitize IDs
+            for record in aln:
+                record.annotations["molecule_type"] = mol_type
+                # Sanitize ID for MrBayes
+                clean_id = record.id.replace("|", "_").replace(":", "_").replace("-", "_").replace("'", "").replace(" ", "_")
+                clean_id = "".join(c for c in clean_id if c.isalnum() or c == "_")
+                record.id = clean_id
+                record.description = ""
+                
+        AlignIO.write(aln, str(nexus_path), "nexus")
+    else:
+        raise RuntimeError("BioPython required for format conversion.")
+
+
+def _run_fasttree(
+    alignment_fasta: Path,
+    output_newick: Path,
+    output_nexus: Path,
+    params: TreeBuilderParams,
+    config: Config,
+    task_logger,
+    job_id: Optional[str] = None
+):
+    """
+    Run FastTree 2.2.0 tree inference.
+    
+    FastTree writes the tree to stdout.
+    Command: fasttree -gtr -nt -gamma -boot 1000 alignment.fasta > tree.newick
+    """
+    
+    # Check binary existence
+    binary_path = Path(config.FASTTREE_BINARY)
+    if not binary_path.exists() and not shutil.which(config.FASTTREE_BINARY):
+        raise RuntimeError(f"FastTree binary not found at {config.FASTTREE_BINARY}")
+
+    # Sanitize FASTA
+    sanitized_fasta = output_newick.parent / "fasttree_input_sanitized.fasta"
+    name_mapping = sanitize_fasta_headers(alignment_fasta, sanitized_fasta)
+    
+    # Build command
+    cmd = [
+        config.FASTTREE_BINARY,
+        "-gtr",
+        "-nt", 
+        "-gamma",
+        "-boot", str(1000) # Fixed 1000 bootstraps as per requirement
+    ]
+    
+    # Check if alignment is valid (not empty)
+    if sanitized_fasta.stat().st_size == 0:
+         raise RuntimeError("Input alignment is empty.")
+
+    cmd.append(str(sanitized_fasta))
+    
+    log_file = output_newick.parent.parent / "logs" / "tree_builder.log"
+    
+    task_logger.info(f"Running FastTree: {' '.join(cmd)}")
+    
+    if job_id:
+        from app.workers.events import publish_command
+        # We perform the redirect manually, but show it in the command event
+        display_cmd = cmd + [">", str(output_newick)]
+        publish_command(job_id, "tree", display_cmd)
+        
+        # FastTree writes progress to stderr, tree to stdout
+        # stdout_path will automatically be opened by run_command_streaming
+        exit_code, stats = run_command_streaming(
+            cmd,
+            stderr_path=log_file,
+            stdout_path=output_newick, 
+            on_stderr_line=_make_log_callback(job_id, "tree", "stderr")
+        )
+            
+        if exit_code != 0:
+             raise RuntimeError(f"FastTree failed with exit code {exit_code}")
+
+    else:
+        # specific handling if we assume run_command captures stdout
+        # run_command returns (returncode, stdout, stderr)
+        returncode, stdout, stderr = run_command(cmd, log_file=log_file)
+        
+        if returncode != 0:
+            task_logger.error(f"FastTree failed. RC={returncode}")
+            task_logger.error(f"STDERR: {stderr}")
+            raise RuntimeError(f"FastTree failed with return code {returncode}. See logs.")
+            
+        # Write stdout to newick file
+        with open(output_newick, "w") as f:
+            f.write(stdout)
+
+    # Check output
+    if not output_newick.exists() or output_newick.stat().st_size == 0:
+        raise RuntimeError("FastTree produced no output.")
+
+    # Restore original names
+    restore_tree_names(output_newick, name_mapping)
+    
+    # Convert to Nexus
+    _convert_newick_to_nexus(output_newick, output_nexus)
+

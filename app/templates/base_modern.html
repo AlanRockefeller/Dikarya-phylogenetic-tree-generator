@@ -1,0 +1,343 @@
+<!DOCTYPE html>
+<html lang="en" class="scroll-smooth">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="csrf-token" content="{{ csrf_token() }}">
+    <title>{% block title %}Dikarya{% endblock %}</title>
+    <meta name="description" content="{% block description %}Dikarya - Mycological Research Tools{% endblock %}">
+    {% include "partials/favicon_links.html" %}
+
+    <!-- Tailwind CSS (vendored from cdn.tailwindcss.com 2026-05-11; SHA-256 in static/vendor/VENDORED_HASHES.txt) -->
+    <script src="{{ url_for('static', filename='vendor/tailwind.js') }}"></script>
+    <script>
+        tailwind.config = {
+            darkMode: 'class',
+            theme: {
+                extend: {
+                    colors: {
+                        'journal-green': '#2d4a3e',
+                        'journal-dark': '#1a2f23',
+                        'journal-gold': '#c9a962',
+                        'journal-gold-light': '#e5d4a1',
+                        'journal-cream': '#f8f6f0',
+                    }
+                }
+            }
+        }
+    </script>
+
+    <!-- Font Awesome (vendored from cdnjs 6.4.0; SHA-256 in static/vendor/VENDORED_HASHES.txt) -->
+    <link rel="stylesheet" href="{{ url_for('static', filename='vendor/fontawesome.min.css') }}">
+
+    <!-- Display fonts for the journal and analysis tools -->
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Cormorant+Garamond:ital,wght@0,400;0,500;0,600;1,400;1,500&family=IBM+Plex+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+
+    <style>
+        :root {
+            --serif: 'Cormorant Garamond', Georgia, serif;
+            --sans: 'IBM Plex Sans', system-ui, sans-serif;
+            --mono: 'JetBrains Mono', monospace;
+            --journal-green: #2d4a3e;
+            --journal-dark: #1a2f23;
+            --journal-gold: #c9a962;
+            --journal-gold-light: #e5d4a1;
+            --journal-cream: #f8f6f0;
+            --bg: #14241b;
+            --panel: #1c3025;
+            --line: #355245;
+            --line-gold: #6a5a36;
+            --text: #ece4cf;
+            --text-dim: #b9b29a;
+            --text-mute: #8a8770;
+            --gold-soft: #e5d4a1;
+        }
+
+        body {
+            font-family: var(--sans);
+        }
+
+        .font-mono {
+            font-family: var(--mono);
+        }
+    </style>
+
+    {% block head %}{% endblock %}
+</head>
+
+<body class="bg-journal-cream dark:bg-journal-dark min-h-screen transition-colors duration-300">
+
+    <!-- Navigation Bar -->
+    <nav class="bg-journal-dark shadow-lg sticky top-0 z-50">
+        <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
+            <div class="flex justify-between items-center h-16">
+                <!-- Logo & Title -->
+                <div class="flex items-center space-x-3">
+                    <div class="w-10 h-10 bg-journal-gold rounded-full flex items-center justify-center">
+                        <i class="fas fa-dna text-journal-dark text-lg"></i>
+                    </div>
+                    <div>
+                        <h1 class="text-white text-xl font-bold">Dikarya</h1>
+                        <p class="text-gray-300 text-xs uppercase tracking-wider hidden sm:block">{% block subtitle
+                            %}Mycological Tools{% endblock %}</p>
+                    </div>
+                </div>
+
+                <!-- Desktop Navigation Links -->
+                <div class="hidden md:flex items-center space-x-6">
+                    <a href="{{ url_for('journal.home') }}"
+                        class="text-gray-300 hover:text-journal-gold transition-colors text-sm font-medium">
+                        <i class="fas fa-book mr-1"></i> Journal Home
+                    </a>
+                    <a href="{{ url_for('main.whats_new') }}"
+                        class="text-gray-300 hover:text-journal-gold transition-colors text-sm font-medium relative {% block nav_whats_new %}{% endblock %}">
+                        <i class="fas fa-star mr-1"></i> What's New
+                        {% if whats_new_has_new %}
+                        <span class="absolute -top-1.5 -right-2 w-2.5 h-2.5 bg-journal-gold rounded-full border border-journal-dark" title="New updates available"></span>
+                        {% endif %}
+                    </a>
+                    <a href="{{ url_for('main.sequence_entry') }}"
+                        class="text-gray-300 hover:text-journal-gold transition-colors text-sm font-medium {% block nav_tree_builder %}{% endblock %}">
+                        <i class="fas fa-tree mr-1"></i> Tree Builder
+                    </a>
+                    {% if current_user.is_authenticated %}
+                    <span class="text-xs text-gray-400 italic" title="You are signed in">
+                        <i class="fas fa-user-check mr-1"></i>{{ current_user.email }}
+                    </span>
+                    <a href="{{ url_for('user.user_jobs') }}"
+                        class="text-gray-300 hover:text-journal-gold transition-colors text-sm font-medium {% block nav_my_jobs %}{% endblock %}">
+                        <i class="fas fa-tasks mr-1"></i> My Jobs
+                    </a>
+                    <a href="{{ url_for('auth.logout') }}"
+                        class="text-gray-300 hover:text-journal-gold transition-colors text-sm font-medium">
+                        <i class="fas fa-sign-out-alt mr-1"></i> Logout
+                    </a>
+                    {% else %}
+                    <span class="text-xs text-gray-400 italic" title="Not signed in — anyone with a job link can edit that job. Log in for exclusive edit access.">
+                        <i class="fas fa-user-secret mr-1"></i>Anonymous
+                    </span>
+                    <a href="{{ url_for('auth.login') }}"
+                        class="text-gray-300 hover:text-journal-gold transition-colors text-sm font-medium">
+                        <i class="fas fa-sign-in-alt mr-1"></i> Login
+                    </a>
+                    <a href="{{ url_for('auth.register') }}"
+                        class="bg-journal-gold text-journal-dark px-4 py-2 rounded-lg text-sm font-semibold hover:bg-journal-gold-light transition-colors">
+                        Register
+                    </a>
+                    {% endif %}
+                </div>
+
+                <!-- Right side: Dark Mode Toggle + Mobile Menu Button -->
+                <div class="flex items-center space-x-2">
+                    <!-- Dark Mode Toggle -->
+                    <button id="dark-mode-toggle"
+                        class="p-2 rounded-lg bg-journal-green hover:bg-journal-gold transition-colors group"
+                        title="Toggle dark mode">
+                        <i id="dark-mode-icon"
+                            class="fas fa-moon text-gray-300 group-hover:text-journal-dark transition-colors"></i>
+                    </button>
+
+                    <!-- Mobile Menu Button (hidden on desktop) -->
+                    <button id="mobile-menu-btn"
+                        class="md:hidden p-2 rounded-lg bg-journal-green hover:bg-journal-gold transition-colors group"
+                        title="Menu">
+                        <i id="mobile-menu-icon"
+                            class="fas fa-bars text-gray-300 group-hover:text-journal-dark transition-colors"></i>
+                    </button>
+                </div>
+            </div>
+        </div>
+
+        <!-- Mobile Menu Panel (hidden by default) -->
+        <div id="mobile-menu" class="md:hidden hidden bg-journal-green border-t border-journal-dark">
+            <div class="px-4 py-4 space-y-3">
+                <a href="{{ url_for('journal.home') }}"
+                    class="block text-gray-200 hover:text-journal-gold transition-colors font-medium py-2">
+                    <i class="fas fa-book mr-2 w-5"></i> Journal Home
+                </a>
+                <a href="{{ url_for('main.whats_new') }}"
+                    class="flex items-center text-gray-200 hover:text-journal-gold transition-colors font-medium py-2">
+                    <i class="fas fa-star mr-2 w-5"></i> What's New
+                    {% if whats_new_has_new %}
+                    <span class="ml-2 w-2 h-2 bg-journal-gold rounded-full flex-shrink-0"></span>
+                    {% endif %}
+                </a>
+                <a href="{{ url_for('main.sequence_entry') }}"
+                    class="block text-gray-200 hover:text-journal-gold transition-colors font-medium py-2">
+                    <i class="fas fa-tree mr-2 w-5"></i> Tree Builder
+                </a>
+                {% if current_user.is_authenticated %}
+                <div class="text-xs text-gray-400 italic py-2 border-t border-journal-dark">
+                    <i class="fas fa-user-check mr-2 w-5"></i>Signed in as {{ current_user.email }}
+                </div>
+                <a href="{{ url_for('user.user_jobs') }}"
+                    class="block text-gray-200 hover:text-journal-gold transition-colors font-medium py-2">
+                    <i class="fas fa-tasks mr-2 w-5"></i> My Jobs
+                </a>
+                <div class="border-t border-journal-dark pt-3 mt-3">
+                    <a href="{{ url_for('auth.logout') }}"
+                        class="block text-gray-200 hover:text-journal-gold transition-colors font-medium py-2">
+                        <i class="fas fa-sign-out-alt mr-2 w-5"></i> Logout
+                    </a>
+                </div>
+                {% else %}
+                <div class="text-xs text-gray-400 italic py-2 border-t border-journal-dark">
+                    <i class="fas fa-user-secret mr-2 w-5"></i>Anonymous &mdash; anyone with a job link can edit it
+                </div>
+                <div class="border-t border-journal-dark pt-3 mt-3">
+                    <a href="{{ url_for('auth.login') }}"
+                        class="block text-gray-200 hover:text-journal-gold transition-colors font-medium py-2">
+                        <i class="fas fa-sign-in-alt mr-2 w-5"></i> Login
+                    </a>
+                    <a href="{{ url_for('auth.register') }}"
+                        class="block bg-journal-gold text-journal-dark px-4 py-2 rounded-lg font-semibold text-center mt-2 hover:bg-journal-gold-light transition-colors">
+                        Register
+                    </a>
+                </div>
+                {% endif %}
+            </div>
+        </div>
+    </nav>
+
+    <!-- Flash Messages -->
+    {% with messages = get_flashed_messages(with_categories=true) %}
+    {% if messages %}
+    <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 pt-4">
+        {% for category, message in messages %}
+        <div
+            class="mb-2 px-4 py-3 rounded-lg {% if category == 'error' %}bg-red-100 text-red-800 dark:bg-red-900 dark:text-red-200{% elif category == 'success' %}bg-green-100 text-green-800 dark:bg-green-900 dark:text-green-200{% else %}bg-blue-100 text-blue-800 dark:bg-blue-900 dark:text-blue-200{% endif %}">
+            {{ message }}
+        </div>
+        {% endfor %}
+    </div>
+    {% endif %}
+    {% endwith %}
+
+    <!-- Main Content -->
+    <main class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-8">
+        {% block content %}{% endblock %}
+    </main>
+
+    <!-- Footer -->
+    <footer class="bg-journal-dark text-gray-400 py-8 mt-12">
+        <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 text-center">
+            <p>&copy; 2026 Dikarya Project. <a href="https://creativecommons.org/licenses/by/4.0/" target="_blank"
+                    rel="noopener">CC BY 4.0.</a></p>
+            <div class="mt-4 flex justify-center space-x-6">
+                <a href="{{ url_for('main.todo') }}"
+                    class="text-gray-500 hover:text-journal-gold transition-colors text-sm">
+                    <i class="fas fa-tasks mr-1"></i> Development To-Do List
+                </a>
+            </div>
+        </div>
+    </footer>
+
+    <!-- Status Alert Container (for auto-dismiss messages) -->
+    <div id="status_alert" class="fixed bottom-6 left-1/2 transform -translate-x-1/2 
+                                   px-6 py-4 rounded-xl shadow-2xl font-medium text-sm
+                                   transition-all duration-300 opacity-0 translate-y-4 pointer-events-none z-50">
+    </div>
+
+    <!-- Base Scripts -->
+    <script>
+        // =========================================================================
+        // Dark Mode Toggle
+        // =========================================================================
+        const darkModeToggle = document.getElementById('dark-mode-toggle');
+        const darkModeIcon = document.getElementById('dark-mode-icon');
+        const html = document.documentElement;
+
+        function initDarkMode() {
+            const savedTheme = localStorage.getItem('theme');
+            if (savedTheme === 'dark' || (!savedTheme && window.matchMedia('(prefers-color-scheme: dark)').matches)) {
+                html.classList.add('dark');
+                darkModeIcon.classList.remove('fa-moon');
+                darkModeIcon.classList.add('fa-sun');
+            }
+        }
+
+        darkModeToggle.addEventListener('click', () => {
+            html.classList.toggle('dark');
+            const isDark = html.classList.contains('dark');
+            localStorage.setItem('theme', isDark ? 'dark' : 'light');
+
+            if (isDark) {
+                darkModeIcon.classList.remove('fa-moon');
+                darkModeIcon.classList.add('fa-sun');
+            } else {
+                darkModeIcon.classList.remove('fa-sun');
+                darkModeIcon.classList.add('fa-moon');
+            }
+        });
+
+        initDarkMode();
+
+        // =========================================================================
+        // Mobile Menu Toggle
+        // =========================================================================
+        const mobileMenuBtn = document.getElementById('mobile-menu-btn');
+        const mobileMenu = document.getElementById('mobile-menu');
+        const mobileMenuIcon = document.getElementById('mobile-menu-icon');
+
+        mobileMenuBtn.addEventListener('click', () => {
+            const isOpen = !mobileMenu.classList.contains('hidden');
+
+            if (isOpen) {
+                mobileMenu.classList.add('hidden');
+                mobileMenuIcon.classList.remove('fa-times');
+                mobileMenuIcon.classList.add('fa-bars');
+            } else {
+                mobileMenu.classList.remove('hidden');
+                mobileMenuIcon.classList.remove('fa-bars');
+                mobileMenuIcon.classList.add('fa-times');
+            }
+        });
+
+        // Close mobile menu when clicking outside
+        document.addEventListener('click', (e) => {
+            if (!mobileMenuBtn.contains(e.target) && !mobileMenu.contains(e.target)) {
+                mobileMenu.classList.add('hidden');
+                mobileMenuIcon.classList.remove('fa-times');
+                mobileMenuIcon.classList.add('fa-bars');
+            }
+        });
+
+        // =========================================================================
+        // Status Alert Functions (available globally)
+        // =========================================================================
+        let statusTimeout = null;
+
+        function showStatus(message, type = 'info') {
+            const statusAlert = document.getElementById('status_alert');
+
+            if (statusTimeout) {
+                clearTimeout(statusTimeout);
+            }
+
+            statusAlert.className = 'fixed bottom-6 left-1/2 transform -translate-x-1/2 px-6 py-4 rounded-xl shadow-2xl font-medium text-sm transition-all duration-300 z-50';
+
+            if (type === 'success') {
+                statusAlert.classList.add('bg-green-500', 'text-white');
+            } else if (type === 'error') {
+                statusAlert.classList.add('bg-red-500', 'text-white');
+            } else {
+                statusAlert.classList.add('bg-blue-500', 'text-white');
+            }
+
+            statusAlert.textContent = message;
+            statusAlert.classList.remove('opacity-0', 'translate-y-4', 'pointer-events-none');
+
+            statusTimeout = setTimeout(() => {
+                statusAlert.classList.add('opacity-0', 'translate-y-4', 'pointer-events-none');
+            }, 5000);
+        }
+    </script>
+
+    {% block scripts %}{% endblock %}
+
+</body>
+
+</html>

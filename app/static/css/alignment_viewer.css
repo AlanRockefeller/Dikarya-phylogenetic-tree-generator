@@ -1,0 +1,472 @@
+/* Dikarya Alignment Viewer styles */
+
+.alignment-viewer {
+    display: flex;
+    flex-direction: column;
+    background: #ffffff;
+    color: #1f2937;
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+
+.dark .alignment-viewer {
+    background: #0a1716;
+    color: #e5e7eb;
+}
+
+/* ============================================================
+   Dark-mode color schemes. Each scheme defines CSS custom
+   properties on the .alignment-viewer root. Light mode ignores
+   them and uses the existing static colors.
+   ============================================================ */
+
+.dark .alignment-viewer[data-color-scheme="moss"] {
+    --av-bg: #1a1f1c;
+    --av-alt-row-bg: #1e2420;
+    --av-name-bg: #161b18;
+    --av-name-text: #8a9b8e;
+    --av-consensus-bg: #212a25;
+    --av-consensus-name-text: #b0c4b6;
+    --av-gap: #2a332d;
+    --av-match-dim: #3d4a42;
+    --av-base-a: #7cba6a;
+    --av-base-t: #c4885e;
+    --av-base-g: #d4a94e;
+    --av-base-c: #5ea4b8;
+    --av-diff-bg: #5c4a1a;
+    --av-diff-border: rgba(124, 186, 106, 0.3);
+    --av-diff-bg-a: #1e2a1e; --av-diff-fg-a: #8cd47a;
+    --av-diff-bg-t: #2a2218; --av-diff-fg-t: #e8c06a;
+    --av-diff-bg-g: #1e2a18; --av-diff-fg-g: #b8d86a;
+    --av-diff-bg-c: #1a2230; --av-diff-fg-c: #7cc4e8;
+}
+
+.dark .alignment-viewer[data-color-scheme="arctic"] {
+    --av-bg: #181c24;
+    --av-alt-row-bg: #1c2029;
+    --av-name-bg: #14171e;
+    --av-name-text: #7b8699;
+    --av-consensus-bg: #1f2432;
+    --av-consensus-name-text: #a3b1c8;
+    --av-gap: #252a36;
+    --av-match-dim: #353b4a;
+    --av-base-a: #6db3d4;
+    --av-base-t: #e07a6a;
+    --av-base-g: #a88ad4;
+    --av-base-c: #5ec4a0;
+    --av-diff-bg: #3a2a18;
+    --av-diff-border: rgba(224, 122, 106, 0.3);
+    --av-diff-bg-a: #182430; --av-diff-fg-a: #88d0f0;
+    --av-diff-bg-t: #2a1c1a; --av-diff-fg-t: #f09080;
+    --av-diff-bg-g: #221e30; --av-diff-fg-g: #bea0e8;
+    --av-diff-bg-c: #1a2a28; --av-diff-fg-c: #78e0be;
+}
+
+.dark .alignment-viewer[data-color-scheme="forest"] {
+    --av-bg: #0f1814;
+    --av-alt-row-bg: #131d18;
+    --av-name-bg: #0a110d;
+    --av-name-text: #9aa195;
+    --av-consensus-bg: #1a2620;
+    --av-consensus-name-text: #c4bda8;
+    --av-gap: #252e28;
+    --av-match-dim: #3d4640;
+    --av-base-a: #c9826f;
+    --av-base-t: #8fab7e;
+    --av-base-g: #d4ac62;
+    --av-base-c: #7fa8c4;
+    --av-diff-bg: #3a2c1a;
+    --av-diff-border: rgba(212, 172, 98, 0.3);
+    --av-diff-bg-a: #2a1e18; --av-diff-fg-a: #e09880;
+    --av-diff-bg-t: #1e2a1e; --av-diff-fg-t: #a8c290;
+    --av-diff-bg-g: #28221a; --av-diff-fg-g: #e6c478;
+    --av-diff-bg-c: #1a2630; --av-diff-fg-c: #95c0d8;
+}
+
+.dark .alignment-viewer[data-color-scheme="solarized"] {
+    --av-bg: #002b36;
+    --av-alt-row-bg: #063540;
+    --av-name-bg: #001f27;
+    --av-name-text: #657b83;
+    --av-consensus-bg: #073642;
+    --av-consensus-name-text: #93a1a1;
+    --av-gap: #0a3845;
+    --av-match-dim: #1f3d47;
+    --av-base-a: #cb4b16;
+    --av-base-t: #859900;
+    --av-base-g: #b58900;
+    --av-base-c: #268bd2;
+    --av-diff-bg: #3d2e0a;
+    --av-diff-border: rgba(181, 137, 0, 0.3);
+    --av-diff-bg-a: #2e1a0a; --av-diff-fg-a: #e07140;
+    --av-diff-bg-t: #1e2a0a; --av-diff-fg-t: #b8c440;
+    --av-diff-bg-g: #2a220a; --av-diff-fg-g: #d4a838;
+    --av-diff-bg-c: #0a2433; --av-diff-fg-c: #5cb3e6;
+}
+
+/* Apply scheme variables to the dark viewer surfaces. */
+.dark .alignment-viewer[data-color-scheme] {
+    background: var(--av-bg);
+}
+
+.alignment-viewer-grid {
+    display: grid;
+    grid-template-columns: minmax(180px, 22rem) 1fr;
+    /* Row 1 = corner+ruler, Row 2 = consensus name+strip, Row 3 = names+cells. */
+    grid-template-rows: auto auto 1fr;
+    overflow: hidden;
+}
+
+.alignment-viewer .av-ruler-corner,
+.alignment-viewer .av-names-header {
+    background: #f3f4f6;
+    border-bottom: 1px solid #e5e7eb;
+    border-right: 1px solid #e5e7eb;
+    font-size: 11px;
+    padding: 4px 8px;
+    color: #374151;
+    position: sticky;
+    top: 0;
+    z-index: 3;
+}
+
+.dark .alignment-viewer .av-ruler-corner,
+.dark .alignment-viewer .av-names-header {
+    background: #122322;
+    border-color: #1f3a36;
+    color: #d1d5db;
+}
+
+.dark .alignment-viewer[data-color-scheme] .av-names-header {
+    background: var(--av-name-bg);
+    color: var(--av-name-text);
+    border-color: var(--av-gap);
+}
+
+.alignment-viewer .av-ruler {
+    overflow: hidden;
+    border-bottom: 1px solid #e5e7eb;
+    background: #f9fafb;
+    white-space: nowrap;
+    font-size: 10px;
+    color: #6b7280;
+    height: 18px;
+}
+.alignment-viewer .av-consensus-name {
+    background: #f3f4f6;
+    border-bottom: 1px solid #e5e7eb;
+    border-right: 1px solid #e5e7eb;
+    color: #b45309;
+    font-weight: 600;
+    font-size: 12px;
+    padding: 0 8px;
+    line-height: 18px;
+    height: 18px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+.dark .alignment-viewer .av-consensus-name {
+    background: #122322;
+    border-color: #1f3a36;
+    color: #f3c969;
+}
+.dark .alignment-viewer[data-color-scheme] .av-consensus-name {
+    background: var(--av-consensus-bg);
+    color: var(--av-consensus-name-text);
+    border-color: var(--av-gap);
+}
+.alignment-viewer .av-consensus-strip {
+    overflow: hidden;
+    border-bottom: 1px solid #e5e7eb;
+    background: #f9fafb;
+    height: 18px;
+}
+.dark .alignment-viewer .av-consensus-strip {
+    background: #0e1d1c;
+    border-color: #1f3a36;
+}
+.dark .alignment-viewer[data-color-scheme] .av-consensus-strip {
+    background: var(--av-consensus-bg);
+    border-color: var(--av-gap);
+}
+
+.dark .alignment-viewer .av-ruler {
+    background: #0e1d1c;
+    border-color: #1f3a36;
+    color: #9ca3af;
+}
+.dark .alignment-viewer[data-color-scheme] .av-ruler {
+    background: var(--av-bg);
+    color: var(--av-name-text);
+    border-color: var(--av-gap);
+}
+
+.alignment-viewer .av-names {
+    /* Virtualization: namesInner is translateY()'d to follow cells scroll; no native scrolling here. */
+    overflow: hidden;
+    background: #ffffff;
+    border-right: 1px solid #e5e7eb;
+    font-size: 12px;
+    font-family: 'IBM Plex Mono', ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+
+.dark .alignment-viewer .av-names {
+    background: #0a1716;
+    border-color: #1f3a36;
+}
+.dark .alignment-viewer[data-color-scheme] .av-names {
+    background: var(--av-name-bg);
+    color: var(--av-name-text);
+    border-color: var(--av-gap);
+}
+/* Sequence name text is always white in dark themes for maximum readability. */
+.dark .alignment-viewer[data-color-scheme] .av-name-text {
+    color: #ffffff;
+}
+
+.alignment-viewer .av-cells {
+    overflow: auto;
+    background: #ffffff;
+    position: relative;
+}
+
+.dark .alignment-viewer .av-cells {
+    background: #0a1716;
+}
+.dark .alignment-viewer[data-color-scheme] .av-cells {
+    background: var(--av-bg);
+}
+
+.alignment-viewer .av-name-row,
+.alignment-viewer .av-cell-row {
+    display: flex;
+    align-items: center;
+    height: 18px;
+    line-height: 18px;
+    white-space: pre;
+}
+
+.alignment-viewer .av-name-row {
+    padding: 0 8px;
+    gap: 6px;
+    border-bottom: 1px solid transparent;
+    cursor: default;
+}
+
+/* Alternating row shading — driven by logical row index from the renderer. */
+.dark .alignment-viewer[data-color-scheme] .av-name-row.av-row-alt,
+.dark .alignment-viewer[data-color-scheme] .av-cell-row.av-row-alt {
+    background: var(--av-alt-row-bg);
+}
+
+.alignment-viewer .av-name-row:hover,
+.alignment-viewer .av-cell-row:hover {
+    background: rgba(245, 158, 11, 0.08);
+}
+
+.alignment-viewer .av-name-text {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    flex: 1;
+}
+
+.alignment-viewer .av-name-score {
+    font-size: 10px;
+    color: #6b7280;
+    font-variant-numeric: tabular-nums;
+}
+
+.dark .alignment-viewer .av-name-score {
+    color: #9ca3af;
+}
+
+.alignment-viewer .av-consensus-row .av-name-text {
+    font-weight: 600;
+    color: #b45309;
+}
+
+.dark .alignment-viewer .av-consensus-row .av-name-text {
+    color: #f3c969;
+}
+
+.alignment-viewer .av-cell {
+    display: inline-block;
+    width: 12px;
+    height: 18px;
+    line-height: 18px;
+    text-align: center;
+    font-size: 11px;
+    font-weight: 600;
+    color: #1f2937;
+    font-family: 'IBM Plex Mono', ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+
+.dark .alignment-viewer .av-cell {
+    color: #f3f4f6;
+}
+
+/* Light-mode base palette (unchanged, intentionally muted). */
+.alignment-viewer .av-cell.av-a { background: #edf7f1; color: #1f2937; }
+.alignment-viewer .av-cell.av-c { background: #eef3fa; color: #1f2937; }
+.alignment-viewer .av-cell.av-g { background: #f7f3e8; color: #3f3a2a; }
+.alignment-viewer .av-cell.av-t { background: #f8eeec; color: #1f2937; }
+.alignment-viewer .av-cell.av-u { background: #f8eeec; color: #1f2937; }
+.alignment-viewer .av-cell.av-gap { background: transparent; color: #c7cdd3; }
+.alignment-viewer .av-cell.av-amb { background: #f1f3f5; color: #6b7280; }
+
+/* Dark-mode legacy palette (only used if no data-color-scheme is set). */
+.dark .alignment-viewer .av-cell.av-a { background: #112a25; color: #95d3b8; }
+.dark .alignment-viewer .av-cell.av-c { background: #14233a; color: #a7c0e6; }
+.dark .alignment-viewer .av-cell.av-g { background: #2a2410; color: #d8c277; }
+.dark .alignment-viewer .av-cell.av-t { background: #2a1818; color: #e4a8a8; }
+.dark .alignment-viewer .av-cell.av-u { background: #2a1818; color: #e4a8a8; }
+.dark .alignment-viewer .av-cell.av-gap { background: transparent; color: #2f3a37; }
+.dark .alignment-viewer .av-cell.av-amb { background: #161f1d; color: #7c8a86; }
+
+/* Dark-mode schemed palette — text colors only; backgrounds are the row tint. */
+.dark .alignment-viewer[data-color-scheme] .av-cell.av-a { background: transparent; color: var(--av-base-a); }
+.dark .alignment-viewer[data-color-scheme] .av-cell.av-t { background: transparent; color: var(--av-base-t); }
+.dark .alignment-viewer[data-color-scheme] .av-cell.av-u { background: transparent; color: var(--av-base-t); }
+.dark .alignment-viewer[data-color-scheme] .av-cell.av-g { background: transparent; color: var(--av-base-g); }
+.dark .alignment-viewer[data-color-scheme] .av-cell.av-c { background: transparent; color: var(--av-base-c); }
+.dark .alignment-viewer[data-color-scheme] .av-cell.av-gap { background: transparent; color: var(--av-gap); }
+.dark .alignment-viewer[data-color-scheme] .av-cell.av-amb { background: transparent; color: var(--av-name-text); }
+
+/* ============================================================
+   Highlight Differences — per-base color carries the identity.
+   No shared amber background, no box-shadow.
+   ============================================================ */
+.alignment-viewer .av-cell.av-match { /* default: no special style */ }
+.alignment-viewer .av-cell.is-diff { /* default: no special style */ }
+
+/* Light-mode fallback (no `.dark` ancestor): muted pastel tints with saturated text. */
+.alignment-viewer.alignment-highlight-differences .av-cell.is-diff.av-a { background: #d4f0d4; color: #1a6030; }
+.alignment-viewer.alignment-highlight-differences .av-cell.is-diff.av-t,
+.alignment-viewer.alignment-highlight-differences .av-cell.is-diff.av-u { background: #f0e0c8; color: #7a4a10; }
+.alignment-viewer.alignment-highlight-differences .av-cell.is-diff.av-g { background: #e0ecc0; color: #4a6010; }
+.alignment-viewer.alignment-highlight-differences .av-cell.is-diff.av-c { background: #c8e0f0; color: #10506a; }
+
+/* Small/medium dark grid: per-base diff highlight at full brightness, bold. */
+.dark .alignment-viewer.alignment-highlight-differences:not(.alignment-large-grid) .av-cell.is-diff.av-a {
+    background: var(--av-diff-bg-a); color: var(--av-diff-fg-a); font-weight: 700;
+}
+.dark .alignment-viewer.alignment-highlight-differences:not(.alignment-large-grid) .av-cell.is-diff.av-t,
+.dark .alignment-viewer.alignment-highlight-differences:not(.alignment-large-grid) .av-cell.is-diff.av-u {
+    background: var(--av-diff-bg-t); color: var(--av-diff-fg-t); font-weight: 700;
+}
+.dark .alignment-viewer.alignment-highlight-differences:not(.alignment-large-grid) .av-cell.is-diff.av-g {
+    background: var(--av-diff-bg-g); color: var(--av-diff-fg-g); font-weight: 700;
+}
+.dark .alignment-viewer.alignment-highlight-differences:not(.alignment-large-grid) .av-cell.is-diff.av-c {
+    background: var(--av-diff-bg-c); color: var(--av-diff-fg-c); font-weight: 700;
+}
+
+/* Large-grid dark: same per-base colors, no font-weight change. */
+.dark .alignment-viewer.alignment-highlight-differences.alignment-large-grid .av-cell.is-diff.av-a {
+    background: var(--av-diff-bg-a); color: var(--av-diff-fg-a);
+}
+.dark .alignment-viewer.alignment-highlight-differences.alignment-large-grid .av-cell.is-diff.av-t,
+.dark .alignment-viewer.alignment-highlight-differences.alignment-large-grid .av-cell.is-diff.av-u {
+    background: var(--av-diff-bg-t); color: var(--av-diff-fg-t);
+}
+.dark .alignment-viewer.alignment-highlight-differences.alignment-large-grid .av-cell.is-diff.av-g {
+    background: var(--av-diff-bg-g); color: var(--av-diff-fg-g);
+}
+.dark .alignment-viewer.alignment-highlight-differences.alignment-large-grid .av-cell.is-diff.av-c {
+    background: var(--av-diff-bg-c); color: var(--av-diff-fg-c);
+}
+
+/* Match dimming (unchanged). */
+.alignment-viewer.alignment-highlight-differences .av-cell.av-match {
+    color: #b6bcc4;
+}
+.dark .alignment-viewer.alignment-highlight-differences:not([data-color-scheme]) .av-cell.av-match {
+    color: #58615f;
+}
+.dark .alignment-viewer[data-color-scheme].alignment-highlight-differences .av-cell.av-match {
+    color: var(--av-match-dim);
+}
+
+/* ============================================================
+   Column-position ruler — quiet navigational aid.
+   ============================================================ */
+.alignment-viewer .av-ruler-tick {
+    display: inline-block;
+    width: 12px;
+    text-align: center;
+    font-size: 9px;
+    color: inherit;
+    border-left: 1px solid transparent;
+    font-variant-numeric: tabular-nums;
+}
+
+.alignment-viewer .av-ruler-tick.av-major {
+    border-left-color: #d1d5db;
+    color: #9ca3af;
+    font-weight: 500;
+    position: relative;
+}
+.alignment-viewer .av-ruler-tick.av-major::after {
+    content: "";
+    position: absolute;
+    left: 50%;
+    bottom: -1px;
+    width: 1px;
+    height: 3px;
+    background: currentColor;
+    transform: translateX(-50%);
+    opacity: 0.7;
+}
+
+.dark .alignment-viewer .av-ruler-tick.av-major {
+    border-left-color: #1f3a36;
+    color: #9ca3af;
+}
+.dark .alignment-viewer[data-color-scheme] .av-ruler-tick.av-major {
+    border-left-color: var(--av-gap);
+    color: var(--av-name-text);
+}
+
+.alignment-viewer .av-cell.av-hidden-col,
+.alignment-viewer .av-ruler-tick.av-hidden-col {
+    display: none;
+}
+
+/* Uppercase nucleotide display — pure CSS so virtualized cells inherit on render. */
+.alignment-viewer.alignment-uppercase .av-cell {
+    text-transform: uppercase;
+}
+
+/* ============================================================
+   Header close (×) button — minimal, upper-right styling.
+   ============================================================ */
+#alignment-viewer-close.av-close-btn {
+    position: absolute;
+    top: 8px;
+    right: 8px;
+    z-index: 11;
+    width: 32px;
+    height: 32px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    background: transparent;
+    border: 0;
+    color: #6b7280;
+    font-size: 17px;
+    border-radius: 6px;
+    transition: background 0.12s ease, color 0.12s ease;
+    cursor: pointer;
+}
+#alignment-viewer-close.av-close-btn:hover {
+    background: rgba(0, 0, 0, 0.04);
+    color: #111827;
+}
+.dark #alignment-viewer-close.av-close-btn {
+    color: #8a9b8e;
+}
+.dark #alignment-viewer-close.av-close-btn:hover {
+    background: rgba(255, 255, 255, 0.04);
+    color: #e5e7eb;
+}

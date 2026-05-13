@@ -1,0 +1,107 @@
+<!-- Alignment Viewer Modal -->
+<div id="modal-alignment-viewer" class="fixed inset-0 z-50 hidden" aria-labelledby="alignment-viewer-title" role="dialog" aria-modal="true">
+    <div class="fixed inset-0 bg-black/60 dark:bg-black/80" id="alignment-viewer-backdrop"></div>
+    <div class="fixed inset-2 md:inset-6 z-10 flex flex-col rounded-xl bg-white dark:bg-journal-green shadow-2xl border border-gray-200 dark:border-journal-dark overflow-hidden">
+        <!-- Sticky Header -->
+        <div class="relative flex flex-wrap items-center gap-3 px-4 py-3 pr-14 border-b border-gray-200 dark:border-journal-dark bg-white dark:bg-journal-green sticky top-0 z-10">
+            <h3 id="alignment-viewer-title" class="text-lg font-bold text-journal-dark dark:text-gray-100 flex items-center gap-2 mr-2">
+                <i class="fas fa-stream text-journal-gold"></i> Alignment Viewer
+            </h3>
+            <span id="alignment-viewer-stats" class="text-xs font-mono text-gray-600 dark:text-gray-300"></span>
+
+            <div class="flex-1"></div>
+
+            <!-- Include pruned toggle (shown only when relevant) -->
+            <label id="alignment-include-pruned-wrap" class="hidden items-center gap-1.5 text-xs font-medium text-gray-700 dark:text-gray-200 cursor-pointer select-none">
+                <input type="checkbox" id="alignment-include-pruned"
+                    class="rounded border-gray-300 text-journal-gold focus:ring-journal-gold w-3.5 h-3.5">
+                <span id="alignment-include-pruned-label">Include Pruned Sequences</span>
+            </label>
+
+            <!-- Sort control -->
+            <select id="alignment-sort-mode"
+                class="text-xs bg-white dark:bg-journal-dark text-gray-800 dark:text-gray-100 border border-gray-300 dark:border-gray-600 rounded px-2 py-1 focus:ring-journal-gold focus:border-journal-gold">
+                <option value="tree">Tree order</option>
+                <option value="name_asc">Name A–Z</option>
+                <option value="name_desc">Name Z–A</option>
+                <option value="similar">Similarity to reference</option>
+                <option value="different">Most different from reference</option>
+                <option value="length">Length</option>
+                <option value="leading_gaps">Leading gaps</option>
+            </select>
+
+            <!-- Reference selector (shown only for similarity sorts) -->
+            <select id="alignment-reference"
+                class="hidden text-xs bg-white dark:bg-journal-dark text-gray-800 dark:text-gray-100 border border-gray-300 dark:border-gray-600 rounded px-2 py-1 max-w-[14rem] focus:ring-journal-gold focus:border-journal-gold"
+                title="Reference sequence for similarity sort"></select>
+
+            <!-- Search -->
+            <input type="text" id="alignment-filter" placeholder="Filter sequences..."
+                class="text-xs bg-white dark:bg-journal-dark text-gray-800 dark:text-gray-100 border border-gray-300 dark:border-gray-600 rounded px-2 py-1 w-44 focus:ring-journal-gold focus:border-journal-gold">
+
+            <!-- Color scheme picker (dark-mode only effect, but always visible) -->
+            <select id="alignment-color-scheme"
+                class="text-xs bg-white dark:bg-journal-dark text-gray-800 dark:text-gray-100 border border-gray-300 dark:border-gray-600 rounded px-2 py-1 focus:ring-journal-gold focus:border-journal-gold"
+                title="Color scheme">
+                <option value="moss">Moss &amp; stone</option>
+                <option value="arctic" selected>Arctic dusk</option>
+                <option value="forest">Forest</option>
+                <option value="solarized">Solarized</option>
+            </select>
+
+            <button type="button" id="alignment-copy-fasta"
+                class="px-2 py-1 text-xs rounded bg-gray-100 dark:bg-journal-dark text-gray-700 dark:text-gray-200 hover:bg-gray-200 dark:hover:bg-gray-800 border border-gray-300 dark:border-gray-600"
+                title="Copy displayed records as FASTA">
+                <i class="fas fa-copy"></i> Copy
+            </button>
+            <button type="button" id="alignment-download-fasta"
+                class="px-2 py-1 text-xs rounded bg-journal-gold text-journal-dark hover:bg-journal-gold-light"
+                title="Download displayed records as FASTA">
+                <i class="fas fa-download"></i> FASTA
+            </button>
+            <button type="button" id="alignment-viewer-close"
+                class="av-close-btn" title="Close" aria-label="Close alignment viewer">
+                <i class="fas fa-times"></i>
+            </button>
+
+            <!-- Line break to push difference toggles onto a new row -->
+            <div class="basis-full h-0"></div>
+
+            <!-- Difference toggles -->
+            <label class="flex items-center gap-1.5 text-xs font-medium text-gray-700 dark:text-gray-200 cursor-pointer select-none"
+                title="Highlights any non-gap base that doesn't match the column's consensus letter. Consensus is the most frequent non-gap, non-N base in each column over the displayed sequences.">
+                <input type="checkbox" id="alignment-highlight-diffs"
+                    class="rounded border-gray-300 text-journal-gold focus:ring-journal-gold w-3.5 h-3.5">
+                Highlight differences
+            </label>
+            <label class="flex items-center gap-1.5 text-xs font-medium text-gray-700 dark:text-gray-200 cursor-pointer select-none">
+                <input type="checkbox" id="alignment-variable-only"
+                    class="rounded border-gray-300 text-journal-gold focus:ring-journal-gold w-3.5 h-3.5">
+                Variable columns only
+            </label>
+            <label class="flex items-center gap-1.5 text-xs font-medium text-gray-700 dark:text-gray-200 cursor-pointer select-none"
+                title="Hide columns where every displayed sequence has a gap. Coordinates still refer to the original alignment.">
+                <input type="checkbox" id="alignment-compact-gaps" checked
+                    class="rounded border-gray-300 text-journal-gold focus:ring-journal-gold w-3.5 h-3.5">
+                Compact gap-only columns
+            </label>
+            <label class="flex items-center gap-1.5 text-xs font-medium text-gray-700 dark:text-gray-200 cursor-pointer select-none"
+                title="Display all nucleotide letters in uppercase">
+                <input type="checkbox" id="alignment-uppercase"
+                    class="rounded border-gray-300 text-journal-gold focus:ring-journal-gold w-3.5 h-3.5">
+                Uppercase
+            </label>
+        </div>
+
+        <!-- Warnings -->
+        <div id="alignment-warnings" class="hidden px-4 py-2 text-xs text-yellow-900 bg-yellow-50 border-b border-yellow-200 dark:bg-yellow-900/30 dark:text-yellow-100 dark:border-yellow-800"></div>
+
+        <!-- Body -->
+        <div class="flex-1 min-h-0 overflow-hidden">
+            <div id="alignment-viewer-body" class="alignment-viewer h-full">
+                <div class="alignment-viewer-empty hidden p-6 text-sm text-gray-500 dark:text-gray-300"></div>
+                <div class="alignment-viewer-grid h-full"></div>
+            </div>
+        </div>
+    </div>
+</div>

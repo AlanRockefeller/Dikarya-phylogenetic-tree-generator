@@ -1,0 +1,92 @@
+{% extends "journal/base_journal.html" %}
+
+{% block title %}Taxonomy & New Species - Dikarya{% endblock %}
+
+{% block content %}
+<div class="journal-page-header">
+    <h1>Taxonomy & New Species</h1>
+</div>
+
+<section class="journal-section">
+    <h2>Recent Discoveries</h2>
+    <p>This section highlights new fungal taxa described in Dikarya, including type specimen information, molecular
+        data, and diagnostic features.</p>
+
+    <div class="journal-announcement">
+        <h4>🍄 Coming Soon</h4>
+        <p>As our first issues are published, this page will feature a searchable database of newly described species
+            with sequence data and specimen information.</p>
+    </div>
+
+    <h3>Recombinations</h3>
+    <p>New taxonomic combinations published in Dikarya:</p>
+    <div class="journal-announcement">
+        <p><em>No recombinations published yet. Check back as new issues are released.</em></p>
+    </div>
+</section>
+
+<section class="journal-section">
+    <h2>Nomenclatural Resources</h2>
+    <div class="journal-card-grid">
+        <div class="journal-card">
+            <h3>MycoBank</h3>
+            <p>Online database for fungal nomenclature and associated data.</p>
+            <a href="https://www.mycobank.org/" target="_blank" rel="noopener">Visit MycoBank →</a>
+        </div>
+        <div class="journal-card">
+            <h3>Index Fungorum</h3>
+            <p>Global nomenclatural database of fungal names.</p>
+            <a href="http://www.indexfungorum.org/" target="_blank" rel="noopener">Visit Index Fungorum →</a>
+        </div>
+        <div class="journal-card">
+            <h3>Species Fungorum</h3>
+            <p>Species-level database linked to Index Fungorum.</p>
+            <a href="http://www.speciesfungorum.org/" target="_blank" rel="noopener">Visit Species Fungorum →</a>
+        </div>
+        <div class="journal-card">
+            <h3>iNaturalist</h3>
+            <p>Citizen science platform for biodiversity observations and species identification.</p>
+            <a href="https://www.inaturalist.org/" target="_blank" rel="noopener">Visit iNaturalist →</a>
+        </div>
+        <div class="journal-card">
+            <h3>Mushroom Observer</h3>
+            <p>Community-driven database for mushroom observations and identifications.</p>
+            <a href="https://mushroomobserver.org/" target="_blank" rel="noopener">Visit Mushroom Observer →</a>
+        </div>
+    </div>
+</section>
+
+<section class="journal-section">
+    <h2>Sequence Databases</h2>
+    <div class="journal-card-grid">
+        <div class="journal-card">
+            <h3>GenBank</h3>
+            <p>NCBI's primary nucleotide sequence database.</p>
+            <a href="https://www.ncbi.nlm.nih.gov/genbank/" target="_blank" rel="noopener">Visit GenBank →</a>
+        </div>
+        <div class="journal-card">
+            <h3>UNITE</h3>
+            <p>Curated fungal ITS sequence database and species hypotheses.</p>
+            <a href="https://unite.ut.ee/" target="_blank" rel="noopener">Visit UNITE →</a>
+        </div>
+        <div class="journal-card">
+            <h3>TreeBASE</h3>
+            <p>Repository for phylogenetic trees and alignments.</p>
+            <a href="https://treebase.org/" target="_blank" rel="noopener">Visit TreeBASE →</a>
+        </div>
+        <div class="journal-card">
+            <h3>Mycomap</h3>
+            <p>Geographic mapping and sequence data for fungal collections.</p>
+            <a href="https://mycomap.com/" target="_blank" rel="noopener">Visit Mycomap →</a>
+        </div>
+    </div>
+</section>
+
+<section class="journal-app-promo">
+    <h2>🧬 Build Your Own Trees</h2>
+    <p>Use our integrated Phylogenetic Tree Builder to analyze your sequences with professional-grade tools.</p>
+    <a href="{{ url_for('main.sequence_entry') }}" class="journal-btn journal-btn-primary journal-btn-large">
+        Launch Tree Builder →
+    </a>
+</section>
+{% endblock %}
