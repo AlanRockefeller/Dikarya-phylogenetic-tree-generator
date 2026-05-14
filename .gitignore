@@ -36,6 +36,7 @@ cache/
 
 # ---- Database / backups ----
 *.sqlite3
+*.sqlite
 *.db
 *.bak
 
@@ -53,6 +54,8 @@ test_sanitized.fasta
 test_tree.newick
 .claude/
 CLAUDE.md
+AGENTS.md
+ARCHITECTURE.md
 temp_jobs/
 *.out
-
+dosage-calculator/

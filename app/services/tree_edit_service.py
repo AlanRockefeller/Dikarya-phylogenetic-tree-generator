@@ -295,8 +295,10 @@ def rename_tip(tree_json: Dict, old_name: str, new_name: str) -> Dict:
     
     def apply_rename(node):
         if node.get("name") == old_name or node.get("original_name") == old_name:
+            node["name"] = new_name
             node["display_name"] = new_name
-            # We keep 'name' as identifier usually, but display_name for UI
+            # Preserve original_name as the stable edit identifier while
+            # making the visible node label update immediately.
             return True
         if "children" in node:
             for child in node["children"]:
@@ -316,7 +318,9 @@ def apply_state_to_structure(node: Dict, renames: Dict, pruned_taxa: Set[str]):
     if original_name:
         # Apply Rename
         if original_name in renames:
-            node["display_name"] = renames[original_name]
+            renamed = renames[original_name]
+            node["name"] = renamed
+            node["display_name"] = renamed
         
         # Apply Prune
         if original_name in pruned_taxa:

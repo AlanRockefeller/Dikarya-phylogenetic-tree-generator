@@ -438,6 +438,8 @@ document.addEventListener('DOMContentLoaded', async () => {
             updateSupportUI(viewer.getStats());
             // Alan 5/9/26 - Size and label the sequence metric sliders after the tree has loaded.
             syncSequenceFilterUI(viewer.getSequenceFilterStats());
+            // Alan 5/14/26 - Refresh toolbar buttons after render so Alignment Viewer sees the loaded tip order.
+            updateButtons();
 
         } catch (err) {
             console.error("Tree Load Error:", err);
@@ -1234,6 +1236,8 @@ document.addEventListener('DOMContentLoaded', async () => {
             // btnMakeCopy remains enabled
             // Alan 5/11/26 - Leave Deselect available in view-only mode because it only changes local highlighting.
             updateDeselectButton(false);
+            // Alan 5/14/26 - Keep the read-only Alignment Viewer enabled once rendered tips are available.
+            updateAlignmentViewerButton();
             return;
         }
 

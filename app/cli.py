@@ -1,6 +1,8 @@
 import click
 from flask.cli import with_appcontext
 from flask import current_app
+from app.dosage.db import get_csv_directory, get_database_path
+from app.dosage.importer import DosageImportError, rebuild_database
 
 @click.command("run-worker")
 @with_appcontext
@@ -59,6 +61,26 @@ def whats_new_list_command():
         return
     for e in entries:
         click.echo(f"[{e.id}] ({e.category}) {e.published_at.strftime('%Y-%m-%d')} — {e.title}")
+
+
+@click.command("dosage-rebuild-db")
+@click.option("--csv-dir", type=click.Path(file_okay=False), help="Directory containing dosage CSV files.")
+@click.option("--db-path", type=click.Path(dir_okay=False), help="SQLite database path to create/replace.")
+@with_appcontext
+def dosage_rebuild_db_command(csv_dir, db_path):
+    """Rebuild the alkaloid estimator SQLite database from CSV files."""
+    try:
+        result = rebuild_database(
+            csv_dir or get_csv_directory(),
+            db_path or get_database_path(),
+        )
+    except DosageImportError as exc:
+        click.echo(f"Dosage import failed: {exc}", err=True)
+        raise click.Abort()
+    click.echo(
+        "Imported {references} references, {species} species rows, "
+        "{test_results} test results into {database}".format(**result)
+    )
 
 
 @click.group("api-token")
@@ -150,4 +172,5 @@ def register(app):
     app.cli.add_command(run_metrics_command)
     app.cli.add_command(whats_new_add_command)
     app.cli.add_command(whats_new_list_command)
+    app.cli.add_command(dosage_rebuild_db_command)
     app.cli.add_command(api_token_group)

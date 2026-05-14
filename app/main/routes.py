@@ -95,6 +95,11 @@ def sequence_entry():
     return render_template('sequence_entry.html')
 
 
+@bp.route('/test')
+def dosage_test():
+    return render_template('test.html')
+
+
 @bp.route('/whats-new')
 def whats_new():
     from app.models import WhatsNewEntry, WhatsNewView

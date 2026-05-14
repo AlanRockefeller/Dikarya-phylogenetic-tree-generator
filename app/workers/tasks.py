@@ -819,12 +819,15 @@ def run_phylo_job(job_params: dict) -> dict:
                     try:
                         _m = db_job.metrics or {}
                         extras = []
-                        if _m.get("inat_matched_its_tip"):
+                        if _m.get("inat_added_its_name"):
+                            extras.append(_m["inat_added_its_name"])
+                        elif _m.get("inat_matched_its_tip"):
                             extras.append(_m["inat_matched_its_tip"])
                         highlighted_tip = highlight_source_observation_tip(
                             job_id,
                             int(_m.get("inat_observation_id") or 0),
                             extra_tip_names=extras,
+                            display_name=_m.get("inat_source_display_name"),
                         )
                     except Exception:
                         highlighted_tip = None

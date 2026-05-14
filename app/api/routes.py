@@ -658,7 +658,11 @@ def inaturalist_tree():
     data = request.get_json(silent=True) or {}
     raw = data.get('observation') or data.get('url') or ''
     try:
-        result = create_job_from_inat_observation(raw, user=current_user)
+        result = create_job_from_inat_observation(
+            raw,
+            user=current_user,
+            public_base_url=request.url_root,
+        )
         return jsonify(result), 202
     except InatTreeError as e:
         return jsonify({"status": "error", "error": str(e)}), e.status

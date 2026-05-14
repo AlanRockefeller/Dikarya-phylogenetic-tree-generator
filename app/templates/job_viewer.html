@@ -612,6 +612,13 @@
         class="mt-6 pt-4 border-t border-gray-200 dark:border-gray-700 flex flex-col gap-3 text-xs text-gray-500 dark:text-gray-400">
         <div class="min-w-0">
             <span class="font-mono block">Job ID: {{ job_id }}</span>
+            {% if job_details.get('inat_source_url') %}
+            <a href="{{ job_details.get('inat_source_url') }}" target="_blank" rel="noopener noreferrer"
+                class="font-mono block mt-2 text-journal-gold hover:text-journal-gold-light underline underline-offset-2 break-all">
+                Generated for iNaturalist observation: {{ job_details.get('inat_source_url') }}
+                <i class="fas fa-external-link-alt ml-1 text-xs"></i>
+            </a>
+            {% endif %}
             {% if job_details.get('mycomap_blast_url') %}
             <a href="{{ job_details.get('mycomap_blast_url') }}" target="_blank" rel="noopener noreferrer"
                 class="font-mono block mt-2 text-journal-gold hover:text-journal-gold-light underline underline-offset-2 break-all">
@@ -648,7 +655,7 @@
 
 <script src="{{ url_for('static', filename='js/tree_viewer_api.js') }}"></script>
 
-<script src="{{ url_for('static', filename='js/tree_viewer_controller.js') }}?v=36"></script>
+<script src="{{ url_for('static', filename='js/tree_viewer_controller.js') }}?v=37"></script>
 
 {% include 'partials/alignment_viewer_modal.html' %}
 

@@ -240,6 +240,31 @@ def _normalize_dna_for_match(text: str) -> str:
     return re.sub(r"[^ACGTNRYSWKMBDHV]", "", str(text).upper())
 
 
+def _find_observation_source_tip_name(sequences: List[Dict[str, Any]],
+                                      observation_id: int) -> Optional[str]:
+    """Return the best existing tip name that appears to belong to the observation.
+
+    Prefer a raw MycoMap tip that embeds the numeric observation ID but is not
+    already an `iNat<id>` label. This avoids creating a second synthetic tip
+    when the source observation is already represented in the imported BLAST
+    results.
+    """
+    if not observation_id:
+        return None
+    obs_id = str(int(observation_id))
+    inat_prefix = f"iNat{obs_id}"
+    digit_pat = re.compile(rf"(?<!\d){re.escape(obs_id)}(?!\d)")
+    for s in sequences:
+        name = str(s.get("name") or "").strip()
+        if not name or name.startswith(inat_prefix):
+            continue
+        if _CONTAMINANT_LABEL_RE.search(name):
+            continue
+        if digit_pat.search(name):
+            return name
+    return None
+
+
 def _maybe_add_inat_its_sequence(observation: Dict[str, Any], observation_id: int,
                                   sequences: List[Dict[str, Any]]
                                   ) -> Tuple[Optional[str], Optional[str]]:
@@ -263,6 +288,11 @@ def _maybe_add_inat_its_sequence(observation: Dict[str, Any], observation_id: in
     its_norm = _normalize_dna_for_match(cleaned)
     if not its_norm:
         return None, None
+
+    source_tip_name = _find_observation_source_tip_name(sequences, observation_id)
+    if source_tip_name:
+        return None, source_tip_name
+
     for s in sequences:
         if _CONTAMINANT_LABEL_RE.search(str(s.get("name") or "")):
             continue
@@ -302,6 +332,92 @@ def _maybe_add_inat_its_sequence(observation: Dict[str, Any], observation_id: in
     return name, None
 
 
+def _clean_display_text(value: Any) -> str:
+    """Normalize a free-form string for use in a tree tip label."""
+    if value is None:
+        return ""
+    text = re.sub(r"[<>'\"]", "", str(value))
+    text = re.sub(r"\s+", " ", text).strip()
+    return text.strip(" ,;:-_")
+
+
+def _extract_inat_species_label(observation: Dict[str, Any]) -> str:
+    """Return the best scientific-name-like label for an iNat observation."""
+    for field_name in ("Species Name Override", "Provisional Species Name"):
+        value = extract_observation_field_value(observation, field_name)
+        if value:
+            cleaned = _clean_display_text(value)
+            if cleaned:
+                return cleaned
+
+    taxon = observation.get("taxon") or {}
+    if isinstance(taxon, dict):
+        for key in ("name", "preferred_common_name"):
+            cleaned = _clean_display_text(taxon.get(key))
+            if cleaned:
+                return cleaned
+    return ""
+
+
+def _normalize_location_piece(piece: str) -> str:
+    """Collapse common country variants so labels stay short."""
+    cleaned = _clean_display_text(piece)
+    if not cleaned:
+        return ""
+    lowered = cleaned.casefold()
+    if lowered in {
+        "united states",
+        "united states of america",
+        "usa",
+        "u.s.a.",
+        "u.s.",
+    }:
+        return "US"
+    return cleaned
+
+
+def _extract_inat_location_label(observation: Dict[str, Any]) -> str:
+    """Return a compact place label like `New Mexico US`."""
+    for key in (
+        "private_place_guess",
+        "place_guess",
+        "private_locality",
+        "locality",
+    ):
+        raw = observation.get(key)
+        if not raw:
+            continue
+        parts = [
+            _normalize_location_piece(part)
+            for part in str(raw).split(",")
+        ]
+        parts = [part for part in parts if part]
+        if not parts:
+            continue
+        # Prefer the human-readable region name when iNat returns nested
+        # place text like "New Mexico, NM, United States". In that case the
+        # middle component is just an abbreviation and the first + last
+        # components are the label people expect to see.
+        if len(parts) >= 3 and len(parts[-2]) <= 3:
+            return f"{parts[0]} {parts[-1]}".strip()
+        if len(parts) >= 2:
+            return " ".join(parts[-2:])
+        return parts[0]
+    return ""
+
+
+def _build_inat_source_display_name(observation: Dict[str, Any], observation_id: int) -> str:
+    """Build the concise source-tip label used in the tree viewer."""
+    parts = [f"iNat{int(observation_id)}"]
+    species = _extract_inat_species_label(observation)
+    if species:
+        parts.append(species)
+    location = _extract_inat_location_label(observation)
+    if location:
+        parts.append(location)
+    return " ".join(parts)
+
+
 def _build_fasta_text(sequences: List[Dict[str, Any]]) -> str:
     parts = []
     for s in sequences:
@@ -315,7 +431,9 @@ def _build_fasta_text(sequences: List[Dict[str, Any]]) -> str:
 
 def create_job_from_inat_observation(raw_input: str, user=None,
                                       include_ncbi: bool = True,
-                                      include_local: bool = True) -> Dict[str, Any]:
+                                      include_local: bool = True,
+                                      public_base_url: Optional[str] = None
+                                      ) -> Dict[str, Any]:
     """Validate the iNat input, pull sequences, enqueue a one-click tree job.
 
     Returns a dict with: status, job_id, observation_id, mycomap_blast_url,
@@ -396,6 +514,7 @@ def create_job_from_inat_observation(raw_input: str, user=None,
 
     job_id = enqueue_job(job_params)
     obs_source_url = f"https://www.inaturalist.org/observations/{observation_id}"
+    public_base_url = _clean_display_text(public_base_url).rstrip("/")
     metrics = {
         "via": "inat_phylogenetic_tree",
         "tree_method": job_params["tree_method"],
@@ -404,6 +523,7 @@ def create_job_from_inat_observation(raw_input: str, user=None,
         "notes": job_params["notes"],
         "inat_observation_id": observation_id,
         "inat_source_url": obs_source_url,
+        "inat_source_display_name": _build_inat_source_display_name(observation, observation_id),
         "mycomap_blast_url": mycomap_url,
         "inat_update_status": "pending",
         "inat_observation_field": PHYLOGENETIC_TREE_FIELD_NAME,
@@ -416,6 +536,8 @@ def create_job_from_inat_observation(raw_input: str, user=None,
         # (typically under its GenBank accession). The viewer will color
         # that tip blue when the job finishes.
         metrics["inat_matched_its_tip"] = matched_inat_its_tip
+    if public_base_url:
+        metrics["inat_public_base_url"] = public_base_url
     job_record = Job(
         id=job_id,
         status="queued",
@@ -500,7 +622,8 @@ def _find_source_observation_tip(tree_structure: Dict[str, Any], observation_id:
 
 
 def highlight_source_observation_tip(job_id: str, observation_id: int,
-                                       extra_tip_names: Optional[List[str]] = None
+                                       extra_tip_names: Optional[List[str]] = None,
+                                       display_name: Optional[str] = None
                                        ) -> List[str]:
     """Materialize tree_state.json for ``job_id`` and add the source-observation
     tip(s) to the Default selection set (blue, ``#1f77b4``).
@@ -516,13 +639,21 @@ def highlight_source_observation_tip(job_id: str, observation_id: int,
     """
     try:
         from app.config import Config
-        from app.services.tree_edit_service import load_tree_state, save_tree_state
+        from app.services.tree_edit_service import load_tree_state, rename_tip, save_tree_state
         job_dir = Config.JOB_DIR / job_id
         state = load_tree_state(job_dir)
         if not state or not isinstance(state.get("tree_structure"), dict):
             return []
         all_tip_names = list(_iter_tree_tip_names(state["tree_structure"]))
         targets: List[str] = []
+        source_label = _clean_display_text(display_name)
+
+        if not source_label and observation_id:
+            try:
+                observation = fetch_observation(observation_id)
+                source_label = _build_inat_source_display_name(observation, observation_id)
+            except Exception:
+                source_label = ""
 
         for raw in (extra_tip_names or []):
             if not raw:
@@ -547,6 +678,10 @@ def highlight_source_observation_tip(job_id: str, observation_id: int,
 
         if not targets:
             return []
+
+        if source_label:
+            for tip in targets:
+                rename_tip(state, tip, source_label)
 
         sel_sets = state.get("selection_sets") or {}
         if not isinstance(sel_sets, dict):
@@ -610,7 +745,10 @@ def post_completed_tree_to_inaturalist(job_id: str, metrics: Dict[str, Any]) -> 
         except Exception:
             tree_url = None
         if not tree_url or tree_url.startswith("/"):
-            base = (current_app.config.get("INAT_PUBLIC_BASE_URL") or "").strip().rstrip("/")
+            base = (
+                (current_app.config.get("INAT_PUBLIC_BASE_URL") or "")
+                or (metrics.get("inat_public_base_url") or "")
+            ).strip().rstrip("/")
             if base:
                 tree_url = f"{base}/job/{job_id}/view"
             else:
