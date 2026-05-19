@@ -57,6 +57,23 @@ MAX_CUSTOM_GENBANK_ACCESSIONS = 200
 MAX_CUSTOM_GENBANK_SEQUENCE_BP = 5000
 MAX_SEQUENCE_METADATA_ITEMS = 5000
 
+US_STATE_TO_ABBR = {
+    "alabama": "al", "alaska": "ak", "arizona": "az", "arkansas": "ar",
+    "california": "ca", "colorado": "co", "connecticut": "ct", "delaware": "de",
+    "florida": "fl", "georgia": "ga", "hawaii": "hi", "idaho": "id",
+    "illinois": "il", "indiana": "in", "iowa": "ia", "kansas": "ks",
+    "kentucky": "ky", "louisiana": "la", "maine": "me", "maryland": "md",
+    "massachusetts": "ma", "michigan": "mi", "minnesota": "mn", "mississippi": "ms",
+    "missouri": "mo", "montana": "mt", "nebraska": "ne", "nevada": "nv",
+    "new hampshire": "nh", "new jersey": "nj", "new mexico": "nm", "new york": "ny",
+    "north carolina": "nc", "north dakota": "nd", "ohio": "oh", "oklahoma": "ok",
+    "oregon": "or", "pennsylvania": "pa", "rhode island": "ri", "south carolina": "sc",
+    "south dakota": "sd", "tennessee": "tn", "texas": "tx", "utah": "ut",
+    "vermont": "vt", "virginia": "va", "washington": "wa", "west virginia": "wv",
+    "wisconsin": "wi", "wyoming": "wy",
+}
+US_STATE_ABBRS = set(US_STATE_TO_ABBR.values())
+
 
 def _optional_float(value):
     """Return a finite float for JSON numeric fields, or None for empty/invalid values."""
@@ -92,6 +109,7 @@ def _normalize_sequence_metadata(raw_items):
             "organism": str(raw.get("organism") or "")[:300],
             "source": str(raw.get("source") or "")[:50],
             "hit_source": str(raw.get("hit_source") or "")[:50],
+            "location": str(raw.get("location") or raw.get("mycomap_location") or "")[:200],
             "identity": _optional_float(raw.get("identity")),
             "query_cover": _optional_float(raw.get("query_cover")),
             "subject_cover": _optional_float(raw.get("subject_cover")),
@@ -103,6 +121,114 @@ def _normalize_sequence_metadata(raw_items):
         normalized.append(row)
 
     return normalized
+
+
+def _normalize_dedup_location(value, preserve_locality=False):
+    """Normalize known geographic labels enough to compare same-location sequences."""
+    text = re.sub(r'\s+', ' ', str(value or '').strip())
+    if not text:
+        return ""
+
+    tokens = [token.strip(" ,.;:()[]{}") for token in text.split()]
+    tokens = [token for token in tokens if token]
+    if not tokens:
+        return ""
+
+    lower = [token.lower() for token in tokens]
+    country = ""
+    if lower[-1] in {"us", "usa", "u.s.", "u.s.a.", "unitedstates", "united", "states"}:
+        country = "us"
+
+    if country == "us":
+        location_tokens = lower[:-1]
+        zip_code = ""
+        if location_tokens and re.fullmatch(r'\d{5}(?:-\d{4})?', location_tokens[-1]):
+            zip_code = location_tokens.pop()
+        for size in (2, 1):
+            if len(location_tokens) >= size:
+                candidate = " ".join(location_tokens[-size:])
+                state = US_STATE_TO_ABBR.get(candidate)
+                if not state and size == 1 and candidate in US_STATE_ABBRS:
+                    state = candidate
+                if state:
+                    locality = ""
+                    if preserve_locality:
+                        locality = re.sub(r'[^a-z0-9]+', ' ', " ".join(location_tokens[:-size])).strip()
+                    return "|".join(part for part in ("us", state, locality, zip_code) if part)
+
+    normalized = re.sub(r'[^a-z0-9]+', ' ', text.lower()).strip()
+    return normalized
+
+
+def _location_from_sequence_label(label):
+    """Extract trailing location fragments from the labels Dikarya renders in tree tips."""
+    text = re.sub(r'\s+', ' ', str(label or '').strip())
+    if not text:
+        return ""
+
+    us_match = re.search(
+        r'\b((?:[A-Za-z]+(?:\s+[A-Za-z]+)?|[A-Z]{2})(?:\s+\d{5}(?:-\d{4})?)?\s+(?:US|USA))\b\s*$',
+        text,
+        flags=re.IGNORECASE,
+    )
+    if us_match:
+        return us_match.group(1)
+
+    country_match = re.search(r'\b([A-Za-z][A-Za-z\s.-]{1,80}\s+[A-Z]{2,3})\b\s*$', text)
+    return country_match.group(1) if country_match else ""
+
+
+def _sequence_location_dedup_key(seq, metadata_by_header):
+    """Return a dedup key for same sequence + same known location, else exact record key."""
+    sequence = ''.join(str(seq.get('sequence') or '').split()).upper()
+    if not sequence:
+        return None
+
+    header = str(seq.get('name') or '').strip()
+    metadata = metadata_by_header.get(header, {})
+    location = metadata.get("location") or _location_from_sequence_label(header)
+    normalized_location = _normalize_dedup_location(location, preserve_locality=bool(metadata.get("location")))
+    if normalized_location:
+        return ("sequence_location", sequence, normalized_location)
+    return ("exact_record", header, sequence)
+
+
+def _dedupe_sequence_payload(sequence_text, sequence_metadata):
+    """Remove duplicate FASTA records when both cleaned sequence and known location match."""
+    sequences = _parse_fasta_sequences(sequence_text)
+    if not sequences:
+        return sequence_text, sequence_metadata
+
+    metadata_by_header = {}
+    for item in sequence_metadata:
+        for key in (item.get("fasta_header"), item.get("name")):
+            if key:
+                metadata_by_header.setdefault(str(key).strip(), item)
+
+    seen = set()
+    deduped = []
+    deduped_headers = set()
+    for seq in sequences:
+        key = _sequence_location_dedup_key(seq, metadata_by_header)
+        if key and key in seen:
+            continue
+        if key:
+            seen.add(key)
+        deduped.append(seq)
+        deduped_headers.add(str(seq.get("name") or "").strip())
+
+    if len(deduped) == len(sequences):
+        return sequence_text, sequence_metadata
+
+    fasta = ''.join(
+        f">{seq.get('name', '').strip()}\n{''.join(str(seq.get('sequence') or '').split())}\n"
+        for seq in deduped
+    ).strip()
+    metadata = [
+        item for item in sequence_metadata
+        if str(item.get("fasta_header") or item.get("name") or "").strip() in deduped_headers
+    ]
+    return fasta, metadata
 
 
 def _parse_genbank_accession_tokens(value):
@@ -554,6 +680,7 @@ def gather_mycomap_sequences_for_queue(url, include_ncbi=True, include_local=Tru
             seq['identity'] = metric.get('identity')
             seq['query_cover'] = metric.get('query_cover')
             seq['subject_cover'] = metric.get('subject_cover')
+            seq['location'] = metric.get('mycomap_location') or ''
             seq['blast_metrics_available'] = any(
                 seq[field] is not None for field in ('identity', 'query_cover', 'subject_cover')
             )
@@ -563,6 +690,7 @@ def gather_mycomap_sequences_for_queue(url, include_ncbi=True, include_local=Tru
             seq['identity'] = None
             seq['query_cover'] = None
             seq['subject_cover'] = None
+            seq['location'] = ''
             seq['blast_metrics_available'] = False
         seq['name'] = remove_lowquality_label(seq.get('name', ''))
         seq.pop('_mycomap_original_name', None)
@@ -873,6 +1001,10 @@ def create_job():
     )
     job_params["mcmc_nruns"] = _clamp_int(job_params.get("mcmc_nruns"), 2, 1, 8)
     job_params["mcmc_nchains"] = _clamp_int(job_params.get("mcmc_nchains"), 4, 1, 16)
+    job_params["sequence"], job_params["sequence_metadata"] = _dedupe_sequence_payload(
+        job_params.get("sequence", ""),
+        job_params.get("sequence_metadata", []),
+    )
 
     try:
         job_id = enqueue_job(job_params)

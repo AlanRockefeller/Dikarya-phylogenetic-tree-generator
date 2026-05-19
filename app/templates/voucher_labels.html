@@ -1,0 +1,323 @@
+{% extends "base_modern.html" %}
+
+{% block title %}Voucher Labels - Dikarya{% endblock %}
+{% block subtitle %}Specimen Tools{% endblock %}
+
+{% block content %}
+<div class="max-w-6xl mx-auto px-4 sm:px-6 lg:px-8 py-8">
+    <div class="mb-6">
+        <h2 class="text-3xl font-bold text-journal-dark dark:text-white">Voucher Labels</h2>
+        <p class="mt-2 text-sm text-gray-600 dark:text-gray-300">
+            Generate numbered specimen voucher label sheets for printing.
+        </p>
+    </div>
+
+    <form id="voucher_label_form" method="post" action="{{ url_for('main.voucher_labels_export') }}"
+        class="grid gap-6 lg:grid-cols-[minmax(0,1fr)_360px]">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+
+        <section class="bg-white dark:bg-journal-green border border-gray-200 dark:border-gray-700 rounded-lg p-5 shadow-sm">
+            <div class="grid gap-5 sm:grid-cols-2">
+                <label class="block">
+                    <span class="block text-sm font-semibold text-journal-dark dark:text-gray-100 mb-2">Prefix</span>
+                    <input id="voucher_prefix" name="prefix" type="text" maxlength="32" placeholder="DIA-"
+                        class="w-full rounded-lg border border-gray-300 dark:border-gray-600 bg-white dark:bg-journal-dark px-3 py-2 text-journal-dark dark:text-white font-mono">
+                </label>
+
+                <label class="block">
+                    <span class="block text-sm font-semibold text-journal-dark dark:text-gray-100 mb-2">Starting Number</span>
+                    <input id="voucher_start_number" name="start_number" type="text" value="001"
+                        class="w-full rounded-lg border border-gray-300 dark:border-gray-600 bg-white dark:bg-journal-dark px-3 py-2 text-journal-dark dark:text-white font-mono">
+                </label>
+
+                <label class="block">
+                    <span class="block text-sm font-semibold text-journal-dark dark:text-gray-100 mb-2">Number of Pages</span>
+                    <input id="voucher_pages" name="pages" type="number" min="1" max="100" value="1"
+                        class="w-full rounded-lg border border-gray-300 dark:border-gray-600 bg-white dark:bg-journal-dark px-3 py-2 text-journal-dark dark:text-white">
+                </label>
+
+                <label id="voucher_print_columns_field" class="block">
+                    <span class="block text-sm font-semibold text-journal-dark dark:text-gray-100 mb-2">Columns to Fill</span>
+                    <input id="voucher_print_columns" name="print_columns" type="number" min="1" max="3" value="3"
+                        class="w-full rounded-lg border border-gray-300 dark:border-gray-600 bg-white dark:bg-journal-dark px-3 py-2 text-journal-dark dark:text-white">
+                </label>
+
+                <label class="block">
+                    <span class="block text-sm font-semibold text-journal-dark dark:text-gray-100 mb-2">Output</span>
+                    <select id="voucher_output_format" name="output_format"
+                        class="w-full rounded-lg border border-gray-300 dark:border-gray-600 bg-white dark:bg-journal-dark px-3 py-2 text-journal-dark dark:text-white">
+                        <option value="pdf" selected>PDF</option>
+                        <option value="rtf">RTF</option>
+                    </select>
+                </label>
+
+                <label class="block">
+                    <span class="block text-sm font-semibold text-journal-dark dark:text-gray-100 mb-2">Label Size</span>
+                    <select name="label_size" id="label_size"
+                        class="w-full rounded-lg border border-gray-300 dark:border-gray-600 bg-white dark:bg-journal-dark px-3 py-2 text-journal-dark dark:text-white">
+                        {% for key, preset in presets.items() %}
+                        <option value="{{ key }}" {% if key == "letter_auto" %}selected{% endif %}>{{ preset.name }}</option>
+                        {% endfor %}
+                        <option value="custom">Custom</option>
+                    </select>
+                </label>
+
+                <label class="block">
+                    <span class="block text-sm font-semibold text-journal-dark dark:text-gray-100 mb-2">Font</span>
+                    <select id="voucher_font_family" name="font_family"
+                        class="w-full rounded-lg border border-gray-300 dark:border-gray-600 bg-white dark:bg-journal-dark px-3 py-2 text-journal-dark dark:text-white">
+                        {% for key, font in pdf_fonts %}
+                        <option value="{{ key }}" {% if key == "helvetica" %}selected{% endif %}>{{ font.name }}</option>
+                        {% endfor %}
+                    </select>
+                </label>
+
+                <label class="block">
+                    <span class="block text-sm font-semibold text-journal-dark dark:text-gray-100 mb-2">Font Size</span>
+                    <input id="voucher_font_size" name="font_size" type="number" min="6" max="36" value="12"
+                        class="w-full rounded-lg border border-gray-300 dark:border-gray-600 bg-white dark:bg-journal-dark px-3 py-2 text-journal-dark dark:text-white">
+                </label>
+
+                <label class="flex items-center gap-2 pt-8 text-sm font-medium text-journal-dark dark:text-gray-100">
+                    <input name="include_guides" value="1" type="checkbox"
+                        class="h-4 w-4 rounded border-gray-300 text-journal-gold focus:ring-journal-gold">
+                    Print cut guide lines
+                </label>
+            </div>
+
+            <div id="custom_label_fields" class="hidden mt-6 border-t border-gray-200 dark:border-gray-700 pt-5">
+                <h3 class="text-sm font-bold uppercase tracking-wide text-gray-500 dark:text-gray-300 mb-4">Custom Sheet</h3>
+                <div class="grid gap-4 sm:grid-cols-4">
+                    <label class="block">
+                        <span class="block text-xs font-semibold text-gray-600 dark:text-gray-300 mb-1">Width in</span>
+                        <input name="custom_width" type="number" step="0.01" min="0.5" max="8.5" value="2.625"
+                            class="w-full rounded-lg border border-gray-300 dark:border-gray-600 bg-white dark:bg-journal-dark px-3 py-2 text-journal-dark dark:text-white">
+                    </label>
+                    <label class="block">
+                        <span class="block text-xs font-semibold text-gray-600 dark:text-gray-300 mb-1">Height in</span>
+                        <input name="custom_height" type="number" step="0.01" min="0.25" max="5" value="1"
+                            class="w-full rounded-lg border border-gray-300 dark:border-gray-600 bg-white dark:bg-journal-dark px-3 py-2 text-journal-dark dark:text-white">
+                    </label>
+                    <label class="block">
+                        <span class="block text-xs font-semibold text-gray-600 dark:text-gray-300 mb-1">Columns</span>
+                        <input id="custom_columns" name="custom_columns" type="number" min="1" max="8" value="3"
+                            class="w-full rounded-lg border border-gray-300 dark:border-gray-600 bg-white dark:bg-journal-dark px-3 py-2 text-journal-dark dark:text-white">
+                    </label>
+                    <label class="block">
+                        <span class="block text-xs font-semibold text-gray-600 dark:text-gray-300 mb-1">Rows</span>
+                        <input name="custom_rows" type="number" min="1" max="40" value="10"
+                            class="w-full rounded-lg border border-gray-300 dark:border-gray-600 bg-white dark:bg-journal-dark px-3 py-2 text-journal-dark dark:text-white">
+                    </label>
+                    <label class="block">
+                        <span class="block text-xs font-semibold text-gray-600 dark:text-gray-300 mb-1">Left Margin in</span>
+                        <input name="custom_margin_left" type="number" step="0.01" min="0" max="4" value="0.25"
+                            class="w-full rounded-lg border border-gray-300 dark:border-gray-600 bg-white dark:bg-journal-dark px-3 py-2 text-journal-dark dark:text-white">
+                    </label>
+                    <label class="block">
+                        <span class="block text-xs font-semibold text-gray-600 dark:text-gray-300 mb-1">Top Margin in</span>
+                        <input name="custom_margin_top" type="number" step="0.01" min="0" max="4" value="0.5"
+                            class="w-full rounded-lg border border-gray-300 dark:border-gray-600 bg-white dark:bg-journal-dark px-3 py-2 text-journal-dark dark:text-white">
+                    </label>
+                    <label class="block">
+                        <span class="block text-xs font-semibold text-gray-600 dark:text-gray-300 mb-1">Column Gap in</span>
+                        <input name="custom_gap_x" type="number" step="0.01" min="0" max="2" value="0.125"
+                            class="w-full rounded-lg border border-gray-300 dark:border-gray-600 bg-white dark:bg-journal-dark px-3 py-2 text-journal-dark dark:text-white">
+                    </label>
+                    <label class="block">
+                        <span class="block text-xs font-semibold text-gray-600 dark:text-gray-300 mb-1">Row Gap in</span>
+                        <input name="custom_gap_y" type="number" step="0.01" min="0" max="2" value="0"
+                            class="w-full rounded-lg border border-gray-300 dark:border-gray-600 bg-white dark:bg-journal-dark px-3 py-2 text-journal-dark dark:text-white">
+                    </label>
+                </div>
+            </div>
+
+            <div class="mt-6 flex flex-wrap gap-3">
+                <a id="voucher_generate_link" href="{{ url_for('main.voucher_labels_export') }}" target="_blank"
+                    class="inline-flex items-center rounded-lg bg-journal-gold px-4 py-2 text-sm font-semibold text-journal-dark shadow-sm transition hover:bg-journal-gold-light focus:outline-none focus:ring-2 focus:ring-journal-gold focus:ring-offset-2 dark:focus:ring-offset-journal-dark">
+                    <i class="fas fa-file-pdf mr-2"></i>Generate Labels
+                </a>
+                <a href="{{ url_for('main.voucher_labels') }}"
+                    class="inline-flex items-center rounded-lg border border-journal-gold px-4 py-2 text-sm font-semibold text-journal-dark transition hover:bg-journal-gold hover:text-journal-dark dark:text-journal-gold dark:hover:text-journal-dark">
+                    <i class="fas fa-rotate-left mr-2"></i>Reset
+                </a>
+            </div>
+        </section>
+
+        <aside class="bg-white dark:bg-journal-green border border-gray-200 dark:border-gray-700 rounded-lg p-5 shadow-sm">
+            <div class="mb-4 flex items-center justify-between gap-3">
+                <h3 class="text-sm font-bold uppercase tracking-wide text-gray-500 dark:text-gray-300">Preview</h3>
+                <span id="voucher_labels_per_page"
+                    class="text-xs font-semibold text-gray-500 dark:text-gray-300">0 per page</span>
+            </div>
+            <div id="voucher_preview" class="grid grid-cols-3 gap-2 text-center font-mono" style="font-family: 'IBM Plex Mono', monospace;">
+                <div class="voucher-preview-label border border-dashed border-gray-300 dark:border-gray-600 rounded p-3 text-journal-dark dark:text-white">001</div>
+                <div class="voucher-preview-label border border-dashed border-gray-300 dark:border-gray-600 rounded p-3 text-journal-dark dark:text-white">002</div>
+                <div class="voucher-preview-label border border-dashed border-gray-300 dark:border-gray-600 rounded p-3 text-journal-dark dark:text-white">003</div>
+                <div class="voucher-preview-label border border-dashed border-gray-300 dark:border-gray-600 rounded p-3 text-journal-dark dark:text-white">004</div>
+                <div class="voucher-preview-label border border-dashed border-gray-300 dark:border-gray-600 rounded p-3 text-journal-dark dark:text-white">005</div>
+                <div class="voucher-preview-label border border-dashed border-gray-300 dark:border-gray-600 rounded p-3 text-journal-dark dark:text-white">006</div>
+            </div>
+        </aside>
+    </form>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+    const labelSizeSelect = document.getElementById('label_size');
+    const customFields = document.getElementById('custom_label_fields');
+    const preview = document.getElementById('voucher_preview');
+    const previewLabels = Array.from(document.querySelectorAll('.voucher-preview-label'));
+    const form = document.getElementById('voucher_label_form');
+    const generateLink = document.getElementById('voucher_generate_link');
+    const prefixInput = document.getElementById('voucher_prefix');
+    const startInput = document.getElementById('voucher_start_number');
+    const printColumnsField = document.getElementById('voucher_print_columns_field');
+    const printColumnsInput = document.getElementById('voucher_print_columns');
+    const customColumnsInput = document.getElementById('custom_columns');
+    const customRowsInput = document.querySelector('input[name="custom_rows"]');
+    const labelsPerPageText = document.getElementById('voucher_labels_per_page');
+    const outputFormatSelect = document.getElementById('voucher_output_format');
+    const fontSelect = document.getElementById('voucher_font_family');
+    const fontSizeInput = document.getElementById('voucher_font_size');
+    const labelPresets = {{ presets|tojson }};
+    const fontChoices = {
+        pdf: {{ pdf_fonts|tojson }},
+        rtf: {{ rtf_fonts|tojson }}
+    };
+    let activeFonts = {};
+
+    function fontOutputFormat() {
+        return outputFormatSelect.value === 'rtf' ? 'rtf' : 'pdf';
+    }
+
+    function syncFontOptions() {
+        const current = fontSelect.value;
+        const choices = fontChoices[fontOutputFormat()] || fontChoices.pdf;
+        activeFonts = {};
+        fontSelect.innerHTML = '';
+        choices.forEach(([key, font]) => {
+            activeFonts[key] = font;
+            const option = document.createElement('option');
+            option.value = key;
+            option.textContent = font.name;
+            fontSelect.appendChild(option);
+        });
+        if (activeFonts[current]) {
+            fontSelect.value = current;
+        } else {
+            fontSelect.value = choices[0]?.[0] || '';
+        }
+    }
+
+    function syncCustomFields() {
+        customFields.classList.toggle('hidden', labelSizeSelect.value !== 'custom');
+        printColumnsField.classList.toggle('hidden', Boolean((labelPresets[labelSizeSelect.value] || {}).auto));
+    }
+
+    function estimatePreviewColumns() {
+        const fontSize = Math.max(6, Math.min(36, parseInt(fontSizeInput.value || '12', 10) || 12));
+        const textWidth = Math.max(1, buildPreviewValue(0).length) * fontSize * 0.6 / 72;
+        const labelWidth = Math.min(8, Math.max(0.35, textWidth + 0.18));
+        return Math.max(1, Math.floor(8 / labelWidth));
+    }
+
+    function estimatePreviewRows() {
+        const fontSize = Math.max(6, Math.min(36, parseInt(fontSizeInput.value || '12', 10) || 12));
+        const textHeight = fontSize / 72;
+        const labelHeight = Math.min(10.5, Math.max(0.22, textHeight + 0.12));
+        return Math.max(1, Math.floor(10.5 / labelHeight));
+    }
+
+    function labelsPerPage() {
+        const preset = labelPresets[labelSizeSelect.value] || {};
+        const columns = availableColumnCount();
+        if (preset.auto) {
+            return columns * estimatePreviewRows();
+        }
+        if (labelSizeSelect.value === 'custom') {
+            const rows = Math.max(1, Math.min(40, parseInt(customRowsInput.value || '10', 10) || 10));
+            return columns * rows;
+        }
+        return columns * Math.max(1, parseInt(preset.rows || '1', 10) || 1);
+    }
+
+    function availableColumnCount() {
+        if ((labelPresets[labelSizeSelect.value] || {}).auto) {
+            return estimatePreviewColumns();
+        }
+        if (labelSizeSelect.value === 'custom') {
+            return Math.max(1, Math.min(8, parseInt(customColumnsInput.value || '3', 10) || 3));
+        }
+        return Math.max(1, parseInt((labelPresets[labelSizeSelect.value] || {}).columns || '3', 10) || 3);
+    }
+
+    function syncPrintColumns(useAvailableDefault = false) {
+        const available = availableColumnCount();
+        printColumnsInput.max = String(available);
+        if ((labelPresets[labelSizeSelect.value] || {}).auto) {
+            printColumnsInput.value = String(available);
+            return;
+        }
+        const current = parseInt(printColumnsInput.value || `${available}`, 10) || available;
+        if (useAvailableDefault || current > available) {
+            printColumnsInput.value = String(available);
+        } else if (current < 1) {
+            printColumnsInput.value = '1';
+        }
+    }
+
+    function buildPreviewValue(offset) {
+        const prefix = prefixInput.value || '';
+        const rawStart = (startInput.value || '001').trim();
+        const match = rawStart.match(/\d+/);
+        const width = match ? Math.max(1, Math.min(12, match[0].length)) : 3;
+        const start = match ? parseInt(match[0], 10) : 1;
+        return `${prefix}${String(start + offset).padStart(width, '0')}`;
+    }
+
+    function syncPreview() {
+        syncPrintColumns();
+        const previewColumns = Math.max(1, Math.min(availableColumnCount(), parseInt(printColumnsInput.value || '1', 10) || 1));
+        const font = activeFonts[fontSelect.value] || {};
+        preview.style.gridTemplateColumns = `repeat(${previewColumns}, minmax(0, 1fr))`;
+        preview.style.fontFamily = font.css || "Arial, Helvetica, sans-serif";
+        preview.style.fontWeight = font.weight || '400';
+        preview.style.fontStyle = font.style || 'normal';
+        preview.style.fontSize = `${Math.max(6, Math.min(36, parseInt(fontSizeInput.value || '12', 10) || 12))}px`;
+        previewLabels.forEach((label, index) => {
+            label.textContent = buildPreviewValue(index);
+            label.classList.remove('hidden');
+        });
+        labelsPerPageText.textContent = `${labelsPerPage()} per page`;
+        syncDownloadLink();
+    }
+
+    function syncDownloadLink() {
+        const params = new URLSearchParams(new FormData(form));
+        params.delete('csrf_token');
+        generateLink.href = `${form.action}?${params.toString()}`;
+    }
+
+    labelSizeSelect.addEventListener('change', () => {
+        syncCustomFields();
+        syncPrintColumns(true);
+        syncPreview();
+    });
+    outputFormatSelect.addEventListener('change', () => {
+        syncFontOptions();
+        syncPreview();
+    });
+    Array.from(form.elements).forEach(input => {
+        input.addEventListener('input', syncPreview);
+        input.addEventListener('change', syncPreview);
+    });
+    form.addEventListener('submit', event => {
+        event.preventDefault();
+        window.open(generateLink.href, '_blank', 'noopener');
+    });
+    syncCustomFields();
+    syncFontOptions();
+    syncPreview();
+</script>
+{% endblock %}

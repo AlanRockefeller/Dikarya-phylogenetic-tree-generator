@@ -1,9 +1,10 @@
-from flask import render_template, redirect, url_for, abort, request, current_app, flash
+from flask import render_template, redirect, url_for, abort, request, current_app, flash, Response
 from flask_login import current_user
 from app.main import bp
 from app.services.security_utils import validate_safe_file_path, validate_job_id
 from app.services.access_control import check_job_access
 from app.extensions import csrf, limiter, db
+from io import BytesIO
 import os
 import re
 from collections import deque
@@ -11,6 +12,83 @@ from datetime import datetime
 
 WHATS_NEW_EDITOR_EMAIL = (os.environ.get("WHATS_NEW_EDITOR_EMAIL") or "").strip().lower()
 TODO_ADMIN_DEFAULT_EMAILS = set()
+
+VOUCHER_LABEL_PRESETS = {
+    "avery_5160": {
+        "name": "Avery 5160 / 8160",
+        "page_width": 8.5,
+        "page_height": 11,
+        "label_width": 2.625,
+        "label_height": 1,
+        "columns": 3,
+        "rows": 10,
+        "margin_left": 0.1875,
+        "margin_top": 0.5,
+        "gap_x": 0.125,
+        "gap_y": 0,
+    },
+    "avery_5167": {
+        "name": "Avery 5167 / 8167",
+        "page_width": 8.5,
+        "page_height": 11,
+        "label_width": 1.75,
+        "label_height": 0.5,
+        "columns": 4,
+        "rows": 20,
+        "margin_left": 0.3125,
+        "margin_top": 0.5,
+        "gap_x": 0.3,
+        "gap_y": 0,
+    },
+    "letter_auto": {
+        "name": "8.5 x 11 letter",
+        "page_width": 8.5,
+        "page_height": 11,
+        "label_width": 2.625,
+        "label_height": 1,
+        "columns": 3,
+        "rows": 10,
+        "margin_left": 0.25,
+        "margin_top": 0.25,
+        "gap_x": 0,
+        "gap_y": 0,
+        "auto": True,
+    },
+}
+
+VOUCHER_PDF_FONT_CHOICES = {
+    "helvetica": {"name": "Helvetica", "pdf": "Helvetica", "rtf": "Arial", "css": "Arial, Helvetica, sans-serif"},
+    "helvetica_bold": {"name": "Helvetica Bold", "pdf": "Helvetica-Bold", "rtf": "Arial", "css": "Arial, Helvetica, sans-serif", "weight": "700"},
+    "helvetica_oblique": {"name": "Helvetica Oblique", "pdf": "Helvetica-Oblique", "rtf": "Arial", "css": "Arial, Helvetica, sans-serif", "style": "italic"},
+    "helvetica_bold_oblique": {"name": "Helvetica Bold Oblique", "pdf": "Helvetica-BoldOblique", "rtf": "Arial", "css": "Arial, Helvetica, sans-serif", "weight": "700", "style": "italic"},
+    "times": {"name": "Times Roman", "pdf": "Times-Roman", "rtf": "Times New Roman", "css": "'Times New Roman', Times, serif"},
+    "times_bold": {"name": "Times Bold", "pdf": "Times-Bold", "rtf": "Times New Roman", "css": "'Times New Roman', Times, serif", "weight": "700"},
+    "times_italic": {"name": "Times Italic", "pdf": "Times-Italic", "rtf": "Times New Roman", "css": "'Times New Roman', Times, serif", "style": "italic"},
+    "times_bold_italic": {"name": "Times Bold Italic", "pdf": "Times-BoldItalic", "rtf": "Times New Roman", "css": "'Times New Roman', Times, serif", "weight": "700", "style": "italic"},
+    "courier": {"name": "Courier", "pdf": "Courier", "rtf": "Courier New", "css": "'Courier New', Courier, monospace"},
+    "courier_bold": {"name": "Courier Bold", "pdf": "Courier-Bold", "rtf": "Courier New", "css": "'Courier New', Courier, monospace", "weight": "700"},
+    "courier_oblique": {"name": "Courier Oblique", "pdf": "Courier-Oblique", "rtf": "Courier New", "css": "'Courier New', Courier, monospace", "style": "italic"},
+    "courier_bold_oblique": {"name": "Courier Bold Oblique", "pdf": "Courier-BoldOblique", "rtf": "Courier New", "css": "'Courier New', Courier, monospace", "weight": "700", "style": "italic"},
+    "symbol": {"name": "Symbol", "pdf": "Symbol", "rtf": "Symbol", "css": "Symbol, serif"},
+    "zapf_dingbats": {"name": "Zapf Dingbats", "pdf": "ZapfDingbats", "rtf": "Zapf Dingbats", "css": "'Zapf Dingbats', serif"},
+}
+
+VOUCHER_RTF_FONT_CHOICES = {
+    "ibm_plex_sans": {"name": "IBM Plex Sans", "pdf": "Helvetica", "rtf": "IBM Plex Sans", "css": "'IBM Plex Sans', system-ui, sans-serif"},
+    "cormorant_garamond": {"name": "Cormorant Garamond", "pdf": "Times-Roman", "rtf": "Cormorant Garamond", "css": "'Cormorant Garamond', Georgia, serif"},
+    "jetbrains_mono": {"name": "JetBrains Mono", "pdf": "Courier", "rtf": "JetBrains Mono", "css": "'JetBrains Mono', monospace"},
+    "ibm_plex_mono": {"name": "IBM Plex Mono", "pdf": "Courier", "rtf": "IBM Plex Mono", "css": "'IBM Plex Mono', 'JetBrains Mono', monospace"},
+    "arial": {"name": "Arial", "pdf": "Helvetica", "rtf": "Arial", "css": "Arial, Helvetica, sans-serif"},
+    "calibri": {"name": "Calibri", "pdf": "Helvetica", "rtf": "Calibri", "css": "Calibri, Arial, sans-serif"},
+    "cambria": {"name": "Cambria", "pdf": "Times-Roman", "rtf": "Cambria", "css": "Cambria, Georgia, serif"},
+    "courier_new": {"name": "Courier New", "pdf": "Courier", "rtf": "Courier New", "css": "'Courier New', Courier, monospace"},
+    "georgia": {"name": "Georgia", "pdf": "Times-Roman", "rtf": "Georgia", "css": "Georgia, 'Times New Roman', serif"},
+    "symbol": {"name": "Symbol", "pdf": "Symbol", "rtf": "Symbol", "css": "Symbol, serif"},
+    "times_new_roman": {"name": "Times New Roman", "pdf": "Times-Roman", "rtf": "Times New Roman", "css": "'Times New Roman', Times, serif"},
+    "verdana": {"name": "Verdana", "pdf": "Helvetica", "rtf": "Verdana", "css": "Verdana, Geneva, sans-serif"},
+    "wingdings": {"name": "Wingdings", "pdf": "ZapfDingbats", "rtf": "Wingdings", "css": "Wingdings, serif"},
+    "zapf_dingbats": {"name": "Zapf Dingbats", "pdf": "ZapfDingbats", "rtf": "Zapf Dingbats", "css": "'Zapf Dingbats', serif"},
+}
 
 
 def can_edit_whats_new():
@@ -93,6 +171,274 @@ def _import_legacy_todos_if_needed():
 @bp.route('/tree')
 def sequence_entry():
     return render_template('sequence_entry.html')
+
+
+def _voucher_int(value, default, lo, hi):
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return default
+    return max(lo, min(hi, parsed))
+
+
+def _voucher_float(value, default, lo, hi):
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return default
+    return max(lo, min(hi, parsed))
+
+
+def _voucher_page_count(form, labels_per_page):
+    if form.get("pages") is not None:
+        return _voucher_int(form.get("pages"), 1, 1, 100)
+    count = _voucher_int(form.get("count"), 30, 1, 1000)
+    return max(1, (count + labels_per_page - 1) // labels_per_page)
+
+
+def _voucher_number_parts(form):
+    prefix = re.sub(r'[\x00-\x1f\x7f]', '', form.get("prefix", "")).strip()[:32]
+    start_raw = (form.get("start_number") or "001").strip()
+    start_match = re.search(r'\d+', start_raw)
+    start_number = int(start_match.group(0)) if start_match else 1
+    number_width = max(1, min(12, len(start_match.group(0)) if start_match else 3))
+    return prefix, start_number, number_width
+
+
+def _voucher_format_label(prefix, start_number, number_width, offset):
+    return f"{prefix}{str(start_number + offset).zfill(number_width)}"
+
+
+def _voucher_label_values(form, layout):
+    prefix, start_number, number_width = _voucher_number_parts(form)
+    labels_per_page = max(1, layout["preset"]["columns"] * layout["preset"]["rows"])
+    count = _voucher_page_count(form, labels_per_page) * labels_per_page
+    return [_voucher_format_label(prefix, start_number, number_width, i) for i in range(count)]
+
+
+def _apply_auto_voucher_layout(preset, sample_label, font_size):
+    page_width = preset["page_width"]
+    page_height = preset["page_height"]
+    margin_left = preset["margin_left"]
+    margin_top = preset["margin_top"]
+    usable_width = max(0.5, page_width - (margin_left * 2))
+    usable_height = max(0.5, page_height - (margin_top * 2))
+    text_width = max(1, len(sample_label or "000")) * font_size * 0.6 / 72
+    text_height = font_size / 72
+    label_width = min(usable_width, max(0.35, text_width + 0.18))
+    label_height = min(usable_height, max(0.22, text_height + 0.12))
+    columns = max(1, int(usable_width // label_width))
+    rows = max(1, int(usable_height // label_height))
+    gap_x = (usable_width - (columns * label_width)) / (columns - 1) if columns > 1 else 0
+    gap_y = (usable_height - (rows * label_height)) / (rows - 1) if rows > 1 else 0
+    preset.update({
+        "label_width": label_width,
+        "label_height": label_height,
+        "columns": columns,
+        "rows": rows,
+        "gap_x": max(0, gap_x),
+        "gap_y": max(0, gap_y),
+    })
+    return preset
+
+
+def _voucher_font_choices_for_output(output_format):
+    if output_format == "rtf":
+        return VOUCHER_RTF_FONT_CHOICES
+    return VOUCHER_PDF_FONT_CHOICES
+
+
+def _voucher_layout_from_form(form, sample_label=None, output_format="pdf"):
+    preset_key = form.get("label_size") or "avery_5160"
+    preset = dict(VOUCHER_LABEL_PRESETS.get(preset_key, VOUCHER_LABEL_PRESETS["avery_5160"]))
+    font_choices = _voucher_font_choices_for_output(output_format)
+    default_font_key = "ibm_plex_sans" if output_format == "rtf" else "helvetica"
+    font_key = form.get("font_family") or default_font_key
+    font_size = _voucher_int(form.get("font_size"), 12, 6, 36)
+    if preset_key == "custom":
+        label_width = _voucher_float(form.get("custom_width"), 2.625, 0.5, 8.5)
+        label_height = _voucher_float(form.get("custom_height"), 1, 0.25, 5)
+        columns = _voucher_int(form.get("custom_columns"), 3, 1, 8)
+        rows = _voucher_int(form.get("custom_rows"), 10, 1, 40)
+        preset.update({
+            "name": "Custom",
+            "page_width": 8.5,
+            "page_height": 11,
+            "label_width": label_width,
+            "label_height": label_height,
+            "columns": columns,
+            "rows": rows,
+            "margin_left": _voucher_float(form.get("custom_margin_left"), 0.25, 0, 4),
+            "margin_top": _voucher_float(form.get("custom_margin_top"), 0.5, 0, 4),
+            "gap_x": _voucher_float(form.get("custom_gap_x"), 0.125, 0, 2),
+            "gap_y": _voucher_float(form.get("custom_gap_y"), 0, 0, 2),
+        })
+    elif preset.get("auto"):
+        prefix, start_number, number_width = _voucher_number_parts(form)
+        sample = sample_label or _voucher_format_label(prefix, start_number, number_width, 0)
+        preset = _apply_auto_voucher_layout(preset, sample, font_size)
+    else:
+        available_columns = preset["columns"]
+        preset["columns"] = _voucher_int(form.get("print_columns"), available_columns, 1, available_columns)
+    return {
+        "preset": preset,
+        "font": font_choices.get(font_key, font_choices[default_font_key]),
+        "font_size": font_size,
+        "include_guides": form.get("include_guides") == "1",
+    }
+
+
+def _voucher_labels_and_layout(values, output_format="pdf"):
+    layout = _voucher_layout_from_form(values, output_format=output_format)
+    labels = _voucher_label_values(values, layout)
+    if not layout["preset"].get("auto"):
+        return labels, layout
+    for _ in range(4):
+        sample_label = max(labels or [""], key=len)
+        next_layout = _voucher_layout_from_form(values, sample_label=sample_label, output_format=output_format)
+        next_labels = _voucher_label_values(values, next_layout)
+        current_preset = layout["preset"]
+        next_preset = next_layout["preset"]
+        if (
+            current_preset["columns"] == next_preset["columns"]
+            and current_preset["rows"] == next_preset["rows"]
+            and len(labels) == len(next_labels)
+        ):
+            return next_labels, next_layout
+        layout = next_layout
+        labels = next_labels
+    return labels, layout
+
+
+def _pdf_escape(value):
+    return str(value).replace("\\", "\\\\").replace("(", "\\(").replace(")", "\\)")
+
+
+def _pdf_object(obj_id, body):
+    return f"{obj_id} 0 obj\n{body}\nendobj\n".encode("latin-1")
+
+
+def _build_voucher_pdf(labels, layout):
+    preset = layout["preset"]
+    font_name = layout["font"]["pdf"]
+    font_size = layout["font_size"]
+    page_w = preset["page_width"] * 72
+    page_h = preset["page_height"] * 72
+    label_w = preset["label_width"] * 72
+    label_h = preset["label_height"] * 72
+    margin_left = preset["margin_left"] * 72
+    margin_top = preset["margin_top"] * 72
+    gap_x = preset["gap_x"] * 72
+    gap_y = preset["gap_y"] * 72
+    per_page = max(1, preset["columns"] * preset["rows"])
+    pages = [labels[i:i + per_page] for i in range(0, len(labels), per_page)]
+
+    objects = []
+    pages_refs = []
+    next_obj = 3
+    for page_labels in pages:
+        content_parts = []
+        for idx, label in enumerate(page_labels):
+            row = idx // preset["columns"]
+            col = idx % preset["columns"]
+            x = margin_left + col * (label_w + gap_x)
+            y_top = page_h - margin_top - row * (label_h + gap_y)
+            y = y_top - (label_h / 2) - (font_size / 3)
+            text_width = len(label) * font_size * 0.6
+            text_x = x + max(4, (label_w - text_width) / 2)
+            if layout["include_guides"]:
+                content_parts.append(f"{x:.2f} {y_top - label_h:.2f} {label_w:.2f} {label_h:.2f} re S")
+            content_parts.append(f"BT /F1 {font_size} Tf {text_x:.2f} {y:.2f} Td ({_pdf_escape(label)}) Tj ET")
+        content = "\n".join(content_parts).encode("latin-1", errors="replace")
+        content_id = next_obj
+        page_id = next_obj + 1
+        next_obj += 2
+        objects.append(_pdf_object(content_id, f"<< /Length {len(content)} >>\nstream\n{content.decode('latin-1')}\nendstream"))
+        objects.append(_pdf_object(page_id, f"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 {page_w:.2f} {page_h:.2f}] /Resources << /Font << /F1 1 0 R >> >> /Contents {content_id} 0 R >>"))
+        pages_refs.append(f"{page_id} 0 R")
+
+    pdf = BytesIO()
+    pdf.write(b"%PDF-1.4\n%\xe2\xe3\xcf\xd3\n")
+    offsets = [0]
+    font_object = _pdf_object(1, f"<< /Type /Font /Subtype /Type1 /BaseFont /{font_name} >>")
+    pages_object = _pdf_object(2, f"<< /Type /Pages /Kids [{' '.join(pages_refs)}] /Count {len(pages_refs)} >>")
+    all_objects = [font_object, pages_object] + objects
+    for obj in all_objects:
+        offsets.append(pdf.tell())
+        pdf.write(obj)
+    catalog_id = next_obj
+    offsets.append(pdf.tell())
+    pdf.write(_pdf_object(catalog_id, "<< /Type /Catalog /Pages 2 0 R >>"))
+    xref_start = pdf.tell()
+    pdf.write(f"xref\n0 {len(offsets)}\n0000000000 65535 f \n".encode("latin-1"))
+    for offset in offsets[1:]:
+        pdf.write(f"{offset:010d} 00000 n \n".encode("latin-1"))
+    pdf.write(f"trailer\n<< /Size {len(offsets)} /Root {catalog_id} 0 R >>\nstartxref\n{xref_start}\n%%EOF\n".encode("latin-1"))
+    return pdf.getvalue()
+
+
+def _rtf_escape(value):
+    text = str(value).replace("\\", "\\\\").replace("{", "\\{").replace("}", "\\}")
+    return text.replace("\n", "\\line ")
+
+
+def _build_voucher_rtf(labels, layout):
+    preset = layout["preset"]
+    font = layout["font"]["rtf"]
+    font_half_points = layout["font_size"] * 2
+    cell_w = int(preset["label_width"] * 1440)
+    cell_h = int(preset["label_height"] * 1440)
+    rows = []
+    for i in range(0, len(labels), preset["columns"]):
+        row_labels = labels[i:i + preset["columns"]]
+        row = [f"\\trowd\\trgaph0\\trleft0\\trrh{cell_h}"]
+        for col in range(len(row_labels)):
+            row.append(f"\\cellx{cell_w * (col + 1)}")
+        for label in row_labels:
+            row.append(f"\\pard\\intbl\\qc\\f0\\fs{font_half_points} {_rtf_escape(label)}\\cell")
+        row.append("\\row")
+        rows.append("".join(row))
+    return ("{\\rtf1\\ansi\\deff0"
+            f"{{\\fonttbl{{\\f0 {font};}}}}"
+            "\\margl720\\margr720\\margt720\\margb720\n"
+            + "\n".join(rows)
+            + "}").encode("utf-8")
+
+
+@bp.route('/voucher')
+@bp.route('/vouchers')
+def voucher_redirect():
+    return redirect(url_for('main.voucher_labels'), code=301)
+
+
+@bp.route('/voucher-labels', methods=['GET'])
+def voucher_labels():
+    return render_template(
+        'voucher_labels.html',
+        presets=VOUCHER_LABEL_PRESETS,
+        pdf_fonts=list(VOUCHER_PDF_FONT_CHOICES.items()),
+        rtf_fonts=list(VOUCHER_RTF_FONT_CHOICES.items()),
+    )
+
+
+@bp.route('/voucher-labels/export', methods=['GET', 'POST'])
+def voucher_labels_export():
+    values = request.form if request.method == "POST" else request.args
+    output_format = (values.get("output_format") or "pdf").lower()
+    labels, layout = _voucher_labels_and_layout(values, output_format=output_format)
+    if output_format == "rtf":
+        data = _build_voucher_rtf(labels, layout)
+        return Response(
+            data,
+            mimetype="application/rtf",
+            headers={"Content-Disposition": "attachment; filename=voucher-labels.rtf"},
+        )
+    data = _build_voucher_pdf(labels, layout)
+    return Response(
+        data,
+        mimetype="application/pdf",
+        headers={"Content-Disposition": "attachment; filename=voucher-labels.pdf"},
+    )
 
 
 @bp.route('/test')

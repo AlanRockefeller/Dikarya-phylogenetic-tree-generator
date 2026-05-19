@@ -1399,10 +1399,65 @@
         return div.innerHTML;
     }
 
-    // Alan 5/8/26 - Treat queue entries as duplicates only when both the name and sequence match.
-    // This lets users re-run add/remove workflows without creating repeated copies of the same record.
+    const US_STATE_TO_ABBR = {
+        alabama: 'al', alaska: 'ak', arizona: 'az', arkansas: 'ar', california: 'ca',
+        colorado: 'co', connecticut: 'ct', delaware: 'de', florida: 'fl', georgia: 'ga',
+        hawaii: 'hi', idaho: 'id', illinois: 'il', indiana: 'in', iowa: 'ia', kansas: 'ks',
+        kentucky: 'ky', louisiana: 'la', maine: 'me', maryland: 'md', massachusetts: 'ma',
+        michigan: 'mi', minnesota: 'mn', mississippi: 'ms', missouri: 'mo', montana: 'mt',
+        nebraska: 'ne', nevada: 'nv', 'new hampshire': 'nh', 'new jersey': 'nj',
+        'new mexico': 'nm', 'new york': 'ny', 'north carolina': 'nc', 'north dakota': 'nd',
+        ohio: 'oh', oklahoma: 'ok', oregon: 'or', pennsylvania: 'pa', 'rhode island': 'ri',
+        'south carolina': 'sc', 'south dakota': 'sd', tennessee: 'tn', texas: 'tx',
+        utah: 'ut', vermont: 'vt', virginia: 'va', washington: 'wa',
+        'west virginia': 'wv', wisconsin: 'wi', wyoming: 'wy'
+    };
+    const US_STATE_ABBRS = new Set(Object.values(US_STATE_TO_ABBR));
+
+    // Alan 5/14/26 - Normalize known location labels so same-sequence duplicates collapse only when their location also matches.
+    function normalizeDedupLocation(value, preserveLocality = false) {
+        const text = String(value || '').replace(/\s+/g, ' ').trim();
+        if (!text) return '';
+        const rawTokens = text.split(' ').map(token => token.replace(/^[,.;:()[\]{}]+|[,.;:()[\]{}]+$/g, '')).filter(Boolean);
+        const tokens = rawTokens.map(token => token.toLowerCase());
+        const countryToken = tokens[tokens.length - 1] || '';
+        const isUs = ['us', 'usa', 'u.s.', 'u.s.a.'].includes(countryToken);
+        if (isUs) {
+            const locationTokens = tokens.slice(0, -1);
+            let zip = '';
+            if (locationTokens.length && /^\d{5}(-\d{4})?$/.test(locationTokens[locationTokens.length - 1])) {
+                zip = locationTokens.pop();
+            }
+            for (const size of [2, 1]) {
+                if (locationTokens.length < size) continue;
+                const candidate = locationTokens.slice(-size).join(' ');
+                const state = US_STATE_TO_ABBR[candidate] || (size === 1 && US_STATE_ABBRS.has(candidate) ? candidate : '');
+                const locality = preserveLocality ? locationTokens.slice(0, -size).join(' ').replace(/[^a-z0-9]+/g, ' ').trim() : '';
+                if (state) return ['us', state, locality, zip].filter(Boolean).join('|');
+            }
+        }
+        return text.toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim();
+    }
+
+    // Alan 5/14/26 - Extract the trailing location text from tree labels when imports do not provide a separate location field.
+    function extractLocationFromSequenceName(name) {
+        const text = String(name || '').replace(/\s+/g, ' ').trim();
+        if (!text) return '';
+        const usMatch = text.match(/\b((?:[A-Za-z]+(?:\s+[A-Za-z]+)?|[A-Z]{2})(?:\s+\d{5}(?:-\d{4})?)?\s+(?:US|USA))\b\s*$/i);
+        if (usMatch) return usMatch[1];
+        const countryMatch = text.match(/\b([A-Za-z][A-Za-z\s.-]{1,80}\s+[A-Z]{2,3})\b\s*$/);
+        return countryMatch ? countryMatch[1] : '';
+    }
+
+    // Alan 5/14/26 - Prefer same sequence plus same known location for deduping, with exact-record fallback for unknown locations.
     function sequenceDedupKey(seq) {
-        return `${String(seq?.name || '')}\u0000${String(seq?.sequence || '')}`;
+        const sequence = String(seq?.sequence || '').replace(/\s+/g, '').toUpperCase();
+        const explicitLocation = seq?.location || seq?.mycomap_location || '';
+        const location = explicitLocation
+            ? normalizeDedupLocation(explicitLocation, true)
+            : normalizeDedupLocation(extractLocationFromSequenceName(seq?.name));
+        if (location) return `sequence-location\u0000${sequence}\u0000${location}`;
+        return `exact-record\u0000${String(seq?.name || '')}\u0000${sequence}`;
     }
 
     function addSequences(sequences, removeDuplicates = true) {
@@ -2762,6 +2817,7 @@
                 organism: seq.organism || '',
                 source: seq.source || '',
                 hit_source: seq.hit_source || '',
+                location: seq.location || seq.mycomap_location || extractLocationFromSequenceName(seq.name) || '',
                 query_cover: seq.query_cover ?? null,
                 subject_cover: seq.subject_cover ?? null,
                 identity: seq.identity ?? null,
