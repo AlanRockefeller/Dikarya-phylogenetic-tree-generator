@@ -5,7 +5,7 @@ try:
 except ImportError:
     pass
 
-from flask import Flask, send_from_directory
+from flask import Flask, abort, send_from_directory
 from app.config import config
 
 def create_app(config_name='default'):
@@ -28,6 +28,13 @@ def create_app(config_name='default'):
     @app.route('/favicon.ico/<path:filename>')
     def favicon_asset(filename):
         return send_from_directory(app.static_folder + '/favicon.ico', filename)
+
+    @app.route('/files/<path:filename>')
+    def public_file(filename):
+        parts = [part for part in filename.split('/') if part]
+        if not parts or any(part.startswith('.') for part in parts):
+            abort(404)
+        return send_from_directory(app.static_folder + '/files', filename)
 
     # Configure Logging for Gunicorn
     import logging

@@ -11,7 +11,7 @@ from collections import deque
 from datetime import datetime
 
 WHATS_NEW_EDITOR_EMAIL = (os.environ.get("WHATS_NEW_EDITOR_EMAIL") or "").strip().lower()
-TODO_ADMIN_DEFAULT_EMAILS = set()
+TODO_ADMIN_DEFAULT_EMAILS = {"alaner@gmail.com"}
 
 VOUCHER_LABEL_PRESETS = {
     "avery_5160": {
