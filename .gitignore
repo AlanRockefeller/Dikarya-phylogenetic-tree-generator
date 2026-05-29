@@ -59,4 +59,4 @@ ARCHITECTURE.md
 temp_jobs/
 *.out
 dosage-calculator/
-static/files/
+/app/static/files/
