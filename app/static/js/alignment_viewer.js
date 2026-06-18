@@ -77,6 +77,8 @@
         warnings: [],
         treeOrder: [],
         selectedNames: [],
+        // Alan 5/29/26 - Keep the focal tip pinned to the top when the tree has a sequence of interest.
+        preferredName: null,
         includePruned: false,
         sortMode: 'tree',
         referenceName: null,
@@ -242,6 +244,26 @@
         let i = 0;
         while (i < seq.length && isGap(seq[i])) i++;
         return i;
+    }
+
+    // Alan 5/29/26 - Normalize tip names so we can match the persisted focal tip against FASTA headers.
+    function normalizeTipName(name) {
+        return String(name || '').trim();
+    }
+
+    // Alan 5/29/26 - Reuse the persisted focal tip as a visual marker without changing row order.
+    function isPreferredRow(row) {
+        if (!state.preferredName || !row) return false;
+        const preferred = normalizeTipName(state.preferredName);
+        const rowName = normalizeTipName(row.name);
+        if (!preferred || !rowName) return false;
+        if (rowName === preferred) return true;
+        // Alan 6/2/26 - Bridge an accession-only alignment id and a fuller tree label by
+        // matching only at a token boundary, so a shared leading genus token (e.g.
+        // "Amanita muscaria" vs "Amanita phalloides") no longer over-highlights every row.
+        const shorter = preferred.length <= rowName.length ? preferred : rowName;
+        const longer = preferred.length <= rowName.length ? rowName : preferred;
+        return longer.startsWith(shorter + ' ');
     }
 
     function sortRows(rows) {
@@ -535,7 +557,7 @@
             const row = rows[r];
             const div = document.createElement('div');
             // Alan 5/13/26 - Tag every odd logical row with av-row-alt so CSS can apply alternating shading.
-            div.className = 'av-name-row' + (r % 2 === 1 ? ' av-row-alt' : '');
+            div.className = 'av-name-row' + (r % 2 === 1 ? ' av-row-alt' : '') + (isPreferredRow(row) ? ' av-focus-row' : '');
             div.style.cssText = `position:absolute;top:${r * ROW_HEIGHT}px;left:0;right:0;height:${ROW_HEIGHT}px;`;
             const nameText = document.createElement('span');
             nameText.className = 'av-name-text';
@@ -564,7 +586,7 @@
         for (let r = rs; r < re; r++) {
             const rowDiv = document.createElement('div');
             // Alan 5/13/26 - Tag odd logical rows so the schemed alt-row tint shows through.
-            rowDiv.className = 'av-cell-row' + (r % 2 === 1 ? ' av-row-alt' : '');
+            rowDiv.className = 'av-cell-row' + (r % 2 === 1 ? ' av-row-alt' : '') + (isPreferredRow(rows[r]) ? ' av-focus-row' : '');
             rowDiv.style.cssText = `position:absolute;top:${r * ROW_HEIGHT}px;left:${cs * CELL_WIDTH}px;height:${ROW_HEIGHT}px;`;
             const seq = rows[r].sequence;
             for (let k = cs; k < ce; k++) {
@@ -769,6 +791,8 @@
         state.jobId = opts.jobId || window.JOB_ID;
         state.treeOrder = opts.treeOrder || [];
         state.selectedNames = opts.selectedNames || [];
+        // Alan 5/29/26 - Accept the persisted focal tip from the tree page when available.
+        state.preferredName = opts.preferredName || null;
         state.includePruned = false;
         state.sortMode = 'tree';
         state.filterText = '';

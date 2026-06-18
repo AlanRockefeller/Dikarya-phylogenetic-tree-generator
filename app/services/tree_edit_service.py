@@ -1,3 +1,4 @@
+import copy
 import json
 import logging
 import shutil
@@ -16,6 +17,9 @@ except ImportError:
     HAS_BIOPYTHON = False
 
 logger = logging.getLogger(__name__)
+
+MAX_SEQUENCE_OF_INTEREST_LENGTH = 1000
+MAX_SEQUENCE_OF_INTEREST_SOURCE_LENGTH = 64
 
 def load_tree_state(job_dir: Path) -> Dict:
     """
@@ -95,6 +99,52 @@ def save_tree_state(job_dir: Path, tree_json: Dict) -> None:
         json.dump(tree_json, f, indent=2)
 
 
+def _iter_tip_names(node: Dict[str, Any]):
+    if not isinstance(node, dict):
+        return
+    children = node.get("children")
+    if children:
+        for child in children:
+            yield from _iter_tip_names(child)
+        return
+    for key in ("original_name", "name"):
+        value = node.get(key)
+        if isinstance(value, str) and value:
+            yield value
+
+
+def _tree_tip_set(tree_json: Dict[str, Any]) -> Set[str]:
+    return set(_iter_tip_names(tree_json.get("tree_structure") or {}))
+
+
+def _has_control_chars(value: str) -> bool:
+    return any(ord(ch) < 32 or ord(ch) == 127 for ch in value)
+
+
+def _validate_sequence_of_interest(tree_json: Dict[str, Any],
+                                   tip_name: Optional[str],
+                                   source: Any) -> Optional[str]:
+    if tip_name is None:
+        return None
+    if not isinstance(tip_name, str):
+        raise ValueError("sequence_of_interest tip_name must be a string or null")
+    if tip_name == "":
+        return None
+    if len(tip_name) > MAX_SEQUENCE_OF_INTEREST_LENGTH:
+        raise ValueError("sequence_of_interest tip_name is too long")
+    if _has_control_chars(tip_name):
+        raise ValueError("sequence_of_interest tip_name contains control characters")
+    if not isinstance(source, str):
+        raise ValueError("sequence_of_interest source must be a string")
+    if len(source) > MAX_SEQUENCE_OF_INTEREST_SOURCE_LENGTH:
+        raise ValueError("sequence_of_interest source is too long")
+    if _has_control_chars(source):
+        raise ValueError("sequence_of_interest source contains control characters")
+    if tip_name not in _tree_tip_set(tree_json):
+        raise ValueError("sequence_of_interest tip_name is not present in the current tree")
+    return tip_name
+
+
 def _int_param(value, default: int) -> int:
     try:
         return int(value)
@@ -161,6 +211,95 @@ def _selection_sets_without_names(tree_json: Dict, removed_names: Set[str]) -> N
         ]
 
 
+def _stable_internal_node_id_from_names(tip_names: List[str]) -> str:
+    """Build the same stable internal-node ID used by the browser viewer."""
+    key = "\x1f".join(sorted(str(name) for name in tip_names if name))
+    hash_value = 2166136261
+    for char in key:
+        hash_value ^= ord(char)
+        hash_value = (hash_value * 16777619) & 0xFFFFFFFF
+    return f"internal:{hash_value:08x}"
+
+
+def _stable_internal_node_id(clade) -> Optional[str]:
+    """Return a stable ID for an internal clade based on descendant tip labels."""
+    if not getattr(clade, "clades", None):
+        return None
+    tip_names = [terminal.name for terminal in clade.get_terminals() if terminal.name]
+    if not tip_names:
+        return None
+    return _stable_internal_node_id_from_names(tip_names)
+
+
+def _editable_tree_input_path(job_dir: Path, what: str = "edit") -> Path:
+    """Return the current editable tree file (pruned if present, else original).
+
+    Shared by rotate/prune/reroot/midpoint so the pruned-vs-original selection
+    lives in one place instead of being copy-pasted into each.
+    """
+    pruned_newick = job_dir / "tree" / "tree_pruned.newick"
+    original_newick = job_dir / "tree" / "tree_original.newick"
+    input_path = pruned_newick if pruned_newick.exists() else original_newick
+    if not input_path.exists():
+        raise FileNotFoundError(f"No tree file found to {what}")
+    return input_path
+
+
+def rotate_node(job_dir: Path, tree_json: Dict, node_id: str) -> Dict:
+    """
+    Reverse the immediate child order for one internal node.
+    This changes only display order; parents, branch lengths, labels, and tips stay intact.
+    """
+    if not node_id:
+        raise ValueError("Missing node_id")
+
+    if not HAS_BIOPYTHON:
+        raise RuntimeError("BioPython not installed; cannot rotate tree")
+
+    input_path = _editable_tree_input_path(job_dir, "rotate")
+
+    try:
+        tree = Phylo.read(str(input_path), "newick")
+
+        target_clade = None
+        for clade in tree.find_clades(order="preorder"):
+            # Alan 6/2/26 - Only internal nodes with >=2 children are rotatable. Skipping
+            # leaves and unary pass-through nodes also avoids a stable-id collision where a
+            # unary parent shares its only child's descendant-leaf set (preorder would hit
+            # the parent first and wrongly fail on a legitimate node).
+            if not getattr(clade, "clades", None) or len(clade.clades) < 2:
+                continue
+            stable_id = _stable_internal_node_id(clade)
+            if stable_id == node_id or (clade.name and clade.name == node_id):
+                target_clade = clade
+                break
+
+        if target_clade is None:
+            raise ValueError("Unknown internal node")
+
+        target_clade.clades.reverse()
+        _drop_confidence_when_named(tree)
+
+        valid_path = job_dir / "tree"
+        valid_path.mkdir(parents=True, exist_ok=True)
+        Phylo.write(tree, str(valid_path / "tree_pruned.newick"), "newick")
+        Phylo.write(tree, str(valid_path / "tree_pruned.nexus"), "nexus")
+
+        new_structure = _clade_to_json(tree.root)
+        tree_json["current_tree"] = "pruned"
+        tree_json["tree_structure"] = new_structure
+        tree_json["last_rotated_node_id"] = node_id
+
+        renames = tree_json.get("renames", {})
+        pruned_taxa = set(tree_json.get("pruned_taxa", []))
+        apply_state_to_structure(new_structure, renames, pruned_taxa)
+        return tree_json
+
+    except Exception as e:
+        logger.error(f"Rotate node failed: {e}")
+        raise
+
+
 def prune_taxa(job_dir: Path, tree_json: Dict, taxa_names: List[str]) -> Dict:
     """
     Remove one or more tips (or subtrees if internal nodes selected).
@@ -174,13 +313,7 @@ def prune_taxa(job_dir: Path, tree_json: Dict, taxa_names: List[str]) -> Dict:
         raise RuntimeError("BioPython not installed; cannot prune tree")
 
     # Physical Pruning logic
-    # Determine input path
-    pruned_newick = job_dir / "tree" / "tree_pruned.newick"
-    original_newick = job_dir / "tree" / "tree_original.newick"
-    
-    input_path = pruned_newick if pruned_newick.exists() else original_newick
-    if not input_path.exists():
-        raise FileNotFoundError("No tree file found to prune")
+    input_path = _editable_tree_input_path(job_dir, "prune")
 
     try:
         tree = Phylo.read(str(input_path), "newick")
@@ -190,7 +323,8 @@ def prune_taxa(job_dir: Path, tree_json: Dict, taxa_names: List[str]) -> Dict:
         
         to_prune = []
         for clade in tree.find_clades():
-            if clade.name in targets:
+            stable_id = _stable_internal_node_id(clade)
+            if clade.name in targets or (stable_id and stable_id in targets):
                 to_prune.append(clade)
                 
         if not to_prune:
@@ -219,6 +353,14 @@ def prune_taxa(job_dir: Path, tree_json: Dict, taxa_names: List[str]) -> Dict:
             if name not in tree_json["pruned_taxa"]:
                 tree_json["pruned_taxa"].append(name)
         _selection_sets_without_names(tree_json, pruned_names)
+
+        # Invalidate the focal sequence if it was pruned out. Only flag that Auto root needs
+        # a new focal tip when an auto-style mode is actually active; midpoint/manual/unrooted
+        # modes must not surface a stale "pick a sequence of interest" prompt after reload.
+        if tree_json.get("sequence_of_interest") in pruned_names:
+            tree_json["sequence_of_interest"] = None
+            auto_modes = ("auto", "most_divergent_hit")
+            tree_json["needs_sequence_of_interest"] = (tree_json.get("root_mode") or "").lower() in auto_modes
              
         # Map parents for manual removal
         parents = {c: p for p in tree.find_clades() for c in p.clades}
@@ -292,7 +434,12 @@ def rename_tip(tree_json: Dict, old_name: str, new_name: str) -> Dict:
         tree_json["renames"] = {}
         
     tree_json["renames"][old_name] = new_name
-    
+
+    # Alan 6/2/26 - Do NOT rewrite sequence_of_interest to the new display name: the focal
+    # tip is tracked by its ORIGINAL name (selection sets, patristic distances and the
+    # alignment all key on original names), so syncing to the display name broke auto-root
+    # resolution for a renamed focal tip. Leaving it as the original name keeps it resolvable.
+
     def apply_rename(node):
         if node.get("name") == old_name or node.get("original_name") == old_name:
             node["name"] = new_name
@@ -339,12 +486,7 @@ def reroot_tree(job_dir: Path, tree_json: Dict, root_target: str) -> Dict:
         return tree_json # Return unchanged if no library
 
     # Determine input path: prefer existing modified tree
-    pruned_newick = job_dir / "tree" / "tree_pruned.newick"
-    original_newick = job_dir / "tree" / "tree_original.newick"
-    
-    input_path = pruned_newick if pruned_newick.exists() else original_newick
-    if not input_path.exists():
-        raise FileNotFoundError("No tree file found to reroot")
+    input_path = _editable_tree_input_path(job_dir, "reroot")
 
     try:
         # Load the tree
@@ -396,6 +538,21 @@ def reroot_tree(job_dir: Path, tree_json: Dict, root_target: str) -> Dict:
         tree_json["root_target"] = root_target
         tree_json["current_tree"] = "pruned"
         tree_json["tree_structure"] = new_structure
+        # Alan 6/2/26 - Rerooting on a node supersedes midpoint rooting and is a deliberate
+        # manual root that needs no focal tip; keep status state honest so a reload doesn't
+        # show a stale Midpoint "(on)" or an Auto/SOI prompt. apply_rooting_mode's "manual"
+        # branch overwrites these with equivalent values when it drives the reroot.
+        tree_json["is_midpoint_rooted"] = False
+        tree_json["needs_sequence_of_interest"] = False
+        tree_json["rooting_info"] = {
+            "query_tip": tree_json.get("sequence_of_interest"),
+            "chosen_root_target": root_target,
+            "chosen_by": "manual",
+            "reason": "user_manual_reroot",
+            "warnings": [],
+            "candidate_count": 0,
+            "rejected_count": 0,
+        }
         
         # Re-apply metadata
         renames = tree_json.get("renames", {})
@@ -425,12 +582,7 @@ def midpoint_root(job_dir: Path, tree_json: Dict) -> Dict:
         raise RuntimeError("Biopython not installed; midpoint rooting unavailable")
 
     # Determine input path
-    pruned_newick = job_dir / "tree" / "tree_pruned.newick"
-    original_newick = job_dir / "tree" / "tree_original.newick"
-    
-    input_path = pruned_newick if pruned_newick.exists() else original_newick
-    if not input_path.exists():
-        raise FileNotFoundError("No tree file found to reroot")
+    input_path = _editable_tree_input_path(job_dir, "reroot")
 
     try:
         tree = Phylo.read(str(input_path), "newick")
@@ -739,6 +891,169 @@ def recompute_tree(
         "metadata": metadata
     }
 
+def apply_rooting_mode(job_dir: Path, tree_json: Dict, mode: str,
+                        target: Optional[str] = None,
+                        sequence_of_interest: Optional[str] = None) -> Dict:
+    """Apply one of the user-facing rooting modes.
+
+    mode: "auto" | "midpoint" | "most_divergent_hit" | "unrooted" | "manual"
+    """
+    from app.services.tree_rooting_service import choose_auto_root_target
+
+    if sequence_of_interest is not None:
+        tree_json = set_sequence_of_interest(tree_json, sequence_of_interest, source="user_selected")
+
+    mode = (mode or "auto").lower()
+
+    if mode == "midpoint":
+        tree_json = midpoint_root(job_dir, tree_json)
+        tree_json["root_mode"] = "midpoint"
+        tree_json["root_target"] = None
+        # Alan 6/2/26 - Non-auto modes never need a focal tip; clear any stale prompt flag.
+        tree_json["needs_sequence_of_interest"] = False
+        tree_json["rooting_info"] = {
+            "query_tip": tree_json.get("sequence_of_interest"),
+            "chosen_root_target": None,
+            "chosen_by": "midpoint",
+            "reason": "user_selected_midpoint",
+            "warnings": [],
+            "candidate_count": 0,
+            "rejected_count": 0,
+        }
+        return tree_json
+
+    if mode == "manual":
+        if not target:
+            raise ValueError("manual rooting requires target")
+        tree_json = reroot_tree(job_dir, tree_json, target)
+        tree_json["root_mode"] = "manual"
+        tree_json["root_target"] = target
+        # Rerooting on a tip replaces midpoint rooting; keep the flag honest so
+        # the Midpoint button doesn't show "(on)" for a non-midpoint root.
+        tree_json["is_midpoint_rooted"] = False
+        # Alan 6/2/26 - Manual rooting doesn't need a focal tip; clear any stale prompt flag.
+        tree_json["needs_sequence_of_interest"] = False
+        tree_json["rooting_info"] = {
+            "query_tip": tree_json.get("sequence_of_interest"),
+            "chosen_root_target": target,
+            "chosen_by": "manual",
+            "reason": "user_manual_reroot",
+            "warnings": [],
+            "candidate_count": 0,
+            "rejected_count": 0,
+        }
+        return tree_json
+
+    if mode == "unrooted":
+        # Renderer doesn't yet support an unrooted layout; record intent so the
+        # UI can show it and so we don't silently lie. Leave the underlying
+        # tree file as-is.
+        tree_json["root_mode"] = "unrooted"
+        tree_json["root_target"] = None
+        tree_json["is_midpoint_rooted"] = False
+        # Alan 6/2/26 - Unrooted intent doesn't need a focal tip; clear any stale prompt flag.
+        tree_json["needs_sequence_of_interest"] = False
+        tree_json["rooting_info"] = {
+            "query_tip": tree_json.get("sequence_of_interest"),
+            "chosen_root_target": None,
+            "chosen_by": "unrooted",
+            "reason": "unrooted_layout_not_implemented_state_only",
+            "warnings": ["renderer_does_not_yet_support_unrooted_layout"],
+            "candidate_count": 0,
+            "rejected_count": 0,
+        }
+        return tree_json
+
+    # auto or most_divergent_hit
+    choice = choose_auto_root_target(job_dir, tree_json, mode=mode)
+
+    if choice.mode == "prompt_for_sequence_of_interest":
+        tree_json["root_mode"] = "auto"
+        tree_json["root_target"] = None
+        tree_json["rooting_info"] = choice.to_info("user_prompt_required")
+        tree_json["needs_sequence_of_interest"] = True
+        return tree_json
+
+    if choice.mode in ("midpoint_fallback", "none"):
+        # Fall back to midpoint and record why.
+        try:
+            tree_json = midpoint_root(job_dir, tree_json)
+        except Exception as e:
+            choice.warnings.append(f"midpoint_fallback_failed:{type(e).__name__}")
+            tree_json["root_mode"] = mode
+            tree_json["root_target"] = None
+            # Alan 6/2/26 - Fallback couldn't reroot; clear any stale target and prompt flag.
+            tree_json["needs_sequence_of_interest"] = False
+            tree_json["rooting_info"] = choice.to_info("midpoint_fallback")
+            return tree_json
+        tree_json["root_mode"] = mode
+        tree_json["root_target"] = None
+        # Alan 6/2/26 - We rooted via midpoint fallback; no focal-tip prompt is pending.
+        tree_json["needs_sequence_of_interest"] = False
+        tree_json["rooting_info"] = choice.to_info("midpoint_fallback")
+        return tree_json
+
+    # Successful auto/most_divergent_hit pick.
+    tree_json = reroot_tree(job_dir, tree_json, choice.target_name)
+    tree_json["root_mode"] = choice.mode
+    tree_json["root_target"] = choice.target_name
+    # Auto root reroots on a chosen tip, not the midpoint; clear the flag so the
+    # Midpoint button reflects reality instead of showing a stale "(on)".
+    tree_json["is_midpoint_rooted"] = False
+    tree_json["needs_sequence_of_interest"] = False
+    tree_json["rooting_info"] = choice.to_info(choice.mode)
+    return tree_json
+
+
+def apply_auto_root_default(job_dir: Path, tree_json: Dict, focal_tip: str,
+                            source: str = "user_selected") -> Dict:
+    """Make Auto root the default for a single-focal-tip job, but only when the tree is
+    still on its build-time default rooting ("" or "MIDPOINT") so a deliberate user
+    rooting choice or an explicit outgroup is never overridden.
+
+    Centralizes the auto-root-default policy (was an iNat-specific special case) and
+    operates on a copy, only adopting it on success so a failed auto-root never persists
+    a half-applied state (focal tip set but no rooting performed).
+    """
+    if not focal_tip:
+        return tree_json
+    if (tree_json.get("root_mode") or "") not in ("", "MIDPOINT"):
+        return tree_json
+    trial = copy.deepcopy(tree_json)
+    trial["sequence_of_interest"] = focal_tip
+    trial["sequence_of_interest_source"] = source
+    try:
+        return apply_rooting_mode(job_dir, trial, "auto", sequence_of_interest=focal_tip)
+    except Exception:
+        logger.warning("Auto-root default failed for %s", job_dir, exc_info=True)
+        return tree_json
+
+
+def set_sequence_of_interest(tree_json: Dict, tip_name: Optional[str],
+                              source: str = "user_selected") -> Dict:
+    """Persist the focal tip in `sequence_of_interest` only.
+
+    The focal highlight is rendered directly from this field (the tree viewer's
+    focal styling and the alignment viewer's preferredName both read it), so we do
+    NOT mirror it into the user-editable Default color group — doing so corrupted
+    user colorings by adding/removing members. resolve_sequence_of_interest() still
+    reads a single blue Default member as a legacy/iNat fallback.
+    """
+    if source is None or source == "":
+        source = "user_selected"
+    tip_name = _validate_sequence_of_interest(tree_json, tip_name, source)
+
+    if not tip_name:
+        tree_json["sequence_of_interest"] = None
+        tree_json["sequence_of_interest_source"] = None
+        return tree_json
+
+    tree_json["sequence_of_interest"] = tip_name
+    tree_json["sequence_of_interest_source"] = source
+    tree_json["needs_sequence_of_interest"] = False
+    return tree_json
+
+
 def parse_newick_to_json(path: Path) -> Dict:
     """
     Convert a Newick tree to our JSON format.
@@ -761,6 +1076,7 @@ def _clade_to_json(clade):
         "confidence": clade.confidence if clade.confidence is not None else getattr(clade, '_poly_confidence', None)
     }
     if clade.clades:
+        node["stable_id"] = _stable_internal_node_id(clade)
         node["children"] = [_clade_to_json(c) for c in clade.clades]
     return node
 

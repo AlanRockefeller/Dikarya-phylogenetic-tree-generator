@@ -19,6 +19,8 @@ spec.loader.exec_module(inaturalist_tree_service)
 
 build_inat_source_display_name = inaturalist_tree_service._build_inat_source_display_name
 find_observation_source_tip_name = inaturalist_tree_service._find_observation_source_tip_name
+maybe_add_inat_its_sequence = inaturalist_tree_service._maybe_add_inat_its_sequence
+source_display_label_for_tip = inaturalist_tree_service._source_display_label_for_tip
 from app.services.tree_edit_service import rename_tip
 
 
@@ -67,6 +69,54 @@ class TestInaturalistTreeSourceLabel(unittest.TestCase):
         self.assertEqual(
             name,
             "HFSONT56_ITS4-7_04_E1-DIK-A55-238849364-Daldinia_-1 ric=405 - 531373",
+        )
+
+    def test_source_tip_dedupes_exact_accession_and_inat_records(self):
+        its = "ACGT" * 30
+        observation = {
+            "ofvs": [
+                {"name": "DNA Barcode ITS", "value": its},
+            ],
+        }
+        sequences = [
+            {
+                "name": "PX375095 iNat317417169 Sarcosphaera sp. 'KM7' Colorado US",
+                "sequence": its,
+            },
+            {
+                "name": "iNat317417169 Sarcosphaera sp. 'KM7' Colorado US",
+                "sequence": its,
+            },
+            {
+                "name": "Other exact hit",
+                "sequence": its,
+            },
+        ]
+
+        added, matched = maybe_add_inat_its_sequence(observation, 317417169, sequences)
+
+        self.assertIsNone(added)
+        self.assertEqual(
+            matched,
+            "PX375095 iNat317417169 Sarcosphaera sp. 'KM7' Colorado US",
+        )
+        self.assertEqual(len(sequences), 2)
+        self.assertEqual(
+            sequences[0]["name"],
+            "PX375095 iNat317417169 Sarcosphaera sp. 'KM7' Colorado US",
+        )
+        self.assertEqual(sequences[1]["name"], "Other exact hit")
+
+    def test_source_display_label_preserves_accession(self):
+        label = source_display_label_for_tip(
+            "PX375095 iNat317417169 Sarcosphaera sp. 'KM7' Colorado US",
+            "iNat317417169 Sarcosphaera sp. 'KM7' Grand Mesa US",
+            317417169,
+        )
+
+        self.assertEqual(
+            label,
+            "PX375095 iNat317417169 Sarcosphaera sp. 'KM7' Grand Mesa US",
         )
 
     def test_rename_tip_updates_visible_name_and_display_name(self):

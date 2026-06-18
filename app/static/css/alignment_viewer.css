@@ -253,6 +253,12 @@
     cursor: default;
 }
 
+.alignment-viewer .av-name-row.av-focus-row,
+.alignment-viewer .av-cell-row.av-focus-row {
+    background: rgba(212, 164, 17, 0.08);
+    box-shadow: inset 3px 0 0 rgba(212, 164, 17, 0.85);
+}
+
 /* Alternating row shading — driven by logical row index from the renderer. */
 .dark .alignment-viewer[data-color-scheme] .av-name-row.av-row-alt,
 .dark .alignment-viewer[data-color-scheme] .av-cell-row.av-row-alt {
@@ -262,6 +268,16 @@
 .alignment-viewer .av-name-row:hover,
 .alignment-viewer .av-cell-row:hover {
     background: rgba(245, 158, 11, 0.08);
+}
+
+.dark .alignment-viewer .av-name-row.av-focus-row,
+.dark .alignment-viewer .av-cell-row.av-focus-row {
+    background: rgba(212, 164, 17, 0.12);
+    box-shadow: inset 3px 0 0 rgba(245, 191, 66, 0.9);
+}
+
+.dark .alignment-viewer .av-name-row.av-focus-row .av-name-text {
+    color: #f3d17a;
 }
 
 .alignment-viewer .av-name-text {

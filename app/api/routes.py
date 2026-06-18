@@ -11,9 +11,12 @@ from datetime import datetime
 
 from app.services.security_utils import validate_job_id, validate_safe_file_path
 from app.services.access_control import check_job_access
-from app.extensions import limiter
+from app.extensions import csrf, limiter
 
 logger = logging.getLogger(__name__)
+
+
+CLIENT_LOG_MAX_STR = 120
 
 
 def _server_error(exc, *, where=""):
@@ -40,6 +43,47 @@ def _server_error(exc, *, where=""):
         "error": "Internal server error",
         "request_id": request_id,
     }), 500
+
+
+def _client_log_value(value, max_length=CLIENT_LOG_MAX_STR):
+    """Return a short printable string for client diagnostics."""
+    text = str(value or "")
+    text = re.sub(r"[\r\n\t]+", " ", text)
+    return text[:max_length]
+
+
+@bp.route('/client-log', methods=['POST'])
+@csrf.exempt
+@limiter.limit("30 per minute; 300 per hour")
+def client_log():
+    """Record sanitized client-side diagnostics that never include raw form data."""
+    data = request.get_json(silent=True) or {}
+    event = _client_log_value(data.get("event"), 60)
+    if event != "mycomap_url_rejected":
+        return jsonify({"status": "ignored"})
+
+    url_length = data.get("url_length")
+    try:
+        url_length = int(url_length)
+    except (TypeError, ValueError):
+        url_length = None
+    if url_length is not None:
+        url_length = max(0, min(url_length, 10000))
+
+    logger.warning(
+        "client_event=%s reason=%s url_length=%s hostname=%s path_prefix=%s "
+        "has_r_id=%s starts_with_required_prefix=%s user_agent=%s referrer=%s",
+        event,
+        _client_log_value(data.get("reason"), 80),
+        url_length,
+        _client_log_value(data.get("hostname"), 120),
+        _client_log_value(data.get("path_prefix"), 120),
+        bool(data.get("has_r_id")),
+        bool(data.get("starts_with_required_prefix")),
+        _client_log_value(request.headers.get("User-Agent"), 200),
+        _client_log_value(request.headers.get("Referer"), 200),
+    )
+    return jsonify({"status": "ok"})
 
 
 # =============================================================================
@@ -1111,6 +1155,35 @@ def rename_tree_tip(job_id):
     except Exception as e:
         return _server_error(e)
 
+@bp.route('/job/<job_id>/tree/rotate', methods=['POST'])
+def rotate_tree_node(job_id):
+    if not validate_job_id(job_id):
+        return jsonify({"status": "error", "error": "Invalid job ID format"}), 400
+
+    _, error_msg, status_code = check_job_access(job_id, mode="edit")
+    if error_msg:
+        return jsonify({"status": "error", "error": error_msg}), status_code
+
+    job_dir = Config.JOB_DIR / job_id
+    data = request.get_json(silent=True) or {}
+    node_id = data.get("node_id")
+    if not isinstance(node_id, str) or not node_id.strip():
+        return jsonify({"status": "error", "error": "Missing node_id"}), 400
+    node_id = node_id.strip()
+    if len(node_id) > 256 or any(ord(char) < 32 for char in node_id):
+        return jsonify({"status": "error", "error": "Invalid node_id"}), 400
+
+    try:
+        from app.services.tree_edit_service import load_tree_state, rotate_node, save_tree_state
+        state = load_tree_state(job_dir)
+        state = rotate_node(job_dir, state, node_id)
+        save_tree_state(job_dir, state)
+        return jsonify(state)
+    except ValueError as e:
+        return jsonify({"status": "error", "error": str(e)}), 400
+    except Exception as e:
+        return _server_error(e)
+
 @bp.route('/job/<job_id>/tree/reroot', methods=['POST'])
 def reroot_tree_endpoint(job_id):
     _, error_msg, status_code = check_job_access(job_id, mode="edit")
@@ -1184,6 +1257,83 @@ def midpoint_root_toggle_endpoint(job_id):
         return jsonify({"status": "error", "error": str(e)}), 400
     except Exception as e:
         return _server_error(e)
+
+@bp.route('/job/<job_id>/tree/rooting_mode', methods=['POST'])
+def set_rooting_mode_endpoint(job_id):
+    """Apply a rooting mode: auto | midpoint | most_divergent_hit | unrooted | manual."""
+    if not validate_job_id(job_id):
+        return jsonify({"status": "error", "error": "Invalid job ID format"}), 400
+    _, error_msg, status_code = check_job_access(job_id, mode="edit")
+    if error_msg:
+        return jsonify({"status": "error", "error": error_msg}), status_code
+
+    job_dir = Config.JOB_DIR / job_id
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict):
+        data = {}
+    # Alan 6/2/26 - Treat missing/null/empty mode as "auto"; reject a non-string mode with a
+    # clean 400 instead of letting (mode or "auto").lower() raise AttributeError -> 500.
+    raw_mode = data.get("mode")
+    if raw_mode is None:
+        mode = "auto"
+    elif isinstance(raw_mode, str):
+        mode = raw_mode.strip().lower() or "auto"
+    else:
+        return jsonify({"status": "error", "error": "Invalid rooting mode"}), 400
+    target = data.get("target")
+    soi = data.get("sequence_of_interest")
+
+    if mode not in ("auto", "midpoint", "most_divergent_hit", "unrooted", "manual"):
+        return jsonify({"status": "error", "error": f"Unknown rooting mode: {mode}"}), 400
+
+    try:
+        from app.services.tree_edit_service import (
+            load_tree_state, save_tree_state, apply_rooting_mode, set_sequence_of_interest,
+        )
+        state = load_tree_state(job_dir)
+        if soi:
+            state = set_sequence_of_interest(state, soi, source="user_selected")
+        state = apply_rooting_mode(job_dir, state, mode, target=target,
+                                    sequence_of_interest=soi)
+        save_tree_state(job_dir, state)
+        return jsonify(state)
+    except ValueError as e:
+        return jsonify({"status": "error", "error": str(e)}), 400
+    except Exception as e:
+        return _server_error(e)
+
+
+@bp.route('/job/<job_id>/tree/sequence_of_interest', methods=['POST'])
+def set_sequence_of_interest_endpoint(job_id):
+    """Set or clear the persisted focal/sequence-of-interest tip."""
+    if not validate_job_id(job_id):
+        return jsonify({"status": "error", "error": "Invalid job ID format"}), 400
+    _, error_msg, status_code = check_job_access(job_id, mode="edit")
+    if error_msg:
+        return jsonify({"status": "error", "error": error_msg}), status_code
+
+    job_dir = Config.JOB_DIR / job_id
+    data = request.get_json(silent=True) or {}
+    tip_name = data.get("tip_name")
+    source = data.get("source", "user_selected")
+
+    try:
+        from app.services.tree_edit_service import (
+            load_tree_state, save_tree_state, set_sequence_of_interest,
+        )
+        state = load_tree_state(job_dir)
+        state = set_sequence_of_interest(state, tip_name, source=source)
+        save_tree_state(job_dir, state)
+        return jsonify({
+            "status": "ok",
+            "sequence_of_interest": state.get("sequence_of_interest"),
+            "sequence_of_interest_source": state.get("sequence_of_interest_source"),
+        })
+    except ValueError as e:
+        return jsonify({"status": "error", "error": str(e)}), 400
+    except Exception as e:
+        return _server_error(e)
+
 
 @bp.route('/job/<job_id>/tree/selection_sets', methods=['POST'])
 def save_selection_sets(job_id):

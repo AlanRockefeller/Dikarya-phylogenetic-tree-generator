@@ -10,7 +10,7 @@ import re
 from collections import deque
 from datetime import datetime
 
-WHATS_NEW_EDITOR_EMAIL = (os.environ.get("WHATS_NEW_EDITOR_EMAIL") or "").strip().lower()
+WHATS_NEW_DEFAULT_EDITOR_EMAILS = {"alaner@gmail.com"}
 TODO_ADMIN_DEFAULT_EMAILS = {"alaner@gmail.com"}
 
 VOUCHER_LABEL_PRESETS = {
@@ -92,9 +92,19 @@ VOUCHER_RTF_FONT_CHOICES = {
 
 
 def can_edit_whats_new():
+    raw_editors = os.environ.get("WHATS_NEW_EDITOR_EMAILS") or os.environ.get("WHATS_NEW_EDITOR_EMAIL")
+    if raw_editors:
+        editor_emails = {
+            item.strip().lower()
+            for item in raw_editors.split(",")
+            if item.strip()
+        }
+    else:
+        editor_emails = WHATS_NEW_DEFAULT_EDITOR_EMAILS
+    email = (getattr(current_user, "email", "") or "").strip().lower()
     return (
         current_user.is_authenticated
-        and (current_user.email or "").strip().lower() == WHATS_NEW_EDITOR_EMAIL
+        and email in editor_emails
     )
 
 

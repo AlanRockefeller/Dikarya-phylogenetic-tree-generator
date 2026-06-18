@@ -226,6 +226,7 @@ DEFAULT_TREE_PARAMS = {
 
 
 DNA_BARCODE_ITS_FIELD_NAME = "DNA Barcode ITS"
+GENBANK_ACCESSION_RE = re.compile(r"^[A-Z]{1,3}_?[0-9]{5,9}(?:\.[0-9]+)?$")
 
 
 def _normalize_dna_for_match(text: str) -> str:
@@ -238,6 +239,60 @@ def _normalize_dna_for_match(text: str) -> str:
     if not text:
         return ""
     return re.sub(r"[^ACGTNRYSWKMBDHV]", "", str(text).upper())
+
+
+def _observation_id_pattern(observation_id: int) -> re.Pattern:
+    obs_id = str(int(observation_id))
+    return re.compile(rf"(?<!\d){re.escape(obs_id)}(?!\d)", re.IGNORECASE)
+
+
+def _name_has_observation_id(name: str, observation_id: int) -> bool:
+    if not name or not observation_id:
+        return False
+    return bool(_observation_id_pattern(observation_id).search(str(name)))
+
+
+def _name_has_inat_token(name: str, observation_id: int) -> bool:
+    if not name or not observation_id:
+        return False
+    token = f"iNat{int(observation_id)}"
+    return bool(re.search(rf"(?<![A-Za-z0-9]){re.escape(token)}(?![0-9])",
+                          str(name), re.IGNORECASE))
+
+
+def _extract_genbank_accession(name: str) -> str:
+    first = str(name or "").split()[0] if str(name or "").split() else ""
+    if GENBANK_ACCESSION_RE.match(first):
+        return first
+    return ""
+
+
+def _source_tip_label_with_inat(name: str, observation_id: int) -> str:
+    original = str(name or "").strip()
+    inat_token = f"iNat{int(observation_id)}"
+    if not original:
+        return inat_token
+    parts = original.split(None, 1)
+    if _name_has_inat_token(original, observation_id):
+        return original
+    if _extract_genbank_accession(original):
+        rest = parts[1] if len(parts) > 1 else ""
+        return f"{parts[0]} {inat_token} {rest}".strip()
+    return f"{inat_token} {original}".strip()
+
+
+def _source_display_label_for_tip(tip_name: str, source_label: str,
+                                  observation_id: int) -> str:
+    """Keep an accession in the visible iNat source label when one exists."""
+    source_label = _clean_display_text(source_label)
+    if not source_label:
+        return source_label
+    accession = _extract_genbank_accession(tip_name)
+    if accession and source_label.split()[0:1] != [accession]:
+        return f"{accession} {source_label}"
+    if observation_id and not _name_has_inat_token(source_label, observation_id):
+        return _source_tip_label_with_inat(source_label, observation_id)
+    return source_label
 
 
 def _find_observation_source_tip_name(sequences: List[Dict[str, Any]],
@@ -253,14 +308,13 @@ def _find_observation_source_tip_name(sequences: List[Dict[str, Any]],
         return None
     obs_id = str(int(observation_id))
     inat_prefix = f"iNat{obs_id}"
-    digit_pat = re.compile(rf"(?<!\d){re.escape(obs_id)}(?!\d)")
     for s in sequences:
         name = str(s.get("name") or "").strip()
         if not name or name.startswith(inat_prefix):
             continue
         if _CONTAMINANT_LABEL_RE.search(name):
             continue
-        if digit_pat.search(name):
+        if _name_has_observation_id(name, observation_id):
             return name
     return None
 
@@ -289,6 +343,35 @@ def _maybe_add_inat_its_sequence(observation: Dict[str, Any], observation_id: in
     if not its_norm:
         return None, None
 
+    source_exact_matches = []
+    for idx, s in enumerate(sequences):
+        name = str(s.get("name") or "").strip()
+        if not name or _CONTAMINANT_LABEL_RE.search(name):
+            continue
+        if not _name_has_observation_id(name, observation_id):
+            continue
+        if _normalize_dna_for_match(s.get("sequence") or "") == its_norm:
+            source_exact_matches.append((idx, s))
+
+    if source_exact_matches:
+        def source_match_score(item: Tuple[int, Dict[str, Any]]) -> Tuple[int, int, int]:
+            idx, seq = item
+            name = str(seq.get("name") or "")
+            accession_penalty = 0 if _extract_genbank_accession(name) else 1
+            synthetic_penalty = 1 if name.startswith(f"iNat{int(observation_id)}") else 0
+            return accession_penalty, synthetic_penalty, idx
+
+        keep_idx, keep_seq = sorted(source_exact_matches, key=source_match_score)[0]
+        keep_name = _source_tip_label_with_inat(keep_seq.get("name") or "", observation_id)
+        keep_seq["name"] = keep_name
+        remove_indexes = {idx for idx, _seq in source_exact_matches if idx != keep_idx}
+        if remove_indexes:
+            sequences[:] = [
+                seq for idx, seq in enumerate(sequences)
+                if idx not in remove_indexes
+            ]
+        return None, keep_name
+
     source_tip_name = _find_observation_source_tip_name(sequences, observation_id)
     if source_tip_name:
         return None, source_tip_name
@@ -305,16 +388,7 @@ def _maybe_add_inat_its_sequence(observation: Dict[str, Any], observation_id: in
             # becomes
             #   "OQ256154 iNat360934883 Beauveria sp. DAVFP-29733 ..."
             original = str(s.get("name") or "")
-            inat_token = f"iNat{int(observation_id)}"
-            parts = original.split(None, 1)
-            if not parts:
-                new_name = inat_token
-            elif inat_token in original.split():
-                new_name = original  # already labelled with this iNat id
-            else:
-                head = parts[0]
-                rest = parts[1] if len(parts) > 1 else ""
-                new_name = f"{head} {inat_token} {rest}".strip()
+            new_name = _source_tip_label_with_inat(original, observation_id)
             s["name"] = new_name
             return None, new_name
     # Name with the iNat<id> token so the highlighter colors it blue.
@@ -336,7 +410,9 @@ def _clean_display_text(value: Any) -> str:
     """Normalize a free-form string for use in a tree tip label."""
     if value is None:
         return ""
-    text = re.sub(r"[<>'\"]", "", str(value))
+    # Strip HTML/attribute-hazard characters (< > ") but KEEP single quotes:
+    # provisional fungal names use them, e.g. Pluteus sp. 'flammasilvae'.
+    text = re.sub(r'[<>"]', "", str(value))
     text = re.sub(r"\s+", " ", text).strip()
     return text.strip(" ,;:-_")
 
@@ -681,7 +757,8 @@ def highlight_source_observation_tip(job_id: str, observation_id: int,
 
         if source_label:
             for tip in targets:
-                rename_tip(state, tip, source_label)
+                display_label = _source_display_label_for_tip(tip, source_label, observation_id)
+                rename_tip(state, tip, display_label)
 
         sel_sets = state.get("selection_sets") or {}
         if not isinstance(sel_sets, dict):
@@ -698,6 +775,16 @@ def highlight_source_observation_tip(job_id: str, observation_id: int,
         colors.setdefault("Default", "#1f77b4")
         state["selection_set_colors"] = colors
         state.setdefault("active_selection_set", "Default")
+
+        # Alan 6/2/26 - When the iNat source observation is the single focal tip, make Auto
+        # root the default (anchored on that sequence of interest) rather than the generic
+        # midpoint default. The shared helper only overrides the build-time default ("" or
+        # "MIDPOINT") and won't persist a partial state if auto-rooting fails.
+        if len(targets) == 1:
+            from app.services.tree_edit_service import apply_auto_root_default
+            state = apply_auto_root_default(job_dir, state, targets[0],
+                                            source="inat_highlight")
+
         save_tree_state(job_dir, state)
         return targets
     except Exception as e:

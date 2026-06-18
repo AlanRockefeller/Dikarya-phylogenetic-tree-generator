@@ -62,6 +62,7 @@ def run_trimming(
         if not output_alignment.exists() or output_alignment.stat().st_size == 0:
              raise RuntimeError(f"Trimming failed: Output file {output_alignment} is missing or empty.")
 
+        _restore_trimmed_fasta_headers(input_alignment, output_alignment, logger)
         logger.info(f"Trimming completed successfully. Output: {output_alignment}")
 
     except Exception as e:
@@ -80,6 +81,73 @@ def _make_log_callback(job_id: Optional[str], step: str, stream: str):
         publish_log(job_id, step, stream, line)
     
     return callback
+
+
+def _restore_trimmed_fasta_headers(
+    input_alignment: Path,
+    output_alignment: Path,
+    logger,
+) -> None:
+    """Restore full FASTA descriptions that external trimmers may shorten."""
+    try:
+        from Bio import SeqIO
+    except ImportError:
+        logger.warning("BioPython unavailable; could not restore trimmed FASTA headers.")
+        return
+
+    input_records = list(SeqIO.parse(str(input_alignment), "fasta"))
+    original_headers: dict[str, str] = {}
+
+    for record in input_records:
+        header = (record.description or record.id or "").strip()
+        if not header:
+            continue
+
+        keys = {
+            (record.id or "").strip(),
+            (record.name or "").strip(),
+            header.split(None, 1)[0].strip(),
+        }
+        for key in keys:
+            if key:
+                original_headers.setdefault(key, header)
+
+    if not original_headers:
+        logger.warning("No source FASTA headers found to restore after trimming.")
+        return
+
+    output_records = list(SeqIO.parse(str(output_alignment), "fasta"))
+    restored = 0
+    missing = 0
+
+    for record in output_records:
+        output_header = (record.description or "").strip()
+        output_first_token = output_header.split(None, 1)[0].strip() if output_header else ""
+        keys = (
+            (record.id or "").strip(),
+            (record.name or "").strip(),
+            output_first_token,
+        )
+        original_header = next((original_headers[key] for key in keys if key in original_headers), None)
+
+        if not original_header:
+            missing += 1
+            continue
+
+        if output_header != original_header:
+            record.description = original_header
+            record.name = record.id
+            restored += 1
+
+    if restored:
+        SeqIO.write(output_records, str(output_alignment), "fasta")
+
+    logger.info(
+        "Restored full FASTA headers for %s/%s trimmed records (%s unmatched).",
+        restored,
+        len(output_records),
+        missing,
+    )
 
 
 def _run_trimal(

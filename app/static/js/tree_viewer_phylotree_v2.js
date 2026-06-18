@@ -75,6 +75,12 @@
         // Alan 5/11/26 - Expose box-select mode state so the toolbar button can stay in sync.
         getBoxSelectMode() { return false; }
 
+        // Alan 6/4/26 - Let implementations expose a controller-owned context-menu prune action.
+        setPruneNodeHandler(fn) { }
+
+        // Alan 6/4/26 - Let implementations expose a controller-owned context-menu copy-name action.
+        setCopySequenceNameHandler(fn) { }
+
         /**
          * Perform a bulk selection action.
          * @param {string} action - One of: 'all', 'none', 'inverse', 'all-leaves', 'all-internal', 'select-filtered'
@@ -261,6 +267,9 @@
             // Alan 5/12/26 - Persist user-selected colors separately from group membership.
             this.selectionSetColors = { 'Default': '#1f77b4' };
             this.activeSelectionSet = 'Default';
+            // Alan 6/2/26 - Focal/sequence-of-interest tip, highlighted directly from durable
+            // state (not via the user-editable Default color group). Set via setFocalTip().
+            this.focalTipName = null;
             // Alan 5/12/26 - Track temporary action selection separately from persistent color groups.
             this.currentSelectionIds = new Set();
             // Alan 5/11/26 - Track locally hidden current selections so Deselect does not mutate color groups.
@@ -290,6 +299,36 @@
             this.baseSpacing = { x: 20, y: 20 }; // Phylotree fixed_width values (per-node/per-level)
             // Alan 5/12/26 - Track box-select mode, active drag state, modifier memory, and removable listeners in one place.
             this.boxSelectState = { enabled: false, drag: null, pointerDownListener: null, contextMenuListener: null, modifierKeyDownListener: null, modifierKeyUpListener: null, modifiers: { alt: false, ctrl: false, meta: false, lastAltDownAt: 0, lastCtrlDownAt: 0, lastMetaDownAt: 0 }, suppressContextMenuUntil: 0 };
+            // Alan 6/2/26 - Controller-supplied handler invoked by the native menu's "Rotate node" item.
+            this._onRotateNode = null;
+            // Alan 6/4/26 - Controller-supplied handler invoked by the native menu's "Prune this node" item.
+            this._onPruneNode = null;
+            // Alan 6/4/26 - Controller-supplied handler invoked by the native menu's "Copy sequence name" item.
+            this._onCopySequenceName = null;
+        }
+
+        // Alan 6/2/26 - Let the controller own the rotate action while the item lives in phylotree's native node menu.
+        setRotateNodeHandler(fn) {
+            this._onRotateNode = typeof fn === 'function' ? fn : null;
+        }
+
+        // Alan 6/4/26 - Let the controller own pruning while the item lives in phylotree's native node menu.
+        setPruneNodeHandler(fn) {
+            this._onPruneNode = typeof fn === 'function' ? fn : null;
+        }
+
+        // Alan 6/4/26 - Let the controller own clipboard copying while the item lives in phylotree's native node menu.
+        setCopySequenceNameHandler(fn) {
+            this._onCopySequenceName = typeof fn === 'function' ? fn : null;
+        }
+
+        // Alan 6/2/26 - Highlight the focal/sequence-of-interest tip directly from durable state,
+        // independent of the user-editable color groups. Re-styles in place (no full redraw).
+        setFocalTip(name) {
+            const next = (typeof name === 'string' && name) ? name : null;
+            if (this.focalTipName === next) return;
+            this.focalTipName = next;
+            if (this.tree && typeof this._updateNodeStylesOnly === 'function') this._updateNodeStylesOnly();
         }
 
         async render(newick) {
@@ -314,8 +353,36 @@
 
             // Tag original order per-parent for correct restoration
             this.tree.traverse_and_compute(n => {
+                // Alan 6/4/26 - Register pruning in the native context menu so right-click edits can use the backend prune flow.
+                if (n.parent) {
+                    n.menu_items = n.menu_items || [];
+                    n.menu_items.push([
+                        () => 'Prune this node',
+                        (node) => { if (typeof this._onPruneNode === 'function') this._onPruneNode(node); },
+                        () => !window.VIEW_ONLY
+                    ]);
+                }
+                // Alan 6/4/26 - Register copy-name only for terminal sequence nodes that have a user-visible name.
+                if (!n.children || n.children.length === 0) {
+                    n.menu_items = n.menu_items || [];
+                    n.menu_items.push([
+                        () => 'Copy sequence name',
+                        (node) => { if (typeof this._onCopySequenceName === 'function') this._onCopySequenceName(node); },
+                        (node) => Boolean(node?.data?.name || node?.name)
+                    ]);
+                }
                 if (n.children) {
                     n.children.forEach((c, i) => c.__original_index = i);
+                    // Alan 6/2/26 - Register "Rotate node" as a native phylotree internal-node menu item so it
+                    // coexists with Collapse/Select instead of being shadowed by a capture-phase handler.
+                    if (n.children.length >= 2) {
+                        n.menu_items = n.menu_items || [];
+                        n.menu_items.push([
+                            () => 'Rotate node',
+                            (node) => { if (typeof this._onRotateNode === 'function') this._onRotateNode(node); },
+                            (node) => Boolean(node.children && node.children.length >= 2)
+                        ]);
+                    }
                 }
             });
 
@@ -1344,6 +1411,9 @@
             if (matchingSetName) return this.getSelectionSetColor(matchingSetName);
             // Alan 5/12/26 - Search matches remain blue when no selection set controls the color.
             if (node?.__search_match) return "#0EA5E9";
+            // Alan 6/2/26 - Focal/sequence-of-interest tip highlights blue directly from state,
+            // so a user-set SOI shows without mutating the user's Default color group.
+            if (this.focalTipName && id === this.focalTipName) return "#1f77b4";
             // Alan 5/12/26 - Ordinary labels should use CSS light/dark colors.
             return null;
         }

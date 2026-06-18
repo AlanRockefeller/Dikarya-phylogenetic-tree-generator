@@ -11167,7 +11167,11 @@
             .attr("class", "phylotree-menu-item dropdown-item")
             .attr("tabindex", "-1")
             .text((d[0])(node)) // eslint-disable-line
-            .on("click", ___namespace.partial(d[1], node));
+            // Alan 6/4/26 - Close custom menu actions before running them so copy/prune/rotate do not leave the menu open.
+            .on("click", () => {
+              menu_object.style("display", "none");
+              d[1](node);
+            });
         });
       }
 

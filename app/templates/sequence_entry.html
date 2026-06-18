@@ -1896,6 +1896,61 @@
         return /r\d+/.test(trimmed);
     }
 
+    // Alan 6/18/26 - Report sanitized client-side Mycomap URL rejections so support can diagnose inputs that never reach /api/mycomap.
+    function getMycomapUrlDiagnostics(url) {
+        const trimmed = (url || '').trim();
+        const startsWithRequiredPrefix = trimmed.startsWith('https://mycomap.com/genetics/blast-search');
+        const hasRId = /r\d+/.test(trimmed);
+        let parsedUrl = null;
+
+        try {
+            parsedUrl = new URL(trimmed);
+        } catch (err) {
+            try {
+                parsedUrl = new URL(`https://${trimmed}`);
+            } catch (innerErr) {
+                parsedUrl = null;
+            }
+        }
+
+        let reason = 'unknown';
+        if (!trimmed) {
+            reason = 'empty';
+        } else if (!startsWithRequiredPrefix) {
+            reason = 'bad_prefix';
+        } else if (!hasRId) {
+            reason = 'missing_r_id';
+        }
+
+        return {
+            event: 'mycomap_url_rejected',
+            reason,
+            url_length: trimmed.length,
+            hostname: parsedUrl ? parsedUrl.hostname : '',
+            path_prefix: parsedUrl ? parsedUrl.pathname.slice(0, 120) : '',
+            has_r_id: hasRId,
+            starts_with_required_prefix: startsWithRequiredPrefix
+        };
+    }
+
+    // Alan 6/18/26 - Fire-and-forget client diagnostics without logging the full typed URL.
+    async function logMycomapUrlRejection(url) {
+        try {
+            const csrfToken = document.querySelector('meta[name="csrf-token"]')?.getAttribute('content') || '';
+            await fetch('/api/client-log', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                    'X-CSRFToken': csrfToken
+                },
+                body: JSON.stringify(getMycomapUrlDiagnostics(url)),
+                keepalive: true
+            });
+        } catch (err) {
+            // Client-side diagnostics should never interrupt the import flow.
+        }
+    }
+
     // Shared fetch logic — returns true on success, false on error.
     async function doFetchMycomap() {
         const url = mycomapUrlInput.value.trim();
@@ -1908,6 +1963,7 @@
         }
 
         if (!isValidMycomapUrl(url)) {
+            logMycomapUrlRejection(url);
             if (url.includes('mycomap.com')) {
                 showStatus('Invalid Mycomap URL. Please use the URL from the BLAST Search page (starts with https://mycomap.com/genetics/blast-search).', 'error');
             } else {

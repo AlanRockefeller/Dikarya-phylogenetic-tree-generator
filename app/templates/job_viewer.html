@@ -420,6 +420,25 @@
                 id="btn-midpoint">
                 <i class="fa fa-balance-scale"></i> Midpoint
             </button>
+            <div class="flex items-center gap-1 px-2 py-1 rounded-lg bg-gray-100 dark:bg-journal-dark border border-gray-300 dark:border-gray-600"
+                 title="Auto root chooses a useful display root for BLAST-result trees; it is not necessarily the true evolutionary root.">
+                <label for="rooting-mode-select" class="text-sm font-semibold text-gray-700 dark:text-gray-200">Root:</label>
+                <select id="rooting-mode-select"
+                        class="text-sm bg-white dark:bg-journal-dark text-gray-900 dark:text-gray-100 border border-gray-300 dark:border-gray-600 rounded px-2 py-1 focus:ring-2 focus:ring-blue-500">
+                    <option value="auto">Auto root</option>
+                    <option value="midpoint">Midpoint root</option>
+                    <option value="most_divergent_hit">Most divergent hit</option>
+                    <option value="unrooted" disabled>Unrooted (coming soon)</option>
+                    <option value="manual">Manual root here</option>
+                </select>
+            </div>
+            <button type="button"
+                class="hidden px-4 py-2 text-sm font-semibold rounded-lg bg-blue-600 hover:bg-blue-700 text-white transition-colors shadow-sm flex items-center gap-2 disabled:opacity-50 disabled:cursor-not-allowed"
+                id="btn-set-soi"
+                title="Set the selected tip as the sequence of interest (focal/query) for Auto root."
+                disabled>
+                <i class="fa fa-crosshairs"></i> Set Sequence of Interest
+            </button>
             <button type="button"
                 class="px-4 py-2 text-sm font-semibold rounded-lg bg-gray-600 hover:bg-gray-700 text-white transition-colors shadow-sm flex items-center gap-2"
                 id="btn-deselect">
@@ -651,15 +670,15 @@
 
 <script src="{{ url_for('static', filename='js/phylotree.js') }}"></script>
 
-<script src="{{ url_for('static', filename='js/tree_viewer_phylotree_v2.js') }}?v=41"></script>
+<script src="{{ url_for('static', filename='js/tree_viewer_phylotree_v2.js') }}?v=44"></script>
 
-<script src="{{ url_for('static', filename='js/tree_viewer_api.js') }}"></script>
+<script src="{{ url_for('static', filename='js/tree_viewer_api.js') }}?v=2"></script>
 
-<script src="{{ url_for('static', filename='js/tree_viewer_controller.js') }}?v=37"></script>
+<script src="{{ url_for('static', filename='js/tree_viewer_controller.js') }}?v=42"></script>
 
 {% include 'partials/alignment_viewer_modal.html' %}
 
-<script src="{{ url_for('static', filename='js/alignment_viewer.js') }}?v=9"></script>
+<script src="{{ url_for('static', filename='js/alignment_viewer.js') }}?v=10"></script>
 
 
 

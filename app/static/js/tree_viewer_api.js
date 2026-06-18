@@ -69,6 +69,23 @@ const TreeEditActions = {
         return data;
     },
 
+    // Alan 5/29/26 - Persist a display-only child-order rotation for one stable internal node.
+    async rotateNode(jobId, nodeId) {
+        const response = await fetch(`/api/job/${jobId}/tree/rotate`, {
+            method: 'POST',
+            headers: this._buildHeaders(),
+            credentials: "same-origin",
+            body: JSON.stringify({ node_id: nodeId })
+        });
+        const data = await response.json().catch(() => ({}));
+        if (!response.ok) {
+            const err = new Error(data.error || data.message || `Failed to rotate node: ${response.status}`);
+            err.details = data;
+            throw err;
+        }
+        return data;
+    },
+
     async reroot(jobId, nodeName) {
         const response = await fetch(`/api/job/${jobId}/tree/reroot`, {
             method: 'POST',
@@ -110,6 +127,46 @@ const TreeEditActions = {
         const data = await response.json().catch(() => ({}));
         if (!response.ok) {
             const err = new Error(data.error || data.message || "Midpoint root toggle failed");
+            err.details = data;
+            throw err;
+        }
+        return data;
+    },
+
+    // Alan 5/29/26 - Generic rooting-mode endpoint supporting auto / midpoint /
+    // most_divergent_hit / unrooted / manual; replaces ad-hoc rooting calls
+    // for new-mode UI while leaving midpointRoot/reroot intact for compat.
+    async setRootingMode(jobId, mode, opts = {}) {
+        const body = { mode };
+        if (opts.target) body.target = opts.target;
+        if (opts.sequenceOfInterest) body.sequence_of_interest = opts.sequenceOfInterest;
+        const response = await fetch(`/api/job/${jobId}/tree/rooting_mode`, {
+            method: 'POST',
+            headers: this._buildHeaders(),
+            credentials: "same-origin",
+            body: JSON.stringify(body)
+        });
+        const data = await response.json().catch(() => ({}));
+        if (!response.ok) {
+            const err = new Error(data.error || data.message || "Set rooting mode failed");
+            err.details = data;
+            throw err;
+        }
+        return data;
+    },
+
+    // Alan 5/29/26 - Persist the focal/sequence-of-interest tip (mirrors into
+    // Default selection set server-side to drive existing blue highlight).
+    async setSequenceOfInterest(jobId, tipName, source = "user_selected") {
+        const response = await fetch(`/api/job/${jobId}/tree/sequence_of_interest`, {
+            method: 'POST',
+            headers: this._buildHeaders(),
+            credentials: "same-origin",
+            body: JSON.stringify({ tip_name: tipName, source })
+        });
+        const data = await response.json().catch(() => ({}));
+        if (!response.ok) {
+            const err = new Error(data.error || data.message || "Set sequence of interest failed");
             err.details = data;
             throw err;
         }

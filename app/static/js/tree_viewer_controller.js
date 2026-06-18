@@ -18,6 +18,9 @@ document.addEventListener('DOMContentLoaded', async () => {
     const btnDeselect = getEl('btn-deselect');
     // Alan 5/13/26 - Cache the Alignment Viewer launcher so its count stays synced to tree state.
     const btnAlignmentViewer = getEl('btn-alignment-viewer');
+    // Alan 5/29/26 - Cache new rooting-mode dropdown + sequence-of-interest button.
+    const rootingModeSelect = getEl('rooting-mode-select');
+    const btnSetSoi = getEl('btn-set-soi');
     const btnRecompute = getEl('btn-recompute');
     const btnMakeCopy = getEl('btn-make-copy');
     // Alan 5/12/26 - Cache clear-color control for selected tips.
@@ -33,8 +36,13 @@ document.addEventListener('DOMContentLoaded', async () => {
 
     // --- HELPER: STATUS MESSAGE ---
     let currentStatusType = null;
+    // Alan 6/1/26 - Track the pending hide-timer so a new message cancels the
+    // previous one. Without this, an earlier timed message (e.g. "...completed.")
+    // hides a later sticky message when its old timeout fires.
+    let statusHideTimer = null;
     function showStatus(msg, type, timeout = 0) {
         if (!statusMsg) return;
+        if (statusHideTimer) { clearTimeout(statusHideTimer); statusHideTimer = null; }
         const colorMap = {
             'info': ['bg-blue-50', 'text-blue-800', 'dark:bg-blue-900/30', 'dark:text-blue-200'],
             'success': ['bg-green-50', 'text-green-800', 'dark:bg-green-900/30', 'dark:text-green-200'],
@@ -46,7 +54,7 @@ document.addEventListener('DOMContentLoaded', async () => {
         currentStatusType = type;
         statusMsg.textContent = msg;
         statusMsg.classList.remove('hidden');
-        if (timeout > 0) setTimeout(() => statusMsg.classList.add('hidden'), timeout);
+        if (timeout > 0) statusHideTimer = setTimeout(() => statusMsg.classList.add('hidden'), timeout);
     }
 
     // --- STATE ---
@@ -57,6 +65,10 @@ document.addEventListener('DOMContentLoaded', async () => {
     let uiWired = false;
     let isLoadingTree = false;
     let isMidpointRooted = true; // Default: midpoint rooted on load
+    // Alan 5/29/26 - Track rooting state so the SOI button can hide unless auto root needs help.
+    let needsSequenceOfInterest = false;
+    // Alan 5/29/26 - Keep the loaded tree state around so other viewers can reuse persisted metadata.
+    let treeState = null;
     // Reroot Capture State (Moved top-level to fix reference errors)
     let rerootCaptureHandler = null;
     let filterDebounce = null;
@@ -81,6 +93,94 @@ document.addEventListener('DOMContentLoaded', async () => {
         }
     }
 
+    // Alan 6/2/26 - Match the backend's stable internal-node ID hash. Sort by Unicode code
+    // point and hash per code point (not UTF-16 unit) so this fallback agrees with Python's
+    // sorted()/ord() even for non-BMP tip names.
+    function stableInternalNodeIdFromTipNames(tipNames) {
+        const names = (Array.isArray(tipNames) ? tipNames : [])
+            .filter(Boolean)
+            .map(String)
+            .sort((a, b) => {
+                const ca = Array.from(a), cb = Array.from(b);
+                const n = Math.min(ca.length, cb.length);
+                for (let i = 0; i < n; i += 1) {
+                    const d = ca[i].codePointAt(0) - cb[i].codePointAt(0);
+                    if (d !== 0) return d;
+                }
+                return ca.length - cb.length;
+            });
+        const key = names.join('\x1f');
+        let hash = 2166136261;
+        for (const ch of key) {
+            hash ^= ch.codePointAt(0);
+            hash = Math.imul(hash, 16777619) >>> 0;
+        }
+        return `internal:${hash.toString(16).padStart(8, '0')}`;
+    }
+
+    // Alan 5/29/26 - Collect descendant tip IDs from a rendered D3 tree node without using child index paths.
+    function getDescendantTipNames(node) {
+        const names = [];
+        const visit = (current) => {
+            if (!current) return;
+            const children = current.children || current.data?.children || [];
+            if (!children || children.length === 0) {
+                const data = current.data || current;
+                const name = data.__original_name || data.original_name || data.name || current.name;
+                if (name) names.push(name);
+                return;
+            }
+            children.forEach(visit);
+        };
+        visit(node);
+        return names;
+    }
+
+    // Alan 6/4/26 - Resolve a right-clicked node into the backend prune target for leaves or internal subtrees.
+    function getPruneTargetForNode(node) {
+        const data = node?.data || node || {};
+        const children = node?.children || data.children || [];
+        if (!children || children.length === 0) return data.__original_name || data.original_name || data.name || node?.name || null;
+        const tipNames = getDescendantTipNames(node);
+        return data.stable_id || stableInternalNodeIdFromTipNames(tipNames);
+    }
+
+    // Alan 6/4/26 - Prefer the displayed sequence label for context-menu clipboard copies.
+    function getDisplaySequenceName(node) {
+        const data = node?.data || node || {};
+        return data.name || node?.name || data.__original_name || data.original_name || "";
+    }
+
+    // Alan 6/4/26 - Copy sequence labels with a textarea fallback for older browsers.
+    async function copyTextToClipboard(text) {
+        if (navigator.clipboard && window.isSecureContext) {
+            await navigator.clipboard.writeText(text);
+            return;
+        }
+        const textarea = document.createElement('textarea');
+        textarea.value = text;
+        textarea.setAttribute('readonly', '');
+        textarea.style.position = 'fixed';
+        textarea.style.left = '-9999px';
+        document.body.appendChild(textarea);
+        textarea.select();
+        document.execCommand('copy');
+        document.body.removeChild(textarea);
+    }
+
+    // Alan 5/29/26 - Alignment Viewer should follow the persisted focal tip, falling back to the single saved Default member.
+    function getPreferredAlignmentTip(state) {
+        if (!state) return null;
+        if (state.sequence_of_interest) return state.sequence_of_interest;
+        const selectionSets = state.selection_sets || {};
+        const defaultMembers = Array.isArray(selectionSets.Default) ? selectionSets.Default : [];
+        if (defaultMembers.length === 1) return defaultMembers[0];
+        const activeName = state.active_selection_set;
+        const activeMembers = activeName && Array.isArray(selectionSets[activeName]) ? selectionSets[activeName] : [];
+        if (activeMembers.length === 1) return activeMembers[0];
+        return null;
+    }
+
     function debouncedSaveSelectionSets() {
         if (selectionSaveDebounce) clearTimeout(selectionSaveDebounce);
         selectionSaveDebounce = setTimeout(saveSelectionSets, 800);
@@ -99,12 +199,12 @@ document.addEventListener('DOMContentLoaded', async () => {
         await saveSelectionSets();
     }
 
-    // Alan 5/12/26 - Prune taxa while preserving unrelated selection-set color annotations.
-    async function pruneTaxaPreservingSelectionColors(names) {
+    // Alan 6/4/26 - Allow internal-node prune callers to clean up descendant tip color annotations too.
+    async function pruneTaxaPreservingSelectionColors(names, cleanupNames = names) {
         // Alan 5/12/26 - Run the existing backend prune action first so failed prunes do not mutate saved colors.
         await TreeEditActions.pruneTaxa(JOB_ID, names);
         // Alan 5/12/26 - Remove only the pruned tips from saved selection sets; keep other colored labels.
-        if (viewer?.removeIdsFromSelectionSets) viewer.removeIdsFromSelectionSets(names);
+        if (viewer?.removeIdsFromSelectionSets) viewer.removeIdsFromSelectionSets(cleanupNames);
         // Alan 5/12/26 - Persist the pruned selection-set cleanup before the tree reloads.
         await saveSelectionSetsNow();
     }
@@ -268,13 +368,43 @@ document.addEventListener('DOMContentLoaded', async () => {
 
     // --- HELPER: BACKEND ACTION WRAPPER ---
     // Alan 5/11/26 - Let non-structural actions such as rename reload without clearing saved selection sets.
+    // Alan 5/31/26 - Build the final status line for a rooting action and refresh
+    // needsSequenceOfInterest. Returned to runBackendAction so it can be shown
+    // AFTER the tree reloads; otherwise the generic "completed" message and the
+    // reload clobber it and "Auto root chose: X" only flashes for an instant.
+    function rootingFinalStatus(mode, result) {
+        needsSequenceOfInterest = !!(result && result.needs_sequence_of_interest);
+        const info = (result && result.rooting_info) || {};
+        if (needsSequenceOfInterest) {
+            return {
+                msg: "Click the sequence you care about, then press \"Set Sequence of Interest\"; Auto root will then choose a useful display root from the other high-quality hits.",
+                type: "warning",
+                timeout: 0
+            };
+        }
+        if (info.chosen_by === 'midpoint_fallback') {
+            return { msg: `Auto root fell back to midpoint (${info.reason || 'no_acceptable_candidates'}).`, type: "warning", timeout: 6000 };
+        }
+        if (info.chosen_by === 'auto' || info.chosen_by === 'most_divergent_hit') {
+            const target = info.chosen_root_target || (result && result.root_target) || 'selected tip';
+            const label = info.chosen_by === 'most_divergent_hit'
+                ? `Auto root: rooted on most divergent hit — ${target}`
+                : `Auto root chose outgroup: ${target}`;
+            // Alan 5/31/26 - Keep the chosen-outgroup message up (sticky) so it can actually be read.
+            return { msg: label, type: "success", timeout: 0 };
+        }
+        if (mode === 'midpoint') return { msg: "Midpoint root applied.", type: "success", timeout: 2500 };
+        if (mode === 'unrooted') return { msg: "Unrooted layout is not yet rendered; tree shown as rooted.", type: "warning", timeout: 4000 };
+        return null;
+    }
+
     async function runBackendAction(name, actionFn, options = {}) {
         if (isProcessing) return;
         isProcessing = true;
         updateButtons(); // Disable
         try {
             showStatus(name + "...", "info");
-            await actionFn();
+            const actionResult = await actionFn();
             showStatus(name + " completed.", "success", 2000);
 
             // Post-action cleanup
@@ -291,7 +421,14 @@ document.addEventListener('DOMContentLoaded', async () => {
             rerootMode = false;
             if (rerootCaptureHandler) removeRerootCapture();
 
-            await loadTree();
+            await loadTree({ fromAction: true });
+
+            // Alan 5/31/26 - Show the action's own final status after the reload so
+            // it persists instead of being overwritten by the interim message.
+            if (actionResult && actionResult.finalStatus && actionResult.finalStatus.msg) {
+                const fs = actionResult.finalStatus;
+                showStatus(fs.msg, fs.type || "info", fs.timeout != null ? fs.timeout : 4000);
+            }
         } catch (err) {
             console.error(err);
 
@@ -390,7 +527,10 @@ document.addEventListener('DOMContentLoaded', async () => {
         updateButtons();
     }
 
-    async function loadTree() {
+    // Alan 5/31/26 - opts.fromAction marks reloads triggered by runBackendAction so
+    // the load-time "Auto root chose" message stays out of the way and lets the
+    // action's own final status show instead of clobbering it.
+    async function loadTree(opts = {}) {
         if (isLoadingTree) return;
         isLoadingTree = true;
         try {
@@ -410,22 +550,54 @@ document.addEventListener('DOMContentLoaded', async () => {
 
             // Fetch tree state to get midpoint rooting status and restore selection sets
             try {
-                const treeState = await TreeEditActions.getTreeState(JOB_ID);
-                isMidpointRooted = treeState.is_midpoint_rooted ?? true;
+                const loadedTreeState = await TreeEditActions.getTreeState(JOB_ID);
+                // Alan 5/29/26 - Cache the latest tree state for alignment-viewer launches and other UI reads.
+                treeState = loadedTreeState;
+                isMidpointRooted = loadedTreeState.is_midpoint_rooted ?? true;
                 updateMidpointButton();
-                // Alan 5/11/26 - Reapply saved rename labels after loading the raw Newick tree.
-                if (treeState.renames && viewer && typeof viewer.applyRenames === 'function') {
-                    viewer.applyRenames(treeState.renames);
+                // Alan 5/29/26 - Sync rooting-mode dropdown to persisted root_mode and warn when auto needs a focal tip.
+                if (rootingModeSelect) {
+                    const mode = (loadedTreeState.root_mode || '').toLowerCase();
+                    const allowed = ['auto', 'midpoint', 'most_divergent_hit', 'unrooted', 'manual'];
+                    if (allowed.includes(mode)) rootingModeSelect.value = mode;
+                    else if (mode === 'tip') rootingModeSelect.value = 'manual';
                 }
-                if (treeState.selection_sets && viewer) {
+                // Alan 5/29/26 - Only prompt for the focal tip when auto root is the chosen mode and we genuinely can't resolve one.
+                needsSequenceOfInterest = !!loadedTreeState.needs_sequence_of_interest;
+                const loadedMode = (loadedTreeState.root_mode || '').toLowerCase();
+                const loadedInfo = loadedTreeState.rooting_info || {};
+                if (needsSequenceOfInterest && loadedMode === 'auto') {
+                    showStatus(
+                        "Auto root needs to know which sequence you care about. " +
+                        "Click the sequence of interest, then press \"Set Sequence of Interest\".",
+                        "warning"
+                    );
+                // Alan 5/31/26 - On initial page load (not post-action reloads), tell the user
+                // which sequence auto root chose as the outgroup when the tree opens already auto-rooted.
+                } else if (!opts.fromAction && loadedMode === 'auto' && (loadedInfo.chosen_by === 'auto' || loadedInfo.chosen_by === 'most_divergent_hit') && loadedInfo.chosen_root_target) {
+                    const label = loadedInfo.chosen_by === 'most_divergent_hit'
+                        ? `Auto root: rooted on most divergent hit — ${loadedInfo.chosen_root_target}`
+                        : `Auto root chose outgroup: ${loadedInfo.chosen_root_target}`;
+                    showStatus(label, "info", 0);
+                }
+                // Alan 5/11/26 - Reapply saved rename labels after loading the raw Newick tree.
+                if (loadedTreeState.renames && viewer && typeof viewer.applyRenames === 'function') {
+                    viewer.applyRenames(loadedTreeState.renames);
+                }
+                if (loadedTreeState.selection_sets && viewer) {
                     viewer.restoreSelectionSets({
-                        sets: treeState.selection_sets,
+                        sets: loadedTreeState.selection_sets,
                         // Alan 5/12/26 - Restore the last active color group for compatibility with saved states.
-                        active: treeState.active_selection_set || 'Default',
+                        active: loadedTreeState.active_selection_set || 'Default',
                         // Alan 5/12/26 - Restore user-selected color metadata when present.
-                        colors: treeState.selection_set_colors || {}
+                        colors: loadedTreeState.selection_set_colors || {}
                     });
                     updateSelectionSetUI();
+                }
+                // Alan 6/2/26 - Render the focal/sequence-of-interest highlight directly from
+                // state (no longer mirrored into the user-editable Default color group).
+                if (viewer && typeof viewer.setFocalTip === 'function') {
+                    viewer.setFocalTip(loadedTreeState.sequence_of_interest || null);
                 }
             } catch (stateErr) {
                 console.warn("Could not fetch tree state:", stateErr);
@@ -824,6 +996,56 @@ document.addEventListener('DOMContentLoaded', async () => {
         // Initial sync after viewer is ready
         if (viewer) updateSelectionSetUI();
 
+        // Alan 6/2/26 - Register the display-only rotate action as a native phylotree menu item
+        // (coexists with Collapse/Select). The viewer invokes this with the clicked node.
+        if (viewer && typeof viewer.setRotateNodeHandler === 'function') {
+            viewer.setRotateNodeHandler((node) => {
+                if (window.VIEW_ONLY || isProcessing) return;
+                const tipNames = getDescendantTipNames(node);
+                if (tipNames.length < 2) return;
+                const nodeId = node?.data?.stable_id || stableInternalNodeIdFromTipNames(tipNames);
+                if (!nodeId) return;
+                runBackendAction("Rotating node", async () => {
+                    await TreeEditActions.rotateNode(JOB_ID, nodeId);
+                }, { clearSelections: false });
+            });
+        }
+
+        // Alan 6/4/26 - Register context-menu pruning so right-click uses the same backend flow as the toolbar Prune button.
+        if (viewer && typeof viewer.setPruneNodeHandler === 'function') {
+            viewer.setPruneNodeHandler((node) => {
+                if (window.VIEW_ONLY || isProcessing) return;
+                const target = getPruneTargetForNode(node);
+                if (!target) {
+                    showStatus("Can't prune: no stable node ID.", "warning", 2500);
+                    return;
+                }
+                // Alan 6/4/26 - Include descendant tips in local color cleanup when pruning an internal node.
+                const cleanupNames = [target, ...getDescendantTipNames(node)];
+                runBackendAction("Pruning node", async () => {
+                    await pruneTaxaPreservingSelectionColors([target], cleanupNames);
+                }, { clearSelections: false });
+            });
+        }
+
+        // Alan 6/4/26 - Register context-menu copying for terminal sequence names.
+        if (viewer && typeof viewer.setCopySequenceNameHandler === 'function') {
+            viewer.setCopySequenceNameHandler(async (node) => {
+                const name = getDisplaySequenceName(node);
+                if (!name) {
+                    showStatus("No sequence name to copy.", "warning", 2000);
+                    return;
+                }
+                try {
+                    await copyTextToClipboard(name);
+                    showStatus("Sequence name copied.", "success", 1500);
+                } catch (err) {
+                    console.error(err);
+                    showStatus("Copy failed.", "danger", 2500);
+                }
+            });
+        }
+
         // New Set button
         btnNewSet?.addEventListener('click', () => {
             // Alan 5/12/26 - Do not open creation UI before the viewer is ready.
@@ -1086,6 +1308,49 @@ document.addEventListener('DOMContentLoaded', async () => {
             });
         });
 
+        // Alan 5/29/26 - Rooting-mode dropdown drives the unified rooting API; "manual" defers to existing Reroot-Here click flow.
+        if (rootingModeSelect) rootingModeSelect.addEventListener('change', () => {
+            if (isProcessing) return;
+            const mode = rootingModeSelect.value;
+            if (mode === 'manual') {
+                rerootMode = true;
+                if (viewer) viewer.clearSelection();
+                installRerootCapture();
+                showStatus("Click a node to reroot.", "info");
+                updateButtons();
+                return;
+            }
+            runBackendAction(`Applying ${mode} rooting`, async () => {
+                const result = await TreeEditActions.setRootingMode(JOB_ID, mode);
+                // Alan 5/31/26 - Return the chosen-tip status so it survives the reload.
+                return { finalStatus: rootingFinalStatus(mode, result) };
+            });
+        });
+
+        // Alan 5/29/26 - Persist focal/sequence-of-interest tip from the current viewer selection.
+        if (btnSetSoi) btnSetSoi.addEventListener('click', () => {
+            if (!viewer || typeof viewer.getSelectedTipNames !== 'function') {
+                showStatus("Select one tip first.", "warning", 2500);
+                return;
+            }
+            const selected = viewer.getSelectedTipNames();
+            if (!selected || selected.length !== 1) {
+                showStatus("Select exactly one tip to mark as the sequence of interest.", "warning", 3000);
+                return;
+            }
+            const tipName = selected[0];
+            runBackendAction("Setting sequence of interest", async () => {
+                await TreeEditActions.setSequenceOfInterest(JOB_ID, tipName, "user_selected");
+                // Alan 5/29/26 - Sequence of interest is now known; clear the prompt flag and re-apply auto root.
+                needsSequenceOfInterest = false;
+                if (rootingModeSelect && rootingModeSelect.value === 'auto') {
+                    const result = await TreeEditActions.setRootingMode(JOB_ID, 'auto');
+                    // Alan 5/31/26 - Persist the chosen-tip status past the reload.
+                    return { finalStatus: rootingFinalStatus('auto', result) };
+                }
+            });
+        });
+
         // Alan 5/11/26 - Clear the currently visible selection without deleting saved selection-set membership.
         if (btnDeselect) btnDeselect.addEventListener('click', () => {
             if (!viewer || typeof viewer.deselectCurrentSelection !== 'function') return;
@@ -1126,6 +1391,8 @@ document.addEventListener('DOMContentLoaded', async () => {
                 jobId: JOB_ID,
                 treeOrder: visible,
                 selectedNames: selected,
+                // Alan 5/29/26 - Prefer the persisted focal tip, but fall back to the saved one-member Default set.
+                preferredName: getPreferredAlignmentTip(treeState),
             });
         });
 
@@ -1250,6 +1517,11 @@ document.addEventListener('DOMContentLoaded', async () => {
             if (btnRename) btnRename.disabled = true;
             if (btnReroot) btnReroot.disabled = true;
             if (btnMidpoint) btnMidpoint.disabled = true;
+            // Alan 5/29/26 - Freeze rooting controls while a backend rooting action is in flight.
+            if (btnSetSoi) btnSetSoi.disabled = true;
+            // Alan 5/29/26 - SOI button only ever appears when auto root has no resolvable focal tip.
+            if (btnSetSoi) btnSetSoi.classList.toggle('hidden', !(rootingModeSelect && rootingModeSelect.value === 'auto' && needsSequenceOfInterest));
+            if (rootingModeSelect) rootingModeSelect.disabled = true;
             if (btnRecompute) btnRecompute.disabled = true;
             if (btnMakeCopy) btnMakeCopy.disabled = true;
             // Alan 5/12/26 - Prevent color clearing while backend actions are refreshing the tree.
@@ -1286,6 +1558,13 @@ document.addEventListener('DOMContentLoaded', async () => {
             }
         }
         if (btnMidpoint) btnMidpoint.disabled = false;
+        // Alan 5/29/26 - Show Set Sequence of Interest only when auto root needs help; require exactly one tip selected to enable it.
+        if (btnSetSoi) {
+            const showSoi = rootingModeSelect && rootingModeSelect.value === 'auto' && needsSequenceOfInterest;
+            btnSetSoi.classList.toggle('hidden', !showSoi);
+            btnSetSoi.disabled = !showSoi || selCount !== 1;
+        }
+        if (rootingModeSelect) rootingModeSelect.disabled = false;
         if (btnRecompute) btnRecompute.disabled = false;
         // Alan 5/12/26 - Enable clear color only when there is a temporary current selection.
         if (btnUncolorSelection) btnUncolorSelection.disabled = selCount === 0;
