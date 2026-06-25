@@ -10809,8 +10809,8 @@
 
   let d3_layout_phylotree_context_menu_id = "d3_layout_phylotree_context_menu";
 
-  // Alan 5/12/26 - Resolve record targets from node labels so the menu can jump to the source record.
-  function extractRecordTarget(node) {
+  // Alan 6/25/26 - Normalize node labels in one place so record-link and copy-number actions parse the same text.
+  function getRecordLabelText(node) {
     const raw = String(
       node?.data?.__original_name ||
       node?.data?.original_name ||
@@ -10818,9 +10818,33 @@
       node?.name ||
       ""
     );
-    if (!raw) return null;
+    return raw ? raw.replace(/\s+/g, " ").trim() : "";
+  }
 
-    const normalized = raw.replace(/\s+/g, " ").trim();
+  // Alan 6/25/26 - Recognize common iNaturalist observation-number formats for links and clipboard copies.
+  function extractINaturalistObservationNumber(value) {
+    const normalized = typeof value === "string" ? value.replace(/\s+/g, " ").trim() : getRecordLabelText(value);
+    if (!normalized) return null;
+
+    const patterns = [
+      /\b(?:https?:\/\/)?(?:www\.)?(?:[a-z0-9-]+\.)*inaturalist(?:\.[a-z0-9-]+)+\/observations\/([0-9]{5,12})\b/i,
+      /\bi\s*naturalist(?:\s*(?:observation|obs))?\s*[-_#:\s]*([0-9]{5,12})(?:[_-][0-9]+)?\b/i,
+      /\binaturalist(?:\s*(?:observation|obs))?\s*[-_#:\s]*([0-9]{5,12})(?:[_-][0-9]+)?\b/i,
+      /\binat(?:uralist)?(?:\s*(?:observation|obs))?\s*[-_#:\s]*([0-9]{5,12})(?:[_-][0-9]+)?\b/i,
+      /\b(?:observation|obs)\s*#?\s*([0-9]{5,12})\s*(?:on\s*)?i(?:naturalist|nat)\b/i
+    ];
+    for (const pattern of patterns) {
+      const match = normalized.match(pattern);
+      if (match) return match[1];
+    }
+    return null;
+  }
+
+  // Alan 5/12/26 - Resolve record targets from node labels so the menu can jump to the source record.
+  function extractRecordTarget(node) {
+    // Alan 6/25/26 - Reuse normalized labels so iNaturalist links and clipboard copies recognize the same formats.
+    const normalized = getRecordLabelText(node);
+    if (!normalized) return null;
 
     // Alan 5/12/26 - Prefer observational record IDs over GenBank accessions when both are present.
     const moPatterns = [
@@ -10843,28 +10867,17 @@
       }
     }
 
-    const iNatPatterns = [
-      /\biNaturalist[_\s]*#\s*([0-9]{6,10})\b/i,
-      /\biNaturalist\s*#\s*([0-9]{6,10})\b/i,
-      /\biNaturalist\s*[:#]?\s*([0-9]{6,10})\b/i,
-      /\biNat[_\s]*#\s*([0-9]{6,10})\b/i,
-      /\biNat\s*#\s*([0-9]{6,10})\b/i,
-      /\biNat\s*[:#]?\s*([0-9]{6,10})\b/i,
-      /\biNat[_\s]*[:#]?\s*([0-9]{6,10})(?:_[0-9]+)?\b/i,
-      /\biNAT\s*[:#]?\s*([0-9]{6,10})\b/i
-    ];
-    for (const pattern of iNatPatterns) {
-      const match = normalized.match(pattern);
-      if (match) {
-        return {
-          kind: "inaturalist",
-          id: match[1],
-          label: "Open observation in iNaturalist",
-          urls: {
-            primary: `https://inaturalist.org/observations/${match[1]}`
-          }
-        };
-      }
+    // Alan 6/25/26 - Share expanded iNaturalist parsing with the clipboard action instead of maintaining parallel regexes.
+    const iNaturalistId = extractINaturalistObservationNumber(normalized);
+    if (iNaturalistId) {
+      return {
+        kind: "inaturalist",
+        id: iNaturalistId,
+        label: "Open observation in iNaturalist",
+        urls: {
+          primary: `https://inaturalist.org/observations/${iNaturalistId}`
+        }
+      };
     }
 
     // Alan 5/12/26 - Recognize Mycoportal occurrence IDs before falling back to GenBank accessions.
@@ -14732,6 +14745,8 @@
   exports.clusterPicker = clusterPicker;
   exports.computeMidpoint = computeMidpoint;
   exports.extract_dates = extract_dates;
+  // Alan 6/25/26 - Export iNaturalist observation parsing so viewer menu actions can copy matching IDs.
+  exports.extractINaturalistObservationNumber = extractINaturalistObservationNumber;
   exports.fitRootToTip = fitRootToTip;
   exports.getDistanceMatrix = getDistanceMatrix;
   exports.getNewick = getNewick;

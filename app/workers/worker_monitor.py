@@ -156,12 +156,10 @@ def run_worker_with_heartbeat(app):
     
     with app.app_context():
         conn = get_redis_connection()
-        # Default queue
-        queue = get_queue() # returns Queue object
+        queues = [get_queue("phylo_high"), get_queue("phylo_bulk")]
         maintenance_interval = HeartbeatWorker._get_int_env("RQ_MAINTENANCE_INTERVAL", 600)
         result_ttl = HeartbeatWorker._get_int_env("RQ_RESULT_TTL", 86400)  # 1 day default
-        # We need to pass queues list
-        worker = HeartbeatWorker([queue], connection=conn, 
+        worker = HeartbeatWorker(queues, connection=conn,
                                  worker_dir=app.config.get("WORKER_DIR", "var/workers"), default_result_ttl=result_ttl)
 
         worker.maintenance_interval = maintenance_interval

@@ -1134,26 +1134,41 @@ def _inat_tree_v1_rate_limit():
 @limiter.limit(_inat_tree_v1_rate_limit, key_func=_inat_tree_v1_rate_key)
 @idempotent
 def tools_inaturalist_tree():
-    """Build a Dikarya tree from a single iNaturalist observation.
+    """Build Dikarya tree jobs from iNaturalist one-click tree input.
 
-    Body: { "observation": "<id or single-observation URL>" }
+    Body: { "observation": "<id, URL, username, or project>", "resolved_type": "user|project" }
     Requires scope ``jobs:write`` (the call creates a tree job and later
     writes back to the iNaturalist observation field).
     """
     from app.services.inaturalist_tree_service import (
         InatTreeError, create_job_from_inat_observation,
+        create_jobs_from_inat_scope, parse_inaturalist_tree_input,
     )
     body = request.get_json(silent=True) or {}
-    raw = body.get("observation") or body.get("url") or ""
+    raw = body.get("observation") or body.get("url") or body.get("input") or ""
+    resolved_type = (body.get("resolved_type") or "").strip().lower()
     try:
-        result = create_job_from_inat_observation(raw, user=g.api_user)
+        parsed = parse_inaturalist_tree_input(raw)
+        if parsed.get("type") == "single_observation":
+            result = create_job_from_inat_observation(raw, user=g.api_user)
+            job_ids = [result["job_id"]]
+        else:
+            if not resolved_type:
+                return error_response(
+                    code="ambiguous_scope",
+                    message="Provide resolved_type='user' or 'project' for username/project inputs.",
+                    status=409,
+                )
+            result = create_jobs_from_inat_scope(raw, resolved_type=resolved_type, user=g.api_user)
+            job_ids = result.get("job_ids") or []
         # Tag metrics with the originating API token id for traceability.
-        job = Job.query.get(result["job_id"])
-        if job is not None:
-            m = job.metrics or {}
-            m["api_token_id"] = g.api_token.id
-            job.metrics = m
-            db.session.commit()
+        for job_id in job_ids:
+            job = Job.query.get(job_id)
+            if job is not None:
+                m = job.metrics or {}
+                m["api_token_id"] = g.api_token.id
+                job.metrics = m
+        db.session.commit()
         return ok(result, status=202)
     except InatTreeError as e:
         code = "validation_failed" if e.status in (400, 422) else "upstream_error"

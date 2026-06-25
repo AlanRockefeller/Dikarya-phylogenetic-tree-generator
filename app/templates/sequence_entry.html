@@ -594,20 +594,40 @@
                 <div>
                     <label for="inaturalist_url"
                         class="block text-sm font-medium text-gray-700 dark:text-gray-200 mb-2">
-                        iNaturalist Observation URL or ID
+                        iNaturalist Observation URL or ID or username or project
                     </label>
                     <input type="text" id="inaturalist_url" class="w-full px-4 py-3 border border-gray-300 dark:border-journal-dark rounded-lg 
                                   bg-white dark:bg-journal-dark text-gray-900 dark:text-gray-100
                                   focus:ring-2 focus:ring-journal-gold focus:border-transparent transition-all"
-                        placeholder="1234567 or https://www.inaturalist.org/observations/1234567">
+                        placeholder="1234567, alan_rockefeller, or inaturalist.org/projects/project-slug">
                     <p class="text-xs text-gray-500 dark:text-gray-400 mt-1">
-                        Enter a 7 to 9 digit iNaturalist observation number or paste a full observation URL.
+                        Enter an observation ID, observation URL, username, user URL, project name, or project URL.
                     </p>
                 </div>
 
                 <!-- Submit Button -->
                 <button id="fetch_inaturalist_btn" data-active-style="outline" class="btn w-full">
                     <i class="fas fa-search mr-2"></i> Submit
+                </button>
+
+                <div id="inaturalist_tree_preview"
+                     class="hidden p-4 bg-gray-50 dark:bg-journal-dark rounded-lg border border-gray-200 dark:border-gray-700">
+                    <p class="text-sm text-gray-700 dark:text-gray-200"></p>
+                    <div id="inaturalist_tree_choices" class="hidden flex flex-wrap gap-2 mt-3">
+                        <button type="button" id="inaturalist_use_user_btn" class="btn btn-small btn-outline-gold">
+                            Use user
+                        </button>
+                        <button type="button" id="inaturalist_use_project_btn" class="btn btn-small btn-outline-gold">
+                            Use project
+                        </button>
+                    </div>
+                </div>
+
+                <button id="inaturalist_tree_btn"
+                        class="hidden btn btn-outline-gold w-full"
+                        title="Build trees from iNaturalist Mycomap BLAST Results fields and post links back to iNaturalist when finished.">
+                    <i class="fas fa-tree mr-2"></i>
+                    One-Click Tree
                 </button>
 
                 <!-- Results Display Area (initially hidden) -->
@@ -639,13 +659,6 @@
                             <i class="fas fa-plus mr-2"></i> Add to Queue
                         </button>
 
-                        <!-- iNat → MycoMap → One-Click Tree Button (single observation only) -->
-                        <button id="inaturalist_tree_btn"
-                                class="hidden btn btn-outline-gold flex-1 min-w-[180px]"
-                                title="Build a tree from this observation's Mycomap BLAST Results field and post the link back to iNaturalist when finished.">
-                            <i class="fas fa-tree mr-2"></i>
-                            Generate tree and add iNaturalist Phylogenetic Tree field
-                        </button>
                     </div>
                 </div>
             </div>
@@ -2113,11 +2126,17 @@
     const inaturalistAddBtn = document.getElementById('inaturalist_add_btn');
     // Alan 5/12/26 - Hook up the "Generate tree and add iNaturalist Phylogenetic Tree field" action.
     const inaturalistTreeBtn = document.getElementById('inaturalist_tree_btn');
+    const inaturalistTreePreview = document.getElementById('inaturalist_tree_preview');
+    const inaturalistTreeChoices = document.getElementById('inaturalist_tree_choices');
+    const inaturalistUseUserBtn = document.getElementById('inaturalist_use_user_btn');
+    const inaturalistUseProjectBtn = document.getElementById('inaturalist_use_project_btn');
 
     function checkInatState() {
         const val = inaturalistUrlInput.value.trim();
         const seemsValid = isValidInaturalistInput(val);
         updateButtonVisuals(fetchInaturalistBtn, seemsValid);
+        clearInaturalistTreePreview();
+        updateInaturalistTreeButtonForInput();
     }
 
     inaturalistUrlInput.addEventListener('input', checkInatState);
@@ -2125,12 +2144,17 @@
     // Store the current iNaturalist analysis result for use by action buttons
     let currentInaturalistResult = null;
     let currentInaturalistUrl = null;
+    let currentInaturalistTreePreview = null;
+    let currentInaturalistTreePreviewInput = '';
+    let currentInaturalistTreeResolvedType = null;
+    let inaturalistTreePreviewRequestId = 0;
 
     function isValidInaturalistInput(value) {
         if (!value) return false;
         if (/^\d{7,9}$/.test(value)) return true;
         try {
-            const parsed = new URL(value);
+            const urlValue = /^https?:\/\//i.test(value) ? value : `https://${value}`;
+            const parsed = new URL(urlValue);
             // Strict hostname check - must be exactly inaturalist.org or www.inaturalist.org
             const validHostnames = ['inaturalist.org', 'www.inaturalist.org'];
             if (!validHostnames.includes(parsed.hostname.toLowerCase())) {
@@ -2145,6 +2169,58 @@
         } catch (e) { return false; }
     }
 
+    function isLikelyInaturalistTreeInput(value) {
+        if (!value) return false;
+        if (/^\d+$/.test(value)) return true;
+        if (/^https?:\/\//i.test(value) || /^www\.inaturalist\.org/i.test(value) || /^inaturalist\.org/i.test(value)) {
+            try {
+                const urlValue = /^https?:\/\//i.test(value) ? value : `https://${value}`;
+                const parsed = new URL(urlValue);
+                return ['inaturalist.org', 'www.inaturalist.org'].includes(parsed.hostname.toLowerCase());
+            } catch (e) {
+                return false;
+            }
+        }
+        return /^[A-Za-z0-9][A-Za-z0-9_. -]{0,198}[A-Za-z0-9]$/.test(value);
+    }
+
+    function setInaturalistTreePreviewMessage(message, type = 'info') {
+        if (!inaturalistTreePreview) return;
+        const text = inaturalistTreePreview.querySelector('p');
+        text.textContent = message || '';
+        inaturalistTreePreview.classList.toggle('hidden', !message);
+        text.classList.toggle('text-red-700', type === 'error');
+        text.classList.toggle('dark:text-red-300', type === 'error');
+        text.classList.toggle('text-gray-700', type !== 'error');
+        text.classList.toggle('dark:text-gray-200', type !== 'error');
+    }
+
+    function clearInaturalistTreePreview() {
+        currentInaturalistTreePreview = null;
+        currentInaturalistTreePreviewInput = '';
+        currentInaturalistTreeResolvedType = null;
+        setInaturalistTreePreviewMessage('');
+        if (inaturalistTreeChoices) inaturalistTreeChoices.classList.add('hidden');
+    }
+
+    function updateInaturalistTreeButtonForInput() {
+        if (!inaturalistTreeBtn) return;
+        const value = inaturalistUrlInput.value.trim();
+        const show = isLikelyInaturalistTreeInput(value);
+        inaturalistTreeBtn.classList.toggle('hidden', !show);
+        if (!show) return;
+        if (currentInaturalistTreePreview && currentInaturalistTreePreviewInput === value) {
+            const type = currentInaturalistTreePreview.type;
+            const count = Number(currentInaturalistTreePreview.eligible_tree_count || 0);
+            if ((type === 'user' || type === 'project') && count > 0) {
+                const label = count === 1 ? 'Create 1 tree job' : `Create ${count} bulk tree jobs`;
+                inaturalistTreeBtn.innerHTML = `<i class="fas fa-tree mr-2"></i> ${label}`;
+                return;
+            }
+        }
+        inaturalistTreeBtn.innerHTML = '<i class="fas fa-tree mr-2"></i> One-Click Tree';
+    }
+
     function resetInaturalistUI() {
         inaturalistResults.classList.add('hidden');
         inaturalistSpeciesList.classList.add('hidden');
@@ -2152,10 +2228,79 @@
         inaturalistAddBtn.classList.add('hidden');
         // Alan 5/12/26 - Reset the iNat-tree action visibility on each analyze.
         if (inaturalistTreeBtn) inaturalistTreeBtn.classList.add('hidden');
+        clearInaturalistTreePreview();
         inaturalistSummary.querySelector('p').textContent = '';
         inaturalistSpeciesItems.innerHTML = '';
         currentInaturalistResult = null;
         currentInaturalistUrl = null;
+    }
+
+    async function previewInaturalistTreeInput(resolvedType = null) {
+        const input = inaturalistUrlInput.value.trim();
+        if (!input || !isLikelyInaturalistTreeInput(input)) {
+            clearInaturalistTreePreview();
+            return null;
+        }
+        inaturalistTreePreviewRequestId += 1;
+        const requestId = inaturalistTreePreviewRequestId;
+        setInaturalistTreePreviewMessage('Checking iNaturalist tree readiness...');
+        if (inaturalistTreeChoices) inaturalistTreeChoices.classList.add('hidden');
+        if (inaturalistTreeBtn) inaturalistTreeBtn.disabled = true;
+        try {
+            const csrfToken = document.querySelector('meta[name="csrf-token"]').getAttribute('content');
+            const body = { input };
+            if (resolvedType) body.resolved_type = resolvedType;
+            const resp = await fetch('/api/inaturalist/tree/preview', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                    'X-CSRFToken': csrfToken
+                },
+                body: JSON.stringify(body)
+            });
+            const data = await resp.json();
+            if (requestId !== inaturalistTreePreviewRequestId) return null;
+            if (!resp.ok) {
+                throw new Error(data.error || data.message || 'Preview failed');
+            }
+            currentInaturalistTreePreview = data;
+            currentInaturalistTreePreviewInput = input;
+            currentInaturalistTreeResolvedType = resolvedType || (data.type === 'user' || data.type === 'project' ? data.type : null);
+            setInaturalistTreePreviewMessage(data.message || '');
+            if (data.type === 'ambiguous' && inaturalistTreeChoices) {
+                inaturalistTreeChoices.classList.remove('hidden');
+            }
+            updateInaturalistTreeButtonForInput();
+            return data;
+        } catch (e) {
+            currentInaturalistTreePreview = null;
+            currentInaturalistTreePreviewInput = '';
+            setInaturalistTreePreviewMessage(e.message, 'error');
+            return null;
+        } finally {
+            if (inaturalistTreeBtn) inaturalistTreeBtn.disabled = false;
+        }
+    }
+
+    inaturalistUrlInput.addEventListener('blur', (event) => {
+        const nextTarget = event.relatedTarget;
+        if (nextTarget && (
+            nextTarget === inaturalistTreeBtn ||
+            nextTarget === inaturalistUseUserBtn ||
+            nextTarget === inaturalistUseProjectBtn
+        )) {
+            return;
+        }
+        const input = inaturalistUrlInput.value.trim();
+        if (!input || !isLikelyInaturalistTreeInput(input)) return;
+        previewInaturalistTreeInput();
+    });
+
+    if (inaturalistUseUserBtn) {
+        inaturalistUseUserBtn.addEventListener('click', () => previewInaturalistTreeInput('user'));
+    }
+    if (inaturalistUseProjectBtn) {
+        inaturalistUseProjectBtn.addEventListener('click', () => previewInaturalistTreeInput('project'));
     }
 
     fetchInaturalistBtn.addEventListener('click', async () => {
@@ -2168,7 +2313,12 @@
         }
 
         if (!isValidInaturalistInput(url)) {
-            showStatus('Invalid iNaturalist input. Enter a 7 to 9 digit observation ID or an inaturalist.org /observations URL.', 'error');
+            if (isLikelyInaturalistTreeInput(url)) {
+                await previewInaturalistTreeInput();
+                showStatus('iNaturalist tree preview ready. Review the count, then click One-Click Tree to queue jobs.', 'info');
+                return;
+            }
+            showStatus('Enter an iNaturalist observation ID, observation URL, username, or project.', 'error');
             return;
         }
 
@@ -2400,25 +2550,50 @@
     // iNaturalist when the job completes. Backed by /api/inaturalist/tree.
     if (inaturalistTreeBtn) {
         inaturalistTreeBtn.addEventListener('click', async () => {
-            if (!currentInaturalistUrl) {
-                showStatus('No iNaturalist observation selected.', 'error');
+            const input = inaturalistUrlInput.value.trim();
+            if (!input || !isLikelyInaturalistTreeInput(input)) {
+                showStatus('Enter an iNaturalist observation, username, or project.', 'error');
                 return;
             }
+
+            const numericOrObservationUrl = /^\d+$/.test(input) ||
+                /^https?:\/\/(?:www\.)?inaturalist\.org\/observations\/\d+(?:[/?#].*)?$/i.test(input) ||
+                /^(?:www\.)?inaturalist\.org\/observations\/\d+(?:[/?#].*)?$/i.test(input);
+            const preview = currentInaturalistTreePreviewInput === input
+                ? currentInaturalistTreePreview
+                : null;
+            if (!numericOrObservationUrl && (!preview || preview.type === 'ambiguous' || preview.type === 'not_found')) {
+                await previewInaturalistTreeInput();
+                return;
+            }
+            if (preview && (preview.type === 'user' || preview.type === 'project')) {
+                const count = Number(preview.eligible_tree_count || 0);
+                if (count < 1) {
+                    showStatus(preview.message || 'No observations are ready for tree building.', 'info');
+                    return;
+                }
+            }
+
             inaturalistTreeBtn.disabled = true;
             const origHtml = inaturalistTreeBtn.innerHTML;
             inaturalistTreeBtn.innerHTML =
-                '<i class="fas fa-spinner fa-spin mr-2"></i> Building tree...';
-            showStatus('Reading MycoMap BLAST Results field and queueing tree job...', 'info');
+                '<i class="fas fa-spinner fa-spin mr-2"></i> Queueing tree jobs...';
+            showStatus('Reading MycoMap BLAST Results fields and queueing tree job(s)...', 'info');
             try {
                 const csrfToken = document.querySelector('meta[name="csrf-token"]')
                     .getAttribute('content');
-                const resp = await fetch('/api/inaturalist/tree', {
+                const isBatch = preview && (preview.type === 'user' || preview.type === 'project');
+                const endpoint = isBatch ? '/api/inaturalist/tree/batch' : '/api/inaturalist/tree';
+                const payload = isBatch
+                    ? { input, resolved_type: currentInaturalistTreeResolvedType || preview.type }
+                    : { observation: input };
+                const resp = await fetch(endpoint, {
                     method: 'POST',
                     headers: {
                         'Content-Type': 'application/json',
                         'X-CSRFToken': csrfToken
                     },
-                    body: JSON.stringify({ observation: currentInaturalistUrl })
+                    body: JSON.stringify(payload)
                 });
                 const data = await resp.json();
                 if (!resp.ok) {
@@ -2430,7 +2605,18 @@
                     'will be added when the job completes.',
                     'success'
                 );
-                window.location.href = data.tree_status_url || ('/job/' + data.job_id);
+                if (data.tree_status_url || data.job_id) {
+                    window.location.href = data.tree_status_url || ('/job/' + data.job_id);
+                } else if (data.job_ids && data.job_ids.length === 1) {
+                    window.location.href = '/job/' + data.job_ids[0];
+                } else {
+                    setInaturalistTreePreviewMessage(data.message || 'Tree jobs queued.');
+                    currentInaturalistTreePreview = null;
+                    currentInaturalistTreePreviewInput = input;
+                    inaturalistTreeBtn.classList.add('hidden');
+                    inaturalistTreeBtn.disabled = false;
+                    inaturalistTreeBtn.innerHTML = origHtml;
+                }
             } catch (e) {
                 showStatus('iNaturalist tree error: ' + e.message, 'error');
                 inaturalistTreeBtn.disabled = false;

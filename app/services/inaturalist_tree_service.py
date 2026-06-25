@@ -18,8 +18,9 @@ import time
 import urllib.parse
 import urllib.request
 import urllib.error
+import uuid
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Iterator, List, Optional, Tuple
 
 from flask import current_app
 
@@ -29,6 +30,8 @@ INAT_API_BASE = "https://api.inaturalist.org/v1"
 USER_AGENT = "Dikarya Phylogenetic Tree Builder 1.0"
 REQUEST_TIMEOUT = 30
 MAX_RAW_INPUT_LEN = 300
+MAX_PER_PAGE = 200
+RATE_LIMIT_DELAY = 1.0
 
 MYCOMAP_BLAST_FIELD_NAME = "Mycomap BLAST Results"
 PHYLOGENETIC_TREE_FIELD_NAME = "Phylogenetic Tree"
@@ -41,6 +44,7 @@ OBS_URL_RE = re.compile(
     r"^https?://(?:www\.)?inaturalist\.org/observations/(\d+)(?:[/?#].*)?$",
     re.IGNORECASE,
 )
+PLAIN_TOKEN_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_. -]{0,198}[A-Za-z0-9]$")
 
 
 class InatTreeError(Exception):
@@ -60,26 +64,104 @@ def parse_single_observation_input(raw: str) -> int:
     Rejects search URLs, multiple IDs, non-iNaturalist hosts, and any other
     malformed input. Returns the numeric observation ID on success.
     """
-    if raw is None:
-        raise InatTreeError("No iNaturalist observation provided.")
-    s = str(raw).strip()
-    if not s:
-        raise InatTreeError("No iNaturalist observation provided.")
-    if len(s) > MAX_RAW_INPUT_LEN:
-        raise InatTreeError("Input is too long.")
-    if s.isdigit():
-        if len(s) > 12:
-            raise InatTreeError("iNaturalist observation ID is implausibly long.")
-        return int(s)
-    m = OBS_URL_RE.match(s)
-    if not m:
+    parsed = parse_inaturalist_tree_input(raw)
+    if parsed.get("type") != "single_observation":
         raise InatTreeError(
             "Provide a single iNaturalist observation as either a numeric "
             "ID (e.g. 360934883) or a single-observation URL "
             "(https://www.inaturalist.org/observations/<id>). Search URLs "
             "are not accepted."
         )
-    return int(m.group(1))
+    return int(parsed["observation_id"])
+
+
+def parse_inaturalist_tree_input(raw_input: str) -> Dict[str, Any]:
+    """Classify Tree Builder iNaturalist one-click input without API calls."""
+    if raw_input is None:
+        raise InatTreeError("No iNaturalist input provided.")
+    raw = str(raw_input).strip()
+    if not raw:
+        raise InatTreeError("No iNaturalist input provided.")
+    if len(raw) > MAX_RAW_INPUT_LEN:
+        raise InatTreeError("Input is too long.")
+    if raw.isdigit():
+        if len(raw) > 12:
+            raise InatTreeError("iNaturalist observation ID is implausibly long.")
+        return {
+            "type": "single_observation",
+            "observation_id": int(raw),
+            "raw": raw,
+            "normalized": raw,
+        }
+
+    urlish = raw
+    if re.match(r"^(?:www\.)?inaturalist\.org(?:/|$)", raw, re.IGNORECASE):
+        urlish = f"https://{raw}"
+    if re.match(r"^https?://", urlish, re.IGNORECASE):
+        parsed = urllib.parse.urlparse(urlish)
+        host = (parsed.hostname or "").lower()
+        if host not in {"inaturalist.org", "www.inaturalist.org"}:
+            raise InatTreeError("Only inaturalist.org URLs are accepted.")
+        path_parts = [
+            urllib.parse.unquote(part)
+            for part in (parsed.path or "").split("/")
+            if part
+        ]
+        query_params = urllib.parse.parse_qs(parsed.query or "", keep_blank_values=True)
+        if len(path_parts) >= 2 and path_parts[0].lower() == "observations":
+            token = path_parts[1].strip()
+            if token.isdigit():
+                return {
+                    "type": "single_observation",
+                    "observation_id": int(token),
+                    "raw": raw,
+                    "normalized": f"https://www.inaturalist.org/observations/{int(token)}",
+                }
+            return {
+                "type": "user_candidate",
+                "value": token,
+                "raw": raw,
+                "normalized": token,
+                "source": "observations_path",
+            }
+        if len(path_parts) == 1 and path_parts[0].lower() == "observations":
+            project_values = query_params.get("project_id") or []
+            project_value = _clean_candidate(project_values[0]) if project_values else ""
+            if project_value:
+                return {
+                    "type": "project_candidate",
+                    "value": project_value,
+                    "raw": raw,
+                    "normalized": project_value,
+                    "source": "observations_project_id",
+                }
+        if len(path_parts) >= 2 and path_parts[0].lower() == "people":
+            return {
+                "type": "user_candidate",
+                "value": path_parts[1].strip(),
+                "raw": raw,
+                "normalized": path_parts[1].strip(),
+                "source": "people_path",
+                "value_kind": "id" if path_parts[1].strip().isdigit() else "login",
+            }
+        if len(path_parts) >= 2 and path_parts[0].lower() == "projects":
+            return {
+                "type": "project_candidate",
+                "value": path_parts[1].strip(),
+                "raw": raw,
+                "normalized": path_parts[1].strip(),
+                "source": "projects_path",
+            }
+        raise InatTreeError("That iNaturalist URL is not supported for one-click trees.")
+
+    if not PLAIN_TOKEN_RE.match(raw):
+        raise InatTreeError("Enter an observation ID, iNaturalist username, project name, or iNaturalist URL.")
+    return {
+        "type": "plain_candidate",
+        "value": re.sub(r"\s+", " ", raw).strip(),
+        "raw": raw,
+        "normalized": re.sub(r"\s+", " ", raw).strip(),
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -124,6 +206,315 @@ def fetch_observation(observation_id: int) -> Dict[str, Any]:
     if not results:
         raise InatTreeError(f"iNaturalist observation {observation_id} was not found.", status=404)
     return results[0]
+
+
+def _clean_candidate(value: Any) -> str:
+    return re.sub(r"\s+", " ", str(value or "")).strip()
+
+
+def _has_nonempty_field(observation: Dict[str, Any], field_name: str) -> bool:
+    value = extract_observation_field_value(observation, field_name)
+    return bool(str(value or "").strip())
+
+
+def _lookup_inaturalist_user_exact(value: str) -> Optional[Dict[str, Any]]:
+    candidate = _clean_candidate(value)
+    if not candidate:
+        return None
+    q = urllib.parse.urlencode({"q": candidate})
+    payload = _http_request(f"{INAT_API_BASE}/users/autocomplete?{q}")
+    for item in payload.get("results") or []:
+        login = _clean_candidate(item.get("login"))
+        if login.casefold() == candidate.casefold():
+            return {
+                "id": item.get("id"),
+                "login": login,
+                "display_name": login,
+                "raw": item,
+            }
+    return None
+
+
+def _lookup_inaturalist_user_by_id(value: str) -> Optional[Dict[str, Any]]:
+    candidate = _clean_candidate(value)
+    if not candidate.isdigit():
+        return None
+    payload = _http_request(f"{INAT_API_BASE}/users/{int(candidate)}")
+    results = payload.get("results") or []
+    if not results:
+        return None
+    item = results[0]
+    login = _clean_candidate(item.get("login"))
+    if not login:
+        return None
+    return {
+        "id": item.get("id"),
+        "login": login,
+        "display_name": login,
+        "raw": item,
+    }
+
+
+def _lookup_inaturalist_project_exact(value: str) -> Optional[Dict[str, Any]]:
+    candidate = _clean_candidate(value)
+    if not candidate:
+        return None
+    q = urllib.parse.urlencode({"q": candidate})
+    payload = _http_request(f"{INAT_API_BASE}/projects?{q}")
+    for item in payload.get("results") or []:
+        slug = _clean_candidate(item.get("slug"))
+        title = _clean_candidate(item.get("title") or item.get("name"))
+        if candidate.casefold() in {slug.casefold(), title.casefold()}:
+            return {
+                "id": item.get("id"),
+                "slug": slug or candidate,
+                "title": title or slug or candidate,
+                "display_name": title or slug or candidate,
+                "raw": item,
+            }
+    return None
+
+
+def _scope_from_user(user_info: Dict[str, Any]) -> Dict[str, Any]:
+    login = _clean_candidate(user_info.get("login"))
+    return {
+        "type": "user",
+        "value": login,
+        "display_name": login,
+        "query_params": {"user_login": login},
+        "user": user_info,
+    }
+
+
+def _scope_from_project(project_info: Dict[str, Any]) -> Dict[str, Any]:
+    project_id = project_info.get("id")
+    if not project_id:
+        raise InatTreeError("The matching iNaturalist project did not include an ID.", status=502)
+    return {
+        "type": "project",
+        "value": _clean_candidate(project_info.get("slug")) or str(project_id),
+        "display_name": _clean_candidate(project_info.get("display_name")) or str(project_id),
+        "query_params": {"project_id": int(project_id)},
+        "project": project_info,
+    }
+
+
+def resolve_inaturalist_user_or_project(parsed: Dict[str, Any],
+                                        preferred_type: Optional[str] = None
+                                        ) -> Dict[str, Any]:
+    """Resolve a parsed username/project candidate through iNaturalist."""
+    preferred_type = (preferred_type or "").strip().lower() or None
+    if preferred_type not in {None, "user", "project"}:
+        raise InatTreeError("resolved_type must be 'user' or 'project'.")
+
+    kind = parsed.get("type")
+    value = _clean_candidate(parsed.get("value"))
+    if kind == "single_observation":
+        return {"type": "single_observation", "observation_id": parsed["observation_id"]}
+    if not value:
+        return {
+            "type": "not_found",
+            "message": f"No iNaturalist user or project was found for '{parsed.get('raw') or ''}'.",
+        }
+
+    user_match = None
+    project_match = None
+    if kind in {"user_candidate", "plain_candidate"} and preferred_type in {None, "user"}:
+        if parsed.get("source") == "people_path" and parsed.get("value_kind") == "id":
+            user_match = _lookup_inaturalist_user_by_id(value)
+        else:
+            user_match = _lookup_inaturalist_user_exact(value)
+    if kind in {"project_candidate", "plain_candidate"} and preferred_type in {None, "project"}:
+        project_match = _lookup_inaturalist_project_exact(value)
+
+    if preferred_type == "user":
+        if user_match:
+            return {"type": "user", "scope": _scope_from_user(user_match)}
+        return {
+            "type": "not_found",
+            "message": f"No iNaturalist user or project was found for '{parsed.get('raw') or value}'.",
+        }
+    if preferred_type == "project":
+        if project_match:
+            return {"type": "project", "scope": _scope_from_project(project_match)}
+        return {
+            "type": "not_found",
+            "message": f"No iNaturalist user or project was found for '{parsed.get('raw') or value}'.",
+        }
+    if user_match and project_match:
+        return {
+            "type": "ambiguous",
+            "message": "This matches both a user and a project. Choose which one to use.",
+            "choices": {
+                "user": {
+                    "login": user_match.get("login"),
+                    "display_name": user_match.get("display_name"),
+                },
+                "project": {
+                    "slug": project_match.get("slug"),
+                    "display_name": project_match.get("display_name"),
+                },
+            },
+        }
+    if user_match:
+        return {"type": "user", "scope": _scope_from_user(user_match)}
+    if project_match:
+        return {"type": "project", "scope": _scope_from_project(project_match)}
+    return {
+        "type": "not_found",
+        "message": f"No iNaturalist user or project was found for '{parsed.get('raw') or value}'.",
+    }
+
+
+def _fetch_scope_observation_page(scope: Dict[str, Any], page: int,
+                                  *, require_mycomap: bool = False,
+                                  per_page: int = MAX_PER_PAGE) -> Dict[str, Any]:
+    params = dict(scope.get("query_params") or {})
+    params.update({
+        "page": int(page),
+        "per_page": int(per_page),
+        "order_by": "id",
+        "order": "asc",
+    })
+    if require_mycomap:
+        params[f"field:{MYCOMAP_BLAST_FIELD_NAME}"] = ""
+    query = urllib.parse.urlencode(params, doseq=True)
+    return _http_request(f"{INAT_API_BASE}/observations?{query}")
+
+
+def _scope_total_observations(scope: Dict[str, Any]) -> int:
+    payload = _fetch_scope_observation_page(scope, 1, per_page=1)
+    return int(payload.get("total_results") or 0)
+
+
+def _collect_tree_eligible_observations(scope: Dict[str, Any]) -> Dict[str, Any]:
+    total_matching = _scope_total_observations(scope)
+    observations = []
+    page = 1
+    total_with_mycomap = 0
+    skipped_existing_tree = 0
+
+    while True:
+        payload = _fetch_scope_observation_page(scope, page, require_mycomap=True)
+        results = payload.get("results") or []
+        if page == 1:
+            total_with_mycomap = int(payload.get("total_results") or 0)
+        if not results:
+            break
+        for obs in results:
+            if _has_nonempty_field(obs, PHYLOGENETIC_TREE_FIELD_NAME):
+                skipped_existing_tree += 1
+                continue
+            if _has_nonempty_field(obs, MYCOMAP_BLAST_FIELD_NAME):
+                observations.append(obs)
+        if len(results) < MAX_PER_PAGE or (page * MAX_PER_PAGE) >= total_with_mycomap:
+            break
+        page += 1
+        time.sleep(RATE_LIMIT_DELAY)
+
+    skipped_missing_mycomap = max(0, total_matching - total_with_mycomap)
+    return {
+        "scope": scope,
+        "total_matching_observations": total_matching,
+        "mycomap_matching_observations": total_with_mycomap,
+        "eligible_tree_count": len(observations),
+        "skipped_existing_tree_count": skipped_existing_tree,
+        "skipped_missing_mycomap_count": skipped_missing_mycomap,
+        "observations": observations,
+    }
+
+
+def count_tree_eligible_observations(scope: Dict[str, Any]) -> Dict[str, Any]:
+    counts = _collect_tree_eligible_observations(scope)
+    counts.pop("observations", None)
+    return counts
+
+
+def iter_tree_eligible_observations(scope: Dict[str, Any]) -> Iterator[Dict[str, Any]]:
+    for obs in _collect_tree_eligible_observations(scope).get("observations") or []:
+        yield obs
+
+
+def _scope_found_label(scope: Dict[str, Any]) -> str:
+    return f"{scope.get('type')} {scope.get('display_name') or scope.get('value')}"
+
+
+def _message_for_scope_counts(scope: Dict[str, Any], counts: Dict[str, Any]) -> str:
+    label = _scope_found_label(scope)
+    ready = int(counts.get("eligible_tree_count") or 0)
+    skipped_tree = int(counts.get("skipped_existing_tree_count") or 0)
+    skipped_myco = int(counts.get("skipped_missing_mycomap_count") or 0)
+    if ready:
+        noun = "observation is" if ready == 1 else "observations are"
+        priority = " high-priority" if ready == 1 else " bulk"
+        message = (
+            f"Found {label}. {ready} {noun} ready for tree building. "
+            f"Clicking One-Click Tree will create {ready}{priority} tree job"
+            f"{'' if ready == 1 else 's'}."
+        )
+        if skipped_tree or skipped_myco:
+            message += (
+                f" Skipped {skipped_tree} observations that already had trees "
+                f"and {skipped_myco} without Mycomap BLAST Results."
+            )
+        return message
+    if skipped_tree and not skipped_myco:
+        return f"Found {label}, but all matching observations already have Phylogenetic Tree fields."
+    if skipped_myco and not skipped_tree:
+        return f"Found {label}, but none of the matching observations have a Mycomap BLAST Results field."
+    return f"Found {label}, but no matching observations are ready for tree building."
+
+
+def preview_inaturalist_tree_input(raw_input: str,
+                                   resolved_type: Optional[str] = None
+                                   ) -> Dict[str, Any]:
+    parsed = parse_inaturalist_tree_input(raw_input)
+    if parsed.get("type") == "single_observation":
+        observation_id = int(parsed["observation_id"])
+        observation = fetch_observation(observation_id)
+        has_mycomap = _has_nonempty_field(observation, MYCOMAP_BLAST_FIELD_NAME)
+        has_tree = _has_nonempty_field(observation, PHYLOGENETIC_TREE_FIELD_NAME)
+        if has_mycomap and has_tree:
+            message = (
+                f"Found observation {observation_id}. It already has a "
+                "Phylogenetic Tree field."
+            )
+        elif has_mycomap:
+            message = (
+                f"Found observation {observation_id}. It has Mycomap BLAST "
+                "Results and is ready for one high-priority tree job."
+            )
+        else:
+            message = (
+                f"Found observation {observation_id}, but it does not have a "
+                "Mycomap BLAST Results field."
+            )
+        return {
+            "status": "success",
+            "type": "single_observation",
+            "observation_id": observation_id,
+            "has_mycomap_blast_results": has_mycomap,
+            "has_phylogenetic_tree": has_tree,
+            "eligible_tree_count": 1 if has_mycomap and not has_tree else 0,
+            "total_matching_observations": 1,
+            "skipped_existing_tree_count": 1 if has_tree else 0,
+            "skipped_missing_mycomap_count": 0 if has_mycomap else 1,
+            "message": message,
+        }
+
+    resolved = resolve_inaturalist_user_or_project(parsed, preferred_type=resolved_type)
+    if resolved.get("type") in {"ambiguous", "not_found"}:
+        return {"status": "success", **resolved}
+    scope = resolved["scope"]
+    counts = count_tree_eligible_observations(scope)
+    return {
+        "status": "success",
+        "type": scope["type"],
+        "scope_value": scope.get("value"),
+        "display_name": scope.get("display_name"),
+        **counts,
+        "message": _message_for_scope_counts(scope, counts),
+    }
 
 
 def find_observation_field_value_record(observation: Dict[str, Any], field_name: str) -> Optional[Dict[str, Any]]:
@@ -508,7 +899,11 @@ def _build_fasta_text(sequences: List[Dict[str, Any]]) -> str:
 def create_job_from_inat_observation(raw_input: str, user=None,
                                       include_ncbi: bool = True,
                                       include_local: bool = True,
-                                      public_base_url: Optional[str] = None
+                                      public_base_url: Optional[str] = None,
+                                      queue_name: str = "phylo_high",
+                                      queue_class: str = "high",
+                                      source: str = "inaturalist_single_tree",
+                                      extra_metrics: Optional[Dict[str, Any]] = None
                                       ) -> Dict[str, Any]:
     """Validate the iNat input, pull sequences, enqueue a one-click tree job.
 
@@ -588,7 +983,13 @@ def create_job_from_inat_observation(raw_input: str, user=None,
         "mycomap_blast_url": mycomap_url,
     }
 
-    job_id = enqueue_job(job_params)
+    rq_meta = {
+        "queue_class": queue_class,
+        "source": source,
+    }
+    if extra_metrics:
+        rq_meta.update(extra_metrics)
+    job_id = enqueue_job(job_params, queue_name=queue_name, meta=rq_meta)
     obs_source_url = f"https://www.inaturalist.org/observations/{observation_id}"
     public_base_url = _clean_display_text(public_base_url).rstrip("/")
     metrics = {
@@ -604,7 +1005,11 @@ def create_job_from_inat_observation(raw_input: str, user=None,
         "inat_update_status": "pending",
         "inat_observation_field": PHYLOGENETIC_TREE_FIELD_NAME,
         "inat_added_its_sequence": bool(added_inat_its),
+        "queue_class": queue_class,
+        "source": source,
     }
+    if extra_metrics:
+        metrics.update(extra_metrics)
     if added_inat_its:
         metrics["inat_added_its_name"] = added_inat_its
     if matched_inat_its_tip:
@@ -645,6 +1050,76 @@ def create_job_from_inat_observation(raw_input: str, user=None,
         "tree_status_url": f"/job/{job_id}",
         "tree_view_url": f"/job/{job_id}/view",
         "inat_added_its_sequence": bool(added_inat_its),
+        "queue_class": queue_class,
+        "message": message,
+    }
+
+
+def create_jobs_from_inat_scope(raw_input: str, resolved_type: str, user=None,
+                                public_base_url: Optional[str] = None) -> Dict[str, Any]:
+    """Queue one one-click tree job for each eligible observation in a scope."""
+    parsed = parse_inaturalist_tree_input(raw_input)
+    resolved = resolve_inaturalist_user_or_project(parsed, preferred_type=resolved_type)
+    if resolved.get("type") == "ambiguous":
+        raise InatTreeError("Choose whether to use the matching user or project before queueing.")
+    if resolved.get("type") == "not_found":
+        raise InatTreeError(resolved.get("message") or "No iNaturalist user or project was found.", status=404)
+    if resolved.get("type") not in {"user", "project"}:
+        raise InatTreeError("Batch tree queueing requires an iNaturalist username or project.")
+
+    scope = resolved["scope"]
+    collected = _collect_tree_eligible_observations(scope)
+    observations = collected.get("observations") or []
+    queued_count = len(observations)
+    queue_class = "high" if queued_count == 1 else "bulk"
+    queue_name = "phylo_high" if queue_class == "high" else "phylo_bulk"
+    batch_id = uuid.uuid4().hex
+    job_ids: List[str] = []
+
+    for observation in observations:
+        obs_id = int(observation.get("id"))
+        result = create_job_from_inat_observation(
+            str(obs_id),
+            user=user,
+            public_base_url=public_base_url,
+            queue_name=queue_name,
+            queue_class=queue_class,
+            source="inaturalist_batch_tree",
+            extra_metrics={
+                "batch_id": batch_id,
+                "batch_scope_type": scope["type"],
+                "batch_scope_value": scope.get("value"),
+            },
+        )
+        job_ids.append(result["job_id"])
+
+    skipped_tree = int(collected.get("skipped_existing_tree_count") or 0)
+    skipped_myco = int(collected.get("skipped_missing_mycomap_count") or 0)
+    if queued_count > 1:
+        message = (
+            f"Queued {queued_count} bulk tree jobs. These will run in the "
+            "background without blocking one-at-a-time tree jobs."
+        )
+    elif queued_count == 1:
+        message = "Queued 1 high-priority tree job."
+    else:
+        message = _message_for_scope_counts(scope, collected)
+    if queued_count and (skipped_tree or skipped_myco):
+        message += (
+            f" Skipped {skipped_tree} observations that already had trees "
+            f"and {skipped_myco} without Mycomap BLAST Results."
+        )
+
+    return {
+        "status": "success",
+        "queued_count": queued_count,
+        "skipped_existing_tree_count": skipped_tree,
+        "skipped_missing_mycomap_count": skipped_myco,
+        "batch_id": batch_id,
+        "job_ids": job_ids,
+        "queue_class": queue_class,
+        "scope_type": scope["type"],
+        "scope_value": scope.get("value"),
         "message": message,
     }
 

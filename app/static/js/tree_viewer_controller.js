@@ -1046,6 +1046,25 @@ document.addEventListener('DOMContentLoaded', async () => {
             });
         }
 
+        // Alan 6/25/26 - Register context-menu copying for iNaturalist observation numbers on clicked or selected tips.
+        if (viewer && typeof viewer.setCopyInaturalistNumbersHandler === 'function') {
+            viewer.setCopyInaturalistNumbersHandler(async (node, numbers = []) => {
+                const uniqueNumbers = Array.from(new Set((Array.isArray(numbers) ? numbers : []).filter(Boolean).map(String)));
+                if (!uniqueNumbers.length) {
+                    showStatus("No iNaturalist number to copy.", "warning", 2000);
+                    return;
+                }
+                try {
+                    await copyTextToClipboard(uniqueNumbers.join(' '));
+                    const copied = uniqueNumbers.length === 1 ? 'iNaturalist number copied.' : 'iNaturalist numbers copied.';
+                    showStatus(copied, "success", 1500);
+                } catch (err) {
+                    console.error(err);
+                    showStatus("Copy failed.", "danger", 2500);
+                }
+            });
+        }
+
         // New Set button
         btnNewSet?.addEventListener('click', () => {
             // Alan 5/12/26 - Do not open creation UI before the viewer is ready.

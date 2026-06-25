@@ -820,18 +820,35 @@ def _inat_tree_rate_limit():
 @bp.route('/inaturalist/tree', methods=['POST'])
 @limiter.limit(_inat_tree_rate_limit, key_func=_inat_tree_rate_key)
 def inaturalist_tree():
-    """Create a one-click Dikarya tree from a single iNaturalist observation.
+    """Create one-click Dikarya tree jobs from iNaturalist input.
 
     Request: { "observation": "<id-or-single-observation-url>" }
+    Scope inputs may include { "resolved_type": "user"|"project" }.
     """
     from app.services.inaturalist_tree_service import (
         InatTreeError, create_job_from_inat_observation,
+        create_jobs_from_inat_scope, parse_inaturalist_tree_input,
     )
     data = request.get_json(silent=True) or {}
-    raw = data.get('observation') or data.get('url') or ''
+    raw = data.get('observation') or data.get('url') or data.get('input') or ''
+    resolved_type = (data.get('resolved_type') or '').strip().lower()
     try:
-        result = create_job_from_inat_observation(
+        parsed = parse_inaturalist_tree_input(raw)
+        if parsed.get("type") == "single_observation":
+            result = create_job_from_inat_observation(
+                raw,
+                user=current_user,
+                public_base_url=request.url_root,
+            )
+            return jsonify(result), 202
+        if not resolved_type:
+            return jsonify({
+                "status": "error",
+                "error": "Preview this username or project and provide resolved_type before queueing.",
+            }), 409
+        result = create_jobs_from_inat_scope(
             raw,
+            resolved_type=resolved_type,
             user=current_user,
             public_base_url=request.url_root,
         )
@@ -840,6 +857,50 @@ def inaturalist_tree():
         return jsonify({"status": "error", "error": str(e)}), e.status
     except Exception as e:
         logger.error("iNaturalist tree endpoint error: %s", e, exc_info=True)
+        return _server_error(e)
+
+
+@bp.route('/inaturalist/tree/preview', methods=['POST'])
+@limiter.limit(_inat_tree_rate_limit, key_func=_inat_tree_rate_key)
+def inaturalist_tree_preview():
+    """Preview iNaturalist one-click tree scope and eligibility."""
+    from app.services.inaturalist_tree_service import (
+        InatTreeError, preview_inaturalist_tree_input,
+    )
+    data = request.get_json(silent=True) or {}
+    raw = data.get('input') or data.get('observation') or data.get('url') or ''
+    resolved_type = data.get('resolved_type')
+    try:
+        return jsonify(preview_inaturalist_tree_input(raw, resolved_type=resolved_type))
+    except InatTreeError as e:
+        return jsonify({"status": "error", "error": str(e)}), e.status
+    except Exception as e:
+        logger.error("iNaturalist tree preview endpoint error: %s", e, exc_info=True)
+        return _server_error(e)
+
+
+@bp.route('/inaturalist/tree/batch', methods=['POST'])
+@limiter.limit(_inat_tree_rate_limit, key_func=_inat_tree_rate_key)
+def inaturalist_tree_batch():
+    """Queue one-click tree jobs for an iNaturalist user or project."""
+    from app.services.inaturalist_tree_service import (
+        InatTreeError, create_jobs_from_inat_scope,
+    )
+    data = request.get_json(silent=True) or {}
+    raw = data.get('input') or data.get('observation') or data.get('url') or ''
+    resolved_type = data.get('resolved_type') or ''
+    try:
+        result = create_jobs_from_inat_scope(
+            raw,
+            resolved_type=resolved_type,
+            user=current_user,
+            public_base_url=request.url_root,
+        )
+        return jsonify(result), 202
+    except InatTreeError as e:
+        return jsonify({"status": "error", "error": str(e)}), e.status
+    except Exception as e:
+        logger.error("iNaturalist tree batch endpoint error: %s", e, exc_info=True)
         return _server_error(e)
 
 

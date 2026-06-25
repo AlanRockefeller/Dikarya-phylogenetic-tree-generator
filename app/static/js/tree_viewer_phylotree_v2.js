@@ -81,6 +81,9 @@
         // Alan 6/4/26 - Let implementations expose a controller-owned context-menu copy-name action.
         setCopySequenceNameHandler(fn) { }
 
+        // Alan 6/25/26 - Let implementations expose a controller-owned iNaturalist-number copy action.
+        setCopyInaturalistNumbersHandler(fn) { }
+
         /**
          * Perform a bulk selection action.
          * @param {string} action - One of: 'all', 'none', 'inverse', 'all-leaves', 'all-internal', 'select-filtered'
@@ -305,6 +308,8 @@
             this._onPruneNode = null;
             // Alan 6/4/26 - Controller-supplied handler invoked by the native menu's "Copy sequence name" item.
             this._onCopySequenceName = null;
+            // Alan 6/25/26 - Controller-supplied handler invoked by the native menu's iNaturalist-number copy item.
+            this._onCopyInaturalistNumbers = null;
         }
 
         // Alan 6/2/26 - Let the controller own the rotate action while the item lives in phylotree's native node menu.
@@ -320,6 +325,11 @@
         // Alan 6/4/26 - Let the controller own clipboard copying while the item lives in phylotree's native node menu.
         setCopySequenceNameHandler(fn) {
             this._onCopySequenceName = typeof fn === 'function' ? fn : null;
+        }
+
+        // Alan 6/25/26 - Let the controller own iNaturalist-number clipboard copying from the native node menu.
+        setCopyInaturalistNumbersHandler(fn) {
+            this._onCopyInaturalistNumbers = typeof fn === 'function' ? fn : null;
         }
 
         // Alan 6/2/26 - Highlight the focal/sequence-of-interest tip directly from durable state,
@@ -369,6 +379,15 @@
                         () => 'Copy sequence name',
                         (node) => { if (typeof this._onCopySequenceName === 'function') this._onCopySequenceName(node); },
                         (node) => Boolean(node?.data?.name || node?.name)
+                    ]);
+                    // Alan 6/25/26 - Offer iNaturalist-number copying when the clicked tip or selected tips expose observation IDs.
+                    n.menu_items.push([
+                        (node) => this._getInaturalistCopyMenuLabel(node),
+                        (node) => {
+                            const numbers = this._getContextInaturalistNumbers(node);
+                            if (typeof this._onCopyInaturalistNumbers === 'function') this._onCopyInaturalistNumbers(node, numbers);
+                        },
+                        (node) => this._getContextInaturalistNumbers(node).length > 0
                     ]);
                 }
                 if (n.children) {
@@ -1222,6 +1241,52 @@
         _getVisibleSelectionIds() {
             this._trimSelectionSetsToCurrentTree();
             return Array.from(this.currentSelectionIds).filter(id => !this.hiddenSelectionIds.has(id));
+        }
+
+        // Alan 6/25/26 - Extract an iNaturalist observation number through phylotree's shared label parser.
+        _getInaturalistObservationNumber(node) {
+            const parser = window.phylotree?.extractINaturalistObservationNumber;
+            return typeof parser === 'function' ? parser(node) : null;
+        }
+
+        // Alan 6/25/26 - Keep selected iNaturalist copy targets limited to visible selected leaf sequences.
+        _getSelectedLeafInaturalistNumbers() {
+            const numbers = [];
+            const seen = new Set();
+            this.getSelectedNodes().forEach((node) => {
+                const children = node?.children || node?.data?.children || [];
+                if (children && children.length) return;
+                const number = this._getInaturalistObservationNumber(node);
+                if (number && !seen.has(number)) {
+                    seen.add(number);
+                    numbers.push(number);
+                }
+            });
+            return numbers;
+        }
+
+        // Alan 6/25/26 - Count selected leaf sequences so active selections can take precedence over a clicked tip.
+        _getSelectedLeafCount() {
+            return this.getSelectedNodes().filter((node) => {
+                const children = node?.children || node?.data?.children || [];
+                return !children || children.length === 0;
+            }).length;
+        }
+
+        // Alan 6/25/26 - Use selected iNaturalist tips when present, otherwise fall back to the right-clicked tip.
+        _getContextInaturalistNumbers(node) {
+            const selectedNumbers = this._getSelectedLeafInaturalistNumbers();
+            if (selectedNumbers.length) return selectedNumbers;
+            if (this._getSelectedLeafCount() > 0) return [];
+            const number = this._getInaturalistObservationNumber(node);
+            return number ? [number] : [];
+        }
+
+        // Alan 6/25/26 - Switch the context-menu text to plural when copying numbers from multiple selected sequences.
+        _getInaturalistCopyMenuLabel(node) {
+            const selectedLeafCount = this._getSelectedLeafCount();
+            const count = selectedLeafCount > 1 ? selectedLeafCount : this._getContextInaturalistNumbers(node).length;
+            return count > 1 ? 'Copy iNaturalist numbers' : 'Copy iNaturalist number';
         }
 
         // Alan 5/12/26 - Clear temporary current selection without changing persistent color groups.
