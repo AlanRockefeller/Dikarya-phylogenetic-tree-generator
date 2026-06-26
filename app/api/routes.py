@@ -7,6 +7,7 @@ from app.extensions import db
 from app.models import Job
 import logging
 import re
+from difflib import SequenceMatcher
 from datetime import datetime
 
 from app.services.security_utils import validate_job_id, validate_safe_file_path
@@ -273,6 +274,185 @@ def _dedupe_sequence_payload(sequence_text, sequence_metadata):
         if str(item.get("fasta_header") or item.get("name") or "").strip() in deduped_headers
     ]
     return fasta, metadata
+
+
+MYCOMAP_LOCAL_FASTA_QUERY_SIMILARITY_MIN = 99.5
+MYCOMAP_LOCAL_FASTA_REPORTED_IDENTITY_CONFLICT_MAX = 98.5
+MAX_IMPORT_FILTER_DETAIL_RECORDS = 100
+
+
+def _sequence_similarity_percent(a, b):
+    """Return approximate percent similarity for short barcode sequences."""
+    seq_a = ''.join(str(a or '').split()).upper()
+    seq_b = ''.join(str(b or '').split()).upper()
+    if not seq_a or not seq_b:
+        return 0.0
+
+    shorter = seq_a if len(seq_a) <= len(seq_b) else seq_b
+    longer = seq_b if len(seq_a) <= len(seq_b) else seq_a
+    if len(shorter) >= 100 and shorter in longer:
+        return 100.0
+
+    return SequenceMatcher(None, seq_a, seq_b, autojunk=False).ratio() * 100
+
+
+def _extract_mycomap_query_tokens(url):
+    """Return likely query identifiers embedded in a MycoMap BLAST URL."""
+    tokens = set()
+    text = str(url or '')
+    for match in re.finditer(r'\binat(?:uralist)?[\s_-]*(\d{5,12})\b', text, flags=re.IGNORECASE):
+        digits = match.group(1)
+        tokens.add(digits)
+        tokens.add(f"inat{digits}")
+    return tokens
+
+
+def _mycomap_query_sequences(sequences, metrics_by_key, query_tokens):
+    """Find query sequences included in MycoMap's local FASTA export."""
+    from app.services.mycomap_service import build_blast_metric_keys
+
+    if not query_tokens:
+        return []
+
+    candidates = []
+
+    for seq in sequences:
+        if seq.get('hit_source') != 'local':
+            continue
+
+        metric = None
+        for lookup_name in (seq.get('name', ''), seq.get('_mycomap_original_name', '')):
+            for key in build_blast_metric_keys(lookup_name):
+                metric = metrics_by_key.get(key)
+                if metric:
+                    break
+            if metric:
+                break
+        if metric:
+            continue
+
+        name = str(seq.get('name') or seq.get('_mycomap_original_name') or '').lower()
+        if query_tokens and not any(token in name for token in query_tokens):
+            continue
+
+        sequence = ''.join(str(seq.get('sequence') or '').split()).upper()
+        if len(sequence) >= 100:
+            candidates.append(sequence)
+
+    return candidates
+
+
+def _mycomap_local_fasta_conflict_detail(seq, metric, query_sequences, query_tokens):
+    """
+    Detect MycoMap localFasta records that appear to contain the query sequence.
+
+    MycoMap can report a local hit at ~88% identity while localFasta exports a
+    sequence that is essentially identical to the query. Trust the BLAST table
+    contradiction and drop that local FASTA record rather than building a tree
+    from mislabeled sequence data.
+    """
+    if seq.get('hit_source') != 'local' or not query_sequences:
+        return None
+
+    name = str(seq.get('name') or seq.get('_mycomap_original_name') or '').lower()
+    if query_tokens and any(token in name for token in query_tokens):
+        return None
+
+    sequence = ''.join(str(seq.get('sequence') or '').split()).upper()
+    if len(sequence) < 100:
+        return None
+
+    best_similarity = max(
+        _sequence_similarity_percent(sequence, query_sequence)
+        for query_sequence in query_sequences
+    )
+    if best_similarity < MYCOMAP_LOCAL_FASTA_QUERY_SIMILARITY_MIN:
+        return None
+
+    if not metric:
+        return {
+            "reason": "local_fasta_matches_query",
+            "reason_label": "Local FASTA sequence matches query, but the label is not the query",
+            "query_similarity": round(best_similarity, 2),
+        } if query_tokens else None
+
+    reported_identity = metric.get('identity')
+    if reported_identity is None:
+        return None
+    try:
+        reported_identity = float(reported_identity)
+    except (TypeError, ValueError):
+        return None
+    if reported_identity > MYCOMAP_LOCAL_FASTA_REPORTED_IDENTITY_CONFLICT_MAX:
+        return None
+
+    return {
+        "reason": "local_fasta_identity_conflict",
+        "reason_label": "Local FASTA sequence matches query, but BLAST table reports lower identity",
+        "query_similarity": round(best_similarity, 2),
+        "reported_identity": reported_identity,
+    }
+
+
+def _append_import_filter_detail(details, *, name, source, reason, reason_label,
+                                 hit_source="", reported_identity=None,
+                                 query_similarity=None):
+    """Append a bounded, sequence-free import filter detail row."""
+    if len(details) >= MAX_IMPORT_FILTER_DETAIL_RECORDS:
+        return
+    row = {
+        "name": str(name or "")[:500],
+        "source": str(source or "")[:50],
+        "hit_source": str(hit_source or "")[:50],
+        "reason": str(reason or "")[:80],
+        "reason_label": str(reason_label or "")[:200],
+    }
+    if reported_identity is not None:
+        row["reported_identity"] = reported_identity
+    if query_similarity is not None:
+        row["query_similarity"] = query_similarity
+    details.append(row)
+
+
+def _normalize_import_filter_details(raw):
+    """Keep compact, frontend-facing import filter diagnostics."""
+    if not isinstance(raw, dict):
+        return {}
+
+    def _count(value):
+        try:
+            return max(0, int(value or 0))
+        except (TypeError, ValueError):
+            return 0
+
+    normalized = {}
+    mycomap = raw.get("mycomap")
+    if isinstance(mycomap, dict):
+        records = []
+        for item in (mycomap.get("filtered_records") or [])[:MAX_IMPORT_FILTER_DETAIL_RECORDS]:
+            if not isinstance(item, dict):
+                continue
+            records.append({
+                "name": str(item.get("name") or "")[:500],
+                "source": str(item.get("source") or "")[:50],
+                "hit_source": str(item.get("hit_source") or "")[:50],
+                "reason": str(item.get("reason") or "")[:80],
+                "reason_label": str(item.get("reason_label") or "")[:200],
+                "reported_identity": _optional_float(item.get("reported_identity")),
+                "query_similarity": _optional_float(item.get("query_similarity")),
+            })
+        counts = mycomap.get("counts") if isinstance(mycomap.get("counts"), dict) else {}
+        normalized["mycomap"] = {
+            "label": str(mycomap.get("label") or "MycoMap import filters")[:100],
+            "filtered_records": records,
+            "counts": {
+                "invalid_sequence": _count(counts.get("invalid_sequence")),
+                "contaminant": _count(counts.get("contaminant")),
+                "conflicting_local": _count(counts.get("conflicting_local")),
+            },
+        }
+
+    return normalized
 
 
 def _parse_genbank_accession_tokens(value):
@@ -694,15 +874,31 @@ def gather_mycomap_sequences_for_queue(url, include_ncbi=True, include_local=Tru
                         seq['name'] = enriched_map[base_acc]['name']
                         seq['sequence'] = enriched_map[base_acc]['sequence']
 
+    filtered_records = []
     original_count = len(sequences)
+    cleaned_sequences = []
     for seq in sequences:
         seq['sequence'] = clean_dna_sequence(seq['sequence'])
-    sequences = [s for s in sequences if s['sequence']]
+        if seq['sequence']:
+            cleaned_sequences.append(seq)
+        else:
+            _append_import_filter_detail(
+                filtered_records,
+                name=seq.get('name', ''),
+                source='mycomap',
+                hit_source=seq.get('hit_source', ''),
+                reason='invalid_sequence',
+                reason_label='Invalid or short sequence after DNA cleanup',
+            )
+    sequences = cleaned_sequences
     dropped_count = original_count - len(sequences)
 
     metrics_by_key = fetch_mycomap_blast_metrics(blast_id, source_url=url)
+    query_tokens = _extract_mycomap_query_tokens(url)
+    query_sequences = _mycomap_query_sequences(sequences, metrics_by_key, query_tokens)
     metrics_attached_count = 0
     contaminant_dropped_count = 0
+    conflicting_local_dropped_count = 0
     filtered_sequences = []
     for seq in sequences:
         metric = None
@@ -714,8 +910,37 @@ def gather_mycomap_sequences_for_queue(url, include_ncbi=True, include_local=Tru
                     break
             if metric:
                 break
+        conflict_detail = _mycomap_local_fasta_conflict_detail(seq, metric, query_sequences, query_tokens)
+        if conflict_detail:
+            conflicting_local_dropped_count += 1
+            _append_import_filter_detail(
+                filtered_records,
+                name=seq.get('name', ''),
+                source='mycomap',
+                hit_source=seq.get('hit_source', ''),
+                reason=conflict_detail.get('reason'),
+                reason_label=conflict_detail.get('reason_label'),
+                reported_identity=conflict_detail.get('reported_identity'),
+                query_similarity=conflict_detail.get('query_similarity'),
+            )
+            logger.warning(
+                "Dropped conflicting MycoMap localFasta record: blast_id=%s name=%r reported_identity=%s",
+                blast_id,
+                seq.get('name', ''),
+                metric.get('identity') if metric else None,
+            )
+            continue
         if is_contaminant_sequence(seq, metric):
             contaminant_dropped_count += 1
+            _append_import_filter_detail(
+                filtered_records,
+                name=seq.get('name', ''),
+                source='mycomap',
+                hit_source=seq.get('hit_source', ''),
+                reason='contaminant',
+                reason_label='Marked as contaminant by MycoMap label or BLAST table',
+                reported_identity=metric.get('identity') if metric else None,
+            )
             continue
         if metric:
             seq['name'] = improve_mycomap_sequence_name(
@@ -751,6 +976,8 @@ def gather_mycomap_sequences_for_queue(url, include_ncbi=True, include_local=Tru
         msg += f" ({dropped_count} dropped due to invalid/short sequences)"
     if contaminant_dropped_count > 0:
         msg += f" ({contaminant_dropped_count} contaminant sequence{'s' if contaminant_dropped_count != 1 else ''} filtered)"
+    if conflicting_local_dropped_count > 0:
+        msg += f" ({conflicting_local_dropped_count} conflicting local FASTA sequence{'s' if conflicting_local_dropped_count != 1 else ''} filtered)"
     if result['errors']:
         msg += f" (warnings: {'; '.join(result['errors'])})"
 
@@ -760,6 +987,18 @@ def gather_mycomap_sequences_for_queue(url, include_ncbi=True, include_local=Tru
         "ncbi_count": result['ncbi_count'],
         "local_count": result['local_count'],
         "blast_metrics_count": metrics_attached_count,
+        "conflicting_local_count": conflicting_local_dropped_count,
+        "import_filter_details": {
+            "mycomap": {
+                "label": "MycoMap import filters",
+                "counts": {
+                    "invalid_sequence": dropped_count,
+                    "contaminant": contaminant_dropped_count,
+                    "conflicting_local": conflicting_local_dropped_count,
+                },
+                "filtered_records": filtered_records,
+            }
+        },
         "message": msg,
     }, None
 
@@ -1037,6 +1276,7 @@ def create_job():
         "notes": data.get("notes", ""),
         "sequence": data.get("sequence", ""),
         "sequence_metadata": _normalize_sequence_metadata(data.get("sequence_metadata", [])),
+        "import_filter_details": _normalize_import_filter_details(data.get("import_filter_details", {})),
         "mycomap_blast_url": data.get("mycomap_blast_url") or "",
         "accessions": data.get("accessions", []),
         "alignment_method": data.get("alignment_method", "default"),

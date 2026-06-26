@@ -1500,6 +1500,8 @@
     function clearQueue() {
         sequenceQueue = [];
         lastBlastQuery = null; // Reset BLAST context
+        // Alan 6/26/26 - Clear import diagnostics when the queue they describe is cleared.
+        importFilterDetails = {};
         selectedQueueOutgroup = '';
         updateQueueDisplay();
     }
@@ -1880,8 +1882,37 @@
     const fetchMycomapBtn = document.getElementById('fetch_mycomap_btn');
     const mycomapQuickTreeBtn = document.getElementById('mycomap_quick_tree_btn');
     let lastMycomapBlastUrl = '';
+    // Alan 6/26/26 - Preserve MycoMap import filter diagnostics so tree Generation Details can explain excluded records.
+    let importFilterDetails = {};
     function getMycomapBlastUrlForPayload() {
         return sequenceQueue.some(seq => seq && seq.source === 'mycomap') ? lastMycomapBlastUrl : '';
+    }
+    // Alan 6/26/26 - Only submit filter diagnostics when the current queue still includes MycoMap records.
+    function getImportFilterDetailsForPayload() {
+        return sequenceQueue.some(seq => seq && seq.source === 'mycomap') ? importFilterDetails : {};
+    }
+
+    function mergeImportFilterDetails(details) {
+        if (!details || typeof details !== 'object') return;
+        if (details.mycomap) {
+            const current = importFilterDetails.mycomap || {
+                label: 'MycoMap import filters',
+                counts: {},
+                filtered_records: []
+            };
+            const incomingCounts = details.mycomap.counts || {};
+            const currentCounts = current.counts || {};
+            current.counts = {
+                invalid_sequence: (currentCounts.invalid_sequence || 0) + (incomingCounts.invalid_sequence || 0),
+                contaminant: (currentCounts.contaminant || 0) + (incomingCounts.contaminant || 0),
+                conflicting_local: (currentCounts.conflicting_local || 0) + (incomingCounts.conflicting_local || 0)
+            };
+            current.filtered_records = [
+                ...(current.filtered_records || []),
+                ...((details.mycomap.filtered_records || []).slice(0, 100))
+            ].slice(0, 100);
+            importFilterDetails.mycomap = current;
+        }
     }
 
     function checkMycomapState() {
@@ -2029,6 +2060,7 @@
             showStatus(statusMsg, 'success');
 
             lastMycomapBlastUrl = url;
+            mergeImportFilterDetails(data.import_filter_details);
             mycomapUrlInput.value = '';
             checkMycomapState();
             return true;
@@ -2082,6 +2114,7 @@
             tree_method: 'fasttree',
             tree_model: 'GTR+G',
             bootstrap: 100,
+            import_filter_details: getImportFilterDetailsForPayload(),
             mycomap_blast_url: getMycomapBlastUrlForPayload()
         };
 
@@ -2686,6 +2719,7 @@
             tree_method: 'fasttree',
             tree_model: 'GTR+G',
             bootstrap: 100,
+            import_filter_details: getImportFilterDetailsForPayload(),
             mycomap_blast_url: getMycomapBlastUrlForPayload()
         };
 
@@ -2999,6 +3033,7 @@
             early_stopping: document.getElementById('early_stopping').checked,
             seed: document.getElementById('raxml_seed').value ? parseInt(document.getElementById('raxml_seed').value) : null,
             outgroup: document.getElementById('outgroup_select').value || null,
+            import_filter_details: getImportFilterDetailsForPayload(),
             mycomap_blast_url: getMycomapBlastUrlForPayload()
         };
 

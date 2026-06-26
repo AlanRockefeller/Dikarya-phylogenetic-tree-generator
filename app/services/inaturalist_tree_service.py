@@ -981,6 +981,7 @@ def create_job_from_inat_observation(raw_input: str, user=None,
         "mcmc_nruns": 2,
         "mcmc_nchains": 4,
         "mycomap_blast_url": mycomap_url,
+        "import_filter_details": (payload or {}).get("import_filter_details") or {},
     }
 
     rq_meta = {
