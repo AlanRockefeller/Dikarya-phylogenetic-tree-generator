@@ -507,6 +507,30 @@ def whats_new_edit():
     )
 
 
+@bp.route('/whats-new/add', methods=['POST'])
+def whats_new_add():
+    require_whats_new_editor()
+
+    from app.models import WhatsNewEntry
+
+    title = (request.form.get("title") or "").strip()
+    body = (request.form.get("body") or "").strip()
+    category = (request.form.get("category") or "update").strip().lower()
+
+    if category not in {"feature", "fix", "improvement", "update"}:
+        category = "update"
+
+    if not title or not body:
+        flash("Title and body are required.", "error")
+        return redirect(url_for("main.whats_new_edit"))
+
+    entry = WhatsNewEntry(title=title[:255], body=body, category=category)
+    db.session.add(entry)
+    db.session.commit()
+    flash("What's New item added.", "success")
+    return redirect(url_for("main.whats_new_edit"))
+
+
 @bp.route('/whats-new/<int:entry_id>/edit', methods=['POST'])
 def whats_new_update(entry_id):
     require_whats_new_editor()

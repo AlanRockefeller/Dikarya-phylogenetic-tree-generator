@@ -80,6 +80,11 @@ def _schemas():
                                       "enum": ["mafft", "muscle", "clustalo", "iqtree_builtin", "default"]},
                 "trimming_method": {"type": "string",
                                      "enum": ["none", "trimal", "bmge"]},
+                "trim_terminal_overhangs": {
+                    "type": "boolean",
+                    "default": True,
+                    "description": "Trim alignment columns outside the common covered span before tree building.",
+                },
                 "bootstrap": {"type": "integer", "minimum": 0, "maximum": 10000},
                 "mcmc_generations": {"type": "integer", "minimum": 1000, "maximum": 100000000},
                 "mcmc_nruns": {"type": "integer", "minimum": 1, "maximum": 8},
@@ -101,6 +106,7 @@ def _schemas():
                 "tree_method": "fasttree",
                 "alignment_method": "mafft",
                 "trimming_method": "none",
+                "trim_terminal_overhangs": True,
                 "notes": "API test with valid pasted FASTA",
             },
             "properties": {
@@ -144,6 +150,11 @@ def _schemas():
                     "type": "string",
                     "enum": ["none", "trimal", "bmge"],
                     "default": "none",
+                },
+                "trim_terminal_overhangs": {
+                    "type": "boolean",
+                    "default": True,
+                    "description": "Trim alignment columns outside the common covered span before tree building.",
                 },
                 "tree_method": {
                     "type": "string",

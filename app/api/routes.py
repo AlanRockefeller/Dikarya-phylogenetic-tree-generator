@@ -10,7 +10,7 @@ import re
 from difflib import SequenceMatcher
 from datetime import datetime
 
-from app.services.security_utils import validate_job_id, validate_safe_file_path
+from app.services.security_utils import validate_job_id, validate_safe_file_path, coerce_bool
 from app.services.access_control import check_job_access
 from app.extensions import csrf, limiter
 
@@ -342,7 +342,7 @@ def _mycomap_query_sequences(sequences, metrics_by_key, query_tokens):
     return candidates
 
 
-def _mycomap_local_fasta_conflict_detail(seq, metric, query_sequences, query_tokens):
+def _mycomap_local_fasta_metric_conflict_detail(seq, metric, query_sequences, query_tokens):
     """
     Detect MycoMap localFasta records that appear to contain the query sequence.
 
@@ -370,6 +370,10 @@ def _mycomap_local_fasta_conflict_detail(seq, metric, query_sequences, query_tok
         return None
 
     if not metric:
+        # A localFasta record whose sequence is essentially the query but whose
+        # label is not the query is mislabeled data; drop it even without a BLAST
+        # metric row (restores pre-refactor behavior). Requires query tokens so
+        # we only act when we actually know what the query looks like.
         return {
             "reason": "local_fasta_matches_query",
             "reason_label": "Local FASTA sequence matches query, but the label is not the query",
@@ -391,6 +395,33 @@ def _mycomap_local_fasta_conflict_detail(seq, metric, query_sequences, query_tok
         "reason_label": "Local FASTA sequence matches query, but BLAST table reports lower identity",
         "query_similarity": round(best_similarity, 2),
         "reported_identity": reported_identity,
+    }
+
+
+def _mycomap_local_fasta_group_conflict_detail(seq, conflict_sequences, query_tokens):
+    """Detect labels sharing a sequence with a metric-backed localFasta conflict."""
+    if seq.get('hit_source') != 'local' or not conflict_sequences:
+        return None
+
+    name = str(seq.get('name') or seq.get('_mycomap_original_name') or '').lower()
+    if query_tokens and any(token in name for token in query_tokens):
+        return None
+
+    sequence = ''.join(str(seq.get('sequence') or '').split()).upper()
+    if len(sequence) < 100:
+        return None
+
+    best_similarity = max(
+        _sequence_similarity_percent(sequence, conflict_sequence)
+        for conflict_sequence in conflict_sequences
+    )
+    if best_similarity < MYCOMAP_LOCAL_FASTA_QUERY_SIMILARITY_MIN:
+        return None
+
+    return {
+        "reason": "local_fasta_matches_conflicting_record",
+        "reason_label": "Local FASTA sequence matches another local record with a query/identity conflict",
+        "query_similarity": round(best_similarity, 2),
     }
 
 
@@ -896,21 +927,37 @@ def gather_mycomap_sequences_for_queue(url, include_ncbi=True, include_local=Tru
     metrics_by_key = fetch_mycomap_blast_metrics(blast_id, source_url=url)
     query_tokens = _extract_mycomap_query_tokens(url)
     query_sequences = _mycomap_query_sequences(sequences, metrics_by_key, query_tokens)
-    metrics_attached_count = 0
-    contaminant_dropped_count = 0
-    conflicting_local_dropped_count = 0
-    filtered_sequences = []
-    for seq in sequences:
+    sequence_metrics = []
+    metric_conflicts = {}
+    conflict_sequences = []
+    for idx, seq in enumerate(sequences):
         metric = None
-        lookup_names = [seq.get('name', ''), seq.get('_mycomap_original_name', '')]
-        for lookup_name in lookup_names:
+        for lookup_name in (seq.get('name', ''), seq.get('_mycomap_original_name', '')):
             for key in build_blast_metric_keys(lookup_name):
                 metric = metrics_by_key.get(key)
                 if metric:
                     break
             if metric:
                 break
-        conflict_detail = _mycomap_local_fasta_conflict_detail(seq, metric, query_sequences, query_tokens)
+        sequence_metrics.append(metric)
+        conflict_detail = _mycomap_local_fasta_metric_conflict_detail(
+            seq, metric, query_sequences, query_tokens
+        )
+        if conflict_detail:
+            metric_conflicts[idx] = conflict_detail
+            conflict_sequences.append(''.join(str(seq.get('sequence') or '').split()).upper())
+
+    metrics_attached_count = 0
+    contaminant_dropped_count = 0
+    conflicting_local_dropped_count = 0
+    filtered_sequences = []
+    for idx, seq in enumerate(sequences):
+        metric = sequence_metrics[idx]
+        conflict_detail = metric_conflicts.get(idx)
+        if not conflict_detail and not metric:
+            conflict_detail = _mycomap_local_fasta_group_conflict_detail(
+                seq, conflict_sequences, query_tokens
+            )
         if conflict_detail:
             conflicting_local_dropped_count += 1
             _append_import_filter_detail(
@@ -1281,6 +1328,7 @@ def create_job():
         "accessions": data.get("accessions", []),
         "alignment_method": data.get("alignment_method", "default"),
         "trimming_method": data.get("trimming_method", "none"),
+        "trim_terminal_overhangs": coerce_bool(data.get("trim_terminal_overhangs"), True)[0],
         "alignment_options": data.get("alignment_options", {}),
         "tree_method": tree_method,
         "tree_model": data.get("tree_model", "GTR+G"),
@@ -1365,6 +1413,7 @@ def create_job():
                 "notes": job_params["notes"],
                 "alignment_method": job_params["alignment_method"],
                 "trimming_method": job_params["trimming_method"],
+                "trim_terminal_overhangs": job_params["trim_terminal_overhangs"],
                 "run_preset": job_params.get("run_preset"),
                 "bootstrap_cap": job_params.get("bootstrap_cap")
             }
@@ -1714,7 +1763,7 @@ def recompute_tree_job(job_id):
             job_params,
             Config,
             logger,
-            use_current_input=bool(params_dict.get("use_current_input"))
+            use_current_input=coerce_bool(params_dict.get("use_current_input"), False)[0]
         )
         return jsonify(result)
         

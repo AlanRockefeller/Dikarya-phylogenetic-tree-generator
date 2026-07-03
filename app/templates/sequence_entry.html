@@ -931,7 +931,7 @@
         <p class="eyebrow">Advanced</p>
         <h3 class="mb-1">Pipeline Configuration</h3>
         <div class="advanced-summary">
-            <p id="advanced_current_summary" class="text-sm">Currently: MAFFT + FastTree 2.2.0, midpoint-rooted, 1000 bootstrap.</p>
+            <p id="advanced_current_summary" class="text-sm">Currently: MAFFT + FastTree 2.2.0, terminal overhang trim, midpoint-rooted, 1000 bootstrap.</p>
             <button id="advanced_customize_btn" type="button" class="btn btn-small btn-outline-gold">▾ Customize</button>
         </div>
     </div>
@@ -971,6 +971,16 @@
             <p class="text-xs text-gray-500 dark:text-gray-400 mt-1">
                 Remove poorly aligned regions to improve signal.
             </p>
+            <label for="trim_terminal_overhangs" class="mt-4 flex items-start gap-3 text-sm text-gray-700 dark:text-gray-200">
+                <input type="checkbox" id="trim_terminal_overhangs" checked
+                    class="mt-1 w-4 h-4 text-journal-gold border-gray-300 rounded focus:ring-journal-gold">
+                <span>
+                    <span class="font-medium">Trim terminal overhangs</span>
+                    <span class="block text-xs text-gray-500 dark:text-gray-400 mt-1">
+                        Remove low-coverage alignment ends before tree building.
+                    </span>
+                </span>
+            </label>
         </div>
     </div>
 
@@ -2111,6 +2121,7 @@
             notes: 'Mycomap Quick Tree',
             alignment_method: 'mafft',
             trimming_method: 'none',
+            trim_terminal_overhangs: true,
             tree_method: 'fasttree',
             tree_model: 'GTR+G',
             bootstrap: 100,
@@ -2716,6 +2727,7 @@
             notes: notes,
             alignment_method: 'mafft',
             trimming_method: 'none',
+            trim_terminal_overhangs: true,
             tree_method: 'fasttree',
             tree_model: 'GTR+G',
             bootstrap: 100,
@@ -2781,7 +2793,10 @@
             : (parseInt(document.getElementById('bootstrap')?.value, 10) || 100);
         const outgroup = document.getElementById('outgroup_select')?.value;
         const rooting = outgroup ? `outgroup: ${outgroup}` : 'midpoint-rooted';
-        advancedCurrentSummary.textContent = `Currently: ${alignment} + ${treeMethod}, ${rooting}, ${bootstrap} bootstrap.`;
+        const terminalTrim = document.getElementById('trim_terminal_overhangs')?.checked
+            ? 'terminal overhang trim'
+            : 'terminal overhangs kept';
+        advancedCurrentSummary.textContent = `Currently: ${alignment} + ${treeMethod}, ${terminalTrim}, ${rooting}, ${bootstrap} bootstrap.`;
     }
 
     function updateForm() {
@@ -2868,7 +2883,7 @@
 
     // Listeners
     treeMethodSelect.addEventListener('change', updateForm);
-    ['alignment_method', 'trimming_method', 'tree_model', 'bootstrap', 'outgroup_select'].forEach(id => {
+    ['alignment_method', 'trimming_method', 'trim_terminal_overhangs', 'tree_model', 'bootstrap', 'outgroup_select'].forEach(id => {
         document.getElementById(id)?.addEventListener('input', refreshAdvancedSummary);
         document.getElementById(id)?.addEventListener('change', refreshAdvancedSummary);
     });
@@ -3012,6 +3027,7 @@
             notes: notes,
             alignment_method: document.getElementById('alignment_method').value,
             trimming_method: document.getElementById('trimming_method').value,
+            trim_terminal_overhangs: document.getElementById('trim_terminal_overhangs').checked,
             tree_method: treeMethodSelect.value,
             tree_model: isRaxml && model === 'AUTO' ? 'GTR+G' : model, // Fallback model if AUTO triggers moose
 

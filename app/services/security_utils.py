@@ -6,6 +6,32 @@ from typing import Optional, Tuple
 # Valid job_id pattern: UUID4 format only
 JOB_ID_PATTERN = re.compile(r'^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$', re.IGNORECASE)
 
+BOOL_TRUE_TOKENS = frozenset({"1", "true", "yes", "on"})
+BOOL_FALSE_TOKENS = frozenset({"0", "false", "no", "off"})
+
+
+def coerce_bool(value, default: bool = True) -> Tuple[bool, bool]:
+    """Coerce a request value to a bool. Single source of truth for the API,
+    api_v1, and worker paths so they can't drift apart.
+
+    Returns ``(result, recognized)``. ``recognized`` is False only when the
+    value was a string matching neither the true nor false token set — a
+    validating caller can reject it (e.g. HTTP 422), while a lenient caller can
+    ignore the flag and fall back to ``default``.
+    """
+    if value is None:
+        return default, True
+    if isinstance(value, bool):
+        return value, True
+    if isinstance(value, str):
+        clean = value.strip().lower()
+        if clean in BOOL_TRUE_TOKENS:
+            return True, True
+        if clean in BOOL_FALSE_TOKENS:
+            return False, True
+        return default, False
+    return bool(value), True
+
 def validate_job_id(job_id: str) -> bool:
     """Validate job_id is a valid UUID4 format. Prevents directory traversal."""
     if not job_id or not isinstance(job_id, str):

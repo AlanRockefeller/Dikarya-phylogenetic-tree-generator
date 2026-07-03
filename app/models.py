@@ -107,6 +107,10 @@ class AlignmentParams:
 @dataclass
 class TrimmingParams:
     method: str  # "none", "trimal", "bmge"
+    # Trim ragged terminal alignment columns before tree building. First-class
+    # so both the worker and recompute paths model it the same way instead of
+    # smuggling it through `options`.
+    trim_terminal_overhangs: bool = True
     options: Dict[str, Any] = field(default_factory=dict)
 
 @dataclass

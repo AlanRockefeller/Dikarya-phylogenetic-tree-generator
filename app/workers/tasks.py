@@ -30,6 +30,11 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 
+def _save_job_params(input_info_path, job_params: dict) -> None:
+    with open(input_info_path, "w") as f:
+        json.dump(job_params, f, indent=2)
+
+
 def parse_fasta_records(fasta_text: str) -> list[tuple[str, str]]:
     """
     Returns list of (header_without_gt, sequence_string_no_whitespace).
@@ -201,6 +206,7 @@ def run_recompute_job(job_id: str, params_dict: dict) -> dict:
         from app import create_app
         from app.extensions import db
         from app.models import Job
+        from app.services.security_utils import coerce_bool
         from app.services.tree_edit_service import build_recompute_job_params, recompute_tree
 
         _app = create_app()
@@ -232,7 +238,7 @@ def run_recompute_job(job_id: str, params_dict: dict) -> dict:
             logger,
             event_job_id=job_id,
             rq_job=job,
-            use_current_input=bool(params_dict.get("use_current_input"))
+            use_current_input=coerce_bool(params_dict.get("use_current_input"), False)[0]
         )
 
         with _app.app_context():
@@ -335,6 +341,12 @@ def run_phylo_job(job_params: dict) -> dict:
     # Stats from streaming command (for error context)
     last_stats = {}
 
+    from app.services.security_utils import coerce_bool
+    job_params = dict(job_params or {})
+    job_params["trim_terminal_overhangs"] = coerce_bool(
+        job_params.get("trim_terminal_overhangs"), True
+    )[0]
+
     logger.info(f"Starting job {job_id} with params: {job_params}")
 
     # 1. Create Job Directory
@@ -350,8 +362,7 @@ def run_phylo_job(job_params: dict) -> dict:
 
     # 2. Save job_params
     input_info_path = job_dir / "input_info.json"
-    with open(input_info_path, "w") as f:
-        json.dump(job_params, f, indent=2)
+    _save_job_params(input_info_path, job_params)
 
     # 2b. Initialize with single app context
     from app import create_app
@@ -399,18 +410,22 @@ def run_phylo_job(job_params: dict) -> dict:
                 # This ensures the UI shows correct pipeline from the start
                 input_type = _normalize_input_type(job_params.get("input_type"))
                 blast_mode = _normalize_blast_mode(job_params.get("blast_mode"))
+                from app.services.trimming_service import describe_trim_step
                 trim_method = job_params.get("trimming_method", "none")
                 if trim_method == "default":
                     trim_method = Config.BEGINNER_DEFAULT_TRIMMING
-                
+                # Already normalized to a bool near the top of run_phylo_job.
+                trim_terminal_overhangs = bool(job_params.get("trim_terminal_overhangs", True))
+
                 # BLAST is only used for single accession with optional blast
                 will_do_blast = (input_type == "accession" and blast_mode == "optional")
                 if not will_do_blast:
                     job.meta["steps"][STEP_BLAST]["state"] = STATE_SKIPPED
                     job.meta["steps"][STEP_BLAST]["label"] = "BLAST Search (skipped)"
-                
-                # Trim is skipped if method is none
-                if not trim_method or trim_method.lower() == "none":
+
+                # Trim is skipped only when both external and terminal trimming are disabled.
+                should_trim, _trim_label, _trim_tool = describe_trim_step(trim_method, trim_terminal_overhangs)
+                if not should_trim:
                     job.meta["steps"][STEP_TRIM]["state"] = STATE_SKIPPED
                     job.meta["steps"][STEP_TRIM]["label"] = "Trimming (skipped)"
                 
@@ -659,19 +674,20 @@ def run_phylo_job(job_params: dict) -> dict:
             # STEP: TRIMMING
             # =========================================================
             current_step = STEP_TRIM
+            from app.services.trimming_service import run_trimming, describe_trim_step, format_trimming_detail
             trim_method = job_params.get("trimming_method", "none")
             if trim_method == "default":
                 trim_method = Config.BEGINNER_DEFAULT_TRIMMING
-            
+            # Already normalized to a bool near the top of run_phylo_job.
+            trim_terminal_overhangs = bool(job_params.get("trim_terminal_overhangs", True))
+            should_trim, current_step_label, current_tool = describe_trim_step(trim_method, trim_terminal_overhangs)
+
             if job:
                 job.meta["current_step"] = current_step
-                job.meta["current_tool"] = trim_method if trim_method != "none" else None
+                job.meta["current_tool"] = current_tool
                 job.save_meta()
-            
-            if trim_method and trim_method.lower() != "none":
-                current_tool = trim_method.lower()
-                current_step_label = f"Trimming ({trim_method})"
-                
+
+            if should_trim:
                 publish_step_start(job_id, STEP_TRIM, current_step_label, "", tool=current_tool)
                 update_step_meta(job, STEP_TRIM, {
                     "state": STATE_RUNNING,
@@ -679,11 +695,20 @@ def run_phylo_job(job_params: dict) -> dict:
                     "tool": current_tool
                 })
 
-                from app.services.trimming_service import run_trimming
-                run_trimming(alignment_raw_path, alignment_trimmed_path, trim_method, Config, logger, job_id=job_id)
+                trim_stats = run_trimming(
+                    alignment_raw_path,
+                    alignment_trimmed_path,
+                    trim_method,
+                    Config,
+                    logger,
+                    job_id=job_id,
+                    trim_terminal_overhangs=trim_terminal_overhangs,
+                )
 
                 _, trimmed_cols = _count_alignment_stats(alignment_trimmed_path)
-                detail = f"{trimmed_cols} columns retained"
+                detail = format_trimming_detail(trim_method, trim_stats, trimmed_cols)
+                job_params["trimming_details"] = trim_stats
+                _save_job_params(input_info_path, job_params)
                 
                 publish_step_done(job_id, STEP_TRIM, detail)
                 publish_overview(job_id, f"Trimming complete: {detail}")
@@ -692,6 +717,15 @@ def run_phylo_job(job_params: dict) -> dict:
                 # Trimming skipped
                 import shutil
                 shutil.copy(alignment_raw_path, alignment_trimmed_path)
+                job_params["trimming_details"] = {
+                    "method": trim_method,
+                    "trim_terminal_overhangs": False,
+                    "terminal_overhang_trim": {
+                        "enabled": False,
+                        "removed_columns": 0,
+                    },
+                }
+                _save_job_params(input_info_path, job_params)
                 update_step_meta(job, STEP_TRIM, {"state": STATE_SKIPPED, "label": "Trimming (skipped)"})
                 publish_overview(job_id, "Trimming skipped (method: none)")
                 current_tool = None
@@ -800,6 +834,8 @@ def run_phylo_job(job_params: dict) -> dict:
             if db_job:
                 metrics = db_job.metrics or {}
                 metrics["completed_at"] = datetime.now(timezone.utc).isoformat()
+                metrics["trim_terminal_overhangs"] = job_params.get("trim_terminal_overhangs")
+                metrics["trimming_details"] = job_params.get("trimming_details")
                 db_job.metrics = metrics
                 db_job.status = "completed"
                 db.session.commit()

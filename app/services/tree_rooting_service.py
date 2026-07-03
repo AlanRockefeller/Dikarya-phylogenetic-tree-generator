@@ -7,6 +7,7 @@ not a claim about the true evolutionary root.
 """
 import json
 import logging
+import math
 from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -29,7 +30,27 @@ BLUE_HIGHLIGHT_COLOR = "#1f77b4"
 MIN_OVERLAP_FRACTION = 0.85
 MIN_RAW_LENGTH_FRACTION = 0.90
 MAX_AMBIGUOUS_FRACTION = 0.05
-MAX_GAP_FRACTION = 0.50
+# Absolute floor on aligned overlap. The fraction-based thresholds scale with
+# the focal sequence's length, so a very short focal (a tiny fragment) makes
+# them trivially small and lets near-empty candidates through. Requiring a
+# minimum absolute overlap keeps distance-based rooting from trusting a sliver
+# of shared residues; when the focal itself is shorter than this, nothing
+# qualifies and rooting falls back to midpoint, which is the safe choice for a
+# fragment too short to place reliably.
+MIN_ABSOLUTE_OVERLAP = 30
+UNINFORMATIVE_EPITHETS = {
+    "aff",
+    "cf",
+    "clade",
+    "clone",
+    "complex",
+    "environmental",
+    "group",
+    "nr",
+    "sp",
+    "spp",
+    "uncultured",
+}
 
 
 @dataclass
@@ -128,20 +149,21 @@ def _load_alignment(job_dir: Path) -> Dict[str, str]:
     if not HAS_BIOPYTHON:
         return {}
     candidates = [
-        job_dir / "alignment" / "alignment_trimmed.fasta",
-        job_dir / "alignment" / "alignment_raw.fasta",
         job_dir / "alignment" / "alignment_pruned_trimmed.fasta",
         job_dir / "alignment" / "alignment_pruned_aligned.fasta",
+        job_dir / "alignment" / "alignment_trimmed.fasta",
+        job_dir / "alignment" / "alignment_raw.fasta",
     ]
     for path in candidates:
         if path.exists():
             try:
                 seqs: Dict[str, str] = {}
-                for rec in SeqIO.parse(str(path), "fasta"):
-                    seq = str(rec.seq).upper()
-                    for name in (rec.id, rec.name, rec.description):
-                        if name:
-                            seqs[str(name).strip()] = seq
+                with open(path, "r") as handle:
+                    for rec in SeqIO.parse(handle, "fasta"):
+                        seq = str(rec.seq).upper()
+                        for name in (rec.id, rec.name, rec.description):
+                            if name:
+                                seqs[str(name).strip()] = seq
                 if seqs:
                     return seqs
             except Exception as e:
@@ -174,18 +196,51 @@ def _assess_candidate(focal_seq: str, focal_raw_len: int,
     """Return (acceptable, rejection_reason)."""
     if not cand_seq:
         return False, "no_aligned_sequence"
-    raw_len, gaps, amb = _seq_stats(cand_seq)
-    if raw_len < int(MIN_RAW_LENGTH_FRACTION * focal_raw_len):
+    raw_len, _gaps, amb = _seq_stats(cand_seq)
+    min_raw_len = max(1, math.ceil(MIN_RAW_LENGTH_FRACTION * focal_raw_len))
+    if raw_len < min_raw_len:
         return False, "too_short"
-    total = len(cand_seq) or 1
-    if gaps / total > MAX_GAP_FRACTION:
-        return False, "mostly_gaps"
     if raw_len and amb / raw_len > MAX_AMBIGUOUS_FRACTION:
         return False, "high_ambiguity"
     overlap = _aligned_overlap(focal_seq, cand_seq)
-    if overlap < int(MIN_OVERLAP_FRACTION * focal_raw_len):
+    min_overlap = max(MIN_ABSOLUTE_OVERLAP, math.ceil(MIN_OVERLAP_FRACTION * focal_raw_len))
+    if overlap < min_overlap:
         return False, "low_overlap"
     return True, None
+
+
+def _extract_binomial(label: str) -> Optional[Tuple[str, str]]:
+    """Best-effort genus/species parser for labels that include accessions first."""
+    if not label:
+        return None
+    cleaned = (
+        str(label)
+        .replace("_", " ")
+        .replace(":", " ")
+        .replace("/", " ")
+        .replace("(", " ")
+        .replace(")", " ")
+        .replace("[", " ")
+        .replace("]", " ")
+    )
+    tokens = [token.strip(".,;\"'") for token in cleaned.split()]
+    for i in range(len(tokens) - 1):
+        genus = tokens[i]
+        epithet = tokens[i + 1]
+        if not genus or not epithet:
+            continue
+        if not genus[0].isupper() or not genus.replace("-", "").isalpha():
+            continue
+        raw_epithet = epithet.rstrip(".")
+        if not raw_epithet or not raw_epithet[0].islower():
+            continue
+        normalized_epithet = raw_epithet.lower()
+        if normalized_epithet in UNINFORMATIVE_EPITHETS:
+            continue
+        if not normalized_epithet.replace("-", "").isalpha():
+            continue
+        return genus.lower(), normalized_epithet
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -312,6 +367,7 @@ def choose_auto_root_target(job_dir: Path, state: Dict[str, Any],
             rejected_count=len(distances),
         )
 
+    focal_taxon = _extract_binomial(focal)
     rejected = 0
     accepted: List[Tuple[str, float]] = []
     for tip_name, dist in distances.items():
@@ -334,16 +390,27 @@ def choose_auto_root_target(job_dir: Path, state: Dict[str, Any],
             rejected_count=rejected,
         )
 
-    # Pick the most distant acceptable candidate.
-    accepted.sort(key=lambda x: x[1], reverse=True)
-    target_name, best_dist = accepted[0]
+    candidate_pool = accepted
+    reason = f"most_distant_acceptable_hit:source={focal_source}"
+    if mode == "auto" and focal_taxon:
+        taxon_distinct = [
+            item for item in accepted
+            if (taxon := _extract_binomial(item[0])) and taxon != focal_taxon
+        ]
+        if taxon_distinct:
+            candidate_pool = taxon_distinct
+            reason = f"most_distant_taxon_distinct_acceptable_hit:source={focal_source}"
+
+    # Pick the most distant candidate after applying mode-specific preference.
+    candidate_pool.sort(key=lambda x: x[1], reverse=True)
+    target_name, best_dist = candidate_pool[0]
 
     out_mode = "most_divergent_hit" if mode == "most_divergent_hit" else "auto"
     return RootChoice(
         mode=out_mode,
         query_tip=focal,
         target_name=target_name,
-        reason=f"most_distant_acceptable_hit:source={focal_source}",
+        reason=reason,
         warnings=warnings,
         score=best_dist,
         candidate_count=len(accepted),

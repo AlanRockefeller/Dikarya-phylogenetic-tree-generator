@@ -25,7 +25,7 @@ from app.api_v1.openapi import build_spec
 from app.config import Config
 from app.extensions import db, limiter
 from app.models import ApiToken, Job
-from app.services.security_utils import validate_safe_file_path
+from app.services.security_utils import validate_safe_file_path, coerce_bool
 from app.workers.queue import enqueue_job, enqueue_recompute_job
 
 
@@ -118,10 +118,28 @@ LIMITS = {
 # input data," not "submit a new dataset." Use POST /jobs for that.
 RECOMPUTE_ALLOWED_FIELDS = frozenset({
     "tree_method", "tree_model",
-    "alignment_method", "trimming_method",
+    "alignment_method", "trimming_method", "trim_terminal_overhangs",
     "bootstrap", "mcmc_generations", "mcmc_nruns", "mcmc_nchains",
     "outgroup", "notes",
 })
+
+
+def _validate_bool(field, value, default=True):
+    """Strict boolean validation for the public API.
+
+    Shares the token sets with the worker/api paths via coerce_bool, but rejects
+    (422) unrecognized strings and non-boolean JSON types instead of coercing.
+    """
+    result, recognized = coerce_bool(value, default)
+    valid_type = value is None or isinstance(value, (bool, str))
+    if recognized and valid_type:
+        return result, None
+    return None, error_response(
+        code="validation_failed",
+        message=f"`{field}` must be a boolean.",
+        status=422,
+        details={"field": field, "value": value},
+    )
 
 
 def _validate_categorical(field, value, allowed):
@@ -302,6 +320,9 @@ def create_job():
     trimmer, err = _validate_categorical(
         "trimming_method", data.get("trimming_method", "none"), VALID_TRIMMERS)
     if err: return err
+    trim_terminal_overhangs, err = _validate_bool(
+        "trim_terminal_overhangs", data.get("trim_terminal_overhangs"), default=True)
+    if err: return err
 
     # Clamped integers.
     bootstrap, err = _validate_clamped_int("bootstrap", data.get("bootstrap"), default=1000)
@@ -403,6 +424,7 @@ def create_job():
         "accessions":        accessions,
         "alignment_method":  aligner,
         "trimming_method":   trimmer,
+        "trim_terminal_overhangs": trim_terminal_overhangs,
         "alignment_options": alignment_options,
         "tree_method":       tree_method,
         "tree_model":        tree_model,
@@ -425,6 +447,7 @@ def create_job():
                 "notes": job_params["notes"],
                 "alignment_method": job_params["alignment_method"],
                 "trimming_method": job_params["trimming_method"],
+                "trim_terminal_overhangs": job_params["trim_terminal_overhangs"],
                 "via": "api_v1",
                 "api_token_id": g.api_token.id,
             },
@@ -567,6 +590,10 @@ def recompute_job(job_id):
                 "trimming_method", body["trimming_method"], VALID_TRIMMERS)
             if err: return err
             overrides["trimming_method"] = v
+        if "trim_terminal_overhangs" in body:
+            v, err = _validate_bool("trim_terminal_overhangs", body["trim_terminal_overhangs"])
+            if err: return err
+            overrides["trim_terminal_overhangs"] = v
         for field, default in (("bootstrap", 1000), ("mcmc_generations", 50_000),
                                ("mcmc_nruns", 2), ("mcmc_nchains", 4)):
             if field in body:

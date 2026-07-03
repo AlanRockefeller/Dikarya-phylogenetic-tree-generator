@@ -282,6 +282,43 @@
                     <div id="color-group-chips" class="flex items-center gap-1 max-w-[360px] overflow-x-auto py-0.5">
                     </div>
 
+                    <div id="color-preset-swatches"
+                        class="flex items-center gap-1 border-l border-gray-200 dark:border-gray-700 pl-1 ml-0.5"
+                        aria-label="Preset colors">
+                        <button type="button"
+                            class="btn-color-preset h-6 w-6 rounded border border-black/20 ring-offset-1 hover:ring-2 hover:ring-journal-gold disabled:opacity-30 disabled:cursor-not-allowed"
+                            data-preset-name="Red" data-preset-color="#dc2626" title="Mark selected sequences red"
+                            aria-label="Red" style="background-color: #dc2626;"></button>
+                        <button type="button"
+                            class="btn-color-preset h-6 w-6 rounded border border-black/20 ring-offset-1 hover:ring-2 hover:ring-journal-gold disabled:opacity-30 disabled:cursor-not-allowed"
+                            data-preset-name="Orange" data-preset-color="#ea580c" title="Mark selected sequences orange"
+                            aria-label="Orange" style="background-color: #ea580c;"></button>
+                        <button type="button"
+                            class="btn-color-preset h-6 w-6 rounded border border-black/20 ring-offset-1 hover:ring-2 hover:ring-journal-gold disabled:opacity-30 disabled:cursor-not-allowed"
+                            data-preset-name="Gold" data-preset-color="#ca8a04" title="Mark selected sequences gold"
+                            aria-label="Gold" style="background-color: #ca8a04;"></button>
+                        <button type="button"
+                            class="btn-color-preset h-6 w-6 rounded border border-black/20 ring-offset-1 hover:ring-2 hover:ring-journal-gold disabled:opacity-30 disabled:cursor-not-allowed"
+                            data-preset-name="Green" data-preset-color="#16a34a" title="Mark selected sequences green"
+                            aria-label="Green" style="background-color: #16a34a;"></button>
+                        <button type="button"
+                            class="btn-color-preset h-6 w-6 rounded border border-black/20 ring-offset-1 hover:ring-2 hover:ring-journal-gold disabled:opacity-30 disabled:cursor-not-allowed"
+                            data-preset-name="Teal" data-preset-color="#0d9488" title="Mark selected sequences teal"
+                            aria-label="Teal" style="background-color: #0d9488;"></button>
+                        <button type="button"
+                            class="btn-color-preset h-6 w-6 rounded border border-black/20 ring-offset-1 hover:ring-2 hover:ring-journal-gold disabled:opacity-30 disabled:cursor-not-allowed"
+                            data-preset-name="Blue" data-preset-color="#2563eb" title="Mark selected sequences blue"
+                            aria-label="Blue" style="background-color: #2563eb;"></button>
+                        <button type="button"
+                            class="btn-color-preset h-6 w-6 rounded border border-black/20 ring-offset-1 hover:ring-2 hover:ring-journal-gold disabled:opacity-30 disabled:cursor-not-allowed"
+                            data-preset-name="Purple" data-preset-color="#9333ea" title="Mark selected sequences purple"
+                            aria-label="Purple" style="background-color: #9333ea;"></button>
+                        <button type="button"
+                            class="btn-color-preset h-6 w-6 rounded border border-black/20 ring-offset-1 hover:ring-2 hover:ring-journal-gold disabled:opacity-30 disabled:cursor-not-allowed"
+                            data-preset-name="Pink" data-preset-color="#db2777" title="Mark selected sequences pink"
+                            aria-label="Pink" style="background-color: #db2777;"></button>
+                    </div>
+
                     <!-- New Set button -->
                     <button type="button" id="btn-new-selection-set"
                         class="px-1.5 py-1 text-xs hover:bg-green-100 dark:hover:bg-green-900/30 rounded text-green-600 dark:text-green-400"
@@ -355,6 +392,40 @@
                         placeholder="Color group name">
                     <label class="mt-2 block text-[10px] font-bold uppercase tracking-wide text-gray-500 dark:text-gray-400"
                         for="input-color-group-new-color">Color</label>
+                    <div class="mt-1 grid grid-cols-8 gap-1" aria-label="Preset colors for new group">
+                        <button type="button"
+                            class="btn-color-preset-create h-6 rounded border border-black/20 ring-offset-1 hover:ring-2 hover:ring-journal-gold"
+                            data-preset-name="Red" data-preset-color="#dc2626" title="Use red" aria-label="Red"
+                            style="background-color: #dc2626;"></button>
+                        <button type="button"
+                            class="btn-color-preset-create h-6 rounded border border-black/20 ring-offset-1 hover:ring-2 hover:ring-journal-gold"
+                            data-preset-name="Orange" data-preset-color="#ea580c" title="Use orange" aria-label="Orange"
+                            style="background-color: #ea580c;"></button>
+                        <button type="button"
+                            class="btn-color-preset-create h-6 rounded border border-black/20 ring-offset-1 hover:ring-2 hover:ring-journal-gold"
+                            data-preset-name="Gold" data-preset-color="#ca8a04" title="Use gold" aria-label="Gold"
+                            style="background-color: #ca8a04;"></button>
+                        <button type="button"
+                            class="btn-color-preset-create h-6 rounded border border-black/20 ring-offset-1 hover:ring-2 hover:ring-journal-gold"
+                            data-preset-name="Green" data-preset-color="#16a34a" title="Use green" aria-label="Green"
+                            style="background-color: #16a34a;"></button>
+                        <button type="button"
+                            class="btn-color-preset-create h-6 rounded border border-black/20 ring-offset-1 hover:ring-2 hover:ring-journal-gold"
+                            data-preset-name="Teal" data-preset-color="#0d9488" title="Use teal" aria-label="Teal"
+                            style="background-color: #0d9488;"></button>
+                        <button type="button"
+                            class="btn-color-preset-create h-6 rounded border border-black/20 ring-offset-1 hover:ring-2 hover:ring-journal-gold"
+                            data-preset-name="Blue" data-preset-color="#2563eb" title="Use blue" aria-label="Blue"
+                            style="background-color: #2563eb;"></button>
+                        <button type="button"
+                            class="btn-color-preset-create h-6 rounded border border-black/20 ring-offset-1 hover:ring-2 hover:ring-journal-gold"
+                            data-preset-name="Purple" data-preset-color="#9333ea" title="Use purple" aria-label="Purple"
+                            style="background-color: #9333ea;"></button>
+                        <button type="button"
+                            class="btn-color-preset-create h-6 rounded border border-black/20 ring-offset-1 hover:ring-2 hover:ring-journal-gold"
+                            data-preset-name="Pink" data-preset-color="#db2777" title="Use pink" aria-label="Pink"
+                            style="background-color: #db2777;"></button>
+                    </div>
                     <div class="mt-1 flex items-center gap-2">
                         <input type="color" id="input-color-group-new-color"
                             class="h-8 w-12 rounded border border-gray-300 bg-transparent p-0 dark:border-gray-700"
@@ -555,6 +626,8 @@
     <h3 class="text-lg font-bold text-journal-dark dark:text-gray-100 mb-4 flex items-center gap-2">
         <i class="fas fa-info-circle text-journal-gold"></i> Generation Details
     </h3>
+    {% set trimming_details = job_details.get('trimming_details') or {} %}
+    {% set terminal_trim = trimming_details.get('terminal_overhang_trim') or {} %}
 
     <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6 text-sm text-gray-700 dark:text-gray-300">
         <!-- Column 1: Core Methods -->
@@ -565,6 +638,10 @@
                         job_details.get('alignment_method', 'Unknown')|upper }}</span></p>
                 <p><span class="opacity-70 w-24 inline-block">Trimming:</span> <span class="font-medium">{{
                         job_details.get('trimming_method', 'None')|title }}</span></p>
+                {% if job_details.get('trim_terminal_overhangs') is not none %}
+                <p><span class="opacity-70 w-24 inline-block">Terminal Ends:</span> <span class="font-medium">{{
+                        'Trimmed' if job_details.get('trim_terminal_overhangs') else 'Kept' }}</span></p>
+                {% endif %}
                 <p><span class="opacity-70 w-24 inline-block">Tree Builder:</span> <span class="font-medium">{{
                         job_details.get('tree_method', 'Unknown')|upper }}</span></p>
             </div>
@@ -581,6 +658,29 @@
                 {% if job_details.get('bootstrap') %}
                 <p><span class="opacity-70 w-32 inline-block">Bootstraps:</span> <span class="font-medium">{{
                         job_details.get('bootstrap') }}</span></p>
+                {% endif %}
+                {% if terminal_trim.get('enabled') %}
+                <p><span class="opacity-70 w-44 inline-block">Terminal Coverage Rule:</span>
+                    <span class="font-medium">
+                        keep ends once {{ terminal_trim.get('min_covered_sequences', 3) }} sequences overlap
+                    </span>
+                </p>
+                <p><span class="opacity-70 w-44 inline-block">Columns Used:</span>
+                    <span class="font-medium">
+                        {{ terminal_trim.get('retained_columns') }} / {{ terminal_trim.get('input_columns') }}
+                    </span>
+                </p>
+                <p><span class="opacity-70 w-44 inline-block">Low-Coverage Ends Ignored:</span>
+                    <span class="font-medium">
+                        {{ terminal_trim.get('removed_columns', 0) }} columns
+                    </span>
+                </p>
+                <p class="text-xs text-gray-500 dark:text-gray-400 mt-1">
+                    Removed {{ terminal_trim.get('left_removed', 0) }} leading and
+                    {{ terminal_trim.get('right_removed', 0) }} trailing columns covered by fewer than
+                    {{ terminal_trim.get('min_covered_sequences', 3) }} sequences; internal gaps and
+                    multi-sequence terminal regions were kept.
+                </p>
                 {% endif %}
                 {% if job_details.get('mcmc_generations') %}
                 <p><span class="opacity-70 w-32 inline-block">MCMC Generations:</span> <span class="font-medium">{{
@@ -600,7 +700,8 @@
 
                 {% for key, value in job_details.items() %}
                 {% if key not in ['alignment_method', 'tree_method', 'trimming_method', 'tree_model', 'bootstrap',
-                'mcmc_generations', 'sequences', 'accessions', 'sequence', 'notes', 'alignment_options', 'input_type']
+                'mcmc_generations', 'sequences', 'accessions', 'sequence', 'notes', 'alignment_options', 'input_type',
+                'trim_terminal_overhangs', 'trimming_details']
                 and value %}
                 {% if key == 'blast_mode' %}
                 <p><span class="opacity-70 w-24 inline-block">BLAST:</span> {{ value|upper }}</p>
@@ -719,7 +820,7 @@
 
 <script src="{{ url_for('static', filename='js/tree_viewer_api.js') }}?v=2"></script>
 
-<script src="{{ url_for('static', filename='js/tree_viewer_controller.js') }}?v=42"></script>
+<script src="{{ url_for('static', filename='js/tree_viewer_controller.js') }}?v=43"></script>
 
 {% include 'partials/alignment_viewer_modal.html' %}
 

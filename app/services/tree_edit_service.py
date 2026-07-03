@@ -3,9 +3,10 @@ import json
 import logging
 import shutil
 from pathlib import Path
-from typing import Dict, Any, List, Optional, Set
+from typing import Dict, Any, List, Optional, Set, Tuple
 from app.config import Config
 from app.models import JobParams, AlignmentParams, TrimmingParams, TreeBuilderParams
+from app.services.security_utils import coerce_bool
 from app.services.subprocess_utils import run_command
 
 # Try to import BioPython
@@ -152,6 +153,10 @@ def _int_param(value, default: int) -> int:
         return default
 
 
+def _bool_param(params_dict: Dict[str, Any], key: str, default: bool) -> bool:
+    return coerce_bool(params_dict.get(key), default)[0]
+
+
 def build_recompute_job_params(params_dict: Dict[str, Any]) -> JobParams:
     """Build the dataclass params used by tree recomputation from stored job JSON."""
     align_params = AlignmentParams(
@@ -160,7 +165,8 @@ def build_recompute_job_params(params_dict: Dict[str, Any]) -> JobParams:
     )
 
     trim_params = TrimmingParams(
-        method=params_dict.get("trimming_method", "none")
+        method=params_dict.get("trimming_method", "none"),
+        trim_terminal_overhangs=_bool_param(params_dict, "trim_terminal_overhangs", True),
     )
 
     tree_params = TreeBuilderParams(
@@ -173,10 +179,10 @@ def build_recompute_job_params(params_dict: Dict[str, Any]) -> JobParams:
         run_preset=params_dict.get("run_preset", "fast_good"),
         bootstrap_preset=params_dict.get("bootstrap_preset", "standard"),
         bootstrap_cap=params_dict.get("bootstrap_cap"),
-        enable_bootstrap=params_dict.get("enable_bootstrap", True),
+        enable_bootstrap=_bool_param(params_dict, "enable_bootstrap", True),
         start_tree_override=params_dict.get("start_tree_override"),
-        moose_enabled=params_dict.get("moose_enabled", False),
-        early_stopping=params_dict.get("early_stopping", False),
+        moose_enabled=_bool_param(params_dict, "moose_enabled", False),
+        early_stopping=_bool_param(params_dict, "early_stopping", False),
         seed=params_dict.get("seed"),
         outgroup=params_dict.get("outgroup")
     )
@@ -477,6 +483,43 @@ def apply_state_to_structure(node: Dict, renames: Dict, pruned_taxa: Set[str]):
         for child in node["children"]:
             apply_state_to_structure(child, renames, pruned_taxa)
 
+
+def _write_rerooted_tree(job_dir: Path, tree_json: Dict, tree, root_target: str) -> Dict:
+    """Persist an already rerooted Bio.Phylo tree and mirror it into tree state."""
+    ladderize_tree(tree)
+    _drop_confidence_when_named(tree)
+
+    new_structure = _clade_to_json(tree.root)
+
+    tree_json["root"] = root_target
+    tree_json["root_mode"] = "TIP"
+    tree_json["root_target"] = root_target
+    tree_json["current_tree"] = "pruned"
+    tree_json["tree_structure"] = new_structure
+    tree_json["is_midpoint_rooted"] = False
+    tree_json["needs_sequence_of_interest"] = False
+    tree_json["rooting_info"] = {
+        "query_tip": tree_json.get("sequence_of_interest"),
+        "chosen_root_target": root_target,
+        "chosen_by": "manual",
+        "reason": "user_manual_reroot",
+        "warnings": [],
+        "candidate_count": 0,
+        "rejected_count": 0,
+    }
+
+    renames = tree_json.get("renames", {})
+    pruned_taxa = set(tree_json.get("pruned_taxa", []))
+    apply_state_to_structure(new_structure, renames, pruned_taxa)
+
+    valid_path = job_dir / "tree"
+    valid_path.mkdir(parents=True, exist_ok=True)
+    Phylo.write(tree, str(valid_path / "tree_pruned.newick"), "newick")
+    logging.info(f"Successfully wrote rerooted tree to {valid_path / 'tree_pruned.newick'}")
+
+    return tree_json
+
+
 def reroot_tree(job_dir: Path, tree_json: Dict, root_target: str) -> Dict:
     """
     Reroot using any valid node (tip or internal). 
@@ -522,56 +565,86 @@ def reroot_tree(job_dir: Path, tree_json: Dict, root_target: str) -> Dict:
         
         # Reroot
         tree.root_with_outgroup(target_clade)
-        
-        # Ladderize (Deterministic)
-        ladderize_tree(tree)
-
-        # FIX: Ensure confidence is dropped for named nodes before saving/returning
-        _drop_confidence_when_named(tree)
-
-        # Build structure
-        new_structure = _clade_to_json(tree.root)
-        
-        # Update state
-        tree_json["root"] = root_target
-        tree_json["root_mode"] = "TIP"
-        tree_json["root_target"] = root_target
-        tree_json["current_tree"] = "pruned"
-        tree_json["tree_structure"] = new_structure
-        # Alan 6/2/26 - Rerooting on a node supersedes midpoint rooting and is a deliberate
-        # manual root that needs no focal tip; keep status state honest so a reload doesn't
-        # show a stale Midpoint "(on)" or an Auto/SOI prompt. apply_rooting_mode's "manual"
-        # branch overwrites these with equivalent values when it drives the reroot.
-        tree_json["is_midpoint_rooted"] = False
-        tree_json["needs_sequence_of_interest"] = False
-        tree_json["rooting_info"] = {
-            "query_tip": tree_json.get("sequence_of_interest"),
-            "chosen_root_target": root_target,
-            "chosen_by": "manual",
-            "reason": "user_manual_reroot",
-            "warnings": [],
-            "candidate_count": 0,
-            "rejected_count": 0,
-        }
-        
-        # Re-apply metadata
-        renames = tree_json.get("renames", {})
-        pruned_taxa = set(tree_json.get("pruned_taxa", []))
-        apply_state_to_structure(new_structure, renames, pruned_taxa)
-        
-        # Save physical file
-        valid_path = job_dir / "tree"
-        valid_path.mkdir(parents=True, exist_ok=True)
-        Phylo.write(tree, str(valid_path / "tree_pruned.newick"), "newick")
-        logging.info(f"Successfully wrote rerooted tree to {valid_path / 'tree_pruned.newick'}")
-        
-        return tree_json
+        return _write_rerooted_tree(job_dir, tree_json, tree, root_target)
         
     except Exception as e:
         logger.error(f"Reroot failed: {e}")
         raise
 
     return tree_json
+
+
+def _find_clade_path_by_tip(clade, tip_name: str, path: Optional[List[Any]] = None):
+    path = list(path or [])
+    current = path + [clade]
+    if clade.name == tip_name and not getattr(clade, "clades", None):
+        return current
+    for child in getattr(clade, "clades", []) or []:
+        found = _find_clade_path_by_tip(child, tip_name, current)
+        if found:
+            return found
+    return None
+
+
+def _terminal_names(clade) -> List[str]:
+    return [terminal.name for terminal in clade.get_terminals() if terminal.name]
+
+
+def _best_taxon_distinct_outgroup_clade(tree, focal_tip: str,
+                                        target_tip: str) -> Tuple[Any, Dict[str, Any]]:
+    from app.services.tree_rooting_service import _extract_binomial
+
+    focal_taxon = _extract_binomial(focal_tip)
+    target_taxon = _extract_binomial(target_tip)
+    if not focal_taxon or not target_taxon or focal_taxon == target_taxon:
+        target = next((t for t in tree.get_terminals() if t.name == target_tip), None)
+        return target, {"tip_count": 1, "rooted_on": "target_tip"}
+
+    path = _find_clade_path_by_tip(tree.root, target_tip)
+    if not path:
+        return None, {"tip_count": 0, "rooted_on": "target_missing"}
+
+    best = None
+    best_names: List[str] = []
+    for clade in path:
+        names = _terminal_names(clade)
+        if target_tip not in names or focal_tip in names:
+            continue
+        has_focal_taxon = any(_extract_binomial(name) == focal_taxon for name in names)
+        if has_focal_taxon:
+            continue
+        if len(names) > len(best_names):
+            best = clade
+            best_names = names
+
+    if best is None:
+        best = path[-1]
+        best_names = _terminal_names(best)
+
+    return best, {
+        "tip_count": len(best_names),
+        "rooted_on": "taxon_distinct_clade" if len(best_names) > 1 else "target_tip",
+        "focal_taxon": " ".join(focal_taxon),
+        "target_taxon": " ".join(target_taxon),
+    }
+
+
+def reroot_tree_on_best_outgroup_clade(job_dir: Path, tree_json: Dict,
+                                       focal_tip: str,
+                                       target_tip: str) -> Tuple[Dict, Dict[str, Any]]:
+    """Root Auto mode on the best clade around a distinct-taxon target tip."""
+    if not HAS_BIOPYTHON:
+        return tree_json, {"tip_count": 0, "rooted_on": "biopython_unavailable"}
+
+    input_path = _editable_tree_input_path(job_dir, "auto-root")
+    tree = Phylo.read(str(input_path), "newick")
+    target_clade, clade_info = _best_taxon_distinct_outgroup_clade(tree, focal_tip, target_tip)
+    if target_clade is None:
+        raise ValueError(f"Root target not found: {target_tip}")
+
+    tree.root_with_outgroup(target_clade)
+    return _write_rerooted_tree(job_dir, tree_json, tree, target_tip), clade_info
+
 
 def midpoint_root(job_dir: Path, tree_json: Dict) -> Dict:
     """
@@ -735,6 +808,89 @@ def _count_fasta_records(path: Path) -> int:
         return 0
 
 
+def _count_fasta_columns(path: Path) -> int:
+    """Alignment width = length of the first record's sequence."""
+    try:
+        seq_len = 0
+        with open(path, "r") as f:
+            in_first = False
+            for line in f:
+                if line.startswith(">"):
+                    if in_first:
+                        break
+                    in_first = True
+                    continue
+                if in_first:
+                    seq_len += len(line.strip())
+        return seq_len
+    except Exception:
+        return 0
+
+
+def _reapply_rooting_after_recompute(job_dir: Path, tree_json: Dict[str, Any],
+                                     previous_mode: Optional[str],
+                                     previous_target: Optional[str],
+                                     task_logger=None) -> Dict[str, Any]:
+    """Reapply the viewer's rooting intent after recompute writes a fresh tree."""
+    mode = (previous_mode or "").lower()
+    if not mode or mode == "original":
+        return tree_json
+
+    try:
+        if mode in ("auto", "most_divergent_hit", "midpoint", "unrooted"):
+            return apply_rooting_mode(job_dir, tree_json, mode)
+        if mode in ("manual", "tip", "outgroup") and previous_target:
+            return apply_rooting_mode(job_dir, tree_json, "manual", target=previous_target)
+
+        # Reached when a manual/tip/outgroup mode has no usable target (e.g. the
+        # target tip was pruned in this recompute) or the stored mode is
+        # unrecognized. Don't silently keep the tree builder's arbitrary root:
+        # log it and record that the prior rooting intent couldn't be reapplied.
+        log = task_logger or logger
+        reason = (
+            "previous rooting target no longer present"
+            if mode in ("manual", "tip", "outgroup")
+            else f"unrecognized rooting mode: {mode}"
+        )
+        log.warning(
+            "Could not reapply %r rooting after recompute (target=%r): %s",
+            mode, previous_target, reason,
+        )
+        tree_json["root"] = None
+        tree_json["root_target"] = None
+        tree_json["root_mode"] = ""
+        tree_json["is_midpoint_rooted"] = False
+        tree_json["needs_sequence_of_interest"] = False
+        tree_json["rooting_info"] = {
+            "query_tip": tree_json.get("sequence_of_interest"),
+            "chosen_root_target": previous_target,
+            "chosen_by": "recompute_rooting_unresolved",
+            "reason": f"reapply_unresolved:{mode}",
+            "warnings": [reason],
+            "candidate_count": 0,
+            "rejected_count": 0,
+        }
+        return tree_json
+    except Exception as e:
+        log = task_logger or logger
+        log.warning("Failed to reapply %s rooting after recompute: %s", mode, e)
+        tree_json["root"] = None
+        tree_json["root_target"] = None
+        tree_json["root_mode"] = ""
+        tree_json["is_midpoint_rooted"] = False
+        tree_json["needs_sequence_of_interest"] = False
+        tree_json["rooting_info"] = {
+            "query_tip": tree_json.get("sequence_of_interest"),
+            "chosen_root_target": previous_target,
+            "chosen_by": "recompute_rooting_failed",
+            "reason": f"reapply_failed:{mode}",
+            "warnings": [str(e)],
+            "candidate_count": 0,
+            "rejected_count": 0,
+        }
+    return tree_json
+
+
 def recompute_tree(
     job_dir: Path,
     job_params: JobParams,
@@ -790,6 +946,8 @@ def recompute_tree(
     
     # 1. Load state
     tree_json = load_tree_state(job_dir)
+    previous_root_mode = tree_json.get("root_mode")
+    previous_root_target = tree_json.get("root_target") or tree_json.get("root")
     
     # 2. Extract pruned FASTA
     # We need the original input (unaligned)
@@ -835,17 +993,35 @@ def recompute_tree(
     trim_params = job_params.trimming_params or TrimmingParams(method="none")
     alignment_pruned_trimmed_path = job_dir / "alignment" / "alignment_pruned_trimmed.fasta"
     
-    from app.services.trimming_service import run_trimming
+    from app.services.trimming_service import run_trimming, describe_trim_step, format_trimming_detail
     trim_method = (trim_params.method or "none").lower()
-    if trim_method == "none":
-        run_trimming(alignment_pruned_aligned_path, alignment_pruned_trimmed_path, trim_method, config, logger, job_id=event_job_id)
-        skip_step("trim", "Trimming (skipped)")
+    trim_terminal_overhangs = bool(trim_params.trim_terminal_overhangs)
+    should_trim, trim_label, trim_tool = describe_trim_step(trim_method, trim_terminal_overhangs)
+    if not should_trim:
+        run_trimming(
+            alignment_pruned_aligned_path,
+            alignment_pruned_trimmed_path,
+            trim_method,
+            config,
+            logger,
+            job_id=event_job_id,
+            trim_terminal_overhangs=False,
+        )
+        skip_step("trim", trim_label)
         overview("Trimming skipped (method: none)")
     else:
-        trim_label = f"Trimming ({trim_method})"
-        start_step("trim", trim_label, "", tool=trim_method)
-        run_trimming(alignment_pruned_aligned_path, alignment_pruned_trimmed_path, trim_method, config, logger, job_id=event_job_id)
-        trim_detail = f"{_count_fasta_records(alignment_pruned_trimmed_path)} sequence(s) retained"
+        start_step("trim", trim_label, "", tool=trim_tool)
+        trim_stats = run_trimming(
+            alignment_pruned_aligned_path,
+            alignment_pruned_trimmed_path,
+            trim_method,
+            config,
+            logger,
+            job_id=event_job_id,
+            trim_terminal_overhangs=trim_terminal_overhangs,
+        )
+        retained_columns = _count_fasta_columns(alignment_pruned_trimmed_path)
+        trim_detail = format_trimming_detail(trim_method, trim_stats, retained_columns)
         finish_step("trim", trim_detail)
         overview(trim_detail)
     
@@ -876,6 +1052,13 @@ def recompute_tree(
     # Yes, parse the new tree
     new_structure = parse_newick_to_json(tree_pruned_newick)
     tree_json["tree_structure"] = new_structure
+    tree_json = _reapply_rooting_after_recompute(
+        job_dir,
+        tree_json,
+        previous_root_mode,
+        previous_root_target,
+        task_logger=logger,
+    )
     save_tree_state(job_dir, tree_json)
     
     # Save metadata
@@ -994,7 +1177,18 @@ def apply_rooting_mode(job_dir: Path, tree_json: Dict, mode: str,
         return tree_json
 
     # Successful auto/most_divergent_hit pick.
-    tree_json = reroot_tree(job_dir, tree_json, choice.target_name)
+    clade_info = {}
+    if choice.mode == "auto" and choice.query_tip:
+        try:
+            tree_json, clade_info = reroot_tree_on_best_outgroup_clade(
+                job_dir, tree_json, choice.query_tip, choice.target_name
+            )
+        except Exception as e:
+            logger.warning("Auto clade rooting failed; falling back to tip root: %s", e)
+            clade_info = {"rooted_on": "target_tip_fallback", "warning": str(e)}
+            tree_json = reroot_tree(job_dir, tree_json, choice.target_name)
+    else:
+        tree_json = reroot_tree(job_dir, tree_json, choice.target_name)
     tree_json["root_mode"] = choice.mode
     tree_json["root_target"] = choice.target_name
     # Auto root reroots on a chosen tip, not the midpoint; clear the flag so the
@@ -1002,6 +1196,8 @@ def apply_rooting_mode(job_dir: Path, tree_json: Dict, mode: str,
     tree_json["is_midpoint_rooted"] = False
     tree_json["needs_sequence_of_interest"] = False
     tree_json["rooting_info"] = choice.to_info(choice.mode)
+    if clade_info:
+        tree_json["rooting_info"]["root_clade"] = clade_info
     return tree_json
 
 

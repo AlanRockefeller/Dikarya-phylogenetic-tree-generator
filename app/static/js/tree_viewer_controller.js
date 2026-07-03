@@ -875,9 +875,83 @@ document.addEventListener('DOMContentLoaded', async () => {
         const groupNewColorInput = getEl('input-color-group-new-color');
         const btnCreateColorGroup = getEl('btn-create-color-group');
         const btnCancelColorGroup = getEl('btn-cancel-color-group');
+        // Alan 7/3/26 - Cache quick preset swatches for one-click coloring of the current selection.
+        const colorPresetButtons = Array.from(document.querySelectorAll('.btn-color-preset'));
+        // Alan 7/3/26 - Cache popover preset swatches so manual group creation can use named colors without typing hex values.
+        const colorPresetCreateButtons = Array.from(document.querySelectorAll('.btn-color-preset-create'));
+        // Alan 7/3/26 - Track when the shared native color picker should apply a custom color to selected tips.
+        let colorInputAppliesToSelection = false;
 
         // Alan 5/12/26 - Read the current transient selection count defensively for chip actions.
         const getCurrentSelectionCount = () => viewer?.getSelectionCount?.() || 0;
+
+        // Alan 7/3/26 - Normalize swatch and custom-picker colors before saving them as reusable color groups.
+        const normalizeQuickColor = (color, fallback = '#1f77b4') => {
+            // Alan 7/3/26 - Accept only full hex values because tree labels are styled inline in SVG.
+            const raw = typeof color === 'string' ? color.trim().toLowerCase() : '';
+            // Alan 7/3/26 - Use the requested hex color when it is safe for inline SVG styling.
+            if (/^#[0-9a-f]{6}$/.test(raw)) return raw;
+            // Alan 7/3/26 - Fall back to the existing default blue for malformed preset metadata.
+            return fallback;
+        };
+
+        // Alan 7/3/26 - Find an existing color group by human-facing name without creating case variants.
+        const findColorGroupByName = (requestedName) => {
+            // Alan 7/3/26 - Normalize the requested name for a case-insensitive comparison.
+            const target = (requestedName || '').trim().toLowerCase();
+            // Alan 7/3/26 - Empty names cannot match a real saved group.
+            if (!target || !viewer?.getSelectionSetNames) return null;
+            // Alan 7/3/26 - Reuse the first matching saved group so preset clicks stay idempotent.
+            return viewer.getSelectionSetNames().find(name => name.toLowerCase() === target) || null;
+        };
+
+        // Alan 7/3/26 - Choose a non-conflicting group name when a preset base name is already taken.
+        const nextAvailableColorGroupName = (baseName) => {
+            // Alan 7/3/26 - Build a lowercase lookup from current color group names.
+            const existing = new Set((viewer?.getSelectionSetNames?.() || []).map(name => name.toLowerCase()));
+            // Alan 7/3/26 - Start with the requested display name for clean preset chips.
+            let candidate = (baseName || 'Color').trim() || 'Color';
+            // Alan 7/3/26 - Add a numeric suffix only when the base name already exists.
+            let suffix = 2;
+            // Alan 7/3/26 - Keep suffixing until createSelectionSet can succeed without overwriting another group.
+            while (existing.has(candidate.toLowerCase())) {
+                // Alan 7/3/26 - Append a compact suffix that reads well in the existing chip strip.
+                candidate = `${baseName} ${suffix}`;
+                // Alan 7/3/26 - Advance the suffix for any additional collision.
+                suffix += 1;
+            }
+            // Alan 7/3/26 - Return the final display name for creation.
+            return candidate;
+        };
+
+        // Alan 7/3/26 - Create or reuse a normal saved color group for quick preset/custom color actions.
+        const ensureQuickColorGroup = (baseName, color) => {
+            // Alan 7/3/26 - Quick colors require an initialized editable viewer.
+            if (!viewer) return null;
+            // Alan 7/3/26 - Normalize the color once before using it for group creation or update.
+            const normalizedColor = normalizeQuickColor(color);
+            // Alan 7/3/26 - Use the requested swatch name as the saved chip label.
+            const requestedName = (baseName || 'Color').trim() || 'Color';
+            // Alan 7/3/26 - Prefer reusing an existing named group so repeated swatch clicks do not duplicate chips.
+            const existingName = findColorGroupByName(requestedName);
+            // Alan 7/3/26 - Existing preset groups are updated to the clicked swatch color for predictable results.
+            if (existingName) {
+                // Alan 7/3/26 - Persist the swatch color on the reused group.
+                viewer.setSelectionSetColor(existingName, normalizedColor);
+                // Alan 7/3/26 - Activate the reused group before applying selected tips.
+                viewer.setActiveSelectionSet(existingName);
+                // Alan 7/3/26 - Tell callers this was a reuse rather than a new group.
+                return { name: existingName, created: false };
+            }
+            // Alan 7/3/26 - Pick a clean name for the new preset-backed group.
+            const groupName = nextAvailableColorGroupName(requestedName);
+            // Alan 7/3/26 - Create the group through the existing persistence-aware viewer API.
+            if (!viewer.createSelectionSet(groupName, normalizedColor)) return null;
+            // Alan 7/3/26 - Make the new group active so the existing apply path colors the current selection.
+            viewer.setActiveSelectionSet(groupName);
+            // Alan 7/3/26 - Tell callers a new user-visible chip was created.
+            return { name: groupName, created: true };
+        };
 
         // Alan 5/12/26 - Hide the new-color-group popover after create/cancel.
         const hideColorGroupPopover = () => {
@@ -909,6 +983,32 @@ document.addEventListener('DOMContentLoaded', async () => {
             showStatus(`${prefix} ${changed} sequence${changed === 1 ? '' : 's'} in "${activeName}".`, "success", 1800);
             // Alan 5/12/26 - Return count for callers that need no-op handling.
             return changed;
+        };
+
+        // Alan 7/3/26 - Apply a preset/custom quick color to the current selection through normal color groups.
+        const applyQuickColorToSelection = async (name, color) => {
+            // Alan 7/3/26 - Ignore quick color actions before the editable viewer is ready.
+            if (!viewer || window.VIEW_ONLY || isProcessing) return;
+            // Alan 7/3/26 - Require a current selection so swatches behave as direct mark buttons.
+            if (getCurrentSelectionCount() === 0) {
+                // Alan 7/3/26 - Use the existing status surface instead of adding persistent helper copy.
+                showStatus("Select sequences first, then choose a color.", "warning", 2200);
+                // Alan 7/3/26 - Stop before creating empty preset groups.
+                return;
+            }
+            // Alan 7/3/26 - Create or reuse the saved color group represented by the quick color.
+            const group = ensureQuickColorGroup(name, color);
+            // Alan 7/3/26 - Surface a guarded failure if group creation was rejected.
+            if (!group) {
+                // Alan 7/3/26 - Keep the message short because the failure is unlikely and non-destructive.
+                showStatus("Could not create color group.", "danger", 2500);
+                // Alan 7/3/26 - Stop before attempting to persist an incomplete color action.
+                return;
+            }
+            // Alan 7/3/26 - Refresh chips so a newly created preset group appears before the selection is consumed.
+            updateSelectionSetUI();
+            // Alan 7/3/26 - Apply through the existing one-color-per-tip persistence flow.
+            await applyActiveColorGroupToSelection(group.created ? group.name : null);
         };
 
         // Helper to sync UI with viewer selection set state (also assigned to outer scope for loadTree access)
@@ -991,6 +1091,26 @@ document.addEventListener('DOMContentLoaded', async () => {
                 // Alan 5/12/26 - Default remains protected and all group edits lock in view-only/processing states.
                 btnDeleteSet.disabled = disableGroupEdits || (active === 'Default');
             }
+            // Alan 7/3/26 - Keep preset swatches tied to the current selection so they read as direct mark buttons.
+            const currentSelectionCount = getCurrentSelectionCount();
+            // Alan 7/3/26 - Disable quick swatches when no selected tips can be colored or edits are locked.
+            colorPresetButtons.forEach((button) => {
+                // Alan 7/3/26 - Resolve the preset name from markup for compact dynamic tooltips.
+                const presetName = button.dataset.presetName || 'Color';
+                // Alan 7/3/26 - Swatches need a selection because they apply immediately instead of setting a mode.
+                const disabled = disableGroupEdits || currentSelectionCount === 0;
+                // Alan 7/3/26 - Reflect the action availability on the native button state.
+                button.disabled = disabled;
+                // Alan 7/3/26 - Explain the exact quick action without adding visible toolbar text.
+                button.title = currentSelectionCount > 0
+                    ? `Mark ${currentSelectionCount} selected sequence${currentSelectionCount === 1 ? '' : 's'} ${presetName.toLowerCase()}`
+                    : `Select sequences to mark ${presetName.toLowerCase()}`;
+            });
+            // Alan 7/3/26 - Make the palette icon switch between quick custom coloring and active-group editing.
+            if (btnEditSetColor) {
+                // Alan 7/3/26 - Use a context-sensitive tooltip because the button now has two useful flows.
+                btnEditSetColor.title = currentSelectionCount > 0 ? 'Choose a custom color for selected sequences' : 'Change Active Color Group Color';
+            }
         }
 
         // Initial sync after viewer is ready
@@ -1065,6 +1185,36 @@ document.addEventListener('DOMContentLoaded', async () => {
             });
         }
 
+        // Alan 7/3/26 - Wire preset swatches as one-click color actions for the current selection.
+        colorPresetButtons.forEach((button) => {
+            // Alan 7/3/26 - Each swatch creates/reuses a normal saved color group behind the scenes.
+            button.addEventListener('click', async () => {
+                // Alan 7/3/26 - Ignore disabled or stale swatch clicks during processing/view-only states.
+                if (!viewer || button.disabled) return;
+                // Alan 7/3/26 - Read the swatch metadata from the template.
+                const presetName = button.dataset.presetName || 'Color';
+                // Alan 7/3/26 - Read the preset hex value from the template.
+                const presetColor = button.dataset.presetColor || '#1f77b4';
+                // Alan 7/3/26 - Apply the selected swatch to the current selection.
+                await applyQuickColorToSelection(presetName, presetColor);
+            });
+        });
+
+        // Alan 7/3/26 - Let preset swatches inside the creation popover fill color and name fields.
+        colorPresetCreateButtons.forEach((button) => {
+            // Alan 7/3/26 - Popover swatches stay local to manual color-group creation.
+            button.addEventListener('click', () => {
+                // Alan 7/3/26 - Ignore stale popover clicks before controls exist.
+                if (!groupNewColorInput) return;
+                // Alan 7/3/26 - Copy the swatch color into the native color field.
+                groupNewColorInput.value = normalizeQuickColor(button.dataset.presetColor || '#1f77b4');
+                // Alan 7/3/26 - Prefill the group name when it is blank so presets avoid unnecessary typing.
+                if (groupNameInput && !groupNameInput.value.trim()) groupNameInput.value = nextAvailableColorGroupName(button.dataset.presetName || 'Color');
+                // Alan 7/3/26 - Keep keyboard focus near the field a user may still want to customize.
+                groupNameInput?.focus();
+            });
+        });
+
         // New Set button
         btnNewSet?.addEventListener('click', () => {
             // Alan 5/12/26 - Do not open creation UI before the viewer is ready.
@@ -1124,6 +1274,8 @@ document.addEventListener('DOMContentLoaded', async () => {
         btnEditSetColor?.addEventListener('click', () => {
             // Alan 5/12/26 - Ignore color edits before the viewer is ready.
             if (!viewer || !colorInput || window.VIEW_ONLY || isProcessing) return;
+            // Alan 7/3/26 - When tips are selected, the palette picker should apply a custom quick color.
+            colorInputAppliesToSelection = getCurrentSelectionCount() > 0;
             // Alan 5/12/26 - Sync the picker to the active group before opening it.
             colorInput.value = viewer.getSelectionSetColor(viewer.getActiveSelectionSet()) || '#1f77b4';
             // Alan 5/12/26 - Open the browser-native color picker.
@@ -1134,10 +1286,23 @@ document.addEventListener('DOMContentLoaded', async () => {
         colorInput?.addEventListener('change', async () => {
             // Alan 5/12/26 - Guard against stale input events.
             if (!viewer || window.VIEW_ONLY || isProcessing) return;
+            // Alan 7/3/26 - Normalize the chosen color before either quick-apply or group-edit paths.
+            const chosenColor = normalizeQuickColor(colorInput.value);
+            // Alan 7/3/26 - Apply native picker colors directly when the palette was opened with tips selected.
+            if (colorInputAppliesToSelection && getCurrentSelectionCount() > 0) {
+                // Alan 7/3/26 - Reset the one-shot mode before the async save path can be re-entered.
+                colorInputAppliesToSelection = false;
+                // Alan 7/3/26 - Use a readable chip name for arbitrary custom colors.
+                await applyQuickColorToSelection(`Custom ${chosenColor.toUpperCase()}`, chosenColor);
+                // Alan 7/3/26 - Stop before editing the previously active group color.
+                return;
+            }
+            // Alan 7/3/26 - Reset one-shot custom coloring when the picker is used for active-group editing.
+            colorInputAppliesToSelection = false;
             // Alan 5/12/26 - Resolve the active group at the time of color edit.
             const active = viewer.getActiveSelectionSet();
             // Alan 5/12/26 - Save the chosen color to the active group.
-            if (!viewer.setSelectionSetColor(active, colorInput.value)) return;
+            if (!viewer.setSelectionSetColor(active, chosenColor)) return;
             // Alan 5/12/26 - Re-render chips with the new color.
             updateSelectionSetUI();
             // Alan 5/12/26 - Persist color metadata.

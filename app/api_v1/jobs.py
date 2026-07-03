@@ -52,6 +52,11 @@ def serialize_job(job):
         "params": {
             "alignment_method": info.get("alignment_method") or (job.metrics or {}).get("alignment_method"),
             "trimming_method":  info.get("trimming_method")  or (job.metrics or {}).get("trimming_method"),
+            "trim_terminal_overhangs": (
+                info.get("trim_terminal_overhangs")
+                if info.get("trim_terminal_overhangs") is not None
+                else (job.metrics or {}).get("trim_terminal_overhangs")
+            ),
             "tree_method":      info.get("tree_method")      or (job.metrics or {}).get("tree_method"),
             "tree_model":       info.get("tree_model"),
             "bootstrap":        info.get("bootstrap"),
