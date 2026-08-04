@@ -121,13 +121,19 @@ class TestDnaSequenceCleanup(unittest.TestCase):
         result = clean_dna_sequence(seq)
         self.assertEqual(result, dna.upper())
 
-    def test_clean_sequence_inline_header(self):
-        """Inline FASTA header (header+sequence on same line) should extract sequence."""
+    def test_clean_sequence_inline_header_with_separator(self):
+        """A clearly separated same-line sequence should be recovered."""
         dna = "AAAGTCGTAACAAGGTTTCCGTAGGTGAACCTGCGGAAGGATCATTATTGAATGAACTTGGCATGGTTGT" * 2  # 140bp
-        # 'text' ends in 't' (valid), so use 'info'
-        seq = f">description_info{dna}"
+        seq = f">description_info {dna}"
         result = clean_dna_sequence(seq)
         self.assertEqual(result, dna.upper())
+
+    def test_clean_sequence_glued_header_rejected(self):
+        """A sequence glued directly to a FASTA header is ambiguous and should be rejected."""
+        dna = "AAAGTCGTAACAAGGTTTCCGTAGGTGAACCTGCGGAAGGATCATTATTGAATGAACTTGGCATGGTTGT" * 2
+        seq = f">description_info{dna}"
+        result = clean_dna_sequence(seq)
+        self.assertEqual(result, "")
 
     def test_clean_sequence_species_name_prefix(self):
         """Species name prefix should be stripped, longest contiguous run extracted."""

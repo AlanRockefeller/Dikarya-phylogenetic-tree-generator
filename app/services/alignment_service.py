@@ -97,6 +97,40 @@ def _make_log_callback(job_id: Optional[str], step: str, stream: str):
     return callback
 
 
+def _restore_mafft_direction_headers(
+    input_fasta: Path,
+    output_fasta: Path,
+    logger,
+) -> int:
+    """Remove MAFFT's ``_R_`` marker while preserving genuine input headers."""
+    input_headers = {
+        line[1:].strip()
+        for line in input_fasta.read_text(encoding="utf-8", errors="replace").splitlines()
+        if line.startswith(">")
+    }
+    output_lines = output_fasta.read_text(encoding="utf-8", errors="replace").splitlines(keepends=True)
+    restored_count = 0
+
+    for index, line in enumerate(output_lines):
+        header_line = line.rstrip("\r\n")
+        if not header_line.startswith(">_R_"):
+            continue
+
+        restored_header = header_line[4:]
+        if restored_header not in input_headers:
+            continue
+
+        newline = line[len(header_line):]
+        output_lines[index] = f">{restored_header}{newline}"
+        restored_count += 1
+
+    if restored_count:
+        output_fasta.write_text("".join(output_lines), encoding="utf-8")
+        logger.info("Restored %s MAFFT direction-marked header(s)", restored_count)
+
+    return restored_count
+
+
 def _run_mafft(
     input_fasta: Path,
     output_fasta: Path,
@@ -163,6 +197,8 @@ def _run_mafft(
             
         with open(output_fasta, "w") as f:
             f.write(stdout)
+
+    _restore_mafft_direction_headers(input_fasta, output_fasta, logger)
 
 
 def _run_muscle(

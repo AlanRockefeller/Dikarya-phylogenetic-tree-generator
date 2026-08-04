@@ -3,6 +3,7 @@
 import unittest
 import sys
 import importlib.util
+from unittest.mock import Mock, patch
 
 # Load security_utils relative to this test file
 import os
@@ -39,28 +40,44 @@ class TestJobIdValidation(unittest.TestCase):
         self.assertFalse(security_utils.validate_job_id("test"))
 
 
-class TestBlastQueryValidation(unittest.TestCase):
-    """Test BLAST query validation."""
-    
-    def test_valid_sequence(self):
-        """Valid nucleotide sequence should pass."""
-        is_valid, _ = security_utils.validate_blast_query("ATGCGATCGATCG")
-        self.assertTrue(is_valid)
-    
-    def test_shell_injection_rejected(self):
-        """Shell metacharacters should be rejected."""
-        # Note: | is now allowed (common in FASTA headers), preventing shell injection 
-        # relies on how the query is used (passed as file/arg, not raw shell string).
-        patterns = ['; rm -rf /', '`whoami`', '$(id)']
-        for pattern in patterns:
-            is_valid, _ = security_utils.validate_blast_query(pattern)
-            self.assertFalse(is_valid, f"Should reject: {pattern}")
+class TestBlastRequestSafety(unittest.TestCase):
+    """Test the current BLAST request boundary rather than a removed helper."""
 
-    def test_fasta_header_allowed(self):
-        """Standard FASTA headers with pipes should be allowed."""
-        valid_query = ">gi|12345|ref|NC_000000| Some Organism\nATCG..."
-        is_valid, _ = security_utils.validate_blast_query(valid_query)
-        self.assertTrue(is_valid, "Should allow FASTA headers with pipes")
+    def test_queries_are_sent_as_http_form_data(self):
+        """Sequences, FASTA headers, and metacharacters remain inert HTTP data."""
+        from app.services import blast_service
+
+        response = Mock()
+        response.text = "RID = TEST_RID\nRTOE = 1"
+        queries = [
+            "ATGCGATCGATCG",
+            ">gi|12345|ref|NC_000000| Some Organism\nATCG...",
+            "; rm -rf / `whoami` $(id)",
+        ]
+
+        for query in queries:
+            with self.subTest(query=query), patch.object(
+                blast_service, "_ncbi_request", return_value=response
+            ) as request:
+                rid, rtoe = blast_service._submit_blast_request(query)
+
+                self.assertEqual((rid, rtoe), ("TEST_RID", 1))
+                request.assert_called_once()
+                args, kwargs = request.call_args
+                self.assertEqual(args, ("POST", blast_service.NCBI_BLAST_URL))
+                self.assertEqual(kwargs["data"]["QUERY"], query)
+
+    def test_query_length_limit_applies_before_http_request(self):
+        """An oversized BLAST query should be rejected without a network call."""
+        from app.services import blast_service
+
+        class ShortQueryConfig:
+            BLAST_MAX_QUERY_LENGTH = 5
+
+        with patch.object(blast_service, "_ncbi_request") as request:
+            with self.assertRaisesRegex(ValueError, "Query too long"):
+                blast_service._submit_blast_request("ATGCGC", ShortQueryConfig)
+            request.assert_not_called()
 
 
 if __name__ == '__main__':

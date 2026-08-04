@@ -7,6 +7,12 @@
 
     const DEBUG_MODE = new URLSearchParams(window.location.search).has('debug');
 
+    // Alan 7/15/26 - Hide pipeline-only MAFFT and RiC annotations from tip labels while preserving stable tree IDs.
+    function cleanTipDisplayName(name) {
+        if (typeof name !== 'string') return name;
+        return name.replace(/^_R_/, '').replace(/\s+RiC(?:\s+\d+)?\s*$/i, '').trim();
+    }
+
     // --- ZOOM PANIC STOP ---
     if (!window.__dikarya_zoom_panic_stop_attached) {
         window.__dikarya_zoom_panic_stop_attached = true;
@@ -162,6 +168,9 @@
          */
         updateSpacing(xDelta, yDelta) { }
 
+        // Alan 7/17/26 - Let saved display preferences replace spacing instead of accumulating it across tree redraws.
+        setSpacingState(x, y) { }
+
         /**
          * Set viewer options.
          * @param {Object} newOpts - Options to merge
@@ -248,8 +257,8 @@
                 queryCoverThreshold: 0,
                 // Alan 5/9/26 - Track view-only MycoMap subject coverage filters separately from destructive prune actions.
                 subjectCoverThreshold: 0,
-                // Alan 5/9/26 - Track view-only MycoMap identity filters separately from destructive prune actions.
-                identityThreshold: 0,
+                // Alan 7/20/26 - Treat identity as a maximum so lowering the slider removes the most similar hits first.
+                identityMaximum: 100,
                 // Alan 5/9/26 - Store per-sequence BLAST metrics passed from the job metadata.
                 sequenceMetrics: [],
                 supportBasePx: 9,
@@ -290,6 +299,8 @@
 
             // Spacing State (relative to default)
             this.spacingState = { x: 0, y: 0 };
+            // Alan 7/17/26 - Apply automatic large-tree spacing only once so backend redraws retain the current viewer spacing.
+            this.automaticSpacingInitialized = false;
             this.spacingTimeout = null;
 
             // Zoom/UI state
@@ -304,12 +315,14 @@
             this.boxSelectState = { enabled: false, drag: null, pointerDownListener: null, contextMenuListener: null, modifierKeyDownListener: null, modifierKeyUpListener: null, modifiers: { alt: false, ctrl: false, meta: false, lastAltDownAt: 0, lastCtrlDownAt: 0, lastMetaDownAt: 0 }, suppressContextMenuUntil: 0 };
             // Alan 6/2/26 - Controller-supplied handler invoked by the native menu's "Rotate node" item.
             this._onRotateNode = null;
-            // Alan 6/4/26 - Controller-supplied handler invoked by the native menu's "Prune this node" item.
+            // Alan 7/17/26 - Controller-supplied handler receives the clicked node and the exact context-menu prune targets.
             this._onPruneNode = null;
             // Alan 6/4/26 - Controller-supplied handler invoked by the native menu's "Copy sequence name" item.
             this._onCopySequenceName = null;
             // Alan 6/25/26 - Controller-supplied handler invoked by the native menu's iNaturalist-number copy item.
             this._onCopyInaturalistNumbers = null;
+            // Alan 7/16/26 - Controller-supplied handler refreshes selected source observations through Mycomap.
+            this._onRefreshMycomapRecords = null;
         }
 
         // Alan 6/2/26 - Let the controller own the rotate action while the item lives in phylotree's native node menu.
@@ -330,6 +343,11 @@
         // Alan 6/25/26 - Let the controller own iNaturalist-number clipboard copying from the native node menu.
         setCopyInaturalistNumbersHandler(fn) {
             this._onCopyInaturalistNumbers = typeof fn === 'function' ? fn : null;
+        }
+
+        // Alan 7/16/26 - Let the controller own API-backed Mycomap refreshes from the native tip menu.
+        setRefreshMycomapRecordsHandler(fn) {
+            this._onRefreshMycomapRecords = typeof fn === 'function' ? fn : null;
         }
 
         // Alan 6/2/26 - Highlight the focal/sequence-of-interest tip directly from durable state,
@@ -363,22 +381,43 @@
 
             // Tag original order per-parent for correct restoration
             this.tree.traverse_and_compute(n => {
-                // Alan 6/4/26 - Register pruning in the native context menu so right-click edits can use the backend prune flow.
+                // Alan 7/15/26 - Hide MAFFT and RiC annotations while retaining the saved tip ID for tree edits.
+                const data = n.data || n;
+                const isTip = !n.children || n.children.length === 0;
+                const displayName = isTip ? cleanTipDisplayName(data.name) : data.name;
+                if (typeof data.name === 'string' && displayName !== data.name) {
+                    const originalName = data.name;
+                    if (!data.__original_name) data.__original_name = originalName;
+                    if (!n.__original_name) n.__original_name = originalName;
+                    data.name = displayName;
+                    if (n.name !== undefined) n.name = displayName;
+                }
+                // Alan 7/17/26 - Register a count-aware prune item that passes the same resolved nodes used by its label.
                 if (n.parent) {
                     n.menu_items = n.menu_items || [];
                     n.menu_items.push([
-                        () => 'Prune this node',
-                        (node) => { if (typeof this._onPruneNode === 'function') this._onPruneNode(node); },
+                        // Alan 7/17/26 - Show how many terminal sequences the context action will remove.
+                        (node) => this._getPruneMenuLabel(node),
+                        // Alan 7/17/26 - Prune all selected tips when multiple tips are selected, otherwise prune the clicked node.
+                        (node) => {
+                            // Alan 7/17/26 - Resolve targets at click time so the action remains aligned with the displayed menu count.
+                            const nodes = this._getContextPruneNodes(node);
+                            // Alan 7/17/26 - Give the controller the resolved bulk target list for the backend prune request.
+                            if (typeof this._onPruneNode === 'function') this._onPruneNode(node, nodes);
+                        },
                         () => !window.VIEW_ONLY
                     ]);
                 }
-                // Alan 6/4/26 - Register copy-name only for terminal sequence nodes that have a user-visible name.
+                // Alan 7/14/26 - Copy the clicked sequence name or all visible selected sequence names from terminal nodes.
                 if (!n.children || n.children.length === 0) {
                     n.menu_items = n.menu_items || [];
                     n.menu_items.push([
-                        () => 'Copy sequence name',
-                        (node) => { if (typeof this._onCopySequenceName === 'function') this._onCopySequenceName(node); },
-                        (node) => Boolean(node?.data?.name || node?.name)
+                        (node) => this._getSequenceNameCopyMenuLabel(node),
+                        (node) => {
+                            const nodes = this._getContextSequenceNameNodes(node);
+                            if (typeof this._onCopySequenceName === 'function') this._onCopySequenceName(node, nodes);
+                        },
+                        (node) => this._getContextSequenceNameNodes(node).length > 0
                     ]);
                     // Alan 6/25/26 - Offer iNaturalist-number copying when the clicked tip or selected tips expose observation IDs.
                     n.menu_items.push([
@@ -388,6 +427,15 @@
                             if (typeof this._onCopyInaturalistNumbers === 'function') this._onCopyInaturalistNumbers(node, numbers);
                         },
                         (node) => this._getContextInaturalistNumbers(node).length > 0
+                    ]);
+                    // Alan 7/16/26 - Refresh one clicked or multiple selected iNaturalist/Mushroom Observer records in Mycomap.
+                    n.menu_items.push([
+                        (node) => this._getMycomapRefreshMenuLabel(node),
+                        (node) => {
+                            const nodes = this._getContextMycomapRecordNodes(node);
+                            if (typeof this._onRefreshMycomapRecords === 'function') this._onRefreshMycomapRecords(node, nodes);
+                        },
+                        (node) => !window.VIEW_ONLY && this._getContextMycomapRecordReferences(node).length > 0
                     ]);
                 }
                 if (n.children) {
@@ -407,6 +455,9 @@
 
             // 2b. Cache Nodes & Compute Metadata (Flatten operations)
             this._cacheNodes();
+
+            // Alan 7/17/26 - Give large trees more initial vertical room so tip labels do not appear crowded.
+            this._initializeAutomaticSpacing();
 
             // 2c. Initial Selection Processing
             // Alan 5/12/26 - Full tree reload clears only temporary action selection; color groups restore below.
@@ -508,6 +559,9 @@
             try {
                 const renderer = this.tree.render(renderOpts);
 
+                // Alan 7/14/26 - Expose visible selected tips to the native source-record menu for bulk observation links.
+                if (renderer) renderer.recordTargetNodesProvider = () => this.getSelectedNodes();
+
                 if (this.container.children.length === 0 && renderer) {
                     if (renderer.element) this.container.appendChild(renderer.element);
                     else if (renderer.svg) this.container.appendChild(renderer.svg.node());
@@ -533,6 +587,8 @@
                 // Intercept wheel events before D3 and let the page scroll instead.
                 const svgEl = this.container.querySelector('svg');
                 if (svgEl) {
+                    // Alan 7/17/26 - Keep double-clicks on the tree from triggering D3's default zoom-in gesture.
+                    window.d3v7.select(svgEl).on('dblclick.zoom', null);
                     svgEl.addEventListener('wheel', (e) => {
                         if (!e.ctrlKey) {
                             e.stopImmediatePropagation();
@@ -574,6 +630,22 @@
             } catch (e) {
                 console.error('Error applying spacing via API:', e);
             }
+        }
+
+        // Alan 7/18/26 - Keep all trees at the compact established vertical spacing regardless of tip count.
+        _recommendedVerticalSpacingDelta() {
+            // Alan 7/18/26 - Let users expand spacing manually instead of adding automatic gaps to large trees.
+            return 0;
+        }
+
+        // Alan 7/17/26 - Set the automatic spacing before the first draw without overwriting later user adjustments.
+        _initializeAutomaticSpacing() {
+            // Alan 7/17/26 - Skip repeat initialization when the tree reloads after an edit.
+            if (this.automaticSpacingInitialized) return;
+            // Alan 7/17/26 - Store the recommendation as the same relative vertical value used by toolbar controls.
+            this.spacingState.y = this._recommendedVerticalSpacingDelta();
+            // Alan 7/17/26 - Remember initialization so reroot, prune, and rename redraws keep the current spacing.
+            this.automaticSpacingInitialized = true;
         }
 
 
@@ -623,7 +695,8 @@
             }
             if (changed) {
                 // Reset spacing state on layout change prevents weird accumulations
-                this.spacingState = { x: 0, y: 0 };
+                // Alan 7/17/26 - Retain the large-tree vertical recommendation when a layout change resets manual spacing.
+                this.spacingState = { x: 0, y: this._recommendedVerticalSpacingDelta() };
                 this._draw();
             }
         }
@@ -666,6 +739,16 @@
 
             // Fallback: full redraw
             this._draw();
+        }
+
+        // Alan 7/17/26 - Replace the relative spacing state so persisted preferences do not compound after redraws.
+        setSpacingState(x, y) {
+            // Alan 7/17/26 - Normalize malformed stored horizontal values to the established zero offset.
+            const nextX = Number.isFinite(Number(x)) ? Number(x) : 0;
+            // Alan 7/17/26 - Normalize malformed stored vertical values to the established zero offset.
+            const nextY = Number.isFinite(Number(y)) ? Number(y) : 0;
+            // Alan 7/17/26 - Reuse incremental rendering with only the difference from the current state.
+            this.updateSpacing(nextX - this.spacingState.x, nextY - this.spacingState.y);
         }
 
         applyTextSizing() {
@@ -732,7 +815,8 @@
                 if (!data.__original_name) data.__original_name = originalName;
                 if (!node.__original_name) node.__original_name = originalName;
                 if (Object.prototype.hasOwnProperty.call(renames, originalName)) {
-                    const displayName = renames[originalName];
+                    // Alan 7/15/26 - Keep persisted rename labels free of pipeline-only MAFFT and RiC annotations too.
+                    const displayName = cleanTipDisplayName(renames[originalName]);
                     if (data.name !== displayName) {
                         data.name = displayName;
                         if (node.name !== undefined) node.name = displayName;
@@ -788,7 +872,8 @@
 
         // Alan 5/9/26 - Let the controller update sequence metric filters from live slider input.
         setSequenceFilterOptions(newOpts = {}) {
-            ['queryCoverThreshold', 'subjectCoverThreshold', 'identityThreshold'].forEach(key => {
+            // Alan 7/20/26 - Accept minimum coverage thresholds plus the independent maximum-identity cutoff.
+            ['queryCoverThreshold', 'subjectCoverThreshold', 'identityMaximum'].forEach(key => {
                 if (Object.prototype.hasOwnProperty.call(newOpts, key)) {
                     const nextValue = Number(newOpts[key]);
                     this.options[key] = Number.isFinite(nextValue)
@@ -803,7 +888,8 @@
         resetSequenceFilters() {
             this.options.queryCoverThreshold = 0;
             this.options.subjectCoverThreshold = 0;
-            this.options.identityThreshold = 0;
+            // Alan 7/20/26 - Reset maximum identity to 100 so all identity values remain visible.
+            this.options.identityMaximum = 100;
             return this._applySequenceFilters({ updateDisplay: true });
         }
 
@@ -963,7 +1049,7 @@
             }
 
             // 5. Resolve pixel dimensions.
-            //    Prefer getBoundingClientRect — reliable even when SVG attrs use "%" or are unset.
+            //    Prefer getBoundingClientRect because it is reliable even when SVG attrs use "%" or are unset.
             //    Only fall back to attribute value if it parses as a plain number (no % unit).
             const rect = svg.getBoundingClientRect();
             let width = rect.width || 0;
@@ -1036,7 +1122,8 @@
                             return;
                         }
 
-                        // White background — JPEG has no alpha channel
+                        // Alan 7/16/26 - Clarify why JPEG export needs a white background.
+                        // Use a white background because JPEG has no alpha channel.
                         ctx.fillStyle = '#ffffff';
                         ctx.fillRect(0, 0, canvas.width, canvas.height);
                         ctx.scale(scale, scale);
@@ -1044,7 +1131,8 @@
 
                         canvas.toBlob(jpgBlob => {
                             if (!jpgBlob) {
-                                reject(new Error('canvas.toBlob() returned null — JPEG encoding failed.'));
+                                // Alan 7/16/26 - Reword the JPEG export error without an em dash.
+                                reject(new Error('canvas.toBlob() returned null, so JPEG encoding failed.'));
                                 return;
                             }
                             let jpgUrl;
@@ -1104,9 +1192,12 @@
             if (!Array.isArray(records)) return map;
             for (const record of records) {
                 if (!record || typeof record !== 'object') continue;
+                // Alan 7/19/26 - Parse subject coverage once so invalid saved values remain missing instead of becoming zero.
+                const subjectCover = this._metricNumber(record.subject_cover);
                 const metric = {
                     query_cover: this._metricNumber(record.query_cover),
-                    subject_cover: this._metricNumber(record.subject_cover),
+                    // Alan 7/19/26 - Treat MycoMap's negative reverse-strand subject coverage as a positive coverage magnitude for existing jobs.
+                    subject_cover: subjectCover === null ? null : Math.abs(subjectCover),
                     identity: this._metricNumber(record.identity),
                     blast_metrics_available: Boolean(record.blast_metrics_available)
                 };
@@ -1156,13 +1247,20 @@
             return Number(metric[field]) + 1e-9 >= threshold;
         }
 
+        // Alan 7/20/26 - Keep hits at or below the chosen identity maximum, preserving tips with missing metrics.
+        _passesMetricMaximum(metric, field, maximum) {
+            if (!metric || metric[field] === null || metric[field] === undefined) return true;
+            return Number(metric[field]) <= maximum + 1e-9;
+        }
+
         // Alan 5/9/26 - Decide whether a leaf should remain visible under the active MycoMap metric sliders.
         _passesSequenceFilters(node) {
             const metric = node.__sequenceMetrics;
             if (!metric || !metric.blast_metrics_available) return true;
             return this._passesMetricThreshold(metric, 'query_cover', this.options.queryCoverThreshold || 0) &&
                 this._passesMetricThreshold(metric, 'subject_cover', this.options.subjectCoverThreshold || 0) &&
-                this._passesMetricThreshold(metric, 'identity', this.options.identityThreshold || 0);
+                // Alan 7/20/26 - Lower identity values hide highly similar hits instead of imposing a reversed minimum.
+                this._passesMetricMaximum(metric, 'identity', this.options.identityMaximum ?? 100);
         }
 
         // Alan 5/9/26 - Compute counts and current thresholds for the sequence metric filter UI.
@@ -1180,7 +1278,8 @@
                 metricsAvailable: metricTips > 0,
                 queryCoverThreshold: this.options.queryCoverThreshold || 0,
                 subjectCoverThreshold: this.options.subjectCoverThreshold || 0,
-                identityThreshold: this.options.identityThreshold || 0
+                // Alan 7/20/26 - Report the direct maximum value displayed by the identity slider.
+                identityMaximum: this.options.identityMaximum ?? 100
             };
         }
 
@@ -1243,6 +1342,73 @@
             return Array.from(this.currentSelectionIds).filter(id => !this.hiddenSelectionIds.has(id));
         }
 
+        // Alan 7/17/26 - Use multiple selected tips as context-menu prune targets, falling back to the right-clicked node.
+        _getContextPruneNodes(node) {
+            // Alan 7/17/26 - Limit bulk context pruning to terminal sequences, as requested for multi-tip selections.
+            const selectedLeaves = this.getSelectedNodes().filter((selectedNode) => {
+                // Alan 7/17/26 - A selected node is a pruneable sequence tip only when it has no children.
+                const children = selectedNode?.children || selectedNode?.data?.children || [];
+                // Alan 7/17/26 - Keep only leaf nodes in the multi-tip target list.
+                return !children || children.length === 0;
+            });
+            // Alan 7/17/26 - Preserve the existing clicked-node behavior unless more than one tip is selected.
+            return selectedLeaves.length > 1 ? selectedLeaves : [node];
+        }
+
+        // Alan 7/17/26 - Count terminal sequences beneath resolved prune targets so the label reflects actual removals.
+        _getContextPruneCount(node) {
+            // Alan 7/17/26 - Track visited tips to avoid double-counting overlapping targets.
+            const tipIds = new Set();
+            // Alan 7/17/26 - Walk each target subtree and collect its terminal node IDs.
+            const visit = (current) => {
+                // Alan 7/17/26 - Ignore missing nodes defensively when building the context-menu count.
+                if (!current) return;
+                // Alan 7/17/26 - Read children from either the rendered node or its wrapped data object.
+                const children = current.children || current.data?.children || [];
+                // Alan 7/17/26 - Count only terminal sequences because those are what pruning removes.
+                if (!children || children.length === 0) {
+                    // Alan 7/17/26 - Prefer the stable viewer ID, with the object as a safe last-resort identity.
+                    const id = this._getNodeId(current) || current;
+                    // Alan 7/17/26 - Deduplicate each terminal sequence across all resolved targets.
+                    tipIds.add(id);
+                    // Alan 7/17/26 - Stop descending after reaching a terminal sequence.
+                    return;
+                }
+                // Alan 7/17/26 - Include every terminal descendant of an internal prune target.
+                children.forEach(visit);
+            };
+            // Alan 7/17/26 - Count the exact target set that the click handler will send to the controller.
+            this._getContextPruneNodes(node).forEach(visit);
+            // Alan 7/17/26 - Return the unique terminal-sequence count for label pluralization.
+            return tipIds.size;
+        }
+
+        // Alan 7/17/26 - Render singular or plural prune wording from the exact context-menu target count.
+        _getPruneMenuLabel(node) {
+            // Alan 7/17/26 - Calculate the removal count when the menu opens so current selections are reflected.
+            const count = this._getContextPruneCount(node);
+            // Alan 7/17/26 - Match the requested "Prune 1 node" and "Prune 28 nodes" wording.
+            return `Prune ${count} node${count === 1 ? '' : 's'}`;
+        }
+
+        // Alan 7/14/26 - Use visible selected leaf sequences for name copying, falling back to the right-clicked tip.
+        _getContextSequenceNameNodes(node) {
+            const selectedLeaves = this.getSelectedNodes().filter((selectedNode) => {
+                const children = selectedNode?.children || selectedNode?.data?.children || [];
+                return !children || children.length === 0;
+            });
+            const candidates = selectedLeaves.length ? selectedLeaves : [node];
+            return candidates.filter((candidate) => {
+                const children = candidate?.children || candidate?.data?.children || [];
+                return (!children || children.length === 0) && Boolean(candidate?.data?.name || candidate?.name);
+            });
+        }
+
+        // Alan 7/14/26 - Pluralize the copy-name menu item when it targets multiple selected sequence names.
+        _getSequenceNameCopyMenuLabel(node) {
+            return this._getContextSequenceNameNodes(node).length > 1 ? 'Copy sequence names' : 'Copy sequence name';
+        }
+
         // Alan 6/25/26 - Extract an iNaturalist observation number through phylotree's shared label parser.
         _getInaturalistObservationNumber(node) {
             const parser = window.phylotree?.extractINaturalistObservationNumber;
@@ -1282,11 +1448,42 @@
             return number ? [number] : [];
         }
 
-        // Alan 6/25/26 - Switch the context-menu text to plural when copying numbers from multiple selected sequences.
+        // Alan 7/14/26 - Pluralize the menu label from the unique iNaturalist numbers the action will copy.
         _getInaturalistCopyMenuLabel(node) {
-            const selectedLeafCount = this._getSelectedLeafCount();
-            const count = selectedLeafCount > 1 ? selectedLeafCount : this._getContextInaturalistNumbers(node).length;
-            return count > 1 ? 'Copy iNaturalist numbers' : 'Copy iNaturalist number';
+            const numberCount = this._getContextInaturalistNumbers(node).length;
+            return numberCount > 1 ? 'Copy iNaturalist numbers' : 'Copy iNaturalist number';
+        }
+
+        // Alan 7/16/26 - Parse either supported observation platform through phylotree's shared label parser.
+        _getMycomapRecordReference(node) {
+            const parser = window.phylotree?.extractObservationRecordReference;
+            return typeof parser === 'function' ? parser(node) : null;
+        }
+
+        // Alan 7/16/26 - Target eligible highlighted tips, falling back to the clicked tip only when nothing is highlighted.
+        _getContextMycomapRecordNodes(node) {
+            const selectedLeaves = this.getSelectedNodes().filter((selectedNode) => {
+                const children = selectedNode?.children || selectedNode?.data?.children || [];
+                return (!children || children.length === 0) && Boolean(this._getMycomapRecordReference(selectedNode));
+            });
+            if (selectedLeaves.length) return selectedLeaves;
+            if (this._getSelectedLeafCount() > 0) return [];
+            return this._getMycomapRecordReference(node) ? [node] : [];
+        }
+
+        // Alan 7/16/26 - Deduplicate references so the menu count matches the Mycomap API work requested.
+        _getContextMycomapRecordReferences(node) {
+            const references = this._getContextMycomapRecordNodes(node)
+                .map((recordNode) => this._getMycomapRecordReference(recordNode)?.reference)
+                .filter(Boolean);
+            return Array.from(new Set(references));
+        }
+
+        // Alan 7/16/26 - Use the requested singular/plural Mycomap wording from the highlighted record count.
+        _getMycomapRefreshMenuLabel(node) {
+            return this._getContextMycomapRecordNodes(node).length > 1
+                ? 'Refresh Mycomap records'
+                : 'Refresh Mycomap record';
         }
 
         // Alan 5/12/26 - Clear temporary current selection without changing persistent color groups.

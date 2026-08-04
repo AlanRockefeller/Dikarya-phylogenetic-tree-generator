@@ -15,7 +15,7 @@ def coerce_bool(value, default: bool = True) -> Tuple[bool, bool]:
     api_v1, and worker paths so they can't drift apart.
 
     Returns ``(result, recognized)``. ``recognized`` is False only when the
-    value was a string matching neither the true nor false token set — a
+    value was a string matching neither the true nor false token set. A
     validating caller can reject it (e.g. HTTP 422), while a lenient caller can
     ignore the flag and fall back to ``default``.
     """
@@ -77,5 +77,4 @@ def validate_safe_file_path(path: Path, base_dir: Path) -> bool:
         return resolved_path.is_relative_to(resolved_base)
     except Exception:
         return False
-
 

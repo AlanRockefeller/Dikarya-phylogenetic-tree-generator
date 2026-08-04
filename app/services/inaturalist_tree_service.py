@@ -6,8 +6,8 @@ one-click Dikarya tree job, and (later, in the worker) writes the public
 tree URL back to the observation's "Phylogenetic Tree" field.
 
 All iNaturalist writes use the site-wide authorized account configured via
-the OAuth flow in app/services/inaturalist_oauth_service.py — they do NOT
-use the logged-in Dikarya user's iNaturalist account.
+the OAuth flow in app/services/inaturalist_oauth_service.py. They do NOT use
+the logged-in Dikarya user's iNaturalist account.
 """
 from __future__ import annotations
 
@@ -48,10 +48,11 @@ PLAIN_TOKEN_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_. -]{0,198}[A-Za-z0-9]$")
 
 
 class InatTreeError(Exception):
-    """User-facing validation error. Safe to surface as a 400/422."""
-    def __init__(self, message, status=400):
+    """User-facing application error with an HTTP status and safe details."""
+    def __init__(self, message, status=400, details=None):
         super().__init__(message)
         self.status = status
+        self.details = details
 
 
 # ---------------------------------------------------------------------------
@@ -367,7 +368,7 @@ def resolve_inaturalist_user_or_project(parsed: Dict[str, Any],
 
 
 def _fetch_scope_observation_page(scope: Dict[str, Any], page: int,
-                                  *, require_mycomap: bool = False,
+                                  *, required_field: Optional[str] = None,
                                   per_page: int = MAX_PER_PAGE) -> Dict[str, Any]:
     params = dict(scope.get("query_params") or {})
     params.update({
@@ -376,8 +377,8 @@ def _fetch_scope_observation_page(scope: Dict[str, Any], page: int,
         "order_by": "id",
         "order": "asc",
     })
-    if require_mycomap:
-        params[f"field:{MYCOMAP_BLAST_FIELD_NAME}"] = ""
+    if required_field:
+        params[f"field:{required_field}"] = ""
     query = urllib.parse.urlencode(params, doseq=True)
     return _http_request(f"{INAT_API_BASE}/observations?{query}")
 
@@ -387,36 +388,67 @@ def _scope_total_observations(scope: Dict[str, Any]) -> int:
     return int(payload.get("total_results") or 0)
 
 
-def _collect_tree_eligible_observations(scope: Dict[str, Any]) -> Dict[str, Any]:
-    total_matching = _scope_total_observations(scope)
-    observations = []
+def _collect_scope_observations_with_field(scope: Dict[str, Any],
+                                           field_name: str) -> Dict[int, Dict[str, Any]]:
+    """Return scope observations with one non-empty tree-input field."""
+    observations: Dict[int, Dict[str, Any]] = {}
     page = 1
-    total_with_mycomap = 0
-    skipped_existing_tree = 0
-
+    total_results = 0
     while True:
-        payload = _fetch_scope_observation_page(scope, page, require_mycomap=True)
+        payload = _fetch_scope_observation_page(
+            scope, page, required_field=field_name
+        )
         results = payload.get("results") or []
         if page == 1:
-            total_with_mycomap = int(payload.get("total_results") or 0)
+            total_results = int(payload.get("total_results") or 0)
         if not results:
             break
-        for obs in results:
-            if _has_nonempty_field(obs, PHYLOGENETIC_TREE_FIELD_NAME):
-                skipped_existing_tree += 1
+        for observation in results:
+            if not _has_nonempty_field(observation, field_name):
                 continue
-            if _has_nonempty_field(obs, MYCOMAP_BLAST_FIELD_NAME):
-                observations.append(obs)
-        if len(results) < MAX_PER_PAGE or (page * MAX_PER_PAGE) >= total_with_mycomap:
+            try:
+                observation_id = int(observation.get("id"))
+            except (TypeError, ValueError):
+                continue
+            observations[observation_id] = observation
+        if len(results) < MAX_PER_PAGE or (page * MAX_PER_PAGE) >= total_results:
             break
         page += 1
         time.sleep(RATE_LIMIT_DELAY)
+    return observations
 
-    skipped_missing_mycomap = max(0, total_matching - total_with_mycomap)
+
+def _collect_tree_eligible_observations(scope: Dict[str, Any]) -> Dict[str, Any]:
+    total_matching = _scope_total_observations(scope)
+    with_mycomap = _collect_scope_observations_with_field(
+        scope, MYCOMAP_BLAST_FIELD_NAME
+    )
+    with_its = _collect_scope_observations_with_field(
+        scope, DNA_BARCODE_ITS_FIELD_NAME
+    )
+    observations_by_id = dict(with_mycomap)
+    for observation_id, observation in with_its.items():
+        observations_by_id.setdefault(observation_id, observation)
+
+    observations = []
+    skipped_existing_tree = 0
+    auto_create_mycomap = 0
+    for observation_id in sorted(observations_by_id):
+        observation = observations_by_id[observation_id]
+        if _has_nonempty_field(observation, PHYLOGENETIC_TREE_FIELD_NAME):
+            skipped_existing_tree += 1
+            continue
+        observations.append(observation)
+        if observation_id not in with_mycomap:
+            auto_create_mycomap += 1
+
+    skipped_missing_mycomap = max(0, total_matching - len(observations_by_id))
     return {
         "scope": scope,
         "total_matching_observations": total_matching,
-        "mycomap_matching_observations": total_with_mycomap,
+        "mycomap_matching_observations": len(with_mycomap),
+        "dna_barcode_its_matching_observations": len(with_its),
+        "auto_create_mycomap_blast_count": auto_create_mycomap,
         "eligible_tree_count": len(observations),
         "skipped_existing_tree_count": skipped_existing_tree,
         "skipped_missing_mycomap_count": skipped_missing_mycomap,
@@ -444,6 +476,7 @@ def _message_for_scope_counts(scope: Dict[str, Any], counts: Dict[str, Any]) -> 
     ready = int(counts.get("eligible_tree_count") or 0)
     skipped_tree = int(counts.get("skipped_existing_tree_count") or 0)
     skipped_myco = int(counts.get("skipped_missing_mycomap_count") or 0)
+    auto_create_mycomap = int(counts.get("auto_create_mycomap_blast_count") or 0)
     if ready:
         noun = "observation is" if ready == 1 else "observations are"
         priority = " high-priority" if ready == 1 else " bulk"
@@ -452,16 +485,25 @@ def _message_for_scope_counts(scope: Dict[str, Any], counts: Dict[str, Any]) -> 
             f"Clicking One-Click Tree will create {ready}{priority} tree job"
             f"{'' if ready == 1 else 's'}."
         )
+        if auto_create_mycomap:
+            blast_noun = "observation" if auto_create_mycomap == 1 else "observations"
+            message += (
+                f" {auto_create_mycomap} {blast_noun} will first get a new "
+                "Mycomap BLAST from DNA Barcode ITS."
+            )
         if skipped_tree or skipped_myco:
             message += (
                 f" Skipped {skipped_tree} observations that already had trees "
-                f"and {skipped_myco} without Mycomap BLAST Results."
+                f"and {skipped_myco} without Mycomap BLAST Results or DNA Barcode ITS."
             )
         return message
     if skipped_tree and not skipped_myco:
         return f"Found {label}, but all matching observations already have Phylogenetic Tree fields."
     if skipped_myco and not skipped_tree:
-        return f"Found {label}, but none of the matching observations have a Mycomap BLAST Results field."
+        return (
+            f"Found {label}, but none of the matching observations have a "
+            "Mycomap BLAST Results or DNA Barcode ITS field."
+        )
     return f"Found {label}, but no matching observations are ready for tree building."
 
 
@@ -473,32 +515,54 @@ def preview_inaturalist_tree_input(raw_input: str,
         observation_id = int(parsed["observation_id"])
         observation = fetch_observation(observation_id)
         has_mycomap = _has_nonempty_field(observation, MYCOMAP_BLAST_FIELD_NAME)
+        has_its = _has_nonempty_field(observation, DNA_BARCODE_ITS_FIELD_NAME)
         has_tree = _has_nonempty_field(observation, PHYLOGENETIC_TREE_FIELD_NAME)
-        if has_mycomap and has_tree:
+        can_recreate_tree = bool(has_tree and (has_mycomap or has_its))
+        if can_recreate_tree:
             message = (
                 f"Found observation {observation_id}. It already has a "
-                "Phylogenetic Tree field."
+                "Phylogenetic Tree field. Select Re-create phylogenetic tree "
+                "to build a new tree and replace the field's current URL."
+            )
+        elif has_tree:
+            message = (
+                f"Found observation {observation_id}. It already has a "
+                "Phylogenetic Tree field, but it cannot be re-created because "
+                "the observation has neither Mycomap BLAST Results nor a DNA "
+                "Barcode ITS field."
             )
         elif has_mycomap:
             message = (
-                f"Found observation {observation_id}. It has Mycomap BLAST "
-                "Results and is ready for one high-priority tree job."
+                f"Found observation iNat # {observation_id}. Mycomap BLAST "
+                "Results loaded."
+            )
+        elif has_its and not has_tree:
+            message = (
+                f"Found observation iNat # {observation_id}. Dikarya will start "
+                "a Mycomap BLAST from its DNA Barcode ITS, add the results URL "
+                "to iNaturalist, and build the tree when NCBI results are ready."
             )
         else:
             message = (
-                f"Found observation {observation_id}, but it does not have a "
-                "Mycomap BLAST Results field."
+                f"Found observation {observation_id}, but it has neither a "
+                "Mycomap BLAST Results field nor a DNA Barcode ITS field."
             )
+        eligible = bool(not has_tree and (has_mycomap or has_its))
         return {
             "status": "success",
             "type": "single_observation",
             "observation_id": observation_id,
             "has_mycomap_blast_results": has_mycomap,
+            "has_dna_barcode_its": has_its,
+            "will_create_mycomap_blast": bool(
+                has_its and not has_mycomap
+            ),
             "has_phylogenetic_tree": has_tree,
-            "eligible_tree_count": 1 if has_mycomap and not has_tree else 0,
+            "can_recreate_phylogenetic_tree": can_recreate_tree,
+            "eligible_tree_count": 1 if eligible else 0,
             "total_matching_observations": 1,
             "skipped_existing_tree_count": 1 if has_tree else 0,
-            "skipped_missing_mycomap_count": 0 if has_mycomap else 1,
+            "skipped_missing_mycomap_count": 0 if has_mycomap or has_its else 1,
             "message": message,
         }
 
@@ -617,6 +681,57 @@ DEFAULT_TREE_PARAMS = {
 }
 
 
+def _refresh_mycomap_blast_results(blast_id: str, *, rebuild_ncbi_blast: bool = False,
+                                   rebuild_local_blast: bool = True,
+                                   mycomap_local_limit=None,
+                                   mycomap_ncbi_limit=None) -> Dict[str, Any]:
+    """Refresh MycoMap BLAST results before importing FASTA for a tree job.
+
+    The automatic local refresh is best-effort so a missing API key or a
+    transient MycoMap failure cannot break trees that can still use the saved
+    result set. An explicitly requested NCBI refresh remains strict.
+    """
+    from app.services.mycomap_service import (
+        MycoMapRerunError,
+        rerun_mycomap_blast,
+        validate_mycomap_rerun_limit,
+    )
+
+    local_limit, local_error = validate_mycomap_rerun_limit(mycomap_local_limit, "local")
+    if local_error:
+        raise MycoMapRerunError(local_error)
+    ncbi_limit, ncbi_error = validate_mycomap_rerun_limit(mycomap_ncbi_limit, "ncbi")
+    if ncbi_error:
+        raise MycoMapRerunError(ncbi_error)
+
+    result: Dict[str, Any] = {
+        "local_limit": local_limit,
+        "ncbi_limit": ncbi_limit,
+        "local": None,
+        "local_status": "skipped" if not rebuild_local_blast else "pending",
+        "warnings": [],
+    }
+    if rebuild_local_blast:
+        try:
+            result["local"] = rerun_mycomap_blast(
+                blast_id, result_type="local", limit=local_limit
+            )
+            result["local_status"] = "completed"
+        except MycoMapRerunError as exc:
+            warning = (
+                "MycoMap local BLAST could not be refreshed; Dikarya will use "
+                f"the saved MycoMap results instead. {exc}"
+            )
+            logger.warning("%s blast_id=%s", warning, blast_id)
+            result["local_status"] = "failed"
+            result["local_error"] = str(exc)
+            result["warnings"].append(warning)
+    if rebuild_ncbi_blast:
+        result["ncbi"] = rerun_mycomap_blast(blast_id, result_type="ncbi", limit=ncbi_limit)
+        result["ncbi_status"] = "queued"
+    return result
+
+
 DNA_BARCODE_ITS_FIELD_NAME = "DNA Barcode ITS"
 GENBANK_ACCESSION_RE = re.compile(r"^[A-Z]{1,3}_?[0-9]{5,9}(?:\.[0-9]+)?$")
 
@@ -624,13 +739,22 @@ GENBANK_ACCESSION_RE = re.compile(r"^[A-Z]{1,3}_?[0-9]{5,9}(?:\.[0-9]+)?$")
 def _normalize_dna_for_match(text: str) -> str:
     """Uppercase + strip everything that isn't a DNA / IUPAC nucleotide letter.
 
-    Used only for the exact-match comparison; the cleaned sequence we
+    Used only for source-sequence comparison; the cleaned sequence we
     actually splice into the tree input goes through clean_dna_sequence so
     it follows the same rules as the rest of the pipeline.
     """
     if not text:
         return ""
     return re.sub(r"[^ACGTNRYSWKMBDHV]", "", str(text).upper())
+
+
+def _dna_matches_with_terminal_overhangs(first: str, second: str) -> bool:
+    """Return true when normalized sequences differ only by terminal overhangs."""
+    first_norm = _normalize_dna_for_match(first)
+    second_norm = _normalize_dna_for_match(second)
+    if not first_norm or not second_norm:
+        return False
+    return first_norm in second_norm or second_norm in first_norm
 
 
 def _observation_id_pattern(observation_id: int) -> re.Pattern:
@@ -720,7 +844,7 @@ def _maybe_add_inat_its_sequence(observation: Dict[str, Any], observation_id: in
       - ``added_name``: header of a new record appended to ``sequences``,
         or None if nothing was added.
       - ``matched_name``: name of an existing MycoMap result whose
-        sequence is an exact match for the ITS field, or None if no match.
+        sequence matches the ITS field, allowing terminal overhangs, or None.
     When ``matched_name`` is set the existing record is left in place
     (no duplicate); the highlighter colors it blue using this metadata.
     """
@@ -735,17 +859,17 @@ def _maybe_add_inat_its_sequence(observation: Dict[str, Any], observation_id: in
     if not its_norm:
         return None, None
 
-    source_exact_matches = []
+    source_sequence_matches = []
     for idx, s in enumerate(sequences):
         name = str(s.get("name") or "").strip()
         if not name or _CONTAMINANT_LABEL_RE.search(name):
             continue
         if not _name_has_observation_id(name, observation_id):
             continue
-        if _normalize_dna_for_match(s.get("sequence") or "") == its_norm:
-            source_exact_matches.append((idx, s))
+        if _dna_matches_with_terminal_overhangs(s.get("sequence") or "", its_norm):
+            source_sequence_matches.append((idx, s))
 
-    if source_exact_matches:
+    if source_sequence_matches:
         def source_match_score(item: Tuple[int, Dict[str, Any]]) -> Tuple[int, int, int]:
             idx, seq = item
             name = str(seq.get("name") or "")
@@ -753,10 +877,10 @@ def _maybe_add_inat_its_sequence(observation: Dict[str, Any], observation_id: in
             synthetic_penalty = 1 if name.startswith(f"iNat{int(observation_id)}") else 0
             return accession_penalty, synthetic_penalty, idx
 
-        keep_idx, keep_seq = sorted(source_exact_matches, key=source_match_score)[0]
+        keep_idx, keep_seq = sorted(source_sequence_matches, key=source_match_score)[0]
         keep_name = _source_tip_label_with_inat(keep_seq.get("name") or "", observation_id)
         keep_seq["name"] = keep_name
-        remove_indexes = {idx for idx, _seq in source_exact_matches if idx != keep_idx}
+        remove_indexes = {idx for idx, _seq in source_sequence_matches if idx != keep_idx}
         if remove_indexes:
             sequences[:] = [
                 seq for idx, seq in enumerate(sequences)
@@ -809,14 +933,30 @@ def _clean_display_text(value: Any) -> str:
     return text.strip(" ,;:-_")
 
 
-def _extract_inat_species_label(observation: Dict[str, Any]) -> str:
-    """Return the best scientific-name-like label for an iNat observation."""
-    for field_name in ("Species Name Override", "Provisional Species Name"):
+INAT_SPECIES_NAME_FIELD_NAMES = (
+    "Species Name Override",
+    "Provisional Species Name",
+    "Tagged NZ Fungal Species",
+    "Barcode Inferred Species or Name",
+)
+
+
+def _extract_inat_species_field_label(observation: Dict[str, Any]) -> str:
+    """Return the most specific saved species-of-interest field value."""
+    for field_name in INAT_SPECIES_NAME_FIELD_NAMES:
         value = extract_observation_field_value(observation, field_name)
         if value:
             cleaned = _clean_display_text(value)
             if cleaned:
                 return cleaned
+    return ""
+
+
+def _extract_inat_species_label(observation: Dict[str, Any]) -> str:
+    """Return the best scientific-name-like label for an iNat observation."""
+    field_label = _extract_inat_species_field_label(observation)
+    if field_label:
+        return field_label
 
     taxon = observation.get("taxon") or {}
     if isinstance(taxon, dict):
@@ -825,6 +965,98 @@ def _extract_inat_species_label(observation: Dict[str, Any]) -> str:
             if cleaned:
                 return cleaned
     return ""
+
+
+def _extract_genus_from_scientific_label(value: Any) -> str:
+    """Extract a leading fungal genus from a scientific-name-like label."""
+    cleaned = _clean_display_text(value)
+    if not cleaned:
+        return ""
+    parts = cleaned.split()
+    if parts and parts[0] == "×":
+        parts = parts[1:]
+    if not parts:
+        return ""
+    candidate = parts[0].strip("()[]{}.,;:")
+    if re.fullmatch(r"[A-Z][A-Za-z-]+", candidate):
+        return candidate
+    return ""
+
+
+def _extract_inat_genus(observation: Dict[str, Any]) -> str:
+    """Return the observation's genus without mistaking a higher rank for one."""
+    field_label = _extract_inat_species_field_label(observation)
+    if field_label:
+        genus = _extract_genus_from_scientific_label(field_label)
+        if genus:
+            return genus
+
+    taxon = observation.get("taxon") or {}
+    if not isinstance(taxon, dict):
+        return ""
+
+    taxon_name = _clean_display_text(taxon.get("name"))
+    taxon_rank = _clean_display_text(taxon.get("rank")).casefold()
+    if taxon_rank in {"genus", "subgenus"}:
+        genus = _extract_genus_from_scientific_label(taxon_name)
+        if genus:
+            return genus
+    if " " in taxon_name:
+        genus = _extract_genus_from_scientific_label(taxon_name)
+        if genus:
+            return genus
+
+    for ancestor in reversed(taxon.get("ancestors") or []):
+        if not isinstance(ancestor, dict):
+            continue
+        if _clean_display_text(ancestor.get("rank")).casefold() != "genus":
+            continue
+        genus = _extract_genus_from_scientific_label(ancestor.get("name"))
+        if genus:
+            return genus
+    return ""
+
+
+def _extract_genus_from_inat_tip(value: Any, observation_id: int) -> str:
+    """Extract the first scientific token following an exact iNat ID token."""
+    cleaned = _clean_display_text(value)
+    if not cleaned:
+        return ""
+    match = re.search(
+        rf"(?<![A-Za-z0-9])iNat{int(observation_id)}(?![0-9])\s+([^\s]+)",
+        cleaned,
+        re.IGNORECASE,
+    )
+    return _extract_genus_from_scientific_label(match.group(1)) if match else ""
+
+
+def _resolve_inat_genus(observation: Dict[str, Any], observation_id: int,
+                        source_tip_name: Optional[str] = None) -> str:
+    """Resolve a genus from fields, current taxonomy, ancestry, or source tip."""
+    genus = _extract_inat_genus(observation)
+    taxon = observation.get("taxon") or {}
+    taxon_id = taxon.get("id") if isinstance(taxon, dict) else None
+    if not genus and taxon_id:
+        try:
+            payload = _http_request(f"{INAT_API_BASE}/taxa/{int(taxon_id)}")
+            results = (payload or {}).get("results") or []
+            if results:
+                genus = _extract_inat_genus({"taxon": results[0]})
+        except Exception as exc:
+            logger.warning(
+                "Could not resolve genus ancestry for iNaturalist observation %s: %s",
+                observation_id,
+                exc,
+            )
+    if not genus and source_tip_name:
+        genus = _extract_genus_from_inat_tip(source_tip_name, observation_id)
+    return genus
+
+
+def _build_inat_job_title(observation_id: int, genus: Optional[str] = None) -> str:
+    """Build the user-facing job title for one iNaturalist tree."""
+    genus_label = _extract_genus_from_scientific_label(genus) or "Genus pending"
+    return f"iNat # {int(observation_id)} - {genus_label} → Phylogenetic Tree"
 
 
 def _normalize_location_piece(piece: str) -> str:
@@ -897,46 +1129,543 @@ def _build_fasta_text(sequences: List[Dict[str, Any]]) -> str:
     return ''.join(parts)
 
 
-def create_job_from_inat_observation(raw_input: str, user=None,
-                                      include_ncbi: bool = True,
-                                      include_local: bool = True,
-                                      public_base_url: Optional[str] = None,
-                                      queue_name: str = "phylo_high",
-                                      queue_class: str = "high",
-                                      source: str = "inaturalist_single_tree",
-                                      extra_metrics: Optional[Dict[str, Any]] = None
-                                      ) -> Dict[str, Any]:
-    """Validate the iNat input, pull sequences, enqueue a one-click tree job.
+def _build_sequence_metadata(sequences: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Preserve MycoMap header provenance separately from rendered tip labels."""
+    metadata = []
+    for sequence in sequences:
+        name = _clean_display_text(sequence.get('name'))
+        if not name:
+            continue
+        metadata.append({
+            'name': name,
+            'fasta_header': name,
+            'organism': _clean_display_text(sequence.get('organism')),
+            'source': _clean_display_text(sequence.get('source')),
+            'hit_source': _clean_display_text(sequence.get('hit_source')),
+            'location': _clean_display_text(sequence.get('location')),
+            'raw_fasta_header': str(sequence.get('raw_fasta_header') or ''),
+            'raw_ncbi_description': str(sequence.get('raw_ncbi_description') or ''),
+            'mycomap_header_format': _clean_display_text(
+                sequence.get('mycomap_header_format')
+            ),
+            'internal_id': _clean_display_text(sequence.get('internal_id')),
+            'display_label': _clean_display_text(sequence.get('display_label')),
+            'accession': _clean_display_text(sequence.get('accession')),
+            'taxon': _clean_display_text(sequence.get('taxon')),
+            'raw_mycomap_taxon': str(sequence.get('raw_mycomap_taxon') or ''),
+            'voucher': _clean_display_text(sequence.get('voucher')),
+            'occurrence': sequence.get('occurrence'),
+            'identity': sequence.get('identity'),
+            'query_cover': sequence.get('query_cover'),
+            'subject_cover': sequence.get('subject_cover'),
+            'blast_metrics_available': bool(sequence.get('blast_metrics_available')),
+        })
+    return metadata
 
-    Returns a dict with: status, job_id, observation_id, mycomap_blast_url,
-    tree_view_url, tree_status_url, message.
+
+def _build_inat_tree_job_params(observation_id: int, mycomap_url: str,
+                                payload: Dict[str, Any],
+                                sequences: List[Dict[str, Any]],
+                                genus: Optional[str] = None) -> Dict[str, Any]:
+    """Build the normal phylogeny-worker payload from imported MycoMap data."""
+    return {
+        "input_type": "pasted_sequence",
+        "notes": _build_inat_job_title(observation_id, genus),
+        "sequence": _build_fasta_text(sequences),
+        "sequence_metadata": _build_sequence_metadata(sequences),
+        "accessions": [],
+        "alignment_method": DEFAULT_TREE_PARAMS["alignment_method"],
+        "trimming_method": DEFAULT_TREE_PARAMS["trimming_method"],
+        "trim_terminal_overhangs": DEFAULT_TREE_PARAMS["trim_terminal_overhangs"],
+        "alignment_options": {},
+        "tree_method": DEFAULT_TREE_PARAMS["tree_method"],
+        "tree_model": DEFAULT_TREE_PARAMS["tree_model"],
+        "bootstrap": DEFAULT_TREE_PARAMS["bootstrap"],
+        "mcmc_generations": DEFAULT_TREE_PARAMS["mcmc_generations"],
+        "mcmc_nruns": 2,
+        "mcmc_nchains": 4,
+        "mycomap_blast_url": mycomap_url,
+        "import_filter_details": (payload or {}).get("import_filter_details") or {},
+    }
+
+
+def _build_inat_tree_metrics(observation_id: int, *, queue_class: str,
+                             source: str, public_base_url: Optional[str],
+                             rebuild_ncbi_blast: bool,
+                             recreate_existing_tree: bool = False,
+                             genus: Optional[str] = None,
+                             extra_metrics: Optional[Dict[str, Any]] = None
+                             ) -> Dict[str, Any]:
+    """Build the metrics stored before the iNaturalist input is imported."""
+    metrics = {
+        "via": "inat_phylogenetic_tree",
+        "tree_method": DEFAULT_TREE_PARAMS["tree_method"],
+        "alignment_method": DEFAULT_TREE_PARAMS["alignment_method"],
+        "trimming_method": DEFAULT_TREE_PARAMS["trimming_method"],
+        "trim_terminal_overhangs": DEFAULT_TREE_PARAMS["trim_terminal_overhangs"],
+        "notes": _build_inat_job_title(observation_id, genus),
+        "inat_observation_id": observation_id,
+        "inat_source_url": f"https://www.inaturalist.org/observations/{observation_id}",
+        "inat_update_status": "pending",
+        "inat_observation_field": PHYLOGENETIC_TREE_FIELD_NAME,
+        "inat_replace_existing_tree": bool(recreate_existing_tree),
+        "queue_class": queue_class,
+        "source": source,
+    }
+    if rebuild_ncbi_blast:
+        metrics["mycomap_ncbi_blast_rebuild_requested"] = True
+        metrics["mycomap_preparation_status"] = "queued"
+    if extra_metrics:
+        metrics.update(extra_metrics)
+    public_base_url = _clean_display_text(public_base_url).rstrip("/")
+    if public_base_url:
+        metrics["inat_public_base_url"] = public_base_url
+    return metrics
+
+
+def _create_mycomap_blast_from_observation(observation: Dict[str, Any],
+                                           observation_id: int, *,
+                                           mycomap_local_limit=None,
+                                           mycomap_ncbi_limit=None,
+                                           pending_creation_details=None
+                                           ) -> Dict[str, Any]:
+    """Create a MycoMap search from an observation's ITS and write its URL back."""
+    from app.services.fasta_utils import clean_dna_sequence
+    from app.services.mycomap_service import (
+        MycoMapCreateError,
+        create_mycomap_blast,
+        find_mycomap_blast_by_title,
+        get_mycomap_ncbi_poll_max_attempts,
+        validate_mycomap_rerun_limit,
+    )
+
+    raw_its = extract_observation_field_value(observation, DNA_BARCODE_ITS_FIELD_NAME)
+    cleaned_its = clean_dna_sequence(raw_its or "") or ""
+    if not cleaned_its:
+        raise InatTreeError(
+            "This observation has no usable DNA Barcode ITS sequence and no "
+            "Mycomap BLAST Results URL.",
+            status=422,
+        )
+    job_title = f"iNat{int(observation_id)} DNA Barcode ITS"
+    created = find_mycomap_blast_by_title(job_title)
+    if created:
+        local_limit, local_error = validate_mycomap_rerun_limit(
+            mycomap_local_limit, "local"
+        )
+        ncbi_limit, ncbi_error = validate_mycomap_rerun_limit(
+            mycomap_ncbi_limit, "ncbi"
+        )
+        if local_error or ncbi_error:
+            raise InatTreeError(local_error or ncbi_error, status=422)
+        created.update({
+            "local_limit": local_limit,
+            "ncbi_limit": ncbi_limit,
+            "reused_existing": True,
+        })
+    elif (pending_creation_details or {}).get("creation_pending"):
+        details = dict(pending_creation_details)
+        attempt = int(details.get("creation_discovery_attempt") or 0) + 1
+        max_attempts = get_mycomap_ncbi_poll_max_attempts()
+        if attempt >= max_attempts:
+            raise InatTreeError(
+                "MycoMap accepted the BLAST request, but its result could not "
+                f"be discovered within {max_attempts} permitted attempts.",
+                status=504,
+            )
+        details["creation_discovery_attempt"] = attempt
+        return details
+    else:
+        try:
+            created = create_mycomap_blast(
+                cleaned_its,
+                title=job_title,
+                local_limit=mycomap_local_limit,
+                ncbi_limit=mycomap_ncbi_limit,
+            )
+        except MycoMapCreateError as exc:
+            raise InatTreeError(str(exc), status=502)
+
+    if created.get("record_pending"):
+        return {
+            "local_limit": created.get("local_limit"),
+            "ncbi_limit": created.get("ncbi_limit"),
+            "local": created,
+            "local_status": "queued",
+            "ncbi": created,
+            "ncbi_status": "queued",
+            "warnings": [],
+            "auto_created": True,
+            "creation_pending": True,
+            "creation_discovery_attempt": 0,
+            "created_title": job_title,
+            "created_blast_id": None,
+            "created_mycomap_url": "",
+            "inat_mycomap_field_status": "pending",
+            "inat_mycomap_field_value_id": None,
+            "ncbi_poll_attempt": 0,
+        }
+
+    mycomap_url = str(created.get("url") or "").strip()
+    blast_id = str(created.get("blast_id") or "").strip()
+    if not mycomap_url or not blast_id:
+        raise InatTreeError(
+            "MycoMap did not return a usable BLAST Results URL.", status=502
+        )
+    set_result = set_observation_field_value(
+        observation_id, MYCOMAP_BLAST_FIELD_NAME, mycomap_url
+    )
+    field_value_id = None
+    if isinstance(set_result, dict):
+        field_value_id = set_result.get("id") or set_result.get("uuid")
+    return {
+        "local_limit": created.get("local_limit"),
+        "ncbi_limit": created.get("ncbi_limit"),
+        "local": created,
+        "local_status": "queued",
+        "ncbi": created,
+        "ncbi_status": "queued",
+        "warnings": [],
+        "auto_created": True,
+        "created_blast_id": blast_id,
+        "created_mycomap_url": mycomap_url,
+        "inat_mycomap_field_status": "success",
+        "inat_mycomap_field_value_id": field_value_id,
+        "ncbi_poll_attempt": 0,
+    }
+
+
+def _check_auto_created_mycomap_ncbi_results(
+        blast_id: str, details: Dict[str, Any],
+        mycomap_url: Optional[str] = None) -> Tuple[bool, Dict[str, Any]]:
+    """Check one polling interval for NCBI hits on an auto-created BLAST."""
+    from app.services.mycomap_service import (
+        get_mycomap_ncbi_local_fallback_seconds,
+        get_mycomap_ncbi_poll_interval_seconds,
+        get_mycomap_ncbi_poll_max_attempts,
+        get_mycomap_ncbi_queue_position,
+        get_mycomap_ncbi_result_count,
+    )
+
+    details = dict(details or {})
+    attempt = int(details.get("ncbi_poll_attempt") or 0) + 1
+    count, warnings = get_mycomap_ncbi_result_count(blast_id)
+    details["ncbi_poll_attempt"] = attempt
+    details["ncbi_result_count"] = count
+    details["ncbi_status"] = "available" if count > 0 else "waiting"
+    if warnings:
+        details["ncbi_poll_warnings"] = warnings
+    if count > 0:
+        details.pop("ncbi_queue_position", None)
+        return True, details
+    queue_position = (
+        get_mycomap_ncbi_queue_position(mycomap_url) if mycomap_url else None
+    )
+    if queue_position is not None:
+        details["ncbi_queue_position"] = queue_position
+    else:
+        details.pop("ncbi_queue_position", None)
+
+    elapsed_seconds = attempt * get_mycomap_ncbi_poll_interval_seconds()
+    fallback_seconds = get_mycomap_ncbi_local_fallback_seconds()
+    if elapsed_seconds >= fallback_seconds:
+        details["ncbi_status"] = "timed_out_local_fallback"
+        details["ncbi_fallback_local_only"] = True
+        fallback_minutes = max(1, round(fallback_seconds / 60))
+        details["warnings"] = list(details.get("warnings") or []) + [
+            "MycoMap NCBI BLAST results were not ready within "
+            f"{fallback_minutes} minute{'s' if fallback_minutes != 1 else ''}; "
+            "building the tree from local (MycoBLAST) results only."
+        ]
+        return True, details
+
+    max_attempts = get_mycomap_ncbi_poll_max_attempts()
+    if attempt >= max_attempts:
+        raise InatTreeError(
+            "MycoMap NCBI BLAST results were not available after "
+            f"{max_attempts} one-minute checks.",
+            status=504,
+        )
+    return False, details
+
+
+def _append_fasta_to_job_input(job_dir, fasta_text: str) -> int:
     """
-    from app.api.routes import gather_mycomap_sequences_for_queue
-    from app.config import Config
+    Append newly-available sequences to a job's original input FASTA,
+    de-duplicating against what's already there. Reuses the same
+    parsing/formatting helpers as the "add sequences to an existing job"
+    API endpoint. Returns the number of sequences actually appended.
+    """
+    from app.api.routes import (
+        _format_fasta_record_for_job,
+        _parse_fasta_sequences,
+        _sequence_exact_key,
+        _split_fasta_header,
+    )
+
+    sequences_to_add = [
+        s for s in _parse_fasta_sequences(fasta_text) if s.get("sequence", "").strip()
+    ]
+    if not sequences_to_add:
+        return 0
+
+    input_path = job_dir / "input" / "input_raw.fasta"
+    input_path.parent.mkdir(parents=True, exist_ok=True)
+
+    existing_ids = set()
+    existing_records = set()
+    if input_path.exists():
+        for s in _parse_fasta_sequences(input_path.read_text()):
+            seq_id, _ = _split_fasta_header(s["name"])
+            if seq_id:
+                existing_ids.add(seq_id)
+            existing_records.add(_sequence_exact_key(s))
+
+    added_count = 0
+    with open(input_path, "a") as f:
+        if input_path.stat().st_size > 0:
+            f.write("\n")
+        for seq in sequences_to_add:
+            exact_key = _sequence_exact_key(seq)
+            if exact_key in existing_records:
+                continue
+            f.write(_format_fasta_record_for_job(seq, existing_ids, added_count + 1))
+            existing_records.add(exact_key)
+            added_count += 1
+    return added_count
+
+
+def _schedule_ncbi_recheck(job_id: str, *, hours: int = 1) -> None:
+    """Schedule one delayed re-check of MycoMap NCBI results for a job."""
+    from datetime import timedelta
+    from app.workers.queue import get_queue
+
+    q = get_queue("phylo_bulk")
+    q.enqueue_in(
+        timedelta(hours=hours),
+        reconcile_delayed_ncbi_results,
+        job_id,
+        job_timeout="10m",
+    )
+
+
+def schedule_initial_ncbi_recheck(job_id: str) -> None:
+    """
+    Called once, right after a job completes having built its tree from
+    local-only results (NCBI results weren't ready in time). Kicks off the
+    hourly background re-check that appends NCBI hits and rebuilds the tree
+    once MycoMap's NCBI BLAST search finally finishes.
+    """
+    _schedule_ncbi_recheck(job_id, hours=1)
+
+
+def reconcile_delayed_ncbi_results(job_id: str) -> Dict[str, Any]:
+    """
+    Background (RQ-scheduled) re-check for a job that fell back to local-only
+    MycoMap results. If NCBI results have since become available, appends
+    them to the job's input and triggers a full recompute (which preserves
+    prunes/renames/rooting). Otherwise reschedules itself hourly, up to
+    ``get_mycomap_ncbi_recheck_max_hours()`` attempts.
+
+    This is intentionally generic over how the job was created (iNat or
+    Mushroom Observer both write the same ``mycomap_blast_rerun`` /
+    ``mycomap_blast_url`` metrics shape), so it can be reused for any future
+    "rebuild this job once more data exists" need.
+    """
+    from app import create_app
     from app.extensions import db
     from app.models import Job
-    from app.services.mycomap_service import validate_mycomap_url
-    from app.workers.queue import enqueue_job
+    from app.config import Config
+    from app.services.mycomap_service import (
+        fetch_mycomap_fasta,
+        get_mycomap_ncbi_recheck_max_hours,
+        get_mycomap_ncbi_result_count,
+        validate_mycomap_url,
+    )
 
-    observation_id = parse_single_observation_input(raw_input)
+    _app = create_app()
+    with _app.app_context():
+        db_job = Job.query.get(job_id)
+        if not db_job:
+            return {"status": "job_not_found"}
+
+        metrics = dict(db_job.metrics or {})
+        rerun_details = dict(metrics.get("mycomap_blast_rerun") or {})
+        if not rerun_details.get("ncbi_fallback_local_only"):
+            # Already reconciled (or never fell back) -- nothing to do.
+            return {"status": "noop"}
+
+        mycomap_url = str(metrics.get("mycomap_blast_url") or "").strip()
+        blast_id = validate_mycomap_url(mycomap_url)
+        if not blast_id:
+            return {"status": "invalid_url"}
+
+        recheck_count = int(rerun_details.get("ncbi_recheck_count") or 0) + 1
+        rerun_details["ncbi_recheck_count"] = recheck_count
+        rerun_details["ncbi_last_rechecked_at"] = datetime.now(timezone.utc).isoformat()
+
+        count, _warnings = get_mycomap_ncbi_result_count(blast_id)
+        if count <= 0:
+            max_hours = get_mycomap_ncbi_recheck_max_hours()
+            if recheck_count >= max_hours:
+                rerun_details["ncbi_status"] = "gave_up"
+                rerun_details["ncbi_fallback_local_only"] = False
+                metrics["mycomap_blast_rerun"] = rerun_details
+                metrics["mycomap_refresh_warnings"] = list(
+                    metrics.get("mycomap_refresh_warnings") or []
+                ) + [
+                    "Gave up waiting for MycoMap NCBI BLAST results after "
+                    f"{max_hours} hourly re-checks; tree remains local-only."
+                ]
+                db_job.metrics = metrics
+                db.session.commit()
+                return {"status": "gave_up"}
+
+            metrics["mycomap_blast_rerun"] = rerun_details
+            db_job.metrics = metrics
+            db.session.commit()
+            _schedule_ncbi_recheck(job_id, hours=1)
+            return {"status": "still_waiting", "recheck_count": recheck_count}
+
+        # NCBI results are in -- fetch and append them, then rebuild.
+        fetch_result = fetch_mycomap_fasta(blast_id, include_ncbi=True, include_local=False)
+        fasta_text = fetch_result.get("fasta_content") or ""
+        added_count = 0
+        if fasta_text.strip():
+            added_count = _append_fasta_to_job_input(Config.JOB_DIR / job_id, fasta_text)
+
+        rerun_details["ncbi_status"] = "available"
+        rerun_details["ncbi_fallback_local_only"] = False
+        rerun_details["ncbi_appended_at"] = datetime.now(timezone.utc).isoformat()
+        rerun_details["ncbi_appended_count"] = added_count
+        metrics["mycomap_blast_rerun"] = rerun_details
+        db_job.metrics = metrics
+        db.session.commit()
+
+        if added_count <= 0:
+            return {"status": "no_new_sequences"}
+
+        input_info_path = (Config.JOB_DIR / job_id) / "input_info.json"
+        params_dict = {}
+        if input_info_path.exists():
+            with open(input_info_path, "r") as f:
+                params_dict = json.load(f)
+        params_dict["use_current_input"] = True
+
+        from app.workers.queue import enqueue_recompute_job
+
+        enqueue_recompute_job(job_id, params_dict)
+        return {"status": "rebuilt", "added_count": added_count}
+
+
+def prepare_inat_tree_job(observation_id: int, *, include_ncbi: bool = True,
+                          include_local: bool = True,
+                          rebuild_ncbi_blast: bool = False,
+                          recreate_existing_tree: bool = False,
+                          mycomap_local_limit=None,
+                          mycomap_ncbi_limit=None,
+                          defer_after_ncbi_rerun: bool = False,
+                          skip_mycomap_refresh: bool = False,
+                          mycomap_rerun_details: Optional[Dict[str, Any]] = None
+                          ) -> Dict[str, Any]:
+    """Fetch, refresh, and import an iNaturalist observation's MycoMap input.
+
+    This runs in an RQ worker. NCBI refresh callers may request a staged return
+    immediately after MycoMap accepts the rerun, then call again after RQ's
+    delayed retry with ``skip_mycomap_refresh`` enabled.
+    """
+    from app.api.routes import gather_mycomap_sequences_for_queue
+    from app.services.mycomap_service import (
+        MycoMapRerunError,
+        validate_mycomap_url,
+    )
+
     observation = fetch_observation(observation_id)
-    mycomap_url = extract_observation_field_value(observation, MYCOMAP_BLAST_FIELD_NAME)
-
-    if not mycomap_url:
+    genus = _resolve_inat_genus(observation, observation_id)
+    existing_tree_record = find_observation_field_value_record(
+        observation, PHYLOGENETIC_TREE_FIELD_NAME
+    )
+    if (
+        existing_tree_record
+        and str(existing_tree_record.get("value") or "").strip()
+        and not recreate_existing_tree
+    ):
         raise InatTreeError(
-            "This iNaturalist observation needs to have a “Mycomap "
-            "BLAST Results” observation field containing a MycoMap "
-            "BLAST result URL.",
-            status=422,
+            "This observation already has a Phylogenetic Tree field. Select "
+            "Re-create phylogenetic tree to replace its URL with a new tree.",
+            status=409,
         )
+    mycomap_url = extract_observation_field_value(observation, MYCOMAP_BLAST_FIELD_NAME)
+    if not mycomap_url:
+        saved_created_url = str(
+            (mycomap_rerun_details or {}).get("created_mycomap_url") or ""
+        ).strip()
+        if skip_mycomap_refresh and saved_created_url:
+            mycomap_url = saved_created_url
+        else:
+            mycomap_rerun_details = _create_mycomap_blast_from_observation(
+                observation,
+                observation_id,
+                mycomap_local_limit=mycomap_local_limit,
+                mycomap_ncbi_limit=mycomap_ncbi_limit,
+                pending_creation_details=mycomap_rerun_details,
+            )
+            return {
+                "status": "waiting_for_ncbi",
+                "notes": _build_inat_job_title(observation_id, genus),
+                "inat_genus": genus,
+                "mycomap_blast_url": mycomap_rerun_details["created_mycomap_url"],
+                "mycomap_rerun_details": mycomap_rerun_details,
+            }
 
     mycomap_url = mycomap_url.strip()
-    if not validate_mycomap_url(mycomap_url):
+    blast_id = validate_mycomap_url(mycomap_url)
+    if not blast_id:
         raise InatTreeError(
             "The observation's Mycomap BLAST Results field does not "
-            "contain a valid MycoMap BLAST URL.",
+            "contain a valid MycoMap BLAST URL. Edit that iNaturalist field "
+            "to contain the complete MycoMap result-page URL ending in an "
+            "r-number, then retry the tree job.",
             status=422,
         )
+
+    if skip_mycomap_refresh:
+        mycomap_rerun_details = dict(mycomap_rerun_details or {})
+    else:
+        try:
+            mycomap_rerun_details = _refresh_mycomap_blast_results(
+                blast_id,
+                rebuild_local_blast=bool(include_local),
+                rebuild_ncbi_blast=bool(rebuild_ncbi_blast),
+                mycomap_local_limit=mycomap_local_limit,
+                mycomap_ncbi_limit=mycomap_ncbi_limit,
+            )
+        except MycoMapRerunError as e:
+            raise InatTreeError(str(e), status=502)
+
+    if rebuild_ncbi_blast and defer_after_ncbi_rerun and not skip_mycomap_refresh:
+        return {
+            "status": "waiting_for_ncbi",
+            "notes": _build_inat_job_title(observation_id, genus),
+            "inat_genus": genus,
+            "mycomap_blast_url": mycomap_url,
+            "mycomap_rerun_details": mycomap_rerun_details,
+        }
+
+    if mycomap_rerun_details.get("auto_created"):
+        ncbi_ready, mycomap_rerun_details = _check_auto_created_mycomap_ncbi_results(
+            blast_id, mycomap_rerun_details, mycomap_url=mycomap_url
+        )
+        if not ncbi_ready:
+            return {
+                "status": "waiting_for_ncbi",
+                "notes": _build_inat_job_title(observation_id, genus),
+                "inat_genus": genus,
+                "mycomap_blast_url": mycomap_url,
+                "mycomap_rerun_details": mycomap_rerun_details,
+            }
+        if mycomap_rerun_details.get("ncbi_fallback_local_only"):
+            include_ncbi = False
 
     payload, err = gather_mycomap_sequences_for_queue(
         mycomap_url, include_ncbi=include_ncbi, include_local=include_local,
@@ -954,75 +1683,116 @@ def create_job_from_inat_observation(raw_input: str, user=None,
             status=422,
         )
 
-    # If the observation has a `DNA Barcode ITS` field, ensure it's
-    # represented in the tree. Either an exact match already exists in
-    # the MycoMap results (we'll color that tip blue) or we append a
-    # synthetic record named `iNat<id> ...` so the highlighter picks it
-    # up automatically.
+    # Ensure an observation's own ITS barcode is represented in the tree.
     added_inat_its, matched_inat_its_tip = _maybe_add_inat_its_sequence(
         observation, observation_id, sequences
     )
-
-    fasta_text = _build_fasta_text(sequences)
-    # The worker aliases "fasta" -> "fasta_upload" (file on disk). Inline
-    # FASTA text must use "pasted_sequence" so the worker writes it to
-    # input_raw.fasta itself.
-    job_params = {
-        "input_type": "pasted_sequence",
-        "notes": f"iNaturalist obs {observation_id} → Phylogenetic Tree",
-        "sequence": fasta_text,
-        "accessions": [],
-        "alignment_method": DEFAULT_TREE_PARAMS["alignment_method"],
-        "trimming_method": DEFAULT_TREE_PARAMS["trimming_method"],
-        "trim_terminal_overhangs": DEFAULT_TREE_PARAMS["trim_terminal_overhangs"],
-        "alignment_options": {},
-        "tree_method": DEFAULT_TREE_PARAMS["tree_method"],
-        "tree_model": DEFAULT_TREE_PARAMS["tree_model"],
-        "bootstrap": DEFAULT_TREE_PARAMS["bootstrap"],
-        "mcmc_generations": DEFAULT_TREE_PARAMS["mcmc_generations"],
-        "mcmc_nruns": 2,
-        "mcmc_nchains": 4,
+    if not genus:
+        genus = _resolve_inat_genus(
+            observation,
+            observation_id,
+            source_tip_name=matched_inat_its_tip,
+        )
+    job_params = _build_inat_tree_job_params(
+        observation_id, mycomap_url, payload or {}, sequences, genus=genus
+    )
+    metrics = {
+        "notes": _build_inat_job_title(observation_id, genus),
+        "inat_genus": genus,
+        "inat_source_display_name": _build_inat_source_display_name(observation, observation_id),
         "mycomap_blast_url": mycomap_url,
-        "import_filter_details": (payload or {}).get("import_filter_details") or {},
+        "inat_added_its_sequence": bool(added_inat_its),
+        "mycomap_blast_rerun": mycomap_rerun_details,
+        "mycomap_local_blast_rebuilt": (
+            mycomap_rerun_details.get("local_status") == "completed"
+        ),
+        "mycomap_ncbi_blast_rebuilt": bool(
+            (rebuild_ncbi_blast and mycomap_rerun_details.get("ncbi"))
+            or (
+                mycomap_rerun_details.get("auto_created")
+                and mycomap_rerun_details.get("ncbi_status") == "available"
+            )
+        ),
+        "mycomap_local_blast_limit": mycomap_rerun_details.get("local_limit"),
+        "mycomap_ncbi_blast_limit": mycomap_rerun_details.get("ncbi_limit"),
+        "mycomap_preparation_status": "completed",
+        "mycomap_blast_auto_created": bool(
+            mycomap_rerun_details.get("auto_created")
+        ),
+    }
+    refresh_warnings = list(mycomap_rerun_details.get("warnings") or [])
+    if refresh_warnings:
+        metrics["mycomap_refresh_warnings"] = refresh_warnings
+    if added_inat_its:
+        metrics["inat_added_its_name"] = added_inat_its
+    if matched_inat_its_tip:
+        metrics["inat_matched_its_tip"] = matched_inat_its_tip
+    return {
+        "job_params": job_params,
+        "metrics": metrics,
+        "mycomap_blast_url": mycomap_url,
+        "inat_added_its_sequence": bool(added_inat_its),
     }
 
+
+def create_job_from_inat_observation(raw_input: str, user=None,
+                                      include_ncbi: bool = True,
+                                      include_local: bool = True,
+                                      rebuild_ncbi_blast: bool = False,
+                                      recreate_existing_tree: bool = False,
+                                      mycomap_local_limit=None,
+                                      mycomap_ncbi_limit=None,
+                                      public_base_url: Optional[str] = None,
+                                      queue_name: str = "phylo_high",
+                                      queue_class: str = "high",
+                                      source: str = "inaturalist_single_tree",
+                                      extra_metrics: Optional[Dict[str, Any]] = None
+                                      ) -> Dict[str, Any]:
+    """Validate the iNat input and queue preparation for a one-click tree job.
+
+    Returns a dict with: status, job_id, observation_id, mycomap_blast_url,
+    tree_view_url, tree_status_url, message.
+    """
+    from app.config import Config
+    from app.extensions import db
+    from app.models import Job
+    from app.workers.queue import enqueue_job
+
+    observation_id = parse_single_observation_input(raw_input)
+    initial_genus = _clean_display_text((extra_metrics or {}).get("inat_genus"))
     rq_meta = {
         "queue_class": queue_class,
         "source": source,
     }
     if extra_metrics:
         rq_meta.update(extra_metrics)
-    job_id = enqueue_job(job_params, queue_name=queue_name, meta=rq_meta)
-    obs_source_url = f"https://www.inaturalist.org/observations/{observation_id}"
-    public_base_url = _clean_display_text(public_base_url).rstrip("/")
-    metrics = {
-        "via": "inat_phylogenetic_tree",
-        "tree_method": job_params["tree_method"],
-        "alignment_method": job_params["alignment_method"],
-        "trimming_method": job_params["trimming_method"],
-        "trim_terminal_overhangs": job_params["trim_terminal_overhangs"],
-        "notes": job_params["notes"],
-        "inat_observation_id": observation_id,
-        "inat_source_url": obs_source_url,
-        "inat_source_display_name": _build_inat_source_display_name(observation, observation_id),
-        "mycomap_blast_url": mycomap_url,
-        "inat_update_status": "pending",
-        "inat_observation_field": PHYLOGENETIC_TREE_FIELD_NAME,
-        "inat_added_its_sequence": bool(added_inat_its),
-        "queue_class": queue_class,
-        "source": source,
+
+    job_id = str(uuid.uuid4())
+    job_params = {
+        "input_type": "inat_tree_preparation",
+        "notes": _build_inat_job_title(observation_id, initial_genus),
+        "trim_terminal_overhangs": DEFAULT_TREE_PARAMS["trim_terminal_overhangs"],
+        "_inat_tree_preparation": {
+            "observation_id": observation_id,
+            "include_ncbi": bool(include_ncbi),
+            "include_local": bool(include_local),
+            "rebuild_ncbi_blast": bool(rebuild_ncbi_blast),
+            "recreate_existing_tree": bool(recreate_existing_tree),
+            "mycomap_local_limit": mycomap_local_limit,
+            "mycomap_ncbi_limit": mycomap_ncbi_limit,
+        },
     }
-    if extra_metrics:
-        metrics.update(extra_metrics)
-    if added_inat_its:
-        metrics["inat_added_its_name"] = added_inat_its
-    if matched_inat_its_tip:
-        # An existing MycoMap result already carried this exact sequence
-        # (typically under its GenBank accession). The viewer will color
-        # that tip blue when the job finishes.
-        metrics["inat_matched_its_tip"] = matched_inat_its_tip
-    if public_base_url:
-        metrics["inat_public_base_url"] = public_base_url
+    metrics = _build_inat_tree_metrics(
+        observation_id,
+        queue_class=queue_class,
+        source=source,
+        public_base_url=public_base_url,
+        rebuild_ncbi_blast=bool(rebuild_ncbi_blast),
+        recreate_existing_tree=bool(recreate_existing_tree),
+        genus=initial_genus,
+        extra_metrics=extra_metrics,
+    )
+    metrics["mycomap_preparation_status"] = "queued"
     job_record = Job(
         id=job_id,
         status="queued",
@@ -1034,33 +1804,68 @@ def create_job_from_inat_observation(raw_input: str, user=None,
         job_record.user_id = user.id
     db.session.add(job_record)
     db.session.commit()
+    try:
+        rq_meta["inat_tree_preparation"] = "queued"
+        enqueue_job(
+            job_params,
+            queue_name=queue_name,
+            meta=rq_meta,
+            job_id=job_id,
+            job_timeout=7200,
+        )
+    except Exception:
+        metrics = dict(job_record.metrics or {})
+        metrics["mycomap_preparation_status"] = "failed"
+        metrics["error"] = "Unable to queue iNaturalist tree preparation."
+        job_record.metrics = metrics
+        job_record.status = "failed"
+        db.session.commit()
+        raise
 
-    message = (
-        "Tree job queued. When it finishes, Dikarya will add a "
-        "“Phylogenetic Tree” field on the iNaturalist "
-        "observation linking to the tree."
-    )
-    if added_inat_its:
+    if recreate_existing_tree:
         message = (
-            "Tree job queued. The observation's DNA Barcode ITS sequence "
-            "was added to the input because it did not exactly match any "
-            "MycoMap result. " + message
+            "Tree re-creation queued. When the new tree finishes, Dikarya "
+            "will replace the existing “Phylogenetic Tree” field URL on the "
+            "iNaturalist observation."
+        )
+    elif rebuild_ncbi_blast:
+        message = (
+            "Tree job queued. Dikarya will refresh MycoMap local and NCBI "
+            "BLAST results in the background, wait for the NCBI results "
+            "without blocking other tree jobs, then build the tree. When it "
+            "finishes, Dikarya will add a “Phylogenetic Tree” field to the "
+            "iNaturalist observation."
+        )
+    else:
+        message = (
+            "Tree job queued. If the observation has saved Mycomap BLAST "
+            "Results, Dikarya will refresh and use them. If it only has a DNA "
+            "Barcode ITS, Dikarya will create the Mycomap BLAST, add its URL "
+            "to iNaturalist, check once a minute for NCBI results, and then "
+            "build the tree. When it finishes, Dikarya will add a “Phylogenetic "
+            "Tree” field to the observation."
         )
     return {
         "status": "queued",
         "job_id": job_id,
         "observation_id": observation_id,
-        "mycomap_blast_url": mycomap_url,
+        "mycomap_blast_url": None,
         "tree_status_url": f"/job/{job_id}",
         "tree_view_url": f"/job/{job_id}/view",
-        "inat_added_its_sequence": bool(added_inat_its),
+        "inat_added_its_sequence": None,
+        "mycomap_local_blast_rebuilt": False,
+        "mycomap_ncbi_blast_rebuilt": False,
+        "mycomap_ncbi_blast_rebuild_requested": bool(rebuild_ncbi_blast),
+        "recreate_existing_tree": bool(recreate_existing_tree),
         "queue_class": queue_class,
         "message": message,
     }
 
 
 def create_jobs_from_inat_scope(raw_input: str, resolved_type: str, user=None,
-                                public_base_url: Optional[str] = None) -> Dict[str, Any]:
+                                public_base_url: Optional[str] = None,
+                                mycomap_local_limit=None,
+                                mycomap_ncbi_limit=None) -> Dict[str, Any]:
     """Queue one one-click tree job for each eligible observation in a scope."""
     parsed = parse_inaturalist_tree_input(raw_input)
     resolved = resolve_inaturalist_user_or_project(parsed, preferred_type=resolved_type)
@@ -1074,51 +1879,122 @@ def create_jobs_from_inat_scope(raw_input: str, resolved_type: str, user=None,
     scope = resolved["scope"]
     collected = _collect_tree_eligible_observations(scope)
     observations = collected.get("observations") or []
-    queued_count = len(observations)
-    queue_class = "high" if queued_count == 1 else "bulk"
+    eligible_count = len(observations)
+    queue_class = "high" if eligible_count == 1 else "bulk"
     queue_name = "phylo_high" if queue_class == "high" else "phylo_bulk"
     batch_id = uuid.uuid4().hex
     job_ids: List[str] = []
+    failed_observations: List[Dict[str, Any]] = []
 
     for observation in observations:
         obs_id = int(observation.get("id"))
-        result = create_job_from_inat_observation(
-            str(obs_id),
-            user=user,
-            public_base_url=public_base_url,
-            queue_name=queue_name,
-            queue_class=queue_class,
-            source="inaturalist_batch_tree",
-            extra_metrics={
-                "batch_id": batch_id,
-                "batch_scope_type": scope["type"],
-                "batch_scope_value": scope.get("value"),
-            },
-        )
-        job_ids.append(result["job_id"])
+        try:
+            result = create_job_from_inat_observation(
+                str(obs_id),
+                user=user,
+                public_base_url=public_base_url,
+                queue_name=queue_name,
+                queue_class=queue_class,
+                source="inaturalist_batch_tree",
+                mycomap_local_limit=mycomap_local_limit,
+                mycomap_ncbi_limit=mycomap_ncbi_limit,
+                extra_metrics={
+                    "batch_id": batch_id,
+                    "batch_scope_type": scope["type"],
+                    "batch_scope_value": scope.get("value"),
+                    "inat_genus": _extract_inat_genus(observation),
+                },
+            )
+            job_ids.append(result["job_id"])
+        except InatTreeError as exc:
+            logger.warning(
+                "Could not queue iNaturalist batch observation %s: %s", obs_id, exc
+            )
+            failed_observations.append({
+                "observation_id": obs_id,
+                "error": str(exc),
+            })
+        except Exception:
+            from app.extensions import db
+
+            db.session.rollback()
+            logger.exception(
+                "Unexpected failure queueing iNaturalist batch observation %s", obs_id
+            )
+            failed_observations.append({
+                "observation_id": obs_id,
+                "error": "Unable to queue this observation's tree job.",
+            })
+
+    queued_count = len(job_ids)
+    failed_count = len(failed_observations)
 
     skipped_tree = int(collected.get("skipped_existing_tree_count") or 0)
     skipped_myco = int(collected.get("skipped_missing_mycomap_count") or 0)
+    auto_create_mycomap = int(
+        collected.get("auto_create_mycomap_blast_count") or 0
+    )
+    if eligible_count and queued_count == 0 and failed_count == eligible_count:
+        raise InatTreeError(
+            "No tree jobs could be queued. Please try again.",
+            status=503,
+            details={
+                "partial": False,
+                "eligible_count": eligible_count,
+                "queued_count": 0,
+                "failed_count": failed_count,
+                "failed_observations": failed_observations,
+                "skipped_existing_tree_count": skipped_tree,
+                "skipped_missing_mycomap_count": skipped_myco,
+                "batch_id": batch_id,
+                "job_ids": [],
+                "queue_class": queue_class,
+                "scope_type": scope["type"],
+                "scope_value": scope.get("value"),
+            },
+        )
     if queued_count > 1:
         message = (
             f"Queued {queued_count} bulk tree jobs. These will run in the "
             "background without blocking one-at-a-time tree jobs."
         )
     elif queued_count == 1:
-        message = "Queued 1 high-priority tree job."
+        priority_label = "high-priority" if queue_class == "high" else "bulk"
+        message = f"Queued 1 {priority_label} tree job."
+    elif failed_count:
+        message = "No eligible iNaturalist tree jobs could be queued."
     else:
         message = _message_for_scope_counts(scope, collected)
     if queued_count and (skipped_tree or skipped_myco):
         message += (
             f" Skipped {skipped_tree} observations that already had trees "
-            f"and {skipped_myco} without Mycomap BLAST Results."
+            f"and {skipped_myco} without Mycomap BLAST Results or DNA Barcode ITS."
         )
+    if queued_count and auto_create_mycomap:
+        blast_noun = "job" if auto_create_mycomap == 1 else "jobs"
+        message += (
+            f" {auto_create_mycomap} {blast_noun} will create Mycomap BLAST "
+            "Results from DNA Barcode ITS and add the URL to iNaturalist "
+            "before building the tree."
+        )
+    if failed_count:
+        message += (
+            f" {failed_count} eligible observation"
+            f"{'s' if failed_count != 1 else ''} could not be queued."
+        )
+        if queued_count:
+            message += " The other queued jobs are unaffected."
 
     return {
         "status": "success",
+        "partial": bool(failed_count),
+        "eligible_count": eligible_count,
         "queued_count": queued_count,
+        "failed_count": failed_count,
+        "failed_observations": failed_observations,
         "skipped_existing_tree_count": skipped_tree,
         "skipped_missing_mycomap_count": skipped_myco,
+        "auto_create_mycomap_blast_count": auto_create_mycomap,
         "batch_id": batch_id,
         "job_ids": job_ids,
         "queue_class": queue_class,
@@ -1285,8 +2161,8 @@ def post_completed_tree_to_inaturalist(job_id: str, metrics: Dict[str, Any]) -> 
        inat_observation_field_value_id: int | None,
        error: str | None}
 
-    Never raises — the caller must not fail the tree job if the iNat write
-    fails. The caller is responsible for merging the result into Job.metrics.
+    Never raises. The caller must not fail the tree job if the iNat write
+    fails and is responsible for merging the result into Job.metrics.
     """
     out: Dict[str, Any] = {
         "status": "skipped",

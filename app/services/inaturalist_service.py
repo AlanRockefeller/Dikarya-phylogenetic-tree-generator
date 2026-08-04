@@ -138,6 +138,55 @@ def get_field_value(observation_data: Dict, field_name: str) -> Optional[str]:
     return None
 
 
+def _clean_display_text(value: Any) -> str:
+    """Normalize free-form iNaturalist text for FASTA/tree labels."""
+    if value is None:
+        return ""
+    text = re.sub(r'[<>"]', "", str(value))
+    text = re.sub(r"\s+", " ", text).strip()
+    return text.strip(" ,;:-_")
+
+
+def _normalize_location_piece(piece: str) -> str:
+    """Collapse common country variants so location labels stay short."""
+    cleaned = _clean_display_text(piece)
+    if not cleaned:
+        return ""
+    lowered = cleaned.casefold()
+    if lowered in {
+        "united states",
+        "united states of america",
+        "usa",
+        "u.s.a.",
+        "u.s.",
+    }:
+        return "US"
+    return cleaned
+
+
+def _extract_location_label(observation_data: Dict) -> str:
+    """Return a compact iNaturalist location label like `New Mexico US`."""
+    for key in (
+        "private_place_guess",
+        "place_guess",
+        "private_locality",
+        "locality",
+    ):
+        raw = observation_data.get(key)
+        if not raw:
+            continue
+        parts = [_normalize_location_piece(part) for part in str(raw).split(",")]
+        parts = [part for part in parts if part]
+        if not parts:
+            continue
+        if len(parts) >= 3 and len(parts[-2]) <= 3:
+            return f"{parts[0]} {parts[-1]}".strip()
+        if len(parts) >= 2:
+            return " ".join(parts[-2:])
+        return parts[0]
+    return ""
+
+
 def _make_api_request(url: str, max_retries: int = 3) -> Dict:
     """
     Make a request to the iNaturalist API with proper headers and 429 retry logic.
@@ -499,16 +548,22 @@ def extract_sequences_from_observations(dna_observations: List[Dict]) -> List[Di
                 species_name = taxon.get('name', '')
         
         # Sanitize species name
-        species_name = re.sub(r'[<>"\']', '', str(species_name)).strip()
+        species_name = re.sub(r'[<>"\']', '', str(species_name or '')).strip()
+        location_label = _extract_location_label(obs)
         
-        # Build sequence name: iNat_<id>
-        seq_name = f"iNat_{obs_id}"
+        # Build sequence name with the observation ID and location visible in tree labels.
+        seq_name_parts = [f"iNat{obs_id}"]
+        if location_label:
+            seq_name_parts.append(location_label)
+        seq_name = " ".join(seq_name_parts)
         
         sequences.append({
             'name': seq_name,
             'organism': species_name,
             'sequence': cleaned_dna,
             'source': 'inaturalist',
+            'hit_source': 'inat_observation',
+            'location': location_label,
             'observation_id': str(obs_id)
         })
     
@@ -563,7 +618,10 @@ def fetch_inaturalist_data(url: str, mode: str = 'all') -> Dict:
         
         # Analyze PSN independently (regardless of whether ITS exists)
         psn_histogram = analyze_provisional_species([observation])
-        
+
+        from app.services.inaturalist_tree_service import MYCOMAP_BLAST_FIELD_NAME
+        mycomap_blast_url = get_field_value(observation, MYCOMAP_BLAST_FIELD_NAME)
+
         final_result.update({
             'total_observations': 1,
             'total_its_observations': 1 if analysis['dna_count'] > 0 else 0,
@@ -574,6 +632,7 @@ def fetch_inaturalist_data(url: str, mode: str = 'all') -> Dict:
             'dna_observations': analysis['dna_observations'],
             'provisional_species': psn_histogram,
             'sequences': sequences,
+            'mycomap_blast_url': mycomap_blast_url,
         })
         
     else:

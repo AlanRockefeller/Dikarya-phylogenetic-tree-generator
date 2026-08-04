@@ -1,2 +1,0 @@
-"""Alkaloid content estimator support."""
-

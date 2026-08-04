@@ -21,8 +21,8 @@
             <h2 class="text-2xl font-bold text-journal-dark dark:text-gray-100 flex items-center">
                 <i class="fas fa-tree text-journal-gold mr-3"></i>
                 {% if view_only %}
-                Tree Viewer <span class="ml-3 text-lg font-normal text-gray-400 dark:text-gray-500">— Viewing
-                    Only</span>
+                Tree Viewer <span class="ml-3 text-lg font-normal text-gray-400 dark:text-gray-500">(Viewing
+                    Only)</span>
                 {% else %}
                 Tree Viewer
                 {% endif %}
@@ -118,12 +118,17 @@
                     </button>
                     <button type="button"
                         class="px-3 py-2 text-sm font-medium text-gray-700 dark:text-gray-200 bg-white dark:bg-journal-dark hover:bg-journal-gold hover:text-journal-dark transition-colors flex items-center gap-1.5 border-l border-gray-300 dark:border-journal-dark"
-                        id="btn-ladderize" title="Sort Nodes">
+                        id="btn-ladderize" title="Cycle Node Sorting (S)">
                         <i class="fa fa-sort-amount-down"></i> Sort
                     </button>
                     <button type="button"
                         class="px-3 py-2 text-sm font-medium text-gray-700 dark:text-gray-200 bg-white dark:bg-journal-dark hover:bg-journal-gold hover:text-journal-dark transition-colors border-l border-gray-300 dark:border-journal-dark"
                         id="btn-toggle-support" title="Toggle Support Values">Hide Node Support</button>
+                    <button type="button"
+                        class="px-3 py-2 text-sm font-medium text-gray-700 dark:text-gray-200 bg-white dark:bg-journal-dark hover:bg-journal-gold hover:text-journal-dark transition-colors flex items-center gap-1.5 border-l border-gray-300 dark:border-journal-dark"
+                        id="btn-tree-shortcuts-help" title="View Tree Viewer Keyboard Shortcuts (?)">
+                        <i class="fas fa-keyboard"></i> Keyboard Shortcuts
+                    </button>
                 </div>
             </div>
         </div>
@@ -254,7 +259,7 @@
 
                     <div class="h-4 w-px bg-gray-300 dark:bg-gray-700 mx-0.5"></div>
 
-                    <div class="flex items-center gap-2" title="Minimum identity">
+                    <div class="flex items-center gap-2" title="Maximum identity; lower this value to hide more similar sequences first">
                         <span class="text-xs font-bold text-purple-700 dark:text-purple-300">Identity %</span>
                         <input type="range" id="slider-identity" min="0" max="100" value="100" step="1"
                             class="w-24 h-2 rounded-lg appearance-none cursor-pointer accent-purple-500" disabled>
@@ -278,7 +283,7 @@
                 <span class="text-xs font-bold uppercase tracking-wide text-gray-600 dark:text-gray-400">Color
                     Groups</span>
                 <div
-                    class="flex gap-1 border border-gray-300 dark:border-journal-dark rounded-lg overflow-hidden min-h-[34px] items-center bg-white dark:bg-journal-dark px-1">
+                    class="flex gap-1 border border-gray-300 dark:border-journal-dark rounded-lg overflow-visible min-h-[34px] items-center bg-white dark:bg-journal-dark px-1">
                     <div id="color-group-chips" class="flex items-center gap-1 max-w-[360px] overflow-x-auto py-0.5">
                     </div>
 
@@ -352,14 +357,16 @@
                     <button type="button"
                         class="btn-selection-action px-2 py-1 text-xs hover:bg-gray-100 dark:hover:bg-gray-800 rounded text-gray-600 dark:text-gray-300"
                         data-action="none" title="Select None">None</button>
-                    <div class="relative group">
-                        <button type="button"
-                            class="px-2 py-1 text-xs hover:bg-gray-100 dark:hover:bg-gray-800 rounded text-gray-600 dark:text-gray-300">
+                    <div class="relative">
+                        <button type="button" id="btn-selection-more"
+                            class="px-2 py-1 text-xs hover:bg-gray-100 dark:hover:bg-gray-800 rounded text-gray-600 dark:text-gray-300"
+                            title="More selection actions" aria-label="More selection actions" aria-haspopup="true"
+                            aria-expanded="false" aria-controls="selection-more-menu">
                             <i class="fas fa-ellipsis-v"></i>
                         </button>
                         <!-- Dropdown Menu -->
-                        <div
-                            class="absolute right-0 top-full mt-1 hidden group-hover:block w-40 bg-white dark:bg-gray-900 border border-gray-200 dark:border-gray-700 rounded shadow-lg z-50 py-1">
+                        <div id="selection-more-menu"
+                            class="absolute right-0 top-full mt-1 hidden w-40 bg-white dark:bg-gray-900 border border-gray-200 dark:border-gray-700 rounded shadow-lg z-50 py-1">
                             <button type="button"
                                 class="btn-selection-action block w-full text-left px-3 py-1.5 text-xs hover:bg-gray-100 dark:hover:bg-gray-800"
                                 data-action="all-internal">All Internal Nodes</button>
@@ -463,7 +470,8 @@
             {% endif %}
             <button type="button"
                 class="px-4 py-2 text-sm font-semibold rounded-lg bg-gray-500 hover:bg-gray-600 text-white transition-colors shadow-sm flex items-center gap-2"
-                id="btn-recompute">
+                id="btn-recompute"
+                title="Recompute rebuilds the tree from scratch using your remaining (unpruned) sequences.  It's a full re-analysis, not just a redraw. It re-runs alignment, trimming, and tree inference with the job's original settings, then reloads the viewer. Your pruned-taxa list and renames are kept; the current selection is cleared.&#10;Use it after pruning low-quality, contaminant, redundant, or long-branch sequences. Pruning only removes tips, while Recompute recalculates alignment, topology, branch lengths, and support values for what's left.&#10;You usually don't need it after renaming, recoloring, rotating, or rerooting (display-only changes), or if you haven't changed the sequence set.">
                 <i class="fa fa-sync"></i> Recompute
             </button>
             <a href="/tree?edit_job_id={{ job_id }}"
@@ -512,12 +520,12 @@
             </button>
             <button type="button"
                 class="px-4 py-2 text-sm font-semibold rounded-lg bg-gray-600 hover:bg-gray-700 text-white transition-colors shadow-sm flex items-center gap-2"
-                id="btn-deselect">
+                id="btn-deselect" title="Deselect current selection (D)">
                 <i class="fa fa-mouse-pointer"></i> Deselect
             </button>
             <button type="button"
                 class="px-4 py-2 text-sm font-semibold rounded-lg bg-purple-600 hover:bg-purple-700 text-white transition-colors shadow-sm flex items-center gap-2 disabled:opacity-50 disabled:cursor-not-allowed"
-                id="btn-alignment-viewer" title="Open the Alignment Viewer for visible/selected tree sequences">
+                id="btn-alignment-viewer" title="Open the Alignment Viewer for visible/selected tree sequences (V)">
                 <i class="fa fa-stream"></i> Alignment Viewer
             </button>
         </div>
@@ -538,6 +546,13 @@
                 class="text-journal-gold hover:text-journal-gold-light transition-colors flex items-center gap-1">
                 <i class="fas fa-download text-xs"></i> NEXUS Tree
             </a>
+            {% if job_details.get('tree_method', '')|lower == 'mrbayes' %}
+            <a href="/api/job/{{ job_id }}/download/mrbayes"
+                class="text-journal-gold hover:text-journal-gold-light transition-colors flex items-center gap-1"
+                title="NEXUS command file, raw .p parameter traces, .t tree traces, and MrBayes summaries">
+                <i class="fas fa-download text-xs"></i> MrBayes Analysis Files
+            </a>
+            {% endif %}
             <a id="fasta-pruned" href="#" target="_blank"
                 class="text-journal-gold hover:text-journal-gold-light transition-colors flex items-center gap-1">
                 <i class="fas fa-download text-xs"></i> Pruned FASTA
@@ -546,6 +561,29 @@
                 class="text-journal-gold hover:text-journal-gold-light transition-colors flex items-center gap-1">
                 <i class="fas fa-download text-xs"></i> Original FASTA
             </a>
+            <a href="/api/job/{{ job_id }}/download/fasta/aligned" download
+                class="text-journal-gold hover:text-journal-gold-light transition-colors flex items-center gap-1"
+                title="Aligned FASTA before trimming; this is also the tree input when trimming is disabled">
+                <i class="fas fa-download text-xs"></i> Aligned FASTA (Before Trimming)
+            </a>
+            {% set export_trimming_details = job_details.get('trimming_details') or {} %}
+            {% set export_terminal_trim = export_trimming_details.get('terminal_overhang_trim') or {} %}
+            {% set export_trim_method = job_details.get('trimming_method', 'none')|lower %}
+            {% set export_has_trimming = export_trim_method not in ['none', ''] or export_terminal_trim.get('enabled') %}
+            {% if export_has_trimming %}
+            <a href="/api/job/{{ job_id }}/download/fasta/trimmed" download
+                class="text-journal-gold hover:text-journal-gold-light transition-colors flex items-center gap-1"
+                title="Final trimmed alignment supplied to the tree builder">
+                <i class="fas fa-download text-xs"></i> Trimmed FASTA (Tree Input)
+            </a>
+            {% endif %}
+            {% if export_trimming_details.get('report_file') %}
+            <a href="/api/job/{{ job_id }}/download/alignment/inspection" download
+                class="text-journal-gold hover:text-journal-gold-light transition-colors flex items-center gap-1"
+                title="Before/after FASTA files and a colored HTML report marking retained and removed columns">
+                <i class="fas fa-search text-xs"></i> Trimming Inspection ZIP
+            </a>
+            {% endif %}
             <a id="btn-save-svg" href="#"
                 class="text-journal-gold hover:text-journal-gold-light transition-colors flex items-center gap-1">
                 <i class="fas fa-download text-xs"></i> Download SVG
@@ -567,6 +605,49 @@
         <option value="phylotree" selected>Phylotree v2</option>
         <option value="d3">D3 Standard</option>
     </select>
+</div>
+
+<!-- Keyboard Shortcuts Modal -->
+<div id="modal-tree-shortcuts" class="fixed inset-0 z-50 hidden" aria-labelledby="tree-shortcuts-title" role="dialog"
+    aria-modal="true">
+    <div class="fixed inset-0 bg-black/50 dark:bg-black/70" id="tree-shortcuts-backdrop"></div>
+    <div class="fixed inset-0 z-10 overflow-y-auto">
+        <div class="flex min-h-full items-center justify-center p-4">
+            <div
+                class="relative w-full max-w-md rounded-xl bg-white dark:bg-journal-green shadow-2xl border border-gray-200 dark:border-journal-dark overflow-hidden">
+                <div class="px-5 py-4 border-b border-gray-200 dark:border-journal-dark flex items-center justify-between">
+                    <h3 id="tree-shortcuts-title" class="text-lg font-bold text-journal-dark dark:text-gray-100">
+                        Tree Viewer Keyboard Shortcuts
+                    </h3>
+                    <button type="button" id="btn-tree-shortcuts-close"
+                        class="p-2 rounded-lg text-gray-500 hover:text-gray-800 hover:bg-gray-100 dark:text-gray-300 dark:hover:text-white dark:hover:bg-journal-dark"
+                        title="Close">
+                        <i class="fas fa-times"></i>
+                    </button>
+                </div>
+                <dl class="grid grid-cols-[auto,1fr] gap-x-4 gap-y-3 px-5 py-4 text-sm text-gray-700 dark:text-gray-200">
+                    <dt><kbd class="rounded border border-gray-300 bg-gray-100 px-2 py-0.5 font-mono dark:border-gray-600 dark:bg-journal-dark">D</kbd></dt>
+                    <dd>Deselect all sequences</dd>
+                    <dt><kbd class="rounded border border-gray-300 bg-gray-100 px-2 py-0.5 font-mono dark:border-gray-600 dark:bg-journal-dark">V</kbd></dt>
+                    <dd>Open the Alignment Viewer</dd>
+                    <dt><kbd class="rounded border border-gray-300 bg-gray-100 px-2 py-0.5 font-mono dark:border-gray-600 dark:bg-journal-dark">S</kbd></dt>
+                    <dd>Cycle node sorting</dd>
+                    <dt><kbd class="rounded border border-gray-300 bg-gray-100 px-2 py-0.5 font-mono dark:border-gray-600 dark:bg-journal-dark">B</kbd></dt>
+                    <dd>Toggle Box Select mode</dd>
+                    <dt><kbd class="rounded border border-gray-300 bg-gray-100 px-2 py-0.5 font-mono dark:border-gray-600 dark:bg-journal-dark">Ctrl/Cmd + drag</kbd></dt>
+                    <dd>Toggle sequences within a selection box</dd>
+                    <dt><kbd class="rounded border border-gray-300 bg-gray-100 px-2 py-0.5 font-mono dark:border-gray-600 dark:bg-journal-dark">Alt/Option + drag</kbd></dt>
+                    <dd>Prune sequences within a selection box</dd>
+                    <dt><kbd class="rounded border border-gray-300 bg-gray-100 px-2 py-0.5 font-mono dark:border-gray-600 dark:bg-journal-dark">Ctrl/Cmd + Enter</kbd></dt>
+                    <dd>Save names in the Rename modal</dd>
+                    <dt><kbd class="rounded border border-gray-300 bg-gray-100 px-2 py-0.5 font-mono dark:border-gray-600 dark:bg-journal-dark">Esc</kbd></dt>
+                    <dd>Close or cancel the current mode</dd>
+                    <dt><kbd class="rounded border border-gray-300 bg-gray-100 px-2 py-0.5 font-mono dark:border-gray-600 dark:bg-journal-dark">?</kbd></dt>
+                    <dd>Show this shortcut list</dd>
+                </dl>
+            </div>
+        </div>
+    </div>
 </div>
 
 <!-- Rename Modal -->
@@ -655,7 +736,7 @@
                 <p><span class="opacity-70 w-32 inline-block">Substitution Model:</span> <span class="font-medium">{{
                         job_details.get('tree_model') }}</span></p>
                 {% endif %}
-                {% if job_details.get('bootstrap') %}
+                {% if job_details.get('bootstrap') and job_details.get('tree_method') in ['raxml', 'iqtree', 'fasttree'] %}
                 <p><span class="opacity-70 w-32 inline-block">Bootstraps:</span> <span class="font-medium">{{
                         job_details.get('bootstrap') }}</span></p>
                 {% endif %}
@@ -682,9 +763,19 @@
                     multi-sequence terminal regions were kept.
                 </p>
                 {% endif %}
-                {% if job_details.get('mcmc_generations') %}
+                {% if job_details.get('tree_method', '')|lower == 'mrbayes' %}
                 <p><span class="opacity-70 w-32 inline-block">MCMC Generations:</span> <span class="font-medium">{{
-                        job_details.get('mcmc_generations') }}</span></p>
+                        job_details.get('mcmc_generations', 50000) }}</span></p>
+                <p><span class="opacity-70 w-32 inline-block">Independent Runs:</span> <span class="font-medium">{{
+                        job_details.get('mcmc_nruns', 2) }}</span></p>
+                <p><span class="opacity-70 w-32 inline-block">Chains per Run:</span> <span class="font-medium">{{
+                        job_details.get('mcmc_nchains', 4) }}</span></p>
+                <p><span class="opacity-70 w-32 inline-block">Relative Burn-in:</span> <span class="font-medium">{{
+                        ((job_details.get('mcmc_burnin_fraction', 0.25)|float) * 100)|round(1) }}%</span></p>
+                <p class="text-xs text-gray-500 dark:text-gray-400 mt-2">
+                    Download the MrBayes analysis files above to inspect the exact NEXUS commands and open each
+                    <code>.p</code> parameter trace in Tracer for convergence and effective sample size assessment.
+                </p>
                 {% endif %}
             </div>
         </div>
@@ -700,7 +791,8 @@
 
                 {% for key, value in job_details.items() %}
                 {% if key not in ['alignment_method', 'tree_method', 'trimming_method', 'tree_model', 'bootstrap',
-                'mcmc_generations', 'sequences', 'accessions', 'sequence', 'notes', 'alignment_options', 'input_type',
+                'mcmc_generations', 'mcmc_nruns', 'mcmc_nchains', 'mcmc_burnin_fraction',
+                'sequences', 'accessions', 'sequence', 'notes', 'alignment_options', 'input_type',
                 'trim_terminal_overhangs', 'trimming_details']
                 and value %}
                 {% if key == 'blast_mode' %}
@@ -738,7 +830,8 @@
             <span class="font-medium">{{ mycomap_filters.get('label', 'MycoMap import filters') }}</span>:
             {{ counts.get('invalid_sequence', 0) }} invalid/short,
             {{ counts.get('contaminant', 0) }} contaminant,
-            {{ counts.get('conflicting_local', 0) }} conflicting local FASTA.
+            {{ counts.get('conflicting_local', 0) }} conflicting local FASTA,
+            {{ counts.get('duplicate_observation', 0) }} duplicate observation records.
         </p>
         {% if mycomap_filters.get('filtered_records') %}
         <div class="mt-3 overflow-x-auto">
@@ -814,13 +907,13 @@
 
 <script src="{{ url_for('static', filename='vendor/underscore-1.13.6-min.js') }}"></script>
 
-<script src="{{ url_for('static', filename='js/phylotree.js') }}"></script>
+<script src="{{ url_for('static', filename='js/phylotree.js') }}?v=6"></script>
 
-<script src="{{ url_for('static', filename='js/tree_viewer_phylotree_v2.js') }}?v=44"></script>
+<script src="{{ url_for('static', filename='js/tree_viewer_phylotree_v2.js') }}?v=56"></script>
 
-<script src="{{ url_for('static', filename='js/tree_viewer_api.js') }}?v=2"></script>
+<script src="{{ url_for('static', filename='js/tree_viewer_api.js') }}?v=3"></script>
 
-<script src="{{ url_for('static', filename='js/tree_viewer_controller.js') }}?v=43"></script>
+<script src="{{ url_for('static', filename='js/tree_viewer_controller.js') }}?v=50"></script>
 
 {% include 'partials/alignment_viewer_modal.html' %}
 

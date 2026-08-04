@@ -1,0 +1,12 @@
+/var/www/dikarya/var/logs/access.log /var/www/dikarya/var/logs/error.log {
+    daily
+    maxsize 25M
+    rotate 14
+    maxage 30
+    missingok
+    notifempty
+    compress
+    dateext
+    dateformat -%Y%m%d-%H%M%S
+    copytruncate
+}

@@ -59,5 +59,12 @@ ARCHITECTURE.md
 temp_jobs/
 *.out
 dosage-calculator/
+/app/dosage/
+/app/static/js/dosage_calculator.js
+/app/templates/test.html
+/tests/test_dosage_calculator.py
 /app/static/files/
 /amanitaceae
+mycomap.com.api.md
+chatgpt_project_context.txt
+mycomap_api_documentation.md

@@ -259,7 +259,7 @@
     box-shadow: inset 3px 0 0 rgba(212, 164, 17, 0.85);
 }
 
-/* Alternating row shading — driven by logical row index from the renderer. */
+/* Alternating row shading driven by the logical row index from the renderer. */
 .dark .alignment-viewer[data-color-scheme] .av-name-row.av-row-alt,
 .dark .alignment-viewer[data-color-scheme] .av-cell-row.av-row-alt {
     background: var(--av-alt-row-bg);
@@ -340,7 +340,7 @@
 .dark .alignment-viewer .av-cell.av-gap { background: transparent; color: #2f3a37; }
 .dark .alignment-viewer .av-cell.av-amb { background: #161f1d; color: #7c8a86; }
 
-/* Dark-mode schemed palette — text colors only; backgrounds are the row tint. */
+/* Dark-mode schemed palette with text colors only; backgrounds use the row tint. */
 .dark .alignment-viewer[data-color-scheme] .av-cell.av-a { background: transparent; color: var(--av-base-a); }
 .dark .alignment-viewer[data-color-scheme] .av-cell.av-t { background: transparent; color: var(--av-base-t); }
 .dark .alignment-viewer[data-color-scheme] .av-cell.av-u { background: transparent; color: var(--av-base-t); }
@@ -350,7 +350,7 @@
 .dark .alignment-viewer[data-color-scheme] .av-cell.av-amb { background: transparent; color: var(--av-name-text); }
 
 /* ============================================================
-   Highlight Differences — per-base color carries the identity.
+   Highlight Differences: per-base color carries the identity.
    No shared amber background, no box-shadow.
    ============================================================ */
 .alignment-viewer .av-cell.av-match { /* default: no special style */ }
@@ -405,7 +405,7 @@
 }
 
 /* ============================================================
-   Column-position ruler — quiet navigational aid.
+   Column-position ruler as a quiet navigational aid.
    ============================================================ */
 .alignment-viewer .av-ruler-tick {
     display: inline-block;
@@ -449,13 +449,13 @@
     display: none;
 }
 
-/* Uppercase nucleotide display — pure CSS so virtualized cells inherit on render. */
+/* Pure CSS uppercase nucleotide display so virtualized cells inherit on render. */
 .alignment-viewer.alignment-uppercase .av-cell {
     text-transform: uppercase;
 }
 
 /* ============================================================
-   Header close (×) button — minimal, upper-right styling.
+   Header close (×) button with minimal, upper-right styling.
    ============================================================ */
 #alignment-viewer-close.av-close-btn {
     position: absolute;

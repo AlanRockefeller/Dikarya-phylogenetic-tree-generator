@@ -1,3 +1,6 @@
+# SHA-256 hashes for immutable third-party browser assets, relative to app/static/.
+# Source, version, copyright, and license details are in vendor/THIRD_PARTY_NOTICES.md.
+# Audited against the documented upstream artifacts on 2026-07-18.
 f2094bbf6141b359722c4fe454eb6c4b0f0e42cc10cc7af921fc158fceb86539  vendor/d3.v7.min.js
 a8d7e6291ad80256f976ace90824a71018d2f706992c9107b20bdced97bee27b  vendor/lodash-4.min.js
 c2e4a9ef08144839ff47c14202063ecfe4e59e70a4e7154a26bd50d880c88ba1  vendor/swagger-ui-bundle.js
@@ -5,7 +8,7 @@ c2e4a9ef08144839ff47c14202063ecfe4e59e70a4e7154a26bd50d880c88ba1  vendor/swagger
 176e894661aa9cdc9a5cba6c720044cbbf7b8bd80d1c9a142a7c24b1b6c50d15  vendor/tailwind.js
 25f436e933246f279adc4967725a4d915e0fc7a6419d3b956a945bb5782dc6e5  vendor/underscore-1.13.6-min.js
 1edb1725a9ea8ca4dcf2f5508cee183218aa1685e47c1b23056717f754f58ebf  vendor/fontawesome.min.css
-358f6db0cc78b2c24e856c10d232762971a6ba59f0db8deee6da969c5bcfc2f5  vendor/inter.css
+98597b6bbeba325f1945b1dd7e0125e289eae6719a666379b7cf34a0c8738430  vendor/inter.css
 40170f0ee859d17f92131ba707329a88a070e4f66874d11365e9a77d232f6117  vendor/swagger-ui.css
 748332090c4b8e20f95d0ff59f0be20fa9c889359d3b36d4b886d73376054207  webfonts/fa-brands-400.woff2
 8e7e5ea1b15f62ab14dbd41768e8fbcd21cc859a4ea5da812457ee714299fb35  webfonts/fa-regular-400.woff2

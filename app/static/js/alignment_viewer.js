@@ -610,7 +610,7 @@
     }
 
     // ============================================================
-    // Public render entry point — preserves all pre-virtualization behavior.
+    // Public render entry point that preserves all pre-virtualization behavior.
     // ============================================================
 
     function renderAlignmentGrid() {

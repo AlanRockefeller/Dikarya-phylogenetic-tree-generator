@@ -24,15 +24,17 @@ def clean_dna_sequence(raw_sequence: str, min_length: int = 100) -> str:
     Clean a DNA sequence by extracting the longest contiguous run of valid nucleotides.
     
     This handles cases where:
-    - The sequence has a FASTA header (>description...) on a separate line or same line
+    - The sequence has a FASTA header (>description...) on a separate line
+    - A malformed one-line FASTA has a clearly separated sequence after its header
     - The sequence has garbage text at the start or end (species name, collection number, notes)
     - The sequence has whitespace/newlines
     
     Algorithm:
-    1. Strip FASTA header markers (>) but keep remainder of line
-    2. Remove all whitespace
-    3. Find the longest contiguous run of valid IUPAC nucleotide characters
-    4. Return that run if it meets minimum length, otherwise empty string
+    1. Discard normal FASTA header lines
+    2. Conservatively recover a sequence from a malformed one-line FASTA
+    3. Remove all whitespace
+    4. Find the longest contiguous run of valid IUPAC nucleotide characters
+    5. Return that run if it meets minimum length, otherwise empty string
     
     Args:
         raw_sequence: Raw DNA sequence string that may contain non-DNA text
@@ -48,23 +50,27 @@ def clean_dna_sequence(raw_sequence: str, min_length: int = 100) -> str:
     # Valid IUPAC nucleotide characters (DNA + ambiguity codes + gap)
     valid_chars = set("ACGTRYSWKMBDHVNacgtryswkmbdhvn-")
     
-    # Process lines: strip > marker but keep rest of each line
-    lines = raw_sequence.strip().split('\n')
+    # Process non-empty lines so normal FASTA headers never become sequence data.
+    lines = [line.strip() for line in raw_sequence.strip().splitlines() if line.strip()]
     processed_lines = []
-    
-    for line in lines:
-        line = line.strip()
-        if not line:
-            continue
-        
-        # Strip FASTA header marker but keep the rest (may contain sequence)
-        if line.startswith(">"):
-            # keep only content after first whitespace (if any)
-            line = line[1:]
-            parts = line.split(None, 1)
-            line = parts[1] if len(parts) == 2 else ""
 
-        
+    for line in lines:
+        if line.startswith(">"):
+            # Only recover same-line sequence data when this is the entire input,
+            # a whitespace boundary separates it from the identifier, and the
+            # whole suffix is long enough to be sequence-like. A directly glued
+            # suffix is ambiguous and must not bleed into the sequence.
+            if len(lines) == 1:
+                parts = line[1:].strip().split(None, 1)
+                if len(parts) == 2:
+                    candidate = ''.join(parts[1].split())
+                    recovery_min_length = max(min_length, 20)
+                    if (
+                        len(candidate) >= recovery_min_length
+                        and all(char in valid_chars for char in candidate)
+                    ):
+                        processed_lines.append(parts[1])
+            continue
         processed_lines.append(line)
     
     # Join all lines and remove whitespace

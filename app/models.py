@@ -1,23 +1,59 @@
+import hmac
 from dataclasses import dataclass, field
+from hashlib import sha256
 from typing import Dict, Any, Optional
 from datetime import datetime
+from flask import current_app
 from flask_login import UserMixin
 from werkzeug.security import generate_password_hash, check_password_hash
 from app.extensions import db, login_manager
 
+
+def _session_auth_hash(password_hash: str) -> str:
+    """Derive the session token that binds a cookie to the current password.
+
+    Remember cookies are long-lived, so changing the password has to be able to
+    revoke them. Deriving the token from the stored password hash gives that
+    for free: rotating the password rotates this value and every outstanding
+    cookie for the account stops authenticating.
+    """
+    secret = current_app.config.get("SECRET_KEY") or ""
+    if isinstance(secret, str):
+        secret = secret.encode("utf-8")
+    return hmac.new(
+        secret,
+        b"dikarya.session:" + (password_hash or "").encode("utf-8"),
+        sha256,
+    ).hexdigest()[:32]
+
+
 @login_manager.user_loader
 def load_user(user_id):
-    return User.query.get(int(user_id))
+    identifier, separator, token = str(user_id or "").partition(".")
+    if not identifier.isdigit():
+        return None
+    user = User.query.get(int(identifier))
+    if user is None:
+        return None
+    # Reject cookies minted before session tokens existed, and any cookie whose
+    # token no longer matches the account's current password hash.
+    if not separator or not hmac.compare_digest(token, _session_auth_hash(user.password_hash)):
+        return None
+    return user
 
 class User(UserMixin, db.Model):
     id = db.Column(db.Integer, primary_key=True)
     email = db.Column(db.String(255), unique=True, nullable=False)
     password_hash = db.Column(db.String(255), nullable=False)
+    is_admin = db.Column(db.Boolean, nullable=False, default=False, server_default="false")
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
-    
+
+    def get_id(self):
+        return f"{self.id}.{_session_auth_hash(self.password_hash)}"
+
     def set_password(self, password):
         self.password_hash = generate_password_hash(password)
-        
+
     def check_password(self, password):
         return check_password_hash(self.password_hash, password)
 
@@ -36,7 +72,7 @@ class Job(db.Model):
 class ApiToken(db.Model):
     """A revocable, scoped bearer token tied to a User.
 
-    The plaintext secret is never stored — only its SHA-256 hash. The token
+    The plaintext secret is never stored; only its SHA-256 hash is kept. The token
     `prefix` (first 12 chars of the secret) is stored separately so the UI
     can show users which token is which without exposing the secret again
     after creation.
@@ -121,6 +157,7 @@ class TreeBuilderParams:
     mcmc_generations: int = 50000   # for MrBayes defaults
     mcmc_nruns: int = 2
     mcmc_nchains: int = 4
+    mcmc_burnin_fraction: float = 0.25
     threads: Optional[int] = None   # autodetect if None
     
     # New RAxML-NG specific fields

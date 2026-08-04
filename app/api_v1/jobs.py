@@ -61,6 +61,9 @@ def serialize_job(job):
             "tree_model":       info.get("tree_model"),
             "bootstrap":        info.get("bootstrap"),
             "mcmc_generations": info.get("mcmc_generations"),
+            "mcmc_nruns":       info.get("mcmc_nruns", 2),
+            "mcmc_nchains":     info.get("mcmc_nchains", 4),
+            "mcmc_burnin_fraction": info.get("mcmc_burnin_fraction", 0.25),
         },
         "metrics": job.metrics or {},
         "links": {
@@ -86,7 +89,20 @@ DOWNLOADABLE_ARTIFACTS = {
     "input_info.json":         "input_info.json",
     "tree_state.json":         "tree/tree_state.json",
     "tree_metadata.json":      "tree/tree_metadata.json",
+    "mrbayes.input.nexus":     "tree/mrbayes_input.nex",
+    "mrbayes.parameters.p":    "tree/mrbayes_input.nex.p",
+    "mrbayes.trees.t":         "tree/mrbayes_input.nex.t",
+    "mrbayes.parameters.pstat": "tree/mrbayes_input.nex.pstat",
+    "mrbayes.trees.tstat":     "tree/mrbayes_input.nex.tstat",
 }
+
+for _run_number in range(1, 9):
+    DOWNLOADABLE_ARTIFACTS[f"mrbayes.run{_run_number}.p"] = (
+        f"tree/mrbayes_input.nex.run{_run_number}.p"
+    )
+    DOWNLOADABLE_ARTIFACTS[f"mrbayes.run{_run_number}.t"] = (
+        f"tree/mrbayes_input.nex.run{_run_number}.t"
+    )
 
 
 LOG_NAMES = {
@@ -123,5 +139,5 @@ def artifact_path(job_id, name):
 def _guess_mime(name):
     if name.endswith(".json"): return "application/json"
     if name.endswith(".fasta"): return "text/plain"
-    if name.endswith(".newick") or name.endswith(".nexus"): return "text/plain"
+    if name.endswith((".newick", ".nexus", ".p", ".t", ".pstat", ".tstat")): return "text/plain"
     return "application/octet-stream"

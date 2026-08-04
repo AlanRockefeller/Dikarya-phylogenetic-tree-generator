@@ -381,6 +381,14 @@ def publish_job_running(job_id: str) -> None:
     })
 
 
+def publish_job_queued(job_id: str) -> None:
+    """Publish job_state:queued when a staged job is waiting to resume."""
+    publish_event(job_id, {
+        "type": EVENT_JOB_STATE,
+        "status": "queued",
+    })
+
+
 def publish_job_completed(job_id: str, view_url: str, result_files: Optional[dict] = None) -> None:
     """
     Publish job_state:completed event.

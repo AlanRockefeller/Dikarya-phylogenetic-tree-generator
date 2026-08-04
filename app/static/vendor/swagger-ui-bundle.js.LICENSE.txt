@@ -1,0 +1,32 @@
+Swagger UI Bundle 5.17.14
+Source: https://github.com/swagger-api/swagger-ui/tree/v5.17.14
+Distribution: https://cdn.jsdelivr.net/npm/swagger-ui-dist@5.17.14/
+
+Swagger UI is licensed under Apache License 2.0.
+Copyright 2020-2021 SmartBear Software Inc.
+The full license and NOTICE are in licenses/Swagger-UI-LICENSE.txt.
+
+This generated browser bundle also incorporates third-party software. The
+upstream dependency manifest and exact resolved versions are recorded at:
+https://github.com/swagger-api/swagger-ui/blob/v5.17.14/package-lock.json
+
+Preserved principal notices include:
+
+- classnames: Copyright (c) 2018 Jed Watson; MIT License.
+  https://github.com/JedWatson/classnames
+- extend: Copyright (c) 2013-2018 Viacheslav Lotsmanov; MIT License.
+  https://github.com/justmoon/node-extend
+- buffer browser module: Copyright Feross Aboukhadijeh and contributors;
+  MIT License. https://github.com/feross/buffer
+- fast-json-patch / JSON-Patch: Copyright (c) 2017-2022 Joachim Wester;
+  MIT License. https://github.com/Starcounter-Jack/JSON-Patch
+- repeat-string: Copyright (c) 2014-2015 Jon Schlinkert; MIT License.
+  https://github.com/jonschlinkert/repeat-string
+- DOMPurify 3.1.4: Copyright Cure53 and other contributors; dual licensed
+  under Apache License 2.0 or Mozilla Public License 2.0.
+  https://github.com/cure53/DOMPurify/tree/3.1.4
+
+The MIT License text applicable to the MIT-licensed dependencies is available
+at https://opensource.org/license/mit/. Apache-2.0 and MPL-2.0 are available
+at https://www.apache.org/licenses/LICENSE-2.0 and
+https://www.mozilla.org/MPL/2.0/ respectively.

@@ -1,4 +1,5 @@
 import os
+from datetime import timedelta
 from pathlib import Path
 from dotenv import load_dotenv
 
@@ -26,6 +27,15 @@ def _csv_env(name, default=""):
 class Config:
     SECRET_KEY = os.environ.get('SECRET_KEY') or 'dev-key-please-change'
     WTF_CSRF_TIME_LIMIT = None  # No expiration; tokens remain valid for session lifetime
+
+    # Keep signed-in users remembered across browser and machine restarts. The
+    # lifetime is rolling and refreshed on every request, so anyone who visits
+    # even once a year stays signed in, while a cookie that was copied off a
+    # machine and then goes unused stops working. Changing an account password
+    # rotates its session token and revokes every outstanding cookie
+    # immediately (see User.get_id in app/models.py).
+    REMEMBER_COOKIE_DURATION = timedelta(days=int(os.environ.get('REMEMBER_COOKIE_DAYS', 365)))
+    REMEMBER_COOKIE_REFRESH_EACH_REQUEST = True
     
     # External Tools
     RAXML_BINARY = os.environ.get('RAXML_BINARY', 'raxml-ng')
@@ -93,6 +103,9 @@ class Config:
     )
     INAT_PUBLIC_BASE_URL = os.environ.get('INAT_PUBLIC_BASE_URL', '')
     INAT_OAUTH_ADMIN_EMAILS = _csv_env('INAT_OAUTH_ADMIN_EMAILS')
+
+    # Site-wide Mushroom Observer account used to post completed tree links.
+    MUSHROOM_OBSERVER_API_KEY = os.environ.get('MUSHROOM_OBSERVER_API_KEY', '')
 
 class DevelopmentConfig(Config):
     DEBUG = True

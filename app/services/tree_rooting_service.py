@@ -109,7 +109,7 @@ def resolve_sequence_of_interest(state: Dict[str, Any]) -> Tuple[Optional[str], 
     Resolution order:
       1. Explicit `sequence_of_interest` field (if still present in tree).
       2. Single member of the Default selection set when its color is blue
-         (#1f77b4) — this is how iNat-imported jobs mark the source tip.
+         (#1f77b4), which is how iNat-imported jobs mark the source tip.
 
     Returns (tip_name, source_label, warnings).
     """

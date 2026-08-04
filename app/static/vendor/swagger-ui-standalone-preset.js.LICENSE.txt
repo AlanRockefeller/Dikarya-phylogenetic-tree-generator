@@ -1,0 +1,14 @@
+Swagger UI Standalone Preset 5.17.14
+Source: https://github.com/swagger-api/swagger-ui/tree/v5.17.14
+Distribution: https://cdn.jsdelivr.net/npm/swagger-ui-dist@5.17.14/
+
+Swagger UI is licensed under Apache License 2.0.
+Copyright 2020-2021 SmartBear Software Inc.
+The full license and NOTICE are in licenses/Swagger-UI-LICENSE.txt.
+
+This generated bundle incorporates third-party dependencies under permissive
+licenses. Exact resolved versions and their upstream packages are recorded in:
+https://github.com/swagger-api/swagger-ui/blob/v5.17.14/package-lock.json
+
+The MIT License text used by MIT-licensed dependencies is available at
+https://opensource.org/license/mit/.

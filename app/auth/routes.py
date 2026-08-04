@@ -43,7 +43,7 @@ def register():
         db.session.add(user)
         db.session.commit()
         
-        login_user(user)
+        login_user(user, remember=True)
         flash('Registration successful!', 'success')
         return redirect(url_for('user.user_jobs'))
         
@@ -61,7 +61,7 @@ def login():
 
         user = User.query.filter_by(email=email).first()
         if user and user.check_password(password):
-            login_user(user)
+            login_user(user, remember=True)
             flash('Logged in successfully.', 'success')
             next_page = _safe_next(request.args.get('next'))
             return redirect(next_page or url_for('user.user_jobs'))

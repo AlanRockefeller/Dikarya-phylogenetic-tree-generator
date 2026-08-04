@@ -16,6 +16,9 @@ def health_check():
     return jsonify(health), status_code
 
 
+# These operational summaries intentionally expose no credentials or private
+# user/job data. /health/workers, /metrics, and /admin/monitoring are safe for
+# the public to view and do not need authentication.
 @bp.route('/health/workers')
 def worker_health():
     """Worker health endpoint."""

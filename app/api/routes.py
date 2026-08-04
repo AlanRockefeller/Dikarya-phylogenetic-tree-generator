@@ -155,10 +155,33 @@ def _normalize_sequence_metadata(raw_items):
             "source": str(raw.get("source") or "")[:50],
             "hit_source": str(raw.get("hit_source") or "")[:50],
             "location": str(raw.get("location") or raw.get("mycomap_location") or "")[:200],
+            "raw_fasta_header": str(raw.get("raw_fasta_header") or "")[:2000],
+            "raw_ncbi_description": str(raw.get("raw_ncbi_description") or "")[:2000],
+            "mycomap_header_format": str(raw.get("mycomap_header_format") or "")[:50],
+            "internal_id": str(raw.get("internal_id") or "")[:150],
+            "display_label": str(raw.get("display_label") or "")[:500],
+            "accession": str(raw.get("accession") or "")[:100],
+            "taxon": str(raw.get("taxon") or "")[:300],
+            "raw_mycomap_taxon": str(raw.get("raw_mycomap_taxon") or "")[:2000],
+            "voucher": str(raw.get("voucher") or "")[:300],
+            "observation_id": str(raw.get("observation_id") or "")[:50],
+            "locus": str(raw.get("locus") or "")[:100],
             "identity": _optional_float(raw.get("identity")),
             "query_cover": _optional_float(raw.get("query_cover")),
             "subject_cover": _optional_float(raw.get("subject_cover")),
         }
+        try:
+            occurrence = int(raw.get("occurrence") or 0)
+        except (TypeError, ValueError):
+            occurrence = 0
+        if occurrence > 0:
+            row["occurrence"] = occurrence
+        try:
+            mo_sequence_id = int(raw.get("mushroom_observer_sequence_id") or 0)
+        except (TypeError, ValueError):
+            mo_sequence_id = 0
+        if mo_sequence_id > 0:
+            row["mushroom_observer_sequence_id"] = mo_sequence_id
         row["blast_metrics_available"] = bool(raw.get("blast_metrics_available")) or any(
             row[field] is not None
             for field in ("identity", "query_cover", "subject_cover")
@@ -223,14 +246,14 @@ def _location_from_sequence_label(label):
     return country_match.group(1) if country_match else ""
 
 
-def _sequence_location_dedup_key(seq, metadata_by_header):
+def _sequence_location_dedup_key(seq, metadata=None):
     """Return a dedup key for same sequence + same known location, else exact record key."""
     sequence = ''.join(str(seq.get('sequence') or '').split()).upper()
     if not sequence:
         return None
 
     header = str(seq.get('name') or '').strip()
-    metadata = metadata_by_header.get(header, {})
+    metadata = metadata or {}
     location = metadata.get("location") or _location_from_sequence_label(header)
     normalized_location = _normalize_dedup_location(location, preserve_locality=bool(metadata.get("location")))
     if normalized_location:
@@ -250,29 +273,119 @@ def _dedupe_sequence_payload(sequence_text, sequence_metadata):
             if key:
                 metadata_by_header.setdefault(str(key).strip(), item)
 
+    positional_metadata = (
+        len(sequence_metadata) == len(sequences)
+        and all(
+            str(
+                sequence_metadata[index].get("fasta_header")
+                or sequence_metadata[index].get("name")
+                or ""
+            ).strip() == str(seq.get("name") or "").strip()
+            for index, seq in enumerate(sequences)
+        )
+    )
     seen = set()
     deduped = []
+    deduped_metadata = []
     deduped_headers = set()
-    for seq in sequences:
-        key = _sequence_location_dedup_key(seq, metadata_by_header)
+    for index, seq in enumerate(sequences):
+        header = str(seq.get('name') or '').strip()
+        metadata = (
+            sequence_metadata[index]
+            if positional_metadata else metadata_by_header.get(header, {})
+        )
+        key = _sequence_location_dedup_key(seq, metadata)
+        preserve_mycomap_ncbi_hit = (
+            str(metadata.get("source") or "").casefold() == "mycomap"
+            and str(metadata.get("hit_source") or "").casefold() == "ncbi"
+        )
+        if preserve_mycomap_ncbi_hit:
+            if key:
+                seen.add(key)
+            deduped.append(seq)
+            if positional_metadata:
+                deduped_metadata.append(metadata)
+            deduped_headers.add(header)
+            continue
         if key and key in seen:
             continue
         if key:
             seen.add(key)
         deduped.append(seq)
+        if positional_metadata:
+            deduped_metadata.append(metadata)
         deduped_headers.add(str(seq.get("name") or "").strip())
 
-    if len(deduped) == len(sequences):
+    metadata = deduped_metadata if positional_metadata else [
+        item for item in sequence_metadata
+        if str(item.get("fasta_header") or item.get("name") or "").strip() in deduped_headers
+    ]
+
+    # Retained records can deliberately share a full FASTA header and sequence
+    # when their positional metadata identifies different locations. Give only
+    # those later records a unique internal ID before the worker's exact-record
+    # cleanup, while leaving their display metadata unchanged.
+    reserved_ids = {
+        str(seq.get("name") or "").strip().split(None, 1)[0]
+        for seq in deduped if str(seq.get("name") or "").strip()
+    }
+    generated_ids = set()
+    retained_exact_counts = {}
+    headers_changed = False
+    for index, seq in enumerate(deduped):
+        header = str(seq.get("name") or "").strip()
+        sequence = ''.join(str(seq.get("sequence") or "").split()).upper()
+        exact_key = (header, sequence)
+        occurrence = retained_exact_counts.get(exact_key, 0) + 1
+        retained_exact_counts[exact_key] = occurrence
+        if occurrence == 1:
+            continue
+
+        parts = header.split(None, 1)
+        base_id = parts[0] if parts else "seq"
+        description = parts[1] if len(parts) > 1 else ""
+        suffix = occurrence
+        internal_id = f"{base_id}_{suffix}"
+        while internal_id in reserved_ids or internal_id in generated_ids:
+            suffix += 1
+            internal_id = f"{base_id}_{suffix}"
+        generated_ids.add(internal_id)
+        new_header = f"{internal_id} {description}".rstrip()
+        updated_seq = dict(seq)
+        updated_seq["name"] = new_header
+        deduped[index] = updated_seq
+        if positional_metadata and index < len(metadata):
+            updated_metadata = dict(metadata[index])
+            updated_metadata["fasta_header"] = new_header
+            metadata[index] = updated_metadata
+        elif not positional_metadata:
+            # Header-keyed metadata: the original header still belongs to the
+            # first occurrence, so add a copy under the new internal ID rather
+            # than rewriting it. Without this the renamed record drops out of
+            # the tree viewer's header -> metric map and silently loses its
+            # identity / query_cover / subject_cover.
+            source_metadata = next(
+                (
+                    item for item in metadata
+                    if str(item.get("fasta_header") or item.get("name") or "").strip() == header
+                ),
+                None,
+            )
+            if source_metadata is not None:
+                copied = dict(source_metadata)
+                if not str(source_metadata.get("fasta_header") or "").strip():
+                    copied["name"] = new_header
+                copied["fasta_header"] = new_header
+                metadata.append(copied)
+        headers_changed = True
+
+    if len(deduped) == len(sequences) and not headers_changed:
         return sequence_text, sequence_metadata
 
     fasta = ''.join(
         f">{seq.get('name', '').strip()}\n{''.join(str(seq.get('sequence') or '').split())}\n"
         for seq in deduped
     ).strip()
-    metadata = [
-        item for item in sequence_metadata
-        if str(item.get("fasta_header") or item.get("name") or "").strip() in deduped_headers
-    ]
     return fasta, metadata
 
 
@@ -302,60 +415,111 @@ def _extract_mycomap_query_tokens(url):
     text = str(url or '')
     for match in re.finditer(r'\binat(?:uralist)?[\s_-]*(\d{5,12})\b', text, flags=re.IGNORECASE):
         digits = match.group(1)
-        tokens.add(digits)
         tokens.add(f"inat{digits}")
     return tokens
 
 
-def _mycomap_query_sequences(sequences, metrics_by_key, query_tokens):
-    """Find query sequences included in MycoMap's local FASTA export."""
+def _mycomap_metric_for_sequence(seq, metrics_by_key):
+    """Return the MycoMap BLAST table metric associated with one FASTA record."""
     from app.services.mycomap_service import build_blast_metric_keys
 
+    for lookup_name in (seq.get('name', ''), seq.get('_mycomap_original_name', '')):
+        for key in build_blast_metric_keys(lookup_name):
+            metric = metrics_by_key.get(key)
+            if metric:
+                return metric
+    return None
+
+
+def _mycomap_sequence_location(seq, metric=None):
+    """Return the best available location for a MycoMap FASTA record."""
+    return str(
+        (metric or {}).get('mycomap_location')
+        or seq.get('location')
+        or _location_from_sequence_label(
+            seq.get('name') or seq.get('_mycomap_original_name') or ''
+        )
+        or ''
+    )
+
+
+def _mycomap_location_region_key(value):
+    """Return a conservative region key suitable for a location exception."""
+    text = re.sub(r'\s+', ' ', str(value or '').strip())
+    if not text:
+        return ''
+
+    us_match = re.search(
+        r'(?:US|USA|U\.S\.?A?\.?|United States(?: of America)?)\s*$',
+        text,
+        flags=re.IGNORECASE,
+    )
+    if us_match:
+        normalized = _normalize_dedup_location(
+            f"{text[:us_match.start()].strip()} US".strip(),
+            preserve_locality=False,
+        )
+        return normalized if normalized.startswith('us|') else 'us'
+
+    country_match = re.search(r'(?:^|\s)([A-Z]{2,3})[.,;]?\s*$', text)
+    return country_match.group(1).lower() if country_match else ''
+
+
+def _mycomap_locations_are_distinct(first, second):
+    """Return true only when both locations resolve to different regions."""
+    normalized_first = _mycomap_location_region_key(first)
+    normalized_second = _mycomap_location_region_key(second)
+    return bool(normalized_first and normalized_second and normalized_first != normalized_second)
+
+
+def _mycomap_label_has_query_token(label, query_tokens):
+    """Match canonical iNaturalist query IDs without bare-number substring matches."""
+    from app.services.mycomap_service import build_blast_metric_keys
+
+    tokens = {str(token or '').casefold() for token in query_tokens}
+    label_keys = {
+        str(key or '').casefold()
+        for key in build_blast_metric_keys(label)
+    }
+    return bool(tokens.intersection(label_keys))
+
+
+def _mycomap_query_sequences(sequences, metrics_by_key, query_tokens):
+    """Find query records included in MycoMap's local FASTA export."""
     if not query_tokens:
         return []
 
     candidates = []
-
     for seq in sequences:
         if seq.get('hit_source') != 'local':
             continue
 
-        metric = None
-        for lookup_name in (seq.get('name', ''), seq.get('_mycomap_original_name', '')):
-            for key in build_blast_metric_keys(lookup_name):
-                metric = metrics_by_key.get(key)
-                if metric:
-                    break
-            if metric:
-                break
+        metric = _mycomap_metric_for_sequence(seq, metrics_by_key)
         if metric:
             continue
 
-        name = str(seq.get('name') or seq.get('_mycomap_original_name') or '').lower()
-        if query_tokens and not any(token in name for token in query_tokens):
+        name = seq.get('name') or seq.get('_mycomap_original_name') or ''
+        if not _mycomap_label_has_query_token(name, query_tokens):
             continue
 
         sequence = ''.join(str(seq.get('sequence') or '').split()).upper()
         if len(sequence) >= 100:
-            candidates.append(sequence)
+            candidates.append({
+                'sequence': sequence,
+                'location': _mycomap_sequence_location(seq, metric),
+            })
 
     return candidates
 
 
-def _mycomap_local_fasta_metric_conflict_detail(seq, metric, query_sequences, query_tokens):
-    """
-    Detect MycoMap localFasta records that appear to contain the query sequence.
-
-    MycoMap can report a local hit at ~88% identity while localFasta exports a
-    sequence that is essentially identical to the query. Trust the BLAST table
-    contradiction and drop that local FASTA record rather than building a tree
-    from mislabeled sequence data.
-    """
+def _mycomap_local_fasta_metric_conflict_detail(seq, metric, query_sequences, query_tokens,
+                                                allow_identical_sequences_different_locations):
+    """Detect a local FASTA record that contradicts the MycoMap BLAST table."""
     if seq.get('hit_source') != 'local' or not query_sequences:
         return None
 
-    name = str(seq.get('name') or seq.get('_mycomap_original_name') or '').lower()
-    if query_tokens and any(token in name for token in query_tokens):
+    name = seq.get('name') or seq.get('_mycomap_original_name') or ''
+    if query_tokens and _mycomap_label_has_query_token(name, query_tokens):
         return None
 
     sequence = ''.join(str(seq.get('sequence') or '').split()).upper()
@@ -363,21 +527,33 @@ def _mycomap_local_fasta_metric_conflict_detail(seq, metric, query_sequences, qu
         return None
 
     best_similarity = max(
-        _sequence_similarity_percent(sequence, query_sequence)
-        for query_sequence in query_sequences
+        _sequence_similarity_percent(sequence, candidate['sequence'])
+        for candidate in query_sequences
     )
     if best_similarity < MYCOMAP_LOCAL_FASTA_QUERY_SIMILARITY_MIN:
         return None
 
+    exact_query_sequences = [
+        candidate for candidate in query_sequences
+        if sequence == candidate['sequence']
+    ]
+    if (
+        allow_identical_sequences_different_locations
+        and exact_query_sequences
+        and all(
+            _mycomap_locations_are_distinct(
+                _mycomap_sequence_location(seq, metric), candidate.get('location')
+            )
+            for candidate in exact_query_sequences
+        )
+    ):
+        return None
+
     if not metric:
-        # A localFasta record whose sequence is essentially the query but whose
-        # label is not the query is mislabeled data; drop it even without a BLAST
-        # metric row (restores pre-refactor behavior). Requires query tokens so
-        # we only act when we actually know what the query looks like.
         return {
-            "reason": "local_fasta_matches_query",
-            "reason_label": "Local FASTA sequence matches query, but the label is not the query",
-            "query_similarity": round(best_similarity, 2),
+            'reason': 'local_fasta_matches_query',
+            'reason_label': 'Local FASTA sequence matches query, but the label is not the query',
+            'query_similarity': round(best_similarity, 2),
         } if query_tokens else None
 
     reported_identity = metric.get('identity')
@@ -391,20 +567,21 @@ def _mycomap_local_fasta_metric_conflict_detail(seq, metric, query_sequences, qu
         return None
 
     return {
-        "reason": "local_fasta_identity_conflict",
-        "reason_label": "Local FASTA sequence matches query, but BLAST table reports lower identity",
-        "query_similarity": round(best_similarity, 2),
-        "reported_identity": reported_identity,
+        'reason': 'local_fasta_identity_conflict',
+        'reason_label': 'Local FASTA sequence matches query, but BLAST table reports lower identity',
+        'query_similarity': round(best_similarity, 2),
+        'reported_identity': reported_identity,
     }
 
 
-def _mycomap_local_fasta_group_conflict_detail(seq, conflict_sequences, query_tokens):
-    """Detect labels sharing a sequence with a metric-backed localFasta conflict."""
+def _mycomap_local_fasta_group_conflict_detail(seq, conflict_sequences, query_tokens,
+                                               allow_identical_sequences_different_locations):
+    """Detect a local record that shares a sequence with a conflicting local record."""
     if seq.get('hit_source') != 'local' or not conflict_sequences:
         return None
 
-    name = str(seq.get('name') or seq.get('_mycomap_original_name') or '').lower()
-    if query_tokens and any(token in name for token in query_tokens):
+    name = seq.get('name') or seq.get('_mycomap_original_name') or ''
+    if query_tokens and _mycomap_label_has_query_token(name, query_tokens):
         return None
 
     sequence = ''.join(str(seq.get('sequence') or '').split()).upper()
@@ -412,16 +589,32 @@ def _mycomap_local_fasta_group_conflict_detail(seq, conflict_sequences, query_to
         return None
 
     best_similarity = max(
-        _sequence_similarity_percent(sequence, conflict_sequence)
-        for conflict_sequence in conflict_sequences
+        _sequence_similarity_percent(sequence, candidate['sequence'])
+        for candidate in conflict_sequences
     )
     if best_similarity < MYCOMAP_LOCAL_FASTA_QUERY_SIMILARITY_MIN:
         return None
 
+    exact_conflicting_sequences = [
+        candidate for candidate in conflict_sequences
+        if sequence == candidate['sequence']
+    ]
+    if (
+        allow_identical_sequences_different_locations
+        and exact_conflicting_sequences
+        and all(
+            _mycomap_locations_are_distinct(
+                _mycomap_sequence_location(seq), candidate.get('location')
+            )
+            for candidate in exact_conflicting_sequences
+        )
+    ):
+        return None
+
     return {
-        "reason": "local_fasta_matches_conflicting_record",
-        "reason_label": "Local FASTA sequence matches another local record with a query/identity conflict",
-        "query_similarity": round(best_similarity, 2),
+        'reason': 'local_fasta_matches_conflicting_record',
+        'reason_label': 'Local FASTA sequence matches another local record with a query/identity conflict',
+        'query_similarity': round(best_similarity, 2),
     }
 
 
@@ -443,6 +636,150 @@ def _append_import_filter_detail(details, *, name, source, reason, reason_label,
     if query_similarity is not None:
         row["query_similarity"] = query_similarity
     details.append(row)
+
+
+def _mycomap_observation_reference(seq):
+    """Return one unambiguous iNaturalist or Mushroom Observer reference."""
+    from app.services.mycomap_service import extract_mycomap_observation_reference
+
+    observation_references = set()
+    hit_source = str(seq.get('hit_source') or '').casefold()
+    for label in (seq.get('name', ''), seq.get('_mycomap_original_name', '')):
+        reference = extract_mycomap_observation_reference(label)
+        if (
+            reference
+            and reference.startswith('mo:')
+            and hit_source != 'local'
+            and not re.search(
+                r'mushroom\s*observer|mushroomobserver\.org|\bmo\s*(?:#|:)',
+                str(label or ''),
+                flags=re.IGNORECASE,
+            )
+        ):
+            # A compact MO123456 token can also be a GenBank accession. Only
+            # treat that shape as Mushroom Observer provenance for local hits.
+            reference = None
+        if reference:
+            observation_references.add(reference)
+    return (
+        next(iter(observation_references))
+        if len(observation_references) == 1 else ''
+    )
+
+
+def _mycomap_ric_score(seq):
+    """Return the highest RiC score encoded in a MycoMap record label."""
+    scores = []
+    for label in (seq.get('name', ''), seq.get('_mycomap_original_name', '')):
+        for match in re.finditer(
+            r'\bRiC\b\s*(?:[:=]\s*)?(\d+(?:\.\d+)?)',
+            str(label or ''),
+            flags=re.IGNORECASE,
+        ):
+            scores.append(float(match.group(1)))
+    return max(scores) if scores else None
+
+
+def _mycomap_observation_record_score(item, observation_reference):
+    """Prefer longer, less ambiguous, higher-quality records within one observation."""
+    index, seq = item
+    name = str(seq.get('name') or '').strip()
+    first_token = name.split()[0] if name.split() else ''
+    sequence = ''.join(str(seq.get('sequence') or '').split()).upper().replace('U', 'T')
+    ambiguous_bases = sum(1 for base in sequence if base not in {'A', 'C', 'G', 'T'})
+    ric_score = _mycomap_ric_score(seq)
+    source, observation_id = observation_reference.split(':', 1)
+    canonical_identifier = f"iNat{observation_id}" if source == 'inat' else f"MO{observation_id}"
+    canonical_observation = first_token.casefold() == canonical_identifier.casefold()
+    genbank_accession = _is_genbank_accession(first_token.split('.')[0])
+    has_metrics = bool(seq.get('blast_metrics_available'))
+    return (
+        -len(sequence),
+        ambiguous_bases,
+        0 if ric_score is not None else 1,
+        -(ric_score or 0),
+        0 if canonical_observation else 1,
+        0 if genbank_accession else 1,
+        0 if has_metrics else 1,
+        index,
+    )
+
+
+def _merge_mycomap_duplicate_metadata(keep, duplicate):
+    """Retain useful optional metadata when collapsing a duplicate source record."""
+    for field in ('organism', 'location', 'identity', 'query_cover', 'subject_cover'):
+        if keep.get(field) in (None, '') and duplicate.get(field) not in (None, ''):
+            keep[field] = duplicate[field]
+    keep['blast_metrics_available'] = bool(keep.get('blast_metrics_available')) or bool(
+        duplicate.get('blast_metrics_available')
+    )
+
+
+def _dedupe_mycomap_observation_records(sequences, filtered_records):
+    """Collapse near-identical records within one source observation."""
+    from app.services.mycomap_service import (
+        MYCOMAP_NEAR_DUPLICATE_MAX_DIFFERENCES,
+        mycomap_sequence_difference_count,
+    )
+
+    groups = {}
+    for index, seq in enumerate(sequences):
+        observation_reference = _mycomap_observation_reference(seq)
+        if observation_reference:
+            groups.setdefault(observation_reference, []).append((index, seq))
+
+    keep_indexes = set(range(len(sequences)))
+    dropped_count = 0
+    for observation_reference, records in groups.items():
+        if len(records) < 2:
+            continue
+        ranked_records = sorted(
+            records,
+            key=lambda item: _mycomap_observation_record_score(
+                item, observation_reference
+            ),
+        )
+        retained_records = []
+        source, observation_id = observation_reference.split(':', 1)
+        source_label = 'iNaturalist' if source == 'inat' else 'Mushroom Observer'
+        for record_index, record in ranked_records:
+            matching_retained = []
+            for retained_index, retained in retained_records:
+                difference_count = mycomap_sequence_difference_count(
+                    record.get('sequence', ''),
+                    retained.get('sequence', ''),
+                    max_distance=MYCOMAP_NEAR_DUPLICATE_MAX_DIFFERENCES,
+                )
+                if (
+                    difference_count is not None
+                    and difference_count <= MYCOMAP_NEAR_DUPLICATE_MAX_DIFFERENCES
+                ):
+                    matching_retained.append((difference_count, retained_index, retained))
+            if not matching_retained:
+                retained_records.append((record_index, record))
+                continue
+
+            difference_count, _retained_index, keep = min(
+                matching_retained,
+                key=lambda item: item[0],
+            )
+            keep_indexes.discard(record_index)
+            dropped_count += 1
+            _merge_mycomap_duplicate_metadata(keep, record)
+            _append_import_filter_detail(
+                filtered_records,
+                name=record.get('_mycomap_original_name') or record.get('name', ''),
+                source='mycomap',
+                hit_source=record.get('hit_source', ''),
+                reason='near_duplicate_observation',
+                reason_label=(
+                    f'Near-duplicate record for {source_label} observation '
+                    f'{observation_id}; {difference_count} non-ambiguous base '
+                    f'difference{"s" if difference_count != 1 else ""}'
+                ),
+            )
+
+    return [seq for index, seq in enumerate(sequences) if index in keep_indexes], dropped_count
 
 
 def _normalize_import_filter_details(raw):
@@ -480,6 +817,7 @@ def _normalize_import_filter_details(raw):
                 "invalid_sequence": _count(counts.get("invalid_sequence")),
                 "contaminant": _count(counts.get("contaminant")),
                 "conflicting_local": _count(counts.get("conflicting_local")),
+                "duplicate_observation": _count(counts.get("duplicate_observation")),
             },
         }
 
@@ -816,14 +1154,18 @@ def fetch_genbank_accessions():
         return _server_error(e)
 
 
-def gather_mycomap_sequences_for_queue(url, include_ncbi=True, include_local=True):
+def gather_mycomap_sequences_for_queue(url, include_ncbi=True, include_local=True,
+                                       filter_conflicting_local_fasta=False,
+                                       allow_identical_sequences_different_locations=True):
     """Reusable helper for fetching MycoMap BLAST result sequences.
 
     Returns a tuple ``(payload, error_response)`` where ``payload`` is the
     dict normally returned by /api/mycomap on success (sequences,
     ncbi_count, local_count, blast_metrics_count, message) and
     ``error_response`` is a ``(json_dict, http_status)`` tuple on failure.
-    Exactly one of the two will be non-None.
+    Exactly one of the two will be non-None. The local FASTA conflict filter
+    is deliberately opt-in because identical barcode sequences can be valid
+    records from separate collection locations.
     """
     if not url:
         return None, ({"status": "error", "error": "No URL provided"}, 400)
@@ -834,13 +1176,22 @@ def gather_mycomap_sequences_for_queue(url, include_ncbi=True, include_local=Tru
         }, 400)
 
     from app.services.mycomap_service import (
-        build_blast_metric_keys,
         fetch_mycomap_blast_metrics,
         fetch_mycomap_fasta,
         improve_mycomap_sequence_name,
+        parse_mycomap_ncbi_fasta_header,
+        prefer_local_mycomap_taxa,
+        uniquify_mycomap_sequence_names,
         validate_mycomap_url,
     )
     from app.services.fasta_utils import clean_dna_sequence
+
+    filter_conflicting_local_fasta = coerce_bool(
+        filter_conflicting_local_fasta, default=False
+    )[0]
+    allow_identical_sequences_different_locations = coerce_bool(
+        allow_identical_sequences_different_locations, default=True
+    )[0]
 
     contaminant_re = re.compile(r'contamin(?:a|e)nt', flags=re.IGNORECASE)
     lowquality_re = re.compile(r'low\s*quality|lowquality', flags=re.IGNORECASE)
@@ -885,11 +1236,27 @@ def gather_mycomap_sequences_for_queue(url, include_ncbi=True, include_local=Tru
         else:
             seq['hit_source'] = 'local'
 
+        if seq['hit_source'] == 'ncbi':
+            header_details = parse_mycomap_ncbi_fasta_header(
+                seq.get('_mycomap_original_name', '')
+            )
+            for field in (
+                'accession', 'taxon', 'raw_mycomap_taxon', 'voucher', 'location',
+                'raw_fasta_header', 'raw_ncbi_description',
+                'mycomap_header_format',
+            ):
+                seq[field] = header_details.get(field, '')
+            seq['name'] = header_details.get('display_name') or seq.get('name', '')
+
     from app.services.blast_service import fetch_fasta_for_accessions
     accessions_to_enrich = []
     for seq in sequences:
         parts = seq['name'].split()
-        if len(parts) == 1 and _is_genbank_accession(parts[0].split('.')[0]):
+        if (
+            len(parts) == 1
+            and seq.get('mycomap_header_format') == 'legacy_flat'
+            and _is_genbank_accession(parts[0].split('.')[0])
+        ):
             accessions_to_enrich.append(parts[0].split('.')[0])
 
     if accessions_to_enrich:
@@ -909,7 +1276,7 @@ def gather_mycomap_sequences_for_queue(url, include_ncbi=True, include_local=Tru
     original_count = len(sequences)
     cleaned_sequences = []
     for seq in sequences:
-        seq['sequence'] = clean_dna_sequence(seq['sequence'])
+        seq['sequence'] = clean_dna_sequence(seq['sequence'], min_length=1)
         if seq['sequence']:
             cleaned_sequences.append(seq)
         else:
@@ -925,27 +1292,35 @@ def gather_mycomap_sequences_for_queue(url, include_ncbi=True, include_local=Tru
     dropped_count = original_count - len(sequences)
 
     metrics_by_key = fetch_mycomap_blast_metrics(blast_id, source_url=url)
-    query_tokens = _extract_mycomap_query_tokens(url)
-    query_sequences = _mycomap_query_sequences(sequences, metrics_by_key, query_tokens)
-    sequence_metrics = []
+    query_tokens = set()
+    query_sequences = []
+    if filter_conflicting_local_fasta:
+        query_tokens = _extract_mycomap_query_tokens(url)
+        query_sequences = _mycomap_query_sequences(
+            sequences, metrics_by_key, query_tokens
+        )
+    sequence_metrics = [
+        _mycomap_metric_for_sequence(seq, metrics_by_key)
+        for seq in sequences
+    ]
     metric_conflicts = {}
     conflict_sequences = []
-    for idx, seq in enumerate(sequences):
-        metric = None
-        for lookup_name in (seq.get('name', ''), seq.get('_mycomap_original_name', '')):
-            for key in build_blast_metric_keys(lookup_name):
-                metric = metrics_by_key.get(key)
-                if metric:
-                    break
-            if metric:
-                break
-        sequence_metrics.append(metric)
-        conflict_detail = _mycomap_local_fasta_metric_conflict_detail(
-            seq, metric, query_sequences, query_tokens
-        )
-        if conflict_detail:
-            metric_conflicts[idx] = conflict_detail
-            conflict_sequences.append(''.join(str(seq.get('sequence') or '').split()).upper())
+    if filter_conflicting_local_fasta:
+        for idx, seq in enumerate(sequences):
+            metric = sequence_metrics[idx]
+            conflict_detail = _mycomap_local_fasta_metric_conflict_detail(
+                seq,
+                metric,
+                query_sequences,
+                query_tokens,
+                allow_identical_sequences_different_locations,
+            )
+            if conflict_detail:
+                metric_conflicts[idx] = conflict_detail
+                conflict_sequences.append({
+                    'sequence': ''.join(str(seq.get('sequence') or '').split()).upper(),
+                    'location': _mycomap_sequence_location(seq, metric),
+                })
 
     metrics_attached_count = 0
     contaminant_dropped_count = 0
@@ -954,9 +1329,12 @@ def gather_mycomap_sequences_for_queue(url, include_ncbi=True, include_local=Tru
     for idx, seq in enumerate(sequences):
         metric = sequence_metrics[idx]
         conflict_detail = metric_conflicts.get(idx)
-        if not conflict_detail and not metric:
+        if filter_conflicting_local_fasta and not conflict_detail and not metric:
             conflict_detail = _mycomap_local_fasta_group_conflict_detail(
-                seq, conflict_sequences, query_tokens
+                seq,
+                conflict_sequences,
+                query_tokens,
+                allow_identical_sequences_different_locations,
             )
         if conflict_detail:
             conflicting_local_dropped_count += 1
@@ -991,12 +1369,19 @@ def gather_mycomap_sequences_for_queue(url, include_ncbi=True, include_local=Tru
             continue
         if metric:
             seq['name'] = improve_mycomap_sequence_name(
-                seq.get('name', ''), metric, seq.get('hit_source', ''),
+                seq.get('name', ''),
+                metric,
+                seq.get('hit_source', ''),
+                accession=seq.get('accession', ''),
+                voucher=seq.get('voucher', ''),
+                location=seq.get('location', ''),
             )
+            if metric.get('species_name'):
+                seq['taxon'] = metric['species_name']
             seq['identity'] = metric.get('identity')
             seq['query_cover'] = metric.get('query_cover')
             seq['subject_cover'] = metric.get('subject_cover')
-            seq['location'] = metric.get('mycomap_location') or ''
+            seq['location'] = metric.get('mycomap_location') or seq.get('location') or ''
             seq['blast_metrics_available'] = any(
                 seq[field] is not None for field in ('identity', 'query_cover', 'subject_cover')
             )
@@ -1006,12 +1391,21 @@ def gather_mycomap_sequences_for_queue(url, include_ncbi=True, include_local=Tru
             seq['identity'] = None
             seq['query_cover'] = None
             seq['subject_cover'] = None
-            seq['location'] = ''
+            seq['location'] = seq.get('location') or ''
             seq['blast_metrics_available'] = False
         seq['name'] = remove_lowquality_label(seq.get('name', ''))
-        seq.pop('_mycomap_original_name', None)
         filtered_sequences.append(seq)
-    sequences = filtered_sequences
+    sequences = prefer_local_mycomap_taxa(filtered_sequences)
+    sequences, duplicate_observation_count = _dedupe_mycomap_observation_records(
+        sequences,
+        filtered_records,
+    )
+    sequences = uniquify_mycomap_sequence_names(sequences)
+    for seq in sequences:
+        seq.pop('_mycomap_original_name', None)
+    metrics_attached_count = sum(
+        1 for seq in sequences if seq.get('blast_metrics_available')
+    )
 
     parts = []
     if include_ncbi:
@@ -1025,6 +1419,8 @@ def gather_mycomap_sequences_for_queue(url, include_ncbi=True, include_local=Tru
         msg += f" ({contaminant_dropped_count} contaminant sequence{'s' if contaminant_dropped_count != 1 else ''} filtered)"
     if conflicting_local_dropped_count > 0:
         msg += f" ({conflicting_local_dropped_count} conflicting local FASTA sequence{'s' if conflicting_local_dropped_count != 1 else ''} filtered)"
+    if duplicate_observation_count > 0:
+        msg += f" ({duplicate_observation_count} duplicate observation record{'s' if duplicate_observation_count != 1 else ''} collapsed)"
     if result['errors']:
         msg += f" (warnings: {'; '.join(result['errors'])})"
 
@@ -1035,6 +1431,11 @@ def gather_mycomap_sequences_for_queue(url, include_ncbi=True, include_local=Tru
         "local_count": result['local_count'],
         "blast_metrics_count": metrics_attached_count,
         "conflicting_local_count": conflicting_local_dropped_count,
+        "duplicate_observation_count": duplicate_observation_count,
+        "conflicting_local_filter_enabled": filter_conflicting_local_fasta,
+        "allow_identical_sequences_different_locations": (
+            allow_identical_sequences_different_locations
+        ),
         "import_filter_details": {
             "mycomap": {
                 "label": "MycoMap import filters",
@@ -1042,6 +1443,7 @@ def gather_mycomap_sequences_for_queue(url, include_ncbi=True, include_local=Tru
                     "invalid_sequence": dropped_count,
                     "contaminant": contaminant_dropped_count,
                     "conflicting_local": conflicting_local_dropped_count,
+                    "duplicate_observation": duplicate_observation_count,
                 },
                 "filtered_records": filtered_records,
             }
@@ -1059,7 +1461,9 @@ def fetch_mycomap():
     Request: {
         "url": "<mycomap URL>",
         "include_ncbi": true,
-        "include_local": true
+        "include_local": true,
+        "filter_conflicting_local_fasta": false,
+        "allow_identical_sequences_different_locations": true
     }
     Response: { "status": "success", "sequences": [...], "message": "..." }
     """
@@ -1067,9 +1471,33 @@ def fetch_mycomap():
     url = data.get('url', '').strip()
     include_ncbi = data.get('include_ncbi', True)
     include_local = data.get('include_local', True)
+    filter_conflicting_local_fasta, filter_conflicts_valid = coerce_bool(
+        data.get('filter_conflicting_local_fasta'), default=False
+    )
+    if not filter_conflicts_valid:
+        return jsonify({
+            "status": "error",
+            "error": "filter_conflicting_local_fasta must be a boolean.",
+        }), 422
+    allow_identical_sequences_different_locations, allow_locations_valid = coerce_bool(
+        data.get('allow_identical_sequences_different_locations'), default=True
+    )
+    if not allow_locations_valid:
+        return jsonify({
+            "status": "error",
+            "error": "allow_identical_sequences_different_locations must be a boolean.",
+        }), 422
 
     try:
-        payload, err = gather_mycomap_sequences_for_queue(url, include_ncbi, include_local)
+        payload, err = gather_mycomap_sequences_for_queue(
+            url,
+            include_ncbi,
+            include_local,
+            filter_conflicting_local_fasta=filter_conflicting_local_fasta,
+            allow_identical_sequences_different_locations=(
+                allow_identical_sequences_different_locations
+            ),
+        )
         if err is not None:
             body, status = err
             return jsonify(body), status
@@ -1077,6 +1505,70 @@ def fetch_mycomap():
     except Exception as e:
         logger.error(f"Mycomap API error: {e}", exc_info=True)
         return _server_error(e)
+
+
+@bp.route('/mycomap/refresh', methods=['POST'])
+@limiter.limit("10 per minute; 200 per hour")
+def start_mycomap_blast_refresh():
+    """
+    Refresh an existing Mycomap BLAST result (local always, NCBI optionally)
+    and gather its sequences for the queue. Runs as a background job because
+    an NCBI rebuild can take about 10 minutes to become available.
+
+    Request: {
+        "url": "<mycomap URL>",
+        "rebuild_ncbi": false,
+        "local_limit": 50,
+        "ncbi_limit": 100,
+        "include_ncbi": true,
+        "include_local": true
+    }
+    Response: { "status": "success", "job_id": "<uuid>" }
+    """
+    data = request.get_json() or {}
+    url = data.get('url', '').strip()
+    if not url:
+        return jsonify({"status": "error", "error": "No URL provided"}), 400
+
+    from app.services.mycomap_service import validate_mycomap_url
+    if not validate_mycomap_url(url):
+        return jsonify({
+            "status": "error",
+            "error": "Invalid Mycomap URL. URL must be from mycomap.com and contain a result ID (e.g., r12345)",
+        }), 400
+
+    rebuild_ncbi, rebuild_ncbi_valid = coerce_bool(data.get('rebuild_ncbi'), default=False)
+    if not rebuild_ncbi_valid:
+        return jsonify({"status": "error", "error": "rebuild_ncbi must be a boolean."}), 422
+    include_ncbi, include_ncbi_valid = coerce_bool(data.get('include_ncbi'), default=True)
+    include_local, include_local_valid = coerce_bool(data.get('include_local'), default=True)
+    if not include_ncbi_valid or not include_local_valid:
+        return jsonify({"status": "error", "error": "include_ncbi/include_local must be booleans."}), 422
+
+    try:
+        from app.workers.queue import enqueue_mycomap_blast_refresh_job
+        job_id = enqueue_mycomap_blast_refresh_job({
+            "url": url,
+            "rebuild_ncbi": rebuild_ncbi,
+            "local_limit": data.get('local_limit'),
+            "ncbi_limit": data.get('ncbi_limit'),
+            "include_ncbi": include_ncbi,
+            "include_local": include_local,
+        })
+        return jsonify({"status": "success", "job_id": job_id})
+    except Exception as e:
+        logger.error(f"Mycomap refresh API error: {e}", exc_info=True)
+        return _server_error(e)
+
+
+@bp.route('/mycomap/refresh/<job_id>', methods=['GET'])
+def get_mycomap_blast_refresh_status(job_id):
+    """Poll a MycoMap BLAST refresh job started via /api/mycomap/refresh."""
+    if not validate_job_id(job_id):
+        return jsonify({"status": "error", "error": "Invalid job ID format"}), 400
+
+    from app.workers.queue import get_job_status
+    return jsonify(get_job_status(job_id))
 
 
 def _inat_tree_rate_key():
@@ -1103,6 +1595,22 @@ def _inat_tree_rate_limit():
     return "20 per hour"
 
 
+def _mycomap_rerun_limit_from_request(data, result_type):
+    """Return a validated MycoMap rerun limit from compatible request keys."""
+    from app.services.mycomap_service import validate_mycomap_rerun_limit
+
+    aliases = {
+        "local": ("mycomap_local_limit", "mycomap_local_blast_limit", "local_limit"),
+        "ncbi": ("mycomap_ncbi_limit", "mycomap_ncbi_blast_limit", "ncbi_limit"),
+    }
+    value = None
+    for key in aliases.get(result_type, ()):
+        if key in data:
+            value = data.get(key)
+            break
+    return validate_mycomap_rerun_limit(value, result_type)
+
+
 @bp.route('/inaturalist/tree', methods=['POST'])
 @limiter.limit(_inat_tree_rate_limit, key_func=_inat_tree_rate_key)
 def inaturalist_tree():
@@ -1118,15 +1626,51 @@ def inaturalist_tree():
     data = request.get_json(silent=True) or {}
     raw = data.get('observation') or data.get('url') or data.get('input') or ''
     resolved_type = (data.get('resolved_type') or '').strip().lower()
+    rebuild_ncbi_blast, rebuild_ncbi_ok = coerce_bool(
+        data.get('rebuild_ncbi_blast', data.get('rebuild_ncbi')),
+        default=False,
+    )
+    if not rebuild_ncbi_ok:
+        return jsonify({
+            "status": "error",
+            "error": "rebuild_ncbi_blast must be a boolean.",
+        }), 422
+    recreate_existing_tree, recreate_existing_ok = coerce_bool(
+        data.get('recreate_existing_tree'),
+        default=False,
+    )
+    if not recreate_existing_ok:
+        return jsonify({
+            "status": "error",
+            "error": "recreate_existing_tree must be a boolean.",
+        }), 422
+    local_limit, local_limit_error = _mycomap_rerun_limit_from_request(data, "local")
+    if local_limit_error:
+        return jsonify({"status": "error", "error": local_limit_error}), 422
+    ncbi_limit, ncbi_limit_error = _mycomap_rerun_limit_from_request(data, "ncbi")
+    if ncbi_limit_error:
+        return jsonify({"status": "error", "error": ncbi_limit_error}), 422
     try:
         parsed = parse_inaturalist_tree_input(raw)
         if parsed.get("type") == "single_observation":
             result = create_job_from_inat_observation(
                 raw,
                 user=current_user,
+                rebuild_ncbi_blast=rebuild_ncbi_blast,
+                recreate_existing_tree=recreate_existing_tree,
+                mycomap_local_limit=local_limit,
+                mycomap_ncbi_limit=ncbi_limit,
                 public_base_url=request.url_root,
             )
             return jsonify(result), 202
+        if rebuild_ncbi_blast or recreate_existing_tree:
+            return jsonify({
+                "status": "error",
+                "error": (
+                    "NCBI BLAST rebuild and existing-tree re-creation are only "
+                    "supported for a single iNaturalist observation."
+                ),
+            }), 422
         if not resolved_type:
             return jsonify({
                 "status": "error",
@@ -1136,11 +1680,17 @@ def inaturalist_tree():
             raw,
             resolved_type=resolved_type,
             user=current_user,
+            mycomap_local_limit=local_limit,
+            mycomap_ncbi_limit=ncbi_limit,
             public_base_url=request.url_root,
         )
         return jsonify(result), 202
     except InatTreeError as e:
-        return jsonify({"status": "error", "error": str(e)}), e.status
+        error_payload = {"status": "error", "error": str(e)}
+        if e.details:
+            error_payload.update(e.details)
+            error_payload["message"] = str(e)
+        return jsonify(error_payload), e.status
     except Exception as e:
         logger.error("iNaturalist tree endpoint error: %s", e, exc_info=True)
         return _server_error(e)
@@ -1175,16 +1725,54 @@ def inaturalist_tree_batch():
     data = request.get_json(silent=True) or {}
     raw = data.get('input') or data.get('observation') or data.get('url') or ''
     resolved_type = data.get('resolved_type') or ''
+    rebuild_ncbi_blast, rebuild_ncbi_ok = coerce_bool(
+        data.get('rebuild_ncbi_blast', data.get('rebuild_ncbi')),
+        default=False,
+    )
+    if not rebuild_ncbi_ok:
+        return jsonify({
+            "status": "error",
+            "error": "rebuild_ncbi_blast must be a boolean.",
+        }), 422
+    recreate_existing_tree, recreate_existing_ok = coerce_bool(
+        data.get('recreate_existing_tree'),
+        default=False,
+    )
+    if not recreate_existing_ok:
+        return jsonify({
+            "status": "error",
+            "error": "recreate_existing_tree must be a boolean.",
+        }), 422
+    local_limit, local_limit_error = _mycomap_rerun_limit_from_request(data, "local")
+    if local_limit_error:
+        return jsonify({"status": "error", "error": local_limit_error}), 422
+    ncbi_limit, ncbi_limit_error = _mycomap_rerun_limit_from_request(data, "ncbi")
+    if ncbi_limit_error:
+        return jsonify({"status": "error", "error": ncbi_limit_error}), 422
+    if rebuild_ncbi_blast or recreate_existing_tree:
+        return jsonify({
+            "status": "error",
+            "error": (
+                "NCBI BLAST rebuild and existing-tree re-creation are only "
+                "supported for a single iNaturalist observation."
+            ),
+        }), 422
     try:
         result = create_jobs_from_inat_scope(
             raw,
             resolved_type=resolved_type,
             user=current_user,
+            mycomap_local_limit=local_limit,
+            mycomap_ncbi_limit=ncbi_limit,
             public_base_url=request.url_root,
         )
         return jsonify(result), 202
     except InatTreeError as e:
-        return jsonify({"status": "error", "error": str(e)}), e.status
+        error_payload = {"status": "error", "error": str(e)}
+        if e.details:
+            error_payload.update(e.details)
+            error_payload["message"] = str(e)
+        return jsonify(error_payload), e.status
     except Exception as e:
         logger.error("iNaturalist tree batch endpoint error: %s", e, exc_info=True)
         return _server_error(e)
@@ -1282,6 +1870,7 @@ def fetch_inaturalist():
                 "can_blast": can_blast,
                 # For single obs with DNA, include the sequence for BLAST
                 "sequence": seq if can_blast else None,
+                "mycomap_blast_url": result.get('mycomap_blast_url') if is_single_url else None,
                 "truncated": result.get('truncated', False),
                 "total_available": result.get('total_available', 0),
                 "message": f"Found {result['dna_count']} observation(s) with DNA Barcode ITS"
@@ -1305,6 +1894,79 @@ def fetch_inaturalist():
     except Exception as e:
         logger.error(f"iNaturalist API error: {e}", exc_info=True)
         return _server_error(e)
+
+
+
+@bp.route('/mushroom-observer', methods=['POST'])
+@limiter.limit("10 per minute; 200 per hour")
+def fetch_mushroom_observer():
+    """Analyze one Mushroom Observer observation or return its selected ITS."""
+    from app.services.mushroom_observer_service import (
+        MushroomObserverError,
+        analyze_observation,
+        build_queue_sequence,
+    )
+
+    data = request.get_json(silent=True) or {}
+    raw = data.get('observation') or data.get('url') or data.get('input') or ''
+    action = str(data.get('action') or 'analyze').strip().lower()
+    if action not in {'analyze', 'fetch_sequence'}:
+        return jsonify({"status": "error", "error": "Invalid action."}), 400
+    try:
+        if action == 'analyze':
+            return jsonify(analyze_observation(raw))
+        sequence = build_queue_sequence(raw, data.get('sequence_id'))
+        return jsonify({
+            "status": "success",
+            "sequences": [sequence],
+            "message": "Fetched the selected ITS sequence from Mushroom Observer.",
+        })
+    except MushroomObserverError as exc:
+        return jsonify({"status": "error", "error": str(exc)}), exc.status
+    except Exception as exc:
+        logger.error("Mushroom Observer API endpoint error: %s", exc, exc_info=True)
+        return _server_error(exc, where="mushroom_observer")
+
+
+@bp.route('/mushroom-observer/tree', methods=['POST'])
+@limiter.limit("10 per 5 minutes; 20 per hour")
+def mushroom_observer_tree():
+    """Queue a one-click tree for one selected Mushroom Observer ITS sequence."""
+    from app.services.mushroom_observer_service import (
+        MushroomObserverError,
+        create_tree_job,
+    )
+
+    data = request.get_json(silent=True) or {}
+    raw = data.get('observation') or data.get('url') or data.get('input') or ''
+    rebuild_ncbi, rebuild_ok = coerce_bool(data.get('rebuild_ncbi_blast'), default=False)
+    if not rebuild_ok:
+        return jsonify({
+            "status": "error",
+            "error": "rebuild_ncbi_blast must be a boolean.",
+        }), 422
+    local_limit, local_error = _mycomap_rerun_limit_from_request(data, "local")
+    if local_error:
+        return jsonify({"status": "error", "error": local_error}), 422
+    ncbi_limit, ncbi_error = _mycomap_rerun_limit_from_request(data, "ncbi")
+    if ncbi_error:
+        return jsonify({"status": "error", "error": ncbi_error}), 422
+    try:
+        result = create_tree_job(
+            raw,
+            data.get('sequence_id'),
+            user=current_user,
+            rebuild_ncbi_blast=rebuild_ncbi,
+            mycomap_local_limit=local_limit,
+            mycomap_ncbi_limit=ncbi_limit,
+            public_base_url=request.url_root,
+        )
+        return jsonify(result), 202
+    except MushroomObserverError as exc:
+        return jsonify({"status": "error", "error": str(exc)}), exc.status
+    except Exception as exc:
+        logger.error("Mushroom Observer tree endpoint error: %s", exc, exc_info=True)
+        return _server_error(exc, where="mushroom_observer_tree")
 
 
 
@@ -1336,6 +1998,7 @@ def create_job():
         "mcmc_generations": data.get("mcmc_generations", 50000),
         "mcmc_nruns": data.get("mcmc_nruns", 2),
         "mcmc_nchains": data.get("mcmc_nchains", 4),
+        "mcmc_burnin_fraction": data.get("mcmc_burnin_fraction", 0.25),
         
         # New RAxML-NG params - Extract raw first
         "run_preset": data.get("run_preset", "fast_good"),
@@ -1388,12 +2051,25 @@ def create_job():
             return default
         return max(lo, min(hi, n))
 
+    def _clamp_float(value, default, lo, hi):
+        import math
+        try:
+            n = float(value)
+        except (TypeError, ValueError):
+            return default
+        if not math.isfinite(n):
+            return default
+        return max(lo, min(hi, n))
+
     job_params["bootstrap"] = _clamp_int(job_params.get("bootstrap"), 1000, 0, 10_000)
     job_params["mcmc_generations"] = _clamp_int(
         job_params.get("mcmc_generations"), 50_000, 1_000, 100_000_000
     )
     job_params["mcmc_nruns"] = _clamp_int(job_params.get("mcmc_nruns"), 2, 1, 8)
     job_params["mcmc_nchains"] = _clamp_int(job_params.get("mcmc_nchains"), 4, 1, 16)
+    job_params["mcmc_burnin_fraction"] = _clamp_float(
+        job_params.get("mcmc_burnin_fraction"), 0.25, 0.0, 0.99
+    )
     job_params["sequence"], job_params["sequence_metadata"] = _dedupe_sequence_payload(
         job_params.get("sequence", ""),
         job_params.get("sequence_metadata", []),
@@ -1504,6 +2180,98 @@ def rename_tree_tip(job_id):
         return jsonify(state)
     except Exception as e:
         return _server_error(e)
+
+
+@bp.route('/job/<job_id>/tree/refresh-mycomap-records', methods=['POST'])
+@limiter.limit("5 per minute; 50 per hour")
+def refresh_tree_mycomap_records(job_id):
+    """Refresh selected observation records and persist changed MycoMap tip labels."""
+    _, error_msg, status_code = check_job_access(job_id, mode="edit")
+    if error_msg:
+        return jsonify({"status": "error", "error": error_msg}), status_code
+
+    data = request.get_json(silent=True) or {}
+    tip_names = data.get("tip_names")
+    if not isinstance(tip_names, list) or not tip_names:
+        return jsonify({
+            "status": "error",
+            "error": "Select at least one observation-backed tree record.",
+        }), 422
+    if len(tip_names) > 100:
+        return jsonify({
+            "status": "error",
+            "error": "No more than 100 MycoMap records can be refreshed at once.",
+        }), 422
+
+    normalized_tip_names = []
+    for value in tip_names:
+        if not isinstance(value, str):
+            return jsonify({"status": "error", "error": "Invalid tree tip name."}), 422
+        name = value.strip()
+        if not name or len(name) > 1000 or any(ord(char) < 32 for char in name):
+            return jsonify({"status": "error", "error": "Invalid tree tip name."}), 422
+        if name not in normalized_tip_names:
+            normalized_tip_names.append(name)
+
+    job_dir = Config.JOB_DIR / job_id
+    from app.services.mycomap_service import MycoMapRefreshError
+    try:
+        from app.services.mycomap_service import (
+            extract_mycomap_observation_reference,
+            refresh_mycomap_observation_records,
+        )
+        from app.services.tree_edit_service import (
+            _tree_tip_set,
+            load_tree_state,
+            refresh_mycomap_tip_labels,
+            save_tree_state,
+        )
+
+        state = load_tree_state(job_dir)
+        available_tips = _tree_tip_set(state)
+        if any(name not in available_tips for name in normalized_tip_names):
+            return jsonify({
+                "status": "error",
+                "error": "One or more selected tree records are no longer available.",
+            }), 409
+
+        renames = state.get("renames") or {}
+        references = []
+        for name in normalized_tip_names:
+            reference = (
+                extract_mycomap_observation_reference(name)
+                or extract_mycomap_observation_reference(renames.get(name))
+            )
+            if reference and reference not in references:
+                references.append(reference)
+        if not references:
+            return jsonify({
+                "status": "error",
+                "error": "The selected records do not contain iNaturalist or Mushroom Observer numbers.",
+            }), 422
+
+        refresh_result = refresh_mycomap_observation_records(references)
+        label_result = refresh_mycomap_tip_labels(
+            state,
+            normalized_tip_names,
+            refresh_result,
+        )
+        changes = label_result["changes"]
+        if changes:
+            save_tree_state(job_dir, label_result["tree_state"])
+        return jsonify({
+            "status": "success",
+            "refreshed_count": len(references),
+            "updated_tip_count": len(changes),
+            "changes": changes,
+            "warnings": label_result["warnings"],
+            "message": refresh_result.get("message") or "",
+        })
+    except MycoMapRefreshError as exc:
+        logger.warning("MycoMap tree-record refresh failed for job %s: %s", job_id, exc)
+        return jsonify({"status": "error", "error": str(exc)}), 502
+    except Exception as exc:
+        return _server_error(exc, where="refresh_tree_mycomap_records")
 
 @bp.route('/job/<job_id>/tree/rotate', methods=['POST'])
 def rotate_tree_node(job_id):
@@ -1854,6 +2622,46 @@ def download_nexus(job_id):
     response.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
     return response
 
+
+@bp.route('/job/<job_id>/download/mrbayes', methods=['GET'])
+def download_mrbayes_files(job_id):
+    """Download the MrBayes command file and raw convergence artifacts."""
+    _, error_msg, status_code = check_job_access(job_id)
+    if error_msg:
+        return jsonify({"status": "error", "error": error_msg}), status_code
+
+    from io import BytesIO
+    from zipfile import ZIP_DEFLATED, ZipFile
+
+    job_dir = Config.JOB_DIR / job_id
+    tree_dir = job_dir / "tree"
+    files = []
+    if tree_dir.exists() and tree_dir.is_dir():
+        files = [
+            path for path in sorted(tree_dir.glob("mrbayes_input.nex*"))
+            if not path.name.endswith("~") and validate_safe_file_path(path, job_dir)
+        ]
+    if not files:
+        return jsonify({
+            "status": "error",
+            "error": "MrBayes analysis files not found"
+        }), 404
+
+    archive = BytesIO()
+    with ZipFile(archive, "w", compression=ZIP_DEFLATED) as zip_file:
+        for path in files:
+            zip_file.write(path, arcname=path.name)
+    archive.seek(0)
+
+    response = send_file(
+        archive,
+        as_attachment=True,
+        download_name="mrbayes_analysis_files.zip",
+        mimetype="application/zip",
+    )
+    response.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
+    return response
+
 @bp.route('/job/<job_id>/download/fasta/original', methods=['GET'])
 def download_fasta_original(job_id):
     # Check authorization
@@ -1951,9 +2759,15 @@ def alignment_view(job_id):
     tree_order = [str(n) for n in tree_order[:MAX_NAMES] if n]
 
     job_dir = Config.JOB_DIR / job_id
-    path = job_dir / "alignment" / "alignment_raw.fasta"
-    if not path.exists():
-        path = job_dir / "alignment" / "aligned.fasta"
+    alignment_dir = job_dir / "alignment"
+    alignment_candidates = (
+        alignment_dir / "alignment_pruned_aligned.fasta",
+        alignment_dir / "alignment_raw.fasta",
+        alignment_dir / "aligned.fasta",
+    )
+    path = next((candidate for candidate in alignment_candidates if candidate.exists()), None)
+    if path is None:
+        return jsonify({"status": "error", "error": "Aligned FASTA not found"}), 404
     if not validate_safe_file_path(path, job_dir):
         return jsonify({"status": "error", "error": "Aligned FASTA not found"}), 404
 
@@ -1982,7 +2796,25 @@ def alignment_view(job_id):
         if first_token:
             by_token.setdefault(first_token, []).append(row)
 
-    def match(name):
+    rename_aliases = {}
+    try:
+        from app.services.tree_edit_service import load_tree_state
+        renames = load_tree_state(job_dir).get("renames") or {}
+        if isinstance(renames, dict):
+            for original_name, display_name in renames.items():
+                if not isinstance(original_name, str) or not isinstance(display_name, str):
+                    continue
+                display_name = display_name.strip()
+                if not display_name:
+                    continue
+                existing = rename_aliases.get(display_name)
+                rename_aliases[display_name] = (
+                    original_name if existing in (None, original_name) else False
+                )
+    except Exception as exc:
+        logger.warning("Could not load rename aliases for alignment view %s: %s", job_id, exc)
+
+    def match_exact_alignment_name(name):
         if not name:
             return None
         if name in by_full:
@@ -1990,11 +2822,31 @@ def alignment_view(job_id):
         t = name.strip()
         if t in by_trimmed:
             return by_trimmed[t]
+        return None
+
+    def match_alignment_token(name):
+        if not name:
+            return None
+        t = name.strip()
         tok = t.split(None, 1)[0] if t else ""
         hits = by_token.get(tok, [])
         if len(hits) == 1:
             return hits[0]
         return None
+
+    def match_alignment_name(name):
+        return match_exact_alignment_name(name) or match_alignment_token(name)
+
+    def match(name):
+        row = match_exact_alignment_name(name)
+        if row is not None:
+            return row
+        original_name = rename_aliases.get(str(name).strip())
+        if original_name:
+            row = match_alignment_name(original_name)
+            if row is not None:
+                return row
+        return match_alignment_token(name)
 
     warnings = []
     alignment_length = max((len(r["sequence"]) for r in fasta_rows), default=0)
@@ -2122,6 +2974,89 @@ def download_fasta_trimmed(job_id):
     return send_file(path, as_attachment=True, download_name="sequences_trimmed.fasta")
 
 
+@bp.route('/job/<job_id>/download/alignment/inspection', methods=['GET'])
+def download_alignment_inspection(job_id):
+    """Download before/after alignments plus the trimmer's marked HTML report."""
+    _, error_msg, status_code = check_job_access(job_id)
+    if error_msg:
+        return jsonify({"status": "error", "error": error_msg}), status_code
+
+    import json
+    from io import BytesIO
+    from zipfile import ZIP_DEFLATED, ZipFile
+
+    job_dir = Config.JOB_DIR / job_id
+    raw_path = job_dir / "alignment" / "alignment_raw.fasta"
+    if not raw_path.exists():
+        raw_path = job_dir / "alignment" / "aligned.fasta"
+    trimmed_path = job_dir / "alignment" / "alignment_trimmed.fasta"
+    report_path = job_dir / "alignment" / "alignment_trimmed_report.html"
+
+    required_paths = (raw_path, trimmed_path, report_path)
+    if not all(validate_safe_file_path(path, job_dir) for path in required_paths):
+        return jsonify({
+            "status": "error",
+            "error": "A marked trimming report is not available for this job",
+        }), 404
+
+    job_details = {}
+    input_info_path = job_dir / "input_info.json"
+    if validate_safe_file_path(input_info_path, job_dir):
+        try:
+            with open(input_info_path, "r") as handle:
+                job_details = json.load(handle)
+        except (OSError, ValueError, TypeError):
+            logger.warning("Could not read trimming details for job %s", job_id)
+
+    trimming_details = job_details.get("trimming_details") or {}
+    terminal_details = trimming_details.get("terminal_overhang_trim") or {}
+    method = str(trimming_details.get("method") or job_details.get("trimming_method") or "unknown")
+    readme_lines = [
+        "Dikarya alignment trimming inspection bundle",
+        "",
+        f"Trimming algorithm: {method}",
+        "",
+        "alignment_before_trimming.fasta",
+        "  The complete aligned FASTA before any trimming.",
+        "",
+        "alignment_after_trimming.fasta",
+        "  The final alignment supplied to the tree builder.",
+        "",
+        "trimming_report.html",
+        "  The trimming algorithm's colored view of retained and removed columns.",
+    ]
+    if terminal_details.get("enabled"):
+        ranges = terminal_details.get("removed_ranges") or []
+        range_text = ", ".join(
+            f"{item.get('start')}-{item.get('end')}"
+            for item in ranges
+            if item.get("start") is not None and item.get("end") is not None
+        ) or "none"
+        readme_lines.extend([
+            "",
+            "Terminal-overhang stage:",
+            f"  Removed original alignment columns (1-based): {range_text}",
+            "  The HTML report uses the alignment after this terminal-overhang stage as its input.",
+        ])
+
+    archive = BytesIO()
+    with ZipFile(archive, "w", compression=ZIP_DEFLATED) as zip_file:
+        zip_file.write(raw_path, arcname="alignment_before_trimming.fasta")
+        zip_file.write(trimmed_path, arcname="alignment_after_trimming.fasta")
+        zip_file.write(report_path, arcname="trimming_report.html")
+        zip_file.writestr("README.txt", "\n".join(readme_lines) + "\n")
+    archive.seek(0)
+
+    response = send_file(
+        archive,
+        as_attachment=True,
+        download_name="alignment_trimming_inspection.zip",
+        mimetype="application/zip",
+    )
+    response.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
+    return response
+
+
 # =============================================================================
 # SSE Real-Time Events Endpoint
 # =============================================================================
@@ -2179,14 +3114,17 @@ def _build_snapshot(job_id: str) -> dict:
         if db_job.status in ('completed', 'failed'):
             status = db_job.status
     
-    # Normalize: RQ uses 'finished', we use 'completed'
-    if status == 'finished':
+    # Normalize RQ vocabulary to the frontend's status vocabulary.
+    if status == 'started':
+        status = 'running'
+    elif status == 'finished':
         status = 'completed'
     
     # Build job info
     job_info = {
         "id": job_id,
         "status": status,
+        "enqueued_at": rq_status.get('enqueued_at'),
         "started_at": rq_status.get('started_at'),
         "ended_at": rq_status.get('ended_at'),
         "elapsed_seconds": None,
@@ -2199,19 +3137,40 @@ def _build_snapshot(job_id: str) -> dict:
         "meta": {},
     }
     
-    # Calculate elapsed time
-    if rq_status.get('started_at'):
+    def _parse_rq_timestamp(value):
+        if not value:
+            return None
         try:
-            started = datetime.fromisoformat(rq_status['started_at'].replace('Z', '+00:00'))
-            if rq_status.get('ended_at'):
-                ended = datetime.fromisoformat(rq_status['ended_at'].replace('Z', '+00:00'))
-                job_info["elapsed_seconds"] = (ended - started).total_seconds()
-            else:
-                from datetime import timezone
-                now = datetime.now(timezone.utc)
-                job_info["elapsed_seconds"] = (now - started).total_seconds()
+            return datetime.fromisoformat(str(value).replace('Z', '+00:00'))
         except Exception:
-            pass
+            return None
+
+    enqueued = _parse_rq_timestamp(rq_status.get('enqueued_at'))
+    started = _parse_rq_timestamp(rq_status.get('started_at'))
+    ended = _parse_rq_timestamp(rq_status.get('ended_at'))
+
+    if enqueued and started:
+        job_info["queue_wait_seconds"] = (started - enqueued).total_seconds()
+    else:
+        job_info["queue_wait_seconds"] = None
+
+    if ended:
+        # A finished job reports how long it actually ran. Deferred MycoMap/NCBI
+        # steps re-enqueue with RQ Retry, which preserves the original
+        # enqueued_at, so measuring from there would bill hours of queue wait as
+        # pipeline runtime.
+        run_start = started or enqueued
+        if run_start:
+            job_info["elapsed_seconds"] = (ended - run_start).total_seconds()
+    else:
+        # A running job counts from when it actually started; a job still
+        # waiting has no start yet, so it counts from enqueue and the queued
+        # page keeps its live counter.
+        live_start = started or enqueued
+        if live_start:
+            from datetime import timezone
+            now = datetime.now(timezone.utc)
+            job_info["elapsed_seconds"] = (now - live_start).total_seconds()
     
     # Get RQ job meta
     try:
@@ -2248,6 +3207,12 @@ def _build_snapshot(job_id: str) -> dict:
             "tree_nexus": f"/api/job/{job_id}/download/tree/nexus",
             "fasta_original": f"/api/job/{job_id}/download/fasta/original",
         }
+        if (job_dir / "tree" / "mrbayes_input.nex").is_file():
+            job_info["result_files"]["mrbayes"] = f"/api/job/{job_id}/download/mrbayes"
+        if (job_dir / "alignment" / "alignment_trimmed_report.html").is_file():
+            job_info["result_files"]["alignment_inspection"] = (
+                f"/api/job/{job_id}/download/alignment/inspection"
+            )
     
     # Read log tails (generous limits to capture most output for completed jobs)
     logs_dir = job_dir / "logs"
@@ -2354,8 +3319,16 @@ def job_events_stream(job_id):
                         logger.debug(f"SSE DB poll for job {job_id}: status={db_job_check.status if db_job_check else 'None'}")
                         if db_job_check and db_job_check.status in ('completed', 'failed'):
                             job_status = db_job_check.status
-                            # Give a moment for final events from Redis
+                            # Give a moment for final metadata to settle, then send a
+                            # terminal snapshot in case the Redis completion event was
+                            # missed. Closing without this snapshot can leave an open
+                            # status page displaying its last non-terminal step.
                             time.sleep(1)
+                            terminal_snapshot = _build_snapshot(job_id)
+                            yield (
+                                "event: snapshot\n"
+                                f"data: {json.dumps(terminal_snapshot)}\n\n"
+                            )
                             break
                 
                 # Brief sleep to prevent CPU spin (50-100ms effective with pubsub timeout)
@@ -2488,8 +3461,9 @@ def add_sequences_to_job(job_id):
     if not input_text:
         return jsonify({"status": "error", "error": "No input provided"}), 400
 
-    # 1. Raw Input Limit (e.g. 200KB characters)
-    MAX_INPUT_CHARS = 200_000
+    # 1. Raw input limit. Leave room for FASTA headers and line wrapping around
+    # the separate 2,000,000-base semantic limit enforced below.
+    MAX_INPUT_CHARS = 2_500_000
     if len(input_text) > MAX_INPUT_CHARS:
         return jsonify({"status": "error", "error": f"Input too large (max {MAX_INPUT_CHARS} chars)"}), 400
         

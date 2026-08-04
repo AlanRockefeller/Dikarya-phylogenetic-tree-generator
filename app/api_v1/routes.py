@@ -4,6 +4,7 @@ Phase 1 endpoints: /health, /me, /tokens
 Phase 2 endpoints: /jobs (+ mutation), /jobs/{id}/files, /jobs/{id}/logs, /tools/*
 """
 import json
+import math
 import re
 from datetime import datetime
 from pathlib import Path
@@ -111,6 +112,7 @@ LIMITS = {
     "mcmc_generations":    (1_000, 100_000_000),
     "mcmc_nruns":          (1,     8),
     "mcmc_nchains":        (1,     16),
+    "mcmc_burnin_fraction": (0.0,   0.99),
 }
 
 # Fields a recompute may override. Sequence/accessions are intentionally
@@ -120,6 +122,7 @@ RECOMPUTE_ALLOWED_FIELDS = frozenset({
     "tree_method", "tree_model",
     "alignment_method", "trimming_method", "trim_terminal_overhangs",
     "bootstrap", "mcmc_generations", "mcmc_nruns", "mcmc_nchains",
+    "mcmc_burnin_fraction",
     "outgroup", "notes",
 })
 
@@ -137,6 +140,32 @@ def _validate_bool(field, value, default=True):
     return None, error_response(
         code="validation_failed",
         message=f"`{field}` must be a boolean.",
+        status=422,
+        details={"field": field, "value": value},
+    )
+
+
+def _validate_mycomap_rerun_limit(body, result_type):
+    """Validate optional MycoMap BLAST rerun limits for tool endpoints."""
+    from app.services.mycomap_service import validate_mycomap_rerun_limit
+
+    aliases = {
+        "local": ("mycomap_local_limit", "mycomap_local_blast_limit", "local_limit"),
+        "ncbi": ("mycomap_ncbi_limit", "mycomap_ncbi_blast_limit", "ncbi_limit"),
+    }
+    value = None
+    field = aliases[result_type][0]
+    for key in aliases.get(result_type, ()):
+        if key in body:
+            field = key
+            value = body.get(key)
+            break
+    limit, message = validate_mycomap_rerun_limit(value, result_type)
+    if not message:
+        return limit, None
+    return None, error_response(
+        code="validation_failed",
+        message=message,
         status=422,
         details={"field": field, "value": value},
     )
@@ -188,6 +217,25 @@ def _validate_clamped_int(field, value, *, default):
             ),
             status=422,
             details={"field": field, "value": n, "min": lo, "max": hi},
+        )
+    return n, None
+
+
+def _validate_fraction(field, value, *, default):
+    """Validate a finite decimal fraction against the configured limits."""
+    lo, hi = LIMITS[field]
+    if value is None:
+        return default, None
+    try:
+        n = float(value)
+    except (TypeError, ValueError):
+        n = math.nan
+    if not math.isfinite(n) or n < lo or n > hi:
+        return None, error_response(
+            code="validation_failed",
+            message=f"`{field}` must be a number between {lo} and {hi}.",
+            status=422,
+            details={"field": field, "value": value, "min": lo, "max": hi},
         )
     return n, None
 
@@ -290,7 +338,7 @@ def _validate_accessions(value):
 def create_job():
     """Create a new phylo job. Body: {input_type, sequence, accessions,
     alignment_method, trimming_method, tree_method, tree_model, bootstrap,
-    mcmc_generations, mcmc_nruns, mcmc_nchains, notes}.
+    mcmc_generations, mcmc_nruns, mcmc_nchains, mcmc_burnin_fraction, notes}.
     """
     data = request.get_json(silent=True)
     if data is None:
@@ -335,6 +383,9 @@ def create_job():
     if err: return err
     mcmc_nchains, err = _validate_clamped_int(
         "mcmc_nchains", data.get("mcmc_nchains"), default=4)
+    if err: return err
+    mcmc_burnin_fraction, err = _validate_fraction(
+        "mcmc_burnin_fraction", data.get("mcmc_burnin_fraction"), default=0.25)
     if err: return err
 
     # Strings.
@@ -432,6 +483,7 @@ def create_job():
         "mcmc_generations":  mcmc_generations,
         "mcmc_nruns":        mcmc_nruns,
         "mcmc_nchains":      mcmc_nchains,
+        "mcmc_burnin_fraction": mcmc_burnin_fraction,
     }
 
     try:
@@ -600,6 +652,12 @@ def recompute_job(job_id):
                 v, err = _validate_clamped_int(field, body[field], default=default)
                 if err: return err
                 overrides[field] = v
+        if "mcmc_burnin_fraction" in body:
+            v, err = _validate_fraction(
+                "mcmc_burnin_fraction", body["mcmc_burnin_fraction"], default=0.25
+            )
+            if err: return err
+            overrides["mcmc_burnin_fraction"] = v
         if "tree_model" in body:
             v, err = _validate_string(
                 "tree_model", body["tree_model"],
@@ -1174,19 +1232,67 @@ def tools_inaturalist_tree():
     body = request.get_json(silent=True) or {}
     raw = body.get("observation") or body.get("url") or body.get("input") or ""
     resolved_type = (body.get("resolved_type") or "").strip().lower()
+    rebuild_ncbi_blast, bool_error = _validate_bool(
+        "rebuild_ncbi_blast",
+        body.get("rebuild_ncbi_blast", body.get("rebuild_ncbi")),
+        default=False,
+    )
+    if bool_error:
+        return bool_error
+    recreate_existing_tree, bool_error = _validate_bool(
+        "recreate_existing_tree",
+        body.get("recreate_existing_tree"),
+        default=False,
+    )
+    if bool_error:
+        return bool_error
+    local_limit, limit_error = _validate_mycomap_rerun_limit(body, "local")
+    if limit_error:
+        return limit_error
+    ncbi_limit, limit_error = _validate_mycomap_rerun_limit(body, "ncbi")
+    if limit_error:
+        return limit_error
     try:
         parsed = parse_inaturalist_tree_input(raw)
         if parsed.get("type") == "single_observation":
-            result = create_job_from_inat_observation(raw, user=g.api_user)
+            result = create_job_from_inat_observation(
+                raw,
+                user=g.api_user,
+                rebuild_ncbi_blast=rebuild_ncbi_blast,
+                recreate_existing_tree=recreate_existing_tree,
+                mycomap_local_limit=local_limit,
+                mycomap_ncbi_limit=ncbi_limit,
+            )
             job_ids = [result["job_id"]]
         else:
+            if rebuild_ncbi_blast or recreate_existing_tree:
+                return error_response(
+                    code="validation_failed",
+                    message=(
+                        "NCBI BLAST rebuild and existing-tree re-creation are "
+                        "only supported for a single iNaturalist observation."
+                    ),
+                    status=422,
+                    details={
+                        "field": (
+                            "rebuild_ncbi_blast"
+                            if rebuild_ncbi_blast else "recreate_existing_tree"
+                        )
+                    },
+                )
             if not resolved_type:
                 return error_response(
                     code="ambiguous_scope",
                     message="Provide resolved_type='user' or 'project' for username/project inputs.",
                     status=409,
                 )
-            result = create_jobs_from_inat_scope(raw, resolved_type=resolved_type, user=g.api_user)
+            result = create_jobs_from_inat_scope(
+                raw,
+                resolved_type=resolved_type,
+                user=g.api_user,
+                mycomap_local_limit=local_limit,
+                mycomap_ncbi_limit=ncbi_limit,
+            )
             job_ids = result.get("job_ids") or []
         # Tag metrics with the originating API token id for traceability.
         for job_id in job_ids:
@@ -1198,8 +1304,18 @@ def tools_inaturalist_tree():
         db.session.commit()
         return ok(result, status=202)
     except InatTreeError as e:
-        code = "validation_failed" if e.status in (400, 422) else "upstream_error"
-        return error_response(code=code, message=str(e), status=e.status)
+        if e.status in (400, 422):
+            code = "validation_failed"
+        elif e.status == 503:
+            code = "service_unavailable"
+        else:
+            code = "upstream_error"
+        return error_response(
+            code=code,
+            message=str(e),
+            status=e.status,
+            details=e.details,
+        )
     except Exception as e:
         db.session.rollback()
         return server_error(e, where="tools_inaturalist_tree")

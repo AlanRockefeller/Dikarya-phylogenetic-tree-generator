@@ -91,13 +91,44 @@ def get_global_metrics():
     for status, count in rows:
         status_counts[status] = count
 
-    since = datetime.utcnow() - timedelta(hours=24)
-    recent_failed = Job.query.filter(Job.status == "error", Job.updated_at > since).count()
+    tracked_statuses = ("failed", "completed", "queued", "running")
+    now = datetime.utcnow()
+    cutoffs = {
+        "24h": now - timedelta(hours=24),
+        "7d": now - timedelta(days=7),
+        "30d": now - timedelta(days=30),
+    }
+    status_period_counts = {
+        status: {"24h": 0, "7d": 0, "30d": 0, "all_time": 0}
+        for status in tracked_statuses
+    }
+
+    # Aggregate in the database. Materializing every job row here made these
+    # (unauthenticated) endpoints scale with table size.
+    all_time_rows = db.session.query(
+        Job.status, func.count(Job.id)
+    ).filter(
+        Job.status.in_(tracked_statuses)
+    ).group_by(Job.status).all()
+    for status, count in all_time_rows:
+        status_period_counts[status]["all_time"] = count
+
+    for period, cutoff in cutoffs.items():
+        period_rows = db.session.query(
+            Job.status, func.count(Job.id)
+        ).filter(
+            Job.status.in_(tracked_statuses),
+            Job.created_at > cutoff,
+        ).group_by(Job.status).all()
+        for status, count in period_rows:
+            status_period_counts[status][period] = count
 
     return {
         "total_jobs": total_jobs,
         "status_counts": status_counts,
-        "recent_failed_24h": recent_failed,
+        "status_period_counts": status_period_counts,
+        # Preserve the existing JSON field for clients already using /metrics.
+        "recent_failed_24h": status_period_counts["failed"]["24h"],
     }
 
 

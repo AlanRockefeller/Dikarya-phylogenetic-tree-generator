@@ -11,8 +11,10 @@ When job_id is provided, streams log output to Redis for real-time SSE updates.
 """
 
 import os
+import re
 import shutil
 import logging
+import math
 from pathlib import Path
 from typing import Dict, Any, Optional, Tuple
 
@@ -32,6 +34,39 @@ except ImportError:
     HAS_BIOPYTHON = False
 
 logger = logging.getLogger(__name__)
+
+# IQ-TREE model strings (e.g. "GTR+F+I+G4", "MFP", "TIM2e+R4",
+# "GTR+G:part1,HKY+I:part2") are made up of model/modifier names, digits,
+# and a small set of punctuation for modifiers/partitions/params. This is a
+# character-allowlist (not a semantic check like raxml_validator.py) --
+# IQ-TREE itself rejects unrecognized model names. Argv passing already
+# prevents shell injection; this is hygiene, matching the outgroup check in
+# raxml_validator.py.
+_IQTREE_MODEL_ALLOWED_RE = re.compile(r"^[A-Za-z0-9+\-_.,:{}*/]+$")
+_IQTREE_MODEL_MAX_LEN = 256
+_IQTREE_DEFAULT_MODEL = "GTR+G"
+
+
+def _validate_iqtree_model(model_str: str) -> str:
+    """Return a safe IQ-TREE -m value, falling back to the default on rejection."""
+    model_str = (model_str or "").strip()
+    if not model_str:
+        return _IQTREE_DEFAULT_MODEL
+    if len(model_str) > _IQTREE_MODEL_MAX_LEN or not _IQTREE_MODEL_ALLOWED_RE.match(model_str):
+        logger.warning(f"Rejected IQ-TREE model string '{model_str}'; using default '{_IQTREE_DEFAULT_MODEL}'.")
+        return _IQTREE_DEFAULT_MODEL
+    return model_str
+
+
+def _normalize_mrbayes_burnin_fraction(value: Any) -> float:
+    """Return a finite relative burn-in fraction accepted by MrBayes."""
+    try:
+        burnin_fraction = float(value)
+    except (TypeError, ValueError):
+        return 0.25
+    if not math.isfinite(burnin_fraction):
+        return 0.25
+    return max(0.0, min(0.99, burnin_fraction))
 
 
 def run_tree_builder(
@@ -69,6 +104,16 @@ def run_tree_builder(
         "bootstrap": params.bootstrap,
         "run_dir": str(output_newick.parent)
     }
+    if method == "mrbayes":
+        burnin_fraction = _normalize_mrbayes_burnin_fraction(
+            params.mcmc_burnin_fraction
+        )
+        metadata.update({
+            "mcmc_generations": params.mcmc_generations,
+            "mcmc_nruns": params.mcmc_nruns,
+            "mcmc_nchains": params.mcmc_nchains,
+            "mcmc_burnin_fraction": burnin_fraction,
+        })
 
     try:
         if method == "nj":
@@ -209,7 +254,8 @@ def _get_raxml_cmd(
         "--model", params.model,
         "--prefix", prefix,
         "--threads", str(threads),
-        "--seed", str(params.seed)
+        "--seed", str(params.seed),
+        "--redo",
     ]
     
     # Starting Trees
@@ -232,10 +278,6 @@ def _get_raxml_cmd(
     if params.enable_early_stopping:
         cmd.extend(["--stop-rule", "kh-mult"]) # or kh, but kh-mult often safer/standard
 
-    # Outgroup (Drawing option in RAxML, but useful for logs)
-    if params.outgroup:
-        cmd.extend(["--outgroup", params.outgroup])
-
     return cmd
 
 def _run_moose(
@@ -248,10 +290,14 @@ def _run_moose(
     """
     Run MOOSE model selection.
     Returns (best_model, alignment_path_to_use).
-    alignment_path_to_use is either the original input or a reduced alignment if MOOSE produced one.
+    Returns ``None`` for the model when MOOSE cannot provide a usable
+    selection, so the caller keeps the model the user configured. The original
+    sanitized alignment is always retained so model partition ranges cannot
+    drift from a MOOSE-reduced alignment.
     """
     task_logger.info("Running MOOSE model selection...")
     from app.services.subprocess_utils import run_command
+    configured_model = getattr(params, "model", None) or "the configured model"
     
     prefix = str(alignment_fasta.parent / "moose_run")
     
@@ -272,7 +318,8 @@ def _run_moose(
         "--moose-options", moose_opts,
         "--prefix", prefix,
         "--threads", "auto", 
-        "--seed", str(params.seed)
+        "--seed", str(params.seed),
+        "--redo",
     ]
     
     if job_id:
@@ -283,16 +330,20 @@ def _run_moose(
     rc, stdout, stderr = run_command(cmd, log_file=log_file)
     
     if rc != 0:
-        task_logger.warning(f"MOOSE failed (RC={rc}). See moose.log. Falling back to default model.")
+        task_logger.warning(
+            f"MOOSE failed (RC={rc}). See moose.log. "
+            f"Keeping {configured_model}."
+        )
         return None, alignment_fasta
         
     # Check for reduced alignment
     # Wiki says: <prefix>.raxml.reduced.phy
     reduced_aln = Path(f"{prefix}.raxml.reduced.phy")
-    final_aln = reduced_aln if reduced_aln.exists() else alignment_fasta
-    
     if reduced_aln.exists():
-        task_logger.info("MOOSE produced reduced alignment. Using it for inference.")
+        task_logger.info(
+            "MOOSE produced a reduced alignment; retaining the original "
+            "sanitized alignment to keep the selected model compatible."
+        )
 
     # Parse output .bestModel
     # Wiki says .moose.bestModel
@@ -302,20 +353,25 @@ def _run_moose(
         best_model_file = Path(f"{prefix}.raxml.bestModel")
 
     if best_model_file.exists():
-        # Return the path to the bestModel file directly
-        # RAxML-NG supports reading model from file: --model /path/to/file
-        task_logger.info(f"Using MOOSE model file: {best_model_file}")
-        
-        # We still want to log what it found for the user
         try:
-             raw_model = best_model_file.read_text().strip()
-             task_logger.info(f"MOOSE selected model configuration: {raw_model}")
-        except Exception:
-             pass
-             
-        return str(best_model_file.absolute()), final_aln
-    
-    task_logger.warning("MOOSE output file not found. Falling back.")
+            raw_model = best_model_file.read_text().strip()
+            selected_model = raw_model.rsplit(",", 1)[0].strip()
+            base_model = selected_model.split("+", 1)[0].split("{", 1)[0]
+            if selected_model and base_model and base_model[0].isalpha():
+                task_logger.info(f"MOOSE selected model configuration: {raw_model}")
+                task_logger.info(f"Using MOOSE-selected model: {selected_model}")
+                return selected_model, alignment_fasta
+        except Exception as exc:
+            task_logger.warning(f"Could not read MOOSE model output: {exc}")
+
+        task_logger.warning(
+            f"MOOSE returned an unusable model. Keeping {configured_model}."
+        )
+        return None, alignment_fasta
+
+    task_logger.warning(
+        f"MOOSE output file not found. Keeping {configured_model}."
+    )
     return None, alignment_fasta
 
 def _run_raxml(
@@ -393,20 +449,17 @@ def _run_raxml(
 
     # 3. Handle MOOSE
     moose_mapping = None
-    reduced_msa_path = None
     
     if resolved.enable_moose:
         if has_moose_support:
             sanitized_fasta_moose = output_newick.parent / "raxml_input_moose_sanitized.fasta"
             moose_mapping = sanitize_fasta_headers(alignment_fasta, sanitized_fasta_moose)
             
-            best_model, best_msa = _run_moose(sanitized_fasta_moose, resolved, config, task_logger, job_id)
+            best_model, _ = _run_moose(
+                sanitized_fasta_moose, resolved, config, task_logger, job_id
+            )
             if best_model:
                 resolved.model = best_model
-            
-            if best_msa != sanitized_fasta_moose and best_msa.exists():
-                 reduced_msa_path = best_msa
-                 # Note: reduced MSA retains simpler sanitized IDs, so moose_mapping is still valid for name restoration
                  
         else:
             task_logger.warning("MOOSE requested but not supported by installed RAxML-NG. Using default model.")
@@ -420,12 +473,12 @@ def _run_raxml(
     prefix = str(output_newick.parent / "raxml_run")
     threads = _get_thread_count(params)
     
-    if reduced_msa_path and moose_mapping:
-         sanitized_fasta = reduced_msa_path
-         name_mapping = moose_mapping
+    if moose_mapping:
+        sanitized_fasta = sanitized_fasta_moose
+        name_mapping = moose_mapping
     else:
-         sanitized_fasta = output_newick.parent / "raxml_input_sanitized.fasta"
-         name_mapping = sanitize_fasta_headers(alignment_fasta, sanitized_fasta)
+        sanitized_fasta = output_newick.parent / "raxml_input_sanitized.fasta"
+        name_mapping = sanitize_fasta_headers(alignment_fasta, sanitized_fasta)
     
     cmd = _get_raxml_cmd(resolved, config, sanitized_fasta, prefix, threads)
     
@@ -468,29 +521,22 @@ def _run_raxml(
             task_logger.info(f"Rerooting tree on outgroup: {resolved.outgroup}")
             tree = Phylo.read(str(output_newick), "newick")
             
-            # Find target (account for sanitization if needed, but resolved.outgroup should match original name)
-            # But name_mapping keys are Original, Values are Sanitized.
-            # RAxML output has Sanitized names.
-            # resolved.outgroup is likely Original name (from UI).
-            # So we need to look up sanitized name.
+            # RAxML output uses sanitized IDs while the UI supplies an original
+            # record ID. Resolve the requested ID before rerooting.
             target_name = resolved.outgroup
-            
-            # If name mapping used, find sanitized equivalent
-            # Mapping: {SanitizedID: OriginalHeader}
-            # We need to find the SanitizedID that corresponds to resolved.outgroup
-            target_name = resolved.outgroup
-            
-            # Simple reverse lookup
+
             for safe_id, original_header in name_mapping.items():
-                if resolved.outgroup in original_header:
-                     # Heuristic match: if selected outgroup name is substring of header
-                     # This helps if outgroup param is "SeqA" but header is "SeqA SpeciesX"
-                     target_name = safe_id
-                     break
-                if original_header == resolved.outgroup:
+                original_id = original_header.split(None, 1)[0]
+                if resolved.outgroup in (original_id, original_header):
                     target_name = safe_id
                     break
-                
+
+            if target_name == resolved.outgroup:
+                for safe_id, original_header in name_mapping.items():
+                    if resolved.outgroup in original_header:
+                        target_name = safe_id
+                        break
+
             # Find clade
             target_clade = next((c for c in tree.find_clades() if c.name == target_name), None)
             
@@ -528,7 +574,7 @@ def _run_iqtree(
     cmd = [
         config.IQTREE_BINARY,
         "-s", str(sanitized_fasta),
-        "-m", params.model,
+        "-m", _validate_iqtree_model(params.model),
         "-nt", str(threads),
         "-pre", prefix,
         "-redo"
@@ -586,6 +632,11 @@ def _run_mrbayes(
     job_id: Optional[str] = None
 ):
     """Run MrBayes Bayesian tree inference."""
+    burnin_fraction = _normalize_mrbayes_burnin_fraction(
+        params.mcmc_burnin_fraction
+    )
+    burnin_value = f"{burnin_fraction:.4f}".rstrip("0").rstrip(".")
+
     # Sanitize FASTA to create safe IDs before converting to NEXUS
     sanitized_fasta = output_newick.parent / "mrbayes_input_sanitized.fasta"
     name_mapping = sanitize_fasta_headers(alignment_fasta, sanitized_fasta)
@@ -599,9 +650,12 @@ def _run_mrbayes(
         f.write("\nbegin mrbayes;\n")
         f.write(f"   set autoclose=yes;\n")
         f.write(f"   lset nst=6 rates=gamma;\n")  # GTR+G equivalent
-        f.write(f"   mcmc ngen={params.mcmc_generations} nchains={params.mcmc_nchains} nruns={params.mcmc_nruns} burninfrac=0.25;\n")
-        f.write(f"   sump;\n")
-        f.write(f"   sumt;\n")
+        f.write(
+            f"   mcmc ngen={params.mcmc_generations} nchains={params.mcmc_nchains} "
+            f"nruns={params.mcmc_nruns} relburnin=yes burninfrac={burnin_value};\n"
+        )
+        f.write(f"   sump relburnin=yes burninfrac={burnin_value};\n")
+        f.write(f"   sumt relburnin=yes burninfrac={burnin_value};\n")
         f.write("end;\n")
         
     cmd = [config.MRBAYES_BINARY, str(nexus_input)]
@@ -825,4 +879,3 @@ def _run_fasttree(
     
     # Convert to Nexus
     _convert_newick_to_nexus(output_newick, output_nexus)
-

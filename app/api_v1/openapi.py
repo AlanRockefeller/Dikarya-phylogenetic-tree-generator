@@ -42,6 +42,9 @@ def _schemas():
                         "tree_model": {"type": "string"},
                         "bootstrap": {"type": "integer"},
                         "mcmc_generations": {"type": "integer"},
+                        "mcmc_nruns": {"type": "integer"},
+                        "mcmc_nchains": {"type": "integer"},
+                        "mcmc_burnin_fraction": {"type": "number"},
                     },
                 },
                 "metrics": {"type": "object"},
@@ -89,6 +92,13 @@ def _schemas():
                 "mcmc_generations": {"type": "integer", "minimum": 1000, "maximum": 100000000},
                 "mcmc_nruns": {"type": "integer", "minimum": 1, "maximum": 8},
                 "mcmc_nchains": {"type": "integer", "minimum": 1, "maximum": 16},
+                "mcmc_burnin_fraction": {
+                    "type": "number",
+                    "minimum": 0,
+                    "maximum": 0.99,
+                    "default": 0.25,
+                    "description": "Relative fraction of MCMC samples discarded as burn-in.",
+                },
                 "outgroup": {"type": "string", "maxLength": 256},
                 "notes": {"type": "string", "maxLength": 2000},
             },
@@ -165,6 +175,13 @@ def _schemas():
                 "mcmc_generations": {"type": "integer", "minimum": 1000, "maximum": 100000000, "default": 50000},
                 "mcmc_nruns": {"type": "integer", "minimum": 1, "maximum": 8, "default": 2},
                 "mcmc_nchains": {"type": "integer", "minimum": 1, "maximum": 16, "default": 4},
+                "mcmc_burnin_fraction": {
+                    "type": "number",
+                    "minimum": 0,
+                    "maximum": 0.99,
+                    "default": 0.25,
+                    "description": "Relative fraction of MCMC samples discarded as burn-in.",
+                },
                 "notes": {"type": "string", "maxLength": 2000},
             },
         },
@@ -265,7 +282,7 @@ def build_spec():
             "version": "1.0.0",
             "description": (
                 "Public API for Dikarya. All endpoints under `/api/v1` require a "
-                "bearer token; mint one at `/user/tokens`. Tokens are scoped — see the "
+                "bearer token; mint one at `/user/tokens`. Tokens are scoped; see the "
                 "Authentication section below."
             ),
             "contact": {"name": "Dikarya", "url": contact_url},
@@ -280,10 +297,10 @@ def build_spec():
                     "description": (
                         "Provide an API token via `Authorization: Bearer dikarya_...`.\n\n"
                         "**Available scopes**:\n"
-                        "- `jobs:read` — list/get jobs, read events, download files & logs\n"
-                        "- `jobs:write` — create, recompute, mutate, delete jobs\n"
-                        "- `tools:read` — BLAST, GenBank, MycoMap, iNaturalist lookups\n"
-                        "- `account:read` — `/me` and list own tokens"
+                        "- `jobs:read`: list/get jobs, read events, download files & logs\n"
+                        "- `jobs:write`: create, recompute, mutate, delete jobs\n"
+                        "- `tools:read`: BLAST, GenBank, MycoMap, iNaturalist lookups\n"
+                        "- `account:read`: `/me` and list own tokens"
                     ),
                 }
             },
@@ -445,7 +462,7 @@ def build_spec():
                         "A single token may hold at most 5 concurrent streams "
                         "(429 `too_many_streams` beyond that). Each connection "
                         "is hard-capped at 30 minutes; on timeout the server "
-                        "emits `event: timeout` and closes — clients should "
+                        "emits `event: timeout` and closes. Clients should "
                         "reconnect. If the token is revoked mid-stream, the "
                         "server emits `event: revoked` and closes."
                     ),
@@ -622,11 +639,19 @@ def build_spec():
                     "summary": "Build a tree from a single iNaturalist observation",
                     "description": (
                         "Reads the observation's `Mycomap BLAST Results` "
-                        "observation field, builds a one-click Dikarya tree "
-                        "from that URL, and when the job completes writes a "
+                        "observation field, refreshes the MycoMap local BLAST "
+                        "results, builds a one-click Dikarya tree from that URL, "
+                        "and when the job completes writes a "
                         "`Phylogenetic Tree` field back to the observation "
                         "with the public tree viewer URL. The write uses "
-                        "the site-wide authorized iNaturalist account."
+                        "the site-wide authorized iNaturalist account. Dikarya "
+                        "queues local MycoMap BLAST preparation in the background "
+                        "with a default of 50 hits. If that automatic local "
+                        "refresh fails, the job uses the saved MycoMap results. "
+                        "If `rebuild_ncbi_blast` is true for a single observation, "
+                        "the job queues MycoMap's asynchronous NCBI rerun and is "
+                        "scheduled to resume about 10 minutes later without "
+                        "occupying the phylogeny worker."
                     ),
                     "security": [{"bearerAuth": ["jobs:write"]}],
                     "requestBody": {
@@ -646,6 +671,47 @@ def build_spec():
                                         "Search URLs and multiple IDs are rejected."
                                     ),
                                     "example": "360934883",
+                                },
+                                "rebuild_ncbi_blast": {
+                                    "type": "boolean",
+                                    "default": False,
+                                    "description": (
+                                        "For single-observation jobs, queue a "
+                                        "background MycoMap NCBI BLAST rerun, then "
+                                        "schedule the tree to resume about 10 "
+                                        "minutes later. Username and project batch jobs "
+                                        "reject this."
+                                    ),
+                                },
+                                "recreate_existing_tree": {
+                                    "type": "boolean",
+                                    "default": False,
+                                    "description": (
+                                        "For a single observation that already has a "
+                                        "Phylogenetic Tree field, explicitly allow a new "
+                                        "tree to replace the field's current URL."
+                                    ),
+                                },
+                                "mycomap_local_limit": {
+                                    "type": "integer",
+                                    "minimum": 1,
+                                    "maximum": 500,
+                                    "default": 50,
+                                    "description": (
+                                        "Number of local MycoMap BLAST hits to "
+                                        "request when the local BLAST results are "
+                                        "rebuilt before importing sequences."
+                                    ),
+                                },
+                                "mycomap_ncbi_limit": {
+                                    "type": "integer",
+                                    "minimum": 1,
+                                    "maximum": 500,
+                                    "default": 100,
+                                    "description": (
+                                        "Number of NCBI BLAST hits to request "
+                                        "when rebuild_ncbi_blast is true."
+                                    ),
                                 }
                             },
                         }}},

@@ -44,7 +44,7 @@ def check_job_access(job_id: str, mode: str = "view") -> Tuple[Optional[Job], Op
         # Rationale: Dikarya allows fully anonymous use. Anonymous users can
         # create, edit, prune, reroot, rename, and recompute their own jobs
         # without signing up. The tradeoff they accept is that the job link
-        # IS the access control — anyone with the URL can also edit. If a
+        # IS the access control, so anyone with the URL can also edit. If a
         # user wants exclusive edit rights, they should create an account
         # and log in before submitting the job; the job will then be owned
         # by that account and edits will be locked to them.

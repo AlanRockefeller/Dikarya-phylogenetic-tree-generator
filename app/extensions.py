@@ -11,10 +11,9 @@ csrf = CSRFProtect()
 login_manager = LoginManager()
 login_manager.login_view = 'auth.login'
 login_manager.login_message_category = 'info'
-# 'strong' = flask-login deletes the session if the request fingerprint
-# (IP + UA) changes after login. Stolen cookies used from a different
-# network get invalidated instead of impersonating the original user.
-login_manager.session_protection = 'strong'
+# Keep fingerprint changes from logging users out when their IP address or
+# browser changes. Basic protection only marks the session as non-fresh.
+login_manager.session_protection = 'basic'
 
 limiter = Limiter(
     key_func=get_remote_address,

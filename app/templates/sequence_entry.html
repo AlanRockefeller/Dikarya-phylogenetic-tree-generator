@@ -621,6 +621,46 @@
                             Use project
                         </button>
                     </div>
+                    <div id="inaturalist_recreate_tree_option"
+                         class="hidden mt-3 p-3 rounded-lg border border-journal-gold/40 bg-journal-gold/10">
+                        <label for="inaturalist_recreate_tree" class="flex items-start gap-3 cursor-pointer">
+                            <input type="checkbox" id="inaturalist_recreate_tree"
+                                   class="mt-1 w-4 h-4 text-journal-gold bg-white dark:bg-journal-dark border-gray-300 dark:border-gray-600 rounded focus:ring-journal-gold">
+                            <span>
+                                <span class="block text-sm font-medium text-journal-dark dark:text-gray-100">
+                                    Re-create phylogenetic tree
+                                </span>
+                                <span class="block mt-1 text-xs text-gray-600 dark:text-gray-300">
+                                    Build a new tree and replace the observation's current Phylogenetic Tree field URL when it finishes.
+                                </span>
+                            </span>
+                        </label>
+                    </div>
+                </div>
+
+                <div id="inaturalist_tree_options"
+                     class="hidden grid grid-cols-1 sm:grid-cols-2 gap-3 text-sm text-gray-700 dark:text-gray-200">
+                    <div>
+                        <label for="inaturalist_local_limit" class="block font-medium mb-1">Local BLAST hits</label>
+                        <input type="number" id="inaturalist_local_limit" min="1" max="500" step="1" value="50"
+                               class="w-full px-3 py-2 border border-gray-300 dark:border-journal-dark rounded-lg bg-white dark:bg-journal-dark text-gray-900 dark:text-gray-100 focus:ring-2 focus:ring-journal-gold focus:border-transparent">
+                        <p class="mt-1 text-xs text-gray-500 dark:text-gray-400">
+                            Local MycoMap BLAST is refreshed by the queued tree job.
+                        </p>
+                    </div>
+                    <div>
+                        <div class="flex items-center gap-2 mb-1">
+                            <input type="checkbox" id="inaturalist_rebuild_ncbi"
+                                   class="w-4 h-4 text-journal-gold bg-gray-100 border-gray-300 rounded focus:ring-journal-gold"
+                                   title="Rebuild MycoMap NCBI BLAST and schedule this tree to resume in about 10 minutes.">
+                            <label for="inaturalist_rebuild_ncbi" class="font-medium">Rebuild NCBI BLAST</label>
+                        </div>
+                        <input type="number" id="inaturalist_ncbi_limit" min="1" max="500" step="1" value="100"
+                               class="w-full px-3 py-2 border border-gray-300 dark:border-journal-dark rounded-lg bg-white dark:bg-journal-dark text-gray-900 dark:text-gray-100 focus:ring-2 focus:ring-journal-gold focus:border-transparent">
+                        <p id="inaturalist_ncbi_wait_hint" class="hidden mt-1 text-xs text-gray-500 dark:text-gray-400">
+                            The tree job queues immediately, then resumes in about 10 minutes without blocking other tree jobs.
+                        </p>
+                    </div>
                 </div>
 
                 <button id="inaturalist_tree_btn"
@@ -649,9 +689,16 @@
 
                     <!-- Action Buttons -->
                     <div id="inaturalist_actions" class="flex flex-wrap gap-3">
-                        <!-- BLAST Button (single observation) -->
-                        <button id="inaturalist_blast_btn" class="hidden btn btn-outline-gold flex-1 min-w-[140px]">
-                            <i class="fas fa-search mr-2"></i> BLAST Sequence
+                        <!-- NCBI BLAST Button (single observation, live NCBI BLAST of the ITS sequence) -->
+                        <button id="inaturalist_blast_btn" class="hidden btn btn-outline-gold flex-1 min-w-[140px]"
+                                title="Submit the DNA Barcode ITS sequence to a live NCBI BLAST search.">
+                            <i class="fas fa-search mr-2"></i> NCBI BLAST
+                        </button>
+
+                        <!-- MycoMap BLAST Button (single observation, refreshes the observation's Mycomap BLAST Results) -->
+                        <button id="inaturalist_mycomap_blast_btn" class="hidden btn btn-outline-gold flex-1 min-w-[140px]"
+                                title="Refresh this observation's Mycomap BLAST Results and add them to the queue.">
+                            <i class="fas fa-dna mr-2"></i> Mycomap BLAST
                         </button>
 
                         <!-- Add to Queue Button (multiple observations) -->
@@ -664,7 +711,86 @@
             </div>
         </div>
 
-        <!-- 2. Mycomap URL Card -->
+        <!-- 2. Mushroom Observer Card -->
+        <div class="tree-card p-6 transition-colors">
+            <h3 class="text-xl font-semibold text-journal-dark dark:text-gray-100 mb-4 flex items-center">
+                <i class="fas fa-binoculars text-journal-gold mr-2"></i>
+                Import from Mushroom Observer
+            </h3>
+
+            <div class="space-y-4">
+                <div>
+                    <label for="mushroom_observer_input"
+                           class="block text-sm font-medium text-gray-700 dark:text-gray-200 mb-2">
+                        Mushroom Observer Observation URL or Number
+                    </label>
+                    <input type="text" id="mushroom_observer_input"
+                           class="w-full px-4 py-3 border border-gray-300 dark:border-journal-dark rounded-lg bg-white dark:bg-journal-dark text-gray-900 dark:text-gray-100 focus:ring-2 focus:ring-journal-gold focus:border-transparent transition-all"
+                           placeholder="575883 or mushroomobserver.org/obs/575883">
+                    <p class="text-xs text-gray-500 dark:text-gray-400 mt-1">
+                        Current, short, and legacy Mushroom Observer observation links are supported.
+                    </p>
+                </div>
+
+                <button id="fetch_mushroom_observer_btn" data-active-style="outline" class="btn w-full">
+                    <i class="fas fa-search mr-2"></i> Submit
+                </button>
+
+                <div id="mushroom_observer_results" class="hidden space-y-4">
+                    <div id="mushroom_observer_summary"
+                         class="p-4 bg-gray-50 dark:bg-journal-dark rounded-lg text-sm text-gray-700 dark:text-gray-200">
+                    </div>
+
+                    <fieldset id="mushroom_observer_sequence_choices" class="hidden space-y-3">
+                        <legend id="mushroom_observer_sequence_legend"
+                                class="text-sm font-semibold text-gray-700 dark:text-gray-200 mb-2">
+                            Choose an ITS sequence
+                        </legend>
+                        <div id="mushroom_observer_sequence_items" class="space-y-3"></div>
+                    </fieldset>
+
+                    <div id="mushroom_observer_tree_options"
+                         class="hidden grid grid-cols-1 sm:grid-cols-2 gap-3 text-sm text-gray-700 dark:text-gray-200">
+                        <div>
+                            <label for="mushroom_observer_local_limit" class="block font-medium mb-1">
+                                Local BLAST hits
+                            </label>
+                            <input type="number" id="mushroom_observer_local_limit" min="1" max="500" step="1" value="50"
+                                   class="w-full px-3 py-2 border border-gray-300 dark:border-journal-dark rounded-lg bg-white dark:bg-journal-dark text-gray-900 dark:text-gray-100 focus:ring-2 focus:ring-journal-gold focus:border-transparent">
+                        </div>
+                        <div>
+                            <div class="flex items-center gap-2 mb-1">
+                                <input type="checkbox" id="mushroom_observer_rebuild_ncbi"
+                                       class="w-4 h-4 text-journal-gold bg-gray-100 border-gray-300 rounded focus:ring-journal-gold">
+                                <label for="mushroom_observer_rebuild_ncbi" class="font-medium">
+                                    Rebuild NCBI BLAST
+                                </label>
+                            </div>
+                            <input type="number" id="mushroom_observer_ncbi_limit" min="1" max="500" step="1" value="100"
+                                   class="w-full px-3 py-2 border border-gray-300 dark:border-journal-dark rounded-lg bg-white dark:bg-journal-dark text-gray-900 dark:text-gray-100 focus:ring-2 focus:ring-journal-gold focus:border-transparent">
+                            <p class="mt-1 text-xs text-gray-500 dark:text-gray-400">
+                                New searches include NCBI automatically; this refreshes a reused search.
+                            </p>
+                        </div>
+                    </div>
+
+                    <div id="mushroom_observer_actions" class="hidden flex flex-wrap gap-3">
+                        <button id="mushroom_observer_blast_btn" class="btn btn-outline-gold flex-1 min-w-[140px]" disabled>
+                            <i class="fas fa-search mr-2"></i> BLAST Sequence
+                        </button>
+                        <button id="mushroom_observer_add_btn" class="btn btn-outline-gold flex-1 min-w-[140px]" disabled>
+                            <i class="fas fa-plus mr-2"></i> Add to Queue
+                        </button>
+                        <button id="mushroom_observer_tree_btn" class="btn btn-outline-gold flex-1 min-w-[140px]" disabled
+                                title="Build a tree and post its public link as a Mushroom Observer comment.">
+                            <i class="fas fa-tree mr-2"></i> One-Click Tree
+                        </button>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- 3. Mycomap URL Card -->
         <div class="tree-card p-6 transition-colors">
             <h3 class="text-xl font-semibold text-journal-dark dark:text-gray-100 mb-4 flex items-center">
                 <i class="fas fa-link text-journal-gold mr-2"></i>
@@ -701,6 +827,16 @@
                         <input type="checkbox" id="mycomap_dedup" checked class="w-4 h-4 text-journal-gold bg-gray-100 border-gray-300 rounded 
                                       focus:ring-journal-gold dark:bg-journal-dark dark:border-gray-600">
                         <span class="text-sm text-gray-700 dark:text-gray-200">Remove Duplicates</span>
+                    </label>
+                    <label class="flex items-center space-x-2 cursor-pointer" title="Exclude local FASTA records that contradict the MycoMap BLAST table.">
+                        <input type="checkbox" id="mycomap_filter_conflicting_local" class="w-4 h-4 text-journal-gold bg-gray-100 border-gray-300 rounded
+                                      focus:ring-journal-gold dark:bg-journal-dark dark:border-gray-600">
+                        <span class="text-sm text-gray-700 dark:text-gray-200">Filter Conflicting Local FASTA</span>
+                    </label>
+                    <label id="mycomap_allow_identical_locations_option" class="flex items-center space-x-2 cursor-pointer opacity-50" title="Keep exact matching sequences when their known locations differ.">
+                        <input type="checkbox" id="mycomap_allow_identical_locations" checked disabled class="w-4 h-4 text-journal-gold bg-gray-100 border-gray-300 rounded
+                                      focus:ring-journal-gold dark:bg-journal-dark dark:border-gray-600">
+                        <span class="text-sm text-gray-700 dark:text-gray-200">Keep Exact Matches at Different Locations</span>
                     </label>
                 </div>
 
@@ -932,11 +1068,10 @@
         <h3 class="mb-1">Pipeline Configuration</h3>
         <div class="advanced-summary">
             <p id="advanced_current_summary" class="text-sm">Currently: MAFFT + FastTree 2.2.0, terminal overhang trim, midpoint-rooted, 1000 bootstrap.</p>
-            <button id="advanced_customize_btn" type="button" class="btn btn-small btn-outline-gold">▾ Customize</button>
         </div>
     </div>
 
-    <div id="advanced_form_body" class="advanced-form-body hidden">
+    <div id="advanced_form_body" class="advanced-form-body">
     <div class="grid grid-cols-1 md:grid-cols-2 gap-6">
         <!-- Alignment Method -->
         <div>
@@ -994,7 +1129,7 @@
             <!-- Tree Method -->
             <div>
                 <label for="tree_method" class="block text-sm font-medium text-gray-700 dark:text-gray-200 mb-2">
-                    Method
+                    Program
                 </label>
                 <select id="tree_method" class="w-full px-4 py-3 border border-gray-300 dark:border-journal-dark rounded-lg 
                                bg-white dark:bg-journal-dark text-gray-900 dark:text-gray-100
@@ -1122,7 +1257,7 @@
 
         <!-- MrBayes Options (Hidden by default) -->
         <div id="mrbayes_options" class="mt-6 hidden">
-            <div class="grid grid-cols-1 md:grid-cols-3 gap-4">
+            <div class="grid grid-cols-1 md:grid-cols-4 gap-4">
                 <div>
                     <label for="mb_gen" class="block text-sm font-medium text-gray-700 dark:text-gray-200 mb-2">
                         Generations
@@ -1147,7 +1282,18 @@
                                   bg-white dark:bg-journal-dark text-gray-900 dark:text-gray-100
                                   focus:ring-2 focus:ring-journal-gold focus:border-transparent transition-all">
                 </div>
+                <div>
+                    <label for="mb_burnin" class="block text-sm font-medium text-gray-700 dark:text-gray-200 mb-2">
+                        Burn-in (%)
+                    </label>
+                    <input type="number" id="mb_burnin" value="25" min="0" max="99" step="0.1" class="w-full px-4 py-3 border border-gray-300 dark:border-journal-dark rounded-lg
+                                  bg-white dark:bg-journal-dark text-gray-900 dark:text-gray-100
+                                  focus:ring-2 focus:ring-journal-gold focus:border-transparent transition-all">
+                </div>
             </div>
+            <p class="text-xs text-gray-500 dark:text-gray-400 mt-2">
+                Relative burn-in is discarded from MrBayes convergence diagnostics and from the <code>sump</code>/<code>sumt</code> summaries. The default is 25%.
+            </p>
         </div>
 
         <!-- RAxML Advanced (Hidden by default) -->
@@ -1473,28 +1619,49 @@
     }
 
     // Alan 5/14/26 - Prefer same sequence plus same known location for deduping, with exact-record fallback for unknown locations.
-    function sequenceDedupKey(seq) {
+    // Alan 7/15/26 - Scope identifier/occurrence deduplication to explicit MycoMap occurrences so ordinary records
+    // with the same identifier and sequence remain distinct when their known locations differ.
+    function sequenceDedupKeys(seq) {
         const sequence = String(seq?.sequence || '').replace(/\s+/g, '').toUpperCase();
+        const keys = [];
+        const source = String(seq?.source || '').toLowerCase();
+        const preserveMycomapNcbiHit = source === 'mycomap' && seq?.hit_source === 'ncbi';
         const explicitLocation = seq?.location || seq?.mycomap_location || '';
         const location = explicitLocation
             ? normalizeDedupLocation(explicitLocation, true)
             : normalizeDedupLocation(extractLocationFromSequenceName(seq?.name));
-        if (location) return `sequence-location\u0000${sequence}\u0000${location}`;
-        return `exact-record\u0000${String(seq?.name || '')}\u0000${sequence}`;
+        if (location && !preserveMycomapNcbiHit) {
+            keys.push(`sequence-location\u0000${sequence}\u0000${location}`);
+        } else {
+            keys.push(`exact-record\u0000${String(seq?.name || '')}\u0000${sequence}`);
+        }
+        const firstToken = String(seq?.name || '').trim().split(/\s+/)[0] || '';
+        const occurrence = Number(seq?.occurrence);
+        const occurrenceIdentifier = String(seq?.internal_id || firstToken).trim();
+        if (
+            source === 'mycomap'
+            && Number.isInteger(occurrence)
+            && occurrence > 0
+            && occurrenceIdentifier
+        ) {
+            keys.push(`mycomap-occurrence\u0000${sequence}\u0000${occurrenceIdentifier.toUpperCase()}\u0000${occurrence}`);
+        }
+        return keys;
     }
 
     function addSequences(sequences, removeDuplicates = true) {
-        const existingKeys = new Set(sequenceQueue.map(sequenceDedupKey));
+        const existingKeys = new Set(sequenceQueue.flatMap(sequenceDedupKeys));
         let added = 0;
         for (const seq of sequences) {
             // Normalize inputs
             seq.name = String(seq.name);
             seq.sequence = String(seq.sequence || '');
-            const dedupKey = sequenceDedupKey(seq);
+            const dedupKeys = sequenceDedupKeys(seq);
+            const isDuplicate = dedupKeys.some(key => existingKeys.has(key));
 
-            if (!removeDuplicates || !existingKeys.has(dedupKey)) {
+            if (!removeDuplicates || !isDuplicate) {
                 sequenceQueue.push(seq);
-                existingKeys.add(dedupKey);
+                dedupKeys.forEach(key => existingKeys.add(key));
                 added++;
             }
         }
@@ -1889,6 +2056,10 @@
     const mycomapNcbiCheckbox = document.getElementById('mycomap_ncbi');
     const mycomapLocalCheckbox = document.getElementById('mycomap_local');
     const mycomapDedupCheckbox = document.getElementById('mycomap_dedup');
+    // Alan 7/10/26 - Wire the opt-in local FASTA safeguard and its location exception into the import controls.
+    const mycomapFilterConflictingLocalCheckbox = document.getElementById('mycomap_filter_conflicting_local');
+    const mycomapAllowIdenticalLocationsCheckbox = document.getElementById('mycomap_allow_identical_locations');
+    const mycomapAllowIdenticalLocationsOption = document.getElementById('mycomap_allow_identical_locations_option');
     const fetchMycomapBtn = document.getElementById('fetch_mycomap_btn');
     const mycomapQuickTreeBtn = document.getElementById('mycomap_quick_tree_btn');
     let lastMycomapBlastUrl = '';
@@ -1915,7 +2086,8 @@
             current.counts = {
                 invalid_sequence: (currentCounts.invalid_sequence || 0) + (incomingCounts.invalid_sequence || 0),
                 contaminant: (currentCounts.contaminant || 0) + (incomingCounts.contaminant || 0),
-                conflicting_local: (currentCounts.conflicting_local || 0) + (incomingCounts.conflicting_local || 0)
+                conflicting_local: (currentCounts.conflicting_local || 0) + (incomingCounts.conflicting_local || 0),
+                duplicate_observation: (currentCounts.duplicate_observation || 0) + (incomingCounts.duplicate_observation || 0)
             };
             current.filtered_records = [
                 ...(current.filtered_records || []),
@@ -1936,7 +2108,21 @@
         }
     }
 
+    // Alan 7/10/26 - Keep the location exception available only while the optional conflict safeguard is enabled.
+    function updateMycomapConflictFilterOptions() {
+        if (!mycomapFilterConflictingLocalCheckbox || !mycomapAllowIdenticalLocationsCheckbox) return;
+        const enabled = mycomapFilterConflictingLocalCheckbox.checked;
+        mycomapAllowIdenticalLocationsCheckbox.disabled = !enabled;
+        if (mycomapAllowIdenticalLocationsOption) {
+            mycomapAllowIdenticalLocationsOption.classList.toggle('opacity-50', !enabled);
+        }
+    }
+
     mycomapUrlInput.addEventListener('input', checkMycomapState);
+    // Alan 7/10/26 - Refresh the dependent location option when the conflict safeguard changes.
+    mycomapFilterConflictingLocalCheckbox?.addEventListener('change', updateMycomapConflictFilterOptions);
+    // Alan 7/10/26 - Initialize the dependent location option in its disabled default state.
+    updateMycomapConflictFilterOptions();
     checkMycomapState();
 
     function isValidMycomapUrl(url) {
@@ -2005,7 +2191,7 @@
         }
     }
 
-    // Shared fetch logic — returns true on success, false on error.
+    // Shared fetch logic returns true on success and false on error.
     async function doFetchMycomap() {
         const url = mycomapUrlInput.value.trim();
         const includeNcbi = mycomapNcbiCheckbox.checked;
@@ -2044,7 +2230,10 @@
                 body: JSON.stringify({
                     url: url,
                     include_ncbi: includeNcbi,
-                    include_local: includeLocal
+                    include_local: includeLocal,
+                    // Alan 7/10/26 - Send the opt-in local FASTA filter policy with each MycoMap import.
+                    filter_conflicting_local_fasta: Boolean(mycomapFilterConflictingLocalCheckbox?.checked),
+                    allow_identical_sequences_different_locations: Boolean(mycomapAllowIdenticalLocationsCheckbox?.checked)
                 })
             });
 
@@ -2167,13 +2356,23 @@
     const inaturalistSpeciesList = document.getElementById('inaturalist_species_list');
     const inaturalistSpeciesItems = document.getElementById('inaturalist_species_items');
     const inaturalistBlastBtn = document.getElementById('inaturalist_blast_btn');
+    const inaturalistMycomapBlastBtn = document.getElementById('inaturalist_mycomap_blast_btn');
     const inaturalistAddBtn = document.getElementById('inaturalist_add_btn');
     // Alan 5/12/26 - Hook up the "Generate tree and add iNaturalist Phylogenetic Tree field" action.
     const inaturalistTreeBtn = document.getElementById('inaturalist_tree_btn');
+    // Alan 7/10/26 - Let single-observation one-click trees control the queued local MycoMap BLAST size.
+    const inaturalistTreeOptions = document.getElementById('inaturalist_tree_options');
+    const inaturalistRebuildNcbiCheckbox = document.getElementById('inaturalist_rebuild_ncbi');
+    const inaturalistLocalLimitInput = document.getElementById('inaturalist_local_limit');
+    const inaturalistNcbiLimitInput = document.getElementById('inaturalist_ncbi_limit');
+    const inaturalistNcbiWaitHint = document.getElementById('inaturalist_ncbi_wait_hint');
     const inaturalistTreePreview = document.getElementById('inaturalist_tree_preview');
     const inaturalistTreeChoices = document.getElementById('inaturalist_tree_choices');
     const inaturalistUseUserBtn = document.getElementById('inaturalist_use_user_btn');
     const inaturalistUseProjectBtn = document.getElementById('inaturalist_use_project_btn');
+    // Alan 7/15/26 - Require explicit confirmation before replacing an existing iNaturalist tree URL.
+    const inaturalistRecreateTreeOption = document.getElementById('inaturalist_recreate_tree_option');
+    const inaturalistRecreateTreeCheckbox = document.getElementById('inaturalist_recreate_tree');
 
     function checkInatState() {
         const val = inaturalistUrlInput.value.trim();
@@ -2228,6 +2427,24 @@
         return /^[A-Za-z0-9][A-Za-z0-9_. -]{0,198}[A-Za-z0-9]$/.test(value);
     }
 
+    function isSingleInaturalistObservationInput(value) {
+        if (!value) return false;
+        if (/^\d+$/.test(value)) return true;
+        return /^https?:\/\/(?:www\.)?inaturalist\.org\/observations\/\d+(?:[/?#].*)?$/i.test(value) ||
+            /^(?:www\.)?inaturalist\.org\/observations\/\d+(?:[/?#].*)?$/i.test(value);
+    }
+
+    function getInaturalistBlastLimit(inputEl, fallback) {
+        const parsed = parseInt(inputEl?.value, 10);
+        if (!Number.isFinite(parsed)) return fallback;
+        return Math.max(1, Math.min(500, parsed));
+    }
+
+    function updateInaturalistNcbiWaitHint() {
+        if (!inaturalistNcbiWaitHint || !inaturalistRebuildNcbiCheckbox) return;
+        inaturalistNcbiWaitHint.classList.toggle('hidden', !inaturalistRebuildNcbiCheckbox.checked);
+    }
+
     function setInaturalistTreePreviewMessage(message, type = 'info') {
         if (!inaturalistTreePreview) return;
         const text = inaturalistTreePreview.querySelector('p');
@@ -2245,6 +2462,9 @@
         currentInaturalistTreeResolvedType = null;
         setInaturalistTreePreviewMessage('');
         if (inaturalistTreeChoices) inaturalistTreeChoices.classList.add('hidden');
+        // Alan 7/15/26 - Clear re-creation consent whenever the observation input or preview changes.
+        if (inaturalistRecreateTreeOption) inaturalistRecreateTreeOption.classList.add('hidden');
+        if (inaturalistRecreateTreeCheckbox) inaturalistRecreateTreeCheckbox.checked = false;
     }
 
     function updateInaturalistTreeButtonForInput() {
@@ -2252,8 +2472,46 @@
         const value = inaturalistUrlInput.value.trim();
         const show = isLikelyInaturalistTreeInput(value);
         inaturalistTreeBtn.classList.toggle('hidden', !show);
+        const previewMatches = Boolean(
+            currentInaturalistTreePreview && currentInaturalistTreePreviewInput === value
+        );
+        const hasExistingTree = Boolean(
+            previewMatches &&
+            currentInaturalistTreePreview.type === 'single_observation' &&
+            currentInaturalistTreePreview.has_phylogenetic_tree
+        );
+        const canRecreateTree = Boolean(
+            hasExistingTree && currentInaturalistTreePreview.can_recreate_phylogenetic_tree
+        );
+        // Alan 7/15/26 - Show the replacement choice only when a new tree can actually be built.
+        if (inaturalistRecreateTreeOption) {
+            inaturalistRecreateTreeOption.classList.toggle('hidden', !canRecreateTree);
+        }
+        if (!canRecreateTree && inaturalistRecreateTreeCheckbox) {
+            inaturalistRecreateTreeCheckbox.checked = false;
+        }
+        // Alan 7/3/26 - Show MycoMap BLAST hit-count controls only for single-observation one-click tree jobs.
+        const showBlastOptions = show && isSingleInaturalistObservationInput(value);
+        if (inaturalistTreeOptions) {
+            inaturalistTreeOptions.classList.toggle('hidden', !showBlastOptions);
+        }
+        if (!showBlastOptions && inaturalistRebuildNcbiCheckbox) {
+            inaturalistRebuildNcbiCheckbox.checked = false;
+            updateInaturalistNcbiWaitHint();
+        }
         if (!show) return;
-        if (currentInaturalistTreePreview && currentInaturalistTreePreviewInput === value) {
+        if (hasExistingTree) {
+            const recreationConfirmed = Boolean(
+                canRecreateTree && inaturalistRecreateTreeCheckbox?.checked
+            );
+            inaturalistTreeBtn.disabled = !recreationConfirmed;
+            inaturalistTreeBtn.innerHTML = canRecreateTree
+                ? '<i class="fas fa-redo mr-2"></i> Re-create Phylogenetic Tree'
+                : '<i class="fas fa-tree mr-2"></i> Tree Cannot Be Re-created';
+            return;
+        }
+        inaturalistTreeBtn.disabled = false;
+        if (previewMatches) {
             const type = currentInaturalistTreePreview.type;
             const count = Number(currentInaturalistTreePreview.eligible_tree_count || 0);
             if ((type === 'user' || type === 'project') && count > 0) {
@@ -2269,9 +2527,16 @@
         inaturalistResults.classList.add('hidden');
         inaturalistSpeciesList.classList.add('hidden');
         inaturalistBlastBtn.classList.add('hidden');
+        if (inaturalistMycomapBlastBtn) inaturalistMycomapBlastBtn.classList.add('hidden');
         inaturalistAddBtn.classList.add('hidden');
         // Alan 5/12/26 - Reset the iNat-tree action visibility on each analyze.
         if (inaturalistTreeBtn) inaturalistTreeBtn.classList.add('hidden');
+        // Alan 7/3/26 - Keep the MycoMap BLAST controls reset with the iNat tree action.
+        if (inaturalistTreeOptions) inaturalistTreeOptions.classList.add('hidden');
+        if (inaturalistRebuildNcbiCheckbox) inaturalistRebuildNcbiCheckbox.checked = false;
+        if (inaturalistLocalLimitInput) inaturalistLocalLimitInput.value = '50';
+        if (inaturalistNcbiLimitInput) inaturalistNcbiLimitInput.value = '100';
+        updateInaturalistNcbiWaitHint();
         clearInaturalistTreePreview();
         inaturalistSummary.querySelector('p').textContent = '';
         inaturalistSpeciesItems.innerHTML = '';
@@ -2314,6 +2579,8 @@
             if (data.type === 'ambiguous' && inaturalistTreeChoices) {
                 inaturalistTreeChoices.classList.remove('hidden');
             }
+            // Alan 7/15/26 - A fresh preview always requires a fresh replacement confirmation.
+            if (inaturalistRecreateTreeCheckbox) inaturalistRecreateTreeCheckbox.checked = false;
             updateInaturalistTreeButtonForInput();
             return data;
         } catch (e) {
@@ -2322,7 +2589,7 @@
             setInaturalistTreePreviewMessage(e.message, 'error');
             return null;
         } finally {
-            if (inaturalistTreeBtn) inaturalistTreeBtn.disabled = false;
+            updateInaturalistTreeButtonForInput();
         }
     }
 
@@ -2331,7 +2598,8 @@
         if (nextTarget && (
             nextTarget === inaturalistTreeBtn ||
             nextTarget === inaturalistUseUserBtn ||
-            nextTarget === inaturalistUseProjectBtn
+            nextTarget === inaturalistUseProjectBtn ||
+            nextTarget === inaturalistRecreateTreeCheckbox
         )) {
             return;
         }
@@ -2345,6 +2613,13 @@
     }
     if (inaturalistUseProjectBtn) {
         inaturalistUseProjectBtn.addEventListener('click', () => previewInaturalistTreeInput('project'));
+    }
+    if (inaturalistRebuildNcbiCheckbox) {
+        inaturalistRebuildNcbiCheckbox.addEventListener('change', updateInaturalistNcbiWaitHint);
+    }
+    if (inaturalistRecreateTreeCheckbox) {
+        // Alan 7/15/26 - Enable re-creation only after the user accepts URL replacement.
+        inaturalistRecreateTreeCheckbox.addEventListener('change', updateInaturalistTreeButtonForInput);
     }
 
     fetchInaturalistBtn.addEventListener('click', async () => {
@@ -2473,11 +2748,16 @@
             // The button reads the observation's `Mycomap BLAST Results`
             // field server-side; it does not require an ITS sequence.
             if (data.is_single && inaturalistTreeBtn) {
-                inaturalistTreeBtn.classList.remove('hidden');
+                updateInaturalistTreeButtonForInput();
+            }
+            if (data.is_single && data.mycomap_blast_url && inaturalistMycomapBlastBtn) {
+                inaturalistMycomapBlastBtn.classList.remove('hidden');
             }
             if (data.can_blast && data.sequence) {
                 inaturalistBlastBtn.classList.remove('hidden');
-                showStatus('Single observation found with DNA sequence. Click BLAST to find related sequences.', 'success');
+                inaturalistAddBtn.classList.remove('hidden');
+                inaturalistAddBtn.innerHTML = '<i class="fas fa-plus mr-2"></i> Add iNaturalist ITS to Queue';
+                showStatus('Single observation found with DNA sequence. BLAST it or add its ITS sequence to the queue.', 'success');
             } else if (data.dna_count > 0) {
                 inaturalistAddBtn.classList.remove('hidden');
                 inaturalistAddBtn.textContent = `Add ${data.dna_count} Sequence${data.dna_count > 1 ? 's' : ''} to Queue`;
@@ -2497,7 +2777,7 @@
         fetchInaturalistBtn.innerHTML = '<i class="fas fa-search mr-2"></i> Submit';
     });
 
-    // BLAST button for single observation
+    // NCBI BLAST button for single observation (live NCBI BLAST of the ITS sequence)
     inaturalistBlastBtn.addEventListener('click', async () => {
         if (!currentInaturalistResult || !currentInaturalistResult.sequence) {
             showStatus('No sequence available to BLAST.', 'error');
@@ -2506,7 +2786,7 @@
 
         inaturalistBlastBtn.disabled = true;
         inaturalistBlastBtn.innerHTML = '<i class="fas fa-spinner fa-spin mr-2"></i> BLASTing...';
-        showStatus('Running BLAST search... This may take a minute.', 'info');
+        showStatus('Running NCBI BLAST search... This may take a minute.', 'info');
 
         try {
             const csrfToken = document.querySelector('meta[name="csrf-token"]').getAttribute('content');
@@ -2526,7 +2806,7 @@
             }
 
             const added = addSequences(data.sequences);
-            showStatus(`BLAST complete! Added ${added} new sequences to queue.`, 'success');
+            showStatus(`NCBI BLAST complete! Added ${added} new sequences to queue.`, 'success');
 
             // Save the query for later use in notes
             lastBlastQuery = 'iNaturalist';
@@ -2536,12 +2816,106 @@
             resetInaturalistUI();
 
         } catch (e) {
-            showStatus('BLAST error: ' + e.message, 'error');
+            showStatus('NCBI BLAST error: ' + e.message, 'error');
         }
 
         inaturalistBlastBtn.disabled = false;
-        inaturalistBlastBtn.innerHTML = '<i class="fas fa-search mr-2"></i> BLAST Sequence';
+        inaturalistBlastBtn.innerHTML = '<i class="fas fa-search mr-2"></i> NCBI BLAST';
     });
+
+    // Mycomap BLAST button for single observation: refreshes the observation's
+    // existing Mycomap BLAST Results (local always, NCBI optionally) and adds
+    // the resulting sequences to the queue. Runs as a background job because
+    // an NCBI rebuild takes about 10 minutes to become available at Mycomap.
+    if (inaturalistMycomapBlastBtn) {
+        inaturalistMycomapBlastBtn.addEventListener('click', async () => {
+            if (!currentInaturalistResult || !currentInaturalistResult.mycomap_blast_url) {
+                showStatus('No Mycomap BLAST Results URL available for this observation.', 'error');
+                return;
+            }
+
+            const rebuildNcbi = Boolean(inaturalistRebuildNcbiCheckbox && inaturalistRebuildNcbiCheckbox.checked);
+            const localLimit = inaturalistLocalLimitInput ? inaturalistLocalLimitInput.value : undefined;
+            const ncbiLimit = inaturalistNcbiLimitInput ? inaturalistNcbiLimitInput.value : undefined;
+
+            inaturalistMycomapBlastBtn.disabled = true;
+            const originalMycomapBlastHtml = inaturalistMycomapBlastBtn.innerHTML;
+            inaturalistMycomapBlastBtn.innerHTML = '<i class="fas fa-spinner fa-spin mr-2"></i> Refreshing...';
+            showStatus(
+                rebuildNcbi
+                    ? 'Refreshing Mycomap BLAST results. Local results refresh right away; NCBI results take about 10 minutes.'
+                    : 'Refreshing Mycomap local BLAST results...',
+                'info'
+            );
+
+            try {
+                const csrfToken = document.querySelector('meta[name="csrf-token"]').getAttribute('content');
+                const startResp = await fetch('/api/mycomap/refresh', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                        'X-CSRFToken': csrfToken
+                    },
+                    body: JSON.stringify({
+                        url: currentInaturalistResult.mycomap_blast_url,
+                        rebuild_ncbi: rebuildNcbi,
+                        local_limit: localLimit,
+                        ncbi_limit: ncbiLimit,
+                        include_ncbi: true,
+                        include_local: true
+                    })
+                });
+                const startData = await startResp.json();
+                if (!startResp.ok) {
+                    throw new Error(startData.error || 'Failed to start Mycomap BLAST refresh');
+                }
+
+                const jobId = startData.job_id;
+                const pollIntervalMs = rebuildNcbi ? 15000 : 3000;
+                const maxAttempts = rebuildNcbi ? 80 : 20;
+
+                let result = null;
+                for (let attempt = 0; attempt < maxAttempts; attempt++) {
+                    await new Promise(resolve => setTimeout(resolve, pollIntervalMs));
+                    const statusResp = await fetch(`/api/mycomap/refresh/${jobId}`);
+                    const statusData = await statusResp.json();
+                    if (statusData.status === 'finished') {
+                        result = statusData.result;
+                        break;
+                    }
+                    if (statusData.status === 'failed' || statusData.status === 'error') {
+                        throw new Error(statusData.error || 'Mycomap BLAST refresh failed');
+                    }
+                    if (rebuildNcbi) {
+                        showStatus('Still waiting on the Mycomap NCBI BLAST rebuild (about 10 minutes total)...', 'info');
+                    }
+                }
+
+                if (!result) {
+                    throw new Error('Mycomap BLAST refresh is taking longer than expected. Try again in a few minutes.');
+                }
+                if (result.status === 'error') {
+                    throw new Error(result.error || 'Mycomap BLAST refresh failed');
+                }
+
+                const added = addSequences(result.sequences);
+                showStatus(`Mycomap BLAST refreshed! Added ${added} new sequences to queue.`, 'success');
+                if (result.warnings && result.warnings.length) {
+                    showStatus(result.warnings.join(' '), 'info');
+                }
+
+                lastBlastQuery = 'iNaturalist';
+                inaturalistUrlInput.value = '';
+                resetInaturalistUI();
+
+            } catch (e) {
+                showStatus('Mycomap BLAST error: ' + e.message, 'error');
+            }
+
+            inaturalistMycomapBlastBtn.disabled = false;
+            inaturalistMycomapBlastBtn.innerHTML = originalMycomapBlastHtml;
+        });
+    }
 
     // Add to Queue button for multiple observations
     inaturalistAddBtn.addEventListener('click', async () => {
@@ -2551,6 +2925,7 @@
         }
 
         inaturalistAddBtn.disabled = true;
+        const originalInaturalistAddHtml = inaturalistAddBtn.innerHTML;
         inaturalistAddBtn.innerHTML = '<i class="fas fa-spinner fa-spin mr-2"></i> Fetching...';
         showStatus('Fetching DNA sequences from iNaturalist...', 'info');
 
@@ -2586,7 +2961,7 @@
         }
 
         inaturalistAddBtn.disabled = false;
-        inaturalistAddBtn.innerHTML = '<i class="fas fa-plus mr-2"></i> Add to Queue';
+        inaturalistAddBtn.innerHTML = originalInaturalistAddHtml || '<i class="fas fa-plus mr-2"></i> Add to Queue';
     });
 
     // Alan 5/12/26 - One-click: build a tree from the observation's MycoMap
@@ -2600,12 +2975,15 @@
                 return;
             }
 
-            const numericOrObservationUrl = /^\d+$/.test(input) ||
-                /^https?:\/\/(?:www\.)?inaturalist\.org\/observations\/\d+(?:[/?#].*)?$/i.test(input) ||
-                /^(?:www\.)?inaturalist\.org\/observations\/\d+(?:[/?#].*)?$/i.test(input);
-            const preview = currentInaturalistTreePreviewInput === input
+            const numericOrObservationUrl = isSingleInaturalistObservationInput(input);
+            let preview = currentInaturalistTreePreviewInput === input
                 ? currentInaturalistTreePreview
                 : null;
+            // Alan 7/15/26 - Check single observations before queueing so existing trees require explicit consent.
+            if (numericOrObservationUrl && !preview) {
+                preview = await previewInaturalistTreeInput();
+                if (!preview) return;
+            }
             if (!numericOrObservationUrl && (!preview || preview.type === 'ambiguous' || preview.type === 'not_found')) {
                 await previewInaturalistTreeInput();
                 return;
@@ -2617,12 +2995,54 @@
                     return;
                 }
             }
+            const hasExistingTree = Boolean(
+                numericOrObservationUrl && preview?.has_phylogenetic_tree
+            );
+            const recreateExistingTree = Boolean(
+                hasExistingTree &&
+                preview?.can_recreate_phylogenetic_tree &&
+                inaturalistRecreateTreeCheckbox?.checked
+            );
+            if (hasExistingTree && !recreateExistingTree) {
+                showStatus(
+                    preview.message || 'Select Re-create phylogenetic tree before replacing the existing URL.',
+                    'info'
+                );
+                updateInaturalistTreeButtonForInput();
+                return;
+            }
 
             inaturalistTreeBtn.disabled = true;
             const origHtml = inaturalistTreeBtn.innerHTML;
+            const rebuildNcbiBlast = numericOrObservationUrl &&
+                inaturalistRebuildNcbiCheckbox &&
+                inaturalistRebuildNcbiCheckbox.checked;
+            // Alan 7/14/26 - Recognize when the server will create a missing Mycomap BLAST from the observation's ITS.
+            const autoCreateMycomapBlast = Boolean(
+                numericOrObservationUrl && preview?.will_create_mycomap_blast
+            );
+            const localBlastLimit = numericOrObservationUrl
+                ? getInaturalistBlastLimit(inaturalistLocalLimitInput, 50)
+                : 50;
+            const ncbiBlastLimit = numericOrObservationUrl
+                ? getInaturalistBlastLimit(inaturalistNcbiLimitInput, 100)
+                : 100;
+            if (inaturalistLocalLimitInput) inaturalistLocalLimitInput.value = String(localBlastLimit);
+            if (inaturalistNcbiLimitInput) inaturalistNcbiLimitInput.value = String(ncbiBlastLimit);
+            // Alan 7/14/26 - Show the queued NCBI wait for both requested rebuilds and automatic new searches.
             inaturalistTreeBtn.innerHTML =
-                '<i class="fas fa-spinner fa-spin mr-2"></i> Queueing tree jobs...';
-            showStatus('Reading MycoMap BLAST Results fields and queueing tree job(s)...', 'info');
+                rebuildNcbiBlast || autoCreateMycomapBlast
+                    ? '<i class="fas fa-spinner fa-spin mr-2"></i> Queueing Mycomap BLAST...'
+                    : '<i class="fas fa-spinner fa-spin mr-2"></i> Queueing local BLAST...';
+            // Alan 7/14/26 - Explain automatic ITS-based Mycomap creation and one-minute NCBI polling before queue submission.
+            showStatus(
+                autoCreateMycomapBlast
+                    ? 'Queueing a tree job to create Mycomap BLAST Results from DNA Barcode ITS, add the URL to iNaturalist, and check once a minute for NCBI results...'
+                    : rebuildNcbiBlast
+                    ? `Queueing a tree job to refresh MycoMap local BLAST (${localBlastLimit} hits) and NCBI BLAST (${ncbiBlastLimit} hits). It will resume in about 10 minutes without blocking other tree jobs...`
+                    : `Queueing a tree job to refresh MycoMap local BLAST (${localBlastLimit} hits) in the background...`,
+                'info'
+            );
             try {
                 const csrfToken = document.querySelector('meta[name="csrf-token"]')
                     .getAttribute('content');
@@ -2630,7 +3050,13 @@
                 const endpoint = isBatch ? '/api/inaturalist/tree/batch' : '/api/inaturalist/tree';
                 const payload = isBatch
                     ? { input, resolved_type: currentInaturalistTreeResolvedType || preview.type }
-                    : { observation: input };
+                    : {
+                        observation: input,
+                        rebuild_ncbi_blast: Boolean(rebuildNcbiBlast),
+                        recreate_existing_tree: recreateExistingTree,
+                        mycomap_local_limit: localBlastLimit,
+                        mycomap_ncbi_limit: ncbiBlastLimit
+                    };
                 const resp = await fetch(endpoint, {
                     method: 'POST',
                     headers: {
@@ -2670,25 +3096,341 @@
     }
 
     // =========================================================================
+    // Mushroom Observer Import
+    // =========================================================================
+    const mushroomObserverInput = document.getElementById('mushroom_observer_input');
+    const fetchMushroomObserverBtn = document.getElementById('fetch_mushroom_observer_btn');
+    const mushroomObserverResults = document.getElementById('mushroom_observer_results');
+    const mushroomObserverSummary = document.getElementById('mushroom_observer_summary');
+    const mushroomObserverChoices = document.getElementById('mushroom_observer_sequence_choices');
+    const mushroomObserverSequenceLegend = document.getElementById('mushroom_observer_sequence_legend');
+    const mushroomObserverItems = document.getElementById('mushroom_observer_sequence_items');
+    const mushroomObserverActions = document.getElementById('mushroom_observer_actions');
+    const mushroomObserverBlastBtn = document.getElementById('mushroom_observer_blast_btn');
+    const mushroomObserverAddBtn = document.getElementById('mushroom_observer_add_btn');
+    const mushroomObserverTreeBtn = document.getElementById('mushroom_observer_tree_btn');
+    const mushroomObserverTreeOptions = document.getElementById('mushroom_observer_tree_options');
+    const mushroomObserverLocalLimit = document.getElementById('mushroom_observer_local_limit');
+    const mushroomObserverNcbiLimit = document.getElementById('mushroom_observer_ncbi_limit');
+    const mushroomObserverRebuildNcbi = document.getElementById('mushroom_observer_rebuild_ncbi');
+
+    let currentMushroomObserverResult = null;
+    let currentMushroomObserverInput = '';
+    let selectedMushroomObserverSequenceId = null;
+
+    function isValidMushroomObserverInput(value) {
+        if (!value) return false;
+        if (/^\d{1,12}$/.test(value)) return Number(value) > 0;
+        try {
+            const urlValue = /^https?:\/\//i.test(value) ? value : `https://${value}`;
+            const parsed = new URL(urlValue);
+            if (!['mushroomobserver.org', 'www.mushroomobserver.org'].includes(parsed.hostname.toLowerCase())) {
+                return false;
+            }
+            if (parsed.username || parsed.password || parsed.port) return false;
+            return [
+                /^\/\d+\/?$/i,
+                /^\/obs\/\d+\/?$/i,
+                /^\/observations\/\d+\/?$/i,
+                /^\/observer\/show_observation\/\d+\/?$/i
+            ].some(pattern => pattern.test(parsed.pathname));
+        } catch (e) {
+            return false;
+        }
+    }
+
+    function selectedMushroomObserverSequence() {
+        if (!currentMushroomObserverResult || !selectedMushroomObserverSequenceId) return null;
+        return (currentMushroomObserverResult.its_sequences || []).find(
+            sequence => Number(sequence.id) === Number(selectedMushroomObserverSequenceId)
+        ) || null;
+    }
+
+    function updateMushroomObserverActions() {
+        const hasSelection = Boolean(selectedMushroomObserverSequence());
+        mushroomObserverBlastBtn.disabled = !hasSelection;
+        mushroomObserverAddBtn.disabled = !hasSelection;
+        mushroomObserverTreeBtn.disabled = !hasSelection;
+        mushroomObserverTreeOptions.classList.toggle('hidden', !hasSelection);
+    }
+
+    function resetMushroomObserverUI() {
+        mushroomObserverResults.classList.add('hidden');
+        mushroomObserverChoices.classList.add('hidden');
+        mushroomObserverActions.classList.add('hidden');
+        mushroomObserverTreeOptions.classList.add('hidden');
+        mushroomObserverSummary.innerHTML = '';
+        mushroomObserverSequenceLegend.textContent = 'Choose an ITS sequence';
+        mushroomObserverItems.innerHTML = '';
+        currentMushroomObserverResult = null;
+        currentMushroomObserverInput = '';
+        selectedMushroomObserverSequenceId = null;
+        mushroomObserverLocalLimit.value = '50';
+        mushroomObserverNcbiLimit.value = '100';
+        mushroomObserverRebuildNcbi.checked = false;
+        updateMushroomObserverActions();
+    }
+
+    function mushroomObserverContributorLabel(sequence) {
+        const contributor = sequence.contributor || {};
+        return contributor.legal_name || contributor.login_name ||
+            (contributor.id ? `User ${contributor.id}` : 'Not provided');
+    }
+
+    function mushroomObserverDate(value) {
+        if (!value) return 'Not provided';
+        const parsed = new Date(value);
+        return Number.isNaN(parsed.getTime()) ? String(value) : parsed.toLocaleString();
+    }
+
+    // Alan 7/17/26 - Default old Mushroom Observer sequences to an NCBI refresh while preserving the user's choice.
+    function applyMushroomObserverNcbiDefault(sequence) {
+        if (!sequence || !sequence.created_at) {
+            mushroomObserverRebuildNcbi.checked = false;
+            return;
+        }
+        const createdAt = new Date(sequence.created_at);
+        if (Number.isNaN(createdAt.getTime())) {
+            mushroomObserverRebuildNcbi.checked = false;
+            return;
+        }
+        const oneYearAgo = new Date();
+        oneYearAgo.setFullYear(oneYearAgo.getFullYear() - 1);
+        mushroomObserverRebuildNcbi.checked = createdAt < oneYearAgo;
+    }
+
+    function renderMushroomObserverResult(data) {
+        const observation = data.observation || {};
+        const owner = observation.owner || {};
+        const ownerLabel = owner.legal_name || owner.login_name ||
+            (owner.id ? `User ${owner.id}` : 'Not provided');
+        const observationLink = observation.url
+            ? `<a href="${escapeHtml(observation.url)}" target="_blank" rel="noopener" class="text-journal-gold hover:underline">MO ${escapeHtml(observation.id)}</a>`
+            : `MO ${escapeHtml(observation.id || '')}`;
+        mushroomObserverSummary.innerHTML = `
+            <div class="space-y-1">
+                <p class="font-semibold text-journal-dark dark:text-gray-100">${observationLink}</p>
+                <p><span class="font-medium">Consensus:</span> ${escapeHtml(observation.consensus_name || 'Not provided')}</p>
+                <p><span class="font-medium">Observed:</span> ${escapeHtml(observation.date || 'Not provided')}</p>
+                <p><span class="font-medium">Location:</span> ${escapeHtml(observation.location || 'Not provided')}</p>
+                <p><span class="font-medium">Observer:</span> ${escapeHtml(ownerLabel)}</p>
+                <p class="pt-1">${escapeHtml(data.message || '')}</p>
+            </div>`;
+
+        const sequences = data.its_sequences || [];
+        if (!sequences.length) {
+            mushroomObserverItems.innerHTML = '';
+            mushroomObserverChoices.classList.add('hidden');
+            mushroomObserverActions.classList.add('hidden');
+            mushroomObserverTreeOptions.classList.add('hidden');
+            return;
+        }
+
+        mushroomObserverSequenceLegend.textContent = sequences.length === 1
+            ? 'ITS sequence information'
+            : 'Choose an ITS sequence';
+        mushroomObserverItems.innerHTML = sequences.map((sequence, index) => {
+            const autoSelected = sequences.length === 1;
+            const inputId = `mushroom_observer_sequence_${Number(sequence.id)}`;
+            const ambiguousLabel = Number(sequence.ambiguous_bases || 0) === 1
+                ? '1 ambiguous base'
+                : `${Number(sequence.ambiguous_bases || 0)} ambiguous bases`;
+            // Alan 7/17/26 - Omit empty Archive and Accession rows from Mushroom Observer sequence details.
+            return `
+                <label for="${inputId}"
+                       class="block cursor-pointer rounded-lg border border-gray-200 dark:border-gray-700 bg-white dark:bg-journal-dark p-4 hover:border-journal-gold transition-colors">
+                    <div class="flex items-start gap-3">
+                        <input type="radio" id="${inputId}" name="mushroom_observer_sequence"
+                               value="${Number(sequence.id)}" ${autoSelected ? 'checked' : ''}
+                               class="mt-1 w-4 h-4 text-journal-gold border-gray-300 focus:ring-journal-gold">
+                        <div class="min-w-0 flex-1 space-y-2">
+                            <div class="flex flex-wrap items-baseline gap-x-3 gap-y-1">
+                                <span class="font-semibold text-journal-dark dark:text-gray-100">
+                                    Sequence ${index + 1}: MO sequence #${Number(sequence.id)}
+                                </span>
+                                <span class="text-sm text-gray-600 dark:text-gray-300">${escapeHtml(sequence.locus || 'ITS')}</span>
+                            </div>
+                            <dl class="grid grid-cols-1 sm:grid-cols-2 gap-x-4 gap-y-1 text-xs text-gray-600 dark:text-gray-300">
+                                <div><dt class="inline font-medium">Length:</dt> <dd class="inline">${Number(sequence.length || 0)} bp${Number(sequence.source_length || 0) !== Number(sequence.length || 0) ? ` (source text: ${Number(sequence.source_length || 0)})` : ''}</dd></div>
+                                <div><dt class="inline font-medium">Ambiguity:</dt> <dd class="inline">${ambiguousLabel}</dd></div>
+                                <div><dt class="inline font-medium">Contributor:</dt> <dd class="inline">${escapeHtml(mushroomObserverContributorLabel(sequence))}</dd></div>
+                                ${sequence.archive ? `<div><dt class="inline font-medium">Archive:</dt> <dd class="inline">${escapeHtml(sequence.archive)}</dd></div>` : ''}
+                                ${sequence.accession ? `<div><dt class="inline font-medium">Accession:</dt> <dd class="inline">${escapeHtml(sequence.accession)}</dd></div>` : ''}
+                                <div><dt class="inline font-medium">Created:</dt> <dd class="inline">${escapeHtml(mushroomObserverDate(sequence.created_at))}</dd></div>
+                                <div><dt class="inline font-medium">Updated:</dt> <dd class="inline">${escapeHtml(mushroomObserverDate(sequence.updated_at))}</dd></div>
+                            </dl>
+                            ${sequence.notes ? `<p class="text-xs text-gray-600 dark:text-gray-300"><span class="font-medium">Sequence notes:</span> ${escapeHtml(sequence.notes)}</p>` : ''}
+                            ${sequence.mycomap_blast_url ? `<p class="text-xs text-gray-600 dark:text-gray-300"><span class="font-medium">MycoMap BLAST detected:</span> <a href="${escapeHtml(sequence.mycomap_blast_url)}" target="_blank" rel="noopener noreferrer" class="text-journal-gold hover:underline">View MycoMap BLAST results</a></p>` : ''}
+                            <details class="text-xs" onclick="event.stopPropagation();">
+                                <summary class="cursor-pointer text-journal-gold hover:underline">Show full sequence</summary>
+                                <p class="mt-2 p-2 rounded bg-gray-50 dark:bg-gray-900 font-mono break-all text-gray-700 dark:text-gray-200">${escapeHtml(sequence.sequence || '')}</p>
+                            </details>
+                        </div>
+                    </div>
+                </label>`;
+        }).join('');
+        mushroomObserverChoices.classList.remove('hidden');
+        mushroomObserverActions.classList.remove('hidden');
+        selectedMushroomObserverSequenceId = sequences.length === 1 ? Number(sequences[0].id) : null;
+        applyMushroomObserverNcbiDefault(selectedMushroomObserverSequence());
+        updateMushroomObserverActions();
+    }
+
+    mushroomObserverInput.addEventListener('input', () => {
+        updateButtonVisuals(fetchMushroomObserverBtn, isValidMushroomObserverInput(mushroomObserverInput.value.trim()));
+        if (currentMushroomObserverInput && mushroomObserverInput.value.trim() !== currentMushroomObserverInput) {
+            resetMushroomObserverUI();
+        }
+    });
+
+    mushroomObserverItems.addEventListener('change', event => {
+        if (event.target && event.target.name === 'mushroom_observer_sequence') {
+            selectedMushroomObserverSequenceId = Number(event.target.value);
+            applyMushroomObserverNcbiDefault(selectedMushroomObserverSequence());
+            updateMushroomObserverActions();
+        }
+    });
+
+    fetchMushroomObserverBtn.addEventListener('click', async () => {
+        const input = mushroomObserverInput.value.trim();
+        if (!isValidMushroomObserverInput(input)) {
+            showStatus('Enter a Mushroom Observer observation URL or number.', 'error');
+            return;
+        }
+        resetMushroomObserverUI();
+        fetchMushroomObserverBtn.disabled = true;
+        fetchMushroomObserverBtn.innerHTML = '<i class="fas fa-spinner fa-spin mr-2"></i> Fetching...';
+        showStatus('Fetching the observation and attached ITS sequences from Mushroom Observer...', 'info');
+        try {
+            const csrfToken = document.querySelector('meta[name="csrf-token"]').getAttribute('content');
+            const response = await fetch('/api/mushroom-observer', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json', 'X-CSRFToken': csrfToken},
+                body: JSON.stringify({observation: input, action: 'analyze'})
+            });
+            const data = await response.json();
+            if (!response.ok) throw new Error(data.error || 'Mushroom Observer request failed');
+            currentMushroomObserverResult = data;
+            currentMushroomObserverInput = input;
+            renderMushroomObserverResult(data);
+            mushroomObserverResults.classList.remove('hidden');
+            showStatus(data.message || 'Mushroom Observer observation loaded.', data.dna_count ? 'success' : 'info');
+        } catch (error) {
+            resetMushroomObserverUI();
+            showStatus('Mushroom Observer error: ' + error.message, 'error');
+        } finally {
+            fetchMushroomObserverBtn.disabled = false;
+            fetchMushroomObserverBtn.innerHTML = '<i class="fas fa-search mr-2"></i> Submit';
+        }
+    });
+
+    mushroomObserverBlastBtn.addEventListener('click', async () => {
+        const selected = selectedMushroomObserverSequence();
+        if (!selected) {
+            showStatus('Choose an ITS sequence first.', 'error');
+            return;
+        }
+        const originalHtml = mushroomObserverBlastBtn.innerHTML;
+        mushroomObserverBlastBtn.disabled = true;
+        mushroomObserverBlastBtn.innerHTML = '<i class="fas fa-spinner fa-spin mr-2"></i> BLASTing...';
+        showStatus('Running BLAST for the selected Mushroom Observer ITS sequence...', 'info');
+        try {
+            const csrfToken = document.querySelector('meta[name="csrf-token"]').getAttribute('content');
+            const response = await fetch('/api/blast', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json', 'X-CSRFToken': csrfToken},
+                body: JSON.stringify({query: selected.sequence})
+            });
+            const data = await response.json();
+            if (!response.ok) throw new Error(data.error || 'BLAST failed');
+            const added = addSequences(data.sequences || []);
+            lastBlastQuery = 'Mushroom Observer';
+            showStatus(`BLAST complete! Added ${added} new sequences to queue.`, 'success');
+        } catch (error) {
+            showStatus('BLAST error: ' + error.message, 'error');
+        } finally {
+            mushroomObserverBlastBtn.disabled = false;
+            mushroomObserverBlastBtn.innerHTML = originalHtml;
+        }
+    });
+
+    mushroomObserverAddBtn.addEventListener('click', async () => {
+        const selected = selectedMushroomObserverSequence();
+        if (!selected || !currentMushroomObserverInput) {
+            showStatus('Choose an ITS sequence first.', 'error');
+            return;
+        }
+        const originalHtml = mushroomObserverAddBtn.innerHTML;
+        mushroomObserverAddBtn.disabled = true;
+        mushroomObserverAddBtn.innerHTML = '<i class="fas fa-spinner fa-spin mr-2"></i> Fetching...';
+        try {
+            const csrfToken = document.querySelector('meta[name="csrf-token"]').getAttribute('content');
+            const response = await fetch('/api/mushroom-observer', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json', 'X-CSRFToken': csrfToken},
+                body: JSON.stringify({
+                    observation: currentMushroomObserverInput,
+                    action: 'fetch_sequence',
+                    sequence_id: selected.id
+                })
+            });
+            const data = await response.json();
+            if (!response.ok) throw new Error(data.error || 'Unable to fetch the selected sequence');
+            const added = addSequences(data.sequences || []);
+            showStatus(`${data.message} Added ${added} new sequence to the queue.`, 'success');
+        } catch (error) {
+            showStatus('Mushroom Observer error: ' + error.message, 'error');
+        } finally {
+            mushroomObserverAddBtn.disabled = false;
+            mushroomObserverAddBtn.innerHTML = originalHtml;
+        }
+    });
+
+    mushroomObserverTreeBtn.addEventListener('click', async () => {
+        const selected = selectedMushroomObserverSequence();
+        if (!selected || !currentMushroomObserverInput) {
+            showStatus('Choose an ITS sequence first.', 'error');
+            return;
+        }
+        const originalHtml = mushroomObserverTreeBtn.innerHTML;
+        mushroomObserverTreeBtn.disabled = true;
+        mushroomObserverTreeBtn.innerHTML = '<i class="fas fa-spinner fa-spin mr-2"></i> Queueing Tree...';
+        showStatus('Queueing the Mushroom Observer one-click tree...', 'info');
+        try {
+            const csrfToken = document.querySelector('meta[name="csrf-token"]').getAttribute('content');
+            const response = await fetch('/api/mushroom-observer/tree', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json', 'X-CSRFToken': csrfToken},
+                body: JSON.stringify({
+                    observation: currentMushroomObserverInput,
+                    sequence_id: selected.id,
+                    rebuild_ncbi_blast: Boolean(mushroomObserverRebuildNcbi.checked),
+                    mycomap_local_limit: Math.max(1, Math.min(500, parseInt(mushroomObserverLocalLimit.value, 10) || 50)),
+                    mycomap_ncbi_limit: Math.max(1, Math.min(500, parseInt(mushroomObserverNcbiLimit.value, 10) || 100))
+                })
+            });
+            const data = await response.json();
+            if (!response.ok) throw new Error(data.error || data.message || 'Unable to queue tree');
+            showStatus(data.message || 'Mushroom Observer tree queued.', 'success');
+            window.location.href = data.tree_status_url || ('/job/' + data.job_id);
+        } catch (error) {
+            showStatus('Mushroom Observer tree error: ' + error.message, 'error');
+            mushroomObserverTreeBtn.disabled = false;
+            mushroomObserverTreeBtn.innerHTML = originalHtml;
+        }
+    });
+
+    // =========================================================================
     // Toggle Advanced Panel
     // =========================================================================
     const advancedPanel = document.getElementById('advanced_panel');
     const toggleBtn = document.getElementById('toggle_advanced_btn');
-    const advancedFormBody = document.getElementById('advanced_form_body');
-    const advancedCustomizeBtn = document.getElementById('advanced_customize_btn');
     let advancedVisible = false;
-    let advancedCustomizeVisible = false;
 
     toggleBtn.addEventListener('click', () => {
         advancedVisible = !advancedVisible;
         advancedPanel.classList.toggle('hidden', !advancedVisible);
         toggleBtn.textContent = advancedVisible ? 'Hide advanced' : 'Advanced…';
-    });
-
-    advancedCustomizeBtn.addEventListener('click', () => {
-        advancedCustomizeVisible = !advancedCustomizeVisible;
-        advancedFormBody.classList.toggle('hidden', !advancedCustomizeVisible);
-        advancedCustomizeBtn.textContent = advancedCustomizeVisible ? '▴ Hide' : '▾ Customize';
     });
 
     // =========================================================================
@@ -2796,7 +3538,15 @@
         const terminalTrim = document.getElementById('trim_terminal_overhangs')?.checked
             ? 'terminal overhang trim'
             : 'terminal overhangs kept';
-        advancedCurrentSummary.textContent = `Currently: ${alignment} + ${treeMethod}, ${terminalTrim}, ${rooting}, ${bootstrap} bootstrap.`;
+        if (treeMethodSelect.value === 'mrbayes') {
+            const generations = parseInt(document.getElementById('mb_gen')?.value, 10) || 50000;
+            const runs = parseInt(document.getElementById('mb_runs')?.value, 10) || 2;
+            const chains = parseInt(document.getElementById('mb_chains')?.value, 10) || 4;
+            const burnin = parseFloat(document.getElementById('mb_burnin')?.value) || 0;
+            advancedCurrentSummary.textContent = `Currently: ${alignment} + ${treeMethod}, ${terminalTrim}, ${generations} generations, ${runs} runs, ${chains} chains/run, ${burnin}% burn-in.`;
+        } else {
+            advancedCurrentSummary.textContent = `Currently: ${alignment} + ${treeMethod}, ${terminalTrim}, ${rooting}, ${bootstrap} bootstrap.`;
+        }
     }
 
     function updateForm() {
@@ -2883,7 +3633,8 @@
 
     // Listeners
     treeMethodSelect.addEventListener('change', updateForm);
-    ['alignment_method', 'trimming_method', 'trim_terminal_overhangs', 'tree_model', 'bootstrap', 'outgroup_select'].forEach(id => {
+    ['alignment_method', 'trimming_method', 'trim_terminal_overhangs', 'tree_model', 'bootstrap', 'outgroup_select',
+        'mb_gen', 'mb_runs', 'mb_chains', 'mb_burnin'].forEach(id => {
         document.getElementById(id)?.addEventListener('input', refreshAdvancedSummary);
         document.getElementById(id)?.addEventListener('change', refreshAdvancedSummary);
     });
@@ -3038,6 +3789,7 @@
             mcmc_generations: parseInt(document.getElementById('mb_gen').value) || 50000,
             mcmc_nruns: parseInt(document.getElementById('mb_runs').value) || 2,
             mcmc_nchains: parseInt(document.getElementById('mb_chains').value) || 4,
+            mcmc_burnin_fraction: (parseFloat(document.getElementById('mb_burnin').value) || 0) / 100,
 
             // RAxML Params
             run_preset: document.getElementById('run_preset').value,
@@ -3082,9 +3834,26 @@
 
     // Helper to build FASTA
     function buildFastaHeaderFromQueueItem(seq) {
-        let header = seq.name;
-        if (seq.organism) {
-            header = `${header} ${seq.organism}`;
+        // Alan 7/17/26 - Keep NCBI BLAST organism names from being appended when the full queue label already contains them.
+        let header = String(seq.name || '').trim();
+        // Alan 7/17/26 - Normalize organism whitespace before comparing or appending it to a FASTA header.
+        const organism = String(seq.organism || '').trim().replace(/\s+/g, ' ');
+        // Alan 7/17/26 - Compare normalized lowercase text so harmless casing or spacing differences do not create duplicates.
+        const normalizedOrganism = organism.toLocaleLowerCase();
+        // Alan 7/17/26 - Remove an already-created trailing duplicate when editing or cloning an affected job.
+        if (normalizedOrganism && header.toLocaleLowerCase().endsWith(normalizedOrganism)) {
+            // Alan 7/17/26 - Inspect the preceding label before deciding whether the trailing organism is redundant.
+            const precedingHeader = header.slice(0, -organism.length).trim();
+            // Alan 7/17/26 - Strip only when the organism also appears earlier, preserving legitimate organism-only suffixes.
+            if (precedingHeader.toLocaleLowerCase().includes(normalizedOrganism)) {
+                // Alan 7/17/26 - Restore the original NCBI label without its duplicated final species name.
+                header = precedingHeader;
+            }
+        }
+        // Alan 7/17/26 - Append organism metadata only when the visible queue name does not already contain it.
+        if (normalizedOrganism && !header.toLocaleLowerCase().includes(normalizedOrganism)) {
+            // Alan 7/17/26 - Preserve organism labels for accession-only and manually named queue entries.
+            header = `${header} ${organism}`;
         }
         return header;
     }
@@ -3098,7 +3867,9 @@
 
     // Alan 5/9/26 - Preserve queue BLAST metrics with the job so the Tree Viewer can filter rendered tips.
     function buildSequenceMetadataFromQueue() {
-        return sequenceQueue.map(seq => {
+        // Alan 7/15/26 - Keep positional metadata when any record has a known location so identical
+        // FASTA headers from different locations remain distinguishable during server-side deduplication.
+        const metadata = sequenceQueue.map(seq => {
             const header = buildFastaHeaderFromQueueItem(seq);
             const hasMetrics = seq.blast_metrics_available === true ||
                 seq.query_cover != null ||
@@ -3111,12 +3882,28 @@
                 source: seq.source || '',
                 hit_source: seq.hit_source || '',
                 location: seq.location || seq.mycomap_location || extractLocationFromSequenceName(seq.name) || '',
+                raw_fasta_header: seq.raw_fasta_header || '',
+                raw_ncbi_description: seq.raw_ncbi_description || '',
+                mycomap_header_format: seq.mycomap_header_format || '',
+                internal_id: seq.internal_id || '',
+                display_label: seq.display_label || '',
+                accession: seq.accession || '',
+                taxon: seq.taxon || '',
+                raw_mycomap_taxon: seq.raw_mycomap_taxon || '',
+                voucher: seq.voucher || '',
+                occurrence: seq.occurrence || null,
+                observation_id: seq.observation_id || '',
+                mushroom_observer_sequence_id: seq.mushroom_observer_sequence_id || null,
+                locus: seq.locus || '',
                 query_cover: seq.query_cover ?? null,
                 subject_cover: seq.subject_cover ?? null,
                 identity: seq.identity ?? null,
                 blast_metrics_available: hasMetrics
             };
-        }).filter(item => item.blast_metrics_available || item.source || item.hit_source);
+        });
+        return metadata.some(item => item.location)
+            ? metadata
+            : metadata.filter(item => item.blast_metrics_available || item.source || item.hit_source);
     }
 
     // =========================================================================
@@ -3345,7 +4132,7 @@
         const esc = s => escapeHtml(String(s));
         let badges = '';
         if (seq.blast_metrics_available) {
-            const fmtN = v => v != null ? v.toFixed(1) + '%' : '—';
+            const fmtN = v => v != null ? v.toFixed(1) + '%' : 'N/A';
             badges = `
                 <span class="ml-2 px-1.5 py-0.5 rounded text-blue-700 dark:text-blue-300 bg-blue-50 dark:bg-blue-900/30">Q:${fmtN(seq.query_cover)}</span>
                 <span class="ml-1 px-1.5 py-0.5 rounded text-green-700 dark:text-green-300 bg-green-50 dark:bg-green-900/30">S:${fmtN(seq.subject_cover)}</span>
@@ -3450,7 +4237,7 @@
         closeFilterModal();
         updateQueueDisplay();
         if (excluded.length === 0) {
-            showStatus('No sequences excluded — all sequences pass the filter.', 'success');
+            showStatus('No sequences excluded because all sequences pass the filter.', 'success');
         } else {
             showStatus(`Removed ${excluded.length} filtered sequence(s) from queue.`, 'success');
         }

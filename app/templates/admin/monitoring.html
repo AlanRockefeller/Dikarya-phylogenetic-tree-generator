@@ -95,21 +95,35 @@
                     <span class="text-sm text-gray-600 dark:text-gray-300">Total Jobs</span>
                     <span class="text-2xl font-bold text-journal-dark dark:text-gray-100">{{ metrics.total_jobs }}</span>
                 </div>
-                <div class="flex items-baseline justify-between border-t border-gray-100 dark:border-journal-dark pt-2 mb-3">
-                    <span class="text-sm text-gray-600 dark:text-gray-300">Failed (24h)</span>
-                    <span class="text-lg font-bold {% if metrics.recent_failed_24h > 0 %}text-red-600 dark:text-red-400{% else %}text-gray-400{% endif %}">{{ metrics.recent_failed_24h }}</span>
+                <div class="overflow-x-auto border-t border-gray-100 dark:border-journal-dark pt-3">
+                    <table class="w-full text-xs">
+                        <thead>
+                            <tr class="text-gray-500 dark:text-gray-400">
+                                <th class="pb-2 pr-2 text-left font-semibold">Status</th>
+                                <th class="pb-2 px-2 text-right font-semibold">24h</th>
+                                <th class="pb-2 px-2 text-right font-semibold">7 days</th>
+                                <th class="pb-2 px-2 text-right font-semibold">30 days</th>
+                                <th class="pb-2 pl-2 text-right font-semibold">All time</th>
+                            </tr>
+                        </thead>
+                        <tbody class="font-mono">
+                            {% for status, counts in metrics.status_period_counts.items() %}
+                            <tr class="border-t border-gray-100 dark:border-journal-dark">
+                                <td class="py-2 pr-2 font-sans font-semibold capitalize
+                                    {% if status == 'failed' %}text-red-600 dark:text-red-400
+                                    {% elif status == 'completed' %}text-green-700 dark:text-green-300
+                                    {% elif status == 'running' %}text-blue-700 dark:text-blue-300
+                                    {% else %}text-gray-600 dark:text-gray-300{% endif %}">{{ status }}</td>
+                                <td class="py-2 px-2 text-right text-journal-dark dark:text-gray-100">{{ counts['24h'] }}</td>
+                                <td class="py-2 px-2 text-right text-journal-dark dark:text-gray-100">{{ counts['7d'] }}</td>
+                                <td class="py-2 px-2 text-right text-journal-dark dark:text-gray-100">{{ counts['30d'] }}</td>
+                                <td class="py-2 pl-2 text-right text-journal-dark dark:text-gray-100">{{ counts['all_time'] }}</td>
+                            </tr>
+                            {% endfor %}
+                        </tbody>
+                    </table>
                 </div>
-                <h4 class="text-xs uppercase tracking-wide text-gray-500 dark:text-gray-400 font-semibold mb-2">By Status</h4>
-                <ul class="space-y-1 text-sm">
-                    {% for status, count in metrics.status_counts.items() %}
-                    <li class="flex justify-between font-mono">
-                        <span class="text-gray-600 dark:text-gray-300">{{ status }}</span>
-                        <span class="text-journal-dark dark:text-gray-100">{{ count }}</span>
-                    </li>
-                    {% else %}
-                    <li class="text-gray-500 italic">No jobs yet</li>
-                    {% endfor %}
-                </ul>
+                <p class="mt-2 text-[11px] text-gray-500 dark:text-gray-400">Time windows use each job's submission time.</p>
             </div>
         </div>
 

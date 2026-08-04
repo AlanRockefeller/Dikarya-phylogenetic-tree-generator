@@ -1,5 +1,7 @@
+import uuid
+
 import redis
-from rq import Queue
+from rq import Queue, Retry
 from flask import current_app
 from typing import Any, Dict, Optional
 
@@ -18,11 +20,34 @@ def get_queue(name=QUEUE_HIGH) -> Queue:
     return Queue(name, connection=conn)
 
 def enqueue_job(job_params: Dict[str, Any], queue_name: str = QUEUE_HIGH,
-                meta: Optional[Dict[str, Any]] = None) -> str:
+                meta: Optional[Dict[str, Any]] = None,
+                job_id: Optional[str] = None,
+                job_timeout: Any = '1h') -> str:
     """Enqueue a phylo analysis job and return the job ID."""
     q = get_queue(queue_name)
     from app.workers.tasks import run_phylo_job
-    job = q.enqueue(run_phylo_job, job_params, job_timeout='1h', meta=meta or {})
+    job = q.enqueue(
+        run_phylo_job,
+        job_params,
+        job_timeout=job_timeout,
+        meta=meta or {},
+        job_id=job_id,
+    )
+    return job.id
+
+
+def enqueue_mycomap_blast_refresh_job(params: Dict[str, Any], job_timeout: Any = '1h') -> str:
+    """Enqueue a MycoMap BLAST refresh (not a full pipeline job) and return its job ID."""
+    q = get_queue(QUEUE_HIGH)
+    from app.workers.tasks import run_mycomap_blast_refresh_job
+    job_id = str(uuid.uuid4())
+    job = q.enqueue(
+        run_mycomap_blast_refresh_job,
+        params,
+        job_timeout=job_timeout,
+        meta={},
+        job_id=job_id,
+    )
     return job.id
 
 
@@ -64,6 +89,8 @@ def get_job_status(job_id: str) -> Dict[str, Any]:
             return {"id": job_id, "status": "unknown", "error": "Job not found"}
         
         status = job.get_status()
+        if status in ("scheduled", "deferred"):
+            status = "queued"
         result = job.result
         
         response = {
@@ -74,10 +101,12 @@ def get_job_status(job_id: str) -> Dict[str, Any]:
             "ended_at": job.ended_at.isoformat() if job.ended_at else None,
         }
         
-        if job.exc_info:
+        if status == "failed" and job.exc_info:
             response["error"] = job.exc_info
             
-        if result:
+        # RQ stores a Retry marker as the result while a job waits to be
+        # scheduled again. It is internal state and cannot be JSON encoded.
+        if result and not isinstance(result, Retry):
             response["result"] = result
             
         return response

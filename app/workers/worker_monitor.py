@@ -166,6 +166,6 @@ def run_worker_with_heartbeat(app):
         
         # Cleanup on exit
         try:
-            worker.work()
+            worker.work(with_scheduler=True)
         finally:
             worker.clean_up_heartbeat()

@@ -631,12 +631,28 @@ def _build_header(record: Dict) -> str:
         # Try stripping both the full organism string and the binomial.
         variants = [v for v in [org_name, org_binomial] if v]
 
+        matched = False
         for v in variants:
             # Remove occurrences anywhere (case-insensitive)
-            val = re.sub(re.escape(v), "", val, flags=re.IGNORECASE)
+            new_val = re.sub(re.escape(v), "", val, flags=re.IGNORECASE)
+            if new_val != val:
+                matched = True
+            val = new_val
 
-        # Clean up punctuation/separators left behind
-        val = re.sub(r"\s*[:;,()\[\]{}]\s*", " ", val)
+        if not matched:
+            # No organism substring was actually present in this value, so
+            # leave punctuation (e.g. "USA: Maryland", "Ecuador: X, Y, Z")
+            # untouched because it isn't leftover residue from a stripped match.
+            return val.strip()
+
+        # Clean up punctuation/separators left behind by the removal above.
+        # Only touch residue at the edges (stray leading/trailing colons,
+        # commas, empty bracket pairs). Do NOT blanket-strip punctuation
+        # throughout the value, since well-formed content like geo_loc_name
+        # ("Ecuador: Reserva Los Cedros, Imbabura, ...") may still be present
+        # even when the organism name was found and removed elsewhere in it.
+        val = re.sub(r"[\(\[\{]\s*[\)\]\}]", "", val)
+        val = re.sub(r"^[\s:;,]+|[\s:;,]+$", "", val)
         val = re.sub(r"\bof\b", "", val, flags=re.IGNORECASE)
         val = " ".join(val.split()).strip()
 

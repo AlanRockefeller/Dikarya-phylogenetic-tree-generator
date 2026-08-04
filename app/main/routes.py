@@ -1,5 +1,6 @@
 from flask import render_template, redirect, url_for, abort, request, current_app, flash, Response
 from flask_login import current_user
+from jinja2 import TemplateNotFound
 from app.main import bp
 from app.services.security_utils import validate_safe_file_path, validate_job_id
 from app.services.access_control import check_job_access
@@ -10,8 +11,6 @@ import re
 from collections import deque
 from datetime import datetime
 
-WHATS_NEW_DEFAULT_EDITOR_EMAILS = {"alaner@gmail.com"}
-TODO_ADMIN_DEFAULT_EMAILS = {"alaner@gmail.com"}
 
 VOUCHER_LABEL_PRESETS = {
     "avery_5160": {
@@ -36,6 +35,8 @@ VOUCHER_LABEL_PRESETS = {
         "columns": 4,
         "rows": 20,
         "margin_left": 0.3125,
+        # 5167 sheets are not symmetric: 0.3125 + 4x1.75 + 3x0.3 leaves 0.2875.
+        "margin_right": 0.2875,
         "margin_top": 0.5,
         "gap_x": 0.3,
         "gap_y": 0,
@@ -92,6 +93,8 @@ VOUCHER_RTF_FONT_CHOICES = {
 
 
 def can_edit_whats_new():
+    if not current_user.is_authenticated:
+        return False
     raw_editors = os.environ.get("WHATS_NEW_EDITOR_EMAILS") or os.environ.get("WHATS_NEW_EDITOR_EMAIL")
     if raw_editors:
         editor_emails = {
@@ -99,13 +102,9 @@ def can_edit_whats_new():
             for item in raw_editors.split(",")
             if item.strip()
         }
-    else:
-        editor_emails = WHATS_NEW_DEFAULT_EDITOR_EMAILS
-    email = (getattr(current_user, "email", "") or "").strip().lower()
-    return (
-        current_user.is_authenticated
-        and email in editor_emails
-    )
+        email = (getattr(current_user, "email", "") or "").strip().lower()
+        return email in editor_emails
+    return bool(getattr(current_user, "is_admin", False))
 
 
 def require_whats_new_editor():
@@ -116,7 +115,6 @@ def require_whats_new_editor():
 def is_todo_admin():
     if not current_user.is_authenticated:
         return False
-    email = (getattr(current_user, "email", "") or "").strip().lower()
     raw_admins = os.environ.get("TODO_ADMIN_EMAILS")
     if raw_admins:
         admin_emails = {
@@ -124,9 +122,9 @@ def is_todo_admin():
             for item in raw_admins.split(",")
             if item.strip()
         }
-    else:
-        admin_emails = TODO_ADMIN_DEFAULT_EMAILS
-    return email in admin_emails
+        email = (getattr(current_user, "email", "") or "").strip().lower()
+        return email in admin_emails
+    return bool(getattr(current_user, "is_admin", False))
 
 
 def _sanitize_todo_input(name, suggestion):
@@ -226,7 +224,16 @@ def _voucher_label_values(form, layout):
     return [_voucher_format_label(prefix, start_number, number_width, i) for i in range(count)]
 
 
-def _apply_auto_voucher_layout(preset, sample_label, font_size):
+def _voucher_fit_count(usable_size, label_size, gap_size):
+    pitch = label_size + gap_size
+    if pitch <= 0:
+        return 1
+    # Small epsilon so a layout that fits exactly is not rounded down by
+    # floating point error in the sheet dimensions.
+    return max(1, int((usable_size + gap_size + 1e-6) // pitch))
+
+
+def _apply_auto_voucher_layout(preset, sample_label, font_size, min_gap_x=0, min_gap_y=0):
     page_width = preset["page_width"]
     page_height = preset["page_height"]
     margin_left = preset["margin_left"]
@@ -237,8 +244,8 @@ def _apply_auto_voucher_layout(preset, sample_label, font_size):
     text_height = font_size / 72
     label_width = min(usable_width, max(0.35, text_width + 0.18))
     label_height = min(usable_height, max(0.22, text_height + 0.12))
-    columns = max(1, int(usable_width // label_width))
-    rows = max(1, int(usable_height // label_height))
+    columns = _voucher_fit_count(usable_width, label_width, min_gap_x)
+    rows = _voucher_fit_count(usable_height, label_height, min_gap_y)
     gap_x = (usable_width - (columns * label_width)) / (columns - 1) if columns > 1 else 0
     gap_y = (usable_height - (rows * label_height)) / (rows - 1) if rows > 1 else 0
     preset.update({
@@ -265,6 +272,8 @@ def _voucher_layout_from_form(form, sample_label=None, output_format="pdf"):
     default_font_key = "ibm_plex_sans" if output_format == "rtf" else "helvetica"
     font_key = form.get("font_family") or default_font_key
     font_size = _voucher_int(form.get("font_size"), 12, 6, 36)
+    min_gap_x = _voucher_float(form.get("spacing_x"), 0, 0, 2)
+    min_gap_y = _voucher_float(form.get("spacing_y"), 0, 0, 2)
     if preset_key == "custom":
         label_width = _voucher_float(form.get("custom_width"), 2.625, 0.5, 8.5)
         label_height = _voucher_float(form.get("custom_height"), 1, 0.25, 5)
@@ -286,9 +295,24 @@ def _voucher_layout_from_form(form, sample_label=None, output_format="pdf"):
     elif preset.get("auto"):
         prefix, start_number, number_width = _voucher_number_parts(form)
         sample = sample_label or _voucher_format_label(prefix, start_number, number_width, 0)
-        preset = _apply_auto_voucher_layout(preset, sample, font_size)
+        preset = _apply_auto_voucher_layout(preset, sample, font_size, min_gap_x, min_gap_y)
     else:
-        available_columns = preset["columns"]
+        preset["gap_x"] = max(preset["gap_x"], min_gap_x)
+        preset["gap_y"] = max(preset["gap_y"], min_gap_y)
+        # Sheet margins are not necessarily symmetric, so honour an explicit
+        # margin_right/margin_bottom when the preset declares one.
+        margin_right = preset.get("margin_right", preset["margin_left"])
+        margin_bottom = preset.get("margin_bottom", preset["margin_top"])
+        usable_width = max(0.5, preset["page_width"] - preset["margin_left"] - margin_right)
+        usable_height = max(0.5, preset["page_height"] - preset["margin_top"] - margin_bottom)
+        available_columns = min(
+            preset["columns"],
+            _voucher_fit_count(usable_width, preset["label_width"], preset["gap_x"]),
+        )
+        preset["rows"] = min(
+            preset["rows"],
+            _voucher_fit_count(usable_height, preset["label_height"], preset["gap_y"]),
+        )
         preset["columns"] = _voucher_int(form.get("print_columns"), available_columns, 1, available_columns)
     return {
         "preset": preset,
@@ -453,7 +477,10 @@ def voucher_labels_export():
 
 @bp.route('/test')
 def dosage_test():
-    return render_template('test.html')
+    try:
+        return render_template('test.html')
+    except TemplateNotFound:
+        abort(404)
 
 
 @bp.route('/whats-new')
@@ -702,7 +729,7 @@ def inat_oauth_callback():
     state = request.args.get("state")
     code = request.args.get("code")
     if not expected_state or not state or state != expected_state:
-        flash("OAuth state mismatch — please retry.", "error")
+        flash("OAuth state mismatch. Please retry.", "error")
         return _redirect(url_for("main.sequence_entry"))
     if not code:
         flash(

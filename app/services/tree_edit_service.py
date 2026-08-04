@@ -1,6 +1,7 @@
 import copy
 import json
 import logging
+import re
 import shutil
 from pathlib import Path
 from typing import Dict, Any, List, Optional, Set, Tuple
@@ -91,13 +92,23 @@ def load_tree_state(job_dir: Path) -> Dict:
         
     return {}
 
+# Keys that edit operations attach to the returned state purely to inform the
+# caller. They are echoed in the API response but never written to disk.
+_TRANSIENT_STATE_KEYS = ("prune_unresolved",)
+
+
 def save_tree_state(job_dir: Path, tree_json: Dict) -> None:
     """
     Save tree_json to tree_state.json with indentation.
     """
     state_path = job_dir / "tree_state.json"
+    persisted = {
+        key: value
+        for key, value in tree_json.items()
+        if key not in _TRANSIENT_STATE_KEYS
+    }
     with open(state_path, "w") as f:
-        json.dump(tree_json, f, indent=2)
+        json.dump(persisted, f, indent=2)
 
 
 def _iter_tip_names(node: Dict[str, Any]):
@@ -153,6 +164,13 @@ def _int_param(value, default: int) -> int:
         return default
 
 
+def _float_param(value, default: float) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
 def _bool_param(params_dict: Dict[str, Any], key: str, default: bool) -> bool:
     return coerce_bool(params_dict.get(key), default)[0]
 
@@ -176,6 +194,9 @@ def build_recompute_job_params(params_dict: Dict[str, Any]) -> JobParams:
         mcmc_generations=_int_param(params_dict.get("mcmc_generations", 50000), 50000),
         mcmc_nruns=_int_param(params_dict.get("mcmc_nruns", 2), 2),
         mcmc_nchains=_int_param(params_dict.get("mcmc_nchains", 4), 4),
+        mcmc_burnin_fraction=_float_param(
+            params_dict.get("mcmc_burnin_fraction", 0.25), 0.25
+        ),
         run_preset=params_dict.get("run_preset", "fast_good"),
         bootstrap_preset=params_dict.get("bootstrap_preset", "standard"),
         bootstrap_cap=params_dict.get("bootstrap_cap"),
@@ -325,25 +346,48 @@ def prune_taxa(job_dir: Path, tree_json: Dict, taxa_names: List[str]) -> Dict:
         tree = Phylo.read(str(input_path), "newick")
         
         # We need to prune multiple nodes. 
-        targets = set(taxa_names)
+        targets = {name for name in taxa_names if name}
+        previously_pruned = targets.intersection(tree_json.get("pruned_taxa", []) or [])
         
         to_prune = []
+        matched_targets = set()
         for clade in tree.find_clades():
             stable_id = _stable_internal_node_id(clade)
-            if clade.name in targets or (stable_id and stable_id in targets):
+            matched_name = clade.name if clade.name in targets else None
+            matched_stable_id = stable_id if stable_id and stable_id in targets else None
+            if matched_name or matched_stable_id:
                 to_prune.append(clade)
-                
-        if not to_prune:
-             # Gather some available names for debugging
-             available_tips = [t.name for t in tree.get_terminals() if t.name][:5]
-             available_internal = [n.name for n in tree.get_nonterminals() if n.name][:5]
-             msg = f"Targets {list(targets)[:3]}... not found in tree. " \
-                   f"Sample tips: {available_tips}. Sample nodes: {available_internal}."
-             logger.warning(msg)
-             # Raise error to inform user in UI instead of silent failure
-             raise ValueError(msg)
+                if matched_name:
+                    matched_targets.add(matched_name)
+                if matched_stable_id:
+                    matched_targets.add(matched_stable_id)
 
-        pruned_names = {name for name in taxa_names if name}
+        unresolved_targets = targets - matched_targets - previously_pruned
+        tree_json.pop("prune_unresolved", None)
+        if unresolved_targets:
+            # A bulk prune can carry a stale name alongside many valid ones, so
+            # prune what matched and report the rest instead of failing the
+            # whole request. Only a request where nothing at all resolved is an
+            # error.
+            available_tips = [t.name for t in tree.get_terminals() if t.name][:5]
+            available_internal = [n.name for n in tree.get_nonterminals() if n.name][:5]
+            logger.warning(
+                "Prune targets not found in tree: %s. Sample tips: %s. Sample nodes: %s.",
+                sorted(unresolved_targets)[:5], available_tips, available_internal,
+            )
+            if not to_prune and not previously_pruned:
+                raise ValueError(
+                    "None of the selected tips were found in the tree: "
+                    + ", ".join(sorted(unresolved_targets)[:5])
+                )
+            # Transient; stripped by save_tree_state so it never persists.
+            tree_json["prune_unresolved"] = sorted(unresolved_targets)
+
+        if not to_prune:
+            logger.info("Prune request already applied for targets: %s", sorted(previously_pruned))
+            return tree_json
+
+        pruned_names = set(matched_targets)
         for clade in to_prune:
             if clade.name:
                 pruned_names.add(clade.name)
@@ -463,6 +507,107 @@ def rename_tip(tree_json: Dict, old_name: str, new_name: str) -> Dict:
         
     return tree_json
 
+
+def _replace_tip_label_fragment(label: str, old_value: str,
+                                new_value: str) -> Tuple[str, bool]:
+    """Replace one name/location fragment while tolerating whitespace changes."""
+    old_value = " ".join(str(old_value or "").split())
+    new_value = " ".join(str(new_value or "").split())
+    if not old_value or old_value.casefold() == new_value.casefold():
+        return label, False
+    pattern = r"\s+".join(re.escape(part) for part in old_value.split())
+    updated, count = re.subn(pattern, lambda _match: new_value, label, count=1, flags=re.IGNORECASE)
+    if not count:
+        return label, False
+    return " ".join(updated.split()).strip(), True
+
+
+def refresh_mycomap_tip_labels(tree_json: Dict, tip_names: List[str],
+                                refresh_result: Dict) -> Dict:
+    """Persist MycoMap name/location changes for selected observation-backed tips."""
+    from app.services.mycomap_service import extract_mycomap_observation_reference
+
+    selected = []
+    seen = set()
+    for value in tip_names:
+        name = str(value or "").strip()
+        if name and name not in seen:
+            selected.append(name)
+            seen.add(name)
+
+    original_tip_names = set()
+
+    def collect_original_names(node):
+        if not isinstance(node, dict):
+            return
+        children = node.get("children") or []
+        if children:
+            for child in children:
+                collect_original_names(child)
+            return
+        original = node.get("original_name") or node.get("name")
+        if original:
+            original_tip_names.add(str(original))
+
+    collect_original_names(tree_json.get("tree_structure") or {})
+    before_records = refresh_result.get("before") or {}
+    after_records = refresh_result.get("after") or {}
+    renames = tree_json.get("renames") or {}
+    changes = []
+    warnings = []
+
+    for original_name in selected:
+        if original_name not in original_tip_names:
+            warnings.append(f"Tree tip is no longer available: {original_name[:120]}")
+            continue
+        current_label = str(renames.get(original_name) or original_name)
+        reference = (
+            extract_mycomap_observation_reference(original_name)
+            or extract_mycomap_observation_reference(current_label)
+        )
+        if not reference:
+            continue
+        before = before_records.get(reference) or {}
+        after = after_records.get(reference) or {}
+        if not after.get("found"):
+            warnings.append(f"MycoMap did not return refreshed details for {reference}.")
+            continue
+
+        updated_label = current_label
+        changed_fields = []
+        for field in ("scientific_name", "location"):
+            old_value = str(before.get(field) or "").strip()
+            new_value = str(after.get(field) or "").strip()
+            if old_value.casefold() == new_value.casefold():
+                continue
+            updated_label, replaced = _replace_tip_label_fragment(
+                updated_label,
+                old_value,
+                new_value,
+            )
+            if replaced:
+                changed_fields.append(field)
+            elif old_value:
+                warnings.append(
+                    f"Refreshed {reference}, but its old {field.replace('_', ' ')} "
+                    "was not present in the tree label."
+                )
+
+        if updated_label != current_label:
+            rename_tip(tree_json, original_name, updated_label)
+            changes.append({
+                "reference": reference,
+                "old_name": current_label,
+                "new_name": updated_label,
+                "changed_fields": changed_fields,
+            })
+
+    return {
+        "tree_state": tree_json,
+        "changes": changes,
+        "warnings": warnings,
+    }
+
 def apply_state_to_structure(node: Dict, renames: Dict, pruned_taxa: Set[str]):
     """
     Recursively apply metadata (renames, prune status) to the tree structure.
@@ -486,7 +631,7 @@ def apply_state_to_structure(node: Dict, renames: Dict, pruned_taxa: Set[str]):
 
 def _write_rerooted_tree(job_dir: Path, tree_json: Dict, tree, root_target: str) -> Dict:
     """Persist an already rerooted Bio.Phylo tree and mirror it into tree state."""
-    ladderize_tree(tree)
+    ladderize_tree(tree, focal_tip=tree_json.get("sequence_of_interest"))
     _drop_confidence_when_named(tree)
 
     new_structure = _clade_to_json(tree.root)
@@ -676,7 +821,7 @@ def midpoint_root(job_dir: Path, tree_json: Dict) -> Dict:
             raise ValueError(f"Midpoint rooting failed: {e}") from e
 
         # Ladderize (Deterministic)
-        ladderize_tree(tree)
+        ladderize_tree(tree, focal_tip=tree_json.get("sequence_of_interest"))
 
         # Ensure unique labels for stable IDs
         ensure_unique_labels(tree)
@@ -732,7 +877,7 @@ def undo_midpoint_root(job_dir: Path, tree_json: Dict) -> Dict:
         ensure_unique_labels(tree)
         
         # Ladderize for consistent display
-        ladderize_tree(tree)
+        ladderize_tree(tree, focal_tip=tree_json.get("sequence_of_interest"))
         
         # FIX: Ensure confidence is dropped for named nodes
         _drop_confidence_when_named(tree)
@@ -1051,6 +1196,9 @@ def recompute_tree(
     # We might want to update the tree structure in JSON too?
     # Yes, parse the new tree
     new_structure = parse_newick_to_json(tree_pruned_newick)
+    renames = tree_json.get("renames", {})
+    pruned_taxa = set(tree_json.get("pruned_taxa", []))
+    apply_state_to_structure(new_structure, renames, pruned_taxa)
     tree_json["tree_structure"] = new_structure
     tree_json = _reapply_rooting_after_recompute(
         job_dir,
@@ -1231,8 +1379,8 @@ def set_sequence_of_interest(tree_json: Dict, tip_name: Optional[str],
 
     The focal highlight is rendered directly from this field (the tree viewer's
     focal styling and the alignment viewer's preferredName both read it), so we do
-    NOT mirror it into the user-editable Default color group — doing so corrupted
-    user colorings by adding/removing members. resolve_sequence_of_interest() still
+    NOT mirror it into the user-editable Default color group because doing so
+    corrupted user colorings by adding/removing members. resolve_sequence_of_interest() still
     reads a single blue Default member as a legacy/iNat fallback.
     """
     if source is None or source == "":
@@ -1472,12 +1620,17 @@ def ensure_unique_labels(tree) -> bool:
     
     return changes_made
 
-def ladderize_tree(tree, ascending: bool = False):
+def ladderize_tree(tree, ascending: bool = False,
+                   focal_tip: Optional[str] = None):
     """
     Sorts clades in-place to ensure deterministic visual output.
     Sort keys:
       1. Number of descendant tips (size).
       2. Lexicographically smallest tip name (min_leaf_name).
+
+    When focal_tip is present, rotate only the branches on its ancestral path
+    after the normal ladderization so the focal sequence is displayed first.
+    All branches outside that path retain the standard ladderized ordering.
     """
     
     # Pre-calculate metrics to avoid re-traversing constantly
@@ -1522,6 +1675,22 @@ def ladderize_tree(tree, ascending: bool = False):
                 sort_clade(c)
 
     sort_clade(tree.root)
+
+    if focal_tip:
+        focal_clade = next(
+            (
+                clade for clade in tree.get_terminals()
+                if clade.name == focal_tip
+            ),
+            None,
+        )
+        if focal_clade is not None:
+            ancestor = tree.root
+            for focal_child in tree.get_path(focal_clade):
+                if focal_child in ancestor.clades:
+                    ancestor.clades.remove(focal_child)
+                    ancestor.clades.insert(0, focal_child)
+                ancestor = focal_child
     
     # Cleanup
     for clade in tree.find_clades():

@@ -33,6 +33,14 @@ document.addEventListener('DOMContentLoaded', async () => {
     const btnRenameModalCancel = getEl('btn-rename-modal-cancel');
     const btnRenameModalClose = getEl('btn-rename-modal-close');
     const renameModalBackdrop = getEl('rename-modal-backdrop');
+    // Alan 7/20/26 - Cache keyboard-help and advanced-selection menu controls for click and hotkey access.
+    const shortcutHelpModal = getEl('modal-tree-shortcuts');
+    const shortcutHelpBackdrop = getEl('tree-shortcuts-backdrop');
+    const btnShortcutHelpClose = getEl('btn-tree-shortcuts-close');
+    // Alan 7/21/26 - Cache the visible toolbar launcher for the shared keyboard-shortcut help modal.
+    const btnShortcutHelpOpen = getEl('btn-tree-shortcuts-help');
+    const btnSelectionMore = getEl('btn-selection-more');
+    const selectionMoreMenu = getEl('selection-more-menu');
 
     // --- HELPER: STATUS MESSAGE ---
     let currentStatusType = null;
@@ -64,6 +72,8 @@ document.addEventListener('DOMContentLoaded', async () => {
     let rerootMode = false;
     let uiWired = false;
     let isLoadingTree = false;
+    // Alan 7/15/26 - Serialize tree loads so an edit-triggered redraw waits behind any load already in progress.
+    let treeLoadQueue = Promise.resolve();
     let isMidpointRooted = true; // Default: midpoint rooted on load
     // Alan 5/29/26 - Track rooting state so the SOI button can hide unless auto root needs help.
     let needsSequenceOfInterest = false;
@@ -78,6 +88,39 @@ document.addEventListener('DOMContentLoaded', async () => {
     // Alan 5/11/26 - Hold only the clicked/current selection being edited in the rename modal.
     let pendingRenameItems = [];
     let updateSelectionSetUI = () => {}; // assigned in wireUI()
+
+    // Alan 7/20/26 - Toggle the advanced selection menu through both mouse and keyboard-accessible state.
+    function setSelectionMoreMenuOpen(open) {
+        if (!btnSelectionMore || !selectionMoreMenu) return;
+        selectionMoreMenu.classList.toggle('hidden', !open);
+        btnSelectionMore.setAttribute('aria-expanded', open ? 'true' : 'false');
+    }
+
+    // Alan 7/20/26 - Open a compact reference for the tree viewer's supported keyboard shortcuts.
+    function openShortcutHelp() {
+        if (!shortcutHelpModal) return;
+        shortcutHelpModal.classList.remove('hidden');
+        document.body.classList.add('overflow-hidden');
+        btnShortcutHelpClose?.focus();
+    }
+
+    // Alan 7/20/26 - Close keyboard help without changing tree selection or viewer mode.
+    function closeShortcutHelp() {
+        if (!shortcutHelpModal) return;
+        shortcutHelpModal.classList.add('hidden');
+        document.body.classList.remove('overflow-hidden');
+    }
+
+    // Alan 7/20/26 - Share one direct deselect action so the D hotkey cannot be blocked by stale button state.
+    function deselectCurrentTreeSelection() {
+        if (isProcessing || !viewer || typeof viewer.deselectCurrentSelection !== 'function') return 0;
+        const cleared = viewer.deselectCurrentSelection();
+        updateButtons();
+        if (cleared > 0) {
+            showStatus(`Deselected ${cleared} sequence${cleared === 1 ? '' : 's'}.`, "info", 1500);
+        }
+        return cleared;
+    }
 
     async function saveSelectionSets() {
         if (!viewer || JOB_ID === 'unknown') return;
@@ -202,7 +245,16 @@ document.addEventListener('DOMContentLoaded', async () => {
     // Alan 6/4/26 - Allow internal-node prune callers to clean up descendant tip color annotations too.
     async function pruneTaxaPreservingSelectionColors(names, cleanupNames = names) {
         // Alan 5/12/26 - Run the existing backend prune action first so failed prunes do not mutate saved colors.
-        await TreeEditActions.pruneTaxa(JOB_ID, names);
+        const pruneResult = await TreeEditActions.pruneTaxa(JOB_ID, names);
+        // Warn about names the backend could not resolve; the rest still pruned.
+        const unresolved = pruneResult?.prune_unresolved;
+        if (Array.isArray(unresolved) && unresolved.length) {
+            showStatus(
+                `Pruned the rest; ${unresolved.length} node${unresolved.length > 1 ? 's were' : ' was'} not found in the tree.`,
+                "warning",
+                4000
+            );
+        }
         // Alan 5/12/26 - Remove only the pruned tips from saved selection sets; keep other colored labels.
         if (viewer?.removeIdsFromSelectionSets) viewer.removeIdsFromSelectionSets(cleanupNames);
         // Alan 5/12/26 - Persist the pruned selection-set cleanup before the tree reloads.
@@ -235,10 +287,19 @@ document.addEventListener('DOMContentLoaded', async () => {
         btnBoxSelect.style.color = active ? '#c9a962' : '';
         // Alan 5/11/26 - Mirror the mode for assistive technology and CSS hooks.
         btnBoxSelect.setAttribute('aria-pressed', active ? 'true' : 'false');
-        // Alan 5/11/26 - Explain modifier behavior in the tooltip without adding in-app instruction text.
+        // Alan 7/20/26 - Keep the B shortcut visible whenever an optional Box Select toolbar button is present.
         btnBoxSelect.title = active
-            ? 'Box Select is on. Drag empty tree background to select tips; Alt removes; Ctrl/Cmd toggles; Esc cancels.'
-            : 'Box Select. Right-drag empty tree background anytime, or turn this on for left-drag selection.';
+            ? 'Box Select is on (B). Drag empty tree background to select tips; Alt removes; Ctrl/Cmd toggles; Esc cancels.'
+            : 'Box Select (B). Right-drag empty tree background anytime, or turn this on for left-drag selection.';
+    }
+
+    // Alan 7/20/26 - Toggle Box Select directly so the B hotkey works even when no toolbar button is rendered.
+    function toggleBoxSelectMode() {
+        if (!viewer?.setBoxSelectMode) return false;
+        const enabled = viewer.setBoxSelectMode(!viewer.getBoxSelectMode());
+        updateBoxSelectButton();
+        showStatus(enabled ? "Box Select on. Drag empty tree background." : "Box Select off.", "info", 1500);
+        return true;
     }
 
     function saveDisplayPrefs() {
@@ -264,9 +325,8 @@ document.addEventListener('DOMContentLoaded', async () => {
             if (sIn && prefs.supportFont) sIn.value = prefs.supportFont;
             if (tIn && prefs.tipFont) tIn.value = prefs.tipFont;
             viewer.applyTextSizing();
-            if (prefs.spacingX || prefs.spacingY) {
-                viewer.updateSpacing(prefs.spacingX || 0, prefs.spacingY || 0);
-            }
+            // Alan 7/17/26 - Replace spacing with the saved values so repeated tree redraws cannot compound them.
+            viewer.setSpacingState(prefs.spacingX || 0, prefs.spacingY || 0);
         } catch (e) {}
     }
 
@@ -388,7 +448,7 @@ document.addEventListener('DOMContentLoaded', async () => {
         if (info.chosen_by === 'auto' || info.chosen_by === 'most_divergent_hit') {
             const target = info.chosen_root_target || (result && result.root_target) || 'selected tip';
             const label = info.chosen_by === 'most_divergent_hit'
-                ? `Auto root: rooted on most divergent hit — ${target}`
+                ? `Auto root used the most divergent hit: ${target}`
                 : `Auto root chose outgroup: ${target}`;
             // Alan 5/31/26 - Keep the chosen-outgroup message up (sticky) so it can actually be read.
             return { msg: label, type: "success", timeout: 0 };
@@ -530,7 +590,16 @@ document.addEventListener('DOMContentLoaded', async () => {
     // Alan 5/31/26 - opts.fromAction marks reloads triggered by runBackendAction so
     // the load-time "Auto root chose" message stays out of the way and lets the
     // action's own final status show instead of clobbering it.
-    async function loadTree(opts = {}) {
+    // Alan 7/15/26 - Queue requested loads instead of dropping a post-edit redraw while another load is active.
+    function loadTree(opts = {}) {
+        // Alan 7/15/26 - Chain the redraw after the active load and keep the caller waiting until it finishes.
+        treeLoadQueue = treeLoadQueue.then(() => loadTreeNow(opts));
+        // Alan 7/15/26 - Return the queued promise so backend actions remain disabled until the new tree is rendered.
+        return treeLoadQueue;
+    }
+
+    // Alan 7/15/26 - Execute one serialized tree load using the existing render and state-restoration flow.
+    async function loadTreeNow(opts = {}) {
         if (isLoadingTree) return;
         isLoadingTree = true;
         try {
@@ -576,7 +645,7 @@ document.addEventListener('DOMContentLoaded', async () => {
                 // which sequence auto root chose as the outgroup when the tree opens already auto-rooted.
                 } else if (!opts.fromAction && loadedMode === 'auto' && (loadedInfo.chosen_by === 'auto' || loadedInfo.chosen_by === 'most_divergent_hit') && loadedInfo.chosen_root_target) {
                     const label = loadedInfo.chosen_by === 'most_divergent_hit'
-                        ? `Auto root: rooted on most divergent hit — ${loadedInfo.chosen_root_target}`
+                        ? `Auto root used the most divergent hit: ${loadedInfo.chosen_root_target}`
                         : `Auto root chose outgroup: ${loadedInfo.chosen_root_target}`;
                     showStatus(label, "info", 0);
                 }
@@ -675,6 +744,25 @@ document.addEventListener('DOMContentLoaded', async () => {
         btnRenameModalCancel?.addEventListener('click', closeRenameModal);
         btnRenameModalClose?.addEventListener('click', closeRenameModal);
         renameModalBackdrop?.addEventListener('click', closeRenameModal);
+        // Alan 7/20/26 - Wire keyboard-help close controls using the same modal interaction pattern as Rename.
+        btnShortcutHelpClose?.addEventListener('click', closeShortcutHelp);
+        shortcutHelpBackdrop?.addEventListener('click', closeShortcutHelp);
+        // Alan 7/21/26 - Open the same complete shortcut reference from the new toolbar button and question-mark hotkey.
+        btnShortcutHelpOpen?.addEventListener('click', openShortcutHelp);
+        // Alan 7/20/26 - Make the three-dot advanced selection control toggle on click instead of hover only.
+        btnSelectionMore?.addEventListener('click', (e) => {
+            e.stopPropagation();
+            setSelectionMoreMenuOpen(btnSelectionMore.getAttribute('aria-expanded') !== 'true');
+        });
+        // Alan 7/20/26 - Close the advanced selection menu after one of its actions is chosen.
+        selectionMoreMenu?.addEventListener('click', (e) => {
+            if (e.target.closest('.btn-selection-action')) setSelectionMoreMenuOpen(false);
+        });
+        // Alan 7/20/26 - Dismiss the advanced selection menu when the user clicks elsewhere on the page.
+        document.addEventListener('click', (e) => {
+            if (btnSelectionMore?.contains(e.target) || selectionMoreMenu?.contains(e.target)) return;
+            setSelectionMoreMenuOpen(false);
+        });
         renameModalRows?.addEventListener('keydown', (e) => {
             if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) {
                 submitRenameModal();
@@ -687,17 +775,8 @@ document.addEventListener('DOMContentLoaded', async () => {
 
         // Alan 5/11/26 - Wire the visible Box Select toggle for trackpads and discoverability.
         const btnBoxSelect = getEl('btn-box-select');
-        // Alan 5/11/26 - Toggle persistent left-drag box selection from the toolbar.
-        btnBoxSelect?.addEventListener('click', () => {
-            // Alan 5/11/26 - Ignore clicks before the viewer is available.
-            if (!viewer?.setBoxSelectMode) return;
-            // Alan 5/11/26 - Flip the mode through the viewer so cursor and callbacks stay centralized.
-            const enabled = viewer.setBoxSelectMode(!viewer.getBoxSelectMode());
-            // Alan 5/11/26 - Keep the toolbar synchronized immediately after toggling.
-            updateBoxSelectButton();
-            // Alan 5/11/26 - Give brief feedback without adding persistent explanatory text.
-            showStatus(enabled ? "Box Select on. Drag empty tree background." : "Box Select off.", "info", 1500);
-        });
+        // Alan 7/20/26 - Keep an optional Box Select button and the B hotkey on one shared toggle path.
+        btnBoxSelect?.addEventListener('click', toggleBoxSelectMode);
         // Alan 5/11/26 - Initialize button state after wiring.
         updateBoxSelectButton();
 
@@ -724,6 +803,8 @@ document.addEventListener('DOMContentLoaded', async () => {
             if (sortMode === 'asc') btnLadderize.innerHTML = '<i class="fa fa-sort-amount-down"></i> Asc';
             else if (sortMode === 'desc') btnLadderize.innerHTML = '<i class="fa fa-sort-amount-up"></i> Desc';
             else btnLadderize.innerHTML = '<i class="fa fa-sort"></i> Sort';
+            // Alan 7/20/26 - Keep the S shortcut discoverable after the sort button label changes.
+            btnLadderize.title = 'Cycle node sorting (S)';
         });
 
         // Zoom & Fit
@@ -1131,34 +1212,50 @@ document.addEventListener('DOMContentLoaded', async () => {
             });
         }
 
-        // Alan 6/4/26 - Register context-menu pruning so right-click uses the same backend flow as the toolbar Prune button.
+        // Alan 7/17/26 - Register count-aware context pruning so multiple selected tips use the bulk backend flow.
         if (viewer && typeof viewer.setPruneNodeHandler === 'function') {
-            viewer.setPruneNodeHandler((node) => {
+            // Alan 7/17/26 - Accept the target nodes resolved by the viewer when it built the context-menu label.
+            viewer.setPruneNodeHandler((node, nodes = []) => {
                 if (window.VIEW_ONLY || isProcessing) return;
-                const target = getPruneTargetForNode(node);
-                if (!target) {
+                // Alan 7/17/26 - Fall back to the clicked node for compatibility with viewer implementations that omit targets.
+                const pruneNodes = Array.isArray(nodes) && nodes.length ? nodes : [node];
+                // Alan 7/17/26 - Convert every selected tip or clicked internal node into a backend prune target.
+                const targets = Array.from(new Set(pruneNodes.map(getPruneTargetForNode).filter(Boolean)));
+                // Alan 7/17/26 - Reject the action only when none of the resolved nodes has a stable prune target.
+                if (!targets.length) {
                     showStatus("Can't prune: no stable node ID.", "warning", 2500);
                     return;
                 }
-                // Alan 6/4/26 - Include descendant tips in local color cleanup when pruning an internal node.
-                const cleanupNames = [target, ...getDescendantTipNames(node)];
-                runBackendAction("Pruning node", async () => {
-                    await pruneTaxaPreservingSelectionColors([target], cleanupNames);
+                // Alan 7/17/26 - Include every pruned descendant tip in local selection-color cleanup.
+                const cleanupNames = Array.from(new Set([
+                    // Alan 7/17/26 - Retain backend targets so leaf IDs and internal stable IDs are both cleaned safely.
+                    ...targets,
+                    // Alan 7/17/26 - Flatten descendant tips from every context-menu prune target.
+                    ...pruneNodes.reduce((names, pruneNode) => names.concat(getDescendantTipNames(pruneNode)), [])
+                ]));
+                // Alan 7/17/26 - Report the number of terminal sequences represented by this context action.
+                const sequenceCount = new Set(pruneNodes.reduce((names, pruneNode) => names.concat(getDescendantTipNames(pruneNode)), [])).size;
+                // Alan 7/17/26 - Use the same singular/plural count shown in the menu while the backend mutation runs.
+                runBackendAction(`Pruning ${sequenceCount} node${sequenceCount === 1 ? '' : 's'}`, async () => {
+                    // Alan 7/17/26 - Send all resolved targets so multi-tip context pruning removes the advertised count.
+                    await pruneTaxaPreservingSelectionColors(targets, cleanupNames);
                 }, { clearSelections: false });
             });
         }
 
-        // Alan 6/4/26 - Register context-menu copying for terminal sequence names.
+        // Alan 7/14/26 - Copy one clicked name or multiple selected sequence names as separate clipboard lines.
         if (viewer && typeof viewer.setCopySequenceNameHandler === 'function') {
-            viewer.setCopySequenceNameHandler(async (node) => {
-                const name = getDisplaySequenceName(node);
-                if (!name) {
+            viewer.setCopySequenceNameHandler(async (node, nodes = []) => {
+                const copyNodes = Array.isArray(nodes) && nodes.length ? nodes : [node];
+                const names = copyNodes.map(getDisplaySequenceName).filter(Boolean).map(String);
+                if (!names.length) {
                     showStatus("No sequence name to copy.", "warning", 2000);
                     return;
                 }
                 try {
-                    await copyTextToClipboard(name);
-                    showStatus("Sequence name copied.", "success", 1500);
+                    await copyTextToClipboard(names.join('\r\n'));
+                    const copied = names.length === 1 ? 'Sequence name copied.' : 'Sequence names copied.';
+                    showStatus(copied, "success", 1500);
                 } catch (err) {
                     console.error(err);
                     showStatus("Copy failed.", "danger", 2500);
@@ -1182,6 +1279,49 @@ document.addEventListener('DOMContentLoaded', async () => {
                     console.error(err);
                     showStatus("Copy failed.", "danger", 2500);
                 }
+            });
+        }
+
+        // Alan 7/16/26 - Refresh clicked/highlighted observation records and reload any persisted label changes.
+        if (viewer && typeof viewer.setRefreshMycomapRecordsHandler === 'function') {
+            viewer.setRefreshMycomapRecordsHandler((node, nodes = []) => {
+                if (window.VIEW_ONLY || isProcessing) return;
+                const recordNodes = Array.isArray(nodes) && nodes.length ? nodes : [node];
+                const tipNames = Array.from(new Set(recordNodes.map((recordNode) => {
+                    const data = recordNode?.data || recordNode || {};
+                    return data.__original_name || data.original_name || data.name || recordNode?.name || '';
+                }).filter(Boolean).map(String)));
+                if (!tipNames.length) {
+                    showStatus("No iNaturalist or Mushroom Observer record to refresh.", "warning", 2500);
+                    return;
+                }
+
+                const references = new Set(recordNodes.map((recordNode) => {
+                    const parser = window.phylotree?.extractObservationRecordReference;
+                    return typeof parser === 'function' ? parser(recordNode)?.reference : null;
+                }).filter(Boolean));
+                const recordCount = references.size || tipNames.length;
+                const actionName = recordCount === 1 ? 'Refreshing Mycomap record' : `Refreshing ${recordCount} Mycomap records`;
+                runBackendAction(actionName, async () => {
+                    const result = await TreeEditActions.refreshMycomapRecords(JOB_ID, tipNames);
+                    const refreshedCount = Number(result.refreshed_count) || recordCount;
+                    const updatedCount = Number(result.updated_tip_count) || 0;
+                    const warningCount = Array.isArray(result.warnings) ? result.warnings.length : 0;
+                    const refreshedText = `${refreshedCount} Mycomap record${refreshedCount === 1 ? '' : 's'} refreshed.`;
+                    const updatedText = updatedCount
+                        ? ` ${updatedCount} tree label${updatedCount === 1 ? '' : 's'} updated.`
+                        : ' Tree labels already match the refreshed records.';
+                    const warningText = warningCount
+                        ? ` ${warningCount} label update warning${warningCount === 1 ? '' : 's'}.`
+                        : '';
+                    return {
+                        finalStatus: {
+                            msg: refreshedText + updatedText + warningText,
+                            type: warningCount ? 'warning' : 'success',
+                            timeout: warningCount ? 6000 : 3000
+                        }
+                    };
+                }, { clearSelections: false });
             });
         }
 
@@ -1535,16 +1675,8 @@ document.addEventListener('DOMContentLoaded', async () => {
             });
         });
 
-        // Alan 5/11/26 - Clear the currently visible selection without deleting saved selection-set membership.
-        if (btnDeselect) btnDeselect.addEventListener('click', () => {
-            if (!viewer || typeof viewer.deselectCurrentSelection !== 'function') return;
-            const cleared = viewer.deselectCurrentSelection();
-            updateButtons();
-            if (cleared > 0) {
-                // Alan 5/11/26 - Report deselected sequences using the same visible-selection count shown on the button.
-                showStatus(`Deselected ${cleared} sequence${cleared === 1 ? '' : 's'}.`, "info", 1500);
-            }
-        });
+        // Alan 7/20/26 - Route button clicks through the same reliable deselect action used by the D hotkey.
+        if (btnDeselect) btnDeselect.addEventListener('click', deselectCurrentTreeSelection);
 
         if (btnRecompute) btnRecompute.addEventListener('click', () => {
             if (!confirm("Recompute tree?")) return;
@@ -1583,6 +1715,17 @@ document.addEventListener('DOMContentLoaded', async () => {
 
 
         document.addEventListener('keydown', (e) => {
+            // Alan 7/20/26 - Close keyboard help before handling viewer modes or other Escape behavior.
+            if (e.key === 'Escape' && shortcutHelpModal && !shortcutHelpModal.classList.contains('hidden')) {
+                closeShortcutHelp();
+                return;
+            }
+            // Alan 7/20/26 - Let Escape dismiss the advanced selection menu without changing tree state.
+            if (e.key === 'Escape' && btnSelectionMore?.getAttribute('aria-expanded') === 'true') {
+                setSelectionMoreMenuOpen(false);
+                btnSelectionMore.focus();
+                return;
+            }
             // Alan 5/11/26 - Escape closes the rename modal before handling reroot cancellation.
             if (e.key === "Escape" && renameModal && !renameModal.classList.contains('hidden')) {
                 closeRenameModal();
@@ -1599,7 +1742,39 @@ document.addEventListener('DOMContentLoaded', async () => {
             if (e.key === "Escape" && rerootMode) {
                 rerootMode = false; removeRerootCapture();
                 showStatus("Reroot cancelled.", "info", 1000); updateButtons();
+                return;
             }
+
+            // Alan 7/20/26 - Handle safe viewer hotkeys only outside text controls, dialogs, and modified browser shortcuts.
+            const target = e.target;
+            const isTyping = target instanceof HTMLElement
+                && (target.isContentEditable || ['INPUT', 'TEXTAREA', 'SELECT'].includes(target.tagName));
+            const modalOpen = Boolean(document.querySelector('[role="dialog"][aria-modal="true"]:not(.hidden)'));
+            if (e.repeat || e.ctrlKey || e.metaKey || e.altKey || isTyping || modalOpen) return;
+
+            const key = e.key.length === 1 ? e.key.toLowerCase() : e.key;
+            let handled = false;
+            // Alan 7/20/26 - D clears the visible current selection directly, independent of button disabled-state timing.
+            if (key === 'd' && viewer && !isProcessing) {
+                deselectCurrentTreeSelection();
+                handled = true;
+            // Alan 7/20/26 - V opens the existing Alignment Viewer through its established click handler.
+            } else if (key === 'v' && viewer && btnAlignmentViewer && !btnAlignmentViewer.disabled) {
+                btnAlignmentViewer.click();
+                handled = true;
+            // Alan 7/20/26 - S cycles the existing original, ascending, and descending node sort modes.
+            } else if (key === 's' && viewer) {
+                getEl('btn-ladderize')?.click();
+                handled = true;
+            // Alan 7/20/26 - B toggles the existing Box Select mode and its normal status feedback.
+            } else if (key === 'b' && viewer) {
+                handled = toggleBoxSelectMode();
+            // Alan 7/20/26 - Question mark opens the shortcut reference without requiring a loaded tree.
+            } else if (e.key === '?') {
+                openShortcutHelp();
+                handled = true;
+            }
+            if (handled) e.preventDefault();
         });
 
         // Reroot Capture
@@ -1661,7 +1836,8 @@ document.addEventListener('DOMContentLoaded', async () => {
             if (!btnDeselect) return;
             const disabled = forceDisabled || selCount === 0;
             btnDeselect.disabled = disabled;
-            btnDeselect.title = selCount > 0 ? `Deselect ${selCount} sequence${selCount === 1 ? '' : 's'}` : "No current selection";
+            // Alan 7/20/26 - Advertise the D shortcut in both enabled and empty-selection button states.
+            btnDeselect.title = selCount > 0 ? `Deselect ${selCount} sequence${selCount === 1 ? '' : 's'} (D)` : "No current selection (D)";
             // Alan 5/11/26 - Show the Deselect count directly on the button like Prune does.
             btnDeselect.innerHTML = selCount > 0 ? '<i class="fa fa-mouse-pointer"></i> Deselect (' + selCount + ')' : '<i class="fa fa-mouse-pointer"></i> Deselect';
             btnDeselect.classList.toggle('opacity-50', disabled);
@@ -1772,9 +1948,10 @@ document.addEventListener('DOMContentLoaded', async () => {
         btnAlignmentViewer.disabled = disabled;
         btnAlignmentViewer.classList.toggle('opacity-50', disabled);
         btnAlignmentViewer.classList.toggle('cursor-not-allowed', disabled);
+        // Alan 7/20/26 - Preserve V shortcut discoverability when the count-aware Alignment Viewer tooltip refreshes.
         btnAlignmentViewer.title = selected.length > 0
-            ? `Open Alignment Viewer for ${selected.length} selected sequence${selected.length === 1 ? '' : 's'}`
-            : `Open Alignment Viewer for ${visible.length} visible sequence${visible.length === 1 ? '' : 's'}`;
+            ? `Open Alignment Viewer for ${selected.length} selected sequence${selected.length === 1 ? '' : 's'} (V)`
+            : `Open Alignment Viewer for ${visible.length} visible sequence${visible.length === 1 ? '' : 's'} (V)`;
         btnAlignmentViewer.innerHTML = count > 0
             ? `<i class="fa fa-stream"></i> Alignment Viewer (${count})`
             : '<i class="fa fa-stream"></i> Alignment Viewer';
@@ -1798,7 +1975,8 @@ document.addEventListener('DOMContentLoaded', async () => {
         const sliderConfig = [
             ['slider-query-cover', 'query-cover-value', 'queryCoverThreshold'],
             ['slider-subject-cover', 'subject-cover-value', 'subjectCoverThreshold'],
-            ['slider-identity', 'identity-value', 'identityThreshold']
+            // Alan 7/20/26 - Identity displays its direct maximum while coverage sliders retain their inverted minimum scale.
+            ['slider-identity', 'identity-value', 'identityMaximum', false]
         ];
         const metricsAvailable = Boolean(stats?.metricsAvailable);
         const countBadge = getEl('sequence-filter-count');
@@ -1812,22 +1990,23 @@ document.addEventListener('DOMContentLoaded', async () => {
                 : 'Metrics: none';
         }
 
-        sliderConfig.forEach(([sliderId, valueId, statKey]) => {
+        // Alan 7/20/26 - Let each metric declare whether its renderer threshold is inverted for display.
+        sliderConfig.forEach(([sliderId, valueId, statKey, invert = true]) => {
             const slider = getEl(sliderId);
             const valueEl = getEl(valueId);
             const rawValue = Number(stats?.[statKey]);
             const value = Number.isFinite(rawValue) ? Math.max(0, Math.min(100, Math.round(rawValue))) : 0;
-            // Alan 5/9/26 - Flip only the visible slider label/position so 0% is on the left while leftward dragging still raises the hidden threshold.
-            const displayValue = 100 - value;
+            // Alan 7/20/26 - Display identity directly so 99% immediately removes hits above 99% identity.
+            const displayValue = invert ? 100 - value : value;
             if (slider) {
-                // Alan 5/9/26 - Use the display value for the thumb position; the renderer still receives the inverted threshold.
+                // Alan 7/20/26 - Put the thumb at the computed direct or inverted display percentage.
                 slider.value = String(displayValue);
                 slider.disabled = !metricsAvailable;
                 slider.classList.toggle('opacity-40', !metricsAvailable);
                 slider.classList.toggle('cursor-not-allowed', !metricsAvailable);
             }
             if (valueEl) {
-                // Alan 5/9/26 - Show the visual percentage scale rather than the inverted filtering threshold.
+                // Alan 7/20/26 - Label the same percentage represented by the slider thumb.
                 valueEl.textContent = metricsAvailable ? `${displayValue}%` : '--';
             }
         });
@@ -1835,15 +2014,19 @@ document.addEventListener('DOMContentLoaded', async () => {
 
     // Alan 5/9/26 - Read current metric slider values into renderer filter options.
     function getSequenceFilterSliderOptions() {
-        const readSlider = (id) => {
+        // Alan 7/20/26 - Read either an inverted minimum threshold or a direct maximum cutoff from a slider.
+        const readSlider = (id, invert = true) => {
             const slider = getEl(id);
-            // Alan 5/9/26 - Invert the visual scale so dragging left still increases the filter threshold.
-            return slider && !slider.disabled ? 100 - parseInt(slider.value, 10) : 0;
+            const fallback = invert ? 0 : 100;
+            return slider && !slider.disabled
+                ? (invert ? 100 - parseInt(slider.value, 10) : parseInt(slider.value, 10))
+                : fallback;
         };
         return {
             queryCoverThreshold: readSlider('slider-query-cover'),
             subjectCoverThreshold: readSlider('slider-subject-cover'),
-            identityThreshold: readSlider('slider-identity')
+            // Alan 7/20/26 - Send identity as the maximum percentage that remains visible.
+            identityMaximum: readSlider('slider-identity', false)
         };
     }
 

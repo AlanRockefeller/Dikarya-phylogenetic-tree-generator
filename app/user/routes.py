@@ -100,7 +100,7 @@ def api_tokens_create():
     # exactly once. After that it is unrecoverable.
     session['new_token_secret'] = plaintext
     session['new_token_name'] = name
-    flash('Token created. Copy it now — it will only be shown once.', 'success')
+    flash('Token created. Copy it now because it will only be shown once.', 'success')
     return redirect(url_for('user.api_tokens'))
 
 

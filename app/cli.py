@@ -1,8 +1,8 @@
+from importlib.util import find_spec
+
 import click
 from flask.cli import with_appcontext
 from flask import current_app
-from app.dosage.db import get_csv_directory, get_database_path
-from app.dosage.importer import DosageImportError, rebuild_database
 
 @click.command("run-worker")
 @with_appcontext
@@ -18,6 +18,7 @@ def run_metrics_command():
     """Run the system metrics collector."""
     import time
     from app.monitoring.services import collect_system_metrics
+    from app.services.log_rotation import rotate_runtime_logs
     import json
     
     metrics_file = current_app.config.get("METRICS_FILE", "var/metrics/system_metrics.jsonl")
@@ -25,9 +26,14 @@ def run_metrics_command():
     # Ensure dir
     import os
     os.makedirs(os.path.dirname(metrics_file), exist_ok=True)
-    
+
     print(f"Collecting metrics to {metrics_file}...")
+    next_log_rotation = 0.0
     while True:
+        now = time.monotonic()
+        if now >= next_log_rotation:
+            rotate_runtime_logs(current_app)
+            next_log_rotation = now + 3600
         m = collect_system_metrics()
         with open(metrics_file, "a") as f:
             f.write(json.dumps(m) + "\n")
@@ -60,7 +66,7 @@ def whats_new_list_command():
         click.echo("No entries.")
         return
     for e in entries:
-        click.echo(f"[{e.id}] ({e.category}) {e.published_at.strftime('%Y-%m-%d')} — {e.title}")
+        click.echo(f"[{e.id}] ({e.category}) {e.published_at.strftime('%Y-%m-%d')}: {e.title}")
 
 
 @click.command("dosage-rebuild-db")
@@ -69,6 +75,9 @@ def whats_new_list_command():
 @with_appcontext
 def dosage_rebuild_db_command(csv_dir, db_path):
     """Rebuild the alkaloid estimator SQLite database from CSV files."""
+    from app.dosage.db import get_csv_directory, get_database_path
+    from app.dosage.importer import DosageImportError, rebuild_database
+
     try:
         result = rebuild_database(
             csv_dir or get_csv_directory(),
@@ -81,6 +90,38 @@ def dosage_rebuild_db_command(csv_dir, db_path):
         "Imported {references} references, {species} species rows, "
         "{test_results} test results into {database}".format(**result)
     )
+
+
+@click.command("grant-admin")
+@click.option('--email', required=True, help='Email of the user to promote')
+@click.option('--revoke', is_flag=True, help='Remove admin rights instead of granting them.')
+@with_appcontext
+def grant_admin_command(email, revoke):
+    """Grant (or revoke) admin rights, which gate What's New and TODO editing."""
+    from app.models import User
+    from app.extensions import db
+
+    user = User.query.filter_by(email=email).first()
+    if not user:
+        click.echo(f"No user with email '{email}'.", err=True)
+        raise click.Abort()
+    user.is_admin = not revoke
+    db.session.commit()
+    click.echo(f"{email} is_admin = {user.is_admin}")
+
+
+@click.command("list-admins")
+@with_appcontext
+def list_admins_command():
+    """List accounts that currently have admin rights."""
+    from app.models import User
+
+    admins = User.query.filter_by(is_admin=True).order_by(User.email).all()
+    if not admins:
+        click.echo("No admin accounts. Use 'flask grant-admin --email ...' to create one.")
+        return
+    for user in admins:
+        click.echo(f"{user.id}\t{user.email}")
 
 
 @click.group("api-token")
@@ -172,5 +213,8 @@ def register(app):
     app.cli.add_command(run_metrics_command)
     app.cli.add_command(whats_new_add_command)
     app.cli.add_command(whats_new_list_command)
-    app.cli.add_command(dosage_rebuild_db_command)
+    app.cli.add_command(grant_admin_command)
+    app.cli.add_command(list_admins_command)
+    if find_spec("app.dosage") is not None:
+        app.cli.add_command(dosage_rebuild_db_command)
     app.cli.add_command(api_token_group)

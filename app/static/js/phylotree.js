@@ -1,3 +1,10 @@
+// Alan 7/18/26 - Record the vendored phylotree source, version, license, and local-modification policy.
+/*!
+ * phylotree.js 2.2.1, with Dikarya changes marked by dated inline comments.
+ * Source: https://cdn.jsdelivr.net/npm/phylotree@2.2.1/dist/phylotree.js
+ * License: MIT; see ../vendor/licenses/phylotree-LICENSE.txt and
+ * ../vendor/THIRD_PARTY_NOTICES.md.
+ */
 (function (global, factory) {
   typeof exports === 'object' && typeof module !== 'undefined' ? factory(exports, require('underscore'), require('lodash')) :
   typeof define === 'function' && define.amd ? define(['exports', 'underscore', 'lodash'], factory) :
@@ -10818,7 +10825,8 @@
       node?.name ||
       ""
     );
-    return raw ? raw.replace(/\s+/g, " ").trim() : "";
+    // Alan 7/14/26 - Ignore MAFFT's reverse-direction marker so legacy tree tips still resolve their source records.
+    return raw ? raw.replace(/^_R_/, "").replace(/\s+/g, " ").trim() : "";
   }
 
   // Alan 6/25/26 - Recognize common iNaturalist observation-number formats for links and clipboard copies.
@@ -10836,6 +10844,58 @@
     for (const pattern of patterns) {
       const match = normalized.match(pattern);
       if (match) return match[1];
+    }
+    return null;
+  }
+
+  // Alan 7/16/26 - Resolve refreshable iNaturalist and Mushroom Observer references from tree tip labels.
+  function extractObservationRecordReference(value) {
+    const normalized = typeof value === "string" ? value.replace(/\s+/g, " ").trim() : getRecordLabelText(value);
+    if (!normalized) return null;
+
+    const iNaturalistId = extractINaturalistObservationNumber(normalized);
+    if (iNaturalistId) {
+      return { kind: "inaturalist", id: iNaturalistId, reference: `inat:${iNaturalistId}` };
+    }
+
+    const mushroomObserverPatterns = [
+      /\bmo\s*:\s*([0-9]{1,12})\b/i,
+      /\b(?:https?:\/\/)?(?:www\.)?mushroomobserver\.org\/(?:obs\/)?([0-9]{1,12})\b/i,
+      /\bmushroom\s*observer(?:\s*(?:observation|obs))?\s*[-_#:\s]*([0-9]{1,12})(?:[_-][0-9]+)?\b/i,
+      /\bmo\s*#?\s*([0-9]{5,12})(?:[_-][0-9]+)?\b/i
+    ];
+    for (const pattern of mushroomObserverPatterns) {
+      const match = normalized.match(pattern);
+      if (match) {
+        return { kind: "mushroom-observer", id: match[1], reference: `mo:${match[1]}` };
+      }
+    }
+    return null;
+  }
+
+  // Alan 7/16/26 - Parse GenBank accessions independently so labels can retain both sequence and observation links.
+  function extractGenBankRecordTarget(value) {
+    const normalized = typeof value === "string" ? value : getRecordLabelText(value);
+    if (!normalized) return null;
+
+    const genbankPatterns = [
+      /\b([A-Z]{1,2}_[0-9]{5,8}(?:\.[0-9]+)?)(?:_[0-9]+)?\b/,
+      /\b([A-Z]{1,2}[0-9]{5,8}(?:\.[0-9]+)?)(?:_[0-9]+)?\b/,
+      /\b([A-Z]{3,4}[0-9]{6,9}(?:\.[0-9]+)?)(?:_[0-9]+)?\b/
+    ];
+    for (const pattern of genbankPatterns) {
+      const match = normalized.match(pattern);
+      if (match) {
+        return {
+          kind: "genbank",
+          id: match[1],
+          label: "Open Sequence in GenBank",
+          urls: {
+            genbank: `https://www.ncbi.nlm.nih.gov/nuccore/${match[1]}`,
+            mycomap: `https://mycomap.com/genbank/accession/lookup/${match[1]}`
+          }
+        };
+      }
     }
     return null;
   }
@@ -10899,27 +10959,68 @@
     }
 
     // Alan 5/12/26 - Fall back to a GenBank accession only after checking for local record IDs.
-    const genbankPatterns = [
-      /\b([A-Z]{1,2}_[0-9]{5,8}(?:\.[0-9]+)?)\b/,
-      /\b([A-Z]{1,2}[0-9]{5,8}(?:\.[0-9]+)?)\b/,
-      /\b([A-Z]{3,4}[0-9]{6,9}(?:\.[0-9]+)?)\b/
-    ];
-    for (const pattern of genbankPatterns) {
-      const match = normalized.match(pattern);
-      if (match) {
-        return {
-          kind: "genbank",
-          id: match[1],
-          label: "Open Sequence in GenBank",
-          urls: {
-            genbank: `https://www.ncbi.nlm.nih.gov/nuccore/${match[1]}`,
-            mycomap: `https://mycomap.com/genbank/accession/lookup/${match[1]}`
-          }
-        };
-      }
+    // Alan 7/12/26 - Tolerate a trailing "_N" dedup suffix (appended by dedupe_and_uniquify_fasta for
+    // repeated accessions) without capturing it, since "_" is a \w char and blocked the trailing \b.
+    // Alan 7/16/26 - Reuse the standalone accession parser when no observation or occurrence record matched.
+    return extractGenBankRecordTarget(normalized);
+  }
+
+  // Alan 7/16/26 - Keep a tip's GenBank/MycoMap actions when its label also contains an observation record.
+  function extractRecordTargets(node) {
+    const primaryTarget = extractRecordTarget(node);
+    if (!primaryTarget) return [];
+    if (primaryTarget.kind === "genbank") return [primaryTarget];
+
+    const genbankTarget = extractGenBankRecordTarget(node);
+    // Alan 8/1/26 - MO observation IDs overlap the two-letter GenBank accession
+    // format. Do not offer GenBank/MycoMap accession links when both parsers
+    // resolved the same MO-prefixed token; retain both links when a label has a
+    // genuinely separate GenBank accession and Mushroom Observer observation.
+    if (
+      primaryTarget.kind === "mushroom-observer" &&
+      genbankTarget &&
+      genbankTarget.id.toUpperCase() === `MO${primaryTarget.id}`.toUpperCase()
+    ) {
+      return [primaryTarget];
+    }
+    return genbankTarget ? [primaryTarget, genbankTarget] : [primaryTarget];
+  }
+
+  // Alan 7/16/26 - Preserve clicked-tip sequence links while retaining bulk actions for selected observations.
+  function getContextRecordTargets(node, selectedNodes) {
+    const clickedTargets = extractRecordTargets(node);
+    const observationKinds = new Set(["inaturalist", "mushroom-observer"]);
+    const seen = new Set();
+    const selectedObservationTargets = (Array.isArray(selectedNodes) ? selectedNodes : [])
+      .filter(isLeafNode)
+      .flatMap(extractRecordTargets)
+      .filter(target => target && observationKinds.has(target.kind))
+      .filter(target => {
+        const key = `${target.kind}:${target.id}`;
+        if (seen.has(key)) return false;
+        seen.add(key);
+        return true;
+      });
+
+    if (selectedObservationTargets.length < 2) return clickedTargets;
+
+    const selectedKinds = new Set(selectedObservationTargets.map(target => target.kind));
+    let label = "Open Multiple Observations";
+    if (selectedKinds.size === 1) {
+      label = selectedKinds.has("inaturalist")
+        ? "Open multiple observations in iNaturalist"
+        : "Open multiple observations in Mushroom Observer";
     }
 
-    return null;
+    return [{
+        kind: "multiple-observations",
+        label,
+        urls: {
+          primary: selectedObservationTargets.map(target => target.urls.primary)
+        }
+      },
+      ...clickedTargets.filter(target => !observationKinds.has(target.kind))
+    ];
   }
 
   // Alan 5/13/26 - Keep source-record actions reusable so they can render before tree editing actions.
@@ -10953,7 +11054,9 @@
       .text(recordTarget.label)
       .on("click", () => {
         menu_object.style("display", "none");
-        window.open(recordTarget.urls.primary, "_blank", "noopener,noreferrer");
+        // Alan 7/14/26 - Open every selected observation URL synchronously from the menu click so each gets a new tab.
+        const primaryUrls = Array.isArray(recordTarget.urls.primary) ? recordTarget.urls.primary : [recordTarget.urls.primary];
+        primaryUrls.forEach(url => window.open(url, "_blank", "noopener,noreferrer"));
       });
   }
 
@@ -10984,10 +11087,15 @@
         !options["show-menu"]
       )
         return;
-      const recordTarget = isLeafNode(node) ? extractRecordTarget(node) : null;
-      // Alan 5/13/26 - Put external source-record links at the top of sequence context menus.
-      if (recordTarget) {
-        appendRecordTargetMenu(menu_object, recordTarget);
+      // Alan 7/14/26 - Let the viewer supply its visible selected tips for a bulk observation-record action.
+      const selectedRecordNodes = typeof this.recordTargetNodesProvider === "function"
+        ? this.recordTargetNodesProvider(node)
+        : [];
+      // Alan 7/16/26 - Render every source represented in a tip label instead of stopping at the first match.
+      const recordTargets = isLeafNode(node) ? getContextRecordTargets(node, selectedRecordNodes) : [];
+      // Alan 7/16/26 - Put all external source-record links at the top of sequence context menus.
+      if (recordTargets.length) {
+        recordTargets.forEach(recordTarget => appendRecordTargetMenu(menu_object, recordTarget));
         menu_object.append("div").attr("class", "phylotree-menu-divider dropdown-divider");
       }
 
@@ -14747,6 +14855,8 @@
   exports.extract_dates = extract_dates;
   // Alan 6/25/26 - Export iNaturalist observation parsing so viewer menu actions can copy matching IDs.
   exports.extractINaturalistObservationNumber = extractINaturalistObservationNumber;
+  // Alan 7/16/26 - Export cross-platform observation parsing for Mycomap record refresh actions.
+  exports.extractObservationRecordReference = extractObservationRecordReference;
   exports.fitRootToTip = fitRootToTip;
   exports.getDistanceMatrix = getDistanceMatrix;
   exports.getNewick = getNewick;

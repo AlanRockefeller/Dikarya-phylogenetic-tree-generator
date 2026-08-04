@@ -17,7 +17,10 @@ import os
 import sys
 import tempfile
 import unittest
+from io import StringIO
 from pathlib import Path
+
+from Bio import Phylo
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
@@ -25,6 +28,7 @@ from app.services.tree_edit_service import (  # noqa: E402
     HAS_BIOPYTHON,
     _reapply_rooting_after_recompute,
     _stable_internal_node_id_from_names,
+    ladderize_tree,
     prune_taxa,
     reroot_tree,
     rotate_node,
@@ -76,6 +80,19 @@ def _json_tip_names(node):
             out.extend(_json_tip_names(child))
         return out
     return [node.get("original_name") or node.get("name")]
+
+
+@unittest.skipUnless(HAS_BIOPYTHON, "requires BioPython")
+class TestFocalAwareLadderization(unittest.TestCase):
+    def test_focal_tip_is_first_while_other_clades_remain_ladderized(self):
+        tree = Phylo.read(StringIO("((A:1,B:1):1,(C:1,(D:1,E:1):1):1)R:0;"), "newick")
+
+        ladderize_tree(tree, focal_tip="A")
+
+        self.assertEqual(
+            [tip.name for tip in tree.get_terminals()],
+            ["A", "B", "E", "D", "C"],
+        )
 
 
 class TestSetSequenceOfInterestDoesNotTouchDefault(unittest.TestCase):

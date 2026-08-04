@@ -141,7 +141,7 @@ def create_app(config_name='default'):
     cli.register(app)
 
     # Security headers. CSP is intentionally NOT set here because templates
-    # use inline scripts that would need nonces — that's a bigger task. The
+    # use inline scripts that would need nonces, which is a bigger task. The
     # four below are free wins:
     #   X-Content-Type-Options: stops MIME-sniffing-based XSS
     #   X-Frame-Options       : blocks clickjacking via iframes

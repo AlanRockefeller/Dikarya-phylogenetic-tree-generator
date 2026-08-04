@@ -9,8 +9,8 @@ nobody:nogroup) because `create_app()` rejects boot without SECRET_KEY.
 This script loads DATABASE_URL from a tree-user-accessible location and
 stubs a CLI-only SECRET_KEY so the validator passes. It never starts a
 web server, never serves requests, and the stub key is not used to sign
-anything — it just lets create_app() succeed for the duration of the
-DB write.
+anything. It only lets create_app() succeed for the duration of the DB
+write.
 
 Env resolution order (first hit wins):
   1. Existing process environment.
@@ -86,8 +86,8 @@ def _load_env() -> None:
 def _ensure_secret_key() -> None:
     """Provide a one-shot SECRET_KEY so create_app() validates.
 
-    The value is never persisted and never used to sign anything user-facing —
-    we only open an app context to write one row and exit.
+    The value is never persisted or used to sign anything user-facing. We only
+    open an app context to write one row and exit.
     """
     if not os.environ.get("SECRET_KEY") or os.environ["SECRET_KEY"] == "dev-key-please-change":
         os.environ["SECRET_KEY"] = "cli-stub-" + secrets.token_urlsafe(32)
@@ -137,7 +137,7 @@ def cmd_list(args: argparse.Namespace) -> int:
             print("No entries.")
             return 0
         for e in entries:
-            print(f"[{e.id}] ({e.category}) {e.published_at.strftime('%Y-%m-%d')} — {e.title}")
+            print(f"[{e.id}] ({e.category}) {e.published_at.strftime('%Y-%m-%d')}: {e.title}")
     return 0
 
 

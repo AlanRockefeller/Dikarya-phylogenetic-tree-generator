@@ -628,11 +628,22 @@
                                 FASTA</a>
                             <a id="dl-aligned" href="/api/job/{{ job_id }}/download/fasta/aligned" download
                                 class="block px-4 py-2 text-sm text-gray-700 dark:text-gray-300 hover:bg-gray-100 dark:hover:bg-gray-700">Aligned
-                                FASTA</a>
+                                FASTA (Before Trimming)</a>
                             <a id="dl-trimmed" href="/api/job/{{ job_id }}/download/fasta/trimmed" download
                                 style="display: none;"
                                 class="block px-4 py-2 text-sm text-gray-700 dark:text-gray-300 hover:bg-gray-100 dark:hover:bg-gray-700">Trimmed
-                                FASTA</a>
+                                FASTA (Tree Input)</a>
+                            <a id="dl-alignment-inspection" href="/api/job/{{ job_id }}/download/alignment/inspection" download
+                                style="display: none;"
+                                class="block px-4 py-2 text-sm text-gray-700 dark:text-gray-300 hover:bg-gray-100 dark:hover:bg-gray-700">Trimming
+                                Inspection ZIP</a>
+                            <div id="dl-mrbayes-heading" style="display: none;"
+                                class="px-4 py-2 bg-gray-50 dark:bg-gray-900 text-xs font-bold uppercase text-gray-500 border-t border-b dark:border-gray-700">
+                                Bayesian Analysis</div>
+                            <a id="dl-mrbayes" href="/api/job/{{ job_id }}/download/mrbayes" download
+                                style="display: none;"
+                                class="block px-4 py-2 text-sm text-gray-700 dark:text-gray-300 hover:bg-gray-100 dark:hover:bg-gray-700">MrBayes
+                                Analysis Files</a>
                         </div>
                     </div>
                 </div>
@@ -665,5 +676,5 @@
 {% endblock %}
 
 {% block scripts %}
-<script src="{{ url_for('static', filename='js/job_status.js') }}?v=11"></script>
+<script src="{{ url_for('static', filename='js/job_status.js') }}?v=13"></script>
 {% endblock %}

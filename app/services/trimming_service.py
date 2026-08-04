@@ -62,6 +62,7 @@ def run_trimming(
     }
     
     terminal_tmp: Optional[Path] = None
+    report_path: Optional[Path] = None
     try:
         if method == "none" or not method:
             if trim_terminal_overhangs:
@@ -82,10 +83,14 @@ def run_trimming(
             )
             tool_input = terminal_tmp
 
+        report_path = output_alignment.with_name(f"{output_alignment.stem}_report.html")
+        if report_path.exists():
+            report_path.unlink()
+
         if method == "trimal":
-            _run_trimal(tool_input, output_alignment, config, logger, job_id)
+            _run_trimal(tool_input, output_alignment, report_path, config, logger, job_id)
         elif method == "bmge":
-            _run_bmge(tool_input, output_alignment, config, logger, job_id)
+            _run_bmge(tool_input, output_alignment, report_path, config, logger, job_id)
         else:
             # Fallback to none if unknown, or raise?
             # Let's raise to be strict.
@@ -95,6 +100,16 @@ def run_trimming(
              raise RuntimeError(f"Trimming failed: Output file {output_alignment} is missing or empty.")
 
         _restore_trimmed_fasta_headers(tool_input, output_alignment, logger)
+        if report_path.exists() and report_path.stat().st_size:
+            stats["report_file"] = report_path.name
+            stats["report_format"] = "html"
+            stats["report_input_stage"] = (
+                "after_terminal_overhang_trimming"
+                if trim_terminal_overhangs
+                else "unaltered_alignment"
+            )
+        else:
+            logger.warning("Trimming report was not produced: %s", report_path)
         logger.info(f"Trimming completed successfully. Output: {output_alignment}")
         return stats
 
@@ -365,6 +380,7 @@ def _restore_trimmed_fasta_headers(
 def _run_trimal(
     input_alignment: Path,
     output_alignment: Path,
+    report_path: Path,
     config: Config,
     logger,
     job_id: Optional[str] = None
@@ -374,6 +390,7 @@ def _run_trimal(
         config.TRIMAL_BINARY,
         "-in", str(input_alignment),
         "-out", str(output_alignment),
+        "-htmlout", str(report_path),
         "-automated1"
     ]
     
@@ -403,6 +420,7 @@ def _run_trimal(
 def _run_bmge(
     input_alignment: Path,
     output_alignment: Path,
+    report_path: Path,
     config: Config,
     logger,
     job_id: Optional[str] = None
@@ -423,7 +441,8 @@ def _run_bmge(
     cmd.extend([
         "-i", str(input_alignment),
         "-t", "DNA",
-        "-of", str(output_alignment)
+        "-of", str(output_alignment),
+        "-oh", str(report_path),
     ])
     
     log_file = output_alignment.parent.parent / "logs" / "alignment.log"

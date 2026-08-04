@@ -69,6 +69,23 @@ const TreeEditActions = {
         return data;
     },
 
+    // Alan 7/16/26 - Refresh selected observation-backed Mycomap records and persist changed tip labels.
+    async refreshMycomapRecords(jobId, tipNames) {
+        const response = await fetch(`/api/job/${jobId}/tree/refresh-mycomap-records`, {
+            method: 'POST',
+            headers: this._buildHeaders(),
+            credentials: "same-origin",
+            body: JSON.stringify({ tip_names: tipNames })
+        });
+        const data = await response.json().catch(() => ({}));
+        if (!response.ok) {
+            const err = new Error(data.error || data.message || `Failed to refresh Mycomap records: ${response.status}`);
+            err.details = data;
+            throw err;
+        }
+        return data;
+    },
+
     // Alan 5/29/26 - Persist a display-only child-order rotation for one stable internal node.
     async rotateNode(jobId, nodeId) {
         const response = await fetch(`/api/job/${jobId}/tree/rotate`, {

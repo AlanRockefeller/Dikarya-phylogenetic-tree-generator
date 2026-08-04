@@ -132,11 +132,17 @@ class JobStatusClient {
         this.updateStatusBadge(job.status);
 
         // Start elapsed timer
-        if (job.started_at) {
-            this.startTime = new Date(job.started_at);
-            if (job.status === 'running') {
+        // Alan 7/18/26 - Count elapsed time from enqueue so queue wait no longer displays as "--".
+        const elapsedStartedAt = job.enqueued_at || job.started_at;
+        // Alan 7/18/26 - Start the live counter for both queued and running jobs when the timestamp is valid.
+        if (elapsedStartedAt) {
+            // Alan 7/18/26 - Store the queue timestamp used by the one-second elapsed-time updater.
+            this.startTime = new Date(elapsedStartedAt);
+            // Alan 7/18/26 - Keep counting while a job waits for a worker as well as while its pipeline runs.
+            if (job.status === 'queued' || job.status === 'running') {
                 this.startElapsedTimer();
-            } else if (job.elapsed_seconds) {
+            // Alan 7/18/26 - Render a server-calculated terminal duration even when it is zero seconds.
+            } else if (job.elapsed_seconds !== null && job.elapsed_seconds !== undefined) {
                 this.elements.elapsedTime.textContent = this.formatDuration(job.elapsed_seconds);
             }
         }
@@ -174,6 +180,14 @@ class JobStatusClient {
         // 1. Clear default "Waiting..." message
         this.elements.overviewFeed.innerHTML = '';
 
+        // Alan 7/10/26 - Restore MycoMap refresh fallback warnings when a user opens or reloads the status page.
+        const mycomapRefreshWarnings = Array.isArray(job.meta?.mycomap_refresh_warnings)
+            ? job.meta.mycomap_refresh_warnings
+            : [];
+        mycomapRefreshWarnings.forEach(message => {
+            this.appendOverview({ message, icon: 'failed' });
+        });
+
         // 2. Add "Job started" if applicable
         if (job.started_at) {
             this.appendOverview({ message: 'Job started', icon: 'running' });
@@ -198,6 +212,16 @@ class JobStatusClient {
                 this.appendOverview({ message: `${step.label || stepKey} failed`, icon: 'failed' }); // using 'failed' icon class
             }
         });
+
+        // Alan 7/18/26 - Explain the otherwise silent wait before a queued Mushroom Observer job starts.
+        if (job.status === 'queued' && this.elements.overviewFeed.children.length === 0) {
+            // Alan 7/18/26 - Identify the high-priority Mushroom Observer lane without claiming the current task can be preempted.
+            const waitingMessage = job.meta?.source === 'mushroom_observer_single_tree'
+                ? 'Mushroom Observer tree queued in the high-priority lane; waiting for the worker to finish its current task.'
+                : 'Job queued; waiting for a worker to start it.';
+            // Alan 7/18/26 - Keep the queue state visible until normal worker overview events arrive.
+            this.appendOverview({ message: waitingMessage, icon: 'running' });
+        }
 
         // 4. Handle terminal states
         if (job.status === 'completed') {
@@ -492,6 +516,29 @@ class JobStatusClient {
             btn.setAttribute('aria-disabled', 'false');
             btn.href = resultFiles.tree_newick?.replace('/api/job', '/job').replace('/download/tree/newick', '/view')
                 || `/job/${this.jobId}/view`;
+        }
+
+        // Alan 7/15/26 - Offer raw MrBayes command and trace files only when this completed job produced them.
+        const mrbayesLink = document.getElementById('dl-mrbayes');
+        // Alan 7/15/26 - Keep the matching dropdown heading synchronized with the conditional analysis download.
+        const mrbayesHeading = document.getElementById('dl-mrbayes-heading');
+        // Alan 7/15/26 - Use the completion payload to avoid showing a dead MrBayes link for other tree methods.
+        if (mrbayesLink && mrbayesHeading && resultFiles?.mrbayes) {
+            // Alan 7/15/26 - Point the visible link at the access-controlled archive endpoint supplied by the server.
+            mrbayesLink.href = resultFiles.mrbayes;
+            // Alan 7/15/26 - Reveal both Bayesian download elements together after successful completion.
+            mrbayesLink.style.display = '';
+            mrbayesHeading.style.display = '';
+        }
+
+        // Alan 7/15/26 - Find the optional bundle that pairs before/after FASTA files with the trimmer's marked report.
+        const alignmentInspectionLink = document.getElementById('dl-alignment-inspection');
+        // Alan 7/15/26 - Show the inspection download only when this completed job actually produced a trimming report.
+        if (alignmentInspectionLink && resultFiles?.alignment_inspection) {
+            // Alan 7/15/26 - Use the access-controlled archive URL supplied by the completion payload.
+            alignmentInspectionLink.href = resultFiles.alignment_inspection;
+            // Alan 7/15/26 - Reveal the inspection bundle alongside the aligned and trimmed FASTA downloads.
+            alignmentInspectionLink.style.display = '';
         }
 
         // Add success to overview

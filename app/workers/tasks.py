@@ -10,16 +10,16 @@ import json
 import logging
 import time
 import traceback
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
-from rq import get_current_job
+from rq import Retry, get_current_job
 
 from app.config import Config
 from app.workers.events import (
     STEP_INPUT, STEP_ORIENT, STEP_BLAST, STEP_ALIGN, STEP_TRIM, STEP_TREE, STEP_POST,
     STATE_QUEUED, STATE_RUNNING, STATE_DONE, STATE_SKIPPED, STATE_FAILED,
     get_initial_steps_meta,
-    publish_job_running, publish_job_completed, publish_job_failed,
+    publish_job_running, publish_job_queued, publish_job_completed, publish_job_failed,
     publish_step_start, publish_step_done, publish_step_failed,
     publish_overview, publish_log, publish_metric,
     update_job_meta, update_step_meta,
@@ -28,6 +28,8 @@ from app.workers.events import (
 # Configure logging for the worker
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+VALID_DNA_SYMBOLS = frozenset("ACGTURYSWKMBDHVN-?")
 
 
 def _save_job_params(input_info_path, job_params: dict) -> None:
@@ -68,6 +70,47 @@ def parse_fasta_records(fasta_text: str) -> list[tuple[str, str]]:
         records.append((header, seq))
 
     return records
+
+
+def validate_dna_fasta(fasta_text: str) -> int:
+    """Validate FASTA structure and DNA symbols, returning the record count."""
+    records = parse_fasta_records(fasta_text)
+    if not records:
+        raise ValueError(
+            "No FASTA records were found. Start each record with a header line "
+            "beginning with '>', followed by its DNA sequence on the next line."
+        )
+
+    for index, (header, sequence) in enumerate(records, start=1):
+        record_name = header or f"record {index}"
+        if not header:
+            raise ValueError(
+                f"FASTA record {index} has an empty header. Add a name after '>', "
+                "for example '>sample_1', then retry."
+            )
+        if not sequence:
+            raise ValueError(
+                f"FASTA record '{record_name[:100]}' has no DNA sequence. Add the "
+                "nucleotide sequence on the line after its header, then retry."
+            )
+
+        invalid_symbols = sorted({
+            symbol
+            for symbol in sequence.upper()
+            if symbol not in VALID_DNA_SYMBOLS
+        })
+        if invalid_symbols:
+            shown_symbols = ", ".join(repr(symbol) for symbol in invalid_symbols[:10])
+            if len(invalid_symbols) > 10:
+                shown_symbols += ", ..."
+            raise ValueError(
+                f"FASTA record '{record_name[:100]}' contains invalid DNA "
+                f"symbol(s): {shown_symbols}. Remove labels, punctuation, and "
+                "other non-sequence text from sequence lines. Valid symbols are "
+                "A, C, G, T/U, IUPAC ambiguity codes, '-' and '?'."
+            )
+
+    return len(records)
 
 
 def dedupe_and_uniquify_fasta(fasta_text: str) -> tuple[str, dict]:
@@ -257,6 +300,10 @@ def run_recompute_job(job_id: str, params_dict: dict) -> dict:
                 "tree_newick": f"/api/job/{job_id}/download/tree/newick",
                 "tree_nexus": f"/api/job/{job_id}/download/tree/nexus",
                 "fasta_original": f"/api/job/{job_id}/download/fasta/original",
+                **({"mrbayes": f"/api/job/{job_id}/download/mrbayes"}
+                   if (job_dir / "tree" / "mrbayes_input.nex").is_file() else {}),
+                **({"alignment_inspection": f"/api/job/{job_id}/download/alignment/inspection"}
+                   if (job_dir / "alignment" / "alignment_trimmed_report.html").is_file() else {}),
             }
         )
         publish_overview(job_id, "Recompute complete! Redirecting to tree viewer...")
@@ -323,6 +370,76 @@ def run_recompute_job(job_id: str, params_dict: dict) -> dict:
             pass
 
 
+def run_mycomap_blast_refresh_job(params: dict) -> dict:
+    """
+    Refresh a MycoMap BLAST result (local always, NCBI optionally) and gather
+    its sequences for the browser's sequence queue.
+
+    Local reruns complete synchronously. When an NCBI rebuild is requested,
+    this task queues it at MycoMap, then returns ``Retry`` so RQ resumes the
+    job after a wait instead of blocking a worker slot for ~10 minutes.
+    """
+    from app.services.mycomap_service import (
+        MycoMapRerunError,
+        get_mycomap_ncbi_rerun_wait_seconds,
+        rerun_mycomap_blast,
+        validate_mycomap_rerun_limit,
+        validate_mycomap_url,
+    )
+
+    job = get_current_job()
+    url = params.get("url", "")
+    blast_id = validate_mycomap_url(url)
+    if not blast_id:
+        return {"status": "error", "error": "Invalid Mycomap URL."}
+
+    resuming = bool(job and job.meta.get("mycomap_refresh_stage") == "waiting_for_ncbi")
+    warnings = list((job.meta.get("mycomap_refresh_warnings") or [])) if (job and resuming) else []
+
+    if not resuming:
+        local_limit, local_error = validate_mycomap_rerun_limit(params.get("local_limit"), "local")
+        if local_error:
+            return {"status": "error", "error": local_error}
+        try:
+            rerun_mycomap_blast(blast_id, result_type="local", limit=local_limit)
+        except MycoMapRerunError as exc:
+            warning = f"MycoMap local BLAST could not be refreshed; using saved results instead. {exc}"
+            logger.warning("%s blast_id=%s", warning, blast_id)
+            warnings.append(warning)
+
+        if params.get("rebuild_ncbi"):
+            ncbi_limit, ncbi_error = validate_mycomap_rerun_limit(params.get("ncbi_limit"), "ncbi")
+            if ncbi_error:
+                return {"status": "error", "error": ncbi_error}
+            try:
+                rerun_mycomap_blast(blast_id, result_type="ncbi", limit=ncbi_limit)
+                wait_seconds = get_mycomap_ncbi_rerun_wait_seconds()
+                if job:
+                    job.meta["mycomap_refresh_stage"] = "waiting_for_ncbi"
+                    job.meta["mycomap_refresh_warnings"] = warnings
+                    job.save_meta()
+                return Retry(max=1, interval=wait_seconds)
+            except MycoMapRerunError as exc:
+                warning = f"MycoMap NCBI BLAST could not be rebuilt; using saved results instead. {exc}"
+                logger.warning("%s blast_id=%s", warning, blast_id)
+                warnings.append(warning)
+
+    from app.api.routes import gather_mycomap_sequences_for_queue
+
+    payload, err = gather_mycomap_sequences_for_queue(
+        url,
+        include_ncbi=bool(params.get("include_ncbi", True)),
+        include_local=bool(params.get("include_local", True)),
+    )
+    if err is not None:
+        body, _status = err
+        return {"status": "error", "error": body.get("error", "MycoMap BLAST refresh failed.")}
+
+    if warnings:
+        payload["warnings"] = warnings
+    return payload
+
+
 def run_phylo_job(job_params: dict) -> dict:
     """
     Main phylogenetic analysis job.
@@ -343,6 +460,26 @@ def run_phylo_job(job_params: dict) -> dict:
 
     from app.services.security_utils import coerce_bool
     job_params = dict(job_params or {})
+    inat_preparation = job_params.get("_inat_tree_preparation")
+    mo_preparation = job_params.get("_mo_tree_preparation")
+    if isinstance(inat_preparation, dict):
+        tree_preparation = inat_preparation
+        tree_preparation_kind = "inat"
+    elif isinstance(mo_preparation, dict):
+        tree_preparation = mo_preparation
+        tree_preparation_kind = "mo"
+    else:
+        tree_preparation = None
+        tree_preparation_kind = None
+    tree_preparation_pending = isinstance(tree_preparation, dict)
+    tree_preparation_meta_key = (
+        f"{tree_preparation_kind}_tree_preparation" if tree_preparation_kind else None
+    )
+    tree_resuming_after_ncbi = bool(
+        job
+        and tree_preparation_meta_key
+        and job.meta.get(tree_preparation_meta_key) == "waiting_for_ncbi"
+    )
     job_params["trim_terminal_overhangs"] = coerce_bool(
         job_params.get("trim_terminal_overhangs"), True
     )[0]
@@ -428,12 +565,193 @@ def run_phylo_job(job_params: dict) -> dict:
                 if not should_trim:
                     job.meta["steps"][STEP_TRIM]["state"] = STATE_SKIPPED
                     job.meta["steps"][STEP_TRIM]["label"] = "Trimming (skipped)"
+
+                if tree_preparation_pending:
+                    job.meta["steps"][STEP_INPUT]["label"] = "MycoMap Input Preparation"
+                    job.meta[tree_preparation_meta_key] = "running"
                 
                 job.save_meta()
             
             # Publish job running
             publish_job_running(job_id)
             publish_overview(job_id, "Starting pipeline...")
+
+            if tree_preparation_pending:
+                current_step = STEP_INPUT
+                current_step_label = "MycoMap Input Preparation"
+                current_tool = None
+                if job:
+                    job.meta["current_step"] = current_step
+                    job.save_meta()
+                publish_step_start(
+                    job_id,
+                    STEP_INPUT,
+                    current_step_label,
+                    "Checking source data and collecting MycoMap results",
+                )
+                update_step_meta(job, STEP_INPUT, {
+                    "state": STATE_RUNNING,
+                    "label": current_step_label,
+                })
+                publish_overview(
+                    job_id,
+                    "Checking the source observation for ITS data and MycoMap BLAST results...",
+                )
+
+                if tree_preparation_kind == "mo":
+                    from app.services.mushroom_observer_service import prepare_tree_job
+
+                    prepared = prepare_tree_job(
+                        tree_preparation,
+                        defer_after_ncbi_rerun=not tree_resuming_after_ncbi,
+                        skip_mycomap_refresh=tree_resuming_after_ncbi,
+                        mycomap_rerun_details=(
+                            job.meta.get("mycomap_rerun_details") if job else None
+                        ),
+                    )
+                else:
+                    from app.services.inaturalist_tree_service import prepare_inat_tree_job
+
+                    prepared = prepare_inat_tree_job(
+                        int(tree_preparation["observation_id"]),
+                        include_ncbi=bool(tree_preparation.get("include_ncbi", True)),
+                        include_local=bool(tree_preparation.get("include_local", True)),
+                        rebuild_ncbi_blast=bool(tree_preparation.get("rebuild_ncbi_blast")),
+                        recreate_existing_tree=bool(
+                            tree_preparation.get("recreate_existing_tree")
+                        ),
+                        mycomap_local_limit=tree_preparation.get("mycomap_local_limit"),
+                        mycomap_ncbi_limit=tree_preparation.get("mycomap_ncbi_limit"),
+                        defer_after_ncbi_rerun=not tree_resuming_after_ncbi,
+                        skip_mycomap_refresh=tree_resuming_after_ncbi,
+                        mycomap_rerun_details=(
+                            job.meta.get("mycomap_rerun_details") if job else None
+                        ),
+                    )
+                if prepared.get("status") == "waiting_for_ncbi":
+                    from app.services.mycomap_service import (
+                        get_mycomap_ncbi_poll_interval_seconds,
+                        get_mycomap_ncbi_poll_max_attempts,
+                        get_mycomap_ncbi_rerun_wait_seconds,
+                    )
+
+                    rerun_details = prepared.get("mycomap_rerun_details") or {}
+                    auto_created = bool(rerun_details.get("auto_created"))
+                    wait_seconds = (
+                        get_mycomap_ncbi_poll_interval_seconds()
+                        if auto_created else get_mycomap_ncbi_rerun_wait_seconds()
+                    )
+                    max_retry_attempts = (
+                        get_mycomap_ncbi_poll_max_attempts() if auto_created else 1
+                    )
+                    resume_at = datetime.now(timezone.utc) + timedelta(seconds=wait_seconds)
+                    refresh_warnings = list(rerun_details.get("warnings") or [])
+                    if auto_created:
+                        poll_attempt = int(rerun_details.get("ncbi_poll_attempt") or 0)
+                        queue_position = rerun_details.get("ncbi_queue_position")
+                        queue_suffix = (
+                            f" MycoMap reports this search is at position "
+                            f"{queue_position} in its NCBI BLAST queue."
+                            if queue_position is not None else ""
+                        )
+                        if rerun_details.get("creation_pending"):
+                            waiting_message = (
+                                "MycoMap accepted the BLAST request and is publishing "
+                                "its result page. Dikarya will locate the URL and "
+                                "continue in one minute."
+                            )
+                        else:
+                            if tree_preparation_kind == "mo":
+                                waiting_message = (
+                                    "MycoMap BLAST was created from the selected Mushroom "
+                                    "Observer ITS sequence. NCBI results are not ready yet; "
+                                    f"check {poll_attempt + 1} will run in one minute."
+                                    f"{queue_suffix}"
+                                )
+                            else:
+                                waiting_message = (
+                                    "MycoMap BLAST was created from the observation's DNA "
+                                    "Barcode ITS and its URL was added to iNaturalist. "
+                                    f"NCBI results are not ready yet; check {poll_attempt + 1} "
+                                    f"will run in one minute.{queue_suffix}"
+                                )
+                    else:
+                        waiting_message = (
+                            "MycoMap NCBI BLAST was queued. This tree will resume "
+                            f"in about {max(1, round(wait_seconds / 60))} minute"
+                            f"{'s' if max(1, round(wait_seconds / 60)) != 1 else ''}; "
+                            "other tree jobs can run while it waits."
+                        )
+
+                    db_job = Job.query.get(job_id)
+                    if db_job:
+                        metrics = dict(db_job.metrics or {})
+                        metrics.update({
+                            "notes": prepared.get("notes") or metrics.get("notes"),
+                            "mycomap_blast_url": prepared.get("mycomap_blast_url"),
+                            "mycomap_blast_rerun": rerun_details,
+                            "mycomap_local_blast_rebuilt": (
+                                rerun_details.get("local_status") == "completed"
+                            ),
+                            "mycomap_ncbi_blast_rebuilt": False,
+                            "mycomap_blast_auto_created": auto_created,
+                            "mycomap_preparation_status": "waiting_for_ncbi",
+                            "mycomap_ncbi_resume_at": resume_at.isoformat(),
+                        })
+                        if tree_preparation_kind == "inat":
+                            metrics["inat_genus"] = prepared.get("inat_genus") or ""
+                        if refresh_warnings:
+                            metrics["mycomap_refresh_warnings"] = refresh_warnings
+                        db_job.metrics = metrics
+                        db_job.status = "queued"
+                        db.session.commit()
+
+                    if job:
+                        job.meta[tree_preparation_meta_key] = "waiting_for_ncbi"
+                        job.meta["mycomap_rerun_details"] = rerun_details
+                        job.meta["mycomap_ncbi_resume_at"] = resume_at.isoformat()
+                        if refresh_warnings:
+                            job.meta["mycomap_refresh_warnings"] = refresh_warnings
+                        job.meta["steps"][STEP_INPUT].update({
+                            "state": STATE_QUEUED,
+                            "label": "Waiting for MycoMap NCBI Results",
+                            "detail": waiting_message,
+                        })
+                        job.meta["current_step"] = STEP_INPUT
+                        job.save_meta()
+
+                    for warning in refresh_warnings:
+                        publish_overview(job_id, warning)
+                    publish_overview(job_id, waiting_message)
+                    publish_job_queued(job_id)
+                    return Retry(max=max_retry_attempts, interval=wait_seconds)
+
+                job_params = prepared["job_params"]
+                _save_job_params(input_info_path, job_params)
+
+                db_job = Job.query.get(job_id)
+                if db_job:
+                    metrics = dict(db_job.metrics or {})
+                    metrics.update(prepared["metrics"])
+                    db_job.metrics = metrics
+                    db_job.input_type = job_params["input_type"]
+                    db.session.commit()
+
+                tree_preparation_pending = False
+                refresh_warnings = list(
+                    prepared["metrics"].get("mycomap_refresh_warnings") or []
+                )
+                if job:
+                    job.meta[tree_preparation_meta_key] = "completed"
+                    if refresh_warnings:
+                        job.meta["mycomap_refresh_warnings"] = refresh_warnings
+                    job.save_meta()
+                for warning in refresh_warnings:
+                    publish_overview(job_id, warning)
+                publish_overview(
+                    job_id,
+                    "MycoMap results imported. Validating the tree input...",
+                )
             
             # =========================================================
             # STEP: INPUT PROCESSING
@@ -447,7 +765,11 @@ def run_phylo_job(job_params: dict) -> dict:
                 job.save_meta()
             
             publish_step_start(job_id, STEP_INPUT, "Input Processing", "Validating input data")
-            update_step_meta(job, STEP_INPUT, {"state": STATE_RUNNING})
+            update_step_meta(job, STEP_INPUT, {
+                "state": STATE_RUNNING,
+                "label": "Input Processing",
+                "detail": "Validating input data",
+            })
             
             input_type = _normalize_input_type(job_params.get("input_type"))
             blast_mode = _normalize_blast_mode(job_params.get("blast_mode"))
@@ -472,15 +794,23 @@ def run_phylo_job(job_params: dict) -> dict:
                 logger.info("Processing pasted sequence")
 
                 if not sequence:
-                    raise ValueError("No sequence provided for pasted_sequence input type")
+                    raise ValueError(
+                        "No DNA sequence was provided. Paste FASTA text such as "
+                        "'>sample_1' followed by the DNA sequence on the next line."
+                    )
                 if not sequence.lstrip().startswith(">"):
-                    raise ValueError("Pasted sequence must be FASTA (must start with '>')")
+                    raise ValueError(
+                        "Pasted input is not FASTA. Start each record with a header "
+                        "line beginning with '>', for example '>sample_1', followed "
+                        "by its DNA sequence on the next line."
+                    )
+
+                n_records = validate_dna_fasta(sequence)
 
                 # Always write what the user gave us
                 input_raw_path.write_text(sequence + "\n", encoding="utf-8")
                 logger.info(f"Wrote input FASTA: {input_raw_path} ({input_raw_path.stat().st_size} bytes)")
 
-                n_records = fasta_record_count(sequence)
                 logger.info(f"Input FASTA records: {n_records}")
 
                 # Optional BLAST only if exactly 1 record
@@ -493,10 +823,14 @@ def run_phylo_job(job_params: dict) -> dict:
                 logger.info("Processing FASTA upload")
 
                 if not input_raw_path.exists():
-                    raise FileNotFoundError(f"Expected uploaded FASTA at {input_raw_path} but it does not exist")
+                    raise FileNotFoundError(
+                        "The uploaded FASTA file was not available when processing "
+                        "started. Return to Tree Builder, upload the file again, and "
+                        "resubmit the job. If this repeats, report the job ID."
+                    )
 
                 uploaded = input_raw_path.read_text(encoding="utf-8", errors="replace")
-                n_records = fasta_record_count(uploaded)
+                n_records = validate_dna_fasta(uploaded)
                 logger.info(f"Uploaded FASTA records: {n_records}")
 
                 if blast_mode == "on" and n_records != 1:
@@ -563,6 +897,7 @@ def run_phylo_job(job_params: dict) -> dict:
 
             # After input is finalized: ensure enough sequences to build alignment/tree
             final_fasta = input_raw_path.read_text(encoding="utf-8", errors="replace")
+            validate_dna_fasta(final_fasta)
             final_fasta, stats = dedupe_and_uniquify_fasta(final_fasta)
             input_raw_path.write_text(final_fasta, encoding="utf-8")
 
@@ -577,7 +912,11 @@ def run_phylo_job(job_params: dict) -> dict:
             final_n = fasta_record_count(final_fasta)
             logger.info(f"Final FASTA records going into alignment: {final_n}")
             if final_n < 2:
-                raise ValueError("Need at least 2 sequences to build an alignment/tree")
+                raise ValueError(
+                    "At least two distinct DNA sequences are required to build a "
+                    "tree. Add another FASTA record, or enable BLAST when submitting "
+                    "a single query sequence."
+                )
 
             # =========================================================
             # STEP: ORIENTATION CHECK
@@ -739,6 +1078,9 @@ def run_phylo_job(job_params: dict) -> dict:
             tree_model = job_params.get("tree_model", Config.DEFAULT_ML_MODEL)
             bootstrap = int(job_params.get("bootstrap", Config.DEFAULT_BOOTSTRAPS))
             mcmc_gens = int(job_params.get("mcmc_generations", Config.DEFAULT_MCMC_GENERATIONS))
+            mcmc_runs = int(job_params.get("mcmc_nruns", Config.DEFAULT_MCMC_NRNS))
+            mcmc_chains = int(job_params.get("mcmc_nchains", Config.DEFAULT_MCMC_CHAINS))
+            mcmc_burnin = float(job_params.get("mcmc_burnin_fraction", 0.25))
             
             current_tool = tree_method.lower()
             current_step_label = f"Tree Building ({tree_method.upper()})"
@@ -757,6 +1099,9 @@ def run_phylo_job(job_params: dict) -> dict:
                 detail_parts.append(f"{bootstrap} bootstraps")
             if tree_method == "mrbayes":
                 detail_parts.append(f"{mcmc_gens} generations")
+                detail_parts.append(f"{mcmc_runs} runs")
+                detail_parts.append(f"{mcmc_chains} chains/run")
+                detail_parts.append(f"{mcmc_burnin * 100:g}% burn-in")
             
             publish_step_start(job_id, STEP_TREE, current_step_label, ", ".join(detail_parts), tool=current_tool)
             update_step_meta(job, STEP_TREE, {
@@ -773,6 +1118,9 @@ def run_phylo_job(job_params: dict) -> dict:
                 model=tree_model,
                 bootstrap=bootstrap,
                 mcmc_generations=mcmc_gens,
+                mcmc_nruns=mcmc_runs,
+                mcmc_nchains=mcmc_chains,
+                mcmc_burnin_fraction=mcmc_burnin,
                 # RAxML Params
                 run_preset=job_params.get("run_preset", "fast_good"),
                 bootstrap_preset=job_params.get("bootstrap_preset", "standard"),
@@ -839,6 +1187,24 @@ def run_phylo_job(job_params: dict) -> dict:
                 db_job.metrics = metrics
                 db_job.status = "completed"
                 db.session.commit()
+
+                # If this tree was built from local-only MycoMap results
+                # because NCBI's queue hadn't cleared in time, kick off an
+                # hourly background re-check that appends NCBI hits and
+                # rebuilds the tree once they finally show up.
+                if (db_job.metrics or {}).get("mycomap_blast_rerun", {}).get(
+                    "ncbi_fallback_local_only"
+                ):
+                    try:
+                        from app.services.inaturalist_tree_service import (
+                            schedule_initial_ncbi_recheck,
+                        )
+                        schedule_initial_ncbi_recheck(job_id)
+                    except Exception:
+                        logger.warning(
+                            "Could not schedule NCBI re-check for job %s", job_id,
+                            exc_info=True,
+                        )
 
             # iNaturalist post-completion hook: if this job came from the
             # /api/inaturalist/tree flow, write the public tree URL back to
@@ -913,6 +1279,63 @@ def run_phylo_job(job_params: dict) -> dict:
                     job_id, type(_inat_err).__name__,
                 )
 
+            # Mushroom Observer post-completion hook: highlight the source tip
+            # and post the public tree URL as a comment. Reporting failures do
+            # not change the successfully completed tree job.
+            try:
+                if db_job and (db_job.metrics or {}).get("via") == "mo_phylogenetic_tree":
+                    from sqlalchemy.orm.attributes import flag_modified
+                    from app.services.mushroom_observer_service import (
+                        highlight_source_observation_tip as highlight_mo_source_tip,
+                        post_completed_tree_comment,
+                    )
+
+                    mo_metrics = dict(db_job.metrics or {})
+                    extra_names = []
+                    if mo_metrics.get("mo_added_its_name"):
+                        extra_names.append(mo_metrics["mo_added_its_name"])
+                    elif mo_metrics.get("mo_matched_its_tip"):
+                        extra_names.append(mo_metrics["mo_matched_its_tip"])
+                    highlighted_tips = highlight_mo_source_tip(
+                        job_id,
+                        int(mo_metrics.get("mo_observation_id") or 0),
+                        extra_tip_names=extra_names,
+                        display_name=mo_metrics.get("mo_source_display_name"),
+                    )
+                    mo_result = post_completed_tree_comment(job_id, mo_metrics)
+                    metrics = dict(db_job.metrics or {})
+                    metrics["mo_comment_status"] = mo_result.get("status", "failed")
+                    metrics["mo_comment_updated_at"] = datetime.now(timezone.utc).isoformat()
+                    if mo_result.get("mo_tree_url"):
+                        metrics["mo_tree_url"] = mo_result["mo_tree_url"]
+                    if mo_result.get("mo_comment_id"):
+                        metrics["mo_comment_id"] = mo_result["mo_comment_id"]
+                    if mo_result.get("error"):
+                        metrics["mo_comment_error"] = mo_result["error"][:300]
+                    if highlighted_tips:
+                        metrics["mo_highlighted_tips"] = [
+                            str(tip)[:300] for tip in highlighted_tips
+                        ]
+                    db_job.metrics = metrics
+                    flag_modified(db_job, "metrics")
+                    db.session.commit()
+                    if mo_result.get("status") == "success":
+                        publish_overview(
+                            job_id,
+                            "Posted the phylogenetic tree link to Mushroom Observer."
+                        )
+                    else:
+                        publish_overview(
+                            job_id,
+                            "Tree built; the Mushroom Observer comment did not succeed "
+                            "(the tree is still available)."
+                        )
+            except Exception as _mo_err:
+                logger.warning(
+                    "Mushroom Observer post-completion hook failed for job %s: %s",
+                    job_id, type(_mo_err).__name__,
+                )
+
             # Publish completion
             publish_job_completed(
                 job_id,
@@ -921,6 +1344,10 @@ def run_phylo_job(job_params: dict) -> dict:
                     "tree_newick": f"/api/job/{job_id}/download/tree/newick",
                     "tree_nexus": f"/api/job/{job_id}/download/tree/nexus",
                     "fasta_original": f"/api/job/{job_id}/download/fasta/original",
+                    **({"mrbayes": f"/api/job/{job_id}/download/mrbayes"}
+                       if (job_dir / "tree" / "mrbayes_input.nex").is_file() else {}),
+                    **({"alignment_inspection": f"/api/job/{job_id}/download/alignment/inspection"}
+                       if (job_dir / "alignment" / "alignment_trimmed_report.html").is_file() else {}),
                 }
             )
             publish_overview(job_id, "Pipeline complete! Redirecting to tree viewer...")
@@ -981,7 +1408,9 @@ def run_phylo_job(job_params: dict) -> dict:
             with _app.app_context():
                 db_job = Job.query.get(job_id)
                 if db_job:
-                    metrics = db_job.metrics or {}
+                    metrics = dict(db_job.metrics or {})
+                    if tree_preparation_pending:
+                        metrics["mycomap_preparation_status"] = "failed"
                     metrics["failed_at"] = datetime.now(timezone.utc).isoformat()
                     metrics["error"] = error_msg
                     metrics["failed_step"] = current_step
