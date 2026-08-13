@@ -16,7 +16,7 @@ from rq import Retry, get_current_job
 
 from app.config import Config
 from app.workers.events import (
-    STEP_INPUT, STEP_ORIENT, STEP_BLAST, STEP_ALIGN, STEP_TRIM, STEP_TREE, STEP_POST,
+    STEP_INPUT, STEP_ORIENT, STEP_BLAST, STEP_ITS, STEP_ALIGN, STEP_TRIM, STEP_TREE, STEP_POST,
     STATE_QUEUED, STATE_RUNNING, STATE_DONE, STATE_SKIPPED, STATE_FAILED,
     get_initial_steps_meta,
     publish_job_running, publish_job_queued, publish_job_completed, publish_job_failed,
@@ -70,6 +70,34 @@ def parse_fasta_records(fasta_text: str) -> list[tuple[str, str]]:
         records.append((header, seq))
 
     return records
+
+
+def cap_fasta_headers(fasta_text: str) -> tuple[str, int]:
+    """Bound every header in a FASTA document, leaving sequence lines untouched.
+
+    Rewrites header lines in place rather than reparsing and re-emitting the
+    file, so the user's own line wrapping survives verbatim and only the names
+    change. Returns (text, number_of_headers_capped).
+    """
+    from app.services.security_utils import cap_fasta_header
+
+    lines = fasta_text.splitlines(keepends=True)
+    capped = 0
+
+    for index, raw_line in enumerate(lines):
+        if not raw_line.startswith(">"):
+            continue
+
+        stripped = raw_line.rstrip("\r\n")
+        line_ending = raw_line[len(stripped):]
+        header = stripped[1:]
+        safe_header = cap_fasta_header(header)
+
+        if safe_header != header:
+            lines[index] = f">{safe_header}{line_ending}"
+            capped += 1
+
+    return "".join(lines), capped
 
 
 def validate_dna_fasta(fasta_text: str) -> int:
@@ -620,6 +648,9 @@ def run_phylo_job(job_params: dict) -> dict:
                         recreate_existing_tree=bool(
                             tree_preparation.get("recreate_existing_tree")
                         ),
+                        keep_existing_tree_url=bool(
+                            tree_preparation.get("keep_existing_tree_url")
+                        ),
                         mycomap_local_limit=tree_preparation.get("mycomap_local_limit"),
                         mycomap_ncbi_limit=tree_preparation.get("mycomap_ncbi_limit"),
                         defer_after_ncbi_rerun=not tree_resuming_after_ncbi,
@@ -655,10 +686,20 @@ def run_phylo_job(job_params: dict) -> dict:
                             if queue_position is not None else ""
                         )
                         if rerun_details.get("creation_pending"):
+                            from app.services.mycomap_service import (
+                                get_mycomap_creation_discovery_max_seconds,
+                            )
+
+                            discovery_minutes = max(1, round(
+                                get_mycomap_creation_discovery_max_seconds() / 60
+                            ))
                             waiting_message = (
-                                "MycoMap accepted the BLAST request and is publishing "
-                                "its result page. Dikarya will locate the URL and "
-                                "continue in one minute."
+                                "MycoMap accepted the BLAST request and queued it. "
+                                "Dikarya is waiting for the result page to appear and "
+                                "will continue in one minute; if MycoMap's queue has "
+                                f"not produced results within {discovery_minutes} "
+                                f"minute{'s' if discovery_minutes != 1 else ''}, this "
+                                "tree will stop and can be rebuilt later."
                             )
                         else:
                             if tree_preparation_kind == "mo":
@@ -805,6 +846,12 @@ def run_phylo_job(job_params: dict) -> dict:
                         "by its DNA sequence on the next line."
                     )
 
+                # Bound header lengths before anything downstream reads them:
+                # MAFFT and trimAl parse these names directly.
+                sequence, capped = cap_fasta_headers(sequence)
+                if capped:
+                    logger.warning(f"Capped {capped} over-long FASTA header(s) in pasted input")
+
                 n_records = validate_dna_fasta(sequence)
 
                 # Always write what the user gave us
@@ -830,6 +877,14 @@ def run_phylo_job(job_params: dict) -> dict:
                     )
 
                 uploaded = input_raw_path.read_text(encoding="utf-8", errors="replace")
+
+                # Same header cap as the pasted path. The upload landed on disk
+                # unfiltered, so rewrite the file before the pipeline reads it.
+                uploaded, capped = cap_fasta_headers(uploaded)
+                if capped:
+                    logger.warning(f"Capped {capped} over-long FASTA header(s) in uploaded file")
+                    input_raw_path.write_text(uploaded, encoding="utf-8")
+
                 n_records = validate_dna_fasta(uploaded)
                 logger.info(f"Uploaded FASTA records: {n_records}")
 
@@ -965,6 +1020,74 @@ def run_phylo_job(job_params: dict) -> dict:
                 publish_metric(job_id, STEP_ORIENT, "reversed", reversed_count)
 
             # =========================================================
+            # STEP: ITS REGION EXTRACTION (optional)
+            # =========================================================
+            current_step = STEP_ITS
+            current_tool = None
+            from app.services.its_extraction_service import (
+                describe_its_step,
+                format_its_detail,
+                normalize_region,
+                resolve_min_length,
+                run_its_extraction,
+            )
+
+            its_region = normalize_region(job_params.get("its_region"))
+            should_extract, current_step_label = describe_its_step(its_region)
+            its_stats = None
+
+            if job:
+                job.meta["current_step"] = current_step
+                job.save_meta()
+
+            if should_extract:
+                its_min_length = resolve_min_length(its_region, job_params.get("its_min_length"))
+                publish_step_start(
+                    job_id, STEP_ITS, current_step_label,
+                    f"minimum {its_min_length} bp",
+                )
+                update_step_meta(job, STEP_ITS, {
+                    "state": STATE_RUNNING,
+                    "label": current_step_label,
+                })
+
+                its_output_path = job_dir / "input" / "its_extracted.fasta"
+                its_stats = run_its_extraction(
+                    input_raw_path,
+                    its_output_path,
+                    its_region,
+                    Config,
+                    logger,
+                    min_length=its_min_length,
+                    job_id=job_id,
+                )
+                # Downstream steps all read input_raw_path, so swap in the
+                # extracted sequences the same way the orientation step does.
+                input_raw_path.write_text(
+                    its_output_path.read_text(encoding="utf-8"), encoding="utf-8"
+                )
+
+                its_detail = format_its_detail(its_stats)
+                publish_step_done(job_id, STEP_ITS, its_detail)
+                publish_overview(job_id, f"ITS region extraction: {its_detail}")
+                update_step_meta(job, STEP_ITS, {
+                    "state": STATE_DONE,
+                    "label": current_step_label,
+                    "detail": its_detail,
+                })
+                publish_metric(job_id, STEP_ITS, "kept", its_stats.get("kept_count", 0))
+                publish_metric(job_id, STEP_ITS, "dropped", its_stats.get("dropped_count", 0))
+            else:
+                update_step_meta(job, STEP_ITS, {
+                    "state": STATE_SKIPPED,
+                    "label": current_step_label,
+                })
+
+            # Persist for the job viewer's Generation Details panel.
+            job_params["its_extraction_details"] = its_stats
+            _save_job_params(input_info_path, job_params)
+
+            # =========================================================
             # STEP: ALIGNMENT
             # =========================================================
             current_step = STEP_ALIGN
@@ -1075,7 +1198,14 @@ def run_phylo_job(job_params: dict) -> dict:
             # =========================================================
             current_step = STEP_TREE
             tree_method = job_params.get("tree_method", "nj")
-            tree_model = job_params.get("tree_model", Config.DEFAULT_ML_MODEL)
+            # IQ-TREE defaults to ModelFinder (MFP) rather than a fixed GTR+G.
+            # Resolved here, not in the web form, so the API, iNaturalist and
+            # Mushroom Observer paths get the same default. An explicitly
+            # supplied model always wins.
+            if tree_method == "iqtree":
+                tree_model = job_params.get("tree_model") or Config.DEFAULT_IQTREE_MODEL
+            else:
+                tree_model = job_params.get("tree_model") or Config.DEFAULT_ML_MODEL
             bootstrap = int(job_params.get("bootstrap", Config.DEFAULT_BOOTSTRAPS))
             mcmc_gens = int(job_params.get("mcmc_generations", Config.DEFAULT_MCMC_GENERATIONS))
             mcmc_runs = int(job_params.get("mcmc_nruns", Config.DEFAULT_MCMC_NRNS))
@@ -1094,9 +1224,39 @@ def run_phylo_job(job_params: dict) -> dict:
             tree_nexus_path = job_dir / "tree" / "tree_original.nexus"
             tree_metadata_path = job_dir / "tree" / "tree_metadata.json"
             
-            detail_parts = [tree_model]
+            # IQ-TREE defaults to UFBoot + SH-aLRT. Resolved here rather than in the web
+            # form so the API, iNaturalist and Mushroom Observer paths get the same
+            # defaults. An explicit alrt_replicates (including 0) is always honoured.
+            if tree_method == "iqtree":
+                alrt_replicates = job_params.get(
+                    "alrt_replicates", Config.DEFAULT_IQTREE_ALRT
+                )
+                try:
+                    alrt_replicates = max(0, min(10_000, int(alrt_replicates)))
+                except (TypeError, ValueError):
+                    alrt_replicates = Config.DEFAULT_IQTREE_ALRT
+            else:
+                alrt_replicates = 0
+
+            # Persist the resolved values so the viewer's details panel can report
+            # them even when the caller relied on the defaults.
+            if (job_params.get("alrt_replicates") != alrt_replicates
+                    or job_params.get("tree_model") != tree_model):
+                job_params["alrt_replicates"] = alrt_replicates
+                job_params["tree_model"] = tree_model
+                _save_job_params(input_info_path, job_params)
+
+            # "MFP"/"MF" mean nothing to a mycologist reading the progress line.
+            detail_parts = [
+                "ModelFinder (auto-select)"
+                if tree_method == "iqtree" and tree_model.upper() in ("MFP", "MF", "TEST", "TESTNEW")
+                else tree_model
+            ]
             if tree_method in ("raxml", "iqtree") and bootstrap:
-                detail_parts.append(f"{bootstrap} bootstraps")
+                label = "UFBoot" if tree_method == "iqtree" else "bootstraps"
+                detail_parts.append(f"{bootstrap} {label}")
+            if tree_method == "iqtree" and alrt_replicates:
+                detail_parts.append(f"{alrt_replicates} SH-aLRT")
             if tree_method == "mrbayes":
                 detail_parts.append(f"{mcmc_gens} generations")
                 detail_parts.append(f"{mcmc_runs} runs")
@@ -1117,6 +1277,7 @@ def run_phylo_job(job_params: dict) -> dict:
                 method=tree_method,
                 model=tree_model,
                 bootstrap=bootstrap,
+                alrt_replicates=alrt_replicates,
                 mcmc_generations=mcmc_gens,
                 mcmc_nruns=mcmc_runs,
                 mcmc_nchains=mcmc_chains,
@@ -1414,6 +1575,23 @@ def run_phylo_job(job_params: dict) -> dict:
                     metrics["failed_at"] = datetime.now(timezone.utc).isoformat()
                     metrics["error"] = error_msg
                     metrics["failed_step"] = current_step
+                    # Persist the diagnostic detail too. It was already published
+                    # live over SSE, but nothing stored it, so reloading the page
+                    # (or opening it later) rebuilt the snapshot without any of it
+                    # and the error panel showed a bare "An error occurred" with an
+                    # empty output box. Keep it bounded so metrics stays small.
+                    metrics["failed_step_label"] = current_step_label or None
+                    metrics["failed_tool"] = current_tool or None
+                    metrics["exit_code"] = exit_code
+                    if stderr_tail:
+                        metrics["stderr_tail"] = [
+                            str(line)[:500] for line in list(stderr_tail)[-30:]
+                        ]
+                    # Last few traceback frames: the exception message alone often
+                    # doesn't say where it came from.
+                    tb_lines = [l for l in (tb or "").splitlines() if l.strip()]
+                    if tb_lines:
+                        metrics["traceback_tail"] = [l[:500] for l in tb_lines[-12:]]
                     db_job.metrics = metrics
                     db_job.status = "failed"
                     db.session.commit()

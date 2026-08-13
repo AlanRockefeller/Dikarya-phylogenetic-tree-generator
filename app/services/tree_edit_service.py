@@ -187,10 +187,21 @@ def build_recompute_job_params(params_dict: Dict[str, Any]) -> JobParams:
         trim_terminal_overhangs=_bool_param(params_dict, "trim_terminal_overhangs", True),
     )
 
+    tree_method = params_dict.get("tree_method", "nj")
+    # Mirror the worker's per-method model default so a recompute of an IQ-TREE
+    # job that never stored a model runs ModelFinder rather than a fixed GTR+G.
+    default_model = "MFP" if tree_method == "iqtree" else "GTR+G"
+
     tree_params = TreeBuilderParams(
-        method=params_dict.get("tree_method", "nj"),
-        model=params_dict.get("tree_model", "GTR+G"),
+        method=tree_method,
+        model=params_dict.get("tree_model") or default_model,
         bootstrap=_int_param(params_dict.get("bootstrap", 100), 100),
+        # Previously dropped here, so recomputing an IQ-TREE job silently lost
+        # SH-aLRT and relabelled every node with UFBoot only.
+        alrt_replicates=(
+            _int_param(params_dict.get("alrt_replicates", 1000), 1000)
+            if tree_method == "iqtree" else 0
+        ),
         mcmc_generations=_int_param(params_dict.get("mcmc_generations", 50000), 50000),
         mcmc_nruns=_int_param(params_dict.get("mcmc_nruns", 2), 2),
         mcmc_nchains=_int_param(params_dict.get("mcmc_nchains", 4), 4),
@@ -1054,7 +1065,7 @@ def recompute_tree(
 
     if event_job_id:
         from app.workers.events import (
-            STEP_INPUT, STEP_ORIENT, STEP_BLAST, STEP_ALIGN, STEP_TRIM, STEP_TREE, STEP_POST,
+            STEP_INPUT, STEP_ORIENT, STEP_BLAST, STEP_ITS, STEP_ALIGN, STEP_TRIM, STEP_TREE, STEP_POST,
             STATE_RUNNING, STATE_DONE, STATE_SKIPPED,
             publish_step_start, publish_step_done, publish_overview, update_step_meta,
         )
@@ -1114,6 +1125,7 @@ def recompute_tree(
     overview(f"Recompute input ready: {input_detail}")
     skip_step("orient", "Orientation Check (skipped)")
     skip_step("blast", "BLAST Search (skipped)")
+    skip_step("its", "ITS Region Extraction (skipped)")
     
     # 3. Re-align
     # We need alignment params. Assuming they are in job_params or we use defaults.

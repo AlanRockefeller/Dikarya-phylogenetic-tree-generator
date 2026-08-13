@@ -466,6 +466,17 @@
                             class="error-stderr mt-2 text-xs font-mono text-gray-600 dark:text-gray-400 overflow-x-auto p-2"></pre>
                     </details>
 
+                    <div class="bg-amber-50 dark:bg-amber-950/30 border border-amber-200 dark:border-amber-800 rounded-lg p-4">
+                        <p class="text-sm text-amber-900 dark:text-amber-100">
+                            If retrying does not solve the problem, contact Alan and include job ID
+                            <span class="font-mono font-semibold">{{ job_id }}</span> so he can find the exact failure in the logs.
+                        </p>
+                        <a href="mailto:alanrockefeller@gmail.com?subject=Dikarya%20job%20{{ job_id }}%20failed"
+                            class="inline-flex items-center mt-3 px-4 py-2 bg-journal-gold text-journal-dark rounded text-sm font-semibold hover:opacity-90 transition-opacity">
+                            <i class="fas fa-envelope mr-2"></i> Contact Alan
+                        </a>
+                    </div>
+
                     <div class="pt-4 border-t border-gray-100 dark:border-gray-700 flex flex-wrap gap-3">
                         <a href="#"
                             class="btn-secondary px-4 py-2 bg-gray-100 dark:bg-gray-700 rounded text-sm font-medium hover:bg-gray-200 dark:hover:bg-gray-600 transition-colors">
@@ -676,5 +687,5 @@
 {% endblock %}
 
 {% block scripts %}
-<script src="{{ url_for('static', filename='js/job_status.js') }}?v=13"></script>
+<script src="{{ url_for('static', filename='js/job_status.js') }}?v=16"></script>
 {% endblock %}

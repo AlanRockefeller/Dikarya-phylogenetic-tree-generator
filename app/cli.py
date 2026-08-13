@@ -208,7 +208,107 @@ def api_token_revoke_command(token_id):
     click.echo(f"Token {token_id} ('{t.name}') revoked.")
 
 
+@click.command("reap-stuck-jobs")
+@click.option("--older-than-days", default=1, show_default=True,
+              help="Only reap non-terminal jobs older than this many days.")
+@click.option("--dry-run", is_flag=True, help="Report what would change, then exit.")
+@with_appcontext
+def reap_stuck_jobs_command(older_than_days, dry_run):
+    """Mark long-abandoned queued/running jobs as failed.
+
+    A job left in a non-terminal state keeps its SSE stream alive, and each open
+    stream holds one of the (workers x threads) request slots. Enough of them and
+    the site stops answering, so these have to be cleaned up rather than left.
+    """
+    from datetime import datetime, timedelta
+    from app.extensions import db
+    from app.models import Job
+    from app.services.job_reconcile_service import reconcile_job_statuses
+
+    # Ask RQ first. Anything it knows is dead gets corrected regardless of age,
+    # which is both more accurate and less blunt than reaping purely on age.
+    reconciled = reconcile_job_statuses(dry_run=dry_run)
+    if reconciled:
+        verb = "Would reconcile" if dry_run else "Reconciled"
+        click.echo(f"{verb} {len(reconciled)} job(s) that RQ already considers dead:")
+        for entry in reconciled:
+            click.echo(f"  {entry['job_id']}  {entry['from_status']} -> failed  (rq={entry['rq_status']})")
+        click.echo("")
+
+    cutoff = datetime.utcnow() - timedelta(days=older_than_days)
+    stale = (
+        Job.query
+        .filter(Job.status.in_(("queued", "running")))
+        .filter(Job.created_at < cutoff)
+        .order_by(Job.created_at)
+        .all()
+    )
+
+    if not stale:
+        click.echo(f"No queued/running jobs older than {older_than_days} day(s).")
+        return
+
+    click.echo(f"{len(stale)} stale job(s) older than {older_than_days} day(s):")
+    for job in stale:
+        age = datetime.utcnow() - (job.created_at or datetime.utcnow())
+        click.echo(f"  {job.id}  {job.status:<8} age={str(age).split('.')[0]}  user={job.user_id}")
+
+    if dry_run:
+        click.echo("\nDry run: nothing changed.")
+        return
+
+    for job in stale:
+        metrics = dict(job.metrics or {})
+        metrics["reaped_at"] = datetime.utcnow().isoformat()
+        metrics["reaped_from_status"] = job.status
+        metrics["reaped_reason"] = (
+            f"Abandoned in '{job.status}' for more than {older_than_days} day(s); "
+            "marked failed so its status stream cannot hold a request slot open."
+        )
+        job.metrics = metrics
+        job.status = "failed"
+        job.updated_at = datetime.utcnow()
+
+    db.session.commit()
+    click.echo(f"\nMarked {len(stale)} job(s) as failed.")
+
+
+@click.command("jobs-in-flight")
+@with_appcontext
+def jobs_in_flight_command():
+    """List jobs RQ still considers live. Exit code 1 if any are.
+
+    Run this BEFORE `sudo /usr/local/sbin/restart-dikarya-worker`: a restart kills
+    the running work horse, losing that job's work and (until the worker's startup
+    reconciliation runs) leaving its row stuck.
+    """
+    from app.services.job_reconcile_service import count_jobs_in_flight
+
+    result = count_jobs_in_flight()
+    in_flight = result["in_flight"]
+    unknown = result["unknown"]
+
+    if unknown:
+        click.echo(f"{len(unknown)} job(s) are non-terminal but unknown to RQ "
+                   f"(likely already dead; `reap-stuck-jobs` will clean them up):")
+        for job_id in unknown:
+            click.echo(f"  {job_id}")
+        click.echo("")
+
+    if not in_flight:
+        click.echo("No jobs in flight. Safe to restart the worker.")
+        return
+
+    click.echo(f"{len(in_flight)} job(s) IN FLIGHT -- restarting the worker will kill them:")
+    for entry in in_flight:
+        click.echo(f"  {entry['job_id']}  db={entry['db_status']}  rq={entry['rq_status']}  created={entry['created_at']}")
+    click.echo("\nWait for these to finish, or accept that their work is lost.")
+    raise SystemExit(1)
+
+
 def register(app):
+    app.cli.add_command(jobs_in_flight_command)
+    app.cli.add_command(reap_stuck_jobs_command)
     app.cli.add_command(run_worker_command)
     app.cli.add_command(run_metrics_command)
     app.cli.add_command(whats_new_add_command)

@@ -38,6 +38,12 @@ MAX_AMBIGUOUS_FRACTION = 0.05
 # qualifies and rooting falls back to midpoint, which is the safe choice for a
 # fragment too short to place reliably.
 MIN_ABSOLUTE_OVERLAP = 30
+# Alan 8/4/26 - A root target that sits within a few nodes of the focal tip splits
+# the focal's own clade: rooting there strands the focal at the base of the drawing
+# while its nearest relatives get pushed to the opposite end. Tips this close are
+# only ever "most distant" because of an aberrant terminal branch (a rogue or
+# chimeric sequence), so prefer candidates outside this neighborhood.
+LOCAL_NEIGHBORHOOD_EDGES = 4
 UNINFORMATIVE_EPITHETS = {
     "aff",
     "cf",
@@ -264,12 +270,24 @@ def _tree_has_branch_lengths(tree) -> bool:
     return any((c.branch_length or 0) > 0 for c in tree.find_clades())
 
 
-def _patristic_distances(tree, focal_name: str) -> Dict[str, float]:
-    """Return patristic distance from the focal tip to every other tip.
+@dataclass
+class TipDistance:
+    """How far another tip sits from the focal tip, measured three ways."""
+    patristic: float          # summed branch lengths, focal tip -> this tip
+    attachment: float         # same, but stopping at this tip's parent node
+    edges: int                # number of tree edges traversed
+
+
+def _patristic_distances(tree, focal_name: str) -> Dict[str, TipDistance]:
+    """Return distance measurements from the focal tip to every other tip.
 
     Single-source traversal of the tree graph (each edge weighted by the child
     clade's branch length) instead of calling tree.distance() once per tip,
     which re-walks the tree on every call (O(N^2) for N tips).
+
+    Alongside the patristic distance we record the distance to the candidate's
+    *attachment point* (its parent node) and the topological edge count, both of
+    which the root-target ranking needs to see past rogue terminal branches.
     """
     focal = next((t for t in tree.get_terminals() if t.name == focal_name), None)
     if focal is None:
@@ -288,25 +306,36 @@ def _patristic_distances(tree, focal_name: str) -> Dict[str, float]:
     # branch_length, so stepping up uses the node's length and stepping down uses
     # the child's length.
     dist: Dict[Any, float] = {focal: 0.0}
+    hops: Dict[Any, int] = {focal: 0}
     queue = deque([focal])
     while queue:
         node = queue.popleft()
         base = dist[node]
+        step = hops[node] + 1
         parent = parents.get(node)
         if parent is not None and parent not in dist:
             dist[parent] = base + float(node.branch_length or 0.0)
+            hops[parent] = step
             queue.append(parent)
         for child in children.get(node, ()):
             if child not in dist:
                 dist[child] = base + float(child.branch_length or 0.0)
+                hops[child] = step
                 queue.append(child)
 
-    out: Dict[str, float] = {}
+    out: Dict[str, TipDistance] = {}
     for t in tree.get_terminals():
         if t is focal or not t.name:
             continue
-        if t in dist:
-            out[t.name] = float(dist[t])
+        if t not in dist:
+            continue
+        total = float(dist[t])
+        own_branch = float(t.branch_length or 0.0)
+        out[t.name] = TipDistance(
+            patristic=total,
+            attachment=max(0.0, total - own_branch),
+            edges=int(hops[t]),
+        )
     return out
 
 
@@ -369,7 +398,7 @@ def choose_auto_root_target(job_dir: Path, state: Dict[str, Any],
 
     focal_taxon = _extract_binomial(focal)
     rejected = 0
-    accepted: List[Tuple[str, float]] = []
+    accepted: List[Tuple[str, TipDistance]] = []
     for tip_name, dist in distances.items():
         if tip_name == focal:
             continue
@@ -401,9 +430,25 @@ def choose_auto_root_target(job_dir: Path, state: Dict[str, Any],
             candidate_pool = taxon_distinct
             reason = f"most_distant_taxon_distinct_acceptable_hit:source={focal_source}"
 
-    # Pick the most distant candidate after applying mode-specific preference.
-    candidate_pool.sort(key=lambda x: x[1], reverse=True)
-    target_name, best_dist = candidate_pool[0]
+    # Alan 8/4/26 - Drop candidates that share a recent ancestor with the focal tip.
+    # Rooting on one of those puts the root *inside* the focal's own clade, which
+    # leaves the focal isolated at the top of the drawing with its closest matches
+    # stranded at the bottom. Soft filter: keep the unfiltered pool if it empties.
+    distant_enough = [
+        item for item in candidate_pool
+        if item[1].edges > LOCAL_NEIGHBORHOOD_EDGES
+    ]
+    if distant_enough and len(distant_enough) < len(candidate_pool):
+        candidate_pool = distant_enough
+        reason += ":outside_focal_neighborhood"
+
+    # Rank by distance to the candidate's attachment point rather than to the tip
+    # itself. A rogue sequence on a hugely inflated terminal branch otherwise wins
+    # "most distant" without being on a genuinely deep lineage; measuring to the
+    # parent node keeps that single bad branch out of the comparison. Ties break on
+    # full patristic distance, then name, so the pick is deterministic.
+    candidate_pool.sort(key=lambda x: (-x[1].attachment, -x[1].patristic, x[0]))
+    target_name, best = candidate_pool[0]
 
     out_mode = "most_divergent_hit" if mode == "most_divergent_hit" else "auto"
     return RootChoice(
@@ -412,7 +457,7 @@ def choose_auto_root_target(job_dir: Path, state: Dict[str, Any],
         target_name=target_name,
         reason=reason,
         warnings=warnings,
-        score=best_dist,
+        score=best.attachment,
         candidate_count=len(accepted),
         rejected_count=rejected,
     )

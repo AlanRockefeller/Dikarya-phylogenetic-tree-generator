@@ -13,6 +13,41 @@
         return name.replace(/^_R_/, '').replace(/\s+RiC(?:\s+\d+)?\s*$/i, '').trim();
     }
 
+    // Alan 8/4/26 - Shared descriptions of what each support scale actually means, so the
+    // badge and the on-tree node labels can both explain that SH-like local supports are
+    // neither bootstrap proportions nor Bayesian posterior probabilities. Reviewers were
+    // reading FastTree's 0-1 values as posteriors from a Bayesian run.
+    window.SUPPORT_TYPE_INFO = {
+        BS: {
+            label: 'Bootstrap',
+            tooltip: 'Bootstrap support (0-100): percentage of pseudoreplicate trees containing this clade.'
+        },
+        PP: {
+            label: 'Posterior',
+            tooltip: 'Bayesian posterior probability (0-1): probability of this clade given the data and model.'
+        },
+        SH: {
+            label: 'FastTree SH-like',
+            tooltip: 'FastTree SH-like local support (0-1). NOT a bootstrap proportion and NOT a Bayesian posterior probability. '
+                + 'It only tests this node against its two nearest-neighbour-interchange alternatives, so it is local, known to be '
+                + 'anti-conservative, and cannot detect long-branch attraction. High values on long branches deserve scepticism.'
+        },
+        ALRT_UFBOOT: {
+            label: 'SH-aLRT / UFBoot',
+            tooltip: 'IQ-TREE dual support, shown as SH-aLRT/UFBoot. Both are percentages (0-100). '
+                + 'A clade is normally called well supported when SH-aLRT is at least 80 AND UFBoot is at least 95. '
+                + 'The threshold filter applies to the UFBoot half.'
+        },
+        mixed: {
+            label: 'Mixed',
+            tooltip: 'Mixed support scales detected in this tree. Check the tree source before comparing values across nodes.'
+        },
+        none: {
+            label: 'None',
+            tooltip: 'This tree carries no node support values.'
+        }
+    };
+
     // --- ZOOM PANIC STOP ---
     if (!window.__dikarya_zoom_panic_stop_attached) {
         window.__dikarya_zoom_panic_stop_attached = true;
@@ -83,6 +118,9 @@
 
         // Alan 6/4/26 - Let implementations expose a controller-owned context-menu prune action.
         setPruneNodeHandler(fn) { }
+
+        // Alan 8/13/26 - Let implementations expose a controller-owned context-menu rename action.
+        setRenameNodeHandler(fn) { }
 
         // Alan 6/4/26 - Let implementations expose a controller-owned context-menu copy-name action.
         setCopySequenceNameHandler(fn) { }
@@ -317,6 +355,8 @@
             this._onRotateNode = null;
             // Alan 7/17/26 - Controller-supplied handler receives the clicked node and the exact context-menu prune targets.
             this._onPruneNode = null;
+            // Alan 8/13/26 - Controller-supplied handler opens Rename for a single selected tip.
+            this._onRenameNode = null;
             // Alan 6/4/26 - Controller-supplied handler invoked by the native menu's "Copy sequence name" item.
             this._onCopySequenceName = null;
             // Alan 6/25/26 - Controller-supplied handler invoked by the native menu's iNaturalist-number copy item.
@@ -333,6 +373,11 @@
         // Alan 6/4/26 - Let the controller own pruning while the item lives in phylotree's native node menu.
         setPruneNodeHandler(fn) {
             this._onPruneNode = typeof fn === 'function' ? fn : null;
+        }
+
+        // Alan 8/13/26 - Let the controller reuse its existing rename modal from the native tip menu.
+        setRenameNodeHandler(fn) {
+            this._onRenameNode = typeof fn === 'function' ? fn : null;
         }
 
         // Alan 6/4/26 - Let the controller own clipboard copying while the item lives in phylotree's native node menu.
@@ -407,6 +452,17 @@
                         },
                         () => !window.VIEW_ONLY
                     ]);
+                    // Alan 8/13/26 - Put Rename below Prune for an unselected tip or the sole selected tip.
+                    if (!n.children || n.children.length === 0) {
+                        n.menu_items.push([
+                            () => 'Rename 1 node',
+                            (node) => {
+                                const renameNode = this._getContextRenameNode(node);
+                                if (renameNode && typeof this._onRenameNode === 'function') this._onRenameNode(renameNode);
+                            },
+                            (node) => !window.VIEW_ONLY && Boolean(this._getContextRenameNode(node))
+                        ]);
+                    }
                 }
                 // Alan 7/14/26 - Copy the clicked sequence name or all visible selected sequence names from terminal nodes.
                 if (!n.children || n.children.length === 0) {
@@ -435,7 +491,9 @@
                             const nodes = this._getContextMycomapRecordNodes(node);
                             if (typeof this._onRefreshMycomapRecords === 'function') this._onRefreshMycomapRecords(node, nodes);
                         },
-                        (node) => !window.VIEW_ONLY && this._getContextMycomapRecordReferences(node).length > 0
+                        (node) => !window.VIEW_ONLY && this._getContextMycomapRecordReferences(node).length > 0,
+                        // Alan 8/13/26 - Keep the currently broken refresh action visible but unavailable.
+                        true
                     ]);
                 }
                 if (n.children) {
@@ -1391,6 +1449,17 @@
             return `Prune ${count} node${count === 1 ? '' : 's'}`;
         }
 
+        // Alan 8/13/26 - Rename the right-clicked tip with no selection, or the sole selected tip when it is clicked.
+        _getContextRenameNode(node) {
+            const selectedNodes = this.getSelectedNodes();
+            if (selectedNodes.length === 0) return node;
+            if (selectedNodes.length !== 1) return null;
+            const selectedNode = selectedNodes[0];
+            const children = selectedNode?.children || selectedNode?.data?.children || [];
+            if (children && children.length > 0) return null;
+            return this._getNodeId(selectedNode) === this._getNodeId(node) ? selectedNode : null;
+        }
+
         // Alan 7/14/26 - Use visible selected leaf sequences for name copying, falling back to the right-clicked tip.
         _getContextSequenceNameNodes(node) {
             const selectedLeaves = this.getSelectedNodes().filter((selectedNode) => {
@@ -1699,7 +1768,37 @@
             }
         }
 
+        // Alan 8/4/26 - IQ-TREE run with both -alrt and -B labels nodes "SH-aLRT/UFBoot"
+        // (e.g. "82.7/87"). Every existing extractor here expects a bare number, so such
+        // trees previously rendered with no support values at all. Returns {alrt, ufboot}
+        // or null. Both halves are percentages on a 0-100 scale.
+        _extractDualSupport(node) {
+            const candidates = [
+                node?.data?.confidence, node?.data?.bootstrap, node?.data?.support,
+                node?.confidence, node?.bootstrap, node?.support,
+                node?.data?.bootstrap_values, node?.bootstrap_values,
+                node?.data?.name, node?.name,
+            ];
+
+            for (const v of candidates) {
+                if (v === undefined || v === null || v === "") continue;
+                const s = String(v).trim();
+                // Tolerate a "Node_12_" prefix, as the single-value path below does.
+                const m = s.match(/^(?:Node_\d+_)?(\d+(?:\.\d+)?)\/(\d+(?:\.\d+)?)$/);
+                if (m) {
+                    return { alrt: Number(m[1]), ufboot: Number(m[2]) };
+                }
+            }
+            return null;
+        }
+
         _extractSupportValue(node) {
+            // Alan 8/4/26 - Dual SH-aLRT/UFBoot labels resolve to the UFBoot half so the
+            // existing 0-100 bootstrap thresholding keeps working unchanged; the label
+            // renderer shows both numbers.
+            const dual = this._extractDualSupport(node);
+            if (dual) return dual.ufboot;
+
             // 1) Direct numeric fields (preferred)
             const direct = [
                 node?.data?.confidence, node?.data?.bootstrap, node?.data?.support,
@@ -1755,6 +1854,13 @@
 
             let supportType = 'none';
 
+            // Alan 8/4/26 - Dual SH-aLRT/UFBoot labels take priority: they are their own
+            // scale (two 0-100 percentages) and must not be reported as plain bootstrap.
+            const hasDual = this.allNodes.some(
+                n => n.children && n.children.length > 0 && this._extractDualSupport(n)
+            );
+            if (hasDual) return { maxSupport, supportType: 'ALRT_UFBOOT' };
+
             // Explicit FastTree Override
             // FastTree support values are SH-like local supports (0-1).
             // They are NOT Bayesian Posteriors (PP), though they look similar.
@@ -1797,6 +1903,10 @@
             }
 
             const { maxSupport, supportType } = this.lastStats;
+            // Alan 8/4/26 - Resolve the support-scale tooltip once per redraw so every node
+            // label can carry a hover note distinguishing SH-like / bootstrap / posterior.
+            const supportInfo = (window.SUPPORT_TYPE_INFO || {})[supportType] || null;
+            const supportTooltip = supportInfo ? supportInfo.tooltip : '';
             const ppThreshold = this.options.ppThreshold;
             const bootThreshold = this.options.bootstrapThreshold;
             const minTips = this.options.minTips;
@@ -1838,7 +1948,16 @@
                     // Threshold Filter - decide PP vs bootstrap vs SH by value magnitude / type
                     const EPS = 1e-9;
 
-                    if (supportType === 'SH') {
+                    // Alan 8/4/26 - Dual SH-aLRT/UFBoot nodes render both halves ("83/97").
+                    // numVal is the UFBoot half, so the existing 0-100 bootstrap threshold
+                    // applies to it directly.
+                    const dualVal = (supportType === 'ALRT_UFBOOT') ? self._extractDualSupport(d) : null;
+                    if (dualVal) {
+                        if (numVal + EPS < bootThreshold) { group.select("text.node-support-value").remove(); return; }
+                        const fmt = v => (Number.isInteger(v) ? String(v) : v.toFixed(1));
+                        rawLabel = `${fmt(dualVal.alrt)}/${fmt(dualVal.ufboot)}`;
+                    }
+                    else if (supportType === 'SH') {
                         // SH-like supports are 0-1, so use ppThreshold
                         if (numVal + EPS < ppThreshold) { group.select("text.node-support-value").remove(); return; }
                         rawLabel = numVal.toFixed(2);
@@ -1859,7 +1978,19 @@
                     // Re-calculate vector info if missing (e.g. after sort)
                     let ux = 0, uy = 0, px = 0, py = 1;
                     let textAnchor = "end";
-                    if (d.parent) {
+                    // Alan 8/4/26 - Rectangular ("linear") trees are drawn by phylotree with a
+                    // stepBefore curve, so the branch arriving at a node is always a HORIZONTAL
+                    // segment. The old code aimed the label along the straight diagonal to the
+                    // parent, which for a node whose parent sits far away vertically flung the
+                    // number well off its own branch and on top of a neighbouring tip label.
+                    // Aim along the drawn segment instead: toward the root is exactly -x, and
+                    // the label sits just above that segment.
+                    const isRadialLayout = (self.options.layout === 'radial');
+                    if (!isRadialLayout) {
+                        ux = -1; uy = 0;
+                        px = 0; py = -1;
+                        textAnchor = 'end';
+                    } else if (d.parent) {
                         const vx = d.parent.y - d.y;
                         const vy = d.parent.x - d.x;
                         const len = Math.hypot(vx, vy);
@@ -1872,12 +2003,29 @@
                             else textAnchor = 'middle';
                         }
                     }
-                    d.__supportVec = { ux, uy, px, py, textAnchor, isTipZone: (d.y > tipZoneStart) };
+                    d.__supportVec = {
+                        ux, uy, px, py, textAnchor,
+                        isTipZone: (d.y > tipZoneStart),
+                        linear: !isRadialLayout
+                    };
 
                     text.attr("text-anchor", textAnchor)
-                        .attr("dominant-baseline", "hanging")
-                        .style("pointer-events", "none")
+                        // Alan 8/4/26 - Alphabetic baseline in linear layout so the number rests
+                        // on top of the horizontal branch instead of hanging down across it.
+                        .attr("dominant-baseline", isRadialLayout ? "hanging" : "auto")
+                        // Alan 8/4/26 - Was pointer-events:none, which blocked hover. Labels need
+                        // to be hoverable to surface the support-scale note below. Clicks still
+                        // bubble to the parent node <g>, so selection and zoom/pan are unchanged.
+                        .style("pointer-events", supportTooltip ? "auto" : "none")
                         .text(rawLabel);
+
+                    // Alan 8/4/26 - Appended after .text(), which replaces child nodes and would
+                    // otherwise wipe the <title>. Explains which scale the number is on so a
+                    // FastTree 1.00 is not misread as a Bayesian posterior probability.
+                    if (supportTooltip) {
+                        text.append("title")
+                            .text(`${supportInfo.label}: ${rawLabel}\n\n${supportTooltip}`);
+                    }
                 });
 
             this._applyTextSizingFromZoom();
@@ -1905,11 +2053,18 @@
 
             svg.selectAll("text.node-support-value").each(function (d) {
                 if (!d || !d.__supportVec) return;
-                const { ux, uy, px, py, isTipZone } = d.__supportVec;
+                const { ux, uy, px, py, isTipZone, linear } = d.__supportVec;
 
                 let offRoot = 10, offPerp = 6;
                 let finalSize = supportBase;
-                if (isTipZone) { offRoot += 20; offPerp += 14; finalSize = Math.max(6, supportBase - 1); }
+                if (linear) {
+                    // Alan 8/4/26 - Sit the label just left of the node and 2px above its own
+                    // horizontal branch. The old perpendicular boost near the tips pushed labels
+                    // a whole row down into someone else's tip text; nudging further toward the
+                    // root is what actually clears the crowded tip zone.
+                    offRoot = 5; offPerp = 2;
+                    if (isTipZone) { offRoot += 8; finalSize = Math.max(6, supportBase - 1); }
+                } else if (isTipZone) { offRoot += 20; offPerp += 14; finalSize = Math.max(6, supportBase - 1); }
 
                 const sz = Math.max(1, finalSize / k);
                 const xOff = (ux * offRoot + px * offPerp) / k;

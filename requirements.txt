@@ -80,6 +80,10 @@ psutil==7.2.0
     # via -r requirements.in
 psycopg2-binary==2.9.11
     # via -r requirements.in
+pyhmmer==0.12.1
+    # via pyitsx
+pyitsx==0.1.0
+    # via -r requirements.in
 python-dateutil==2.9.0.post0
     # via croniter
 python-dotenv==1.2.2

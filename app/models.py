@@ -62,7 +62,10 @@ class Job(db.Model):
     user_id = db.Column(db.Integer, db.ForeignKey("user.id"), nullable=True)
     status = db.Column(db.String(32), nullable=False, default="queued")
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
-    updated_at = db.Column(db.DateTime, default=datetime.utcnow)
+    # onupdate is what makes this differ from created_at. Without it the column
+    # was set once at insert and never moved again, so every job looked like it
+    # had not been touched since submission.
+    updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
     job_dir = db.Column(db.String(512), nullable=False)
     input_type = db.Column(db.String(64), nullable=False)
     metrics = db.Column(db.JSON, default=dict)
@@ -159,6 +162,10 @@ class TreeBuilderParams:
     mcmc_nchains: int = 4
     mcmc_burnin_fraction: float = 0.25
     threads: Optional[int] = None   # autodetect if None
+
+    # IQ-TREE SH-aLRT replicates (-alrt). 0/None disables it. When enabled,
+    # IQ-TREE writes dual "SH-aLRT/UFBoot" node labels into its .treefile.
+    alrt_replicates: Optional[int] = None
     
     # New RAxML-NG specific fields
     run_preset: str = "fast_good"          # fast_good, standard, publication, maximum

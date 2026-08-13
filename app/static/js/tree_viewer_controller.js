@@ -432,6 +432,29 @@ document.addEventListener('DOMContentLoaded', async () => {
     // needsSequenceOfInterest. Returned to runBackendAction so it can be shown
     // AFTER the tree reloads; otherwise the generic "completed" message and the
     // reload clobber it and "Auto root chose: X" only flashes for an instant.
+    // Alan 8/4/26 - Mirror the rooting message into a persistent banner above the tree.
+    // It used to exist only as a toast, so how the tree was rooted disappeared as soon
+    // as the next action fired a new status. The banner shares a container with the
+    // server-rendered duplicate-removal notice.
+    // Returns true when the banner took the message, so callers can skip the toast
+    // instead of showing the same sentence twice.
+    function setRootingNotice(text) {
+        const wrap = getEl('tree-notices');
+        const row = getEl('notice-rooting');
+        const slot = getEl('notice-rooting-text');
+        if (!wrap || !row || !slot) return false;
+        if (!text) {
+            row.classList.add('hidden');
+            row.classList.remove('flex');
+            return false;
+        }
+        slot.textContent = text;
+        row.classList.remove('hidden');
+        row.classList.add('flex');
+        wrap.classList.remove('hidden');
+        return true;
+    }
+
     function rootingFinalStatus(mode, result) {
         needsSequenceOfInterest = !!(result && result.needs_sequence_of_interest);
         const info = (result && result.rooting_info) || {};
@@ -451,6 +474,11 @@ document.addEventListener('DOMContentLoaded', async () => {
                 ? `Auto root used the most divergent hit: ${target}`
                 : `Auto root chose outgroup: ${target}`;
             // Alan 5/31/26 - Keep the chosen-outgroup message up (sticky) so it can actually be read.
+            // Alan 8/4/26 - The persistent banner now carries this, so suppress the duplicate
+            // toast whenever the banner accepted it; a short confirmation is enough.
+            if (setRootingNotice(label)) {
+                return { msg: "Rooting updated.", type: "success", timeout: 2500 };
+            }
             return { msg: label, type: "success", timeout: 0 };
         }
         if (mode === 'midpoint') return { msg: "Midpoint root applied.", type: "success", timeout: 2500 };
@@ -571,8 +599,15 @@ document.addEventListener('DOMContentLoaded', async () => {
             alignTips: false,
             // grab initial DOM values
             minTips: parseInt(getEl('input-min-tips')?.value || 0),
-            ppThreshold: parseFloat(getEl('input-pp-threshold')?.value || 0.9),
-            bootstrapThreshold: parseInt(getEl('input-bs-threshold')?.value || 70),
+            // Alan 8/4/26 - These used to read the threshold inputs directly, ignoring the
+            // "Apply thresholds (Filter Low)" checkbox, which ships unchecked. On first load
+            // that silently hid every node below PP 0.80 / BS 70 until the user happened to
+            // touch a filter input (which runs updateOpts and zeroes them). Low support is
+            // information, so honour the checkbox from the start and show everything by default.
+            ppThreshold: getEl('cb-hide-low-support')?.checked
+                ? parseFloat(getEl('input-pp-threshold')?.value || 0.9) : 0,
+            bootstrapThreshold: getEl('cb-hide-low-support')?.checked
+                ? parseInt(getEl('input-bs-threshold')?.value || 70) : 0,
             // Alan 5/9/26 - Pass stored per-sequence BLAST metrics into the viewer for tip filtering.
             sequenceMetrics: Array.isArray(window.SEQUENCE_METRICS) ? window.SEQUENCE_METRICS : [],
             treeMethod: window.TREE_METHOD || ''
@@ -647,7 +682,10 @@ document.addEventListener('DOMContentLoaded', async () => {
                     const label = loadedInfo.chosen_by === 'most_divergent_hit'
                         ? `Auto root used the most divergent hit: ${loadedInfo.chosen_root_target}`
                         : `Auto root chose outgroup: ${loadedInfo.chosen_root_target}`;
-                    showStatus(label, "info", 0);
+                    // Alan 8/4/26 - Prefer the persistent banner; only fall back to the sticky
+                    // toast when the banner is missing, otherwise the same rooting sentence
+                    // renders twice on screen.
+                    if (!setRootingNotice(label)) showStatus(label, "info", 0);
                 }
                 // Alan 5/11/26 - Reapply saved rename labels after loading the raw Newick tree.
                 if (loadedTreeState.renames && viewer && typeof viewer.applyRenames === 'function') {
@@ -1243,6 +1281,14 @@ document.addEventListener('DOMContentLoaded', async () => {
             });
         }
 
+        // Alan 8/13/26 - Reuse the existing single-sequence rename modal from the tip context menu.
+        if (viewer && typeof viewer.setRenameNodeHandler === 'function') {
+            viewer.setRenameNodeHandler((node) => {
+                if (window.VIEW_ONLY || isProcessing || !node) return;
+                openRenameModal([node]);
+            });
+        }
+
         // Alan 7/14/26 - Copy one clicked name or multiple selected sequence names as separate clipboard lines.
         if (viewer && typeof viewer.setCopySequenceNameHandler === 'function') {
             viewer.setCopySequenceNameHandler(async (node, nodes = []) => {
@@ -1685,6 +1731,43 @@ document.addEventListener('DOMContentLoaded', async () => {
             });
         });
 
+        // Alan 8/4/26 - Rebuild the tree with the deduped duplicate records added back in.
+        // Creates a separate job so the current tree keeps its URL.
+        const btnRebuildDupes = getEl('btn-rebuild-with-duplicates');
+        if (btnRebuildDupes) btnRebuildDupes.addEventListener('click', async () => {
+            if (!confirm("Start a new job with the removed duplicate sequences added back in?\n\nThis tree is left unchanged.")) return;
+            btnRebuildDupes.disabled = true;
+            btnRebuildDupes.classList.add('opacity-50', 'cursor-not-allowed');
+            try {
+                // Alan 8/4/26 - Reuse TreeEditActions' CSRF header builder; a bare fetch
+                // here is rejected by CSRFProtect with "CSRF token missing".
+                const csrf = document.querySelector('meta[name="csrf-token"]')?.getAttribute('content');
+                const headers = { 'Content-Type': 'application/json' };
+                if (csrf) headers['X-CSRFToken'] = csrf;
+                const resp = await fetch(`/api/job/${JOB_ID}/rebuild-with-duplicates`, {
+                    method: 'POST',
+                    credentials: 'same-origin',
+                    headers
+                });
+                const data = await resp.json().catch(() => ({}));
+                if (!resp.ok) {
+                    showStatus(data.error || "Could not start the rebuild.", "danger", 5000);
+                    btnRebuildDupes.disabled = false;
+                    btnRebuildDupes.classList.remove('opacity-50', 'cursor-not-allowed');
+                    return;
+                }
+                showStatus(
+                    `Queued a new tree with ${data.restored_count} duplicate record(s) restored. Opening it now...`,
+                    "success", 0
+                );
+                setTimeout(() => { window.location.href = data.status_url || `/job/${data.job_id}`; }, 1200);
+            } catch (err) {
+                showStatus("Could not start the rebuild.", "danger", 5000);
+                btnRebuildDupes.disabled = false;
+                btnRebuildDupes.classList.remove('opacity-50', 'cursor-not-allowed');
+            }
+        });
+
         // Alan 5/13/26 - Open the full-screen Alignment Viewer for selected/visible tree tips.
         if (btnAlignmentViewer) btnAlignmentViewer.addEventListener('click', () => {
             if (!viewer || typeof viewer.getVisibleTipOrder !== 'function') {
@@ -2058,30 +2141,36 @@ document.addEventListener('DOMContentLoaded', async () => {
         const showSupport = viewer ? viewer.options.showSupport : true;
 
         if (badge) {
-            let label = 'None';
-            if (stats.supportType === 'BS') label = 'Bootstrap';
-            else if (stats.supportType === 'PP') label = 'Posterior';
-            else if (stats.supportType === 'SH') label = 'FastTree SH-like';
-            else if (stats.supportType === 'mixed') label = 'Mixed';
+            // Alan 8/4/26 - Pull the label and hover note from the shared SUPPORT_TYPE_INFO map
+            // (tree_viewer_phylotree_v2.js) so the badge and the on-tree labels stay in sync.
+            const info = (window.SUPPORT_TYPE_INFO || {})[stats.supportType]
+                || (window.SUPPORT_TYPE_INFO || {}).none
+                || { label: 'None', tooltip: '' };
+            const label = info.label;
 
             badge.textContent = `Support: ${label}`;
-            badge.className = "px-2 py-0.5 text-xs font-semibold rounded shrink-0 transition-colors";
+            // Alan 8/4/26 - Reviewers were misreading FastTree's 0-1 SH-like values as Bayesian
+            // posteriors. Give the badge a ring + tooltip so the scale is legible at a glance.
+            badge.title = info.tooltip;
+            badge.className = "px-2 py-0.5 text-xs font-semibold rounded shrink-0 transition-colors ring-1 cursor-help";
 
+            // Alan 8/4/26 - Added matching ring-* colors so the ring-1 outline above tracks
+            // each support scale instead of falling back to Tailwind's default blue ring.
             if (stats.supportType === 'BS') {
-                badge.classList.add('text-blue-800', 'bg-blue-100', 'dark:text-blue-200', 'dark:bg-blue-900/40');
+                badge.classList.add('text-blue-800', 'bg-blue-100', 'ring-blue-400/60', 'dark:text-blue-200', 'dark:bg-blue-900/40');
             }
             else if (stats.supportType === 'PP') {
-                badge.classList.add('text-purple-800', 'bg-purple-100', 'dark:text-purple-200', 'dark:bg-purple-900/40');
+                badge.classList.add('text-purple-800', 'bg-purple-100', 'ring-purple-400/60', 'dark:text-purple-200', 'dark:bg-purple-900/40');
             }
             else if (stats.supportType === 'SH') {
                 // Teal for FastTree SH
-                badge.classList.add('text-teal-800', 'bg-teal-100', 'dark:text-teal-200', 'dark:bg-teal-900/40');
+                badge.classList.add('text-teal-800', 'bg-teal-100', 'ring-teal-400/60', 'dark:text-teal-200', 'dark:bg-teal-900/40');
             }
             else if (stats.supportType === 'mixed') {
-                badge.classList.add('text-amber-800', 'bg-amber-100', 'dark:text-amber-200', 'dark:bg-amber-900/40');
+                badge.classList.add('text-amber-800', 'bg-amber-100', 'ring-amber-400/60', 'dark:text-amber-200', 'dark:bg-amber-900/40');
             }
             else {
-                badge.classList.add('text-gray-800', 'bg-gray-100', 'dark:text-gray-200', 'dark:bg-gray-700/40');
+                badge.classList.add('text-gray-800', 'bg-gray-100', 'ring-gray-400/60', 'dark:text-gray-200', 'dark:bg-gray-700/40');
             }
         }
 
@@ -2106,7 +2195,13 @@ document.addEventListener('DOMContentLoaded', async () => {
             setInput(ppInput, globalEnable && (s === 'PP' || s === 'mixed' || s === 'SH'));
         }
 
-        if (bsInput) setInput(bsInput, globalEnable && (s === 'BS' || s === 'mixed'));
+        // Alan 8/4/26 - Dual SH-aLRT/UFBoot trees threshold on the UFBoot half, so the
+        // bootstrap input stays live and is relabelled to say which half it filters.
+        if (bsInput) {
+            const bsLabel = bsInput.parentElement && bsInput.parentElement.querySelector('span');
+            if (bsLabel) bsLabel.textContent = (s === 'ALRT_UFBOOT') ? "UFBoot >" : "BS >";
+            setInput(bsInput, globalEnable && (s === 'BS' || s === 'mixed' || s === 'ALRT_UFBOOT'));
+        }
     }
 
     // START

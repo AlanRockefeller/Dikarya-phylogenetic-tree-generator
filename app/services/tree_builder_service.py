@@ -22,7 +22,11 @@ from app.config import Config
 from app.models import TreeBuilderParams
 
 _RAXML_HELP_CACHE = None
-from app.services.subprocess_utils import run_command, run_command_streaming
+from app.services.subprocess_utils import (
+    run_command,
+    run_command_streaming,
+    tool_failure_message,
+)
 from app.services.fasta_utils import sanitize_fasta_headers, restore_tree_names
 
 # Try to import Bio.Phylo for NJ, or implement simple fallback
@@ -35,6 +39,11 @@ except ImportError:
 
 logger = logging.getLogger(__name__)
 
+# Number of resamples FastTree uses for its SH-like local support test (-boot N).
+# Despite the flag name, these are NOT bootstrap replicates: the resulting node
+# values are SH-like local supports on a 0-1 scale.
+FASTTREE_SH_RESAMPLES = 1000
+
 # IQ-TREE model strings (e.g. "GTR+F+I+G4", "MFP", "TIM2e+R4",
 # "GTR+G:part1,HKY+I:part2") are made up of model/modifier names, digits,
 # and a small set of punctuation for modifiers/partitions/params. This is a
@@ -45,6 +54,17 @@ logger = logging.getLogger(__name__)
 _IQTREE_MODEL_ALLOWED_RE = re.compile(r"^[A-Za-z0-9+\-_.,:{}*/]+$")
 _IQTREE_MODEL_MAX_LEN = 256
 _IQTREE_DEFAULT_MODEL = "GTR+G"
+
+# IQ-TREE model strings that ask ModelFinder to pick the model rather than
+# naming one. MF selects only; MFP selects then infers the tree. TEST/TESTNEW
+# are the jModelTest-compatible aliases.
+_MODEL_FINDER_REQUESTS = frozenset({"MF", "MFP", "TEST", "TESTNEW", "TESTONLY", "TESTNEWONLY"})
+
+
+def _is_model_finder_request(model_str: str) -> bool:
+    """True when the model string delegates model choice to ModelFinder."""
+    base = (model_str or "").strip().upper().split("+")[0]
+    return base in _MODEL_FINDER_REQUESTS
 
 
 def _validate_iqtree_model(model_str: str) -> str:
@@ -104,6 +124,18 @@ def run_tree_builder(
         "bootstrap": params.bootstrap,
         "run_dir": str(output_newick.parent)
     }
+    if method == "fasttree":
+        # FastTree ignores params.bootstrap entirely: _run_fasttree hardcodes
+        # -boot N, which computes SH-like local supports (0-1), not bootstrap
+        # proportions. Recording a bootstrap count here made the viewer report a
+        # number that was both wrong and the wrong kind of support value.
+        metadata["bootstrap"] = None
+        metadata["support_type"] = "sh_like"
+        metadata["support_resamples"] = FASTTREE_SH_RESAMPLES
+    if method == "iqtree" and (params.alrt_replicates or 0) > 0:
+        # Node labels are dual "SH-aLRT/UFBoot" values, both on a 0-100 scale.
+        metadata["support_type"] = "alrt_ufboot"
+        metadata["alrt_replicates"] = params.alrt_replicates
     if method == "mrbayes":
         burnin_fraction = _normalize_mrbayes_burnin_fraction(
             params.mcmc_burnin_fraction
@@ -121,7 +153,16 @@ def run_tree_builder(
         elif method == "raxml":
             _run_raxml(alignment_fasta, output_newick, output_nexus, params, config, task_logger, job_id)
         elif method == "iqtree":
-            _run_iqtree(alignment_fasta, output_newick, output_nexus, params, config, task_logger, job_id)
+            selected_model = _run_iqtree(
+                alignment_fasta, output_newick, output_nexus, params, config, task_logger, job_id
+            )
+            if selected_model:
+                # params.model stays as requested ("MFP"); model_selected is what
+                # ModelFinder actually fit. Both matter: one is the setting, the
+                # other is what you cite.
+                metadata["model_selected"] = selected_model
+                if _is_model_finder_request(params.model):
+                    task_logger.info(f"ModelFinder selected substitution model: {selected_model}")
         elif method == "mrbayes":
             _run_mrbayes(alignment_fasta, output_newick, output_nexus, params, config, task_logger, job_id)
         elif method == "fasttree":
@@ -488,19 +529,27 @@ def _run_raxml(
         from app.workers.events import publish_command
         publish_command(job_id, "tree", cmd)
         
+        limit_hours = float(getattr(config, "RAXML_TIME_LIMIT_HOURS", 15) or 15)
+        limit_seconds = int(limit_hours * 3600)
+
         exit_code, stats = run_command_streaming(
             cmd,
             stderr_path=log_file,
             on_stdout_line=_make_log_callback(job_id, "tree", "stdout"),
             on_stderr_line=_make_log_callback(job_id, "tree", "stderr"),
+            timeout=limit_seconds,
+            # RLIMIT_CPU is summed across threads, so the wall-clock budget has
+            # to be multiplied by the thread count (plus headroom) or the kernel
+            # kills RAxML a fraction of the way into the time it was granted.
+            cpu_limit_seconds=int(limit_seconds * max(1, threads) * 1.2),
         )
-        
+
         if exit_code != 0:
-            raise RuntimeError(f"RAxML failed with exit code {exit_code}")
+            raise RuntimeError(tool_failure_message("RAxML", exit_code, limit_hours))
     else:
         returncode, stdout, stderr = run_command(cmd, log_file=log_file)
         if returncode != 0:
-            raise RuntimeError(f"RAxML failed with return code {returncode}. See logs.")
+            raise RuntimeError(tool_failure_message("RAxML", returncode))
             
     # 6. Output Handling
     best_tree = Path(f"{prefix}.raxml.bestTree")
@@ -582,7 +631,14 @@ def _run_iqtree(
     
     if params.bootstrap and params.bootstrap > 0:
         cmd.extend(["-B", str(params.bootstrap)])
-        
+
+    # SH-aLRT branch test. With both -alrt and -B, IQ-TREE writes dual
+    # "SH-aLRT/UFBoot" labels (e.g. "82.7/87") into <prefix>.treefile.
+    alrt = params.alrt_replicates or 0
+    use_alrt = alrt > 0
+    if use_alrt:
+        cmd.extend(["-alrt", str(alrt)])
+
     log_file = output_newick.parent.parent / "logs" / "tree_builder.log"
     
     if job_id:
@@ -598,19 +654,25 @@ def _run_iqtree(
         )
         
         if exit_code != 0:
-            raise RuntimeError(f"IQ-TREE failed with exit code {exit_code}")
+            raise RuntimeError(tool_failure_message("IQ-TREE", exit_code))
     else:
         returncode, stdout, stderr = run_command(cmd, log_file=log_file)
         
         if returncode != 0:
-            raise RuntimeError(f"IQ-TREE failed with return code {returncode}. See logs.")
+            raise RuntimeError(tool_failure_message("IQ-TREE", returncode))
         
     # Output handling
     treefile = Path(f"{prefix}.treefile")
     contree = Path(f"{prefix}.contree")
-    
-    source_tree = contree if contree.exists() else treefile
-    
+
+    # .contree (the UFBoot consensus tree) carries UFBoot values only, so it
+    # silently drops the SH-aLRT half of the dual labels. When SH-aLRT was
+    # requested we must take .treefile, which carries both.
+    if use_alrt and treefile.exists():
+        source_tree = treefile
+    else:
+        source_tree = contree if contree.exists() else treefile
+
     if source_tree.exists():
         shutil.copy(source_tree, output_newick)
         
@@ -620,6 +682,35 @@ def _run_iqtree(
         _convert_newick_to_nexus(output_newick, output_nexus)
     else:
         raise RuntimeError("IQ-TREE output tree not found.")
+
+    # When ModelFinder chose the model, "MFP" is what the user asked for but not
+    # what was actually used. Report the concrete winner so the tree is
+    # reproducible and citable.
+    return _read_iqtree_selected_model(Path(f"{prefix}.iqtree"))
+
+
+# ModelFinder writes exactly one such line into <prefix>.iqtree, e.g.
+#   Best-fit model according to BIC: TIM2+F+I+G4
+_IQTREE_BEST_MODEL_RE = re.compile(
+    r"^Best-fit model according to \w+:\s*(\S+)\s*$", re.MULTILINE
+)
+
+
+def _read_iqtree_selected_model(report_path: Path) -> Optional[str]:
+    """Return the model ModelFinder picked, or None if it did not run."""
+    try:
+        report_text = report_path.read_text(errors="replace")
+    except OSError:
+        return None
+    match = _IQTREE_BEST_MODEL_RE.search(report_text)
+    if not match:
+        return None
+    selected = match.group(1)
+    # Same character hygiene as the inbound model string; this value is echoed
+    # into JSON that the viewer renders.
+    if len(selected) > _IQTREE_MODEL_MAX_LEN or not _IQTREE_MODEL_ALLOWED_RE.match(selected):
+        return None
+    return selected
 
 
 def _run_mrbayes(
@@ -676,7 +767,7 @@ def _run_mrbayes(
         )
         
         if exit_code != 0:
-            raise RuntimeError(f"MrBayes failed with exit code {exit_code}")
+            raise RuntimeError(tool_failure_message("MrBayes", exit_code))
     else:
         returncode, stdout, stderr = run_command(cmd, log_file=log_file)
         
@@ -684,7 +775,7 @@ def _run_mrbayes(
             task_logger.error(f"MrBayes failed. RC={returncode}")
             task_logger.error(f"STDOUT: {stdout}")
             task_logger.error(f"STDERR: {stderr}")
-            raise RuntimeError(f"MrBayes failed with return code {returncode}. Error: {stderr}")
+            raise RuntimeError(tool_failure_message("MrBayes", returncode))
         
     # Output: <input>.con.tre (Consensus tree)
     con_tree = Path(f"{nexus_input}.con.tre")
@@ -805,9 +896,13 @@ def _run_fasttree(
 ):
     """
     Run FastTree 2.2.0 tree inference.
-    
+
     FastTree writes the tree to stdout.
     Command: fasttree -gtr -nt -gamma -boot 1000 alignment.fasta > tree.newick
+
+    Note: -boot sets the number of resamples for FastTree's SH-like local
+    support test, not a bootstrap analysis. Node values are 0-1 SH-like
+    supports. params.bootstrap is deliberately unused here.
     """
     
     # Check binary existence
@@ -825,7 +920,8 @@ def _run_fasttree(
         "-gtr",
         "-nt", 
         "-gamma",
-        "-boot", str(1000) # Fixed 1000 bootstraps as per requirement
+        # Resamples for the SH-like local support test (not bootstrap replicates)
+        "-boot", str(FASTTREE_SH_RESAMPLES)
     ]
     
     # Check if alignment is valid (not empty)
@@ -854,7 +950,7 @@ def _run_fasttree(
         )
             
         if exit_code != 0:
-             raise RuntimeError(f"FastTree failed with exit code {exit_code}")
+             raise RuntimeError(tool_failure_message("FastTree", exit_code))
 
     else:
         # specific handling if we assume run_command captures stdout
@@ -864,7 +960,7 @@ def _run_fasttree(
         if returncode != 0:
             task_logger.error(f"FastTree failed. RC={returncode}")
             task_logger.error(f"STDERR: {stderr}")
-            raise RuntimeError(f"FastTree failed with return code {returncode}. See logs.")
+            raise RuntimeError(tool_failure_message("FastTree", returncode))
             
         # Write stdout to newick file
         with open(output_newick, "w") as f:

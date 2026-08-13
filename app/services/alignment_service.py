@@ -17,7 +17,69 @@ from typing import Optional
 
 from app.config import Config
 from app.models import AlignmentParams
-from app.services.subprocess_utils import run_command, run_command_streaming
+from app.services.subprocess_utils import (
+    run_command,
+    run_command_streaming,
+    tool_failure_message,
+)
+
+
+def _verify_already_aligned(input_fasta: Path, logger) -> None:
+    """Fail early, and by name, when 'no alignment' is used on unaligned input.
+
+    Choosing method='none' asserts the sequences are already aligned. When they
+    are not, nothing here used to object: trimming logged a warning and copied
+    the file through, and the first real complaint came from trimAl ("exit code
+    255") or FastTree ("expected 611 but have 601 instead") -- neither of which
+    tells the user what they actually did wrong. Three of the pipeline failures
+    on record were this exact situation.
+
+    Headers are still the user's own at this point (sanitization happens later,
+    per tool), so the offending sequences can be named as submitted.
+    """
+    lengths = {}
+    name = None
+    with open(input_fasta) as handle:
+        for line in handle:
+            line = line.rstrip("\n")
+            if line.startswith(">"):
+                name = line[1:].strip()
+                lengths[name] = 0
+            elif name is not None:
+                lengths[name] += len(line.strip())
+
+    if len(lengths) < 2:
+        return
+
+    counts = {}
+    for length in lengths.values():
+        counts[length] = counts.get(length, 0) + 1
+    if len(counts) == 1:
+        return
+
+    # The modal length is the intended column count; everything else is odd.
+    expected = max(counts, key=lambda length: (counts[length], length))
+    odd = [(n, l) for n, l in lengths.items() if l != expected]
+    # Full GenBank descriptions run to hundreds of characters and would bury
+    # the message; the leading accession is what identifies the record.
+    shown = ", ".join(
+        f"{n[:57] + '...' if len(n) > 60 else n} ({l})" for n, l in odd[:3]
+    )
+    if len(odd) > 3:
+        shown += f", and {len(odd) - 3} more"
+
+    logger.error(
+        "Alignment method 'none' rejected: %d of %d sequences differ from the "
+        "modal length of %d columns.", len(odd), len(lengths), expected
+    )
+    raise RuntimeError(
+        f"You chose to skip alignment, which requires sequences that are "
+        f"already aligned, but {len(odd)} of {len(lengths)} are not the same "
+        f"length as the rest. Aligned sequences must all have the same number "
+        f"of columns (including gaps). Most are {expected} columns; these "
+        f"differ: {shown}. Either choose an alignment method such as MAFFT or "
+        f"MUSCLE, or submit a file that is already aligned."
+    )
 
 
 def run_alignment(
@@ -58,6 +120,7 @@ def run_alignment(
     try:
         if method == "none":
             logger.info("Skipping alignment (method='none'). Copying input to output.")
+            _verify_already_aligned(input_fasta, logger)
             shutil.copy(input_fasta, output_fasta)
         elif method == "mafft":
             _run_mafft(input_fasta, output_fasta, params, config, logger, job_id)
@@ -187,13 +250,13 @@ def _run_mafft(
         )
         
         if exit_code != 0:
-            raise RuntimeError(f"MAFFT failed with exit code {exit_code}")
+            raise RuntimeError(tool_failure_message("MAFFT", exit_code))
     else:
         # Fallback to non-streaming for backward compatibility
         returncode, stdout, stderr = run_command(cmd, log_file=log_file)
         
         if returncode != 0:
-            raise RuntimeError(f"MAFFT failed with return code {returncode}. See logs.")
+            raise RuntimeError(tool_failure_message("MAFFT", returncode))
             
         with open(output_fasta, "w") as f:
             f.write(stdout)
@@ -231,12 +294,12 @@ def _run_muscle(
         )
         
         if exit_code != 0:
-            raise RuntimeError(f"MUSCLE failed with exit code {exit_code}")
+            raise RuntimeError(tool_failure_message("MUSCLE", exit_code))
     else:
         returncode, stdout, stderr = run_command(cmd, log_file=log_file)
         
         if returncode != 0:
-            raise RuntimeError(f"MUSCLE failed with return code {returncode}. See logs.")
+            raise RuntimeError(tool_failure_message("MUSCLE", returncode))
 
 
 def _run_clustalo(
@@ -268,12 +331,12 @@ def _run_clustalo(
         )
         
         if exit_code != 0:
-            raise RuntimeError(f"Clustal Omega failed with exit code {exit_code}")
+            raise RuntimeError(tool_failure_message("Clustal Omega", exit_code))
     else:
         returncode, stdout, stderr = run_command(cmd, log_file=log_file)
         
         if returncode != 0:
-            raise RuntimeError(f"Clustal Omega failed with return code {returncode}. See logs.")
+            raise RuntimeError(tool_failure_message("Clustal Omega", returncode))
 
 
 def _run_iqtree_builtin(
@@ -315,12 +378,12 @@ def _run_iqtree_builtin(
         )
         
         if exit_code != 0:
-            raise RuntimeError(f"IQ-TREE alignment failed with exit code {exit_code}")
+            raise RuntimeError(tool_failure_message("IQ-TREE alignment", exit_code))
     else:
         returncode, stdout, stderr = run_command(cmd, log_file=log_file)
         
         if returncode != 0:
-            raise RuntimeError(f"IQ-TREE alignment failed with return code {returncode}. See logs.")
+            raise RuntimeError(tool_failure_message("IQ-TREE alignment", returncode))
     
     # IQ-TREE output file handling
     # Check for likely output files

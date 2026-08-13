@@ -11,6 +11,10 @@ from difflib import SequenceMatcher
 from datetime import datetime
 
 from app.services.security_utils import validate_job_id, validate_safe_file_path, coerce_bool
+from app.services.its_extraction_service import (
+    normalize_region as normalize_its_region,
+    resolve_min_length as resolve_its_min_length,
+)
 from app.services.access_control import check_job_access
 from app.extensions import csrf, limiter
 
@@ -101,6 +105,25 @@ def _is_genbank_accession(text):
 MAX_CUSTOM_GENBANK_ACCESSIONS = 200
 MAX_CUSTOM_GENBANK_SEQUENCE_BP = 5000
 MAX_SEQUENCE_METADATA_ITEMS = 5000
+
+VALID_TREE_METHODS = {"nj", "raxml", "iqtree", "mrbayes", "fasttree"}
+
+# Settings the tree viewer's Advanced panel may change on a recompute. Anything
+# outside this set (sequences, import provenance, trimming report, job
+# ownership) is read from the stored job and is not request-controlled.
+RECOMPUTE_OVERRIDABLE_FIELDS = frozenset({
+    "alignment_method", "trimming_method", "trim_terminal_overhangs",
+    "tree_method", "tree_model",
+    "bootstrap", "alrt_replicates",
+    "mcmc_generations", "mcmc_nruns", "mcmc_nchains", "mcmc_burnin_fraction",
+    "run_preset", "bootstrap_preset", "bootstrap_cap", "enable_bootstrap",
+    "start_tree_override", "moose_enabled", "early_stopping", "seed",
+    "outgroup", "notes",
+})
+
+# Settings the viewer's Advanced panel reads back so it can open pre-filled with
+# what the job actually ran. Same list, minus free-text notes.
+RECOMPUTE_READABLE_FIELDS = RECOMPUTE_OVERRIDABLE_FIELDS - {"notes"}
 
 US_STATE_TO_ABBR = {
     "alabama": "al", "alaska": "ak", "arizona": "az", "arkansas": "ar",
@@ -1082,6 +1105,12 @@ def run_blast():
             "message": f"Found {len(sequences)} related sequences"
         })
         
+    except ValueError as e:
+        # Invalid/oversized BLAST input is a user-correctable request, not an
+        # application crash. Keep it out of the 500 log and return the useful
+        # explanation to the Tree Builder.
+        logger.warning("BLAST request rejected: %s", e)
+        return jsonify({"status": "error", "error": str(e)}), 400
     except Exception as e:
         logger.error(f"BLAST API error: {e}", exc_info=True)
         return _server_error(e)
@@ -1151,6 +1180,49 @@ def fetch_genbank_accessions():
         })
     except Exception as e:
         logger.error(f"GenBank accession API error: {e}", exc_info=True)
+        return _server_error(e)
+
+
+@bp.route('/genbank/locations', methods=['POST'])
+@limiter.limit("20 per minute; 300 per hour")
+def fetch_genbank_locations():
+    """
+    Look up collection locations for GenBank accessions.
+
+    Used by the Tree Builder's "add collection locations" option, which appends
+    the location to FASTA headers for pasted accessions and for accessions found
+    inside pasted FASTA headers.
+
+    Request: { "accessions": ["OR807397", "MJ505555.1"] }
+    Response: { "status": "success", "locations": {"OR807397": "USA: Arizona, Greenlee County"}, "missing": [...] }
+    """
+    data = request.get_json(silent=True) or {}
+    raw_accessions = data.get("accessions", data.get("input", ""))
+
+    # Tokens scraped out of FASTA headers are best-effort guesses, so silently
+    # drop anything that is not accession-shaped instead of failing the request.
+    accessions, _invalid = _parse_genbank_accession_tokens(raw_accessions)
+
+    if not accessions:
+        return jsonify({"status": "error", "error": "No GenBank accessions provided"}), 400
+
+    if len(accessions) > MAX_CUSTOM_GENBANK_ACCESSIONS:
+        return jsonify({
+            "status": "error",
+            "error": f"Too many accessions (max {MAX_CUSTOM_GENBANK_ACCESSIONS})"
+        }), 400
+
+    try:
+        from app.services.genbank_location_service import lookup_locations
+
+        locations, missing = lookup_locations(accessions)
+        return jsonify({
+            "status": "success",
+            "locations": locations,
+            "missing": missing
+        })
+    except Exception as e:
+        logger.error(f"GenBank location API error: {e}", exc_info=True)
         return _server_error(e)
 
 
@@ -1647,6 +1719,17 @@ def inaturalist_tree():
     local_limit, local_limit_error = _mycomap_rerun_limit_from_request(data, "local")
     if local_limit_error:
         return jsonify({"status": "error", "error": local_limit_error}), 422
+    # Alan 8/4/26 - Allow an extra tree that leaves the observation's existing
+    # Phylogenetic Tree field URL in place.
+    keep_existing_tree_url, keep_existing_ok = coerce_bool(
+        data.get('keep_existing_tree_url'),
+        default=False,
+    )
+    if not keep_existing_ok:
+        return jsonify({
+            "status": "error",
+            "error": "keep_existing_tree_url must be a boolean.",
+        }), 422
     ncbi_limit, ncbi_limit_error = _mycomap_rerun_limit_from_request(data, "ncbi")
     if ncbi_limit_error:
         return jsonify({"status": "error", "error": ncbi_limit_error}), 422
@@ -1658,16 +1741,17 @@ def inaturalist_tree():
                 user=current_user,
                 rebuild_ncbi_blast=rebuild_ncbi_blast,
                 recreate_existing_tree=recreate_existing_tree,
+                keep_existing_tree_url=keep_existing_tree_url,
                 mycomap_local_limit=local_limit,
                 mycomap_ncbi_limit=ncbi_limit,
                 public_base_url=request.url_root,
             )
             return jsonify(result), 202
-        if rebuild_ncbi_blast or recreate_existing_tree:
+        if rebuild_ncbi_blast or recreate_existing_tree or keep_existing_tree_url:
             return jsonify({
                 "status": "error",
                 "error": (
-                    "NCBI BLAST rebuild and existing-tree re-creation are only "
+                    "NCBI BLAST rebuild and existing-tree options are only "
                     "supported for a single iNaturalist observation."
                 ),
             }), 422
@@ -1743,17 +1827,26 @@ def inaturalist_tree_batch():
             "status": "error",
             "error": "recreate_existing_tree must be a boolean.",
         }), 422
+    keep_existing_tree_url, keep_existing_ok = coerce_bool(
+        data.get('keep_existing_tree_url'),
+        default=False,
+    )
+    if not keep_existing_ok:
+        return jsonify({
+            "status": "error",
+            "error": "keep_existing_tree_url must be a boolean.",
+        }), 422
     local_limit, local_limit_error = _mycomap_rerun_limit_from_request(data, "local")
     if local_limit_error:
         return jsonify({"status": "error", "error": local_limit_error}), 422
     ncbi_limit, ncbi_limit_error = _mycomap_rerun_limit_from_request(data, "ncbi")
     if ncbi_limit_error:
         return jsonify({"status": "error", "error": ncbi_limit_error}), 422
-    if rebuild_ncbi_blast or recreate_existing_tree:
+    if rebuild_ncbi_blast or recreate_existing_tree or keep_existing_tree_url:
         return jsonify({
             "status": "error",
             "error": (
-                "NCBI BLAST rebuild and existing-tree re-creation are only "
+                "NCBI BLAST rebuild and existing-tree options are only "
                 "supported for a single iNaturalist observation."
             ),
         }), 422
@@ -1989,11 +2082,17 @@ def create_job():
         "mycomap_blast_url": data.get("mycomap_blast_url") or "",
         "accessions": data.get("accessions", []),
         "alignment_method": data.get("alignment_method", "default"),
-        "trimming_method": data.get("trimming_method", "none"),
+        "trimming_method": data.get("trimming_method", Config.DEFAULT_TRIMMING_METHOD),
         "trim_terminal_overhangs": coerce_bool(data.get("trim_terminal_overhangs"), True)[0],
+        "its_region": normalize_its_region(data.get("its_region")),
+        "its_min_length": resolve_its_min_length(
+            normalize_its_region(data.get("its_region")), data.get("its_min_length")
+        ),
         "alignment_options": data.get("alignment_options", {}),
         "tree_method": tree_method,
-        "tree_model": data.get("tree_model", "GTR+G"),
+        # Left unset when the caller omits it: the worker resolves the default
+        # per method (ModelFinder for IQ-TREE, Config.DEFAULT_ML_MODEL otherwise).
+        "tree_model": data.get("tree_model") or None,
         "bootstrap": data.get("bootstrap", 1000), # Legacy field
         "mcmc_generations": data.get("mcmc_generations", 50000),
         "mcmc_nruns": data.get("mcmc_nruns", 2),
@@ -2011,6 +2110,13 @@ def create_job():
         "seed": data.get("seed"),
         "outgroup": data.get("outgroup")
     }
+
+    # job_params is a whitelist, so IQ-TREE's SH-aLRT setting has to be copied
+    # across explicitly. Only forward it when the caller actually sent one --
+    # leaving the key absent lets the worker apply DEFAULT_IQTREE_ALRT, while an
+    # explicit 0 still disables the test.
+    if "alrt_replicates" in data:
+        job_params["alrt_replicates"] = data.get("alrt_replicates")
 
     # Validate/Clamp RAxML params if method is raxml
     if tree_method == 'raxml':
@@ -2090,6 +2196,7 @@ def create_job():
                 "alignment_method": job_params["alignment_method"],
                 "trimming_method": job_params["trimming_method"],
                 "trim_terminal_overhangs": job_params["trim_terminal_overhangs"],
+                "its_region": job_params.get("its_region"),
                 "run_preset": job_params.get("run_preset"),
                 "bootstrap_cap": job_params.get("bootstrap_cap")
             }
@@ -2486,6 +2593,137 @@ def save_selection_sets(job_id):
     except Exception as e:
         return _server_error(e)
 
+@bp.route('/job/<job_id>/rebuild-with-duplicates', methods=['POST'])
+@limiter.limit("6 per minute")
+def rebuild_with_duplicates(job_id):
+    """Start a NEW job from this job's sequences with the removed duplicates added back.
+
+    Deliberately creates a separate job rather than recomputing in place, so the
+    original tree keeps its URL and stays citable.
+    """
+    db_job, error_msg, status_code = check_job_access(job_id, mode="edit")
+    if error_msg:
+        return jsonify({"status": "error", "error": error_msg}), status_code
+
+    try:
+        import json as _json
+        input_info_path = Config.JOB_DIR / job_id / "input_info.json"
+        if not input_info_path.exists():
+            return jsonify({"status": "error", "error": "Original job inputs are no longer on disk"}), 404
+
+        with open(input_info_path, "r") as f:
+            source_params = _json.load(f)
+
+        duplicates = (source_params.get("import_filter_details") or {}).get("duplicates") or {}
+        removed = duplicates.get("removed_records") or []
+        if not removed:
+            return jsonify({"status": "error", "error": "This job has no removed duplicates to restore"}), 400
+
+        restored = [r for r in removed if str(r.get("sequence") or "").strip()]
+        if not restored:
+            return jsonify({
+                "status": "error",
+                "error": "Removed duplicates were recorded without their sequences, so they cannot be restored"
+            }), 400
+
+        job_params = dict(source_params)
+        # Append the removed records back onto the FASTA payload.
+        sequence_text = str(job_params.get("sequence") or "").rstrip("\n")
+        blocks = [sequence_text] if sequence_text else []
+        for record in restored:
+            sequence = "".join(str(record.get("sequence") or "").split())
+            wrapped = "\n".join(sequence[i:i + 80] for i in range(0, len(sequence), 80))
+            blocks.append(f">{record.get('name', '')}\n{wrapped}")
+        job_params["sequence"] = "\n".join(blocks) + "\n"
+
+        # Without this the dedup in enqueue_job would immediately strip them again.
+        job_params["skip_observation_dedup"] = True
+        job_params["import_filter_details"] = {
+            k: v for k, v in (job_params.get("import_filter_details") or {}).items()
+            if k != "duplicates"
+        }
+        job_params["notes"] = (
+            f"Rebuild of {job_id} including {len(restored)} duplicate "
+            f"observation record{'' if len(restored) == 1 else 's'}"
+        )
+        job_params["rebuilt_from_job_id"] = job_id
+
+        new_job_id = enqueue_job(job_params)
+        new_record = Job(
+            id=new_job_id,
+            status="queued",
+            job_dir=str(Config.JOB_DIR / new_job_id),
+            input_type=job_params.get("input_type", "sequence"),
+            metrics={
+                "tree_method": job_params.get("tree_method"),
+                "notes": job_params.get("notes"),
+                "alignment_method": job_params.get("alignment_method"),
+                "trimming_method": job_params.get("trimming_method"),
+                "rebuilt_from_job_id": job_id,
+            },
+        )
+        if db_job is not None and db_job.user_id:
+            new_record.user_id = db_job.user_id
+        elif current_user.is_authenticated:
+            new_record.user_id = current_user.id
+        db.session.add(new_record)
+        db.session.commit()
+
+        return jsonify({
+            "status": "queued",
+            "job_id": new_job_id,
+            "restored_count": len(restored),
+            "view_url": f"/job/{new_job_id}/view",
+            "status_url": f"/job/{new_job_id}",
+        }), 202
+    except Exception as e:
+        return _server_error(e)
+
+
+@bp.route('/job/<job_id>/params', methods=['GET'])
+def get_job_pipeline_params(job_id):
+    """Return the pipeline settings a job ran with.
+
+    Used by the Add Sequences page to open its Advanced panel pre-filled with
+    the job's real settings instead of the form defaults, so "Add & Recompute"
+    doesn't quietly change the analysis.
+    """
+    _, error_msg, status_code = check_job_access(job_id, mode="edit")
+    if error_msg:
+        return jsonify({"status": "error", "error": error_msg}), status_code
+
+    import json as _json
+    input_info_path = Config.JOB_DIR / job_id / "input_info.json"
+    if not input_info_path.exists():
+        return jsonify({"status": "error", "error": "Job inputs are no longer on disk"}), 404
+
+    try:
+        with open(input_info_path, "r") as f:
+            stored = _json.load(f)
+    except (OSError, ValueError) as e:
+        logger.warning(f"Could not read params for job {job_id}: {e}")
+        return jsonify({"status": "error", "error": "Job parameters could not be read"}), 500
+
+    params = {key: stored.get(key) for key in RECOMPUTE_READABLE_FIELDS if key in stored}
+
+    # The requested model may be "MFP"; report what ModelFinder actually chose
+    # so the panel can show it rather than leaving the user guessing.
+    selected_model = None
+    metadata_path = Config.JOB_DIR / job_id / "tree" / "tree_metadata.json"
+    if metadata_path.exists():
+        try:
+            with open(metadata_path, "r") as f:
+                selected_model = (_json.load(f) or {}).get("model_selected")
+        except (OSError, ValueError):
+            pass
+
+    return jsonify({
+        "status": "success",
+        "params": params,
+        "model_selected": selected_model,
+    })
+
+
 @bp.route('/job/<job_id>/tree/recompute', methods=['POST'])
 @limiter.limit("1 per minute")
 def recompute_tree_job(job_id):
@@ -2506,9 +2744,36 @@ def recompute_tree_job(job_id):
             with open(input_info_path, "r") as f:
                 params_dict = json.load(f)
         
-        # Merge with request data
+        # Merge with request data. Only pipeline settings may be overridden --
+        # the request must not be able to rewrite the stored sequences, the
+        # import provenance, or the trimming report by posting those keys.
         req_data = request.get_json(silent=True) or {}
-        params_dict.update(req_data)
+        overrides = {
+            key: value for key, value in req_data.items()
+            if key in RECOMPUTE_OVERRIDABLE_FIELDS
+        }
+        if overrides:
+            method = str(overrides.get("tree_method", params_dict.get("tree_method", "")) or "").lower()
+            if "tree_method" in overrides and method not in VALID_TREE_METHODS:
+                return jsonify({
+                    "status": "error",
+                    "error": f"Unsupported tree method. Choose one of: {', '.join(sorted(VALID_TREE_METHODS))}"
+                }), 400
+            params_dict.update(overrides)
+            # Persist so the status page, the viewer's details panel and any
+            # later recompute all report the settings this run actually used.
+            try:
+                with open(input_info_path, "w") as f:
+                    json.dump(params_dict, f, indent=2)
+            except OSError as write_err:
+                logger.warning(f"Could not persist recompute overrides for job {job_id}: {write_err}")
+
+        # Per-request control flags, not pipeline settings. Applied after the
+        # write above so they are not persisted into the job's stored params,
+        # and passed through params_dict because that is where both the sync
+        # call below and run_recompute_job read them from.
+        if "use_current_input" in req_data:
+            params_dict["use_current_input"] = req_data["use_current_input"]
 
         if req_data.get("async"):
             recompute_job_id = enqueue_recompute_job(job_id, params_dict)
@@ -3183,22 +3448,54 @@ def _build_snapshot(job_id: str) -> dict:
         pass
     
     # If job failed, extract failure info
+    # Surface an automatic restart at any status: a requeued job goes back to
+    # 'queued', so gating this on 'failed' would hide it exactly when the user is
+    # watching the job run again and wondering why it started over.
+    _metrics_any = (db_job.metrics if db_job else None) or {}
+    job_info["requeued_after_interrupt"] = bool(_metrics_any.get('requeued_at'))
+    job_info["restart_requeue_count"] = _metrics_any.get('restart_requeue_count') or 0
+    if job_info["requeued_after_interrupt"] and status != 'failed':
+        job_info["interrupted_notice"] = _metrics_any.get('interrupted_reason')
+
     if status == 'failed':
-        if db_job and db_job.metrics:
-            job_info["error_summary"] = db_job.metrics.get('error')
-            job_info["failed_step"] = db_job.metrics.get('failed_step')
-        
+        metrics = (db_job.metrics if db_job else None) or {}
+        if metrics:
+            job_info["error_summary"] = metrics.get('error')
+            job_info["failed_step"] = metrics.get('failed_step')
+            # Diagnostics persisted by the worker's failure handler. Without these
+            # a reloaded page lost everything the live SSE stream had shown.
+            job_info["exit_code"] = metrics.get('exit_code')
+            job_info["stderr_tail"] = metrics.get('stderr_tail') or []
+            job_info["traceback_tail"] = metrics.get('traceback_tail') or []
+            job_info["failed_step_label"] = metrics.get('failed_step_label')
+            job_info["tool"] = metrics.get('failed_tool')
+            job_info["failed_at"] = metrics.get('failed_at')
+
+            # A job killed mid-run (service restart, OOM) never reaches the
+            # failure handler, so it has no 'error' at all and the panel would
+            # just say "An error occurred". The reconciler records what happened;
+            # surface that instead, plus whether it was retried.
+            interrupted = metrics.get('interrupted_reason')
+            if interrupted and not job_info["error_summary"]:
+                job_info["error_summary"] = interrupted
+            job_info["interrupted"] = bool(interrupted)
+            job_info["requeued_after_interrupt"] = bool(metrics.get('requeued_at'))
+            job_info["restart_requeue_count"] = metrics.get('restart_requeue_count') or 0
+
         # Try to get more from RQ result
         result = rq_status.get('result', {})
         if isinstance(result, dict):
             job_info["error_summary"] = job_info["error_summary"] or result.get('error')
-            
-        # Get failed step label from meta
+
+        # Fall back to step meta for the label/tool when metrics lacks them
+        # (jobs that failed before this richer capture existed).
         failed_step = job_info.get("failed_step")
         if failed_step and "steps" in job_info["meta"]:
             step_info = job_info["meta"]["steps"].get(failed_step, {})
-            job_info["failed_step_label"] = step_info.get("label", failed_step)
-            job_info["tool"] = step_info.get("tool")
+            job_info["failed_step_label"] = (
+                job_info.get("failed_step_label") or step_info.get("label", failed_step)
+            )
+            job_info["tool"] = job_info.get("tool") or step_info.get("tool")
     
     # If job completed, include result files
     if status == 'completed':
@@ -3271,18 +3568,50 @@ def job_events_stream(job_id):
             
             # Check if job is already terminal
             job_status = snapshot["job"]["status"]
-            if job_status in ('completed', 'failed'):
-                # Still keep connection open briefly for any final events
-                pass
-            
+            # A job that finished before the client connected will never produce a
+            # terminal pubsub event, and the DB-poll block below is skipped for
+            # terminal jobs -- so without a deadline this loop had no reachable exit
+            # and every viewer of a completed job pinned a request slot until their
+            # socket happened to fail. Linger only long enough to catch stragglers.
+            already_terminal = job_status in ('completed', 'failed')
+            terminal_deadline = (
+                time.monotonic() + Config.SSE_TERMINAL_LINGER_SECONDS
+                if already_terminal else None
+            )
+
             # Throttle timers (use monotonic clock for reliable intervals)
-            last_ping = time.monotonic()
+            stream_started = time.monotonic()
+            last_ping = stream_started
             last_db_poll = 0.0  # Start at 0 to trigger immediate first poll
-            
+
             # Tunable interval for DB polling (seconds)
             DB_POLL_INTERVAL = 1.0
-            
+
+            # Hard lifetime cap. This loop only exits on a terminal job state, and a
+            # generator whose client has gone away keeps looping while sleeping --
+            # burning almost no CPU but permanently holding one of the
+            # (workers x threads) request slots. Jobs that never reach a terminal
+            # state therefore leak a slot per viewer until the pool is exhausted and
+            # the whole site stops responding. Cutting the stream lets EventSource
+            # reconnect (it retries automatically and we re-send a fresh snapshot),
+            # so a live viewer sees nothing but an orphan cannot pin a thread.
+            MAX_STREAM_SECONDS = Config.SSE_MAX_STREAM_SECONDS
+
             while True:
+                if time.monotonic() - stream_started >= MAX_STREAM_SECONDS:
+                    # Ask the client to come straight back, then let go of the slot.
+                    yield "event: reconnect\ndata: {\"reason\": \"max_stream_age\"}\n\n"
+                    logger.info(
+                        "SSE stream for job %s hit the %ss lifetime cap; closing so the "
+                        "client can reconnect.", job_id, MAX_STREAM_SECONDS
+                    )
+                    break
+
+                if terminal_deadline is not None and time.monotonic() >= terminal_deadline:
+                    # Job was already finished when this stream opened; nothing more
+                    # is coming, so release the slot instead of pinging forever.
+                    break
+
                 # Check for PubSub messages (non-blocking with short timeout)
                 # Use shorter timeout to allow responsive loop with brief sleep
                 message = pubsub.get_message(timeout=0.1)

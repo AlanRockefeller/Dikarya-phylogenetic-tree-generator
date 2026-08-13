@@ -11263,9 +11263,11 @@
       var has_user_elements = [];
       if ("menu_items" in node && typeof node["menu_items"] === "object") {
         node["menu_items"].forEach(function(d) {
-          if (d.length == 3) {
+          if (d.length >= 3) {
             if (!d[2] || d[2](node)) {
-              has_user_elements.push([d[0], d[1]]);
+              // Alan 8/13/26 - An optional fourth value keeps unavailable custom actions visible but disabled.
+              const disabled = typeof d[3] === "function" ? d[3](node) : Boolean(d[3]);
+              has_user_elements.push([d[0], d[1], disabled]);
             }
           }
         });
@@ -11285,11 +11287,13 @@
         has_user_elements.forEach(function(d) {
           menu_object
             .append("a")
-            .attr("class", "phylotree-menu-item dropdown-item")
+            .attr("class", "phylotree-menu-item dropdown-item" + (d[2] ? " disabled" : ""))
+            .attr("aria-disabled", d[2] ? "true" : null)
             .attr("tabindex", "-1")
             .text((d[0])(node)) // eslint-disable-line
             // Alan 6/4/26 - Close custom menu actions before running them so copy/prune/rotate do not leave the menu open.
             .on("click", () => {
+              if (d[2]) return;
               menu_object.style("display", "none");
               d[1](node);
             });

@@ -1,4 +1,4 @@
-/var/www/dikarya/var/logs/access.log /var/www/dikarya/var/logs/error.log {
+/var/www/dikarya/var/logs/access.log /var/www/dikarya/var/logs/error.log /var/www/dikarya/var/logs/worker.log {
     daily
     maxsize 25M
     rotate 14

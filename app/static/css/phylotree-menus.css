@@ -47,6 +47,23 @@
   background-color: #e9ecef;
 }
 
+/* Alan 8/13/26 - Keep temporarily unavailable actions visible without making them interactive. */
+.phylotree-menu-item.disabled,
+.phylotree-menu-item[aria-disabled="true"],
+.phylotree-menu-item.disabled:hover,
+.phylotree-menu-item[aria-disabled="true"]:hover,
+.phylotree-menu-item.disabled:focus,
+.phylotree-menu-item[aria-disabled="true"]:focus {
+  color: #9ca3af;
+  background-color: transparent;
+  cursor: not-allowed;
+}
+
+.dark .phylotree-menu-item.disabled,
+.dark .phylotree-menu-item[aria-disabled="true"] {
+  color: #6b7280;
+}
+
 .phylotree-menu-divider {
   height: 0;
   margin: 8px 0;

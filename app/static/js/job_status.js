@@ -188,6 +188,14 @@ class JobStatusClient {
             this.appendOverview({ message, icon: 'failed' });
         });
 
+        // Alan 8/5/26 - Tell the user when a job was auto-resubmitted after a server
+        // restart. Without this the job silently starts over from step one and looks
+        // like it stalled or lost progress.
+        if (job.interrupted_notice && !this._noticedRequeue) {
+            this._noticedRequeue = true;
+            this.appendOverview({ message: job.interrupted_notice, icon: 'running' });
+        }
+
         // 2. Add "Job started" if applicable
         if (job.started_at) {
             this.appendOverview({ message: 'Job started', icon: 'running' });
@@ -195,7 +203,7 @@ class JobStatusClient {
 
         // 3. Backfill step events
         // We iterate through a logical order of steps to reconstruct the feed
-        const stepOrder = ['input', 'orient', 'blast', 'align', 'trim', 'tree', 'post'];
+        const stepOrder = ['input', 'orient', 'blast', 'its', 'align', 'trim', 'tree', 'post'];
         stepOrder.forEach(stepKey => {
             const step = job.meta.steps?.[stepKey];
             if (!step) return;
@@ -240,6 +248,15 @@ class JobStatusClient {
             }
         } else if (job.status === 'failed') {
             this.showErrorPanel(job);
+        }
+
+        // Alan 8/5/26 - Close the stream once the job is terminal. Nothing further can
+        // arrive, and leaving EventSource open held a server request slot (the pool is
+        // only workers x threads) for as long as the tab stayed open. The server now
+        // also closes terminal streams, so without this the browser would just keep
+        // reconnecting every few seconds.
+        if (job.status === 'completed' || job.status === 'failed') {
+            this.disconnect();
         }
 
         this.lastStatus = job.status;
@@ -301,6 +318,12 @@ class JobStatusClient {
 
         } else if (event.status === 'failed') {
             this.showErrorPanel(event);
+        }
+
+        // Alan 8/5/26 - Same as the snapshot path: release the stream (and the server
+        // request slot behind it) as soon as the job reaches a terminal state.
+        if (event.status === 'completed' || event.status === 'failed') {
+            this.disconnect();
         }
     }
 
@@ -564,26 +587,88 @@ class JobStatusClient {
         const errorSummary = errorInfo.error_summary || 'An error occurred';
         const stderrTail = errorInfo.stderr_tail || [];
 
+        // Alan 8/5/26 - A job killed mid-run (server restart, OOM) never reaches the
+        // failure handler, so it has no step or error of its own. Report the
+        // interruption plainly instead of "Unknown Step Failed / An error occurred".
+        const wasInterrupted = !!errorInfo.interrupted;
+        const wasRequeued = !!errorInfo.requeued_after_interrupt;
+
         // Title
-        panel.querySelector('.error-title').textContent = `${stepLabel} Failed`;
+        panel.querySelector('.error-title').textContent = wasInterrupted
+            ? (wasRequeued ? 'Interrupted - Restarted Automatically' : 'Job Interrupted')
+            : `${stepLabel} Failed`;
 
         // What happened
         let whatHappened = errorSummary;
-        if (tool && exitCode !== undefined && exitCode !== null) {
+        if (wasInterrupted) {
+            whatHappened = stepLabel && stepLabel !== 'Unknown Step'
+                ? `The server restarted while this job was in "${stepLabel}".`
+                : 'The server restarted while this job was running.';
+        } else if (tool && exitCode !== undefined && exitCode !== null) {
             whatHappened = `${tool.toUpperCase()} exited with code ${exitCode}`;
+        } else if (tool) {
+            whatHappened = `${tool.toUpperCase()} failed during ${stepLabel}`;
         }
         panel.querySelector('.error-what').textContent = whatHappened;
 
-        // Why (simple heuristics)
+        // Alan 8/5/26 - Widened the "why" heuristics. Previously only one case was
+        // recognised and everything else echoed the raw exception, which for tool
+        // failures is often unreadable.
         let why = errorSummary;
-        if (errorSummary.includes('at least 2 sequences')) {
+        const haystack = `${errorSummary} ${stderrTail.join(' ')}`.toLowerCase();
+        if (wasInterrupted) {
+            why = wasRequeued
+                ? 'Nothing is wrong with your data. The job was resubmitted automatically and will run again from the start - you can leave this page open.'
+                : 'Nothing is wrong with your data - the server restarted mid-run. Please submit the job again.';
+        } else if (errorSummary.includes('at least 2 sequences')) {
             why = 'You need at least 2 sequences to build a tree. If you have a single sequence, enable BLAST to find related sequences.';
+        } else if (haystack.includes('cpu-time allowance') || haystack.includes('sigxcpu') || haystack.includes('cpu limit')) {
+            why = 'This analysis needed more processing time than the server allowance. Dikarya stopped only this job so the website and other queued work could remain available. Try MAFFT or FastTree; if it happens again, contact Alan below.';
+        } else if (haystack.includes('out of memory') || haystack.includes('bad_alloc') || haystack.includes('cannot allocate') || haystack.includes('memory pressure')) {
+            why = 'The analysis exceeded the memory available to one job, so it was stopped before it could take down the site. Try removing some sequences; if the dataset should fit, contact Alan below.';
+        } else if (haystack.includes('timeout') || haystack.includes('timed out')) {
+            why = 'The job exceeded its time limit and was stopped without crashing the site. Try fewer sequences or a faster method such as MAFFT or FastTree; if it happens again, contact Alan below.';
+        } else if (haystack.includes('invalid dna') || haystack.includes('invalid symbol') || haystack.includes('contains invalid')) {
+            why = 'One or more sequences contain characters that are not valid DNA. Check for pasted labels or punctuation on sequence lines.';
+        } else if (haystack.includes('binary not found') || haystack.includes('no such file or directory')) {
+            why = 'A required tool could not be run on the server. This is a server-side problem, not a problem with your data - please report it.';
+        } else if (haystack.includes('empty') && haystack.includes('alignment')) {
+            why = 'The alignment came out empty. This usually means the sequences had no overlapping region, or trimming removed everything.';
+        // Alan 8/5/26 - MycoMap queue failures had no "why" of their own, so the
+        // whole backlog paragraph was echoed into both columns.
+        } else if (haystack.includes('mycomap')) {
+            why = 'Nothing is wrong with your data or your observation. MycoMap runs the BLAST search that supplies this tree\'s sequences, and its queue is shared with every other MycoMap user - when it is busy, results can take much longer than usual to appear.';
         }
-        panel.querySelector('.error-why').textContent = why;
 
-        // Relevant output
-        if (stderrTail.length > 0) {
-            panel.querySelector('.error-stderr').textContent = stderrTail.join('\n');
+        // Alan 8/5/26 - Both fields default to the raw error summary, so any failure
+        // that matched no heuristic printed the identical text under "What happened"
+        // and again under "Why". Show the explanation once and give it the full width.
+        const whyEl = panel.querySelector('.error-why');
+        const whyColumn = whyEl.parentElement;
+        const whatColumn = panel.querySelector('.error-what').parentElement;
+        if (why === whatHappened) {
+            if (whyColumn) whyColumn.style.display = 'none';
+            if (whatColumn) whatColumn.classList.add('md:col-span-2');
+        } else {
+            whyEl.textContent = why;
+            if (whyColumn) whyColumn.style.display = '';
+            if (whatColumn) whatColumn.classList.remove('md:col-span-2');
+        }
+
+        // Relevant output. stderr is the most useful thing we have; fall back to
+        // the traceback tail so the panel is never blank.
+        const output = stderrTail.length > 0
+            ? stderrTail
+            : (errorInfo.traceback_tail || []);
+        const stderrEl = panel.querySelector('.error-stderr');
+        // Alan 8/5/26 - Hide the output section when the only thing we could put in
+        // it is the error summary that is already displayed above.
+        if (output.length > 0) {
+            stderrEl.textContent = output.join('\n');
+            if (stderrEl.parentElement) stderrEl.parentElement.style.display = '';
+        } else {
+            stderrEl.textContent = '';
+            if (stderrEl.parentElement) stderrEl.parentElement.style.display = 'none';
         }
 
         // Hide current step card

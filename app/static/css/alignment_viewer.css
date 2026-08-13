@@ -110,10 +110,57 @@
 
 .alignment-viewer-grid {
     display: grid;
+    /* Default only: the JS splitter overrides this with an explicit px width for the names column. */
     grid-template-columns: minmax(180px, 22rem) 1fr;
     /* Row 1 = corner+ruler, Row 2 = consensus name+strip, Row 3 = names+cells. */
     grid-template-rows: auto auto 1fr;
     overflow: hidden;
+    /* Anchor for the absolutely positioned column splitter. */
+    position: relative;
+}
+
+/* ============================================================
+   Draggable splitter between the name column and the alignment.
+   ============================================================ */
+.alignment-viewer .av-col-resizer {
+    position: absolute;
+    top: 0;
+    bottom: 0;
+    width: 9px;
+    margin-left: -4px;
+    z-index: 6;
+    cursor: col-resize;
+    touch-action: none;
+}
+
+/* The visible hairline sits in the middle of a wider, easier-to-grab hit area. */
+.alignment-viewer .av-col-resizer::after {
+    content: "";
+    position: absolute;
+    left: 4px;
+    top: 0;
+    bottom: 0;
+    width: 1px;
+    background: transparent;
+    transition: background 0.12s ease, box-shadow 0.12s ease;
+}
+
+.alignment-viewer .av-col-resizer:hover::after,
+.alignment-viewer .av-col-resizer.is-dragging::after {
+    background: rgba(212, 164, 17, 0.9);
+    box-shadow: 0 0 0 1px rgba(212, 164, 17, 0.35);
+}
+
+.dark .alignment-viewer .av-col-resizer:hover::after,
+.dark .alignment-viewer .av-col-resizer.is-dragging::after {
+    background: rgba(245, 191, 66, 0.9);
+    box-shadow: 0 0 0 1px rgba(245, 191, 66, 0.3);
+}
+
+/* Keep the col-resize cursor and kill text selection for the whole drag. */
+body.av-col-resizing {
+    cursor: col-resize;
+    user-select: none;
 }
 
 .alignment-viewer .av-ruler-corner,
@@ -251,6 +298,44 @@
     gap: 6px;
     border-bottom: 1px solid transparent;
     cursor: default;
+}
+
+/* Clicking a name promotes that sequence to the comparison reference. */
+.alignment-viewer .av-name-row-clickable {
+    cursor: pointer;
+}
+
+/* Reference (baseline) row: blue marker so it reads apart from the gold focal-tip highlight. */
+.alignment-viewer .av-name-row.av-ref-row,
+.alignment-viewer .av-cell-row.av-ref-row {
+    background: rgba(37, 99, 235, 0.10);
+    box-shadow: inset 3px 0 0 rgba(37, 99, 235, 0.9);
+}
+
+.dark .alignment-viewer .av-name-row.av-ref-row,
+.dark .alignment-viewer .av-cell-row.av-ref-row {
+    background: rgba(96, 165, 250, 0.14);
+    box-shadow: inset 3px 0 0 rgba(96, 165, 250, 0.95);
+}
+
+.alignment-viewer .av-name-row.av-ref-row .av-name-text {
+    font-weight: 700;
+    color: #1d4ed8;
+}
+
+.dark .alignment-viewer .av-name-row.av-ref-row .av-name-text,
+.dark .alignment-viewer[data-color-scheme] .av-name-row.av-ref-row .av-name-text {
+    color: #93c5fd;
+}
+
+/* Baseline strip header switches to the reference color when a sequence is the baseline. */
+.alignment-viewer .av-consensus-name.av-ref-header {
+    color: #1d4ed8;
+}
+
+.dark .alignment-viewer .av-consensus-name.av-ref-header,
+.dark .alignment-viewer[data-color-scheme] .av-consensus-name.av-ref-header {
+    color: #93c5fd;
 }
 
 .alignment-viewer .av-name-row.av-focus-row,

@@ -5,6 +5,165 @@ from typing import List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
+# RQ raises this in the worker thread when a job outlives its job_timeout. It
+# subclasses Exception, so it must be caught ahead of any catch-all or it gets
+# misreported as a tool crash. Kept as a tuple, and empty when RQ is absent, so
+# this module stays importable outside the worker.
+try:
+    from rq.timeouts import JobTimeoutException as _RQJobTimeoutException
+    _JOB_TIMEOUT_EXCEPTIONS = (_RQJobTimeoutException,)
+except Exception:  # pragma: no cover - RQ not installed
+    _JOB_TIMEOUT_EXCEPTIONS = ()
+
+
+def _build_rlimit_preexec(cpu_limit_seconds: Optional[int] = None):
+    """Return a preexec_fn that caps the child's memory, CPU, and core dumps.
+
+    Returns None when limits are disabled or unavailable, in which case the
+    process is spawned exactly as before.
+
+    `cpu_limit_seconds` overrides SUBPROCESS_CPU_LIMIT_SECONDS for one call.
+    RLIMIT_CPU counts CPU seconds summed across threads, so a tool that is
+    allowed N wall-hours on T threads needs roughly N*3600*T here or the kernel
+    kills it long before its wall-clock deadline. Callers that grant a long
+    wall-clock budget must raise this to match; see _run_raxml.
+
+    The callable runs in the forked child between fork() and exec(). It only
+    issues setrlimit syscalls -- no allocation, no locks -- which is what keeps
+    it safe to use from the threaded Gunicorn workers as well as the RQ worker.
+    """
+    try:
+        import resource
+        from app.config import Config
+    except Exception:
+        return None
+
+    memory_mb = getattr(Config, "SUBPROCESS_MEMORY_LIMIT_MB", 0) or 0
+    if cpu_limit_seconds is not None:
+        cpu_seconds = cpu_limit_seconds
+    else:
+        cpu_seconds = getattr(Config, "SUBPROCESS_CPU_LIMIT_SECONDS", 0) or 0
+
+    if memory_mb <= 0 and cpu_seconds <= 0:
+        return None
+
+    memory_bytes = memory_mb * 1024 * 1024
+
+    def _apply_limits():
+        # Never leave a core dump behind: these alignments are user data, and a
+        # multi-GB core in the job directory is its own problem.
+        resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
+        if memory_bytes > 0:
+            resource.setrlimit(resource.RLIMIT_AS, (memory_bytes, memory_bytes))
+        if cpu_seconds > 0:
+            # Leave headroom between the soft and hard limit. At the soft limit
+            # the kernel sends SIGXCPU, which terminates the process and gives
+            # us an exit code we can attribute to the CPU cap; with soft == hard
+            # the SIGKILL at the hard limit lands first and the failure is
+            # indistinguishable from an OOM kill.
+            resource.setrlimit(resource.RLIMIT_CPU, (cpu_seconds, cpu_seconds + 30))
+
+    return _apply_limits
+
+
+def _describe_termination_signal(exit_code: int) -> Optional[str]:
+    """Explain a negative exit code, so a resource kill is not just '-24'."""
+    if exit_code >= 0:
+        return None
+
+    explanations = {
+        24: "[LIMIT] Killed by SIGXCPU -- exceeded SUBPROCESS_CPU_LIMIT_SECONDS.",
+        9: "[LIMIT] Killed by SIGKILL -- the kernel OOM killer, the RQ job timeout, or a worker restart.",
+        11: "[CRASH] Killed by SIGSEGV -- the tool crashed. Keep the input; it is worth reporting upstream.",
+        6: "[CRASH] Killed by SIGABRT -- the tool aborted, often a failed allocation under SUBPROCESS_MEMORY_LIMIT_MB.",
+    }
+    return explanations.get(-exit_code)
+
+
+# Returned when the program could not be launched at all -- the configured
+# binary does not exist, or is not executable. No real tool exits with this, so
+# it is safe to use as a sentinel. Previously this case came back as a generic
+# -1, which reached the job page as "failed with exit code -1" and told nobody
+# anything.
+EXIT_CODE_TOOL_NOT_FOUND = -127
+
+# Returned when the tool was still running when its time budget ran out --
+# either the subprocess `timeout` or RQ's job-level death penalty. Previously
+# the RQ case fell through the catch-all below and was reported as a bare -1,
+# which read as a tool crash rather than "this took too long".
+EXIT_CODE_JOB_TIMEOUT = -128
+
+
+def tool_failure_message(tool_label: str, exit_code: int,
+                         time_limit_hours: Optional[float] = None) -> str:
+    """Build the user-facing message for a failed external tool run.
+
+    Deliberately omits the configured binary path. Where the tool is installed
+    is a server detail that belongs in the log, not on a user's job page.
+    """
+    contact = (
+        " If retrying does not solve it, contact Alan at alanrockefeller@gmail.com "
+        "and include the job ID shown on this page."
+    )
+    if exit_code == EXIT_CODE_TOOL_NOT_FOUND:
+        return (
+            f"{tool_label} is not available on the server, so this step never "
+            f"started. This is a server configuration problem, not a problem "
+            f"with your sequences." + contact
+        )
+    if exit_code == EXIT_CODE_JOB_TIMEOUT:
+        limit = f"{time_limit_hours:g}-hour " if time_limit_hours else ""
+        return (
+            f"{tool_label} was still running when this job's {limit}time limit "
+            f"was reached, so it was stopped. Try a faster preset, fewer "
+            f"bootstrap replicates, or fewer sequences." + contact
+        )
+    if exit_code == -24:
+        return (
+            f"{tool_label} used the full server CPU-time allowance and was "
+            "stopped so the rest of Dikarya could stay available. Try again "
+            "with MAFFT or FastTree, or reduce the number of sequences." + contact
+        )
+    if exit_code == -9:
+        return (
+            f"{tool_label} was stopped unexpectedly by the server. The usual "
+            "causes are memory pressure, a job timeout, or a server restart." + contact
+        )
+    if exit_code == -11:
+        return f"{tool_label} crashed unexpectedly (segmentation fault)." + contact
+    if exit_code == -6:
+        return (
+            f"{tool_label} aborted, usually because it could not allocate enough memory."
+            + contact
+        )
+    return f"{tool_label} failed with exit code {exit_code}." + contact
+
+
+def _kill_child(process) -> None:
+    """Kill a still-running child so a failed step leaves nothing behind.
+
+    Without this, a job that timed out was marked failed while its tool kept
+    running and burning CPU -- one RAxML run kept writing checkpoints for seven
+    minutes after its job had already been reported as failed.
+    """
+    if not process or process.poll() is not None:
+        return
+    try:
+        process.kill()
+        process.wait(timeout=10)
+    except Exception:
+        logger.warning("Could not kill child process %s", getattr(process, "pid", "?"))
+
+
+def _log_missing_executable(args: List[str], error: Exception) -> str:
+    """Log the unresolvable path for operators, return a path-free summary."""
+    logger.error(
+        f"Executable not found, command never started: {args[0]!r} ({error}). "
+        f"Check the *_BINARY setting in the environment file."
+    )
+    return f"[ERROR] {Path(args[0]).name} could not be started (not found on server)"
+
+
 def run_command(args: List[str], cwd: Optional[Path] = None, log_file: Optional[Path] = None) -> Tuple[int, str, str]:
     """
     Run an external command safely.
@@ -36,7 +195,8 @@ def run_command(args: List[str], cwd: Optional[Path] = None, log_file: Optional[
             env=env,
             capture_output=True,
             text=True,
-            check=False
+            check=False,
+            preexec_fn=_build_rlimit_preexec()
         )
         
         stdout = result.stdout
@@ -54,6 +214,9 @@ def run_command(args: List[str], cwd: Optional[Path] = None, log_file: Optional[
 
         return result.returncode, stdout, stderr
 
+    except FileNotFoundError as e:
+        return EXIT_CODE_TOOL_NOT_FOUND, "", _log_missing_executable(args, e)
+
     except Exception as e:
         logger.exception(f"Exception running command: {args}")
         return -1, "", str(e)
@@ -67,6 +230,7 @@ def run_command_streaming(
     on_stdout_line: Optional[callable] = None,
     on_stderr_line: Optional[callable] = None,
     timeout: Optional[int] = None,
+    cpu_limit_seconds: Optional[int] = None,
 ) -> Tuple[int, dict]:
     """
     Run an external command with streaming output.
@@ -151,48 +315,41 @@ def run_command_streaming(
                 stderr=subprocess.PIPE,
                 text=True,
                 bufsize=1,  # Line buffered
+                preexec_fn=_build_rlimit_preexec(cpu_limit_seconds),
             )
             
-            # If stdout goes to file, we only need to handle stderr
-            if stdout_file:
-                # Stream stderr only
-                for line in process.stderr:
-                    stats["stderr_lines"] += 1
-                    stderr_tail_buffer.append(line.rstrip())
-                    
-                    if stderr_file:
-                        stderr_file.write(line)
-                        stderr_file.flush()
-                    
-                    if on_stderr_line:
-                        try:
-                            on_stderr_line(line.rstrip())
-                        except Exception:
-                            pass  # Don't fail job due to callback error
-            else:
-                # Stream both stdout and stderr using select for non-blocking reads
-                # This is more complex but handles interleaved output properly
-                import selectors
-                
-                sel = selectors.DefaultSelector()
-                if process.stdout:
-                    sel.register(process.stdout, selectors.EVENT_READ, 'stdout')
-                if process.stderr:
-                    sel.register(process.stderr, selectors.EVENT_READ, 'stderr')
-                
+            # Stream stdout and stderr using select for non-blocking reads.
+            # This also covers the stdout_path case: stdout then goes straight
+            # to the file and process.stdout is None, so only stderr registers.
+            # Draining through select (rather than a blocking `for line in
+            # process.stderr`) is what lets the deadline below be enforced even
+            # while the tool is producing no output at all.
+            deadline = (start_time + timeout) if timeout else None
+
+            import selectors
+
+            sel = selectors.DefaultSelector()
+            if process.stdout:
+                sel.register(process.stdout, selectors.EVENT_READ, 'stdout')
+            if process.stderr:
+                sel.register(process.stderr, selectors.EVENT_READ, 'stderr')
+
+            try:
                 while sel.get_map():
+                    if deadline and time.time() > deadline:
+                        raise subprocess.TimeoutExpired(args, timeout)
                     ready = sel.select(timeout=0.1)
                     for key, _ in ready:
                         stream = key.fileobj
                         stream_name = key.data
-                        
+
                         line = stream.readline()
                         if not line:
                             sel.unregister(stream)
                             continue
-                        
+
                         line = line.rstrip()
-                        
+
                         if stream_name == 'stdout':
                             stats["stdout_lines"] += 1
                             if on_stdout_line:
@@ -203,47 +360,86 @@ def run_command_streaming(
                         else:  # stderr
                             stats["stderr_lines"] += 1
                             stderr_tail_buffer.append(line)
-                            
+
                             if stderr_file:
                                 stderr_file.write(line + "\n")
                                 stderr_file.flush()
-                            
+
                             if on_stderr_line:
                                 try:
                                     on_stderr_line(line)
                                 except Exception:
                                     pass
-                
+            finally:
                 sel.close()
-            
-            # Wait for process to complete
-            process.wait(timeout=timeout)
+
+            # Wait for the process itself. The pipes are drained by now, so this
+            # normally returns at once; the remaining budget still bounds a tool
+            # that closed its streams but has not exited.
+            remaining = max(0.1, deadline - time.time()) if deadline else None
+            process.wait(timeout=remaining)
             exit_code = process.returncode
+
+            signal_note = _describe_termination_signal(exit_code)
+            if signal_note:
+                logger.error(f"{signal_note} Command: {' '.join(args)}")
+                stderr_tail_buffer.append(signal_note)
+                if stderr_file:
+                    stderr_file.write(signal_note + "\n")
             
         finally:
             if stdout_file:
                 stdout_file.close()
             if stderr_file:
                 stderr_file.write("-" * 40 + "\n")
-                stderr_file.write(f"Exit code: {process.returncode if 'process' in dir() else 'N/A'}\n")
+                # `process` is always bound here but is None when Popen itself
+                # raised. Dereferencing it then threw an AttributeError out of
+                # the finally block, which replaced the real exception -- a
+                # missing binary was reported as "'NoneType' has no attribute
+                # 'returncode'" and the FileNotFoundError never reached a
+                # handler that could explain it.
+                stderr_file.write(f"Exit code: {process.returncode if process else 'N/A'}\n")
                 stderr_file.close()
         
         stats["duration_seconds"] = time.time() - start_time
         stats["stderr_tail"] = list(stderr_tail_buffer)
         
         return exit_code, stats
-        
-    except subprocess.TimeoutExpired:
-        logger.error(f"Command timed out after {timeout}s: {args}")
-        if process:
-            process.kill()
+
+    except FileNotFoundError as e:
         stats["duration_seconds"] = time.time() - start_time
         stats["stderr_tail"] = list(stderr_tail_buffer)
-        stats["stderr_tail"].append(f"[TIMEOUT] Command killed after {timeout}s")
-        return -1, stats
-        
+        stats["stderr_tail"].append(_log_missing_executable(args, e))
+        return EXIT_CODE_TOOL_NOT_FOUND, stats
+
+    except subprocess.TimeoutExpired:
+        logger.error(f"Command timed out after {timeout}s: {args}")
+        _kill_child(process)
+        stats["duration_seconds"] = time.time() - start_time
+        stats["stderr_tail"] = list(stderr_tail_buffer)
+        stats["stderr_tail"].append(
+            f"[TIMEOUT] {Path(args[0]).name} exceeded its {timeout}s time limit and was stopped."
+        )
+        return EXIT_CODE_JOB_TIMEOUT, stats
+
+    except _JOB_TIMEOUT_EXCEPTIONS as e:
+        # RQ's death penalty fires in this thread while the child is still
+        # running. It subclasses Exception, so before this branch existed the
+        # catch-all below swallowed it and returned a bare -1 -- and, because
+        # only the TimeoutExpired branch killed anything, the tool was left
+        # running unsupervised after the job was already marked failed.
+        logger.error(f"Job time limit reached while running: {' '.join(args)} ({e})")
+        _kill_child(process)
+        stats["duration_seconds"] = time.time() - start_time
+        stats["stderr_tail"] = list(stderr_tail_buffer)
+        stats["stderr_tail"].append(
+            f"[TIMEOUT] {Path(args[0]).name} was stopped when the job's time limit was reached."
+        )
+        return EXIT_CODE_JOB_TIMEOUT, stats
+
     except Exception as e:
         logger.exception(f"Exception running command: {args}")
+        _kill_child(process)
         stats["duration_seconds"] = time.time() - start_time
         stats["stderr_tail"] = list(stderr_tail_buffer)
         stats["stderr_tail"].append(f"[ERROR] {str(e)}")

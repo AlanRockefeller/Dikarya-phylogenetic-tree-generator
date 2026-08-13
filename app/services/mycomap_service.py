@@ -39,8 +39,12 @@ MYCOMAP_RERUN_REQUEST_TIMEOUT = 60
 MYCOMAP_NCBI_RERUN_WAIT_SECONDS = 600
 MYCOMAP_NCBI_POLL_INTERVAL_SECONDS = 60
 MYCOMAP_NCBI_POLL_MAX_ATTEMPTS = 120
-MYCOMAP_NCBI_LOCAL_FALLBACK_SECONDS = 900
+MYCOMAP_NCBI_LOCAL_FALLBACK_SECONDS = 600
 MYCOMAP_NCBI_RECHECK_MAX_HOURS = 48
+# How long to keep looking for a newly created BLAST's result page before
+# giving up. MycoMap answers the create POST with "Job added to queue" and no
+# ID, so the record only becomes discoverable once its queue reaches the job.
+MYCOMAP_CREATION_DISCOVERY_MAX_SECONDS = 600
 MYCOMAP_NEAR_DUPLICATE_MAX_DIFFERENCES = 4
 
 _CONCRETE_DNA_BASES = frozenset("ACGT")
@@ -208,6 +212,99 @@ def mycomap_sequence_difference_count(
     return min(forward_distance, reverse_distance)
 
 
+# Overlap comparison tuning. The anchor is a seed exact-match used to find how
+# the two reads line up; several starts are tried so a mismatch inside one seed
+# does not sink the comparison.
+_OVERLAP_ANCHOR_LENGTH = 25
+_OVERLAP_ANCHOR_ATTEMPTS = 8
+# A shared region shorter than this proves nothing, and one that covers only
+# part of the shorter read means these are not the same stretch of DNA.
+_OVERLAP_MIN_BASES = 100
+_OVERLAP_MIN_FRACTION = 0.8
+
+
+def _overlap_anchor_offset(shorter: str, longer: str) -> Optional[int]:
+    """Return the offset lining ``shorter`` up against ``longer``, or None.
+
+    The offset is defined so ``shorter[i]`` corresponds to ``longer[i + offset]``.
+    Seeds that occur more than once in ``longer`` are skipped: a repeat gives no
+    evidence about which copy the read came from.
+    """
+    span = len(shorter) - _OVERLAP_ANCHOR_LENGTH
+    if span < 0:
+        return None
+    step = max(1, span // _OVERLAP_ANCHOR_ATTEMPTS)
+    for start in range(0, span + 1, step):
+        seed = shorter[start:start + _OVERLAP_ANCHOR_LENGTH]
+        position = longer.find(seed)
+        if position < 0 or longer.find(seed, position + 1) >= 0:
+            continue
+        return position - start
+    return None
+
+
+def _oriented_overlap_distance(
+    first: str,
+    second: str,
+    max_distance: Optional[int],
+) -> Optional[int]:
+    """Distance over the shared region of two already-normalized sequences."""
+    shorter, longer = (first, second) if len(first) <= len(second) else (second, first)
+    offset = _overlap_anchor_offset(shorter, longer)
+    if offset is None:
+        return None
+
+    start = max(0, -offset)
+    end = min(len(shorter), len(longer) - offset)
+    overlap_length = end - start
+    if (
+        overlap_length < _OVERLAP_MIN_BASES
+        or overlap_length < _OVERLAP_MIN_FRACTION * len(shorter)
+    ):
+        return None
+
+    return _ambiguity_aware_edit_distance(
+        shorter[start:end],
+        longer[start + offset:end + offset],
+        max_distance,
+    )
+
+
+def mycomap_sequence_overlap_difference_count(
+    first: str,
+    second: str,
+    max_distance: Optional[int] = None,
+) -> Optional[int]:
+    """Return the distance over the region two reads share, or None if unrelated.
+
+    Unlike :func:`mycomap_sequence_difference_count` this ignores how far each
+    read extends past the other: two records of the same DNA trimmed to 584 and
+    596 bases score 0 here, where the global distance charges a base per
+    overhang and scores 12. Substitutions and indels inside the shared region
+    still count normally.
+
+    Returns None when the reads cannot be lined up confidently -- no unique seed
+    match, or too little overlap to judge -- so callers can fall back to the
+    global comparison rather than treat "unknown" as "identical".
+    """
+    normalized_first = _normalize_dna_for_near_duplicate_comparison(first)
+    normalized_second = _normalize_dna_for_near_duplicate_comparison(second)
+    if not normalized_first or not normalized_second:
+        return None
+
+    forward = _oriented_overlap_distance(
+        normalized_first, normalized_second, max_distance
+    )
+    if forward == 0:
+        return 0
+    reverse_complement = normalized_second.translate(_IUPAC_COMPLEMENT)[::-1]
+    reverse = _oriented_overlap_distance(
+        normalized_first, reverse_complement, max_distance
+    )
+    candidates = [d for d in (forward, reverse) if d is not None]
+    return min(candidates) if candidates else None
+
+
 def _env_int(name: str, default: int, *, min_value: Optional[int] = None,
              max_value: Optional[int] = None) -> int:
     raw = os.environ.get(name)
@@ -298,6 +395,27 @@ def get_mycomap_ncbi_local_fallback_seconds() -> int:
         min_value=60,
         max_value=7200,
     )
+
+
+def get_mycomap_creation_discovery_max_seconds() -> int:
+    """
+    Return how long to keep looking for a just-created BLAST's result page
+    before giving up. Nothing can be built until the record is discovered:
+    local and NCBI results both hang off the same MycoMap BLAST ID.
+    """
+    return _env_int(
+        "MYCOMAP_CREATION_DISCOVERY_MAX_SECONDS",
+        MYCOMAP_CREATION_DISCOVERY_MAX_SECONDS,
+        min_value=60,
+        max_value=7200,
+    )
+
+
+def get_mycomap_creation_discovery_max_attempts() -> int:
+    """Return the discovery budget expressed as one-per-poll-interval checks."""
+    interval = max(1, get_mycomap_ncbi_poll_interval_seconds())
+    max_seconds = get_mycomap_creation_discovery_max_seconds()
+    return max(1, -(-max_seconds // interval))
 
 
 def get_mycomap_ncbi_recheck_max_hours() -> int:
@@ -434,11 +552,37 @@ def _parse_created_mycomap_blast(parsed_body, raw_body: str,
     )
 
 
-def find_mycomap_blast_by_title(title: str) -> Optional[dict]:
-    """Find the newest public MycoMap BLAST record matching an exact job title."""
-    wanted = " ".join(str(title or "").split()).strip()
-    if not wanted:
-        return None
+def _title_matches_blast_label(label: str, wanted: str) -> bool:
+    """Match a MycoMap job label against a title, allowing its " - id" suffix."""
+    label = " ".join(str(label or "").split()).strip()
+    if not label:
+        return False
+    return label == wanted or label.startswith(f"{wanted} - ")
+
+
+def _blast_page_mentions_title(url: str, wanted: str) -> bool:
+    """Confirm a synthesized BLAST result URL really is the job we created."""
+    request = urllib.request.Request(
+        url,
+        headers={
+            "User-Agent": "Dikarya-TreeBuilder/1.0",
+            "Accept": "text/html,*/*",
+            "Cache-Control": "no-cache",
+        },
+        method="GET",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=REQUEST_TIMEOUT) as resp:
+            page = resp.read().decode("utf-8", errors="replace")
+    except Exception as exc:
+        logger.warning("Could not verify MycoMap BLAST page %s: %s", url, exc)
+        return False
+    text = " ".join(html.unescape(re.sub(r"<[^>]+>", " ", page)).split())
+    return wanted in text
+
+
+def _fetch_mycomap_blast_listing(warnings: Optional[list] = None) -> str:
+    """Fetch the public BLAST listing page, or "" if it cannot be read."""
     listing_query = urllib.parse.urlencode({"d": "38", "_": str(time.time_ns())})
     request = urllib.request.Request(
         f"https://mycomap.com/genetics/blast-search/?{listing_query}",
@@ -452,9 +596,165 @@ def find_mycomap_blast_by_title(title: str) -> Optional[dict]:
     )
     try:
         with urllib.request.urlopen(request, timeout=REQUEST_TIMEOUT) as resp:
-            page = resp.read().decode("utf-8", errors="replace")
+            return resp.read().decode("utf-8", errors="replace")
     except Exception as exc:
-        logger.warning("Could not check MycoMap for existing BLAST title %s: %s", wanted, exc)
+        logger.warning("Could not read the MycoMap BLAST listing page: %s", exc)
+        if warnings is not None:
+            warnings.append(f"MycoMap BLAST listing page could not be read: {exc}")
+        return ""
+
+
+def find_mycomap_record_url_by_id(blast_id: str,
+                                  warnings: Optional[list] = None
+                                  ) -> Optional[str]:
+    """
+    Resolve a BLAST ID to its real result page URL.
+
+    MycoMap result pages live at ``<title-slug>-r<id>/``; the bare
+    ``blast-search/r<id>/`` form that can be built from an ID alone always
+    404s, so an ID has to be matched back to a full URL on the listing page.
+    """
+    blast_id = str(blast_id or "").strip()
+    if not blast_id.isdigit():
+        return None
+    page = _fetch_mycomap_blast_listing(warnings)
+    if not page:
+        return None
+    pattern = re.compile(
+        r"https?://(?:[A-Za-z0-9-]+\.)*mycomap\.com/genetics/blast-search/"
+        r"[A-Za-z0-9._-]*?-?r" + re.escape(blast_id) + r"/",
+        re.IGNORECASE,
+    )
+    match = pattern.search(html.unescape(page))
+    if not match:
+        return None
+    url = match.group(0)
+    return url if validate_mycomap_url(url) == blast_id else None
+
+
+def find_mycomap_blast_via_history(title: str,
+                                   warnings: Optional[list] = None
+                                   ) -> Optional[dict]:
+    """
+    Find a BLAST record by title through the authenticated history API.
+
+    The public listing page only shows a short window of already-published
+    searches, so a queued job can be invisible there for as long as MycoMap's
+    BLAST queue is backed up -- and can scroll off it entirely. The history
+    endpoint is the authoritative view of jobs we created.
+
+    A lookup that fails outright (bad credentials, MycoMap down) is
+    indistinguishable from "not published yet" in the return value, so the
+    reason is appended to ``warnings`` when one is supplied. Callers that give
+    up after a timeout can then report why they never found the record instead
+    of blaming MycoMap's queue.
+    """
+    wanted = " ".join(str(title or "").split()).strip()
+    if not wanted:
+        return None
+    try:
+        payload = _mycomap_refresh_request(
+            "blast/history",
+            data={"userID": str(get_mycomap_user_id()), "perPage": "100"},
+        )
+    except MycoMapRefreshError as exc:
+        logger.warning("MycoMap BLAST history lookup failed for %s: %s", wanted, exc)
+        if warnings is not None:
+            warnings.append(f"MycoMap BLAST history lookup failed: {exc}")
+        return None
+    except Exception as exc:
+        logger.warning(
+            "Unexpected MycoMap BLAST history error for %s: %s", wanted, exc
+        )
+        if warnings is not None:
+            warnings.append(f"MycoMap BLAST history lookup error: {exc}")
+        return None
+
+    for row in _mycomap_result_rows(payload):
+        label = _find_api_field(
+            row,
+            ("title", "jobtitle", "job_title", "blasttitle", "blast_title",
+             "name", "label"),
+        )
+        if not _title_matches_blast_label(label, wanted):
+            continue
+
+        url_text = _find_api_field(
+            row,
+            ("url", "resulturl", "result_url", "blasturl", "blast_url",
+             "link", "permalink"),
+        )
+        if url_text.startswith("/"):
+            url_text = urllib.parse.urljoin("https://mycomap.com", url_text)
+        blast_id = validate_mycomap_url(url_text)
+        if blast_id:
+            logger.info(
+                "Found MycoMap BLAST %s for title %s via history API",
+                blast_id, wanted,
+            )
+            return {"blast_id": blast_id, "url": url_text, "title": wanted}
+
+        # No usable URL on the row: fall back to its numeric ID and resolve the
+        # real result page. The row already matched our exact title under our
+        # own userID, so the ID is trustworthy -- what is missing is its URL.
+        for id_names in (
+            ("blastid", "blast_id", "resultid", "result_id",
+             "recordid", "record_id"),
+            ("jobid", "job_id"),
+            ("id",),
+        ):
+            match = re.fullmatch(
+                r"(?:r)?(\d+)", _find_api_field(row, id_names).strip(), re.IGNORECASE
+            )
+            if not match:
+                continue
+            candidate_id = match.group(1)
+            # Alan 8/5/26 - This used to synthesize blast-search/r<id>/ and check
+            # that page for the title. That URL form does not exist on MycoMap
+            # (records are <slug>-r<id>/), so the check 404'd every time and the
+            # record was discarded no matter how long we waited. Resolve the
+            # real slug URL from the listing instead.
+            candidate_url = find_mycomap_record_url_by_id(candidate_id, warnings)
+            if candidate_url:
+                logger.info(
+                    "Found MycoMap BLAST %s for title %s via history API ID",
+                    candidate_id, wanted,
+                )
+                return {
+                    "blast_id": candidate_id,
+                    "url": candidate_url,
+                    "title": wanted,
+                }
+            logger.warning(
+                "MycoMap history API returned BLAST %s for title %s, but its "
+                "result page URL is not on the listing yet",
+                candidate_id, wanted,
+            )
+            if warnings is not None:
+                warnings.append(
+                    f"MycoMap reported BLAST record {candidate_id} for this "
+                    "search, but its results page has not been published yet"
+                )
+    return None
+
+
+def find_mycomap_blast_by_title(title: str,
+                                warnings: Optional[list] = None
+                                ) -> Optional[dict]:
+    """
+    Find the newest MycoMap BLAST record matching an exact job title.
+
+    When ``warnings`` is supplied, any reason the lookup could not complete is
+    appended to it -- see ``find_mycomap_blast_via_history``.
+    """
+    wanted = " ".join(str(title or "").split()).strip()
+    if not wanted:
+        return None
+    found = find_mycomap_blast_via_history(wanted, warnings=warnings)
+    if found:
+        return found
+    page = _fetch_mycomap_blast_listing(warnings)
+    if not page:
         return None
 
     link_pattern = re.compile(
@@ -464,8 +764,7 @@ def find_mycomap_blast_by_title(title: str) -> Optional[dict]:
     )
     for match in link_pattern.finditer(page):
         label = html.unescape(re.sub(r"<[^>]+>", " ", match.group("label")))
-        label = " ".join(label.split()).strip()
-        if label != wanted and not label.startswith(f"{wanted} - "):
+        if not _title_matches_blast_label(label, wanted):
             continue
         url = urllib.parse.urljoin("https://mycomap.com", html.unescape(match.group("url")))
         blast_id = validate_mycomap_url(url)
@@ -603,6 +902,14 @@ def get_mycomap_ncbi_result_count(blast_id: str) -> Tuple[int, list]:
         str(blast_id), include_ncbi=True, include_local=False
     )
     return int(result.get("ncbi_count") or 0), list(result.get("errors") or [])
+
+
+def get_mycomap_local_result_count(blast_id: str) -> Tuple[int, list]:
+    """Return the currently exported local (MycoBLAST) hit count and warnings."""
+    result = fetch_mycomap_fasta(
+        str(blast_id), include_ncbi=False, include_local=True
+    )
+    return int(result.get("local_count") or 0), list(result.get("errors") or [])
 
 
 def rerun_mycomap_blast(blast_id: str, result_type: str = "local",

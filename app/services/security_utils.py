@@ -9,6 +9,22 @@ JOB_ID_PATTERN = re.compile(r'^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-
 BOOL_TRUE_TOKENS = frozenset({"1", "true", "yes", "on"})
 BOOL_FALSE_TOKENS = frozenset({"0", "false", "no", "off"})
 
+# Maximum length of a FASTA header written into a job's input.
+#
+# Sequence *data* is already restricted to the IUPAC alphabet by
+# validate_dna_fasta, and the tree builders never see a user-controlled name at
+# all (sanitize_fasta_headers rewrites every record to SEQ###### first). Headers
+# are the one piece of arbitrary user text that reaches a C parser unmodified:
+# MAFFT and trimAl both read the submitted names. Without this cap a single
+# record could hand them a header the size of the whole request body.
+#
+# 500 is deliberately the same limit _normalize_sequence_metadata already applies
+# to fasta_header, so this cannot desynchronise a header from its metadata: a
+# header longer than 500 was already truncated on the metadata side. The longest
+# header in 56,502 real production records is 324 characters, so this never
+# touches legitimate input.
+MAX_FASTA_HEADER_LEN = 500
+
 
 def coerce_bool(value, default: bool = True) -> Tuple[bool, bool]:
     """Coerce a request value to a bool. Single source of truth for the API,
@@ -37,6 +53,18 @@ def validate_job_id(job_id: str) -> bool:
     if not job_id or not isinstance(job_id, str):
         return False
     return bool(JOB_ID_PATTERN.match(job_id))
+
+def cap_fasta_header(header: str) -> str:
+    """Strip control characters from a FASTA header and cap it to a sane length.
+
+    Applied to every record on the way into a job so the alignment and trimming
+    binaries never receive an unbounded name. See MAX_FASTA_HEADER_LEN.
+    """
+    if not header:
+        return ""
+    cleaned = "".join(ch for ch in header if ord(ch) >= 32 or ch == "\t")
+    return cleaned.strip()[:MAX_FASTA_HEADER_LEN].strip()
+
 
 def sanitize_fasta_sequence(seq: str) -> str:
     """Remove any non-standard characters from FASTA sequence."""

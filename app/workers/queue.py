@@ -19,11 +19,45 @@ def get_queue(name=QUEUE_HIGH) -> Queue:
     conn = get_redis_connection()
     return Queue(name, connection=conn)
 
+def resolve_job_timeout(job_params: Dict[str, Any]) -> str:
+    """Pick the RQ job_timeout for a job based on the tree method it will run.
+
+    RAxML-NG needs longer than the already-generous general allowance. This
+    lives here, rather than
+    at each submission site, so every path that creates a job (web /tree, API
+    v1, iNaturalist auto-tree, Mushroom Observer, rebuild) gets the same budget
+    and a new entry point cannot silently fall back to one hour.
+    """
+    from app.config import Config
+
+    if str((job_params or {}).get("tree_method") or "").lower() == "raxml":
+        hours = float(getattr(Config, "RAXML_TIME_LIMIT_HOURS", 15) or 15)
+        # A little above the tool's own limit so the subprocess timeout fires
+        # first and produces the specific "RAxML ran out of time" message
+        # instead of RQ killing the horse with no explanation.
+        return f"{int(hours * 3600) + 600}s"
+
+    hours = float(getattr(Config, "GENERAL_JOB_TIME_LIMIT_HOURS", 8) or 8)
+    # Let the subprocess CPU ceiling fire first when both limits are close; it
+    # produces a more specific explanation than RQ's outer death penalty.
+    return f"{int(hours * 3600) + 600}s"
+
+
 def enqueue_job(job_params: Dict[str, Any], queue_name: str = QUEUE_HIGH,
                 meta: Optional[Dict[str, Any]] = None,
                 job_id: Optional[str] = None,
-                job_timeout: Any = '1h') -> str:
+                job_timeout: Any = None) -> str:
     """Enqueue a phylo analysis job and return the job ID."""
+    # Collapse near-identical records that share an observation number. This
+    # lives here rather than in each caller so every job-creation path gets it
+    # (web /tree, API v1, iNaturalist auto-tree, Mushroom Observer) instead of
+    # only the web one, and so a future entry point cannot silently skip it.
+    from app.services.sequence_dedup_service import apply_observation_dedup
+    apply_observation_dedup(job_params)
+
+    if job_timeout is None:
+        job_timeout = resolve_job_timeout(job_params)
+
     q = get_queue(queue_name)
     from app.workers.tasks import run_phylo_job
     job = q.enqueue(
@@ -55,7 +89,7 @@ def enqueue_recompute_job(job_id: str, params_dict: Dict[str, Any]) -> str:
     """Enqueue a recompute job under the existing job ID so status pages stream normally."""
     q = get_queue(QUEUE_HIGH)
     from app.workers.events import (
-        STEP_INPUT, STEP_ORIENT, STEP_BLAST,
+        STEP_INPUT, STEP_ORIENT, STEP_BLAST, STEP_ITS,
         STATE_QUEUED, STATE_SKIPPED, get_initial_steps_meta,
     )
     from app.workers.tasks import run_recompute_job
@@ -64,11 +98,16 @@ def enqueue_recompute_job(job_id: str, params_dict: Dict[str, Any]) -> str:
     steps[STEP_INPUT] = {"label": "Sequence Queue", "state": STATE_QUEUED}
     steps[STEP_ORIENT] = {"label": "Orientation Check (skipped)", "state": STATE_SKIPPED}
     steps[STEP_BLAST] = {"label": "BLAST Search (skipped)", "state": STATE_SKIPPED}
+    # Recompute reuses sequences that were already region-extracted, so the
+    # extraction step never re-runs here.
+    steps[STEP_ITS] = {"label": "ITS Region Extraction (skipped)", "state": STATE_SKIPPED}
 
     job = q.enqueue_call(
         run_recompute_job,
         args=(job_id, params_dict),
-        timeout='1h',
+        # Recompute re-runs the tree step, so it needs the same budget a fresh
+        # RAxML job gets.
+        timeout=resolve_job_timeout(params_dict),
         job_id=job_id,
         meta={
             "steps": steps,

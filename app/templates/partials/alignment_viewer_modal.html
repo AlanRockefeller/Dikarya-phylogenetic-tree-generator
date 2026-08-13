@@ -30,10 +30,10 @@
                 <option value="leading_gaps">Leading gaps</option>
             </select>
 
-            <!-- Reference selector (shown only for similarity sorts) -->
+            <!-- Reference selector: baseline for difference highlighting, variable columns and similarity sorts -->
             <select id="alignment-reference"
-                class="hidden text-xs bg-white dark:bg-journal-dark text-gray-800 dark:text-gray-100 border border-gray-300 dark:border-gray-600 rounded px-2 py-1 max-w-[14rem] focus:ring-journal-gold focus:border-journal-gold"
-                title="Reference sequence for similarity sort"></select>
+                class="text-xs bg-white dark:bg-journal-dark text-gray-800 dark:text-gray-100 border border-gray-300 dark:border-gray-600 rounded px-2 py-1 max-w-[16rem] focus:ring-journal-gold focus:border-journal-gold"
+                title="Sequence every row is compared against. Pick a holotype (or any sequence) to see how the rest differ from it; Consensus uses the most frequent base per column. You can also click a sequence name in the list."></select>
 
             <!-- Search -->
             <input type="text" id="alignment-filter" placeholder="Filter sequences..."
@@ -69,13 +69,14 @@
 
             <!-- Difference toggles -->
             <label class="flex items-center gap-1.5 text-xs font-medium text-gray-700 dark:text-gray-200 cursor-pointer select-none"
-                title="Highlights any non-gap base that doesn't match the column's consensus letter. Consensus is the most frequent non-gap, non-N base in each column over the displayed sequences.">
-                <input type="checkbox" id="alignment-highlight-diffs"
+                title="Highlights any non-gap base that doesn't match the reference. With Compare to: Consensus that is the most frequent non-gap, non-N base in each column over the displayed sequences; otherwise it is the sequence you selected.">
+                <input type="checkbox" id="alignment-highlight-diffs" checked
                     class="rounded border-gray-300 text-journal-gold focus:ring-journal-gold w-3.5 h-3.5">
                 Highlight differences
             </label>
-            <label class="flex items-center gap-1.5 text-xs font-medium text-gray-700 dark:text-gray-200 cursor-pointer select-none">
-                <input type="checkbox" id="alignment-variable-only"
+            <label class="flex items-center gap-1.5 text-xs font-medium text-gray-700 dark:text-gray-200 cursor-pointer select-none"
+                title="Show only columns that vary. With a reference sequence selected, a column is shown when at least one displayed sequence differs from the reference there.">
+                <input type="checkbox" id="alignment-variable-only" checked
                     class="rounded border-gray-300 text-journal-gold focus:ring-journal-gold w-3.5 h-3.5">
                 Variable columns only
             </label>

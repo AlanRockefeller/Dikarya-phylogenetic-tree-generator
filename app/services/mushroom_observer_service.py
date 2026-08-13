@@ -394,7 +394,6 @@ def create_tree_job(raw_input: str, sequence_id: Any, *, user=None,
                 "mo_tree_preparation": "queued",
             },
             job_id=job_id,
-            job_timeout=7200,
         )
     except Exception:
         failed_metrics = dict(record.metrics or {})
@@ -537,6 +536,7 @@ def prepare_tree_job(preparation: Dict[str, Any], *, defer_after_ncbi_rerun: boo
         _build_fasta_text,
         _build_sequence_metadata,
         _check_auto_created_mycomap_ncbi_results,
+        _mycomap_queue_backlog_message,
         _refresh_mycomap_blast_results,
     )
     from app.services.mycomap_service import (
@@ -544,7 +544,8 @@ def prepare_tree_job(preparation: Dict[str, Any], *, defer_after_ncbi_rerun: boo
         MycoMapRerunError,
         create_mycomap_blast,
         find_mycomap_blast_by_title,
-        get_mycomap_ncbi_poll_max_attempts,
+        get_mycomap_creation_discovery_max_attempts,
+        get_mycomap_creation_discovery_max_seconds,
         validate_mycomap_url,
         validate_mycomap_rerun_limit,
     )
@@ -577,9 +578,11 @@ def prepare_tree_job(preparation: Dict[str, Any], *, defer_after_ncbi_rerun: boo
         found = find_mycomap_blast_by_title(title)
         if not found:
             attempt = int(details.get("creation_discovery_attempt") or 0) + 1
-            if attempt >= get_mycomap_ncbi_poll_max_attempts():
+            if attempt >= get_mycomap_creation_discovery_max_attempts():
                 raise MushroomObserverError(
-                    "MycoMap accepted the BLAST request, but its result page could not be found.",
+                    _mycomap_queue_backlog_message(
+                        get_mycomap_creation_discovery_max_seconds()
+                    ),
                     status=504,
                 )
             details["creation_discovery_attempt"] = attempt

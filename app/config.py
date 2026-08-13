@@ -48,12 +48,52 @@ class Config:
     BMGE_BINARY = os.environ.get('BMGE_BINARY', 'bmge')
     FASTTREE_BINARY = os.environ.get('FASTTREE_BINARY', '/usr/local/bin/FastTree')
 
-    
+    # Resource ceilings applied to every external tool we spawn (see
+    # subprocess_utils.run_command). The host has 15 GB of RAM and no swap, so
+    # an alignment or tree run that grows without bound gets the machine OOM
+    # killed rather than just failing its own job -- and the kernel picks the
+    # victim, which may well be Gunicorn or Redis rather than the culprit.
+    # These limits make the offending process die on its own instead.
+    #
+    # 9 GB leaves headroom beneath the worker cgroup's 10 GB ceiling, so the
+    # child receives a diagnosable allocation failure before systemd has to
+    # kill the whole worker. The host's remaining 5 GB stays available to the
+    # OS, Redis, and Gunicorn. The CPU ceiling is deliberately generous enough
+    # for alignments containing several hundred sequences, while the job's
+    # wall-clock timeout still bounds a stalled process.
+    # Set either to 0 to disable that limit.
+    SUBPROCESS_MEMORY_LIMIT_MB = int(os.environ.get('SUBPROCESS_MEMORY_LIMIT_MB', '9216'))
+    SUBPROCESS_CPU_LIMIT_SECONDS = int(os.environ.get('SUBPROCESS_CPU_LIMIT_SECONDS', '43200'))
+
+    # Ordinary jobs previously had a one-hour RQ deadline. That was too short
+    # for legitimate large MUSCLE/MAFFT alignments even though the host still
+    # had ample memory. RAxML keeps its separate, longer allowance below.
+    GENERAL_JOB_TIME_LIMIT_HOURS = float(os.environ.get('GENERAL_JOB_TIME_LIMIT_HOURS', '8'))
+
+    # RAxML-NG with --all and autoMRE bootstrapping routinely needs far more
+    # than the default 1h wall clock, and used to die at exactly one hour with
+    # an unexplained failure. It now gets its own budget, which has to be
+    # honoured in three places or the shortest one still wins:
+    #   1. the RQ job_timeout   (app/workers/queue.py)
+    #   2. the subprocess wait  (_run_raxml)
+    #   3. RLIMIT_CPU           (_run_raxml, scaled by thread count)
+    RAXML_TIME_LIMIT_HOURS = float(os.environ.get('RAXML_TIME_LIMIT_HOURS', '15'))
+
+
     # Paths
     BASE_DIR = Path(__file__).resolve().parent.parent
     JOB_DIR = Path(os.environ.get('JOB_DIR') or BASE_DIR / 'var' / 'jobs')
     BLAST_CACHE_DIR = Path(os.environ.get('BLAST_CACHE_DIR') or BASE_DIR / 'cache' / 'blast')
+    # ITSx HMM profiles, used by pyitsx for optional ITS1/5.8S/ITS2 extraction.
+    ITSX_HMM_DIR = Path(os.environ.get('ITSX_HMM_DIR') or BASE_DIR / 'cache' / 'itsx' / 'HMMs')
     BLAST_EMAIL = os.environ.get('BLAST_EMAIL', '')
+    # Reverse geocoder used when a GenBank record has lat_lon coordinates but no
+    # textual geo_loc_name/country. Nominatim is free and needs no key; its usage
+    # policy caps us at 1 request/second (enforced in genbank_location_service).
+    REVERSE_GEOCODE_URL = os.environ.get(
+        'REVERSE_GEOCODE_URL', 'https://nominatim.openstreetmap.org/reverse'
+    )
+    REVERSE_GEOCODE_ENABLED = os.environ.get('REVERSE_GEOCODE_ENABLED', '1') not in ('0', 'false', 'False')
     BLAST_MAX_QUERY_LENGTH = int(os.environ.get('BLAST_MAX_QUERY_LENGTH', '50000'))  # 50KB max
 
     # Global request body cap. Sequences via /api/v1/jobs can be up to 5 MB;
@@ -84,7 +124,35 @@ class Config:
     BEGINNER_DEFAULT_TRIMMING = os.environ.get('BEGINNER_DEFAULT_TRIMMING', 'none')
     
     DEFAULT_ML_MODEL = os.environ.get("DEFAULT_ML_MODEL", "GTR+G")
+    # IQ-TREE gets its own default because it ships ModelFinder. "MFP" picks the
+    # best-fit substitution model by BIC and then infers the tree with it, which
+    # is the right default for a tool that can do the selection itself -- a fixed
+    # GTR+G silently ignores whether the data want +I, +R, or a simpler matrix.
+    # Costs seconds on typical ITS datasets. Set to a concrete model name (e.g.
+    # "GTR+G") to go back to a fixed model for every IQ-TREE job.
+    DEFAULT_IQTREE_MODEL = os.environ.get("DEFAULT_IQTREE_MODEL", "MFP")
     DEFAULT_BOOTSTRAPS = int(os.environ.get("DEFAULT_BOOTSTRAPS", "100"))
+    # IQ-TREE runs SH-aLRT alongside Ultrafast Bootstrap by default, giving dual
+    # "SH-aLRT/UFBoot" node labels. Set to 0 to report UFBoot only.
+    DEFAULT_IQTREE_ALRT = int(os.environ.get("DEFAULT_IQTREE_ALRT", "1000"))
+
+    # Default alignment trimmer. "trimal_gappy" (trimAl -gt 0.9) drops columns
+    # that are >90% gaps -- alignment junk -- while leaving the variable ITS1/ITS2
+    # regions intact. Deliberately NOT "trimal" (-automated1), which strips ~43% of
+    # ITS1/ITS2 and produced fewer well-supported nodes than no trimming at all.
+    DEFAULT_TRIMMING_METHOD = os.environ.get("DEFAULT_TRIMMING_METHOD", "trimal_gappy")
+
+    # SSE (/api/job/<id>/events) safety limits. Gunicorn runs a fixed
+    # workers x threads pool, so any stream that outlives its client holds a
+    # request slot. These caps bound that: the client's EventSource reconnects
+    # automatically and receives a fresh snapshot, so a live viewer sees no
+    # interruption while an orphaned stream cannot pin a thread forever.
+    SSE_MAX_STREAM_SECONDS = int(os.environ.get("SSE_MAX_STREAM_SECONDS", "1800"))
+    # How long to hold a stream open for a job that was already finished when the
+    # client connected (catches events still settling), before closing.
+    SSE_TERMINAL_LINGER_SECONDS = int(
+        os.environ.get("SSE_TERMINAL_LINGER_SECONDS", "10")
+    )
     DEFAULT_MCMC_GENERATIONS = int(os.environ.get("DEFAULT_MCMC_GENERATIONS", "50000"))
     DEFAULT_MCMC_NRNS = int(os.environ.get("DEFAULT_MCMC_NRNS", "2"))
     DEFAULT_MCMC_CHAINS = int(os.environ.get("DEFAULT_MCMC_CHAINS", "4"))

@@ -41,6 +41,7 @@ def _schemas():
                         "tree_method": {"type": "string"},
                         "tree_model": {"type": "string"},
                         "bootstrap": {"type": "integer"},
+                        "alrt_replicates": {"type": "integer"},
                         "mcmc_generations": {"type": "integer"},
                         "mcmc_nruns": {"type": "integer"},
                         "mcmc_nchains": {"type": "integer"},
@@ -82,13 +83,17 @@ def _schemas():
                 "alignment_method": {"type": "string",
                                       "enum": ["mafft", "muscle", "clustalo", "iqtree_builtin", "default"]},
                 "trimming_method": {"type": "string",
-                                     "enum": ["none", "trimal", "bmge"]},
+                                     "enum": ["none", "trimal_gappy", "trimal", "bmge"]},
                 "trim_terminal_overhangs": {
                     "type": "boolean",
                     "default": True,
                     "description": "Trim alignment columns outside the common covered span before tree building.",
                 },
                 "bootstrap": {"type": "integer", "minimum": 0, "maximum": 10000},
+                "alrt_replicates": {
+                    "type": "integer", "minimum": 0, "maximum": 10000,
+                    "description": "IQ-TREE SH-aLRT replicates. 0 reports UFBoot only.",
+                },
                 "mcmc_generations": {"type": "integer", "minimum": 1000, "maximum": 100000000},
                 "mcmc_nruns": {"type": "integer", "minimum": 1, "maximum": 8},
                 "mcmc_nchains": {"type": "integer", "minimum": 1, "maximum": 16},
@@ -115,7 +120,7 @@ def _schemas():
                 ),
                 "tree_method": "fasttree",
                 "alignment_method": "mafft",
-                "trimming_method": "none",
+                "trimming_method": "trimal_gappy",
                 "trim_terminal_overhangs": True,
                 "notes": "API test with valid pasted FASTA",
             },
@@ -158,8 +163,14 @@ def _schemas():
                 },
                 "trimming_method": {
                     "type": "string",
-                    "enum": ["none", "trimal", "bmge"],
-                    "default": "none",
+                    "enum": ["none", "trimal_gappy", "trimal", "bmge"],
+                    "default": "trimal_gappy",
+                    "description": (
+                        "Alignment trimmer. 'trimal_gappy' (default) runs trimAl -gt 0.9, "
+                        "dropping columns that are >90%% gaps. 'trimal' runs -automated1, "
+                        "which is aggressive and strips much of ITS1/ITS2 -- not recommended "
+                        "for ITS."
+                    ),
                 },
                 "trim_terminal_overhangs": {
                     "type": "boolean",
@@ -170,8 +181,20 @@ def _schemas():
                     "type": "string",
                     "enum": ["nj", "raxml", "iqtree", "mrbayes", "fasttree"],
                 },
-                "tree_model": {"type": "string", "default": "GTR+G"},
+                "tree_model": {
+                    "type": "string", "default": "GTR+G",
+                    "description": (
+                        "Substitution model. Defaults to GTR+G, except for tree_method=iqtree, "
+                        "where omitting it runs ModelFinder (-m MFP) to select the best-fit "
+                        "model by BIC; the chosen model is reported as model_selected in "
+                        "tree_metadata.json. Pass an explicit model name to fix it."
+                    ),
+                },
                 "bootstrap": {"type": "integer", "minimum": 0, "maximum": 10000, "default": 1000},
+                "alrt_replicates": {
+                    "type": "integer", "minimum": 0, "maximum": 10000, "default": 1000,
+                    "description": "IQ-TREE SH-aLRT replicates, run alongside Ultrafast Bootstrap. Nodes are labelled SH-aLRT/UFBoot. 0 reports UFBoot only.",
+                },
                 "mcmc_generations": {"type": "integer", "minimum": 1000, "maximum": 100000000, "default": 50000},
                 "mcmc_nruns": {"type": "integer", "minimum": 1, "maximum": 8, "default": 2},
                 "mcmc_nchains": {"type": "integer", "minimum": 1, "maximum": 16, "default": 4},
@@ -690,6 +713,17 @@ def build_spec():
                                         "For a single observation that already has a "
                                         "Phylogenetic Tree field, explicitly allow a new "
                                         "tree to replace the field's current URL."
+                                    ),
+                                },
+                                "keep_existing_tree_url": {
+                                    "type": "boolean",
+                                    "default": False,
+                                    "description": (
+                                        "For a single observation that already has a "
+                                        "Phylogenetic Tree field, build an additional "
+                                        "tree and leave the field's current URL "
+                                        "unchanged. Takes precedence over "
+                                        "`recreate_existing_tree`."
                                     ),
                                 },
                                 "mycomap_local_limit": {

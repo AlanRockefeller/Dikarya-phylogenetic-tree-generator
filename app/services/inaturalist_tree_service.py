@@ -33,6 +33,14 @@ MAX_RAW_INPUT_LEN = 300
 MAX_PER_PAGE = 200
 RATE_LIMIT_DELAY = 1.0
 
+# Transient statuses worth retrying: 429 is iNat's rate limiter, the 5xx set is
+# their infrastructure having a moment. Anything else (404, 422, auth) is a real
+# answer and retrying it just wastes the user's time.
+RETRYABLE_HTTP_STATUSES = frozenset({429, 500, 502, 503, 504})
+MAX_HTTP_ATTEMPTS = 4
+RETRY_BACKOFF_BASE = 2.0
+RETRY_BACKOFF_CAP = 30.0
+
 MYCOMAP_BLAST_FIELD_NAME = "Mycomap BLAST Results"
 PHYLOGENETIC_TREE_FIELD_NAME = "Phylogenetic Tree"
 PHYLOGENETIC_TREE_FIELD_DESC = (
@@ -169,6 +177,27 @@ def parse_inaturalist_tree_input(raw_input: str) -> Dict[str, Any]:
 # iNaturalist HTTP helpers
 # ---------------------------------------------------------------------------
 
+def _retry_delay(error, attempt: int) -> float:
+    """Seconds to wait before retry `attempt`, preferring iNat's own guidance.
+
+    A Retry-After header is what the server actually wants; exponential backoff
+    is the fallback. Capped so one unlucky request cannot stall a job for
+    minutes.
+    """
+    if error is not None:
+        header = None
+        try:
+            header = error.headers.get('Retry-After')
+        except Exception:
+            header = None
+        if header:
+            try:
+                return max(0.0, min(float(header), RETRY_BACKOFF_CAP))
+            except (TypeError, ValueError):
+                pass  # iNat can send an HTTP-date instead; fall through.
+    return min(RETRY_BACKOFF_BASE ** attempt, RETRY_BACKOFF_CAP)
+
+
 def _http_request(url: str, *, method: str = "GET", body: Optional[Dict[str, Any]] = None,
                    bearer: Optional[str] = None) -> Dict[str, Any]:
     data = None
@@ -182,22 +211,65 @@ def _http_request(url: str, *, method: str = "GET", body: Optional[Dict[str, Any
     if bearer:
         headers['Authorization'] = f'Bearer {bearer}'
     req = urllib.request.Request(url, data=data, method=method, headers=headers)
-    try:
-        with urllib.request.urlopen(req, timeout=REQUEST_TIMEOUT) as resp:
-            raw = resp.read().decode('utf-8') or '{}'
-            return json.loads(raw) if raw.strip() else {}
-    except urllib.error.HTTPError as e:
+
+    # iNaturalist rate-limits aggressively, and a bare 429 used to fail the job
+    # outright: 564 of the failures on record were "iNaturalist API returned
+    # HTTP 429", nearly all of them in two days of bulk importing. Retry the
+    # transient statuses, honouring Retry-After when iNat sends it.
+    attempt = 0
+    waited = 0.0
+    while True:
+        attempt += 1
         try:
-            detail = e.read().decode('utf-8', errors='replace')[:200]
-        except Exception:
-            detail = ''
-        logger.warning("iNat %s %s failed: HTTP %s", method, url, e.code)
-        raise InatTreeError(
-            f"iNaturalist API returned HTTP {e.code}.",
-            status=502 if e.code >= 500 else 400,
-        )
-    except urllib.error.URLError as e:
-        raise InatTreeError(f"iNaturalist network error: {e.reason}", status=502)
+            with urllib.request.urlopen(req, timeout=REQUEST_TIMEOUT) as resp:
+                raw = resp.read().decode('utf-8') or '{}'
+                return json.loads(raw) if raw.strip() else {}
+        except urllib.error.HTTPError as e:
+            if e.code in RETRYABLE_HTTP_STATUSES and attempt <= MAX_HTTP_ATTEMPTS:
+                delay = _retry_delay(e, attempt)
+                logger.warning(
+                    "iNat %s %s: HTTP %s, retrying in %.1fs (attempt %d/%d)",
+                    method, url, e.code, delay, attempt, MAX_HTTP_ATTEMPTS,
+                )
+                time.sleep(delay)
+                waited += delay
+                continue
+            logger.warning("iNat %s %s failed: HTTP %s", method, url, e.code)
+            if e.code == 429:
+                raise InatTreeError(
+                    f"iNaturalist is rate-limiting requests right now (HTTP 429). "
+                    f"Dikarya retried {MAX_HTTP_ATTEMPTS} times over about "
+                    f"{waited:.0f} seconds and was still refused. Please wait a "
+                    f"few minutes and try again; importing fewer observations at "
+                    f"once makes this less likely.",
+                    status=429,
+                )
+            if e.code >= 500:
+                raise InatTreeError(
+                    f"iNaturalist's servers returned an error (HTTP {e.code}) after "
+                    f"{attempt} attempt(s). This is a problem on their end, not with "
+                    f"your data -- please try again shortly.",
+                    status=502,
+                )
+            raise InatTreeError(
+                f"iNaturalist API returned HTTP {e.code}.",
+                status=400,
+            )
+        except urllib.error.URLError as e:
+            if attempt <= MAX_HTTP_ATTEMPTS:
+                delay = _retry_delay(None, attempt)
+                logger.warning(
+                    "iNat %s %s network error (%s), retrying in %.1fs (attempt %d/%d)",
+                    method, url, e.reason, delay, attempt, MAX_HTTP_ATTEMPTS,
+                )
+                time.sleep(delay)
+                waited += delay
+                continue
+            raise InatTreeError(
+                f"Could not reach iNaturalist after {MAX_HTTP_ATTEMPTS} attempts "
+                f"({e.reason}). Please try again shortly.",
+                status=502,
+            )
 
 
 def fetch_observation(observation_id: int) -> Dict[str, Any]:
@@ -516,13 +588,19 @@ def preview_inaturalist_tree_input(raw_input: str,
         observation = fetch_observation(observation_id)
         has_mycomap = _has_nonempty_field(observation, MYCOMAP_BLAST_FIELD_NAME)
         has_its = _has_nonempty_field(observation, DNA_BARCODE_ITS_FIELD_NAME)
-        has_tree = _has_nonempty_field(observation, PHYLOGENETIC_TREE_FIELD_NAME)
+        tree_url = (
+            extract_observation_field_value(
+                observation, PHYLOGENETIC_TREE_FIELD_NAME
+            ) or ""
+        ).strip()
+        has_tree = bool(tree_url)
         can_recreate_tree = bool(has_tree and (has_mycomap or has_its))
         if can_recreate_tree:
             message = (
                 f"Found observation {observation_id}. It already has a "
                 "Phylogenetic Tree field. Select Re-create phylogenetic tree "
-                "to build a new tree and replace the field's current URL."
+                "to build a new tree and replace the field's current URL, or "
+                "Build a new tree without replacing to leave the field alone."
             )
         elif has_tree:
             message = (
@@ -558,6 +636,7 @@ def preview_inaturalist_tree_input(raw_input: str,
                 has_its and not has_mycomap
             ),
             "has_phylogenetic_tree": has_tree,
+            "phylogenetic_tree_url": tree_url or None,
             "can_recreate_phylogenetic_tree": can_recreate_tree,
             "eligible_tree_count": 1 if eligible else 0,
             "total_matching_observations": 1,
@@ -672,7 +751,7 @@ def set_observation_field_value(observation_id: int, field_name: str, value: str
 DEFAULT_TREE_PARAMS = {
     "input_type": "fasta",
     "alignment_method": "mafft",
-    "trimming_method": "none",
+    "trimming_method": "trimal_gappy",
     "trim_terminal_overhangs": True,
     "tree_method": "fasttree",
     "tree_model": "GTR+G",
@@ -1193,6 +1272,7 @@ def _build_inat_tree_metrics(observation_id: int, *, queue_class: str,
                              source: str, public_base_url: Optional[str],
                              rebuild_ncbi_blast: bool,
                              recreate_existing_tree: bool = False,
+                             keep_existing_tree_url: bool = False,
                              genus: Optional[str] = None,
                              extra_metrics: Optional[Dict[str, Any]] = None
                              ) -> Dict[str, Any]:
@@ -1209,9 +1289,14 @@ def _build_inat_tree_metrics(observation_id: int, *, queue_class: str,
         "inat_update_status": "pending",
         "inat_observation_field": PHYLOGENETIC_TREE_FIELD_NAME,
         "inat_replace_existing_tree": bool(recreate_existing_tree),
+        # Alan 8/4/26 - Allow building an extra tree while leaving the
+        # observation's existing Phylogenetic Tree field URL untouched.
+        "inat_skip_field_update": bool(keep_existing_tree_url),
         "queue_class": queue_class,
         "source": source,
     }
+    if keep_existing_tree_url:
+        metrics["inat_update_status"] = "skipped"
     if rebuild_ncbi_blast:
         metrics["mycomap_ncbi_blast_rebuild_requested"] = True
         metrics["mycomap_preparation_status"] = "queued"
@@ -1221,6 +1306,55 @@ def _build_inat_tree_metrics(observation_id: int, *, queue_class: str,
     if public_base_url:
         metrics["inat_public_base_url"] = public_base_url
     return metrics
+
+
+def _mycomap_queue_backlog_message(waited_seconds: int,
+                                   local_count: Optional[int] = None) -> str:
+    """
+    Explain that MycoMap's BLAST produced too few results to build a tree.
+
+    Only use this once the search's result counts have actually been read --
+    for a search we could never even locate, see
+    ``_mycomap_creation_discovery_message``.
+    """
+    minutes = max(1, round(waited_seconds / 60))
+    local_summary = (
+        "no local (MycoBLAST) hits" if not local_count
+        else f"only {local_count} local (MycoBLAST) hit"
+             f"{'s' if local_count != 1 else ''}"
+    )
+    return (
+        "MycoMap accepted this BLAST request and added it to its queue, but "
+        f"produced no NCBI hits and {local_summary} within {minutes} minute"
+        f"{'s' if minutes != 1 else ''} - its BLAST queue is backed up. That "
+        "is not enough to build a tree from. Rebuild this tree once the "
+        "search finishes at https://mycomap.com/genetics/blast-search/."
+    )
+
+
+def _mycomap_creation_discovery_message(waited_seconds: int,
+                                        warnings: Optional[List[str]] = None
+                                        ) -> str:
+    """
+    Explain that a newly created MycoMap BLAST never became readable.
+
+    Local and NCBI hits both hang off one MycoMap BLAST ID, and at this point
+    we never obtained one, so we cannot say anything about how many hits the
+    search found - only that we could not find the search itself.
+    """
+    minutes = max(1, round(waited_seconds / 60))
+    message = (
+        "MycoMap accepted this BLAST request, but its results page had still "
+        f"not appeared {minutes} minute{'s' if minutes != 1 else ''} later, "
+        "so there was no search to read local (MycoBLAST) or NCBI hits from. "
+        "This usually means MycoMap's BLAST queue is backed up. Rebuild this "
+        "tree once the search appears at "
+        "https://mycomap.com/genetics/blast-search/."
+    )
+    detail = "; ".join(dict.fromkeys(w for w in (warnings or []) if w))
+    if detail:
+        message = f"{message} Last lookup problem: {detail}"
+    return message
 
 
 def _create_mycomap_blast_from_observation(observation: Dict[str, Any],
@@ -1235,7 +1369,8 @@ def _create_mycomap_blast_from_observation(observation: Dict[str, Any],
         MycoMapCreateError,
         create_mycomap_blast,
         find_mycomap_blast_by_title,
-        get_mycomap_ncbi_poll_max_attempts,
+        get_mycomap_creation_discovery_max_attempts,
+        get_mycomap_creation_discovery_max_seconds,
         validate_mycomap_rerun_limit,
     )
 
@@ -1248,7 +1383,10 @@ def _create_mycomap_blast_from_observation(observation: Dict[str, Any],
             status=422,
         )
     job_title = f"iNat{int(observation_id)} DNA Barcode ITS"
-    created = find_mycomap_blast_by_title(job_title)
+    # Alan 8/5/26 - Collect why a lookup failed so a discovery timeout can say
+    # what actually went wrong instead of always blaming MycoMap's queue.
+    discovery_warnings: List[str] = []
+    created = find_mycomap_blast_by_title(job_title, warnings=discovery_warnings)
     if created:
         local_limit, local_error = validate_mycomap_rerun_limit(
             mycomap_local_limit, "local"
@@ -1266,14 +1404,18 @@ def _create_mycomap_blast_from_observation(observation: Dict[str, Any],
     elif (pending_creation_details or {}).get("creation_pending"):
         details = dict(pending_creation_details)
         attempt = int(details.get("creation_discovery_attempt") or 0) + 1
-        max_attempts = get_mycomap_ncbi_poll_max_attempts()
+        max_attempts = get_mycomap_creation_discovery_max_attempts()
         if attempt >= max_attempts:
             raise InatTreeError(
-                "MycoMap accepted the BLAST request, but its result could not "
-                f"be discovered within {max_attempts} permitted attempts.",
+                _mycomap_creation_discovery_message(
+                    get_mycomap_creation_discovery_max_seconds(),
+                    discovery_warnings,
+                ),
                 status=504,
             )
         details["creation_discovery_attempt"] = attempt
+        if discovery_warnings:
+            details["creation_discovery_warnings"] = discovery_warnings
         return details
     else:
         try:
@@ -1340,6 +1482,7 @@ def _check_auto_created_mycomap_ncbi_results(
         mycomap_url: Optional[str] = None) -> Tuple[bool, Dict[str, Any]]:
     """Check one polling interval for NCBI hits on an auto-created BLAST."""
     from app.services.mycomap_service import (
+        get_mycomap_local_result_count,
         get_mycomap_ncbi_local_fallback_seconds,
         get_mycomap_ncbi_poll_interval_seconds,
         get_mycomap_ncbi_poll_max_attempts,
@@ -1369,15 +1512,31 @@ def _check_auto_created_mycomap_ncbi_results(
     elapsed_seconds = attempt * get_mycomap_ncbi_poll_interval_seconds()
     fallback_seconds = get_mycomap_ncbi_local_fallback_seconds()
     if elapsed_seconds >= fallback_seconds:
-        details["ncbi_status"] = "timed_out_local_fallback"
-        details["ncbi_fallback_local_only"] = True
-        fallback_minutes = max(1, round(fallback_seconds / 60))
-        details["warnings"] = list(details.get("warnings") or []) + [
-            "MycoMap NCBI BLAST results were not ready within "
-            f"{fallback_minutes} minute{'s' if fallback_minutes != 1 else ''}; "
-            "building the tree from local (MycoBLAST) results only."
-        ]
-        return True, details
+        # Local and NCBI hits both come from this one MycoMap BLAST. Only fall
+        # back to a local-only tree once local results actually exist -- if the
+        # whole search is still queued there is nothing to build from.
+        local_count, local_warnings = get_mycomap_local_result_count(blast_id)
+        details["local_result_count"] = local_count
+        if local_warnings:
+            details["local_poll_warnings"] = local_warnings
+        if local_count >= 2:
+            details["ncbi_status"] = "timed_out_local_fallback"
+            details["ncbi_fallback_local_only"] = True
+            fallback_minutes = max(1, round(fallback_seconds / 60))
+            details["warnings"] = list(details.get("warnings") or []) + [
+                "MycoMap NCBI BLAST results were not ready within "
+                f"{fallback_minutes} minute"
+                f"{'s' if fallback_minutes != 1 else ''}; building the tree "
+                "from local (MycoBLAST) results only. Rebuild this tree once "
+                "the NCBI results arrive to include them."
+            ]
+            return True, details
+        # Alan 8/5/26 - Report the local hit count we just measured rather than
+        # asserting there are none.
+        raise InatTreeError(
+            _mycomap_queue_backlog_message(fallback_seconds, local_count),
+            status=504,
+        )
 
     max_attempts = get_mycomap_ncbi_poll_max_attempts()
     if attempt >= max_attempts:
@@ -1562,6 +1721,7 @@ def prepare_inat_tree_job(observation_id: int, *, include_ncbi: bool = True,
                           include_local: bool = True,
                           rebuild_ncbi_blast: bool = False,
                           recreate_existing_tree: bool = False,
+                          keep_existing_tree_url: bool = False,
                           mycomap_local_limit=None,
                           mycomap_ncbi_limit=None,
                           defer_after_ncbi_rerun: bool = False,
@@ -1589,10 +1749,13 @@ def prepare_inat_tree_job(observation_id: int, *, include_ncbi: bool = True,
         existing_tree_record
         and str(existing_tree_record.get("value") or "").strip()
         and not recreate_existing_tree
+        # Alan 8/4/26 - Building without replacing is also explicit consent.
+        and not keep_existing_tree_url
     ):
         raise InatTreeError(
             "This observation already has a Phylogenetic Tree field. Select "
-            "Re-create phylogenetic tree to replace its URL with a new tree.",
+            "Re-create phylogenetic tree to replace its URL with a new tree, "
+            "or Build a new tree without replacing to keep the current URL.",
             status=409,
         )
     mycomap_url = extract_observation_field_value(observation, MYCOMAP_BLAST_FIELD_NAME)
@@ -1740,6 +1903,7 @@ def create_job_from_inat_observation(raw_input: str, user=None,
                                       include_local: bool = True,
                                       rebuild_ncbi_blast: bool = False,
                                       recreate_existing_tree: bool = False,
+                                      keep_existing_tree_url: bool = False,
                                       mycomap_local_limit=None,
                                       mycomap_ncbi_limit=None,
                                       public_base_url: Optional[str] = None,
@@ -1759,6 +1923,10 @@ def create_job_from_inat_observation(raw_input: str, user=None,
     from app.workers.queue import enqueue_job
 
     observation_id = parse_single_observation_input(raw_input)
+    # Alan 8/4/26 - Keeping the existing URL wins over replacing it.
+    keep_existing_tree_url = bool(keep_existing_tree_url)
+    if keep_existing_tree_url:
+        recreate_existing_tree = False
     initial_genus = _clean_display_text((extra_metrics or {}).get("inat_genus"))
     rq_meta = {
         "queue_class": queue_class,
@@ -1778,6 +1946,7 @@ def create_job_from_inat_observation(raw_input: str, user=None,
             "include_local": bool(include_local),
             "rebuild_ncbi_blast": bool(rebuild_ncbi_blast),
             "recreate_existing_tree": bool(recreate_existing_tree),
+            "keep_existing_tree_url": keep_existing_tree_url,
             "mycomap_local_limit": mycomap_local_limit,
             "mycomap_ncbi_limit": mycomap_ncbi_limit,
         },
@@ -1789,6 +1958,7 @@ def create_job_from_inat_observation(raw_input: str, user=None,
         public_base_url=public_base_url,
         rebuild_ncbi_blast=bool(rebuild_ncbi_blast),
         recreate_existing_tree=bool(recreate_existing_tree),
+        keep_existing_tree_url=keep_existing_tree_url,
         genus=initial_genus,
         extra_metrics=extra_metrics,
     )
@@ -1811,7 +1981,6 @@ def create_job_from_inat_observation(raw_input: str, user=None,
             queue_name=queue_name,
             meta=rq_meta,
             job_id=job_id,
-            job_timeout=7200,
         )
     except Exception:
         metrics = dict(job_record.metrics or {})
@@ -1822,7 +1991,13 @@ def create_job_from_inat_observation(raw_input: str, user=None,
         db.session.commit()
         raise
 
-    if recreate_existing_tree:
+    if keep_existing_tree_url:
+        message = (
+            "Tree job queued. Dikarya will build a new tree and leave the "
+            "iNaturalist observation's existing “Phylogenetic Tree” field "
+            "URL unchanged."
+        )
+    elif recreate_existing_tree:
         message = (
             "Tree re-creation queued. When the new tree finishes, Dikarya "
             "will replace the existing “Phylogenetic Tree” field URL on the "
@@ -1857,6 +2032,7 @@ def create_job_from_inat_observation(raw_input: str, user=None,
         "mycomap_ncbi_blast_rebuilt": False,
         "mycomap_ncbi_blast_rebuild_requested": bool(rebuild_ncbi_blast),
         "recreate_existing_tree": bool(recreate_existing_tree),
+        "keep_existing_tree_url": keep_existing_tree_url,
         "queue_class": queue_class,
         "message": message,
     }
@@ -2175,6 +2351,13 @@ def post_completed_tree_to_inaturalist(job_id: str, metrics: Dict[str, Any]) -> 
         if not observation_id:
             out["error"] = "missing observation id"
             out["status"] = "failed"
+            return out
+
+        # Alan 8/4/26 - The user asked for an extra tree, so leave the
+        # observation's existing Phylogenetic Tree field URL alone.
+        if metrics.get("inat_skip_field_update"):
+            out["status"] = "skipped"
+            out["skipped_reason"] = "kept existing Phylogenetic Tree field URL"
             return out
 
         # Build the external tree URL. Prefer url_for(_external=True) when

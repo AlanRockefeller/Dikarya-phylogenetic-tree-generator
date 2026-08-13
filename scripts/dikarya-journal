@@ -1,0 +1,58 @@
+#!/bin/sh
+# Read-only journal access, limited to the three Dikarya units.
+#
+# Install as root:
+#   cp scripts/dikarya-journal /usr/local/sbin/dikarya-journal
+#   chown root:root /usr/local/sbin/dikarya-journal
+#   chmod 0755 /usr/local/sbin/dikarya-journal
+#
+# Then add to the tree user's sudoers entry, alongside the restart wrappers:
+#   tree ALL=(root) NOPASSWD: /usr/local/sbin/dikarya-journal
+# Edit with `visudo` so a syntax error cannot lock you out of sudo.
+#
+# Usage:
+#   sudo /usr/local/sbin/dikarya-journal worker
+#   sudo /usr/local/sbin/dikarya-journal worker 1000
+#   sudo /usr/local/sbin/dikarya-journal web 500 | grep -i traceback
+#
+# WHY THIS DOES NOT FORWARD "$@" TO journalctl:
+#
+# journalctl ORs its -u arguments, so a wrapper that appended user arguments to
+# a fixed "-u dikarya-worker" would let any caller write
+#   dikarya-journal -u ssh.service
+# and read the whole journal anyway -- exactly what scoping this wrapper is
+# meant to prevent. --file, --directory, --machine and --root would each defeat
+# it too. So this takes a unit *keyword* mapped to a fixed unit name, plus a
+# line count validated as an integer, and forwards nothing else.
+#
+# Filtering is deliberately left to the caller's own pipeline (grep, awk), which
+# needs no privilege at all.
+
+set -eu
+
+UNIT="${1:-worker}"
+LINES="${2:-200}"
+
+case "$UNIT" in
+    web)     SERVICE=dikarya-web.service ;;
+    worker)  SERVICE=dikarya-worker.service ;;
+    metrics) SERVICE=dikarya-metrics.service ;;
+    *)
+        echo "usage: dikarya-journal {web|worker|metrics} [lines]" >&2
+        exit 2
+        ;;
+esac
+
+case "$LINES" in
+    ''|*[!0-9]*)
+        echo "dikarya-journal: line count must be a positive integer" >&2
+        exit 2
+        ;;
+esac
+
+# Bound the output so a runaway call cannot dump the entire journal.
+if [ "$LINES" -gt 5000 ]; then
+    LINES=5000
+fi
+
+exec /usr/bin/journalctl --no-pager --unit "$SERVICE" --lines "$LINES"

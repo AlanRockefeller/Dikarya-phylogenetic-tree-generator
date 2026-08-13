@@ -32,6 +32,12 @@
     // Alan 5/12/26 - Switch to the cheapest .is-diff styling once the LIVE rendered cell count exceeds this.
     const LARGE_LIVE_CELLS = 8000;
 
+    // Alan 8/4/26 - Draggable names/alignment splitter. Width persists across sessions like the color scheme.
+    const NAMES_MIN_WIDTH = 110;
+    const NAMES_DEFAULT_WIDTH = 352; // Matches the old 22rem CSS max.
+    const CELLS_MIN_WIDTH = 160;
+    const NAMES_WIDTH_STORAGE_KEY = 'av-names-width';
+
     // Alan 5/12/26 - Cache controls so callbacks don't repeatedly query the DOM.
     const $ = (id) => document.getElementById(id);
     const backdrop = $('alignment-viewer-backdrop');
@@ -90,6 +96,9 @@
         visibleColumnIndexes: null,
         gapOnlyHidden: 0,
         consensus: '',
+        // Alan 8/4/26 - Baseline string every cell is compared against: the reference sequence when one is
+        // chosen, otherwise the computed consensus. Drives diff highlighting and Variable Columns Only.
+        baselineSeq: '',
         // Alan 5/12/26 - Fingerprint identifies the row SET + column-affecting toggles, not row order.
         _diffComputedFor: '',
         // Alan 5/12/26 - Virtualization scroll/window cache.
@@ -101,7 +110,52 @@
         _colWindow: { cs: -1, ce: -1 },
         _dom: null,
         _resizeObs: null,
+        // Alan 8/4/26 - Current width of the names column, in px; driven by the splitter.
+        namesWidth: NAMES_DEFAULT_WIDTH,
     };
+
+    // Alan 8/4/26 - Read the persisted names-column width; ignore anything absurd.
+    function loadNamesWidth() {
+        try {
+            const v = parseInt(localStorage.getItem(NAMES_WIDTH_STORAGE_KEY), 10);
+            if (Number.isFinite(v) && v >= NAMES_MIN_WIDTH && v <= 4000) return v;
+        } catch (_) { /* ignore storage errors */ }
+        return NAMES_DEFAULT_WIDTH;
+    }
+
+    // Alan 8/4/26 - Apply a names-column width, clamped so both columns stay usable at the current modal size.
+    function applyNamesWidth(px, persist) {
+        const total = gridEl.clientWidth || 0;
+        const max = total > 0 ? Math.max(NAMES_MIN_WIDTH, total - CELLS_MIN_WIDTH) : 4000;
+        const w = Math.round(Math.min(Math.max(px, NAMES_MIN_WIDTH), max));
+        state.namesWidth = w;
+        gridEl.style.gridTemplateColumns = `${w}px 1fr`;
+        if (state._dom && state._dom.resizer) state._dom.resizer.style.left = `${w}px`;
+        if (persist) {
+            try { localStorage.setItem(NAMES_WIDTH_STORAGE_KEY, String(w)); } catch (_) { /* ignore */ }
+        }
+    }
+
+    // Alan 8/4/26 - Double-clicking the splitter fits the column to the longest displayed name. Measured on a
+    // canvas with the same font as .av-names rather than by laying out the (virtualized) rows.
+    function measureLongestNameWidth() {
+        const rows = state.displayedRows || [];
+        if (!rows.length) return NAMES_DEFAULT_WIDTH;
+        const canvas = measureLongestNameWidth._canvas
+            || (measureLongestNameWidth._canvas = document.createElement('canvas'));
+        const ctx = canvas.getContext('2d');
+        if (!ctx) return NAMES_DEFAULT_WIDTH;
+        ctx.font = "12px 'IBM Plex Mono', ui-monospace, SFMono-Regular, Menlo, Consolas, monospace";
+        let max = 0;
+        for (let i = 0; i < rows.length; i++) {
+            const label = (state.referenceName === rows[i].name ? '◆ ' : '') + rows[i].name;
+            const w = ctx.measureText(label).width;
+            if (w > max) max = w;
+        }
+        // 8px padding each side, the score badge when a similarity sort is active, plus a little slack.
+        const scoreRoom = (state.sortMode === 'similar' || state.sortMode === 'different') ? 52 : 0;
+        return Math.ceil(max + 16 + scoreRoom + 6);
+    }
 
     // Alan 5/13/26 - Read persisted color scheme; fall back to "moss" default if missing or invalid.
     function loadColorScheme() {
@@ -166,9 +220,19 @@
         return `Sort: ${sortLabel} · ${variable} var · ${conserved} cons`;
     }
 
+    // Alan 8/4/26 - Resolve the chosen reference row from the full fetched set (not displayedRows) so it
+    // stays the baseline even when the text filter hides it. null means "compare to consensus".
+    function getReferenceRow() {
+        if (!state.referenceName) return null;
+        return state.sequences.find(r => r.name === state.referenceName) || null;
+    }
+
     // Alan 5/13/26 - Variability ignores gaps and N so a column with one base plus gaps is not "variable".
     // Operates on the rows passed in (the filter-aware, pruned-respecting displayedRows), never on DOM.
-    function buildVisibleColumnIndexes(rows) {
+    // Alan 8/4/26 - With a reference sequence chosen, "variable" means "some displayed row differs from the
+    // reference here" rather than "more than one base is present"; that is what makes a holotype comparison
+    // useful. Columns where the reference itself is a gap or N fall back to the distinct-base rule.
+    function buildVisibleColumnIndexes(rows, refSeq) {
         const len = state.alignmentLength;
         const indexes = [];
         let gapOnly = 0;
@@ -176,6 +240,9 @@
             let hasNonGap = false;
             let firstBase = null;
             let varied = false;
+            const refCh = refSeq ? (refSeq[i] || '-').toUpperCase() : null;
+            const useRef = !!refCh && !isGap(refCh) && refCh !== 'N';
+            if (useRef) firstBase = refCh;
             for (let r = 0; r < rows.length; r++) {
                 const ch = rows[r].sequence[i] || '-';
                 const gap = isGap(ch);
@@ -195,7 +262,7 @@
         return indexes;
     }
 
-    function computeConsensus(rows, visibleIdx) {
+    function computeConsensus(rows, visibleIdx, refSeq) {
         if (!rows.length) { state.variableColumnCount = 0; return ''; }
         const out = new Array(state.alignmentLength).fill('-');
         // Alan 5/13/26 - Count variable columns (>1 distinct non-gap/non-N base) while computing consensus for the corner label.
@@ -204,11 +271,17 @@
             const i = visibleIdx[k];
             const counts = {};
             let distinct = 0;
+            // Alan 8/4/26 - Against a reference, a column counts as variable when any row differs from the
+            // reference base, so the corner label matches what Variable Columns Only actually shows.
+            const refCh = refSeq ? (refSeq[i] || '-').toUpperCase() : null;
+            const useRef = !!refCh && refCh !== '-' && refCh !== '.' && refCh !== 'N';
+            let differsFromRef = false;
             for (let r = 0; r < rows.length; r++) {
                 const c = (rows[r].sequence[i] || '-').toUpperCase();
                 if (c === '-' || c === '.' || c === 'N') continue;
                 if (counts[c] === undefined) { counts[c] = 1; distinct++; }
                 else counts[c]++;
+                if (useRef && c !== refCh) differsFromRef = true;
             }
             let best = '-';
             let bestN = 0;
@@ -216,7 +289,7 @@
                 if (counts[k2] > bestN) { best = k2; bestN = counts[k2]; }
             }
             out[i] = best;
-            if (distinct > 1) variable++;
+            if (useRef ? differsFromRef : distinct > 1) variable++;
         }
         state.variableColumnCount = variable;
         return out.join('');
@@ -285,9 +358,11 @@
             return rows.slice().sort((a, b) => leadingGapCount(a.sequence) - leadingGapCount(b.sequence));
         }
         if (mode === 'similar' || mode === 'different') {
-            const ref = rows.find(r => r.name === state.referenceName) || rows[0];
-            if (!ref) return rows.slice();
-            const scored = rows.map(r => ({ row: r, score: r === ref ? 1 : percentIdentity(ref.sequence, r.sequence) }));
+            // Alan 8/4/26 - Score against the same baseline the cells are colored against: the chosen
+            // reference sequence, or the consensus when none is selected.
+            const refSeq = state.baselineSeq || (rows[0] && rows[0].sequence);
+            if (!refSeq) return rows.slice();
+            const scored = rows.map(r => ({ row: r, score: percentIdentity(refSeq, r.sequence) }));
             scored.sort((a, b) => (mode === 'similar' ? b.score - a.score : a.score - b.score));
             for (const s of scored) s.row.__score = s.score;
             return scored.map(s => s.row);
@@ -295,31 +370,46 @@
         return rows.slice();
     }
 
+    // Alan 8/4/26 - The reference selector is now always visible and drives diffs, variable columns and
+    // similarity sorts alike. The empty value means "compare to the computed consensus" (the old behavior).
     function populateReferenceSelector() {
         if (!refSel) return;
-        const showRef = state.sortMode === 'similar' || state.sortMode === 'different';
-        refSel.classList.toggle('hidden', !showRef);
-        if (!showRef) return;
         refSel.innerHTML = '';
+        const consensusOpt = document.createElement('option');
+        consensusOpt.value = '';
+        consensusOpt.textContent = 'Compare to: Consensus';
+        refSel.appendChild(consensusOpt);
         for (const row of state.sequences) {
             const opt = document.createElement('option');
             opt.value = row.name;
-            opt.textContent = row.name.length > 50 ? row.name.slice(0, 47) + '…' : row.name;
+            opt.textContent = 'Compare to: ' + (row.name.length > 50 ? row.name.slice(0, 47) + '…' : row.name);
+            opt.title = row.name;
             refSel.appendChild(opt);
         }
-        if (state.referenceName && state.sequences.some(r => r.name === state.referenceName)) {
-            refSel.value = state.referenceName;
-        } else if (state.sequences.length) {
-            refSel.value = state.sequences[0].name;
-            state.referenceName = refSel.value;
+        if (state.referenceName && !state.sequences.some(r => r.name === state.referenceName)) {
+            state.referenceName = null;
         }
+        refSel.value = state.referenceName || '';
+    }
+
+    // Alan 8/4/26 - Set the reference sequence (null / '' restores the consensus baseline) and rerender.
+    function setReferenceName(name) {
+        const next = name || null;
+        if (next === state.referenceName) return;
+        state.referenceName = next;
+        if (refSel) refSel.value = next || '';
+        // Column set and baseline both change; force the consensus/visible-column recompute.
+        state._diffComputedFor = '';
+        renderAlignmentGrid();
     }
 
     function pickInitialReference() {
+        // Alan 8/4/26 - Keep an explicitly chosen reference across refetches (e.g. the Include Pruned toggle)
+        // as long as it is still in the alignment; open() clears it so each session starts fresh.
+        if (state.referenceName && state.sequences.some(r => r.name === state.referenceName)) return;
+        // Alan 8/4/26 - A single selected tip still seeds the reference; otherwise start from the consensus.
         if (state.selectedNames.length === 1) {
             state.referenceName = state.selectedNames[0];
-        } else if (state.sequences.length) {
-            state.referenceName = state.sequences[0].name;
         } else {
             state.referenceName = null;
         }
@@ -329,7 +419,8 @@
         const up = ch.toUpperCase();
         let cls = 'av-cell ';
         cls += NUC_CLASS[up] || (AMBIG.has(up) ? 'av-amb' : 'av-amb');
-        if (consensusCh) {
+        // Alan 8/4/26 - An N in the baseline is unknown, not a mismatch, so it never marks a whole column diff.
+        if (consensusCh && consensusCh.toUpperCase() !== 'N') {
             const consUp = consensusCh.toUpperCase();
             if (up === consUp && up !== '-') cls += ' av-match';
             else if (up !== consUp && !isGap(ch)) cls += ' is-diff';
@@ -343,12 +434,28 @@
         return names.join('\x1f')
             + '|cg=' + (state.compactGaps ? 1 : 0)
             + '|vo=' + (state.variableOnly ? 1 : 0)
-            + '|ip=' + (state.includePruned ? 1 : 0);
+            + '|ip=' + (state.includePruned ? 1 : 0)
+            // Alan 8/4/26 - The reference changes both the baseline and the variable-column set.
+            + '|ref=' + (state.referenceName || '');
     }
 
     // ============================================================
     // Virtualized rendering
     // ============================================================
+
+    // Alan 8/4/26 - Label the baseline strip with the reference name (or "Consensus") plus the ref marker.
+    function setBaselineLabel(el) {
+        if (!el) return;
+        const ref = getReferenceRow();
+        el.classList.toggle('av-ref-header', !!ref);
+        if (ref) {
+            el.textContent = '◆ ' + ref.name;
+            el.title = `Reference sequence: ${ref.name}\nEvery row is compared to this sequence. Click a name to change it.`;
+        } else {
+            el.textContent = 'Consensus';
+            el.title = 'Most frequent non-gap, non-N base in each column. Click a sequence name to compare against that sequence instead.';
+        }
+    }
 
     // Alan 5/12/26 - Build the persistent skeleton (sizers + strips); only rerun when the row/column set changes.
     function buildSkeleton(rows, visibleIdx) {
@@ -371,7 +478,8 @@
 
         const consensusName = document.createElement('div');
         consensusName.className = 'av-consensus-name';
-        consensusName.textContent = 'Consensus';
+        // Alan 8/4/26 - The top strip shows whichever baseline is active: consensus or a chosen sequence.
+        setBaselineLabel(consensusName);
 
         const consensusStrip = document.createElement('div');
         consensusStrip.className = 'av-consensus-strip';
@@ -394,12 +502,48 @@
         cellsSizer.style.cssText = `position:relative;width:${totalW}px;height:${totalH}px;`;
         cellsCol.appendChild(cellsSizer);
 
+        // Alan 8/4/26 - Splitter overlay on the names/cells boundary. Absolutely positioned so it claims no
+        // grid track; the grid itself is position:relative in CSS.
+        const resizer = document.createElement('div');
+        resizer.className = 'av-col-resizer';
+        resizer.title = 'Drag to resize the sequence name column (double-click to fit the longest name)';
+        resizer.setAttribute('role', 'separator');
+        resizer.setAttribute('aria-orientation', 'vertical');
+
         gridEl.appendChild(corner);
         gridEl.appendChild(ruler);
         gridEl.appendChild(consensusName);
         gridEl.appendChild(consensusStrip);
         gridEl.appendChild(namesCol);
         gridEl.appendChild(cellsCol);
+        gridEl.appendChild(resizer);
+
+        // Alan 8/4/26 - Pointer events (not mouse) so the splitter works with touch and pen too.
+        let dragStartX = 0;
+        let dragStartW = 0;
+        resizer.addEventListener('pointerdown', (e) => {
+            e.preventDefault();
+            dragStartX = e.clientX;
+            dragStartW = state.namesWidth;
+            resizer.classList.add('is-dragging');
+            document.body.classList.add('av-col-resizing');
+            resizer.setPointerCapture(e.pointerId);
+        });
+        resizer.addEventListener('pointermove', (e) => {
+            if (!resizer.classList.contains('is-dragging')) return;
+            applyNamesWidth(dragStartW + (e.clientX - dragStartX), false);
+        });
+        const endDrag = (e) => {
+            if (!resizer.classList.contains('is-dragging')) return;
+            resizer.classList.remove('is-dragging');
+            document.body.classList.remove('av-col-resizing');
+            try { resizer.releasePointerCapture(e.pointerId); } catch (_) { /* already released */ }
+            // Only persist on release so a drag in progress doesn't spam localStorage.
+            applyNamesWidth(state.namesWidth, true);
+        };
+        resizer.addEventListener('pointerup', endDrag);
+        resizer.addEventListener('pointercancel', endDrag);
+        resizer.addEventListener('dblclick', () => applyNamesWidth(measureLongestNameWidth(), true));
 
         // Alan 5/12/26 - Detach the previous resize observer so it doesn't fire on torn-down DOM.
         if (state._resizeObs) { state._resizeObs.disconnect(); state._resizeObs = null; }
@@ -411,7 +555,18 @@
         // Alan 5/12/26 - Single scroll listener on cells viewport; everything else follows via transform.
         cellsCol.addEventListener('scroll', onScroll, { passive: true });
 
-        state._dom = { corner, ruler, rulerInner, consensusName, consensusStrip, consensusInner, namesCol, namesInner, cellsCol, cellsSizer };
+        // Alan 8/4/26 - Click a sequence name to make it the reference; click it again to go back to consensus.
+        // Delegated on the names column so virtualized rows need no per-row listeners.
+        namesCol.addEventListener('click', (e) => {
+            const rowEl = e.target.closest('.av-name-row');
+            if (!rowEl || !rowEl.dataset.name) return;
+            setReferenceName(rowEl.dataset.name === state.referenceName ? null : rowEl.dataset.name);
+        });
+
+        state._dom = { corner, ruler, rulerInner, consensusName, consensusStrip, consensusInner, namesCol, namesInner, cellsCol, cellsSizer, resizer };
+
+        // Alan 8/4/26 - Re-apply the stored width to the fresh skeleton (clamped to the current modal size).
+        applyNamesWidth(state.namesWidth, false);
     }
 
     function onScroll() {
@@ -533,7 +688,8 @@
 
     function renderConsensusWindow(cs, ce) {
         const idx = state.visibleColumnIndexes;
-        const consensus = state.consensus;
+        // Alan 8/4/26 - Strip shows the active baseline (reference sequence or consensus).
+        const consensus = state.baselineSeq || state.consensus;
         const inner = state._dom.consensusInner;
         const frag = document.createDocumentFragment();
         for (let k = cs; k < ce; k++) {
@@ -553,16 +709,23 @@
         const inner = state._dom.namesInner;
         const frag = document.createDocumentFragment();
         const showScores = state.sortMode === 'similar' || state.sortMode === 'different';
+        // Alan 8/4/26 - Mark the reference row and expose the name for the delegated click handler.
+        const refName = state.referenceName;
         for (let r = rs; r < re; r++) {
             const row = rows[r];
             const div = document.createElement('div');
             // Alan 5/13/26 - Tag every odd logical row with av-row-alt so CSS can apply alternating shading.
-            div.className = 'av-name-row' + (r % 2 === 1 ? ' av-row-alt' : '') + (isPreferredRow(row) ? ' av-focus-row' : '');
+            const isRef = !!refName && row.name === refName;
+            div.className = 'av-name-row av-name-row-clickable' + (r % 2 === 1 ? ' av-row-alt' : '')
+                + (isPreferredRow(row) ? ' av-focus-row' : '') + (isRef ? ' av-ref-row' : '');
             div.style.cssText = `position:absolute;top:${r * ROW_HEIGHT}px;left:0;right:0;height:${ROW_HEIGHT}px;`;
+            div.dataset.name = row.name;
             const nameText = document.createElement('span');
             nameText.className = 'av-name-text';
-            nameText.textContent = row.name;
-            nameText.title = row.name;
+            nameText.textContent = isRef ? '◆ ' + row.name : row.name;
+            nameText.title = isRef
+                ? `${row.name}\n(reference — click to compare to the consensus again)`
+                : `${row.name}\nClick to use as the reference sequence`;
             div.appendChild(nameText);
             if (showScores && typeof row.__score === 'number') {
                 const score = document.createElement('span');
@@ -578,7 +741,9 @@
     function renderCellsWindow(rs, re, cs, ce) {
         const rows = state.displayedRows;
         const idx = state.visibleColumnIndexes;
-        const consensus = state.consensus;
+        // Alan 8/4/26 - Compare against the active baseline (reference sequence or consensus).
+        const consensus = state.baselineSeq || state.consensus;
+        const refName = state.referenceName;
         const sizer = state._dom.cellsSizer;
         const frag = document.createDocumentFragment();
         // Alan 5/13/26 - In diff mode, av-match cells render as a middle dot; new cells from scroll inherit this.
@@ -586,7 +751,11 @@
         for (let r = rs; r < re; r++) {
             const rowDiv = document.createElement('div');
             // Alan 5/13/26 - Tag odd logical rows so the schemed alt-row tint shows through.
-            rowDiv.className = 'av-cell-row' + (r % 2 === 1 ? ' av-row-alt' : '') + (isPreferredRow(rows[r]) ? ' av-focus-row' : '');
+            // Alan 8/4/26 - The reference row keeps its literal bases in diff mode; dotting it would hide the
+            // very sequence everything else is being read against.
+            const isRef = !!refName && rows[r].name === refName;
+            rowDiv.className = 'av-cell-row' + (r % 2 === 1 ? ' av-row-alt' : '')
+                + (isPreferredRow(rows[r]) ? ' av-focus-row' : '') + (isRef ? ' av-ref-row' : '');
             rowDiv.style.cssText = `position:absolute;top:${r * ROW_HEIGHT}px;left:${cs * CELL_WIDTH}px;height:${ROW_HEIGHT}px;`;
             const seq = rows[r].sequence;
             for (let k = cs; k < ce; k++) {
@@ -596,7 +765,7 @@
                 const cls = cellClass(ch, consensus[i]);
                 span.className = cls;
                 // Alan 5/13/26 - Replace matches with · only when highlight-differences is on; gaps are unaffected.
-                if (diffMode && cls.indexOf('av-match') !== -1) {
+                if (diffMode && !isRef && cls.indexOf('av-match') !== -1) {
                     span.dataset.orig = ch;
                     span.textContent = '·';
                 } else {
@@ -620,13 +789,13 @@
         const filter = (state.filterText || '').trim().toLowerCase();
         if (filter) rows = rows.filter(r => r.name.toLowerCase().includes(filter));
         for (const r of rows) r.__score = undefined;
-        rows = sortRows(rows);
         state.displayedRows = rows;
 
         if (rows.length === 0) {
             state.visibleColumnIndexes = [];
             state.gapOnlyHidden = 0;
             state.consensus = '';
+            state.baselineSeq = '';
             gridEl.innerHTML = '';
             state._dom = null;
             emptyEl.textContent = 'No sequences match the current filter.';
@@ -636,14 +805,23 @@
         }
 
         // Alan 5/12/26 - Recompute visible columns + consensus only when the row SET or column toggles change.
+        // Alan 8/4/26 - Runs before sorting now: the similarity sorts score against the resolved baseline,
+        // and neither the column set nor the consensus depends on row order.
+        const refRow = getReferenceRow();
+        const refSeq = refRow ? refRow.sequence : null;
         const fp = rowSetFingerprint(rows);
         const rowSetChanged = fp !== state._diffComputedFor;
         if (rowSetChanged) {
-            state.visibleColumnIndexes = buildVisibleColumnIndexes(rows);
-            state.consensus = computeConsensus(rows, state.visibleColumnIndexes);
+            state.visibleColumnIndexes = buildVisibleColumnIndexes(rows, refSeq);
+            state.consensus = computeConsensus(rows, state.visibleColumnIndexes, refSeq);
             state._diffComputedFor = fp;
         }
+        state.baselineSeq = refSeq || state.consensus;
         const visibleIdx = state.visibleColumnIndexes;
+
+        // Alan 8/4/26 - Sort after the baseline exists so "Similarity to reference" uses the same yardstick.
+        rows = sortRows(rows);
+        state.displayedRows = rows;
 
         // Alan 5/12/26 - Rebuild the skeleton when row count or column count changes; otherwise just rerender the window.
         const needSkeleton = !state._dom
@@ -666,6 +844,8 @@
             // Update header text in case col/row counts displayed there changed.
             // Alan 5/13/26 - Refresh corner with sort mode + variable/conserved column counts on rerender.
             state._dom.corner.textContent = cornerLabel(visibleIdx.length);
+            // Alan 8/4/26 - Keep the baseline strip label in sync when only the reference changed.
+            setBaselineLabel(state._dom.consensusName);
         }
 
         bodyEl.classList.toggle('alignment-highlight-differences', state.highlightDiffs);
@@ -683,7 +863,8 @@
         // Alan 5/13/26 - Swap visible av-match cell text between original base and · without a full skeleton rebuild.
         const sizer = state._dom && state._dom.cellsSizer;
         if (sizer) {
-            const matches = sizer.querySelectorAll('.av-cell.av-match');
+            // Alan 8/4/26 - Never dot the reference row itself; it stays readable as the comparison baseline.
+            const matches = sizer.querySelectorAll('.av-cell-row:not(.av-ref-row) .av-cell.av-match');
             if (state.highlightDiffs) {
                 for (let m = 0; m < matches.length; m++) {
                     const el = matches[m];
@@ -711,6 +892,11 @@
         const total = state.sequences.length;
         const visibleCols = state.visibleColumnIndexes ? state.visibleColumnIndexes.length : state.alignmentLength;
         let txt = `${shown}/${total} sequences · ${visibleCols}/${state.alignmentLength} columns`;
+        // Alan 8/4/26 - Make the active comparison baseline visible in the header stats.
+        if (state.referenceName) {
+            const short = state.referenceName.length > 32 ? state.referenceName.slice(0, 29) + '…' : state.referenceName;
+            txt += ` · vs ${short}`;
+        }
         if (state.compactGaps && state.gapOnlyHidden > 0) {
             txt += ` · ${state.gapOnlyHidden} gap-only columns hidden`;
         }
@@ -796,20 +982,25 @@
         state.includePruned = false;
         state.sortMode = 'tree';
         state.filterText = '';
-        state.highlightDiffs = false;
-        state.variableOnly = false;
+        // Alan 8/4/26 - Open with difference highlighting and variable-columns-only already on; that is the
+        // view people actually want first, and both are one click away from off.
+        state.highlightDiffs = true;
+        state.variableOnly = true;
         state.compactGaps = true;
         state.referenceName = null;
+        // Alan 8/4/26 - Start each session on the consensus baseline.
+        state.baselineSeq = '';
         state._diffComputedFor = '';
         state._dom = null;
 
         if (sortSel) sortSel.value = 'tree';
         if (filterInp) filterInp.value = '';
-        if (diffsChk) diffsChk.checked = false;
-        if (variableChk) variableChk.checked = false;
+        // Alan 8/4/26 - Checkbox state must mirror the defaults above.
+        if (diffsChk) diffsChk.checked = true;
+        if (variableChk) variableChk.checked = true;
         if (compactChk) compactChk.checked = true;
         if (includeChk) includeChk.checked = false;
-        bodyEl.classList.remove('alignment-highlight-differences');
+        bodyEl.classList.add('alignment-highlight-differences');
         bodyEl.classList.remove('alignment-large-grid');
         // Alan 5/13/26 - Reset uppercase mode on each open so it starts in the default (mixed-case) state.
         if (uppercaseChk) uppercaseChk.checked = false;
@@ -887,6 +1078,8 @@
     }
     // Alan 5/13/26 - Apply persisted scheme once at startup so the viewer is correctly styled before first open.
     applyColorScheme(loadColorScheme());
+    // Alan 8/4/26 - Seed the names-column width from storage; the skeleton re-applies it once it exists.
+    state.namesWidth = loadNamesWidth();
     document.addEventListener('keydown', (e) => {
         if (e.key === 'Escape' && !modal.classList.contains('hidden')) closeModal();
     });
@@ -897,13 +1090,13 @@
     });
     sortSel.addEventListener('change', () => {
         // Alan 5/12/26 - Sorting only reorders rows; row set fingerprint stays the same so consensus is reused.
+        // Alan 8/4/26 - The reference selector is always visible now, so it no longer needs rebuilding here.
         state.sortMode = sortSel.value;
-        populateReferenceSelector();
         renderAlignmentGrid();
     });
     refSel.addEventListener('change', () => {
-        state.referenceName = refSel.value;
-        renderAlignmentGrid();
+        // Alan 8/4/26 - Empty value restores the consensus baseline.
+        setReferenceName(refSel.value);
     });
     let filterDeb = null;
     filterInp.addEventListener('input', () => {
@@ -936,6 +1129,9 @@
     // Alan 5/12/26 - Re-render the visible window on window resize as a fallback for browsers without ResizeObserver.
     window.addEventListener('resize', () => {
         if (modal.classList.contains('hidden')) return;
+        // Alan 8/4/26 - Re-clamp the names column so a narrower window can't squeeze out the alignment.
+        // Not persisted: shrinking the window shouldn't overwrite the width the user chose.
+        if (state._dom) applyNamesWidth(state.namesWidth, false);
         scheduleRender();
     });
 
@@ -943,6 +1139,8 @@
         open,
         close: closeModal,
         setHighlightDifferences,
+        // Alan 8/4/26 - Allow the tree viewer (or the console) to pin a reference sequence programmatically.
+        setReferenceName,
     };
 
     // Alan 5/12/26 - Lightweight debug surface for triaging perf in the console.
@@ -978,6 +1176,9 @@
                 includedPruned: state.includedPruned,
                 prunedRowsExcludedFromFetch: state.includePruned ? 0 : state.availablePruned,
                 variableOnlyEnabled: state.variableOnly,
+                // Alan 8/4/26 - null baseline name means the computed consensus is in use.
+                referenceName: state.referenceName,
+                baselineIsReference: !!state.referenceName,
                 variableColumnCount: state.variableColumnCount || 0,
                 visibleColumns: (state.visibleColumnIndexes || []).length,
                 alignmentLength: state.alignmentLength,

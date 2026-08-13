@@ -97,7 +97,7 @@ def _clamp_int(value, default, lo, hi):
 
 VALID_TREE_METHODS = {"nj", "raxml", "iqtree", "mrbayes", "fasttree"}
 VALID_ALIGNERS    = {"mafft", "muscle", "clustalo", "iqtree_builtin", "default"}
-VALID_TRIMMERS    = {"none", "trimal", "bmge"}
+VALID_TRIMMERS    = {"none", "trimal_gappy", "trimal", "bmge"}
 
 # Per-field limits used in both create and recompute paths. Kept in one place
 # so validation errors and the OpenAPI schema can quote the same numbers.
@@ -109,6 +109,7 @@ LIMITS = {
     "tree_model_max":      64,
     "outgroup_max":        256,
     "bootstrap":           (0,     10_000),
+    "alrt_replicates":     (0,     10_000),
     "mcmc_generations":    (1_000, 100_000_000),
     "mcmc_nruns":          (1,     8),
     "mcmc_nchains":        (1,     16),
@@ -121,7 +122,7 @@ LIMITS = {
 RECOMPUTE_ALLOWED_FIELDS = frozenset({
     "tree_method", "tree_model",
     "alignment_method", "trimming_method", "trim_terminal_overhangs",
-    "bootstrap", "mcmc_generations", "mcmc_nruns", "mcmc_nchains",
+    "bootstrap", "alrt_replicates", "mcmc_generations", "mcmc_nruns", "mcmc_nchains",
     "mcmc_burnin_fraction",
     "outgroup", "notes",
 })
@@ -366,7 +367,7 @@ def create_job():
         "alignment_method", data.get("alignment_method", "mafft"), VALID_ALIGNERS)
     if err: return err
     trimmer, err = _validate_categorical(
-        "trimming_method", data.get("trimming_method", "none"), VALID_TRIMMERS)
+        "trimming_method", data.get("trimming_method", Config.DEFAULT_TRIMMING_METHOD), VALID_TRIMMERS)
     if err: return err
     trim_terminal_overhangs, err = _validate_bool(
         "trim_terminal_overhangs", data.get("trim_terminal_overhangs"), default=True)
@@ -374,6 +375,12 @@ def create_job():
 
     # Clamped integers.
     bootstrap, err = _validate_clamped_int("bootstrap", data.get("bootstrap"), default=1000)
+    if err: return err
+    # IQ-TREE SH-aLRT replicates; defaults to Config.DEFAULT_IQTREE_ALRT so API
+    # callers get the same UFBoot + SH-aLRT pairing as the web form. 0 disables it.
+    alrt_replicates, err = _validate_clamped_int(
+        "alrt_replicates", data.get("alrt_replicates"),
+        default=Config.DEFAULT_IQTREE_ALRT)
     if err: return err
     mcmc_generations, err = _validate_clamped_int(
         "mcmc_generations", data.get("mcmc_generations"), default=50_000)
@@ -392,8 +399,13 @@ def create_job():
     notes, err = _validate_string("notes", data.get("notes"),
                                   max_len=LIMITS["notes_max"])
     if err: return err
+    # IQ-TREE ships ModelFinder, so an omitted model means "let ModelFinder pick"
+    # rather than a fixed GTR+G. Every other method keeps the fixed default.
+    default_tree_model = (
+        Config.DEFAULT_IQTREE_MODEL if tree_method == "iqtree" else Config.DEFAULT_ML_MODEL
+    )
     tree_model, err = _validate_string(
-        "tree_model", data.get("tree_model", "GTR+G"),
+        "tree_model", data.get("tree_model", default_tree_model),
         max_len=LIMITS["tree_model_max"], allow_empty=False)
     if err: return err
 
@@ -480,6 +492,7 @@ def create_job():
         "tree_method":       tree_method,
         "tree_model":        tree_model,
         "bootstrap":         bootstrap,
+        "alrt_replicates":   alrt_replicates,
         "mcmc_generations":  mcmc_generations,
         "mcmc_nruns":        mcmc_nruns,
         "mcmc_nchains":      mcmc_nchains,
@@ -646,7 +659,9 @@ def recompute_job(job_id):
             v, err = _validate_bool("trim_terminal_overhangs", body["trim_terminal_overhangs"])
             if err: return err
             overrides["trim_terminal_overhangs"] = v
-        for field, default in (("bootstrap", 1000), ("mcmc_generations", 50_000),
+        for field, default in (("bootstrap", 1000),
+                               ("alrt_replicates", Config.DEFAULT_IQTREE_ALRT),
+                               ("mcmc_generations", 50_000),
                                ("mcmc_nruns", 2), ("mcmc_nchains", 4)):
             if field in body:
                 v, err = _validate_clamped_int(field, body[field], default=default)
@@ -1246,6 +1261,14 @@ def tools_inaturalist_tree():
     )
     if bool_error:
         return bool_error
+    # Alan 8/4/26 - Build an extra tree without touching the existing field URL.
+    keep_existing_tree_url, bool_error = _validate_bool(
+        "keep_existing_tree_url",
+        body.get("keep_existing_tree_url"),
+        default=False,
+    )
+    if bool_error:
+        return bool_error
     local_limit, limit_error = _validate_mycomap_rerun_limit(body, "local")
     if limit_error:
         return limit_error
@@ -1260,25 +1283,27 @@ def tools_inaturalist_tree():
                 user=g.api_user,
                 rebuild_ncbi_blast=rebuild_ncbi_blast,
                 recreate_existing_tree=recreate_existing_tree,
+                keep_existing_tree_url=keep_existing_tree_url,
                 mycomap_local_limit=local_limit,
                 mycomap_ncbi_limit=ncbi_limit,
             )
             job_ids = [result["job_id"]]
         else:
-            if rebuild_ncbi_blast or recreate_existing_tree:
+            if rebuild_ncbi_blast or recreate_existing_tree or keep_existing_tree_url:
+                if rebuild_ncbi_blast:
+                    invalid_field = "rebuild_ncbi_blast"
+                elif recreate_existing_tree:
+                    invalid_field = "recreate_existing_tree"
+                else:
+                    invalid_field = "keep_existing_tree_url"
                 return error_response(
                     code="validation_failed",
                     message=(
-                        "NCBI BLAST rebuild and existing-tree re-creation are "
+                        "NCBI BLAST rebuild and existing-tree options are "
                         "only supported for a single iNaturalist observation."
                     ),
                     status=422,
-                    details={
-                        "field": (
-                            "rebuild_ncbi_blast"
-                            if rebuild_ncbi_blast else "recreate_existing_tree"
-                        )
-                    },
+                    details={"field": invalid_field},
                 )
             if not resolved_type:
                 return error_response(

@@ -155,6 +155,21 @@ def run_worker_with_heartbeat(app):
     from app.workers.queue import get_redis_connection
     
     with app.app_context():
+        # A restart kills the previous work horse mid-job, and the killed process
+        # never reaches the handler that would mark its DB row failed. Reconcile
+        # against RQ on startup so those rows don't sit at 'running' forever
+        # holding SSE streams (and therefore request slots) open.
+        try:
+            from app.services.job_reconcile_service import reconcile_job_statuses
+            reconciled = reconcile_job_statuses()
+            if reconciled:
+                print(f"Reconciled {len(reconciled)} job(s) that died without recording a failure.")
+                for entry in reconciled[:10]:
+                    print(f"  {entry['job_id']} {entry['from_status']} -> failed (rq={entry['rq_status']})")
+        except Exception as exc:
+            # Never block the worker from starting over a bookkeeping step.
+            print(f"Job reconciliation skipped: {exc}")
+
         conn = get_redis_connection()
         queues = [get_queue("phylo_high"), get_queue("phylo_bulk")]
         maintenance_interval = HeartbeatWorker._get_int_env("RQ_MAINTENANCE_INTERVAL", 600)

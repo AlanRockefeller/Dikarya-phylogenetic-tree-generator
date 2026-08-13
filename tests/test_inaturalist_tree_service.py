@@ -398,6 +398,10 @@ class TestInaturalistTreeSourceLabel(unittest.TestCase):
 
         self.assertEqual(preview["eligible_tree_count"], 0)
         self.assertTrue(preview["has_phylogenetic_tree"])
+        self.assertEqual(
+            preview["phylogenetic_tree_url"],
+            "https://dikarya.us/job/old-tree/view",
+        )
         self.assertTrue(preview["can_recreate_phylogenetic_tree"])
         self.assertIn("replace the field's current URL", preview["message"])
 
