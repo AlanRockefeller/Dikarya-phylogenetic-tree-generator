@@ -181,6 +181,70 @@ def sequence_entry():
     return render_template('sequence_entry.html')
 
 
+@bp.route('/help')
+def help_page():
+    return render_template('help.html')
+
+
+# Alan 8/14/26 - The site had no robots.txt at all, so crawlers had nothing telling
+# them which paths are worth fetching. nginx serves this file directly when the
+# config in ops/nginx/ is installed; this route is the fallback so it works either
+# way, and so it stays correct if the vhost is ever rebuilt.
+@bp.route('/robots.txt')
+def robots_txt():
+    from flask import send_from_directory
+    return send_from_directory(
+        current_app.static_folder, 'robots.txt', mimetype='text/plain'
+    )
+
+
+# Alan 8/14/26 - The public site is only a couple of dozen pages. Listing them
+# explicitly lets search engines index everything without crawling the per-job URL
+# space, which is unbounded and holds a request slot per fetch.
+SITEMAP_ENDPOINTS = (
+    ('journal.home', 'weekly', '1.0'),
+    ('journal.about', 'monthly', '0.6'),
+    ('journal.current_issue', 'weekly', '0.8'),
+    ('journal.archive', 'monthly', '0.6'),
+    ('journal.submit_manuscript', 'monthly', '0.6'),
+    ('journal.taxonomy', 'monthly', '0.6'),
+    ('journal.reviewers', 'monthly', '0.5'),
+    ('journal.resources', 'monthly', '0.5'),
+    ('journal.contact', 'monthly', '0.5'),
+    ('journal.support', 'monthly', '0.5'),
+    ('main.sequence_entry', 'weekly', '0.9'),
+    ('main.help_page', 'monthly', '0.7'),
+    ('main.whats_new', 'weekly', '0.7'),
+    ('main.voucher_labels', 'monthly', '0.5'),
+    ('main.todo', 'monthly', '0.4'),
+)
+
+
+@bp.route('/sitemap.xml')
+def sitemap_xml():
+    from xml.sax.saxutils import escape
+
+    lines = [
+        '<?xml version="1.0" encoding="UTF-8"?>',
+        '<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">',
+    ]
+    for endpoint, changefreq, priority in SITEMAP_ENDPOINTS:
+        try:
+            loc = url_for(endpoint, _external=True)
+        except Exception:
+            # An endpoint that has been renamed or removed should not take the
+            # whole sitemap down with it.
+            current_app.logger.warning("Sitemap: unknown endpoint %r; skipping", endpoint)
+            continue
+        lines.append(
+            f'  <url><loc>{escape(loc)}</loc>'
+            f'<changefreq>{changefreq}</changefreq>'
+            f'<priority>{priority}</priority></url>'
+        )
+    lines.append('</urlset>')
+    return Response("\n".join(lines) + "\n", mimetype='application/xml')
+
+
 def _voucher_int(value, default, lo, hi):
     try:
         parsed = int(value)

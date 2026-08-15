@@ -223,14 +223,16 @@ const TreeEditActions = {
     },
 
     async logClientError(message, context = null) {
+        // Alan 8/15/26 - This posted a bare {message, context, url, stack} body,
+        // which /api/log/client discards because it carries no recognised `event`
+        // -- so every tree edit failure reported here has been silently dropped.
+        // It also sent window.location.href, query string included. Delegating to
+        // the shared layer gets sanitizing, dedup and rate limiting for free; the
+        // signature and the call sites are unchanged.
         try {
-            await fetch('/api/log/client', {
-                method: 'POST',
-                headers: this._buildHeaders(),
-                credentials: "same-origin",
-                body: JSON.stringify({ message, context, url: window.location.href, stack: new Error().stack }),
-                keepalive: true
-            });
+            const error = new Error(String(message || 'tree edit failure'));
+            if (context) error.stack = String(context);
+            window.reportClientError?.('tree_edit.action_failed', error);
         } catch (e) {
             console.error("Failed to log client error:", e);
         }

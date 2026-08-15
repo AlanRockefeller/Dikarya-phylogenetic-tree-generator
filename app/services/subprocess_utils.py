@@ -1,5 +1,7 @@
 import subprocess
 import logging
+import os
+import shutil
 from pathlib import Path
 from typing import List, Optional, Tuple
 
@@ -16,54 +18,64 @@ except Exception:  # pragma: no cover - RQ not installed
     _JOB_TIMEOUT_EXCEPTIONS = ()
 
 
-def _build_rlimit_preexec(cpu_limit_seconds: Optional[int] = None):
-    """Return a preexec_fn that caps the child's memory, CPU, and core dumps.
+_LIMITER_WARNING_EMITTED = False
 
-    Returns None when limits are disabled or unavailable, in which case the
-    process is spawned exactly as before.
+# Standard locations for util-linux prlimit. shutil.which() only searches PATH, and
+# Gunicorn runs with a PATH that does not include /usr/bin -- so in production the web
+# process silently ran MAFFT/trimal/FastTree (tree recomputation happens in-request)
+# with no memory or CPU ceiling at all, while the RQ worker was correctly limited.
+_LIMITER_FALLBACK_PATHS = ("/usr/bin/prlimit", "/bin/prlimit", "/usr/local/bin/prlimit")
 
-    `cpu_limit_seconds` overrides SUBPROCESS_CPU_LIMIT_SECONDS for one call.
-    RLIMIT_CPU counts CPU seconds summed across threads, so a tool that is
-    allowed N wall-hours on T threads needs roughly N*3600*T here or the kernel
-    kills it long before its wall-clock deadline. Callers that grant a long
-    wall-clock budget must raise this to match; see _run_raxml.
 
-    The callable runs in the forked child between fork() and exec(). It only
-    issues setrlimit syscalls -- no allocation, no locks -- which is what keeps
-    it safe to use from the threaded Gunicorn workers as well as the RQ worker.
+def _find_limiter() -> Optional[str]:
+    """Locate util-linux prlimit on PATH, then at its standard absolute paths."""
+    limiter = shutil.which("prlimit")
+    if limiter:
+        return limiter
+    for candidate in _LIMITER_FALLBACK_PATHS:
+        if os.access(candidate, os.X_OK):
+            return candidate
+    return None
+
+
+def _build_limited_argv(
+    args: List[str], cpu_limit_seconds: Optional[int] = None
+) -> Tuple[List[str], bool]:
+    """Apply rlimits through util-linux ``prlimit``, never ``preexec_fn``.
+
+    Python warns that ``preexec_fn`` can deadlock after fork in a threaded
+    application.  If the safe argv wrapper is unavailable, run normally and
+    log the missing protection rather than falling back to child-side Python.
     """
-    try:
-        import resource
-        from app.config import Config
-    except Exception:
-        return None
+    from app.config import Config
 
-    memory_mb = getattr(Config, "SUBPROCESS_MEMORY_LIMIT_MB", 0) or 0
-    if cpu_limit_seconds is not None:
-        cpu_seconds = cpu_limit_seconds
-    else:
-        cpu_seconds = getattr(Config, "SUBPROCESS_CPU_LIMIT_SECONDS", 0) or 0
+    memory_mb = int(getattr(Config, "SUBPROCESS_MEMORY_LIMIT_MB", 0) or 0)
+    cpu_seconds = (
+        int(cpu_limit_seconds)
+        if cpu_limit_seconds is not None
+        else int(getattr(Config, "SUBPROCESS_CPU_LIMIT_SECONDS", 0) or 0)
+    )
+    limiter = _find_limiter()
+    if not limiter:
+        global _LIMITER_WARNING_EMITTED
+        if not _LIMITER_WARNING_EMITTED:
+            logger.warning(
+                "DEGRADED subprocess_limits_unavailable: "
+                "util-linux prlimit is unavailable; subprocess memory/CPU/core "
+                "limits cannot be applied safely on this platform"
+            )
+            _LIMITER_WARNING_EMITTED = True
+        return list(args), False
 
-    if memory_mb <= 0 and cpu_seconds <= 0:
-        return None
-
-    memory_bytes = memory_mb * 1024 * 1024
-
-    def _apply_limits():
-        # Never leave a core dump behind: these alignments are user data, and a
-        # multi-GB core in the job directory is its own problem.
-        resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
-        if memory_bytes > 0:
-            resource.setrlimit(resource.RLIMIT_AS, (memory_bytes, memory_bytes))
-        if cpu_seconds > 0:
-            # Leave headroom between the soft and hard limit. At the soft limit
-            # the kernel sends SIGXCPU, which terminates the process and gives
-            # us an exit code we can attribute to the CPU cap; with soft == hard
-            # the SIGKILL at the hard limit lands first and the failure is
-            # indistinguishable from an OOM kill.
-            resource.setrlimit(resource.RLIMIT_CPU, (cpu_seconds, cpu_seconds + 30))
-
-    return _apply_limits
+    limited = [limiter, "--core=0:0"]
+    if memory_mb > 0:
+        memory_bytes = memory_mb * 1024 * 1024
+        limited.append(f"--as={memory_bytes}:{memory_bytes}")
+    if cpu_seconds > 0:
+        # A soft SIGXCPU remains distinguishable from the hard SIGKILL.
+        limited.append(f"--cpu={cpu_seconds}:{cpu_seconds + 30}")
+    limited.extend(["--", *args])
+    return limited, True
 
 
 def _describe_termination_signal(exit_code: int) -> Optional[str]:
@@ -189,14 +201,14 @@ def run_command(args: List[str], cwd: Optional[Path] = None, log_file: Optional[
         if cwd and not cwd.exists():
             return -1, "", f"Working directory does not exist: {cwd}"
 
+        command_args, limiter_used = _build_limited_argv(args)
         result = subprocess.run(
-            args,
+            command_args,
             cwd=cwd,
             env=env,
             capture_output=True,
             text=True,
             check=False,
-            preexec_fn=_build_rlimit_preexec()
         )
         
         stdout = result.stdout
@@ -212,6 +224,10 @@ def run_command(args: List[str], cwd: Optional[Path] = None, log_file: Optional[
             except Exception as e:
                 logger.error(f"Failed to write to log file {log_file}: {e}")
 
+        if limiter_used and result.returncode == 127 and "failed to execute" in stderr:
+            return EXIT_CODE_TOOL_NOT_FOUND, stdout, _log_missing_executable(
+                args, FileNotFoundError(stderr.strip())
+            )
         return result.returncode, stdout, stderr
 
     except FileNotFoundError as e:
@@ -307,15 +323,17 @@ def run_command_streaming(
         process = None
         try:
             # Start process
+            command_args, limiter_used = _build_limited_argv(
+                args, cpu_limit_seconds
+            )
             process = subprocess.Popen(
-                args,
+                command_args,
                 cwd=cwd,
                 env=env,
                 stdout=subprocess.PIPE if not stdout_file else stdout_file,
                 stderr=subprocess.PIPE,
                 text=True,
                 bufsize=1,  # Line buffered
-                preexec_fn=_build_rlimit_preexec(cpu_limit_seconds),
             )
             
             # Stream stdout and stderr using select for non-blocking reads.
@@ -379,6 +397,13 @@ def run_command_streaming(
             remaining = max(0.1, deadline - time.time()) if deadline else None
             process.wait(timeout=remaining)
             exit_code = process.returncode
+
+            if (
+                limiter_used
+                and exit_code == 127
+                and any("failed to execute" in line for line in stderr_tail_buffer)
+            ):
+                exit_code = EXIT_CODE_TOOL_NOT_FOUND
 
             signal_note = _describe_termination_signal(exit_code)
             if signal_note:

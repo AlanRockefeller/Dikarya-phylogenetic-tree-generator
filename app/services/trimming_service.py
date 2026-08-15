@@ -334,6 +334,12 @@ def _restore_trimmed_fasta_headers(
 
     input_records = list(SeqIO.parse(str(input_alignment), "fasta"))
     original_headers: dict[str, str] = {}
+    # Alan 8/14/26 - Track keys claimed by more than one input record. Trimmers shorten
+    # a header to its first token, so two records sharing that token used to both
+    # resolve to whichever header landed in the map first -- silently relabelling one
+    # sequence with another's name and producing duplicate tips that then made the
+    # tree unrootable ("Duplicate tip name found"). An ambiguous key restores nothing.
+    ambiguous_keys: set[str] = set()
 
     for record in input_records:
         header = (record.description or record.id or "").strip()
@@ -346,32 +352,72 @@ def _restore_trimmed_fasta_headers(
             header.split(None, 1)[0].strip(),
         }
         for key in keys:
-            if key:
-                original_headers.setdefault(key, header)
+            if not key:
+                continue
+            if key in original_headers and original_headers[key] != header:
+                ambiguous_keys.add(key)
+            original_headers.setdefault(key, header)
 
-    if not original_headers:
+    for key in ambiguous_keys:
+        original_headers.pop(key, None)
+
+    output_records = list(SeqIO.parse(str(output_alignment), "fasta"))
+
+    # Alan 8/14/26 - Trimmers drop alignment columns, never records, so when the counts
+    # match, position is an exact and collision-proof mapping. Fall back to key lookup
+    # only when a trimmer did change the record count.
+    positional = len(output_records) == len(input_records)
+
+    # Only a degradation when the key map is actually consulted. On the
+    # positional path the shared identifiers are never looked up, so every
+    # trimmed job with two records sharing a first token was logging a DEGRADED
+    # line for a restoration failure that did not happen.
+    if ambiguous_keys and not positional:
+        from app.services.log_context import log_degradation
+        log_degradation(
+            logger,
+            "trimmed_header_ambiguous_ids",
+            f"{len(ambiguous_keys)} identifier(s) are shared by multiple records "
+            f"(e.g. {', '.join(sorted(ambiguous_keys)[:5])}); those records keep their "
+            "trimmer-written headers rather than being restored to a possibly wrong name",
+            shared_ids=len(ambiguous_keys),
+        )
+
+    if not original_headers and not positional:
         logger.warning("No source FASTA headers found to restore after trimming.")
         return
 
-    output_records = list(SeqIO.parse(str(output_alignment), "fasta"))
     restored = 0
     missing = 0
 
-    for record in output_records:
+    for index, record in enumerate(output_records):
         output_header = (record.description or "").strip()
-        output_first_token = output_header.split(None, 1)[0].strip() if output_header else ""
-        keys = (
-            (record.id or "").strip(),
-            (record.name or "").strip(),
-            output_first_token,
-        )
-        original_header = next((original_headers[key] for key in keys if key in original_headers), None)
+
+        if positional:
+            original_header = (
+                input_records[index].description or input_records[index].id or ""
+            ).strip() or None
+        else:
+            output_first_token = output_header.split(None, 1)[0].strip() if output_header else ""
+            keys = (
+                (record.id or "").strip(),
+                (record.name or "").strip(),
+                output_first_token,
+            )
+            original_header = next(
+                (original_headers[key] for key in keys if key in original_headers), None
+            )
 
         if not original_header:
             missing += 1
             continue
 
         if output_header != original_header:
+            # Alan 8/14/26 - Also realign record.id with the restored header's first
+            # token. BioPython writes ">{id} {description}" unless the description
+            # already starts with the id, so a stale id would duplicate the token in
+            # the written header.
+            record.id = original_header.split(None, 1)[0]
             record.description = original_header
             record.name = record.id
             restored += 1

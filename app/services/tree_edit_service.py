@@ -1,8 +1,11 @@
 import copy
 import json
 import logging
+import os
 import re
 import shutil
+import tempfile
+import time
 from pathlib import Path
 from typing import Dict, Any, List, Optional, Set, Tuple
 from app.config import Config
@@ -31,9 +34,40 @@ def load_tree_state(job_dir: Path) -> Dict:
     """
     state_path = job_dir / "tree_state.json"
     if state_path.exists():
-        with open(state_path, "r") as f:
-            return json.load(f)
-            
+        try:
+            with open(state_path, "r") as f:
+                return json.load(f)
+        except OSError as exc:
+            # We could not read the file, which says nothing about its contents.
+            # Falling through would rebuild default state and save_tree_state()
+            # below would overwrite every prune, rename and root the user made.
+            # Callers treated this as fatal before; keep it that way.
+            from app.services.log_context import log_degradation
+            log_degradation(
+                logger, "job_metadata_unreadable",
+                "Existing tree state could not be read; refusing to overwrite it",
+                file="tree_state.json", exception=type(exc).__name__,
+            )
+            raise
+        except json.JSONDecodeError as exc:
+            # Genuinely corrupt content (writes are atomic, so this is not a
+            # half-written file). Rebuilding is the only way forward, but move
+            # the damaged copy aside first so the edits stay recoverable.
+            from app.services.log_context import log_degradation
+            salvage_path = state_path.with_name(f"tree_state.corrupt.{time.time_ns()}.json")
+            try:
+                os.replace(state_path, salvage_path)
+                salvaged = salvage_path.name
+            except OSError:
+                salvaged = None
+            log_degradation(
+                logger, "job_metadata_unreadable",
+                "Existing tree state was corrupt; rebuilding from original tree",
+                file="tree_state.json", exception=type(exc).__name__,
+                salvaged_to=salvaged,
+            )
+
+
     # Initialize from original tree
     newick_path = job_dir / "tree" / "tree_original.newick"
     if newick_path.exists():
@@ -67,8 +101,13 @@ def load_tree_state(job_dir: Path) -> Dict:
                         state["root"] = outgroup
                         state["root_mode"] = "OUTGROUP"
                         logging.info(f"Outgroup '{outgroup}' detected. Skipping default midpoint rooting.")
-            except Exception as e:
-                logging.warning(f"Failed to check input_info for outgroup: {e}")
+            except (OSError, json.JSONDecodeError) as exc:
+                from app.services.log_context import log_degradation
+                log_degradation(
+                    logger, "job_metadata_unreadable",
+                    "Existing input metadata was unreadable; rooting fallback continued",
+                    file="input_info.json", exception=type(exc).__name__,
+                )
 
         # Default policy: Midpoint root the tree (if not outgroup rooted)
         if should_midpoint:
@@ -100,6 +139,11 @@ _TRANSIENT_STATE_KEYS = ("prune_unresolved",)
 def save_tree_state(job_dir: Path, tree_json: Dict) -> None:
     """
     Save tree_json to tree_state.json with indentation.
+
+    Written atomically. The viewer fires prune/rename/reroot requests
+    back-to-back while read-only endpoints (the edited-FASTA download, the tree
+    view) read the same file, so a plain truncate-then-write left a window in
+    which a reader saw a half-written file and treated it as corrupt.
     """
     state_path = job_dir / "tree_state.json"
     persisted = {
@@ -107,8 +151,29 @@ def save_tree_state(job_dir: Path, tree_json: Dict) -> None:
         for key, value in tree_json.items()
         if key not in _TRANSIENT_STATE_KEYS
     }
-    with open(state_path, "w") as f:
-        json.dump(persisted, f, indent=2)
+    # Same directory, so os.replace() is a same-filesystem atomic rename.
+    fd, temp_name = tempfile.mkstemp(
+        dir=str(job_dir), prefix=".tree_state.", suffix=".tmp"
+    )
+    try:
+        with os.fdopen(fd, "w") as f:
+            json.dump(persisted, f, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        # mkstemp() creates 0600; the previous truncate-in-place kept whatever
+        # mode the file already had (0644 in production). Preserve it so the
+        # rename does not silently tighten permissions on every job.
+        try:
+            os.chmod(temp_name, state_path.stat().st_mode & 0o7777)
+        except OSError:
+            os.chmod(temp_name, 0o644)
+        os.replace(temp_name, state_path)
+    except BaseException:
+        try:
+            os.unlink(temp_name)
+        except OSError:
+            pass
+        raise
 
 
 def _iter_tip_names(node: Dict[str, Any]):
@@ -183,14 +248,17 @@ def build_recompute_job_params(params_dict: Dict[str, Any]) -> JobParams:
     )
 
     trim_params = TrimmingParams(
-        method=params_dict.get("trimming_method", "none"),
+        method=params_dict.get("trimming_method", Config.DEFAULT_TRIMMING_METHOD),
         trim_terminal_overhangs=_bool_param(params_dict, "trim_terminal_overhangs", True),
     )
 
     tree_method = params_dict.get("tree_method", "nj")
     # Mirror the worker's per-method model default so a recompute of an IQ-TREE
     # job that never stored a model runs ModelFinder rather than a fixed GTR+G.
-    default_model = "MFP" if tree_method == "iqtree" else "GTR+G"
+    default_model = (
+        Config.DEFAULT_IQTREE_MODEL
+        if tree_method == "iqtree" else Config.DEFAULT_ML_MODEL
+    )
 
     tree_params = TreeBuilderParams(
         method=tree_method,
@@ -199,7 +267,10 @@ def build_recompute_job_params(params_dict: Dict[str, Any]) -> JobParams:
         # Previously dropped here, so recomputing an IQ-TREE job silently lost
         # SH-aLRT and relabelled every node with UFBoot only.
         alrt_replicates=(
-            _int_param(params_dict.get("alrt_replicates", 1000), 1000)
+            _int_param(
+                params_dict.get("alrt_replicates", Config.DEFAULT_IQTREE_ALRT),
+                Config.DEFAULT_IQTREE_ALRT,
+            )
             if tree_method == "iqtree" else 0
         ),
         mcmc_generations=_int_param(params_dict.get("mcmc_generations", 50000), 50000),
@@ -257,6 +328,14 @@ def _stable_internal_node_id_from_names(tip_names: List[str]) -> str:
         hash_value ^= ord(char)
         hash_value = (hash_value * 16777619) & 0xFFFFFFFF
     return f"internal:{hash_value:08x}"
+
+
+def _as_float(value) -> Optional[float]:
+    """Return value as a float, or None when it is not numeric."""
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
 
 
 def _stable_internal_node_id(clade) -> Optional[str]:
@@ -695,20 +774,46 @@ def reroot_tree(job_dir: Path, tree_json: Dict, root_target: str) -> Dict:
         if not root_target:
              raise ValueError("Reroot target cannot be empty")
              
-        # Find the target clade (search ANY clade, not just terminals)
+        # Alan 8/14/26 - Internal nodes are addressed by stable ID, the same scheme
+        # rotate/prune already use. The viewer renders from raw Newick parsed in the
+        # browser, so an internal node's client-side "name" is its support label
+        # ("1.000"); BioPython moves that same label into .confidence as a float, so
+        # matching on the label could never work and every internal-node reroot failed
+        # with "Root target not found: 1.000".
         target_clade = None
-        for clade in tree.find_clades():
-            if clade.name == root_target:
-                target_clade = clade
-                break
-        
+        if root_target.startswith("internal:"):
+            for clade in tree.find_clades(order="preorder"):
+                # Mirror rotate_node: unary pass-through nodes share their only
+                # child's descendant-leaf set, so skipping them avoids resolving a
+                # stable ID to the wrong node.
+                if not getattr(clade, "clades", None) or len(clade.clades) < 2:
+                    continue
+                if _stable_internal_node_id(clade) == root_target:
+                    target_clade = clade
+                    break
+
+        # Find the target clade (search ANY clade, not just terminals)
         if target_clade is None:
-             # Fallback: check confidence converted to string
-             # This handles cases where Newick I/O converted numeric name -> confidence
-             for clade in tree.find_clades():
-                 if clade.confidence is not None and str(clade.confidence) == root_target:
-                     target_clade = clade
-                     break
+            for clade in tree.find_clades():
+                if clade.name == root_target:
+                    target_clade = clade
+                    break
+
+        if target_clade is None:
+             # Fallback: match a numeric support label. Newick I/O turns a numeric
+             # internal name into a float confidence, so compare numerically --
+             # str(1.0) never equals the "1.000" the tree file actually carried.
+             # Ambiguous by nature (many nodes share a support value), so this is
+             # only a last resort behind the stable-ID lookup above.
+             target_value = _as_float(root_target)
+             if target_value is not None:
+                 for clade in tree.find_clades():
+                     if clade.confidence is None:
+                         continue
+                     clade_value = _as_float(clade.confidence)
+                     if clade_value is not None and clade_value == target_value:
+                         target_clade = clade
+                         break
 
         if target_clade is None:
              # Useful debug info in the error
@@ -956,6 +1061,94 @@ def extract_pruned_fasta(original_fasta: Path, tree_json: Dict, output_fasta: Pa
     with open(output_fasta, "w") as f:
         SeqIO.write(sequences, f, "fasta")
 
+
+def _clean_fasta_label(label) -> Optional[str]:
+    """Normalize one FASTA/tree label for comparison; blank labels become None."""
+    if label is None:
+        return None
+    cleaned = str(label).strip()
+    return cleaned or None
+
+
+def _active_renames(tree_json: Dict) -> Dict[str, str]:
+    """Renames that actually change a tip label (blank and no-op entries ignored)."""
+    active: Dict[str, str] = {}
+    for original, renamed in (tree_json.get("renames") or {}).items():
+        original_name = _clean_fasta_label(original)
+        new_name = _clean_fasta_label(renamed)
+        if original_name and new_name and original_name != new_name:
+            active[original_name] = new_name
+    return active
+
+
+def has_fasta_affecting_edits(tree_json: Dict) -> bool:
+    """
+    True when the persisted tree state changes what an exported FASTA contains.
+
+    Only pruning and renaming qualify; rerooting, rotating, selecting and other
+    display-only operations leave the sequence set and headers alone.
+    """
+    pruned = any(
+        _clean_fasta_label(name)
+        for name in (tree_json.get("pruned_taxa") or [])
+    )
+    return bool(pruned) or bool(_active_renames(tree_json))
+
+
+def build_edited_fasta_text(original_fasta: Path, tree_json: Dict,
+                            line_width: int = 60) -> str:
+    """
+    Render the original UNALIGNED FASTA with the viewer's current edits applied.
+
+    Pruned records are dropped and renamed tips carry their current tree label as
+    the whole FASTA header. Nucleotide data is copied verbatim, and the source
+    file is never modified. Kept separate from extract_pruned_fasta(), which
+    feeds recomputation and must keep the original identifiers.
+    """
+    if not HAS_BIOPYTHON:
+        raise RuntimeError("BioPython required for FASTA manipulation")
+
+    pruned_taxa = {
+        cleaned
+        for name in (tree_json.get("pruned_taxa") or [])
+        for cleaned in [_clean_fasta_label(name)]
+        if cleaned
+    }
+    renames = _active_renames(tree_json)
+
+    lines: List[str] = []
+    with open(original_fasta, "r") as f:
+        for record in SeqIO.parse(f, "fasta"):
+            # Tree tips can be the full header or just its first token, so match
+            # against the same id/name/description trio extract_pruned_fasta()
+            # already relies on -- full header first, since that is what the
+            # viewer shows for headers carrying a description.
+            labels = [
+                cleaned
+                for label in (record.description, record.id, record.name)
+                for cleaned in [_clean_fasta_label(label)]
+                if cleaned
+            ]
+            if not set(labels).isdisjoint(pruned_taxa):
+                continue
+
+            header = labels[0] if labels else ""
+            for label in labels:
+                if label in renames:
+                    header = renames[label]
+                    break
+
+            sequence = str(record.seq)
+            lines.append(f">{header}")
+            if sequence:
+                for start in range(0, len(sequence), line_width):
+                    lines.append(sequence[start:start + line_width])
+            else:
+                lines.append("")
+
+    return "\n".join(lines) + ("\n" if lines else "")
+
+
 def _count_fasta_records(path: Path) -> int:
     try:
         with open(path, "r") as f:
@@ -1008,9 +1201,13 @@ def _reapply_rooting_after_recompute(job_dir: Path, tree_json: Dict[str, Any],
             if mode in ("manual", "tip", "outgroup")
             else f"unrecognized rooting mode: {mode}"
         )
-        log.warning(
-            "Could not reapply %r rooting after recompute (target=%r): %s",
-            mode, previous_target, reason,
+        from app.services.log_context import log_degradation
+        log_degradation(
+            log,
+            "rooting_not_reapplied",
+            f"could not reapply {mode!r} rooting after recompute: {reason}; the tree "
+            "keeps the tree builder's arbitrary root",
+            mode=mode, target=previous_target,
         )
         tree_json["root"] = None
         tree_json["root_target"] = None
@@ -1522,22 +1719,49 @@ def _drop_confidence_when_named(tree) -> None:
 def ensure_unique_labels(tree) -> bool:
     """
     Traverse the tree and ensure every internal node has a unique name.
-    Tips are PROTECTED: Duplicate tip names will raise ValueError.
-    Internal nodes with no name or duplicate/numeric names will be assigned 'Node_{i}'.
+    Duplicate tip names are disambiguated with a numeric suffix rather than
+    rejected, so a tree built from input with a repeated identifier can still
+    be rooted. Internal nodes with no name or duplicate/numeric names will be
+    assigned 'Node_{i}'.
     Returns True if changes were made.
     """
     seen_names = set()
     changes_made = False
     counter = 1
-    
-    # Pass 1: Collect tip names and validate uniqueness
+
+    # Pass 1: Collect tip names, disambiguating any duplicates.
+    # Alan 8/14/26 - This used to raise, which left the whole tree unrootable: one
+    # repeated identifier in the input made midpoint rooting fail outright and the
+    # user got an error instead of a tree. The upstream cause (the trimmed-header
+    # restore relabelling records that shared a first token) is fixed in
+    # trimming_service, but keep a backstop here so no tree is ever unrootable --
+    # renaming the later copy is strictly better than refusing to root.
+    duplicate_tips = []
     for clade in tree.get_terminals():
         if not clade.name:
              # Should practically never happen for a valid Newick tip, but strict check
              raise ValueError("Tip node missing name")
         if clade.name in seen_names:
-             raise ValueError(f"Duplicate tip name found: '{clade.name}'. Tips must be unique.")
+            original = clade.name
+            suffix = 2
+            candidate = f"{original}_{suffix}"
+            while candidate in seen_names:
+                suffix += 1
+                candidate = f"{original}_{suffix}"
+            clade.name = candidate
+            duplicate_tips.append((original, candidate))
+            changes_made = True
         seen_names.add(clade.name)
+
+    if duplicate_tips:
+        from app.services.log_context import log_degradation
+        log_degradation(
+            logger,
+            "duplicate_tip_names",
+            "renamed duplicate tip(s) so the tree stays rootable: "
+            + "; ".join(f"{old!r} -> {new!r}" for old, new in duplicate_tips[:5]),
+            duplicates=len(duplicate_tips),
+        )
         
     # Pass 2: Handle Internal Nodes
     # We want to preserve existing unique non-numeric internal names if possible

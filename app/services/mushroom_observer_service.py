@@ -536,7 +536,7 @@ def prepare_tree_job(preparation: Dict[str, Any], *, defer_after_ncbi_rerun: boo
         _build_fasta_text,
         _build_sequence_metadata,
         _check_auto_created_mycomap_ncbi_results,
-        _mycomap_queue_backlog_message,
+        _mycomap_creation_discovery_message,
         _refresh_mycomap_blast_results,
     )
     from app.services.mycomap_service import (
@@ -575,17 +575,24 @@ def prepare_tree_job(preparation: Dict[str, Any], *, defer_after_ncbi_rerun: boo
     ).strip()
 
     if skip_mycomap_refresh and details.get("creation_pending"):
-        found = find_mycomap_blast_by_title(title)
+        discovery_warnings = list(details.get("creation_discovery_warnings") or [])
+        lookup_warnings = []
+        found = find_mycomap_blast_by_title(title, warnings=lookup_warnings)
+        discovery_warnings.extend(lookup_warnings)
+        discovery_warnings = list(dict.fromkeys(discovery_warnings))
         if not found:
             attempt = int(details.get("creation_discovery_attempt") or 0) + 1
             if attempt >= get_mycomap_creation_discovery_max_attempts():
                 raise MushroomObserverError(
-                    _mycomap_queue_backlog_message(
-                        get_mycomap_creation_discovery_max_seconds()
+                    _mycomap_creation_discovery_message(
+                        get_mycomap_creation_discovery_max_seconds(),
+                        discovery_warnings,
                     ),
                     status=504,
                 )
             details["creation_discovery_attempt"] = attempt
+            if discovery_warnings:
+                details["creation_discovery_warnings"] = discovery_warnings
             return {
                 "status": "waiting_for_ncbi",
                 "notes": _job_title(observation_id, preparation.get("consensus_name")),
@@ -598,10 +605,11 @@ def prepare_tree_job(preparation: Dict[str, Any], *, defer_after_ncbi_rerun: boo
         mycomap_url = found["url"]
 
     if not skip_mycomap_refresh:
+        discovery_warnings = []
         found = (
             {"blast_id": notes_blast_id, "url": notes_mycomap_url}
             if notes_blast_id
-            else find_mycomap_blast_by_title(title)
+            else find_mycomap_blast_by_title(title, warnings=discovery_warnings)
         )
         if found:
             mycomap_url = found["url"]
@@ -676,7 +684,9 @@ def prepare_tree_job(preparation: Dict[str, Any], *, defer_after_ncbi_rerun: boo
         body, status = error
         raise MushroomObserverError(
             body.get("error", "Failed to fetch MycoMap sequences."),
-            status=status if status in {400, 422, 502} else 502,
+            # 404 = MycoMap has no such BLAST result. Passing it through keeps the
+            # status honest; collapsing it to 502 reads as "our gateway is broken".
+            status=status if status in {400, 404, 422, 502} else 502,
         )
     sequences = (payload or {}).get("sequences") or []
     if len(sequences) < 2:

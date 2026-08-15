@@ -1,4 +1,5 @@
 import uuid
+import logging
 
 import redis
 from rq import Queue, Retry
@@ -8,6 +9,7 @@ from typing import Any, Dict, Optional
 QUEUE_HIGH = "phylo_high"
 QUEUE_BULK = "phylo_bulk"
 VALID_QUEUE_NAMES = {QUEUE_HIGH, QUEUE_BULK}
+logger = logging.getLogger(__name__)
 
 def get_redis_connection():
     redis_url = current_app.config.get('REDIS_URL', 'redis://localhost:6379/0')
@@ -38,9 +40,40 @@ def resolve_job_timeout(job_params: Dict[str, Any]) -> str:
         return f"{int(hours * 3600) + 600}s"
 
     hours = float(getattr(Config, "GENERAL_JOB_TIME_LIMIT_HOURS", 8) or 8)
-    # Let the subprocess CPU ceiling fire first when both limits are close; it
-    # produces a more specific explanation than RQ's outer death penalty.
+    # Generic subprocess CPU limiting is disabled by default because CPU time
+    # accumulates across threads. RQ remains the ordinary wall-clock guard.
     return f"{int(hours * 3600) + 600}s"
+
+
+def safe_job_description(kind: str, job_params: Optional[Dict[str, Any]] = None,
+                         job_id: Optional[str] = None) -> str:
+    """Return the one-line string RQ prints for a job, with no user payload in it.
+
+    Alan 8/15/26 - RQ's default description is get_call_string(func, args,
+    kwargs), which renders the *whole* argument tuple. For run_phylo_job that is
+    the job_params dict, so every "phylo_high: ... (uuid)" line the worker logged
+    at job start contained the submitter's raw FASTA, their specimen notes, and
+    any imported metadata -- written to worker.log and, on failure, to error.log.
+    Every enqueue path therefore passes an explicit description built only from
+    bounded, non-sensitive values.
+    """
+    parts = [kind]
+    if job_id:
+        parts.append(f"job={str(job_id)[:40]}")
+    if isinstance(job_params, dict):
+        # summarize_job_params is the same bounded summary used for
+        # event=job.started: counts and option names only, never payloads.
+        from app.workers.tasks import summarize_job_params
+
+        summary = summarize_job_params(job_params)
+        options = summary.get("options") or {}
+        parts.append(f"input={summary.get('input_type')}")
+        parts.append(f"sequences={summary.get('sequence_count')}")
+        if summary.get("accession_count"):
+            parts.append(f"accessions={summary['accession_count']}")
+        if options.get("tree_method"):
+            parts.append(f"tree={options['tree_method']}")
+    return " ".join(str(part) for part in parts)[:200]
 
 
 def enqueue_job(job_params: Dict[str, Any], queue_name: str = QUEUE_HIGH,
@@ -66,6 +99,7 @@ def enqueue_job(job_params: Dict[str, Any], queue_name: str = QUEUE_HIGH,
         job_timeout=job_timeout,
         meta=meta or {},
         job_id=job_id,
+        description=safe_job_description("phylo pipeline", job_params, job_id),
     )
     return job.id
 
@@ -81,6 +115,7 @@ def enqueue_mycomap_blast_refresh_job(params: Dict[str, Any], job_timeout: Any =
         job_timeout=job_timeout,
         meta={},
         job_id=job_id,
+        description=safe_job_description("mycomap blast refresh", job_id=job_id),
     )
     return job.id
 
@@ -109,6 +144,7 @@ def enqueue_recompute_job(job_id: str, params_dict: Dict[str, Any]) -> str:
         # RAxML job gets.
         timeout=resolve_job_timeout(params_dict),
         job_id=job_id,
+        description=safe_job_description("phylo recompute", params_dict, job_id),
         meta={
             "steps": steps,
             "current_step": None,
@@ -151,4 +187,10 @@ def get_job_status(job_id: str) -> Dict[str, Any]:
         return response
         
     except Exception as e:
+        from app.services.log_context import log_degradation_rate_limited
+        log_degradation_rate_limited(
+            logger, "rq_status_lookup_failed",
+            "RQ status lookup failed; returning the existing error response",
+            job_id=job_id, exception=type(e).__name__,
+        )
         return {"id": job_id, "status": "error", "error": str(e)}

@@ -50,7 +50,7 @@ def validate_inaturalist_url(url: str) -> Optional[Dict[str, Any]]:
     
     url = url.strip()
     if re.fullmatch(r'\d{7,9}', url):
-        logger.info(f"Validated bare iNaturalist observation ID: {url}")
+        logger.debug(f"Validated bare iNaturalist observation ID: {url}")
         return {
             'type': 'single_observation',
             'observation_id': url
@@ -76,7 +76,7 @@ def validate_inaturalist_url(url: str) -> Optional[Dict[str, Any]]:
     single_obs_match = re.search(r'/observations/(\d+)(?:\?|$|#)', url)
     if single_obs_match:
         obs_id = single_obs_match.group(1)
-        logger.info(f"Validated single observation URL, ID: {obs_id}")
+        logger.debug(f"Validated single observation URL, ID: {obs_id}")
         return {
             'type': 'single_observation',
             'observation_id': obs_id

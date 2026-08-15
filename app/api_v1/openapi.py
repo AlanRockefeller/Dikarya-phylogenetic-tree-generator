@@ -182,12 +182,14 @@ def _schemas():
                     "enum": ["nj", "raxml", "iqtree", "mrbayes", "fasttree"],
                 },
                 "tree_model": {
-                    "type": "string", "default": "GTR+G",
+                    "type": "string",
                     "description": (
-                        "Substitution model. Defaults to GTR+G, except for tree_method=iqtree, "
-                        "where omitting it runs ModelFinder (-m MFP) to select the best-fit "
-                        "model by BIC; the chosen model is reported as model_selected in "
-                        "tree_metadata.json. Pass an explicit model name to fix it."
+                        "Substitution model. When omitted, tree_method=iqtree runs "
+                        "ModelFinder (-m MFP) to select the best-fit model by BIC; "
+                        "other maximum-likelihood methods use the server's "
+                        "DEFAULT_ML_MODEL (normally GTR+G). The chosen IQ-TREE model "
+                        "is reported as model_selected in tree_metadata.json. Pass an "
+                        "explicit model name to fix it."
                     ),
                 },
                 "bootstrap": {"type": "integer", "minimum": 0, "maximum": 10000, "default": 1000},

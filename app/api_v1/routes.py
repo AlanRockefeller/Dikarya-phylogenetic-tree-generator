@@ -6,6 +6,7 @@ Phase 2 endpoints: /jobs (+ mutation), /jobs/{id}/files, /jobs/{id}/logs, /tools
 import json
 import math
 import re
+import logging
 from datetime import datetime
 from pathlib import Path
 
@@ -28,6 +29,8 @@ from app.extensions import db, limiter
 from app.models import ApiToken, Job
 from app.services.security_utils import validate_safe_file_path, coerce_bool
 from app.workers.queue import enqueue_job, enqueue_recompute_job
+
+logger = logging.getLogger(__name__)
 
 
 # ============================================================================
@@ -808,11 +811,17 @@ def job_events(job_id):
         r_gate = _redis.from_url(Config.REDIS_URL)
         current = r_gate.incr(conn_key)
         r_gate.expire(conn_key, SSE_MAX_DURATION_SECONDS + 60)
-    except Exception:
+    except Exception as exc:
         # If Redis is unreachable we fall back to enforcing only the per-token
         # rate limit -- which is itself sufficient to bound abuse.
         current = 1
         r_gate = None
+        from app.services.log_context import log_degradation_rate_limited
+        log_degradation_rate_limited(
+            logger, "sse_connection_gate_failed",
+            "API SSE stream continued without the Redis connection gate",
+            exception=type(exc).__name__,
+        )
 
     if current > SSE_MAX_CONCURRENT_PER_TOKEN:
         if r_gate is not None:
@@ -840,13 +849,16 @@ def job_events(job_id):
     api_token_id = token_id
 
     def generate():
+        from app.services.log_context import log_degradation_rate_limited
         from app.models import ApiToken as _ApiToken
         started = time.monotonic()
-        r = _redis.from_url(Config.REDIS_URL)
-        pubsub = r.pubsub()
-        channel = f"job:{job_id}:events"
-        pubsub.subscribe(channel)
+        close_reason = "unexpected_exception"
+        pubsub = None
         try:
+            r = _redis.from_url(Config.REDIS_URL)
+            pubsub = r.pubsub()
+            pubsub.subscribe(f"job:{job_id}:events")
+            logger.info("event=sse.opened API SSE stream opened")
             snapshot = _build_snapshot(job_id)
             yield f"event: snapshot\ndata: {json.dumps(snapshot)}\n\n"
             job_status = snapshot["job"]["status"]
@@ -861,6 +873,7 @@ def job_events(job_id):
                         "data: {\"reason\": \"max_duration_reached\", "
                         f"\"max_seconds\": {SSE_MAX_DURATION_SECONDS}}}\n\n"
                     )
+                    close_reason = "lifetime_cap"
                     break
 
                 message = pubsub.get_message(timeout=0.1)
@@ -873,6 +886,7 @@ def job_events(job_id):
                         ev = json.loads(data)
                         if ev.get('type') == 'job_state' and ev.get('status') in ('completed', 'failed'):
                             time.sleep(0.5)
+                            close_reason = "terminal_completion"
                             break
                     except json.JSONDecodeError:
                         pass
@@ -891,9 +905,15 @@ def job_events(job_id):
                                     "event: revoked\n"
                                     "data: {\"reason\": \"token_revoked\"}\n\n"
                                 )
+                                close_reason = "token_revoked"
                                 break
-                        except Exception:
+                        except Exception as exc:
                             db.session.rollback()
+                            log_degradation_rate_limited(
+                                logger, "sse_token_check_failed",
+                                "API SSE token recheck failed; stream remained open",
+                                exception=type(exc).__name__,
+                            )
                 if job_status not in ('completed', 'failed'):
                     if now - last_db_poll >= 1.0:
                         last_db_poll = now
@@ -902,19 +922,34 @@ def job_events(job_id):
                         if db_job_check and db_job_check.status in ('completed', 'failed'):
                             job_status = db_job_check.status
                             time.sleep(1)
+                            close_reason = "terminal_completion"
                             break
                 time.sleep(0.05)
+        except GeneratorExit:
+            close_reason = "client_disconnect"
+            raise
+        except _redis.RedisError as exc:
+            close_reason = "redis_failure"
+            log_degradation_rate_limited(logger, "sse_redis_failure", "API SSE stream lost Redis", exception=type(exc).__name__)
+        except Exception:
+            close_reason = "unexpected_exception"
+            logger.exception("event=sse.generator_failed API SSE generator failed")
         finally:
             try:
-                pubsub.unsubscribe()
-                pubsub.close()
-            except Exception:
-                pass
+                if pubsub is not None:
+                    pubsub.unsubscribe()
+                    pubsub.close()
+            except Exception as exc:
+                log_degradation_rate_limited(logger, "sse_cleanup_failed", "API SSE cleanup failed", exception=type(exc).__name__)
             if r_gate is not None:
                 try:
                     r_gate.decr(conn_key)
-                except Exception:
-                    pass
+                except Exception as exc:
+                    log_degradation_rate_limited(logger, "sse_gate_cleanup_failed", "API SSE connection gate cleanup failed", exception=type(exc).__name__)
+            logger.info(
+                "event=sse.closed API SSE stream closed reason=%s duration_seconds=%.3f",
+                close_reason, time.monotonic() - started,
+            )
 
     return Response(
         stream_with_context(generate()),

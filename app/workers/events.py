@@ -185,7 +185,12 @@ def publish_event(job_id: str, payload: dict) -> None:
         _get_redis().publish(channel, message)
     except Exception as e:
         # Log but don't fail the job
-        logger.warning(f"Failed to publish event: {e}")
+        from app.services.log_context import log_degradation_rate_limited
+        log_degradation_rate_limited(
+            logger, "sse_publish_failed",
+            "Worker could not publish a live status event; job processing continued",
+            event_type=payload.get("type"), exception=type(e).__name__,
+        )
 
 
 def publish_log(job_id: str, step: str, stream: str, line: str) -> None:
@@ -270,6 +275,8 @@ def publish_step_start(
         detail: Additional detail (e.g., "8 threads, --auto")
         tool: Tool name (e.g., "mafft", "raxml-ng")
     """
+    from app.services.log_context import set_pipeline_context
+    set_pipeline_context(step=step, tool=tool or None)
     payload = {
         "type": EVENT_STEP_START,
         "step": step,
@@ -376,6 +383,7 @@ def publish_metric(job_id: str, step: str, key: str, value: Any) -> None:
 
 def publish_job_running(job_id: str) -> None:
     """Publish job_state:running event."""
+    logger.info("event=job.running Job entered running state")
     publish_event(job_id, {
         "type": EVENT_JOB_STATE,
         "status": "running",

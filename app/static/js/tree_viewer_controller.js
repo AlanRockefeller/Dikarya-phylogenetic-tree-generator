@@ -188,6 +188,20 @@ document.addEventListener('DOMContentLoaded', async () => {
         return data.stable_id || stableInternalNodeIdFromTipNames(tipNames);
     }
 
+    // Alan 8/14/26 - Resolve a clicked node into a backend reroot target. Tips keep their
+    // original name; internal nodes use the stable descendant-tip ID rather than their
+    // rendered support label, which the backend cannot match back to a clade.
+    function getRerootTargetForNode(node) {
+        const data = node?.data || node || {};
+        const children = node?.children || data.children || [];
+        if (!children || children.length === 0) {
+            return data.__original_name || data.original_name || data.name || node?.name || null;
+        }
+        const tipNames = getDescendantTipNames(node);
+        if (!tipNames.length) return null;
+        return data.stable_id || stableInternalNodeIdFromTipNames(tipNames);
+    }
+
     // Alan 6/4/26 - Prefer the displayed sequence label for context-menu clipboard copies.
     function getDisplaySequenceName(node) {
         const data = node?.data || node || {};
@@ -246,6 +260,9 @@ document.addEventListener('DOMContentLoaded', async () => {
     async function pruneTaxaPreservingSelectionColors(names, cleanupNames = names) {
         // Alan 5/12/26 - Run the existing backend prune action first so failed prunes do not mutate saved colors.
         const pruneResult = await TreeEditActions.pruneTaxa(JOB_ID, names);
+        // Alan 8/15/26 - The prune response is the saved tree state, so enable Edited FASTA now
+        // instead of waiting for the tree reload.
+        updateEditedFastaAvailability(pruneResult);
         // Warn about names the backend could not resolve; the rest still pruned.
         const unresolved = pruneResult?.prune_unresolved;
         if (Array.isArray(unresolved) && unresolved.length) {
@@ -420,7 +437,10 @@ document.addEventListener('DOMContentLoaded', async () => {
         const count = changes.length;
         runBackendAction(`Renaming ${count} sequence${count === 1 ? '' : 's'}`, async () => {
             for (const change of changes) {
-                await TreeEditActions.renameTip(JOB_ID, change.oldName, change.newName);
+                const renameResult = await TreeEditActions.renameTip(JOB_ID, change.oldName, change.newName);
+                // Alan 8/15/26 - The rename response is the saved tree state, so enable Edited
+                // FASTA as soon as the first rename lands.
+                updateEditedFastaAvailability(renameResult);
             }
         // Alan 5/11/26 - Renaming changes labels only, so saved selection sets should not be cleared.
         }, { clearSelections: false });
@@ -657,6 +677,9 @@ document.addEventListener('DOMContentLoaded', async () => {
                 const loadedTreeState = await TreeEditActions.getTreeState(JOB_ID);
                 // Alan 5/29/26 - Cache the latest tree state for alignment-viewer launches and other UI reads.
                 treeState = loadedTreeState;
+                // Alan 8/15/26 - Reevaluate Edited FASTA from the authoritative persisted state
+                // on initial load and after every backend action that reloads the tree.
+                updateEditedFastaAvailability(loadedTreeState);
                 isMidpointRooted = loadedTreeState.is_midpoint_rooted ?? true;
                 updateMidpointButton();
                 // Alan 5/29/26 - Sync rooting-mode dropdown to persisted root_mode and warn when auto needs a focal tip.
@@ -722,6 +745,7 @@ document.addEventListener('DOMContentLoaded', async () => {
 
         } catch (err) {
             console.error("Tree Load Error:", err);
+            window.reportClientError?.('tree_viewer.load_newick', err);
             if (container) container.textContent = `Failed to load Newick: ${err.message}`;
             // Log to server
             if (window.TreeEditActions && typeof TreeEditActions.logClientError === 'function') {
@@ -738,9 +762,52 @@ document.addEventListener('DOMContentLoaded', async () => {
         setupLink('newick-link-original', `/api/job/${JOB_ID}/download/tree/newick/original`);
         // 'newick-link-pruned' is now a client-side export, wired below
         setupLink('nexus-link', `/api/job/${JOB_ID}/download/tree/nexus`);
-        setupLink('fasta-pruned', `/api/job/${JOB_ID}/download/fasta/pruned`);
         setupLink('fasta-original', `/api/job/${JOB_ID}/download/fasta/original`);
     }
+
+    // Alan 8/15/26 - Edited FASTA only exists once the tree state prunes or renames
+    // something; rerooting, rotating and selecting leave the sequences untouched.
+    function treeStateHasFastaEdits(state) {
+        if (!state) return false;
+        const pruned = Array.isArray(state.pruned_taxa)
+            ? state.pruned_taxa.some(name => String(name || '').trim())
+            : false;
+        if (pruned) return true;
+        const renames = state.renames || {};
+        return Object.keys(renames).some(original => {
+            const from = String(original || '').trim();
+            const to = String(renames[original] || '').trim();
+            return from && to && from !== to;
+        });
+    }
+
+    // Alan 8/15/26 - Single place that enables/disables the Edited FASTA download, driven
+    // by the persisted tree state so undone edits disable it again without a page reload.
+    function updateEditedFastaAvailability(state) {
+        const link = getEl('fasta-edited');
+        if (!link) return;
+        const available = JOB_ID !== "unknown" && treeStateHasFastaEdits(state);
+        link.classList.toggle('is-available', available);
+        link.classList.toggle('is-unavailable', !available);
+        link.setAttribute('aria-disabled', available ? 'false' : 'true');
+        if (available) {
+            link.href = `/api/job/${JOB_ID}/download/fasta/edited`;
+            link.title = "Download the current unaligned sequences with pruning and renaming applied.";
+            link.removeAttribute('tabindex');
+        } else {
+            link.removeAttribute('href');
+            link.title = "Available after pruning or renaming sequences.";
+            link.setAttribute('tabindex', '-1');
+        }
+    }
+
+    // Alan 8/15/26 - Keep the disabled state unclickable even where the cursor style is ignored.
+    getEl('fasta-edited')?.addEventListener('click', (e) => {
+        if (getEl('fasta-edited')?.getAttribute('aria-disabled') === 'true') {
+            e.preventDefault();
+            showStatus("Edited FASTA is available after you prune or rename sequences.", "info", 3000);
+        }
+    });
 
     // Current Newick export (client-side with selection annotations)
     const newickCurrentLink = getEl('newick-link-pruned');
@@ -1593,6 +1660,7 @@ document.addEventListener('DOMContentLoaded', async () => {
                 showStatus("SVG downloaded.", "success", 2500);
             } catch (err) {
                 console.error("SVG export error:", err);
+                window.reportClientError?.('tree_viewer.export_svg', err);
                 const msg = err instanceof Error ? err.message : String(err);
                 showStatus("SVG export failed: " + msg, "danger", 5000);
             }
@@ -1608,6 +1676,7 @@ document.addEventListener('DOMContentLoaded', async () => {
                 showStatus("JPG downloaded.", "success", 2500);
             } catch (err) {
                 console.error("JPG export error:", err);
+                window.reportClientError?.('tree_viewer.export_jpg', err);
                 const msg = err instanceof Error ? err.message : String(err);
                 showStatus("JPG export failed: " + msg, "danger", 5000);
             }
@@ -1866,17 +1935,22 @@ document.addEventListener('DOMContentLoaded', async () => {
             rerootCaptureHandler = async (e) => {
                 if (!rerootMode || !viewer) return;
 
-                // Use robust helper
+                // Alan 8/14/26 - Resolve the clicked node to a stable ID for internal nodes
+                // instead of its rendered label. The viewer parses raw Newick in the browser,
+                // so an internal node's label is its support value ("1.000"); the backend
+                // reads the same file with BioPython, which moves that label into .confidence,
+                // so every internal-node reroot failed with "Root target not found: 1.000".
+                // getRerootTargetForNode returns the tip name for leaves and the shared
+                // stable ID (same scheme rotate/prune use) for internal nodes.
                 let nodeName = null;
-                if (typeof viewer.getNodeIdFromEvent === 'function') {
+                const g = e.target.closest('g.node, g.internal-node');
+                if (g && window.d3v7) {
+                    try {
+                        nodeName = getRerootTargetForNode(window.d3v7.select(g).datum());
+                    } catch (err) { nodeName = null; }
+                }
+                if (!nodeName && typeof viewer.getNodeIdFromEvent === 'function') {
                     nodeName = viewer.getNodeIdFromEvent(e);
-                } else {
-                    // Fallback
-                    const g = e.target.closest('g.node, g.internal-node');
-                    if (g && window.d3v7) {
-                        const d = window.d3v7.select(g).datum();
-                        nodeName = d?.data?.__original_name || d?.data?.name || d?.data?.id || d?.name;
-                    }
                 }
 
                 if (!nodeName) {

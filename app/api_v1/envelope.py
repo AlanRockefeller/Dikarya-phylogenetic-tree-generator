@@ -45,16 +45,10 @@ def error_response(*, code, message, status, details=None):
 
 def server_error(exc, *, where=""):
     """Generic 500 -- log the full traceback, return only request_id to caller."""
-    import traceback
     from flask import current_app
-    rid = _request_id()
-    current_app.logger.error(
-        "[%s] %s%s: %s\n%s",
-        rid,
-        where + " " if where else "",
-        type(exc).__name__,
-        exc,
-        traceback.format_exc(),
+    current_app.logger.exception(
+        "event=http.unhandled_error where=%s exception=%s",
+        where or "api_v1", type(exc).__name__,
     )
     return error_response(
         code="internal_error",

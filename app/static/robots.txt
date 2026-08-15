@@ -1,0 +1,58 @@
+# Dikarya (dikarya.us)
+#
+# Search engines are welcome on the public pages -- there are only a couple of
+# dozen of them, and they are all listed in /sitemap.xml.
+#
+# Everything disallowed below is either per-job (an unbounded space of UUID URLs
+# that is useless in an index), an API endpoint, or a long-lived stream. Each of
+# those costs one of a small number of Gunicorn request slots, so crawling them
+# degrades the site for real users without producing anything indexable.
+
+User-agent: *
+Disallow: /api/
+Disallow: /api_v1/
+Disallow: /job/
+Disallow: /auth/
+Disallow: /labels/
+Disallow: /tree/oauth/
+Disallow: /voucher-labels/export
+Disallow: /whats-new/edit
+Disallow: /whats-new/add
+Disallow: /todo/
+Disallow: /test
+Disallow: /thumb/
+Allow: /
+
+Sitemap: https://dikarya.us/sitemap.xml
+
+# Image scrapers. These crawl a /thumb/<n>.jpg namespace that does not exist on
+# this site and never has: in a two-day sample ImageBot alone made 43,466
+# requests, all 404, ~88% of all traffic. nginx blocks these outright; the
+# entries are kept here so a well-behaved client can opt out before being blocked.
+User-agent: ImageBot
+Disallow: /
+
+User-agent: img2dataset
+Disallow: /
+
+# Non-search crawlers that fetch aggressively and send no readers back.
+User-agent: AhrefsBot
+Disallow: /
+
+User-agent: SemrushBot
+Disallow: /
+
+User-agent: MJ12bot
+Disallow: /
+
+User-agent: DotBot
+Disallow: /
+
+User-agent: PetalBot
+Disallow: /
+
+User-agent: DataForSeoBot
+Disallow: /
+
+User-agent: Bytespider
+Disallow: /

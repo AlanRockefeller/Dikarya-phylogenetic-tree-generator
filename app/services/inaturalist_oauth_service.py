@@ -46,7 +46,9 @@ def _read_credentials_file(path: str) -> Dict[str, str]:
     try:
         with open(path, 'r') as f:
             raw = f.read().strip()
-    except OSError:
+    except OSError as exc:
+        from app.services.log_context import log_degradation_rate_limited
+        log_degradation_rate_limited(logger, "oauth_credentials_unreadable", "OAuth credentials file could not be read", exception=type(exc).__name__)
         return {}
     if not raw:
         return {}
@@ -55,8 +57,10 @@ def _read_credentials_file(path: str) -> Dict[str, str]:
             data = json.loads(raw)
             if isinstance(data, dict):
                 return {str(k): str(v) for k, v in data.items() if v is not None}
-        except json.JSONDecodeError:
-            pass
+        except json.JSONDecodeError as exc:
+            from app.services.log_context import log_degradation_rate_limited
+            log_degradation_rate_limited(logger, "oauth_credentials_malformed", "OAuth credentials JSON was malformed", exception=type(exc).__name__)
+            return {}
     out: Dict[str, str] = {}
     if '=' in raw:
         for line in raw.splitlines():
@@ -100,7 +104,9 @@ def load_tokens() -> Dict[str, Any]:
     try:
         with open(path, 'r') as f:
             return json.load(f) or {}
-    except (OSError, json.JSONDecodeError):
+    except (OSError, json.JSONDecodeError) as exc:
+        from app.services.log_context import log_degradation_rate_limited
+        log_degradation_rate_limited(logger, "oauth_token_unreadable", "OAuth token file was unreadable or malformed", exception=type(exc).__name__)
         return {}
 
 

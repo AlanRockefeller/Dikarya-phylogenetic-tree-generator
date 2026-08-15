@@ -13,8 +13,10 @@ class TestWorkerScheduler(unittest.TestCase):
             instance = None
 
             @staticmethod
-            def _get_int_env(_name, default):
-                return default
+            def _get_int_env(name, default):
+                # Simulate the legacy production value and verify Dikarya caps
+                # it so abandoned-job cleanup is not delayed ten minutes.
+                return 600 if name == "RQ_MAINTENANCE_INTERVAL" else default
 
             def __init__(self, queues, **_kwargs):
                 self.queues = queues
@@ -44,6 +46,7 @@ class TestWorkerScheduler(unittest.TestCase):
 
         self.assertEqual(FakeWorker.instance.queues, ["phylo_high", "phylo_bulk"])
         self.assertEqual(FakeWorker.instance.work_kwargs, {"with_scheduler": True})
+        self.assertEqual(FakeWorker.instance.maintenance_interval, 120)
         self.assertTrue(FakeWorker.instance.cleaned_up)
 
 

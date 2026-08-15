@@ -7,6 +7,9 @@ from app.extensions import db
 from app.models import Job
 import logging
 import re
+import hashlib
+import time
+from urllib.parse import urlsplit
 from difflib import SequenceMatcher
 from datetime import datetime
 
@@ -32,16 +35,11 @@ def _server_error(exc, *, where=""):
     can be correlated to the log without exposing file paths, library
     versions, or message text from the underlying error.
     """
-    import uuid as _uuid
-    import traceback as _tb
-    request_id = _uuid.uuid4().hex[:12]
-    logger.error(
-        "[%s] %s%s: %s\n%s",
-        request_id,
-        where + " " if where else "",
-        type(exc).__name__,
-        exc,
-        _tb.format_exc(),
+    from flask import g
+    request_id = g.request_id
+    logger.exception(
+        "event=http.unhandled_error where=%s exception=%s",
+        where or "unknown", type(exc).__name__,
     )
     return jsonify({
         "status": "error",
@@ -51,10 +49,15 @@ def _server_error(exc, *, where=""):
 
 
 def _client_log_value(value, max_length=CLIENT_LOG_MAX_STR):
-    """Return a short printable string for client diagnostics."""
-    text = str(value or "")
-    text = re.sub(r"[\r\n\t]+", " ", text)
-    return text[:max_length]
+    """Return a short, printable, credential-free string for client diagnostics.
+
+    Alan 8/15/26 - This used to only strip newlines and truncate. Every caller
+    passes browser-supplied text, so it now defers to the shared telemetry
+    sanitizer (query strings, credentials and nucleotide runs removed).
+    """
+    from app.services.log_context import sanitize_telemetry_text
+
+    return sanitize_telemetry_text(value, max_length)
 
 
 @bp.route('/client-log', methods=['POST'])
@@ -77,7 +80,7 @@ def client_log():
 
     logger.warning(
         "client_event=%s reason=%s url_length=%s hostname=%s path_prefix=%s "
-        "has_r_id=%s starts_with_required_prefix=%s user_agent=%s referrer=%s",
+        "has_r_id=%s starts_with_required_prefix=%s user_agent=%s referrer_path=%s",
         event,
         _client_log_value(data.get("reason"), 80),
         url_length,
@@ -86,7 +89,7 @@ def client_log():
         bool(data.get("has_r_id")),
         bool(data.get("starts_with_required_prefix")),
         _client_log_value(request.headers.get("User-Agent"), 200),
-        _client_log_value(request.headers.get("Referer"), 200),
+        urlsplit(request.headers.get("Referer") or "").path[:200],
     )
     return jsonify({"status": "ok"})
 
@@ -1112,12 +1115,11 @@ def run_blast():
         logger.warning("BLAST request rejected: %s", e)
         return jsonify({"status": "error", "error": str(e)}), 400
     except Exception as e:
-        logger.error(f"BLAST API error: {e}", exc_info=True)
-        return _server_error(e)
+        return _server_error(e, where="blast")
 
 
 @bp.route('/genbank/accessions', methods=['POST'])
-@limiter.limit("10 per minute; 200 per hour")
+@limiter.limit("40 per minute; 600 per hour")
 def fetch_genbank_accessions():
     """
     Fetch one or more GenBank accessions for direct queue insertion.
@@ -1179,12 +1181,11 @@ def fetch_genbank_accessions():
             "message": message
         })
     except Exception as e:
-        logger.error(f"GenBank accession API error: {e}", exc_info=True)
-        return _server_error(e)
+        return _server_error(e, where="genbank_accessions")
 
 
 @bp.route('/genbank/locations', methods=['POST'])
-@limiter.limit("20 per minute; 300 per hour")
+@limiter.limit("60 per minute; 900 per hour")
 def fetch_genbank_locations():
     """
     Look up collection locations for GenBank accessions.
@@ -1222,13 +1223,13 @@ def fetch_genbank_locations():
             "missing": missing
         })
     except Exception as e:
-        logger.error(f"GenBank location API error: {e}", exc_info=True)
-        return _server_error(e)
+        return _server_error(e, where="genbank_locations")
 
 
 def gather_mycomap_sequences_for_queue(url, include_ncbi=True, include_local=True,
                                        filter_conflicting_local_fasta=False,
-                                       allow_identical_sequences_different_locations=True):
+                                       allow_identical_sequences_different_locations=True,
+                                       fetch_time_budget=None):
     """Reusable helper for fetching MycoMap BLAST result sequences.
 
     Returns a tuple ``(payload, error_response)`` where ``payload`` is the
@@ -1238,6 +1239,11 @@ def gather_mycomap_sequences_for_queue(url, include_ncbi=True, include_local=Tru
     Exactly one of the two will be non-None. The local FASTA conflict filter
     is deliberately opt-in because identical barcode sequences can be valid
     records from separate collection locations.
+
+    ``fetch_time_budget`` bounds the total upstream FASTA fetch time. Callers
+    running inside a request must pass one (see
+    ``INTERACTIVE_FETCH_BUDGET_SECONDS``) so a MycoMap outage cannot hold a
+    Gunicorn slot for the full retry budget; worker callers leave it None.
     """
     if not url:
         return None, ({"status": "error", "error": "No URL provided"}, 400)
@@ -1254,6 +1260,7 @@ def gather_mycomap_sequences_for_queue(url, include_ncbi=True, include_local=Tru
         parse_mycomap_ncbi_fasta_header,
         prefer_local_mycomap_taxa,
         uniquify_mycomap_sequence_names,
+        validate_mycomap_sequence_url,
         validate_mycomap_url,
     )
     from app.services.fasta_utils import clean_dna_sequence
@@ -1281,6 +1288,20 @@ def gather_mycomap_sequences_for_queue(url, include_ncbi=True, include_local=Tru
         cleaned = lowquality_re.sub('', str(name or ''))
         return re.sub(r'\s+', ' ', cleaned).strip(' ,;:-_')
 
+    # Alan 8/14/26 - A sequence record URL also carries an r<digits> token, so
+    # validate_mycomap_url() happily reads it as a BLAST ID and would fetch an
+    # unrelated BLAST record. Route it to the endpoint that actually understands it.
+    if validate_mycomap_sequence_url(url):
+        return None, ({
+            "status": "error",
+            "error": (
+                "That is a MycoMap sequence record page, not a BLAST results page. "
+                "Use the sequence import for it, or paste the URL from the BLAST "
+                "Search page to import BLAST hits."
+            ),
+            "sequence_url": True,
+        }, 400)
+
     blast_id = validate_mycomap_url(url)
     if not blast_id:
         return None, ({
@@ -1288,10 +1309,33 @@ def gather_mycomap_sequences_for_queue(url, include_ncbi=True, include_local=Tru
             "error": "Invalid Mycomap URL. URL must be from mycomap.com and contain a result ID (e.g., r12345)",
         }, 400)
 
-    logger.info(f"Mycomap helper: blast_id={blast_id} (ncbi={include_ncbi}, local={include_local})")
-    result = fetch_mycomap_fasta(blast_id, include_ncbi, include_local)
+    # Alan 8/15/26 - Log the URL alongside the extracted ID. The raw URL was logged
+    # only when validation *failed*, so a URL that parsed to the wrong ID and then
+    # 404'd upstream left no record of what the user actually pasted -- which is
+    # exactly the case that needed diagnosing on 2026-08-14. This line fires once
+    # per operation, not once per validation call, so it is not the volume problem
+    # the old per-validation INFO line was.
+    logger.info(
+        f"Mycomap helper: blast_id={blast_id} (ncbi={include_ncbi}, local={include_local}) url={url}"
+    )
+    result = fetch_mycomap_fasta(
+        blast_id, include_ncbi, include_local, time_budget=fetch_time_budget
+    )
 
     if result['errors'] and not result['fasta_content']:
+        # An upstream 404 means the record does not exist -- a real answer, not a
+        # gateway fault. Say so in words the user can act on instead of returning
+        # a 502 carrying raw urllib text ("Network error fetching fasta: HTTP
+        # Error 404: Not Found"), which reads as a site outage and prompts retries.
+        if all('404' in err for err in result['errors']):
+            return None, ({
+                "status": "error",
+                "error": (
+                    f"MycoMap has no BLAST result r{blast_id}. Check the URL — the "
+                    "result may have expired, or the link may point somewhere other "
+                    "than a BLAST Search page."
+                ),
+            }, 404)
         return None, ({"status": "error", "error": "; ".join(result['errors'])}, 502)
 
     sequences = _parse_fasta_sequences(result['fasta_content'])
@@ -1493,6 +1537,17 @@ def gather_mycomap_sequences_for_queue(url, include_ncbi=True, include_local=Tru
         msg += f" ({conflicting_local_dropped_count} conflicting local FASTA sequence{'s' if conflicting_local_dropped_count != 1 else ''} filtered)"
     if duplicate_observation_count > 0:
         msg += f" ({duplicate_observation_count} duplicate observation record{'s' if duplicate_observation_count != 1 else ''} collapsed)"
+    # Alan 8/14/26 - Call out a source that failed outright. A MycoMap 500 on one half
+    # of the fetch still returns the other half, and burying that in a trailing
+    # "(warnings: ...)" meant users imported a partial result set without noticing.
+    failed_sources = result.get('failed_sources') or []
+    if failed_sources:
+        labels = {'ncbi': 'NCBI', 'local': 'local MycoBLAST'}
+        named = ' and '.join(labels.get(s, s) for s in failed_sources)
+        msg += (
+            f" -- WARNING: {named} results could not be retrieved from MycoMap, "
+            f"so those sequences are missing. Try again in a moment."
+        )
     if result['errors']:
         msg += f" (warnings: {'; '.join(result['errors'])})"
 
@@ -1501,6 +1556,7 @@ def gather_mycomap_sequences_for_queue(url, include_ncbi=True, include_local=Tru
         "sequences": sequences,
         "ncbi_count": result['ncbi_count'],
         "local_count": result['local_count'],
+        "failed_sources": failed_sources,
         "blast_metrics_count": metrics_attached_count,
         "conflicting_local_count": conflicting_local_dropped_count,
         "duplicate_observation_count": duplicate_observation_count,
@@ -1524,8 +1580,82 @@ def gather_mycomap_sequences_for_queue(url, include_ncbi=True, include_local=Tru
     }, None
 
 
+# Alan 8/14/26 - Accept MycoMap sequence record pages
+# (https://mycomap.com/genetics/sequences/...-r<id>/), which the Tree Builder used to
+# reject as an invalid URL. These identify a single sequence rather than a BLAST
+# search, so they get their own endpoint and return one queue-ready entry.
+@bp.route('/mycomap/sequence', methods=['POST'])
+@limiter.limit("40 per minute; 600 per hour")
+def fetch_mycomap_sequence_record():
+    """
+    Fetch one sequence from a Mycomap sequence record URL.
+
+    Request:  { "url": "https://mycomap.com/genetics/sequences/.../...-r763916/" }
+    Response: { "status": "success", "sequences": [ {...} ], "message": "..." }
+    """
+    from app.services.mycomap_service import (
+        fetch_mycomap_sequence,
+        validate_mycomap_sequence_url,
+    )
+    from app.services.fasta_utils import clean_dna_sequence
+
+    data = request.get_json(silent=True) or {}
+    url = (data.get('url') or '').strip()
+    if not url:
+        return jsonify({"status": "error", "error": "Missing MycoMap sequence URL."}), 400
+
+    sequence_id = validate_mycomap_sequence_url(url)
+    if not sequence_id:
+        return jsonify({
+            "status": "error",
+            "error": (
+                "Invalid MycoMap sequence URL. It must be a mycomap.com sequence "
+                "record page containing a record ID (e.g. .../genetics/sequences/"
+                "ont_sequences/<slug>-r12345/)."
+            ),
+        }), 400
+
+    try:
+        record = fetch_mycomap_sequence(sequence_id)
+    except Exception as e:
+        return _server_error(e, where="mycomap_sequence")
+
+    if record.get('errors') or not record.get('sequence'):
+        error = '; '.join(record.get('errors') or []) or (
+            f"MycoMap sequence {sequence_id} has no DNA sequence attached."
+        )
+        # 502 for an upstream fault, 404 when the record simply has nothing to import.
+        status = 404 if 'does not have a DNA sequence' in error else 502
+        return jsonify({"status": "error", "error": error}), status
+
+    cleaned = clean_dna_sequence(record['sequence'])
+    if not cleaned:
+        return jsonify({
+            "status": "error",
+            "error": f"MycoMap sequence {sequence_id} contains no usable DNA characters.",
+        }), 422
+
+    sequence_entry = {
+        "name": record.get('name') or f"MycoMap{sequence_id}",
+        "sequence": cleaned,
+        "organism": record.get('species') or '',
+        "source": "mycomap",
+        "hit_source": "sequence_record",
+        "mycomap_sequence_id": sequence_id,
+        "mycomap_record_url": record.get('record_url') or url,
+    }
+
+    return jsonify({
+        "status": "success",
+        "sequences": [sequence_entry],
+        "message": (
+            f"Fetched 1 sequence ({len(cleaned)} bp) from MycoMap record {sequence_id}"
+        ),
+    })
+
+
 @bp.route('/mycomap', methods=['POST'])
-@limiter.limit("10 per minute; 200 per hour")
+@limiter.limit("40 per minute; 600 per hour")
 def fetch_mycomap():
     """
     Fetch sequences from a Mycomap BLAST results URL.
@@ -1561,6 +1691,8 @@ def fetch_mycomap():
         }), 422
 
     try:
+        from app.services.mycomap_service import INTERACTIVE_FETCH_BUDGET_SECONDS
+
         payload, err = gather_mycomap_sequences_for_queue(
             url,
             include_ncbi,
@@ -1569,14 +1701,15 @@ def fetch_mycomap():
             allow_identical_sequences_different_locations=(
                 allow_identical_sequences_different_locations
             ),
+            # This runs in a request handler, so cap the upstream retry budget.
+            fetch_time_budget=INTERACTIVE_FETCH_BUDGET_SECONDS,
         )
         if err is not None:
             body, status = err
             return jsonify(body), status
         return jsonify(payload)
     except Exception as e:
-        logger.error(f"Mycomap API error: {e}", exc_info=True)
-        return _server_error(e)
+        return _server_error(e, where="mycomap")
 
 
 @bp.route('/mycomap/refresh', methods=['POST'])
@@ -1629,8 +1762,7 @@ def start_mycomap_blast_refresh():
         })
         return jsonify({"status": "success", "job_id": job_id})
     except Exception as e:
-        logger.error(f"Mycomap refresh API error: {e}", exc_info=True)
-        return _server_error(e)
+        return _server_error(e, where="mycomap_refresh")
 
 
 @bp.route('/mycomap/refresh/<job_id>', methods=['GET'])
@@ -1663,8 +1795,26 @@ def _inat_tree_rate_limit():
         admins = Config.INAT_OAUTH_ADMIN_EMAILS
         if email in admins:
             return "10000 per minute"
-        return "10 per 5 minutes"
-    return "20 per hour"
+        return "30 per 5 minutes"
+    return "60 per hour"
+
+
+def _inat_tree_preview_rate_limit():
+    """Rate string for the read-only preview lookup.
+
+    Alan 8/14/26 - Preview used to share the job-creation limit, so pasting a few
+    observations to look at them burned the same budget as queueing trees and real
+    users were served 429s (the only 429s in the whole access-log history). Preview
+    creates nothing: it is a lookup that fires while the user pastes, so it gets a
+    budget sized for interactive use. Still bounded, because each call fans out to
+    the iNaturalist API, which rate-limits us in turn.
+    """
+    if current_user.is_authenticated:
+        email = (current_user.email or "").strip().lower()
+        if email in Config.INAT_OAUTH_ADMIN_EMAILS:
+            return "10000 per minute"
+        return "60 per minute; 1000 per hour"
+    return "30 per minute; 400 per hour"
 
 
 def _mycomap_rerun_limit_from_request(data, result_type):
@@ -1776,12 +1926,11 @@ def inaturalist_tree():
             error_payload["message"] = str(e)
         return jsonify(error_payload), e.status
     except Exception as e:
-        logger.error("iNaturalist tree endpoint error: %s", e, exc_info=True)
-        return _server_error(e)
+        return _server_error(e, where="inaturalist_tree")
 
 
 @bp.route('/inaturalist/tree/preview', methods=['POST'])
-@limiter.limit(_inat_tree_rate_limit, key_func=_inat_tree_rate_key)
+@limiter.limit(_inat_tree_preview_rate_limit, key_func=_inat_tree_rate_key)
 def inaturalist_tree_preview():
     """Preview iNaturalist one-click tree scope and eligibility."""
     from app.services.inaturalist_tree_service import (
@@ -1795,8 +1944,7 @@ def inaturalist_tree_preview():
     except InatTreeError as e:
         return jsonify({"status": "error", "error": str(e)}), e.status
     except Exception as e:
-        logger.error("iNaturalist tree preview endpoint error: %s", e, exc_info=True)
-        return _server_error(e)
+        return _server_error(e, where="inaturalist_tree_preview")
 
 
 @bp.route('/inaturalist/tree/batch', methods=['POST'])
@@ -1867,12 +2015,11 @@ def inaturalist_tree_batch():
             error_payload["message"] = str(e)
         return jsonify(error_payload), e.status
     except Exception as e:
-        logger.error("iNaturalist tree batch endpoint error: %s", e, exc_info=True)
-        return _server_error(e)
+        return _server_error(e, where="inaturalist_tree_batch")
 
 
 @bp.route('/inaturalist', methods=['POST'])
-@limiter.limit("10 per minute; 200 per hour")
+@limiter.limit("40 per minute; 600 per hour")
 def fetch_inaturalist():
     """
     Fetch DNA sequences from iNaturalist observations.
@@ -1985,13 +2132,12 @@ def fetch_inaturalist():
         logger.warning(f"iNaturalist API validation error: {e}")
         return jsonify({"status": "error", "error": str(e)}), 400
     except Exception as e:
-        logger.error(f"iNaturalist API error: {e}", exc_info=True)
-        return _server_error(e)
+        return _server_error(e, where="inaturalist")
 
 
 
 @bp.route('/mushroom-observer', methods=['POST'])
-@limiter.limit("10 per minute; 200 per hour")
+@limiter.limit("40 per minute; 600 per hour")
 def fetch_mushroom_observer():
     """Analyze one Mushroom Observer observation or return its selected ITS."""
     from app.services.mushroom_observer_service import (
@@ -2017,12 +2163,11 @@ def fetch_mushroom_observer():
     except MushroomObserverError as exc:
         return jsonify({"status": "error", "error": str(exc)}), exc.status
     except Exception as exc:
-        logger.error("Mushroom Observer API endpoint error: %s", exc, exc_info=True)
         return _server_error(exc, where="mushroom_observer")
 
 
 @bp.route('/mushroom-observer/tree', methods=['POST'])
-@limiter.limit("10 per 5 minutes; 20 per hour")
+@limiter.limit("20 per 5 minutes; 60 per hour")
 def mushroom_observer_tree():
     """Queue a one-click tree for one selected Mushroom Observer ITS sequence."""
     from app.services.mushroom_observer_service import (
@@ -2058,14 +2203,15 @@ def mushroom_observer_tree():
     except MushroomObserverError as exc:
         return jsonify({"status": "error", "error": str(exc)}), exc.status
     except Exception as exc:
-        logger.error("Mushroom Observer tree endpoint error: %s", exc, exc_info=True)
         return _server_error(exc, where="mushroom_observer_tree")
 
 
 
 
 @bp.route('/job', methods=['POST'])
-@limiter.limit("20 per hour; 100 per day")
+# Alan 8/14/26 - Raised so a user working through a batch of observations in one
+# sitting is not cut off partway.
+@limiter.limit("60 per hour; 300 per day")
 def create_job():
     data = request.get_json() or {}
     
@@ -2630,14 +2776,86 @@ def rebuild_with_duplicates(job_id):
         # Append the removed records back onto the FASTA payload.
         sequence_text = str(job_params.get("sequence") or "").rstrip("\n")
         blocks = [sequence_text] if sequence_text else []
+        sequence_metadata = list(job_params.get("sequence_metadata") or [])
+        existing_records = _parse_fasta_sequences(sequence_text)
+        used_ids = {
+            str(record.get("name") or "").strip().split(None, 1)[0]
+            for record in existing_records
+            if str(record.get("name") or "").strip()
+        }
+
         for record in restored:
             sequence = "".join(str(record.get("sequence") or "").split())
             wrapped = "\n".join(sequence[i:i + 80] for i in range(0, len(sequence), 80))
-            blocks.append(f">{record.get('name', '')}\n{wrapped}")
-        job_params["sequence"] = "\n".join(blocks) + "\n"
+            original_header = str(record.get("name") or "").strip()
+            parts = original_header.split(None, 1) if original_header else ["seq"]
+            base_id = parts[0] or "seq"
+            description = parts[1] if len(parts) > 1 else ""
+            internal_id = base_id
+            suffix = 2
+            while internal_id in used_ids:
+                internal_id = f"{base_id}_{suffix}"
+                suffix += 1
+            used_ids.add(internal_id)
+            internal_header = f"{internal_id} {description}".rstrip()
+            blocks.append(f">{internal_header}\n{wrapped}")
+
+            restored_metadata = dict(record.get("metadata") or {})
+            restored_metadata.setdefault(
+                "display_label",
+                restored_metadata.get("name") or original_header,
+            )
+            restored_metadata.setdefault("raw_fasta_header", original_header)
+            # FASTA/header keyed consumers need the unique tool-facing name;
+            # display_label/raw_fasta_header retain the original occurrence.
+            restored_metadata["name"] = internal_header
+            restored_metadata["fasta_header"] = internal_header
+            sequence_metadata.append(restored_metadata)
+        combined_fasta = "\n".join(blocks) + "\n"
+        combined_records = _parse_fasta_sequences(combined_fasta)
+        from app.workers.tasks import uniquify_fasta_identifiers
+
+        unique_fasta, _unique_stats = uniquify_fasta_identifiers(combined_fasta)
+        unique_records = _parse_fasta_sequences(unique_fasta)
+
+        positional_metadata = (
+            len(sequence_metadata) == len(combined_records)
+            and all(
+                str(sequence_metadata[index].get("fasta_header")
+                    or sequence_metadata[index].get("name") or "").strip()
+                == str(record.get("name") or "").strip()
+                for index, record in enumerate(combined_records)
+            )
+        )
+        metadata_by_header = {}
+        if not positional_metadata:
+            for item in sequence_metadata:
+                key = str(item.get("fasta_header") or item.get("name") or "").strip()
+                metadata_by_header.setdefault(key, []).append(item)
+
+        updated_metadata = []
+        for index, (before, after) in enumerate(zip(combined_records, unique_records)):
+            original_header = str(before.get("name") or "").strip()
+            internal_header = str(after.get("name") or "").strip()
+            if positional_metadata:
+                item = dict(sequence_metadata[index])
+            else:
+                candidates = metadata_by_header.get(original_header) or []
+                item = dict(candidates.pop(0)) if candidates else {}
+            item.setdefault("display_label", item.get("name") or original_header)
+            item.setdefault("raw_fasta_header", original_header)
+            item["name"] = internal_header
+            item["fasta_header"] = internal_header
+            updated_metadata.append(item)
+
+        job_params["sequence"] = unique_fasta
+        job_params["sequence_metadata"] = updated_metadata
 
         # Without this the dedup in enqueue_job would immediately strip them again.
         job_params["skip_observation_dedup"] = True
+        # Internal-only pipeline flag: the worker must uniquify identifiers but
+        # must not collapse the exact records this action explicitly restores.
+        job_params["preserve_exact_duplicate_records"] = True
         job_params["import_filter_details"] = {
             k: v for k, v in (job_params.get("import_filter_details") or {}).items()
             if k != "duplicates"
@@ -2725,7 +2943,9 @@ def get_job_pipeline_params(job_id):
 
 
 @bp.route('/job/<job_id>/tree/recompute', methods=['POST'])
-@limiter.limit("1 per minute")
+# Alan 8/14/26 - 1/min blocked a legitimate second attempt (adjust settings, re-run).
+# Still tight because recompute runs MAFFT/FastTree inside the web request.
+@limiter.limit("6 per minute; 60 per hour")
 def recompute_tree_job(job_id):
     db_job, error_msg, status_code = check_job_access(job_id, mode="edit")
     if error_msg:
@@ -2801,8 +3021,6 @@ def recompute_tree_job(job_id):
         return jsonify(result)
         
     except Exception as e:
-        import traceback
-        logger.error(f"Recompute error: {e}\n{traceback.format_exc()}")
         return _server_error(e)
 
 @bp.route('/job/<job_id>/download/tree/newick', methods=['GET'])
@@ -2941,13 +3159,62 @@ def download_fasta_original(job_id):
         
     return send_file(path, as_attachment=True, download_name="sequences_original.fasta")
 
-@bp.route('/job/<job_id>/download/fasta/pruned', methods=['GET'])
-def download_fasta_pruned(job_id):
+@bp.route('/job/<job_id>/download/fasta/edited', methods=['GET'])
+def download_fasta_edited(job_id):
+    """Download the current unaligned sequence set: original FASTA with the tree
+    viewer's pruning and renaming applied. Built fresh from the persisted tree
+    state on every request so it can never serve a stale export."""
+    from io import BytesIO
+
     # Check authorization
     _, error_msg, status_code = check_job_access(job_id)
     if error_msg:
         return jsonify({"status": "error", "error": error_msg}), status_code
-    
+
+    job_dir = Config.JOB_DIR / job_id
+    input_path = job_dir / "input" / "input_raw.fasta"
+    if not validate_safe_file_path(input_path, job_dir):
+        return jsonify({"status": "error", "error": "FASTA file not found or invalid"}), 404
+
+    try:
+        from app.services.tree_edit_service import build_edited_fasta_text, load_tree_state
+        state = load_tree_state(job_dir)
+        content = build_edited_fasta_text(input_path, state)
+    except Exception as e:
+        logger.warning(f"Failed to build edited FASTA for job {job_id}: {e}")
+        return jsonify({"status": "error", "error": "Could not build edited FASTA"}), 500
+
+    if not content.strip():
+        return jsonify({
+            "status": "error",
+            "error": "No sequences remain after the current tree edits"
+        }), 404
+
+    response = send_file(
+        BytesIO(content.encode("utf-8")),
+        as_attachment=True,
+        download_name="sequences_edited.fasta",
+        mimetype="text/plain",
+    )
+    response.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
+    return response
+
+
+@bp.route('/job/<job_id>/download/fasta/pruned', methods=['GET'])
+def download_fasta_pruned(job_id):
+    """Legacy prune-only export, kept for old links and for the add-sequences flow.
+
+    Deliberately NOT an alias for the edited export: /tree?edit=<job> loads this
+    FASTA into the queue and can hand it straight back to /sequences/add, which
+    rewrites input_raw.fasta. Renamed headers here would replace the original
+    names that tree_state's renames/pruned_taxa are keyed on, so recomputation
+    keeps getting original identifiers.
+    """
+    # Check authorization
+    _, error_msg, status_code = check_job_access(job_id)
+    if error_msg:
+        return jsonify({"status": "error", "error": error_msg}), status_code
+
     job_dir = Config.JOB_DIR / job_id
     path = job_dir / "alignment" / "alignment_pruned.fasta"
     try:
@@ -2966,7 +3233,7 @@ def download_fasta_pruned(job_id):
 
     if not validate_safe_file_path(path, job_dir):
         return jsonify({"status": "error", "error": "Pruned FASTA not found or invalid"}), 404
-        
+
     return send_file(path, as_attachment=True, download_name="sequences_pruned.fasta")
 
 @bp.route('/job/<job_id>/download/fasta/aligned', methods=['GET'])
@@ -3553,15 +3820,17 @@ def job_events_stream(job_id):
     job_dir = Config.JOB_DIR / job_id
     
     def generate():
-        # Connect to Redis for PubSub
-        redis_url = Config.REDIS_URL
-        r = redis.from_url(redis_url)
-        pubsub = r.pubsub()
-        
-        channel = f"job:{job_id}:events"
-        pubsub.subscribe(channel)
-        
+        from app.services.log_context import log_degradation_rate_limited
+        stream_started = time.monotonic()
+        close_reason = "unexpected_exception"
+        pubsub = None
         try:
+            # Connect inside the guarded region so connection/subscription
+            # failures are observable and cleanup stays safe.
+            r = redis.from_url(Config.REDIS_URL)
+            pubsub = r.pubsub()
+            pubsub.subscribe(f"job:{job_id}:events")
+            logger.info("event=sse.opened SSE stream opened")
             # Send initial snapshot
             snapshot = _build_snapshot(job_id)
             yield f"event: snapshot\ndata: {json.dumps(snapshot)}\n\n"
@@ -3580,7 +3849,6 @@ def job_events_stream(job_id):
             )
 
             # Throttle timers (use monotonic clock for reliable intervals)
-            stream_started = time.monotonic()
             last_ping = stream_started
             last_db_poll = 0.0  # Start at 0 to trigger immediate first poll
 
@@ -3596,6 +3864,12 @@ def job_events_stream(job_id):
             # reconnect (it retries automatically and we re-send a fresh snapshot),
             # so a live viewer sees nothing but an orphan cannot pin a thread.
             MAX_STREAM_SECONDS = Config.SSE_MAX_STREAM_SECONDS
+            # Alan 8/14/26 - Age alone is a bad proxy for "this stream is abandoned":
+            # it cut genuinely long jobs (a RAxML publication run) every 30 minutes.
+            # Idleness is the signal that actually distinguishes a stuck or orphaned
+            # stream from a slow one, so track when this stream last saw real activity.
+            MAX_IDLE_SECONDS = Config.SSE_MAX_IDLE_SECONDS
+            last_activity = stream_started
 
             while True:
                 if time.monotonic() - stream_started >= MAX_STREAM_SECONDS:
@@ -3605,11 +3879,29 @@ def job_events_stream(job_id):
                         "SSE stream for job %s hit the %ss lifetime cap; closing so the "
                         "client can reconnect.", job_id, MAX_STREAM_SECONDS
                     )
+                    close_reason = "lifetime_cap"
+                    break
+
+                if (
+                    MAX_IDLE_SECONDS > 0
+                    and job_status not in ('completed', 'failed')
+                    and time.monotonic() - last_activity >= MAX_IDLE_SECONDS
+                ):
+                    # Nothing has happened on this job for a long time. Either the
+                    # viewer is gone or the job is stuck; both pin a request slot for
+                    # no benefit. A live viewer's EventSource reconnects immediately.
+                    yield "event: reconnect\ndata: {\"reason\": \"idle\"}\n\n"
+                    logger.info(
+                        "SSE stream for job %s idle for %ss with status %r; closing so "
+                        "the client can reconnect.", job_id, MAX_IDLE_SECONDS, job_status
+                    )
+                    close_reason = "idle_reconnect"
                     break
 
                 if terminal_deadline is not None and time.monotonic() >= terminal_deadline:
                     # Job was already finished when this stream opened; nothing more
                     # is coming, so release the slot instead of pinging forever.
+                    close_reason = "terminal_completion"
                     break
 
                 # Check for PubSub messages (non-blocking with short timeout)
@@ -3621,13 +3913,16 @@ def job_events_stream(job_id):
                     if isinstance(data, bytes):
                         data = data.decode('utf-8')
                     yield f"data: {data}\n\n"
-                    
+                    # Real job output: this stream is following live work, not idling.
+                    last_activity = time.monotonic()
+
                     # Check if this is a terminal event
                     try:
                         event = json.loads(data)
                         if event.get('type') == 'job_state' and event.get('status') in ('completed', 'failed'):
                             # Send final event and close after brief delay
                             time.sleep(0.5)
+                            close_reason = "terminal_completion"
                             break
                     except json.JSONDecodeError:
                         pass
@@ -3658,14 +3953,40 @@ def job_events_stream(job_id):
                                 "event: snapshot\n"
                                 f"data: {json.dumps(terminal_snapshot)}\n\n"
                             )
+                            close_reason = "terminal_completion"
                             break
                 
                 # Brief sleep to prevent CPU spin (50-100ms effective with pubsub timeout)
                 time.sleep(0.05)
         
+        except GeneratorExit:
+            close_reason = "client_disconnect"
+            raise
+        except redis.RedisError as exc:
+            close_reason = "redis_failure"
+            log_degradation_rate_limited(
+                logger, "sse_redis_failure",
+                "SSE stream closed after Redis failure",
+                exception=type(exc).__name__,
+            )
+        except Exception:
+            close_reason = "unexpected_exception"
+            logger.exception("event=sse.generator_failed SSE generator failed")
         finally:
-            pubsub.unsubscribe()
-            pubsub.close()
+            if pubsub is not None:
+                try:
+                    pubsub.unsubscribe()
+                    pubsub.close()
+                except Exception as exc:
+                    log_degradation_rate_limited(
+                        logger, "sse_cleanup_failed",
+                        "SSE PubSub cleanup failed",
+                        exception=type(exc).__name__,
+                    )
+            logger.info(
+                "event=sse.closed SSE stream closed reason=%s duration_seconds=%.3f",
+                close_reason, time.monotonic() - stream_started,
+            )
     
     response = Response(
         stream_with_context(generate()),
@@ -3732,38 +4053,60 @@ def download_log(job_id, log_name):
 def log_client_error():
     """
     Log client-side errors to the server log.
-    Expected JSON: { "message": "...", "stack": "...", "url": "...", "context": "..." }
+    Accept only bounded, query-free telemetry fields from the shared browser layer.
     """
     from flask import current_app
-    
+    if request.content_length and request.content_length > 16 * 1024:
+        return jsonify({"status": "ignored", "error": "payload too large"}), 413
+
     data = request.get_json(silent=True) or {}
-    # Apply size limits to prevent log spam
-    msg = (data.get("message") or "Unknown client error")[:2000]
-    stack = (data.get("stack") or "")[:20000]
-    context = (data.get("context") or "")[:1000]
-    # Sanitize inputs to prevent log injection
-    msg = msg.replace('\n', ' ').replace('\r', ' ')
-    stack = stack.replace('\n', ' ').replace('\r', ' ')
-    context = context.replace('\n', ' ').replace('\r', ' ')
-    url = (data.get("url") or "")[:500].replace('\n', '').replace('\r', '')
-    
-    # Request metadata for debugging
-    client_ip = request.headers.get("X-Forwarded-For", request.remote_addr) or "unknown"
-    user_agent = (request.headers.get("User-Agent") or "")[:200]
-    
-    # Format log message with metadata
-    log_msg = f"Client Error: {msg}"
-    log_msg += f" [IP: {client_ip}]"
-    if url:
-        log_msg += f" [URL: {url}]"
-    if context:
-        log_msg += f" [Context: {context}]"
-    if user_agent:
-        log_msg += f" [UA: {user_agent}]"
-    if stack:
-        log_msg += f"\nStack: {stack}"
-        
-    current_app.logger.error(log_msg)
+    allowed_events = {
+        "window_error", "unhandled_rejection", "resource_load_failed",
+        "api_non_2xx", "ui_action_failed",
+    }
+    event = _client_log_value(data.get("event"), 50)
+    if event not in allowed_events:
+        return jsonify({"status": "ignored"}), 200
+    # Defense in depth: every untrusted field goes through the one shared
+    # sanitizer. The browser helper cleans the same fields, but this endpoint is
+    # a plain POST that anything can call, and a stack frame or an action label
+    # is exactly where a pasted sequence or an OAuth callback URL ends up.
+    from app.services.log_context import sanitize_telemetry_text
+
+    message = sanitize_telemetry_text(data.get("message") or "browser failure", 500)
+    action = sanitize_telemetry_text(data.get("action"), 100)
+    pathname = sanitize_telemetry_text(
+        urlsplit(str(data.get("pathname") or "")).path, 500
+    )
+    if not pathname.startswith("/"):
+        pathname = "/"
+    job_id = _client_log_value(data.get("job_id"), 40)
+    if job_id and not validate_job_id(job_id):
+        job_id = ""
+    stack = sanitize_telemetry_text(data.get("stack"), 2000)
+    supplied_fingerprint = _client_log_value(data.get("fingerprint"), 80)
+    fingerprint = supplied_fingerprint or hashlib.sha256(
+        f"{event}|{pathname}|{action}|{message}|{stack[:300]}".encode()
+    ).hexdigest()[:16]
+
+    # Cross-process short-window dedup. Telemetry remains fail-open if Redis is
+    # unavailable; the endpoint's existing rate limit and size bounds still apply.
+    try:
+        from app.workers.queue import get_redis_connection
+        if not get_redis_connection().set(
+            f"client-telemetry:{fingerprint}", "1", nx=True, ex=120
+        ):
+            return jsonify({"status": "duplicate"}), 200
+    except Exception:
+        pass
+
+    current_app.logger.error(
+        "event=client.%s Browser failure pathname=%s job_id=%s action=%s "
+        "message=%s fingerprint=%s release=%s browser=%s stack=%s",
+        event, pathname, job_id or "-", action or "-", message, fingerprint,
+        current_app.config.get("RELEASE_VERSION", "unknown"),
+        sanitize_telemetry_text(request.headers.get("User-Agent"), 200), stack or "-",
+    )
     return jsonify({"status": "logged"}), 200
 
 @bp.route('/job/<job_id>/sequences/add', methods=['POST'])
@@ -3819,7 +4162,7 @@ def add_sequences_to_job(job_id):
                  return jsonify({"status": "error", "error": f"Too many accessions (max {MAX_CUSTOM_GENBANK_ACCESSIONS})"}), 400
             
             if accessions:
-                logger.info(f"Adding sequences from accessions: {accessions}")
+                logger.info("event=job.accessions_added Adding sequences accession_count=%s", len(accessions))
                 sequences_to_add, skipped = _fetch_genbank_sequences_for_queue(
                     accessions,
                     max_sequence_bp=MAX_CUSTOM_GENBANK_SEQUENCE_BP
@@ -3924,5 +4267,4 @@ def add_sequences_to_job(job_id):
         })
         
     except Exception as e:
-        logger.error(f"Failed to add sequences: {e}", exc_info=True)
-        return _server_error(e)
+        return _server_error(e, where="add_sequences")

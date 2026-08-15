@@ -247,9 +247,14 @@ def _submit_blast_request(seq: str, config: Config = None, min_identity: float =
     if len(seq) > config.BLAST_MAX_QUERY_LENGTH:
         raise ValueError(f"Query too long: {len(seq)} chars (max: {config.BLAST_MAX_QUERY_LENGTH})")
     
-    # Log sequence info
-    seq_preview = seq[:100] + "..." if len(seq) > 100 else seq
-    logger.info(f"Submitting BLAST request (ident={min_identity}%, max={max_sequences}), sequence preview: {seq_preview}")
+    # Sequence content is sensitive and high-volume; length + a stable digest
+    # provide enough correlation without writing bases to logs.
+    from app.services.log_context import stable_fingerprint
+    logger.info(
+        "event=blast.submitted Submitting BLAST request identity=%s max_hits=%s "
+        "query_bases=%s query_fingerprint=%s",
+        min_identity, max_sequences, len(seq), stable_fingerprint(seq),
+    )
     
     params = {
         "CMD": "Put",
@@ -268,7 +273,7 @@ def _submit_blast_request(seq: str, config: Config = None, min_identity: float =
     # Raise if 4xx/5xx (though 5xx handled by retry, final attempt might fail)
     response.raise_for_status()
     
-    logger.debug(f"BLAST submission response: {response.text[:500]}")
+    logger.debug("BLAST submission response_chars=%s", len(response.text))
     
     # Parse RID and RTOE from response text
     # Response usually contains: "    RID = ...\n    RTOE = ..."
@@ -323,7 +328,7 @@ def _poll_blast(rid: str, rtoe: int, config: Config, logger) -> None:
                 
             content = response.text
              # Log full poll response for debugging
-            logger.debug(f"Poll response for RID {rid}: {content[:500]}")
+            logger.debug("BLAST poll response RID=%s response_chars=%s", rid, len(content))
             
             if "Status=WAITING" in content:
                 logger.info(f"BLAST Status: WAITING. Sleeping {poll_interval}s...")
@@ -406,7 +411,12 @@ def _fetch_blast_results(rid: str) -> Dict[str, List]:
     
     # Check if response looks like JSON
     if not content.strip().startswith('{') and not content.strip().startswith('['):
-        logger.warning(f"BLAST response doesn't look like JSON, first 500 chars: {content[:500]}")
+        from app.services.log_context import stable_fingerprint
+        logger.warning(
+            "event=blast.response_unexpected BLAST response was not JSON "
+            "response_chars=%s response_fingerprint=%s",
+            len(content), stable_fingerprint(content),
+        )
         # Try to extract accessions from text-based format as fallback
         import re
         accession_pattern = r'\b([A-Z]{1,2}_?\d{6,}(?:\.\d+)?)\b'
@@ -479,7 +489,12 @@ def _fetch_blast_results(rid: str) -> Dict[str, List]:
         return {"accessions": accessions[:50], "hit_details": hit_details[:50]}
         
     except json.JSONDecodeError as e:
-        logger.error(f"JSON decode error: {e}, response preview: {content[:500]}")
+        from app.services.log_context import stable_fingerprint
+        logger.error(
+            "event=blast.response_parse_failed JSON decode failed exception=%s "
+            "response_bytes=%s response_fingerprint=%s",
+            type(e).__name__, len(content), stable_fingerprint(content),
+        )
         raise ValueError(f"Failed to parse BLAST JSON response: {e}")
 
 def _fetch_genbank_xml_batch(accessions: List[str]) -> Optional[str]:

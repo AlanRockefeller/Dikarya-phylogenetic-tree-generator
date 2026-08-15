@@ -222,7 +222,7 @@ def dedupe_by_observation(
                     continue
                 kept_index, difference = duplicate_of
                 kept_name = records[kept_index].get("name", "")
-                dropped[index] = {
+                removed_record = {
                     "name": records[index].get("name", ""),
                     "sequence": records[index].get("sequence", ""),
                     "duplicate_of": kept_name,
@@ -240,6 +240,13 @@ def dedupe_by_observation(
                         )
                     ),
                 }
+                record_metadata = metadata_for(index, records[index])
+                if record_metadata:
+                    # Keep observation/display/BLAST provenance with the removed
+                    # record so a later duplicate-restoration job can recreate
+                    # a positional metadata row for this exact occurrence.
+                    removed_record["metadata"] = dict(record_metadata)
+                dropped[index] = removed_record
 
         if not dropped:
             return sequence_text, sequence_metadata, []

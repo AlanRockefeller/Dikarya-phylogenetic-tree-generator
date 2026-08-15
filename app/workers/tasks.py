@@ -6,15 +6,21 @@ It publishes real-time events via Redis PubSub for the SSE status dashboard.
 """
 
 import copy
+import collections
 import json
 import logging
 import time
 import traceback
+import hashlib
 from datetime import datetime, timedelta, timezone
 
 from rq import Retry, get_current_job
 
 from app.config import Config
+from app.services.log_context import (
+    JobContextFilter, background_job_context, bind_background_context,
+    stable_fingerprint,
+)
 from app.workers.events import (
     STEP_INPUT, STEP_ORIENT, STEP_BLAST, STEP_ITS, STEP_ALIGN, STEP_TRIM, STEP_TREE, STEP_POST,
     STATE_QUEUED, STATE_RUNNING, STATE_DONE, STATE_SKIPPED, STATE_FAILED,
@@ -25,11 +31,174 @@ from app.workers.events import (
     update_job_meta, update_step_meta,
 )
 
-# Configure logging for the worker
-logging.basicConfig(level=logging.INFO)
+# Alan 8/15/26 - No logging.basicConfig() here.
+#
+# It was a no-op in every process that matters: create_app() installs the
+# errors.log handler on the root logger first, and basicConfig does nothing once
+# the root logger has any handler. Worse, relying on it meant that when that
+# handler appeared the root logger silently stayed at WARNING and every INFO
+# record in this module -- job.started, job.completed, the invariant checks, and
+# everything the per-job pipeline.log handler exists to capture -- was dropped.
+# Levels and handlers are now set explicitly in app._install_logging().
 logger = logging.getLogger(__name__)
 
 VALID_DNA_SYMBOLS = frozenset("ACGTURYSWKMBDHVN-?")
+
+# Metadata reaches us from user-controlled imports, so "source" is not a safe
+# label to echo into a log line: a crafted record could carry a specimen note or
+# a token in that field. Anything unrecognised is counted as "other".
+KNOWN_SEQUENCE_SOURCES = frozenset({
+    "ncbi", "local", "mycomap", "inaturalist", "mushroom_observer", "genbank",
+    "blast", "upload", "manual", "user", "unknown",
+})
+
+
+def summarize_job_params(job_params: dict) -> dict:
+    """Return bounded diagnostics without sequences, metadata, notes, or secrets."""
+    params = job_params if isinstance(job_params, dict) else {}
+    sequence = params.get("sequence") if isinstance(params.get("sequence"), str) else ""
+    records = parse_fasta_records(sequence) if sequence else []
+    accessions = params.get("accessions") if isinstance(params.get("accessions"), list) else []
+    metadata = params.get("sequence_metadata") if isinstance(params.get("sequence_metadata"), list) else []
+    bounded_options = {}
+    for key in (
+        "alignment_method", "trimming_method", "trim_terminal_overhangs",
+        "tree_method", "tree_model", "bootstrap", "alrt_replicates",
+        "run_preset", "bootstrap_preset", "enable_bootstrap", "its_region",
+        "blast_mode", "include_ncbi", "include_local", "moose_enabled",
+    ):
+        value = params.get(key)
+        if isinstance(value, (str, int, float, bool)) or value is None:
+            bounded_options[key] = str(value)[:80] if isinstance(value, str) else value
+    sources = collections.Counter()
+    for item in metadata[:10000]:
+        if isinstance(item, dict):
+            raw_source = str(item.get("hit_source") or item.get("source") or "unknown")
+            source = raw_source.strip().lower()[:40]
+            sources[source if source in KNOWN_SEQUENCE_SOURCES else "other"] += 1
+    summary = {
+        "input_type": str(params.get("input_type") or "unknown")[:40],
+        "sequence_count": len(records),
+        "total_bases": sum(len(seq) for _, seq in records),
+        "accession_count": len(accessions),
+        "imported_record_count": len(metadata),
+        "sources": dict(sorted(sources.items())),
+        "options": bounded_options,
+    }
+    summary["parameter_fingerprint"] = stable_fingerprint(
+        json.dumps(summary, sort_keys=True, separators=(",", ":"), default=str)
+    )
+    return summary
+
+
+def _add_job_log_handler(job_id, log_file):
+    """Capture all service logs for this job, without cross-job leakage."""
+    handler = logging.FileHandler(log_file)
+    handler.addFilter(JobContextFilter(job_id))
+    handler.setFormatter(logging.Formatter(
+        "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+    ))
+    logging.getLogger().addHandler(handler)
+    return handler
+
+
+def _remove_job_log_handler(handler):
+    try:
+        logging.getLogger().removeHandler(handler)
+        handler.close()
+    except Exception:
+        pass
+
+
+def validate_pipeline_outputs(job_dir, job_params, logger_obj=logger) -> dict:
+    """Check completed artifacts without modifying them or job status."""
+    from io import StringIO
+    from Bio import Phylo, SeqIO
+    from app.services.log_context import log_degradation
+
+    required = [
+        job_dir / "input" / "input_raw.fasta",
+        job_dir / "alignment" / "alignment_raw.fasta",
+        job_dir / "alignment" / "alignment_trimmed.fasta",
+        job_dir / "tree" / "tree_original.newick",
+        job_dir / "tree" / "tree_original.nexus",
+    ]
+    failures = []
+    for path in required:
+        if not path.is_file() or path.stat().st_size == 0:
+            failures.append(f"missing_or_empty:{path.relative_to(job_dir)}")
+
+    fasta_counts = {}
+    for path in required[:3]:
+        if path.is_file() and path.stat().st_size:
+            try:
+                fasta_counts[path.name] = sum(1 for _ in SeqIO.parse(str(path), "fasta"))
+                if fasta_counts[path.name] == 0:
+                    failures.append(f"unparseable_fasta:{path.name}")
+            except Exception as exc:
+                failures.append(f"unparseable_fasta:{path.name}:{type(exc).__name__}")
+
+    terminal_count = None
+    tree_path = job_dir / "tree" / "tree_original.newick"
+    if tree_path.is_file() and tree_path.stat().st_size:
+        try:
+            tree = Phylo.read(StringIO(tree_path.read_text(errors="replace")), "newick")
+            terminal_count = len(tree.get_terminals())
+        except Exception as exc:
+            failures.append(f"unparseable_newick:{type(exc).__name__}")
+
+    final_count = fasta_counts.get("alignment_trimmed.fasta")
+    legitimately_pruned = False
+    state_path = job_dir / "tree_state.json"
+    if state_path.is_file():
+        try:
+            state = json.loads(state_path.read_text())
+            legitimately_pruned = bool(state.get("pruned_taxa"))
+        except (OSError, json.JSONDecodeError):
+            # load_tree_state separately reports corrupt state; do not duplicate it.
+            pass
+    if (
+        not legitimately_pruned and terminal_count is not None
+        and final_count is not None and terminal_count != final_count
+    ):
+        failures.append(f"terminal_count_mismatch:fasta={final_count}:tree={terminal_count}")
+
+    # run_phylo_job passes the raw params dict; run_recompute_job passes a
+    # JobParams dataclass, which has no .get at all. Every attribute below is
+    # dict-only, so treat anything else as "no source-import metadata" rather
+    # than raising -- an AttributeError here reaches the caller's except and
+    # marks a job failed after its tree was written successfully.
+    params = job_params if isinstance(job_params, dict) else {}
+    metadata = params.get("sequence_metadata")
+    is_source_import = bool(
+        params.get("mycomap_blast_url")
+        or params.get("_inat_tree_preparation")
+        or params.get("_mo_tree_preparation")
+    )
+    if is_source_import and isinstance(metadata, list) and metadata:
+        present = collections.Counter(
+            str(row.get("hit_source") or row.get("source") or "").lower()
+            for row in metadata if isinstance(row, dict)
+        )
+        for source, flag in (("ncbi", "include_ncbi"), ("local", "include_local")):
+            if params.get(flag) is True and present[source] == 0:
+                log_degradation(
+                    logger_obj, "requested_source_missing",
+                    "A requested source set had no records in completed job metadata",
+                    source=source,
+                )
+
+    if failures:
+        logger_obj.error(
+            "event=pipeline.invariant_failed Pipeline output invariant failed diagnostics=%s",
+            ",".join(failures[:12]),
+        )
+    else:
+        logger_obj.info(
+            "event=pipeline.invariants_ok Pipeline outputs validated fasta_records=%s tree_terminals=%s",
+            final_count, terminal_count,
+        )
+    return {"ok": not failures, "failures": failures, "fasta_records": final_count, "tree_terminals": terminal_count}
 
 
 def _save_job_params(input_info_path, job_params: dict) -> None:
@@ -141,69 +310,67 @@ def validate_dna_fasta(fasta_text: str) -> int:
     return len(records)
 
 
-def dedupe_and_uniquify_fasta(fasta_text: str) -> tuple[str, dict]:
-    """
-    - Drops records that are exact duplicates of a prior record (same full header AND same sequence).
-    - Ensures unique record IDs (first token of header). If repeated, appends _2, _3...
-    Returns: (new_fasta_text, stats dict)
-    """
-    records = parse_fasta_records(fasta_text)
-
-    seen_exact: set[tuple[str, str]] = set()
-    id_counts: dict[str, int] = {}
-
-    kept: list[tuple[str, str]] = []
-    dropped_exact = 0
-    renamed = 0
-
-    for header, seq in records:
-        key = (header, seq)
-        if key in seen_exact:
-            dropped_exact += 1
-            continue
-        seen_exact.add(key)
-
-        # split header into id + description
-        if header.strip():
-            parts = header.split(None, 1)
-            rec_id = parts[0]
-            desc = parts[1] if len(parts) > 1 else ""
-        else:
-            rec_id = "seq"
-            desc = ""
-        
-        # Cap header lengths to prevent abuse (e.g., 200KB pasted headers)
-        MAX_SEQ_ID_LEN = 100
-        MAX_DESC_LEN = 300
-        rec_id = rec_id[:MAX_SEQ_ID_LEN]
-        desc = desc[:MAX_DESC_LEN]
-
-        # make ID unique
-        id_counts[rec_id] = id_counts.get(rec_id, 0) + 1
-        n = id_counts[rec_id]
-        if n > 1:
-            new_id = f"{rec_id}_{n}"
-            renamed += 1
-        else:
-            new_id = rec_id
-
-        new_header = f"{new_id} {desc}".rstrip()
-        kept.append((new_header, seq))
-
-    # write back out with wrapped sequence lines (optional; here: 80 cols)
+def _format_fasta_records(records: list[tuple[str, str]]) -> str:
     out_lines: list[str] = []
-    for header, seq in kept:
+    for header, seq in records:
         out_lines.append(f">{header}")
         for i in range(0, len(seq), 80):
             out_lines.append(seq[i:i+80])
+    return "\n".join(out_lines) + "\n" if out_lines else ""
+
+
+def uniquify_fasta_identifiers(fasta_text: str) -> tuple[str, dict]:
+    """Keep every record while making each first-token tool ID unique."""
+    records = parse_fasta_records(fasta_text)
+    reserved_ids = {
+        (header.split(None, 1)[0] if header.strip() else "seq")[:100]
+        for header, _sequence in records
+    }
+    used_ids: set[str] = set()
+    next_suffix: dict[str, int] = {}
+    unique_records: list[tuple[str, str]] = []
+    renamed = 0
+
+    for header, sequence in records:
+        parts = header.split(None, 1) if header.strip() else ["seq"]
+        base_id = parts[0][:100] or "seq"
+        description = (parts[1] if len(parts) > 1 else "")[:300]
+        unique_id = base_id
+        if unique_id in used_ids:
+            suffix = next_suffix.get(base_id, 2)
+            unique_id = f"{base_id}_{suffix}"
+            while unique_id in used_ids or unique_id in reserved_ids:
+                suffix += 1
+                unique_id = f"{base_id}_{suffix}"
+            next_suffix[base_id] = suffix + 1
+            renamed += 1
+        used_ids.add(unique_id)
+        unique_records.append((f"{unique_id} {description}".rstrip(), sequence))
 
     stats = {
         "input_records": len(records),
-        "kept_records": len(kept),
-        "dropped_exact_duplicates": dropped_exact,
+        "kept_records": len(unique_records),
+        "dropped_exact_duplicates": 0,
         "renamed_due_to_duplicate_ids": renamed,
     }
-    return "\n".join(out_lines) + "\n", stats
+    return _format_fasta_records(unique_records), stats
+
+
+def dedupe_and_uniquify_fasta(fasta_text: str) -> tuple[str, dict]:
+    """Drop exact records, then make the surviving tool identifiers unique."""
+    records = parse_fasta_records(fasta_text)
+    seen_exact: set[tuple[str, str]] = set()
+    kept: list[tuple[str, str]] = []
+    for record in records:
+        if record in seen_exact:
+            continue
+        seen_exact.add(record)
+        kept.append(record)
+
+    unique_fasta, stats = uniquify_fasta_identifiers(_format_fasta_records(kept))
+    stats["input_records"] = len(records)
+    stats["dropped_exact_duplicates"] = len(records) - len(kept)
+    return unique_fasta, stats
 
 
 def fasta_record_count(fasta_text: str) -> int:
@@ -261,6 +428,7 @@ def _count_alignment_stats(fasta_path) -> tuple[int, int]:
         return 0, 0
 
 
+@background_job_context(0)
 def run_recompute_job(job_id: str, params_dict: dict) -> dict:
     """Background task for recomputing an existing tree while streaming status events."""
     job = get_current_job()
@@ -269,9 +437,7 @@ def run_recompute_job(job_id: str, params_dict: dict) -> dict:
     (job_dir / "logs").mkdir(exist_ok=True)
 
     log_file = job_dir / "logs" / "pipeline.log"
-    file_handler = logging.FileHandler(log_file)
-    file_handler.setFormatter(logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s"))
-    logger.addHandler(file_handler)
+    file_handler = _add_job_log_handler(job_id, log_file)
 
     try:
         from app import create_app
@@ -292,6 +458,10 @@ def run_recompute_job(job_id: str, params_dict: dict) -> dict:
         with _app.app_context():
             db_job = Job.query.get(job_id)
             if db_job:
+                bind_background_context(user=(
+                    getattr(getattr(db_job, "user", None), "email", None)
+                    or f"id:{db_job.user_id}" if db_job.user_id else "anon"
+                ))
                 metrics = db_job.metrics or {}
                 metrics["recompute_started_at"] = datetime.now(timezone.utc).isoformat()
                 db_job.metrics = metrics
@@ -311,6 +481,7 @@ def run_recompute_job(job_id: str, params_dict: dict) -> dict:
             rq_job=job,
             use_current_input=coerce_bool(params_dict.get("use_current_input"), False)[0]
         )
+        validate_pipeline_outputs(job_dir, job_params, logger)
 
         with _app.app_context():
             db_job = Job.query.get(job_id)
@@ -346,8 +517,7 @@ def run_recompute_job(job_id: str, params_dict: dict) -> dict:
     except Exception as e:
         error_msg = str(e)
         tb = traceback.format_exc()
-        logger.error(f"Recompute job {job_id} failed: {error_msg}")
-        logger.error(tb)
+        logger.exception("event=job.recompute_failed Recompute job failed")
 
         failed_step = "unknown"
         failed_step_label = "Recompute"
@@ -392,12 +562,12 @@ def run_recompute_job(job_id: str, params_dict: dict) -> dict:
 
     finally:
         try:
-            logger.removeHandler(file_handler)
-            file_handler.close()
+            _remove_job_log_handler(file_handler)
         except Exception:
             pass
 
 
+@background_job_context()
 def run_mycomap_blast_refresh_job(params: dict) -> dict:
     """
     Refresh a MycoMap BLAST result (local always, NCBI optionally) and gather
@@ -468,6 +638,7 @@ def run_mycomap_blast_refresh_job(params: dict) -> dict:
     return payload
 
 
+@background_job_context()
 def run_phylo_job(job_params: dict) -> dict:
     """
     Main phylogenetic analysis job.
@@ -512,8 +683,6 @@ def run_phylo_job(job_params: dict) -> dict:
         job_params.get("trim_terminal_overhangs"), True
     )[0]
 
-    logger.info(f"Starting job {job_id} with params: {job_params}")
-
     # 1. Create Job Directory
     job_dir = Config.JOB_DIR / job_id
     job_dir.mkdir(parents=True, exist_ok=True)
@@ -538,9 +707,11 @@ def run_phylo_job(job_params: dict) -> dict:
     
     # Per-job pipeline log
     log_file = job_dir / "logs" / "pipeline.log"
-    file_handler = logging.FileHandler(log_file)
-    file_handler.setFormatter(logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s"))
-    logger.addHandler(file_handler)
+    file_handler = _add_job_log_handler(job_id, log_file)
+    logger.info(
+        "event=job.started Starting job summary=%s",
+        json.dumps(summarize_job_params(job_params), sort_keys=True, separators=(",", ":")),
+    )
 
     input_raw_path = job_dir / "input" / "input_raw.fasta"
     blast_result = None
@@ -551,6 +722,10 @@ def run_phylo_job(job_params: dict) -> dict:
             # Initialize DB status
             db_job = Job.query.get(job_id)
             if db_job:
+                bind_background_context(user=(
+                    getattr(getattr(db_job, "user", None), "email", None)
+                    or (f"id:{db_job.user_id}" if db_job.user_id else "anon")
+                ))
                 metrics = db_job.metrics or {}
                 metrics["started_at"] = datetime.now(timezone.utc).isoformat()
                 
@@ -576,7 +751,9 @@ def run_phylo_job(job_params: dict) -> dict:
                 input_type = _normalize_input_type(job_params.get("input_type"))
                 blast_mode = _normalize_blast_mode(job_params.get("blast_mode"))
                 from app.services.trimming_service import describe_trim_step
-                trim_method = job_params.get("trimming_method", "none")
+                trim_method = job_params.get(
+                    "trimming_method", Config.DEFAULT_TRIMMING_METHOD
+                )
                 if trim_method == "default":
                     trim_method = Config.BEGINNER_DEFAULT_TRIMMING
                 # Already normalized to a bool near the top of run_phylo_job.
@@ -953,7 +1130,10 @@ def run_phylo_job(job_params: dict) -> dict:
             # After input is finalized: ensure enough sequences to build alignment/tree
             final_fasta = input_raw_path.read_text(encoding="utf-8", errors="replace")
             validate_dna_fasta(final_fasta)
-            final_fasta, stats = dedupe_and_uniquify_fasta(final_fasta)
+            if job_params.get("preserve_exact_duplicate_records"):
+                final_fasta, stats = uniquify_fasta_identifiers(final_fasta)
+            else:
+                final_fasta, stats = dedupe_and_uniquify_fasta(final_fasta)
             input_raw_path.write_text(final_fasta, encoding="utf-8")
 
             logger.info(
@@ -1137,7 +1317,9 @@ def run_phylo_job(job_params: dict) -> dict:
             # =========================================================
             current_step = STEP_TRIM
             from app.services.trimming_service import run_trimming, describe_trim_step, format_trimming_detail
-            trim_method = job_params.get("trimming_method", "none")
+            trim_method = job_params.get(
+                "trimming_method", Config.DEFAULT_TRIMMING_METHOD
+            )
             if trim_method == "default":
                 trim_method = Config.BEGINNER_DEFAULT_TRIMMING
             # Already normalized to a bool near the top of run_phylo_job.
@@ -1310,6 +1492,8 @@ def run_phylo_job(job_params: dict) -> dict:
             from app.services.tree_edit_service import load_tree_state
             load_tree_state(job_dir)
 
+            validate_pipeline_outputs(job_dir, job_params, logger)
+
             publish_step_done(job_id, STEP_TREE, "Tree generated")
             publish_overview(job_id, f"Tree built using {tree_method.upper()}")
             update_step_meta(job, STEP_TREE, {"state": STATE_DONE, "detail": "Tree generated"})
@@ -1336,7 +1520,7 @@ def run_phylo_job(job_params: dict) -> dict:
             # =========================================================
             # JOB COMPLETED
             # =========================================================
-            logger.info(f"Job {job_id} completed successfully.")
+            logger.info("event=job.completed Job completed successfully")
             
             # Update DB
             db_job = Job.query.get(job_id)
@@ -1362,9 +1546,10 @@ def run_phylo_job(job_params: dict) -> dict:
                         )
                         schedule_initial_ncbi_recheck(job_id)
                     except Exception:
-                        logger.warning(
-                            "Could not schedule NCBI re-check for job %s", job_id,
-                            exc_info=True,
+                        from app.services.log_context import log_degradation
+                        log_degradation(
+                            logger, "ncbi_recheck_schedule_failed",
+                            "Completed local-only tree could not schedule its NCBI follow-up",
                         )
 
             # iNaturalist post-completion hook: if this job came from the
@@ -1392,7 +1577,13 @@ def run_phylo_job(job_params: dict) -> dict:
                             extra_tip_names=extras,
                             display_name=_m.get("inat_source_display_name"),
                         )
-                    except Exception:
+                    except Exception as exc:
+                        from app.services.log_context import log_degradation
+                        log_degradation(
+                            logger, "inat_tip_highlight_failed",
+                            "Completed tree could not highlight its source observation tip",
+                            exception=type(exc).__name__,
+                        )
                         highlighted_tip = None
                     inat_result = post_completed_tree_to_inaturalist(
                         job_id, db_job.metrics or {}
@@ -1435,9 +1626,11 @@ def run_phylo_job(job_params: dict) -> dict:
                             "(tree is still available)."
                         )
             except Exception as _inat_err:
-                logger.warning(
-                    "iNat post-completion hook failed for job %s: %s",
-                    job_id, type(_inat_err).__name__,
+                from app.services.log_context import log_degradation
+                log_degradation(
+                    logger, "inat_post_completion_failed",
+                    "Tree completed but the iNaturalist delivery hook failed",
+                    exception=type(_inat_err).__name__,
                 )
 
             # Mushroom Observer post-completion hook: highlight the source tip
@@ -1492,9 +1685,11 @@ def run_phylo_job(job_params: dict) -> dict:
                             "(the tree is still available)."
                         )
             except Exception as _mo_err:
-                logger.warning(
-                    "Mushroom Observer post-completion hook failed for job %s: %s",
-                    job_id, type(_mo_err).__name__,
+                from app.services.log_context import log_degradation
+                log_degradation(
+                    logger, "mo_post_completion_failed",
+                    "Tree completed but the Mushroom Observer delivery hook failed",
+                    exception=type(_mo_err).__name__,
                 )
 
             # Publish completion
@@ -1534,8 +1729,10 @@ def run_phylo_job(job_params: dict) -> dict:
         error_msg = str(e)
         tb = traceback.format_exc()
         
-        logger.error(f"Job {job_id} failed at step '{current_step}': {error_msg}")
-        logger.error(tb)
+        logger.exception(
+            "event=job.failed Job failed at step=%s exception=%s",
+            current_step or "unknown", type(e).__name__,
+        )
         
         # Get stderr tail from last command if available
         stderr_tail = last_stats.get("stderr_tail", [])
@@ -1604,7 +1801,6 @@ def run_phylo_job(job_params: dict) -> dict:
     finally:
         # Always remove the per-job handler so logs don't duplicate across jobs
         try:
-            logger.removeHandler(file_handler)
-            file_handler.close()
+            _remove_job_log_handler(file_handler)
         except Exception:
             pass

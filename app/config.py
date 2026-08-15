@@ -24,6 +24,19 @@ def _csv_env(name, default=""):
     return [item.strip().lower() for item in raw.split(",") if item.strip()]
 
 
+def _release_version(base_dir):
+    """Resolve the deployment identifier through the one canonical resolver.
+
+    app.services.log_context owns this (it stamps `release` onto every log
+    record and caches the answer for the life of the process); this shim keeps
+    the existing RELEASE_VERSION config key working without a second copy of the
+    .git-reading logic that could drift out of step with it.
+    """
+    from app.services.log_context import configured_release
+
+    return configured_release(base_dir)
+
+
 class Config:
     SECRET_KEY = os.environ.get('SECRET_KEY') or 'dev-key-please-change'
     WTF_CSRF_TIME_LIMIT = None  # No expiration; tokens remain valid for session lifetime
@@ -58,12 +71,13 @@ class Config:
     # 9 GB leaves headroom beneath the worker cgroup's 10 GB ceiling, so the
     # child receives a diagnosable allocation failure before systemd has to
     # kill the whole worker. The host's remaining 5 GB stays available to the
-    # OS, Redis, and Gunicorn. The CPU ceiling is deliberately generous enough
-    # for alignments containing several hundred sequences, while the job's
-    # wall-clock timeout still bounds a stalled process.
-    # Set either to 0 to disable that limit.
+    # OS, Redis, and Gunicorn. Generic CPU limiting is disabled by default:
+    # RLIMIT_CPU accumulates across threads, so a fixed value can expire before
+    # the advertised wall-clock allowance for a multithreaded tool. RAxML
+    # explicitly supplies a thread-scaled CPU allowance. Set either resource
+    # value to 0 to disable that limit.
     SUBPROCESS_MEMORY_LIMIT_MB = int(os.environ.get('SUBPROCESS_MEMORY_LIMIT_MB', '9216'))
-    SUBPROCESS_CPU_LIMIT_SECONDS = int(os.environ.get('SUBPROCESS_CPU_LIMIT_SECONDS', '43200'))
+    SUBPROCESS_CPU_LIMIT_SECONDS = int(os.environ.get('SUBPROCESS_CPU_LIMIT_SECONDS', '0'))
 
     # Ordinary jobs previously had a one-hour RQ deadline. That was too short
     # for legitimate large MUSCLE/MAFFT alignments even though the host still
@@ -76,7 +90,7 @@ class Config:
     # honoured in three places or the shortest one still wins:
     #   1. the RQ job_timeout   (app/workers/queue.py)
     #   2. the subprocess wait  (_run_raxml)
-    #   3. RLIMIT_CPU           (_run_raxml, scaled by thread count)
+    #   3. RLIMIT_CPU via prlimit (_run_raxml, scaled by thread count)
     RAXML_TIME_LIMIT_HOURS = float(os.environ.get('RAXML_TIME_LIMIT_HOURS', '15'))
 
 
@@ -108,6 +122,16 @@ class Config:
     DOSAGE_DB_PATH = Path(os.environ.get('DOSAGE_DB_PATH') or BASE_DIR / 'instance' / 'dosage_calculator.sqlite')
     
     # Database
+    #
+    # Alan 8/14/26 - The SQLite fallback below is a footgun on the live host: a
+    # maintenance script run without DATABASE_URL in its environment silently
+    # connects to a stale local app.db instead of production Postgres, and every
+    # query returns a plausible-looking empty result rather than an error. That
+    # cost real debugging time (a job lookup returned None because the shell had
+    # no DATABASE_URL, not because the job was missing). create_app() now refuses
+    # to boot on the fallback unless it is explicitly opted into.
+    DATABASE_URL_IS_EXPLICIT = bool(os.environ.get('DATABASE_URL'))
+    ALLOW_SQLITE_FALLBACK = os.environ.get('ALLOW_SQLITE_FALLBACK', '') in ('1', 'true', 'True', 'yes')
     SQLALCHEMY_DATABASE_URI = os.environ.get('DATABASE_URL') or 'sqlite:///' + str(BASE_DIR / 'app.db')
     SQLALCHEMY_TRACK_MODIFICATIONS = False
     # Validate pooled connections on checkout (cheap SELECT 1) and recycle
@@ -142,12 +166,34 @@ class Config:
     # ITS1/ITS2 and produced fewer well-supported nodes than no trimming at all.
     DEFAULT_TRIMMING_METHOD = os.environ.get("DEFAULT_TRIMMING_METHOD", "trimal_gappy")
 
+    # WARNING-and-above mirror of error.log. error.log stays as-is (nothing is
+    # removed); this is the low-noise view for "what is actually broken", since
+    # error.log runs ~98% INFO and buries real failures.
+    ERROR_LOG_PATH = Path(os.environ.get('ERROR_LOG_PATH') or BASE_DIR / 'var' / 'logs' / 'errors.log')
+    RELEASE_VERSION = _release_version(BASE_DIR)
+
+    # Trust one proxy hop (nginx on this host) for X-Forwarded-For/-Proto/-Host, so
+    # request.remote_addr is the real client rather than 127.0.0.1. Rate limiting is
+    # keyed on it. Set to 0 only if the app is ever exposed without nginx in front.
+    TRUST_PROXY_HEADERS = os.environ.get("TRUST_PROXY_HEADERS", "1") not in ("0", "false", "False")
+
     # SSE (/api/job/<id>/events) safety limits. Gunicorn runs a fixed
     # workers x threads pool, so any stream that outlives its client holds a
     # request slot. These caps bound that: the client's EventSource reconnects
     # automatically and receives a fresh snapshot, so a live viewer sees no
     # interruption while an orphaned stream cannot pin a thread forever.
-    SSE_MAX_STREAM_SECONDS = int(os.environ.get("SSE_MAX_STREAM_SECONDS", "1800"))
+    #
+    # Alan 8/14/26 - Raised from 30 minutes to 6 hours. The old cap punished long
+    # jobs for being long: a RAxML "publication" run streaming normal progress was
+    # cut every 30 minutes purely because of its age. Slot protection now comes from
+    # SSE_MAX_IDLE_SECONDS below (which targets streams that are actually doing
+    # nothing) plus a per-IP limit_conn in nginx, so this is only a final ceiling.
+    SSE_MAX_STREAM_SECONDS = int(os.environ.get("SSE_MAX_STREAM_SECONDS", "21600"))
+    # Close a stream that has seen no event, progress, or status change for this
+    # long while its job is still non-terminal. That is the orphaned-viewer and
+    # stuck-job case -- an actively progressing job keeps resetting this, so it
+    # streams for as long as it genuinely runs.
+    SSE_MAX_IDLE_SECONDS = int(os.environ.get("SSE_MAX_IDLE_SECONDS", "1800"))
     # How long to hold a stream open for a job that was already finished when the
     # client connected (catches events still settling), before closing.
     SSE_TERMINAL_LINGER_SECONDS = int(

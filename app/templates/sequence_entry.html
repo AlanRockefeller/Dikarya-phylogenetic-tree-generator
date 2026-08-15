@@ -1591,6 +1591,38 @@
 {% block scripts %}
 <script>
     // =========================================================================
+    // Workflow failure telemetry
+    //
+    // Alan 8/15/26 - The import and submit workflows swallowed every failure into
+    // a showStatus() toast, so a browser-side bug (a parse error, a DOM change, a
+    // renamed field) was invisible unless a user described it. These three
+    // helpers feed the shared telemetry layer in base_modern.html.
+    //
+    // The rule: a 4xx is the server deliberately answering "no" and is already
+    // shown to the user, so it is never reported. Unexpected 5xx are reported by
+    // the shared fetch wrapper. What is added here is the client-side half.
+    // Actions are fixed identifiers -- never sequence names or user text.
+    // =========================================================================
+    function httpError(response, message) {
+        const error = new Error(message);
+        error.httpStatus = Number(response?.status) || 0;
+        return error;
+    }
+
+    function expectedError(message) {
+        const error = new Error(message);
+        error.expected = true;   // remote-service outcome, recorded server-side
+        return error;
+    }
+
+    function reportWorkflowFailure(action, error) {
+        if (!error || error.expected || error.name === 'AbortError') return;
+        const status = Number(error.httpStatus) || 0;
+        if (status >= 400 && status < 500) return;
+        window.reportClientError?.(action, error);
+    }
+
+    // =========================================================================
     // Sequence Queue State
     // =========================================================================
     let sequenceQueue = [];
@@ -1964,7 +1996,7 @@
 
             const data = await resp.json();
             if (!resp.ok) {
-                throw new Error(data.error || 'GenBank location lookup failed');
+                throw httpError(resp, data.error || 'GenBank location lookup failed');
             }
             Object.assign(locations, data.locations || {});
         }
@@ -2004,6 +2036,7 @@
         try {
             locations = await fetchGenBankLocations(accessions);
         } catch (e) {
+            reportWorkflowFailure('tree_builder.genbank_locations', e);
             return ` Location lookup failed: ${e.message}`;
         }
 
@@ -2149,7 +2182,7 @@
             const data = await resp.json();
 
             if (!resp.ok) {
-                throw new Error(data.error || 'BLAST failed');
+                throw httpError(resp, data.error || 'BLAST failed');
             }
 
             const added = addSequences(data.sequences);
@@ -2165,6 +2198,7 @@
             updateBlastButtonState();
 
         } catch (e) {
+            reportWorkflowFailure('tree_builder.blast', e);
             showStatus('BLAST error: ' + e.message, 'error');
         }
 
@@ -2264,7 +2298,7 @@
 
             const data = await resp.json();
             if (!resp.ok) {
-                throw new Error(data.error || 'GenBank lookup failed');
+                throw httpError(resp, data.error || 'GenBank lookup failed');
             }
 
             const fetched = data.sequences || [];
@@ -2282,6 +2316,7 @@
 
             sequenceTextInput.value = '';
         } catch (e) {
+            reportWorkflowFailure('tree_builder.genbank_lookup', e);
             showStatus('GenBank lookup error: ' + e.message, 'error');
         }
 
@@ -2451,6 +2486,58 @@
         return /r\d+/.test(trimmed);
     }
 
+    // Alan 8/14/26 - MycoMap sequence record pages (a single sequence, not a BLAST
+    // search) were rejected as invalid input even though they are a natural handle
+    // for "put this sequence in my tree". Recognize them and import the one sequence.
+    function isMycomapSequenceUrl(url) {
+        if (!url) return false;
+        const trimmed = url.trim();
+        if (!/^https?:\/\/(www\.)?mycomap\.com\//i.test(trimmed)) return false;
+        let path = '';
+        try {
+            path = new URL(trimmed).pathname;
+        } catch (err) {
+            return false;
+        }
+        if (!/\/genetics\/sequences(\/|$)/i.test(path)) return false;
+        return /(?:^|[^a-zA-Z0-9])r\d+(?:[^0-9]|$)/.test(path);
+    }
+
+    // Alan 8/14/26 - Import a single sequence from a MycoMap sequence record URL.
+    async function doFetchMycomapSequence(url) {
+        showStatus('Fetching sequence from MycoMap...', 'info');
+        try {
+            const csrfToken = document.querySelector('meta[name="csrf-token"]').getAttribute('content');
+            const resp = await fetch('/api/mycomap/sequence', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                    'X-CSRFToken': csrfToken
+                },
+                body: JSON.stringify({ url: url })
+            });
+            const data = await resp.json();
+            if (!resp.ok) {
+                throw httpError(resp, data.error || 'Failed to fetch the MycoMap sequence');
+            }
+
+            const removeDuplicates = mycomapDedupCheckbox.checked;
+            const added = addSequences(data.sequences, removeDuplicates);
+            if (added > 0) {
+                showStatus(`${data.message}. Added to queue.`, 'success');
+            } else {
+                showStatus(`${data.message}, but it is already in the queue.`, 'info');
+            }
+            mycomapUrlInput.value = '';
+            checkMycomapState();
+            return true;
+        } catch (e) {
+            reportWorkflowFailure('tree_builder.mycomap_fetch', e);
+            showStatus(e.message || 'Failed to fetch the MycoMap sequence', 'error');
+            return false;
+        }
+    }
+
     // Alan 6/18/26 - Report sanitized client-side Mycomap URL rejections so support can diagnose inputs that never reach /api/mycomap.
     function getMycomapUrlDiagnostics(url) {
         const trimmed = (url || '').trim();
@@ -2517,10 +2604,16 @@
             return false;
         }
 
+        // Alan 8/14/26 - A sequence record page is a valid thing to paste here; import
+        // that single sequence instead of telling the user their URL is invalid.
+        if (isMycomapSequenceUrl(url)) {
+            return await doFetchMycomapSequence(url);
+        }
+
         if (!isValidMycomapUrl(url)) {
             logMycomapUrlRejection(url);
             if (url.includes('mycomap.com')) {
-                showStatus('Invalid Mycomap URL. Please use the URL from the BLAST Search page (starts with https://mycomap.com/genetics/blast-search).', 'error');
+                showStatus('Invalid Mycomap URL. Please use the URL from the BLAST Search page (starts with https://mycomap.com/genetics/blast-search), or a sequence record page from https://mycomap.com/genetics/sequences/.', 'error');
             } else {
                 showStatus('Invalid Mycomap URL. URL must be from mycomap.com and contain a result ID.', 'error');
             }
@@ -2555,7 +2648,7 @@
             const data = await resp.json();
 
             if (!resp.ok) {
-                throw new Error(data.error || 'Failed to fetch from Mycomap');
+                throw httpError(resp, data.error || 'Failed to fetch from Mycomap');
             }
 
             const fetched = data.sequences.length;
@@ -2580,6 +2673,7 @@
             return true;
 
         } catch (e) {
+            reportWorkflowFailure('tree_builder.mycomap_import', e);
             showStatus('Mycomap error: ' + e.message, 'error');
             return false;
         }
@@ -2647,13 +2741,14 @@
             const data = await resp.json();
 
             if (!resp.ok) {
-                throw new Error(data.message || data.error || 'Server error');
+                throw httpError(resp, data.message || data.error || 'Server error');
             }
 
             showStatus('Job submitted! Redirecting...', 'success');
             window.location.href = '/job/' + data.job_id;
 
         } catch (e) {
+            reportWorkflowFailure('tree_builder.mycomap_quick_tree', e);
             showStatus('Submission failed: ' + e.message, 'error');
             mycomapQuickTreeBtn.disabled = false;
             fetchMycomapBtn.disabled = false;
@@ -2917,7 +3012,7 @@
             const data = await resp.json();
             if (requestId !== inaturalistTreePreviewRequestId) return null;
             if (!resp.ok) {
-                throw new Error(data.error || data.message || 'Preview failed');
+                throw httpError(resp, data.error || data.message || 'Preview failed');
             }
             currentInaturalistTreePreview = data;
             currentInaturalistTreePreviewInput = input;
@@ -2937,6 +3032,7 @@
         } catch (e) {
             currentInaturalistTreePreview = null;
             currentInaturalistTreePreviewInput = '';
+            reportWorkflowFailure('tree_builder.inaturalist_preview', e);
             setInaturalistTreePreviewMessage(e.message, 'error');
             setInaturalistExistingTreeLink('');
             return null;
@@ -3020,7 +3116,7 @@
             const data = await resp.json();
 
             if (!resp.ok) {
-                throw new Error(data.error || 'Failed to fetch from iNaturalist');
+                throw httpError(resp, data.error || 'Failed to fetch from iNaturalist');
             }
 
             currentInaturalistResult = data;
@@ -3124,6 +3220,7 @@
             }
 
         } catch (e) {
+            reportWorkflowFailure('tree_builder.inaturalist_import', e);
             showStatus('iNaturalist error: ' + e.message, 'error');
             resetInaturalistUI();
         }
@@ -3158,7 +3255,7 @@
             const data = await resp.json();
 
             if (!resp.ok) {
-                throw new Error(data.error || 'BLAST failed');
+                throw httpError(resp, data.error || 'BLAST failed');
             }
 
             const added = addSequences(data.sequences);
@@ -3172,6 +3269,7 @@
             resetInaturalistUI();
 
         } catch (e) {
+            reportWorkflowFailure('tree_builder.inaturalist_blast', e);
             showStatus('NCBI BLAST error: ' + e.message, 'error');
         }
 
@@ -3223,7 +3321,7 @@
                 });
                 const startData = await startResp.json();
                 if (!startResp.ok) {
-                    throw new Error(startData.error || 'Failed to start Mycomap BLAST refresh');
+                    throw httpError(startResp, startData.error || 'Failed to start Mycomap BLAST refresh');
                 }
 
                 const jobId = startData.job_id;
@@ -3240,7 +3338,7 @@
                         break;
                     }
                     if (statusData.status === 'failed' || statusData.status === 'error') {
-                        throw new Error(statusData.error || 'Mycomap BLAST refresh failed');
+                        throw expectedError(statusData.error || 'Mycomap BLAST refresh failed');
                     }
                     if (rebuildNcbi) {
                         showStatus('Still waiting on the Mycomap NCBI BLAST rebuild (about 10 minutes total)...', 'info');
@@ -3248,10 +3346,10 @@
                 }
 
                 if (!result) {
-                    throw new Error('Mycomap BLAST refresh is taking longer than expected. Try again in a few minutes.');
+                    throw expectedError('Mycomap BLAST refresh is taking longer than expected. Try again in a few minutes.');
                 }
                 if (result.status === 'error') {
-                    throw new Error(result.error || 'Mycomap BLAST refresh failed');
+                    throw expectedError(result.error || 'Mycomap BLAST refresh failed');
                 }
 
                 const added = addSequences(result.sequences);
@@ -3302,7 +3400,7 @@
             const data = await resp.json();
 
             if (!resp.ok) {
-                throw new Error(data.error || 'Failed to fetch sequences');
+                throw httpError(resp, data.error || 'Failed to fetch sequences');
             }
 
             const added = addSequences(data.sequences);
@@ -3313,6 +3411,7 @@
             resetInaturalistUI();
 
         } catch (e) {
+            reportWorkflowFailure('tree_builder.inaturalist_add', e);
             showStatus('iNaturalist error: ' + e.message, 'error');
         }
 
@@ -3673,7 +3772,7 @@
                 body: JSON.stringify({observation: input, action: 'analyze'})
             });
             const data = await response.json();
-            if (!response.ok) throw new Error(data.error || 'Mushroom Observer request failed');
+            if (!response.ok) throw httpError(response, data.error || 'Mushroom Observer request failed');
             currentMushroomObserverResult = data;
             currentMushroomObserverInput = input;
             renderMushroomObserverResult(data);
@@ -3681,6 +3780,7 @@
             showStatus(data.message || 'Mushroom Observer observation loaded.', data.dna_count ? 'success' : 'info');
         } catch (error) {
             resetMushroomObserverUI();
+            reportWorkflowFailure('tree_builder.mushroom_observer_fetch', error);
             showStatus('Mushroom Observer error: ' + error.message, 'error');
         } finally {
             fetchMushroomObserverBtn.disabled = false;
@@ -3706,11 +3806,12 @@
                 body: JSON.stringify({query: selected.sequence})
             });
             const data = await response.json();
-            if (!response.ok) throw new Error(data.error || 'BLAST failed');
+            if (!response.ok) throw httpError(response, data.error || 'BLAST failed');
             const added = addSequences(data.sequences || []);
             lastBlastQuery = 'Mushroom Observer';
             showStatus(`BLAST complete! Added ${added} new sequences to queue.`, 'success');
         } catch (error) {
+            reportWorkflowFailure('tree_builder.mushroom_observer_blast', error);
             showStatus('BLAST error: ' + error.message, 'error');
         } finally {
             mushroomObserverBlastBtn.disabled = false;
@@ -3739,10 +3840,11 @@
                 })
             });
             const data = await response.json();
-            if (!response.ok) throw new Error(data.error || 'Unable to fetch the selected sequence');
+            if (!response.ok) throw httpError(response, data.error || 'Unable to fetch the selected sequence');
             const added = addSequences(data.sequences || []);
             showStatus(`${data.message} Added ${added} new sequence to the queue.`, 'success');
         } catch (error) {
+            reportWorkflowFailure('tree_builder.mushroom_observer_add', error);
             showStatus('Mushroom Observer error: ' + error.message, 'error');
         } finally {
             mushroomObserverAddBtn.disabled = false;
@@ -3774,10 +3876,11 @@
                 })
             });
             const data = await response.json();
-            if (!response.ok) throw new Error(data.error || data.message || 'Unable to queue tree');
+            if (!response.ok) throw httpError(response, data.error || data.message || 'Unable to queue tree');
             showStatus(data.message || 'Mushroom Observer tree queued.', 'success');
             window.location.href = data.tree_status_url || ('/job/' + data.job_id);
         } catch (error) {
+            reportWorkflowFailure('tree_builder.mushroom_observer_tree', error);
             showStatus('Mushroom Observer tree error: ' + error.message, 'error');
             mushroomObserverTreeBtn.disabled = false;
             mushroomObserverTreeBtn.innerHTML = originalHtml;
@@ -3855,13 +3958,14 @@
             const data = await resp.json();
 
             if (!resp.ok) {
-                throw new Error(data.message || data.error || 'Server error');
+                throw httpError(resp, data.message || data.error || 'Server error');
             }
 
             showStatus('Job submitted successfully! Redirecting...', 'success');
             window.location.href = '/job/' + data.job_id;
 
         } catch (e) {
+            reportWorkflowFailure('tree_builder.submit_quick_tree', e);
             showStatus('Submission Failed: ' + e.message, 'error');
             btn.disabled = false;
             btn.innerHTML = '▶ Run Quick Tree';
@@ -4302,13 +4406,14 @@
             const data = await resp.json();
 
             if (!resp.ok) {
-                throw new Error(data.message || data.error || 'Server error');
+                throw httpError(resp, data.message || data.error || 'Server error');
             }
 
             showStatus('Job submitted successfully! Redirecting...', 'success');
             window.location.href = '/job/' + data.job_id;
 
         } catch (e) {
+            reportWorkflowFailure('tree_builder.submit_job', e);
             showStatus('Submission Failed: ' + e.message, 'error');
             btn.disabled = false;
             btn.innerHTML = '<i class="fas fa-play mr-2"></i> Start Analysis';
@@ -4702,7 +4807,7 @@
                     });
 
                     const addData = await addResp.json();
-                    if (!addResp.ok) throw new Error(addData.error || 'Failed to add sequences');
+                    if (!addResp.ok) throw httpError(addResp, addData.error || 'Failed to add sequences');
 
                     const savedMessage = addData.message || `Saved ${addData.count} queued sequences.`;
                     showStatus(`${savedMessage} Starting recompute...`, 'success');
@@ -4723,7 +4828,7 @@
                         body: JSON.stringify(recomputeBody)
                     });
                     const recompData = await recomputeResp.json();
-                    if (!recomputeResp.ok) throw new Error(recompData.error || 'Failed to trigger recompute');
+                    if (!recomputeResp.ok) throw httpError(recomputeResp, recompData.error || 'Failed to trigger recompute');
 
                     showStatus('Recompute started. Opening job status...', 'success');
 
@@ -4731,6 +4836,7 @@
                     window.location.href = recompData.redirect_url || `/job/${EDIT_JOB_ID}`;
 
                 } catch (e) {
+                    reportWorkflowFailure('tree_builder.add_and_recompute', e);
                     showStatus('Error: ' + e.message, 'error');
                     btn.disabled = false;
                     btn.innerHTML = '<i class="fas fa-sync mr-2"></i> Add & Recompute';

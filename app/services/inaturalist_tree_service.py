@@ -23,6 +23,7 @@ from datetime import datetime, timezone
 from typing import Any, Dict, Iterator, List, Optional, Tuple
 
 from flask import current_app
+from app.services.log_context import background_job_context
 
 logger = logging.getLogger(__name__)
 
@@ -1597,7 +1598,7 @@ def _append_fasta_to_job_input(job_dir, fasta_text: str) -> int:
 def _schedule_ncbi_recheck(job_id: str, *, hours: int = 1) -> None:
     """Schedule one delayed re-check of MycoMap NCBI results for a job."""
     from datetime import timedelta
-    from app.workers.queue import get_queue
+    from app.workers.queue import get_queue, safe_job_description
 
     q = get_queue("phylo_bulk")
     q.enqueue_in(
@@ -1605,6 +1606,8 @@ def _schedule_ncbi_recheck(job_id: str, *, hours: int = 1) -> None:
         reconcile_delayed_ncbi_results,
         job_id,
         job_timeout="10m",
+        # Without this RQ renders the raw call string into worker.log.
+        description=safe_job_description("delayed ncbi reconcile", job_id=job_id),
     )
 
 
@@ -1618,6 +1621,7 @@ def schedule_initial_ncbi_recheck(job_id: str) -> None:
     _schedule_ncbi_recheck(job_id, hours=1)
 
 
+@background_job_context(0, pipeline_log=True)
 def reconcile_delayed_ncbi_results(job_id: str) -> Dict[str, Any]:
     """
     Background (RQ-scheduled) re-check for a job that fell back to local-only
@@ -1647,6 +1651,11 @@ def reconcile_delayed_ncbi_results(job_id: str) -> Dict[str, Any]:
         db_job = Job.query.get(job_id)
         if not db_job:
             return {"status": "job_not_found"}
+        from app.services.log_context import bind_background_context
+        bind_background_context(user=(
+            getattr(getattr(db_job, "user", None), "email", None)
+            or (f"id:{db_job.user_id}" if db_job.user_id else "anon")
+        ))
 
         metrics = dict(db_job.metrics or {})
         rerun_details = dict(metrics.get("mycomap_blast_rerun") or {})
@@ -1689,6 +1698,49 @@ def reconcile_delayed_ncbi_results(job_id: str) -> Dict[str, Any]:
         # NCBI results are in -- fetch and append them, then rebuild.
         fetch_result = fetch_mycomap_fasta(blast_id, include_ncbi=True, include_local=False)
         fasta_text = fetch_result.get("fasta_content") or ""
+
+        # Alan 8/14/26 - A failed fetch is not an answer. This used to record
+        # ncbi_status="available" unconditionally, so one transient MycoMap 500 marked
+        # the job as having NCBI results it never received and cancelled all further
+        # rechecks -- the sequences were then never picked up. Leave the status alone
+        # and reschedule so the next pass can try again.
+        if fetch_result.get("failed_sources"):
+            errors = "; ".join(fetch_result.get("errors") or []) or "unknown error"
+            # Bounded by the same budget as the "still waiting" path, so a persistently
+            # broken endpoint gives up instead of rescheduling forever.
+            max_hours = get_mycomap_ncbi_recheck_max_hours()
+            if recheck_count >= max_hours:
+                rerun_details["ncbi_status"] = "gave_up"
+                rerun_details["ncbi_fallback_local_only"] = False
+                metrics["mycomap_blast_rerun"] = rerun_details
+                metrics["mycomap_refresh_warnings"] = list(
+                    metrics.get("mycomap_refresh_warnings") or []
+                ) + [
+                    "MycoMap NCBI results were ready but could not be downloaded after "
+                    f"{max_hours} attempts ({errors}); tree remains local-only."
+                ]
+                db_job.metrics = metrics
+                db.session.commit()
+                logger.warning(
+                    "Giving up on MycoMap NCBI fetch for job %s (blast %s) after %s "
+                    "attempts: %s", job_id, blast_id, recheck_count, errors,
+                )
+                return {"status": "gave_up", "error": errors}
+
+            from app.services.log_context import log_degradation
+            log_degradation(
+                logger,
+                "mycomap_ncbi_recheck_failed",
+                f"NCBI results are ready but could not be downloaded ({errors}); "
+                "leaving the job local-only and rescheduling the recheck",
+                job=job_id, blast_id=blast_id, attempt=recheck_count,
+            )
+            metrics["mycomap_blast_rerun"] = rerun_details
+            db_job.metrics = metrics
+            db.session.commit()
+            _schedule_ncbi_recheck(job_id, hours=1)
+            return {"status": "fetch_failed", "error": errors}
+
         added_count = 0
         if fasta_text.strip():
             added_count = _append_fasta_to_job_input(Config.JOB_DIR / job_id, fasta_text)
@@ -1837,7 +1889,9 @@ def prepare_inat_tree_job(observation_id: int, *, include_ncbi: bool = True,
         body, status = err
         raise InatTreeError(
             body.get('error', 'Failed to fetch MycoMap sequences.'),
-            status=status if status in (400, 422, 502) else 502,
+            # 404 = MycoMap has no such BLAST result. Passing it through keeps the
+            # status honest; collapsing it to 502 reads as "our gateway is broken".
+            status=status if status in (400, 404, 422, 502) else 502,
         )
     sequences = (payload or {}).get('sequences') or []
     if len(sequences) < 2:

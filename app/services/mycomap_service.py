@@ -25,6 +25,20 @@ logger = logging.getLogger(__name__)
 # Timeout for network requests in seconds
 REQUEST_TIMEOUT = 10
 
+# FASTA fetches are retried on transient upstream faults (5xx, timeouts, connection
+# errors). Three attempts with 2s then 4s of backoff stays well inside the job's
+# budget while riding out the brief MycoMap 500s seen in production.
+FASTA_FETCH_ATTEMPTS = 3
+FASTA_FETCH_RETRY_BASE_SECONDS = 2
+
+# Alan 8/15/26 - That full retry budget is only affordable in a worker. A request
+# handler fetches both endpoints, so the unbounded worst case is
+# 2 x (3 x REQUEST_TIMEOUT + 6s backoff) = 72s spent holding one of only 8
+# Gunicorn slots -- long enough to be killed by the worker timeout, so the user
+# pays the whole wait and still gets nothing. Interactive callers pass this as a
+# deadline covering all of their fetches; retries stop once it is spent.
+INTERACTIVE_FETCH_BUDGET_SECONDS = 25
+
 # Mycomap API base URL
 MYCOMAP_BASE_URL = "https://mycomap.com/index.php"
 MYCOMAP_API_BASE_URL = "https://mycomap.com/api/mycomap"
@@ -1326,14 +1340,223 @@ def validate_mycomap_url(url: str) -> Optional[str]:
     # Extract the r<digits> pattern from path or query
     # Use word boundary to avoid matching middle of other tokens
     search_text = parsed.path + '?' + (parsed.query or '')
-    match = re.search(r'(?:^|[^a-zA-Z0-9])r(\d+)', search_text)
-    if not match:
-        logger.warning(f"URL validation failed: no r<digits> pattern found in: {url}")
-        return None
-    
-    blast_id = match.group(1)
-    logger.info(f"Validated Mycomap URL, extracted blast_id: {blast_id}")
+
+    # Alan 8/15/26 - Prefer r<digits> standing alone as a whole path segment or
+    # query value, which is what a real BLAST URL looks like
+    # (https://mycomap.com/genetics/blast-search/r590124/), and take the last such
+    # match rather than the first.
+    #
+    # The old pattern was the loose scan below with no trailing boundary, so the
+    # first r-followed-by-digits anywhere in the URL won -- including inside a
+    # longer slug. On 2026-08-14 that turned a pasted URL into blast_id "025" and
+    # a user retried four times, each attempt fetching a nonexistent record and
+    # getting a 502; the real IDs that day were all six digits. ID length is not a
+    # usable check (tests and older records use short IDs like r42), so anchor on
+    # the delimiter instead.
+    segment_matches = re.findall(r'(?:^|[/?&=])r(\d+)(?=$|[/?&#])', search_text)
+    if segment_matches:
+        blast_id = segment_matches[-1]
+    else:
+        # Fall back to the loose scan for hand-edited or unusual URLs, but require
+        # the digits to end the token so "r025abc" is not read as 025.
+        match = re.search(r'(?:^|[^a-zA-Z0-9])r(\d+)(?![a-zA-Z0-9])', search_text)
+        if not match:
+            logger.warning(f"URL validation failed: no r<digits> pattern found in: {url}")
+            return None
+        blast_id = match.group(1)
+        logger.info(
+            "Mycomap URL had no standalone r<digits> segment; using loose match "
+            "blast_id=%s from: %s", blast_id, url,
+        )
+
+    # Alan 8/14/26 - DEBUG, not INFO. This fires several times per user action and
+    # was 37% of every line in error.log (97 of 267), burying real errors. The
+    # blast_id is still recoverable from the surrounding "Mycomap helper"/fetch
+    # lines, which log once per operation rather than once per validation call.
+    logger.debug("Validated Mycomap URL, extracted blast_id: %s", blast_id)
     return blast_id
+
+
+# Alan 8/14/26 - MycoMap sequence record pages, e.g.
+# https://mycomap.com/genetics/sequences/ont_sequences/f05-bc26-...-ric100-r763916/
+# These are a different thing from BLAST result pages: they identify one sequence
+# record rather than a search. They used to be rejected outright by the Tree Builder
+# ("bad_prefix"), which is confusing because the URL is a perfectly good handle for a
+# sequence a user wants in their tree.
+_MYCOMAP_SEQUENCE_PATH_RE = re.compile(r'/genetics/sequences(?:/|$)', re.IGNORECASE)
+_MYCOMAP_RECORD_ID_RE = re.compile(r'(?:^|[^a-zA-Z0-9])r(\d+)(?:[^0-9]|$)')
+
+# A DNA payload found in an arbitrary JSON field: mostly IUPAC nucleotide codes and
+# long enough not to be an accession, primer name, or status string.
+_DNA_LIKE_RE = re.compile(r'^[ACGTURYKMSWBDHVN\-\.\s]+$', re.IGNORECASE)
+MYCOMAP_MIN_SEQUENCE_LENGTH = 50
+
+
+def validate_mycomap_sequence_url(url: str) -> Optional[str]:
+    """Validate a MycoMap sequence record URL and extract its numeric record ID.
+
+    Applies the same strict hostname/scheme checks as validate_mycomap_url -- the
+    hostname must be exactly mycomap.com, so lookalikes such as
+    https://mycomap.com.evil.com/... and https://evil.com/?q=mycomap.com/r1 are
+    rejected. Returns None for anything that is not a sequence record URL,
+    including BLAST result URLs, so callers can tell the two apart.
+    """
+    if not url:
+        return None
+
+    try:
+        parsed = urllib.parse.urlparse(url.strip())
+    except Exception:
+        logger.warning("Sequence URL validation failed: could not parse URL")
+        return None
+
+    hostname = (parsed.hostname or '').lower()
+    if hostname not in ('mycomap.com', 'www.mycomap.com'):
+        logger.warning(
+            "Sequence URL validation failed: invalid hostname %r (expected mycomap.com)",
+            hostname,
+        )
+        return None
+
+    if parsed.scheme not in ('http', 'https'):
+        logger.warning(
+            "Sequence URL validation failed: invalid scheme %r (expected http/https)",
+            parsed.scheme,
+        )
+        return None
+
+    if not _MYCOMAP_SEQUENCE_PATH_RE.search(parsed.path or ''):
+        return None
+
+    # The record ID is the r<digits> token, conventionally last in the slug. Take the
+    # last match so a slug that happens to contain an earlier r<digits> (a RiC number,
+    # a run label) cannot win over the actual record ID.
+    matches = _MYCOMAP_RECORD_ID_RE.findall(parsed.path + '?' + (parsed.query or ''))
+    if not matches:
+        logger.warning("Sequence URL validation failed: no r<digits> record ID in path")
+        return None
+
+    sequence_id = matches[-1]
+    logger.debug("Validated MycoMap sequence URL, extracted sequence_id: %s", sequence_id)
+    return sequence_id
+
+
+def _looks_like_dna(value) -> bool:
+    """True when a JSON value looks like a usable nucleotide sequence."""
+    if not isinstance(value, str):
+        return False
+    compact = ''.join(value.split())
+    if len(compact) < MYCOMAP_MIN_SEQUENCE_LENGTH:
+        return False
+    if not _DNA_LIKE_RE.match(compact):
+        return False
+    # Guard against long runs of a single ambiguity code (e.g. a padded field).
+    bases = sum(compact.upper().count(base) for base in 'ACGTU')
+    return bases >= len(compact) * 0.5
+
+
+def _find_dna_in_payload(payload, _depth: int = 0):
+    """Recursively locate the nucleotide sequence in a MycoMap record payload.
+
+    The sequences API response shape is not pinned down in our copy of the MycoMap
+    docs, and the field has been named differently across MycoMap versions, so match
+    on the value rather than on a guessed key. Preferred key names are tried first so
+    a record carrying several DNA-ish fields resolves predictably.
+    """
+    if _depth > 6:
+        return None
+
+    if isinstance(payload, dict):
+        for key in ('sequence', 'sequence_data', 'nucleotides', 'dna', 'seq', 'fasta'):
+            value = payload.get(key)
+            if _looks_like_dna(value):
+                return value
+        for value in payload.values():
+            found = _find_dna_in_payload(value, _depth + 1)
+            if found:
+                return found
+        return None
+
+    if isinstance(payload, list):
+        for item in payload:
+            found = _find_dna_in_payload(item, _depth + 1)
+            if found:
+                return found
+        return None
+
+    return payload if _looks_like_dna(payload) else None
+
+
+def _first_str(record: dict, keys) -> str:
+    """Return the first non-empty string value among keys."""
+    for key in keys:
+        value = record.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return ''
+
+
+def fetch_mycomap_sequence(sequence_id: str) -> dict:
+    """Fetch a single MycoMap sequence record by its numeric record ID.
+
+    Returns a dict with 'sequence' (nucleotides), 'name' (a display label),
+    'species', 'location', 'record_url', and 'errors'.
+    """
+    result = {
+        'sequence_id': sequence_id,
+        'sequence': '',
+        'name': '',
+        'species': '',
+        'location': '',
+        'record_url': '',
+        'errors': [],
+    }
+
+    if not str(sequence_id).isdigit():
+        result['errors'].append("Invalid MycoMap sequence ID.")
+        return result
+
+    try:
+        payload = _mycomap_refresh_request(f"sequences/{sequence_id}")
+    except MycoMapRefreshError as exc:
+        result['errors'].append(str(exc))
+        return result
+
+    rows = _mycomap_result_rows(payload)
+    record = rows[0] if rows else {}
+    if not isinstance(record, dict):
+        record = {}
+
+    sequence = _find_dna_in_payload(payload)
+    if not sequence:
+        result['errors'].append(
+            f"MycoMap sequence {sequence_id} does not have a DNA sequence attached."
+        )
+        return result
+
+    result['sequence'] = ''.join(str(sequence).split()).upper()
+    result['species'] = _first_str(record, ('scientificName', 'species', 'species_name', 'taxon'))
+    result['location'] = _first_str(record, ('location', 'locality', 'place'))
+    result['record_url'] = _first_str(record, ('url', 'record_url', 'permalink', 'link'))
+
+    title = _first_str(record, ('title', 'name', 'label'))
+    # Build a tip label in the same spirit as the BLAST importer: identity first,
+    # then whatever context is available, so it stays readable on a tree.
+    parts = [part for part in (title or f"MycoMap{sequence_id}", result['species'], result['location']) if part]
+    seen = set()
+    deduped = []
+    for part in parts:
+        if part.lower() in seen:
+            continue
+        seen.add(part.lower())
+        deduped.append(part)
+    result['name'] = ' '.join(deduped)
+
+    logger.info(
+        "Fetched MycoMap sequence %s: %s bp, name=%r",
+        sequence_id, len(result['sequence']), result['name'],
+    )
+    return result
 
 
 _NCBI_QUEUE_POSITION_RE = re.compile(
@@ -1382,14 +1605,19 @@ def _count_fasta_sequences(fasta_bytes: bytes) -> int:
     return sum(1 for line in fasta_bytes.splitlines() if line.startswith(b'>'))
 
 
-def _fetch_fasta(blast_id: str, endpoint: str) -> Tuple[bytes, Optional[str]]:
+def _fetch_fasta(
+    blast_id: str, endpoint: str, deadline: Optional[float] = None
+) -> Tuple[bytes, Optional[str]]:
     """
     Fetch FASTA content from Mycomap.
-    
+
     Args:
         blast_id: The blast ID to fetch
         endpoint: Either 'fasta' (NCBI) or 'localFasta' (local/MycoBLAST)
-        
+        deadline: Optional time.monotonic() value past which no further attempt
+            is started and per-attempt timeouts are shortened to fit. None means
+            the full retry budget, which is only appropriate off the request path.
+
     Returns:
         Tuple of (fasta_bytes, error_message). If error, fasta_bytes will be empty.
     """
@@ -1421,37 +1649,83 @@ def _fetch_fasta(blast_id: str, endpoint: str) -> Tuple[bytes, Optional[str]]:
         },
     )
     
-    try:
-        with urllib.request.urlopen(request, timeout=REQUEST_TIMEOUT) as resp:
-            content = resp.read()
-        return content, None
-    except urllib.error.URLError as e:
-        error_msg = f"Network error fetching {endpoint}: {e}"
-        logger.error(error_msg)
-        return b'', error_msg
-    except TimeoutError:
-        error_msg = f"Request timed out after {REQUEST_TIMEOUT}s for {endpoint}"
-        logger.error(error_msg)
-        return b'', error_msg
-    except Exception as e:
-        error_msg = f"Unexpected error fetching {endpoint}: {e}"
-        logger.error(error_msg, exc_info=True)
-        return b'', error_msg
+    # Alan 8/14/26 - Retry transient upstream failures. A single MycoMap 500 used to
+    # drop an entire result set: the caller kept the sequences it did get and built a
+    # tree missing all of the NCBI references, with no warning to the user. Only
+    # server-side/network faults are retried -- a 4xx is a real answer, not a blip.
+    last_error = None
+    for attempt in range(FASTA_FETCH_ATTEMPTS):
+        timeout = REQUEST_TIMEOUT
+        if deadline is not None:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                # Never fall through with last_error still None: the caller
+                # treats (b'', None) as a successful empty fetch and would
+                # silently import zero sequences from this endpoint.
+                last_error = last_error or (
+                    f"Ran out of time fetching {endpoint} before any attempt completed"
+                )
+                break
+            timeout = min(REQUEST_TIMEOUT, remaining)
+        try:
+            with urllib.request.urlopen(request, timeout=timeout) as resp:
+                content = resp.read()
+            if attempt:
+                logger.info(
+                    "Fetched %s for blast_id %s on attempt %s/%s.",
+                    endpoint, blast_id, attempt + 1, FASTA_FETCH_ATTEMPTS,
+                )
+            return content, None
+        except urllib.error.HTTPError as e:
+            last_error = f"Network error fetching {endpoint}: {e}"
+            if e.code < 500:
+                logger.error(last_error)
+                return b'', last_error
+        except urllib.error.URLError as e:
+            last_error = f"Network error fetching {endpoint}: {e}"
+        except TimeoutError:
+            last_error = f"Request timed out after {timeout:.0f}s for {endpoint}"
+        except Exception as e:
+            last_error = f"Unexpected error fetching {endpoint}: {e}"
+            logger.error(last_error, exc_info=True)
+            return b'', last_error
+
+        if attempt + 1 < FASTA_FETCH_ATTEMPTS:
+            delay = FASTA_FETCH_RETRY_BASE_SECONDS * (2 ** attempt)
+            if deadline is not None and time.monotonic() + delay >= deadline:
+                logger.warning(
+                    "%s (attempt %s/%s); no time budget left to retry.",
+                    last_error, attempt + 1, FASTA_FETCH_ATTEMPTS,
+                )
+                break
+            logger.warning(
+                "%s (attempt %s/%s); retrying in %ss.",
+                last_error, attempt + 1, FASTA_FETCH_ATTEMPTS, delay,
+            )
+            time.sleep(delay)
+
+    logger.error("%s (gave up on %s for blast_id %s)", last_error, endpoint, blast_id)
+    return b'', last_error
 
 
 def fetch_mycomap_fasta(
     blast_id: str,
     include_ncbi: bool = True,
-    include_local: bool = True
+    include_local: bool = True,
+    time_budget: Optional[float] = None
 ) -> dict:
     """
     Fetch FASTA sequences from Mycomap BLAST results.
-    
+
     Args:
         blast_id: The Mycomap blast ID (digits only)
         include_ncbi: Whether to include NCBI BLAST results
         include_local: Whether to include local MycoBLAST results
-        
+        time_budget: Optional wall-clock ceiling in seconds covering *both*
+            endpoint fetches together. Request handlers should pass
+            INTERACTIVE_FETCH_BUDGET_SECONDS; workers leave it None for the
+            full retry budget.
+
     Returns:
         Dict with keys:
         - fasta_content: str - Combined FASTA content
@@ -1463,21 +1737,31 @@ def fetch_mycomap_fasta(
         'fasta_content': '',
         'ncbi_count': 0,
         'local_count': 0,
-        'errors': []
+        'errors': [],
+        # Alan 8/14/26 - Name which requested sources actually failed. Callers used to
+        # see only a flat error list and treated "some FASTA came back" as success, so
+        # a MycoMap 500 on the NCBI half silently produced a tree with no NCBI
+        # references and no warning anywhere the user could see it.
+        'failed_sources': [],
     }
-    
+
     if not include_ncbi and not include_local:
         result['errors'].append("At least one result type must be selected")
         return result
-    
+
+    # One deadline shared by both fetches, so a slow NCBI half cannot spend the
+    # local half's time as well.
+    deadline = None if time_budget is None else time.monotonic() + time_budget
+
     fasta_parts = []
-    
+
     # Fetch NCBI results
     if include_ncbi:
         logger.info(f"Fetching NCBI FASTA for blast_id: {blast_id}")
-        ncbi_bytes, ncbi_error = _fetch_fasta(blast_id, 'fasta')
+        ncbi_bytes, ncbi_error = _fetch_fasta(blast_id, 'fasta', deadline)
         if ncbi_error:
             result['errors'].append(ncbi_error)
+            result['failed_sources'].append('ncbi')
         else:
             result['ncbi_count'] = _count_fasta_sequences(ncbi_bytes)
             if ncbi_bytes:
@@ -1487,9 +1771,10 @@ def fetch_mycomap_fasta(
     # Fetch local/MycoBLAST results
     if include_local:
         logger.info(f"Fetching local FASTA for blast_id: {blast_id}")
-        local_bytes, local_error = _fetch_fasta(blast_id, 'localFasta')
+        local_bytes, local_error = _fetch_fasta(blast_id, 'localFasta', deadline)
         if local_error:
             result['errors'].append(local_error)
+            result['failed_sources'].append('local')
         else:
             result['local_count'] = _count_fasta_sequences(local_bytes)
             if local_bytes:
@@ -1498,6 +1783,23 @@ def fetch_mycomap_fasta(
     
     # Combine FASTA content
     result['fasta_content'] = '\n'.join(fasta_parts)
+
+    # Alan 8/14/26 - Say out loud when a requested source came back empty but we are
+    # returning the other one anyway. Previously this produced a tree missing its
+    # entire NCBI reference set with nothing in the logs marking it as degraded --
+    # the fetch ERROR was followed by ordinary INFO lines and a completed job.
+    if result['failed_sources'] and result['fasta_content']:
+        from app.services.log_context import log_degradation
+        log_degradation(
+            logger,
+            "mycomap_partial_fetch",
+            f"continuing with {'/'.join(s for s in ('ncbi', 'local') if s not in result['failed_sources'])} "
+            f"results only; sequences from {'/'.join(result['failed_sources'])} are missing from this import",
+            blast_id=blast_id,
+            failed=','.join(result['failed_sources']),
+            ncbi_count=result['ncbi_count'],
+            local_count=result['local_count'],
+        )
 
     return result
 

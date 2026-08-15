@@ -143,3 +143,51 @@
     background-color: #4f46e5 !important;
     /* indigo-600 */
 }
+
+/* Edited FASTA export control.
+   Styled here rather than with Tailwind utilities because the enabled/disabled
+   swap happens from JS, and the vendored Tailwind runtime does not reliably
+   generate classes that were never present in the served HTML. */
+.edited-fasta-link {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.4rem;
+    padding: 0.3rem 0.75rem;
+    border-radius: 0.5rem;
+    border: 1px solid transparent;
+    font-weight: 600;
+    line-height: 1.35;
+    text-decoration: none;
+    transition: background-color .15s ease, border-color .15s ease, color .15s ease;
+}
+
+/* Available: the app's gold accent, so the file you now want is the easiest
+   thing to find in the export row. */
+.edited-fasta-link.is-available {
+    background-color: #c9a962;
+    border-color: #c9a962;
+    color: #1a2f23;
+    cursor: pointer;
+    box-shadow: 0 1px 2px rgba(0, 0, 0, .12);
+}
+
+.edited-fasta-link.is-available:hover,
+.edited-fasta-link.is-available:focus-visible {
+    background-color: #e5d4a1;
+    border-color: #e5d4a1;
+    color: #1a2f23;
+}
+
+/* Unavailable: visible so the feature is discoverable, but plainly inert. */
+.edited-fasta-link.is-unavailable {
+    background-color: transparent;
+    border-color: #d1d5db;
+    color: #9ca3af;
+    cursor: not-allowed;
+    opacity: .75;
+}
+
+.dark .edited-fasta-link.is-unavailable {
+    border-color: #355245;
+    color: #7b8a80;
+}

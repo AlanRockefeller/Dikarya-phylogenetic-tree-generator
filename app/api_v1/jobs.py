@@ -60,6 +60,7 @@ def serialize_job(job):
             "tree_method":      info.get("tree_method")      or (job.metrics or {}).get("tree_method"),
             "tree_model":       info.get("tree_model"),
             "bootstrap":        info.get("bootstrap"),
+            "alrt_replicates":  info.get("alrt_replicates"),
             "mcmc_generations": info.get("mcmc_generations"),
             "mcmc_nruns":       info.get("mcmc_nruns", 2),
             "mcmc_nchains":     info.get("mcmc_nchains", 4),

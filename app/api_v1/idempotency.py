@@ -18,6 +18,7 @@ import functools
 import hashlib
 import json
 import re
+import logging
 
 from flask import g, request
 
@@ -28,6 +29,16 @@ IDEM_PENDING_TTL_SECONDS = 60    # placeholder lifetime while the handler runs
 MAX_KEY_LEN = 200
 _KEY_CHARSET_RE = re.compile(r"^[A-Za-z0-9_\-]{1,200}$")
 _PENDING_PREFIX = "PENDING:"
+logger = logging.getLogger(__name__)
+
+
+def _log_fail_open(stage, exc=None):
+    from app.services.log_context import log_degradation_rate_limited
+    log_degradation_rate_limited(
+        logger, "idempotency_fail_open",
+        "API request executed without duplicate protection because Redis was unavailable",
+        stage=stage, exception=type(exc).__name__ if exc else "unknown",
+    )
 
 
 def _redis():
@@ -62,11 +73,13 @@ def _replay(cached, *, is_replay=True):
     )
     if is_replay:
         resp.headers["X-Idempotent-Replay"] = "true"
-    # Preserve the original request id so callers can correlate the replay
-    # back to the original handler invocation.
+    # The current request keeps its own single correlation ID. Expose the
+    # original separately so replay debugging does not make access/app logs
+    # disagree about which request produced this response.
     original_rid = cached.get("request_id")
     if original_rid:
-        resp.headers["X-Request-Id"] = original_rid
+        resp.headers["X-Original-Request-Id"] = original_rid
+    resp.headers["X-Request-Id"] = getattr(g, "request_id", "-")
     return resp
 
 
@@ -116,18 +129,20 @@ def idempotent(fn):
 
         try:
             r = _redis()
-        except Exception:
+        except Exception as exc:
             # If Redis is unreachable we skip the cache rather than 500. This
             # *does* mean a true concurrent retry could double-execute during
             # a Redis outage, but failing the request entirely would be worse
             # for callers; document this tradeoff in the API guide.
+            _log_fail_open("connect", exc)
             return fn(*args, **kwargs)
 
         # Atomically reserve the slot. NX returns truthy on success.
         placeholder = f"{_PENDING_PREFIX}{body_hash}"
         try:
             reserved = r.set(cache_key, placeholder, nx=True, ex=IDEM_PENDING_TTL_SECONDS)
-        except Exception:
+        except Exception as exc:
+            _log_fail_open("reserve", exc)
             reserved = None
 
         if not reserved:
@@ -135,7 +150,8 @@ def idempotent(fn):
             # cached response is sitting there. Inspect it.
             try:
                 existing_raw = r.get(cache_key)
-            except Exception:
+            except Exception as exc:
+                _log_fail_open("read", exc)
                 existing_raw = None
             if existing_raw is None:
                 # Race: it just expired. Run the handler without caching;
@@ -208,7 +224,7 @@ def idempotent(fn):
                 # Don't lock the key for 24h on a 4xx/5xx; let the caller
                 # fix their request and retry.
                 r.delete(cache_key)
-        except Exception:
-            pass
+        except Exception as exc:
+            _log_fail_open("store_response", exc)
         return response
     return wrapper

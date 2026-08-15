@@ -4,7 +4,7 @@
 {% block subtitle %}Tree Viewer{% endblock %}
 
 {% block head %}
-<link rel="stylesheet" href="{{ url_for('static', filename='css/tree_viewer.css') }}?v=3">
+<link rel="stylesheet" href="{{ url_for('static', filename='css/tree_viewer.css') }}?v=4">
 <link rel="stylesheet" href="{{ url_for('static', filename='css/phylotree.css') }}">
 <link rel="stylesheet" href="{{ url_for('static', filename='css/phylotree-menus.css') }}?v=2">
 <link rel="preconnect" href="https://fonts.googleapis.com">
@@ -533,7 +533,11 @@
 
     <!-- Export Links Row -->
     <div class="mt-4 pt-4 border-t border-gray-200 dark:border-journal-dark">
-        <div class="flex flex-wrap gap-x-6 gap-y-2 text-sm">
+        <div class="flex flex-wrap items-center gap-x-6 gap-y-2 text-sm">
+            <a id="fasta-edited" download class="edited-fasta-link is-unavailable" aria-disabled="true"
+                tabindex="-1" title="Available after pruning or renaming sequences.">
+                <i class="fas fa-download text-xs"></i> Edited FASTA
+            </a>
             <a id="newick-link-original" href="#" target="_blank"
                 class="text-journal-gold hover:text-journal-gold-light transition-colors flex items-center gap-1">
                 <i class="fas fa-download text-xs"></i> Original Newick
@@ -553,12 +557,9 @@
                 <i class="fas fa-download text-xs"></i> MrBayes Analysis Files
             </a>
             {% endif %}
-            <a id="fasta-pruned" href="#" target="_blank"
-                class="text-journal-gold hover:text-journal-gold-light transition-colors flex items-center gap-1">
-                <i class="fas fa-download text-xs"></i> Pruned FASTA
-            </a>
             <a id="fasta-original" href="#" target="_blank"
-                class="text-journal-gold hover:text-journal-gold-light transition-colors flex items-center gap-1">
+                class="text-journal-gold hover:text-journal-gold-light transition-colors flex items-center gap-1"
+                title="Unaligned sequences and headers exactly as supplied to the tree-building job">
                 <i class="fas fa-download text-xs"></i> Original FASTA
             </a>
             <a href="/api/job/{{ job_id }}/download/fasta/aligned" download
@@ -634,10 +635,12 @@
                     <dd>Cycle node sorting</dd>
                     <dt><kbd class="rounded border border-gray-300 bg-gray-100 px-2 py-0.5 font-mono dark:border-gray-600 dark:bg-journal-dark">B</kbd></dt>
                     <dd>Toggle Box Select mode</dd>
-                    <dt><kbd class="rounded border border-gray-300 bg-gray-100 px-2 py-0.5 font-mono dark:border-gray-600 dark:bg-journal-dark">Ctrl/Cmd + drag</kbd></dt>
+                    <dt><kbd class="rounded border border-gray-300 bg-gray-100 px-2 py-0.5 font-mono dark:border-gray-600 dark:bg-journal-dark">Ctrl/Cmd + right-drag</kbd></dt>
                     <dd>Toggle sequences within a selection box</dd>
-                    <dt><kbd class="rounded border border-gray-300 bg-gray-100 px-2 py-0.5 font-mono dark:border-gray-600 dark:bg-journal-dark">Alt/Option + drag</kbd></dt>
-                    <dd>Prune sequences within a selection box</dd>
+                    <dt><kbd class="rounded border border-gray-300 bg-gray-100 px-2 py-0.5 font-mono dark:border-gray-600 dark:bg-journal-dark">Right-drag</kbd></dt>
+                    <dd>Select sequences within a selection box</dd>
+                    <dt><kbd class="rounded border border-gray-300 bg-gray-100 px-2 py-0.5 font-mono dark:border-gray-600 dark:bg-journal-dark">Alt/Option + right-drag</kbd></dt>
+                    <dd>Prune sequences within the red box</dd>
                     <dt><kbd class="rounded border border-gray-300 bg-gray-100 px-2 py-0.5 font-mono dark:border-gray-600 dark:bg-journal-dark">Ctrl/Cmd + Enter</kbd></dt>
                     <dd>Save names in the Rename modal</dd>
                     <dt><kbd class="rounded border border-gray-300 bg-gray-100 px-2 py-0.5 font-mono dark:border-gray-600 dark:bg-journal-dark">Esc</kbd></dt>
@@ -1052,7 +1055,7 @@
 
 <script src="{{ url_for('static', filename='js/tree_viewer_api.js') }}?v=3"></script>
 
-<script src="{{ url_for('static', filename='js/tree_viewer_controller.js') }}?v=56"></script>
+<script src="{{ url_for('static', filename='js/tree_viewer_controller.js') }}?v=57"></script>
 
 {% include 'partials/alignment_viewer_modal.html' %}
 

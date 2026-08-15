@@ -69,6 +69,7 @@ class JobStatusClient {
                 this.handleSnapshot(data);
             } catch (err) {
                 console.error('Failed to parse snapshot:', err);
+                window.reportClientError?.('job_status.snapshot_parse', err);
             }
         });
 
@@ -79,6 +80,7 @@ class JobStatusClient {
                 this.handleEvent(data);
             } catch (err) {
                 console.error('Failed to parse event:', err);
+                window.reportClientError?.('job_status.event_parse', err);
             }
         };
 
@@ -313,6 +315,7 @@ class JobStatusClient {
                     this.triggerRedirect(targetUrl);
                 } catch (err) {
                     console.error('Error calling triggerRedirect:', err);
+                    window.reportClientError?.('job_status.redirect', err);
                 }
             }
 
@@ -813,6 +816,8 @@ document.addEventListener('DOMContentLoaded', () => {
 
         } catch (err) {
             console.error(`Failed to load ${logName} log:`, err);
+            // logName is one of three fixed identifiers, never user text.
+            window.reportClientError?.(`job_status.load_log.${logName}`, err);
             content.textContent = 'Failed to load log.';
         }
     }
@@ -843,6 +848,7 @@ document.addEventListener('DOMContentLoaded', () => {
             window.sequencesLoaded = true;
         } catch (err) {
             console.error('Failed to load sequences:', err);
+            window.reportClientError?.('job_status.load_sequences', err);
             content.textContent = 'Failed to load sequences.';
         }
     }
@@ -888,6 +894,7 @@ document.addEventListener('DOMContentLoaded', () => {
             console.log('Aligned sequences loaded successfully');
         } catch (err) {
             console.error('Failed to load aligned sequences:', err);
+            window.reportClientError?.('job_status.load_alignment', err);
             content.textContent = 'Failed to load aligned sequences.';
         }
     }

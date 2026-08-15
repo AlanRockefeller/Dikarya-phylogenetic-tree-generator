@@ -1,0 +1,529 @@
+{% extends "base_modern.html" %}
+
+{% block title %}Help - Dikarya{% endblock %}
+{% block description %}Practical help for building fungal phylogenetic trees, inspecting alignments, editing finished trees, downloading results, and using the Dikarya API.{% endblock %}
+{% block subtitle %}Help &amp; Practical Guide{% endblock %}
+{% block nav_help %}text-journal-gold{% endblock %}
+
+{% block head %}
+<style>
+    .help-page section[id] {
+        scroll-margin-top: 6rem;
+    }
+
+    .help-page .help-copy p + p {
+        margin-top: .85rem;
+    }
+
+    .help-page .help-copy a:not(.help-action) {
+        color: #9a7a33;
+        font-weight: 600;
+        text-decoration: underline;
+        text-decoration-thickness: 1px;
+        text-underline-offset: 3px;
+    }
+
+    .dark .help-page .help-copy a:not(.help-action) {
+        color: var(--journal-gold-light);
+    }
+
+    .help-page .help-copy li + li {
+        margin-top: .45rem;
+    }
+
+    .help-page .help-copy code {
+        font-family: var(--mono);
+    }
+</style>
+{% endblock %}
+
+{% macro contact_actions() %}
+<div class="flex flex-wrap gap-3">
+    <a href="#" target="_self"
+        class="js-email-alan help-action inline-flex items-center gap-2 rounded-lg bg-journal-gold px-4 py-2.5 text-sm font-semibold text-journal-dark shadow-sm transition-colors hover:bg-journal-gold-light focus:outline-none focus-visible:ring-2 focus-visible:ring-journal-gold focus-visible:ring-offset-2 dark:focus-visible:ring-offset-journal-dark"
+        data-mailbox="alanrockefeller" data-domain="gmail" data-tld="com">
+        <i class="fas fa-envelope" aria-hidden="true"></i> Email Alan
+    </a>
+    <a href="{{ url_for('main.todo') }}"
+        class="help-action inline-flex items-center gap-2 rounded-lg border border-journal-gold bg-white px-4 py-2.5 text-sm font-semibold text-journal-dark shadow-sm transition-colors hover:bg-journal-gold/10 focus:outline-none focus-visible:ring-2 focus-visible:ring-journal-gold focus-visible:ring-offset-2 dark:bg-journal-green dark:text-gray-100 dark:focus-visible:ring-offset-journal-dark">
+        <i class="fas fa-comment-dots" aria-hidden="true"></i> Leave a suggestion
+    </a>
+</div>
+{% endmacro %}
+
+{% block content %}
+<div class="help-page help-copy mx-auto max-w-6xl text-gray-700 dark:text-gray-200">
+    <header class="mb-8 border-b border-gray-200 pb-8 dark:border-journal-green">
+        <p class="mb-2 text-xs font-bold uppercase tracking-[0.2em] text-journal-gold">Dikarya Help</p>
+        <h1 class="text-3xl font-bold leading-tight text-journal-dark dark:text-gray-100 sm:text-4xl">
+            Make a useful tree first. Adjust the machinery when you need to.
+        </h1>
+        <p class="mt-4 max-w-3xl text-lg leading-relaxed text-gray-600 dark:text-gray-300">
+            <strong class="text-journal-dark dark:text-journal-gold-light">Dikarya was created by Alan Rockefeller.</strong>
+            I made it to make fungal phylogenetic analysis and sequence identification easier without asking people
+            to install and wire together a bioinformatics pipeline first.
+        </p>
+        <p class="mt-3 max-w-3xl">
+            Questions, problems, feature ideas, and bug reports are welcome. Email Alan or leave a suggestion.
+            The address is <span class="font-mono text-sm">alanrockefeller [at] gmail [dot] com</span>.
+        </p>
+        <div class="mt-5">{{ contact_actions() }}</div>
+    </header>
+
+    <nav aria-label="Help page sections"
+        class="mb-8 rounded-xl border border-gray-200 bg-white p-4 shadow-sm dark:border-journal-green dark:bg-journal-green/30 lg:hidden">
+        <p class="mb-3 text-xs font-bold uppercase tracking-wider text-journal-gold">Jump to</p>
+        <div class="flex flex-wrap gap-x-4 gap-y-2 text-sm">
+            <a href="#quick-start">Quick Start</a>
+            <a href="#tree-viewer">Tree Viewer</a>
+            <a href="#alignment-viewer">Alignment Viewer</a>
+            <a href="#getting-sequences-in">Getting Sequences In</a>
+            <a href="#downloads">Downloads</a>
+            <a href="#advanced">Advanced</a>
+            <a href="#api">API</a>
+            <a href="#help-feedback">Help</a>
+        </div>
+    </nav>
+
+    <div class="grid gap-10 lg:grid-cols-[12rem_minmax(0,1fr)]">
+        <aside class="hidden lg:block">
+            <nav aria-label="Help page table of contents"
+                class="sticky top-24 rounded-xl border border-gray-200 bg-white p-4 shadow-sm dark:border-journal-green dark:bg-journal-green/30">
+                <p class="mb-3 text-xs font-bold uppercase tracking-wider text-journal-gold">On this page</p>
+                <ul class="space-y-2 text-sm">
+                    <li><a href="#quick-start">Quick Start</a></li>
+                    <li><a href="#tree-viewer">Tree Viewer</a></li>
+                    <li><a href="#alignment-viewer">Alignment Viewer</a></li>
+                    <li><a href="#getting-sequences-in">Getting Sequences In</a></li>
+                    <li><a href="#downloads">Downloads</a></li>
+                    <li><a href="#advanced">Advanced</a></li>
+                    <li><a href="#api">API</a></li>
+                    <li><a href="#help-feedback">Help</a></li>
+                </ul>
+            </nav>
+        </aside>
+
+        <article class="min-w-0 space-y-12">
+            <section id="quick-start" aria-labelledby="quick-start-title"
+                class="rounded-2xl border-2 border-journal-gold bg-white p-5 shadow-md dark:bg-journal-green/30 sm:p-7">
+                <p class="text-xs font-bold uppercase tracking-[0.18em] text-journal-gold">Quick Start</p>
+                <h2 id="quick-start-title" class="mt-2 text-2xl font-bold text-journal-dark dark:text-gray-100 sm:text-3xl">
+                    The easy way: make a tree from an iNaturalist observation
+                </h2>
+                <ol class="mt-5 list-decimal space-y-3 pl-6 leading-relaxed">
+                    <li>Open the <a href="{{ url_for('main.sequence_entry') }}">Tree Builder</a>.</li>
+                    <li>Paste an iNaturalist observation URL into <strong>Import from iNaturalist</strong>. An observation number works too.</li>
+                    <li>Click <strong>Submit</strong>, check the preview, then click <strong>One-Click Tree</strong>.</li>
+                    <li>Dikarya finds the observation's sequence and related sequences, aligns them, builds the tree, and takes you to the result.</li>
+                </ol>
+                <div class="mt-6 rounded-xl bg-journal-gold/15 p-4 text-journal-dark ring-1 ring-journal-gold/50 dark:text-gray-100">
+                    <strong>For most identification work, this is all you need.</strong>
+                    I use the One-Click Tree for about 99.9% of the trees I make.
+                </div>
+                <p class="mt-4 text-sm text-gray-600 dark:text-gray-300">
+                    The same box also accepts an iNaturalist username, user URL, project name, or project URL. Those
+                    inputs preview the eligible observations and can create bulk tree jobs; they do not change the
+                    simple single-observation workflow above.
+                </p>
+            </section>
+
+            <section id="quick-versus-publication" aria-labelledby="quick-versus-publication-title">
+                <h2 id="quick-versus-publication-title" class="text-2xl font-bold text-journal-dark dark:text-gray-100">
+                    Quick trees and publication trees are different jobs
+                </h2>
+                <p class="mt-3 leading-relaxed">
+                    The normal quick tree is for sequence identification, exploring BLAST results, seeing where an
+                    unknown collection falls, checking relationships quickly, and deciding what deserves closer
+                    investigation. It is much faster, and for routine identification the slower methods usually do
+                    not add enough practical benefit to justify running them every time.
+                </p>
+                <div class="mt-5 border-l-4 border-amber-500 bg-amber-50 p-4 text-amber-950 dark:bg-amber-900/20 dark:text-amber-100">
+                    <p class="font-semibold">
+                        For publication trees, use an appropriate advanced phylogenetic method such as RAxML-NG,
+                        IQ-TREE, or MrBayes rather than relying on the quick exploratory tree.
+                    </p>
+                    <p class="mt-2 text-sm">
+                        Choosing one of those programs is not a scientific shortcut. Inspect the alignment, choose
+                        models and support analyses deliberately, use a biologically appropriate outgroup, evaluate
+                        convergence where applicable, and document what you ran.
+                    </p>
+                </div>
+            </section>
+
+            <section id="tree-viewer" aria-labelledby="tree-viewer-title"
+                class="rounded-2xl bg-journal-dark p-5 text-gray-100 shadow-lg sm:p-7">
+                <p class="text-xs font-bold uppercase tracking-[0.18em] text-journal-gold">Easy to miss</p>
+                <h2 id="tree-viewer-title" class="mt-2 text-2xl font-bold text-white">Tree Viewer Tricks</h2>
+                <div class="mt-5 grid gap-4 sm:grid-cols-2">
+                    <div class="rounded-xl border border-journal-green bg-white/5 p-4">
+                        <p class="font-mono text-sm font-semibold text-journal-gold-light">Right-click + drag</p>
+                        <p class="mt-2 text-sm leading-relaxed text-gray-200">
+                            Drag across empty tree background to draw a selection box. Every visible tip inside it is
+                            selected. This is the fastest way to grab a clade before opening the Alignment Viewer.
+                        </p>
+                        <p class="mt-3 font-semibold text-white">Right-drag = select</p>
+                    </div>
+                    <div class="rounded-xl border border-red-500/60 bg-red-950/20 p-4">
+                        <p class="font-mono text-sm font-semibold text-red-300">Alt/Option + right-click + drag</p>
+                        <p class="mt-2 text-sm leading-relaxed text-gray-200">
+                            The box turns red. Releasing it prunes every visible tip inside, which is much quicker than
+                            removing a long run of unwanted sequences one at a time.
+                        </p>
+                        <p class="mt-3 font-semibold text-white">Alt + right-drag = prune</p>
+                    </div>
+                </div>
+                <div class="mt-5 border-t border-journal-green pt-5">
+                    <h3 class="text-lg font-semibold text-white">Right-click a branch tip or internal node</h3>
+                    <p class="mt-2 text-sm leading-relaxed text-gray-200">
+                        A tip menu can open its source observation, prune the clicked tip (or the current multi-tip
+                        selection), copy sequence names or iNaturalist numbers, and rename one tip. <strong>Rename 1
+                        node</strong> appears below the prune action when no tip is selected, or when the right-clicked
+                        tip is the only selected tip. It changes the displayed tree-tip name, not the DNA sequence.
+                    </p>
+                    <p class="mt-3 text-sm leading-relaxed text-gray-200">
+                        On an internal node, the menu can select descendant branches, collapse or expand the subtree,
+                        and <strong>Rotate node</strong>. Rotation only changes the order in which the branches are
+                        drawn; the topology is unchanged.
+                    </p>
+                </div>
+            </section>
+
+            <section id="alignment-viewer" aria-labelledby="alignment-viewer-title-help">
+                <h2 id="alignment-viewer-title-help" class="text-2xl font-bold text-journal-dark dark:text-gray-100">Alignment Viewer</h2>
+                <p class="mt-3 leading-relaxed">This is the check I use most often after looking at the tree:</p>
+                <ol class="mt-4 list-decimal space-y-2 pl-6">
+                    <li>Right-click and drag to select the clade or sequences of interest.</li>
+                    <li>Click <strong>Alignment Viewer</strong> (or press <kbd class="rounded border px-1.5 py-0.5 font-mono text-xs dark:border-gray-600">V</kbd>).</li>
+                    <li>Inspect the aligned sequences together.</li>
+                </ol>
+                <p class="mt-4 leading-relaxed">
+                    This shows which bases actually differ, whether a branch reflects meaningful substitutions, where
+                    gaps occur, and whether questionable sequence ends are driving the result. If nothing is selected,
+                    the viewer opens the sequences currently visible in the tree.
+                </p>
+                <div class="mt-5 grid gap-4 sm:grid-cols-2">
+                    <div>
+                        <h3 class="font-semibold text-journal-dark dark:text-journal-gold-light">Compare cleanly</h3>
+                        <p class="mt-2 text-sm leading-relaxed">
+                            <strong>Highlight differences</strong> and <strong>Variable columns only</strong> start on.
+                            Compare to the consensus, choose a reference sequence from the menu, or click a sequence
+                            name to use it as the reference.
+                        </p>
+                    </div>
+                    <div>
+                        <h3 class="font-semibold text-journal-dark dark:text-journal-gold-light">Narrow the view</h3>
+                        <p class="mt-2 text-sm leading-relaxed">
+                            Filter names; sort in tree order, by similarity, difference, length, or leading gaps; and
+                            optionally include pruned sequences. Copy or download the displayed records as FASTA when
+                            you want to work with that subset elsewhere.
+                        </p>
+                    </div>
+                </div>
+            </section>
+
+            <section id="finished-tree" aria-labelledby="finished-tree-title">
+                <h2 id="finished-tree-title" class="text-2xl font-bold text-journal-dark dark:text-gray-100">Working with a finished tree</h2>
+
+                <div class="mt-6 space-y-7">
+                    <div>
+                        <h3 class="text-lg font-semibold text-journal-dark dark:text-journal-gold-light">Pruning</h3>
+                        <p class="mt-2 leading-relaxed">
+                            Select one or several tips and click <strong>Prune</strong>, use the tip's right-click menu,
+                            or use the red Alt/Option + right-drag box. Pruning removes those tips from the working tree
+                            and from the pruned FASTA. <strong>Original Newick</strong> and <strong>Original FASTA</strong>
+                            remain available, so the input analysis is not erased.
+                        </p>
+                    </div>
+                    <div>
+                        <h3 class="text-lg font-semibold text-journal-dark dark:text-journal-gold-light">Rename</h3>
+                        <p class="mt-2 leading-relaxed">
+                            Select one or more tips and click <strong>Rename</strong> to edit them together. For one tip,
+                            right-click it and use <strong>Rename 1 node</strong>. Renames are saved and reapplied when the
+                            tree reloads, but they change labels only&mdash;the underlying nucleotide sequence is untouched.
+                        </p>
+                    </div>
+                    <div>
+                        <h3 class="text-lg font-semibold text-journal-dark dark:text-journal-gold-light">Rerooting</h3>
+                        <p class="mt-2 leading-relaxed">
+                            The Root menu currently offers <strong>Auto root</strong>, <strong>Midpoint root</strong>,
+                            <strong>Most divergent hit</strong>, and <strong>Manual root here</strong>. The separate
+                            <strong>Reroot</strong> button also starts manual rooting, and <strong>Midpoint</strong> applies
+                            midpoint rooting directly. Auto root uses the sequence of interest when Dikarya can identify
+                            it; the viewer lets you set that focal tip when it cannot.
+                        </p>
+                        <p class="mt-2 text-sm leading-relaxed text-amber-800 dark:text-amber-200">
+                            A convenient display root on an exploratory BLAST tree is not evidence of the true
+                            evolutionary root. For publication work, choose an outgroup based on the biology.
+                        </p>
+                    </div>
+                    <div>
+                        <h3 class="text-lg font-semibold text-journal-dark dark:text-journal-gold-light">Rotate, collapse, sort, and color</h3>
+                        <p class="mt-2 leading-relaxed">
+                            <strong>Rotate node</strong>, subtree collapse, and node sorting make a crowded tree easier to
+                            read without changing its topology. Color groups and quick color swatches save highlights on
+                            selected tips, which is handy for marking collections, clades, types, or sequences you want
+                            to discuss later.
+                        </p>
+                    </div>
+                    <div>
+                        <h3 class="text-lg font-semibold text-journal-dark dark:text-journal-gold-light">Recompute</h3>
+                        <p class="mt-2 leading-relaxed">
+                            Prune first, then use <strong>Recompute</strong> when you want Dikarya to realign the remaining
+                            sequences and infer a new tree. This recalculates topology, branch lengths, and support; it is
+                            more than a redraw. Renames and the pruned-taxa list are kept. Recompute is usually unnecessary
+                            after a display-only rename, color, rotation, or reroot.
+                        </p>
+                    </div>
+                </div>
+            </section>
+
+            <section id="getting-sequences-in" aria-labelledby="getting-sequences-title">
+                <h2 id="getting-sequences-title" class="text-2xl font-bold text-journal-dark dark:text-gray-100">Other ways to start a tree</h2>
+                <p class="mt-3">These are useful when the One-Click Tree is not the right starting point.</p>
+
+                <div class="mt-6 grid gap-x-7 gap-y-6 md:grid-cols-2">
+                    <div>
+                        <h3 class="font-semibold text-journal-dark dark:text-journal-gold-light">iNaturalist</h3>
+                        <p class="mt-2 text-sm leading-relaxed">
+                            Use an observation ID or URL for one collection. A username, user URL, project name, or
+                            project URL previews eligible observations and can queue bulk tree jobs. A single observation
+                            can also be sent to <strong>NCBI BLAST</strong> or <strong>Mycomap BLAST</strong> before you add
+                            results to the queue.
+                        </p>
+                    </div>
+                    <div>
+                        <h3 class="font-semibold text-journal-dark dark:text-journal-gold-light">Mushroom Observer</h3>
+                        <p class="mt-2 text-sm leading-relaxed">
+                            Paste a current, short, or legacy Mushroom Observer observation URL, or just its number. When
+                            ITS sequence data are available, choose the sequence and BLAST it, add it to the queue, or use
+                            <strong>One-Click Tree</strong>.
+                        </p>
+                    </div>
+                    <div>
+                        <h3 class="font-semibold text-journal-dark dark:text-journal-gold-light">Mycomap BLAST results</h3>
+                        <p class="mt-2 text-sm leading-relaxed">
+                            Paste a Mycomap BLAST Results URL. Choose NCBI Results, Local Results, or both, and optionally
+                            remove duplicates or filter conflicting local FASTA records. You can fetch sequences into the
+                            queue or run a <strong>One-Click Tree</strong> directly.
+                        </p>
+                    </div>
+                    <div>
+                        <h3 class="font-semibold text-journal-dark dark:text-journal-gold-light">BLAST</h3>
+                        <p class="mt-2 text-sm leading-relaxed">
+                            Paste one DNA sequence or GenBank accession into <strong>BLAST for Related Sequences</strong>.
+                            Set the minimum identity and choose 10, 50, 100, or 200 maximum results, then add the useful
+                            hits to the queue.
+                        </p>
+                    </div>
+                    <div>
+                        <h3 class="font-semibold text-journal-dark dark:text-journal-gold-light">FASTA</h3>
+                        <p class="mt-2 text-sm leading-relaxed">
+                            Paste FASTA into <strong>Add Custom Sequences</strong>, or upload a <code>.fa</code>,
+                            <code>.fasta</code>, <code>.fna</code>, or <code>.txt</code> file.
+                        </p>
+                        <pre class="mt-3 overflow-x-auto rounded-lg bg-gray-100 p-3 text-xs text-journal-dark dark:bg-black/40 dark:text-gray-200"><code>&gt;My_sequence
+ACGTACGTACGT...
+
+&gt;Another_sequence
+ACGTACGTACGT...</code></pre>
+                    </div>
+                    <div>
+                        <h3 class="font-semibold text-journal-dark dark:text-journal-gold-light">GenBank accessions</h3>
+                        <p class="mt-2 text-sm leading-relaxed">
+                            Paste one or more accessions into <strong>Add Custom Sequences</strong>. This is useful for
+                            adding named reference sequences or rebuilding a sequence set from a paper. The form can also
+                            append GenBank collection locations to the FASTA headers.
+                        </p>
+                    </div>
+                </div>
+            </section>
+
+            <section id="sequence-queue" aria-labelledby="sequence-queue-title">
+                <h2 id="sequence-queue-title" class="text-2xl font-bold text-journal-dark dark:text-gray-100">Sequence Queue</h2>
+                <p class="mt-3 leading-relaxed">
+                    The queue matters mostly when you are not using the single-observation One-Click Tree. It lets you
+                    combine your own FASTA with iNaturalist, Mushroom Observer, GenBank, NCBI BLAST, and Mycomap records
+                    before starting an analysis.
+                </p>
+                <p class="mt-3 leading-relaxed">
+                    Use the <strong>&times;</strong> beside a sequence to remove it or <strong>Clear All</strong> to empty the
+                    queue. The queue can be downloaded as FASTA. When imported Mycomap records include metrics,
+                    <strong>Filter</strong> can screen them by query coverage, subject coverage, and identity. The star
+                    checkbox marks a queued sequence as an outgroup for a RAxML-NG run.
+                </p>
+            </section>
+
+            <section id="adding-sequences" aria-labelledby="adding-sequences-title">
+                <h2 id="adding-sequences-title" class="text-2xl font-bold text-journal-dark dark:text-gray-100">Adding sequences to an existing tree</h2>
+                <p class="mt-3 leading-relaxed">
+                    From an editable finished tree, click <strong>Add Seq</strong>. Dikarya opens the Tree Builder with the
+                    current unpruned sequence set already in the queue. Add or remove records from any of the normal
+                    sources, then click <strong>Add &amp; Recompute</strong>. The advanced panel is prefilled from the job;
+                    leave it alone to reuse those settings, or change it deliberately for the new run.
+                </p>
+            </section>
+
+            <section id="downloads" aria-labelledby="downloads-title">
+                <h2 id="downloads-title" class="text-2xl font-bold text-journal-dark dark:text-gray-100">Downloads</h2>
+                <p class="mt-3">The finished tree toolbar exposes the files that exist for that analysis:</p>
+                <ul class="mt-4 list-disc pl-6 leading-relaxed">
+                    <li><strong>Original Newick</strong> and <strong>Current Newick</strong> for the untouched and currently displayed trees.</li>
+                    <li><strong>NEXUS Tree</strong>, using the edited/pruned NEXUS tree when one exists.</li>
+                    <li><strong>Original FASTA</strong>, the unaligned sequences exactly as submitted, and
+                        <strong>Edited FASTA</strong>, the same unaligned sequences with your pruning and tip
+                        renaming applied. Edited FASTA stays greyed out until you prune or rename something.</li>
+                    <li><strong>Aligned FASTA (Before Trimming)</strong> and, when applicable, <strong>Trimmed FASTA (Tree Input)</strong>.</li>
+                    <li><strong>Trimming Inspection ZIP</strong> when a trimming report was produced; it includes before/after FASTA and a marked HTML report.</li>
+                    <li><strong>MrBayes Analysis Files</strong> for MrBayes jobs, including commands, parameter/tree traces, and summaries.</li>
+                    <li><strong>Download SVG</strong> and <strong>Download JPG</strong> for a picture of the displayed tree.</li>
+                </ul>
+                <p class="mt-4 rounded-lg bg-gray-100 p-4 text-sm dark:bg-journal-green/30">
+                    For publication work, keep the alignment, tree, trimming report, and program output&mdash;not only a screenshot.
+                </p>
+            </section>
+
+            <section id="advanced" aria-labelledby="advanced-title">
+                <p class="text-xs font-bold uppercase tracking-[0.18em] text-journal-gold">Advanced Tree Building</p>
+                <h2 id="advanced-title" class="mt-2 text-2xl font-bold text-journal-dark dark:text-gray-100">Settings for when you have a reason to change them</h2>
+                <p class="mt-3 font-semibold text-journal-dark dark:text-journal-gold-light">
+                    You do not need these settings for routine One-Click Trees.
+                </p>
+
+                <div class="mt-7 space-y-7">
+                    <div>
+                        <h3 class="text-lg font-semibold text-journal-dark dark:text-journal-gold-light">Alignment</h3>
+                        <p class="mt-2 leading-relaxed">
+                            <strong>MAFFT (Default)</strong> is the normal choice. MUSCLE and Clustal Omega are available,
+                            and <strong>None - Skip Alignment (Use as-is)</strong> is for input that is already aligned.
+                            The ITS Region control can extract ITS1, 5.8S, ITS2, or full ITS with ITSx before alignment;
+                            sequences without enough of the requested region are dropped and reported below the tree.
+                        </p>
+                    </div>
+                    <div>
+                        <h3 class="text-lg font-semibold text-journal-dark dark:text-journal-gold-light">Trimming</h3>
+                        <p class="mt-2 leading-relaxed">
+                            The default is <strong>trimAl gap-threshold (recommended)</strong>, which removes columns that
+                            are more than 90% gaps. You can choose no trimming, trimAl <code>-automated1</code>, or BMGE;
+                            terminal-overhang trimming is a separate control. The interface specifically warns that
+                            <code>-automated1</code> can remove informative ITS1/ITS2 regions. Automated trimming is not
+                            automatically correct&mdash;inspect important alignments in the Alignment Viewer and retain the
+                            Trimming Inspection ZIP when it is available.
+                        </p>
+                    </div>
+                    <div>
+                        <h3 class="text-lg font-semibold text-journal-dark dark:text-journal-gold-light">FastTree 2.2.0 (Fast ML)</h3>
+                        <p class="mt-2 leading-relaxed">
+                            This is the quick method and my normal exploratory choice. It is fast and useful for
+                            identification. Dikarya runs nucleotide GTR+CAT/Gamma settings and reports FastTree's SH-like
+                            local support from 1,000 resamples; those values are not bootstrap proportions or Bayesian
+                            posterior probabilities.
+                        </p>
+                    </div>
+                    <div>
+                        <h3 class="text-lg font-semibold text-journal-dark dark:text-journal-gold-light">RAxML-NG (High Quality ML)</h3>
+                        <p class="mt-2 leading-relaxed">
+                            RAxML-NG performs maximum-likelihood inference. Dikarya groups the main run choices into
+                            <strong>Fast but Good</strong>, <strong>Standard</strong>, <strong>Publication</strong>, and
+                            <strong>Maximum</strong> presets, which change starting-tree counts and early stopping. Its
+                            bootstrap controls use AutoMRE with selectable replicate caps, and this is the method that
+                            exposes the queued outgroup selector.
+                        </p>
+                    </div>
+                    <div>
+                        <h3 class="text-lg font-semibold text-journal-dark dark:text-journal-gold-light">IQ-TREE (Maximum Likelihood)</h3>
+                        <p class="mt-2 leading-relaxed">
+                            IQ-TREE is another maximum-likelihood option. <strong>ModelFinder</strong> is the recommended
+                            model choice in the form and selects by BIC; fixed and custom models are also available.
+                            Dikarya exposes Ultrafast Bootstrap and SH-aLRT replicates and labels nodes
+                            <code>SH-aLRT/UFBoot</code> when both are run.
+                        </p>
+                    </div>
+                    <div>
+                        <h3 class="text-lg font-semibold text-journal-dark dark:text-journal-gold-light">MrBayes (Bayesian)</h3>
+                        <p class="mt-2 leading-relaxed">
+                            MrBayes uses Bayesian phylogenetic inference. The form exposes generations, independent runs,
+                            chains per run, and burn-in. More generations do not by themselves make a result reliable:
+                            inspect the downloaded parameter traces and summaries for convergence and effective sample
+                            size, and report how convergence was assessed.
+                        </p>
+                    </div>
+                    <div>
+                        <h3 class="text-lg font-semibold text-journal-dark dark:text-journal-gold-light">Models, support, and rooting</h3>
+                        <p class="mt-2 leading-relaxed">
+                            A substitution model describes how sequence changes are treated. Bootstrap, UFBoot, SH-aLRT,
+                            SH-like support, and posterior probabilities are program-specific measures; none is proof that
+                            a taxonomic conclusion is correct. For serious phylogenetic work, select an appropriate
+                            outgroup and explain why. Automatic and midpoint roots are useful display choices for
+                            exploratory trees, not substitutes for that biological decision.
+                        </p>
+                        <p class="mt-3 text-sm text-gray-600 dark:text-gray-300">
+                            <strong>Neighbor Joining (Fast)</strong> is also available as a simple distance-based option,
+                            but it is not the default exploratory method or one of the publication-oriented choices above.
+                        </p>
+                    </div>
+                </div>
+            </section>
+
+            <section id="api" aria-labelledby="api-title">
+                <h2 id="api-title" class="text-2xl font-bold text-journal-dark dark:text-gray-100">API and Automation</h2>
+                <p class="mt-3 leading-relaxed">
+                    Dikarya has a public API for scripts, other websites, and applications. It can submit and list jobs,
+                    check status or stream events, retrieve files and logs, recompute or edit trees, and call supported
+                    sequence tools including BLAST and GenBank lookup. The API also supports the single-observation
+                    iNaturalist One-Click Tree workflow.
+                </p>
+                <p class="mt-3 leading-relaxed">
+                    Most API calls use a scoped token in the <code>Authorization: Bearer dikarya_...</code> header. Sign in
+                    to mint a token, copy its secret when it is shown, and grant only the scopes the script needs.
+                </p>
+                <div class="mt-5 flex flex-wrap gap-3">
+                    <a href="{{ url_for('api_v1.api_docs') }}"
+                        class="help-action inline-flex items-center gap-2 rounded-lg bg-journal-dark px-4 py-2.5 text-sm font-semibold text-white transition-colors hover:bg-journal-green focus:outline-none focus-visible:ring-2 focus-visible:ring-journal-gold focus-visible:ring-offset-2 dark:ring-1 dark:ring-journal-green dark:focus-visible:ring-offset-journal-dark">
+                        <i class="fas fa-code" aria-hidden="true"></i> Open API Docs
+                    </a>
+                    <a href="{{ url_for('user.api_tokens') }}"
+                        class="help-action inline-flex items-center gap-2 rounded-lg border border-journal-gold bg-white px-4 py-2.5 text-sm font-semibold text-journal-dark transition-colors hover:bg-journal-gold/10 focus:outline-none focus-visible:ring-2 focus-visible:ring-journal-gold focus-visible:ring-offset-2 dark:bg-journal-green dark:text-gray-100 dark:focus-visible:ring-offset-journal-dark">
+                        <i class="fas fa-key" aria-hidden="true"></i> Manage API Tokens
+                    </a>
+                </div>
+                <p class="mt-3 text-sm text-gray-500 dark:text-gray-400">Token management requires a Dikarya login.</p>
+            </section>
+
+            <section id="rule-of-thumb" aria-labelledby="rule-of-thumb-title"
+                class="rounded-2xl border border-journal-gold bg-journal-gold/10 p-5 sm:p-6">
+                <h2 id="rule-of-thumb-title" class="text-xl font-bold text-journal-dark dark:text-gray-100">Practical rule of thumb</h2>
+                <p class="mt-3 text-lg font-semibold text-journal-dark dark:text-journal-gold-light">
+                    For sequence identification: paste the iNaturalist URL &rarr; Submit &rarr; One-Click Tree &rarr;
+                    inspect the tree &rarr; select the interesting clade &rarr; Alignment Viewer.
+                </p>
+                <p class="mt-4 leading-relaxed">
+                    Start changing alignment methods, trimming methods, evolutionary models, support settings, or
+                    tree-building programs when you have a reason to. For publication trees, use an appropriate advanced
+                    phylogenetic method, inspect the alignment carefully, retain the underlying files, and report the
+                    analysis settings.
+                </p>
+            </section>
+
+            <section id="help-feedback" aria-labelledby="help-feedback-title"
+                class="rounded-2xl bg-journal-green p-5 text-gray-100 shadow-lg sm:p-7">
+                <h2 id="help-feedback-title" class="text-2xl font-bold text-white">Help and feedback</h2>
+                <p class="mt-3 max-w-2xl leading-relaxed text-gray-200">
+                    If something is confusing, a tree looks wrong, you find a bug, or you have an idea that would make
+                    Dikarya more useful, please let me know. Alan Rockefeller reads the messages and the public suggestion
+                    list. Email: <span class="font-mono text-sm text-journal-gold-light">alanrockefeller [at] gmail [dot] com</span>.
+                </p>
+                <div class="mt-5">{{ contact_actions() }}</div>
+            </section>
+        </article>
+    </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+    document.querySelectorAll('.js-email-alan').forEach((link) => {
+        const address = `${link.dataset.mailbox}@${link.dataset.domain}.${link.dataset.tld}`;
+        link.href = `mailto:${address}?subject=${encodeURIComponent('Dikarya help')}`;
+    });
+</script>
+{% endblock %}

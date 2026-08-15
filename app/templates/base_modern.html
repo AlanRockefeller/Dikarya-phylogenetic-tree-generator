@@ -5,6 +5,7 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <meta name="csrf-token" content="{{ csrf_token() }}">
+    <meta name="dikarya-release" content="{{ config.RELEASE_VERSION|e }}">
     <title>{% block title %}Dikarya{% endblock %}</title>
     <meta name="description" content="{% block description %}Dikarya - Mycological Research Tools{% endblock %}">
     {% include "partials/favicon_links.html" %}
@@ -69,6 +70,96 @@
 </head>
 
 <body class="bg-journal-cream dark:bg-journal-dark min-h-screen transition-colors duration-300">
+    <script>
+        (() => {
+            const endpoint = '/api/log/client';
+            const seen = new Map();
+            let sending = false;
+            const release = document.querySelector('meta[name="dikarya-release"]')?.content || 'unknown';
+            const csrf = document.querySelector('meta[name="csrf-token"]')?.content || '';
+            const jobMatch = location.pathname.match(/[0-9a-f]{8}-[0-9a-f-]{27,}/i);
+            const clean = (value, limit) => String(value || '')
+                .replace(/https?:\/\/[^\s?]+\?[^\s]+/gi, match => match.split('?')[0] + '?<redacted>')
+                .replace(/\b(code|state|token|authorization)=\S+/gi, '$1=<redacted>')
+                .replace(/[\r\n\t]+/g, ' ').slice(0, limit);
+            async function report(event, details = {}) {
+                if (sending || details.name === 'AbortError') return;
+                const payload = {
+                    event, pathname: location.pathname, job_id: jobMatch?.[0] || '',
+                    action: clean(details.action, 100), message: clean(details.message, 500),
+                    stack: clean(details.stack, 2000), release
+                };
+                const key = [payload.event, payload.pathname, payload.action, payload.message, payload.stack.slice(0, 200)].join('|');
+                const now = Date.now();
+                if (seen.has(key) && now - seen.get(key) < 120000) return;
+                seen.set(key, now);
+                if (seen.size > 100) for (const [item, at] of seen) if (now - at > 120000) seen.delete(item);
+                sending = true;
+                try {
+                    await window.fetch(endpoint, {
+                        method: 'POST', headers: {'Content-Type': 'application/json', 'X-CSRFToken': csrf},
+                        credentials: 'same-origin', body: JSON.stringify(payload), keepalive: true
+                    });
+                } catch (_) { /* telemetry must never recurse */ }
+                finally { sending = false; }
+            }
+            // Call sites pass a STABLE action identifier (e.g. 'tree.export_svg'),
+            // never user-entered text: the action is a grouping key in the server
+            // log and in the digest, and it must not carry specimen names.
+            window.reportClientError = (action, error) => {
+                if (error?.name === 'AbortError') return;
+                report('ui_action_failed', {
+                    action, message: error?.message || error, stack: error?.stack
+                });
+            };
+            window.addEventListener('error', event => {
+                if (event.target && event.target !== window) {
+                    const tag = event.target.tagName?.toLowerCase();
+                    // Scripts and stylesheets only. Images fail constantly and
+                    // harmlessly (deleted iNat photos, hotlinked thumbnails, slow
+                    // CDNs) and a broken <img> is never the cause of a bug report,
+                    // so reporting them buried the failures that matter.
+                    if (['script', 'link'].includes(tag)) report('resource_load_failed', {
+                        action: tag, message: new URL(event.target.src || event.target.href || '', location.href).pathname
+                    });
+                    return;
+                }
+                report('window_error', {message: event.message, stack: event.error?.stack});
+            }, true);
+            window.addEventListener('unhandledrejection', event => {
+                const reason = event.reason;
+                if (reason?.name !== 'AbortError') report('unhandled_rejection', {
+                    message: reason?.message || reason, stack: reason?.stack
+                });
+            });
+            const originalFetch = window.fetch.bind(window);
+            window.fetch = async (...args) => {
+                const raw = typeof args[0] === 'string' ? args[0] : args[0]?.url;
+                let path = '';
+                try { path = raw ? new URL(raw, location.href).pathname : ''; } catch (_) { path = ''; }
+                let response;
+                try {
+                    response = await originalFetch(...args);
+                } catch (err) {
+                    // A rejected request (offline, DNS, TLS, connection reset) never
+                    // produced a status, so the api_non_2xx path below cannot see it.
+                    // Report it, then rethrow untouched so every existing catch block
+                    // behaves exactly as before.
+                    if (err?.name !== 'AbortError' && path !== endpoint) {
+                        report('ui_action_failed', {
+                            action: `network:${path || 'unknown'}`,
+                            message: err?.message || err, stack: err?.stack
+                        });
+                    }
+                    throw err;
+                }
+                if (!response.ok && path.startsWith('/api/') && path !== endpoint && ![400, 401, 403, 404, 409, 422, 429].includes(response.status)) {
+                    report('api_non_2xx', {action: path, message: `HTTP ${response.status}`});
+                }
+                return response;
+            };
+        })();
+    </script>
 
     <!-- Navigation Bar -->
     <nav class="bg-journal-dark shadow-lg sticky top-0 z-50">
@@ -102,6 +193,10 @@
                     <a href="{{ url_for('main.sequence_entry') }}"
                         class="text-gray-300 hover:text-journal-gold transition-colors text-sm font-medium {% block nav_tree_builder %}{% endblock %}">
                         <i class="fas fa-tree mr-1"></i> Tree Builder
+                    </a>
+                    <a href="{{ url_for('main.help_page') }}"
+                        class="text-gray-300 hover:text-journal-gold transition-colors text-sm font-medium {% block nav_help %}{% endblock %}">
+                        <i class="fas fa-circle-question mr-1"></i> Help
                     </a>
                     {% if current_user.is_authenticated %}
                     <span class="text-xs text-gray-400 italic" title="You are signed in">
@@ -168,6 +263,10 @@
                 <a href="{{ url_for('main.sequence_entry') }}"
                     class="block text-gray-200 hover:text-journal-gold transition-colors font-medium py-2">
                     <i class="fas fa-tree mr-2 w-5"></i> Tree Builder
+                </a>
+                <a href="{{ url_for('main.help_page') }}"
+                    class="block text-gray-200 hover:text-journal-gold transition-colors font-medium py-2">
+                    <i class="fas fa-circle-question mr-2 w-5"></i> Help
                 </a>
                 {% if current_user.is_authenticated %}
                 <div class="text-xs text-gray-400 italic py-2 border-t border-journal-dark">

@@ -17,10 +17,11 @@ def run_worker_command():
 def run_metrics_command():
     """Run the system metrics collector."""
     import time
-    from app.monitoring.services import collect_system_metrics
+    from app.monitoring.services import collect_system_metrics, emit_health_transitions
     from app.services.log_rotation import rotate_runtime_logs
+    from app.extensions import db
     import json
-    
+
     metrics_file = current_app.config.get("METRICS_FILE", "var/metrics/system_metrics.jsonl")
     
     # Ensure dir
@@ -35,8 +36,17 @@ def run_metrics_command():
             rotate_runtime_logs(current_app)
             next_log_rotation = now + 3600
         m = collect_system_metrics()
+        emit_health_transitions(m)
         with open(metrics_file, "a") as f:
             f.write(json.dumps(m) + "\n")
+        # Alan 8/15/26 - Release the DB session between ticks.
+        #
+        # emit_health_transitions() runs SELECT 1 and a Job count every minute, and
+        # this loop holds a single app context for the life of the process, so the
+        # session's transaction never ended: production showed this connection
+        # "idle in transaction" for 4h41m, holding ACCESS SHARE on jobs and blocking
+        # any migration that wants an ALTER TABLE.
+        db.session.remove()
         time.sleep(60)
 
 @click.command("whats-new-add")
@@ -214,7 +224,7 @@ def api_token_revoke_command(token_id):
 @click.option("--dry-run", is_flag=True, help="Report what would change, then exit.")
 @with_appcontext
 def reap_stuck_jobs_command(older_than_days, dry_run):
-    """Mark long-abandoned queued/running jobs as failed.
+    """Verify and mark long-abandoned queued/running jobs as failed.
 
     A job left in a non-terminal state keeps its SSE stream alive, and each open
     stream holds one of the (workers x threads) request slots. Enough of them and
@@ -223,23 +233,38 @@ def reap_stuck_jobs_command(older_than_days, dry_run):
     from datetime import datetime, timedelta
     from app.extensions import db
     from app.models import Job
-    from app.services.job_reconcile_service import reconcile_job_statuses
+    from sqlalchemy import func
+    from app.services.job_reconcile_service import (
+        classify_reap_candidate,
+        inspect_rq_job,
+        reconcile_job_statuses,
+    )
+    from app.workers.queue import get_redis_connection
 
     # Ask RQ first. Anything it knows is dead gets corrected regardless of age,
     # which is both more accurate and less blunt than reaping purely on age.
-    reconciled = reconcile_job_statuses(dry_run=dry_run)
+    # Let the age-based section below own verified-missing jobs so the report
+    # clearly distinguishes ordinary terminal RQ reconciliation from reaping.
+    reconciled = reconcile_job_statuses(
+        dry_run=dry_run, reconcile_missing_records=False
+    )
     if reconciled:
         verb = "Would reconcile" if dry_run else "Reconciled"
-        click.echo(f"{verb} {len(reconciled)} job(s) that RQ already considers dead:")
+        click.echo(f"{verb} {len(reconciled)} job(s) through ordinary RQ state handling:")
         for entry in reconciled:
-            click.echo(f"  {entry['job_id']}  {entry['from_status']} -> failed  (rq={entry['rq_status']})")
+            click.echo(
+                f"  {entry['job_id']}  {entry['from_status']} -> "
+                f"{entry['action']}  (rq={entry['rq_status']})"
+            )
         click.echo("")
+
+    reconciled_ids = {entry["job_id"] for entry in reconciled}
 
     cutoff = datetime.utcnow() - timedelta(days=older_than_days)
     stale = (
         Job.query
         .filter(Job.status.in_(("queued", "running")))
-        .filter(Job.created_at < cutoff)
+        .filter(func.coalesce(Job.updated_at, Job.created_at) < cutoff)
         .order_by(Job.created_at)
         .all()
     )
@@ -248,39 +273,94 @@ def reap_stuck_jobs_command(older_than_days, dry_run):
         click.echo(f"No queued/running jobs older than {older_than_days} day(s).")
         return
 
-    click.echo(f"{len(stale)} stale job(s) older than {older_than_days} day(s):")
+    try:
+        redis_conn = get_redis_connection()
+        # A ping distinguishes a constructed client from a working connection.
+        redis_conn.ping()
+    except Exception as exc:
+        click.echo(
+            f"RQ status could not be verified ({exc}); skipped all {len(stale)} "
+            "candidate job(s)."
+        )
+        return
+
+    would_reap = []
+    skipped_live = []
+    skipped_unverified = []
+    ordinary_rq = []
+
     for job in stale:
-        age = datetime.utcnow() - (job.created_at or datetime.utcnow())
-        click.echo(f"  {job.id}  {job.status:<8} age={str(age).split('.')[0]}  user={job.user_id}")
+        activity_at = job.updated_at or job.created_at or datetime.utcnow()
+        age = datetime.utcnow() - activity_at
+        inspection = inspect_rq_job(redis_conn, job.id)
+        item = (job, age, inspection)
+
+        classification = classify_reap_candidate(
+            inspection, already_reconciled=job.id in reconciled_ids
+        )
+        if classification == "ordinary_rq":
+            ordinary_rq.append(item)
+        elif classification == "live":
+            skipped_live.append(item)
+        elif classification == "reap":
+            # Only a positively verified absence may be reaped.  Age identifies
+            # this candidate; it does not override any live RQ state.
+            would_reap.append(item)
+        else:
+            skipped_unverified.append(item)
+
+    def _print_group(label, items):
+        click.echo(f"{label}: {len(items)}")
+        for job, age, inspection in items:
+            rq_status = inspection.status or ("missing" if inspection.missing else "unknown")
+            click.echo(
+                f"  {job.id}  db={job.status:<8} rq={rq_status:<10} "
+                f"inactive={str(age).split('.')[0]}  user={job.user_id}"
+            )
+
+    _print_group("Would reap" if dry_run else "Verified abandoned", would_reap)
+    _print_group("Skipped because live in RQ", skipped_live)
+    _print_group("Skipped because RQ status could not be verified", skipped_unverified)
+    _print_group("Reconciled/skipped through ordinary RQ state handling", ordinary_rq)
 
     if dry_run:
         click.echo("\nDry run: nothing changed.")
         return
 
-    for job in stale:
+    now = datetime.utcnow()
+    for job, _age, _inspection in would_reap:
         metrics = dict(job.metrics or {})
-        metrics["reaped_at"] = datetime.utcnow().isoformat()
+        metrics["reaped_at"] = now.isoformat()
         metrics["reaped_from_status"] = job.status
         metrics["reaped_reason"] = (
-            f"Abandoned in '{job.status}' for more than {older_than_days} day(s); "
-            "marked failed so its status stream cannot hold a request slot open."
+            f"No RQ job record exists and the database was inactive in "
+            f"'{job.status}' for more than {older_than_days} day(s); marked "
+            "failed so its status stream cannot hold a request slot open."
         )
         job.metrics = metrics
         job.status = "failed"
-        job.updated_at = datetime.utcnow()
+        job.updated_at = now
 
-    db.session.commit()
-    click.echo(f"\nMarked {len(stale)} job(s) as failed.")
+    if would_reap:
+        db.session.commit()
+    click.echo(f"\nMarked {len(would_reap)} verified abandoned job(s) as failed.")
 
 
 @click.command("jobs-in-flight")
 @with_appcontext
 def jobs_in_flight_command():
-    """List jobs RQ still considers live. Exit code 1 if any are.
+    """List jobs RQ still considers live. Fail unless safety is verified.
 
     Run this BEFORE `sudo /usr/local/sbin/restart-dikarya-worker`: a restart kills
     the running work horse, losing that job's work and (until the worker's startup
     reconciliation runs) leaving its row stuck.
+
+    Exit codes: 0 = safe to restart, 1 = a job is genuinely in flight and a
+    restart would destroy its work, 2 = nothing is confirmed running but some
+    non-terminal row could not be checked against RQ. Both non-zero codes mean
+    "do not restart", so a plain `if ! flask jobs-in-flight` is still correct;
+    they are distinct because 2 is routine (an expired RQ record self-clears on
+    the worker's next reconciliation pass) while 1 means live work is at stake.
     """
     from app.services.job_reconcile_service import count_jobs_in_flight
 
@@ -289,11 +369,37 @@ def jobs_in_flight_command():
     unknown = result["unknown"]
 
     if unknown:
-        click.echo(f"{len(unknown)} job(s) are non-terminal but unknown to RQ "
-                   f"(likely already dead; `reap-stuck-jobs` will clean them up):")
+        click.echo(
+            "Cannot establish that the worker is safe to restart: "
+            f"{len(unknown)} non-terminal database job(s) could not be "
+            "verified against RQ:"
+        )
         for job_id in unknown:
             click.echo(f"  {job_id}")
-        click.echo("")
+
+        if in_flight:
+            click.echo(
+                f"\nAdditionally, {len(in_flight)} job(s) are confirmed in flight:"
+            )
+            for entry in in_flight:
+                click.echo(
+                    f"  {entry['job_id']}  db={entry['db_status']}  "
+                    f"rq={entry['rq_status']}  created={entry['created_at']}"
+                )
+            click.echo(
+                "\nDo not restart the worker until every job can be verified as terminal."
+            )
+            raise SystemExit(1)
+
+        click.echo(
+            "\nDo not restart the worker until every job can be verified as terminal.\n"
+            "Nothing is confirmed running, though. A row lands here when RQ has "
+            "no record of it, which is normal once RQ's result TTL expires; the "
+            "worker's reconciliation pass marks such rows failed after "
+            "MISSING_RECORD_GRACE. Re-run this after that pass, or use "
+            "`flask reap-stuck-jobs --dry-run` to inspect them."
+        )
+        raise SystemExit(2)
 
     if not in_flight:
         click.echo("No jobs in flight. Safe to restart the worker.")

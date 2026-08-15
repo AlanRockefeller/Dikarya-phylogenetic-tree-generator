@@ -250,7 +250,9 @@ class TestInaturalistTreeSourceLabel(unittest.TestCase):
         self.assertEqual(fake_session.added[0].id, result["job_id"])
         self.assertEqual(fake_session.added[0].status, "queued")
         self.assertEqual(enqueue_job.call_args.kwargs["job_id"], result["job_id"])
-        self.assertEqual(enqueue_job.call_args.kwargs["job_timeout"], 7200)
+        # Timeout selection is centralized in enqueue_job so this path gets the
+        # same general/RAxML allowance as every other submission path.
+        self.assertNotIn("job_timeout", enqueue_job.call_args.kwargs)
 
     def test_local_refresh_queues_before_observation_fetch(self):
         """The automatic local rerun must not run in the HTTP request process."""
