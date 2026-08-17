@@ -29,6 +29,10 @@ from app.extensions import db, limiter
 from app.models import ApiToken, Job
 from app.services.artifact_storage import read_artifact_bytes
 from app.services.security_utils import validate_safe_file_path, coerce_bool
+from app.services.tree_edit_service import (
+    MAX_TREE_TIP_NAME_LENGTH,
+    NEWICK_UNSAFE_TIP_CHARS,
+)
 from app.workers.queue import enqueue_job, enqueue_recompute_job
 
 logger = logging.getLogger(__name__)
@@ -984,13 +988,13 @@ def job_events(job_id):
 # downstream a reasonable size.
 TREE_MUTATION_LIMITS = {
     "max_tips":      10_000,
-    "max_name_len":  256,
+    "max_name_len":  MAX_TREE_TIP_NAME_LENGTH,
 }
 
 # Characters that would corrupt Newick syntax if written verbatim as a tip
 # name. Reject these in *new* tip names (rename target, prune target list)
 # so a malformed name can't break tree exports.
-_NEWICK_UNSAFE = set("()[];,:'\"\t\n\r")
+_NEWICK_UNSAFE = set(NEWICK_UNSAFE_TIP_CHARS) | set("\t\n\r")
 
 
 def _validate_tip_name(field, value, *, allow_newick_unsafe=False):
@@ -1093,31 +1097,17 @@ def prune_tree_v1(job_id):
 @limiter.limit("60 per hour", key_func=api_token_key_func)
 def rename_tip_v1(job_id):
     def handler(job_dir, body):
-        from app.services.tree_edit_service import load_tree_state, rename_tip, save_tree_state
-        max_len = TREE_MUTATION_LIMITS["max_name_len"]
-        old_name = body.get("old_name")
-        new_name = body.get("new_name")
-        if not isinstance(old_name, str) or not old_name:
-            raise ValueError(
-                "`old_name` must be a non-empty string matching an existing "
-                "tip in the tree."
-            )
-        if not isinstance(new_name, str) or not new_name:
-            raise ValueError(
-                "`new_name` must be a non-empty string."
-            )
-        if len(old_name) > max_len or len(new_name) > max_len:
-            raise ValueError(
-                f"Tip names are limited to {max_len:,} characters "
-                f"(old_name={len(old_name)}, new_name={len(new_name)})."
-            )
-        bad = sorted({c for c in new_name if c in _NEWICK_UNSAFE})
-        if bad:
-            raise ValueError(
-                f"`new_name` contains characters that are invalid in Newick "
-                f"tip names: {bad}. Avoid parentheses, brackets, commas, "
-                f"colons, semicolons, quotes, and whitespace other than spaces."
-            )
+        from app.services.tree_edit_service import (
+            load_tree_state,
+            rename_tip,
+            save_tree_state,
+            validate_tip_rename,
+        )
+        if not isinstance(body, dict):
+            raise ValueError("Request body must be a JSON object.")
+        old_name, new_name = validate_tip_rename(
+            body.get("old_name"), body.get("new_name")
+        )
         state = load_tree_state(job_dir)
         state = rename_tip(state, old_name, new_name)
         save_tree_state(job_dir, state)

@@ -4,7 +4,7 @@
 {% block subtitle %}Tree Viewer{% endblock %}
 
 {% block head %}
-<link rel="stylesheet" href="{{ url_for('static', filename='css/tree_viewer.css') }}?v=7">
+<link rel="stylesheet" href="{{ url_for('static', filename='css/tree_viewer.css') }}?v=8">
 <link rel="stylesheet" href="{{ url_for('static', filename='css/phylotree.css') }}">
 <link rel="stylesheet" href="{{ url_for('static', filename='css/phylotree-menus.css') }}?v=2">
 <link rel="preconnect" href="https://fonts.googleapis.com">
@@ -236,8 +236,8 @@
                                 class="fas fa-plus text-[10px]"></i></button>
                     </div>
                     <div class="h-4 w-px bg-gray-300 dark:bg-gray-700 mx-0.5"></div>
-                    <div class="flex items-center gap-1" title="Tip label gap (works with unaligned tips)">
-                        <span class="text-[10px] font-bold text-gray-500 dark:text-gray-400">Text</span>
+                    <div class="flex items-center gap-1" title="Horizontal space between branch tips and their labels.">
+                        <span class="text-[10px] font-bold text-gray-500 dark:text-gray-400">Tip label gap: <span id="tip-label-gap-value">2</span> px</span>
                         <button type="button" id="btn-tip-label-gap-dec" aria-label="Decrease tip label gap"
                             class="px-1.5 hover:text-journal-gold transition-colors"><i
                                 class="fas fa-minus text-[10px]"></i></button>
@@ -584,8 +584,8 @@
             {% endif %}
             <a id="fasta-original" href="#" target="_blank"
                 class="text-journal-gold hover:text-journal-gold-light transition-colors flex items-center gap-1"
-                title="Unaligned sequences and headers exactly as supplied to the tree-building job">
-                <i class="fas fa-download text-xs"></i> Original FASTA
+                title="Unaligned processed sequence set used to build this tree">
+                <i class="fas fa-download text-xs"></i> Processed Input FASTA
             </a>
             <a href="/api/job/{{ job_id }}/download/fasta/aligned" download
                 class="text-journal-gold hover:text-journal-gold-light transition-colors flex items-center gap-1"
@@ -765,7 +765,7 @@
                                 <i class="fas fa-plus"></i> Annotate selected clade…
                             </button>
                             <span class="text-xs text-gray-500 dark:text-gray-400">
-                                or right-click a branch and choose <em>Add clade annotation…</em>
+                                or right-click any non-root branch and choose <em>Add annotation…</em>
                             </span>
                         </div>
                         <div id="annotation-list" class="space-y-1 max-h-[45vh] overflow-y-auto pr-1"></div>
@@ -810,7 +810,7 @@
                     class="px-5 py-4 border-b border-gray-200 dark:border-journal-dark flex items-center justify-between">
                     <div>
                         <h3 id="annotation-editor-title" class="text-lg font-bold text-journal-dark dark:text-gray-100">
-                            Add Clade Annotation
+                            Add Annotation
                         </h3>
                         <p id="annotation-editor-subtitle" class="text-sm text-gray-600 dark:text-gray-300 mt-1"></p>
                     </div>
@@ -828,7 +828,7 @@
                         <textarea id="input-annotation-label" maxlength="500" rows="3"
                             placeholder="Galerina sect. Mycenopsis&#10;Northern clade"
                             class="mt-1 w-full resize-y rounded border border-gray-300 bg-white px-2 py-1.5 text-sm text-gray-900 focus:border-journal-gold focus:ring-journal-gold dark:border-gray-700 dark:bg-journal-dark dark:text-gray-100"></textarea>
-                        <p class="mt-1 text-xs text-gray-500 dark:text-gray-400">Line breaks are preserved in the tree and exported figure.</p>
+                        <p class="mt-1 text-xs text-gray-500 dark:text-gray-400">Up to 500 characters and 10 lines; line breaks are preserved in the tree and exported figure.</p>
                     </div>
 
                     <div>
@@ -836,8 +836,9 @@
                             class="block text-[10px] font-bold uppercase tracking-wide text-gray-500 dark:text-gray-400">Annotation type</label>
                         <select id="select-annotation-type"
                             class="mt-1 w-full rounded border border-gray-300 bg-white px-2 py-1.5 text-sm text-gray-900 focus:border-journal-gold focus:ring-journal-gold dark:border-gray-700 dark:bg-journal-dark dark:text-gray-100">
-                            <option value="line">Line — span the complete clade</option>
-                            <option value="bubble">Bubble — rounded callout at the clade midpoint</option>
+                            <option value="clade_line">Clade line — bracket beside descendant tips</option>
+                            <option value="branch_text">Branch text — multiline text above the branch</option>
+                            <option value="branch_bubble">Branch bubble — rounded callout above the branch</option>
                         </select>
                     </div>
 
@@ -874,7 +875,7 @@
                         <span class="block text-[10px] font-bold uppercase tracking-wide text-gray-500 dark:text-gray-400">Live preview</span>
                         <div id="annotation-live-preview-wrap"
                             class="mt-1 min-h-[72px] overflow-x-auto rounded border border-dashed border-gray-300 bg-gray-50 p-4 dark:border-gray-700 dark:bg-journal-dark/60">
-                            <div id="annotation-live-preview" class="annotation-live-preview"></div>
+                            <svg id="annotation-live-preview" class="annotation-live-preview" role="img" aria-label="Annotation preview"></svg>
                         </div>
                     </div>
 
@@ -1311,13 +1312,13 @@
 
 <script src="{{ url_for('static', filename='vendor/underscore-1.13.6-min.js') }}"></script>
 
-<script src="{{ url_for('static', filename='js/phylotree.js') }}?v=8"></script>
+<script src="{{ url_for('static', filename='js/phylotree.js') }}?v=9"></script>
 
-<script src="{{ url_for('static', filename='js/tree_viewer_phylotree_v2.js') }}?v=65"></script>
+<script src="{{ url_for('static', filename='js/tree_viewer_phylotree_v2.js') }}?v=66"></script>
 
 <script src="{{ url_for('static', filename='js/tree_viewer_api.js') }}?v=6"></script>
 
-<script src="{{ url_for('static', filename='js/tree_viewer_controller.js') }}?v=61"></script>
+<script src="{{ url_for('static', filename='js/tree_viewer_controller.js') }}?v=62"></script>
 
 {% include 'partials/alignment_viewer_modal.html' %}
 

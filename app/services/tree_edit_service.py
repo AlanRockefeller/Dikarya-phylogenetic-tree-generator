@@ -31,6 +31,8 @@ _tree_state_lock_context = threading.local()
 
 MAX_SEQUENCE_OF_INTEREST_LENGTH = 1000
 MAX_SEQUENCE_OF_INTEREST_SOURCE_LENGTH = 64
+MAX_TREE_TIP_NAME_LENGTH = 256
+NEWICK_UNSAFE_TIP_CHARS = frozenset("()[];,:'\"")
 
 
 class DegenerateTreeError(ValueError):
@@ -264,6 +266,31 @@ def _tree_tip_set(tree_json: Dict[str, Any]) -> Set[str]:
 
 def _has_control_chars(value: str) -> bool:
     return any(ord(ch) < 32 or ord(ch) == 127 for ch in value)
+
+
+def validate_tip_rename(old_name: Any, new_name: Any) -> Tuple[str, str]:
+    """Validate external rename inputs before they enter persisted tree state."""
+    for field, value in (("old_name", old_name), ("new_name", new_name)):
+        if not isinstance(value, str):
+            raise ValueError(f"`{field}` must be a string.")
+        if not value.strip():
+            raise ValueError(f"`{field}` must be a non-empty string.")
+        if len(value) > MAX_TREE_TIP_NAME_LENGTH:
+            raise ValueError(
+                f"`{field}` is {len(value):,} characters; the maximum is "
+                f"{MAX_TREE_TIP_NAME_LENGTH:,}."
+            )
+        if _has_control_chars(value):
+            raise ValueError(f"`{field}` contains control characters.")
+
+    bad = sorted(set(new_name) & NEWICK_UNSAFE_TIP_CHARS)
+    if bad:
+        raise ValueError(
+            f"`new_name` contains characters that are invalid in Newick tip "
+            f"names: {bad}. Avoid parentheses, brackets, commas, colons, "
+            f"semicolons, and quotes."
+        )
+    return old_name, new_name
 
 
 def _validate_sequence_of_interest(tree_json: Dict[str, Any],
@@ -1184,7 +1211,7 @@ def has_fasta_affecting_edits(tree_json: Dict) -> bool:
 def build_edited_fasta_text(original_fasta: Path, tree_json: Dict,
                             line_width: int = 60) -> str:
     """
-    Render the original UNALIGNED FASTA with the viewer's current edits applied.
+    Render the unaligned tree-input FASTA with the viewer's current edits applied.
 
     Pruned records are dropped and renamed tips carry their current tree label as
     the whole FASTA header. Nucleotide data is copied verbatim, and the source

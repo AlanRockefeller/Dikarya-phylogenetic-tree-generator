@@ -11087,6 +11087,36 @@
         !options["show-menu"]
       )
         return;
+      // Alan 8/17/26 - Custom items may opt into the first position with a truthy fifth tuple
+      // value. Dikarya uses this for the branch's primary Add/Edit annotation
+      // action while preserving the established order of every other item.
+      const user_elements = [];
+      if ("menu_items" in node && typeof node["menu_items"] === "object") {
+        node["menu_items"].forEach(function(d) {
+          if (d.length >= 3 && (!d[2] || d[2](node))) {
+            const disabled = typeof d[3] === "function" ? d[3](node) : Boolean(d[3]);
+            user_elements.push([d[0], d[1], disabled, Boolean(d[4])]);
+          }
+        });
+      }
+      const append_user_element = function(d) {
+        menu_object
+          .append("a")
+          .attr("class", "phylotree-menu-item dropdown-item" + (d[2] ? " disabled" : ""))
+          .attr("aria-disabled", d[2] ? "true" : null)
+          .attr("tabindex", "-1")
+          .text((d[0])(node))
+          .on("click", () => {
+            if (d[2]) return;
+            menu_object.style("display", "none");
+            d[1](node);
+          });
+      };
+      const priority_user_elements = user_elements.filter(d => d[3]);
+      priority_user_elements.forEach(append_user_element);
+      if (priority_user_elements.length) {
+        menu_object.append("div").attr("class", "phylotree-menu-divider dropdown-divider");
+      }
       // Alan 7/14/26 - Let the viewer supply its visible selected tips for a bulk observation-record action.
       const selectedRecordNodes = typeof this.recordTargetNodesProvider === "function"
         ? this.recordTargetNodesProvider(node)
@@ -11260,18 +11290,8 @@
 
       // now see if we need to add user defined menus
 
-      var has_user_elements = [];
-      if ("menu_items" in node && typeof node["menu_items"] === "object") {
-        node["menu_items"].forEach(function(d) {
-          if (d.length >= 3) {
-            if (!d[2] || d[2](node)) {
-              // Alan 8/13/26 - An optional fourth value keeps unavailable custom actions visible but disabled.
-              const disabled = typeof d[3] === "function" ? d[3](node) : Boolean(d[3]);
-              has_user_elements.push([d[0], d[1], disabled]);
-            }
-          }
-        });
-      }
+      // Alan 8/17/26 - Reuse the validated custom-item list for non-priority entries.
+      const has_user_elements = user_elements.filter(d => !d[3]);
 
       if (has_user_elements.length) {
         const show_divider_options = [
@@ -11284,20 +11304,8 @@
           menu_object.append("div").attr("class", "phylotree-menu-divider dropdown-divider");
         }
 
-        has_user_elements.forEach(function(d) {
-          menu_object
-            .append("a")
-            .attr("class", "phylotree-menu-item dropdown-item" + (d[2] ? " disabled" : ""))
-            .attr("aria-disabled", d[2] ? "true" : null)
-            .attr("tabindex", "-1")
-            .text((d[0])(node)) // eslint-disable-line
-            // Alan 6/4/26 - Close custom menu actions before running them so copy/prune/rotate do not leave the menu open.
-            .on("click", () => {
-              if (d[2]) return;
-              menu_object.style("display", "none");
-              d[1](node);
-            });
-        });
+        // Alan 8/17/26 - Render ordinary custom items with the same disabled and close behavior.
+        has_user_elements.forEach(append_user_element);
       }
 
       let tree_container = document.querySelector(container); // eslint-disable-line
@@ -12155,7 +12163,13 @@
       this.label_width = this._label_width(this.shown_font_size);
 
       const _label_width = this.options["show-labels"] ? this.label_width : 0;
-      return this.offsets[1] + this.options["left-offset"] + _label_width;
+      // Alan 8/17/26 - Grow fixed SVG padding beyond Dikarya's established 2px label gap;
+      // radial layout consumes this as symmetric padding on every side.
+      const requested_tip_gap = Number(this.options["tip-label-gap"]);
+      const extra_tip_gap = Number.isFinite(requested_tip_gap)
+        ? Math.max(0, requested_tip_gap - 2)
+        : 0;
+      return this.offsets[1] + this.options["left-offset"] + _label_width + extra_tip_gap;
     }
 
     /**

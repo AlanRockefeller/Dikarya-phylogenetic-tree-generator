@@ -2436,11 +2436,31 @@ def rename_tree_tip(job_id):
     job_dir = Config.JOB_DIR / job_id
         
     data = request.get_json(silent=True) or {}
-    old_name = data.get("old_name")
-    new_name = data.get("new_name")
-    
+    if not isinstance(data, dict):
+        return jsonify({
+            "status": "error",
+            "error": "Request body must be a JSON object.",
+        }), 400
+
     try:
-        from app.services.tree_edit_service import load_tree_state, rename_tip, save_tree_state, tree_state_lock
+        from app.services.tree_edit_service import (
+            load_tree_state,
+            rename_tip,
+            save_tree_state,
+            tree_state_lock,
+            validate_tip_rename,
+        )
+    except Exception as e:
+        return _server_error(e)
+
+    try:
+        old_name, new_name = validate_tip_rename(
+            data.get("old_name"), data.get("new_name")
+        )
+    except ValueError as e:
+        return jsonify({"status": "error", "error": str(e)}), 400
+
+    try:
         with tree_state_lock(job_dir):
             state = load_tree_state(job_dir)
             state = rename_tip(state, old_name, new_name)
@@ -3264,8 +3284,8 @@ def download_fasta_original(job_id):
 
 @bp.route('/job/<job_id>/download/fasta/edited', methods=['GET'])
 def download_fasta_edited(job_id):
-    """Download the current unaligned sequence set: original FASTA with the tree
-    viewer's pruning and renaming applied. Built fresh from the persisted tree
+    """Download the current unaligned tree input with the tree viewer's pruning
+    and renaming applied. Built fresh from the persisted tree
     state on every request so it can never serve a stale export."""
     from io import BytesIO
 

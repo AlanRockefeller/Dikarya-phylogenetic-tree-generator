@@ -42,7 +42,10 @@
             font_style: 'normal',
             font_weight: 'normal',
             text_color: '#1f2937',
-            line_color: '#1f2937'
+            // Alan 8/17/26 - Supply default border, fill, and opacity for branch bubbles.
+            line_color: '#1f2937',
+            fill_color: '#ffffff',
+            fill_opacity: 0.9
         }
     };
 
@@ -285,6 +288,8 @@
          * Apply text sizing based on zoom level.
          */
         applyTextSizing() { }
+        // Alan 8/17/26 - Let implementations expose the independent tip-label offset.
+        setTipLabelGap(value) { }
 
         /**
          * Sort/ladderize nodes.
@@ -338,6 +343,8 @@
                 layout: 'linear',
                 alignTips: false
             }, initialOptions);
+            // Alan 8/17/26 - Track tip-label spacing independently from branch spacing.
+            this.tipLabelGap = 2;
             // Alan 5/9/26 - Build a lookup once so tree tips can be matched to stored BLAST metrics quickly.
             this.sequenceMetricMap = this._buildSequenceMetricMap(this.options.sequenceMetrics);
 
@@ -496,6 +503,50 @@
                 // Alan 7/17/26 - Register a count-aware prune item that passes the same resolved nodes used by its label.
                 if (n.parent) {
                     n.menu_items = n.menu_items || [];
+                    // Alan 8/17/26 - Priority custom item: phylotree renders the optional fifth-field items
+                    // before its built-in collapse/selection actions.
+                    n.menu_items.unshift([
+                        (node) => {
+                            const count = this.getAnnotationsForNode(node).length;
+                            if (count === 1) return 'Edit annotation…';
+                            if (count > 1) return `Edit annotations… (${count})`;
+                            return 'Add annotation…';
+                        },
+                        (node) => {
+                            const memberIds = this.getDescendantLeafIds(node);
+                            const annotationIds = this.getAnnotationsForNode(node)
+                                .map((annotation) => annotation.id).filter(Boolean);
+                            if (typeof this._onAddCladeAnnotation === 'function') {
+                                this._onAddCladeAnnotation(node, memberIds, {
+                                    annotationIds,
+                                    defaultType: (node.children && node.children.length)
+                                        ? 'clade_line' : 'branch_text'
+                                });
+                            }
+                        },
+                        (node) => !window.VIEW_ONLY && Boolean(node.parent)
+                            && this.getDescendantLeafIds(node).length > 0,
+                        false,
+                        true
+                    ], [
+                        // Alan 8/17/26 - Keep an explicit creation path once one or more
+                        // annotations already occupy this incoming branch.
+                        () => 'Add another annotation…',
+                        (node) => {
+                            const memberIds = this.getDescendantLeafIds(node);
+                            if (typeof this._onAddCladeAnnotation === 'function') {
+                                this._onAddCladeAnnotation(node, memberIds, {
+                                    forceAdd: true,
+                                    defaultType: (node.children && node.children.length)
+                                        ? 'clade_line' : 'branch_text'
+                                });
+                            }
+                        },
+                        (node) => !window.VIEW_ONLY && Boolean(node.parent)
+                            && this.getAnnotationsForNode(node).length > 0,
+                        false,
+                        true
+                    ]);
                     n.menu_items.push([
                         // Alan 7/17/26 - Show how many terminal sequences the context action will remove.
                         (node) => this._getPruneMenuLabel(node),
@@ -552,6 +603,8 @@
                         true
                     ]);
                 }
+                // Alan 8/17/26 - Annotation actions are registered for every parented node above;
+                // internal-node-specific registration here now only adds rotation.
                 if (n.children) {
                     n.children.forEach((c, i) => c.__original_index = i);
                     // Alan 6/2/26 - Register "Rotate node" as a native phylotree internal-node menu item so it
@@ -563,21 +616,7 @@
                             (node) => { if (typeof this._onRotateNode === 'function') this._onRotateNode(node); },
                             (node) => Boolean(node.children && node.children.length >= 2)
                         ]);
-                        // Alan 8/15/26 - Annotate a whole clade from the same native internal-node menu,
-                        // so the user never has to select every descendant of an obvious clade by hand.
-                        n.menu_items.push([
-                            (node) => {
-                                const count = this.getDescendantLeafIds(node).length;
-                                return `Add clade annotation… (${count} tip${count === 1 ? '' : 's'})`;
-                            },
-                            (node) => {
-                                const memberIds = this.getDescendantLeafIds(node);
-                                if (typeof this._onAddCladeAnnotation === 'function') {
-                                    this._onAddCladeAnnotation(node, memberIds);
-                                }
-                            },
-                            (node) => !window.VIEW_ONLY && this.getDescendantLeafIds(node).length > 0
-                        ]);
+                        // Alan 8/17/26 - Annotation creation now stays in the shared priority menu above.
                     }
                 }
             });
@@ -674,6 +713,8 @@
                 'zoom': true,
                 // Alan 8/16/26 - Keep phylotree's built-in brush off; our own left-drag box select replaces it.
                 'brush': false,
+                // Alan 8/17/26 - Include custom tip-label spacing in phylotree's SVG padding.
+                'tip-label-gap': this.tipLabelGap,
                 'left-right-spacing': 'fixed-step',
                 'top-bottom-spacing': 'fixed-step',
                 'node-styler': (element, node) => this._styleNode(element, node)
@@ -862,6 +903,38 @@
 
         applyTextSizing() {
             this._applyTextSizingFromZoom();
+        }
+
+        // Alan 8/17/26 - Keep the independent tip-label offset in the requested 0-80 px,
+        // two-pixel-step range and repaint without changing branch geometry.
+        setTipLabelGap(value) {
+            const numeric = Number(value);
+            const clamped = Number.isFinite(numeric)
+                ? Math.max(0, Math.min(80, Math.round(numeric / 2) * 2))
+                : 2;
+            this.tipLabelGap = clamped;
+            const output = document.getElementById('tip-label-gap-value');
+            if (output) output.textContent = String(clamped);
+            // Alan 8/17/26 - Ask phylotree to recompute its label padding immediately so a
+            // large gap cannot push labels beyond the fixed-step SVG viewport.
+            const display = this.tree?.display;
+            if (display) {
+                display.options['tip-label-gap'] = clamped;
+                // Alan 8/17/26 - Reset phylotree's raw size before resizeSvg adds padding,
+                // preventing repeated gap clicks from compounding the current SVG dimensions.
+                if (typeof display.placenodes === 'function') display.placenodes();
+                if (typeof display.resizeSvg === 'function') {
+                    display.resizeSvg(display.phylotree, display.svg, false);
+                }
+            }
+            this._applyTextSizingFromZoom();
+            return clamped;
+        }
+
+        // Alan 8/17/26 - Convert the saved screen-space gap into an outward SVG offset.
+        _tipLabelDx(node, zoomScale = 1) {
+            const direction = node?.text_align === 'end' ? -1 : 1;
+            return direction * this.tipLabelGap / (zoomScale || 1);
         }
 
         sortNodes(mode) {
@@ -2138,7 +2211,9 @@
 
             svg.selectAll("text.phylotree-node-text")
                 .style("font-size", `${tipFontSvgPx}px`)
-                .attr("dx", 2.0 / k).attr("dy", 1.9 / k);
+                // Alan 8/17/26 - Preserve phylotree's outward sign for end-aligned radial labels.
+                .attr("dx", d => this._tipLabelDx(d, k))
+                .attr("dy", 1.9 / k);
 
             // Alan 8/15/26 - Tip labels keep a constant screen size across zoom, so the label
             // edge the annotations sit beside moves with k. Redraw them on the same trailing
@@ -2239,6 +2314,22 @@
          * Robust click handling using Native DOM Capture Phase.
          * Intercepts clicks BEFORE phylotree sees them.
          */
+        // Alan 8/17/26 - Resolve a node-menu target from either a node element or a rendered
+        // branch edge. phylotree binds path.branch to {source,target}; the distal target owns
+        // the branch's canonical descendant set regardless of where along the path was clicked.
+        _getContextMenuNode(target) {
+            if (!target || typeof target.closest !== 'function') return null;
+            const nodeElement = target.closest('.node, .internal-node');
+            const branchElement = target.closest('path.branch');
+            let node = window.d3v7.select(target).datum()
+                || (nodeElement ? window.d3v7.select(nodeElement).datum() : null);
+            if (branchElement) {
+                const edge = window.d3v7.select(branchElement).datum();
+                if (edge?.target) node = edge.target;
+            }
+            return node || null;
+        }
+
         _overrideClickBehavior() {
             const self = this;
 
@@ -2281,12 +2372,15 @@
             // Define context menu listener (for Right Click)
             this._contextMenuListener = function (event) {
                 const target = event.target;
-                if (target.classList.contains('phylotree-node-text') || target.tagName === 'circle' || target.closest('.node')) {
+                // Alan 8/17/26 - Resolve both node and incoming-branch right clicks to a distal node.
+                const d = self._getContextMenuNode(target);
+                if (d && (target.classList.contains('phylotree-node-text')
+                    || target.tagName === 'circle'
+                    || target.closest('.node, .internal-node, path.branch'))) {
                     event.preventDefault(); // Stop Chrome menu
                     event.stopPropagation();
 
-                    const d = window.d3v7.select(target).datum() || window.d3v7.select(target.closest('.node')).datum();
-
+                    // Alan 8/17/26 - Dispatch the already-resolved distal node to phylotree's menu.
                     if (self.tree && self.tree.display) {
                         self.tree.display.handle_node_click(d, event);
                     }
@@ -2358,8 +2452,9 @@
                 // Alan 5/11/26 - Context menu handling is complete for suppressed box gestures.
                 return;
             }
-            // Alan 5/11/26 - Preserve node context menus because they are handled by phylotree.
-            if (event.target?.closest?.('.node, .internal-node')) return;
+            // Alan 8/17/26 - Preserve node and incoming-branch context menus. Branch paths are bound to
+            // {source,target}; the bubble-phase listener resolves their distal target.
+            if (event.target?.closest?.('.node, .internal-node, path.branch')) return;
             // Alan 8/16/26 - Background right-drag now pans the tree, so the browser menu must stay closed.
             event.preventDefault();
             // Alan 5/11/26 - Keep background context clicks from bubbling into unrelated handlers.
@@ -2400,8 +2495,8 @@
         _isBoxSelectBackgroundTarget(target) {
             // Alan 5/11/26 - Defensive guard for non-element event targets.
             if (!target || typeof target.closest !== 'function') return false;
-            // Alan 5/11/26 - Keep tip and internal-node click/right-click behavior unchanged.
-            if (target.closest('.node, .internal-node')) return false;
+            // Alan 8/17/26 - Keep tip, internal-node, and incoming-branch context menus out of box select.
+            if (target.closest('.node, .internal-node, path.branch')) return false;
             // Alan 5/11/26 - Avoid hijacking toolbar or form controls if they bubble through the container.
             if (target.closest('button, a, input, select, textarea, label')) return false;
             // Alan 5/11/26 - Allow empty SVG background and the surrounding tree container.
@@ -3368,6 +3463,43 @@
             return ids;
         }
 
+        // Alan 8/17/26 - Compare annotations by canonical descendant membership rather than
+        // display order, so rotation and renaming cannot turn Edit into an accidental Add.
+        _annotationMembershipKey(ids) {
+            return Array.from(new Set(Array.isArray(ids) ? ids.filter(Boolean) : []))
+                .sort().join('\u0000');
+        }
+
+        // Alan 8/17/26 - Reuse exact membership lookup for both branch context menus and the
+        // selected-clade workflow.
+        getAnnotationsForMemberIds(memberIds) {
+            const key = this._annotationMembershipKey(memberIds);
+            if (!key) return [];
+            return this.cladeAnnotations.filter((annotation) =>
+                annotation && this._annotationMembershipKey(annotation.member_tip_ids) === key
+            );
+        }
+
+        // Alan 8/17/26 - Distinguish a clade from an annotatable incoming branch. The root
+        // is a valid whole-tree clade but deliberately returns false here.
+        hasIncomingBranchForMemberIds(memberIds) {
+            const key = this._annotationMembershipKey(memberIds);
+            if (!key) return false;
+            // Alan 8/17/26 - Reject different-sized candidates via the cached leaf count before
+            // walking descendants; whole-tree membership now performs no subtree traversals.
+            const memberCount = new Set(memberIds.filter(Boolean)).size;
+            return this.allNodes.some((node) => node?.parent
+                && node.__leafCount === memberCount
+                && this._annotationMembershipKey(this.getDescendantLeafIds(node)) === key);
+        }
+
+        // Alan 8/17/26 - Resolve a clicked node to the annotations already attached to its
+        // exact descendant set. The root has no context-menu annotation action.
+        getAnnotationsForNode(node) {
+            if (!node?.parent) return [];
+            return this.getAnnotationsForMemberIds(this.getDescendantLeafIds(node));
+        }
+
         /**
          * Alan 8/15/26 - Resolve the current selection into a clade.
          * Returns the descendant leaf IDs when the selected leaves are exactly the
@@ -3467,11 +3599,21 @@
         // collapses them, so multiline labels used to render as one run-on line.
         _annotationLabelLines(label) {
             const text = String(label === null || label === undefined ? '' : label);
-            const lines = text.replace(/\r\n/g, '\n').replace(/\r/g, '\n').split('\n');
+            // Alan 8/17/26 - Normalize tabs and cap lines exactly as the server validator does.
+            const lines = text.replace(/\r\n/g, '\n').replace(/\r/g, '\n')
+                .replace(/\t/g, '    ').split('\n');
             // Keep interior blank lines (they are deliberate spacing) but never let a
             // trailing newline add an empty row that shifts the block off-centre.
             while (lines.length > 1 && lines[lines.length - 1].trim() === '') lines.pop();
-            return lines.length ? lines : [''];
+            return (lines.length ? lines : ['']).slice(0, 10);
+        }
+
+        // Alan 8/17/26 - Read old missing/short-lived type values lazily without rewriting state.
+        _annotationType(annotation) {
+            const type = annotation?.annotation_type;
+            if (type === 'branch_text') return 'branch_text';
+            if (type === 'branch_bubble' || type === 'bubble') return 'branch_bubble';
+            return 'clade_line';
         }
 
         // Alan 8/15/26 - Measure rendered label width with a throwaway <text> in the live SVG,
@@ -3570,15 +3712,20 @@
          * tip order, so "does this member set form one clade?" becomes a set lookup on
          * "firstIndex:lastIndex" instead of a fresh traversal per annotation.
          */
-        _buildCladeBlockIndex(positions) {
-            const blocks = new Set();
+        // Alan 8/17/26 - Build clade and incoming-branch topology indexes together.
+        _buildAnnotationTopologyIndexes(positions) {
+            const cladeBlocks = new Set();
+            const branchNodes = new Map();
             const visit = (node) => {
                 const children = node.children || [];
                 if (!children.length) {
                     const id = this._getNodeId(node);
                     const entry = id ? positions.get(id) : null;
                     if (!entry) return null;
-                    blocks.add(`${entry.index}:${entry.index}`);
+                    // Alan 8/17/26 - Index terminal clades while excluding only a root branch target.
+                    const key = `${entry.index}:${entry.index}`;
+                    cladeBlocks.add(key);
+                    if (node.parent) branchNodes.set(key, node);
                     return { min: entry.index, max: entry.index };
                 }
                 let min = Infinity;
@@ -3590,13 +3737,27 @@
                     if (span.max > max) max = span.max;
                 }
                 if (min === Infinity) return null;
-                blocks.add(`${min}:${max}`);
+                const key = `${min}:${max}`;
+                // Alan 8/17/26 - Every node, including the root, is a valid clade block for
+                // a publication bracket; only non-root nodes own an incoming branch.
+                cladeBlocks.add(key);
+                if (node.parent) branchNodes.set(key, node);
                 return { min, max };
             };
             for (const root of this.allNodes) {
                 if (!root.parent) visit(root);
             }
-            return blocks;
+            return { cladeBlocks, branchNodes };
+        }
+
+        // Alan 8/17/26 - Retain the incoming-branch index helper for renderer compatibility.
+        _buildCladeNodeIndex(positions) {
+            return this._buildAnnotationTopologyIndexes(positions).branchNodes;
+        }
+
+        // Alan 8/17/26 - Retain the clade-block helper for DOM-free geometry callers.
+        _buildCladeBlockIndex(positions) {
+            return this._buildAnnotationTopologyIndexes(positions).cladeBlocks;
         }
 
         // Alan 8/15/26 - True when the sorted tip indices occupy one unbroken block of the
@@ -3622,9 +3783,15 @@
          * showing the warning, the state stays persisted, and rerooting back to a topology
          * where the set is a clade again makes it render again on the next redraw.
          */
-        _resolveAnnotationsForRender(positions, cladeBlocks, layerById) {
+        // Alan 8/17/26 - Accept a precomputed incoming-branch index for type-aware resolution.
+        _resolveAnnotationsForRender(positions, cladeBlocks, layerById, branchNodes = null) {
             const validity = new Map();
             const resolved = [];
+            // Alan 8/17/26 - Accept the precomputed branch index, with compatibility fallbacks.
+            const incomingBranchNodes = branchNodes
+                || (cladeBlocks instanceof Map
+                    ? cladeBlocks
+                    : this._buildCladeNodeIndex(positions));
             for (const annotation of this.cladeAnnotations) {
                 if (!annotation || !annotation.id) continue;
                 const layer = layerById.get(annotation.layer_id) || null;
@@ -3642,8 +3809,14 @@
                     continue;
                 }
                 indices.sort((a, b) => a - b);
-                const valid = this._annotationIsContiguous(indices)
-                    && cladeBlocks.has(`${indices[0]}:${indices[indices.length - 1]}`);
+                // Alan 8/17/26 - Branch text and bubbles additionally require a non-root target.
+                const blockKey = `${indices[0]}:${indices[indices.length - 1]}`;
+                const annotationType = this._annotationType(annotation);
+                const isClade = this._annotationIsContiguous(indices)
+                    && cladeBlocks.has(blockKey);
+                const hasIncomingBranch = incomingBranchNodes.has(blockKey);
+                const valid = isClade
+                    && (annotationType === 'clade_line' || hasIncomingBranch);
                 validity.set(annotation.id, { present: indices.length, valid });
                 // Invalid annotations are kept in state and flagged in the manager, but they
                 // are never drawn: any line beside the tips would imply a clade that the
@@ -3651,7 +3824,14 @@
                 if (!valid) continue;
                 // Hidden layers keep their annotations but neither draw nor reserve width.
                 if (!layer || layer.visible === false) continue;
-                resolved.push({ annotation, layer, indices });
+                // Alan 8/17/26 - Carry the target node and save order into branch stacking.
+                resolved.push({
+                    annotation,
+                    layer,
+                    indices,
+                    targetNode: incomingBranchNodes.get(blockKey) || null,
+                    savedIndex: this.cladeAnnotations.indexOf(annotation)
+                });
             }
             return { validity, resolved };
         }
@@ -3681,12 +3861,22 @@
                 svgNode.setAttribute('data-annotation-base-width', currentWidth);
             }
             const baseWidth = parseFloat(svgNode.getAttribute('data-annotation-base-width'));
+            // Alan 8/17/26 - Preserve phylotree's own viewBox separately from annotation expansion.
+            const currentViewBox = svgNode.getAttribute('viewBox') || '';
+            if (currentViewBox !== svgNode.getAttribute('data-annotation-set-viewbox')) {
+                svgNode.setAttribute('data-annotation-base-viewbox', currentViewBox);
+            }
+            const baseViewBox = svgNode.getAttribute('data-annotation-base-viewbox') || '';
             const setWidth = (value) => {
                 svgNode.setAttribute('width', String(value));
                 svgNode.setAttribute('data-annotation-set-width', String(value));
             };
             const restoreWidth = () => {
                 if (Number.isFinite(baseWidth)) setWidth(baseWidth);
+                // Alan 8/17/26 - Restore both dimensions of the original viewport with its width.
+                if (baseViewBox) svgNode.setAttribute('viewBox', baseViewBox);
+                else svgNode.removeAttribute('viewBox');
+                svgNode.setAttribute('data-annotation-set-viewbox', baseViewBox);
             };
 
             const layerById = new Map();
@@ -3711,7 +3901,8 @@
             const geometry = this._buildAnnotationGeometry(svg);
             if (!geometry) { this._annotationsDrawn = false; restoreWidth(); return; }
             const { positions, labelRight, rowPitch } = geometry;
-            const cladeBlocks = this._buildCladeBlockIndex(positions);
+            // Alan 8/17/26 - Build clade validity and incoming-branch targets in the same pass.
+            const { cladeBlocks, branchNodes } = this._buildAnnotationTopologyIndexes(positions);
 
             // Tip labels are kept at constant screen size by _applyTextSizingFromZoom, so scale
             // annotation text the same way and the bracket keeps its relationship to the labels.
@@ -3722,12 +3913,16 @@
             const GAP_BETWEEN_LANES = 14 * scale;
             const LINE_TO_TEXT_GAP = 6 * scale;
             const LINE_WIDTH = Math.max(0.5, 1.5 * scale);
+            // Alan 8/17/26 - Keep stacked branch labels clear of their branch and each other.
+            const BRANCH_GAP = 5 * scale;
 
             // Alan 8/15/26 - Resolve each annotation against the current tree once. Only the
             // ones that are still exactly one clade come back for drawing; the rest are
             // recorded as invalid for the manager's warning and left off the figure.
+            // Alan 8/17/26 - Pass the shared incoming-branch index into type-aware validation.
             const { validity, resolved } = this._resolveAnnotationsForRender(
-                positions, cladeBlocks, layerById
+                // Alan 8/17/26 - Reuse branch targets built with the clade-block index.
+                positions, cladeBlocks, layerById, branchNodes
             );
             this.annotationValidity = validity;
 
@@ -3750,36 +3945,38 @@
                 return entry ? entry.y : 0;
             };
 
+            // Alan 8/17/26 - Resolve text/style and measure once; both clade lanes and incoming-branch
+            // annotations consume this exact item shape and the same SVG text primitive.
+            for (const item of resolved) {
+                const style = {};
+                for (const field of ['font_family', 'font_size', 'font_style',
+                    'font_weight', 'text_color', 'line_color', 'fill_color',
+                    'fill_opacity']) {
+                    const entry = this._resolveAnnotationStyleEntry(item.annotation, item.layer, field);
+                    style[field] = (field === 'font_size' || field === 'fill_opacity')
+                        ? Number(entry.value) : entry.value;
+                    style[field + '_is_default'] = entry.isDefault;
+                }
+                item.style = style;
+                item.lines = this._annotationLabelLines(item.annotation.label);
+                item.label = item.lines.join('\n');
+                item.type = this._annotationType(item.annotation);
+                item.top = yOf(item.indices[0]);
+                item.bottom = yOf(item.indices[item.indices.length - 1]);
+                item.textWidth = this._measureAnnotationLabel(svgNode, item.lines, style) * scale;
+                item.scaledFontSize = style.font_size * scale;
+                item.metrics = this._annotationLayoutMetrics(item, LINE_TO_TEXT_GAP);
+            }
+
             let cursorX = labelRight + GAP_FROM_TREE;
 
             for (const layer of orderedLayers) {
-                const items = resolved.filter((item) => item.layer.id === layer.id);
+                // Alan 8/17/26 - Reserve right-side lanes only for publication-style clade lines.
+                const items = resolved.filter((item) => item.layer.id === layer.id
+                    && item.type === 'clade_line');
                 if (!items.length) continue;
 
-                // Alan 8/17/26 - Prepare each item's vertical extent, its measured width (the
-                // WIDEST line, now that labels may be multiline) and the box geometry its
-                // annotation type occupies, so packing and lane widths account for a bubble
-                // and for a label taller than the clade it names.
-                for (const item of items) {
-                    const style = {};
-                    for (const field of ['font_family', 'font_size', 'font_style',
-                        'font_weight', 'text_color', 'line_color']) {
-                        const entry = this._resolveAnnotationStyleEntry(item.annotation, item.layer, field);
-                        style[field] = field === 'font_size' ? Number(entry.value) : entry.value;
-                        style[field + '_is_default'] = entry.isDefault;
-                    }
-                    const lines = this._annotationLabelLines(item.annotation.label);
-                    item.style = style;
-                    item.lines = lines;
-                    item.label = lines.join('\n');
-                    item.type = item.annotation.annotation_type === 'bubble' ? 'bubble' : 'line';
-                    item.top = yOf(item.indices[0]);
-                    item.bottom = yOf(item.indices[item.indices.length - 1]);
-                    item.textWidth = this._measureAnnotationLabel(svgNode, lines, style) * scale;
-                    item.scaledFontSize = style.font_size * scale;
-                    item.metrics = this._annotationLayoutMetrics(item, LINE_TO_TEXT_GAP);
-                }
-
+                // Alan 8/17/26 - Item preparation moved above so branch and clade renderers share it.
                 // Greedy interval packing into sub-lanes so nested or overlapping annotations
                 // in one layer never draw on top of each other. The extents are the DRAWN
                 // ones, so a bubble packs by its box and a tall multiline label reserves the
@@ -3812,14 +4009,47 @@
                 }
             }
 
+            // Alan 8/17/26 - Branch annotations are attached to the exact node resolved from the saved
+            // descendant set. Layer order affects only stacking on that SAME branch.
+            const layerOrder = new Map(orderedLayers.map((layer, index) => [layer.id, index]));
+            const branchItems = resolved
+                .filter((item) => item.type !== 'clade_line' && item.targetNode?.parent)
+                .sort((a, b) => (layerOrder.get(a.layer.id) - layerOrder.get(b.layer.id))
+                    || (a.savedIndex - b.savedIndex));
+            const branchCursors = new Map();
+            for (const item of branchItems) {
+                const node = item.targetNode;
+                const point = this._annotationNodePoint(node);
+                const parentPoint = this._annotationNodePoint(node.parent);
+                if (!point || !parentPoint) continue;
+                const branchKey = item.indices.join(':');
+                let bottom = branchCursors.get(branchKey);
+                if (!Number.isFinite(bottom)) {
+                    bottom = point.y - BRANCH_GAP;
+                    const supportBox = this._annotationSupportBox(svg, node, point);
+                    if (supportBox) bottom = Math.min(bottom, supportBox.top - BRANCH_GAP);
+                }
+                const branchMetrics = this._branchAnnotationMetrics(item);
+                branchMetrics.midY = bottom - branchMetrics.boxHeight / 2;
+                branchMetrics.renderTop = bottom - branchMetrics.boxHeight;
+                branchMetrics.renderBottom = bottom;
+                item.metrics = branchMetrics;
+                const centerX = (parentPoint.x + point.x) / 2;
+                this._drawBranchAnnotation(group, item, centerX, LINE_WIDTH);
+                branchCursors.set(branchKey, branchMetrics.renderTop - BRANCH_GAP);
+            }
+
             this._annotationsDrawn = true;
 
             // Grow the canvas so long labels and large fonts are never clipped. The tree
             // itself is untouched -- shrinking it to fit would make the biology unreadable.
             let requiredRight = cursorX;
+            // Alan 8/17/26 - Capture the full annotation bounds for width and viewBox expansion.
+            let annotationBox = null;
             try {
-                const box = group.node().getBBox();
-                requiredRight = Math.max(requiredRight, box.x + box.width);
+                // Alan 8/17/26 - Measure once and reuse the same bounds for all viewport axes.
+                annotationBox = group.node().getBBox();
+                requiredRight = Math.max(requiredRight, annotationBox.x + annotationBox.width);
             } catch (_) { /* fall back to the layout cursor */ }
             // The container group carries translate(...) alone before any zoom, and
             // translate(...) scale(k) afterwards, so convert group units to SVG units.
@@ -3833,41 +4063,38 @@
             } else if (needed > 0) {
                 setWidth(needed);
             }
+            // Alan 8/17/26 - Branch labels may extend above or left of their short incoming segment. Expand
+            // the viewBox instead of shrinking text or clipping the saved/exported figure.
+            if (annotationBox) {
+                const raw = (baseViewBox || `0 0 ${Number.isFinite(baseWidth) ? baseWidth : needed} ${parseFloat(svgNode.getAttribute('height')) || 800}`)
+                    .trim().split(/[\s,]+/).map(Number);
+                if (raw.length === 4 && raw.every(Number.isFinite)) {
+                    const translate = /translate\(\s*(-?[\d.]+)(?:[ ,]+(-?[\d.]+))?/.exec(transform);
+                    const tx = translate ? (parseFloat(translate[1]) || 0) : 0;
+                    const ty = translate ? (parseFloat(translate[2]) || 0) : 0;
+                    const left = tx + annotationBox.x * (k || 1) - 12;
+                    const top = ty + annotationBox.y * (k || 1) - 12;
+                    const right = tx + (annotationBox.x + annotationBox.width) * (k || 1) + 12;
+                    const bottom = ty + (annotationBox.y + annotationBox.height) * (k || 1) + 12;
+                    const minX = Math.min(raw[0], left);
+                    const minY = Math.min(raw[1], top);
+                    const maxX = Math.max(raw[0] + raw[2], right, needed);
+                    const maxY = Math.max(raw[1] + raw[3], bottom);
+                    const nextViewBox = `${minX} ${minY} ${maxX - minX} ${maxY - minY}`;
+                    svgNode.setAttribute('viewBox', nextViewBox);
+                    svgNode.setAttribute('data-annotation-set-viewbox', nextViewBox);
+                }
+            }
         }
 
-        /**
-         * Alan 8/17/26 - Pure geometry for one annotation, split out of the renderer so the
-         * "line vs bubble" and multiline layout rules are testable without a DOM.
-         *
-         * A LINE annotation spans its whole clade with a vertical bracket and puts the label
-         * beside it. A BUBBLE annotation is a callout at the clade midpoint: a short leader
-         * from the lane, then a rounded pill around the label. The two therefore occupy
-         * different vertical extents and different lane widths, which is what packing and the
-         * canvas-width calculation consume.
-         */
+        // Alan 8/17/26 - Keep pure multiline clade-line geometry shared by preview and rendering.
         _annotationLayoutMetrics(item, textGap) {
             const fontSize = item.scaledFontSize || 0;
             const lineCount = Math.max(1, (item.lines || ['']).length);
             const lineHeight = fontSize * 1.25;
             const blockHeight = lineCount * lineHeight;
             const midY = (item.top + item.bottom) / 2;
-            const isBubble = item.type === 'bubble';
-
-            if (isBubble) {
-                const padX = Math.max(3, fontSize * 0.55);
-                const padY = Math.max(2, fontSize * 0.35);
-                const boxWidth = item.textWidth + padX * 2;
-                const boxHeight = blockHeight + padY * 2;
-                return {
-                    isBubble: true, lineHeight, blockHeight, midY, padX, padY,
-                    boxWidth, boxHeight,
-                    textX: textGap + padX,
-                    laneWidth: textGap + boxWidth,
-                    renderTop: midY - boxHeight / 2,
-                    renderBottom: midY + boxHeight / 2
-                };
-            }
-
+            // Alan 8/17/26 - Branch bubble dimensions now live in _branchAnnotationMetrics.
             // The text block can be taller than the clade it labels (a two-line name on a
             // two-tip clade), so the reserved extent is the union of the two.
             return {
@@ -3880,18 +4107,72 @@
             };
         }
 
+        // Alan 8/17/26 - Normalize phylotree's rectangular screen coordinates for branch layout.
+        _annotationNodePoint(node) {
+            if (!node) return null;
+            const x = (typeof node.screen_x === 'number') ? node.screen_x : node.y;
+            const y = (typeof node.screen_y === 'number') ? node.screen_y : node.x;
+            return (Number.isFinite(x) && Number.isFinite(y)) ? { x, y } : null;
+        }
+
+        // Alan 8/17/26 - Reserve the rendered support label nearest the incoming branch.
+        _annotationSupportBox(svg, node, point) {
+            let found = null;
+            svg.selectAll('g.node, g.internal-node').each(function (datum) {
+                if (found || datum !== node) return;
+                const support = this.querySelector('text.node-support-value');
+                if (!support) return;
+                try {
+                    const box = support.getBBox();
+                    found = {
+                        left: point.x + box.x,
+                        right: point.x + box.x + box.width,
+                        top: point.y + box.y,
+                        bottom: point.y + box.y + box.height
+                    };
+                } catch (_) { /* detached support label */ }
+            });
+            return found;
+        }
+
+        // Alan 8/17/26 - Share multiline branch text/bubble dimensions with the SVG preview.
+        _branchAnnotationMetrics(item) {
+            const fontSize = item.scaledFontSize || 0;
+            const lineCount = Math.max(1, (item.lines || ['']).length);
+            const lineHeight = fontSize * 1.25;
+            const blockHeight = lineCount * lineHeight;
+            const isBubble = item.type === 'branch_bubble';
+            const padX = isBubble ? Math.max(3, fontSize * 0.55) : 0;
+            const padY = isBubble ? Math.max(2, fontSize * 0.35) : 0;
+            return {
+                isBubble,
+                lineHeight,
+                blockHeight,
+                padX,
+                padY,
+                boxWidth: item.textWidth + padX * 2,
+                boxHeight: blockHeight + padY * 2,
+                cornerRadius: Math.max(2, fontSize * 0.6)
+            };
+        }
+
         // Alan 8/17/26 - Render the label as one <tspan> per logical line, centred as a block
         // on the clade midpoint. A bare <text> node collapses "\n", so the multiline labels the
         // editor accepts used to come out as a single run-on line.
-        _appendAnnotationLabel(parent, item, x, cssClass) {
+        // Alan 8/17/26 - Accept optional vertical centering and text anchoring from branch labels.
+        _appendAnnotationLabel(parent, item, x, cssClass, options = {}) {
             const metrics = item.metrics;
             const lines = item.lines && item.lines.length ? item.lines : [''];
-            const firstY = metrics.midY - ((lines.length - 1) * metrics.lineHeight) / 2;
+            // Alan 8/17/26 - Allow branch primitives to center labels and choose their anchor.
+            const centerY = Number.isFinite(options.midY) ? options.midY : metrics.midY;
+            const anchor = options.anchor || 'start';
+            const firstY = centerY - ((lines.length - 1) * metrics.lineHeight) / 2;
             const text = parent.append('text')
                 .attr('class', cssClass)
                 .attr('x', x)
                 .attr('y', firstY)
-                .attr('text-anchor', 'start')
+                // Alan 8/17/26 - Apply the caller's start or centered text anchor.
+                .attr('text-anchor', anchor)
                 .attr('dominant-baseline', 'central')
                 .style('font-family', annotationFontStack(item.style.font_family))
                 .style('font-size', `${item.scaledFontSize}px`)
@@ -3910,11 +4191,94 @@
             return text;
         }
 
-        // Alan 8/17/26 - Draw one annotation in the style its annotation_type asks for. "line"
-        // is the original publication bracket: one vertical span over the clade plus a label.
-        // "bubble" is a rounded callout at the clade midpoint -- a short leader from the lane
-        // and a pill around the label -- which previously validated and saved but rendered
-        // identically to "line". Only annotations that are still exactly one clade reach here.
+        // Alan 8/17/26 - Draw branch text and bubbles through one live/preview SVG primitive.
+        _drawBranchAnnotation(group, item, centerX, lineWidth) {
+            const metrics = item.metrics;
+            const inkClass = (base, isDefault) =>
+                isDefault ? `${base} clade-annotation-default-ink` : base;
+            const entry = group.append('g')
+                .attr('class', 'clade-annotation branch-annotation')
+                .attr('data-annotation-type', item.type)
+                .attr('data-annotation-id', item.annotation.id || 'preview');
+
+            if (metrics.isBubble) {
+                entry.append('rect')
+                    .attr('class', inkClass(
+                        'clade-annotation-bubble', item.style.line_color_is_default
+                    ))
+                    .attr('x', centerX - metrics.boxWidth / 2)
+                    .attr('y', metrics.midY - metrics.boxHeight / 2)
+                    .attr('width', Math.max(1, metrics.boxWidth))
+                    .attr('height', Math.max(1, metrics.boxHeight))
+                    .attr('rx', Math.min(metrics.boxHeight / 2, metrics.cornerRadius))
+                    .style('fill', item.style.fill_color)
+                    .style('fill-opacity', item.style.fill_opacity)
+                    .style('stroke', item.style.line_color)
+                    .style('stroke-width', `${lineWidth}px`);
+            }
+
+            this._appendAnnotationLabel(
+                entry,
+                item,
+                centerX,
+                metrics.isBubble
+                    ? 'clade-annotation-label clade-annotation-bubble-label'
+                    : inkClass(
+                        'clade-annotation-label', item.style.text_color_is_default
+                    ),
+                { anchor: 'middle', midY: metrics.midY }
+            );
+            return entry;
+        }
+
+        // Alan 8/17/26 - Render the editor preview with the same primitives used by the tree.
+        renderAnnotationPreview(svgElement, annotation, layer) {
+            if (!svgElement || !window.d3v7) return;
+            const svg = window.d3v7.select(svgElement);
+            svg.selectAll('*').remove();
+            const width = Math.max(260, svgElement.clientWidth || 420);
+            const height = 120;
+            svg.attr('viewBox', `0 0 ${width} ${height}`)
+                .attr('width', '100%').attr('height', height);
+            const style = {};
+            for (const field of ['font_family', 'font_size', 'font_style', 'font_weight',
+                'text_color', 'line_color', 'fill_color', 'fill_opacity']) {
+                const entry = this._resolveAnnotationStyleEntry(annotation, layer, field);
+                style[field] = (field === 'font_size' || field === 'fill_opacity')
+                    ? Number(entry.value) : entry.value;
+                style[field + '_is_default'] = entry.isDefault;
+            }
+            const lines = this._annotationLabelLines(annotation.label || 'Annotation preview');
+            const item = {
+                annotation: Object.assign({ id: 'preview' }, annotation),
+                style,
+                lines,
+                type: this._annotationType(annotation),
+                scaledFontSize: style.font_size,
+                textWidth: this._measureAnnotationLabel(svgElement, lines, style),
+                top: 24,
+                bottom: height - 24
+            };
+            const group = svg.append('g').attr('class', 'clade-annotations annotation-preview-svg');
+            const lineWidth = 1.5;
+            if (item.type === 'clade_line') {
+                item.metrics = this._annotationLayoutMetrics(item, 7);
+                this._drawOneAnnotation(group, item, 24, 7, lineWidth, 20);
+            } else {
+                const branchY = height - 20;
+                group.append('line')
+                    .attr('x1', 24).attr('x2', width - 24)
+                    .attr('y1', branchY).attr('y2', branchY)
+                    .style('stroke', '#9ca3af').style('stroke-width', '1px');
+                item.metrics = this._branchAnnotationMetrics(item);
+                item.metrics.midY = branchY - 8 - item.metrics.boxHeight / 2;
+                item.metrics.renderTop = item.metrics.midY - item.metrics.boxHeight / 2;
+                item.metrics.renderBottom = item.metrics.midY + item.metrics.boxHeight / 2;
+                this._drawBranchAnnotation(group, item, width / 2, lineWidth);
+            }
+        }
+
+        // Alan 8/17/26 - Draw the publication-style clade bracket beside its complete descendant-tip span.
         _drawOneAnnotation(group, item, laneX, textGap, lineWidth, rowPitch) {
             const metrics = item.metrics || this._annotationLayoutMetrics(item, textGap);
             const tickHalf = Math.max(1, rowPitch * 0.4);
@@ -3930,51 +4294,22 @@
             const inkClass = (base, isDefault) =>
                 isDefault ? `${base} clade-annotation-default-ink` : base;
 
-            if (metrics.isBubble) {
-                // Leader from the lane to the pill, so the callout stays anchored to its clade.
-                entry.append('line')
-                    .attr('class', inkClass('clade-annotation-line', item.style.line_color_is_default))
-                    .attr('x1', laneX).attr('x2', laneX + textGap)
-                    .attr('y1', metrics.midY).attr('y2', metrics.midY)
-                    .style('stroke', item.style.line_color)
-                    .style('stroke-width', `${lineWidth}px`)
-                    .style('stroke-linecap', 'round');
+            // Alan 8/17/26 - Clade lines always draw as a bracket, including a short one-tip tick.
+            const singleTip = item.top === item.bottom;
+            entry.append('line')
+                .attr('class', inkClass('clade-annotation-line', item.style.line_color_is_default))
+                .attr('x1', laneX).attr('x2', laneX)
+                .attr('y1', singleTip ? item.top - tickHalf : item.top)
+                .attr('y2', singleTip ? item.bottom + tickHalf : item.bottom)
+                .style('stroke', item.style.line_color)
+                .style('stroke-width', `${lineWidth}px`)
+                .style('stroke-linecap', 'round');
 
-                // Inline white fill so the exported figure always has a readable pill; the
-                // dark-mode rule in tree_viewer.css is !important and so wins on screen only.
-                entry.append('rect')
-                    .attr('class', 'clade-annotation-bubble')
-                    .attr('x', laneX + textGap)
-                    .attr('y', metrics.midY - metrics.boxHeight / 2)
-                    .attr('width', Math.max(1, metrics.boxWidth))
-                    .attr('height', Math.max(1, metrics.boxHeight))
-                    .attr('rx', Math.min(metrics.boxHeight / 2, Math.max(2, item.scaledFontSize * 0.6)))
-                    .style('fill', '#ffffff')
-                    .style('stroke', item.style.line_color)
-                    .style('stroke-width', `${lineWidth}px`);
-            } else {
-                // A one-tip annotation has no vertical extent, so give it a short tick instead.
-                const singleTip = item.top === item.bottom;
-                entry.append('line')
-                    .attr('class', inkClass('clade-annotation-line', item.style.line_color_is_default))
-                    .attr('x1', laneX).attr('x2', laneX)
-                    .attr('y1', singleTip ? item.top - tickHalf : item.top)
-                    .attr('y2', singleTip ? item.bottom + tickHalf : item.bottom)
-                    // Inline style rather than a presentation attribute, so an unrelated
-                    // stylesheet rule matching bare <line> cannot repaint a chosen colour.
-                    // The dark-mode default-ink rule still wins because it is !important.
-                    .style('stroke', item.style.line_color)
-                    .style('stroke-width', `${lineWidth}px`)
-                    .style('stroke-linecap', 'round');
-            }
-
-            // Bubble text sits on the pill's own light fill, so it must never be lightened by
-            // the dark-mode default-ink rule -- that would leave pale text on white.
+            // Alan 8/17/26 - Clade-line labels always use inherited ink without bubble handling.
             this._appendAnnotationLabel(
                 entry, item, laneX + metrics.textX,
-                metrics.isBubble
-                    ? 'clade-annotation-label clade-annotation-bubble-label'
-                    : inkClass('clade-annotation-label', item.style.text_color_is_default)
+                // Alan 8/17/26 - Use the clade-line text class after bubble drawing moved out.
+                inkClass('clade-annotation-label', item.style.text_color_is_default)
             );
         }
 

@@ -34,6 +34,7 @@ from app.services.tree_annotation_service import (  # noqa: E402
     ANNOTATION_LAYERS_KEY,
     CLADE_ANNOTATIONS_KEY,
     MAX_LABEL_LENGTH,
+    MAX_LABEL_LINES,
     AnnotationValidationError,
     apply_annotation_config,
     build_leaf_identity_map,
@@ -128,6 +129,9 @@ class NormalizationTests(unittest.TestCase):
         # Unset style fields stay null so they keep inheriting from the layer.
         self.assertIsNone(annotation["font_size"])
         self.assertIsNone(annotation["text_color"])
+        self.assertEqual(annotation["annotation_type"], "clade_line")
+        self.assertIsNone(annotation["fill_color"])
+        self.assertIsNone(annotation["fill_opacity"])
 
     def test_order_one_is_innermost_and_order_is_normalized(self):
         config = normalize_annotation_config(self.state, {
@@ -152,6 +156,29 @@ class NormalizationTests(unittest.TestCase):
         self.assertEqual(layer["order"], 1)
         self.assertTrue(layer["visible"])
         self.assertEqual(layer["default_font_family"], "Arial")
+        self.assertEqual(layer["default_fill_color"], "#ffffff")
+        self.assertEqual(layer["default_fill_opacity"], 0.9)
+
+    def test_all_three_annotation_types_round_trip(self):
+        config = normalize_annotation_config(self.state, {
+            "layers": [_layer()],
+            "annotations": [
+                _annotation("clade", members=["A", "B"], annotation_type="clade_line"),
+                _annotation("text", members=["C"], annotation_type="branch_text"),
+                _annotation("bubble", members=["D"], annotation_type="branch_bubble"),
+            ],
+        })
+        self.assertEqual(
+            [item["annotation_type"] for item in config[CLADE_ANNOTATIONS_KEY]],
+            ["clade_line", "branch_text", "branch_bubble"],
+        )
+
+    def test_old_type_aliases_normalize_only_on_explicit_save(self):
+        old = _annotation(annotation_type="line")
+        state = dict(self.state, **{ANNOTATION_LAYERS_KEY: [_layer()], CLADE_ANNOTATIONS_KEY: [old]})
+        self.assertNotIn("fill_color", get_annotation_config(state)[CLADE_ANNOTATIONS_KEY][0])
+        config = normalize_annotation_config(state, {"layers": [_layer()], "annotations": [old]})
+        self.assertEqual(config[CLADE_ANNOTATIONS_KEY][0]["annotation_type"], "clade_line")
 
     def test_duplicate_member_ids_are_deduplicated(self):
         config = normalize_annotation_config(self.state, {
@@ -256,6 +283,44 @@ class RejectionTests(unittest.TestCase):
         self._reject({
             "layers": [_layer()],
             "annotations": [_annotation(label="Bad\x00label")],
+        })
+
+    def test_more_than_ten_lines_is_rejected(self):
+        self._reject({
+            "layers": [_layer()],
+            "annotations": [_annotation(label="\n".join(["x"] * (MAX_LABEL_LINES + 1)))],
+        })
+
+    def test_multiline_and_tabs_are_normalized(self):
+        config = normalize_annotation_config(self.state, {
+            "layers": [_layer()],
+            "annotations": [_annotation(label="A\r\nB\tC")],
+        })
+        self.assertEqual(config[CLADE_ANNOTATIONS_KEY][0]["label"], "A\nB    C")
+
+    def test_fill_color_and_opacity_are_validated(self):
+        config = normalize_annotation_config(self.state, {
+            "layers": [_layer(default_fill_color="#ABCDEF", default_fill_opacity=0)],
+            "annotations": [_annotation(
+                annotation_type="branch_bubble", fill_color="#123456", fill_opacity=1,
+            )],
+        })
+        layer = config[ANNOTATION_LAYERS_KEY][0]
+        annotation = config[CLADE_ANNOTATIONS_KEY][0]
+        self.assertEqual(layer["default_fill_color"], "#abcdef")
+        self.assertEqual(layer["default_fill_opacity"], 0)
+        self.assertEqual(annotation["fill_opacity"], 1)
+        for bad in (-0.01, 1.01, float("nan"), "0.5", True):
+            with self.subTest(opacity=bad):
+                self._reject({
+                    "layers": [_layer(default_fill_opacity=bad)],
+                    "annotations": [],
+                })
+
+    def test_unknown_annotation_type_is_rejected(self):
+        self._reject({
+            "layers": [_layer()],
+            "annotations": [_annotation(annotation_type="speech_balloon")],
         })
 
     def test_member_ids_must_resolve_to_real_leaves(self):
@@ -606,6 +671,7 @@ const vm = require('vm');
 const input = JSON.parse(fs.readFileSync(0, 'utf8'));
 const sandbox = {
     console, setTimeout, clearTimeout, URLSearchParams,
+    document: { getElementById: () => null },
     window: {
         location: { search: '' },
         addEventListener: () => {},
@@ -621,8 +687,13 @@ vm.runInContext(fs.readFileSync(process.argv[2], 'utf8'), sandbox);
 const allNodes = [];
 function build(spec, parent) {
     const node = { parent: parent || null, children: [] };
-    if (typeof spec === 'string') node.id = spec;
-    else node.children = spec.map((child) => build(child, node));
+    if (typeof spec === 'string') {
+        node.id = spec;
+        node.__leafCount = 1;
+    } else {
+        node.children = spec.map((child) => build(child, node));
+        node.__leafCount = node.children.reduce((sum, child) => sum + child.__leafCount, 0);
+    }
     allNodes.push(node);
     return node;
 }
@@ -636,17 +707,105 @@ viewer.allNodes = allNodes;
 viewer._getNodeId = (node) => node.id || null;
 viewer.annotationLayers = input.layers;
 viewer.cladeAnnotations = input.annotations;
-
-const blocks = viewer._buildCladeBlockIndex(positions);
-const layerById = new Map(input.layers.map((layer) => [layer.id, layer]));
-const { validity, resolved } = viewer._resolveAnnotationsForRender(
-    positions, blocks, layerById
+viewer.getSelectedNodes = () => allNodes.filter((node) =>
+    !node.children.length && (input.selectedIds || []).includes(node.id)
 );
 
+let incomingBranchResult = null;
+let incomingBranchDescendantWalks = null;
+if (input.incomingBranchMembers) {
+    const getDescendantLeafIds = viewer.getDescendantLeafIds.bind(viewer);
+    incomingBranchDescendantWalks = 0;
+    viewer.getDescendantLeafIds = (node) => {
+        incomingBranchDescendantWalks += 1;
+        return getDescendantLeafIds(node);
+    };
+    incomingBranchResult = viewer.hasIncomingBranchForMemberIds(input.incomingBranchMembers);
+    viewer.getDescendantLeafIds = getDescendantLeafIds;
+}
+
+let tipLabelOffsets = null;
+if (input.tipLabelGap !== undefined && input.tipLabelGap !== null) {
+    viewer.tipLabelGap = input.tipLabelGap;
+    tipLabelOffsets = {
+        start: viewer._tipLabelDx({ text_align: 'start' }, 2),
+        end: viewer._tipLabelDx({ text_align: 'end' }, 2)
+    };
+}
+
+const { cladeBlocks, branchNodes } = viewer._buildAnnotationTopologyIndexes(positions);
+const layerById = new Map(input.layers.map((layer) => [layer.id, layer]));
+const { validity, resolved } = viewer._resolveAnnotationsForRender(
+    positions, cladeBlocks, layerById, branchNodes
+);
+
+let annotationsForNode = null;
+if (input.lookupMembers) {
+    const lookupKey = viewer._annotationMembershipKey(input.lookupMembers);
+    const lookupNode = allNodes.find((node) =>
+        node.parent && viewer._annotationMembershipKey(viewer.getDescendantLeafIds(node)) === lookupKey
+    );
+    annotationsForNode = lookupNode
+        ? viewer.getAnnotationsForNode(lookupNode).map((annotation) => annotation.id)
+        : [];
+}
+
+let contextBranchTargets = null;
+let contextDispatchedTargets = null;
+if (input.branchTargetMembers) {
+    const targetKey = viewer._annotationMembershipKey(input.branchTargetMembers);
+    const distalNode = allNodes.find((node) =>
+        node.parent && viewer._annotationMembershipKey(viewer.getDescendantLeafIds(node)) === targetKey
+    );
+    const branchElement = { __datum: { source: distalNode?.parent, target: distalNode } };
+    sandbox.window.d3v7 = {
+        select: (element) => ({ datum: () => element?.__datum || null })
+    };
+    const makeClickTarget = () => ({
+        __datum: branchElement.__datum,
+        tagName: 'path',
+        classList: { contains: () => false },
+        closest: (selector) => selector.includes('path.branch') ? branchElement : null
+    });
+    const clickTargets = [makeClickTarget(), makeClickTarget()];
+    contextBranchTargets = clickTargets.map((target) => {
+        const resolvedNode = viewer._getContextMenuNode(target);
+        return viewer._annotationMembershipKey(viewer.getDescendantLeafIds(resolvedNode));
+    });
+    const listeners = {};
+    viewer.container = {
+        addEventListener: (type, handler) => { listeners[type] = handler; },
+        removeEventListener: () => {}
+    };
+    let dispatchedNode = null;
+    viewer.tree = { display: { handle_node_click: (node) => { dispatchedNode = node; } } };
+    viewer._overrideClickBehavior();
+    contextDispatchedTargets = clickTargets.map((target) => {
+        dispatchedNode = null;
+        listeners.contextmenu({
+            target,
+            preventDefault: () => {},
+            stopPropagation: () => {}
+        });
+        return viewer._annotationMembershipKey(viewer.getDescendantLeafIds(dispatchedNode));
+    });
+}
+
 process.stdout.write(JSON.stringify({
-    blocks: Array.from(blocks).sort(),
+    blocks: Array.from(cladeBlocks).sort(),
+    branchBlocks: Array.from(branchNodes.keys()).sort(),
     validity: Object.fromEntries(validity),
-    drawn: resolved.map((item) => item.annotation.id)
+    drawn: resolved.map((item) => item.annotation.id),
+    drawnTypes: resolved.map((item) => viewer._annotationType(item.annotation)),
+    annotationsForNode,
+    selectedClade: input.selectedIds ? viewer.getSelectedCladeLeafIds() : null,
+    selectedHasIncomingBranch: input.selectedIds
+        ? viewer.hasIncomingBranchForMemberIds(input.selectedIds) : null,
+    contextBranchTargets,
+    contextDispatchedTargets,
+    incomingBranchResult,
+    incomingBranchDescendantWalks,
+    tipLabelOffsets
 }));
 """
 
@@ -657,7 +816,7 @@ def _node_available():
 
 @unittest.skipUnless(_node_available(), "Node is required to exercise the renderer")
 class AnnotationRenderDecisionTests(unittest.TestCase):
-    """Only a member set that is still exactly ONE clade may be drawn.
+    """Only exact clades draw; branch types additionally require an incoming branch.
 
     Contiguity alone is not enough. After a reroot an annotation's tips can sit
     together in the tip order while no node has that exact descendant set; the
@@ -674,16 +833,23 @@ class AnnotationRenderDecisionTests(unittest.TestCase):
     TREE = [["A", "B"], ["C", "D"]]
     TIP_ORDER = ["A", "B", "C", "D"]
 
-    def _resolve(self, annotations, layers=None):
+    def _resolve(self, annotations, layers=None, tree=None, tip_order=None,
+                 lookup_members=None, selected_ids=None, branch_target_members=None,
+                 incoming_branch_members=None, tip_label_gap=None):
         layers = layers if layers is not None else [_layer()]
         with tempfile.TemporaryDirectory() as tmp:
             harness = Path(tmp) / "resolve_annotations.js"
             harness.write_text(_RENDER_HARNESS_JS)
             payload = json.dumps({
-                "tree": self.TREE,
-                "tipOrder": self.TIP_ORDER,
+                "tree": tree if tree is not None else self.TREE,
+                "tipOrder": tip_order if tip_order is not None else self.TIP_ORDER,
                 "layers": layers,
                 "annotations": annotations,
+                "lookupMembers": lookup_members,
+                "selectedIds": selected_ids,
+                "branchTargetMembers": branch_target_members,
+                "incomingBranchMembers": incoming_branch_members,
+                "tipLabelGap": tip_label_gap,
             })
             result = subprocess.run(
                 ["node", str(harness), str(self.VIEWER_JS)],
@@ -694,7 +860,12 @@ class AnnotationRenderDecisionTests(unittest.TestCase):
 
     def test_clade_block_index_matches_the_topology(self):
         out = self._resolve([_annotation(members=["A", "B"])])
-        self.assertEqual(out["blocks"], ["0:0", "0:1", "0:3", "1:1", "2:2", "2:3", "3:3"])
+        self.assertEqual(
+            out["blocks"], ["0:0", "0:1", "0:3", "1:1", "2:2", "2:3", "3:3"]
+        )
+        self.assertEqual(
+            out["branchBlocks"], ["0:0", "0:1", "1:1", "2:2", "2:3", "3:3"]
+        )
 
     def test_valid_clade_is_drawn(self):
         out = self._resolve([_annotation("ann_ab", members=["A", "B"])])
@@ -727,14 +898,93 @@ class AnnotationRenderDecisionTests(unittest.TestCase):
         # Only the real clade reaches the figure.
         self.assertEqual(out["drawn"], ["ann_ab"])
 
-    def test_whole_tree_and_single_tip_annotations_are_clades(self):
+    def test_whole_tree_clade_line_and_terminal_branch_are_valid(self):
         out = self._resolve([
-            _annotation("ann_all", members=["A", "B", "C", "D"]),
+            _annotation("ann_all", members=["A", "B", "C", "D"],
+                        annotation_type="clade_line"),
             _annotation("ann_one", members=["C"]),
         ])
         self.assertTrue(out["validity"]["ann_all"]["valid"])
         self.assertTrue(out["validity"]["ann_one"]["valid"])
-        self.assertEqual(sorted(out["drawn"]), ["ann_all", "ann_one"])
+        self.assertEqual(out["drawn"], ["ann_all", "ann_one"])
+
+    def test_root_branch_types_are_invalid_without_an_incoming_branch(self):
+        for annotation_type in ("branch_text", "branch_bubble"):
+            with self.subTest(annotation_type=annotation_type):
+                out = self._resolve([_annotation(
+                    "ann_all", members=["A", "B", "C", "D"],
+                    annotation_type=annotation_type,
+                )])
+                self.assertFalse(out["validity"]["ann_all"]["valid"])
+                self.assertEqual(out["drawn"], [])
+
+    def test_selecting_every_tip_resolves_the_root_clade(self):
+        out = self._resolve(
+            [_annotation("ann_all", members=["A", "B", "C", "D"])],
+            selected_ids=["A", "B", "C", "D"],
+        )
+        self.assertEqual(set(out["selectedClade"]), {"A", "B", "C", "D"})
+        self.assertFalse(out["selectedHasIncomingBranch"])
+
+    def test_non_root_selected_clade_has_an_incoming_branch(self):
+        out = self._resolve([], selected_ids=["A", "B"])
+        self.assertEqual(set(out["selectedClade"]), {"A", "B"})
+        self.assertTrue(out["selectedHasIncomingBranch"])
+
+    def test_whole_tree_branch_check_skips_all_descendant_walks(self):
+        out = self._resolve([], incoming_branch_members=["A", "B", "C", "D"])
+        self.assertFalse(out["incomingBranchResult"])
+        self.assertEqual(out["incomingBranchDescendantWalks"], 0)
+
+    def test_tip_label_gap_points_outward_on_both_radial_halves(self):
+        out = self._resolve([], tip_label_gap=80)
+        self.assertEqual(out["tipLabelOffsets"], {"start": 40, "end": -40})
+
+    def test_rotation_preserves_exact_descendant_membership(self):
+        out = self._resolve(
+            [_annotation("ann_ab", members=["A", "B"], annotation_type="branch_text")],
+            tree=[["B", "A"], ["D", "C"]],
+            tip_order=["B", "A", "D", "C"],
+        )
+        self.assertTrue(out["validity"]["ann_ab"]["valid"])
+        self.assertEqual(out["drawnTypes"], ["branch_text"])
+
+    def test_type_switching_does_not_change_membership(self):
+        for annotation_type in ("clade_line", "branch_text", "branch_bubble"):
+            with self.subTest(annotation_type=annotation_type):
+                out = self._resolve([
+                    _annotation("ann_ab", members=["A", "B"], annotation_type=annotation_type)
+                ])
+                self.assertTrue(out["validity"]["ann_ab"]["valid"])
+                self.assertEqual(out["drawnTypes"], [annotation_type])
+
+    def test_context_lookup_finds_existing_annotations_by_exact_membership(self):
+        out = self._resolve([
+            _annotation("ann_ab_first", members=["A", "B"]),
+            _annotation("ann_cd", members=["C", "D"]),
+            _annotation("ann_ab_second", members=["B", "A"], annotation_type="branch_text"),
+        ], lookup_members=["B", "A"])
+        self.assertEqual(
+            out["annotationsForNode"], ["ann_ab_first", "ann_ab_second"]
+        )
+
+    def test_context_lookup_does_not_match_a_different_descendant_set(self):
+        out = self._resolve([
+            _annotation("ann_ab", members=["A", "B"]),
+        ], lookup_members=["C", "D"])
+        self.assertEqual(out["annotationsForNode"], [])
+
+    def test_terminal_branch_context_resolves_its_distal_tip_at_both_ends(self):
+        out = self._resolve([], branch_target_members=["C"])
+        expected = "C"
+        self.assertEqual(out["contextBranchTargets"], [expected, expected])
+        self.assertEqual(out["contextDispatchedTargets"], [expected, expected])
+
+    def test_internal_branch_context_resolves_its_distal_clade_at_both_ends(self):
+        out = self._resolve([], branch_target_members=["A", "B"])
+        expected = "A\u0000B"
+        self.assertEqual(out["contextBranchTargets"], [expected, expected])
+        self.assertEqual(out["contextDispatchedTargets"], [expected, expected])
 
     def test_members_missing_from_the_tree_are_reported_as_absent(self):
         out = self._resolve([_annotation("ann_gone", members=["Z"])])
@@ -763,6 +1013,7 @@ const vm = require('vm');
 const input = JSON.parse(fs.readFileSync(0, 'utf8'));
 const sandbox = {
     console, setTimeout, clearTimeout, URLSearchParams,
+    document: { getElementById: () => null },
     window: {
         location: { search: '' },
         addEventListener: () => {},
@@ -780,6 +1031,11 @@ const viewer = Object.create(sandbox.window.DikaryaTreeViewer.prototype);
 viewer._measureAnnotationText = (svgNode, text, style) => text.length * style.font_size;
 
 const out = {};
+
+if (input.tipGaps) {
+    viewer._applyTextSizingFromZoom = () => {};
+    out.tipGaps = input.tipGaps.map((value) => viewer.setTipLabelGap(value));
+}
 
 if (input.label !== undefined) out.lines = viewer._annotationLabelLines(input.label);
 
@@ -804,7 +1060,9 @@ if (input.items) {
             style: { font_size: spec.font_size },
             textWidth: viewer._measureAnnotationLabel(null, lines, { font_size: spec.font_size })
         };
-        const metrics = viewer._annotationLayoutMetrics(item, spec.textGap || 6);
+        const metrics = spec.type === 'clade_line'
+            ? viewer._annotationLayoutMetrics(item, spec.textGap || 6)
+            : viewer._branchAnnotationMetrics(item);
         return { textWidth: item.textWidth, lineCount: lines.length, metrics };
     });
 }
@@ -834,6 +1092,10 @@ class AnnotationLayoutTests(unittest.TestCase):
         out = self._run({"label": "Galerina\nsect. Mycenopsis"})
         self.assertEqual(out["lines"], ["Galerina", "sect. Mycenopsis"])
 
+    def test_tip_label_gap_rounds_to_two_pixels_and_clamps(self):
+        out = self._run({"tipGaps": [-3, 1, 79, 100, "bad"]})
+        self.assertEqual(out["tipGaps"], [0, 2, 80, 80, 2])
+
     def test_trailing_newline_does_not_add_an_empty_row(self):
         out = self._run({"label": "Galerina\n"})
         self.assertEqual(out["lines"], ["Galerina"])
@@ -844,7 +1106,7 @@ class AnnotationLayoutTests(unittest.TestCase):
 
     def test_multiline_width_comes_from_the_widest_line(self):
         out = self._run({"items": [{
-            "label": "short\nmuch longer line", "type": "line",
+            "label": "short\nmuch longer line", "type": "clade_line",
             "top": 0, "bottom": 40, "font_size": 10,
         }]})
         item = out["items"][0]
@@ -856,7 +1118,7 @@ class AnnotationLayoutTests(unittest.TestCase):
         # A two-line label on a clade with no vertical extent must still reserve
         # room for both lines, or packing would overlap the next annotation.
         out = self._run({"items": [{
-            "label": "one\ntwo", "type": "line",
+            "label": "one\ntwo", "type": "clade_line",
             "top": 100, "bottom": 100, "font_size": 10,
         }]})
         metrics = out["items"][0]["metrics"]
@@ -865,37 +1127,36 @@ class AnnotationLayoutTests(unittest.TestCase):
         self.assertAlmostEqual(metrics["renderTop"], 100 - metrics["blockHeight"] / 2)
         self.assertAlmostEqual(metrics["renderBottom"], 100 + metrics["blockHeight"] / 2)
 
-    def test_bubble_and_line_produce_different_geometry(self):
+    def test_branch_bubble_padding_exceeds_branch_text_geometry(self):
         out = self._run({"items": [
-            {"label": "Section X", "type": "line", "top": 0, "bottom": 40, "font_size": 10},
-            {"label": "Section X", "type": "bubble", "top": 0, "bottom": 40, "font_size": 10},
+            {"label": "Section X", "type": "branch_text", "top": 0, "bottom": 40, "font_size": 10},
+            {"label": "Section X", "type": "branch_bubble", "top": 0, "bottom": 40, "font_size": 10},
         ]})
-        line, bubble = out["items"][0]["metrics"], out["items"][1]["metrics"]
-        self.assertFalse(line["isBubble"])
+        text, bubble = out["items"][0]["metrics"], out["items"][1]["metrics"]
+        self.assertFalse(text["isBubble"])
         self.assertTrue(bubble["isBubble"])
-        # The pill is padded, so it is wider than the bare label and claims more lane.
-        self.assertGreater(bubble["boxWidth"], line["boxWidth"])
-        self.assertGreater(bubble["laneWidth"], line["laneWidth"])
-        # The label is inset by the pill's padding rather than starting at the gap.
-        self.assertGreater(bubble["textX"], line["textX"])
-        # A line spans its whole clade; a bubble is a callout around the midpoint.
-        self.assertEqual(line["renderTop"], 0)
-        self.assertEqual(line["renderBottom"], 40)
-        self.assertGreater(bubble["renderTop"], 0)
-        self.assertLess(bubble["renderBottom"], 40)
+        self.assertGreater(bubble["boxWidth"], text["boxWidth"])
+        self.assertGreater(bubble["boxHeight"], text["boxHeight"])
+        self.assertGreater(bubble["padX"], 0)
+        self.assertGreater(bubble["padY"], 0)
 
     def test_inherited_default_ink_is_distinguishable_from_the_same_colour_chosen(self):
         default_ink = "#1f2937"
         out = self._run({"style": {
-            "annotation": {"text_color": default_ink, "line_color": None},
-            "layer": {"default_text_color": default_ink, "default_line_color": default_ink},
-            "fields": {"text_color": True, "line_color": True},
+            "annotation": {"text_color": default_ink, "line_color": None,
+                           "fill_color": None, "fill_opacity": 0.4},
+            "layer": {"default_text_color": default_ink, "default_line_color": default_ink,
+                      "default_fill_color": "#ffffff", "default_fill_opacity": 0.9},
+            "fields": {"text_color": True, "line_color": True,
+                       "fill_color": True, "fill_opacity": True},
         }})
         # Explicitly chosen on the annotation: same value, but NOT a default, so
         # dark mode must leave it exactly as the user picked it.
         self.assertEqual(out["style"]["text_color"], {"value": default_ink, "isDefault": False})
         # Inherited from a layer that still carries the shared default: lightenable.
         self.assertEqual(out["style"]["line_color"], {"value": default_ink, "isDefault": True})
+        self.assertEqual(out["style"]["fill_color"], {"value": "#ffffff", "isDefault": True})
+        self.assertEqual(out["style"]["fill_opacity"], {"value": 0.4, "isDefault": False})
 
     def test_a_chosen_non_default_colour_is_never_treated_as_default(self):
         out = self._run({"style": {

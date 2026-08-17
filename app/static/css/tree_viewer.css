@@ -155,56 +155,28 @@
    Annotation Manager explains the situation in words, so it reappears by itself once
    the topology makes it a clade again. That is why there is no "broken" style here. */
 
-/* Untouched default ink follows the theme so annotations stay readable on the dark
-   tree canvas. A color the user actually picked is never overridden, because the
-   exported publication figure has to reproduce exactly what they chose. */
-.dark #tree-container text.clade-annotation-default-ink {
+/* Untouched default ink follows dark mode on screen (including the SVG editor
+   preview). Explicit annotation overrides do not receive this class, and SVG/JPG
+   exports have no .dark ancestor, so user-picked and exported colors stay exact. */
+.dark text.clade-annotation-default-ink {
     fill: #f3f4f6 !important;
 }
 
-.dark #tree-container line.clade-annotation-default-ink {
+.dark line.clade-annotation-default-ink {
     stroke: #f3f4f6 !important;
 }
 
-/* Bubble annotations. The pill's fill is written inline as white so the exported
-   SVG (which carries no .dark ancestor) always reproduces a readable publication
-   callout; this rule is !important purely so the on-screen dark theme can win over
-   that inline value. The stroke stays the annotation's own line color. */
-.dark #tree-container rect.clade-annotation-bubble {
-    fill: #111827 !important;
+.dark rect.clade-annotation-default-ink {
+    stroke: #f3f4f6 !important;
 }
 
-/* Bubble label text sits on the pill, so it keeps its own color in both themes --
-   lightening it for dark mode would put pale text on the light exported pill. */
-.dark #tree-container text.clade-annotation-bubble-label {
-    fill: #f3f4f6 !important;
-}
-
-/* Editor live preview. Mirrors the SVG closely enough to judge a label before
-   saving: the same resolved font/color, real line breaks, and a pill outline for
-   the bubble type. Built in JS, so the rules live here rather than as utilities. */
+/* The preview is an actual SVG rendered by the viewer's annotation primitive.
+   Inline resolved colors stay identical in light mode, dark mode, and exports. */
 .annotation-live-preview {
-    display: inline-block;
-    max-width: 100%;
-    white-space: pre-line;
-    line-height: 1.25;
-    color: #1f2937;
-}
-
-.annotation-live-preview-line {
-    border-left: 2px solid currentColor;
-    padding: 0.15rem 0 0.15rem 0.5rem;
-}
-
-.annotation-live-preview-bubble {
-    border: 1.5px solid currentColor;
-    border-radius: 9999px;
-    padding: 0.3rem 0.75rem;
-    background: #ffffff;
-}
-
-.dark .annotation-live-preview-bubble {
-    background: #111827;
+    display: block;
+    width: 100%;
+    min-width: 260px;
+    overflow: visible;
 }
 
 /* Annotation Manager / editor layout.

@@ -592,7 +592,7 @@ def build_spec():
                             "properties": {
                                 "old_name": {"type": "string", "minLength": 1, "maxLength": 256},
                                 "new_name": {"type": "string", "minLength": 1, "maxLength": 256,
-                                              "description": "May not contain Newick-unsafe characters: ()[],:;'\"\\t\\n\\r"},
+                                              "description": "May not contain control characters or Newick-unsafe punctuation: ()[],:;'\""},
                             },
                         }}},
                     },

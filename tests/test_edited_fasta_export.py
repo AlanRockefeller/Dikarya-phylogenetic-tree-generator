@@ -1,7 +1,7 @@
 """
 Regression coverage for the Edited FASTA export.
 
-Edited FASTA is the original UNALIGNED input FASTA with the tree viewer's
+Edited FASTA is the processed, unaligned tree-input FASTA with the tree viewer's
 current state applied: pruned records dropped, renamed tips carrying their
 current tree label as the whole header, nucleotide data untouched.
 

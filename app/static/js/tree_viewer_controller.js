@@ -528,13 +528,17 @@ document.addEventListener('DOMContentLoaded', async () => {
         { field: 'font_style', label: 'Style' },
         { field: 'font_weight', label: 'Weight' },
         { field: 'text_color', label: 'Text color' },
-        { field: 'line_color', label: 'Line color' }
+        // Alan 8/17/26 - Expose bubble fill controls alongside the shared line and text styles.
+        { field: 'line_color', label: 'Line / border color' },
+        { field: 'fill_color', label: 'Bubble fill' },
+        { field: 'fill_opacity', label: 'Bubble opacity' }
     ];
 
     const annotationsEditable = () => !window.VIEW_ONLY;
     const annotationConfig = () => window.DikaryaCladeAnnotations || {
         FONT_FAMILIES: ['Arial'], MIN_FONT_SIZE: 6, MAX_FONT_SIZE: 72,
-        DEFAULTS: { font_family: 'Arial', font_size: 12, font_style: 'normal', font_weight: 'normal', text_color: '#1f2937', line_color: '#1f2937' }
+        // Alan 8/17/26 - Keep the controller fallback complete when server configuration is absent.
+        DEFAULTS: { font_family: 'Arial', font_size: 12, font_style: 'normal', font_weight: 'normal', text_color: '#1f2937', line_color: '#1f2937', fill_color: '#ffffff', fill_opacity: 0.9 }
     };
 
     // Alan 8/15/26 - Short, URL/attribute-safe IDs inside the server's 64-char limit.
@@ -565,25 +569,17 @@ document.addEventListener('DOMContentLoaded', async () => {
         const preview = getEl('annotation-live-preview');
         if (!preview || !annotationEditorState) return;
         const label = String(getEl('input-annotation-label')?.value || '') || 'Annotation preview';
-        const type = getEl('select-annotation-type')?.value === 'bubble' ? 'bubble' : 'line';
+        // Alan 8/17/26 - Hand the complete typed draft to the renderer's shared SVG preview.
+        const type = getEl('select-annotation-type')?.value || 'clade_line';
         const layer = findAnnotationLayer(getEl('select-annotation-layer')?.value);
-        const style = {};
+        // Alan 8/17/26 - Package label, type, and nullable style overrides for the SVG renderer.
+        const draft = { label, annotation_type: type };
         ANNOTATION_STYLE_FIELDS.forEach(({ field }) => {
-            style[field] = effectiveAnnotationStyle(
-                { [field]: annotationEditorState.style[field] }, layer, field
-            );
+            // Alan 8/17/26 - Keep inheritance explicit by passing null for unchecked overrides.
+            draft[field] = annotationEditorState.style[field] ?? null;
         });
-
-        preview.textContent = label;
-        preview.classList.toggle('annotation-live-preview-line', type === 'line');
-        preview.classList.toggle('annotation-live-preview-bubble', type === 'bubble');
-        const stacks = annotationConfig().FONT_STACKS || {};
-        preview.style.fontFamily = stacks[style.font_family] || style.font_family;
-        preview.style.fontSize = `${style.font_size}px`;
-        preview.style.fontStyle = style.font_style;
-        preview.style.fontWeight = style.font_weight;
-        preview.style.color = style.text_color;
-        preview.style.borderColor = style.line_color;
+        // Alan 8/17/26 - Replace the old CSS-only preview with the shared SVG primitive.
+        if (viewer?.renderAnnotationPreview) viewer.renderAnnotationPreview(preview, draft, layer);
     }
 
     // Alan 8/15/26 - Adopt a configuration (ours or the server's) into state, renderer and UI.
@@ -741,7 +737,10 @@ document.addEventListener('DOMContentLoaded', async () => {
             default_font_style: defaults.font_style,
             default_font_weight: defaults.font_weight,
             default_text_color: defaults.text_color,
-            default_line_color: defaults.line_color
+            // Alan 8/17/26 - New layers inherit bubble fill styling as concrete defaults.
+            default_line_color: defaults.line_color,
+            default_fill_color: defaults.fill_color,
+            default_fill_opacity: defaults.fill_opacity
         };
         if (fromEditorSession) layer.__editorSession = true;
         annotationLayers.push(layer);
@@ -840,12 +839,14 @@ document.addEventListener('DOMContentLoaded', async () => {
                     control.appendChild(option);
                 });
                 control.value = effective;
-            } else if (field === 'font_size') {
+            // Alan 8/17/26 - Treat opacity as a bounded numeric override like font size.
+            } else if (field === 'font_size' || field === 'fill_opacity') {
                 control = document.createElement('input');
                 control.type = 'number';
-                control.min = String(cfg.MIN_FONT_SIZE);
-                control.max = String(cfg.MAX_FONT_SIZE);
-                control.step = '1';
+                // Alan 8/17/26 - Bound opacity to 0–1 while retaining configured font-size bounds.
+                control.min = field === 'fill_opacity' ? '0' : String(cfg.MIN_FONT_SIZE);
+                control.max = field === 'fill_opacity' ? '1' : String(cfg.MAX_FONT_SIZE);
+                control.step = field === 'fill_opacity' ? '0.05' : '1';
                 control.className = 'w-24 rounded border border-gray-300 bg-white px-2 py-1 text-xs text-gray-900 dark:border-gray-700 dark:bg-journal-dark dark:text-gray-100';
                 control.value = String(effective);
             } else {
@@ -858,7 +859,9 @@ document.addEventListener('DOMContentLoaded', async () => {
             control.disabled = !toggle.checked;
             const commit = () => {
                 if (!toggle.checked) { draft[field] = null; return; }
-                draft[field] = (field === 'font_size') ? Number(control.value) : control.value;
+                // Alan 8/17/26 - Store numeric opacity without string coercion in the draft.
+                draft[field] = (field === 'font_size' || field === 'fill_opacity')
+                    ? Number(control.value) : control.value;
                 renderAnnotationLivePreview();
             };
             toggle.addEventListener('change', () => {
@@ -921,6 +924,12 @@ document.addEventListener('DOMContentLoaded', async () => {
             // untouched by a cancel.
             createdLayerIds: []
         };
+        // Alan 8/17/26 - Whole-tree clades may use a bracket, but the root has no incoming
+        // segment on which branch text or a branch bubble could be placed.
+        annotationEditorState.hasIncomingBranch = viewer?.hasIncomingBranchForMemberIds
+            ? viewer.hasIncomingBranchForMemberIds(annotationEditorState.memberIds)
+            : true;
+        annotationEditorState.defaultType = options.defaultType || 'clade_line';
 
         if (!annotationLayers.length) {
             // First use: give them a sensible layer rather than a dead-end dropdown.
@@ -931,13 +940,25 @@ document.addEventListener('DOMContentLoaded', async () => {
             annotationEditorState.style[field] = existing ? (existing[field] ?? null) : null;
         });
 
+        // Alan 8/17/26 - Use branch-oriented copy and restrict root annotations to clade lines.
         getEl('annotation-editor-title').textContent = mode === 'edit'
-            ? 'Edit Clade Annotation' : 'Add Clade Annotation';
+            // Alan 8/17/26 - Shorten the modal title now that it supports branch annotations.
+            ? 'Edit Annotation' : 'Add Annotation';
         const count = annotationEditorState.memberIds.length;
+        // Alan 8/17/26 - Describe saved membership as descendants of the annotated branch.
         getEl('annotation-editor-subtitle').textContent =
-            `${count} tip${count === 1 ? '' : 's'} in this clade.`;
+            // Alan 8/17/26 - Use branch-relative descendant wording for the membership count.
+            `${count} descendant tip${count === 1 ? '' : 's'} on this branch.`;
         getEl('input-annotation-label').value = existing ? existing.label : '';
-        getEl('select-annotation-type').value = existing?.annotation_type === 'bubble' ? 'bubble' : 'line';
+        // Alan 8/17/26 - Map short-lived aliases and disable branch-only root choices.
+        const savedType = existing?.annotation_type === 'line' ? 'clade_line'
+            : (existing?.annotation_type === 'bubble' ? 'branch_bubble' : existing?.annotation_type);
+        const typeSelect = getEl('select-annotation-type');
+        typeSelect.querySelectorAll('option').forEach(option => {
+            option.disabled = !annotationEditorState.hasIncomingBranch
+                && option.value !== 'clade_line';
+        });
+        typeSelect.value = savedType || annotationEditorState.defaultType;
         getEl('btn-annotation-save-text').textContent = mode === 'edit' ? 'Save changes' : 'Save';
         getEl('btn-annotation-delete').classList.toggle('hidden', mode !== 'edit');
         getEl('annotation-style-details').open = false;
@@ -952,9 +973,16 @@ document.addEventListener('DOMContentLoaded', async () => {
 
     async function submitAnnotationEditor() {
         if (!annotationEditorState) return;
-        const label = String(getEl('input-annotation-label')?.value || '').trim();
+        // Alan 8/17/26 - Normalize textarea newlines and tabs before client validation and saving.
+        const label = String(getEl('input-annotation-label')?.value || '')
+            .replace(/\r\n/g, '\n').replace(/\r/g, '\n').replace(/\t/g, '    ').trim();
         if (!label) {
             setAnnotationEditorError('Enter a label for this annotation.');
+            return;
+        }
+        // Alan 8/17/26 - Match the server's ten-line annotation-label limit in the editor.
+        if (label.split('\n').length > 10) {
+            setAnnotationEditorError('Use no more than 10 lines.');
             return;
         }
         const layerId = getEl('select-annotation-layer')?.value;
@@ -966,12 +994,21 @@ document.addEventListener('DOMContentLoaded', async () => {
             setAnnotationEditorError('This annotation has no member tips.');
             return;
         }
+        // Alan 8/17/26 - Refuse branch-only types when the selected membership resolves to the root.
+        const requestedType = getEl('select-annotation-type')?.value || 'clade_line';
+        if (!annotationEditorState.hasIncomingBranch && requestedType !== 'clade_line') {
+            setAnnotationEditorError('The whole-tree root has no incoming branch. Use Clade line.');
+            return;
+        }
 
         const payload = {
             id: annotationEditorState.annotationId || newAnnotationId('annotation'),
             layer_id: layerId,
             label,
-            annotation_type: getEl('select-annotation-type')?.value === 'bubble' ? 'bubble' : 'line',
+            // Alan 8/17/26 - Save only the three supported canonical annotation types.
+            annotation_type: ['clade_line', 'branch_text', 'branch_bubble'].includes(
+                requestedType
+            ) ? requestedType : 'clade_line',
             member_tip_ids: annotationEditorState.memberIds.slice()
         };
         ANNOTATION_STYLE_FIELDS.forEach(({ field }) => {
@@ -1056,7 +1093,8 @@ document.addEventListener('DOMContentLoaded', async () => {
         if (!cladeAnnotations.length) {
             const empty = document.createElement('p');
             empty.className = 'annotation-empty text-gray-500 dark:text-gray-400';
-            empty.textContent = 'No annotations yet. Right-click a branch and choose "Add clade annotation…", or select a complete clade and use the button above.';
+            // Alan 8/17/26 - Describe the branch-first creation workflow in the empty state.
+            empty.textContent = 'No annotations yet. Right-click any non-root branch and choose "Add annotation…", or select a complete clade and use the button above.';
             host.appendChild(empty);
             return;
         }
@@ -1082,7 +1120,11 @@ document.addEventListener('DOMContentLoaded', async () => {
             const meta = document.createElement('div');
             meta.className = 'annotation-row-meta text-gray-500 dark:text-gray-400';
             const memberCount = (annotation.member_tip_ids || []).length;
-            const typeLabel = annotation.annotation_type === 'bubble' ? 'Bubble' : 'Line';
+            // Alan 8/17/26 - Show canonical branch and clade type names in the manager.
+            const type = annotation.annotation_type === 'line' ? 'clade_line'
+                : (annotation.annotation_type === 'bubble' ? 'branch_bubble' : annotation.annotation_type);
+            const typeLabel = type === 'branch_text' ? 'Branch text'
+                : (type === 'branch_bubble' ? 'Branch bubble' : 'Clade line');
             meta.textContent = `${typeLabel} · ${layer ? layer.name : 'Unknown layer'} · ${memberCount} tip${memberCount === 1 ? '' : 's'}`;
             main.appendChild(meta);
 
@@ -1150,25 +1192,30 @@ document.addEventListener('DOMContentLoaded', async () => {
                 option.textContent = value;
                 control.appendChild(option);
             });
-        } else if (field === 'font_size') {
+        // Alan 8/17/26 - Layer opacity uses the same bounded numeric control as font size.
+        } else if (field === 'font_size' || field === 'fill_opacity') {
             control = document.createElement('input');
             control.type = 'number';
-            control.min = String(cfg.MIN_FONT_SIZE);
-            control.max = String(cfg.MAX_FONT_SIZE);
-            control.step = '1';
+            // Alan 8/17/26 - Bound layer opacity to 0–1 while retaining font-size bounds.
+            control.min = field === 'fill_opacity' ? '0' : String(cfg.MIN_FONT_SIZE);
+            control.max = field === 'fill_opacity' ? '1' : String(cfg.MAX_FONT_SIZE);
+            control.step = field === 'fill_opacity' ? '0.05' : '1';
             control.className = 'w-16 rounded border border-gray-300 bg-white px-1 py-0.5 text-xs text-gray-900 dark:border-gray-700 dark:bg-journal-dark dark:text-gray-100';
         } else {
             control = document.createElement('input');
             control.type = 'color';
             control.className = 'h-6 w-10 rounded border border-gray-300 bg-transparent p-0 dark:border-gray-700';
         }
-        control.value = String(layer['default_' + field]);
+        // Alan 8/17/26 - Resolve absent newer layer fields through shared defaults for old state.
+        control.value = String(effectiveAnnotationStyle(null, layer, field));
         // Left visible but inert for read-only viewers, so they can still see what a layer's
         // style actually is without being offered an edit that the server would refuse.
         control.disabled = !annotationsEditable();
 
         const commit = () => {
-            layer['default_' + field] = (field === 'font_size') ? Number(control.value) : control.value;
+            // Alan 8/17/26 - Persist opacity as a number so layer defaults round-trip cleanly.
+            layer['default_' + field] = (field === 'font_size' || field === 'fill_opacity')
+                ? Number(control.value) : control.value;
             // Repaint immediately so inheriting annotations restyle without waiting for the
             // debounced save round-trip.
             if (viewer?.setCladeAnnotations) viewer.setCladeAnnotations(annotationLayers, cladeAnnotations);
@@ -1288,6 +1335,9 @@ document.addEventListener('DOMContentLoaded', async () => {
             styles.appendChild(layerStyleControl(layer, 'font_weight', 'Weight'));
             styles.appendChild(layerStyleControl(layer, 'text_color', 'Text'));
             styles.appendChild(layerStyleControl(layer, 'line_color', 'Line'));
+            // Alan 8/17/26 - Let managers edit the default fill and opacity for bubble annotations.
+            styles.appendChild(layerStyleControl(layer, 'fill_color', 'Fill'));
+            styles.appendChild(layerStyleControl(layer, 'fill_opacity', 'Opacity'));
             card.appendChild(styles);
 
             host.appendChild(card);
@@ -1319,6 +1369,45 @@ document.addEventListener('DOMContentLoaded', async () => {
         }
     }
 
+    // Alan 8/17/26 - Open Add, Edit, or the manager from one exact canonical membership set,
+    // while allowing explicit Add entry points to create supported same-branch stacks.
+    function openAnnotationForMembership(memberIds, options = {}) {
+        const suppliedIds = Array.isArray(options.annotationIds)
+            ? options.annotationIds.filter(Boolean) : null;
+        const annotationIds = suppliedIds || (
+            viewer?.getAnnotationsForMemberIds
+                ? viewer.getAnnotationsForMemberIds(memberIds)
+                    .map(annotation => annotation.id).filter(Boolean)
+                : []
+        );
+        // Alan 8/17/26 - An explicit Add action must remain Add even when this branch already
+        // has annotations; editing stays available from the branch shortcut and manager.
+        if (options.forceAdd) {
+            openAnnotationEditor('add', {
+                memberIds,
+                defaultType: options.defaultType || 'clade_line'
+            });
+            return;
+        }
+        if (annotationIds.length === 1) {
+            openAnnotationEditor('edit', { annotationId: annotationIds[0] });
+            return;
+        }
+        if (annotationIds.length > 1) {
+            openAnnotationManager();
+            setAnnotationManagerTab('annotations');
+            showStatus(
+                `This clade has ${annotationIds.length} annotations. Choose one from the annotation list to edit.`,
+                'info', 5000
+            );
+            return;
+        }
+        openAnnotationEditor('add', {
+            memberIds,
+            defaultType: options.defaultType || 'clade_line'
+        });
+    }
+
     // Alan 8/15/26 - Secondary workflow: annotate whatever is selected, but only when the
     // selection is exactly one clade. Anything else would draw a bracket across taxa that
     // do not belong to it, so refuse with an explanation instead.
@@ -1332,7 +1421,8 @@ document.addEventListener('DOMContentLoaded', async () => {
             );
             return;
         }
-        openAnnotationEditor('add', { memberIds });
+        // Alan 8/17/26 - The button says Annotate, so keep it as an Add path for stacked labels.
+        openAnnotationForMembership(memberIds, { defaultType: 'clade_line', forceAdd: true });
     }
 
     function saveDisplayPrefs() {
@@ -2018,6 +2108,16 @@ document.addEventListener('DOMContentLoaded', async () => {
             saveDisplayPrefs();
         });
 
+        // Alan 8/17/26 - Adjust and persist the independent tip-label gap from toolbar buttons.
+        const changeTipLabelGap = (delta) => {
+            if (!viewer?.setTipLabelGap) return;
+            const next = viewer.setTipLabelGap((viewer.tipLabelGap ?? 2) + delta);
+            showStatus(`Tip label gap: ${next} px`, 'info', 1200);
+            saveDisplayPrefs();
+        };
+        getEl('btn-tip-label-gap-inc')?.addEventListener('click', () => changeTipLabelGap(2));
+        getEl('btn-tip-label-gap-dec')?.addEventListener('click', () => changeTipLabelGap(-2));
+
         // Font Size Controls
         ['input-support-font', 'input-tip-font'].forEach(id => {
             const el = getEl(id);
@@ -2420,13 +2520,21 @@ document.addEventListener('DOMContentLoaded', async () => {
         // Alan 8/15/26 - Primary annotation workflow: the viewer hands over the clicked clade's
         // canonical descendant leaf IDs, so the user never selects every tip by hand.
         if (viewer && typeof viewer.setAddCladeAnnotationHandler === 'function') {
-            viewer.setAddCladeAnnotationHandler((node, memberIds = []) => {
+            // Alan 8/17/26 - Accept exact-match metadata and explicit stacked-annotation requests.
+            viewer.setAddCladeAnnotationHandler((node, memberIds = [], annotationOptions = {}) => {
                 if (window.VIEW_ONLY || isProcessing) return;
                 if (!Array.isArray(memberIds) || !memberIds.length) {
                     showStatus("Can't annotate: this branch has no tips.", "warning", 2500);
                     return;
                 }
-                openAnnotationEditor('add', { memberIds });
+                // Alan 8/17/26 - Preserve whether the clicked menu action meant Edit or Add another.
+                const annotationIds = Array.isArray(annotationOptions.annotationIds)
+                    ? annotationOptions.annotationIds.filter(Boolean) : [];
+                openAnnotationForMembership(memberIds, {
+                    annotationIds,
+                    defaultType: annotationOptions.defaultType || 'clade_line',
+                    forceAdd: annotationOptions.forceAdd === true
+                });
             });
         }
 

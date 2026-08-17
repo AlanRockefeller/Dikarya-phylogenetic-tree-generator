@@ -18,6 +18,7 @@ from app.services.tree_edit_service import (
     load_tree_state,
     save_tree_state,
     tree_state_lock,
+    validate_tip_rename,
 )
 
 
@@ -94,6 +95,49 @@ def test_trimmed_fasta_download_decompresses_gzipped_artifact(tmp_path):
         response.direct_passthrough = False
         assert response.get_data() == fasta
         assert "sequences_trimmed.fasta" in response.headers["Content-Disposition"]
+
+
+@pytest.mark.parametrize(
+    ("old_name", "new_name"),
+    [
+        (None, "Safe name"),
+        ("A", 42),
+        ("A", ""),
+        ("A", "   "),
+        ("A", "x" * 257),
+        ("A", "broken\nheader"),
+        ("A", "broken\x7fheader"),
+        ("A", "A:0.5"),
+    ],
+)
+def test_tip_rename_validation_rejects_unsafe_external_values(old_name, new_name):
+    with pytest.raises(ValueError):
+        validate_tip_rename(old_name, new_name)
+
+
+def test_browser_rename_rejects_invalid_label_without_changing_state(tmp_path):
+    job_dir = tmp_path / JOB_ID
+    job_dir.mkdir()
+    original = {
+        "tree_structure": {"name": "A", "original_name": "A"},
+        "renames": {},
+    }
+    save_tree_state(job_dir, original)
+
+    app = Flask(__name__)
+    with (
+        app.test_request_context(
+            method="POST",
+            json={"old_name": "A", "new_name": "broken\n>injected"},
+        ),
+        patch.object(Config, "JOB_DIR", tmp_path),
+        patch.object(routes, "check_job_access", return_value=(None, None, 200)),
+    ):
+        response, status = routes.rename_tree_tip(JOB_ID)
+
+    assert status == 400
+    assert "control characters" in response.get_json()["error"]
+    assert load_tree_state(job_dir) == original
 
 
 def test_v1_nexus_prefers_pruned_tree_and_falls_back_to_original(tmp_path):
