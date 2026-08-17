@@ -1,0 +1,148 @@
+#!/bin/bash
+# Root-owned wrapper letting the Dikarya web app (running as `dikarya`) obtain a
+# Claude review of a finished alignment + tree using the `tree` account's Claude
+# Code credentials, which are mode 600 and unreadable to `dikarya`.
+#
+# Install as root:
+#   install -o root -g root -m 0755 \
+#       /var/www/dikarya/scripts/dikarya-claude-review \
+#       /usr/local/sbin/dikarya-claude-review
+#   install -o root -g root -m 0440 \
+#       /var/www/dikarya/ops/sudoers/dikarya-claude \
+#       /etc/sudoers.d/dikarya-claude
+#   visudo -c
+#
+# Called as:  sudo -n -u tree /usr/local/sbin/dikarya-claude-review  < prompt.txt
+#
+# ---------------------------------------------------------------------------
+# THIS WRAPPER DELIBERATELY ACCEPTS NO ARGUMENTS.
+#
+# It is invoked by a process that handles untrusted input from the public
+# internet. Every `claude` flag below is pinned here, in a root-owned file that
+# `dikarya` cannot edit. Forwarding "$@" would hand that process the rest of the
+# Claude Code CLI -- `--tools Bash`, `--dangerously-skip-permissions`,
+# `--settings`, `--plugin-dir` -- which is arbitrary code execution as `tree`.
+# This is the same reasoning that keeps dikarya-journal from forwarding
+# arguments to journalctl.
+#
+# The prompt arrives on stdin, where it can only ever be data. Anything a
+# caller wants to vary (model, effort) is an environment variable read below
+# and validated against a fixed allowlist, never passed through verbatim.
+# ---------------------------------------------------------------------------
+
+set -euo pipefail
+
+if [ "$#" -ne 0 ]; then
+    echo "dikarya-claude-review: takes no arguments (prompt is read from stdin)" >&2
+    exit 64
+fi
+
+CLAUDE_BIN=/home/tree/.local/bin/claude
+PROMPT_DIR=/etc/dikarya/claude-review
+SYSTEM_PROMPT_FILE="$PROMPT_DIR/system_prompt.txt"
+SCHEMA_FILE="$PROMPT_DIR/schema.json"
+
+# Reject an oversized prompt before spending anything. The generated review
+# context is 8-17 KB on the real job corpus, so 256 KB is generous headroom
+# while still bounding what a malformed or hostile caller can submit.
+MAX_PROMPT_BYTES=$((256 * 1024))
+
+# Wall-clock ceiling. nginx gives the web app proxy_read_timeout 300s, so this
+# must stay comfortably under that or the user sees a 504 instead of an error.
+TIMEOUT_SECONDS=${DIKARYA_CLAUDE_TIMEOUT:-240}
+
+# Hard per-invocation spend cap enforced by the CLI itself, so a runaway review
+# cannot bill without limit even if everything above it misbehaves.
+MAX_BUDGET_USD=${DIKARYA_CLAUDE_MAX_BUDGET:-1.00}
+
+MODEL=${DIKARYA_CLAUDE_MODEL:-claude-opus-5}
+EFFORT=${DIKARYA_CLAUDE_EFFORT:-medium}
+
+# Allowlist rather than pass-through: these reach the CLI as flag values, and a
+# caller-supplied string must never be able to become another flag.
+case "$MODEL" in
+    claude-opus-5|claude-opus-4-8|claude-sonnet-5|claude-haiku-4-5) ;;
+    *) echo "dikarya-claude-review: unsupported model '$MODEL'" >&2; exit 64 ;;
+esac
+case "$EFFORT" in
+    low|medium|high|xhigh|max) ;;
+    *) echo "dikarya-claude-review: unsupported effort '$EFFORT'" >&2; exit 64 ;;
+esac
+case "$TIMEOUT_SECONDS" in
+    ''|*[!0-9]*) echo "dikarya-claude-review: timeout must be an integer" >&2; exit 64 ;;
+esac
+if [ "$TIMEOUT_SECONDS" -lt 10 ] || [ "$TIMEOUT_SECONDS" -gt 280 ]; then
+    echo "dikarya-claude-review: timeout out of range (10-280)" >&2
+    exit 64
+fi
+case "$MAX_BUDGET_USD" in
+    ''|*[!0-9.]*|*.*.*) echo "dikarya-claude-review: bad budget '$MAX_BUDGET_USD'" >&2; exit 64 ;;
+esac
+
+for required in "$SYSTEM_PROMPT_FILE" "$SCHEMA_FILE"; do
+    if [ ! -r "$required" ]; then
+        echo "dikarya-claude-review: missing $required (see install notes)" >&2
+        exit 78
+    fi
+done
+
+if [ ! -x "$CLAUDE_BIN" ]; then
+    echo "dikarya-claude-review: $CLAUDE_BIN not executable" >&2
+    exit 78
+fi
+
+# The system prompt and schema live in a root-owned directory, not in the repo
+# and not in anything the caller sends. The caller supplies only the statistics
+# to be reviewed, so it cannot rewrite the reviewer's instructions.
+SYSTEM_PROMPT=$(cat "$SYSTEM_PROMPT_FILE")
+SCHEMA=$(cat "$SCHEMA_FILE")
+
+PROMPT_FILE=$(mktemp /tmp/dikarya-claude-review.XXXXXXXX)
+WORKDIR=$(mktemp -d /tmp/dikarya-claude-cwd.XXXXXXXX)
+trap 'rm -f "$PROMPT_FILE"; rm -rf "$WORKDIR"' EXIT
+
+# head -c bounds what we read; a caller streaming forever cannot exhaust disk.
+head -c "$((MAX_PROMPT_BYTES + 1))" > "$PROMPT_FILE"
+PROMPT_BYTES=$(wc -c < "$PROMPT_FILE")
+if [ "$PROMPT_BYTES" -gt "$MAX_PROMPT_BYTES" ]; then
+    echo "dikarya-claude-review: prompt exceeds ${MAX_PROMPT_BYTES} bytes" >&2
+    exit 64
+fi
+if [ "$PROMPT_BYTES" -eq 0 ]; then
+    echo "dikarya-claude-review: empty prompt on stdin" >&2
+    exit 64
+fi
+
+# Run from an empty scratch directory so Claude Code cannot discover the repo's
+# CLAUDE.md, .claude/settings.json, skills or hooks. --safe-mode disables those
+# customizations as well; the empty cwd means there is nothing to find in the
+# first place. Both, because either alone is one config change from failing.
+cd "$WORKDIR"
+
+# --tools ""            no tools at all: this is one inference call, not an agent
+# --safe-mode           ignore CLAUDE.md, skills, plugins, hooks, MCP, agents
+# --strict-mcp-config   ignore every MCP server configuration on the box
+# --disable-slash-commands  no skill invocation from prompt text
+# --no-session-persistence  do not write transcripts for a server-side call
+# --system-prompt       replace the coding-agent persona with the reviewer's
+# --json-schema         constrain the reply to the review schema
+# Not `exec`: that would replace this shell and the EXIT trap above would never
+# run, leaking the prompt file and scratch directory on every single review.
+set +e
+timeout --signal=TERM --kill-after=10s "$TIMEOUT_SECONDS" \
+    "$CLAUDE_BIN" -p \
+        --system-prompt "$SYSTEM_PROMPT" \
+        --json-schema "$SCHEMA" \
+        --tools "" \
+        --safe-mode \
+        --strict-mcp-config \
+        --disable-slash-commands \
+        --no-session-persistence \
+        --model "$MODEL" \
+        --effort "$EFFORT" \
+        --max-budget-usd "$MAX_BUDGET_USD" \
+        --output-format json \
+        < "$PROMPT_FILE"
+STATUS=$?
+set -e
+exit "$STATUS"

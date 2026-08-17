@@ -187,9 +187,11 @@ def _schemas():
                         "Substitution model. When omitted, tree_method=iqtree runs "
                         "ModelFinder (-m MFP) to select the best-fit model by BIC; "
                         "other maximum-likelihood methods use the server's "
-                        "DEFAULT_ML_MODEL (normally GTR+G). The chosen IQ-TREE model "
-                        "is reported as model_selected in tree_metadata.json. Pass an "
-                        "explicit model name to fix it."
+                        "DEFAULT_ML_MODEL (normally GTR+G). RAxML with moose_enabled "
+                        "also substitutes its own pick. Whenever the fitted model "
+                        "differs from the requested one it is reported as "
+                        "model_selected in tree_metadata.json, with model_selector "
+                        "naming what chose it. Pass an explicit model name to fix it."
                     ),
                 },
                 "bootstrap": {"type": "integer", "minimum": 0, "maximum": 10000, "default": 1000},

@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any, Dict, Optional
 
 from app.config import Config
+from app.services.artifact_storage import compress_artifact, discard_artifact
 from app.services.subprocess_utils import (
     run_command,
     run_command_streaming,
@@ -92,8 +93,9 @@ def run_trimming(
             tool_input = terminal_tmp
 
         report_path = output_alignment.with_name(f"{output_alignment.stem}_report.html")
-        if report_path.exists():
-            report_path.unlink()
+        # Clear both forms: a rerun must not leave last run's report behind in
+        # the other representation (see the gzip step after the trimmer runs).
+        discard_artifact(report_path)
 
         if method == "trimal_gappy":
             _run_trimal_gappy(tool_input, output_alignment, report_path, config, logger, job_id)
@@ -111,6 +113,10 @@ def run_trimming(
 
         _restore_trimmed_fasta_headers(tool_input, output_alignment, logger)
         if report_path.exists() and report_path.stat().st_size:
+            # trimAl's -htmlout is one <span> per residue: ~1.65 MB per report,
+            # 2.4 GiB across the job tree, and it compresses ~43x because of
+            # that repetition. It is only ever read to build the trimming
+            # inspection ZIP, so it is stored gzipped and decompressed there.
             stats["report_file"] = report_path.name
             stats["report_format"] = "html"
             stats["report_input_stage"] = (
@@ -118,6 +124,7 @@ def run_trimming(
                 if trim_terminal_overhangs
                 else "unaltered_alignment"
             )
+            compress_artifact(report_path)
         else:
             logger.warning("Trimming report was not produced: %s", report_path)
         logger.info(f"Trimming completed successfully. Output: {output_alignment}")

@@ -6,6 +6,11 @@ from flask import g, url_for
 
 from app.config import Config
 from app.models import Job
+from app.services.artifact_storage import (
+    artifact_exists,
+    artifact_size,
+    resolve_artifact,
+)
 from app.services.security_utils import validate_job_id
 
 
@@ -82,13 +87,18 @@ def serialize_job(job):
 DOWNLOADABLE_ARTIFACTS = {
     "tree.newick":             "tree/tree_pruned.newick",
     "tree.original.newick":    "tree/tree_original.newick",
-    "tree.nexus":              "tree/tree.nexus",
+    # These five pointed at paths the pipeline has never written, so the v1
+    # downloads for them always 404'd. Verified against all 10,865 job dirs:
+    # tree/tree.nexus, alignment/alignment_aligned.fasta,
+    # alignment/alignment_aligned_trimmed.fasta, tree/tree_state.json and a
+    # root-level blast_results.json exist in exactly zero of them.
+    "tree.nexus":              "tree/tree_pruned.nexus",
     "input.fasta":             "input/input_raw.fasta",
-    "alignment.fasta":         "alignment/alignment_aligned.fasta",
-    "trimmed.fasta":           "alignment/alignment_aligned_trimmed.fasta",
-    "blast_results.json":      "blast_results.json",
+    "alignment.fasta":         "alignment/alignment_raw.fasta",
+    "trimmed.fasta":           "alignment/alignment_trimmed.fasta",
+    "blast_results.json":      "blast/blast_results.json",
     "input_info.json":         "input_info.json",
-    "tree_state.json":         "tree/tree_state.json",
+    "tree_state.json":         "tree_state.json",
     "tree_metadata.json":      "tree/tree_metadata.json",
     "mrbayes.input.nexus":     "tree/mrbayes_input.nex",
     "mrbayes.parameters.p":    "tree/mrbayes_input.nex.p",
@@ -118,23 +128,40 @@ def list_available_artifacts(job_id):
     base = Config.JOB_DIR / job_id
     out = []
     for name, rel in DOWNLOADABLE_ARTIFACTS.items():
-        p = base / rel
-        if p.exists() and p.is_file():
+        p = _logical_artifact_path(base, name, rel)
+        if artifact_exists(p):
             out.append({
                 "name": name,
-                "size_bytes": p.stat().st_size,
+                # Report the uncompressed size: that is what a client
+                # downloading this artifact actually receives, whether or not it
+                # happens to be gzipped at rest.
+                "size_bytes": artifact_size(p),
                 "mime": _guess_mime(name),
             })
     return out
 
 
 def artifact_path(job_id, name):
-    """Resolve an artifact name to an absolute Path, or None if unknown/missing."""
+    """
+    Resolve an artifact name to the absolute Path that holds it, or None if the
+    name is unknown or nothing is on disk.
+
+    May return a `.gz` path -- callers serve bytes via read_artifact_bytes
+    rather than sending the file directly.
+    """
     rel = DOWNLOADABLE_ARTIFACTS.get(name)
     if not rel:
         return None
-    p = Config.JOB_DIR / job_id / rel
-    return p if p.exists() and p.is_file() else None
+    path = _logical_artifact_path(Config.JOB_DIR / job_id, name, rel)
+    return resolve_artifact(path)
+
+
+def _logical_artifact_path(base, name, rel):
+    """Prefer the edited Nexus tree while retaining the original fallback."""
+    path = base / rel
+    if name == "tree.nexus" and not artifact_exists(path):
+        return base / "tree" / "tree_original.nexus"
+    return path
 
 
 def _guess_mime(name):

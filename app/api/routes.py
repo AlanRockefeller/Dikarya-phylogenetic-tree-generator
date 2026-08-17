@@ -14,6 +14,12 @@ from difflib import SequenceMatcher
 from datetime import datetime
 
 from app.services.security_utils import validate_job_id, validate_safe_file_path, coerce_bool
+from app.services.artifact_storage import (
+    artifact_exists,
+    open_artifact,
+    read_artifact_bytes,
+    resolve_artifact,
+)
 from app.services.its_extraction_service import (
     normalize_region as normalize_its_region,
     resolve_min_length as resolve_its_min_length,
@@ -2344,17 +2350,24 @@ def create_job():
                 "trim_terminal_overhangs": job_params["trim_terminal_overhangs"],
                 "its_region": job_params.get("its_region"),
                 "run_preset": job_params.get("run_preset"),
-                "bootstrap_cap": job_params.get("bootstrap_cap")
+                "bootstrap_cap": job_params.get("bootstrap_cap"),
+                # Set by enqueue_job when the submitted set cannot yield an
+                # informative tree. Kept on the record so the warning is still
+                # there when the user opens the finished job.
+                "input_warnings": job_params.get("input_warnings") or [],
             }
         )
-        
+
         if current_user.is_authenticated:
             job_record.user_id = current_user.id
-            
+
         db.session.add(job_record)
         db.session.commit()
-        
-        return jsonify({"status": "queued", "job_id": job_id}), 202
+
+        response = {"status": "queued", "job_id": job_id}
+        if job_params.get("input_warnings"):
+            response["warnings"] = job_params["input_warnings"]
+        return jsonify(response), 202
     except Exception as e:
         return _server_error(e)
 
@@ -2405,10 +2418,11 @@ def prune_tree(job_id):
         return jsonify({"status": "error", "error": "No tips specified"}), 400
     
     try:
-        from app.services.tree_edit_service import load_tree_state, prune_taxa, save_tree_state
-        state = load_tree_state(job_dir)
-        state = prune_taxa(job_dir, state, tip_names)
-        save_tree_state(job_dir, state)
+        from app.services.tree_edit_service import load_tree_state, prune_taxa, save_tree_state, tree_state_lock
+        with tree_state_lock(job_dir):
+            state = load_tree_state(job_dir)
+            state = prune_taxa(job_dir, state, tip_names)
+            save_tree_state(job_dir, state)
         return jsonify(state)
     except Exception as e:
         return _server_error(e)
@@ -2426,10 +2440,11 @@ def rename_tree_tip(job_id):
     new_name = data.get("new_name")
     
     try:
-        from app.services.tree_edit_service import load_tree_state, rename_tip, save_tree_state
-        state = load_tree_state(job_dir)
-        state = rename_tip(state, old_name, new_name)
-        save_tree_state(job_dir, state)
+        from app.services.tree_edit_service import load_tree_state, rename_tip, save_tree_state, tree_state_lock
+        with tree_state_lock(job_dir):
+            state = load_tree_state(job_dir)
+            state = rename_tip(state, old_name, new_name)
+            save_tree_state(job_dir, state)
         return jsonify(state)
     except Exception as e:
         return _server_error(e)
@@ -2478,6 +2493,7 @@ def refresh_tree_mycomap_records(job_id):
             load_tree_state,
             refresh_mycomap_tip_labels,
             save_tree_state,
+            tree_state_lock,
         )
 
         state = load_tree_state(job_dir)
@@ -2504,14 +2520,26 @@ def refresh_tree_mycomap_records(job_id):
             }), 422
 
         refresh_result = refresh_mycomap_observation_records(references)
-        label_result = refresh_mycomap_tip_labels(
-            state,
-            normalized_tip_names,
-            refresh_result,
-        )
-        changes = label_result["changes"]
-        if changes:
-            save_tree_state(job_dir, label_result["tree_state"])
+        with tree_state_lock(job_dir):
+            # The remote lookup can take several seconds, so reload only at
+            # commit time under the shared edit lock. This avoids either
+            # holding the lock across network I/O or saving the stale snapshot
+            # that was used to resolve observation references above.
+            state = load_tree_state(job_dir)
+            available_tips = _tree_tip_set(state)
+            if any(name not in available_tips for name in normalized_tip_names):
+                return jsonify({
+                    "status": "error",
+                    "error": "One or more selected tree records are no longer available.",
+                }), 409
+            label_result = refresh_mycomap_tip_labels(
+                state,
+                normalized_tip_names,
+                refresh_result,
+            )
+            changes = label_result["changes"]
+            if changes:
+                save_tree_state(job_dir, label_result["tree_state"])
         return jsonify({
             "status": "success",
             "refreshed_count": len(references),
@@ -2545,10 +2573,11 @@ def rotate_tree_node(job_id):
         return jsonify({"status": "error", "error": "Invalid node_id"}), 400
 
     try:
-        from app.services.tree_edit_service import load_tree_state, rotate_node, save_tree_state
-        state = load_tree_state(job_dir)
-        state = rotate_node(job_dir, state, node_id)
-        save_tree_state(job_dir, state)
+        from app.services.tree_edit_service import load_tree_state, rotate_node, save_tree_state, tree_state_lock
+        with tree_state_lock(job_dir):
+            state = load_tree_state(job_dir)
+            state = rotate_node(job_dir, state, node_id)
+            save_tree_state(job_dir, state)
         return jsonify(state)
     except ValueError as e:
         return jsonify({"status": "error", "error": str(e)}), 400
@@ -2570,10 +2599,11 @@ def reroot_tree_endpoint(job_id):
         return jsonify({"status": "error", "error": "Missing root_target"}), 400
     
     try:
-        from app.services.tree_edit_service import load_tree_state, reroot_tree, save_tree_state
-        state = load_tree_state(job_dir)
-        state = reroot_tree(job_dir, state, target)
-        save_tree_state(job_dir, state)
+        from app.services.tree_edit_service import load_tree_state, reroot_tree, save_tree_state, tree_state_lock
+        with tree_state_lock(job_dir):
+            state = load_tree_state(job_dir)
+            state = reroot_tree(job_dir, state, target)
+            save_tree_state(job_dir, state)
         return jsonify(state)
     except ValueError as e:
         return jsonify({"status": "error", "error": str(e)}), 400
@@ -2589,10 +2619,11 @@ def midpoint_root_endpoint(job_id):
     job_dir = Config.JOB_DIR / job_id
         
     try:
-        from app.services.tree_edit_service import load_tree_state, midpoint_root, save_tree_state
-        state = load_tree_state(job_dir)
-        state = midpoint_root(job_dir, state)
-        save_tree_state(job_dir, state)
+        from app.services.tree_edit_service import load_tree_state, midpoint_root, save_tree_state, tree_state_lock
+        with tree_state_lock(job_dir):
+            state = load_tree_state(job_dir)
+            state = midpoint_root(job_dir, state)
+            save_tree_state(job_dir, state)
         return jsonify(state)
     except ValueError as e:
         return jsonify({"status": "error", "error": str(e)}), 400
@@ -2610,19 +2641,21 @@ def midpoint_root_toggle_endpoint(job_id):
         
     try:
         from app.services.tree_edit_service import (
-            load_tree_state, midpoint_root, undo_midpoint_root, save_tree_state
+            load_tree_state, midpoint_root, undo_midpoint_root, save_tree_state,
+            tree_state_lock,
         )
-        state = load_tree_state(job_dir)
-        
-        # Check current state and toggle
-        if state.get("is_midpoint_rooted", False):
-            # Currently midpoint rooted - undo it
-            state = undo_midpoint_root(job_dir, state)
-        else:
-            # Not midpoint rooted - apply it
-            state = midpoint_root(job_dir, state)
-        
-        save_tree_state(job_dir, state)
+        with tree_state_lock(job_dir):
+            state = load_tree_state(job_dir)
+
+            # Check current state and toggle
+            if state.get("is_midpoint_rooted", False):
+                # Currently midpoint rooted - undo it
+                state = undo_midpoint_root(job_dir, state)
+            else:
+                # Not midpoint rooted - apply it
+                state = midpoint_root(job_dir, state)
+
+            save_tree_state(job_dir, state)
         return jsonify(state)
     except ValueError as e:
         return jsonify({"status": "error", "error": str(e)}), 400
@@ -2660,13 +2693,15 @@ def set_rooting_mode_endpoint(job_id):
     try:
         from app.services.tree_edit_service import (
             load_tree_state, save_tree_state, apply_rooting_mode, set_sequence_of_interest,
+            tree_state_lock,
         )
-        state = load_tree_state(job_dir)
-        if soi:
-            state = set_sequence_of_interest(state, soi, source="user_selected")
-        state = apply_rooting_mode(job_dir, state, mode, target=target,
-                                    sequence_of_interest=soi)
-        save_tree_state(job_dir, state)
+        with tree_state_lock(job_dir):
+            state = load_tree_state(job_dir)
+            if soi:
+                state = set_sequence_of_interest(state, soi, source="user_selected")
+            state = apply_rooting_mode(job_dir, state, mode, target=target,
+                                       sequence_of_interest=soi)
+            save_tree_state(job_dir, state)
         return jsonify(state)
     except ValueError as e:
         return jsonify({"status": "error", "error": str(e)}), 400
@@ -2691,10 +2726,12 @@ def set_sequence_of_interest_endpoint(job_id):
     try:
         from app.services.tree_edit_service import (
             load_tree_state, save_tree_state, set_sequence_of_interest,
+            tree_state_lock,
         )
-        state = load_tree_state(job_dir)
-        state = set_sequence_of_interest(state, tip_name, source=source)
-        save_tree_state(job_dir, state)
+        with tree_state_lock(job_dir):
+            state = load_tree_state(job_dir)
+            state = set_sequence_of_interest(state, tip_name, source=source)
+            save_tree_state(job_dir, state)
         return jsonify({
             "status": "ok",
             "sequence_of_interest": state.get("sequence_of_interest"),
@@ -2729,15 +2766,75 @@ def save_selection_sets(job_id):
         return jsonify({"status": "error", "error": "Invalid 'colors' field"}), 400
 
     try:
-        from app.services.tree_edit_service import load_tree_state, save_tree_state
-        state = load_tree_state(job_dir)
-        state["selection_sets"] = sets
-        state["active_selection_set"] = active
-        state["selection_set_colors"] = colors or {}
-        save_tree_state(job_dir, state)
+        from app.services.tree_edit_service import load_tree_state, save_tree_state, tree_state_lock
+        with tree_state_lock(job_dir):
+            state = load_tree_state(job_dir)
+            state["selection_sets"] = sets
+            state["active_selection_set"] = active
+            state["selection_set_colors"] = colors or {}
+            save_tree_state(job_dir, state)
         return jsonify({"status": "ok"})
     except Exception as e:
         return _server_error(e)
+
+@bp.route('/job/<job_id>/tree/annotations', methods=['POST'])
+def save_clade_annotations(job_id):
+    """Replace this job's clade-annotation configuration in one atomic save.
+
+    The whole configuration is submitted together: partial updates would let a
+    rejected layer leave the annotations referencing it stranded. Everything
+    else in tree_state.json is preserved, and last-write-wins across tabs.
+    """
+    if not validate_job_id(job_id):
+        return jsonify({"status": "error", "error": "Invalid job ID format"}), 400
+
+    _, error_msg, status_code = check_job_access(job_id, mode="edit")
+    if error_msg:
+        return jsonify({"status": "error", "error": error_msg}), status_code
+
+    job_dir = Config.JOB_DIR / job_id
+    if not job_dir.exists():
+        return jsonify({"status": "error", "error": "Job not found"}), 404
+
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict):
+        return jsonify({
+            "status": "error",
+            "error": "Request body must be a valid JSON object",
+        }), 400
+
+    try:
+        from app.services.tree_edit_service import load_tree_state, save_tree_state, tree_state_lock
+        from app.services.tree_annotation_service import (
+            ANNOTATION_LAYERS_KEY,
+            AnnotationValidationError,
+            CLADE_ANNOTATIONS_KEY,
+            apply_annotation_config,
+            normalize_annotation_config,
+        )
+
+        with tree_state_lock(job_dir):
+            # Load and commit under the same per-job lock. This preserves a
+            # prune/reroot/rename that finishes while an annotation request is
+            # in flight instead of writing the request's stale whole snapshot.
+            state = load_tree_state(job_dir)
+            try:
+                config = normalize_annotation_config(state, data)
+            except AnnotationValidationError as exc:
+                # Nothing has been mutated at this point, so the previously saved
+                # configuration is still intact on disk.
+                return jsonify({"status": "error", "error": str(exc)}), 400
+
+            apply_annotation_config(state, config)
+            save_tree_state(job_dir, state)
+        return jsonify({
+            "status": "ok",
+            "layers": config[ANNOTATION_LAYERS_KEY],
+            "annotations": config[CLADE_ANNOTATIONS_KEY],
+        })
+    except Exception as e:
+        return _server_error(e, where="save_clade_annotations")
+
 
 @bp.route('/job/<job_id>/rebuild-with-duplicates', methods=['POST'])
 @limiter.limit("6 per minute")
@@ -2924,14 +3021,19 @@ def get_job_pipeline_params(job_id):
 
     params = {key: stored.get(key) for key in RECOMPUTE_READABLE_FIELDS if key in stored}
 
-    # The requested model may be "MFP"; report what ModelFinder actually chose
-    # so the panel can show it rather than leaving the user guessing.
+    # The requested model is often not the one that was fit -- IQ-TREE's "MFP"
+    # defers to ModelFinder, and RAxML with MOOSE enabled substitutes its own
+    # pick. Report the fitted model, and who chose it, rather than leaving the
+    # user guessing.
     selected_model = None
+    model_selector = None
     metadata_path = Config.JOB_DIR / job_id / "tree" / "tree_metadata.json"
     if metadata_path.exists():
         try:
             with open(metadata_path, "r") as f:
-                selected_model = (_json.load(f) or {}).get("model_selected")
+                metadata = _json.load(f) or {}
+            selected_model = metadata.get("model_selected")
+            model_selector = metadata.get("model_selector")
         except (OSError, ValueError):
             pass
 
@@ -2939,6 +3041,7 @@ def get_job_pipeline_params(job_id):
         "status": "success",
         "params": params,
         "model_selected": selected_model,
+        "model_selector": model_selector,
     })
 
 
@@ -2984,7 +3087,7 @@ def recompute_tree_job(job_id):
             # later recompute all report the settings this run actually used.
             try:
                 with open(input_info_path, "w") as f:
-                    json.dump(params_dict, f, indent=2)
+                    json.dump(params_dict, f, separators=(",", ":"))
             except OSError as write_err:
                 logger.warning(f"Could not persist recompute overrides for job {job_id}: {write_err}")
 
@@ -3245,15 +3348,28 @@ def download_fasta_aligned(job_id):
         return jsonify({"status": "error", "error": error_msg}), status_code
     
     job_dir = Config.JOB_DIR / job_id
-    
+
     # Return the raw alignment (before trimming)
     path = job_dir / "alignment" / "alignment_raw.fasta"
-    if not path.exists():
+    if not artifact_exists(path):
         path = job_dir / "alignment" / "aligned.fasta"
-    
-    if not validate_safe_file_path(path, job_dir):
+
+    stored = resolve_artifact(path)
+    if stored is None or not validate_safe_file_path(stored, job_dir):
         return jsonify({"status": "error", "error": "Aligned FASTA not found or invalid"}), 404
-        
+
+    if stored != path:
+        # Stored gzipped: hand the client the plain FASTA it asked for rather
+        # than a .gz they did not, since this is an attachment download.
+        from io import BytesIO
+
+        return send_file(
+            BytesIO(read_artifact_bytes(path)),
+            as_attachment=True,
+            download_name="sequences_aligned.fasta",
+            mimetype="text/plain",
+        )
+
     return send_file(path, as_attachment=True, download_name="sequences_aligned.fasta")
 
 @bp.route('/job/<job_id>/alignment/view', methods=['POST'])
@@ -3297,14 +3413,16 @@ def alignment_view(job_id):
         alignment_dir / "alignment_raw.fasta",
         alignment_dir / "aligned.fasta",
     )
-    path = next((candidate for candidate in alignment_candidates if candidate.exists()), None)
-    if path is None:
+    path = next((candidate for candidate in alignment_candidates if artifact_exists(candidate)), None)
+    stored = resolve_artifact(path) if path is not None else None
+    if stored is None:
         return jsonify({"status": "error", "error": "Aligned FASTA not found"}), 404
-    if not validate_safe_file_path(path, job_dir):
+    if not validate_safe_file_path(stored, job_dir):
         return jsonify({"status": "error", "error": "Aligned FASTA not found"}), 404
 
     try:
-        records = list(SeqIO.parse(str(path), "fasta"))
+        with open_artifact(path, "rt") as handle:
+            records = list(SeqIO.parse(handle, "fasta"))
     except Exception as exc:  # pragma: no cover - defensive
         return _server_error(exc, where="alignment_view parse")
 
@@ -3499,10 +3617,21 @@ def download_fasta_trimmed(job_id):
     
     job_dir = Config.JOB_DIR / job_id
     path = job_dir / "alignment" / "alignment_trimmed.fasta"
-    
-    if not validate_safe_file_path(path, job_dir):
+
+    stored = resolve_artifact(path)
+    if stored is None or not validate_safe_file_path(stored, job_dir):
         return jsonify({"status": "error", "error": "Trimmed FASTA not found or invalid"}), 404
-        
+
+    if stored != path:
+        from io import BytesIO
+
+        return send_file(
+            BytesIO(read_artifact_bytes(path)),
+            as_attachment=True,
+            download_name="sequences_trimmed.fasta",
+            mimetype="text/plain",
+        )
+
     return send_file(path, as_attachment=True, download_name="sequences_trimmed.fasta")
 
 
@@ -3519,13 +3648,19 @@ def download_alignment_inspection(job_id):
 
     job_dir = Config.JOB_DIR / job_id
     raw_path = job_dir / "alignment" / "alignment_raw.fasta"
-    if not raw_path.exists():
+    if not artifact_exists(raw_path):
         raw_path = job_dir / "alignment" / "aligned.fasta"
     trimmed_path = job_dir / "alignment" / "alignment_trimmed.fasta"
     report_path = job_dir / "alignment" / "alignment_trimmed_report.html"
 
-    required_paths = (raw_path, trimmed_path, report_path)
-    if not all(validate_safe_file_path(path, job_dir) for path in required_paths):
+    # Any of these may be stored gzipped (see app/services/artifact_storage.py).
+    # Resolve to whichever form is on disk first, then run the usual symlink /
+    # traversal check against that real path.
+    resolved = [resolve_artifact(path) for path in (raw_path, trimmed_path, report_path)]
+    if not all(
+        path is not None and validate_safe_file_path(path, job_dir)
+        for path in resolved
+    ):
         return jsonify({
             "status": "error",
             "error": "A marked trimming report is not available for this job",
@@ -3573,9 +3708,11 @@ def download_alignment_inspection(job_id):
 
     archive = BytesIO()
     with ZipFile(archive, "w", compression=ZIP_DEFLATED) as zip_file:
-        zip_file.write(raw_path, arcname="alignment_before_trimming.fasta")
-        zip_file.write(trimmed_path, arcname="alignment_after_trimming.fasta")
-        zip_file.write(report_path, arcname="trimming_report.html")
+        # writestr rather than write: these artifacts may be gzipped at rest,
+        # and the bundle must always contain the plain text the names promise.
+        zip_file.writestr("alignment_before_trimming.fasta", read_artifact_bytes(raw_path))
+        zip_file.writestr("alignment_after_trimming.fasta", read_artifact_bytes(trimmed_path))
+        zip_file.writestr("trimming_report.html", read_artifact_bytes(report_path))
         zip_file.writestr("README.txt", "\n".join(readme_lines) + "\n")
     archive.seek(0)
 
@@ -3587,6 +3724,77 @@ def download_alignment_inspection(job_id):
     )
     response.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
     return response
+
+
+@bp.route('/job/<job_id>/analysis/review', methods=['POST'])
+@limiter.limit("4 per minute; 40 per hour")
+def claude_review(job_id):
+    """Have Claude assess this job's alignment and tree and report back.
+
+    The numbers are computed here (see tree_analysis_service) and only the
+    summary is sent to the API, so the response time depends on the model rather
+    than on how large the alignment is. A review is cached against a fingerprint
+    of those numbers: re-opening the viewer replays the stored review for free,
+    and only an actual change to the tree or alignment triggers a new call.
+
+    Read-only, so view-mode visitors get it too.
+    """
+    if not validate_job_id(job_id):
+        return jsonify({"status": "error", "error": "Invalid job ID format"}), 400
+
+    _, error_msg, status_code = check_job_access(job_id)
+    if error_msg:
+        return jsonify({"status": "error", "error": error_msg}), status_code
+
+    job_dir = Config.JOB_DIR / job_id
+    if not job_dir.exists():
+        return jsonify({"status": "error", "error": "Job not found"}), 404
+
+    from app.services.tree_analysis_service import (
+        TreeAnalysisError,
+        TreeAnalysisUnavailable,
+        is_configured,
+        review_job,
+    )
+
+    if not is_configured():
+        return jsonify({
+            "status": "error",
+            "error": "Claude review is not enabled on this server.",
+        }), 503
+
+    data = request.get_json(silent=True) or {}
+    force_refresh, _ = coerce_bool(data.get("refresh"), False)
+
+    try:
+        payload = review_job(job_dir, force_refresh=force_refresh)
+    except TreeAnalysisUnavailable as exc:
+        # Out of capacity or misconfigured: a retry may well succeed, so this is
+        # deliberately not the same status as a dataset we cannot review at all.
+        return jsonify({"status": "error", "error": str(exc)}), 503
+    except FileNotFoundError:
+        return jsonify({
+            "status": "error",
+            "error": "This job has no tree yet, so there is nothing to review.",
+        }), 404
+    except TreeAnalysisError as exc:
+        logger.warning("event=claude_review.failed reason=%s", type(exc).__name__)
+        return jsonify({"status": "error", "error": str(exc)}), 400
+    except Exception as e:
+        return _server_error(e, where="claude_review")
+
+    logger.info(
+        "event=claude_review.served cached=%s model=%s elapsed=%s",
+        payload.get("cached"), payload.get("model"), payload.get("elapsed_seconds"),
+    )
+    return jsonify({
+        "status": "ok",
+        "cached": payload.get("cached", False),
+        "model": payload.get("model"),
+        "generated_at": payload.get("generated_at"),
+        "review": payload.get("review"),
+        "metrics": payload.get("metrics"),
+    })
 
 
 # =============================================================================
@@ -3773,7 +3981,7 @@ def _build_snapshot(job_id: str) -> dict:
         }
         if (job_dir / "tree" / "mrbayes_input.nex").is_file():
             job_info["result_files"]["mrbayes"] = f"/api/job/{job_id}/download/mrbayes"
-        if (job_dir / "alignment" / "alignment_trimmed_report.html").is_file():
+        if artifact_exists(job_dir / "alignment" / "alignment_trimmed_report.html"):
             job_info["result_files"]["alignment_inspection"] = (
                 f"/api/job/{job_id}/download/alignment/inspection"
             )

@@ -41,6 +41,17 @@ document.addEventListener('DOMContentLoaded', async () => {
     const btnShortcutHelpOpen = getEl('btn-tree-shortcuts-help');
     const btnSelectionMore = getEl('btn-selection-more');
     const selectionMoreMenu = getEl('selection-more-menu');
+    // Alan 8/17/26 - Cache the "Analyze with Claude" modal's elements alongside the other
+    // toolbar controls. Claude review controls. Absent when the server has no API key configured,
+    // in which case every reference below no-ops via optional chaining.
+    const btnClaudeReview = getEl('btn-claude-review');
+    const claudeReviewModal = getEl('modal-claude-review');
+    const claudeReviewBackdrop = getEl('claude-review-backdrop');
+    const claudeReviewBody = getEl('claude-review-body');
+    const claudeReviewSubtitle = getEl('claude-review-subtitle');
+    const btnClaudeReviewClose = getEl('btn-claude-review-close');
+    const btnClaudeReviewDone = getEl('btn-claude-review-done');
+    const btnClaudeReviewRefresh = getEl('btn-claude-review-refresh');
 
     // --- HELPER: STATUS MESSAGE ---
     let currentStatusType = null;
@@ -109,6 +120,218 @@ document.addEventListener('DOMContentLoaded', async () => {
         if (!shortcutHelpModal) return;
         shortcutHelpModal.classList.add('hidden');
         document.body.classList.remove('overflow-hidden');
+    }
+
+    // Alan 8/17/26 - New section: the "Analyze with Claude" review modal and its renderer.
+    // --- CLAUDE REVIEW ---
+    // Claude's review is prose plus a few short lists, all of it model output, so
+    // everything below is escaped before it reaches the DOM and only a tiny,
+    // fixed subset of Markdown is turned back into markup.
+    let claudeReviewInFlight = false;
+
+    function escapeHtml(value) {
+        return String(value ?? '')
+            .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+            .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+    }
+
+    // Alan 8/17/26 - Tiny Markdown subset for Claude's review prose, so model output never
+    // reaches the DOM as markup. Deliberately minimal: paragraphs, `code`, **bold**, *italic*,
+    // and dash bullets. Anything else stays literal text, which is the safe failure.
+    function renderSimpleMarkdown(text) {
+        const inline = (chunk) => escapeHtml(chunk)
+            .replace(/`([^`]+)`/g, '<code class="px-1 py-0.5 rounded bg-gray-100 dark:bg-journal-dark font-mono text-[0.85em]">$1</code>')
+            .replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>')
+            .replace(/(^|[^*])\*([^*]+)\*/g, '$1<em>$2</em>');
+
+        return String(text ?? '').split(/\n{2,}/).map((block) => {
+            const lines = block.split('\n').map(l => l.trim()).filter(Boolean);
+            if (!lines.length) return '';
+            if (lines.every(l => /^[-*]\s+/.test(l))) {
+                const items = lines.map(l => `<li>${inline(l.replace(/^[-*]\s+/, ''))}</li>`).join('');
+                return `<ul class="list-disc pl-5 space-y-1">${items}</ul>`;
+            }
+            return `<p>${inline(lines.join(' '))}</p>`;
+        }).join('');
+    }
+
+    const CLAUDE_RATING_STYLES = {
+        strong: { label: 'Strong', classes: 'bg-green-100 text-green-800 dark:bg-green-900/40 dark:text-green-200' },
+        usable: { label: 'Usable', classes: 'bg-blue-100 text-blue-800 dark:bg-blue-900/40 dark:text-blue-200' },
+        caution: { label: 'Caution', classes: 'bg-yellow-100 text-yellow-800 dark:bg-yellow-900/40 dark:text-yellow-200' },
+        unreliable: { label: 'Unreliable', classes: 'bg-red-100 text-red-800 dark:bg-red-900/40 dark:text-red-200' }
+    };
+    const CLAUDE_SEVERITY_STYLES = {
+        high: 'border-red-400 dark:border-red-500',
+        medium: 'border-yellow-400 dark:border-yellow-500',
+        low: 'border-gray-300 dark:border-gray-600'
+    };
+
+    function setClaudeReviewBody(html) {
+        if (claudeReviewBody) claudeReviewBody.innerHTML = html;
+    }
+
+    function renderClaudeReviewLoading() {
+        if (claudeReviewSubtitle) claudeReviewSubtitle.textContent = 'Reading the alignment and tree statistics…';
+        setClaudeReviewBody(`
+            <div class="flex items-center gap-3 text-gray-600 dark:text-gray-300 py-8 justify-center">
+                <i class="fas fa-circle-notch fa-spin text-journal-gold text-xl"></i>
+                <span class="text-sm">This usually takes under a minute.</span>
+            </div>`);
+    }
+
+    function renderClaudeReviewError(message) {
+        if (claudeReviewSubtitle) claudeReviewSubtitle.textContent = 'Review unavailable';
+        setClaudeReviewBody(`
+            <div class="rounded-lg border border-red-300 dark:border-red-700 bg-red-50 dark:bg-red-900/20 p-4">
+                <p class="text-sm font-semibold text-red-800 dark:text-red-200 mb-1">Could not complete the review</p>
+                <p class="text-sm text-red-700 dark:text-red-300">${escapeHtml(message)}</p>
+            </div>`);
+    }
+
+    function renderClaudeReview(payload) {
+        const review = payload?.review || {};
+        const rating = CLAUDE_RATING_STYLES[review.overall_rating] || CLAUDE_RATING_STYLES.usable;
+        const metrics = payload?.metrics || {};
+        const alignment = metrics.alignment || {};
+        const tree = metrics.tree || {};
+
+        if (claudeReviewSubtitle) {
+            const when = payload?.generated_at ? new Date(payload.generated_at * 1000).toLocaleString() : '';
+            claudeReviewSubtitle.textContent = payload?.cached
+                ? `Saved review${when ? ` from ${when}` : ''} — use Re-run for a fresh one.`
+                : `Reviewed by ${payload?.model || 'Claude'}${when ? ` at ${when}` : ''}.`;
+        }
+
+        const sections = [];
+
+        sections.push(`
+            <div class="flex flex-wrap items-center gap-3">
+                <span class="px-3 py-1 rounded-full text-xs font-bold uppercase tracking-wide ${rating.classes}">${escapeHtml(rating.label)}</span>
+                <p class="text-base font-semibold text-journal-dark dark:text-gray-100 flex-1 min-w-[16rem]">${escapeHtml(review.headline || '')}</p>
+            </div>`);
+
+        // A compact strip of the numbers Claude was actually given, so any claim
+        // in the prose can be checked against its source without leaving the modal.
+        const facts = [
+            ['Sequences', alignment.sequences],
+            ['Alignment columns', alignment.columns],
+            ['Parsimony-informative', alignment.parsimony_informative_columns],
+            ['Gaps', alignment.overall_gap_percent != null ? `${alignment.overall_gap_percent}%` : null],
+            ['Tips', tree.tips],
+            ['Support scale', tree.support_type && tree.support_type !== 'none' ? tree.support_type : null],
+            ['Well supported', tree.strongly_supported_percent != null ? `${tree.strongly_supported_percent}%` : null]
+        ].filter(([, value]) => value !== null && value !== undefined);
+
+        if (facts.length) {
+            sections.push(`
+                <div class="grid grid-cols-2 sm:grid-cols-4 gap-3">
+                    ${facts.map(([label, value]) => `
+                        <div class="rounded-lg border border-gray-200 dark:border-journal-dark px-3 py-2">
+                            <div class="text-[10px] font-bold uppercase tracking-wide text-gray-500 dark:text-gray-400">${escapeHtml(label)}</div>
+                            <div class="text-sm font-semibold text-journal-dark dark:text-gray-100">${escapeHtml(value)}</div>
+                        </div>`).join('')}
+                </div>`);
+        }
+
+        if (review.summary) {
+            sections.push(`
+                <div class="text-sm text-gray-700 dark:text-gray-200 space-y-3 leading-relaxed">
+                    ${renderSimpleMarkdown(review.summary)}
+                </div>`);
+        }
+
+        const concerns = Array.isArray(review.concerns) ? review.concerns : [];
+        if (concerns.length) {
+            sections.push(`
+                <div>
+                    <h4 class="font-semibold text-journal-gold mb-2 uppercase text-xs tracking-wider">Concerns</h4>
+                    <div class="space-y-2">
+                        ${concerns.map(item => `
+                            <div class="border-l-4 ${CLAUDE_SEVERITY_STYLES[item?.severity] || CLAUDE_SEVERITY_STYLES.low} pl-3 py-1">
+                                <p class="text-sm font-semibold text-journal-dark dark:text-gray-100">
+                                    ${escapeHtml(item?.title || '')}
+                                    <span class="ml-1 text-[10px] font-bold uppercase text-gray-500 dark:text-gray-400">${escapeHtml(item?.severity || '')}</span>
+                                </p>
+                                <p class="text-sm text-gray-700 dark:text-gray-300">${escapeHtml(item?.detail || '')}</p>
+                            </div>`).join('')}
+                    </div>
+                </div>`);
+        }
+
+        const strengths = Array.isArray(review.strengths) ? review.strengths : [];
+        if (strengths.length) {
+            sections.push(`
+                <div>
+                    <h4 class="font-semibold text-journal-gold mb-2 uppercase text-xs tracking-wider">Strengths</h4>
+                    <ul class="list-disc pl-5 space-y-1 text-sm text-gray-700 dark:text-gray-300">
+                        ${strengths.map(item => `<li>${escapeHtml(item)}</li>`).join('')}
+                    </ul>
+                </div>`);
+        }
+
+        const recommendations = Array.isArray(review.recommendations) ? review.recommendations : [];
+        if (recommendations.length) {
+            sections.push(`
+                <div>
+                    <h4 class="font-semibold text-journal-gold mb-2 uppercase text-xs tracking-wider">Suggested next steps</h4>
+                    <ol class="list-decimal pl-5 space-y-1 text-sm text-gray-700 dark:text-gray-300">
+                        ${recommendations.map(item => `<li>${escapeHtml(item)}</li>`).join('')}
+                    </ol>
+                </div>`);
+        }
+
+        const suspects = Array.isArray(review.sequences_to_inspect) ? review.sequences_to_inspect : [];
+        if (suspects.length) {
+            sections.push(`
+                <div>
+                    <h4 class="font-semibold text-journal-gold mb-2 uppercase text-xs tracking-wider">Sequences worth a look</h4>
+                    <div class="overflow-x-auto">
+                        <table class="min-w-full text-xs text-left text-gray-600 dark:text-gray-300">
+                            <thead class="text-gray-500 dark:text-gray-400 uppercase border-b border-gray-200 dark:border-gray-700">
+                                <tr><th class="py-2 pr-4 font-semibold">Sequence</th><th class="py-2 font-semibold">Why</th></tr>
+                            </thead>
+                            <tbody class="divide-y divide-gray-100 dark:divide-gray-800">
+                                ${suspects.map(item => `
+                                    <tr>
+                                        <td class="py-2 pr-4 font-mono break-all max-w-sm">${escapeHtml(item?.name || '')}</td>
+                                        <td class="py-2">${escapeHtml(item?.reason || '')}</td>
+                                    </tr>`).join('')}
+                            </tbody>
+                        </table>
+                    </div>
+                </div>`);
+        }
+
+        setClaudeReviewBody(sections.join(''));
+    }
+
+    function closeClaudeReview() {
+        if (!claudeReviewModal) return;
+        claudeReviewModal.classList.add('hidden');
+        document.body.classList.remove('overflow-hidden');
+    }
+
+    async function runClaudeReview({ refresh = false } = {}) {
+        if (!claudeReviewModal || claudeReviewInFlight) return;
+        claudeReviewInFlight = true;
+        claudeReviewModal.classList.remove('hidden');
+        document.body.classList.add('overflow-hidden');
+        btnClaudeReview?.setAttribute('disabled', 'disabled');
+        if (btnClaudeReviewRefresh) btnClaudeReviewRefresh.disabled = true;
+        renderClaudeReviewLoading();
+        btnClaudeReviewClose?.focus();
+
+        try {
+            const payload = await TreeEditActions.claudeReview(window.JOB_ID, { refresh });
+            renderClaudeReview(payload);
+        } catch (error) {
+            renderClaudeReviewError(error?.message || 'Unknown error.');
+        } finally {
+            claudeReviewInFlight = false;
+            btnClaudeReview?.removeAttribute('disabled');
+            if (btnClaudeReviewRefresh) btnClaudeReviewRefresh.disabled = false;
+        }
     }
 
     // Alan 7/20/26 - Share one direct deselect action so the D hotkey cannot be blocked by stale button state.
@@ -278,45 +501,838 @@ document.addEventListener('DOMContentLoaded', async () => {
         await saveSelectionSetsNow();
     }
 
-    // Alan 5/11/26 - Keep the Box Select toolbar button visually synchronized with viewer mode.
-    function updateBoxSelectButton() {
-        // Alan 5/11/26 - Look up lazily so the helper can run before UI wiring finishes.
-        const btnBoxSelect = getEl('btn-box-select');
-        // Alan 5/11/26 - Nothing to update when the toolbar button is absent.
-        if (!btnBoxSelect) return;
-        // Alan 5/11/26 - Read the viewer mode through its public API.
-        const active = Boolean(viewer?.getBoxSelectMode?.());
-        // Alan 5/11/26 - Use active styling to make the persistent drag mode discoverable.
-        btnBoxSelect.classList.toggle('active', active);
-        // Alan 5/11/26 - Add gold active styling without relying on a separate CSS build step.
-        btnBoxSelect.classList.toggle('bg-journal-gold/20', active);
-        // Alan 5/11/26 - Add gold active styling without relying on a separate CSS build step.
-        btnBoxSelect.classList.toggle('text-journal-dark', active);
-        // Alan 5/11/26 - Add gold active styling without relying on a separate CSS build step.
-        btnBoxSelect.classList.toggle('dark:text-journal-gold-light', active);
-        // Alan 5/11/26 - Add gold active styling without relying on a separate CSS build step.
-        btnBoxSelect.classList.toggle('border-journal-gold', active);
-        // Alan 5/11/26 - Apply active styling inline because Tailwind CDN may not see classes added from JS.
-        btnBoxSelect.style.backgroundColor = active ? 'rgba(201,169,98,.18)' : '';
-        // Alan 5/11/26 - Apply active styling inline because Tailwind CDN may not see classes added from JS.
-        btnBoxSelect.style.borderColor = active ? '#c9a962' : '';
-        // Alan 5/11/26 - Apply active styling inline because Tailwind CDN may not see classes added from JS.
-        btnBoxSelect.style.color = active ? '#c9a962' : '';
-        // Alan 5/11/26 - Mirror the mode for assistive technology and CSS hooks.
-        btnBoxSelect.setAttribute('aria-pressed', active ? 'true' : 'false');
-        // Alan 7/20/26 - Keep the B shortcut visible whenever an optional Box Select toolbar button is present.
-        btnBoxSelect.title = active
-            ? 'Box Select is on (B). Drag empty tree background to select tips; Alt removes; Ctrl/Cmd toggles; Esc cancels.'
-            : 'Box Select (B). Right-drag empty tree background anytime, or turn this on for left-drag selection.';
+    // ======================================================================
+    // Alan 8/15/26 - LAYERED CLADE ANNOTATIONS
+    //
+    // Local mirror of the persisted `annotation_layers` / `clade_annotations`
+    // arrays. Every mutation goes through saveAnnotationsNow(), which posts the
+    // WHOLE configuration to one atomic endpoint and then adopts the server's
+    // normalized reply (so layer order is always the server's, never ours).
+    // ======================================================================
+    let annotationLayers = [];
+    let cladeAnnotations = [];
+    let annotationSaveDebounce = null;
+    // Alan 8/15/26 - Serialize annotation saves: at most one POST in flight per tab, with
+    // everything requested meanwhile coalesced into one follow-up send of the LATEST state.
+    // `annotationSaveChain` is that in-flight cycle, `annotationSaveQueued` says another send
+    // is owed, and `annotationRevision` counts local edits so a reply that is already stale
+    // (the user kept typing/dragging while it was in flight) is never applied over them.
+    let annotationSaveChain = null;
+    let annotationSaveQueued = false;
+    let annotationRevision = 0;
+    // Alan 8/15/26 - Editor session: what is being added/edited and for which tips.
+    let annotationEditorState = null;
+    const ANNOTATION_STYLE_FIELDS = [
+        { field: 'font_family', label: 'Font' },
+        { field: 'font_size', label: 'Size' },
+        { field: 'font_style', label: 'Style' },
+        { field: 'font_weight', label: 'Weight' },
+        { field: 'text_color', label: 'Text color' },
+        { field: 'line_color', label: 'Line color' }
+    ];
+
+    const annotationsEditable = () => !window.VIEW_ONLY;
+    const annotationConfig = () => window.DikaryaCladeAnnotations || {
+        FONT_FAMILIES: ['Arial'], MIN_FONT_SIZE: 6, MAX_FONT_SIZE: 72,
+        DEFAULTS: { font_family: 'Arial', font_size: 12, font_style: 'normal', font_weight: 'normal', text_color: '#1f2937', line_color: '#1f2937' }
+    };
+
+    // Alan 8/15/26 - Short, URL/attribute-safe IDs inside the server's 64-char limit.
+    function newAnnotationId(prefix) {
+        return `${prefix}_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 10)}`;
     }
 
-    // Alan 7/20/26 - Toggle Box Select directly so the B hotkey works even when no toolbar button is rendered.
-    function toggleBoxSelectMode() {
-        if (!viewer?.setBoxSelectMode) return false;
-        const enabled = viewer.setBoxSelectMode(!viewer.getBoxSelectMode());
-        updateBoxSelectButton();
-        showStatus(enabled ? "Box Select on. Drag empty tree background." : "Box Select off.", "info", 1500);
-        return true;
+    function findAnnotationLayer(layerId) {
+        return annotationLayers.find(layer => layer && layer.id === layerId) || null;
+    }
+
+    // Alan 8/15/26 - Effective value for one style property: annotation override, then layer
+    // default, then the shared default. Mirrors the renderer so the editor previews the truth.
+    function effectiveAnnotationStyle(annotation, layer, field) {
+        const own = annotation ? annotation[field] : null;
+        if (own !== null && own !== undefined && own !== '') return own;
+        const inherited = layer ? layer['default_' + field] : null;
+        if (inherited !== null && inherited !== undefined && inherited !== '') return inherited;
+        return annotationConfig().DEFAULTS[field];
+    }
+
+    // Alan 8/17/26 - Render the same plain text, line breaks, type, and resolved whole-label
+    // style that the SVG renderer will use. textContent rather than HTML, so pasted markup is
+    // displayed literally and can never execute; the CSS carries white-space: pre-line so the
+    // preview shows the same line breaks the tree will draw. The font is mapped through the
+    // shared fallback stack so the preview and the figure use the same typeface.
+    function renderAnnotationLivePreview() {
+        const preview = getEl('annotation-live-preview');
+        if (!preview || !annotationEditorState) return;
+        const label = String(getEl('input-annotation-label')?.value || '') || 'Annotation preview';
+        const type = getEl('select-annotation-type')?.value === 'bubble' ? 'bubble' : 'line';
+        const layer = findAnnotationLayer(getEl('select-annotation-layer')?.value);
+        const style = {};
+        ANNOTATION_STYLE_FIELDS.forEach(({ field }) => {
+            style[field] = effectiveAnnotationStyle(
+                { [field]: annotationEditorState.style[field] }, layer, field
+            );
+        });
+
+        preview.textContent = label;
+        preview.classList.toggle('annotation-live-preview-line', type === 'line');
+        preview.classList.toggle('annotation-live-preview-bubble', type === 'bubble');
+        const stacks = annotationConfig().FONT_STACKS || {};
+        preview.style.fontFamily = stacks[style.font_family] || style.font_family;
+        preview.style.fontSize = `${style.font_size}px`;
+        preview.style.fontStyle = style.font_style;
+        preview.style.fontWeight = style.font_weight;
+        preview.style.color = style.text_color;
+        preview.style.borderColor = style.line_color;
+    }
+
+    // Alan 8/15/26 - Adopt a configuration (ours or the server's) into state, renderer and UI.
+    // Reuse matching object identities: a focused layer control has handlers closed over its
+    // layer object, and renderAnnotationManager deliberately leaves that control in place.
+    // Replacing the object here would make the next change mutate a detached stale object.
+    function adoptAnnotationObjects(current, incoming) {
+        const byId = new Map(
+            (Array.isArray(current) ? current : [])
+                .filter(item => item && item.id)
+                .map(item => [item.id, item])
+        );
+        return (Array.isArray(incoming) ? incoming : []).map(next => {
+            if (!next || !next.id || !byId.has(next.id)) return next;
+            const existing = byId.get(next.id);
+            Object.keys(existing).forEach(key => {
+                if (!Object.prototype.hasOwnProperty.call(next, key)) delete existing[key];
+            });
+            Object.assign(existing, next);
+            return existing;
+        });
+    }
+
+    function applyAnnotationState(layers, annotations) {
+        // Alan 8/15/26 - A layer belonging to an open editor session is deliberately not sent
+        // to the server yet, so no reply can mention it. Carry it across the adoption instead
+        // of letting an unrelated round trip delete the layer the user is currently filling in.
+        const pendingLayers = annotationLayers.filter(layer => layer && layer.__editorSession);
+        annotationLayers = adoptAnnotationObjects(annotationLayers, layers);
+        if (pendingLayers.length) {
+            const known = new Set(annotationLayers.map(layer => layer && layer.id));
+            pendingLayers.forEach(layer => { if (!known.has(layer.id)) annotationLayers.push(layer); });
+        }
+        cladeAnnotations = adoptAnnotationObjects(cladeAnnotations, annotations);
+        if (viewer && typeof viewer.setCladeAnnotations === 'function') {
+            viewer.setCladeAnnotations(annotationLayers, cladeAnnotations);
+        }
+        renderAnnotationManager();
+    }
+
+    // Alan 8/15/26 - Re-read the authoritative persisted configuration. Used after a failed
+    // save so the UI never keeps showing changes that were rejected.
+    async function reloadAnnotationsFromServer() {
+        try {
+            const state = await TreeEditActions.getTreeState(JOB_ID);
+            applyAnnotationState(state.annotation_layers, state.clade_annotations);
+        } catch (e) {
+            console.warn('Could not reload annotations:', e);
+        }
+    }
+
+    // Alan 8/15/26 - Every local annotation mutation bumps this before asking for a save, so
+    // the save cycle can tell "this reply describes exactly what I sent" from "the user has
+    // edited since, do not overwrite them with the server's older normalization".
+    function touchAnnotations() {
+        annotationRevision += 1;
+    }
+
+    // Alan 8/15/26 - Layers still owned by an open annotation editor are held back from every
+    // save until that editor commits, so an unrelated save (a colour tweak, a visibility
+    // toggle) can never persist a layer the user is about to cancel out of.
+    function annotationLayersForSave() {
+        return annotationLayers.filter(layer => layer && !layer.__editorSession);
+    }
+
+    // Alan 8/15/26 - The one place that talks to the annotation endpoint. It loops rather
+    // than recursing so several requests can never overlap: whatever was asked for while a
+    // POST was in flight is coalesced into a single follow-up send of the current state.
+    async function runAnnotationSaveCycle() {
+        let ok = true;
+        try {
+            do {
+                annotationSaveQueued = false;
+                const sentRevision = annotationRevision;
+                try {
+                    // Serialized at call time, so this is a snapshot of the state as it is now.
+                    const data = await TreeEditActions.saveCladeAnnotations(
+                        JOB_ID, annotationLayersForSave(), cladeAnnotations
+                    );
+                    ok = true;
+                    // Adopt the server's normalization only while it is still the newest
+                    // thing anyone has said. If the user edited during the round trip, their
+                    // state wins and the next pass (or the pending debounce) sends it.
+                    if (annotationRevision === sentRevision) {
+                        applyAnnotationState(data.layers, data.annotations);
+                    }
+                } catch (err) {
+                    const msg = (err.details && err.details.error) ? err.details.error : err.message;
+                    showStatus(`Could not save annotations: ${msg}`, 'danger', 6000);
+                    // Stop the cycle instead of retrying the same rejected payload forever,
+                    // and fall back to the authoritative persisted configuration so nothing
+                    // local-only keeps being displayed as if it had been saved.
+                    annotationSaveQueued = false;
+                    if (annotationSaveDebounce) {
+                        clearTimeout(annotationSaveDebounce);
+                        annotationSaveDebounce = null;
+                    }
+                    await reloadAnnotationsFromServer();
+                    ok = false;
+                    break;
+                }
+            } while (annotationSaveQueued);
+            return ok;
+        } finally {
+            // Cleared synchronously as the loop exits, so a caller can never join a cycle
+            // that has already decided it has nothing left to send.
+            annotationSaveChain = null;
+        }
+    }
+
+    // Alan 8/15/26 - One atomic save of the complete configuration. Last-write-wins across
+    // tabs by design; the endpoint replaces only the annotation keys of tree_state.json.
+    // Callers await the outcome of the coalesced cycle rather than starting a second POST.
+    function saveAnnotationsNow() {
+        if (annotationSaveDebounce) {
+            clearTimeout(annotationSaveDebounce);
+            annotationSaveDebounce = null;
+        }
+        if (!annotationsEditable() || JOB_ID === 'unknown') return Promise.resolve(false);
+        touchAnnotations();
+        if (annotationSaveChain) {
+            annotationSaveQueued = true;
+            return annotationSaveChain;
+        }
+        annotationSaveChain = runAnnotationSaveCycle();
+        return annotationSaveChain;
+    }
+
+    // Alan 8/15/26 - Debounce rapid edits, especially the colour inputs, into one request.
+    // The revision is bumped now, not when the timer fires, so an in-flight reply that lands
+    // in between cannot repaint the UI with the colour the user has already moved past.
+    function debouncedSaveAnnotations() {
+        touchAnnotations();
+        if (annotationSaveDebounce) clearTimeout(annotationSaveDebounce);
+        annotationSaveDebounce = setTimeout(() => {
+            annotationSaveDebounce = null;
+            saveAnnotationsNow();
+        }, 500);
+    }
+
+    // Alan 8/15/26 - Give a first-time user a layer without making them go find the Layers tab.
+    // A layer created from inside the annotation editor is part of that editor's transaction:
+    // it is tagged `__editorSession`, which holds it back from every save (see
+    // annotationLayersForSave) and lets a cancel roll it back. Saving the annotation clears
+    // the tag, so the layer goes to the server in the same atomic request as the annotation.
+    function createAnnotationLayer(name, fromEditorSession = false) {
+        const defaults = annotationConfig().DEFAULTS;
+        const layer = {
+            id: newAnnotationId('layer'),
+            name: name,
+            order: annotationLayers.length + 1,
+            visible: true,
+            default_font_family: defaults.font_family,
+            default_font_size: defaults.font_size,
+            default_font_style: defaults.font_style,
+            default_font_weight: defaults.font_weight,
+            default_text_color: defaults.text_color,
+            default_line_color: defaults.line_color
+        };
+        if (fromEditorSession) layer.__editorSession = true;
+        annotationLayers.push(layer);
+        if (fromEditorSession && annotationEditorState) {
+            annotationEditorState.createdLayerIds.push(layer.id);
+        }
+        return layer;
+    }
+
+    // Alan 8/17/26 - New section: the Add/Edit clade-annotation dialog and its transaction.
+    // --- Annotation editor ------------------------------------------------
+
+    function setAnnotationEditorError(message) {
+        const el = getEl('annotation-editor-error');
+        if (!el) return;
+        el.textContent = message || '';
+        el.classList.toggle('hidden', !message);
+    }
+
+    /**
+     * Alan 8/15/26 - Close the editor, rolling back anything it created but never persisted.
+     * Layers made inside an editor session used to survive a cancel as local-only "ghost"
+     * state, and the next unrelated save would then persist a layer the user had thrown
+     * away. Layers that existed before the editor opened are deliberately left alone.
+     *
+     * Committing (the save path) simply clears the session tag, which is what releases those
+     * layers into the very next save alongside the annotation that references them.
+     */
+    function closeAnnotationEditor(commit) {
+        // Strict comparison because this is also wired straight to click handlers, which
+        // would otherwise pass an Event object here and read as "committed".
+        const committed = commit === true;
+        const sessionIds = new Set(
+            (annotationEditorState && annotationEditorState.createdLayerIds) || []
+        );
+        if (committed) {
+            annotationLayers.forEach(layer => {
+                if (layer && sessionIds.has(layer.id)) delete layer.__editorSession;
+            });
+        }
+        const createdIds = committed ? null : sessionIds;
+        annotationEditorState = null;
+        getEl('modal-annotation-editor')?.classList.add('hidden');
+        getEl('annotation-inline-layer-row')?.classList.add('hidden');
+        setAnnotationEditorError('');
+        if (!createdIds || !createdIds.size) return;
+        const before = annotationLayers.length;
+        annotationLayers = annotationLayers.filter(
+            layer => !(layer && layer.__editorSession && createdIds.has(layer.id))
+        );
+        if (annotationLayers.length === before) return;
+        // Nothing was ever sent for these, so there is nothing to save -- just resync the UI.
+        if (viewer?.setCladeAnnotations) viewer.setCladeAnnotations(annotationLayers, cladeAnnotations);
+        renderAnnotationManager();
+    }
+
+    // Alan 8/15/26 - Build the compact per-property override rows. An unchecked box means the
+    // stored value stays null, i.e. the annotation keeps inheriting that property from its layer.
+    function renderAnnotationStyleOverrides() {
+        const host = getEl('annotation-style-overrides');
+        if (!host || !annotationEditorState) return;
+        const cfg = annotationConfig();
+        const layer = findAnnotationLayer(getEl('select-annotation-layer')?.value);
+        const draft = annotationEditorState.style;
+        host.textContent = '';
+
+        ANNOTATION_STYLE_FIELDS.forEach(({ field, label }) => {
+            const row = document.createElement('div');
+            row.className = 'annotation-style-row';
+
+            const toggle = document.createElement('input');
+            toggle.type = 'checkbox';
+            toggle.className = 'rounded border-gray-300 text-journal-gold focus:ring-journal-gold';
+            toggle.checked = draft[field] !== null && draft[field] !== undefined;
+            toggle.title = `Override the layer's ${label.toLowerCase()}`;
+
+            const caption = document.createElement('label');
+            caption.className = 'text-xs text-gray-600 dark:text-gray-300';
+            caption.textContent = label;
+
+            let control;
+            const effective = effectiveAnnotationStyle(
+                { [field]: draft[field] }, layer, field
+            );
+
+            if (field === 'font_family' || field === 'font_style' || field === 'font_weight') {
+                control = document.createElement('select');
+                control.className = 'rounded border border-gray-300 bg-white px-2 py-1 text-xs text-gray-900 dark:border-gray-700 dark:bg-journal-dark dark:text-gray-100';
+                const options = field === 'font_family'
+                    ? cfg.FONT_FAMILIES
+                    : (field === 'font_style' ? ['normal', 'italic'] : ['normal', 'bold']);
+                options.forEach(value => {
+                    const option = document.createElement('option');
+                    option.value = value;
+                    option.textContent = value;
+                    control.appendChild(option);
+                });
+                control.value = effective;
+            } else if (field === 'font_size') {
+                control = document.createElement('input');
+                control.type = 'number';
+                control.min = String(cfg.MIN_FONT_SIZE);
+                control.max = String(cfg.MAX_FONT_SIZE);
+                control.step = '1';
+                control.className = 'w-24 rounded border border-gray-300 bg-white px-2 py-1 text-xs text-gray-900 dark:border-gray-700 dark:bg-journal-dark dark:text-gray-100';
+                control.value = String(effective);
+            } else {
+                control = document.createElement('input');
+                control.type = 'color';
+                control.className = 'h-7 w-14 rounded border border-gray-300 bg-transparent p-0 dark:border-gray-700';
+                control.value = effective;
+            }
+
+            control.disabled = !toggle.checked;
+            const commit = () => {
+                if (!toggle.checked) { draft[field] = null; return; }
+                draft[field] = (field === 'font_size') ? Number(control.value) : control.value;
+                renderAnnotationLivePreview();
+            };
+            toggle.addEventListener('change', () => {
+                control.disabled = !toggle.checked;
+                commit();
+                renderAnnotationLivePreview();
+            });
+            control.addEventListener('change', commit);
+            control.addEventListener('input', commit);
+
+            row.appendChild(toggle);
+            row.appendChild(caption);
+            row.appendChild(control);
+            host.appendChild(row);
+        });
+    }
+
+    function populateAnnotationLayerSelect(selectedLayerId) {
+        const select = getEl('select-annotation-layer');
+        if (!select) return;
+        select.textContent = '';
+        annotationLayers
+            .slice()
+            .sort((a, b) => (a.order || 0) - (b.order || 0))
+            .forEach(layer => {
+                const option = document.createElement('option');
+                option.value = layer.id;
+                option.textContent = `${layer.order}. ${layer.name}`;
+                select.appendChild(option);
+            });
+        if (selectedLayerId) select.value = selectedLayerId;
+    }
+
+    /**
+     * Alan 8/15/26 - Open the Add/Edit dialog.
+     * `memberIds` are canonical leaf IDs already resolved from the tree; the editor never
+     * derives membership from labels or positions.
+     */
+    function openAnnotationEditor(mode, options = {}) {
+        if (!annotationsEditable()) return;
+        const modal = getEl('modal-annotation-editor');
+        if (!modal) return;
+
+        const existing = mode === 'edit'
+            ? cladeAnnotations.find(a => a.id === options.annotationId)
+            : null;
+        if (mode === 'edit' && !existing) return;
+
+        // Alan 8/15/26 - Open the transaction BEFORE creating the first-use layer, so that
+        // layer is recorded as this session's and is rolled back on cancel like any other
+        // layer made inside the editor.
+        annotationEditorState = {
+            mode,
+            annotationId: existing ? existing.id : null,
+            memberIds: existing
+                ? (existing.member_tip_ids || []).slice()
+                : (Array.isArray(options.memberIds) ? options.memberIds.slice() : []),
+            style: {},
+            // Layers this editor session created; everything that existed beforehand is
+            // untouched by a cancel.
+            createdLayerIds: []
+        };
+
+        if (!annotationLayers.length) {
+            // First use: give them a sensible layer rather than a dead-end dropdown.
+            createAnnotationLayer('Annotations', true);
+        }
+
+        ANNOTATION_STYLE_FIELDS.forEach(({ field }) => {
+            annotationEditorState.style[field] = existing ? (existing[field] ?? null) : null;
+        });
+
+        getEl('annotation-editor-title').textContent = mode === 'edit'
+            ? 'Edit Clade Annotation' : 'Add Clade Annotation';
+        const count = annotationEditorState.memberIds.length;
+        getEl('annotation-editor-subtitle').textContent =
+            `${count} tip${count === 1 ? '' : 's'} in this clade.`;
+        getEl('input-annotation-label').value = existing ? existing.label : '';
+        getEl('select-annotation-type').value = existing?.annotation_type === 'bubble' ? 'bubble' : 'line';
+        getEl('btn-annotation-save-text').textContent = mode === 'edit' ? 'Save changes' : 'Save';
+        getEl('btn-annotation-delete').classList.toggle('hidden', mode !== 'edit');
+        getEl('annotation-style-details').open = false;
+
+        populateAnnotationLayerSelect(existing ? existing.layer_id : annotationLayers[0]?.id);
+        renderAnnotationStyleOverrides();
+        renderAnnotationLivePreview();
+        setAnnotationEditorError('');
+        modal.classList.remove('hidden');
+        getEl('input-annotation-label')?.focus();
+    }
+
+    async function submitAnnotationEditor() {
+        if (!annotationEditorState) return;
+        const label = String(getEl('input-annotation-label')?.value || '').trim();
+        if (!label) {
+            setAnnotationEditorError('Enter a label for this annotation.');
+            return;
+        }
+        const layerId = getEl('select-annotation-layer')?.value;
+        if (!layerId || !findAnnotationLayer(layerId)) {
+            setAnnotationEditorError('Choose a layer for this annotation.');
+            return;
+        }
+        if (!annotationEditorState.memberIds.length) {
+            setAnnotationEditorError('This annotation has no member tips.');
+            return;
+        }
+
+        const payload = {
+            id: annotationEditorState.annotationId || newAnnotationId('annotation'),
+            layer_id: layerId,
+            label,
+            annotation_type: getEl('select-annotation-type')?.value === 'bubble' ? 'bubble' : 'line',
+            member_tip_ids: annotationEditorState.memberIds.slice()
+        };
+        ANNOTATION_STYLE_FIELDS.forEach(({ field }) => {
+            payload[field] = annotationEditorState.style[field] ?? null;
+        });
+
+        if (annotationEditorState.mode === 'edit') {
+            const index = cladeAnnotations.findIndex(a => a.id === payload.id);
+            if (index >= 0) cladeAnnotations[index] = payload;
+        } else {
+            cladeAnnotations.push(payload);
+        }
+
+        // Alan 8/15/26 - Commit the editor transaction: any layer created in this session is
+        // kept and goes to the server in the same atomic save as the annotation that uses it.
+        // If that save fails, saveAnnotationsNow() reloads the persisted configuration, which
+        // drops the local-only layer rather than leaving it behind as a fake.
+        closeAnnotationEditor(true);
+        const saved = await saveAnnotationsNow();
+        if (saved) showStatus(`Annotation "${label}" saved.`, 'success', 2000);
+    }
+
+    async function deleteCurrentAnnotation() {
+        if (!annotationEditorState || annotationEditorState.mode !== 'edit') return;
+        const id = annotationEditorState.annotationId;
+        cladeAnnotations = cladeAnnotations.filter(a => a.id !== id);
+        closeAnnotationEditor();
+        const saved = await saveAnnotationsNow();
+        if (saved) showStatus('Annotation deleted.', 'success', 2000);
+    }
+
+    // Alan 8/17/26 - New section: the Annotation Manager list, layer cards and validity warnings.
+    // --- Annotation manager ------------------------------------------------
+
+    function openAnnotationManager() {
+        const modal = getEl('modal-clade-annotations');
+        if (!modal) return;
+        renderAnnotationManager();
+        modal.classList.remove('hidden');
+        document.body.classList.add('overflow-hidden');
+    }
+
+    function closeAnnotationManager() {
+        getEl('modal-clade-annotations')?.classList.add('hidden');
+        document.body.classList.remove('overflow-hidden');
+    }
+
+    function setAnnotationManagerTab(tab) {
+        const isLayers = tab === 'layers';
+        getEl('annotations-tab-annotations')?.classList.toggle('hidden', isLayers);
+        getEl('annotations-tab-layers')?.classList.toggle('hidden', !isLayers);
+        document.querySelectorAll('.annotation-tab').forEach(button => {
+            const active = button.getAttribute('data-annotation-tab') === tab;
+            button.classList.toggle('border-journal-gold', active);
+            button.classList.toggle('border-transparent', !active);
+            button.classList.toggle('text-journal-dark', active);
+            button.classList.toggle('dark:text-gray-100', active);
+            button.classList.toggle('text-gray-500', !active);
+            button.classList.toggle('dark:text-gray-400', !active);
+        });
+    }
+
+    // Alan 8/15/26 - Small helper for the manager's compact icon buttons.
+    function annotationIconButton(iconClass, title, onClick, extraClass = '') {
+        const button = document.createElement('button');
+        button.type = 'button';
+        button.title = title;
+        button.setAttribute('aria-label', title);
+        button.className = 'px-2 py-1 text-xs rounded border border-gray-300 dark:border-gray-600 text-gray-600 dark:text-gray-300 hover:bg-gray-100 dark:hover:bg-journal-dark disabled:opacity-40 disabled:cursor-not-allowed ' + extraClass;
+        const icon = document.createElement('i');
+        icon.className = iconClass;
+        button.appendChild(icon);
+        button.addEventListener('click', onClick);
+        return button;
+    }
+
+    function renderAnnotationList() {
+        const host = getEl('annotation-list');
+        if (!host) return;
+        host.textContent = '';
+
+        if (!cladeAnnotations.length) {
+            const empty = document.createElement('p');
+            empty.className = 'annotation-empty text-gray-500 dark:text-gray-400';
+            empty.textContent = 'No annotations yet. Right-click a branch and choose "Add clade annotation…", or select a complete clade and use the button above.';
+            host.appendChild(empty);
+            return;
+        }
+
+        const validity = (viewer && typeof viewer.getCladeAnnotationValidity === 'function')
+            ? viewer.getCladeAnnotationValidity() : new Map();
+
+        cladeAnnotations.forEach(annotation => {
+            const layer = findAnnotationLayer(annotation.layer_id);
+            const row = document.createElement('div');
+            row.className = 'annotation-row';
+
+            const main = document.createElement('div');
+            main.className = 'annotation-row-main';
+
+            const title = document.createElement('div');
+            title.className = 'annotation-row-title text-gray-900 dark:text-gray-100';
+            // textContent, never innerHTML: a label such as "<svg onload=alert(1)>" must
+            // appear literally, exactly as it does on the tree.
+            title.textContent = annotation.label;
+            main.appendChild(title);
+
+            const meta = document.createElement('div');
+            meta.className = 'annotation-row-meta text-gray-500 dark:text-gray-400';
+            const memberCount = (annotation.member_tip_ids || []).length;
+            const typeLabel = annotation.annotation_type === 'bubble' ? 'Bubble' : 'Line';
+            meta.textContent = `${typeLabel} · ${layer ? layer.name : 'Unknown layer'} · ${memberCount} tip${memberCount === 1 ? '' : 's'}`;
+            main.appendChild(meta);
+
+            const status = validity.get(annotation.id);
+            if (status && !status.valid) {
+                const warning = document.createElement('div');
+                warning.className = 'annotation-row-warning';
+                warning.textContent = status.present === 0
+                    ? 'None of its tips are in the current tree.'
+                    : 'No longer forms one clade in the current rooting';
+                main.appendChild(warning);
+            }
+            if (layer && layer.visible === false) {
+                const hidden = document.createElement('div');
+                hidden.className = 'annotation-row-meta text-gray-400 dark:text-gray-500';
+                hidden.textContent = 'Its layer is hidden.';
+                main.appendChild(hidden);
+            }
+
+            row.appendChild(main);
+
+            row.appendChild(annotationIconButton('fas fa-crosshairs', 'Select this annotation’s tips', () => {
+                if (!viewer?.selectLeafIds) return;
+                const matched = viewer.selectLeafIds(annotation.member_tip_ids || []);
+                updateButtons();
+                showStatus(`Selected ${matched} tip${matched === 1 ? '' : 's'}.`, 'info', 1800);
+            }));
+
+            // Mutating controls simply are not rendered for read-only viewers; the server
+            // rejects the requests regardless, so this is presentation only.
+            if (annotationsEditable()) {
+                row.appendChild(annotationIconButton('fas fa-pen', 'Edit annotation', () => {
+                    openAnnotationEditor('edit', { annotationId: annotation.id });
+                }));
+                row.appendChild(annotationIconButton('fas fa-trash', 'Delete annotation', async () => {
+                    cladeAnnotations = cladeAnnotations.filter(a => a.id !== annotation.id);
+                    const saved = await saveAnnotationsNow();
+                    if (saved) showStatus('Annotation deleted.', 'success', 2000);
+                }, 'text-red-600 dark:text-red-300'));
+            }
+
+            host.appendChild(row);
+        });
+    }
+
+    // Alan 8/15/26 - Build one labelled control for a layer's default style.
+    function layerStyleControl(layer, field, labelText) {
+        const cfg = annotationConfig();
+        const wrap = document.createElement('label');
+        wrap.className = 'annotation-layer-style text-gray-600 dark:text-gray-300';
+        const caption = document.createElement('span');
+        caption.textContent = labelText;
+        wrap.appendChild(caption);
+
+        let control;
+        if (field === 'font_family' || field === 'font_style' || field === 'font_weight') {
+            control = document.createElement('select');
+            control.className = 'rounded border border-gray-300 bg-white px-1 py-0.5 text-xs text-gray-900 dark:border-gray-700 dark:bg-journal-dark dark:text-gray-100';
+            const options = field === 'font_family'
+                ? cfg.FONT_FAMILIES
+                : (field === 'font_style' ? ['normal', 'italic'] : ['normal', 'bold']);
+            options.forEach(value => {
+                const option = document.createElement('option');
+                option.value = value;
+                option.textContent = value;
+                control.appendChild(option);
+            });
+        } else if (field === 'font_size') {
+            control = document.createElement('input');
+            control.type = 'number';
+            control.min = String(cfg.MIN_FONT_SIZE);
+            control.max = String(cfg.MAX_FONT_SIZE);
+            control.step = '1';
+            control.className = 'w-16 rounded border border-gray-300 bg-white px-1 py-0.5 text-xs text-gray-900 dark:border-gray-700 dark:bg-journal-dark dark:text-gray-100';
+        } else {
+            control = document.createElement('input');
+            control.type = 'color';
+            control.className = 'h-6 w-10 rounded border border-gray-300 bg-transparent p-0 dark:border-gray-700';
+        }
+        control.value = String(layer['default_' + field]);
+        // Left visible but inert for read-only viewers, so they can still see what a layer's
+        // style actually is without being offered an edit that the server would refuse.
+        control.disabled = !annotationsEditable();
+
+        const commit = () => {
+            layer['default_' + field] = (field === 'font_size') ? Number(control.value) : control.value;
+            // Repaint immediately so inheriting annotations restyle without waiting for the
+            // debounced save round-trip.
+            if (viewer?.setCladeAnnotations) viewer.setCladeAnnotations(annotationLayers, cladeAnnotations);
+            debouncedSaveAnnotations();
+        };
+        control.addEventListener('change', commit);
+        if (control.type === 'color') control.addEventListener('input', commit);
+
+        wrap.appendChild(control);
+        return wrap;
+    }
+
+    function renderAnnotationLayerList() {
+        const host = getEl('annotation-layer-list');
+        if (!host) return;
+        host.textContent = '';
+
+        if (!annotationLayers.length) {
+            const empty = document.createElement('p');
+            empty.className = 'annotation-empty text-gray-500 dark:text-gray-400';
+            empty.textContent = 'No layers yet. Add one, or just create an annotation and a default layer will be made for you.';
+            host.appendChild(empty);
+            return;
+        }
+
+        const ordered = annotationLayers.slice().sort((a, b) => (a.order || 0) - (b.order || 0));
+        ordered.forEach((layer, index) => {
+            const card = document.createElement('div');
+            card.className = 'annotation-layer-card';
+
+            const top = document.createElement('div');
+            top.className = 'annotation-layer-head';
+
+            const badge = document.createElement('span');
+            badge.className = 'annotation-layer-order text-gray-500 dark:text-gray-400';
+            badge.textContent = String(layer.order);
+            badge.title = layer.order === 1 ? 'Innermost layer, closest to the tips' : 'Higher numbers sit further from the tree';
+            top.appendChild(badge);
+
+            if (annotationsEditable()) {
+                const name = document.createElement('input');
+                name.type = 'text';
+                name.maxLength = 80;
+                name.value = layer.name;
+                name.className = 'annotation-layer-name rounded border border-gray-300 bg-white px-2 py-1 text-sm text-gray-900 dark:border-gray-700 dark:bg-journal-dark dark:text-gray-100';
+                name.addEventListener('change', () => {
+                    const next = name.value.trim();
+                    if (!next) { name.value = layer.name; return; }
+                    layer.name = next;
+                    debouncedSaveAnnotations();
+                });
+                top.appendChild(name);
+            } else {
+                const name = document.createElement('span');
+                name.className = 'annotation-layer-name annotation-row-title text-gray-900 dark:text-gray-100';
+                name.textContent = layer.name;
+                top.appendChild(name);
+            }
+
+            const visible = layer.visible !== false;
+
+            if (annotationsEditable()) {
+                // Simple up/down controls rather than drag-and-drop: the project has no
+                // reusable sortable-list pattern, and order here is a small integer anyway.
+                const up = annotationIconButton('fas fa-arrow-up', 'Move layer inward (closer to the tips)', async () => {
+                    if (index === 0) return;
+                    const previous = ordered[index - 1];
+                    const swap = layer.order; layer.order = previous.order; previous.order = swap;
+                    await saveAnnotationsNow();
+                });
+                up.disabled = index === 0;
+                top.appendChild(up);
+
+                const down = annotationIconButton('fas fa-arrow-down', 'Move layer outward (further from the tree)', async () => {
+                    if (index === ordered.length - 1) return;
+                    const next = ordered[index + 1];
+                    const swap = layer.order; layer.order = next.order; next.order = swap;
+                    await saveAnnotationsNow();
+                });
+                down.disabled = index === ordered.length - 1;
+                top.appendChild(down);
+
+                top.appendChild(annotationIconButton(visible ? 'fas fa-eye' : 'fas fa-eye-slash',
+                    visible ? 'Hide this layer (its annotations are kept)' : 'Show this layer', async () => {
+                        layer.visible = !visible;
+                        await saveAnnotationsNow();
+                    }));
+
+                // Deleting a layer never silently discards the annotations inside it.
+                top.appendChild(annotationIconButton('fas fa-trash', 'Delete layer', async () => {
+                    const used = cladeAnnotations.filter(a => a.layer_id === layer.id).length;
+                    if (used > 0) {
+                        showStatus(
+                            `"${layer.name}" still holds ${used} annotation${used === 1 ? '' : 's'}. Move them to another layer or delete them first.`,
+                            'warning', 5000
+                        );
+                        return;
+                    }
+                    annotationLayers = annotationLayers.filter(l => l.id !== layer.id);
+                    const saved = await saveAnnotationsNow();
+                    if (saved) showStatus('Layer deleted.', 'success', 2000);
+                }, 'text-red-600 dark:text-red-300'));
+            } else if (!visible) {
+                const hidden = document.createElement('span');
+                hidden.className = 'text-xs text-gray-400 dark:text-gray-500';
+                hidden.textContent = 'hidden';
+                top.appendChild(hidden);
+            }
+
+            card.appendChild(top);
+
+            const styles = document.createElement('div');
+            styles.className = 'annotation-layer-styles';
+            styles.appendChild(layerStyleControl(layer, 'font_family', 'Font'));
+            styles.appendChild(layerStyleControl(layer, 'font_size', 'Size'));
+            styles.appendChild(layerStyleControl(layer, 'font_style', 'Style'));
+            styles.appendChild(layerStyleControl(layer, 'font_weight', 'Weight'));
+            styles.appendChild(layerStyleControl(layer, 'text_color', 'Text'));
+            styles.appendChild(layerStyleControl(layer, 'line_color', 'Line'));
+            card.appendChild(styles);
+
+            host.appendChild(card);
+        });
+    }
+
+    function renderAnnotationManager() {
+        // Rebuilding the rows replaces the very control the user is holding, which would
+        // close an open colour picker mid-drag. The viewer still repaints, so the tree is
+        // always current; the list catches up on the next render.
+        const active = document.activeElement;
+        if (active && active.closest && active.closest('#modal-clade-annotations')
+            && ['INPUT', 'SELECT'].includes(active.tagName)) {
+            return;
+        }
+        renderAnnotationList();
+        renderAnnotationLayerList();
+        const status = getEl('annotation-manager-status');
+        if (status) {
+            status.textContent = annotationsEditable()
+                ? `${cladeAnnotations.length} annotation${cladeAnnotations.length === 1 ? '' : 's'} across ${annotationLayers.length} layer${annotationLayers.length === 1 ? '' : 's'}.`
+                : 'Read-only view. Make an editable copy of this tree to add annotations.';
+        }
+        // Authorization is enforced server-side by check_job_access(mode="edit"); hiding the
+        // static add buttons here only avoids offering a read-only user an action that fails.
+        if (!annotationsEditable()) {
+            document.querySelectorAll('#modal-clade-annotations .annotation-edit-control')
+                .forEach(el => { el.disabled = true; el.classList.add('hidden'); });
+        }
+    }
+
+    // Alan 8/15/26 - Secondary workflow: annotate whatever is selected, but only when the
+    // selection is exactly one clade. Anything else would draw a bracket across taxa that
+    // do not belong to it, so refuse with an explanation instead.
+    function annotateCurrentSelection() {
+        if (!annotationsEditable() || !viewer?.getSelectedCladeLeafIds) return;
+        const memberIds = viewer.getSelectedCladeLeafIds();
+        if (!memberIds) {
+            showStatus(
+                'The selected sequences do not form a single clade. Select a complete clade or right-click its branch.',
+                'warning', 6000
+            );
+            return;
+        }
+        openAnnotationEditor('add', { memberIds });
     }
 
     function saveDisplayPrefs() {
@@ -327,6 +1343,7 @@ document.addEventListener('DOMContentLoaded', async () => {
                 tipFont: Number(getEl('input-tip-font')?.value) || 12,
                 spacingX: viewer?.spacingState?.x || 0,
                 spacingY: viewer?.spacingState?.y || 0,
+                tipLabelGap: viewer?.tipLabelGap ?? 2,
             }));
         } catch (e) {}
     }
@@ -344,6 +1361,7 @@ document.addEventListener('DOMContentLoaded', async () => {
             viewer.applyTextSizing();
             // Alan 7/17/26 - Replace spacing with the saved values so repeated tree redraws cannot compound them.
             viewer.setSpacingState(prefs.spacingX || 0, prefs.spacingY || 0);
+            viewer.setTipLabelGap(prefs.tipLabelGap ?? 2);
         } catch (e) {}
     }
 
@@ -586,7 +1604,7 @@ document.addEventListener('DOMContentLoaded', async () => {
                     showStatus("No sequences in box.", "info", 1500);
                     return;
                 }
-                // Alan 5/12/26 - Treat Alt/right-drag boxes as direct prune requests, matching Select + Prune.
+                // Alan 8/16/26 - Treat Alt/left-drag boxes as direct prune requests, matching Select + Prune.
                 if (result.mode === 'remove') {
                     // Alan 5/12/26 - Copy the boxed tip IDs defensively before the tree reloads.
                     const names = Array.isArray(result.ids) ? result.ids.slice() : [];
@@ -605,11 +1623,6 @@ document.addEventListener('DOMContentLoaded', async () => {
                 const verb = result.mode === 'remove' ? 'removed' : (result.mode === 'toggle' ? 'toggled' : 'selected');
                 // Alan 5/11/26 - Report matched tips rather than only changed tips so users know what the box covered.
                 showStatus(`Box ${verb} ${result.matched} sequence${result.matched === 1 ? '' : 's'}.`, "success", 1800);
-            },
-            // Alan 5/11/26 - Keep the toolbar button synchronized when Esc or code changes box-select mode.
-            onBoxSelectModeChange: () => {
-                // Alan 5/11/26 - Refresh only the box-select button state for mode changes.
-                updateBoxSelectButton();
             }
         };
 
@@ -729,6 +1742,12 @@ document.addEventListener('DOMContentLoaded', async () => {
                 if (viewer && typeof viewer.setFocalTip === 'function') {
                     viewer.setFocalTip(loadedTreeState.sequence_of_interest || null);
                 }
+                // Alan 8/15/26 - Restore layered clade annotations. Old tree state has neither
+                // key, which simply means "no layers, no annotations" and is left alone on disk.
+                applyAnnotationState(
+                    loadedTreeState.annotation_layers,
+                    loadedTreeState.clade_annotations
+                );
             } catch (stateErr) {
                 console.warn("Could not fetch tree state:", stateErr);
             }
@@ -849,11 +1868,68 @@ document.addEventListener('DOMContentLoaded', async () => {
         btnRenameModalCancel?.addEventListener('click', closeRenameModal);
         btnRenameModalClose?.addEventListener('click', closeRenameModal);
         renameModalBackdrop?.addEventListener('click', closeRenameModal);
+        // Alan 8/15/26 - Wire the clade-annotation manager and editor using the same modal
+        // interaction pattern as Rename (button, backdrop, close, Esc handled globally).
+        getEl('btn-annotations')?.addEventListener('click', openAnnotationManager);
+        getEl('btn-clade-annotations-close')?.addEventListener('click', closeAnnotationManager);
+        getEl('btn-clade-annotations-done')?.addEventListener('click', closeAnnotationManager);
+        getEl('clade-annotations-backdrop')?.addEventListener('click', closeAnnotationManager);
+        document.querySelectorAll('.annotation-tab').forEach(button => {
+            button.addEventListener('click', () => setAnnotationManagerTab(button.getAttribute('data-annotation-tab')));
+        });
+        getEl('btn-annotation-add-selected')?.addEventListener('click', annotateCurrentSelection);
+        getEl('btn-annotation-add-layer')?.addEventListener('click', async () => {
+            if (!annotationsEditable()) return;
+            createAnnotationLayer(`Layer ${annotationLayers.length + 1}`);
+            await saveAnnotationsNow();
+            setAnnotationManagerTab('layers');
+        });
+        getEl('btn-annotation-editor-close')?.addEventListener('click', closeAnnotationEditor);
+        getEl('btn-annotation-cancel')?.addEventListener('click', closeAnnotationEditor);
+        getEl('annotation-editor-backdrop')?.addEventListener('click', closeAnnotationEditor);
+        getEl('btn-annotation-save')?.addEventListener('click', submitAnnotationEditor);
+        getEl('btn-annotation-delete')?.addEventListener('click', deleteCurrentAnnotation);
+        // Alan 8/15/26 - Switching layer changes what the override rows inherit, so re-render them.
+        getEl('select-annotation-layer')?.addEventListener('change', renderAnnotationStyleOverrides);
+        // Alan 8/17/26 - The live preview only refreshed when a style override changed, so
+        // typing a label or switching Line/Bubble left it showing the previous annotation.
+        // Wire the three controls that own the preview's content directly.
+        getEl('input-annotation-label')?.addEventListener('input', renderAnnotationLivePreview);
+        getEl('select-annotation-type')?.addEventListener('change', renderAnnotationLivePreview);
+        getEl('select-annotation-layer')?.addEventListener('change', renderAnnotationLivePreview);
+        getEl('btn-annotation-inline-new-layer')?.addEventListener('click', () => {
+            const row = getEl('annotation-inline-layer-row');
+            row?.classList.toggle('hidden');
+            if (row && !row.classList.contains('hidden')) getEl('input-annotation-new-layer-name')?.focus();
+        });
+        // Alan 8/15/26 - Create a layer inline so the user never abandons a half-written annotation.
+        getEl('btn-annotation-inline-layer-create')?.addEventListener('click', () => {
+            const input = getEl('input-annotation-new-layer-name');
+            const name = String(input?.value || '').trim();
+            if (!name) { setAnnotationEditorError('Enter a name for the new layer.'); return; }
+            // Alan 8/15/26 - Part of the editor transaction, not an independent change: it is
+            // persisted with the annotation on save and rolled back if the editor is cancelled.
+            const layer = createAnnotationLayer(name, true);
+            if (input) input.value = '';
+            getEl('annotation-inline-layer-row')?.classList.add('hidden');
+            populateAnnotationLayerSelect(layer.id);
+            renderAnnotationStyleOverrides();
+            setAnnotationEditorError('');
+        });
+
         // Alan 7/20/26 - Wire keyboard-help close controls using the same modal interaction pattern as Rename.
         btnShortcutHelpClose?.addEventListener('click', closeShortcutHelp);
         shortcutHelpBackdrop?.addEventListener('click', closeShortcutHelp);
         // Alan 7/21/26 - Open the same complete shortcut reference from the new toolbar button and question-mark hotkey.
         btnShortcutHelpOpen?.addEventListener('click', openShortcutHelp);
+        // Alan 8/17/26 - Wire the new "Analyze with Claude" toolbar button and its modal controls.
+        // Claude review: opening uses the cached review when the tree has not
+        // changed, so only Re-run ever spends a fresh call.
+        btnClaudeReview?.addEventListener('click', () => runClaudeReview());
+        btnClaudeReviewRefresh?.addEventListener('click', () => runClaudeReview({ refresh: true }));
+        btnClaudeReviewClose?.addEventListener('click', closeClaudeReview);
+        btnClaudeReviewDone?.addEventListener('click', closeClaudeReview);
+        claudeReviewBackdrop?.addEventListener('click', closeClaudeReview);
         // Alan 7/20/26 - Make the three-dot advanced selection control toggle on click instead of hover only.
         btnSelectionMore?.addEventListener('click', (e) => {
             e.stopPropagation();
@@ -877,13 +1953,6 @@ document.addEventListener('DOMContentLoaded', async () => {
         // Layout
         getEl('btn-layout-linear')?.addEventListener('click', () => viewer?.updateLayout('linear'));
         getEl('btn-layout-radial')?.addEventListener('click', () => viewer?.updateLayout('radial'));
-
-        // Alan 5/11/26 - Wire the visible Box Select toggle for trackpads and discoverability.
-        const btnBoxSelect = getEl('btn-box-select');
-        // Alan 7/20/26 - Keep an optional Box Select button and the B hotkey on one shared toggle path.
-        btnBoxSelect?.addEventListener('click', toggleBoxSelectMode);
-        // Alan 5/11/26 - Initialize button state after wiring.
-        updateBoxSelectButton();
 
         // Align
         const btnAlign = getEl('btn-align-tips');
@@ -1345,6 +2414,19 @@ document.addEventListener('DOMContentLoaded', async () => {
                     // Alan 7/17/26 - Send all resolved targets so multi-tip context pruning removes the advertised count.
                     await pruneTaxaPreservingSelectionColors(targets, cleanupNames);
                 }, { clearSelections: false });
+            });
+        }
+
+        // Alan 8/15/26 - Primary annotation workflow: the viewer hands over the clicked clade's
+        // canonical descendant leaf IDs, so the user never selects every tip by hand.
+        if (viewer && typeof viewer.setAddCladeAnnotationHandler === 'function') {
+            viewer.setAddCladeAnnotationHandler((node, memberIds = []) => {
+                if (window.VIEW_ONLY || isProcessing) return;
+                if (!Array.isArray(memberIds) || !memberIds.length) {
+                    showStatus("Can't annotate: this branch has no tips.", "warning", 2500);
+                    return;
+                }
+                openAnnotationEditor('add', { memberIds });
             });
         }
 
@@ -1872,23 +2954,36 @@ document.addEventListener('DOMContentLoaded', async () => {
                 closeShortcutHelp();
                 return;
             }
+            // Alan 8/17/26 - Escape now also closes the Claude review modal, matching Rename.
+            // Escape dismisses Claude's review the same way it dismisses Rename.
+            // The request keeps running; the result is cached either way.
+            if (e.key === 'Escape' && claudeReviewModal && !claudeReviewModal.classList.contains('hidden')) {
+                closeClaudeReview();
+                return;
+            }
             // Alan 7/20/26 - Let Escape dismiss the advanced selection menu without changing tree state.
             if (e.key === 'Escape' && btnSelectionMore?.getAttribute('aria-expanded') === 'true') {
                 setSelectionMoreMenuOpen(false);
                 btnSelectionMore.focus();
                 return;
             }
+            // Alan 8/15/26 - Escape closes the annotation editor first, then the manager behind it,
+            // matching how the Rename modal already behaves.
+            if (e.key === 'Escape') {
+                const editorModal = getEl('modal-annotation-editor');
+                if (editorModal && !editorModal.classList.contains('hidden')) {
+                    closeAnnotationEditor();
+                    return;
+                }
+                const managerModal = getEl('modal-clade-annotations');
+                if (managerModal && !managerModal.classList.contains('hidden')) {
+                    closeAnnotationManager();
+                    return;
+                }
+            }
             // Alan 5/11/26 - Escape closes the rename modal before handling reroot cancellation.
             if (e.key === "Escape" && renameModal && !renameModal.classList.contains('hidden')) {
                 closeRenameModal();
-                return;
-            }
-            // Alan 5/11/26 - Escape turns off persistent Box Select mode when no modal has focus.
-            if (e.key === "Escape" && viewer?.getBoxSelectMode?.()) {
-                // Alan 5/11/26 - Route through the viewer so cursor and button callbacks reset together.
-                viewer.setBoxSelectMode(false);
-                // Alan 5/11/26 - Confirm the mode change without interrupting other viewer state.
-                showStatus("Box Select off.", "info", 1000);
                 return;
             }
             if (e.key === "Escape" && rerootMode) {
@@ -1918,9 +3013,7 @@ document.addEventListener('DOMContentLoaded', async () => {
             } else if (key === 's' && viewer) {
                 getEl('btn-ladderize')?.click();
                 handled = true;
-            // Alan 7/20/26 - B toggles the existing Box Select mode and its normal status feedback.
-            } else if (key === 'b' && viewer) {
-                handled = toggleBoxSelectMode();
+            // Alan 8/16/26 - The B hotkey and its Box Select mode are gone; left-drag always draws the box.
             // Alan 7/20/26 - Question mark opens the shortcut reference without requiring a loaded tree.
             } else if (e.key === '?') {
                 openShortcutHelp();
@@ -1977,8 +3070,6 @@ document.addEventListener('DOMContentLoaded', async () => {
 
     function updateButtons() {
         if (!viewer) return;
-        // Alan 5/11/26 - Keep Box Select styling current whenever broader toolbar state refreshes.
-        updateBoxSelectButton();
 
         // Multi-select check
         let selCount = 0;

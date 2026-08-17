@@ -1,15 +1,19 @@
 import copy
+import fcntl
 import json
 import logging
 import os
 import re
 import shutil
 import tempfile
+import threading
 import time
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Dict, Any, List, Optional, Set, Tuple
 from app.config import Config
 from app.models import JobParams, AlignmentParams, TrimmingParams, TreeBuilderParams
+from app.services.artifact_storage import discard_gzipped_form
 from app.services.security_utils import coerce_bool
 from app.services.subprocess_utils import run_command
 
@@ -23,8 +27,61 @@ except ImportError:
 
 logger = logging.getLogger(__name__)
 
+_tree_state_lock_context = threading.local()
+
 MAX_SEQUENCE_OF_INTEREST_LENGTH = 1000
 MAX_SEQUENCE_OF_INTEREST_SOURCE_LENGTH = 64
+
+
+class DegenerateTreeError(ValueError):
+    """The tree is well-formed but carries no signal to act on.
+
+    Raised when an edit is arithmetically impossible rather than broken -- e.g.
+    midpoint rooting a tree whose branch lengths are all zero, which is what
+    FastTree emits for a set of identical sequences. Callers already treat this
+    as ValueError; the subclass exists so the logging can say "user submitted
+    two identical sequences" instead of filing it in errors.log next to real
+    failures.
+    """
+
+
+@contextmanager
+def tree_state_lock(job_dir: Path):
+    """Serialize one job's tree-state read/modify/write operations.
+
+    The separate lock file survives the atomic replacement of tree_state.json,
+    and ``flock`` coordinates all Gunicorn processes. The thread-local depth
+    makes the lock re-entrant because load_tree_state() may initialize a missing
+    state by calling save_tree_state() while its caller already holds the lock.
+    """
+    lock_path = Path(job_dir) / ".tree_state.lock"
+    key = str(lock_path.resolve())
+    held = getattr(_tree_state_lock_context, "held", None)
+    if held is None:
+        held = {}
+        _tree_state_lock_context.held = held
+
+    existing = held.get(key)
+    if existing is not None:
+        existing["depth"] += 1
+        try:
+            yield
+        finally:
+            existing["depth"] -= 1
+        return
+
+    handle = open(lock_path, "a+")
+    held[key] = {"depth": 1, "handle": handle}
+    try:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        yield
+    finally:
+        held.pop(key, None)
+        try:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        finally:
+            handle.close()
+
 
 def load_tree_state(job_dir: Path) -> Dict:
     """
@@ -122,6 +179,11 @@ def load_tree_state(job_dir: Path) -> Dict:
                 state = midpoint_root(job_dir, state)
                 state["is_midpoint_rooted"] = True
                 logging.info("Applied default midpoint rooting.")
+            except DegenerateTreeError as e:
+                # midpoint_root() already logged this as a degradation; the tree
+                # is simply left unrooted.
+                state["is_midpoint_rooted"] = False
+                logging.info(f"Default midpoint rooting not applicable: {e}")
             except Exception as e:
                 state["is_midpoint_rooted"] = False
                 logging.warning(f"Default midpoint rooting skipped/failed: {e}")
@@ -138,42 +200,48 @@ _TRANSIENT_STATE_KEYS = ("prune_unresolved",)
 
 def save_tree_state(job_dir: Path, tree_json: Dict) -> None:
     """
-    Save tree_json to tree_state.json with indentation.
+    Save tree_json to tree_state.json.
+
+    Serialized compactly rather than pretty-printed. `tree_structure` is a
+    deeply nested per-node dict, so `indent=2` spent roughly two thirds of the
+    file on whitespace -- 68% measured across 300 production states, or ~1 GiB
+    over the job tree. Nothing consumes this file by eye; the viewer parses it.
 
     Written atomically. The viewer fires prune/rename/reroot requests
     back-to-back while read-only endpoints (the edited-FASTA download, the tree
     view) read the same file, so a plain truncate-then-write left a window in
     which a reader saw a half-written file and treated it as corrupt.
     """
-    state_path = job_dir / "tree_state.json"
-    persisted = {
-        key: value
-        for key, value in tree_json.items()
-        if key not in _TRANSIENT_STATE_KEYS
-    }
-    # Same directory, so os.replace() is a same-filesystem atomic rename.
-    fd, temp_name = tempfile.mkstemp(
-        dir=str(job_dir), prefix=".tree_state.", suffix=".tmp"
-    )
-    try:
-        with os.fdopen(fd, "w") as f:
-            json.dump(persisted, f, indent=2)
-            f.flush()
-            os.fsync(f.fileno())
-        # mkstemp() creates 0600; the previous truncate-in-place kept whatever
-        # mode the file already had (0644 in production). Preserve it so the
-        # rename does not silently tighten permissions on every job.
+    with tree_state_lock(job_dir):
+        state_path = job_dir / "tree_state.json"
+        persisted = {
+            key: value
+            for key, value in tree_json.items()
+            if key not in _TRANSIENT_STATE_KEYS
+        }
+        # Same directory, so os.replace() is a same-filesystem atomic rename.
+        fd, temp_name = tempfile.mkstemp(
+            dir=str(job_dir), prefix=".tree_state.", suffix=".tmp"
+        )
         try:
-            os.chmod(temp_name, state_path.stat().st_mode & 0o7777)
-        except OSError:
-            os.chmod(temp_name, 0o644)
-        os.replace(temp_name, state_path)
-    except BaseException:
-        try:
-            os.unlink(temp_name)
-        except OSError:
-            pass
-        raise
+            with os.fdopen(fd, "w") as f:
+                json.dump(persisted, f, separators=(",", ":"))
+                f.flush()
+                os.fsync(f.fileno())
+            # mkstemp() creates 0600; the previous truncate-in-place kept whatever
+            # mode the file already had (0644 in production). Preserve it so the
+            # rename does not silently tighten permissions on every job.
+            try:
+                os.chmod(temp_name, state_path.stat().st_mode & 0o7777)
+            except OSError:
+                os.chmod(temp_name, 0o644)
+            os.replace(temp_name, state_path)
+        except BaseException:
+            try:
+                os.unlink(temp_name)
+            except OSError:
+                pass
+            raise
 
 
 def _iter_tip_names(node: Dict[str, Any]):
@@ -493,6 +561,14 @@ def prune_taxa(job_dir: Path, tree_json: Dict, taxa_names: List[str]) -> Dict:
             if name not in tree_json["pruned_taxa"]:
                 tree_json["pruned_taxa"].append(name)
         _selection_sets_without_names(tree_json, pruned_names)
+        # Clade annotations are tip-set state just like selection sets, so they
+        # get the same focused cleanup: pruned leaves leave their annotations,
+        # every other member survives, and an annotation is only deleted once it
+        # has no members left at all.
+        from app.services.tree_annotation_service import (
+            remove_pruned_members_from_annotations,
+        )
+        remove_pruned_members_from_annotations(tree_json, pruned_names)
 
         # Invalidate the focal sequence if it was pruned out. Only flag that Auto root needs
         # a new focal tip when an auto-style mode is actually active; midpoint/manual/unrooted
@@ -925,7 +1001,9 @@ def midpoint_root(job_dir: Path, tree_json: Dict) -> Dict:
         # Heuristic: Verify we have at least one positive branch length.
         has_lengths = any((c.branch_length or 0) > 0 for c in tree.find_clades())
         if not has_lengths:
-             raise ValueError("Cannot perform midpoint rooting: Tree has no valid branch lengths.")
+             raise DegenerateTreeError(
+                 "Cannot perform midpoint rooting: Tree has no valid branch lengths."
+             )
 
         # Attempt BioPython midpoint rooting
         # This modifies the tree in-place usually, but sometimes returns new tree depending on version.
@@ -968,6 +1046,14 @@ def midpoint_root(job_dir: Path, tree_json: Dict) -> Dict:
         
         return tree_json
         
+    except DegenerateTreeError as e:
+        # Not a failure: the input cannot be midpoint rooted, and the caller
+        # already carries on without it. Counted as a degradation so it stays
+        # greppable without sitting in errors.log looking like a bug.
+        from app.services.log_context import log_degradation
+
+        log_degradation(logger, "midpoint_root_degenerate_tree", str(e))
+        raise
     except Exception as e:
         logger.error(f"Midpoint root failed: {e}")
         raise
@@ -1244,6 +1330,80 @@ def _reapply_rooting_after_recompute(job_dir: Path, tree_json: Dict[str, Any],
     return tree_json
 
 
+def commit_recompute_tree_state(job_dir: Path,
+                                new_structure: Dict[str, Any],
+                                initial_state: Optional[Dict[str, Any]] = None,
+                                task_logger=None) -> Dict[str, Any]:
+    """Install a freshly recomputed topology into the LATEST tree state.
+
+    Recompute runs for minutes without the tree-state lock, so the state it
+    started from is routinely stale by the time it finishes: the user may have
+    added an annotation, renamed a tip, changed the selection sets or picked a
+    different rooting meanwhile. Writing back the old snapshot would silently
+    undo all of that, so the merge happens here instead, under the lock and
+    against the state as it is right now.
+
+    Recompute OWNS only ``tree_structure``, ``current_tree`` and the rooting
+    fields that follow from the new topology. Everything else -- renames,
+    pruned_taxa, selection sets and their colours, sequence_of_interest,
+    annotation layers and annotations -- is taken from the latest state, which
+    is also what the new structure is reconciled against.
+
+    Must be called WITHOUT holding ``tree_state_lock``; it takes the lock for
+    the (fast) merge itself. Returns the committed state.
+    """
+    from app.services.tree_annotation_service import (
+        restrict_annotations_to_current_leaves,
+    )
+
+    initial_state = initial_state or {}
+    with tree_state_lock(job_dir):
+        state = load_tree_state(job_dir)
+        if not isinstance(state, dict) or not state:
+            # No usable current state (a brand-new job dir, or a state that
+            # could not be rebuilt). Fall back to the snapshot we started from
+            # rather than dropping the user's metadata entirely.
+            state = copy.deepcopy(initial_state)
+
+        # The rooting INTENT is user-authored, so the newest one wins. Only when
+        # the latest state carries no mode at all do we fall back to the mode
+        # this recompute started with.
+        if state.get("root_mode"):
+            previous_mode = state.get("root_mode")
+            previous_target = state.get("root_target") or state.get("root")
+        else:
+            previous_mode = initial_state.get("root_mode")
+            previous_target = (
+                initial_state.get("root_target") or initial_state.get("root")
+            )
+
+        state["current_tree"] = "pruned"
+        structure = copy.deepcopy(new_structure)
+        apply_state_to_structure(
+            structure,
+            state.get("renames") or {},
+            set(state.get("pruned_taxa") or []),
+        )
+        state["tree_structure"] = structure
+
+        # Clade annotations are user-authored display metadata, so recompute
+        # keeps them: only members whose leaves genuinely disappeared are
+        # dropped, one-member annotations survive, and an annotation that no
+        # longer forms a single clade under the new topology stays persisted and
+        # is flagged by the viewer rather than deleted here.
+        restrict_annotations_to_current_leaves(state)
+
+        state = _reapply_rooting_after_recompute(
+            job_dir,
+            state,
+            previous_mode,
+            previous_target,
+            task_logger=task_logger or logger,
+        )
+        save_tree_state(job_dir, state)
+        return state
+
+
 def recompute_tree(
     job_dir: Path,
     job_params: JobParams,
@@ -1297,15 +1457,25 @@ def recompute_tree(
         def overview(message):
             return None
     
-    # 1. Load state
+    # 1. Load state. This snapshot only decides what goes INTO the recompute
+    # (which sequences, which rooting intent to fall back on); it is never the
+    # thing written back at the end -- see commit_recompute_tree_state().
     tree_json = load_tree_state(job_dir)
-    previous_root_mode = tree_json.get("root_mode")
-    previous_root_target = tree_json.get("root_target") or tree_json.get("root")
-    
+
     # 2. Extract pruned FASTA
     # We need the original input (unaligned)
     input_raw = job_dir / "input" / "input_raw.fasta"
     alignment_pruned_path = job_dir / "alignment" / "alignment_pruned.fasta" # Unaligned input for re-run
+
+    # Everything this recompute derives is rebuilt below. Drop any gzipped
+    # copies the cold-artifact sweep made of the previous run's outputs so the
+    # job does not end up holding both forms.
+    for stale in (
+        "alignment_pruned_aligned.fasta",
+        "alignment_pruned_trimmed.fasta",
+        "alignment_pruned_trimmed_report.html",
+    ):
+        discard_gzipped_form(job_dir / "alignment" / stale)
 
     start_step("input", "Sequence Queue", "Preparing queued sequences")
     if use_current_input:
@@ -1401,23 +1571,18 @@ def recompute_tree(
     
     # 6. Update State
     start_step("post", "Post-Processing", "Saving recomputed tree")
-    tree_json["current_tree"] = "pruned"
-    # We might want to update the tree structure in JSON too?
-    # Yes, parse the new tree
+    # Everything above ran WITHOUT the tree-state lock, because MAFFT/trimAl/
+    # RAxML take minutes and holding the lock would freeze every viewer edit for
+    # the duration. The snapshot loaded in step 1 is therefore stale by now, so
+    # the new topology is merged into whatever the state is at commit time.
     new_structure = parse_newick_to_json(tree_pruned_newick)
-    renames = tree_json.get("renames", {})
-    pruned_taxa = set(tree_json.get("pruned_taxa", []))
-    apply_state_to_structure(new_structure, renames, pruned_taxa)
-    tree_json["tree_structure"] = new_structure
-    tree_json = _reapply_rooting_after_recompute(
+    tree_json = commit_recompute_tree_state(
         job_dir,
-        tree_json,
-        previous_root_mode,
-        previous_root_target,
+        new_structure,
+        initial_state=tree_json,
         task_logger=logger,
     )
-    save_tree_state(job_dir, tree_json)
-    
+
     # Save metadata
     with open(job_dir / "tree" / "tree_pruned_metadata.json", "w") as f:
         json.dump(metadata, f, indent=2)
@@ -1960,7 +2125,10 @@ def initialize_tree(job_dir: Path) -> Path:
         # Save to pruned
         Phylo.write(tree, str(pruned_path), "newick")
         
-        # Initialize basic state JSON too
+        # Initialize basic state JSON too -- but only when the job genuinely has
+        # none. This is reached from a plain Newick download, and renames,
+        # annotations and selection sets can all exist before tree_pruned.newick
+        # does; writing a fresh default state over them would discard them.
         tree_json = _clade_to_json(tree.root)
         state = {
             "current_tree": "pruned",
@@ -1969,8 +2137,10 @@ def initialize_tree(job_dir: Path) -> Path:
             "renames": {},
             "root": None
         }
-        save_tree_state(job_dir, state)
-        
+        with tree_state_lock(job_dir):
+            if not (job_dir / "tree_state.json").exists():
+                save_tree_state(job_dir, state)
+
     except Exception as e:
         logger.error(f"Failed to initialize tree: {e}")
         # Fallback copy

@@ -678,7 +678,20 @@ def job_status(job_id):
     # Initial status check (optional, could just render template)
     from app.workers.queue import get_job_status
     status_info = get_job_status(job_id)
-    return render_template('job_status.html', job_id=job_id, status=status_info.get('status', 'unknown'))
+
+    # Warnings recorded at submission for input that cannot produce an
+    # informative tree (two sequences, or a set that is all one sequence). Shown
+    # here because the submit page redirects immediately, so a toast there would
+    # be gone before it was read.
+    from app.models import Job
+    job_record = db.session.get(Job, job_id)
+    input_warnings = []
+    if job_record and isinstance(job_record.metrics, dict):
+        input_warnings = job_record.metrics.get("input_warnings") or []
+
+    return render_template('job_status.html', job_id=job_id,
+                           status=status_info.get('status', 'unknown'),
+                           input_warnings=input_warnings)
 
 from app.config import Config
 import json
@@ -730,7 +743,14 @@ def job_viewer(job_id):
         except Exception:
             job_details.pop("mycomap_blast_url", None)
             
-    return render_template('job_viewer.html', job_id=job_id, job_details=job_details, view_only=view_only)
+    # Hide the Claude review control entirely when no API key is configured,
+    # rather than offering a button that can only ever answer 503.
+    from app.services.tree_analysis_service import is_configured as claude_review_enabled
+
+    return render_template(
+        'job_viewer.html', job_id=job_id, job_details=job_details, view_only=view_only,
+        claude_review_enabled=claude_review_enabled(),
+    )
 
 # /health moved to the monitoring blueprint (app/monitoring/routes.py) where
 # it does an actual DB + filesystem check. Keeping just one /health avoids

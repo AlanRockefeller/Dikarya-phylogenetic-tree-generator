@@ -13,6 +13,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+from app.services.artifact_storage import artifact_exists, open_artifact
+
 logger = logging.getLogger(__name__)
 
 try:
@@ -161,10 +163,10 @@ def _load_alignment(job_dir: Path) -> Dict[str, str]:
         job_dir / "alignment" / "alignment_raw.fasta",
     ]
     for path in candidates:
-        if path.exists():
+        if artifact_exists(path):
             try:
                 seqs: Dict[str, str] = {}
-                with open(path, "r") as handle:
+                with open_artifact(path, "rt") as handle:
                     for rec in SeqIO.parse(handle, "fasta"):
                         seq = str(rec.seq).upper()
                         for name in (rec.id, rec.name, rec.description):

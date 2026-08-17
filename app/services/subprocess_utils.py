@@ -247,6 +247,7 @@ def run_command_streaming(
     on_stderr_line: Optional[callable] = None,
     timeout: Optional[int] = None,
     cpu_limit_seconds: Optional[int] = None,
+    stderr_file_filter: Optional[callable] = None,
 ) -> Tuple[int, dict]:
     """
     Run an external command with streaming output.
@@ -267,7 +268,11 @@ def run_command_streaming(
         on_stdout_line: Callback for each stdout line (if not stdout_path)
         on_stderr_line: Callback for each stderr line
         timeout: Optional timeout in seconds
-    
+        stderr_file_filter: Optional predicate deciding whether a stderr line is
+            worth persisting to stderr_path. Live streaming (on_stderr_line) and
+            the error tail are unaffected, so a tool's per-iteration progress
+            chatter can still drive the UI without being kept on disk forever.
+
     Returns:
         (exit_code, stats_dict)
         
@@ -380,8 +385,15 @@ def run_command_streaming(
                             stderr_tail_buffer.append(line)
 
                             if stderr_file:
-                                stderr_file.write(line + "\n")
-                                stderr_file.flush()
+                                keep = True
+                                if stderr_file_filter:
+                                    try:
+                                        keep = stderr_file_filter(line)
+                                    except Exception:
+                                        keep = True
+                                if keep:
+                                    stderr_file.write(line + "\n")
+                                    stderr_file.flush()
 
                             if on_stderr_line:
                                 try:

@@ -8,7 +8,7 @@ like RAxML, and restoring original headers in output files.
 import logging
 import re
 from pathlib import Path
-from typing import Dict
+from typing import Dict, List
 
 try:
     from Bio import SeqIO
@@ -111,6 +111,69 @@ def clean_dna_sequence(raw_sequence: str, min_length: int = 100) -> str:
     
     # No valid run of sufficient length found
     return ""
+
+
+def describe_degenerate_input(sequence_text: str, *, accession_count: int = 0,
+                              blast_mode: str = "auto") -> List[str]:
+    """Return user-facing warnings for input that cannot produce an informative tree.
+
+    Two identical sequences make FastTree emit ``(A:0.0,B:0.0);`` -- a tree with
+    no branch lengths, which cannot be midpoint rooted and tells the submitter
+    nothing. That used to run the full pipeline and hand back a blank-looking
+    result with no explanation. These checks run at submission so the warning
+    arrives before the wait, not after it.
+
+    BLAST is only a rescue for a *single* query (see ``_should_blast_single_only``
+    in ``app/workers/tasks.py``): it is never run for multi-sequence input, so a
+    two-sequence submission stays two sequences no matter what the mode is.
+    """
+    sequences = []
+    for line in (sequence_text or "").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        if line.startswith(">"):
+            sequences.append([])
+        elif sequences:
+            sequences[-1].append(line)
+
+    count = len(sequences) or max(int(accession_count or 0), 0)
+    if count == 0:
+        # Empty input is rejected upstream; nothing useful to add here.
+        return []
+
+    if count == 1:
+        if (blast_mode or "auto").strip().lower() != "off":
+            # BLAST will add homologs, so one query is a normal submission.
+            return []
+        return [
+            "Only one sequence was submitted and BLAST is turned off, so there is "
+            "nothing to compare it against. A tree needs at least three sequences "
+            "to show any relationship."
+        ]
+
+    warnings = []
+    if count == 2:
+        warnings.append(
+            "Only two sequences were submitted. There is just one possible tree for "
+            "two sequences, so the result cannot show any grouping. Add a third "
+            "sequence (an outgroup or a reference) to get an informative tree."
+        )
+
+    # Compare on bases alone: gaps and case differ between import sources without
+    # making the sequences meaningfully different.
+    normalized = {
+        re.sub(r"[^A-Z]", "", "".join(chunks).upper()) for chunks in sequences
+    }
+    normalized.discard("")
+    if len(normalized) == 1 and len(sequences) > 1:
+        warnings.append(
+            f"All {count} submitted sequences are identical. Every branch length "
+            "will be zero, so the tree cannot be rooted at its midpoint and its "
+            "shape carries no information."
+        )
+
+    return warnings
 
 
 def sanitize_fasta_headers(input_path: Path, output_path: Path) -> Dict[str, str]:

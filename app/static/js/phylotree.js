@@ -12440,6 +12440,17 @@
       if (this.options["zoom"]) {
         let zoom$1 = zoom()
           .scaleExtent([0.1, 10])
+          // Alan 8/16/26 - Dikarya change: pan with the RIGHT mouse button so the left
+          // button is free for box select. Node right-drags are excluded so the tip and
+          // internal-node context menus still open. Non-mouse gestures (wheel, touch)
+          // keep d3's default filter.
+          .filter((event) => {
+            if (event.type === "mousedown") {
+              if (event.button !== 2) return false;
+              return !(event.target && event.target.closest && event.target.closest(".node, .internal-node"));
+            }
+            return !event.ctrlKey || event.type === "wheel";
+          })
           .on("zoom", (event) => {
 
             select("." + css_classes["tree-container"]).attr("transform", d => {

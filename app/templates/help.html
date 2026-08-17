@@ -156,21 +156,33 @@
                 <h2 id="tree-viewer-title" class="mt-2 text-2xl font-bold text-white">Tree Viewer Tricks</h2>
                 <div class="mt-5 grid gap-4 sm:grid-cols-2">
                     <div class="rounded-xl border border-journal-green bg-white/5 p-4">
-                        <p class="font-mono text-sm font-semibold text-journal-gold-light">Right-click + drag</p>
+                        <p class="font-mono text-sm font-semibold text-journal-gold-light">Left-click + drag</p>
                         <p class="mt-2 text-sm leading-relaxed text-gray-200">
                             Drag across empty tree background to draw a selection box. Every visible tip inside it is
                             selected. This is the fastest way to grab a clade before opening the Alignment Viewer.
                         </p>
-                        <p class="mt-3 font-semibold text-white">Right-drag = select</p>
+                        <p class="mt-3 font-semibold text-white">Left-drag = select</p>
                     </div>
                     <div class="rounded-xl border border-red-500/60 bg-red-950/20 p-4">
-                        <p class="font-mono text-sm font-semibold text-red-300">Alt/Option + right-click + drag</p>
+                        <p class="font-mono text-sm font-semibold text-red-300">Alt/Option + left-click + drag</p>
                         <p class="mt-2 text-sm leading-relaxed text-gray-200">
                             The box turns red. Releasing it prunes every visible tip inside, which is much quicker than
                             removing a long run of unwanted sequences one at a time.
                         </p>
-                        <p class="mt-3 font-semibold text-white">Alt + right-drag = prune</p>
+                        <p class="mt-3 font-semibold text-white">Alt + left-drag = prune</p>
                     </div>
+                </div>
+                <div class="mt-5 border-t border-journal-green pt-5">
+                    <h3 class="text-lg font-semibold text-white">Right-drag pans the tree</h3>
+                    <p class="mt-2 text-sm leading-relaxed text-gray-200">
+                        The mouse buttons are the other way around from what you might expect: <strong>left-drag on
+                        empty background draws a selection box</strong> and <strong>right-drag moves the tree</strong>.
+                        Hold <kbd class="rounded border border-gray-500 px-1.5 py-0.5 font-mono text-xs">Ctrl</kbd> or
+                        <kbd class="rounded border border-gray-500 px-1.5 py-0.5 font-mono text-xs">Cmd</kbd> while
+                        left-dragging to toggle tips instead of adding them, and press
+                        <kbd class="rounded border border-gray-500 px-1.5 py-0.5 font-mono text-xs">Esc</kbd> during a
+                        drag to cancel the box.
+                    </p>
                 </div>
                 <div class="mt-5 border-t border-journal-green pt-5">
                     <h3 class="text-lg font-semibold text-white">Right-click a branch tip or internal node</h3>
@@ -192,7 +204,7 @@
                 <h2 id="alignment-viewer-title-help" class="text-2xl font-bold text-journal-dark dark:text-gray-100">Alignment Viewer</h2>
                 <p class="mt-3 leading-relaxed">This is the check I use most often after looking at the tree:</p>
                 <ol class="mt-4 list-decimal space-y-2 pl-6">
-                    <li>Right-click and drag to select the clade or sequences of interest.</li>
+                    <li>Left-click and drag across empty tree background to select the clade or sequences of interest.</li>
                     <li>Click <strong>Alignment Viewer</strong> (or press <kbd class="rounded border px-1.5 py-0.5 font-mono text-xs dark:border-gray-600">V</kbd>).</li>
                     <li>Inspect the aligned sequences together.</li>
                 </ol>
@@ -229,7 +241,7 @@
                         <h3 class="text-lg font-semibold text-journal-dark dark:text-journal-gold-light">Pruning</h3>
                         <p class="mt-2 leading-relaxed">
                             Select one or several tips and click <strong>Prune</strong>, use the tip's right-click menu,
-                            or use the red Alt/Option + right-drag box. Pruning removes those tips from the working tree
+                            or use the red Alt/Option + left-drag box. Pruning removes those tips from the working tree
                             and from the pruned FASTA. <strong>Original Newick</strong> and <strong>Original FASTA</strong>
                             remain available, so the input analysis is not erased.
                         </p>

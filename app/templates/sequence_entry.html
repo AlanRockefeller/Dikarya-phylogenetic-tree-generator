@@ -4739,11 +4739,17 @@
                 if (summaryBox) {
                     const note = document.createElement('p');
                     note.className = 'text-xs mt-2 italic';
-                    note.textContent = data.model_selected
-                        ? `Loaded from this job. ModelFinder previously selected ${data.model_selected}. `
-                          + 'Changes here apply to the recompute; the sequence set comes from the queue.'
-                        : 'Loaded from this job. Changes here apply to the recompute; '
-                          + 'the sequence set comes from the queue.';
+                    // The model actually fit can come from ModelFinder (IQ-TREE)
+                    // or MOOSE (RAxML), so name the selector when the job
+                    // recorded one instead of always crediting ModelFinder.
+                    let modelNote = '';
+                    if (data.model_selected && data.model_selector) {
+                        modelNote = `${data.model_selector} previously selected ${data.model_selected}. `;
+                    } else if (data.model_selected) {
+                        modelNote = `This job was built with ${data.model_selected}. `;
+                    }
+                    note.textContent = 'Loaded from this job. ' + modelNote
+                        + 'Changes here apply to the recompute; the sequence set comes from the queue.';
                     summaryBox.appendChild(note);
                 }
                 if (advToggleBtn) advToggleBtn.textContent = 'Advanced…';

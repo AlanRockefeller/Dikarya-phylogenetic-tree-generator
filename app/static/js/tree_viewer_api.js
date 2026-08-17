@@ -190,6 +190,25 @@ const TreeEditActions = {
         return data;
     },
 
+    // Alan 8/15/26 - Save the whole layered clade-annotation configuration in one
+    // atomic request. Partial saves would let a rejected layer strand the
+    // annotations that reference it, so layers and annotations always travel together.
+    async saveCladeAnnotations(jobId, layers, annotations) {
+        const response = await fetch(`/api/job/${jobId}/tree/annotations`, {
+            method: 'POST',
+            headers: this._buildHeaders(),
+            credentials: "same-origin",
+            body: JSON.stringify({ layers: layers, annotations: annotations })
+        });
+        const data = await response.json().catch(() => ({}));
+        if (!response.ok) {
+            const err = new Error(data.error || data.message || `Failed to save annotations: ${response.status}`);
+            err.details = data;
+            throw err;
+        }
+        return data;
+    },
+
     async recomputeTree(jobId) {
         const response = await fetch(`/api/job/${jobId}/tree/recompute`, {
             method: 'POST',
@@ -217,6 +236,28 @@ const TreeEditActions = {
         if (!response.ok) {
             const err = new Error(data.error || data.message || `Failed to add sequences: ${response.status}`);
             err.details = data;
+            throw err;
+        }
+        return data;
+    },
+
+    // Alan 8/17/26 - New client for the "Analyze with Claude" endpoint used by the tree viewer.
+    // Ask Claude to assess this job's alignment and tree. The server caches the
+    // result against the tree's current statistics, so this is cheap to call on
+    // repeat opens; pass refresh:true only when the user explicitly re-runs it.
+    // Deliberately no client-side timeout -- the server already caps the call.
+    async claudeReview(jobId, { refresh = false } = {}) {
+        const response = await fetch(`/api/job/${jobId}/analysis/review`, {
+            method: 'POST',
+            headers: this._buildHeaders(),
+            credentials: "same-origin",
+            body: JSON.stringify({ refresh: refresh })
+        });
+        const data = await response.json().catch(() => ({}));
+        if (!response.ok) {
+            const err = new Error(data.error || data.message || `Review failed: ${response.status}`);
+            err.details = data;
+            err.status = response.status;
             throw err;
         }
         return data;

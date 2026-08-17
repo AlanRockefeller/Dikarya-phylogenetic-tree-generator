@@ -771,46 +771,52 @@ def highlight_source_observation_tip(job_id: str, observation_id: int,
             load_tree_state,
             rename_tip,
             save_tree_state,
+            tree_state_lock,
         )
 
         job_dir = Config.JOB_DIR / job_id
-        state = load_tree_state(job_dir)
-        if not state or not isinstance(state.get("tree_structure"), dict):
-            return []
-        tips = list(_iter_tree_tip_names(state["tree_structure"]))
-        targets = []
-        for raw_name in extra_tip_names or []:
-            wanted = str(raw_name or "")
-            for tip in tips:
-                if tip == wanted or (wanted.split() and tip.split() and tip.split()[0] == wanted.split()[0]):
-                    if tip not in targets:
-                        targets.append(tip)
-                    break
-        pattern = re.compile(rf"(?<![A-Za-z0-9])MO\s*#?\s*{int(observation_id)}(?!\d)", re.IGNORECASE)
-        for tip in tips:
-            if pattern.search(tip) and tip not in targets:
-                targets.append(tip)
-        if not targets:
-            return []
+        # Everything below is fast local work on the state itself -- no network
+        # and no subprocess -- so the whole load/modify/save runs inside the
+        # per-job lock. Splitting it would let a viewer edit that lands mid-way
+        # be overwritten by this function's stale snapshot.
         source_label = _clean_text(display_name, 500)
-        if source_label:
-            for tip in list(targets):
-                rename_tip(state, tip, _source_name(source_label, observation_id))
-        selection_sets = state.get("selection_sets") or {}
-        default_members = list(selection_sets.get("Default") or [])
-        for target in targets:
-            if target not in default_members:
-                default_members.append(target)
-        selection_sets["Default"] = default_members
-        state["selection_sets"] = selection_sets
-        colors = state.get("selection_set_colors") or {}
-        colors.setdefault("Default", "#1f77b4")
-        state["selection_set_colors"] = colors
-        state.setdefault("active_selection_set", "Default")
-        if len(targets) == 1:
-            state = apply_auto_root_default(job_dir, state, targets[0], source="mo_highlight")
-        save_tree_state(job_dir, state)
-        return targets
+        with tree_state_lock(job_dir):
+            state = load_tree_state(job_dir)
+            if not state or not isinstance(state.get("tree_structure"), dict):
+                return []
+            tips = list(_iter_tree_tip_names(state["tree_structure"]))
+            targets = []
+            for raw_name in extra_tip_names or []:
+                wanted = str(raw_name or "")
+                for tip in tips:
+                    if tip == wanted or (wanted.split() and tip.split() and tip.split()[0] == wanted.split()[0]):
+                        if tip not in targets:
+                            targets.append(tip)
+                        break
+            pattern = re.compile(rf"(?<![A-Za-z0-9])MO\s*#?\s*{int(observation_id)}(?!\d)", re.IGNORECASE)
+            for tip in tips:
+                if pattern.search(tip) and tip not in targets:
+                    targets.append(tip)
+            if not targets:
+                return []
+            if source_label:
+                for tip in list(targets):
+                    rename_tip(state, tip, _source_name(source_label, observation_id))
+            selection_sets = state.get("selection_sets") or {}
+            default_members = list(selection_sets.get("Default") or [])
+            for target in targets:
+                if target not in default_members:
+                    default_members.append(target)
+            selection_sets["Default"] = default_members
+            state["selection_sets"] = selection_sets
+            colors = state.get("selection_set_colors") or {}
+            colors.setdefault("Default", "#1f77b4")
+            state["selection_set_colors"] = colors
+            state.setdefault("active_selection_set", "Default")
+            if len(targets) == 1:
+                state = apply_auto_root_default(job_dir, state, targets[0], source="mo_highlight")
+            save_tree_state(job_dir, state)
+            return targets
     except Exception as exc:
         logger.warning("Mushroom Observer source highlighting failed for %s: %s", job_id, type(exc).__name__)
         return []

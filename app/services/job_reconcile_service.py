@@ -11,6 +11,8 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional
 
+from app.services.artifact_storage import discard_artifact
+
 logger = logging.getLogger(__name__)
 
 RQ_DEAD_STATUSES = {"failed", "stopped", "canceled"}
@@ -123,8 +125,10 @@ def _requeue_killed_job(db_job, rq_job) -> Optional[str]:
     for relative in ("alignment/alignment_raw.fasta", "alignment/alignment_trimmed.fasta"):
         stale = Config.JOB_DIR / db_job.id / relative
         try:
-            if stale.exists():
-                stale.unlink()
+            # discard_artifact clears the gzipped form too, so a requeued job
+            # cannot pick up a compressed copy of the alignment it is about to
+            # rebuild.
+            discard_artifact(stale)
         except Exception:
             logger.warning("Could not remove stale artifact %s", stale)
 

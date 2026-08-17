@@ -116,6 +116,36 @@ class Config:
     MAX_CONTENT_LENGTH = int(os.environ.get('MAX_CONTENT_LENGTH', str(16 * 1024 * 1024)))
     BLAST_POLL_INTERVAL_SECONDS = int(os.environ.get('BLAST_POLL_INTERVAL_SECONDS', '60'))
     REDIS_URL = os.environ.get('REDIS_URL', 'redis://localhost:6379/0')
+
+    # Claude review of a finished alignment + tree (app/services/tree_analysis_service.py).
+    # Unconfigured, the button is hidden and the endpoint returns 503, so a
+    # deployment without it behaves as if the feature does not exist.
+    #
+    # Two backends:
+    #   cli - shell out through a root-owned sudo wrapper to the `tree` account's
+    #         Claude Code CLI. No API key needed; requires the wrapper to be
+    #         installed (see ops/sudoers/dikarya-claude).
+    #   api - call the Anthropic API directly with ANTHROPIC_API_KEY.
+    CLAUDE_REVIEW_BACKEND = os.environ.get('CLAUDE_REVIEW_BACKEND', 'cli')
+    CLAUDE_REVIEW_WRAPPER = os.environ.get(
+        'CLAUDE_REVIEW_WRAPPER', '/usr/local/sbin/dikarya-claude-review'
+    )
+    ANTHROPIC_API_KEY = os.environ.get('ANTHROPIC_API_KEY', '')
+    CLAUDE_REVIEW_MODEL = os.environ.get('CLAUDE_REVIEW_MODEL', 'claude-opus-5')
+    # Measured on a 147-sequence job: low = 61s/$0.25, medium = 156s/$0.35, for
+    # the same verdict. The request is synchronous and nginx cuts it off at 300s,
+    # so low is the setting that fits; raise it if reviews read as too shallow.
+    CLAUDE_REVIEW_EFFORT = os.environ.get('CLAUDE_REVIEW_EFFORT', 'low')
+    CLAUDE_REVIEW_MAX_TOKENS = int(os.environ.get('CLAUDE_REVIEW_MAX_TOKENS', '32000'))
+    # Hard wall-clock cap. A review runs inside a Gunicorn request slot (4 workers
+    # x 2 threads = 8 total) and behind nginx's proxy_read_timeout 300s, so it must
+    # finish well inside that or the user gets a 504 instead of an error.
+    CLAUDE_REVIEW_TIMEOUT_SECONDS = float(os.environ.get('CLAUDE_REVIEW_TIMEOUT_SECONDS', '240'))
+    # Per-invocation spend ceiling, enforced by the CLI's own --max-budget-usd.
+    CLAUDE_REVIEW_MAX_BUDGET_USD = os.environ.get('CLAUDE_REVIEW_MAX_BUDGET_USD', '1.00')
+    # Ceiling on reviews running at once, enforced with a Redis counter. Rate limits
+    # are per-client and cannot stop eight different users from taking every slot.
+    CLAUDE_REVIEW_MAX_CONCURRENT = int(os.environ.get('CLAUDE_REVIEW_MAX_CONCURRENT', '2'))
     WORKER_DIR = Path(os.environ.get('WORKER_DIR') or BASE_DIR / 'var' / 'workers')
     METRICS_FILE = Path(os.environ.get('METRICS_FILE') or BASE_DIR / 'var' / 'metrics' / 'system_metrics.jsonl')
     DOSAGE_CSV_DIR = Path(os.environ.get('DOSAGE_CSV_DIR') or BASE_DIR / 'dosage-calculator')

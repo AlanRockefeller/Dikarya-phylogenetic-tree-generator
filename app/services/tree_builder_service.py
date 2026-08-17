@@ -151,7 +151,17 @@ def run_tree_builder(
         if method == "nj":
             _run_neighbor_joining(alignment_fasta, output_newick, output_nexus, task_logger, job_id)
         elif method == "raxml":
-            _run_raxml(alignment_fasta, output_newick, output_nexus, params, config, task_logger, job_id)
+            # Alan 8/15/26 - MOOSE routinely overrides params.model (a
+            # GTR+G request came back as TPM2+FE+R2), but only the requested
+            # model was ever recorded, so the viewer cited a model the tree was
+            # not built under. Same model_selected contract as IQ-TREE below.
+            effective_model, selected_by = _run_raxml(
+                alignment_fasta, output_newick, output_nexus, params, config, task_logger, job_id
+            )
+            if effective_model and effective_model != params.model:
+                metadata["model_selected"] = effective_model
+                if selected_by:
+                    metadata["model_selector"] = selected_by
         elif method == "iqtree":
             selected_model = _run_iqtree(
                 alignment_fasta, output_newick, output_nexus, params, config, task_logger, job_id
@@ -162,6 +172,7 @@ def run_tree_builder(
                 # other is what you cite.
                 metadata["model_selected"] = selected_model
                 if _is_model_finder_request(params.model):
+                    metadata["model_selector"] = "ModelFinder"
                     task_logger.info(f"ModelFinder selected substitution model: {selected_model}")
         elif method == "mrbayes":
             _run_mrbayes(alignment_fasta, output_newick, output_nexus, params, config, task_logger, job_id)
@@ -179,6 +190,34 @@ def run_tree_builder(
     except Exception as e:
         task_logger.error(f"Tree building failed: {e}")
         raise
+
+    finally:
+        _discard_scratch_inputs(output_newick.parent, task_logger)
+
+
+def _discard_scratch_inputs(tree_dir: Path, task_logger) -> None:
+    """
+    Remove the `*_input_sanitized.fasta` copies once the builder has exited.
+
+    Every builder writes a header-sanitized copy of the trimmed alignment purely
+    to hand a path to an external binary; the name mapping it needs is returned
+    in memory and persisted to tree_metadata.json. Nothing reads these files
+    back, and they were the single largest category of dead weight in var/jobs
+    (~1.3 GiB across the job tree). The trimmed alignment they were derived from
+    is retained, so nothing is lost on the failure path either.
+    """
+    from app.services.artifact_storage import discard_artifact
+
+    try:
+        scratch = sorted(tree_dir.glob("*_input_sanitized.fasta"))
+    except OSError:
+        return
+    reclaimed = sum(discard_artifact(path) for path in scratch)
+    if reclaimed:
+        task_logger.info(
+            "Removed %d sanitized tree input(s), reclaiming %.1f MB",
+            len(scratch), reclaimed / (1024 * 1024),
+        )
 
 
 def _get_thread_count(params: TreeBuilderParams) -> int:
@@ -424,7 +463,15 @@ def _run_raxml(
     task_logger,
     job_id: Optional[str] = None
 ):
-    """Run RAxML-NG tree inference with upgraded workflow."""
+    """
+    Run RAxML-NG tree inference with upgraded workflow.
+
+    Returns ``(effective_model, selected_by)``. The effective model is the one
+    RAxML was actually handed, which is not necessarily ``params.model`` --
+    MOOSE overrides it, and the validator can substitute a data-type default.
+    ``selected_by`` names the selector ("MOOSE") when something other than the
+    user's setting picked the model, else ``None``.
+    """
     from app.services.raxml_validator import validate_and_resolve_raxml_params
     
     # 1. Detect Data Type
@@ -490,18 +537,20 @@ def _run_raxml(
 
     # 3. Handle MOOSE
     moose_mapping = None
-    
+    model_selected_by = None
+
     if resolved.enable_moose:
         if has_moose_support:
             sanitized_fasta_moose = output_newick.parent / "raxml_input_moose_sanitized.fasta"
             moose_mapping = sanitize_fasta_headers(alignment_fasta, sanitized_fasta_moose)
-            
+
             best_model, _ = _run_moose(
                 sanitized_fasta_moose, resolved, config, task_logger, job_id
             )
             if best_model:
                 resolved.model = best_model
-                 
+                model_selected_by = "MOOSE"
+
         else:
             task_logger.warning("MOOSE requested but not supported by installed RAxML-NG. Using default model.")
             
@@ -601,6 +650,8 @@ def _run_raxml(
     # 8. Final Name Restoration & Nexus Conversion
     restore_tree_names(output_newick, name_mapping)
     _convert_newick_to_nexus(output_newick, output_nexus)
+
+    return resolved.model, model_selected_by
 
 
 def _run_iqtree(

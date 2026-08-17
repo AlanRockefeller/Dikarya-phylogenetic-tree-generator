@@ -88,6 +88,20 @@ def enqueue_job(job_params: Dict[str, Any], queue_name: str = QUEUE_HIGH,
     from app.services.sequence_dedup_service import apply_observation_dedup
     apply_observation_dedup(job_params)
 
+    # Flag input that cannot produce an informative tree (two sequences, or a set
+    # that is all one sequence). Runs after dedup so the count is the one the
+    # pipeline will actually align, and here rather than in create_job so every
+    # submission path gets it. Callers read it back off job_params to show the
+    # user; it is advisory only and never blocks the job.
+    from app.services.fasta_utils import describe_degenerate_input
+    input_warnings = describe_degenerate_input(
+        job_params.get("sequence", ""),
+        accession_count=len(job_params.get("accessions") or []),
+        blast_mode=job_params.get("blast_mode"),
+    )
+    if input_warnings:
+        job_params["input_warnings"] = input_warnings
+
     if job_timeout is None:
         job_timeout = resolve_job_timeout(job_params)
 

@@ -10,7 +10,9 @@ Provides functions for running multiple sequence alignment using various tools:
 When job_id is provided, streams log output to Redis for real-time SSE updates.
 """
 
+import logging
 import os
+import re
 import shutil
 from pathlib import Path
 from typing import Optional
@@ -160,6 +162,54 @@ def _make_log_callback(job_id: Optional[str], step: str, stream: str):
     return callback
 
 
+# MAFFT reports one stderr line per pairwise comparison and per progressive
+# step. On a 484-sequence job that is ~105,000 of the log's 107,000 lines, and
+# across var/jobs it accounted for 92% of the 0.77 GiB of alignment.log. The
+# lines carry no information once the run is over -- they are a progress bar --
+# so they are streamed live to the UI but not persisted.
+_MAFFT_NOISE_PATTERNS = (
+    # "001-0002-0 (thread    1) identical" / "... better" / "... worse"
+    re.compile(r"^\d+-\d+-\d+ \(thread\s+\d+\)\s+(identical|better|worse)\s*$"),
+    # "STEP     1 / 483 (thread    0) f" -- often with backspaces appended
+    re.compile(r"^STEP\s+\d+\s*/\s*\d+\s+\(thread\s+\d+\).*$"),
+    # "100 / 484 (thread 1)" and the bare "  100 / 484" counter
+    re.compile(r"^\s*\d+\s*/\s*\d+(\s+\(thread\s+\d+\))?\s*$"),
+)
+
+
+def _keep_mafft_log_line(line: str) -> bool:
+    """
+    Decide whether a MAFFT stderr line is worth keeping on disk.
+
+    Drops per-comparison progress chatter and the blank lines MAFFT emits
+    between progress blocks, keeping the version banner, parameter echo,
+    warnings, "Converged."/"done." markers and anything unrecognised. Unknown
+    output is always kept -- this must never swallow a diagnostic.
+    """
+    stripped = line.strip()
+    if not stripped:
+        return False
+    return not any(pattern.match(line.rstrip("\b \t")) for pattern in _MAFFT_NOISE_PATTERNS)
+
+
+def _append_filtered_log(log_file: Path, cmd, stderr: str, returncode: int) -> None:
+    """Append a MAFFT run's stderr to alignment.log with progress chatter removed."""
+    try:
+        log_file.parent.mkdir(parents=True, exist_ok=True)
+        kept = [line for line in (stderr or "").splitlines() if _keep_mafft_log_line(line)]
+        with open(log_file, "a") as handle:
+            handle.write(f"CMD: {' '.join(str(part) for part in cmd)}\n")
+            handle.write("-" * 40 + "\n")
+            if kept:
+                handle.write("\n".join(kept) + "\n")
+            handle.write("-" * 40 + "\n")
+            handle.write(f"Exit code: {returncode}\n")
+    except OSError as exc:
+        logging.getLogger(__name__).warning(
+            "Could not write alignment log %s: %s", log_file, exc
+        )
+
+
 def _restore_mafft_direction_headers(
     input_fasta: Path,
     output_fasta: Path,
@@ -247,17 +297,24 @@ def _run_mafft(
             stdout_path=output_fasta,  # MAFFT writes alignment to stdout
             stderr_path=log_file,
             on_stderr_line=_make_log_callback(job_id, "align", "stderr"),
+            stderr_file_filter=_keep_mafft_log_line,
         )
         
         if exit_code != 0:
             raise RuntimeError(tool_failure_message("MAFFT", exit_code))
     else:
-        # Fallback to non-streaming for backward compatibility
-        returncode, stdout, stderr = run_command(cmd, log_file=log_file)
-        
+        # Fallback to non-streaming for backward compatibility. log_file is
+        # deliberately not passed to run_command: MAFFT's stdout *is* the
+        # alignment, and run_command's generic handler would write the entire
+        # aligned FASTA into alignment.log a second time (92 existing logs were
+        # inflated this way, some over 1 MB).
+        returncode, stdout, stderr = run_command(cmd)
+
+        _append_filtered_log(log_file, cmd, stderr, returncode)
+
         if returncode != 0:
             raise RuntimeError(tool_failure_message("MAFFT", returncode))
-            
+
         with open(output_fasta, "w") as f:
             f.write(stdout)
 

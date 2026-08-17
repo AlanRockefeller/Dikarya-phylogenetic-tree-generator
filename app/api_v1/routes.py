@@ -20,13 +20,14 @@ from app.api_v1.auth import require_api_token, api_token_key_func
 from app.api_v1.envelope import error_response, ok, paginate_query, server_error
 from app.api_v1.idempotency import idempotent
 from app.api_v1.jobs import (
-    DOWNLOADABLE_ARTIFACTS, LOG_NAMES, artifact_path,
+    DOWNLOADABLE_ARTIFACTS, LOG_NAMES, _guess_mime, artifact_path,
     get_owned_job_or_404, list_available_artifacts, serialize_job,
 )
 from app.api_v1.openapi import build_spec
 from app.config import Config
 from app.extensions import db, limiter
 from app.models import ApiToken, Job
+from app.services.artifact_storage import read_artifact_bytes
 from app.services.security_utils import validate_safe_file_path, coerce_bool
 from app.workers.queue import enqueue_job, enqueue_recompute_job
 
@@ -753,6 +754,17 @@ def download_job_file(job_id, name):
     job_dir = Config.JOB_DIR / job_id
     if p is None or not validate_safe_file_path(p, job_dir):
         return error_response(code="not_found", message="File not available yet.", status=404)
+    if p.suffix == ".gz":
+        # Stored gzipped at rest; the client asked for `name`, so hand back the
+        # decompressed bytes rather than an archive under a misleading name.
+        from io import BytesIO
+
+        return send_file(
+            BytesIO(read_artifact_bytes(p)),
+            as_attachment=True,
+            download_name=name,
+            mimetype=_guess_mime(name),
+        )
     return send_file(p, as_attachment=True, download_name=name)
 
 
@@ -1024,7 +1036,10 @@ def _mutation(handler, job_id, *, where, scope="jobs:write"):
     job_dir = Config.JOB_DIR / job_id
     body = request.get_json(silent=True) or {}
     try:
-        result = handler(job_dir, body)
+        from app.services.tree_edit_service import tree_state_lock
+
+        with tree_state_lock(job_dir):
+            result = handler(job_dir, body)
         return ok(result)
     except ValueError as e:
         return error_response(code="validation_failed", message=str(e), status=422)

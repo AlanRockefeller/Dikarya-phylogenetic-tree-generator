@@ -2300,15 +2300,15 @@ def highlight_source_observation_tip(job_id: str, observation_id: int,
     """
     try:
         from app.config import Config
-        from app.services.tree_edit_service import load_tree_state, rename_tip, save_tree_state
+        from app.services.tree_edit_service import tree_state_lock
         job_dir = Config.JOB_DIR / job_id
-        state = load_tree_state(job_dir)
-        if not state or not isinstance(state.get("tree_structure"), dict):
-            return []
-        all_tip_names = list(_iter_tree_tip_names(state["tree_structure"]))
-        targets: List[str] = []
-        source_label = _clean_display_text(display_name)
 
+        # The display name may require an iNaturalist API call, so it is
+        # resolved BEFORE the lock is taken: the tree-state lock must never be
+        # held across network I/O. Everything after it is fast local work, and
+        # the state is read fresh inside the lock so a viewer edit made while
+        # the lookup was in flight is not overwritten by a stale snapshot.
+        source_label = _clean_display_text(display_name)
         if not source_label and observation_id:
             try:
                 observation = fetch_observation(observation_id)
@@ -2316,66 +2316,84 @@ def highlight_source_observation_tip(job_id: str, observation_id: int,
             except Exception:
                 source_label = ""
 
-        for raw in (extra_tip_names or []):
-            if not raw:
-                continue
-            wanted = str(raw)
-            if wanted in all_tip_names and wanted not in targets:
-                targets.append(wanted)
-                continue
-            # Fall back to matching by first whitespace token (FASTA IDs
-            # sometimes get normalized to the leading accession only).
-            first = wanted.split()[0] if wanted.split() else ""
-            if first:
-                for tn in all_tip_names:
-                    if tn == first or tn.split()[0] == first:
-                        if tn not in targets:
-                            targets.append(tn)
-                        break
-
-        pattern_tip = _find_source_observation_tip(state["tree_structure"], observation_id)
-        if pattern_tip and pattern_tip not in targets:
-            targets.append(pattern_tip)
-
-        if not targets:
-            return []
-
-        if source_label:
-            for tip in targets:
-                display_label = _source_display_label_for_tip(tip, source_label, observation_id)
-                rename_tip(state, tip, display_label)
-
-        sel_sets = state.get("selection_sets") or {}
-        if not isinstance(sel_sets, dict):
-            sel_sets = {}
-        default_members = list(sel_sets.get("Default") or [])
-        for tip in targets:
-            if tip not in default_members:
-                default_members.append(tip)
-        sel_sets["Default"] = default_members
-        state["selection_sets"] = sel_sets
-        colors = state.get("selection_set_colors") or {}
-        if not isinstance(colors, dict):
-            colors = {}
-        colors.setdefault("Default", "#1f77b4")
-        state["selection_set_colors"] = colors
-        state.setdefault("active_selection_set", "Default")
-
-        # Alan 6/2/26 - When the iNat source observation is the single focal tip, make Auto
-        # root the default (anchored on that sequence of interest) rather than the generic
-        # midpoint default. The shared helper only overrides the build-time default ("" or
-        # "MIDPOINT") and won't persist a partial state if auto-rooting fails.
-        if len(targets) == 1:
-            from app.services.tree_edit_service import apply_auto_root_default
-            state = apply_auto_root_default(job_dir, state, targets[0],
-                                            source="inat_highlight")
-
-        save_tree_state(job_dir, state)
-        return targets
+        with tree_state_lock(job_dir):
+            return _apply_inat_source_highlight(
+                job_dir, observation_id, extra_tip_names, source_label
+            )
     except Exception as e:
         logger.warning("highlight_source_observation_tip failed for job %s: %s",
                        job_id, type(e).__name__)
         return []
+
+
+def _apply_inat_source_highlight(job_dir, observation_id: int,
+                                 extra_tip_names: Optional[List[str]],
+                                 source_label: str) -> List[str]:
+    """Fast local half of the source highlight; the caller holds tree_state_lock."""
+    from app.services.tree_edit_service import load_tree_state, rename_tip, save_tree_state
+
+    state = load_tree_state(job_dir)
+    if not state or not isinstance(state.get("tree_structure"), dict):
+        return []
+    all_tip_names = list(_iter_tree_tip_names(state["tree_structure"]))
+    targets: List[str] = []
+
+    for raw in (extra_tip_names or []):
+        if not raw:
+            continue
+        wanted = str(raw)
+        if wanted in all_tip_names and wanted not in targets:
+            targets.append(wanted)
+            continue
+        # Fall back to matching by first whitespace token (FASTA IDs
+        # sometimes get normalized to the leading accession only).
+        first = wanted.split()[0] if wanted.split() else ""
+        if first:
+            for tn in all_tip_names:
+                if tn == first or tn.split()[0] == first:
+                    if tn not in targets:
+                        targets.append(tn)
+                    break
+
+    pattern_tip = _find_source_observation_tip(state["tree_structure"], observation_id)
+    if pattern_tip and pattern_tip not in targets:
+        targets.append(pattern_tip)
+
+    if not targets:
+        return []
+
+    if source_label:
+        for tip in targets:
+            display_label = _source_display_label_for_tip(tip, source_label, observation_id)
+            rename_tip(state, tip, display_label)
+
+    sel_sets = state.get("selection_sets") or {}
+    if not isinstance(sel_sets, dict):
+        sel_sets = {}
+    default_members = list(sel_sets.get("Default") or [])
+    for tip in targets:
+        if tip not in default_members:
+            default_members.append(tip)
+    sel_sets["Default"] = default_members
+    state["selection_sets"] = sel_sets
+    colors = state.get("selection_set_colors") or {}
+    if not isinstance(colors, dict):
+        colors = {}
+    colors.setdefault("Default", "#1f77b4")
+    state["selection_set_colors"] = colors
+    state.setdefault("active_selection_set", "Default")
+
+    # Alan 6/2/26 - When the iNat source observation is the single focal tip, make Auto
+    # root the default (anchored on that sequence of interest) rather than the generic
+    # midpoint default. The shared helper only overrides the build-time default ("" or
+    # "MIDPOINT") and won't persist a partial state if auto-rooting fails.
+    if len(targets) == 1:
+        from app.services.tree_edit_service import apply_auto_root_default
+        state = apply_auto_root_default(job_dir, state, targets[0],
+                                        source="inat_highlight")
+
+    save_tree_state(job_dir, state)
+    return targets
 
 
 # ---------------------------------------------------------------------------

@@ -17,6 +17,9 @@ from datetime import datetime, timedelta, timezone
 from rq import Retry, get_current_job
 
 from app.config import Config
+from app.services.artifact_storage import (
+    artifact_exists, artifact_size, discard_gzipped_form, open_artifact,
+)
 from app.services.log_context import (
     JobContextFilter, background_job_context, bind_background_context,
     stable_fingerprint,
@@ -125,14 +128,18 @@ def validate_pipeline_outputs(job_dir, job_params, logger_obj=logger) -> dict:
     ]
     failures = []
     for path in required:
-        if not path.is_file() or path.stat().st_size == 0:
+        # Validation may run long after the pipeline, by which point the cold
+        # artifact sweep may have gzipped the alignments; artifact_size reports
+        # the uncompressed size either way.
+        if not artifact_exists(path) or artifact_size(path) == 0:
             failures.append(f"missing_or_empty:{path.relative_to(job_dir)}")
 
     fasta_counts = {}
     for path in required[:3]:
-        if path.is_file() and path.stat().st_size:
+        if artifact_exists(path) and artifact_size(path):
             try:
-                fasta_counts[path.name] = sum(1 for _ in SeqIO.parse(str(path), "fasta"))
+                with open_artifact(path, "rt") as handle:
+                    fasta_counts[path.name] = sum(1 for _ in SeqIO.parse(handle, "fasta"))
                 if fasta_counts[path.name] == 0:
                     failures.append(f"unparseable_fasta:{path.name}")
             except Exception as exc:
@@ -202,8 +209,14 @@ def validate_pipeline_outputs(job_dir, job_params, logger_obj=logger) -> dict:
 
 
 def _save_job_params(input_info_path, job_params: dict) -> None:
+    # Compact rather than indented. `sequence` (the original submitted FASTA)
+    # and `sequence_metadata` are 90% of this file and neither is read by eye.
+    # Note `sequence` is NOT redundant with input/input_raw.fasta: that file is
+    # the processed input after dedup/orientation/BLAST augmentation, while this
+    # is what the user actually submitted, which recompute and the
+    # restore-removed-duplicates endpoint both need.
     with open(input_info_path, "w") as f:
-        json.dump(job_params, f, indent=2)
+        json.dump(job_params, f, separators=(",", ":"))
 
 
 def parse_fasta_records(fasta_text: str) -> list[tuple[str, str]]:
@@ -416,7 +429,7 @@ def _should_blast_single_only(blast_mode: str, n_queries: int) -> bool:
 def _count_alignment_stats(fasta_path) -> tuple[int, int]:
     """Count sequences and alignment columns from a FASTA file."""
     try:
-        with open(fasta_path, 'r') as f:
+        with open_artifact(fasta_path, 'rt') as f:
             content = f.read()
         records = parse_fasta_records(content)
         if not records:
@@ -502,7 +515,7 @@ def run_recompute_job(job_id: str, params_dict: dict) -> dict:
                 **({"mrbayes": f"/api/job/{job_id}/download/mrbayes"}
                    if (job_dir / "tree" / "mrbayes_input.nex").is_file() else {}),
                 **({"alignment_inspection": f"/api/job/{job_id}/download/alignment/inspection"}
-                   if (job_dir / "alignment" / "alignment_trimmed_report.html").is_file() else {}),
+                   if artifact_exists(job_dir / "alignment" / "alignment_trimmed_report.html") else {}),
             }
         )
         publish_overview(job_id, "Recompute complete! Redirecting to tree viewer...")
@@ -1285,7 +1298,14 @@ def run_phylo_job(job_params: dict) -> dict:
             
             alignment_raw_path = job_dir / "alignment" / "alignment_raw.fasta"
             alignment_trimmed_path = job_dir / "alignment" / "alignment_trimmed.fasta"
-            
+
+            # This run is about to write both alignments fresh. If a previous
+            # run's outputs were gzipped by the cold-artifact sweep, drop them
+            # now so the job never carries a stale compressed copy alongside the
+            # new plain one.
+            discard_gzipped_form(alignment_raw_path)
+            discard_gzipped_form(alignment_trimmed_path)
+
             threads = min(8, __import__('os').cpu_count() or 1)
             publish_step_start(job_id, STEP_ALIGN, current_step_label, f"{threads} threads", tool=current_tool)
             update_step_meta(job, STEP_ALIGN, {
@@ -1703,7 +1723,7 @@ def run_phylo_job(job_params: dict) -> dict:
                     **({"mrbayes": f"/api/job/{job_id}/download/mrbayes"}
                        if (job_dir / "tree" / "mrbayes_input.nex").is_file() else {}),
                     **({"alignment_inspection": f"/api/job/{job_id}/download/alignment/inspection"}
-                       if (job_dir / "alignment" / "alignment_trimmed_report.html").is_file() else {}),
+                       if artifact_exists(job_dir / "alignment" / "alignment_trimmed_report.html") else {}),
                 }
             )
             publish_overview(job_id, "Pipeline complete! Redirecting to tree viewer...")
