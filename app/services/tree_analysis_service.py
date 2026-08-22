@@ -84,6 +84,16 @@ class TreeAnalysisError(Exception):
     """A review could not be produced for a reason worth showing the user."""
 
 
+class TreeAnalysisNoTree(TreeAnalysisError):
+    """The job has not produced a tree file, so there is nothing to review (404).
+
+    Separate from the other TreeAnalysisError cases because it is the one that
+    is genuinely "no such resource" rather than "this request is wrong": the
+    endpoint answered it with 404 through a `except FileNotFoundError` branch
+    that stopped being reachable once _review_newick_path took over the check.
+    """
+
+
 class TreeAnalysisUpstreamError(TreeAnalysisError):
     """Claude itself failed: no reply, an unusable reply, or one that broke the
     response contract (502).
@@ -1403,7 +1413,7 @@ def _review_newick_path(job_dir: Path) -> Path:
     for candidate in (tree_dir / "tree_pruned.newick", tree_dir / "tree_original.newick"):
         if artifact_exists(candidate):
             return candidate
-    raise TreeAnalysisError("This job has no tree file, so there is nothing to review.")
+    raise TreeAnalysisNoTree("This job has no tree yet, so there is nothing to review.")
 
 
 def _tree_metadata(job_dir: Path, recomputed: bool) -> Dict[str, Any]:

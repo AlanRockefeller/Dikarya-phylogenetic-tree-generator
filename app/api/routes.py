@@ -123,6 +123,11 @@ def client_log():
 #   WGS: 4 letters + 2-digit assembly version + 6 or 8 contig digits, so
 #        exactly 4+8 or 4+10 e.g. AAAA01000001. Notably never 4+9, which is
 #        what keeps the observed iNaturalist id from matching this arm.
+#   WGS (6-letter prefix): 6 letters + 2-digit assembly version + 7 or 9
+#        contig digits e.g. AAAAAA010000001. No iNaturalist id has ever had
+#        six leading letters, so this arm costs nothing to allow -- and
+#        without it a perfectly ordinary INSDC accession was rejected as "not
+#        an accession" before any NCBI call.
 #
 # A 4+8 id is genuinely ambiguous -- "INAT12546775" is shape-identical to a
 # real WGS accession, and no pattern can separate them. That case still reaches
@@ -137,6 +142,8 @@ _GENBANK_ACCESSION_RE = re.compile(
     r'|[A-Z]{2}_\d{8,9}'
     r'|[A-Z]{4}\d{8}'
     r'|[A-Z]{4}\d{10}'
+    r'|[A-Z]{6}\d{9}'
+    r'|[A-Z]{6}\d{11}'
     r')(?:\.\d+)?$',
     re.IGNORECASE,
 )
@@ -3862,6 +3869,7 @@ def claude_review(job_id):
         TreeAnalysisDailyLimit,
         TreeAnalysisError,
         TreeAnalysisInProgress,
+        TreeAnalysisNoTree,
         TreeAnalysisUnavailable,
         TreeAnalysisUpstreamError,
         is_configured,
@@ -3894,11 +3902,10 @@ def claude_review(job_id):
         # Out of capacity or misconfigured: a retry may well succeed, so this is
         # deliberately not the same status as a dataset we cannot review at all.
         return jsonify({"status": "error", "error": str(exc)}), 503
-    except FileNotFoundError:
-        return jsonify({
-            "status": "error",
-            "error": "This job has no tree yet, so there is nothing to review.",
-        }), 404
+    except TreeAnalysisNoTree as exc:
+        # A job that never produced a tree: no such resource, rather than a bad
+        # request. Must precede the TreeAnalysisError handler it subclasses.
+        return jsonify({"status": "error", "error": str(exc)}), 404
     except TreeAnalysisUpstreamError as exc:
         # 502, not 400. The browser's request was fine; what failed was the
         # model's reply -- an empty review, a malformed one, or one that named

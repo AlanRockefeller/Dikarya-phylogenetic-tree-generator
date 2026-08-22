@@ -901,7 +901,12 @@ def fetch_fasta_for_accessions(accessions: List[str]) -> str:
     
     # Validate accession format
     import re
-    valid_pattern = re.compile(r'^[A-Z]{1,6}_?\d{5,9}(?:\.\d+)?$', re.IGNORECASE)
+    # Loose safety net only -- the entry points validate against the exact
+    # INSDC shapes (_GENBANK_ACCESSION_RE in app/api/routes.py). The digit
+    # range has to cover the longest of those (a 6-letter WGS prefix with a
+    # 2-digit assembly version and 9 contig digits), or this filter silently
+    # drops accessions the caller was already told were valid.
+    valid_pattern = re.compile(r'^[A-Z]{1,6}_?\d{5,11}(?:\.\d+)?$', re.IGNORECASE)
     validated = [a for a in accessions if valid_pattern.match(a)]
     
     if not validated:

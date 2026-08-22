@@ -11,7 +11,6 @@ import logging
 import os
 import sys
 import unittest
-from contextlib import nullcontext
 from datetime import datetime, timedelta
 from pathlib import Path
 from unittest.mock import Mock, patch
@@ -513,7 +512,9 @@ def test_every_enqueue_path_sets_an_explicit_description():
     fake_queue.enqueue.return_value = fake_job
     fake_queue.enqueue_call.return_value = fake_job
     fake_queue.enqueue_in.return_value = fake_job
-    fake_queue.connection.lock.return_value = nullcontext()
+    # The enqueue lock is acquired and released explicitly, never as a context
+    # manager, so it may not fail the enqueue it protects.
+    fake_queue.connection.lock.return_value = Mock(**{"acquire.return_value": True})
     fake_queue.fetch_job.return_value = None
 
     with patch.object(queue_module, "get_queue", return_value=fake_queue):
@@ -545,7 +546,9 @@ def test_recompute_enqueue_reuses_an_active_job():
     existing = Mock(id=JOB_A)
     existing.get_status.return_value = "started"
     fake_queue = Mock()
-    fake_queue.connection.lock.return_value = nullcontext()
+    # The enqueue lock is acquired and released explicitly, never as a context
+    # manager, so it may not fail the enqueue it protects.
+    fake_queue.connection.lock.return_value = Mock(**{"acquire.return_value": True})
     fake_queue.fetch_job.return_value = existing
 
     with patch.object(queue_module, "get_queue", return_value=fake_queue):

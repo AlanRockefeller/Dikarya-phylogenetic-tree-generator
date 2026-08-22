@@ -1472,6 +1472,24 @@ def commit_recompute_tree_state(job_dir: Path,
         return state
 
 
+def _record_tree_state_snapshot(job_dir: Path, rq_job, logger) -> None:
+    """Note in RQ meta which generation of tree_state.json this run is using.
+
+    Read by app.workers.queue.active_recompute_snapshot_mtime(), which is how
+    the recompute endpoint tells a repeated click apart from a click that
+    follows viewer edits the running task will never see.
+    """
+    if rq_job is None:
+        return
+    try:
+        rq_job.meta["tree_state_snapshot_mtime"] = (
+            Path(job_dir) / "tree_state.json"
+        ).stat().st_mtime
+        rq_job.save_meta()
+    except Exception as exc:  # pragma: no cover - never fail a run over meta
+        logger.warning("Could not record tree_state snapshot time: %s", exc)
+
+
 def _discard_abandoned_staging(job_dir: Path, logger) -> None:
     """Remove staging directories a previous run never got to clean up.
 
@@ -1654,14 +1672,7 @@ def _recompute_tree_staged(
     # Recompute click carries no body of its own, so this is the only way the
     # endpoint can tell "the same request again" from "the user pruned three
     # more taxa after this run started", which this run will never see.
-    if rq_job is not None:
-        try:
-            rq_job.meta["tree_state_snapshot_mtime"] = (
-                job_dir / "tree_state.json"
-            ).stat().st_mtime
-            rq_job.save_meta()
-        except Exception as exc:  # pragma: no cover - never fail a run over meta
-            logger.warning("Could not record tree_state snapshot time: %s", exc)
+    _record_tree_state_snapshot(job_dir, rq_job, logger)
 
     # 2. Extract pruned FASTA
     # We need the original input (unaligned)
@@ -1781,6 +1792,10 @@ def _recompute_tree_staged(
         initial_state=tree_json,
         task_logger=logger,
     )
+    # The commit above rewrites tree_state.json, which would otherwise read as
+    # "the user edited the viewer since this run started" and make a duplicate
+    # click in the last seconds of the run conflict for no reason.
+    _record_tree_state_snapshot(job_dir, rq_job, logger)
 
     finish_step("post", "All files ready")
     overview("Recompute complete")

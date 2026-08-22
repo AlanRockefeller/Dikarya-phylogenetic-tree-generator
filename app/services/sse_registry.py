@@ -77,13 +77,17 @@ def open_stream(redis_conn, job_id):
 
     capacity = _capacity()
     threshold = _pressure_threshold()
+    # sse.opened is emitted unconditionally. It used to be the `else` of the
+    # check below, so opens stopped being logged exactly during the pressure
+    # episodes this registry exists to diagnose -- anything pairing sse.opened
+    # with sse.closed undercounted precisely then. The pressure warning is an
+    # additional record, not a replacement.
+    logger.info("event=sse.opened SSE stream opened open_streams=%s", count)
     if count >= threshold:
         logger.warning(
             "event=sse.capacity_pressure open_streams=%s threshold=%s capacity=%s job=%s",
             count, threshold, capacity, job_id,
         )
-    else:
-        logger.info("event=sse.opened SSE stream opened open_streams=%s", count)
     return token, count
 
 

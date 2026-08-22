@@ -37,6 +37,34 @@ def _release_version(base_dir):
     return configured_release(base_dir)
 
 
+# Where the BMGE jar is installed. Probed rather than hardcoded: the shipped
+# default used to be one developer's conda prefix, so rebuilding that env or
+# bumping the BMGE version left `java -jar <missing>` as the default command
+# and BMGE trimming failed at the JVM instead of falling back to the PATH shim.
+_BMGE_JAR_PATTERNS = (
+    '/home/tree/miniforge3/share/bmge-*/BMGE.jar',
+    '/opt/conda/share/bmge-*/BMGE.jar',
+    '/usr/local/share/bmge/BMGE.jar',
+    '/usr/share/bmge/BMGE.jar',
+)
+
+
+def _default_bmge_binary() -> str:
+    """First BMGE jar actually present, else the `bmge` shim on PATH.
+
+    The jar is strongly preferred -- only with it can trimming_service size
+    -Xmx to fit SUBPROCESS_MEMORY_LIMIT_MB -- but a missing jar must degrade to
+    something runnable rather than to a path that cannot exist.
+    """
+    import glob
+
+    for pattern in _BMGE_JAR_PATTERNS:
+        for candidate in sorted(glob.glob(pattern), reverse=True):
+            if os.path.isfile(candidate):
+                return candidate
+    return 'bmge'
+
+
 class Config:
     SECRET_KEY = os.environ.get('SECRET_KEY') or 'dev-key-please-change'
     WTF_CSRF_TIME_LIMIT = None  # No expiration; tokens remain valid for session lifetime
@@ -66,9 +94,7 @@ class Config:
     # had already run. Point at the jar so trimming_service can size -Xmx from
     # SUBPROCESS_MEMORY_LIMIT_MB; the shim path still works if the jar is
     # missing, but only while no memory limit is set.
-    BMGE_BINARY = os.environ.get(
-        'BMGE_BINARY', '/home/tree/miniforge3/share/bmge-1.12-1/BMGE.jar'
-    )
+    BMGE_BINARY = os.environ.get('BMGE_BINARY') or _default_bmge_binary()
     # Share of SUBPROCESS_MEMORY_LIMIT_MB the JVM may use as heap. RLIMIT_AS
     # counts *reserved* address space, and a JVM reserves far more than -Xmx:
     # metaspace, compressed class space, code cache, thread stacks and GC

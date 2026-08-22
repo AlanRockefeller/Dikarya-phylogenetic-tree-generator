@@ -6,7 +6,8 @@ Five independent passes, each safe to re-run and each skippable:
 
   scratch    Delete tree/*_input_sanitized.fasta -- header-sanitized copies of
              the trimmed alignment written purely as argv for the tree binary
-             and never read back.
+             and never read back -- plus .recompute-*/ staging directories left
+             behind when a worker restart killed a recompute mid-run.
   logs       Strip MAFFT's per-comparison progress chatter from
              logs/alignment.log. ~96% of those bytes; diagnostics are kept.
   json       Re-serialize tree_state.json and input_info.json compactly.
@@ -50,6 +51,7 @@ GZIP_LEVEL = 6
 MIN_COMPRESS_BYTES = 4096
 
 SCRATCH_GLOB = "tree/*_input_sanitized.fasta"
+RECOMPUTE_STAGING_GLOB = ".recompute-*"
 REPORT_GLOB = "alignment/*_report.html"
 
 COMPRESSIBLE_ALIGNMENTS = (
@@ -146,11 +148,38 @@ def gzip_in_place(path: Path, apply: bool) -> int:
     return saved
 
 
+def _tree_bytes(root: Path) -> int:
+    """Bytes held under root, not following symlinks (staging links to logs/)."""
+    total = 0
+    for base, _dirs, files in os.walk(root, followlinks=False):
+        for name in files:
+            path = Path(base) / name
+            try:
+                total += path.lstat().st_size
+            except OSError:
+                continue
+    return total
+
+
 def pass_scratch(job_dir: Path, apply: bool, tally: Tally) -> None:
     for path in sorted(job_dir.glob(SCRATCH_GLOB)):
         size = path.stat().st_size
         if apply:
             path.unlink()
+        tally.add("scratch", size)
+
+    # recompute_tree() stages a whole run inside .recompute-XXXX/ and leaves
+    # cleanup to TemporaryDirectory, which a SIGKILL skips -- and
+    # restart-dikarya-worker SIGKILLs the work horse by design. A recompute
+    # killed that way leaves the full staged alignment and tree behind with
+    # nothing to reclaim it. Only jobs untouched for --min-age-hours reach
+    # here, so a directory in scope can never belong to a live run.
+    for path in sorted(job_dir.glob(RECOMPUTE_STAGING_GLOB)):
+        if not path.is_dir():
+            continue
+        size = _tree_bytes(path)
+        if apply:
+            shutil.rmtree(path, ignore_errors=True)
         tally.add("scratch", size)
 
 
