@@ -1,13 +1,32 @@
 import unittest
+import urllib.error
 from unittest.mock import patch
 
 from app.services.mushroom_observer_service import (
     MushroomObserverError,
+    _api_request,
     prepare_tree_job,
 )
 
 
 class MushroomObserverMycoMapMessageTests(unittest.TestCase):
+    def test_upstream_http_error_logs_table_method_and_status(self):
+        upstream_error = urllib.error.HTTPError(
+            "https://mushroomobserver.org/api2/observations", 503,
+            "Service Unavailable", None, None,
+        )
+        with (
+            patch("urllib.request.urlopen", side_effect=upstream_error),
+            self.assertLogs("app.services.mushroom_observer_service", level="WARNING") as logs,
+            self.assertRaises(MushroomObserverError) as caught,
+        ):
+            _api_request("observations")
+
+        self.assertEqual(caught.exception.status, 502)
+        self.assertIn(
+            "table=observations method=GET status=503", "\n".join(logs.output)
+        )
+
     def test_creation_discovery_timeout_does_not_invent_hit_counts(self):
         preparation = {
             "observation_id": 123,

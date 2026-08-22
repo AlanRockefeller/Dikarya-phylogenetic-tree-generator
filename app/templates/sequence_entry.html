@@ -1099,7 +1099,7 @@
         <p class="eyebrow">Advanced</p>
         <h3 class="mb-1">Pipeline Configuration</h3>
         <div class="advanced-summary">
-            <p id="advanced_current_summary" class="text-sm">Currently: MAFFT + FastTree 2.2.0, terminal overhang trim, midpoint-rooted, 1000 bootstrap.</p>
+            <p id="advanced_current_summary" class="text-sm">Currently: MAFFT + FastTree 2.2.0, terminal overhang trim, midpoint-rooted, SH-like local support (not bootstrap).</p>
         </div>
     </div>
 
@@ -2158,7 +2158,7 @@
                 if (seqs.length === 1) {
                     query = seqs[0].sequence;
                 } else if (seqs.length > 1) {
-                    throw new Error(
+                    throw expectedError(
                         `BLAST accepts one query sequence at a time; this input contains ${seqs.length}. ` +
                         'Use Add Sequences to put them in the queue, then build the tree.'
                     );
@@ -3999,9 +3999,10 @@
         if (!advancedCurrentSummary) return;
         const alignment = selectedText('alignment_method') || 'MAFFT';
         const treeMethod = treeMethodSelect.value === 'fasttree' ? 'FastTree 2.2.0' : selectedText('tree_method');
-        const bootstrap = treeMethodSelect.value === 'fasttree'
-            ? 1000
-            : (parseInt(document.getElementById('bootstrap')?.value, 10) || 100);
+        // FastTree does not bootstrap. It reports SH-like local support, so there
+        // is no replicate count to show and claiming one here told users they had
+        // 1000 bootstraps when none were ever run.
+        const bootstrap = parseInt(document.getElementById('bootstrap')?.value, 10) || 100;
         const outgroup = document.getElementById('outgroup_select')?.value;
         const rooting = outgroup ? `outgroup: ${outgroup}` : 'midpoint-rooted';
         let terminalTrim = document.getElementById('trim_terminal_overhangs')?.checked
@@ -4025,6 +4026,10 @@
             const iqModel = iqtreeModelSelect?.value || 'MFP';
             const modelLabel = iqModel === 'MFP' ? 'ModelFinder' : iqModel;
             advancedCurrentSummary.textContent = `Currently: ${alignment} + ${treeMethod}, ${modelLabel}, ${terminalTrim}, ${rooting}, ${support}.`;
+        } else if (treeMethodSelect.value === 'fasttree') {
+            advancedCurrentSummary.textContent = `Currently: ${alignment} + ${treeMethod}, ${terminalTrim}, ${rooting}, SH-like local support (not bootstrap).`;
+        } else if (treeMethodSelect.value === 'nj') {
+            advancedCurrentSummary.textContent = `Currently: ${alignment} + ${treeMethod}, ${terminalTrim}, ${rooting}, no node support.`;
         } else {
             advancedCurrentSummary.textContent = `Currently: ${alignment} + ${treeMethod}, ${terminalTrim}, ${rooting}, ${bootstrap} bootstrap.`;
         }

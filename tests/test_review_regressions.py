@@ -98,6 +98,53 @@ def test_trimmed_fasta_download_decompresses_gzipped_artifact(tmp_path):
 
 
 @pytest.mark.parametrize(
+    "payload",
+    [
+        {"async": True, "use_current_input": True},
+        {"async": True, "tree_method": "mrbayes"},
+    ],
+)
+def test_mutated_recompute_request_conflicts_with_active_generation(tmp_path, payload):
+    job_dir = tmp_path / JOB_ID
+    job_dir.mkdir()
+    (job_dir / "input_info.json").write_text('{"tree_method":"raxml"}')
+
+    app = Flask(__name__)
+    with (
+        app.test_request_context(method="POST", json=payload),
+        patch.object(Config, "JOB_DIR", tmp_path),
+        patch.object(routes, "check_job_access", return_value=(None, None, 200)),
+        patch.object(routes, "enqueue_recompute_job", return_value=(JOB_ID, False)),
+        patch.object(routes, "url_for", return_value=f"/job/{JOB_ID}"),
+    ):
+        response, status = routes.recompute_tree_job.__wrapped__(JOB_ID)
+
+    body = response.get_json()
+    assert status == 409
+    assert body["status"] == "conflict"
+    assert "will not include" in body["error"]
+
+
+def test_unchanged_duplicate_recompute_remains_idempotent(tmp_path):
+    job_dir = tmp_path / JOB_ID
+    job_dir.mkdir()
+    (job_dir / "input_info.json").write_text('{"tree_method":"raxml"}')
+
+    app = Flask(__name__)
+    with (
+        app.test_request_context(method="POST", json={"async": True}),
+        patch.object(Config, "JOB_DIR", tmp_path),
+        patch.object(routes, "check_job_access", return_value=(None, None, 200)),
+        patch.object(routes, "enqueue_recompute_job", return_value=(JOB_ID, False)),
+        patch.object(routes, "url_for", return_value=f"/job/{JOB_ID}"),
+    ):
+        response, status = routes.recompute_tree_job.__wrapped__(JOB_ID)
+
+    assert status == 202
+    assert response.get_json()["status"] == "already_queued"
+
+
+@pytest.mark.parametrize(
     ("old_name", "new_name"),
     [
         (None, "Safe name"),

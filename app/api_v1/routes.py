@@ -700,16 +700,35 @@ def recompute_job(job_id):
             overrides["notes"] = v
 
         params.update(overrides)
-        # Always async for the public API.
-        rq_job_id = enqueue_recompute_job(job_id, params)
-        job.status = "queued"
-        metrics = job.metrics or {}
-        metrics["recompute_requested_at"] = datetime.utcnow().isoformat()
-        job.metrics = metrics
-        db.session.commit()
+        # Always async for the public API. At most one recompute is active per
+        # job, so a request that carries overrides while another generation is
+        # already running cannot be answered as an idempotent duplicate: the
+        # running task captured its params when it started, and reporting 202
+        # here would promise settings the resulting tree was never built with.
+        rq_job_id, created = enqueue_recompute_job(
+            job_id, params, return_created=True,
+        )
+        if not created and overrides:
+            return error_response(
+                code="recompute_in_progress",
+                message=(
+                    "Another recompute is already in progress for this job and "
+                    "will not use the supplied settings. Wait for it to finish, "
+                    "then retry."
+                ),
+                status=409,
+                details={"rq_job_id": rq_job_id,
+                         "ignored_fields": sorted(overrides)},
+            )
+        if created:
+            job.status = "queued"
+            metrics = job.metrics or {}
+            metrics["recompute_requested_at"] = datetime.utcnow().isoformat()
+            job.metrics = metrics
+            db.session.commit()
         return ok({
             "id": job_id,
-            "status": "queued",
+            "status": "queued" if created else "already_queued",
             "rq_job_id": rq_job_id,
             "links": {
                 "self":   url_for("api_v1.get_job", job_id=job_id),

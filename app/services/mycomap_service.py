@@ -58,7 +58,11 @@ MYCOMAP_NCBI_RECHECK_MAX_HOURS = 48
 # How long to keep looking for a newly created BLAST's result page before
 # giving up. MycoMap answers the create POST with "Job added to queue" and no
 # ID, so the record only becomes discoverable once its queue reaches the job.
-MYCOMAP_CREATION_DISCOVERY_MAX_SECONDS = 600
+# MycoMap can leave an accepted search in its queue for well over ten minutes.
+# RQ retries do not occupy a worker slot, so keep discovering for an hour
+# before asking the user to rebuild instead of turning ordinary queue backlog
+# into a failed tree.
+MYCOMAP_CREATION_DISCOVERY_MAX_SECONDS = 3600
 MYCOMAP_NEAR_DUPLICATE_MAX_DIFFERENCES = 4
 
 _CONCRETE_DNA_BASES = frozenset("ACGT")
@@ -700,7 +704,16 @@ def find_mycomap_blast_via_history(title: str,
         )
         if url_text.startswith("/"):
             url_text = urllib.parse.urljoin("https://mycomap.com", url_text)
-        blast_id = validate_mycomap_url(url_text)
+        # The history API sometimes puts its own collection endpoint in a
+        # generic ``url`` field. It is metadata, not a malformed user URL, so
+        # do not feed it through the warning-producing result URL validator on
+        # every discovery poll.
+        history_api_url = f"{MYCOMAP_API_BASE_URL}/blast"
+        blast_id = (
+            validate_mycomap_url(url_text)
+            if url_text.rstrip("/") != history_api_url.rstrip("/")
+            else None
+        )
         if blast_id:
             logger.info(
                 "Found MycoMap BLAST %s for title %s via history API",
@@ -739,7 +752,9 @@ def find_mycomap_blast_via_history(title: str,
                     "url": candidate_url,
                     "title": wanted,
                 }
-            logger.warning(
+            # This is the normal intermediate state after MycoMap accepts a
+            # search but before its public result page is generated.
+            logger.info(
                 "MycoMap history API returned BLAST %s for title %s, but its "
                 "result page URL is not on the listing yet",
                 candidate_id, wanted,
@@ -1359,11 +1374,16 @@ def validate_mycomap_url(url: str) -> Optional[str]:
     else:
         # Fall back to the loose scan for hand-edited or unusual URLs, but require
         # the digits to end the token so "r025abc" is not read as 025.
-        match = re.search(r'(?:^|[^a-zA-Z0-9])r(\d+)(?![a-zA-Z0-9])', search_text)
-        if not match:
+        loose_matches = re.findall(
+            r'(?:^|[^a-zA-Z0-9])r(\d+)(?![a-zA-Z0-9])', search_text
+        )
+        if not loose_matches:
             logger.warning(f"URL validation failed: no r<digits> pattern found in: {url}")
             return None
-        blast_id = match.group(1)
+        # Slug-style result URLs may contain earlier r-prefixed specimen or
+        # plate tokens before the final BLAST result ID. The result ID is the
+        # last complete r<digits> token in the slug.
+        blast_id = loose_matches[-1]
         logger.info(
             "Mycomap URL had no standalone r<digits> segment; using loose match "
             "blast_id=%s from: %s", blast_id, url,

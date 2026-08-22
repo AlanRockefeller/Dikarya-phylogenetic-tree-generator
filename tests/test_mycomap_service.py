@@ -50,6 +50,15 @@ class TestMycomapUrlValidation(unittest.TestCase):
         result = validate_mycomap_url(url)
         self.assertEqual(result, "54321")
 
+    def test_slug_with_multiple_r_tokens_uses_final_result_id(self):
+        """Earlier r-prefixed slug tokens must not override the result ID."""
+        url = (
+            "https://mycomap.com/genetics/blast-search/"
+            "h11-r025-01591-inat327124600-1v1-ric51-snp3-563287-r452058/"
+        )
+        result = validate_mycomap_url(url)
+        self.assertEqual(result, "452058")
+
     def test_invalid_url_wrong_domain(self):
         """Non-Mycomap domains should be rejected."""
         url = "https://example.com/r12345"

@@ -45,7 +45,14 @@ from app.workers.events import (
 # Levels and handlers are now set explicitly in app._install_logging().
 logger = logging.getLogger(__name__)
 
-VALID_DNA_SYMBOLS = frozenset("ACGTURYSWKMBDHVN-?")
+# Relocated to app/services/fasta_utils.py so the API can reject a malformed
+# FASTA at submit time instead of accepting the job and failing it in the
+# worker minutes later. Re-exported here because the pipeline still calls both.
+from app.services.fasta_utils import (  # noqa: E402
+    VALID_DNA_SYMBOLS,
+    parse_fasta_records,
+    validate_dna_fasta,
+)
 
 # Metadata reaches us from user-controlled imports, so "source" is not a safe
 # label to echo into a log line: a crafted record could carry a specimen note or
@@ -219,39 +226,6 @@ def _save_job_params(input_info_path, job_params: dict) -> None:
         json.dump(job_params, f, separators=(",", ":"))
 
 
-def parse_fasta_records(fasta_text: str) -> list[tuple[str, str]]:
-    """
-    Returns list of (header_without_gt, sequence_string_no_whitespace).
-    Assumes FASTA headers start with '>'.
-    """
-    records: list[tuple[str, str]] = []
-    header: str | None = None
-    seq_chunks: list[str] = []
-
-    for raw_line in fasta_text.splitlines():
-        line = raw_line.strip()
-        if not line:
-            continue
-
-        if line.startswith(">"):
-            # flush previous record
-            if header is not None:
-                seq = "".join(seq_chunks)
-                seq = "".join(seq.split())  # remove ALL whitespace
-                records.append((header, seq))
-
-            header = line[1:].strip()
-            seq_chunks = []
-        else:
-            seq_chunks.append(line)
-
-    # flush final record
-    if header is not None:
-        seq = "".join(seq_chunks)
-        seq = "".join(seq.split())
-        records.append((header, seq))
-
-    return records
 
 
 def cap_fasta_headers(fasta_text: str) -> tuple[str, int]:
@@ -282,45 +256,6 @@ def cap_fasta_headers(fasta_text: str) -> tuple[str, int]:
     return "".join(lines), capped
 
 
-def validate_dna_fasta(fasta_text: str) -> int:
-    """Validate FASTA structure and DNA symbols, returning the record count."""
-    records = parse_fasta_records(fasta_text)
-    if not records:
-        raise ValueError(
-            "No FASTA records were found. Start each record with a header line "
-            "beginning with '>', followed by its DNA sequence on the next line."
-        )
-
-    for index, (header, sequence) in enumerate(records, start=1):
-        record_name = header or f"record {index}"
-        if not header:
-            raise ValueError(
-                f"FASTA record {index} has an empty header. Add a name after '>', "
-                "for example '>sample_1', then retry."
-            )
-        if not sequence:
-            raise ValueError(
-                f"FASTA record '{record_name[:100]}' has no DNA sequence. Add the "
-                "nucleotide sequence on the line after its header, then retry."
-            )
-
-        invalid_symbols = sorted({
-            symbol
-            for symbol in sequence.upper()
-            if symbol not in VALID_DNA_SYMBOLS
-        })
-        if invalid_symbols:
-            shown_symbols = ", ".join(repr(symbol) for symbol in invalid_symbols[:10])
-            if len(invalid_symbols) > 10:
-                shown_symbols += ", ..."
-            raise ValueError(
-                f"FASTA record '{record_name[:100]}' contains invalid DNA "
-                f"symbol(s): {shown_symbols}. Remove labels, punctuation, and "
-                "other non-sequence text from sequence lines. Valid symbols are "
-                "A, C, G, T/U, IUPAC ambiguity codes, '-' and '?'."
-            )
-
-    return len(records)
 
 
 def _format_fasta_records(records: list[tuple[str, str]]) -> str:

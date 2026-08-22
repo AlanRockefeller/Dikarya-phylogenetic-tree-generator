@@ -163,6 +163,25 @@ def create_app(config_name='default'):
     def favicon_asset(filename):
         return send_from_directory(app.static_folder + '/favicon.ico', filename)
 
+    # Browsers and pinned/mobile launchers probe these conventional root URLs
+    # even when the page declares explicit icon links.
+    @app.route('/favicon.ico')
+    def favicon_root():
+        return send_from_directory(app.static_folder + '/favicon.ico', 'favicon.ico')
+
+    @app.route('/apple-touch-icon.png')
+    @app.route('/apple-touch-icon-precomposed.png')
+    def apple_touch_icon_root():
+        return send_from_directory(
+            app.static_folder + '/favicon.ico', 'apple-touch-icon.png'
+        )
+
+    @app.route('/site.webmanifest')
+    def web_manifest_root():
+        return send_from_directory(
+            app.static_folder + '/favicon.ico', 'site.webmanifest'
+        )
+
     @app.route('/files/<path:filename>')
     def public_file(filename):
         parts = [part for part in filename.split('/') if part]

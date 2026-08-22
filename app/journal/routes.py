@@ -27,6 +27,11 @@ def submit_manuscript():
     return render_template('journal/submit.html')
 
 
+@bp.route('/ai-policy')
+def ai_policy():
+    return render_template('journal/ai_policy.html')
+
+
 @bp.route('/taxonomy')
 def taxonomy():
     return render_template('journal/taxonomy.html')

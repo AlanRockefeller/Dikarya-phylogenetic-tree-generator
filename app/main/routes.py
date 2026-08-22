@@ -207,6 +207,7 @@ SITEMAP_ENDPOINTS = (
     ('journal.current_issue', 'weekly', '0.8'),
     ('journal.archive', 'monthly', '0.6'),
     ('journal.submit_manuscript', 'monthly', '0.6'),
+    ('journal.ai_policy', 'monthly', '0.6'),
     ('journal.taxonomy', 'monthly', '0.6'),
     ('journal.reviewers', 'monthly', '0.5'),
     ('journal.resources', 'monthly', '0.5'),
@@ -336,8 +337,8 @@ def _voucher_layout_from_form(form, sample_label=None, output_format="pdf"):
     default_font_key = "ibm_plex_sans" if output_format == "rtf" else "helvetica"
     font_key = form.get("font_family") or default_font_key
     font_size = _voucher_int(form.get("font_size"), 12, 6, 36)
-    min_gap_x = _voucher_float(form.get("spacing_x"), 0, 0, 2)
-    min_gap_y = _voucher_float(form.get("spacing_y"), 0, 0, 2)
+    min_gap_x = _voucher_float(form.get("spacing_x"), 0.1, 0, 2)
+    min_gap_y = _voucher_float(form.get("spacing_y"), 0.1, 0, 2)
     if preset_key == "custom":
         label_width = _voucher_float(form.get("custom_width"), 2.625, 0.5, 8.5)
         label_height = _voucher_float(form.get("custom_height"), 1, 0.25, 5)
@@ -745,11 +746,27 @@ def job_viewer(job_id):
             
     # Hide the Claude review control entirely when no API key is configured,
     # rather than offering a button that can only ever answer 503.
-    from app.services.tree_analysis_service import is_configured as claude_review_enabled
+    from app.services.tree_analysis_service import (
+        is_configured as claude_review_enabled,
+        resolve_tree_support_context,
+    )
+
+    # The viewer used to resolve the tree builder from input_info.json alone
+    # while the review preferred the builder's own metadata, so a recomputed job
+    # could show one support scale on the badge and describe another in the
+    # review. Both read the same resolution now.
+    try:
+        tree_support_context = resolve_tree_support_context(job_dir)
+    except Exception:
+        tree_support_context = {
+            "tree_method": job_details.get("tree_method", "") or "",
+            "alrt_only": False,
+        }
 
     return render_template(
         'job_viewer.html', job_id=job_id, job_details=job_details, view_only=view_only,
         claude_review_enabled=claude_review_enabled(),
+        tree_support_context=tree_support_context,
     )
 
 # /health moved to the monitoring blueprint (app/monitoring/routes.py) where

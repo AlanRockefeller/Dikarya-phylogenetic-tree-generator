@@ -8,6 +8,7 @@ Provides functions for trimming multiple sequence alignments:
 When job_id is provided, streams log output to Redis for real-time SSE updates.
 """
 
+import logging
 import shutil
 from pathlib import Path
 from typing import Any, Dict, Optional
@@ -15,10 +16,13 @@ from typing import Any, Dict, Optional
 from app.config import Config
 from app.services.artifact_storage import compress_artifact, discard_artifact
 from app.services.subprocess_utils import (
+    log_tool_failure,
     run_command,
     run_command_streaming,
     tool_failure_message,
 )
+
+_logger = logging.getLogger(__name__)
 
 # A terminal alignment column is kept if several sequences have a residue
 # there. This trims singleton/doubleton flanking tails without letting a few
@@ -536,12 +540,62 @@ def _run_trimal(
         )
         
         if exit_code != 0:
+            log_tool_failure(_logger, "trimAl", exit_code, stats, job=job_id, step="trim")
             raise RuntimeError(tool_failure_message("trimAl", exit_code))
     else:
         returncode, stdout, stderr = run_command(cmd, log_file=log_file)
-        
+
         if returncode != 0:
+            log_tool_failure(
+                _logger, "trimAl", returncode,
+                {"stdout_tail": (stdout or "").splitlines(),
+                 "stderr_tail": (stderr or "").splitlines()},
+                step="trim",
+            )
             raise RuntimeError(tool_failure_message("trimAl", returncode))
+
+
+def _bmge_command(bmge_bin, config: Config) -> list:
+    """Build the BMGE invocation, sizing the JVM heap to fit inside RLIMIT_AS.
+
+    Every external tool is spawned under ``prlimit --as=SUBPROCESS_MEMORY_LIMIT_MB``.
+    A JVM reserves its whole ``-Xmx`` as address space at startup, so the conda
+    shim's hardcoded ``-Xmx128G`` could never start under a 9 GB cap -- BMGE
+    trimming failed for every job after that limit was introduced, and only
+    after the alignment step had already completed. Passing an explicit heap
+    below the limit is what makes the two settings agree.
+    """
+    if not str(bmge_bin).endswith(".jar"):
+        # A wrapper script owns its own -Xmx and we cannot override it, so the
+        # limit and the wrapper will disagree unless no limit is set at all.
+        if int(getattr(config, "SUBPROCESS_MEMORY_LIMIT_MB", 0) or 0) > 0:
+            _logger.warning(
+                "event=bmge.unmanaged_heap BMGE_BINARY=%s is not a .jar, so its "
+                "JVM heap cannot be sized to fit SUBPROCESS_MEMORY_LIMIT_MB",
+                bmge_bin,
+            )
+        return [str(bmge_bin)]
+
+    cmd = ["java"]
+    memory_mb = int(getattr(config, "SUBPROCESS_MEMORY_LIMIT_MB", 0) or 0)
+    if memory_mb > 0:
+        floor_mb = int(getattr(config, "JVM_MIN_ADDRESS_SPACE_MB", 4096) or 0)
+        if memory_mb < floor_mb:
+            _logger.warning(
+                "event=bmge.limit_too_low SUBPROCESS_MEMORY_LIMIT_MB=%s is below "
+                "the %s MB a JVM needs to start under RLIMIT_AS; BMGE trimming "
+                "will fail until the limit is raised",
+                memory_mb, floor_mb,
+            )
+        percent = int(getattr(config, "JVM_HEAP_PERCENT", 60) or 60)
+        heap_mb = max(256, memory_mb * percent // 100)
+        cmd.extend([
+            f"-Xmx{heap_mb}m",
+            f"-XX:CompressedClassSpaceSize={int(getattr(config, 'JVM_CLASS_SPACE_MB', 128))}m",
+            f"-XX:MaxMetaspaceSize={int(getattr(config, 'JVM_METASPACE_MB', 256))}m",
+        ])
+    cmd.extend(["-jar", str(bmge_bin)])
+    return cmd
 
 
 def _run_bmge(
@@ -558,13 +612,8 @@ def _run_bmge(
     Handles both JAR file and binary executable configurations.
     """
     bmge_bin = config.BMGE_BINARY
-    cmd = []
-    
-    if str(bmge_bin).endswith(".jar"):
-        cmd = ["java", "-jar", bmge_bin]
-    else:
-        cmd = [bmge_bin]
-        
+    cmd = _bmge_command(bmge_bin, config)
+
     cmd.extend([
         "-i", str(input_alignment),
         "-t", "DNA",
@@ -587,9 +636,16 @@ def _run_bmge(
         )
         
         if exit_code != 0:
+            log_tool_failure(_logger, "BMGE", exit_code, stats, job=job_id, step="trim")
             raise RuntimeError(tool_failure_message("BMGE", exit_code))
     else:
         returncode, stdout, stderr = run_command(cmd, log_file=log_file)
-        
+
         if returncode != 0:
+            log_tool_failure(
+                _logger, "BMGE", returncode,
+                {"stdout_tail": (stdout or "").splitlines(),
+                 "stderr_tail": (stderr or "").splitlines()},
+                step="trim",
+            )
             raise RuntimeError(tool_failure_message("BMGE", returncode))

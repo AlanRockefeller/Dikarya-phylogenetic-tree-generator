@@ -184,8 +184,10 @@ class TestGenBankHeader(unittest.TestCase):
 
     @patch("app.services.blast_service._fetch_genbank_xml_batch")
     def test_fetch_fasta_integration(self, mock_fetch):
-        # Mock XML response
-        mock_fetch.return_value = """
+        # Mock XML response. _fetch_genbank_xml_batch returns a *list* of
+        # documents so a batch that had to be retried per accession can keep
+        # the records that did resolve.
+        mock_fetch.return_value = ["""
         <GBSet>
             <GBSeq>
                 <GBSeq_primary-accession>AA123456</GBSeq_primary-accession>
@@ -194,7 +196,7 @@ class TestGenBankHeader(unittest.TestCase):
                 <GBSeq_sequence>AAAA</GBSeq_sequence>
             </GBSeq>
         </GBSet>
-        """
+        """]
         
         result = fetch_fasta_for_accessions(["AA123456"])
         self.assertIn(">AA123456.1 Org1", result)
@@ -204,13 +206,13 @@ class TestGenBankHeader(unittest.TestCase):
     @patch("app.services.blast_service._ncbi_request")
     def test_fallback_missing_sequence(self, mock_ncbi, mock_fetch):
         # XML return has record but NO sequence
-        mock_fetch.return_value = """
+        mock_fetch.return_value = ["""
         <GBSet>
             <GBSeq>
                 <GBSeq_primary-accession>AA123456</GBSeq_primary-accession>
             </GBSeq>
         </GBSet>
-        """
+        """]
         # Mock fallback response
         mock_ncbi.return_value.status_code = 200
         mock_ncbi.return_value.text = ">AA123456 Fallback\nTTTT"

@@ -17,6 +17,12 @@ from pathlib import Path
 from textwrap import wrap
 from typing import Dict, List, Optional, Tuple
 
+# The single source of truth for what a sequence line may contain. This module
+# used to carry its own character class that omitted 'U' and '?', both of which
+# validate_dna_fasta accepts -- so every gap character in an alignment-derived
+# import raised a bogus "Non-IUPAC symbols" warning.
+from app.services.fasta_utils import VALID_DNA_SYMBOLS
+
 logger = logging.getLogger(__name__)
 
 # -----------------------------------------------------------------------------
@@ -305,22 +311,26 @@ def fix_sequence_orientation(
     output_records: List[str] = []
     reversed_headers: List[str] = []
     uncertain_headers: List[str] = []
-    
+    unexpected_symbols: set = set()
+    unexpected_records = 0
+
     for header, seq in records:
         stats["total"] += 1
-        
+
         if not seq:
             stats["empty"] += 1
             logger.warning(f"Empty sequence for '{header}'")
             output_records.append(format_fasta(header, seq))
             continue
-        
-        # Validate sequence (warn about non-IUPAC characters)
-        invalid_chars = re.findall(r"[^ACGTRYMKWSVHDBNacgtrymkwsvhdbn\-]", seq)
-        if invalid_chars:
-            unique_chars = sorted(set(invalid_chars))
-            logger.warning(f"Non-IUPAC symbols in '{header}': {', '.join(unique_chars)}")
-        
+
+        # Collect rather than log per record. One warning per FASTA record made
+        # a single 130-sequence job the single largest source of lines in
+        # errors.log; the aggregate below says the same thing in one line.
+        unexpected = {c for c in seq.upper() if c not in VALID_DNA_SYMBOLS}
+        if unexpected:
+            unexpected_records += 1
+            unexpected_symbols |= unexpected
+
         # Determine orientation
         orientation, fwd_stats, rev_stats = decide_orientation(seq, max_mm)
         stats[orientation] += 1
@@ -341,9 +351,16 @@ def fix_sequence_orientation(
             logger.debug(f"Uncertain orientation for '{header}'")
     
     # Log summary
+    if unexpected_symbols:
+        logger.warning(
+            "event=input.symbols_unexpected records=%s of %s symbols=%s",
+            unexpected_records, stats["total"],
+            "".join(sorted(unexpected_symbols)),
+        )
+
     if reversed_headers:
         logger.info(f"Reversed {len(reversed_headers)} sequence(s): {reversed_headers[:5]}{'...' if len(reversed_headers) > 5 else ''}")
-    
+
     if uncertain_headers:
         logger.debug(f"Uncertain orientation for {len(uncertain_headers)} sequence(s)")
     

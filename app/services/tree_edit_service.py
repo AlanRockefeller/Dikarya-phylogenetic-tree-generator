@@ -13,7 +13,11 @@ from pathlib import Path
 from typing import Dict, Any, List, Optional, Set, Tuple
 from app.config import Config
 from app.models import JobParams, AlignmentParams, TrimmingParams, TreeBuilderParams
-from app.services.artifact_storage import discard_gzipped_form
+from app.services.artifact_storage import (
+    discard_artifact,
+    discard_gzipped_form,
+    gz_path,
+)
 from app.services.security_utils import coerce_bool
 from app.services.subprocess_utils import run_command
 
@@ -33,6 +37,35 @@ MAX_SEQUENCE_OF_INTEREST_LENGTH = 1000
 MAX_SEQUENCE_OF_INTEREST_SOURCE_LENGTH = 64
 MAX_TREE_TIP_NAME_LENGTH = 256
 NEWICK_UNSAFE_TIP_CHARS = frozenset("()[];,:'\"")
+
+
+# Biopython's Newick writer defaults to "%1.5f" for branch lengths, so any
+# branch shorter than 5e-6 is written as 0.00000. That is not a rounding
+# curiosity here: RAxML-NG's minimum branch length is 1e-6 and the trees in
+# var/jobs carry nine decimal places, with hundreds of branches at 6e-9. Every
+# prune, reroot or midpoint-root re-serialized those as exact zeros, so a single
+# viewer edit turned real (if tiny) branches into "identical sequences" for the
+# tree viewer, the downloadable Newick and the Claude review alike. Measured
+# across production jobs, pruned trees carried 3-7x more zero-length branches
+# than the originals they came from.
+#
+# Ten decimal places covers everything the tree builders emit and, unlike a "%g"
+# format, never introduces exponent notation into a file the user may open in
+# FigTree or MEGA.
+NEWICK_BRANCH_LENGTH_FORMAT = "%1.10f"
+
+
+def write_tree_file(tree, path, fmt: str = "newick") -> None:
+    """Serialize a Bio.Phylo tree without silently rounding short branches away.
+
+    Use this instead of Phylo.write() for anything under var/jobs/<id>/tree.
+    Nexus output goes through the same Newick writer, so it takes the same
+    keyword.
+    """
+    Phylo.write(
+        tree, str(path), fmt,
+        format_branch_length=NEWICK_BRANCH_LENGTH_FORMAT,
+    )
 
 
 class DegenerateTreeError(ValueError):
@@ -494,8 +527,8 @@ def rotate_node(job_dir: Path, tree_json: Dict, node_id: str) -> Dict:
 
         valid_path = job_dir / "tree"
         valid_path.mkdir(parents=True, exist_ok=True)
-        Phylo.write(tree, str(valid_path / "tree_pruned.newick"), "newick")
-        Phylo.write(tree, str(valid_path / "tree_pruned.nexus"), "nexus")
+        write_tree_file(tree, str(valid_path / "tree_pruned.newick"), "newick")
+        write_tree_file(tree, str(valid_path / "tree_pruned.nexus"), "nexus")
 
         new_structure = _clade_to_json(tree.root)
         tree_json["current_tree"] = "pruned"
@@ -652,8 +685,8 @@ def prune_taxa(job_dir: Path, tree_json: Dict, taxa_names: List[str]) -> Dict:
         # Save
         valid_path = job_dir / "tree"
         valid_path.mkdir(parents=True, exist_ok=True)
-        Phylo.write(tree, str(valid_path / "tree_pruned.newick"), "newick")
-        Phylo.write(tree, str(valid_path / "tree_pruned.nexus"), "nexus")
+        write_tree_file(tree, str(valid_path / "tree_pruned.newick"), "newick")
+        write_tree_file(tree, str(valid_path / "tree_pruned.nexus"), "nexus")
         
         # Update JSON structure to match
         new_structure = _clade_to_json(tree.root)
@@ -852,7 +885,7 @@ def _write_rerooted_tree(job_dir: Path, tree_json: Dict, tree, root_target: str)
 
     valid_path = job_dir / "tree"
     valid_path.mkdir(parents=True, exist_ok=True)
-    Phylo.write(tree, str(valid_path / "tree_pruned.newick"), "newick")
+    write_tree_file(tree, str(valid_path / "tree_pruned.newick"), "newick")
     logging.info(f"Successfully wrote rerooted tree to {valid_path / 'tree_pruned.newick'}")
 
     return tree_json
@@ -1069,7 +1102,7 @@ def midpoint_root(job_dir: Path, tree_json: Dict) -> Dict:
         # Save physical file
         valid_path = job_dir / "tree"
         valid_path.mkdir(parents=True, exist_ok=True)
-        Phylo.write(tree, str(valid_path / "tree_pruned.newick"), "newick")
+        write_tree_file(tree, str(valid_path / "tree_pruned.newick"), "newick")
         
         return tree_json
         
@@ -1130,7 +1163,7 @@ def undo_midpoint_root(job_dir: Path, tree_json: Dict) -> Dict:
         # Save physical file
         valid_path = job_dir / "tree"
         valid_path.mkdir(parents=True, exist_ok=True)
-        Phylo.write(tree, str(valid_path / "tree_pruned.newick"), "newick")
+        write_tree_file(tree, str(valid_path / "tree_pruned.newick"), "newick")
         
         return tree_json
         
@@ -1339,7 +1372,15 @@ def _reapply_rooting_after_recompute(job_dir: Path, tree_json: Dict[str, Any],
         return tree_json
     except Exception as e:
         log = task_logger or logger
-        log.warning("Failed to reapply %s rooting after recompute: %s", mode, e)
+        from app.services.log_context import log_degradation
+        log_degradation(
+            log,
+            "rooting_not_reapplied",
+            "Failed to reapply rooting after recompute; keeping the tree builder's root",
+            mode=mode,
+            target=previous_target,
+            exception=type(e).__name__,
+        )
         tree_json["root"] = None
         tree_json["root_target"] = None
         tree_json["root_mode"] = ""
@@ -1431,6 +1472,31 @@ def commit_recompute_tree_state(job_dir: Path,
         return state
 
 
+def _discard_abandoned_staging(job_dir: Path, logger) -> None:
+    """Remove staging directories a previous run never got to clean up.
+
+    TemporaryDirectory only cleans up on a normal exit or a Python-level
+    exception. restart-dikarya-worker SIGKILLs the work horse -- a routine,
+    documented operation -- so a kill mid-recompute leaves .recompute-XXXX/
+    holding the whole staged alignment and tree behind. RQ never runs two jobs
+    with the same id at once, so any staging directory still here belongs to a
+    run that is already over.
+    """
+    for stale in sorted(Path(job_dir).glob(".recompute-*")):
+        if not stale.is_dir():
+            continue
+        try:
+            shutil.rmtree(stale, ignore_errors=False)
+            logger.warning(
+                "Removed abandoned recompute staging directory %s", stale.name,
+            )
+        except OSError as exc:
+            logger.warning(
+                "Could not remove abandoned staging directory %s: %s",
+                stale.name, exc,
+            )
+
+
 def recompute_tree(
     job_dir: Path,
     job_params: JobParams,
@@ -1439,6 +1505,102 @@ def recompute_tree(
     event_job_id: Optional[str] = None,
     rq_job=None,
     use_current_input: bool = False
+) -> Dict[str, Any]:
+    """Recompute into an isolated workspace, then install validated outputs.
+
+    External tools write several files over many minutes. Keeping those files
+    outside the live job directory means a timeout, worker restart, or tool
+    crash leaves the previous usable tree intact.
+    """
+    job_dir = Path(job_dir)
+    _discard_abandoned_staging(job_dir, logger)
+    with tempfile.TemporaryDirectory(prefix=".recompute-", dir=job_dir) as tmp:
+        output_dir = Path(tmp)
+        (output_dir / "alignment").mkdir()
+        (output_dir / "tree").mkdir()
+        (job_dir / "logs").mkdir(exist_ok=True)
+        # Alignment/tree services derive their log directory from the output
+        # root. Point that location at the job's durable logs while all data
+        # artifacts remain staged.
+        (output_dir / "logs").symlink_to(
+            (job_dir / "logs").resolve(), target_is_directory=True,
+        )
+        return _recompute_tree_staged(
+            job_dir,
+            job_params,
+            config,
+            logger,
+            event_job_id=event_job_id,
+            rq_job=rq_job,
+            use_current_input=use_current_input,
+            output_dir=output_dir,
+        )
+
+
+def _install_recompute_outputs(job_dir: Path, output_dir: Path) -> None:
+    """Atomically replace each live artifact after the staged run validates."""
+    relative_paths = [
+        Path("alignment/alignment_pruned.fasta"),
+        Path("alignment/alignment_pruned_aligned.fasta"),
+        Path("alignment/alignment_pruned_trimmed.fasta"),
+        Path("tree/tree_pruned.newick"),
+        Path("tree/tree_pruned.nexus"),
+        Path("tree/tree_pruned_metadata.json"),
+    ]
+    missing = [str(path) for path in relative_paths if not (output_dir / path).is_file()]
+    if missing:
+        raise RuntimeError(
+            "Recompute completed without required staged output(s): " + ", ".join(missing)
+        )
+
+    for relative_path in relative_paths:
+        staged = output_dir / relative_path
+        destination = job_dir / relative_path
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        if relative_path.parts[0] == "alignment":
+            discard_gzipped_form(destination)
+        os.replace(staged, destination)
+
+    # run_trimming() compresses reports over 4 KiB in the staging directory
+    # and removes the plain file. Install whichever representation survived,
+    # and clear both live forms first so a run with no report cannot leave an
+    # older generation visible.
+    report_relative = Path("alignment/alignment_pruned_trimmed_report.html")
+    staged_report = output_dir / report_relative
+    staged_report_gz = gz_path(staged_report)
+    live_report = job_dir / report_relative
+    live_report.parent.mkdir(parents=True, exist_ok=True)
+    discard_artifact(live_report)
+    if staged_report.is_file():
+        os.replace(staged_report, live_report)
+    elif staged_report_gz.is_file():
+        os.replace(staged_report_gz, gz_path(live_report))
+
+    # MrBayes writes a family of convergence/result files next to its command
+    # file. Install the family as one generation and remove members left by an
+    # older run (for example run3/run4 files after recomputing with two runs).
+    staged_tree = output_dir / "tree"
+    live_tree = job_dir / "tree"
+    staged_mrbayes = {
+        path.name: path for path in staged_tree.glob("mrbayes_input.nex*")
+        if path.is_file()
+    }
+    for old_path in live_tree.glob("mrbayes_input.nex*"):
+        if old_path.is_file() and old_path.name not in staged_mrbayes:
+            old_path.unlink()
+    for name, staged in staged_mrbayes.items():
+        os.replace(staged, live_tree / name)
+
+
+def _recompute_tree_staged(
+    job_dir: Path,
+    job_params: JobParams,
+    config: Config,
+    logger,
+    event_job_id: Optional[str] = None,
+    rq_job=None,
+    use_current_input: bool = False,
+    output_dir: Optional[Path] = None,
 ) -> Dict[str, Any]:
     """
     Re-run the alignment, trimming, and tree inference pipeline 
@@ -1488,21 +1650,24 @@ def recompute_tree(
     # (which sequences, which rooting intent to fall back on); it is never the
     # thing written back at the end -- see commit_recompute_tree_state().
     tree_json = load_tree_state(job_dir)
+    # Record which generation of tree_state.json this run captured. A second
+    # Recompute click carries no body of its own, so this is the only way the
+    # endpoint can tell "the same request again" from "the user pruned three
+    # more taxa after this run started", which this run will never see.
+    if rq_job is not None:
+        try:
+            rq_job.meta["tree_state_snapshot_mtime"] = (
+                job_dir / "tree_state.json"
+            ).stat().st_mtime
+            rq_job.save_meta()
+        except Exception as exc:  # pragma: no cover - never fail a run over meta
+            logger.warning("Could not record tree_state snapshot time: %s", exc)
 
     # 2. Extract pruned FASTA
     # We need the original input (unaligned)
     input_raw = job_dir / "input" / "input_raw.fasta"
-    alignment_pruned_path = job_dir / "alignment" / "alignment_pruned.fasta" # Unaligned input for re-run
-
-    # Everything this recompute derives is rebuilt below. Drop any gzipped
-    # copies the cold-artifact sweep made of the previous run's outputs so the
-    # job does not end up holding both forms.
-    for stale in (
-        "alignment_pruned_aligned.fasta",
-        "alignment_pruned_trimmed.fasta",
-        "alignment_pruned_trimmed_report.html",
-    ):
-        discard_gzipped_form(job_dir / "alignment" / stale)
+    output_dir = Path(output_dir or job_dir)
+    alignment_pruned_path = output_dir / "alignment" / "alignment_pruned.fasta" # Unaligned input for re-run
 
     start_step("input", "Sequence Queue", "Preparing queued sequences")
     if use_current_input:
@@ -1529,7 +1694,7 @@ def recompute_tree(
     # For now, let's reuse original params or defaults.
     
     align_params = job_params.alignment_params or AlignmentParams(method="default")
-    alignment_pruned_aligned_path = job_dir / "alignment" / "alignment_pruned_aligned.fasta" # Result of alignment
+    alignment_pruned_aligned_path = output_dir / "alignment" / "alignment_pruned_aligned.fasta" # Result of alignment
     
     from app.services.alignment_service import run_alignment
     align_method = (align_params.method or "default").lower()
@@ -1542,7 +1707,7 @@ def recompute_tree(
     
     # 4. Re-trim
     trim_params = job_params.trimming_params or TrimmingParams(method="none")
-    alignment_pruned_trimmed_path = job_dir / "alignment" / "alignment_pruned_trimmed.fasta"
+    alignment_pruned_trimmed_path = output_dir / "alignment" / "alignment_pruned_trimmed.fasta"
     
     from app.services.trimming_service import run_trimming, describe_trim_step, format_trimming_detail
     trim_method = (trim_params.method or "none").lower()
@@ -1578,8 +1743,8 @@ def recompute_tree(
     
     # 5. Re-build Tree
     tree_params = job_params.tree_builder_params or TreeBuilderParams(method="nj")
-    tree_pruned_newick = job_dir / "tree" / "tree_pruned.newick"
-    tree_pruned_nexus = job_dir / "tree" / "tree_pruned.nexus"
+    tree_pruned_newick = output_dir / "tree" / "tree_pruned.newick"
+    tree_pruned_nexus = output_dir / "tree" / "tree_pruned.nexus"
     
     from app.services.tree_builder_service import run_tree_builder
     tree_method = (tree_params.method or "nj").lower()
@@ -1603,6 +1768,13 @@ def recompute_tree(
     # the duration. The snapshot loaded in step 1 is therefore stale by now, so
     # the new topology is merged into whatever the state is at commit time.
     new_structure = parse_newick_to_json(tree_pruned_newick)
+
+    # Write metadata into the same staged tree and validate every required
+    # artifact before any live file is replaced.
+    with open(output_dir / "tree" / "tree_pruned_metadata.json", "w") as f:
+        json.dump(metadata, f, indent=2)
+    _install_recompute_outputs(job_dir, output_dir)
+
     tree_json = commit_recompute_tree_state(
         job_dir,
         new_structure,
@@ -1610,16 +1782,13 @@ def recompute_tree(
         task_logger=logger,
     )
 
-    # Save metadata
-    with open(job_dir / "tree" / "tree_pruned_metadata.json", "w") as f:
-        json.dump(metadata, f, indent=2)
     finish_step("post", "All files ready")
     overview("Recompute complete")
         
     return {
         "status": "completed",
-        "newick": str(tree_pruned_newick),
-        "nexus": str(tree_pruned_nexus),
+        "newick": str(job_dir / "tree" / "tree_pruned.newick"),
+        "nexus": str(job_dir / "tree" / "tree_pruned.nexus"),
         "metadata": metadata
     }
 
@@ -2150,7 +2319,7 @@ def initialize_tree(job_dir: Path) -> Path:
         ensure_unique_labels(tree)
         
         # Save to pruned
-        Phylo.write(tree, str(pruned_path), "newick")
+        write_tree_file(tree, str(pruned_path), "newick")
         
         # Initialize basic state JSON too -- but only when the job genuinely has
         # none. This is reached from a plain Newick download, and renames,

@@ -551,6 +551,15 @@ body.journal-page {
     .journal-section {
         padding: var(--space-xl) var(--space-md);
     }
+
+    .ai-policy-page-header h1 {
+        font-size: 2rem;
+    }
+
+    .ai-policy-content {
+        margin: var(--space-md);
+        padding: var(--space-lg);
+    }
 }
 
 [data-theme="dark"] .journal-btn-text {

@@ -94,20 +94,45 @@ def _api_request(table: str, *, params: Optional[Dict[str, Any]] = None,
             payload = json.loads(response.read().decode("utf-8", errors="replace") or "{}")
     except urllib.error.HTTPError as exc:
         status = 502 if exc.code >= 500 else exc.code
+        logger.warning(
+            "Mushroom Observer API HTTP error table=%s method=%s status=%s",
+            table, method, exc.code,
+        )
         raise MushroomObserverError(
             f"Mushroom Observer API returned HTTP {exc.code}.", status=status
         )
     except urllib.error.URLError as exc:
-        logger.warning("Mushroom Observer API network error: %s", exc.reason)
+        logger.warning(
+            "Mushroom Observer API network error table=%s method=%s reason=%s",
+            table, method, exc.reason,
+        )
         raise MushroomObserverError("Mushroom Observer could not be reached.", status=502)
-    except (TimeoutError, ValueError):
+    except TimeoutError:
+        logger.warning(
+            "Mushroom Observer API timed out table=%s method=%s", table, method
+        )
+        raise MushroomObserverError("Mushroom Observer returned an invalid response.", status=502)
+    except ValueError:
+        logger.warning(
+            "Mushroom Observer API returned invalid JSON table=%s method=%s",
+            table, method,
+        )
         raise MushroomObserverError("Mushroom Observer returned an invalid response.", status=502)
 
     errors = payload.get("errors") if isinstance(payload, dict) else None
     if errors:
         detail = str((errors[0] or {}).get("details") or "Mushroom Observer API error.")
-        raise MushroomObserverError(detail[:300], status=502)
+        safe_detail = _clean_text(detail, 300)
+        logger.warning(
+            "Mushroom Observer API error payload table=%s method=%s detail=%s",
+            table, method, safe_detail,
+        )
+        raise MushroomObserverError(safe_detail, status=502)
     if not isinstance(payload, dict):
+        logger.warning(
+            "Mushroom Observer API returned non-object JSON table=%s method=%s type=%s",
+            table, method, type(payload).__name__,
+        )
         raise MushroomObserverError("Mushroom Observer returned an invalid response.", status=502)
     return payload
 

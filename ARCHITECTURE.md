@@ -165,7 +165,9 @@ The design point is that **the model never sees the sequences**. Every number �
 gap fraction, column occupancy, parsimony-informative count, mean pairwise
 identity, support distribution, long-branch outliers — is computed here from
 `alignment/alignment_trimmed.fasta` and the current Newick, and only that
-summary (8–17 KB of JSON on the real corpus) goes to the API. Counting is work
+summary (median 27 KB, max 30 KB over a 60-job sample) goes to the API. The
+summary is bounded by construction — every list in it is capped at TOP_N — so
+prompt size does not grow with alignment size. Counting is work
 code does exactly and a language model does slowly; the model is used only for
 the judgement of reading those numbers together.
 
@@ -186,9 +188,105 @@ Three consequences follow:
 Support values are classified with the same rules as the viewer's support badge
 (`tree_viewer_phylotree_v2.js`), including resolving IQ-TREE's dual
 `SH-aLRT/UFBoot` labels, so the review and the badge can never disagree about a
-node. The scale's meaning is sent with the numbers — FastTree's 0–1 SH-like
-support in particular is neither a bootstrap proportion nor a posterior
-probability, and is routinely misread as one.
+node. Both sides read the *same resolved builder*: `resolve_tree_support_context()`
+is what fills `window.TREE_METHOD`, so a recomputed job whose displayed tree was
+rebuilt by a different builder cannot classify one way on the badge and another
+in the review. The classification is **method-first**: the builder that wrote the file
+decides the scale, and the magnitude of the values is consulted only for a
+builder neither side recognises. RAxML-NG writes bootstrap values of `0`, `1`
+and `0.95` for badly supported clades, and the older "everything ≤ 1 must be a
+posterior" rule relabelled those trees as Bayesian. The scale's meaning is sent
+with the numbers — FastTree's 0–1 SH-like support in particular is neither a
+bootstrap proportion nor a posterior probability, and is routinely misread as
+one.
+
+The two implementations are pinned to one another by
+`tests/fixtures/support_classification_cases.json`.
+`tests/test_tree_analysis_metrics.py` runs every case against `_classify_support()`
+in Python and, under `node`, against `window.classifySupportType()` from the
+viewer file, so the pair cannot drift apart silently. Add a case there rather
+than to either implementation alone.
+
+### Metric contracts worth knowing
+
+- **Column tallies are exact only when the whole alignment was scored.** Past
+  `MAX_ALIGNMENT_CELLS` the columns are sampled, and the bare counts
+  (`parsimony_informative_columns`, `columns_below_50_percent_occupancy`,
+  `all_gap_columns`) are then *absent* — replaced by `*_estimated` siblings
+  scaled from the sample, with `column_metrics_are_estimates: true` covering the
+  lot. A name without the suffix therefore always means an exact count. The
+  viewer's facts strip follows the same rule and labels an estimate as one.
+- **Occupancy is non-gap occupancy.** An ambiguous base such as `N` occupies its
+  column but contributes no state to the parsimony-informative test, so 100%
+  occupancy is not 100% confidently called bases. The ambiguity fields carry
+  that separately, and `alignment.occupancy_definition` says so in the prompt.
+- **Rooting comes from `tree_state.json`, not from topology.** Dikarya
+  midpoint-roots by default, so neither a null `outgroup` nor a root of degree 3
+  means the tree is unrooted. `tree.rooting` reports `root_mode`, `root_target`
+  and `is_midpoint_rooted`. Two different negatives are kept apart:
+  `state_known: false` means the file could not be read, and
+  `rooting_known: false` means it was read but carries no rooting information --
+  which every rename and prune produces, and which the old code reported as
+  *explicitly unrooted*. Only an explicit mode, or an explicit
+  `is_midpoint_rooted: true`, licenses a statement about the rooting. The root is
+  likewise never counted as a polytomy, and the Newick root's degree is reported
+  separately as `file_root_degree` (renamed from `root_degree`, which read as the
+  viewer's rooting state).
+- **Internal nodes are informative splits, not Newick nodes.** An unrooted binary
+  tree written through a rooted Newick root has an artificial root whose two
+  children are the two sides of one bipartition. They are merged into a single
+  edge, with the two half-lengths summed and the one support label that either
+  side carries -- previously they were two nodes, one of them a phantom
+  unsupported one, and the edge appeared in the quantiles at half its length.
+  `artificial_root_edge_merged` says whether that happened.
+- **Long-branch outliers are cut from the positive terminal branches only.** The
+  rule is `max(Q3 + 3*IQR, 5*median)` over those, published verbatim as
+  `outlier_rule`. On a tree dominated by zero-length tips -- the common shape
+  here -- the old quartiles were both zero, the cut collapsed to zero, and a
+  40x branch was reported as no outlier at all; the 5x-median floor stops the
+  opposite failure, where a tight cluster of tiny lengths makes every slightly
+  longer branch a false suspect. Quantiles and branch lengths below 1e-4 keep
+  three significant figures rather than rounding to six decimals, for the same
+  reason `write_tree_file()` exists.
+- **The alignment says what it is.** `alignment_is_tree_builder_input`,
+  `alignment_is_trim_output` and `alignment_restricted_to_current_tips` are
+  reported rather than assumed. After a recompute the displayed tree came from
+  `alignment_pruned_trimmed.fasta`, not from `alignment_trimmed.fasta`, and
+  `alignment_pruned_aligned.fasta` is realigned rather than trimmed --
+  `columns_removed_by_trimming` is published only for a genuine trim pair (named
+  in `trimming_measured_from`) with `trimming_method != none`. When the row set
+  was restricted to the displayed tips, `scope_note` says so and says that
+  support was estimated on the full builder alignment.
+- **IQ-TREE has three support scales, not one.** `UFBOOT` (ultrafast bootstrap,
+  strong at 95 and with no conventional moderate band -- the classical 70 does
+  not apply), `ALRT` (SH-aLRT only, when `-alrt` ran without `-B`, strong at 80)
+  and `ALRT_UFBOOT` (the dual label). `moderate_support_threshold` is null for
+  scales with no middle band, and no `at_least_moderate_percent` is published for
+  them.
+- **Support is stratified by the branch it sits on.**
+  `support_by_subtending_branch_length` splits scored splits at 1e-6, so weak
+  support inside a cluster of near-identical sequences is distinguishable from a
+  weakly supported backbone without the model doing the partition itself.
+- **A missing branch length is not a zero one.** `zero_length_terminal_branches`
+  counts tips whose length is present and non-positive;
+  `tips_missing_branch_length` counts tips with no length at all, and those are
+  excluded from the quantiles, the total, the outlier cut and the longest-tip
+  ranking rather than entered as zeros.
+- **Truncated lists carry their totals.** `outlier_tip_count`,
+  `identical_sequence_group_count` and `sequences_in_identical_groups_total` are
+  computed before the `TOP_N` slice, and each identical-sequence group keeps its
+  own `count` plus a `names_truncated` flag.
+- **`_validate_review()` enforces the contract, not just key presence.** Ratings
+  and severities must be in their `RESPONSE_SCHEMA` enums and every field must
+  have its declared type before a reply is cached or rendered. It also enforces
+  the 140-character headline, that every `sequences_to_inspect[].name` resolves
+  to a tip the viewer is currently showing, and the two rating/severity
+  combinations the prompt rules out (`strong` with a high-severity concern,
+  `unreliable` with none). A failure here raises `TreeAnalysisUpstreamError` and
+  the endpoint answers **502**: the browser's request was fine, the model's reply
+  was not. A dataset with nothing to review is still 400. The viewer's
+  fallback for an unexpected rating is a neutral grey *Unrated* chip — never the
+  "Usable" styling, which would dress a malformed answer up as a favourable one.
 
 ### Backends
 
@@ -211,7 +309,7 @@ The pinned invocation is `--tools ""` (no tools — this is one inference call, 
 an agent), `--safe-mode` (no CLAUDE.md, skills, plugins, hooks, MCP),
 `--strict-mcp-config`, `--disable-slash-commands`, `--no-session-persistence`,
 plus `--system-prompt` and `--json-schema` read from root-owned files in
-`/etc/dikarya/claude-review/`, and `--max-budget-usd` as a hard spend stop. It
+`/etc/dikarya-claude-review/`, and `--max-budget-usd` as a hard spend stop. It
 runs from an empty scratch directory so there is no project config to discover
 in the first place. Model, effort, timeout and budget arrive as environment
 variables and are checked against allowlists before reaching the CLI.
@@ -224,13 +322,54 @@ Measured on a 147-sequence job, `cli` backend, Claude Opus 5:
 
 | Effort | Wall clock | Cost | Verdict |
 |---|---|---|---|
-| `low` (default) | ~60–90 s | ~$0.24 | same |
-| `medium` | ~156 s | ~$0.35 | same |
+| `low` (default) | 69–136 s | $0.24–$0.48 | same |
+| `medium` | ~200 s | ~$0.39 | same |
+
+Measured end-to-end through the installed wrapper. The spread tracks prompt
+size; the high end of each row is a ~27 KB prompt, at or above the largest seen
+in a 500-job sample. `medium` at that size leaves only ~40 s under the wrapper's
+240 s cap, which is why `low` is the default and why the wrapper's own fallback
+was changed to match it — if `env_keep` ever stops propagating
+`DIKARYA_CLAUDE_EFFORT`, the fallback must be the path that fits.
+
+Gunicorn's `--timeout 120` does **not** abort these. That timeout is a worker
+heartbeat, and the `gthread` worker keeps notifying the arbiter while a request
+occupies a thread — `POST /tree/recompute` has returned 200 after 1751 s in this
+deployment. The binding limits are the ones in the chain above.
 
 `low` is the default because the request is synchronous and nginx's
 `proxy_read_timeout` for `location /` is 300 s. The CLI also carries ~17–28 K
 tokens of Claude Code harness context per invocation, cached after the first
 call — this is why the `api` backend is cheaper if a key is available.
+
+**Usage accounting.** Every *billed* review appends one JSON line to
+`var/logs/claude_reviews.jsonl` (`_append_usage_log()`); cache hits never reach
+it, so the totals are what the feature actually consumed rather than how often
+the button was pressed. `/admin/monitoring` aggregates the last 30 days from it
+via `get_ai_usage()` in `app/monitoring/services.py`. Writing the log is
+best-effort and every failure is swallowed — a monitoring line must never cost a
+user their review.
+
+A Redis counter enforces a site-wide allowance of 25 new reviews per UTC day;
+cache hits do not consume it. The dated key is seeded from the usage log when it
+is first created, so deploying the guard partway through a day or restarting
+Redis does not reset completed usage. Reservations are not refunded after a
+model failure because a timeout or unusable reply may still have incurred cost.
+If Redis cannot verify the counter, new reviews fail closed while cached reviews
+remain available.
+
+`scripts/dikarya_backfill_review_usage.py` replays reviews already cached on
+disk into the log, keyed on `(job_id, ts)` so it is safe to re-run. It writes to
+`var/logs`, which is dikarya-owned, so agents cannot run it:
+
+```bash
+sudo -u dikarya /var/www/dikarya/.venv/bin/python \
+    /var/www/dikarya/scripts/dikarya_backfill_review_usage.py --dry-run
+```
+
+Note `/admin/monitoring` is unauthenticated, so these usage totals are public.
+They expose no job or user data, but they do reveal how much the feature is
+being used.
 
 **Configuration** (unconfigured → button not rendered, endpoint answers 503):
 
@@ -245,6 +384,7 @@ call — this is why the `api` backend is cheaper if a key is available.
 | `CLAUDE_REVIEW_MAX_BUDGET_USD` | `1.00` | Per-invocation spend stop (`cli`) |
 | `CLAUDE_REVIEW_TIMEOUT_SECONDS` | `240` | Hard cap; must stay under nginx's 300 s |
 | `CLAUDE_REVIEW_MAX_CONCURRENT` | `2` | Global in-flight ceiling |
+| `CLAUDE_REVIEW_MAX_DAILY` | `25` | Site-wide new reviews per UTC day; cache hits excluded |
 
 ### Installing the `cli` backend (root)
 
@@ -255,29 +395,55 @@ install -o root -g root -m 0440 \
     /var/www/dikarya/ops/sudoers/dikarya-claude /etc/sudoers.d/dikarya-claude
 visudo -c
 
-mkdir -p /etc/dikarya/claude-review
+mkdir -p /etc/dikarya-claude-review
+chmod 0755 /etc/dikarya-claude-review
 cd /var/www/dikarya
 .venv/bin/python scripts/dikarya_export_review_prompt.py system \
-    > /etc/dikarya/claude-review/system_prompt.txt
+    > /etc/dikarya-claude-review/system_prompt.txt
 .venv/bin/python scripts/dikarya_export_review_prompt.py schema \
-    > /etc/dikarya/claude-review/schema.json
-chmod 0444 /etc/dikarya/claude-review/*
+    > /etc/dikarya-claude-review/schema.json
+chmod 0444 /etc/dikarya-claude-review/*
 
 sudo /usr/local/sbin/restart-dikarya-web
 ```
 
 The system prompt and schema live in `/etc` rather than the repo so the web
-process cannot rewrite the reviewer's own instructions. That makes them a copy,
+process cannot rewrite the reviewer's own instructions. They sit in their own
+top-level directory rather than under `/etc/dikarya/`, because that directory is
+`drwx------ root root` — it holds `dikarya.environment.live` — and the wrapper
+runs as `tree`, which cannot traverse it. Loosening the mode on the secrets
+directory to fix that would be the wrong trade; a separate directory costs
+nothing and leaves it untouched. That makes them a copy,
 and copies go stale — `dikarya_export_review_prompt.py --check` compares them
 against the code and exits non-zero on drift. Run it after any change to
 `SYSTEM_PROMPT` or `RESPONSE_SCHEMA`.
 
 The review runs inside a Gunicorn request slot, and there are only
 `4 workers x 2 threads = 8` of them. Flask-Limiter caps one client but cannot
-stop eight different users from taking every slot, so a Redis counter
-(`dikarya:claude_review:in_flight`) enforces a global ceiling and returns 503
-past it. That counter has a 900 s expiry so a killed worker cannot leak a slot
-permanently.
+stop eight different users from taking every slot, so Redis enforces a global
+ceiling and returns 503 past it. The registry (`dikarya:claude_review:in_flight`)
+is a **sorted set of request tokens scored by acquisition time**, not a counter:
+entries older than the worst-case transport time plus a 30 s grace are dropped
+before the ceiling is checked, so a worker killed mid-review leaks its slot for
+one timeout
+rather than until a shared expiry, a *rejected* request can no longer postpone
+that expiry by touching the key, and there is no counter to drive negative when a
+release races an expiry.
+
+A second guard stops the same review being bought twice.
+`dikarya:claude_review:lock:<fingerprint>` is taken with `SET NX` before the slot
+and before the daily reservation, and released with a delete-if-owned script, so
+a double click, a reload mid-call, or two people on a shared link produce one
+Claude call and one charge; the duplicate gets **409** with `Retry-After`.
+
+Both lifetimes come from `_max_transport_seconds()`, which is the timeout for the
+CLI backend and `(CLAUDE_API_MAX_RETRIES + 1) x` the timeout for the API one. The
+Anthropic SDK applies its timeout **per attempt**, so an API review that retries a
+529 can legitimately run for two full timeouts; a lifetime of one timeout expired
+underneath it and let the next request take the same fingerprint lock and buy the
+same review twice -- the one thing this guard exists to prevent. Both
+guards degrade to "unlimited" if Redis is unreachable, matching the existing
+fail-safe intent -- only the daily spending guard fails closed.
 
 ## Runtime & Deployment
 - **Environment**: Remote Linux Server

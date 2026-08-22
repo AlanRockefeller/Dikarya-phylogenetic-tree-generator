@@ -181,6 +181,126 @@
         </div>
     </div>
 
+    <!-- Claude Review (AI) usage -->
+    <div class="bg-white dark:bg-journal-green rounded-xl shadow-lg overflow-hidden transition-colors">
+        <div class="bg-journal-dark px-5 py-3 border-b border-journal-green flex items-center justify-between">
+            <h3 class="text-white font-semibold flex items-center">
+                <i class="fas fa-wand-magic-sparkles text-journal-gold mr-2"></i>AI Review Usage
+                <span class="ml-2 text-xs font-normal text-gray-400">last {{ ai_usage.days }} days</span>
+            </h3>
+            {% if ai_usage.enabled %}
+            <span class="px-2 py-0.5 rounded-full text-xs font-bold bg-green-100 text-green-800 dark:bg-green-900 dark:text-green-200">Enabled</span>
+            {% else %}
+            <span class="px-2 py-0.5 rounded-full text-xs font-bold bg-gray-200 text-gray-700 dark:bg-journal-dark dark:text-gray-300">Disabled</span>
+            {% endif %}
+        </div>
+
+        <div class="p-5">
+        {% if not ai_usage.available or ai_usage.total_reviews == 0 %}
+            <p class="text-gray-500 dark:text-gray-400 italic">
+                No AI reviews recorded yet.
+                {% if not ai_usage.available %}The usage log is created the first time a review runs.{% endif %}
+            </p>
+        {% else %}
+            <!-- Totals -->
+            <div class="grid grid-cols-2 md:grid-cols-4 gap-4 mb-6">
+                <div class="bg-gray-50 dark:bg-journal-dark rounded-lg p-4">
+                    <p class="text-xs uppercase tracking-wider text-gray-500 dark:text-gray-400">Reviews run</p>
+                    <p class="text-2xl font-bold text-journal-dark dark:text-gray-100">{{ ai_usage.total_reviews }}</p>
+                    <p class="text-xs text-gray-500 dark:text-gray-400 mt-1">cache hits not counted</p>
+                </div>
+                <div class="bg-gray-50 dark:bg-journal-dark rounded-lg p-4">
+                    <p class="text-xs uppercase tracking-wider text-gray-500 dark:text-gray-400">Est. usage value</p>
+                    <p class="text-2xl font-bold text-journal-dark dark:text-gray-100">
+                        {% if ai_usage.cost_available %}${{ '%.2f'|format(ai_usage.total_cost_usd) }}{% else %}Unavailable{% endif %}
+                    </p>
+                    <p class="text-xs text-gray-500 dark:text-gray-400 mt-1">plan usage, not billed</p>
+                </div>
+                <div class="bg-gray-50 dark:bg-journal-dark rounded-lg p-4">
+                    <p class="text-xs uppercase tracking-wider text-gray-500 dark:text-gray-400">Avg duration</p>
+                    <p class="text-2xl font-bold text-journal-dark dark:text-gray-100">{{ ai_usage.avg_seconds }}<span class="text-base font-normal">s</span></p>
+                    <p class="text-xs text-gray-500 dark:text-gray-400 mt-1">per uncached review</p>
+                </div>
+                <div class="bg-gray-50 dark:bg-journal-dark rounded-lg p-4">
+                    <p class="text-xs uppercase tracking-wider text-gray-500 dark:text-gray-400">Tokens</p>
+                    <p class="text-2xl font-bold text-journal-dark dark:text-gray-100">
+                        {{ (ai_usage.total_output_tokens / 1000)|round(1) }}k<span class="text-base font-normal"> out</span>
+                    </p>
+                    <p class="text-xs text-gray-500 dark:text-gray-400 mt-1">{{ (ai_usage.total_input_tokens / 1000)|round(0)|int }}k in</p>
+                </div>
+            </div>
+
+            <!-- Daily chart: bar height is reviews that day, gold overlay is spend -->
+            <div class="overflow-x-auto">
+                <svg viewBox="0 0 620 150" preserveAspectRatio="none" class="w-full h-40" role="img"
+                     aria-label="Claude reviews per day over the last {{ ai_usage.days }} days">
+                    <!-- gridlines -->
+                    {% for frac in [0, 0.25, 0.5, 0.75, 1.0] %}
+                    <line x1="30" x2="620" y1="{{ 110 - (frac * 100) }}" y2="{{ 110 - (frac * 100) }}"
+                          class="stroke-gray-200 dark:stroke-journal-dark" stroke-width="1" />
+                    {% endfor %}
+                    <!-- y axis labels -->
+                    {% for frac in [0, 0.5, 1.0] %}
+                    <text x="26" y="{{ 114 - (frac * 100) }}" text-anchor="end"
+                          class="fill-gray-500 dark:fill-gray-400" font-size="9">
+                        {{ (ai_usage.max_daily_reviews * frac)|round(0)|int }}
+                    </text>
+                    {% endfor %}
+
+                    {% set bar_w = 590 / ai_usage.series|length %}
+                    {% for point in ai_usage.series %}
+                        {% set h = (point.reviews / ai_usage.max_daily_reviews * 100) if ai_usage.max_daily_reviews else 0 %}
+                        <rect x="{{ 30 + loop.index0 * bar_w }}" y="{{ 110 - h }}"
+                              width="{{ bar_w - 2 }}" height="{{ h }}" rx="1"
+                              class="fill-journal-gold hover:fill-yellow-500 transition-colors">
+                            <title>{{ point.date }}: {{ point.reviews }} review{{ '' if point.reviews == 1 else 's' }}{% if point.cost_available %}, ${{ '%.2f'|format(point.cost) }}{% else %}, cost unavailable{% endif %}</title>
+                        </rect>
+                        {% if loop.index0 % 5 == 0 or loop.last %}
+                        <text x="{{ 30 + loop.index0 * bar_w + bar_w / 2 }}" y="126" text-anchor="middle"
+                              class="fill-gray-500 dark:fill-gray-400" font-size="8">{{ point.label }}</text>
+                        {% endif %}
+                    {% endfor %}
+                    <line x1="30" x2="620" y1="110" y2="110" class="stroke-gray-400 dark:stroke-gray-500" stroke-width="1" />
+                </svg>
+            </div>
+            <p class="text-xs text-gray-500 dark:text-gray-400 mt-1 text-center">
+                Reviews per day &mdash; hover a bar for the date, count and estimated value
+            </p>
+
+            <!-- Verdict + model breakdown -->
+            <div class="grid grid-cols-1 md:grid-cols-2 gap-6 mt-6 pt-5 border-t border-gray-100 dark:border-journal-dark">
+                <div>
+                    <p class="text-xs uppercase tracking-wider text-gray-500 dark:text-gray-400 mb-2">Verdicts</p>
+                    {% if ai_usage.by_rating %}
+                    <div class="space-y-1">
+                        {% for rating, count in ai_usage.by_rating.items() %}
+                        <div class="flex items-center justify-between text-sm">
+                            <span class="capitalize text-gray-700 dark:text-gray-200">{{ rating }}</span>
+                            <span class="font-mono text-gray-600 dark:text-gray-300">{{ count }}</span>
+                        </div>
+                        {% endfor %}
+                    </div>
+                    {% else %}
+                    <p class="text-sm text-gray-500 dark:text-gray-400 italic">none recorded</p>
+                    {% endif %}
+                </div>
+                <div>
+                    <p class="text-xs uppercase tracking-wider text-gray-500 dark:text-gray-400 mb-2">Models</p>
+                    <div class="space-y-1">
+                        {% for model, count in ai_usage.models.items() %}
+                        <div class="flex items-center justify-between text-sm">
+                            <span class="font-mono text-xs text-gray-700 dark:text-gray-200">{{ model }}</span>
+                            <span class="font-mono text-gray-600 dark:text-gray-300">{{ count }}</span>
+                        </div>
+                        {% endfor %}
+                    </div>
+                    <p class="text-xs text-gray-500 dark:text-gray-400 mt-3">Last review: {{ ai_usage.last_review }}</p>
+                </div>
+            </div>
+        {% endif %}
+        </div>
+    </div>
+
     <!-- JSON endpoint links -->
     <div class="bg-white dark:bg-journal-green rounded-xl shadow p-4 text-xs text-gray-500 dark:text-gray-400">
         JSON endpoints:

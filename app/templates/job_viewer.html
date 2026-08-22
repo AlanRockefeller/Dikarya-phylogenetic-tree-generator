@@ -1300,7 +1300,11 @@
 
 <script>
     window.JOB_ID = "{{ job_id }}";
-    window.TREE_METHOD = "{{ job_details.get('tree_method', '') }}";
+    // Alan 8/22/26 - Resolved server-side (tree_analysis_service.resolve_tree_support_context)
+    // so the support badge and the Claude review classify the same tree the same way, including
+    // after a recompute, where the displayed tree's builder metadata is the pruned one.
+    window.TREE_METHOD = "{{ tree_support_context.tree_method }}";
+    window.TREE_SUPPORT_CONTEXT = {{ tree_support_context|tojson }};
     window.VIEW_ONLY = {{ 'true' if view_only else 'false' }};
     window.SEQUENCE_METRICS = {{ job_details.get('sequence_metadata', [])|tojson }};
 </script>
@@ -1310,15 +1314,22 @@
     window.d3v7 = window.d3; // Critical for your v2 renderer
 </script>
 
+<script src="{{ url_for('static', filename='vendor/lodash-4.min.js') }}?v=1"></script>
+<script>
+    // phylotree 2.2.1's browser bundle expects Lodash as `_$1` and
+    // Underscore as `_`. Preserve Lodash before Underscore claims `_` below.
+    window._$1 = window._;
+</script>
+
 <script src="{{ url_for('static', filename='vendor/underscore-1.13.6-min.js') }}"></script>
 
 <script src="{{ url_for('static', filename='js/phylotree.js') }}?v=9"></script>
 
-<script src="{{ url_for('static', filename='js/tree_viewer_phylotree_v2.js') }}?v=66"></script>
+<script src="{{ url_for('static', filename='js/tree_viewer_phylotree_v2.js') }}?v=69"></script>
 
 <script src="{{ url_for('static', filename='js/tree_viewer_api.js') }}?v=6"></script>
 
-<script src="{{ url_for('static', filename='js/tree_viewer_controller.js') }}?v=62"></script>
+<script src="{{ url_for('static', filename='js/tree_viewer_controller.js') }}?v=63"></script>
 
 {% include 'partials/alignment_viewer_modal.html' %}
 

@@ -1,4 +1,4 @@
-g ---- Secrets / local env ----
+>g ---- Secrets / local env ---0
 .env
 .env.*
 !.env.example
@@ -66,5 +66,5 @@ dosage-calculator/
 /app/static/files/
 /amanitaceae
 mycomap.com.api.md
-chatgpt_project_context.txt
+chatgpt_project_context*
 mycomap_api_documentation.md

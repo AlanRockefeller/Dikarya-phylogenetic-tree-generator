@@ -58,7 +58,33 @@ class Config:
     MUSCLE_BINARY = os.environ.get('MUSCLE_BINARY', 'muscle')
     CLUSTALO_BINARY = os.environ.get('CLUSTALO_BINARY', 'clustalo')
     TRIMAL_BINARY = os.environ.get('TRIMAL_BINARY', 'trimal')
-    BMGE_BINARY = os.environ.get('BMGE_BINARY', 'bmge')
+    # BMGE is the only Java tool in the pipeline, and that matters: the conda
+    # `bmge` shim is `exec java -Xmx128G -jar .../BMGE.jar`, and a JVM cannot
+    # reserve a 128 GB heap under the RLIMIT_AS below. It died at VM init in
+    # ~185 ms with "Could not reserve enough space for object heap" on stdout,
+    # which read as a bare "BMGE failed with exit code 1" after the alignment
+    # had already run. Point at the jar so trimming_service can size -Xmx from
+    # SUBPROCESS_MEMORY_LIMIT_MB; the shim path still works if the jar is
+    # missing, but only while no memory limit is set.
+    BMGE_BINARY = os.environ.get(
+        'BMGE_BINARY', '/home/tree/miniforge3/share/bmge-1.12-1/BMGE.jar'
+    )
+    # Share of SUBPROCESS_MEMORY_LIMIT_MB the JVM may use as heap. RLIMIT_AS
+    # counts *reserved* address space, and a JVM reserves far more than -Xmx:
+    # metaspace, compressed class space, code cache, thread stacks and GC
+    # structures all sit outside the heap and scale with it. A fixed headroom
+    # was measured to be unreliable (-Xmx8192m under a 9216 MB cap still died
+    # on the compressed class space); a proportion plus the explicit non-heap
+    # caps below starts cleanly from 4 GB upward.
+    JVM_HEAP_PERCENT = int(os.environ.get('JVM_HEAP_PERCENT', '60'))
+    # A JVM reserves a 1 GB compressed class space by default regardless of
+    # heap size, which is what makes small limits fail outright. Capping it and
+    # metaspace keeps the total reservation proportional to the limit.
+    JVM_CLASS_SPACE_MB = int(os.environ.get('JVM_CLASS_SPACE_MB', '128'))
+    JVM_METASPACE_MB = int(os.environ.get('JVM_METASPACE_MB', '256'))
+    # Below this the JVM cannot reserve its own fixed structures under
+    # RLIMIT_AS at any heap size, so BMGE simply cannot run.
+    JVM_MIN_ADDRESS_SPACE_MB = int(os.environ.get('JVM_MIN_ADDRESS_SPACE_MB', '4096'))
     FASTTREE_BINARY = os.environ.get('FASTTREE_BINARY', '/usr/local/bin/FastTree')
 
     # Resource ceilings applied to every external tool we spawn (see
@@ -146,6 +172,8 @@ class Config:
     # Ceiling on reviews running at once, enforced with a Redis counter. Rate limits
     # are per-client and cannot stop eight different users from taking every slot.
     CLAUDE_REVIEW_MAX_CONCURRENT = int(os.environ.get('CLAUDE_REVIEW_MAX_CONCURRENT', '2'))
+    # Site-wide billed-review allowance per UTC day. Cache hits do not consume it.
+    CLAUDE_REVIEW_MAX_DAILY = int(os.environ.get('CLAUDE_REVIEW_MAX_DAILY', '25'))
     WORKER_DIR = Path(os.environ.get('WORKER_DIR') or BASE_DIR / 'var' / 'workers')
     METRICS_FILE = Path(os.environ.get('METRICS_FILE') or BASE_DIR / 'var' / 'metrics' / 'system_metrics.jsonl')
     DOSAGE_CSV_DIR = Path(os.environ.get('DOSAGE_CSV_DIR') or BASE_DIR / 'dosage-calculator')
@@ -218,12 +246,35 @@ class Config:
     # cut every 30 minutes purely because of its age. Slot protection now comes from
     # SSE_MAX_IDLE_SECONDS below (which targets streams that are actually doing
     # nothing) plus a per-IP limit_conn in nginx, so this is only a final ceiling.
+    # Request slots available site-wide. Gunicorn is launched with these values
+    # by the systemd unit; they are mirrored here so sse_registry can say how
+    # much of the pool open streams are holding. Keep in step with the unit.
+    GUNICORN_WORKERS = int(os.environ.get("GUNICORN_WORKERS", "4"))
+    # Alan 8/22/26 - Raised 2 -> 8 in dikarya-web.service. The binding limit was
+    # never the 8-slot total; it was the *per-worker* pair of threads. gthread
+    # workers pre-accept connections into their own queue, so one worker with
+    # both threads parked on idle SSE streams stranded every connection it had
+    # accepted while the other three served normally. That produced 11 nginx
+    # 504s on 2026-08-21 -- each exactly proxy_read_timeout, on endpoints as
+    # trivial as /favicon.ico -- at a global occupancy of 2-4 of 8.
+    GUNICORN_THREADS = int(os.environ.get("GUNICORN_THREADS", "8"))
+
     SSE_MAX_STREAM_SECONDS = int(os.environ.get("SSE_MAX_STREAM_SECONDS", "21600"))
     # Close a stream that has seen no event, progress, or status change for this
     # long while its job is still non-terminal. That is the orphaned-viewer and
     # stuck-job case -- an actively progressing job keeps resetting this, so it
     # streams for as long as it genuinely runs.
-    SSE_MAX_IDLE_SECONDS = int(os.environ.get("SSE_MAX_IDLE_SECONDS", "1800"))
+    #
+    # Alan 8/22/26 - Lowered 1800 -> 600. Streams sitting out the full 30 minutes
+    # were what pinned worker threads during the 2026-08-21 504s: every one of
+    # the offending streams that day ran exactly 1800.0s, i.e. straight to this
+    # cap. Closing is not a disconnect -- the stream yields `event: reconnect`
+    # and EventSource comes straight back with a fresh snapshot -- so the only
+    # cost is a reconnect, while the slot is released in between. Safe for long
+    # jobs because the timer is reset by any PubSub message and the tree builder
+    # streams every stderr line through publish_log(), so a live RAxML run keeps
+    # resetting it; only genuinely silent streams reach 600s.
+    SSE_MAX_IDLE_SECONDS = int(os.environ.get("SSE_MAX_IDLE_SECONDS", "600"))
     # How long to hold a stream open for a job that was already finished when the
     # client connected (catches events still settling), before closing.
     SSE_TERMINAL_LINGER_SECONDS = int(

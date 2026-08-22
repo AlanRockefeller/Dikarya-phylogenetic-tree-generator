@@ -5,6 +5,7 @@ from app.monitoring.services import (
     get_worker_status,
     get_global_metrics,
     collect_system_metrics,
+    get_ai_usage,
 )
 
 
@@ -38,10 +39,12 @@ def admin_dashboard():
     workers = get_worker_status()
     metrics_data = get_global_metrics()
     system = collect_system_metrics()
+    ai_usage = get_ai_usage(days=30)
     return render_template(
         'admin/monitoring.html',
         health=health,
         workers=workers,
         metrics=metrics_data,
         system=system,
+        ai_usage=ai_usage,
     )

@@ -2,6 +2,7 @@ import uuid
 import logging
 
 import redis
+from redis.exceptions import LockError
 from rq import Queue, Retry
 from flask import current_app
 from typing import Any, Dict, Optional
@@ -134,8 +135,15 @@ def enqueue_mycomap_blast_refresh_job(params: Dict[str, Any], job_timeout: Any =
     return job.id
 
 
-def enqueue_recompute_job(job_id: str, params_dict: Dict[str, Any]) -> str:
-    """Enqueue a recompute job under the existing job ID so status pages stream normally."""
+def enqueue_recompute_job(job_id: str, params_dict: Dict[str, Any], *,
+                          return_created: bool = False):
+    """Enqueue at most one active recompute for a job.
+
+    The Redis lock closes the request race where two browser clicks both see
+    no active RQ job and then enqueue the same output-producing work.  The
+    optional tuple return lets HTTP callers distinguish a new request from a
+    harmless duplicate without changing older internal callers.
+    """
     q = get_queue(QUEUE_HIGH)
     from app.workers.events import (
         STEP_INPUT, STEP_ORIENT, STEP_BLAST, STEP_ITS,
@@ -151,22 +159,89 @@ def enqueue_recompute_job(job_id: str, params_dict: Dict[str, Any]) -> str:
     # extraction step never re-runs here.
     steps[STEP_ITS] = {"label": "ITS Region Extraction (skipped)", "state": STATE_SKIPPED}
 
-    job = q.enqueue_call(
-        run_recompute_job,
-        args=(job_id, params_dict),
-        # Recompute re-runs the tree step, so it needs the same budget a fresh
-        # RAxML job gets.
-        timeout=resolve_job_timeout(params_dict),
-        job_id=job_id,
-        description=safe_job_description("phylo recompute", params_dict, job_id),
-        meta={
-            "steps": steps,
-            "current_step": None,
-            "current_tool": None,
-            "recompute": True,
-        }
+    lock = q.connection.lock(
+        f"dikarya:recompute-enqueue:{job_id}", timeout=15, blocking_timeout=10,
     )
-    return job.id
+    # Acquired and released by hand rather than with `with lock:`. The lock is
+    # an optimization -- it collapses two simultaneous clicks -- and must never
+    # be able to fail the enqueue it is protecting. `Lock.__enter__` raises
+    # LockError when it cannot acquire within blocking_timeout, and
+    # `Lock.__exit__` raises LockNotOwnedError when the 15s lease expired
+    # first; the latter fires *after* enqueue_call has already created the job,
+    # so the caller was told the recompute failed while it was in fact running.
+    # Losing the lock only costs us the duplicate-collapse, which fetch_job()
+    # below still handles for all but a sub-second race.
+    try:
+        acquired = bool(lock.acquire())
+    except LockError as exc:
+        logger.warning(
+            "event=recompute.enqueue_lock_unavailable job=%s error=%s", job_id, exc,
+        )
+        acquired = False
+    if not acquired:
+        logger.warning(
+            "event=recompute.enqueue_unlocked job=%s proceeding without the "
+            "duplicate-collapse lock", job_id,
+        )
+
+    try:
+        existing = q.fetch_job(job_id)
+        if existing is not None:
+            existing_status = existing.get_status(refresh=True)
+            if existing_status in {"queued", "started", "scheduled", "deferred"}:
+                return (existing.id, False) if return_created else existing.id
+
+        job = q.enqueue_call(
+            run_recompute_job,
+            args=(job_id, params_dict),
+            # Recompute re-runs the tree step, so it needs the same budget a fresh
+            # RAxML job gets.
+            timeout=resolve_job_timeout(params_dict),
+            job_id=job_id,
+            description=safe_job_description("phylo recompute", params_dict, job_id),
+            meta={
+                "steps": steps,
+                "current_step": None,
+                "current_tool": None,
+                "recompute": True,
+            }
+        )
+    finally:
+        if acquired:
+            try:
+                lock.release()
+            except LockError as exc:
+                # The lease expired while we were enqueueing. The job exists;
+                # saying otherwise would be a lie to the user.
+                logger.warning(
+                    "event=recompute.enqueue_lock_expired job=%s error=%s",
+                    job_id, exc,
+                )
+    return (job.id, True) if return_created else job.id
+
+
+def active_recompute_snapshot_mtime(job_id: str):
+    """When the active recompute captured tree_state.json, or None.
+
+    ``run_recompute_job`` records this in RQ meta as soon as it reads the
+    state, so callers can tell whether the viewer has been edited since. None
+    means there is nothing to conflict with: no active job, a job that has not
+    reached that step yet (its read will pick the edits up), or an RQ/Redis
+    hiccup, all of which should fall through to the normal idempotent path.
+    """
+    try:
+        job = get_queue(QUEUE_HIGH).fetch_job(job_id)
+        if job is None:
+            return None
+        if job.get_status(refresh=True) not in {"queued", "started", "scheduled", "deferred"}:
+            return None
+        value = (job.meta or {}).get("tree_state_snapshot_mtime")
+        return float(value) if value is not None else None
+    except Exception as exc:
+        logger.warning(
+            "event=recompute.snapshot_lookup_failed job=%s error=%s", job_id, exc,
+        )
+        return None
 
 def get_job_status(job_id: str) -> Dict[str, Any]:
     """Return a dict with at least: id, status, error (optional), progress (optional)."""

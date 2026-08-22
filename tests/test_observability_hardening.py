@@ -11,6 +11,7 @@ import logging
 import os
 import sys
 import unittest
+from contextlib import nullcontext
 from datetime import datetime, timedelta
 from pathlib import Path
 from unittest.mock import Mock, patch
@@ -512,6 +513,8 @@ def test_every_enqueue_path_sets_an_explicit_description():
     fake_queue.enqueue.return_value = fake_job
     fake_queue.enqueue_call.return_value = fake_job
     fake_queue.enqueue_in.return_value = fake_job
+    fake_queue.connection.lock.return_value = nullcontext()
+    fake_queue.fetch_job.return_value = None
 
     with patch.object(queue_module, "get_queue", return_value=fake_queue):
         queue_module.enqueue_job(dict(params))
@@ -534,6 +537,24 @@ def test_every_enqueue_path_sets_an_explicit_description():
         assert description, f"enqueue without a description: {call}"
         for secret in ("ACGTACGT", "AR-9", "private note", "leaked-source-label"):
             assert secret not in description
+
+
+def test_recompute_enqueue_reuses_an_active_job():
+    from app.workers import queue as queue_module
+
+    existing = Mock(id=JOB_A)
+    existing.get_status.return_value = "started"
+    fake_queue = Mock()
+    fake_queue.connection.lock.return_value = nullcontext()
+    fake_queue.fetch_job.return_value = existing
+
+    with patch.object(queue_module, "get_queue", return_value=fake_queue):
+        result = queue_module.enqueue_recompute_job(
+            JOB_A, _sensitive_params(), return_created=True,
+        )
+
+    assert result == (JOB_A, False)
+    fake_queue.enqueue_call.assert_not_called()
 
 
 def test_enqueue_job_preserves_queue_selection_ids_and_timeouts():
@@ -788,7 +809,11 @@ def test_worker_lifecycle_matches_rq_starts_completions_failures_and_retries(tmp
     _worker_log(tmp_path, [
         # A: an entirely ordinary RQ job -- start, then Job OK.
         f"[{_stamp(90)}] [INFO] [rq.worker] phylo_high: phylo pipeline job={JOB_A} sequences=12 ({JOB_A}) [release=git:abc]\n",
+        # The app emits its own start for that same attempt; it is not a retry.
+        f"[{_stamp(90)}] [INFO] [app.workers.tasks] event=job.started Starting job summary={{}} [job={JOB_A} rq={JOB_A} release=git:abc]\n",
         f"[{_stamp(88)}] [INFO] [rq.worker] phylo_high: Job OK ({JOB_A}) [release=git:abc]\n",
+        # Likewise, a second terminal vocabulary must not double-count A.
+        f"[{_stamp(88)}] [INFO] [app.workers.tasks] event=job.completed Job completed successfully [job={JOB_A} rq={JOB_A} release=git:abc]\n",
         # B: Dikarya's own stable events.
         f"[{_stamp(80)}] [INFO] [app.workers.tasks] event=job.started Starting job summary={{}} [job={JOB_B} rq={JOB_B} release=git:abc]\n",
         f"[{_stamp(75)}] [INFO] [app.workers.tasks] event=job.completed Job completed successfully [job={JOB_B} rq={JOB_B} release=git:abc]\n",
@@ -811,6 +836,41 @@ def test_worker_lifecycle_matches_rq_starts_completions_failures_and_retries(tmp
     assert counts["retried"] == 1
     assert stale == [], "an ordinary start followed by Job OK must not be reported"
     assert coverage["files"] == ["worker.log"]
+
+
+def test_worker_lifecycle_counts_repeated_stable_start_as_retry(tmp_path):
+    digest = _digest_module()
+    digest.LOG_DIR = tmp_path
+    _worker_log(tmp_path, [
+        f"[{_stamp(20)}] [INFO] [app.workers.tasks] event=job.started first [job={JOB_A}]\n",
+        f"[{_stamp(18)}] [INFO] [app.workers.tasks] event=job.started resumed [job={JOB_A}]\n",
+        f"[{_stamp(17)}] [INFO] [app.workers.tasks] event=job.completed done [job={JOB_A}]\n",
+    ])
+
+    counts, stale, _ = digest.analyze_worker(datetime.now() - timedelta(hours=1))
+
+    assert counts["started"] == 1
+    assert counts["retried"] == 1
+    assert counts["completed"] == 1
+    assert stale == []
+
+
+def test_worker_lifecycle_reused_job_id_starts_a_new_run(tmp_path):
+    digest = _digest_module()
+    digest.LOG_DIR = tmp_path
+    _worker_log(tmp_path, [
+        f"[{_stamp(30)}] [INFO] [app.workers.tasks] event=job.started original [job={JOB_A}]\n",
+        f"[{_stamp(25)}] [INFO] [app.workers.tasks] event=job.completed original [job={JOB_A}]\n",
+        f"[{_stamp(20)}] [INFO] [app.workers.tasks] event=job.started recompute [job={JOB_A}]\n",
+        f"[{_stamp(15)}] [INFO] [app.workers.tasks] event=job.completed recompute [job={JOB_A}]\n",
+    ])
+
+    counts, stale, _ = digest.analyze_worker(datetime.now() - timedelta(hours=1))
+
+    assert counts["started"] == 2
+    assert counts["completed"] == 2
+    assert counts["retried"] == 0
+    assert stale == []
 
 
 def test_worker_lifecycle_separates_active_jobs_from_genuinely_stale_ones(tmp_path):

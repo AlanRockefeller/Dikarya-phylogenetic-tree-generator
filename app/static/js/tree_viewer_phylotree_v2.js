@@ -75,6 +75,21 @@
                 + 'It only tests this node against its two nearest-neighbour-interchange alternatives, so it is local, known to be '
                 + 'anti-conservative, and cannot detect long-branch attraction. High values on long branches deserve scepticism.'
         },
+        // Alan 8/22/26 - IQ-TREE's single-value support is the ultrafast bootstrap, which
+        // is not the classical bootstrap and does not share its 70 "moderate" convention.
+        // Labelling it "Bootstrap" told users a UFBoot of 80 was moderately supported.
+        UFBOOT: {
+            label: 'UFBoot',
+            tooltip: 'IQ-TREE ultrafast bootstrap (0-100). NOT the classical bootstrap scale: UFBoot is '
+                + 'markedly less conservative, so the conventional cutoff is 95, and the 70 "moderate" '
+                + 'convention from standard bootstrap does not apply to it.'
+        },
+        ALRT: {
+            label: 'SH-aLRT',
+            tooltip: 'IQ-TREE SH-aLRT branch test (0-100), written when -alrt ran without ultrafast '
+                + 'bootstrap. A likelihood-ratio test of the branch, not a bootstrap proportion; the '
+                + 'conventional cutoff is 80.'
+        },
         ALRT_UFBOOT: {
             label: 'SH-aLRT / UFBoot',
             tooltip: 'IQ-TREE dual support, shown as SH-aLRT/UFBoot. Both are percentages (0-100). '
@@ -89,6 +104,54 @@
             label: 'None',
             tooltip: 'This tree carries no node support values.'
         }
+    };
+
+    // Alan 8/21/26 - Support scale is decided by which program built the tree, not by how
+    // big the numbers are. RAxML-NG happily writes bootstrap values of 0, 1 and 0.95 for
+    // poorly supported clades, and the old "everything <= 1 must be posterior" rule
+    // relabelled those trees as Bayesian. Mirrors _classify_support() /
+    // _normalize_tree_method() in app/services/tree_analysis_service.py -- the cases in
+    // tests/fixtures/support_classification_cases.json are run against both.
+    const SUPPORT_METHOD_ALIASES = {
+        'raxml-ng': 'raxml', 'raxmlng': 'raxml', 'raxml_ng': 'raxml', 'raxml8': 'raxml',
+        'iq-tree': 'iqtree', 'iqtree2': 'iqtree', 'iq-tree2': 'iqtree',
+        'mr_bayes': 'mrbayes', 'mrbayes3': 'mrbayes',
+        'fasttree2': 'fasttree',
+        'neighbor-joining': 'nj', 'neighbour-joining': 'nj'
+    };
+    const SUPPORT_METHOD_TYPES = {
+        fasttree: 'SH',
+        raxml: 'BS',
+        iqtree: 'UFBOOT',
+        mrbayes: 'PP'
+    };
+
+    // Alan 8/22/26 - Whitespace is removed rather than trimmed, so "IQ-TREE 2", "RAxML NG"
+    // and "Fast Tree" normalize onto the same builder as their hyphenated spellings instead
+    // of falling through to the value-shape fallback.
+    window.normalizeTreeMethod = function (treeMethod) {
+        const method = String(treeMethod == null ? '' : treeMethod).toLowerCase().replace(/\s+/g, '');
+        return SUPPORT_METHOD_ALIASES[method] || method;
+    };
+
+    // Alan 8/22/26 - `options.alrtOnly` marks an IQ-TREE run that used -alrt without
+    // ultrafast bootstrap: the node labels are then single SH-aLRT percentages, and reading
+    // them as bootstrap gives both the wrong test and the wrong threshold. The flag is
+    // resolved server-side (tree_analysis_service.resolve_tree_support_context) so the badge
+    // and the Claude review cannot disagree about the same tree.
+    window.classifySupportType = function (values, hasDual, treeMethod, options) {
+        if (hasDual) return 'ALRT_UFBOOT';
+        if (!values || !values.length) return 'none';
+
+        const declared = SUPPORT_METHOD_TYPES[window.normalizeTreeMethod(treeMethod)];
+        if (declared === 'UFBOOT' && options && options.alrtOnly) return 'ALRT';
+        if (declared) return declared;
+
+        // Genuinely unknown or legacy builder: the numbers are all there is to go on.
+        if (values.some(v => v > 1.0)) {
+            return values.some(v => v > 0 && v < 1.0) ? 'mixed' : 'BS';
+        }
+        return 'PP';
     };
 
     // --- ZOOM PANIC STOP ---
@@ -420,12 +483,21 @@
             this._annotationsDrawn = false;
             // Alan 8/15/26 - Controller-supplied handler opens the annotation editor for a clade.
             this._onAddCladeAnnotation = null;
+            // Alan 8/21/26 - Controller-supplied handler opens the editor for one drawn annotation,
+            // so a right-click on the bracket or label itself edits exactly that annotation.
+            this._onEditCladeAnnotation = null;
         }
 
         // Alan 8/15/26 - Let the controller own the annotation editor while the item lives in
         // phylotree's native internal-node menu, rather than adding a second context-menu system.
         setAddCladeAnnotationHandler(fn) {
             this._onAddCladeAnnotation = typeof fn === 'function' ? fn : null;
+        }
+
+        // Alan 8/21/26 - Same arrangement for editing a drawn annotation directly: the viewer
+        // knows which annotation was clicked, the controller owns the editor modal.
+        setEditCladeAnnotationHandler(fn) {
+            this._onEditCladeAnnotation = typeof fn === 'function' ? fn : null;
         }
 
         // Alan 6/2/26 - Let the controller own the rotate action while the item lives in phylotree's native node menu.
@@ -507,20 +579,27 @@
                     // before its built-in collapse/selection actions.
                     n.menu_items.unshift([
                         (node) => {
-                            const count = this.getAnnotationsForNode(node).length;
+                            // Alan 8/21/26 - Label the item for the membership it will actually
+                            // annotate, which may be the selected clade rather than the clicked tip.
+                            const memberIds = this.getAnnotationTargetLeafIds(node);
+                            const count = this.getAnnotationsForMemberIds(memberIds).length;
                             if (count === 1) return 'Edit annotation…';
                             if (count > 1) return `Edit annotations… (${count})`;
-                            return 'Add annotation…';
+                            return this._isSelectionAnnotationTarget(node)
+                                // Alan 8/21/26 - Say so when the action will use the selection.
+                                ? `Add annotation to ${memberIds.length} selected…`
+                                : 'Add annotation…';
                         },
                         (node) => {
-                            const memberIds = this.getDescendantLeafIds(node);
-                            const annotationIds = this.getAnnotationsForNode(node)
+                            // Alan 8/21/26 - Annotate the selected clade when the clicked tip is part of it.
+                            const memberIds = this.getAnnotationTargetLeafIds(node);
+                            const annotationIds = this.getAnnotationsForMemberIds(memberIds)
                                 .map((annotation) => annotation.id).filter(Boolean);
                             if (typeof this._onAddCladeAnnotation === 'function') {
                                 this._onAddCladeAnnotation(node, memberIds, {
                                     annotationIds,
-                                    defaultType: (node.children && node.children.length)
-                                        ? 'clade_line' : 'branch_text'
+                                    // Alan 8/21/26 - Let a multi-tip selection default to Clade line.
+                                    defaultType: this.getDefaultAnnotationType(node, memberIds)
                                 });
                             }
                         },
@@ -533,17 +612,21 @@
                         // annotations already occupy this incoming branch.
                         () => 'Add another annotation…',
                         (node) => {
-                            const memberIds = this.getDescendantLeafIds(node);
+                            // Alan 8/21/26 - Stack onto the same membership the primary item uses.
+                            const memberIds = this.getAnnotationTargetLeafIds(node);
                             if (typeof this._onAddCladeAnnotation === 'function') {
                                 this._onAddCladeAnnotation(node, memberIds, {
                                     forceAdd: true,
-                                    defaultType: (node.children && node.children.length)
-                                        ? 'clade_line' : 'branch_text'
+                                    // Alan 8/21/26 - Let a multi-tip selection default to Clade line.
+                                    defaultType: this.getDefaultAnnotationType(node, memberIds)
                                 });
                             }
                         },
                         (node) => !window.VIEW_ONLY && Boolean(node.parent)
-                            && this.getAnnotationsForNode(node).length > 0,
+                            // Alan 8/21/26 - Offer stacking against the resolved membership.
+                            && this.getAnnotationsForMemberIds(
+                                this.getAnnotationTargetLeafIds(node)
+                            ).length > 0,
                         false,
                         true
                     ]);
@@ -1150,6 +1233,9 @@
                 for (const child of el.children) removeDarkReader(child);
             };
             removeDarkReader(clone);
+            // Alan 8/21/26 - The invisible right-click targets behind each annotation are UI
+            // only; keep them out of exported SVG/JPG figures.
+            clone.querySelectorAll('.clade-annotation-hit').forEach(hit => hit.remove());
             clone.querySelectorAll('style').forEach(s => {
                 if ((s.textContent || '').toLowerCase().includes('darkreader')) s.remove();
             });
@@ -1421,6 +1507,15 @@
         // Alan 5/9/26 - Return leaf nodes so sequence metric filters only hide terminal tips.
         _getLeafNodes() {
             return (this.allNodes || []).filter(node => !node.children || !node.children.length);
+        }
+
+        // Alan 8/22/26 - Display names of the tips currently on screen (renames applied), so
+        // the Claude review renderer can tell a sequence the user can actually find from one
+        // the model named but the tree does not contain.
+        getTipNames() {
+            return this._getLeafNodes()
+                .map(node => String((node.data && node.data.name) || node.name || ''))
+                .filter(Boolean);
         }
 
         // Alan 5/9/26 - Compare one metric against its current threshold while allowing missing metric fields.
@@ -1976,38 +2071,18 @@
                 }
             }
 
-            let supportType = 'none';
-
             // Alan 8/4/26 - Dual SH-aLRT/UFBoot labels take priority: they are their own
             // scale (two 0-100 percentages) and must not be reported as plain bootstrap.
             const hasDual = this.allNodes.some(
                 n => n.children && n.children.length > 0 && this._extractDualSupport(n)
             );
-            if (hasDual) return { maxSupport, supportType: 'ALRT_UFBOOT' };
 
-            // Explicit FastTree Override
-            // FastTree support values are SH-like local supports (0-1).
-            // They are NOT Bayesian Posteriors (PP), though they look similar.
-            if (this.options.treeMethod === 'fasttree' && supportValues.length > 0) {
-                supportType = 'SH';
-            }
-            else if (supportValues.length > 0) {
-                const hasLarge = supportValues.some(v => v > 1.0);
-                // If we have large values (Bootstrap), we only consider it 'mixed' if we see values <= 1.0
-                // that are NOT 1.0 (or 0).
-                // RAxML can output 0 or 1 for Bootstrap.
-                // We assume 1.0 is low bootstrap (1%) if we have other high values.
-                // Posterior Probabilities are usually fractional (0.95, 0.99).
-
-                if (hasLarge) {
-                    // Check for clearly fractional small values that imply mixed data
-                    const hasFractionalSmall = supportValues.some(v => v < 1.0 && v > 0);
-                    supportType = hasFractionalSmall ? 'mixed' : 'BS';
-                } else {
-                    // Only small values -> PP
-                    supportType = 'PP';
-                }
-            }
+            // Alan 8/21/26 - Shared method-first rules, kept in one place so the badge, the
+            // node labels and the backend review cannot drift apart.
+            const supportType = window.classifySupportType(
+                supportValues, hasDual, this.options.treeMethod,
+                { alrtOnly: !!this.options.alrtOnly }
+            );
             return { maxSupport, supportType };
         }
 
@@ -2084,12 +2159,23 @@
                         const fmt = v => (Number.isInteger(v) ? String(v) : v.toFixed(1));
                         rawLabel = `${fmt(dualVal.alrt)}/${fmt(dualVal.ufboot)}`;
                     }
-                    else if (supportType === 'SH') {
-                        // SH-like supports are 0-1, so use ppThreshold
+                    // Alan 8/21/26 - Threshold and formatting now follow the declared scale
+                    // rather than the magnitude of the value. A RAxML tree whose bootstraps
+                    // are all 0 or 1 is a tree with 0-1% support, and filtering it against
+                    // the 0-1 posterior threshold displayed those as well-supported nodes.
+                    else if (supportType === 'SH' || supportType === 'PP') {
+                        // 0-1 scales: filter and format as a proportion.
                         if (numVal + EPS < ppThreshold) { group.select("text.node-support-value").remove(); return; }
                         rawLabel = numVal.toFixed(2);
                     }
+                    // Alan 8/22/26 - UFBoot and SH-aLRT are 0-100 scales like bootstrap, so they
+                    // format and threshold the same way even though they mean different things.
+                    else if (supportType === 'BS' || supportType === 'UFBOOT' || supportType === 'ALRT') {
+                        if (numVal + EPS < bootThreshold) { group.select("text.node-support-value").remove(); return; }
+                        rawLabel = Math.round(numVal).toString();
+                    }
                     else if (numVal <= 1.0) {
+                        // Unknown or mixed scale: the value's own magnitude is all there is.
                         if (numVal + EPS < ppThreshold) { group.select("text.node-support-value").remove(); return; }
                         rawLabel = numVal.toFixed(2);
                     } else {
@@ -3500,6 +3586,58 @@
             return this.getAnnotationsForMemberIds(this.getDescendantLeafIds(node));
         }
 
+        // Alan 8/21/26 - Count the selected TIPS only, so internal-node selections do not
+        // change what the annotation menu offers.
+        getSelectedLeafCount() {
+            return this.getSelectedNodes().filter((node) => {
+                const children = node?.children || node?.data?.children || [];
+                return !children || children.length === 0;
+            }).length;
+        }
+
+        /**
+         * Alan 8/21/26 - Resolve which tips a context-menu annotation should cover.
+         *
+         * Normally that is the clicked branch's descendants. The exception is right-clicking
+         * a TIP that belongs to a multi-tip selection which is itself exactly one clade: the
+         * user has already said what group they mean, so annotate that group rather than the
+         * single tip under the cursor. Requiring the clicked tip to be inside the selection
+         * keeps a click on an unrelated branch acting on that branch, and restricting this to
+         * tips keeps a click on an inner branch meaning that inner branch.
+         */
+        getAnnotationTargetLeafIds(node) {
+            return this._selectionAnnotationLeafIds(node) || this.getDescendantLeafIds(node);
+        }
+
+        // Alan 8/21/26 - The selected clade when it should stand in for the clicked tip, else null.
+        _selectionAnnotationLeafIds(node) {
+            const children = node?.children || [];
+            if (children.length || this.getSelectedLeafCount() < 2) return null;
+            const id = this._getNodeId(node);
+            if (!id) return null;
+            const selectedClade = this.getSelectedCladeLeafIds();
+            if (!selectedClade || selectedClade.length < 2) return null;
+            return selectedClade.includes(id) ? selectedClade : null;
+        }
+
+        // Alan 8/21/26 - True when the context menu will annotate the selection, not the click.
+        _isSelectionAnnotationTarget(node) {
+            return Boolean(this._selectionAnnotationLeafIds(node));
+        }
+
+        /**
+         * Alan 8/21/26 - Pick the annotation type the editor should open with.
+         * A group of tips gets the right-hand bracket; a lone tip gets branch text. Reading
+         * this off the RESOLVED membership is what makes a multi-tip selection default to
+         * Clade line instead of stacking a single-tip label over the branch labels.
+         */
+        getDefaultAnnotationType(node, memberIds = null) {
+            const children = node?.children || [];
+            if (children.length) return 'clade_line';
+            const ids = memberIds || this.getAnnotationTargetLeafIds(node);
+            return ids.length > 1 ? 'clade_line' : 'branch_text';
+        }
+
         /**
          * Alan 8/15/26 - Resolve the current selection into a clade.
          * Returns the descendant leaf IDs when the selected leaves are exactly the
@@ -4003,7 +4141,19 @@
                     let laneWidth = 0;
                     for (const item of lane.items) {
                         laneWidth = Math.max(laneWidth, item.metrics.laneWidth);
-                        this._drawOneAnnotation(group, item, laneX, LINE_TO_TEXT_GAP, LINE_WIDTH, rowPitch);
+                        const entry = this._drawOneAnnotation(
+                            group, item, laneX, LINE_TO_TEXT_GAP, LINE_WIDTH, rowPitch
+                        );
+                        // Alan 8/21/26 - Right-click the bracket or its label to edit it.
+                        this._attachAnnotationInteraction(entry, item, {
+                            x: laneX - LINE_WIDTH,
+                            y: item.metrics.renderTop,
+                            width: item.metrics.laneWidth + LINE_WIDTH,
+                            height: Math.max(
+                                item.scaledFontSize,
+                                item.metrics.renderBottom - item.metrics.renderTop
+                            )
+                        });
                     }
                     cursorX += laneWidth + GAP_BETWEEN_LANES;
                 }
@@ -4035,7 +4185,14 @@
                 branchMetrics.renderBottom = bottom;
                 item.metrics = branchMetrics;
                 const centerX = (parentPoint.x + point.x) / 2;
-                this._drawBranchAnnotation(group, item, centerX, LINE_WIDTH);
+                const branchEntry = this._drawBranchAnnotation(group, item, centerX, LINE_WIDTH);
+                // Alan 8/21/26 - Right-click the branch label or bubble to edit it.
+                this._attachAnnotationInteraction(branchEntry, item, {
+                    x: centerX - branchMetrics.boxWidth / 2,
+                    y: branchMetrics.renderTop,
+                    width: branchMetrics.boxWidth,
+                    height: branchMetrics.boxHeight
+                });
                 branchCursors.set(branchKey, branchMetrics.renderTop - BRANCH_GAP);
             }
 
@@ -4311,6 +4468,43 @@
                 // Alan 8/17/26 - Use the clade-line text class after bubble drawing moved out.
                 inkClass('clade-annotation-label', item.style.text_color_is_default)
             );
+            return entry;
+        }
+
+        /**
+         * Alan 8/21/26 - Make one drawn annotation right-clickable so it can be edited where
+         * the user is looking at it, instead of only through its branch menu or the manager.
+         *
+         * The whole g.clade-annotations group is pointer-events: none so annotations never
+         * intercept clicks meant for the tree, and the label text sets it explicitly too. The
+         * hit target is therefore an invisible rect covering just this annotation's own drawn
+         * extent, added behind the ink. It is stripped from export clones.
+         */
+        _attachAnnotationInteraction(entry, item, bounds) {
+            if (!entry || entry.empty?.() || window.VIEW_ONLY) return;
+            const annotationId = item?.annotation?.id;
+            if (!annotationId || annotationId === 'preview') return;
+            if (!bounds || !Number.isFinite(bounds.x) || !Number.isFinite(bounds.y)) return;
+
+            entry.insert('rect', ':first-child')
+                .attr('class', 'clade-annotation-hit')
+                .attr('x', bounds.x)
+                .attr('y', bounds.y)
+                .attr('width', Math.max(1, bounds.width))
+                .attr('height', Math.max(1, bounds.height))
+                .style('fill', 'transparent')
+                .style('stroke', 'none')
+                .style('pointer-events', 'all')
+                .style('cursor', 'context-menu');
+
+            const node = entry.node();
+            if (!node) return;
+            node.addEventListener('contextmenu', (event) => {
+                if (typeof this._onEditCladeAnnotation !== 'function') return;
+                event.preventDefault();
+                event.stopPropagation();
+                this._onEditCladeAnnotation(annotationId, item.annotation);
+            });
         }
 
         _getSvgAndZoomGroup() {

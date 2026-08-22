@@ -161,6 +161,14 @@ document.addEventListener('DOMContentLoaded', async () => {
         caution: { label: 'Caution', classes: 'bg-yellow-100 text-yellow-800 dark:bg-yellow-900/40 dark:text-yellow-200' },
         unreliable: { label: 'Unreliable', classes: 'bg-red-100 text-red-800 dark:bg-red-900/40 dark:text-red-200' }
     };
+    // Alan 8/21/26 - Defence in depth only: the server rejects a rating outside the schema
+    // enum before it can be cached. If one ever reaches here it must not land on the
+    // "Usable" styling, which would dress a malformed answer up as a favourable one.
+    // Not a rating the model may produce -- it is not in RESPONSE_SCHEMA.
+    const CLAUDE_RATING_UNKNOWN = {
+        label: 'Unrated',
+        classes: 'bg-gray-100 text-gray-700 dark:bg-gray-700/50 dark:text-gray-200'
+    };
     const CLAUDE_SEVERITY_STYLES = {
         high: 'border-red-400 dark:border-red-500',
         medium: 'border-yellow-400 dark:border-yellow-500',
@@ -189,9 +197,81 @@ document.addEventListener('DOMContentLoaded', async () => {
             </div>`);
     }
 
+    // Alan 8/22/26 - "Well supported: 62%" told the user nothing about what counted as
+    // well supported, and the scale itself was shown as its raw code ("SH", "UFBOOT").
+    // Both now say what they mean, using the same support-type information the badge uses.
+    function claudeSupportLabel(supportType) {
+        const info = (window.SUPPORT_TYPE_INFO || {})[supportType];
+        return info ? info.label : supportType;
+    }
+
+    function claudeSupportCriterion(supportType, threshold) {
+        if (threshold === null || threshold === undefined) return '';
+        const value = Number(threshold);
+        const shown = Number.isInteger(value) ? String(value) : value.toFixed(2);
+        switch (supportType) {
+            case 'BS': return `BS ≥${shown}`;
+            case 'UFBOOT': return `UFBoot ≥${shown}`;
+            case 'ALRT': return `SH-aLRT ≥${shown}`;
+            // The single-value percentage thresholds the UFBoot half; the joint rule is
+            // reported separately from dual_support_summary so neither is overstated.
+            case 'ALRT_UFBOOT': return `UFBoot ≥${shown}`;
+            case 'SH': return `≥${shown} SH-like`;
+            case 'PP': return `PP ≥${shown}`;
+            default: return `≥${shown}`;
+        }
+    }
+
+    // Same loose matching the backend uses to line tip labels up with FASTA headers.
+    function claudeNormalizeName(value) {
+        return String(value ?? '').replace(/_/g, ' ').replace(/\s+/g, ' ').trim().toLowerCase();
+    }
+
+    // Alan 8/22/26 - Claude's prose must not be the authority for a branch length or a gap
+    // percentage. Every deterministic per-sequence number the backend already computed is
+    // indexed here and rendered beside the model's reason.
+    function claudeSequenceFacts(metrics) {
+        const index = new Map();
+        const merge = (rows) => {
+            (Array.isArray(rows) ? rows : []).forEach(row => {
+                if (!row || !row.name) return;
+                const key = claudeNormalizeName(row.name);
+                index.set(key, Object.assign({}, index.get(key) || {}, row));
+            });
+        };
+        const tree = metrics.tree || {};
+        const alignment = metrics.alignment || {};
+        merge(tree.longest_terminal_branches);
+        merge(tree.outlier_long_branch_tips);
+        merge(alignment.gappiest_sequences);
+        merge(alignment.most_internally_gapped_sequences);
+        merge(alignment.most_ambiguous_sequences);
+        merge(alignment.shortest_sequences);
+        return index;
+    }
+
+    function claudeFactChips(row) {
+        if (!row) return '';
+        const chips = [];
+        const num = (value, digits) => (typeof value === 'number'
+            ? (digits === undefined ? String(value) : value.toFixed(digits))
+            : null);
+        if (typeof row.branch_length === 'number') chips.push(`branch ${num(row.branch_length)}`);
+        if (typeof row.ungapped_length === 'number') chips.push(`${row.ungapped_length} bp`);
+        if (typeof row.gap_percent === 'number') chips.push(`gaps ${num(row.gap_percent, 1)}%`);
+        if (typeof row.terminal_gap_percent === 'number' && typeof row.internal_gap_percent === 'number') {
+            chips.push(`terminal ${num(row.terminal_gap_percent, 1)}% / internal ${num(row.internal_gap_percent, 1)}%`);
+        }
+        if (typeof row.ambiguity_percent === 'number') chips.push(`ambiguity ${num(row.ambiguity_percent, 1)}%`);
+        if (typeof row.parent_support === 'number') chips.push(`parent support ${num(row.parent_support)}`);
+        if (!chips.length) return '';
+        return `<div class="mt-1 flex flex-wrap gap-1">${chips.map(chip => `
+            <span class="px-1.5 py-0.5 rounded bg-gray-100 dark:bg-journal-dark text-[10px] font-mono text-gray-600 dark:text-gray-300">${escapeHtml(chip)}</span>`).join('')}</div>`;
+    }
+
     function renderClaudeReview(payload) {
         const review = payload?.review || {};
-        const rating = CLAUDE_RATING_STYLES[review.overall_rating] || CLAUDE_RATING_STYLES.usable;
+        const rating = CLAUDE_RATING_STYLES[review.overall_rating] || CLAUDE_RATING_UNKNOWN;
         const metrics = payload?.metrics || {};
         const alignment = metrics.alignment || {};
         const tree = metrics.tree || {};
@@ -213,15 +293,53 @@ document.addEventListener('DOMContentLoaded', async () => {
 
         // A compact strip of the numbers Claude was actually given, so any claim
         // in the prose can be checked against its source without leaving the modal.
+        // Alan 8/21/26 - Column tallies are exact only when every column was scored. On a
+        // sampled run the backend publishes `parsimony_informative_columns_estimated`
+        // instead of the bare count, so a figure extrapolated from a fraction of the
+        // alignment can never be shown as the count for the whole alignment.
+        const sampled = alignment.column_metrics_are_estimates === true;
+        const informativeLabel = sampled ? 'Parsimony-informative (est.)' : 'Parsimony-informative';
+        const informativeValue = sampled
+            ? (alignment.parsimony_informative_columns_estimated != null
+                ? `≈${alignment.parsimony_informative_columns_estimated}`
+                : (alignment.parsimony_informative_percent != null
+                    ? `≈${alignment.parsimony_informative_percent}% of columns`
+                    : null))
+            : alignment.parsimony_informative_columns;
+
+        // Alan 8/22/26 - Show the human-readable scale name rather than the backend's code,
+        // and say what "well supported" was measured against. A bare percentage under an
+        // unexplained "SH" is exactly the misreading the support work was meant to end.
+        const supportType = tree.support_type;
+        const supportCriterion = claudeSupportCriterion(supportType, tree.strong_support_threshold);
+        const dual = tree.dual_support_summary;
+
+        // Alan 8/22/26 - Rooting is never inferred from topology, and "unknown" is a real
+        // answer the user needs to see rather than an absent row.
+        const rooting = tree.rooting || {};
+        const rootingValue = rooting.rooting_known
+            ? (rooting.description || rooting.root_mode)
+            : 'Unknown (not recorded)';
+
         const facts = [
             ['Sequences', alignment.sequences],
             ['Alignment columns', alignment.columns],
-            ['Parsimony-informative', alignment.parsimony_informative_columns],
+            [informativeLabel, informativeValue],
+            sampled
+                ? ['Columns scored', `${alignment.columns_scored} of ${alignment.columns} (sampled)`]
+                : null,
             ['Gaps', alignment.overall_gap_percent != null ? `${alignment.overall_gap_percent}%` : null],
             ['Tips', tree.tips],
-            ['Support scale', tree.support_type && tree.support_type !== 'none' ? tree.support_type : null],
-            ['Well supported', tree.strongly_supported_percent != null ? `${tree.strongly_supported_percent}%` : null]
-        ].filter(([, value]) => value !== null && value !== undefined);
+            ['Support scale', supportType && supportType !== 'none' ? claudeSupportLabel(supportType) : null],
+            [
+                supportCriterion ? `Well supported (${supportCriterion})` : 'Well supported',
+                tree.strongly_supported_percent != null ? `${tree.strongly_supported_percent}%` : null
+            ],
+            (dual && dual.nodes_scored)
+                ? ['SH-aLRT ≥80 + UFBoot ≥95', `${dual.nodes_meeting_both_thresholds} of ${dual.nodes_scored} nodes`]
+                : null,
+            ['Rooting', rootingValue]
+        ].filter(entry => entry && entry[1] !== null && entry[1] !== undefined);
 
         if (facts.length) {
             sections.push(`
@@ -231,6 +349,27 @@ document.addEventListener('DOMContentLoaded', async () => {
                             <div class="text-[10px] font-bold uppercase tracking-wide text-gray-500 dark:text-gray-400">${escapeHtml(label)}</div>
                             <div class="text-sm font-semibold text-journal-dark dark:text-gray-100">${escapeHtml(value)}</div>
                         </div>`).join('')}
+                </div>`);
+        }
+
+        // Alan 8/22/26 - When the review describes a pruned or recomputed tree it is NOT
+        // describing every sequence the tree builder saw, and the user has no way to know
+        // that from the prose. Say so above the summary.
+        const builderSequences = alignment.sequences_in_builder_alignment
+            ?? alignment.sequences_in_source_file;
+        const scopeNotes = [];
+        if (alignment.alignment_restricted_to_current_tips && builderSequences) {
+            scopeNotes.push(`Reviewed the currently displayed tree (${alignment.sequences} of ${builderSequences} sequences in the alignment the tree builder used). Branch support was estimated on the full alignment; the alignment statistics above describe only the displayed tips.`);
+        } else if (alignment.alignment_is_tree_builder_input === false) {
+            scopeNotes.push(`Alignment statistics come from ${alignment.source_file}, which is not the alignment this tree's builder consumed.`);
+        }
+        if (alignment.tree_tips_unmatched_in_alignment) {
+            scopeNotes.push(`${alignment.tree_tips_unmatched_in_alignment} tip(s) in this tree had no matching alignment row, so no alignment statistics could be computed for them.`);
+        }
+        if (scopeNotes.length) {
+            sections.push(`
+                <div class="rounded-lg border border-gray-200 dark:border-journal-dark bg-gray-50 dark:bg-journal-dark/40 px-3 py-2">
+                    ${scopeNotes.map(note => `<p class="text-xs text-gray-600 dark:text-gray-300">${escapeHtml(note)}</p>`).join('')}
                 </div>`);
         }
 
@@ -283,6 +422,14 @@ document.addEventListener('DOMContentLoaded', async () => {
 
         const suspects = Array.isArray(review.sequences_to_inspect) ? review.sequences_to_inspect : [];
         if (suspects.length) {
+            // Alan 8/22/26 - Join the backend's own numbers onto each named sequence, and flag
+            // a name that is not a tip of the tree on screen instead of presenting the model's
+            // prose as authoritative. A cached review can also outlive a rename.
+            const factIndex = claudeSequenceFacts(metrics);
+            const currentTips = (viewer && typeof viewer.getTipNames === 'function')
+                ? new Set(viewer.getTipNames().map(claudeNormalizeName))
+                : null;
+
             sections.push(`
                 <div>
                     <h4 class="font-semibold text-journal-gold mb-2 uppercase text-xs tracking-wider">Sequences worth a look</h4>
@@ -292,14 +439,24 @@ document.addEventListener('DOMContentLoaded', async () => {
                                 <tr><th class="py-2 pr-4 font-semibold">Sequence</th><th class="py-2 font-semibold">Why</th></tr>
                             </thead>
                             <tbody class="divide-y divide-gray-100 dark:divide-gray-800">
-                                ${suspects.map(item => `
+                                ${suspects.map(item => {
+                                    const key = claudeNormalizeName(item?.name || '');
+                                    const facts = factIndex.get(key);
+                                    const missing = currentTips && key && !currentTips.has(key);
+                                    return `
                                     <tr>
-                                        <td class="py-2 pr-4 font-mono break-all max-w-sm">${escapeHtml(item?.name || '')}</td>
-                                        <td class="py-2">${escapeHtml(item?.reason || '')}</td>
-                                    </tr>`).join('')}
+                                        <td class="py-2 pr-4 font-mono break-all max-w-sm align-top">
+                                            ${escapeHtml(item?.name || '')}
+                                            ${missing ? `<div class="mt-1 inline-block px-1.5 py-0.5 rounded bg-yellow-100 text-yellow-800 dark:bg-yellow-900/40 dark:text-yellow-200 text-[10px] font-sans font-semibold">not a tip on this tree</div>` : ''}
+                                            ${claudeFactChips(facts)}
+                                        </td>
+                                        <td class="py-2 align-top">${escapeHtml(item?.reason || '')}</td>
+                                    </tr>`;
+                                }).join('')}
                             </tbody>
                         </table>
                     </div>
+                    <p class="mt-2 text-[11px] text-gray-500 dark:text-gray-400">Values in grey are computed from the alignment and tree, not written by Claude.</p>
                 </div>`);
         }
 
@@ -1733,7 +1890,10 @@ document.addEventListener('DOMContentLoaded', async () => {
                 ? parseInt(getEl('input-bs-threshold')?.value || 70) : 0,
             // Alan 5/9/26 - Pass stored per-sequence BLAST metrics into the viewer for tip filtering.
             sequenceMetrics: Array.isArray(window.SEQUENCE_METRICS) ? window.SEQUENCE_METRICS : [],
-            treeMethod: window.TREE_METHOD || ''
+            treeMethod: window.TREE_METHOD || '',
+            // Alan 8/22/26 - IQ-TREE run with -alrt but no ultrafast bootstrap writes single
+            // SH-aLRT percentages, not UFBoot ones.
+            alrtOnly: !!(window.TREE_SUPPORT_CONTEXT && window.TREE_SUPPORT_CONTEXT.alrt_only)
         };
 
         viewer = new DikaryaTreeViewer('tree-container', callbacks, initialOptions);
@@ -2538,6 +2698,15 @@ document.addEventListener('DOMContentLoaded', async () => {
             });
         }
 
+        // Alan 8/21/26 - Right-clicking a drawn annotation edits that exact annotation, which is
+        // the only unambiguous path when several are stacked on one clade or branch.
+        if (viewer && typeof viewer.setEditCladeAnnotationHandler === 'function') {
+            viewer.setEditCladeAnnotationHandler((annotationId) => {
+                if (window.VIEW_ONLY || isProcessing || !annotationId) return;
+                openAnnotationEditor('edit', { annotationId });
+            });
+        }
+
         // Alan 8/13/26 - Reuse the existing single-sequence rename modal from the tip context menu.
         if (viewer && typeof viewer.setRenameNodeHandler === 'function') {
             viewer.setRenameNodeHandler((node) => {
@@ -2983,11 +3152,19 @@ document.addEventListener('DOMContentLoaded', async () => {
         // Alan 7/20/26 - Route button clicks through the same reliable deselect action used by the D hotkey.
         if (btnDeselect) btnDeselect.addEventListener('click', deselectCurrentTreeSelection);
 
-        if (btnRecompute) btnRecompute.addEventListener('click', () => {
+        if (btnRecompute) btnRecompute.addEventListener('click', async () => {
             if (!confirm("Recompute tree?")) return;
-            runBackendAction("Recomputing", async () => {
-                await TreeEditActions.recomputeTree(JOB_ID);
-            });
+            btnRecompute.disabled = true;
+            try {
+                const result = await TreeEditActions.recomputeTree(JOB_ID);
+                showStatus(result.message || "Tree recompute queued.", "success", 2500);
+                setTimeout(() => {
+                    window.location.href = result.redirect_url || `/job/${JOB_ID}`;
+                }, 500);
+            } catch (error) {
+                showStatus(error.message || "Could not queue the recompute.", "danger", 5000);
+                btnRecompute.disabled = false;
+            }
         });
 
         // Alan 8/4/26 - Rebuild the tree with the deduped duplicate records added back in.
@@ -3432,6 +3609,14 @@ document.addEventListener('DOMContentLoaded', async () => {
             if (stats.supportType === 'BS') {
                 badge.classList.add('text-blue-800', 'bg-blue-100', 'ring-blue-400/60', 'dark:text-blue-200', 'dark:bg-blue-900/40');
             }
+            // Alan 8/22/26 - IQ-TREE's own scales get their own colours so they are not read
+            // as the classical bootstrap sitting next to them in blue.
+            else if (stats.supportType === 'UFBOOT') {
+                badge.classList.add('text-indigo-800', 'bg-indigo-100', 'ring-indigo-400/60', 'dark:text-indigo-200', 'dark:bg-indigo-900/40');
+            }
+            else if (stats.supportType === 'ALRT') {
+                badge.classList.add('text-cyan-800', 'bg-cyan-100', 'ring-cyan-400/60', 'dark:text-cyan-200', 'dark:bg-cyan-900/40');
+            }
             else if (stats.supportType === 'PP') {
                 badge.classList.add('text-purple-800', 'bg-purple-100', 'ring-purple-400/60', 'dark:text-purple-200', 'dark:bg-purple-900/40');
             }
@@ -3472,8 +3657,14 @@ document.addEventListener('DOMContentLoaded', async () => {
         // bootstrap input stays live and is relabelled to say which half it filters.
         if (bsInput) {
             const bsLabel = bsInput.parentElement && bsInput.parentElement.querySelector('span');
-            if (bsLabel) bsLabel.textContent = (s === 'ALRT_UFBOOT') ? "UFBoot >" : "BS >";
-            setInput(bsInput, globalEnable && (s === 'BS' || s === 'mixed' || s === 'ALRT_UFBOOT'));
+            if (bsLabel) {
+                if (s === 'ALRT_UFBOOT' || s === 'UFBOOT') bsLabel.textContent = "UFBoot >";
+                else if (s === 'ALRT') bsLabel.textContent = "SH-aLRT >";
+                else bsLabel.textContent = "BS >";
+            }
+            setInput(bsInput, globalEnable && (
+                s === 'BS' || s === 'mixed' || s === 'ALRT_UFBOOT' || s === 'UFBOOT' || s === 'ALRT'
+            ));
         }
     }
 

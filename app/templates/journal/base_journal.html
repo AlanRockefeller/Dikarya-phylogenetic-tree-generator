@@ -8,7 +8,7 @@
     <meta name="description"
         content="{% block meta_description %}Dikarya: A peer-reviewed journal dedicated to fungal taxonomy, systematics, and phylogenetics.{% endblock %}">
     {% include "partials/favicon_links.html" %}
-    <link rel="stylesheet" href="{{ url_for('static', filename='css/journal.css') }}?v=3">
+    <link rel="stylesheet" href="{{ url_for('static', filename='css/journal.css') }}?v=4">
     <!-- Font Awesome (vendored; see static/vendor/VENDORED_HASHES.txt) -->
     <link rel="stylesheet" href="{{ url_for('static', filename='vendor/fontawesome.min.css') }}">
     {% block head %}{% endblock %}
@@ -96,6 +96,7 @@
                 <ul>
                     <li><a href="{{ url_for('journal.submit_manuscript') }}">Submit Manuscript</a></li>
                     <li><a href="{{ url_for('journal.submit_manuscript') }}#guidelines">Author Guidelines</a></li>
+                    <li><a href="{{ url_for('journal.ai_policy') }}">AI Policy</a></li>
                     <li><a href="{{ url_for('journal.resources') }}">Writing Resources</a></li>
                 </ul>
             </div>
@@ -148,8 +149,14 @@
                 }
             }
 
-            // Load saved theme or detect preference
-            const savedTheme = localStorage.getItem('theme');
+            // Load saved theme or detect preference. Storage can be disabled by
+            // browser privacy settings, in which case reads and writes may throw.
+            let savedTheme = null;
+            try {
+                savedTheme = localStorage.getItem('theme');
+            } catch (_) {
+                savedTheme = null;
+            }
             if (savedTheme === 'dark' || (!savedTheme && window.matchMedia('(prefers-color-scheme: dark)').matches)) {
                 applyTheme('dark');
             }
@@ -159,7 +166,11 @@
                 const isDark = html.getAttribute('data-theme') === 'dark';
                 const newTheme = isDark ? 'light' : 'dark';
                 applyTheme(newTheme);
-                localStorage.setItem('theme', newTheme);
+                try {
+                    localStorage.setItem('theme', newTheme);
+                } catch (_) {
+                    // Keep the current page usable even when persistence is blocked.
+                }
             });
         })();
     </script>

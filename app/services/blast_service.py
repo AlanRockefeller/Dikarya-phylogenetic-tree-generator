@@ -19,14 +19,21 @@ NCBI_EFETCH_URL = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi"
 _ncbi_lock = threading.Lock()
 _last_request_time = 0.0
 _MIN_REQUEST_GAP = 1.0 / 3.0  # At least 0.34s between requests (~3 req/s)
+# Wall-clock ceiling for re-fetching a rejected batch one accession at a time.
+# 50 ids at the rate limit cost ~17s when NCBI is healthy; this only bites when
+# it is not, and it is what keeps the pass inside nginx's 300s read timeout.
+_ISOLATION_BUDGET_SECONDS = 60.0
 
-def _ncbi_request(method: str, url: str, **kwargs) -> requests.Response:
+def _ncbi_request(method: str, url: str, max_retries: int = 5, **kwargs) -> requests.Response:
     """
     Helper to perform NCBI requests with:
     - Global rate limiting (min gap between requests)
     - User-Agent header
     - Retries with exponential backoff for suitable errors
     - Respect for Retry-After headers
+
+    ``max_retries`` is settable so a caller making many requests in a row can
+    stop each one from multiplying an NCBI outage by its own backoff schedule.
     """
     global _last_request_time
     
@@ -49,7 +56,7 @@ def _ncbi_request(method: str, url: str, **kwargs) -> requests.Response:
     # 3. Execute with Retries
     # Retry on: Connection errors, Timeouts, HTTP 429, HTTP 5xx
     # Do NOT retry on: HTTP 4xx (except 429)
-    max_retries = 5
+    max_retries = max(1, int(max_retries))
     backoff = 1.0  # Start with 1s
     
     for attempt in range(max_retries):
@@ -497,13 +504,17 @@ def _fetch_blast_results(rid: str) -> Dict[str, List]:
         )
         raise ValueError(f"Failed to parse BLAST JSON response: {e}")
 
-def _fetch_genbank_xml_batch(accessions: List[str]) -> Optional[str]:
+def _fetch_genbank_xml_batch(accessions: List[str]) -> List[str]:
     """
     Fetch GenBank XML for a single batch of accessions.
-    Returns XML string or None on failure.
+
+    Returns a list of XML documents -- normally one for the whole batch, but
+    one per accession when the batch had to be retried individually. Empty when
+    nothing could be fetched. Each document is parsed separately by the caller,
+    since efetch replies cannot simply be concatenated into one XML tree.
     """
     if not accessions:
-        return None
+        return []
         
     ids = ",".join(accessions)
     params = {
@@ -517,10 +528,104 @@ def _fetch_genbank_xml_batch(accessions: List[str]) -> Optional[str]:
         # Use existing helper with retries
         response = _ncbi_request("POST", NCBI_EFETCH_URL, data=params, timeout=(15, 90))
         response.raise_for_status()
-        return response.text
+        return [response.text]
     except Exception as e:
-        logger.error(f"Failed to fetch GenBank XML for batch {accessions[:3]}...: {e}")
-        return None
+        # Log the whole batch, not accessions[:3]. The truncation hid how many
+        # records a single failure was taking down, and the "..." read as if
+        # the batch were always large when it was often one bad id.
+        logger.error(
+            "event=ncbi.batch_failed Failed to fetch GenBank XML batch_size=%s "
+            "accessions=%s error=%s",
+            len(accessions), ",".join(accessions[:50]), e,
+        )
+        # NCBI rejects the entire efetch when any one id is unresolvable, so a
+        # single bad accession used to void every good one beside it. Retry the
+        # survivors individually to find out which id is actually at fault --
+        # but ONLY when the batch was rejected rather than merely unreachable.
+        # This runs synchronously inside a Gunicorn request slot: on a timeout
+        # or a 5xx, splitting a 50-id batch into 50 requests that each retry
+        # with their own exponential backoff turns one slow call into an hour
+        # of them, well past nginx's proxy_read_timeout.
+        if len(accessions) > 1 and _is_rejected_batch(e):
+            return _fetch_genbank_xml_individually(accessions)
+        _report_unresolved_accessions(accessions, 0)
+        return []
+
+
+def _is_rejected_batch(error: Exception) -> bool:
+    """True when NCBI answered and refused, rather than failing to answer.
+
+    A 4xx (other than 429, which _ncbi_request already retries) is NCBI saying
+    it will not resolve these ids -- the case individual isolation can actually
+    fix. Timeouts, connection errors and RetryError mean the service is down or
+    slow, where isolation only multiplies the damage.
+    """
+    response = getattr(error, "response", None)
+    status = getattr(response, "status_code", None)
+    return isinstance(status, int) and 400 <= status < 500 and status != 429
+
+
+def _fetch_genbank_xml_individually(accessions: List[str]) -> List[str]:
+    """Re-fetch a rejected batch one accession at a time, keeping what works.
+
+    Only reached after NCBI refused a whole batch, so the extra requests are
+    bounded by that rare case rather than being the normal path. Everything
+    here is deliberately cheap per accession: this can run inside a Gunicorn
+    request slot, so each id gets one attempt with a short read timeout, and
+    the pass abandons the rest once _ISOLATION_BUDGET_SECONDS is spent. The
+    accessions it gives up on are reported as unresolved like any other, so a
+    truncated pass still shows up as a degradation rather than a silent gap.
+    """
+    documents: List[str] = []
+    failed: List[str] = []
+    deadline = time.monotonic() + _ISOLATION_BUDGET_SECONDS
+
+    for index, accession in enumerate(accessions):
+        if time.monotonic() >= deadline:
+            logger.warning(
+                "event=ncbi.isolation_budget_exhausted Stopped isolating a "
+                "rejected batch after %ss; %s of %s accessions unchecked",
+                _ISOLATION_BUDGET_SECONDS, len(accessions) - index, len(accessions),
+            )
+            failed.extend(accessions[index:])
+            break
+        params = {
+            "db": "nuccore",
+            "id": accession,
+            "rettype": "gb",
+            "retmode": "xml",
+        }
+        try:
+            response = _ncbi_request(
+                "POST", NCBI_EFETCH_URL, max_retries=1, data=params, timeout=(10, 30),
+            )
+            response.raise_for_status()
+            documents.append(response.text)
+        except Exception:
+            failed.append(accession)
+
+    if failed:
+        _report_unresolved_accessions(failed, len(documents))
+
+    return documents
+
+
+def _report_unresolved_accessions(failed: List[str], recovered: int) -> None:
+    """Mark accessions NCBI would not return as a degradation, not a silent gap.
+
+    A tree quietly missing its reference sequences looks like a successful run,
+    which is exactly the failure mode log_degradation() exists to prevent.
+    """
+    from app.services.log_context import log_degradation
+    log_degradation(
+        logger,
+        "ncbi_accessions_unresolved",
+        "NCBI could not resolve every requested accession; sequences for "
+        "these accessions are missing",
+        failed=",".join(failed[:50]),
+        failed_count=len(failed),
+        recovered_count=recovered,
+    )
 
 def _parse_genbank_xml(xml_text: str) -> Dict[str, Dict]:
     """
@@ -820,20 +925,23 @@ def fetch_fasta_for_accessions(accessions: List[str]) -> str:
     
     for i in range(0, len(validated), BATCH_SIZE):
         batch = validated[i : i + BATCH_SIZE]
-        xml_text = _fetch_genbank_xml_batch(batch)
-        
-        if xml_text:
+        xml_documents = _fetch_genbank_xml_batch(batch)
+
+        if not xml_documents:
+            counters["batch_fail"] += 1
+            continue
+
+        for xml_text in xml_documents:
             parsed = _parse_genbank_xml(xml_text)
             records_by_acc.update(parsed["by_acc"])
             records_by_ver.update(parsed["by_ver"])
-            
+
             # counting stats
             for r in parsed["by_acc"].values():
                 if r.get("type_material"): counters["type_structured"] += 1
                 elif "holotype" in r.get("blob", "").lower(): counters["type_keyword"] += 1 # approx check
-        else:
-            counters["batch_fail"] += 1
-            
+
+
     # 2. Reassemble deterministically
     final_lines = []
     missing_for_fallback = []
@@ -884,12 +992,17 @@ def fetch_fasta_for_accessions(accessions: List[str]) -> str:
             if response.status_code == 200:
                 final_lines.append(response.text.strip())
             else:
-                logger.error(f"Fallback FASTA fetch failed: {response.status_code}")
-                # Ultimate fallback: Simple headers with empty sequences? Or just omit?
-                # If we omit, the alignment step might fail. 
-                # Better to include barebones if possible, but we don't have sequence.
-                pass
+                logger.error(
+                    "event=ncbi.fallback_failed Fallback FASTA fetch failed "
+                    "status=%s count=%s",
+                    response.status_code, len(missing_for_fallback),
+                )
+                # These accessions are now definitively absent from the result.
+                # Silently returning without them produced a tree missing its
+                # references that looked like a completely successful run.
+                _report_unresolved_accessions(missing_for_fallback, len(final_lines))
         except Exception as e:
             logger.error(f"Fallback FASTA fetch exception: {e}")
-            
+            _report_unresolved_accessions(missing_for_fallback, len(final_lines))
+
     return "\n".join(final_lines)

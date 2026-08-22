@@ -1659,9 +1659,30 @@ def reconcile_delayed_ncbi_results(job_id: str) -> Dict[str, Any]:
 
         metrics = dict(db_job.metrics or {})
         rerun_details = dict(metrics.get("mycomap_blast_rerun") or {})
-        if not rerun_details.get("ncbi_fallback_local_only"):
+        rebuild_pending = bool(rerun_details.get("ncbi_recompute_pending"))
+        if not rerun_details.get("ncbi_fallback_local_only") and not rebuild_pending:
             # Already reconciled (or never fell back) -- nothing to do.
             return {"status": "noop"}
+
+        if rebuild_pending:
+            input_info_path = (Config.JOB_DIR / job_id) / "input_info.json"
+            params_dict = {}
+            if input_info_path.exists():
+                with open(input_info_path, "r") as f:
+                    params_dict = json.load(f)
+            params_dict["use_current_input"] = True
+            from app.workers.queue import enqueue_recompute_job
+            _rq_id, created = enqueue_recompute_job(
+                job_id, params_dict, return_created=True,
+            )
+            if not created:
+                _schedule_ncbi_recheck(job_id, hours=1)
+                return {"status": "rebuild_waiting"}
+            rerun_details["ncbi_recompute_pending"] = False
+            metrics["mycomap_blast_rerun"] = rerun_details
+            db_job.metrics = metrics
+            db.session.commit()
+            return {"status": "rebuilt", "added_count": rerun_details.get("ncbi_appended_count", 0)}
 
         mycomap_url = str(metrics.get("mycomap_blast_url") or "").strip()
         blast_id = validate_mycomap_url(mycomap_url)
@@ -1749,6 +1770,7 @@ def reconcile_delayed_ncbi_results(job_id: str) -> Dict[str, Any]:
         rerun_details["ncbi_fallback_local_only"] = False
         rerun_details["ncbi_appended_at"] = datetime.now(timezone.utc).isoformat()
         rerun_details["ncbi_appended_count"] = added_count
+        rerun_details["ncbi_recompute_pending"] = added_count > 0
         metrics["mycomap_blast_rerun"] = rerun_details
         db_job.metrics = metrics
         db.session.commit()
@@ -1765,7 +1787,16 @@ def reconcile_delayed_ncbi_results(job_id: str) -> Dict[str, Any]:
 
         from app.workers.queue import enqueue_recompute_job
 
-        enqueue_recompute_job(job_id, params_dict)
+        _rq_id, created = enqueue_recompute_job(
+            job_id, params_dict, return_created=True,
+        )
+        if not created:
+            _schedule_ncbi_recheck(job_id, hours=1)
+            return {"status": "rebuild_waiting", "added_count": added_count}
+        rerun_details["ncbi_recompute_pending"] = False
+        metrics["mycomap_blast_rerun"] = rerun_details
+        db_job.metrics = metrics
+        db.session.commit()
         return {"status": "rebuilt", "added_count": added_count}
 
 
@@ -1836,6 +1867,36 @@ def prepare_inat_tree_job(observation_id: int, *, include_ncbi: bool = True,
     mycomap_url = mycomap_url.strip()
     blast_id = validate_mycomap_url(mycomap_url)
     if not blast_id:
+        # Some older observations contain MycoMap's legacy query-string URL,
+        # which cannot identify a result through the current API. If the
+        # observation still has its ITS barcode, recover automatically by
+        # creating a current search and replacing the field when it appears.
+        from app.services.fasta_utils import clean_dna_sequence
+        raw_its = extract_observation_field_value(
+            observation, DNA_BARCODE_ITS_FIELD_NAME,
+        )
+        if clean_dna_sequence(raw_its or ""):
+            from app.services.log_context import log_degradation
+            log_degradation(
+                logger,
+                "invalid_mycomap_url_replaced",
+                "Saved MycoMap URL was unusable; creating a replacement search from ITS",
+                observation_id=observation_id,
+            )
+            mycomap_rerun_details = _create_mycomap_blast_from_observation(
+                observation,
+                observation_id,
+                mycomap_local_limit=mycomap_local_limit,
+                mycomap_ncbi_limit=mycomap_ncbi_limit,
+                pending_creation_details=mycomap_rerun_details,
+            )
+            return {
+                "status": "waiting_for_ncbi",
+                "notes": _build_inat_job_title(observation_id, genus),
+                "inat_genus": genus,
+                "mycomap_blast_url": mycomap_rerun_details["created_mycomap_url"],
+                "mycomap_rerun_details": mycomap_rerun_details,
+            }
         raise InatTreeError(
             "The observation's Mycomap BLAST Results field does not "
             "contain a valid MycoMap BLAST URL. Edit that iNaturalist field "

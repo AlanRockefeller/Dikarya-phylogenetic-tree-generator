@@ -1,7 +1,12 @@
 from flask import jsonify, request, send_file, url_for
 from flask_login import current_user
 from app.api import bp
-from app.workers.queue import enqueue_job, enqueue_recompute_job, get_job_status
+from app.workers.queue import (
+    active_recompute_snapshot_mtime,
+    enqueue_job,
+    enqueue_recompute_job,
+    get_job_status,
+)
 from app.config import Config
 from app.extensions import db
 from app.models import Job
@@ -104,11 +109,42 @@ def client_log():
 # BLAST API Endpoint
 # =============================================================================
 
+# INSDC nucleotide accessions come in a small number of fixed shapes, and the
+# previous catch-all (1-6 letters + 5-9 digits) was loose enough to accept
+# things that are not accessions at all: an iNaturalist observation id pasted
+# into the accession box ("INAT125467754", 4 letters + 9 digits) matched, was
+# sent to NCBI, and came back as an opaque 400 that took the rest of its batch
+# down with it. Matching the real shapes rejects it here, by name, instead.
+#
+#   1 letter  + 5 digits            e.g. U49845
+#   2 letters + 6 digits            e.g. OR807397, AF123456
+#   2 letters + 8 digits            e.g. KY12345678
+#   RefSeq: 2 letters + '_' + 6, 8 or 9 digits   e.g. NC_012345, NM_001234567
+#   WGS: 4 letters + 2-digit assembly version + 6 or 8 contig digits, so
+#        exactly 4+8 or 4+10 e.g. AAAA01000001. Notably never 4+9, which is
+#        what keeps the observed iNaturalist id from matching this arm.
+#
+# A 4+8 id is genuinely ambiguous -- "INAT12546775" is shape-identical to a
+# real WGS accession, and no pattern can separate them. That case still reaches
+# NCBI, which is why _fetch_genbank_xml_batch also isolates a failing accession
+# rather than letting it void its whole batch.
+_GENBANK_ACCESSION_RE = re.compile(
+    r'^(?:'
+    r'[A-Z]\d{5}'
+    r'|[A-Z]{2}\d{6}'
+    r'|[A-Z]{2}\d{8}'
+    r'|[A-Z]{2}_\d{6}'
+    r'|[A-Z]{2}_\d{8,9}'
+    r'|[A-Z]{4}\d{8}'
+    r'|[A-Z]{4}\d{10}'
+    r')(?:\.\d+)?$',
+    re.IGNORECASE,
+)
+
+
 def _is_genbank_accession(text):
     """Check if text looks like a GenBank accession number."""
-    # Common nucleotide patterns: NC_012345, NM_001234567, OR807397.1, etc.
-    pattern = r'^[A-Z]{1,6}_?\d{5,9}(?:\.\d+)?$'
-    return bool(re.match(pattern, text.strip(), re.IGNORECASE))
+    return bool(_GENBANK_ACCESSION_RE.match((text or "").strip()))
 
 
 MAX_CUSTOM_GENBANK_ACCESSIONS = 200
@@ -2333,6 +2369,22 @@ def create_job():
         job_params.get("sequence_metadata", []),
     )
 
+    # Reject a malformed FASTA here rather than in the worker. This validation
+    # used to live only in run_phylo_job, so a stray character on a sequence
+    # line was accepted with 202, queued, and only reported as a failed job
+    # once a worker picked it up -- the user waited for a run that could never
+    # have started. validate_dna_fasta is pure, so it is safe in-request.
+    #
+    # Only the pasted path is checked: a fasta_upload lands on disk separately
+    # and an accession/MycoMap import has no sequence text yet, both of which
+    # the worker still validates once it has the records in hand.
+    if job_params.get("sequence"):
+        from app.services.fasta_utils import validate_dna_fasta
+        try:
+            validate_dna_fasta(job_params["sequence"])
+        except ValueError as e:
+            return jsonify({"status": "error", "error": str(e)}), 400
+
     try:
         job_id = enqueue_job(job_params)
         
@@ -3078,8 +3130,6 @@ def recompute_tree_job(job_id):
         
     try:
         import json
-        from app.services.tree_edit_service import build_recompute_job_params, recompute_tree
-        
         # Load original params
         input_info_path = job_dir / "input_info.json"
         params_dict = {}
@@ -3103,13 +3153,7 @@ def recompute_tree_job(job_id):
                     "error": f"Unsupported tree method. Choose one of: {', '.join(sorted(VALID_TREE_METHODS))}"
                 }), 400
             params_dict.update(overrides)
-            # Persist so the status page, the viewer's details panel and any
-            # later recompute all report the settings this run actually used.
-            try:
-                with open(input_info_path, "w") as f:
-                    json.dump(params_dict, f, separators=(",", ":"))
-            except OSError as write_err:
-                logger.warning(f"Could not persist recompute overrides for job {job_id}: {write_err}")
+        persisted_params = dict(params_dict)
 
         # Per-request control flags, not pipeline settings. Applied after the
         # write above so they are not persisted into the job's stored params,
@@ -3118,30 +3162,74 @@ def recompute_tree_job(job_id):
         if "use_current_input" in req_data:
             params_dict["use_current_input"] = req_data["use_current_input"]
 
-        if req_data.get("async"):
-            recompute_job_id = enqueue_recompute_job(job_id, params_dict)
+        # Recompute can take hours. It must never run inside one of Gunicorn's
+        # eight request slots: a routine web restart would SIGTERM the tool and
+        # two concurrent requests could write the same output paths. Queue every
+        # request and make unchanged duplicate clicks idempotent.
+        recompute_job_id, created = enqueue_recompute_job(
+            job_id, params_dict, return_created=True,
+        )
+        mutation_requested = bool(overrides) or "use_current_input" in req_data
+        if not created and not mutation_requested:
+            # The viewer's Recompute button posts {"async": true} and nothing
+            # else: the pruning it means to apply lives in tree_state.json,
+            # which the running task snapshotted at its step 1. Prune three more
+            # taxa and click again and the body still looks like a duplicate,
+            # so the request was swallowed and the finished tree still carried
+            # the three taxa with nothing on screen saying why.
+            snapshot = active_recompute_snapshot_mtime(job_id)
+            state_path = job_dir / "tree_state.json"
+            if snapshot is not None:
+                try:
+                    mutation_requested = state_path.stat().st_mtime > snapshot
+                except OSError:
+                    mutation_requested = False
+        if not created and mutation_requested:
+            # Add & Recompute saves input_raw.fasta before it reaches this
+            # endpoint. An already-running task may already have copied its
+            # input into staging, so accepting this as an idempotent duplicate
+            # would make the saved queue/settings disagree with the resulting
+            # tree. Leave the new input in place and make the caller retry once
+            # the active generation finishes.
+            return jsonify({
+                "status": "conflict",
+                "error": (
+                    "Another recompute is already in progress and will not include "
+                    "your newest changes. Wait for it to finish, then recompute "
+                    "again."
+                ),
+                "job_id": job_id,
+                "rq_job_id": recompute_job_id,
+                "redirect_url": url_for('main.job_status', job_id=job_id),
+            }), 409
+        if created:
+            # Only the request that actually created this run may update its
+            # reported settings. A duplicate request cannot alter the params
+            # already captured by the active RQ task.
+            if overrides:
+                try:
+                    with open(input_info_path, "w") as f:
+                        json.dump(persisted_params, f, separators=(",", ":"))
+                except OSError as write_err:
+                    logger.warning(
+                        f"Could not persist recompute overrides for job {job_id}: {write_err}"
+                    )
             if db_job:
-                metrics = db_job.metrics or {}
+                metrics = dict(db_job.metrics or {})
                 metrics["recompute_requested_at"] = datetime.utcnow().isoformat()
                 db_job.metrics = metrics
                 db_job.status = "queued"
                 db.session.commit()
-            return jsonify({
-                "status": "queued",
-                "job_id": job_id,
-                "rq_job_id": recompute_job_id,
-                "redirect_url": url_for('main.job_status', job_id=job_id)
-            }), 202
-
-        job_params = build_recompute_job_params(params_dict)
-        result = recompute_tree(
-            job_dir,
-            job_params,
-            Config,
-            logger,
-            use_current_input=coerce_bool(params_dict.get("use_current_input"), False)[0]
-        )
-        return jsonify(result)
+        return jsonify({
+            "status": "queued" if created else "already_queued",
+            "job_id": job_id,
+            "rq_job_id": recompute_job_id,
+            "redirect_url": url_for('main.job_status', job_id=job_id),
+            "message": (
+                "Tree recompute queued."
+                if created else "A recompute for this tree is already in progress."
+            ),
+        }), 202
         
     except Exception as e:
         return _server_error(e)
@@ -3771,8 +3859,11 @@ def claude_review(job_id):
         return jsonify({"status": "error", "error": "Job not found"}), 404
 
     from app.services.tree_analysis_service import (
+        TreeAnalysisDailyLimit,
         TreeAnalysisError,
+        TreeAnalysisInProgress,
         TreeAnalysisUnavailable,
+        TreeAnalysisUpstreamError,
         is_configured,
         review_job,
     )
@@ -3788,6 +3879,17 @@ def claude_review(job_id):
 
     try:
         payload = review_job(job_dir, force_refresh=force_refresh)
+    except TreeAnalysisDailyLimit as exc:
+        response = jsonify({"status": "error", "error": str(exc)})
+        response.headers["Retry-After"] = str(exc.retry_after_seconds)
+        return response, 429
+    except TreeAnalysisInProgress as exc:
+        # A duplicate of a review already running: a conflicting request for the
+        # same resource, not an outage. Must be caught before the Unavailable
+        # handler below, which it subclasses.
+        response = jsonify({"status": "error", "error": str(exc)})
+        response.headers["Retry-After"] = str(exc.retry_after_seconds)
+        return response, 409
     except TreeAnalysisUnavailable as exc:
         # Out of capacity or misconfigured: a retry may well succeed, so this is
         # deliberately not the same status as a dataset we cannot review at all.
@@ -3797,7 +3899,18 @@ def claude_review(job_id):
             "status": "error",
             "error": "This job has no tree yet, so there is nothing to review.",
         }), 404
+    except TreeAnalysisUpstreamError as exc:
+        # 502, not 400. The browser's request was fine; what failed was the
+        # model's reply -- an empty review, a malformed one, or one that named
+        # sequences this tree does not contain. Reporting that as a client error
+        # blamed the user for an upstream failure and told every retry-on-5xx
+        # client not to bother. Must precede the TreeAnalysisError handler it
+        # subclasses.
+        logger.warning("event=claude_review.upstream_failed reason=%s", type(exc).__name__)
+        return jsonify({"status": "error", "error": str(exc)}), 502
     except TreeAnalysisError as exc:
+        # The job itself has nothing reviewable (no tree, no aligned FASTA, an
+        # empty alignment). That really is about the request.
         logger.warning("event=claude_review.failed reason=%s", type(exc).__name__)
         return jsonify({"status": "error", "error": str(exc)}), 400
     except Exception as e:
@@ -4049,16 +4162,20 @@ def job_events_stream(job_id):
     
     def generate():
         from app.services.log_context import log_degradation_rate_limited
+        from app.services import sse_registry
         stream_started = time.monotonic()
         close_reason = "unexpected_exception"
         pubsub = None
+        stream_token = None
+        registry_conn = None
         try:
             # Connect inside the guarded region so connection/subscription
             # failures are observable and cleanup stays safe.
             r = redis.from_url(Config.REDIS_URL)
             pubsub = r.pubsub()
             pubsub.subscribe(f"job:{job_id}:events")
-            logger.info("event=sse.opened SSE stream opened")
+            registry_conn = r
+            stream_token, _ = sse_registry.open_stream(r, job_id)
             # Send initial snapshot
             snapshot = _build_snapshot(job_id)
             yield f"event: snapshot\ndata: {json.dumps(snapshot)}\n\n"
@@ -4166,8 +4283,25 @@ def job_events_stream(job_id):
                 if job_status not in ('completed', 'failed'):
                     if now - last_db_poll >= DB_POLL_INTERVAL:
                         last_db_poll = now
-                        db.session.expire_all()
-                        db_job_check = Job.query.get(job_id)
+                        try:
+                            db.session.expire_all()
+                            db_job_check = Job.query.get(job_id)
+                        except Exception as db_exc:
+                            # An SSE request can outlive the PostgreSQL SSL
+                            # connection it checked out. Discard that scoped
+                            # session and retry once with a fresh pooled
+                            # connection instead of ending the stream.
+                            from sqlalchemy.exc import OperationalError
+                            if not isinstance(db_exc, OperationalError):
+                                raise
+                            db.session.remove()
+                            log_degradation_rate_limited(
+                                logger,
+                                "sse_db_connection_recovered",
+                                "SSE database connection dropped; retrying with a fresh session",
+                                job_id=job_id,
+                            )
+                            db_job_check = Job.query.get(job_id)
                         logger.debug(f"SSE DB poll for job {job_id}: status={db_job_check.status if db_job_check else 'None'}")
                         if db_job_check and db_job_check.status in ('completed', 'failed'):
                             job_status = db_job_check.status
@@ -4211,9 +4345,14 @@ def job_events_stream(job_id):
                         "SSE PubSub cleanup failed",
                         exception=type(exc).__name__,
                     )
+            remaining = (
+                sse_registry.close_stream(registry_conn, stream_token)
+                if stream_token is not None else 0
+            )
             logger.info(
-                "event=sse.closed SSE stream closed reason=%s duration_seconds=%.3f",
-                close_reason, time.monotonic() - stream_started,
+                "event=sse.closed SSE stream closed reason=%s duration_seconds=%.3f "
+                "open_streams=%s",
+                close_reason, time.monotonic() - stream_started, remaining,
             )
     
     response = Response(

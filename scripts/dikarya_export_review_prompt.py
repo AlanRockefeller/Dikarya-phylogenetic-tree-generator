@@ -1,16 +1,16 @@
 #!/usr/bin/env python3
 """Print the Claude review system prompt or response schema on stdout.
 
-The sudo wrapper reads both from /etc/dikarya/claude-review/, which is root
+The sudo wrapper reads both from /etc/dikarya-claude-review/, which is root
 owned so the web process cannot rewrite the reviewer's own instructions. That
 means the files are a copy of what lives in tree_analysis_service.py, and a copy
 can go stale. This script is the one supported way to refresh them:
 
-    sudo mkdir -p /etc/dikarya/claude-review
+    sudo mkdir -p /etc/dikarya-claude-review
     .venv/bin/python scripts/dikarya_export_review_prompt.py system \\
-        | sudo tee /etc/dikarya/claude-review/system_prompt.txt >/dev/null
+        | sudo tee /etc/dikarya-claude-review/system_prompt.txt >/dev/null
     .venv/bin/python scripts/dikarya_export_review_prompt.py schema \\
-        | sudo tee /etc/dikarya/claude-review/schema.json >/dev/null
+        | sudo tee /etc/dikarya-claude-review/schema.json >/dev/null
 
 Re-run both after changing SYSTEM_PROMPT or RESPONSE_SCHEMA, and bump
 REVIEW_SCHEMA_VERSION at the same time so already-cached reviews are discarded
@@ -33,7 +33,7 @@ from app.services.tree_analysis_service import (  # noqa: E402
     SYSTEM_PROMPT,
 )
 
-INSTALL_DIR = Path("/etc/dikarya/claude-review")
+INSTALL_DIR = Path("/etc/dikarya-claude-review")
 FILES = {"system": "system_prompt.txt", "schema": "schema.json"}
 
 

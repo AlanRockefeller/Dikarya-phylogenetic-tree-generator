@@ -38,7 +38,7 @@ if [ "$#" -ne 0 ]; then
 fi
 
 CLAUDE_BIN=/home/tree/.local/bin/claude
-PROMPT_DIR=/etc/dikarya/claude-review
+PROMPT_DIR=/etc/dikarya-claude-review
 SYSTEM_PROMPT_FILE="$PROMPT_DIR/system_prompt.txt"
 SCHEMA_FILE="$PROMPT_DIR/schema.json"
 
@@ -56,7 +56,10 @@ TIMEOUT_SECONDS=${DIKARYA_CLAUDE_TIMEOUT:-240}
 MAX_BUDGET_USD=${DIKARYA_CLAUDE_MAX_BUDGET:-1.00}
 
 MODEL=${DIKARYA_CLAUDE_MODEL:-claude-opus-5}
-EFFORT=${DIKARYA_CLAUDE_EFFORT:-medium}
+# Must match CLAUDE_REVIEW_EFFORT in app/config.py. If env_keep ever stops
+# propagating the variable through sudo, the fallback should be the fast path
+# that fits inside nginx timeout, not the slow one.
+EFFORT=${DIKARYA_CLAUDE_EFFORT:-low}
 
 # Allowlist rather than pass-through: these reach the CLI as flag values, and a
 # caller-supplied string must never be able to become another flag.
@@ -81,7 +84,7 @@ esac
 
 for required in "$SYSTEM_PROMPT_FILE" "$SCHEMA_FILE"; do
     if [ ! -r "$required" ]; then
-        echo "dikarya-claude-review: missing $required (see install notes)" >&2
+        echo "dikarya-claude-review: cannot read $required -- absent, or not readable by $(id -un) (see install notes)" >&2
         exit 78
     fi
 done

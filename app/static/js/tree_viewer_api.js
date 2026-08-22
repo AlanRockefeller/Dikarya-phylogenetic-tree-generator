@@ -214,7 +214,7 @@ const TreeEditActions = {
             method: 'POST',
             headers: this._buildHeaders(),
             credentials: "same-origin",
-            body: JSON.stringify({})
+            body: JSON.stringify({ async: true })
         });
         const data = await response.json().catch(() => ({}));
         if (!response.ok) {

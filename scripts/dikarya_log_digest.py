@@ -31,7 +31,7 @@ SCANNER_MARKERS = (
     "/id_rsa", "/backup.sql", "/dump.sql", "/database.sql", "/server-status",
     "/solr/", "/jenkins", "/hudson", "/manager/html", "/struts", "/login.action",
     "/telescope", "/debug/default", "/geoserver", "/owa/", "/autodiscover",
-    "/boaform", "/hnap1", "/setup.cgi", "/shell", "/eval-stdin",
+    "/boaform", "/hnap1", "/setup.cgi", "/shell", "/eval-stdin", "/wp/",
     # Appliance / webmail credential probes seen daily against this host.
     "/+cscoe+", "/remote/login", "/dana-na", "/global-protect", "/ecp/",
     "/autodiscover", "/onvif", "/device_service", "/mcp",
@@ -44,6 +44,12 @@ SCANNER_EXACT_PATHS = frozenset({
     "/config", "/env", "/settings", "/api/config", "/api/env", "/api/settings",
     "/api/v1/config", "/api/v1/env", "/api/v1/settings", "/server-info",
     "/console", "/status", "/info",
+    # Auth/console routes this app has never had. One scanner probed each of
+    # these 88 times in a day, in the same sweep as the /login and /signin
+    # probes above, but they were landing in the product bucket and crowding
+    # out the real 4xx entries. Dikarya's own auth lives at /auth/login.
+    "/signup", "/register", "/dashboard", "/admin", "/account",
+    "/auth/callback", "/api/auth/signin", "/login.html", "/sftp-config.json",
 })
 # UUID form used for RQ job ids in worker logs.
 UUID_PATTERN = r'[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}'
@@ -119,7 +125,7 @@ def context_fields(text):
     return dict(re.findall(r'(\w+)=([^\s\]]+)', match.group("body")))
 
 
-def is_noise_4xx(path, ua):
+def is_noise_4xx(path, ua, status=0, method=""):
     """Classify a 4xx target as crawler/scanner/static noise.
 
     ``path`` must already be query-free (see normalize_path): scanners append
@@ -127,6 +133,14 @@ def is_noise_4xx(path, ua):
     fall through to the product bucket purely because it did not *end* in .php.
     """
     lower = path.split("?", 1)[0].lower()
+    # A 405 means the route exists but not for that verb, which the UI never
+    # does -- it only calls endpoints it knows. In practice these are scanners
+    # POSTing to document routes: two IPs sent 312 of the 317 "POST /" 405s in
+    # one day, and they were filed as product-relevant errors. A 405 under
+    # /api/ is still worth seeing, since that would be a genuine route/frontend
+    # mismatch rather than a probe.
+    if status == 405 and not lower.startswith("/api/"):
+        return True
     return (
         lower.endswith(STATIC_SUFFIXES)
         or lower.endswith((".php", ".asp", ".aspx", ".jsp", ".cgi", ".bak", ".sql", ".yml", ".yaml", ".ini"))
@@ -186,7 +200,9 @@ def analyze_access(cutoff):
                 if status >= 500:
                     server_errors[(status, endpoint)] += 1
                 elif status >= 400:
-                    target = noise_4xx if is_noise_4xx(normalized, match.group("ua")) else product_4xx
+                    target = noise_4xx if is_noise_4xx(
+                        normalized, match.group("ua"), status, match.group("method")
+                    ) else product_4xx
                     target[(status, endpoint)] += 1
                 if status == 429:
                     rate_limited[match.group("ip")] += 1
@@ -325,12 +341,33 @@ def _first_match(patterns, line):
     return None
 
 
+# Lines that belong to the record above them rather than starting a new one.
+_CONTINUATION_PREFIXES = (
+    " ", "\t", "Traceback (most recent call last)", "During handling of",
+    "The above exception", "  File \"",
+)
+
+
+def _is_record_continuation(line):
+    """True when a timestamp-less line continues the preceding log record."""
+    if not line.strip():
+        return True
+    if line.startswith((" ", "\t")):
+        return True
+    if line.startswith(_CONTINUATION_PREFIXES):
+        return True
+    # "SomeError: detail" -- the final line of a traceback.
+    return bool(EXCEPTION_RE.match(line.strip()))
+
+
 def analyze_worker(cutoff, grace=timedelta(minutes=60)):
     """Summarize worker job lifecycle from worker.log alone (no Redis, no DB)."""
     files = log_files("worker", cutoff)
     counts = collections.Counter()
     started = {}
     terminal = set()
+    last_start = {}
+    retry_markers = collections.Counter()
     oldest = newest = None
     lines = unparsed = contextual = window_lines = 0
     for path in files:
@@ -339,7 +376,13 @@ def analyze_worker(cutoff, grace=timedelta(minutes=60)):
                 lines += 1
                 when = parse_log_ts(line)
                 if when is None:
-                    unparsed += 1
+                    # Traceback bodies, RQ banners and the worker's own startup
+                    # echo are continuations of the record above them, not
+                    # unreadable lines. Counting them as "unparsed" reported
+                    # 124 failures on a file with none, which made the coverage
+                    # footer look broken every time a job raised.
+                    if not _is_record_continuation(line):
+                        unparsed += 1
                     continue
                 if when < cutoff:
                     continue
@@ -357,11 +400,37 @@ def analyze_worker(cutoff, grace=timedelta(minutes=60)):
                 event_match = STABLE_EVENT_RE.search(line)
                 if event_match and fields.get("job"):
                     state = event_match.group(1)
-                    counts[state] += 1
                     if state == "started":
-                        started.setdefault(fields["job"], when)
+                        job_id = fields["job"]
+                        if job_id in terminal:
+                            # Application job UUIDs are deliberately reused as
+                            # RQ IDs for later recomputes. A start after a
+                            # terminal event is a new lifecycle.
+                            terminal.remove(job_id)
+                            started.pop(job_id, None)
+                            last_start.pop(job_id, None)
+                            retry_markers.pop(job_id, None)
+                        previous = last_start.get(job_id)
+                        if job_id not in started:
+                            counts["started"] += 1
+                            started[job_id] = when
+                        elif retry_markers[job_id]:
+                            # The RQ retry record already counted this attempt.
+                            retry_markers[job_id] -= 1
+                        elif not (
+                            previous
+                            and previous[1] == "rq"
+                            and abs((when - previous[0]).total_seconds()) <= 30
+                        ):
+                            # RQ does not consistently emit its retry wording,
+                            # but each resumed task emits another stable start.
+                            counts["retried"] += 1
+                        last_start[job_id] = (when, "stable")
                     else:
-                        terminal.add(fields["job"])
+                        job_id = fields["job"]
+                        if job_id not in terminal:
+                            counts[state] += 1
+                            terminal.add(job_id)
                     continue
 
                 # 2. RQ terminal lines. Checked before starts because "Job OK
@@ -370,8 +439,9 @@ def analyze_worker(cutoff, grace=timedelta(minutes=60)):
                 for state, patterns in RQ_TERMINAL_RES.items():
                     job_id = _first_match(patterns, line)
                     if job_id:
-                        counts[state] += 1
-                        terminal.add(job_id)
+                        if job_id not in terminal:
+                            counts[state] += 1
+                            terminal.add(job_id)
                         matched = True
                         break
                 if matched:
@@ -380,12 +450,30 @@ def analyze_worker(cutoff, grace=timedelta(minutes=60)):
                 job_id = _first_match(RQ_RETRY_RES, line)
                 if job_id:
                     counts["retried"] += 1
+                    retry_markers[job_id] += 1
                     continue
 
                 start_match = RQ_START_RE.search(line)
                 if start_match and start_match.group("desc").strip() != "Job OK":
-                    counts["started"] += 1
-                    started.setdefault(start_match.group("id"), when)
+                    job_id = start_match.group("id")
+                    if job_id in terminal:
+                        terminal.remove(job_id)
+                        started.pop(job_id, None)
+                        last_start.pop(job_id, None)
+                        retry_markers.pop(job_id, None)
+                    previous = last_start.get(job_id)
+                    if job_id not in started:
+                        counts["started"] += 1
+                        started[job_id] = when
+                    elif retry_markers[job_id]:
+                        retry_markers[job_id] -= 1
+                    elif not (
+                        previous
+                        and previous[1] == "stable"
+                        and abs((when - previous[0]).total_seconds()) <= 30
+                    ):
+                        counts["retried"] += 1
+                    last_start[job_id] = (when, "rq")
 
     # "Unterminated" only means something once a job has had time to finish.
     # Anything younger than the grace period is simply still running.

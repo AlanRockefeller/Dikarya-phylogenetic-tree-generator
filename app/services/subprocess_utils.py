@@ -141,6 +141,12 @@ def tool_failure_message(tool_label: str, exit_code: int,
             f"{tool_label} was stopped unexpectedly by the server. The usual "
             "causes are memory pressure, a job timeout, or a server restart." + contact
         )
+    if exit_code == -15:
+        return (
+            f"{tool_label} was interrupted before it completed, usually because "
+            "the application or background worker was restarted. Retry the job."
+            + contact
+        )
     if exit_code == -11:
         return f"{tool_label} crashed unexpectedly (segmentation fault)." + contact
     if exit_code == -6:
@@ -149,6 +155,29 @@ def tool_failure_message(tool_label: str, exit_code: int,
             + contact
         )
     return f"{tool_label} failed with exit code {exit_code}." + contact
+
+
+def log_tool_failure(tool_logger, tool_label: str, exit_code: int,
+                     stats: Optional[dict] = None, **context) -> None:
+    """Record why an external tool failed, including what it printed.
+
+    ``tool_failure_message()`` is written for the user's job page and carries
+    only the exit code. That left operators with nothing: BMGE failing under
+    SUBPROCESS_MEMORY_LIMIT_MB reached the logs as a bare "exit code 1" because
+    the JVM writes its diagnosis to stdout and only stderr was persisted.
+    Both tails are emitted here so the cause survives in errors.log.
+    """
+    stats = stats or {}
+    fields = "".join(f" {key}={value}" for key, value in sorted(context.items()))
+
+    def _tail(name: str) -> str:
+        lines = [line for line in (stats.get(name) or []) if line.strip()]
+        return " | ".join(lines[-5:]) if lines else "-"
+
+    tool_logger.error(
+        "event=tool.failed tool=%s exit_code=%s%s stderr_tail=%r stdout_tail=%r",
+        tool_label, exit_code, fields, _tail("stderr_tail"), _tail("stdout_tail"),
+    )
 
 
 def _kill_child(process) -> None:
@@ -280,23 +309,30 @@ def run_command_streaming(
         - stdout_lines: int (count)
         - stderr_lines: int (count)
         - stderr_tail: List[str] (last 30 lines for error reporting)
+        - stdout_tail: List[str] (last 30 lines for error reporting)
         - duration_seconds: float
     """
     import os
     import time
     from collections import deque
-    
+
     start_time = time.time()
-    
+
     stats = {
         "stdout_lines": 0,
         "stderr_lines": 0,
         "stderr_tail": [],
+        "stdout_tail": [],
         "duration_seconds": 0.0,
     }
-    
-    # Ring buffer for last 30 stderr lines
+
+    # Ring buffers for the last 30 lines of each stream. stdout is kept for the
+    # same reason as stderr: a tool that fails before it produces any stderr
+    # still explains itself somewhere. The JVM is the case that forced this --
+    # "Could not reserve enough space for object heap" goes to stdout, so a
+    # BMGE failure used to reach the logs as a bare "exit code 1".
     stderr_tail_buffer: deque = deque(maxlen=30)
+    stdout_tail_buffer: deque = deque(maxlen=30)
     
     try:
         # Augment PATH
@@ -375,6 +411,7 @@ def run_command_streaming(
 
                         if stream_name == 'stdout':
                             stats["stdout_lines"] += 1
+                            stdout_tail_buffer.append(line)
                             if on_stdout_line:
                                 try:
                                     on_stdout_line(line)
@@ -440,12 +477,14 @@ def run_command_streaming(
         
         stats["duration_seconds"] = time.time() - start_time
         stats["stderr_tail"] = list(stderr_tail_buffer)
+        stats["stdout_tail"] = list(stdout_tail_buffer)
         
         return exit_code, stats
 
     except FileNotFoundError as e:
         stats["duration_seconds"] = time.time() - start_time
         stats["stderr_tail"] = list(stderr_tail_buffer)
+        stats["stdout_tail"] = list(stdout_tail_buffer)
         stats["stderr_tail"].append(_log_missing_executable(args, e))
         return EXIT_CODE_TOOL_NOT_FOUND, stats
 
@@ -454,6 +493,7 @@ def run_command_streaming(
         _kill_child(process)
         stats["duration_seconds"] = time.time() - start_time
         stats["stderr_tail"] = list(stderr_tail_buffer)
+        stats["stdout_tail"] = list(stdout_tail_buffer)
         stats["stderr_tail"].append(
             f"[TIMEOUT] {Path(args[0]).name} exceeded its {timeout}s time limit and was stopped."
         )
@@ -469,6 +509,7 @@ def run_command_streaming(
         _kill_child(process)
         stats["duration_seconds"] = time.time() - start_time
         stats["stderr_tail"] = list(stderr_tail_buffer)
+        stats["stdout_tail"] = list(stdout_tail_buffer)
         stats["stderr_tail"].append(
             f"[TIMEOUT] {Path(args[0]).name} was stopped when the job's time limit was reached."
         )
@@ -479,5 +520,6 @@ def run_command_streaming(
         _kill_child(process)
         stats["duration_seconds"] = time.time() - start_time
         stats["stderr_tail"] = list(stderr_tail_buffer)
+        stats["stdout_tail"] = list(stdout_tail_buffer)
         stats["stderr_tail"].append(f"[ERROR] {str(e)}")
         return -1, stats
