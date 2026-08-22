@@ -1,0 +1,30 @@
+/var/www/dikarya/var/logs/access.log /var/www/dikarya/var/logs/error.log /var/www/dikarya/var/logs/errors.log /var/www/dikarya/var/logs/worker.log {
+    daily
+    maxsize 25M
+    rotate 14
+    maxage 30
+    missingok
+    notifempty
+    compress
+    dateext
+    dateformat -%Y%m%d-%H%M%S
+    copytruncate
+}
+
+# Alan 8/15/26 - The metrics collector appends one JSON line per minute to this
+# file and nothing ever truncated it, so it had grown to 36 MB since December and
+# would keep going at roughly 50 MB a year. Nothing reads it back -- the
+# monitoring dashboard calls collect_system_metrics() live -- so it is a pure
+# write-only sink that only ever cost disk. Same policy as the logs above.
+/var/www/dikarya/var/metrics/system_metrics.jsonl {
+    daily
+    maxsize 25M
+    rotate 7
+    maxage 30
+    missingok
+    notifempty
+    compress
+    dateext
+    dateformat -%Y%m%d-%H%M%S
+    copytruncate
+}

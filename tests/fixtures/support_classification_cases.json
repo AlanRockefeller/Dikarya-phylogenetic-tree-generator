@@ -1,0 +1,236 @@
+{
+  "_comment": [
+    "Shared truth table for support-scale classification. Consumed by",
+    "tests/test_tree_analysis_metrics.py, which runs every case against both",
+    "_classify_support() in app/services/tree_analysis_service.py and",
+    "window.classifySupportType() in app/static/js/tree_viewer_phylotree_v2.js.",
+    "Add a case here rather than to either implementation alone.",
+    "`alrt_only` is optional and defaults to false: it marks an IQ-TREE run that",
+    "used -alrt without ultrafast bootstrap, whose node labels are single SH-aLRT",
+    "percentages rather than UFBoot ones."
+  ],
+  "cases": [
+    {
+      "name": "fasttree SH-like values look like posteriors but are not",
+      "values": [
+        0.95,
+        0.87,
+        1.0
+      ],
+      "has_dual": false,
+      "tree_method": "fasttree",
+      "expected": "SH"
+    },
+    {
+      "name": "raxml bootstraps of 0/1/0.95 are still bootstraps",
+      "values": [
+        0.0,
+        1.0,
+        0.95
+      ],
+      "has_dual": false,
+      "tree_method": "raxml",
+      "expected": "BS"
+    },
+    {
+      "name": "ordinary raxml bootstrap percentages",
+      "values": [
+        70.0,
+        95.0,
+        42.0
+      ],
+      "has_dual": false,
+      "tree_method": "raxml",
+      "expected": "BS"
+    },
+    {
+      "name": "raxml-ng alias normalizes",
+      "values": [
+        88.0
+      ],
+      "has_dual": false,
+      "tree_method": "RAxML-NG",
+      "expected": "BS"
+    },
+    {
+      "name": "method casing and whitespace are normalized",
+      "values": [
+        0.5,
+        88.0
+      ],
+      "has_dual": false,
+      "tree_method": "  RaxML  ",
+      "expected": "BS"
+    },
+    {
+      "name": "iqtree single-support UFBoot written as a proportion",
+      "values": [
+        0.88,
+        0.97
+      ],
+      "has_dual": false,
+      "tree_method": "iqtree",
+      "expected": "UFBOOT"
+    },
+    {
+      "name": "iqtree ordinary UFBoot percentages",
+      "values": [
+        80.0,
+        95.0
+      ],
+      "has_dual": false,
+      "tree_method": "iqtree",
+      "expected": "UFBOOT"
+    },
+    {
+      "name": "iqtree dual SH-aLRT/UFBoot keeps its own scale",
+      "values": [
+        95.0,
+        99.0
+      ],
+      "has_dual": true,
+      "tree_method": "iqtree",
+      "expected": "ALRT_UFBOOT"
+    },
+    {
+      "name": "dual labels win even for a method that should not produce them",
+      "values": [
+        95.0
+      ],
+      "has_dual": true,
+      "tree_method": "raxml",
+      "expected": "ALRT_UFBOOT"
+    },
+    {
+      "name": "mrbayes posterior probabilities",
+      "values": [
+        0.95,
+        1.0
+      ],
+      "has_dual": false,
+      "tree_method": "mrbayes",
+      "expected": "PP"
+    },
+    {
+      "name": "no support values at all",
+      "values": [],
+      "has_dual": false,
+      "tree_method": "raxml",
+      "expected": "none"
+    },
+    {
+      "name": "no support values and no method",
+      "values": [],
+      "has_dual": false,
+      "tree_method": "",
+      "expected": "none"
+    },
+    {
+      "name": "unknown method falls back to value shape: proportions",
+      "values": [
+        0.95,
+        0.99
+      ],
+      "has_dual": false,
+      "tree_method": "phyml",
+      "expected": "PP"
+    },
+    {
+      "name": "unknown method falls back to value shape: percentages",
+      "values": [
+        70.0,
+        95.0,
+        1.0
+      ],
+      "has_dual": false,
+      "tree_method": "",
+      "expected": "BS"
+    },
+    {
+      "name": "unknown method with both scales present stays mixed",
+      "values": [
+        0.95,
+        88.0
+      ],
+      "has_dual": false,
+      "tree_method": "legacy",
+      "expected": "mixed"
+    },
+    {
+      "name": "neighbour joining carrying stray values uses the shape fallback",
+      "values": [
+        0.9
+      ],
+      "has_dual": false,
+      "tree_method": "nj",
+      "expected": "PP"
+    },
+    {
+      "name": "iq-tree 2 with a space normalizes to iqtree",
+      "values": [
+        92.0
+      ],
+      "has_dual": false,
+      "tree_method": "IQ-TREE 2",
+      "expected": "UFBOOT"
+    },
+    {
+      "name": "fasttree with a space normalizes to fasttree",
+      "values": [
+        0.91
+      ],
+      "has_dual": false,
+      "tree_method": "Fast Tree",
+      "expected": "SH"
+    },
+    {
+      "name": "raxml ng with a space normalizes to raxml",
+      "values": [
+        0.4,
+        0.9
+      ],
+      "has_dual": false,
+      "tree_method": "RAxML NG",
+      "expected": "BS"
+    },
+    {
+      "name": "iqtree alrt-only labels are SH-aLRT, not bootstrap",
+      "values": [
+        88.0,
+        95.0
+      ],
+      "has_dual": false,
+      "tree_method": "iqtree",
+      "alrt_only": true,
+      "expected": "ALRT"
+    },
+    {
+      "name": "iqtree alrt-only with dual labels is still the dual scale",
+      "values": [
+        95.0
+      ],
+      "has_dual": true,
+      "tree_method": "iqtree",
+      "alrt_only": true,
+      "expected": "ALRT_UFBOOT"
+    },
+    {
+      "name": "alrt_only does not reclassify a non-iqtree builder",
+      "values": [
+        88.0
+      ],
+      "has_dual": false,
+      "tree_method": "raxml",
+      "alrt_only": true,
+      "expected": "BS"
+    },
+    {
+      "name": "alrt_only with no values at all is still none",
+      "values": [],
+      "has_dual": false,
+      "tree_method": "iqtree",
+      "alrt_only": true,
+      "expected": "none"
+    }
+  ]
+}

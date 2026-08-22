@@ -1,0 +1,29 @@
+# Weekly Dikarya job-artifact sweep.
+#
+# Install for the `dikarya` user (NOT `tree`):
+#     sudo crontab -u dikarya /var/www/dikarya/ops/cron/dikarya-reclaim-job-space
+# Inspect:  sudo crontab -u dikarya -l
+# Remove:   sudo crontab -u dikarya -r
+#
+# Must run as `dikarya`. var/jobs is dikarya:dikarya, so the `tree` user cannot
+# write there at all, and artifacts created by root would be owned by root and
+# then unwritable by the web and worker processes that have to rewrite them on
+# recompute.
+#
+# Runs 03:20 UTC every Sunday and reclaims space in var/jobs by:
+#   - deleting tree/*_input_sanitized.fasta (tool scratch, never read back)
+#   - stripping MAFFT progress chatter from logs/alignment.log
+#   - re-serializing tree_state.json / input_info.json compactly
+#   - gzipping the trimAl HTML reports and the aligned/trimmed FASTAs
+#
+# Nothing is lost: every reader goes through app/services/artifact_storage.py,
+# which transparently decompresses. --min-age-hours 24 means a running or
+# recently finished job is never touched.
+#
+# Log goes to the dikarya user's home rather than var/logs/, so it does not
+# interleave with the app's own rotated logs.
+
+SHELL=/bin/bash
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+20 3 * * 0 mkdir -p $HOME/.dikarya/reclaim && cd /var/www/dikarya && /var/www/dikarya/.venv/bin/python /var/www/dikarya/scripts/dikarya_reclaim_job_space.py --apply --min-age-hours 24 --quiet > $HOME/.dikarya/reclaim/$(date -u +\%Y-\%m-\%d).txt 2>&1; find $HOME/.dikarya/reclaim -name '*.txt' -mtime +90 -delete

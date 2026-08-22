@@ -1,0 +1,42 @@
+#!/bin/sh
+# Import smoke check. Run this before restarting the web or worker service.
+#
+# Why this exists: on 2026-08-14, app/workers/tasks.py was deployed importing a
+# name that app/services/log_context.py did not define yet. That single
+# ImportError had two blast radii, because enqueue_job() imports the worker task
+# module inside the web request handler:
+#
+#   * POST /api/job returned 500 -- users could not submit at all.
+#   * Seven already-queued jobs died in the worker with RQ's misleading
+#     "ValueError: Invalid attribute name: run_phylo_job", which is what
+#     import_attribute() reports when the module behind the name fails to
+#     import.
+#
+# Neither surfaced until real traffic hit it, 20 minutes after the restart.
+# Importing the modules is enough to catch it: the failure was at import time.
+#
+# This deliberately does NOT call create_app(). That needs SECRET_KEY from
+# /etc/dikarya/dikarya.environment.live, which is root-only, so an agent or a
+# developer running as `tree` could not use this check if it did.
+#
+# Usage:
+#   scripts/dikarya-preflight && sudo /usr/local/sbin/restart-dikarya-web
+#
+# Exits 0 when every module imports, 1 otherwise.
+set -eu
+
+cd "$(dirname "$0")/.."
+
+if [ ! -x .venv/bin/python ]; then
+    echo "preflight: .venv/bin/python not found -- run from the Dikarya checkout" >&2
+    exit 1
+fi
+
+# Modules that must import cleanly for the app to serve or process a job. Add to
+# this list, do not replace it.
+if .venv/bin/python -c "import app.workers.tasks, app.workers.queue, app.api.routes, app.api_v1.routes, app.main.routes"; then
+    echo "preflight: imports OK"
+else
+    echo "preflight: FAILED -- do not restart; the traceback above is what users would get as a 500" >&2
+    exit 1
+fi
