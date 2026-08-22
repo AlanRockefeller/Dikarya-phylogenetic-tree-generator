@@ -1,0 +1,470 @@
+"""Tree rooting heuristics for BLAST-result trees.
+
+Provides choose_auto_root_target(), a conservative auto-rooting helper that
+anchors on a known sequence of interest (focal tip) and picks the most distant
+high-quality candidate as the display root. This is a visualization heuristic,
+not a claim about the true evolutionary root.
+"""
+import json
+import logging
+import math
+from collections import deque
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
+
+from app.services.artifact_storage import artifact_exists, open_artifact
+
+logger = logging.getLogger(__name__)
+
+try:
+    from Bio import Phylo, SeqIO
+    HAS_BIOPYTHON = True
+except ImportError:
+    HAS_BIOPYTHON = False
+
+# Blue used by the iNaturalist source-tip highlight in the Default selection
+# set. Treat this as the canonical marker of "sequence of interest" when the
+# state has not been set explicitly.
+BLUE_HIGHLIGHT_COLOR = "#1f77b4"
+
+# Conservative quality thresholds for candidate hits.
+MIN_OVERLAP_FRACTION = 0.85
+MIN_RAW_LENGTH_FRACTION = 0.90
+MAX_AMBIGUOUS_FRACTION = 0.05
+# Absolute floor on aligned overlap. The fraction-based thresholds scale with
+# the focal sequence's length, so a very short focal (a tiny fragment) makes
+# them trivially small and lets near-empty candidates through. Requiring a
+# minimum absolute overlap keeps distance-based rooting from trusting a sliver
+# of shared residues; when the focal itself is shorter than this, nothing
+# qualifies and rooting falls back to midpoint, which is the safe choice for a
+# fragment too short to place reliably.
+MIN_ABSOLUTE_OVERLAP = 30
+# Alan 8/4/26 - A root target that sits within a few nodes of the focal tip splits
+# the focal's own clade: rooting there strands the focal at the base of the drawing
+# while its nearest relatives get pushed to the opposite end. Tips this close are
+# only ever "most distant" because of an aberrant terminal branch (a rogue or
+# chimeric sequence), so prefer candidates outside this neighborhood.
+LOCAL_NEIGHBORHOOD_EDGES = 4
+UNINFORMATIVE_EPITHETS = {
+    "aff",
+    "cf",
+    "clade",
+    "clone",
+    "complex",
+    "environmental",
+    "group",
+    "nr",
+    "sp",
+    "spp",
+    "uncultured",
+}
+
+
+@dataclass
+class RootChoice:
+    mode: str  # auto, most_divergent_hit, midpoint_fallback, prompt_for_sequence_of_interest, none
+    query_tip: Optional[str] = None
+    target_name: Optional[str] = None
+    reason: str = ""
+    warnings: List[str] = field(default_factory=list)
+    score: Optional[float] = None
+    candidate_count: int = 0
+    rejected_count: int = 0
+
+    def to_info(self, chosen_by: str) -> Dict[str, Any]:
+        return {
+            "query_tip": self.query_tip,
+            "chosen_root_target": self.target_name,
+            "chosen_by": chosen_by,
+            "reason": self.reason,
+            "warnings": list(self.warnings),
+            "candidate_count": self.candidate_count,
+            "rejected_count": self.rejected_count,
+            "score": self.score,
+        }
+
+
+# ---------------------------------------------------------------------------
+# Focal-tip resolution
+# ---------------------------------------------------------------------------
+
+def _iter_tip_names(node: Dict[str, Any]):
+    """Yield tip (terminal) names from a tree_structure dict."""
+    if not isinstance(node, dict):
+        return
+    children = node.get("children")
+    if children:
+        for c in children:
+            yield from _iter_tip_names(c)
+    else:
+        # Prefer original_name: selection_sets and pruned_taxa key on the stable
+        # original tip id, not the post-rename display label. The iNat source
+        # highlight renames the tip and stores the *pre-rename* id in Default.
+        name = node.get("original_name") or node.get("name")
+        if name:
+            yield name
+
+
+def _tree_tip_set(state: Dict[str, Any]) -> set:
+    structure = state.get("tree_structure") or {}
+    return set(_iter_tip_names(structure))
+
+
+def resolve_sequence_of_interest(state: Dict[str, Any]) -> Tuple[Optional[str], str, List[str]]:
+    """Resolve the focal tip from durable state.
+
+    Resolution order:
+      1. Explicit `sequence_of_interest` field (if still present in tree).
+      2. Single member of the Default selection set when its color is blue
+         (#1f77b4), which is how iNat-imported jobs mark the source tip.
+
+    Returns (tip_name, source_label, warnings).
+    """
+    warnings: List[str] = []
+    tips = _tree_tip_set(state)
+
+    explicit = state.get("sequence_of_interest")
+    if explicit:
+        if explicit in tips:
+            return explicit, state.get("sequence_of_interest_source") or "explicit", warnings
+        warnings.append(f"Stored sequence_of_interest '{explicit}' not present in tree.")
+
+    sel_sets = state.get("selection_sets") or {}
+    colors = state.get("selection_set_colors") or {}
+    default_color = (colors.get("Default") or "").lower()
+    default_members = sel_sets.get("Default") or []
+    if isinstance(default_members, list) and default_color == BLUE_HIGHLIGHT_COLOR.lower():
+        present = [m for m in default_members if m in tips]
+        if len(present) == 1:
+            return present[0], "inat_highlight", warnings
+        if len(present) > 1:
+            warnings.append(
+                f"Multiple blue-highlighted tips ({len(present)}); explicit sequence_of_interest required."
+            )
+        elif default_members:
+            warnings.append("Blue-highlighted tips not present in current tree.")
+
+    return None, "unknown", warnings
+
+
+# ---------------------------------------------------------------------------
+# Alignment quality checks
+# ---------------------------------------------------------------------------
+
+def _load_alignment(job_dir: Path) -> Dict[str, str]:
+    """Return {tip_name: aligned_sequence}. Prefers trimmed alignment."""
+    if not HAS_BIOPYTHON:
+        return {}
+    candidates = [
+        job_dir / "alignment" / "alignment_pruned_trimmed.fasta",
+        job_dir / "alignment" / "alignment_pruned_aligned.fasta",
+        job_dir / "alignment" / "alignment_trimmed.fasta",
+        job_dir / "alignment" / "alignment_raw.fasta",
+    ]
+    for path in candidates:
+        if artifact_exists(path):
+            try:
+                seqs: Dict[str, str] = {}
+                with open_artifact(path, "rt") as handle:
+                    for rec in SeqIO.parse(handle, "fasta"):
+                        seq = str(rec.seq).upper()
+                        for name in (rec.id, rec.name, rec.description):
+                            if name:
+                                seqs[str(name).strip()] = seq
+                if seqs:
+                    return seqs
+            except Exception as e:
+                logger.warning("Failed to parse alignment %s: %s", path, e)
+    return {}
+
+
+def _seq_stats(seq: str) -> Tuple[int, int, int]:
+    """Return (raw_length, gap_count, ambiguous_count)."""
+    gaps = seq.count("-") + seq.count(".")
+    raw_len = len(seq) - gaps
+    ambiguous = sum(1 for c in seq if c not in "ACGTU-.")
+    return raw_len, gaps, ambiguous
+
+
+def _aligned_overlap(focal: str, other: str) -> int:
+    """Count alignment columns where both have a non-gap residue."""
+    n = min(len(focal), len(other))
+    overlap = 0
+    for i in range(n):
+        a = focal[i]
+        b = other[i]
+        if a not in "-." and b not in "-.":
+            overlap += 1
+    return overlap
+
+
+def _assess_candidate(focal_seq: str, focal_raw_len: int,
+                      cand_seq: str) -> Tuple[bool, Optional[str]]:
+    """Return (acceptable, rejection_reason)."""
+    if not cand_seq:
+        return False, "no_aligned_sequence"
+    raw_len, _gaps, amb = _seq_stats(cand_seq)
+    min_raw_len = max(1, math.ceil(MIN_RAW_LENGTH_FRACTION * focal_raw_len))
+    if raw_len < min_raw_len:
+        return False, "too_short"
+    if raw_len and amb / raw_len > MAX_AMBIGUOUS_FRACTION:
+        return False, "high_ambiguity"
+    overlap = _aligned_overlap(focal_seq, cand_seq)
+    min_overlap = max(MIN_ABSOLUTE_OVERLAP, math.ceil(MIN_OVERLAP_FRACTION * focal_raw_len))
+    if overlap < min_overlap:
+        return False, "low_overlap"
+    return True, None
+
+
+def _extract_binomial(label: str) -> Optional[Tuple[str, str]]:
+    """Best-effort genus/species parser for labels that include accessions first."""
+    if not label:
+        return None
+    cleaned = (
+        str(label)
+        .replace("_", " ")
+        .replace(":", " ")
+        .replace("/", " ")
+        .replace("(", " ")
+        .replace(")", " ")
+        .replace("[", " ")
+        .replace("]", " ")
+    )
+    tokens = [token.strip(".,;\"'") for token in cleaned.split()]
+    for i in range(len(tokens) - 1):
+        genus = tokens[i]
+        epithet = tokens[i + 1]
+        if not genus or not epithet:
+            continue
+        if not genus[0].isupper() or not genus.replace("-", "").isalpha():
+            continue
+        raw_epithet = epithet.rstrip(".")
+        if not raw_epithet or not raw_epithet[0].islower():
+            continue
+        normalized_epithet = raw_epithet.lower()
+        if normalized_epithet in UNINFORMATIVE_EPITHETS:
+            continue
+        if not normalized_epithet.replace("-", "").isalpha():
+            continue
+        return genus.lower(), normalized_epithet
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Tree / distance helpers
+# ---------------------------------------------------------------------------
+
+def _load_phylo_tree(job_dir: Path):
+    if not HAS_BIOPYTHON:
+        return None
+    for name in ("tree_pruned.newick", "tree_original.newick"):
+        path = job_dir / "tree" / name
+        if path.exists():
+            try:
+                return Phylo.read(str(path), "newick")
+            except Exception as e:
+                logger.warning("Failed to read %s: %s", path, e)
+    return None
+
+
+def _tree_has_branch_lengths(tree) -> bool:
+    return any((c.branch_length or 0) > 0 for c in tree.find_clades())
+
+
+@dataclass
+class TipDistance:
+    """How far another tip sits from the focal tip, measured three ways."""
+    patristic: float          # summed branch lengths, focal tip -> this tip
+    attachment: float         # same, but stopping at this tip's parent node
+    edges: int                # number of tree edges traversed
+
+
+def _patristic_distances(tree, focal_name: str) -> Dict[str, TipDistance]:
+    """Return distance measurements from the focal tip to every other tip.
+
+    Single-source traversal of the tree graph (each edge weighted by the child
+    clade's branch length) instead of calling tree.distance() once per tip,
+    which re-walks the tree on every call (O(N^2) for N tips).
+
+    Alongside the patristic distance we record the distance to the candidate's
+    *attachment point* (its parent node) and the topological edge count, both of
+    which the root-target ranking needs to see past rogue terminal branches.
+    """
+    focal = next((t for t in tree.get_terminals() if t.name == focal_name), None)
+    if focal is None:
+        return {}
+
+    # One pass to build parent links and child lists (clades are hashable by identity).
+    parents: Dict[Any, Any] = {}
+    children: Dict[Any, list] = {}
+    for clade in tree.find_clades():
+        kids = list(clade.clades)
+        children[clade] = kids
+        for child in kids:
+            parents[child] = clade
+
+    # BFS out from the focal tip. The branch leading to a clade is that clade's
+    # branch_length, so stepping up uses the node's length and stepping down uses
+    # the child's length.
+    dist: Dict[Any, float] = {focal: 0.0}
+    hops: Dict[Any, int] = {focal: 0}
+    queue = deque([focal])
+    while queue:
+        node = queue.popleft()
+        base = dist[node]
+        step = hops[node] + 1
+        parent = parents.get(node)
+        if parent is not None and parent not in dist:
+            dist[parent] = base + float(node.branch_length or 0.0)
+            hops[parent] = step
+            queue.append(parent)
+        for child in children.get(node, ()):
+            if child not in dist:
+                dist[child] = base + float(child.branch_length or 0.0)
+                hops[child] = step
+                queue.append(child)
+
+    out: Dict[str, TipDistance] = {}
+    for t in tree.get_terminals():
+        if t is focal or not t.name:
+            continue
+        if t not in dist:
+            continue
+        total = float(dist[t])
+        own_branch = float(t.branch_length or 0.0)
+        out[t.name] = TipDistance(
+            patristic=total,
+            attachment=max(0.0, total - own_branch),
+            edges=int(hops[t]),
+        )
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Main entry point
+# ---------------------------------------------------------------------------
+
+def choose_auto_root_target(job_dir: Path, state: Dict[str, Any],
+                             mode: str = "auto") -> RootChoice:
+    """Choose a rooting target.
+
+    mode:
+      - "auto": most distant high-quality acceptable hit
+      - "most_divergent_hit": same algorithm; returned mode tag differs
+    """
+    warnings: List[str] = []
+
+    if not HAS_BIOPYTHON:
+        return RootChoice(mode="none", reason="biopython_unavailable",
+                          warnings=["BioPython not installed"])
+
+    focal, focal_source, focal_warn = resolve_sequence_of_interest(state)
+    warnings.extend(focal_warn)
+    if not focal:
+        return RootChoice(
+            mode="prompt_for_sequence_of_interest",
+            reason="no_focal_tip",
+            warnings=warnings,
+        )
+
+    tree = _load_phylo_tree(job_dir)
+    if tree is None:
+        return RootChoice(mode="none", query_tip=focal,
+                          reason="no_tree_file", warnings=warnings)
+
+    if not _tree_has_branch_lengths(tree):
+        warnings.append("tree_missing_branch_lengths")
+        return RootChoice(mode="midpoint_fallback", query_tip=focal,
+                          reason="no_branch_lengths", warnings=warnings)
+
+    distances = _patristic_distances(tree, focal)
+    if not distances:
+        warnings.append("focal_tip_not_in_tree")
+        return RootChoice(mode="midpoint_fallback", query_tip=focal,
+                          reason="focal_not_in_tree", warnings=warnings)
+
+    alignment = _load_alignment(job_dir)
+    focal_seq = alignment.get(focal, "")
+    focal_raw_len = _seq_stats(focal_seq)[0] if focal_seq else 0
+
+    if focal_raw_len == 0:
+        warnings.append("focal_alignment_missing")
+        return RootChoice(
+            mode="midpoint_fallback", query_tip=focal,
+            reason="focal_alignment_missing",
+            warnings=warnings,
+            candidate_count=0,
+            rejected_count=len(distances),
+        )
+
+    focal_taxon = _extract_binomial(focal)
+    rejected = 0
+    accepted: List[Tuple[str, TipDistance]] = []
+    for tip_name, dist in distances.items():
+        if tip_name == focal:
+            continue
+        cand_seq = alignment.get(tip_name, "")
+        ok, _reason = _assess_candidate(focal_seq, focal_raw_len, cand_seq)
+        if ok:
+            accepted.append((tip_name, dist))
+        else:
+            rejected += 1
+
+    if not accepted:
+        warnings.append("no_acceptable_candidates")
+        return RootChoice(
+            mode="midpoint_fallback", query_tip=focal,
+            reason="no_acceptable_candidates",
+            warnings=warnings,
+            candidate_count=0,
+            rejected_count=rejected,
+        )
+
+    candidate_pool = accepted
+    reason = f"most_distant_acceptable_hit:source={focal_source}"
+    if mode == "auto" and focal_taxon:
+        taxon_distinct = [
+            item for item in accepted
+            if (taxon := _extract_binomial(item[0])) and taxon != focal_taxon
+        ]
+        if taxon_distinct:
+            candidate_pool = taxon_distinct
+            reason = f"most_distant_taxon_distinct_acceptable_hit:source={focal_source}"
+
+    # Alan 8/4/26 - Drop candidates that share a recent ancestor with the focal tip.
+    # Rooting on one of those puts the root *inside* the focal's own clade, which
+    # leaves the focal isolated at the top of the drawing with its closest matches
+    # stranded at the bottom. Soft filter: keep the unfiltered pool if it empties.
+    distant_enough = [
+        item for item in candidate_pool
+        if item[1].edges > LOCAL_NEIGHBORHOOD_EDGES
+    ]
+    if distant_enough and len(distant_enough) < len(candidate_pool):
+        candidate_pool = distant_enough
+        reason += ":outside_focal_neighborhood"
+
+    # Rank by distance to the candidate's attachment point rather than to the tip
+    # itself. A rogue sequence on a hugely inflated terminal branch otherwise wins
+    # "most distant" without being on a genuinely deep lineage; measuring to the
+    # parent node keeps that single bad branch out of the comparison. Ties break on
+    # full patristic distance, then name, so the pick is deterministic.
+    candidate_pool.sort(key=lambda x: (-x[1].attachment, -x[1].patristic, x[0]))
+    target_name, best = candidate_pool[0]
+
+    out_mode = "most_divergent_hit" if mode == "most_divergent_hit" else "auto"
+    return RootChoice(
+        mode=out_mode,
+        query_tip=focal,
+        target_name=target_name,
+        reason=reason,
+        warnings=warnings,
+        score=best.attachment,
+        candidate_count=len(accepted),
+        rejected_count=rejected,
+    )
+
+
+def is_blast_result_job(job_dir: Path) -> bool:
+    """Heuristic: a BLAST-result job has blast/blast_results.json."""
+    return (job_dir / "blast" / "blast_results.json").exists()
