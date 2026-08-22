@@ -39,33 +39,17 @@ MAX_TREE_TIP_NAME_LENGTH = 256
 NEWICK_UNSAFE_TIP_CHARS = frozenset("()[];,:'\"")
 
 
-# Biopython's Newick writer defaults to "%1.5f" for branch lengths, so any
-# branch shorter than 5e-6 is written as 0.00000. That is not a rounding
-# curiosity here: RAxML-NG's minimum branch length is 1e-6 and the trees in
-# var/jobs carry nine decimal places, with hundreds of branches at 6e-9. Every
-# prune, reroot or midpoint-root re-serialized those as exact zeros, so a single
-# viewer edit turned real (if tiny) branches into "identical sequences" for the
-# tree viewer, the downloadable Newick and the Claude review alike. Measured
-# across production jobs, pruned trees carried 3-7x more zero-length branches
-# than the originals they came from.
-#
-# Ten decimal places covers everything the tree builders emit and, unlike a "%g"
-# format, never introduces exponent notation into a file the user may open in
-# FigTree or MEGA.
-NEWICK_BRANCH_LENGTH_FORMAT = "%1.10f"
-
-
-def write_tree_file(tree, path, fmt: str = "newick") -> None:
-    """Serialize a Bio.Phylo tree without silently rounding short branches away.
-
-    Use this instead of Phylo.write() for anything under var/jobs/<id>/tree.
-    Nexus output goes through the same Newick writer, so it takes the same
-    keyword.
-    """
-    Phylo.write(
-        tree, str(path), fmt,
-        format_branch_length=NEWICK_BRANCH_LENGTH_FORMAT,
-    )
+# Both writers live in tree_io so the tree builders can share them without
+# importing this module (tree_edit_service imports tree_builder_service inside
+# recompute, so a module-level import the other way would be circular). The
+# names stay exported here because that is where the rest of the codebase, and
+# CLAUDE.md, expect to find them.
+from app.services.tree_io import (  # noqa: E402,F401
+    NEWICK_BRANCH_LENGTH_FORMAT,
+    quote_tree_label,
+    write_nexus_tree,
+    write_tree_file,
+)
 
 
 class DegenerateTreeError(ValueError):
@@ -401,12 +385,27 @@ def build_recompute_job_params(params_dict: Dict[str, Any]) -> JobParams:
             )
             if tree_method == "iqtree" else 0
         ),
-        mcmc_generations=_int_param(params_dict.get("mcmc_generations", 50000), 50000),
-        mcmc_nruns=_int_param(params_dict.get("mcmc_nruns", 2), 2),
-        mcmc_nchains=_int_param(params_dict.get("mcmc_nchains", 4), 4),
-        mcmc_burnin_fraction=_float_param(
-            params_dict.get("mcmc_burnin_fraction", 0.25), 0.25
+        mcmc_generations=_int_param(
+            params_dict.get("mcmc_generations", Config.DEFAULT_MCMC_GENERATIONS),
+            Config.DEFAULT_MCMC_GENERATIONS,
         ),
+        mcmc_nruns=_int_param(
+            params_dict.get("mcmc_nruns", Config.DEFAULT_MCMC_NRNS),
+            Config.DEFAULT_MCMC_NRNS,
+        ),
+        mcmc_nchains=_int_param(
+            params_dict.get("mcmc_nchains", Config.DEFAULT_MCMC_CHAINS),
+            Config.DEFAULT_MCMC_CHAINS,
+        ),
+        mcmc_burnin_fraction=_float_param(
+            params_dict.get("mcmc_burnin_fraction", Config.DEFAULT_MCMC_BURNIN_FRACTION),
+            Config.DEFAULT_MCMC_BURNIN_FRACTION,
+        ),
+        # params_dict is a stored job (plus whatever the Advanced panel chose to
+        # override), so an absent key means the job predates the setting and ran
+        # without the stop rule. Defaulting to True here would re-run an old
+        # analysis under settings it never had.
+        mcmc_stop_early=_bool_param(params_dict, "mcmc_stop_early", False),
         run_preset=params_dict.get("run_preset", "fast_good"),
         bootstrap_preset=params_dict.get("bootstrap_preset", "standard"),
         bootstrap_cap=params_dict.get("bootstrap_cap"),
@@ -2021,7 +2020,14 @@ def _collapse_unifurcations(tree) -> None:
     
     Branch lengths are summed when collapsing: if parent has length 0.1 and
     child has length 0.2, the surviving child gets length 0.3.
-    
+
+    Support is carried down rather than discarded. A node with exactly one
+    child defines the same bipartition as that child, so the two describe the
+    same split and the collapsed node's confidence is the surviving node's
+    confidence. Dropping it silently deleted support values from clades that
+    had them, which is why pruning could turn a well-supported branch into an
+    unlabelled one.
+
     Modifies tree in-place.
     """
     # Handle root unifurcation first
@@ -2033,6 +2039,8 @@ def _collapse_unifurcations(tree) -> None:
             only_child.branch_length += tree.root.branch_length
         elif tree.root.branch_length:
             only_child.branch_length = tree.root.branch_length
+        if only_child.confidence is None and tree.root.confidence is not None:
+            only_child.confidence = tree.root.confidence
         # Promote child to root
         tree.root = only_child
         # Continue loop in case the new root is also a unifurcation
@@ -2066,7 +2074,12 @@ def _collapse_unifurcations(tree) -> None:
                 else:
                     new_length = clade.branch_length
             only_child.branch_length = new_length
-            
+
+            # The collapsed node and its only child define the same split, so
+            # the support value survives the collapse.
+            if only_child.confidence is None and clade.confidence is not None:
+                only_child.confidence = clade.confidence
+
             # Replace clade with only_child in parent's children list
             idx = parent.clades.index(clade)
             parent.clades[idx] = only_child

@@ -168,6 +168,7 @@ RECOMPUTE_OVERRIDABLE_FIELDS = frozenset({
     "tree_method", "tree_model",
     "bootstrap", "alrt_replicates",
     "mcmc_generations", "mcmc_nruns", "mcmc_nchains", "mcmc_burnin_fraction",
+    "mcmc_stop_early",
     "run_preset", "bootstrap_preset", "bootstrap_cap", "enable_bootstrap",
     "start_tree_override", "moose_enabled", "early_stopping", "seed",
     "outgroup", "notes",
@@ -2289,10 +2290,18 @@ def create_job():
         # per method (ModelFinder for IQ-TREE, Config.DEFAULT_ML_MODEL otherwise).
         "tree_model": data.get("tree_model") or None,
         "bootstrap": data.get("bootstrap", 1000), # Legacy field
-        "mcmc_generations": data.get("mcmc_generations", 50000),
-        "mcmc_nruns": data.get("mcmc_nruns", 2),
-        "mcmc_nchains": data.get("mcmc_nchains", 4),
-        "mcmc_burnin_fraction": data.get("mcmc_burnin_fraction", 0.25),
+        "mcmc_generations": data.get("mcmc_generations", Config.DEFAULT_MCMC_GENERATIONS),
+        "mcmc_nruns": data.get("mcmc_nruns", Config.DEFAULT_MCMC_NRNS),
+        "mcmc_nchains": data.get("mcmc_nchains", Config.DEFAULT_MCMC_CHAINS),
+        "mcmc_burnin_fraction": data.get(
+            "mcmc_burnin_fraction", Config.DEFAULT_MCMC_BURNIN_FRACTION
+        ),
+        # MrBayes convergence-based early stopping. New jobs default to on;
+        # mcmc_generations then acts as a maximum. Stored explicitly so a later
+        # read of this job never has to guess what it ran with.
+        "mcmc_stop_early": coerce_bool(
+            data.get("mcmc_stop_early"), Config.DEFAULT_MCMC_STOP_EARLY
+        )[0],
         
         # New RAxML-NG params - Extract raw first
         "run_preset": data.get("run_preset", "fast_good"),
@@ -2364,12 +2373,16 @@ def create_job():
 
     job_params["bootstrap"] = _clamp_int(job_params.get("bootstrap"), 1000, 0, 10_000)
     job_params["mcmc_generations"] = _clamp_int(
-        job_params.get("mcmc_generations"), 50_000, 1_000, 100_000_000
+        job_params.get("mcmc_generations"),
+        Config.DEFAULT_MCMC_GENERATIONS, 1_000, 100_000_000
     )
-    job_params["mcmc_nruns"] = _clamp_int(job_params.get("mcmc_nruns"), 2, 1, 8)
-    job_params["mcmc_nchains"] = _clamp_int(job_params.get("mcmc_nchains"), 4, 1, 16)
+    job_params["mcmc_nruns"] = _clamp_int(
+        job_params.get("mcmc_nruns"), Config.DEFAULT_MCMC_NRNS, 1, 8)
+    job_params["mcmc_nchains"] = _clamp_int(
+        job_params.get("mcmc_nchains"), Config.DEFAULT_MCMC_CHAINS, 1, 16)
     job_params["mcmc_burnin_fraction"] = _clamp_float(
-        job_params.get("mcmc_burnin_fraction"), 0.25, 0.0, 0.99
+        job_params.get("mcmc_burnin_fraction"),
+        Config.DEFAULT_MCMC_BURNIN_FRACTION, 0.0, 0.99
     )
     job_params["sequence"], job_params["sequence_metadata"] = _dedupe_sequence_payload(
         job_params.get("sequence", ""),
@@ -3099,6 +3112,13 @@ def get_job_pipeline_params(job_id):
         return jsonify({"status": "error", "error": "Job parameters could not be read"}), 500
 
     params = {key: stored.get(key) for key in RECOMPUTE_READABLE_FIELDS if key in stored}
+
+    # A MrBayes job stored before mcmc_stop_early existed did not use the
+    # convergence stop rule, so report it as off rather than leaving the key
+    # absent and letting the form's "on" default describe someone else's run.
+    if (str(stored.get("tree_method", "")).lower() == "mrbayes"
+            and "mcmc_stop_early" not in stored):
+        params["mcmc_stop_early"] = False
 
     # The requested model is often not the one that was fit -- IQ-TREE's "MFP"
     # defers to ModelFinder, and RAxML with MOOSE enabled substitutes its own

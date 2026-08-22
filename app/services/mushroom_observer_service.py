@@ -751,6 +751,7 @@ def prepare_tree_job(preparation: Dict[str, Any], *, defer_after_ncbi_rerun: boo
         "mcmc_generations": DEFAULT_TREE_PARAMS["mcmc_generations"],
         "mcmc_nruns": 2,
         "mcmc_nchains": 4,
+        "mcmc_stop_early": DEFAULT_TREE_PARAMS["mcmc_stop_early"],
         "mycomap_blast_url": mycomap_url,
         "import_filter_details": (payload or {}).get("import_filter_details") or {},
     }

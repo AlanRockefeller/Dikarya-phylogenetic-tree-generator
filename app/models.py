@@ -157,10 +157,18 @@ class TreeBuilderParams:
     method: str            # "nj", "raxml", "iqtree", "mrbayes", "fasttree"
     model: str = "GTR+G"   # default model for ML
     bootstrap: int = 1000   # ML bootstrap replicates (Ignored for new RAxML workflow in favor of bootstrap_cap/p)
-    mcmc_generations: int = 50000   # for MrBayes defaults
+    # MrBayes defaults. mcmc_generations is a *maximum* whenever
+    # mcmc_stop_early is on: MrBayes ends the run as soon as the independent
+    # runs agree on split frequencies to within DEFAULT_MCMC_STOPVAL.
+    mcmc_generations: int = 1000000
     mcmc_nruns: int = 2
     mcmc_nchains: int = 4
     mcmc_burnin_fraction: float = 0.25
+    # MrBayes-only convergence stop rule. Deliberately separate from
+    # `early_stopping` below, which is RAxML's unrelated bootstrap-convergence
+    # test. Requires mcmc_nruns >= 2; with a single run there are no split
+    # frequencies to compare and no stop rule is emitted.
+    mcmc_stop_early: bool = True
     threads: Optional[int] = None   # autodetect if None
 
     # IQ-TREE SH-aLRT replicates (-alrt). 0/None disables it. When enabled,

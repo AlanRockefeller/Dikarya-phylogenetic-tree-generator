@@ -453,10 +453,15 @@ ACGTACGTACGT...</code></pre>
                     <div>
                         <h3 class="text-lg font-semibold text-journal-dark dark:text-journal-gold-light">MrBayes (Bayesian)</h3>
                         <p class="mt-2 leading-relaxed">
-                            MrBayes uses Bayesian phylogenetic inference. The form exposes generations, independent runs,
-                            chains per run, and burn-in. More generations do not by themselves make a result reliable:
-                            inspect the downloaded parameter traces and summaries for convergence and effective sample
-                            size, and report how convergence was assessed.
+                            MrBayes uses Bayesian phylogenetic inference. The form exposes a maximum generation count,
+                            independent runs, chains per run, and burn-in. By default Dikarya runs up to 1,000,000
+                            generations with two independent runs and lets MrBayes stop earlier, as soon as the average
+                            standard deviation of split frequencies between those runs falls below 0.01. That avoids
+                            spending hours on a chain that settled long ago, but it is a criterion about tree topology
+                            agreement, not a certificate of a good analysis. More generations do not by themselves make
+                            a result reliable either: inspect the reported ESS and PSRF diagnostics and the downloaded
+                            parameter traces and summaries, and report how convergence was assessed. Server-side job
+                            runtime limits still apply, so a very large dataset may hit those before the maximum.
                         </p>
                     </div>
                     <div>

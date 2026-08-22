@@ -131,7 +131,7 @@ RECOMPUTE_ALLOWED_FIELDS = frozenset({
     "tree_method", "tree_model",
     "alignment_method", "trimming_method", "trim_terminal_overhangs",
     "bootstrap", "alrt_replicates", "mcmc_generations", "mcmc_nruns", "mcmc_nchains",
-    "mcmc_burnin_fraction",
+    "mcmc_burnin_fraction", "mcmc_stop_early",
     "outgroup", "notes",
 })
 
@@ -347,7 +347,8 @@ def _validate_accessions(value):
 def create_job():
     """Create a new phylo job. Body: {input_type, sequence, accessions,
     alignment_method, trimming_method, tree_method, tree_model, bootstrap,
-    mcmc_generations, mcmc_nruns, mcmc_nchains, mcmc_burnin_fraction, notes}.
+    mcmc_generations, mcmc_nruns, mcmc_nchains, mcmc_burnin_fraction,
+    mcmc_stop_early, notes}.
     """
     data = request.get_json(silent=True)
     if data is None:
@@ -390,17 +391,25 @@ def create_job():
         "alrt_replicates", data.get("alrt_replicates"),
         default=Config.DEFAULT_IQTREE_ALRT)
     if err: return err
+    # With mcmc_stop_early on (the default), this is the maximum: MrBayes ends
+    # the run early once the independent runs agree on split frequencies.
     mcmc_generations, err = _validate_clamped_int(
-        "mcmc_generations", data.get("mcmc_generations"), default=50_000)
+        "mcmc_generations", data.get("mcmc_generations"),
+        default=Config.DEFAULT_MCMC_GENERATIONS)
     if err: return err
     mcmc_nruns, err = _validate_clamped_int(
-        "mcmc_nruns", data.get("mcmc_nruns"), default=2)
+        "mcmc_nruns", data.get("mcmc_nruns"), default=Config.DEFAULT_MCMC_NRNS)
     if err: return err
     mcmc_nchains, err = _validate_clamped_int(
-        "mcmc_nchains", data.get("mcmc_nchains"), default=4)
+        "mcmc_nchains", data.get("mcmc_nchains"), default=Config.DEFAULT_MCMC_CHAINS)
     if err: return err
     mcmc_burnin_fraction, err = _validate_fraction(
-        "mcmc_burnin_fraction", data.get("mcmc_burnin_fraction"), default=0.25)
+        "mcmc_burnin_fraction", data.get("mcmc_burnin_fraction"),
+        default=Config.DEFAULT_MCMC_BURNIN_FRACTION)
+    if err: return err
+    mcmc_stop_early, err = _validate_bool(
+        "mcmc_stop_early", data.get("mcmc_stop_early"),
+        default=Config.DEFAULT_MCMC_STOP_EARLY)
     if err: return err
 
     # Strings.
@@ -505,6 +514,7 @@ def create_job():
         "mcmc_nruns":        mcmc_nruns,
         "mcmc_nchains":      mcmc_nchains,
         "mcmc_burnin_fraction": mcmc_burnin_fraction,
+        "mcmc_stop_early":   mcmc_stop_early,
     }
 
     try:
@@ -669,18 +679,26 @@ def recompute_job(job_id):
             overrides["trim_terminal_overhangs"] = v
         for field, default in (("bootstrap", 1000),
                                ("alrt_replicates", Config.DEFAULT_IQTREE_ALRT),
-                               ("mcmc_generations", 50_000),
-                               ("mcmc_nruns", 2), ("mcmc_nchains", 4)):
+                               ("mcmc_generations", Config.DEFAULT_MCMC_GENERATIONS),
+                               ("mcmc_nruns", Config.DEFAULT_MCMC_NRNS),
+                               ("mcmc_nchains", Config.DEFAULT_MCMC_CHAINS)):
             if field in body:
                 v, err = _validate_clamped_int(field, body[field], default=default)
                 if err: return err
                 overrides[field] = v
         if "mcmc_burnin_fraction" in body:
             v, err = _validate_fraction(
-                "mcmc_burnin_fraction", body["mcmc_burnin_fraction"], default=0.25
+                "mcmc_burnin_fraction", body["mcmc_burnin_fraction"],
+                default=Config.DEFAULT_MCMC_BURNIN_FRACTION
             )
             if err: return err
             overrides["mcmc_burnin_fraction"] = v
+        if "mcmc_stop_early" in body:
+            v, err = _validate_bool(
+                "mcmc_stop_early", body["mcmc_stop_early"],
+                default=Config.DEFAULT_MCMC_STOP_EARLY)
+            if err: return err
+            overrides["mcmc_stop_early"] = v
         if "tree_model" in body:
             v, err = _validate_string(
                 "tree_model", body["tree_model"],

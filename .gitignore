@@ -1,4 +1,4 @@
->g ---- Secrets / local env ---0
+# ---- Secrets / local env ----
 .env
 .env.*
 !.env.example
@@ -54,7 +54,6 @@ test_sanitized.fasta
 test_tree.newick
 .claude/
 CLAUDE.md
-AGENTS.md
 ARCHITECTURE.md
 temp_jobs/
 *.out

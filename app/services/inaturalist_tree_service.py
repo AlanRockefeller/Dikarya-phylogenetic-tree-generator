@@ -23,6 +23,7 @@ from datetime import datetime, timezone
 from typing import Any, Dict, Iterator, List, Optional, Tuple
 
 from flask import current_app
+from app.config import Config
 from app.services.log_context import background_job_context
 
 logger = logging.getLogger(__name__)
@@ -757,7 +758,8 @@ DEFAULT_TREE_PARAMS = {
     "tree_method": "fasttree",
     "tree_model": "GTR+G",
     "bootstrap": 1000,
-    "mcmc_generations": 50000,
+    "mcmc_generations": Config.DEFAULT_MCMC_GENERATIONS,
+    "mcmc_stop_early": Config.DEFAULT_MCMC_STOP_EARLY,
 }
 
 
@@ -1264,6 +1266,7 @@ def _build_inat_tree_job_params(observation_id: int, mycomap_url: str,
         "mcmc_generations": DEFAULT_TREE_PARAMS["mcmc_generations"],
         "mcmc_nruns": 2,
         "mcmc_nchains": 4,
+        "mcmc_stop_early": DEFAULT_TREE_PARAMS["mcmc_stop_early"],
         "mycomap_blast_url": mycomap_url,
         "import_filter_details": (payload or {}).get("import_filter_details") or {},
     }

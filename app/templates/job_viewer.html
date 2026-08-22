@@ -1075,8 +1075,14 @@
                 </p>
                 {% endif %}
                 {% if job_details.get('tree_method', '')|lower == 'mrbayes' %}
-                <p><span class="opacity-70 w-32 inline-block">MCMC Generations:</span> <span class="font-medium">{{
-                        job_details.get('mcmc_generations', 50000) }}</span></p>
+                {% set mcmc_stop_early = job_details.get('mcmc_stop_early', False)
+                    and (job_details.get('mcmc_nruns', 2)|int) > 1 %}
+                {# The 50000 fallback is deliberate: it is what a job that stored
+                   no generation count actually ran with, not today's default. #}
+                <p><span class="opacity-70 w-32 inline-block">{{ 'Max MCMC Generations' if mcmc_stop_early else 'MCMC Generations' }}:</span>
+                    <span class="font-medium">{{ job_details.get('mcmc_generations', 50000) }}</span></p>
+                <p><span class="opacity-70 w-32 inline-block">Early Stopping:</span> <span class="font-medium">{{
+                        'stop at split-frequency 0.01' if mcmc_stop_early else 'off (full run)' }}</span></p>
                 <p><span class="opacity-70 w-32 inline-block">Independent Runs:</span> <span class="font-medium">{{
                         job_details.get('mcmc_nruns', 2) }}</span></p>
                 <p><span class="opacity-70 w-32 inline-block">Chains per Run:</span> <span class="font-medium">{{
@@ -1103,6 +1109,7 @@
                 {% for key, value in job_details.items() %}
                 {% if key not in ['alignment_method', 'tree_method', 'trimming_method', 'tree_model', 'bootstrap',
                 'mcmc_generations', 'mcmc_nruns', 'mcmc_nchains', 'mcmc_burnin_fraction',
+                'mcmc_stop_early',
                 'sequences', 'accessions', 'sequence', 'notes', 'alignment_options', 'input_type',
                 'trim_terminal_overhangs', 'trimming_details']
                 and value %}

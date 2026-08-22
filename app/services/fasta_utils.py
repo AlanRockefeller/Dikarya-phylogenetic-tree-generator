@@ -227,21 +227,19 @@ def sanitize_fasta_headers(input_path: Path, output_path: Path) -> Dict[str, str
 
 
 def _quote_newick_name(name: str) -> str:
+    """Quote a taxon label for Newick/NEXUS.
+
+    Delegates to tree_io.quote_tree_label, which quotes anything that is not
+    purely alphanumeric. That is stricter than Newick alone needs, and
+    deliberately so: restore_tree_names is called on NEXUS files too, where the
+    punctuation set is wider (a bare ``-`` or ``=`` is punctuation) and where an
+    unquoted underscore is read as a space. The old rule here covered only
+    ``:;,()[]`` and whitespace, which left labels like ``E01-iNatFoltz193`` and
+    ``MO142746_2`` unquoted and misparsed.
     """
-    Quote a name for Newick format if it contains special characters.
-    Standard Newick quoting uses single quotes, with internal single quotes doubled.
-    """
-    # Characters that definitely require quoting in Newick
-    # Whitespace, colon, semicolon, comma, parens, brackets
-    special_chars = set(":;,()[] ")
-    
-    # Check if quoting is needed
-    if any(c in special_chars for c in name) or "'" in name:
-        # Escape existing single quotes
-        escaped_name = name.replace("'", "''")
-        return f"'{escaped_name}'"
-        
-    return name
+    from app.services.tree_io import quote_tree_label
+
+    return quote_tree_label(name)
 
 
 def restore_tree_names(tree_path: Path, mapping: Dict[str, str]) -> None:

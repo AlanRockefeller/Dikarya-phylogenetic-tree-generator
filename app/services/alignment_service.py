@@ -91,7 +91,7 @@ def run_alignment(
     config: Config,
     logger,
     job_id: Optional[str] = None
-) -> None:
+) -> dict:
     """
     Run a multiple sequence alignment according to user-selected or default parameters.
     
@@ -109,8 +109,12 @@ def run_alignment(
         config: Application config
         logger: Logger instance
         job_id: Optional job ID for real-time event streaming
+
+    Returns:
+        Stats dict describing what the aligner actually did.
     """
     method = params.method.lower()
+    stats = {"method": method, "reversed_by_aligner": 0}
     
     if method == "default":
         # Beginner mode default: use configured default aligner (e.g. mafft)
@@ -125,7 +129,9 @@ def run_alignment(
             _verify_already_aligned(input_fasta, logger)
             shutil.copy(input_fasta, output_fasta)
         elif method == "mafft":
-            _run_mafft(input_fasta, output_fasta, params, config, logger, job_id)
+            stats["reversed_by_aligner"] = _run_mafft(
+                input_fasta, output_fasta, params, config, logger, job_id
+            )
         elif method == "muscle":
             _run_muscle(input_fasta, output_fasta, params, config, logger, job_id)
         elif method == "clustalo":
@@ -138,7 +144,9 @@ def run_alignment(
         if not output_fasta.exists() or output_fasta.stat().st_size == 0:
              raise RuntimeError(f"Alignment failed: Output file {output_fasta} is missing or empty.")
 
+        stats["method"] = method
         logger.info(f"Alignment completed successfully. Output: {output_fasta}")
+        return stats
 
     except Exception as e:
         logger.error(f"Alignment failed: {e}")
@@ -215,7 +223,17 @@ def _restore_mafft_direction_headers(
     output_fasta: Path,
     logger,
 ) -> int:
-    """Remove MAFFT's ``_R_`` marker while preserving genuine input headers."""
+    """Remove MAFFT's ``_R_`` marker while preserving genuine input headers.
+
+    The marker has to go -- every downstream step matches on the exact input
+    header -- but stripping it silently was its own problem. ``_R_`` is the
+    only record that MAFFT reverse-complemented a sequence, and the ORIENT step
+    has already made its own orientation call by the time MAFFT runs. When the
+    two disagree the alignment ends up holding a sequence in the opposite
+    orientation to ``input/input_raw.fasta``, which is what recompute
+    re-derives from. The count is returned, logged as a degradation, and
+    surfaced to the user by the caller.
+    """
     input_headers = {
         line[1:].strip()
         for line in input_fasta.read_text(encoding="utf-8", errors="replace").splitlines()
@@ -259,7 +277,7 @@ def _run_mafft(
     and stream stderr to Redis for progress updates.
     """
     threads = _get_thread_count()
-    cmd = [config.MAFFT_BINARY, "--thread", "2", "--adjustdirectionaccurately"]
+    cmd = [config.MAFFT_BINARY, "--thread", str(threads), "--adjustdirectionaccurately"]
     
     # Check if this is a fast NJ tree build
     tree_method = params.advanced_options.get("tree_method", "").lower()
@@ -318,7 +336,20 @@ def _run_mafft(
         with open(output_fasta, "w") as f:
             f.write(stdout)
 
-    _restore_mafft_direction_headers(input_fasta, output_fasta, logger)
+    reversed_count = _restore_mafft_direction_headers(input_fasta, output_fasta, logger)
+    if reversed_count:
+        # ORIENT already ran its own motif-based orientation check over this
+        # same input, so a MAFFT flip here means the two disagreed. Record it:
+        # the alignment now holds those sequences in the opposite orientation
+        # to input/input_raw.fasta.
+        from app.services.log_context import log_degradation
+
+        log_degradation(
+            logger, "aligner_reversed_sequences",
+            "MAFFT reverse-complemented sequences the orientation step had left forward",
+            count=reversed_count,
+        )
+    return reversed_count
 
 
 def _run_muscle(

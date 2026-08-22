@@ -205,13 +205,17 @@ def _log_missing_executable(args: List[str], error: Exception) -> str:
     return f"[ERROR] {Path(args[0]).name} could not be started (not found on server)"
 
 
-def run_command(args: List[str], cwd: Optional[Path] = None, log_file: Optional[Path] = None) -> Tuple[int, str, str]:
+def run_command(args: List[str], cwd: Optional[Path] = None, log_file: Optional[Path] = None,
+                timeout: Optional[int] = None) -> Tuple[int, str, str]:
     """
     Run an external command safely.
 
     - args: list of command and arguments (no shell=True).
     - cwd: optional working directory.
     - log_file: optional path to append stdout/stderr.
+    - timeout: optional wall-clock limit in seconds. Without one a wedged tool
+      holds the single RQ worker forever; this path is used by recompute and by
+      the CLI, neither of which had any limit at all.
 
     Returns (returncode, stdout, stderr).
     Raises no exceptions; caller decides what to do.
@@ -238,8 +242,13 @@ def run_command(args: List[str], cwd: Optional[Path] = None, log_file: Optional[
             capture_output=True,
             text=True,
             check=False,
+            timeout=timeout,
+            # Never let a child inherit the worker's stdin. MrBayes in
+            # particular drops to an interactive prompt if its command block
+            # does not quit, and would then block on a stdin it does not own.
+            stdin=subprocess.DEVNULL,
         )
-        
+
         stdout = result.stdout
         stderr = result.stderr
         
@@ -258,6 +267,13 @@ def run_command(args: List[str], cwd: Optional[Path] = None, log_file: Optional[
                 args, FileNotFoundError(stderr.strip())
             )
         return result.returncode, stdout, stderr
+
+    except subprocess.TimeoutExpired:
+        logger.error(f"Command timed out after {timeout}s: {args}")
+        return EXIT_CODE_JOB_TIMEOUT, "", (
+            f"[TIMEOUT] {Path(args[0]).name} exceeded its {timeout}s time limit "
+            f"and was stopped."
+        )
 
     except FileNotFoundError as e:
         return EXIT_CODE_TOOL_NOT_FOUND, "", _log_missing_executable(args, e)

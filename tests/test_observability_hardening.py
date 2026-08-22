@@ -653,7 +653,19 @@ def test_pipeline_invariants_log_success_and_failure(tmp_path, clean_logging):
     (job_dir / "alignment" / "alignment_raw.fasta").write_text(fasta)
     (job_dir / "alignment" / "alignment_trimmed.fasta").write_text(fasta)
     (job_dir / "tree" / "tree_original.newick").write_text("(A:0.1,B:0.1);\n")
-    (job_dir / "tree" / "tree_original.nexus").write_text("#NEXUS\n")
+    # A real NEXUS, not a bare "#NEXUS" header: the invariant check now
+    # confirms the NEXUS export actually round-trips, because for years it was
+    # written by a writer whose output no NEXUS reader could parse.
+    from io import StringIO
+
+    from Bio import Phylo
+
+    from app.services.tree_io import write_nexus_tree
+
+    write_nexus_tree(
+        Phylo.read(StringIO("(A:0.1,B:0.1);"), "newick"),
+        job_dir / "tree" / "tree_original.nexus",
+    )
 
     capture = _Capture()
     probe = logging.getLogger("app.probe.invariants")
@@ -668,6 +680,13 @@ def test_pipeline_invariants_log_success_and_failure(tmp_path, clean_logging):
     bad = validate_pipeline_outputs(job_dir, {}, logger_obj=probe)
     assert bad["ok"] is False
     assert "event=pipeline.invariant_failed" in capture.text
+
+    # A malformed NEXUS is a failure in its own right, even with a good Newick.
+    (job_dir / "tree" / "tree_original.newick").write_text("(A:0.1,B:0.1);\n")
+    (job_dir / "tree" / "tree_original.nexus").write_text("#NEXUS\n")
+    bad_nexus = validate_pipeline_outputs(job_dir, {}, logger_obj=probe)
+    assert bad_nexus["ok"] is False
+    assert any(f.startswith("unparseable_nexus") for f in bad_nexus["failures"])
     probe.removeHandler(capture)
 
 

@@ -5,6 +5,30 @@ time and emit either JSON or YAML. Update this file when adding endpoints.
 """
 from flask import request
 
+from app.config import Config
+
+# MrBayes defaults are quoted straight from the config so the published schema
+# cannot drift from what the API actually applies.
+DEFAULT_MCMC_GENERATIONS = Config.DEFAULT_MCMC_GENERATIONS
+DEFAULT_MCMC_NRUNS = Config.DEFAULT_MCMC_NRNS
+DEFAULT_MCMC_CHAINS = Config.DEFAULT_MCMC_CHAINS
+DEFAULT_MCMC_BURNIN_FRACTION = Config.DEFAULT_MCMC_BURNIN_FRACTION
+DEFAULT_MCMC_STOP_EARLY = Config.DEFAULT_MCMC_STOP_EARLY
+
+MCMC_STOP_EARLY_DESCRIPTION = (
+    "Enable MrBayes convergence-based early stopping (mcmcdiagn=yes "
+    f"stoprule=yes stopval={Config.DEFAULT_MCMC_STOPVAL}). MrBayes ends the run "
+    "as soon as the average standard deviation of split frequencies between the "
+    "independent runs falls below "
+    f"{Config.DEFAULT_MCMC_STOPVAL}, so mcmc_generations is a maximum rather "
+    "than a fixed run length. Requires mcmc_nruns >= 2: with a single run there "
+    "are no independent runs to compare, no stop rule is applied, and the "
+    "analysis uses the full mcmc_generations. Reaching this criterion does not "
+    "by itself guarantee satisfactory ESS or PSRF -- those are checked "
+    "separately after the run and reported in tree_metadata.json. Defaults to "
+    "true for newly submitted jobs."
+)
+
 
 def _schemas():
     return {
@@ -46,6 +70,14 @@ def _schemas():
                         "mcmc_nruns": {"type": "integer"},
                         "mcmc_nchains": {"type": "integer"},
                         "mcmc_burnin_fraction": {"type": "number"},
+                        "mcmc_stop_early": {
+                            "type": "boolean",
+                            "description": (
+                                "Whether the job used MrBayes convergence-based "
+                                "early stopping. Reported as false for jobs "
+                                "created before this option existed."
+                            ),
+                        },
                     },
                 },
                 "metrics": {"type": "object"},
@@ -94,15 +126,25 @@ def _schemas():
                     "type": "integer", "minimum": 0, "maximum": 10000,
                     "description": "IQ-TREE SH-aLRT replicates. 0 reports UFBoot only.",
                 },
-                "mcmc_generations": {"type": "integer", "minimum": 1000, "maximum": 100000000},
+                "mcmc_generations": {
+                    "type": "integer", "minimum": 1000, "maximum": 100000000,
+                    "description": (
+                        "MrBayes MCMC generations; the maximum whenever "
+                        "mcmc_stop_early is enabled."
+                    ),
+                },
                 "mcmc_nruns": {"type": "integer", "minimum": 1, "maximum": 8},
                 "mcmc_nchains": {"type": "integer", "minimum": 1, "maximum": 16},
                 "mcmc_burnin_fraction": {
                     "type": "number",
                     "minimum": 0,
                     "maximum": 0.99,
-                    "default": 0.25,
+                    "default": DEFAULT_MCMC_BURNIN_FRACTION,
                     "description": "Relative fraction of MCMC samples discarded as burn-in.",
+                },
+                "mcmc_stop_early": {
+                    "type": "boolean",
+                    "description": MCMC_STOP_EARLY_DESCRIPTION,
                 },
                 "outgroup": {"type": "string", "maxLength": 256},
                 "notes": {"type": "string", "maxLength": 2000},
@@ -199,15 +241,35 @@ def _schemas():
                     "type": "integer", "minimum": 0, "maximum": 10000, "default": 1000,
                     "description": "IQ-TREE SH-aLRT replicates, run alongside Ultrafast Bootstrap. Nodes are labelled SH-aLRT/UFBoot. 0 reports UFBoot only.",
                 },
-                "mcmc_generations": {"type": "integer", "minimum": 1000, "maximum": 100000000, "default": 50000},
-                "mcmc_nruns": {"type": "integer", "minimum": 1, "maximum": 8, "default": 2},
-                "mcmc_nchains": {"type": "integer", "minimum": 1, "maximum": 16, "default": 4},
+                "mcmc_generations": {
+                    "type": "integer", "minimum": 1000, "maximum": 100000000,
+                    "default": DEFAULT_MCMC_GENERATIONS,
+                    "description": (
+                        "MrBayes MCMC generations. With mcmc_stop_early enabled "
+                        "(the default) this is the maximum: the run may finish "
+                        "substantially earlier. Server-side job runtime limits "
+                        "still apply."
+                    ),
+                },
+                "mcmc_nruns": {
+                    "type": "integer", "minimum": 1, "maximum": 8,
+                    "default": DEFAULT_MCMC_NRUNS,
+                },
+                "mcmc_nchains": {
+                    "type": "integer", "minimum": 1, "maximum": 16,
+                    "default": DEFAULT_MCMC_CHAINS,
+                },
                 "mcmc_burnin_fraction": {
                     "type": "number",
                     "minimum": 0,
                     "maximum": 0.99,
-                    "default": 0.25,
+                    "default": DEFAULT_MCMC_BURNIN_FRACTION,
                     "description": "Relative fraction of MCMC samples discarded as burn-in.",
+                },
+                "mcmc_stop_early": {
+                    "type": "boolean",
+                    "default": DEFAULT_MCMC_STOP_EARLY,
+                    "description": MCMC_STOP_EARLY_DESCRIPTION,
                 },
                 "notes": {"type": "string", "maxLength": 2000},
             },

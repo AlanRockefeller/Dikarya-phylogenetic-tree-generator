@@ -67,9 +67,14 @@ def serialize_job(job):
             "bootstrap":        info.get("bootstrap"),
             "alrt_replicates":  info.get("alrt_replicates"),
             "mcmc_generations": info.get("mcmc_generations"),
-            "mcmc_nruns":       info.get("mcmc_nruns", 2),
-            "mcmc_nchains":     info.get("mcmc_nchains", 4),
-            "mcmc_burnin_fraction": info.get("mcmc_burnin_fraction", 0.25),
+            "mcmc_nruns":       info.get("mcmc_nruns", Config.DEFAULT_MCMC_NRNS),
+            "mcmc_nchains":     info.get("mcmc_nchains", Config.DEFAULT_MCMC_CHAINS),
+            "mcmc_burnin_fraction": info.get(
+                "mcmc_burnin_fraction", Config.DEFAULT_MCMC_BURNIN_FRACTION
+            ),
+            # False, not the current default: a job stored without this key ran
+            # before the stop rule existed and must not be reported as using it.
+            "mcmc_stop_early":  bool(info.get("mcmc_stop_early", False)),
         },
         "metrics": job.metrics or {},
         "links": {

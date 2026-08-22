@@ -31,6 +31,27 @@ _logger = logging.getLogger(__name__)
 # so internal low-coverage columns are always preserved.
 MIN_TERMINAL_COVERED_SEQUENCES = 3
 
+# ...but a flat floor of 3 is meaningless once the alignment is large: on a
+# 147-sequence ITS job three stray long reads were enough to retain every
+# column, and the terminal trim removed nothing at all. The threshold is now
+# whichever is greater of the flat floor and this fraction of the alignment, so
+# it scales with the dataset.
+MIN_TERMINAL_COVERAGE_FRACTION = 0.05
+
+# Characters that mean "no residue here". Only "-" was recognised before, so an
+# alignment padded with "." or "?" -- both common in Sanger ITS submissions and
+# both emitted by some aligners -- registered as full coverage and defeated the
+# trim entirely.
+TERMINAL_GAP_CHARS = frozenset("-.?~")
+
+
+def _min_terminal_covered(sequence_count: int) -> int:
+    """Coverage threshold for the terminal trim at this alignment size."""
+    if sequence_count <= 0:
+        return MIN_TERMINAL_COVERED_SEQUENCES
+    scaled = int(round(sequence_count * MIN_TERMINAL_COVERAGE_FRACTION))
+    return max(1, min(sequence_count, max(MIN_TERMINAL_COVERED_SEQUENCES, scaled)))
+
 
 def run_trimming(
     input_alignment: Path,
@@ -240,7 +261,7 @@ def _trim_terminal_overhangs(input_alignment: Path, output_alignment: Path, logg
             "mode": "min_sequence_coverage_span",
             "skipped": True,
             "skipped_reason": reason,
-            "min_covered_sequences": min(MIN_TERMINAL_COVERED_SEQUENCES, len(records) or 1),
+            "min_covered_sequences": _min_terminal_covered(len(records)),
             "input_columns": input_columns,
             "retained_columns": input_columns,
             "removed_columns": 0,
@@ -264,10 +285,10 @@ def _trim_terminal_overhangs(input_alignment: Path, output_alignment: Path, logg
     coverage = [0] * alignment_length
     for _, sequence in records:
         for idx, char in enumerate(sequence):
-            if char != "-":
+            if char not in TERMINAL_GAP_CHARS:
                 coverage[idx] += 1
 
-    min_covered = max(1, min(MIN_TERMINAL_COVERED_SEQUENCES, len(records)))
+    min_covered = _min_terminal_covered(len(records))
     covered_columns = [idx for idx, count in enumerate(coverage) if count >= min_covered]
     if not covered_columns:
         return _copy_through("no column meets the terminal sequence coverage threshold", alignment_length)

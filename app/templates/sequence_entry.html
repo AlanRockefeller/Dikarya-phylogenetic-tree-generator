@@ -1402,9 +1402,9 @@
             <div class="grid grid-cols-1 md:grid-cols-4 gap-4">
                 <div>
                     <label for="mb_gen" class="block text-sm font-medium text-gray-700 dark:text-gray-200 mb-2">
-                        Generations
+                        Maximum generations
                     </label>
-                    <input type="number" id="mb_gen" value="50000" step="1000" class="w-full px-4 py-3 border border-gray-300 dark:border-journal-dark rounded-lg 
+                    <input type="number" id="mb_gen" value="1000000" step="1000" class="w-full px-4 py-3 border border-gray-300 dark:border-journal-dark rounded-lg
                                   bg-white dark:bg-journal-dark text-gray-900 dark:text-gray-100
                                   focus:ring-2 focus:ring-journal-gold focus:border-transparent transition-all">
                 </div>
@@ -1432,6 +1432,20 @@
                                   bg-white dark:bg-journal-dark text-gray-900 dark:text-gray-100
                                   focus:ring-2 focus:ring-journal-gold focus:border-transparent transition-all">
                 </div>
+            </div>
+            <div class="mt-4">
+                <label class="flex items-start gap-3 cursor-pointer">
+                    <input type="checkbox" id="mb_stop_early" checked
+                           class="mt-1 h-4 w-4 rounded border-gray-300 dark:border-journal-dark text-journal-gold focus:ring-journal-gold">
+                    <span class="text-sm text-gray-700 dark:text-gray-200">
+                        Stop early when runs reach convergence criterion
+                        <span id="mb_stop_early_help" class="block text-xs text-gray-500 dark:text-gray-400 mt-1">
+                            MrBayes can stop before the maximum when the independent runs reach an average
+                            split-frequency difference below 0.01. Convergence diagnostics are still checked
+                            after the run.
+                        </span>
+                    </span>
+                </label>
             </div>
             <p class="text-xs text-gray-500 dark:text-gray-400 mt-2">
                 Relative burn-in is discarded from MrBayes convergence diagnostics and from the <code>sump</code>/<code>sumt</code> summaries. The default is 25%.
@@ -3980,6 +3994,39 @@
     const mbOptions = document.getElementById('mrbayes_options');
     const advancedCurrentSummary = document.getElementById('advanced_current_summary');
 
+    // MrBayes: generations is a maximum whenever the convergence stop rule is
+    // on, so these defaults must match Config.DEFAULT_MCMC_* on the server.
+    const MB_DEFAULT_MAX_GENERATIONS = 1000000;
+    const mbStopEarly = document.getElementById('mb_stop_early');
+    const mbStopEarlyHelp = document.getElementById('mb_stop_early_help');
+    const MB_STOP_EARLY_HELP_DEFAULT = mbStopEarlyHelp ? mbStopEarlyHelp.innerHTML : '';
+    const MB_STOP_EARLY_HELP_SINGLE_RUN =
+        'Convergence-based stopping compares split frequencies between independent runs, '
+        + 'so it needs at least 2 runs. Set Runs to 2 or more to use it.';
+    if (mbStopEarly) mbStopEarly.dataset.choice = mbStopEarly.checked ? '1' : '0';
+
+    /** The stop rule is meaningless with a single run, so the checkbox is
+     *  disabled there. The user's own choice is remembered in dataset.choice and
+     *  restored when Runs goes back to 2+, rather than being silently lost. */
+    function updateMrBayesStopEarlyState() {
+        if (!mbStopEarly) return;
+        const runs = parseInt(document.getElementById('mb_runs')?.value, 10) || 0;
+        const supported = runs >= 2;
+        mbStopEarly.disabled = !supported;
+        mbStopEarly.checked = supported && mbStopEarly.dataset.choice !== '0';
+        if (mbStopEarlyHelp) {
+            mbStopEarlyHelp.innerHTML = supported
+                ? MB_STOP_EARLY_HELP_DEFAULT
+                : MB_STOP_EARLY_HELP_SINGLE_RUN;
+        }
+        mbStopEarly.closest('label')?.classList.toggle('opacity-60', !supported);
+    }
+
+    /** What the form is actually asking the server for. */
+    function mbStopEarlyValue() {
+        return !!(mbStopEarly && mbStopEarly.checked && !mbStopEarly.disabled);
+    }
+
     // RAxML Specifics
     const raxmlPresetContainer = document.getElementById('raxml_preset_container');
     const raxmlModelSelect = document.getElementById('raxml_model_select');
@@ -4013,11 +4060,16 @@
             terminalTrim = `${selectedText('its_region')}, ${terminalTrim}`;
         }
         if (treeMethodSelect.value === 'mrbayes') {
-            const generations = parseInt(document.getElementById('mb_gen')?.value, 10) || 50000;
+            const generations = parseInt(document.getElementById('mb_gen')?.value, 10) || MB_DEFAULT_MAX_GENERATIONS;
             const runs = parseInt(document.getElementById('mb_runs')?.value, 10) || 2;
             const chains = parseInt(document.getElementById('mb_chains')?.value, 10) || 4;
             const burnin = parseFloat(document.getElementById('mb_burnin')?.value) || 0;
-            advancedCurrentSummary.textContent = `Currently: ${alignment} + ${treeMethod}, ${terminalTrim}, ${generations} generations, ${runs} runs, ${chains} chains/run, ${burnin}% burn-in.`;
+            const stopEarly = mbStopEarlyValue();
+            // "up to" only when MrBayes may actually finish sooner.
+            const generationsLabel = stopEarly
+                ? `up to ${generations.toLocaleString('en-US')} generations, stop early at convergence criterion`
+                : `${generations.toLocaleString('en-US')} generations`;
+            advancedCurrentSummary.textContent = `Currently: ${alignment} + ${treeMethod}, ${terminalTrim}, ${generationsLabel}, ${runs} runs, ${chains} chains/run, ${burnin}% burn-in.`;
         } else if (treeMethodSelect.value === 'iqtree') {
             const alrt = parseInt(document.getElementById('alrt_replicates')?.value, 10) || 0;
             const support = alrt > 0
@@ -4119,6 +4171,7 @@
             treeModelText.value = 'GTR+CAT';
         } else if (method === 'mrbayes') {
             mbOptions.classList.remove('hidden');
+            updateMrBayesStopEarlyState();
             if (treeModelText.value === 'GTR+CAT') {
                 treeModelText.value = 'GTR+G';
             }
@@ -4140,10 +4193,21 @@
     });
     ['alignment_method', 'trimming_method', 'trim_terminal_overhangs', 'its_region', 'its_min_length',
         'tree_model', 'bootstrap', 'outgroup_select',
-        'mb_gen', 'mb_runs', 'mb_chains', 'mb_burnin'].forEach(id => {
+        'mb_gen', 'mb_runs', 'mb_chains', 'mb_burnin', 'mb_stop_early'].forEach(id => {
         document.getElementById(id)?.addEventListener('input', refreshAdvancedSummary);
         document.getElementById(id)?.addEventListener('change', refreshAdvancedSummary);
     });
+    // Runs drives whether the stop rule can apply at all.
+    ['input', 'change'].forEach(evt => {
+        document.getElementById('mb_runs')?.addEventListener(evt, () => {
+            updateMrBayesStopEarlyState();
+            refreshAdvancedSummary();
+        });
+    });
+    mbStopEarly?.addEventListener('change', () => {
+        if (!mbStopEarly.disabled) mbStopEarly.dataset.choice = mbStopEarly.checked ? '1' : '0';
+    });
+    updateMrBayesStopEarlyState();
 
     // ITS region extraction: default minimum length and the drop warning both
     // depend on which subregion is selected.
@@ -4378,10 +4442,11 @@
                 : 0,
 
             // Bayes params
-            mcmc_generations: parseInt(document.getElementById('mb_gen').value) || 50000,
+            mcmc_generations: parseInt(document.getElementById('mb_gen').value) || MB_DEFAULT_MAX_GENERATIONS,
             mcmc_nruns: parseInt(document.getElementById('mb_runs').value) || 2,
             mcmc_nchains: parseInt(document.getElementById('mb_chains').value) || 4,
             mcmc_burnin_fraction: (parseFloat(document.getElementById('mb_burnin').value) || 0) / 100,
+            mcmc_stop_early: mbStopEarlyValue(),
 
             // RAxML Params
             run_preset: document.getElementById('run_preset').value,
@@ -4606,6 +4671,12 @@
         if (p.mcmc_burnin_fraction !== undefined && p.mcmc_burnin_fraction !== null) {
             setFieldValue('mb_burnin', Math.round(p.mcmc_burnin_fraction * 100));
         }
+        // A job stored before this option existed reports it as false, so the
+        // panel shows what that job really ran rather than this form's default.
+        if (mbStopEarly && p.mcmc_stop_early !== undefined && p.mcmc_stop_early !== null) {
+            mbStopEarly.dataset.choice = p.mcmc_stop_early ? '1' : '0';
+        }
+        updateMrBayesStopEarlyState();
 
         setFieldValue('run_preset', p.run_preset);
         setFieldValue('bootstrap_preset', p.bootstrap_preset);
@@ -4653,10 +4724,11 @@
             alrt_replicates: method === 'iqtree'
                 ? (parseInt(document.getElementById('alrt_replicates')?.value, 10) || 0)
                 : 0,
-            mcmc_generations: parseInt(document.getElementById('mb_gen').value, 10) || 50000,
+            mcmc_generations: parseInt(document.getElementById('mb_gen').value, 10) || MB_DEFAULT_MAX_GENERATIONS,
             mcmc_nruns: parseInt(document.getElementById('mb_runs').value, 10) || 2,
             mcmc_nchains: parseInt(document.getElementById('mb_chains').value, 10) || 4,
             mcmc_burnin_fraction: (parseFloat(document.getElementById('mb_burnin').value) || 0) / 100,
+            mcmc_stop_early: mbStopEarlyValue(),
             run_preset: document.getElementById('run_preset').value,
             bootstrap_preset: document.getElementById('bootstrap_preset').value,
             bootstrap_cap: document.getElementById('bootstrap_cap_custom').value

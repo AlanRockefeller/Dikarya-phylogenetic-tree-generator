@@ -153,13 +153,26 @@ def validate_pipeline_outputs(job_dir, job_params, logger_obj=logger) -> dict:
                 failures.append(f"unparseable_fasta:{path.name}:{type(exc).__name__}")
 
     terminal_count = None
+    tree_quality = {}
     tree_path = job_dir / "tree" / "tree_original.newick"
     if tree_path.is_file() and tree_path.stat().st_size:
         try:
             tree = Phylo.read(StringIO(tree_path.read_text(errors="replace")), "newick")
             terminal_count = len(tree.get_terminals())
+            tree_quality = _summarize_tree_quality(tree, logger_obj)
         except Exception as exc:
             failures.append(f"unparseable_newick:{type(exc).__name__}")
+
+    # The NEXUS export is a user-facing download, and for years it was written
+    # by a writer that produced files no NEXUS reader could parse. Confirm it
+    # is actually usable rather than only that it is non-empty.
+    nexus_path = job_dir / "tree" / "tree_original.nexus"
+    if nexus_path.is_file() and nexus_path.stat().st_size:
+        from app.services.tree_io import validate_nexus_file
+
+        nexus_ok, nexus_reason = validate_nexus_file(nexus_path)
+        if not nexus_ok:
+            failures.append(f"unparseable_nexus:{nexus_reason}")
 
     final_count = fasta_counts.get("alignment_trimmed.fasta")
     legitimately_pruned = False
@@ -209,10 +222,78 @@ def validate_pipeline_outputs(job_dir, job_params, logger_obj=logger) -> dict:
         )
     else:
         logger_obj.info(
-            "event=pipeline.invariants_ok Pipeline outputs validated fasta_records=%s tree_terminals=%s",
+            "event=pipeline.invariants_ok Pipeline outputs validated fasta_records=%s "
+            "tree_terminals=%s quality=%s",
             final_count, terminal_count,
+            json.dumps(tree_quality, sort_keys=True, separators=(",", ":")),
         )
-    return {"ok": not failures, "failures": failures, "fasta_records": final_count, "tree_terminals": terminal_count}
+    return {
+        "ok": not failures,
+        "failures": failures,
+        "fasta_records": final_count,
+        "tree_terminals": terminal_count,
+        "tree_quality": tree_quality,
+    }
+
+
+def _summarize_tree_quality(tree, logger_obj) -> dict:
+    """Report the tree-shaped failure modes this pipeline actually produces.
+
+    The invariant check counted records and confirmed the Newick parsed, which
+    a badly degraded tree passes easily. These are the things that have gone
+    wrong in production: branch lengths rounded away to exact zeros, a tree
+    with no support values where the method should have produced them, and a
+    topology so unresolved it carries no information.
+    """
+    from app.services.log_context import log_degradation
+
+    branch_lengths = []
+    zero_branches = 0
+    supported = 0
+    internal = 0
+    max_children = 0
+
+    for clade in tree.find_clades():
+        if clade.branch_length is not None:
+            branch_lengths.append(clade.branch_length)
+            if clade.branch_length == 0:
+                zero_branches += 1
+        if clade.clades:
+            internal += 1
+            max_children = max(max_children, len(clade.clades))
+            if clade.confidence is not None:
+                supported += 1
+
+    terminals = len(tree.get_terminals())
+    summary = {
+        "terminals": terminals,
+        "internal_nodes": internal,
+        "zero_length_branches": zero_branches,
+        "branches_with_length": len(branch_lengths),
+        "internal_nodes_with_support": supported,
+        "max_polytomy": max_children,
+    }
+
+    if branch_lengths and zero_branches / len(branch_lengths) > 0.25:
+        log_degradation(
+            logger_obj, "tree_many_zero_length_branches",
+            "More than a quarter of branches have length exactly zero",
+            zero_branches=zero_branches, total=len(branch_lengths),
+        )
+    if internal and supported == 0 and terminals > 3:
+        log_degradation(
+            logger_obj, "tree_without_support_values",
+            "Tree carries no support values on any internal node",
+            internal_nodes=internal,
+        )
+    if terminals > 3 and max_children > max(3, terminals // 2):
+        log_degradation(
+            logger_obj, "tree_largely_unresolved",
+            "Tree contains a polytomy spanning most of the taxa",
+            max_polytomy=max_children, terminals=terminals,
+        )
+
+    return summary
 
 
 def _save_job_params(input_info_path, job_params: dict) -> None:
@@ -1256,11 +1337,22 @@ def run_phylo_job(job_params: dict) -> dict:
             from app.services.alignment_service import run_alignment
 
             align_params = AlignmentParams(method=align_method, advanced_options=align_opts)
-            run_alignment(input_raw_path, alignment_raw_path, align_params, Config, logger, job_id=job_id)
+            align_stats = run_alignment(
+                input_raw_path, alignment_raw_path, align_params, Config, logger, job_id=job_id
+            ) or {}
 
             n_seqs, n_cols = _count_alignment_stats(alignment_raw_path)
             detail = f"{n_seqs} sequences, {n_cols} columns"
-            
+
+            # MAFFT runs --adjustdirectionaccurately, so it makes its own
+            # orientation call after ORIENT already made one. A flip here means
+            # the two disagreed, and it used to be stripped out silently along
+            # with MAFFT's _R_ marker.
+            aligner_reversed = int(align_stats.get("reversed_by_aligner") or 0)
+            if aligner_reversed:
+                detail += f", {aligner_reversed} reverse-complemented by the aligner"
+                publish_metric(job_id, STEP_ALIGN, "reversed_by_aligner", aligner_reversed)
+
             publish_step_done(job_id, STEP_ALIGN, detail)
             publish_overview(job_id, f"Alignment complete: {detail}")
             update_step_meta(job, STEP_ALIGN, {"state": STATE_DONE, "detail": detail})
@@ -1347,7 +1439,12 @@ def run_phylo_job(job_params: dict) -> dict:
             mcmc_gens = int(job_params.get("mcmc_generations", Config.DEFAULT_MCMC_GENERATIONS))
             mcmc_runs = int(job_params.get("mcmc_nruns", Config.DEFAULT_MCMC_NRNS))
             mcmc_chains = int(job_params.get("mcmc_nchains", Config.DEFAULT_MCMC_CHAINS))
-            mcmc_burnin = float(job_params.get("mcmc_burnin_fraction", 0.25))
+            mcmc_burnin = float(
+                job_params.get("mcmc_burnin_fraction", Config.DEFAULT_MCMC_BURNIN_FRACTION)
+            )
+            # Absent means the job predates the setting, so it ran without the
+            # stop rule; every current submission path stores it explicitly.
+            mcmc_stop_early = coerce_bool(job_params.get("mcmc_stop_early"), False)[0]
             
             current_tool = tree_method.lower()
             current_step_label = f"Tree Building ({tree_method.upper()})"
@@ -1395,7 +1492,13 @@ def run_phylo_job(job_params: dict) -> dict:
             if tree_method == "iqtree" and alrt_replicates:
                 detail_parts.append(f"{alrt_replicates} SH-aLRT")
             if tree_method == "mrbayes":
-                detail_parts.append(f"{mcmc_gens} generations")
+                stop_rule_active = mcmc_stop_early and mcmc_runs > 1
+                detail_parts.append(
+                    f"up to {mcmc_gens} generations" if stop_rule_active
+                    else f"{mcmc_gens} generations"
+                )
+                if stop_rule_active:
+                    detail_parts.append("stop early at convergence criterion")
                 detail_parts.append(f"{mcmc_runs} runs")
                 detail_parts.append(f"{mcmc_chains} chains/run")
                 detail_parts.append(f"{mcmc_burnin * 100:g}% burn-in")
@@ -1419,6 +1522,7 @@ def run_phylo_job(job_params: dict) -> dict:
                 mcmc_nruns=mcmc_runs,
                 mcmc_nchains=mcmc_chains,
                 mcmc_burnin_fraction=mcmc_burnin,
+                mcmc_stop_early=mcmc_stop_early,
                 # RAxML Params
                 run_preset=job_params.get("run_preset", "fast_good"),
                 bootstrap_preset=job_params.get("bootstrap_preset", "standard"),

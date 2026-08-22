@@ -306,9 +306,26 @@ class Config:
     SSE_TERMINAL_LINGER_SECONDS = int(
         os.environ.get("SSE_TERMINAL_LINGER_SECONDS", "10")
     )
-    DEFAULT_MCMC_GENERATIONS = int(os.environ.get("DEFAULT_MCMC_GENERATIONS", "50000"))
+    # Maximum MCMC generations, not a fixed run length: with two or more
+    # independent runs MrBayes stops as soon as the average standard deviation
+    # of split frequencies falls below DEFAULT_MCMC_STOPVAL. The old 50,000
+    # default was demonstrably too short -- a real Dikarya run finished it with
+    # min ESS ~10 and max PSRF ~1.10.
+    DEFAULT_MCMC_GENERATIONS = int(os.environ.get("DEFAULT_MCMC_GENERATIONS", "1000000"))
     DEFAULT_MCMC_NRNS = int(os.environ.get("DEFAULT_MCMC_NRNS", "2"))
     DEFAULT_MCMC_CHAINS = int(os.environ.get("DEFAULT_MCMC_CHAINS", "4"))
+    DEFAULT_MCMC_BURNIN_FRACTION = float(
+        os.environ.get("DEFAULT_MCMC_BURNIN_FRACTION", "0.25")
+    )
+    # Convergence-based early stopping (MrBayes stoprule) for newly created
+    # jobs. Requires at least two independent runs; see DEFAULT_MCMC_STOPVAL.
+    DEFAULT_MCMC_STOP_EARLY = os.environ.get(
+        "DEFAULT_MCMC_STOP_EARLY", "1"
+    ).strip().lower() not in ("0", "false", "no", "off")
+    # Average standard deviation of split frequencies at which MrBayes may stop
+    # early. 0.01 is the threshold the MrBayes manual recommends, and the same
+    # value tree_builder_service uses to judge ASDSF after the run.
+    DEFAULT_MCMC_STOPVAL = float(os.environ.get("DEFAULT_MCMC_STOPVAL", "0.01"))
 
     # iNaturalist OAuth. The site-wide authorized account writes the
     # "Phylogenetic Tree" observation field back when a tree job finishes.
