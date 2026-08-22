@@ -1,0 +1,518 @@
+{% extends "base_modern.html" %}
+
+{% block title %}Voucher Labels - Dikarya{% endblock %}
+{% block subtitle %}Specimen Tools{% endblock %}
+
+{% block head %}
+<style>
+    #voucher_preview {
+        position: relative;
+        width: 100%;
+        overflow: hidden;
+        background: white;
+        color: black;
+        box-shadow: 0 1px 4px rgb(0 0 0 / 0.2);
+    }
+
+    .voucher-preview-label {
+        position: absolute;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        overflow: hidden;
+        white-space: nowrap;
+        line-height: 1;
+    }
+</style>
+{% endblock %}
+
+{% block content %}
+<div class="max-w-6xl mx-auto px-4 sm:px-6 lg:px-8 py-8">
+    <div class="mb-6">
+        <h2 class="text-3xl font-bold text-journal-dark dark:text-white">Voucher Labels</h2>
+        <p class="mt-2 text-sm text-gray-600 dark:text-gray-300">
+            Generate numbered specimen voucher label sheets for printing.
+        </p>
+    </div>
+
+    <form id="voucher_label_form" method="post" action="{{ url_for('main.voucher_labels_export') }}"
+        class="grid gap-6 lg:grid-cols-[minmax(0,1fr)_360px]">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+
+        <section class="bg-white dark:bg-journal-green border border-gray-200 dark:border-gray-700 rounded-lg p-5 shadow-sm">
+            <div class="grid gap-5 sm:grid-cols-2">
+                <label class="block">
+                    <span class="block text-sm font-semibold text-journal-dark dark:text-gray-100 mb-2">Prefix</span>
+                    <input id="voucher_prefix" name="prefix" type="text" maxlength="32" placeholder="DIA-"
+                        class="w-full rounded-lg border border-gray-300 dark:border-gray-600 bg-white dark:bg-journal-dark px-3 py-2 text-journal-dark dark:text-white font-mono">
+                </label>
+
+                <label class="block">
+                    <span class="block text-sm font-semibold text-journal-dark dark:text-gray-100 mb-2">Starting Number</span>
+                    <input id="voucher_start_number" name="start_number" type="text" value="001"
+                        class="w-full rounded-lg border border-gray-300 dark:border-gray-600 bg-white dark:bg-journal-dark px-3 py-2 text-journal-dark dark:text-white font-mono">
+                </label>
+
+                <label class="block">
+                    <span class="block text-sm font-semibold text-journal-dark dark:text-gray-100 mb-2">Number of Pages</span>
+                    <input id="voucher_pages" name="pages" type="number" min="1" max="100" value="1"
+                        class="w-full rounded-lg border border-gray-300 dark:border-gray-600 bg-white dark:bg-journal-dark px-3 py-2 text-journal-dark dark:text-white">
+                </label>
+
+                <label id="voucher_print_columns_field" class="block">
+                    <span class="block text-sm font-semibold text-journal-dark dark:text-gray-100 mb-2">Columns to Fill</span>
+                    <input id="voucher_print_columns" name="print_columns" type="number" min="1" max="3" value="3"
+                        class="w-full rounded-lg border border-gray-300 dark:border-gray-600 bg-white dark:bg-journal-dark px-3 py-2 text-journal-dark dark:text-white">
+                </label>
+
+                <label class="block">
+                    <span class="block text-sm font-semibold text-journal-dark dark:text-gray-100 mb-2">Output</span>
+                    <select id="voucher_output_format" name="output_format"
+                        class="w-full rounded-lg border border-gray-300 dark:border-gray-600 bg-white dark:bg-journal-dark px-3 py-2 text-journal-dark dark:text-white">
+                        <option value="pdf" selected>PDF</option>
+                        <option value="rtf">RTF</option>
+                    </select>
+                </label>
+
+                <label class="block">
+                    <span class="block text-sm font-semibold text-journal-dark dark:text-gray-100 mb-2">Label Size</span>
+                    <select name="label_size" id="label_size"
+                        class="w-full rounded-lg border border-gray-300 dark:border-gray-600 bg-white dark:bg-journal-dark px-3 py-2 text-journal-dark dark:text-white">
+                        {% for key, preset in presets.items() %}
+                        <option value="{{ key }}" {% if key == "letter_auto" %}selected{% endif %}>{{ preset.name }}</option>
+                        {% endfor %}
+                        <option value="custom">Custom</option>
+                    </select>
+                </label>
+
+                <label class="block">
+                    <span class="block text-sm font-semibold text-journal-dark dark:text-gray-100 mb-2">Font</span>
+                    <select id="voucher_font_family" name="font_family"
+                        class="w-full rounded-lg border border-gray-300 dark:border-gray-600 bg-white dark:bg-journal-dark px-3 py-2 text-journal-dark dark:text-white">
+                        {% for key, font in pdf_fonts %}
+                        <option value="{{ key }}" {% if key == "helvetica" %}selected{% endif %}>{{ font.name }}</option>
+                        {% endfor %}
+                    </select>
+                </label>
+
+                <label class="block">
+                    <span class="block text-sm font-semibold text-journal-dark dark:text-gray-100 mb-2">Font Size</span>
+                    <input id="voucher_font_size" name="font_size" type="number" min="6" max="36" value="12"
+                        class="w-full rounded-lg border border-gray-300 dark:border-gray-600 bg-white dark:bg-journal-dark px-3 py-2 text-journal-dark dark:text-white">
+                </label>
+
+                <div id="voucher_spacing_fields" class="sm:col-span-2 grid gap-5 sm:grid-cols-2">
+                    <label class="block">
+                        <span class="block text-sm font-semibold text-journal-dark dark:text-gray-100 mb-2">Minimum Horizontal Spacing (in)</span>
+                        <input id="voucher_spacing_x" name="spacing_x" type="number" step="0.01" min="0" max="2" value="0.1"
+                            class="w-full rounded-lg border border-gray-300 dark:border-gray-600 bg-white dark:bg-journal-dark px-3 py-2 text-journal-dark dark:text-white">
+                    </label>
+                    <label class="block">
+                        <span class="block text-sm font-semibold text-journal-dark dark:text-gray-100 mb-2">Minimum Vertical Spacing (in)</span>
+                        <input id="voucher_spacing_y" name="spacing_y" type="number" step="0.01" min="0" max="2" value="0.1"
+                            class="w-full rounded-lg border border-gray-300 dark:border-gray-600 bg-white dark:bg-journal-dark px-3 py-2 text-journal-dark dark:text-white">
+                    </label>
+                    <p class="sm:col-span-2 -mt-3 text-xs text-gray-500 dark:text-gray-400">
+                        Defaults to 0.1 in. Set both to 0 to keep the current preset spacing. Increasing either value may reduce the number of labels per page.
+                    </p>
+                </div>
+
+                <label class="flex items-center gap-2 pt-8 text-sm font-medium text-journal-dark dark:text-gray-100">
+                    <input name="include_guides" value="1" type="checkbox"
+                        class="h-4 w-4 rounded border-gray-300 text-journal-gold focus:ring-journal-gold">
+                    Print cut guide lines
+                </label>
+            </div>
+
+            <div id="custom_label_fields" class="hidden mt-6 border-t border-gray-200 dark:border-gray-700 pt-5">
+                <h3 class="text-sm font-bold uppercase tracking-wide text-gray-500 dark:text-gray-300 mb-4">Custom Sheet</h3>
+                <div class="grid gap-4 sm:grid-cols-4">
+                    <label class="block">
+                        <span class="block text-xs font-semibold text-gray-600 dark:text-gray-300 mb-1">Width in</span>
+                        <input name="custom_width" type="number" step="0.01" min="0.5" max="8.5" value="2.625"
+                            class="w-full rounded-lg border border-gray-300 dark:border-gray-600 bg-white dark:bg-journal-dark px-3 py-2 text-journal-dark dark:text-white">
+                    </label>
+                    <label class="block">
+                        <span class="block text-xs font-semibold text-gray-600 dark:text-gray-300 mb-1">Height in</span>
+                        <input name="custom_height" type="number" step="0.01" min="0.25" max="5" value="1"
+                            class="w-full rounded-lg border border-gray-300 dark:border-gray-600 bg-white dark:bg-journal-dark px-3 py-2 text-journal-dark dark:text-white">
+                    </label>
+                    <label class="block">
+                        <span class="block text-xs font-semibold text-gray-600 dark:text-gray-300 mb-1">Columns</span>
+                        <input id="custom_columns" name="custom_columns" type="number" min="1" max="8" value="3"
+                            class="w-full rounded-lg border border-gray-300 dark:border-gray-600 bg-white dark:bg-journal-dark px-3 py-2 text-journal-dark dark:text-white">
+                    </label>
+                    <label class="block">
+                        <span class="block text-xs font-semibold text-gray-600 dark:text-gray-300 mb-1">Rows</span>
+                        <input name="custom_rows" type="number" min="1" max="40" value="10"
+                            class="w-full rounded-lg border border-gray-300 dark:border-gray-600 bg-white dark:bg-journal-dark px-3 py-2 text-journal-dark dark:text-white">
+                    </label>
+                    <label class="block">
+                        <span class="block text-xs font-semibold text-gray-600 dark:text-gray-300 mb-1">Left Margin in</span>
+                        <input name="custom_margin_left" type="number" step="0.01" min="0" max="4" value="0.25"
+                            class="w-full rounded-lg border border-gray-300 dark:border-gray-600 bg-white dark:bg-journal-dark px-3 py-2 text-journal-dark dark:text-white">
+                    </label>
+                    <label class="block">
+                        <span class="block text-xs font-semibold text-gray-600 dark:text-gray-300 mb-1">Top Margin in</span>
+                        <input name="custom_margin_top" type="number" step="0.01" min="0" max="4" value="0.5"
+                            class="w-full rounded-lg border border-gray-300 dark:border-gray-600 bg-white dark:bg-journal-dark px-3 py-2 text-journal-dark dark:text-white">
+                    </label>
+                    <label class="block">
+                        <span class="block text-xs font-semibold text-gray-600 dark:text-gray-300 mb-1">Column Gap in</span>
+                        <input name="custom_gap_x" type="number" step="0.01" min="0" max="2" value="0.125"
+                            class="w-full rounded-lg border border-gray-300 dark:border-gray-600 bg-white dark:bg-journal-dark px-3 py-2 text-journal-dark dark:text-white">
+                    </label>
+                    <label class="block">
+                        <span class="block text-xs font-semibold text-gray-600 dark:text-gray-300 mb-1">Row Gap in</span>
+                        <input name="custom_gap_y" type="number" step="0.01" min="0" max="2" value="0"
+                            class="w-full rounded-lg border border-gray-300 dark:border-gray-600 bg-white dark:bg-journal-dark px-3 py-2 text-journal-dark dark:text-white">
+                    </label>
+                </div>
+            </div>
+
+            <div class="mt-6 flex flex-wrap gap-3">
+                <a id="voucher_generate_link" href="{{ url_for('main.voucher_labels_export') }}" target="_blank"
+                    class="inline-flex items-center rounded-lg bg-journal-gold px-4 py-2 text-sm font-semibold text-journal-dark shadow-sm transition hover:bg-journal-gold-light focus:outline-none focus:ring-2 focus:ring-journal-gold focus:ring-offset-2 dark:focus:ring-offset-journal-dark">
+                    <i class="fas fa-file-pdf mr-2"></i>Generate Labels
+                </a>
+                <a id="voucher_reset_link" href="{{ url_for('main.voucher_labels') }}"
+                    class="inline-flex items-center rounded-lg border border-journal-gold px-4 py-2 text-sm font-semibold text-journal-dark transition hover:bg-journal-gold hover:text-journal-dark dark:text-journal-gold dark:hover:text-journal-dark">
+                    <i class="fas fa-rotate-left mr-2"></i>Reset
+                </a>
+            </div>
+        </section>
+
+        <aside class="bg-white dark:bg-journal-green border border-gray-200 dark:border-gray-700 rounded-lg p-5 shadow-sm">
+            <div class="mb-4 flex items-center justify-between gap-3">
+                <h3 class="text-sm font-bold uppercase tracking-wide text-gray-500 dark:text-gray-300">Preview</h3>
+                <span id="voucher_labels_per_page"
+                    class="text-xs font-semibold text-gray-500 dark:text-gray-300">0 per page</span>
+            </div>
+            <div class="rounded bg-gray-200 p-3 dark:bg-journal-dark">
+                <div id="voucher_preview" aria-label="Scaled preview of the first output page"></div>
+            </div>
+            <p class="mt-3 text-xs text-gray-500 dark:text-gray-400">Scaled preview of the first output page.</p>
+        </aside>
+    </form>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+    const labelSizeSelect = document.getElementById('label_size');
+    const customFields = document.getElementById('custom_label_fields');
+    const spacingFields = document.getElementById('voucher_spacing_fields');
+    const preview = document.getElementById('voucher_preview');
+    const form = document.getElementById('voucher_label_form');
+    const generateLink = document.getElementById('voucher_generate_link');
+    const resetLink = document.getElementById('voucher_reset_link');
+    const prefixInput = document.getElementById('voucher_prefix');
+    const startInput = document.getElementById('voucher_start_number');
+    const pagesInput = document.getElementById('voucher_pages');
+    const printColumnsField = document.getElementById('voucher_print_columns_field');
+    const printColumnsInput = document.getElementById('voucher_print_columns');
+    const labelsPerPageText = document.getElementById('voucher_labels_per_page');
+    const outputFormatSelect = document.getElementById('voucher_output_format');
+    const fontSelect = document.getElementById('voucher_font_family');
+    const fontSizeInput = document.getElementById('voucher_font_size');
+    const guideInput = form.querySelector('input[name="include_guides"]');
+    const labelPresets = {{ presets|tojson }};
+    const fontChoices = {
+        pdf: {{ pdf_fonts|tojson }},
+        rtf: {{ rtf_fonts|tojson }}
+    };
+    const preferencesStorageKey = 'dikarya.voucher-labels.preferences.v1';
+    const persistedFieldNames = [
+        'prefix',
+        'pages',
+        'output_format',
+        'label_size',
+        'print_columns',
+        'font_family',
+        'font_size',
+        'spacing_x',
+        'spacing_y',
+        'custom_width',
+        'custom_height',
+        'custom_columns',
+        'custom_rows',
+        'custom_margin_left',
+        'custom_margin_top',
+        'custom_gap_x',
+        'custom_gap_y'
+    ];
+    let activeFonts = {};
+
+    function fontOutputFormat() {
+        return outputFormatSelect.value === 'rtf' ? 'rtf' : 'pdf';
+    }
+
+    function syncFontOptions() {
+        const current = fontSelect.value;
+        const choices = fontChoices[fontOutputFormat()] || fontChoices.pdf;
+        activeFonts = {};
+        fontSelect.innerHTML = '';
+        choices.forEach(([key, font]) => {
+            activeFonts[key] = font;
+            const option = document.createElement('option');
+            option.value = key;
+            option.textContent = font.name;
+            fontSelect.appendChild(option);
+        });
+        if (activeFonts[current]) {
+            fontSelect.value = current;
+        } else {
+            fontSelect.value = choices[0]?.[0] || '';
+        }
+    }
+
+    function syncCustomFields() {
+        const isCustom = labelSizeSelect.value === 'custom';
+        customFields.classList.toggle('hidden', !isCustom);
+        spacingFields.classList.toggle('hidden', isCustom);
+        printColumnsField.classList.toggle('hidden', isCustom || Boolean((labelPresets[labelSizeSelect.value] || {}).auto));
+    }
+
+    function clampValue(value, fallback, minimum, maximum) {
+        const parsed = parseFloat(value);
+        return Math.max(minimum, Math.min(maximum, Number.isFinite(parsed) ? parsed : fallback));
+    }
+
+    function fieldValue(name, fallback, minimum, maximum) {
+        return clampValue(form.elements[name]?.value, fallback, minimum, maximum);
+    }
+
+    function fitCount(usableSize, labelSize, gapSize) {
+        return Math.max(1, Math.floor((usableSize + gapSize) / (labelSize + gapSize)));
+    }
+
+    function buildPreviewValue(offset) {
+        const prefix = prefixInput.value || '';
+        const rawStart = (startInput.value || '001').trim();
+        const match = rawStart.match(/\d+/);
+        const width = match ? Math.max(1, Math.min(12, match[0].length)) : 3;
+        const start = match ? parseInt(match[0], 10) : 1;
+        return `${prefix}${String(start + offset).padStart(width, '0')}`;
+    }
+
+    function nextStartingNumber(layout) {
+        const rawStart = (startInput.value || '001').trim();
+        const match = rawStart.match(/\d+/);
+        const width = match ? Math.max(1, Math.min(12, match[0].length)) : 3;
+        const start = match ? parseInt(match[0], 10) : 1;
+        const pages = Math.trunc(clampValue(pagesInput.value, 1, 1, 100));
+        const generatedCount = pages * Math.max(1, layout.columns * layout.rows);
+        return String(start + generatedCount).padStart(width, '0');
+    }
+
+    function restorePreferences() {
+        let saved;
+        try {
+            saved = JSON.parse(localStorage.getItem(preferencesStorageKey) || 'null');
+        } catch (error) {
+            return null;
+        }
+        if (!saved || saved.version !== 1 || !saved.fields) return null;
+
+        persistedFieldNames.forEach(name => {
+            if (name === 'font_family' || saved.fields[name] === undefined) return;
+            const field = form.elements[name];
+            if (field) field.value = saved.fields[name];
+        });
+        if (saved.fields.start_number !== undefined) {
+            startInput.value = saved.fields.start_number;
+        }
+        guideInput.checked = Boolean(saved.fields.include_guides);
+        return saved.fields;
+    }
+
+    function savePreferencesForNextSheet() {
+        const fields = {};
+        persistedFieldNames.forEach(name => {
+            const field = form.elements[name];
+            if (field) fields[name] = field.value;
+        });
+        fields.include_guides = guideInput.checked;
+        fields.start_number = nextStartingNumber(currentLayout());
+        try {
+            localStorage.setItem(preferencesStorageKey, JSON.stringify({
+                version: 1,
+                fields
+            }));
+        } catch (error) {
+            // Label generation should still work when browser storage is unavailable.
+        }
+    }
+
+    function clearPreferences() {
+        try {
+            localStorage.removeItem(preferencesStorageKey);
+        } catch (error) {
+            // The Reset navigation still restores the form defaults.
+        }
+    }
+
+    function layoutForSample(sampleLabel) {
+        const presetKey = labelSizeSelect.value;
+        const fontSize = fieldValue('font_size', 12, 6, 36);
+        let preset;
+
+        if (presetKey === 'custom') {
+            preset = {
+                name: 'Custom',
+                page_width: 8.5,
+                page_height: 11,
+                label_width: fieldValue('custom_width', 2.625, 0.5, 8.5),
+                label_height: fieldValue('custom_height', 1, 0.25, 5),
+                columns: Math.trunc(fieldValue('custom_columns', 3, 1, 8)),
+                rows: Math.trunc(fieldValue('custom_rows', 10, 1, 40)),
+                margin_left: fieldValue('custom_margin_left', 0.25, 0, 4),
+                margin_top: fieldValue('custom_margin_top', 0.5, 0, 4),
+                gap_x: fieldValue('custom_gap_x', 0.125, 0, 2),
+                gap_y: fieldValue('custom_gap_y', 0, 0, 2)
+            };
+            preset.available_columns = preset.columns;
+            return preset;
+        }
+
+        preset = { ...(labelPresets[presetKey] || labelPresets.avery_5160) };
+        const usableWidth = Math.max(0.5, preset.page_width - (preset.margin_left * 2));
+        const usableHeight = Math.max(0.5, preset.page_height - (preset.margin_top * 2));
+        const minGapX = fieldValue('spacing_x', 0.1, 0, 2);
+        const minGapY = fieldValue('spacing_y', 0.1, 0, 2);
+
+        if (preset.auto) {
+            const textWidth = Math.max(1, sampleLabel.length) * fontSize * 0.6 / 72;
+            const textHeight = fontSize / 72;
+            preset.label_width = Math.min(usableWidth, Math.max(0.35, textWidth + 0.18));
+            preset.label_height = Math.min(usableHeight, Math.max(0.22, textHeight + 0.12));
+            preset.columns = fitCount(usableWidth, preset.label_width, minGapX);
+            preset.rows = fitCount(usableHeight, preset.label_height, minGapY);
+            preset.gap_x = preset.columns > 1
+                ? Math.max(0, (usableWidth - (preset.columns * preset.label_width)) / (preset.columns - 1))
+                : 0;
+            preset.gap_y = preset.rows > 1
+                ? Math.max(0, (usableHeight - (preset.rows * preset.label_height)) / (preset.rows - 1))
+                : 0;
+            preset.available_columns = preset.columns;
+            return preset;
+        }
+
+        preset.gap_x = Math.max(preset.gap_x, minGapX);
+        preset.gap_y = Math.max(preset.gap_y, minGapY);
+        preset.available_columns = Math.min(
+            preset.columns,
+            fitCount(usableWidth, preset.label_width, preset.gap_x)
+        );
+        preset.rows = Math.min(
+            preset.rows,
+            fitCount(usableHeight, preset.label_height, preset.gap_y)
+        );
+        preset.columns = Math.trunc(clampValue(
+            printColumnsInput.value,
+            preset.available_columns,
+            1,
+            preset.available_columns
+        ));
+        return preset;
+    }
+
+    function currentLayout() {
+        let layout = layoutForSample(buildPreviewValue(0));
+        if (!layout.auto) return layout;
+
+        const pages = Math.trunc(clampValue(pagesInput.value, 1, 1, 100));
+        for (let iteration = 0; iteration < 4; iteration += 1) {
+            const lastOffset = Math.max(0, (pages * layout.columns * layout.rows) - 1);
+            const nextLayout = layoutForSample(buildPreviewValue(lastOffset));
+            if (nextLayout.columns === layout.columns && nextLayout.rows === layout.rows) {
+                return nextLayout;
+            }
+            layout = nextLayout;
+        }
+        return layout;
+    }
+
+    function syncPrintColumns(useAvailableDefault = false) {
+        const layout = layoutForSample(buildPreviewValue(0));
+        const available = layout.available_columns || layout.columns;
+        printColumnsInput.max = String(available);
+        if (layout.auto || labelSizeSelect.value === 'custom') return;
+
+        const current = parseInt(printColumnsInput.value || `${available}`, 10) || available;
+        printColumnsInput.value = String(useAvailableDefault ? available : Math.max(1, Math.min(available, current)));
+    }
+
+    function renderPreview(layout) {
+        const font = activeFonts[fontSelect.value] || {};
+        const fontSize = fieldValue('font_size', 12, 6, 36);
+        const pageWidthPoints = layout.page_width * 72;
+        const scale = preview.clientWidth / pageWidthPoints;
+        const perPage = Math.max(1, layout.columns * layout.rows);
+        const fragment = document.createDocumentFragment();
+
+        preview.style.aspectRatio = `${layout.page_width} / ${layout.page_height}`;
+        preview.style.fontFamily = font.css || "Arial, Helvetica, sans-serif";
+        preview.style.fontWeight = font.weight || '400';
+        preview.style.fontStyle = font.style || 'normal';
+        preview.replaceChildren();
+
+        for (let index = 0; index < perPage; index += 1) {
+            const row = Math.floor(index / layout.columns);
+            const col = index % layout.columns;
+            const label = document.createElement('div');
+            label.className = 'voucher-preview-label';
+            label.textContent = buildPreviewValue(index);
+            label.style.left = `${((layout.margin_left + col * (layout.label_width + layout.gap_x)) / layout.page_width) * 100}%`;
+            label.style.top = `${((layout.margin_top + row * (layout.label_height + layout.gap_y)) / layout.page_height) * 100}%`;
+            label.style.width = `${(layout.label_width / layout.page_width) * 100}%`;
+            label.style.height = `${(layout.label_height / layout.page_height) * 100}%`;
+            label.style.fontSize = `${Math.max(1, fontSize * scale)}px`;
+            label.style.border = guideInput.checked ? '1px solid #111827' : 'none';
+            fragment.appendChild(label);
+        }
+        preview.appendChild(fragment);
+        labelsPerPageText.textContent = `${perPage} per page`;
+    }
+
+    function syncPreview() {
+        syncPrintColumns();
+        renderPreview(currentLayout());
+        syncDownloadLink();
+    }
+
+    function syncDownloadLink() {
+        const params = new URLSearchParams(new FormData(form));
+        params.delete('csrf_token');
+        generateLink.href = `${form.action}?${params.toString()}`;
+    }
+
+    labelSizeSelect.addEventListener('change', () => {
+        syncCustomFields();
+        syncPrintColumns(true);
+        syncPreview();
+    });
+    outputFormatSelect.addEventListener('change', () => {
+        syncFontOptions();
+        syncPreview();
+    });
+    Array.from(form.elements).forEach(input => {
+        input.addEventListener('input', syncPreview);
+        input.addEventListener('change', syncPreview);
+    });
+    generateLink.addEventListener('click', savePreferencesForNextSheet);
+    resetLink.addEventListener('click', clearPreferences);
+    form.addEventListener('submit', event => {
+        event.preventDefault();
+        savePreferencesForNextSheet();
+        window.open(generateLink.href, '_blank', 'noopener');
+    });
+    const savedPreferences = restorePreferences();
+    syncCustomFields();
+    syncFontOptions();
+    if (savedPreferences?.font_family && activeFonts[savedPreferences.font_family]) {
+        fontSelect.value = savedPreferences.font_family;
+    }
+    syncPreview();
+</script>
+{% endblock %}

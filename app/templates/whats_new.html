@@ -1,0 +1,216 @@
+{% extends "base_modern.html" %}
+
+{% block title %}What's New - Dikarya{% endblock %}
+{% block subtitle %}Changelog & Updates{% endblock %}
+
+{% block content %}
+<div class="max-w-3xl mx-auto">
+    <!-- Header -->
+    <div class="mb-10 text-center">
+        <h2 class="text-3xl font-bold text-journal-dark dark:text-journal-gold mb-2 flex items-center justify-center gap-3">
+            <i class="fas {% if edit_mode %}fa-pen-to-square{% else %}fa-star{% endif %} text-journal-gold"></i>
+            {% if edit_mode %}Edit What's New{% else %}What's New{% endif %}
+        </h2>
+        <p class="text-gray-600 dark:text-gray-400">Recent updates, improvements, and new features in Dikarya tree builder.</p>
+    </div>
+
+    {% if can_edit_whats_new %}
+    <div class="mb-6 flex justify-end">
+        {% if edit_mode %}
+        <a href="{{ url_for('main.whats_new') }}"
+            class="inline-flex items-center gap-2 px-4 py-2 rounded-lg bg-journal-dark hover:bg-journal-green text-white text-sm font-semibold shadow-sm transition-colors">
+            <i class="fas fa-check"></i> Done
+        </a>
+        {% else %}
+        <a href="{{ url_for('main.whats_new_edit') }}"
+            class="inline-flex items-center gap-2 px-4 py-2 rounded-lg bg-journal-gold hover:bg-journal-gold-light text-journal-dark text-sm font-semibold shadow-sm transition-colors">
+            <i class="fas fa-pen-to-square"></i> Edit
+        </a>
+        {% endif %}
+    </div>
+    {% endif %}
+
+    {% if edit_mode %}
+    <div class="rounded-2xl shadow-sm border border-journal-gold/40 bg-white dark:bg-journal-dark/70 p-6 mb-6">
+        <form method="post" action="{{ url_for('main.whats_new_add') }}" class="space-y-4">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+
+            <div class="flex items-center gap-2 text-sm font-bold text-journal-dark dark:text-journal-gold">
+                <i class="fas fa-plus-circle text-journal-gold"></i>
+                Add What's New Item
+            </div>
+
+            <div class="grid grid-cols-1 md:grid-cols-[1fr_13rem] gap-3">
+                <label class="block">
+                    <span class="block text-xs font-bold uppercase tracking-wide text-gray-500 dark:text-gray-400 mb-1">Title</span>
+                    <input type="text" name="title" required maxlength="255"
+                        class="w-full rounded-lg border border-gray-300 dark:border-journal-dark bg-white dark:bg-journal-dark px-3 py-2 text-sm text-gray-900 dark:text-gray-100 focus:ring-2 focus:ring-journal-gold focus:border-journal-gold">
+                </label>
+
+                <label class="block">
+                    <span class="block text-xs font-bold uppercase tracking-wide text-gray-500 dark:text-gray-400 mb-1">Icon</span>
+                    <select name="category"
+                        class="w-full rounded-lg border border-gray-300 dark:border-journal-dark bg-white dark:bg-journal-dark px-3 py-2 text-sm text-gray-900 dark:text-gray-100 focus:ring-2 focus:ring-journal-gold focus:border-journal-gold">
+                        <option value="feature">Feature</option>
+                        <option value="fix">Fix</option>
+                        <option value="improvement" selected>Improvement</option>
+                        <option value="update">Update</option>
+                    </select>
+                </label>
+            </div>
+
+            <label class="block">
+                <span class="block text-xs font-bold uppercase tracking-wide text-gray-500 dark:text-gray-400 mb-1">Text</span>
+                <textarea name="body" rows="4" required
+                    class="w-full rounded-lg border border-gray-300 dark:border-journal-dark bg-white dark:bg-journal-dark px-3 py-2 text-sm leading-relaxed text-gray-900 dark:text-gray-100 focus:ring-2 focus:ring-journal-gold focus:border-journal-gold"></textarea>
+            </label>
+
+            <div class="flex justify-end">
+                <button type="submit"
+                    class="inline-flex items-center gap-2 px-4 py-2 rounded-lg bg-journal-gold hover:bg-journal-gold-light text-journal-dark text-sm font-semibold shadow-sm transition-colors">
+                    <i class="fas fa-plus"></i> Add Item
+                </button>
+            </div>
+        </form>
+    </div>
+    {% endif %}
+
+    {% if entries %}
+    <div class="space-y-4">
+        {% for entry in entries %}
+        {% set is_new = (not edit_mode) and (last_viewed is none or entry.published_at > last_viewed) %}
+
+        <div class="rounded-2xl shadow-sm border transition-all duration-200
+            {% if is_new %}
+                bg-white dark:bg-journal-green/30 border-journal-gold/50 shadow-journal-gold/10 shadow-md
+            {% else %}
+                bg-gray-50 dark:bg-journal-dark/60 border-gray-200 dark:border-journal-green/20 opacity-75
+            {% endif %}
+            p-6">
+
+            <!-- Category badge + New indicator + date -->
+            <div class="flex items-center justify-between mb-3 flex-wrap gap-2">
+                <div class="flex items-center gap-2">
+                    {% if is_new %}
+                    <span class="inline-flex items-center gap-1 bg-journal-gold text-journal-dark text-xs font-bold px-2 py-0.5 rounded-full uppercase tracking-wider">
+                        <i class="fas fa-star text-xs"></i> New
+                    </span>
+                    {% endif %}
+                    {% if entry.category == 'feature' %}
+                    <span class="inline-flex items-center gap-1 bg-green-100 text-green-800 dark:bg-green-900/40 dark:text-green-300 text-xs font-semibold px-2.5 py-0.5 rounded-full">
+                        <i class="fas fa-plus-circle text-xs"></i> Feature
+                    </span>
+                    {% elif entry.category == 'fix' %}
+                    <span class="inline-flex items-center gap-1 bg-red-100 text-red-800 dark:bg-red-900/40 dark:text-red-300 text-xs font-semibold px-2.5 py-0.5 rounded-full">
+                        <i class="fas fa-bug text-xs"></i> Fix
+                    </span>
+                    {% elif entry.category == 'improvement' %}
+                    <span class="inline-flex items-center gap-1 bg-blue-100 text-blue-800 dark:bg-blue-900/40 dark:text-blue-300 text-xs font-semibold px-2.5 py-0.5 rounded-full">
+                        <i class="fas fa-wrench text-xs"></i> Improvement
+                    </span>
+                    {% else %}
+                    <span class="inline-flex items-center gap-1 bg-gray-100 text-gray-700 dark:bg-gray-700/40 dark:text-gray-300 text-xs font-semibold px-2.5 py-0.5 rounded-full">
+                        <i class="fas fa-info-circle text-xs"></i> Update
+                    </span>
+                    {% endif %}
+                </div>
+                <time class="text-xs text-gray-400 dark:text-gray-500 tabular-nums">
+                    {{ entry.published_at.strftime('%B %-d, %Y') }}
+                </time>
+            </div>
+
+            {% if edit_mode %}
+            <form method="post" action="{{ url_for('main.whats_new_update', entry_id=entry.id) }}" class="space-y-4">
+                <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+
+                <div class="grid grid-cols-1 md:grid-cols-[1fr_13rem] gap-3">
+                    <label class="block">
+                        <span class="block text-xs font-bold uppercase tracking-wide text-gray-500 dark:text-gray-400 mb-1">Title</span>
+                        <input type="text" name="title" value="{{ entry.title }}" required maxlength="255"
+                            class="w-full rounded-lg border border-gray-300 dark:border-journal-dark bg-white dark:bg-journal-dark px-3 py-2 text-sm text-gray-900 dark:text-gray-100 focus:ring-2 focus:ring-journal-gold focus:border-journal-gold">
+                    </label>
+
+                    <label class="block">
+                        <span class="block text-xs font-bold uppercase tracking-wide text-gray-500 dark:text-gray-400 mb-1">Icon</span>
+                        <select name="category"
+                            class="w-full rounded-lg border border-gray-300 dark:border-journal-dark bg-white dark:bg-journal-dark px-3 py-2 text-sm text-gray-900 dark:text-gray-100 focus:ring-2 focus:ring-journal-gold focus:border-journal-gold">
+                            <option value="feature" {% if entry.category == 'feature' %}selected{% endif %}>Feature</option>
+                            <option value="fix" {% if entry.category == 'fix' %}selected{% endif %}>Fix</option>
+                            <option value="improvement" {% if entry.category == 'improvement' %}selected{% endif %}>Improvement</option>
+                            <option value="update" {% if entry.category == 'update' %}selected{% endif %}>Update</option>
+                        </select>
+                    </label>
+                </div>
+
+                <label class="block">
+                    <span class="block text-xs font-bold uppercase tracking-wide text-gray-500 dark:text-gray-400 mb-1">Text</span>
+                    <textarea name="body" rows="4" required
+                        class="w-full rounded-lg border border-gray-300 dark:border-journal-dark bg-white dark:bg-journal-dark px-3 py-2 text-sm leading-relaxed text-gray-900 dark:text-gray-100 focus:ring-2 focus:ring-journal-gold focus:border-journal-gold">{{ entry.body }}</textarea>
+                </label>
+
+                <div class="flex flex-wrap items-center justify-end gap-2">
+                    <button type="submit"
+                        class="inline-flex items-center gap-2 px-4 py-2 rounded-lg bg-journal-gold hover:bg-journal-gold-light text-journal-dark text-sm font-semibold shadow-sm transition-colors">
+                        <i class="fas fa-save"></i> Save
+                    </button>
+                    <button type="submit" formaction="{{ url_for('main.whats_new_delete', entry_id=entry.id) }}"
+                        onclick="return confirm('Delete this item?')"
+                        class="inline-flex items-center gap-2 px-4 py-2 rounded-lg bg-red-600 hover:bg-red-700 text-white text-sm font-semibold shadow-sm transition-colors">
+                        <i class="fas fa-trash"></i> Delete
+                    </button>
+                </div>
+            </form>
+            {% else %}
+            <!-- Title -->
+            <h3 class="text-lg font-semibold mb-2
+                {% if is_new %}
+                    text-journal-dark dark:text-white
+                {% else %}
+                    text-gray-600 dark:text-gray-400
+                {% endif %}">
+                {{ entry.title }}
+            </h3>
+
+            <!-- Body -->
+            <div class="text-sm leading-relaxed
+                {% if is_new %}
+                    text-gray-700 dark:text-gray-300
+                {% else %}
+                    text-gray-500 dark:text-gray-500
+                {% endif %}">
+                {{ entry.body | safe }}
+            </div>
+            {% if can_edit_whats_new %}
+            <div class="mt-4 pt-4 border-t border-gray-200 dark:border-journal-green/20 flex justify-end">
+                <form method="post" action="{{ url_for('main.whats_new_delete', entry_id=entry.id) }}">
+                    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+                    <input type="hidden" name="next" value="{{ url_for('main.whats_new') }}">
+                    <button type="submit" onclick="return confirm('Delete this item?')"
+                        class="inline-flex items-center gap-2 px-3 py-1.5 rounded-lg bg-red-600 hover:bg-red-700 text-white text-xs font-semibold shadow-sm transition-colors">
+                        <i class="fas fa-trash"></i> Delete
+                    </button>
+                </form>
+            </div>
+            {% endif %}
+            {% endif %}
+        </div>
+        {% endfor %}
+    </div>
+
+    {% if last_viewed %}
+    <p class="text-center text-xs text-gray-400 dark:text-gray-600 mt-8">
+        <i class="fas fa-clock mr-1"></i>
+        Items above the marker are new since your last visit on {{ last_viewed.strftime('%B %-d, %Y at %-I:%M %p') }} UTC.
+    </p>
+    {% endif %}
+
+    {% else %}
+    <!-- Empty state -->
+    <div class="bg-gray-50 dark:bg-journal-dark/50 border-2 border-dashed border-gray-200 dark:border-journal-green/30 p-16 rounded-2xl text-center">
+        <i class="fas fa-star text-5xl text-gray-200 dark:text-journal-green/30 mb-4 block"></i>
+        <p class="text-gray-500 dark:text-gray-400 text-lg font-medium">No updates posted yet.</p>
+        <p class="text-gray-400 dark:text-gray-500 text-sm mt-1">Check back soon for news about new features and improvements.</p>
+    </div>
+    {% endif %}
+</div>
+{% endblock %}

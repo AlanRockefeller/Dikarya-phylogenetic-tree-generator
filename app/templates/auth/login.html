@@ -1,0 +1,96 @@
+{% extends "base_modern.html" %}
+
+{% block title %}Dikarya - Login{% endblock %}
+{% block subtitle %}Login{% endblock %}
+
+{% block content %}
+<div class="max-w-md mx-auto mt-12">
+    <!-- Why an Account? Info Card -->
+    <div class="bg-white dark:bg-journal-green rounded-xl shadow-md overflow-hidden mb-6 transition-colors">
+        <div class="px-6 py-5">
+            <h3 class="text-base font-bold text-journal-dark dark:text-gray-100 flex items-center mb-3">
+                <i class="fas fa-circle-info text-journal-gold mr-2"></i>Why create an account?
+            </h3>
+            <ul class="text-sm text-gray-700 dark:text-gray-300 space-y-2">
+                <li class="flex items-start">
+                    <i class="fas fa-shield-halved text-journal-gold mt-1 mr-2 w-4"></i>
+                    <span><strong>Exclusive edit access.</strong> Only you can prune, reroot, rename tips, or recompute your trees. Without an account, anyone who has the job link can modify the tree.</span>
+                </li>
+                <li class="flex items-start">
+                    <i class="fas fa-tasks text-journal-gold mt-1 mr-2 w-4"></i>
+                    <span><strong>My Jobs dashboard.</strong> See all of your past analyses in one place, instead of having to bookmark each job URL.</span>
+                </li>
+                <li class="flex items-start">
+                    <i class="fas fa-clock-rotate-left text-journal-gold mt-1 mr-2 w-4"></i>
+                    <span><strong>Persistent history.</strong> Your jobs stay tied to your account so you can come back to them later.</span>
+                </li>
+            </ul>
+            <div class="mt-4 pt-3 border-t border-gray-200 dark:border-journal-dark">
+                <p class="text-xs text-gray-600 dark:text-gray-400 leading-relaxed">
+                    <i class="fas fa-user-secret text-gray-400 mr-1"></i>
+                    <strong>Prefer not to sign up?</strong> You can use Dikarya anonymously without an account &mdash; build trees, share links, and download results just the same. The only tradeoff is that anyone with a job link can also edit that tree.
+                </p>
+            </div>
+        </div>
+    </div>
+
+    <!-- Login Card -->
+    <div class="bg-white dark:bg-journal-green rounded-xl shadow-lg overflow-hidden transition-colors">
+        <!-- Card Header -->
+        <div class="bg-journal-dark px-6 py-4 border-b border-journal-green">
+            <h2 class="text-xl font-bold text-white flex items-center">
+                <i class="fas fa-sign-in-alt text-journal-gold mr-3"></i>Login
+            </h2>
+            <p class="text-gray-300 text-sm mt-1">Sign in to access your phylogenetic analyses</p>
+        </div>
+
+        <!-- Card Body -->
+        <div class="px-6 py-8">
+            <form method="POST" action="{{ url_for('auth.login') }}" class="space-y-6">
+                <input type="hidden" name="csrf_token" value="{{ csrf_token() }}" />
+                <!-- Email Field -->
+                <div>
+                    <label for="email" class="block text-sm font-semibold text-journal-dark dark:text-gray-200 mb-2">
+                        <i class="fas fa-envelope text-journal-gold mr-2"></i>Email Address
+                    </label>
+                    <input type="email" class="w-full px-4 py-3 rounded-lg border border-gray-300 dark:border-journal-dark 
+                                  bg-white dark:bg-journal-dark text-journal-dark dark:text-gray-100
+                                  focus:ring-2 focus:ring-journal-gold focus:border-transparent
+                                  transition-all placeholder-gray-400 dark:placeholder-gray-500" id="email"
+                        name="email" placeholder="your.email@example.com" required>
+                </div>
+
+                <!-- Password Field -->
+                <div>
+                    <label for="password" class="block text-sm font-semibold text-journal-dark dark:text-gray-200 mb-2">
+                        <i class="fas fa-lock text-journal-gold mr-2"></i>Password
+                    </label>
+                    <input type="password" class="w-full px-4 py-3 rounded-lg border border-gray-300 dark:border-journal-dark 
+                                  bg-white dark:bg-journal-dark text-journal-dark dark:text-gray-100
+                                  focus:ring-2 focus:ring-journal-gold focus:border-transparent
+                                  transition-all placeholder-gray-400 dark:placeholder-gray-500" id="password"
+                        name="password" placeholder="Enter your password" required>
+                </div>
+
+                <!-- Submit Button -->
+                <button type="submit" class="w-full bg-journal-gold hover:bg-journal-gold-light text-journal-dark 
+                               px-6 py-3 rounded-lg font-semibold shadow-md hover:shadow-lg 
+                               transition-all transform hover:-translate-y-0.5 flex items-center justify-center">
+                    <i class="fas fa-sign-in-alt mr-2"></i>Sign In
+                </button>
+            </form>
+        </div>
+
+        <!-- Card Footer -->
+        <div class="bg-gray-50 dark:bg-journal-dark px-6 py-4 border-t border-gray-200 dark:border-journal-green">
+            <p class="text-sm text-gray-600 dark:text-gray-300 text-center">
+                Don't have an account?
+                <a href="{{ url_for('auth.register') }}"
+                    class="text-journal-gold hover:text-journal-gold-light font-semibold transition-colors">
+                    Register here
+                </a>
+            </p>
+        </div>
+    </div>
+</div>
+{% endblock %}

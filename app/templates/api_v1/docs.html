@@ -1,0 +1,491 @@
+{% extends "base_modern.html" %}
+
+{% block title %}Dikarya - API Docs{% endblock %}
+{% block subtitle %}API v1 Documentation{% endblock %}
+
+{% block head %}
+<link rel="stylesheet" href="{{ url_for('static', filename='vendor/swagger-ui.css') }}">
+<style>
+    /* Keep Swagger UI from blowing out the journal-themed page chrome */
+    .swagger-ui .topbar { display: none; }
+    #swagger-ui .info { margin: 30px 0; }
+    .swagger-card { background: white; border-radius: 12px; box-shadow: 0 4px 12px rgba(0,0,0,.08); }
+    .dark .swagger-card { background: #1c3025; }
+
+    /* =====================================================================
+       Dark-mode overrides for Swagger UI. The bundled stylesheet is built
+       for a light page; in dark mode many of its dark-on-light text styles
+       become unreadable on the journal's dark surfaces. We retint the
+       essentials here using the journal-green / journal-gold tokens.
+       ===================================================================== */
+    html.dark .swagger-ui,
+    html.dark .swagger-ui .info .title,
+    html.dark .swagger-ui .info,
+    html.dark .swagger-ui .info p,
+    html.dark .swagger-ui .info li,
+    html.dark .swagger-ui .info table,
+    html.dark .swagger-ui .scheme-container,
+    html.dark .swagger-ui .opblock-tag,
+    html.dark .swagger-ui .opblock-tag small,
+    html.dark .swagger-ui .opblock .opblock-summary-description,
+    html.dark .swagger-ui .opblock .opblock-summary-path,
+    html.dark .swagger-ui .opblock .opblock-summary-path__deprecated,
+    html.dark .swagger-ui .opblock .opblock-summary-operation-id,
+    html.dark .swagger-ui .opblock-description-wrapper p,
+    html.dark .swagger-ui .opblock-external-docs-wrapper p,
+    html.dark .swagger-ui .opblock-title_normal p,
+    html.dark .swagger-ui .opblock-section-header,
+    html.dark .swagger-ui .opblock-section-header h4,
+    html.dark .swagger-ui .opblock-section-header > label,
+    html.dark .swagger-ui .responses-inner h4,
+    html.dark .swagger-ui .responses-inner h5,
+    html.dark .swagger-ui .response-col_status,
+    html.dark .swagger-ui .response-col_description,
+    html.dark .swagger-ui .response-col_links,
+    html.dark .swagger-ui table thead tr td,
+    html.dark .swagger-ui table thead tr th,
+    html.dark .swagger-ui table tbody tr td,
+    html.dark .swagger-ui .parameter__name,
+    html.dark .swagger-ui .parameter__type,
+    html.dark .swagger-ui .parameter__deprecated,
+    html.dark .swagger-ui .parameter__in,
+    html.dark .swagger-ui .parameters-col_description p,
+    html.dark .swagger-ui .parameters-col_description,
+    html.dark .swagger-ui .model,
+    html.dark .swagger-ui .model-title,
+    html.dark .swagger-ui .model-box,
+    html.dark .swagger-ui section.models h4,
+    html.dark .swagger-ui section.models h4 span,
+    html.dark .swagger-ui section.models .model-container,
+    html.dark .swagger-ui .markdown p,
+    html.dark .swagger-ui .markdown li,
+    html.dark .swagger-ui .renderedMarkdown p,
+    html.dark .swagger-ui .renderedMarkdown li,
+    html.dark .swagger-ui .tab li,
+    html.dark .swagger-ui label,
+    html.dark .swagger-ui .response-control-media-type__title,
+    html.dark .swagger-ui .response-control-examples__title,
+    html.dark .swagger-ui .servers-title,
+    html.dark .swagger-ui .servers > label,
+    html.dark .swagger-ui .auth-container h4,
+    html.dark .swagger-ui .auth-container .scopes h2,
+    html.dark .swagger-ui .auth-container,
+    html.dark .swagger-ui .dialog-ux .modal-ux,
+    html.dark .swagger-ui .dialog-ux .modal-ux-header h3,
+    html.dark .swagger-ui .dialog-ux .modal-ux-content h4,
+    html.dark .swagger-ui .dialog-ux .modal-ux-content p {
+        color: #ece4cf;
+    }
+
+    /* Section / card backgrounds */
+    html.dark .swagger-ui .scheme-container,
+    html.dark .swagger-ui .opblock-tag-section,
+    html.dark .swagger-ui section.models,
+    html.dark .swagger-ui section.models .model-container,
+    html.dark .swagger-ui .dialog-ux .modal-ux,
+    html.dark .swagger-ui .auth-container {
+        background: #1c3025;
+        box-shadow: none;
+        border-color: #355245;
+    }
+    html.dark .swagger-ui .opblock-tag {
+        border-bottom-color: #355245;
+    }
+
+    /* Operation rows: leave the colored stripe alone but darken the body */
+    html.dark .swagger-ui .opblock {
+        background: #1c3025;
+        border-color: #355245;
+    }
+    html.dark .swagger-ui .opblock .opblock-section-header {
+        background: #14241b;
+        box-shadow: none;
+    }
+    html.dark .swagger-ui .opblock.is-open .opblock-summary {
+        border-bottom-color: #355245;
+    }
+
+    /* Tables */
+    html.dark .swagger-ui table thead tr td,
+    html.dark .swagger-ui table thead tr th {
+        border-bottom-color: #355245;
+    }
+    html.dark .swagger-ui table tbody tr td {
+        border-bottom-color: #2d4a3e;
+    }
+
+    /* Code / pre blocks. Swagger UI's microlight syntax highlighter writes
+       inline `style="color: ..."` on each token span, which wins over the
+       cascade. Force inherit on those inline spans so the parent color sticks. */
+    html.dark .swagger-ui .highlight-code,
+    html.dark .swagger-ui .opblock-body pre.microlight,
+    html.dark .swagger-ui .response-col_description pre,
+    html.dark .swagger-ui pre,
+    html.dark .swagger-ui code,
+    html.dark .swagger-ui .renderedMarkdown code,
+    html.dark .swagger-ui .example,
+    html.dark .swagger-ui .body-param__example,
+    html.dark .swagger-ui .curl-command,
+    html.dark .swagger-ui .curl {
+        background: #0b2418 !important;
+        color: #f4f0dc !important;
+    }
+    html.dark .swagger-ui .highlight-code span,
+    html.dark .swagger-ui .microlight span,
+    html.dark .swagger-ui pre span,
+    html.dark .swagger-ui code span {
+        color: inherit !important;
+    }
+    /* Restore subtle accent on a few token types so highlighting is still
+       legible rather than fully monochrome. These are scoped to dark mode. */
+    html.dark .swagger-ui .microlight .hljs-string,
+    html.dark .swagger-ui .highlight-code .hljs-string {
+        color: #d4b87a !important;  /* warm sand for string literals */
+    }
+    html.dark .swagger-ui .microlight .hljs-number,
+    html.dark .swagger-ui .highlight-code .hljs-number,
+    html.dark .swagger-ui .microlight .hljs-literal,
+    html.dark .swagger-ui .highlight-code .hljs-literal {
+        color: #9ec1a1 !important;  /* sage green for numbers/literals */
+    }
+    html.dark .swagger-ui .microlight .hljs-comment,
+    html.dark .swagger-ui .highlight-code .hljs-comment {
+        color: #8a9c8e !important;  /* muted comments */
+        font-style: italic;
+    }
+
+    /* Form inputs */
+    html.dark .swagger-ui input[type=text],
+    html.dark .swagger-ui input[type=password],
+    html.dark .swagger-ui input[type=search],
+    html.dark .swagger-ui input[type=email],
+    html.dark .swagger-ui textarea,
+    html.dark .swagger-ui select {
+        background: #14241b;
+        color: #ece4cf;
+        border-color: #355245;
+    }
+    html.dark .swagger-ui textarea.curl,
+    html.dark .swagger-ui textarea.curl-command {
+        background: #0f1c14;
+        color: #ece4cf;
+    }
+
+    /* Buttons */
+    html.dark .swagger-ui .btn {
+        color: #ece4cf;
+        background: #2d4a3e;
+        border-color: #355245;
+        box-shadow: none;
+    }
+    html.dark .swagger-ui .btn.authorize {
+        color: #1a2f23;
+        background: #c9a962;
+        border-color: #c9a962;
+    }
+    html.dark .swagger-ui .btn.authorize svg { fill: #1a2f23; }
+    html.dark .swagger-ui .btn.execute {
+        color: #1a2f23;
+        background: #c9a962;
+        border-color: #c9a962;
+    }
+
+    /* Links / accent */
+    html.dark .swagger-ui a,
+    html.dark .swagger-ui a:visited,
+    html.dark .swagger-ui .info a,
+    html.dark .swagger-ui .info a:hover {
+        color: #c9a962;
+    }
+
+    /* Tabs */
+    html.dark .swagger-ui .tab li.active,
+    html.dark .swagger-ui .tab li.tabitem.active {
+        color: #c9a962;
+    }
+
+    /* Models / schema viewer */
+    html.dark .swagger-ui .model-toggle:after { background: #ece4cf; }
+    html.dark .swagger-ui .prop-type,
+    html.dark .swagger-ui .prop-format,
+    html.dark .swagger-ui .property.primitive {
+        color: #b9b29a;
+    }
+    html.dark .swagger-ui .model .property {
+        color: #ece4cf;
+    }
+
+    /* Schema label pills (required/etc.) */
+    html.dark .swagger-ui .parameter__name.required:after,
+    html.dark .swagger-ui .parameter__name.required span {
+        color: #f87171;
+    }
+
+    /* "Try it out" / response containers */
+    html.dark .swagger-ui .responses-wrapper,
+    html.dark .swagger-ui .opblock-body {
+        background: #1c3025;
+    }
+    html.dark .swagger-ui .response .response-col_description__inner div.markdown,
+    html.dark .swagger-ui .response .response-col_description__inner div.renderedMarkdown {
+        background: #0f1c14;
+        color: #ece4cf;
+    }
+
+    /* Modal / authorize dialog overlay */
+    html.dark .swagger-ui .dialog-ux .backdrop-ux {
+        background: rgba(0,0,0,0.7);
+    }
+    html.dark .swagger-ui .dialog-ux .modal-ux {
+        border-color: #355245;
+    }
+    html.dark .swagger-ui .dialog-ux .modal-ux-header {
+        background: #14241b;
+        border-bottom-color: #355245;
+    }
+
+    /* Authorize-status caption ("Available authorizations") */
+    html.dark .swagger-ui .auth-wrapper .authorize { color: #c9a962; }
+
+    /* =====================================================================
+       Title / version / OAS pills. Swagger UI's default rendering is a chunky
+       green badge with black text -- works on a white page, looks awkward
+       elsewhere. Reshape to a compact rounded chip that fits the journal
+       palette. Applies in both modes (smaller in light, retinted in dark).
+       ===================================================================== */
+    .swagger-ui .info .title small,
+    .swagger-ui .info .title .version-stamp {
+        background: transparent;
+        padding: 0;
+        margin-left: 8px;
+        vertical-align: middle;
+    }
+    .swagger-ui .info .title small pre,
+    .swagger-ui .info .title .version-stamp pre,
+    .swagger-ui .info .title small .version {
+        display: inline-block;
+        background: #e8efe9;
+        color: #1a2f23;
+        border: 1px solid #c9a962;
+        border-radius: 9999px;
+        padding: 2px 10px;
+        font-size: 11px;
+        font-weight: 600;
+        line-height: 1.4;
+        margin: 0;
+        white-space: nowrap;
+    }
+    html.dark .swagger-ui .info .title small pre,
+    html.dark .swagger-ui .info .title .version-stamp pre,
+    html.dark .swagger-ui .info .title small .version {
+        background: #2d4a3e;
+        color: #c9a962;
+        border-color: #6a5a36;
+    }
+</style>
+{% endblock %}
+
+{% block content %}
+<div class="max-w-7xl mx-auto space-y-6">
+
+    <!-- Header -->
+    <div class="bg-white dark:bg-journal-green rounded-xl shadow-lg p-6 transition-colors">
+        <div class="flex items-start justify-between flex-wrap gap-4">
+            <div>
+                <h2 class="text-2xl font-bold text-journal-dark dark:text-gray-100 flex items-center">
+                    <i class="fas fa-book text-journal-gold mr-3"></i>Dikarya API v1
+                </h2>
+                <p class="text-sm text-gray-600 dark:text-gray-300 mt-1">
+                    Programmatic access for scripts and tools. All endpoints require a bearer token.
+                </p>
+            </div>
+            <div class="flex flex-wrap gap-3 text-sm">
+                {% if current_user.is_authenticated %}
+                <a href="{{ url_for('user.api_tokens') }}"
+                   class="bg-journal-gold hover:bg-journal-gold-light text-journal-dark px-4 py-2 rounded-lg font-semibold transition-colors flex items-center">
+                    <i class="fas fa-key mr-2"></i>Manage tokens
+                </a>
+                {% else %}
+                <a href="{{ url_for('auth.login') }}"
+                   class="bg-journal-gold hover:bg-journal-gold-light text-journal-dark px-4 py-2 rounded-lg font-semibold transition-colors flex items-center">
+                    <i class="fas fa-sign-in-alt mr-2"></i>Log in to mint a token
+                </a>
+                {% endif %}
+                <a href="{{ url_for('api_v1.openapi_json') }}"
+                   class="bg-journal-dark hover:bg-journal-green text-white px-4 py-2 rounded-lg font-semibold transition-colors flex items-center">
+                    <i class="fas fa-file-code mr-2"></i>OpenAPI JSON
+                </a>
+            </div>
+        </div>
+    </div>
+
+    <!-- Quick start examples -->
+    <div class="bg-white dark:bg-journal-green rounded-xl shadow-lg overflow-hidden transition-colors">
+        <div class="bg-journal-dark px-5 py-3 border-b border-journal-green">
+            <h3 class="text-white font-semibold flex items-center">
+                <i class="fas fa-rocket text-journal-gold mr-2"></i>Quick start
+            </h3>
+        </div>
+        <div class="p-5 space-y-4 text-sm">
+            <p class="text-gray-700 dark:text-gray-200">
+                1. Mint a token at <a href="{{ url_for('user.api_tokens') }}" class="text-journal-gold hover:underline">/user/tokens</a>.
+                2. Send it in the <code class="font-mono text-xs bg-gray-100 dark:bg-journal-dark text-journal-dark dark:text-journal-cream px-1.5 py-0.5 rounded">Authorization</code> header.
+            </p>
+
+            <div>
+                <h4 class="font-semibold text-journal-dark dark:text-gray-100 mb-2">curl</h4>
+                <p class="text-xs text-gray-600 dark:text-gray-300 mb-2">
+                    Requires <code class="font-mono bg-gray-100 dark:bg-journal-dark text-journal-dark dark:text-journal-cream px-1 rounded">jq</code>.
+                    Use <code class="font-mono bg-gray-100 dark:bg-journal-dark text-journal-dark dark:text-journal-cream px-1 rounded">"input_type": "pasted_sequence"</code>
+                    when sending FASTA text in JSON &mdash; <code class="font-mono">"fasta"</code> is reserved for file-upload flows and is not supported on this endpoint.
+                </p>
+                <pre class="bg-gray-100 dark:bg-journal-dark text-journal-dark dark:text-journal-cream text-xs p-3 rounded overflow-x-auto"><code>TOKEN="dikarya_..."
+
+# Identity check
+curl -H "Authorization: Bearer $TOKEN" https://dikarya.us/api/v1/me
+
+# Create a small working tree job and save the returned UUID
+JOB_ID=$(
+  curl -s -X POST https://dikarya.us/api/v1/jobs \
+    -H "Authorization: Bearer $TOKEN" \
+    -H "Content-Type: application/json" \
+    -d '{
+      "input_type": "pasted_sequence",
+      "sequence": ">Sample_A\nATGCGTACGTAGCTAGCTAGCTAGCTAGCTAACGATCGATCGATCGATCGATCGATCGATCGATCGATCGATCGATCGATCGATCGATCGATCGATCG\n>Sample_B\nATGCGTACGTAGCTAGCTAGCTAGCTAGCTAACGATCGATCGATCGATCGATCGATCGATCGATCGATCGATCGATCGATCGTTTGATCGATCGATCG\n>Sample_C\nATGCGTACGTAGCTAGCTAGCTAGCTAGCTAACGATCGATCGATCGATCGATCGATCGATCGATCGATCGATCGATCGATCGATCGTTTGATCG\n>Sample_D\nATGCGTACGTAGCTAGCTAGCTAGCTAGCTAACGATCGATCGATCGATCGATCGATCGATCGATCGATCGATCGTTTGATCGATCGATCGATCGATCG",
+      "tree_method": "fasttree",
+      "alignment_method": "mafft",
+      "trimming_method": "none",
+      "notes": "API test with valid pasted FASTA"
+    }' | jq -r '.data.id'
+)
+
+echo "$JOB_ID"
+
+# Poll until the job finishes
+for i in {1..60}; do
+  STATUS=$(
+    curl -s -H "Authorization: Bearer $TOKEN" \
+      "https://dikarya.us/api/v1/jobs/$JOB_ID" | jq -r '.data.status // .error.message'
+  )
+
+  echo "$(date +%T) $STATUS"
+
+  case "$STATUS" in
+    completed|failed|error) break ;;
+  esac
+
+  sleep 2
+done
+
+# Show the final job record
+curl -s -H "Authorization: Bearer $TOKEN" \
+  "https://dikarya.us/api/v1/jobs/$JOB_ID" | jq
+
+# Download the Newick tree
+curl -H "Authorization: Bearer $TOKEN" \
+  "https://dikarya.us/api/v1/jobs/$JOB_ID/files/tree.newick" \
+  -o tree.newick
+
+cat tree.newick</code></pre>
+            </div>
+
+            <div>
+                <h4 class="font-semibold text-journal-dark dark:text-gray-100 mb-2">Python</h4>
+                <p class="text-xs text-gray-600 dark:text-gray-300 mb-2">
+                    Reads your token from <code class="font-mono bg-gray-100 dark:bg-journal-dark text-journal-dark dark:text-journal-cream px-1 rounded">DIKARYA_TOKEN</code>.
+                    Same <code class="font-mono">pasted_sequence</code> convention as the curl example.
+                </p>
+                <pre class="bg-gray-100 dark:bg-journal-dark text-journal-dark dark:text-journal-cream text-xs p-3 rounded overflow-x-auto"><code>import os
+import time
+import requests
+
+API = "https://dikarya.us/api/v1"
+TOKEN = os.environ["DIKARYA_TOKEN"]
+HEADERS = {"Authorization": f"Bearer {TOKEN}"}
+
+sequence = """&gt;Sample_A
+ATGCGTACGTAGCTAGCTAGCTAGCTAGCTAACGATCGATCGATCGATCGATCGATCGATCGATCGATCGATCGATCGATCGATCGATCGATCGATCG
+&gt;Sample_B
+ATGCGTACGTAGCTAGCTAGCTAGCTAGCTAACGATCGATCGATCGATCGATCGATCGATCGATCGATCGATCGATCGATCGTTTGATCGATCGATCG
+&gt;Sample_C
+ATGCGTACGTAGCTAGCTAGCTAGCTAGCTAACGATCGATCGATCGATCGATCGATCGATCGATCGATCGATCGATCGATCGATCGTTTGATCG
+&gt;Sample_D
+ATGCGTACGTAGCTAGCTAGCTAGCTAGCTAACGATCGATCGATCGATCGATCGATCGATCGATCGATCGATCGTTTGATCGATCGATCGATCGATCG
+"""
+
+payload = {
+    "input_type": "pasted_sequence",
+    "sequence": sequence,
+    "tree_method": "fasttree",
+    "alignment_method": "mafft",
+    "trimming_method": "none",
+    "notes": "Python API test with valid pasted FASTA",
+}
+
+response = requests.post(
+    f"{API}/jobs",
+    headers={**HEADERS, "Content-Type": "application/json"},
+    json=payload,
+)
+response.raise_for_status()
+job_id = response.json()["data"]["id"]
+print("Job ID:", job_id)
+
+while True:
+    response = requests.get(f"{API}/jobs/{job_id}", headers=HEADERS)
+    response.raise_for_status()
+    job = response.json()["data"]
+    print(job["status"])
+
+    if job["status"] in ("completed", "failed", "error"):
+        break
+
+    time.sleep(2)
+
+if job["status"] != "completed":
+    raise RuntimeError(f"Job did not complete: {job['status']}")
+
+tree_response = requests.get(
+    f"{API}/jobs/{job_id}/files/tree.newick",
+    headers=HEADERS,
+)
+tree_response.raise_for_status()
+print(tree_response.text)</code></pre>
+            </div>
+
+            <p class="text-xs text-gray-500 dark:text-gray-400 italic">
+                Use the <code class="font-mono">Authorize</code> button below to plug in your token,
+                then any endpoint can be tried directly from this page.
+            </p>
+        </div>
+    </div>
+
+    <!-- Swagger UI mount -->
+    <div class="swagger-card p-2">
+        <div id="swagger-ui"></div>
+    </div>
+
+</div>
+
+<script src="{{ url_for('static', filename='vendor/swagger-ui-bundle.js') }}"></script>
+<script src="{{ url_for('static', filename='vendor/swagger-ui-standalone-preset.js') }}"></script>
+<script>
+    window.onload = function() {
+        window.ui = SwaggerUIBundle({
+            url: "{{ url_for('api_v1.openapi_json') }}",
+            dom_id: '#swagger-ui',
+            deepLinking: true,
+            presets: [
+                SwaggerUIBundle.presets.apis,
+                SwaggerUIStandalonePreset
+            ],
+            plugins: [SwaggerUIBundle.plugins.DownloadUrl],
+            layout: "BaseLayout",
+            persistAuthorization: true,
+            tryItOutEnabled: true,
+            displayRequestDuration: true,
+            defaultModelsExpandDepth: -1,
+        });
+    };
+</script>
+{% endblock %}
