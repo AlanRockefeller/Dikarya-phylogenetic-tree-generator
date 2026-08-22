@@ -1,0 +1,75 @@
+{% extends "journal/base_journal.html" %}
+
+{% block title %}Resources - Dikarya{% endblock %}
+
+{% block content %}
+<div class="journal-page-header">
+    <h1>Additional Resources</h1>
+</div>
+
+<section class="journal-section">
+    <h2>Writing & Publication Guides</h2>
+    <div class="journal-card-grid">
+        <div class="journal-card">
+            <h3>How to Publish a New Fungal Species</h3>
+            <p>ICTF guidelines (v3.0) covering ICNafp requirements, best practices for species descriptions, model
+                papers, checklists, and templates.</p>
+            <a href="https://link.springer.com/article/10.1186/s43008-021-00063-1" target="_blank" rel="noopener">Read
+                Article →</a>
+        </div>
+        <div class="journal-card">
+            <h3>Tree Thinking: An Introduction to Phylogenetic Biology</h3>
+            <p>Essential reading by Baum & Smith covering how to read and interpret phylogenetic trees, common
+                misconceptions, and the conceptual foundations of evolutionary analysis.</p>
+            <a href="https://www.amazon.com/Tree-Thinking-Introduction-Phylogenetic-Biology/dp/1936221160"
+                target="_blank" rel="noopener">View Book →</a>
+        </div>
+        <div class="journal-card">
+            <h3>Data Deposition Guide</h3>
+            <p>Step-by-step instructions for submitting sequences to GenBank and UNITE.</p>
+        </div>
+    </div>
+</section>
+
+<section class="journal-section">
+    <h2>Databases & Tools</h2>
+    <div class="journal-card-grid">
+        <div class="journal-card">
+            <h3>🧬 Dikarya Tree Builder</h3>
+            <p>Our integrated phylogenetic analysis pipeline. Build publication-quality trees from your sequences.</p>
+            <a href="{{ url_for('main.sequence_entry') }}">Launch Tool →</a>
+        </div>
+        <div class="journal-card">
+            <h3>Mycomap BLAST</h3>
+            <p>Search iNaturalist, Mushroom Observer, NCBI, UNITE, and BOLD simultaneously. Features many useful tools
+                not found on other BLAST websites.</p>
+            <a href="https://mycomap.com/genetics/blast-search/" target="_blank" rel="noopener">Launch Mycomap BLAST
+                →</a>
+        </div>
+        <div class="journal-card">
+            <h3>NCBI BLAST</h3>
+            <p>Search nucleotide and protein databases for sequence similarity.</p>
+            <a href="https://blast.ncbi.nlm.nih.gov/" target="_blank" rel="noopener">Visit BLAST →</a>
+        </div>
+        <div class="journal-card">
+            <h3>ITSx</h3>
+            <p>Extract ITS1, 5.8S, and ITS2 regions from fungal sequences.</p>
+            <a href="https://microbiology.se/software/itsx/" target="_blank" rel="noopener">Learn More →</a>
+        </div>
+    </div>
+</section>
+
+<section class="journal-section">
+    <h2>Collaboration Opportunities</h2>
+    <div class="journal-content" style="max-width: 100%;">
+        <h2>Partner Labs & Collections</h2>
+        <p>Dikarya facilitates connections between researchers and mycological collections. If you are seeking
+            collaborators or access to specimens, <a href="{{ url_for('journal.contact') }}">contact us</a> for
+            assistance.</p>
+
+        <h2>Workshops & Training</h2>
+        <p>We periodically organize workshops on molecular phylogenetics, nomenclature, and scientific writing.
+            Subscribe to our announcements to stay informed.</p>
+    </div>
+</section>
+{% endblock %}

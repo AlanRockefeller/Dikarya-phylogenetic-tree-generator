@@ -1,0 +1,916 @@
+/**
+ * Job Status Dashboard Styles
+ * 
+ * A professional, real-time status dashboard for phylogenetic analysis jobs.
+ * Uses stable step keys: input, blast, align, trim, tree, post
+ * States: queued, running, done, skipped, failed
+ */
+
+/* =============================================================================
+   CSS Variables / Design Tokens
+   ============================================================================= */
+
+:root {
+    /* Status Colors */
+    --status-queued: #6b7280;
+    --status-running: #3b82f6;
+    --status-done: #10b981;
+    --status-skipped: #9ca3af;
+    --status-failed: #ef4444;
+
+    /* Terminal Colors */
+    --terminal-bg: #1e1e1e;
+    --terminal-text: #d4d4d4;
+    --terminal-stderr: #f48771;
+    --terminal-tag: #6b7280;
+
+    /* UI Colors */
+    --card-bg: #ffffff;
+    --card-border: #e5e7eb;
+    --header-bg: #f9fafb;
+    --text-primary: #111827;
+    --text-secondary: #6b7280;
+    --link-color: #3b82f6;
+
+    /* Spacing */
+    --space-xs: 0.25rem;
+    --space-sm: 0.5rem;
+    --space-md: 1rem;
+    --space-lg: 1.5rem;
+    --space-xl: 2rem;
+
+    /* Animation */
+    --transition-fast: 150ms ease;
+    --transition-normal: 200ms ease;
+}
+
+/* Dark mode support */
+@media (prefers-color-scheme: dark) {
+    :root {
+        --card-bg: #1f2937;
+        --card-border: #374151;
+        --header-bg: #111827;
+        --text-primary: #f9fafb;
+        --text-secondary: #9ca3af;
+    }
+}
+
+/* =============================================================================
+   Layout
+   ============================================================================= */
+
+.job-status-page {
+    max-width: 1200px;
+    margin: 0 auto;
+    padding: var(--space-lg);
+    background-color: #ffffff;
+    color: #111827;
+}
+
+.job-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: flex-start;
+    margin-bottom: var(--space-lg);
+    flex-wrap: wrap;
+    gap: var(--space-md);
+}
+
+.job-header-left h1 {
+    margin: 0 0 var(--space-sm) 0;
+    font-size: 1.75rem;
+    font-weight: 600;
+    color: #1f2937;
+}
+
+.job-header-meta {
+    color: var(--text-secondary);
+    font-size: 0.875rem;
+}
+
+.job-header-meta span {
+    margin-right: var(--space-lg);
+}
+
+.job-header-right {
+    display: flex;
+    align-items: center;
+    gap: var(--space-md);
+}
+
+/* =============================================================================
+   Connection Indicator
+   ============================================================================= */
+
+.connection-indicator {
+    display: flex;
+    align-items: center;
+    gap: var(--space-xs);
+    font-size: 0.875rem;
+    color: var(--text-secondary);
+}
+
+.connection-dot {
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    background-color: var(--status-running);
+}
+
+.connection-indicator.connected .connection-dot {
+    background-color: var(--status-done);
+}
+
+.connection-indicator.disconnected .connection-dot {
+    background-color: var(--status-failed);
+    animation: pulse 1.5s infinite;
+}
+
+/* =============================================================================
+   Status Badge
+   ============================================================================= */
+
+.status-badge {
+    display: inline-flex;
+    align-items: center;
+    gap: var(--space-xs);
+    padding: var(--space-xs) var(--space-sm);
+    border-radius: 9999px;
+    font-size: 0.75rem;
+    font-weight: 500;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+}
+
+.status-badge.queued {
+    background-color: rgba(107, 114, 128, 0.1);
+    color: var(--status-queued);
+}
+
+.status-badge.running {
+    background-color: rgba(59, 130, 246, 0.1);
+    color: var(--status-running);
+}
+
+.status-badge.completed,
+.status-badge.done {
+    background-color: rgba(16, 185, 129, 0.1);
+    color: var(--status-done);
+}
+
+.status-badge.skipped {
+    background-color: rgba(156, 163, 175, 0.1);
+    color: var(--status-skipped);
+    font-style: italic;
+}
+
+.status-badge.failed {
+    background-color: rgba(239, 68, 68, 0.1);
+    color: var(--status-failed);
+}
+
+/* =============================================================================
+   Pipeline Timeline
+   ============================================================================= */
+
+.pipeline-card {
+    background: var(--card-bg);
+    border: 1px solid var(--card-border);
+    border-radius: 0.5rem;
+    padding: var(--space-lg);
+    margin-bottom: var(--space-lg);
+}
+
+.pipeline-card h2 {
+    font-size: 0.875rem;
+    font-weight: 500;
+    color: var(--text-secondary);
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    margin: 0 0 var(--space-md) 0;
+}
+
+.pipeline-timeline {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    position: relative;
+}
+
+.pipeline-step {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: var(--space-xs);
+    position: relative;
+    z-index: 1;
+    flex: 1;
+}
+
+.step-indicator {
+    width: 32px;
+    height: 32px;
+    border-radius: 50%;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 0.875rem;
+    font-weight: 500;
+    background: var(--card-bg);
+    border: 2px solid var(--status-queued);
+    color: var(--status-queued);
+    transition: all var(--transition-normal);
+}
+
+.step-indicator.queued {
+    border-color: var(--status-queued);
+    color: var(--status-queued);
+}
+
+.step-indicator.running {
+    border-color: var(--status-running);
+    background-color: var(--status-running);
+    color: white;
+    animation: pulseRing 1.5s infinite;
+}
+
+.step-indicator.done {
+    border-color: var(--status-done);
+    background-color: var(--status-done);
+    color: white;
+}
+
+.step-indicator.skipped {
+    border-color: var(--status-skipped);
+    color: var(--status-skipped);
+    border-style: dashed;
+}
+
+.step-indicator.failed {
+    border-color: var(--status-failed);
+    background-color: var(--status-failed);
+    color: white;
+}
+
+.step-label {
+    font-size: 0.75rem;
+    color: var(--text-secondary);
+    text-align: center;
+    max-width: 80px;
+    line-height: 1.3;
+}
+
+.step-label.running {
+    color: var(--status-running);
+    font-weight: 500;
+}
+
+.step-label.done {
+    color: var(--text-primary);
+}
+
+.step-label.skipped {
+    font-style: italic;
+}
+
+.step-label.failed {
+    color: var(--status-failed);
+}
+
+/* Pipeline connector line */
+.pipeline-timeline::before {
+    content: '';
+    position: absolute;
+    top: 16px;
+    left: 32px;
+    right: 32px;
+    height: 2px;
+    background: linear-gradient(to right, var(--status-done) 0%, var(--status-queued) 100%);
+    z-index: 0;
+}
+
+/* =============================================================================
+   Current Step Card
+   ============================================================================= */
+
+.current-step-card {
+    background: var(--card-bg);
+    border: 1px solid var(--card-border);
+    border-radius: 0.5rem;
+    padding: var(--space-lg);
+    margin-bottom: var(--space-lg);
+    border-left: 4px solid var(--status-running);
+}
+
+.current-step-card.completed {
+    border-left-color: var(--status-done);
+}
+
+.current-step-card.failed {
+    border-left-color: var(--status-failed);
+}
+
+.current-step-header {
+    display: flex;
+    align-items: center;
+    gap: var(--space-sm);
+    margin-bottom: var(--space-sm);
+}
+
+.current-step-indicator {
+    width: 12px;
+    height: 12px;
+    border-radius: 50%;
+    background-color: var(--status-running);
+    animation: pulse 1.5s infinite;
+}
+
+.current-step-card.completed .current-step-indicator {
+    background-color: var(--status-done);
+    animation: none;
+}
+
+.current-step-card.failed .current-step-indicator {
+    background-color: var(--status-failed);
+    animation: none;
+}
+
+.current-step-name {
+    font-size: 1.125rem;
+    font-weight: 500;
+    color: var(--text-primary);
+}
+
+.current-step-detail {
+    color: var(--text-secondary);
+    font-size: 0.875rem;
+    margin-bottom: var(--space-sm);
+}
+
+.current-step-time {
+    color: var(--text-secondary);
+    font-size: 0.75rem;
+}
+
+/* =============================================================================
+   Main Content Grid
+   ============================================================================= */
+
+.content-grid {
+    display: grid;
+    grid-template-columns: 1fr 2fr;
+    gap: var(--space-lg);
+}
+
+@media (max-width: 768px) {
+    .content-grid {
+        grid-template-columns: 1fr;
+    }
+}
+
+/* =============================================================================
+   Overview Feed
+   ============================================================================= */
+
+.overview-card {
+    background: var(--card-bg);
+    border: 1px solid var(--card-border);
+    border-radius: 0.5rem;
+    padding: var(--space-lg);
+    height: fit-content;
+}
+
+.overview-card h3 {
+    font-size: 0.875rem;
+    font-weight: 500;
+    color: var(--text-secondary);
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    margin: 0 0 var(--space-md) 0;
+}
+
+.overview-feed {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-sm);
+    max-height: 300px;
+    overflow-y: auto;
+}
+
+.overview-item {
+    display: flex;
+    gap: var(--space-sm);
+    font-size: 0.875rem;
+    line-height: 1.5;
+    color: var(--text-primary);
+}
+
+.overview-icon {
+    flex-shrink: 0;
+    width: 16px;
+    text-align: center;
+}
+
+.overview-icon.done {
+    color: var(--status-done);
+}
+
+.overview-icon.running {
+    color: var(--status-running);
+}
+
+.overview-icon.skipped {
+    color: var(--status-skipped);
+}
+
+.overview-icon.failed {
+    color: var(--status-failed);
+}
+
+/* =============================================================================
+   Terminal Pane
+   ============================================================================= */
+
+.terminal-card {
+    background: var(--terminal-bg);
+}
+
+.terminal-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: var(--space-sm) var(--space-md);
+    background: rgba(255, 255, 255, 0.05);
+    border-bottom: 1px solid rgba(255, 255, 255, 0.1);
+}
+
+.terminal-title {
+    font-size: 0.875rem;
+    font-weight: 500;
+    color: var(--terminal-text);
+}
+
+.terminal-controls {
+    display: flex;
+    gap: var(--space-sm);
+    align-items: center;
+}
+
+.terminal-controls label {
+    display: flex;
+    align-items: center;
+    gap: var(--space-xs);
+    font-size: 0.75rem;
+    color: var(--terminal-text);
+    opacity: 0.7;
+    cursor: pointer;
+}
+
+.terminal-controls button {
+    background: none;
+    border: none;
+    color: var(--terminal-text);
+    opacity: 0.7;
+    cursor: pointer;
+    font-size: 0.75rem;
+    padding: var(--space-xs) var(--space-sm);
+    border-radius: 0.25rem;
+}
+
+.terminal-controls button:hover {
+    background: rgba(255, 255, 255, 0.1);
+    opacity: 1;
+}
+
+.terminal-content {
+    height: 300px;
+    overflow-y: auto;
+    padding: var(--space-md);
+    font-family: 'SF Mono', 'Menlo', 'Monaco', 'Consolas', monospace;
+    font-size: 0.8125rem;
+    line-height: 1.5;
+}
+
+.log-line {
+    white-space: pre-wrap;
+    word-break: break-all;
+    color: var(--terminal-text);
+}
+
+.log-line.stderr {
+    color: var(--terminal-stderr);
+}
+
+.log-line.cmd {
+    color: #10b981;
+    font-weight: 600;
+}
+
+.log-tag {
+    color: var(--terminal-tag);
+    margin-right: var(--space-sm);
+    font-weight: 500;
+}
+
+/* =============================================================================
+   Error Panel
+   ============================================================================= */
+
+.error-panel {
+    background: var(--card-bg);
+    border: 1px solid var(--status-failed);
+    border-radius: 0.5rem;
+    padding: var(--space-lg);
+    margin-bottom: var(--space-lg);
+}
+
+.error-panel h2 {
+    display: flex;
+    align-items: center;
+    gap: var(--space-sm);
+    color: var(--status-failed);
+    font-size: 1.25rem;
+    margin: 0 0 var(--space-md) 0;
+}
+
+.error-section {
+    margin-bottom: var(--space-md);
+}
+
+.error-section h3 {
+    font-size: 0.875rem;
+    font-weight: 500;
+    color: var(--text-secondary);
+    margin: 0 0 var(--space-xs) 0;
+}
+
+.error-section p {
+    margin: 0;
+    color: var(--text-primary);
+    line-height: 1.6;
+}
+
+.error-section ul {
+    margin: var(--space-xs) 0 0 0;
+    padding-left: var(--space-lg);
+    color: var(--text-primary);
+}
+
+.error-section ul li {
+    margin-bottom: var(--space-xs);
+}
+
+.error-details {
+    margin-top: var(--space-md);
+}
+
+.error-details summary {
+    cursor: pointer;
+    color: var(--text-secondary);
+    font-size: 0.875rem;
+}
+
+.error-details pre {
+    background: var(--terminal-bg);
+    color: var(--terminal-text);
+    padding: var(--space-md);
+    border-radius: 0.25rem;
+    overflow-x: auto;
+    font-size: 0.75rem;
+    margin-top: var(--space-sm);
+}
+
+/* =============================================================================
+   Action Buttons
+   ============================================================================= */
+
+.action-buttons {
+    display: flex;
+    gap: var(--space-md);
+    margin-top: var(--space-lg);
+    flex-wrap: wrap;
+}
+
+.btn-primary {
+    display: inline-flex;
+    align-items: center;
+    gap: var(--space-sm);
+    background: var(--status-running);
+    color: white;
+    padding: var(--space-sm) var(--space-lg);
+    border: none;
+    border-radius: 0.375rem;
+    font-size: 0.875rem;
+    font-weight: 500;
+    cursor: pointer;
+    text-decoration: none;
+    transition: background var(--transition-fast);
+}
+
+.btn-primary:hover:not(:disabled):not(.disabled) {
+    background: #2563eb;
+}
+
+.btn-primary:disabled,
+.btn-primary.disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
+    pointer-events: none;
+}
+
+.btn-secondary {
+    display: inline-flex;
+    align-items: center;
+    gap: var(--space-sm);
+    background: #374151;
+    color: #f9fafb;
+    padding: var(--space-sm) var(--space-lg);
+    border: 1px solid #4b5563;
+    border-radius: 0.375rem;
+    font-size: 0.875rem;
+    font-weight: 500;
+    cursor: pointer;
+    text-decoration: none;
+    transition: all var(--transition-fast);
+}
+
+.btn-secondary:hover {
+    background: #4b5563;
+    border-color: #6b7280;
+}
+
+/* Dropdown */
+.dropdown {
+    position: relative;
+    display: inline-block;
+}
+
+.dropdown-content {
+    display: none;
+    position: absolute;
+    top: 100%;
+    left: 0;
+    background: #1f2937;
+    border: 1px solid #374151;
+    border-radius: 0.375rem;
+    min-width: 180px;
+    box-shadow: 0 4px 12px rgba(0, 0, 0, 0.3);
+    z-index: 10;
+}
+
+.dropdown:hover .dropdown-content {
+    display: block;
+}
+
+.dropdown-content a {
+    display: block;
+    padding: var(--space-sm) var(--space-md);
+    color: #f3f4f6;
+    text-decoration: none;
+    font-size: 0.875rem;
+}
+
+.dropdown-content a:hover {
+    background: #374151;
+}
+
+/* =============================================================================
+   Skeleton Loading
+   ============================================================================= */
+
+.skeleton {
+    background: linear-gradient(90deg, var(--card-border) 25%, var(--card-bg) 50%, var(--card-border) 75%);
+    background-size: 200% 100%;
+    animation: shimmer 1.5s infinite;
+    border-radius: 0.25rem;
+}
+
+.skeleton-text {
+    height: 1rem;
+    margin-bottom: var(--space-sm);
+}
+
+.skeleton-circle {
+    border-radius: 50%;
+}
+
+/* =============================================================================
+   Animations
+   ============================================================================= */
+
+@keyframes pulse {
+
+    0%,
+    100% {
+        opacity: 1;
+    }
+
+    50% {
+        opacity: 0.5;
+    }
+}
+
+@keyframes pulseRing {
+    0% {
+        box-shadow: 0 0 0 0 rgba(59, 130, 246, 0.4);
+    }
+
+    70% {
+        box-shadow: 0 0 0 8px rgba(59, 130, 246, 0);
+    }
+
+    100% {
+        box-shadow: 0 0 0 0 rgba(59, 130, 246, 0);
+    }
+}
+
+@keyframes shimmer {
+    0% {
+        background-position: -200% 0;
+    }
+
+    100% {
+        background-position: 200% 0;
+    }
+}
+
+/* =============================================================================
+   Tabs
+   ============================================================================= */
+
+.tabbed-pane {
+    background: var(--card-bg);
+    border: 1px solid var(--card-border);
+    border-radius: 0.5rem;
+    overflow: hidden;
+}
+
+.tab-header {
+    display: flex;
+    background: #374151;
+    padding: var(--space-xs) var(--space-xs) 0;
+    gap: var(--space-xs);
+}
+
+.tab-btn {
+    padding: var(--space-sm) var(--space-lg);
+    background: #4b5563;
+    border: none;
+    border-radius: 0.375rem 0.375rem 0 0;
+    font-size: 0.875rem;
+    font-weight: 500;
+    color: #d1d5db;
+    cursor: pointer;
+    transition: all var(--transition-fast);
+}
+
+.tab-btn:hover {
+    background: #6b7280;
+    color: #ffffff;
+}
+
+.tab-btn.active {
+    background: var(--terminal-bg);
+    color: #ffffff;
+}
+
+.tab-content {
+    display: none;
+}
+
+.tab-content.active {
+    display: block;
+}
+
+/* =============================================================================
+   Sequence Viewer
+   ============================================================================= */
+
+.sequence-card {
+    background: var(--terminal-bg);
+}
+
+.sequence-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: var(--space-sm) var(--space-md);
+    background: rgba(255, 255, 255, 0.05);
+    border-bottom: 1px solid rgba(255, 255, 255, 0.1);
+}
+
+.sequence-title {
+    font-size: 0.875rem;
+    font-weight: 500;
+    color: var(--terminal-text);
+}
+
+.sequence-count {
+    font-size: 0.75rem;
+    color: var(--text-secondary);
+}
+
+.sequence-content {
+    height: 300px;
+    overflow-y: auto;
+    padding: var(--space-md);
+    margin: 0;
+    font-family: 'SF Mono', 'Menlo', 'Monaco', 'Consolas', monospace;
+    font-size: 0.8125rem;
+    line-height: 1.5;
+    color: var(--terminal-text);
+    white-space: pre-wrap;
+    word-break: break-all;
+    user-select: text;
+    cursor: text;
+}
+
+/* =============================================================================
+   Log Viewer
+   ============================================================================= */
+
+.log-viewer-card {
+    background: var(--terminal-bg);
+}
+
+.log-viewer-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: var(--space-sm) var(--space-md);
+    background: rgba(255, 255, 255, 0.05);
+    border-bottom: 1px solid rgba(255, 255, 255, 0.1);
+}
+
+.log-viewer-title {
+    font-size: 0.875rem;
+    font-weight: 500;
+    color: var(--terminal-text);
+}
+
+.log-viewer-content {
+    height: 300px;
+    overflow-y: auto;
+    padding: var(--space-md);
+    margin: 0;
+    font-family: 'SF Mono', 'Menlo', 'Monaco', 'Consolas', monospace;
+    font-size: 0.8125rem;
+    line-height: 1.5;
+    color: var(--terminal-text);
+    white-space: pre-wrap;
+    word-break: break-all;
+    user-select: text;
+    cursor: text;
+}
+
+/* =============================================================================
+   Dropdown Enhancements
+   ============================================================================= */
+
+.dropdown-section {
+    padding: var(--space-xs) var(--space-md);
+    font-size: 0.75rem;
+    font-weight: 600;
+    color: #9ca3af;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    background: #111827;
+}
+
+.dropdown-divider {
+    height: 1px;
+    background: var(--card-border);
+    margin: var(--space-xs) 0;
+}
+
+/* =============================================================================
+   Responsive
+   ============================================================================= */
+
+@media (max-width: 640px) {
+    .job-status-page {
+        padding: var(--space-md);
+    }
+
+    .job-header {
+        flex-direction: column;
+    }
+
+    .pipeline-timeline {
+        flex-wrap: wrap;
+        gap: var(--space-md);
+    }
+
+    .pipeline-timeline::before {
+        display: none;
+    }
+
+    .pipeline-step {
+        width: calc(33% - var(--space-md));
+    }
+
+    .terminal-content,
+    .sequence-content {
+        height: 200px;
+    }
+}

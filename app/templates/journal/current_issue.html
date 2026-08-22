@@ -1,0 +1,50 @@
+{% extends "journal/base_journal.html" %}
+
+{% block title %}Current Issue - Dikarya{% endblock %}
+
+{% block content %}
+<div class="journal-page-header">
+    <h1>Current Issue</h1>
+</div>
+
+<section class="journal-section">
+    <h2>Volume 1, Issue 1 (January 2026)</h2>
+
+    <div class="journal-card-grid">
+        <article class="journal-card">
+            <span class="journal-card-meta">Research Article</span>
+            <h3>Launching Dikarya: A new era for mycological publishing</h3>
+            <p><em>Alan Rockefeller</em></p>
+            <p>We introduce Dikarya, a new, free, peer reviewed open-access journal dedicated to fungal systematics and
+                phylogenetics.</p>
+        </article>
+    </div>
+
+    <div class="journal-announcement" style="margin-top: 2rem;">
+        <h4>📢 Now Accepting Submissions</h4>
+        <p>We are actively seeking high-quality manuscripts for our inaugural issues. <a
+                href="{{ url_for('journal.submit_manuscript') }}">Submit your research today</a>.</p>
+    </div>
+</section>
+
+<section class="journal-section">
+    <h2>Article Types</h2>
+    <div class="journal-card-grid">
+        <div class="journal-card">
+            <h3>Research Articles</h3>
+            <p>Full-length papers presenting original research, including species descriptions, phylogenetic studies,
+                and methodological advances.</p>
+        </div>
+        <div class="journal-card">
+            <h3>Short Communications</h3>
+            <p>Brief reports of significant findings, new records, or preliminary results warranting rapid publication.
+            </p>
+        </div>
+        <div class="journal-card">
+            <h3>Reviews</h3>
+            <p>Comprehensive syntheses of current knowledge on topics of broad interest to the mycological community.
+            </p>
+        </div>
+    </div>
+</section>
+{% endblock %}

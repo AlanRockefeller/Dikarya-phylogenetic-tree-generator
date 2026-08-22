@@ -1,0 +1,53 @@
+<!-- Add Sequences Modal -->
+<div id="modal-add-sequences" class="fixed inset-0 z-50 hidden" aria-labelledby="modal-title" role="dialog"
+    aria-modal="true">
+    <!-- Backdrop -->
+    <div class="fixed inset-0 bg-gray-500 bg-opacity-75 transition-opacity" data-backdrop></div>
+
+    <div class="fixed inset-0 z-10 overflow-y-auto">
+        <div class="flex min-h-full items-end justify-center p-4 text-center sm:items-center sm:p-0">
+            <!-- Modal Panel -->
+            <div
+                class="relative transform overflow-hidden rounded-lg bg-white dark:bg-gray-800 text-left shadow-xl transition-all sm:my-8 sm:w-full sm:max-w-xl">
+
+                <div class="bg-white dark:bg-gray-800 px-4 pb-4 pt-5 sm:p-6 sm:pb-4">
+                    <div class="sm:flex sm:items-start">
+                        <div
+                            class="mx-auto flex h-12 w-12 flex-shrink-0 items-center justify-center rounded-full bg-green-100 dark:bg-green-900/30 sm:mx-0 sm:h-10 sm:w-10">
+                            <i class="fas fa-dna text-green-600 dark:text-green-400"></i>
+                        </div>
+                        <div class="mt-3 text-center sm:ml-4 sm:mt-0 sm:text-left w-full">
+                            <h3 class="text-base font-semibold leading-6 text-gray-900 dark:text-gray-100"
+                                id="modal-title">Add Sequences</h3>
+                            <div class="mt-2 text-sm text-gray-500 dark:text-gray-400">
+                                <p>Paste a list of Accession IDs or raw FASTA sequences to add to this tree.</p>
+                                <p class="mt-1 text-xs italic">Example Accessions: AY702745, NC_012345</p>
+                                <p class="mt-1 text-xs italic">Example FASTA: >Seq1\nATGC...</p>
+                            </div>
+
+                            <div class="mt-4">
+                                <textarea id="textarea-add-sequences" rows="6"
+                                    class="w-full rounded-md border-0 py-1.5 text-gray-900 dark:text-gray-100 shadow-sm ring-1 ring-inset ring-gray-300 dark:ring-gray-700 placeholder:text-gray-400 focus:ring-2 focus:ring-inset focus:ring-journal-gold sm:text-sm sm:leading-6 bg-white dark:bg-gray-900"
+                                    placeholder=">Sequence_1
+ATGC...
+OR
+AY702745, AY702746"></textarea>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="bg-gray-50 dark:bg-gray-700/50 px-4 py-3 sm:flex sm:flex-row-reverse sm:px-6">
+                    <button type="button" id="btn-modal-add-confirm"
+                        class="inline-flex w-full justify-center rounded-md bg-green-600 px-3 py-2 text-sm font-semibold text-white shadow-sm hover:bg-green-500 sm:ml-3 sm:w-auto">
+                        Add & Recompute
+                    </button>
+                    <button type="button" id="btn-modal-add-cancel"
+                        class="mt-3 inline-flex w-full justify-center rounded-md bg-white dark:bg-gray-800 px-3 py-2 text-sm font-semibold text-gray-900 dark:text-gray-300 shadow-sm ring-1 ring-inset ring-gray-300 dark:ring-gray-600 hover:bg-gray-50 dark:hover:bg-gray-700 sm:mt-0 sm:w-auto">
+                        Cancel
+                    </button>
+                </div>
+            </div>
+        </div>
+    </div>
+</div>

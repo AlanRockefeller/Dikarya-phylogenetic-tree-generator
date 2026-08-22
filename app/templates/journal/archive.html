@@ -1,0 +1,39 @@
+{% extends "journal/base_journal.html" %}
+
+{% block title %}Archive - Dikarya{% endblock %}
+
+{% block content %}
+<div class="journal-page-header">
+    <h1>Archive</h1>
+</div>
+
+<section class="journal-section">
+    <h2>Browse Past Issues</h2>
+
+    <div class="journal-content" style="max-width: 100%;">
+        <h2>2026</h2>
+        <ul>
+            <li><a href="{{ url_for('journal.current_issue') }}">Volume 1, Issue 1 (January 2026)</a> - Inaugural Issue
+            </li>
+        </ul>
+
+        <p style="color: var(--text-muted); font-style: italic; margin-top: 2rem;">
+            Dikarya launched in January 2026. Check back for future issues as our archive grows.
+        </p>
+    </div>
+</section>
+
+<section class="journal-section">
+    <h2>Search Articles</h2>
+    <div class="journal-content" style="max-width: 100%;">
+        <form style="display: flex; gap: 1rem; flex-wrap: wrap;">
+            <input type="text" placeholder="Search by keyword, author, or title..." class="journal-input"
+                style="flex: 1; min-width: 250px;">
+            <button type="submit" class="journal-btn journal-btn-primary">Search</button>
+        </form>
+        <p style="color: var(--text-muted); font-size: 0.9rem; margin-top: 1rem;">
+            Full-text search coming soon. For now, browse by issue above.
+        </p>
+    </div>
+</section>
+{% endblock %}

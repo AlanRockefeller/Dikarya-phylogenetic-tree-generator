@@ -1,0 +1,312 @@
+{% extends "base_modern.html" %}
+
+{% block title %}Dikarya - System Monitoring{% endblock %}
+{% block subtitle %}System Monitoring{% endblock %}
+
+{% block content %}
+<div class="max-w-7xl mx-auto space-y-6">
+
+    <!-- Header -->
+    <div class="flex items-center justify-between flex-wrap gap-3">
+        <h2 class="text-2xl font-bold text-journal-dark dark:text-gray-100 flex items-center">
+            <i class="fas fa-gauge-high text-journal-gold mr-3"></i>System Monitoring
+        </h2>
+        <button onclick="window.location.reload()"
+            class="bg-journal-gold hover:bg-journal-gold-light text-journal-dark px-4 py-2 rounded-lg text-sm font-semibold transition-colors flex items-center">
+            <i class="fas fa-arrows-rotate mr-2"></i>Refresh
+        </button>
+    </div>
+
+    <!-- Top row: three summary cards -->
+    <div class="grid grid-cols-1 md:grid-cols-3 gap-6">
+
+        <!-- System Health -->
+        <div class="bg-white dark:bg-journal-green rounded-xl shadow-lg overflow-hidden transition-colors">
+            <div class="bg-journal-dark px-5 py-3 border-b border-journal-green">
+                <h3 class="text-white font-semibold flex items-center">
+                    <i class="fas fa-heart-pulse text-journal-gold mr-2"></i>System Health
+                </h3>
+            </div>
+            <div class="p-5 space-y-3">
+                <div class="flex items-center justify-between">
+                    <span class="text-sm text-gray-600 dark:text-gray-300">Status</span>
+                    {% if health.status == 'ok' %}
+                    <span class="px-3 py-1 rounded-full text-xs font-bold bg-green-100 text-green-800 dark:bg-green-900 dark:text-green-200">OK</span>
+                    {% else %}
+                    <span class="px-3 py-1 rounded-full text-xs font-bold bg-red-100 text-red-800 dark:bg-red-900 dark:text-red-200">{{ health.status|upper }}</span>
+                    {% endif %}
+                </div>
+                <div class="flex items-center justify-between border-t border-gray-100 dark:border-journal-dark pt-3">
+                    <span class="text-sm text-gray-600 dark:text-gray-300"><i class="fas fa-database mr-2 opacity-70"></i>Database</span>
+                    {% if health.components.database == 'ok' %}
+                    <span class="text-sm font-mono text-green-700 dark:text-green-300">ok</span>
+                    {% else %}
+                    <span class="text-sm font-mono text-red-700 dark:text-red-300">{{ health.components.database }}</span>
+                    {% endif %}
+                </div>
+                <div class="flex items-center justify-between border-t border-gray-100 dark:border-journal-dark pt-3">
+                    <span class="text-sm text-gray-600 dark:text-gray-300"><i class="fas fa-hard-drive mr-2 opacity-70"></i>Filesystem</span>
+                    {% if health.components.filesystem == 'ok' %}
+                    <span class="text-sm font-mono text-green-700 dark:text-green-300">ok</span>
+                    {% else %}
+                    <span class="text-sm font-mono text-red-700 dark:text-red-300">{{ health.components.filesystem }}</span>
+                    {% endif %}
+                </div>
+                <p class="text-xs text-gray-500 dark:text-gray-400 pt-2 italic">Last check: {{ health.timestamp }}</p>
+            </div>
+        </div>
+
+        <!-- Resources -->
+        <div class="bg-white dark:bg-journal-green rounded-xl shadow-lg overflow-hidden transition-colors">
+            <div class="bg-journal-dark px-5 py-3 border-b border-journal-green">
+                <h3 class="text-white font-semibold flex items-center">
+                    <i class="fas fa-microchip text-journal-gold mr-2"></i>Resources
+                </h3>
+            </div>
+            <div class="p-5 space-y-4">
+                {% for label, icon, value in [
+                    ('CPU', 'fa-microchip', system.cpu_percent),
+                    ('Memory', 'fa-memory', system.memory_percent),
+                    ('Disk (JOB_DIR)', 'fa-hard-drive', system.disk_usage)
+                ] %}
+                <div>
+                    <div class="flex items-center justify-between text-sm mb-1">
+                        <span class="text-gray-600 dark:text-gray-300"><i class="fas {{ icon }} mr-2 opacity-70"></i>{{ label }}</span>
+                        <span class="font-mono text-journal-dark dark:text-gray-100">{{ value }}%</span>
+                    </div>
+                    <div class="w-full bg-gray-200 dark:bg-journal-dark rounded-full h-2">
+                        {% set bar_color = 'bg-green-500' if value < 60 else ('bg-yellow-500' if value < 85 else 'bg-red-500') %}
+                        <div class="{{ bar_color }} h-2 rounded-full transition-all" style="width: {{ value }}%"></div>
+                    </div>
+                </div>
+                {% endfor %}
+            </div>
+        </div>
+
+        <!-- Job Stats -->
+        <div class="bg-white dark:bg-journal-green rounded-xl shadow-lg overflow-hidden transition-colors">
+            <div class="bg-journal-dark px-5 py-3 border-b border-journal-green">
+                <h3 class="text-white font-semibold flex items-center">
+                    <i class="fas fa-chart-bar text-journal-gold mr-2"></i>Job Stats
+                </h3>
+            </div>
+            <div class="p-5">
+                <div class="flex items-baseline justify-between mb-2">
+                    <span class="text-sm text-gray-600 dark:text-gray-300">Total Jobs</span>
+                    <span class="text-2xl font-bold text-journal-dark dark:text-gray-100">{{ metrics.total_jobs }}</span>
+                </div>
+                <div class="overflow-x-auto border-t border-gray-100 dark:border-journal-dark pt-3">
+                    <table class="w-full text-xs">
+                        <thead>
+                            <tr class="text-gray-500 dark:text-gray-400">
+                                <th class="pb-2 pr-2 text-left font-semibold">Status</th>
+                                <th class="pb-2 px-2 text-right font-semibold">24h</th>
+                                <th class="pb-2 px-2 text-right font-semibold">7 days</th>
+                                <th class="pb-2 px-2 text-right font-semibold">30 days</th>
+                                <th class="pb-2 pl-2 text-right font-semibold">All time</th>
+                            </tr>
+                        </thead>
+                        <tbody class="font-mono">
+                            {% for status, counts in metrics.status_period_counts.items() %}
+                            <tr class="border-t border-gray-100 dark:border-journal-dark">
+                                <td class="py-2 pr-2 font-sans font-semibold capitalize
+                                    {% if status == 'failed' %}text-red-600 dark:text-red-400
+                                    {% elif status == 'completed' %}text-green-700 dark:text-green-300
+                                    {% elif status == 'running' %}text-blue-700 dark:text-blue-300
+                                    {% else %}text-gray-600 dark:text-gray-300{% endif %}">{{ status }}</td>
+                                <td class="py-2 px-2 text-right text-journal-dark dark:text-gray-100">{{ counts['24h'] }}</td>
+                                <td class="py-2 px-2 text-right text-journal-dark dark:text-gray-100">{{ counts['7d'] }}</td>
+                                <td class="py-2 px-2 text-right text-journal-dark dark:text-gray-100">{{ counts['30d'] }}</td>
+                                <td class="py-2 pl-2 text-right text-journal-dark dark:text-gray-100">{{ counts['all_time'] }}</td>
+                            </tr>
+                            {% endfor %}
+                        </tbody>
+                    </table>
+                </div>
+                <p class="mt-2 text-[11px] text-gray-500 dark:text-gray-400">Time windows use each job's submission time.</p>
+            </div>
+        </div>
+
+    </div>
+
+    <!-- Workers Table -->
+    <div class="bg-white dark:bg-journal-green rounded-xl shadow-lg overflow-hidden transition-colors">
+        <div class="bg-journal-dark px-5 py-3 border-b border-journal-green">
+            <h3 class="text-white font-semibold flex items-center">
+                <i class="fas fa-users-gear text-journal-gold mr-2"></i>Worker Nodes
+                <span class="ml-2 text-xs text-gray-400">({{ workers.workers|length }} found)</span>
+            </h3>
+        </div>
+        <div class="p-5">
+            {% if workers.workers %}
+            <div class="overflow-x-auto">
+                <table class="w-full text-sm">
+                    <thead>
+                        <tr class="border-b border-gray-200 dark:border-journal-dark text-left">
+                            <th class="py-2 pr-4 font-semibold text-gray-700 dark:text-gray-200">Worker ID</th>
+                            <th class="py-2 pr-4 font-semibold text-gray-700 dark:text-gray-200">Status</th>
+                            <th class="py-2 pr-4 font-semibold text-gray-700 dark:text-gray-200">Last Heartbeat</th>
+                            <th class="py-2 pr-4 font-semibold text-gray-700 dark:text-gray-200 text-right">Age (s)</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        {% for worker in workers.workers %}
+                        <tr class="border-b border-gray-100 dark:border-journal-dark last:border-0 hover:bg-gray-50 dark:hover:bg-journal-dark/40 transition-colors">
+                            <td class="py-2 pr-4 font-mono text-xs text-gray-700 dark:text-gray-200">{{ worker.id }}</td>
+                            <td class="py-2 pr-4">
+                                {% if worker.status == 'healthy' %}
+                                <span class="px-2 py-0.5 rounded-full text-xs font-bold bg-green-100 text-green-800 dark:bg-green-900 dark:text-green-200">Healthy</span>
+                                {% elif worker.status == 'stale' %}
+                                <span class="px-2 py-0.5 rounded-full text-xs font-bold bg-yellow-100 text-yellow-800 dark:bg-yellow-900 dark:text-yellow-200">Stale</span>
+                                {% else %}
+                                <span class="px-2 py-0.5 rounded-full text-xs font-bold bg-red-100 text-red-800 dark:bg-red-900 dark:text-red-200">Dead</span>
+                                {% endif %}
+                            </td>
+                            <td class="py-2 pr-4 font-mono text-xs text-gray-600 dark:text-gray-300">{{ worker.last_heartbeat }}</td>
+                            <td class="py-2 pr-4 font-mono text-right text-gray-700 dark:text-gray-200">{{ worker.age_seconds }}</td>
+                        </tr>
+                        {% endfor %}
+                    </tbody>
+                </table>
+            </div>
+            {% else %}
+            <p class="text-gray-500 dark:text-gray-400 italic">
+                {% if workers.status == 'no_workers_dir' %}
+                Worker directory not found. Is the worker service running?
+                {% else %}
+                No worker heartbeats detected.
+                {% endif %}
+            </p>
+            {% endif %}
+        </div>
+    </div>
+
+    <!-- Claude Review (AI) usage -->
+    <div class="bg-white dark:bg-journal-green rounded-xl shadow-lg overflow-hidden transition-colors">
+        <div class="bg-journal-dark px-5 py-3 border-b border-journal-green flex items-center justify-between">
+            <h3 class="text-white font-semibold flex items-center">
+                <i class="fas fa-wand-magic-sparkles text-journal-gold mr-2"></i>AI Review Usage
+                <span class="ml-2 text-xs font-normal text-gray-400">last {{ ai_usage.days }} days</span>
+            </h3>
+            {% if ai_usage.enabled %}
+            <span class="px-2 py-0.5 rounded-full text-xs font-bold bg-green-100 text-green-800 dark:bg-green-900 dark:text-green-200">Enabled</span>
+            {% else %}
+            <span class="px-2 py-0.5 rounded-full text-xs font-bold bg-gray-200 text-gray-700 dark:bg-journal-dark dark:text-gray-300">Disabled</span>
+            {% endif %}
+        </div>
+
+        <div class="p-5">
+        {% if not ai_usage.available or ai_usage.total_reviews == 0 %}
+            <p class="text-gray-500 dark:text-gray-400 italic">
+                No AI reviews recorded yet.
+                {% if not ai_usage.available %}The usage log is created the first time a review runs.{% endif %}
+            </p>
+        {% else %}
+            <!-- Totals -->
+            <div class="grid grid-cols-2 md:grid-cols-4 gap-4 mb-6">
+                <div class="bg-gray-50 dark:bg-journal-dark rounded-lg p-4">
+                    <p class="text-xs uppercase tracking-wider text-gray-500 dark:text-gray-400">Reviews run</p>
+                    <p class="text-2xl font-bold text-journal-dark dark:text-gray-100">{{ ai_usage.total_reviews }}</p>
+                    <p class="text-xs text-gray-500 dark:text-gray-400 mt-1">cache hits not counted</p>
+                </div>
+                <div class="bg-gray-50 dark:bg-journal-dark rounded-lg p-4">
+                    <p class="text-xs uppercase tracking-wider text-gray-500 dark:text-gray-400">Est. usage value</p>
+                    <p class="text-2xl font-bold text-journal-dark dark:text-gray-100">
+                        {% if ai_usage.cost_available %}${{ '%.2f'|format(ai_usage.total_cost_usd) }}{% else %}Unavailable{% endif %}
+                    </p>
+                    <p class="text-xs text-gray-500 dark:text-gray-400 mt-1">plan usage, not billed</p>
+                </div>
+                <div class="bg-gray-50 dark:bg-journal-dark rounded-lg p-4">
+                    <p class="text-xs uppercase tracking-wider text-gray-500 dark:text-gray-400">Avg duration</p>
+                    <p class="text-2xl font-bold text-journal-dark dark:text-gray-100">{{ ai_usage.avg_seconds }}<span class="text-base font-normal">s</span></p>
+                    <p class="text-xs text-gray-500 dark:text-gray-400 mt-1">per uncached review</p>
+                </div>
+                <div class="bg-gray-50 dark:bg-journal-dark rounded-lg p-4">
+                    <p class="text-xs uppercase tracking-wider text-gray-500 dark:text-gray-400">Tokens</p>
+                    <p class="text-2xl font-bold text-journal-dark dark:text-gray-100">
+                        {{ (ai_usage.total_output_tokens / 1000)|round(1) }}k<span class="text-base font-normal"> out</span>
+                    </p>
+                    <p class="text-xs text-gray-500 dark:text-gray-400 mt-1">{{ (ai_usage.total_input_tokens / 1000)|round(0)|int }}k in</p>
+                </div>
+            </div>
+
+            <!-- Daily chart: bar height is reviews that day, gold overlay is spend -->
+            <div class="overflow-x-auto">
+                <svg viewBox="0 0 620 150" preserveAspectRatio="none" class="w-full h-40" role="img"
+                     aria-label="Claude reviews per day over the last {{ ai_usage.days }} days">
+                    <!-- gridlines -->
+                    {% for frac in [0, 0.25, 0.5, 0.75, 1.0] %}
+                    <line x1="30" x2="620" y1="{{ 110 - (frac * 100) }}" y2="{{ 110 - (frac * 100) }}"
+                          class="stroke-gray-200 dark:stroke-journal-dark" stroke-width="1" />
+                    {% endfor %}
+                    <!-- y axis labels -->
+                    {% for frac in [0, 0.5, 1.0] %}
+                    <text x="26" y="{{ 114 - (frac * 100) }}" text-anchor="end"
+                          class="fill-gray-500 dark:fill-gray-400" font-size="9">
+                        {{ (ai_usage.max_daily_reviews * frac)|round(0)|int }}
+                    </text>
+                    {% endfor %}
+
+                    {% set bar_w = 590 / ai_usage.series|length %}
+                    {% for point in ai_usage.series %}
+                        {% set h = (point.reviews / ai_usage.max_daily_reviews * 100) if ai_usage.max_daily_reviews else 0 %}
+                        <rect x="{{ 30 + loop.index0 * bar_w }}" y="{{ 110 - h }}"
+                              width="{{ bar_w - 2 }}" height="{{ h }}" rx="1"
+                              class="fill-journal-gold hover:fill-yellow-500 transition-colors">
+                            <title>{{ point.date }}: {{ point.reviews }} review{{ '' if point.reviews == 1 else 's' }}{% if point.cost_available %}, ${{ '%.2f'|format(point.cost) }}{% else %}, cost unavailable{% endif %}</title>
+                        </rect>
+                        {% if loop.index0 % 5 == 0 or loop.last %}
+                        <text x="{{ 30 + loop.index0 * bar_w + bar_w / 2 }}" y="126" text-anchor="middle"
+                              class="fill-gray-500 dark:fill-gray-400" font-size="8">{{ point.label }}</text>
+                        {% endif %}
+                    {% endfor %}
+                    <line x1="30" x2="620" y1="110" y2="110" class="stroke-gray-400 dark:stroke-gray-500" stroke-width="1" />
+                </svg>
+            </div>
+            <p class="text-xs text-gray-500 dark:text-gray-400 mt-1 text-center">
+                Reviews per day &mdash; hover a bar for the date, count and estimated value
+            </p>
+
+            <!-- Verdict + model breakdown -->
+            <div class="grid grid-cols-1 md:grid-cols-2 gap-6 mt-6 pt-5 border-t border-gray-100 dark:border-journal-dark">
+                <div>
+                    <p class="text-xs uppercase tracking-wider text-gray-500 dark:text-gray-400 mb-2">Verdicts</p>
+                    {% if ai_usage.by_rating %}
+                    <div class="space-y-1">
+                        {% for rating, count in ai_usage.by_rating.items() %}
+                        <div class="flex items-center justify-between text-sm">
+                            <span class="capitalize text-gray-700 dark:text-gray-200">{{ rating }}</span>
+                            <span class="font-mono text-gray-600 dark:text-gray-300">{{ count }}</span>
+                        </div>
+                        {% endfor %}
+                    </div>
+                    {% else %}
+                    <p class="text-sm text-gray-500 dark:text-gray-400 italic">none recorded</p>
+                    {% endif %}
+                </div>
+                <div>
+                    <p class="text-xs uppercase tracking-wider text-gray-500 dark:text-gray-400 mb-2">Models</p>
+                    <div class="space-y-1">
+                        {% for model, count in ai_usage.models.items() %}
+                        <div class="flex items-center justify-between text-sm">
+                            <span class="font-mono text-xs text-gray-700 dark:text-gray-200">{{ model }}</span>
+                            <span class="font-mono text-gray-600 dark:text-gray-300">{{ count }}</span>
+                        </div>
+                        {% endfor %}
+                    </div>
+                    <p class="text-xs text-gray-500 dark:text-gray-400 mt-3">Last review: {{ ai_usage.last_review }}</p>
+                </div>
+            </div>
+        {% endif %}
+        </div>
+    </div>
+
+    <!-- JSON endpoint links -->
+    <div class="bg-white dark:bg-journal-green rounded-xl shadow p-4 text-xs text-gray-500 dark:text-gray-400">
+        JSON endpoints:
+        <a href="{{ url_for('monitoring.health_check') }}" class="font-mono hover:text-journal-gold mx-2">/health</a> |
+        <a href="{{ url_for('monitoring.worker_health') }}" class="font-mono hover:text-journal-gold mx-2">/health/workers</a> |
+        <a href="{{ url_for('monitoring.metrics') }}" class="font-mono hover:text-journal-gold mx-2">/metrics</a>
+    </div>
+</div>
+{% endblock %}

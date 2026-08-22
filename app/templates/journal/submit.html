@@ -1,0 +1,71 @@
+{% extends "journal/base_journal.html" %}
+
+{% block title %}Submit a Manuscript - Dikarya{% endblock %}
+
+{% block content %}
+<div class="journal-page-header">
+    <h1>Submit a Manuscript</h1>
+</div>
+
+<div class="journal-content">
+    <h2>Submission Process</h2>
+    <p>We welcome submissions from researchers worldwide. Our streamlined review process aims to provide constructive
+        feedback within 4-6 weeks of submission.</p>
+
+    <ol>
+        <li><strong>Prepare your manuscript</strong> following our formatting guidelines below.</li>
+        <li><strong>Deposit sequence data</strong> in GenBank, UNITE, or other appropriate repositories.</li>
+        <li><strong>Submit via email</strong> to <a href="mailto:submit@dikarya.us">submit@dikarya.us</a>.</li>
+        <li><strong>Track your submission</strong> through our editorial system.</li>
+    </ol>
+
+    <h2 id="guidelines">Author Guidelines</h2>
+
+    <h3>Artificial intelligence</h3>
+    <p>Dikarya permits AI-assisted writing, but authors remain responsible for every idea, statement, citation, and
+        conclusion and should not use AI as a substitute for the intellectual work of writing. See our <a
+            href="{{ url_for('journal.ai_policy') }}">Artificial Intelligence Policy</a>.</p>
+
+    <h3>Manuscript Format</h3>
+    <ul>
+        <li>Submit manuscripts as a single Word document (.docx) or Google Docs link</li>
+        <li>Use 12-point Times New Roman or similar serif font</li>
+        <li>Double-space all text, including references</li>
+        <li>Number all pages and lines continuously</li>
+        <li>Include captions on all figures and tables</li>
+    </ul>
+
+    <h3>Structure</h3>
+    <p>Research articles should include:</p>
+    <ul>
+        <li><strong>Title page:</strong> Title, author names, affiliations, corresponding author email</li>
+        <li><strong>Abstract:</strong> Maximum 300 words summarizing key findings</li>
+        <li><strong>Keywords:</strong> 5-8 terms for indexing</li>
+        <li><strong>Introduction:</strong> Background and objectives</li>
+        <li><strong>Materials and Methods:</strong> Reproducible description of procedures</li>
+        <li><strong>Results:</strong> Presentation of findings with figures/tables</li>
+        <li><strong>Discussion:</strong> Interpretation and broader implications</li>
+        <li><strong>References:</strong> Follow journal citation style</li>
+    </ul>
+
+    <h3>Special Requirements for Taxonomic Works</h3>
+    <ul>
+        <li>New species descriptions must follow the International Code of Nomenclature</li>
+        <li>Type specimens must be deposited in recognized herbaria</li>
+        <li>Molecular data must be deposited in GenBank with accession numbers provided</li>
+        <li>MycoBank or Index Fungorum numbers should be obtained prior to publication</li>
+    </ul>
+
+    <h3>Data Availability</h3>
+    <p>Dikarya requires that all sequence data be made publicly available. Alignments and phylogenetic trees should be
+        deposited in TreeBASE or similar repositories.</p>
+
+    <h2>Peer Review</h2>
+    <p>All submissions undergo single-blind peer review by at least two experts in the field. We are committed to
+        constructive, timely reviews that help authors improve their work.</p>
+
+    <h2>Contact</h2>
+    <p>For pre-submission inquiries or questions about manuscript preparation, please contact us at <a
+            href="mailto:editor@dikarya.us">editor@dikarya.us</a>.</p>
+</div>
+{% endblock %}

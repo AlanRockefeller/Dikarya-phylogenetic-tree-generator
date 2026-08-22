@@ -1,0 +1,179 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>{% block title %}Dikarya - Mycological Journal{% endblock %}</title>
+    <meta name="description"
+        content="{% block meta_description %}Dikarya: A peer-reviewed journal dedicated to fungal taxonomy, systematics, and phylogenetics.{% endblock %}">
+    {% include "partials/favicon_links.html" %}
+    <link rel="stylesheet" href="{{ url_for('static', filename='css/journal.css') }}?v=4">
+    <!-- Font Awesome (vendored; see static/vendor/VENDORED_HASHES.txt) -->
+    <link rel="stylesheet" href="{{ url_for('static', filename='vendor/fontawesome.min.css') }}">
+    {% block head %}{% endblock %}
+</head>
+
+<body class="journal-page">
+    <header class="journal-header">
+        <div class="journal-header-top">
+            <a href="{{ url_for('journal.home') }}" class="journal-logo">
+                <div class="journal-logo-icon">🍄</div>
+                <div>
+                    <div class="journal-title">Dikarya</div>
+                    <div class="journal-subtitle">Mycological Scientific Journal</div>
+                </div>
+            </a>
+            <div class="journal-header-actions">
+                <button class="theme-toggle" id="dark-mode-toggle" aria-label="Toggle dark mode"
+                    title="Toggle light/dark mode">
+                    <i id="dark-mode-icon" class="fas fa-moon"></i>
+                </button>
+                <a href="{{ url_for('main.sequence_entry') }}" class="journal-btn journal-btn-primary">
+                    🧬 Tree Builder App
+                </a>
+                <a href="https://dikarya.us/labels" class="journal-btn journal-btn-primary">
+                    🏷️ Herbarium Label Generator
+                </a>
+                {% if current_user.is_authenticated %}
+                <a href="{{ url_for('user.user_jobs') }}" class="journal-btn journal-btn-outline">My Jobs</a>
+                <a href="{{ url_for('auth.logout') }}" class="journal-btn journal-btn-outline">Logout</a>
+                {% else %}
+                <a href="{{ url_for('auth.login') }}" class="journal-btn journal-btn-outline">Login</a>
+                {% endif %}
+            </div>
+        </div>
+        <nav class="journal-nav">
+            <div class="journal-nav-inner">
+                <a href="{{ url_for('journal.home') }}"
+                    class="{% if request.endpoint == 'journal.home' %}active{% endif %}">Home</a>
+                <a href="{{ url_for('journal.about') }}"
+                    class="{% if request.endpoint == 'journal.about' %}active{% endif %}">About</a>
+                <a href="{{ url_for('journal.current_issue') }}"
+                    class="{% if request.endpoint == 'journal.current_issue' %}active{% endif %}">Current Issue</a>
+                <a href="{{ url_for('journal.archive') }}"
+                    class="{% if request.endpoint == 'journal.archive' %}active{% endif %}">Archive</a>
+                <a href="{{ url_for('journal.submit_manuscript') }}"
+                    class="{% if request.endpoint == 'journal.submit_manuscript' %}active{% endif %}">Submit</a>
+                <a href="{{ url_for('journal.taxonomy') }}"
+                    class="{% if request.endpoint == 'journal.taxonomy' %}active{% endif %}">Taxonomy</a>
+                <a href="{{ url_for('journal.reviewers') }}"
+                    class="{% if request.endpoint == 'journal.reviewers' %}active{% endif %}">For Reviewers</a>
+                <a href="{{ url_for('journal.resources') }}"
+                    class="{% if request.endpoint == 'journal.resources' %}active{% endif %}">Resources</a>
+            </div>
+        </nav>
+    </header>
+
+    <main class="journal-main">
+        {% with messages = get_flashed_messages(with_categories=true) %}
+        {% if messages %}
+        <div style="max-width: 900px; margin: 1rem auto; padding: 0 1rem;">
+            {% for category, message in messages %}
+            <div class="journal-announcement">
+                <p>{{ message }}</p>
+            </div>
+            {% endfor %}
+        </div>
+        {% endif %}
+        {% endwith %}
+
+        {% block content %}{% endblock %}
+    </main>
+
+    <footer class="journal-footer">
+        <div class="journal-footer-inner">
+            <div>
+                <h4>About Dikarya</h4>
+                <ul>
+                    <li><a href="{{ url_for('journal.about') }}">Mission & Scope</a></li>
+                    <li><a href="{{ url_for('journal.about') }}#editorial-board">Editorial Board</a></li>
+                    <li><a href="{{ url_for('journal.about') }}#ethics">Publication Ethics</a></li>
+                </ul>
+            </div>
+            <div>
+                <h4>For Authors</h4>
+                <ul>
+                    <li><a href="{{ url_for('journal.submit_manuscript') }}">Submit Manuscript</a></li>
+                    <li><a href="{{ url_for('journal.submit_manuscript') }}#guidelines">Author Guidelines</a></li>
+                    <li><a href="{{ url_for('journal.ai_policy') }}">AI Policy</a></li>
+                    <li><a href="{{ url_for('journal.resources') }}">Writing Resources</a></li>
+                </ul>
+            </div>
+            <div>
+                <h4>For Reviewers</h4>
+                <ul>
+                    <li><a href="{{ url_for('journal.reviewers') }}">Reviewer Guidelines</a></li>
+                    <li><a href="{{ url_for('journal.reviewers') }}#portal">Reviewer Portal</a></li>
+                </ul>
+            </div>
+            <div>
+                <h4>Connect</h4>
+                <ul>
+                    <li><a href="{{ url_for('journal.contact') }}">Contact Us</a></li>
+                    <li><a href="{{ url_for('journal.support') }}">Support the Journal</a></li>
+                </ul>
+            </div>
+            <div>
+                <h4>Tools</h4>
+                <ul>
+                    <li><a href="{{ url_for('main.todo') }}">Development To-Do List</a></li>
+                    <li><a href="https://dikarya.us/voucher-labels">Voucher Labels</a></li>
+                </ul>
+            </div>
+        </div>
+        <div class="journal-footer-bottom">
+            <p>&copy; 2026 Dikarya Mycological Journal. <a href="https://creativecommons.org/licenses/by/4.0/"
+                    target="_blank" rel="noopener">CC BY 4.0.</a></p>
+        </div>
+    </footer>
+
+    {% block scripts %}{% endblock %}
+
+    <script>
+        // Theme toggle functionality (synced with base_modern.html)
+        (function () {
+            const toggle = document.getElementById('dark-mode-toggle');
+            const icon = document.getElementById('dark-mode-icon');
+            const html = document.documentElement;
+
+            function applyTheme(theme) {
+                if (theme === 'dark') {
+                    html.setAttribute('data-theme', 'dark');
+                    icon.classList.remove('fa-moon');
+                    icon.classList.add('fa-sun');
+                } else {
+                    html.removeAttribute('data-theme');
+                    icon.classList.remove('fa-sun');
+                    icon.classList.add('fa-moon');
+                }
+            }
+
+            // Load saved theme or detect preference. Storage can be disabled by
+            // browser privacy settings, in which case reads and writes may throw.
+            let savedTheme = null;
+            try {
+                savedTheme = localStorage.getItem('theme');
+            } catch (_) {
+                savedTheme = null;
+            }
+            if (savedTheme === 'dark' || (!savedTheme && window.matchMedia('(prefers-color-scheme: dark)').matches)) {
+                applyTheme('dark');
+            }
+
+            // Toggle theme on click
+            toggle.addEventListener('click', function () {
+                const isDark = html.getAttribute('data-theme') === 'dark';
+                const newTheme = isDark ? 'light' : 'dark';
+                applyTheme(newTheme);
+                try {
+                    localStorage.setItem('theme', newTheme);
+                } catch (_) {
+                    // Keep the current page usable even when persistence is blocked.
+                }
+            });
+        })();
+    </script>
+</body>
+
+</html>
