@@ -1,0 +1,95 @@
+#!/bin/sh
+# Read-only access to nginx's own logs.
+#
+# Install as root:
+#   cp scripts/dikarya-nginx-log /usr/local/sbin/dikarya-nginx-log
+#   chown root:root /usr/local/sbin/dikarya-nginx-log
+#   chmod 0755 /usr/local/sbin/dikarya-nginx-log
+#
+# Then add to the tree user's sudoers entry, alongside the other wrappers:
+#   tree ALL=(root) NOPASSWD: /usr/local/sbin/dikarya-nginx-log
+# Edit with `visudo` so a syntax error cannot lock you out of sudo.
+#
+# Usage:
+#   sudo /usr/local/sbin/dikarya-nginx-log error
+#   sudo /usr/local/sbin/dikarya-nginx-log error 1000
+#   sudo /usr/local/sbin/dikarya-nginx-log access 2000 | grep ' 504 '
+#
+# nginx rotates these daily, so the live file only reaches back to midnight.
+# The -all keywords read the rotations too, oldest first, which is what you
+# need for anything that happened yesterday:
+#
+#   sudo /usr/local/sbin/dikarya-nginx-log error-all 5000 | grep '21/Aug'
+#   sudo /usr/local/sbin/dikarya-nginx-log access-all 5000 | grep ' 504 '
+#
+# WHY THIS EXISTS:
+#
+# /var/log/nginx is 0640 root:adm and the tree user is in neither adm nor
+# systemd-journal, so nothing outside nginx could read these. That left a real
+# blind spot: nginx returns 502 on a restart and 504 when a request waits past
+# proxy_read_timeout, and *neither ever reaches Gunicorn*, so they appear in
+# no application log and the digest structurally cannot see them. On
+# 2026-08-21 users hit 504s on POST /api/job and on a tree/state call that
+# normally takes 10 ms, and the only server-side trace was the browser's own
+# client-error beacon.
+#
+# WHY THIS DOES NOT FORWARD "$@":
+#
+# Same reasoning as dikarya-journal: a wrapper that passed caller arguments
+# through to cat/tail/zcat would be an arbitrary file read as root. This takes
+# a log *keyword* mapped to a fixed path, plus a line count validated as an
+# integer, and forwards nothing else. Filter with your own grep/awk pipeline,
+# which needs no privilege.
+
+set -eu
+
+LOG="${1:-error}"
+LINES="${2:-200}"
+
+# The keyword selects a fixed glob, never a caller-supplied path. The globs
+# cover logrotate's own naming (error.log, error.log.1, error.log.2.gz).
+case "$LOG" in
+    error)      GLOB='/var/log/nginx/error.log' ;;
+    access)     GLOB='/var/log/nginx/access.log' ;;
+    error-all)  GLOB='/var/log/nginx/error.log*' ;;
+    access-all) GLOB='/var/log/nginx/access.log*' ;;
+    *)
+        echo "usage: dikarya-nginx-log {error|access|error-all|access-all} [lines]" >&2
+        exit 2
+        ;;
+esac
+
+case "$LINES" in
+    ''|*[!0-9]*)
+        echo "dikarya-nginx-log: line count must be a positive integer" >&2
+        exit 2
+        ;;
+esac
+
+# Bound the output so a runaway call cannot dump the entire archive at once.
+# The ceiling is high because the access log runs ~60 lines/minute: 5000 lines
+# reached back only 80 minutes, which made access-all useless for the very
+# thing it exists for (finding a 504 that happened yesterday). The cap is a
+# guard against an accidental full dump, not a security control -- the security
+# property is that the caller never chooses a path -- so it can afford to be
+# generous. Always pipe to grep rather than reading the raw output.
+if [ "$LINES" -gt 200000 ]; then
+    LINES=200000
+fi
+
+# Oldest rotation first so the output reads forward in time. logrotate numbers
+# them newest-lowest (error.log.1 is more recent than error.log.2.gz), so the
+# live file sorts last and the numbered ones sort in reverse.
+FILES=""
+for f in $(ls -1 $GLOB 2>/dev/null | sort -r); do
+    [ -r "$f" ] && FILES="$FILES $f"
+done
+
+if [ -z "$FILES" ]; then
+    echo "dikarya-nginx-log: no readable log matching $GLOB" >&2
+    exit 1
+fi
+
+# zcat -f passes plain files through uncompressed, so one pipeline handles the
+# live file and the gzipped rotations together.
+/usr/bin/zcat -f $FILES | /usr/bin/tail -n "$LINES"

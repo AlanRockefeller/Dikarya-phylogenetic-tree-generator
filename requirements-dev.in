@@ -1,0 +1,9 @@
+-r requirements.txt
+
+# Test, audit, secret-scan, and lockfile maintenance tools.
+detect-secrets==1.5.0
+pip==26.1.2
+pip-audit==2.10.1
+pip-tools==7.5.3
+pytest==9.1.1
+setuptools==83.0.0

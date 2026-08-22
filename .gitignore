@@ -1,0 +1,69 @@
+# ---- Secrets / local env ----
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+.secrets.baseline
+
+# ---- Python bytecode / caches ----
+__pycache__/
+*.py[cod]
+*$py.class
+
+# ---- Virtual environments ----
+.venv/
+venv/
+ENV/
+env/
+
+# ---- Test / tooling caches ----
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# ---- Logs ----
+*.log
+
+# ---- App runtime data (jobs, logs, outputs) ----
+var/
+cache/
+# If you want to keep var/ directory but ignore its contents, use instead:
+# var/*
+# !var/.gitkeep
+
+# ---- Database / backups ----
+*.sqlite3
+*.sqlite
+*.db
+*.bak
+
+# ---- Editors ----
+.vscode/
+.idea/
+*.swp
+*~
+.DS_Store
+Thumbs.db
+
+# ---- Misc ----
+test_input.fasta
+test_sanitized.fasta
+test_tree.newick
+.claude/
+CLAUDE.md
+ARCHITECTURE.md
+temp_jobs/
+*.out
+dosage-calculator/
+/app/dosage/
+/app/static/js/dosage_calculator.js
+/app/templates/test.html
+/tests/test_dosage_calculator.py
+/app/static/files/
+/amanitaceae
+mycomap.com.api.md
+chatgpt_project_context*
+mycomap_api_documentation.md

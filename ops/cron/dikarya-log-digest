@@ -1,0 +1,23 @@
+# Daily Dikarya log digest.
+#
+# Install for the `tree` user:
+#     crontab /var/www/dikarya/ops/cron/dikarya-log-digest
+# Inspect:  crontab -l
+# Remove:   crontab -r
+#
+# Runs at 07:05 UTC, covering the previous 24 hours across live and rotated logs,
+# and writes one dated file to
+# ~/.dikarya/log-digests/. Keeps 30 days and deletes older ones.
+#
+# Output goes to the tree user's home, NOT var/logs/: that directory is owned by
+# dikarya:dikarya and the tree user cannot create anything in it, so writing there
+# would fail silently every night -- exactly the kind of quiet failure this whole
+# change set is meant to eliminate.
+#
+# The digest reads only files -- no database, no network, no privileges -- so it
+# is safe to run unattended and cannot affect the running site.
+
+SHELL=/bin/bash
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+5 7 * * * mkdir -p $HOME/.dikarya/log-digests && /var/www/dikarya/.venv/bin/python /var/www/dikarya/scripts/dikarya_log_digest.py --hours 24 > $HOME/.dikarya/log-digests/$(date -u +\%Y-\%m-\%d).txt 2>&1; find $HOME/.dikarya/log-digests -name '*.txt' -mtime +30 -delete

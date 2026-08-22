@@ -1,0 +1,22 @@
+# Lets the Dikarya web app reach the `tree` account's Claude Code credentials,
+# which are mode 600 and unreadable to `dikarya`.
+#
+# Install as root:
+#   install -o root -g root -m 0440 \
+#       /var/www/dikarya/ops/sudoers/dikarya-claude /etc/sudoers.d/dikarya-claude
+#   visudo -c
+#
+# The trailing "" is load-bearing: it permits the command with NO arguments at
+# all. Without it, sudo allows any arguments, and `dikarya` could call
+#     sudo -u tree /usr/local/sbin/dikarya-claude-review --tools Bash ...
+# Argument handling is pinned in the root-owned wrapper, which `dikarya` cannot
+# edit; this line makes sure the wrapper is the only thing that decides them.
+# The wrapper also rejects a non-empty argv itself, so the two agree.
+#
+# Grant is (tree), not (root): the wrapper only ever needs to read one user's
+# credential file and run one binary as that user.
+dikarya ALL=(tree) NOPASSWD: /usr/local/sbin/dikarya-claude-review ""
+
+# Do not add further commands to this file. Each entry here is a path from an
+# internet-facing process into another user's account.
+Defaults!/usr/local/sbin/dikarya-claude-review env_keep += "DIKARYA_CLAUDE_MODEL DIKARYA_CLAUDE_EFFORT DIKARYA_CLAUDE_TIMEOUT DIKARYA_CLAUDE_MAX_BUDGET"
