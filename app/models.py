@@ -197,11 +197,15 @@ class VoucherSyncRun(db.Model):
     user_id = db.Column(db.Integer, db.ForeignKey('user.id', ondelete='CASCADE'), nullable=False)
     kind = db.Column(db.String(16), nullable=False, default='scan')
     status = db.Column(db.String(16), nullable=False, default='queued')
-    params = db.Column(db.JSON, nullable=False, default=dict)
+    # Mutable-tracked for the same reason Job.metrics is: the apply worker reads
+    # a run's rows, edits them and writes them back, and a plain db.JSON column
+    # compares the new value against the committed one, finds the same object and
+    # emits no UPDATE. The PostgreSQL column stays plain JSON, so no migration.
+    params = db.Column(MutableDict.as_mutable(db.JSON), nullable=False, default=dict)
     progress_done = db.Column(db.Integer, nullable=False, default=0)
     progress_total = db.Column(db.Integer, nullable=True)
-    rows = db.Column(db.JSON, nullable=True)
-    summary = db.Column(db.JSON, nullable=True)
+    rows = db.Column(MutableList.as_mutable(db.JSON), nullable=True)
+    summary = db.Column(MutableDict.as_mutable(db.JSON), nullable=True)
     error = db.Column(db.Text, nullable=True)
     parent_run_id = db.Column(db.String(64), db.ForeignKey('voucher_sync_run.id', ondelete='SET NULL'),
                               nullable=True)
