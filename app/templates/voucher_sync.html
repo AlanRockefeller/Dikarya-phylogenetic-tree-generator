@@ -7,20 +7,170 @@
 
 {% block head %}
 <style>
-    .vs-row-update { background-color: rgb(220 252 231); }
-    .vs-row-ocr    { background-color: rgb(219 234 254); }
-    .vs-row-skip   { background-color: rgb(243 244 246); color: rgb(107 114 128); }
-    .vs-row-flag   { background-color: rgb(254 243 199); }
-    .vs-row-applied{ background-color: rgb(236 253 245); color: rgb(107 114 128); }
-    .dark .vs-row-update { background-color: rgb(20 83 45 / 0.45); }
-    .dark .vs-row-ocr    { background-color: rgb(30 58 138 / 0.45); }
-    .dark .vs-row-skip   { background-color: rgb(31 41 55 / 0.6); color: rgb(156 163 175); }
-    .dark .vs-row-flag   { background-color: rgb(120 53 15 / 0.45); }
-    .dark .vs-row-applied{ background-color: rgb(6 78 59 / 0.4); color: rgb(156 163 175); }
+    /* ---- Results table: neutral zebra + 4px status rail (Claude Design "Status Rail") ---- */
+    /* Status is never carried by the row tint alone: the rail is always paired with the
+       ACTION word, so the coding survives color-blind vision and grayscale print. */
+    /* fixed layout so the <colgroup> widths hold and the Taxon/Reason cells truncate */
+    #vs_table { table-layout: fixed; width: 100%;
+                --row: #fff; --row-alt: #f9fafb; --line: rgb(0 0 0 / 0.07); --muted: #6b7280; }
+    .dark #vs_table { --row: #15201a; --row-alt: #18251e; --line: rgb(255 255 255 / 0.06); --muted: #a3b0a4; }
+    .vs-thead { background: #f3f4f6; color: #4b5563; border-bottom: 1px solid rgb(0 0 0 / 0.08); }
+    .dark .vs-thead { background: #0f1712; color: #cbd6c8; border-bottom-color: #2a3a2f; }
+    .vs-th { padding: 11px 12px; text-align: left; font-family: var(--mono, 'JetBrains Mono', monospace);
+             font-size: 10.5px; font-weight: 600; letter-spacing: .11em; text-transform: uppercase; white-space: nowrap; }
+    .vs-row { --rail: transparent; --action: inherit; background: var(--row); border-bottom: 1px solid var(--line); }
+    .vs-row.vs-zebra { background: var(--row-alt); }
+    /* inset shadow rather than border-left on <tr>, which does not render reliably */
+    .vs-row td:first-child { box-shadow: inset 4px 0 0 var(--rail); }
+    .vs-row-update { --rail: #16a34a; --action: #15803d; }
+    .vs-row-skip   { --rail: #9ca3af; --action: #4b5563; }
+    .vs-row-flag   { --rail: #e8a93f; --action: #b45309; }
+    .vs-row-applied{ --rail: #16a34a; --action: var(--muted); }
+    .dark .vs-row-update { --rail: #56c489; --action: #7ed6a3; }
+    .dark .vs-row-skip   { --rail: #8ea691; --action: #b9cdb9; }
+    .dark .vs-row-flag   { --rail: #e8a93f; --action: #f0b455; }
+    .dark .vs-row-applied{ --rail: #56c489; --action: var(--muted); }
+    .vs-td { padding: 10px 12px; font-size: 13px; vertical-align: top; }
+    .vs-mono { font-family: var(--mono, 'JetBrains Mono', monospace); font-size: 12px; }
+    .vs-muted { color: var(--muted); }
+    .vs-action { padding: 10px 12px; font-size: 13px; font-weight: 600; white-space: nowrap; color: var(--action); }
+    .vs-reason { padding: 10px 12px; font-family: var(--mono, 'JetBrains Mono', monospace); font-size: 11.5px;
+                 color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 15rem; }
+    .vs-row-hidden { display: none; }
     #vs_log { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 0.75rem; white-space: pre-wrap; }
-    .vs-chip { display: inline-flex; align-items: center; gap: .35rem; padding: .25rem .65rem; border-radius: 9999px; font-size: .75rem; font-weight: 600; }
-    .vs-switch { width: 2.75rem; height: 1.5rem; }
+
+    #vs_progress_bar { height: 100%; background: linear-gradient(90deg, #c9a24b, #e9c877); transition: width .3s; }
+    .vs-bar-primary { background: #ddb154; color: #1e2c1c; border: 1px solid #e9c877; border-radius: 6px;
+                      padding: 8px 13px; font-size: 13.5px; font-weight: 600; white-space: nowrap; flex: none; }
+    .vs-bar-primary:hover:not(:disabled) { background: #e9c877; }
+    .vs-bar-ghost { background: transparent; color: #6b7280; border: 1px solid #d1d5db; border-radius: 6px;
+                    padding: 8px 10px; display: flex; align-items: center; flex: none; }
+    .dark .vs-bar-ghost { color: #5f7565; border-color: #2f4a37; }
+    .vs-bar-ghost:not(:disabled):hover { color: #1a2f23; border-color: #9ca3af; }
+    .dark .vs-bar-ghost:not(:disabled):hover { color: #cfe0d0; border-color: #4c7057; }
+    .vs-bar-primary.vs-bar-stop { background: #f3f4f6; color: #b91c1c; border-color: #fecaca; }
+    .vs-bar-primary.vs-bar-stop:hover:not(:disabled) { background: #fee2e2; }
+    .dark .vs-bar-primary.vs-bar-stop { background: #4a2e2a; color: #e0a9a0; border-color: #5a3f3a; }
+    .dark .vs-bar-primary.vs-bar-stop:hover:not(:disabled) { background: #5a3733; }
+    .vs-bar-apply { display: flex; align-items: center; gap: 9px; border-radius: 6px; padding: 8px 14px;
+                    font-size: 13.5px; font-weight: 600; white-space: nowrap; flex: none;
+                    background: #16a34a; color: #fff; border: 1px solid #15803d; }
+    .vs-bar-apply:hover:not(:disabled) { background: #15803d; }
+    .vs-bar-apply:disabled { background: #e5e7eb; color: #9ca3af; border-color: #d1d5db; cursor: not-allowed; }
+    .dark .vs-bar-apply:disabled { background: #294c34; color: #7d9a85; border-color: rgb(53 96 65 / 0.5); }
+    .vs-count { font-family: var(--mono, 'JetBrains Mono', monospace); font-variant-numeric: tabular-nums;
+                font-size: 11.5px; font-weight: 600; background: rgb(0 0 0 / 0.22); border-radius: 10px; padding: 2px 7px; }
+    /* the disabled button is pale in light mode, so the pill has to lighten too */
+    .vs-bar-apply:disabled .vs-count { background: rgb(0 0 0 / 0.08); }
+    .dark .vs-bar-apply:disabled .vs-count { background: rgb(0 0 0 / 0.28); }
+    .vs-bar-div { width: 1px; height: 24px; flex: none; background: #e5e7eb; }
+    .dark .vs-bar-div { background: #2f4a37; }
+    button:disabled { cursor: not-allowed; }
+
+    /* ---- Summary-first bar (Claude Design "Action Bar" 1b) ---- */
+    .vs-head { display: flex; align-items: center; justify-content: space-between; gap: 16px;
+               padding: 13px 16px; background: #f9fafb; border-bottom: 1px solid #e5e7eb; }
+    .dark .vs-head { background: #1e3125; border-bottom-color: #2f4a37; }
+    .vs-mini-track { width: 110px; height: 4px; border-radius: 2px; background: #e5e7eb; overflow: hidden; flex: none; }
+    .dark .vs-mini-track { background: #16261c; }
+    #vs_progress_bar { height: 100%; background: #c9a24b; transition: width .3s; }
+
+    /* Stat tiles: the counts are the filters. The 1px grid gap draws the hairlines. */
+    #vs_chips { display: grid; grid-template-columns: repeat(4, 1fr); gap: 1px; background: #e5e7eb; }
+    .dark #vs_chips { background: #2f4a37; }
+    .vs-chip { position: relative; display: flex; flex-direction: column; gap: 3px; align-items: flex-start;
+               text-align: left; padding: 14px 16px 15px; background: #fff; border: none;
+               border-top: 2px solid var(--accent); cursor: pointer; }
+    .dark .vs-chip { background: #223629; }
+    .vs-chip:hover { background: #f3f4f6; }
+    .dark .vs-chip:hover { background: #274030; }
+    .vs-chip[data-filter="update"] { --accent: #16a34a; --wash: rgb(22 163 74 / 0.10); }
+    .vs-chip[data-filter="skip"]   { --accent: #9ca3af; --wash: rgb(156 163 175 / 0.18); }
+    .vs-chip[data-filter="flag"]   { --accent: #e8a93f; --wash: rgb(232 169 63 / 0.14); background: #fffbeb; }
+    .vs-chip[data-filter="ocr"]    { --accent: #3b82f6; --wash: rgb(59 130 246 / 0.10); }
+    .dark .vs-chip[data-filter="update"] { --accent: #56c489; --wash: rgb(86 196 137 / 0.14); }
+    .dark .vs-chip[data-filter="skip"]   { --accent: #8ea691; --wash: rgb(142 166 145 / 0.18); }
+    .dark .vs-chip[data-filter="flag"]   { --accent: #e8a93f; --wash: rgb(232 169 63 / 0.16); background: #2a3a26; }
+    .dark .vs-chip[data-filter="ocr"]    { --accent: #6f9fd8; --wash: rgb(111 159 216 / 0.16); }
+    .vs-chip[data-filter="flag"]:hover { background: #fef3c7; }
+    .dark .vs-chip[data-filter="flag"]:hover { background: #31431f; }
+    .vs-chip-count { font-family: var(--mono, 'JetBrains Mono', monospace); font-variant-numeric: tabular-nums;
+                     font-size: 26px; font-weight: 500; line-height: 1; color: #1a2f23; }
+    .dark .vs-chip-count { color: #e6ede4; }
+    .vs-chip[data-filter="flag"] .vs-chip-count { color: #92610d; }
+    .dark .vs-chip[data-filter="flag"] .vs-chip-count { color: #f0d69a; }
+    .vs-tile-label { font-size: 12.5px; color: #6b7280; }
+    .dark .vs-tile-label { color: #8ea691; }
+    .vs-chip[data-filter="flag"] .vs-tile-label { color: #a16207; }
+    .dark .vs-chip[data-filter="flag"] .vs-tile-label { color: #d8b878; }
+    .vs-chip[aria-pressed="true"]::after { content: ''; position: absolute; inset: 0;
+        border: 2px solid var(--accent); background: var(--wash); pointer-events: none; }
+    .vs-chip:focus-visible { outline: 2px solid #c9a962; outline-offset: -2px; }
+
+    .vs-filterbar { display: flex; align-items: center; gap: 8px; padding: 9px 16px;
+                    background: #f9fafb; border-top: 1px solid #e5e7eb; }
+    .dark .vs-filterbar { background: #1f3327; border-top-color: #2f4a37; }
+    .vs-actions { display: flex; align-items: center; justify-content: space-between; gap: 16px;
+                  padding: 13px 16px; border-top: 1px solid #e5e7eb; }
+    .dark .vs-actions { border-top-color: #2f4a37; }
+    .vs-bar-secondary { background: #f3f4f6; color: #374151; border: 1px solid #d1d5db; border-radius: 6px;
+                        padding: 9px 14px; font-size: 13.5px; font-weight: 500; white-space: nowrap; flex: none; }
+    .vs-bar-secondary:hover { background: #e5e7eb; }
+    .dark .vs-bar-secondary { background: #2b4434; color: #cfe0d0; border-color: #3b5a45; }
+    .dark .vs-bar-secondary:hover { background: #34513e; }
+    .vs-bar-danger { background: transparent; color: #6b7280; border: 1px solid transparent; border-radius: 6px;
+                     padding: 9px 12px; font-size: 13.5px; white-space: nowrap; flex: none; }
+    .dark .vs-bar-danger { color: #7e9682; }
+    .vs-bar-danger:not(:disabled):hover { color: #b91c1c; border-color: #fecaca; }
+    .dark .vs-bar-danger:not(:disabled):hover { color: #e0a9a0; border-color: #5a3f3a; }
+
     #vs_field_suggest { max-height: 14rem; overflow-y: auto; }
+
+    /* ---- Matching card (compact stack) ---- */
+    .vs-divider { height: 1px; background: rgb(0 0 0 / 0.08); margin: 16px 0; }
+    .dark .vs-divider { background: rgb(255 255 255 / 0.08); }
+    .vs-input { width: 100%; box-sizing: border-box; border-radius: 7px; padding: 9px 11px; font-size: 13.5px; line-height: 1.2;
+                background: #f9fafb; border: 1px solid rgb(0 0 0 / 0.12); color: #1a2f23; outline: none; }
+    .vs-input:focus { border-color: #c9a962; box-shadow: 0 0 0 2px rgb(201 169 98 / 0.25); }
+    .dark .vs-input { background: #1a2f23; border-color: rgb(255 255 255 / 0.12); color: #eef2ef; }
+    .vs-date { flex: 1; min-width: 0; padding: 8px 9px; font-family: 'JetBrains Mono', ui-monospace, monospace; font-size: 12.5px; }
+    .dark .vs-date { color-scheme: dark; }
+    .vs-pill { font-family: 'JetBrains Mono', ui-monospace, monospace; font-size: 10.5px; font-weight: 500; line-height: 1;
+               padding: 4px 7px; border-radius: 5px; background: #f3f4f6; border: 1px solid rgb(0 0 0 / 0.10); color: #6b7280; cursor: pointer; }
+    .vs-pill:hover { border-color: #c9a962; color: #1a2f23; }
+    .dark .vs-pill { background: #1a2f23; border-color: rgb(255 255 255 / 0.10); color: #8fa298; }
+    .dark .vs-pill:hover { color: #eef2ef; }
+    .vs-pill-input { width: 5.5rem; cursor: text; color: #1a2f23; -moz-appearance: textfield; }
+    .vs-pill-input::-webkit-outer-spin-button, .vs-pill-input::-webkit-inner-spin-button { -webkit-appearance: none; margin: 0; }
+    .dark .vs-pill-input { color: #eef2ef; }
+    .vs-tile-wrap { display: block; cursor: pointer; }
+    .vs-tile { display: block; padding: 7px 6px; border-radius: 6px; text-align: center; font-size: 12px; font-weight: 600; line-height: 1.2;
+               background: #f3f4f6; color: #4b5563; border: 1px solid rgb(0 0 0 / 0.08); transition: border-color .15s, color .15s; }
+    .vs-tile-wrap:hover .vs-tile { border-color: rgb(201 169 98 / 0.5); color: #1a2f23; }
+    .vs-tile-wrap input:checked + .vs-tile { background: rgb(201 169 98 / 0.18); color: #7a5d1d; border-color: rgb(201 169 98 / 0.6); font-weight: 700; }
+    .vs-tile-wrap input:focus-visible + .vs-tile { box-shadow: 0 0 0 2px rgb(201 169 98 / 0.45); }
+    .dark .vs-tile { background: #1a2f23; color: #b9c7bf; border-color: rgb(255 255 255 / 0.08); }
+    .dark .vs-tile-wrap:hover .vs-tile { border-color: rgb(201 169 98 / 0.4); color: #eef2ef; }
+    .dark .vs-tile-wrap input:checked + .vs-tile { background: rgb(201 169 98 / 0.16); color: #e8cd8e; border-color: rgb(201 169 98 / 0.45); }
+    .vs-seg { display: inline-flex; padding: 2px; border-radius: 6px; background: #f3f4f6; border: 1px solid rgb(0 0 0 / 0.10); }
+    .dark .vs-seg { background: #1a2f23; border-color: rgb(255 255 255 / 0.10); }
+    .vs-seg-wrap { cursor: pointer; }
+    .vs-seg-opt { display: block; padding: 3px 9px; border-radius: 4px; font-size: 11px; font-weight: 600; color: #6b7280; }
+    .vs-seg-wrap input:checked + .vs-seg-opt { background: rgb(201 169 98 / 0.2); color: #7a5d1d; font-weight: 700; }
+    .vs-seg-wrap input:focus-visible + .vs-seg-opt { box-shadow: 0 0 0 2px rgb(201 169 98 / 0.45); }
+    .dark .vs-seg-opt { color: #8fa298; }
+    .dark .vs-seg-wrap input:checked + .vs-seg-opt { background: rgb(201 169 98 / 0.18); color: #e8cd8e; }
+    .vs-help { display: inline-flex; align-items: center; justify-content: center; width: 14px; height: 14px; border-radius: 50%; margin-left: 2px;
+               border: 1px solid rgb(0 0 0 / 0.25); font-size: 9px; font-weight: 700; color: #6b7280; vertical-align: middle; cursor: help; }
+    .dark .vs-help { border-color: rgb(255 255 255 / 0.25); color: #8fa298; }
+    .vs-switch { flex: none; position: relative; width: 34px; height: 19px; border-radius: 10px; background: #e5e7eb; border: 1px solid rgb(0 0 0 / 0.14); transition: background .15s, border-color .15s; }
+    .vs-switch::after { content: ''; position: absolute; top: 2.5px; left: 3px; width: 12px; height: 12px; border-radius: 50%; background: #9ca3af; transition: transform .15s, background .15s; }
+    input:checked + .vs-switch { background: rgb(201 169 98 / 0.35); border-color: rgb(201 169 98 / 0.6); }
+    input:checked + .vs-switch::after { transform: translateX(15px); background: #c9a962; }
+    input:focus-visible + .vs-switch { box-shadow: 0 0 0 2px rgb(201 169 98 / 0.45); }
+    .dark .vs-switch { background: #1a2f23; border-color: rgb(255 255 255 / 0.14); }
+    .dark .vs-switch::after { background: #7d8f85; }
+    .dark input:checked + .vs-switch::after { background: #e8cd8e; }
 </style>
 {% endblock %}
 
@@ -93,71 +243,77 @@
             </section>
 
             <!-- Settings card -->
-            <section class="bg-white dark:bg-journal-green border border-gray-200 dark:border-gray-700 rounded-lg p-5 shadow-sm space-y-5">
-                <h3 class="text-sm font-semibold uppercase tracking-wide text-gray-500 dark:text-gray-300">
-                    <i class="fas fa-sliders mr-1"></i> Matching
-                </h3>
-
-                <div class="relative">
-                    <label for="vs_field_name" class="block text-sm font-semibold text-journal-dark dark:text-gray-100 mb-2">Observation field</label>
-                    <input id="vs_field_name" type="text" value="{{ default_field_name }}" autocomplete="off"
-                        class="w-full rounded-lg border border-gray-300 dark:border-gray-600 bg-white dark:bg-journal-dark px-3 py-2 text-journal-dark dark:text-white">
-                    <ul id="vs_field_suggest" class="hidden absolute z-20 mt-1 w-full rounded-lg border border-gray-200 dark:border-gray-600 bg-white dark:bg-journal-dark shadow-lg text-sm"></ul>
-                    <div class="mt-2 flex items-center gap-2 text-xs text-gray-500 dark:text-gray-400">
-                        <span>Field ID</span>
-                        <input id="vs_field_id" type="number" min="1" value="{{ default_field_id }}"
-                            class="w-24 rounded border border-gray-300 dark:border-gray-600 bg-white dark:bg-journal-dark px-2 py-1 text-journal-dark dark:text-white font-mono">
-                    </div>
+            <!-- Compact stack (Claude Design "Matching Card Variations" 1a) -->
+            <section id="vs_matching" class="vs-card bg-white dark:bg-journal-green border border-gray-200 dark:border-white/5 rounded-[10px] p-4 shadow-sm text-journal-dark dark:text-[#eef2ef]">
+                <div class="flex items-center justify-between mb-3.5">
+                    <h3 class="flex items-center gap-2 text-[11.5px] font-extrabold uppercase tracking-[.14em] text-journal-dark dark:text-[#eef2ef]">
+                        <i class="fas fa-sliders text-journal-gold"></i> Matching
+                    </h3>
+                    <button type="button" id="vs_reset" class="text-[11px] font-semibold text-gray-500 dark:text-[#8fa298] hover:text-journal-gold transition-colors">Reset</button>
                 </div>
 
+                <div class="relative">
+                    <div class="flex items-center justify-between mb-1.5">
+                        <label for="vs_field_name" class="text-[12.5px] font-bold">Observation field</label>
+                        <button type="button" id="vs_field_id_pill" class="vs-pill" title="Click to edit the numeric field ID">ID <span id="vs_field_id_text">{{ default_field_id }}</span></button>
+                        <input id="vs_field_id" type="number" min="1" value="{{ default_field_id }}" class="vs-pill vs-pill-input hidden" aria-label="Observation field ID">
+                    </div>
+                    <input id="vs_field_name" type="text" value="{{ default_field_name }}" autocomplete="off" class="vs-input">
+                    <ul id="vs_field_suggest" class="hidden absolute z-20 mt-1 w-full rounded-lg border border-gray-200 dark:border-gray-600 bg-white dark:bg-journal-dark shadow-lg text-sm"></ul>
+                </div>
+
+                <div class="vs-divider"></div>
+
                 <div>
-                    <span class="block text-sm font-semibold text-journal-dark dark:text-gray-100 mb-2">Code format</span>
-                    <div class="space-y-1.5">
+                    <div class="flex items-baseline justify-between mb-[7px]">
+                        <span class="text-[12.5px] font-bold">Code format</span>
+                        <span id="vs_format_hint" class="font-mono text-[10.5px] text-gray-500 dark:text-[#8fa298] truncate max-w-[55%]"></span>
+                    </div>
+                    <div class="grid grid-cols-2 gap-[5px]">
                         {% for f in voucher_formats %}
-                        <label class="flex items-center gap-2 text-sm text-gray-700 dark:text-gray-200 cursor-pointer">
+                        <label class="vs-tile-wrap">
                             <input type="radio" name="vs_format" value="{{ f.name }}" data-regex="{{ f.regex }}" data-example="{{ f.example }}"
-                                {% if f.name == default_format %}checked{% endif %} class="accent-journal-gold">
-                            <span>{{ f.name }}</span>
+                                {% if f.name == default_format %}checked{% endif %} class="sr-only">
+                            <span class="vs-tile">{{ 'Numbers' if f.name == 'Numbers only' else f.name }}</span>
                         </label>
                         {% endfor %}
                     </div>
                     <div id="vs_custom_regex_wrap" class="hidden mt-2">
-                        <input id="vs_custom_regex" type="text" placeholder="Regular expression" maxlength="200"
-                            class="w-full rounded-lg border border-gray-300 dark:border-gray-600 bg-white dark:bg-journal-dark px-3 py-2 text-journal-dark dark:text-white font-mono text-sm">
+                        <input id="vs_custom_regex" type="text" placeholder="Regular expression, e.g. \bBT-\d{3}\b" maxlength="200" class="vs-input font-mono text-[12.5px]">
                     </div>
-                    <p id="vs_format_hint" class="mt-2 text-xs text-gray-500 dark:text-gray-400"></p>
                 </div>
+
+                <div class="vs-divider"></div>
 
                 <div>
-                    <span class="block text-sm font-semibold text-journal-dark dark:text-gray-100 mb-2">Upload date</span>
-                    <div class="flex items-center gap-3 text-sm text-gray-700 dark:text-gray-200 mb-2">
-                        <label class="flex items-center gap-1.5 cursor-pointer"><input type="radio" name="vs_date_mode" value="single" checked class="accent-journal-gold"> Single day</label>
-                        <label class="flex items-center gap-1.5 cursor-pointer"><input type="radio" name="vs_date_mode" value="range" class="accent-journal-gold"> Range</label>
+                    <div class="flex items-center justify-between mb-[7px]">
+                        <span class="text-[12.5px] font-bold" title="The date the observation was uploaded to iNaturalist.">Uploaded</span>
+                        <div class="vs-seg" role="radiogroup" aria-label="Single day or range">
+                            <label class="vs-seg-wrap"><input type="radio" name="vs_date_mode" value="single" checked class="sr-only"><span class="vs-seg-opt">Day</span></label>
+                            <label class="vs-seg-wrap"><input type="radio" name="vs_date_mode" value="range" class="sr-only"><span class="vs-seg-opt">Range</span></label>
+                        </div>
                     </div>
                     <div class="flex items-center gap-2">
-                        <input id="vs_date_start" type="date"
-                            class="flex-1 rounded-lg border border-gray-300 dark:border-gray-600 bg-white dark:bg-journal-dark px-3 py-2 text-journal-dark dark:text-white text-sm">
-                        <span id="vs_date_to" class="hidden text-gray-500 text-sm">to</span>
-                        <input id="vs_date_end" type="date"
-                            class="hidden flex-1 rounded-lg border border-gray-300 dark:border-gray-600 bg-white dark:bg-journal-dark px-3 py-2 text-journal-dark dark:text-white text-sm">
+                        <input id="vs_date_start" type="date" class="vs-input vs-date" aria-label="Upload date">
+                        <span id="vs_date_to" class="hidden text-[11px] text-gray-500 dark:text-[#8fa298]">to</span>
+                        <input id="vs_date_end" type="date" class="vs-input vs-date hidden" aria-label="Upload date end">
                     </div>
-                    <p class="mt-2 text-xs text-gray-500 dark:text-gray-400">The date the observation was uploaded to iNaturalist.</p>
                 </div>
 
-                <div class="space-y-3">
-                    <label class="flex items-start gap-3 cursor-pointer">
-                        <input id="vs_overwrite" type="checkbox" class="mt-1 accent-journal-gold">
-                        <span class="text-sm text-gray-700 dark:text-gray-200">
-                            <span class="font-semibold">Overwrite existing values</span><br>
-                            <span class="text-xs text-gray-500 dark:text-gray-400">When off, observations whose field already holds a different value are flagged, not changed.</span>
+                <div class="vs-divider"></div>
+
+                <div class="flex flex-col gap-[11px]">
+                    <label class="flex items-center justify-between gap-2.5 cursor-pointer">
+                        <span class="text-[12.5px] font-semibold">OCR fallback
+                            <span class="vs-help" title="If no QR code decodes, read the printed ID. OCR matches are shown in blue for review." aria-label="If no QR code decodes, read the printed ID. OCR matches are shown in blue for review.">?</span>
                         </span>
+                        <input id="vs_use_ocr" type="checkbox" checked class="sr-only"><span class="vs-switch" aria-hidden="true"></span>
                     </label>
-                    <label class="flex items-start gap-3 cursor-pointer">
-                        <input id="vs_use_ocr" type="checkbox" checked class="mt-1 accent-journal-gold">
-                        <span class="text-sm text-gray-700 dark:text-gray-200">
-                            <span class="font-semibold">OCR fallback</span><br>
-                            <span class="text-xs text-gray-500 dark:text-gray-400">If no QR code decodes, read the printed ID. OCR matches are shown in blue for review.</span>
+                    <label class="flex items-center justify-between gap-2.5 cursor-pointer">
+                        <span class="text-[12.5px] font-semibold">Overwrite existing values
+                            <span class="vs-help" title="When off, observations whose field already holds a different value are flagged, not changed." aria-label="When off, observations whose field already holds a different value are flagged, not changed.">?</span>
                         </span>
+                        <input id="vs_overwrite" type="checkbox" class="sr-only"><span class="vs-switch" aria-hidden="true"></span>
                     </label>
                 </div>
             </section>
@@ -165,65 +321,73 @@
 
         <!-- Right column: actions + results -->
         <div class="space-y-4">
-            <section class="bg-white dark:bg-journal-green border border-gray-200 dark:border-gray-700 rounded-lg p-4 shadow-sm">
-                <div class="flex flex-wrap items-center gap-2">
-                    <button id="vs_btn_preview" type="button" {% if not credential.connected %}disabled{% endif %}
-                        class="inline-flex items-center gap-2 bg-journal-gold text-journal-dark px-4 py-2 rounded-lg text-sm font-semibold hover:bg-journal-gold-light transition-colors disabled:opacity-50 disabled:cursor-not-allowed">
-                        <i class="fas fa-magnifying-glass"></i> Preview run
-                    </button>
-                    <button id="vs_btn_stop" type="button" disabled
-                        class="inline-flex items-center gap-2 px-4 py-2 rounded-lg text-sm font-semibold border border-gray-300 dark:border-gray-600 text-gray-700 dark:text-gray-200 hover:bg-gray-100 dark:hover:bg-journal-dark transition-colors disabled:opacity-50 disabled:cursor-not-allowed">
-                        <i class="fas fa-stop"></i> Stop
-                    </button>
-                    <span class="flex-1"></span>
-                    <button id="vs_btn_apply" type="button" disabled
-                        class="inline-flex items-center gap-2 bg-green-600 text-white px-4 py-2 rounded-lg text-sm font-semibold hover:bg-green-700 transition-colors disabled:opacity-50 disabled:cursor-not-allowed">
-                        <i class="fas fa-cloud-arrow-up"></i> Apply updates
-                    </button>
-                    <a id="vs_btn_export" href="#" aria-disabled="true"
-                        class="inline-flex items-center gap-2 px-4 py-2 rounded-lg text-sm font-semibold border border-gray-300 dark:border-gray-600 text-gray-700 dark:text-gray-200 hover:bg-gray-100 dark:hover:bg-journal-dark transition-colors opacity-50 pointer-events-none">
-                        <i class="fas fa-file-csv"></i> Export CSV
-                    </a>
-                    <button id="vs_btn_clear" type="button" disabled
-                        class="inline-flex items-center gap-2 px-3 py-2 rounded-lg text-sm border border-transparent text-gray-500 dark:text-gray-400 hover:text-journal-dark dark:hover:text-white transition-colors disabled:opacity-50">
-                        <i class="fas fa-rotate-left"></i> Clear
-                    </button>
-                </div>
-
-                <div class="mt-4">
-                    <div class="flex items-center justify-between text-xs text-gray-500 dark:text-gray-400 mb-1">
-                        <span id="vs_status_text">Ready.</span>
-                        <span id="vs_progress_text"></span>
+            <!-- Summary-first bar (Claude Design "Action Bar" 1b) -->
+            <section class="bg-white dark:bg-journal-green border border-gray-200 dark:border-[#2f4a37] rounded-lg shadow-sm overflow-hidden">
+                <div class="vs-head">
+                    <div class="flex items-center gap-2.5 min-w-0">
+                        <span id="vs_status_dot" class="block w-2 h-2 rounded-full bg-gray-400 flex-none"></span>
+                        <span id="vs_status_text" class="text-[13.5px] font-semibold text-journal-dark dark:text-[#e6ede4] truncate" aria-live="polite">Ready.</span>
+                        <span id="vs_status_time" class="text-xs text-gray-500 dark:text-[#7e9682] whitespace-nowrap"></span>
                     </div>
-                    <div class="h-2 w-full rounded-full bg-gray-200 dark:bg-gray-700 overflow-hidden">
-                        <div id="vs_progress_bar" class="h-2 bg-journal-gold transition-all duration-300" style="width:0%"></div>
+                    <div class="flex items-center gap-2.5 flex-none">
+                        <div class="vs-mini-track"><div id="vs_progress_bar" style="width:0%"></div></div>
+                        <span id="vs_progress_text" class="font-mono text-xs text-gray-500 dark:text-[#b9cdb9] whitespace-nowrap tabular-nums"></span>
                     </div>
                 </div>
 
-                <div id="vs_chips" class="mt-4 flex flex-wrap gap-2">
-                    <span class="vs-chip bg-green-100 text-green-800 dark:bg-green-900/40 dark:text-green-200"><i class="fas fa-circle-check"></i> Update <span id="vs_chip_update">0</span></span>
-                    <span class="vs-chip bg-blue-100 text-blue-800 dark:bg-blue-900/40 dark:text-blue-200"><i class="fas fa-eye"></i> via OCR <span id="vs_chip_ocr">0</span></span>
-                    <span class="vs-chip bg-gray-100 text-gray-700 dark:bg-gray-800 dark:text-gray-300"><i class="fas fa-forward"></i> Skip <span id="vs_chip_skip">0</span></span>
-                    <span class="vs-chip bg-amber-100 text-amber-800 dark:bg-amber-900/40 dark:text-amber-200"><i class="fas fa-flag"></i> Flag <span id="vs_chip_flag">0</span></span>
+                <div id="vs_chips" role="group" aria-label="Filter rows by action">
+                    <button type="button" data-filter="update" class="vs-chip" aria-pressed="false" title="Show only rows to update">
+                        <span id="vs_chip_update" class="vs-chip-count">0</span><span class="vs-tile-label">to update</span>
+                    </button>
+                    <button type="button" data-filter="skip" class="vs-chip" aria-pressed="false" title="Show only skipped rows">
+                        <span id="vs_chip_skip" class="vs-chip-count">0</span><span class="vs-tile-label">to skip</span>
+                    </button>
+                    <button type="button" data-filter="flag" class="vs-chip" aria-pressed="false" title="Show only flagged rows">
+                        <span id="vs_chip_flag" class="vs-chip-count">0</span><span class="vs-tile-label">flagged</span>
+                    </button>
+                    <button type="button" data-filter="ocr" class="vs-chip" aria-pressed="false" title="Show only updates read by OCR rather than a QR code">
+                        <span id="vs_chip_ocr" class="vs-chip-count">0</span><span class="vs-tile-label">via OCR</span>
+                    </button>
+                </div>
+
+                <div class="vs-filterbar">
+                    <span id="vs_filter_hint" class="text-xs text-gray-500 dark:text-[#8ea691]" aria-live="polite"></span>
+                </div>
+
+                <div class="vs-actions">
+                    <div class="flex items-center gap-2">
+                        <button id="vs_btn_preview" type="button" class="vs-bar-primary disabled:opacity-50"
+                            {% if not credential.connected %}disabled{% endif %}>Preview</button>
+                    </div>
+                    <div class="flex items-center gap-2">
+                        <button id="vs_btn_clear" type="button" class="vs-bar-danger disabled:opacity-50" disabled>Clear results</button>
+                        <a id="vs_btn_export" href="#" aria-disabled="true"
+                            class="vs-bar-secondary opacity-50 pointer-events-none">Export CSV</a>
+                        <button id="vs_btn_apply" type="button" class="vs-bar-apply" disabled
+                            title="Nothing to write yet">Apply updates <span id="vs_apply_count" class="vs-count">0</span></button>
+                    </div>
                 </div>
             </section>
 
-            <section class="bg-white dark:bg-journal-green border border-gray-200 dark:border-gray-700 rounded-lg shadow-sm overflow-hidden">
+            <section class="bg-white dark:bg-[#15201a] border border-gray-200 dark:border-[#2a3a2f] rounded-md shadow-sm overflow-hidden">
                 <div class="overflow-x-auto">
-                    <table class="min-w-full text-sm">
-                        <thead class="bg-gray-50 dark:bg-journal-dark text-xs uppercase tracking-wide text-gray-500 dark:text-gray-300">
+                    <table id="vs_table" class="min-w-full text-journal-dark dark:text-[#ece9df]">
+                        <colgroup>
+                            <col style="width:38px"><col style="width:120px"><col><col style="width:104px">
+                            <col style="width:118px"><col style="width:92px"><col style="width:150px">
+                        </colgroup>
+                        <thead class="vs-thead">
                             <tr>
-                                <th class="px-3 py-2 text-left w-8"><input id="vs_select_all" type="checkbox" class="accent-journal-gold" title="Select all Update rows"></th>
-                                <th class="px-3 py-2 text-left">Observation</th>
-                                <th class="px-3 py-2 text-left">Taxon</th>
-                                <th class="px-3 py-2 text-left">Uploaded</th>
-                                <th class="px-3 py-2 text-left">Detected</th>
-                                <th class="px-3 py-2 text-left">Current</th>
-                                <th class="px-3 py-2 text-left">Action</th>
-                                <th class="px-3 py-2 text-left">Reason</th>
+                                <th class="vs-th"><input id="vs_select_all" type="checkbox" class="accent-journal-gold ml-1" title="Select all visible Update rows"></th>
+                                <th class="vs-th">Observation</th>
+                                <th class="vs-th">Taxon</th>
+                                <th class="vs-th">Uploaded</th>
+                                <th class="vs-th">Voucher</th>
+                                <th class="vs-th">Action</th>
+                                <th class="vs-th">Reason</th>
                             </tr>
                         </thead>
-                        <tbody id="vs_rows" class="divide-y divide-gray-100 dark:divide-gray-700"></tbody>
+                        <tbody id="vs_rows"></tbody>
                     </table>
                 </div>
                 <div id="vs_empty" class="px-4 py-10 text-center text-sm text-gray-500 dark:text-gray-400">
@@ -240,6 +404,15 @@
             </section>
         </div>
     </div>
+
+    <!-- Attribution: this tool was contributed to Dikarya, and the desktop original
+         is still maintained separately, so the link is useful as well as due credit. -->
+    <p class="mt-8 pt-4 border-t border-gray-200 dark:border-gray-700 text-xs text-gray-500 dark:text-gray-400">
+        Voucher Sync by <span class="font-semibold text-gray-600 dark:text-gray-300">Bryce Thorson</span> &mdash;
+        ported from <a href="https://github.com/bthorson1029/inat-voucher-sync" target="_blank" rel="noopener"
+            class="underline hover:text-journal-gold transition-colors">inat-voucher-sync</a>,
+        which also runs as a standalone desktop app.
+    </p>
 </div>
 
 <!-- Apply confirmation modal -->
@@ -263,7 +436,7 @@
     const POLL_MS = 2000;
 
     const el = (id) => document.getElementById(id);
-    const btnPreview = el('vs_btn_preview'), btnStop = el('vs_btn_stop'), btnApply = el('vs_btn_apply'),
+    const btnPreview = el('vs_btn_preview'), btnApply = el('vs_btn_apply'),
           btnExport = el('vs_btn_export'), btnClear = el('vs_btn_clear');
     const rowsBody = el('vs_rows'), emptyMsg = el('vs_empty'), logBox = el('vs_log');
 
@@ -275,7 +448,9 @@
         order: [],
         cursor: 0, logCursor: 0,
         polling: null,
+        busy: false,          // a run is queued/running (set before polling starts)
         selected: new Set(),
+        filters: new Set(), // active chip filters; empty = show everything
     };
 
     // ---------- helpers ----------
@@ -290,11 +465,30 @@
         try { data = await resp.json(); } catch (e) { data = {}; }
         return { ok: resp.ok, status: resp.status, data };
     }
-    function setStatus(text) { el('vs_status_text').textContent = text; }
+    function setStatus(text, tone, time) {
+        el('vs_status_text').textContent = text;
+        el('vs_status_time').textContent = time || '';
+        const dot = el('vs_status_dot');
+        dot.className = 'block w-1.5 h-1.5 rounded-full flex-none ' + ({
+            ok: 'bg-green-500', busy: 'bg-journal-gold animate-pulse', error: 'bg-red-500',
+        }[tone] || 'bg-gray-400');
+    }
+    // "3 minutes ago" phrasing for the resumed-run status line.
+    function relativeTime(iso) {
+        const then = Date.parse(iso.endsWith('Z') || iso.includes('+') ? iso : iso + 'Z');
+        if (!then) return '';
+        const mins = Math.round((Date.now() - then) / 60000);
+        if (mins < 1) return 'just now';
+        if (mins < 60) return `${mins} minute${mins === 1 ? '' : 's'} ago`;
+        const hrs = Math.round(mins / 60);
+        if (hrs < 24) return `${hrs} hour${hrs === 1 ? '' : 's'} ago`;
+        const days = Math.round(hrs / 24);
+        return `${days} day${days === 1 ? '' : 's'} ago`;
+    }
     function setProgress(done, total) {
         const pct = total ? Math.round(100 * done / total) : 0;
         el('vs_progress_bar').style.width = pct + '%';
-        el('vs_progress_text').textContent = total ? `${done} / ${total}` : '';
+        el('vs_progress_text').textContent = total ? `${done} / ${total} scanned` : '';
     }
     function log(line) {
         const div = document.createElement('div');
@@ -304,16 +498,74 @@
     }
     function esc(s) { return String(s == null ? '' : s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
     function rowClass(r) {
-        if (r.reason === 'applied') return 'vs-row-applied';
-        if (r.action === 'update') return (r.reason || '').includes('ocr') ? 'vs-row-ocr' : 'vs-row-update';
-        if (r.action === 'flag') return 'vs-row-flag';
-        return 'vs-row-skip';
+        // The rail follows the action; "via OCR" is a modifier shown in the
+        // Action word and Reason column, not a fourth status colour.
+        if (r.reason === 'applied') return 'vs-row vs-row-applied';
+        if (r.action === 'update') return 'vs-row vs-row-update';
+        if (r.action === 'flag') return 'vs-row vs-row-flag';
+        return 'vs-row vs-row-skip';
+    }
+    function voucherCell(r) {
+        const detected = r.detected_voucher, current = r.current_value;
+        const conflict = detected && current &&
+            String(current).trim().toUpperCase() !== String(detected).trim().toUpperCase();
+        if (conflict) return `<span class="vs-muted">${esc(current)}</span> &rarr; ${esc(detected)}`;
+        const value = detected || current;
+        return value ? esc(value) : '<span class="vs-muted">&mdash;</span>';
     }
     function actionLabel(r) {
         if (r.reason === 'applied') return 'Applied';
         if (r.action === 'update') return (r.reason || '').includes('ocr') ? 'Update (OCR)' : 'Update';
         return r.action.charAt(0).toUpperCase() + r.action.slice(1);
     }
+    function rowCategories(r) {
+        if (r.action === 'update') {
+            return (r.reason || '').includes('ocr') ? ['update', 'ocr'] : ['update'];
+        }
+        return [r.action === 'flag' ? 'flag' : 'skip'];
+    }
+    function rowMatchesFilters(r) {
+        if (!state.filters.size) return true;
+        return rowCategories(r).some(c => state.filters.has(c));
+    }
+    function applyFilters() {
+        let visible = 0;
+        rowsBody.querySelectorAll('tr').forEach(tr => {
+            const r = state.rows.get(Number(tr.dataset.id));
+            const show = !r || rowMatchesFilters(r);
+            tr.classList.toggle('vs-row-hidden', !show);
+            // Stripe by visible index: nth-child would keep counting the rows a
+            // filter has hidden and produce two same-tone rows side by side.
+            if (show) tr.classList.toggle('vs-zebra', visible % 2 === 1);
+            if (show) visible++;
+        });
+        const chips = el('vs_chips');
+        chips.classList.toggle('vs-filtering', state.filters.size > 0);
+        chips.querySelectorAll('.vs-chip').forEach(b =>
+            b.setAttribute('aria-pressed', state.filters.has(b.dataset.filter) ? 'true' : 'false'));
+        const hint = el('vs_filter_hint');
+        if (state.filters.size) {
+            hint.innerHTML = `&mdash; Showing ${visible} of ${state.rows.size} &middot; ` +
+                `<button type="button" id="vs_filter_clear" class="text-journal-gold hover:underline">Clear filter</button>`;
+            el('vs_filter_clear').addEventListener('click', () => { state.filters.clear(); applyFilters(); });
+        } else {
+            hint.textContent = state.rows.size ? `\u2014 Showing all ${state.rows.size} rows` : '';
+        }
+        if (state.rows.size && !visible) {
+            emptyMsg.textContent = 'No rows match the selected filters.';
+            emptyMsg.classList.remove('hidden');
+        } else if (state.rows.size) {
+            emptyMsg.classList.add('hidden');
+        }
+    }
+    el('vs_chips').addEventListener('click', (e) => {
+        const chip = e.target.closest('.vs-chip');
+        if (!chip) return;
+        const f = chip.dataset.filter;
+        if (state.filters.has(f)) state.filters.delete(f); else state.filters.add(f);
+        applyFilters();
+    });
+
     function renderRow(r) {
         const id = r.observation_id;
         let tr = rowsBody.querySelector(`tr[data-id="${id}"]`);
@@ -322,21 +574,21 @@
             tr.dataset.id = id;
             rowsBody.appendChild(tr);
         }
-        tr.className = rowClass(r) + ' align-top';
+        tr.className = rowClass(r);
         const canSelect = r.action === 'update' && r.detected_voucher;
         if (canSelect && !state.rows.has(id)) state.selected.add(id);
         if (!canSelect) state.selected.delete(id);
         tr.innerHTML = `
-            <td class="px-3 py-2">${canSelect ? `<input type="checkbox" class="vs-pick accent-journal-gold" data-id="${id}" ${state.selected.has(id) ? 'checked' : ''}>` : ''}</td>
-            <td class="px-3 py-2 whitespace-nowrap"><a href="${esc(r.url)}" target="_blank" rel="noopener" class="text-journal-dark dark:text-journal-gold hover:underline font-mono">#${esc(id)}</a></td>
-            <td class="px-3 py-2 max-w-[14rem] truncate" title="${esc(r.taxon)}">${esc(r.taxon)}</td>
-            <td class="px-3 py-2 whitespace-nowrap">${esc(r.upload_date)}</td>
-            <td class="px-3 py-2 font-mono">${esc(r.detected_voucher || '')}</td>
-            <td class="px-3 py-2 font-mono">${esc(r.current_value || '')}</td>
-            <td class="px-3 py-2 font-semibold whitespace-nowrap">${esc(actionLabel(r))}</td>
-            <td class="px-3 py-2 text-xs text-gray-600 dark:text-gray-300" title="${esc(r.raw_ocr || r.raw_qr || '')}">${esc(r.reason)}</td>`;
+            <td class="vs-td">${canSelect ? `<input type="checkbox" class="vs-pick accent-journal-gold ml-1" data-id="${id}" ${state.selected.has(id) ? 'checked' : ''}>` : ''}</td>
+            <td class="vs-td vs-mono whitespace-nowrap"><a href="${esc(r.url)}" target="_blank" rel="noopener" class="hover:text-journal-gold hover:underline">#${esc(id)}</a></td>
+            <td class="vs-td truncate" title="${esc(r.taxon)}">${esc(r.taxon)}</td>
+            <td class="vs-td vs-mono vs-muted whitespace-nowrap">${esc(r.upload_date)}</td>
+            <td class="vs-td vs-mono whitespace-nowrap">${voucherCell(r)}</td>
+            <td class="vs-action">${esc(actionLabel(r))}</td>
+            <td class="vs-reason" title="${esc(r.reason)}${r.raw_ocr || r.raw_qr ? ' — ' + esc(r.raw_ocr || r.raw_qr) : ''}">${esc(r.reason)}</td>`;
         if (!state.rows.has(id)) state.order.push(id);
         state.rows.set(id, r);
+        tr.classList.toggle('vs-row-hidden', !rowMatchesFilters(r));
         emptyMsg.classList.add('hidden');
     }
     function updateChips() {
@@ -348,10 +600,25 @@
         }
         el('vs_chip_update').textContent = u; el('vs_chip_ocr').textContent = o;
         el('vs_chip_skip').textContent = s; el('vs_chip_flag').textContent = f;
-        const busy = !!state.polling;
-        btnApply.disabled = busy || u === 0 || !CONNECTED;
-        btnClear.disabled = busy || state.rows.size === 0;
-        if (state.runId && state.rows.size) {
+        applyFilters();
+        const busy = state.busy || !!state.polling;
+        // The pill counts what Apply would actually write - the selected Update
+        // rows - not the raw Update tally, so it tracks the checkboxes.
+        const selected = applyCounts().total;
+        el('vs_apply_count').textContent = selected;
+        btnApply.disabled = busy || selected === 0 || !CONNECTED;
+        btnApply.title = selected
+            ? `Write ${selected} voucher number(s) to iNaturalist`
+            : (u ? 'Nothing selected - tick the rows you want to write'
+                 : 'Nothing to write - 0 observations would be updated');
+        const hasRows = state.rows.size > 0;
+        btnClear.disabled = busy || !hasRows;
+        // A finished run reruns the same settings, so the verb changes.
+        // One button, two roles: it starts a run, and stops the one in flight.
+        btnPreview.textContent = busy ? 'Stop' : (hasRows ? 'Preview again' : 'Preview');
+        btnPreview.classList.toggle('vs-bar-stop', busy);
+        btnPreview.title = busy ? 'Stop the run in progress' : '';
+        if (state.runId && hasRows) {
             btnExport.href = `/api/voucher-sync/runs/${state.runId}/export.csv`;
             btnExport.classList.remove('opacity-50', 'pointer-events-none');
             btnExport.removeAttribute('aria-disabled');
@@ -361,15 +628,19 @@
             btnExport.setAttribute('aria-disabled', 'true');
         }
     }
+
     function setBusy(busy) {
-        btnPreview.disabled = busy || !CONNECTED;
-        btnStop.disabled = !busy;
+        state.busy = busy;
+        // Stays enabled while running - it is the Stop control then.
+        btnPreview.disabled = !CONNECTED;
         updateChips();
     }
     function clearResults() {
         state.rows.clear(); state.order = []; state.selected.clear();
         state.cursor = 0; state.logCursor = 0;
         rowsBody.innerHTML = ''; logBox.innerHTML = '';
+        state.filters.clear();
+        emptyMsg.innerHTML = 'No results yet. Choose a date and press <strong>Preview run</strong>.';
         emptyMsg.classList.remove('hidden');
         setProgress(0, 0);
         updateChips();
@@ -381,8 +652,10 @@
         const f = selectedFormat();
         const custom = f.value === 'Custom';
         el('vs_custom_regex_wrap').classList.toggle('hidden', !custom);
-        el('vs_format_hint').textContent = custom ? 'Case-insensitive Python regular expression, e.g. \\bBT-\\d{3}\\b'
-                                                  : `Examples: ${f.dataset.example}`;
+        const hint = el('vs_format_hint');
+        hint.textContent = custom ? 'regex' : (f.dataset.example || '').split(',')[0].trim();
+        hint.title = custom ? 'Case-insensitive Python regular expression' : `Examples: ${f.dataset.example}`;
+        if (custom) el('vs_custom_regex').focus();
     }
     document.querySelectorAll('input[name="vs_format"]').forEach(r => r.addEventListener('change', refreshFormatUI));
     refreshFormatUI();
@@ -391,10 +664,41 @@
         const range = document.querySelector('input[name="vs_date_mode"]:checked').value === 'range';
         el('vs_date_end').classList.toggle('hidden', !range);
         el('vs_date_to').classList.toggle('hidden', !range);
+        if (range && !el('vs_date_end').value) el('vs_date_end').value = el('vs_date_start').value;
     }
     document.querySelectorAll('input[name="vs_date_mode"]').forEach(r => r.addEventListener('change', refreshDateUI));
     refreshDateUI();
-    el('vs_date_start').value = new Date().toISOString().slice(0, 10);
+    const today = new Date().toISOString().slice(0, 10);
+    el('vs_date_start').value = today;
+
+    // Field ID pill <-> input
+    const fieldIdInput = el('vs_field_id'), fieldIdPill = el('vs_field_id_pill');
+    function syncFieldIdPill() { el('vs_field_id_text').textContent = fieldIdInput.value || '?'; }
+    function closeFieldIdEditor() {
+        if (!fieldIdInput.value || Number(fieldIdInput.value) < 1) fieldIdInput.value = '{{ default_field_id }}';
+        syncFieldIdPill();
+        fieldIdInput.classList.add('hidden');
+        fieldIdPill.classList.remove('hidden');
+    }
+    fieldIdPill.addEventListener('click', () => {
+        fieldIdPill.classList.add('hidden');
+        fieldIdInput.classList.remove('hidden');
+        fieldIdInput.focus(); fieldIdInput.select();
+    });
+    fieldIdInput.addEventListener('blur', closeFieldIdEditor);
+    fieldIdInput.addEventListener('keydown', (e) => { if (e.key === 'Enter' || e.key === 'Escape') { e.preventDefault(); fieldIdInput.blur(); } });
+
+    // Reset the card to its defaults
+    el('vs_reset').addEventListener('click', () => {
+        el('vs_field_name').value = '{{ default_field_name }}';
+        fieldIdInput.value = '{{ default_field_id }}'; syncFieldIdPill();
+        document.querySelector('input[name="vs_format"][value="{{ default_format }}"]').checked = true;
+        el('vs_custom_regex').value = '';
+        document.querySelector('input[name="vs_date_mode"][value="single"]').checked = true;
+        el('vs_date_start').value = today; el('vs_date_end').value = '';
+        el('vs_overwrite').checked = false; el('vs_use_ocr').checked = true;
+        refreshFormatUI(); refreshDateUI();
+    });
 
     // Observation field typeahead
     let fieldTimer = null;
@@ -412,7 +716,7 @@
                 li.className = 'px-3 py-2 cursor-pointer hover:bg-gray-100 dark:hover:bg-journal-green';
                 li.innerHTML = `${esc(f.name)} <span class="text-xs text-gray-400 font-mono">#${esc(f.id)}</span>`;
                 li.addEventListener('mousedown', () => {
-                    fieldInput.value = f.name; el('vs_field_id').value = f.id; suggest.classList.add('hidden');
+                    fieldInput.value = f.name; el('vs_field_id').value = f.id; syncFieldIdPill(); suggest.classList.add('hidden');
                 });
                 suggest.appendChild(li);
             });
@@ -430,7 +734,7 @@
         const { ok, status, data } = await api(`/api/voucher-sync/runs/${runId}?cursor=${state.cursor}&log_cursor=${state.logCursor}`);
         if (!ok) {
             log(`ERROR: could not read run status (HTTP ${status}).`);
-            setStatus('Lost contact with the run.');
+            setStatus('Lost contact with the run.', 'error');
             stopPolling();
             return;
         }
@@ -446,26 +750,28 @@
 
         const active = data.status === 'queued' || data.status === 'running';
         if (active) {
-            setStatus(data.status === 'queued' ? 'Waiting for a worker...' : (data.kind === 'apply' ? 'Applying updates...' : 'Scanning photos...'));
+            setStatus(data.status === 'queued' ? 'Waiting for a worker...' : (data.kind === 'apply' ? 'Applying updates...' : 'Scanning photos...'), 'busy');
             state.polling = setTimeout(() => pollOnce(runId), POLL_MS);
             return;
         }
         // Terminal state.
         state.polling = null;
         if (data.status === 'failed') {
-            setStatus('Run failed.');
+            setStatus('Run failed.', 'error');
             showStatus(data.error || 'The run failed.', 'error');
         } else if (data.kind === 'apply') {
             const s = data.summary || {};
-            setStatus(`${data.status === 'cancelled' ? 'Apply stopped' : 'Apply complete'}: ${s.applied || 0} written, ${s.failed || 0} failed.`);
+            setStatus(data.status === 'cancelled' ? 'Apply stopped' : 'Apply complete',
+                      s.failed ? 'error' : 'ok',
+                      `${s.applied || 0} written${s.failed ? `, ${s.failed} failed` : ''}`);
             showStatus(`Applied ${s.applied || 0} update(s)${s.failed ? `, ${s.failed} failed` : ''}.`, s.failed ? 'error' : 'success');
             state.applyRunId = null;
             // Re-read the preview so applied rows show their final state.
             await reloadPreview(state.runId);
         } else {
             const s = data.summary || {};
-            setStatus(data.status === 'cancelled' ? `Preview stopped - ${state.rows.size} scanned.` :
-                      `Preview complete: ${s.update || 0} to update, ${s.skip || 0} to skip, ${s.flag || 0} flagged.`);
+            setStatus(data.status === 'cancelled' ? 'Preview stopped' : 'Preview complete', 'ok',
+                      'just now \u00b7 nothing written yet');
         }
         setBusy(false);
     }
@@ -488,7 +794,21 @@
     }
 
     // ---------- actions ----------
+    async function cancelRun() {
+        const id = state.kind === 'apply' ? state.applyRunId : state.runId;
+        if (!id) return;
+        btnPreview.disabled = true;          // re-enabled by setBusy on the terminal poll
+        const { ok, data } = await api(`/api/voucher-sync/runs/${id}/cancel`, { method: 'POST', body: '{}' });
+        if (!ok) {
+            showStatus(data.error || 'Could not stop the run.', 'error');
+            btnPreview.disabled = !CONNECTED;
+        } else {
+            setStatus('Stopping...', 'busy');
+        }
+    }
+
     btnPreview.addEventListener('click', async () => {
+        if (state.busy || state.polling) { cancelRun(); return; }
         const f = selectedFormat();
         const range = document.querySelector('input[name="vs_date_mode"]:checked').value === 'range';
         const body = {
@@ -503,7 +823,7 @@
         };
         if (!body.date_start) { showStatus('Choose an upload date first.', 'error'); return; }
         clearResults();
-        setStatus('Queueing scan...');
+        setStatus('Queueing scan...', 'busy');
         const { ok, status, data } = await api('/api/voucher-sync/scan', { method: 'POST', body: JSON.stringify(body) });
         if (!ok) {
             if (status === 409 && data.active_run_id) { startPolling(data.active_run_id, 'scan'); return; }
@@ -514,15 +834,6 @@
         startPolling(data.run_id, 'scan');
     });
 
-    btnStop.addEventListener('click', async () => {
-        const id = state.kind === 'apply' ? state.applyRunId : state.runId;
-        if (!id) return;
-        btnStop.disabled = true;
-        const { ok, data } = await api(`/api/voucher-sync/runs/${id}/cancel`, { method: 'POST', body: '{}' });
-        if (!ok) showStatus(data.error || 'Could not stop the run.', 'error');
-        else setStatus('Stopping...');
-    });
-
     btnClear.addEventListener('click', () => { clearResults(); state.runId = null; setStatus('Ready.'); });
 
     rowsBody.addEventListener('change', (e) => {
@@ -531,7 +842,7 @@
         if (e.target.checked) state.selected.add(id); else state.selected.delete(id);
     });
     el('vs_select_all').addEventListener('change', (e) => {
-        rowsBody.querySelectorAll('.vs-pick').forEach(cb => {
+        rowsBody.querySelectorAll('tr:not(.vs-row-hidden) .vs-pick').forEach(cb => {
             cb.checked = e.target.checked;
             const id = Number(cb.dataset.id);
             if (cb.checked) state.selected.add(id); else state.selected.delete(id);
@@ -566,7 +877,7 @@
         el('vs_apply_modal').classList.add('hidden');
         const c = applyCounts();
         const body = { observation_ids: Array.from(state.selected), confirm_overwrite: c.overwrite > 0 };
-        setStatus('Queueing apply...');
+        setStatus('Queueing apply...', 'busy');
         const { ok, status, data } = await api(`/api/voucher-sync/runs/${state.runId}/apply`, { method: 'POST', body: JSON.stringify(body) });
         if (!ok) {
             showStatus(data.error === 'confirm_overwrite_required' ? 'Overwrite confirmation required.' : (data.error || `Could not start apply (HTTP ${status}).`), 'error');
@@ -603,7 +914,8 @@
                 state.runId = scan.id;
                 await reloadPreview(scan.id);
                 const s = scan.summary || {};
-                setStatus(`Last preview (${scan.created_at.slice(0, 16).replace('T', ' ')} UTC): ${s.update || 0} to update, ${s.skip || 0} to skip, ${s.flag || 0} flagged.`);
+                setStatus('Preview complete', 'ok',
+                          `${relativeTime(scan.created_at)} \u00b7 ${scan.created_at.slice(11, 16)} UTC`);
                 setProgress(scan.progress_done || 0, scan.progress_total || 0);
             }
         }
