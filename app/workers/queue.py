@@ -4,6 +4,8 @@ import logging
 import redis
 from redis.exceptions import LockError
 from rq import Queue, Retry
+from rq.exceptions import NoSuchJobError
+from rq.job import Job as RqJob
 from flask import current_app
 from typing import Any, Dict, Optional
 
@@ -264,10 +266,9 @@ def active_recompute_snapshot_mtime(job_id: str):
 def get_job_status(job_id: str) -> Dict[str, Any]:
     """Return a dict with at least: id, status, error (optional), progress (optional)."""
     try:
-        q = get_queue()
-        job = q.fetch_job(job_id)
-        
-        if job is None:
+        try:
+            job = RqJob.fetch(job_id, connection=get_redis_connection())
+        except NoSuchJobError:
             return {"id": job_id, "status": "unknown", "error": "Job not found"}
         
         status = job.get_status()
@@ -283,12 +284,15 @@ def get_job_status(job_id: str) -> Dict[str, Any]:
             "ended_at": job.ended_at.isoformat() if job.ended_at else None,
         }
         
-        if status == "failed" and job.exc_info:
-            response["error"] = job.exc_info
+        if status == "failed":
+            # exc_info is a complete traceback and can contain paths, source
+            # names, submitted sequences, and secrets. Detailed diagnostics
+            # remain in server-side logs and the persisted job metrics.
+            response["error"] = "Job failed"
             
         # RQ stores a Retry marker as the result while a job waits to be
         # scheduled again. It is internal state and cannot be JSON encoded.
-        if result and not isinstance(result, Retry):
+        if status != "failed" and result and not isinstance(result, Retry):
             response["result"] = result
             
         return response
@@ -300,4 +304,4 @@ def get_job_status(job_id: str) -> Dict[str, Any]:
             "RQ status lookup failed; returning the existing error response",
             job_id=job_id, exception=type(e).__name__,
         )
-        return {"id": job_id, "status": "error", "error": str(e)}
+        return {"id": job_id, "status": "error", "error": "Job status unavailable"}

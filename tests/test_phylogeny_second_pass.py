@@ -13,6 +13,7 @@ from Bio.SeqRecord import SeqRecord
 
 from app.models import AlignmentParams, JobParams, TreeBuilderParams
 from app.services import alignment_service, tree_builder_service, trimming_service
+from app.services.tree_parameter_validation import validate_iqtree_ufboot_count
 
 
 LOGGER = logging.getLogger("tests.phylogeny_second_pass")
@@ -48,6 +49,11 @@ def _config(**overrides):
 def _write_alignment(path):
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(">A\nACGTACGT\n>B\nACGTACGA\n")
+
+
+def _write_amino_acid_alignment(path):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(">A\nMPEPTIDE\n>B\nMPEPTIDQ\n")
 
 
 def test_alignment_and_trimming_services_have_no_unbounded_external_call_sites():
@@ -265,7 +271,7 @@ def _split(tree):
 
 @pytest.mark.parametrize(
     ("bootstrap", "alrt"),
-    [(1000, 1000), (1000, 0), (0, 1000), (0, 0)],
+    [(2000, 1000), (1000, 0), (1000.0, 0), (0, 1000), (0, 0)],
 )
 def test_iqtree_primary_is_always_ml_tree(tmp_path, monkeypatch, bootstrap, alrt):
     alignment = tmp_path / "alignment" / "alignment.fasta"
@@ -303,7 +309,48 @@ def test_iqtree_primary_is_always_ml_tree(tmp_path, monkeypatch, bootstrap, alrt
     assert frozenset({"A", "B"}) in _split(delivered)
     assert frozenset({"A", "C"}) not in _split(delivered)
     assert ("-B" in commands[0]) is (bootstrap > 0)
+    if bootstrap > 0:
+        assert commands[0][commands[0].index("-B") + 1] == str(int(bootstrap))
     assert ("-alrt" in commands[0]) is (alrt > 0)
+
+
+@pytest.mark.parametrize("bootstrap", [1, 999, "many", 1000.5])
+def test_iqtree_rejects_invalid_ufboot_before_command_construction(
+    tmp_path, monkeypatch, bootstrap
+):
+    called = []
+    monkeypatch.setattr(
+        tree_builder_service, "run_command", lambda *args, **kwargs: called.append(args)
+    )
+    with pytest.raises(ValueError, match="integer|at least 1000"):
+        tree_builder_service._run_iqtree(
+            tmp_path / "alignment.fasta",
+            tmp_path / "tree.newick",
+            tmp_path / "tree.nexus",
+            TreeBuilderParams(method="iqtree", bootstrap=bootstrap),
+            _config(), LOGGER,
+        )
+    assert called == []
+
+
+@pytest.mark.parametrize(
+    ("bootstrap", "expected"),
+    [(0, 0), (1000, 1000), (2000, 2000), ("1000", 1000), (1000.0, 1000)],
+)
+def test_iqtree_ufboot_validator_returns_exact_integer(bootstrap, expected):
+    result = validate_iqtree_ufboot_count("iqtree", bootstrap)
+    assert result == expected
+    assert type(result) is int
+
+
+@pytest.mark.parametrize("bootstrap", [1, 999, "many", 1000.5])
+def test_iqtree_ufboot_validator_rejects_invalid_counts(bootstrap):
+    with pytest.raises(ValueError, match="integer|at least 1000"):
+        validate_iqtree_ufboot_count("iqtree", bootstrap)
+
+
+def test_iqtree_ufboot_validator_does_not_change_raxml_semantics():
+    assert validate_iqtree_ufboot_count("raxml", 999.5) == 999.5
 
 
 def test_iqtree_missing_ml_tree_is_not_replaced_by_consensus(tmp_path, monkeypatch):
@@ -556,11 +603,17 @@ def test_raxml_applied_outgroup_records_actual_rooting_outcome(
 
 
 @pytest.mark.parametrize(
-    ("selected_model", "moose_applied"),
-    [(None, False), ("HKY+G", True)],
+    ("requested_model", "selected_model", "moose_supported", "moose_applied", "expected_model"),
+    [
+        ("GTR+G", None, True, False, "GTR+G"),
+        ("NOT_A_MODEL", None, True, False, "GTR+G"),
+        ("GTR+G", "HKY+G", True, True, "HKY+G"),
+        ("GTR{1/2/3/4/5/6}+G", None, False, False, "GTR{1/2/3/4/5/6}+G"),
+    ],
 )
 def test_raxml_applied_moose_records_actual_selection_outcome(
-    tmp_path, monkeypatch, selected_model, moose_applied
+    tmp_path, monkeypatch, requested_model, selected_model, moose_supported,
+    moose_applied, expected_model
 ):
     alignment = tmp_path / "alignment" / "alignment.fasta"
     output = tmp_path / "tree" / "tree_original.newick"
@@ -570,7 +623,7 @@ def test_raxml_applied_moose_records_actual_selection_outcome(
 
     monkeypatch.setattr(
         tree_builder_service, "_check_raxml_feature",
-        lambda _config, flag: flag == "--moose",
+        lambda _config, flag: moose_supported and flag == "--moose",
     )
     monkeypatch.setattr(
         tree_builder_service, "_run_moose",
@@ -588,7 +641,7 @@ def test_raxml_applied_moose_records_actual_selection_outcome(
         output,
         nexus,
         TreeBuilderParams(
-            method="raxml", model="GTR+G", enable_bootstrap=False,
+            method="raxml", model=requested_model, enable_bootstrap=False,
             moose_enabled=True,
         ),
         _config(),
@@ -598,4 +651,63 @@ def test_raxml_applied_moose_records_actual_selection_outcome(
     assert metadata["parameters_requested"]["moose_enabled"] is True
     assert metadata["parameters_applied"]["moose_enabled"] is moose_applied
     assert (selector == "MOOSE") is moose_applied
-    assert effective == (selected_model or "GTR+G")
+    assert metadata["parameters_requested"]["model"] == requested_model
+    assert metadata["parameters_applied"]["model"] == expected_model
+    assert effective == expected_model
+
+
+@pytest.mark.parametrize(
+    ("requested_model", "moose_supported", "expected_model"),
+    [
+        ("WAG+G", False, "WAG+G"),
+        ("WAG+G", True, "WAG+G"),
+        ("", False, "LG+G"),
+        ("", True, "LG+G"),
+    ],
+)
+def test_raxml_aa_moose_failure_retains_validated_fallback(
+    tmp_path, monkeypatch, requested_model, moose_supported, expected_model
+):
+    alignment = tmp_path / "alignment" / "alignment.fasta"
+    output = tmp_path / "tree" / "tree_original.newick"
+    nexus = tmp_path / "tree" / "tree_original.nexus"
+    _write_amino_acid_alignment(alignment)
+    output.parent.mkdir()
+
+    monkeypatch.setattr(
+        tree_builder_service,
+        "_check_raxml_feature",
+        lambda _config, flag: moose_supported and flag == "--moose",
+    )
+    monkeypatch.setattr(
+        tree_builder_service,
+        "_run_moose",
+        lambda alignment_path, *args: (None, alignment_path),
+    )
+
+    def fake_run(cmd, **kwargs):
+        prefix = cmd[cmd.index("--prefix") + 1]
+        Path(prefix + ".raxml.bestTree").write_text("(SEQ1:0.1,SEQ2:0.1);\n")
+        return 0, "", ""
+
+    monkeypatch.setattr(tree_builder_service, "run_command", fake_run)
+    effective, selector, metadata = tree_builder_service._run_raxml(
+        alignment,
+        output,
+        nexus,
+        TreeBuilderParams(
+            method="raxml",
+            model=requested_model,
+            enable_bootstrap=False,
+            moose_enabled=True,
+        ),
+        _config(),
+        LOGGER,
+    )
+
+    assert selector is None
+    assert effective == expected_model
+    assert metadata["data_type"] == "AA"
+    assert metadata["parameters_requested"]["model"] == requested_model
+    assert metadata["parameters_applied"]["model"] == expected_model
+    assert metadata["parameters_applied"]["moose_enabled"] is False

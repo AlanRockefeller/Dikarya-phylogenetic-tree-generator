@@ -35,6 +35,7 @@ from app.extensions import db, limiter
 from app.models import ApiToken, Job
 from app.services.artifact_storage import read_artifact_bytes
 from app.services.security_utils import validate_safe_file_path, coerce_bool
+from app.services.tree_parameter_validation import validate_iqtree_ufboot_count
 from app.services.tree_edit_service import (
     MAX_TREE_TIP_NAME_LENGTH,
     NEWICK_UNSAFE_TIP_CHARS,
@@ -407,8 +408,20 @@ def create_job():
     if err: return err
 
     # Clamped integers.
+    try:
+        requested_bootstrap = data.get("bootstrap")
+        if requested_bootstrap is None:
+            requested_bootstrap = DEFAULT_BOOTSTRAP
+        requested_bootstrap = validate_iqtree_ufboot_count(
+            tree_method, requested_bootstrap
+        )
+    except ValueError as exc:
+        return error_response(
+            code="validation_failed", message=str(exc), status=422,
+            details={"field": "bootstrap", "value": data.get("bootstrap")},
+        )
     bootstrap, err = _validate_clamped_int(
-        "bootstrap", data.get("bootstrap"), default=DEFAULT_BOOTSTRAP)
+        "bootstrap", requested_bootstrap, default=DEFAULT_BOOTSTRAP)
     if err: return err
     # IQ-TREE SH-aLRT replicates; defaults to Config.DEFAULT_IQTREE_ALRT so API
     # callers get the same UFBoot + SH-aLRT pairing as the web form. 0 disables it.
@@ -995,8 +1008,7 @@ def recompute_job(job_id):
             v, err = _validate_bool("fix_orientation", body["fix_orientation"])
             if err: return err
             overrides["fix_orientation"] = v
-        for field, default in (("bootstrap", 1000),
-                               ("alrt_replicates", Config.DEFAULT_IQTREE_ALRT),
+        for field, default in (("alrt_replicates", Config.DEFAULT_IQTREE_ALRT),
                                ("mcmc_generations", Config.DEFAULT_MCMC_GENERATIONS),
                                ("mcmc_nruns", Config.DEFAULT_MCMC_NRNS),
                                ("mcmc_nchains", Config.DEFAULT_MCMC_CHAINS)):
@@ -1004,6 +1016,11 @@ def recompute_job(job_id):
                 v, err = _validate_clamped_int(field, body[field], default=default)
                 if err: return err
                 overrides[field] = v
+        if "bootstrap" in body:
+            # The effective tree method is resolved after all overrides merge;
+            # preserve the raw value until the IQ-TREE-specific validator sees
+            # it so a fractional count cannot be truncated by int().
+            overrides["bootstrap"] = body["bootstrap"]
         if "mcmc_burnin_fraction" in body:
             v, err = _validate_fraction(
                 "mcmc_burnin_fraction", body["mcmc_burnin_fraction"],
@@ -1036,6 +1053,20 @@ def recompute_job(job_id):
             overrides["notes"] = v
 
         params.update(overrides)
+        try:
+            requested_bootstrap = validate_iqtree_ufboot_count(
+                params.get("tree_method"), params.get("bootstrap", DEFAULT_BOOTSTRAP)
+            )
+        except ValueError as exc:
+            return error_response(
+                code="validation_failed", message=str(exc), status=422,
+                details={"field": "bootstrap", "value": params.get("bootstrap")},
+            )
+        bootstrap, err = _validate_clamped_int(
+            "bootstrap", requested_bootstrap, default=DEFAULT_BOOTSTRAP
+        )
+        if err: return err
+        params["bootstrap"] = bootstrap
         # Always async for the public API. At most one recompute is active per
         # job, so a request that carries overrides while another generation is
         # already running cannot be answered as an idempotent duplicate: the

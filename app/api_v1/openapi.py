@@ -177,7 +177,13 @@ def _schemas():
                         "missing coverage."
                     ),
                 },
-                "bootstrap": {"type": "integer", "minimum": 0, "maximum": 10000},
+                "bootstrap": {
+                    "type": "integer", "minimum": 0, "maximum": 10000,
+                    "description": (
+                        "Support replicates. For IQ-TREE UFBoot, use 0 to disable "
+                        "or at least 1000; values 1-999 are invalid."
+                    ),
+                },
                 "alrt_replicates": {
                     "type": "integer", "minimum": 0, "maximum": 10000,
                     "description": "IQ-TREE SH-aLRT replicates. 0 reports UFBoot only.",
@@ -303,8 +309,14 @@ def _schemas():
                         "naming what chose it. Pass an explicit model name to fix it."
                     ),
                 },
-                "bootstrap": {"type": "integer", "minimum": 0, "maximum": 10000,
-                              "default": DEFAULT_BOOTSTRAP},
+                "bootstrap": {
+                    "type": "integer", "minimum": 0, "maximum": 10000,
+                    "default": DEFAULT_BOOTSTRAP,
+                    "description": (
+                        "Support replicates. For IQ-TREE UFBoot, use 0 to disable "
+                        "or at least 1000; values 1-999 are invalid."
+                    ),
+                },
                 "alrt_replicates": {
                     "type": "integer", "minimum": 0, "maximum": 10000,
                     "default": DEFAULT_IQTREE_ALRT,

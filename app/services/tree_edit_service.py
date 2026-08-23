@@ -580,6 +580,19 @@ def prune_taxa(job_dir: Path, tree_json: Dict, taxa_names: List[str]) -> Dict:
                     matched_targets.add(matched_stable_id)
 
         unresolved_targets = targets - matched_targets - previously_pruned
+
+        # Resolve the complete descendant union before touching either the tree
+        # or its persisted/display state. Overlapping internal/terminal targets
+        # count each tip once. A one-tip survivor is valid; an empty tree is not.
+        terminals = set(tree.get_terminals())
+        terminals_to_remove = {
+            terminal
+            for clade in to_prune
+            for terminal in clade.get_terminals()
+        }
+        if terminals and not (terminals - terminals_to_remove):
+            raise ValueError("Cannot prune every remaining taxon from the tree.")
+
         tree_json.pop("prune_unresolved", None)
         if unresolved_targets:
             # A bulk prune can carry a stale name alongside many valid ones, so

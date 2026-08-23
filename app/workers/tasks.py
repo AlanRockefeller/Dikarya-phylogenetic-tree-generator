@@ -26,6 +26,7 @@ from app.services.log_context import (
     JobContextFilter, background_job_context, bind_background_context,
     stable_fingerprint,
 )
+from app.services.tree_parameter_validation import validate_iqtree_ufboot_count
 from app.workers.events import (
     STEP_INPUT, STEP_ORIENT, STEP_BLAST, STEP_ITS, STEP_ALIGN, STEP_TRIM, STEP_TREE, STEP_POST,
     STATE_QUEUED, STATE_RUNNING, STATE_DONE, STATE_SKIPPED, STATE_FAILED,
@@ -1550,7 +1551,11 @@ def run_phylo_job(job_params: dict) -> dict:
                 tree_model = job_params.get("tree_model") or Config.DEFAULT_IQTREE_MODEL
             else:
                 tree_model = job_params.get("tree_model") or Config.DEFAULT_ML_MODEL
-            bootstrap = int(job_params.get("bootstrap", Config.DEFAULT_BOOTSTRAPS))
+            bootstrap = validate_iqtree_ufboot_count(
+                tree_method,
+                job_params.get("bootstrap", Config.DEFAULT_BOOTSTRAPS),
+            )
+            bootstrap = int(bootstrap)
             mcmc_gens = int(job_params.get("mcmc_generations", Config.DEFAULT_MCMC_GENERATIONS))
             mcmc_runs = int(job_params.get("mcmc_nruns", Config.DEFAULT_MCMC_NRNS))
             mcmc_chains = int(job_params.get("mcmc_nchains", Config.DEFAULT_MCMC_CHAINS))

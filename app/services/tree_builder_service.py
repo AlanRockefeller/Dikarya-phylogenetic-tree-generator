@@ -32,6 +32,7 @@ from app.services.subprocess_utils import (
     tool_failure_message,
 )
 from app.services.fasta_utils import sanitize_fasta_headers, restore_tree_names
+from app.services.tree_parameter_validation import validate_iqtree_ufboot_count
 from app.services.tree_io import (
     newick_file_to_nexus,
     write_tree_file,
@@ -124,6 +125,7 @@ def run_tree_builder(
         Metadata dict with method, model, etc.
     """
     method = params.method.lower()
+    params.bootstrap = validate_iqtree_ufboot_count(method, params.bootstrap)
     task_logger.info(f"Starting tree building with method: {method}")
     
     # `model` and `bootstrap` describe what the user asked for. Anything a
@@ -1096,6 +1098,7 @@ def _run_iqtree(
     job_id: Optional[str] = None
 ):
     """Run IQ-TREE maximum likelihood tree inference."""
+    bootstrap = validate_iqtree_ufboot_count("iqtree", params.bootstrap)
     prefix = str(output_newick.parent / "iqtree_run")
     threads = _get_thread_count(params)
     
@@ -1116,8 +1119,8 @@ def _run_iqtree(
         "-redo"
     ]
 
-    if params.bootstrap and params.bootstrap > 0:
-        cmd.extend(["-B", str(params.bootstrap)])
+    if bootstrap > 0:
+        cmd.extend(["-B", str(bootstrap)])
 
     # SH-aLRT branch test. With both -alrt and -B, IQ-TREE writes dual
     # "SH-aLRT/UFBoot" labels (e.g. "82.7/87") into <prefix>.treefile.

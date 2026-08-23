@@ -155,6 +155,26 @@ class CreateOrderingTests(unittest.TestCase):
         self.assertNotIn("enqueue", events)
         self.assertIn("rollback", events)
 
+    def test_invalid_iqtree_ufboot_is_rejected_before_persistence(self):
+        for bootstrap, message in (
+            (999, "at least 1000"),
+            ("many", "integer"),
+            (1000.5, "integer"),
+        ):
+            with self.subTest(bootstrap=bootstrap):
+                response, events, created, db = _call_create({
+                    "input_type": "pasted_sequence",
+                    "sequence": FASTA,
+                    "tree_method": "iqtree",
+                    "bootstrap": bootstrap,
+                })
+
+                self.assertEqual(response.status_code, 422)
+                self.assertIn(message, response.get_json()["error"]["message"])
+                self.assertEqual(events, [])
+                self.assertEqual(created, {})
+                self.assertEqual(db.added, [])
+
 
 # ---------------------------------------------------------------------------
 # CodeRabbit #17 -- reject unsupported input_type synchronously

@@ -3,6 +3,7 @@
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import pytest
 from flask import Flask, g
 
 from app.api import routes
@@ -40,7 +41,8 @@ class RecordingDb:
             raise RuntimeError("database unavailable")
 
 
-def _submit(*, fail_commits=(), enqueue_error=None, prepare_warning=False):
+def _submit(*, fail_commits=(), enqueue_error=None, prepare_warning=False,
+            tree_method="nj", bootstrap=1000):
     events = []
     database = RecordingDb(events, fail_commits=fail_commits)
     queued = {}
@@ -66,7 +68,8 @@ def _submit(*, fail_commits=(), enqueue_error=None, prepare_warning=False):
         app.test_request_context(method="POST", json={
             "input_type": "sequence",
             "sequence": FASTA,
-            "tree_method": "nj",
+            "tree_method": tree_method,
+            "bootstrap": bootstrap,
         }),
         patch.object(routes, "db", database),
         patch.object(routes, "Job", side_effect=make_job),
@@ -123,3 +126,21 @@ def test_web_submission_keeps_the_default_high_priority_queue():
 
     # No queue override means enqueue_job's established phylo_high default.
     assert "queue_name" not in queued
+
+
+@pytest.mark.parametrize(
+    ("bootstrap", "message"),
+    [(999, "at least 1000"), ("many", "integer"), (1000.5, "integer")],
+)
+def test_web_submission_rejects_invalid_iqtree_ufboot_before_persistence(
+    bootstrap, message
+):
+    response, events, database, queued = _submit(
+        tree_method="iqtree", bootstrap=bootstrap
+    )
+
+    assert response.status_code == 400
+    assert message in response.get_json()["error"]
+    assert events == []
+    assert database.added == []
+    assert queued == {}

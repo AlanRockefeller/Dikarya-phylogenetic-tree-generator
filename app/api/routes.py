@@ -21,6 +21,7 @@ from difflib import SequenceMatcher
 from datetime import datetime
 
 from app.services.security_utils import validate_job_id, validate_safe_file_path, coerce_bool
+from app.services.tree_parameter_validation import validate_iqtree_ufboot_count
 from app.services.artifact_storage import (
     artifact_exists,
     open_artifact,
@@ -2454,7 +2455,16 @@ def create_job():
             return default
         return max(lo, min(hi, n))
 
-    job_params["bootstrap"] = _clamp_int(job_params.get("bootstrap"), 1000, 0, 10_000)
+    try:
+        requested_bootstrap = job_params.get("bootstrap")
+        if requested_bootstrap is None:
+            requested_bootstrap = 1000
+        requested_bootstrap = validate_iqtree_ufboot_count(
+            tree_method, requested_bootstrap
+        )
+    except ValueError as exc:
+        return jsonify({"status": "error", "error": str(exc)}), 400
+    job_params["bootstrap"] = _clamp_int(requested_bootstrap, 1000, 0, 10_000)
     job_params["mcmc_generations"] = _clamp_int(
         job_params.get("mcmc_generations"),
         Config.DEFAULT_MCMC_GENERATIONS, 1_000, 100_000_000
@@ -3328,6 +3338,12 @@ def recompute_tree_job(job_id):
                     "error": f"Unsupported tree method. Choose one of: {', '.join(sorted(VALID_TREE_METHODS))}"
                 }), 400
             params_dict.update(overrides)
+        try:
+            params_dict["bootstrap"] = validate_iqtree_ufboot_count(
+                params_dict.get("tree_method"), params_dict.get("bootstrap", 1000)
+            )
+        except ValueError as exc:
+            return jsonify({"status": "error", "error": str(exc)}), 400
         persisted_params = dict(params_dict)
 
         # Per-request control flags, not pipeline settings. Applied after the
