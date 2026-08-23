@@ -241,7 +241,7 @@ def run_worker_with_heartbeat(app):
             logger.exception("Startup job reconciliation skipped")
 
         conn = get_redis_connection()
-        queues = [get_queue("phylo_high"), get_queue("phylo_bulk")]
+        queues = [get_queue("phylo_high"), get_queue("phylo_bulk"), get_queue("voucher_sync")]
         # RQ must first expire and clean an abandoned StartedJobRegistry entry
         # before reconciliation has positive AbandonedJobError evidence. A
         # short default bounds restart recovery latency without guessing from

@@ -44,7 +44,7 @@ class TestWorkerScheduler(unittest.TestCase):
         ):
             worker_monitor.run_worker_with_heartbeat(FakeApp())
 
-        self.assertEqual(FakeWorker.instance.queues, ["phylo_high", "phylo_bulk"])
+        self.assertEqual(FakeWorker.instance.queues, ["phylo_high", "phylo_bulk", "voucher_sync"])
         self.assertEqual(FakeWorker.instance.work_kwargs, {"with_scheduler": True})
         self.assertEqual(FakeWorker.instance.maintenance_interval, 120)
         self.assertTrue(FakeWorker.instance.cleaned_up)

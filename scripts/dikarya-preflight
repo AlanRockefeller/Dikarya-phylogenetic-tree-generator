@@ -32,9 +32,18 @@ if [ ! -x .venv/bin/python ]; then
     exit 1
 fi
 
+# Voucher Sync decodes photos in the worker. cv2 is lazy-imported so a broken
+# OpenCV/ONNX install would only surface as every scan row flagged
+# "cv2_not_installed"; check it here so the worker restart is informed.
+if .venv/bin/python -c "import cv2, rapidocr_onnxruntime" 2>/dev/null; then
+    echo "preflight: voucher sync OCR stack OK"
+else
+    echo "preflight: WARNING -- cv2/rapidocr_onnxruntime failed to import; Voucher Sync scans will flag every row (libgl1/libglib2.0-0 missing?)" >&2
+fi
+
 # Modules that must import cleanly for the app to serve or process a job. Add to
 # this list, do not replace it.
-if .venv/bin/python -c "import app.workers.tasks, app.workers.queue, app.api.routes, app.api_v1.routes, app.main.routes"; then
+if .venv/bin/python -c "import app.workers.tasks, app.workers.queue, app.api.routes, app.api_v1.routes, app.main.routes, app.workers.voucher_sync_tasks, app.services.voucher_sync_service, app.services.inat_user_credential_service, app.api.voucher_sync_routes"; then
     echo "preflight: imports OK"
 else
     echo "preflight: FAILED -- do not restart; the traceback above is what users would get as a 500" >&2

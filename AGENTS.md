@@ -196,12 +196,13 @@ flask jobs-in-flight    # exits 1 and lists them if any job is live
 
 **Agents usually cannot run that command.** It calls `create_app()`, which
 requires `SECRET_KEY` from `/etc/dikarya/dikarya.environment.live` — a root-only
-file. Use the equivalent Redis check instead; all four must print `0` before you
+file. Use the equivalent Redis check instead; all six must print `0` before you
 restart the worker:
 
 ```bash
-redis-cli LLEN rq:queue:phylo_high  ; redis-cli ZCARD rq:wip:phylo_high
-redis-cli LLEN rq:queue:phylo_bulk  ; redis-cli ZCARD rq:wip:phylo_bulk
+redis-cli LLEN rq:queue:phylo_high   ; redis-cli ZCARD rq:wip:phylo_high
+redis-cli LLEN rq:queue:phylo_bulk   ; redis-cli ZCARD rq:wip:phylo_bulk
+redis-cli LLEN rq:queue:voucher_sync ; redis-cli ZCARD rq:wip:voucher_sync
 ```
 
 `rq:queue:<name>` is the pending queue and `rq:wip:<name>` is RQ's
@@ -283,6 +284,41 @@ The tree viewer's **Analyze with Claude** button posts to
   nginx's `proxy_read_timeout 300`. The timeout chain (wrapper 240s < subprocess
   260s < nginx 300s) and the Redis concurrency ceiling are load-bearing. Do not
   remove them or raise the timeout past nginx.
+
+## Voucher Sync (`/voucher-sync`)
+
+Reads specimen voucher IDs (QR code, OCR fallback) from the last photo of a
+user's iNaturalist observations and writes them to an observation field. Ported
+from the desktop tool at https://github.com/bthorson1029/inat-voucher-sync.
+Rules that matter when editing it:
+
+- **Per-user iNaturalist grants, not the site-wide one.** `/tree/oauth/*` is
+  the single admin account that posts tree links. Voucher Sync writes to *each
+  user's own* observations, so every user connects their own account
+  (`/voucher-sync/oauth/connect`). Grants live in `inat_user_credential`,
+  Fernet-encrypted (`INAT_TOKEN_ENCRYPTION_KEY`, else derived from
+  `SECRET_KEY`) via `app/services/inat_user_credential_service.py`. Never read
+  the `*_enc` columns directly and never put a token in a job argument, RQ
+  description, JSON response or log line -- the worker loads it from the DB by
+  `run_id`.
+- **Runs are `voucher_sync_run` rows, not `Job` rows.** `Job` is the phylo
+  pipeline (job_dir, /user/jobs, SSE, reconcile). Live progress streams through
+  Redis lists (`voucher_sync:run:<id>:rows|log|cancel`) and the page polls
+  `GET /api/voucher-sync/runs/<id>?cursor=N` every 2 s -- deliberately no SSE,
+  which holds a Gunicorn slot per stream. Finished rows/summary are persisted
+  on the row so Apply re-reads the *server-held* preview; the browser only
+  sends observation ids and `confirm_overwrite`.
+- **Scans run on the shared RQ worker** (`voucher_sync` queue, listened to
+  last). OpenCV/RapidOCR are lazy-imported inside
+  `app/services/voucher_sync_service.py`, so the web process never loads them;
+  `scripts/dikarya-preflight` checks they import. `rapidocr-onnxruntime`
+  requires the *full* `opencv-python`, which needs `libgl1` and `libglib2.0-0`
+  on the host.
+- **Writes are gated.** Scans are locked to the connected iNat login; one
+  active run per user; Apply requires a finished preview, re-fetches any
+  overwrite target before the PUT, paces writes at
+  `VOUCHER_SYNC_WRITE_PAUSE_SECONDS`, and refuses overwrites unless
+  `confirm_overwrite` is set.
 
 ## Key Conventions & UI Patterns
 

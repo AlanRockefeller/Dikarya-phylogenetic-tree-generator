@@ -350,6 +350,7 @@ def create_app(config_name='default'):
     # all. It stays after _install_logging() so the import-time records it emits
     # already carry context; tasks.py no longer configures logging itself.
     from app.workers import tasks as _worker_tasks  # noqa: F401
+    from app.workers import voucher_sync_tasks as _voucher_tasks  # noqa: F401
 
     # Security headers. CSP is intentionally NOT set here because templates
     # use inline scripts that would need nonces, which is a bigger task. The

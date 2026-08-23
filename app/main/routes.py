@@ -2,7 +2,7 @@ from flask import (
     render_template, redirect, url_for, abort, request, current_app, flash,
     jsonify, session, send_from_directory, Response,
 )
-from flask_login import current_user
+from flask_login import current_user, login_required
 from jinja2 import TemplateNotFound
 from app.main import bp
 from app.services.security_utils import (
@@ -1076,3 +1076,112 @@ def todo_delete(suggestion_id):
     if return_status not in {'open', 'done', 'all'}:
         return_status = 'open'
     return redirect(url_for('main.todo', status=return_status))
+
+
+# ---------------------------------------------------------------------------
+# Voucher Sync  (/voucher-sync)
+#
+# Reads specimen voucher IDs from observation photos and writes them into an
+# observation field. Unlike the site-wide /tree/oauth flow above, every user
+# connects their *own* iNaturalist account; the grant is stored per user by
+# app/services/inat_user_credential_service.py. The JSON endpoints the page
+# talks to live in app/api/voucher_sync_routes.py.
+# ---------------------------------------------------------------------------
+
+def _voucher_sync_redirect_uri():
+    uri = (current_app.config.get("INAT_VOUCHER_OAUTH_REDIRECT_URI") or "").strip()
+    if uri:
+        return uri
+    # Fall back to this deployment's own callback URL. iNaturalist still has to
+    # have it registered on the OAuth app for the consent step to succeed.
+    return url_for("main.voucher_sync_oauth_callback", _external=True)
+
+
+@bp.route("/voucher-sync")
+@login_required
+def voucher_sync():
+    from app.services.inat_user_credential_service import credential_status
+    from app.services.voucher_sync_service import (
+        DEFAULT_FIELD_ID, DEFAULT_FIELD_NAME, DEFAULT_VOUCHER_FORMAT,
+        VOUCHER_FORMAT_EXAMPLES, VOUCHER_FORMATS,
+    )
+    return render_template(
+        "voucher_sync.html",
+        credential=credential_status(current_user.id),
+        voucher_formats=[{"name": n, "regex": r or "", "example": VOUCHER_FORMAT_EXAMPLES.get(n, "")}
+                         for n, r in VOUCHER_FORMATS],
+        default_format=DEFAULT_VOUCHER_FORMAT,
+        default_field_name=DEFAULT_FIELD_NAME,
+        default_field_id=DEFAULT_FIELD_ID,
+        oauth_configured=bool(current_app.config.get("INAT_CLIENT_ID")
+                              or current_app.config.get("INAT_CREDENTIALS_FILE")),
+    )
+
+
+@bp.route("/voucher-sync/oauth/connect")
+@login_required
+def voucher_sync_oauth_connect():
+    from flask import session
+    from app.services.inaturalist_oauth_service import (
+        InatAuthError, authorize_url, new_oauth_state,
+    )
+    try:
+        state = new_oauth_state()
+        session["inat_vs_oauth_state"] = state
+        return redirect(authorize_url(state, redirect_uri=_voucher_sync_redirect_uri()))
+    except InatAuthError as e:
+        flash(f"iNaturalist sign-in is not configured on this server: {e}", "error")
+        return redirect(url_for("main.voucher_sync"))
+
+
+@bp.route("/voucher-sync/oauth/callback")
+@login_required
+def voucher_sync_oauth_callback():
+    from flask import session
+    from app.services.inaturalist_oauth_service import (
+        InatAuthError, exchange_code, mint_api_jwt,
+    )
+    from app.services.inat_user_credential_service import upsert_credential
+    from app.services.voucher_sync_service import INatClient
+
+    expected_state = session.pop("inat_vs_oauth_state", None)
+    state = request.args.get("state")
+    code = request.args.get("code")
+    if not expected_state or not state or state != expected_state:
+        flash("iNaturalist sign-in state mismatch. Please try again.", "error")
+        return redirect(url_for("main.voucher_sync"))
+    if request.args.get("error"):
+        flash("iNaturalist sign-in was cancelled.", "error")
+        return redirect(url_for("main.voucher_sync"))
+    if not code:
+        flash("iNaturalist did not return an authorization code.", "error")
+        return redirect(url_for("main.voucher_sync"))
+    try:
+        payload = exchange_code(code, redirect_uri=_voucher_sync_redirect_uri())
+        jwt = mint_api_jwt(payload["access_token"])
+        me = INatClient(jwt).verify_token()
+        if not me or not me.get("login"):
+            raise InatAuthError("could not read your iNaturalist profile.")
+        upsert_credential(
+            current_user.id, payload["access_token"],
+            inat_login=me["login"], inat_user_id=me.get("id"),
+            scope=str(payload.get("scope") or ""), jwt=jwt,
+        )
+    except InatAuthError as e:
+        flash(f"iNaturalist sign-in failed: {e}", "error")
+        return redirect(url_for("main.voucher_sync"))
+    except Exception:
+        current_app.logger.exception("event=voucher_sync.oauth_callback_failed user=%s", current_user.id)
+        flash("iNaturalist sign-in failed. Please try again.", "error")
+        return redirect(url_for("main.voucher_sync"))
+    flash(f"Connected to iNaturalist as {me['login']}.", "success")
+    return redirect(url_for("main.voucher_sync"))
+
+
+@bp.route("/voucher-sync/oauth/disconnect", methods=["POST"])
+@login_required
+def voucher_sync_oauth_disconnect():
+    from app.services.inat_user_credential_service import clear_credential
+    clear_credential(current_user.id)
+    flash("Disconnected from iNaturalist.", "success")
+    return redirect(url_for("main.voucher_sync"))

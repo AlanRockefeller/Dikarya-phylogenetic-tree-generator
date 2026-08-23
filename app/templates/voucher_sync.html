@@ -1,0 +1,614 @@
+{% extends "base_modern.html" %}
+
+{% block title %}Voucher Sync - Dikarya{% endblock %}
+{% block description %}Read specimen voucher numbers from your iNaturalist photos and sync them to an observation field.{% endblock %}
+{% block subtitle %}Specimen Tools{% endblock %}
+{% block nav_voucher_sync %}text-journal-gold{% endblock %}
+
+{% block head %}
+<style>
+    .vs-row-update { background-color: rgb(220 252 231); }
+    .vs-row-ocr    { background-color: rgb(219 234 254); }
+    .vs-row-skip   { background-color: rgb(243 244 246); color: rgb(107 114 128); }
+    .vs-row-flag   { background-color: rgb(254 243 199); }
+    .vs-row-applied{ background-color: rgb(236 253 245); color: rgb(107 114 128); }
+    .dark .vs-row-update { background-color: rgb(20 83 45 / 0.45); }
+    .dark .vs-row-ocr    { background-color: rgb(30 58 138 / 0.45); }
+    .dark .vs-row-skip   { background-color: rgb(31 41 55 / 0.6); color: rgb(156 163 175); }
+    .dark .vs-row-flag   { background-color: rgb(120 53 15 / 0.45); }
+    .dark .vs-row-applied{ background-color: rgb(6 78 59 / 0.4); color: rgb(156 163 175); }
+    #vs_log { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 0.75rem; white-space: pre-wrap; }
+    .vs-chip { display: inline-flex; align-items: center; gap: .35rem; padding: .25rem .65rem; border-radius: 9999px; font-size: .75rem; font-weight: 600; }
+    .vs-switch { width: 2.75rem; height: 1.5rem; }
+    #vs_field_suggest { max-height: 14rem; overflow-y: auto; }
+</style>
+{% endblock %}
+
+{% block content %}
+<div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-8">
+    <div class="mb-6">
+        <h2 class="text-3xl font-bold text-journal-dark dark:text-white">Voucher Sync</h2>
+        <p class="mt-2 text-sm text-gray-600 dark:text-gray-300 max-w-3xl">
+            Photograph a printed voucher label (QR code + printed ID) as the <strong>last photo</strong> of each
+            observation. Voucher Sync reads the code from that photo and writes it into an observation field, so
+            voucher numbers never have to be typed by hand. Nothing is written to iNaturalist until you review the
+            preview and press <em>Apply updates</em>.
+        </p>
+    </div>
+
+    {% with messages = get_flashed_messages(with_categories=true) %}
+    {% if messages %}
+    <div class="mb-6 space-y-2">
+        {% for category, message in messages %}
+        <div class="rounded-lg px-4 py-3 text-sm {% if category == 'error' %}bg-red-50 text-red-800 border border-red-200 dark:bg-red-900/30 dark:text-red-200 dark:border-red-800{% else %}bg-green-50 text-green-800 border border-green-200 dark:bg-green-900/30 dark:text-green-200 dark:border-green-800{% endif %}">
+            {{ message }}
+        </div>
+        {% endfor %}
+    </div>
+    {% endif %}
+    {% endwith %}
+
+    <div class="grid gap-6 lg:grid-cols-[360px_minmax(0,1fr)]">
+        <!-- Left column: connection + settings -->
+        <div class="space-y-6">
+            <!-- Connection card -->
+            <section class="bg-white dark:bg-journal-green border border-gray-200 dark:border-gray-700 rounded-lg p-5 shadow-sm">
+                <h3 class="text-sm font-semibold uppercase tracking-wide text-gray-500 dark:text-gray-300 mb-3">
+                    <i class="fas fa-link mr-1"></i> iNaturalist account
+                </h3>
+                {% if credential.connected %}
+                <div class="flex items-center justify-between gap-3">
+                    <div>
+                        <div class="text-sm text-gray-600 dark:text-gray-300">Connected as</div>
+                        <div id="vs_connected_login" class="text-lg font-semibold text-journal-dark dark:text-white">{{ credential.inat_login }}</div>
+                    </div>
+                    <form method="post" action="{{ url_for('main.voucher_sync_oauth_disconnect') }}"
+                        onsubmit="return confirm('Disconnect your iNaturalist account from Dikarya?');">
+                        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+                        <button type="submit"
+                            class="text-sm px-3 py-2 rounded-lg border border-gray-300 dark:border-gray-600 text-gray-700 dark:text-gray-200 hover:bg-gray-100 dark:hover:bg-journal-dark transition-colors">
+                            Disconnect
+                        </button>
+                    </form>
+                </div>
+                <p class="mt-3 text-xs text-gray-500 dark:text-gray-400">
+                    Scans are limited to this account's own observations.
+                </p>
+                {% else %}
+                <p class="text-sm text-gray-600 dark:text-gray-300 mb-4">
+                    Sign in with iNaturalist to let Dikarya read your observations and write voucher numbers on your behalf.
+                    You can disconnect at any time.
+                </p>
+                {% if oauth_configured %}
+                <a href="{{ url_for('main.voucher_sync_oauth_connect') }}"
+                    class="inline-flex items-center gap-2 bg-journal-gold text-journal-dark px-4 py-2 rounded-lg text-sm font-semibold hover:bg-journal-gold-light transition-colors">
+                    <i class="fas fa-right-to-bracket"></i> Sign in with iNaturalist
+                </a>
+                {% else %}
+                <div class="text-sm rounded-lg px-3 py-2 bg-amber-50 text-amber-800 border border-amber-200 dark:bg-amber-900/30 dark:text-amber-200 dark:border-amber-800">
+                    iNaturalist sign-in is not configured on this server yet.
+                </div>
+                {% endif %}
+                {% endif %}
+            </section>
+
+            <!-- Settings card -->
+            <section class="bg-white dark:bg-journal-green border border-gray-200 dark:border-gray-700 rounded-lg p-5 shadow-sm space-y-5">
+                <h3 class="text-sm font-semibold uppercase tracking-wide text-gray-500 dark:text-gray-300">
+                    <i class="fas fa-sliders mr-1"></i> Matching
+                </h3>
+
+                <div class="relative">
+                    <label for="vs_field_name" class="block text-sm font-semibold text-journal-dark dark:text-gray-100 mb-2">Observation field</label>
+                    <input id="vs_field_name" type="text" value="{{ default_field_name }}" autocomplete="off"
+                        class="w-full rounded-lg border border-gray-300 dark:border-gray-600 bg-white dark:bg-journal-dark px-3 py-2 text-journal-dark dark:text-white">
+                    <ul id="vs_field_suggest" class="hidden absolute z-20 mt-1 w-full rounded-lg border border-gray-200 dark:border-gray-600 bg-white dark:bg-journal-dark shadow-lg text-sm"></ul>
+                    <div class="mt-2 flex items-center gap-2 text-xs text-gray-500 dark:text-gray-400">
+                        <span>Field ID</span>
+                        <input id="vs_field_id" type="number" min="1" value="{{ default_field_id }}"
+                            class="w-24 rounded border border-gray-300 dark:border-gray-600 bg-white dark:bg-journal-dark px-2 py-1 text-journal-dark dark:text-white font-mono">
+                    </div>
+                </div>
+
+                <div>
+                    <span class="block text-sm font-semibold text-journal-dark dark:text-gray-100 mb-2">Code format</span>
+                    <div class="space-y-1.5">
+                        {% for f in voucher_formats %}
+                        <label class="flex items-center gap-2 text-sm text-gray-700 dark:text-gray-200 cursor-pointer">
+                            <input type="radio" name="vs_format" value="{{ f.name }}" data-regex="{{ f.regex }}" data-example="{{ f.example }}"
+                                {% if f.name == default_format %}checked{% endif %} class="accent-journal-gold">
+                            <span>{{ f.name }}</span>
+                        </label>
+                        {% endfor %}
+                    </div>
+                    <div id="vs_custom_regex_wrap" class="hidden mt-2">
+                        <input id="vs_custom_regex" type="text" placeholder="Regular expression" maxlength="200"
+                            class="w-full rounded-lg border border-gray-300 dark:border-gray-600 bg-white dark:bg-journal-dark px-3 py-2 text-journal-dark dark:text-white font-mono text-sm">
+                    </div>
+                    <p id="vs_format_hint" class="mt-2 text-xs text-gray-500 dark:text-gray-400"></p>
+                </div>
+
+                <div>
+                    <span class="block text-sm font-semibold text-journal-dark dark:text-gray-100 mb-2">Upload date</span>
+                    <div class="flex items-center gap-3 text-sm text-gray-700 dark:text-gray-200 mb-2">
+                        <label class="flex items-center gap-1.5 cursor-pointer"><input type="radio" name="vs_date_mode" value="single" checked class="accent-journal-gold"> Single day</label>
+                        <label class="flex items-center gap-1.5 cursor-pointer"><input type="radio" name="vs_date_mode" value="range" class="accent-journal-gold"> Range</label>
+                    </div>
+                    <div class="flex items-center gap-2">
+                        <input id="vs_date_start" type="date"
+                            class="flex-1 rounded-lg border border-gray-300 dark:border-gray-600 bg-white dark:bg-journal-dark px-3 py-2 text-journal-dark dark:text-white text-sm">
+                        <span id="vs_date_to" class="hidden text-gray-500 text-sm">to</span>
+                        <input id="vs_date_end" type="date"
+                            class="hidden flex-1 rounded-lg border border-gray-300 dark:border-gray-600 bg-white dark:bg-journal-dark px-3 py-2 text-journal-dark dark:text-white text-sm">
+                    </div>
+                    <p class="mt-2 text-xs text-gray-500 dark:text-gray-400">The date the observation was uploaded to iNaturalist.</p>
+                </div>
+
+                <div class="space-y-3">
+                    <label class="flex items-start gap-3 cursor-pointer">
+                        <input id="vs_overwrite" type="checkbox" class="mt-1 accent-journal-gold">
+                        <span class="text-sm text-gray-700 dark:text-gray-200">
+                            <span class="font-semibold">Overwrite existing values</span><br>
+                            <span class="text-xs text-gray-500 dark:text-gray-400">When off, observations whose field already holds a different value are flagged, not changed.</span>
+                        </span>
+                    </label>
+                    <label class="flex items-start gap-3 cursor-pointer">
+                        <input id="vs_use_ocr" type="checkbox" checked class="mt-1 accent-journal-gold">
+                        <span class="text-sm text-gray-700 dark:text-gray-200">
+                            <span class="font-semibold">OCR fallback</span><br>
+                            <span class="text-xs text-gray-500 dark:text-gray-400">If no QR code decodes, read the printed ID. OCR matches are shown in blue for review.</span>
+                        </span>
+                    </label>
+                </div>
+            </section>
+        </div>
+
+        <!-- Right column: actions + results -->
+        <div class="space-y-4">
+            <section class="bg-white dark:bg-journal-green border border-gray-200 dark:border-gray-700 rounded-lg p-4 shadow-sm">
+                <div class="flex flex-wrap items-center gap-2">
+                    <button id="vs_btn_preview" type="button" {% if not credential.connected %}disabled{% endif %}
+                        class="inline-flex items-center gap-2 bg-journal-gold text-journal-dark px-4 py-2 rounded-lg text-sm font-semibold hover:bg-journal-gold-light transition-colors disabled:opacity-50 disabled:cursor-not-allowed">
+                        <i class="fas fa-magnifying-glass"></i> Preview run
+                    </button>
+                    <button id="vs_btn_stop" type="button" disabled
+                        class="inline-flex items-center gap-2 px-4 py-2 rounded-lg text-sm font-semibold border border-gray-300 dark:border-gray-600 text-gray-700 dark:text-gray-200 hover:bg-gray-100 dark:hover:bg-journal-dark transition-colors disabled:opacity-50 disabled:cursor-not-allowed">
+                        <i class="fas fa-stop"></i> Stop
+                    </button>
+                    <span class="flex-1"></span>
+                    <button id="vs_btn_apply" type="button" disabled
+                        class="inline-flex items-center gap-2 bg-green-600 text-white px-4 py-2 rounded-lg text-sm font-semibold hover:bg-green-700 transition-colors disabled:opacity-50 disabled:cursor-not-allowed">
+                        <i class="fas fa-cloud-arrow-up"></i> Apply updates
+                    </button>
+                    <a id="vs_btn_export" href="#" aria-disabled="true"
+                        class="inline-flex items-center gap-2 px-4 py-2 rounded-lg text-sm font-semibold border border-gray-300 dark:border-gray-600 text-gray-700 dark:text-gray-200 hover:bg-gray-100 dark:hover:bg-journal-dark transition-colors opacity-50 pointer-events-none">
+                        <i class="fas fa-file-csv"></i> Export CSV
+                    </a>
+                    <button id="vs_btn_clear" type="button" disabled
+                        class="inline-flex items-center gap-2 px-3 py-2 rounded-lg text-sm border border-transparent text-gray-500 dark:text-gray-400 hover:text-journal-dark dark:hover:text-white transition-colors disabled:opacity-50">
+                        <i class="fas fa-rotate-left"></i> Clear
+                    </button>
+                </div>
+
+                <div class="mt-4">
+                    <div class="flex items-center justify-between text-xs text-gray-500 dark:text-gray-400 mb-1">
+                        <span id="vs_status_text">Ready.</span>
+                        <span id="vs_progress_text"></span>
+                    </div>
+                    <div class="h-2 w-full rounded-full bg-gray-200 dark:bg-gray-700 overflow-hidden">
+                        <div id="vs_progress_bar" class="h-2 bg-journal-gold transition-all duration-300" style="width:0%"></div>
+                    </div>
+                </div>
+
+                <div id="vs_chips" class="mt-4 flex flex-wrap gap-2">
+                    <span class="vs-chip bg-green-100 text-green-800 dark:bg-green-900/40 dark:text-green-200"><i class="fas fa-circle-check"></i> Update <span id="vs_chip_update">0</span></span>
+                    <span class="vs-chip bg-blue-100 text-blue-800 dark:bg-blue-900/40 dark:text-blue-200"><i class="fas fa-eye"></i> via OCR <span id="vs_chip_ocr">0</span></span>
+                    <span class="vs-chip bg-gray-100 text-gray-700 dark:bg-gray-800 dark:text-gray-300"><i class="fas fa-forward"></i> Skip <span id="vs_chip_skip">0</span></span>
+                    <span class="vs-chip bg-amber-100 text-amber-800 dark:bg-amber-900/40 dark:text-amber-200"><i class="fas fa-flag"></i> Flag <span id="vs_chip_flag">0</span></span>
+                </div>
+            </section>
+
+            <section class="bg-white dark:bg-journal-green border border-gray-200 dark:border-gray-700 rounded-lg shadow-sm overflow-hidden">
+                <div class="overflow-x-auto">
+                    <table class="min-w-full text-sm">
+                        <thead class="bg-gray-50 dark:bg-journal-dark text-xs uppercase tracking-wide text-gray-500 dark:text-gray-300">
+                            <tr>
+                                <th class="px-3 py-2 text-left w-8"><input id="vs_select_all" type="checkbox" class="accent-journal-gold" title="Select all Update rows"></th>
+                                <th class="px-3 py-2 text-left">Observation</th>
+                                <th class="px-3 py-2 text-left">Taxon</th>
+                                <th class="px-3 py-2 text-left">Uploaded</th>
+                                <th class="px-3 py-2 text-left">Detected</th>
+                                <th class="px-3 py-2 text-left">Current</th>
+                                <th class="px-3 py-2 text-left">Action</th>
+                                <th class="px-3 py-2 text-left">Reason</th>
+                            </tr>
+                        </thead>
+                        <tbody id="vs_rows" class="divide-y divide-gray-100 dark:divide-gray-700"></tbody>
+                    </table>
+                </div>
+                <div id="vs_empty" class="px-4 py-10 text-center text-sm text-gray-500 dark:text-gray-400">
+                    No results yet. Choose a date and press <strong>Preview run</strong>.
+                </div>
+            </section>
+
+            <section class="bg-white dark:bg-journal-green border border-gray-200 dark:border-gray-700 rounded-lg shadow-sm">
+                <button id="vs_log_toggle" type="button" class="w-full flex items-center justify-between px-4 py-3 text-sm font-semibold text-journal-dark dark:text-gray-100">
+                    <span><i class="fas fa-terminal mr-2 text-gray-400"></i>Run log</span>
+                    <i id="vs_log_caret" class="fas fa-chevron-down text-gray-400"></i>
+                </button>
+                <div id="vs_log" class="hidden px-4 pb-4 max-h-72 overflow-y-auto text-gray-700 dark:text-gray-200"></div>
+            </section>
+        </div>
+    </div>
+</div>
+
+<!-- Apply confirmation modal -->
+<div id="vs_apply_modal" class="hidden fixed inset-0 z-50 flex items-center justify-center bg-black/50 px-4">
+    <div class="bg-white dark:bg-journal-green rounded-xl shadow-2xl max-w-md w-full p-6">
+        <h3 class="text-lg font-bold text-journal-dark dark:text-white mb-3"><i class="fas fa-cloud-arrow-up mr-2 text-green-600"></i>Apply updates?</h3>
+        <div id="vs_apply_modal_body" class="text-sm text-gray-700 dark:text-gray-200 space-y-2"></div>
+        <div class="mt-6 flex justify-end gap-2">
+            <button id="vs_apply_cancel" type="button" class="px-4 py-2 rounded-lg text-sm border border-gray-300 dark:border-gray-600 text-gray-700 dark:text-gray-200 hover:bg-gray-100 dark:hover:bg-journal-dark">Cancel</button>
+            <button id="vs_apply_confirm" type="button" class="px-4 py-2 rounded-lg text-sm font-semibold bg-green-600 text-white hover:bg-green-700">Apply</button>
+        </div>
+    </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+(function () {
+    const CSRF = document.querySelector('meta[name="csrf-token"]').getAttribute('content');
+    const CONNECTED = {{ 'true' if credential.connected else 'false' }};
+    const POLL_MS = 2000;
+
+    const el = (id) => document.getElementById(id);
+    const btnPreview = el('vs_btn_preview'), btnStop = el('vs_btn_stop'), btnApply = el('vs_btn_apply'),
+          btnExport = el('vs_btn_export'), btnClear = el('vs_btn_clear');
+    const rowsBody = el('vs_rows'), emptyMsg = el('vs_empty'), logBox = el('vs_log');
+
+    const state = {
+        runId: null,          // the preview (scan) run the table shows
+        applyRunId: null,     // an in-flight apply run
+        kind: null,
+        rows: new Map(),      // observation_id -> row
+        order: [],
+        cursor: 0, logCursor: 0,
+        polling: null,
+        selected: new Set(),
+    };
+
+    // ---------- helpers ----------
+    async function api(path, opts = {}) {
+        const headers = Object.assign({ 'Accept': 'application/json' }, opts.headers || {});
+        if (opts.method && opts.method !== 'GET') {
+            headers['Content-Type'] = 'application/json';
+            headers['X-CSRFToken'] = CSRF;
+        }
+        const resp = await fetch(path, Object.assign({}, opts, { headers, credentials: 'same-origin' }));
+        let data = null;
+        try { data = await resp.json(); } catch (e) { data = {}; }
+        return { ok: resp.ok, status: resp.status, data };
+    }
+    function setStatus(text) { el('vs_status_text').textContent = text; }
+    function setProgress(done, total) {
+        const pct = total ? Math.round(100 * done / total) : 0;
+        el('vs_progress_bar').style.width = pct + '%';
+        el('vs_progress_text').textContent = total ? `${done} / ${total}` : '';
+    }
+    function log(line) {
+        const div = document.createElement('div');
+        div.textContent = line;
+        logBox.appendChild(div);
+        logBox.scrollTop = logBox.scrollHeight;
+    }
+    function esc(s) { return String(s == null ? '' : s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
+    function rowClass(r) {
+        if (r.reason === 'applied') return 'vs-row-applied';
+        if (r.action === 'update') return (r.reason || '').includes('ocr') ? 'vs-row-ocr' : 'vs-row-update';
+        if (r.action === 'flag') return 'vs-row-flag';
+        return 'vs-row-skip';
+    }
+    function actionLabel(r) {
+        if (r.reason === 'applied') return 'Applied';
+        if (r.action === 'update') return (r.reason || '').includes('ocr') ? 'Update (OCR)' : 'Update';
+        return r.action.charAt(0).toUpperCase() + r.action.slice(1);
+    }
+    function renderRow(r) {
+        const id = r.observation_id;
+        let tr = rowsBody.querySelector(`tr[data-id="${id}"]`);
+        if (!tr) {
+            tr = document.createElement('tr');
+            tr.dataset.id = id;
+            rowsBody.appendChild(tr);
+        }
+        tr.className = rowClass(r) + ' align-top';
+        const canSelect = r.action === 'update' && r.detected_voucher;
+        if (canSelect && !state.rows.has(id)) state.selected.add(id);
+        if (!canSelect) state.selected.delete(id);
+        tr.innerHTML = `
+            <td class="px-3 py-2">${canSelect ? `<input type="checkbox" class="vs-pick accent-journal-gold" data-id="${id}" ${state.selected.has(id) ? 'checked' : ''}>` : ''}</td>
+            <td class="px-3 py-2 whitespace-nowrap"><a href="${esc(r.url)}" target="_blank" rel="noopener" class="text-journal-dark dark:text-journal-gold hover:underline font-mono">#${esc(id)}</a></td>
+            <td class="px-3 py-2 max-w-[14rem] truncate" title="${esc(r.taxon)}">${esc(r.taxon)}</td>
+            <td class="px-3 py-2 whitespace-nowrap">${esc(r.upload_date)}</td>
+            <td class="px-3 py-2 font-mono">${esc(r.detected_voucher || '')}</td>
+            <td class="px-3 py-2 font-mono">${esc(r.current_value || '')}</td>
+            <td class="px-3 py-2 font-semibold whitespace-nowrap">${esc(actionLabel(r))}</td>
+            <td class="px-3 py-2 text-xs text-gray-600 dark:text-gray-300" title="${esc(r.raw_ocr || r.raw_qr || '')}">${esc(r.reason)}</td>`;
+        if (!state.rows.has(id)) state.order.push(id);
+        state.rows.set(id, r);
+        emptyMsg.classList.add('hidden');
+    }
+    function updateChips() {
+        let u = 0, o = 0, s = 0, f = 0;
+        for (const r of state.rows.values()) {
+            if (r.action === 'update') { u++; if ((r.reason || '').includes('ocr')) o++; }
+            else if (r.action === 'flag') f++;
+            else s++;
+        }
+        el('vs_chip_update').textContent = u; el('vs_chip_ocr').textContent = o;
+        el('vs_chip_skip').textContent = s; el('vs_chip_flag').textContent = f;
+        const busy = !!state.polling;
+        btnApply.disabled = busy || u === 0 || !CONNECTED;
+        btnClear.disabled = busy || state.rows.size === 0;
+        if (state.runId && state.rows.size) {
+            btnExport.href = `/api/voucher-sync/runs/${state.runId}/export.csv`;
+            btnExport.classList.remove('opacity-50', 'pointer-events-none');
+            btnExport.removeAttribute('aria-disabled');
+        } else {
+            btnExport.href = '#';
+            btnExport.classList.add('opacity-50', 'pointer-events-none');
+            btnExport.setAttribute('aria-disabled', 'true');
+        }
+    }
+    function setBusy(busy) {
+        btnPreview.disabled = busy || !CONNECTED;
+        btnStop.disabled = !busy;
+        updateChips();
+    }
+    function clearResults() {
+        state.rows.clear(); state.order = []; state.selected.clear();
+        state.cursor = 0; state.logCursor = 0;
+        rowsBody.innerHTML = ''; logBox.innerHTML = '';
+        emptyMsg.classList.remove('hidden');
+        setProgress(0, 0);
+        updateChips();
+    }
+
+    // ---------- form helpers ----------
+    function selectedFormat() { return document.querySelector('input[name="vs_format"]:checked'); }
+    function refreshFormatUI() {
+        const f = selectedFormat();
+        const custom = f.value === 'Custom';
+        el('vs_custom_regex_wrap').classList.toggle('hidden', !custom);
+        el('vs_format_hint').textContent = custom ? 'Case-insensitive Python regular expression, e.g. \\bBT-\\d{3}\\b'
+                                                  : `Examples: ${f.dataset.example}`;
+    }
+    document.querySelectorAll('input[name="vs_format"]').forEach(r => r.addEventListener('change', refreshFormatUI));
+    refreshFormatUI();
+
+    function refreshDateUI() {
+        const range = document.querySelector('input[name="vs_date_mode"]:checked').value === 'range';
+        el('vs_date_end').classList.toggle('hidden', !range);
+        el('vs_date_to').classList.toggle('hidden', !range);
+    }
+    document.querySelectorAll('input[name="vs_date_mode"]').forEach(r => r.addEventListener('change', refreshDateUI));
+    refreshDateUI();
+    el('vs_date_start').value = new Date().toISOString().slice(0, 10);
+
+    // Observation field typeahead
+    let fieldTimer = null;
+    const fieldInput = el('vs_field_name'), suggest = el('vs_field_suggest');
+    fieldInput.addEventListener('input', () => {
+        clearTimeout(fieldTimer);
+        const q = fieldInput.value.trim();
+        if (q.length < 2) { suggest.classList.add('hidden'); return; }
+        fieldTimer = setTimeout(async () => {
+            const { ok, data } = await api(`/api/voucher-sync/fields?q=${encodeURIComponent(q)}`);
+            suggest.innerHTML = '';
+            if (!ok || !data.fields || !data.fields.length) { suggest.classList.add('hidden'); return; }
+            data.fields.forEach(f => {
+                const li = document.createElement('li');
+                li.className = 'px-3 py-2 cursor-pointer hover:bg-gray-100 dark:hover:bg-journal-green';
+                li.innerHTML = `${esc(f.name)} <span class="text-xs text-gray-400 font-mono">#${esc(f.id)}</span>`;
+                li.addEventListener('mousedown', () => {
+                    fieldInput.value = f.name; el('vs_field_id').value = f.id; suggest.classList.add('hidden');
+                });
+                suggest.appendChild(li);
+            });
+            suggest.classList.remove('hidden');
+        }, 250);
+    });
+    fieldInput.addEventListener('blur', () => setTimeout(() => suggest.classList.add('hidden'), 150));
+
+    // ---------- polling ----------
+    function stopPolling() {
+        if (state.polling) { clearTimeout(state.polling); state.polling = null; }
+        setBusy(false);
+    }
+    async function pollOnce(runId) {
+        const { ok, status, data } = await api(`/api/voucher-sync/runs/${runId}?cursor=${state.cursor}&log_cursor=${state.logCursor}`);
+        if (!ok) {
+            log(`ERROR: could not read run status (HTTP ${status}).`);
+            setStatus('Lost contact with the run.');
+            stopPolling();
+            return;
+        }
+        (data.rows || []).forEach(renderRow);
+        (data.log || []).forEach(log);
+        if (data.source === 'live') {
+            state.cursor = data.next_cursor; state.logCursor = data.next_log_cursor;
+        } else {
+            state.cursor = data.next_cursor;
+        }
+        setProgress(data.progress_done || 0, data.progress_total || 0);
+        updateChips();
+
+        const active = data.status === 'queued' || data.status === 'running';
+        if (active) {
+            setStatus(data.status === 'queued' ? 'Waiting for a worker...' : (data.kind === 'apply' ? 'Applying updates...' : 'Scanning photos...'));
+            state.polling = setTimeout(() => pollOnce(runId), POLL_MS);
+            return;
+        }
+        // Terminal state.
+        state.polling = null;
+        if (data.status === 'failed') {
+            setStatus('Run failed.');
+            showStatus(data.error || 'The run failed.', 'error');
+        } else if (data.kind === 'apply') {
+            const s = data.summary || {};
+            setStatus(`${data.status === 'cancelled' ? 'Apply stopped' : 'Apply complete'}: ${s.applied || 0} written, ${s.failed || 0} failed.`);
+            showStatus(`Applied ${s.applied || 0} update(s)${s.failed ? `, ${s.failed} failed` : ''}.`, s.failed ? 'error' : 'success');
+            state.applyRunId = null;
+            // Re-read the preview so applied rows show their final state.
+            await reloadPreview(state.runId);
+        } else {
+            const s = data.summary || {};
+            setStatus(data.status === 'cancelled' ? `Preview stopped - ${state.rows.size} scanned.` :
+                      `Preview complete: ${s.update || 0} to update, ${s.skip || 0} to skip, ${s.flag || 0} flagged.`);
+        }
+        setBusy(false);
+    }
+    async function reloadPreview(runId) {
+        if (!runId) return;
+        state.rows.clear(); state.order = []; rowsBody.innerHTML = '';
+        const { ok, data } = await api(`/api/voucher-sync/runs/${runId}?cursor=0&log_cursor=${state.logCursor}`);
+        if (!ok) return;
+        (data.rows || []).forEach(renderRow);
+        (data.log || []).forEach(log);
+        state.logCursor = data.next_log_cursor || state.logCursor;
+        updateChips();
+    }
+    function startPolling(runId, kind) {
+        if (kind === 'scan') { state.runId = runId; state.cursor = 0; }
+        else { state.applyRunId = runId; state.cursor = 0; }
+        state.kind = kind;
+        setBusy(true);
+        pollOnce(runId);
+    }
+
+    // ---------- actions ----------
+    btnPreview.addEventListener('click', async () => {
+        const f = selectedFormat();
+        const range = document.querySelector('input[name="vs_date_mode"]:checked').value === 'range';
+        const body = {
+            format: f.value,
+            regex: f.value === 'Custom' ? el('vs_custom_regex').value : '',
+            field_id: el('vs_field_id').value,
+            field_name: fieldInput.value,
+            date_start: el('vs_date_start').value,
+            date_end: range ? el('vs_date_end').value : el('vs_date_start').value,
+            allow_overwrite: el('vs_overwrite').checked,
+            use_ocr: el('vs_use_ocr').checked,
+        };
+        if (!body.date_start) { showStatus('Choose an upload date first.', 'error'); return; }
+        clearResults();
+        setStatus('Queueing scan...');
+        const { ok, status, data } = await api('/api/voucher-sync/scan', { method: 'POST', body: JSON.stringify(body) });
+        if (!ok) {
+            if (status === 409 && data.active_run_id) { startPolling(data.active_run_id, 'scan'); return; }
+            showStatus(data.error || `Could not start the scan (HTTP ${status}).`, 'error');
+            setStatus('Ready.');
+            return;
+        }
+        startPolling(data.run_id, 'scan');
+    });
+
+    btnStop.addEventListener('click', async () => {
+        const id = state.kind === 'apply' ? state.applyRunId : state.runId;
+        if (!id) return;
+        btnStop.disabled = true;
+        const { ok, data } = await api(`/api/voucher-sync/runs/${id}/cancel`, { method: 'POST', body: '{}' });
+        if (!ok) showStatus(data.error || 'Could not stop the run.', 'error');
+        else setStatus('Stopping...');
+    });
+
+    btnClear.addEventListener('click', () => { clearResults(); state.runId = null; setStatus('Ready.'); });
+
+    rowsBody.addEventListener('change', (e) => {
+        if (!e.target.classList.contains('vs-pick')) return;
+        const id = Number(e.target.dataset.id);
+        if (e.target.checked) state.selected.add(id); else state.selected.delete(id);
+    });
+    el('vs_select_all').addEventListener('change', (e) => {
+        rowsBody.querySelectorAll('.vs-pick').forEach(cb => {
+            cb.checked = e.target.checked;
+            const id = Number(cb.dataset.id);
+            if (cb.checked) state.selected.add(id); else state.selected.delete(id);
+        });
+    });
+
+    function applyCounts() {
+        let total = 0, ocr = 0, overwrite = 0;
+        for (const id of state.selected) {
+            const r = state.rows.get(id);
+            if (!r || r.action !== 'update') continue;
+            total++;
+            if ((r.reason || '').includes('ocr')) ocr++;
+            if (r.current_value) overwrite++;
+        }
+        return { total, ocr, overwrite };
+    }
+    btnApply.addEventListener('click', () => {
+        const c = applyCounts();
+        if (!c.total) { showStatus('Select at least one Update row.', 'error'); return; }
+        const body = el('vs_apply_modal_body');
+        body.innerHTML = `
+            <p>This will write <strong>${c.total}</strong> voucher number(s) to iNaturalist field
+               <strong>${esc(fieldInput.value || ('#' + el('vs_field_id').value))}</strong>.</p>
+            ${c.ocr ? `<p class="text-blue-700 dark:text-blue-300"><i class="fas fa-eye mr-1"></i>${c.ocr} value(s) came from OCR - please double-check them in the table.</p>` : ''}
+            ${c.overwrite ? `<p class="text-amber-700 dark:text-amber-300"><i class="fas fa-triangle-exclamation mr-1"></i>${c.overwrite} observation(s) already have a different value that will be <strong>overwritten</strong>.</p>` : ''}
+            <p class="text-xs text-gray-500 dark:text-gray-400">Writes are paced at about one per second.</p>`;
+        el('vs_apply_modal').classList.remove('hidden');
+    });
+    el('vs_apply_cancel').addEventListener('click', () => el('vs_apply_modal').classList.add('hidden'));
+    el('vs_apply_confirm').addEventListener('click', async () => {
+        el('vs_apply_modal').classList.add('hidden');
+        const c = applyCounts();
+        const body = { observation_ids: Array.from(state.selected), confirm_overwrite: c.overwrite > 0 };
+        setStatus('Queueing apply...');
+        const { ok, status, data } = await api(`/api/voucher-sync/runs/${state.runId}/apply`, { method: 'POST', body: JSON.stringify(body) });
+        if (!ok) {
+            showStatus(data.error === 'confirm_overwrite_required' ? 'Overwrite confirmation required.' : (data.error || `Could not start apply (HTTP ${status}).`), 'error');
+            setStatus('Ready.');
+            return;
+        }
+        log(`Apply queued: ${data.counts.total} update(s).`);
+        startPolling(data.run_id, 'apply');
+    });
+
+    el('vs_log_toggle').addEventListener('click', () => {
+        const hidden = logBox.classList.toggle('hidden');
+        el('vs_log_caret').className = hidden ? 'fas fa-chevron-down text-gray-400' : 'fas fa-chevron-up text-gray-400';
+    });
+
+    // ---------- resume on reload ----------
+    (async function resume() {
+        if (!CONNECTED) { setStatus('Connect your iNaturalist account to begin.'); return; }
+        const { ok, data } = await api('/api/voucher-sync/status');
+        if (ok && data.active_run_id) {
+            const run = await api(`/api/voucher-sync/runs/${data.active_run_id}`);
+            const kind = run.ok ? run.data.kind : 'scan';
+            if (kind === 'apply' && run.data.parent_run_id) {
+                state.runId = run.data.parent_run_id;
+                await reloadPreview(state.runId);
+            }
+            startPolling(data.active_run_id, kind);
+            return;
+        }
+        const last = await api('/api/voucher-sync/runs');
+        if (last.ok) {
+            const scan = (last.data.runs || []).find(r => r.kind === 'scan' && r.status !== 'failed' && r.summary);
+            if (scan) {
+                state.runId = scan.id;
+                await reloadPreview(scan.id);
+                const s = scan.summary || {};
+                setStatus(`Last preview (${scan.created_at.slice(0, 16).replace('T', ' ')} UTC): ${s.update || 0} to update, ${s.skip || 0} to skip, ${s.flag || 0} flagged.`);
+                setProgress(scan.progress_done || 0, scan.progress_total || 0);
+            }
+        }
+    })();
+    updateChips();
+})();
+</script>
+{% endblock %}

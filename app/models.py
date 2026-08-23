@@ -154,6 +154,83 @@ class TodoSuggestion(db.Model):
     completed_by = db.relationship('User', backref=db.backref('completed_todo_suggestions', lazy=True))
 
 
+class InatUserCredential(db.Model):
+    """A Dikarya user's own iNaturalist OAuth grant (Voucher Sync).
+
+    Secrets are Fernet-encrypted by app/services/inat_user_credential_service.py;
+    never read ``*_enc`` columns directly.
+    """
+    __tablename__ = 'inat_user_credential'
+    id = db.Column(db.Integer, primary_key=True)
+    user_id = db.Column(db.Integer, db.ForeignKey('user.id', ondelete='CASCADE'),
+                        nullable=False, unique=True)
+    access_token_enc = db.Column(db.Text, nullable=False)
+    jwt_enc = db.Column(db.Text, nullable=True)
+    jwt_created_at = db.Column(db.Integer, nullable=True)
+    inat_login = db.Column(db.String(64), nullable=True)
+    inat_user_id = db.Column(db.Integer, nullable=True)
+    scope = db.Column(db.String(64), nullable=False, default='')
+    created_at = db.Column(db.DateTime, default=datetime.utcnow, nullable=False)
+    updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
+
+    user = db.relationship('User', backref=db.backref('inat_credential', uselist=False,
+                                                      cascade='all, delete-orphan'))
+
+
+class VoucherSyncRun(db.Model):
+    """One Voucher Sync scan or apply run.
+
+    Deliberately separate from ``Job``: that table is the phylogenetics
+    pipeline (job_dir, /user/jobs, SSE, reconcile). A run's live progress is
+    in Redis while it executes; ``rows``/``summary`` are persisted here when
+    it finishes so Apply can reuse the server-held preview.
+    """
+    __tablename__ = 'voucher_sync_run'
+    __table_args__ = (
+        db.CheckConstraint("kind in ('scan', 'apply')", name='ck_voucher_sync_run_kind'),
+        db.CheckConstraint(
+            "status in ('queued', 'running', 'completed', 'cancelled', 'failed')",
+            name='ck_voucher_sync_run_status'),
+        db.Index('ix_voucher_sync_run_user_created', 'user_id', 'created_at'),
+    )
+    id = db.Column(db.String(64), primary_key=True)
+    user_id = db.Column(db.Integer, db.ForeignKey('user.id', ondelete='CASCADE'), nullable=False)
+    kind = db.Column(db.String(16), nullable=False, default='scan')
+    status = db.Column(db.String(16), nullable=False, default='queued')
+    params = db.Column(db.JSON, nullable=False, default=dict)
+    progress_done = db.Column(db.Integer, nullable=False, default=0)
+    progress_total = db.Column(db.Integer, nullable=True)
+    rows = db.Column(db.JSON, nullable=True)
+    summary = db.Column(db.JSON, nullable=True)
+    error = db.Column(db.Text, nullable=True)
+    parent_run_id = db.Column(db.String(64), db.ForeignKey('voucher_sync_run.id', ondelete='SET NULL'),
+                              nullable=True)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow, nullable=False)
+    updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
+    started_at = db.Column(db.DateTime, nullable=True)
+    finished_at = db.Column(db.DateTime, nullable=True)
+
+    user = db.relationship('User', backref=db.backref('voucher_sync_runs', lazy=True))
+
+    ACTIVE_STATUSES = ('queued', 'running')
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "id": self.id,
+            "kind": self.kind,
+            "status": self.status,
+            "params": self.params or {},
+            "progress_done": self.progress_done or 0,
+            "progress_total": self.progress_total,
+            "summary": self.summary,
+            "error": self.error,
+            "parent_run_id": self.parent_run_id,
+            "created_at": self.created_at.isoformat() if self.created_at else None,
+            "started_at": self.started_at.isoformat() if self.started_at else None,
+            "finished_at": self.finished_at.isoformat() if self.finished_at else None,
+        }
+
+
 @dataclass
 class AlignmentParams:
     method: str  # "mafft", "muscle", "clustalo", "iqtree_builtin", "default"
