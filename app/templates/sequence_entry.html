@@ -1121,6 +1121,19 @@
             <p class="text-xs text-gray-500 dark:text-gray-400 mt-1">
                 Choose the algorithm for multiple sequence alignment.
             </p>
+            <label id="fix_orientation_row" for="fix_orientation"
+                class="mt-4 flex items-start gap-3 text-sm text-gray-700 dark:text-gray-200">
+                <input type="checkbox" id="fix_orientation" checked
+                    class="mt-1 w-4 h-4 text-journal-gold border-gray-300 rounded focus:ring-journal-gold">
+                <span>
+                    <span class="font-medium">Fix sequence orientation</span>
+                    <span class="block text-xs text-gray-500 dark:text-gray-400 mt-1"
+                        id="fix_orientation_help">
+                        Reverse-complement any sequence that was submitted backwards. A single
+                        reversed sequence is enough to wreck an alignment and the tree built from it.
+                    </span>
+                </span>
+            </label>
         </div>
 
         <!-- Trimming Method -->
@@ -1995,6 +2008,7 @@
     async function fetchGenBankLocations(accessions) {
         const csrfToken = document.querySelector('meta[name="csrf-token"]').getAttribute('content');
         const locations = {};
+        const unavailable = [];
 
         // The endpoint caps each request at 200 accessions; a large FASTA paste can
         // exceed that, so ask in batches rather than failing the whole lookup.
@@ -2014,9 +2028,12 @@
                 throw httpError(resp, data.error || 'GenBank location lookup failed');
             }
             Object.assign(locations, data.locations || {});
+            // Accessions GenBank could not be asked about (a failed batch), as
+            // opposed to records that genuinely carry no collection site.
+            (data.unavailable || []).forEach(accession => unavailable.push(accession));
         }
 
-        return locations;
+        return { locations, unavailable };
     }
 
     // Alan 8/10/26 - Append the location to the header text only. Writing seq.location
@@ -2048,8 +2065,11 @@
         if (accessions.length === 0) return '';
 
         let locations;
+        let unavailable = [];
         try {
-            locations = await fetchGenBankLocations(accessions);
+            const result = await fetchGenBankLocations(accessions);
+            locations = result.locations;
+            unavailable = result.unavailable;
         } catch (e) {
             reportWorkflowFailure('tree_builder.genbank_locations', e);
             return ` Location lookup failed: ${e.message}`;
@@ -2066,9 +2086,12 @@
             }
         });
 
-        if (applied === 0) return ' No GenBank locations were available.';
-        if (applied < sequences.length) return ` Locations added for ${applied} of ${sequences.length}.`;
-        return ' Locations added.';
+        const note = unavailable.length
+            ? ` GenBank could not be reached for ${unavailable.length} accession${unavailable.length === 1 ? '' : 's'}, so their locations are unknown -- try again to add them.`
+            : '';
+        if (applied === 0) return ` No GenBank locations were added.${note}`;
+        if (applied < sequences.length) return ` Locations added for ${applied} of ${sequences.length}.${note}`;
+        return ` Locations added.${note}`;
     }
 
     function countDetectedInputItems(text) {
@@ -4111,6 +4134,32 @@
         }
     }
 
+    // The orientation fix is available for every aligner, but it is delivered
+    // two different ways: MAFFT has --adjustdirectionaccurately built in, while
+    // MUSCLE and Clustal Omega are direction-blind and need a short MAFFT pass
+    // run ahead of them. 'None' is excluded outright -- that option asserts the
+    // input is already aligned, and flipping one row of an alignment would
+    // destroy the column correspondence. The One-Click buttons never read this
+    // control; they post no fix_orientation and the server defaults it on.
+    function updateOrientationVisibility() {
+        const row = document.getElementById('fix_orientation_row');
+        const help = document.getElementById('fix_orientation_help');
+        const box = document.getElementById('fix_orientation');
+        if (!row || !help || !box) return;
+
+        const aligner = document.getElementById('alignment_method')?.value || 'mafft';
+        row.classList.toggle('hidden', aligner === 'none');
+
+        help.textContent = aligner === 'mafft'
+            ? 'Reverse-complement any sequence that was submitted backwards, using MAFFT\u2019s '
+              + 'built-in direction check. A single reversed sequence is enough to wreck an '
+              + 'alignment and the tree built from it.'
+            : 'Reverse-complement any sequence that was submitted backwards. '
+              + aligner.toUpperCase().replace('CLUSTALO', 'Clustal Omega')
+              + ' cannot detect direction on its own, so a short MAFFT pass runs first to '
+              + 'decide it. A single reversed sequence is enough to wreck an alignment.';
+    }
+
     function updateForm() {
         const method = treeMethodSelect.value;
         const bootstrapInput = document.getElementById('bootstrap');
@@ -4215,7 +4264,7 @@
         e.target.dataset.userEdited = '1';
         refreshAdvancedSummary();
     });
-    ['alignment_method', 'trimming_method', 'trim_terminal_overhangs', 'its_region', 'its_min_length',
+    ['alignment_method', 'trimming_method', 'trim_terminal_overhangs', 'fix_orientation', 'its_region', 'its_min_length',
         'tree_model', 'bootstrap', 'outgroup_select',
         'mb_gen', 'mb_runs', 'mb_chains', 'mb_burnin', 'mb_stop_early'].forEach(id => {
         document.getElementById(id)?.addEventListener('input', refreshAdvancedSummary);
@@ -4407,8 +4456,11 @@
         refreshAdvancedSummary();
     });
 
+    document.getElementById('alignment_method')?.addEventListener('change', updateOrientationVisibility);
+
     // Init initial state
     updateForm();
+    updateOrientationVisibility();
     // Re-run population when queue changes?
     // Hooked into updateQueueDisplay directly now.
 
@@ -4459,6 +4511,7 @@
             alignment_method: document.getElementById('alignment_method').value,
             trimming_method: document.getElementById('trimming_method').value,
             trim_terminal_overhangs: document.getElementById('trim_terminal_overhangs').checked,
+            fix_orientation: document.getElementById('fix_orientation')?.checked ?? true,
             its_region: document.getElementById('its_region')?.value || 'none',
             its_min_length: parseInt(document.getElementById('its_min_length')?.value, 10) || undefined,
             tree_method: treeMethodSelect.value,
@@ -4671,6 +4724,10 @@
         setFieldValue('alignment_method', p.alignment_method);
         setFieldValue('trimming_method', p.trimming_method);
         setFieldValue('trim_terminal_overhangs', p.trim_terminal_overhangs);
+        // Older jobs predate the setting and stored nothing; they ran with the
+        // correction on, so absent must read as checked rather than unchecked.
+        setFieldValue('fix_orientation', p.fix_orientation !== false);
+        updateOrientationVisibility();
         setFieldValue('tree_method', p.tree_method);
 
         // Show the right per-method controls before filling them in; updateForm
@@ -4755,6 +4812,7 @@
             alignment_method: document.getElementById('alignment_method').value,
             trimming_method: document.getElementById('trimming_method').value,
             trim_terminal_overhangs: document.getElementById('trim_terminal_overhangs').checked,
+            fix_orientation: document.getElementById('fix_orientation')?.checked ?? true,
             tree_method: method,
             tree_model: isRaxml && model === 'AUTO' ? 'GTR+G' : model,
             bootstrap: parseInt(document.getElementById('bootstrap').value, 10) || 100,

@@ -8,7 +8,8 @@ request body, we 409 to avoid silently accepting a divergent retry.
 
 To prevent two concurrent retries from both executing the handler (which
 would create duplicate jobs), the first request atomically reserves the
-cache key with a short-lived "PENDING" placeholder using SET NX. A second
+cache key with a "PENDING" placeholder using SET NX, and renews that
+reservation as a lease for as long as the handler is still running. A second
 request that sees the placeholder gets 409 `in_flight` and is expected to
 retry shortly. After the handler completes, the placeholder is replaced
 with the real cached response on 2xx, or deleted on error (so the retry
@@ -19,13 +20,28 @@ import hashlib
 import json
 import re
 import logging
+import threading
 
 from flask import g, request
 
 from app.api_v1.envelope import error_response
 
 IDEM_TTL_SECONDS = 86400         # 24h for cached successful responses
-IDEM_PENDING_TTL_SECONDS = 60    # placeholder lifetime while the handler runs
+
+# Pending-reservation lease.
+#
+# The placeholder used to live for a flat 60 seconds, which is shorter than
+# several of the handlers it protects: /tools/inaturalist-tree walks upstream
+# pagination and POST /jobs can wait on NCBI. When the placeholder expired
+# under a still-running handler, a retry reserved the *same* key and ran the
+# side effect a second time -- exactly what the header is supposed to prevent.
+#
+# So the reservation is a lease, not a fixed window: it is taken for
+# IDEM_PENDING_TTL_SECONDS and renewed every IDEM_PENDING_REFRESH_SECONDS for
+# as long as the handler is still running. If the process dies, its renewal
+# thread dies with it and the finite lease expires naturally.
+IDEM_PENDING_TTL_SECONDS = 120
+IDEM_PENDING_REFRESH_SECONDS = 30
 MAX_KEY_LEN = 200
 _KEY_CHARSET_RE = re.compile(r"^[A-Za-z0-9_\-]{1,200}$")
 _PENDING_PREFIX = "PENDING:"
@@ -44,7 +60,10 @@ def _log_fail_open(stage, exc=None):
 def _redis():
     import redis as _r
     from app.config import Config
-    return _r.from_url(Config.REDIS_URL)
+    from app.workers.queue import REDIS_CONNECT_TIMEOUT_SECONDS
+    return _r.from_url(
+        Config.REDIS_URL, socket_connect_timeout=REDIS_CONNECT_TIMEOUT_SECONDS
+    )
 
 
 def _key(user_id, method, path, idem_key):
@@ -81,6 +100,72 @@ def _replay(cached, *, is_replay=True):
         resp.headers["X-Original-Request-Id"] = original_rid
     resp.headers["X-Request-Id"] = getattr(g, "request_id", "-")
     return resp
+
+
+# Renew only while the key still holds *our* placeholder, so a lease can never
+# extend a value some other request has since written.
+_REFRESH_SCRIPT = """
+if redis.call('get', KEYS[1]) == ARGV[1] then
+  return redis.call('expire', KEYS[1], ARGV[2])
+end
+return 0
+"""
+
+
+def _refresh_pending(r, cache_key, placeholder):
+    """Extend our own pending reservation. Returns False if it is no longer ours."""
+    try:
+        return bool(r.eval(_REFRESH_SCRIPT, 1, cache_key, placeholder,
+                           IDEM_PENDING_TTL_SECONDS))
+    except AttributeError:
+        # A Redis client without EVAL: use WATCH so the compare and expiration
+        # are still conditional. Never unconditionally extend a key that may
+        # now belong to another request.
+        try:
+            with r.pipeline() as pipe:
+                pipe.watch(cache_key)
+                current = pipe.get(cache_key)
+                expected = (placeholder.encode("utf-8")
+                            if isinstance(current, bytes) else placeholder)
+                if current != expected:
+                    pipe.unwatch()
+                    return False
+                pipe.multi()
+                pipe.expire(cache_key, IDEM_PENDING_TTL_SECONDS)
+                result = pipe.execute()
+                return bool(result and result[0])
+        except Exception:
+            return False
+    except Exception:
+        return False
+
+
+class _PendingLease:
+    """Keeps a pending reservation alive for the lifetime of the handler."""
+
+    def __init__(self, r, cache_key, placeholder):
+        self._r = r
+        self._cache_key = cache_key
+        self._placeholder = placeholder
+        self._stop = threading.Event()
+        self._thread = None
+
+    def __enter__(self):
+        self._thread = threading.Thread(
+            target=self._run, name="idem-lease", daemon=True)
+        self._thread.start()
+        return self
+
+    def _run(self):
+        while not self._stop.wait(IDEM_PENDING_REFRESH_SECONDS):
+            if not _refresh_pending(self._r, self._cache_key, self._placeholder):
+                return
+
+    def __exit__(self, exc_type, exc, tb):
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=1)
+        return False
 
 
 def idempotent(fn):
@@ -200,9 +285,11 @@ def idempotent(fn):
                 )
             return _replay(cached, is_replay=True)
 
-        # We hold the reservation. Run the handler.
+        # We hold the reservation. Run the handler, renewing the lease
+        # underneath it so the key cannot expire while the work is still going.
         try:
-            response = fn(*args, **kwargs)
+            with _PendingLease(r, cache_key, placeholder):
+                response = fn(*args, **kwargs)
         except Exception:
             # Release the placeholder so a retry can succeed.
             try:

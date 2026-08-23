@@ -1,3 +1,4 @@
+import os
 import sys
 try:
     __import__('pysqlite3')
@@ -106,8 +107,8 @@ def create_app(config_name='default'):
     # anonymous limit on /api/inaturalist/tree/preview was consumed collectively,
     # which is why real users were served 429s after a handful of previews -- and
     # equally, one abusive client could rate-limit everyone else off the site.
-    # It also means per-IP view dedup (WhatsNewView) was counting all visitors as
-    # a single viewer.
+    # (It also used to mean per-IP What's New view dedup counted all visitors as
+    # a single viewer; that tracking no longer keys on the address at all.)
     #
     # x_for=1 takes the rightmost X-Forwarded-For entry. nginx sets that header
     # with $proxy_add_x_forwarded_for, which appends the real peer address, so the
@@ -142,10 +143,10 @@ def create_app(config_name='default'):
     # Read the opt-in from the environment here rather than trusting the value
     # Config captured at import time: the config module is imported the first time
     # anything touches `app`, which can be well before a caller gets to set it.
-    import os as _os
+    from app.config import bool_env
     _allow_sqlite = (
         app.config.get('ALLOW_SQLITE_FALLBACK')
-        or _os.environ.get('ALLOW_SQLITE_FALLBACK', '') in ('1', 'true', 'True', 'yes')
+        or bool_env('ALLOW_SQLITE_FALLBACK', False)
     )
     if not app.config.get('DATABASE_URL_IS_EXPLICIT') and not _allow_sqlite:
         raise RuntimeError(
@@ -161,25 +162,25 @@ def create_app(config_name='default'):
 
     @app.route('/favicon.ico/<path:filename>')
     def favicon_asset(filename):
-        return send_from_directory(app.static_folder + '/favicon.ico', filename)
+        return send_from_directory(os.path.join(app.static_folder, 'favicon.ico'), filename)
 
     # Browsers and pinned/mobile launchers probe these conventional root URLs
     # even when the page declares explicit icon links.
     @app.route('/favicon.ico')
     def favicon_root():
-        return send_from_directory(app.static_folder + '/favicon.ico', 'favicon.ico')
+        return send_from_directory(os.path.join(app.static_folder, 'favicon.ico'), 'favicon.ico')
 
     @app.route('/apple-touch-icon.png')
     @app.route('/apple-touch-icon-precomposed.png')
     def apple_touch_icon_root():
         return send_from_directory(
-            app.static_folder + '/favicon.ico', 'apple-touch-icon.png'
+            os.path.join(app.static_folder, 'favicon.ico'), 'apple-touch-icon.png'
         )
 
     @app.route('/site.webmanifest')
     def web_manifest_root():
         return send_from_directory(
-            app.static_folder + '/favicon.ico', 'site.webmanifest'
+            os.path.join(app.static_folder, 'favicon.ico'), 'site.webmanifest'
         )
 
     @app.route('/files/<path:filename>')
@@ -187,7 +188,7 @@ def create_app(config_name='default'):
         parts = [part for part in filename.split('/') if part]
         if not parts or any(part.startswith('.') for part in parts):
             abort(404)
-        return send_from_directory(app.static_folder + '/files', filename)
+        return send_from_directory(os.path.join(app.static_folder, 'files'), filename)
 
     # Configure Logging for Gunicorn
     import logging
@@ -237,16 +238,24 @@ def create_app(config_name='default'):
     @app.errorhandler(RequestEntityTooLarge)
     def handle_request_too_large(e):
         if request.path.startswith("/api/v1/"):
+            # The per-field number comes from the same LIMITS table the
+            # validator and the OpenAPI schema quote, so raising the cap does
+            # not leave this message advertising the old one. Imported here
+            # rather than at module scope: this runs at request time, long
+            # after the blueprint that defines it has been registered.
+            from app.api_v1.routes import LIMITS
             limit_bytes = app.config.get("MAX_CONTENT_LENGTH") or 0
             limit_mb = limit_bytes / (1024 * 1024)
+            field_mb = LIMITS["sequence_max_bytes"] / 1_000_000
             return jsonify({
                 "error": {
                     "code": "payload_too_large",
                     "message": (
                         f"Request body exceeds the maximum allowed size of "
                         f"{limit_mb:.1f} MB. If you are submitting a FASTA "
-                        f"`sequence`, note that the per-field cap is 5 MB; "
-                        f"larger inputs should be split into multiple jobs."
+                        f"`sequence`, note that the per-field cap is "
+                        f"{field_mb:g} MB; larger inputs should be split into "
+                        f"multiple jobs."
                     ),
                 }
             }), 413
@@ -285,18 +294,38 @@ def create_app(config_name='default'):
         try:
             from app.models import WhatsNewEntry, WhatsNewView
             from flask_login import current_user
-            from flask import request as req
             latest = WhatsNewEntry.query.order_by(WhatsNewEntry.published_at.desc()).first()
             if not latest:
                 return {'whats_new_has_new': False}
-            view_record = None
             if current_user.is_authenticated:
                 view_record = WhatsNewView.query.filter_by(user_id=current_user.id).first()
+                last_viewed = view_record.last_viewed_at if view_record else None
             else:
-                view_record = WhatsNewView.query.filter_by(ip_address=req.remote_addr).first()
-            has_new = view_record is None or latest.published_at > view_record.last_viewed_at
+                # Anonymous state lives in the session cookie, not in a row
+                # keyed by IP -- see main.whats_new(). This also means the badge
+                # no longer runs a query per page render for logged-out
+                # visitors, who are most of them.
+                from app.main.routes import read_anonymous_whats_new_view
+                last_viewed = read_anonymous_whats_new_view()
+            has_new = last_viewed is None or latest.published_at > last_viewed
             return {'whats_new_has_new': has_new}
-        except Exception:
+        except Exception as exc:
+            # The badge renders on every page, so it is the first thing to
+            # touch the database in a request -- and a failed query leaves the
+            # session in a rollback-required state, turning one bad badge query
+            # into PendingRollbackError for every later query in the same
+            # request. Roll back here so the page that follows still works.
+            try:
+                from app.extensions import db
+                db.session.rollback()
+            except Exception:
+                pass
+            from app.services.log_context import log_degradation_rate_limited
+            log_degradation_rate_limited(
+                app.logger, "whats_new_badge_unavailable",
+                "What's New badge suppressed because its lookup failed",
+                exception=type(exc).__name__,
+            )
             return {'whats_new_has_new': False}
 
     # Register CLI commands

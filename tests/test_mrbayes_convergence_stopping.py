@@ -192,9 +192,9 @@ def _submit(payload):
     """Call POST /api/job's handler and return the params it enqueued."""
     captured = {}
 
-    def _fake_enqueue(job_params):
+    def _fake_enqueue(job_params, *args, **kwargs):
         captured.update(job_params)
-        return JOB_ID
+        return kwargs.get("job_id") or JOB_ID
 
     app = Flask(__name__)
     with (

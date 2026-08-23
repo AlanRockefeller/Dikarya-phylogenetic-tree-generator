@@ -194,13 +194,23 @@ def _fetch_annotation_xml(accessions: List[str]) -> Optional[str]:
         return None
 
 
-def lookup_locations(accessions: List[str]) -> Tuple[Dict[str, str], List[str]]:
+def lookup_locations(accessions: List[str]) -> Tuple[Dict[str, str], List[str], List[str]]:
     """Look up collection locations for GenBank accessions.
 
-    Returns ``(locations, missing)`` where ``locations`` is keyed by both the
-    bare accession and the versioned accession (both uppercase) so a caller can
-    match whichever form appeared in the user's FASTA header, and ``missing``
-    lists accessions NCBI returned no record for.
+    Returns ``(locations, missing, unavailable)``.
+
+    ``locations`` is keyed by both the bare accession and the versioned
+    accession (both uppercase) so a caller can match whichever form appeared in
+    the user's FASTA header.
+
+    ``missing`` lists accessions NCBI answered about and had no location for --
+    a fact about the record.
+
+    ``unavailable`` lists accessions we could not ask about, because their whole
+    efetch batch failed. These used to be folded into ``missing``, which turned
+    an NCBI outage into the claim that a hundred records have no collection
+    site: wrong, and wrong in the direction that makes a user stop asking. A
+    caller should say "could not be checked" and offer a retry.
     """
     requested = []
     seen = set()
@@ -219,10 +229,13 @@ def lookup_locations(accessions: List[str]) -> Tuple[Dict[str, str], List[str]]:
         elif cached:
             locations[accession] = cached
 
+    unavailable_set = set()
     for start in range(0, len(to_fetch), EFETCH_BATCH_SIZE):
         batch = to_fetch[start:start + EFETCH_BATCH_SIZE]
         xml_text = _fetch_annotation_xml(batch)
         if not xml_text:
+            # The request failed; nothing was learned about any id in it.
+            unavailable_set.update(batch)
             continue
 
         parsed = _parse_genbank_xml(xml_text)
@@ -242,11 +255,24 @@ def lookup_locations(accessions: List[str]) -> Tuple[Dict[str, str], List[str]]:
     # a version NCBI has since superseded), so resolve each requested accession
     # against its bare form too before deciding it went unanswered.
     missing = []
+    unavailable = []
     for accession in requested:
         base = accession.split(".")[0]
         if accession not in locations and base in locations:
             locations[accession] = locations[base]
         if accession not in locations and _cache_get(accession) is None and _cache_get(base) is None:
-            missing.append(accession)
+            if accession in unavailable_set:
+                unavailable.append(accession)
+            else:
+                missing.append(accession)
 
-    return locations, missing
+    if unavailable:
+        from app.services.log_context import log_degradation
+        log_degradation(
+            logger, "genbank_locations_unavailable",
+            "GenBank could not be queried for some accessions, so their "
+            "collection locations are unknown rather than absent",
+            count=len(unavailable),
+        )
+
+    return locations, missing, unavailable

@@ -7,14 +7,30 @@ from app.services.security_utils import validate_job_id
 def check_job_access(job_id: str, mode: str = "view") -> Tuple[Optional[Job], Optional[str], int]:
     """
     Check if current user can access the given job.
-    
+
     Args:
         job_id: The job ID to check.
         mode: "view" (default) or "edit".
-        
+
+            "view" is PUBLIC, LINK-BASED (capability) access and performs NO
+            owner check at all. It verifies only that the job id is well formed
+            and that the job exists; any caller holding the UUID -- signed in,
+            signed in as somebody else, or fully anonymous -- gets (job, None,
+            200). This is intentional: the job URL is what people paste into
+            papers and messages, and the tree viewer is meant to open for
+            whoever follows the link. Do not tighten it into an owner check;
+            that would break every shared tree link in existence.
+
+            "edit" is where ownership is enforced. See the policy comment in
+            the body: an owned job is editable only by its owner, an ownerless
+            job by anyone holding the UUID.
+
+            So a caller wanting "only the owner may do this" must pass
+            mode="edit". Reaching for the default gets a public read.
+
     Returns:
         (db_job, error_message, status_code)
-        
+
         If access is granted: (db_job, None, 200)
         If error: (None, error_message, status_code)
     """

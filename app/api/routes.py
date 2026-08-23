@@ -6,6 +6,7 @@ from app.workers.queue import (
     enqueue_job,
     enqueue_recompute_job,
     get_job_status,
+    prepare_phylo_job_params,
 )
 from app.config import Config
 from app.extensions import db
@@ -14,6 +15,7 @@ import logging
 import re
 import hashlib
 import time
+import uuid
 from urllib.parse import urlsplit
 from difflib import SequenceMatcher
 from datetime import datetime
@@ -165,6 +167,7 @@ VALID_TREE_METHODS = {"nj", "raxml", "iqtree", "mrbayes", "fasttree"}
 # ownership) is read from the stored job and is not request-controlled.
 RECOMPUTE_OVERRIDABLE_FIELDS = frozenset({
     "alignment_method", "trimming_method", "trim_terminal_overhangs",
+    "fix_orientation",
     "tree_method", "tree_model",
     "bootstrap", "alrt_replicates",
     "mcmc_generations", "mcmc_nruns", "mcmc_nchains", "mcmc_burnin_fraction",
@@ -183,7 +186,7 @@ RECOMPUTE_OVERRIDABLE_FIELDS = frozenset({
 # the way in, where the value is still a request value.
 RECOMPUTE_BOOLEAN_FIELDS = frozenset({
     "trim_terminal_overhangs", "enable_bootstrap", "moose_enabled",
-    "early_stopping", "mcmc_stop_early",
+    "early_stopping", "mcmc_stop_early", "fix_orientation",
 })
 
 # Settings the viewer's Advanced panel reads back so it can open pre-filled with
@@ -1257,7 +1260,10 @@ def fetch_genbank_locations():
     inside pasted FASTA headers.
 
     Request: { "accessions": ["OR807397", "MJ505555.1"] }
-    Response: { "status": "success", "locations": {"OR807397": "USA: Arizona, Greenlee County"}, "missing": [...] }
+    Response: { "status": "success",
+                "locations": {"OR807397": "USA: Arizona, Greenlee County"},
+                "missing": [...],      # NCBI answered; the record has no location
+                "unavailable": [...] } # NCBI could not be reached for these
     """
     data = request.get_json(silent=True) or {}
     raw_accessions = data.get("accessions", data.get("input", ""))
@@ -1278,11 +1284,15 @@ def fetch_genbank_locations():
     try:
         from app.services.genbank_location_service import lookup_locations
 
-        locations, missing = lookup_locations(accessions)
+        locations, missing, unavailable = lookup_locations(accessions)
         return jsonify({
             "status": "success",
             "locations": locations,
-            "missing": missing
+            "missing": missing,
+            # Kept separate from `missing` on purpose: "GenBank has no location
+            # for this record" and "GenBank did not answer" are different
+            # answers, and only one of them is worth retrying.
+            "unavailable": unavailable
         })
     except Exception as e:
         return _server_error(e, where="genbank_locations")
@@ -2112,6 +2122,18 @@ def inaturalist_tree_batch():
         return _server_error(e, where="inaturalist_tree_batch")
 
 
+def _inaturalist_result_message(message, result):
+    """Append an explicit note when the search stopped before it finished."""
+    if not result.get('timed_out'):
+        return message
+    total = result.get('total_available') or 0
+    return (
+        f"{message}. This search was still running when it hit its time limit, "
+        f"so these are partial results out of {total} matching observation(s) -- "
+        f"narrow the search (by taxon, place or date) to see the rest."
+    )
+
+
 @bp.route('/inaturalist', methods=['POST'])
 @limiter.limit("40 per minute; 600 per hour")
 def fetch_inaturalist():
@@ -2156,6 +2178,7 @@ def fetch_inaturalist():
     
     try:
         from app.services.inaturalist_service import (
+            INTERACTIVE_FETCH_BUDGET_SECONDS,
             validate_inaturalist_url,
             fetch_inaturalist_data
         )
@@ -2173,8 +2196,12 @@ def fetch_inaturalist():
         logger.info(f"iNaturalist API: Processing URL type={url_info['type']}, action={action}")
         
         if action == 'analyze':
-            # Fetch and analyze observations (default mode='all' gets both ITS and PSN stats)
-            result = fetch_inaturalist_data(url, mode='all')
+            # Fetch and analyze observations (default mode='all' gets both ITS and PSN stats).
+            # This runs inside a request, so pagination gets a wall-clock budget
+            # and reports partial results rather than holding the slot for the
+            # full 50-page walk of each query.
+            result = fetch_inaturalist_data(
+                url, mode='all', time_budget=INTERACTIVE_FETCH_BUDGET_SECONDS)
 
             # Return analysis without full sequences
             # Defensive: check sequences list exists and has items before accessing
@@ -2206,20 +2233,29 @@ def fetch_inaturalist():
                 "sequence": seq if can_blast else None,
                 "mycomap_blast_url": result.get('mycomap_blast_url') if is_single_url else None,
                 "truncated": result.get('truncated', False),
+                "timed_out": result.get('timed_out', False),
                 "total_available": result.get('total_available', 0),
-                "message": f"Found {result['dna_count']} observation(s) with DNA Barcode ITS"
+                "message": _inaturalist_result_message(
+                    f"Found {result['dna_count']} observation(s) with DNA Barcode ITS",
+                    result,
+                )
             })
         else:
             # Optimize: Only fetch ITS sequences for queue adding (skip PSN stats)
-            result = fetch_inaturalist_data(url, mode='its_only')
+            result = fetch_inaturalist_data(
+                url, mode='its_only', time_budget=INTERACTIVE_FETCH_BUDGET_SECONDS)
             
             # Return full sequences for queue
             return jsonify({
                 "status": "success",
                 "sequences": result['sequences'],
                 "truncated": result.get('truncated', False),
+                "timed_out": result.get('timed_out', False),
                 "total_available": result.get('total_available', 0),
-                "message": f"Fetched {len(result['sequences'])} DNA sequences from iNaturalist"
+                "message": _inaturalist_result_message(
+                    f"Fetched {len(result['sequences'])} DNA sequences from iNaturalist",
+                    result,
+                )
             })
         
     except ValueError as e:
@@ -2324,6 +2360,9 @@ def create_job():
         "alignment_method": data.get("alignment_method", "default"),
         "trimming_method": data.get("trimming_method", Config.DEFAULT_TRIMMING_METHOD),
         "trim_terminal_overhangs": coerce_bool(data.get("trim_terminal_overhangs"), True)[0],
+        # Defaults true, so the One-Click paths -- which never send it -- keep
+        # the direction correction they have always had via MAFFT.
+        "fix_orientation": coerce_bool(data.get("fix_orientation"), True)[0],
         "its_region": normalize_its_region(data.get("its_region")),
         "its_min_length": resolve_its_min_length(
             normalize_its_region(data.get("its_region")), data.get("its_min_length")
@@ -2458,43 +2497,71 @@ def create_job():
         except ValueError as e:
             return jsonify({"status": "error", "error": str(e)}), 400
 
+    # Apply the same submission-wide dedup/warning logic enqueue_job normally
+    # owns before persisting, then enqueue with that preparation disabled. This
+    # preserves the observable params while ensuring RQ cannot run first.
+    prepare_phylo_job_params(job_params)
+    job_id = str(uuid.uuid4())
+    job_record = Job(
+        id=job_id,
+        status="queued",
+        job_dir=str(Config.JOB_DIR / job_id),
+        input_type=job_params["input_type"],
+        metrics={
+            "tree_method": job_params["tree_method"],
+            "notes": job_params["notes"],
+            "alignment_method": job_params["alignment_method"],
+            "trimming_method": job_params["trimming_method"],
+            "trim_terminal_overhangs": job_params["trim_terminal_overhangs"],
+            "fix_orientation": job_params["fix_orientation"],
+            "its_region": job_params.get("its_region"),
+            "run_preset": job_params.get("run_preset"),
+            "bootstrap_cap": job_params.get("bootstrap_cap"),
+            # Set by enqueue_job when the submitted set cannot yield an
+            # informative tree. Kept on the record so the warning is still
+            # there when the user opens the finished job.
+            "input_warnings": job_params.get("input_warnings") or [],
+        }
+    )
+
+    if current_user.is_authenticated:
+        job_record.user_id = current_user.id
+
     try:
-        job_id = enqueue_job(job_params)
-        
-        # Create DB record
-        job_record = Job(
-            id=job_id,
-            status="queued",
-            job_dir=str(Config.JOB_DIR / job_id),
-            input_type=job_params["input_type"],
-            metrics={
-                "tree_method": job_params["tree_method"],
-                "notes": job_params["notes"],
-                "alignment_method": job_params["alignment_method"],
-                "trimming_method": job_params["trimming_method"],
-                "trim_terminal_overhangs": job_params["trim_terminal_overhangs"],
-                "its_region": job_params.get("its_region"),
-                "run_preset": job_params.get("run_preset"),
-                "bootstrap_cap": job_params.get("bootstrap_cap"),
-                # Set by enqueue_job when the submitted set cannot yield an
-                # informative tree. Kept on the record so the warning is still
-                # there when the user opens the finished job.
-                "input_warnings": job_params.get("input_warnings") or [],
-            }
-        )
-
-        if current_user.is_authenticated:
-            job_record.user_id = current_user.id
-
         db.session.add(job_record)
         db.session.commit()
+    except Exception as e:
+        db.session.rollback()
+        return _server_error(e, where="create_job.persist")
 
+    try:
+        enqueue_job(job_params, job_id=job_id, prepare=False)
         response = {"status": "queued", "job_id": job_id}
         if job_params.get("input_warnings"):
             response["warnings"] = job_params["input_warnings"]
         return jsonify(response), 202
     except Exception as e:
-        return _server_error(e)
+        logger.exception(
+            "event=web.enqueue_failed job=%s could not be queued after its DB "
+            "row was committed", job_id,
+        )
+        try:
+            job_record.status = "failed"
+            metrics = dict(job_record.metrics or {})
+            metrics["error"] = (
+                "This job could not be added to the processing queue and was "
+                "never started. Please submit it again."
+            )
+            metrics["enqueue_error"] = type(e).__name__
+            metrics["failed_at"] = datetime.utcnow().isoformat()
+            job_record.metrics = metrics
+            db.session.commit()
+        except Exception:
+            db.session.rollback()
+            logger.exception(
+                "event=web.enqueue_failure_unrecorded job=%s", job_id,
+            )
+        return _server_error(e, where="create_job.enqueue")
 
 @bp.route('/job/<job_id>/status', methods=['GET'])
 def get_job_status_route(job_id):
@@ -3108,7 +3175,8 @@ def rebuild_with_duplicates(job_id):
         )
         job_params["rebuilt_from_job_id"] = job_id
 
-        new_job_id = enqueue_job(job_params)
+        prepare_phylo_job_params(job_params)
+        new_job_id = str(uuid.uuid4())
         new_record = Job(
             id=new_job_id,
             status="queued",
@@ -3128,6 +3196,20 @@ def rebuild_with_duplicates(job_id):
             new_record.user_id = current_user.id
         db.session.add(new_record)
         db.session.commit()
+        try:
+            enqueue_job(job_params, job_id=new_job_id, prepare=False)
+        except Exception as exc:
+            new_record.status = "failed"
+            failed_metrics = dict(new_record.metrics or {})
+            failed_metrics["error"] = (
+                "This rebuild could not be added to the processing queue and "
+                "was never started. Please try again."
+            )
+            failed_metrics["enqueue_error"] = type(exc).__name__
+            failed_metrics["failed_at"] = datetime.utcnow().isoformat()
+            new_record.metrics = failed_metrics
+            db.session.commit()
+            raise
 
         return jsonify({
             "status": "queued",

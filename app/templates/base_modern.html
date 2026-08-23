@@ -207,10 +207,13 @@
                         class="text-gray-300 hover:text-journal-gold transition-colors text-sm font-medium {% block nav_my_jobs %}{% endblock %}">
                         <i class="fas fa-tasks mr-1"></i> My Jobs
                     </a>
-                    <a href="{{ url_for('auth.logout') }}"
-                        class="text-gray-300 hover:text-journal-gold transition-colors text-sm font-medium">
-                        <i class="fas fa-sign-out-alt mr-1"></i> Logout
-                    </a>
+                    <form action="{{ url_for('auth.logout') }}" method="post" class="inline">
+                        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+                        <button type="submit"
+                            class="text-gray-300 hover:text-journal-gold transition-colors text-sm font-medium">
+                            <i class="fas fa-sign-out-alt mr-1"></i> Logout
+                        </button>
+                    </form>
                     {% else %}
                     <span class="text-xs text-gray-400 italic" title="Not signed in. Anyone with a job link can edit that job. Log in for exclusive edit access.">
                         <i class="fas fa-user-secret mr-1"></i>Anonymous
@@ -278,10 +281,13 @@
                     <i class="fas fa-tasks mr-2 w-5"></i> My Jobs
                 </a>
                 <div class="border-t border-journal-dark pt-3 mt-3">
-                    <a href="{{ url_for('auth.logout') }}"
-                        class="block text-gray-200 hover:text-journal-gold transition-colors font-medium py-2">
-                        <i class="fas fa-sign-out-alt mr-2 w-5"></i> Logout
-                    </a>
+                    <form action="{{ url_for('auth.logout') }}" method="post">
+                        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+                        <button type="submit"
+                            class="block w-full text-left text-gray-200 hover:text-journal-gold transition-colors font-medium py-2">
+                            <i class="fas fa-sign-out-alt mr-2 w-5"></i> Logout
+                        </button>
+                    </form>
                 </div>
                 {% else %}
                 <div class="text-xs text-gray-400 italic py-2 border-t border-journal-dark">

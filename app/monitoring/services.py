@@ -87,7 +87,15 @@ def emit_health_transitions(metrics):
         db.session.execute(text("SELECT 1"))
         _transition("database", False, "query=ok")
         cutoff = datetime.utcnow() - timedelta(days=1)
-        stuck = Job.query.filter(Job.status.in_(("queued", "running")), Job.updated_at < cutoff).count()
+        # coalesce, to agree with `flask reap-stuck-jobs`, which uses the same
+        # expression. `Job.updated_at < cutoff` is NULL -- and therefore never
+        # true -- for rows written before updated_at existed, so the jobs most
+        # likely to be genuinely abandoned were the ones this check could not
+        # see, and the reaper's list and the health check's count disagreed.
+        stuck = Job.query.filter(
+            Job.status.in_(("queued", "running")),
+            func.coalesce(Job.updated_at, Job.created_at) < cutoff,
+        ).count()
         _transition("stuck_jobs", stuck > 0, f"older_than_1d={stuck}")
     except Exception as exc:
         _transition("database", True, f"exception={type(exc).__name__}")
@@ -162,7 +170,11 @@ def get_worker_status():
                 status = "dead"
             workers.append({
                 "id": hb_file.stem,
-                "last_heartbeat": datetime.fromtimestamp(mtime).isoformat(),
+                # UTC, like every other timestamp this module emits.
+                # fromtimestamp() rendered server-local time, so a
+                # heartbeat looked hours off from the "timestamp" field
+                # sitting next to it in the same payload.
+                "last_heartbeat": datetime.utcfromtimestamp(mtime).isoformat(),
                 "age_seconds": round(age, 1),
                 "status": status,
             })

@@ -19,6 +19,12 @@ except ImportError:
 logger = logging.getLogger(__name__)
 
 
+# The unambiguous nucleotides. A run has to contain at least one of these to
+# count as DNA -- '-' and 'N' are placeholders for the absence of a base, and a
+# string of nothing but placeholders carries no sequence information at all.
+CONCRETE_BASES = frozenset("ACGTacgt")
+
+
 def clean_dna_sequence(raw_sequence: str, min_length: int = 100) -> str:
     """
     Clean a DNA sequence by extracting the longest contiguous run of valid nucleotides.
@@ -34,7 +40,14 @@ def clean_dna_sequence(raw_sequence: str, min_length: int = 100) -> str:
     2. Conservatively recover a sequence from a malformed one-line FASTA
     3. Remove all whitespace
     4. Find the longest contiguous run of valid IUPAC nucleotide characters
+       that contains at least one concrete base
     5. Return that run if it meets minimum length, otherwise empty string
+
+    Step 4's "at least one concrete base" is what stops a row of 100 dashes --
+    which is entirely composed of valid characters -- from being accepted as a
+    sequence and going on to align against real data. The bar is deliberately
+    only one A/C/G/T: heavily ambiguous reads are still real reads, and a
+    percentage threshold would start throwing away biology.
     
     Args:
         raw_sequence: Raw DNA sequence string that may contain non-DNA text
@@ -84,25 +97,33 @@ def clean_dna_sequence(raw_sequence: str, min_length: int = 100) -> str:
     best_start = 0
     best_length = 0
     current_start = None
-    
+    current_has_base = False
+
+    def _consider(start, length, has_base):
+        # A run made entirely of gaps and ambiguity codes is not a sequence, so
+        # it is not eligible to win -- a shorter run with real bases beside it
+        # is the better answer, and no run at all is better than a row of dashes.
+        nonlocal best_start, best_length
+        if has_base and length > best_length:
+            best_start = start
+            best_length = length
+
     for i, c in enumerate(combined):
         if c in valid_chars:
             if current_start is None:
                 current_start = i
+                current_has_base = False
+            if c in CONCRETE_BASES:
+                current_has_base = True
         else:
             if current_start is not None:
-                run_length = i - current_start
-                if run_length > best_length:
-                    best_start = current_start
-                    best_length = run_length
+                _consider(current_start, i - current_start, current_has_base)
                 current_start = None
+                current_has_base = False
     
     # Check final run (if string ends with valid chars)
     if current_start is not None:
-        run_length = len(combined) - current_start
-        if run_length > best_length:
-            best_start = current_start
-            best_length = run_length
+        _consider(current_start, len(combined) - current_start, current_has_base)
     
     # Extract the best run if it meets minimum length
     if best_length >= min_length:

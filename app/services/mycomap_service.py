@@ -589,27 +589,6 @@ def _title_matches_blast_label(label: str, wanted: str) -> bool:
     return label == wanted or label.startswith(f"{wanted} - ")
 
 
-def _blast_page_mentions_title(url: str, wanted: str) -> bool:
-    """Confirm a synthesized BLAST result URL really is the job we created."""
-    request = urllib.request.Request(
-        url,
-        headers={
-            "User-Agent": "Dikarya-TreeBuilder/1.0",
-            "Accept": "text/html,*/*",
-            "Cache-Control": "no-cache",
-        },
-        method="GET",
-    )
-    try:
-        with urllib.request.urlopen(request, timeout=REQUEST_TIMEOUT) as resp:
-            page = resp.read().decode("utf-8", errors="replace")
-    except Exception as exc:
-        logger.warning("Could not verify MycoMap BLAST page %s: %s", url, exc)
-        return False
-    text = " ".join(html.unescape(re.sub(r"<[^>]+>", " ", page)).split())
-    return wanted in text
-
-
 def _fetch_mycomap_blast_listing(warnings: Optional[list] = None) -> str:
     """Fetch the public BLAST listing page, or "" if it cannot be read."""
     listing_query = urllib.parse.urlencode({"d": "38", "_": str(time.time_ns())})

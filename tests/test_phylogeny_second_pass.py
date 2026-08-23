@@ -18,6 +18,10 @@ from app.services import alignment_service, tree_builder_service, trimming_servi
 LOGGER = logging.getLogger("tests.phylogeny_second_pass")
 
 
+# MAFFT's own limit, asserted both for a MAFFT alignment and for the direction
+# pre-pass that now precedes every other aligner.
+MAFFT_LIMIT_HOURS = 1.25
+
 def _config(**overrides):
     values = {
         "MAFFT_BINARY": "mafft",
@@ -27,7 +31,7 @@ def _config(**overrides):
         "RAXML_BINARY": "raxml-ng",
         "TRIMAL_BINARY": "trimal",
         "BMGE_BINARY": "BMGE.jar",
-        "MAFFT_TIME_LIMIT_HOURS": 1.25,
+        "MAFFT_TIME_LIMIT_HOURS": MAFFT_LIMIT_HOURS,
         "MUSCLE_TIME_LIMIT_HOURS": 1.5,
         "CLUSTALO_TIME_LIMIT_HOURS": 1.75,
         "IQTREE_ALIGNMENT_TIME_LIMIT_HOURS": 2,
@@ -73,7 +77,7 @@ def test_alignment_and_trimming_services_have_no_unbounded_external_call_sites()
 @pytest.mark.parametrize(
     ("method", "tool", "hours"),
     [
-        ("mafft", "MAFFT", 1.25),
+        ("mafft", "MAFFT", MAFFT_LIMIT_HOURS),
         ("muscle", "MUSCLE", 1.5),
         ("clustalo", "Clustal Omega", 1.75),
         ("iqtree_builtin", "IQ-TREE alignment", 2),
@@ -123,9 +127,18 @@ def test_every_aligner_call_site_passes_a_wall_clock_limit(
         input_path, output_path, AlignmentParams(method=method), _config(), LOGGER, job_id
     )
 
-    assert calls[0]["timeout"] == int(hours * 3600)
+    # The direction pre-pass adds a MAFFT invocation ahead of every
+    # direction-blind aligner, so the chosen aligner is the *last* call, not the
+    # first. Both still have to carry a wall-clock limit, which is what this
+    # test exists to guarantee -- so check the pre-pass too rather than
+    # skipping past it.
+    if method != "mafft":
+        assert len(calls) == 2, f"expected direction pre-pass + aligner, got {len(calls)}"
+        assert calls[0]["timeout"] == int(MAFFT_LIMIT_HOURS * 3600)
+    aligner_call = calls[-1]
+    assert aligner_call["timeout"] == int(hours * 3600)
     if streaming:
-        assert calls[0]["cpu_limit_seconds"] >= calls[0]["timeout"]
+        assert aligner_call["cpu_limit_seconds"] >= aligner_call["timeout"]
 
 
 @pytest.mark.parametrize(

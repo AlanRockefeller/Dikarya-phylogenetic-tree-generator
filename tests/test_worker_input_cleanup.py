@@ -65,9 +65,9 @@ class WorkerInputCleanupTests(unittest.TestCase):
         }
         captured = {}
 
-        def fake_enqueue(params):
+        def fake_enqueue(params, *args, **kwargs):
             captured.update(params)
-            return "new-job"
+            return kwargs.get("job_id") or "new-job"
 
         fake_session = SimpleNamespace(add=Mock(), commit=Mock())
         fake_job_model = lambda **kwargs: SimpleNamespace(**kwargs)

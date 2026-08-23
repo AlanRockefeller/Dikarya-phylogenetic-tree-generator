@@ -120,9 +120,17 @@ class WhatsNewEntry(db.Model):
 
 
 class WhatsNewView(db.Model):
+    """Last time a *signed-in* user opened the What's New page.
+
+    Anonymous visitors are tracked in their own session cookie instead (see
+    `main.whats_new`), so nothing writes `ip_address` any more. The column and
+    the rows already written to it are left alone: they are harmless, and
+    dropping a column is not something to do on the way past.
+    """
     __tablename__ = 'whats_new_view'
     id = db.Column(db.Integer, primary_key=True)
     user_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=True, unique=True)
+    # Legacy: written only by versions before anonymous state moved to the session.
     ip_address = db.Column(db.String(45), nullable=True, unique=True)
     last_viewed_at = db.Column(db.DateTime, default=datetime.utcnow, nullable=False)
 
@@ -149,6 +157,14 @@ class TodoSuggestion(db.Model):
 @dataclass
 class AlignmentParams:
     method: str  # "mafft", "muscle", "clustalo", "iqtree_builtin", "default"
+    # Reverse-complement sequences the aligner finds are backwards. MAFFT does
+    # this natively (--adjustdirectionaccurately); MUSCLE, Clustal Omega and
+    # IQ-TREE have no equivalent, so for those a short MAFFT pass runs first
+    # purely to decide direction. First-class rather than smuggled through
+    # `advanced_options`, for the same reason as
+    # TrimmingParams.trim_terminal_overhangs: the worker and recompute paths
+    # must model it identically.
+    fix_orientation: bool = True
     advanced_options: Dict[str, Any] = field(default_factory=dict)
 
 @dataclass

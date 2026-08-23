@@ -395,6 +395,30 @@ class DeleteJobTests(unittest.TestCase):
         self.assertTrue((self.job_dir / "tree" / "tree_original.newick").is_file())
         self.assertIn("rollback", events)
 
+    def test_a_live_job_commit_failure_restores_files_and_guard_state(self):
+        class _FailLogicalDeleteOnce(_RecordingDb):
+            def __init__(self, events):
+                super().__init__(events)
+                self.commits = 0
+
+            def _commit(self):
+                self.commits += 1
+                self.events.append("commit")
+                if self.commits == 2:
+                    raise RuntimeError("delete commit failed")
+
+        events = []
+        database = _FailLogicalDeleteOnce(events)
+        response, events, database = self._delete(
+            status="queued", db=database, events=events,
+            release=(True, "canceled"),
+        )
+
+        self.assertEqual(response.status_code, 500)
+        self.assertTrue(self.job_dir.is_dir())
+        self.assertEqual(database.deleted[0].status, "queued")
+        self.assertEqual(database.commits, 3)
+
     def test_a_job_that_cannot_be_stopped_is_not_deleted_at_all(self):
         events = []
         response, events, db = self._delete(
@@ -404,8 +428,9 @@ class DeleteJobTests(unittest.TestCase):
         self.assertEqual(response.status_code, 409)
         self.assertEqual(response.get_json()["error"]["code"], "conflict")
         self.assertTrue(self.job_dir.is_dir())
-        self.assertEqual(events, [])
+        self.assertEqual(events, ["commit", "commit"])
         self.assertEqual(db.deleted, [])
+        self.assertEqual(db.added, [])
 
     def test_a_queued_job_is_released_from_rq_before_anything_is_touched(self):
         calls = []
@@ -433,6 +458,21 @@ class DeleteJobTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         # RQ was released while the directory was still in place.
         self.assertEqual(calls, [(self.JOB_ID, True)])
+
+    def test_the_durable_guard_is_committed_before_rq_release(self):
+        events = []
+
+        def _release(_job_id):
+            events.append("release")
+            return True, "cancelled"
+
+        response, events, _db = self._delete(
+            status="queued", events=events,
+            extra_patches=[patch.object(v1, "_release_rq_job", _release)],
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(events[:2], ["commit", "release"])
 
     def test_a_completed_job_needs_no_redis_round_trip(self):
         def _explode(job_id):
@@ -532,7 +572,7 @@ class ReleaseRqJobTests(unittest.TestCase):
 
     def test_a_queued_job_is_cancelled_out_of_the_queue(self):
         rq_job = MagicMock()
-        rq_job.get_status.return_value = "queued"
+        rq_job.get_status.side_effect = ["queued", "canceled"]
         released, detail = self._release(MagicMock(return_value=rq_job))
         self.assertTrue(released)
         rq_job.cancel.assert_called_once_with()
@@ -563,12 +603,62 @@ class ReleaseRqJobTests(unittest.TestCase):
         self.assertEqual(detail, "stopped")
         stop.assert_called_once()
 
+    def test_a_job_dequeued_during_cancel_is_stopped(self):
+        rq_job = MagicMock()
+        rq_job.get_status.side_effect = ["queued", "started", "stopped"]
+        with (
+            patch.object(v1, "DELETE_STOP_WAIT_SECONDS", 1.0),
+            patch.object(v1, "DELETE_STOP_POLL_SECONDS", 0.01),
+            patch("rq.command.send_stop_job_command", MagicMock()) as stop,
+        ):
+            released, detail = self._release(MagicMock(return_value=rq_job))
+        self.assertTrue(released)
+        self.assertEqual(detail, "stopped")
+        rq_job.cancel.assert_called_once_with()
+        stop.assert_called_once()
+
     def test_redis_trouble_is_never_reported_as_released(self):
         with patch("app.workers.queue.get_redis_connection",
                    side_effect=OSError("redis down")):
             released, detail = v1._release_rq_job(self.JOB_ID)
         self.assertFalse(released)
         self.assertIn("OSError", detail)
+
+
+class WorkerDeletionGuardTests(unittest.TestCase):
+    JOB_ID = "33333333-3333-4333-8333-333333333333"
+
+    def test_missing_deleted_row_prevents_any_directory_recreation(self):
+        from app.workers import tasks
+
+        app = Flask(__name__)
+        model = MagicMock()
+        model.query.get.return_value = None
+        with TemporaryDirectory() as tmp, \
+                patch.object(tasks, "get_current_job",
+                             return_value=SimpleNamespace(id=self.JOB_ID)), \
+                patch("app.create_app", return_value=app), \
+                patch("app.models.Job", model), \
+                patch.object(Config, "JOB_DIR", Path(tmp)):
+            result = tasks.run_phylo_job.__wrapped__({})
+            self.assertEqual(result["status"], "cancelled")
+            self.assertFalse((Path(tmp) / self.JOB_ID).exists())
+
+    def test_deleting_row_prevents_the_worker_from_beginning(self):
+        from app.workers import tasks
+
+        app = Flask(__name__)
+        model = MagicMock()
+        model.query.get.return_value = SimpleNamespace(status="deleting")
+        with TemporaryDirectory() as tmp, \
+                patch.object(tasks, "get_current_job",
+                             return_value=SimpleNamespace(id=self.JOB_ID)), \
+                patch("app.create_app", return_value=app), \
+                patch("app.models.Job", model), \
+                patch.object(Config, "JOB_DIR", Path(tmp)):
+            result = tasks.run_phylo_job.__wrapped__({})
+            self.assertEqual(result["status"], "cancelled")
+            self.assertFalse((Path(tmp) / self.JOB_ID).exists())
 
 
 # ---------------------------------------------------------------------------

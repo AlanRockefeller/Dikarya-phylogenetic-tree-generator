@@ -6,6 +6,11 @@ time and emit either JSON or YAML. Update this file when adding endpoints.
 from flask import request
 
 from app.config import Config
+from app.api_v1.job_defaults import (
+    DEFAULT_ALIGNMENT_METHOD,
+    DEFAULT_BOOTSTRAP,
+    DEFAULT_TREE_METHOD,
+)
 
 # MrBayes defaults are quoted straight from the config so the published schema
 # cannot drift from what the API actually applies.
@@ -14,6 +19,13 @@ DEFAULT_MCMC_NRUNS = Config.DEFAULT_MCMC_NRNS
 DEFAULT_MCMC_CHAINS = Config.DEFAULT_MCMC_CHAINS
 DEFAULT_MCMC_BURNIN_FRACTION = Config.DEFAULT_MCMC_BURNIN_FRACTION
 DEFAULT_MCMC_STOP_EARLY = Config.DEFAULT_MCMC_STOP_EARLY
+
+# ...and so do the job-parameter defaults, which are re-exported from the
+# module that create_job() itself applies them from. A number written here by
+# hand is a number that goes stale the first time the runtime default moves:
+# `alrt_replicates` was already documented as a literal 1000 while the route
+# read Config.DEFAULT_IQTREE_ALRT.
+DEFAULT_IQTREE_ALRT = Config.DEFAULT_IQTREE_ALRT
 
 MCMC_STOP_EARLY_DESCRIPTION = (
     "Enable MrBayes convergence-based early stopping (mcmcdiagn=yes "
@@ -30,6 +42,14 @@ MCMC_STOP_EARLY_DESCRIPTION = (
     "by itself guarantee satisfactory ESS or PSRF -- those are checked "
     "separately after the run and reported in tree_metadata.json. Defaults to "
     "true for newly submitted jobs."
+)
+
+
+TIMESTAMP_FILTER_DESCRIPTION = (
+    "ISO-8601 timestamp filtering on {field}. An offset (`2026-08-01T12:00:00-07:00`) "
+    "or a trailing `Z` is converted to UTC before the comparison; a timestamp "
+    "with no offset is taken to already be UTC, which is what job timestamps "
+    "are stored and returned in."
 )
 
 
@@ -65,6 +85,23 @@ def _schemas():
                     "properties": {
                         "alignment_method": {"type": "string"},
                         "trimming_method": {"type": "string"},
+                        # serialize_job() has always returned this; the schema
+                        # simply never listed it.
+                        "trim_terminal_overhangs": {
+                            "type": ["boolean", "null"],
+                            "description": (
+                                "Whether terminal-overhang trimming was applied. "
+                                "Null for jobs stored before the option existed."
+                            ),
+                        },
+                        "fix_orientation": {
+                            "type": ["boolean", "null"],
+                            "description": (
+                                "Whether backwards sequences were reverse-complemented before "
+                                "alignment. Null for jobs stored before the option existed; "
+                                "those ran with it on."
+                            ),
+                        },
                         "tree_method": {"type": "string"},
                         "tree_model": {"type": "string"},
                         "bootstrap": {"type": "integer"},
@@ -119,6 +156,18 @@ def _schemas():
                                       "enum": ["mafft", "muscle", "clustalo", "iqtree_builtin", "default"]},
                 "trimming_method": {"type": "string",
                                      "enum": ["none", "trimal_gappy", "trimal", "bmge"]},
+                "fix_orientation": {
+                    "type": "boolean",
+                    "default": True,
+                    "description": (
+                        "Reverse-complement sequences submitted in the wrong orientation before "
+                        "aligning. MAFFT does this natively; for MUSCLE and Clustal Omega, which "
+                        "cannot detect direction, a short MAFFT pass runs first to decide it. "
+                        "Ignored when alignment_method is 'none', since the input is already "
+                        "aligned. Leave on unless the sequences are already oriented and must "
+                        "not be altered."
+                    ),
+                },
                 "trim_terminal_overhangs": {
                     "type": "boolean",
                     "default": True,
@@ -176,6 +225,7 @@ def _schemas():
                 "alignment_method": "mafft",
                 "trimming_method": "trimal_gappy",
                 "trim_terminal_overhangs": True,
+                "fix_orientation": True,
                 "notes": "API test with valid pasted FASTA",
             },
             "properties": {
@@ -213,15 +263,15 @@ def _schemas():
                 "alignment_method": {
                     "type": "string",
                     "enum": ["mafft", "muscle", "clustalo", "iqtree_builtin", "default"],
-                    "default": "mafft",
+                    "default": DEFAULT_ALIGNMENT_METHOD,
                 },
                 "trimming_method": {
                     "type": "string",
                     "enum": ["none", "trimal_gappy", "trimal", "bmge"],
-                    "default": "trimal_gappy",
+                    "default": Config.DEFAULT_TRIMMING_METHOD,
                     "description": (
                         "Alignment trimmer. 'trimal_gappy' (default) runs trimAl -gt 0.1, "
-                        "dropping columns that are >90%% gaps. 'trimal' runs -automated1, "
+                        "dropping columns that are >90% gaps. 'trimal' runs -automated1, "
                         "which is aggressive and strips much of ITS1/ITS2 -- not recommended "
                         "for ITS."
                     ),
@@ -238,6 +288,7 @@ def _schemas():
                 "tree_method": {
                     "type": "string",
                     "enum": ["nj", "raxml", "iqtree", "mrbayes", "fasttree"],
+                    "default": DEFAULT_TREE_METHOD,
                 },
                 "tree_model": {
                     "type": "string",
@@ -252,9 +303,11 @@ def _schemas():
                         "naming what chose it. Pass an explicit model name to fix it."
                     ),
                 },
-                "bootstrap": {"type": "integer", "minimum": 0, "maximum": 10000, "default": 1000},
+                "bootstrap": {"type": "integer", "minimum": 0, "maximum": 10000,
+                              "default": DEFAULT_BOOTSTRAP},
                 "alrt_replicates": {
-                    "type": "integer", "minimum": 0, "maximum": 10000, "default": 1000,
+                    "type": "integer", "minimum": 0, "maximum": 10000,
+                    "default": DEFAULT_IQTREE_ALRT,
                     "description": "IQ-TREE SH-aLRT replicates, run alongside Ultrafast Bootstrap. Nodes are labelled SH-aLRT/UFBoot. 0 reports UFBoot only.",
                 },
                 "mcmc_generations": {
@@ -490,8 +543,12 @@ def build_spec():
                         {"$ref": "#/components/parameters/Page"},
                         {"$ref": "#/components/parameters/PerPage"},
                         {"name": "status", "in": "query", "schema": {"type": "string"}},
-                        {"name": "since", "in": "query", "schema": {"type": "string", "format": "date-time"}},
-                        {"name": "until", "in": "query", "schema": {"type": "string", "format": "date-time"}},
+                        {"name": "since", "in": "query",
+                         "schema": {"type": "string", "format": "date-time"},
+                         "description": TIMESTAMP_FILTER_DESCRIPTION.format(field="created_at >=")},
+                        {"name": "until", "in": "query",
+                         "schema": {"type": "string", "format": "date-time"},
+                         "description": TIMESTAMP_FILTER_DESCRIPTION.format(field="created_at <")},
                     ],
                     "responses": {
                         "200": {"description": "OK", "content": _data_list_response("Job")},

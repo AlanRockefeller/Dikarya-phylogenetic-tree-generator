@@ -8,7 +8,7 @@ import math
 import re
 import logging
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 from flask import (
@@ -20,6 +20,11 @@ from app.api_v1 import bp
 from app.api_v1.auth import require_api_token, api_token_key_func
 from app.api_v1.envelope import error_response, ok, paginate_query, server_error
 from app.api_v1.idempotency import idempotent
+from app.api_v1.job_defaults import (
+    DEFAULT_ALIGNMENT_METHOD,
+    DEFAULT_BOOTSTRAP,
+    DEFAULT_TREE_METHOD,
+)
 from app.api_v1.jobs import (
     DOWNLOADABLE_ARTIFACTS, LOG_NAMES, _guess_mime, artifact_path,
     get_owned_job_or_404, list_available_artifacts, serialize_job,
@@ -144,6 +149,7 @@ LIMITS = {
 RECOMPUTE_ALLOWED_FIELDS = frozenset({
     "tree_method", "tree_model",
     "alignment_method", "trimming_method", "trim_terminal_overhangs",
+    "fix_orientation",
     "bootstrap", "alrt_replicates", "mcmc_generations", "mcmc_nruns", "mcmc_nchains",
     "mcmc_burnin_fraction", "mcmc_stop_early",
     "outgroup", "notes",
@@ -384,10 +390,11 @@ def create_job():
 
     # Allowlisted categorical params.
     tree_method, err = _validate_categorical(
-        "tree_method", data.get("tree_method", "fasttree"), VALID_TREE_METHODS)
+        "tree_method", data.get("tree_method", DEFAULT_TREE_METHOD), VALID_TREE_METHODS)
     if err: return err
     aligner, err = _validate_categorical(
-        "alignment_method", data.get("alignment_method", "mafft"), VALID_ALIGNERS)
+        "alignment_method", data.get("alignment_method", DEFAULT_ALIGNMENT_METHOD),
+        VALID_ALIGNERS)
     if err: return err
     trimmer, err = _validate_categorical(
         "trimming_method", data.get("trimming_method", Config.DEFAULT_TRIMMING_METHOD), VALID_TRIMMERS)
@@ -395,9 +402,13 @@ def create_job():
     trim_terminal_overhangs, err = _validate_bool(
         "trim_terminal_overhangs", data.get("trim_terminal_overhangs"), default=True)
     if err: return err
+    fix_orientation, err = _validate_bool(
+        "fix_orientation", data.get("fix_orientation"), default=True)
+    if err: return err
 
     # Clamped integers.
-    bootstrap, err = _validate_clamped_int("bootstrap", data.get("bootstrap"), default=1000)
+    bootstrap, err = _validate_clamped_int(
+        "bootstrap", data.get("bootstrap"), default=DEFAULT_BOOTSTRAP)
     if err: return err
     # IQ-TREE SH-aLRT replicates; defaults to Config.DEFAULT_IQTREE_ALRT so API
     # callers get the same UFBoot + SH-aLRT pairing as the web form. 0 disables it.
@@ -550,6 +561,7 @@ def create_job():
         "alignment_method":  aligner,
         "trimming_method":   trimmer,
         "trim_terminal_overhangs": trim_terminal_overhangs,
+        "fix_orientation":   fix_orientation,
         "alignment_options": alignment_options,
         "tree_method":       tree_method,
         "tree_model":        tree_model,
@@ -580,6 +592,7 @@ def create_job():
             "alignment_method": job_params["alignment_method"],
             "trimming_method": job_params["trimming_method"],
             "trim_terminal_overhangs": job_params["trim_terminal_overhangs"],
+            "fix_orientation": job_params["fix_orientation"],
             "via": "api_v1",
             "api_token_id": g.api_token.id,
         },
@@ -623,12 +636,38 @@ def create_job():
     return ok(serialize_job(job_record), status=202)
 
 
+def parse_utc_query_timestamp(raw):
+    """Parse an ISO-8601 query timestamp into the form the DB column holds.
+
+    `Job.created_at` is a naive `DateTime` written from `datetime.utcnow()`, so
+    every stored value is UTC with no tzinfo. An offset-aware filter compared
+    against it raises `TypeError: can't compare offset-naive and offset-aware
+    datetimes` on SQLite and, worse, is compared *literally* by PostgreSQL --
+    `?since=2026-08-01T00:00:00-07:00` silently filtered on midnight rather
+    than on 07:00 UTC.
+
+    So an offset (including a trailing `Z`) is honoured and converted to UTC,
+    then stripped. A timestamp with no offset is taken to already be UTC, which
+    matches what the API returns in `created_at`; it is never re-interpreted as
+    server local time.
+
+    Raises ValueError on anything `datetime.fromisoformat` will not accept.
+    """
+    parsed = datetime.fromisoformat(str(raw).strip().replace("Z", "+00:00"))
+    if parsed.tzinfo is not None:
+        parsed = parsed.astimezone(timezone.utc).replace(tzinfo=None)
+    return parsed
+
+
 @bp.route('/jobs', methods=['GET'])
 @require_api_token(scope='jobs:read')
 @limiter.limit("600 per minute", key_func=api_token_key_func)
 def list_jobs():
     """List the caller's jobs. Filters: ?status=, ?since=, ?until=.
-    Pagination: ?page=, ?per_page= (max 100)."""
+    Pagination: ?page=, ?per_page= (max 100).
+
+    `since`/`until` accept offset-aware or naive ISO-8601; see
+    `parse_utc_query_timestamp` for how each is interpreted."""
     q = Job.query.filter_by(user_id=g.api_user.id)
 
     status = request.args.get("status")
@@ -638,17 +677,21 @@ def list_jobs():
     since = request.args.get("since")
     if since:
         try:
-            q = q.filter(Job.created_at >= datetime.fromisoformat(since.replace("Z", "+00:00")))
+            q = q.filter(Job.created_at >= parse_utc_query_timestamp(since))
         except ValueError:
-            return error_response(code="bad_request",
-                                  message="`since` must be ISO-8601.", status=400)
+            return error_response(
+                code="bad_request",
+                message="`since` must be ISO-8601 (naive values are read as UTC).",
+                status=400)
     until = request.args.get("until")
     if until:
         try:
-            q = q.filter(Job.created_at < datetime.fromisoformat(until.replace("Z", "+00:00")))
+            q = q.filter(Job.created_at < parse_utc_query_timestamp(until))
         except ValueError:
-            return error_response(code="bad_request",
-                                  message="`until` must be ISO-8601.", status=400)
+            return error_response(
+                code="bad_request",
+                message="`until` must be ISO-8601 (naive values are read as UTC).",
+                status=400)
 
     q = q.order_by(desc(Job.created_at))
     items, meta = paginate_query(q, default_per_page=50, max_per_page=100)
@@ -705,7 +748,13 @@ def _release_rq_job(job_id):
             # queued / deferred / scheduled / created: cancelling removes it
             # from the queue, so it can never begin.
             rq_job.cancel()
-            return True, f"cancelled from {status}"
+            terminal = rq_job.get_status(refresh=True)
+            if terminal in _RQ_TERMINAL_STATUSES:
+                return True, f"cancelled from {status}"
+            if terminal != "started":
+                return False, f"RQ status became {terminal} during cancellation"
+            # A worker won the dequeue race. Fall through to the same stop and
+            # positive-terminal-evidence path as a job that was already started.
 
         # Started: ask the worker to kill the horse, then wait for RQ to say so.
         from rq.command import send_stop_job_command
@@ -741,13 +790,38 @@ def delete_job(job_id):
     job = get_owned_job_or_404(job_id)
     if not job:
         return error_response(code="not_found", message="Job not found.", status=404)
+    if job.status == "deleting":
+        return error_response(
+            code="conflict",
+            message="This job is already being deleted. Try again shortly.",
+            status=409,
+            details={"job_id": job_id, "status": job.status},
+        )
 
-    # Stop the work before touching anything. Only for jobs the database still
-    # believes are live: a completed job needs no Redis round trip, so an
-    # ordinary delete keeps working even when Redis does not.
+    original_status = job.status
+
+    # Publish a durable guard before relying on queue cancellation. A worker
+    # dequeued in the status-check/cancel window checks this state before its
+    # first filesystem write and exits. Finished jobs need no guard or Redis.
     if job.status in ("queued", "running"):
+        try:
+            job.status = "deleting"
+            db.session.commit()
+        except Exception as exc:
+            db.session.rollback()
+            return server_error(exc, where="delete_job.guard")
+
         released, detail = _release_rq_job(job_id)
         if not released:
+            try:
+                job.status = original_status
+                db.session.commit()
+            except Exception as exc:
+                db.session.rollback()
+                logger.exception(
+                    "event=api_v1.delete_guard_restore_failed job=%s", job_id,
+                )
+                return server_error(exc, where="delete_job.restore_guard")
             logger.warning(
                 "event=api_v1.delete_blocked job=%s reason=%s", job_id, detail,
             )
@@ -785,6 +859,15 @@ def delete_job(job_id):
                 logger.exception(
                     "event=api_v1.delete_stage_failed job=%s", job_id,
                 )
+                if original_status in ("queued", "running"):
+                    try:
+                        job.status = original_status
+                        db.session.commit()
+                    except Exception as restore_exc:
+                        db.session.rollback()
+                        return server_error(
+                            restore_exc, where="delete_job.restore_guard"
+                        )
                 return error_response(
                     code="conflict",
                     message=(
@@ -808,6 +891,15 @@ def delete_job(job_id):
                 logger.exception(
                     "event=api_v1.delete_restore_failed job=%s staged=%s",
                     job_id, staged,
+                )
+        if original_status in ("queued", "running"):
+            try:
+                job.status = original_status
+                db.session.commit()
+            except Exception:
+                db.session.rollback()
+                logger.exception(
+                    "event=api_v1.delete_guard_restore_failed job=%s", job_id,
                 )
         return server_error(e, where="delete_job")
 
@@ -899,6 +991,10 @@ def recompute_job(job_id):
             v, err = _validate_bool("trim_terminal_overhangs", body["trim_terminal_overhangs"])
             if err: return err
             overrides["trim_terminal_overhangs"] = v
+        if "fix_orientation" in body:
+            v, err = _validate_bool("fix_orientation", body["fix_orientation"])
+            if err: return err
+            overrides["fix_orientation"] = v
         for field, default in (("bootstrap", 1000),
                                ("alrt_replicates", Config.DEFAULT_IQTREE_ALRT),
                                ("mcmc_generations", Config.DEFAULT_MCMC_GENERATIONS),

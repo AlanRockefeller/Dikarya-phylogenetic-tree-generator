@@ -767,6 +767,25 @@ def run_phylo_job(job_params: dict) -> dict:
     """
     job = get_current_job()
     job_id = job.id if job else "local_debug"
+
+    # RQ cancellation and worker dequeue are not one atomic operation. DELETE
+    # commits a DB-visible guard first, and every real RQ execution checks it
+    # before creating even the top-level job directory. A missing row means a
+    # successful deletion already committed; `deleting` means it is in flight.
+    from app import create_app
+    from app.extensions import db
+    from app.models import Job
+
+    _app = create_app()
+    if job is not None:
+        with _app.app_context():
+            db_job = Job.query.get(job_id)
+            if db_job is None or db_job.status == "deleting":
+                logger.info(
+                    "event=job.start_suppressed job=%s reason=%s",
+                    job_id, "missing" if db_job is None else "deleting",
+                )
+                return {"status": "cancelled", "job_id": job_id}
     
     # Track current step for error reporting
     current_step = None
@@ -818,12 +837,6 @@ def run_phylo_job(job_params: dict) -> dict:
     _save_job_params(input_info_path, job_params)
 
     # 2b. Initialize with single app context
-    from app import create_app
-    from app.extensions import db
-    from app.models import Job
-
-    _app = create_app()
-    
     # Per-job pipeline log
     log_file = job_dir / "logs" / "pipeline.log"
     file_handler = _add_job_log_handler(job_id, log_file)
@@ -1426,9 +1439,21 @@ def run_phylo_job(job_params: dict) -> dict:
             from app.models import AlignmentParams
             from app.services.alignment_service import run_alignment
 
-            align_params = AlignmentParams(method=align_method, advanced_options=align_opts)
+            # Default on: a backwards sequence is a wrong tree, and only MAFFT
+            # notices without help. Off is for input the user has already
+            # oriented and does not want touched.
+            fix_orientation = bool(job_params.get("fix_orientation", True))
+            align_params = AlignmentParams(
+                method=align_method,
+                fix_orientation=fix_orientation,
+                advanced_options=align_opts,
+            )
             align_stats = run_alignment(
-                input_raw_path, alignment_raw_path, align_params, Config, logger, job_id=job_id
+                input_raw_path, alignment_raw_path, align_params, Config, logger, job_id=job_id,
+                # ORIENT is unconditional in this pipeline, so uncertain_count is
+                # always bound here. It lets the aligner-flip degradation say
+                # whether MAFFT merely settled what ORIENT abstained on.
+                orient_uncertain=uncertain_count,
             ) or {}
 
             n_seqs, n_cols = _count_alignment_stats(alignment_raw_path)

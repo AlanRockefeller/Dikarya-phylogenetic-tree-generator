@@ -19,16 +19,25 @@ class FakeRedis:
 
     def __init__(self):
         self.store = {}
+        self.expires_at = {}
         self.calls = 0
 
-    def eval(self, script, numkeys, key, now_ms, interval_ms, ttl_ms):
+    def eval(self, script, numkeys, key, now_ms, interval_ms, max_wait_ms):
         self.calls += 1
-        now_ms, interval_ms = int(now_ms), int(interval_ms)
+        now_ms, interval_ms, max_wait_ms = (
+            int(now_ms), int(interval_ms), int(max_wait_ms)
+        )
         slot = int(self.store.get(key, 0))
         if slot < now_ms:
             slot = now_ms
-        self.store[key] = slot + interval_ms
-        return slot
+        wait = slot - now_ms
+        if max_wait_ms >= 0 and wait > max_wait_ms:
+            return [-1, wait]
+        next_slot = slot + interval_ms
+        ttl = max(interval_ms * 2, next_slot - now_ms + interval_ms)
+        self.store[key] = next_slot
+        self.expires_at[key] = now_ms + ttl
+        return [slot, ttl]
 
 
 class _Clock:
@@ -45,12 +54,12 @@ class RedisReservationTests(unittest.TestCase):
         self.clock = _Clock()
         svc._local_next_slot = 0.0
 
-    def _reserve(self, interval=1.0):
+    def _reserve(self, interval=1.0, max_wait=None):
         with (
             patch.object(svc, "_pacing_redis", return_value=self.redis),
             patch.object(svc.time, "time", self.clock.time),
         ):
-            return svc._reserve_inat_slot(interval)
+            return svc._reserve_inat_slot(interval, max_wait=max_wait)
 
     def test_first_request_is_not_delayed(self):
         self.assertEqual(self._reserve(), 0.0)
@@ -81,9 +90,30 @@ class RedisReservationTests(unittest.TestCase):
         self.assertEqual(first, 0.0)
         self.assertAlmostEqual(second, 1.0, places=3)
 
-    def test_wait_is_capped_so_one_request_cannot_hang_indefinitely(self):
-        self.redis.store[svc._PACING_KEY] = int(self.clock.now * 1000) + 600_000
-        self.assertEqual(self._reserve(), svc.MAX_PACING_WAIT_SECONDS)
+    def test_large_background_burst_never_collapses_at_interactive_cap(self):
+        waits = [self._reserve() for _ in range(40)]
+        self.assertEqual(waits, [float(i) for i in range(40)])
+        starts = [self.clock.now + wait for wait in waits]
+        self.assertTrue(all(
+            later - earlier >= svc.RATE_LIMIT_DELAY
+            for earlier, later in zip(starts, starts[1:])
+        ))
+
+    def test_deep_interactive_caller_is_deferred_not_sent_early(self):
+        accepted = [self._reserve(max_wait=30) for _ in range(31)]
+        self.assertEqual(accepted[-1], 30.0)
+        cursor_before = self.redis.store[svc._PACING_KEY]
+        with self.assertRaises(svc.InatTreeError) as caught:
+            self._reserve(max_wait=30)
+        self.assertEqual(caught.exception.status, 503)
+        self.assertEqual(self.redis.store[svc._PACING_KEY], cursor_before)
+
+    def test_cursor_ttl_outlives_every_future_reservation(self):
+        waits = [self._reserve() for _ in range(40)]
+        latest_start_ms = int((self.clock.now + waits[-1]) * 1000)
+        self.assertGreater(
+            self.redis.expires_at[svc._PACING_KEY], latest_start_ms
+        )
 
 
 class RedisFailureFallbackTests(unittest.TestCase):
@@ -106,6 +136,15 @@ class RedisFailureFallbackTests(unittest.TestCase):
     def test_fallback_is_still_paced_and_never_raises(self):
         with patch.object(svc, "_pacing_redis", side_effect=RuntimeError("boom")):
             self.assertIsInstance(svc._reserve_inat_slot(1.0), float)
+
+    def test_interactive_fallback_defers_instead_of_sending_early(self):
+        svc._local_next_slot = 1000.0
+        with (
+            patch.object(svc, "_pacing_redis", side_effect=OSError("no redis")),
+            patch.object(svc.time, "monotonic", return_value=900.0),
+        ):
+            with self.assertRaises(svc.InatTreeError):
+                svc._reserve_inat_slot(1.0, max_wait=30.0)
 
 
 class RequestPathTests(unittest.TestCase):

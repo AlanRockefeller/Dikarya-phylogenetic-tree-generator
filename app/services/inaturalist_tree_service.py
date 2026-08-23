@@ -59,16 +59,26 @@ RETRY_BACKOFF_CAP = 30.0
 # process behind it.
 _PACING_KEY = "dikarya:inat:next-request-slot-ms"
 # Reserving further ahead than this means many callers are queued behind each
-# other; waiting the full amount inside a web request is worse than being
-# slightly early, so the wait is capped and the overrun is logged.
+# other. Interactive requests are rejected at that point instead of sleeping
+# for an unreasonable time. Background workers have no cap and wait for the
+# slot they reserved.
 MAX_PACING_WAIT_SECONDS = 30.0
 _PACING_SCRIPT = """
 local slot = tonumber(redis.call('GET', KEYS[1]) or '0')
 local now = tonumber(ARGV[1])
 local interval = tonumber(ARGV[2])
 if slot < now then slot = now end
-redis.call('SET', KEYS[1], slot + interval, 'PX', ARGV[3])
-return slot
+local wait = slot - now
+local max_wait = tonumber(ARGV[3])
+if max_wait >= 0 and wait > max_wait then
+  return {-1, wait}
+end
+local next_slot = slot + interval
+-- Keep the cursor alive beyond every reservation it represents. A fixed TTL
+-- can expire while a deep queue still has future slots outstanding.
+local ttl = math.max(interval * 2, next_slot - now + interval)
+redis.call('SET', KEYS[1], next_slot, 'PX', ttl)
+return {slot, ttl}
 """
 
 _pacing_lock = threading.Lock()
@@ -96,7 +106,8 @@ def _reserve_slot_local(interval: float) -> float:
         return max(0.0, slot - now)
 
 
-def _reserve_inat_slot(interval: float = RATE_LIMIT_DELAY) -> float:
+def _reserve_inat_slot(interval: float = RATE_LIMIT_DELAY,
+                       max_wait: Optional[float] = None) -> float:
     """Reserve the next iNaturalist request slot. Returns seconds to wait.
 
     Falls back to per-process pacing if Redis is unavailable. That is a
@@ -107,10 +118,21 @@ def _reserve_inat_slot(interval: float = RATE_LIMIT_DELAY) -> float:
     interval_ms = max(1, int(interval * 1000))
     try:
         now_ms = int(time.time() * 1000)
-        slot_ms = _pacing_redis().eval(
-            _PACING_SCRIPT, 1, _PACING_KEY, now_ms, interval_ms, interval_ms * 10,
+        max_wait_ms = -1 if max_wait is None else max(0, int(max_wait * 1000))
+        result = _pacing_redis().eval(
+            _PACING_SCRIPT, 1, _PACING_KEY, now_ms, interval_ms, max_wait_ms,
         )
+        slot_ms = result[0]
+        if int(slot_ms) < 0:
+            queued_wait = float(result[1]) / 1000.0
+            raise InatTreeError(
+                "iNaturalist requests are busy right now. Please try again shortly.",
+                status=503,
+                details={"retry_after_seconds": max(1, int(queued_wait))},
+            )
         wait = max(0.0, (float(slot_ms) - now_ms) / 1000.0)
+    except InatTreeError:
+        raise
     except Exception as exc:
         from app.services.log_context import log_degradation_rate_limited
         log_degradation_rate_limited(
@@ -119,20 +141,22 @@ def _reserve_inat_slot(interval: float = RATE_LIMIT_DELAY) -> float:
             exception=type(exc).__name__,
         )
         wait = _reserve_slot_local(interval)
-    if wait > MAX_PACING_WAIT_SECONDS:
-        from app.services.log_context import log_degradation_rate_limited
-        log_degradation_rate_limited(
-            logger, "inat_pacing_wait_capped",
-            "iNaturalist request pacing queue is deeper than the wait cap",
-            requested_wait=round(wait, 2), cap=MAX_PACING_WAIT_SECONDS,
-        )
-        wait = MAX_PACING_WAIT_SECONDS
+        if max_wait is not None and wait > max_wait:
+            raise InatTreeError(
+                "iNaturalist requests are busy right now. Please try again shortly.",
+                status=503,
+                details={"retry_after_seconds": max(1, int(wait))},
+            )
     return wait
 
 
 def _pace_inat_request() -> None:
     """Block until this process may start its next iNaturalist request."""
-    wait = _reserve_inat_slot()
+    from flask import has_request_context
+
+    wait = _reserve_inat_slot(
+        max_wait=MAX_PACING_WAIT_SECONDS if has_request_context() else None,
+    )
     if wait > 0:
         time.sleep(wait)
 

@@ -362,9 +362,11 @@ def reconcile_job_statuses(
         # connection "idle in transaction" for 4h45m. That holds ACCESS SHARE on
         # jobs, which is enough to block a `flask db upgrade` ALTER TABLE behind it.
         #
-        # This also un-stages a dry run. --dry-run still assigns job.status/metrics
-        # above and merely skips the commit, leaving dirty objects in the session
-        # for whatever commits next; rolling back makes "dry" actually mean dry.
+        # The dry-run branches above now skip the assignments outright rather
+        # than staging them and declining to commit, so there is nothing dirty
+        # left to discard. The rollback is still required for the reason above:
+        # it ends the read transaction, on the dry-run and nothing-to-do paths
+        # alike.
         db.session.rollback()
 
     return changed

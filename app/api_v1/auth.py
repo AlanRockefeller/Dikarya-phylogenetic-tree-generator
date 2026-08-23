@@ -13,6 +13,7 @@ Available scopes:
 import functools
 import hashlib
 import hmac
+import logging
 import secrets
 from datetime import datetime
 
@@ -21,6 +22,9 @@ from flask import g, request
 from app.extensions import db
 from app.models import ApiToken
 from app.api_v1.envelope import error_response
+from app.services.log_context import log_degradation_rate_limited
+
+logger = logging.getLogger(__name__)
 
 TOKEN_PREFIX = "dikarya_"
 TOKEN_SECRET_BYTES = 32  # → ~43 base64url chars
@@ -88,6 +92,103 @@ def _lookup_token(plaintext):
     return token
 
 
+# ---------------------------------------------------------------------------
+# Failed-authentication throttle (per client IP)
+# ---------------------------------------------------------------------------
+#
+# Every @require_api_token endpoint carries its own token-keyed limit, but that
+# decorator only runs once a token has been resolved -- a request with a bad or
+# absent token is rejected here first and never reaches it. That left the
+# unauthenticated path unmetered: an attacker could spend a Gunicorn slot, a
+# SHA-256 hash and an indexed SELECT per request, for free, forever.
+#
+# This is deliberately NOT a brute-force defence. The secrets are 256 bits of
+# `secrets.token_urlsafe`; nobody is guessing one. The point is that repeated
+# *failed* authentication stops being free work, while a caller holding a valid
+# token is untouched -- successful requests never hit this counter, so the
+# existing per-token limits remain the only thing a legitimate client sees.
+FAILED_AUTH_LIMITS = ("60 per minute", "600 per hour")
+_FAILED_AUTH_NAMESPACE = "api_v1_auth_fail"
+_failed_auth_items = None
+
+# Token-shaped credentials require one indexed hash lookup before we can know
+# whether they are valid. Bound that work with a deliberately much higher IP
+# ceiling; the ordinary failed-auth bucket remains lower and, importantly, is
+# never consulted for a successfully authenticated request.
+PRE_AUTH_LOOKUP_LIMITS = ("600 per minute", "6000 per hour")
+_PRE_AUTH_LOOKUP_NAMESPACE = "api_v1_auth_lookup"
+_pre_auth_lookup_items = None
+
+
+def _failed_auth_limit_items():
+    global _failed_auth_items
+    if _failed_auth_items is None:
+        from limits import parse
+        _failed_auth_items = tuple(parse(text) for text in FAILED_AUTH_LIMITS)
+    return _failed_auth_items
+
+
+def _pre_auth_lookup_limit_items():
+    global _pre_auth_lookup_items
+    if _pre_auth_lookup_items is None:
+        from limits import parse
+        _pre_auth_lookup_items = tuple(
+            parse(text) for text in PRE_AUTH_LOOKUP_LIMITS
+        )
+    return _pre_auth_lookup_items
+
+
+def _client_address():
+    from flask_limiter.util import get_remote_address
+    return get_remote_address() or "unknown"
+
+
+def _failed_auth_over_budget():
+    """True once this client has spent its failed-authentication budget.
+
+    Applied only after authentication has failed. A valid credential from a
+    shared address must not inherit another caller's failed-auth penalty. Any
+    storage problem fails open: a broken limiter backend must not lock out API
+    clients.
+    """
+    from app.extensions import limiter
+    try:
+        strategy = limiter.limiter
+        address = _client_address()
+        return any(
+            not strategy.test(item, _FAILED_AUTH_NAMESPACE, address)
+            for item in _failed_auth_limit_items()
+        )
+    except Exception:
+        return False
+
+
+def _record_failed_auth():
+    """Charge one failed authentication against the caller's IP budget."""
+    from app.extensions import limiter
+    try:
+        strategy = limiter.limiter
+        address = _client_address()
+        for item in _failed_auth_limit_items():
+            strategy.hit(item, _FAILED_AUTH_NAMESPACE, address)
+    except Exception:
+        pass
+
+
+def _pre_auth_lookup_allowed():
+    """Charge the high-volume lookup bucket, failing open on backend errors."""
+    from app.extensions import limiter
+    try:
+        strategy = limiter.limiter
+        address = _client_address()
+        return all(
+            strategy.hit(item, _PRE_AUTH_LOOKUP_NAMESPACE, address)
+            for item in _pre_auth_lookup_limit_items()
+        )
+    except Exception:
+        return True
+
+
 def require_api_token(scope=None):
     """Decorator: require a valid, unrevoked API token with the given scope.
 
@@ -103,14 +204,32 @@ def require_api_token(scope=None):
         def wrapper(*args, **kwargs):
             plaintext = _extract_token()
             if not plaintext:
+                if _failed_auth_over_budget():
+                    return _failed_auth_limited_response()
+                _record_failed_auth()
                 return error_response(
                     code="missing_token",
                     message="Provide an API token via the Authorization header: "
                             "Authorization: Bearer dikarya_...",
                     status=401,
                 )
+            if not _pre_auth_lookup_allowed():
+                return error_response(
+                    code="too_many_auth_attempts",
+                    message=(
+                        "Too many authentication attempts from this address. "
+                        "Wait a minute and try again."
+                    ),
+                    status=429,
+                )
             token = _lookup_token(plaintext)
             if token is None or not token.is_active:
+                # A syntactically valid bearer credential must be resolved
+                # before consulting the IP failure bucket; otherwise failures
+                # from another client behind the same NAT block valid tokens.
+                if _failed_auth_over_budget():
+                    return _failed_auth_limited_response()
+                _record_failed_auth()
                 return error_response(
                     code="invalid_token",
                     message="The provided API token is invalid or has been revoked.",
@@ -143,13 +262,32 @@ def require_api_token(scope=None):
                     # Keep the in-memory object in sync so downstream code
                     # sees the new timestamp without a re-fetch.
                     token.last_used_at = now
-                except Exception:
-                    # Best-effort: a failure here must never block auth.
-                    pass
+                except Exception as exc:
+                    # Best-effort: a failure here must never block auth. It is
+                    # still worth knowing about -- a token whose last_used_at
+                    # silently stops advancing makes `flask api-tokens` report
+                    # active tokens as unused -- so say so, rate limited, since
+                    # whatever broke the write will break it on every API call.
+                    log_degradation_rate_limited(
+                        logger, "api_token_last_used_not_recorded",
+                        "API request served without recording the token's last_used_at",
+                        exception=type(exc).__name__,
+                    )
 
             return fn(*args, **kwargs)
         return wrapper
     return decorator
+
+
+def _failed_auth_limited_response():
+    return error_response(
+        code="too_many_failed_auth",
+        message=(
+            "Too many failed authentication attempts from this address. "
+            "Wait a minute and try again. Valid API tokens remain usable."
+        ),
+        status=429,
+    )
 
 
 def api_token_key_func():

@@ -195,7 +195,20 @@ def dedupe_by_observation(
 
         dropped: Dict[int, Dict[str, Any]] = {}
         for reference, indexes in groups.items():
-            if len(indexes) < 2 or len(indexes) > MAX_GROUP_SIZE:
+            if len(indexes) < 2:
+                continue
+            if len(indexes) > MAX_GROUP_SIZE:
+                # Keeping all records is the safe outcome, but it is not the
+                # requested one: the user gets a tree with duplicate tips for
+                # this observation and nothing on screen says why. Say so here
+                # so the cap can be reviewed against real data instead of
+                # guessed at.
+                logger.warning(
+                    "event=dedup.group_skipped observation=%s records=%d max=%d "
+                    "Observation group too large to compare pairwise; all of its "
+                    "records were kept, so duplicate tips may remain.",
+                    reference, len(indexes), MAX_GROUP_SIZE,
+                )
                 continue
             # Longest first, so the representative left in the tree is the most
             # complete read of the observation and the shorter trimmings are the

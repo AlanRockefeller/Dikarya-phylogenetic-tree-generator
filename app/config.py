@@ -24,6 +24,31 @@ def _csv_env(name, default=""):
     return [item.strip().lower() for item in raw.split(",") if item.strip()]
 
 
+# Environment booleans were parsed three different ways here, so the answer
+# depended on which setting you were reading: ALLOW_SQLITE_FALLBACK accepted
+# 'True' but not 'TRUE' or 'on', while REVERSE_GEOCODE_ENABLED treated every
+# unrecognised value -- including 'no' and 'off' -- as true. One token set for
+# all of them; anything unrecognised falls back to the setting's own default
+# rather than silently landing on whichever side the old expression happened to
+# put it. Deliberately independent of security_utils.coerce_bool, which parses
+# *request* values and must not drag app.services into config import time.
+_BOOL_ENV_TRUE = frozenset({"1", "true", "yes", "on"})
+_BOOL_ENV_FALSE = frozenset({"0", "false", "no", "off"})
+
+
+def bool_env(name, default=False):
+    """Read an environment variable as a boolean, or ``default`` if unset/unclear."""
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    clean = raw.strip().lower()
+    if clean in _BOOL_ENV_TRUE:
+        return True
+    if clean in _BOOL_ENV_FALSE:
+        return False
+    return default
+
+
 def _release_version(base_dir):
     """Resolve the deployment identifier through the one canonical resolver.
 
@@ -182,7 +207,7 @@ class Config:
     REVERSE_GEOCODE_URL = os.environ.get(
         'REVERSE_GEOCODE_URL', 'https://nominatim.openstreetmap.org/reverse'
     )
-    REVERSE_GEOCODE_ENABLED = os.environ.get('REVERSE_GEOCODE_ENABLED', '1') not in ('0', 'false', 'False')
+    REVERSE_GEOCODE_ENABLED = bool_env('REVERSE_GEOCODE_ENABLED', True)
     BLAST_MAX_QUERY_LENGTH = int(os.environ.get('BLAST_MAX_QUERY_LENGTH', '50000'))  # 50KB max
 
     # Global request body cap. Sequences via /api/v1/jobs can be up to 5 MB;
@@ -238,7 +263,7 @@ class Config:
     # no DATABASE_URL, not because the job was missing). create_app() now refuses
     # to boot on the fallback unless it is explicitly opted into.
     DATABASE_URL_IS_EXPLICIT = bool(os.environ.get('DATABASE_URL'))
-    ALLOW_SQLITE_FALLBACK = os.environ.get('ALLOW_SQLITE_FALLBACK', '') in ('1', 'true', 'True', 'yes')
+    ALLOW_SQLITE_FALLBACK = bool_env('ALLOW_SQLITE_FALLBACK', False)
     SQLALCHEMY_DATABASE_URI = os.environ.get('DATABASE_URL') or 'sqlite:///' + str(BASE_DIR / 'app.db')
     SQLALCHEMY_TRACK_MODIFICATIONS = False
     # Validate pooled connections on checkout (cheap SELECT 1) and recycle
@@ -375,6 +400,16 @@ class Config:
 
     # Site-wide Mushroom Observer account used to post completed tree links.
     MUSHROOM_OBSERVER_API_KEY = os.environ.get('MUSHROOM_OBSERVER_API_KEY', '')
+
+    # Editor/admin allowlists for the What's New and TODO pages. Read through
+    # config like INAT_OAUTH_ADMIN_EMAILS above, so every allowlist in the app
+    # is set the same way and is visible to tests via app.config. An empty list
+    # keeps the historical fallback: the User.is_admin flag decides.
+    # WHATS_NEW_EDITOR_EMAIL (singular) is the older spelling and still works.
+    WHATS_NEW_EDITOR_EMAILS = (
+        _csv_env('WHATS_NEW_EDITOR_EMAILS') or _csv_env('WHATS_NEW_EDITOR_EMAIL')
+    )
+    TODO_ADMIN_EMAILS = _csv_env('TODO_ADMIN_EMAILS')
 
 class DevelopmentConfig(Config):
     DEBUG = True

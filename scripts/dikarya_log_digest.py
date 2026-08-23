@@ -54,6 +54,11 @@ SCANNER_EXACT_PATHS = frozenset({
     "/signup", "/register", "/dashboard", "/admin", "/account",
     "/auth/callback", "/api/auth/signin", "/login.html", "/sftp-config.json",
 })
+# Scanner probes hide the extension behind a version digit -- /randkeyword.PhP7,
+# /zup.php73, /baxa1.phP8 all arrived in one sweep and were filed as
+# product-relevant 404s because a plain endswith(".php") does not match them.
+# Case is already folded by the caller; the trailing digits are the whole point.
+SCRIPT_EXT_RE = re.compile(r'\.(?:php|asp|aspx|jsp|cgi|pl|cfm)[0-9]*$')
 # UUID form used for RQ job ids in worker logs.
 UUID_PATTERN = r'[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}'
 
@@ -216,7 +221,8 @@ def is_noise_4xx(path, ua, status=0, method=""):
         return True
     return (
         lower.endswith(STATIC_SUFFIXES)
-        or lower.endswith((".php", ".asp", ".aspx", ".jsp", ".cgi", ".bak", ".sql", ".yml", ".yaml", ".ini"))
+        or lower.endswith((".bak", ".sql", ".yml", ".yaml", ".ini"))
+        or SCRIPT_EXT_RE.search(lower) is not None
         or lower in ("/robots.txt", "/.well-known/traffic-advice")
         or lower.rstrip("/") in SCANNER_EXACT_PATHS
         or lower.startswith("/thumb/")

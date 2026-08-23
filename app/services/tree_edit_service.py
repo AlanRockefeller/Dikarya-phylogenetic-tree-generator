@@ -356,6 +356,7 @@ def build_recompute_job_params(params_dict: Dict[str, Any]) -> JobParams:
     """Build the dataclass params used by tree recomputation from stored job JSON."""
     align_params = AlignmentParams(
         method=params_dict.get("alignment_method", "default"),
+        fix_orientation=_bool_param(params_dict, "fix_orientation", True),
         advanced_options=params_dict.get("alignment_options", {}) or {}
     )
 

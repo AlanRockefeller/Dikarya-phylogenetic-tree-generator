@@ -1,3 +1,4 @@
+import logging
 from datetime import datetime
 from flask import (
     abort, flash, make_response, redirect, render_template, request, url_for,
@@ -8,6 +9,8 @@ from app.user import bp
 from app.extensions import db
 from app.models import Job, ApiToken
 from app.api_v1.auth import generate_token, ALL_SCOPES
+
+logger = logging.getLogger(__name__)
 
 
 @bp.route('/jobs')
@@ -20,11 +23,22 @@ def user_jobs():
 @bp.route('/jobs/clear', methods=['POST'])
 @login_required
 def clear_jobs():
+    """Remove the user's job history, and their files where that is possible.
+
+    Two things happen here and they can succeed independently: the history row
+    is deleted from the database, and the job's directory under var/jobs is
+    deleted from disk. The old version reported "N jobs cleared successfully"
+    for every run regardless, wrote directory failures to stdout with print()
+    (so they went nowhere anybody reads), and left the user believing files had
+    been removed that were still on disk. Now the flash says exactly what
+    happened, and a failure is logged with the job id attached.
+    """
     import shutil
     import os
 
     jobs = Job.query.filter_by(user_id=current_user.id).all()
-    count = 0
+    removed_rows = 0
+    failed_dirs = []
     for job in jobs:
         if job.job_dir and os.path.exists(job.job_dir):
             try:
@@ -32,12 +46,30 @@ def clear_jobs():
                     shutil.rmtree(job.job_dir)
                 else:
                     os.remove(job.job_dir)
-            except Exception as e:
-                print(f"Error deleting job dir {job.job_dir}: {e}")
+            except OSError as e:
+                failed_dirs.append(job.id)
+                logger.warning(
+                    "event=jobs.clear_dir_failed job=%s dir=%s error=%s "
+                    "The history row was still removed; the files remain on disk.",
+                    job.id, job.job_dir, type(e).__name__,
+                )
         db.session.delete(job)
-        count += 1
+        removed_rows += 1
     db.session.commit()
-    flash(f'{count} jobs cleared successfully.', 'success')
+
+    if not removed_rows:
+        flash('There were no jobs to clear.', 'info')
+    elif failed_dirs:
+        # Deliberately not "success": some of what the user asked to delete is
+        # still there, and only an administrator can finish the job.
+        flash(
+            f'{removed_rows} job(s) removed from your history, but the files '
+            f'for {len(failed_dirs)} of them could not be deleted and are still '
+            f'on the server. This has been logged for the administrator.',
+            'warning',
+        )
+    else:
+        flash(f'{removed_rows} job(s) cleared, including their files.', 'success')
     return redirect(url_for('user.user_jobs'))
 
 

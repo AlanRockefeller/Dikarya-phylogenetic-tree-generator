@@ -74,6 +74,36 @@ def parse_mushroom_observer_input(raw_input: str) -> int:
     )
 
 
+def _map_upstream_status(upstream_code: int) -> Tuple[int, str]:
+    """Translate a Mushroom Observer HTTP status into ours, plus a message.
+
+    Forwarding the upstream code verbatim for everything under 500 was wrong in
+    both directions:
+
+    * an upstream 401/403 became a Dikarya 401/403, telling a signed-in user
+      that *they* were not authorized when the failure is entirely between this
+      server and Mushroom Observer;
+    * every other 4xx (400 from a malformed request of ours, 422, and so on)
+      became the user's problem too.
+
+    So the only upstream status that keeps its meaning is 404, which really does
+    mean "no such observation", and 429, which really does mean "come back
+    later" (503, because the throttling is on our shared client, not on this
+    user). Everything else is an upstream/integration fault and is reported as
+    such: 502.
+    """
+    if upstream_code == 404:
+        return 404, "That observation was not found on Mushroom Observer."
+    if upstream_code == 429:
+        return 503, ("Mushroom Observer is rate-limiting requests right now. "
+                     "Please try again in a minute.")
+    if upstream_code >= 500:
+        return 502, f"Mushroom Observer API returned HTTP {upstream_code}."
+    return 502, (f"Mushroom Observer rejected the request (HTTP "
+                 f"{upstream_code}). This is a problem with the Mushroom "
+                 f"Observer integration, not with your account.")
+
+
 def _api_request(table: str, *, params: Optional[Dict[str, Any]] = None,
                  method: str = "GET", body: Optional[Dict[str, Any]] = None
                  ) -> Dict[str, Any]:
@@ -93,14 +123,12 @@ def _api_request(table: str, *, params: Optional[Dict[str, Any]] = None,
 
             payload = json.loads(response.read().decode("utf-8", errors="replace") or "{}")
     except urllib.error.HTTPError as exc:
-        status = 502 if exc.code >= 500 else exc.code
+        status, message = _map_upstream_status(exc.code)
         logger.warning(
             "Mushroom Observer API HTTP error table=%s method=%s status=%s",
             table, method, exc.code,
         )
-        raise MushroomObserverError(
-            f"Mushroom Observer API returned HTTP {exc.code}.", status=status
-        )
+        raise MushroomObserverError(message, status=status)
     except urllib.error.URLError as exc:
         logger.warning(
             "Mushroom Observer API network error table=%s method=%s reason=%s",
@@ -111,7 +139,11 @@ def _api_request(table: str, *, params: Optional[Dict[str, Any]] = None,
         logger.warning(
             "Mushroom Observer API timed out table=%s method=%s", table, method
         )
-        raise MushroomObserverError("Mushroom Observer returned an invalid response.", status=502)
+        raise MushroomObserverError(
+            f"Mushroom Observer did not respond within {REQUEST_TIMEOUT} seconds. "
+            "Please try again.",
+            status=504,
+        )
     except ValueError:
         logger.warning(
             "Mushroom Observer API returned invalid JSON table=%s method=%s",
@@ -149,6 +181,21 @@ def fetch_observation(observation_id: int) -> Dict[str, Any]:
     return results[0]
 
 
+def _coerce_sequence_id(value: Any) -> Optional[int]:
+    """Return a positive sequence id, or None for anything unusable.
+
+    Accepts the integer or numeric string Mushroom Observer normally sends and
+    rejects everything else -- nulls, names, nested objects -- without raising.
+    """
+    if isinstance(value, bool) or value is None:
+        return None
+    try:
+        parsed = int(str(value).strip())
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed > 0 else None
+
+
 def _fetch_sequence_details(sequence_ids: List[int]) -> Dict[int, Dict[str, Any]]:
     if not sequence_ids:
         return {}
@@ -157,11 +204,14 @@ def _fetch_sequence_details(sequence_ids: List[int]) -> Dict[int, Dict[str, Any]
         "detail": "high",
         "format": "json",
     })
-    return {
-        int(record["id"]): record
-        for record in (payload.get("results") or [])
-        if record.get("id")
-    }
+    details = {}
+    for record in (payload.get("results") or []):
+        if not isinstance(record, dict):
+            continue
+        record_id = _coerce_sequence_id(record.get("id"))
+        if record_id is not None:
+            details[record_id] = record
+    return details
 
 
 def _clean_text(value: Any, max_length: int = 500) -> str:
@@ -221,8 +271,11 @@ def _sequence_candidate(record: Dict[str, Any], observation_id: int) -> Optional
         return None
     owner = record.get("user") or {}
     ambiguous = sum(1 for base in cleaned if base not in "ACGT")
+    candidate_id = _coerce_sequence_id(record.get("id"))
+    if candidate_id is None:
+        return None
     return {
-        "id": int(record.get("id") or 0),
+        "id": candidate_id,
         "observation_id": int(observation_id),
         "locus": locus,
         "sequence": cleaned,
@@ -247,11 +300,39 @@ def analyze_observation(raw_input: str) -> Dict[str, Any]:
     observation_id = parse_mushroom_observer_input(raw_input)
     observation = fetch_observation(observation_id)
     embedded = observation.get("sequences") or []
-    sequence_ids = [int(item["id"]) for item in embedded if item.get("id")]
-    detailed = _fetch_sequence_details(sequence_ids)
+    if not isinstance(embedded, list):
+        logger.warning(
+            "Mushroom Observer observation %s returned a non-list `sequences` "
+            "field (%s); treating it as empty.",
+            observation_id, type(embedded).__name__,
+        )
+        embedded = []
+
+    # Everything below comes from an external API, so a single unusable row is
+    # skipped rather than allowed to raise. `int(item["id"])` on a null, a
+    # string, or a nested object used to abort the whole import and leave the
+    # user with a 500 for an observation whose other sequences were perfectly
+    # good.
+    usable = []
+    skipped = 0
+    for item in embedded:
+        if not isinstance(item, dict):
+            skipped += 1
+            continue
+        sequence_id = _coerce_sequence_id(item.get("id"))
+        if sequence_id is None:
+            skipped += 1
+            continue
+        usable.append((sequence_id, item))
+    if skipped:
+        logger.warning(
+            "Mushroom Observer observation %s: skipped %s sequence record(s) "
+            "with a missing or non-numeric id.", observation_id, skipped,
+        )
+
+    detailed = _fetch_sequence_details([sequence_id for sequence_id, _ in usable])
     candidates = []
-    for embedded_record in embedded:
-        sequence_id = int(embedded_record.get("id") or 0)
+    for sequence_id, embedded_record in usable:
         record = dict(embedded_record)
         record.update(detailed.get(sequence_id) or {})
         candidate = _sequence_candidate(record, observation_id)
