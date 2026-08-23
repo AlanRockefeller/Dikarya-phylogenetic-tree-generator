@@ -16,6 +16,9 @@ from typing import Any, Dict, Optional
 from app.config import Config
 from app.services.artifact_storage import compress_artifact, discard_artifact
 from app.services.subprocess_utils import (
+    configured_tool_limits,
+    configured_tool_time_limit_hours,
+    configured_tool_timeout_seconds,
     log_tool_failure,
     run_command,
     run_command_streaming,
@@ -38,11 +41,12 @@ MIN_TERMINAL_COVERED_SEQUENCES = 3
 # it scales with the dataset.
 MIN_TERMINAL_COVERAGE_FRACTION = 0.05
 
-# Characters that mean "no residue here". Only "-" was recognised before, so an
-# alignment padded with "." or "?" -- both common in Sanger ITS submissions and
-# both emitted by some aligners -- registered as full coverage and defeated the
-# trim entirely.
-TERMINAL_GAP_CHARS = frozenset("-.?~")
+# Characters that do not demonstrate genuine terminal coverage. ``N`` is an
+# unknown nucleotide, and Sanger reads are often quality-padded with terminal
+# runs of Ns; counting those runs as residues let missing data set the retained
+# boundary. Other IUPAC ambiguity codes still represent a constrained base and
+# therefore count as coverage.
+TERMINAL_GAP_CHARS = frozenset("-.?~Nn")
 
 
 def _min_terminal_covered(sequence_count: int) -> int:
@@ -67,7 +71,7 @@ def run_trimming(
     
     trim_method options:
         - "none" - No trimming (copy input to output)
-        - "trimal_gappy" - trimAl -gt 0.9 (drop columns that are >90% gaps).
+        - "trimal_gappy" - trimAl -gt 0.1 (drop columns that are >90% gaps).
           The default: removes alignment junk while leaving the variable ITS1/ITS2
           regions essentially intact.
         - "trimal" - trimAl -automated1. Aggressive; see _run_trimal for why this
@@ -83,6 +87,12 @@ def run_trimming(
         job_id: Optional job ID for real-time event streaming
     """
     method = (trim_method or "none").lower()
+    # This is deliberately independent of the external trimmer. The terminal
+    # rule has a three-sequence floor and treats N as missing coverage, whereas
+    # trimAl -gt is a per-column gap score. Even when their percentage
+    # thresholds are nested on a large ordinary alignment, they are not the
+    # same scientific test.
+    apply_terminal_overhangs = bool(trim_terminal_overhangs)
     
     logger.info(f"Starting trimming with method: {method}")
 
@@ -90,16 +100,16 @@ def run_trimming(
         "method": method,
         "trim_terminal_overhangs": bool(trim_terminal_overhangs),
         "terminal_overhang_trim": {
-            "enabled": bool(trim_terminal_overhangs),
+            "enabled": apply_terminal_overhangs,
             "removed_columns": 0,
         },
     }
-    
+
     terminal_tmp: Optional[Path] = None
     report_path: Optional[Path] = None
     try:
         if method == "none" or not method:
-            if trim_terminal_overhangs:
+            if apply_terminal_overhangs:
                 stats["terminal_overhang_trim"] = _trim_terminal_overhangs(
                     input_alignment, output_alignment, logger
                 )
@@ -110,7 +120,7 @@ def run_trimming(
             return stats
 
         tool_input = input_alignment
-        if trim_terminal_overhangs:
+        if apply_terminal_overhangs:
             terminal_tmp = output_alignment.with_name(f"{output_alignment.stem}.terminal_overhangs.fasta")
             stats["terminal_overhang_trim"] = _trim_terminal_overhangs(
                 input_alignment, terminal_tmp, logger
@@ -146,7 +156,7 @@ def run_trimming(
             stats["report_format"] = "html"
             stats["report_input_stage"] = (
                 "after_terminal_overhang_trimming"
-                if trim_terminal_overhangs
+                if apply_terminal_overhangs
                 else "unaltered_alignment"
             )
             compress_artifact(report_path)
@@ -175,11 +185,12 @@ def describe_trim_step(trim_method: Optional[str], trim_terminal_overhangs: bool
     """
     method = (trim_method or "none").lower()
     external = method not in ("", "none")
-    if not external and not trim_terminal_overhangs:
+    effective_terminal = bool(trim_terminal_overhangs)
+    if not external and not effective_terminal:
         return False, "Trimming (skipped)", None
-    if external and trim_terminal_overhangs:
+    if external and effective_terminal:
         label = f"Trimming ({method} + terminal overhangs)"
-    elif trim_terminal_overhangs:
+    elif effective_terminal:
         label = "Trimming (terminal overhangs)"
     else:
         label = f"Trimming ({method})"
@@ -506,16 +517,25 @@ def _run_trimal_gappy(
             stderr_path=log_file,
             on_stdout_line=_make_log_callback(job_id, "trim", "stdout"),
             on_stderr_line=_make_log_callback(job_id, "trim", "stderr"),
+            **configured_tool_limits(config, "trimAl"),
         )
 
         if exit_code != 0:
-            raise RuntimeError(tool_failure_message("trimAl (gap threshold)", exit_code))
+            raise RuntimeError(tool_failure_message(
+                "trimAl (gap threshold)", exit_code,
+                configured_tool_time_limit_hours(config, "trimAl")))
     else:
-        returncode, stdout, stderr = run_command(cmd, log_file=log_file)
+        returncode, stdout, stderr = run_command(
+            cmd, log_file=log_file,
+            timeout=configured_tool_timeout_seconds(config, "trimAl"),
+        )
 
         if returncode != 0:
             raise RuntimeError(
-                tool_failure_message("trimAl (gap threshold)", returncode)
+                tool_failure_message(
+                    "trimAl (gap threshold)", returncode,
+                    configured_tool_time_limit_hours(config, "trimAl")
+                )
             )
 
 
@@ -558,13 +578,18 @@ def _run_trimal(
             stderr_path=log_file,
             on_stdout_line=_make_log_callback(job_id, "trim", "stdout"),
             on_stderr_line=_make_log_callback(job_id, "trim", "stderr"),
+            **configured_tool_limits(config, "trimAl"),
         )
         
         if exit_code != 0:
             log_tool_failure(_logger, "trimAl", exit_code, stats, job=job_id, step="trim")
-            raise RuntimeError(tool_failure_message("trimAl", exit_code))
+            raise RuntimeError(tool_failure_message(
+                "trimAl", exit_code, configured_tool_time_limit_hours(config, "trimAl")))
     else:
-        returncode, stdout, stderr = run_command(cmd, log_file=log_file)
+        returncode, stdout, stderr = run_command(
+            cmd, log_file=log_file,
+            timeout=configured_tool_timeout_seconds(config, "trimAl"),
+        )
 
         if returncode != 0:
             log_tool_failure(
@@ -573,7 +598,8 @@ def _run_trimal(
                  "stderr_tail": (stderr or "").splitlines()},
                 step="trim",
             )
-            raise RuntimeError(tool_failure_message("trimAl", returncode))
+            raise RuntimeError(tool_failure_message(
+                "trimAl", returncode, configured_tool_time_limit_hours(config, "trimAl")))
 
 
 def _bmge_command(bmge_bin, config: Config) -> list:
@@ -654,13 +680,18 @@ def _run_bmge(
             stderr_path=log_file,
             on_stdout_line=_make_log_callback(job_id, "trim", "stdout"),
             on_stderr_line=_make_log_callback(job_id, "trim", "stderr"),
+            **configured_tool_limits(config, "BMGE"),
         )
         
         if exit_code != 0:
             log_tool_failure(_logger, "BMGE", exit_code, stats, job=job_id, step="trim")
-            raise RuntimeError(tool_failure_message("BMGE", exit_code))
+            raise RuntimeError(tool_failure_message(
+                "BMGE", exit_code, configured_tool_time_limit_hours(config, "BMGE")))
     else:
-        returncode, stdout, stderr = run_command(cmd, log_file=log_file)
+        returncode, stdout, stderr = run_command(
+            cmd, log_file=log_file,
+            timeout=configured_tool_timeout_seconds(config, "BMGE"),
+        )
 
         if returncode != 0:
             log_tool_failure(
@@ -669,4 +700,5 @@ def _run_bmge(
                  "stderr_tail": (stderr or "").splitlines()},
                 step="trim",
             )
-            raise RuntimeError(tool_failure_message("BMGE", returncode))
+            raise RuntimeError(tool_failure_message(
+                "BMGE", returncode, configured_tool_time_limit_hours(config, "BMGE")))

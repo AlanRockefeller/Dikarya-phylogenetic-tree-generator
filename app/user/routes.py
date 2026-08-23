@@ -1,5 +1,7 @@
 from datetime import datetime
-from flask import render_template, request, redirect, url_for, flash, abort
+from flask import (
+    abort, flash, make_response, redirect, render_template, request, url_for,
+)
 from flask_login import login_required, current_user
 
 from app.user import bp
@@ -45,32 +47,45 @@ def clear_jobs():
 # not the API bearer token.)
 # ---------------------------------------------------------------------------
 
-@bp.route('/tokens', methods=['GET'])
-@login_required
-def api_tokens():
+def _render_api_tokens_page(new_secret=None, new_token_name=None):
+    """Render the token list, optionally revealing one just-created secret.
+
+    `new_secret` is passed straight from the POST handler that minted it and is
+    never stored anywhere. It used to travel through Flask's session, which is a
+    signed -- not encrypted -- client-side cookie, so the plaintext bearer token
+    was written to the user's browser and to anything that logged the cookie.
+    """
     tokens = (ApiToken.query
               .filter_by(user_id=current_user.id)
               .order_by(ApiToken.created_at.desc())
               .all())
-    # `new_token_secret` is populated in the session by /tokens/create after
-    # a successful POST and shown exactly once.
-    from flask import session
-    new_secret = session.pop('new_token_secret', None)
-    new_token_name = session.pop('new_token_name', None)
-    return render_template(
+    html = render_template(
         'user/api_tokens.html',
         tokens=tokens,
         all_scopes=ALL_SCOPES,
         new_secret=new_secret,
         new_token_name=new_token_name,
     )
+    response = make_response(html)
+    if new_secret:
+        # The only response that ever carries the plaintext token must not be
+        # written to a browser or proxy cache.
+        response.headers['Cache-Control'] = 'no-store, no-cache, must-revalidate, max-age=0'
+        response.headers['Pragma'] = 'no-cache'
+    return response
+
+
+@bp.route('/tokens', methods=['GET'])
+@login_required
+def api_tokens():
+    # A plain GET can never reveal a secret: the plaintext exists only in the
+    # response to the POST that created it.
+    return _render_api_tokens_page()
 
 
 @bp.route('/tokens/create', methods=['POST'])
 @login_required
 def api_tokens_create():
-    from flask import session
-
     name = (request.form.get('name') or '').strip()
     if not name:
         flash('Token name is required.', 'danger')
@@ -96,12 +111,12 @@ def api_tokens_create():
     db.session.add(token)
     db.session.commit()
 
-    # Stash the plaintext in the session so the next page render can show it
-    # exactly once. After that it is unrecoverable.
-    session['new_token_secret'] = plaintext
-    session['new_token_name'] = name
+    # Render the token page directly from this POST instead of redirecting.
+    # The plaintext is shown exactly once, in this response only; it is not
+    # stored anywhere, so a later GET (or a replayed session cookie) cannot
+    # recover it. Only the SHA-256 hash reached the database.
     flash('Token created. Copy it now because it will only be shown once.', 'success')
-    return redirect(url_for('user.api_tokens'))
+    return _render_api_tokens_page(new_secret=plaintext, new_token_name=name)
 
 
 @bp.route('/tokens/<int:token_id>/revoke', methods=['POST'])

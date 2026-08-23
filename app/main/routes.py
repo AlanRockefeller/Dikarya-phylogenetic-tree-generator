@@ -477,8 +477,44 @@ def _build_voucher_pdf(labels, layout):
 
 
 def _rtf_escape(value):
-    text = str(value).replace("\\", "\\\\").replace("{", "\\{").replace("}", "\\}")
-    return text.replace("\n", "\\line ")
+    """Escape label text for an RTF document body.
+
+    RTF is a 7-bit format: the header declares \\ansi, so a raw UTF-8 byte is
+    read as a single Windows-1252 character and an accented voucher prefix
+    ("Boleté", "Åland") came out mojibake. Non-ASCII therefore goes out as
+    \\uN? escapes, where N is the signed 16-bit UTF-16 code unit and "?" is the
+    one-character fallback for readers that do not understand \\u (matching the
+    \\uc1 in the header). Characters outside the BMP are emitted as their
+    surrogate pair rather than being dropped.
+    """
+    out = []
+    for ch in str(value).replace("\r\n", "\n").replace("\r", "\n"):
+        if ch == "\\":
+            out.append("\\\\")
+        elif ch == "{":
+            out.append("\\{")
+        elif ch == "}":
+            out.append("\\}")
+        elif ch == "\n":
+            out.append("\\line ")
+        elif ch == "\t":
+            out.append("\\tab ")
+        elif " " <= ch <= "~":
+            out.append(ch)
+        elif ord(ch) < 0x20:
+            # Other control characters have no RTF meaning; drop them.
+            continue
+        else:
+            code = ord(ch)
+            if code < 0x10000:
+                units = (code,)
+            else:
+                offset = code - 0x10000
+                units = (0xD800 + (offset >> 10), 0xDC00 + (offset & 0x3FF))
+            for unit in units:
+                # RTF's \uN takes a *signed* 16-bit value.
+                out.append(f"\\u{unit - 0x10000 if unit > 0x7FFF else unit}?")
+    return "".join(out)
 
 
 def _build_voucher_rtf(labels, layout):
@@ -497,7 +533,9 @@ def _build_voucher_rtf(labels, layout):
             row.append(f"\\pard\\intbl\\qc\\f0\\fs{font_half_points} {_rtf_escape(label)}\\cell")
         row.append("\\row")
         rows.append("".join(row))
-    return ("{\\rtf1\\ansi\\deff0"
+    # \uc1: every \uN escape written by _rtf_escape is followed by exactly one
+    # ASCII fallback character.
+    return ("{\\rtf1\\ansi\\ansicpg1252\\uc1\\deff0"
             f"{{\\fonttbl{{\\f0 {font};}}}}"
             "\\margl720\\margr720\\margt720\\margb720\n"
             + "\n".join(rows)
@@ -728,6 +766,16 @@ def job_viewer(job_id):
                 job_details = json.load(f)
         except Exception:
             pass
+
+    # input_info.json can carry raw JSON-request values for the boolean
+    # settings, and "false" is the one that bites: a non-empty string is truthy
+    # in Jinja, so the page reported a setting as on while the worker -- which
+    # goes through coerce_bool -- had already run it off.
+    from app.services.security_utils import coerce_bool as _coerce_bool
+    for _flag in ("mcmc_stop_early", "trim_terminal_overhangs",
+                  "enable_bootstrap", "moose_enabled", "early_stopping"):
+        if _flag in job_details:
+            job_details[_flag] = _coerce_bool(job_details[_flag], default=False)[0]
 
     mycomap_blast_url = job_details.get("mycomap_blast_url")
     if not mycomap_blast_url and db_job and isinstance(db_job.metrics, dict):

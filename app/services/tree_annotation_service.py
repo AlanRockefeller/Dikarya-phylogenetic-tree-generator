@@ -24,8 +24,9 @@ node rotation and rerooting without storing a single coordinate.
 
 If the current tree somehow carries two leaves with the same canonical name,
 that name is AMBIGUOUS and membership referencing it is rejected rather than
-silently bound to whichever leaf happens to come first. ``ensure_unique_labels``
-in ``tree_edit_service`` normally prevents this from ever happening.
+silently bound to whichever leaf happens to come first. Upstream FASTA/tree
+validation normally prevents this; tree serialization fails loudly if it does
+occur rather than silently changing a phylogenetic tip label.
 """
 
 import math

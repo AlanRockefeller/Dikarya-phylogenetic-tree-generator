@@ -574,6 +574,10 @@ class TestInaturalistTreeSourceLabel(unittest.TestCase):
                 return_value=(0, []),
             ),
             patch(
+                "app.services.mycomap_service.get_mycomap_ncbi_queue_position",
+                return_value=None,
+            ),
+            patch(
                 "app.api.routes.gather_mycomap_sequences_for_queue",
                 side_effect=AssertionError("tree input must wait for an NCBI hit"),
             ),
@@ -626,6 +630,10 @@ class TestInaturalistTreeSourceLabel(unittest.TestCase):
                 return_value=(2, []),
             ),
             patch(
+                "app.services.mycomap_service.get_mycomap_ncbi_queue_position",
+                return_value=None,
+            ),
+            patch(
                 "app.api.routes.gather_mycomap_sequences_for_queue",
                 return_value=(payload, None),
             ),
@@ -640,6 +648,70 @@ class TestInaturalistTreeSourceLabel(unittest.TestCase):
         self.assertTrue(prepared["metrics"]["mycomap_blast_auto_created"])
         self.assertTrue(prepared["metrics"]["mycomap_ncbi_blast_rebuilt"])
         self.assertIn(">AB123456 Example one", prepared["job_params"]["sequence"])
+
+    def test_auto_created_blast_uses_queue_position_without_probing_fasta(self):
+        details = {
+            "auto_created": True,
+            "created_mycomap_url": "https://mycomap.com/genetics/blast-search/r42/",
+            "ncbi_poll_attempt": 0,
+            "warnings": [],
+        }
+        with (
+            patch(
+                "app.services.mycomap_service.get_mycomap_ncbi_queue_position",
+                return_value=2741,
+            ),
+            patch(
+                "app.services.mycomap_service.get_mycomap_ncbi_result_count",
+                side_effect=AssertionError("queued NCBI export must not be fetched"),
+            ),
+            patch(
+                "app.services.mycomap_service.get_mycomap_local_result_count",
+                return_value=(0, []),
+            ),
+        ):
+            ready, updated = (
+                inaturalist_tree_service._check_auto_created_mycomap_ncbi_results(
+                    "42", details,
+                    mycomap_url=details["created_mycomap_url"],
+                )
+            )
+
+        self.assertFalse(ready)
+        self.assertEqual(updated["ncbi_status"], "queued")
+        self.assertEqual(updated["ncbi_queue_position"], 2741)
+
+    def test_deep_queue_builds_from_available_local_hits_immediately(self):
+        details = {
+            "auto_created": True,
+            "created_mycomap_url": "https://mycomap.com/genetics/blast-search/r42/",
+            "ncbi_poll_attempt": 0,
+            "warnings": [],
+        }
+        with (
+            patch(
+                "app.services.mycomap_service.get_mycomap_ncbi_queue_position",
+                return_value=2741,
+            ),
+            patch(
+                "app.services.mycomap_service.get_mycomap_ncbi_result_count",
+                side_effect=AssertionError("queued NCBI export must not be fetched"),
+            ),
+            patch(
+                "app.services.mycomap_service.get_mycomap_local_result_count",
+                return_value=(50, []),
+            ),
+        ):
+            ready, updated = (
+                inaturalist_tree_service._check_auto_created_mycomap_ncbi_results(
+                    "42", details,
+                    mycomap_url=details["created_mycomap_url"],
+                )
+            )
+
+        self.assertTrue(ready)
+        self.assertTrue(updated["ncbi_fallback_local_only"])
+        self.assertIn("position 2741", updated["warnings"][-1])
 
     def test_batch_admission_returns_successful_ids_after_one_failure(self):
         collected = {

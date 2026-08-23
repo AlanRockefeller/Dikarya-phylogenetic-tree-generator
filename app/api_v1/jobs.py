@@ -11,7 +11,7 @@ from app.services.artifact_storage import (
     artifact_size,
     resolve_artifact,
 )
-from app.services.security_utils import validate_job_id
+from app.services.security_utils import coerce_bool, validate_job_id
 
 
 def get_owned_job_or_404(job_id):
@@ -74,7 +74,10 @@ def serialize_job(job):
             ),
             # False, not the current default: a job stored without this key ran
             # before the stop rule existed and must not be reported as using it.
-            "mcmc_stop_early":  bool(info.get("mcmc_stop_early", False)),
+            # coerce_bool, not bool(): a job whose params were stored from a
+            # JSON request may hold the string "false", which bool() reports as
+            # enabled while the worker reads it as disabled.
+            "mcmc_stop_early":  coerce_bool(info.get("mcmc_stop_early"), default=False)[0],
         },
         "metrics": job.metrics or {},
         "links": {

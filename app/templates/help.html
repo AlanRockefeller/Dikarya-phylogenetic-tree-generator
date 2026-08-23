@@ -81,6 +81,7 @@
             <a href="#downloads">Downloads</a>
             <a href="#advanced">Advanced</a>
             <a href="#api">API</a>
+            <a href="#source-code">Source Code</a>
             <a href="#help-feedback">Help</a>
         </div>
     </nav>
@@ -98,6 +99,7 @@
                     <li><a href="#downloads">Downloads</a></li>
                     <li><a href="#advanced">Advanced</a></li>
                     <li><a href="#api">API</a></li>
+                    <li><a href="#source-code">Source Code</a></li>
                     <li><a href="#help-feedback">Help</a></li>
                 </ul>
             </nav>
@@ -415,8 +417,9 @@ ACGTACGTACGT...</code></pre>
                         <h3 class="text-lg font-semibold text-journal-dark dark:text-journal-gold-light">Trimming</h3>
                         <p class="mt-2 leading-relaxed">
                             The default is <strong>trimAl gap-threshold (recommended)</strong>, which removes columns that
-                            are more than 90% gaps. You can choose no trimming, trimAl <code>-automated1</code>, or BMGE;
-                            terminal-overhang trimming is a separate control. The interface specifically warns that
+                            are more than 90% gaps. You can choose no trimming, trimAl <code>-automated1</code>, or BMGE.
+                            Terminal-overhang trimming is a separate first pass based on genuine end coverage;
+                            terminal N padding does not count as coverage. The interface specifically warns that
                             <code>-automated1</code> can remove informative ITS1/ITS2 regions. Automated trimming is not
                             automatically correct&mdash;inspect important alignments in the Alignment Viewer and retain the
                             Trimming Inspection ZIP when it is available.
@@ -506,6 +509,25 @@ ACGTACGTACGT...</code></pre>
                 <p class="mt-3 text-sm text-gray-500 dark:text-gray-400">Token management requires a Dikarya login.</p>
             </section>
 
+            <section id="source-code" aria-labelledby="source-code-title">
+                <h2 id="source-code-title" class="text-2xl font-bold text-journal-dark dark:text-gray-100">Source Code</h2>
+                <p class="mt-3 leading-relaxed">
+                    Dikarya is open source. The full source for the phylogenetic tree generator &mdash; the pipeline,
+                    the web application, the tree viewer, and the API &mdash; lives on GitHub at
+                    <a href="https://github.com/AlanRockefeller/dikarya-phylogenetic-tree-generator"
+                        target="_blank" rel="noopener"
+                        class="font-mono text-sm text-journal-dark underline decoration-journal-gold underline-offset-2 hover:text-journal-green dark:text-journal-gold-light dark:hover:text-journal-gold">github.com/AlanRockefeller/dikarya-phylogenetic-tree-generator</a>.
+                    Bug reports, feature requests, and pull requests are welcome there.
+                </p>
+                <div class="mt-5">
+                    <a href="https://github.com/AlanRockefeller/dikarya-phylogenetic-tree-generator"
+                        target="_blank" rel="noopener"
+                        class="help-action inline-flex items-center gap-2 rounded-lg bg-journal-dark px-4 py-2.5 text-sm font-semibold text-white transition-colors hover:bg-journal-green focus:outline-none focus-visible:ring-2 focus-visible:ring-journal-gold focus-visible:ring-offset-2 dark:ring-1 dark:ring-journal-green dark:focus-visible:ring-offset-journal-dark">
+                        <i class="fab fa-github" aria-hidden="true"></i> View on GitHub
+                    </a>
+                </div>
+            </section>
+
             <section id="rule-of-thumb" aria-labelledby="rule-of-thumb-title"
                 class="rounded-2xl border border-journal-gold bg-journal-gold/10 p-5 sm:p-6">
                 <h2 id="rule-of-thumb-title" class="text-xl font-bold text-journal-dark dark:text-gray-100">Practical rule of thumb</h2>
@@ -528,6 +550,10 @@ ACGTACGTACGT...</code></pre>
                     If something is confusing, a tree looks wrong, you find a bug, or you have an idea that would make
                     Dikarya more useful, please let me know. Alan Rockefeller reads the messages and the public suggestion
                     list. Email: <span class="font-mono text-sm text-journal-gold-light">alanrockefeller [at] gmail [dot] com</span>.
+                    You can also open an issue on
+                    <a href="https://github.com/AlanRockefeller/dikarya-phylogenetic-tree-generator"
+                        target="_blank" rel="noopener"
+                        class="font-semibold text-journal-gold-light underline underline-offset-2 hover:text-journal-gold">GitHub</a>.
                 </p>
                 <div class="mt-5">{{ contact_actions() }}</div>
             </section>

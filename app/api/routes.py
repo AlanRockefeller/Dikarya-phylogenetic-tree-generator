@@ -174,6 +174,18 @@ RECOMPUTE_OVERRIDABLE_FIELDS = frozenset({
     "outgroup", "notes",
 })
 
+# The overridable settings that are booleans. JSON clients send these as
+# "true"/"false"/0/1 at least as often as real bools, and the override dict
+# is persisted into input_info.json verbatim -- so a stored string stays truthy
+# everywhere that does not route through coerce_bool (the v1 API's params block
+# and the viewer's Jinja template both read it raw), and the job page would
+# report a setting the worker had already coerced the other way. Normalize on
+# the way in, where the value is still a request value.
+RECOMPUTE_BOOLEAN_FIELDS = frozenset({
+    "trim_terminal_overhangs", "enable_bootstrap", "moose_enabled",
+    "early_stopping", "mcmc_stop_early",
+})
+
 # Settings the viewer's Advanced panel reads back so it can open pre-filled with
 # what the job actually ran. Same list, minus free-text notes.
 RECOMPUTE_READABLE_FIELDS = RECOMPUTE_OVERRIDABLE_FIELDS - {"notes"}
@@ -1306,6 +1318,7 @@ def gather_mycomap_sequences_for_queue(url, include_ncbi=True, include_local=Tru
     from app.services.mycomap_service import (
         fetch_mycomap_blast_metrics,
         fetch_mycomap_fasta,
+        get_mycomap_ncbi_queue_position,
         improve_mycomap_sequence_name,
         parse_mycomap_ncbi_fasta_header,
         prefer_local_mycomap_taxa,
@@ -1368,8 +1381,29 @@ def gather_mycomap_sequences_for_queue(url, include_ncbi=True, include_local=Tru
     logger.info(
         f"Mycomap helper: blast_id={blast_id} (ncbi={include_ncbi}, local={include_local}) url={url}"
     )
+    ncbi_queue_position = (
+        get_mycomap_ncbi_queue_position(url) if include_ncbi else None
+    )
+    ncbi_queued = ncbi_queue_position is not None
+    if ncbi_queued:
+        logger.info(
+            "event=mycomap.ncbi_queued blast_id=%s position=%s",
+            blast_id, ncbi_queue_position,
+        )
+        if not include_local:
+            return None, ({
+                "status": "pending",
+                "error": (
+                    "MycoMap's NCBI results are still waiting in its BLAST queue "
+                    f"at position {ncbi_queue_position}. Try this import again "
+                    "after the queue advances, or include local MycoBLAST results now."
+                ),
+                "ncbi_queue_position": ncbi_queue_position,
+                "retryable": True,
+            }, 409)
     result = fetch_mycomap_fasta(
-        blast_id, include_ncbi, include_local, time_budget=fetch_time_budget
+        blast_id, include_ncbi and not ncbi_queued, include_local,
+        time_budget=fetch_time_budget
     )
 
     if result['errors'] and not result['fasta_content']:
@@ -1575,10 +1609,18 @@ def gather_mycomap_sequences_for_queue(url, include_ncbi=True, include_local=Tru
 
     parts = []
     if include_ncbi:
-        parts.append(f"{result['ncbi_count']} NCBI")
+        parts.append(
+            "NCBI queued" if ncbi_queued else f"{result['ncbi_count']} NCBI"
+        )
     if include_local:
         parts.append(f"{result['local_count']} local")
     msg = f"Fetched {' + '.join(parts)} sequences from Mycomap"
+    if ncbi_queued:
+        msg += (
+            f" -- MycoMap reports the NCBI search is still at queue position "
+            f"{ncbi_queue_position}; local results were imported now without "
+            "treating the pending NCBI export as a failure."
+        )
     if dropped_count > 0:
         msg += f" ({dropped_count} dropped due to invalid/short sequences)"
     if contaminant_dropped_count > 0:
@@ -1607,6 +1649,8 @@ def gather_mycomap_sequences_for_queue(url, include_ncbi=True, include_local=Tru
         "ncbi_count": result['ncbi_count'],
         "local_count": result['local_count'],
         "failed_sources": failed_sources,
+        "pending_sources": ["ncbi"] if ncbi_queued else [],
+        "ncbi_queue_position": ncbi_queue_position,
         "blast_metrics_count": metrics_attached_count,
         "conflicting_local_count": conflicting_local_dropped_count,
         "duplicate_observation_count": duplicate_observation_count,
@@ -2380,6 +2424,15 @@ def create_job():
         job_params.get("mcmc_nruns"), Config.DEFAULT_MCMC_NRNS, 1, 8)
     job_params["mcmc_nchains"] = _clamp_int(
         job_params.get("mcmc_nchains"), Config.DEFAULT_MCMC_CHAINS, 1, 16)
+    # DEFAULT_MCMC_GENERATIONS is a ceiling the stop rule is expected to end the
+    # run well short of, and the stop rule needs two independent runs. A caller
+    # who asks for one run and names no generation count would otherwise inherit
+    # the ceiling as a full-length run -- 5x the work, no early exit, on a worker
+    # that runs one job at a time. Only the unrequested default is reduced.
+    if (tree_method == "mrbayes"
+            and data.get("mcmc_generations") in (None, "")
+            and not (job_params["mcmc_stop_early"] and job_params["mcmc_nruns"] > 1)):
+        job_params["mcmc_generations"] = Config.DEFAULT_MCMC_GENERATIONS_FIXED_RUN
     job_params["mcmc_burnin_fraction"] = _clamp_float(
         job_params.get("mcmc_burnin_fraction"),
         Config.DEFAULT_MCMC_BURNIN_FRACTION, 0.0, 0.99
@@ -3113,6 +3166,13 @@ def get_job_pipeline_params(job_id):
 
     params = {key: stored.get(key) for key in RECOMPUTE_READABLE_FIELDS if key in stored}
 
+    # Same normalization the recompute endpoint now applies on the way in, for
+    # jobs whose params were stored before it did. The Advanced panel checks
+    # these boxes on truthiness, and the string "false" is truthy.
+    for key in RECOMPUTE_BOOLEAN_FIELDS:
+        if key in params:
+            params[key], _ = coerce_bool(params[key], default=False)
+
     # A MrBayes job stored before mcmc_stop_early existed did not use the
     # convergence stop rule, so report it as off rather than leaving the key
     # absent and letting the form's "on" default describe someone else's run.
@@ -3172,6 +3232,12 @@ def recompute_tree_job(job_id):
             key: value for key, value in req_data.items()
             if key in RECOMPUTE_OVERRIDABLE_FIELDS
         }
+        for key in RECOMPUTE_BOOLEAN_FIELDS:
+            if key in overrides:
+                # An unparseable value keeps whatever the job already had rather
+                # than inventing a default the user never asked for.
+                current, _ = coerce_bool(params_dict.get(key), default=False)
+                overrides[key], _ = coerce_bool(overrides[key], default=current)
         if overrides:
             method = str(overrides.get("tree_method", params_dict.get("tree_method", "")) or "").lower()
             if "tree_method" in overrides and method not in VALID_TREE_METHODS:
@@ -3890,6 +3956,7 @@ def claude_review(job_id):
         TreeAnalysisError,
         TreeAnalysisInProgress,
         TreeAnalysisNoTree,
+        TreeAnalysisRateLimited,
         TreeAnalysisUnavailable,
         TreeAnalysisUpstreamError,
         is_configured,
@@ -3918,6 +3985,10 @@ def claude_review(job_id):
         response = jsonify({"status": "error", "error": str(exc)})
         response.headers["Retry-After"] = str(exc.retry_after_seconds)
         return response, 409
+    except TreeAnalysisRateLimited as exc:
+        response = jsonify({"status": "error", "error": str(exc)})
+        response.headers["Retry-After"] = str(exc.retry_after_seconds)
+        return response, 429
     except TreeAnalysisUnavailable as exc:
         # Out of capacity or misconfigured: a retry may well succeed, so this is
         # deliberately not the same status as a dataset we cannot review at all.

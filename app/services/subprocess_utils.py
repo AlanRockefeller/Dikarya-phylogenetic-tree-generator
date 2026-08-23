@@ -106,6 +106,50 @@ EXIT_CODE_TOOL_NOT_FOUND = -127
 EXIT_CODE_JOB_TIMEOUT = -128
 
 
+# Shared wall-clock budgets for every external phylogenetics executable. Keep
+# the environment/config naming in one place so a new call site cannot invent a
+# parallel timeout convention.
+_TOOL_TIME_LIMIT_HOURS = {
+    "RAxML": ("RAXML_TIME_LIMIT_HOURS", 15.0),
+    "IQ-TREE": ("IQTREE_TIME_LIMIT_HOURS", 15.0),
+    "MrBayes": ("MRBAYES_TIME_LIMIT_HOURS", 15.0),
+    "FastTree": ("FASTTREE_TIME_LIMIT_HOURS", 6.0),
+    "MAFFT": ("MAFFT_TIME_LIMIT_HOURS", 8.0),
+    "MUSCLE": ("MUSCLE_TIME_LIMIT_HOURS", 8.0),
+    "Clustal Omega": ("CLUSTALO_TIME_LIMIT_HOURS", 8.0),
+    "IQ-TREE alignment": ("IQTREE_ALIGNMENT_TIME_LIMIT_HOURS", 8.0),
+    "trimAl": ("TRIMAL_TIME_LIMIT_HOURS", 4.0),
+    "BMGE": ("BMGE_TIME_LIMIT_HOURS", 4.0),
+}
+
+
+def configured_tool_time_limit_hours(config, tool: str) -> float:
+    """Return a positive, operator-overridable wall-clock budget in hours."""
+    attr, default = _TOOL_TIME_LIMIT_HOURS.get(tool, (None, 8.0))
+    try:
+        value = float(getattr(config, attr, default)) if attr else default
+    except (TypeError, ValueError):
+        value = default
+    return value if value > 0 else default
+
+
+def configured_tool_timeout_seconds(config, tool: str) -> int:
+    return int(configured_tool_time_limit_hours(config, tool) * 3600)
+
+
+def configured_tool_limits(config, tool: str, threads: int = 1) -> dict:
+    """Keyword args for the streaming runner's wall and CPU limits.
+
+    RLIMIT_CPU accumulates CPU across threads, so a multithreaded tool needs its
+    advertised wall budget multiplied by the actual thread count plus headroom.
+    """
+    seconds = configured_tool_timeout_seconds(config, tool)
+    return {
+        "timeout": seconds,
+        "cpu_limit_seconds": int(seconds * max(1, int(threads or 1)) * 1.2),
+    }
+
+
 def tool_failure_message(tool_label: str, exit_code: int,
                          time_limit_hours: Optional[float] = None) -> str:
     """Build the user-facing message for a failed external tool run.

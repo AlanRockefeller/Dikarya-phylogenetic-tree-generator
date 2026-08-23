@@ -1171,7 +1171,8 @@
                 <span>
                     <span class="font-medium">Trim terminal overhangs</span>
                     <span class="block text-xs text-gray-500 dark:text-gray-400 mt-1">
-                        Remove low-coverage alignment ends before tree building.
+                        Remove low-coverage alignment ends before the selected trimmer and tree builder.
+                        Terminal runs of unknown bases (N) do not count as genuine coverage.
                     </span>
                 </span>
             </label>
@@ -1401,7 +1402,7 @@
         <div id="mrbayes_options" class="mt-6 hidden">
             <div class="grid grid-cols-1 md:grid-cols-4 gap-4">
                 <div>
-                    <label for="mb_gen" class="block text-sm font-medium text-gray-700 dark:text-gray-200 mb-2">
+                    <label for="mb_gen" id="mb_gen_label" class="block text-sm font-medium text-gray-700 dark:text-gray-200 mb-2">
                         Maximum generations
                     </label>
                     <input type="number" id="mb_gen" value="1000000" step="1000" class="w-full px-4 py-3 border border-gray-300 dark:border-journal-dark rounded-lg
@@ -3997,6 +3998,11 @@
     // MrBayes: generations is a maximum whenever the convergence stop rule is
     // on, so these defaults must match Config.DEFAULT_MCMC_* on the server.
     const MB_DEFAULT_MAX_GENERATIONS = 1000000;
+    // What a run that cannot stop itself gets instead. The ceiling above is
+    // only reasonable because the stop rule is expected to end the run well
+    // before it; without one, the ceiling is simply the full length of the run.
+    // Mirrors Config.DEFAULT_MCMC_GENERATIONS_FIXED_RUN.
+    const MB_DEFAULT_FIXED_RUN_GENERATIONS = 200000;
     const mbStopEarly = document.getElementById('mb_stop_early');
     const mbStopEarlyHelp = document.getElementById('mb_stop_early_help');
     const MB_STOP_EARLY_HELP_DEFAULT = mbStopEarlyHelp ? mbStopEarlyHelp.innerHTML : '';
@@ -4020,6 +4026,24 @@
                 : MB_STOP_EARLY_HELP_SINGLE_RUN;
         }
         mbStopEarly.closest('label')?.classList.toggle('opacity-60', !supported);
+        syncMrBayesGenerationsDefault();
+    }
+
+    /** Keep the generations field honest about what it means. With the stop
+     *  rule on it is a ceiling the run is expected to duck under; with it off
+     *  it is the full length of the run, so leaving the ceiling default there
+     *  would silently request 5x the work with no way to finish early. A value
+     *  the user typed themselves is never overwritten. */
+    function syncMrBayesGenerationsDefault() {
+        const mbGen = document.getElementById('mb_gen');
+        if (!mbGen) return;
+        const stopRule = mbStopEarlyValue();
+        const label = document.getElementById('mb_gen_label');
+        if (label) label.textContent = stopRule ? 'Maximum generations' : 'Generations';
+        if (mbGen.dataset.userEdited === '1') return;
+        mbGen.value = stopRule
+            ? MB_DEFAULT_MAX_GENERATIONS
+            : MB_DEFAULT_FIXED_RUN_GENERATIONS;
     }
 
     /** What the form is actually asking the server for. */
@@ -4204,8 +4228,15 @@
             refreshAdvancedSummary();
         });
     });
+    // A generation count the user typed is theirs; the default follows the
+    // stop rule, a typed value never does.
+    document.getElementById('mb_gen')?.addEventListener('input', (e) => {
+        e.target.dataset.userEdited = '1';
+    });
     mbStopEarly?.addEventListener('change', () => {
         if (!mbStopEarly.disabled) mbStopEarly.dataset.choice = mbStopEarly.checked ? '1' : '0';
+        syncMrBayesGenerationsDefault();
+        refreshAdvancedSummary();
     });
     updateMrBayesStopEarlyState();
 
@@ -4666,6 +4697,12 @@
         }
 
         setFieldValue('mb_gen', p.mcmc_generations);
+        if (p.mcmc_generations !== undefined && p.mcmc_generations !== null) {
+            // What this job actually ran with. Stop the stop-rule default from
+            // overwriting it a few lines below.
+            const mbGenInput = document.getElementById('mb_gen');
+            if (mbGenInput) mbGenInput.dataset.userEdited = '1';
+        }
         setFieldValue('mb_runs', p.mcmc_nruns);
         setFieldValue('mb_chains', p.mcmc_nchains);
         if (p.mcmc_burnin_fraction !== undefined && p.mcmc_burnin_fraction !== null) {

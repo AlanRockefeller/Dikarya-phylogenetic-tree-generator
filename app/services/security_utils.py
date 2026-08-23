@@ -66,11 +66,25 @@ def cap_fasta_header(header: str) -> str:
     return cleaned.strip()[:MAX_FASTA_HEADER_LEN].strip()
 
 
+# The canonical nucleotide alphabet accepted in submitted sequence data: the
+# four DNA bases, U for RNA, every IUPAC ambiguity code, and the gap character
+# used by pre-aligned input.
+#
+# Written once and case-folded below rather than as two hand-maintained
+# strings. The lowercase half used to be typed out separately and was missing
+# w, b, d and h, so a lowercase ambiguity code was silently deleted -- which
+# shortens the sequence and shifts every coordinate after it.
+NUCLEOTIDE_ALPHABET = "ACGTUNRYKMSWBDHV"
+FASTA_SEQUENCE_GAP_CHARS = "-"
+ALLOWED_FASTA_SEQUENCE_CHARS = frozenset(
+    NUCLEOTIDE_ALPHABET + NUCLEOTIDE_ALPHABET.lower() + FASTA_SEQUENCE_GAP_CHARS
+)
+
+
 def sanitize_fasta_sequence(seq: str) -> str:
     """Remove any non-standard characters from FASTA sequence."""
-    # Allow only valid nucleotide/amino acid characters
-    allowed = set('ACGTUNRYKMSWBDHVacgtunrykmsv-')
-    return ''.join(c for c in seq if c in allowed)
+    # Allow only valid nucleotide characters (either case) and the gap symbol.
+    return ''.join(c for c in seq if c in ALLOWED_FASTA_SEQUENCE_CHARS)
 
 def validate_safe_file_path(path: Path, base_dir: Path) -> bool:
     """

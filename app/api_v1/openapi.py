@@ -23,7 +23,10 @@ MCMC_STOP_EARLY_DESCRIPTION = (
     f"{Config.DEFAULT_MCMC_STOPVAL}, so mcmc_generations is a maximum rather "
     "than a fixed run length. Requires mcmc_nruns >= 2: with a single run there "
     "are no independent runs to compare, no stop rule is applied, and the "
-    "analysis uses the full mcmc_generations. Reaching this criterion does not "
+    f"analysis uses the full mcmc_generations -- which is why an omitted "
+    f"mcmc_generations then defaults to "
+    f"{Config.DEFAULT_MCMC_GENERATIONS_FIXED_RUN} rather than to the "
+    f"{Config.DEFAULT_MCMC_GENERATIONS} ceiling. Reaching this criterion does not "
     "by itself guarantee satisfactory ESS or PSRF -- those are checked "
     "separately after the run and reported in tree_metadata.json. Defaults to "
     "true for newly submitted jobs."
@@ -119,7 +122,11 @@ def _schemas():
                 "trim_terminal_overhangs": {
                     "type": "boolean",
                     "default": True,
-                    "description": "Trim alignment columns outside the common covered span before tree building.",
+                    "description": (
+                        "Trim alignment columns outside the common genuinely covered span before "
+                        "external trimming and tree building. Terminal N/n padding counts as "
+                        "missing coverage."
+                    ),
                 },
                 "bootstrap": {"type": "integer", "minimum": 0, "maximum": 10000},
                 "alrt_replicates": {
@@ -130,7 +137,12 @@ def _schemas():
                     "type": "integer", "minimum": 1000, "maximum": 100000000,
                     "description": (
                         "MrBayes MCMC generations; the maximum whenever "
-                        "mcmc_stop_early is enabled."
+                        f"mcmc_stop_early is enabled, in which case it defaults "
+                        f"to {Config.DEFAULT_MCMC_GENERATIONS}. When no stop "
+                        f"rule applies (mcmc_stop_early false, or mcmc_nruns 1) "
+                        f"this is the full length of the run and the default "
+                        f"drops to {Config.DEFAULT_MCMC_GENERATIONS_FIXED_RUN}. "
+                        "An explicitly supplied value is always used as given."
                     ),
                 },
                 "mcmc_nruns": {"type": "integer", "minimum": 1, "maximum": 8},
@@ -208,7 +220,7 @@ def _schemas():
                     "enum": ["none", "trimal_gappy", "trimal", "bmge"],
                     "default": "trimal_gappy",
                     "description": (
-                        "Alignment trimmer. 'trimal_gappy' (default) runs trimAl -gt 0.9, "
+                        "Alignment trimmer. 'trimal_gappy' (default) runs trimAl -gt 0.1, "
                         "dropping columns that are >90%% gaps. 'trimal' runs -automated1, "
                         "which is aggressive and strips much of ITS1/ITS2 -- not recommended "
                         "for ITS."
@@ -217,7 +229,11 @@ def _schemas():
                 "trim_terminal_overhangs": {
                     "type": "boolean",
                     "default": True,
-                    "description": "Trim alignment columns outside the common covered span before tree building.",
+                    "description": (
+                        "Trim alignment columns outside the common genuinely covered span before "
+                        "external trimming and tree building. Terminal N/n padding counts as "
+                        "missing coverage."
+                    ),
                 },
                 "tree_method": {
                     "type": "string",
@@ -549,10 +565,16 @@ def build_spec():
                         "Returns `text/event-stream`. Emits a `snapshot` event "
                         "first, then live `data:` updates, with 15-second pings. "
                         "A single token may hold at most 5 concurrent streams "
-                        "(429 `too_many_streams` beyond that). Each connection "
-                        "is hard-capped at 30 minutes; on timeout the server "
-                        "emits `event: timeout` and closes. Clients should "
-                        "reconnect. If the token is revoked mid-stream, the "
+                        "(429 `too_many_streams` beyond that). The server closes "
+                        "a stream with `event: timeout` when it reaches the "
+                        "absolute lifetime cap (`reason: max_duration_reached`) "
+                        "or when it has seen no activity on a still-running job "
+                        "for the idle limit (`reason: idle`); both carry "
+                        "`max_seconds`. Clients should reconnect -- an "
+                        "`EventSource` does so automatically and receives a "
+                        "fresh snapshot. Connecting to a job that has already "
+                        "finished or failed yields its snapshot, a short linger, "
+                        "then close. If the token is revoked mid-stream, the "
                         "server emits `event: revoked` and closes."
                     ),
                     "security": [{"bearerAuth": ["jobs:read"]}],

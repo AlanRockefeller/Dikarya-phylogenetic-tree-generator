@@ -1,5 +1,12 @@
 import gzip
+import shutil
 from pathlib import Path
+
+import pytest
+
+from app.models import (
+    AlignmentParams, JobParams, TreeBuilderParams, TrimmingParams,
+)
 
 
 def test_install_recompute_outputs_replaces_complete_mrbayes_generation(tmp_path):
@@ -100,3 +107,69 @@ def test_install_recompute_outputs_removes_stale_report_when_none_was_produced(t
 
     assert not (job_dir / report).exists()
     assert not (job_dir / f"{report}.gz").exists()
+
+
+def test_malformed_staged_recompute_does_not_replace_live_tree(tmp_path, monkeypatch):
+    from app.services import (
+        alignment_service, tree_builder_service, tree_edit_service,
+        trimming_service,
+    )
+
+    job_dir = tmp_path / "job"
+    output_dir = tmp_path / "staged"
+    for root in (job_dir, output_dir):
+        (root / "alignment").mkdir(parents=True)
+        (root / "tree").mkdir()
+    (job_dir / "input").mkdir()
+    (job_dir / "input" / "input_raw.fasta").write_text(
+        ">A\nACGT\n>B\nACGA\n"
+    )
+    live_newick = job_dir / "tree" / "tree_pruned.newick"
+    live_nexus = job_dir / "tree" / "tree_pruned.nexus"
+    live_newick.write_text("(A:0.1,B:0.1);\n")
+    live_nexus.write_text("last usable nexus\n")
+
+    monkeypatch.setattr(
+        tree_edit_service, "load_tree_state",
+        lambda _job_dir: {"pruned_taxa": [], "structure": {}},
+    )
+    monkeypatch.setattr(
+        alignment_service, "run_alignment",
+        lambda source, destination, *args, **kwargs: shutil.copy(source, destination),
+    )
+
+    def fake_trim(source, destination, *args, **kwargs):
+        shutil.copy(source, destination)
+        return {"terminal_overhang_trim": {"enabled": False}}
+
+    monkeypatch.setattr(trimming_service, "run_trimming", fake_trim)
+
+    def malformed_tree(_alignment, newick, nexus, *args, **kwargs):
+        newick.write_text("not a tree\n")
+        nexus.write_text("#NEXUS\n")
+        return {"method": "nj"}
+
+    monkeypatch.setattr(tree_builder_service, "run_tree_builder", malformed_tree)
+    installed = []
+    monkeypatch.setattr(
+        tree_edit_service, "_install_recompute_outputs",
+        lambda *args: installed.append(args),
+    )
+
+    params = JobParams(
+        input_type="fasta",
+        alignment_params=AlignmentParams(method="default"),
+        trimming_params=TrimmingParams(
+            method="none", trim_terminal_overhangs=False,
+        ),
+        tree_builder_params=TreeBuilderParams(method="nj"),
+    )
+    with pytest.raises(RuntimeError, match="Pipeline output validation failed"):
+        tree_edit_service._recompute_tree_staged(
+            job_dir, params, object(), tree_edit_service.logger,
+            output_dir=output_dir,
+        )
+
+    assert installed == []
+    assert live_newick.read_text() == "(A:0.1,B:0.1);\n"
+    assert live_nexus.read_text() == "last usable nexus\n"

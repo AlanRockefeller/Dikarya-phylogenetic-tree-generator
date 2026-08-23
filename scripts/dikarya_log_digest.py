@@ -4,13 +4,16 @@
 import argparse
 import collections
 import gzip
+import json
 import math
 import re
 import sys
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-LOG_DIR = Path(__file__).resolve().parent.parent / "var" / "logs"
+REPO_ROOT = Path(__file__).resolve().parent.parent
+LOG_DIR = REPO_ROOT / "var" / "logs"
+DEFAULT_CHECKPOINT = REPO_ROOT / ".log-review-checkpoint.json"
 ACCESS_RE = re.compile(
     r'^(?P<ip>\S+) \S+ \S+ \[(?P<ts>[^\]]+)\] '
     r'"(?P<method>[A-Z]+) (?P<path>\S+) (?P<proto>[^"]+)" '
@@ -111,6 +114,76 @@ def parse_log_ts(line):
         return None
 
 
+def parse_window_timestamp(raw):
+    """Parse an ISO-8601 operator boundary and normalize it to naive UTC."""
+    value = str(raw or "").strip()
+    if value.endswith(("Z", "z")):
+        value = value[:-1] + "+00:00"
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError as exc:
+        raise ValueError(
+            f"Invalid timestamp {raw!r}; use ISO-8601, e.g. 2026-08-22T18:03:00Z"
+        ) from exc
+    if parsed.tzinfo is not None:
+        parsed = parsed.astimezone(timezone.utc).replace(tzinfo=None)
+    return parsed.replace(microsecond=0)
+
+
+def format_window_timestamp(value):
+    """Render the naive UTC timestamps used by the log parsers."""
+    if value.tzinfo is not None:
+        value = value.astimezone(timezone.utc).replace(tzinfo=None)
+    return value.replace(microsecond=0).isoformat(timespec="seconds") + "Z"
+
+
+def read_review_checkpoint(path):
+    """Return the completed review boundary stored in ``path``."""
+    try:
+        payload = json.loads(path.read_text())
+    except FileNotFoundError as exc:
+        raise ValueError(
+            f"No log-review checkpoint exists at {path}. Seed it with "
+            f"--mark-reviewed <ISO timestamp> after completing an initial review."
+        ) from exc
+    except (OSError, ValueError, TypeError) as exc:
+        raise ValueError(f"Could not read log-review checkpoint {path}: {exc}") from exc
+    if not isinstance(payload, dict) or not payload.get("reviewed_through"):
+        raise ValueError(
+            f"Log-review checkpoint {path} has no reviewed_through timestamp."
+        )
+    return parse_window_timestamp(payload["reviewed_through"])
+
+
+def write_review_checkpoint(path, reviewed_through):
+    """Atomically record a successfully reviewed UTC boundary."""
+    reviewed_through = reviewed_through.replace(microsecond=0)
+    now = datetime.now(timezone.utc).replace(tzinfo=None, microsecond=0)
+    if reviewed_through > now:
+        raise ValueError(
+            "Refusing to mark future logs as reviewed "
+            f"({format_window_timestamp(reviewed_through)} > "
+            f"{format_window_timestamp(now)})."
+        )
+    if path.exists():
+        previous = read_review_checkpoint(path)
+        if reviewed_through < previous:
+            raise ValueError(
+                "Refusing to move the log-review checkpoint backwards "
+                f"({format_window_timestamp(previous)} -> "
+                f"{format_window_timestamp(reviewed_through)})."
+            )
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "version": 1,
+        "reviewed_through": format_window_timestamp(reviewed_through),
+        "updated_at": format_window_timestamp(datetime.now(timezone.utc)),
+    }
+    temporary = path.with_name(path.name + ".tmp")
+    temporary.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
+    temporary.replace(path)
+
+
 def percentile(values, fraction):
     if not values:
         return 0.0
@@ -161,7 +234,7 @@ def coverage_record(files, oldest, newest, lines, unparsed, timed=0, contextual=
     }
 
 
-def analyze_access(cutoff):
+def analyze_access(cutoff, until=None):
     files = log_files("access", cutoff)
     statuses = collections.Counter()
     server_errors = collections.Counter()
@@ -186,7 +259,7 @@ def analyze_access(cutoff):
                 if when is None:
                     unparsed += 1
                     continue
-                if when < cutoff:
+                if when < cutoff or (until is not None and when >= until):
                     continue
                 oldest = when if oldest is None or when < oldest else oldest
                 newest = when if newest is None or when > newest else newest
@@ -253,11 +326,12 @@ def meaningful_error_key(record):
     return message.strip()[:180]
 
 
-def analyze_errors(cutoff):
+def analyze_errors(cutoff, until=None):
     files = log_files("error", cutoff) + log_files("errors", cutoff)
     exceptions = collections.Counter()
     degradations = collections.Counter()
     affected = collections.defaultdict(set)
+    affected_jobs = collections.defaultdict(set)
     seen = set()
     oldest = newest = None
     lines = unparsed = contextual = records = 0
@@ -269,7 +343,11 @@ def analyze_errors(cutoff):
             if when is None:
                 unparsed += 1
                 continue
-            if when < cutoff or not LEVEL_RE.search(record.splitlines()[0]):
+            if (
+                when < cutoff
+                or (until is not None and when >= until)
+                or not LEVEL_RE.search(record.splitlines()[0])
+            ):
                 continue
             fields = context_fields(record.splitlines()[0])
             oldest = when if oldest is None or when < oldest else oldest
@@ -283,18 +361,24 @@ def analyze_errors(cutoff):
             if fields:
                 contextual += 1
             user = fields.get("user")
+            job = fields.get("job")
             if "DEGRADED" in record:
                 event = re.search(r'event=degraded\.([\w.-]+)', record)
                 slug = event.group(1) if event else record.split("DEGRADED", 1)[-1].strip().split(":", 1)[0]
                 degradations[slug[:100]] += 1
                 if user:
                     affected[slug[:100]].add(user)
+                if job:
+                    affected_jobs[slug[:100]].add(job)
             else:
                 exceptions[key] += 1
                 if user:
                     affected[key].add(user)
+                if job:
+                    affected_jobs[key].add(job)
     return {
         "exceptions": exceptions, "degradations": degradations, "affected": affected,
+        "affected_jobs": affected_jobs,
         "coverage": coverage_record(files, oldest, newest, lines, unparsed, 0, contextual, len(seen)),
     }
 
@@ -360,7 +444,7 @@ def _is_record_continuation(line):
     return bool(EXCEPTION_RE.match(line.strip()))
 
 
-def analyze_worker(cutoff, grace=timedelta(minutes=60)):
+def analyze_worker(cutoff, grace=timedelta(minutes=60), until=None):
     """Summarize worker job lifecycle from worker.log alone (no Redis, no DB)."""
     files = log_files("worker", cutoff)
     counts = collections.Counter()
@@ -384,7 +468,7 @@ def analyze_worker(cutoff, grace=timedelta(minutes=60)):
                     if not _is_record_continuation(line):
                         unparsed += 1
                     continue
-                if when < cutoff:
+                if when < cutoff or (until is not None and when >= until):
                     continue
                 window_lines += 1
                 oldest = when if oldest is None or when < oldest else oldest
@@ -477,7 +561,7 @@ def analyze_worker(cutoff, grace=timedelta(minutes=60)):
 
     # "Unterminated" only means something once a job has had time to finish.
     # Anything younger than the grace period is simply still running.
-    reference = newest or datetime.now()
+    reference = until or newest or datetime.now()
     unmatched = [(job_id, when) for job_id, when in started.items() if job_id not in terminal]
     active = [item for item in unmatched if reference - item[1] < grace]
     stale = sorted((item for item in unmatched if reference - item[1] >= grace), key=lambda item: item[1])
@@ -516,7 +600,24 @@ def format_coverage(label, data):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--hours", type=float, default=24)
+    window = parser.add_mutually_exclusive_group()
+    window.add_argument("--hours", type=float)
+    window.add_argument("--since", help="ISO-8601 UTC start boundary")
+    window.add_argument(
+        "--since-checkpoint", action="store_true",
+        help="start at the last successfully reviewed checkpoint",
+    )
+    parser.add_argument(
+        "--until", help="ISO-8601 UTC end boundary (default: current UTC second)",
+    )
+    parser.add_argument(
+        "--checkpoint-file", type=Path, default=DEFAULT_CHECKPOINT,
+        help=f"review checkpoint path (default: {DEFAULT_CHECKPOINT})",
+    )
+    parser.add_argument(
+        "--mark-reviewed", metavar="TIMESTAMP",
+        help="record a completed review boundary and exit; use a digest's checkpoint_candidate",
+    )
     parser.add_argument("--since-rotated", action="store_true", help="deprecated; rotations are always included")
     parser.add_argument("--top", type=int, default=10)
     parser.add_argument("--slow-threshold", type=float, default=5.0)
@@ -525,16 +626,53 @@ def main():
         help="how long a started job may run before it is listed as having no terminal event",
     )
     args = parser.parse_args()
+    if args.mark_reviewed:
+        try:
+            reviewed_through = parse_window_timestamp(args.mark_reviewed)
+            write_review_checkpoint(args.checkpoint_file, reviewed_through)
+        except ValueError as exc:
+            parser.error(str(exc))
+        print(
+            f"Log-review checkpoint advanced through "
+            f"{format_window_timestamp(reviewed_through)} at {args.checkpoint_file}"
+        )
+        return 0
     if not LOG_DIR.is_dir():
         print(f"No log directory at {LOG_DIR}", file=sys.stderr)
         return 1
-    cutoff = datetime.now() - timedelta(hours=args.hours)
-    access = analyze_access(cutoff)
-    errors = analyze_errors(cutoff)
+    try:
+        until = (
+            parse_window_timestamp(args.until)
+            if args.until else
+            datetime.now(timezone.utc).replace(tzinfo=None, microsecond=0)
+        )
+        if args.since_checkpoint:
+            cutoff = read_review_checkpoint(args.checkpoint_file)
+            window_label = "checkpointed review window"
+        elif args.since:
+            cutoff = parse_window_timestamp(args.since)
+            window_label = "explicit review window"
+        else:
+            hours = 24 if args.hours is None else args.hours
+            if hours <= 0:
+                parser.error("--hours must be greater than zero")
+            cutoff = until - timedelta(hours=hours)
+            window_label = f"{hours:g}h window"
+    except ValueError as exc:
+        parser.error(str(exc))
+    if cutoff >= until:
+        parser.error("The review start must be earlier than --until")
+
+    access = analyze_access(cutoff, until=until)
+    errors = analyze_errors(cutoff, until=until)
     worker_counts, unterminated, worker_coverage = analyze_worker(
-        cutoff, grace=timedelta(minutes=args.unterminated_grace_minutes)
+        cutoff, grace=timedelta(minutes=args.unterminated_grace_minutes), until=until
     )
-    print(f"Dikarya log digest -- {args.hours:g}h window (since {cutoff:%Y-%m-%d %H:%M})")
+    print(
+        f"Dikarya log digest -- {window_label} "
+        f"[{format_window_timestamp(cutoff)}, {format_window_timestamp(until)})"
+    )
+    print(f"checkpoint_candidate={format_window_timestamp(until)}")
 
     section("Traffic")
     print(f"  {access['total']} requests   " + "  ".join(f"{k}={v}" for k, v in sorted(access['statuses'].items())))
@@ -545,7 +683,18 @@ def main():
     section("Crawler/scanner/static noise (4xx)")
     rows([f"{count:>5}  {status}  {endpoint}" for (status, endpoint), count in access["noise_4xx"].most_common(args.top)])
     section("Exceptions and errors")
-    rows([f"{count:>5}  {key}" + (f" [users: {', '.join(sorted(errors['affected'][key])[:3])}]" if errors['affected'].get(key) else "") for key, count in errors["exceptions"].most_common(args.top)])
+    rows([
+        f"{count:>5}  {key}"
+        + (
+            f" [jobs: {len(errors['affected_jobs'][key])}]"
+            if errors["affected_jobs"].get(key) else ""
+        )
+        + (
+            f" [users: {', '.join(sorted(errors['affected'][key])[:3])}]"
+            if errors['affected'].get(key) else ""
+        )
+        for key, count in errors["exceptions"].most_common(args.top)
+    ])
     section("Degraded work")
     rows([f"{count:>5}  {key}" for key, count in errors["degradations"].most_common(args.top)])
     section("Worker lifecycle")
@@ -553,7 +702,7 @@ def main():
         f"{key}={worker_counts.get(key, 0)}"
         for key in ("started", "completed", "failed", "retried", "active", "degraded")
     ))
-    reference = worker_coverage["newest"] or datetime.now()
+    reference = until
     rows(
         [f"no terminal event observed: {job} (started {when:%Y-%m-%d %H:%M}, age {format_age(reference - when)})"
          for job, when in unterminated[:args.top]],

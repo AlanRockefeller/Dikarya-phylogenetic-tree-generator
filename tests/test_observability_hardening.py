@@ -7,6 +7,7 @@ log went silent, and the digest kept printing while its numbers were wrong.
 
 import gzip
 import importlib.util
+import json
 import logging
 import os
 import sys
@@ -30,6 +31,23 @@ def _digest_module():
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
+
+
+def test_log_review_checkpoint_round_trip_and_refuses_regression(tmp_path):
+    digest = _digest_module()
+    checkpoint = tmp_path / "review.json"
+    boundary = digest.parse_window_timestamp("2026-08-22T18:03:00Z")
+
+    digest.write_review_checkpoint(checkpoint, boundary)
+
+    assert digest.read_review_checkpoint(checkpoint) == boundary
+    payload = json.loads(checkpoint.read_text())
+    assert payload["reviewed_through"] == "2026-08-22T18:03:00Z"
+    with pytest.raises(ValueError, match="backwards"):
+        digest.write_review_checkpoint(
+            checkpoint,
+            digest.parse_window_timestamp("2026-08-22T18:02:59Z"),
+        )
 
 
 @pytest.fixture

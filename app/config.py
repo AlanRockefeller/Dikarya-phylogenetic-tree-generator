@@ -145,6 +145,29 @@ class Config:
     #   3. RLIMIT_CPU via prlimit (_run_raxml, scaled by thread count)
     RAXML_TIME_LIMIT_HOURS = float(os.environ.get('RAXML_TIME_LIMIT_HOURS', '15'))
 
+    # The same budget for the other tree builders. Previously only RAxML had
+    # one, so IQ-TREE, MrBayes and FastTree could run forever; the worker is
+    # single-process, so one wedged run blocked every queued job behind it.
+    # These must exist here even though _tool_time_limit_hours() falls back to a
+    # literal: it reads them with getattr(), so an operator raising the cap for
+    # a large job by setting IQTREE_TIME_LIMIT_HOURS in the environment would
+    # otherwise have it silently ignored and the job killed at 15h anyway.
+    IQTREE_TIME_LIMIT_HOURS = float(os.environ.get('IQTREE_TIME_LIMIT_HOURS', '15'))
+    MRBAYES_TIME_LIMIT_HOURS = float(os.environ.get('MRBAYES_TIME_LIMIT_HOURS', '15'))
+    FASTTREE_TIME_LIMIT_HOURS = float(os.environ.get('FASTTREE_TIME_LIMIT_HOURS', '6'))
+
+    # Alignment and trimming tools need their own subprocess deadlines too. The
+    # RQ job deadline is only a backstop for the entire pipeline; without these,
+    # a wedged early step can consume that whole allowance and hold the worker.
+    MAFFT_TIME_LIMIT_HOURS = float(os.environ.get('MAFFT_TIME_LIMIT_HOURS', '8'))
+    MUSCLE_TIME_LIMIT_HOURS = float(os.environ.get('MUSCLE_TIME_LIMIT_HOURS', '8'))
+    CLUSTALO_TIME_LIMIT_HOURS = float(os.environ.get('CLUSTALO_TIME_LIMIT_HOURS', '8'))
+    IQTREE_ALIGNMENT_TIME_LIMIT_HOURS = float(
+        os.environ.get('IQTREE_ALIGNMENT_TIME_LIMIT_HOURS', '8')
+    )
+    TRIMAL_TIME_LIMIT_HOURS = float(os.environ.get('TRIMAL_TIME_LIMIT_HOURS', '4'))
+    BMGE_TIME_LIMIT_HOURS = float(os.environ.get('BMGE_TIME_LIMIT_HOURS', '4'))
+
 
     # Paths
     BASE_DIR = Path(__file__).resolve().parent.parent
@@ -244,7 +267,7 @@ class Config:
     # "SH-aLRT/UFBoot" node labels. Set to 0 to report UFBoot only.
     DEFAULT_IQTREE_ALRT = int(os.environ.get("DEFAULT_IQTREE_ALRT", "1000"))
 
-    # Default alignment trimmer. "trimal_gappy" (trimAl -gt 0.9) drops columns
+    # Default alignment trimmer. "trimal_gappy" (trimAl -gt 0.1) drops columns
     # that are >90% gaps -- alignment junk -- while leaving the variable ITS1/ITS2
     # regions intact. Deliberately NOT "trimal" (-automated1), which strips ~43% of
     # ITS1/ITS2 and produced fewer well-supported nodes than no trimming at all.
@@ -312,6 +335,14 @@ class Config:
     # default was demonstrably too short -- a real Dikarya run finished it with
     # min ESS ~10 and max PSRF ~1.10.
     DEFAULT_MCMC_GENERATIONS = int(os.environ.get("DEFAULT_MCMC_GENERATIONS", "1000000"))
+    # The ceiling above is only safe because the stop rule is expected to cut the
+    # run short, and the stop rule needs two independent runs. A user who picks
+    # mcmc_nruns=1 gets no stop rule, so the ceiling becomes a promise to run the
+    # full length -- on a single-process worker that blocks every queued job
+    # behind it for hours. A run that cannot stop itself gets this instead.
+    DEFAULT_MCMC_GENERATIONS_FIXED_RUN = int(
+        os.environ.get("DEFAULT_MCMC_GENERATIONS_FIXED_RUN", "200000")
+    )
     DEFAULT_MCMC_NRNS = int(os.environ.get("DEFAULT_MCMC_NRNS", "2"))
     DEFAULT_MCMC_CHAINS = int(os.environ.get("DEFAULT_MCMC_CHAINS", "4"))
     DEFAULT_MCMC_BURNIN_FRACTION = float(

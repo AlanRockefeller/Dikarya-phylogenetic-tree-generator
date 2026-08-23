@@ -82,3 +82,54 @@ class TestBlastRequestSafety(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class TestFastaSequenceSanitization(unittest.TestCase):
+    """Every IUPAC nucleotide code must survive in both cases.
+
+    The lowercase half of the allowed set was written out by hand and omitted
+    w, b, d and h, so those codes were silently deleted -- which shortens the
+    sequence and shifts every downstream coordinate.
+    """
+
+    IUPAC = "ACGTUNRYKMSWBDHV"
+
+    def test_every_iupac_code_survives_in_upper_case(self):
+        for base in self.IUPAC:
+            with self.subTest(base=base):
+                self.assertEqual(
+                    security_utils.sanitize_fasta_sequence(base), base
+                )
+
+    def test_every_iupac_code_survives_in_lower_case(self):
+        for base in self.IUPAC.lower():
+            with self.subTest(base=base):
+                self.assertEqual(
+                    security_utils.sanitize_fasta_sequence(base), base
+                )
+
+    def test_mixed_case_sequence_is_returned_unchanged(self):
+        seq = "acgtuNRYkmswbdhv-ACGTUnrykmSWBDHV"
+        self.assertEqual(security_utils.sanitize_fasta_sequence(seq), seq)
+
+    def test_lowercase_ambiguity_codes_are_not_dropped(self):
+        # The exact regression: w/b/d/h used to disappear.
+        self.assertEqual(
+            security_utils.sanitize_fasta_sequence("acgwbdhtt"), "acgwbdhtt"
+        )
+
+    def test_gap_character_is_preserved(self):
+        self.assertEqual(security_utils.sanitize_fasta_sequence("AC-GT"), "AC-GT")
+
+    def test_invalid_characters_are_still_removed(self):
+        self.assertEqual(
+            security_utils.sanitize_fasta_sequence("AC GT\n>x*1ZzE"), "ACGT"
+        )
+
+    def test_allowed_alphabet_is_closed_under_case(self):
+        allowed = security_utils.ALLOWED_FASTA_SEQUENCE_CHARS
+        letters = [c for c in allowed if c.isalpha()]
+        self.assertEqual(len(letters), 2 * len(self.IUPAC))
+        for c in letters:
+            with self.subTest(char=c):
+                self.assertIn(c.swapcase(), allowed)

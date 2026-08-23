@@ -15,6 +15,7 @@ import re
 import shutil
 import logging
 import math
+from collections import Counter
 from pathlib import Path
 from typing import Dict, Any, Optional, Tuple
 
@@ -23,6 +24,9 @@ from app.models import TreeBuilderParams
 
 _RAXML_HELP_CACHE = None
 from app.services.subprocess_utils import (
+    configured_tool_limits,
+    configured_tool_time_limit_hours,
+    configured_tool_timeout_seconds,
     run_command,
     run_command_streaming,
     tool_failure_message,
@@ -148,10 +152,20 @@ def run_tree_builder(
         metadata["bootstrap"] = None
         metadata["support_type"] = "sh_like"
         metadata["support_resamples"] = FASTTREE_SH_RESAMPLES
-    if method == "iqtree" and (params.alrt_replicates or 0) > 0:
-        # Node labels are dual "SH-aLRT/UFBoot" values, both on a 0-100 scale.
-        metadata["support_type"] = "alrt_ufboot"
-        metadata["alrt_replicates"] = params.alrt_replicates
+    if method == "iqtree":
+        has_alrt = (params.alrt_replicates or 0) > 0
+        has_ufboot = (params.bootstrap or 0) > 0
+        if has_alrt and has_ufboot:
+            # Dual "SH-aLRT/UFBoot" labels, both on a 0-100 scale.
+            metadata["support_type"] = "alrt_ufboot"
+        elif has_alrt:
+            metadata["support_type"] = "alrt"
+        elif has_ufboot:
+            metadata["support_type"] = "ufboot"
+        else:
+            metadata["support_type"] = None
+        if has_alrt:
+            metadata["alrt_replicates"] = params.alrt_replicates
     if method == "mrbayes":
         burnin_fraction = _normalize_mrbayes_burnin_fraction(
             params.mcmc_burnin_fraction
@@ -271,42 +285,16 @@ def _make_log_callback(job_id: Optional[str], step: str, stream: str):
     return callback
 
 
-# Wall-clock budget per tool, in hours. Only RAxML had one; IQ-TREE, MrBayes
-# and FastTree could run forever, and the worker is single-process, so one
-# wedged run blocked every queued job behind it and left an SSE stream open.
-# Each is overridable from config as <TOOL>_TIME_LIMIT_HOURS.
-_TOOL_TIME_LIMIT_HOURS = {
-    "RAxML": ("RAXML_TIME_LIMIT_HOURS", 15.0),
-    "IQ-TREE": ("IQTREE_TIME_LIMIT_HOURS", 15.0),
-    "MrBayes": ("MRBAYES_TIME_LIMIT_HOURS", 15.0),
-    "FastTree": ("FASTTREE_TIME_LIMIT_HOURS", 6.0),
-}
-
-
 def _tool_time_limit_hours(config: Config, tool: str) -> float:
-    attr, default = _TOOL_TIME_LIMIT_HOURS.get(tool, (None, 15.0))
-    if attr is None:
-        return default
-    try:
-        return float(getattr(config, attr, default) or default)
-    except (TypeError, ValueError):
-        return default
+    return configured_tool_time_limit_hours(config, tool)
 
 
 def _tool_timeout_seconds(config: Config, tool: str) -> int:
-    return int(_tool_time_limit_hours(config, tool) * 3600)
+    return configured_tool_timeout_seconds(config, tool)
 
 
 def _tool_limits(config: Config, tool: str, threads: int) -> Dict[str, Any]:
-    """Keyword arguments giving a tool a wall-clock and CPU budget."""
-    limit_seconds = _tool_timeout_seconds(config, tool)
-    return {
-        "timeout": limit_seconds,
-        # RLIMIT_CPU is summed across threads, so the wall-clock budget has to
-        # be multiplied by the thread count (plus headroom) or the kernel kills
-        # the tool a fraction of the way into the time it was granted.
-        "cpu_limit_seconds": int(limit_seconds * max(1, threads) * 1.2),
-    }
+    return configured_tool_limits(config, tool, threads)
 
 
 def _resolve_seed(params: TreeBuilderParams) -> int:
@@ -343,6 +331,12 @@ MIN_NJ_PAIRWISE_OVERLAP = 30
 # finite so NJ still runs.
 NJ_SATURATED_DISTANCE = 2.0
 
+# A production sample separated routine NJ corrections (0--16% negative limbs,
+# no capped pairs through the 90th percentile) from clearly non-additive trees
+# at roughly 22--30%.  One quarter is therefore the point at which this stops
+# being an occasional representation correction and becomes a quality warning.
+NJ_DEGRADED_FRACTION = 0.25
+
 
 def _encode_alignment(aln):
     """Encode an alignment as an (n_seq x n_col) uint8 array of A/C/G/T codes."""
@@ -360,7 +354,7 @@ def _encode_alignment(aln):
     return lookup[np.stack(rows)]
 
 
-def _k2p_distance_matrix(aln, task_logger):
+def _k2p_distance_matrix(aln, task_logger, name_mapping=None):
     """Kimura 2-parameter distances with pairwise deletion of missing data.
 
     Replaces Biopython's ``DistanceCalculator('identity')``, which is an
@@ -383,6 +377,11 @@ def _k2p_distance_matrix(aln, task_logger):
     matrix = [[0.0] * (i + 1) for i in range(n_seqs)]
     saturated = 0
     low_overlap = 0
+    ordinary_k2p = 0
+    jc_fallback = 0
+    total_pairs = 0
+    overlap_histogram = Counter()
+    insufficient_by_taxon = [0] * n_seqs
 
     for i in range(n_seqs):
         if i + 1 >= n_seqs:
@@ -392,6 +391,9 @@ def _k2p_distance_matrix(aln, task_logger):
 
         valid = (row != _NT_MISSING) & (others != _NT_MISSING)
         n_valid = valid.sum(axis=1)
+        total_pairs += len(n_valid)
+        for overlap, count in zip(*np.unique(n_valid, return_counts=True)):
+            overlap_histogram[int(overlap)] += int(count)
 
         # With A=0,C=1,G=2,T=3 an XOR of exactly 2 is A<->G or C<->T, i.e.
         # precisely the transitions; any other non-zero XOR is a transversion.
@@ -422,25 +424,84 @@ def _k2p_distance_matrix(aln, task_logger):
         distances = np.nan_to_num(distances, nan=NJ_SATURATED_DISTANCE)
         distances = np.clip(distances, 0.0, NJ_SATURATED_DISTANCE)
 
-        saturated += int((~usable_k2p & ~usable_jc & ~too_thin).sum())
+        eligible = ~too_thin
+        ordinary_k2p += int((usable_k2p & eligible).sum())
+        jc_fallback += int((usable_jc & eligible).sum())
+        saturated += int((~usable_k2p & ~usable_jc & eligible).sum())
         low_overlap += int(too_thin.sum())
+        for offset in np.flatnonzero(too_thin):
+            insufficient_by_taxon[i] += 1
+            insufficient_by_taxon[i + 1 + int(offset)] += 1
 
         for offset, value in enumerate(distances):
             matrix[i + 1 + offset][i] = float(value)
 
-    if low_overlap or saturated:
+    capped_pairs = low_overlap + saturated
+    capped_fraction = capped_pairs / total_pairs if total_pairs else 0.0
+    if capped_pairs:
+        task_logger.warning(
+            "Capped %d/%d NJ pairwise distances (%d insufficient overlap, %d saturated).",
+            capped_pairs, total_pairs, low_overlap, saturated,
+        )
+
+    if total_pairs and capped_fraction >= NJ_DEGRADED_FRACTION:
         from app.services.log_context import log_degradation
 
         log_degradation(
             task_logger, "nj_distance_estimates_capped",
-            "Some NJ pairwise distances could not be estimated and were capped",
+            "A substantial share of NJ pairwise distances could not be estimated; "
+            "the quick NJ topology is poorly determined, so an ML method such as "
+            "IQ-TREE is preferable",
             low_overlap_pairs=low_overlap, saturated_pairs=saturated,
+            total_pairs=total_pairs, capped_fraction=round(capped_fraction, 4),
             min_overlap=MIN_NJ_PAIRWISE_OVERLAP,
         )
 
+    def _overlap_quantile(rank: int):
+        seen = 0
+        for overlap in sorted(overlap_histogram):
+            seen += overlap_histogram[overlap]
+            if seen > rank:
+                return overlap
+        return None
+
+    median_overlap = None
+    if total_pairs:
+        lower = _overlap_quantile((total_pairs - 1) // 2)
+        upper = _overlap_quantile(total_pairs // 2)
+        median_overlap = (lower + upper) / 2
+
+    unusual_cutoff = max(3, math.ceil(max(0, n_seqs - 1) * 0.25))
+    original_names = name_mapping or {}
+    insufficient_taxa = [
+        {
+            "taxon": original_names.get(names[index], names[index]),
+            "pairs": count,
+            "fraction": round(count / max(1, n_seqs - 1), 4),
+        }
+        for index, count in sorted(
+            enumerate(insufficient_by_taxon), key=lambda item: (-item[1], names[item[0]])
+        )
+        if count >= unusual_cutoff
+    ][:10]
+
+    def _fraction(count):
+        return count / total_pairs if total_pairs else 0.0
+
     return DistanceMatrix(names, matrix), {
-        "low_overlap_pairs": low_overlap,
+        "total_pairwise_distances": total_pairs,
+        "ordinary_k2p_pairs": ordinary_k2p,
+        "ordinary_k2p_fraction": _fraction(ordinary_k2p),
+        "jc_fallback_pairs": jc_fallback,
+        "jc_fallback_fraction": _fraction(jc_fallback),
         "saturated_pairs": saturated,
+        "saturated_fraction": _fraction(saturated),
+        "low_overlap_pairs": low_overlap,
+        "low_overlap_fraction": _fraction(low_overlap),
+        "capped_pairwise_fraction": capped_fraction,
+        "minimum_pairwise_overlap": min(overlap_histogram) if overlap_histogram else None,
+        "median_pairwise_overlap": median_overlap,
+        "taxa_with_many_low_overlap_pairs": insufficient_taxa,
     }
 
 
@@ -514,7 +575,7 @@ def _run_neighbor_joining(
         distance_model = "blosum62"
         distance_stats = {}
     else:
-        dm, distance_stats = _k2p_distance_matrix(aln, task_logger)
+        dm, distance_stats = _k2p_distance_matrix(aln, task_logger, name_mapping)
         distance_model = "K2P"
     task_logger.info("NJ distance model: %s", distance_model)
 
@@ -522,14 +583,10 @@ def _run_neighbor_joining(
     constructor = DistanceTreeConstructor()
     tree = constructor.nj(dm)
 
-    # NJ can produce slightly negative branch lengths; every standard
-    # implementation clamps them to zero rather than drawing a negative branch.
-    #
-    # These zeros are NOT the same failure as the rounding one this module used
-    # to have: a rounded zero was a real distance destroyed by "%1.5f", whereas
-    # a clamped zero means "no evidence of divergence", which is a genuine
-    # statement about near-identical sequences. But nothing downstream can tell
-    # them apart, so the count is recorded and a high proportion is flagged.
+    # NJ can produce negative limbs when the estimated pairwise matrix does not
+    # fit an additive tree. Newick consumers generally cannot usefully display
+    # them, so clamp as a representation choice and record exactly how often it
+    # happened; zero here does *not* mean "no evidence of divergence".
     total_branches = 0
     negative_branches = 0
     for clade in tree.find_clades():
@@ -544,7 +601,7 @@ def _run_neighbor_joining(
             "Clamped %d of %d negative NJ branch length(s) to zero.",
             negative_branches, total_branches,
         )
-    if total_branches and negative_branches / total_branches > 0.2:
+    if total_branches and negative_branches / total_branches >= NJ_DEGRADED_FRACTION:
         # Pairwise deletion makes the distance matrix non-additive (each pair is
         # measured over a different column subset), and on a set of
         # near-identical ITS sequences that shows up as many small negative
@@ -555,7 +612,8 @@ def _run_neighbor_joining(
         log_degradation(
             task_logger, "nj_many_negative_branches",
             "A large share of NJ branch lengths were negative and clamped to zero; "
-            "the distance matrix is only weakly additive for this dataset",
+            "the distance matrix fits an additive tree poorly, so the quick NJ "
+            "topology is poorly determined and an ML method such as IQ-TREE is preferable",
             negative=negative_branches, total=total_branches,
         )
 
@@ -563,11 +621,12 @@ def _run_neighbor_joining(
 
     progress("Writing output files...")
     write_tree_file(tree, output_newick, "newick")
-    write_tree_file(tree, output_nexus, "nexus")
 
-    # Restore original names in output files
+    # Restore names in the canonical Newick first, then parse that exact tree to
+    # produce NEXUS. Textually replacing safe IDs in an already-written NEXUS
+    # bypassed the serializer's duplicate/unnamed-tip validation.
     restore_tree_names(output_newick, name_mapping)
-    restore_tree_names(output_nexus, name_mapping)
+    _convert_newick_to_nexus(output_newick, output_nexus)
 
     metadata = {
         "distance_model": distance_model,
@@ -589,7 +648,9 @@ def _check_raxml_feature(config: Config, feature_flag: str) -> bool:
     from app.services.subprocess_utils import run_command
     try:
         cmd = [config.RAXML_BINARY, "--help"]
-        _, stdout, _ = run_command(cmd)
+        _, stdout, _ = run_command(
+            cmd, timeout=min(60, _tool_timeout_seconds(config, "RAxML"))
+        )
         _RAXML_HELP_CACHE = stdout
         return feature_flag in stdout
     except Exception:
@@ -686,7 +747,13 @@ def _run_moose(
         publish_command(job_id, "tree", cmd)
     
     log_file = alignment_fasta.parent.parent / "logs" / "moose.log"
-    rc, stdout, stderr = run_command(cmd, log_file=log_file)
+    # MOOSE model selection is RAxML-NG over the whole alignment, so it gets
+    # RAxML's budget. Without one it was the last unbounded call in this module,
+    # and a wedged run here holds the single worker exactly as a wedged tree
+    # search does -- before a tree has even been started.
+    rc, stdout, stderr = run_command(
+        cmd, log_file=log_file, timeout=_tool_timeout_seconds(config, "RAxML")
+    )
     
     if rc != 0:
         task_logger.warning(
@@ -809,6 +876,18 @@ def _run_raxml(
     }
     
     resolved = validate_and_resolve_raxml_params(params_dict, data_type=mol_type)
+    requested_parameters = {
+        "model": params.model,
+        "enable_bootstrap": params.enable_bootstrap,
+        "bootstrap_cap": params.bootstrap_cap,
+        "bootstrap_preset": params.bootstrap_preset,
+        "start_tree_override": params.start_tree_override,
+        "run_preset": params.run_preset,
+        "seed": params.seed,
+        "outgroup": params.outgroup,
+        "moose_enabled": params.moose_enabled,
+        "early_stopping": params.early_stopping,
+    }
     
     # Check Support for Features
     has_moose_support = _check_raxml_feature(config, "--moose")
@@ -817,6 +896,7 @@ def _run_raxml(
     # 3. Handle MOOSE
     moose_mapping = None
     model_selected_by = None
+    moose_applied = False
 
     if resolved.enable_moose:
         if has_moose_support:
@@ -829,14 +909,41 @@ def _run_raxml(
             if best_model:
                 resolved.model = best_model
                 model_selected_by = "MOOSE"
+                moose_applied = True
+            else:
+                resolved.warnings.append(
+                    "MOOSE did not produce a usable model; retained the validated configured model."
+                )
 
         else:
-            task_logger.warning("MOOSE requested but not supported by installed RAxML-NG. Using default model.")
+            task_logger.warning(
+                "MOOSE requested but not supported by installed RAxML-NG; "
+                "using the validated configured model or data-type default."
+            )
+            resolved.warnings.append(
+                "MOOSE was requested but is not supported by the installed RAxML-NG; "
+                "using the validated configured model or data-type default."
+            )
+
+    if not resolved.model:
+        # The validator deliberately leaves the model blank while MOOSE is
+        # expected to choose it. If MOOSE is unavailable or fails, an empty
+        # ``--model`` is not a fallback at all; install the data-type default and
+        # record the substitution.
+        resolved.model = "GTR+G" if resolved.data_type == "DNA" else "LG+G"
+        resolved.warnings.append(
+            f"No usable model remained after model selection; applied the "
+            f"{resolved.data_type} default {resolved.model}."
+        )
             
     # 4. Handle Early Stopping Flag
     if resolved.enable_early_stopping and not has_early_stop_support:
         task_logger.warning("Early stopping requested but not supported/found in help. Disabling.")
         resolved.enable_early_stopping = False
+        resolved.warnings.append(
+            "Early stopping was requested but is unsupported by the installed "
+            "RAxML-NG; it was disabled."
+        )
 
     # 5. Prepare Main Run
     prefix = str(output_newick.parent / "raxml_run")
@@ -890,6 +997,7 @@ def _run_raxml(
     shutil.copy(source_tree, output_newick)
     
     # 7. Post-Processing: Outgroup Rerooting
+    applied_outgroup = None
     if resolved.outgroup and HAS_BIOPYTHON:
         try:
             task_logger.info(f"Rerooting tree on outgroup: {resolved.outgroup}")
@@ -918,14 +1026,49 @@ def _run_raxml(
                 tree.root_with_outgroup(target_clade)
                 # Overwrite output_newick with rooted version
                 write_tree_file(tree, output_newick, "newick")
+                applied_outgroup = resolved.outgroup
             else:
                 task_logger.warning(f"Outgroup {target_name} not found in tree. Skipping reroot.")
+                resolved.warnings.append(
+                    f"Requested outgroup {resolved.outgroup!r} was not found in the "
+                    "inferred tree; the tree was not outgroup-rooted."
+                )
         except Exception as e:
             task_logger.error(f"Outgroup rerooting failed: {e}")
+            resolved.warnings.append(
+                f"Requested outgroup rooting failed ({type(e).__name__}); the tree "
+                "was retained without that rooting operation."
+            )
+    elif resolved.outgroup:
+        resolved.warnings.append(
+            "Requested outgroup rooting could not be applied because Biopython "
+            "tree support is unavailable."
+        )
 
     # 8. Final Name Restoration & Nexus Conversion
     restore_tree_names(output_newick, name_mapping)
     _convert_newick_to_nexus(output_newick, output_nexus)
+
+    applied_parameters = {
+        "model": resolved.model,
+        "enable_bootstrap": resolved.enable_bootstrap,
+        "bootstrap_cap": resolved.bootstrap_cap if resolved.enable_bootstrap else None,
+        "start_tree_spec": resolved.start_tree_spec,
+        "seed": resolved.seed,
+        "outgroup": applied_outgroup,
+        "moose_enabled": moose_applied,
+        "early_stopping": resolved.enable_early_stopping,
+        "data_type": resolved.data_type,
+    }
+    if resolved.warnings:
+        from app.services.log_context import log_degradation
+
+        log_degradation(
+            task_logger, "raxml_parameters_adjusted",
+            "RAxML-NG ran with scientifically meaningful parameter adjustments; "
+            "see tree_metadata.json for requested, applied, and warning details",
+            warning_count=len(resolved.warnings),
+        )
 
     return resolved.model, model_selected_by, {
         # RAxML is run with --bs-trees autoMRE{cap}, an adaptive replicate
@@ -937,6 +1080,9 @@ def _run_raxml(
         "support_type": "bootstrap" if resolved.enable_bootstrap else None,
         "seed": resolved.seed,
         "data_type": resolved.data_type,
+        "parameters_requested": requested_parameters,
+        "parameters_applied": applied_parameters,
+        "parameter_warnings": list(resolved.warnings),
     }
 
 
@@ -1004,29 +1150,29 @@ def _run_iqtree(
         )
 
         if returncode != 0:
-            raise RuntimeError(tool_failure_message("IQ-TREE", returncode))
+            raise RuntimeError(tool_failure_message(
+                "IQ-TREE", returncode, _tool_time_limit_hours(config, "IQ-TREE")))
         
     # Output handling
     treefile = Path(f"{prefix}.treefile")
     contree = Path(f"{prefix}.contree")
 
-    # .contree (the UFBoot consensus tree) carries UFBoot values only, so it
-    # silently drops the SH-aLRT half of the dual labels. When SH-aLRT was
-    # requested we must take .treefile, which carries both.
-    if use_alrt and treefile.exists():
-        source_tree = treefile
-    else:
-        source_tree = contree if contree.exists() else treefile
-
-    if source_tree.exists():
-        shutil.copy(source_tree, output_newick)
+    # The site promises the inferred maximum-likelihood tree. ``.contree`` is a
+    # UFBoot consensus tree and can have a different topology; selecting it only
+    # when SH-aLRT was disabled made the delivered topology depend on a support
+    # toggle. IQ-TREE leaves the consensus alongside the run as a separate raw
+    # artifact, but it is never substituted for the primary tree.
+    if treefile.exists():
+        shutil.copy(treefile, output_newick)
         
         # Restore original names in the Newick tree
         restore_tree_names(output_newick, name_mapping)
         
         _convert_newick_to_nexus(output_newick, output_nexus)
     else:
-        raise RuntimeError("IQ-TREE output tree not found.")
+        consensus_note = " (a bootstrap consensus exists, but the ML tree is missing)" \
+            if contree.exists() else ""
+        raise RuntimeError(f"IQ-TREE maximum-likelihood .treefile not found{consensus_note}.")
 
     # When ModelFinder chose the model, "MFP" is what the user asked for but not
     # what was actually used. Report the concrete winner so the tree is
@@ -1058,13 +1204,28 @@ def _read_iqtree_selected_model(report_path: Path) -> Optional[str]:
     return selected
 
 
-# MrBayes' substitution-rate settings. nst=1 is JC/F81, nst=2 is K80/HKY,
-# nst=6 is GTR; SYM is GTR with equal base frequencies, which MrBayes expresses
-# through a prior rather than through nst.
-_MRBAYES_NST_BY_BASE = {
-    "JC": 1, "JC69": 1, "F81": 1,
-    "K80": 2, "K2P": 2, "HKY": 2, "HKY85": 2,
-    "GTR": 6, "SYM": 6, "TN93": 6, "TIM": 6, "TVM": 6,
+# MrBayes' substitution models, as (nst, equal_base_frequencies, label).
+# nst=1 is JC/F81, nst=2 is K80/HKY, nst=6 is GTR. Whether base frequencies are
+# fixed equal or estimated is *not* part of nst -- MrBayes expresses it through
+# `prset statefreqpr`, so JC vs F81, K2P vs HKY and SYM vs GTR are distinguished
+# only by that prior. Emitting nst alone silently ran JC as F81 and SYM as GTR.
+#
+# The third element is the model that actually runs, which is what gets reported
+# as model_selected. TN93, TIM and TVM have no MrBayes form at all; they collapse
+# onto GTR and must be named GTR, not echoed back under the requested name.
+_MRBAYES_MODELS = {
+    "JC":    (1, True,  "JC"),
+    "JC69":  (1, True,  "JC"),
+    "F81":   (1, False, "F81"),
+    "K80":   (2, True,  "K80"),
+    "K2P":   (2, True,  "K2P"),
+    "HKY":   (2, False, "HKY"),
+    "HKY85": (2, False, "HKY"),
+    "SYM":   (6, True,  "SYM"),
+    "GTR":   (6, False, "GTR"),
+    "TN93":  (6, False, "GTR"),
+    "TIM":   (6, False, "GTR"),
+    "TVM":   (6, False, "GTR"),
 }
 
 # Target number of posterior samples retained per run. MrBayes' default
@@ -1084,21 +1245,27 @@ MRBAYES_MAX_PSRF = 1.02
 MRBAYES_MIN_ESS = 200.0
 
 
-def _mrbayes_lset_from_model(model_str: str, task_logger) -> Tuple[int, str, str]:
-    """Map a requested model string onto MrBayes ``lset`` settings.
+def _mrbayes_lset_from_model(model_str: str, task_logger) -> Tuple[int, str, bool, str]:
+    """Map a requested model string onto MrBayes ``lset``/``prset`` settings.
 
-    Returns ``(nst, rates, effective_label)``. Previously this function did not
-    exist and the block hardcoded ``nst=6 rates=gamma``, so every Bayesian run
-    was GTR+G regardless of what the user selected -- while tree_metadata.json
-    reported the selection back to them as though it had been honoured.
+    Returns ``(nst, rates, equal_base_frequencies, effective_label)``.
+    Previously this function did not exist and the block hardcoded
+    ``nst=6 rates=gamma``, so every Bayesian run was GTR+G regardless of what
+    the user selected -- while tree_metadata.json reported the selection back to
+    them as though it had been honoured.
+
+    ``effective_label`` describes the model that MrBayes will actually run, not
+    the one that was asked for. Reporting the request would reintroduce the same
+    defect on a smaller scale: TN93/TIM/TVM have no MrBayes form and run as GTR,
+    so that is what they are called.
     """
     raw = (model_str or "").strip() or _IQTREE_DEFAULT_MODEL
     parts = [p.strip().upper() for p in raw.split("+") if p.strip()]
     base = parts[0] if parts else "GTR"
     modifiers = set(parts[1:])
 
-    nst = _MRBAYES_NST_BY_BASE.get(base.split("{", 1)[0])
-    unrecognised = nst is None
+    entry = _MRBAYES_MODELS.get(base.split("{", 1)[0])
+    unrecognised = entry is None
     if unrecognised:
         # Includes ModelFinder requests ("MFP"), which MrBayes cannot honour.
         # Fall back to GTR+G -- the old hardcoded behaviour -- rather than to a
@@ -1106,8 +1273,15 @@ def _mrbayes_lset_from_model(model_str: str, task_logger) -> Tuple[int, str, str
         task_logger.warning(
             "Model '%s' has no MrBayes equivalent; using GTR+G (nst=6, gamma).", raw
         )
-        nst = 6
-        base = "GTR"
+        entry = _MRBAYES_MODELS["GTR"]
+
+    nst, equal_freqs, effective_base = entry
+    if not unrecognised and effective_base != base.split("{", 1)[0]:
+        task_logger.warning(
+            "MrBayes has no %s model; running %s (nst=%d), which is the closest "
+            "it can do.", base, effective_base, nst,
+        )
+    base = effective_base
 
     has_gamma = any(m.startswith("G") or m.startswith("R") for m in modifiers) or unrecognised
     has_invariant = "I" in modifiers
@@ -1126,7 +1300,7 @@ def _mrbayes_lset_from_model(model_str: str, task_logger) -> Tuple[int, str, str
     else:
         rates, suffix = "equal", ""
 
-    return nst, rates, f"{base}{suffix}"
+    return nst, rates, equal_freqs, f"{base}{suffix}"
 
 
 def _read_mrbayes_convergence(nexus_input: Path, task_logger) -> Dict[str, Any]:
@@ -1202,6 +1376,37 @@ def _read_mrbayes_convergence(nexus_input: Path, task_logger) -> Dict[str, Any]:
     if min_ess is not None and min_ess < MRBAYES_MIN_ESS:
         problems.append(f"min ESS={min_ess:.0f} < {MRBAYES_MIN_ESS:.0f}")
 
+    # "converged" is a claim, and it needs evidence. An empty `problems` list
+    # means "nothing failed", which is not the same as "everything passed":
+    # with mcmc_nruns=1 MrBayes writes no ASDSF and no PSRF at all, and a
+    # truncated or missing .mcmc/.pstat yields nothing either. Reporting True
+    # there stamped a tree as converged on no evidence whatsoever -- precisely
+    # the failure mode this function exists to remove. The key is omitted
+    # rather than set to False, because the run did not fail the check; it was
+    # never checked.
+    checked = [
+        name for name in ("asdsf", "max_psrf", "min_ess")
+        if diagnostics.get(name) is not None
+    ]
+    diagnostics["convergence_checked"] = bool(checked)
+    if not checked:
+        diagnostics["convergence_unavailable"] = (
+            "MrBayes wrote no readable ASDSF, PSRF or ESS diagnostic"
+        )
+        from app.services.log_context import log_degradation
+
+        log_degradation(
+            task_logger, "mrbayes_convergence_unknown",
+            "MrBayes convergence could not be assessed: no ASDSF, PSRF or ESS "
+            "was readable (a single independent run writes none of them)",
+        )
+        task_logger.warning(
+            "MrBayes convergence UNKNOWN: no diagnostic could be read from %s. "
+            "The posterior probabilities on this tree are unverified.",
+            nexus_input.name,
+        )
+        return diagnostics
+
     diagnostics["converged"] = not problems
     if problems:
         diagnostics["convergence_warnings"] = problems
@@ -1242,9 +1447,10 @@ def _run_mrbayes(
     )
     burnin_value = f"{burnin_fraction:.4f}".rstrip("0").rstrip(".")
 
-    nst, rates, effective_model = _mrbayes_lset_from_model(params.model, task_logger)
+    nst, rates, equal_freqs, effective_model = _mrbayes_lset_from_model(
+        params.model, task_logger
+    )
 
-    ngen = max(1000, int(params.mcmc_generations or config.DEFAULT_MCMC_GENERATIONS))
     nruns = max(1, int(params.mcmc_nruns or config.DEFAULT_MCMC_NRNS))
     nchains = max(1, int(params.mcmc_nchains or config.DEFAULT_MCMC_CHAINS))
     # The split-frequency stop rule compares independent runs against each
@@ -1254,6 +1460,26 @@ def _run_mrbayes(
     stop_early_requested = bool(params.mcmc_stop_early)
     stop_early = stop_early_requested and nruns > 1
     stopval = MRBAYES_MAX_ASDSF
+
+    # DEFAULT_MCMC_GENERATIONS is a ceiling chosen on the assumption that the
+    # stop rule will cut the run short. When it cannot -- one independent run --
+    # that ceiling turns into a promise to run the whole million generations,
+    # 20x the previous default, on a worker that runs one job at a time. Only
+    # the default is reduced; a generation count the user actually asked for is
+    # always honoured.
+    requested_ngen = int(params.mcmc_generations or 0)
+    if requested_ngen > 0:
+        ngen = max(1000, requested_ngen)
+    elif stop_early:
+        ngen = max(1000, int(config.DEFAULT_MCMC_GENERATIONS))
+    else:
+        ngen = max(1000, int(config.DEFAULT_MCMC_GENERATIONS_FIXED_RUN))
+        task_logger.info(
+            "No stop rule is in effect, so this run cannot end early; using the "
+            "fixed-run default of %d generations rather than the %d-generation "
+            "ceiling.", ngen, config.DEFAULT_MCMC_GENERATIONS,
+        )
+
     if stop_early_requested and not stop_early:
         task_logger.warning(
             "MrBayes convergence-based early stopping was requested but needs at "
@@ -1280,6 +1506,11 @@ def _run_mrbayes(
         # otherwise seeds from the clock and records nothing.
         f.write(f"   set seed={seed} swapseed={seed};\n")
         f.write(f"   lset nst={nst} rates={rates};\n")
+        if equal_freqs:
+            # JC, K2P and SYM are their nst siblings with base frequencies held
+            # equal instead of estimated. Without this prior MrBayes runs F81,
+            # HKY and GTR respectively, which is what it silently did before.
+            f.write("   prset statefreqpr=fixed(equal);\n")
         mcmc_opts = (
             f"ngen={ngen} nchains={nchains} nruns={nruns} "
             f"samplefreq={samplefreq} printfreq={printfreq} "
@@ -1323,7 +1554,9 @@ def _run_mrbayes(
         )
 
         if exit_code != 0:
-            raise RuntimeError(tool_failure_message("MrBayes", exit_code))
+            raise RuntimeError(tool_failure_message(
+                "MrBayes", exit_code, _tool_time_limit_hours(config, "MrBayes")
+            ))
     else:
         returncode, stdout, stderr = run_command(
             cmd, log_file=log_file, timeout=_tool_timeout_seconds(config, "MrBayes")
@@ -1333,7 +1566,9 @@ def _run_mrbayes(
             task_logger.error(f"MrBayes failed. RC={returncode}")
             task_logger.error(f"STDOUT: {stdout}")
             task_logger.error(f"STDERR: {stderr}")
-            raise RuntimeError(tool_failure_message("MrBayes", returncode))
+            raise RuntimeError(tool_failure_message(
+                "MrBayes", returncode, _tool_time_limit_hours(config, "MrBayes")
+            ))
 
     # Output: <input>.con.tre (Consensus tree)
     con_tree = Path(f"{nexus_input}.con.tre")
@@ -1351,6 +1586,9 @@ def _run_mrbayes(
     metadata = {
         "model_selected": effective_model,
         "mrbayes_lset": f"nst={nst} rates={rates}",
+        "mrbayes_prset": (
+            "statefreqpr=fixed(equal)" if equal_freqs else "statefreqpr=dirichlet (default)"
+        ),
         "mcmc_samplefreq": samplefreq,
         # What was actually written into the MrBayes block, so a run can be
         # described accurately later without re-reading the NEXUS file.

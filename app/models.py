@@ -6,6 +6,8 @@ from datetime import datetime
 from flask import current_app
 from flask_login import UserMixin
 from werkzeug.security import generate_password_hash, check_password_hash
+from sqlalchemy.ext.mutable import MutableDict, MutableList
+
 from app.extensions import db, login_manager
 
 
@@ -68,7 +70,13 @@ class Job(db.Model):
     updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
     job_dir = db.Column(db.String(512), nullable=False)
     input_type = db.Column(db.String(64), nullable=False)
-    metrics = db.Column(db.JSON, default=dict)
+    # MutableDict, not a bare db.JSON: several worker paths read `db_job.metrics`,
+    # mutate the dict in place and assign the *same object* back. SQLAlchemy
+    # compares the new value against the committed one, finds them equal (they
+    # are the same object), records no history and emits no UPDATE -- so those
+    # metrics were silently lost. Tracking mutation fixes it without touching
+    # the PostgreSQL column, which stays plain JSON.
+    metrics = db.Column(MutableDict.as_mutable(db.JSON), default=dict)
     
     user = db.relationship("User", backref=db.backref("jobs", lazy=True))
 
@@ -87,7 +95,7 @@ class ApiToken(db.Model):
     token_hash = db.Column(db.String(64), nullable=False, unique=True, index=True)
     token_prefix = db.Column(db.String(20), nullable=False)
     # JSON list of scope strings, e.g. ["jobs:read","jobs:write","tools:read","account:read"]
-    scopes = db.Column(db.JSON, nullable=False, default=list)
+    scopes = db.Column(MutableList.as_mutable(db.JSON), nullable=False, default=list)
     created_at = db.Column(db.DateTime, default=datetime.utcnow, nullable=False)
     last_used_at = db.Column(db.DateTime, nullable=True)
     revoked_at = db.Column(db.DateTime, nullable=True)

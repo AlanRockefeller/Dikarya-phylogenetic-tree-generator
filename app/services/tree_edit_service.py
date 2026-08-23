@@ -522,7 +522,6 @@ def rotate_node(job_dir: Path, tree_json: Dict, node_id: str) -> Dict:
             raise ValueError("Unknown internal node")
 
         target_clade.clades.reverse()
-        _drop_confidence_when_named(tree)
 
         valid_path = job_dir / "tree"
         valid_path.mkdir(parents=True, exist_ok=True)
@@ -857,7 +856,6 @@ def apply_state_to_structure(node: Dict, renames: Dict, pruned_taxa: Set[str]):
 def _write_rerooted_tree(job_dir: Path, tree_json: Dict, tree, root_target: str) -> Dict:
     """Persist an already rerooted Bio.Phylo tree and mirror it into tree state."""
     ladderize_tree(tree, focal_tip=tree_json.get("sequence_of_interest"))
-    _drop_confidence_when_named(tree)
 
     new_structure = _clade_to_json(tree.root)
 
@@ -885,6 +883,7 @@ def _write_rerooted_tree(job_dir: Path, tree_json: Dict, tree, root_target: str)
     valid_path = job_dir / "tree"
     valid_path.mkdir(parents=True, exist_ok=True)
     write_tree_file(tree, str(valid_path / "tree_pruned.newick"), "newick")
+    write_tree_file(tree, str(valid_path / "tree_pruned.nexus"), "nexus")
     logging.info(f"Successfully wrote rerooted tree to {valid_path / 'tree_pruned.newick'}")
 
     return tree_json
@@ -1076,12 +1075,6 @@ def midpoint_root(job_dir: Path, tree_json: Dict) -> Dict:
         # Ladderize (Deterministic)
         ladderize_tree(tree, focal_tip=tree_json.get("sequence_of_interest"))
 
-        # Ensure unique labels for stable IDs
-        ensure_unique_labels(tree)
-
-        # FIX: Ensure confidence is dropped for named nodes before saving/returning
-        _drop_confidence_when_named(tree)
-
         # Build structure
         new_structure = _clade_to_json(tree.root)
         
@@ -1102,6 +1095,7 @@ def midpoint_root(job_dir: Path, tree_json: Dict) -> Dict:
         valid_path = job_dir / "tree"
         valid_path.mkdir(parents=True, exist_ok=True)
         write_tree_file(tree, str(valid_path / "tree_pruned.newick"), "newick")
+        write_tree_file(tree, str(valid_path / "tree_pruned.nexus"), "nexus")
         
         return tree_json
         
@@ -1134,14 +1128,8 @@ def undo_midpoint_root(job_dir: Path, tree_json: Dict) -> Dict:
         # Parse the stored original newick
         tree = Phylo.read(StringIO(pre_midpoint_newick), "newick")
         
-        # Ensure unique labels
-        ensure_unique_labels(tree)
-        
         # Ladderize for consistent display
         ladderize_tree(tree, focal_tip=tree_json.get("sequence_of_interest"))
-        
-        # FIX: Ensure confidence is dropped for named nodes
-        _drop_confidence_when_named(tree)
 
         # Build structure
         new_structure = _clade_to_json(tree.root)
@@ -1163,6 +1151,7 @@ def undo_midpoint_root(job_dir: Path, tree_json: Dict) -> Dict:
         valid_path = job_dir / "tree"
         valid_path.mkdir(parents=True, exist_ok=True)
         write_tree_file(tree, str(valid_path / "tree_pruned.newick"), "newick")
+        write_tree_file(tree, str(valid_path / "tree_pruned.nexus"), "nexus")
         
         return tree_json
         
@@ -1783,6 +1772,13 @@ def _recompute_tree_staged(
     # artifact before any live file is replaced.
     with open(output_dir / "tree" / "tree_pruned_metadata.json", "w") as f:
         json.dump(metadata, f, indent=2)
+    # Validate the staged generation itself before it replaces the last usable
+    # live tree. The worker repeats this after installation as a backstop.
+    from app.workers.tasks import require_valid_pipeline_outputs
+
+    require_valid_pipeline_outputs(
+        output_dir, job_params, logger, recompute=True
+    )
     _install_recompute_outputs(job_dir, output_dir)
 
     tree_json = commit_recompute_tree_state(
@@ -2001,7 +1997,7 @@ def _clade_to_json(clade):
         "name": clade.name,
         "original_name": clade.name,
         "branch_length": clade.branch_length,
-        "confidence": clade.confidence if clade.confidence is not None else getattr(clade, '_poly_confidence', None)
+        "confidence": clade.confidence,
     }
     if clade.clades:
         node["stable_id"] = _stable_internal_node_id(clade)
@@ -2041,6 +2037,8 @@ def _collapse_unifurcations(tree) -> None:
             only_child.branch_length = tree.root.branch_length
         if only_child.confidence is None and tree.root.confidence is not None:
             only_child.confidence = tree.root.confidence
+        if only_child.name is None and tree.root.name is not None:
+            only_child.name = tree.root.name
         # Promote child to root
         tree.root = only_child
         # Continue loop in case the new root is also a unifurcation
@@ -2079,6 +2077,12 @@ def _collapse_unifurcations(tree) -> None:
             # the support value survives the collapse.
             if only_child.confidence is None and clade.confidence is not None:
                 only_child.confidence = clade.confidence
+            if only_child.name is None and clade.name is not None:
+                # IQ-TREE dual SH-aLRT/UFBoot support is parsed as an internal
+                # name rather than as ``confidence``. A collapsed unary node and
+                # its child define the same surviving split, so carry that label
+                # when the child has no annotation of its own.
+                only_child.name = clade.name
 
             # Replace clade with only_child in parent's children list
             idx = parent.clades.index(clade)
@@ -2092,158 +2096,6 @@ def _collapse_unifurcations(tree) -> None:
             parents = {c: p for p in tree.find_clades() for c in p.clades}
             break  # Restart iteration with fresh non-terminal list
 
-
-def _drop_confidence_when_named(tree) -> None:
-    """
-    Biopython Newick writer concatenates clade.name + clade.confidence.
-    If we set name (e.g., Node_12_100), confidence must be None to prevent 
-    outputting Node_12_100100.
-    """
-    for clade in tree.get_nonterminals():
-        if clade.name and clade.confidence is not None:
-            # Stash confidence so it's not lost when we clear it for Newick write safety
-            clade._poly_confidence = clade.confidence
-            clade.confidence = None
-
-def ensure_unique_labels(tree) -> bool:
-    """
-    Traverse the tree and ensure every internal node has a unique name.
-    Duplicate tip names are disambiguated with a numeric suffix rather than
-    rejected, so a tree built from input with a repeated identifier can still
-    be rooted. Internal nodes with no name or duplicate/numeric names will be
-    assigned 'Node_{i}'.
-    Returns True if changes were made.
-    """
-    seen_names = set()
-    changes_made = False
-    counter = 1
-
-    # Pass 1: Collect tip names, disambiguating any duplicates.
-    # Alan 8/14/26 - This used to raise, which left the whole tree unrootable: one
-    # repeated identifier in the input made midpoint rooting fail outright and the
-    # user got an error instead of a tree. The upstream cause (the trimmed-header
-    # restore relabelling records that shared a first token) is fixed in
-    # trimming_service, but keep a backstop here so no tree is ever unrootable --
-    # renaming the later copy is strictly better than refusing to root.
-    duplicate_tips = []
-    for clade in tree.get_terminals():
-        if not clade.name:
-             # Should practically never happen for a valid Newick tip, but strict check
-             raise ValueError("Tip node missing name")
-        if clade.name in seen_names:
-            original = clade.name
-            suffix = 2
-            candidate = f"{original}_{suffix}"
-            while candidate in seen_names:
-                suffix += 1
-                candidate = f"{original}_{suffix}"
-            clade.name = candidate
-            duplicate_tips.append((original, candidate))
-            changes_made = True
-        seen_names.add(clade.name)
-
-    if duplicate_tips:
-        from app.services.log_context import log_degradation
-        log_degradation(
-            logger,
-            "duplicate_tip_names",
-            "renamed duplicate tip(s) so the tree stays rootable: "
-            + "; ".join(f"{old!r} -> {new!r}" for old, new in duplicate_tips[:5]),
-            duplicates=len(duplicate_tips),
-        )
-        
-    # Pass 2: Handle Internal Nodes
-    # We want to preserve existing unique non-numeric internal names if possible
-    
-    # Collect existing internal names to avoid collisions
-    existing_internal_names = set()
-    for clade in tree.get_nonterminals():
-        if clade.name:
-            existing_internal_names.add(clade.name)
-
-    # Assign/Sanitize
-    seen_in_pass = set()
-    import re
-    numeric_pattern = re.compile(r'^\d+(\.\d+)?$')
-
-    for clade in tree.get_nonterminals():
-        needs_rename = False
-        
-        # Check original numeric value (Name or Confidence)
-        original_numeric_match = None
-        is_numeric_name = False
-        
-        if clade.name:
-            if numeric_pattern.match(clade.name):
-                is_numeric_name = True
-                # Filter out likely IDs (e.g. 6100)
-                try:
-                    val = float(clade.name)
-                    if val <= 100:
-                        original_numeric_match = clade.name
-                except ValueError:
-                    pass
-        elif clade.confidence is not None:
-             # Check confidence if name missing
-             conf_str = str(clade.confidence)
-             if numeric_pattern.match(conf_str):
-                 # Filter out likely IDs
-                 try:
-                    val = float(conf_str)
-                    if val <= 100:
-                        original_numeric_match = conf_str
-                 except ValueError:
-                    pass
-
-        # Criteria for renaming internal node:
-        # 1. Empty name
-        # 2. Duplicate of matched Tip (cannot clash with tips)
-        # 3. Duplicate of already seen internal name
-        # 4. Numeric name (matches regex) - sanitize to avoid confusion
-        
-        if not clade.name:
-            needs_rename = True
-        elif clade.name in seen_names: # Clash with tip
-            needs_rename = True
-        elif clade.name in seen_in_pass: # Clash with other internal
-            needs_rename = True
-        elif is_numeric_name: # Numeric safety
-            needs_rename = True
-            
-        if needs_rename:
-            changes_made = True
-            # Generate unique name
-            while True:
-                candidate = f"Node_{counter}"
-                
-                # Hybrid Logic: If we are renaming, preserve value if we found one
-                if original_numeric_match:
-                    candidate = f"{candidate}_{original_numeric_match}"
-                    
-                counter += 1
-                
-                # Must be unique globally (not in Tips, not in Existing Internal, not in Newly Assigned)
-                if (candidate not in seen_names and 
-                    candidate not in existing_internal_names and 
-                    candidate not in seen_in_pass):
-                    clade.name = candidate
-                    # Add to "existing" so we don't re-generate it
-                    existing_internal_names.add(candidate)
-                    
-                    # Probably not needed, but just in case
-                    if clade.confidence is not None:
-                         clade._poly_confidence = clade.confidence
-                    clade.confidence = None
-                    break
-        
-        if clade.name:
-            seen_in_pass.add(clade.name)
-            
-    # CRITICAL FIX: Prevent BioPython from doubling up (Name + Confidence)
-    # This applies to ALL named internal nodes, whether we renamed them or they came named.
-    _drop_confidence_when_named(tree)
-    
-    return changes_made
 
 def ladderize_tree(tree, ascending: bool = False,
                    focal_tip: Optional[str] = None):
@@ -2324,8 +2176,11 @@ def ladderize_tree(tree, ascending: bool = False,
 
 def initialize_tree(job_dir: Path) -> Path:
     """
-    Ensure tree_pruned.newick exists and has unique node labels.
-    If missing, copy original -> pruned, sanitize labels, and save.
+    Ensure tree_pruned.newick exists without changing phylogenetic labels.
+
+    Internal viewer IDs are derived from descendant tip identity in JSON; they
+    must never be written into ``clade.name``, where they would collide with the
+    Newick field used for branch support and program-authored node labels.
     Returns path to pruned tree.
     """
     pruned_path = job_dir / "tree" / "tree_pruned.newick"
@@ -2344,8 +2199,7 @@ def initialize_tree(job_dir: Path) -> Path:
         
     try:
         tree = Phylo.read(str(original_path), "newick")
-        ensure_unique_labels(tree)
-        
+
         # Save to pruned
         write_tree_file(tree, str(pruned_path), "newick")
         

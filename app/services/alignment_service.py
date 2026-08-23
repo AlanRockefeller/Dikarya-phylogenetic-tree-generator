@@ -20,6 +20,9 @@ from typing import Optional
 from app.config import Config
 from app.models import AlignmentParams
 from app.services.subprocess_utils import (
+    configured_tool_limits,
+    configured_tool_time_limit_hours,
+    configured_tool_timeout_seconds,
     run_command,
     run_command_streaming,
     tool_failure_message,
@@ -316,22 +319,27 @@ def _run_mafft(
             stderr_path=log_file,
             on_stderr_line=_make_log_callback(job_id, "align", "stderr"),
             stderr_file_filter=_keep_mafft_log_line,
+            **configured_tool_limits(config, "MAFFT", threads),
         )
         
         if exit_code != 0:
-            raise RuntimeError(tool_failure_message("MAFFT", exit_code))
+            raise RuntimeError(tool_failure_message(
+                "MAFFT", exit_code, configured_tool_time_limit_hours(config, "MAFFT")))
     else:
         # Fallback to non-streaming for backward compatibility. log_file is
         # deliberately not passed to run_command: MAFFT's stdout *is* the
         # alignment, and run_command's generic handler would write the entire
         # aligned FASTA into alignment.log a second time (92 existing logs were
         # inflated this way, some over 1 MB).
-        returncode, stdout, stderr = run_command(cmd)
+        returncode, stdout, stderr = run_command(
+            cmd, timeout=configured_tool_timeout_seconds(config, "MAFFT")
+        )
 
         _append_filtered_log(log_file, cmd, stderr, returncode)
 
         if returncode != 0:
-            raise RuntimeError(tool_failure_message("MAFFT", returncode))
+            raise RuntimeError(tool_failure_message(
+                "MAFFT", returncode, configured_tool_time_limit_hours(config, "MAFFT")))
 
         with open(output_fasta, "w") as f:
             f.write(stdout)
@@ -366,6 +374,7 @@ def _run_muscle(
     Uses MUSCLE v5 syntax (-align/-output).
     """
     # MUSCLE v5 uses -align and -output (v3 used -in/-out)
+    threads = _get_thread_count()
     cmd = [config.MUSCLE_BINARY, "-align", str(input_fasta), "-output", str(output_fasta)]
     
     log_file = output_fasta.parent.parent / "logs" / "alignment.log"
@@ -379,15 +388,21 @@ def _run_muscle(
             cmd,
             stderr_path=log_file,
             on_stderr_line=_make_log_callback(job_id, "align", "stderr"),
+            **configured_tool_limits(config, "MUSCLE", threads),
         )
         
         if exit_code != 0:
-            raise RuntimeError(tool_failure_message("MUSCLE", exit_code))
+            raise RuntimeError(tool_failure_message(
+                "MUSCLE", exit_code, configured_tool_time_limit_hours(config, "MUSCLE")))
     else:
-        returncode, stdout, stderr = run_command(cmd, log_file=log_file)
+        returncode, stdout, stderr = run_command(
+            cmd, log_file=log_file,
+            timeout=configured_tool_timeout_seconds(config, "MUSCLE"),
+        )
         
         if returncode != 0:
-            raise RuntimeError(tool_failure_message("MUSCLE", returncode))
+            raise RuntimeError(tool_failure_message(
+                "MUSCLE", returncode, configured_tool_time_limit_hours(config, "MUSCLE")))
 
 
 def _run_clustalo(
@@ -403,6 +418,7 @@ def _run_clustalo(
     
     Note: Clustal Omega threading support varies by version.
     """
+    threads = _get_thread_count()
     cmd = [config.CLUSTALO_BINARY, "-i", str(input_fasta), "-o", str(output_fasta), "--force"]
     
     log_file = output_fasta.parent.parent / "logs" / "alignment.log"
@@ -416,15 +432,23 @@ def _run_clustalo(
             cmd,
             stderr_path=log_file,
             on_stderr_line=_make_log_callback(job_id, "align", "stderr"),
+            **configured_tool_limits(config, "Clustal Omega", threads),
         )
         
         if exit_code != 0:
-            raise RuntimeError(tool_failure_message("Clustal Omega", exit_code))
+            raise RuntimeError(tool_failure_message(
+                "Clustal Omega", exit_code,
+                configured_tool_time_limit_hours(config, "Clustal Omega")))
     else:
-        returncode, stdout, stderr = run_command(cmd, log_file=log_file)
+        returncode, stdout, stderr = run_command(
+            cmd, log_file=log_file,
+            timeout=configured_tool_timeout_seconds(config, "Clustal Omega"),
+        )
         
         if returncode != 0:
-            raise RuntimeError(tool_failure_message("Clustal Omega", returncode))
+            raise RuntimeError(tool_failure_message(
+                "Clustal Omega", returncode,
+                configured_tool_time_limit_hours(config, "Clustal Omega")))
 
 
 def _run_iqtree_builtin(
@@ -463,15 +487,23 @@ def _run_iqtree_builtin(
             cmd,
             stderr_path=log_file,
             on_stderr_line=_make_log_callback(job_id, "align", "stderr"),
+            **configured_tool_limits(config, "IQ-TREE alignment", threads),
         )
         
         if exit_code != 0:
-            raise RuntimeError(tool_failure_message("IQ-TREE alignment", exit_code))
+            raise RuntimeError(tool_failure_message(
+                "IQ-TREE alignment", exit_code,
+                configured_tool_time_limit_hours(config, "IQ-TREE alignment")))
     else:
-        returncode, stdout, stderr = run_command(cmd, log_file=log_file)
+        returncode, stdout, stderr = run_command(
+            cmd, log_file=log_file,
+            timeout=configured_tool_timeout_seconds(config, "IQ-TREE alignment"),
+        )
         
         if returncode != 0:
-            raise RuntimeError(tool_failure_message("IQ-TREE alignment", returncode))
+            raise RuntimeError(tool_failure_message(
+                "IQ-TREE alignment", returncode,
+                configured_tool_time_limit_hours(config, "IQ-TREE alignment")))
     
     # IQ-TREE output file handling
     # Check for likely output files

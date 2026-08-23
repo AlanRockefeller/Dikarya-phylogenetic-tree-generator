@@ -6,7 +6,6 @@ import time
 import requests
 import threading
 import xml.etree.ElementTree as ET
-from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Any
 from app.config import Config
 
@@ -23,6 +22,20 @@ _MIN_REQUEST_GAP = 1.0 / 3.0  # At least 0.34s between requests (~3 req/s)
 # 50 ids at the rate limit cost ~17s when NCBI is healthy; this only bites when
 # it is not, and it is what keeps the pass inside nginx's 300s read timeout.
 _ISOLATION_BUDGET_SECONDS = 60.0
+
+# How many hits a BLAST search returns when the caller names no limit. Both
+# public entry points already defaulted to this; it is named here so the
+# submission (HITLIST_SIZE) and the parse cannot drift apart again.
+DEFAULT_MAX_SEQUENCES = 50
+
+
+def _normalize_max_sequences(value) -> int:
+    """Coerce a requested hit limit to a usable positive integer."""
+    try:
+        limit = int(value)
+    except (TypeError, ValueError):
+        return DEFAULT_MAX_SEQUENCES
+    return limit if limit > 0 else DEFAULT_MAX_SEQUENCES
 
 def _ncbi_request(method: str, url: str, max_retries: int = 5, **kwargs) -> requests.Response:
     """
@@ -100,7 +113,8 @@ def _ncbi_request(method: str, url: str, max_retries: int = 5, **kwargs) -> requ
     raise requests.exceptions.RetryError(f"Max retries ({max_retries}) exceeded for NCBI request to {url}")
 
 
-def blast_from_sequence(seq: str, config: Config, min_identity: float = 90.0, max_sequences: int = 50, logger=logger) -> Dict:
+def blast_from_sequence(seq: str, config: Config, min_identity: float = 90.0,
+                        max_sequences: int = DEFAULT_MAX_SEQUENCES, logger=logger) -> Dict:
     """
     Perform remote BLAST using the given nucleotide sequence.
     Use caching if available.
@@ -119,7 +133,7 @@ def blast_from_sequence(seq: str, config: Config, min_identity: float = 90.0, ma
         
         _poll_blast(rid, rtoe, config, logger)
         
-        blast_result = _fetch_blast_results(rid)
+        blast_result = _fetch_blast_results(rid, max_sequences)
         hit_accessions = blast_result.get("accessions", [])
         hit_details = blast_result.get("hit_details", [])
         logger.info(f"BLAST finished. Found {len(hit_accessions)} hits.")
@@ -134,7 +148,8 @@ def blast_from_sequence(seq: str, config: Config, min_identity: float = 90.0, ma
         # Re-raise to let caller handle failure (e.g. show user error)
         raise
 
-def blast_from_accessions(accessions: List[str], config: Config, min_identity: float = 90.0, max_sequences: int = 50, logger=logger) -> Dict:
+def blast_from_accessions(accessions: List[str], config: Config, min_identity: float = 90.0,
+                          max_sequences: int = DEFAULT_MAX_SEQUENCES, logger=logger) -> Dict:
     """
     Retrieve sequences for the provided accessions.
     Then run remote BLAST using the combined sequence.
@@ -162,7 +177,7 @@ def blast_from_accessions(accessions: List[str], config: Config, min_identity: f
         
         _poll_blast(rid, rtoe, config, logger)
         
-        blast_result = _fetch_blast_results(rid)
+        blast_result = _fetch_blast_results(rid, max_sequences)
         hit_accessions = blast_result.get("accessions", [])
         hit_details = blast_result.get("hit_details", [])
         logger.info(f"BLAST finished. Found {len(hit_accessions)} hits.")
@@ -363,12 +378,18 @@ def _poll_blast(rid: str, rtoe: int, config: Config, logger) -> None:
 
     raise TimeoutError("BLAST timed out waiting for results")
 
-def _fetch_blast_results(rid: str) -> Dict[str, List]:
+def _fetch_blast_results(rid: str, max_sequences: int = DEFAULT_MAX_SEQUENCES) -> Dict[str, List]:
     """Fetch BLAST results from NCBI. Handle both raw JSON and ZIP-compressed responses.
-    
+
+    `max_sequences` is the same limit that was sent to NCBI as HITLIST_SIZE. It
+    has to be repeated here because the parse used to slice its output to a
+    hard-coded 50, so a caller asking for 200 reference sequences quietly got
+    50 -- a change in taxon sampling, not just a truncated list.
+
     Returns:
         Dict with 'accessions' (list of str) and 'hit_details' (list of dicts with accession/organism)
     """
+    limit = _normalize_max_sequences(max_sequences)
     import io
     import zipfile
     
@@ -429,7 +450,7 @@ def _fetch_blast_results(rid: str) -> Dict[str, List]:
         accession_pattern = r'\b([A-Z]{1,2}_?\d{6,}(?:\.\d+)?)\b'
         matches = re.findall(accession_pattern, content)
         if matches:
-            unique_accessions = list(dict.fromkeys(matches))[:50]
+            unique_accessions = list(dict.fromkeys(matches))[:limit]
             logger.info(f"Extracted {len(unique_accessions)} accessions from text response")
             return {"accessions": unique_accessions, "hit_details": []}
         logger.warning("Could not extract accessions from non-JSON response")
@@ -446,10 +467,18 @@ def _fetch_blast_results(rid: str) -> Dict[str, List]:
         blast_output = data.get("BlastOutput2", {})
         
         if not blast_output:
-            logger.warning(f"No BlastOutput2 in response. Full response keys: {list(data.keys())}")
-            debug_path = Path("/tmp/blast_debug_response.json")
-            debug_path.write_text(json.dumps(data, indent=2)[:10000])
-            logger.info(f"Saved debug response to {debug_path}")
+            # Deliberately no debug dump. This used to write the decoded NCBI
+            # response to a fixed /tmp/blast_debug_response.json, which every
+            # concurrent job overwrote and which put upstream response data
+            # outside the normal logging controls. The bounded fingerprint plus
+            # the key list is enough to recognise a recurring malformed shape.
+            from app.services.log_context import stable_fingerprint
+            logger.warning(
+                "event=blast.no_blastoutput2 BLAST response carried no "
+                "BlastOutput2 top_level_keys=%s response_chars=%s "
+                "response_fingerprint=%s",
+                sorted(data.keys())[:20], len(content), stable_fingerprint(content),
+            )
             return {"accessions": [], "hit_details": []}
         
         # Handle both dict and list formats
@@ -493,7 +522,7 @@ def _fetch_blast_results(rid: str) -> Dict[str, List]:
                     hit_details.append({"accession": acc, "organism": organism})
                     
         logger.info(f"Extracted {len(accessions)} accessions from hits")
-        return {"accessions": accessions[:50], "hit_details": hit_details[:50]}
+        return {"accessions": accessions[:limit], "hit_details": hit_details[:limit]}
         
     except json.JSONDecodeError as e:
         from app.services.log_context import stable_fingerprint

@@ -9,10 +9,12 @@ import copy
 import collections
 import json
 import logging
+import re
 import time
 import traceback
 import hashlib
 from datetime import datetime, timedelta, timezone
+from typing import Optional
 
 from rq import Retry, get_current_job
 
@@ -120,19 +122,29 @@ def _remove_job_log_handler(handler):
         pass
 
 
-def validate_pipeline_outputs(job_dir, job_params, logger_obj=logger) -> dict:
+def validate_pipeline_outputs(job_dir, job_params, logger_obj=logger,
+                              recompute: bool = False) -> dict:
     """Check completed artifacts without modifying them or job status."""
     from io import StringIO
     from Bio import Phylo, SeqIO
     from app.services.log_context import log_degradation
 
-    required = [
-        job_dir / "input" / "input_raw.fasta",
-        job_dir / "alignment" / "alignment_raw.fasta",
-        job_dir / "alignment" / "alignment_trimmed.fasta",
-        job_dir / "tree" / "tree_original.newick",
-        job_dir / "tree" / "tree_original.nexus",
-    ]
+    if recompute:
+        required = [
+            job_dir / "alignment" / "alignment_pruned.fasta",
+            job_dir / "alignment" / "alignment_pruned_aligned.fasta",
+            job_dir / "alignment" / "alignment_pruned_trimmed.fasta",
+            job_dir / "tree" / "tree_pruned.newick",
+            job_dir / "tree" / "tree_pruned.nexus",
+        ]
+    else:
+        required = [
+            job_dir / "input" / "input_raw.fasta",
+            job_dir / "alignment" / "alignment_raw.fasta",
+            job_dir / "alignment" / "alignment_trimmed.fasta",
+            job_dir / "tree" / "tree_original.newick",
+            job_dir / "tree" / "tree_original.nexus",
+        ]
     failures = []
     for path in required:
         # Validation may run long after the pipeline, by which point the cold
@@ -154,19 +166,22 @@ def validate_pipeline_outputs(job_dir, job_params, logger_obj=logger) -> dict:
 
     terminal_count = None
     tree_quality = {}
-    tree_path = job_dir / "tree" / "tree_original.newick"
+    tree_path = required[3]
     if tree_path.is_file() and tree_path.stat().st_size:
         try:
             tree = Phylo.read(StringIO(tree_path.read_text(errors="replace")), "newick")
             terminal_count = len(tree.get_terminals())
-            tree_quality = _summarize_tree_quality(tree, logger_obj)
+            tree_quality = _summarize_tree_quality(
+                tree, logger_obj,
+                support_expected=_support_expected(job_params),
+            )
         except Exception as exc:
             failures.append(f"unparseable_newick:{type(exc).__name__}")
 
     # The NEXUS export is a user-facing download, and for years it was written
     # by a writer that produced files no NEXUS reader could parse. Confirm it
     # is actually usable rather than only that it is non-empty.
-    nexus_path = job_dir / "tree" / "tree_original.nexus"
+    nexus_path = required[4]
     if nexus_path.is_file() and nexus_path.stat().st_size:
         from app.services.tree_io import validate_nexus_file
 
@@ -174,7 +189,10 @@ def validate_pipeline_outputs(job_dir, job_params, logger_obj=logger) -> dict:
         if not nexus_ok:
             failures.append(f"unparseable_nexus:{nexus_reason}")
 
-    final_count = fasta_counts.get("alignment_trimmed.fasta")
+    final_name = (
+        "alignment_pruned_trimmed.fasta" if recompute else "alignment_trimmed.fasta"
+    )
+    final_count = fasta_counts.get(final_name)
     legitimately_pruned = False
     state_path = job_dir / "tree_state.json"
     if state_path.is_file():
@@ -185,7 +203,7 @@ def validate_pipeline_outputs(job_dir, job_params, logger_obj=logger) -> dict:
             # load_tree_state separately reports corrupt state; do not duplicate it.
             pass
     if (
-        not legitimately_pruned and terminal_count is not None
+        (recompute or not legitimately_pruned) and terminal_count is not None
         and final_count is not None and terminal_count != final_count
     ):
         failures.append(f"terminal_count_mismatch:fasta={final_count}:tree={terminal_count}")
@@ -236,7 +254,64 @@ def validate_pipeline_outputs(job_dir, job_params, logger_obj=logger) -> dict:
     }
 
 
-def _summarize_tree_quality(tree, logger_obj) -> dict:
+def require_valid_pipeline_outputs(job_dir, job_params, logger_obj=logger,
+                                   recompute: bool = False) -> dict:
+    """Validate completed artifacts and stop the success path on hard failures."""
+    result = validate_pipeline_outputs(
+        job_dir, job_params, logger_obj, recompute=recompute
+    )
+    if not result["ok"]:
+        diagnostics = ", ".join(result["failures"][:12])
+        raise RuntimeError(f"Pipeline output validation failed: {diagnostics}")
+    return result
+
+
+def _pipeline_param(job_params, name, default=None):
+    """Read one flattened or dataclass-backed pipeline parameter."""
+    if isinstance(job_params, dict):
+        if name in job_params:
+            return job_params[name]
+        nested = job_params.get("tree_builder_params")
+        if isinstance(nested, dict):
+            nested_name = "method" if name == "tree_method" else name
+            return nested.get(nested_name, default)
+        return default
+
+    direct = getattr(job_params, name, None)
+    if direct is not None:
+        return direct
+    tree_params = getattr(job_params, "tree_builder_params", None)
+    nested_name = "method" if name == "tree_method" else name
+    return getattr(tree_params, nested_name, default) if tree_params is not None else default
+
+
+def _support_expected(job_params) -> Optional[bool]:
+    """Whether the selected method/settings were asked to calculate support."""
+    method = str(_pipeline_param(job_params, "tree_method", "") or "").lower()
+    if method == "nj":
+        return False
+    if method in {"fasttree", "mrbayes"}:
+        return True
+    if method == "iqtree":
+        try:
+            bootstrap = int(_pipeline_param(job_params, "bootstrap", 0) or 0)
+        except (TypeError, ValueError):
+            bootstrap = 0
+        try:
+            alrt = int(_pipeline_param(job_params, "alrt_replicates", 0) or 0)
+        except (TypeError, ValueError):
+            alrt = 0
+        return bootstrap > 0 or alrt > 0
+    if method == "raxml":
+        value = _pipeline_param(job_params, "enable_bootstrap", True)
+        if isinstance(value, str):
+            return value.strip().lower() not in {"0", "false", "no", "off"}
+        return bool(value)
+    return None
+
+
+def _summarize_tree_quality(tree, logger_obj,
+                            support_expected: Optional[bool] = None) -> dict:
     """Report the tree-shaped failure modes this pipeline actually produces.
 
     The invariant check counted records and confirmed the Newick parsed, which
@@ -261,7 +336,16 @@ def _summarize_tree_quality(tree, logger_obj) -> dict:
         if clade.clades:
             internal += 1
             max_children = max(max_children, len(clade.clades))
-            if clade.confidence is not None:
+            if (
+                clade.confidence is not None
+                or (
+                    isinstance(clade.name, str)
+                    and re.fullmatch(
+                        r"\s*\d+(?:\.\d+)?\s*/\s*\d+(?:\.\d+)?\s*",
+                        clade.name,
+                    )
+                )
+            ):
                 supported += 1
 
     terminals = len(tree.get_terminals())
@@ -280,7 +364,11 @@ def _summarize_tree_quality(tree, logger_obj) -> dict:
             "More than a quarter of branches have length exactly zero",
             zero_branches=zero_branches, total=len(branch_lengths),
         )
-    if internal and supported == 0 and terminals > 3:
+    # "no support values where the method should have produced them" -- NJ never
+    # would, and _strip_generated_inner_labels() now clears the InnerN names that
+    # used to make this look satisfied, so without the method check every single
+    # NJ job logged a DEGRADED line and made `grep DEGRADED` uncountable.
+    if internal and supported == 0 and terminals > 3 and support_expected is True:
         log_degradation(
             logger_obj, "tree_without_support_values",
             "Tree carries no support values on any internal node",
@@ -510,7 +598,9 @@ def run_recompute_job(job_id: str, params_dict: dict) -> dict:
             rq_job=job,
             use_current_input=coerce_bool(params_dict.get("use_current_input"), False)[0]
         )
-        validate_pipeline_outputs(job_dir, job_params, logger)
+        require_valid_pipeline_outputs(
+            job_dir, job_params, logger, recompute=True
+        )
 
         with _app.app_context():
             db_job = Job.query.get(job_id)
@@ -1551,7 +1641,7 @@ def run_phylo_job(job_params: dict) -> dict:
             from app.services.tree_edit_service import load_tree_state
             load_tree_state(job_dir)
 
-            validate_pipeline_outputs(job_dir, job_params, logger)
+            require_valid_pipeline_outputs(job_dir, job_params, logger)
 
             publish_step_done(job_id, STEP_TREE, "Tree generated")
             publish_overview(job_id, f"Tree built using {tree_method.upper()}")
