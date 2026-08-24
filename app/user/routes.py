@@ -1,4 +1,7 @@
+import json
 import logging
+import re
+import secrets
 from datetime import datetime
 from flask import (
     abort, flash, make_response, redirect, render_template, request, url_for,
@@ -79,13 +82,69 @@ def clear_jobs():
 # not the API bearer token.)
 # ---------------------------------------------------------------------------
 
+# A just-created plaintext token is handed to the following GET through Redis,
+# never through the session cookie (which is signed, not encrypted) and never
+# by rendering the page straight from the POST (which made an ordinary browser
+# refresh mint a second token). The stash is keyed by the owning user, popped
+# on first read, and expires on its own if the redirect is never followed.
+_REVEAL_TTL_SECONDS = 300
+_REVEAL_ID_RE = re.compile(r'\A[0-9a-f]{32}\Z')
+
+
+def _reveal_key(user_id, reveal_id):
+    return f'dikarya:token_reveal:{user_id}:{reveal_id}'
+
+
+def _stash_new_secret(plaintext, name):
+    """Park the plaintext for one following GET. Returns None if Redis is down."""
+    from app.workers.queue import get_redis_connection
+
+    reveal_id = secrets.token_hex(16)
+    try:
+        get_redis_connection().set(
+            _reveal_key(current_user.id, reveal_id),
+            json.dumps({'secret': plaintext, 'name': name}),
+            ex=_REVEAL_TTL_SECONDS,
+        )
+    except Exception as e:
+        logger.warning(
+            'event=token.reveal_stash_failed error=%s '
+            'The token was created; its plaintext could not be handed off.',
+            type(e).__name__,
+        )
+        return None
+    return reveal_id
+
+
+def _pop_new_secret(reveal_id):
+    """Read and destroy a stashed plaintext. Returns (secret, name)."""
+    from app.workers.queue import get_redis_connection
+
+    if not reveal_id or not _REVEAL_ID_RE.match(reveal_id):
+        return None, None
+    try:
+        raw = get_redis_connection().getdel(_reveal_key(current_user.id, reveal_id))
+    except Exception as e:
+        logger.warning(
+            'event=token.reveal_read_failed error=%s', type(e).__name__,
+        )
+        return None, None
+    if not raw:
+        return None, None
+    try:
+        payload = json.loads(raw)
+    except ValueError:
+        return None, None
+    return payload.get('secret'), payload.get('name')
+
+
 def _render_api_tokens_page(new_secret=None, new_token_name=None):
     """Render the token list, optionally revealing one just-created secret.
 
-    `new_secret` is passed straight from the POST handler that minted it and is
-    never stored anywhere. It used to travel through Flask's session, which is a
-    signed -- not encrypted -- client-side cookie, so the plaintext bearer token
-    was written to the user's browser and to anything that logged the cookie.
+    `new_secret` is never stored in the session, which is a signed -- not
+    encrypted -- client-side cookie, so the plaintext bearer token would
+    otherwise be written to the user's browser and to anything that logged the
+    cookie.
     """
     tokens = (ApiToken.query
               .filter_by(user_id=current_user.id)
@@ -110,9 +169,11 @@ def _render_api_tokens_page(new_secret=None, new_token_name=None):
 @bp.route('/tokens', methods=['GET'])
 @login_required
 def api_tokens():
-    # A plain GET can never reveal a secret: the plaintext exists only in the
-    # response to the POST that created it.
-    return _render_api_tokens_page()
+    # A GET reveals a secret only when it carries the one-time id handed out by
+    # the redirect from the creation POST, and only the first time: the stash is
+    # popped here, so a refresh of this URL shows the list without the token.
+    new_secret, new_token_name = _pop_new_secret(request.args.get('reveal'))
+    return _render_api_tokens_page(new_secret=new_secret, new_token_name=new_token_name)
 
 
 @bp.route('/tokens/create', methods=['POST'])
@@ -143,12 +204,20 @@ def api_tokens_create():
     db.session.add(token)
     db.session.commit()
 
-    # Render the token page directly from this POST instead of redirecting.
-    # The plaintext is shown exactly once, in this response only; it is not
-    # stored anywhere, so a later GET (or a replayed session cookie) cannot
-    # recover it. Only the SHA-256 hash reached the database.
+    # Post/redirect/GET: rendering the page straight from this POST made a
+    # browser refresh (or a back/forward resubmission) mint a second live token
+    # every time. The plaintext travels to the redirect target through a
+    # single-use, user-scoped, five-minute Redis stash -- never the session
+    # cookie -- and only the SHA-256 hash reached the database.
+    reveal_id = _stash_new_secret(plaintext, name)
+    if reveal_id is None:
+        # Redis is unreachable. The token exists and is usable, but the only
+        # copy of its plaintext is in this process, so it has to be shown now.
+        flash('Token created. Copy it now because it will only be shown once.', 'success')
+        return _render_api_tokens_page(new_secret=plaintext, new_token_name=name)
+
     flash('Token created. Copy it now because it will only be shown once.', 'success')
-    return _render_api_tokens_page(new_secret=plaintext, new_token_name=name)
+    return redirect(url_for('user.api_tokens', reveal=reveal_id))
 
 
 @bp.route('/tokens/<int:token_id>/revoke', methods=['POST'])
