@@ -14,6 +14,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+import threading
 import time
 import urllib.parse
 import urllib.request
@@ -42,6 +43,122 @@ RETRYABLE_HTTP_STATUSES = frozenset({429, 500, 502, 503, 504})
 MAX_HTTP_ATTEMPTS = 4
 RETRY_BACKOFF_BASE = 2.0
 RETRY_BACKOFF_CAP = 30.0
+
+# --- Request pacing --------------------------------------------------------
+#
+# iNaturalist asks for at most one request per second. Honouring that with a
+# process-local counter is not enough here: Dikarya runs four Gunicorn workers
+# (eight threads each) plus a separate RQ worker process, so "one per second"
+# per process is up to nine per second at the API. The reservation therefore
+# lives in Redis, which every process already shares.
+#
+# The reservation is a single atomic script that hands each caller the earliest
+# instant it may *start* a request and advances the shared cursor by one
+# interval. The caller then sleeps on its own -- no lock is held across the
+# upstream call, so a slow iNaturalist response cannot stall every other
+# process behind it.
+_PACING_KEY = "dikarya:inat:next-request-slot-ms"
+# Reserving further ahead than this means many callers are queued behind each
+# other. Interactive requests are rejected at that point instead of sleeping
+# for an unreasonable time. Background workers have no cap and wait for the
+# slot they reserved.
+MAX_PACING_WAIT_SECONDS = 30.0
+_PACING_SCRIPT = """
+local slot = tonumber(redis.call('GET', KEYS[1]) or '0')
+local now = tonumber(ARGV[1])
+local interval = tonumber(ARGV[2])
+if slot < now then slot = now end
+local wait = slot - now
+local max_wait = tonumber(ARGV[3])
+if max_wait >= 0 and wait > max_wait then
+  return {-1, wait}
+end
+local next_slot = slot + interval
+-- Keep the cursor alive beyond every reservation it represents. A fixed TTL
+-- can expire while a deep queue still has future slots outstanding.
+local ttl = math.max(interval * 2, next_slot - now + interval)
+redis.call('SET', KEYS[1], next_slot, 'PX', ttl)
+return {slot, ttl}
+"""
+
+_pacing_lock = threading.Lock()
+_pacing_client = None
+# Fallback cursor used only while Redis is unreachable. Monotonic seconds.
+_local_next_slot = 0.0
+
+
+def _pacing_redis():
+    """Lazily create (and reuse) the Redis client used for request pacing."""
+    global _pacing_client
+    if _pacing_client is None:
+        import redis
+        _pacing_client = redis.from_url(Config.REDIS_URL)
+    return _pacing_client
+
+
+def _reserve_slot_local(interval: float) -> float:
+    """Process-local fallback reservation. Returns seconds to wait."""
+    global _local_next_slot
+    with _pacing_lock:
+        now = time.monotonic()
+        slot = max(_local_next_slot, now)
+        _local_next_slot = slot + interval
+        return max(0.0, slot - now)
+
+
+def _reserve_inat_slot(interval: float = RATE_LIMIT_DELAY,
+                       max_wait: Optional[float] = None) -> float:
+    """Reserve the next iNaturalist request slot. Returns seconds to wait.
+
+    Falls back to per-process pacing if Redis is unavailable. That is a
+    deliberate choice: a brief Redis problem should slow iNaturalist imports
+    down to a still-polite rate, not make them impossible. iNat's own 429
+    handling in _http_request remains the backstop.
+    """
+    interval_ms = max(1, int(interval * 1000))
+    try:
+        now_ms = int(time.time() * 1000)
+        max_wait_ms = -1 if max_wait is None else max(0, int(max_wait * 1000))
+        result = _pacing_redis().eval(
+            _PACING_SCRIPT, 1, _PACING_KEY, now_ms, interval_ms, max_wait_ms,
+        )
+        slot_ms = result[0]
+        if int(slot_ms) < 0:
+            queued_wait = float(result[1]) / 1000.0
+            raise InatTreeError(
+                "iNaturalist requests are busy right now. Please try again shortly.",
+                status=503,
+                details={"retry_after_seconds": max(1, int(queued_wait))},
+            )
+        wait = max(0.0, (float(slot_ms) - now_ms) / 1000.0)
+    except InatTreeError:
+        raise
+    except Exception as exc:
+        from app.services.log_context import log_degradation_rate_limited
+        log_degradation_rate_limited(
+            logger, "inat_pacing_redis_unavailable",
+            "iNaturalist request pacing fell back to per-process timing",
+            exception=type(exc).__name__,
+        )
+        wait = _reserve_slot_local(interval)
+        if max_wait is not None and wait > max_wait:
+            raise InatTreeError(
+                "iNaturalist requests are busy right now. Please try again shortly.",
+                status=503,
+                details={"retry_after_seconds": max(1, int(wait))},
+            )
+    return wait
+
+
+def _pace_inat_request() -> None:
+    """Block until this process may start its next iNaturalist request."""
+    from flask import has_request_context
+
+    wait = _reserve_inat_slot(
+        max_wait=MAX_PACING_WAIT_SECONDS if has_request_context() else None,
+    )
+    if wait > 0:
+        time.sleep(wait)
 
 MYCOMAP_BLAST_FIELD_NAME = "Mycomap BLAST Results"
 PHYLOGENETIC_TREE_FIELD_NAME = "Phylogenetic Tree"
@@ -222,6 +339,9 @@ def _http_request(url: str, *, method: str = "GET", body: Optional[Dict[str, Any
     waited = 0.0
     while True:
         attempt += 1
+        # Every attempt goes through the shared pacer, retries included: a
+        # retry is another request to iNaturalist and must not jump the queue.
+        _pace_inat_request()
         try:
             with urllib.request.urlopen(req, timeout=REQUEST_TIMEOUT) as resp:
                 raw = resp.read().decode('utf-8') or '{}'
@@ -488,7 +608,9 @@ def _collect_scope_observations_with_field(scope: Dict[str, Any],
         if len(results) < MAX_PER_PAGE or (page * MAX_PER_PAGE) >= total_results:
             break
         page += 1
-        time.sleep(RATE_LIMIT_DELAY)
+        # No sleep here any more: _http_request paces every call through the
+        # shared reservation, so an extra one-second sleep would double the
+        # gap between pages without making anything safer.
     return observations
 
 
@@ -1487,6 +1609,7 @@ def _check_auto_created_mycomap_ncbi_results(
     """Check one polling interval for NCBI hits on an auto-created BLAST."""
     from app.services.mycomap_service import (
         get_mycomap_local_result_count,
+        get_mycomap_ncbi_backlog_fallback_position,
         get_mycomap_ncbi_local_fallback_seconds,
         get_mycomap_ncbi_poll_interval_seconds,
         get_mycomap_ncbi_poll_max_attempts,
@@ -1496,18 +1619,26 @@ def _check_auto_created_mycomap_ncbi_results(
 
     details = dict(details or {})
     attempt = int(details.get("ncbi_poll_attempt") or 0) + 1
-    count, warnings = get_mycomap_ncbi_result_count(blast_id)
+    # The result page is the authoritative cheap signal that MycoMap has not
+    # reached this search yet. Do not hammer its NCBI FASTA export while it says
+    # the search is queued; that endpoint returns 500 during a backlog.
+    queue_position = (
+        get_mycomap_ncbi_queue_position(mycomap_url) if mycomap_url else None
+    )
+    if queue_position is None:
+        count, warnings = get_mycomap_ncbi_result_count(blast_id)
+    else:
+        count, warnings = 0, []
     details["ncbi_poll_attempt"] = attempt
     details["ncbi_result_count"] = count
-    details["ncbi_status"] = "available" if count > 0 else "waiting"
+    details["ncbi_status"] = (
+        "available" if count > 0 else "queued" if queue_position is not None else "waiting"
+    )
     if warnings:
         details["ncbi_poll_warnings"] = warnings
     if count > 0:
         details.pop("ncbi_queue_position", None)
         return True, details
-    queue_position = (
-        get_mycomap_ncbi_queue_position(mycomap_url) if mycomap_url else None
-    )
     if queue_position is not None:
         details["ncbi_queue_position"] = queue_position
     else:
@@ -1515,7 +1646,11 @@ def _check_auto_created_mycomap_ncbi_results(
 
     elapsed_seconds = attempt * get_mycomap_ncbi_poll_interval_seconds()
     fallback_seconds = get_mycomap_ncbi_local_fallback_seconds()
-    if elapsed_seconds >= fallback_seconds:
+    deep_backlog = (
+        queue_position is not None
+        and queue_position >= get_mycomap_ncbi_backlog_fallback_position()
+    )
+    if elapsed_seconds >= fallback_seconds or deep_backlog:
         # Local and NCBI hits both come from this one MycoMap BLAST. Only fall
         # back to a local-only tree once local results actually exist -- if the
         # whole search is still queued there is nothing to build from.
@@ -1527,14 +1662,23 @@ def _check_auto_created_mycomap_ncbi_results(
             details["ncbi_status"] = "timed_out_local_fallback"
             details["ncbi_fallback_local_only"] = True
             fallback_minutes = max(1, round(fallback_seconds / 60))
-            details["warnings"] = list(details.get("warnings") or []) + [
+            wait_reason = (
+                f"MycoMap's NCBI BLAST queue is backed up at position {queue_position}"
+                if deep_backlog else
                 "MycoMap NCBI BLAST results were not ready within "
-                f"{fallback_minutes} minute"
-                f"{'s' if fallback_minutes != 1 else ''}; building the tree "
+                f"{fallback_minutes} minute{'s' if fallback_minutes != 1 else ''}"
+            )
+            details["warnings"] = list(details.get("warnings") or []) + [
+                f"{wait_reason}; building the tree "
                 "from local (MycoBLAST) results only. Rebuild this tree once "
                 "the NCBI results arrive to include them."
             ]
             return True, details
+        if deep_backlog and elapsed_seconds < fallback_seconds:
+            # The queue is deep but local MycoBLAST has not produced enough to
+            # build anything yet. Keep the bounded short poll rather than
+            # failing immediately solely because the queue position is honest.
+            return False, details
         # Alan 8/5/26 - Report the local hit count we just measured rather than
         # asserting there are none.
         raise InatTreeError(
@@ -1645,6 +1789,7 @@ def reconcile_delayed_ncbi_results(job_id: str) -> Dict[str, Any]:
     from app.services.mycomap_service import (
         fetch_mycomap_fasta,
         get_mycomap_ncbi_recheck_max_hours,
+        get_mycomap_ncbi_queue_position,
         get_mycomap_ncbi_result_count,
         validate_mycomap_url,
     )
@@ -1696,7 +1841,15 @@ def reconcile_delayed_ncbi_results(job_id: str) -> Dict[str, Any]:
         rerun_details["ncbi_recheck_count"] = recheck_count
         rerun_details["ncbi_last_rechecked_at"] = datetime.now(timezone.utc).isoformat()
 
-        count, _warnings = get_mycomap_ncbi_result_count(blast_id)
+        queue_position = get_mycomap_ncbi_queue_position(mycomap_url)
+        if queue_position is None:
+            count, _warnings = get_mycomap_ncbi_result_count(blast_id)
+            rerun_details.pop("ncbi_queue_position", None)
+        else:
+            # A queued search is healthy pending work, not a failed export.
+            count, _warnings = 0, []
+            rerun_details["ncbi_status"] = "queued"
+            rerun_details["ncbi_queue_position"] = queue_position
         if count <= 0:
             max_hours = get_mycomap_ncbi_recheck_max_hours()
             if recheck_count >= max_hours:
@@ -1955,10 +2108,40 @@ def prepare_inat_tree_job(observation_id: int, *, include_ncbi: bool = True,
             body.get('error', 'Failed to fetch MycoMap sequences.'),
             # 404 = MycoMap has no such BLAST result. Passing it through keeps the
             # status honest; collapsing it to 502 reads as "our gateway is broken".
-            status=status if status in (400, 404, 422, 502) else 502,
+            status=status if status in (400, 404, 409, 422, 502) else 502,
         )
+    pending_sources = set((payload or {}).get("pending_sources") or [])
+    if "ncbi" in pending_sources:
+        queue_position = (payload or {}).get("ncbi_queue_position")
+        mycomap_rerun_details["ncbi_status"] = "queued"
+        mycomap_rerun_details["ncbi_queue_position"] = queue_position
+        mycomap_rerun_details["ncbi_fallback_local_only"] = True
+        queue_suffix = (
+            f" at position {queue_position}" if queue_position is not None else ""
+        )
+        backlog_warning = (
+            f"MycoMap NCBI results are still queued{queue_suffix}; building "
+            "from local MycoBLAST results now. Dikarya will check hourly and "
+            "rebuild the tree when the NCBI results arrive."
+        )
+        mycomap_rerun_details["warnings"] = list(dict.fromkeys(
+            list(mycomap_rerun_details.get("warnings") or []) + [backlog_warning]
+        ))
     sequences = (payload or {}).get('sequences') or []
     if len(sequences) < 2:
+        if "ncbi" in pending_sources:
+            queue_position = (payload or {}).get("ncbi_queue_position")
+            queue_suffix = (
+                f" (currently position {queue_position})"
+                if queue_position is not None else ""
+            )
+            raise InatTreeError(
+                "MycoMap's NCBI results are still queued"
+                f"{queue_suffix}, and fewer than 2 usable local MycoBLAST "
+                "sequences are available. Nothing is lost; rebuild this tree "
+                "after the MycoMap queue advances.",
+                status=409,
+            )
         raise InatTreeError(
             "MycoMap returned fewer than 2 usable sequences; cannot build a tree.",
             status=422,
@@ -1988,7 +2171,11 @@ def prepare_inat_tree_job(observation_id: int, *, include_ncbi: bool = True,
             mycomap_rerun_details.get("local_status") == "completed"
         ),
         "mycomap_ncbi_blast_rebuilt": bool(
-            (rebuild_ncbi_blast and mycomap_rerun_details.get("ncbi"))
+            (
+                rebuild_ncbi_blast
+                and mycomap_rerun_details.get("ncbi")
+                and "ncbi" not in pending_sources
+            )
             or (
                 mycomap_rerun_details.get("auto_created")
                 and mycomap_rerun_details.get("ncbi_status") == "available"

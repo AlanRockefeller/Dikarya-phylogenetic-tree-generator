@@ -54,6 +54,7 @@ MYCOMAP_NCBI_RERUN_WAIT_SECONDS = 600
 MYCOMAP_NCBI_POLL_INTERVAL_SECONDS = 60
 MYCOMAP_NCBI_POLL_MAX_ATTEMPTS = 120
 MYCOMAP_NCBI_LOCAL_FALLBACK_SECONDS = 600
+MYCOMAP_NCBI_BACKLOG_FALLBACK_POSITION = 100
 MYCOMAP_NCBI_RECHECK_MAX_HOURS = 48
 # How long to keep looking for a newly created BLAST's result page before
 # giving up. MycoMap answers the create POST with "Job added to queue" and no
@@ -415,6 +416,16 @@ def get_mycomap_ncbi_local_fallback_seconds() -> int:
     )
 
 
+def get_mycomap_ncbi_backlog_fallback_position() -> int:
+    """Queue depth at which waiting ten minutes before using local hits is futile."""
+    return _env_int(
+        "MYCOMAP_NCBI_BACKLOG_FALLBACK_POSITION",
+        MYCOMAP_NCBI_BACKLOG_FALLBACK_POSITION,
+        min_value=1,
+        max_value=10000,
+    )
+
+
 def get_mycomap_creation_discovery_max_seconds() -> int:
     """
     Return how long to keep looking for a just-created BLAST's result page
@@ -576,27 +587,6 @@ def _title_matches_blast_label(label: str, wanted: str) -> bool:
     if not label:
         return False
     return label == wanted or label.startswith(f"{wanted} - ")
-
-
-def _blast_page_mentions_title(url: str, wanted: str) -> bool:
-    """Confirm a synthesized BLAST result URL really is the job we created."""
-    request = urllib.request.Request(
-        url,
-        headers={
-            "User-Agent": "Dikarya-TreeBuilder/1.0",
-            "Accept": "text/html,*/*",
-            "Cache-Control": "no-cache",
-        },
-        method="GET",
-    )
-    try:
-        with urllib.request.urlopen(request, timeout=REQUEST_TIMEOUT) as resp:
-            page = resp.read().decode("utf-8", errors="replace")
-    except Exception as exc:
-        logger.warning("Could not verify MycoMap BLAST page %s: %s", url, exc)
-        return False
-    text = " ".join(html.unescape(re.sub(r"<[^>]+>", " ", page)).split())
-    return wanted in text
 
 
 def _fetch_mycomap_blast_listing(warnings: Optional[list] = None) -> str:
@@ -926,19 +916,25 @@ def create_mycomap_blast(sequence: str, *, title: str = "",
 
 
 def get_mycomap_ncbi_result_count(blast_id: str) -> Tuple[int, list]:
-    """Return the currently exported NCBI hit count and any fetch warnings."""
-    result = fetch_mycomap_fasta(
-        str(blast_id), include_ncbi=True, include_local=False
+    """Return the currently exported NCBI hit count and any fetch warnings.
+
+    This is a poll, not an interactive import. The outer RQ schedule is already
+    the retry policy, so one quiet upstream attempt is enough; three nested
+    attempts every minute turned an ordinary MycoMap backlog into dozens of
+    ERROR records for one search.
+    """
+    ncbi_bytes, error = _fetch_fasta(
+        str(blast_id), "fasta", max_attempts=1, log_final_failure=False
     )
-    return int(result.get("ncbi_count") or 0), list(result.get("errors") or [])
+    return _count_fasta_sequences(ncbi_bytes), [error] if error else []
 
 
 def get_mycomap_local_result_count(blast_id: str) -> Tuple[int, list]:
     """Return the currently exported local (MycoBLAST) hit count and warnings."""
-    result = fetch_mycomap_fasta(
-        str(blast_id), include_ncbi=False, include_local=True
+    local_bytes, error = _fetch_fasta(
+        str(blast_id), "localFasta", max_attempts=1, log_final_failure=False
     )
-    return int(result.get("local_count") or 0), list(result.get("errors") or [])
+    return _count_fasta_sequences(local_bytes), [error] if error else []
 
 
 def rerun_mycomap_blast(blast_id: str, result_type: str = "local",
@@ -1608,7 +1604,10 @@ def get_mycomap_ncbi_queue_position(mycomap_url: str) -> Optional[int]:
         with urllib.request.urlopen(request, timeout=REQUEST_TIMEOUT) as resp:
             content = resp.read().decode('utf-8', errors='replace')
     except Exception as e:
-        logger.warning(f"Could not fetch Mycomap page to check queue position: {e}")
+        # Queue position is best-effort context. The actual result fetch still
+        # decides whether work can proceed, so a status-page hiccup is not an
+        # operator warning by itself.
+        logger.info("Could not fetch MycoMap page to check queue position: %s", e)
         return None
 
     match = _NCBI_QUEUE_POSITION_RE.search(content)
@@ -1626,7 +1625,8 @@ def _count_fasta_sequences(fasta_bytes: bytes) -> int:
 
 
 def _fetch_fasta(
-    blast_id: str, endpoint: str, deadline: Optional[float] = None
+    blast_id: str, endpoint: str, deadline: Optional[float] = None, *,
+    max_attempts: Optional[int] = None, log_final_failure: bool = True,
 ) -> Tuple[bytes, Optional[str]]:
     """
     Fetch FASTA content from Mycomap.
@@ -1637,6 +1637,10 @@ def _fetch_fasta(
         deadline: Optional time.monotonic() value past which no further attempt
             is started and per-attempt timeouts are shortened to fit. None means
             the full retry budget, which is only appropriate off the request path.
+        max_attempts: Override the nested fetch retry count. Polling callers use
+            one because their outer RQ schedule is already the retry policy.
+        log_final_failure: Emit ERROR after exhausting attempts. Polling callers
+            set this false because a not-yet-ready export is an expected state.
 
     Returns:
         Tuple of (fasta_bytes, error_message). If error, fasta_bytes will be empty.
@@ -1673,8 +1677,9 @@ def _fetch_fasta(
     # drop an entire result set: the caller kept the sequences it did get and built a
     # tree missing all of the NCBI references, with no warning to the user. Only
     # server-side/network faults are retried -- a 4xx is a real answer, not a blip.
+    attempts = FASTA_FETCH_ATTEMPTS if max_attempts is None else max(1, int(max_attempts))
     last_error = None
-    for attempt in range(FASTA_FETCH_ATTEMPTS):
+    for attempt in range(attempts):
         timeout = REQUEST_TIMEOUT
         if deadline is not None:
             remaining = deadline - time.monotonic()
@@ -1693,7 +1698,7 @@ def _fetch_fasta(
             if attempt:
                 logger.info(
                     "Fetched %s for blast_id %s on attempt %s/%s.",
-                    endpoint, blast_id, attempt + 1, FASTA_FETCH_ATTEMPTS,
+                    endpoint, blast_id, attempt + 1, attempts,
                 )
             return content, None
         except urllib.error.HTTPError as e:
@@ -1710,21 +1715,27 @@ def _fetch_fasta(
             logger.error(last_error, exc_info=True)
             return b'', last_error
 
-        if attempt + 1 < FASTA_FETCH_ATTEMPTS:
+        if attempt + 1 < attempts:
             delay = FASTA_FETCH_RETRY_BASE_SECONDS * (2 ** attempt)
             if deadline is not None and time.monotonic() + delay >= deadline:
                 logger.warning(
                     "%s (attempt %s/%s); no time budget left to retry.",
-                    last_error, attempt + 1, FASTA_FETCH_ATTEMPTS,
+                    last_error, attempt + 1, attempts,
                 )
                 break
             logger.warning(
                 "%s (attempt %s/%s); retrying in %ss.",
-                last_error, attempt + 1, FASTA_FETCH_ATTEMPTS, delay,
+                last_error, attempt + 1, attempts, delay,
             )
             time.sleep(delay)
 
-    logger.error("%s (gave up on %s for blast_id %s)", last_error, endpoint, blast_id)
+    if log_final_failure:
+        logger.error("%s (gave up on %s for blast_id %s)", last_error, endpoint, blast_id)
+    else:
+        logger.info(
+            "MycoMap %s export is not ready for blast_id %s: %s",
+            endpoint, blast_id, last_error,
+        )
     return b'', last_error
 
 

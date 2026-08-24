@@ -1,26 +1,32 @@
 """Cross-process census of open SSE streams.
 
-Gunicorn runs `--workers 4 --threads 2`, so the whole site has **8** request
-slots, and every open `/api/job/<id>/events` stream holds one for its entire
-lifetime. When enough streams are open at once, ordinary requests get no slot
-and nginx returns 504 after `proxy_read_timeout`.
+Gunicorn runs `--workers 4 --threads 8` (GUNICORN_WORKERS / GUNICORN_THREADS in
+app/config.py, which is what _capacity() below reads), so the whole site has
+**32** request slots, and every open `/api/job/<id>/events` stream holds one for
+its entire lifetime. When enough streams are open at once, ordinary requests get
+no slot and nginx returns 504 after `proxy_read_timeout`.
 
 The failure mode is subtler than global exhaustion, and the count alone will
 not predict it. Gunicorn's gthread workers each pre-accept connections into
-their own queue, so a worker whose 2 threads are both parked on 30-minute
-streams strands every connection it has accepted -- while the other three
-workers serve traffic normally.
+their own queue, so a worker whose threads are all parked on 30-minute streams
+strands every connection it has accepted -- while the other three workers serve
+traffic normally. That is why _pressure_threshold() keys off threads *per
+worker* rather than the global total: raising the thread count raises the bar
+for stranding one worker, it does not remove it.
 
-On 2026-08-21 that produced 11 nginx 504s between 17:48 and 19:12, every one
-of them exactly 300s (proxy_read_timeout), on endpoints as trivial as
-/favicon.ico -- at a global occupancy of 2-4 of 8 slots. The decisive evidence
-is that the 504'd `GET /tree` at 18:58:34 never appears in Gunicorn's access
-log at all, while the same client's /favicon.ico one second later was served
-200: no worker ever accepted it.
+On 2026-08-21 -- when this deployment still ran `--workers 4 --threads 2`, for
+8 slots in total -- that produced 11 nginx 504s between 17:48 and 19:12, every
+one of them exactly 300s (proxy_read_timeout), on endpoints as trivial as
+/favicon.ico, at a global occupancy of 2-4 of those 8 slots. The decisive
+evidence is that the 504'd `GET /tree` at 18:58:34 never appears in Gunicorn's
+access log at all, while the same client's /favicon.ico one second later was
+served 200: no worker ever accepted it. The thread count has since gone up; the
+mechanism has not changed, only the number of streams it takes to reach it.
 
-So treat this count as a pressure gauge, not a threshold. Two streams on one
-unlucky worker can time out requests while six slots sit idle. Gunicorn's
-access log cannot show this on its own -- it only records requests that
+So treat this count as a pressure gauge, not a threshold. Enough streams on one
+unlucky worker can time out requests while most of the global pool sits idle --
+at 4x8 that takes 8 streams landing on the same worker, where at 4x2 it took 2.
+Gunicorn's access log cannot show this on its own -- it only records requests that
 *completed*, so a stranded connection leaves no trace there.
 
 The registry is a Redis sorted set of stream ids scored by expiry, so a worker

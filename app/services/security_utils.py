@@ -1,6 +1,7 @@
 import re
 from pathlib import Path
 from typing import Optional, Tuple
+from urllib.parse import urlparse
 
 
 # Valid job_id pattern: UUID4 format only
@@ -66,11 +67,25 @@ def cap_fasta_header(header: str) -> str:
     return cleaned.strip()[:MAX_FASTA_HEADER_LEN].strip()
 
 
+# The canonical nucleotide alphabet accepted in submitted sequence data: the
+# four DNA bases, U for RNA, every IUPAC ambiguity code, and the gap character
+# used by pre-aligned input.
+#
+# Written once and case-folded below rather than as two hand-maintained
+# strings. The lowercase half used to be typed out separately and was missing
+# w, b, d and h, so a lowercase ambiguity code was silently deleted -- which
+# shortens the sequence and shifts every coordinate after it.
+NUCLEOTIDE_ALPHABET = "ACGTUNRYKMSWBDHV"
+FASTA_SEQUENCE_GAP_CHARS = "-"
+ALLOWED_FASTA_SEQUENCE_CHARS = frozenset(
+    NUCLEOTIDE_ALPHABET + NUCLEOTIDE_ALPHABET.lower() + FASTA_SEQUENCE_GAP_CHARS
+)
+
+
 def sanitize_fasta_sequence(seq: str) -> str:
     """Remove any non-standard characters from FASTA sequence."""
-    # Allow only valid nucleotide/amino acid characters
-    allowed = set('ACGTUNRYKMSWBDHVacgtunrykmsv-')
-    return ''.join(c for c in seq if c in allowed)
+    # Allow only valid nucleotide characters (either case) and the gap symbol.
+    return ''.join(c for c in seq if c in ALLOWED_FASTA_SEQUENCE_CHARS)
 
 def validate_safe_file_path(path: Path, base_dir: Path) -> bool:
     """
@@ -106,3 +121,43 @@ def validate_safe_file_path(path: Path, base_dir: Path) -> bool:
     except Exception:
         return False
 
+
+
+# Characters a browser will strip or normalize before it ever issues the
+# request, which is what makes them dangerous inside a redirect target: the
+# string we validate is not the string the browser navigates to.
+_REDIRECT_FORBIDDEN_RE = re.compile(r'[\x00-\x20\x7f\\]')
+
+
+def safe_next_url(next_url: Optional[str]) -> Optional[str]:
+    """Return ``next_url`` if it is a same-origin path, else ``None``.
+
+    Single source of truth for every ``?next=`` / ``next`` form field, because
+    checking this in two places produced two different answers: the login form
+    parsed the URL and rejected a netloc, while the What's New delete form
+    accepted anything starting with ``/`` -- so ``//evil.tld/phish`` was an open
+    redirect there.
+
+    Rejected:
+
+    * an absolute URL (``https://evil.tld``) -- any scheme or netloc at all;
+    * a protocol-relative URL (``//evil.tld``), which browsers treat as absolute;
+    * anything containing a backslash (``/\\evil.tld``), which browsers normalize
+      to ``/`` before navigating, turning it back into the case above;
+    * control characters and whitespace, including the newline that would make
+      this usable for header injection.
+
+    A legitimate internal target -- ``/user/jobs``, ``/whats-new?edit=1``,
+    ``/job/<uuid>#tree`` -- passes through unchanged.
+    """
+    if not next_url:
+        return None
+    candidate = str(next_url)
+    if _REDIRECT_FORBIDDEN_RE.search(candidate):
+        return None
+    if not candidate.startswith('/') or candidate.startswith('//'):
+        return None
+    parsed = urlparse(candidate)
+    if parsed.scheme or parsed.netloc:
+        return None
+    return candidate

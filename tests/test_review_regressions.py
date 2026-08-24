@@ -145,6 +145,34 @@ def test_unchanged_duplicate_recompute_remains_idempotent(tmp_path):
 
 
 @pytest.mark.parametrize(
+    ("bootstrap", "message"),
+    [(999, "at least 1000"), ("many", "integer"), (1000.5, "integer")],
+)
+def test_recompute_rejects_invalid_iqtree_ufboot_before_enqueue(
+    tmp_path, bootstrap, message
+):
+    job_dir = tmp_path / JOB_ID
+    job_dir.mkdir()
+    input_info = job_dir / "input_info.json"
+    original = '{"tree_method":"iqtree","bootstrap":1000}'
+    input_info.write_text(original)
+
+    app = Flask(__name__)
+    with (
+        app.test_request_context(method="POST", json={"bootstrap": bootstrap}),
+        patch.object(Config, "JOB_DIR", tmp_path),
+        patch.object(routes, "check_job_access", return_value=(None, None, 200)),
+        patch.object(routes, "enqueue_recompute_job") as enqueue,
+    ):
+        response, status = routes.recompute_tree_job.__wrapped__(JOB_ID)
+
+    assert status == 400
+    assert message in response.get_json()["error"]
+    enqueue.assert_not_called()
+    assert input_info.read_text() == original
+
+
+@pytest.mark.parametrize(
     ("old_name", "new_name"),
     [
         (None, "Safe name"),

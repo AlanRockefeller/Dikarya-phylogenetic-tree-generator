@@ -56,7 +56,7 @@ Clone the repository, create a Python 3.12 virtual environment, and install the
 pinned production dependency set:
 
 ```bash
-git clone https://github.com/AlanRockefeller/Dikarya-phylogenetic-tree-generator dikarya
+git clone https://github.com/AlanRockefeller/dikarya-phylogenetic-tree-generator dikarya
 cd dikarya
 python3.12 -m venv .venv
 source .venv/bin/activate

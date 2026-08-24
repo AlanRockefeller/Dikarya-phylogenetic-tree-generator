@@ -183,6 +183,73 @@ class RQInterruptionEvidenceTests(unittest.TestCase):
         self.assertEqual(changed[0]["from_status"], "queued")
         rq_job.requeue.assert_not_called()
 
+    def test_a_stale_artifact_that_will_not_delete_blocks_the_requeue(self):
+        """Cleanup failure must never end in a requeue.
+
+        Removing the possibly-truncated alignment left by a SIGKILLed tool is
+        the entire safety mechanism. `discard_artifact` logs and swallows
+        OSError rather than raising, so the only reliable signal is whether the
+        file is still there afterwards; if it is, the job is failed with a
+        reason instead of rerun into corrupt partial output.
+        """
+        rq_job = _rq_job(
+            "Work-horse terminated unexpectedly; waitpid returned 9 (signal 9); ",
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            job_dir = Path(tmp) / "job-1"
+            (job_dir / "alignment").mkdir(parents=True)
+            (job_dir / "input_info.json").write_text('{"sequence": ">a\\nACGT"}')
+            stale = job_dir / "alignment" / "alignment_raw.fasta"
+            stale.write_text("truncated")
+            db_job = SimpleNamespace(
+                id="job-1", status="running", metrics={},
+                created_at=datetime.utcnow(), updated_at=None,
+            )
+            inspection = RQJobInspection(
+                verified=True, status="failed", rq_job=rq_job
+            )
+            # Exactly what discard_artifact does when unlink() fails: it warns
+            # and returns, leaving the file in place.
+            with patch(
+                "app.services.job_reconcile_service.discard_artifact",
+                return_value=0,
+            ):
+                changed, _fake_db = self._reconcile(db_job, inspection, tmp)
+
+            rq_job.requeue.assert_not_called()
+            self.assertEqual(db_job.status, "failed")
+            self.assertEqual(changed[0]["action"], "failed")
+            self.assertIn("alignment_raw.fasta", db_job.metrics["reconciled_reason"])
+            self.assertIn("could not be removed",
+                          db_job.metrics["reconciled_reason"])
+            self.assertTrue(stale.exists())
+
+    def test_a_gzipped_stale_artifact_left_behind_also_blocks_the_requeue(self):
+        rq_job = _rq_job(
+            "Work-horse terminated unexpectedly; waitpid returned 9 (signal 9); ",
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            job_dir = Path(tmp) / "job-1"
+            (job_dir / "alignment").mkdir(parents=True)
+            (job_dir / "input_info.json").write_text('{"sequence": ">a\\nACGT"}')
+            leftover = job_dir / "alignment" / "alignment_raw.fasta.gz"
+            leftover.write_bytes(b"\x1f\x8b")
+            db_job = SimpleNamespace(
+                id="job-1", status="running", metrics={},
+                created_at=datetime.utcnow(), updated_at=None,
+            )
+            inspection = RQJobInspection(
+                verified=True, status="failed", rq_job=rq_job
+            )
+            with patch(
+                "app.services.job_reconcile_service.discard_artifact",
+                return_value=0,
+            ):
+                changed, _fake_db = self._reconcile(db_job, inspection, tmp)
+
+            rq_job.requeue.assert_not_called()
+            self.assertEqual(changed[0]["action"], "failed")
+
     def test_unverified_rq_lookup_changes_nothing(self):
         db_job = SimpleNamespace(
             id="job-1", status="running", metrics={},

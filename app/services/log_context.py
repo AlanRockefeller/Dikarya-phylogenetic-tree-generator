@@ -330,7 +330,11 @@ def install_error_mirror(path, level=logging.WARNING) -> bool:
     from logging.handlers import WatchedFileHandler
 
     root = logging.getLogger()
-    target = str(path)
+    # FileHandler stores baseFilename as an absolute path, so comparing a
+    # relative target against it never matched and the "already installed"
+    # check silently failed -- adding a second handler on the same file and
+    # duplicating every WARNING in errors.log.
+    target = os.path.abspath(str(path))
     already = _has_marked_handler(root, ERROR_MIRROR_MARKER) or any(
         getattr(handler, "baseFilename", None) == target for handler in root.handlers
     )

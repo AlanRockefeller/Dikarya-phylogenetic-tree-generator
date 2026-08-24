@@ -11,6 +11,7 @@ import json
 import logging
 import os
 import secrets
+import tempfile
 import time
 import urllib.parse
 import urllib.request
@@ -111,6 +112,14 @@ def load_tokens() -> Dict[str, Any]:
 
 
 def save_tokens(data: Dict[str, Any]) -> None:
+    """Write the token file atomically, private from the moment it exists.
+
+    The temp file used to be opened with the default umask and only chmod'd
+    after `json.dump` had already written the OAuth access token into it. The
+    directory is 0700, so this is hardening rather than a known exposure -- but
+    a window where a credential file is world-readable is not something to
+    leave in place when closing it costs one call. mkstemp creates at 0600.
+    """
     path = _token_path()
     parent = os.path.dirname(path)
     if parent:
@@ -119,14 +128,28 @@ def save_tokens(data: Dict[str, Any]) -> None:
             os.chmod(parent, 0o700)
         except OSError:
             pass
-    tmp = path + '.tmp'
-    with open(tmp, 'w') as f:
-        json.dump(data, f)
+    # dir=parent (never the system temp dir) so os.replace stays a rename
+    # within one filesystem, which is what makes it atomic.
+    fd, tmp = tempfile.mkstemp(dir=parent or '.',
+                               prefix=os.path.basename(path) + '.',
+                               suffix='.tmp')
     try:
-        os.chmod(tmp, 0o600)
-    except OSError:
-        pass
-    os.replace(tmp, path)
+        with os.fdopen(fd, 'w') as f:
+            json.dump(data, f)
+            f.flush()
+            os.fsync(f.fileno())
+        try:
+            os.chmod(tmp, 0o600)
+        except OSError:
+            pass
+        os.replace(tmp, path)
+    except BaseException:
+        # Never leave a half-written file holding a live token behind.
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
 
 
 def is_authorized() -> bool:
@@ -148,6 +171,34 @@ def authorize_url(state: str) -> str:
     return INAT_AUTHORIZE_URL + '?' + urllib.parse.urlencode(params)
 
 
+def _log_upstream_error(method: str, url: str, exc) -> None:
+    """Record an upstream OAuth failure without recording what it contained.
+
+    The response body of a token exchange is the last place to take text from
+    and hand to a user: it is attacker-influencable, it is rendered into a flash
+    message, and on some error paths providers echo request parameters -- which
+    on this endpoint means the client secret or the authorization code. It is
+    equally not something to write to the log verbatim, since these logs are
+    read (and pasted) freely.
+
+    So: the status, the length, and a fingerprint. Two identical failures share
+    a fingerprint, which is enough to tell "the same error, repeatedly" from
+    "something new" without the content ever being stored.
+    """
+    from app.services.log_context import stable_fingerprint
+    body = b''
+    try:
+        body = exc.read() or b''
+    except Exception:
+        pass
+    logger.warning(
+        "event=inat_oauth.upstream_error method=%s url=%s status=%s "
+        "body_bytes=%s body_fingerprint=%s",
+        method, url, exc.code, len(body),
+        stable_fingerprint(body.decode('utf-8', errors='replace')),
+    )
+
+
 def _http_post_json(url: str, form: Dict[str, str], *, bearer: Optional[str] = None,
                     json_body: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     if json_body is not None:
@@ -166,15 +217,11 @@ def _http_post_json(url: str, form: Dict[str, str], *, bearer: Optional[str] = N
         with urllib.request.urlopen(req, timeout=REQUEST_TIMEOUT) as resp:
             return json.loads(resp.read().decode('utf-8'))
     except urllib.error.HTTPError as e:
-        body = ''
-        try:
-            body = e.read().decode('utf-8', errors='replace')[:300]
-        except Exception:
-            pass
-        logger.warning("iNat POST %s failed: HTTP %s", url, e.code)
-        raise InatAuthError(f"iNaturalist HTTP {e.code}: {body[:120]}")
+        _log_upstream_error('POST', url, e)
+        raise InatAuthError(f"iNaturalist returned HTTP {e.code}.")
     except urllib.error.URLError as e:
-        raise InatAuthError(f"iNaturalist network error: {e.reason}")
+        logger.warning("iNat POST %s failed: %s", url, type(e.reason).__name__)
+        raise InatAuthError("iNaturalist could not be reached.")
 
 
 def exchange_code_for_token(code: str) -> Dict[str, Any]:
@@ -212,14 +259,11 @@ def _http_get_json(url: str, bearer: str) -> Dict[str, Any]:
         with urllib.request.urlopen(req, timeout=REQUEST_TIMEOUT) as resp:
             return json.loads(resp.read().decode('utf-8'))
     except urllib.error.HTTPError as e:
-        body = ''
-        try:
-            body = e.read().decode('utf-8', errors='replace')[:200]
-        except Exception:
-            pass
-        raise InatAuthError(f"iNaturalist HTTP {e.code}: {body[:120]}")
+        _log_upstream_error('GET', url, e)
+        raise InatAuthError(f"iNaturalist returned HTTP {e.code}.")
     except urllib.error.URLError as e:
-        raise InatAuthError(f"iNaturalist network error: {e.reason}")
+        logger.warning("iNat GET %s failed: %s", url, type(e.reason).__name__)
+        raise InatAuthError("iNaturalist could not be reached.")
 
 
 def get_api_jwt() -> str:

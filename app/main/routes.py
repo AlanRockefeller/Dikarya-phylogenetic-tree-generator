@@ -1,15 +1,24 @@
-from flask import render_template, redirect, url_for, abort, request, current_app, flash, Response
+from flask import (
+    render_template, redirect, url_for, abort, request, current_app, flash,
+    jsonify, session, send_from_directory, Response,
+)
 from flask_login import current_user
 from jinja2 import TemplateNotFound
 from app.main import bp
-from app.services.security_utils import validate_safe_file_path, validate_job_id
+from app.services.security_utils import (
+    safe_next_url, validate_safe_file_path, validate_job_id,
+)
 from app.services.access_control import check_job_access
 from app.extensions import csrf, limiter, db
 from io import BytesIO
+import logging
 import os
 import re
 from collections import deque
 from datetime import datetime
+from xml.sax.saxutils import escape
+
+logger = logging.getLogger(__name__)
 
 
 VOUCHER_LABEL_PRESETS = {
@@ -95,13 +104,13 @@ VOUCHER_RTF_FONT_CHOICES = {
 def can_edit_whats_new():
     if not current_user.is_authenticated:
         return False
-    raw_editors = os.environ.get("WHATS_NEW_EDITOR_EMAILS") or os.environ.get("WHATS_NEW_EDITOR_EMAIL")
-    if raw_editors:
-        editor_emails = {
-            item.strip().lower()
-            for item in raw_editors.split(",")
-            if item.strip()
-        }
+    # Read through config, like _require_inat_oauth_admin below, rather than
+    # os.environ: the environment is only consulted once at Config import time,
+    # so a test (or any caller that sets app.config directly) sees the same
+    # answer the request does. Unset means the User.is_admin flag decides,
+    # which is the historical behaviour.
+    editor_emails = set(current_app.config.get("WHATS_NEW_EDITOR_EMAILS") or ())
+    if editor_emails:
         email = (getattr(current_user, "email", "") or "").strip().lower()
         return email in editor_emails
     return bool(getattr(current_user, "is_admin", False))
@@ -115,13 +124,8 @@ def require_whats_new_editor():
 def is_todo_admin():
     if not current_user.is_authenticated:
         return False
-    raw_admins = os.environ.get("TODO_ADMIN_EMAILS")
-    if raw_admins:
-        admin_emails = {
-            item.strip().lower()
-            for item in raw_admins.split(",")
-            if item.strip()
-        }
+    admin_emails = set(current_app.config.get("TODO_ADMIN_EMAILS") or ())
+    if admin_emails:
         email = (getattr(current_user, "email", "") or "").strip().lower()
         return email in admin_emails
     return bool(getattr(current_user, "is_admin", False))
@@ -140,10 +144,22 @@ def _sanitize_todo_input(name, suggestion):
     return name, suggestion
 
 
+# Set once the legacy bootstrap has been shown to be unnecessary in this
+# process, so /todo stops issuing the probe query on every single GET. Not a
+# cache of the todo list itself -- only of "the one-time import is behind us",
+# which cannot become false again.
+_LEGACY_TODOS_IMPORTED = False
+
+
 def _import_legacy_todos_if_needed():
+    global _LEGACY_TODOS_IMPORTED
     from app.models import TodoSuggestion
 
+    if _LEGACY_TODOS_IMPORTED:
+        return
+
     if TodoSuggestion.query.first():
+        _LEGACY_TODOS_IMPORTED = True
         return
 
     todo_file = os.path.join(current_app.root_path, 'static', 'todos.txt')
@@ -174,6 +190,7 @@ def _import_legacy_todos_if_needed():
     if legacy_entries:
         db.session.add_all(legacy_entries)
         db.session.commit()
+    _LEGACY_TODOS_IMPORTED = True
 
 
 @bp.route('/tree')
@@ -192,7 +209,6 @@ def help_page():
 # way, and so it stays correct if the vhost is ever rebuilt.
 @bp.route('/robots.txt')
 def robots_txt():
-    from flask import send_from_directory
     return send_from_directory(
         current_app.static_folder, 'robots.txt', mimetype='text/plain'
     )
@@ -223,8 +239,6 @@ SITEMAP_ENDPOINTS = (
 
 @bp.route('/sitemap.xml')
 def sitemap_xml():
-    from xml.sax.saxutils import escape
-
     lines = [
         '<?xml version="1.0" encoding="UTF-8"?>',
         '<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">',
@@ -477,8 +491,44 @@ def _build_voucher_pdf(labels, layout):
 
 
 def _rtf_escape(value):
-    text = str(value).replace("\\", "\\\\").replace("{", "\\{").replace("}", "\\}")
-    return text.replace("\n", "\\line ")
+    """Escape label text for an RTF document body.
+
+    RTF is a 7-bit format: the header declares \\ansi, so a raw UTF-8 byte is
+    read as a single Windows-1252 character and an accented voucher prefix
+    ("Boleté", "Åland") came out mojibake. Non-ASCII therefore goes out as
+    \\uN? escapes, where N is the signed 16-bit UTF-16 code unit and "?" is the
+    one-character fallback for readers that do not understand \\u (matching the
+    \\uc1 in the header). Characters outside the BMP are emitted as their
+    surrogate pair rather than being dropped.
+    """
+    out = []
+    for ch in str(value).replace("\r\n", "\n").replace("\r", "\n"):
+        if ch == "\\":
+            out.append("\\\\")
+        elif ch == "{":
+            out.append("\\{")
+        elif ch == "}":
+            out.append("\\}")
+        elif ch == "\n":
+            out.append("\\line ")
+        elif ch == "\t":
+            out.append("\\tab ")
+        elif " " <= ch <= "~":
+            out.append(ch)
+        elif ord(ch) < 0x20:
+            # Other control characters have no RTF meaning; drop them.
+            continue
+        else:
+            code = ord(ch)
+            if code < 0x10000:
+                units = (code,)
+            else:
+                offset = code - 0x10000
+                units = (0xD800 + (offset >> 10), 0xDC00 + (offset & 0x3FF))
+            for unit in units:
+                # RTF's \uN takes a *signed* 16-bit value.
+                out.append(f"\\u{unit - 0x10000 if unit > 0x7FFF else unit}?")
+    return "".join(out)
 
 
 def _build_voucher_rtf(labels, layout):
@@ -497,7 +547,9 @@ def _build_voucher_rtf(labels, layout):
             row.append(f"\\pard\\intbl\\qc\\f0\\fs{font_half_points} {_rtf_escape(label)}\\cell")
         row.append("\\row")
         rows.append("".join(row))
-    return ("{\\rtf1\\ansi\\deff0"
+    # \uc1: every \uN escape written by _rtf_escape is followed by exactly one
+    # ASCII fallback character.
+    return ("{\\rtf1\\ansi\\ansicpg1252\\uc1\\deff0"
             f"{{\\fonttbl{{\\f0 {font};}}}}"
             "\\margl720\\margr720\\margt720\\margb720\n"
             + "\n".join(rows)
@@ -506,7 +558,7 @@ def _build_voucher_rtf(labels, layout):
 
 @bp.route('/voucher')
 @bp.route('/vouchers')
-def voucher_redirect():
+def voucherredirect():
     return redirect(url_for('main.voucher_labels'), code=301)
 
 
@@ -520,7 +572,15 @@ def voucher_labels():
     )
 
 
+# The label count is already bounded by the form parsers -- pages <= 100 and a
+# per-page count that cannot exceed what physically fits on the sheet -- which
+# caps a single export at 2,700 labels, ~30 ms of work and ~150 KB. So the
+# workload per request is fine; what was missing was a bound on the *number* of
+# requests, since this is public, unauthenticated, and answers with a generated
+# document. A separate total-label cap would sit above the maximum the form can
+# actually produce and would only ever reject valid input.
 @bp.route('/voucher-labels/export', methods=['GET', 'POST'])
+@limiter.limit("30 per minute; 300 per hour")
 def voucher_labels_export():
     values = request.form if request.method == "POST" else request.args
     output_format = (values.get("output_format") or "pdf").lower()
@@ -548,31 +608,50 @@ def dosage_test():
         abort(404)
 
 
+# Session key holding an anonymous visitor's last What's New view, as an ISO
+# timestamp. Deliberately not a database row: see whats_new() below.
+WHATS_NEW_SESSION_KEY = "whats_new_last_viewed"
+
+
+def read_anonymous_whats_new_view():
+    """Last time this browser opened /whats-new, or None. Never raises."""
+    try:
+        raw = session.get(WHATS_NEW_SESSION_KEY)
+        return datetime.fromisoformat(raw) if raw else None
+    except (ValueError, TypeError):
+        # A cookie carrying junk in this key just means "not seen yet".
+        return None
+
+
+def write_anonymous_whats_new_view(seen_at):
+    session[WHATS_NEW_SESSION_KEY] = seen_at.isoformat()
+
+
 @bp.route('/whats-new')
 def whats_new():
     from app.models import WhatsNewEntry, WhatsNewView
 
     entries = WhatsNewEntry.query.order_by(WhatsNewEntry.published_at.desc()).all()
 
-    last_viewed = None
-    if current_user.is_authenticated:
-        view_record = WhatsNewView.query.filter_by(user_id=current_user.id).first()
-    else:
-        view_record = WhatsNewView.query.filter_by(ip_address=request.remote_addr).first()
-
-    if view_record:
-        last_viewed = view_record.last_viewed_at
-
     now = datetime.utcnow()
-    if view_record:
-        view_record.last_viewed_at = now
-    else:
-        if current_user.is_authenticated:
-            view_record = WhatsNewView(user_id=current_user.id, last_viewed_at=now)
+    if current_user.is_authenticated:
+        # A logged-in reader has an account to hang this off, and wants the
+        # badge to agree across their devices, so it stays in the database.
+        view_record = WhatsNewView.query.filter_by(user_id=current_user.id).first()
+        last_viewed = view_record.last_viewed_at if view_record else None
+        if view_record:
+            view_record.last_viewed_at = now
         else:
-            view_record = WhatsNewView(ip_address=request.remote_addr, last_viewed_at=now)
-        db.session.add(view_record)
-    db.session.commit()
+            db.session.add(WhatsNewView(user_id=current_user.id, last_viewed_at=now))
+        db.session.commit()
+    else:
+        # Anonymous readers used to get a row keyed by request.remote_addr: a
+        # write to the database on a GET, storing an IP address indefinitely,
+        # for no purpose beyond remembering that this browser had seen the page.
+        # The session cookie already is per-browser state and is exactly the
+        # right size for this.
+        last_viewed = read_anonymous_whats_new_view()
+        write_anonymous_whats_new_view(now)
 
     return render_template(
         'whats_new.html',
@@ -659,13 +738,16 @@ def whats_new_delete(entry_id):
     db.session.delete(entry)
     db.session.commit()
     flash("What's New item deleted.", "success")
-    next_url = request.form.get("next")
-    if next_url and next_url.startswith("/"):
+    # startswith("/") alone let `//evil.tld/phish` through: the browser reads
+    # that as protocol-relative and leaves the site. Same validation as the
+    # login form's ?next=.
+    next_url = safe_next_url(request.form.get("next"))
+    if next_url:
         return redirect(next_url)
     return redirect(url_for("main.whats_new_edit"))
 
 @bp.route('/job')
-def job_redirect():
+def jobredirect():
     return redirect(url_for('user.user_jobs'))
 
 @bp.route('/job/<job_id>')
@@ -726,8 +808,28 @@ def job_viewer(job_id):
         try:
             with open(input_info_path, 'r') as f:
                 job_details = json.load(f)
-        except Exception:
-            pass
+        except (OSError, ValueError) as exc:
+            # The viewer still renders with no submitted-parameters panel, but
+            # which job lost its metadata used to be unrecoverable from the
+            # logs. ValueError covers JSONDecodeError and the UnicodeDecodeError
+            # a truncated/binary file raises.
+            from app.services.log_context import log_degradation
+            log_degradation(
+                logger, "job_metadata_unreadable",
+                "Tree viewer rendered without the job's submitted parameters",
+                job_id=job_id, file="input_info.json",
+                exception=type(exc).__name__,
+            )
+
+    # input_info.json can carry raw JSON-request values for the boolean
+    # settings, and "false" is the one that bites: a non-empty string is truthy
+    # in Jinja, so the page reported a setting as on while the worker -- which
+    # goes through coerce_bool -- had already run it off.
+    from app.services.security_utils import coerce_bool as _coerce_bool
+    for _flag in ("mcmc_stop_early", "trim_terminal_overhangs",
+                  "enable_bootstrap", "moose_enabled", "early_stopping"):
+        if _flag in job_details:
+            job_details[_flag] = _coerce_bool(job_details[_flag], default=False)[0]
 
     mycomap_blast_url = job_details.get("mycomap_blast_url")
     if not mycomap_blast_url and db_job and isinstance(db_job.metrics, dict):
@@ -805,7 +907,6 @@ def _require_inat_oauth_admin():
 
 @bp.route("/tree/oauth/connect")
 def inat_oauth_connect():
-    from flask import session, redirect as _redirect
     from app.services.inaturalist_oauth_service import (
         InatAuthError, authorize_url, new_oauth_state,
     )
@@ -813,15 +914,14 @@ def inat_oauth_connect():
     try:
         state = new_oauth_state()
         session["inat_oauth_state"] = state
-        return _redirect(authorize_url(state))
+        return redirect(authorize_url(state))
     except InatAuthError as e:
         flash(f"iNaturalist OAuth not configured: {e}", "error")
-        return _redirect(url_for("main.sequence_entry"))
+        return redirect(url_for("main.sequence_entry"))
 
 
 @bp.route("/tree/oauth/callback")
 def inat_oauth_callback():
-    from flask import session, redirect as _redirect
     from app.services.inaturalist_oauth_service import (
         InatAuthError, exchange_code_for_token,
     )
@@ -831,32 +931,36 @@ def inat_oauth_callback():
     code = request.args.get("code")
     if not expected_state or not state or state != expected_state:
         flash("OAuth state mismatch. Please retry.", "error")
-        return _redirect(url_for("main.sequence_entry"))
+        return redirect(url_for("main.sequence_entry"))
     if not code:
         flash(
             "iNaturalist did not return an authorization code.",
             "error",
         )
-        return _redirect(url_for("main.sequence_entry"))
+        return redirect(url_for("main.sequence_entry"))
     try:
         exchange_code_for_token(code)
     except InatAuthError as e:
-        flash(f"iNaturalist authorization failed: {e}", "error")
-        return _redirect(url_for("main.sequence_entry"))
+        # InatAuthError messages are fixed strings carrying at most an upstream
+        # status code; the service never puts a response body into one. That is
+        # deliberate -- this text is rendered straight into a flash message, and
+        # a token endpoint's error body can echo back the request it was given.
+        flash(f"iNaturalist authorization failed: {e} "
+              "The server log has the details.", "error")
+        return redirect(url_for("main.sequence_entry"))
     flash(
         "iNaturalist authorization succeeded. The site can now post "
         "Phylogenetic Tree links back to observations.",
         "success",
     )
-    return _redirect(url_for("main.sequence_entry"))
+    return redirect(url_for("main.sequence_entry"))
 
 
 @bp.route("/tree/oauth/status")
 def inat_oauth_status():
-    from flask import jsonify as _jsonify
     from app.services.inaturalist_oauth_service import is_authorized
     _require_inat_oauth_admin()
-    return _jsonify({"authorized": bool(is_authorized())})
+    return jsonify({"authorized": bool(is_authorized())})
 
 
 @bp.route('/todo', methods=['GET', 'POST'])

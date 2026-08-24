@@ -386,6 +386,39 @@ heaviest clients:
 .venv/bin/python scripts/dikarya_log_digest.py --hours 24 --unterminated-grace-minutes 240
 ```
 
+### Reviewing only logs not reviewed before
+
+Repeated agent log reviews use the durable checkpoint at
+`.log-review-checkpoint.json`; conversation history, daily digest timestamps,
+file mtimes, and log-rotation boundaries are not review checkpoints.
+
+At the start of a review, run:
+
+```bash
+.venv/bin/python scripts/dikarya_log_digest.py --since-checkpoint
+```
+
+This reads the last successfully reviewed boundary without changing it and
+prints an exact half-open UTC window plus a line such as
+`checkpoint_candidate=2026-08-22T18:03:00Z`. Investigate and report everything
+in that window. Capture the candidate exactly as printed; do not substitute the
+time when the investigation finishes, because events arriving during the
+review belong to the next review.
+
+Only after the review has completed successfully, advance the checkpoint:
+
+```bash
+.venv/bin/python scripts/dikarya_log_digest.py \
+  --mark-reviewed 2026-08-22T18:03:00Z
+```
+
+Never advance the checkpoint for a failed, interrupted, partial, or merely
+started review. The next run will intentionally cover the same records again.
+To audit a particular historical interval without touching the checkpoint, use
+`--since <ISO-8601 UTC> --until <ISO-8601 UTC>`. To initialize a missing
+checkpoint, complete an initial explicit review, then mark its printed
+`checkpoint_candidate`.
+
 The window governs which files are opened, not just which records count: only
 the live file, rotations that overlap the window, and the one rotation
 immediately before it are read, so a 24-hour report does not decompress two

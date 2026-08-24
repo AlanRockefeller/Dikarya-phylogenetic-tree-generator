@@ -158,6 +158,57 @@ class TestMycomapLocalFastaConflictFilter(unittest.TestCase):
         self.assertEqual(len(strict_payload["sequences"]), 1)
         self.assertEqual(strict_payload["sequences"][0]["name"], "iNat123456 Amanita example California US")
 
+    def test_queued_ncbi_import_uses_local_results_without_fetching_ncbi_export(self):
+        with (
+            patch("app.services.mycomap_service.validate_mycomap_url", return_value="42"),
+            patch(
+                "app.services.mycomap_service.get_mycomap_ncbi_queue_position",
+                return_value=2741,
+            ),
+            patch(
+                "app.services.mycomap_service.fetch_mycomap_fasta",
+                return_value=MOCK_FASTA_RESULT,
+            ) as fetch_fasta,
+            patch("app.services.mycomap_service.fetch_mycomap_blast_metrics", return_value={}),
+            patch(
+                "app.services.mycomap_service.improve_mycomap_sequence_name",
+                side_effect=lambda name, *_, **__: name,
+            ),
+            patch("app.services.blast_service.fetch_fasta_for_accessions", return_value=""),
+        ):
+            payload, error = gather_mycomap_sequences_for_queue(
+                MOCK_BLAST_URL, include_ncbi=True, include_local=True,
+            )
+
+        self.assertIsNone(error)
+        fetch_fasta.assert_called_once_with(
+            "42", False, True, time_budget=None,
+        )
+        self.assertEqual(payload["pending_sources"], ["ncbi"])
+        self.assertEqual(payload["ncbi_queue_position"], 2741)
+        self.assertIn("local results were imported", payload["message"])
+
+    def test_queued_ncbi_only_import_returns_retryable_pending_response(self):
+        with (
+            patch("app.services.mycomap_service.validate_mycomap_url", return_value="42"),
+            patch(
+                "app.services.mycomap_service.get_mycomap_ncbi_queue_position",
+                return_value=2741,
+            ),
+            patch("app.services.mycomap_service.fetch_mycomap_fasta") as fetch_fasta,
+        ):
+            payload, error = gather_mycomap_sequences_for_queue(
+                MOCK_BLAST_URL, include_ncbi=True, include_local=False,
+            )
+
+        self.assertIsNone(payload)
+        body, status = error
+        self.assertEqual(status, 409)
+        self.assertEqual(body["status"], "pending")
+        self.assertTrue(body["retryable"])
+        self.assertEqual(body["ncbi_queue_position"], 2741)
+        fetch_fasta.assert_not_called()
+
     def test_gather_does_not_treat_same_state_labels_as_distinct_locations(self):
         same_state_fasta = (
             ">iNat123456 Amanita example California US\n"

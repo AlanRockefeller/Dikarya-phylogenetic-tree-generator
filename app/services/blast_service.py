@@ -6,7 +6,6 @@ import time
 import requests
 import threading
 import xml.etree.ElementTree as ET
-from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Any
 from app.config import Config
 
@@ -23,6 +22,20 @@ _MIN_REQUEST_GAP = 1.0 / 3.0  # At least 0.34s between requests (~3 req/s)
 # 50 ids at the rate limit cost ~17s when NCBI is healthy; this only bites when
 # it is not, and it is what keeps the pass inside nginx's 300s read timeout.
 _ISOLATION_BUDGET_SECONDS = 60.0
+
+# How many hits a BLAST search returns when the caller names no limit. Both
+# public entry points already defaulted to this; it is named here so the
+# submission (HITLIST_SIZE) and the parse cannot drift apart again.
+DEFAULT_MAX_SEQUENCES = 50
+
+
+def _normalize_max_sequences(value) -> int:
+    """Coerce a requested hit limit to a usable positive integer."""
+    try:
+        limit = int(value)
+    except (TypeError, ValueError):
+        return DEFAULT_MAX_SEQUENCES
+    return limit if limit > 0 else DEFAULT_MAX_SEQUENCES
 
 def _ncbi_request(method: str, url: str, max_retries: int = 5, **kwargs) -> requests.Response:
     """
@@ -60,6 +73,10 @@ def _ncbi_request(method: str, url: str, max_retries: int = 5, **kwargs) -> requ
     backoff = 1.0  # Start with 1s
     
     for attempt in range(max_retries):
+        # On the last pass there is no retry left to back off before: sleeping
+        # here only delayed the RetryError below by the full backoff (4s on the
+        # default three attempts) while holding the caller's request slot.
+        last_attempt = attempt == max_retries - 1
         try:
             response = requests.request(method, url, **kwargs)
             
@@ -74,14 +91,20 @@ def _ncbi_request(method: str, url: str, max_retries: int = 5, **kwargs) -> requ
                 else:
                     wait_time = backoff
                 
-                logger.warning(f"NCBI 429 (Too Many Requests). Waiting {wait_time}s before retry {attempt + 1}/{max_retries}")
+                if last_attempt:
+                    logger.warning(f"NCBI 429 (Too Many Requests) on final attempt {attempt + 1}/{max_retries}. Giving up.")
+                    break
+                logger.warning(f"NCBI 429 (Too Many Requests). Waiting {wait_time}s before retry {attempt + 2}/{max_retries}")
                 time.sleep(wait_time)
                 backoff *= 2 # Exponential backoff for next time if needed
                 continue
                 
             # Check for 5xx Server Errors
             if 500 <= response.status_code < 600:
-                logger.warning(f"NCBI {response.status_code} Error. Waiting {backoff}s before retry {attempt + 1}/{max_retries}")
+                if last_attempt:
+                    logger.warning(f"NCBI {response.status_code} Error on final attempt {attempt + 1}/{max_retries}. Giving up.")
+                    break
+                logger.warning(f"NCBI {response.status_code} Error. Waiting {backoff}s before retry {attempt + 2}/{max_retries}")
                 time.sleep(backoff)
                 backoff *= 2
                 continue
@@ -91,16 +114,19 @@ def _ncbi_request(method: str, url: str, max_retries: int = 5, **kwargs) -> requ
             return response
             
         except (requests.ConnectionError, requests.Timeout) as e:
-            logger.warning(f"NCBI Connection/Timeout error: {e}. Waiting {backoff}s before retry {attempt + 1}/{max_retries}")
+            if last_attempt:
+                logger.warning(f"NCBI Connection/Timeout error on final attempt {attempt + 1}/{max_retries}: {e}. Giving up.")
+                break
+            logger.warning(f"NCBI Connection/Timeout error: {e}. Waiting {backoff}s before retry {attempt + 2}/{max_retries}")
             time.sleep(backoff)
             backoff *= 2
             
-    # Final attempt (or if we ran out of retries)
-    # If we exited loop, try one last time or re-raise
+    # Every attempt is spent.
     raise requests.exceptions.RetryError(f"Max retries ({max_retries}) exceeded for NCBI request to {url}")
 
 
-def blast_from_sequence(seq: str, config: Config, min_identity: float = 90.0, max_sequences: int = 50, logger=logger) -> Dict:
+def blast_from_sequence(seq: str, config: Config, min_identity: float = 90.0,
+                        max_sequences: int = DEFAULT_MAX_SEQUENCES, logger=logger) -> Dict:
     """
     Perform remote BLAST using the given nucleotide sequence.
     Use caching if available.
@@ -119,7 +145,7 @@ def blast_from_sequence(seq: str, config: Config, min_identity: float = 90.0, ma
         
         _poll_blast(rid, rtoe, config, logger)
         
-        blast_result = _fetch_blast_results(rid)
+        blast_result = _fetch_blast_results(rid, max_sequences)
         hit_accessions = blast_result.get("accessions", [])
         hit_details = blast_result.get("hit_details", [])
         logger.info(f"BLAST finished. Found {len(hit_accessions)} hits.")
@@ -134,7 +160,8 @@ def blast_from_sequence(seq: str, config: Config, min_identity: float = 90.0, ma
         # Re-raise to let caller handle failure (e.g. show user error)
         raise
 
-def blast_from_accessions(accessions: List[str], config: Config, min_identity: float = 90.0, max_sequences: int = 50, logger=logger) -> Dict:
+def blast_from_accessions(accessions: List[str], config: Config, min_identity: float = 90.0,
+                          max_sequences: int = DEFAULT_MAX_SEQUENCES, logger=logger) -> Dict:
     """
     Retrieve sequences for the provided accessions.
     Then run remote BLAST using the combined sequence.
@@ -162,7 +189,7 @@ def blast_from_accessions(accessions: List[str], config: Config, min_identity: f
         
         _poll_blast(rid, rtoe, config, logger)
         
-        blast_result = _fetch_blast_results(rid)
+        blast_result = _fetch_blast_results(rid, max_sequences)
         hit_accessions = blast_result.get("accessions", [])
         hit_details = blast_result.get("hit_details", [])
         logger.info(f"BLAST finished. Found {len(hit_accessions)} hits.")
@@ -302,21 +329,51 @@ def _submit_blast_request(seq: str, config: Config = None, min_identity: float =
     logger.info(f"BLAST submission successful. RID={rid}, RTOE={rtoe}")
     return rid, rtoe
 
-def _poll_blast(rid: str, rtoe: int, config: Config, logger) -> None:
-    """Poll NCBI for BLAST job completion."""
-    # 1. Wait initial RTOE
-    logger.info(f"Waiting {rtoe} seconds for RTOE...")
-    time.sleep(rtoe)
-    
-    start_time = time.time()
-    max_wait = 600  # 10 minutes max
-    
+# Total time _poll_blast will wait for one RID, counting the initial RTOE wait.
+BLAST_MAX_WAIT_SECONDS = 600
+
+
+def _poll_blast(rid: str, rtoe: int, config: Config, logger,
+                max_wait: float = BLAST_MAX_WAIT_SECONDS) -> None:
+    """Poll NCBI for BLAST job completion.
+
+    `max_wait` is the whole budget, not the budget after the initial wait. RTOE
+    is NCBI's own estimate of how long the search will take and arrives in its
+    response, so it is upstream-controlled input: the timer used to start
+    *after* sleeping for it, which meant a large RTOE was slept off in full and
+    then followed by the entire 10-minute poll budget. Every wait below is now
+    clamped to what is left of the budget, so the call cannot overrun it.
+    """
+    start_time = time.monotonic()
+    deadline = start_time + max_wait
+
+    # 1. Wait the initial RTOE, but only for as long as the budget allows.
+    try:
+        rtoe_seconds = max(0.0, float(rtoe or 0))
+    except (TypeError, ValueError):
+        rtoe_seconds = 0.0
+    initial_wait = min(rtoe_seconds, max(0.0, deadline - time.monotonic()))
+    if initial_wait > 0:
+        logger.info(
+            f"Waiting {initial_wait:.0f}s for RTOE (estimate {rtoe_seconds:.0f}s, "
+            f"budget {max_wait:.0f}s)..."
+        )
+        time.sleep(initial_wait)
+
     # Use configured poll interval, but MINIMUM 60 seconds
     configured_interval = getattr(config, 'BLAST_POLL_INTERVAL_SECONDS', 60)
     poll_interval = max(60, configured_interval)
-    
+
+    def _sleep_within_budget(seconds: float) -> bool:
+        """Sleep, but never past the deadline. False when the budget is spent."""
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return False
+        time.sleep(min(seconds, remaining))
+        return True
+
     # 2. Poll Loop
-    while (time.time() - start_time) < max_wait:
+    while time.monotonic() < deadline:
         params = {
             "CMD": "Get",
             "FORMAT_OBJECT": "SearchInfo",
@@ -330,7 +387,7 @@ def _poll_blast(rid: str, rtoe: int, config: Config, logger) -> None:
             # If 404, maybe RID expired.
             if response.status_code != 200:
                 logger.warning(f"Poll got status {response.status_code}. Retrying next cycle.")
-                time.sleep(poll_interval)
+                _sleep_within_budget(poll_interval)
                 continue
                 
             content = response.text
@@ -339,7 +396,7 @@ def _poll_blast(rid: str, rtoe: int, config: Config, logger) -> None:
             
             if "Status=WAITING" in content:
                 logger.info(f"BLAST Status: WAITING. Sleeping {poll_interval}s...")
-                time.sleep(poll_interval)
+                _sleep_within_budget(poll_interval)
                 continue
             
             if "Status=FAILED" in content:
@@ -358,17 +415,26 @@ def _poll_blast(rid: str, rtoe: int, config: Config, logger) -> None:
                 
         except Exception as e:
              logger.warning(f"Poll exception: {e}. Retrying next cycle.")
-             time.sleep(poll_interval)
+             _sleep_within_budget(poll_interval)
              continue
 
-    raise TimeoutError("BLAST timed out waiting for results")
+    raise TimeoutError(
+        f"BLAST timed out waiting for results after {max_wait:.0f}s "
+        f"(RID {rid})"
+    )
 
-def _fetch_blast_results(rid: str) -> Dict[str, List]:
+def _fetch_blast_results(rid: str, max_sequences: int = DEFAULT_MAX_SEQUENCES) -> Dict[str, List]:
     """Fetch BLAST results from NCBI. Handle both raw JSON and ZIP-compressed responses.
-    
+
+    `max_sequences` is the same limit that was sent to NCBI as HITLIST_SIZE. It
+    has to be repeated here because the parse used to slice its output to a
+    hard-coded 50, so a caller asking for 200 reference sequences quietly got
+    50 -- a change in taxon sampling, not just a truncated list.
+
     Returns:
         Dict with 'accessions' (list of str) and 'hit_details' (list of dicts with accession/organism)
     """
+    limit = _normalize_max_sequences(max_sequences)
     import io
     import zipfile
     
@@ -429,7 +495,7 @@ def _fetch_blast_results(rid: str) -> Dict[str, List]:
         accession_pattern = r'\b([A-Z]{1,2}_?\d{6,}(?:\.\d+)?)\b'
         matches = re.findall(accession_pattern, content)
         if matches:
-            unique_accessions = list(dict.fromkeys(matches))[:50]
+            unique_accessions = list(dict.fromkeys(matches))[:limit]
             logger.info(f"Extracted {len(unique_accessions)} accessions from text response")
             return {"accessions": unique_accessions, "hit_details": []}
         logger.warning("Could not extract accessions from non-JSON response")
@@ -446,10 +512,18 @@ def _fetch_blast_results(rid: str) -> Dict[str, List]:
         blast_output = data.get("BlastOutput2", {})
         
         if not blast_output:
-            logger.warning(f"No BlastOutput2 in response. Full response keys: {list(data.keys())}")
-            debug_path = Path("/tmp/blast_debug_response.json")
-            debug_path.write_text(json.dumps(data, indent=2)[:10000])
-            logger.info(f"Saved debug response to {debug_path}")
+            # Deliberately no debug dump. This used to write the decoded NCBI
+            # response to a fixed /tmp/blast_debug_response.json, which every
+            # concurrent job overwrote and which put upstream response data
+            # outside the normal logging controls. The bounded fingerprint plus
+            # the key list is enough to recognise a recurring malformed shape.
+            from app.services.log_context import stable_fingerprint
+            logger.warning(
+                "event=blast.no_blastoutput2 BLAST response carried no "
+                "BlastOutput2 top_level_keys=%s response_chars=%s "
+                "response_fingerprint=%s",
+                sorted(data.keys())[:20], len(content), stable_fingerprint(content),
+            )
             return {"accessions": [], "hit_details": []}
         
         # Handle both dict and list formats
@@ -493,7 +567,7 @@ def _fetch_blast_results(rid: str) -> Dict[str, List]:
                     hit_details.append({"accession": acc, "organism": organism})
                     
         logger.info(f"Extracted {len(accessions)} accessions from hits")
-        return {"accessions": accessions[:50], "hit_details": hit_details[:50]}
+        return {"accessions": accessions[:limit], "hit_details": hit_details[:limit]}
         
     except json.JSONDecodeError as e:
         from app.services.log_context import stable_fingerprint
@@ -943,8 +1017,11 @@ def fetch_fasta_for_accessions(accessions: List[str]) -> str:
 
             # counting stats
             for r in parsed["by_acc"].values():
-                if r.get("type_material"): counters["type_structured"] += 1
-                elif "holotype" in r.get("blob", "").lower(): counters["type_keyword"] += 1 # approx check
+                if r.get("type_material"):
+                    counters["type_structured"] += 1
+                elif "holotype" in r.get("blob", "").lower():
+                    # Approximate: a free-text mention, not a structured field.
+                    counters["type_keyword"] += 1
 
 
     # 2. Reassemble deterministically
@@ -974,40 +1051,41 @@ def fetch_fasta_for_accessions(accessions: List[str]) -> str:
                 f"BatchFail={counters['batch_fail']}")
 
     # 3. Fallback for missing
+    #
+    # Batched at BATCH_SIZE like the XML pass above. This used to send every
+    # missing id in one POST, which is the case that matters least when the
+    # list is short and most when it is long: a whole failed XML batch lands
+    # here, so 500 accessions could become a single oversized request whose
+    # failure took all 500 down together. Each chunk now fails on its own, and
+    # is reported on its own.
     if missing_for_fallback:
         logger.warning(f"Falling back to legacy FASTA fetch for {len(missing_for_fallback)} accessions")
-        
-        # We can implement a simple fallback here using the OLD method (efetch fasta)
-        # Construct parameters for fallback
-        try:
-            ids = ",".join(missing_for_fallback)
+
+        for start in range(0, len(missing_for_fallback), BATCH_SIZE):
+            chunk = missing_for_fallback[start:start + BATCH_SIZE]
             params = {
                 "db": "nuccore",
-                "id": ids,
+                "id": ",".join(chunk),
                 "rettype": "fasta",
                 "retmode": "text"
             }
-            # Use same batching logic? Or just dump all if small?
-            # Safe to assume fallback list might be small, but if batch fail, it could be large.
-            # Let's just do one call if small, or reuse verify logic? 
-            # Simple approach: Just request. If it's huge, requests might fail, but existing code didn't batch FASTA fetch anyway.
-            # Wait, existing code did NOT batch FASTA fetch (it sent all IDs).
-            
-            response = _ncbi_request("POST", NCBI_EFETCH_URL, data=params, timeout=(10, 60))
-            if response.status_code == 200:
-                final_lines.append(response.text.strip())
-            else:
+            try:
+                response = _ncbi_request("POST", NCBI_EFETCH_URL, data=params, timeout=(10, 60))
+                if response.status_code == 200:
+                    text = response.text.strip()
+                    if text:
+                        final_lines.append(text)
+                    continue
                 logger.error(
                     "event=ncbi.fallback_failed Fallback FASTA fetch failed "
                     "status=%s count=%s",
-                    response.status_code, len(missing_for_fallback),
+                    response.status_code, len(chunk),
                 )
-                # These accessions are now definitively absent from the result.
-                # Silently returning without them produced a tree missing its
-                # references that looked like a completely successful run.
-                _report_unresolved_accessions(missing_for_fallback, len(final_lines))
-        except Exception as e:
-            logger.error(f"Fallback FASTA fetch exception: {e}")
-            _report_unresolved_accessions(missing_for_fallback, len(final_lines))
+            except Exception as e:
+                logger.error(f"Fallback FASTA fetch exception: {e}")
+            # These accessions are now definitively absent from the result.
+            # Silently returning without them produced a tree missing its
+            # references that looked like a completely successful run.
+            _report_unresolved_accessions(chunk, len(final_lines))
 
     return "\n".join(final_lines)

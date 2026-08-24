@@ -26,6 +26,7 @@ htmlcov/
 
 # ---- Logs ----
 *.log
+.log-review-checkpoint.json
 
 # ---- App runtime data (jobs, logs, outputs) ----
 var/

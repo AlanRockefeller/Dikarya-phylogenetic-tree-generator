@@ -24,11 +24,13 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 import random
 import re
 import time
 from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 from hashlib import sha256
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
@@ -108,6 +110,14 @@ class TreeAnalysisUpstreamError(TreeAnalysisError):
 
 class TreeAnalysisUnavailable(TreeAnalysisError):
     """The feature is switched off or temporarily out of capacity (503)."""
+
+
+class TreeAnalysisRateLimited(TreeAnalysisUnavailable):
+    """The upstream reviewer refused a call until a later time (429)."""
+
+    def __init__(self, message: str, retry_after_seconds: int = 60):
+        super().__init__(message)
+        self.retry_after_seconds = max(1, int(retry_after_seconds))
 
 
 class TreeAnalysisInProgress(TreeAnalysisUnavailable):
@@ -2371,6 +2381,61 @@ def _call_claude_cli(
             "Claude did not finish the review in time. Try again in a moment."
         ) from exc
 
+    try:
+        envelope = json.loads(completed.stdout)
+    except (TypeError, ValueError):
+        envelope = None
+
+    # Claude Code reports API failures as a JSON result on stdout and exits 1;
+    # stderr is empty. Treating every exit 1 as a sudo/configuration problem hid
+    # the actual provider error (including quota reset times) from both the log
+    # and the user.
+    if isinstance(envelope, dict) and envelope.get("is_error"):
+        status = envelope.get("api_error_status")
+        logger.error(
+            "event=claude_review.cli_error subtype=%s status=%s terminal_reason=%s",
+            envelope.get("subtype"), status, envelope.get("terminal_reason"),
+        )
+        if status == 429:
+            result = envelope.get("result")
+            reset_match = re.search(
+                r"\bresets?\s+([0-9]{1,2}:[0-9]{2}\s*(?:am|pm)\s*\(UTC\))",
+                result if isinstance(result, str) else "",
+                flags=re.IGNORECASE,
+            )
+            if reset_match:
+                reset_text = reset_match.group(1)
+                reset_clock = re.sub(r"\s*\(UTC\)\s*$", "", reset_text, flags=re.I)
+                now = datetime.now(timezone.utc)
+                try:
+                    parsed_clock = datetime.strptime(
+                        reset_clock.strip().upper(), "%I:%M %p"
+                    ).time()
+                except ValueError:
+                    raise TreeAnalysisRateLimited(
+                        "Claude's session limit has been reached. Reviews should be "
+                        f"available again after {reset_text}.",
+                        60,
+                    )
+                reset_at = datetime.combine(now.date(), parsed_clock, tzinfo=timezone.utc)
+                if reset_at <= now:
+                    reset_at += timedelta(days=1)
+                retry_after = max(1, math.ceil((reset_at - now).total_seconds()))
+                raise TreeAnalysisRateLimited(
+                    "Claude's session limit has been reached. Reviews should be "
+                    f"available again after {reset_text}.",
+                    retry_after,
+                )
+            raise TreeAnalysisRateLimited(
+                "Claude is rate limiting reviews right now. Try again shortly.",
+                60,
+            )
+        if status in (401, 403):
+            raise TreeAnalysisUnavailable(
+                "Claude review is not configured correctly on this server."
+            )
+        raise TreeAnalysisUpstreamError("Claude could not complete the review.")
+
     if completed.returncode != 0:
         detail = (completed.stderr or "").strip()[:300]
         logger.error(
@@ -2381,23 +2446,14 @@ def _call_claude_cli(
             raise TreeAnalysisUpstreamError(
                 "Claude did not finish the review in time. Try again in a moment."
             )
-        if "sudo" in detail.lower() or completed.returncode == 1:
+        if "sudo" in detail.lower():
             raise TreeAnalysisUnavailable(
                 "Claude review is not configured correctly on this server."
             )
         raise TreeAnalysisUpstreamError("Claude could not complete the review.")
 
-    try:
-        envelope = json.loads(completed.stdout)
-    except ValueError as exc:
-        raise TreeAnalysisUpstreamError("Claude returned a malformed review.") from exc
-
-    if envelope.get("is_error"):
-        logger.error(
-            "event=claude_review.cli_error subtype=%s status=%s",
-            envelope.get("subtype"), envelope.get("api_error_status"),
-        )
-        raise TreeAnalysisUpstreamError("Claude could not complete the review.")
+    if not isinstance(envelope, dict):
+        raise TreeAnalysisUpstreamError("Claude returned a malformed review.")
 
     # --json-schema puts the validated object on structured_output; `result` is
     # the same content as a string. Prefer the parsed form and fall back only if
@@ -2478,8 +2534,9 @@ def _call_claude(
             "Claude did not respond in time. Try again in a moment."
         ) from exc
     except anthropic.RateLimitError as exc:
-        raise TreeAnalysisUnavailable(
-            "Claude is rate limiting requests right now. Try again shortly."
+        raise TreeAnalysisRateLimited(
+            "Claude is rate limiting requests right now. Try again shortly.",
+            60,
         ) from exc
     except anthropic.AuthenticationError as exc:
         logger.error("Claude review rejected the configured API key")

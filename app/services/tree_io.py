@@ -60,6 +60,17 @@ def quote_tree_label(name: str) -> str:
 
 def tree_to_newick_string(tree) -> str:
     """Return the tree as a Newick string at full branch-length precision."""
+    for clade in tree.get_nonterminals():
+        if clade.name is not None and clade.confidence is not None:
+            # Biopython concatenates these two fields with no delimiter, turning
+            # e.g. name="CladeA", confidence=95 into the invented label
+            # "CladeA95". There is no portable Newick representation for two
+            # independent internal annotations, so fail instead of corrupting
+            # either one.
+            raise ValueError(
+                "Cannot serialize an internal node carrying both a name and a "
+                "confidence value"
+            )
     handle = StringIO()
     Phylo.write(
         tree, handle, "newick",
@@ -69,15 +80,21 @@ def tree_to_newick_string(tree) -> str:
 
 
 def _terminal_labels(tree) -> list:
-    """Ordered, de-duplicated tip labels; unnamed tips are skipped."""
-    seen = set()
+    """Return one existing, unique label per terminal or fail loudly."""
     labels = []
-    for tip in tree.get_terminals():
-        name = tip.name
-        if not name or name in seen:
-            continue
-        seen.add(name)
-        labels.append(name)
+    seen = set()
+    for position, tip in enumerate(tree.get_terminals(), start=1):
+        if tip.name is None or not str(tip.name).strip():
+            raise ValueError(
+                f"Cannot write NEXUS: terminal taxon {position} has no label"
+            )
+        label = str(tip.name)
+        if label in seen:
+            raise ValueError(
+                f"Cannot write NEXUS: duplicate terminal taxon label {label!r}"
+            )
+        seen.add(label)
+        labels.append(label)
     return labels
 
 
@@ -100,17 +117,17 @@ def write_nexus_tree(tree, path, tree_name: str = "tree1",
     if not HAS_BIOPYTHON:
         raise RuntimeError("BioPython is required to write NEXUS trees.")
 
+    terminals = tree.get_terminals()
     labels = _terminal_labels(tree)
-    index_by_label = {label: i + 1 for i, label in enumerate(labels)}
-
     # Serialize with the tips renamed to their translate indices, then put the
     # original names back on the in-memory tree so the caller's object is
-    # unchanged.
-    original_names = [(tip, tip.name) for tip in tree.get_terminals()]
+    # unchanged. Indices come from each tip's *position*, not from a lookup on
+    # its name: two tips sharing a name would otherwise both be renamed to the
+    # same index, and an unnamed tip would keep no index at all.
+    original_names = [(tip, tip.name) for tip in terminals]
     try:
-        for tip, name in original_names:
-            if name in index_by_label:
-                tip.name = str(index_by_label[name])
+        for position, tip in enumerate(terminals, start=1):
+            tip.name = str(position)
         newick = tree_to_newick_string(tree)
     finally:
         for tip, name in original_names:
@@ -135,7 +152,7 @@ def write_nexus_tree(tree, path, tree_name: str = "tree1",
     lines.append("    TRANSLATE")
     translate_entries = [
         f"        {index} {quote_tree_label(label)}"
-        for label, index in index_by_label.items()
+        for index, label in enumerate(labels, start=1)
     ]
     lines.append(",\n".join(translate_entries) + ";")
     lines.append(f"    TREE {tree_name} = {rooted_flag} {newick}")

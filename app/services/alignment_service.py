@@ -20,6 +20,9 @@ from typing import Optional
 from app.config import Config
 from app.models import AlignmentParams
 from app.services.subprocess_utils import (
+    configured_tool_limits,
+    configured_tool_time_limit_hours,
+    configured_tool_timeout_seconds,
     run_command,
     run_command_streaming,
     tool_failure_message,
@@ -90,7 +93,8 @@ def run_alignment(
     params: AlignmentParams,
     config: Config,
     logger,
-    job_id: Optional[str] = None
+    job_id: Optional[str] = None,
+    orient_uncertain: Optional[int] = None,
 ) -> dict:
     """
     Run a multiple sequence alignment according to user-selected or default parameters.
@@ -109,12 +113,16 @@ def run_alignment(
         config: Application config
         logger: Logger instance
         job_id: Optional job ID for real-time event streaming
+        orient_uncertain: How many sequences ORIENT declined to call, when it
+            ran. Recorded alongside any aligner flip so the degradation line
+            explains itself; None means ORIENT did not run (recompute).
 
     Returns:
         Stats dict describing what the aligner actually did.
     """
     method = params.method.lower()
     stats = {"method": method, "reversed_by_aligner": 0}
+    fix_orientation = getattr(params, "fix_orientation", True)
     
     if method == "default":
         # Beginner mode default: use configured default aligner (e.g. mafft)
@@ -125,21 +133,34 @@ def run_alignment(
     
     try:
         if method == "none":
+            # Deliberately no direction check. method='none' asserts the input
+            # is already aligned, and reverse-complementing one row of an
+            # existing alignment would destroy the column correspondence that
+            # makes it an alignment at all.
             logger.info("Skipping alignment (method='none'). Copying input to output.")
             _verify_already_aligned(input_fasta, logger)
             shutil.copy(input_fasta, output_fasta)
         elif method == "mafft":
             stats["reversed_by_aligner"] = _run_mafft(
-                input_fasta, output_fasta, params, config, logger, job_id
+                input_fasta, output_fasta, params, config, logger, job_id,
+                orient_uncertain=orient_uncertain,
+                fix_orientation=fix_orientation,
             )
-        elif method == "muscle":
-            _run_muscle(input_fasta, output_fasta, params, config, logger, job_id)
-        elif method == "clustalo":
-            _run_clustalo(input_fasta, output_fasta, params, config, logger, job_id)
-        elif method == "iqtree_builtin":
-            _run_iqtree_builtin(input_fasta, output_fasta, params, config, logger, job_id)
         else:
-            raise ValueError(f"Unsupported alignment method: {method}")
+            # Every other aligner is direction-blind, so the correction has to
+            # happen before it sees the sequences.
+            if fix_orientation:
+                stats["reversed_by_aligner"] = fix_direction_with_mafft(
+                    input_fasta, config, logger, job_id
+                )
+            if method == "muscle":
+                _run_muscle(input_fasta, output_fasta, params, config, logger, job_id)
+            elif method == "clustalo":
+                _run_clustalo(input_fasta, output_fasta, params, config, logger, job_id)
+            elif method == "iqtree_builtin":
+                _run_iqtree_builtin(input_fasta, output_fasta, params, config, logger, job_id)
+            else:
+                raise ValueError(f"Unsupported alignment method: {method}")
             
         if not output_fasta.exists() or output_fasta.stat().st_size == 0:
              raise RuntimeError(f"Alignment failed: Output file {output_fasta} is missing or empty.")
@@ -262,13 +283,131 @@ def _restore_mafft_direction_headers(
     return restored_count
 
 
+def _flipped_headers_from_mafft(aligned_text: str, input_headers: set) -> set:
+    """Headers MAFFT marked with ``_R_``, restricted to ones we actually sent.
+
+    Split out from the rewrite so the marker parsing is testable on its own and
+    so a mangled header can never cause a record to be flipped by accident: a
+    ``_R_`` line that does not correspond to a real input header is ignored,
+    exactly as in _restore_mafft_direction_headers.
+    """
+    flipped = set()
+    for line in aligned_text.splitlines():
+        if not line.startswith(">_R_"):
+            continue
+        header = line[4:].strip()
+        if header in input_headers:
+            flipped.add(header)
+    return flipped
+
+
+def fix_direction_with_mafft(
+    input_fasta: Path,
+    config: Config,
+    logger,
+    job_id: Optional[str] = None,
+) -> int:
+    """Reverse-complement backwards sequences in ``input_fasta``, in place.
+
+    MUSCLE, Clustal Omega and IQ-TREE's --align-only have no direction
+    adjustment of their own, so a reversed sequence used to go into the
+    alignment backwards and quietly produce a wrong tree. ORIENT does not cover
+    this: it knows only the three ITS motifs, so any other marker (LSU, RPB2,
+    TEF1) lands entirely in its "uncertain" bucket and passes through
+    untouched. MAFFT's check is similarity-based rather than motif-based, so it
+    works on any marker -- which is why it is worth borrowing here.
+
+    We run MAFFT only to read its ``_R_`` markers and then throw the alignment
+    away, because the sequences must reach the real aligner unaligned. The flip
+    is applied to the *input* file, so unlike MAFFT's native adjustment this
+    leaves input/input_raw.fasta and the alignment in agreement -- which is the
+    divergence that aligner_reversed_sequences exists to report.
+
+    Returns the number of sequences flipped.
+    """
+    from app.services.orientation_service import fasta_reader, format_fasta, revcomp
+
+    records = fasta_reader(input_fasta.read_text(encoding="utf-8", errors="replace"))
+    if len(records) < 2:
+        # --adjustdirection decides direction by comparing sequences to one
+        # another, so a single sequence has nothing to be compared against.
+        return 0
+
+    threads = _get_thread_count()
+    cmd = [
+        config.MAFFT_BINARY, "--thread", str(threads),
+        "--adjustdirectionaccurately",
+        # Direction only: skip the iterative refinement that makes a MAFFT run
+        # expensive. The _R_ markers are decided before any of it.
+        "--retree", "1", "--maxiterate", "0",
+        "--quiet", str(input_fasta),
+    ]
+    if job_id:
+        # Show it in the live log like every other tool invocation, so the extra
+        # MAFFT line in a MUSCLE run is self-explanatory rather than alarming.
+        from app.workers.events import publish_command
+        publish_command(job_id, "align", cmd)
+
+        # Same runner the real aligners use, so this pass gets the RLIMIT_CPU
+        # ceiling too -- run_command carries only a wall clock. MAFFT writes the
+        # alignment to stdout, and we need it back to read the _R_ markers, so
+        # it goes to a scratch file that is deleted either way.
+        scratch = input_fasta.parent / f"{input_fasta.stem}.directioncheck.fasta"
+        try:
+            returncode, _ = run_command_streaming(
+                cmd,
+                stdout_path=scratch,
+                stderr_path=input_fasta.parent.parent / "logs" / "alignment.log",
+                **configured_tool_limits(config, "MAFFT", threads),
+            )
+            stdout = scratch.read_text(encoding="utf-8", errors="replace") if scratch.exists() else ""
+        finally:
+            scratch.unlink(missing_ok=True)
+        stderr = ""
+    else:
+        returncode, stdout, stderr = run_command(
+            cmd, timeout=configured_tool_timeout_seconds(config, "MAFFT")
+        )
+
+    if returncode != 0:
+        # Fail open. The chosen aligner can still produce a tree; it just will
+        # not have had its directions corrected, which is exactly the behaviour
+        # before this pass existed.
+        from app.services.log_context import log_degradation
+
+        log_degradation(
+            logger, "direction_check_failed",
+            "MAFFT direction pre-pass failed; sequences go to the aligner as submitted",
+            exit_code=returncode, detail=(stderr or "").strip()[:200],
+        )
+        return 0
+
+    input_headers = {header for header, _ in records}
+    flipped = _flipped_headers_from_mafft(stdout, input_headers)
+    if not flipped:
+        return 0
+
+    rewritten = [
+        format_fasta(header, revcomp(seq) if header in flipped else seq)
+        for header, seq in records
+    ]
+    input_fasta.write_text("\n".join(rewritten) + "\n", encoding="utf-8")
+    logger.info(
+        "Direction pre-pass reverse-complemented %s of %s sequence(s)",
+        len(flipped), len(records),
+    )
+    return len(flipped)
+
+
 def _run_mafft(
     input_fasta: Path,
     output_fasta: Path,
     params: AlignmentParams,
     config: Config,
     logger,
-    job_id: Optional[str] = None
+    job_id: Optional[str] = None,
+    orient_uncertain: Optional[int] = None,
+    fix_orientation: bool = True,
 ):
     """
     Run MAFFT alignment.
@@ -277,7 +416,9 @@ def _run_mafft(
     and stream stderr to Redis for progress updates.
     """
     threads = _get_thread_count()
-    cmd = [config.MAFFT_BINARY, "--thread", str(threads), "--adjustdirectionaccurately"]
+    cmd = [config.MAFFT_BINARY, "--thread", str(threads)]
+    if fix_orientation:
+        cmd.append("--adjustdirectionaccurately")
     
     # Check if this is a fast NJ tree build
     tree_method = params.advanced_options.get("tree_method", "").lower()
@@ -316,22 +457,27 @@ def _run_mafft(
             stderr_path=log_file,
             on_stderr_line=_make_log_callback(job_id, "align", "stderr"),
             stderr_file_filter=_keep_mafft_log_line,
+            **configured_tool_limits(config, "MAFFT", threads),
         )
         
         if exit_code != 0:
-            raise RuntimeError(tool_failure_message("MAFFT", exit_code))
+            raise RuntimeError(tool_failure_message(
+                "MAFFT", exit_code, configured_tool_time_limit_hours(config, "MAFFT")))
     else:
         # Fallback to non-streaming for backward compatibility. log_file is
         # deliberately not passed to run_command: MAFFT's stdout *is* the
         # alignment, and run_command's generic handler would write the entire
         # aligned FASTA into alignment.log a second time (92 existing logs were
         # inflated this way, some over 1 MB).
-        returncode, stdout, stderr = run_command(cmd)
+        returncode, stdout, stderr = run_command(
+            cmd, timeout=configured_tool_timeout_seconds(config, "MAFFT")
+        )
 
         _append_filtered_log(log_file, cmd, stderr, returncode)
 
         if returncode != 0:
-            raise RuntimeError(tool_failure_message("MAFFT", returncode))
+            raise RuntimeError(tool_failure_message(
+                "MAFFT", returncode, configured_tool_time_limit_hours(config, "MAFFT")))
 
         with open(output_fasta, "w") as f:
             f.write(stdout)
@@ -339,15 +485,29 @@ def _run_mafft(
     reversed_count = _restore_mafft_direction_headers(input_fasta, output_fasta, logger)
     if reversed_count:
         # ORIENT already ran its own motif-based orientation check over this
-        # same input, so a MAFFT flip here means the two disagreed. Record it:
-        # the alignment now holds those sequences in the opposite orientation
-        # to input/input_raw.fasta.
+        # same input, so a MAFFT flip here means the alignment now holds those
+        # sequences in the opposite orientation to input/input_raw.fasta, which
+        # is what recompute re-derives from.
+        #
+        # Log ORIENT's uncertain tally next to the flip count, because the two
+        # numbers are what distinguish the benign case from the real one.
+        # ORIENT knows only the three ITS motifs, so a non-ITS marker lands
+        # entirely in "uncertain" and MAFFT is simply finishing a call ORIENT
+        # declined to make -- every occurrence in the first week had
+        # flipped <= uncertain (one LSU job was 78/78 uncertain). A flip with
+        # uncertain=0 is the different, worrying case: there the two methods
+        # genuinely disagree about a sequence ORIENT was confident in.
         from app.services.log_context import log_degradation
+
+        context = {"count": reversed_count}
+        if orient_uncertain is not None:
+            context["orient_uncertain"] = orient_uncertain
+            context["disagreement"] = reversed_count > orient_uncertain
 
         log_degradation(
             logger, "aligner_reversed_sequences",
             "MAFFT reverse-complemented sequences the orientation step had left forward",
-            count=reversed_count,
+            **context,
         )
     return reversed_count
 
@@ -366,6 +526,7 @@ def _run_muscle(
     Uses MUSCLE v5 syntax (-align/-output).
     """
     # MUSCLE v5 uses -align and -output (v3 used -in/-out)
+    threads = _get_thread_count()
     cmd = [config.MUSCLE_BINARY, "-align", str(input_fasta), "-output", str(output_fasta)]
     
     log_file = output_fasta.parent.parent / "logs" / "alignment.log"
@@ -379,15 +540,21 @@ def _run_muscle(
             cmd,
             stderr_path=log_file,
             on_stderr_line=_make_log_callback(job_id, "align", "stderr"),
+            **configured_tool_limits(config, "MUSCLE", threads),
         )
         
         if exit_code != 0:
-            raise RuntimeError(tool_failure_message("MUSCLE", exit_code))
+            raise RuntimeError(tool_failure_message(
+                "MUSCLE", exit_code, configured_tool_time_limit_hours(config, "MUSCLE")))
     else:
-        returncode, stdout, stderr = run_command(cmd, log_file=log_file)
+        returncode, stdout, stderr = run_command(
+            cmd, log_file=log_file,
+            timeout=configured_tool_timeout_seconds(config, "MUSCLE"),
+        )
         
         if returncode != 0:
-            raise RuntimeError(tool_failure_message("MUSCLE", returncode))
+            raise RuntimeError(tool_failure_message(
+                "MUSCLE", returncode, configured_tool_time_limit_hours(config, "MUSCLE")))
 
 
 def _run_clustalo(
@@ -403,6 +570,7 @@ def _run_clustalo(
     
     Note: Clustal Omega threading support varies by version.
     """
+    threads = _get_thread_count()
     cmd = [config.CLUSTALO_BINARY, "-i", str(input_fasta), "-o", str(output_fasta), "--force"]
     
     log_file = output_fasta.parent.parent / "logs" / "alignment.log"
@@ -416,15 +584,23 @@ def _run_clustalo(
             cmd,
             stderr_path=log_file,
             on_stderr_line=_make_log_callback(job_id, "align", "stderr"),
+            **configured_tool_limits(config, "Clustal Omega", threads),
         )
         
         if exit_code != 0:
-            raise RuntimeError(tool_failure_message("Clustal Omega", exit_code))
+            raise RuntimeError(tool_failure_message(
+                "Clustal Omega", exit_code,
+                configured_tool_time_limit_hours(config, "Clustal Omega")))
     else:
-        returncode, stdout, stderr = run_command(cmd, log_file=log_file)
+        returncode, stdout, stderr = run_command(
+            cmd, log_file=log_file,
+            timeout=configured_tool_timeout_seconds(config, "Clustal Omega"),
+        )
         
         if returncode != 0:
-            raise RuntimeError(tool_failure_message("Clustal Omega", returncode))
+            raise RuntimeError(tool_failure_message(
+                "Clustal Omega", returncode,
+                configured_tool_time_limit_hours(config, "Clustal Omega")))
 
 
 def _run_iqtree_builtin(
@@ -463,15 +639,23 @@ def _run_iqtree_builtin(
             cmd,
             stderr_path=log_file,
             on_stderr_line=_make_log_callback(job_id, "align", "stderr"),
+            **configured_tool_limits(config, "IQ-TREE alignment", threads),
         )
         
         if exit_code != 0:
-            raise RuntimeError(tool_failure_message("IQ-TREE alignment", exit_code))
+            raise RuntimeError(tool_failure_message(
+                "IQ-TREE alignment", exit_code,
+                configured_tool_time_limit_hours(config, "IQ-TREE alignment")))
     else:
-        returncode, stdout, stderr = run_command(cmd, log_file=log_file)
+        returncode, stdout, stderr = run_command(
+            cmd, log_file=log_file,
+            timeout=configured_tool_timeout_seconds(config, "IQ-TREE alignment"),
+        )
         
         if returncode != 0:
-            raise RuntimeError(tool_failure_message("IQ-TREE alignment", returncode))
+            raise RuntimeError(tool_failure_message(
+                "IQ-TREE alignment", returncode,
+                configured_tool_time_limit_hours(config, "IQ-TREE alignment")))
     
     # IQ-TREE output file handling
     # Check for likely output files

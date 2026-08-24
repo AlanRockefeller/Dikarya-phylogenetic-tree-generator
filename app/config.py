@@ -24,6 +24,31 @@ def _csv_env(name, default=""):
     return [item.strip().lower() for item in raw.split(",") if item.strip()]
 
 
+# Environment booleans were parsed three different ways here, so the answer
+# depended on which setting you were reading: ALLOW_SQLITE_FALLBACK accepted
+# 'True' but not 'TRUE' or 'on', while REVERSE_GEOCODE_ENABLED treated every
+# unrecognised value -- including 'no' and 'off' -- as true. One token set for
+# all of them; anything unrecognised falls back to the setting's own default
+# rather than silently landing on whichever side the old expression happened to
+# put it. Deliberately independent of security_utils.coerce_bool, which parses
+# *request* values and must not drag app.services into config import time.
+_BOOL_ENV_TRUE = frozenset({"1", "true", "yes", "on"})
+_BOOL_ENV_FALSE = frozenset({"0", "false", "no", "off"})
+
+
+def bool_env(name, default=False):
+    """Read an environment variable as a boolean, or ``default`` if unset/unclear."""
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    clean = raw.strip().lower()
+    if clean in _BOOL_ENV_TRUE:
+        return True
+    if clean in _BOOL_ENV_FALSE:
+        return False
+    return default
+
+
 def _release_version(base_dir):
     """Resolve the deployment identifier through the one canonical resolver.
 
@@ -145,6 +170,29 @@ class Config:
     #   3. RLIMIT_CPU via prlimit (_run_raxml, scaled by thread count)
     RAXML_TIME_LIMIT_HOURS = float(os.environ.get('RAXML_TIME_LIMIT_HOURS', '15'))
 
+    # The same budget for the other tree builders. Previously only RAxML had
+    # one, so IQ-TREE, MrBayes and FastTree could run forever; the worker is
+    # single-process, so one wedged run blocked every queued job behind it.
+    # These must exist here even though _tool_time_limit_hours() falls back to a
+    # literal: it reads them with getattr(), so an operator raising the cap for
+    # a large job by setting IQTREE_TIME_LIMIT_HOURS in the environment would
+    # otherwise have it silently ignored and the job killed at 15h anyway.
+    IQTREE_TIME_LIMIT_HOURS = float(os.environ.get('IQTREE_TIME_LIMIT_HOURS', '15'))
+    MRBAYES_TIME_LIMIT_HOURS = float(os.environ.get('MRBAYES_TIME_LIMIT_HOURS', '15'))
+    FASTTREE_TIME_LIMIT_HOURS = float(os.environ.get('FASTTREE_TIME_LIMIT_HOURS', '6'))
+
+    # Alignment and trimming tools need their own subprocess deadlines too. The
+    # RQ job deadline is only a backstop for the entire pipeline; without these,
+    # a wedged early step can consume that whole allowance and hold the worker.
+    MAFFT_TIME_LIMIT_HOURS = float(os.environ.get('MAFFT_TIME_LIMIT_HOURS', '8'))
+    MUSCLE_TIME_LIMIT_HOURS = float(os.environ.get('MUSCLE_TIME_LIMIT_HOURS', '8'))
+    CLUSTALO_TIME_LIMIT_HOURS = float(os.environ.get('CLUSTALO_TIME_LIMIT_HOURS', '8'))
+    IQTREE_ALIGNMENT_TIME_LIMIT_HOURS = float(
+        os.environ.get('IQTREE_ALIGNMENT_TIME_LIMIT_HOURS', '8')
+    )
+    TRIMAL_TIME_LIMIT_HOURS = float(os.environ.get('TRIMAL_TIME_LIMIT_HOURS', '4'))
+    BMGE_TIME_LIMIT_HOURS = float(os.environ.get('BMGE_TIME_LIMIT_HOURS', '4'))
+
 
     # Paths
     BASE_DIR = Path(__file__).resolve().parent.parent
@@ -159,7 +207,7 @@ class Config:
     REVERSE_GEOCODE_URL = os.environ.get(
         'REVERSE_GEOCODE_URL', 'https://nominatim.openstreetmap.org/reverse'
     )
-    REVERSE_GEOCODE_ENABLED = os.environ.get('REVERSE_GEOCODE_ENABLED', '1') not in ('0', 'false', 'False')
+    REVERSE_GEOCODE_ENABLED = bool_env('REVERSE_GEOCODE_ENABLED', True)
     BLAST_MAX_QUERY_LENGTH = int(os.environ.get('BLAST_MAX_QUERY_LENGTH', '50000'))  # 50KB max
 
     # Global request body cap. Sequences via /api/v1/jobs can be up to 5 MB;
@@ -215,7 +263,7 @@ class Config:
     # no DATABASE_URL, not because the job was missing). create_app() now refuses
     # to boot on the fallback unless it is explicitly opted into.
     DATABASE_URL_IS_EXPLICIT = bool(os.environ.get('DATABASE_URL'))
-    ALLOW_SQLITE_FALLBACK = os.environ.get('ALLOW_SQLITE_FALLBACK', '') in ('1', 'true', 'True', 'yes')
+    ALLOW_SQLITE_FALLBACK = bool_env('ALLOW_SQLITE_FALLBACK', False)
     SQLALCHEMY_DATABASE_URI = os.environ.get('DATABASE_URL') or 'sqlite:///' + str(BASE_DIR / 'app.db')
     SQLALCHEMY_TRACK_MODIFICATIONS = False
     # Validate pooled connections on checkout (cheap SELECT 1) and recycle
@@ -244,7 +292,7 @@ class Config:
     # "SH-aLRT/UFBoot" node labels. Set to 0 to report UFBoot only.
     DEFAULT_IQTREE_ALRT = int(os.environ.get("DEFAULT_IQTREE_ALRT", "1000"))
 
-    # Default alignment trimmer. "trimal_gappy" (trimAl -gt 0.9) drops columns
+    # Default alignment trimmer. "trimal_gappy" (trimAl -gt 0.1) drops columns
     # that are >90% gaps -- alignment junk -- while leaving the variable ITS1/ITS2
     # regions intact. Deliberately NOT "trimal" (-automated1), which strips ~43% of
     # ITS1/ITS2 and produced fewer well-supported nodes than no trimming at all.
@@ -312,6 +360,14 @@ class Config:
     # default was demonstrably too short -- a real Dikarya run finished it with
     # min ESS ~10 and max PSRF ~1.10.
     DEFAULT_MCMC_GENERATIONS = int(os.environ.get("DEFAULT_MCMC_GENERATIONS", "1000000"))
+    # The ceiling above is only safe because the stop rule is expected to cut the
+    # run short, and the stop rule needs two independent runs. A user who picks
+    # mcmc_nruns=1 gets no stop rule, so the ceiling becomes a promise to run the
+    # full length -- on a single-process worker that blocks every queued job
+    # behind it for hours. A run that cannot stop itself gets this instead.
+    DEFAULT_MCMC_GENERATIONS_FIXED_RUN = int(
+        os.environ.get("DEFAULT_MCMC_GENERATIONS_FIXED_RUN", "200000")
+    )
     DEFAULT_MCMC_NRNS = int(os.environ.get("DEFAULT_MCMC_NRNS", "2"))
     DEFAULT_MCMC_CHAINS = int(os.environ.get("DEFAULT_MCMC_CHAINS", "4"))
     DEFAULT_MCMC_BURNIN_FRACTION = float(
@@ -344,6 +400,16 @@ class Config:
 
     # Site-wide Mushroom Observer account used to post completed tree links.
     MUSHROOM_OBSERVER_API_KEY = os.environ.get('MUSHROOM_OBSERVER_API_KEY', '')
+
+    # Editor/admin allowlists for the What's New and TODO pages. Read through
+    # config like INAT_OAUTH_ADMIN_EMAILS above, so every allowlist in the app
+    # is set the same way and is visible to tests via app.config. An empty list
+    # keeps the historical fallback: the User.is_admin flag decides.
+    # WHATS_NEW_EDITOR_EMAIL (singular) is the older spelling and still works.
+    WHATS_NEW_EDITOR_EMAILS = (
+        _csv_env('WHATS_NEW_EDITOR_EMAILS') or _csv_env('WHATS_NEW_EDITOR_EMAIL')
+    )
+    TODO_ADMIN_EMAILS = _csv_env('TODO_ADMIN_EMAILS')
 
 class DevelopmentConfig(Config):
     DEBUG = True

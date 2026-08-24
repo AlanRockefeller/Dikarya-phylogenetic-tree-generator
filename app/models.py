@@ -6,6 +6,8 @@ from datetime import datetime
 from flask import current_app
 from flask_login import UserMixin
 from werkzeug.security import generate_password_hash, check_password_hash
+from sqlalchemy.ext.mutable import MutableDict, MutableList
+
 from app.extensions import db, login_manager
 
 
@@ -68,7 +70,13 @@ class Job(db.Model):
     updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
     job_dir = db.Column(db.String(512), nullable=False)
     input_type = db.Column(db.String(64), nullable=False)
-    metrics = db.Column(db.JSON, default=dict)
+    # MutableDict, not a bare db.JSON: several worker paths read `db_job.metrics`,
+    # mutate the dict in place and assign the *same object* back. SQLAlchemy
+    # compares the new value against the committed one, finds them equal (they
+    # are the same object), records no history and emits no UPDATE -- so those
+    # metrics were silently lost. Tracking mutation fixes it without touching
+    # the PostgreSQL column, which stays plain JSON.
+    metrics = db.Column(MutableDict.as_mutable(db.JSON), default=dict)
     
     user = db.relationship("User", backref=db.backref("jobs", lazy=True))
 
@@ -87,7 +95,7 @@ class ApiToken(db.Model):
     token_hash = db.Column(db.String(64), nullable=False, unique=True, index=True)
     token_prefix = db.Column(db.String(20), nullable=False)
     # JSON list of scope strings, e.g. ["jobs:read","jobs:write","tools:read","account:read"]
-    scopes = db.Column(db.JSON, nullable=False, default=list)
+    scopes = db.Column(MutableList.as_mutable(db.JSON), nullable=False, default=list)
     created_at = db.Column(db.DateTime, default=datetime.utcnow, nullable=False)
     last_used_at = db.Column(db.DateTime, nullable=True)
     revoked_at = db.Column(db.DateTime, nullable=True)
@@ -112,9 +120,17 @@ class WhatsNewEntry(db.Model):
 
 
 class WhatsNewView(db.Model):
+    """Last time a *signed-in* user opened the What's New page.
+
+    Anonymous visitors are tracked in their own session cookie instead (see
+    `main.whats_new`), so nothing writes `ip_address` any more. The column and
+    the rows already written to it are left alone: they are harmless, and
+    dropping a column is not something to do on the way past.
+    """
     __tablename__ = 'whats_new_view'
     id = db.Column(db.Integer, primary_key=True)
     user_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=True, unique=True)
+    # Legacy: written only by versions before anonymous state moved to the session.
     ip_address = db.Column(db.String(45), nullable=True, unique=True)
     last_viewed_at = db.Column(db.DateTime, default=datetime.utcnow, nullable=False)
 
@@ -141,6 +157,14 @@ class TodoSuggestion(db.Model):
 @dataclass
 class AlignmentParams:
     method: str  # "mafft", "muscle", "clustalo", "iqtree_builtin", "default"
+    # Reverse-complement sequences the aligner finds are backwards. MAFFT does
+    # this natively (--adjustdirectionaccurately); MUSCLE, Clustal Omega and
+    # IQ-TREE have no equivalent, so for those a short MAFFT pass runs first
+    # purely to decide direction. First-class rather than smuggled through
+    # `advanced_options`, for the same reason as
+    # TrimmingParams.trim_terminal_overhangs: the worker and recompute paths
+    # must model it identically.
+    fix_orientation: bool = True
     advanced_options: Dict[str, Any] = field(default_factory=dict)
 
 @dataclass

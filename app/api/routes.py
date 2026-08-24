@@ -6,6 +6,7 @@ from app.workers.queue import (
     enqueue_job,
     enqueue_recompute_job,
     get_job_status,
+    prepare_phylo_job_params,
 )
 from app.config import Config
 from app.extensions import db
@@ -14,11 +15,13 @@ import logging
 import re
 import hashlib
 import time
+import uuid
 from urllib.parse import urlsplit
 from difflib import SequenceMatcher
 from datetime import datetime
 
 from app.services.security_utils import validate_job_id, validate_safe_file_path, coerce_bool
+from app.services.tree_parameter_validation import validate_iqtree_ufboot_count
 from app.services.artifact_storage import (
     artifact_exists,
     open_artifact,
@@ -165,6 +168,7 @@ VALID_TREE_METHODS = {"nj", "raxml", "iqtree", "mrbayes", "fasttree"}
 # ownership) is read from the stored job and is not request-controlled.
 RECOMPUTE_OVERRIDABLE_FIELDS = frozenset({
     "alignment_method", "trimming_method", "trim_terminal_overhangs",
+    "fix_orientation",
     "tree_method", "tree_model",
     "bootstrap", "alrt_replicates",
     "mcmc_generations", "mcmc_nruns", "mcmc_nchains", "mcmc_burnin_fraction",
@@ -172,6 +176,18 @@ RECOMPUTE_OVERRIDABLE_FIELDS = frozenset({
     "run_preset", "bootstrap_preset", "bootstrap_cap", "enable_bootstrap",
     "start_tree_override", "moose_enabled", "early_stopping", "seed",
     "outgroup", "notes",
+})
+
+# The overridable settings that are booleans. JSON clients send these as
+# "true"/"false"/0/1 at least as often as real bools, and the override dict
+# is persisted into input_info.json verbatim -- so a stored string stays truthy
+# everywhere that does not route through coerce_bool (the v1 API's params block
+# and the viewer's Jinja template both read it raw), and the job page would
+# report a setting the worker had already coerced the other way. Normalize on
+# the way in, where the value is still a request value.
+RECOMPUTE_BOOLEAN_FIELDS = frozenset({
+    "trim_terminal_overhangs", "enable_bootstrap", "moose_enabled",
+    "early_stopping", "mcmc_stop_early", "fix_orientation",
 })
 
 # Settings the viewer's Advanced panel reads back so it can open pre-filled with
@@ -1245,7 +1261,10 @@ def fetch_genbank_locations():
     inside pasted FASTA headers.
 
     Request: { "accessions": ["OR807397", "MJ505555.1"] }
-    Response: { "status": "success", "locations": {"OR807397": "USA: Arizona, Greenlee County"}, "missing": [...] }
+    Response: { "status": "success",
+                "locations": {"OR807397": "USA: Arizona, Greenlee County"},
+                "missing": [...],      # NCBI answered; the record has no location
+                "unavailable": [...] } # NCBI could not be reached for these
     """
     data = request.get_json(silent=True) or {}
     raw_accessions = data.get("accessions", data.get("input", ""))
@@ -1266,11 +1285,15 @@ def fetch_genbank_locations():
     try:
         from app.services.genbank_location_service import lookup_locations
 
-        locations, missing = lookup_locations(accessions)
+        locations, missing, unavailable = lookup_locations(accessions)
         return jsonify({
             "status": "success",
             "locations": locations,
-            "missing": missing
+            "missing": missing,
+            # Kept separate from `missing` on purpose: "GenBank has no location
+            # for this record" and "GenBank did not answer" are different
+            # answers, and only one of them is worth retrying.
+            "unavailable": unavailable
         })
     except Exception as e:
         return _server_error(e, where="genbank_locations")
@@ -1306,6 +1329,7 @@ def gather_mycomap_sequences_for_queue(url, include_ncbi=True, include_local=Tru
     from app.services.mycomap_service import (
         fetch_mycomap_blast_metrics,
         fetch_mycomap_fasta,
+        get_mycomap_ncbi_queue_position,
         improve_mycomap_sequence_name,
         parse_mycomap_ncbi_fasta_header,
         prefer_local_mycomap_taxa,
@@ -1368,8 +1392,29 @@ def gather_mycomap_sequences_for_queue(url, include_ncbi=True, include_local=Tru
     logger.info(
         f"Mycomap helper: blast_id={blast_id} (ncbi={include_ncbi}, local={include_local}) url={url}"
     )
+    ncbi_queue_position = (
+        get_mycomap_ncbi_queue_position(url) if include_ncbi else None
+    )
+    ncbi_queued = ncbi_queue_position is not None
+    if ncbi_queued:
+        logger.info(
+            "event=mycomap.ncbi_queued blast_id=%s position=%s",
+            blast_id, ncbi_queue_position,
+        )
+        if not include_local:
+            return None, ({
+                "status": "pending",
+                "error": (
+                    "MycoMap's NCBI results are still waiting in its BLAST queue "
+                    f"at position {ncbi_queue_position}. Try this import again "
+                    "after the queue advances, or include local MycoBLAST results now."
+                ),
+                "ncbi_queue_position": ncbi_queue_position,
+                "retryable": True,
+            }, 409)
     result = fetch_mycomap_fasta(
-        blast_id, include_ncbi, include_local, time_budget=fetch_time_budget
+        blast_id, include_ncbi and not ncbi_queued, include_local,
+        time_budget=fetch_time_budget
     )
 
     if result['errors'] and not result['fasta_content']:
@@ -1575,10 +1620,18 @@ def gather_mycomap_sequences_for_queue(url, include_ncbi=True, include_local=Tru
 
     parts = []
     if include_ncbi:
-        parts.append(f"{result['ncbi_count']} NCBI")
+        parts.append(
+            "NCBI queued" if ncbi_queued else f"{result['ncbi_count']} NCBI"
+        )
     if include_local:
         parts.append(f"{result['local_count']} local")
     msg = f"Fetched {' + '.join(parts)} sequences from Mycomap"
+    if ncbi_queued:
+        msg += (
+            f" -- MycoMap reports the NCBI search is still at queue position "
+            f"{ncbi_queue_position}; local results were imported now without "
+            "treating the pending NCBI export as a failure."
+        )
     if dropped_count > 0:
         msg += f" ({dropped_count} dropped due to invalid/short sequences)"
     if contaminant_dropped_count > 0:
@@ -1607,6 +1660,8 @@ def gather_mycomap_sequences_for_queue(url, include_ncbi=True, include_local=Tru
         "ncbi_count": result['ncbi_count'],
         "local_count": result['local_count'],
         "failed_sources": failed_sources,
+        "pending_sources": ["ncbi"] if ncbi_queued else [],
+        "ncbi_queue_position": ncbi_queue_position,
         "blast_metrics_count": metrics_attached_count,
         "conflicting_local_count": conflicting_local_dropped_count,
         "duplicate_observation_count": duplicate_observation_count,
@@ -2068,6 +2123,18 @@ def inaturalist_tree_batch():
         return _server_error(e, where="inaturalist_tree_batch")
 
 
+def _inaturalist_result_message(message, result):
+    """Append an explicit note when the search stopped before it finished."""
+    if not result.get('timed_out'):
+        return message
+    total = result.get('total_available') or 0
+    return (
+        f"{message}. This search was still running when it hit its time limit, "
+        f"so these are partial results out of {total} matching observation(s) -- "
+        f"narrow the search (by taxon, place or date) to see the rest."
+    )
+
+
 @bp.route('/inaturalist', methods=['POST'])
 @limiter.limit("40 per minute; 600 per hour")
 def fetch_inaturalist():
@@ -2112,6 +2179,7 @@ def fetch_inaturalist():
     
     try:
         from app.services.inaturalist_service import (
+            INTERACTIVE_FETCH_BUDGET_SECONDS,
             validate_inaturalist_url,
             fetch_inaturalist_data
         )
@@ -2129,8 +2197,12 @@ def fetch_inaturalist():
         logger.info(f"iNaturalist API: Processing URL type={url_info['type']}, action={action}")
         
         if action == 'analyze':
-            # Fetch and analyze observations (default mode='all' gets both ITS and PSN stats)
-            result = fetch_inaturalist_data(url, mode='all')
+            # Fetch and analyze observations (default mode='all' gets both ITS and PSN stats).
+            # This runs inside a request, so pagination gets a wall-clock budget
+            # and reports partial results rather than holding the slot for the
+            # full 50-page walk of each query.
+            result = fetch_inaturalist_data(
+                url, mode='all', time_budget=INTERACTIVE_FETCH_BUDGET_SECONDS)
 
             # Return analysis without full sequences
             # Defensive: check sequences list exists and has items before accessing
@@ -2162,20 +2234,29 @@ def fetch_inaturalist():
                 "sequence": seq if can_blast else None,
                 "mycomap_blast_url": result.get('mycomap_blast_url') if is_single_url else None,
                 "truncated": result.get('truncated', False),
+                "timed_out": result.get('timed_out', False),
                 "total_available": result.get('total_available', 0),
-                "message": f"Found {result['dna_count']} observation(s) with DNA Barcode ITS"
+                "message": _inaturalist_result_message(
+                    f"Found {result['dna_count']} observation(s) with DNA Barcode ITS",
+                    result,
+                )
             })
         else:
             # Optimize: Only fetch ITS sequences for queue adding (skip PSN stats)
-            result = fetch_inaturalist_data(url, mode='its_only')
+            result = fetch_inaturalist_data(
+                url, mode='its_only', time_budget=INTERACTIVE_FETCH_BUDGET_SECONDS)
             
             # Return full sequences for queue
             return jsonify({
                 "status": "success",
                 "sequences": result['sequences'],
                 "truncated": result.get('truncated', False),
+                "timed_out": result.get('timed_out', False),
                 "total_available": result.get('total_available', 0),
-                "message": f"Fetched {len(result['sequences'])} DNA sequences from iNaturalist"
+                "message": _inaturalist_result_message(
+                    f"Fetched {len(result['sequences'])} DNA sequences from iNaturalist",
+                    result,
+                )
             })
         
     except ValueError as e:
@@ -2280,6 +2361,9 @@ def create_job():
         "alignment_method": data.get("alignment_method", "default"),
         "trimming_method": data.get("trimming_method", Config.DEFAULT_TRIMMING_METHOD),
         "trim_terminal_overhangs": coerce_bool(data.get("trim_terminal_overhangs"), True)[0],
+        # Defaults true, so the One-Click paths -- which never send it -- keep
+        # the direction correction they have always had via MAFFT.
+        "fix_orientation": coerce_bool(data.get("fix_orientation"), True)[0],
         "its_region": normalize_its_region(data.get("its_region")),
         "its_min_length": resolve_its_min_length(
             normalize_its_region(data.get("its_region")), data.get("its_min_length")
@@ -2371,7 +2455,16 @@ def create_job():
             return default
         return max(lo, min(hi, n))
 
-    job_params["bootstrap"] = _clamp_int(job_params.get("bootstrap"), 1000, 0, 10_000)
+    try:
+        requested_bootstrap = job_params.get("bootstrap")
+        if requested_bootstrap is None:
+            requested_bootstrap = 1000
+        requested_bootstrap = validate_iqtree_ufboot_count(
+            tree_method, requested_bootstrap
+        )
+    except ValueError as exc:
+        return jsonify({"status": "error", "error": str(exc)}), 400
+    job_params["bootstrap"] = _clamp_int(requested_bootstrap, 1000, 0, 10_000)
     job_params["mcmc_generations"] = _clamp_int(
         job_params.get("mcmc_generations"),
         Config.DEFAULT_MCMC_GENERATIONS, 1_000, 100_000_000
@@ -2380,6 +2473,15 @@ def create_job():
         job_params.get("mcmc_nruns"), Config.DEFAULT_MCMC_NRNS, 1, 8)
     job_params["mcmc_nchains"] = _clamp_int(
         job_params.get("mcmc_nchains"), Config.DEFAULT_MCMC_CHAINS, 1, 16)
+    # DEFAULT_MCMC_GENERATIONS is a ceiling the stop rule is expected to end the
+    # run well short of, and the stop rule needs two independent runs. A caller
+    # who asks for one run and names no generation count would otherwise inherit
+    # the ceiling as a full-length run -- 5x the work, no early exit, on a worker
+    # that runs one job at a time. Only the unrequested default is reduced.
+    if (tree_method == "mrbayes"
+            and data.get("mcmc_generations") in (None, "")
+            and not (job_params["mcmc_stop_early"] and job_params["mcmc_nruns"] > 1)):
+        job_params["mcmc_generations"] = Config.DEFAULT_MCMC_GENERATIONS_FIXED_RUN
     job_params["mcmc_burnin_fraction"] = _clamp_float(
         job_params.get("mcmc_burnin_fraction"),
         Config.DEFAULT_MCMC_BURNIN_FRACTION, 0.0, 0.99
@@ -2405,43 +2507,71 @@ def create_job():
         except ValueError as e:
             return jsonify({"status": "error", "error": str(e)}), 400
 
+    # Apply the same submission-wide dedup/warning logic enqueue_job normally
+    # owns before persisting, then enqueue with that preparation disabled. This
+    # preserves the observable params while ensuring RQ cannot run first.
+    prepare_phylo_job_params(job_params)
+    job_id = str(uuid.uuid4())
+    job_record = Job(
+        id=job_id,
+        status="queued",
+        job_dir=str(Config.JOB_DIR / job_id),
+        input_type=job_params["input_type"],
+        metrics={
+            "tree_method": job_params["tree_method"],
+            "notes": job_params["notes"],
+            "alignment_method": job_params["alignment_method"],
+            "trimming_method": job_params["trimming_method"],
+            "trim_terminal_overhangs": job_params["trim_terminal_overhangs"],
+            "fix_orientation": job_params["fix_orientation"],
+            "its_region": job_params.get("its_region"),
+            "run_preset": job_params.get("run_preset"),
+            "bootstrap_cap": job_params.get("bootstrap_cap"),
+            # Set by enqueue_job when the submitted set cannot yield an
+            # informative tree. Kept on the record so the warning is still
+            # there when the user opens the finished job.
+            "input_warnings": job_params.get("input_warnings") or [],
+        }
+    )
+
+    if current_user.is_authenticated:
+        job_record.user_id = current_user.id
+
     try:
-        job_id = enqueue_job(job_params)
-        
-        # Create DB record
-        job_record = Job(
-            id=job_id,
-            status="queued",
-            job_dir=str(Config.JOB_DIR / job_id),
-            input_type=job_params["input_type"],
-            metrics={
-                "tree_method": job_params["tree_method"],
-                "notes": job_params["notes"],
-                "alignment_method": job_params["alignment_method"],
-                "trimming_method": job_params["trimming_method"],
-                "trim_terminal_overhangs": job_params["trim_terminal_overhangs"],
-                "its_region": job_params.get("its_region"),
-                "run_preset": job_params.get("run_preset"),
-                "bootstrap_cap": job_params.get("bootstrap_cap"),
-                # Set by enqueue_job when the submitted set cannot yield an
-                # informative tree. Kept on the record so the warning is still
-                # there when the user opens the finished job.
-                "input_warnings": job_params.get("input_warnings") or [],
-            }
-        )
-
-        if current_user.is_authenticated:
-            job_record.user_id = current_user.id
-
         db.session.add(job_record)
         db.session.commit()
+    except Exception as e:
+        db.session.rollback()
+        return _server_error(e, where="create_job.persist")
 
+    try:
+        enqueue_job(job_params, job_id=job_id, prepare=False)
         response = {"status": "queued", "job_id": job_id}
         if job_params.get("input_warnings"):
             response["warnings"] = job_params["input_warnings"]
         return jsonify(response), 202
     except Exception as e:
-        return _server_error(e)
+        logger.exception(
+            "event=web.enqueue_failed job=%s could not be queued after its DB "
+            "row was committed", job_id,
+        )
+        try:
+            job_record.status = "failed"
+            metrics = dict(job_record.metrics or {})
+            metrics["error"] = (
+                "This job could not be added to the processing queue and was "
+                "never started. Please submit it again."
+            )
+            metrics["enqueue_error"] = type(e).__name__
+            metrics["failed_at"] = datetime.utcnow().isoformat()
+            job_record.metrics = metrics
+            db.session.commit()
+        except Exception:
+            db.session.rollback()
+            logger.exception(
+                "event=web.enqueue_failure_unrecorded job=%s", job_id,
+            )
+        return _server_error(e, where="create_job.enqueue")
 
 @bp.route('/job/<job_id>/status', methods=['GET'])
 def get_job_status_route(job_id):
@@ -3055,7 +3185,8 @@ def rebuild_with_duplicates(job_id):
         )
         job_params["rebuilt_from_job_id"] = job_id
 
-        new_job_id = enqueue_job(job_params)
+        prepare_phylo_job_params(job_params)
+        new_job_id = str(uuid.uuid4())
         new_record = Job(
             id=new_job_id,
             status="queued",
@@ -3075,6 +3206,20 @@ def rebuild_with_duplicates(job_id):
             new_record.user_id = current_user.id
         db.session.add(new_record)
         db.session.commit()
+        try:
+            enqueue_job(job_params, job_id=new_job_id, prepare=False)
+        except Exception as exc:
+            new_record.status = "failed"
+            failed_metrics = dict(new_record.metrics or {})
+            failed_metrics["error"] = (
+                "This rebuild could not be added to the processing queue and "
+                "was never started. Please try again."
+            )
+            failed_metrics["enqueue_error"] = type(exc).__name__
+            failed_metrics["failed_at"] = datetime.utcnow().isoformat()
+            new_record.metrics = failed_metrics
+            db.session.commit()
+            raise
 
         return jsonify({
             "status": "queued",
@@ -3112,6 +3257,13 @@ def get_job_pipeline_params(job_id):
         return jsonify({"status": "error", "error": "Job parameters could not be read"}), 500
 
     params = {key: stored.get(key) for key in RECOMPUTE_READABLE_FIELDS if key in stored}
+
+    # Same normalization the recompute endpoint now applies on the way in, for
+    # jobs whose params were stored before it did. The Advanced panel checks
+    # these boxes on truthiness, and the string "false" is truthy.
+    for key in RECOMPUTE_BOOLEAN_FIELDS:
+        if key in params:
+            params[key], _ = coerce_bool(params[key], default=False)
 
     # A MrBayes job stored before mcmc_stop_early existed did not use the
     # convergence stop rule, so report it as off rather than leaving the key
@@ -3172,6 +3324,12 @@ def recompute_tree_job(job_id):
             key: value for key, value in req_data.items()
             if key in RECOMPUTE_OVERRIDABLE_FIELDS
         }
+        for key in RECOMPUTE_BOOLEAN_FIELDS:
+            if key in overrides:
+                # An unparseable value keeps whatever the job already had rather
+                # than inventing a default the user never asked for.
+                current, _ = coerce_bool(params_dict.get(key), default=False)
+                overrides[key], _ = coerce_bool(overrides[key], default=current)
         if overrides:
             method = str(overrides.get("tree_method", params_dict.get("tree_method", "")) or "").lower()
             if "tree_method" in overrides and method not in VALID_TREE_METHODS:
@@ -3180,6 +3338,12 @@ def recompute_tree_job(job_id):
                     "error": f"Unsupported tree method. Choose one of: {', '.join(sorted(VALID_TREE_METHODS))}"
                 }), 400
             params_dict.update(overrides)
+        try:
+            params_dict["bootstrap"] = validate_iqtree_ufboot_count(
+                params_dict.get("tree_method"), params_dict.get("bootstrap", 1000)
+            )
+        except ValueError as exc:
+            return jsonify({"status": "error", "error": str(exc)}), 400
         persisted_params = dict(params_dict)
 
         # Per-request control flags, not pipeline settings. Applied after the
@@ -3890,6 +4054,7 @@ def claude_review(job_id):
         TreeAnalysisError,
         TreeAnalysisInProgress,
         TreeAnalysisNoTree,
+        TreeAnalysisRateLimited,
         TreeAnalysisUnavailable,
         TreeAnalysisUpstreamError,
         is_configured,
@@ -3918,6 +4083,10 @@ def claude_review(job_id):
         response = jsonify({"status": "error", "error": str(exc)})
         response.headers["Retry-After"] = str(exc.retry_after_seconds)
         return response, 409
+    except TreeAnalysisRateLimited as exc:
+        response = jsonify({"status": "error", "error": str(exc)})
+        response.headers["Retry-After"] = str(exc.retry_after_seconds)
+        return response, 429
     except TreeAnalysisUnavailable as exc:
         # Out of capacity or misconfigured: a retry may well succeed, so this is
         # deliberately not the same status as a dataset we cannot review at all.

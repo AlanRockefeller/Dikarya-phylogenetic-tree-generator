@@ -298,6 +298,12 @@
                 <p class="text-sm text-gray-600 dark:text-gray-300 mt-1">
                     Programmatic access for scripts and tools. All endpoints require a bearer token.
                 </p>
+                <p class="text-sm text-gray-600 dark:text-gray-300 mt-1">
+                    Source code:
+                    <a href="https://github.com/AlanRockefeller/dikarya-phylogenetic-tree-generator"
+                       target="_blank" rel="noopener"
+                       class="font-mono text-xs text-journal-gold hover:underline">github.com/AlanRockefeller/dikarya-phylogenetic-tree-generator</a>
+                </p>
             </div>
             <div class="flex flex-wrap gap-3 text-sm">
                 {% if current_user.is_authenticated %}
@@ -314,6 +320,11 @@
                 <a href="{{ url_for('api_v1.openapi_json') }}"
                    class="bg-journal-dark hover:bg-journal-green text-white px-4 py-2 rounded-lg font-semibold transition-colors flex items-center">
                     <i class="fas fa-file-code mr-2"></i>OpenAPI JSON
+                </a>
+                <a href="https://github.com/AlanRockefeller/dikarya-phylogenetic-tree-generator"
+                   target="_blank" rel="noopener"
+                   class="bg-journal-dark hover:bg-journal-green text-white px-4 py-2 rounded-lg font-semibold transition-colors flex items-center">
+                    <i class="fab fa-github mr-2"></i>Source on GitHub
                 </a>
             </div>
         </div>

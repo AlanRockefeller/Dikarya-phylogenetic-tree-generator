@@ -4,6 +4,8 @@ import logging
 import redis
 from redis.exceptions import LockError
 from rq import Queue, Retry
+from rq.exceptions import NoSuchJobError
+from rq.job import Job as RqJob
 from flask import current_app
 from typing import Any, Dict, Optional
 
@@ -12,9 +14,20 @@ QUEUE_BULK = "phylo_bulk"
 VALID_QUEUE_NAMES = {QUEUE_HIGH, QUEUE_BULK}
 logger = logging.getLogger(__name__)
 
+# Bound the TCP connect only. Without this, a Redis host that accepts no
+# connections (down, firewalled, wrong address) blocks the caller for the OS
+# connect timeout -- minutes -- and every one of those callers is holding one of
+# the site's finite Gunicorn request slots while it waits. `socket_timeout` is
+# deliberately NOT set: it applies to reads too, and the SSE endpoints park on a
+# blocking pubsub read for the whole life of a stream.
+REDIS_CONNECT_TIMEOUT_SECONDS = 5
+
+
 def get_redis_connection():
     redis_url = current_app.config.get('REDIS_URL', 'redis://localhost:6379/0')
-    return redis.from_url(redis_url)
+    return redis.from_url(
+        redis_url, socket_connect_timeout=REDIS_CONNECT_TIMEOUT_SECONDS
+    )
 
 def get_queue(name=QUEUE_HIGH) -> Queue:
     if name not in VALID_QUEUE_NAMES:
@@ -77,11 +90,8 @@ def safe_job_description(kind: str, job_params: Optional[Dict[str, Any]] = None,
     return " ".join(str(part) for part in parts)[:200]
 
 
-def enqueue_job(job_params: Dict[str, Any], queue_name: str = QUEUE_HIGH,
-                meta: Optional[Dict[str, Any]] = None,
-                job_id: Optional[str] = None,
-                job_timeout: Any = None) -> str:
-    """Enqueue a phylo analysis job and return the job ID."""
+def prepare_phylo_job_params(job_params: Dict[str, Any]) -> None:
+    """Apply submission-wide normalization before persistence or enqueueing."""
     # Collapse near-identical records that share an observation number. This
     # lives here rather than in each caller so every job-creation path gets it
     # (web /tree, API v1, iNaturalist auto-tree, Mushroom Observer) instead of
@@ -102,6 +112,16 @@ def enqueue_job(job_params: Dict[str, Any], queue_name: str = QUEUE_HIGH,
     )
     if input_warnings:
         job_params["input_warnings"] = input_warnings
+
+
+def enqueue_job(job_params: Dict[str, Any], queue_name: str = QUEUE_HIGH,
+                meta: Optional[Dict[str, Any]] = None,
+                job_id: Optional[str] = None,
+                job_timeout: Any = None,
+                prepare: bool = True) -> str:
+    """Enqueue a phylo analysis job and return the job ID."""
+    if prepare:
+        prepare_phylo_job_params(job_params)
 
     if job_timeout is None:
         job_timeout = resolve_job_timeout(job_params)
@@ -246,10 +266,9 @@ def active_recompute_snapshot_mtime(job_id: str):
 def get_job_status(job_id: str) -> Dict[str, Any]:
     """Return a dict with at least: id, status, error (optional), progress (optional)."""
     try:
-        q = get_queue()
-        job = q.fetch_job(job_id)
-        
-        if job is None:
+        try:
+            job = RqJob.fetch(job_id, connection=get_redis_connection())
+        except NoSuchJobError:
             return {"id": job_id, "status": "unknown", "error": "Job not found"}
         
         status = job.get_status()
@@ -265,12 +284,15 @@ def get_job_status(job_id: str) -> Dict[str, Any]:
             "ended_at": job.ended_at.isoformat() if job.ended_at else None,
         }
         
-        if status == "failed" and job.exc_info:
-            response["error"] = job.exc_info
+        if status == "failed":
+            # exc_info is a complete traceback and can contain paths, source
+            # names, submitted sequences, and secrets. Detailed diagnostics
+            # remain in server-side logs and the persisted job metrics.
+            response["error"] = "Job failed"
             
         # RQ stores a Retry marker as the result while a job waits to be
         # scheduled again. It is internal state and cannot be JSON encoded.
-        if result and not isinstance(result, Retry):
+        if status != "failed" and result and not isinstance(result, Retry):
             response["result"] = result
             
         return response
@@ -282,4 +304,4 @@ def get_job_status(job_id: str) -> Dict[str, Any]:
             "RQ status lookup failed; returning the existing error response",
             job_id=job_id, exception=type(e).__name__,
         )
-        return {"id": job_id, "status": "error", "error": str(e)}
+        return {"id": job_id, "status": "error", "error": "Job status unavailable"}

@@ -30,6 +30,19 @@ RATE_LIMIT_DELAY = 1.0  # seconds between requests
 MAX_PER_PAGE = 200  # iNaturalist max per_page value
 MAX_OBSERVATIONS = 10000  # API pagination limit
 
+# Wall-clock budget for a paginated search made from inside a web request.
+#
+# A full walk is up to 50 pages per field query, each page costing an upstream
+# round trip plus the 1s courtesy delay, and an `analyze` runs two such queries
+# -- several minutes of one Gunicorn slot (of eight) for a single click, with
+# nginx having given up at 300s long before. Passing a budget makes the fetch
+# return what it has, flagged as incomplete, instead of holding the slot.
+#
+# Background/worker callers pass `time_budget=None` and still walk the whole
+# result set: there is no request to keep alive there, and a truncated tree is
+# a worse outcome than a slow one.
+INTERACTIVE_FETCH_BUDGET_SECONDS = 45
+
 # Valid IUPAC nucleotide characters (DNA + ambiguity codes + gap)
 VALID_DNA_CHARS = set('ATGCYRWSKMNatgcyrwskmn-')
 
@@ -355,10 +368,10 @@ def build_base_params(query_params: Dict[str, List[str]]) -> Dict[str, Any]:
         if key in allowed_params or key.startswith('field:'):
             # Sanitize values - no script injection
             safe_values = [re.sub(r'[<>]', '', str(v)) for v in values]
-            # Use empty string for blank values (e.g. field:Name=) to mean "must be present"
+            # A blank value (e.g. field:Name=) is passed through as "" rather
+            # than dropped: to iNaturalist that means "the field must be
+            # present", which is not the same query as omitting it.
             val = safe_values[0] if len(safe_values) == 1 else safe_values
-            if val == "": 
-                 val = "" # Explicitly keep empty string value
             base_params[key] = val
             
     # Default required params
@@ -369,16 +382,22 @@ def build_base_params(query_params: Dict[str, List[str]]) -> Dict[str, Any]:
     return base_params
 
 
-def fetch_observations_with_field_filter(base_params: Dict, field_name: str) -> Dict:
+def fetch_observations_with_field_filter(base_params: Dict, field_name: str,
+                                         deadline: Optional[float] = None) -> Dict:
     """
     Fetch observations enforcing a specific observation field filter.
     
     Args:
         base_params: Base query parameters
         field_name: Name of the field to enforce (e.g. 'DNA Barcode ITS')
+        deadline: Optional time.monotonic() value past which pagination stops
+            and returns what it has. None means walk the whole result set.
         
     Returns:
-        Dict with 'observations', 'truncated', 'total_available'
+        Dict with 'observations', 'fetched_count', 'truncated', 'timed_out',
+        'total_available'. 'timed_out' is True only when the deadline cut the
+        walk short, so a caller can say "partial results" rather than presenting
+        them as the complete answer.
     """
     # Strip any existing field: parameters to avoid intersection/conflict
     # We want these queries to be independent based on the base filters (taxon, place, etc.)
@@ -389,10 +408,20 @@ def fetch_observations_with_field_filter(base_params: Dict, field_name: str) -> 
     
     all_observations = []
     page = 1
+    timed_out = False
+    total_results = 0
     
     logger.info(f"Fetching observations with field '{field_name}' (params: {list(params.keys())})")
     
     while True:
+        if deadline is not None and time.monotonic() >= deadline:
+            timed_out = True
+            logger.warning(
+                "event=inaturalist.fetch_truncated Time budget spent after "
+                "%s page(s) for '%s'; returning %s of %s observations",
+                page - 1, field_name, len(all_observations), total_results,
+            )
+            break
         params['page'] = page
         query_string = urllib.parse.urlencode(params, doseq=True)
         url = f"{INATURALIST_API_BASE}/observations?{query_string}"
@@ -417,7 +446,9 @@ def fetch_observations_with_field_filter(base_params: Dict, field_name: str) -> 
         page += 1
         time.sleep(RATE_LIMIT_DELAY)
         
-    truncated = len(all_observations) >= MAX_OBSERVATIONS and len(all_observations) < total_results
+    truncated = len(all_observations) < total_results and (
+        timed_out or len(all_observations) >= MAX_OBSERVATIONS
+    )
     
     logger.info(f"Fetched {len(all_observations)} observations for '{field_name}' (total_available={total_results})")
     
@@ -425,6 +456,7 @@ def fetch_observations_with_field_filter(base_params: Dict, field_name: str) -> 
         'observations': all_observations,
         'fetched_count': len(all_observations),
         'truncated': truncated,
+        'timed_out': timed_out,
         'total_available': total_results
     }
 
@@ -570,7 +602,8 @@ def extract_sequences_from_observations(dna_observations: List[Dict]) -> List[Di
     return sequences
 
 
-def fetch_inaturalist_data(url: str, mode: str = 'all') -> Dict:
+def fetch_inaturalist_data(url: str, mode: str = 'all',
+                           time_budget: Optional[float] = None) -> Dict:
     """
     Main entry point: validate URL and fetch/analyze observations.
     
@@ -578,6 +611,12 @@ def fetch_inaturalist_data(url: str, mode: str = 'all') -> Dict:
         url: iNaturalist URL (observation or search)
         mode: 'all' (default) to fetch both ITS and PSN data (for analysis),
               or 'its_only' to fetch only ITS sequences (for adding to queue).
+        time_budget: Seconds of wall clock the paginated search may spend in
+              total, shared across the ITS and PSN queries. Callers running
+              inside a web request must pass one (see
+              INTERACTIVE_FETCH_BUDGET_SECONDS); background callers leave it
+              None to fetch everything. When the budget runs out the result is
+              returned with 'truncated' and 'timed_out' set.
         
     Returns:
         Dict with analysis results and extracted sequences
@@ -605,8 +644,11 @@ def fetch_inaturalist_data(url: str, mode: str = 'all') -> Dict:
         'sequences': [],
         'is_single': url_info['type'] == 'single_observation',
         'truncated': False,
+        'timed_out': False,
         'total_available': 0
     }
+
+    deadline = None if time_budget is None else time.monotonic() + time_budget
     
     if url_info['type'] == 'single_observation':
         # Single observation: fetch once, analyze for both
@@ -640,7 +682,8 @@ def fetch_inaturalist_data(url: str, mode: str = 'all') -> Dict:
         base_params = build_base_params(url_info.get('query_params', {}))
         
         # 1. Fetch ITS observations (needed in all modes)
-        its_result = fetch_observations_with_field_filter(base_params, "DNA Barcode ITS")
+        its_result = fetch_observations_with_field_filter(
+            base_params, "DNA Barcode ITS", deadline=deadline)
         its_obs = its_result['observations']
         
         # Analyze ITS results
@@ -656,12 +699,14 @@ def fetch_inaturalist_data(url: str, mode: str = 'all') -> Dict:
             'dna_observations': its_analysis['dna_observations'],
             'sequences': sequences,
             'truncated': its_result['truncated'],
+            'timed_out': its_result.get('timed_out', False),
             'total_available': its_result['total_available']
         })
 
         # 2. Fetch PSN observations (only if mode is 'all')
         if mode == 'all':
-            psn_result = fetch_observations_with_field_filter(base_params, "Provisional Species Name")
+            psn_result = fetch_observations_with_field_filter(
+                base_params, "Provisional Species Name", deadline=deadline)
             psn_obs = psn_result['observations']
             psn_histogram = analyze_provisional_species(psn_obs)
             
@@ -671,6 +716,8 @@ def fetch_inaturalist_data(url: str, mode: str = 'all') -> Dict:
                 'provisional_species': psn_histogram,
                 # Update truncated status to reflect if ANY query was truncated
                 'truncated': its_result['truncated'] or psn_result['truncated'],
+                'timed_out': (its_result.get('timed_out', False)
+                              or psn_result.get('timed_out', False)),
                  # Update total available to be the max of either query
                 'total_available': max(its_result['total_available'], psn_result['total_available'])
             })

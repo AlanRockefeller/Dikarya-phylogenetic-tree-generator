@@ -1121,6 +1121,19 @@
             <p class="text-xs text-gray-500 dark:text-gray-400 mt-1">
                 Choose the algorithm for multiple sequence alignment.
             </p>
+            <label id="fix_orientation_row" for="fix_orientation"
+                class="mt-4 flex items-start gap-3 text-sm text-gray-700 dark:text-gray-200">
+                <input type="checkbox" id="fix_orientation" checked
+                    class="mt-1 w-4 h-4 text-journal-gold border-gray-300 rounded focus:ring-journal-gold">
+                <span>
+                    <span class="font-medium">Fix sequence orientation</span>
+                    <span class="block text-xs text-gray-500 dark:text-gray-400 mt-1"
+                        id="fix_orientation_help">
+                        Reverse-complement any sequence that was submitted backwards. A single
+                        reversed sequence is enough to wreck an alignment and the tree built from it.
+                    </span>
+                </span>
+            </label>
         </div>
 
         <!-- Trimming Method -->
@@ -1171,7 +1184,8 @@
                 <span>
                     <span class="font-medium">Trim terminal overhangs</span>
                     <span class="block text-xs text-gray-500 dark:text-gray-400 mt-1">
-                        Remove low-coverage alignment ends before tree building.
+                        Remove low-coverage alignment ends before the selected trimmer and tree builder.
+                        Terminal runs of unknown bases (N) do not count as genuine coverage.
                     </span>
                 </span>
             </label>
@@ -1401,7 +1415,7 @@
         <div id="mrbayes_options" class="mt-6 hidden">
             <div class="grid grid-cols-1 md:grid-cols-4 gap-4">
                 <div>
-                    <label for="mb_gen" class="block text-sm font-medium text-gray-700 dark:text-gray-200 mb-2">
+                    <label for="mb_gen" id="mb_gen_label" class="block text-sm font-medium text-gray-700 dark:text-gray-200 mb-2">
                         Maximum generations
                     </label>
                     <input type="number" id="mb_gen" value="1000000" step="1000" class="w-full px-4 py-3 border border-gray-300 dark:border-journal-dark rounded-lg
@@ -1994,6 +2008,7 @@
     async function fetchGenBankLocations(accessions) {
         const csrfToken = document.querySelector('meta[name="csrf-token"]').getAttribute('content');
         const locations = {};
+        const unavailable = [];
 
         // The endpoint caps each request at 200 accessions; a large FASTA paste can
         // exceed that, so ask in batches rather than failing the whole lookup.
@@ -2013,9 +2028,12 @@
                 throw httpError(resp, data.error || 'GenBank location lookup failed');
             }
             Object.assign(locations, data.locations || {});
+            // Accessions GenBank could not be asked about (a failed batch), as
+            // opposed to records that genuinely carry no collection site.
+            (data.unavailable || []).forEach(accession => unavailable.push(accession));
         }
 
-        return locations;
+        return { locations, unavailable };
     }
 
     // Alan 8/10/26 - Append the location to the header text only. Writing seq.location
@@ -2047,8 +2065,11 @@
         if (accessions.length === 0) return '';
 
         let locations;
+        let unavailable = [];
         try {
-            locations = await fetchGenBankLocations(accessions);
+            const result = await fetchGenBankLocations(accessions);
+            locations = result.locations;
+            unavailable = result.unavailable;
         } catch (e) {
             reportWorkflowFailure('tree_builder.genbank_locations', e);
             return ` Location lookup failed: ${e.message}`;
@@ -2065,9 +2086,12 @@
             }
         });
 
-        if (applied === 0) return ' No GenBank locations were available.';
-        if (applied < sequences.length) return ` Locations added for ${applied} of ${sequences.length}.`;
-        return ' Locations added.';
+        const note = unavailable.length
+            ? ` GenBank could not be reached for ${unavailable.length} accession${unavailable.length === 1 ? '' : 's'}, so their locations are unknown -- try again to add them.`
+            : '';
+        if (applied === 0) return ` No GenBank locations were added.${note}`;
+        if (applied < sequences.length) return ` Locations added for ${applied} of ${sequences.length}.${note}`;
+        return ` Locations added.${note}`;
     }
 
     function countDetectedInputItems(text) {
@@ -3997,6 +4021,11 @@
     // MrBayes: generations is a maximum whenever the convergence stop rule is
     // on, so these defaults must match Config.DEFAULT_MCMC_* on the server.
     const MB_DEFAULT_MAX_GENERATIONS = 1000000;
+    // What a run that cannot stop itself gets instead. The ceiling above is
+    // only reasonable because the stop rule is expected to end the run well
+    // before it; without one, the ceiling is simply the full length of the run.
+    // Mirrors Config.DEFAULT_MCMC_GENERATIONS_FIXED_RUN.
+    const MB_DEFAULT_FIXED_RUN_GENERATIONS = 200000;
     const mbStopEarly = document.getElementById('mb_stop_early');
     const mbStopEarlyHelp = document.getElementById('mb_stop_early_help');
     const MB_STOP_EARLY_HELP_DEFAULT = mbStopEarlyHelp ? mbStopEarlyHelp.innerHTML : '';
@@ -4020,6 +4049,24 @@
                 : MB_STOP_EARLY_HELP_SINGLE_RUN;
         }
         mbStopEarly.closest('label')?.classList.toggle('opacity-60', !supported);
+        syncMrBayesGenerationsDefault();
+    }
+
+    /** Keep the generations field honest about what it means. With the stop
+     *  rule on it is a ceiling the run is expected to duck under; with it off
+     *  it is the full length of the run, so leaving the ceiling default there
+     *  would silently request 5x the work with no way to finish early. A value
+     *  the user typed themselves is never overwritten. */
+    function syncMrBayesGenerationsDefault() {
+        const mbGen = document.getElementById('mb_gen');
+        if (!mbGen) return;
+        const stopRule = mbStopEarlyValue();
+        const label = document.getElementById('mb_gen_label');
+        if (label) label.textContent = stopRule ? 'Maximum generations' : 'Generations';
+        if (mbGen.dataset.userEdited === '1') return;
+        mbGen.value = stopRule
+            ? MB_DEFAULT_MAX_GENERATIONS
+            : MB_DEFAULT_FIXED_RUN_GENERATIONS;
     }
 
     /** What the form is actually asking the server for. */
@@ -4085,6 +4132,32 @@
         } else {
             advancedCurrentSummary.textContent = `Currently: ${alignment} + ${treeMethod}, ${terminalTrim}, ${rooting}, ${bootstrap} bootstrap.`;
         }
+    }
+
+    // The orientation fix is available for every aligner, but it is delivered
+    // two different ways: MAFFT has --adjustdirectionaccurately built in, while
+    // MUSCLE and Clustal Omega are direction-blind and need a short MAFFT pass
+    // run ahead of them. 'None' is excluded outright -- that option asserts the
+    // input is already aligned, and flipping one row of an alignment would
+    // destroy the column correspondence. The One-Click buttons never read this
+    // control; they post no fix_orientation and the server defaults it on.
+    function updateOrientationVisibility() {
+        const row = document.getElementById('fix_orientation_row');
+        const help = document.getElementById('fix_orientation_help');
+        const box = document.getElementById('fix_orientation');
+        if (!row || !help || !box) return;
+
+        const aligner = document.getElementById('alignment_method')?.value || 'mafft';
+        row.classList.toggle('hidden', aligner === 'none');
+
+        help.textContent = aligner === 'mafft'
+            ? 'Reverse-complement any sequence that was submitted backwards, using MAFFT\u2019s '
+              + 'built-in direction check. A single reversed sequence is enough to wreck an '
+              + 'alignment and the tree built from it.'
+            : 'Reverse-complement any sequence that was submitted backwards. '
+              + aligner.toUpperCase().replace('CLUSTALO', 'Clustal Omega')
+              + ' cannot detect direction on its own, so a short MAFFT pass runs first to '
+              + 'decide it. A single reversed sequence is enough to wreck an alignment.';
     }
 
     function updateForm() {
@@ -4191,7 +4264,7 @@
         e.target.dataset.userEdited = '1';
         refreshAdvancedSummary();
     });
-    ['alignment_method', 'trimming_method', 'trim_terminal_overhangs', 'its_region', 'its_min_length',
+    ['alignment_method', 'trimming_method', 'trim_terminal_overhangs', 'fix_orientation', 'its_region', 'its_min_length',
         'tree_model', 'bootstrap', 'outgroup_select',
         'mb_gen', 'mb_runs', 'mb_chains', 'mb_burnin', 'mb_stop_early'].forEach(id => {
         document.getElementById(id)?.addEventListener('input', refreshAdvancedSummary);
@@ -4204,8 +4277,15 @@
             refreshAdvancedSummary();
         });
     });
+    // A generation count the user typed is theirs; the default follows the
+    // stop rule, a typed value never does.
+    document.getElementById('mb_gen')?.addEventListener('input', (e) => {
+        e.target.dataset.userEdited = '1';
+    });
     mbStopEarly?.addEventListener('change', () => {
         if (!mbStopEarly.disabled) mbStopEarly.dataset.choice = mbStopEarly.checked ? '1' : '0';
+        syncMrBayesGenerationsDefault();
+        refreshAdvancedSummary();
     });
     updateMrBayesStopEarlyState();
 
@@ -4376,8 +4456,11 @@
         refreshAdvancedSummary();
     });
 
+    document.getElementById('alignment_method')?.addEventListener('change', updateOrientationVisibility);
+
     // Init initial state
     updateForm();
+    updateOrientationVisibility();
     // Re-run population when queue changes?
     // Hooked into updateQueueDisplay directly now.
 
@@ -4428,6 +4511,7 @@
             alignment_method: document.getElementById('alignment_method').value,
             trimming_method: document.getElementById('trimming_method').value,
             trim_terminal_overhangs: document.getElementById('trim_terminal_overhangs').checked,
+            fix_orientation: document.getElementById('fix_orientation')?.checked ?? true,
             its_region: document.getElementById('its_region')?.value || 'none',
             its_min_length: parseInt(document.getElementById('its_min_length')?.value, 10) || undefined,
             tree_method: treeMethodSelect.value,
@@ -4640,6 +4724,10 @@
         setFieldValue('alignment_method', p.alignment_method);
         setFieldValue('trimming_method', p.trimming_method);
         setFieldValue('trim_terminal_overhangs', p.trim_terminal_overhangs);
+        // Older jobs predate the setting and stored nothing; they ran with the
+        // correction on, so absent must read as checked rather than unchecked.
+        setFieldValue('fix_orientation', p.fix_orientation !== false);
+        updateOrientationVisibility();
         setFieldValue('tree_method', p.tree_method);
 
         // Show the right per-method controls before filling them in; updateForm
@@ -4666,6 +4754,12 @@
         }
 
         setFieldValue('mb_gen', p.mcmc_generations);
+        if (p.mcmc_generations !== undefined && p.mcmc_generations !== null) {
+            // What this job actually ran with. Stop the stop-rule default from
+            // overwriting it a few lines below.
+            const mbGenInput = document.getElementById('mb_gen');
+            if (mbGenInput) mbGenInput.dataset.userEdited = '1';
+        }
         setFieldValue('mb_runs', p.mcmc_nruns);
         setFieldValue('mb_chains', p.mcmc_nchains);
         if (p.mcmc_burnin_fraction !== undefined && p.mcmc_burnin_fraction !== null) {
@@ -4718,6 +4812,7 @@
             alignment_method: document.getElementById('alignment_method').value,
             trimming_method: document.getElementById('trimming_method').value,
             trim_terminal_overhangs: document.getElementById('trim_terminal_overhangs').checked,
+            fix_orientation: document.getElementById('fix_orientation')?.checked ?? true,
             tree_method: method,
             tree_model: isRaxml && model === 'AUTO' ? 'GTR+G' : model,
             bootstrap: parseInt(document.getElementById('bootstrap').value, 10) || 100,

@@ -1,8 +1,11 @@
+import logging
 from importlib.util import find_spec
 
 import click
 from flask.cli import with_appcontext
 from flask import current_app
+
+logger = logging.getLogger(__name__)
 
 @click.command("run-worker")
 @with_appcontext
@@ -24,29 +27,59 @@ def run_metrics_command():
 
     metrics_file = current_app.config.get("METRICS_FILE", "var/metrics/system_metrics.jsonl")
     
-    # Ensure dir
+    # Ensure dir. dirname() is empty when METRICS_FILE is a bare filename in the
+    # working directory, and os.makedirs("") raises FileNotFoundError.
     import os
-    os.makedirs(os.path.dirname(metrics_file), exist_ok=True)
+    metrics_dir = os.path.dirname(metrics_file)
+    if metrics_dir:
+        os.makedirs(metrics_dir, exist_ok=True)
 
-    print(f"Collecting metrics to {metrics_file}...")
+    logger.info("event=metrics.started Collecting metrics to %s", metrics_file)
     next_log_rotation = 0.0
     while True:
-        now = time.monotonic()
-        if now >= next_log_rotation:
-            rotate_runtime_logs(current_app)
-            next_log_rotation = now + 3600
-        m = collect_system_metrics()
-        emit_health_transitions(m)
-        with open(metrics_file, "a") as f:
-            f.write(json.dumps(m) + "\n")
-        # Alan 8/15/26 - Release the DB session between ticks.
+        # One bad tick must not end the process. psutil can raise on a
+        # disappearing mount, the database can be briefly unreachable, and the
+        # metrics file lives on the same disk whose exhaustion we are trying to
+        # report -- all transient, and all of which used to kill the collector
+        # outright, so the health transitions that would have said so stopped
+        # being emitted at exactly the moment they mattered.
         #
-        # emit_health_transitions() runs SELECT 1 and a Job count every minute, and
-        # this loop holds a single app context for the life of the process, so the
-        # session's transaction never ended: production showed this connection
-        # "idle in transaction" for 4h41m, holding ACCESS SHARE on jobs and blocking
-        # any migration that wants an ALTER TABLE.
-        db.session.remove()
+        # `except Exception` on purpose: KeyboardInterrupt and SystemExit are
+        # BaseExceptions and still stop the process, so systemd can shut this
+        # down normally.
+        try:
+            now = time.monotonic()
+            if now >= next_log_rotation:
+                rotate_runtime_logs(current_app)
+                next_log_rotation = now + 3600
+            m = collect_system_metrics()
+            emit_health_transitions(m)
+            with open(metrics_file, "a") as f:
+                f.write(json.dumps(m) + "\n")
+        except Exception:
+            logger.exception(
+                "event=metrics.tick_failed A metrics tick failed; the collector "
+                "will retry on the next interval."
+            )
+        finally:
+            # Alan 8/15/26 - Release the DB session between ticks.
+            #
+            # emit_health_transitions() runs SELECT 1 and a Job count every minute,
+            # and this loop holds a single app context for the life of the process,
+            # so the session's transaction never ended: production showed this
+            # connection "idle in transaction" for 4h41m, holding ACCESS SHARE on
+            # jobs and blocking any migration that wants an ALTER TABLE.
+            #
+            # In `finally` because a failed tick is the case that most needs it:
+            # a tick that raised part-way through emit_health_transitions() leaves
+            # exactly the open transaction this is here to close.
+            try:
+                db.session.remove()
+            except Exception:
+                logger.warning(
+                    "event=metrics.session_release_failed Could not release the "
+                    "database session after a metrics tick.", exc_info=True,
+                )
         time.sleep(60)
 
 @click.command("whats-new-add")

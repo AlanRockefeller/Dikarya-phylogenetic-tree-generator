@@ -11,7 +11,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional
 
-from app.services.artifact_storage import discard_artifact
+from app.services.artifact_storage import discard_artifact, gz_path
 
 logger = logging.getLogger(__name__)
 
@@ -129,8 +129,35 @@ def _requeue_killed_job(db_job, rq_job) -> Optional[str]:
             # cannot pick up a compressed copy of the alignment it is about to
             # rebuild.
             discard_artifact(stale)
-        except Exception:
-            logger.warning("Could not remove stale artifact %s", stale)
+            # discard_artifact logs and swallows OSError rather than raising, so
+            # its return value says nothing about whether the file is gone.
+            # Check both forms directly: this removal *is* the safety mechanism.
+            # A SIGKILLed tool can leave a truncated or zero-byte alignment that
+            # a rerun would treat as finished output, producing a tree from a
+            # partial matrix. If we cannot confirm the stale file is gone, do not
+            # requeue -- return a reason so reconciliation fails the job and
+            # tells the operator why it was not retried.
+            leftover = next(
+                (c for c in (stale, gz_path(stale)) if c.exists()), None,
+            )
+        except Exception as exc:
+            logger.warning(
+                "Could not remove stale artifact %s: %s", stale, exc, exc_info=True,
+            )
+            return (
+                f"stale alignment output {relative} could not be removed "
+                f"({type(exc).__name__}), so rerunning it could reuse partial "
+                f"results from the interrupted run"
+            )
+        if leftover is not None:
+            logger.warning(
+                "Stale artifact %s survived cleanup; refusing to requeue job %s",
+                leftover, db_job.id,
+            )
+            return (
+                f"stale alignment output {relative} could not be removed, so "
+                f"rerunning it could reuse partial results from the interrupted run"
+            )
 
     try:
         # Public RQ failed-job machinery preserves ID, callable, args, metadata,
@@ -335,9 +362,11 @@ def reconcile_job_statuses(
         # connection "idle in transaction" for 4h45m. That holds ACCESS SHARE on
         # jobs, which is enough to block a `flask db upgrade` ALTER TABLE behind it.
         #
-        # This also un-stages a dry run. --dry-run still assigns job.status/metrics
-        # above and merely skips the commit, leaving dirty objects in the session
-        # for whatever commits next; rolling back makes "dry" actually mean dry.
+        # The dry-run branches above now skip the assignments outright rather
+        # than staging them and declining to commit, so there is nothing dirty
+        # left to discard. The rollback is still required for the reason above:
+        # it ends the read transaction, on the dry-run and nothing-to-do paths
+        # alike.
         db.session.rollback()
 
     return changed

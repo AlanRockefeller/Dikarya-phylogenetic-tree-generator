@@ -192,9 +192,9 @@ def _submit(payload):
     """Call POST /api/job's handler and return the params it enqueued."""
     captured = {}
 
-    def _fake_enqueue(job_params):
+    def _fake_enqueue(job_params, *args, **kwargs):
         captured.update(job_params)
-        return JOB_ID
+        return kwargs.get("job_id") or JOB_ID
 
     app = Flask(__name__)
     with (
@@ -242,9 +242,11 @@ def _undecorated(fn):
 def _submit_v1(payload):
     captured = {}
 
-    def _fake_enqueue(job_params):
+    def _fake_enqueue(job_params, *args, **kwargs):
+        # v1 now mints the id itself and commits the Job row before enqueueing,
+        # so the id arrives as a keyword rather than coming back from RQ.
         captured.update(job_params)
-        return JOB_ID
+        return kwargs.get("job_id") or JOB_ID
 
     app = Flask(__name__)
     with (

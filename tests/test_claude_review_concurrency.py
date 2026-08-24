@@ -369,6 +369,17 @@ def test_endpoint_answers_502_when_claude_returns_something_unusable(tmp_path):
     assert status == 502
 
 
+def test_endpoint_answers_429_with_retry_after_when_upstream_is_throttled(tmp_path):
+    response, status = _call_endpoint(
+        tmp_path,
+        service.TreeAnalysisRateLimited("Claude is rate limiting reviews.", 90),
+    )
+
+    assert status == 429
+    assert response.headers["Retry-After"] == "90"
+    assert "rate limiting" in response.get_json()["error"]
+
+
 def test_endpoint_still_answers_400_when_the_job_has_nothing_to_review(tmp_path):
     response, status = _call_endpoint(
         tmp_path, service.TreeAnalysisError("This job has no tree file.")

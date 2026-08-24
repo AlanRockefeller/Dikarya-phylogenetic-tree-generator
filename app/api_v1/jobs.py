@@ -1,5 +1,6 @@
 """Job-related helpers shared by /api/v1 routes."""
 import json
+import logging
 from pathlib import Path
 
 from flask import g, url_for
@@ -11,7 +12,10 @@ from app.services.artifact_storage import (
     artifact_size,
     resolve_artifact,
 )
-from app.services.security_utils import validate_job_id
+from app.services.log_context import log_degradation
+from app.services.security_utils import coerce_bool, validate_job_id
+
+logger = logging.getLogger(__name__)
 
 
 def get_owned_job_or_404(job_id):
@@ -33,14 +37,29 @@ def get_owned_job_or_404(job_id):
 
 
 def _load_input_info(job_id):
-    """Best-effort read of var/jobs/{id}/input_info.json."""
+    """Best-effort read of var/jobs/{id}/input_info.json.
+
+    An unreadable or truncated file still yields {} -- the job resource is
+    served with its params degraded to whatever `metrics` carries rather than
+    500ing -- but it no longer does so silently: without the job id in the log
+    there was no way to tell which job's metadata had gone bad, and the empty
+    dict looks exactly like a job legitimately submitted with no options.
+    """
     path = Config.JOB_DIR / job_id / "input_info.json"
     if not path.exists():
         return {}
     try:
         with open(path, "r") as f:
             return json.load(f)
-    except Exception:
+    except (OSError, ValueError) as exc:
+        # ValueError covers json.JSONDecodeError and the UnicodeDecodeError a
+        # binary/truncated file raises; both mean "unusable metadata", not
+        # "missing".
+        log_degradation(
+            logger, "job_metadata_unreadable",
+            "Job served without its submitted parameters; input_info.json could not be read",
+            job_id=job_id, file="input_info.json", exception=type(exc).__name__,
+        )
         return {}
 
 
@@ -62,6 +81,11 @@ def serialize_job(job):
                 if info.get("trim_terminal_overhangs") is not None
                 else (job.metrics or {}).get("trim_terminal_overhangs")
             ),
+            "fix_orientation": (
+                info.get("fix_orientation")
+                if info.get("fix_orientation") is not None
+                else (job.metrics or {}).get("fix_orientation")
+            ),
             "tree_method":      info.get("tree_method")      or (job.metrics or {}).get("tree_method"),
             "tree_model":       info.get("tree_model"),
             "bootstrap":        info.get("bootstrap"),
@@ -74,7 +98,10 @@ def serialize_job(job):
             ),
             # False, not the current default: a job stored without this key ran
             # before the stop rule existed and must not be reported as using it.
-            "mcmc_stop_early":  bool(info.get("mcmc_stop_early", False)),
+            # coerce_bool, not bool(): a job whose params were stored from a
+            # JSON request may hold the string "false", which bool() reports as
+            # enabled while the worker reads it as disabled.
+            "mcmc_stop_early":  coerce_bool(info.get("mcmc_stop_early"), default=False)[0],
         },
         "metrics": job.metrics or {},
         "links": {
