@@ -7,13 +7,14 @@
 function renderD3Tree(treeJson, elementId, callbacks) {
     const d3 = window.d3v5 || window.d3;
     const container = document.getElementById(elementId);
-    // Same early return renderPhylotree() uses; without it the offsetWidth read
-    // below throws when the pane is missing.
+    // Alan 8/23/26 - Same early return renderPhylotree() uses; without it the
+    // offsetWidth read below throws when the pane is missing.
     if (!container) {
         console.error(`renderD3Tree: element #${elementId} not found.`);
         return;
     }
-    // An omitted callbacks argument would otherwise throw inside the click handlers.
+    // Alan 8/23/26 - An omitted callbacks argument would otherwise throw inside the
+    // click handlers.
     callbacks = callbacks || {};
     const width = container.offsetWidth || 800;
     const height = 600;
@@ -34,8 +35,8 @@ function renderD3Tree(treeJson, elementId, callbacks) {
     const treeLayout = d3.tree().size([height - 40, width - 160]);
     treeLayout(root);
 
-    // Appending without clearing stacked a second tree under the first (and left
-    // the partial's static <svg> in the layout) on every re-render.
+    // Alan 8/23/26 - Appending without clearing stacked a second tree under the first
+    // (and left the partial's static <svg> in the layout) on every re-render.
     container.replaceChildren();
     const svg = d3.select(`#${elementId}`).append("svg")
         .attr("width", width)

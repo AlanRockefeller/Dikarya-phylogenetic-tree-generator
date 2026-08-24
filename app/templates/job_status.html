@@ -716,19 +716,30 @@
 {% endblock %}
 
 {% block scripts %}
-<script src="{{ url_for('static', filename='js/job_status.js') }}?v=17"></script>
+<script src="{{ url_for('static', filename='js/job_status.js') }}?v=18"></script>
 <script>
     // Downloads dropdown. The completed job's downloads are its primary output, so
     // they must be reachable with a mouse, a keyboard and a finger alike.
     //
-    // Visible state is derived from exactly two inputs and applied in one place, so
-    // the class and aria-expanded cannot drift apart:
-    //   visible = pinned (clicked/tapped open) OR hovering (mouse over the group)
+    // Alan 8/23/26 - Explicit three-flag state machine so a click can close the menu
+    // while the pointer is still inside it. `visible = pinned || hovering` alone
+    // could not: on desktop the pointer sits over the control after the click, so
+    // hovering stayed true and un-pinning changed nothing on screen.
     //
-    // Focus deliberately does not open the menu on its own: a focus-driven open
-    // cannot be closed while the trigger keeps focus, which is what broke Escape
-    // and the second click. Keyboard users press Enter/Space on the button, which
-    // fires click, and Escape closes and returns focus to the button.
+    //   pointerInside   truthful mouseenter/mouseleave state
+    //   hoverSuppressed set by an explicit close, cleared when the pointer leaves,
+    //                   so the same unmoved pointer cannot immediately reopen it
+    //   pinned          opened deliberately by click/tap
+    //
+    //   visible = pinned || (pointerInside && !hoverSuppressed)
+    //
+    // Hover opens, the first click pins it open, the next click closes it. Both the
+    // class and aria-expanded are written from that one expression in sync(), so
+    // they cannot drift apart. Focus deliberately does not open the menu on its
+    // own: a focus-driven open cannot be closed while the trigger keeps focus,
+    // which is what broke Escape and the second click. Keyboard users press
+    // Enter/Space on the button, which fires click; Escape closes and restores
+    // focus to the button.
     (function () {
         const wrap = document.getElementById('downloads-menu-wrap');
         const btn = document.getElementById('downloads-menu-btn');
@@ -736,46 +747,65 @@
         if (!wrap || !btn || !menu) return;
 
         let pinned = false;
-        let hovering = false;
+        let pointerInside = false;
+        let hoverSuppressed = false;
 
         function sync() {
-            const visible = pinned || hovering;
+            const visible = pinned || (pointerInside && !hoverSuppressed);
             menu.classList.toggle('hidden', !visible);
             btn.setAttribute('aria-expanded', visible ? 'true' : 'false');
         }
 
+        // Alan 8/23/26 - One close path for Escape, outside clicks and chosen
+        // downloads: drop the pin and suppress hover, so a stationary pointer does
+        // not put the menu straight back.
+        function closeMenu() {
+            pinned = false;
+            hoverSuppressed = true;
+            sync();
+        }
+
         btn.addEventListener('click', (e) => {
             e.stopPropagation();
-            pinned = !pinned;
+            if (pinned) {
+                closeMenu();
+            } else {
+                pinned = true;
+                hoverSuppressed = false;
+                sync();
+            }
+        });
+
+        // Alan 8/23/26 - A fresh hover cycle clears the suppression, so once the
+        // pointer has left and come back the menu opens on hover again. mouseleave
+        // never fires on touch, which is why tapping relies on `pinned` alone.
+        wrap.addEventListener('mouseenter', () => {
+            pointerInside = true;
+            hoverSuppressed = false;
+            sync();
+        });
+        wrap.addEventListener('mouseleave', () => {
+            pointerInside = false;
+            hoverSuppressed = false;
             sync();
         });
 
-        // Hover keeps the original desktop affordance. mouseleave never fires on
-        // touch, which is why tapping relies on `pinned` instead.
-        wrap.addEventListener('mouseenter', () => { hovering = true; sync(); });
-        wrap.addEventListener('mouseleave', () => { hovering = false; sync(); });
-
         document.addEventListener('click', (e) => {
             if (wrap.contains(e.target)) return;
-            pinned = false;
-            sync();
+            closeMenu();
         });
 
         document.addEventListener('keydown', (e) => {
             if (e.key !== 'Escape') return;
-            if (!pinned && !hovering) return;
-            pinned = false;
-            hovering = false;
-            sync();
+            if (menu.classList.contains('hidden')) return;
+            closeMenu();
             btn.focus();
         });
 
         // A chosen download closes the menu.
         menu.addEventListener('click', (e) => {
             if (!e.target.closest('a')) return;
-            pinned = false;
-            hovering = false;
-            sync();
+            closeMenu();
         });
 
         sync();

@@ -23,6 +23,9 @@ from scripts.dikarya_whats_new import (
 
 OLD_TITLE_RE = re.compile(r"^iNaturalist obs (\d+) → Phylogenetic Tree$")
 FETCH_CHUNK_SIZE = 150
+# How many resolved titles the dry run prints so an operator can eyeball them
+# before committing. Sampled from the real resolved set, not a fixed list.
+PREVIEW_LIMIT = 10
 
 
 def _build_app():
@@ -48,10 +51,26 @@ def _matching_jobs():
 
 
 def _observation_id(job) -> int:
+    """The observation this job is about, or 0 when there is not a usable one.
+
+    metrics is a free-form JSON column, so inat_observation_id can be a string,
+    a float, or something that is not a number at all. Anything unusable is 0 --
+    the same answer as "absent" -- so main() has exactly one condition to skip
+    on, rather than a skip for the missing case and a crash for the malformed one.
+    """
     metrics = job.metrics if isinstance(job.metrics, dict) else {}
     value = metrics.get("inat_observation_id")
     if value:
-        return int(value)
+        try:
+            if isinstance(value, bool):
+                raise ValueError("boolean is not an observation id")
+            observation_id = int(value)
+            if isinstance(value, float) and not value.is_integer():
+                raise ValueError("fractional observation id")
+        except (TypeError, ValueError, OverflowError):
+            observation_id = 0
+        if observation_id > 0:
+            return observation_id
     match = OLD_TITLE_RE.fullmatch(str(metrics.get("notes") or ""))
     return int(match.group(1)) if match else 0
 
@@ -144,12 +163,21 @@ def _update_input_info(job, title):
         return "invalid"
     payload["notes"] = title
     temp_path = input_info_path.with_suffix(".json.tmp")
+
+    def discard_temp():
+        try:
+            temp_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+
     try:
         temp_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
         temp_path.replace(input_info_path)
     except PermissionError:
+        discard_temp()
         return "permission_denied"
     except OSError:
+        discard_temp()
         return "write_failed"
     return "updated"
 
@@ -164,12 +192,23 @@ def main(argv=None):
     from app.services.inaturalist_tree_service import _build_inat_job_title
 
     with app.app_context():
-        jobs = _matching_jobs()
+        # Filter once, here, so the preview, the database loop and the
+        # input_info loop all operate on the same population. _matching_jobs()
+        # accepts any job tagged via=inat_phylogenetic_tree, including ones that
+        # carry neither an observation id nor a legacy title; _observation_id()
+        # returns 0 for those, they never enter `genera`, and the apply loops
+        # used to raise KeyError on them -- the second one after the commit had
+        # already renamed the database rows, leaving input_info.json behind.
+        jobs = []
         jobs_by_observation = defaultdict(list)
-        for job in jobs:
+        skipped_without_observation = 0
+        for job in _matching_jobs():
             observation_id = _observation_id(job)
-            if observation_id:
-                jobs_by_observation[observation_id].append(job)
+            if not observation_id:
+                skipped_without_observation += 1
+                continue
+            jobs.append(job)
+            jobs_by_observation[observation_id].append(job)
 
         observations = _fetch_observations(jobs_by_observation)
         genera, unresolved = _resolve_genera(jobs_by_observation, observations)
@@ -177,16 +216,19 @@ def main(argv=None):
             print(json.dumps({"unresolved": unresolved}, indent=2))
             return 1
 
+        # Built from the observations actually resolved in this run. A fixed
+        # list of ids produced an empty preview on any dataset that did not
+        # happen to contain them, which is every dataset but the author's.
         preview = {
             str(observation_id): _build_inat_job_title(observation_id, genera[observation_id])
-            for observation_id in (110793649, 134803150, 180881786, 360921334, 374117614)
-            if observation_id in genera
+            for observation_id in sorted(genera)[:PREVIEW_LIMIT]
         }
         summary = {
             "mode": "apply" if args.apply else "dry-run",
             "job_count": len(jobs),
             "observation_count": len(jobs_by_observation),
             "resolved_genus_count": len(genera),
+            "skipped_without_observation": skipped_without_observation,
             "preview": preview,
         }
         if not args.apply:
@@ -211,6 +253,12 @@ def main(argv=None):
         summary["database_jobs_updated"] = len(jobs)
         summary["input_info"] = dict(sorted(input_info_counts.items()))
         print(json.dumps(summary, indent=2))
+        # The database rows are already committed at this point. Any job whose
+        # input_info.json did not follow leaves the two stores disagreeing about
+        # the same job, so the run must not report success.
+        failed = sum(count for status, count in input_info_counts.items() if status != "updated")
+        if failed:
+            return 1
     return 0
 
 

@@ -215,8 +215,8 @@
         statusAlert.classList.add('alert-info');
         statusAlert.classList.remove('d-none');
 
-        // `parseInt(...) || fallback` threw away a deliberate 0 (bootstrap min="0"
-        // means "no bootstrap") and silently substituted a value the field never
+        // Alan 8/23/26 - `parseInt(...) || fallback` threw away a deliberate 0 (bootstrap
+        // min="0" means "no bootstrap") and silently substituted a value the field never
         // showed. Only a genuinely unparseable entry falls back now.
         const intOr = (id, fallback) => {
             const v = parseInt(document.getElementById(id).value, 10);
@@ -259,8 +259,8 @@
                 body: JSON.stringify(payload)
             });
 
-            // A gateway can answer 502/504 with HTML, and resp.json() would then
-            // throw a parser message instead of reporting the HTTP status.
+            // Alan 8/23/26 - A gateway can answer 502/504 with HTML, and resp.json() would
+            // then throw a parser message instead of reporting the HTTP status.
             let data = null;
             try { data = await resp.json(); } catch (e) { /* non-JSON body */ }
 

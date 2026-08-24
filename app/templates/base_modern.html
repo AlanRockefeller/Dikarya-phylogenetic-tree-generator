@@ -439,10 +439,10 @@
         // =========================================================================
         let statusTimeout = null;
 
-        // Callers across the tree viewer and alignment viewer already pass 'warning'
-        // and 'danger' plus an explicit duration. Both were being ignored, so a
-        // failed alignment load or a refused tree edit rendered as an ordinary blue
-        // informational toast for a fixed five seconds.
+        // Alan 8/23/26 - Callers across the tree viewer and alignment viewer already
+        // pass 'warning' and 'danger' plus an explicit duration. Both were being
+        // ignored, so a failed alignment load or a refused tree edit rendered as an
+        // ordinary blue informational toast for a fixed five seconds.
         const STATUS_VARIANT_CLASSES = {
             success: ['bg-green-500', 'text-white'],
             error: ['bg-red-500', 'text-white'],
@@ -465,8 +465,8 @@
             statusAlert.textContent = message;
             statusAlert.classList.remove('opacity-0', 'translate-y-4', 'pointer-events-none');
 
-            // A non-positive or non-finite duration leaves the message up until the
-            // next showStatus() call.
+            // Alan 8/23/26 - A non-positive or non-finite duration leaves the message up
+            // until the next showStatus() call.
             const ms = Number(durationMs);
             if (Number.isFinite(ms) && ms > 0) {
                 statusTimeout = setTimeout(() => {

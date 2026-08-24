@@ -91,12 +91,21 @@ def human(n):
         n /= 1024.0
 
 
-def replace_atomically(path: Path, data: bytes) -> None:
-    """Write data over path via a same-directory temp file, preserving mode."""
+def replace_atomically(path: Path, data) -> int:
+    """Write data over path via a same-directory temp file, preserving mode.
+
+    ``data`` is either a bytes object or an iterable of bytes chunks. The
+    iterable form exists for alignment.log, which is the largest text artifact
+    in a job and must never be materialized in full (see pass_logs). Returns the
+    number of bytes written.
+    """
+    chunks = (data,) if isinstance(data, (bytes, bytearray)) else data
+    written = 0
     fd, temp_name = tempfile.mkstemp(dir=str(path.parent), prefix=".reclaim.", suffix=".tmp")
     try:
         with os.fdopen(fd, "wb") as handle:
-            handle.write(data)
+            for chunk in chunks:
+                written += handle.write(chunk)
             handle.flush()
             os.fsync(handle.fileno())
         try:
@@ -110,6 +119,7 @@ def replace_atomically(path: Path, data: bytes) -> None:
         except OSError:
             pass
         raise
+    return written
 
 
 def gzip_in_place(path: Path, apply: bool) -> int:
@@ -138,11 +148,19 @@ def gzip_in_place(path: Path, apply: bool) -> int:
         ratio = len(sample) / compressed_sample
         return int(original - original / ratio)
 
+    # A partial .gz.tmp is invisible to every pass in this script -- pass_reports
+    # globs *_report.html, pass_alignments uses fixed names, pass_scratch matches
+    # neither -- so nothing would ever reclaim it. One full disk would leave a
+    # half-written archive in each job it touched, permanently.
     tmp = target.with_name(target.name + ".tmp")
-    with open(path, "rb") as src, gzip.open(tmp, "wb", compresslevel=GZIP_LEVEL) as dst:
-        shutil.copyfileobj(src, dst, length=1024 * 1024)
-    shutil.copymode(path, tmp)
-    os.replace(tmp, target)
+    try:
+        with open(path, "rb") as src, gzip.open(tmp, "wb", compresslevel=GZIP_LEVEL) as dst:
+            shutil.copyfileobj(src, dst, length=1024 * 1024)
+        shutil.copymode(path, tmp)
+        os.replace(tmp, target)
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
     saved = original - target.stat().st_size
     path.unlink()
     return saved
@@ -179,8 +197,40 @@ def pass_scratch(job_dir: Path, apply: bool, tally: Tally) -> None:
             continue
         size = _tree_bytes(path)
         if apply:
+            # ignore_errors keeps one unreadable staging directory from aborting
+            # the whole run, but it also hides the failure. Re-measure instead of
+            # trusting it: if anything survives, those bytes were not reclaimed
+            # and the run was partial, which the exit status has to reflect.
             shutil.rmtree(path, ignore_errors=True)
+            remaining = _tree_bytes(path) if path.exists() else 0
+            if remaining or path.exists():
+                tally.errors += 1
+                print(f"  ! {job_dir.name} [scratch]: {path.name} not fully removed", file=sys.stderr)
+            size -= remaining
         tally.add("scratch", size)
+
+
+def _kept_log_chunks(path: Path):
+    """Yield the encoded lines of an alignment log that survive filtering.
+
+    Reproduces exactly what "\\n".join(kept) + "\\n" used to produce, including
+    the empty result when nothing is kept, but without holding the file.
+    """
+    with open(path, encoding="utf-8", errors="replace") as handle:
+        first = True
+        for line in handle:
+            line = line.rstrip("\n")
+            # read_text().splitlines(), used by the original buffered version,
+            # removes the CR in CRLF input. Preserve that normalization while
+            # retaining the streaming implementation.
+            if line.endswith("\r"):
+                line = line[:-1]
+            if not _keep_mafft_log_line(line):
+                continue
+            yield (line if first else "\n" + line).encode("utf-8")
+            first = False
+        if not first:
+            yield b"\n"
 
 
 def pass_logs(job_dir: Path, apply: bool, tally: Tally) -> None:
@@ -190,14 +240,17 @@ def pass_logs(job_dir: Path, apply: bool, tally: Tally) -> None:
     original = path.stat().st_size
     if original < MIN_COMPRESS_BYTES:
         return
-    text = path.read_text(encoding="utf-8", errors="replace")
-    kept = [line for line in text.splitlines() if _keep_mafft_log_line(line)]
-    data = ("\n".join(kept) + "\n").encode("utf-8") if kept else b""
-    if len(data) >= original:
+    # Two streaming passes rather than one buffered one. MAFFT chatter is ~96%
+    # of these bytes (see the module docstring), so alignment.log is the biggest
+    # text file in a job, and this script walks every job directory in a single
+    # process: reading one into a string, then a list of lines, then a bytes copy
+    # made peak memory several times the largest log on disk.
+    kept_bytes = sum(len(chunk) for chunk in _kept_log_chunks(path))
+    if kept_bytes >= original:
         return
     if apply:
-        replace_atomically(path, data)
-    tally.add("logs", original - len(data))
+        replace_atomically(path, _kept_log_chunks(path))
+    tally.add("logs", original - kept_bytes)
 
 
 def pass_json(job_dir: Path, apply: bool, tally: Tally) -> None:
@@ -348,7 +401,11 @@ def main():
     print(f"elapsed: {time.time() - started:.1f}s")
     if not apply:
         print("\nDry run -- nothing was modified. Re-run with --apply to reclaim.")
+    # This runs weekly from cron (ops/cron/dikarya-reclaim-job-space). Exiting 0
+    # after counting failures means a run that reclaimed nothing looks identical
+    # to a clean one, and the space quietly stops coming back.
+    return 1 if tally.errors else 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

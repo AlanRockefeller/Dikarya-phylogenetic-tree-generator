@@ -1,5 +1,8 @@
+import logging
 import os
+import re
 from datetime import timedelta
+from decimal import Decimal
 from pathlib import Path
 from dotenv import load_dotenv
 
@@ -47,6 +50,62 @@ def bool_env(name, default=False):
     if clean in _BOOL_ENV_FALSE:
         return False
     return default
+
+
+# Ceiling on CLAUDE_REVIEW_MAX_BUDGET_USD, which is the only setting that spends
+# money and which travels through sudo into a root-owned wrapper as a plain
+# string. Without a ceiling the per-invocation cap could simply be configured
+# away, which is the one thing --max-budget-usd exists to prevent.
+#
+# $2.00 is derived, not picked: it is twice the shipped default of $1.00, about
+# six times the measured cost of a real review (low effort $0.25, medium $0.35
+# on a 147-sequence job -- see CLAUDE_REVIEW_EFFORT below), and it bounds the
+# worst case site-wide spend at CLAUDE_REVIEW_MAX_DAILY x $2.00 = $50 per day.
+# That leaves deliberate headroom for a higher effort setting or an unusually
+# large tree while keeping a misconfiguration survivable. Raising it means
+# accepting a proportionally higher daily maximum; document the new figure in
+# ARCHITECTURE.md if you do.
+CLAUDE_REVIEW_MAX_BUDGET_HARD_CAP_USD = Decimal("2.00")
+_BUDGET_RE = re.compile(r"^[0-9]{1,4}(\.[0-9]{1,2})?$")
+
+
+def budget_env(name, default):
+    """Canonicalize a dollar amount, falling back to ``default`` if unusable.
+
+    This layer *canonicalizes*: it tolerates surrounding whitespace and any
+    accepted precision, and always emits the two-decimal form. The root-owned
+    wrapper is the *enforcement* boundary and is deliberately stricter -- it
+    accepts only the canonical shape, with no whitespace. The two are therefore
+    not identical grammars, and do not need to be. The invariant that matters is
+    one-directional: every value this function can return is a value the wrapper
+    accepts, so a legal configuration can never fail inside sudo. It is asserted
+    in tests/test_maintenance_script_safety.py.
+
+    Deliberately falls back rather than raising: this runs at import time, and a
+    typo in one optional environment variable must not stop the web app from
+    booting. Falling back also fails in the safe direction, towards the smaller
+    default rather than towards more spending.
+    """
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    clean = raw.strip()
+    rejection = None
+    if not _BUDGET_RE.match(clean):
+        rejection = "not a plain dollar amount"
+    else:
+        value = Decimal(clean)
+        if value <= 0:
+            rejection = "must be greater than zero"
+        elif value > CLAUDE_REVIEW_MAX_BUDGET_HARD_CAP_USD:
+            rejection = f"above the ${CLAUDE_REVIEW_MAX_BUDGET_HARD_CAP_USD} hard cap"
+    if rejection:
+        # Say so rather than silently running on a budget nobody configured.
+        logging.getLogger(__name__).warning(
+            "%s=%r ignored (%s); using %s", name, raw, rejection, default
+        )
+        return default
+    return f"{Decimal(clean):.2f}"
 
 
 def _release_version(base_dir):
@@ -251,7 +310,7 @@ class Config:
     # finish well inside that or the user gets a 504 instead of an error.
     CLAUDE_REVIEW_TIMEOUT_SECONDS = float(os.environ.get('CLAUDE_REVIEW_TIMEOUT_SECONDS', '240'))
     # Per-invocation spend ceiling, enforced by the CLI's own --max-budget-usd.
-    CLAUDE_REVIEW_MAX_BUDGET_USD = os.environ.get('CLAUDE_REVIEW_MAX_BUDGET_USD', '1.00')
+    CLAUDE_REVIEW_MAX_BUDGET_USD = budget_env('CLAUDE_REVIEW_MAX_BUDGET_USD', '1.00')
     # Ceiling on reviews running at once, enforced with a Redis counter. Rate limits
     # are per-client and cannot stop eight different users from taking every slot.
     CLAUDE_REVIEW_MAX_CONCURRENT = int(os.environ.get('CLAUDE_REVIEW_MAX_CONCURRENT', '2'))

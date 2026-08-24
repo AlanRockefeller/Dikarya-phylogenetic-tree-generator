@@ -8,6 +8,17 @@ alembic==1.17.2
     # via
     #   -r requirements.txt
     #   flask-migrate
+annotated-types==0.8.0
+    # via
+    #   -r requirements.txt
+    #   pydantic
+anthropic==0.122.0
+    # via -r requirements.txt
+anyio==4.14.2
+    # via
+    #   -r requirements.txt
+    #   anthropic
+    #   httpx
 biopython==1.87
     # via -r requirements.txt
 blinker==1.9.0
@@ -25,6 +36,8 @@ cachecontrol==0.14.4
 certifi==2025.11.12
     # via
     #   -r requirements.txt
+    #   httpcore
+    #   httpx
     #   requests
 charset-normalizer==3.4.4
     # via
@@ -50,6 +63,14 @@ deprecated==1.3.1
     #   limits
 detect-secrets==1.5.0
     # via -r requirements-dev.in
+distro==1.9.0
+    # via
+    #   -r requirements.txt
+    #   anthropic
+docstring-parser==0.18.0
+    # via
+    #   -r requirements.txt
+    #   anthropic
 filelock==3.29.7
     # via cachecontrol
 flask==3.1.3
@@ -78,9 +99,23 @@ greenlet==3.3.0
     #   sqlalchemy
 gunicorn==23.0.0
     # via -r requirements.txt
+h11==0.16.0
+    # via
+    #   -r requirements.txt
+    #   httpcore
+httpcore==1.0.9
+    # via
+    #   -r requirements.txt
+    #   httpx
+httpx==0.28.1
+    # via
+    #   -r requirements.txt
+    #   anthropic
 idna==3.15
     # via
     #   -r requirements.txt
+    #   anyio
+    #   httpx
     #   requests
 iniconfig==2.3.0
     # via pytest
@@ -93,6 +128,10 @@ jinja2==3.1.6
     # via
     #   -r requirements.txt
     #   flask
+jiter==0.16.0
+    # via
+    #   -r requirements.txt
+    #   anthropic
 license-expression==30.4.4
     # via cyclonedx-python-lib
 limits==5.6.0
@@ -150,15 +189,31 @@ platformdirs==4.10.0
 pluggy==1.6.0
     # via pytest
 psutil==7.2.0
-    # via -r requirements.txt
+    # via
+    #   -r requirements.txt
+    #   pyhmmer
 psycopg2-binary==2.9.11
     # via -r requirements.txt
 py-serializable==2.1.0
     # via cyclonedx-python-lib
+pydantic==2.13.4
+    # via
+    #   -r requirements.txt
+    #   anthropic
+pydantic-core==2.46.4
+    # via
+    #   -r requirements.txt
+    #   pydantic
 pygments==2.20.0
     # via
     #   pytest
     #   rich
+pyhmmer==0.12.1
+    # via
+    #   -r requirements.txt
+    #   pyitsx
+pyitsx==0.1.0
+    # via -r requirements.txt
 pyparsing==3.3.2
     # via pip-requirements-parser
 pyproject-hooks==1.2.0
@@ -197,6 +252,10 @@ six==1.17.0
     # via
     #   -r requirements.txt
     #   python-dateutil
+sniffio==1.3.1
+    # via
+    #   -r requirements.txt
+    #   anthropic
 sortedcontainers==2.4.0
     # via cyclonedx-python-lib
 sqlalchemy==2.0.45
@@ -212,10 +271,19 @@ typing-extensions==4.15.0
     # via
     #   -r requirements.txt
     #   alembic
+    #   anthropic
+    #   anyio
     #   cyclonedx-python-lib
     #   flask-limiter
     #   limits
+    #   pydantic
+    #   pydantic-core
     #   sqlalchemy
+    #   typing-inspection
+typing-inspection==0.4.4
+    # via
+    #   -r requirements.txt
+    #   pydantic
 urllib3==2.7.0
     # via
     #   -r requirements.txt

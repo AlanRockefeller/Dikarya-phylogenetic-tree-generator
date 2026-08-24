@@ -10,6 +10,12 @@ class JobStatusClient {
     // Upper bound on retained terminal rows (see _trimTerminal).
     static MAX_LOG_LINES = 2000;
 
+    // Alan 8/23/26 - The only stream values that may become a CSS class. 'cmd' is
+    // what publish_command() emits and is what makes the "$ mafft ..." lines green;
+    // whitelisting rather than passing event.stream through keeps a hostile value
+    // from turning into an arbitrary class.
+    static LOG_STREAM_CLASSES = new Set(['stdout', 'stderr', 'cmd']);
+
     constructor(jobId) {
         this.jobId = jobId;
         this.eventSource = null;
@@ -62,7 +68,8 @@ class JobStatusClient {
     }
 
     connect() {
-        // Never leave a second stream open: each one holds a server request slot.
+        // Alan 8/23/26 - Never leave a second stream open: each one holds a server
+        // request slot, and the pageshow reconnect below can call this again.
         if (this.eventSource) {
             this.eventSource.close();
             this.eventSource = null;
@@ -147,8 +154,8 @@ class JobStatusClient {
         // Alan 7/18/26 - Start the live counter for both queued and running jobs when the timestamp is valid.
         if (elapsedStartedAt) {
             // Alan 7/18/26 - Store the queue timestamp used by the one-second elapsed-time updater.
-            // A malformed timestamp yields a truthy Invalid Date, which the updater
-            // would render as "NaNs"; drop it and keep the server-rendered value.
+            // Alan 8/23/26 - A malformed timestamp yields a truthy Invalid Date, which the
+            // updater would render as "NaNs"; drop it and keep the server-rendered value.
             const parsedStart = new Date(elapsedStartedAt);
             this.startTime = Number.isNaN(parsedStart.getTime()) ? null : parsedStart;
             // Alan 7/18/26 - Keep counting while a job waits for a worker as well as while its pipeline runs.
@@ -470,13 +477,13 @@ class JobStatusClient {
         this.elements.currentStepDetail.textContent = event.error;
     }
 
-    // Build one terminal row from text only. Everything here arrives over SSE, so
-    // nothing is interpolated into markup: the tag and the line become text nodes
-    // and the stream only ever contributes a known class name.
+    // Alan 8/23/26 - Build one terminal row from text only. Everything here arrives
+    // over SSE, so nothing is interpolated into markup: the tag and the line become
+    // text nodes and the stream only ever contributes a known class name.
     _buildLogLine(tagText, lineText, stream) {
         const lineEl = document.createElement('div');
         lineEl.className = 'log-line';
-        if (stream === 'stdout' || stream === 'stderr') {
+        if (JobStatusClient.LOG_STREAM_CLASSES.has(stream)) {
             lineEl.classList.add(stream);
         }
 
@@ -488,8 +495,8 @@ class JobStatusClient {
         return lineEl;
     }
 
-    // A long alignment or tree run emits thousands of lines; without a cap the
-    // node count grows for the whole lifetime of the tab.
+    // Alan 8/23/26 - A long alignment or tree run emits thousands of lines; without a
+    // cap the node count grows for the whole lifetime of the tab.
     _trimTerminal(container) {
         while (container.childElementCount > JobStatusClient.MAX_LOG_LINES) {
             container.removeChild(container.firstElementChild);
@@ -499,8 +506,8 @@ class JobStatusClient {
     appendLog(event) {
         const container = this.elements.terminalContent;
 
-        // event.step is absent on some worker log events; String() keeps this from
-        // throwing the way `event.step.toUpperCase()` did.
+        // Alan 8/23/26 - event.step is absent on some worker log events; String() keeps
+        // this from throwing the way `event.step.toUpperCase()` did.
         const step = String(event.step || 'log').toUpperCase();
         container.appendChild(this._buildLogLine(`[${step}]`, event.line, event.stream));
         this._trimTerminal(container);
@@ -523,7 +530,7 @@ class JobStatusClient {
             skipped: '○',
             failed: '✗',
         };
-        // Only the four known keys may reach the class attribute.
+        // Alan 8/23/26 - Only the four known keys may reach the class attribute.
         const iconClass = Object.prototype.hasOwnProperty.call(iconMap, event.icon) ? event.icon : 'running';
 
         const iconEl = document.createElement('span');
@@ -544,8 +551,8 @@ class JobStatusClient {
     populateLogTails(logTails) {
         const container = this.elements.terminalContent;
 
-        // A reconnect (bfcache restore, dropped stream) re-delivers the snapshot;
-        // without this the same tail would be appended to the terminal again.
+        // Alan 8/23/26 - A reconnect (bfcache restore, dropped stream) re-delivers the
+        // snapshot; without this the same tail would be appended to the terminal again.
         if (this._logTailsPopulated) return;
         this._logTailsPopulated = true;
 
@@ -570,8 +577,8 @@ class JobStatusClient {
         // Stop elapsed timer
         if (this.elapsedTimer) {
             clearInterval(this.elapsedTimer);
-            // startElapsedTimer() returns early while this is truthy, so a stale id
-            // here would make the timer unrestartable.
+            // Alan 8/23/26 - startElapsedTimer() returns early while this is truthy, so a
+            // stale id here would make the timer unrestartable.
             this.elapsedTimer = null;
         }
 
@@ -757,7 +764,7 @@ class JobStatusClient {
 
     clearTerminal() {
         this.elements.terminalContent.replaceChildren();
-        // A manual clear should not stop a later snapshot from restoring the tail.
+        // Alan 8/23/26 - A manual clear should not stop a later snapshot restoring the tail.
         this._logTailsPopulated = false;
     }
 }
@@ -837,8 +844,8 @@ document.addEventListener('DOMContentLoaded', () => {
     });
 
     // Generic function to load log files
-    // A tab can be clicked repeatedly before the first response lands. Without an
-    // in-flight marker each click started another full download.
+    // Alan 8/23/26 - A tab can be clicked repeatedly before the first response lands.
+    // Without an in-flight marker each click started another full download.
     const inFlightLoads = new Set();
 
     async function loadLog(logName, elementId) {
@@ -960,10 +967,10 @@ document.addEventListener('DOMContentLoaded', () => {
     }
 });
 
-// Cleanup when the page is hidden. `pagehide` rather than `beforeunload`, which
-// disqualifies the page from the back/forward cache in Firefox; the paired
-// `pageshow` below reconnects a restored page so it cannot sit on stale status
-// with a dead stream.
+// Alan 8/23/26 - Cleanup when the page is hidden. `pagehide` rather than
+// `beforeunload`, which disqualifies the page from the back/forward cache in
+// Firefox; the paired `pageshow` below reconnects a restored page so it cannot sit
+// on stale status with a dead stream.
 window.addEventListener('pagehide', () => {
     if (window.jobStatusClient) {
         window.jobStatusClient.disconnect();

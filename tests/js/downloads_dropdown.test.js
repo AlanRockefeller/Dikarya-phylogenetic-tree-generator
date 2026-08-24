@@ -8,6 +8,11 @@
  * visible while the toggle had already set aria-expanded="false", and the menu
  * could not be closed at all while the trigger kept focus.
  *
+ * The desktop hover path is exercised explicitly. Checking click-open/click-close
+ * from a cold start passed while the real bug was live: on a real pointer device
+ * the pointer is inside the wrapper when you click, `visible = pinned || hovering`
+ * kept the menu on screen, and the second click appeared to do nothing.
+ *
  * Usage: node downloads_dropdown.test.js <path-to-extracted-script>
  */
 'use strict';
@@ -95,6 +100,45 @@ wrap.dispatch('mouseenter');
 check('hover opens and aria follows', true);
 wrap.dispatch('mouseleave');
 check('unhover closes', false);
+
+// The desktop sequence the previous harness never established: the pointer is
+// already inside the wrapper when the clicks happen.
+wrap.dispatch('mouseenter');
+check('hovered: menu is open', true);
+clickBtn();
+check('hovered: first click pins it open', true);
+clickBtn();
+check('hovered: second click CLOSES it', false);
+// The pointer has not moved, so nothing may put it back on screen.
+check('still inside the wrapper: stays closed', false);
+wrap.dispatch('mouseleave');
+check('leaving while closed keeps it closed', false);
+wrap.dispatch('mouseenter');
+check('a new hover cycle can open it again', true);
+wrap.dispatch('mouseleave');
+check('unhover closes again', false);
+
+// Escape and outside click must also survive a stationary pointer.
+wrap.dispatch('mouseenter');
+clickBtn();
+check('hovered and pinned before Escape', true);
+btn.focused = false;
+document.fire('keydown', { key: 'Escape' });
+check('Escape closes while still hovered', false);
+if (!btn.focused) failures.push('Escape did not return focus to the trigger while hovered');
+wrap.dispatch('mouseleave');
+
+wrap.dispatch('mouseenter');
+clickBtn();
+document.fire('click', { target: outside });
+check('outside click closes while still hovered', false);
+wrap.dispatch('mouseleave');
+
+wrap.dispatch('mouseenter');
+clickBtn();
+menu.dispatch('click', { target: link });
+check('choosing a download closes while still hovered', false);
+wrap.dispatch('mouseleave');
 
 // Touch: a tap fires click; mouseleave never fires on touch.
 clickBtn();

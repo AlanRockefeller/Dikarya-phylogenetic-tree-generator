@@ -195,15 +195,34 @@ class TestDnaSequenceCleanup(unittest.TestCase):
 class TestSecurityInputSanitization(unittest.TestCase):
     """Test security-related input sanitization."""
 
-    def test_url_with_script_injection(self):
-        """URLs with script tags should be rejected (wrong domain)."""
+    def test_search_url_without_a_filter_is_rejected_script_tags_or_not(self):
+        """A bare search URL is rejected because it carries no filter param.
+
+        The old version asserted only `if result:`, so it proved nothing
+        whenever validation returned None -- which is in fact what happens here.
+        Its docstring also blamed the domain, but inaturalist.org is the accepted
+        domain; the rejection comes from the missing filter.
+        """
         url = "https://inaturalist.org/observations?<script>alert(1)</script>"
-        # This will be rejected because of malformed URL, not script tags
+        self.assertIsNone(validate_inaturalist_url(url))
+
+    def test_script_tags_in_the_query_are_carried_through_as_inert_data(self):
+        """Markup in a query value must neither be executed nor change the verdict.
+
+        With a filter present the URL is accepted, and the point of the security
+        contract is that the tag survives as an ordinary string in query_params
+        rather than being interpreted, stripped, or causing a rejection that
+        would look like validation working for the wrong reason.
+        """
+        payload = "<script>alert(1)</script>"
+        url = f"https://inaturalist.org/observations?taxon_id=123&q={payload}"
+
         result = validate_inaturalist_url(url)
-        # The URL will parse but query params contain < and >
-        # Our service should still handle this safely
-        if result:
-            self.assertEqual(result['type'], 'observations_search')
+
+        self.assertIsNotNone(result)
+        self.assertEqual(result["type"], "observations_search")
+        self.assertEqual(result["query_params"]["q"], [payload])
+        self.assertEqual(result["query_params"]["taxon_id"], ["123"])
 
     def test_url_path_traversal(self):
         """Path traversal attempts should not affect validation."""

@@ -30,6 +30,11 @@ FASTA = ">A\nACGTACGTAC\n>B\nACGTACGTAT\n>C\nACGTACGTAA\n"
 # Defaults
 # ---------------------------------------------------------------------------
 
+def _undecorated(fn):
+    while hasattr(fn, "__wrapped__"):
+        fn = fn.__wrapped__
+    return fn
+
 def test_new_mrbayes_jobs_default_to_one_million_max_generations():
     assert Config.DEFAULT_MCMC_GENERATIONS == 1_000_000
     assert TreeBuilderParams(method="mrbayes").mcmc_generations == 1_000_000
@@ -204,7 +209,7 @@ def _submit(payload):
         patch.object(routes, "db", MagicMock()),
         patch.object(routes, "current_user", SimpleNamespace(is_authenticated=False)),
     ):
-        routes.create_job.__wrapped__()
+        _undecorated(routes.create_job)()
     return captured
 
 
@@ -232,12 +237,6 @@ def test_web_submission_propagates_explicit_mcmc_stop_early():
 # ---------------------------------------------------------------------------
 # Public API v1
 # ---------------------------------------------------------------------------
-
-def _undecorated(fn):
-    while hasattr(fn, "__wrapped__"):
-        fn = fn.__wrapped__
-    return fn
-
 
 def _submit_v1(payload):
     captured = {}

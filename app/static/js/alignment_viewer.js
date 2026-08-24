@@ -124,8 +124,8 @@
     }
 
     // Alan 8/4/26 - Apply a names-column width, clamped so both columns stay usable at the current modal size.
-    // A role="separator" that is focusable is a range widget: without these it is
-    // announced with no position and no bounds.
+    // Alan 8/23/26 - A role="separator" that is focusable is a range widget: without
+    // these it is announced with no position and no bounds.
     function updateResizerAriaValues(resizer, width, max) {
         resizer.setAttribute('aria-valuemin', String(NAMES_MIN_WIDTH));
         resizer.setAttribute('aria-valuemax', String(Math.round(max)));
@@ -141,9 +141,9 @@
         gridEl.style.gridTemplateColumns = `${w}px 1fr`;
         if (state._dom && state._dom.resizer) {
             state._dom.resizer.style.left = `${w}px`;
-            // Every path that changes the width -- drag, arrow keys, double-click,
-            // the restored preference, a container resize -- comes through here, so
-            // this is the one place the announced range can be kept true.
+            // Alan 8/23/26 - Every path that changes the width -- drag, arrow keys,
+            // double-click, the restored preference, a container resize -- comes through
+            // here, so this is the one place the announced range can be kept true.
             updateResizerAriaValues(state._dom.resizer, w, max);
         }
         if (persist) {
@@ -524,6 +524,8 @@
         resizer.title = 'Drag to resize the sequence name column (double-click to fit the longest name)';
         resizer.setAttribute('role', 'separator');
         resizer.setAttribute('aria-orientation', 'vertical');
+        // Alan 8/23/26 - Make the splitter focusable and drivable from the keyboard; it
+        // advertised role="separator" but could only ever be dragged with a pointer.
         resizer.setAttribute('tabindex', '0');
         resizer.setAttribute('aria-label', 'Resize the sequence name column');
         // Seeded here so the control is never exposed without a value; the real
@@ -953,9 +955,9 @@
         }
     }
 
-    // Alignment requests are bounded and singular: the Include Pruned toggle (and a
-    // reopen) can re-enter refresh() while a request is still running, and without
-    // this a slow earlier response could overwrite a newer alignment.
+    // Alan 8/23/26 - Alignment requests are bounded and singular: the Include Pruned
+    // toggle (and a reopen) can re-enter refresh() while a request is still running,
+    // and without this a slow earlier response could overwrite a newer alignment.
     let inFlightRequest = null;
     const FETCH_TIMEOUT_MS = 60000;
 
@@ -1034,8 +1036,8 @@
             populateReferenceSelector();
             renderAlignmentGrid();
         } catch (e) {
-            // A request we cancelled ourselves in favour of a newer one is not a
-            // failure the user should see; the newer one owns the UI now.
+            // Alan 8/23/26 - A request we cancelled ourselves in favour of a newer one is
+            // not a failure the user should see; the newer one owns the UI now.
             if (e && e.name === 'AbortError' && e.superseded) return;
             console.error('Alignment Viewer failed:', e);
             showStatusMsg(`Alignment Viewer failed: ${e.message}`, 'danger', 4000);

@@ -4,18 +4,15 @@ Unit tests for mycomap_service.py
 Tests URL validation logic without requiring network access.
 """
 
-import sys
 import unittest
-import importlib.util
 from unittest.mock import patch
 
-# Load mycomap_service directly to avoid Flask dependency from app/__init__.py
-spec = importlib.util.spec_from_file_location(
-    "mycomap_service", 
-    "/var/www/dikarya/app/services/mycomap_service.py"
-)
-mycomap_service = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(mycomap_service)
+# Imported as the package module the application actually uses. This used to
+# load the file from a hardcoded /var/www/dikarya path, which failed in any
+# checkout or CI runner outside the production deployment directory, and built a
+# second module object that would silently drift from the real one.
+from app.services import mycomap_service
+
 validate_mycomap_url = mycomap_service.validate_mycomap_url
 build_blast_metric_keys = mycomap_service.build_blast_metric_keys
 improve_mycomap_sequence_name = mycomap_service.improve_mycomap_sequence_name
@@ -91,10 +88,9 @@ class TestMycomapUrlValidation(unittest.TestCase):
         """Partial domain match (e.g., notmycomap.com) should be rejected."""
         url = "https://notmycomap.com/r12345"
         result = validate_mycomap_url(url)
-        # This should actually match because 'mycomap.com' is in the string
-        # Let's verify current behavior - this might be a loose match
-        # For security, it would be better to be stricter, but keeping current behavior
-        self.assertIsNone(result)  # If this fails, we need stricter domain validation
+        # Domain validation compares host labels, not substrings: "mycomap.com"
+        # appearing inside "notmycomap.com" must not make it a MycoMap URL.
+        self.assertIsNone(result)
 
 
 class TestMycomapBlastMetrics(unittest.TestCase):

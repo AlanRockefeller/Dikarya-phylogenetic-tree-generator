@@ -2089,7 +2089,13 @@ document.addEventListener('DOMContentLoaded', async () => {
                 showStatus("Tree not loaded yet.", "warning", 2000);
                 return;
             }
-            const newickStr = viewer.getNewickString();
+            let newickStr;
+            try {
+                newickStr = viewer.getNewickString();
+            } catch (err) {
+                showStatus(err?.message || "Tree export failed.", "warning", 3000);
+                return;
+            }
             if (!newickStr) {
                 showStatus("No tree data to export.", "warning", 2000);
                 return;
@@ -3108,8 +3114,8 @@ document.addEventListener('DOMContentLoaded', async () => {
 
         // Alan 5/29/26 - Rooting-mode dropdown drives the unified rooting API; "manual" defers to existing Reroot-Here click flow.
         if (rootingModeSelect) rootingModeSelect.addEventListener('change', () => {
-            // Rooting is a persisted edit; view-only trees must not reach it.
-            // The backend enforces this too (check_job_access mode="edit"), so this
+            // Alan 8/23/26 - Rooting is a persisted edit; view-only trees must not reach
+            // it. The backend enforces this too (check_job_access mode="edit"), so this
             // only keeps the UI from offering an action that can only 403.
             if (window.VIEW_ONLY || isProcessing) return;
             const mode = rootingModeSelect.value;
@@ -3396,8 +3402,8 @@ document.addEventListener('DOMContentLoaded', async () => {
             disableBtn(btnRecompute);
             // Alan 5/12/26 - Color clearing is a persisted edit, so disable it in view-only mode.
             disableBtn(btnUncolorSelection);
-            // Rooting mode and sequence-of-interest both persist edits, so they
-            // belong with the disabled controls rather than beside them.
+            // Alan 8/23/26 - Rooting mode and sequence-of-interest both persist edits, so
+            // they belong with the disabled controls rather than beside them.
             if (rootingModeSelect) {
                 rootingModeSelect.disabled = true;
                 rootingModeSelect.title = "View Only - Make an editable copy to use this feature";

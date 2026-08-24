@@ -7,6 +7,28 @@
 
     const DEBUG_MODE = new URLSearchParams(window.location.search).has('debug');
 
+    // Alan 8/24/26 - Say why a phylotree instance is not usable, or null when it is.
+    // phylotree.js does not throw on a truncated or otherwise unparseable Newick: its
+    // parser hands back a plain array instead of a d3 hierarchy, and the constructor
+    // now tolerates that rather than dying inside .links(). That tolerance is what
+    // keeps the bundle from taking the page down, but on its own it would turn a
+    // corrupt tree artifact into a blank viewer with no explanation. Every caller
+    // must run the model past this before treating it as renderable.
+    function describeTreeParseFailure(tree) {
+        const root = tree && (typeof tree.getNodes === 'function' ? tree.getNodes() : tree.nodes);
+        if (!root || Array.isArray(root) || typeof root.descendants !== 'function') {
+            return 'The tree file could not be parsed as Newick (it looks truncated or malformed).';
+        }
+        const tips = typeof tree.getTips === 'function' ? tree.getTips() : [];
+        if (!tips || tips.length === 0) {
+            return 'The tree file parsed but contains no sequences.';
+        }
+        return null;
+    }
+
+    // Exported so the Node regression harness can drive it without a DOM.
+    window.describeTreeParseFailure = describeTreeParseFailure;
+
     // Alan 7/15/26 - Hide pipeline-only MAFFT and RiC annotations from tip labels while preserving stable tree IDs.
     function cleanTipDisplayName(name) {
         if (typeof name !== 'string') return name;
@@ -558,6 +580,18 @@
 
             // 2. CREATE TREE
             this.tree = new phylotreeLib.phylotree(newick);
+
+            // Alan 8/24/26 - Refuse to render a model the parser never actually built.
+            // Throwing here reaches loadTreeNow()'s catch in tree_viewer_controller.js,
+            // which prints the reason into the container and ships it to the server log,
+            // so a corrupt tree/tree_original.newick is a legible failure rather than an
+            // empty canvas that looks like a tree with nothing in it.
+            const parseFailure = describeTreeParseFailure(this.tree);
+            if (parseFailure) {
+                this.tree = null;
+                this.allNodes = [];
+                throw new Error(parseFailure);
+            }
 
             // Tag original order per-parent for correct restoration
             this.tree.traverse_and_compute(n => {

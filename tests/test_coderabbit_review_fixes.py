@@ -136,8 +136,10 @@ class VoucherNumberingTests(unittest.TestCase):
     def test_browser_and_server_produce_identical_labels(self):
         script = extract_js(
             read("app", "templates", "voucher_labels.html"),
-            "    // Must stay equal to MAX_VOUCHER_NUMBER_DIGITS",
-            "    // Say so rather than quietly numbering from 1.",
+            # Anchored on code, not on comment prose, so re-wording a comment
+            # cannot quietly stop this test from extracting the real parser.
+            "    const MAX_VOUCHER_NUMBER_DIGITS =",
+            "    function renderStartNumberNotice()",
         )
         rows = run_node("voucher_number.test.js", script, json.dumps(self.CASES))
         self.assertEqual(len(rows), len(self.CASES))
@@ -157,8 +159,10 @@ class VoucherNumberingTests(unittest.TestCase):
     def test_the_over_limit_case_is_flagged_to_the_user(self):
         script = extract_js(
             read("app", "templates", "voucher_labels.html"),
-            "    // Must stay equal to MAX_VOUCHER_NUMBER_DIGITS",
-            "    // Say so rather than quietly numbering from 1.",
+            # Anchored on code, not on comment prose, so re-wording a comment
+            # cannot quietly stop this test from extracting the real parser.
+            "    const MAX_VOUCHER_NUMBER_DIGITS =",
+            "    function renderStartNumberNotice()",
         )
         cases = [
             ("1" * main_routes.MAX_VOUCHER_NUMBER_DIGITS, "X", 0),
@@ -167,6 +171,37 @@ class VoucherNumberingTests(unittest.TestCase):
         rows = run_node("voucher_number.test.js", script, json.dumps(cases))
         self.assertFalse(rows[0]["tooLong"])
         self.assertTrue(rows[1]["tooLong"])
+
+
+class LogLineStreamClassTests(unittest.TestCase):
+    """Command lines must stay green, and no other stream may become a class.
+
+    The safe-DOM refactor replaced ``className = `log-line ${event.stream}` `` with
+    a two-value check for stdout/stderr, which silently dropped the ``cmd`` class
+    that publish_command() relies on to render "$ mafft ..." in green.
+    """
+
+    def test_the_worker_still_emits_the_cmd_stream(self):
+        events = read("app", "workers", "events.py")
+        self.assertIn('"stream": "cmd"', events)
+
+    def test_the_page_still_styles_the_cmd_class(self):
+        html = read("app", "templates", "job_status.html")
+        self.assertIn("#job-status-page .log-line.cmd", html)
+
+    def test_only_the_known_streams_become_classes(self):
+        js = read("app", "static", "js", "job_status.js")
+        self.assertIn("LOG_STREAM_CLASSES", js)
+        self.assertIn("'stdout', 'stderr', 'cmd'", js)
+
+    def test_class_assignment_behaviour(self):
+        # Runs the shipped job_status.js: cmd/stdout/stderr are applied, and a
+        # hostile stream value contributes nothing.
+        run_node(
+            "log_line_classes.test.js",
+            read("app", "static", "js", "job_status.js"),
+            expect_json=False,
+        )
 
 
 class DownloadsDropdownBehaviourTests(unittest.TestCase):
@@ -224,14 +259,47 @@ class DeadStylesheetTests(unittest.TestCase):
     def test_the_dead_stylesheet_is_gone(self):
         self.assertFalse((REPO / "app" / "static" / "css" / "job_status.css").exists())
 
-    def test_nothing_references_it(self):
-        hits = subprocess.run(
-            ["git", "grep", "-l", "job_status.css"],
-            cwd=REPO,
-            capture_output=True,
-            text=True,
+    def test_no_live_source_references_it(self):
+        """Scan the application tree only.
+
+        The first version shelled out to a repo-wide ``git grep``. That passed
+        only for as long as this file was untracked: ``git grep`` skips
+        untracked files, so once the test was committed it matched its own
+        source and failed. Walking ``app/`` instead is independent of whether
+        anything is tracked, and it also catches a stale reference in a file
+        that has not been added to the index yet -- which ``git grep`` would
+        miss entirely.
+        """
+        needle = "job_status" + ".css"
+        app_dir = REPO / "app"
+        scanned = 0
+        offenders = []
+        for path in app_dir.rglob("*"):
+            if not path.is_file() or path.suffix not in {".html", ".py", ".js", ".css", ".txt"}:
+                continue
+            if "__pycache__" in path.parts:
+                continue
+            scanned += 1
+            if needle in path.read_text(encoding="utf-8", errors="replace"):
+                offenders.append(str(path.relative_to(REPO)))
+        # Guard against a glob that silently matches nothing and passes vacuously.
+        self.assertGreater(scanned, 100, "the scan inspected suspiciously few files")
+        self.assertEqual(offenders, [], "stale reference to the deleted stylesheet")
+
+    def test_the_scan_would_catch_a_reintroduced_reference(self):
+        """The assertion above must be able to fail."""
+        needle = "job_status" + ".css"
+        probe = REPO / "app" / "templates" / "_stale_stylesheet_probe.html"
+        self.assertFalse(probe.exists())
+        probe.write_text(
+            '<link rel="stylesheet" href="/static/css/{}">\n'.format(needle),
+            encoding="utf-8",
         )
-        self.assertEqual(hits.stdout.strip(), "")
+        try:
+            with self.assertRaises(AssertionError):
+                self.test_no_live_source_references_it()
+        finally:
+            probe.unlink()
 
     def test_the_live_page_keeps_its_own_scoped_styles(self):
         # The page's real styles are inline and scoped under #job-status-page;

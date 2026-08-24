@@ -80,8 +80,13 @@ fi
 # Oldest rotation first so the output reads forward in time. logrotate numbers
 # them newest-lowest (error.log.1 is more recent than error.log.2.gz), so the
 # live file sorts last and the numbered ones sort in reverse.
+#
+# -V, not plain -r: once ten or more rotations exist, a lexical reverse sort
+# puts .11 and .10 ahead of .9, and an -all request spanning those rotations
+# jumps backward and forward in time. Version sort orders the trailing
+# generation numerically, which is what makes the output chronological.
 FILES=""
-for f in $(ls -1 $GLOB 2>/dev/null | sort -r); do
+for f in $(ls -1 $GLOB 2>/dev/null | sort -Vr); do
     [ -r "$f" ] && FILES="$FILES $f"
 done
 

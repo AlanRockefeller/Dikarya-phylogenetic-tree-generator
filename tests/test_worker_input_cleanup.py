@@ -70,7 +70,9 @@ class WorkerInputCleanupTests(unittest.TestCase):
             return kwargs.get("job_id") or "new-job"
 
         fake_session = SimpleNamespace(add=Mock(), commit=Mock())
-        fake_job_model = lambda **kwargs: SimpleNamespace(**kwargs)
+        def fake_job_model(**kwargs):
+            return SimpleNamespace(**kwargs)
+
         source_db_job = SimpleNamespace(user_id=7)
         app = Flask(__name__)
         app.secret_key = "test"

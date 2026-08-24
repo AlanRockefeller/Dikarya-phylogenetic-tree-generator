@@ -1308,6 +1308,9 @@
 {% block scripts %}
 
 <script>
+    // Alan 8/23/26 - Serialize every value with the tojson filter; interpolating one
+    // directly into a quoted JS string breaks the statement on any quote or
+    // backslash in the value, and HTML escaping does not apply inside <script>.
     window.JOB_ID = {{ job_id|tojson }};
     // Alan 8/22/26 - Resolved server-side (tree_analysis_service.resolve_tree_support_context)
     // so the support badge and the Claude review classify the same tree the same way, including

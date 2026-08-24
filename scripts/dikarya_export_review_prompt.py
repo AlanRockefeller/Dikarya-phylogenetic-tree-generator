@@ -42,7 +42,12 @@ def rendered(what: str) -> str:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description=__doc__)
+    # Raw, because the docstring above is the copy/paste install procedure and
+    # the default formatter re-wraps it into one unusable paragraph.
+    parser = argparse.ArgumentParser(
+        description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
     parser.add_argument("what", choices=["system", "schema"], nargs="?")
     parser.add_argument(
         "--check", action="store_true",

@@ -306,10 +306,18 @@ def test_viewer_support_classification_matches_the_same_table():
     assert completed.returncode == 0, completed.stderr
 
     got = json.loads(completed.stdout)
-    expected = [case["expected"] for case in _support_cases()]
+    # One read of the shared table, and an explicit length check before the
+    # comparison: zip() stops at the shorter input, so a harness that returned
+    # results for only the first few cases produced an empty `mismatches` and a
+    # green test over a table that was never fully checked.
+    cases = _support_cases()
+    expected = [case["expected"] for case in cases]
+    assert len(got) == len(expected), (
+        f"the viewer returned {len(got)} results for {len(expected)} cases"
+    )
     mismatches = [
         (case["name"], want, have)
-        for case, want, have in zip(_support_cases(), expected, got)
+        for case, want, have in zip(cases, expected, got, strict=True)
         if want != have
     ]
     assert not mismatches, f"viewer disagrees with the shared table: {mismatches}"

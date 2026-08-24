@@ -273,9 +273,9 @@ const TreeEditActions = {
         try {
             const error = new Error(String(message || 'tree edit failure'));
             if (context) error.stack = String(context);
-            // Optional-chaining away the call made the report vanish silently when
-            // the shared reporting layer had not loaded -- the exact outcome the
-            // comment above is about.
+            // Alan 8/23/26 - Optional-chaining away the call made the report vanish
+            // silently when the shared reporting layer had not loaded -- the exact
+            // outcome the comment above is about.
             if (typeof window.reportClientError === 'function') {
                 window.reportClientError('tree_edit.action_failed', error);
             } else {

@@ -63,8 +63,13 @@ class _FakeRedis:
         return int(self.values.pop(key, None) is not None)
 
     def eval(self, script, numkeys, key, arg):
-        # The only script this module runs is delete-if-owned.
-        assert "del" in script
+        # The only script this module runs is compare-and-delete, and this fake
+        # implements exactly that. Check both halves case-insensitively: a bare
+        # `"del" in script` matched any Lua text containing those three letters
+        # and broke on the equally valid redis.call("DEL", ...), reporting a
+        # confusing AssertionError instead of a redis-behaviour mismatch.
+        lowered = script.lower()
+        assert "del" in lowered and "get" in lowered, script
         if self.values.get(key) == arg:
             return self.delete(key)
         return 0

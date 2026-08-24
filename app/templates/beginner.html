@@ -44,6 +44,8 @@
 
     if (!seq && file) {
       statusEl.textContent = "Reading file…";
+      // Alan 8/23/26 - A FileReader rejection used to escape this async listener and
+      // leave the status stuck on "Reading file…" with no error shown.
       try {
         seq = (await readFileAsText(file)).trim();
       } catch (e) {
@@ -57,6 +59,8 @@
       return;
     }
 
+    // Alan 8/23/26 - Disable while posting: every click submitted another job, so a
+    // double-click created duplicate pipeline runs.
     const btn = document.getElementById("submit_btn");
     if (btn) {
       if (btn.disabled) return;
@@ -80,6 +84,8 @@
     const headers = { "Content-Type": "application/json" };
     if (csrfToken) headers["X-CSRFToken"] = csrfToken;
 
+    // Alan 8/23/26 - fetch throws on network failure; without this the status stayed
+    // on "Submitting job…" and the button never came back.
     let resp = null;
     let data = null;
     try {

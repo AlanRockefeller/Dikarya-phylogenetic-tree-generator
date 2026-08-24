@@ -6,6 +6,8 @@
  * body below is a stub, not a working renderer.
  */
 function renderJsPhyloSVG(treeJson, elementId, callbacks) {
+    // Alan 8/23/26 - Guard the lookup and write text rather than markup; the stub also
+    // no longer claims to be rendering something.
     const container = document.getElementById(elementId);
     if (!container) {
         console.error(`renderJsPhyloSVG: element #${elementId} not found.`);

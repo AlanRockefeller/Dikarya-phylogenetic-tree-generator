@@ -19,4 +19,15 @@ dikarya ALL=(tree) NOPASSWD: /usr/local/sbin/dikarya-claude-review ""
 
 # Do not add further commands to this file. Each entry here is a path from an
 # internet-facing process into another user's account.
+# These four are the only caller-supplied values that survive sudo, and every one
+# of them is checked twice: the unprivileged caller (app/config.py) canonicalizes
+# them, and the root-owned wrapper enforces them. The wrapper is the boundary and
+# is deliberately the stricter of the two; what must hold is that it never
+# rejects a value the app can legitimately emit.
+#
+# DIKARYA_CLAUDE_MAX_BUDGET is the one that spends money. It is capped at $2.00
+# in both places -- CLAUDE_REVIEW_MAX_BUDGET_HARD_CAP_USD in app/config.py, which
+# explains where the figure comes from, and MAX_BUDGET_HARD_CENTS in the wrapper.
+# env_keep only carries the value; it cannot check it, so neither side may relax
+# its own rules.
 Defaults!/usr/local/sbin/dikarya-claude-review env_keep += "DIKARYA_CLAUDE_MODEL DIKARYA_CLAUDE_EFFORT DIKARYA_CLAUDE_TIMEOUT DIKARYA_CLAUDE_MAX_BUDGET"

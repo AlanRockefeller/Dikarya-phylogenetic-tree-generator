@@ -25,6 +25,15 @@ NUMERIC_SEG_RE = re.compile(r'/\d+(?=/|$|\.)')
 TS_RE = re.compile(r'^\[?(\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2})')
 LEVEL_RE = re.compile(r'\[(ERROR|CRITICAL|WARNING)\]')
 CONTEXT_RE = re.compile(r'\[(?=[^\]]*\b(?:req|job|rq|user)=)(?P<body>[^\]]+)\]')
+# The WARNING+ mirror's timestamp has milliseconds and is followed by a logger
+# name. Gunicorn's copy instead has a numeric UTC offset and no logger field.
+# Distinguish those formatter layouts before removing metadata: an application
+# message may itself legitimately begin with a bracketed tag such as [ALIGN].
+MIRROR_HEAD_RE = re.compile(
+    r'^\[\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2},\d{3}\]\s+'
+    r'\[\d+\]\s+\[(?:ERROR|CRITICAL|WARNING)\]\s+'
+    r'\[[^\]]+\]\s*(?P<message>.*)$'
+)
 EXCEPTION_RE = re.compile(r'^([A-Za-z_][\w.]*(?:Error|Exception|Warning|Exit|Interrupt))(?::\s*(.*))?$')
 STATIC_SUFFIXES = (".css", ".js", ".map", ".ico", ".png", ".jpg", ".jpeg", ".gif", ".svg", ".webp", ".woff", ".woff2")
 SCANNER_MARKERS = (
@@ -103,10 +112,32 @@ def normalize_path(path):
 
 
 def parse_access_ts(raw):
+    """Parse Gunicorn's %(t)s and normalize it to naive UTC.
+
+    Everything else in this digest is naive UTC: the window boundaries come from
+    parse_window_timestamp(), which converts to UTC and drops the tzinfo, and the
+    application log timestamps are written in UTC. Gunicorn's timestamp carries
+    an explicit offset, and it used to be discarded -- correct only for as long
+    as the host stays on UTC. On any other host, or across a DST transition, that
+    silently slides the whole 24-hour window by the offset. Apply the offset and
+    convert; do not simply strip it.
+    """
+    parts = raw.strip().strip("[]").split()
+    if not parts:
+        return None
     try:
-        return datetime.strptime(raw.split()[0], "%d/%b/%Y:%H:%M:%S")
+        when = datetime.strptime(parts[0], "%d/%b/%Y:%H:%M:%S")
     except ValueError:
         return None
+    if len(parts) < 2:
+        # No offset in the record. It is already whatever the host writes, which
+        # is the same assumption parse_log_ts makes about the app logs.
+        return when
+    try:
+        aware = datetime.strptime(f"{parts[0]} {parts[1]}", "%d/%b/%Y:%H:%M:%S %z")
+    except ValueError:
+        return when
+    return aware.astimezone(timezone.utc).replace(tzinfo=None)
 
 
 def parse_log_ts(line):
@@ -316,6 +347,16 @@ def iter_log_records(path):
             yield "".join(current)
 
 
+def formatted_log_message(first_line):
+    """Return message data after stripping only known formatter metadata."""
+    mirror = MIRROR_HEAD_RE.match(first_line)
+    if mirror:
+        message = mirror.group("message")
+    else:
+        message = LEVEL_RE.split(first_line, 1)[-1]
+    return CONTEXT_RE.sub("", message).strip()
+
+
 def meaningful_error_key(record):
     lines = [line.strip() for line in record.splitlines() if line.strip()]
     for line in reversed(lines[1:]):
@@ -324,16 +365,54 @@ def meaningful_error_key(record):
             detail = re.sub(r'\b\d+\b', '<n>', UUID_RE.sub('<id>', match.group(2) or ''))
             return f"{match.group(1).split('.')[-1]}: {detail}"[:180].rstrip(": ")
     first = lines[0] if lines else record
-    message = LEVEL_RE.split(first, 1)[-1]
-    message = CONTEXT_RE.sub("", message)
-    message = re.sub(r'^\s*\[[^\]]+\]\s*', '', message)
+    message = formatted_log_message(first)
     message = UUID_RE.sub("<id>", message)
     message = re.sub(r'\b\d+\b', '<n>', message)
     return message.strip()[:180]
 
 
+def record_identity(record):
+    """A mirror-invariant identity for one log record.
+
+    error.log and errors.log carry the same WARNING+ records, but not the same
+    bytes. error.log is written by the handler Gunicorn installed, wrapped by
+    ContextFormatter -- "[2026-08-24 08:01:02 +0000] [pid] [ERROR] msg [req=..]".
+    errors.log is written by install_error_mirror()'s own handler, whose format
+    adds the logger name and milliseconds -- "[2026-08-24 08:01:02,123] [pid]
+    [ERROR] [app.services.queue] msg [req=..]". Keying on the raw text therefore
+    counted one incident twice.
+
+    Everything below is derived only from the parts both formats carry: the
+    message after the level, with the logger-name bracket and the trailing
+    context suffix removed, plus the traceback lines (identical in both, because
+    ContextFormatter appends its suffix to the first line only) and the context
+    fields themselves. Note that identifiers and numbers are deliberately NOT
+    normalized away here -- unlike meaningful_error_key(), which folds them so
+    related failures group together, this has to keep two genuinely different
+    same-second messages apart.
+    """
+    lines = record.splitlines()
+    first = lines[0] if lines else record
+    message = formatted_log_message(first)
+    body = tuple(line.rstrip() for line in lines[1:])
+    context = tuple(sorted(context_fields(first).items()))
+    return (message.strip(), body, context)
+
+
 def analyze_errors(cutoff, until=None):
-    files = log_files("error", cutoff) + log_files("errors", cutoff)
+    # Grouped by stem rather than flattened into one list, because the
+    # occurrence counter below has to reset between the two mirrored streams
+    # while still counting across each stream's own rotations.
+    #
+    # errors.log is a level-filtered mirror of error.log (app/__init__.py
+    # attaches the WARNING+ handler to the root logger), so a WARNING or worse
+    # record is written to both, in the same order. It is NOT written at the
+    # same byte offset -- error.log carries the INFO traffic in between -- so
+    # position in the file cannot identify a record across the mirror. What does
+    # survive the mirror is ordinal position *among matching records*: the third
+    # "Redis unavailable" in this second is the third in either file.
+    streams = [log_files("error", cutoff), log_files("errors", cutoff)]
+    files = [path for stream in streams for path in stream]
     exceptions = collections.Counter()
     degradations = collections.Counter()
     affected = collections.defaultdict(set)
@@ -341,47 +420,72 @@ def analyze_errors(cutoff, until=None):
     seen = set()
     oldest = newest = None
     lines = unparsed = contextual = records = 0
-    for path in files:
-        for record in iter_log_records(path):
-            records += 1
-            lines += record.count("\n") or 1
-            when = parse_log_ts(record)
-            if when is None:
-                unparsed += 1
-                continue
-            if (
-                when < cutoff
-                or (until is not None and when >= until)
-                or not LEVEL_RE.search(record.splitlines()[0])
-            ):
-                continue
-            fields = context_fields(record.splitlines()[0])
-            oldest = when if oldest is None or when < oldest else oldest
-            newest = when if newest is None or when > newest else newest
-            key = meaningful_error_key(record)
-            # Mirrored files and repeated records inside one request are one incident.
-            incident = (fields.get("req"), key) if fields.get("req") not in (None, "-") else (when, key)
-            if incident in seen:
-                continue
-            seen.add(incident)
-            if fields:
-                contextual += 1
-            user = fields.get("user")
-            job = fields.get("job")
-            if "DEGRADED" in record:
-                event = re.search(r'event=degraded\.([\w.-]+)', record)
-                slug = event.group(1) if event else record.split("DEGRADED", 1)[-1].strip().split(":", 1)[0]
-                degradations[slug[:100]] += 1
-                if user:
-                    affected[slug[:100]].add(user)
-                if job:
-                    affected_jobs[slug[:100]].add(job)
-            else:
-                exceptions[key] += 1
-                if user:
-                    affected[key].add(user)
-                if job:
-                    affected_jobs[key].add(job)
+    for stream in streams:
+        # How many times this exact record has already been seen in this stream.
+        # Reset per stream so the mirror's copies line up with the originals,
+        # and shared across the stream's rotations so a record either side of a
+        # rotation boundary is not mistaken for the same occurrence.
+        occurrences = collections.Counter()
+        for path in stream:
+            for record in iter_log_records(path):
+                records += 1
+                lines += record.count("\n") or 1
+                when = parse_log_ts(record)
+                if when is None:
+                    unparsed += 1
+                    continue
+                if (
+                    when < cutoff
+                    or (until is not None and when >= until)
+                    or not LEVEL_RE.search(record.splitlines()[0])
+                ):
+                    continue
+                fields = context_fields(record.splitlines()[0])
+                oldest = when if oldest is None or when < oldest else oldest
+                newest = when if newest is None or when > newest else newest
+                key = meaningful_error_key(record)
+                request = fields.get("req")
+                if request not in (None, "-"):
+                    # A request id already identifies the occurrence: repeats
+                    # inside one request are one incident, and the mirror
+                    # carries the same id.
+                    incident = (request, key)
+                else:
+                    # No request id, so the record has to identify itself.
+                    # Timestamp plus normalized key is not enough (one-second
+                    # resolution, and the key rewrites every integer to <n>), and
+                    # the raw text is worse than useless: it is byte-identical
+                    # for three separate failures in the same second, and NOT
+                    # identical for the two copies of one failure, because the
+                    # two streams are formatted by different handlers. Identify
+                    # the record by its normalized semantic content -- which is
+                    # the same on both sides of the mirror -- and separate
+                    # repeats by their occurrence ordinal within the stream, so
+                    # the mirror's Nth copy lands on the original's Nth.
+                    signature = (when, key, record_identity(record))
+                    incident = signature + (occurrences[signature],)
+                    occurrences[signature] += 1
+                if incident in seen:
+                    continue
+                seen.add(incident)
+                if fields:
+                    contextual += 1
+                user = fields.get("user")
+                job = fields.get("job")
+                if "DEGRADED" in record:
+                    event = re.search(r'event=degraded\.([\w.-]+)', record)
+                    slug = event.group(1) if event else record.split("DEGRADED", 1)[-1].strip().split(":", 1)[0]
+                    degradations[slug[:100]] += 1
+                    if user:
+                        affected[slug[:100]].add(user)
+                    if job:
+                        affected_jobs[slug[:100]].add(job)
+                else:
+                    exceptions[key] += 1
+                    if user:
+                        affected[key].add(user)
+                    if job:
+                        affected_jobs[key].add(job)
     return {
         "exceptions": exceptions, "degradations": degradations, "affected": affected,
         "affected_jobs": affected_jobs,
@@ -567,7 +671,12 @@ def analyze_worker(cutoff, grace=timedelta(minutes=60), until=None):
 
     # "Unterminated" only means something once a job has had time to finish.
     # Anything younger than the grace period is simply still running.
-    reference = until or newest or datetime.now()
+    # `until` is always set by main(), so this falls back only when a caller
+    # uses analyze_worker() directly. Age against the present in naive UTC, not
+    # against `newest`: a worker that died stops advancing the log, which would
+    # pin the reference near its last line and report its stranded job "active"
+    # forever -- the exact case this section exists to surface.
+    reference = until or datetime.now(timezone.utc).replace(tzinfo=None)
     unmatched = [(job_id, when) for job_id, when in started.items() if job_id not in terminal]
     active = [item for item in unmatched if reference - item[1] < grace]
     stale = sorted((item for item in unmatched if reference - item[1] >= grace), key=lambda item: item[1])

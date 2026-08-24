@@ -35,6 +35,7 @@ from app.services.tree_annotation_service import (  # noqa: E402
     CLADE_ANNOTATIONS_KEY,
     MAX_LABEL_LENGTH,
     MAX_LABEL_LINES,
+    MAX_LAYERS,
     AnnotationValidationError,
     apply_annotation_config,
     build_leaf_identity_map,
@@ -343,8 +344,14 @@ class RejectionTests(unittest.TestCase):
         self._reject({"layers": [_layer()], "annotations": [_annotation(members=[])]})
 
     def test_too_many_layers_are_rejected(self):
+        # MAX_LAYERS + 1, taken from the validator rather than a copy of its
+        # current value: a hardcoded 21 stops testing the limit the moment the
+        # limit moves, and does so without failing.
         self._reject({
-            "layers": [_layer(f"layer_{i}", f"L{i}", order=i + 1) for i in range(21)],
+            "layers": [
+                _layer(f"layer_{i}", f"L{i}", order=i + 1)
+                for i in range(MAX_LAYERS + 1)
+            ],
             "annotations": [],
         })
 
@@ -664,7 +671,12 @@ class IncompletePayloadRouteTests(unittest.TestCase):
 # browser stubs, hands the viewer a synthetic tip order and node tree, and asks
 # it to resolve annotations -- no DOM, no D3, no new JS test framework.
 
-_RENDER_HARNESS_JS = r"""
+# The browser stubs both Node harnesses need, defined once. They used to be
+# copied verbatim into each harness, so a viewer that started touching a new
+# global had to be accommodated in both -- and updating only one failed with a
+# ReferenceError pointing at the viewer rather than at the harness that was
+# missing the stub.
+_HARNESS_PRELUDE_JS = r"""
 const fs = require('fs');
 const vm = require('vm');
 
@@ -681,7 +693,16 @@ const sandbox = {
 sandbox.window.window = sandbox.window;
 vm.createContext(sandbox);
 vm.runInContext(fs.readFileSync(process.argv[2], 'utf8'), sandbox);
+"""
 
+# Instantiated without running the constructor: these tests exercise pure
+# methods, and the real constructor wants a DOM.
+_HARNESS_VIEWER_JS = r"""
+const viewer = Object.create(sandbox.window.DikaryaTreeViewer.prototype);
+"""
+
+
+_RENDER_HARNESS_JS = _HARNESS_PRELUDE_JS + r"""
 // Build a node tree from a nested array spec: a string is a leaf, an array is
 // an internal node. Same shape the viewer walks when it indexes clade blocks.
 const allNodes = [];
@@ -701,8 +722,7 @@ build(input.tree, null);
 
 const positions = new Map();
 input.tipOrder.forEach((id, index) => positions.set(id, { y: index * 10, index }));
-
-const viewer = Object.create(sandbox.window.DikaryaTreeViewer.prototype);
+""" + _HARNESS_VIEWER_JS + r"""
 viewer.allNodes = allNodes;
 viewer._getNodeId = (node) => node.id || null;
 viewer.annotationLayers = input.layers;
@@ -1006,25 +1026,7 @@ class AnnotationRenderDecisionTests(unittest.TestCase):
 # pure functions, so Node evaluates them directly. No DOM, no D3, no new JS test
 # framework.
 
-_LAYOUT_HARNESS_JS = r"""
-const fs = require('fs');
-const vm = require('vm');
-
-const input = JSON.parse(fs.readFileSync(0, 'utf8'));
-const sandbox = {
-    console, setTimeout, clearTimeout, URLSearchParams,
-    document: { getElementById: () => null },
-    window: {
-        location: { search: '' },
-        addEventListener: () => {},
-        removeEventListener: () => {}
-    }
-};
-sandbox.window.window = sandbox.window;
-vm.createContext(sandbox);
-vm.runInContext(fs.readFileSync(process.argv[2], 'utf8'), sandbox);
-
-const viewer = Object.create(sandbox.window.DikaryaTreeViewer.prototype);
+_LAYOUT_HARNESS_JS = _HARNESS_PRELUDE_JS + _HARNESS_VIEWER_JS + r"""
 
 // Character-count stand-in for getComputedTextLength(): deterministic, and all
 // the layout rules care about is which string is the widest.

@@ -18,11 +18,22 @@ from unittest.mock import Mock, patch
 
 import pytest
 
-# create_app() refuses the unconfigured SQLite fallback so a production script
-# cannot silently query a stale local app.db; opt in explicitly for these tests.
-os.environ.setdefault("ALLOW_SQLITE_FALLBACK", "1")
-
 REPO_ROOT = Path(__file__).resolve().parents[1]
+
+
+@pytest.fixture(autouse=True)
+def allow_sqlite_fallback():
+    """Opt into the SQLite fallback for this module only.
+
+    create_app() refuses the unconfigured fallback so a production script cannot
+    silently query a stale local app.db. This used to be set on os.environ at
+    import time and never removed: pytest collects every module into one
+    process, so the opt-in leaked into every module imported after this one, and
+    a test elsewhere asserting that create_app() *refuses* the fallback would
+    have passed for the wrong reason.
+    """
+    with patch.dict(os.environ, {"ALLOW_SQLITE_FALLBACK": "1"}):
+        yield
 
 
 def _digest_module():

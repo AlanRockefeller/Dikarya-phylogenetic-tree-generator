@@ -288,19 +288,19 @@
     function fitCount(usableSize, labelSize, gapSize) {
         const pitch = labelSize + gapSize;
         if (pitch <= 0) return 1;
-        // Same epsilon as _voucher_fit_count server-side, so a layout that fits
-        // exactly is not rounded down here and drawn differently from the output.
+        // Alan 8/23/26 - Same epsilon as _voucher_fit_count server-side, so a layout that
+        // fits exactly is not rounded down here and drawn differently from the output.
         return Math.max(1, Math.floor((usableSize + gapSize + 1e-6) / pitch));
     }
 
-    // Must stay equal to MAX_VOUCHER_NUMBER_DIGITS in app/main/routes.py: the
-    // browser preview and the generated sheet have to agree on every label.
+    // Alan 8/23/26 - Must stay equal to MAX_VOUCHER_NUMBER_DIGITS in app/main/routes.py:
+    // the browser preview and the generated sheet have to agree on every label.
     const MAX_VOUCHER_NUMBER_DIGITS = 30;
 
-    // One parser for both call sites. BigInt, not Number: a voucher number is an
-    // identifier, so it is reproduced exactly however long it is, and Number
-    // silently repeated values past 2^53. Nothing is truncated -- an implausibly
-    // long run is reported and the default is used, matching the server.
+    // Alan 8/23/26 - One parser for both call sites. BigInt, not Number: a voucher
+    // number is an identifier, so it is reproduced exactly however long it is, and
+    // Number silently repeated values past 2^53. Nothing is truncated -- an
+    // implausibly long run is reported and the default is used, matching the server.
     function startNumberParts() {
         const rawStart = (startInput.value || '001').trim();
         const match = rawStart.match(/\d+/);
@@ -328,7 +328,7 @@
         return String(start + BigInt(generatedCount)).padStart(width, '0');
     }
 
-    // Say so rather than quietly numbering from 1.
+    // Alan 8/23/26 - Say so rather than quietly numbering from 1.
     function renderStartNumberNotice() {
         if (!startNumberNotice) return;
         const { tooLong } = startNumberParts();
@@ -404,8 +404,8 @@
                 gap_x: fieldValue('custom_gap_x', 0.125, 0, 2),
                 gap_y: fieldValue('custom_gap_y', 0, 0, 2)
             };
-            // Mirrors _voucher_layout_from_form: the sheet cannot hold more than
-            // this, and without the clamp the preview drew clipped labels while
+            // Alan 8/23/26 - Mirrors _voucher_layout_from_form: the sheet cannot hold more
+            // than this, and without the clamp the preview drew clipped labels while
             // reporting the full requested count.
             const usableWidth = Math.max(0, preset.page_width - preset.margin_left);
             const usableHeight = Math.max(0, preset.page_height - preset.margin_top);
