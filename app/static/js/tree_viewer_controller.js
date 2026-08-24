@@ -3299,8 +3299,8 @@ document.addEventListener('DOMContentLoaded', async () => {
             if (key === 'd' && viewer && !isProcessing) {
                 deselectCurrentTreeSelection();
                 handled = true;
-            // Alan 7/20/26 - V opens the existing Alignment Viewer through its established click handler.
-            } else if (key === 'v' && viewer && btnAlignmentViewer && !btnAlignmentViewer.disabled) {
+            // Alan 8/24/26 - A opens the Alignment Viewer; V stays as the original alias.
+            } else if ((key === 'a' || key === 'v') && viewer && btnAlignmentViewer && !btnAlignmentViewer.disabled) {
                 btnAlignmentViewer.click();
                 handled = true;
             // Alan 7/20/26 - S cycles the existing original, ascending, and descending node sort modes.
@@ -3499,8 +3499,8 @@ document.addEventListener('DOMContentLoaded', async () => {
         btnAlignmentViewer.classList.toggle('cursor-not-allowed', disabled);
         // Alan 7/20/26 - Preserve V shortcut discoverability when the count-aware Alignment Viewer tooltip refreshes.
         btnAlignmentViewer.title = selected.length > 0
-            ? `Open Alignment Viewer for ${selected.length} selected sequence${selected.length === 1 ? '' : 's'} (V)`
-            : `Open Alignment Viewer for ${visible.length} visible sequence${visible.length === 1 ? '' : 's'} (V)`;
+            ? `Open Alignment Viewer for ${selected.length} selected sequence${selected.length === 1 ? '' : 's'} (A)`
+            : `Open Alignment Viewer for ${visible.length} visible sequence${visible.length === 1 ? '' : 's'} (A)`;
         btnAlignmentViewer.innerHTML = count > 0
             ? `<i class="fa fa-stream"></i> Alignment Viewer (${count})`
             : '<i class="fa fa-stream"></i> Alignment Viewer';
