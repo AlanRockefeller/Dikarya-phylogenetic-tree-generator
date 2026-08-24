@@ -1,0 +1,80 @@
+#!/bin/sh
+# Source for /usr/local/sbin/restart-dikarya-web (root-owned, installed
+# separately; see "Restarting Dikarya services" in AGENTS.md).
+#
+# WHY THIS VERIFIES RATHER THAN JUST RESTARTING
+# ---------------------------------------------
+# `systemctl restart` returns when systemd is satisfied the unit started, which
+# is not the same as Dikarya being able to serve a request. Gunicorn does not
+# import the application until a request arrives, so a module that fails to
+# import survives a "successful" restart and only breaks when the first real
+# user shows up. That is exactly the 2026-08-14 incident recorded in AGENTS.md:
+# POST /api/job returned 500 for 3.5 hours after a restart systemd called fine.
+#
+# Curling /health after the restart forces that first request ourselves, so the
+# import happens here, in front of whoever ran the restart, instead of in front
+# of a user. /health also exercises the database and filesystem checks.
+#
+# Exit codes:
+#   0   restarted and healthy
+#   64  arguments were passed (this wrapper accepts none, by design)
+#   69  restarted but never became healthy   <- look at the journal output
+#   70  systemctl restart itself failed
+#   77  not run as root (re-run with sudo)
+#   75  serving, but /health reports degraded (503)
+set -eu
+
+[ "$#" -eq 0 ] || exit 64
+
+# Without this, a non-root caller falls through to polkit, which answers "you
+# forgot sudo" with an interactive identity picker listing every admin on the
+# box and then a password prompt that cannot succeed. Fail fast with the actual
+# remedy instead.
+if [ "$(id -u)" -ne 0 ]; then
+    echo "restart-dikarya-web: must run as root. Re-run:" >&2
+    echo "    sudo /usr/local/sbin/restart-dikarya-web" >&2
+    exit 77
+fi
+
+UNIT=dikarya-web.service
+HEALTH_URL=http://127.0.0.1:8000/health
+DEADLINE=45          # seconds to allow for the app to start serving
+
+if ! /usr/bin/systemctl restart "$UNIT"; then
+    echo "restart-dikarya-web: systemctl restart $UNIT failed" >&2
+    /usr/bin/systemctl status --no-pager --lines=20 "$UNIT" >&2 || true
+    exit 70
+fi
+
+# Poll rather than sleeping a fixed interval: a healthy restart is usually
+# serving in 3-4 seconds and there is no reason to wait longer than it takes.
+i=0
+last_code=000
+while [ "$i" -lt "$DEADLINE" ]; do
+    last_code=$(/usr/bin/curl -sS -o /dev/null -w '%{http_code}' \
+        --max-time 5 "$HEALTH_URL" 2>/dev/null || echo 000)
+    case "$last_code" in
+        200)
+            echo "restart-dikarya-web: $UNIT restarted and healthy (${i}s)"
+            exit 0
+            ;;
+        503)
+            # Serving, so the restart worked and the code imported; the app
+            # itself is reporting a sick dependency. Distinct from a failure to
+            # come back at all, and needs a different fix, so say so.
+            echo "restart-dikarya-web: $UNIT is serving but /health reports" \
+                 "DEGRADED (503). The restart succeeded; something the app" \
+                 "depends on is unhealthy:" >&2
+            /usr/bin/curl -sS --max-time 5 "$HEALTH_URL" >&2 || true
+            echo >&2
+            exit 75
+            ;;
+    esac
+    i=$((i + 1))
+    sleep 1
+done
+
+echo "restart-dikarya-web: $UNIT did NOT come back within ${DEADLINE}s" \
+     "(last HTTP status: $last_code). Recent journal:" >&2
+/usr/bin/journalctl -u "$UNIT" --no-pager --lines=40 >&2 || true
+exit 69

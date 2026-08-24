@@ -688,14 +688,55 @@ document.addEventListener('DOMContentLoaded', async () => {
         // Alan 8/17/26 - Expose bubble fill controls alongside the shared line and text styles.
         { field: 'line_color', label: 'Line / border color' },
         { field: 'fill_color', label: 'Bubble fill' },
-        { field: 'fill_opacity', label: 'Bubble opacity' }
+        { field: 'fill_opacity', label: 'Bubble opacity' },
+        // Alan 8/24/26 - Clade highlights get their own fill fields; sharing the bubble's
+        // would give every band the bubble default of near-opaque white.
+        { field: 'highlight_color', label: 'Highlight color' },
+        { field: 'highlight_opacity', label: 'Highlight opacity' }
     ];
+    // Alan 8/24/26 - "Automatic" is a real, stored choice, not the absence of one: an
+    // automatic highlight takes the colour of the clade's persistent colour group when it has
+    // one and a palette colour otherwise. Keeping it as an explicit mode is what lets a user
+    // deliberately pick the historical gold #c9a962 as a fixed colour and keep it.
+    const HIGHLIGHT_COLOR_MODE_FIELD = 'highlight_color_mode';
+    const LEGACY_AUTO_HIGHLIGHT_COLOR = '#c9a962';
+
+    // Alan 8/24/26 - Carried alongside highlight_color but never given a row of its own; the
+    // highlight-color row's Auto/Fixed select writes it.
+    const ANNOTATION_HIDDEN_STYLE_FIELDS = [HIGHLIGHT_COLOR_MODE_FIELD];
+
+    // Alan 8/24/26 - The bounded 0..1 style fields, so an opacity control is never built
+    // with font-size bounds. Mirrors the renderer's ANNOTATION_NUMERIC_STYLE_FIELDS.
+    const ANNOTATION_OPACITY_FIELDS = new Set(['fill_opacity', 'highlight_opacity']);
+    const isNumericAnnotationField = (field) =>
+        field === 'font_size' || ANNOTATION_OPACITY_FIELDS.has(field);
+    // Alan 8/24/26 - Types that annotate a clade as a whole. They occupy a right-hand lane
+    // and stay valid on the root, which has no incoming branch to hang a label on.
+    const CLADE_ANNOTATION_TYPES = ['clade_line', 'clade_highlight'];
+    const ALL_ANNOTATION_TYPES = CLADE_ANNOTATION_TYPES.concat(['branch_text', 'branch_bubble']);
+
+    // Alan 8/24/26 - Read the effective mode for a layer, inferring it for layers saved
+    // before the field existed: those said "automatic" by still carrying the shared default.
+    function layerHighlightColorMode(layer) {
+        const stored = layer ? layer['default_' + HIGHLIGHT_COLOR_MODE_FIELD] : null;
+        if (stored === 'auto' || stored === 'fixed') return stored;
+        const color = layer ? layer.default_highlight_color : null;
+        return (!color || color === LEGACY_AUTO_HIGHLIGHT_COLOR) ? 'auto' : 'fixed';
+    }
+
+    // Alan 8/24/26 - Map the short-lived old aliases onto the canonical type in one place.
+    function canonicalAnnotationType(value) {
+        if (value === 'line') return 'clade_line';
+        if (value === 'bubble') return 'branch_bubble';
+        return ALL_ANNOTATION_TYPES.includes(value) ? value : 'clade_line';
+    }
 
     const annotationsEditable = () => !window.VIEW_ONLY;
     const annotationConfig = () => window.DikaryaCladeAnnotations || {
         FONT_FAMILIES: ['Arial'], MIN_FONT_SIZE: 6, MAX_FONT_SIZE: 72,
         // Alan 8/17/26 - Keep the controller fallback complete when server configuration is absent.
-        DEFAULTS: { font_family: 'Arial', font_size: 12, font_style: 'normal', font_weight: 'normal', text_color: '#1f2937', line_color: '#1f2937', fill_color: '#ffffff', fill_opacity: 0.9 }
+        DEFAULTS: { font_family: 'Arial', font_size: 12, font_style: 'normal', font_weight: 'normal', text_color: '#1f2937', line_color: '#1f2937', fill_color: '#ffffff', fill_opacity: 0.9,
+            highlight_color: '#c9a962', highlight_opacity: 0.2 }
     };
 
     // Alan 8/15/26 - Short, URL/attribute-safe IDs inside the server's 64-char limit.
@@ -713,8 +754,12 @@ document.addEventListener('DOMContentLoaded', async () => {
         const own = annotation ? annotation[field] : null;
         if (own !== null && own !== undefined && own !== '') return own;
         const inherited = layer ? layer['default_' + field] : null;
+        const defaults = annotationConfig().DEFAULTS;
+        // Alan 8/24/26 - highlight_color deliberately does NOT pass through here: its three
+        // states (inherit / automatic / fixed) cannot be expressed as one value, so it has its
+        // own control in highlightColorRow() and layerHighlightColorControl().
         if (inherited !== null && inherited !== undefined && inherited !== '') return inherited;
-        return annotationConfig().DEFAULTS[field];
+        return defaults[field];
     }
 
     // Alan 8/17/26 - Render the same plain text, line breaks, type, and resolved whole-label
@@ -735,8 +780,23 @@ document.addEventListener('DOMContentLoaded', async () => {
             // Alan 8/17/26 - Keep inheritance explicit by passing null for unchecked overrides.
             draft[field] = annotationEditorState.style[field] ?? null;
         });
+        // Alan 8/24/26 - The preview resolves the highlight colour exactly as the tree does,
+        // so it needs the mode and the saved palette slot as well as the colour itself.
+        ANNOTATION_HIDDEN_STYLE_FIELDS.forEach(field => {
+            draft[field] = annotationEditorState.style[field] ?? null;
+        });
+        draft.automatic_highlight_slot = Number.isInteger(annotationEditorState.automaticSlot)
+            ? annotationEditorState.automaticSlot : null;
         // Alan 8/17/26 - Replace the old CSS-only preview with the shared SVG primitive.
-        if (viewer?.renderAnnotationPreview) viewer.renderAnnotationPreview(preview, draft, layer);
+        // Alan 8/24/26 - Hand it the session's membership and id so an unstyled clade highlight
+        // previews the automatic colour it will really be assigned, not a placeholder.
+        if (viewer?.renderAnnotationPreview) {
+            viewer.renderAnnotationPreview(preview, draft, layer, {
+                memberIds: annotationEditorState.memberIds,
+                annotationId: annotationEditorState.annotationId
+                    || annotationEditorState.pendingId
+            });
+        }
     }
 
     // Alan 8/15/26 - Adopt a configuration (ours or the server's) into state, renderer and UI.
@@ -897,7 +957,18 @@ document.addEventListener('DOMContentLoaded', async () => {
             // Alan 8/17/26 - New layers inherit bubble fill styling as concrete defaults.
             default_line_color: defaults.line_color,
             default_fill_color: defaults.fill_color,
-            default_fill_opacity: defaults.fill_opacity
+            default_fill_opacity: defaults.fill_opacity,
+            // Alan 8/24/26 - Seed the highlight defaults too, so a new layer's bands are
+            // the subtle gold tint rather than the bubble's near-opaque white.
+            default_highlight_color: defaults.highlight_color,
+            // Alan 8/24/26 - A fresh layer is Automatic, stated outright rather than implied
+            // by the colour it happens to carry.
+            default_highlight_color_mode: 'auto',
+            // Alan 8/24/26 - Deliberately NOT seeded: an untouched highlight opacity has to
+            // be absent, not a copy of the shared default, or the layer's opacity control
+            // would be inert at exactly the value it displays. The renderer resolves the
+            // absent value to the theme-aware automatic opacity.
+            default_highlight_opacity: null
         };
         if (fromEditorSession) layer.__editorSession = true;
         annotationLayers.push(layer);
@@ -965,6 +1036,14 @@ document.addEventListener('DOMContentLoaded', async () => {
         host.textContent = '';
 
         ANNOTATION_STYLE_FIELDS.forEach(({ field, label }) => {
+            // Alan 8/24/26 - Highlight colour is not a plain override: its three states are
+            // "inherit from the layer", "work it out from the tree" and "this exact colour",
+            // and showing a gold swatch for the first two while drawing blue was misleading.
+            if (field === 'highlight_color') {
+                host.appendChild(highlightColorRow(layer, draft, label));
+                return;
+            }
+
             const row = document.createElement('div');
             row.className = 'annotation-style-row';
 
@@ -997,13 +1076,14 @@ document.addEventListener('DOMContentLoaded', async () => {
                 });
                 control.value = effective;
             // Alan 8/17/26 - Treat opacity as a bounded numeric override like font size.
-            } else if (field === 'font_size' || field === 'fill_opacity') {
+            } else if (isNumericAnnotationField(field)) {
+                const isOpacity = ANNOTATION_OPACITY_FIELDS.has(field);
                 control = document.createElement('input');
                 control.type = 'number';
                 // Alan 8/17/26 - Bound opacity to 0–1 while retaining configured font-size bounds.
-                control.min = field === 'fill_opacity' ? '0' : String(cfg.MIN_FONT_SIZE);
-                control.max = field === 'fill_opacity' ? '1' : String(cfg.MAX_FONT_SIZE);
-                control.step = field === 'fill_opacity' ? '0.05' : '1';
+                control.min = isOpacity ? '0' : String(cfg.MIN_FONT_SIZE);
+                control.max = isOpacity ? '1' : String(cfg.MAX_FONT_SIZE);
+                control.step = isOpacity ? '0.05' : '1';
                 control.className = 'w-24 rounded border border-gray-300 bg-white px-2 py-1 text-xs text-gray-900 dark:border-gray-700 dark:bg-journal-dark dark:text-gray-100';
                 control.value = String(effective);
             } else {
@@ -1017,7 +1097,7 @@ document.addEventListener('DOMContentLoaded', async () => {
             const commit = () => {
                 if (!toggle.checked) { draft[field] = null; return; }
                 // Alan 8/17/26 - Store numeric opacity without string coercion in the draft.
-                draft[field] = (field === 'font_size' || field === 'fill_opacity')
+                draft[field] = isNumericAnnotationField(field)
                     ? Number(control.value) : control.value;
                 renderAnnotationLivePreview();
             };
@@ -1034,6 +1114,122 @@ document.addEventListener('DOMContentLoaded', async () => {
             row.appendChild(control);
             host.appendChild(row);
         });
+    }
+
+    /**
+     * Alan 8/24/26 - The annotation-level highlight colour control.
+     *
+     * One select for the mode and one picker for the colour. The picker stays visible while
+     * the mode is Inherit or Automatic, showing the colour that will actually be drawn, but
+     * is disabled so it reads as a preview rather than a choice.
+     */
+    function highlightColorRow(layer, draft, labelText) {
+        const row = document.createElement('div');
+        row.className = 'annotation-style-row';
+
+        const caption = document.createElement('label');
+        caption.className = 'text-xs text-gray-600 dark:text-gray-300';
+        caption.textContent = labelText;
+
+        const mode = document.createElement('select');
+        mode.className = 'rounded border border-gray-300 bg-white px-2 py-1 text-xs text-gray-900 dark:border-gray-700 dark:bg-journal-dark dark:text-gray-100';
+        [
+            ['inherit', 'Layer default'],
+            ['auto', 'Automatic'],
+            ['fixed', 'Fixed color']
+        ].forEach(([value, text]) => {
+            const option = document.createElement('option');
+            option.value = value;
+            option.textContent = text;
+            mode.appendChild(option);
+        });
+
+        const picker = document.createElement('input');
+        picker.type = 'color';
+        picker.className = 'h-7 w-14 rounded border border-gray-300 bg-transparent p-0 dark:border-gray-700';
+
+        // Inherit is "no annotation-level opinion at all": neither a colour nor a mode.
+        const current = () => {
+            if (draft.highlight_color) return 'fixed';
+            if (draft[HIGHLIGHT_COLOR_MODE_FIELD] === 'auto') return 'auto';
+            if (draft[HIGHLIGHT_COLOR_MODE_FIELD] === 'fixed') return 'fixed';
+            return 'inherit';
+        };
+        mode.value = current();
+
+        // Alan 8/24/26 - Ask with the DRAFT, not with the annotation id alone. While an
+        // existing Fixed highlight is being switched to Automatic the saved annotation still
+        // says fixed and still carries its palette slot, and resolving against that stale
+        // object showed a swatch the save would not reproduce. The draft below is exactly what
+        // saving would write for an Automatic highlight, so the swatch and the saved figure
+        // agree -- including the stored slot, which the save keeps.
+        const automaticColor = () => {
+            if (!viewer?.resolveDraftHighlightColor || !annotationEditorState) {
+                return annotationConfig().DEFAULTS.highlight_color;
+            }
+            return viewer.resolveDraftHighlightColor({
+                id: annotationEditorState.annotationId || annotationEditorState.pendingId,
+                layer_id: layer?.id || null,
+                annotation_type: 'clade_highlight',
+                member_tip_ids: annotationEditorState.memberIds,
+                highlight_color: null,
+                [HIGHLIGHT_COLOR_MODE_FIELD]: 'auto',
+                automatic_highlight_slot: Number.isInteger(annotationEditorState.automaticSlot)
+                    ? annotationEditorState.automaticSlot : null
+            }, layer);
+        };
+
+        const sync = () => {
+            const selected = mode.value;
+            picker.disabled = selected !== 'fixed' || !annotationsEditable();
+            picker.title = selected === 'fixed'
+                ? 'Highlight color for this annotation'
+                : 'The color this highlight will be drawn with';
+            if (selected === 'fixed') {
+                picker.value = draft.highlight_color
+                    || (layerHighlightColorMode(layer) === 'fixed'
+                        && layer?.default_highlight_color)
+                    || automaticColor();
+            } else if (selected === 'auto') {
+                picker.value = automaticColor();
+            } else {
+                picker.value = layerHighlightColorMode(layer) === 'fixed'
+                    ? (layer?.default_highlight_color
+                        || annotationConfig().DEFAULTS.highlight_color)
+                    : automaticColor();
+            }
+        };
+
+        const commit = () => {
+            const selected = mode.value;
+            if (selected === 'fixed') {
+                draft.highlight_color = picker.value;
+                draft[HIGHLIGHT_COLOR_MODE_FIELD] = 'fixed';
+            } else if (selected === 'auto') {
+                // No colour, and an explicit auto, so an Auto annotation stays automatic even
+                // on a layer whose default is a fixed colour.
+                draft.highlight_color = null;
+                draft[HIGHLIGHT_COLOR_MODE_FIELD] = 'auto';
+            } else {
+                draft.highlight_color = null;
+                draft[HIGHLIGHT_COLOR_MODE_FIELD] = null;
+            }
+            renderAnnotationLivePreview();
+            // The automatic colour is only known after the draft settles, so refresh the
+            // swatch from the value the renderer just resolved.
+            sync();
+        };
+
+        mode.disabled = !annotationsEditable();
+        mode.addEventListener('change', commit);
+        picker.addEventListener('change', commit);
+        picker.addEventListener('input', commit);
+        sync();
+
+        row.appendChild(mode);
+        row.appendChild(caption);
+        row.appendChild(picker);
+        return row;
     }
 
     function populateAnnotationLayerSelect(selectedLayerId) {
@@ -1081,6 +1277,10 @@ document.addEventListener('DOMContentLoaded', async () => {
             // untouched by a cancel.
             createdLayerIds: []
         };
+        // Alan 8/24/26 - Reserve the id for a new annotation now rather than at save time. The
+        // automatic highlight colour is assigned per annotation id, so the preview and the saved
+        // annotation have to be talking about the same one.
+        if (mode !== 'edit') annotationEditorState.pendingId = newAnnotationId('annotation');
         // Alan 8/17/26 - Whole-tree clades may use a bracket, but the root has no incoming
         // segment on which branch text or a branch bubble could be placed.
         annotationEditorState.hasIncomingBranch = viewer?.hasIncomingBranchForMemberIds
@@ -1096,6 +1296,17 @@ document.addEventListener('DOMContentLoaded', async () => {
         ANNOTATION_STYLE_FIELDS.forEach(({ field }) => {
             annotationEditorState.style[field] = existing ? (existing[field] ?? null) : null;
         });
+        // Alan 8/24/26 - Carried but not shown as its own row; the highlight-color row owns it.
+        ANNOTATION_HIDDEN_STYLE_FIELDS.forEach(field => {
+            annotationEditorState.style[field] = existing ? (existing[field] ?? null) : null;
+        });
+        // Alan 8/24/26 - An automatic highlight keeps the palette slot it was saved with, so
+        // deleting or adding OTHER annotations never recolours it. Editing preserves it; a new
+        // annotation reserves one now so the preview shows the colour it will really get.
+        annotationEditorState.automaticSlot = existing
+            ? (Number.isInteger(existing.automatic_highlight_slot)
+                ? existing.automatic_highlight_slot : null)
+            : null;
 
         // Alan 8/17/26 - Use branch-oriented copy and restrict root annotations to clade lines.
         getEl('annotation-editor-title').textContent = mode === 'edit'
@@ -1108,12 +1319,13 @@ document.addEventListener('DOMContentLoaded', async () => {
             `${count} descendant tip${count === 1 ? '' : 's'} on this branch.`;
         getEl('input-annotation-label').value = existing ? existing.label : '';
         // Alan 8/17/26 - Map short-lived aliases and disable branch-only root choices.
-        const savedType = existing?.annotation_type === 'line' ? 'clade_line'
-            : (existing?.annotation_type === 'bubble' ? 'branch_bubble' : existing?.annotation_type);
+        const savedType = existing ? canonicalAnnotationType(existing.annotation_type) : null;
         const typeSelect = getEl('select-annotation-type');
         typeSelect.querySelectorAll('option').forEach(option => {
+            // Alan 8/24/26 - Clade line AND clade highlight annotate the clade itself, so both
+            // remain available on the root; only the branch types need an incoming branch.
             option.disabled = !annotationEditorState.hasIncomingBranch
-                && option.value !== 'clade_line';
+                && !CLADE_ANNOTATION_TYPES.includes(option.value);
         });
         typeSelect.value = savedType || annotationEditorState.defaultType;
         getEl('btn-annotation-save-text').textContent = mode === 'edit' ? 'Save changes' : 'Save';
@@ -1153,24 +1365,43 @@ document.addEventListener('DOMContentLoaded', async () => {
         }
         // Alan 8/17/26 - Refuse branch-only types when the selected membership resolves to the root.
         const requestedType = getEl('select-annotation-type')?.value || 'clade_line';
-        if (!annotationEditorState.hasIncomingBranch && requestedType !== 'clade_line') {
-            setAnnotationEditorError('The whole-tree root has no incoming branch. Use Clade line.');
+        if (!annotationEditorState.hasIncomingBranch
+            && !CLADE_ANNOTATION_TYPES.includes(requestedType)) {
+            setAnnotationEditorError(
+                'The whole-tree root has no incoming branch. Use Clade line or Clade highlight.'
+            );
             return;
         }
 
         const payload = {
-            id: annotationEditorState.annotationId || newAnnotationId('annotation'),
+            // Alan 8/24/26 - Reuse the id the preview reserved, so the automatic colour the
+            // user just approved is the one this annotation is assigned once saved.
+            id: annotationEditorState.annotationId || annotationEditorState.pendingId
+                || newAnnotationId('annotation'),
             layer_id: layerId,
             label,
-            // Alan 8/17/26 - Save only the three supported canonical annotation types.
-            annotation_type: ['clade_line', 'branch_text', 'branch_bubble'].includes(
-                requestedType
-            ) ? requestedType : 'clade_line',
+            // Alan 8/24/26 - Save only the supported canonical annotation types.
+            annotation_type: canonicalAnnotationType(requestedType),
             member_tip_ids: annotationEditorState.memberIds.slice()
         };
         ANNOTATION_STYLE_FIELDS.forEach(({ field }) => {
             payload[field] = annotationEditorState.style[field] ?? null;
         });
+        ANNOTATION_HIDDEN_STYLE_FIELDS.forEach(field => {
+            payload[field] = annotationEditorState.style[field] ?? null;
+        });
+        // Alan 8/24/26 - Pin the automatic palette slot on first save (and backfill it for
+        // annotations saved before slots existed), so this highlight keeps the colour it was
+        // published with no matter what happens to the annotations around it. It stays an
+        // Automatic highlight: it still follows a colour group if its clade joins one, and it
+        // still takes the theme-aware automatic opacity.
+        if (payload.annotation_type === 'clade_highlight') {
+            let slot = annotationEditorState.automaticSlot;
+            if (!Number.isInteger(slot) && viewer?.reserveAutomaticHighlightSlot) {
+                slot = viewer.reserveAutomaticHighlightSlot(payload.id, payload.member_tip_ids);
+            }
+            payload.automatic_highlight_slot = Number.isInteger(slot) ? slot : null;
+        }
 
         if (annotationEditorState.mode === 'edit') {
             const index = cladeAnnotations.findIndex(a => a.id === payload.id);
@@ -1278,10 +1509,12 @@ document.addEventListener('DOMContentLoaded', async () => {
             meta.className = 'annotation-row-meta text-gray-500 dark:text-gray-400';
             const memberCount = (annotation.member_tip_ids || []).length;
             // Alan 8/17/26 - Show canonical branch and clade type names in the manager.
-            const type = annotation.annotation_type === 'line' ? 'clade_line'
-                : (annotation.annotation_type === 'bubble' ? 'branch_bubble' : annotation.annotation_type);
-            const typeLabel = type === 'branch_text' ? 'Branch text'
-                : (type === 'branch_bubble' ? 'Branch bubble' : 'Clade line');
+            const type = canonicalAnnotationType(annotation.annotation_type);
+            const typeLabel = {
+                branch_text: 'Branch text',
+                branch_bubble: 'Branch bubble',
+                clade_highlight: 'Clade highlight'
+            }[type] || 'Clade line';
             meta.textContent = `${typeLabel} · ${layer ? layer.name : 'Unknown layer'} · ${memberCount} tip${memberCount === 1 ? '' : 's'}`;
             main.appendChild(meta);
 
@@ -1328,6 +1561,63 @@ document.addEventListener('DOMContentLoaded', async () => {
     }
 
     // Alan 8/15/26 - Build one labelled control for a layer's default style.
+    /**
+     * Alan 8/24/26 - A layer's default highlight colour: Automatic, or one fixed colour.
+     *
+     * Same reasoning as the annotation-level row. A layer set to Automatic hands each of its
+     * highlights its own colour, so there is no single swatch to show for it and the picker is
+     * disabled until the user says Fixed.
+     */
+    function layerHighlightColorControl(layer) {
+        const wrap = document.createElement('label');
+        wrap.className = 'annotation-layer-style text-gray-600 dark:text-gray-300';
+        const caption = document.createElement('span');
+        caption.textContent = 'Highlight';
+        wrap.appendChild(caption);
+
+        const mode = document.createElement('select');
+        mode.className = 'rounded border border-gray-300 bg-white px-1 py-0.5 text-xs text-gray-900 dark:border-gray-700 dark:bg-journal-dark dark:text-gray-100';
+        [['auto', 'Auto'], ['fixed', 'Fixed']].forEach(([value, text]) => {
+            const option = document.createElement('option');
+            option.value = value;
+            option.textContent = text;
+            mode.appendChild(option);
+        });
+        mode.value = layerHighlightColorMode(layer);
+
+        const picker = document.createElement('input');
+        picker.type = 'color';
+        picker.className = 'h-6 w-10 rounded border border-gray-300 bg-transparent p-0 dark:border-gray-700';
+        picker.value = layer.default_highlight_color
+            || annotationConfig().DEFAULTS.highlight_color;
+
+        const sync = () => {
+            picker.disabled = mode.value !== 'fixed' || !annotationsEditable();
+            picker.title = mode.value === 'fixed'
+                ? 'Default highlight color for this layer'
+                : 'Each highlight picks its own color from its clade or the palette';
+        };
+        mode.disabled = !annotationsEditable();
+
+        const commit = () => {
+            layer['default_' + HIGHLIGHT_COLOR_MODE_FIELD] = mode.value;
+            // The colour is kept even while Automatic is selected, so switching back to Fixed
+            // returns the colour the user last chose rather than a reset one.
+            layer.default_highlight_color = picker.value;
+            sync();
+            if (viewer?.setCladeAnnotations) viewer.setCladeAnnotations(annotationLayers, cladeAnnotations);
+            debouncedSaveAnnotations();
+        };
+        mode.addEventListener('change', commit);
+        picker.addEventListener('change', commit);
+        picker.addEventListener('input', commit);
+        sync();
+
+        wrap.appendChild(mode);
+        wrap.appendChild(picker);
+        return wrap;
+    }
+
     function layerStyleControl(layer, field, labelText) {
         const cfg = annotationConfig();
         const wrap = document.createElement('label');
@@ -1350,13 +1640,14 @@ document.addEventListener('DOMContentLoaded', async () => {
                 control.appendChild(option);
             });
         // Alan 8/17/26 - Layer opacity uses the same bounded numeric control as font size.
-        } else if (field === 'font_size' || field === 'fill_opacity') {
+        } else if (isNumericAnnotationField(field)) {
             control = document.createElement('input');
             control.type = 'number';
             // Alan 8/17/26 - Bound layer opacity to 0–1 while retaining font-size bounds.
-            control.min = field === 'fill_opacity' ? '0' : String(cfg.MIN_FONT_SIZE);
-            control.max = field === 'fill_opacity' ? '1' : String(cfg.MAX_FONT_SIZE);
-            control.step = field === 'fill_opacity' ? '0.05' : '1';
+            const isOpacity = ANNOTATION_OPACITY_FIELDS.has(field);
+            control.min = isOpacity ? '0' : String(cfg.MIN_FONT_SIZE);
+            control.max = isOpacity ? '1' : String(cfg.MAX_FONT_SIZE);
+            control.step = isOpacity ? '0.05' : '1';
             control.className = 'w-16 rounded border border-gray-300 bg-white px-1 py-0.5 text-xs text-gray-900 dark:border-gray-700 dark:bg-journal-dark dark:text-gray-100';
         } else {
             control = document.createElement('input');
@@ -1371,7 +1662,7 @@ document.addEventListener('DOMContentLoaded', async () => {
 
         const commit = () => {
             // Alan 8/17/26 - Persist opacity as a number so layer defaults round-trip cleanly.
-            layer['default_' + field] = (field === 'font_size' || field === 'fill_opacity')
+            layer['default_' + field] = isNumericAnnotationField(field)
                 ? Number(control.value) : control.value;
             // Repaint immediately so inheriting annotations restyle without waiting for the
             // debounced save round-trip.
@@ -1495,6 +1786,9 @@ document.addEventListener('DOMContentLoaded', async () => {
             // Alan 8/17/26 - Let managers edit the default fill and opacity for bubble annotations.
             styles.appendChild(layerStyleControl(layer, 'fill_color', 'Fill'));
             styles.appendChild(layerStyleControl(layer, 'fill_opacity', 'Opacity'));
+            // Alan 8/24/26 - Layer-level defaults for the clade-highlight band.
+            styles.appendChild(layerHighlightColorControl(layer));
+            styles.appendChild(layerStyleControl(layer, 'highlight_opacity', 'Highlight opacity'));
             card.appendChild(styles);
 
             host.appendChild(card);
@@ -3051,7 +3345,10 @@ document.addEventListener('DOMContentLoaded', async () => {
         wireBackendActions();
     }
 
-    const triggerZoom = (delta) => {
+    // Alan 8/24/26 - A function declaration, not a const arrow, so it hoists: it is
+    // wired to the zoom buttons ~800 lines above this point. The body uses no `this`,
+    // so the arrow form bought nothing.
+    function triggerZoom(delta) {
         const svg = container?.querySelector('svg');
         if (!svg) return;
         const rect = svg.getBoundingClientRect();
@@ -3061,7 +3358,7 @@ document.addEventListener('DOMContentLoaded', async () => {
             clientX: cx, clientY: cy, deltaY: delta,
             bubbles: true, cancelable: true, view: window
         }));
-    };
+    }
 
     function wireBackendActions() {
         if (btnPrune) btnPrune.addEventListener('click', () => {

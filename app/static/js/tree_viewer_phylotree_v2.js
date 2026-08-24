@@ -67,9 +67,72 @@
             // Alan 8/17/26 - Supply default border, fill, and opacity for branch bubbles.
             line_color: '#1f2937',
             fill_color: '#ffffff',
-            fill_opacity: 0.9
+            fill_opacity: 0.9,
+            // Alan 8/24/26 - Clade highlights get their OWN fill fields. Reusing the bubble's
+            // fill_color/fill_opacity would paint every highlight near-opaque white and hide
+            // the tree underneath it. journal-gold at 0.15 tints both themes without dominating.
+            highlight_color: '#c9a962',
+            // Alan 8/24/26 - Automatic means "work the colour out from the tree": the clade's
+            // own persistent colour group when it has one, otherwise the next palette colour.
+            highlight_color_mode: 'auto',
+            // Alan 8/24/26 - Equal to AUTO_HIGHLIGHT_OPACITY.light below, and it must stay
+            // equal: an untouched highlight is drawn with the automatic, theme-aware opacity,
+            // so a shared default that differed from it made the layer card report a number
+            // the figure never used. Mirrors DEFAULT_HIGHLIGHT_OPACITY in the service.
+            highlight_opacity: 0.2
         }
     };
+
+    // Alan 8/24/26 - The style properties every annotation resolves, in one place: the live
+    // renderer and the editor preview used to carry two copies of this list, so adding the
+    // highlight fields to one and not the other would have silently unstyled the preview.
+    // Mirrors _LAYER_STYLE_FIELDS in tree_annotation_service.py.
+    const ANNOTATION_STYLE_FIELDS = [
+        'font_family', 'font_size', 'font_style', 'font_weight', 'text_color',
+        'line_color', 'fill_color', 'fill_opacity', 'highlight_color',
+        'highlight_color_mode', 'highlight_opacity'
+    ];
+    const ANNOTATION_NUMERIC_STYLE_FIELDS = new Set([
+        'font_size', 'fill_opacity', 'highlight_opacity'
+    ]);
+    // Alan 8/24/26 - Layer fields the server leaves absent rather than backfilling with the
+    // shared default, so absence really means "nobody chose this". Mirrors
+    // _LAYER_OPTIONAL_STYLE_FIELDS in tree_annotation_service.py.
+    const ANNOTATION_OPTIONAL_LAYER_STYLE_FIELDS = new Set(['highlight_opacity']);
+
+    // Alan 8/24/26 - Curated fills for LARGE translucent clade backgrounds, which is a very
+    // different job from the categorical line colours in _selectionColors: those are chosen to
+    // be legible as a 1px stroke and read as neon poster paint when spread over a third of a
+    // figure. These are mid-tone and slightly desaturated so that, at the automatic opacities
+    // below, a light theme gets a pale tint that black tip labels stay readable on and a dark
+    // theme gets a deep tint that white ones do. Order is the assignment order for successive
+    // unstyled highlights, arranged so the first four are maximally distinct.
+    const HIGHLIGHT_PALETTE = [
+        '#3b6fb6',  // blue
+        '#7a5aa6',  // purple
+        '#2f8f83',  // teal
+        '#b8536b',  // rose
+        '#c08a2e',  // amber
+        '#4a8b4a',  // green
+        '#a8503c',  // muted red
+        '#2b7f9e'   // cyan
+    ];
+
+    // Alan 8/24/26 - The opacity an UNSTYLED highlight is drawn at. A pale wash that reads
+    // clearly on white is nearly invisible on black, so the automatic value differs by theme --
+    // but it is resolved here and written inline, never applied as a CSS override, so the
+    // exported SVG carries exactly what was on screen. An opacity the user chose is used
+    // verbatim in both themes.
+    const AUTO_HIGHLIGHT_OPACITY = { light: 0.2, dark: 0.26 };
+
+    // Alan 8/24/26 - Published on the shared config so the editor and the regression harness
+    // resolve styles through the same list the renderer uses, instead of their own copies.
+    window.DikaryaCladeAnnotations.STYLE_FIELDS = ANNOTATION_STYLE_FIELDS;
+    window.DikaryaCladeAnnotations.NUMERIC_STYLE_FIELDS = Array.from(
+        ANNOTATION_NUMERIC_STYLE_FIELDS
+    );
+    window.DikaryaCladeAnnotations.HIGHLIGHT_PALETTE = HIGHLIGHT_PALETTE;
+    window.DikaryaCladeAnnotations.AUTO_HIGHLIGHT_OPACITY = AUTO_HIGHLIGHT_OPACITY;
 
     // Alan 8/15/26 - Map a validated family name onto its fallback stack; anything unknown
     // falls back to the default rather than reaching the SVG verbatim.
@@ -1890,6 +1953,23 @@
             });
         }
 
+        /**
+         * Alan 8/24/26 - Repaint everything a persistent colour group controls.
+         *
+         * Group membership, group precedence and group colour all feed BOTH the tip/node
+         * styling and the automatic clade-highlight colour. Only the first was being
+         * repainted, so recolouring a group turned its labels blue immediately while the
+         * band behind them kept its old palette colour until some unrelated redraw happened.
+         *
+         * The annotation redraw is the existing debounced one and no-ops entirely on trees
+         * that have no annotations, so this stays as cheap as the label repaint it replaces.
+         * Nothing here rebuilds the tree.
+         */
+        _refreshPersistentColorVisuals() {
+            this._updateNodeStylesOnly();
+            this._scheduleAnnotationRedraw();
+        }
+
         // Alan 5/12/26 - Normalize user-provided group colors before saving them.
         _normalizeColor(color, fallback = '#1f77b4') {
             // Alan 5/12/26 - Lowercase string colors so persisted values compare predictably.
@@ -1967,30 +2047,10 @@
         _getNodeDisplayColor(id, node) {
             // Alan 5/12/26 - Missing IDs cannot belong to selection sets.
             if (!id) return null;
-            // Alan 5/12/26 - Find which set(s) this node belongs to.
-            const setNames = Object.keys(this.selectionSets);
-            // Alan 5/12/26 - Track which one-color group controls this label.
-            let matchingSetName = null;
-            // Alan 5/12/26 - Prefer the active set's color so adding a previously selected tip visibly changes color.
-            const activeSetIndex = setNames.indexOf(this.activeSelectionSet);
-            // Alan 5/12/26 - Use active color-group membership first; temporary Deselect no longer hides colors.
-            if (activeSetIndex >= 0 && this.selectionSets[this.activeSelectionSet]?.has(id)) {
-                // Alan 5/12/26 - Store the active set index for palette lookup.
-                matchingSetName = this.activeSelectionSet;
-            }
-            // Alan 5/12/26 - Fall back to the first non-active saved set containing this node.
-            for (let i = 0; i < setNames.length; i++) {
-                // Alan 5/12/26 - Stop scanning if the active set already supplied the display color.
-                if (matchingSetName) break;
-                // Alan 5/12/26 - Active set was already considered before lower-priority saved sets.
-                if (setNames[i] === this.activeSelectionSet) continue;
-                // Alan 5/12/26 - Use the first saved-set membership as the fallback color.
-                if (this.selectionSets[setNames[i]].has(id)) {
-                    // Alan 5/12/26 - Store the fallback set index for palette lookup.
-                    matchingSetName = setNames[i];
-                    break;
-                }
-            }
+            // Alan 8/24/26 - Group membership now resolves in one place, shared with the
+            // automatic clade-highlight colour, so a highlight and the labels it sits behind
+            // can never disagree about which group a tip belongs to.
+            const matchingSetName = this._persistentGroupNameForTip(id);
             // Alan 5/12/26 - Return selection-set color when membership is visible.
             if (matchingSetName) return this.getSelectionSetColor(matchingSetName);
             // Alan 5/12/26 - Search matches remain blue when no selection set controls the color.
@@ -3069,7 +3129,8 @@
             // Alan 5/12/26 - Clear temporary action selections for pruned tips only.
             for (const id of removedIds) this.currentSelectionIds.delete(id);
             // Alan 5/12/26 - Refresh labels so remaining set colors stay visible.
-            this._updateNodeStylesOnly();
+            // Alan 8/24/26 - Also repaints automatic highlights derived from this group.
+            this._refreshPersistentColorVisuals();
             // Alan 5/12/26 - Refresh toolbar counts after pruning selection memberships.
             this._updateStats();
             // Alan 5/12/26 - Return how many saved set memberships were removed.
@@ -3096,7 +3157,8 @@
                 changed += 1;
             });
             // Alan 5/12/26 - Repaint labels so applied color is visible immediately.
-            this._updateNodeStylesOnly();
+            // Alan 8/24/26 - Also repaints automatic highlights derived from this group.
+            this._refreshPersistentColorVisuals();
             // Alan 5/12/26 - Keep action button counts synchronized.
             this._updateStats();
             // Alan 5/12/26 - Return new membership count for status text.
@@ -3110,7 +3172,8 @@
             // Alan 5/12/26 - Remove selected tips from all groups because colors are mutually exclusive.
             const changed = this._removeIdsFromAllColorGroups(ids);
             // Alan 5/12/26 - Repaint labels so cleared colors disappear immediately.
-            this._updateNodeStylesOnly();
+            // Alan 8/24/26 - Also repaints automatic highlights derived from this group.
+            this._refreshPersistentColorVisuals();
             // Alan 5/12/26 - Keep action button counts synchronized.
             this._updateStats();
             // Alan 5/12/26 - Return removed membership count for status text.
@@ -3399,7 +3462,8 @@
             }
 
             // Alan 5/12/26 - Deleting a color group should preserve temporary action selection.
-            this._updateNodeStylesOnly();
+            // Alan 8/24/26 - Also repaints automatic highlights derived from this group.
+            this._refreshPersistentColorVisuals();
             this._updateStats();
             return true;
         }
@@ -3414,7 +3478,8 @@
             this.activeSelectionSet = name;
             // Alan 5/12/26 - Switching color groups should not clear temporary action selection.
             // Alan 5/12/26 - Repaint immediately because active set membership now controls color priority.
-            this._updateNodeStylesOnly();
+            // Alan 8/24/26 - Also repaints automatic highlights derived from this group.
+            this._refreshPersistentColorVisuals();
             this._updateStats();
             return true;
         }
@@ -3450,7 +3515,8 @@
             // Alan 5/12/26 - Normalize before storing so inline styles stay safe.
             this.selectionSetColors[name] = this._normalizeColor(color, this.getSelectionSetColor(name) || '#1f77b4');
             // Alan 5/12/26 - Repaint labels immediately after a color edit.
-            this._updateNodeStylesOnly();
+            // Alan 8/24/26 - Also repaints automatic highlights derived from this group.
+            this._refreshPersistentColorVisuals();
             // Alan 5/12/26 - Report a successful color edit.
             return true;
         }
@@ -3519,7 +3585,8 @@
             this.hiddenSelectionIds.clear();
             // Alan 5/10/26 - Do not restore saved selections for nodes removed by pruning.
             this._trimSelectionSetsToCurrentTree();
-            this._updateNodeStylesOnly();
+            // Alan 8/24/26 - Restored groups change automatic highlight colours too.
+            this._refreshPersistentColorVisuals();
             this._updateStats();
         }
 
@@ -3758,9 +3825,15 @@
             }
             const inherited = layer ? layer['default_' + field] : null;
             if (inherited !== null && inherited !== undefined && inherited !== '') {
-                // A layer always stores a concrete value (the server fills the shared default
-                // in when none was sent), so "the layer still carries the shared default" is
-                // the closest thing to "untouched" that exists at layer level.
+                // Alan 8/24/26 - A layer that stores this field at all has had it chosen: the
+                // server leaves it absent otherwise. No value-as-sentinel, so a user who types
+                // the shared default gets exactly that and not the automatic value.
+                if (ANNOTATION_OPTIONAL_LAYER_STYLE_FIELDS.has(field)) {
+                    return { value: inherited, isDefault: false };
+                }
+                // Every other layer field always stores a concrete value (the server fills the
+                // shared default in when none was sent), so "the layer still carries the shared
+                // default" is the closest thing to "untouched" that exists at layer level.
                 return { value: inherited, isDefault: inherited === defaults[field] };
             }
             return { value: defaults[field], isDefault: true };
@@ -3785,7 +3858,468 @@
             const type = annotation?.annotation_type;
             if (type === 'branch_text') return 'branch_text';
             if (type === 'branch_bubble' || type === 'bubble') return 'branch_bubble';
+            // Alan 8/24/26 - Highlights are a clade annotation, so they keep the clade lane,
+            // the bracket and the label, and add a band behind the clade.
+            if (type === 'clade_highlight') return 'clade_highlight';
             return 'clade_line';
+        }
+
+        // ==================================================================
+        // Alan 8/24/26 - AUTOMATIC HIGHLIGHT COLOURS
+        //
+        // A clade highlight that the user has not styled does not fall back to one shared
+        // colour. It resolves, in order, to:
+        //   1. the persistent colour group its tips already belong to, softened for use as a
+        //      large translucent area;
+        //   2. a palette colour chosen so successive highlights differ from one another.
+        //
+        // Everything here is a pure function of the saved annotations plus the existing
+        // selection-set state, so the same tree always produces the same colours, and the
+        // editor preview can show exactly what the figure will draw before anything is saved.
+        // ==================================================================
+
+        _hexToRgb(hex) {
+            const value = typeof hex === 'string' ? hex.trim() : '';
+            if (!/^#[0-9a-fA-F]{6}$/.test(value)) return null;
+            return {
+                r: parseInt(value.slice(1, 3), 16),
+                g: parseInt(value.slice(3, 5), 16),
+                b: parseInt(value.slice(5, 7), 16)
+            };
+        }
+
+        _rgbToHex(r, g, b) {
+            const channel = (v) => Math.max(0, Math.min(255, Math.round(v)))
+                .toString(16).padStart(2, '0');
+            return `#${channel(r)}${channel(g)}${channel(b)}`;
+        }
+
+        // Alan 8/24/26 - Standard sRGB <-> HSL, kept local so softening a group colour needs
+        // no colour library and stays byte-for-byte reproducible across browsers.
+        _hexToHsl(hex) {
+            const rgb = this._hexToRgb(hex);
+            if (!rgb) return null;
+            const r = rgb.r / 255, g = rgb.g / 255, b = rgb.b / 255;
+            const max = Math.max(r, g, b), min = Math.min(r, g, b);
+            const l = (max + min) / 2;
+            const d = max - min;
+            if (d === 0) return { h: 0, s: 0, l };
+            const s = l > 0.5 ? d / (2 - max - min) : d / (max + min);
+            let h;
+            if (max === r) h = ((g - b) / d + (g < b ? 6 : 0)) / 6;
+            else if (max === g) h = ((b - r) / d + 2) / 6;
+            else h = ((r - g) / d + 4) / 6;
+            return { h, s, l };
+        }
+
+        _hslToHex(h, s, l) {
+            if (s === 0) return this._rgbToHex(l * 255, l * 255, l * 255);
+            const q = l < 0.5 ? l * (1 + s) : l + s - l * s;
+            const p = 2 * l - q;
+            const toChannel = (t) => {
+                let value = t;
+                if (value < 0) value += 1;
+                if (value > 1) value -= 1;
+                if (value < 1 / 6) return p + (q - p) * 6 * value;
+                if (value < 1 / 2) return q;
+                if (value < 2 / 3) return p + (q - p) * (2 / 3 - value) * 6;
+                return p;
+            };
+            return this._rgbToHex(
+                toChannel(h + 1 / 3) * 255, toChannel(h) * 255, toChannel(h - 1 / 3) * 255
+            );
+        }
+
+        /**
+         * Alan 8/24/26 - Turn a group's line colour into a background of the same hue.
+         *
+         * The categorical colours the colour groups use are picked to be legible as thin
+         * marks; spread over a whole clade at any useful opacity they read as neon. Keeping
+         * the hue and capping saturation and lightness gives an area fill that is recognisably
+         * "the blue group" without shouting. Deterministic, so the same group always softens
+         * to the same fill.
+         */
+        _softenHighlightColor(hex) {
+            const hsl = this._hexToHsl(hex);
+            if (!hsl) return null;
+            return this._hslToHex(hsl.h, Math.min(hsl.s, 0.5), 0.45);
+        }
+
+        /**
+         * Alan 8/24/26 - Which persistent colour group owns this tip, or null.
+         *
+         * Split out of _getNodeDisplayColor so the highlight and the tip label agree about
+         * group membership by construction. Deliberately stops before that method's search-match
+         * and sequence-of-interest colours: those are transient view state, not a statement that
+         * these taxa are a group, and a highlight derived from them would change colour when the
+         * user typed in the search box.
+         */
+        _persistentGroupNameForTip(id) {
+            if (!id || !this.selectionSets) return null;
+            const setNames = Object.keys(this.selectionSets);
+            // The active group wins, so adding a tip to a group visibly recolours it.
+            if (setNames.includes(this.activeSelectionSet)
+                && this.selectionSets[this.activeSelectionSet]?.has(id)) {
+                return this.activeSelectionSet;
+            }
+            for (const name of setNames) {
+                if (name === this.activeSelectionSet) continue;
+                if (this.selectionSets[name]?.has(id)) return name;
+            }
+            return null;
+        }
+
+        /**
+         * Alan 8/24/26 - The shared group colour for a whole clade, or null.
+         *
+         * Requires EVERY member to be in the same group. A clade of 18 blue tips and 5 orange
+         * ones has no single group colour, and averaging them would invent a muddy brown that
+         * corresponds to nothing in the figure, so mixed membership falls through to the
+         * palette instead.
+         */
+        _persistentGroupColorForTips(memberIds) {
+            const ids = Array.isArray(memberIds) ? memberIds.filter(Boolean) : [];
+            if (!ids.length) return null;
+            let groupName = null;
+            for (const id of ids) {
+                const name = this._persistentGroupNameForTip(id);
+                if (!name) return null;
+                if (groupName === null) groupName = name;
+                else if (groupName !== name) return null;
+            }
+            const color = groupName ? this.getSelectionSetColor(groupName) : null;
+            return color ? this._softenHighlightColor(color) : null;
+        }
+
+        /**
+         * Alan 8/24/26 - Is this highlight's colour chosen, or worked out from the tree?
+         *
+         * An annotation-level colour is always a choice. Otherwise the stored mode decides,
+         * annotation first and then layer. When neither carries a mode -- state saved before
+         * the field existed -- fall back to the old rule that a layer still holding the shared
+         * default gold was never styled, so those keep behaving exactly as they did.
+         */
+        _resolveHighlightColorIntent(annotation, layer) {
+            const defaults = window.DikaryaCladeAnnotations.DEFAULTS;
+            const own = annotation ? annotation.highlight_color : null;
+            if (own !== null && own !== undefined && own !== '') {
+                return { mode: 'fixed', color: own };
+            }
+            const layerColor = layer ? layer.default_highlight_color : null;
+            const fixedColor = (layerColor !== null && layerColor !== undefined && layerColor !== '')
+                ? layerColor : defaults.highlight_color;
+
+            const ownMode = annotation ? annotation.highlight_color_mode : null;
+            if (ownMode === 'fixed') return { mode: 'fixed', color: fixedColor };
+            if (ownMode === 'auto') return { mode: 'auto', color: null };
+
+            const layerMode = layer ? layer.default_highlight_color_mode : null;
+            if (layerMode === 'fixed') return { mode: 'fixed', color: fixedColor };
+            if (layerMode === 'auto') return { mode: 'auto', color: null };
+
+            // No mode stored anywhere: the legacy reading of the colour value.
+            return (layerColor === null || layerColor === undefined || layerColor === ''
+                || layerColor === defaults.highlight_color)
+                ? { mode: 'auto', color: null }
+                : { mode: 'fixed', color: layerColor };
+        }
+
+        _highlightColorIsAutomatic(annotation, layer) {
+            return this._resolveHighlightColorIntent(annotation, layer).mode === 'auto';
+        }
+
+        /**
+         * Alan 8/24/26 - Are two candidate band colours close enough to read as the same wash?
+         *
+         * Spread over a clade at 0.2 opacity, two colours 10 degrees of hue apart are simply
+         * one colour with a wobble -- which is what a softened group blue (#397dac) and the
+         * first palette blue (#3b6fb6) were. Compares hue first, but only calls it a clash when
+         * lightness and saturation are also close, so a deliberately pale and a deliberately
+         * deep version of one hue still read as two regions. Near-greys have no usable hue and
+         * are compared on lightness alone.
+         */
+        _highlightColorsAreTooClose(a, b) {
+            const x = this._hexToHsl(a);
+            const y = this._hexToHsl(b);
+            if (!x || !y) return false;
+            const dl = Math.abs(x.l - y.l);
+            const ds = Math.abs(x.s - y.s);
+            if (x.s < 0.12 || y.s < 0.12) return dl < 0.15 && ds < 0.2;
+            let dh = Math.abs(x.h - y.h);
+            if (dh > 0.5) dh = 1 - dh;
+            // 0.055 of the hue circle is about 20 degrees.
+            return dh < 0.055 && dl < 0.25 && ds < 0.4;
+        }
+
+        /**
+         * Alan 8/24/26 - Work out the fill for every clade highlight in one pass.
+         *
+         * Two passes, because a colour that is already decided must be visible to a colour
+         * that is still being chosen:
+         *
+         *   Pass 1 places everything whose colour is already settled -- a colour the user
+         *   fixed, a colour derived from the clade's persistent colour group, and a palette
+         *   slot that was stored when the annotation was first saved. These are never changed.
+         *
+         *   Pass 2 chooses palette colours for the rest, avoiding any colour that would read
+         *   as the same wash as a neighbouring band, whichever pass placed it. Fixed and
+         *   derived colours therefore take part in clash avoidance without consuming a palette
+         *   slot -- the palette exists for clades with no colour of their own.
+         *
+         * Every clade_highlight is walked, including ones the current rooting cannot resolve
+         * and ones on hidden layers, so neither a reroot nor a hidden layer can renumber the
+         * colours of anything else.
+         *
+         * @param {Map} positions   canonical leaf id -> {index}, for the adjacency rule. Optional.
+         * @param {Object} pending  an unsaved annotation being previewed, appended at the end.
+         * @returns {{colors: Map, slots: Map}} id -> hex, and id -> palette index for the
+         *          highlights that were given one in pass 2.
+         */
+        _automaticHighlightAssignments(positions = null, pending = null) {
+            const layerById = new Map();
+            for (const layer of this.annotationLayers || []) {
+                if (layer && layer.id) layerById.set(layer.id, layer);
+            }
+
+            const entries = [];
+            for (const annotation of this.cladeAnnotations || []) {
+                if (!annotation || !annotation.id) continue;
+                if (this._annotationType(annotation) !== 'clade_highlight') continue;
+                const layer = layerById.get(annotation.layer_id) || null;
+                const intent = this._resolveHighlightColorIntent(annotation, layer);
+                entries.push({
+                    id: annotation.id,
+                    members: annotation.member_tip_ids || [],
+                    intent,
+                    slot: Number.isInteger(annotation.automatic_highlight_slot)
+                        ? annotation.automatic_highlight_slot : null
+                });
+            }
+            if (pending && (pending.id || pending.annotation?.id)) {
+                // Alan 8/24/26 - A draft may arrive either as the bare (id, members, slot)
+                // triple the swatch asks with, or as the whole annotation object the editor is
+                // about to save. When the object is given, its OWN colour intent, membership
+                // and slot are used, because those -- not the pre-edit ones still sitting in
+                // this.cladeAnnotations -- are what the save will write.
+                const draftAnnotation = pending.annotation || null;
+                const draftLayer = draftAnnotation
+                    ? (pending.layer || layerById.get(draftAnnotation.layer_id) || null)
+                    : null;
+                const draftId = pending.id || draftAnnotation.id;
+                const draftMembers = pending.memberIds
+                    || (draftAnnotation && draftAnnotation.member_tip_ids) || [];
+                const draftSlot = Number.isInteger(pending.slot)
+                    ? pending.slot
+                    : (draftAnnotation
+                        && Number.isInteger(draftAnnotation.automatic_highlight_slot)
+                        ? draftAnnotation.automatic_highlight_slot : null);
+                const draft = {
+                    id: draftId,
+                    members: draftMembers,
+                    intent: draftAnnotation
+                        ? this._resolveHighlightColorIntent(draftAnnotation, draftLayer)
+                        : { mode: 'auto', color: null },
+                    // A slot the editor is reserving is one the annotation does not hold yet,
+                    // so forcing the palette path also means ignoring any stored slot; that is
+                    // what lets the editor ask for the slot a clade would get even while it
+                    // derives a group colour.
+                    slot: pending.forcePalette ? null : draftSlot,
+                    forcePalette: !!pending.forcePalette
+                };
+                // Alan 8/24/26 - In edit mode the pending id names an annotation that is
+                // already saved. The edited membership and colour intent are what the user is
+                // looking at, so they REPLACE the saved entry instead of being discarded --
+                // dropping them made the preview resolve against the pre-edit annotation and
+                // show a colour the save would not produce.
+                const index = entries.findIndex((entry) => entry.id === draftId);
+                if (index >= 0) entries[index] = draft;
+                else entries.push(draft);
+            }
+
+            const span = (members) => {
+                if (!positions) return null;
+                let min = Infinity;
+                let max = -Infinity;
+                for (const member of members) {
+                    const entry = positions.get(member);
+                    if (!entry) continue;
+                    if (entry.index < min) min = entry.index;
+                    if (entry.index > max) max = entry.index;
+                }
+                return min === Infinity ? null : { min, max };
+            };
+            // Touching counts as adjacent, so two clades stacked one directly above the other
+            // do not come out the same colour.
+            const touches = (a, b) => !!a && !!b && a.min <= b.max + 1 && b.min <= a.max + 1;
+
+            const colors = new Map();
+            const slots = new Map();
+            const placed = [];
+            const useCount = HIGHLIGHT_PALETTE.map(() => 0);
+            const deferred = [];
+
+            for (const entry of entries) {
+                entry.span = span(entry.members);
+                if (entry.intent.mode === 'fixed') {
+                    // Never altered, but still blocks a neighbour from picking its twin.
+                    placed.push({ color: entry.intent.color, span: entry.span });
+                    continue;
+                }
+                const group = entry.forcePalette
+                    ? null : this._persistentGroupColorForTips(entry.members);
+                if (group) {
+                    colors.set(entry.id, group);
+                    placed.push({ color: group, span: entry.span });
+                    continue;
+                }
+                if (entry.slot !== null) {
+                    const index = ((entry.slot % HIGHLIGHT_PALETTE.length)
+                        + HIGHLIGHT_PALETTE.length) % HIGHLIGHT_PALETTE.length;
+                    const color = HIGHLIGHT_PALETTE[index];
+                    colors.set(entry.id, color);
+                    slots.set(entry.id, entry.slot);
+                    useCount[index] += 1;
+                    placed.push({ color, span: entry.span });
+                    continue;
+                }
+                deferred.push(entry);
+            }
+
+            for (const entry of deferred) {
+                const neighbourColors = placed
+                    .filter((other) => touches(entry.span, other.span))
+                    .map((other) => other.color);
+                const order = HIGHLIGHT_PALETTE
+                    .map((_, index) => index)
+                    .sort((a, b) => (useCount[a] - useCount[b]) || (a - b));
+                let chosen = order.find((index) => !neighbourColors.some(
+                    (color) => this._highlightColorsAreTooClose(HIGHLIGHT_PALETTE[index], color)
+                ));
+                // Every colour clashes with something next door: take the least-used one, so
+                // the outcome is still deterministic rather than arbitrary.
+                if (chosen === undefined) chosen = order[0];
+                useCount[chosen] += 1;
+                colors.set(entry.id, HIGHLIGHT_PALETTE[chosen]);
+                slots.set(entry.id, chosen);
+                placed.push({ color: HIGHLIGHT_PALETTE[chosen], span: entry.span });
+            }
+
+            return { colors, slots };
+        }
+
+        /**
+         * Alan 8/24/26 - The colour one highlight would receive with nothing chosen for it.
+         *
+         * Used by the renderer and by the editor's live preview, so what the user sees before
+         * saving is what gets drawn. `annotationId` may name an annotation that does not exist
+         * yet; it is then assigned last, which is where saving will put it.
+         */
+        resolveAutomaticHighlightColor(annotationId, memberIds, slot = null, draft = null) {
+            const { colors } = this._automaticHighlightAssignments(
+                this._lastAnnotationPositions || null,
+                { id: annotationId, memberIds, slot,
+                  annotation: draft?.annotation || null, layer: draft?.layer || null }
+            );
+            return colors.get(annotationId) || HIGHLIGHT_PALETTE[0];
+        }
+
+        /**
+         * Alan 8/24/26 - The colour a DRAFT highlight would be painted with, resolved from the
+         * draft itself rather than from whatever is currently saved under the same id.
+         *
+         * The editor mutates a copy: while "Fixed red" is being switched to "Automatic", the
+         * saved annotation still says fixed. Feeding the saved object into the assignment made
+         * the preview and the swatch show a colour the save would not produce, because a fixed
+         * entry takes no palette slot and a draft that is now automatic needs one. The draft
+         * carries its own id, membership, layer, colour, mode and stored slot, so it can stand
+         * in for the future saved state exactly -- and it REPLACES the saved entry rather than
+         * being appended, so the annotation is never counted twice.
+         */
+        resolveDraftHighlightColor(annotation, layer = null) {
+            if (!annotation || !annotation.id) return HIGHLIGHT_PALETTE[0];
+            const { colors } = this._automaticHighlightAssignments(
+                this._lastAnnotationPositions || null, { annotation, layer }
+            );
+            return colors.get(annotation.id) || HIGHLIGHT_PALETTE[0];
+        }
+
+        /**
+         * Alan 8/24/26 - The palette slot a new automatic highlight should be saved with.
+         *
+         * Stored on the annotation so its colour survives other annotations being deleted or
+         * added. Deliberately computed as if the clade had no colour group: a clade that is in
+         * one today takes its fill from the group, but if it later leaves the group the stored
+         * slot is what stops it jumping to whatever colour is free at that moment.
+         */
+        reserveAutomaticHighlightSlot(annotationId, memberIds) {
+            const { slots } = this._automaticHighlightAssignments(
+                this._lastAnnotationPositions || null,
+                { id: annotationId, memberIds, forcePalette: true }
+            );
+            const slot = slots.get(annotationId);
+            // Alan 8/24/26 - No slot means "nothing was reserved", which must NOT collapse to
+            // 0: 0 is a real palette slot, and a stored slot beats the clash-avoidance pass, so
+            // returning it here used to pin the highlight to the first palette blue forever --
+            // even directly beside another blue band. Null lets the renderer choose each time.
+            return Number.isInteger(slot) ? slot : null;
+        }
+
+        // Alan 8/24/26 - True when the page is in dark mode. Guarded: the annotation code also
+        // runs under Node in the regression harness, which has no documentElement.
+        _isDarkTheme() {
+            try {
+                return !!document.documentElement?.classList?.contains('dark');
+            } catch (_) {
+                return false;
+            }
+        }
+
+        /**
+         * Alan 8/24/26 - The colour and opacity a highlight is actually drawn with.
+         *
+         * Both are resolved here and written inline by the caller. Nothing about a highlight's
+         * appearance may live in a stylesheet: the export path clones the live SVG without the
+         * page's CSS, so a themed CSS override would silently make the exported figure differ
+         * from the one the user was looking at.
+         */
+        _effectiveHighlightStyle(item, assignments = null) {
+            const style = item.style || {};
+            const intent = this._resolveHighlightColorIntent(item.annotation, item.layer);
+            const color = intent.mode === 'fixed'
+                ? intent.color
+                : ((assignments && assignments.get(item.annotation?.id))
+                    // Alan 8/24/26 - No precomputed assignment means this is a one-off
+                    // resolution -- the editor preview. Resolve it from the item's OWN
+                    // annotation and layer, which in the editor is the unsaved draft.
+                    || this.resolveDraftHighlightColor(item.annotation, item.layer));
+            // An opacity the user picked is theirs in both themes; only the automatic one
+            // adapts, because a wash tuned for white is invisible on black.
+            const opacity = style.highlight_opacity_is_default
+                ? (this._isDarkTheme() ? AUTO_HIGHLIGHT_OPACITY.dark : AUTO_HIGHLIGHT_OPACITY.light)
+                : style.highlight_opacity;
+            return { color, opacity };
+        }
+
+        // Alan 8/24/26 - Automatic highlight opacity depends on the theme, and the theme can be
+        // toggled while a tree is on screen, so repaint when the class changes. One observer per
+        // viewer; harmless where there is no DOM to observe.
+        _watchThemeChanges() {
+            if (this._themeObserver || typeof MutationObserver !== 'function') return;
+            try {
+                const root = document.documentElement;
+                if (!root) return;
+                this._themeObserver = new MutationObserver(() => this._scheduleAnnotationRedraw());
+                this._themeObserver.observe(root, {
+                    attributes: true, attributeFilter: ['class']
+                });
+            } catch (_) { /* no DOM to watch; inline styles are still correct as drawn */ }
+        }
+
+        // Alan 8/24/26 - True for the types that annotate a clade as a whole rather than one
+        // incoming branch. These are the ones that occupy a right-hand lane and that remain
+        // valid on the root, which has no incoming branch to hang a label on.
+        _isCladeAnnotationType(type) {
+            return type === 'clade_line' || type === 'clade_highlight';
         }
 
         // Alan 8/15/26 - Measure rendered label width with a throwaway <text> in the live SVG,
@@ -3833,6 +4367,7 @@
             const positions = new Map();
             const leaves = [];
             let labelRight = -Infinity;
+            const self = this;
 
             svg.selectAll('g.node, g.internal-node').each(function (d) {
                 if (!d) return;
@@ -3841,20 +4376,19 @@
                 const x = (typeof d.screen_x === 'number') ? d.screen_x : d.y;
                 const y = (typeof d.screen_y === 'number') ? d.screen_y : d.x;
                 if (typeof x !== 'number' || typeof y !== 'number') return;
-                let right = x;
-                try {
-                    const box = this.getBBox();
-                    right = x + box.x + box.width;
-                } catch (_) { /* detached node; keep the branch tip as the edge */ }
-                if (right > labelRight) labelRight = right;
-                leaves.push({ node: d, y });
+                const right = self._tipLabelRightEdge(this, x);
+                if (Number.isFinite(right) && right > labelRight) labelRight = right;
+                leaves.push({ node: d, y, right });
             });
 
             if (!leaves.length) return null;
 
-            const self = this;
             leaves.sort((a, b) => a.y - b.y);
             const tipOrder = [];
+            // Alan 8/24/26 - The right edge of EACH row's own label, in tip order. A clade
+            // annotation is placed from the labels of its own descendants, so one very long
+            // name elsewhere in the tree cannot push a small local annotation across the page.
+            const tipRights = [];
             leaves.forEach((leaf, index) => {
                 const id = self._getNodeId(leaf.node);
                 if (!id) return;
@@ -3862,6 +4396,7 @@
                 // membership for it, so the first occurrence here is never load-bearing.
                 if (!positions.has(id)) positions.set(id, { y: leaf.y, index: tipOrder.length });
                 tipOrder.push(id);
+                tipRights.push(Number.isFinite(leaf.right) ? leaf.right : null);
             });
 
             // Row pitch from the median gap, so uneven spacing does not produce silly ticks.
@@ -3870,12 +4405,67 @@
             gaps.sort((a, b) => a - b);
             const rowPitch = gaps.length ? (gaps[Math.floor(gaps.length / 2)] || 10) : 10;
 
+            // Alan 8/24/26 - Kept so the editor's live preview can work out which automatic
+            // colour a not-yet-saved highlight will get, including the adjacency rule, without
+            // re-measuring the DOM on every keystroke.
+            this._lastAnnotationPositions = positions;
+
             return {
                 positions,
                 tipOrder,
+                tipRights,
                 labelRight: Number.isFinite(labelRight) ? labelRight : 0,
                 rowPitch: Math.max(4, rowPitch)
             };
+        }
+
+        /**
+         * Alan 8/24/26 - The right-hand edge of one leaf's VISIBLE tip label.
+         *
+         * Was the bounding box of the whole leaf <g>. That box is the union of everything the
+         * group happens to contain, which is not only the label: phylotree puts the node bubble
+         * in there, and it appends a branch-tracer <line> running all the way out to
+         * right_most_leaf when tip alignment is on -- and never removes that line for a leaf
+         * when alignment is switched back off. Any of those makes the measured edge far wider
+         * than the text, and since this value is where the annotation lane starts, the result
+         * was a large empty band between the tip labels and the bracket.
+         *
+         * Measuring the label element itself is exact whichever of those is responsible. The
+         * text carries its own transform when tips are aligned, and getBBox() reports a child's
+         * geometry before its own transform, so that translation is added back here. Falls back
+         * to the old group measurement for anything without a rendered label.
+         */
+        _tipLabelRightEdge(groupElement, nodeX) {
+            const measure = (element, offsetX) => {
+                try {
+                    const box = element.getBBox();
+                    if (!box || !(box.width > 0)) return null;
+                    return nodeX + offsetX + box.x + box.width;
+                } catch (_) {
+                    return null;
+                }
+            };
+
+            let label = null;
+            try {
+                label = groupElement.querySelector('text.phylotree-node-text');
+            } catch (_) { /* fall through to the group measurement */ }
+
+            if (label) {
+                let offsetX = 0;
+                try {
+                    // Rectangular layout only translates; radial rotation is out of scope for
+                    // annotations, and consolidate() returns null when there is no transform.
+                    const matrix = label.transform?.baseVal?.consolidate()?.matrix;
+                    if (matrix && Number.isFinite(matrix.e)) offsetX = matrix.e;
+                } catch (_) { /* untransformed label */ }
+                const right = measure(label, offsetX);
+                if (right !== null) return right;
+            }
+
+            const fallback = measure(groupElement, 0);
+            // A leaf with no drawn label at all still occupies its own branch tip.
+            return fallback !== null ? fallback : nodeX;
         }
 
         /**
@@ -3888,6 +4478,10 @@
         _buildAnnotationTopologyIndexes(positions) {
             const cladeBlocks = new Set();
             const branchNodes = new Map();
+            // Alan 8/24/26 - Also keep the node ITSELF for every clade block, root included.
+            // A clade highlight starts at its internal node's x coordinate, and the root has
+            // no incoming branch, so branchNodes alone cannot supply it.
+            const cladeNodes = new Map();
             const visit = (node) => {
                 const children = node.children || [];
                 if (!children.length) {
@@ -3897,6 +4491,7 @@
                     // Alan 8/17/26 - Index terminal clades while excluding only a root branch target.
                     const key = `${entry.index}:${entry.index}`;
                     cladeBlocks.add(key);
+                    if (!cladeNodes.has(key)) cladeNodes.set(key, node);
                     if (node.parent) branchNodes.set(key, node);
                     return { min: entry.index, max: entry.index };
                 }
@@ -3913,13 +4508,19 @@
                 // Alan 8/17/26 - Every node, including the root, is a valid clade block for
                 // a publication bracket; only non-root nodes own an incoming branch.
                 cladeBlocks.add(key);
+                // Alan 8/24/26 - A knuckle (one child) repeats its child's descendant block.
+                // Children are visited before this line, so the first writer for a key is
+                // always the deepest node carrying it -- the one drawn closest to the clade it
+                // labels. An unconditional set() here put the SHALLOWEST node back, which
+                // started the band out at the top of the unary chain instead.
+                if (!cladeNodes.has(key)) cladeNodes.set(key, node);
                 if (node.parent) branchNodes.set(key, node);
                 return { min, max };
             };
             for (const root of this.allNodes) {
                 if (!root.parent) visit(root);
             }
-            return { cladeBlocks, branchNodes };
+            return { cladeBlocks, branchNodes, cladeNodes };
         }
 
         // Alan 8/17/26 - Retain the incoming-branch index helper for renderer compatibility.
@@ -3956,7 +4557,10 @@
          * where the set is a clade again makes it render again on the next redraw.
          */
         // Alan 8/17/26 - Accept a precomputed incoming-branch index for type-aware resolution.
-        _resolveAnnotationsForRender(positions, cladeBlocks, layerById, branchNodes = null) {
+        // Alan 8/24/26 - Accept the clade-node index too, so a highlight knows where its
+        // internal node is drawn. Optional, so existing four-argument callers still work.
+        _resolveAnnotationsForRender(positions, cladeBlocks, layerById, branchNodes = null,
+                                     cladeNodes = null) {
             const validity = new Map();
             const resolved = [];
             // Alan 8/17/26 - Accept the precomputed branch index, with compatibility fallbacks.
@@ -3987,8 +4591,10 @@
                 const isClade = this._annotationIsContiguous(indices)
                     && cladeBlocks.has(blockKey);
                 const hasIncomingBranch = incomingBranchNodes.has(blockKey);
+                // Alan 8/24/26 - Clade lines and clade highlights need only be one clade;
+                // the branch types additionally need a branch to sit on.
                 const valid = isClade
-                    && (annotationType === 'clade_line' || hasIncomingBranch);
+                    && (this._isCladeAnnotationType(annotationType) || hasIncomingBranch);
                 validity.set(annotation.id, { present: indices.length, valid });
                 // Invalid annotations are kept in state and flagged in the manager, but they
                 // are never drawn: any line beside the tips would imply a clade that the
@@ -4002,6 +4608,10 @@
                     layer,
                     indices,
                     targetNode: incomingBranchNodes.get(blockKey) || null,
+                    // Alan 8/24/26 - The node the highlight band starts at. Falls back to the
+                    // incoming-branch target, which is the same node everywhere but the root.
+                    cladeNode: (cladeNodes && cladeNodes.get(blockKey))
+                        || incomingBranchNodes.get(blockKey) || null,
                     savedIndex: this.cladeAnnotations.indexOf(annotation)
                 });
             }
@@ -4023,6 +4633,9 @@
             if (enclosure.empty()) return;
 
             enclosure.selectAll('g.clade-annotations').remove();
+            // Alan 8/24/26 - Highlight bands live in their own group so they can sit BEHIND
+            // the branches, node/support labels and tip labels rather than on top of them.
+            enclosure.selectAll('g.clade-annotation-highlights').remove();
             this.annotationValidity = new Map();
 
             // Remember the width phylotree itself wants, so hiding a layer gives the space
@@ -4070,23 +4683,26 @@
                 return;
             }
 
+            // Alan 8/24/26 - Automatic opacity follows the theme, which can be toggled with a
+            // tree on screen; repaint when it changes.
+            this._watchThemeChanges();
             const geometry = this._buildAnnotationGeometry(svg);
             if (!geometry) { this._annotationsDrawn = false; restoreWidth(); return; }
             const { positions, labelRight, rowPitch } = geometry;
             // Alan 8/17/26 - Build clade validity and incoming-branch targets in the same pass.
-            const { cladeBlocks, branchNodes } = this._buildAnnotationTopologyIndexes(positions);
+            // Alan 8/24/26 - cladeNodes additionally covers the root, which highlights allow.
+            const { cladeBlocks, branchNodes, cladeNodes } =
+                this._buildAnnotationTopologyIndexes(positions);
 
             // Tip labels are kept at constant screen size by _applyTextSizingFromZoom, so scale
             // annotation text the same way and the bracket keeps its relationship to the labels.
             const { k } = this._getSvgAndZoomGroup();
             const scale = 1 / (k || 1);
 
-            const GAP_FROM_TREE = 18 * scale;
-            const GAP_BETWEEN_LANES = 14 * scale;
-            const LINE_TO_TEXT_GAP = 6 * scale;
-            const LINE_WIDTH = Math.max(0.5, 1.5 * scale);
-            // Alan 8/17/26 - Keep stacked branch labels clear of their branch and each other.
-            const BRANCH_GAP = 5 * scale;
+            const {
+                GAP_FROM_TREE, GAP_BETWEEN_LANES, LINE_TO_TEXT_GAP,
+                LINE_WIDTH, BRANCH_GAP, HIGHLIGHT_PAD_X
+            } = this._annotationLaneMetrics(scale);
 
             // Alan 8/15/26 - Resolve each annotation against the current tree once. Only the
             // ones that are still exactly one clade come back for drawing; the rest are
@@ -4094,7 +4710,7 @@
             // Alan 8/17/26 - Pass the shared incoming-branch index into type-aware validation.
             const { validity, resolved } = this._resolveAnnotationsForRender(
                 // Alan 8/17/26 - Reuse branch targets built with the clade-block index.
-                positions, cladeBlocks, layerById, branchNodes
+                positions, cladeBlocks, layerById, branchNodes, cladeNodes
             );
             this.annotationValidity = validity;
 
@@ -4105,6 +4721,13 @@
             }
 
             const group = enclosure.append('g').attr('class', 'clade-annotations');
+            // Alan 8/24/26 - Behind EVERYTHING phylotree drew: first child of the same
+            // container group, so it shares the tree's coordinate space and zoom transform
+            // while painting under the branches. pointer-events is off here as well as in
+            // CSS, because an exported/cloned SVG carries no stylesheet.
+            const highlightGroup = enclosure.insert('g', ':first-child')
+                .attr('class', 'clade-annotation-highlights')
+                .style('pointer-events', 'none');
 
             const orderedLayers = this.annotationLayers
                 .filter((layer) => layer && layer.visible !== false && layerById.has(layer.id))
@@ -4121,11 +4744,9 @@
             // annotations consume this exact item shape and the same SVG text primitive.
             for (const item of resolved) {
                 const style = {};
-                for (const field of ['font_family', 'font_size', 'font_style',
-                    'font_weight', 'text_color', 'line_color', 'fill_color',
-                    'fill_opacity']) {
+                for (const field of ANNOTATION_STYLE_FIELDS) {
                     const entry = this._resolveAnnotationStyleEntry(item.annotation, item.layer, field);
-                    style[field] = (field === 'font_size' || field === 'fill_opacity')
+                    style[field] = ANNOTATION_NUMERIC_STYLE_FIELDS.has(field)
                         ? Number(entry.value) : entry.value;
                     style[field + '_is_default'] = entry.isDefault;
                 }
@@ -4140,41 +4761,46 @@
                 item.metrics = this._annotationLayoutMetrics(item, LINE_TO_TEXT_GAP);
             }
 
-            let cursorX = labelRight + GAP_FROM_TREE;
+            // Alan 8/24/26 - Each clade annotation is placed from ITS OWN descendants' tip
+            // labels, not from the longest label anywhere in the tree. One long name in an
+            // unrelated part of the figure used to drag every bracket out with it, which is
+            // what left a small nested annotation such as "sensu stricto" stranded hundreds of
+            // pixels from the sequences it names.
+            for (const item of resolved) {
+                item.localLabelRight = this._localTipLabelRight(item.indices, geometry);
+                item.preferredLaneX = item.localLabelRight + GAP_FROM_TREE;
+            }
+
+            // Not seeded from labelRight: the first lane is allowed to sit beside its own
+            // clade. Later lanes are pushed out only as far as clearing the earlier ones needs.
+            let cursorX = -Infinity;
 
             for (const layer of orderedLayers) {
                 // Alan 8/17/26 - Reserve right-side lanes only for publication-style clade lines.
+                // Alan 8/24/26 - Highlights keep the bracket and label, so they share the
+                // clade lane with clade lines; only the band behind them is extra.
                 const items = resolved.filter((item) => item.layer.id === layer.id
-                    && item.type === 'clade_line');
+                    && this._isCladeAnnotationType(item.type));
                 if (!items.length) continue;
 
-                // Alan 8/17/26 - Item preparation moved above so branch and clade renderers share it.
-                // Greedy interval packing into sub-lanes so nested or overlapping annotations
-                // in one layer never draw on top of each other. The extents are the DRAWN
-                // ones, so a bubble packs by its box and a tall multiline label reserves the
-                // room its text really needs.
-                items.sort((a, b) => (a.metrics.renderTop - b.metrics.renderTop)
-                    || (b.metrics.renderBottom - a.metrics.renderBottom));
-                const lanes = [];
-                for (const item of items) {
-                    const padding = Math.max(item.scaledFontSize, rowPitch) * 0.6;
-                    let placed = false;
-                    for (const lane of lanes) {
-                        if (lane.lastBottom + padding < item.metrics.renderTop) {
-                            lane.items.push(item);
-                            lane.lastBottom = Math.max(lane.lastBottom, item.metrics.renderBottom);
-                            placed = true;
-                            break;
-                        }
-                    }
-                    if (!placed) lanes.push({ items: [item], lastBottom: item.metrics.renderBottom });
-                }
+                const placement = this._layoutAnnotationLanes(
+                    items, rowPitch, GAP_BETWEEN_LANES, cursorX
+                );
+                cursorX = placement.cursorX;
 
-                for (const lane of lanes) {
-                    const laneX = cursorX;
-                    let laneWidth = 0;
+                placement.lanes.forEach((lane, laneIndex) => {
+                    const laneX = lane.x;
+                    // Alan 8/24/26 - Bands are flushed per LANE, not per layer: two lanes are
+                    // separate columns, and stretching one out to the other's longest label
+                    // smears it across the gap between them.
+                    const laneKey = `${layer.id}#${laneIndex}`;
                     for (const item of lane.items) {
-                        laneWidth = Math.max(laneWidth, item.metrics.laneWidth);
+                        item.laneX = laneX;
+                        // Alan 8/24/26 - The band has to reach past the label it belongs to,
+                        // which is only known once the lane this item landed in is placed.
+                        item.highlightRight = laneX + item.metrics.laneWidth + HIGHLIGHT_PAD_X;
+                        item.highlightLayerId = layer.id;
+                        item.highlightLaneId = laneKey;
                         const entry = this._drawOneAnnotation(
                             group, item, laneX, LINE_TO_TEXT_GAP, LINE_WIDTH, rowPitch
                         );
@@ -4189,7 +4815,45 @@
                             )
                         });
                     }
-                    cursorX += laneWidth + GAP_BETWEEN_LANES;
+                });
+            }
+
+            // Alan 8/24/26 - Paint the highlight bands now that every lane is placed, so each
+            // band knows how far right its own label reaches. Larger clades are painted first
+            // and nested ones on top of them, so a section inside a section stays legible; the
+            // order is taken from the descendant span rather than from creation order, which
+            // would otherwise make the hierarchy depend on the order the user happened to add
+            // the annotations in.
+            const highlightItems = this._orderCladeHighlights(resolved);
+            this._alignHighlightRightEdges(highlightItems);
+            // Alan 8/24/26 - Work the automatic colours out once for the whole tree rather than
+            // per band, so the "second highlight gets a different colour" rule can see them all.
+            const highlightColors = highlightItems.length
+                ? this._automaticHighlightAssignments(positions).colors
+                : null;
+            for (const item of highlightItems) {
+                const fallbackRight = Number.isFinite(item.preferredLaneX)
+                    ? item.preferredLaneX : labelRight + GAP_FROM_TREE;
+                const { band, label } = this._cladeHighlightRects(
+                    item, rowPitch, HIGHLIGHT_PAD_X, fallbackRight
+                );
+                if (!band) continue;
+                // Alan 8/24/26 - Resolve the colour and opacity that are actually visible and
+                // write both inline. Nothing themed may be left to CSS: the export clones this
+                // SVG without the page stylesheet, so a CSS-only dark-mode opacity used to make
+                // the exported figure paler than the one the user was looking at.
+                const effective = this._effectiveHighlightStyle(item, highlightColors);
+                this._appendHighlightRect(
+                    highlightGroup, band, effective, item.annotation.id
+                );
+                // Alan 8/24/26 - A label taller than its clade gets its own backing piece in
+                // the annotation lane, at the same colour and opacity. It never reaches back
+                // across the tip labels, so a three-line note on one sequence cannot make the
+                // rows above and below it look like members of the clade.
+                if (label) {
+                    this._appendHighlightRect(
+                        highlightGroup, label, effective, item.annotation.id
+                    );
                 }
             }
 
@@ -4197,7 +4861,9 @@
             // descendant set. Layer order affects only stacking on that SAME branch.
             const layerOrder = new Map(orderedLayers.map((layer, index) => [layer.id, index]));
             const branchItems = resolved
-                .filter((item) => item.type !== 'clade_line' && item.targetNode?.parent)
+                // Alan 8/24/26 - Only the branch types go here; both clade types were already
+                // drawn in their lane, and a highlight must not also stack over the branch.
+                .filter((item) => !this._isCladeAnnotationType(item.type) && item.targetNode?.parent)
                 .sort((a, b) => (layerOrder.get(a.layer.id) - layerOrder.get(b.layer.id))
                     || (a.savedIndex - b.savedIndex));
             const branchCursors = new Map();
@@ -4234,12 +4900,27 @@
 
             // Grow the canvas so long labels and large fonts are never clipped. The tree
             // itself is untouched -- shrinking it to fit would make the biology unreadable.
-            let requiredRight = cursorX;
+            let requiredRight = Number.isFinite(cursorX)
+                ? cursorX : labelRight + GAP_FROM_TREE;
             // Alan 8/17/26 - Capture the full annotation bounds for width and viewBox expansion.
             let annotationBox = null;
             try {
                 // Alan 8/17/26 - Measure once and reuse the same bounds for all viewport axes.
                 annotationBox = group.node().getBBox();
+                // Alan 8/24/26 - Union in the highlight bands, which extend half a row above
+                // the first tip and below the last one and would otherwise be clipped.
+                if (highlightItems.length) {
+                    const bandBox = highlightGroup.node().getBBox();
+                    if (bandBox && bandBox.width && bandBox.height) {
+                        const minX = Math.min(annotationBox.x, bandBox.x);
+                        const minY = Math.min(annotationBox.y, bandBox.y);
+                        const maxX = Math.max(annotationBox.x + annotationBox.width,
+                            bandBox.x + bandBox.width);
+                        const maxY = Math.max(annotationBox.y + annotationBox.height,
+                            bandBox.y + bandBox.height);
+                        annotationBox = { x: minX, y: minY, width: maxX - minX, height: maxY - minY };
+                    }
+                }
                 requiredRight = Math.max(requiredRight, annotationBox.x + annotationBox.width);
             } catch (_) { /* fall back to the layout cursor */ }
             // The container group carries translate(...) alone before any zoom, and
@@ -4278,6 +4959,101 @@
             }
         }
 
+        /**
+         * Alan 8/24/26 - The right edge of the tip labels belonging to ONE clade.
+         *
+         * This, not the tree-wide `labelRight`, is where that clade's annotation lane wants to
+         * begin. A single very long sequence name somewhere else in the figure used to define
+         * the lane for every annotation, so a small nested clade with short labels got its
+         * bracket pushed across a wide empty band.
+         *
+         * A label that could not be measured contributes nothing; if none of the clade's rows
+         * could be measured at all, the tree-wide edge is used, which is never narrower than
+         * this clade's own labels and therefore cannot draw over the tips.
+         */
+        _localTipLabelRight(indices, geometry) {
+            const rights = geometry && geometry.tipRights;
+            let right = -Infinity;
+            if (Array.isArray(rights)) {
+                for (const index of indices || []) {
+                    const value = rights[index];
+                    if (Number.isFinite(value) && value > right) right = value;
+                }
+            }
+            return Number.isFinite(right)
+                ? right
+                : ((geometry && Number.isFinite(geometry.labelRight)) ? geometry.labelRight : 0);
+        }
+
+        /**
+         * Alan 8/24/26 - Pack one layer's clade annotations into non-overlapping lanes.
+         *
+         * Smallest clade first, so a nested annotation takes the lane NEAREST the tree and its
+         * containing clade is the one pushed outward. The other way round (which is what
+         * sorting by vertical extent produced) put the outer clade's long label in the inner
+         * lane and shoved the short inner label past it -- the "sensu stricto stranded far to
+         * the right" case.
+         *
+         * Overlap is tested against every annotation already in a lane rather than against a
+         * running low-water mark, because the order the items arrive in is no longer sorted by
+         * vertical position.
+         */
+        _packAnnotationLanes(items, rowPitch) {
+            const ordered = (items || []).slice().sort((a, b) =>
+                (a.indices.length - b.indices.length)
+                || (a.metrics.renderTop - b.metrics.renderTop)
+                || ((a.savedIndex || 0) - (b.savedIndex || 0)));
+            const lanes = [];
+            for (const item of ordered) {
+                const padding = Math.max(item.scaledFontSize || 0, rowPitch) * 0.6;
+                const top = item.metrics.renderTop;
+                const bottom = item.metrics.renderBottom;
+                let placed = null;
+                for (const lane of lanes) {
+                    const clashes = lane.items.some((other) =>
+                        other.metrics.renderTop - padding < bottom
+                        && top - padding < other.metrics.renderBottom);
+                    if (!clashes) { placed = lane; break; }
+                }
+                if (placed) placed.items.push(item);
+                else lanes.push({ items: [item] });
+            }
+            return lanes;
+        }
+
+        /**
+         * Alan 8/24/26 - Pack one layer's clade annotations into lanes and give each lane its
+         * horizontal position. Pure, so the placement rule is pinned by a test rather than only
+         * by reading the draw loop.
+         *
+         * A lane begins where the annotations IN IT want it -- just past their own clades' tip
+         * labels -- and is moved right only as far as clearing the lanes already placed
+         * requires. `cursorX` is that running floor and may be -Infinity for the first lane,
+         * which is what lets the innermost lane sit beside its own labels no matter how wide
+         * the rest of the figure is.
+         */
+        _layoutAnnotationLanes(items, rowPitch, gapBetweenLanes, cursorX = -Infinity) {
+            const lanes = this._packAnnotationLanes(items, rowPitch);
+            let cursor = cursorX;
+            lanes.forEach((lane, index) => {
+                let laneX = -Infinity;
+                let laneWidth = 0;
+                for (const item of lane.items) {
+                    if (Number.isFinite(item.preferredLaneX)) {
+                        laneX = Math.max(laneX, item.preferredLaneX);
+                    }
+                    laneWidth = Math.max(laneWidth, item.metrics.laneWidth || 0);
+                }
+                if (Number.isFinite(cursor)) laneX = Math.max(laneX, cursor);
+                if (!Number.isFinite(laneX)) laneX = 0;
+                lane.index = index;
+                lane.x = laneX;
+                lane.width = laneWidth;
+                cursor = laneX + laneWidth + gapBetweenLanes;
+            });
+            return { lanes, cursorX: cursor };
+        }
+
         // Alan 8/17/26 - Keep pure multiline clade-line geometry shared by preview and rendering.
         _annotationLayoutMetrics(item, textGap) {
             const fontSize = item.scaledFontSize || 0;
@@ -4295,6 +5071,216 @@
                 laneWidth: textGap + item.textWidth,
                 renderTop: Math.min(item.top, midY - blockHeight / 2),
                 renderBottom: Math.max(item.bottom, midY + blockHeight / 2)
+            };
+        }
+
+        /**
+         * Alan 8/24/26 - The layout constants, converted from screen pixels into the tree's
+         * own units for the current zoom.
+         *
+         * Annotation text is held at a constant SCREEN size, so every gap beside it has to be
+         * divided by the zoom factor to keep the same apparent distance. Pulled out of the
+         * renderer so the relationship between the lane and the tip labels -- a modest gap
+         * after the longest label, not a band of empty figure -- is pinned by a test rather
+         * than only by reading the draw code.
+         */
+        _annotationLaneMetrics(scale) {
+            return {
+                // Distance from the right edge of the longest DRAWN tip label to the bracket.
+                GAP_FROM_TREE: 18 * scale,
+                GAP_BETWEEN_LANES: 14 * scale,
+                LINE_TO_TEXT_GAP: 6 * scale,
+                LINE_WIDTH: Math.max(0.5, 1.5 * scale),
+                // Alan 8/17/26 - Keep stacked branch labels clear of their branch and each other.
+                BRANCH_GAP: 5 * scale,
+                // Alan 8/24/26 - Breathing room around a highlight band, so it reads as a
+                // deliberate region rather than a rectangle clipped onto the branch strokes.
+                HIGHLIGHT_PAD_X: 8 * scale
+            };
+        }
+
+        /**
+         * Alan 8/24/26 - Append one highlight band. Shared by the tree and the editor preview
+         * so they cannot drift apart, and so the drawn attributes can be asserted without a DOM.
+         *
+         * Square corners on purpose: a rounded rectangle behind a clade reads as a UI card
+         * rather than as a region of a figure. No rx attribute is set at all.
+         *
+         * Colour and opacity arrive already resolved and are written inline, because the export
+         * path clones this SVG without the page stylesheet.
+         */
+        _appendHighlightRect(parent, rect, effective, annotationId) {
+            const band = parent.append('rect')
+                .attr('class', 'clade-annotation-highlight')
+                .attr('x', rect.x)
+                .attr('y', rect.y)
+                .attr('width', rect.width)
+                .attr('height', rect.height)
+                .style('fill', effective.color)
+                .style('fill-opacity', effective.opacity)
+                // No border by default: an outline around a translucent band competes with
+                // the branches it is supposed to sit quietly behind.
+                .style('stroke', 'none')
+                .style('pointer-events', 'none');
+            if (annotationId) band.attr('data-annotation-id', annotationId);
+            return band;
+        }
+
+        /**
+         * Alan 8/24/26 - Give every band in one LANE the same right edge.
+         *
+         * Each band is first sized to clear its OWN label, which left bands sharing a lane
+         * ragged: a clade whose name happens to be longer than its neighbour's stuck out past
+         * it for no reason the reader can see. Flushing them to the widest edge in the lane
+         * restores the publication look and still clears the longest label, so nothing is
+         * clipped.
+         *
+         * Per lane and not per layer. A layer can hold several lanes -- that is how nested
+         * annotations avoid each other -- and flushing a whole layer stretched an inner band
+         * out to an outer lane's long label, dragging it across the lane in between and
+         * undoing exactly the compactness the local lane placement is there to give.
+         *
+         * The lane identity is ephemeral, assigned while drawing. Nothing about horizontal
+         * position is ever persisted: every redraw recomputes it from the live layout.
+         */
+        _alignHighlightRightEdges(items) {
+            const laneKey = (item) => item.highlightLaneId
+                || item.highlightLayerId || item.layer?.id || '';
+            const widest = new Map();
+            for (const item of items || []) {
+                if (!Number.isFinite(item.highlightRight)) continue;
+                const key = laneKey(item);
+                const current = widest.get(key);
+                if (current === undefined || item.highlightRight > current) {
+                    widest.set(key, item.highlightRight);
+                }
+            }
+            for (const item of items || []) {
+                const shared = widest.get(laneKey(item));
+                if (Number.isFinite(shared)) item.highlightRight = shared;
+            }
+            return items;
+        }
+
+        /**
+         * Alan 8/24/26 - Paint order for the highlight bands: the largest clade first and
+         * nested ones over it, so a section inside a section still reads as nested.
+         *
+         * Deliberately NOT creation order: which annotation the user happened to add first
+         * says nothing about the hierarchy, and clade size does, so two trees with the same
+         * annotations always paint the same way.
+         */
+        _orderCladeHighlights(resolved) {
+            return (resolved || [])
+                .filter((item) => item && item.type === 'clade_highlight')
+                .sort((a, b) => (b.indices.length - a.indices.length)
+                    || (a.indices[0] - b.indices[0])
+                    || (a.savedIndex - b.savedIndex));
+        }
+
+        /**
+         * Alan 8/24/26 - The band behind one highlighted clade, in the tree's own coordinates.
+         *
+         * Pure geometry, so it is testable without a DOM. Every input is derived from the
+         * live layout on each redraw, exactly like the brackets, which is why rotation,
+         * spacing changes, pruning and rerooting need no stored coordinates.
+         *
+         *   left   the clade's internal node, nudged slightly back so the band does not
+         *          clip the node itself. The nudge is capped at a quarter of the incoming
+         *          branch: covering that branch would say the ancestral lineage is part of
+         *          the highlighted clade, which is a different phylogenetic claim.
+         *   top    half a row above the FIRST DESCENDANT TIP.
+         *   bottom half a row below the LAST DESCENDANT TIP.
+         *   right  past the annotation's own label, so the band covers the clade AND the
+         *          thing naming it. Falls back to just outside the tip labels when the item
+         *          never got a lane.
+         *
+         * The vertical extent comes from the descendant rows and from nothing else. It used to
+         * be the union of those rows with the annotation TEXT block, which meant a three-line
+         * label on a single sequence painted the rows above and below it too -- the band across
+         * the tree is a statement about which taxa are in the clade, so a longer caption must
+         * never add taxa to it. The text is covered by a separate piece instead; see
+         * _cladeHighlightRects.
+         */
+        _cladeHighlightRect(item, rowPitch, padX, fallbackRight) {
+            return this._cladeHighlightRects(item, rowPitch, padX, fallbackRight).band;
+        }
+
+        /**
+         * Alan 8/24/26 - The one or two rectangles a highlight is drawn from.
+         *
+         *   band   the biological clade: its height is the descendant tip rows plus about half
+         *          a row at each end, whatever the label says.
+         *   label  present only when the annotation's text block is taller than that band. It
+         *          backs the text in the ANNOTATION LANE only, starting just left of the
+         *          bracket, so the two pieces meet edge to edge and read as one stepped region
+         *          without ever reaching back across the tip labels.
+         *
+         * The two never overlap: where a label piece exists the band stops at the lane, so a
+         * translucent wash is never painted twice over the same pixels and the drawn colour is
+         * exactly the resolved one. With a one-line label there is no second rectangle at all.
+         */
+        _cladeHighlightRects(item, rowPitch, padX, fallbackRight) {
+            const empty = { band: null, label: null };
+            const point = this._annotationNodePoint(item?.cladeNode);
+            if (!point) return empty;
+            const parentPoint = this._annotationNodePoint(item.cladeNode.parent);
+            const backward = parentPoint
+                ? Math.max(0, Math.min(padX, (point.x - parentPoint.x) * 0.25))
+                : padX;
+            const left = point.x - backward;
+            const right = Number.isFinite(item.highlightRight) ? item.highlightRight : fallbackRight;
+            const metrics = item.metrics || {};
+            const padY = rowPitch * 0.5;
+            // Biological extent only. renderTop/renderBottom describe the text block and are
+            // deliberately not consulted here.
+            const top = item.top - padY;
+            const bottom = item.bottom + padY;
+
+            const labelTop = Number.isFinite(metrics.renderTop) ? metrics.renderTop : top;
+            const labelBottom = Number.isFinite(metrics.renderBottom) ? metrics.renderBottom : bottom;
+            // A little air around the text, but a small fraction of a row: the backing sits in
+            // the lane, where being generous costs nothing, yet it should still look attached.
+            // It is DECORATION on a piece that is already needed -- it must never be what
+            // decides the piece exists. Adding it before this comparison made an ordinary
+            // one-line label on a single tip (a ~15px text block inside a 20px row) test as
+            // overflowing by exactly the padding, so every such highlight was split into two
+            // rectangles for no visible reason.
+            const labelPadY = padY * 0.5;
+            // The actual text bounds against the actual band, with no tolerance: an exact fit
+            // (labelTop === top) is a fit, and float noise at that boundary would only decide
+            // between two renderings that are within a fraction of a pixel of each other.
+            const overflows = labelTop < top || labelBottom > bottom;
+
+            // Where the lane begins. The bracket is drawn at laneX, so backing it from a little
+            // left of that is what makes the step touch the band.
+            let laneLeft = Number.isFinite(item.laneX) ? item.laneX - padX : NaN;
+            if (!Number.isFinite(laneLeft) && Number.isFinite(metrics.laneWidth)) {
+                laneLeft = right - metrics.laneWidth - padX;
+            }
+            const canSplit = overflows && Number.isFinite(laneLeft)
+                && laneLeft > left && laneLeft < right;
+
+            const band = {
+                x: left,
+                y: top,
+                // With a label piece the band stops where that piece starts, so the two abut
+                // instead of overlapping; otherwise it runs the whole way as before.
+                width: Math.max(1, (canSplit ? laneLeft : right) - left),
+                height: Math.max(1, bottom - top)
+            };
+            if (!canSplit) return { band, label: null };
+
+            const labelY = Math.min(top, labelTop - labelPadY);
+            const labelEnd = Math.max(bottom, labelBottom + labelPadY);
+            return {
+                band,
+                label: {
+                    x: laneLeft,
+                    y: labelY,
+                    width: Math.max(1, right - laneLeft),
+                    height: Math.max(1, labelEnd - labelY)
+                }
             };
         }
 
@@ -4422,8 +5408,38 @@
             return entry;
         }
 
+        /**
+         * Alan 8/24/26 - The stand-in clade a highlight preview is drawn over.
+         *
+         * The preview has no topology, so it invents one -- but it has to invent something the
+         * tree could plausibly draw. It used to span the whole preview box (24 .. height-24),
+         * i.e. a clade far taller than any label, so a three-line annotation never reached
+         * outside the band and the stepped backing the figure would draw was never previewed.
+         * A small clade of two rows, centred, shows the difference: a one-line label sits
+         * inside the band, a three-line one does not.
+         *
+         * This is a STYLE preview, not a miniature of the selected clade -- it deliberately
+         * knows nothing about the live tree and draws no neighbouring taxa.
+         */
+        _previewHighlightGeometry(width, height) {
+            const rowPitch = 20;
+            const midY = height / 2;
+            return {
+                rowPitch,
+                padX: 8,
+                // Two tip rows, so the band is rowPitch * 2 tall once padded.
+                top: midY - rowPitch / 2,
+                bottom: midY + rowPitch / 2,
+                nodeX: 12,
+                laneX: 24,
+                fallbackRight: width - 12
+            };
+        }
+
         // Alan 8/17/26 - Render the editor preview with the same primitives used by the tree.
-        renderAnnotationPreview(svgElement, annotation, layer) {
+        // Alan 8/24/26 - `options` carries the editor session's membership and annotation id so
+        // an unsaved highlight previews the automatic colour it will actually be given.
+        renderAnnotationPreview(svgElement, annotation, layer, options = {}) {
             if (!svgElement || !window.d3v7) return;
             const svg = window.d3v7.select(svgElement);
             svg.selectAll('*').remove();
@@ -4432,29 +5448,67 @@
             svg.attr('viewBox', `0 0 ${width} ${height}`)
                 .attr('width', '100%').attr('height', height);
             const style = {};
-            for (const field of ['font_family', 'font_size', 'font_style', 'font_weight',
-                'text_color', 'line_color', 'fill_color', 'fill_opacity']) {
+            for (const field of ANNOTATION_STYLE_FIELDS) {
                 const entry = this._resolveAnnotationStyleEntry(annotation, layer, field);
-                style[field] = (field === 'font_size' || field === 'fill_opacity')
+                style[field] = ANNOTATION_NUMERIC_STYLE_FIELDS.has(field)
                     ? Number(entry.value) : entry.value;
                 style[field + '_is_default'] = entry.isDefault;
             }
             const lines = this._annotationLabelLines(annotation.label || 'Annotation preview');
+            const previewId = options.annotationId || 'preview';
+            const previewType = this._annotationType(annotation);
+            const geom = previewType === 'clade_highlight'
+                ? this._previewHighlightGeometry(width, height) : null;
             const item = {
-                annotation: Object.assign({ id: 'preview' }, annotation),
+                annotation: Object.assign({ id: previewId }, annotation, {
+                    member_tip_ids: options.memberIds || annotation.member_tip_ids || []
+                }),
+                // Alan 8/24/26 - The layer is part of the item, not just of `style`:
+                // _effectiveHighlightStyle() resolves the colour intent from (annotation,
+                // layer), so omitting it here made a layer-level Fixed colour invisible in the
+                // preview while the saved figure drew it.
+                layer: layer || null,
                 style,
                 lines,
-                type: this._annotationType(annotation),
+                type: previewType,
                 scaledFontSize: style.font_size,
                 textWidth: this._measureAnnotationLabel(svgElement, lines, style),
-                top: 24,
-                bottom: height - 24
+                top: geom ? geom.top : 24,
+                bottom: geom ? geom.bottom : height - 24
             };
             const group = svg.append('g').attr('class', 'clade-annotations annotation-preview-svg');
             const lineWidth = 1.5;
-            if (item.type === 'clade_line') {
+            // Alan 8/24/26 - Highlights preview through the clade-line primitives plus their
+            // band, so what the editor shows is what the figure will draw.
+            if (this._isCladeAnnotationType(item.type)) {
                 item.metrics = this._annotationLayoutMetrics(item, 7);
-                this._drawOneAnnotation(group, item, 24, 7, lineWidth, 20);
+                if (item.type === 'clade_highlight') {
+                    // A stand-in for the clade's internal node; the preview has no topology.
+                    item.cladeNode = { screen_x: geom.nodeX, screen_y: (item.top + item.bottom) / 2 };
+                    item.laneX = geom.laneX;
+                    item.highlightRight = geom.laneX + item.metrics.laneWidth + geom.padX;
+                    // Alan 8/24/26 - The same stepped primitive the figure uses, so a multiline
+                    // label previews with its own backing piece rather than with one tall band
+                    // the tree would never draw.
+                    const { band, label } = this._cladeHighlightRects(
+                        item, geom.rowPitch, geom.padX, geom.fallbackRight
+                    );
+                    if (band) {
+                        // Alan 8/24/26 - Exactly the resolution the tree uses, so the swatch the
+                        // user approves is the fill the figure gets -- automatic group colour,
+                        // automatic palette colour, or their own override.
+                        const effective = this._effectiveHighlightStyle(item);
+                        // Appended before the bracket, so the band is behind it here too.
+                        this._appendHighlightRect(group, band, effective, null);
+                        if (label) this._appendHighlightRect(group, label, effective, null);
+                    }
+                }
+                // Alan 8/24/26 - Same lane and row pitch the band above was built from, so a
+                // later change to _previewHighlightGeometry() cannot slide the bracket off it.
+                this._drawOneAnnotation(
+                    group, item, geom ? geom.laneX : 24, 7, lineWidth,
+                    geom ? geom.rowPitch : 20
+                );
             } else {
                 const branchY = height - 20;
                 group.append('line')

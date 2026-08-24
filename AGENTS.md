@@ -156,6 +156,33 @@ Run this after changes that affect the web application runtime, routes, views/te
 
 Use the worker or metrics restart wrappers only when the change affects those specific background services.
 
+### Always check the restart wrapper's exit code
+
+`restart-dikarya-web` does not just restart the unit — it then polls
+`http://127.0.0.1:8000/health` until the app actually serves, and **exits
+non-zero if it does not**. That check exists because `systemctl restart` returns
+when *systemd* is satisfied, which is not the same as Dikarya being able to
+answer a request: Gunicorn does not import the application until traffic
+arrives, so a module that fails to import survives a "successful" restart (this
+is the 2026-08-14 incident described below). The wrapper's curl forces that
+first import while you are still watching.
+
+A non-zero exit means **the site may be down right now**. Do not move on, and do
+not simply re-run it:
+
+| Exit | Meaning | What to do |
+|---|---|---|
+| 0 | Restarted and healthy | Continue. |
+| 64 | Arguments were passed | The wrapper takes none, by design. |
+| 69 | Restarted but never became healthy | **The site is down.** Read the journal lines the wrapper printed, then `sudo /usr/local/sbin/dikarya-journal web 200`. Usually an import error or a bad config value — fix it and restart again. |
+| 70 | `systemctl restart` itself failed | Check whether you ran it under `sudo`. |
+| 75 | Serving, but `/health` reports 503 | The restart worked and the code imported; a dependency (database, filesystem) is unhealthy. Restarting again will not fix it. |
+| 77 | Not run as root | Re-run as `sudo /usr/local/sbin/restart-dikarya-web`. |
+
+Do not mask the exit code — no `|| true`, and if you pipe the output, keep
+stderr and check `${PIPESTATUS[0]}`.
+
+
 ### Run the preflight import check before any restart
 
 ```bash
@@ -500,8 +527,9 @@ logrotate in `app/services/log_rotation.py` can truncate it.
   same pattern as `dikarya-journal`, e.g. `/usr/local/sbin/dikarya-pyspy <pid>`,
   validating the PID argument rather than forwarding it blindly.
 
-  Gunicorn runs `--workers 4 --threads 2`, so only **8 requests can be in flight at
-  once**. A hang where workers are alive but idle (low CPU, few established sockets
+  Gunicorn runs `--workers 4 --threads 8` (verified against
+  `/etc/systemd/system/dikarya-web.service` on 2026-08-24; this file previously
+  said `--threads 2`), so **32 requests can be in flight at once**. A hang where workers are alive but idle (low CPU, few established sockets
   on `:8000`) means those slots are held by handlers that are sleeping rather than
   working — dump the threads to find which handler. Long-lived streaming endpoints
   such as `/api/job/<id>/events` (SSE) are the usual suspects.

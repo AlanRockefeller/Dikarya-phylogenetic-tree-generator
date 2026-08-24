@@ -121,6 +121,30 @@
     fill: none;
 }
 
+/* Clade highlight bands. Their own group, inserted as the FIRST child of the
+   phylotree container so they paint under the branches, node/support labels and
+   tip labels instead of over them. The fill and opacity are resolved per
+   annotation and written inline (so they survive export, which carries no
+   stylesheet); only the structural rules belong here.
+
+   pointer-events must stay off: a band spans a whole clade and would otherwise
+   swallow every right-click meant for the branches underneath it. */
+#tree-container .clade-annotation-highlights {
+    pointer-events: none;
+}
+
+#tree-container .clade-annotation-highlight {
+    stroke: none;
+    pointer-events: none;
+}
+
+/* Deliberately NO themed fill/opacity rule here. The renderer resolves the
+   effective highlight colour and opacity -- including the lighter automatic
+   wash used in light mode and the stronger one used in dark mode -- and writes
+   both inline on the rect. Export clones the live SVG without this stylesheet,
+   so anything themed left in CSS would come out of the exporter looking
+   different from what the user was looking at when they clicked Export. */
+
 #tree-container .clade-annotation-label {
     paint-order: normal;
     stroke: none;
@@ -146,6 +170,7 @@
 .dark rect.clade-annotation-default-ink {
     stroke: #f3f4f6 !important;
 }
+
 
 /* The preview is an actual SVG rendered by the viewer's annotation primitive.
    Inline resolved colors stay identical in light mode, dark mode, and exports. */

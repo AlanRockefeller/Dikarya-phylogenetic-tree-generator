@@ -4,7 +4,7 @@
 {% block subtitle %}Tree Viewer{% endblock %}
 
 {% block head %}
-<link rel="stylesheet" href="{{ url_for('static', filename='css/tree_viewer.css') }}?v=9">
+<link rel="stylesheet" href="{{ url_for('static', filename='css/tree_viewer.css') }}?v=10">
 <link rel="stylesheet" href="{{ url_for('static', filename='css/phylotree.css') }}?v=2">
 <link rel="stylesheet" href="{{ url_for('static', filename='css/phylotree-menus.css') }}?v=3">
 <link rel="preconnect" href="https://fonts.googleapis.com">
@@ -841,6 +841,7 @@
                             <option value="clade_line">Clade line — bracket beside descendant tips</option>
                             <option value="branch_text">Branch text — multiline text above the branch</option>
                             <option value="branch_bubble">Branch bubble — rounded callout above the branch</option>
+                            <option value="clade_highlight">Clade highlight — translucent band behind the clade</option>
                         </select>
                     </div>
 
@@ -1337,11 +1338,11 @@
 
 <script src="{{ url_for('static', filename='js/phylotree.js') }}?v=9"></script>
 
-<script src="{{ url_for('static', filename='js/tree_viewer_phylotree_v2.js') }}?v=69"></script>
+<script src="{{ url_for('static', filename='js/tree_viewer_phylotree_v2.js') }}?v=74"></script>
 
 <script src="{{ url_for('static', filename='js/tree_viewer_api.js') }}?v=7"></script>
 
-<script src="{{ url_for('static', filename='js/tree_viewer_controller.js') }}?v=64"></script>
+<script src="{{ url_for('static', filename='js/tree_viewer_controller.js') }}?v=67"></script>
 
 {% include 'partials/alignment_viewer_modal.html' %}
 
