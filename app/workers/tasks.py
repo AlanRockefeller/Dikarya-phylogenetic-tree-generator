@@ -617,6 +617,17 @@ def _count_alignment_stats(fasta_path) -> tuple[int, int]:
         return 0, 0
 
 
+def _check_and_maybe_fix_orientation(input_path, fix_orientation: bool) -> dict:
+    """Classify orientations, only rewriting the FASTA when correction is on."""
+    from app.services.orientation_service import fix_sequence_orientation
+
+    orient_fasta = input_path.read_text(encoding="utf-8", errors="replace")
+    fixed_fasta, orient_stats = fix_sequence_orientation(orient_fasta)
+    if fix_orientation:
+        input_path.write_text(fixed_fasta, encoding="utf-8")
+    return orient_stats
+
+
 @background_job_context(0)
 def run_recompute_job(job_id: str, params_dict: dict) -> dict:
     """Background task for recomputing an existing tree while streaming status events."""
@@ -1364,16 +1375,21 @@ def run_phylo_job(job_params: dict) -> dict:
             publish_step_start(job_id, STEP_ORIENT, "Orientation Check", "Checking sequence orientations")
             update_step_meta(job, STEP_ORIENT, {"state": STATE_RUNNING})
             
-            from app.services.orientation_service import fix_sequence_orientation
-            
-            orient_fasta = input_raw_path.read_text(encoding="utf-8", errors="replace")
-            fixed_fasta, orient_stats = fix_sequence_orientation(orient_fasta)
-            input_raw_path.write_text(fixed_fasta, encoding="utf-8")
+            fix_orientation = bool(job_params.get("fix_orientation", True))
+            orient_stats = _check_and_maybe_fix_orientation(
+                input_raw_path, fix_orientation
+            )
             
             reversed_count = orient_stats.get("reverse", 0)
             uncertain_count = orient_stats.get("uncertain", 0)
             
-            if reversed_count > 0:
+            if not fix_orientation:
+                orient_detail = "Orientation correction disabled"
+                if reversed_count > 0:
+                    orient_detail += f"; {reversed_count} reverse sequence(s) detected"
+                if uncertain_count > 0:
+                    orient_detail += f", {uncertain_count} uncertain"
+            elif reversed_count > 0:
                 orient_detail = f"{reversed_count} sequence(s) reverse complemented"
                 if uncertain_count > 0:
                     orient_detail += f", {uncertain_count} uncertain"
@@ -1383,7 +1399,8 @@ def run_phylo_job(job_params: dict) -> dict:
                 orient_detail = "All sequences correctly oriented"
             
             logger.info(
-                "Orientation check: total=%s forward=%s reverse=%s uncertain=%s",
+                "Orientation check: correction_enabled=%s total=%s forward=%s reverse=%s uncertain=%s",
+                fix_orientation,
                 orient_stats.get("total", 0),
                 orient_stats.get("forward", 0),
                 reversed_count,
@@ -1393,7 +1410,7 @@ def run_phylo_job(job_params: dict) -> dict:
             publish_step_done(job_id, STEP_ORIENT, orient_detail)
             update_step_meta(job, STEP_ORIENT, {"state": STATE_DONE, "detail": orient_detail})
             
-            if reversed_count > 0:
+            if fix_orientation and reversed_count > 0:
                 publish_metric(job_id, STEP_ORIENT, "reversed", reversed_count)
 
             # =========================================================
@@ -1507,7 +1524,6 @@ def run_phylo_job(job_params: dict) -> dict:
             # Default on: a backwards sequence is a wrong tree, and only MAFFT
             # notices without help. Off is for input the user has already
             # oriented and does not want touched.
-            fix_orientation = bool(job_params.get("fix_orientation", True))
             align_params = AlignmentParams(
                 method=align_method,
                 fix_orientation=fix_orientation,
@@ -1515,9 +1531,8 @@ def run_phylo_job(job_params: dict) -> dict:
             )
             align_stats = run_alignment(
                 input_raw_path, alignment_raw_path, align_params, Config, logger, job_id=job_id,
-                # ORIENT is unconditional in this pipeline, so uncertain_count is
-                # always bound here. It lets the aligner-flip degradation say
-                # whether MAFFT merely settled what ORIENT abstained on.
+                # ORIENT still classifies sequences when correction is disabled,
+                # but both it and the aligner leave the sequence data untouched.
                 orient_uncertain=uncertain_count,
             ) or {}
 

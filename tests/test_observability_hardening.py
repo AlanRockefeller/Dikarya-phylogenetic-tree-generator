@@ -610,6 +610,36 @@ def test_enqueue_job_preserves_queue_selection_ids_and_timeouts():
     assert kwargs["job_timeout"].endswith("s")
 
 
+@pytest.mark.parametrize(
+    ("tree_method", "tree_hours"),
+    [("raxml", 15), ("iqtree", 14), ("mrbayes", 13), ("fasttree", 6)],
+)
+def test_job_timeout_allows_pipeline_stages_before_tree_builder(tree_method, tree_hours):
+    from app.config import Config
+    from app.workers.queue import resolve_job_timeout
+
+    limits = {
+        "RAXML_TIME_LIMIT_HOURS": 15,
+        "IQTREE_TIME_LIMIT_HOURS": 14,
+        "MRBAYES_TIME_LIMIT_HOURS": 13,
+        "FASTTREE_TIME_LIMIT_HOURS": 6,
+    }
+    with patch.object(Config, "GENERAL_JOB_TIME_LIMIT_HOURS", 8), patch.multiple(
+        Config, **limits
+    ):
+        timeout = resolve_job_timeout({"tree_method": tree_method})
+
+    assert timeout == f"{int((8 + tree_hours) * 3600) + 600}s"
+
+
+def test_job_timeout_uses_general_allowance_without_a_limited_tree_builder():
+    from app.config import Config
+    from app.workers.queue import resolve_job_timeout
+
+    with patch.object(Config, "GENERAL_JOB_TIME_LIMIT_HOURS", 8):
+        assert resolve_job_timeout({"tree_method": "nj"}) == "29400s"
+
+
 # ---------------------------------------------------------------------------
 # Health transitions
 # ---------------------------------------------------------------------------

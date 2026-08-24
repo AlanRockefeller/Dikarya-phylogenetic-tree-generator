@@ -3619,10 +3619,19 @@ def download_fasta_pruned(job_id):
 
     job_dir = Config.JOB_DIR / job_id
     path = job_dir / "alignment" / "alignment_pruned.fasta"
+    input_path = job_dir / "input" / "input_raw.fasta"
+    # Alan 8/24/26 - "nothing pruned" is the normal state, not an error: with an
+    # empty pruned_taxa the pruned set IS the processed input, so serve that
+    # rather than 404ing. The 404 sent /tree?edit= down its fallback to
+    # /download/fasta/original, which is the sequences the user SUBMITTED --
+    # a different set from input_raw.fasta (dedup/orient/BLAST augmentation) in
+    # 43% of jobs, so add-and-recompute silently lost those changes. Serving
+    # input_raw also discards a stale alignment_pruned.fasta left behind by an
+    # earlier state that did have prunes.
+    unpruned = None
     try:
         from app.services.tree_edit_service import load_tree_state, extract_pruned_fasta
         state = load_tree_state(job_dir)
-        input_path = job_dir / "input" / "input_raw.fasta"
         if state.get("pruned_taxa") and validate_safe_file_path(input_path, job_dir):
             if path.parent.exists() and (path.parent.is_symlink() or not path.parent.is_dir()):
                 raise RuntimeError("Pruned FASTA directory is unsafe")
@@ -3630,8 +3639,15 @@ def download_fasta_pruned(job_id):
                 raise RuntimeError("Pruned FASTA path is unsafe")
             path.parent.mkdir(parents=True, exist_ok=True)
             extract_pruned_fasta(input_path, state, path)
+        elif not state.get("pruned_taxa"):
+            unpruned = True
     except Exception as e:
         logger.warning(f"Failed to refresh pruned FASTA for job {job_id}: {e}")
+
+    if unpruned and validate_safe_file_path(input_path, job_dir):
+        return send_file(
+            input_path, as_attachment=True, download_name="sequences_pruned.fasta"
+        )
 
     if not validate_safe_file_path(path, job_dir):
         return jsonify({"status": "error", "error": "Pruned FASTA not found or invalid"}), 404
