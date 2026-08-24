@@ -6,6 +6,7 @@ reviews:
   auto_review:
     enabled: true
     base_branches:
+      - "public-main"
       - "review-base"
 
   path_filters:
