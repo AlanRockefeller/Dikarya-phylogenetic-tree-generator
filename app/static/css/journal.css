@@ -1,5 +1,9 @@
 /* Dikarya Mycological Journal Styles */
 
+/* Typography. @import must come before every style rule or the browser drops
+   it and the journal silently falls back to system fonts. */
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Libre+Baskerville:ital,wght@0,400;0,700;1,400&display=swap');
+
 :root {
     /* Color Palette - Forest/Mycology inspired */
     --primary-dark: #1a2f23;
@@ -115,9 +119,6 @@
 *::after {
     box-sizing: border-box;
 }
-
-/* Typography */
-@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Libre+Baskerville:ital,wght@0,400;0,700;1,400&display=swap');
 
 body.journal-page {
     font-family: var(--font-sans);
@@ -582,4 +583,18 @@ body.journal-page {
 [data-theme="dark"] .journal-input:focus {
     border-color: var(--accent);
     box-shadow: 0 0 0 2px rgba(163, 176, 136, 0.2);
+}
+
+/* Label text kept for assistive technology where the visual design relies on a
+   placeholder alone. */
+.journal-visually-hidden {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    padding: 0;
+    margin: -1px;
+    overflow: hidden;
+    clip: rect(0, 0, 0, 0);
+    white-space: nowrap;
+    border: 0;
 }

@@ -7,7 +7,9 @@
 <p>Phylogenetic Tree Builder</p>
 
 <div class="actions">
-    <a href="{{ url_for('main.beginner') }}"><button>Beginner Quick Tree</button></a>
-    <a href="{{ url_for('main.advanced') }}"><button>Advanced Analysis</button></a>
+    <!-- Buttons nested inside anchors are invalid HTML and give one navigation
+         two focusable controls; the anchors carry the styling instead. -->
+    <a class="action-button" href="{{ url_for('main.beginner') }}">Beginner Quick Tree</a>
+    <a class="action-button" href="{{ url_for('main.advanced') }}">Advanced Analysis</a>
 </div>
 {% endblock %}

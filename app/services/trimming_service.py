@@ -15,6 +15,7 @@ from typing import Any, Dict, Optional
 
 from app.config import Config
 from app.services.artifact_storage import compress_artifact, discard_artifact
+from app.services.fasta_utils import read_fasta_records
 from app.services.subprocess_utils import (
     configured_tool_limits,
     configured_tool_time_limit_hours,
@@ -22,6 +23,7 @@ from app.services.subprocess_utils import (
     log_tool_failure,
     run_command,
     run_command_streaming,
+    ToolExecutionError,
     tool_failure_message,
 )
 
@@ -221,30 +223,6 @@ def format_trimming_detail(trim_method: Optional[str], trim_stats: Optional[Dict
     return "; ".join(detail_parts)
 
 
-def _read_fasta_records(path: Path) -> list[tuple[str, str]]:
-    records: list[tuple[str, str]] = []
-    header: Optional[str] = None
-    seq_parts: list[str] = []
-
-    with open(path, "r") as handle:
-        for raw_line in handle:
-            line = raw_line.strip()
-            if not line:
-                continue
-            if line.startswith(">"):
-                if header is not None:
-                    records.append((header, "".join(seq_parts)))
-                header = line[1:].strip()
-                seq_parts = []
-            else:
-                seq_parts.append(line)
-
-    if header is not None:
-        records.append((header, "".join(seq_parts)))
-
-    return records
-
-
 def _write_fasta_records(records: list[tuple[str, str]], path: Path) -> None:
     with open(path, "w") as handle:
         for header, sequence in records:
@@ -262,7 +240,7 @@ def _trim_terminal_overhangs(input_alignment: Path, output_alignment: Path, logg
     threshold) the input is copied through unchanged rather than raising, so an
     unusual dataset degrades to "no trimming" instead of failing the job.
     """
-    records = _read_fasta_records(input_alignment)
+    records = read_fasta_records(input_alignment)
 
     def _copy_through(reason: str, input_columns: int) -> Dict[str, Any]:
         shutil.copy(input_alignment, output_alignment)
@@ -521,9 +499,10 @@ def _run_trimal_gappy(
         )
 
         if exit_code != 0:
-            raise RuntimeError(tool_failure_message(
-                "trimAl (gap threshold)", exit_code,
-                configured_tool_time_limit_hours(config, "trimAl")))
+            raise ToolExecutionError(
+                "trimAl (gap threshold)", exit_code, stats, tool_failure_message(
+                    "trimAl (gap threshold)", exit_code,
+                    configured_tool_time_limit_hours(config, "trimAl")))
     else:
         returncode, stdout, stderr = run_command(
             cmd, log_file=log_file,
@@ -583,8 +562,9 @@ def _run_trimal(
         
         if exit_code != 0:
             log_tool_failure(_logger, "trimAl", exit_code, stats, job=job_id, step="trim")
-            raise RuntimeError(tool_failure_message(
-                "trimAl", exit_code, configured_tool_time_limit_hours(config, "trimAl")))
+            raise ToolExecutionError(
+                "trimAl", exit_code, stats, tool_failure_message(
+                    "trimAl", exit_code, configured_tool_time_limit_hours(config, "trimAl")))
     else:
         returncode, stdout, stderr = run_command(
             cmd, log_file=log_file,
@@ -685,8 +665,9 @@ def _run_bmge(
         
         if exit_code != 0:
             log_tool_failure(_logger, "BMGE", exit_code, stats, job=job_id, step="trim")
-            raise RuntimeError(tool_failure_message(
-                "BMGE", exit_code, configured_tool_time_limit_hours(config, "BMGE")))
+            raise ToolExecutionError(
+                "BMGE", exit_code, stats, tool_failure_message(
+                    "BMGE", exit_code, configured_tool_time_limit_hours(config, "BMGE")))
     else:
         returncode, stdout, stderr = run_command(
             cmd, log_file=log_file,

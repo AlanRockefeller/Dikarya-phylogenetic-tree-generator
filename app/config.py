@@ -216,6 +216,15 @@ class Config:
     MAX_CONTENT_LENGTH = int(os.environ.get('MAX_CONTENT_LENGTH', str(16 * 1024 * 1024)))
     BLAST_POLL_INTERVAL_SECONDS = int(os.environ.get('BLAST_POLL_INTERVAL_SECONDS', '60'))
     REDIS_URL = os.environ.get('REDIS_URL', 'redis://localhost:6379/0')
+    # Progress publication is best-effort and must never stall a phylogeny job
+    # behind a blackholed Redis connection. RQ/SSE clients have different
+    # blocking semantics and deliberately do not use these values.
+    EVENT_REDIS_CONNECT_TIMEOUT_SECONDS = float(
+        os.environ.get('EVENT_REDIS_CONNECT_TIMEOUT_SECONDS', '2')
+    )
+    EVENT_REDIS_SOCKET_TIMEOUT_SECONDS = float(
+        os.environ.get('EVENT_REDIS_SOCKET_TIMEOUT_SECONDS', '2')
+    )
 
     # Claude review of a finished alignment + tree (app/services/tree_analysis_service.py).
     # Unconfigured, the button is hidden and the endpoint returns 503, so a

@@ -3108,7 +3108,10 @@ document.addEventListener('DOMContentLoaded', async () => {
 
         // Alan 5/29/26 - Rooting-mode dropdown drives the unified rooting API; "manual" defers to existing Reroot-Here click flow.
         if (rootingModeSelect) rootingModeSelect.addEventListener('change', () => {
-            if (isProcessing) return;
+            // Rooting is a persisted edit; view-only trees must not reach it.
+            // The backend enforces this too (check_job_access mode="edit"), so this
+            // only keeps the UI from offering an action that can only 403.
+            if (window.VIEW_ONLY || isProcessing) return;
             const mode = rootingModeSelect.value;
             if (mode === 'manual') {
                 rerootMode = true;
@@ -3393,6 +3396,13 @@ document.addEventListener('DOMContentLoaded', async () => {
             disableBtn(btnRecompute);
             // Alan 5/12/26 - Color clearing is a persisted edit, so disable it in view-only mode.
             disableBtn(btnUncolorSelection);
+            // Rooting mode and sequence-of-interest both persist edits, so they
+            // belong with the disabled controls rather than beside them.
+            if (rootingModeSelect) {
+                rootingModeSelect.disabled = true;
+                rootingModeSelect.title = "View Only - Make an editable copy to use this feature";
+            }
+            disableBtn(btnSetSoi);
             // btnMakeCopy remains enabled
             // Alan 5/11/26 - Leave Deselect available in view-only mode because it only changes local highlighting.
             updateDeselectButton(false);

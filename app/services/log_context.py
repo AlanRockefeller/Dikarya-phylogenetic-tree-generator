@@ -86,6 +86,18 @@ def reset_release_cache() -> None:
         _RELEASE_CACHE = None
 
 
+def background_user_identity(db_job) -> str:
+    """Return the log identity for a background job's owner.
+
+    Deliberately never the email address. Background job logs are written to
+    files that are read, digested and pasted around far more freely than the
+    request log, and the address adds nothing a grep on the stable internal id
+    cannot do. An ownerless (anonymous) job reports "anon".
+    """
+    user_id = getattr(db_job, "user_id", None) if db_job is not None else None
+    return f"id:{user_id}" if user_id else "anon"
+
+
 def bind_background_context(**values):
     """Merge safe values into the current task context and return a reset token."""
     current = dict(_BACKGROUND.get())

@@ -14,7 +14,6 @@ import logging
 import re
 from dataclasses import dataclass
 from pathlib import Path
-from textwrap import wrap
 from typing import Dict, List, Optional, Tuple
 
 # The single source of truth for what a sequence line may contain. This module
@@ -268,10 +267,17 @@ def fasta_reader(fasta_text: str) -> List[Tuple[str, str]]:
 
 
 def format_fasta(header: str, seq: str, wrap_width: int = WRAP_WIDTH) -> str:
-    """Format a single FASTA record with wrapped sequence lines."""
+    """Format a single FASTA record with wrapped sequence lines.
+
+    Fixed-width slicing, not textwrap: textwrap is prose-oriented and breaks on
+    hyphens, so an alignment-derived sequence carrying gap characters came out
+    in ragged lines of varying width. The characters themselves were never
+    reordered or dropped, but FASTA line width should be exactly what was asked
+    for, and slicing is the only way to guarantee that for every input.
+    """
     lines = [f">{header}"]
-    for chunk in wrap(seq, wrap_width):
-        lines.append(chunk)
+    for start in range(0, len(seq), wrap_width):
+        lines.append(seq[start:start + wrap_width])
     return "\n".join(lines)
 
 

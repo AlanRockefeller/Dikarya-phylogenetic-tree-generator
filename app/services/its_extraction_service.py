@@ -20,7 +20,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-from app.services.trimming_service import _read_fasta_records
+from app.services.fasta_utils import read_fasta_records
 
 # Region keys accepted from the API/UI. "none" means "do not extract".
 REGION_NONE = "none"
@@ -209,7 +209,7 @@ def run_its_extraction(
     label = REGION_LABELS[region]
     stats = ItsExtractionStats(region=region, region_label=label, min_length=min_len)
 
-    records = _read_fasta_records(input_fasta)
+    records = read_fasta_records(input_fasta)
     stats.input_count = len(records)
     if not records:
         raise ItsExtractionError("No sequences available for ITS region extraction.")

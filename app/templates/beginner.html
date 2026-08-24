@@ -44,7 +44,12 @@
 
     if (!seq && file) {
       statusEl.textContent = "Reading file…";
-      seq = (await readFileAsText(file)).trim();
+      try {
+        seq = (await readFileAsText(file)).trim();
+      } catch (e) {
+        statusEl.textContent = "Could not read the selected file.";
+        return;
+      }
     }
 
     if (!seq) {
@@ -52,6 +57,11 @@
       return;
     }
 
+    const btn = document.getElementById("submit_btn");
+    if (btn) {
+      if (btn.disabled) return;
+      btn.disabled = true;
+    }
     statusEl.textContent = "Submitting job…";
 
     const payload = {
@@ -70,18 +80,25 @@
     const headers = { "Content-Type": "application/json" };
     if (csrfToken) headers["X-CSRFToken"] = csrfToken;
 
-    const resp = await fetch("/api/job", {
-      method: "POST",
-      headers: headers,
-      body: JSON.stringify(payload)
-    });
-
+    let resp = null;
     let data = null;
-    try { data = await resp.json(); } catch (e) { }
+    try {
+      resp = await fetch("/api/job", {
+        method: "POST",
+        headers: headers,
+        body: JSON.stringify(payload)
+      });
+      try { data = await resp.json(); } catch (e) { }
+    } catch (e) {
+      statusEl.textContent = "Network error. Please try again.";
+      if (btn) btn.disabled = false;
+      return;
+    }
 
     if (!resp.ok) {
       statusEl.textContent = "Error submitting job (" + resp.status + ")";
       resultEl.textContent = data ? JSON.stringify(data, null, 2) : "";
+      if (btn) btn.disabled = false;
       return;
     }
 

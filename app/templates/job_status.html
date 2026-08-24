@@ -257,7 +257,9 @@
     }
 
     .dark #job-status-page .step-label.skipped {
-        color: #4b5563;
+        /* Must be lighter than the dark card, not darker: #4b5563 was all but
+           invisible on it. Matches .step-indicator.skipped in dark mode. */
+        color: #6b7280;
     }
 
     /* Current Step Card & Others */
@@ -499,7 +501,7 @@
                     </div>
 
                     <div class="pt-4 border-t border-gray-100 dark:border-gray-700 flex flex-wrap gap-3">
-                        <a href="#"
+                        <a href="/api/job/{{ job_id }}/logs/pipeline" download
                             class="btn-secondary px-4 py-2 bg-gray-100 dark:bg-gray-700 rounded text-sm font-medium hover:bg-gray-200 dark:hover:bg-gray-600 transition-colors">
                             <i class="fas fa-download mr-1"></i> Download Logs
                         </a>
@@ -631,14 +633,20 @@
                     </a>
 
                     <!-- Downloads Dropdown -->
-                    <div class="relative group">
-                        <button
+                    <div class="relative group" id="downloads-menu-wrap">
+                        <button type="button" id="downloads-menu-btn"
+                            aria-haspopup="true" aria-expanded="false" aria-controls="downloads-menu"
                             class="bg-white dark:bg-journal-dark border-2 border-gray-200 dark:border-gray-600 text-gray-700 dark:text-gray-200 py-4 px-8 rounded-xl font-semibold text-lg shadow-md flex items-center gap-2 hover:border-journal-gold transition-colors">
                             <i class="fas fa-download"></i> Downloads <i class="fas fa-chevron-up text-xs ml-1"></i>
                         </button>
-                        <!-- Dropdown Menu -->
-                        <div
-                            class="absolute bottom-full right-0 mb-2 w-64 bg-white dark:bg-gray-800 border border-gray-200 dark:border-gray-700 rounded-xl shadow-2xl overflow-hidden hidden group-hover:block z-50">
+                        <!-- Dropdown Menu. Visibility is driven entirely from the script at
+                             the foot of this template: hover, click/tap, Escape and outside
+                             click all funnel through one setter, so `aria-expanded` can never
+                             disagree with what is on screen. Deliberately no group-hover: /
+                             group-focus-within: variants -- a CSS rule that forces display
+                             cannot be overridden by the toggle and made the menu unclosable. -->
+                        <div id="downloads-menu"
+                            class="absolute bottom-full right-0 mb-2 w-64 bg-white dark:bg-gray-800 border border-gray-200 dark:border-gray-700 rounded-xl shadow-2xl overflow-hidden hidden z-50">
                             <div
                                 class="px-4 py-2 bg-gray-50 dark:bg-gray-900 text-xs font-bold uppercase text-gray-500 border-b dark:border-gray-700">
                                 Logs</div>
@@ -708,5 +716,69 @@
 {% endblock %}
 
 {% block scripts %}
-<script src="{{ url_for('static', filename='js/job_status.js') }}?v=16"></script>
+<script src="{{ url_for('static', filename='js/job_status.js') }}?v=17"></script>
+<script>
+    // Downloads dropdown. The completed job's downloads are its primary output, so
+    // they must be reachable with a mouse, a keyboard and a finger alike.
+    //
+    // Visible state is derived from exactly two inputs and applied in one place, so
+    // the class and aria-expanded cannot drift apart:
+    //   visible = pinned (clicked/tapped open) OR hovering (mouse over the group)
+    //
+    // Focus deliberately does not open the menu on its own: a focus-driven open
+    // cannot be closed while the trigger keeps focus, which is what broke Escape
+    // and the second click. Keyboard users press Enter/Space on the button, which
+    // fires click, and Escape closes and returns focus to the button.
+    (function () {
+        const wrap = document.getElementById('downloads-menu-wrap');
+        const btn = document.getElementById('downloads-menu-btn');
+        const menu = document.getElementById('downloads-menu');
+        if (!wrap || !btn || !menu) return;
+
+        let pinned = false;
+        let hovering = false;
+
+        function sync() {
+            const visible = pinned || hovering;
+            menu.classList.toggle('hidden', !visible);
+            btn.setAttribute('aria-expanded', visible ? 'true' : 'false');
+        }
+
+        btn.addEventListener('click', (e) => {
+            e.stopPropagation();
+            pinned = !pinned;
+            sync();
+        });
+
+        // Hover keeps the original desktop affordance. mouseleave never fires on
+        // touch, which is why tapping relies on `pinned` instead.
+        wrap.addEventListener('mouseenter', () => { hovering = true; sync(); });
+        wrap.addEventListener('mouseleave', () => { hovering = false; sync(); });
+
+        document.addEventListener('click', (e) => {
+            if (wrap.contains(e.target)) return;
+            pinned = false;
+            sync();
+        });
+
+        document.addEventListener('keydown', (e) => {
+            if (e.key !== 'Escape') return;
+            if (!pinned && !hovering) return;
+            pinned = false;
+            hovering = false;
+            sync();
+            btn.focus();
+        });
+
+        // A chosen download closes the menu.
+        menu.addEventListener('click', (e) => {
+            if (!e.target.closest('a')) return;
+            pinned = false;
+            hovering = false;
+            sync();
+        });
+
+        sync();
+    })();
+</script>
 {% endblock %}

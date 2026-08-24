@@ -19,7 +19,7 @@
             </label>
 
             <!-- Sort control -->
-            <select id="alignment-sort-mode"
+            <select id="alignment-sort-mode" aria-label="Sort sequences"
                 class="text-xs bg-white dark:bg-journal-dark text-gray-800 dark:text-gray-100 border border-gray-300 dark:border-gray-600 rounded px-2 py-1 focus:ring-journal-gold focus:border-journal-gold">
                 <option value="tree">Tree order</option>
                 <option value="name_asc">Name A–Z</option>
@@ -31,16 +31,16 @@
             </select>
 
             <!-- Reference selector: baseline for difference highlighting, variable columns and similarity sorts -->
-            <select id="alignment-reference"
+            <select id="alignment-reference" aria-label="Reference sequence"
                 class="text-xs bg-white dark:bg-journal-dark text-gray-800 dark:text-gray-100 border border-gray-300 dark:border-gray-600 rounded px-2 py-1 max-w-[16rem] focus:ring-journal-gold focus:border-journal-gold"
                 title="Sequence every row is compared against. Pick a holotype (or any sequence) to see how the rest differ from it; Consensus uses the most frequent base per column. You can also click a sequence name in the list."></select>
 
             <!-- Search -->
-            <input type="text" id="alignment-filter" placeholder="Filter sequences..."
+            <input type="text" id="alignment-filter" placeholder="Filter sequences..." aria-label="Filter sequences"
                 class="text-xs bg-white dark:bg-journal-dark text-gray-800 dark:text-gray-100 border border-gray-300 dark:border-gray-600 rounded px-2 py-1 w-44 focus:ring-journal-gold focus:border-journal-gold">
 
             <!-- Color scheme picker (dark-mode only effect, but always visible) -->
-            <select id="alignment-color-scheme"
+            <select id="alignment-color-scheme" aria-label="Color scheme"
                 class="text-xs bg-white dark:bg-journal-dark text-gray-800 dark:text-gray-100 border border-gray-300 dark:border-gray-600 rounded px-2 py-1 focus:ring-journal-gold focus:border-journal-gold"
                 title="Color scheme">
                 <option value="moss">Moss &amp; stone</option>

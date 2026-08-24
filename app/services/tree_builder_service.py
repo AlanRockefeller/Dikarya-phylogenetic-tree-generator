@@ -29,6 +29,7 @@ from app.services.subprocess_utils import (
     configured_tool_timeout_seconds,
     run_command,
     run_command_streaming,
+    ToolExecutionError,
     tool_failure_message,
 )
 from app.services.fasta_utils import sanitize_fasta_headers, restore_tree_names
@@ -650,11 +651,14 @@ def _check_raxml_feature(config: Config, feature_flag: str) -> bool:
     from app.services.subprocess_utils import run_command
     try:
         cmd = [config.RAXML_BINARY, "--help"]
-        _, stdout, _ = run_command(
+        returncode, stdout, stderr = run_command(
             cmd, timeout=min(60, _tool_timeout_seconds(config, "RAxML"))
         )
-        _RAXML_HELP_CACHE = stdout
-        return feature_flag in stdout
+        help_text = "\n".join(part for part in (stdout, stderr) if part).strip()
+        if returncode != 0 or not help_text:
+            return False
+        _RAXML_HELP_CACHE = help_text
+        return feature_flag in help_text
     except Exception:
         return False
 
@@ -810,15 +814,18 @@ def _run_raxml(
     config: Config,
     task_logger,
     job_id: Optional[str] = None
-):
+) -> Tuple[Optional[str], Optional[str], Dict[str, Any]]:
     """
     Run RAxML-NG tree inference with upgraded workflow.
 
-    Returns ``(effective_model, selected_by)``. The effective model is the one
-    RAxML was actually handed, which is not necessarily ``params.model`` --
-    MOOSE overrides it, and the validator can substitute a data-type default.
+    Returns ``(effective_model, selected_by, metadata)``. The effective model is
+    the one RAxML was actually handed, which is not necessarily ``params.model``
+    -- MOOSE overrides it, and the validator can substitute a data-type default.
     ``selected_by`` names the selector ("MOOSE") when something other than the
-    user's setting picked the model, else ``None``.
+    user's setting picked the model, else ``None``. ``metadata`` is the
+    tree_metadata.json fragment for this run: the bootstrap spec actually used,
+    support type, seed, data type, and the requested/applied parameter record
+    with any validator warnings. run_tree_builder() merges it wholesale.
     """
     from app.services.raxml_validator import validate_and_resolve_raxml_params
     
@@ -977,7 +984,10 @@ def _run_raxml(
         )
 
         if exit_code != 0:
-            raise RuntimeError(tool_failure_message("RAxML", exit_code, limit_hours))
+            raise ToolExecutionError(
+                "RAxML", exit_code, stats,
+                tool_failure_message("RAxML", exit_code, limit_hours),
+            )
     else:
         returncode, stdout, stderr = run_command(
             cmd, log_file=log_file, timeout=_tool_timeout_seconds(config, "RAxML")
@@ -1145,8 +1155,9 @@ def _run_iqtree(
         )
 
         if exit_code != 0:
-            raise RuntimeError(tool_failure_message(
-                "IQ-TREE", exit_code, _tool_time_limit_hours(config, "IQ-TREE")))
+            raise ToolExecutionError(
+                "IQ-TREE", exit_code, stats, tool_failure_message(
+                    "IQ-TREE", exit_code, _tool_time_limit_hours(config, "IQ-TREE")))
     else:
         returncode, stdout, stderr = run_command(
             cmd, log_file=log_file, timeout=_tool_timeout_seconds(config, "IQ-TREE")
@@ -1557,9 +1568,10 @@ def _run_mrbayes(
         )
 
         if exit_code != 0:
-            raise RuntimeError(tool_failure_message(
-                "MrBayes", exit_code, _tool_time_limit_hours(config, "MrBayes")
-            ))
+            raise ToolExecutionError(
+                "MrBayes", exit_code, stats, tool_failure_message(
+                    "MrBayes", exit_code, _tool_time_limit_hours(config, "MrBayes")
+                ))
     else:
         returncode, stdout, stderr = run_command(
             cmd, log_file=log_file, timeout=_tool_timeout_seconds(config, "MrBayes")
@@ -1796,8 +1808,9 @@ def _run_fasttree(
         )
 
         if exit_code != 0:
-             raise RuntimeError(tool_failure_message(
-                 "FastTree", exit_code, _tool_time_limit_hours(config, "FastTree")))
+             raise ToolExecutionError(
+                 "FastTree", exit_code, stats, tool_failure_message(
+                     "FastTree", exit_code, _tool_time_limit_hours(config, "FastTree")))
 
     else:
         # specific handling if we assume run_command captures stdout

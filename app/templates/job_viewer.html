@@ -4,13 +4,13 @@
 {% block subtitle %}Tree Viewer{% endblock %}
 
 {% block head %}
-<link rel="stylesheet" href="{{ url_for('static', filename='css/tree_viewer.css') }}?v=8">
-<link rel="stylesheet" href="{{ url_for('static', filename='css/phylotree.css') }}">
-<link rel="stylesheet" href="{{ url_for('static', filename='css/phylotree-menus.css') }}?v=2">
+<link rel="stylesheet" href="{{ url_for('static', filename='css/tree_viewer.css') }}?v=9">
+<link rel="stylesheet" href="{{ url_for('static', filename='css/phylotree.css') }}?v=2">
+<link rel="stylesheet" href="{{ url_for('static', filename='css/phylotree-menus.css') }}?v=3">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;700&display=swap">
-<link rel="stylesheet" href="{{ url_for('static', filename='css/alignment_viewer.css') }}?v=16">
+<link rel="stylesheet" href="{{ url_for('static', filename='css/alignment_viewer.css') }}?v=17">
 {% endblock %}
 
 {% block content %}
@@ -493,11 +493,13 @@
                 title="Recompute rebuilds the tree from scratch using your remaining (unpruned) sequences.  It's a full re-analysis, not just a redraw. It re-runs alignment, trimming, and tree inference with the job's original settings, then reloads the viewer. Your pruned-taxa list and renames are kept; the current selection is cleared.&#10;Use it after pruning low-quality, contaminant, redundant, or long-branch sequences. Pruning only removes tips, while Recompute recalculates alignment, topology, branch lengths, and support values for what's left.&#10;You usually don't need it after renaming, recoloring, rotating, or rerooting (display-only changes), or if you haven't changed the sequence set.">
                 <i class="fa fa-sync"></i> Recompute
             </button>
+            {% if not view_only %}
             <a href="/tree?edit_job_id={{ job_id }}"
                 class="px-4 py-2 text-sm font-semibold rounded-lg bg-green-500 hover:bg-green-600 text-white transition-colors shadow-sm flex items-center gap-2"
                 id="btn-add-sequences-link">
                 <i class="fa fa-plus-circle"></i> Add Seq
             </a>
+            {% endif %}
             <button type="button"
                 class="px-4 py-2 text-sm font-semibold rounded-lg bg-yellow-500 hover:bg-yellow-600 text-white transition-colors shadow-sm flex items-center gap-2"
                 id="btn-prune">
@@ -1306,11 +1308,11 @@
 {% block scripts %}
 
 <script>
-    window.JOB_ID = "{{ job_id }}";
+    window.JOB_ID = {{ job_id|tojson }};
     // Alan 8/22/26 - Resolved server-side (tree_analysis_service.resolve_tree_support_context)
     // so the support badge and the Claude review classify the same tree the same way, including
     // after a recompute, where the displayed tree's builder metadata is the pruned one.
-    window.TREE_METHOD = "{{ tree_support_context.tree_method }}";
+    window.TREE_METHOD = {{ tree_support_context.tree_method|tojson }};
     window.TREE_SUPPORT_CONTEXT = {{ tree_support_context|tojson }};
     window.VIEW_ONLY = {{ 'true' if view_only else 'false' }};
     window.SEQUENCE_METRICS = {{ job_details.get('sequence_metadata', [])|tojson }};
@@ -1334,13 +1336,13 @@
 
 <script src="{{ url_for('static', filename='js/tree_viewer_phylotree_v2.js') }}?v=69"></script>
 
-<script src="{{ url_for('static', filename='js/tree_viewer_api.js') }}?v=6"></script>
+<script src="{{ url_for('static', filename='js/tree_viewer_api.js') }}?v=7"></script>
 
-<script src="{{ url_for('static', filename='js/tree_viewer_controller.js') }}?v=63"></script>
+<script src="{{ url_for('static', filename='js/tree_viewer_controller.js') }}?v=64"></script>
 
 {% include 'partials/alignment_viewer_modal.html' %}
 
-<script src="{{ url_for('static', filename='js/alignment_viewer.js') }}?v=13"></script>
+<script src="{{ url_for('static', filename='js/alignment_viewer.js') }}?v=15"></script>
 
 
 

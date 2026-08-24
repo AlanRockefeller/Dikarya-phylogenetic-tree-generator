@@ -124,13 +124,28 @@
     }
 
     // Alan 8/4/26 - Apply a names-column width, clamped so both columns stay usable at the current modal size.
+    // A role="separator" that is focusable is a range widget: without these it is
+    // announced with no position and no bounds.
+    function updateResizerAriaValues(resizer, width, max) {
+        resizer.setAttribute('aria-valuemin', String(NAMES_MIN_WIDTH));
+        resizer.setAttribute('aria-valuemax', String(Math.round(max)));
+        resizer.setAttribute('aria-valuenow', String(width));
+        resizer.setAttribute('aria-valuetext', `${width} pixels`);
+    }
+
     function applyNamesWidth(px, persist) {
         const total = gridEl.clientWidth || 0;
         const max = total > 0 ? Math.max(NAMES_MIN_WIDTH, total - CELLS_MIN_WIDTH) : 4000;
         const w = Math.round(Math.min(Math.max(px, NAMES_MIN_WIDTH), max));
         state.namesWidth = w;
         gridEl.style.gridTemplateColumns = `${w}px 1fr`;
-        if (state._dom && state._dom.resizer) state._dom.resizer.style.left = `${w}px`;
+        if (state._dom && state._dom.resizer) {
+            state._dom.resizer.style.left = `${w}px`;
+            // Every path that changes the width -- drag, arrow keys, double-click,
+            // the restored preference, a container resize -- comes through here, so
+            // this is the one place the announced range can be kept true.
+            updateResizerAriaValues(state._dom.resizer, w, max);
+        }
         if (persist) {
             try { localStorage.setItem(NAMES_WIDTH_STORAGE_KEY, String(w)); } catch (_) { /* ignore */ }
         }
@@ -509,6 +524,27 @@
         resizer.title = 'Drag to resize the sequence name column (double-click to fit the longest name)';
         resizer.setAttribute('role', 'separator');
         resizer.setAttribute('aria-orientation', 'vertical');
+        resizer.setAttribute('tabindex', '0');
+        resizer.setAttribute('aria-label', 'Resize the sequence name column');
+        // Seeded here so the control is never exposed without a value; the real
+        // bounds land as soon as applyNamesWidth() runs against the built grid.
+        updateResizerAriaValues(resizer, state.namesWidth, state.namesWidth);
+        resizer.addEventListener('keydown', (e) => {
+            const step = e.shiftKey ? 40 : 8;
+            if (e.key === 'ArrowLeft') {
+                applyNamesWidth(state.namesWidth - step, true);
+            } else if (e.key === 'ArrowRight') {
+                applyNamesWidth(state.namesWidth + step, true);
+            } else if (e.key === 'Home') {
+                applyNamesWidth(NAMES_MIN_WIDTH, true);
+            } else if (e.key === 'Enter') {
+                // Same as the double-click shortcut: fit the longest name.
+                applyNamesWidth(measureLongestNameWidth(), true);
+            } else {
+                return;
+            }
+            e.preventDefault();
+        });
 
         gridEl.appendChild(corner);
         gridEl.appendChild(ruler);
@@ -917,6 +953,12 @@
         }
     }
 
+    // Alignment requests are bounded and singular: the Include Pruned toggle (and a
+    // reopen) can re-enter refresh() while a request is still running, and without
+    // this a slow earlier response could overwrite a newer alignment.
+    let inFlightRequest = null;
+    const FETCH_TIMEOUT_MS = 60000;
+
     async function fetchAlignment() {
         const treeOrder = state.treeOrder;
         const tipNames = state.selectedNames.length ? state.selectedNames : [];
@@ -932,17 +974,46 @@
         const csrfToken = document.querySelector('meta[name="csrf-token"]')?.getAttribute('content');
         if (csrfToken) headers['X-CSRFToken'] = csrfToken;
 
-        const resp = await fetch(`/api/job/${state.jobId}/alignment/view`, {
-            method: 'POST',
-            headers,
-            body: JSON.stringify(payload),
-        });
-        const data = await resp.json().catch(() => ({}));
-        if (!resp.ok || data.status !== 'success') {
-            const err = data && data.error ? data.error : `HTTP ${resp.status}`;
-            throw new Error(err);
+        if (inFlightRequest) {
+            inFlightRequest.superseded = true;
+            inFlightRequest.controller.abort();
         }
-        return data;
+        const controller = new AbortController();
+        const request = { controller, superseded: false, timedOut: false };
+        inFlightRequest = request;
+        const timer = setTimeout(() => {
+            request.timedOut = true;
+            controller.abort();
+        }, FETCH_TIMEOUT_MS);
+
+        try {
+            const resp = await fetch(`/api/job/${state.jobId}/alignment/view`, {
+                method: 'POST',
+                headers,
+                body: JSON.stringify(payload),
+                signal: controller.signal,
+            });
+            const data = await resp.json().catch(() => ({}));
+            if (!resp.ok || data.status !== 'success') {
+                const err = data && data.error ? data.error : `HTTP ${resp.status}`;
+                throw new Error(err);
+            }
+            return data;
+        } catch (e) {
+            if (e && e.name === 'AbortError') {
+                const abortError = new Error(
+                    request.timedOut ? 'The request timed out.' : 'Superseded by a newer request.'
+                );
+                abortError.name = 'AbortError';
+                abortError.superseded = request.superseded;
+                throw abortError;
+            }
+            throw e;
+        } finally {
+            clearTimeout(timer);
+            // Cleared either way, so a failed load stays retryable.
+            if (inFlightRequest === request) inFlightRequest = null;
+        }
     }
 
     async function refresh() {
@@ -963,6 +1034,9 @@
             populateReferenceSelector();
             renderAlignmentGrid();
         } catch (e) {
+            // A request we cancelled ourselves in favour of a newer one is not a
+            // failure the user should see; the newer one owns the UI now.
+            if (e && e.name === 'AbortError' && e.superseded) return;
             console.error('Alignment Viewer failed:', e);
             showStatusMsg(`Alignment Viewer failed: ${e.message}`, 'danger', 4000);
             emptyEl.textContent = `Could not load alignment: ${e.message}`;

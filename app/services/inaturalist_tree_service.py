@@ -1799,11 +1799,10 @@ def reconcile_delayed_ncbi_results(job_id: str) -> Dict[str, Any]:
         db_job = Job.query.get(job_id)
         if not db_job:
             return {"status": "job_not_found"}
-        from app.services.log_context import bind_background_context
-        bind_background_context(user=(
-            getattr(getattr(db_job, "user", None), "email", None)
-            or (f"id:{db_job.user_id}" if db_job.user_id else "anon")
-        ))
+        from app.services.log_context import (
+            bind_background_context, background_user_identity,
+        )
+        bind_background_context(user=background_user_identity(db_job))
 
         metrics = dict(db_job.metrics or {})
         rerun_details = dict(metrics.get("mycomap_blast_rerun") or {})

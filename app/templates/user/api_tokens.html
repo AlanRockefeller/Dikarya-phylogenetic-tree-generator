@@ -82,7 +82,10 @@
                 <div class="space-y-2">
                     {% for scope in all_scopes %}
                     <label class="flex items-start gap-2 cursor-pointer">
-                        <input type="checkbox" name="scopes" value="{{ scope }}" checked
+                        {# Least privilege: read scopes are pre-selected, write scopes are not,
+                           so a token only carries destructive authority when it was asked for. #}
+                        <input type="checkbox" name="scopes" value="{{ scope }}"
+                               {% if scope.endswith(':read') %}checked{% endif %}
                                class="mt-1 rounded border-gray-300 text-journal-gold focus:ring-journal-gold">
                         <span class="text-sm">
                             <span class="font-mono text-journal-dark dark:text-gray-100">{{ scope }}</span>

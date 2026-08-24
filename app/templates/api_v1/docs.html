@@ -372,8 +372,12 @@ JOB_ID=$(
 
 echo "$JOB_ID"
 
-# Poll until the job finishes
-for i in {1..60}; do
+# Poll until the job finishes. Trees can take far longer than two minutes,
+# so the deadline is configurable rather than a fixed 60 iterations.
+MAX_WAIT_SECONDS="${MAX_WAIT_SECONDS:-3600}"
+STATUS=""
+deadline=$((SECONDS + MAX_WAIT_SECONDS))
+while (( SECONDS &lt; deadline )); do
   STATUS=$(
     curl -s -H "Authorization: Bearer $TOKEN" \
       "https://dikarya.us/api/v1/jobs/$JOB_ID" | jq -r '.data.status // .error.message'
@@ -382,18 +386,24 @@ for i in {1..60}; do
   echo "$(date +%T) $STATUS"
 
   case "$STATUS" in
-    completed|failed|error) break ;;
+    completed) break ;;
+    failed|error) echo "Job did not complete: $STATUS" &gt;&amp;2; exit 1 ;;
   esac
 
   sleep 2
 done
 
+if [[ "$STATUS" != "completed" ]]; then
+  echo "Job did not complete within ${MAX_WAIT_SECONDS}s" &gt;&amp;2
+  exit 1
+fi
+
 # Show the final job record
 curl -s -H "Authorization: Bearer $TOKEN" \
   "https://dikarya.us/api/v1/jobs/$JOB_ID" | jq
 
-# Download the Newick tree
-curl -H "Authorization: Bearer $TOKEN" \
+# Download the Newick tree. -f so an error response is not saved as tree.newick.
+curl -fS -H "Authorization: Bearer $TOKEN" \
   "https://dikarya.us/api/v1/jobs/$JOB_ID/files/tree.newick" \
   -o tree.newick
 
@@ -433,17 +443,21 @@ payload = {
     "notes": "Python API test with valid pasted FASTA",
 }
 
+# (connect, read) timeouts; without them a stalled connection blocks forever.
+TIMEOUT = (5, 30)
+
 response = requests.post(
     f"{API}/jobs",
     headers={**HEADERS, "Content-Type": "application/json"},
     json=payload,
+    timeout=TIMEOUT,
 )
 response.raise_for_status()
 job_id = response.json()["data"]["id"]
 print("Job ID:", job_id)
 
 while True:
-    response = requests.get(f"{API}/jobs/{job_id}", headers=HEADERS)
+    response = requests.get(f"{API}/jobs/{job_id}", headers=HEADERS, timeout=TIMEOUT)
     response.raise_for_status()
     job = response.json()["data"]
     print(job["status"])
@@ -459,6 +473,7 @@ if job["status"] != "completed":
 tree_response = requests.get(
     f"{API}/jobs/{job_id}/files/tree.newick",
     headers=HEADERS,
+    timeout=TIMEOUT,
 )
 tree_response.raise_for_status()
 print(tree_response.text)</code></pre>
@@ -492,7 +507,6 @@ print(tree_response.text)</code></pre>
             ],
             plugins: [SwaggerUIBundle.plugins.DownloadUrl],
             layout: "BaseLayout",
-            persistAuthorization: true,
             tryItOutEnabled: true,
             displayRequestDuration: true,
             defaultModelsExpandDepth: -1,
