@@ -78,9 +78,48 @@ if [ "$TIMEOUT_SECONDS" -lt 10 ] || [ "$TIMEOUT_SECONDS" -gt 280 ]; then
     echo "dikarya-claude-review: timeout out of range (10-280)" >&2
     exit 64
 fi
-case "$MAX_BUDGET_USD" in
-    ''|*[!0-9.]*|*.*.*) echo "dikarya-claude-review: bad budget '$MAX_BUDGET_USD'" >&2; exit 64 ;;
-esac
+# The budget is the only knob that costs money, so it gets a format AND a
+# ceiling. The old glob accepted "." (no digits at all) and, more importantly,
+# any magnitude -- a caller who could set DIKARYA_CLAUDE_MAX_BUDGET could simply
+# delete the spend cap by asking for 100000. Enforce one decimal format, then
+# compare in integer cents; bash has no floating point, and shelling out to a
+# calculator here would just be another parser to get wrong.
+#
+# This is the enforcement boundary, so it is deliberately strict: exactly the
+# canonical form, no leading or trailing whitespace, no other spellings. The
+# unprivileged caller (budget_env in app/config.py) canonicalizes into that form
+# before setting the variable, so everything it emits is accepted here. The two
+# are not the same grammar and do not need to be -- what must hold is that this
+# side never rejects a value the app can legitimately produce.
+#
+# MAX_BUDGET_HARD_CENTS must stay equal to
+# CLAUDE_REVIEW_MAX_BUDGET_HARD_CAP_USD in app/config.py, which explains how the
+# figure is derived. Both are asserted against each other in
+# tests/test_maintenance_script_safety.py.
+MAX_BUDGET_HARD_CENTS=200
+
+if [[ ! "$MAX_BUDGET_USD" =~ ^[0-9]{1,4}(\.[0-9]{1,2})?$ ]]; then
+    echo "dikarya-claude-review: bad budget '$MAX_BUDGET_USD' (want dollars, e.g. 1.00)" >&2
+    exit 64
+fi
+budget_whole=${MAX_BUDGET_USD%%.*}
+budget_frac=""
+if [[ "$MAX_BUDGET_USD" == *.* ]]; then
+    budget_frac=${MAX_BUDGET_USD#*.}
+fi
+# Pad to exactly two digits so "1.5" is 150 cents rather than 15.
+budget_frac="${budget_frac}00"
+budget_frac=${budget_frac:0:2}
+# 10# forces base 10: "08" is not an octal literal here.
+BUDGET_CENTS=$(( 10#$budget_whole * 100 + 10#$budget_frac ))
+if [ "$BUDGET_CENTS" -le 0 ]; then
+    echo "dikarya-claude-review: budget must be greater than zero" >&2
+    exit 64
+fi
+if [ "$BUDGET_CENTS" -gt "$MAX_BUDGET_HARD_CENTS" ]; then
+    echo "dikarya-claude-review: budget '$MAX_BUDGET_USD' exceeds the hard cap of \$$((MAX_BUDGET_HARD_CENTS / 100)).$(printf '%02d' $((MAX_BUDGET_HARD_CENTS % 100)))" >&2
+    exit 64
+fi
 
 for required in "$SYSTEM_PROMPT_FILE" "$SCHEMA_FILE"; do
     if [ ! -r "$required" ]; then

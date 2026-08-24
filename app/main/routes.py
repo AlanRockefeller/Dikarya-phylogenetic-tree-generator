@@ -9,7 +9,7 @@ from app.services.security_utils import (
     safe_next_url, validate_safe_file_path, validate_job_id,
 )
 from app.services.access_control import check_job_access
-from app.extensions import csrf, limiter, db
+from app.extensions import limiter, db
 from io import BytesIO
 import logging
 import os
@@ -283,13 +283,26 @@ def _voucher_page_count(form, labels_per_page):
     return max(1, (count + labels_per_page - 1) // labels_per_page)
 
 
+# One explicit ceiling on the length of a starting number, mirrored by
+# startNumberParts() in voucher_labels.html so the browser preview and the
+# generated sheet always agree. Nothing is ever truncated: a run longer than
+# this is treated as unusable input and the default is used instead, and the
+# page says so. The limit is also a real safety bound -- int() itself refuses a
+# string past sys.get_int_max_str_digits() (4300 by default), so an unbounded
+# parse here was a 500 waiting for someone to paste a wall of digits.
+MAX_VOUCHER_NUMBER_DIGITS = 30
+
+
 def _voucher_number_parts(form):
     prefix = re.sub(r'[\x00-\x1f\x7f]', '', form.get("prefix", "")).strip()[:32]
     start_raw = (form.get("start_number") or "001").strip()
     start_match = re.search(r'\d+', start_raw)
-    start_number = int(start_match.group(0)) if start_match else 1
-    number_width = max(1, min(12, len(start_match.group(0)) if start_match else 3))
-    return prefix, start_number, number_width
+    digits = start_match.group(0) if start_match else None
+    if not digits or len(digits) > MAX_VOUCHER_NUMBER_DIGITS:
+        return prefix, 1, 3
+    # Python ints are exact at any size, so the voucher number is preserved
+    # verbatim; only the zero-padding width is capped.
+    return prefix, int(digits), max(1, min(12, len(digits)))
 
 
 def _voucher_format_label(prefix, start_number, number_width, offset):
@@ -358,6 +371,21 @@ def _voucher_layout_from_form(form, sample_label=None, output_format="pdf"):
         label_height = _voucher_float(form.get("custom_height"), 1, 0.25, 5)
         columns = _voucher_int(form.get("custom_columns"), 3, 1, 8)
         rows = _voucher_int(form.get("custom_rows"), 10, 1, 40)
+        margin_left = _voucher_float(form.get("custom_margin_left"), 0.25, 0, 4)
+        margin_top = _voucher_float(form.get("custom_margin_top"), 0.5, 0, 4)
+        gap_x = _voucher_float(form.get("custom_gap_x"), 0.125, 0, 2)
+        gap_y = _voucher_float(form.get("custom_gap_y"), 0, 0, 2)
+        # Every other branch clamps the grid to what the sheet can hold; the
+        # custom branch did not, so a request such as width 8.5 x 2 columns
+        # printed labels past the edge of the page while still reporting the
+        # full count per page. The custom form has no right/bottom margin field
+        # and the renderer lays labels out from margin_left/margin_top to the
+        # page edge, so the usable extent subtracts the leading margin only --
+        # subtracting it twice would wrongly reject the 3-column default.
+        usable_width = max(0.0, 8.5 - margin_left)
+        usable_height = max(0.0, 11 - margin_top)
+        columns = min(columns, _voucher_fit_count(usable_width, label_width, gap_x))
+        rows = min(rows, _voucher_fit_count(usable_height, label_height, gap_y))
         preset.update({
             "name": "Custom",
             "page_width": 8.5,
@@ -366,10 +394,10 @@ def _voucher_layout_from_form(form, sample_label=None, output_format="pdf"):
             "label_height": label_height,
             "columns": columns,
             "rows": rows,
-            "margin_left": _voucher_float(form.get("custom_margin_left"), 0.25, 0, 4),
-            "margin_top": _voucher_float(form.get("custom_margin_top"), 0.5, 0, 4),
-            "gap_x": _voucher_float(form.get("custom_gap_x"), 0.125, 0, 2),
-            "gap_y": _voucher_float(form.get("custom_gap_y"), 0, 0, 2),
+            "margin_left": margin_left,
+            "margin_top": margin_top,
+            "gap_x": gap_x,
+            "gap_y": gap_y,
         })
     elif preset.get("auto"):
         prefix, start_number, number_width = _voucher_number_parts(form)
@@ -964,7 +992,9 @@ def inat_oauth_status():
 
 
 @bp.route('/todo', methods=['GET', 'POST'])
-@csrf.exempt
+# Deliberately NOT csrf-exempt: the POST writes a public suggestion, and the
+# exemption let any third-party page submit one on a visitor's behalf. The form
+# in todo.html carries the token like every other form in the app.
 @limiter.limit("10 per minute")
 def todo():
     from app.models import TodoSuggestion

@@ -1,18 +1,13 @@
 """Security tests for input validation."""
 
 import unittest
-import sys
-import importlib.util
 from unittest.mock import Mock, patch
 
-# Load security_utils relative to this test file
-import os
-current_dir = os.path.dirname(os.path.abspath(__file__))
-module_path = os.path.join(current_dir, '../app/services/security_utils.py')
-
-spec = importlib.util.spec_from_file_location("security_utils", module_path)
-security_utils = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(security_utils)
+# The application's own module, not a second copy of it. Loading the file by
+# path built an independent module object named "security_utils": these tests
+# then validated that copy, and would keep passing after the real
+# app.services.security_utils diverged from it.
+from app.services import security_utils
 
 
 class TestJobIdValidation(unittest.TestCase):
@@ -79,9 +74,29 @@ class TestBlastRequestSafety(unittest.TestCase):
                 blast_service._submit_blast_request("ATGCGC", ShortQueryConfig)
             request.assert_not_called()
 
+    def test_query_at_exactly_the_length_limit_is_accepted(self):
+        """A query of exactly BLAST_MAX_QUERY_LENGTH must still be submitted.
 
-if __name__ == '__main__':
-    unittest.main()
+        The rejection test above passes just as well against `len(seq) >= max`,
+        which would reject every maximum-length query in production. Only the
+        accepted side of the boundary distinguishes the two.
+        """
+        from app.services import blast_service
+
+        class ShortQueryConfig:
+            BLAST_MAX_QUERY_LENGTH = 5
+            BLAST_EMAIL = "tests@example.com"
+
+        response = Mock()
+        response.text = "RID = TEST_RID\nRTOE = 1"
+        with patch.object(
+            blast_service, "_ncbi_request", return_value=response
+        ) as request:
+            rid, rtoe = blast_service._submit_blast_request("ATGCG", ShortQueryConfig)
+
+        self.assertEqual((rid, rtoe), ("TEST_RID", 1))
+        request.assert_called_once()
+
 
 
 class TestFastaSequenceSanitization(unittest.TestCase):
@@ -133,3 +148,7 @@ class TestFastaSequenceSanitization(unittest.TestCase):
         for c in letters:
             with self.subTest(char=c):
                 self.assertIn(c.swapcase(), allowed)
+
+
+if __name__ == '__main__':
+    unittest.main()

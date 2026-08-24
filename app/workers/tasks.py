@@ -24,9 +24,11 @@ from app.services.artifact_storage import (
 )
 from app.services.log_context import (
     JobContextFilter, background_job_context, bind_background_context,
+    background_user_identity,
     stable_fingerprint,
 )
 from app.services.tree_parameter_validation import validate_iqtree_ufboot_count
+from app.services.subprocess_utils import ToolExecutionError, log_tool_failure
 from app.workers.events import (
     STEP_INPUT, STEP_ORIENT, STEP_BLAST, STEP_ITS, STEP_ALIGN, STEP_TRIM, STEP_TREE, STEP_POST,
     STATE_QUEUED, STATE_RUNNING, STATE_DONE, STATE_SKIPPED, STATE_FAILED,
@@ -64,6 +66,46 @@ KNOWN_SEQUENCE_SOURCES = frozenset({
     "ncbi", "local", "mycomap", "inaturalist", "mushroom_observer", "genbank",
     "blast", "upload", "manual", "user", "unknown",
 })
+
+
+def failure_diagnostics(exc: Exception, fallback_tool: Optional[str] = None) -> dict:
+    """Return diagnostics only when they belong to the operation that failed."""
+    if not isinstance(exc, ToolExecutionError):
+        return {
+            "tool": fallback_tool,
+            "exit_code": None,
+            "failure_kind": None,
+            "stats": {},
+        }
+    return {
+        "tool": exc.tool,
+        "exit_code": exc.exit_code,
+        "failure_kind": exc.failure_kind,
+        "stats": dict(exc.stats),
+    }
+
+
+def failure_metric_updates(
+    error_msg: str,
+    current_step: Optional[str],
+    current_step_label: Optional[str],
+    diagnostic: dict,
+) -> dict:
+    """Build the internal DB fields for one failure diagnostic."""
+    stats = diagnostic.get("stats") or {}
+    return {
+        "failed_at": datetime.now(timezone.utc).isoformat(),
+        "error": error_msg,
+        "failed_step": current_step,
+        "failed_step_label": current_step_label or None,
+        "failed_tool": diagnostic.get("tool") or None,
+        "exit_code": diagnostic.get("exit_code"),
+        "failure_kind": diagnostic.get("failure_kind"),
+        "failed_tool_signal": stats.get("signal"),
+        "failed_tool_duration_seconds": stats.get("duration_seconds"),
+        "failed_tool_stdout_lines": stats.get("stdout_lines"),
+        "failed_tool_stderr_lines": stats.get("stderr_lines"),
+    }
 
 
 def summarize_job_params(job_params: dict) -> dict:
@@ -531,6 +573,35 @@ def _should_blast_single_only(blast_mode: str, n_queries: int) -> bool:
     return n_queries == 1  # for "auto" and effectively for "on" too
 
 
+def blast_expected_at_start(input_type: str | None, blast_mode: str) -> Optional[bool]:
+    """Will this job BLAST? Tri-state, from normalized params alone.
+
+    ``True``/``False`` when the answer is already settled; ``None`` when it
+    depends on the record count, which is not known until the input step has
+    parsed the FASTA. Both arguments must already be normalized by
+    ``_normalize_input_type`` / ``_normalize_blast_mode``.
+
+    This exists because the initial SSE metadata used to test
+    ``input_type == "accession" and blast_mode == "optional"`` -- two values no
+    normalizer can ever produce -- so every job, including the accession-list
+    jobs that *require* BLAST to fetch their sequences, opened with the BLAST
+    step pre-marked "skipped" and then flipped to running moments later. The
+    computation was always correct; only the displayed pipeline lied.
+    """
+    if blast_mode == "off":
+        # accession_list raises rather than running, so it is still not a BLAST.
+        return False
+    if input_type == "accession_list":
+        # Exactly one accession is enforced downstream; BLAST is how the
+        # sequence is fetched at all, so it is never optional here.
+        return True
+    if input_type in ("pasted_sequence", "fasta_upload"):
+        # _should_blast_single_only() needs the record count.
+        return None
+    # Unknown input type: the input step raises before BLAST is reached.
+    return False
+
+
 def _count_alignment_stats(fasta_path) -> tuple[int, int]:
     """Count sequences and alignment columns from a FASTA file."""
     try:
@@ -544,6 +615,17 @@ def _count_alignment_stats(fasta_path) -> tuple[int, int]:
         return n_seqs, n_cols
     except Exception:
         return 0, 0
+
+
+def _check_and_maybe_fix_orientation(input_path, fix_orientation: bool) -> dict:
+    """Classify orientations, only rewriting the FASTA when correction is on."""
+    from app.services.orientation_service import fix_sequence_orientation
+
+    orient_fasta = input_path.read_text(encoding="utf-8", errors="replace")
+    fixed_fasta, orient_stats = fix_sequence_orientation(orient_fasta)
+    if fix_orientation:
+        input_path.write_text(fixed_fasta, encoding="utf-8")
+    return orient_stats
 
 
 @background_job_context(0)
@@ -576,10 +658,7 @@ def run_recompute_job(job_id: str, params_dict: dict) -> dict:
         with _app.app_context():
             db_job = Job.query.get(job_id)
             if db_job:
-                bind_background_context(user=(
-                    getattr(getattr(db_job, "user", None), "email", None)
-                    or f"id:{db_job.user_id}" if db_job.user_id else "anon"
-                ))
+                bind_background_context(user=background_user_identity(db_job))
                 metrics = db_job.metrics or {}
                 metrics["recompute_started_at"] = datetime.now(timezone.utc).isoformat()
                 db_job.metrics = metrics
@@ -793,9 +872,6 @@ def run_phylo_job(job_params: dict) -> dict:
     current_tool = None
     current_step_label = None
     
-    # Stats from streaming command (for error context)
-    last_stats = {}
-
     from app.services.security_utils import coerce_bool
     job_params = dict(job_params or {})
     inat_preparation = job_params.get("_inat_tree_preparation")
@@ -855,10 +931,7 @@ def run_phylo_job(job_params: dict) -> dict:
             # Initialize DB status
             db_job = Job.query.get(job_id)
             if db_job:
-                bind_background_context(user=(
-                    getattr(getattr(db_job, "user", None), "email", None)
-                    or (f"id:{db_job.user_id}" if db_job.user_id else "anon")
-                ))
+                bind_background_context(user=background_user_identity(db_job))
                 metrics = db_job.metrics or {}
                 metrics["started_at"] = datetime.now(timezone.utc).isoformat()
                 
@@ -892,9 +965,11 @@ def run_phylo_job(job_params: dict) -> dict:
                 # Already normalized to a bool near the top of run_phylo_job.
                 trim_terminal_overhangs = bool(job_params.get("trim_terminal_overhangs", True))
 
-                # BLAST is only used for single accession with optional blast
-                will_do_blast = (input_type == "accession" and blast_mode == "optional")
-                if not will_do_blast:
+                # Only pre-mark BLAST skipped when that is already certain.
+                # When it depends on the record count (None), leave the step
+                # queued and let the BLAST step itself set the final state --
+                # which it does on both branches.
+                if blast_expected_at_start(input_type, blast_mode) is False:
                     job.meta["steps"][STEP_BLAST]["state"] = STATE_SKIPPED
                     job.meta["steps"][STEP_BLAST]["label"] = "BLAST Search (skipped)"
 
@@ -1300,16 +1375,21 @@ def run_phylo_job(job_params: dict) -> dict:
             publish_step_start(job_id, STEP_ORIENT, "Orientation Check", "Checking sequence orientations")
             update_step_meta(job, STEP_ORIENT, {"state": STATE_RUNNING})
             
-            from app.services.orientation_service import fix_sequence_orientation
-            
-            orient_fasta = input_raw_path.read_text(encoding="utf-8", errors="replace")
-            fixed_fasta, orient_stats = fix_sequence_orientation(orient_fasta)
-            input_raw_path.write_text(fixed_fasta, encoding="utf-8")
+            fix_orientation = bool(job_params.get("fix_orientation", True))
+            orient_stats = _check_and_maybe_fix_orientation(
+                input_raw_path, fix_orientation
+            )
             
             reversed_count = orient_stats.get("reverse", 0)
             uncertain_count = orient_stats.get("uncertain", 0)
             
-            if reversed_count > 0:
+            if not fix_orientation:
+                orient_detail = "Orientation correction disabled"
+                if reversed_count > 0:
+                    orient_detail += f"; {reversed_count} reverse sequence(s) detected"
+                if uncertain_count > 0:
+                    orient_detail += f", {uncertain_count} uncertain"
+            elif reversed_count > 0:
                 orient_detail = f"{reversed_count} sequence(s) reverse complemented"
                 if uncertain_count > 0:
                     orient_detail += f", {uncertain_count} uncertain"
@@ -1319,7 +1399,8 @@ def run_phylo_job(job_params: dict) -> dict:
                 orient_detail = "All sequences correctly oriented"
             
             logger.info(
-                "Orientation check: total=%s forward=%s reverse=%s uncertain=%s",
+                "Orientation check: correction_enabled=%s total=%s forward=%s reverse=%s uncertain=%s",
+                fix_orientation,
                 orient_stats.get("total", 0),
                 orient_stats.get("forward", 0),
                 reversed_count,
@@ -1329,7 +1410,7 @@ def run_phylo_job(job_params: dict) -> dict:
             publish_step_done(job_id, STEP_ORIENT, orient_detail)
             update_step_meta(job, STEP_ORIENT, {"state": STATE_DONE, "detail": orient_detail})
             
-            if reversed_count > 0:
+            if fix_orientation and reversed_count > 0:
                 publish_metric(job_id, STEP_ORIENT, "reversed", reversed_count)
 
             # =========================================================
@@ -1443,7 +1524,6 @@ def run_phylo_job(job_params: dict) -> dict:
             # Default on: a backwards sequence is a wrong tree, and only MAFFT
             # notices without help. Off is for input the user has already
             # oriented and does not want touched.
-            fix_orientation = bool(job_params.get("fix_orientation", True))
             align_params = AlignmentParams(
                 method=align_method,
                 fix_orientation=fix_orientation,
@@ -1451,9 +1531,8 @@ def run_phylo_job(job_params: dict) -> dict:
             )
             align_stats = run_alignment(
                 input_raw_path, alignment_raw_path, align_params, Config, logger, job_id=job_id,
-                # ORIENT is unconditional in this pipeline, so uncertain_count is
-                # always bound here. It lets the aligner-flip degradation say
-                # whether MAFFT merely settled what ORIENT abstained on.
+                # ORIENT still classifies sequences when correction is disabled,
+                # but both it and the aligner leave the sequence data untouched.
                 orient_uncertain=uncertain_count,
             ) or {}
 
@@ -1913,9 +1992,25 @@ def run_phylo_job(job_params: dict) -> dict:
             current_step or "unknown", type(e).__name__,
         )
         
-        # Get stderr tail from last command if available
-        stderr_tail = last_stats.get("stderr_tail", [])
-        exit_code = last_stats.get("exit_code")
+        # A structured tool exception carries data from the failed invocation.
+        # Ordinary exceptions deliberately get no process stats: substituting a
+        # previous successful stage here would be worse than recording none.
+        diagnostic = failure_diagnostics(e, current_tool)
+        current_tool = diagnostic["tool"]
+        failed_stats = diagnostic["stats"]
+        stderr_tail = failed_stats.get("stderr_tail", [])
+        exit_code = diagnostic["exit_code"]
+        failure_kind = diagnostic["failure_kind"]
+        if exit_code is not None:
+            log_tool_failure(
+                logger,
+                current_tool or "unknown",
+                exit_code,
+                failed_stats,
+                job=job_id,
+                step=current_step or "unknown",
+                failure_kind=failure_kind,
+            )
         
         # Publish step failure
         if current_step:
@@ -1948,17 +2043,17 @@ def run_phylo_job(job_params: dict) -> dict:
                     metrics = dict(db_job.metrics or {})
                     if tree_preparation_pending:
                         metrics["mycomap_preparation_status"] = "failed"
-                    metrics["failed_at"] = datetime.now(timezone.utc).isoformat()
-                    metrics["error"] = error_msg
-                    metrics["failed_step"] = current_step
+                    metrics.update(failure_metric_updates(
+                        error_msg,
+                        current_step,
+                        current_step_label,
+                        diagnostic,
+                    ))
                     # Persist the diagnostic detail too. It was already published
                     # live over SSE, but nothing stored it, so reloading the page
                     # (or opening it later) rebuilt the snapshot without any of it
                     # and the error panel showed a bare "An error occurred" with an
                     # empty output box. Keep it bounded so metrics stays small.
-                    metrics["failed_step_label"] = current_step_label or None
-                    metrics["failed_tool"] = current_tool or None
-                    metrics["exit_code"] = exit_code
                     if stderr_tail:
                         metrics["stderr_tail"] = [
                             str(line)[:500] for line in list(stderr_tail)[-30:]

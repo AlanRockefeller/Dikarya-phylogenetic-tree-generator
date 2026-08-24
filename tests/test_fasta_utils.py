@@ -1,14 +1,9 @@
 
-import sys
 import unittest
 from pathlib import Path
 import shutil
 import tempfile
 import logging
-
-# Ensure app is in path if needed, though usually not for simple unit tests
-# For this environment, we might need to adjust path
-sys.path.append("/var/www/dikarya")
 
 from app.services.fasta_utils import sanitize_fasta_headers, restore_tree_names
 
@@ -39,14 +34,12 @@ ACGT
         mapping = sanitize_fasta_headers(self.input_fasta, self.output_fasta)
         
         # Verify mapping keys are safe
-        print("Mapping:", mapping)
-        for safe_id in mapping.keys():
+        for safe_id in mapping:
             self.assertTrue(safe_id.startswith("SEQ"), f"ID {safe_id} should start with SEQ")
             self.assertTrue(" " not in safe_id, "ID should not contain spaces")
             
         # Verify sanitized file content
         clean_content = self.output_fasta.read_text()
-        print("Sanitized content:\n", clean_content)
         self.assertNotIn("Seq 1 with spaces", clean_content)
         self.assertIn("SEQ000001", clean_content)
 
@@ -60,7 +53,6 @@ ACGT
         
         # 4. Verify Restored content
         restored_content = self.tree_file.read_text()
-        print("Restored content:\n", restored_content)
         
         # Check that original names are back (quoted if necessary)
         self.assertIn("'Seq 1 with spaces'", restored_content)

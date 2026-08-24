@@ -5,7 +5,9 @@
 }
 
 .tree-scale-bar text {
-  font: sans-serif;
+  /* Local fix, not upstream: the `font` shorthand needs a size, so `font: sans-serif`
+     failed to parse and the whole declaration was dropped. */
+  font-family: sans-serif;
 }
 
 .tree-scale-bar line,

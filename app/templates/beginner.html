@@ -44,7 +44,14 @@
 
     if (!seq && file) {
       statusEl.textContent = "Reading file…";
-      seq = (await readFileAsText(file)).trim();
+      // Alan 8/23/26 - A FileReader rejection used to escape this async listener and
+      // leave the status stuck on "Reading file…" with no error shown.
+      try {
+        seq = (await readFileAsText(file)).trim();
+      } catch (e) {
+        statusEl.textContent = "Could not read the selected file.";
+        return;
+      }
     }
 
     if (!seq) {
@@ -52,6 +59,13 @@
       return;
     }
 
+    // Alan 8/23/26 - Disable while posting: every click submitted another job, so a
+    // double-click created duplicate pipeline runs.
+    const btn = document.getElementById("submit_btn");
+    if (btn) {
+      if (btn.disabled) return;
+      btn.disabled = true;
+    }
     statusEl.textContent = "Submitting job…";
 
     const payload = {
@@ -70,18 +84,27 @@
     const headers = { "Content-Type": "application/json" };
     if (csrfToken) headers["X-CSRFToken"] = csrfToken;
 
-    const resp = await fetch("/api/job", {
-      method: "POST",
-      headers: headers,
-      body: JSON.stringify(payload)
-    });
-
+    // Alan 8/23/26 - fetch throws on network failure; without this the status stayed
+    // on "Submitting job…" and the button never came back.
+    let resp = null;
     let data = null;
-    try { data = await resp.json(); } catch (e) { }
+    try {
+      resp = await fetch("/api/job", {
+        method: "POST",
+        headers: headers,
+        body: JSON.stringify(payload)
+      });
+      try { data = await resp.json(); } catch (e) { }
+    } catch (e) {
+      statusEl.textContent = "Network error. Please try again.";
+      if (btn) btn.disabled = false;
+      return;
+    }
 
     if (!resp.ok) {
       statusEl.textContent = "Error submitting job (" + resp.status + ")";
       resultEl.textContent = data ? JSON.stringify(data, null, 2) : "";
+      if (btn) btn.disabled = false;
       return;
     }
 

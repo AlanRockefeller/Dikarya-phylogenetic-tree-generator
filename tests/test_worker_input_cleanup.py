@@ -8,6 +8,7 @@ from unittest.mock import Mock, patch
 from flask import Flask
 
 from app.workers.tasks import (
+    _check_and_maybe_fix_orientation,
     dedupe_and_uniquify_fasta,
     parse_fasta_records,
     uniquify_fasta_identifiers,
@@ -15,6 +16,31 @@ from app.workers.tasks import (
 
 
 class WorkerInputCleanupTests(unittest.TestCase):
+    def test_orientation_opt_out_classifies_without_rewriting_input(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            input_path = Path(tmp) / "input_raw.fasta"
+            input_path.write_text(">sample\nAAAA\n")
+            with patch(
+                "app.services.orientation_service.fix_sequence_orientation",
+                return_value=(">sample\nTTTT\n", {"reverse": 1}),
+            ):
+                stats = _check_and_maybe_fix_orientation(input_path, False)
+
+            self.assertEqual(input_path.read_text(), ">sample\nAAAA\n")
+            self.assertEqual(stats["reverse"], 1)
+
+    def test_orientation_default_rewrites_input_with_corrected_sequence(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            input_path = Path(tmp) / "input_raw.fasta"
+            input_path.write_text(">sample\nAAAA\n")
+            with patch(
+                "app.services.orientation_service.fix_sequence_orientation",
+                return_value=(">sample\nTTTT\n", {"reverse": 1}),
+            ):
+                _check_and_maybe_fix_orientation(input_path, True)
+
+            self.assertEqual(input_path.read_text(), ">sample\nTTTT\n")
+
     def test_duplicate_rebuild_mode_keeps_identical_header_and_sequence(self):
         fasta = ">same original header\nACGT\n>same original header\nACGT\n"
 
@@ -70,7 +96,9 @@ class WorkerInputCleanupTests(unittest.TestCase):
             return kwargs.get("job_id") or "new-job"
 
         fake_session = SimpleNamespace(add=Mock(), commit=Mock())
-        fake_job_model = lambda **kwargs: SimpleNamespace(**kwargs)
+        def fake_job_model(**kwargs):
+            return SimpleNamespace(**kwargs)
+
         source_db_job = SimpleNamespace(user_id=7)
         app = Flask(__name__)
         app.secret_key = "test"

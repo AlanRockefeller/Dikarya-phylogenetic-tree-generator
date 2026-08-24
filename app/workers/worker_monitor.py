@@ -1,6 +1,5 @@
 import atexit
 import os
-import signal
 import time
 import socket
 import logging
@@ -30,8 +29,16 @@ class HeartbeatWorker(Worker):
     def __init__(self, queues, name=None, default_result_ttl=None, connection=None,
                  exc_handler=None, default_worker_ttl=None, job_class=None,
                  queue_class=None, heartbeat_interval=10, worker_dir=None):
-        super().__init__(queues, name, default_result_ttl, connection,
-                         exc_handler, default_worker_ttl, job_class, queue_class)
+        super().__init__(
+            queues,
+            name=name,
+            default_result_ttl=default_result_ttl,
+            connection=connection,
+            exc_handler=exc_handler,
+            default_worker_ttl=default_worker_ttl,
+            job_class=job_class,
+            queue_class=queue_class,
+        )
         self.heartbeat_interval = heartbeat_interval
         # Caller must supply the worker dir; we no longer carry a misleading
         # hardcoded default like "/var/phylojobs/workers".
@@ -41,6 +48,7 @@ class HeartbeatWorker(Worker):
         self.last_heartbeat = 0
         self._last_sweep = 0
         self._cleanup_ran = False
+        self._heartbeat_thread = None
 
         # Ensure directory exists
         if not self.worker_dir.exists():
@@ -49,23 +57,20 @@ class HeartbeatWorker(Worker):
             except Exception as e:
                 logger.error(f"Could not create worker dir {self.worker_dir}: {e}")
 
-        # Always try to remove our own heartbeat on shutdown, including
-        # SIGTERM (what systemd sends), SIGINT (Ctrl-C), and normal exit.
-        # SIGKILL and segfaults can't be caught -- those corpses are reaped
-        # later by the in-process sweeper below.
+        # Remove our own heartbeat on any orderly exit. Deliberately no
+        # SIGTERM/SIGINT handler of our own: RQ's Worker.work() calls
+        # _install_signal_handlers() (rq 2.6.1, worker.py) and binds both
+        # signals to request_stop, so anything registered here is replaced the
+        # moment the worker starts and never runs. It also would not be wanted
+        # if it did -- the old handler re-raised through SIG_DFL, which kills
+        # the process outright and skips RQ's warm shutdown of the running job.
+        # The three real paths are covered without it:
+        #   warm/cold shutdown -> work() returns or raises SystemExit, and
+        #                         run_worker_with_heartbeat()'s finally clause
+        #                         plus this atexit hook both clean up;
+        #   SIGKILL / segfault -> uncatchable either way; the corpse is reaped
+        #                         by _maybe_reap_stale_heartbeats() below.
         atexit.register(self.clean_up_heartbeat)
-        try:
-            signal.signal(signal.SIGTERM, self._signal_cleanup)
-            signal.signal(signal.SIGINT, self._signal_cleanup)
-        except (ValueError, OSError):
-            # signal() only works in the main thread; fine to skip otherwise.
-            pass
-
-    def _signal_cleanup(self, signum, frame):
-        self.clean_up_heartbeat()
-        # Re-raise with the default handler so RQ's own shutdown still runs.
-        signal.signal(signum, signal.SIG_DFL)
-        os.kill(os.getpid(), signum)
 
     def run_maintenance_tasks(self):
         """Let RQ identify abandoned executions, then reconcile their DB rows.
@@ -105,22 +110,43 @@ class HeartbeatWorker(Worker):
         """Override work to start heartbeat loop or hook into it."""
         # RQ's work loop is blocking. We can override `register_birth` or `monitor_work_horse`
         # But RQ doesn't make it super easy to run a side thread without custom loop.
-        # simpler: override `heartbeat` method if available (used for redis), 
-        # or just hook into the loop. 
+        # simpler: override `heartbeat` method if available (used for redis),
+        # or just hook into the loop.
         # Actually, RQ workers have a `work` loop that calls `play_work_horse`.
         # We can implement a method that updates the file.
-        
+
         # We'll rely on the main loop calling `self.register_birth()` and `self.set_state()`.
         # But those update Redis. We want a file.
         # Let's wrap `register_birth` and `set_shutdown_requested_date` or similar?
         # A simple way is to extend `perform_job`? No, that's for jobs.
-        
+
         # We can spawn a thread in __init__?
-        import threading
-        t = threading.Thread(target=self._file_heartbeat_loop, daemon=True)
-        t.start()
-        
+        self._ensure_heartbeat_thread()
+
         super().work(burst=burst, logging_level=logging_level, date_format=date_format, log_format=log_format, max_jobs=max_jobs, with_scheduler=with_scheduler, **kwargs)
+
+    def _ensure_heartbeat_thread(self):
+        """Start the file-heartbeat loop once per worker.
+
+        Production calls work() exactly once, but tests and any future reuse
+        can call it again, and each call used to leak another daemon loop
+        touching the same file forever. The loop never returns on its own, so a
+        thread that is no longer alive died on something unrecoverable; start a
+        replacement rather than silently losing the heartbeat.
+        """
+        import threading
+
+        existing = self._heartbeat_thread
+        if existing is not None and existing.is_alive():
+            return existing
+        thread = threading.Thread(
+            target=self._file_heartbeat_loop,
+            name=f"dikarya-heartbeat-{self.name}",
+            daemon=True,
+        )
+        self._heartbeat_thread = thread
+        thread.start()
+        return thread
 
     @staticmethod
     def _get_int_env(name: str, default: int) -> int:
@@ -169,8 +195,7 @@ class HeartbeatWorker(Worker):
                 logger.warning("Could not reap %s: %s", hb_file, e)
 
     def touch_heartbeat_file(self):
-        if not self.worker_dir.exists():
-            return
+        self.worker_dir.mkdir(parents=True, exist_ok=True)
         filepath = self.worker_dir / f"{self.name}.heartbeat"
         filepath.touch()
 
@@ -191,7 +216,7 @@ def run_worker_with_heartbeat(app):
     """
     from app.workers.queue import get_queue
     from app.workers.queue import get_redis_connection
-    
+
     with app.app_context():
         # A restart kills the previous work horse mid-job, and the killed process
         # never reaches the handler that would mark its DB row failed. Reconcile
@@ -201,15 +226,19 @@ def run_worker_with_heartbeat(app):
             from app.services.job_reconcile_service import reconcile_job_statuses
             reconciled = reconcile_job_statuses()
             if reconciled:
-                print(f"Reconciled {len(reconciled)} job(s) against RQ state.")
+                logger.info(
+                    "Startup reconciliation: %s job(s) reconciled against RQ state.",
+                    len(reconciled),
+                )
                 for entry in reconciled[:10]:
-                    print(
-                        f"  {entry['job_id']} {entry['from_status']} -> "
-                        f"{entry['action']} (rq={entry['rq_status']})"
+                    logger.info(
+                        "  %s %s -> %s (rq=%s)",
+                        entry["job_id"], entry["from_status"],
+                        entry["action"], entry["rq_status"],
                     )
-        except Exception as exc:
+        except Exception:
             # Never block the worker from starting over a bookkeeping step.
-            print(f"Job reconciliation skipped: {exc}")
+            logger.exception("Startup job reconciliation skipped")
 
         conn = get_redis_connection()
         queues = [get_queue("phylo_high"), get_queue("phylo_bulk")]
@@ -236,7 +265,7 @@ def run_worker_with_heartbeat(app):
                                  worker_dir=app.config.get("WORKER_DIR", "var/workers"), default_result_ttl=result_ttl)
 
         worker.maintenance_interval = maintenance_interval
-        
+
         # Cleanup on exit
         try:
             worker.work(with_scheduler=True)

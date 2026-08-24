@@ -164,9 +164,10 @@ class TestGenBankHeader(unittest.TestCase):
             }
         }
         header = _build_header(record)
-        self.assertIn("ACC.1 Org specimens_voucher VoucherXYZ", header.replace('_voucher', 's_voucher')) # Typo check... wait
-        # The code is `specimen_voucher`.
-        self.assertIn("specimen_voucher VoucherXYZ", header)
+        # The rewritten-string assertion this replaces only ever compared a value
+        # against a string its own .replace() had just produced, so it held no
+        # matter what _build_header returned.
+        self.assertIn("ACC.1 Org specimen_voucher VoucherXYZ", header)
         self.assertNotIn("strain", header)
 
     def test_sequence_cleanup(self):

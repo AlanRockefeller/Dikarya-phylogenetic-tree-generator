@@ -7,6 +7,15 @@
  */
 
 class JobStatusClient {
+    // Upper bound on retained terminal rows (see _trimTerminal).
+    static MAX_LOG_LINES = 2000;
+
+    // Alan 8/23/26 - The only stream values that may become a CSS class. 'cmd' is
+    // what publish_command() emits and is what makes the "$ mafft ..." lines green;
+    // whitelisting rather than passing event.stream through keeps a hostile value
+    // from turning into an arbitrary class.
+    static LOG_STREAM_CLASSES = new Set(['stdout', 'stderr', 'cmd']);
+
     constructor(jobId) {
         this.jobId = jobId;
         this.eventSource = null;
@@ -59,6 +68,12 @@ class JobStatusClient {
     }
 
     connect() {
+        // Alan 8/23/26 - Never leave a second stream open: each one holds a server
+        // request slot, and the pageshow reconnect below can call this again.
+        if (this.eventSource) {
+            this.eventSource.close();
+            this.eventSource = null;
+        }
         const url = `/api/job/${this.jobId}/events`;
         this.eventSource = new EventSource(url);
 
@@ -139,7 +154,10 @@ class JobStatusClient {
         // Alan 7/18/26 - Start the live counter for both queued and running jobs when the timestamp is valid.
         if (elapsedStartedAt) {
             // Alan 7/18/26 - Store the queue timestamp used by the one-second elapsed-time updater.
-            this.startTime = new Date(elapsedStartedAt);
+            // Alan 8/23/26 - A malformed timestamp yields a truthy Invalid Date, which the
+            // updater would render as "NaNs"; drop it and keep the server-rendered value.
+            const parsedStart = new Date(elapsedStartedAt);
+            this.startTime = Number.isNaN(parsedStart.getTime()) ? null : parsedStart;
             // Alan 7/18/26 - Keep counting while a job waits for a worker as well as while its pipeline runs.
             if (job.status === 'queued' || job.status === 'running') {
                 this.startElapsedTimer();
@@ -207,7 +225,7 @@ class JobStatusClient {
         // We iterate through a logical order of steps to reconstruct the feed
         const stepOrder = ['input', 'orient', 'blast', 'its', 'align', 'trim', 'tree', 'post'];
         stepOrder.forEach(stepKey => {
-            const step = job.meta.steps?.[stepKey];
+            const step = job.meta?.steps?.[stepKey];
             if (!step) return;
 
             // Skipping 'skipped' steps in the feed to avoid clutter, or maybe show them as skipped?
@@ -459,17 +477,40 @@ class JobStatusClient {
         this.elements.currentStepDetail.textContent = event.error;
     }
 
+    // Alan 8/23/26 - Build one terminal row from text only. Everything here arrives
+    // over SSE, so nothing is interpolated into markup: the tag and the line become
+    // text nodes and the stream only ever contributes a known class name.
+    _buildLogLine(tagText, lineText, stream) {
+        const lineEl = document.createElement('div');
+        lineEl.className = 'log-line';
+        if (JobStatusClient.LOG_STREAM_CLASSES.has(stream)) {
+            lineEl.classList.add(stream);
+        }
+
+        const tagEl = document.createElement('span');
+        tagEl.className = 'log-tag';
+        tagEl.textContent = tagText;
+        lineEl.appendChild(tagEl);
+        lineEl.appendChild(document.createTextNode(lineText == null ? '' : String(lineText)));
+        return lineEl;
+    }
+
+    // Alan 8/23/26 - A long alignment or tree run emits thousands of lines; without a
+    // cap the node count grows for the whole lifetime of the tab.
+    _trimTerminal(container) {
+        while (container.childElementCount > JobStatusClient.MAX_LOG_LINES) {
+            container.removeChild(container.firstElementChild);
+        }
+    }
+
     appendLog(event) {
         const container = this.elements.terminalContent;
 
-        const lineEl = document.createElement('div');
-        lineEl.className = `log-line ${event.stream}`;
-
-        // Add step tag
-        const tag = `[${event.step.toUpperCase()}]`;
-        lineEl.innerHTML = `<span class="log-tag">${tag}</span>${this.escapeHtml(event.line)}`;
-
-        container.appendChild(lineEl);
+        // Alan 8/23/26 - event.step is absent on some worker log events; String() keeps
+        // this from throwing the way `event.step.toUpperCase()` did.
+        const step = String(event.step || 'log').toUpperCase();
+        container.appendChild(this._buildLogLine(`[${step}]`, event.line, event.stream));
+        this._trimTerminal(container);
 
         // Autoscroll
         if (this.autoscroll) {
@@ -483,19 +524,24 @@ class JobStatusClient {
         const item = document.createElement('div');
         item.className = 'overview-item';
 
-        const iconClass = event.icon || 'running';
         const iconMap = {
             done: '✓',
             running: '⋯',
             skipped: '○',
             failed: '✗',
         };
+        // Alan 8/23/26 - Only the four known keys may reach the class attribute.
+        const iconClass = Object.prototype.hasOwnProperty.call(iconMap, event.icon) ? event.icon : 'running';
 
-        item.innerHTML = `
-            <span class="overview-icon ${iconClass}">${iconMap[iconClass] || '•'}</span>
-            <span>${this.escapeHtml(event.message)}</span>
-        `;
+        const iconEl = document.createElement('span');
+        iconEl.className = `overview-icon ${iconClass}`;
+        iconEl.textContent = iconMap[iconClass];
 
+        const msgEl = document.createElement('span');
+        msgEl.textContent = event.message == null ? '' : String(event.message);
+
+        item.appendChild(iconEl);
+        item.appendChild(msgEl);
         feed.appendChild(item);
 
         // Scroll to bottom
@@ -505,17 +551,21 @@ class JobStatusClient {
     populateLogTails(logTails) {
         const container = this.elements.terminalContent;
 
+        // Alan 8/23/26 - A reconnect (bfcache restore, dropped stream) re-delivers the
+        // snapshot; without this the same tail would be appended to the terminal again.
+        if (this._logTailsPopulated) return;
+        this._logTailsPopulated = true;
+
         // Combine and sort by time (we don't have timestamps, just show in order)
-        for (const [logName, lines] of Object.entries(logTails)) {
+        for (const [logName, lines] of Object.entries(logTails || {})) {
             for (const line of lines) {
                 if (!line.trim()) continue;
-
-                const lineEl = document.createElement('div');
-                lineEl.className = 'log-line';
-                lineEl.innerHTML = `<span class="log-tag">[${logName.toUpperCase()}]</span>${this.escapeHtml(line)}`;
-                container.appendChild(lineEl);
+                container.appendChild(
+                    this._buildLogLine(`[${String(logName).toUpperCase()}]`, line, null)
+                );
             }
         }
+        this._trimTerminal(container);
 
         // Scroll to bottom
         if (this.autoscroll) {
@@ -527,6 +577,9 @@ class JobStatusClient {
         // Stop elapsed timer
         if (this.elapsedTimer) {
             clearInterval(this.elapsedTimer);
+            // Alan 8/23/26 - startElapsedTimer() returns early while this is truthy, so a
+            // stale id here would make the timer unrestartable.
+            this.elapsedTimer = null;
         }
 
         // Update current step card
@@ -578,6 +631,7 @@ class JobStatusClient {
         // Stop elapsed timer
         if (this.elapsedTimer) {
             clearInterval(this.elapsedTimer);
+            this.elapsedTimer = null;
         }
 
         const panel = this.elements.errorPanel;
@@ -703,19 +757,15 @@ class JobStatusClient {
         return `${secs}s`;
     }
 
-    escapeHtml(text) {
-        const div = document.createElement('div');
-        div.textContent = text;
-        return div.innerHTML;
-    }
-
     toggleAutoscroll() {
         this.autoscroll = !this.autoscroll;
         document.getElementById('autoscroll-checkbox').checked = this.autoscroll;
     }
 
     clearTerminal() {
-        this.elements.terminalContent.innerHTML = '';
+        this.elements.terminalContent.replaceChildren();
+        // Alan 8/23/26 - A manual clear should not stop a later snapshot restoring the tail.
+        this._logTailsPopulated = false;
     }
 }
 
@@ -794,7 +844,13 @@ document.addEventListener('DOMContentLoaded', () => {
     });
 
     // Generic function to load log files
+    // Alan 8/23/26 - A tab can be clicked repeatedly before the first response lands.
+    // Without an in-flight marker each click started another full download.
+    const inFlightLoads = new Set();
+
     async function loadLog(logName, elementId) {
+        if (inFlightLoads.has(logName)) return;
+        inFlightLoads.add(logName);
         const content = document.getElementById(elementId);
         content.textContent = 'Loading log...';
 
@@ -819,11 +875,16 @@ document.addEventListener('DOMContentLoaded', () => {
             // logName is one of three fixed identifiers, never user text.
             window.reportClientError?.(`job_status.load_log.${logName}`, err);
             content.textContent = 'Failed to load log.';
+        } finally {
+            // Cleared either way so a failed load stays retryable.
+            inFlightLoads.delete(logName);
         }
     }
 
     // Function to load input sequences
     async function loadSequences() {
+        if (inFlightLoads.has('sequences')) return;
+        inFlightLoads.add('sequences');
         const content = document.getElementById('sequence-content');
         const title = document.getElementById('sequence-title');
         const count = document.getElementById('sequence-count');
@@ -850,11 +911,15 @@ document.addEventListener('DOMContentLoaded', () => {
             console.error('Failed to load sequences:', err);
             window.reportClientError?.('job_status.load_sequences', err);
             content.textContent = 'Failed to load sequences.';
+        } finally {
+            inFlightLoads.delete('sequences');
         }
     }
 
     // Function to load aligned sequences
     async function loadAligned() {
+        if (inFlightLoads.has('aligned')) return;
+        inFlightLoads.add('aligned');
         const content = document.getElementById('aligned-content');
         const title = document.getElementById('aligned-title');
         const count = document.getElementById('aligned-count');
@@ -896,13 +961,28 @@ document.addEventListener('DOMContentLoaded', () => {
             console.error('Failed to load aligned sequences:', err);
             window.reportClientError?.('job_status.load_alignment', err);
             content.textContent = 'Failed to load aligned sequences.';
+        } finally {
+            inFlightLoads.delete('aligned');
         }
     }
 });
 
-// Cleanup on page unload
-window.addEventListener('beforeunload', () => {
+// Alan 8/23/26 - Cleanup when the page is hidden. `pagehide` rather than
+// `beforeunload`, which disqualifies the page from the back/forward cache in
+// Firefox; the paired `pageshow` below reconnects a restored page so it cannot sit
+// on stale status with a dead stream.
+window.addEventListener('pagehide', () => {
     if (window.jobStatusClient) {
         window.jobStatusClient.disconnect();
     }
+});
+
+window.addEventListener('pageshow', (event) => {
+    if (!event.persisted) return;
+    const client = window.jobStatusClient;
+    // A terminal job has nothing more to stream, and the snapshot it already
+    // rendered is still correct.
+    if (!client || client.eventSource) return;
+    if (client.lastStatus === 'completed' || client.lastStatus === 'failed') return;
+    client.connect();
 });

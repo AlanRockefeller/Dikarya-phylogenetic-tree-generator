@@ -25,6 +25,7 @@ from app.services.subprocess_utils import (
     configured_tool_timeout_seconds,
     run_command,
     run_command_streaming,
+    ToolExecutionError,
     tool_failure_message,
 )
 
@@ -42,29 +43,29 @@ def _verify_already_aligned(input_fasta: Path, logger) -> None:
     Headers are still the user's own at this point (sanitization happens later,
     per tool), so the offending sequences can be named as submitted.
     """
-    lengths = {}
+    lengths = []
     name = None
     with open(input_fasta) as handle:
         for line in handle:
             line = line.rstrip("\n")
             if line.startswith(">"):
                 name = line[1:].strip()
-                lengths[name] = 0
+                lengths.append([name, 0])
             elif name is not None:
-                lengths[name] += len(line.strip())
+                lengths[-1][1] += len(line.strip())
 
     if len(lengths) < 2:
         return
 
     counts = {}
-    for length in lengths.values():
+    for _, length in lengths:
         counts[length] = counts.get(length, 0) + 1
     if len(counts) == 1:
         return
 
     # The modal length is the intended column count; everything else is odd.
     expected = max(counts, key=lambda length: (counts[length], length))
-    odd = [(n, l) for n, l in lengths.items() if l != expected]
+    odd = [(n, l) for n, l in lengths if l != expected]
     # Full GenBank descriptions run to hundreds of characters and would bury
     # the message; the leading accession is what identifies the record.
     shown = ", ".join(
@@ -461,8 +462,9 @@ def _run_mafft(
         )
         
         if exit_code != 0:
-            raise RuntimeError(tool_failure_message(
-                "MAFFT", exit_code, configured_tool_time_limit_hours(config, "MAFFT")))
+            raise ToolExecutionError(
+                "MAFFT", exit_code, stats, tool_failure_message(
+                    "MAFFT", exit_code, configured_tool_time_limit_hours(config, "MAFFT")))
     else:
         # Fallback to non-streaming for backward compatibility. log_file is
         # deliberately not passed to run_command: MAFFT's stdout *is* the
@@ -544,8 +546,9 @@ def _run_muscle(
         )
         
         if exit_code != 0:
-            raise RuntimeError(tool_failure_message(
-                "MUSCLE", exit_code, configured_tool_time_limit_hours(config, "MUSCLE")))
+            raise ToolExecutionError(
+                "MUSCLE", exit_code, stats, tool_failure_message(
+                    "MUSCLE", exit_code, configured_tool_time_limit_hours(config, "MUSCLE")))
     else:
         returncode, stdout, stderr = run_command(
             cmd, log_file=log_file,
@@ -588,9 +591,10 @@ def _run_clustalo(
         )
         
         if exit_code != 0:
-            raise RuntimeError(tool_failure_message(
-                "Clustal Omega", exit_code,
-                configured_tool_time_limit_hours(config, "Clustal Omega")))
+            raise ToolExecutionError(
+                "Clustal Omega", exit_code, stats, tool_failure_message(
+                    "Clustal Omega", exit_code,
+                    configured_tool_time_limit_hours(config, "Clustal Omega")))
     else:
         returncode, stdout, stderr = run_command(
             cmd, log_file=log_file,
@@ -643,9 +647,10 @@ def _run_iqtree_builtin(
         )
         
         if exit_code != 0:
-            raise RuntimeError(tool_failure_message(
-                "IQ-TREE alignment", exit_code,
-                configured_tool_time_limit_hours(config, "IQ-TREE alignment")))
+            raise ToolExecutionError(
+                "IQ-TREE alignment", exit_code, stats, tool_failure_message(
+                    "IQ-TREE alignment", exit_code,
+                    configured_tool_time_limit_hours(config, "IQ-TREE alignment")))
     else:
         returncode, stdout, stderr = run_command(
             cmd, log_file=log_file,

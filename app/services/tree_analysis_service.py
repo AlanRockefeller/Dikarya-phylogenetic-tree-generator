@@ -2392,7 +2392,12 @@ def _call_claude_cli(
     # and the user.
     if isinstance(envelope, dict) and envelope.get("is_error"):
         status = envelope.get("api_error_status")
-        logger.error(
+        # Alan 8/24/26 - A 429 is expected operation, not a defect: the branch
+        # below turns it into a user-facing Retry-After and the viewer retries.
+        # Logging it at ERROR put it in errors.log and in the log digest's
+        # exception list, where routine quota exhaustion read as a bug.
+        logger.log(
+            logging.WARNING if status == 429 else logging.ERROR,
             "event=claude_review.cli_error subtype=%s status=%s terminal_reason=%s",
             envelope.get("subtype"), status, envelope.get("terminal_reason"),
         )

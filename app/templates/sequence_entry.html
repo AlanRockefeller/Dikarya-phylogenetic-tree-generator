@@ -2652,6 +2652,11 @@
             logMycomapUrlRejection(url);
             if (url.includes('mycomap.com')) {
                 showStatus('Invalid Mycomap URL. Please use the URL from the BLAST Search page (starts with https://mycomap.com/genetics/blast-search), or a sequence record page from https://mycomap.com/genetics/sequences/.', 'error');
+            } else if (url.includes('mycomap.org')) {
+                // Alan 8/24/26 - mycomap.org is a real site, so "must be from
+                // mycomap.com" reads like a typo rather than a real distinction.
+                // Only the .com BLAST API is wired up here.
+                showStatus('That is a mycomap.org URL. Sequence import works with mycomap.com only — open the BLAST Search page on https://mycomap.com/genetics/blast-search and paste that URL instead.', 'error');
             } else {
                 showStatus('Invalid Mycomap URL. URL must be from mycomap.com and contain a result ID.', 'error');
             }

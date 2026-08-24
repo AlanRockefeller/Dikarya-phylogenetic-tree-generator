@@ -69,6 +69,8 @@ EVENT_METRIC = "metric"
 MAX_LOG_LINE_LENGTH = 4096  # 4KB max per line
 MAX_LINES_PER_SECOND = 200  # Rate limit per (job_id, step, stream)
 OVERFLOW_WARNING_INTERVAL = 5.0  # Seconds between overflow warnings
+RATE_LIMITER_IDLE_TTL = 3600.0  # Defensive cleanup for jobs missing a terminal event
+RATE_LIMITER_CLEANUP_INTERVAL = 60.0
 
 # -----------------------------------------------------------------------------
 # Redis Connection (worker-side, no Flask app context)
@@ -84,7 +86,12 @@ def _get_redis() -> redis.Redis:
     if _redis_client is None:
         with _redis_lock:
             if _redis_client is None:
-                _redis_client = redis.from_url(Config.REDIS_URL)
+                _redis_client = redis.from_url(
+                    Config.REDIS_URL,
+                    socket_connect_timeout=Config.EVENT_REDIS_CONNECT_TIMEOUT_SECONDS,
+                    socket_timeout=Config.EVENT_REDIS_SOCKET_TIMEOUT_SECONDS,
+                    retry_on_timeout=False,
+                )
     return _redis_client
 
 
@@ -105,29 +112,74 @@ class RateLimiter:
     Refills at MAX_LINES_PER_SECOND tokens per second.
     """
     
-    def __init__(self):
+    def __init__(
+        self,
+        idle_ttl: float = RATE_LIMITER_IDLE_TTL,
+        cleanup_interval: float = RATE_LIMITER_CLEANUP_INTERVAL,
+        clock=time.monotonic,
+    ):
         self._buckets: Dict[str, Dict[str, float]] = {}
         self._lock = threading.Lock()
         self._last_overflow_warning: Dict[str, float] = {}
+        self._job_keys: Dict[str, set] = {}
+        self._idle_ttl = idle_ttl
+        self._cleanup_interval = cleanup_interval
+        self._clock = clock
+        self._last_cleanup = clock()
     
     def _bucket_key(self, job_id: str, step: str, stream: str) -> str:
         return f"{job_id}:{step}:{stream}"
+
+    def _remember_key(self, job_id: str, key: str) -> None:
+        self._job_keys.setdefault(job_id, set()).add(key)
+
+    def _evict_stale(self, now: float) -> None:
+        if now - self._last_cleanup < self._cleanup_interval:
+            return
+        self._last_cleanup = now
+        stale_jobs = {
+            job_id
+            for job_id, keys in self._job_keys.items()
+            if keys and all(
+                now - max(
+                    self._buckets.get(key, {}).get("last_seen", 0),
+                    self._last_overflow_warning.get(key, 0),
+                ) >= self._idle_ttl
+                for key in keys
+            )
+        }
+        for job_id in stale_jobs:
+            self._forget_job_locked(job_id)
+
+    def _forget_job_locked(self, job_id: str) -> None:
+        for key in self._job_keys.pop(job_id, ()):
+            self._buckets.pop(key, None)
+            self._last_overflow_warning.pop(key, None)
+
+    def forget_job(self, job_id: str) -> None:
+        """Remove rate-limit and warning state for exactly one terminal job."""
+        with self._lock:
+            self._forget_job_locked(job_id)
     
     def try_consume(self, job_id: str, step: str, stream: str) -> bool:
         """
         Try to consume one token. Returns True if allowed, False if rate limited.
         """
         key = self._bucket_key(job_id, step, stream)
-        now = time.time()
+        now = self._clock()
         
         with self._lock:
+            self._evict_stale(now)
             if key not in self._buckets:
                 self._buckets[key] = {
                     "tokens": MAX_LINES_PER_SECOND,
-                    "last_refill": now
+                    "last_refill": now,
+                    "last_seen": now,
                 }
+                self._remember_key(job_id, key)
             
             bucket = self._buckets[key]
+            bucket["last_seen"] = now
             
             # Refill tokens based on elapsed time
             elapsed = now - bucket["last_refill"]
@@ -143,9 +195,11 @@ class RateLimiter:
     def should_warn_overflow(self, job_id: str, step: str, stream: str) -> bool:
         """Check if we should emit an overflow warning (throttled)."""
         key = self._bucket_key(job_id, step, stream)
-        now = time.time()
+        now = self._clock()
         
         with self._lock:
+            self._evict_stale(now)
+            self._remember_key(job_id, key)
             last_warning = self._last_overflow_warning.get(key, 0)
             if now - last_warning >= OVERFLOW_WARNING_INTERVAL:
                 self._last_overflow_warning[key] = now
@@ -415,7 +469,10 @@ def publish_job_completed(job_id: str, view_url: str, result_files: Optional[dic
     if result_files:
         payload["result_files"] = result_files
     
-    publish_event(job_id, payload)
+    try:
+        publish_event(job_id, payload)
+    finally:
+        _rate_limiter.forget_job(job_id)
 
 
 def publish_job_failed(
@@ -453,7 +510,10 @@ def publish_job_failed(
     if stderr_tail:
         payload["stderr_tail"] = stderr_tail[:30]
     
-    publish_event(job_id, payload)
+    try:
+        publish_event(job_id, payload)
+    finally:
+        _rate_limiter.forget_job(job_id)
 
 
 # -----------------------------------------------------------------------------

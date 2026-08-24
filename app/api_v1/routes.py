@@ -1480,8 +1480,8 @@ def _validate_tip_name(field, value, *, allow_newick_unsafe=False):
                 message=(
                     f"`{field}` contains characters that are invalid in "
                     f"Newick tip names: {bad}. Avoid parentheses, brackets, "
-                    f"commas, colons, semicolons, quotes, and whitespace "
-                    f"other than spaces."
+                    f"commas, colons, semicolons, and whitespace other than "
+                    f"spaces."
                 ),
                 status=422,
                 details={"field": field, "invalid_chars": bad},

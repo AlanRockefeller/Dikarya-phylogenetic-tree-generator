@@ -8204,6 +8204,12 @@
       parent["children"] = [child];
     }
 
+    // Alan 8/24/26 - Maintain the parent/child invariant here rather than in
+    // each caller. createNode() leaves `parent` as the empty string, so without
+    // this every node built by addChild() looked like a root to pathToRoot(),
+    // reroot() and any other upward traversal.
+    child.parent = parent;
+
     return parent;
 
   }
@@ -8262,16 +8268,28 @@
               node.parent.children[1 - delete_me_idx].parent = node.parent.parent;
               nodes.splice(nodes.indexOf(node.parent), 1);
             } else {
+              // Alan 8/24/26 - node.parent is the root and has just lost one of
+              // its two children, so the survivor becomes the new root. This
+              // used to write the root fields onto `nodes` - the array returned
+              // by descendants() - and threw on `nodes.data` before the
+              // deletion completed.
+              let survivor = node.parent.children[1 - delete_me_idx];
+
               nodes.splice(0, 1);
-              nodes.parent = null;
-              delete nodes.data["attribute"];
-              delete nodes.data["annotation"];
-              delete nodes.data["original_child_order"];
-              nodes.name = "root";
-              nodes.data.name = "root";
+              survivor.parent = null;
+              delete survivor.data["attribute"];
+              delete survivor.data["annotation"];
+              delete survivor.data["original_child_order"];
+              survivor.name = "root";
+              survivor.data.name = "root";
+              this.nodes = survivor;
             }
           }
         }
+
+        // Alan 8/24/26 - The hierarchy was mutated in place, so depths and the
+        // cached link list now describe a tree that no longer exists.
+        this.update(this.nodes);
       }
     }
 
@@ -8293,6 +8311,12 @@
    * console.log(`Tree has ${numTaxa} taxa`);
    */
   function getTips() {
+    // Alan 8/24/26 - Same guard as traverse_and_compute: an unparseable tree
+    // leaves `nodes` as a plain array with no .descendants().
+    if (!this.nodes || typeof this.nodes.descendants !== "function") {
+      return [];
+    }
+
     // get all nodes that have no nodes
     return ___namespace.filter(this.nodes.descendants(), n => {
       return !___namespace.has(n, "children");
@@ -8773,13 +8797,31 @@
 
     if (!annotator) annotator = d => '';
 
-    function nodeDisplay(n) {
-      // Skip the node if it is hidden
-      if (n.notshown) return;
+    // Alan 8/24/26 - Does this subtree still contain a visible terminal taxon?
+    // A tip is visible unless it is hidden; an internal node is visible only
+    // while something below it is, so filtering every tip out of a clade
+    // removes the clade rather than turning its internal label - often a
+    // support value, not a taxon name - into a terminal.
+    function hasVisibleTip(n) {
+      if (n.notshown) return false;
+      if (isLeafNode(n)) return true;
+      return n.children.some(hasVisibleTip);
+    }
 
-      if (!isLeafNode(n)) {
+    function nodeDisplay(n) {
+      // Skip the node if it is hidden, or if every tip below it is.
+      if (!hasVisibleTip(n)) return;
+
+      // Alan 8/24/26 - Decide which children are actually written before
+      // emitting any separator. The comma used to be positional, so hiding a
+      // first or middle child produced "(A,,C)" - not parseable Newick.
+      const shown_children = isLeafNode(n)
+        ? []
+        : n.children.filter(hasVisibleTip);
+
+      if (shown_children.length) {
         element_array.push("(");
-        n.children.forEach(function(d, i) {
+        shown_children.forEach(function(d, i) {
           if (i) {
             element_array.push(",");
           }
@@ -8810,7 +8852,11 @@
 
     let element_array = [];
     annotator = annotator || "";
-    nodeDisplay(root || this.nodes);
+    const export_root = root || this.nodes;
+    if (!export_root || !hasVisibleTip(export_root)) {
+      throw new Error("No visible sequences remain to export.");
+    }
+    nodeDisplay(export_root);
 
     return element_array.join("")+";";
   }
@@ -9553,8 +9599,20 @@
       new_json.children = [node.copy()];
       new_json.data.__mapped_bl = undefined;
 
+      // Alan 8/24/26 - defBranchLengthAccessor deliberately reports 0 for a
+      // root that carries no branch length ("allow for empty branch length at
+      // root"). Carrying that synthetic 0 into the length shuffle below made
+      // the old root look like a real zero-length branch: `t !== undefined`
+      // held, `stashed_bl` was overwritten with 0, and the branch length of the
+      // root child we came up through was dropped instead of being handed to
+      // the surviving child. That silently changed tip-to-tip distances.
       nodes.each(n => {
-        n.data.__mapped_bl = this.branch_length_accessor(n);
+        const has_own_length =
+          n.data["attribute"] && String(n.data["attribute"]).length;
+
+        n.data.__mapped_bl = (!n.parent && !has_own_length)
+          ? undefined
+          : this.branch_length_accessor(n);
       });
 
       this.setBranchLength(n => {
@@ -9643,6 +9701,14 @@
 
     }
 
+    // Alan 8/24/26 - Rerooting on the current root is a no-op, not a request
+    // to throw the tree away. `new_json` is only built inside the branch above,
+    // so this used to hand update() `undefined` and leave the model with no
+    // hierarchy at all.
+    if (new_json === undefined) {
+      return this;
+    }
+
     // need to traverse the nodes and update parents
     this.update(new_json);
 
@@ -9661,9 +9727,25 @@
       // retain selection
       let selectionName = this.display.selection_attribute_name;
 
+      // Alan 8/24/26 - The replacement TreeRender starts with an empty
+      // _eventListeners map, so every listener a consumer registered - the
+      // 'rerooted' one emitted a few lines below included - used to be dropped
+      // by the very operation that fires it. Carry the externally registered
+      // handlers over to the new renderer.
+      let retained_listeners = this.display._eventListeners;
+      let retained_selection_callback = this.display._selectionCallback;
+
       delete this.display;
 
       let rendered_tree = this.render(options);
+
+      if (retained_listeners) {
+        rendered_tree._eventListeners = retained_listeners;
+      }
+      if (retained_selection_callback) {
+        rendered_tree._selectionCallback = retained_selection_callback;
+      }
+
       rendered_tree.selectionLabel(selectionName);
       rendered_tree.update();
       select(rendered_tree.container).node().appendChild(rendered_tree.show());
@@ -11434,7 +11516,10 @@
       }
     } else if (this.options["binary-selectable"]) {
       if (typeof node_selecter === "function") {
-        this.links.forEach(function(d) {
+        // Alan 8/24/26 - Arrow callback: the bundle is strict mode, so a plain
+        // function() here ran with `this === undefined` and threw on the first
+        // link as soon as binary-selectable was enabled.
+        this.links.forEach(d => {
           var select_me = node_selecter(d);
           d[attr] = d[attr] || false;
 
@@ -11462,7 +11547,9 @@
           }
         });
 
-        this.links.forEach(function(d) {
+        // Alan 8/24/26 - Same strict-mode `this` problem on the array-selector
+        // path.
+        this.links.forEach(d => {
           d[attr] = d.target[attr];
           this.options["attribute-list"].forEach(function(type) {
             if (type != attr && d[attr] !== true) {
@@ -13554,10 +13641,17 @@
         self.parsed_tags = Object.keys(_parsed_tags);
       }
 
-      self.links = self.nodes.links();
+      // Alan 8/24/26 - The branch above leaves `nodes` as a plain array when the
+      // parser could not produce a hierarchy (a truncated Newick, say). The
+      // rest of the constructor assumed a d3 node, so .links() and then
+      // .descendants() threw and a corrupt tree file took the whole viewer down
+      // instead of yielding an empty model the caller can check.
+      let has_hierarchy = typeof self.nodes.links === "function";
+
+      self.links = has_hierarchy ? self.nodes.links() : [];
 
       // If no branch lengths are supplied, set all to 1
-      if (!this.hasBranchLengths()) {
+      if (has_hierarchy && !this.hasBranchLengths()) {
         console.warn(
           "Phylotree User Warning : NO BRANCH LENGTHS DETECTED, SETTING ALL LENGTHS TO 1"
         );
@@ -13672,7 +13766,14 @@
         }
       }
 
-      traversal_type(root_node ? root_node : this.nodes);
+      let start = root_node ? root_node : this.nodes;
+
+      // Alan 8/24/26 - An unparseable tree leaves `nodes` as a plain array, and
+      // the traversal used to hand that array to the callback as though it were
+      // a node. Visit nothing instead.
+      if (start && !Array.isArray(start)) {
+        traversal_type(start);
+      }
 
       return this;
     }
@@ -13684,6 +13785,29 @@
     update(json) {
       // update with new hiearchy layout
       this.nodes = json;
+
+      // Alan 8/24/26 - Replacing the hierarchy invalidates every derived view
+      // of the topology. Callers (reroot in particular) re-attach children by
+      // hand, so re-establish parent pointers and depths from the children
+      // downwards, then rebuild the cached link list. Without this,
+      // Phylotree.links kept pointing at nodes from the previous topology and
+      // box selection after a reroot operated on stale objects.
+      if (!json || typeof json.eachBefore !== "function") {
+        this.links = [];
+        return;
+      }
+
+      json.parent = null;
+      json.depth = 0;
+
+      json.eachBefore(n => {
+        ___namespace.each(n.children, c => {
+          c.parent = n;
+          c.depth = n.depth + 1;
+        });
+      });
+
+      this.links = json.links();
     }
 
     /**

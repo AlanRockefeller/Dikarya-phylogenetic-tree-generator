@@ -59,9 +59,47 @@
   cursor: not-allowed;
 }
 
+/* The menu surface itself had no dark rules, so right-clicking a node in dark
+   mode opened a white panel over the dark tree. */
+.dark .phylotree-context-menu {
+  background-color: #1f2937;
+  border-color: rgba(255, 255, 255, 0.15);
+  color: #e5e7eb;
+}
+
+.dark .phylotree-menu-item {
+  color: #e5e7eb;
+}
+
+.dark .phylotree-menu-item:hover,
+.dark .phylotree-menu-item:focus {
+  background-color: #374151;
+  color: #ffffff;
+}
+
+.dark .phylotree-menu-item:active {
+  background-color: #4b5563;
+}
+
+.dark .phylotree-menu-divider {
+  border-top-color: rgba(255, 255, 255, 0.12);
+}
+
+.dark .phylotree-menu-header {
+  color: #9ca3af;
+}
+
+/* Must follow the dark hover/focus rules above, which otherwise match a disabled
+   item at equal specificity and would give it an interactive highlight. */
 .dark .phylotree-menu-item.disabled,
-.dark .phylotree-menu-item[aria-disabled="true"] {
+.dark .phylotree-menu-item[aria-disabled="true"],
+.dark .phylotree-menu-item.disabled:hover,
+.dark .phylotree-menu-item[aria-disabled="true"]:hover,
+.dark .phylotree-menu-item.disabled:focus,
+.dark .phylotree-menu-item[aria-disabled="true"]:focus {
   color: #6b7280;
+  background-color: transparent;
+  cursor: not-allowed;
 }
 
 .phylotree-menu-divider {

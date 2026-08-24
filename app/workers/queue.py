@@ -38,25 +38,32 @@ def get_queue(name=QUEUE_HIGH) -> Queue:
 def resolve_job_timeout(job_params: Dict[str, Any]) -> str:
     """Pick the RQ job_timeout for a job based on the tree method it will run.
 
-    RAxML-NG needs longer than the already-generous general allowance. This
-    lives here, rather than
-    at each submission site, so every path that creates a job (web /tree, API
-    v1, iNaturalist auto-tree, Mushroom Observer, rebuild) gets the same budget
-    and a new entry point cannot silently fall back to one hour.
+    Tree-builder subprocess limits apply after input preparation, BLAST,
+    alignment and trimming. Give recognized builders their complete tool limit
+    in addition to the general pipeline allowance so RQ cannot kill the work
+    horse before the subprocess timeout produces a structured error. This lives
+    here, rather than at each submission site, so every enqueue path gets the
+    same budget.
     """
     from app.config import Config
 
-    if str((job_params or {}).get("tree_method") or "").lower() == "raxml":
-        hours = float(getattr(Config, "RAXML_TIME_LIMIT_HOURS", 15) or 15)
-        # A little above the tool's own limit so the subprocess timeout fires
-        # first and produces the specific "RAxML ran out of time" message
-        # instead of RQ killing the horse with no explanation.
-        return f"{int(hours * 3600) + 600}s"
+    general_hours = float(getattr(Config, "GENERAL_JOB_TIME_LIMIT_HOURS", 8) or 8)
+    method = str((job_params or {}).get("tree_method") or "").lower()
+    tree_limits = {
+        "raxml": ("RAXML_TIME_LIMIT_HOURS", 15),
+        "iqtree": ("IQTREE_TIME_LIMIT_HOURS", 15),
+        "mrbayes": ("MRBAYES_TIME_LIMIT_HOURS", 15),
+        "fasttree": ("FASTTREE_TIME_LIMIT_HOURS", 6),
+    }
+    limit = tree_limits.get(method)
+    if limit:
+        attr, default = limit
+        general_hours += float(getattr(Config, attr, default) or default)
 
-    hours = float(getattr(Config, "GENERAL_JOB_TIME_LIMIT_HOURS", 8) or 8)
     # Generic subprocess CPU limiting is disabled by default because CPU time
-    # accumulates across threads. RQ remains the ordinary wall-clock guard.
-    return f"{int(hours * 3600) + 600}s"
+    # accumulates across threads. The ten-minute grace ensures a subprocess
+    # timeout is handled before RQ reaches this wall-clock backstop.
+    return f"{int(general_hours * 3600) + 600}s"
 
 
 def safe_job_description(kind: str, job_params: Optional[Dict[str, Any]] = None,

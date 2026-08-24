@@ -381,10 +381,40 @@ being used.
 | `CLAUDE_REVIEW_MODEL` | `claude-opus-5` | Model id |
 | `CLAUDE_REVIEW_EFFORT` | `low` | `low`–`max` |
 | `CLAUDE_REVIEW_MAX_TOKENS` | `32000` | Thinking + output ceiling (`api`) |
-| `CLAUDE_REVIEW_MAX_BUDGET_USD` | `1.00` | Per-invocation spend stop (`cli`) |
+| `CLAUDE_REVIEW_MAX_BUDGET_USD` | `1.00` | Per-invocation spend stop (`cli`); capped at `2.00`, see below |
 | `CLAUDE_REVIEW_TIMEOUT_SECONDS` | `240` | Hard cap; must stay under nginx's 300 s |
 | `CLAUDE_REVIEW_MAX_CONCURRENT` | `2` | Global in-flight ceiling |
 | `CLAUDE_REVIEW_MAX_DAILY` | `25` | Site-wide new reviews per UTC day; cache hits excluded |
+
+#### The `$2.00` budget hard cap
+
+`CLAUDE_REVIEW_MAX_BUDGET_USD` is configurable, but not without limit. The value
+reaches the CLI through an environment variable that an internet-facing process
+sets, so if it could be set to any magnitude then `--max-budget-usd` — the one
+control that stops a runaway review from billing without bound — could simply be
+configured away. Both layers therefore refuse anything above **$2.00**:
+
+* `CLAUDE_REVIEW_MAX_BUDGET_HARD_CAP_USD` in `app/config.py` (unprivileged;
+  canonicalizes the value and falls back to the default with a logged warning),
+* `MAX_BUDGET_HARD_CENTS` in `scripts/dikarya-claude-review` (privileged; the
+  actual enforcement boundary, which exits 64 rather than falling back).
+
+The two must stay equal; `tests/test_maintenance_script_safety.py` asserts it.
+
+$2.00 is derived rather than chosen for roundness:
+
+* twice the shipped default of `1.00`, so the budget can still be raised
+  deliberately for a higher effort setting or an unusually large tree;
+* roughly six times the measured cost of a real review — low effort $0.25,
+  medium $0.35 on a 147-sequence job;
+* and it bounds worst-case site-wide spend at `CLAUDE_REVIEW_MAX_DAILY` × $2.00
+  = **$50 per UTC day**, which is the number to re-derive if either value moves.
+
+The two layers do not implement the same grammar and are not meant to. The app
+canonicalizes — it tolerates surrounding whitespace and any accepted precision,
+and always emits the two-decimal form — while the wrapper accepts only that
+canonical form. The invariant is one-directional: everything the app can emit,
+the wrapper accepts, so a legal configuration can never fail inside `sudo`.
 
 ### Installing the `cli` backend (root)
 

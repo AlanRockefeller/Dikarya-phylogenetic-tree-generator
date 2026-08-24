@@ -1,11 +1,22 @@
 import tempfile
 import unittest
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 from rq.results import Result
+
+
+def _naive_utc_now():
+    """Now, as the naive UTC value Job.created_at stores.
+
+    The migration declares created_at as sa.DateTime() with no timezone, so the
+    fixtures must stay naive. datetime.utcnow() produced exactly this value but
+    is deprecated in 3.12 and emitted a warning on every one of these tests.
+    """
+    return datetime.now(timezone.utc).replace(tzinfo=None)
+
 
 from app.config import Config
 from app.services.job_reconcile_service import (
@@ -125,7 +136,7 @@ class RQInterruptionEvidenceTests(unittest.TestCase):
             for status, rq_job in cases:
                 db_job = SimpleNamespace(
                     id="job-1", status="running", metrics={},
-                    created_at=datetime.utcnow(), updated_at=None,
+                    created_at=_naive_utc_now(), updated_at=None,
                 )
                 inspection = RQJobInspection(
                     verified=True, status=status, rq_job=rq_job
@@ -148,7 +159,7 @@ class RQInterruptionEvidenceTests(unittest.TestCase):
             stale.write_text("")
             db_job = SimpleNamespace(
                 id="job-1", status="running", metrics={},
-                created_at=datetime.utcnow(), updated_at=None,
+                created_at=_naive_utc_now(), updated_at=None,
             )
             inspection = RQJobInspection(
                 verified=True, status="failed", rq_job=rq_job
@@ -171,7 +182,7 @@ class RQInterruptionEvidenceTests(unittest.TestCase):
         )
         db_job = SimpleNamespace(
             id="job-1", status="queued", metrics={"restart_requeue_count": 1},
-            created_at=datetime.utcnow(), updated_at=None,
+            created_at=_naive_utc_now(), updated_at=None,
         )
         inspection = RQJobInspection(
             verified=True, status="failed", rq_job=rq_job
@@ -203,7 +214,7 @@ class RQInterruptionEvidenceTests(unittest.TestCase):
             stale.write_text("truncated")
             db_job = SimpleNamespace(
                 id="job-1", status="running", metrics={},
-                created_at=datetime.utcnow(), updated_at=None,
+                created_at=_naive_utc_now(), updated_at=None,
             )
             inspection = RQJobInspection(
                 verified=True, status="failed", rq_job=rq_job
@@ -236,7 +247,7 @@ class RQInterruptionEvidenceTests(unittest.TestCase):
             leftover.write_bytes(b"\x1f\x8b")
             db_job = SimpleNamespace(
                 id="job-1", status="running", metrics={},
-                created_at=datetime.utcnow(), updated_at=None,
+                created_at=_naive_utc_now(), updated_at=None,
             )
             inspection = RQJobInspection(
                 verified=True, status="failed", rq_job=rq_job
@@ -253,7 +264,7 @@ class RQInterruptionEvidenceTests(unittest.TestCase):
     def test_unverified_rq_lookup_changes_nothing(self):
         db_job = SimpleNamespace(
             id="job-1", status="running", metrics={},
-            created_at=datetime.utcnow(), updated_at=None,
+            created_at=_naive_utc_now(), updated_at=None,
         )
         inspection = RQJobInspection(verified=False, error="Redis unavailable")
         with tempfile.TemporaryDirectory() as tmp:

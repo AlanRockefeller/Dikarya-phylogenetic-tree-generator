@@ -13,6 +13,7 @@ import pytest
 
 from Bio import Phylo
 
+import app.services.tree_io as tree_io
 from app.services.tree_edit_service import (
     NEWICK_BRANCH_LENGTH_FORMAT,
     load_tree_state,
@@ -21,7 +22,11 @@ from app.services.tree_edit_service import (
     reroot_tree,
     write_tree_file,
 )
-from app.services.tree_io import tree_to_newick_string, write_nexus_tree
+from app.services.tree_io import (
+    tree_to_newick_string,
+    validate_nexus_file,
+    write_nexus_tree,
+)
 
 
 # Normal, very small positive, exactly zero, and one tip with no length at all.
@@ -51,6 +56,199 @@ def test_genuine_zero_stays_zero(tmp_path):
     _, lengths = _roundtrip(tmp_path)
 
     assert lengths["C"] == 0.0
+
+
+def test_an_absent_branch_length_stays_absent(tmp_path):
+    """D carries no branch length, and must not acquire one.
+
+    "No length was measured" and "this branch has length zero" are different
+    claims, and the second is what makes a terminal branch read as an identical
+    sequence -- the same false inference the precision tests above exist to
+    prevent, arriving by a different route.
+
+    Biopython renders every node as ``clade.branch_length or 0.0``, so it turned
+    the first statement into the second. `_render_newick` writes no ``:length``
+    token for such a clade, which is how Newick spells "unspecified".
+    """
+    _, lengths = _roundtrip(tmp_path)
+
+    assert lengths["D"] is None
+
+
+def test_absent_and_explicit_zero_are_not_the_same_value(tmp_path):
+    """The distinction has to survive in one file, side by side.
+
+    C is written ``C:0.0`` in the fixture and D has no length at all. If the
+    writer ever collapses them again, this fails while the two single-value
+    tests above could both still pass.
+    """
+    path, lengths = _roundtrip(tmp_path)
+
+    assert lengths["C"] == 0.0
+    assert lengths["D"] is None
+    assert lengths["C"] is not lengths["D"]
+
+    text = path.read_text()
+    assert "C:0.0000000000" in text, text
+    # D appears with no colon after it: either "D," or "D)" depending on where
+    # it sits in the tree.
+    assert "D:" not in text, text
+
+
+def test_a_length_less_root_does_not_gain_a_zero(tmp_path):
+    """297 of 300 production trees have a root with no branch length.
+
+    Every one of them used to be rewritten with a trailing ``:0.0000000000``
+    the builder never produced.
+    """
+    tree = Phylo.read(StringIO(SYNTHETIC), "newick")
+    assert tree.root.branch_length is None
+
+    path = tmp_path / "root.newick"
+    write_tree_file(tree, path, "newick")
+
+    assert path.read_text().strip().endswith(");")
+    assert Phylo.read(str(path), "newick").root.branch_length is None
+
+
+def test_serializing_does_not_mutate_the_caller_s_tree(tmp_path):
+    """The absent lengths are carried through Biopython as a sentinel value.
+
+    That sentinel must never be visible to the caller, including when writing
+    raises partway.
+    """
+    tree = Phylo.read(StringIO(SYNTHETIC), "newick")
+    before = [(clade.name, clade.branch_length) for clade in tree.find_clades()]
+
+    write_tree_file(tree, tmp_path / "a.newick", "newick")
+    write_tree_file(tree, tmp_path / "b.nexus", "nexus")
+
+    after = [(clade.name, clade.branch_length) for clade in tree.find_clades()]
+    assert before == after
+
+
+def test_a_label_containing_the_sentinel_token_is_not_corrupted(tmp_path):
+    """The sentinel substitution is exact, not merely improbable.
+
+    A taxon label is copied into the output verbatim, and quoting does not
+    protect it from a plain string replacement, so a label that happens to
+    contain the sentinel's rendered token must push the writer onto a different
+    sentinel rather than have the text cut out of its name.
+    """
+    hostile = "weird:-1.0000000000 isolate"
+    newick = f"(('{hostile}':0.5,B)90:0.02,C:0.25);"
+    tree = Phylo.read(StringIO(newick), "newick")
+
+    path = tmp_path / "hostile.newick"
+    write_tree_file(tree, path, "newick")
+
+    reloaded = Phylo.read(str(path), "newick")
+    names = {clade.name for clade in reloaded.get_terminals()}
+    assert hostile in names, names
+    lengths = {clade.name: clade.branch_length for clade in reloaded.get_terminals()}
+    assert lengths[hostile] == pytest.approx(0.5)
+    assert lengths["B"] is None
+
+
+def test_a_real_negative_branch_length_does_not_collide_with_the_sentinel(tmp_path):
+    """Biopython's NJ can emit negative branch lengths.
+
+    The sentinel is negative too, so it is chosen against the tree's actual
+    values rather than assumed to be unused.
+    """
+    tree = Phylo.read(StringIO("((A:-1.0,B)90:0.02,C:-2.0);"), "newick")
+
+    path = tmp_path / "negative.newick"
+    write_tree_file(tree, path, "newick")
+
+    lengths = {
+        clade.name: clade.branch_length
+        for clade in Phylo.read(str(path), "newick").get_terminals()
+    }
+    assert lengths["A"] == pytest.approx(-1.0)
+    assert lengths["C"] == pytest.approx(-2.0)
+    assert lengths["B"] is None
+
+
+def test_every_initial_sentinel_collision_still_preserves_absent_lengths(tmp_path):
+    """Collision avoidance cannot have a finite semantic failure path."""
+    real_lengths = ",".join(
+        f"N{index}:{-float(index)}" for index in range(1, 13)
+    )
+    tree = Phylo.read(StringIO(f"({real_lengths},Missing);"), "newick")
+
+    path = tmp_path / "many-negative-lengths.newick"
+    write_tree_file(tree, path, "newick")
+    reloaded = Phylo.read(str(path), "newick")
+    lengths = {tip.name: tip.branch_length for tip in reloaded.get_terminals()}
+
+    assert lengths["Missing"] is None
+    for index in range(1, 13):
+        assert lengths[f"N{index}"] == pytest.approx(-float(index))
+
+
+def test_comments_containing_sentinel_text_are_preserved(tmp_path):
+    tree = Phylo.read(StringIO("(A[keep:-1.0000000000],B);"), "newick")
+
+    path = tmp_path / "comment.newick"
+    write_tree_file(tree, path, "newick")
+
+    text = path.read_text()
+    assert "[keep:-1.0000000000]" in text
+    reloaded = Phylo.read(str(path), "newick")
+    tips = {tip.name: tip for tip in reloaded.get_terminals()}
+    assert tips["A"].comment == "keep:-1.0000000000"
+    assert tips["B"].branch_length is None
+
+
+def test_newick_renderer_restores_absent_lengths_when_biopython_raises(monkeypatch):
+    tree = Phylo.read(StringIO(SYNTHETIC), "newick")
+    before = [(clade.name, clade.branch_length) for clade in tree.find_clades()]
+
+    def fail(_tree):
+        raise OSError("simulated serializer failure")
+
+    monkeypatch.setattr(tree_io, "_biopython_newick", fail)
+    with pytest.raises(OSError, match="simulated serializer failure"):
+        tree_io.tree_to_newick_string(tree)
+
+    assert [(clade.name, clade.branch_length) for clade in tree.find_clades()] == before
+
+
+def test_write_tree_file_does_not_mutate_tree_when_disk_write_raises(
+    tmp_path, monkeypatch
+):
+    tree = Phylo.read(StringIO(SYNTHETIC), "newick")
+    before = [(clade.name, clade.branch_length) for clade in tree.find_clades()]
+
+    def fail_write_text(self, data, encoding=None):
+        raise OSError("simulated disk failure")
+
+    monkeypatch.setattr(tree_io.Path, "write_text", fail_write_text)
+    with pytest.raises(OSError, match="simulated disk failure"):
+        write_tree_file(tree, tmp_path / "failed.newick", "newick")
+
+    assert [(clade.name, clade.branch_length) for clade in tree.find_clades()] == before
+
+
+def test_nexus_omits_the_token_for_an_absent_length(tmp_path):
+    """The same distinction has to reach the NEXUS file.
+
+    Asserted on the file text rather than on a Biopython round trip: its NEXUS
+    *reader* substitutes 0.0 for a missing length, which is a reader limitation
+    and not something this writer can do anything about.
+    """
+    path = tmp_path / "tree.nexus"
+    tree = Phylo.read(StringIO(SYNTHETIC), "newick")
+    write_tree_file(tree, path, "nexus")
+
+    text = path.read_text()
+    tree_line = next(line for line in text.splitlines() if line.strip().startswith("TREE "))
+    # Tips are integers in the TRANSLATE form; D is the fourth terminal.
+    assert "3:0.0000000000" in tree_line, tree_line   # C, an explicit zero
+    assert "4:" not in tree_line, tree_line           # D, no length at all
+    ok, reason = validate_nexus_file(path)
+    assert ok, reason
 
 
 def test_default_biopython_format_would_have_lost_them(tmp_path):

@@ -18,11 +18,20 @@ corrected here:
    NEXUS file the site had ever served was malformed. `write_nexus_tree`
    replaces that writer entirely.
 
+A third Biopython default is corrected here for the same reason as the first:
+
+3. Its Newick writer renders every node's branch length as
+   ``clade.branch_length or 0.0``, so a clade that carries *no* branch length
+   is written as an explicit zero. "Not measured" and "measured as zero" are
+   different claims, and the second one reads as "these sequences are
+   identical" -- the very inference item 1 exists to prevent. `_render_newick`
+   keeps the distinction by omitting the ``:length`` token entirely for such a
+   clade, which is what Newick uses to mean "unspecified".
+
 `write_tree_file` is the entry point for both formats; it is re-exported from
 ``tree_edit_service`` under the name the rest of the codebase already uses.
 """
 
-import logging
 import re
 from io import StringIO
 from pathlib import Path
@@ -33,8 +42,6 @@ try:
     HAS_BIOPYTHON = True
 except ImportError:  # pragma: no cover - Biopython is a hard dependency in prod
     HAS_BIOPYTHON = False
-
-logger = logging.getLogger(__name__)
 
 # Ten decimal places covers everything the tree builders emit and, unlike a
 # "%g" format, never introduces exponent notation into a file the user may open
@@ -58,6 +65,89 @@ def quote_tree_label(name: str) -> str:
     return "'" + name.replace("'", "''") + "'"
 
 
+# Candidate stand-ins for "this clade has no branch length". Negative, because
+# no tree builder Dikarya runs emits a negative branch length -- but the choice
+# is still verified against the actual tree rather than assumed (see
+# `_absent_length_sentinel`), because Biopython's own NJ implementation can
+# produce one.
+def _absent_length_sentinel(tree) -> float:
+    """Pick a branch length whose serialized token appears nowhere else.
+
+    The comparison is on the *formatted* token, not on the float: two different
+    floats can render to the same ten-decimal string, and it is the string that
+    the substitution below removes.
+    """
+    taken = set()
+    for clade in tree.find_clades():
+        if clade.branch_length is not None:
+            taken.add(NEWICK_BRANCH_LENGTH_FORMAT % clade.branch_length)
+    # A label or a comment is copied into the output verbatim, so a sentinel
+    # token occurring inside one would be deleted from it by the substitution.
+    # Labels containing ':' are quoted, which does not protect them from a plain
+    # str.replace, so they have to be checked explicitly.
+    literals = []
+    for clade in tree.find_clades():
+        if clade.name is not None:
+            literals.append(str(clade.name))
+        comment = getattr(clade, "comment", None)
+        if comment:
+            literals.append(str(comment))
+    # A finite candidate list creates a semantic failure path: a tree that uses
+    # every entry makes absent lengths fall back to explicit zero. A finite tree
+    # contains only finitely many formatted lengths and literal substrings, so
+    # walking the negative integers must eventually find a collision-free token.
+    candidate = -1.0
+    while True:
+        token = NEWICK_BRANCH_LENGTH_FORMAT % candidate
+        if token not in taken and not any(token in literal for literal in literals):
+            return candidate
+        candidate -= 1.0
+
+
+def _render_newick(tree) -> str:
+    """Serialize to Newick, keeping "no branch length" distinct from zero.
+
+    Biopython's Newick writer builds every node's suffix from
+    ``clade.branch_length or 0.0``, so a clade with no branch length is written
+    as an explicit zero and reloads as 0.0. Those are different statements: a
+    zero-length terminal branch says two sequences are identical, which is
+    exactly the false reading this module exists to prevent for short branches.
+    No writer parameter reaches that expression, and hand-rolling a Newick
+    emitter would put every tree the site produces behind new parsing code, so
+    the absent lengths are carried through Biopython as a sentinel value and the
+    sentinel's token is then removed -- leaving the clade with no ``:length`` at
+    all, which is what "unspecified" looks like in Newick.
+
+    The substitution is exact rather than merely improbable: the sentinel is
+    chosen so its rendered token matches no real branch length, no taxon label
+    and no comment in this tree.
+    """
+    absent = [clade for clade in tree.find_clades() if clade.branch_length is None]
+    if not absent:
+        return _biopython_newick(tree)
+
+    sentinel = _absent_length_sentinel(tree)
+    token = ":" + (NEWICK_BRANCH_LENGTH_FORMAT % sentinel)
+    for clade in absent:
+        clade.branch_length = sentinel
+    try:
+        text = _biopython_newick(tree)
+    finally:
+        # The caller's tree object must come back exactly as it was handed over.
+        for clade in absent:
+            clade.branch_length = None
+    return text.replace(token, "")
+
+
+def _biopython_newick(tree) -> str:
+    handle = StringIO()
+    Phylo.write(
+        tree, handle, "newick",
+        format_branch_length=NEWICK_BRANCH_LENGTH_FORMAT,
+    )
+    return handle.getvalue().strip()
+
+
 def tree_to_newick_string(tree) -> str:
     """Return the tree as a Newick string at full branch-length precision."""
     for clade in tree.get_nonterminals():
@@ -71,12 +161,7 @@ def tree_to_newick_string(tree) -> str:
                 "Cannot serialize an internal node carrying both a name and a "
                 "confidence value"
             )
-    handle = StringIO()
-    Phylo.write(
-        tree, handle, "newick",
-        format_branch_length=NEWICK_BRANCH_LENGTH_FORMAT,
-    )
-    return handle.getvalue().strip()
+    return _render_newick(tree)
 
 
 def _terminal_labels(tree) -> list:
@@ -171,6 +256,11 @@ def write_tree_file(tree, path, fmt: str = "newick") -> None:
     """
     if fmt == "nexus":
         write_nexus_tree(tree, path)
+        return
+    if fmt == "newick":
+        # Through the shared renderer, so a file on disk and a string in memory
+        # agree about clades that carry no branch length.
+        Path(path).write_text(_render_newick(tree) + "\n", encoding="utf-8")
         return
     Phylo.write(
         tree, str(path), fmt,

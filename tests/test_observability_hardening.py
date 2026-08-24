@@ -18,11 +18,22 @@ from unittest.mock import Mock, patch
 
 import pytest
 
-# create_app() refuses the unconfigured SQLite fallback so a production script
-# cannot silently query a stale local app.db; opt in explicitly for these tests.
-os.environ.setdefault("ALLOW_SQLITE_FALLBACK", "1")
-
 REPO_ROOT = Path(__file__).resolve().parents[1]
+
+
+@pytest.fixture(autouse=True)
+def allow_sqlite_fallback():
+    """Opt into the SQLite fallback for this module only.
+
+    create_app() refuses the unconfigured fallback so a production script cannot
+    silently query a stale local app.db. This used to be set on os.environ at
+    import time and never removed: pytest collects every module into one
+    process, so the opt-in leaked into every module imported after this one, and
+    a test elsewhere asserting that create_app() *refuses* the fallback would
+    have passed for the wrong reason.
+    """
+    with patch.dict(os.environ, {"ALLOW_SQLITE_FALLBACK": "1"}):
+        yield
 
 
 def _digest_module():
@@ -597,6 +608,36 @@ def test_enqueue_job_preserves_queue_selection_ids_and_timeouts():
     assert kwargs["job_id"] == "abc"
     assert kwargs["meta"] == {"steps": {}}
     assert kwargs["job_timeout"].endswith("s")
+
+
+@pytest.mark.parametrize(
+    ("tree_method", "tree_hours"),
+    [("raxml", 15), ("iqtree", 14), ("mrbayes", 13), ("fasttree", 6)],
+)
+def test_job_timeout_allows_pipeline_stages_before_tree_builder(tree_method, tree_hours):
+    from app.config import Config
+    from app.workers.queue import resolve_job_timeout
+
+    limits = {
+        "RAXML_TIME_LIMIT_HOURS": 15,
+        "IQTREE_TIME_LIMIT_HOURS": 14,
+        "MRBAYES_TIME_LIMIT_HOURS": 13,
+        "FASTTREE_TIME_LIMIT_HOURS": 6,
+    }
+    with patch.object(Config, "GENERAL_JOB_TIME_LIMIT_HOURS", 8), patch.multiple(
+        Config, **limits
+    ):
+        timeout = resolve_job_timeout({"tree_method": tree_method})
+
+    assert timeout == f"{int((8 + tree_hours) * 3600) + 600}s"
+
+
+def test_job_timeout_uses_general_allowance_without_a_limited_tree_builder():
+    from app.config import Config
+    from app.workers.queue import resolve_job_timeout
+
+    with patch.object(Config, "GENERAL_JOB_TIME_LIMIT_HOURS", 8):
+        assert resolve_job_timeout({"tree_method": "nj"}) == "29400s"
 
 
 # ---------------------------------------------------------------------------

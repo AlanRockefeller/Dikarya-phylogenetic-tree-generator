@@ -1,6 +1,8 @@
 """Regression coverage for the review fixes around artifacts and tree state."""
 
+import fcntl
 import gzip
+import inspect
 import threading
 from unittest.mock import patch
 
@@ -20,6 +22,18 @@ from app.services.tree_edit_service import (
     tree_state_lock,
     validate_tip_rename,
 )
+
+
+
+def _undecorated(view):
+    """The view function itself, with every decorator layer removed.
+
+    Reaching for .__wrapped__ once only steps past the outermost decorator. The
+    endpoint carries @limiter.limit today; the day it also carries an auth or
+    validation decorator, a single-layer unwrap would silently start testing
+    that decorator instead of the handler.
+    """
+    return inspect.unwrap(view)
 
 
 JOB_ID = "12345678-1234-1234-1234-123456789abc"
@@ -117,7 +131,7 @@ def test_mutated_recompute_request_conflicts_with_active_generation(tmp_path, pa
         patch.object(routes, "enqueue_recompute_job", return_value=(JOB_ID, False)),
         patch.object(routes, "url_for", return_value=f"/job/{JOB_ID}"),
     ):
-        response, status = routes.recompute_tree_job.__wrapped__(JOB_ID)
+        response, status = _undecorated(routes.recompute_tree_job)(JOB_ID)
 
     body = response.get_json()
     assert status == 409
@@ -138,7 +152,7 @@ def test_unchanged_duplicate_recompute_remains_idempotent(tmp_path):
         patch.object(routes, "enqueue_recompute_job", return_value=(JOB_ID, False)),
         patch.object(routes, "url_for", return_value=f"/job/{JOB_ID}"),
     ):
-        response, status = routes.recompute_tree_job.__wrapped__(JOB_ID)
+        response, status = _undecorated(routes.recompute_tree_job)(JOB_ID)
 
     assert status == 202
     assert response.get_json()["status"] == "already_queued"
@@ -164,7 +178,7 @@ def test_recompute_rejects_invalid_iqtree_ufboot_before_enqueue(
         patch.object(routes, "check_job_access", return_value=(None, None, 200)),
         patch.object(routes, "enqueue_recompute_job") as enqueue,
     ):
-        response, status = routes.recompute_tree_job.__wrapped__(JOB_ID)
+        response, status = _undecorated(routes.recompute_tree_job)(JOB_ID)
 
     assert status == 400
     assert message in response.get_json()["error"]
@@ -231,48 +245,103 @@ def test_v1_nexus_prefers_pruned_tree_and_falls_back_to_original(tmp_path):
         assert listed["tree.nexus"]["size_bytes"] == len("edited")
 
 
-def test_tree_state_lock_preserves_annotation_and_tree_edits(tmp_path):
-    """A second writer must load only after the first writer has committed."""
+def test_tree_state_lock_blocks_a_second_writer_until_the_first_commits(tmp_path):
+    """Writer B must not run the protected body while writer A holds the lock.
+
+    The proof does not depend on scheduling. tree_state_lock() serializes with
+    fcntl.flock(LOCK_EX), so this patches flock itself and lets B announce its
+    arrival *from inside the blocking call*. "B is waiting for the lock" is then
+    an observed fact rather than something inferred from a sleep, and the two
+    ways the lock can be broken both fail deterministically:
+
+      * replaced by a no-op context manager -- flock is never called, B never
+        announces, and A's bounded wait fails with a specific message;
+      * acquired non-exclusively -- B enters the body while A holds the lock,
+        and the ordering assertion fails.
+
+    Every wait is bounded and every thread exception is surfaced, so a failure
+    reports rather than hanging.
+    """
     job_dir = tmp_path / JOB_ID
     job_dir.mkdir()
     save_tree_state(job_dir, _annotation_state())
 
-    first_has_lock = threading.Event()
-    second_attempting = threading.Event()
+    first_holds_lock = threading.Event()
+    second_reached_lock = threading.Event()
+    second_entered_body = threading.Event()
+    first_released = threading.Event()
     errors = []
+    order = []
+    threads = {}
+
+    real_flock = fcntl.flock
+
+    def instrumented_flock(handle, operation):
+        if operation == fcntl.LOCK_EX and threading.current_thread() is threads.get("second"):
+            second_reached_lock.set()
+        return real_flock(handle, operation)
 
     def rename_writer():
         try:
             with tree_state_lock(job_dir):
                 state = load_tree_state(job_dir)
-                first_has_lock.set()
-                assert second_attempting.wait(timeout=2)
+                first_holds_lock.set()
+                assert second_reached_lock.wait(timeout=10), (
+                    "the second writer never reached fcntl.flock -- "
+                    "tree_state_lock() is not taking the lock at all"
+                )
+                # B is inside an exclusive acquire that this thread owns, so it
+                # cannot be running the body. This is guaranteed by flock, not
+                # by how long anything slept.
+                assert not second_entered_body.is_set(), (
+                    "the second writer entered the critical section while the "
+                    "first still held the lock"
+                )
                 state["renames"]["A"] = "Alpha"
                 save_tree_state(job_dir, state)
+                order.append("first-committed")
+            first_released.set()
         except BaseException as exc:  # surface thread failures in the test
             errors.append(exc)
+            # Never leave the other thread waiting on an event this one owns.
+            first_holds_lock.set()
+            first_released.set()
 
     def annotation_writer():
         try:
-            assert first_has_lock.wait(timeout=2)
-            second_attempting.set()
+            assert first_holds_lock.wait(timeout=10)
             with tree_state_lock(job_dir):
+                second_entered_body.set()
+                order.append("second-entered")
+                # A released the lock only after committing, so its rename is
+                # already on disk. Reading anything else means B loaded a stale
+                # snapshot and is about to save over an edit it never saw.
                 state = load_tree_state(job_dir)
+                assert state["renames"] == {"A": "Alpha"}
                 state[CLADE_ANNOTATIONS_KEY][0]["label"] = "Updated"
                 save_tree_state(job_dir, state)
         except BaseException as exc:  # surface thread failures in the test
             errors.append(exc)
+            second_reached_lock.set()
 
-    first = threading.Thread(target=rename_writer)
-    second = threading.Thread(target=annotation_writer)
-    first.start()
-    second.start()
-    first.join(timeout=3)
-    second.join(timeout=3)
+    first = threading.Thread(target=rename_writer, name="rename_writer")
+    second = threading.Thread(target=annotation_writer, name="annotation_writer")
+    threads["first"], threads["second"] = first, second
 
-    assert not first.is_alive()
-    assert not second.is_alive()
-    assert not errors
+    with patch("fcntl.flock", instrumented_flock):
+        first.start()
+        second.start()
+        first.join(timeout=20)
+        second.join(timeout=20)
+
+    assert not first.is_alive(), "the first writer did not finish"
+    assert not second.is_alive(), "the second writer did not finish"
+    assert not errors, errors
+    assert order == ["first-committed", "second-entered"], (
+        f"the writers were not serialized: {order}"
+    )
+
+    # Both edits survive: neither writer clobbered the other's field.
     state = load_tree_state(job_dir)
     assert state["renames"] == {"A": "Alpha"}
     assert state[CLADE_ANNOTATIONS_KEY][0]["label"] == "Updated"

@@ -1,7 +1,7 @@
 /* Minimal site styling */
 
 body {
-  font-family: system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif;
+  font-family: system-ui, -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
   margin: 0;
   padding: 0;
   line-height: 1.4;
@@ -40,3 +40,18 @@ main {
 .flash-info    { border-color: #0277bd; background: #e1f5fe; }
 .flash-warning { border-color: #f9a825; background: #fff8e1; }
 .flash-danger  { border-color: #c62828; background: #ffebee; }
+
+.actions .action-button {
+  display: inline-block;
+  padding: 0.4rem 0.9rem;
+  margin-right: 0.5rem;
+  border: 1px solid #888;
+  border-radius: 4px;
+  text-decoration: none;
+  color: inherit;
+}
+
+.actions .action-button:hover,
+.actions .action-button:focus {
+  background: #eee;
+}

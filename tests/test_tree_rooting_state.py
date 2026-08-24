@@ -285,8 +285,12 @@ class TestPruneFocalNeedsFlag(unittest.TestCase):
             job_dir = Path(d)
             _write_job_tree(job_dir, self.NEWICK)
             tj = {"sequence_of_interest": "A", "root_mode": root_mode}
-            prune_taxa(job_dir, tj, ["A"])
-            return tj
+            # Assert on what prune_taxa returns, not on the dict handed to it.
+            # tests/test_clade_annotations.py already uses the return value, and
+            # two conventions for one function cannot both stay correct: the day
+            # prune_taxa stops mutating in place, this helper would read a stale
+            # dictionary and the tests below would quietly stop testing anything.
+            return prune_taxa(job_dir, tj, ["A"])
 
     def test_prune_focal_in_midpoint_mode_does_not_prompt(self):
         tj = self._prune_focal("midpoint")

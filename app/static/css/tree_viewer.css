@@ -109,29 +109,6 @@
 }
 
 
-
-/* Also support explicit dark class on container or parent */
-/* Also support explicit dark class on container or parent */
-.dark #tree-container .node text,
-.dark #tree-container .phylotree-node-text,
-.dark #tree-container text.phylotree-node-text {
-    fill: #ffffff !important;
-}
-
-.dark #tree-container .tree-scale-bar text {
-    fill: #ffffff !important;
-}
-
-.dark #tree-container .tree-scale-bar line,
-.dark #tree-container .tree-scale-bar path {
-    stroke: #ffffff !important;
-}
-
-.dark #tree-container .branch {
-    stroke: #ccc !important;
-    /* Brighter for dark mode */
-}
-
 /* Layered clade annotations.
    Drawn inside the tree SVG (g.clade-annotations) so they export with the figure.
    Colors and fonts come from the saved per-annotation/per-layer style as inline

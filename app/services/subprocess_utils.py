@@ -1,6 +1,7 @@
 import subprocess
 import logging
 import os
+import re
 import shutil
 from pathlib import Path
 from typing import List, Optional, Tuple
@@ -105,6 +106,72 @@ EXIT_CODE_TOOL_NOT_FOUND = -127
 # which read as a tool crash rather than "this took too long".
 EXIT_CODE_JOB_TIMEOUT = -128
 
+# Returned when the runner itself fails before it can report a real child
+# status. Keep this outside Python's negative-signal return-code range so an
+# internal exception can never be mistaken for (for example) SIGHUP/-1.
+EXIT_CODE_RUNNER_ERROR = -129
+
+
+def _failure_kind(exit_code: int) -> str:
+    """Classify the subprocess outcome without guessing beyond its exit status."""
+    if exit_code == EXIT_CODE_JOB_TIMEOUT:
+        return "timeout"
+    if exit_code == EXIT_CODE_TOOL_NOT_FOUND:
+        return "launch_failure"
+    if exit_code == EXIT_CODE_RUNNER_ERROR:
+        return "runner_error"
+    if exit_code == -24:
+        return "cpu_limit"
+    if exit_code == -15:
+        return "interrupted"
+    if exit_code == -9:
+        return "forced_kill"
+    if exit_code < 0:
+        return "signal"
+    return "nonzero_exit"
+
+
+_LONG_IUPAC_RUN_RE = re.compile(r"[ACGTURYSWKMBDHVN]{40,}", re.IGNORECASE)
+
+
+def _bounded_diagnostic_tail(lines) -> list[str]:
+    """Keep a small operator diagnostic while excluding FASTA-like payloads."""
+    bounded = []
+    sequence_chars = frozenset("ACGTURYSWKMBDHVNacgturyswkmbdhvn-.?~*")
+    for raw_line in list(lines or [])[-30:]:
+        line = str(raw_line).strip()
+        compact = "".join(line.split())
+        if line.startswith(">") or (
+            len(compact) >= 40 and set(compact) <= sequence_chars
+        ):
+            line = "[sequence output omitted]"
+        else:
+            line = _LONG_IUPAC_RUN_RE.sub("[sequence output omitted]", line)
+        bounded.append(line[:500])
+    return bounded
+
+
+class ToolExecutionError(RuntimeError):
+    """A user-safe tool failure carrying bounded internal process diagnostics."""
+
+    def __init__(self, tool: str, exit_code: int, stats: Optional[dict], message: str):
+        super().__init__(message)
+        source = stats or {}
+        self.tool = tool
+        self.exit_code = exit_code
+        self.failure_kind = _failure_kind(exit_code)
+        signal_number = -exit_code if -127 < exit_code < 0 else None
+        self.stats = {
+            "exit_code": exit_code,
+            "failure_kind": self.failure_kind,
+            "signal": signal_number,
+            "duration_seconds": source.get("duration_seconds"),
+            "stdout_lines": source.get("stdout_lines"),
+            "stderr_lines": source.get("stderr_lines"),
+            "stdout_tail": _bounded_diagnostic_tail(source.get("stdout_tail")),
+            "stderr_tail": _bounded_diagnostic_tail(source.get("stderr_tail")),
+        }
+
 
 # Shared wall-clock budgets for every external phylogenetics executable. Keep
 # the environment/config naming in one place so a new call site cannot invent a
@@ -173,6 +240,12 @@ def tool_failure_message(tool_label: str, exit_code: int,
             f"{tool_label} was still running when this job's {limit}time limit "
             f"was reached, so it was stopped. Try a faster preset, fewer "
             f"bootstrap replicates, or fewer sequences." + contact
+        )
+    if exit_code == EXIT_CODE_RUNNER_ERROR:
+        return (
+            f"{tool_label} could not be monitored because of an internal server "
+            f"error. This is a server problem, not a problem with your sequences."
+            + contact
         )
     if exit_code == -24:
         return (
@@ -276,7 +349,7 @@ def run_command(args: List[str], cwd: Optional[Path] = None, log_file: Optional[
         
         # Ensure cwd exists if provided
         if cwd and not cwd.exists():
-            return -1, "", f"Working directory does not exist: {cwd}"
+            return EXIT_CODE_RUNNER_ERROR, "", f"Working directory does not exist: {cwd}"
 
         command_args, limiter_used = _build_limited_argv(args)
         result = subprocess.run(
@@ -324,7 +397,7 @@ def run_command(args: List[str], cwd: Optional[Path] = None, log_file: Optional[
 
     except Exception as e:
         logger.exception(f"Exception running command: {args}")
-        return -1, "", str(e)
+        return EXIT_CODE_RUNNER_ERROR, "", str(e)
 
 
 def run_command_streaming(
@@ -406,7 +479,7 @@ def run_command_streaming(
         # Ensure cwd exists
         if cwd and not cwd.exists():
             stats["stderr_tail"] = [f"Working directory does not exist: {cwd}"]
-            return -1, stats
+            return EXIT_CODE_RUNNER_ERROR, stats
         
         # Open stdout file if specified
         stdout_file = None
@@ -431,6 +504,7 @@ def run_command_streaming(
                 command_args,
                 cwd=cwd,
                 env=env,
+                stdin=subprocess.DEVNULL,
                 stdout=subprocess.PIPE if not stdout_file else stdout_file,
                 stderr=subprocess.PIPE,
                 text=True,
@@ -582,4 +656,4 @@ def run_command_streaming(
         stats["stderr_tail"] = list(stderr_tail_buffer)
         stats["stdout_tail"] = list(stdout_tail_buffer)
         stats["stderr_tail"].append(f"[ERROR] {str(e)}")
-        return -1, stats
+        return EXIT_CODE_RUNNER_ERROR, stats

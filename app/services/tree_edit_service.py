@@ -36,7 +36,20 @@ _tree_state_lock_context = threading.local()
 MAX_SEQUENCE_OF_INTEREST_LENGTH = 1000
 MAX_SEQUENCE_OF_INTEREST_SOURCE_LENGTH = 64
 MAX_TREE_TIP_NAME_LENGTH = 256
-NEWICK_UNSAFE_TIP_CHARS = frozenset("()[];,:'\"")
+# Structural Newick punctuation, rejected in *new* tip names so a rename cannot
+# produce a tree file no parser will read.
+#
+# Alan 8/24/26 - Quote characters used to be in here too, which rejected the
+# apostrophes that provisional fungal names are full of ("Cortinarius sp.
+# 'olivaceofuscus'"). Nothing downstream needed that ban: renames live in
+# tree_state.json and are applied client-side by applyRenames() in
+# tree_viewer_phylotree_v2.js AFTER the Newick is parsed, so a rename value never
+# becomes Newick syntax at all -- the tree files on disk carry the original
+# names. Even on the paths that do write a label, quote_tree_label() wraps
+# anything non-alphanumeric in '...' and doubles an interior apostrophe, so both
+# quote characters were already safe. The structural characters below stay
+# banned: they are legible-looking but genuinely ambiguous in a tip label.
+NEWICK_UNSAFE_TIP_CHARS = frozenset("()[];,:")
 
 
 # Both writers live in tree_io so the tree builders can share them without
@@ -305,7 +318,7 @@ def validate_tip_rename(old_name: Any, new_name: Any) -> Tuple[str, str]:
         raise ValueError(
             f"`new_name` contains characters that are invalid in Newick tip "
             f"names: {bad}. Avoid parentheses, brackets, commas, colons, "
-            f"semicolons, and quotes."
+            f"and semicolons."
         )
     return old_name, new_name
 

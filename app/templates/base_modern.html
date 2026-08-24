@@ -439,29 +439,40 @@
         // =========================================================================
         let statusTimeout = null;
 
-        function showStatus(message, type = 'info') {
+        // Alan 8/23/26 - Callers across the tree viewer and alignment viewer already
+        // pass 'warning' and 'danger' plus an explicit duration. Both were being
+        // ignored, so a failed alignment load or a refused tree edit rendered as an
+        // ordinary blue informational toast for a fixed five seconds.
+        const STATUS_VARIANT_CLASSES = {
+            success: ['bg-green-500', 'text-white'],
+            error: ['bg-red-500', 'text-white'],
+            danger: ['bg-red-500', 'text-white'],
+            warning: ['bg-amber-500', 'text-white'],
+            info: ['bg-blue-500', 'text-white'],
+        };
+
+        function showStatus(message, type = 'info', durationMs = 5000) {
             const statusAlert = document.getElementById('status_alert');
 
             if (statusTimeout) {
                 clearTimeout(statusTimeout);
+                statusTimeout = null;
             }
 
             statusAlert.className = 'fixed bottom-6 left-1/2 transform -translate-x-1/2 px-6 py-4 rounded-xl shadow-2xl font-medium text-sm transition-all duration-300 z-50';
-
-            if (type === 'success') {
-                statusAlert.classList.add('bg-green-500', 'text-white');
-            } else if (type === 'error') {
-                statusAlert.classList.add('bg-red-500', 'text-white');
-            } else {
-                statusAlert.classList.add('bg-blue-500', 'text-white');
-            }
+            statusAlert.classList.add(...(STATUS_VARIANT_CLASSES[type] || STATUS_VARIANT_CLASSES.info));
 
             statusAlert.textContent = message;
             statusAlert.classList.remove('opacity-0', 'translate-y-4', 'pointer-events-none');
 
-            statusTimeout = setTimeout(() => {
-                statusAlert.classList.add('opacity-0', 'translate-y-4', 'pointer-events-none');
-            }, 5000);
+            // Alan 8/23/26 - A non-positive or non-finite duration leaves the message up
+            // until the next showStatus() call.
+            const ms = Number(durationMs);
+            if (Number.isFinite(ms) && ms > 0) {
+                statusTimeout = setTimeout(() => {
+                    statusAlert.classList.add('opacity-0', 'translate-y-4', 'pointer-events-none');
+                }, ms);
+            }
         }
     </script>
 

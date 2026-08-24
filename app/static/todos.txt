@@ -1,6 +1,6 @@
 Alan: Have the option to add type sequences to the BLAST results / FASTA files that users upload.
-Alan: Import sequences from a list of Genbank accessions, for recreating trees from papers.
-Alan: Implement adjusted identity from https//github.com/joshuaowalker/adjusted-identity
+[DONE] Alan: Import sequences from a list of Genbank accessions, for recreating trees from papers.
+Alan: Implement adjusted identity from https://github.com/joshuaowalker/adjusted-identity
 Alan: Make it easy to embed tree in iNaturalist observation
 Mathias Rocheleau-Duplain: The phylotree viewer shows some responsiveness issues during user interaction.Clicking on the black screen causes flickering effects.I suggest optimizing the UX for smoother user experience.
 Alan: Add ability to make trees with adjusted identity
@@ -10,5 +10,5 @@ Alan: Highlighting makes text bold instead of just changing color - harder to re
 Alan: Add date submitted to todo list
 Alan: Allow anonymous users to have a list of previous jobs too
 Ian: Could we possibly have an export of an SVG file option?
-Ian: Error when uploading fasta file. When I upload a fasta file it says click add to add to quque, but I'm not sure where this button is.
+Ian: Error when uploading fasta file. When I upload a fasta file it says click add to add to queue, but I'm not sure where this button is.
 Alan: Remove off-target sequences from trees by default when using mycomap source

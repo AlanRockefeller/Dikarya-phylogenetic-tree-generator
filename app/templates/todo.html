@@ -114,6 +114,7 @@
                 </h3>
 
                 <form action="{{ url_for('main.todo') }}" method="post" class="space-y-4">
+                    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
                     <div>
                         <label for="name" class="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">Your
                             Name</label>

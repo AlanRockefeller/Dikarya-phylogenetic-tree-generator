@@ -340,6 +340,19 @@ def parse_fasta_records(fasta_text: str) -> list[tuple[str, str]]:
 
     return records
 
+def read_fasta_records(path) -> list[tuple[str, str]]:
+    """Parse a FASTA file on disk into ``(header, sequence)`` pairs, in file order.
+
+    The single on-disk entry point, so trimming, ITS extraction and anything
+    added later cannot drift into slightly different sequence semantics. Reads
+    through artifact_storage, so a cold artifact stored as ``foo.fasta.gz`` is
+    handled identically to a plain ``foo.fasta`` (the plain file always wins).
+    """
+    from app.services.artifact_storage import read_artifact_text
+
+    return parse_fasta_records(read_artifact_text(path))
+
+
 def validate_dna_fasta(fasta_text: str) -> int:
     """Validate FASTA structure and DNA symbols, returning the record count."""
     records = parse_fasta_records(fasta_text)
