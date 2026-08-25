@@ -8797,15 +8797,44 @@
 
     if (!annotator) annotator = d => '';
 
+    let element_array = [];
+    const export_root = root || this.nodes;
+
+    // Alan 8/25/26 - Index visible terminal taxa once for this serialization.
+    // nodeDisplay consults the same local cache for both its node guard and its
+    // child filter, avoiding repeated walks down ladderized subtrees. Build the
+    // index from export_root (rather than the whole tree) so subtree exports
+    // have the same visibility semantics and linear cost within that subtree.
+    const visible_tip_by_node = new Map();
+    const visibility_stack = export_root ? [[export_root, false]] : [];
+
+    while (visibility_stack.length) {
+      const [node, children_indexed] = visibility_stack.pop();
+
+      if (children_indexed) {
+        visible_tip_by_node.set(
+          node,
+          node.children.some(child => visible_tip_by_node.get(child) === true)
+        );
+      } else if (node.notshown) {
+        visible_tip_by_node.set(node, false);
+      } else if (isLeafNode(node)) {
+        visible_tip_by_node.set(node, true);
+      } else {
+        visibility_stack.push([node, true]);
+        for (let i = node.children.length - 1; i >= 0; i--) {
+          visibility_stack.push([node.children[i], false]);
+        }
+      }
+    }
+
     // Alan 8/24/26 - Does this subtree still contain a visible terminal taxon?
     // A tip is visible unless it is hidden; an internal node is visible only
     // while something below it is, so filtering every tip out of a clade
     // removes the clade rather than turning its internal label - often a
     // support value, not a taxon name - into a terminal.
     function hasVisibleTip(n) {
-      if (n.notshown) return false;
-      if (isLeafNode(n)) return true;
-      return n.children.some(hasVisibleTip);
+      return visible_tip_by_node.get(n) === true;
     }
 
     function nodeDisplay(n) {
@@ -8850,9 +8879,6 @@
       }
     }
 
-    let element_array = [];
-    annotator = annotator || "";
-    const export_root = root || this.nodes;
     if (!export_root || !hasVisibleTip(export_root)) {
       throw new Error("No visible sequences remain to export.");
     }

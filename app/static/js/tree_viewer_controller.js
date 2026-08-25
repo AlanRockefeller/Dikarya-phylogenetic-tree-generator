@@ -643,6 +643,14 @@ document.addEventListener('DOMContentLoaded', async () => {
         return names;
     }
 
+    // Alan 8/25/26 - Is this node a terminal sequence rather than a clade? Uses the same
+    // children test the surrounding helpers already apply inline, so the answer never
+    // disagrees with getDescendantTipNames or getPruneTargetForNode.
+    function isTipNode(node) {
+        const children = node?.children || node?.data?.children || [];
+        return !children || children.length === 0;
+    }
+
     // Alan 6/4/26 - Resolve a right-clicked node into the backend prune target for leaves or internal subtrees.
     function getPruneTargetForNode(node) {
         const data = node?.data || node || {};
@@ -2000,13 +2008,26 @@ document.addEventListener('DOMContentLoaded', async () => {
     // Alan 5/11/26 - Open a modal for renaming the current visible clicked selections only.
     function openRenameModal(nodes) {
         if (!renameModal || !renameModalRows || !Array.isArray(nodes) || nodes.length === 0) return;
-        pendingRenameItems = nodes.map((node, index) => {
+        // Alan 8/25/26 - Rename tips only. getSelectedNodes() traverses the whole tree, so a
+        // selected clade arrived here as an internal node whose data.name is its RENDERED
+        // SUPPORT LABEL, offering a rename row called "0.85". Accepting it was worse than
+        // cosmetic: rename_tip() keys the flat `renames` dict by name, and
+        // apply_state_to_structure() applies that entry to EVERY node whose original_name
+        // matches, so renaming one clade would relabel every other clade sharing its support
+        // value -- and persist that in tree_state.json.
+        const tipNodes = nodes.filter(isTipNode);
+        pendingRenameItems = tipNodes.map((node, index) => {
             const data = node?.data || node || {};
             const originalName = data.__original_name || data.original_name || data.name || node?.name || "";
             const displayName = data.name || data.display_name || originalName;
             return { index, originalName, displayName };
         }).filter(item => item.originalName);
-        if (pendingRenameItems.length === 0) return;
+        // Alan 8/25/26 - Say why nothing opened when the selection was all clades, rather
+        // than having the Rename button appear inert.
+        if (pendingRenameItems.length === 0) {
+            if (nodes.length) showStatus("Rename applies to sequences; select at least one tip.", "warning", 3000);
+            return;
+        }
 
         renameModalRows.innerHTML = "";
         pendingRenameItems.forEach(item => {
@@ -3476,13 +3497,30 @@ document.addEventListener('DOMContentLoaded', async () => {
             const nodes = viewer.getSelectedNodes();
             if (nodes.length === 0) return;
 
-            const names = nodes.map(n => n.data.__original_name || n.data.name);
-            const displayNames = nodes.map(n => n.data.name).join(", ");
-            // No confirmation requested
+            // Alan 8/25/26 - Resolve every selection through getPruneTargetForNode instead of
+            // reading data.name directly. getSelectedNodes() traverses the whole tree, so a
+            // selected clade arrives here as an internal node whose data.name is its RENDERED
+            // SUPPORT LABEL ("0.85"). Support lives in confidence rather than name, so the
+            // backend could never match it: the clade silently survived while the user was
+            // told a node "was not found in the tree". Internal nodes now become the same
+            // stable descendant-tip ID the context-menu prune has always sent.
+            const targets = Array.from(new Set(nodes.map(getPruneTargetForNode).filter(Boolean)));
+            // Alan 8/25/26 - Mirror the context-menu guard for selections with no stable ID.
+            if (!targets.length) {
+                showStatus("Can't prune: no stable node ID.", "warning", 2500);
+                return;
+            }
+            // Alan 8/25/26 - Clean selection colors off the pruned clades' descendant tips too,
+            // not just the targets, so a pruned clade leaves no colored orphans behind.
+            const descendantTips = nodes.reduce((names, node) => names.concat(getDescendantTipNames(node)), []);
+            const cleanupNames = Array.from(new Set([...targets, ...descendantTips]));
+            // Alan 8/25/26 - Count terminal sequences, matching the context menu. The old
+            // nodes.length undercounted a clade selection as a single node.
+            const sequenceCount = new Set(descendantTips).size || nodes.length;
 
-            runBackendAction(`Pruning ${nodes.length} nodes`, async () => {
+            runBackendAction(`Pruning ${sequenceCount} node${sequenceCount === 1 ? '' : 's'}`, async () => {
                 // Alan 5/12/26 - Prune selected names without clearing unrelated selection-set colors.
-                await pruneTaxaPreservingSelectionColors(names);
+                await pruneTaxaPreservingSelectionColors(targets, cleanupNames);
             // Alan 5/12/26 - Selection-set cleanup is handled inside pruneTaxaPreservingSelectionColors.
             }, { clearSelections: false });
         });
