@@ -155,6 +155,66 @@ iNaturalist/Mushroom Observer source-tip highlighters follow the same pattern:
 the remote lookup happens first, the state is read and written under the lock
 afterwards.
 
+## Single-level undo of a tree edit (`tree_undo_service.py`)
+
+The viewer's **Undo** button and Ctrl/Cmd+Z take back the last change. There are
+two kinds, sharing one visible slot in the toolbar:
+
+**Viewer-only.** Collapsing and expanding clades is phylotree's transient
+`node.collapsed` and nothing else. `tree_viewer_phylotree_v2.js` keeps a
+one-entry record of the clades a collapse/expand changed and restores it
+locally. Nothing reaches the server, and collapse is deliberately **not**
+persisted — a reload shows the whole tree again.
+
+**Persisted.** Prune, rename, rotate and every rooting change are undone by
+restoring a file snapshot taken immediately before them. Those operations write
+exactly three files:
+
+```
+tree_state.json
+tree/tree_pruned.newick
+tree/tree_pruned.nexus
+```
+
+and everything the viewer shows — topology, pruned membership, renames, rooting,
+selection colours, annotations — is derived from them, including the Edited FASTA
+download, which `build_edited_fasta_text()` generates on demand from the ORIGINAL
+input plus `tree_state.json`. Copying those three files back therefore restores
+the whole visible state, and cannot get a branch length wrong the way inverting a
+prune (whose unifurcations were spliced out by `_collapse_unifurcations()`) would.
+
+**If you add a file that a tree edit writes, add it to `SNAPSHOT_PATHS`.** An
+edit that writes a fourth file would otherwise be half-undone, which is worse
+than not being undoable at all. `tests/test_tree_undo.py` pins the list.
+
+Rules the implementation depends on:
+
+- The checkpoint is captured **after** `load_tree_state()` (which may initialize
+  and midpoint-root a job that has none yet) and **before** the mutation, and it
+  only replaces the previous checkpoint if the mutation succeeded and the handler
+  called `checkpoint.commit()`. A failed or no-op edit leaves the earlier, still
+  useful checkpoint alone.
+- Undo restores the whole snapshot, so any operation that writes tree state and is
+  *not* undoable must call `clear_undo_checkpoint()` rather than let a later Undo
+  silently revert it. Annotations, the MycoMap label refresh, the focal sequence,
+  every `/api/v1` tree mutation and recompute all do.
+  `/tree/selection_sets` deliberately does not: the viewer saves selections
+  automatically right after every prune, so clearing there would disable Undo the
+  instant it became useful.
+- Recompute is never undoable. It clears the checkpoint when a run is created and
+  again in `commit_recompute_tree_state()`, because the new topology is no longer
+  the tree the snapshot describes.
+- `GET /api/job/<id>/tree/undo` reports `available` (a checkpoint exists) and
+  `can_undo` (this caller may apply it) separately, so a read-only visitor is
+  never shown an Undo that promises a persisted edit they cannot make. `POST` is
+  `mode="edit"`, i.e. the same ownership check as prune.
+- One checkpoint per job, consumed on use, expired after seven days on the next
+  read. There is no redo.
+
+The Rename modal posts every changed name in **one** request (`{"renames": {...}}`)
+for this reason: one request per name would put the checkpoint between the
+renames, so undoing "Rename 3 sequences" would give back one of them.
+
 ## Claude Review of a Finished Tree
 
 `app/services/tree_analysis_service.py` backs the tree viewer's **Analyze with

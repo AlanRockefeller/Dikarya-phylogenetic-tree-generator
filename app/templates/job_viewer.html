@@ -126,7 +126,7 @@
                         id="btn-toggle-support" title="Toggle Support Values">Hide Node Support</button>
                     <button type="button"
                         class="px-3 py-2 text-sm font-medium text-gray-700 dark:text-gray-200 bg-white dark:bg-journal-dark hover:bg-journal-gold hover:text-journal-dark transition-colors flex items-center gap-1.5 border-l border-gray-300 dark:border-journal-dark"
-                        id="btn-tree-shortcuts-help" title="View Tree Viewer Keyboard Shortcuts (?)">
+                        id="btn-tree-shortcuts-help" title="Shortcuts, and how Collapse, Prune, Recompute and Undo differ (?)">
                         <i class="fas fa-keyboard"></i> Keyboard Shortcuts
                     </button>
                 </div>
@@ -520,6 +520,17 @@
                 id="btn-midpoint">
                 <i class="fa fa-balance-scale"></i> Midpoint
             </button>
+            <!-- Alan 8/24/26 - Single-level undo. Rendered in view-only mode too, because
+                 collapsing a clade is a viewer-only display change that read-only visitors
+                 may make and therefore may also take back; the button stays disabled unless
+                 something is actually undoable. -->
+            <button type="button"
+                class="px-4 py-2 text-sm font-semibold rounded-lg bg-slate-600 hover:bg-slate-700 text-white transition-colors shadow-sm flex items-center gap-2 disabled:opacity-50 disabled:cursor-not-allowed"
+                id="btn-undo"
+                title="Nothing to undo yet (Ctrl/Cmd+Z)"
+                disabled>
+                <i class="fa fa-rotate-left"></i> Undo
+            </button>
             <div class="flex items-center gap-1 px-2 py-1 rounded-lg bg-gray-100 dark:bg-journal-dark border border-gray-300 dark:border-gray-600"
                  title="Auto root chooses a useful display root for BLAST-result trees; it is not necessarily the true evolutionary root.">
                 <label for="rooting-mode-select" class="text-sm font-semibold text-gray-700 dark:text-gray-200">Root:</label>
@@ -642,10 +653,10 @@
     <div class="fixed inset-0 z-10 overflow-y-auto">
         <div class="flex min-h-full items-center justify-center p-4">
             <div
-                class="relative w-full max-w-md rounded-xl bg-white dark:bg-journal-green shadow-2xl border border-gray-200 dark:border-journal-dark overflow-hidden">
+                class="relative w-full max-w-2xl max-h-[85vh] overflow-y-auto rounded-xl bg-white dark:bg-journal-green shadow-2xl border border-gray-200 dark:border-journal-dark">
                 <div class="px-5 py-4 border-b border-gray-200 dark:border-journal-dark flex items-center justify-between">
                     <h3 id="tree-shortcuts-title" class="text-lg font-bold text-journal-dark dark:text-gray-100">
-                        Tree Viewer Keyboard Shortcuts
+                        Tree Viewer Shortcuts &amp; Editing Guide
                     </h3>
                     <button type="button" id="btn-tree-shortcuts-close"
                         class="p-2 rounded-lg text-gray-500 hover:text-gray-800 hover:bg-gray-100 dark:text-gray-300 dark:hover:text-white dark:hover:bg-journal-dark"
@@ -672,9 +683,63 @@
                     <dd>Save names in the Rename modal</dd>
                     <dt><kbd class="rounded border border-gray-300 bg-gray-100 px-2 py-0.5 font-mono dark:border-gray-600 dark:bg-journal-dark">Esc</kbd></dt>
                     <dd>Close or cancel the current mode</dd>
+                    <dt><kbd class="rounded border border-gray-300 bg-gray-100 px-2 py-0.5 font-mono dark:border-gray-600 dark:bg-journal-dark">Ctrl/Cmd + Z</kbd></dt>
+                    <dd>Undo the last tree edit or clade collapse (same as the <strong>Undo</strong> button; ignored while you are typing in a field)</dd>
                     <dt><kbd class="rounded border border-gray-300 bg-gray-100 px-2 py-0.5 font-mono dark:border-gray-600 dark:bg-journal-dark">?</kbd></dt>
                     <dd>Show this shortcut list</dd>
                 </dl>
+
+                <!-- Alan 8/24/26 - Collapse / Prune / Recompute get confused with one another
+                     constantly, and the difference is the difference between a redraw and a
+                     re-analysis. Explaining it here keeps one help surface instead of two. -->
+                <div class="border-t border-gray-200 dark:border-journal-dark px-5 py-4 space-y-4 text-sm text-gray-700 dark:text-gray-200">
+                    <div>
+                        <h4 class="font-semibold text-journal-dark dark:text-gray-100 mb-1">Collapse a clade</h4>
+                        <p>
+                            Right-click an internal branch or node and choose <strong>Collapse Clade</strong> to
+                            fold that clade into a single wedge. Collapsing is a display change only: it does
+                            <em>not</em> remove sequences, does <em>not</em> change the phylogeny, and does
+                            <em>not</em> recompute anything. Choose <strong>Expand Clade</strong> on the same
+                            node to unfold it again.
+                        </p>
+                        <p class="mt-1">
+                            Select two or more internal nodes (click their circles) and the menu also offers
+                            <strong>Collapse&nbsp;N&nbsp;Clades</strong> / <strong>Expand&nbsp;N&nbsp;Clades</strong>.
+                            If you select a clade and a clade nested inside it, only the outer one is collapsed —
+                            collapsing both would be the same single wedge. Collapsed clades are not saved:
+                            reloading the page shows the whole tree again.
+                        </p>
+                    </div>
+                    <div>
+                        <h4 class="font-semibold text-journal-dark dark:text-gray-100 mb-1">Prune</h4>
+                        <p>
+                            Pruning removes the selected sequences (or a whole clade) from the
+                            <strong>edited tree</strong> and from the Edited FASTA download. It does
+                            <em>not</em> re-infer the phylogeny: the remaining branches keep the lengths and
+                            support values they were given when the tree was built.
+                        </p>
+                    </div>
+                    <div>
+                        <h4 class="font-semibold text-journal-dark dark:text-gray-100 mb-1">Recompute</h4>
+                        <p>
+                            Recompute takes the sequences that are left and re-runs alignment, trimming and
+                            tree inference. Topology, branch lengths and support values may all change.
+                            Recompute cannot be undone.
+                        </p>
+                    </div>
+                    <div>
+                        <h4 class="font-semibold text-journal-dark dark:text-gray-100 mb-1">Undo</h4>
+                        <p>
+                            The <strong>Undo</strong> button (or <kbd class="rounded border border-gray-300 bg-gray-100 px-1.5 py-0.5 font-mono dark:border-gray-600 dark:bg-journal-dark">Ctrl/Cmd&nbsp;+&nbsp;Z</kbd>)
+                            takes back the most recent change: a collapse or expand, or the last prune,
+                            rename, rotation or rooting change. It is a single step, not a full history —
+                            after you undo, there is nothing further to undo, and there is no redo. The button
+                            is disabled and its tooltip says so whenever nothing can be undone. Starting a
+                            Recompute clears the undo point, because the new tree is no longer the tree the
+                            saved state describes.
+                        </p>
+                    </div>
+                </div>
             </div>
         </div>
     </div>
@@ -1336,13 +1401,13 @@
 
 <script src="{{ url_for('static', filename='vendor/underscore-1.13.6-min.js') }}"></script>
 
-<script src="{{ url_for('static', filename='js/phylotree.js') }}?v=9"></script>
+<script src="{{ url_for('static', filename='js/phylotree.js') }}?v=10"></script>
 
-<script src="{{ url_for('static', filename='js/tree_viewer_phylotree_v2.js') }}?v=74"></script>
+<script src="{{ url_for('static', filename='js/tree_viewer_phylotree_v2.js') }}?v=75"></script>
 
-<script src="{{ url_for('static', filename='js/tree_viewer_api.js') }}?v=7"></script>
+<script src="{{ url_for('static', filename='js/tree_viewer_api.js') }}?v=8"></script>
 
-<script src="{{ url_for('static', filename='js/tree_viewer_controller.js') }}?v=67"></script>
+<script src="{{ url_for('static', filename='js/tree_viewer_controller.js') }}?v=68"></script>
 
 {% include 'partials/alignment_viewer_modal.html' %}
 

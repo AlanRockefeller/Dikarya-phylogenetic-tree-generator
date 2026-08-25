@@ -338,6 +338,15 @@ The tree viewer's **Analyze with Claude** button posts to
   stricter than Newick alone needs and deliberately so: the same helper backs
   `restore_tree_names()`, which also rewrites NEXUS files, where `-` and `=`
   are punctuation and a bare `_` reads as a space.
+- **Any file a tree edit writes must be listed in `SNAPSHOT_PATHS`** in
+  `app/services/tree_undo_service.py`. Undo restores a snapshot of
+  `tree_state.json` and `tree/tree_pruned.{newick,nexus}` taken before the edit;
+  a fourth file left out of that list would be half-undone. Conversely, a NEW
+  endpoint that writes tree state but is not undoable must call
+  `clear_undo_checkpoint()`, or a later Undo silently reverts it. See the
+  "Single-level undo of a tree edit" section of `ARCHITECTURE.md`.
+- Collapsing a clade in the viewer is display state only (phylotree's transient
+  `node.collapsed`). It must never prune, persist, or trigger a recompute.
 - Use existing Tailwind utility style patterns from `templates/sequence_entry.html` and `templates/partials/*.html`.
 - Reuse modal structure from `templates/partials/add_sequences_modal.html`.
 - Support dark mode (`dark:*` classes) for all new UI.

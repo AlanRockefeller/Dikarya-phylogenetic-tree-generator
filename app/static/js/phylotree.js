@@ -11217,7 +11217,11 @@
             .append("a")
             .attr("class", "phylotree-menu-item dropdown-item")
             .attr("tabindex", "-1")
-            .text(isNodeCollapsed(node) ? "Expand Subtree" : "Collapse Subtree")
+            // Alan 8/24/26 - Dikarya wording: "clade" is what a mycologist calls the
+            // monophyletic group this folds away, and upstream's wording read to users
+            // like the action deleted something. The operation is unchanged and still
+            // transient (node.collapsed); only the label differs from upstream phylotree.
+            .text(isNodeCollapsed(node) ? "Expand Clade" : "Collapse Clade")
             .on("click", d => {
               menu_object.style("display", "none");
               this.toggleCollapse(node).update();

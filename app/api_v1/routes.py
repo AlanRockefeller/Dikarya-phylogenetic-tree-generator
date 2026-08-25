@@ -1527,6 +1527,12 @@ def _mutation(handler, job_id, *, where, scope="jobs:write"):
 
         with tree_state_lock(job_dir):
             result = handler(job_dir, body)
+            # The v1 API is a separate client from the tree viewer, so it does
+            # not get the viewer's Undo affordance -- but it does write the same
+            # files. Leaving a viewer checkpoint from before this mutation would
+            # let a later Undo silently revert an API edit, so drop it.
+            from app.services.tree_undo_service import clear_undo_checkpoint
+            clear_undo_checkpoint(job_dir)
         return ok(result)
     except ValueError as e:
         return error_response(code="validation_failed", message=str(e), status=422)

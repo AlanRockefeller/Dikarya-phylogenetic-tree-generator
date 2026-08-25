@@ -33,6 +33,13 @@ from app.services.its_extraction_service import (
     resolve_min_length as resolve_its_min_length,
 )
 from app.services.access_control import check_job_access
+from app.services.tree_undo_service import (
+    UndoUnavailable,
+    clear_undo_checkpoint,
+    describe_undo_checkpoint,
+    undo_checkpoint,
+    undo_last_edit,
+)
 from app.extensions import csrf, limiter
 
 logger = logging.getLogger(__name__)
@@ -60,6 +67,19 @@ def _server_error(exc, *, where=""):
         "error": "Internal server error",
         "request_id": request_id,
     }), 500
+
+
+def _with_undo_state(state, job_dir):
+    """Echo the job's Undo availability alongside a saved tree state.
+
+    The viewer's toolbar has to know whether Undo is now offered and what it
+    would undo. Piggy-backing on the reply the edit already returns keeps that
+    to zero extra round trips; the keys are namespaced so they cannot collide
+    with tree-state fields.
+    """
+    payload = dict(state) if isinstance(state, dict) else {"status": "success"}
+    payload["undo"] = describe_undo_checkpoint(job_dir)
+    return payload
 
 
 def _client_log_value(value, max_length=CLIENT_LOG_MAX_STR):
@@ -2620,12 +2640,27 @@ def prune_tree(job_id):
         return jsonify({"status": "error", "error": "No tips specified"}), 400
     
     try:
-        from app.services.tree_edit_service import load_tree_state, prune_taxa, save_tree_state, tree_state_lock
+        from app.services.tree_edit_service import (
+            _tree_tip_set, load_tree_state, prune_taxa, save_tree_state, tree_state_lock,
+        )
         with tree_state_lock(job_dir):
             state = load_tree_state(job_dir)
-            state = prune_taxa(job_dir, state, tip_names)
-            save_tree_state(job_dir, state)
-        return jsonify(state)
+            # Captured after load_tree_state(), which initializes (and midpoint
+            # roots) a job that has no state yet -- snapshotting before that
+            # would record a directory the viewer never showed anybody.
+            with undo_checkpoint(job_dir, "prune", "the last prune") as checkpoint:
+                before_tips = _tree_tip_set(state)
+                state = prune_taxa(job_dir, state, tip_names)
+                save_tree_state(job_dir, state)
+                removed = len(before_tips - _tree_tip_set(state))
+                # Only a prune that actually removed something is worth undoing;
+                # an already-applied duplicate would otherwise replace a real
+                # checkpoint with a no-op one.
+                if removed:
+                    checkpoint.commit(
+                        f"prune of {removed} sequence{'' if removed == 1 else 's'}"
+                    )
+        return jsonify(_with_undo_state(state, job_dir))
     except Exception as e:
         return _server_error(e)
 
@@ -2655,19 +2690,44 @@ def rename_tree_tip(job_id):
     except Exception as e:
         return _server_error(e)
 
+    # Alan 8/24/26 - The Rename modal renames the whole current selection, so it
+    # sends every change in one request. Renaming one tip per request wrote the
+    # state N times and, once Undo existed, left a checkpoint taken between the
+    # renames -- so undoing a "Rename 3 sequences" gave back exactly one of them.
+    # The single-pair form is unchanged and still accepted.
+    batch = data.get("renames")
+    pairs = []
     try:
-        old_name, new_name = validate_tip_rename(
-            data.get("old_name"), data.get("new_name")
-        )
+        if batch is not None:
+            if not isinstance(batch, dict) or not batch:
+                return jsonify({
+                    "status": "error",
+                    "error": "`renames` must be a non-empty object of old-name to new-name.",
+                }), 400
+            if len(batch) > 1000:
+                return jsonify({
+                    "status": "error",
+                    "error": "No more than 1000 tips can be renamed in one request.",
+                }), 400
+            for old_value, new_value in batch.items():
+                pairs.append(validate_tip_rename(old_value, new_value))
+        else:
+            pairs.append(validate_tip_rename(data.get("old_name"), data.get("new_name")))
     except ValueError as e:
         return jsonify({"status": "error", "error": str(e)}), 400
 
     try:
         with tree_state_lock(job_dir):
             state = load_tree_state(job_dir)
-            state = rename_tip(state, old_name, new_name)
-            save_tree_state(job_dir, state)
-        return jsonify(state)
+            label = "rename" if len(pairs) == 1 else f"rename of {len(pairs)} sequences"
+            with undo_checkpoint(job_dir, "rename", label) as checkpoint:
+                for old_name, new_name in pairs:
+                    state = rename_tip(state, old_name, new_name)
+                # One save for the whole batch: a partial write would leave the
+                # viewer showing some of the new names and none of the rest.
+                save_tree_state(job_dir, state)
+                checkpoint.commit()
+        return jsonify(_with_undo_state(state, job_dir))
     except Exception as e:
         return _server_error(e)
 
@@ -2762,6 +2822,9 @@ def refresh_tree_mycomap_records(job_id):
             changes = label_result["changes"]
             if changes:
                 save_tree_state(job_dir, label_result["tree_state"])
+                # Refreshed labels are not undoable; an older checkpoint would
+                # revert them along with whatever it does undo.
+                clear_undo_checkpoint(job_dir)
         return jsonify({
             "status": "success",
             "refreshed_count": len(references),
@@ -2775,6 +2838,66 @@ def refresh_tree_mycomap_records(job_id):
         return jsonify({"status": "error", "error": str(exc)}), 502
     except Exception as exc:
         return _server_error(exc, where="refresh_tree_mycomap_records")
+
+@bp.route('/job/<job_id>/tree/undo', methods=['GET'])
+def get_tree_undo_state(job_id):
+    """Report whether a persisted tree edit can be undone, and by this caller.
+
+    Deliberately readable by anyone who can view the job (the viewer asks on
+    every load, including for shared read-only links) but it separates "a
+    checkpoint exists" from "you may apply it", so a read-only viewer is never
+    shown an Undo button that promises a persisted edit it cannot make.
+    """
+    if not validate_job_id(job_id):
+        return jsonify({"status": "error", "error": "Invalid job ID format"}), 400
+
+    _, error_msg, status_code = check_job_access(job_id)
+    if error_msg:
+        return jsonify({"status": "error", "error": error_msg}), status_code
+
+    job_dir = Config.JOB_DIR / job_id
+    if not job_dir.exists():
+        return jsonify({"status": "error", "error": "Job not found"}), 404
+
+    _, edit_error, _ = check_job_access(job_id, mode="edit")
+    payload = dict(describe_undo_checkpoint(job_dir))
+    payload["can_undo"] = bool(payload.get("available")) and not edit_error
+    payload["status"] = "success"
+    return jsonify(payload)
+
+
+@bp.route('/job/<job_id>/tree/undo', methods=['POST'])
+def undo_tree_edit(job_id):
+    """Restore the single checkpoint taken before the last supported edit."""
+    if not validate_job_id(job_id):
+        return jsonify({"status": "error", "error": "Invalid job ID format"}), 400
+
+    _, error_msg, status_code = check_job_access(job_id, mode="edit")
+    if error_msg:
+        return jsonify({"status": "error", "error": error_msg}), status_code
+
+    job_dir = Config.JOB_DIR / job_id
+    if not job_dir.exists():
+        return jsonify({"status": "error", "error": "Job not found"}), 404
+
+    try:
+        from app.services.tree_edit_service import load_tree_state, tree_state_lock
+        with tree_state_lock(job_dir):
+            result = undo_last_edit(job_dir)
+            state = load_tree_state(job_dir)
+        payload = _with_undo_state(state, job_dir)
+        payload["undone"] = {
+            "operation": result["operation"],
+            "label": result["label"],
+        }
+        return jsonify(payload)
+    except UndoUnavailable as exc:
+        # 409, not 500: the state is simply not what the client believed. The
+        # viewer turns this back into a disabled Undo button.
+        return jsonify({"status": "error", "error": str(exc)}), 409
+    except Exception as e:
+        return _server_error(e)
+
 
 @bp.route('/job/<job_id>/tree/rotate', methods=['POST'])
 def rotate_tree_node(job_id):
@@ -2798,9 +2921,11 @@ def rotate_tree_node(job_id):
         from app.services.tree_edit_service import load_tree_state, rotate_node, save_tree_state, tree_state_lock
         with tree_state_lock(job_dir):
             state = load_tree_state(job_dir)
-            state = rotate_node(job_dir, state, node_id)
-            save_tree_state(job_dir, state)
-        return jsonify(state)
+            with undo_checkpoint(job_dir, "rotate", "node rotation") as checkpoint:
+                state = rotate_node(job_dir, state, node_id)
+                save_tree_state(job_dir, state)
+                checkpoint.commit()
+        return jsonify(_with_undo_state(state, job_dir))
     except ValueError as e:
         return jsonify({"status": "error", "error": str(e)}), 400
     except Exception as e:
@@ -2824,9 +2949,11 @@ def reroot_tree_endpoint(job_id):
         from app.services.tree_edit_service import load_tree_state, reroot_tree, save_tree_state, tree_state_lock
         with tree_state_lock(job_dir):
             state = load_tree_state(job_dir)
-            state = reroot_tree(job_dir, state, target)
-            save_tree_state(job_dir, state)
-        return jsonify(state)
+            with undo_checkpoint(job_dir, "reroot", "reroot") as checkpoint:
+                state = reroot_tree(job_dir, state, target)
+                save_tree_state(job_dir, state)
+                checkpoint.commit()
+        return jsonify(_with_undo_state(state, job_dir))
     except ValueError as e:
         return jsonify({"status": "error", "error": str(e)}), 400
     except Exception as e:
@@ -2844,9 +2971,11 @@ def midpoint_root_endpoint(job_id):
         from app.services.tree_edit_service import load_tree_state, midpoint_root, save_tree_state, tree_state_lock
         with tree_state_lock(job_dir):
             state = load_tree_state(job_dir)
-            state = midpoint_root(job_dir, state)
-            save_tree_state(job_dir, state)
-        return jsonify(state)
+            with undo_checkpoint(job_dir, "reroot", "midpoint rooting") as checkpoint:
+                state = midpoint_root(job_dir, state)
+                save_tree_state(job_dir, state)
+                checkpoint.commit()
+        return jsonify(_with_undo_state(state, job_dir))
     except ValueError as e:
         return jsonify({"status": "error", "error": str(e)}), 400
     except Exception as e:
@@ -2869,16 +2998,23 @@ def midpoint_root_toggle_endpoint(job_id):
         with tree_state_lock(job_dir):
             state = load_tree_state(job_dir)
 
-            # Check current state and toggle
-            if state.get("is_midpoint_rooted", False):
-                # Currently midpoint rooted - undo it
-                state = undo_midpoint_root(job_dir, state)
-            else:
-                # Not midpoint rooted - apply it
-                state = midpoint_root(job_dir, state)
+            # The midpoint toggle is its own inverse, but it still gets a
+            # checkpoint so the generic Undo button describes the same action
+            # the user just performed instead of skipping back past it.
+            with undo_checkpoint(job_dir, "reroot", "rooting change") as checkpoint:
+                # Check current state and toggle
+                if state.get("is_midpoint_rooted", False):
+                    # Currently midpoint rooted - undo it
+                    state = undo_midpoint_root(job_dir, state)
+                    label = "turning midpoint rooting off"
+                else:
+                    # Not midpoint rooted - apply it
+                    state = midpoint_root(job_dir, state)
+                    label = "midpoint rooting"
 
-            save_tree_state(job_dir, state)
-        return jsonify(state)
+                save_tree_state(job_dir, state)
+                checkpoint.commit(label)
+        return jsonify(_with_undo_state(state, job_dir))
     except ValueError as e:
         return jsonify({"status": "error", "error": str(e)}), 400
     except Exception as e:
@@ -2919,12 +3055,14 @@ def set_rooting_mode_endpoint(job_id):
         )
         with tree_state_lock(job_dir):
             state = load_tree_state(job_dir)
-            if soi:
-                state = set_sequence_of_interest(state, soi, source="user_selected")
-            state = apply_rooting_mode(job_dir, state, mode, target=target,
-                                       sequence_of_interest=soi)
-            save_tree_state(job_dir, state)
-        return jsonify(state)
+            with undo_checkpoint(job_dir, "reroot", "rooting change") as checkpoint:
+                if soi:
+                    state = set_sequence_of_interest(state, soi, source="user_selected")
+                state = apply_rooting_mode(job_dir, state, mode, target=target,
+                                           sequence_of_interest=soi)
+                save_tree_state(job_dir, state)
+                checkpoint.commit()
+        return jsonify(_with_undo_state(state, job_dir))
     except ValueError as e:
         return jsonify({"status": "error", "error": str(e)}), 400
     except Exception as e:
@@ -2954,6 +3092,10 @@ def set_sequence_of_interest_endpoint(job_id):
             state = load_tree_state(job_dir)
             state = set_sequence_of_interest(state, tip_name, source=source)
             save_tree_state(job_dir, state)
+            # Not undoable, and undo restores the WHOLE tree state, so leaving a
+            # checkpoint here would let a later Undo silently discard the focal
+            # tip the user just picked.
+            clear_undo_checkpoint(job_dir)
         return jsonify({
             "status": "ok",
             "sequence_of_interest": state.get("sequence_of_interest"),
@@ -3049,6 +3191,10 @@ def save_clade_annotations(job_id):
 
             apply_annotation_config(state, config)
             save_tree_state(job_dir, state)
+            # Annotations are deliberate authoring work and are not undoable.
+            # An undo checkpoint older than this save would roll them back with
+            # the edit it does undo, so drop it rather than offer that.
+            clear_undo_checkpoint(job_dir)
         return jsonify({
             "status": "ok",
             "layers": config[ANNOTATION_LAYERS_KEY],
@@ -3394,6 +3540,10 @@ def recompute_tree_job(job_id):
                 "redirect_url": url_for('main.job_status', job_id=job_id),
             }), 409
         if created:
+            # Recompute is not undoable, and it replaces the topology outright:
+            # a checkpoint taken against the previous tree would restore a state
+            # that no longer describes what the user is looking at.
+            clear_undo_checkpoint(job_dir)
             # Only the request that actually created this run may update its
             # reported settings. A duplicate request cannot alter the params
             # already captured by the active RQ task.

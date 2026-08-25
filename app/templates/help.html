@@ -77,6 +77,8 @@
             <a href="#quick-start">Quick Start</a>
             <a href="#tree-viewer">Tree Viewer</a>
             <a href="#alignment-viewer">Alignment Viewer</a>
+            <a href="#annotations">Annotations</a>
+            <a href="#annotation-colors">Colored Annotations</a>
             <a href="#getting-sequences-in">Getting Sequences In</a>
             <a href="#downloads">Downloads</a>
             <a href="#advanced">Advanced</a>
@@ -95,6 +97,8 @@
                     <li><a href="#quick-start">Quick Start</a></li>
                     <li><a href="#tree-viewer">Tree Viewer</a></li>
                     <li><a href="#alignment-viewer">Alignment Viewer</a></li>
+                    <li><a href="#annotations">Annotations</a></li>
+                    <li><a href="#annotation-colors">Colored Annotations</a></li>
                     <li><a href="#getting-sequences-in">Getting Sequences In</a></li>
                     <li><a href="#downloads">Downloads</a></li>
                     <li><a href="#advanced">Advanced</a></li>
@@ -195,9 +199,11 @@
                         tip is the only selected tip. It changes the displayed tree-tip name, not the DNA sequence.
                     </p>
                     <p class="mt-3 text-sm leading-relaxed text-gray-200">
-                        On an internal node, the menu can select descendant branches, collapse or expand the subtree,
-                        and <strong>Rotate node</strong>. Rotation only changes the order in which the branches are
-                        drawn; the topology is unchanged.
+                        On an internal node, the menu can select descendant branches, <strong>Collapse Clade</strong> or
+                        <strong>Expand Clade</strong>, and <strong>Rotate node</strong>. Rotation only changes the order
+                        in which the branches are drawn; the topology is unchanged. Click the circles on two or more
+                        internal nodes first and the menu also offers <strong>Collapse 4 Clades</strong> (or however many
+                        you picked), so a busy tree can be folded down in one go.
                     </p>
                 </div>
             </section>
@@ -245,7 +251,9 @@
                             Select one or several tips and click <strong>Prune</strong>, use the tip's right-click menu,
                             or use the red Alt/Option + left-drag box. Pruning removes those tips from the working tree
                             and from the pruned FASTA. <strong>Original Newick</strong> and <strong>Processed Input FASTA</strong>
-                            remain available, so the input analysis is not erased.
+                            remain available, so the input analysis is not erased. If you prune something you wanted,
+                            <strong>Undo</strong> puts it straight back&mdash;see below. Pruning does not re-infer the
+                            phylogeny; the branches that remain keep the lengths and support they were built with.
                         </p>
                     </div>
                     <div>
@@ -271,12 +279,32 @@
                         </p>
                     </div>
                     <div>
-                        <h3 class="text-lg font-semibold text-journal-dark dark:text-journal-gold-light">Rotate, collapse, sort, and color</h3>
+                        <h3 class="text-lg font-semibold text-journal-dark dark:text-journal-gold-light">Collapsing clades</h3>
                         <p class="mt-2 leading-relaxed">
-                            <strong>Rotate node</strong>, subtree collapse, and node sorting make a crowded tree easier to
-                            read without changing its topology. Color groups and quick color swatches save highlights on
-                            selected tips, which is handy for marking collections, clades, types, or sequences you want
-                            to discuss later.
+                            Right-click an internal branch or node and choose <strong>Collapse Clade</strong> to fold that
+                            group into a single wedge, which is how you make a hundred-tip tree readable without throwing
+                            anything away. Nothing is removed: every sequence, branch length and support value is still
+                            there, the phylogeny does not change, nothing is recomputed, and <strong>Expand Clade</strong>
+                            on the same node unfolds it again.
+                        </p>
+                        <p class="mt-2 leading-relaxed">
+                            To fold several at once, click the circles on the internal nodes you want and then right-click
+                            any node: the menu offers <strong>Collapse&nbsp;N&nbsp;Clades</strong> and
+                            <strong>Expand&nbsp;N&nbsp;Clades</strong>. If you pick a clade and also something nested
+                            inside it, only the outer one is collapsed&mdash;collapsing both would produce the same single
+                            wedge. Selecting tips never collapses anything, and nothing you do here can collapse the whole
+                            tree at the root.
+                        </p>
+                        <p class="mt-2 text-sm leading-relaxed text-gray-600 dark:text-gray-400">
+                            Collapsed clades are a view, not a saved edit, so reloading the page shows the full tree again.
+                        </p>
+                    </div>
+                    <div>
+                        <h3 class="text-lg font-semibold text-journal-dark dark:text-journal-gold-light">Rotate, sort, and color</h3>
+                        <p class="mt-2 leading-relaxed">
+                            <strong>Rotate node</strong> and node sorting make a crowded tree easier to read without
+                            changing its topology. Color groups and quick color swatches save highlights on selected tips,
+                            which is handy for marking collections, clades, types, or sequences you want to discuss later.
                         </p>
                     </div>
                     <div>
@@ -288,7 +316,222 @@
                             after a display-only rename, color, rotation, or reroot.
                         </p>
                     </div>
+                    <div>
+                        <h3 class="text-lg font-semibold text-journal-dark dark:text-journal-gold-light">Undo</h3>
+                        <p class="mt-2 leading-relaxed">
+                            The <strong>Undo</strong> button&mdash;or
+                            <kbd class="rounded border px-1.5 py-0.5 font-mono text-xs dark:border-gray-600">Ctrl</kbd>&nbsp;/
+                            <kbd class="rounded border px-1.5 py-0.5 font-mono text-xs dark:border-gray-600">Cmd</kbd>&nbsp;+
+                            <kbd class="rounded border px-1.5 py-0.5 font-mono text-xs dark:border-gray-600">Z</kbd>&mdash;takes
+                            back your most recent change: a prune, a rename, a rotation, a rooting change, or a collapse.
+                            Its tooltip names what it would undo, so you can check before clicking. Pruning a clade you
+                            turn out to want back is one keystroke away, which is the point: it is meant to make
+                            experimenting on a tree feel safe.
+                        </p>
+                        <p class="mt-2 leading-relaxed">
+                            It is a single step, not a full history. Once you have undone something, there is nothing
+                            further to undo and no redo. Starting a <strong>Recompute</strong> clears it, because the new
+                            tree is no longer the one the saved step describes, and Recompute itself cannot be undone.
+                            The button is greyed out and says so whenever there is nothing to take back.
+                        </p>
+                        <p class="mt-2 text-sm leading-relaxed text-gray-600 dark:text-gray-400">
+                            While you are typing in a rename box, an annotation label, or any other text field,
+                            <kbd class="rounded border px-1.5 py-0.5 font-mono text-xs dark:border-gray-600">Ctrl</kbd>&nbsp;/
+                            <kbd class="rounded border px-1.5 py-0.5 font-mono text-xs dark:border-gray-600">Cmd</kbd>&nbsp;+
+                            <kbd class="rounded border px-1.5 py-0.5 font-mono text-xs dark:border-gray-600">Z</kbd>
+                            undoes your typing as usual and leaves the tree alone. On a tree someone shared with you
+                            read-only, Undo still works for collapsing and expanding, which are the changes you are
+                            allowed to make.
+                        </p>
+                    </div>
                 </div>
+            </section>
+
+            <section id="annotations" aria-labelledby="annotations-title">
+                <h2 id="annotations-title" class="text-2xl font-bold text-journal-dark dark:text-gray-100">Annotations: labeling clades</h2>
+                <p class="mt-3 leading-relaxed">
+                    Annotations are the publication-style labels that sit beside the tree&mdash;subgenera, sections,
+                    species complexes, <em>sensu stricto</em> groups, or any custom grouping you want a reader to see.
+                    They are saved with the tree, reapplied when it reloads, and drawn into the SVG and PNG exports
+                    exactly as they appear on screen. Open them with the teal <strong>Annotations</strong> button
+                    above the tree.
+                </p>
+
+                <div class="mt-6 space-y-7">
+                    <div>
+                        <h3 class="text-lg font-semibold text-journal-dark dark:text-journal-gold-light">Adding one</h3>
+                        <p class="mt-2 leading-relaxed">
+                            Two ways, and they do the same thing:
+                        </p>
+                        <ul class="mt-3 list-disc space-y-1 pl-6">
+                            <li><strong>Right-click the branch</strong> that leads to the group and choose <em>Add annotation…</em>. This is usually the quickest route.</li>
+                            <li><strong>Select the tips</strong> (left-drag a box around them), then click <strong>Annotations</strong> and <em>Annotate selected clade…</em>.</li>
+                        </ul>
+                        <p class="mt-3 leading-relaxed">
+                            An annotation has to name a <strong>complete clade</strong>&mdash;every descendant of one
+                            node, with nothing left out. If the selection is a scattering of tips that do not descend
+                            from a single node, Dikarya says so rather than drawing a label that makes a claim the tree
+                            does not support. The remedy is normally to select one tip fewer or one tip more, or to
+                            right-click the branch instead. The root itself cannot be annotated with a bracket, but it
+                            can be highlighted.
+                        </p>
+                        <p class="mt-2 leading-relaxed">
+                            Labels take up to 500 characters over 10 lines, and line breaks are preserved in both the
+                            tree and the exported figure&mdash;so a long name can be broken deliberately rather than
+                            wherever it happens to land.
+                        </p>
+                    </div>
+
+                    <div>
+                        <h3 class="text-lg font-semibold text-journal-dark dark:text-journal-gold-light">The four types</h3>
+                        <div class="mt-3 grid gap-4 sm:grid-cols-2">
+                            <div class="rounded-xl border border-gray-200 p-4 dark:border-journal-green">
+                                <p class="font-semibold text-journal-dark dark:text-gray-100">Clade line</p>
+                                <p class="mt-1 text-sm leading-relaxed">A bracket beside the descendant tips with the label alongside it. The conventional way to mark a section or subgenus in a published figure.</p>
+                            </div>
+                            <div class="rounded-xl border border-gray-200 p-4 dark:border-journal-green">
+                                <p class="font-semibold text-journal-dark dark:text-gray-100">Clade highlight</p>
+                                <p class="mt-1 text-sm leading-relaxed">A translucent colored band behind the clade. The best choice when you want the group visible at a glance rather than read off the margin.</p>
+                            </div>
+                            <div class="rounded-xl border border-gray-200 p-4 dark:border-journal-green">
+                                <p class="font-semibold text-journal-dark dark:text-gray-100">Branch text</p>
+                                <p class="mt-1 text-sm leading-relaxed">Multiline text sitting above the branch itself&mdash;for a note about that lineage rather than a name for its members.</p>
+                            </div>
+                            <div class="rounded-xl border border-gray-200 p-4 dark:border-journal-green">
+                                <p class="font-semibold text-journal-dark dark:text-gray-100">Branch bubble</p>
+                                <p class="mt-1 text-sm leading-relaxed">The same thing in a rounded callout, which stands out more on a busy tree.</p>
+                            </div>
+                        </div>
+                        <p class="mt-3 leading-relaxed">
+                            The type can be changed at any time from the editor's <strong>Annotation type</strong> menu;
+                            the group it names stays the same. The <strong>Live preview</strong> at the bottom of the
+                            editor draws with the same code the tree does, so what you approve there is what the figure
+                            gets.
+                        </p>
+                    </div>
+
+                    <div>
+                        <h3 class="text-lg font-semibold text-journal-dark dark:text-journal-gold-light">Layers</h3>
+                        <p class="mt-2 leading-relaxed">
+                            Every annotation belongs to a layer, and a layer carries the style its annotations inherit:
+                            font, size, weight, colors, opacity. Put your sections on one layer and your subgenera on
+                            another and you can restyle each set in one place, or hide one set entirely while you work.
+                            <strong>Layer 1 sits closest to the tips</strong> and higher-numbered layers stack outward,
+                            which is what lets a figure carry sections next to the tips and subgenera outside them.
+                        </p>
+                        <p class="mt-2 leading-relaxed">
+                            An individual annotation can override anything it inherits under <strong>Style</strong> in
+                            the editor. Leave it alone and it follows the layer, so changing the layer changes every
+                            annotation on it.
+                        </p>
+                        <p class="mt-2 leading-relaxed">
+                            Placement is worked out per clade rather than for the whole tree: an annotation sits just
+                            beyond <em>its own</em> tips' labels, so one very long sequence name elsewhere no longer
+                            pushes every label across a band of empty page. Where annotations nest, the smallest clade
+                            is packed nearest the tree and the ones containing it step outward&mdash;so a
+                            <em>sensu stricto</em> group sits inside the broader name that encloses it.
+                        </p>
+                    </div>
+                </div>
+            </section>
+
+            <section id="annotation-colors" aria-labelledby="annotation-colors-title"
+                class="rounded-2xl border-2 border-journal-gold bg-white p-5 shadow-md dark:bg-journal-green/30 sm:p-7">
+                <p class="text-xs font-bold uppercase tracking-[0.18em] text-journal-gold">Colored annotations</p>
+                <h2 id="annotation-colors-title" class="mt-2 text-2xl font-bold text-journal-dark dark:text-gray-100">
+                    Clade highlights pick their own colors
+                </h2>
+                <p class="mt-4 leading-relaxed">
+                    A <strong>clade highlight</strong> paints a translucent band behind the clade and behind its label.
+                    You do not have to choose a color for it. Left on <strong>Automatic</strong>&mdash;which is the
+                    default&mdash;Dikarya works one out from the tree, and it keeps working it out as the tree changes.
+                </p>
+
+                <div class="mt-6 space-y-6">
+                    <div>
+                        <h3 class="text-lg font-semibold text-journal-dark dark:text-journal-gold-light">Where an automatic color comes from</h3>
+                        <ol class="mt-3 list-decimal space-y-3 pl-6 leading-relaxed">
+                            <li>
+                                <strong>Your color groups come first.</strong> If every tip in the clade belongs to the
+                                same saved color group, the highlight is drawn in that group's color, softened for use
+                                as a large translucent wash. The band and the tip labels then say the same thing by
+                                construction, and recoloring the group recolors the highlight with it.
+                            </li>
+                            <li>
+                                <strong>Mixed membership falls through.</strong> A clade of eighteen blue tips and five
+                                orange ones has no single group color, and averaging them would invent a muddy shade
+                                that corresponds to nothing in the figure. Those get a palette color instead.
+                            </li>
+                            <li>
+                                <strong>Otherwise, a curated palette.</strong> Eight mid-tone, slightly desaturated
+                                fills&mdash;blue, purple, teal, rose, amber, green, muted red, cyan&mdash;ordered so the
+                                first four are maximally distinct. They are chosen for large translucent areas, which is
+                                a different job from the bright categorical colors used for tip labels: those read as
+                                neon when spread across a third of a figure.
+                            </li>
+                        </ol>
+                        <p class="mt-3 leading-relaxed">
+                            Each annotation keeps the palette slot it was given, so adding, editing, or deleting a
+                            different annotation does not shuffle the colors of the ones you already approved. Two
+                            highlights that end up next to each other are also kept from landing on shades too close to
+                            tell apart.
+                        </p>
+                    </div>
+
+                    <div>
+                        <h3 class="text-lg font-semibold text-journal-dark dark:text-journal-gold-light">Choosing the color yourself</h3>
+                        <p class="mt-2 leading-relaxed">
+                            Open <strong>Style</strong> in the annotation editor. The highlight color row has three
+                            settings:
+                        </p>
+                        <ul class="mt-3 list-disc space-y-2 pl-6 leading-relaxed">
+                            <li><strong>Layer default</strong> &mdash; no opinion at this annotation; whatever the layer says.</li>
+                            <li><strong>Automatic</strong> &mdash; worked out from the tree as described above. The swatch stays visible but greyed, showing the color that will actually be drawn.</li>
+                            <li><strong>Fixed color</strong> &mdash; your pick, used verbatim, in both light and dark mode.</li>
+                        </ul>
+                        <p class="mt-3 leading-relaxed">
+                            A layer has the same choice, as <strong>Auto</strong> or <strong>Fixed</strong>, applying to
+                            every annotation on it that has not overridden it. Switching an annotation from Fixed back
+                            to Automatic shows you the automatic color immediately, before you save.
+                        </p>
+                    </div>
+
+                    <div>
+                        <h3 class="text-lg font-semibold text-journal-dark dark:text-journal-gold-light">Opacity, and light versus dark</h3>
+                        <p class="mt-2 leading-relaxed">
+                            An automatic highlight is drawn a little stronger in dark mode than in light, because a pale
+                            wash that reads clearly on white is nearly invisible on black. An opacity you set yourself
+                            is used exactly as given in both themes&mdash;if you have chosen a value, Dikarya does not
+                            second-guess it. Either way the value is written into the exported SVG, so the file matches
+                            the screen.
+                        </p>
+                    </div>
+
+                    <div>
+                        <h3 class="text-lg font-semibold text-journal-dark dark:text-journal-gold-light">What the band covers</h3>
+                        <p class="mt-2 leading-relaxed">
+                            The colored band's height is the clade's own tip rows and nothing else. That matters
+                            biologically: the band is a statement about which sequences are in the group, so a long
+                            caption must never make it swallow the neighboring taxa. When a multiline label is taller
+                            than the clade it names&mdash;three lines of text on a single sequence, say&mdash;the extra
+                            text gets its own backing panel out in the label area, stepped off the main band and joined
+                            to it. A label that fits inside the band needs no second piece and does not get one.
+                        </p>
+                    </div>
+                </div>
+
+                <div class="mt-6 rounded-xl bg-journal-gold/15 p-4 text-journal-dark ring-1 ring-journal-gold/50 dark:text-gray-100">
+                    <strong>In practice:</strong> add the highlight, leave it on Automatic, and only reach for
+                    <em>Fixed color</em> when a journal, a figure convention, or a companion figure requires a
+                    particular color. If you already use color groups to mark your collections, the highlights will
+                    match them without being told.
+                </div>
+
+                <p class="mt-5 text-sm text-gray-600 dark:text-gray-300">
+                    Annotations are edited from the same list they are created in: open <strong>Annotations</strong>,
+                    click one to edit it, and use <strong>Delete annotation</strong> in the editor to remove it. A tree
+                    someone shared with you read-only shows its annotations but does not let you change them.
+                </p>
             </section>
 
             <section id="getting-sequences-in" aria-labelledby="getting-sequences-title">

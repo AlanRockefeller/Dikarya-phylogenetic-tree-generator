@@ -1484,6 +1484,12 @@ def commit_recompute_tree_state(job_dir: Path,
             task_logger=task_logger or logger,
         )
         save_tree_state(job_dir, state)
+        # A new inferred topology invalidates any single-level undo checkpoint
+        # taken against the old one. The recompute endpoint already clears it at
+        # enqueue time; this is the backstop for every other path into a commit
+        # (the worker, a resumed run, a direct call from a script).
+        from app.services.tree_undo_service import clear_undo_checkpoint
+        clear_undo_checkpoint(job_dir)
         return state
 
 

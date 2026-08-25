@@ -29,6 +29,33 @@
     // Exported so the Node regression harness can drive it without a DOM.
     window.describeTreeParseFailure = describeTreeParseFailure;
 
+    // Alan 8/24/26 - The same stable internal-node ID the backend computes in
+    // tree_edit_service._stable_internal_node_id_from_names() and the controller computes in
+    // stableInternalNodeIdFromTipNames(): FNV-1a over the sorted descendant tip names. Two
+    // distinct clades can only collide by having identical tip sets, which in a tree means a
+    // unary chain -- and those are excluded from collapse targets below. Sorting is by Unicode
+    // code point (not UTF-16 unit) so it agrees with Python's sorted()/ord() on non-BMP names.
+    function stableCladeIdFromTipNames(tipNames) {
+        const names = (Array.isArray(tipNames) ? tipNames : [])
+            .filter(Boolean)
+            .map(String)
+            .sort((a, b) => {
+                const ca = Array.from(a), cb = Array.from(b);
+                const n = Math.min(ca.length, cb.length);
+                for (let i = 0; i < n; i += 1) {
+                    const d = ca[i].codePointAt(0) - cb[i].codePointAt(0);
+                    if (d !== 0) return d;
+                }
+                return ca.length - cb.length;
+            });
+        let hash = 2166136261;
+        for (const ch of names.join('\x1f')) {
+            hash ^= ch.codePointAt(0);
+            hash = Math.imul(hash, 16777619) >>> 0;
+        }
+        return `internal:${hash.toString(16).padStart(8, '0')}`;
+    }
+
     // Alan 7/15/26 - Hide pipeline-only MAFFT and RiC annotations from tip labels while preserving stable tree IDs.
     function cleanTipDisplayName(name) {
         if (typeof name !== 'string') return name;
@@ -289,6 +316,19 @@
         // Alan 5/11/26 - Clear visible active selections without mutating saved selection sets.
         deselectCurrentSelection() { return 0; }
 
+        // Alan 8/24/26 - Viewer-only clade collapse. Non-destructive: no tips are removed, no
+        // topology or branch length changes, nothing is persisted and nothing is recomputed.
+        getSelectedCladeNodes() { return []; }
+        getSelectedCladeCount() { return 0; }
+        getBulkCollapseTargets() { return []; }
+        getBulkExpandTargets() { return []; }
+        collapseSelectedClades() { return 0; }
+        expandSelectedClades() { return 0; }
+        hasCollapseUndo() { return false; }
+        getCollapseUndoLabel() { return null; }
+        undoLastCollapseChange() { return null; }
+        clearCollapseUndo() { }
+
         // Alan 5/12/26 - Remove pruned IDs from saved selection sets without clearing unrelated colors.
         removeIdsFromSelectionSets(ids) { return 0; }
 
@@ -513,6 +553,25 @@
             this.currentSelectionIds = new Set();
             // Alan 5/11/26 - Track locally hidden current selections so Deselect does not mutate color groups.
             this.hiddenSelectionIds = new Set();
+            // Alan 8/24/26 - Selected INTERNAL nodes are tracked separately, by the same stable
+            // descendant-tip ID the backend uses for rotate/prune/reroot. currentSelectionIds keys
+            // on _getNodeId(), which for an internal node is its support label ("100") and is
+            // therefore shared by dozens of unrelated clades -- fine for highlighting, useless as
+            // an identity for "collapse exactly the clades I picked".
+            this.selectedCladeIds = new Set();
+            // Alan 8/24/26 - Resolving those IDs back to nodes costs a traversal that hashes
+            // each clade's descendant tips, and the context menu asks for the target set once
+            // per label and per enabled/disabled check. The revision counter lets one menu
+            // open share a single resolution; it is bumped wherever the selection or the
+            // parsed tree changes.
+            this._cladeSelectionRevision = 0;
+            this._cladeNodeCache = null;
+            // Alan 8/24/26 - One-slot record of the last collapse/expand so the viewer can undo it.
+            // Collapse is transient display state (node.collapsed), so this never touches the server.
+            this._collapseUndo = null;
+            // Alan 8/24/26 - Set while a bulk collapse/expand runs so phylotree's per-node
+            // 'collapsed' event does not record N single-node undo entries over the bulk one.
+            this._bulkCollapseInProgress = false;
             // Color palette from d3.schemeCategory10 for persistent color groups
             this._selectionColors = [
                 '#1f77b4', '#ff7f0e', '#2ca02c', '#d62728', '#9467bd',
@@ -796,6 +855,50 @@
                             (node) => { if (typeof this._onRotateNode === 'function') this._onRotateNode(node); },
                             (node) => Boolean(node.children && node.children.length >= 2)
                         ]);
+                        // Alan 8/24/26 - Bulk collapse/expand of the SELECTED clades. These act on
+                        // the selection, not on the clicked node, so they are registered on every
+                        // internal node and only appear once two or more clades are selected -- a
+                        // single clade is already served by phylotree's own Collapse Clade item.
+                        // They are priority items so they sit next to it rather than at the bottom.
+                        //
+                        // Three items rather than one toggle: when the selected clades are all
+                        // expanded (or all collapsed) one unambiguous counted action is clearer,
+                        // and when the selection is MIXED a toggle would have to guess, so both
+                        // directions are offered explicitly.
+                        n.menu_items.push([
+                            () => {
+                                const collapseCount = this.getBulkCollapseTargets().length;
+                                if (collapseCount) {
+                                    return `Collapse ${collapseCount} Clade${collapseCount === 1 ? '' : 's'}`;
+                                }
+                                const expandCount = this.getBulkExpandTargets().length;
+                                return `Expand ${expandCount} Clade${expandCount === 1 ? '' : 's'}`;
+                            },
+                            () => {
+                                if (this.getBulkCollapseTargets().length) this.collapseSelectedClades();
+                                else this.expandSelectedClades();
+                            },
+                            () => this.getSelectedCladeCount() >= 2
+                                && !(this.getBulkCollapseTargets().length && this.getBulkExpandTargets().length),
+                            false,
+                            true
+                        ], [
+                            () => 'Collapse Selected Clades',
+                            () => this.collapseSelectedClades(),
+                            () => this.getSelectedCladeCount() >= 2
+                                && Boolean(this.getBulkCollapseTargets().length)
+                                && Boolean(this.getBulkExpandTargets().length),
+                            () => this.getBulkCollapseTargets().length === 0,
+                            true
+                        ], [
+                            () => 'Expand Selected Clades',
+                            () => this.expandSelectedClades(),
+                            () => this.getSelectedCladeCount() >= 2
+                                && Boolean(this.getBulkCollapseTargets().length)
+                                && Boolean(this.getBulkExpandTargets().length),
+                            () => this.getBulkExpandTargets().length === 0,
+                            true
+                        ]);
                         // Alan 8/17/26 - Annotation creation now stays in the shared priority menu above.
                     }
                 }
@@ -812,6 +915,11 @@
             this.currentSelectionIds.clear();
             // Alan 5/12/26 - Reset transient hidden state tied to temporary action selection.
             this.hiddenSelectionIds.clear();
+            // Alan 8/24/26 - A reload replaces every node object, so both the clade registry and
+            // the collapse undo entry (which holds node references) describe a tree that is gone.
+            this.selectedCladeIds.clear();
+            this._collapseUndo = null;
+            this._invalidateCladeSelection();
 
             // 3. COMPUTE STATS
             this.lastStats = this._computeSupportStats();
@@ -925,6 +1033,10 @@
 
                 // Hook into phylotree's native selection system
                 this._hookPhylotreeSelection();
+
+                // Alan 8/24/26 - Watch the native Collapse/Expand Clade menu item so a single
+                // collapse is undoable and so Dikarya's support labels repaint with it.
+                this._hookNativeCollapseEvents();
 
                 // Override click behavior: left-click = select, shift/right = menu
                 this._overrideClickBehavior();
@@ -1876,6 +1988,10 @@
             const visibleIds = this._getVisibleSelectionIds();
             this.currentSelectionIds.clear();
             this.hiddenSelectionIds.clear();
+            // Alan 8/24/26 - Deselect drops selected clades along with selected tips. Collapsed
+            // clades stay collapsed: this clears the selection, not the display state.
+            this.selectedCladeIds.clear();
+            this._invalidateCladeSelection();
             // Alan 5/11/26 - Clear phylotree's native selected styling so deselected labels stop looking selected.
             this._clearNativeSelectionForIds(visibleIds);
             this._updateStats();
@@ -2465,6 +2581,9 @@
                             self.hiddenSelectionIds.delete(id);
                             self.selectedIds.add(id);
                         }
+                        // Alan 8/24/26 - "All internal branches" and friends hand over real node
+                        // objects, so register their stable clade IDs here too.
+                        self._syncCladeSelection(node, true);
                     });
 
                     // Update our styling
@@ -2483,6 +2602,8 @@
                             self.hiddenSelectionIds.delete(id);
                             self.selectedIds.add(id);
                         }
+                        // Alan 8/24/26 - Keep the stable clade registry in step with native selection events.
+                        self._syncCladeSelection(node, true);
                     });
                     self._updateNodeStylesOnly();
                     self._updateStats();
@@ -2542,7 +2663,11 @@
                     const id = self._getNodeId(d);
                     if (id) {
                         // Alan 5/11/26 - Toggle visible selection state while preserving Deselect-hidden set membership.
-                        self._toggleVisibleSelection(id);
+                        const nowSelected = self._toggleVisibleSelection(id);
+                        // Alan 8/24/26 - Mirror internal-node clicks into the stable clade registry
+                        // so bulk collapse targets exactly the clades that were clicked, not every
+                        // clade that happens to share this one's support label.
+                        self._syncCladeSelection(d, nowSelected);
                         self._updateNodeStylesOnly();
                         self._updateStats();
                     }
@@ -3102,6 +3227,9 @@
             this.currentSelectionIds.clear();
             // Alan 5/12/26 - Clear transient Deselect state when current selection is removed.
             this.hiddenSelectionIds.clear();
+            // Alan 8/24/26 - Selected clades are part of the same transient selection.
+            this.selectedCladeIds.clear();
+            this._invalidateCladeSelection();
             this._updateStats();
             this._updateNodeStylesOnly();
         }
@@ -3357,6 +3485,8 @@
                     this.hiddenSelectionIds.delete(id);
                     this.selectedIds.add(id);
                 }
+                // Alan 8/24/26 - Register internal descendants as selected clades too.
+                this._syncCladeSelection(node, true);
 
                 if (node.children && node.children.length) {
                     for (const child of node.children) {
@@ -3422,6 +3552,247 @@
                 }
             }
             return names;
+        }
+
+        // ==================================================================
+        // Alan 8/24/26 - CLADE COLLAPSE (viewer-only, never persisted)
+        //
+        // Collapsing folds a monophyletic group into a wedge. It is purely a
+        // display state (phylotree's transient `node.collapsed`): every tip,
+        // branch length and support value stays in the model, nothing is written
+        // to tree_state.json, no tree-edit API is called, and the edited FASTA is
+        // untouched. It is therefore NOT persisted across a page reload.
+        // ==================================================================
+
+        // Is this a collapsible clade? Leaves are not, and neither is a unary
+        // pass-through node, whose descendant tip set -- and therefore stable ID --
+        // is identical to its only child's.
+        _isCollapsibleClade(node) {
+            const children = node?.children || node?.data?.children || [];
+            return Boolean(children && children.length >= 2);
+        }
+
+        // Stable ID for an internal node, or null for anything that is not a
+        // collapsible clade.
+        _getCladeId(node) {
+            if (!this._isCollapsibleClade(node)) return null;
+            const tipIds = this.getDescendantLeafIds(node);
+            if (!tipIds.length) return null;
+            return stableCladeIdFromTipNames(tipIds);
+        }
+
+        // Keep the clade registry in step with a selection change made against a
+        // real node object. Called from every place that selects/deselects one.
+        _syncCladeSelection(node, selected) {
+            const cladeId = this._getCladeId(node);
+            if (!cladeId) return;
+            const before = this.selectedCladeIds.size;
+            if (selected) this.selectedCladeIds.add(cladeId);
+            else this.selectedCladeIds.delete(cladeId);
+            if (this.selectedCladeIds.size !== before) this._invalidateCladeSelection();
+        }
+
+        // Called wherever the selected-clade set or the parsed tree changes.
+        _invalidateCladeSelection() {
+            this._cladeSelectionRevision = (this._cladeSelectionRevision || 0) + 1;
+            this._cladeNodeCache = null;
+        }
+
+        // Resolve the registry back to live nodes in the CURRENT tree, dropping
+        // IDs whose clade no longer exists (after a prune, say). The root is
+        // excluded: collapsing it would blank the whole tree, and no bulk action
+        // should ever be able to do that by accident.
+        getSelectedCladeNodes() {
+            if (!this.tree || this.selectedCladeIds.size === 0) return [];
+            if (this._cladeNodeCache
+                && this._cladeNodeCache.revision === this._cladeSelectionRevision) {
+                return this._cladeNodeCache.nodes;
+            }
+            const wanted = new Set(this.selectedCladeIds);
+            const found = new Map();
+            this.tree.traverse_and_compute((node) => {
+                if (node.parent === undefined || node.parent === null) return;
+                const cladeId = this._getCladeId(node);
+                if (cladeId && wanted.has(cladeId) && !found.has(cladeId)) {
+                    found.set(cladeId, node);
+                }
+            });
+            const nodes = Array.from(found.values());
+            // Cached by object identity, not by collapsed state: the callers below
+            // re-read node.collapsed on every call, so a collapse never needs to
+            // invalidate this.
+            this._cladeNodeCache = { revision: this._cladeSelectionRevision, nodes };
+            return nodes;
+        }
+
+        // Reduce a set of clades to the MAXIMAL non-overlapping ones: a clade with
+        // a selected ancestor in the same set is dropped. Selecting a clade and one
+        // of its descendants and asking to collapse both means one visible collapse,
+        // not two, and the descendant would vanish under the ancestor's wedge anyway.
+        _maximalClades(nodes) {
+            const members = new Set(nodes);
+            const hasSelectedAncestor = (node) => {
+                let cursor = node.parent;
+                while (cursor) {
+                    if (members.has(cursor)) return true;
+                    cursor = cursor.parent;
+                }
+                return false;
+            };
+            return nodes.filter((node) => !hasSelectedAncestor(node));
+        }
+
+        // What a bulk collapse would fold: maximal selected clades not already
+        // collapsed. Deliberately deterministic and order-preserving.
+        getBulkCollapseTargets() {
+            const selected = this.getSelectedCladeNodes();
+            if (selected.length === 0) return [];
+            return this._maximalClades(selected).filter((node) => !node.collapsed);
+        }
+
+        // What a bulk expand would unfold: every selected clade that is collapsed,
+        // WITHOUT the maximal-clade reduction. Expanding is idempotent and cannot
+        // hide anything, and reducing here would strand a nested collapsed clade
+        // permanently behind its expanded ancestor.
+        getBulkExpandTargets() {
+            return this.getSelectedCladeNodes().filter((node) => Boolean(node.collapsed));
+        }
+
+        // Count of clades a bulk action currently has to work with, for menu labels.
+        getSelectedCladeCount() {
+            return this.getSelectedCladeNodes().length;
+        }
+
+        // Repaint after a collapse change. phylotree's own menu item only calls
+        // update(), which leaves Dikarya's support labels, event handlers and
+        // selection colors describing the pre-collapse SVG.
+        _refreshAfterCollapse() {
+            const display = this.tree?.display;
+            if (!display || typeof display.update !== 'function') {
+                this._draw();
+                return;
+            }
+            display.update();
+            this._addSupportLabels();
+            this._attachEventHandlers();
+            this._updateNodeStylesOnly();
+            this._applyTextSizingFromZoom();
+            this._scheduleAnnotationRedraw();
+        }
+
+        // Record the one-slot undo entry and tell the controller a collapse happened.
+        // `collapsed` is the direction the action moved in, so the controller can word
+        // its message without parsing the undo label.
+        _recordCollapseUndo(entries, label, collapsed) {
+            if (!entries.length) return;
+            this._collapseUndo = { entries, label };
+            if (typeof this.callbacks.onCollapseChange === 'function') {
+                this.callbacks.onCollapseChange({ label, count: entries.length, collapsed });
+            }
+        }
+
+        // Apply one collapsed state to a list of clades in a single repaint.
+        // Returns the number of clades actually changed.
+        _setCladesCollapsed(nodes, collapsed, label) {
+            const display = this.tree?.display;
+            if (!display || typeof display.toggleCollapse !== 'function') return 0;
+            const changed = nodes.filter((node) => Boolean(node.collapsed) !== collapsed);
+            if (changed.length === 0) return 0;
+            this._bulkCollapseInProgress = true;
+            try {
+                changed.forEach((node) => display.toggleCollapse(node));
+            } finally {
+                this._bulkCollapseInProgress = false;
+            }
+            this._refreshAfterCollapse();
+            this._recordCollapseUndo(
+                changed.map((node) => ({ node, collapsed: !collapsed })),
+                label || `${collapsed ? 'collapse' : 'expand'} of ${changed.length} clade${changed.length === 1 ? '' : 's'}`,
+                collapsed
+            );
+            return changed.length;
+        }
+
+        // Collapse the current bulk target set. Returns how many clades folded.
+        collapseSelectedClades() {
+            const targets = this.getBulkCollapseTargets();
+            const count = targets.length;
+            return this._setCladesCollapsed(
+                targets, true,
+                `collapse of ${count} clade${count === 1 ? '' : 's'}`
+            );
+        }
+
+        // Expand every selected clade that is currently collapsed.
+        expandSelectedClades() {
+            const targets = this.getBulkExpandTargets();
+            const count = targets.length;
+            return this._setCladesCollapsed(
+                targets, false,
+                `expand of ${count} clade${count === 1 ? '' : 's'}`
+            );
+        }
+
+        // Is a collapse/expand available to undo?
+        hasCollapseUndo() {
+            return Boolean(this._collapseUndo && this._collapseUndo.entries.length);
+        }
+
+        // Label for the pending collapse undo, e.g. "collapse of 4 clades".
+        getCollapseUndoLabel() {
+            return this._collapseUndo ? this._collapseUndo.label : null;
+        }
+
+        // Restore the collapse state captured before the last collapse/expand and
+        // consume the entry. Returns the label of what was undone, or null.
+        undoLastCollapseChange() {
+            if (!this.hasCollapseUndo()) return null;
+            const { entries, label } = this._collapseUndo;
+            this._collapseUndo = null;
+            const display = this.tree?.display;
+            if (!display || typeof display.toggleCollapse !== 'function') return null;
+            this._bulkCollapseInProgress = true;
+            try {
+                entries.forEach(({ node, collapsed }) => {
+                    if (Boolean(node.collapsed) !== Boolean(collapsed)) display.toggleCollapse(node);
+                });
+            } finally {
+                this._bulkCollapseInProgress = false;
+            }
+            this._refreshAfterCollapse();
+            return label;
+        }
+
+        // Forget the pending collapse undo (the tree it referred to is gone).
+        clearCollapseUndo() {
+            this._collapseUndo = null;
+        }
+
+        // Watch phylotree's own collapse item so a single "Collapse Clade" from the
+        // context menu is undoable too. The event carries the node and its NEW
+        // state, so the previous state is simply its negation.
+        _hookNativeCollapseEvents() {
+            const display = this.tree?.display;
+            if (!display || typeof display.on !== 'function') return;
+            if (this._nativeCollapseHandler) display.off?.('collapsed', this._nativeCollapseHandler);
+            this._nativeCollapseHandler = (node, collapsed) => {
+                if (this._bulkCollapseInProgress) return;
+                this._recordCollapseUndo(
+                    [{ node, collapsed: !collapsed }],
+                    collapsed ? 'collapse of 1 clade' : 'expand of 1 clade',
+                    collapsed
+                );
+                // toggleCollapse() emits BEFORE phylotree's own menu handler calls
+                // update(), so refreshing inline would rebuild support labels and
+                // event handlers against the pre-collapse SVG and then have them
+                // wiped by that update. Deferring one turn puts this last.
+                if (this._nativeCollapseRefreshTimer) clearTimeout(this._nativeCollapseRefreshTimer);
+                this._nativeCollapseRefreshTimer = setTimeout(() => {
+                    this._nativeCollapseRefreshTimer = null;
+                    this._refreshAfterCollapse();
+                }, 0);
+            };
+            display.on('collapsed', this._nativeCollapseHandler);
         }
 
         // --- SELECTION SET MANAGEMENT (CRUD) ---
@@ -3780,6 +4151,9 @@
             const wanted = new Set(Array.isArray(ids) ? ids.filter(Boolean) : []);
             this.currentSelectionIds.clear();
             this.hiddenSelectionIds.clear();
+            // Alan 8/24/26 - This REPLACES the selection with a leaf set, so no clade stays selected.
+            this.selectedCladeIds.clear();
+            this._invalidateCladeSelection();
             let matched = 0;
             for (const node of this.allNodes) {
                 const id = this._getNodeId(node);

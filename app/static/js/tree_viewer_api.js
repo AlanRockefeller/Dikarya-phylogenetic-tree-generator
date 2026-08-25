@@ -69,6 +69,25 @@ const TreeEditActions = {
         return data;
     },
 
+    // Alan 8/24/26 - Rename every selected tip in ONE request. Renaming one at a time
+    // saved the tree state N times and left the undo checkpoint between the renames,
+    // so undoing a multi-tip rename gave back only the last one.
+    async renameTips(jobId, renames) {
+        const response = await fetch(`/api/job/${jobId}/tree/rename`, {
+            method: 'POST',
+            headers: this._buildHeaders(),
+            credentials: "same-origin",
+            body: JSON.stringify({ renames: renames })
+        });
+        const data = await response.json().catch(() => ({}));
+        if (!response.ok) {
+            const err = new Error(data.error || data.message || `Failed to rename: ${response.status}`);
+            err.details = data;
+            throw err;
+        }
+        return data;
+    },
+
     // Alan 7/16/26 - Refresh selected observation-backed Mycomap records and persist changed tip labels.
     async refreshMycomapRecords(jobId, tipNames) {
         const response = await fetch(`/api/job/${jobId}/tree/refresh-mycomap-records`, {
@@ -204,6 +223,40 @@ const TreeEditActions = {
         if (!response.ok) {
             const err = new Error(data.error || data.message || `Failed to save annotations: ${response.status}`);
             err.details = data;
+            throw err;
+        }
+        return data;
+    },
+
+    // Alan 8/24/26 - Single-level undo of the last persisted tree edit. The checkpoint
+    // lives server-side (see app/services/tree_undo_service.py); the client only ever
+    // asks whether one exists and asks for it to be applied.
+    async getUndoState(jobId) {
+        const response = await fetch(`/api/job/${jobId}/tree/undo`, {
+            cache: "no-store",
+            credentials: "same-origin"
+        });
+        const data = await response.json().catch(() => ({}));
+        if (!response.ok) {
+            const err = new Error(data.error || data.message || `Failed to read undo state: ${response.status}`);
+            err.details = data;
+            err.status = response.status;
+            throw err;
+        }
+        return data;
+    },
+
+    async undoLastEdit(jobId) {
+        const response = await fetch(`/api/job/${jobId}/tree/undo`, {
+            method: 'POST',
+            headers: this._buildHeaders(false),
+            credentials: "same-origin"
+        });
+        const data = await response.json().catch(() => ({}));
+        if (!response.ok) {
+            const err = new Error(data.error || data.message || `Undo failed: ${response.status}`);
+            err.details = data;
+            err.status = response.status;
             throw err;
         }
         return data;

@@ -16,6 +16,8 @@ document.addEventListener('DOMContentLoaded', async () => {
     const btnMidpoint = getEl('btn-midpoint');
     // Alan 5/11/26 - Track the viewer-only deselect control separately from persistent selection-set actions.
     const btnDeselect = getEl('btn-deselect');
+    // Alan 8/24/26 - Single-level Undo control (toolbar button plus Ctrl/Cmd+Z).
+    const btnUndo = getEl('btn-undo');
     // Alan 5/13/26 - Cache the Alignment Viewer launcher so its count stays synced to tree state.
     const btnAlignmentViewer = getEl('btn-alignment-viewer');
     // Alan 5/29/26 - Cache new rooting-mode dropdown + sequence-of-interest button.
@@ -99,6 +101,88 @@ document.addEventListener('DOMContentLoaded', async () => {
     // Alan 5/11/26 - Hold only the clicked/current selection being edited in the rename modal.
     let pendingRenameItems = [];
     let updateSelectionSetUI = () => {}; // assigned in wireUI()
+    // ======================================================================
+    // Alan 8/24/26 - SINGLE-LEVEL UNDO
+    //
+    // Two kinds of undoable action share one visible slot:
+    //
+    //   viewer  collapse/expand of clades. Pure display state living on the
+    //           phylotree nodes, so undoing it is local and instant.
+    //   server  the last persisted edit (prune / rename / rotate / reroot /
+    //           rooting change). The checkpoint is a file snapshot held by
+    //           app/services/tree_undo_service.py; `serverUndoState` is only
+    //           this tab's view of whether one exists.
+    //
+    // The newer of the two wins, so the button always describes the thing the
+    // user just did. Undoing a collapse falls back to the persisted checkpoint
+    // if one is still there, which is why prune -> collapse -> Undo -> Undo
+    // walks back the way a user expects. There is no redo.
+    // ======================================================================
+    let serverUndoState = null;
+
+    // What Undo would do right now, or null when there is nothing to undo.
+    function currentUndoTarget() {
+        if (viewer && typeof viewer.hasCollapseUndo === 'function' && viewer.hasCollapseUndo()) {
+            return { kind: 'viewer', label: viewer.getCollapseUndoLabel() || 'the last collapse' };
+        }
+        // A persisted undo is offered only where a persisted edit is allowed:
+        // can_undo is false for a read-only visitor even though the checkpoint
+        // itself exists, so a shared link never advertises an edit it cannot make.
+        if (serverUndoState && serverUndoState.can_undo) {
+            return { kind: 'server', label: serverUndoState.label || 'the last edit' };
+        }
+        return null;
+    }
+
+    function updateUndoButton() {
+        if (!btnUndo) return;
+        const target = currentUndoTarget();
+        const disabled = !target || isProcessing;
+        btnUndo.disabled = disabled;
+        btnUndo.classList.toggle('opacity-50', disabled);
+        btnUndo.classList.toggle('cursor-not-allowed', disabled);
+        btnUndo.title = target
+            ? `Undo ${target.label} (Ctrl/Cmd+Z)`
+            : "Nothing to undo yet (Ctrl/Cmd+Z)";
+    }
+
+    // Ask the server whether a persisted checkpoint is available. Cheap, and
+    // called after every edit so the button never claims more than is true.
+    async function refreshServerUndoState() {
+        if (JOB_ID === 'unknown') { serverUndoState = null; updateUndoButton(); return; }
+        try {
+            serverUndoState = await TreeEditActions.getUndoState(JOB_ID);
+        } catch (err) {
+            // An unreadable undo state is not an error worth interrupting for;
+            // it just means Undo is not offered.
+            serverUndoState = null;
+        }
+        updateUndoButton();
+    }
+
+    // Apply whatever the single Undo slot currently holds.
+    async function performUndo() {
+        const target = currentUndoTarget();
+        if (!target || isProcessing) return;
+
+        if (target.kind === 'viewer') {
+            const label = viewer.undoLastCollapseChange();
+            if (label) showStatus(`Undid ${label}.`, "success", 2500);
+            // Consuming the collapse entry can uncover a persisted checkpoint
+            // underneath it, so the button is re-derived rather than just disabled.
+            updateButtons();
+            return;
+        }
+
+        await runBackendAction("Undo", async () => {
+            const data = await TreeEditActions.undoLastEdit(JOB_ID);
+            // The reply carries the restored state, so the Edited FASTA link is
+            // correct before the tree finishes reloading.
+            updateEditedFastaAvailability(data);
+            const label = data?.undone?.label || target.label;
+            return { finalStatus: { msg: `Undid ${label}.`, type: "success", timeout: 3500 } };
+        }, { suppressUndoHint: true });
+    }
 
     // Alan 7/20/26 - Toggle the advanced selection menu through both mouse and keyboard-accessible state.
     function setSelectionMoreMenuOpen(open) {
@@ -1995,12 +2079,15 @@ document.addEventListener('DOMContentLoaded', async () => {
         closeRenameModal();
         const count = changes.length;
         runBackendAction(`Renaming ${count} sequence${count === 1 ? '' : 's'}`, async () => {
-            for (const change of changes) {
-                const renameResult = await TreeEditActions.renameTip(JOB_ID, change.oldName, change.newName);
-                // Alan 8/15/26 - The rename response is the saved tree state, so enable Edited
-                // FASTA as soon as the first rename lands.
-                updateEditedFastaAvailability(renameResult);
-            }
+            // Alan 8/24/26 - Send the whole batch in one request. One request per name
+            // wrote the tree state once per name, and put an undo checkpoint between
+            // them, so undoing a three-tip rename handed back only the third.
+            const renames = {};
+            for (const change of changes) renames[change.oldName] = change.newName;
+            const renameResult = await TreeEditActions.renameTips(JOB_ID, renames);
+            // Alan 8/15/26 - The rename response is the saved tree state, so enable Edited
+            // FASTA as soon as the rename lands.
+            updateEditedFastaAvailability(renameResult);
         // Alan 5/11/26 - Renaming changes labels only, so saved selection sets should not be cleared.
         }, { clearSelections: false });
     }
@@ -2090,11 +2177,20 @@ document.addEventListener('DOMContentLoaded', async () => {
 
             await loadTree({ fromAction: true });
 
+            // Alan 8/24/26 - Re-read the persisted checkpoint after every action, so the
+            // Undo button describes what actually landed rather than what was attempted.
+            await refreshServerUndoState();
+
             // Alan 5/31/26 - Show the action's own final status after the reload so
             // it persists instead of being overwritten by the interim message.
             if (actionResult && actionResult.finalStatus && actionResult.finalStatus.msg) {
                 const fs = actionResult.finalStatus;
                 showStatus(fs.msg, fs.type || "info", fs.timeout != null ? fs.timeout : 4000);
+            } else if (!options.suppressUndoHint && serverUndoState && serverUndoState.can_undo) {
+                // Alan 8/24/26 - Say so in plain text rather than injecting a link:
+                // showStatus() renders text only, and an enabled Undo button is the
+                // affordance. This is what makes a destructive-looking edit feel safe.
+                showStatus(name + " completed. Undo is available.", "success", 4000);
             }
         } catch (err) {
             console.error(err);
@@ -2135,6 +2231,15 @@ document.addEventListener('DOMContentLoaded', async () => {
             onSelectionChange: (count) => {
                 // Alan 5/12/26 - Current selection is transient, so selection changes only refresh action controls.
                 updateButtons();
+            },
+            // Alan 8/24/26 - A collapse/expand is a viewer-only change, so it never touches the
+            // server; it only claims the single Undo slot and reports what it folded.
+            onCollapseChange: (change) => {
+                updateButtons();
+                if (!change || !change.count) return;
+                const verb = change.collapsed ? 'Collapsed' : 'Expanded';
+                const what = change.count === 1 ? '1 clade' : `${change.count} clades`;
+                showStatus(`${verb} ${what}. Undo is available.`, "success", 2500);
             },
             // Alan 5/11/26 - Let the viewer report completed box-select gestures for concise feedback.
             onBoxSelect: (result) => {
@@ -2295,6 +2400,11 @@ document.addEventListener('DOMContentLoaded', async () => {
             } catch (stateErr) {
                 console.warn("Could not fetch tree state:", stateErr);
             }
+
+            // Alan 8/24/26 - viewer.render() replaced every node object, so any collapse the
+            // viewer was holding an undo entry for no longer exists; the persisted checkpoint,
+            // which is a file snapshot, does survive and is re-read here.
+            await refreshServerUndoState();
 
             // Restore display preferences (font sizes, spacing) from localStorage
             restoreDisplayPrefs();
@@ -3458,11 +3568,25 @@ document.addEventListener('DOMContentLoaded', async () => {
         // Alan 7/20/26 - Route button clicks through the same reliable deselect action used by the D hotkey.
         if (btnDeselect) btnDeselect.addEventListener('click', deselectCurrentTreeSelection);
 
+        // Alan 8/24/26 - Toolbar Undo. Kept in sync with Ctrl/Cmd+Z through the same
+        // performUndo(), so there is one code path and one notion of what is undoable.
+        if (btnUndo) btnUndo.addEventListener('click', () => { performUndo(); });
+
         if (btnRecompute) btnRecompute.addEventListener('click', async () => {
             if (!confirm("Recompute tree?")) return;
             btnRecompute.disabled = true;
             try {
                 const result = await TreeEditActions.recomputeTree(JOB_ID);
+                // Alan 8/24/26 - Recompute is not undoable and the server drops the
+                // checkpoint the moment a run is created, so stop offering it here too
+                // rather than leaving a button that would 409 on the next click. Only
+                // for a run this click actually created: a duplicate click reports
+                // already_queued and cleared nothing server-side.
+                if (result && result.status === 'queued') {
+                    serverUndoState = null;
+                    if (viewer && typeof viewer.clearCollapseUndo === 'function') viewer.clearCollapseUndo();
+                    updateButtons();
+                }
                 showStatus(result.message || "Tree recompute queued.", "success", 2500);
                 setTimeout(() => {
                     window.location.href = result.redirect_url || `/job/${JOB_ID}`;
@@ -3539,6 +3663,15 @@ document.addEventListener('DOMContentLoaded', async () => {
 
 
 
+        // Alan 8/24/26 - A keystroke belongs to a text control, not to the tree, whenever
+        // focus is in one. This is what keeps Ctrl/Cmd+Z editing the rename field, the
+        // annotation label box or any contenteditable exactly as the browser intends.
+        const isTextEntryTarget = (target) => target instanceof HTMLElement
+            && (target.isContentEditable || ['INPUT', 'TEXTAREA', 'SELECT'].includes(target.tagName));
+        const anyModalOpen = () => Boolean(
+            document.querySelector('[role="dialog"][aria-modal="true"]:not(.hidden)')
+        );
+
         document.addEventListener('keydown', (e) => {
             // Alan 7/20/26 - Close keyboard help before handling viewer modes or other Escape behavior.
             if (e.key === 'Escape' && shortcutHelpModal && !shortcutHelpModal.classList.contains('hidden')) {
@@ -3583,11 +3716,26 @@ document.addEventListener('DOMContentLoaded', async () => {
                 return;
             }
 
+            // Alan 8/24/26 - Ctrl+Z / Cmd+Z is the one deliberately modified hotkey, so it is
+            // handled before the guard below rejects every modified keystroke. Shift+Ctrl+Z is
+            // left alone: it is the browser's redo, and there is no tree redo to claim it for.
+            if ((e.key === 'z' || e.key === 'Z') && (e.ctrlKey || e.metaKey)
+                && !e.altKey && !e.shiftKey && !e.repeat) {
+                // Inside a text control the browser's own undo must win, untouched.
+                if (isTextEntryTarget(e.target) || anyModalOpen()) return;
+                // Mid-edit the tree is about to be replaced; taking an undo now would
+                // race the mutation that is still running.
+                if (isProcessing) return;
+                if (!currentUndoTarget()) return;
+                e.preventDefault();
+                performUndo();
+                return;
+            }
+
             // Alan 7/20/26 - Handle safe viewer hotkeys only outside text controls, dialogs, and modified browser shortcuts.
             const target = e.target;
-            const isTyping = target instanceof HTMLElement
-                && (target.isContentEditable || ['INPUT', 'TEXTAREA', 'SELECT'].includes(target.tagName));
-            const modalOpen = Boolean(document.querySelector('[role="dialog"][aria-modal="true"]:not(.hidden)'));
+            const isTyping = isTextEntryTarget(target);
+            const modalOpen = anyModalOpen();
             if (e.repeat || e.ctrlKey || e.metaKey || e.altKey || isTyping || modalOpen) return;
 
             const key = e.key.length === 1 ? e.key.toLowerCase() : e.key;
@@ -3660,6 +3808,10 @@ document.addEventListener('DOMContentLoaded', async () => {
     }
 
     function updateButtons() {
+        // Alan 8/24/26 - Refreshed before the viewer guard and before every early
+        // return below, so the Undo button is correct in view-only mode, while an
+        // action is in flight, and before a tree has finished loading.
+        updateUndoButton();
         if (!viewer) return;
 
         // Multi-select check
