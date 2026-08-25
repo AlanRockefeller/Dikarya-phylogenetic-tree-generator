@@ -12,6 +12,7 @@ from app.user import bp
 from app.extensions import db
 from app.models import Job, ApiToken
 from app.api_v1.auth import generate_token, ALL_SCOPES
+from app.services.security_utils import validate_job_id
 
 logger = logging.getLogger(__name__)
 
@@ -48,18 +49,24 @@ def clear_jobs():
     are still in the staging area.
     """
     import shutil
-    import os
     import time
     from pathlib import Path
 
     from app.config import Config
 
-    def _inside_job_dir(candidate: Path) -> bool:
-        """Never move or delete anything outside the job storage area."""
+    def _canonical_job_dir(job) -> Path | None:
+        """Return a trusted canonical path, or None for a corrupt row."""
+        if not validate_job_id(job.id):
+            return None
+        candidate = Config.JOB_DIR / job.id
         try:
-            return candidate.resolve().is_relative_to(Config.JOB_DIR.resolve())
-        except OSError:
-            return False
+            if Path(job.job_dir).resolve() != candidate.resolve():
+                return None
+            if not candidate.resolve().is_relative_to(Config.JOB_DIR.resolve()):
+                return None
+        except (OSError, TypeError, ValueError):
+            return None
+        return candidate
 
     jobs = Job.query.filter_by(user_id=current_user.id).all()
     removed_rows = 0
@@ -68,32 +75,31 @@ def clear_jobs():
     trash_root = Config.JOB_DIR / ".trash"
 
     for job in jobs:
-        if job.job_dir and os.path.exists(job.job_dir):
-            candidate = Path(job.job_dir)
-            if not _inside_job_dir(candidate):
+        candidate = _canonical_job_dir(job)
+        if candidate is None:
+            failed_dirs.append(job.id)
+            logger.warning(
+                "event=jobs.clear_invalid_job_path job=%s dir=%s "
+                "The history row was still removed; its invalid or "
+                "non-canonical path was left untouched.",
+                job.id, job.job_dir,
+            )
+        elif candidate.exists():
+            try:
+                trash_root.mkdir(parents=True, exist_ok=True)
+                staged = trash_root / f"{job.id}.{int(time.time() * 1000)}"
+                candidate.rename(staged)
+                staged_entries.append((job.id, candidate, staged))
+            except OSError as e:
+                # Staging failed, so nothing was destroyed: the row goes
+                # anyway (as it always has) and the files are reported as
+                # still present rather than silently leaked.
                 failed_dirs.append(job.id)
                 logger.warning(
-                    "event=jobs.clear_dir_outside_job_dir job=%s dir=%s "
-                    "The history row was still removed; the path is outside "
-                    "var/jobs and was left untouched.",
-                    job.id, job.job_dir,
+                    "event=jobs.clear_dir_failed job=%s dir=%s error=%s "
+                    "The history row was still removed; the files remain on disk.",
+                    job.id, job.job_dir, type(e).__name__,
                 )
-            else:
-                try:
-                    trash_root.mkdir(parents=True, exist_ok=True)
-                    staged = trash_root / f"{job.id}.{int(time.time() * 1000)}"
-                    candidate.rename(staged)
-                    staged_entries.append((job.id, candidate, staged))
-                except OSError as e:
-                    # Staging failed, so nothing was destroyed: the row goes
-                    # anyway (as it always has) and the files are reported as
-                    # still present rather than silently leaked.
-                    failed_dirs.append(job.id)
-                    logger.warning(
-                        "event=jobs.clear_dir_failed job=%s dir=%s error=%s "
-                        "The history row was still removed; the files remain on disk.",
-                        job.id, job.job_dir, type(e).__name__,
-                    )
         db.session.delete(job)
         removed_rows += 1
 

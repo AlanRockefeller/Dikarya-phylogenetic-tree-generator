@@ -596,7 +596,8 @@ class ClearJobsReportingTests(unittest.TestCase):
     """
 
     def _run(self, *, rmtree_error=None, commit_error=None, rename_error=None,
-             outside_job_dir=False, restore_error=None, restore_fails_for=None):
+             outside_job_dir=False, restore_error=None, restore_fails_for=None,
+             corrupt_rows=None):
         import shutil
         import tempfile
         from pathlib import Path as _Path
@@ -611,13 +612,19 @@ class ClearJobsReportingTests(unittest.TestCase):
         outside = _Path(tmp) / "elsewhere"
         outside.mkdir()
 
-        jobs = []
-        for name in ("job-a", "job-b"):
-            parent = outside if outside_job_dir else job_root
-            directory = parent / name
-            directory.mkdir()
-            (directory / "tree_state.json").write_text("{}")
-            jobs.append(SimpleNamespace(id=name, job_dir=str(directory)))
+        if corrupt_rows is not None:
+            jobs = corrupt_rows(job_root, outside)
+        else:
+            jobs = []
+            for name in (
+                "11111111-1111-4111-8111-111111111111",
+                "22222222-2222-4222-8222-222222222222",
+            ):
+                parent = outside if outside_job_dir else job_root
+                directory = parent / name
+                directory.mkdir()
+                (directory / "tree_state.json").write_text("{}")
+                jobs.append(SimpleNamespace(id=name, job_dir=str(directory)))
 
         flashes = []
         db = MagicMock()
@@ -698,7 +705,40 @@ class ClearJobsReportingTests(unittest.TestCase):
         self.assertEqual(category, "warning")
         for job in result.jobs:
             self.assertTrue(Path(job.job_dir).is_dir())
-        self.assertIn("jobs.clear_dir_outside_job_dir", result.warn.call_args[0][0])
+        self.assertIn("jobs.clear_invalid_job_path", result.warn.call_args[0][0])
+
+    def test_a_traversal_job_id_cannot_shape_a_staging_or_deletion_path(self):
+        def corrupt_rows(job_root, outside):
+            victim = outside / "victim"
+            victim.mkdir()
+            (victim / "keep.txt").write_text("keep")
+            return [SimpleNamespace(id="../victim", job_dir=str(victim))]
+
+        result = self._run(corrupt_rows=corrupt_rows)
+
+        victim = Path(result.jobs[0].job_dir)
+        self.assertEqual((victim / "keep.txt").read_text(), "keep")
+        trash = result.job_root / ".trash"
+        self.assertEqual(list(trash.iterdir()) if trash.exists() else [], [])
+        self.assertEqual(result.db.session.delete.call_count, 1)
+        self.assertIn("jobs.clear_invalid_job_path", result.warn.call_args[0][0])
+
+    def test_a_row_pointing_at_another_jobs_directory_cannot_delete_it(self):
+        def corrupt_rows(job_root, _outside):
+            row_id = "11111111-1111-4111-8111-111111111111"
+            other_id = "22222222-2222-4222-8222-222222222222"
+            other = job_root / other_id
+            other.mkdir()
+            (other / "keep.txt").write_text("keep")
+            return [SimpleNamespace(id=row_id, job_dir=str(other))]
+
+        result = self._run(corrupt_rows=corrupt_rows)
+
+        other = Path(result.jobs[0].job_dir)
+        self.assertEqual((other / "keep.txt").read_text(), "keep")
+        trash = result.job_root / ".trash"
+        self.assertEqual(list(trash.iterdir()) if trash.exists() else [], [])
+        self.assertIn("jobs.clear_invalid_job_path", result.warn.call_args[0][0])
 
     def test_a_commit_failure_puts_every_artifact_back(self):
         result = self._run(commit_error=RuntimeError("db is down"))
@@ -722,7 +762,7 @@ class ClearJobsReportingTests(unittest.TestCase):
         result = self._run(
             commit_error=RuntimeError("db is down"),
             restore_error=OSError("cross-device link"),
-            restore_fails_for="job-a",
+            restore_fails_for="11111111-1111-4111-8111-111111111111",
         )
 
         message, category = result.flashes[0]
@@ -736,12 +776,12 @@ class ClearJobsReportingTests(unittest.TestCase):
 
         result.db.session.rollback.assert_called_once()
 
-        # job-b restored cleanly; job-a did not and its bytes are still staged.
+        # The second job restored cleanly; the first did not and its bytes are still staged.
         job_a, job_b = result.jobs
         self.assertTrue(Path(job_b.job_dir).is_dir())
         self.assertFalse(Path(job_a.job_dir).exists())
         staged = list((result.job_root / ".trash").iterdir())
-        self.assertEqual([entry.name.split(".")[0] for entry in staged], ["job-a"])
+        self.assertTrue(staged[0].name.startswith(job_a.id + "."))
         # Left intact for manual recovery, not cleaned up.
         self.assertTrue((staged[0] / "tree_state.json").is_file())
 
@@ -750,7 +790,7 @@ class ClearJobsReportingTests(unittest.TestCase):
                     if "jobs.clear_restore_failed" in call[0][0]]
         self.assertEqual(len(recovery), 1)
         template, job_id, staged_path, source_path = recovery[0][0]
-        self.assertEqual(job_id, "job-a")
+        self.assertEqual(job_id, job_a.id)
         self.assertEqual(Path(staged_path), staged[0])
         self.assertEqual(Path(source_path), Path(job_a.job_dir))
         # The degradation line is countable by `grep DEGRADED`.

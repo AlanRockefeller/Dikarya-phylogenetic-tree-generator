@@ -33,6 +33,7 @@ const assert = require('assert');
 
 const REPO = process.argv[2] || path.resolve(__dirname, '..', '..');
 const AS_JSON = process.argv.includes('--json');
+const SELF_TEST_ASYNC_FAILURE = process.argv.includes('--self-test-async-failure');
 
 const SCRIPTS = [
     'app/static/vendor/d3.v7.min.js',
@@ -73,7 +74,7 @@ function makeStub(name) {
     });
 }
 
-function buildSandbox({ fetchImpl } = {}) {
+function buildSandbox({ fetchImpl, exposeControllerTestHooks = false } = {}) {
     const docListeners = [];
     const winListeners = [];
     const doc = {
@@ -151,7 +152,14 @@ function buildSandbox({ fetchImpl } = {}) {
     ctx.self = ctx;
     for (const rel of SCRIPTS) {
         if (rel === '@alias:_$1') { ctx._$1 = ctx._; continue; }
-        vm.runInContext(fs.readFileSync(path.join(REPO, rel), 'utf8'), ctx, { filename: rel });
+        let source = fs.readFileSync(path.join(REPO, rel), 'utf8');
+        if (exposeControllerTestHooks && rel.endsWith('tree_viewer_controller.js')) {
+            const marker = '    // START\n    loadTree();';
+            assert.ok(source.includes(marker), 'controller test-hook marker drifted');
+            source = source.replace(marker,
+                '    window.__testScheduleSelectionSetSave = debouncedSaveSelectionSets;\n\n' + marker);
+        }
+        vm.runInContext(source, ctx, { filename: rel });
     }
     return { ctx, docListeners, winListeners };
 }
@@ -226,16 +234,36 @@ function select(viewer, nodes) {
 
 // ---------------------------------------------------------------------------
 const results = [];
+const pendingTests = [];
 function test(group, name, fn) {
+    const result = { group, name, ok: false, error: '' };
+    results.push(result);
     try {
-        fn();
-        results.push({ group, name, ok: true, error: '' });
+        const returned = fn();
+        if (returned && typeof returned.then === 'function') {
+            const tracked = Promise.resolve(returned).then(() => {
+                result.ok = true;
+            }, (e) => {
+                result.error = `${e.name}: ${e.message}`;
+            });
+            pendingTests.push(tracked);
+            return tracked;
+        }
+        result.ok = true;
     } catch (e) {
-        results.push({ group, name, ok: false, error: `${e.name}: ${e.message}` });
+        result.error = `${e.name}: ${e.message}`;
     }
+    return Promise.resolve();
 }
 
 function main() {
+    if (SELF_TEST_ASYNC_FAILURE) {
+        test('async-accounting', 'a rejected async assertion keeps its test name', async () => {
+            await Promise.resolve();
+            assert.fail('intentional async assertion failure');
+        });
+        return Promise.resolve();
+    }
     const { ctx } = buildSandbox();
 
     // --- stable clade IDs ---------------------------------------------------
@@ -497,6 +525,11 @@ function main() {
 function keyboardTests() {
     const JOB = '00000000-0000-0000-0000-000000000000';
     const posts = [];
+    let persistedState = {
+        renames: {}, pruned_taxa: [], root_mode: 'MIDPOINT', is_midpoint_rooted: true,
+        selection_sets: { Stale: ['B'] }, active_selection_set: 'Stale',
+        selection_set_colors: { Stale: '#ff0000' },
+    };
 
     function jsonResponse(body) {
         return Promise.resolve({
@@ -509,7 +542,7 @@ function keyboardTests() {
 
     const fetchImpl = (url, opts = {}) => {
         const method = opts.method || 'GET';
-        if (method !== 'GET') posts.push({ url, method });
+        if (method !== 'GET') posts.push({ url, method, body: opts.body });
         if (url.endsWith('/tree/undo') && method === 'GET') {
             return jsonResponse({
                 status: 'success', available: true, can_undo: true,
@@ -517,18 +550,39 @@ function keyboardTests() {
             });
         }
         if (url.endsWith('/tree/undo')) {
+            persistedState = {
+                renames: {}, pruned_taxa: [], root_mode: 'MIDPOINT', is_midpoint_rooted: true,
+                selection_sets: { Restored: ['A'] }, active_selection_set: 'Restored',
+                selection_set_colors: { Restored: '#00ff00' },
+            };
             return jsonResponse({ undone: { operation: 'prune', label: 'prune of 18 sequences' } });
+        }
+        if (url.endsWith('/tree/selection_sets') && method === 'POST') {
+            const stale = JSON.parse(opts.body);
+            persistedState = {
+                ...persistedState,
+                selection_sets: stale.sets,
+                active_selection_set: stale.active,
+                selection_set_colors: stale.colors,
+            };
+            return jsonResponse({ status: 'ok' });
         }
         if (url.includes('/download/tree/newick')) {
             return Promise.resolve({ ok: true, status: 200, text: () => Promise.resolve(NEWICK) });
         }
         if (url.includes('/tree/state')) {
-            return jsonResponse({ renames: {}, pruned_taxa: [], root_mode: 'MIDPOINT', is_midpoint_rooted: true });
+            return jsonResponse(persistedState);
         }
         return jsonResponse({ status: 'ok' });
     };
 
-    const { ctx, docListeners } = buildSandbox({ fetchImpl });
+    const { ctx, docListeners } = buildSandbox({
+        fetchImpl,
+        // The debounce helper is deliberately closure-private in production.
+        // Expose that exact shipped function inside this VM so the race test
+        // can arrange the state that existed immediately before Undo.
+        exposeControllerTestHooks: true,
+    });
     const domReady = docListeners.filter(([t]) => t === 'DOMContentLoaded').map(([, fn]) => fn);
     if (!domReady.length) {
         results.push({ group: 'keyboard', name: 'controller registers a bootstrap', ok: false,
@@ -587,19 +641,34 @@ function keyboardTests() {
             assert.strictEqual(undoPosts(), before);
         });
 
-        test('keyboard', 'Ctrl+Z outside a text field undoes the last tree edit', () => {
+        return test('keyboard', 'Ctrl+Z outside a text field undoes the last tree edit', () => {
             const before = undoPosts();
+            ctx.__testScheduleSelectionSetSave();
             const prevented = fire({ ctrlKey: true, target: bodyTarget });
             assert.strictEqual(prevented, true, 'the hotkey must claim the keystroke');
-            return new Promise((r) => setTimeout(r, 30)).then(() => {
+            // Cross the real 800 ms debounce boundary. If performUndo stops
+            // cancelling the pending timer, the stale selection-set POST now
+            // fires even though clearSelections:false remains in place.
+            return new Promise((r) => setTimeout(r, 850)).then(() => {
                 assert.strictEqual(undoPosts(), before + 1);
+                const selectionPosts = posts.filter(
+                    (p) => p.url.endsWith('/tree/selection_sets') && p.method === 'POST'
+                );
+                assert.deepStrictEqual(selectionPosts, [],
+                    'the pre-Undo debounced selection-set save was not cancelled');
             });
-        });
-
-        // The click above resolves asynchronously; give it a turn, then check Cmd.
-        return new Promise((r) => setTimeout(r, 60)).then(() => {
+        }).then(() => {
             test('keyboard', 'Ctrl+Z outside a text field posted an undo', () => {
                 assert.ok(undoPosts() >= 1, 'no undo request was made');
+            });
+            test('keyboard', 'Undo preserves restored persistent color membership', () => {
+                const selectionPosts = posts.filter(
+                    (p) => p.url.endsWith('/tree/selection_sets') && p.method === 'POST'
+                );
+                assert.deepStrictEqual(selectionPosts, [],
+                    'Undo posted pre-restore selection-set state');
+                assert.deepStrictEqual(persistedState.selection_sets, { Restored: ['A'] });
+                assert.strictEqual(persistedState.selection_set_colors.Restored, '#00ff00');
             });
             const before = undoPosts();
             fire({ metaKey: true, target: bodyTarget });
@@ -612,7 +681,7 @@ function keyboardTests() {
     });
 }
 
-Promise.resolve(main()).then(() => {
+Promise.resolve(main()).then(() => Promise.all(pendingTests)).then(() => {
     if (AS_JSON) {
         process.stdout.write(JSON.stringify(results));
         return;

@@ -20,8 +20,12 @@ the DOM is a stub, so a wrong SVG transform passes. That is what
 import json
 import shutil
 import subprocess
+import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
+
+from scripts import dikarya_viewer_smoke as live_smoke
 
 REPO = Path(__file__).resolve().parents[1]
 HARNESS = Path(__file__).resolve().parent / "js" / "viewer_init_smoke.test.js"
@@ -81,6 +85,60 @@ class ViewerInitSmokeTests(unittest.TestCase):
         forever. They are all caught here.
         """
         self._assert_ok("bootstrap-runs-without-throwing")
+
+
+class ServedAssetIntegrityTests(unittest.TestCase):
+    def test_cross_origin_static_looking_script_is_rejected(self):
+        self.assertIsNone(
+            live_smoke.local_path_for(
+                "https://attacker.example/static/js/tree_viewer_controller.js",
+                "https://dikarya.us",
+            )
+        )
+        self.assertEqual(
+            live_smoke.local_path_for(
+                "https://dikarya.us/static/js/tree_viewer_controller.js?v=1",
+                "https://dikarya.us",
+            ),
+            "app/static/js/tree_viewer_controller.js",
+        )
+
+    def test_mismatched_remote_bytes_are_never_mirrored_for_execution(self):
+        with (
+            tempfile.TemporaryDirectory() as repo_tmp,
+            tempfile.TemporaryDirectory() as mirror_tmp,
+        ):
+            repo = Path(repo_tmp)
+            rel = "app/static/js/example.js"
+            trusted = repo / rel
+            trusted.parent.mkdir(parents=True)
+            trusted.write_bytes(b"globalThis.executed = 'trusted';\n")
+
+            with patch.object(live_smoke, "REPO", repo):
+                matched = live_smoke.mirror_verified_asset(
+                    rel, b"globalThis.executed = 'remote';\n", Path(mirror_tmp)
+                )
+
+            self.assertFalse(matched)
+            self.assertFalse((Path(mirror_tmp) / rel).exists())
+
+    def test_matching_remote_bytes_are_mirrored_from_the_trusted_checkout(self):
+        with (
+            tempfile.TemporaryDirectory() as repo_tmp,
+            tempfile.TemporaryDirectory() as mirror_tmp,
+        ):
+            repo = Path(repo_tmp)
+            rel = "app/static/js/example.js"
+            trusted = repo / rel
+            trusted.parent.mkdir(parents=True)
+            body = b"globalThis.executed = 'trusted';\n"
+            trusted.write_bytes(body)
+
+            with patch.object(live_smoke, "REPO", repo):
+                matched = live_smoke.mirror_verified_asset(rel, body, Path(mirror_tmp))
+
+            self.assertTrue(matched)
+            self.assertEqual((Path(mirror_tmp) / rel).read_bytes(), body)
 
 
 if __name__ == "__main__":

@@ -91,15 +91,18 @@ def _schemas():
                             "type": ["boolean", "null"],
                             "description": (
                                 "Whether terminal-overhang trimming was applied. "
-                                "Null for jobs stored before the option existed."
+                                "Null when the option was not recorded (including "
+                                "legacy jobs) or its stored value is not a "
+                                "recognized boolean."
                             ),
                         },
                         "fix_orientation": {
                             "type": ["boolean", "null"],
                             "description": (
                                 "Whether backwards sequences were reverse-complemented before "
-                                "alignment. Null for jobs stored before the option existed; "
-                                "those ran with it on."
+                                "alignment. Null when the option was not recorded "
+                                "(including legacy jobs, which ran with it on) or "
+                                "its stored value is not a recognized boolean."
                             ),
                         },
                         "tree_method": {"type": "string"},

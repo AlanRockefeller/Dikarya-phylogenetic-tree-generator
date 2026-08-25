@@ -308,7 +308,7 @@
         // user never asked for (and dropping the letters, which belong in the
         // separate prefix field). Surrounding whitespace is still fine -- it is
         // trimmed above, exactly as the server strips it.
-        const match = rawStart.match(/^\d+$/);
+        const match = rawStart.match(/^[0-9]+$/);
         if (!match || match[0].length > MAX_VOUCHER_NUMBER_DIGITS) {
             return { start: 1n, width: 3, tooLong: Boolean(match) };
         }

@@ -210,6 +210,29 @@ class CheckpointLifecycleTests(unittest.TestCase):
             self.assertEqual(describe_undo_checkpoint(job_dir), {"available": False})
             self.assertFalse((job_dir / UNDO_DIR_NAME).exists())
 
+    def test_direct_undo_refuses_expired_checkpoint_without_restoring(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            job_dir = _make_job(Path(tmp))
+            with undo_checkpoint(job_dir, "rename", "rename") as checkpoint:
+                checkpoint.commit()
+
+            state = load_tree_state(job_dir)
+            state["renames"] = {"A": "live edit must survive"}
+            save_tree_state(job_dir, state)
+
+            manifest_path = job_dir / UNDO_DIR_NAME / "manifest.json"
+            manifest = json.loads(manifest_path.read_text())
+            manifest["created_at"] = time.time() - (30 * 24 * 3600)
+            manifest_path.write_text(json.dumps(manifest))
+
+            with self.assertRaises(UndoUnavailable):
+                undo_last_edit(job_dir)
+
+            self.assertEqual(
+                load_tree_state(job_dir)["renames"], {"A": "live edit must survive"}
+            )
+            self.assertFalse((job_dir / UNDO_DIR_NAME).exists())
+
     def test_a_checkpoint_without_its_state_is_refused_not_half_applied(self):
         with tempfile.TemporaryDirectory() as tmp:
             job_dir = _make_job(Path(tmp))

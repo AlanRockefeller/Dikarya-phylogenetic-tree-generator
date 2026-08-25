@@ -174,6 +174,11 @@ document.addEventListener('DOMContentLoaded', async () => {
             return;
         }
 
+        // A queued selection-set write contains the state from before Undo.
+        // Cancel it before the restore request, then skip runBackendAction's
+        // normal post-edit selection cleanup so the restored checkpoint stays
+        // authoritative until loadTree() reads it back.
+        cancelPendingSelectionSetSave();
         await runBackendAction("Undo", async () => {
             const data = await TreeEditActions.undoLastEdit(JOB_ID);
             // The reply carries the restored state, so the Edited FASTA link is
@@ -181,7 +186,7 @@ document.addEventListener('DOMContentLoaded', async () => {
             updateEditedFastaAvailability(data);
             const label = data?.undone?.label || target.label;
             return { finalStatus: { msg: `Undid ${label}.`, type: "success", timeout: 3500 } };
-        }, { suppressUndoHint: true });
+        }, { suppressUndoHint: true, clearSelections: false });
     }
 
     // Alan 7/20/26 - Toggle the advanced selection menu through both mouse and keyboard-accessible state.
@@ -715,15 +720,16 @@ document.addEventListener('DOMContentLoaded', async () => {
         selectionSaveDebounce = setTimeout(saveSelectionSets, 800);
     }
 
+    function cancelPendingSelectionSetSave() {
+        if (!selectionSaveDebounce) return;
+        clearTimeout(selectionSaveDebounce);
+        selectionSaveDebounce = null;
+    }
+
     // Alan 5/12/26 - Save selection/color sets immediately after destructive prune cleanup.
     async function saveSelectionSetsNow() {
         // Alan 5/12/26 - Cancel pending debounced saves so stale pre-prune colors cannot overwrite cleanup.
-        if (selectionSaveDebounce) {
-            // Alan 5/12/26 - Clear the pending save timer before forcing a fresh save.
-            clearTimeout(selectionSaveDebounce);
-            // Alan 5/12/26 - Reset the timer handle after cancellation.
-            selectionSaveDebounce = null;
-        }
+        cancelPendingSelectionSetSave();
         // Alan 5/12/26 - Persist the viewer's current selection/color state.
         await saveSelectionSets();
     }
@@ -2187,9 +2193,7 @@ document.addEventListener('DOMContentLoaded', async () => {
                 // Alan 5/10/26 - Persist cleared selections before reload so pruned nodes cannot reappear as selected.
                 viewer.clearSelection();
                 // Alan 5/10/26 - Cancel pending selection saves that may still contain pre-prune IDs.
-                if (selectionSaveDebounce) {
-                    selectionSaveDebounce = clearTimeout(selectionSaveDebounce);
-                }
+                cancelPendingSelectionSetSave();
                 // Alan 5/10/26 - Save the empty selection state before fetching tree_state again.
                 await saveSelectionSets();
             }

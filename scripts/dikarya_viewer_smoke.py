@@ -15,10 +15,12 @@ status of the HTML is blind to the entire class of failure that actually takes
 this viewer down, because the viewer is a client-side application and the server
 is merely handing over its parts.
 
-So this script fetches the page, then fetches every script tag the page
-references - at the exact ?v= URL production serves - and *executes* that
-downloaded bundle through the same init harness the unit tests use
-(tests/js/viewer_init_smoke.test.js).
+So this script fetches the page, then fetches every same-origin static script
+the page references at the exact ?v= URL production serves. It first requires
+every executable response to match the trusted local checkout byte-for-byte,
+then executes the verified bundle through the same init harness the unit tests
+use (tests/js/viewer_init_smoke.test.js). Mismatched remote bytes are reported
+and never executed.
 
 That last step is the point. The unit tests check your working tree; this
 checks what users are being served. Those differ exactly when it matters most -
@@ -101,17 +103,45 @@ def check(results, name, ok, detail=""):
     return ok
 
 
-def local_path_for(src_url):
+def local_path_for(src_url, base_url):
     """Map a served /static/... URL back onto its repo-relative path.
 
-    The harness loads scripts by repo-relative path, so the mirror of the
-    downloaded bundle has to reproduce that layout.
+    Only same-origin repository assets are eligible. An unrelated host can use
+    a path containing /static/ too; that does not make its JavaScript trusted.
     """
-    path = urlparse(src_url).path
-    marker = "/static/"
-    if marker not in path:
+    parsed = urlparse(src_url)
+    origin = urlparse(base_url)
+    if (parsed.scheme.lower(), parsed.netloc.lower()) != (
+        origin.scheme.lower(), origin.netloc.lower()
+    ):
         return None
-    return "app/static/" + path.split(marker, 1)[1]
+    marker = "/static/"
+    if not parsed.path.startswith(marker):
+        return None
+    suffix = parsed.path[len(marker):]
+    parts = Path(suffix).parts
+    if not suffix or any(part in ("", ".", "..") for part in parts):
+        return None
+    return str(Path("app/static").joinpath(*parts))
+
+
+def served_asset_matches_local(rel, served_bytes):
+    """Return whether executable served bytes equal the trusted checkout."""
+    trusted = REPO / rel
+    try:
+        return trusted.is_file() and trusted.read_bytes() == served_bytes
+    except OSError:
+        return False
+
+
+def mirror_verified_asset(rel, served_bytes, workdir):
+    """Mirror only an executable asset proven identical to the checkout."""
+    if not served_asset_matches_local(rel, served_bytes):
+        return False
+    destination = Path(workdir) / rel
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copyfile(REPO / rel, destination)
+    return True
 
 
 def main():
@@ -162,10 +192,11 @@ def main():
 
     workdir = Path(tempfile.mkdtemp(prefix="dikarya-viewer-smoke-"))
     fetched = []
+    executable_assets_match = True
     try:
         for src in srcs:
             url = urljoin(view_url, src)
-            rel = local_path_for(url)
+            rel = local_path_for(url, args.base_url)
             if rel is None:
                 continue  # a CDN or inline-adjacent script; not ours to mirror
             try:
@@ -180,14 +211,19 @@ def main():
                 continue
             check(results, f"nonempty:{rel}", len(body) > 0,
                   f"{url} served an empty body")
+            matches = mirror_verified_asset(rel, body, workdir)
+            check(results, f"integrity:{rel}", matches,
+                  f"the served executable {rel} differs from the trusted "
+                  "local checkout; refusing to execute remote bytes")
+            if not matches:
+                executable_assets_match = False
+                continue
             dest = workdir / rel
-            dest.parent.mkdir(parents=True, exist_ok=True)
-            dest.write_bytes(body)
             fetched.append(rel)
 
-            # Syntax-check what was actually served. Catches a truncated or
-            # half-deployed file that the unit tests, reading the working tree,
-            # would never see.
+            # Syntax-check the trusted copy after proving byte equality. A
+            # truncated or half-deployed response fails the integrity check
+            # above and never reaches Node.
             proc = subprocess.run([node, "--check", str(dest)],
                                   capture_output=True, text=True)
             check(results, f"parses:{rel}", proc.returncode == 0,
@@ -197,8 +233,14 @@ def main():
         # --- 4. Execute the served bundle. The actual test.
         missing = [p for p in ("app/static/js/tree_viewer_controller.js",)
                    if p not in fetched]
-        if check(results, "controller-was-served", not missing,
-                 f"the page never referenced {missing}"):
+        controller_served = check(
+            results, "controller-was-served", not missing,
+            f"the page never referenced {missing}",
+        )
+        if controller_served and check(
+            results, "executable-assets-match-checkout", executable_assets_match,
+            "one or more served executable assets failed the integrity gate",
+        ):
             proc = subprocess.run(
                 [node, str(HARNESS), str(workdir), "--json"],
                 capture_output=True, text=True, timeout=180,

@@ -41,10 +41,17 @@ def run_harness():
     node = shutil.which("node")
     if not node:
         raise unittest.SkipTest("node is not installed")
-    proc = subprocess.run(
-        [node, str(HARNESS), str(REPO), "--json"],
-        capture_output=True, text=True,
-    )
+    try:
+        proc = subprocess.run(
+            [node, str(HARNESS), str(REPO), "--json"],
+            capture_output=True, text=True, timeout=60,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise AssertionError(
+            "the collapse harness exceeded the 60-second timeout:\n{}\n{}".format(
+                exc.stdout or "", exc.stderr or ""
+            )
+        ) from exc
     if proc.returncode != 0:
         raise AssertionError(
             "the collapse harness could not run:\n{}\n{}".format(proc.stdout, proc.stderr)
@@ -95,6 +102,27 @@ class CollapseBehaviourTests(unittest.TestCase):
         """A group that stops running would otherwise pass silently."""
         ran = {r["group"] for r in self.results}
         self.assertEqual(ran, set(GROUPS), "harness groups drifted from this driver")
+
+    def test_async_rejection_is_reported_under_the_named_test(self):
+        node = shutil.which("node")
+        if not node:
+            raise unittest.SkipTest("node is not installed")
+        proc = subprocess.run(
+            [
+                node, str(HARNESS), str(REPO), "--json",
+                "--self-test-async-failure",
+            ],
+            capture_output=True, text=True, timeout=60,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        rows = json.loads(proc.stdout)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(
+            rows[0]["name"], "a rejected async assertion keeps its test name"
+        )
+        self.assertFalse(rows[0]["ok"])
+        self.assertIn("intentional async assertion failure", rows[0]["error"])
+        self.assertNotEqual(rows[0]["group"], "harness")
 
 
 class StableCladeIdAgreementTests(unittest.TestCase):

@@ -88,6 +88,7 @@ class VoucherNumberingTests(unittest.TestCase):
         ("ABC123", "P", 0),
         ("123ABC", "P", 0),
         ("12 34", "P", 0),
+        ("\u0661\u0662\u0663", "P", 0),
         # Surrounding whitespace around a valid number is still fine, and
         # leading zeros still set the padding width.
         ("  0042  ", "P", 8),

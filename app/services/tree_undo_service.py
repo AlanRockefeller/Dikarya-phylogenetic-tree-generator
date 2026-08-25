@@ -115,6 +115,15 @@ def _read_manifest(job_dir: Path) -> Optional[Dict[str, Any]]:
     return manifest
 
 
+def _checkpoint_is_expired(manifest: Dict[str, Any]) -> bool:
+    """Apply the one checkpoint-age policy used by describe and restore."""
+    created_at = manifest.get("created_at")
+    return (
+        isinstance(created_at, (int, float))
+        and time.time() - created_at > MAX_CHECKPOINT_AGE_SECONDS
+    )
+
+
 def clear_undo_checkpoint(job_dir: Path) -> bool:
     """Drop the job's checkpoint. Returns True if one was actually removed."""
     target = _undo_dir(job_dir)
@@ -163,10 +172,9 @@ def describe_undo_checkpoint(job_dir: Path) -> Dict[str, Any]:
         return {"available": False}
 
     created_at = manifest.get("created_at")
-    if isinstance(created_at, (int, float)):
-        if time.time() - created_at > MAX_CHECKPOINT_AGE_SECONDS:
-            clear_undo_checkpoint(job_dir)
-            return {"available": False}
+    if _checkpoint_is_expired(manifest):
+        clear_undo_checkpoint(job_dir)
+        return {"available": False}
 
     return {
         "available": True,
@@ -313,6 +321,9 @@ def undo_last_edit(job_dir: Path) -> Dict[str, Any]:
     manifest = _read_manifest(job_dir)
     if manifest is None:
         raise UndoUnavailable("There is nothing to undo.")
+    if _checkpoint_is_expired(manifest):
+        clear_undo_checkpoint(job_dir)
+        raise UndoUnavailable("The saved undo point has expired.")
 
     checkpoint = _undo_dir(job_dir)
     present = [p for p in manifest.get("present") or [] if p in SNAPSHOT_PATHS]

@@ -1103,6 +1103,8 @@ def recompute_job(job_id):
                          "ignored_fields": sorted(overrides)},
             )
         if created:
+            from app.services.tree_undo_service import clear_undo_checkpoint
+            clear_undo_checkpoint(job_dir)
             job.status = "queued"
             metrics = job.metrics or {}
             metrics["recompute_requested_at"] = datetime.utcnow().isoformat()

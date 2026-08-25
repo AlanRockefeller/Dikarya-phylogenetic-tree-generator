@@ -600,10 +600,16 @@ def _config_timeouts(env):
         + repr(sorted(_TIMEOUT_ENV_DEFAULTS))
         + "}))"
     )
-    result = subprocess.run(
-        [sys.executable, "-c", program], env=child_env,
-        capture_output=True, text=True,
-    )
+    try:
+        result = subprocess.run(
+            [sys.executable, "-c", program], env=child_env,
+            capture_output=True, text=True, timeout=60,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise AssertionError(
+            "importing Config exceeded the 60-second subprocess timeout; "
+            "stdout={!r} stderr={!r}".format(exc.stdout, exc.stderr)
+        ) from exc
     assert result.returncode == 0, (
         "importing Config must not be fatal for a malformed timeout: "
         + result.stderr[-2000:]
@@ -1333,5 +1339,5 @@ def test_the_browser_start_number_parser_is_anchored():
     html = (Path(__file__).resolve().parents[1]
             / "app" / "templates" / "voucher_labels.html").read_text()
 
-    assert "rawStart.match(/^\\d+$/)" in html
+    assert "rawStart.match(/^[0-9]+$/)" in html
     assert "rawStart.match(/\\d+/)" not in html

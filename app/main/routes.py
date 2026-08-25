@@ -300,7 +300,7 @@ def _voucher_number_parts(form):
     # startNumberParts() in voucher_labels.html. Extracting the first digit run
     # made "ABC123" mean 123 -- a number the user never entered, with the
     # letters silently discarded rather than moved to the prefix field.
-    start_match = re.fullmatch(r'\d+', start_raw)
+    start_match = re.fullmatch(r'[0-9]+', start_raw)
     digits = start_match.group(0) if start_match else None
     if not digits or len(digits) > MAX_VOUCHER_NUMBER_DIGITS:
         return prefix, 1, 3
