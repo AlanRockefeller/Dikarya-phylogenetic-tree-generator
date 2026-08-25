@@ -35,7 +35,10 @@ from app.extensions import db, limiter
 from app.models import ApiToken, Job
 from app.services.artifact_storage import read_artifact_bytes
 from app.services.security_utils import validate_safe_file_path, coerce_bool
-from app.services.tree_parameter_validation import validate_iqtree_ufboot_count
+from app.services.tree_parameter_validation import (
+    normalize_inherited_iqtree_ufboot_count,
+    validate_iqtree_ufboot_count,
+)
 from app.services.tree_edit_service import (
     MAX_TREE_TIP_NAME_LENGTH,
     NEWICK_UNSAFE_TIP_CHARS,
@@ -1053,10 +1056,22 @@ def recompute_job(job_id):
             overrides["notes"] = v
 
         params.update(overrides)
+        # Same split as the web recompute route: strict for a value the caller
+        # supplied (or for an IQ-TREE configuration newly requested through a
+        # tree_method override), lenient for one inherited from a job that
+        # predates the -B >= 1000 rule.
+        caller_chose_bootstrap = (
+            "bootstrap" in overrides or "tree_method" in overrides
+        )
         try:
-            requested_bootstrap = validate_iqtree_ufboot_count(
-                params.get("tree_method"), params.get("bootstrap", DEFAULT_BOOTSTRAP)
-            )
+            if caller_chose_bootstrap:
+                requested_bootstrap = validate_iqtree_ufboot_count(
+                    params.get("tree_method"), params.get("bootstrap", DEFAULT_BOOTSTRAP)
+                )
+            else:
+                requested_bootstrap = normalize_inherited_iqtree_ufboot_count(
+                    params.get("tree_method"), params.get("bootstrap", DEFAULT_BOOTSTRAP)
+                )
         except ValueError as exc:
             return error_response(
                 code="validation_failed", message=str(exc), status=422,

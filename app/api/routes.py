@@ -21,7 +21,10 @@ from difflib import SequenceMatcher
 from datetime import datetime
 
 from app.services.security_utils import validate_job_id, validate_safe_file_path, coerce_bool
-from app.services.tree_parameter_validation import validate_iqtree_ufboot_count
+from app.services.tree_parameter_validation import (
+    normalize_inherited_iqtree_ufboot_count,
+    validate_iqtree_ufboot_count,
+)
 from app.services.artifact_storage import (
     artifact_exists,
     open_artifact,
@@ -3355,16 +3358,32 @@ def rebuild_with_duplicates(job_id):
         try:
             enqueue_job(job_params, job_id=new_job_id, prepare=False)
         except Exception as exc:
-            new_record.status = "failed"
-            failed_metrics = dict(new_record.metrics or {})
-            failed_metrics["error"] = (
-                "This rebuild could not be added to the processing queue and "
-                "was never started. Please try again."
+            logger.exception(
+                "event=web.rebuild_enqueue_failed job=%s could not be queued "
+                "after its DB row was committed", new_job_id,
             )
-            failed_metrics["enqueue_error"] = type(exc).__name__
-            failed_metrics["failed_at"] = datetime.utcnow().isoformat()
-            new_record.metrics = failed_metrics
-            db.session.commit()
+            # Recording the failure must not itself be able to break the error
+            # path: an exception from this commit left the session in a
+            # rollback-required state, so the outer handler's own database work
+            # raised PendingRollbackError and the user got that instead of the
+            # real enqueue failure.
+            try:
+                new_record.status = "failed"
+                failed_metrics = dict(new_record.metrics or {})
+                failed_metrics["error"] = (
+                    "This rebuild could not be added to the processing queue and "
+                    "was never started. Please try again."
+                )
+                failed_metrics["enqueue_error"] = type(exc).__name__
+                failed_metrics["failed_at"] = datetime.utcnow().isoformat()
+                new_record.metrics = failed_metrics
+                db.session.commit()
+            except Exception:
+                db.session.rollback()
+                logger.exception(
+                    "event=web.rebuild_enqueue_failure_unrecorded job=%s",
+                    new_job_id,
+                )
             raise
 
         return jsonify({
@@ -3484,10 +3503,23 @@ def recompute_tree_job(job_id):
                     "error": f"Unsupported tree method. Choose one of: {', '.join(sorted(VALID_TREE_METHODS))}"
                 }), 400
             params_dict.update(overrides)
+        # A value the caller actually supplied -- or an IQ-TREE configuration
+        # the caller is newly requesting by overriding tree_method -- obeys the
+        # current rule. A count merely inherited from a job that predates that
+        # rule is lifted to the supported minimum instead, so an old job stays
+        # recomputable rather than 400ing on a field nobody touched.
+        caller_chose_bootstrap = (
+            "bootstrap" in overrides or "tree_method" in overrides
+        )
         try:
-            params_dict["bootstrap"] = validate_iqtree_ufboot_count(
-                params_dict.get("tree_method"), params_dict.get("bootstrap", 1000)
-            )
+            if caller_chose_bootstrap:
+                params_dict["bootstrap"] = validate_iqtree_ufboot_count(
+                    params_dict.get("tree_method"), params_dict.get("bootstrap", 1000)
+                )
+            else:
+                params_dict["bootstrap"] = normalize_inherited_iqtree_ufboot_count(
+                    params_dict.get("tree_method"), params_dict.get("bootstrap", 1000)
+                )
         except ValueError as exc:
             return jsonify({"status": "error", "error": str(exc)}), 400
         persisted_params = dict(params_dict)

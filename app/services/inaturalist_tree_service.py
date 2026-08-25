@@ -96,14 +96,32 @@ def _pacing_redis():
     return _pacing_client
 
 
-def _reserve_slot_local(interval: float) -> float:
-    """Process-local fallback reservation. Returns seconds to wait."""
+def _reserve_slot_local(interval: float,
+                        max_wait: Optional[float] = None) -> float:
+    """Process-local fallback reservation. Returns seconds to wait.
+
+    Mirrors the Redis Lua path exactly: the prospective wait is checked against
+    ``max_wait`` *before* the cursor is committed, so a rejected caller does not
+    consume a slot. Advancing first and rejecting afterwards pushed the cursor
+    further into the future on every refusal, which made each subsequent
+    interactive request wait longer than the last for requests that were never
+    actually sent.
+
+    Raises InatTreeError when the wait exceeds ``max_wait``.
+    """
     global _local_next_slot
     with _pacing_lock:
         now = time.monotonic()
         slot = max(_local_next_slot, now)
+        wait = max(0.0, slot - now)
+        if max_wait is not None and wait > max_wait:
+            raise InatTreeError(
+                "iNaturalist requests are busy right now. Please try again shortly.",
+                status=503,
+                details={"retry_after_seconds": max(1, int(wait))},
+            )
         _local_next_slot = slot + interval
-        return max(0.0, slot - now)
+        return wait
 
 
 def _reserve_inat_slot(interval: float = RATE_LIMIT_DELAY,
@@ -140,13 +158,7 @@ def _reserve_inat_slot(interval: float = RATE_LIMIT_DELAY,
             "iNaturalist request pacing fell back to per-process timing",
             exception=type(exc).__name__,
         )
-        wait = _reserve_slot_local(interval)
-        if max_wait is not None and wait > max_wait:
-            raise InatTreeError(
-                "iNaturalist requests are busy right now. Please try again shortly.",
-                status=503,
-                details={"retry_after_seconds": max(1, int(wait))},
-            )
+        wait = _reserve_slot_local(interval, max_wait)
     return wait
 
 

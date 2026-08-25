@@ -32,10 +32,13 @@ A third Biopython default is corrected here for the same reason as the first:
 ``tree_edit_service`` under the name the rest of the codebase already uses.
 """
 
+import logging
 import re
 from io import StringIO
 from pathlib import Path
 from typing import Optional
+
+logger = logging.getLogger(__name__)
 
 try:
     from Bio import Phylo
@@ -258,9 +261,14 @@ def write_tree_file(tree, path, fmt: str = "newick") -> None:
         write_nexus_tree(tree, path)
         return
     if fmt == "newick":
-        # Through the shared renderer, so a file on disk and a string in memory
-        # agree about clades that carry no branch length.
-        Path(path).write_text(_render_newick(tree) + "\n", encoding="utf-8")
+        # Through `tree_to_newick_string`, not `_render_newick` directly, so a
+        # file on disk and a string in memory agree about clades that carry no
+        # branch length *and* are subject to the same guard against an internal
+        # node carrying both a name and a confidence. Rendering fully before
+        # touching the path means a rejected tree leaves no truncated file
+        # behind.
+        text = tree_to_newick_string(tree)
+        Path(path).write_text(text + "\n", encoding="utf-8")
         return
     Phylo.write(
         tree, str(path), fmt,

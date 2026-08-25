@@ -260,11 +260,17 @@ def lookup_locations(accessions: List[str]) -> Tuple[Dict[str, str], List[str], 
         base = accession.split(".")[0]
         if accession not in locations and base in locations:
             locations[accession] = locations[base]
-        if accession not in locations and _cache_get(accession) is None and _cache_get(base) is None:
-            if accession in unavailable_set:
-                unavailable.append(accession)
-            else:
-                missing.append(accession)
+        if accession in locations:
+            continue
+        # Every requested accession that produced no location lands in exactly
+        # one bucket. The cache is deliberately not consulted here: a record
+        # NCBI answered about but had no usable location for is cached as "",
+        # and testing the cache for None made those records fall out of all
+        # three result sets -- so the caller could not report them at all.
+        if accession in unavailable_set:
+            unavailable.append(accession)
+        else:
+            missing.append(accession)
 
     if unavailable:
         from app.services.log_context import log_degradation

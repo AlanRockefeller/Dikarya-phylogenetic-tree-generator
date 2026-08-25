@@ -36,10 +36,15 @@ class JsonMutationTests(unittest.TestCase):
         db.drop_all()
         self.ctx.pop()
 
-    def _job(self, metrics=None):
+    # Sentinel, so "no metrics argument" and "metrics is explicitly NULL" are
+    # distinguishable. Defaulting None to {} meant the NULL test below never
+    # actually stored NULL, and so proved nothing about the case it names.
+    _UNSET = object()
+
+    def _job(self, metrics=_UNSET):
         job = Job(id="job-1", user_id=self.user_id, status="running",
                   job_dir="/tmp/job-1", input_type="pasted_sequence",
-                  metrics=metrics if metrics is not None else {})
+                  metrics={} if metrics is self._UNSET else metrics)
         db.session.add(job)
         db.session.commit()
         return job
@@ -87,6 +92,9 @@ class JsonMutationTests(unittest.TestCase):
 
     def test_metrics_starting_from_null_can_be_populated(self):
         job = self._job(None)
+        # The column really holds NULL before the update is exercised.
+        self.assertIsNone(self._reload().metrics)
+        job = db.session.get(Job, "job-1")
         metrics = job.metrics or {}
         metrics["started_at"] = "now"
         job.metrics = metrics

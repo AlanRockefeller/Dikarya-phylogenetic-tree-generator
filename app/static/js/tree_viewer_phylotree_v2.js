@@ -2759,7 +2759,12 @@
             }
             // Alan 8/17/26 - Preserve node and incoming-branch context menus. Branch paths are bound to
             // {source,target}; the bubble-phase listener resolves their distal target.
-            if (event.target?.closest?.('.node, .internal-node, path.branch')) return;
+            // Alan 8/25/26 - A drawn annotation's own right-click-to-edit target has to be let
+            // through here too. This listener is on the CONTAINER in the capture phase, so its
+            // stopPropagation() ran before the event ever reached the g.clade-annotation the
+            // edit handler is attached to -- right-clicking a bracket, label or branch bubble
+            // did nothing at all, not even open the browser menu.
+            if (event.target?.closest?.('.node, .internal-node, path.branch, .clade-annotation')) return;
             // Alan 8/16/26 - Background right-drag now pans the tree, so the browser menu must stay closed.
             event.preventDefault();
             // Alan 5/11/26 - Keep background context clicks from bubbling into unrelated handlers.

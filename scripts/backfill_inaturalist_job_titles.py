@@ -147,7 +147,13 @@ def _resolve_genera(jobs_by_observation, observations):
     return genera, unresolved
 
 
-def _update_input_info(job, title):
+def _update_input_info(job, title, journal=None):
+    """Rewrite one job's on-disk notes, recording what to undo it with.
+
+    When ``journal`` is given, the file's previous bytes are appended to it as
+    ``(path, original_bytes)`` on every successful write, so a later failure
+    can put the artifact back. See main() for why the ordering matters.
+    """
     from app.config import Config
 
     job_dir = Path(job.job_dir).resolve()
@@ -158,8 +164,9 @@ def _update_input_info(job, title):
     if not input_info_path.is_file():
         return "missing"
     try:
-        payload = json.loads(input_info_path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
+        original = input_info_path.read_bytes()
+        payload = json.loads(original.decode("utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
         return "invalid"
     payload["notes"] = title
     temp_path = input_info_path.with_suffix(".json.tmp")
@@ -179,7 +186,26 @@ def _update_input_info(job, title):
     except OSError:
         discard_temp()
         return "write_failed"
+    if journal is not None:
+        journal.append((input_info_path, original))
     return "updated"
+
+
+def _restore_input_info(journal):
+    """Put every journalled artifact back. Returns the paths that would not."""
+    failures = []
+    for path, original in journal:
+        temp_path = path.with_suffix(".json.tmp")
+        try:
+            temp_path.write_bytes(original)
+            temp_path.replace(path)
+        except OSError:
+            try:
+                temp_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+            failures.append(str(path))
+    return failures
 
 
 def main(argv=None):
@@ -235,27 +261,48 @@ def main(argv=None):
             print(json.dumps(summary, indent=2))
             return 0
 
+        # Artifact first, database second, and only for the jobs whose artifact
+        # actually followed. Committing the rows first and rewriting
+        # input_info.json afterwards meant a write failure -- a read-only
+        # directory, a job whose file had been removed -- left the run
+        # reporting failure with the two stores permanently disagreeing about
+        # the same job's title, and nothing to undo it with. Now a job whose
+        # file could not be rewritten simply keeps its old title in both
+        # places, and a failed commit restores every file this run touched.
+        journal = []
+        input_info_counts = defaultdict(int)
+        updated_jobs = []
         for job in jobs:
             observation_id = _observation_id(job)
             genus = genera[observation_id]
+            title = _build_inat_job_title(observation_id, genus)
+            status = _update_input_info(job, title, journal=journal)
+            input_info_counts[status] += 1
+            if status != "updated":
+                continue
             metrics = dict(job.metrics or {})
-            metrics["notes"] = _build_inat_job_title(observation_id, genus)
+            metrics["notes"] = title
             metrics["inat_genus"] = genus
             job.metrics = metrics
-        db.session.commit()
+            updated_jobs.append(job)
 
-        input_info_counts = defaultdict(int)
-        for job in jobs:
-            observation_id = _observation_id(job)
-            title = _build_inat_job_title(observation_id, genera[observation_id])
-            input_info_counts[_update_input_info(job, title)] += 1
+        try:
+            db.session.commit()
+        except Exception as exc:
+            db.session.rollback()
+            summary["database_jobs_updated"] = 0
+            summary["input_info"] = dict(sorted(input_info_counts.items()))
+            summary["error"] = f"database commit failed: {type(exc).__name__}"
+            summary["input_info_restore_failures"] = _restore_input_info(journal)
+            print(json.dumps(summary, indent=2))
+            return 1
 
-        summary["database_jobs_updated"] = len(jobs)
+        summary["database_jobs_updated"] = len(updated_jobs)
         summary["input_info"] = dict(sorted(input_info_counts.items()))
         print(json.dumps(summary, indent=2))
-        # The database rows are already committed at this point. Any job whose
-        # input_info.json did not follow leaves the two stores disagreeing about
-        # the same job, so the run must not report success.
+        # Every job counted here kept its old title in *both* stores, so the two
+        # never disagree -- but the operator still asked for a backfill that did
+        # not fully happen, so the run must not report success.
         failed = sum(count for status, count in input_info_counts.items() if status != "updated")
         if failed:
             return 1

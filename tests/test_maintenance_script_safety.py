@@ -885,10 +885,14 @@ def test_a_legacy_title_still_supplies_the_observation_id(run_backfill, tmp_path
 
 
 def test_apply_returns_nonzero_when_an_input_info_write_fails(run_backfill, tmp_path):
-    """The database is already committed, so a partial run must not report success.
+    """A partial run must not report success -- and must not half-apply either.
 
-    A job whose input_info.json did not follow leaves the two stores disagreeing
-    about the same job's title, and cron can only see that through the exit code.
+    The artifact is written first and the database row only follows for a job
+    whose file actually changed. A job whose input_info.json could not be
+    rewritten therefore keeps its old title in *both* stores rather than being
+    renamed in the database alone, which used to leave the two permanently
+    disagreeing with nothing to undo it with. Cron still sees the shortfall
+    through the exit code.
     """
     good = _make_job(tmp_path, "0123abcd-0123-0123-0123-00000000000e", {
         "via": "inat_phylogenetic_tree", "inat_observation_id": 111,
@@ -908,10 +912,11 @@ def test_apply_returns_nonzero_when_an_input_info_write_fails(run_backfill, tmp_
 
     assert code == 1, "a partial apply reported success"
     assert summary["input_info"] == {"missing": 1, "updated": 1}
-    assert summary["database_jobs_updated"] == 2
-    # The database half did happen; that is exactly why the exit code matters.
+    # Only the job whose artifact followed was renamed in the database.
+    assert summary["database_jobs_updated"] == 1
     assert commits == [True]
-    assert broken.metrics["notes"] == "iNat # 222 - Russula → Phylogenetic Tree"
+    assert "notes" not in (broken.metrics or {})
+    assert good.metrics["notes"] == "iNat # 111 - Amanita → Phylogenetic Tree"
 
 
 def test_input_info_failure_removes_its_temporary_file(
@@ -1084,7 +1089,7 @@ def test_the_hard_cap_is_the_same_number_on_both_sides():
     assert "$2.00" in (REPO_ROOT / "ARCHITECTURE.md").read_text()
 
 
-def test_everything_the_app_can_emit_is_accepted_by_the_wrapper():
+def test_everything_the_app_can_emit_is_accepted_by_the_wrapper(monkeypatch):
     """The invariant that actually matters across the privilege boundary.
 
     The two layers are not the same grammar: the app canonicalizes (it tolerates
@@ -1101,13 +1106,12 @@ def test_everything_the_app_can_emit_is_accepted_by_the_wrapper():
         "1.00; rm -rf /", "",
     ]
     for candidate in candidates:
-        os.environ["BUDGET_PROBE"] = candidate
+        monkeypatch.setenv("BUDGET_PROBE", candidate)
         emitted = config.budget_env("BUDGET_PROBE", "1.00")
         assert _wrapper_budget_verdict(emitted) == "accept", (candidate, emitted)
-    os.environ.pop("BUDGET_PROBE", None)
 
 
-def test_the_app_canonicalizes_and_clamps_out_of_range_values():
+def test_the_app_canonicalizes_and_clamps_out_of_range_values(monkeypatch):
     config = _app_config()
     cases = {
         "1": "1.00", "1.5": "1.50", " 1.25 ": "1.25", "01.50": "1.50",
@@ -1117,12 +1121,11 @@ def test_the_app_canonicalizes_and_clamps_out_of_range_values():
         "-1": "1.00", "1e9": "1.00", "NaN": "1.00", "": "1.00",
     }
     for raw, expected in cases.items():
-        os.environ["BUDGET_PROBE"] = raw
+        monkeypatch.setenv("BUDGET_PROBE", raw)
         assert config.budget_env("BUDGET_PROBE", "1.00") == expected, raw
-    os.environ.pop("BUDGET_PROBE", None)
 
     # Unset is left to the caller's default rather than canonicalized.
-    os.environ.pop("BUDGET_PROBE", None)
+    monkeypatch.delenv("BUDGET_PROBE", raising=False)
     assert config.budget_env("BUDGET_PROBE", "1.00") == "1.00"
 
 

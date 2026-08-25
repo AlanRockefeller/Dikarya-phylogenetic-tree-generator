@@ -82,6 +82,18 @@ class VoucherNumberingTests(unittest.TestCase):
         ("  042xyz ", "P", 8),
         ("000000000001", "Z", 0),
         ("999999999999", "Z", 1),
+        # A starting number must be digits and nothing else. Extracting the
+        # first digit run turned "ABC123" into 123 -- a number the user never
+        # typed, with the letters dropped rather than moved to the prefix field.
+        ("ABC123", "P", 0),
+        ("123ABC", "P", 0),
+        ("12 34", "P", 0),
+        # Surrounding whitespace around a valid number is still fine, and
+        # leading zeros still set the padding width.
+        ("  0042  ", "P", 8),
+        ("007", "P", 995),
+        # One past the digit limit: refused on both sides, never truncated.
+        ("1" * (main_routes.MAX_VOUCHER_NUMBER_DIGITS + 1), "P", 1),
     ]
 
     def test_the_browser_parser_never_truncates(self):

@@ -35,35 +35,123 @@ def get_queue(name=QUEUE_HIGH) -> Queue:
     conn = get_redis_connection()
     return Queue(name, connection=conn)
 
-def resolve_job_timeout(job_params: Dict[str, Any]) -> str:
-    """Pick the RQ job_timeout for a job based on the tree method it will run.
+# Which externally-timed tool bounds each pipeline stage. The names are the
+# keys `configured_tool_time_limit_hours` understands, so the RQ backstop and
+# the per-subprocess limits can never drift apart. ``None`` means the stage runs
+# no external tool and therefore consumes only the general allowance.
+_ALIGNMENT_STAGE_TOOL = {
+    "mafft": "MAFFT",
+    "muscle": "MUSCLE",
+    "clustalo": "Clustal Omega",
+    "iqtree_builtin": "IQ-TREE alignment",
+    "none": None,
+}
+# Keyed by the exact method names `trimming_service.run_trimming` dispatches on.
+# `trimal_gappy` is Dikarya's shipped default (DEFAULT_TRIMMING_METHOD) and the
+# /tree form's preselected option; it was missing here, so an ordinary default
+# pipeline was budgeted as if it did no external trimming at all while the
+# worker went on to run trimAl under its own four-hour limit.
+_TRIMMING_STAGE_TOOL = {
+    "trimal_gappy": "trimAl",
+    "trimal": "trimAl",
+    "bmge": "BMGE",
+    "none": None,
+    "": None,
+}
+_TREE_STAGE_TOOL = {
+    "raxml": "RAxML",
+    "iqtree": "IQ-TREE",
+    "mrbayes": "MrBayes",
+    "fasttree": "FastTree",
+    # Neighbour-joining is computed in-process, so it has no tool budget of its
+    # own and lives inside the general allowance.
+    "nj": None,
+}
 
-    Tree-builder subprocess limits apply after input preparation, BLAST,
-    alignment and trimming. Give recognized builders their complete tool limit
-    in addition to the general pipeline allowance so RQ cannot kill the work
-    horse before the subprocess timeout produces a structured error. This lives
-    here, rather than at each submission site, so every enqueue path gets the
-    same budget.
+# Grace on top of the summed stage budgets, so a tool's own timeout fires first
+# and produces a structured, user-facing error instead of RQ killing the work
+# horse mid-run.
+JOB_TIMEOUT_GRACE_SECONDS = 600
+
+
+def _resolved_method(value, default: str) -> str:
+    method = str(value or "default").strip().lower()
+    if method == "default":
+        method = str(default or "").strip().lower()
+    return method
+
+
+def resolve_job_timeout(job_params: Dict[str, Any]) -> str:
+    """Pick the RQ job_timeout covering every independently bounded stage.
+
+    Each external tool carries its own wall-clock limit (MAFFT 8h, trimAl 4h,
+    RAxML 15h, ...), and they run one after another. A backstop of "general
+    allowance + tree builder" therefore did not cover a legal pipeline: a job
+    could stay inside every subprocess timeout it was given and still be killed
+    by RQ before the tree builder's own limit was reached, which loses the work
+    with no structured error. So the budget is the sum of the stages this
+    particular job will run -- not of every tool Dikarya can run -- plus the
+    general allowance for the non-tool work (input handling, BLAST, NCBI
+    fetches, tree post-processing) and a grace period.
+
+    This lives here, rather than at each submission site, so every enqueue path
+    gets the same budget.
     """
     from app.config import Config
+    from app.services.subprocess_utils import (
+        configured_tool_time_limit_hours,
+        resolve_time_limit_hours,
+    )
+    from app.services.security_utils import coerce_bool
 
-    general_hours = float(getattr(Config, "GENERAL_JOB_TIME_LIMIT_HOURS", 8) or 8)
-    method = str((job_params or {}).get("tree_method") or "").lower()
-    tree_limits = {
-        "raxml": ("RAXML_TIME_LIMIT_HOURS", 15),
-        "iqtree": ("IQTREE_TIME_LIMIT_HOURS", 15),
-        "mrbayes": ("MRBAYES_TIME_LIMIT_HOURS", 15),
-        "fasttree": ("FASTTREE_TIME_LIMIT_HOURS", 6),
-    }
-    limit = tree_limits.get(method)
-    if limit:
-        attr, default = limit
-        general_hours += float(getattr(Config, attr, default) or default)
+    params = job_params or {}
+    hours = resolve_time_limit_hours(
+        getattr(Config, "GENERAL_JOB_TIME_LIMIT_HOURS", 8), 8.0
+    )
 
-    # Generic subprocess CPU limiting is disabled by default because CPU time
-    # accumulates across threads. The ten-minute grace ensures a subprocess
-    # timeout is handled before RQ reaches this wall-clock backstop.
-    return f"{int(general_hours * 3600) + 600}s"
+    align_method = _resolved_method(
+        params.get("alignment_method"),
+        getattr(Config, "BEGINNER_DEFAULT_ALIGNER", "mafft"),
+    )
+    # Resolved by the same helper the worker's trim step uses, so an absent
+    # key lands on DEFAULT_TRIMMING_METHOD and the literal "default" on
+    # BEGINNER_DEFAULT_TRIMMING exactly as run_phylo_job does.
+    from app.services.trimming_service import resolve_trimming_method
+
+    trim_method = resolve_trimming_method(params)
+    tree_method = str(params.get("tree_method") or "").strip().lower()
+
+    stage_tools = []
+    # An unrecognized aligner fails fast in run_alignment, but budget it as the
+    # configured default rather than as nothing.
+    if align_method in _ALIGNMENT_STAGE_TOOL:
+        stage_tools.append(_ALIGNMENT_STAGE_TOOL[align_method])
+    else:
+        stage_tools.append(_ALIGNMENT_STAGE_TOOL.get(
+            _resolved_method(None, getattr(Config, "BEGINNER_DEFAULT_ALIGNER", "mafft")),
+            "MAFFT",
+        ))
+
+    # MUSCLE, Clustal Omega and IQ-TREE's aligner are direction-blind, so
+    # run_alignment runs a separate MAFFT pass over the input first. That pass
+    # carries MAFFT's full budget, so it is a stage in its own right.
+    if (
+        align_method not in ("none", "mafft")
+        and stage_tools[0] is not None
+        and coerce_bool(params.get("fix_orientation"), True)[0]
+    ):
+        stage_tools.append("MAFFT")
+
+    # An unrecognised trimmer raises in run_trimming before any executable is
+    # spawned, so it genuinely gets no tool budget.
+    stage_tools.append(_TRIMMING_STAGE_TOOL.get(trim_method))
+    stage_tools.append(_TREE_STAGE_TOOL.get(tree_method))
+
+    for tool in stage_tools:
+        if tool:
+            hours += configured_tool_time_limit_hours(Config, tool)
+
+    return f"{int(hours * 3600) + JOB_TIMEOUT_GRACE_SECONDS}s"
 
 
 def safe_job_description(kind: str, job_params: Optional[Dict[str, Any]] = None,

@@ -610,34 +610,201 @@ def test_enqueue_job_preserves_queue_selection_ids_and_timeouts():
     assert kwargs["job_timeout"].endswith("s")
 
 
+# The RQ backstop has to outlast every independently bounded stage the job will
+# actually run. Each external tool carries its own wall-clock limit and they run
+# one after another, so "general allowance + tree builder" left a legal pipeline
+# -- MAFFT 8h then trimAl 4h then RAxML 15h -- killable by RQ while every
+# subprocess was still inside its own timeout.
+_STAGE_LIMITS = {
+    "RAXML_TIME_LIMIT_HOURS": 15,
+    "IQTREE_TIME_LIMIT_HOURS": 14,
+    "MRBAYES_TIME_LIMIT_HOURS": 13,
+    "FASTTREE_TIME_LIMIT_HOURS": 6,
+    "MAFFT_TIME_LIMIT_HOURS": 8,
+    "MUSCLE_TIME_LIMIT_HOURS": 7,
+    "CLUSTALO_TIME_LIMIT_HOURS": 7,
+    "IQTREE_ALIGNMENT_TIME_LIMIT_HOURS": 7,
+    "TRIMAL_TIME_LIMIT_HOURS": 4,
+    "BMGE_TIME_LIMIT_HOURS": 3,
+}
+
+
+def _resolved_timeout(params, general=8, **config_defaults):
+    """Resolve the RQ deadline against a known set of configured limits.
+
+    The three method defaults are pinned rather than inherited from the live
+    config, so what an omitted field costs is stated here rather than read out
+    of app/config.py:
+
+    * an omitted ``alignment_method`` resolves to MAFFT and therefore *does*
+      buy an 8h aligner stage, which is what production does too;
+    * an omitted or ``"default"`` ``trimming_method`` resolves to no trimming,
+      so a case that does not mention trimming means "no trimmer stage".
+
+    The cases that exercise the shipped trimming default (``trimal_gappy``)
+    override ``DEFAULT_TRIMMING_METHOD``/``BEGINNER_DEFAULT_TRIMMING``
+    explicitly, so the setting under test is visible in the case itself.
+    """
+    from app.config import Config
+    from app.workers.queue import resolve_job_timeout
+
+    defaults = {
+        "BEGINNER_DEFAULT_ALIGNER": "mafft",
+        "BEGINNER_DEFAULT_TRIMMING": "none",
+        "DEFAULT_TRIMMING_METHOD": "none",
+    }
+    defaults.update(config_defaults)
+    with patch.object(Config, "GENERAL_JOB_TIME_LIMIT_HOURS", general), \
+            patch.multiple(Config, **defaults), \
+            patch.multiple(Config, **_STAGE_LIMITS):
+        return resolve_job_timeout(params)
+
+
 @pytest.mark.parametrize(
     ("tree_method", "tree_hours"),
     [("raxml", 15), ("iqtree", 14), ("mrbayes", 13), ("fasttree", 6)],
 )
 def test_job_timeout_allows_pipeline_stages_before_tree_builder(tree_method, tree_hours):
+    # Alignment defaults to MAFFT here, so its 8h stage is part of the budget.
+    timeout = _resolved_timeout({"tree_method": tree_method})
+    assert timeout == f"{int((8 + 8 + tree_hours) * 3600) + 600}s"
+
+
+@pytest.mark.parametrize(
+    ("params", "stage_hours"),
+    [
+        # MAFFT + trimAl + FastTree
+        ({"alignment_method": "mafft", "trimming_method": "trimal",
+          "tree_method": "fasttree"}, 8 + 4 + 6),
+        # trimal_gappy is the *shipped default* trimmer and runs the same
+        # executable under the same limit. It was missing from the stage map,
+        # so an ordinary default pipeline got a deadline shorter than the sum
+        # of the subprocess limits it is legally allowed to consume.
+        ({"alignment_method": "mafft", "trimming_method": "trimal_gappy",
+          "tree_method": "raxml"}, 8 + 4 + 15),
+        ({"alignment_method": "mafft", "trimming_method": "trimal_gappy",
+          "tree_method": "fasttree"}, 8 + 4 + 6),
+        # Case is not the caller's problem; run_trimming lowercases too.
+        ({"alignment_method": "mafft", "trimming_method": "TrimAl_Gappy",
+          "tree_method": "fasttree"}, 8 + 4 + 6),
+        # MAFFT + BMGE + IQ-TREE
+        ({"alignment_method": "mafft", "trimming_method": "bmge",
+          "tree_method": "iqtree"}, 8 + 3 + 14),
+        # No trimming at all.
+        ({"alignment_method": "mafft", "trimming_method": "none",
+          "tree_method": "raxml"}, 8 + 15),
+        # alignment_method="none": the input is already aligned, so no aligner
+        # stage exists to budget for.
+        ({"alignment_method": "none", "trimming_method": "trimal",
+          "tree_method": "fasttree"}, 4 + 6),
+        # Neighbour-joining runs in-process: no tree-builder stage.
+        ({"alignment_method": "mafft", "trimming_method": "none",
+          "tree_method": "nj"}, 8),
+        # MUSCLE is direction-blind, so run_alignment runs a full MAFFT pass
+        # over the input first; that pass carries MAFFT's own budget.
+        ({"alignment_method": "muscle", "trimming_method": "none",
+          "tree_method": "fasttree"}, 7 + 8 + 6),
+        # ... and not when the user turned orientation correction off.
+        ({"alignment_method": "muscle", "trimming_method": "none",
+          "tree_method": "fasttree", "fix_orientation": False}, 7 + 6),
+        # The string form of that flag counts the same way the worker reads it.
+        ({"alignment_method": "muscle", "trimming_method": "none",
+          "tree_method": "fasttree", "fix_orientation": "false"}, 7 + 6),
+    ],
+)
+def test_job_timeout_covers_every_stage_the_job_will_run(params, stage_hours):
+    assert _resolved_timeout(params) == f"{int((8 + stage_hours) * 3600) + 600}s"
+
+
+def test_the_stage_maps_cover_every_method_the_dispatchers_accept():
+    """A method the pipeline can run but the map cannot name gets no budget."""
+    from app.api_v1 import routes as v1_routes
+    from app.workers import queue as queue_module
+
+    # VALID_* are what the public API accepts; "default" is resolved before
+    # the map is consulted and so is deliberately not a key.
+    assert (v1_routes.VALID_ALIGNERS - {"default"}) <= set(
+        queue_module._ALIGNMENT_STAGE_TOOL)
+    assert v1_routes.VALID_TRIMMERS <= set(queue_module._TRIMMING_STAGE_TOOL)
+    assert v1_routes.VALID_TREE_METHODS <= set(queue_module._TREE_STAGE_TOOL)
+
+
+def test_an_omitted_trimmer_is_budgeted_as_the_shipped_default():
+    # The worker reads an absent trimming_method as DEFAULT_TRIMMING_METHOD,
+    # which ships as trimal_gappy. Resolving it as "no trimming" here was the
+    # bug: the job ran trimAl on a deadline that never accounted for it.
+    assert _resolved_timeout(
+        {"alignment_method": "mafft", "tree_method": "raxml"},
+        DEFAULT_TRIMMING_METHOD="trimal_gappy",
+    ) == f"{int((8 + 8 + 4 + 15) * 3600) + 600}s"
+
+
+def test_the_literal_default_trimmer_resolves_through_beginner_default():
+    # "default" is the beginner mode's token and goes through a *different*
+    # setting from an absent key. Both must reach trimAl when configured to.
+    assert _resolved_timeout(
+        {"alignment_method": "mafft", "trimming_method": "default",
+         "tree_method": "raxml"},
+        BEGINNER_DEFAULT_TRIMMING="trimal_gappy",
+        DEFAULT_TRIMMING_METHOD="none",
+    ) == f"{int((8 + 8 + 4 + 15) * 3600) + 600}s"
+
+
+def test_omitted_alignment_and_trimming_both_resolve_to_their_defaults():
+    assert _resolved_timeout(
+        {"tree_method": "raxml"},
+        BEGINNER_DEFAULT_ALIGNER="mafft",
+        DEFAULT_TRIMMING_METHOD="trimal_gappy",
+    ) == f"{int((8 + 8 + 4 + 15) * 3600) + 600}s"
+
+
+def test_no_trimming_never_buys_a_trimal_budget():
+    for value in ("none", "", None):
+        assert _resolved_timeout(
+            {"alignment_method": "mafft", "trimming_method": value,
+             "tree_method": "raxml"},
+            DEFAULT_TRIMMING_METHOD="trimal_gappy",
+        ) == f"{int((8 + 8 + 15) * 3600) + 600}s"
+
+
+def test_the_queue_and_the_worker_resolve_the_same_trimmer():
+    """The RQ budget and the trim step must not disagree about the method."""
     from app.config import Config
-    from app.workers.queue import resolve_job_timeout
+    from app.services.trimming_service import resolve_trimming_method
+    from app.workers.queue import _TRIMMING_STAGE_TOOL
 
-    limits = {
-        "RAXML_TIME_LIMIT_HOURS": 15,
-        "IQTREE_TIME_LIMIT_HOURS": 14,
-        "MRBAYES_TIME_LIMIT_HOURS": 13,
-        "FASTTREE_TIME_LIMIT_HOURS": 6,
-    }
-    with patch.object(Config, "GENERAL_JOB_TIME_LIMIT_HOURS", 8), patch.multiple(
-        Config, **limits
-    ):
-        timeout = resolve_job_timeout({"tree_method": tree_method})
-
-    assert timeout == f"{int((8 + tree_hours) * 3600) + 600}s"
+    with patch.object(Config, "DEFAULT_TRIMMING_METHOD", "trimal_gappy"), \
+            patch.object(Config, "BEGINNER_DEFAULT_TRIMMING", "bmge"):
+        assert resolve_trimming_method({}) == "trimal_gappy"
+        assert resolve_trimming_method({"trimming_method": "default"}) == "bmge"
+        assert resolve_trimming_method({"trimming_method": None}) == "none"
+        assert resolve_trimming_method({"trimming_method": " BMGE "}) == "bmge"
+    # Every method run_trimming dispatches on is a key here, so a new trimmer
+    # cannot be added to the dispatcher without a budget decision.
+    for method in ("none", "trimal_gappy", "trimal", "bmge"):
+        assert method in _TRIMMING_STAGE_TOOL
+    assert _TRIMMING_STAGE_TOOL["trimal_gappy"] == "trimAl"
 
 
 def test_job_timeout_uses_general_allowance_without_a_limited_tree_builder():
-    from app.config import Config
-    from app.workers.queue import resolve_job_timeout
+    assert _resolved_timeout(
+        {"tree_method": "nj", "alignment_method": "none",
+         "trimming_method": "none"}
+    ) == "29400s"
 
-    with patch.object(Config, "GENERAL_JOB_TIME_LIMIT_HOURS", 8):
-        assert resolve_job_timeout({"tree_method": "nj"}) == "29400s"
+
+@pytest.mark.parametrize(
+    "general", [None, "", "abc", float("nan"), float("inf"), float("-inf"), 0, -4, True],
+)
+def test_job_timeout_falls_back_on_unusable_configuration(general):
+    # float("inf") reaches int(hours * 3600) as OverflowError and NaN compares
+    # False against every bound, so an unusable configured value must resolve to
+    # the documented default rather than propagate.
+    assert _resolved_timeout(
+        {"tree_method": "nj", "alignment_method": "none",
+         "trimming_method": "none"},
+        general=general,
+    ) == "29400s"
 
 
 # ---------------------------------------------------------------------------

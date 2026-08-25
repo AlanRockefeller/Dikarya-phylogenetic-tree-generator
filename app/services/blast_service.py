@@ -684,6 +684,37 @@ def _fetch_genbank_xml_individually(accessions: List[str]) -> List[str]:
     return documents
 
 
+def _fasta_accession_tokens(fasta_text: str) -> set:
+    """Return every accession-ish identifier appearing in FASTA headers.
+
+    Both the versioned and the bare form of each identifier are included, so a
+    caller that asked for ``MJ505555`` matches a record NCBI labelled
+    ``MJ505555.1`` and vice versa. NCBI's older pipe-delimited header form
+    (``gi|...|gb|MJ505555.1|``) is handled by splitting the first token on
+    ``|``.
+    """
+    from app.services.fasta_utils import parse_fasta_records
+
+    tokens = set()
+    for header, _sequence in parse_fasta_records(fasta_text or ""):
+        first = str(header or "").strip().split()[0] if str(header or "").strip() else ""
+        for piece in first.split("|"):
+            piece = piece.strip().upper()
+            if not piece:
+                continue
+            tokens.add(piece)
+            tokens.add(piece.split(".")[0])
+    return tokens
+
+
+def _accession_is_present(accession: str, tokens: set) -> bool:
+    """True when a requested accession is among the identifiers returned."""
+    value = str(accession or "").strip().upper()
+    if not value:
+        return False
+    return value in tokens or value.split(".")[0] in tokens
+
+
 def _report_unresolved_accessions(failed: List[str], recovered: int) -> None:
     """Mark accessions NCBI would not return as a degradation, not a silent gap.
 
@@ -1069,23 +1100,48 @@ def fetch_fasta_for_accessions(accessions: List[str]) -> str:
                 "rettype": "fasta",
                 "retmode": "text"
             }
+            recovered_text = ""
             try:
                 response = _ncbi_request("POST", NCBI_EFETCH_URL, data=params, timeout=(10, 60))
                 if response.status_code == 200:
-                    text = response.text.strip()
-                    if text:
-                        final_lines.append(text)
-                    continue
-                logger.error(
-                    "event=ncbi.fallback_failed Fallback FASTA fetch failed "
-                    "status=%s count=%s",
-                    response.status_code, len(chunk),
-                )
+                    # A 200 with an empty body is NCBI answering "nothing" --
+                    # it is not a recovery. Continuing on every 200 dropped
+                    # those accessions out of the result *and* out of the
+                    # unresolved report, so the run looked entirely successful.
+                    recovered_text = (response.text or "").strip()
+                    if not recovered_text:
+                        logger.error(
+                            "event=ncbi.fallback_empty Fallback FASTA fetch "
+                            "returned an empty body status=200 count=%s",
+                            len(chunk),
+                        )
+                else:
+                    logger.error(
+                        "event=ncbi.fallback_failed Fallback FASTA fetch failed "
+                        "status=%s count=%s",
+                        response.status_code, len(chunk),
+                    )
             except Exception as e:
                 logger.error(f"Fallback FASTA fetch exception: {e}")
-            # These accessions are now definitively absent from the result.
-            # Silently returning without them produced a tree missing its
-            # references that looked like a completely successful run.
-            _report_unresolved_accessions(chunk, len(final_lines))
+
+            # NCBI can answer a multi-id efetch with only some of the records,
+            # so which accessions were recovered is read back off the FASTA it
+            # actually returned rather than assumed to be all or none.
+            returned = _fasta_accession_tokens(recovered_text)
+            if returned:
+                final_lines.append(recovered_text)
+            unresolved = [
+                acc for acc in chunk
+                if not _accession_is_present(acc, returned)
+            ]
+            if unresolved:
+                # These accessions are now definitively absent from the result.
+                # Silently returning without them produced a tree missing its
+                # references that looked like a completely successful run. The
+                # recovered count is this chunk's own, not the length of the
+                # whole accumulated output.
+                _report_unresolved_accessions(
+                    unresolved, len(chunk) - len(unresolved)
+                )
 
     return "\n".join(final_lines)

@@ -25,7 +25,7 @@ from app.services.artifact_storage import (
 from app.services.log_context import (
     JobContextFilter, background_job_context, bind_background_context,
     background_user_identity,
-    stable_fingerprint,
+    stable_fingerprint, utc_formatter,
 )
 from app.services.tree_parameter_validation import validate_iqtree_ufboot_count
 from app.services.subprocess_utils import ToolExecutionError, log_tool_failure
@@ -150,7 +150,9 @@ def _add_job_log_handler(job_id, log_file):
     """Capture all service logs for this job, without cross-job leakage."""
     handler = logging.FileHandler(log_file)
     handler.addFilter(JobContextFilter(job_id))
-    handler.setFormatter(logging.Formatter(
+    # UTC, matching every other Dikarya log timestamp and what the log digest
+    # assumes when it reads a timestamp carrying no offset.
+    handler.setFormatter(utc_formatter(
         "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
     ))
     logging.getLogger().addHandler(handler)
@@ -617,6 +619,44 @@ def _count_alignment_stats(fasta_path) -> tuple[int, int]:
         return 0, 0
 
 
+def _resolved_alignment_method(job_params: dict) -> str:
+    """Return the alignment method this job will actually run, lowercased.
+
+    ``"default"`` (and a missing value) resolve to the configured beginner
+    aligner. Steps that need to know whether the input is already aligned --
+    ORIENT, which runs long before STEP_ALIGN -- must use this rather than
+    reading ``alignment_method`` raw, or a job submitted with ``"default"``
+    would be classified differently in the two places.
+    """
+    method = job_params.get("alignment_method") or "default"
+    method = str(method).strip().lower()
+    if method == "default":
+        method = str(Config.BEGINNER_DEFAULT_ALIGNER).lower()
+    return method
+
+
+def _resolve_orientation_plan(job_params: dict):
+    """Return ``(requested, effective)`` orientation correction for this job.
+
+    ``requested`` is the user's own setting, coerced through the project-wide
+    `coerce_bool` -- ``bool("false")`` is True, so a stored string form of the
+    flag used to silently re-enable correction for a user who had turned it off.
+
+    ``effective`` additionally accounts for ``alignment_method="none"``, which
+    asserts the submitted records are ALREADY ALIGNED. Reverse-complementing one
+    row of an existing alignment destroys the column correspondence that makes
+    it an alignment, so no correction happens for such a job however the flag is
+    set. `run_alignment` already declines to correct direction for ``none``; the
+    ORIENT step runs much earlier and used to rewrite input_raw.fasta anyway.
+    """
+    from app.services.security_utils import coerce_bool
+
+    params = job_params or {}
+    requested = coerce_bool(params.get("fix_orientation"), True)[0]
+    prealigned = _resolved_alignment_method(params) == "none"
+    return requested, (requested and not prealigned)
+
+
 def _check_and_maybe_fix_orientation(input_path, fix_orientation: bool) -> dict:
     """Classify orientations, only rewriting the FASTA when correction is on."""
     from app.services.orientation_service import fix_sequence_orientation
@@ -897,6 +937,12 @@ def run_phylo_job(job_params: dict) -> dict:
     job_params["trim_terminal_overhangs"] = coerce_bool(
         job_params.get("trim_terminal_overhangs"), True
     )[0]
+    # Same treatment for fix_orientation: bool("false") is True, so a stored
+    # string form of the flag used to re-enable orientation correction for a
+    # user who had switched it off.
+    job_params["fix_orientation"] = coerce_bool(
+        job_params.get("fix_orientation"), True
+    )[0]
 
     # 1. Create Job Directory
     job_dir = Config.JOB_DIR / job_id
@@ -956,12 +1002,10 @@ def run_phylo_job(job_params: dict) -> dict:
                 # This ensures the UI shows correct pipeline from the start
                 input_type = _normalize_input_type(job_params.get("input_type"))
                 blast_mode = _normalize_blast_mode(job_params.get("blast_mode"))
-                from app.services.trimming_service import describe_trim_step
-                trim_method = job_params.get(
-                    "trimming_method", Config.DEFAULT_TRIMMING_METHOD
+                from app.services.trimming_service import (
+                    describe_trim_step, resolve_trimming_method,
                 )
-                if trim_method == "default":
-                    trim_method = Config.BEGINNER_DEFAULT_TRIMMING
+                trim_method = resolve_trimming_method(job_params)
                 # Already normalized to a bool near the top of run_phylo_job.
                 trim_terminal_overhangs = bool(job_params.get("trim_terminal_overhangs", True))
 
@@ -1375,15 +1419,28 @@ def run_phylo_job(job_params: dict) -> dict:
             publish_step_start(job_id, STEP_ORIENT, "Orientation Check", "Checking sequence orientations")
             update_step_meta(job, STEP_ORIENT, {"state": STATE_RUNNING})
             
-            fix_orientation = bool(job_params.get("fix_orientation", True))
+            # One helper resolves both the flag and the already-aligned case, so
+            # ORIENT and STEP_ALIGN cannot disagree about either.
+            fix_orientation, correct_orientation = _resolve_orientation_plan(
+                job_params
+            )
+            input_is_prealigned = _resolved_alignment_method(job_params) == "none"
             orient_stats = _check_and_maybe_fix_orientation(
-                input_raw_path, fix_orientation
+                input_raw_path, correct_orientation
             )
             
             reversed_count = orient_stats.get("reverse", 0)
             uncertain_count = orient_stats.get("uncertain", 0)
             
-            if not fix_orientation:
+            if input_is_prealigned:
+                orient_detail = (
+                    "Orientation correction skipped (input is already aligned)"
+                )
+                if reversed_count > 0:
+                    orient_detail += f"; {reversed_count} reverse sequence(s) detected"
+                if uncertain_count > 0:
+                    orient_detail += f", {uncertain_count} uncertain"
+            elif not fix_orientation:
                 orient_detail = "Orientation correction disabled"
                 if reversed_count > 0:
                     orient_detail += f"; {reversed_count} reverse sequence(s) detected"
@@ -1400,7 +1457,7 @@ def run_phylo_job(job_params: dict) -> dict:
             
             logger.info(
                 "Orientation check: correction_enabled=%s total=%s forward=%s reverse=%s uncertain=%s",
-                fix_orientation,
+                correct_orientation,
                 orient_stats.get("total", 0),
                 orient_stats.get("forward", 0),
                 reversed_count,
@@ -1410,7 +1467,7 @@ def run_phylo_job(job_params: dict) -> dict:
             publish_step_done(job_id, STEP_ORIENT, orient_detail)
             update_step_meta(job, STEP_ORIENT, {"state": STATE_DONE, "detail": orient_detail})
             
-            if fix_orientation and reversed_count > 0:
+            if correct_orientation and reversed_count > 0:
                 publish_metric(job_id, STEP_ORIENT, "reversed", reversed_count)
 
             # =========================================================
@@ -1485,9 +1542,9 @@ def run_phylo_job(job_params: dict) -> dict:
             # STEP: ALIGNMENT
             # =========================================================
             current_step = STEP_ALIGN
-            align_method = job_params.get("alignment_method", "default")
-            if align_method == "default":
-                align_method = Config.BEGINNER_DEFAULT_ALIGNER
+            # Resolved by the same helper the ORIENT step used, so the two
+            # steps can never disagree about whether this job skips alignment.
+            align_method = _resolved_alignment_method(job_params)
             
             current_tool = align_method.lower()
             current_step_label = f"Alignment ({align_method.upper()})"
@@ -1558,12 +1615,11 @@ def run_phylo_job(job_params: dict) -> dict:
             # STEP: TRIMMING
             # =========================================================
             current_step = STEP_TRIM
-            from app.services.trimming_service import run_trimming, describe_trim_step, format_trimming_detail
-            trim_method = job_params.get(
-                "trimming_method", Config.DEFAULT_TRIMMING_METHOD
+            from app.services.trimming_service import (
+                run_trimming, describe_trim_step, format_trimming_detail,
+                resolve_trimming_method,
             )
-            if trim_method == "default":
-                trim_method = Config.BEGINNER_DEFAULT_TRIMMING
+            trim_method = resolve_trimming_method(job_params)
             # Already normalized to a bool near the top of run_phylo_job.
             trim_terminal_overhangs = bool(job_params.get("trim_terminal_overhangs", True))
             should_trim, current_step_label, current_tool = describe_trim_step(trim_method, trim_terminal_overhangs)

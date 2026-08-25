@@ -202,8 +202,22 @@ def write_review_checkpoint(path, reviewed_through):
             f"{format_window_timestamp(now)})."
         )
     if path.exists():
-        previous = read_review_checkpoint(path)
-        if reviewed_through < previous:
+        # Reads stay strict everywhere else -- a review must never silently
+        # start from a boundary nobody can vouch for. Here the operator is
+        # explicitly reseeding the file, and refusing to overwrite a corrupt
+        # checkpoint made --mark-reviewed, the documented recovery, unable to
+        # recover it. An unreadable file therefore means "no valid previous
+        # boundary", which cannot be moved backwards.
+        try:
+            previous = read_review_checkpoint(path)
+        except ValueError as exc:
+            print(
+                f"warning: replacing an unreadable log-review checkpoint at "
+                f"{path} ({exc})",
+                file=sys.stderr,
+            )
+            previous = None
+        if previous is not None and reviewed_through < previous:
             raise ValueError(
                 "Refusing to move the log-review checkpoint backwards "
                 f"({format_window_timestamp(previous)} -> "

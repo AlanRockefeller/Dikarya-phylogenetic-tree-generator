@@ -83,6 +83,26 @@ class DocsExampleTests(unittest.TestCase):
         self.assertNotIn("completed|failed|error) break", html)
         self.assertIn("curl -fS -H", html)
 
+    def test_the_shell_polling_deadline_bounds_each_request_too(self):
+        """MAX_WAIT_SECONDS has to be a real deadline.
+
+        The loop checked the deadline before starting each curl, but a single
+        status request could then block past it on its own, so the example could
+        run indefinitely while claiming a configurable ceiling.
+        """
+        html = read("app", "templates", "api_v1", "docs.html")
+        loop = html.split("deadline=$((SECONDS + MAX_WAIT_SECONDS))")[1]
+        loop = loop.split("if [[ \"$STATUS\" != \"completed\" ]]")[0]
+
+        self.assertIn("--connect-timeout", loop)
+        # Bounded by what is left of the wall clock, not by a fixed number.
+        self.assertIn("remaining=$(( deadline - SECONDS ))", loop)
+        self.assertIn('--max-time "$remaining"', loop)
+        # And a non-positive remainder never reaches curl.
+        self.assertIn("(( remaining &lt; 1 ))", loop)
+        # The existing jq/status handling is untouched.
+        self.assertIn(".data.status // .error.message", loop)
+
     def test_every_python_request_carries_a_timeout(self):
         html = read("app", "templates", "api_v1", "docs.html")
         example = html.split("import requests")[1]
@@ -108,9 +128,14 @@ class JobStatusTemplateTests(unittest.TestCase):
         self.assertIn('aria-expanded="false"', self.html)
         self.assertIn('aria-haspopup="true"', self.html)
         self.assertIn('aria-controls="downloads-menu"', self.html)
-        # The button must be a real button, not an implicit submit.
-        btn = self.html.split('id="downloads-menu-btn"')[0]
-        self.assertIn('<button type="button"', btn[btn.rindex("<button"):] + 'type="button"')
+        # The button must be a real button, not an implicit submit. Inspect the
+        # whole opening tag as it is shipped: the previous version appended
+        # 'type="button"' to its own haystack, so it passed whether or not the
+        # template still carried the attribute.
+        start = self.html.index('id="downloads-menu-btn"')
+        opening = self.html[self.html.rindex("<button", 0, start):]
+        opening = opening[:opening.index(">") + 1]
+        self.assertRegex(opening, r'<button\b[^>]*\btype="button"')
         # Behaviour itself is covered by DownloadsDropdownBehaviourTests in
         # tests/test_coderabbit_review_fixes.py, which runs the shipped script.
 

@@ -373,8 +373,14 @@ def build_recompute_job_params(params_dict: Dict[str, Any]) -> JobParams:
         advanced_options=params_dict.get("alignment_options", {}) or {}
     )
 
+    # Through the shared resolver, so an absent key and the literal "default"
+    # land where the worker's own trim step puts them. Passing "default"
+    # straight through reached run_trimming, whose dispatcher has no such
+    # branch and raises "Unsupported trimming method: default".
+    from app.services.trimming_service import resolve_trimming_method
+
     trim_params = TrimmingParams(
-        method=params_dict.get("trimming_method", Config.DEFAULT_TRIMMING_METHOD),
+        method=resolve_trimming_method(params_dict),
         trim_terminal_overhangs=_bool_param(params_dict, "trim_terminal_overhangs", True),
     )
 
@@ -2038,6 +2044,28 @@ def _clade_to_json(clade):
     return node
 
 
+def _carry_collapsed_annotation(removed, survivor) -> None:
+    """Move a collapsed node's internal annotation onto its surviving child.
+
+    A node with exactly one child defines the same bipartition as that child,
+    so the annotation describes the surviving split and is carried down rather
+    than discarded. ``name`` and ``confidence`` are treated as **mutually
+    exclusive** here: Newick has no representation for an internal node holding
+    both (Biopython concatenates them into an invented label such as
+    ``CladeA95``, which is why `tree_to_newick_string` refuses to serialize
+    one). So the survivor's own annotation always wins, and the collapsed
+    node's is used only when the survivor carries neither.
+    """
+    if survivor.confidence is not None or survivor.name is not None:
+        return
+    if removed.confidence is not None:
+        survivor.confidence = removed.confidence
+    elif removed.name is not None:
+        # IQ-TREE dual SH-aLRT/UFBoot support is parsed as an internal name
+        # rather than as ``confidence``, so the label is worth carrying too.
+        survivor.name = removed.name
+
+
 def _collapse_unifurcations(tree) -> None:
     """
     Collapse internal nodes that have exactly one child (unifurcations).
@@ -2055,7 +2083,8 @@ def _collapse_unifurcations(tree) -> None:
     same split and the collapsed node's confidence is the surviving node's
     confidence. Dropping it silently deleted support values from clades that
     had them, which is why pruning could turn a well-supported branch into an
-    unlabelled one.
+    unlabelled one. The transfer goes through `_carry_collapsed_annotation`,
+    which never lets a survivor end up holding both a name and a confidence.
 
     Modifies tree in-place.
     """
@@ -2068,10 +2097,7 @@ def _collapse_unifurcations(tree) -> None:
             only_child.branch_length += tree.root.branch_length
         elif tree.root.branch_length:
             only_child.branch_length = tree.root.branch_length
-        if only_child.confidence is None and tree.root.confidence is not None:
-            only_child.confidence = tree.root.confidence
-        if only_child.name is None and tree.root.name is not None:
-            only_child.name = tree.root.name
+        _carry_collapsed_annotation(tree.root, only_child)
         # Promote child to root
         tree.root = only_child
         # Continue loop in case the new root is also a unifurcation
@@ -2108,14 +2134,7 @@ def _collapse_unifurcations(tree) -> None:
 
             # The collapsed node and its only child define the same split, so
             # the support value survives the collapse.
-            if only_child.confidence is None and clade.confidence is not None:
-                only_child.confidence = clade.confidence
-            if only_child.name is None and clade.name is not None:
-                # IQ-TREE dual SH-aLRT/UFBoot support is parsed as an internal
-                # name rather than as ``confidence``. A collapsed unary node and
-                # its child define the same surviving split, so carry that label
-                # when the child has no annotation of its own.
-                only_child.name = clade.name
+            _carry_collapsed_annotation(clade, only_child)
 
             # Replace clade with only_child in parent's children list
             idx = parent.clades.index(clade)

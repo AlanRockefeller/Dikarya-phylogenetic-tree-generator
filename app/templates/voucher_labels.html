@@ -303,7 +303,12 @@
     // implausibly long run is reported and the default is used, matching the server.
     function startNumberParts() {
         const rawStart = (startInput.value || '001').trim();
-        const match = rawStart.match(/\d+/);
+        // Alan 8/25/26 - Anchored: the WHOLE field has to be digits. A bare /\d+/
+        // search turned "ABC123" into 123, quietly renumbering from a value the
+        // user never asked for (and dropping the letters, which belong in the
+        // separate prefix field). Surrounding whitespace is still fine -- it is
+        // trimmed above, exactly as the server strips it.
+        const match = rawStart.match(/^\d+$/);
         if (!match || match[0].length > MAX_VOUCHER_NUMBER_DIGITS) {
             return { start: 1n, width: 3, tooLong: Boolean(match) };
         }

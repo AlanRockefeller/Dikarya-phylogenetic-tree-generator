@@ -63,6 +63,26 @@ def _load_input_info(job_id):
         return {}
 
 
+def _serialized_bool(info, job, field):
+    """Normalize a persisted boolean job parameter for the v1 job resource.
+
+    Keeps the existing precedence -- input_info.json first, job.metrics as the
+    fallback -- and returns None when neither store carries the field, so a
+    legacy job is reported as "not recorded" rather than as False.
+    """
+    value = info.get(field)
+    if value is None:
+        value = (job.metrics or {}).get(field)
+    if value is None:
+        return None
+    coerced, recognized = coerce_bool(value, default=True)
+    if not recognized:
+        # An unrecognized string is not a boolean in either direction; saying
+        # so beats guessing.
+        return None
+    return coerced
+
+
 def serialize_job(job):
     """Build the v1 job resource for a Job row."""
     info = _load_input_info(job.id)
@@ -76,16 +96,17 @@ def serialize_job(job):
         "params": {
             "alignment_method": info.get("alignment_method") or (job.metrics or {}).get("alignment_method"),
             "trimming_method":  info.get("trimming_method")  or (job.metrics or {}).get("trimming_method"),
-            "trim_terminal_overhangs": (
-                info.get("trim_terminal_overhangs")
-                if info.get("trim_terminal_overhangs") is not None
-                else (job.metrics or {}).get("trim_terminal_overhangs")
+            # coerce_bool, not the raw stored value: OpenAPI declares these as
+            # boolean-or-null, but a job submitted through a JSON client may
+            # have persisted the string "false", which serialized as a string
+            # the schema forbids and which any client reading it as truthy
+            # would take for the opposite of what the worker ran. None is
+            # preserved: a legacy job that never stored the field has no answer,
+            # and reporting False would invent one.
+            "trim_terminal_overhangs": _serialized_bool(
+                info, job, "trim_terminal_overhangs"
             ),
-            "fix_orientation": (
-                info.get("fix_orientation")
-                if info.get("fix_orientation") is not None
-                else (job.metrics or {}).get("fix_orientation")
-            ),
+            "fix_orientation": _serialized_bool(info, job, "fix_orientation"),
             "tree_method":      info.get("tree_method")      or (job.metrics or {}).get("tree_method"),
             "tree_model":       info.get("tree_model"),
             "bootstrap":        info.get("bootstrap"),

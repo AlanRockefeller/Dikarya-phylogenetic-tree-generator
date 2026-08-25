@@ -296,7 +296,11 @@ MAX_VOUCHER_NUMBER_DIGITS = 30
 def _voucher_number_parts(form):
     prefix = re.sub(r'[\x00-\x1f\x7f]', '', form.get("prefix", "")).strip()[:32]
     start_raw = (form.get("start_number") or "001").strip()
-    start_match = re.search(r'\d+', start_raw)
+    # fullmatch, not search: the whole field must be digits, mirroring
+    # startNumberParts() in voucher_labels.html. Extracting the first digit run
+    # made "ABC123" mean 123 -- a number the user never entered, with the
+    # letters silently discarded rather than moved to the prefix field.
+    start_match = re.fullmatch(r'\d+', start_raw)
     digits = start_match.group(0) if start_match else None
     if not digits or len(digits) > MAX_VOUCHER_NUMBER_DIGITS:
         return prefix, 1, 3
@@ -384,6 +388,16 @@ def _voucher_layout_from_form(form, sample_label=None, output_format="pdf"):
         # subtracting it twice would wrongly reject the 3-column default.
         usable_width = max(0.0, 8.5 - margin_left)
         usable_height = max(0.0, 11 - margin_top)
+        # Clamp the label itself to the printable extent before fitting the
+        # grid. _voucher_fit_count always returns at least one column, so a
+        # label wider than the page minus its margin produced a single column
+        # that still ran off the sheet -- the grid fit cannot rescue a cell that
+        # does not fit on its own. Clamping first also means the stored layout
+        # dimensions describe what is actually printed.
+        if usable_width > 0:
+            label_width = min(label_width, usable_width)
+        if usable_height > 0:
+            label_height = min(label_height, usable_height)
         columns = min(columns, _voucher_fit_count(usable_width, label_width, gap_x))
         rows = min(rows, _voucher_fit_count(usable_height, label_height, gap_y))
         preset.update({
