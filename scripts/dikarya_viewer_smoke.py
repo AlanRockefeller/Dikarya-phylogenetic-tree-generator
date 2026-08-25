@@ -40,11 +40,11 @@ it outside the sandbox.
 
 import argparse
 import json
-import re
 import shutil
 import subprocess
 import sys
 import tempfile
+from html.parser import HTMLParser
 from pathlib import Path
 from urllib.parse import urljoin, urlparse
 
@@ -60,7 +60,40 @@ DEFAULT_JOB = "3abfc9b9-5aea-4db6-acde-323148f41361"
 # emitting these, the viewer wires itself to nothing and silently does nothing.
 REQUIRED_ELEMENT_IDS = ["tree-container", "status-message"]
 
-SCRIPT_SRC_RE = re.compile(r'<script[^>]+src=["\']([^"\']+)["\']', re.I)
+
+class _ScriptSrcExtractor(HTMLParser):
+    """Collect the src of every external <script> the page references.
+
+    A regex cannot do this correctly. `<script src=/static/js/x.js></script>`
+    is valid unquoted-attribute HTML, and the pattern this replaced matched
+    only quoted values -- so an unquoted asset was silently never fetched,
+    never integrity-checked, and never executed. HTMLParser also lowercases
+    tag and attribute names for us, tolerates any attribute order, and treats
+    a <script> body as CDATA, so a "<script>" inside a JS string cannot be
+    mistaken for a tag.
+    """
+
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.srcs = []
+
+    def handle_starttag(self, tag, attrs):
+        if tag != "script":
+            return
+        for name, value in attrs:
+            # A valueless `src` yields None; an inline script has no src at
+            # all. Neither is an external asset.
+            if name == "src" and value and value.strip():
+                self.srcs.append(value.strip())
+                return
+
+
+def script_srcs(html):
+    """Return the src of every external script tag, in document order."""
+    parser = _ScriptSrcExtractor()
+    parser.feed(html)
+    parser.close()
+    return parser.srcs
 
 
 class Failure(Exception):
@@ -103,6 +136,24 @@ def check(results, name, ok, detail=""):
     return ok
 
 
+def _verified_static_path(rel):
+    """Resolve a repo-relative asset path, or None if it escapes app/static.
+
+    Defence in depth for the two callers below: an absolute or escaping `rel`
+    would make `REPO / rel` and `workdir / rel` name the SAME file outside the
+    checkout, so copyfile would be handed its own source and an arbitrary
+    local file could be read as though it were a trusted repository asset.
+    """
+    static_root = (REPO / "app" / "static").resolve()
+    try:
+        candidate = (REPO / rel).resolve()
+    except OSError:
+        return None
+    if candidate != static_root and static_root not in candidate.parents:
+        return None
+    return candidate
+
+
 def local_path_for(src_url, base_url):
     """Map a served /static/... URL back onto its repo-relative path.
 
@@ -118,16 +169,26 @@ def local_path_for(src_url, base_url):
     marker = "/static/"
     if not parsed.path.startswith(marker):
         return None
-    suffix = parsed.path[len(marker):]
-    parts = Path(suffix).parts
-    if not suffix or any(part in ("", ".", "..") for part in parts):
+    # Split the URL path on "/" rather than handing it to Path. "/static//tmp/
+    # evil.js" leaves the suffix "/tmp/evil.js", whose first Path part is "/" --
+    # which joinpath() honours as an absolute path, discarding "app/static" and
+    # escaping the repository entirely. As plain segments the leading "" is
+    # visible and refused, along with ".", ".." and empty interior segments.
+    parts = parsed.path[len(marker):].split("/")
+    if any(part in ("", ".", "..") or "\\" in part or "\0" in part
+           for part in parts):
         return None
-    return str(Path("app/static").joinpath(*parts))
+    rel = str(Path("app/static").joinpath(*parts))
+    if _verified_static_path(rel) is None:
+        return None
+    return rel
 
 
 def served_asset_matches_local(rel, served_bytes):
     """Return whether executable served bytes equal the trusted checkout."""
-    trusted = REPO / rel
+    trusted = _verified_static_path(rel)
+    if trusted is None:
+        return False
     try:
         return trusted.is_file() and trusted.read_bytes() == served_bytes
     except OSError:
@@ -136,11 +197,12 @@ def served_asset_matches_local(rel, served_bytes):
 
 def mirror_verified_asset(rel, served_bytes, workdir):
     """Mirror only an executable asset proven identical to the checkout."""
-    if not served_asset_matches_local(rel, served_bytes):
+    trusted = _verified_static_path(rel)
+    if trusted is None or not served_asset_matches_local(rel, served_bytes):
         return False
     destination = Path(workdir) / rel
     destination.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copyfile(REPO / rel, destination)
+    shutil.copyfile(trusted, destination)
     return True
 
 
@@ -185,7 +247,7 @@ def main():
               f"bind to nothing")
 
     # --- 3. Every script tag, at the exact URL production serves.
-    srcs = [s for s in SCRIPT_SRC_RE.findall(html)]
+    srcs = script_srcs(html)
     if not check(results, "page-references-scripts", bool(srcs),
                  "the page referenced no external scripts at all"):
         return report(results, args)

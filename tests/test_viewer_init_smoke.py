@@ -24,6 +24,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
+from urllib.parse import urljoin
 
 from scripts import dikarya_viewer_smoke as live_smoke
 
@@ -87,6 +88,60 @@ class ViewerInitSmokeTests(unittest.TestCase):
         self._assert_ok("bootstrap-runs-without-throwing")
 
 
+class ScriptSrcExtractionTests(unittest.TestCase):
+    """Every external script the page names has to be discovered.
+
+    A src the extractor misses is never fetched, never integrity-checked and
+    never executed -- so a broken asset shipped that way passes the smoke test
+    silently, which is the exact failure mode this script exists to catch.
+    """
+
+    PAGE = (
+        '<script src="/static/js/quoted.js?v=3"></script>\n'
+        "<script src='/static/js/single.js'></script>\n"
+        "<script src=/static/js/unquoted.js></script>\n"
+        '<script defer SRC=/static/js/attrs_reordered.js type="module"></script>\n'
+        '<script>var s = "<script src=/static/js/inline.js></script>";</script>\n'
+        '<script src="https://cdn.example/lib.js"></script>\n'
+        "<script></script>\n"
+        "<script src></script>\n"
+    )
+
+    def test_quoted_single_quoted_and_unquoted_srcs_are_all_found(self):
+        self.assertEqual(
+            live_smoke.script_srcs(self.PAGE),
+            [
+                "/static/js/quoted.js?v=3",
+                "/static/js/single.js",
+                "/static/js/unquoted.js",
+                "/static/js/attrs_reordered.js",
+                "https://cdn.example/lib.js",
+            ],
+        )
+
+    def test_an_unquoted_static_script_enters_the_same_integrity_path(self):
+        """The regression: only quoted srcs used to reach local_path_for()."""
+        mapped = [
+            live_smoke.local_path_for(
+                urljoin("https://dikarya.us/job/x/view", src), "https://dikarya.us"
+            )
+            for src in live_smoke.script_srcs(self.PAGE)
+        ]
+        self.assertEqual(
+            mapped,
+            [
+                "app/static/js/quoted.js",
+                "app/static/js/single.js",
+                "app/static/js/unquoted.js",
+                "app/static/js/attrs_reordered.js",
+                None,  # cross-origin CDN asset: fetched by nobody, mirrored never
+            ],
+        )
+
+    def test_inline_scripts_are_never_treated_as_external_assets(self):
+        self.assertEqual(live_smoke.script_srcs("<script>let a = 1;</script>"), [])
+
+
 class ServedAssetIntegrityTests(unittest.TestCase):
     def test_cross_origin_static_looking_script_is_rejected(self):
         self.assertIsNone(
@@ -102,6 +157,68 @@ class ServedAssetIntegrityTests(unittest.TestCase):
             ),
             "app/static/js/tree_viewer_controller.js",
         )
+
+    def test_an_ordinary_static_script_still_maps_onto_the_checkout(self):
+        rel = live_smoke.local_path_for(
+            "https://dikarya.us/static/js/tree_viewer_controller.js",
+            "https://dikarya.us",
+        )
+        self.assertEqual(rel, "app/static/js/tree_viewer_controller.js")
+        # Not merely well-formed: it is the file the harness goes on to execute.
+        self.assertTrue((REPO / rel).is_file())
+
+    def test_a_rooted_suffix_cannot_escape_app_static(self):
+        """`/static//tmp/example.js` leaves the suffix `/tmp/example.js`.
+
+        Path.joinpath() honours that leading "/" as an absolute path, throwing
+        away "app/static" -- so the mapping used to hand mirror_verified_asset
+        a path outside the repository, where REPO / rel and workdir / rel name
+        the same file and copyfile is given its own source.
+        """
+        for url in (
+            "https://dikarya.us/static//tmp/example.js",
+            "https://dikarya.us/static///etc/passwd",
+            "https://dikarya.us/static//",
+        ):
+            with self.subTest(url=url):
+                self.assertIsNone(
+                    live_smoke.local_path_for(url, "https://dikarya.us")
+                )
+
+    def test_traversal_and_empty_suffixes_are_rejected(self):
+        for url in (
+            "https://dikarya.us/static/../../etc/passwd",
+            "https://dikarya.us/static/js/../../../etc/passwd",
+            "https://dikarya.us/static/./js/tree_viewer_controller.js",
+            "https://dikarya.us/static/js//tree_viewer_controller.js",
+            "https://dikarya.us/static/",
+            "https://dikarya.us/static",
+            "https://dikarya.us/staticky/js/x.js",
+        ):
+            with self.subTest(url=url):
+                self.assertIsNone(
+                    live_smoke.local_path_for(url, "https://dikarya.us")
+                )
+
+    def test_mirroring_refuses_a_path_outside_app_static(self):
+        """Defence in depth, in case a future caller skips local_path_for()."""
+        with (
+            tempfile.TemporaryDirectory() as repo_tmp,
+            tempfile.TemporaryDirectory() as mirror_tmp,
+        ):
+            repo = Path(repo_tmp)
+            outsider = repo / "outside.js"
+            body = b"globalThis.executed = 'outside';\n"
+            outsider.write_bytes(body)
+
+            with patch.object(live_smoke, "REPO", repo):
+                for rel in (str(outsider), "outside.js", "app/static/../outside.js"):
+                    with self.subTest(rel=rel):
+                        self.assertFalse(
+                            live_smoke.mirror_verified_asset(
+                                rel, body, Path(mirror_tmp)
+                            )
+                        )
 
     def test_mismatched_remote_bytes_are_never_mirrored_for_execution(self):
         with (

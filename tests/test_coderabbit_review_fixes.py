@@ -69,7 +69,7 @@ class VoucherNumberingTests(unittest.TestCase):
     """
 
     # (start_number field, prefix, offset)
-    CASES = [
+    CASES = (
         ("001", "AR-", 0),
         ("001", "AR-", 1),
         ("001", "AR-", 999),
@@ -95,7 +95,7 @@ class VoucherNumberingTests(unittest.TestCase):
         ("007", "P", 995),
         # One past the digit limit: refused on both sides, never truncated.
         ("1" * (main_routes.MAX_VOUCHER_NUMBER_DIGITS + 1), "P", 1),
-    ]
+    )
 
     def test_the_browser_parser_never_truncates(self):
         html = read("app", "templates", "voucher_labels.html")

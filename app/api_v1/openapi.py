@@ -200,7 +200,10 @@ def _schemas():
                         f"rule applies (mcmc_stop_early false, or mcmc_nruns 1) "
                         f"this is the full length of the run and the default "
                         f"drops to {Config.DEFAULT_MCMC_GENERATIONS_FIXED_RUN}. "
-                        "An explicitly supplied value is always used as given."
+                        "An explicitly supplied integer from 1,000 through "
+                        "100,000,000 is used as given; a value outside that "
+                        "range, or one that is not an integer, is rejected "
+                        "with 422 rather than clamped."
                     ),
                 },
                 "mcmc_nruns": {"type": "integer", "minimum": 1, "maximum": 8},
@@ -341,8 +344,11 @@ def _schemas():
                         "mcmc_nruns 1) this is the full length of the run, and "
                         "an omitted value instead defaults to "
                         f"{Config.DEFAULT_MCMC_GENERATIONS_FIXED_RUN}. An "
-                        "explicitly supplied value is always used as given. "
-                        "Server-side job runtime limits still apply."
+                        "explicitly supplied integer from 1,000 through "
+                        "100,000,000 is used as given; a value outside that "
+                        "range, or one that is not an integer, is rejected "
+                        "with 422 rather than clamped. Server-side job "
+                        "runtime limits still apply."
                     ),
                 },
                 "mcmc_nruns": {
