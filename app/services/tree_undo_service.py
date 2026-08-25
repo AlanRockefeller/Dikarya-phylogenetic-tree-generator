@@ -54,6 +54,7 @@ the previous topology, so it clears one.
 
 import json
 import logging
+import math
 import os
 import shutil
 import tempfile
@@ -118,10 +119,13 @@ def _read_manifest(job_dir: Path) -> Optional[Dict[str, Any]]:
 def _checkpoint_is_expired(manifest: Dict[str, Any]) -> bool:
     """Apply the one checkpoint-age policy used by describe and restore."""
     created_at = manifest.get("created_at")
-    return (
-        isinstance(created_at, (int, float))
-        and time.time() - created_at > MAX_CHECKPOINT_AGE_SECONDS
-    )
+    if (
+        isinstance(created_at, bool)
+        or not isinstance(created_at, (int, float))
+        or not math.isfinite(created_at)
+    ):
+        return True
+    return time.time() - created_at > MAX_CHECKPOINT_AGE_SECONDS
 
 
 def clear_undo_checkpoint(job_dir: Path) -> bool:

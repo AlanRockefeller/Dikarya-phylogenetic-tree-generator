@@ -210,6 +210,34 @@ class CheckpointLifecycleTests(unittest.TestCase):
             self.assertEqual(describe_undo_checkpoint(job_dir), {"available": False})
             self.assertFalse((job_dir / UNDO_DIR_NAME).exists())
 
+    def test_a_checkpoint_with_missing_created_at_is_dropped(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            job_dir = _make_job(Path(tmp))
+            with undo_checkpoint(job_dir, "prune", "prune of 1 sequence") as checkpoint:
+                checkpoint.commit()
+
+            manifest_path = job_dir / UNDO_DIR_NAME / "manifest.json"
+            manifest = json.loads(manifest_path.read_text())
+            del manifest["created_at"]
+            manifest_path.write_text(json.dumps(manifest))
+
+            self.assertEqual(describe_undo_checkpoint(job_dir), {"available": False})
+            self.assertFalse((job_dir / UNDO_DIR_NAME).exists())
+
+    def test_a_checkpoint_with_nan_created_at_is_dropped(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            job_dir = _make_job(Path(tmp))
+            with undo_checkpoint(job_dir, "prune", "prune of 1 sequence") as checkpoint:
+                checkpoint.commit()
+
+            manifest_path = job_dir / UNDO_DIR_NAME / "manifest.json"
+            manifest = json.loads(manifest_path.read_text())
+            manifest["created_at"] = float("nan")
+            manifest_path.write_text(json.dumps(manifest))
+
+            self.assertEqual(describe_undo_checkpoint(job_dir), {"available": False})
+            self.assertFalse((job_dir / UNDO_DIR_NAME).exists())
+
     def test_direct_undo_refuses_expired_checkpoint_without_restoring(self):
         with tempfile.TemporaryDirectory() as tmp:
             job_dir = _make_job(Path(tmp))
