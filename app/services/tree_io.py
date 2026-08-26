@@ -276,10 +276,61 @@ def write_tree_file(tree, path, fmt: str = "newick") -> None:
     )
 
 
-_NTAX_TAXLABELS_RE = re.compile(
-    r"dimensions\s+ntax\s*=\s*(\d+)\s*;\s*taxlabels\s+([^;]*);",
-    re.IGNORECASE,
-)
+_NTAX_RE = re.compile(r"dimensions\s+ntax\s*=\s*(\d+)\s*;", re.IGNORECASE)
+_TAXLABELS_RE = re.compile(r"taxlabels\b", re.IGNORECASE)
+
+
+def _parse_taxlabels(text: str):
+    """Return ``(declared_ntax, [label, ...])`` for a TAXA block, or None.
+
+    Hand-scanned rather than matched with a regex because the block terminates
+    at a semicolon *outside* quotes, and fungal labels are full of semicolons
+    inside them -- a GenBank description reads "... partial sequence; 5.8S
+    ribosomal RNA gene, complete sequence; and ...". A ``[^;]*`` capture stops
+    at the first of those, truncating the list and reporting a bogus token
+    count for a perfectly valid file.
+    """
+    ntax_match = _NTAX_RE.search(text)
+    if not ntax_match:
+        return None
+    labels_match = _TAXLABELS_RE.search(text, ntax_match.end())
+    if not labels_match:
+        return None
+
+    tokens: list[str] = []
+    current = ""
+    index, end = labels_match.end(), len(text)
+    while index < end:
+        char = text[index]
+        if char == "'":
+            # Quoted label; a doubled '' is an escaped quote, not the end.
+            index += 1
+            buffer = []
+            while index < end:
+                if text[index] == "'":
+                    if index + 1 < end and text[index + 1] == "'":
+                        buffer.append("'")
+                        index += 2
+                        continue
+                    index += 1
+                    break
+                buffer.append(text[index])
+                index += 1
+            tokens.append("".join(buffer))
+            continue
+        if char == ";":
+            if current:
+                tokens.append(current)
+            return int(ntax_match.group(1)), tokens
+        if char.isspace():
+            if current:
+                tokens.append(current)
+                current = ""
+            index += 1
+            continue
+        current += char
+        index += 1
+    return None  # unterminated block
 
 
 def validate_nexus_file(path) -> tuple:
@@ -315,11 +366,9 @@ def validate_nexus_file(path) -> tuple:
     if not re.search(r"^\s*tree\s+\S+\s*=", text, re.IGNORECASE | re.MULTILINE):
         return False, "no_tree_statement"
 
-    match = _NTAX_TAXLABELS_RE.search(text)
-    if match:
-        declared = int(match.group(1))
-        # Quoted labels are one token each however much whitespace they hold.
-        tokens = re.findall(r"'(?:[^']|'')*'|\S+", match.group(2))
+    parsed = _parse_taxlabels(text)
+    if parsed:
+        declared, tokens = parsed
         if len(tokens) != declared:
             return False, f"taxlabels_{len(tokens)}_vs_ntax_{declared}"
 

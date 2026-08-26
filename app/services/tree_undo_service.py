@@ -63,7 +63,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from app.services.artifact_storage import discard_gzipped_form
+from app.services.artifact_storage import default_file_mode, discard_gzipped_form
 
 logger = logging.getLogger(__name__)
 
@@ -300,7 +300,7 @@ def _restore_file(source: Path, destination: Path) -> None:
         try:
             os.chmod(temp_name, destination.stat().st_mode & 0o7777)
         except OSError:
-            os.chmod(temp_name, 0o644)
+            os.chmod(temp_name, default_file_mode())
         os.replace(temp_name, destination)
     except BaseException:
         try:

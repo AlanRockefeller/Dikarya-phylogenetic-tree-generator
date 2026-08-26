@@ -1346,6 +1346,168 @@ document.addEventListener('DOMContentLoaded', async () => {
         if (selectedLayerId) select.value = selectedLayerId;
     }
 
+    // Alan 8/26/26 - Suggesting a default annotation label.
+    //
+    // Tip labels here are FASTA headers, not taxon names: an accession or iNat number, the
+    // binomial, then a voucher, a locality and sometimes a RiC count, in any of several
+    // orders and joined by spaces, underscores or pipes. The binomial is found positionally
+    // -- a capitalised genus-shaped word immediately followed by a lowercase epithet -- which
+    // is what keeps a locality ("Ovid Township", "Metamora-Hadley Recreation Area") from being
+    // read as a name: those are followed by another capitalised word, never by an epithet.
+
+    // Genus-shaped words that are never a genus.
+    const NON_GENUS_WORDS = new Set([
+        'uncultured', 'unidentified', 'unclassified', 'fungal', 'fungus', 'voucher',
+        'isolate', 'strain', 'clone', 'culture', 'specimen', 'sequence', 'sample',
+        'environmental', 'herbarium', 'unite', 'genbank', 'type', 'note', 'fungi'
+    ]);
+
+    // Lowercase words that follow a genus without being its epithet.
+    const NON_EPITHET_WORDS = new Set([
+        'voucher', 'isolate', 'strain', 'clone', 'culture', 'specimen', 'sequence',
+        'internal', 'transcribed', 'spacer', 'small', 'large', 'subunit', 'ribosomal',
+        'partial', 'complete', 'gene', 'genes', 'and', 'from', 'the', 'group', 'clade',
+        'complex', 'sensu', 'locked', 'unite', 'sequences'
+    ]);
+
+    const SPECIES_RANK_MARKERS = {
+        sp: 'sp.', spp: 'sp.', cf: 'cf.', aff: 'aff.', nr: 'nr.'
+    };
+
+    const SPECIES_QUOTE_CHARS = '"\u2018\u2019\u201c\u201d\'';
+
+    function speciesTokens(label) {
+        return String(label || '').replace(/[_|]+/g, ' ').trim().split(/\s+/).filter(Boolean);
+    }
+
+    // "AG25041-Bullatosporium" is one token but two things; the name is the trailing part.
+    function speciesGenusCandidate(token) {
+        const word = String(token).split(/[-\u2013]/).pop().replace(/[^A-Za-z]/g, '');
+        if (!/^[A-Z][a-z]{2,}$/.test(word)) return null;
+        return NON_GENUS_WORDS.has(word.toLowerCase()) ? null : word;
+    }
+
+    function speciesEpithetCandidate(token) {
+        const word = String(token).replace(/[^A-Za-z-]/g, '');
+        if (!/^[a-z][a-z-]{2,}$/.test(word)) return null;
+        return NON_EPITHET_WORDS.has(word) ? null : word;
+    }
+
+    // Provisional names travel quoted -- Amanita sp. 'albemarlensis', Amanita "albemarlensis" --
+    // and both spellings have to reduce to the same suggestion so they count as one species.
+    // Informal codes (Russula "sp-IN67", Tricholoma "moseri-CA01") are quoted the same way and
+    // are kept as they are written, because they are what separates two species in these trees.
+    function speciesQuotedEpithet(token) {
+        const match = new RegExp(
+            `^[${SPECIES_QUOTE_CHARS}]+([A-Za-z][A-Za-z0-9.-]{1,})[${SPECIES_QUOTE_CHARS}]+$`
+        ).exec(String(token));
+        if (!match) return null;
+        const epithet = match[1];
+        return /[0-9]/.test(epithet) ? epithet : epithet.toLowerCase();
+    }
+
+    function speciesRankMarker(token) {
+        const word = String(token).replace(/[^A-Za-z]/g, '').toLowerCase();
+        return Object.prototype.hasOwnProperty.call(SPECIES_RANK_MARKERS, word)
+            ? SPECIES_RANK_MARKERS[word]
+            : null;
+    }
+
+    /**
+     * Alan 8/26/26 - Pull just the taxon name out of one tip label, or null when the label
+     * carries none. Never returns an accession, an iNat number, a voucher or a locality.
+     */
+    function extractSpeciesName(label) {
+        const tokens = speciesTokens(label);
+        for (let i = 0; i < tokens.length - 1; i++) {
+            const genus = speciesGenusCandidate(tokens[i]);
+            if (!genus) continue;
+            // A duplicate suffix can sit between the two halves: "Stropharia_2 pseudocyanea".
+            let j = i + 1;
+            while (j < tokens.length && /^\d+$/.test(tokens[j])) j++;
+            if (j >= tokens.length) break;
+
+            const marker = speciesRankMarker(tokens[j]);
+            if (marker) {
+                const next = j + 1 < tokens.length ? tokens[j + 1] : '';
+                const provisional = speciesQuotedEpithet(next);
+                if (provisional) return `${genus} '${provisional}'`;
+                if (marker === 'sp.') return `${genus} sp.`;
+                const qualified = speciesEpithetCandidate(next);
+                if (qualified) return `${genus} ${marker} ${qualified}`;
+                continue;
+            }
+            const provisional = speciesQuotedEpithet(tokens[j]);
+            if (provisional) return `${genus} '${provisional}'`;
+            const epithet = speciesEpithetCandidate(tokens[j]);
+            if (epithet) return `${genus} ${epithet}`;
+        }
+        return null;
+    }
+
+    // An accession or iNat id, i.e. the token a bare genus name follows in these headers.
+    function isSpeciesIdentifierToken(token) {
+        return /[0-9]/.test(String(token));
+    }
+
+    /**
+     * Alan 8/26/26 - Fallback for labels identified only to genus ("KT334709 uncultured Russula
+     * Poland", "iNat174588914 Russula Ravenna Ohio US RiC 30"). Only the taxon SLOT is read --
+     * the start of the label, or just past the record id and at most one qualifier word -- and
+     * anything further right is ignored, because a bare capitalised word later in the header is
+     * far more often a locality ("uncultured fungus Yunnan CN"). The occasional label whose
+     * taxon slot really does hold a place name is absorbed by the majority vote over the clade.
+     */
+    function extractGenusName(label) {
+        const tokens = speciesTokens(label);
+        let slot = 0;
+        if (tokens.length > 1 && isSpeciesIdentifierToken(tokens[0])) slot += 1;
+        const qualifier = tokens[slot] ? tokens[slot].replace(/[^A-Za-z]/g, '').toLowerCase() : '';
+        if (qualifier && NON_GENUS_WORDS.has(qualifier)) slot += 1;
+        return slot < tokens.length ? speciesGenusCandidate(tokens[slot]) : null;
+    }
+
+    /**
+     * Alan 8/26/26 - The default label for a NEW annotation: the species name held by the most
+     * tips in the clade. Ties go to a determinate binomial over "Genus sp." or a provisional
+     * name, then to whichever appeared first, so a mixed clade never suggests the vaguer name.
+     * A clade whose tips carry no species name at all falls back to the dominant genus, and
+     * failing that the field is left empty exactly as before.
+     */
+    function mostCommonName(labels, extract) {
+        const counts = new Map();
+        labels.forEach((label) => {
+            const name = extract(label);
+            if (!name) return;
+            let entry = counts.get(name);
+            if (!entry) {
+                entry = {
+                    name,
+                    count: 0,
+                    order: counts.size,
+                    determinate: !name.endsWith(' sp.') && !name.includes("'")
+                };
+                counts.set(name, entry);
+            }
+            entry.count += 1;
+        });
+        const best = Array.from(counts.values()).sort((a, b) =>
+            (b.count - a.count)
+            || (Number(b.determinate) - Number(a.determinate))
+            || (a.order - b.order))[0];
+        return best ? best.name : '';
+    }
+
+    function suggestedAnnotationLabel(memberIds) {
+        if (!Array.isArray(memberIds) || !memberIds.length) return '';
+        const labels = viewer?.getDisplayLabelsForLeafIds
+            ? viewer.getDisplayLabelsForLeafIds(memberIds)
+            : [];
+        if (!labels.length) return '';
+        return mostCommonName(labels, extractSpeciesName)
+            || mostCommonName(labels, extractGenusName);
+    }
+
     /**
      * Alan 8/15/26 - Open the Add/Edit dialog.
      * `memberIds` are canonical leaf IDs already resolved from the tree; the editor never
@@ -1415,7 +1577,10 @@ document.addEventListener('DOMContentLoaded', async () => {
         getEl('annotation-editor-subtitle').textContent =
             // Alan 8/17/26 - Use branch-relative descendant wording for the membership count.
             `${count} descendant tip${count === 1 ? '' : 's'} on this branch.`;
-        getEl('input-annotation-label').value = existing ? existing.label : '';
+        // Alan 8/26/26 - A new annotation opens pre-filled with the clade's dominant species
+        // name; it is selected below so typing replaces it outright.
+        const suggestedLabel = existing ? '' : suggestedAnnotationLabel(annotationEditorState.memberIds);
+        getEl('input-annotation-label').value = existing ? existing.label : suggestedLabel;
         // Alan 8/17/26 - Map short-lived aliases and disable branch-only root choices.
         const savedType = existing ? canonicalAnnotationType(existing.annotation_type) : null;
         const typeSelect = getEl('select-annotation-type');
@@ -1435,7 +1600,9 @@ document.addEventListener('DOMContentLoaded', async () => {
         renderAnnotationLivePreview();
         setAnnotationEditorError('');
         modal.classList.remove('hidden');
-        getEl('input-annotation-label')?.focus();
+        const labelInput = getEl('input-annotation-label');
+        labelInput?.focus();
+        if (labelInput && suggestedLabel) labelInput.select();
     }
 
     async function submitAnnotationEditor() {

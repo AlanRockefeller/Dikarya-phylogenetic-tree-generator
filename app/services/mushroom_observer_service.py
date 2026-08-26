@@ -249,14 +249,69 @@ def _location_name(observation: Dict[str, Any]) -> str:
     return _clean_text((observation.get("location") or {}).get("name"), 300)
 
 
+# Country spellings collapsed so a tip label stays short and matches the ones
+# the iNaturalist importer writes.
+_US_COUNTRY_NAMES = {
+    "united states", "united states of america", "usa", "u.s.a.", "u.s.",
+}
+# "near 8537 Nussbaumen" -> "Nussbaumen": Mushroom Observer localities often
+# carry an approximation marker and a postal code that mean nothing on a tree.
+_LOCALITY_NOISE_RE = re.compile(r"^(?:near|nr\.?)\s+|^[0-9][0-9A-Za-z-]*\s+",
+                                re.IGNORECASE)
+
+
+def _normalize_country(piece: str) -> str:
+    cleaned = _clean_text(piece, 60)
+    if cleaned.casefold() in _US_COUNTRY_NAMES:
+        return "US"
+    return cleaned
+
+
+def _clean_locality(piece: str) -> str:
+    cleaned = _clean_text(piece, 120)
+    previous = None
+    while cleaned != previous:
+        previous = cleaned
+        cleaned = _LOCALITY_NOISE_RE.sub("", cleaned).strip()
+    return cleaned or _clean_text(piece, 120)
+
+
 def _compact_location(observation: Dict[str, Any]) -> str:
+    """Compact a Mushroom Observer location into a tip label.
+
+    MO writes locations in postal order, most specific first:
+    "Mount Leconte, Great Smoky Mountains National Park, Sevier Co., Tennessee,
+    USA". Taking the last two components kept the country and threw the county
+    away, so every US observation collapsed to "<State> USA" -- MO hands us the
+    county and we were discarding it. Split the country off first, then take
+    two components from what is left:
+
+        Sevier Co., Tennessee, USA        -> Sevier Co. Tennessee US
+        Aullwood ..., Englewood, Ohio, US -> Englewood Ohio US
+        near 8537 Nussbaumen, Switzerland -> Nussbaumen Switzerland
+    """
     raw = _location_name(observation)
     if not raw:
         return ""
     parts = [part.strip() for part in raw.split(",") if part.strip()]
-    if len(parts) >= 2:
-        return _clean_text(" ".join(parts[-2:]), 120)
-    return _clean_text(parts[0], 120)
+    if not parts:
+        return ""
+
+    country = _normalize_country(parts[-1])
+    # A lone component is a country only when it reads like one; otherwise it
+    # is the locality and there is no country to split off.
+    if len(parts) == 1 and country == parts[0]:
+        country = ""
+    rest = parts[:-1] if country else parts
+    if not rest:
+        return _clean_text(country, 120)
+
+    tail = rest[-2:]
+    # The last remaining component is the state/region; the one before it is
+    # the county or town, and only that one carries the observer's noise.
+    tail[0] = _clean_locality(tail[0])
+    tail = [part for part in tail if part]
+    return _clean_text(" ".join(tail + ([country] if country else [])), 120)
 
 
 def _sequence_candidate(record: Dict[str, Any], observation_id: int) -> Optional[Dict[str, Any]]:
@@ -385,9 +440,11 @@ def build_queue_sequence(raw_input: str, sequence_id: Any) -> Dict[str, Any]:
     analysis, candidate = _selected_candidate(raw_input, sequence_id)
     observation = analysis["observation"]
     location = _compact_location({"location": {"name": observation.get("location")}})
+    # The observation number alone. The species and then the location are
+    # appended when the FASTA header is built, so a tip reads
+    # "MO490001 Gymnopilus Alachua Co. Florida US" rather than burying the
+    # species behind the place.
     name = f"MO{observation['id']}"
-    if location:
-        name = f"{name} {location}"
     return {
         "name": name,
         "organism": observation.get("consensus_name") or "",

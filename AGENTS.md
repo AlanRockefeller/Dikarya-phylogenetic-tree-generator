@@ -121,20 +121,43 @@ and the aligned/trimmed FASTAs. Deliberately left plain: `input_raw.fasta`,
 normal user action (add sequences, every viewer edit, recompute).
 
 `scripts/dikarya_reclaim_job_space.py` applies all of this retroactively and
-runs weekly from `ops/cron/dikarya-reclaim-job-space`. It **must run as the
-`dikarya` user** — `var/jobs` is dikarya-owned and the `tree` user cannot write
-there, so agents cannot run it and must ask the human:
+runs weekly from `ops/cron/dikarya-reclaim-job-space`:
 
 ```bash
-sudo -u dikarya /var/www/dikarya/.venv/bin/python \
-  scripts/dikarya_reclaim_job_space.py --dry-run     # always dry-run first
-sudo -u dikarya /var/www/dikarya/.venv/bin/python \
-  scripts/dikarya_reclaim_job_space.py --apply
+.venv/bin/python scripts/dikarya_reclaim_job_space.py --dry-run   # always first
+.venv/bin/python scripts/dikarya_reclaim_job_space.py --apply
 ```
 
 Jobs touched within `--min-age-hours` (default 24) are skipped, so a live run is
 never disturbed. The passes (`scratch`, `logs`, `json`, `reports`, `alignments`)
 are independent and individually selectable with `--passes`.
+
+### Writing to var/jobs
+
+`var/jobs` is `dikarya`-owned but **group-writable**, and the `tree` account is
+in the `dikarya` group, so agents can run maintenance scripts against it
+directly. Two things make that hold:
+
+- Directories carry setgid (`chmod g+ws`), so a new job directory inherits group
+  `dikarya` rather than the creating process's primary group.
+- `dikarya-web`, `dikarya-worker` and `dikarya-metrics` run with `UMask=0002`
+  via `/etc/systemd/system/<unit>.service.d/umask.conf` (source:
+  `scripts/dikarya-umask.conf`), so the files they create are 0664 / 2775
+  instead of 0644 / 0755. Without it a chmod pass would be undone by the next
+  thing the pipeline wrote.
+
+**A session that predates the group grant will still be denied.** Supplementary
+groups are stamped at login, so an agent started from an older shell inherits
+the old set — restarting the CLI inside that shell changes nothing, it takes a
+fresh login. Check with `id` before concluding the permissions are wrong.
+
+Code that writes a job artifact atomically (mkstemp → `os.replace`) must set the
+mode explicitly, because mkstemp creates 0600. Preserve the target's existing
+mode when it has one and fall back to `default_file_mode()` from
+`app/services/artifact_storage.py` when it does not — never a hardcoded 0644.
+`tree_state.json` is the cautionary tale: its creation path hardcoded 0644 and
+every later save *preserved* that, so the one file every viewer edit rewrites
+stayed group-unwritable in a job directory where everything else was 0664.
 
 ## Restarting Dikarya services
 

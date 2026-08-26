@@ -14,6 +14,7 @@ from typing import Dict, Any, List, Optional, Set, Tuple
 from app.config import Config
 from app.models import JobParams, AlignmentParams, TrimmingParams, TreeBuilderParams
 from app.services.artifact_storage import (
+    default_file_mode,
     discard_artifact,
     discard_gzipped_form,
     gz_path,
@@ -262,11 +263,14 @@ def save_tree_state(job_dir: Path, tree_json: Dict) -> None:
                 os.fsync(f.fileno())
             # mkstemp() creates 0600; the previous truncate-in-place kept whatever
             # mode the file already had (0644 in production). Preserve it so the
-            # rename does not silently tighten permissions on every job.
+            # rename does not silently tighten permissions on every job. On a
+            # job whose state does not exist yet, fall back to what a plain
+            # create would give under this process's umask -- NOT a hardcoded
+            # 0644, which this file then preserved forever.
             try:
                 os.chmod(temp_name, state_path.stat().st_mode & 0o7777)
             except OSError:
-                os.chmod(temp_name, 0o644)
+                os.chmod(temp_name, default_file_mode())
             os.replace(temp_name, state_path)
         except BaseException:
             try:

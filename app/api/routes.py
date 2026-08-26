@@ -217,6 +217,12 @@ RECOMPUTE_BOOLEAN_FIELDS = frozenset({
 # what the job actually ran. Same list, minus free-text notes.
 RECOMPUTE_READABLE_FIELDS = RECOMPUTE_OVERRIDABLE_FIELDS - {"notes"}
 
+# Wall clock the blank-location fill may spend on iNaturalist inside a request.
+# The lookup is a nicety on top of an import that has already done its upstream
+# work, so it gets a small slice of its own rather than a share of the FASTA
+# budget: worst case it resolves what it can and leaves the rest blank.
+MYCOMAP_PLACE_FILL_BUDGET_SECONDS = 12
+
 US_STATE_TO_ABBR = {
     "alabama": "al", "alaska": "ak", "arizona": "az", "arkansas": "ar",
     "california": "ca", "colorado": "co", "connecticut": "ct", "delaware": "de",
@@ -1634,6 +1640,32 @@ def gather_mycomap_sequences_for_queue(url, include_ncbi=True, include_local=Tru
         sequences,
         filtered_records,
     )
+    # MycoMap supplies a location for most hits and that one is authoritative --
+    # it is what "Refresh MycoMap records" syncs to. Only the blanks are filled,
+    # from iNaturalist's standardized places, and only for hits whose label
+    # carries an observation number. Deliberately after the dedup passes: those
+    # key on the location, and giving records a location they did not have when
+    # the rule was written would silently change what collapses.
+    try:
+        from app.services.inaturalist_places import fill_missing_inat_locations
+        place_deadline = (None if fetch_time_budget is None
+                          else time.monotonic() + MYCOMAP_PLACE_FILL_BUDGET_SECONDS)
+        # A blank `location` field does not mean the label lacks a place: a
+        # MycoMap header can read "... Amanita example California US" with
+        # nothing in the metric. Appending a second place to those is exactly
+        # the doubled-up location this is meant to avoid.
+        fillable = [
+            seq for seq in sequences
+            if not str(seq.get('location') or '').strip()
+            and not _location_from_sequence_label(seq.get('name'))
+        ]
+        filled_locations = fill_missing_inat_locations(fillable, deadline=place_deadline)
+        if filled_locations:
+            logger.info("Filled %d MycoMap hit location(s) from iNaturalist places",
+                        filled_locations)
+    except Exception:
+        # A location is a nicety; never fail an import over one.
+        logger.warning("iNaturalist place fill failed for MycoMap hits", exc_info=True)
     sequences = uniquify_mycomap_sequence_names(sequences)
     for seq in sequences:
         seq.pop('_mycomap_original_name', None)

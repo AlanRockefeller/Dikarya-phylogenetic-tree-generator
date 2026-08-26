@@ -1275,51 +1275,14 @@ def _build_inat_job_title(observation_id: int, genus: Optional[str] = None) -> s
     return f"iNat # {int(observation_id)} - {genus_label} → Phylogenetic Tree"
 
 
-def _normalize_location_piece(piece: str) -> str:
-    """Collapse common country variants so labels stay short."""
-    cleaned = _clean_display_text(piece)
-    if not cleaned:
-        return ""
-    lowered = cleaned.casefold()
-    if lowered in {
-        "united states",
-        "united states of america",
-        "usa",
-        "u.s.a.",
-        "u.s.",
-    }:
-        return "US"
-    return cleaned
-
-
 def _extract_inat_location_label(observation: Dict[str, Any]) -> str:
-    """Return a compact place label like `New Mexico US`."""
-    for key in (
-        "private_place_guess",
-        "place_guess",
-        "private_locality",
-        "locality",
-    ):
-        raw = observation.get(key)
-        if not raw:
-            continue
-        parts = [
-            _normalize_location_piece(part)
-            for part in str(raw).split(",")
-        ]
-        parts = [part for part in parts if part]
-        if not parts:
-            continue
-        # Prefer the human-readable region name when iNat returns nested
-        # place text like "New Mexico, NM, United States". In that case the
-        # middle component is just an abbreviation and the first + last
-        # components are the label people expect to see.
-        if len(parts) >= 3 and len(parts[-2]) <= 3:
-            return f"{parts[0]} {parts[-1]}".strip()
-        if len(parts) >= 2:
-            return " ".join(parts[-2:])
-        return parts[0]
-    return ""
+    """Return a compact place label like `Pike Co. MS US`.
+
+    Uses iNaturalist's standardized places (derived from the coordinates) and
+    falls back to parsing the observer's free-text place_guess.
+    """
+    from app.services.inaturalist_places import location_label_for_observation
+    return location_label_for_observation(observation)
 
 
 def _build_inat_source_display_name(observation: Dict[str, Any], observation_id: int) -> str:

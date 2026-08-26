@@ -370,6 +370,13 @@
         margin-left: 8px;
     }
 
+    .queue-location {
+        color: var(--text-dim);
+        font-family: var(--sans);
+        font-size: 11px;
+        margin-left: 8px;
+    }
+
     .queue-length {
         color: var(--gold-soft);
         font-family: var(--mono);
@@ -1702,6 +1709,12 @@
             listEl.innerHTML = sequenceQueue.map((seq, idx) => {
                 const name = seq.name || '';
                 const organism = seq.organism || '';
+                // iNaturalist records keep the place in seq.location instead of
+                // the name, so show it here rather than only in the FASTA header.
+                const locationText = String(seq.location || '').trim();
+                const location = locationText
+                    && !`${name} ${organism}`.toLocaleLowerCase().includes(locationText.toLocaleLowerCase())
+                    ? locationText : '';
                 const length = String(seq.sequence || '').length;
                 const isOutgroup = selectedOutgroup && selectedOutgroup === name;
                 return `
@@ -1713,6 +1726,7 @@
                         <div class="queue-name">
                             <span class="queue-accession" title="${escapeHtml(name)}">${escapeHtml(name)}</span>
                             ${organism ? `<span class="queue-species">${escapeHtml(organism)}</span>` : ''}
+                            ${location ? `<span class="queue-location">${escapeHtml(location)}</span>` : ''}
                         </div>
                         <span class="queue-length">${length}<span>bp</span></span>
                         <button onclick="removeSequence(${idx})" class="queue-remove" title="Remove">×</button>
@@ -4579,6 +4593,12 @@
         }
     });
 
+    // Importers whose queue records carry the location in seq.location rather
+    // than inside seq.name, so the FASTA header can read
+    // "<id> <species> <location>" instead of burying the species.
+    const LOCATION_AFTER_ORGANISM_HIT_SOURCES = new Set(['inat_observation', 'mo_observation']);
+    const LOCATION_AFTER_ORGANISM_SOURCES = new Set(['inaturalist', 'mushroom_observer']);
+
     // Helper to build FASTA
     function buildFastaHeaderFromQueueItem(seq) {
         // Alan 7/17/26 - Keep NCBI BLAST organism names from being appended when the full queue label already contains them.
@@ -4601,6 +4621,17 @@
         if (normalizedOrganism && !header.toLocaleLowerCase().includes(normalizedOrganism)) {
             // Alan 7/17/26 - Preserve organism labels for accession-only and manually named queue entries.
             header = `${header} ${organism}`;
+        }
+        // Observation importers keep their location out of seq.name so the
+        // species reads right after the observation number; it goes on the end
+        // here. Scoped to those importers because MycoMap and NCBI records
+        // already carry their location inside the header text.
+        const isObservationImport = LOCATION_AFTER_ORGANISM_HIT_SOURCES.has(String(seq.hit_source || ''))
+            || LOCATION_AFTER_ORGANISM_SOURCES.has(String(seq.source || ''));
+        const location = String(seq.location || '').trim().replace(/\s+/g, ' ');
+        if (isObservationImport && location
+            && !header.toLocaleLowerCase().includes(location.toLocaleLowerCase())) {
+            header = `${header} ${location}`;
         }
         return header;
     }

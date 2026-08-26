@@ -152,6 +152,15 @@
     // verbatim in both themes.
     const AUTO_HIGHLIGHT_OPACITY = { light: 0.2, dark: 0.26 };
 
+    // Alan 8/26/26 - Minimum HSL lightness a colour-group / marker colour is DRAWN at in dark
+    // mode. The categorical group colours are picked to read against white and were then used
+    // verbatim in both themes, but the dark tree panel is #2d4a3e: the Blue group (#2563eb)
+    // sat at 1.88:1 against bare canvas, and 1.06:1 where it crossed a light user-picked clade
+    // highlight -- text that is effectively not on the page. 0.76 roughly doubles that worst
+    // case while leaving the closest pair of group colours about 7 CIE76 units apart, so the
+    // groups stay tellable apart. See _displayColorForTheme().
+    const DARK_LABEL_MIN_LIGHTNESS = 0.76;
+
     // Alan 8/24/26 - Published on the shared config so the editor and the regression harness
     // resolve styles through the same list the renderer uses, instead of their own copies.
     window.DikaryaCladeAnnotations.STYLE_FIELDS = ANNOTATION_STYLE_FIELDS;
@@ -2167,13 +2176,20 @@
             // automatic clade-highlight colour, so a highlight and the labels it sits behind
             // can never disagree about which group a tip belongs to.
             const matchingSetName = this._persistentGroupNameForTip(id);
+            // Alan 8/26/26 - Every colour leaving here is a DRAWN colour, so each one goes
+            // through the dark-mode lift. This is the one place both the node marks and the
+            // label text resolve through, so they cannot disagree about the adjustment.
             // Alan 5/12/26 - Return selection-set color when membership is visible.
-            if (matchingSetName) return this.getSelectionSetColor(matchingSetName);
+            if (matchingSetName) {
+                return this._displayColorForTheme(this.getSelectionSetColor(matchingSetName));
+            }
             // Alan 5/12/26 - Search matches remain blue when no selection set controls the color.
-            if (node?.__search_match) return "#0EA5E9";
+            if (node?.__search_match) return this._displayColorForTheme("#0EA5E9");
             // Alan 6/2/26 - Focal/sequence-of-interest tip highlights blue directly from state,
             // so a user-set SOI shows without mutating the user's Default color group.
-            if (this.focalTipName && id === this.focalTipName) return "#1f77b4";
+            if (this.focalTipName && id === this.focalTipName) {
+                return this._displayColorForTheme("#1f77b4");
+            }
             // Alan 5/12/26 - Ordinary labels should use CSS light/dark colors.
             return null;
         }
@@ -4026,6 +4042,27 @@
             return ids;
         }
 
+        /**
+         * Alan 8/26/26 - Resolve canonical leaf IDs to the labels currently ON SCREEN.
+         * The annotation editor uses these to suggest a default label, and a tip the user has
+         * renamed should contribute the name they gave it, not the original FASTA header.
+         * IDs with no matching tip (a pruned member of a stale annotation) are skipped.
+         */
+        getDisplayLabelsForLeafIds(ids) {
+            const wanted = new Set(Array.isArray(ids) ? ids.filter(Boolean) : []);
+            if (!wanted.size || !Array.isArray(this.allNodes)) return [];
+            const labels = [];
+            this.allNodes.forEach((node) => {
+                const children = node.children || node.data?.children || [];
+                if (children && children.length) return;
+                const id = this._getNodeId(node);
+                if (!id || !wanted.has(id)) return;
+                const label = node.data?.name || node.name || id;
+                if (label) labels.push(String(label));
+            });
+            return labels;
+        }
+
         // Alan 8/17/26 - Compare annotations by canonical descendant membership rather than
         // display order, so rotation and renaming cannot turn Edit into an accidental Add.
         _annotationMembershipKey(ids) {
@@ -4322,6 +4359,30 @@
             const hsl = this._hexToHsl(hex);
             if (!hsl) return null;
             return this._hslToHex(hsl.h, Math.min(hsl.s, 0.5), 0.45);
+        }
+
+        /**
+         * Alan 8/26/26 - The colour a group mark or tip label is actually PAINTED with.
+         *
+         * Hue and saturation are kept, so a tip still reads as "the blue group"; only lightness
+         * is floored, and only in dark mode. Light mode is untouched.
+         *
+         * Deliberately NOT folded into getSelectionSetColor(): that value is the user's stored
+         * choice and has to keep flowing unchanged to the swatches, the group editor and
+         * _persistentGroupColorForTips(), which derives clade-highlight fills from it. Lifting
+         * it there would make saved state and highlight fills drift with the theme.
+         *
+         * Resolved here and written inline by the caller, never as a CSS override, for the same
+         * reason the highlight styles are: the export path clones the live SVG without the
+         * page stylesheet, so a themed CSS rule would make the exported figure differ from the
+         * one on screen.
+         */
+        _displayColorForTheme(hex) {
+            if (!hex || !this._isDarkTheme()) return hex;
+            const hsl = this._hexToHsl(hex);
+            if (!hsl) return hex;
+            if (hsl.l >= DARK_LABEL_MIN_LIGHTNESS) return hex;
+            return this._hslToHex(hsl.h, hsl.s, DARK_LABEL_MIN_LIGHTNESS);
         }
 
         /**
@@ -4682,12 +4743,21 @@
         // Alan 8/24/26 - Automatic highlight opacity depends on the theme, and the theme can be
         // toggled while a tree is on screen, so repaint when the class changes. One observer per
         // viewer; harmless where there is no DOM to observe.
+        // Alan 8/26/26 - Group mark/label colours are theme-dependent too now
+        // (_displayColorForTheme), and they are written inline, so a toggle has to restyle the
+        // nodes as well or the labels keep the previous theme's colours until an unrelated
+        // redraw. Guarded on this.tree the same way the other out-of-band callers are.
         _watchThemeChanges() {
             if (this._themeObserver || typeof MutationObserver !== 'function') return;
             try {
                 const root = document.documentElement;
                 if (!root) return;
-                this._themeObserver = new MutationObserver(() => this._scheduleAnnotationRedraw());
+                this._themeObserver = new MutationObserver(() => {
+                    if (this.tree && typeof this._updateNodeStylesOnly === 'function') {
+                        this._updateNodeStylesOnly();
+                    }
+                    this._scheduleAnnotationRedraw();
+                });
                 this._themeObserver.observe(root, {
                     attributes: true, attributeFilter: ['class']
                 });
