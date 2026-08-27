@@ -17,12 +17,15 @@ the DOM is a stub, so a wrong SVG transform passes. That is what
 ``scripts/dikarya_viewer_smoke.py`` checks against the live site.
 """
 
+import contextlib
+import io
 import json
 import shutil
 import subprocess
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 from urllib.parse import urljoin
 
@@ -256,6 +259,103 @@ class ServedAssetIntegrityTests(unittest.TestCase):
 
             self.assertTrue(matched)
             self.assertEqual((Path(mirror_tmp) / rel).read_bytes(), body)
+
+
+class HarnessFailureReportingTests(unittest.TestCase):
+    """A broken harness run is a FAIL, not a traceback out of the script.
+
+    `subprocess.run(..., timeout=180)` raises `TimeoutExpired` and
+    `json.loads()` raises `JSONDecodeError`; both escaped `main()`, so a cron
+    invocation got a stack trace instead of a verdict and `--json` printed
+    nothing a caller could parse.
+    """
+
+    def _run(self, side_effect):
+        results = []
+        with patch.object(live_smoke.subprocess, "run", side_effect=side_effect):
+            live_smoke.run_served_harness(results, "/usr/bin/node", Path("/nonexistent"))
+        return {r["name"]: r for r in results}
+
+    def test_a_timed_out_harness_is_reported_as_a_failed_check(self):
+        results = self._run(subprocess.TimeoutExpired(
+            cmd=["node"], timeout=live_smoke.HARNESS_TIMEOUT, output=b"partial"))
+
+        self.assertIn("served-bundle-boots", results)
+        self.assertFalse(results["served-bundle-boots"]["ok"])
+        detail = results["served-bundle-boots"]["detail"]
+        self.assertIn(str(live_smoke.HARNESS_TIMEOUT), detail)
+        self.assertIn("timeout", detail)
+
+    def test_malformed_harness_output_is_reported_as_a_failed_check(self):
+        results = self._run(lambda *a, **kw: subprocess.CompletedProcess(
+            a[0], 0, stdout="not json at all", stderr=""))
+
+        self.assertIn("served-bundle-boots", results)
+        self.assertFalse(results["served-bundle-boots"]["ok"])
+        detail = results["served-bundle-boots"]["detail"]
+        self.assertIn("malformed JSON", detail)
+        self.assertIn("not json at all", detail)
+
+    def test_a_nonzero_exit_is_still_reported_the_way_it_was(self):
+        results = self._run(lambda *a, **kw: subprocess.CompletedProcess(
+            a[0], 1, stdout="", stderr="ReferenceError"))
+
+        self.assertFalse(results["served-bundle-boots"]["ok"])
+        self.assertIn("could not run", results["served-bundle-boots"]["detail"])
+
+    def test_a_good_run_still_records_each_harness_check(self):
+        rows = [{"name": "boots", "ok": True, "detail": ""},
+                {"name": "wires", "ok": False, "detail": "no handler"}]
+        results = self._run(lambda *a, **kw: subprocess.CompletedProcess(
+            a[0], 0, stdout=json.dumps(rows), stderr=""))
+
+        self.assertTrue(results["served/boots"]["ok"])
+        self.assertFalse(results["served/wires"]["ok"])
+
+    def test_json_mode_still_emits_parseable_json_after_a_harness_failure(self):
+        """The whole point: --json has to answer even when the harness died."""
+        for side_effect in (
+            subprocess.TimeoutExpired(cmd=["node"], timeout=live_smoke.HARNESS_TIMEOUT),
+            lambda *a, **kw: subprocess.CompletedProcess(a[0], 0, stdout="{", stderr=""),
+        ):
+            with self.subTest(side_effect=type(side_effect).__name__):
+                results = []
+                with patch.object(
+                    live_smoke.subprocess, "run", side_effect=side_effect
+                ):
+                    live_smoke.run_served_harness(
+                        results, "/usr/bin/node", Path("/nonexistent"))
+
+                buf = io.StringIO()
+                with contextlib.redirect_stdout(buf):
+                    code = live_smoke.report(
+                        results, SimpleNamespace(json=True, quiet=True))
+
+                self.assertEqual(code, 1)
+                parsed = json.loads(buf.getvalue())
+                self.assertEqual(parsed[0]["name"], "served-bundle-boots")
+                self.assertFalse(parsed[0]["ok"])
+
+    def test_text_mode_prints_a_useful_failure_message(self):
+        results = []
+        with patch.object(live_smoke.subprocess, "run", side_effect=(
+                subprocess.TimeoutExpired(cmd=["node"],
+                                          timeout=live_smoke.HARNESS_TIMEOUT))):
+            live_smoke.run_served_harness(results, "/usr/bin/node", Path("/nonexistent"))
+
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            code = live_smoke.report(results, SimpleNamespace(json=False, quiet=True))
+
+        self.assertEqual(code, 1)
+        self.assertIn("served-bundle-boots", err.getvalue())
+        self.assertIn(str(live_smoke.HARNESS_TIMEOUT), err.getvalue())
+
+    def test_the_runner_does_not_catch_unrelated_exceptions(self):
+        """A bug in this script must still surface, not become a viewer FAIL."""
+        with self.assertRaises(MemoryError):
+            self._run(MemoryError("not a harness failure"))
+
 
 
 if __name__ == "__main__":

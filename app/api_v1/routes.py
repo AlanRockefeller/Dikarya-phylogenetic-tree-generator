@@ -5,6 +5,7 @@ Phase 2 endpoints: /jobs (+ mutation), /jobs/{id}/files, /jobs/{id}/logs, /tools
 """
 import json
 import math
+import numbers
 import re
 import logging
 import uuid
@@ -219,28 +220,73 @@ def _validate_categorical(field, value, allowed):
     return value, None
 
 
-def _validate_clamped_int(field, value, *, default):
-    """Validate-and-clamp; reject non-numeric values with a clear 422.
+def _json_integer(value):
+    """Return `value` as an exact int, or None if it is not a JSON integer.
 
-    If the value is missing (None) we substitute the default. If present
-    but not coercible to int, we 422 instead of silently substituting --
-    silent substitution hides typos like `"bootstrap": "many"`.
+    The OpenAPI schema documents these fields as `type: integer`, so the
+    runtime has to mean it. `int()` did not: it truncated 1000.5 to 1000,
+    parsed the string "1000", and turned True into 1 -- three values the
+    schema calls invalid, silently accepted as three different numbers.
+
+    JSON has a single number type and many clients spell an integer 1000.0,
+    so an integer-valued float is accepted; a fractional or non-finite one is
+    not. Booleans are rejected before the Integral check, because bool is a
+    subclass of int and `True` has never meant "one replicate".
+    """
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, numbers.Integral):
+        return int(value)
+    if isinstance(value, numbers.Real):
+        numeric_value = float(value)
+        if math.isfinite(numeric_value) and numeric_value.is_integer():
+            return int(numeric_value)
+    return None
+
+
+def _not_an_integer_error(field, value):
+    """The shared 422 for a value the `type: integer` contract excludes."""
+    lo, hi = LIMITS[field]
+    return error_response(
+        code="validation_failed",
+        message=(
+            f"`{field}` must be an integer between {lo:,} and {hi:,}. "
+            f"Received {value!r} ({type(value).__name__})."
+        ),
+        status=422,
+        details={"field": field, "value": value, "min": lo, "max": hi},
+    )
+
+
+def _reject_non_integer(field, value):
+    """Pre-check for a field whose raw value meets a domain validator first.
+
+    `bootstrap` is normalized by `validate_iqtree_ufboot_count` before
+    `_validate_clamped_int` ever sees it, and that normalizer deliberately
+    accepts the string forms stored by old jobs. Screening the caller's raw
+    value here keeps the public API strict without loosening -- or tightening
+    -- what an inherited value is allowed to be. Returns an error response or
+    None.
+    """
+    if value is None or _json_integer(value) is not None:
+        return None
+    return _not_an_integer_error(field, value)
+
+
+def _validate_clamped_int(field, value, *, default):
+    """Validate-and-clamp; reject non-integer values with a clear 422.
+
+    If the value is missing (None) we substitute the default. If present but
+    not an integer, we 422 instead of silently coercing -- silent coercion
+    hides typos like `"bootstrap": "many"`, and silent truncation would build
+    a tree with a replicate count the caller never asked for.
     """
     lo, hi = LIMITS[field]
     if value is None:
         return default, None
-    try:
-        n = int(value)
-    except (TypeError, ValueError):
-        return None, error_response(
-            code="validation_failed",
-            message=(
-                f"`{field}` must be an integer between {lo:,} and {hi:,}. "
-                f"Received {value!r} ({type(value).__name__})."
-            ),
-            status=422,
-            details={"field": field, "value": value, "min": lo, "max": hi},
-        )
+    n = _json_integer(value)
+    if n is None:
+        return None, _not_an_integer_error(field, value)
     if n < lo or n > hi:
         return None, error_response(
             code="validation_failed",
@@ -411,6 +457,10 @@ def create_job():
     if err: return err
 
     # Clamped integers.
+    # `validate_iqtree_ufboot_count` normalizes the string forms old stored
+    # jobs carry, so screen what the caller actually sent before it gets there.
+    err = _reject_non_integer("bootstrap", data.get("bootstrap"))
+    if err: return err
     try:
         requested_bootstrap = data.get("bootstrap")
         if requested_bootstrap is None:
@@ -1022,7 +1072,11 @@ def recompute_job(job_id):
         if "bootstrap" in body:
             # The effective tree method is resolved after all overrides merge;
             # preserve the raw value until the IQ-TREE-specific validator sees
-            # it so a fractional count cannot be truncated by int().
+            # it so a fractional count cannot be truncated by int(). That
+            # validator accepts the representations old jobs stored, so the
+            # caller's own value is type-checked here instead.
+            err = _reject_non_integer("bootstrap", body["bootstrap"])
+            if err: return err
             overrides["bootstrap"] = body["bootstrap"]
         if "mcmc_burnin_fraction" in body:
             v, err = _validate_fraction(

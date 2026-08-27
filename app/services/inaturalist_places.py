@@ -141,8 +141,55 @@ def _cache_store(records: Dict[int, Optional[Dict[str, Any]]]) -> None:
         _PLACE_CACHE.update(records)
 
 
-def _fetch_place_batch(place_ids: Sequence[int]) -> Dict[int, Dict[str, Any]]:
-    """Resolve one batch of place ids. Returns {} on any upstream problem."""
+def _remaining(deadline: Optional[float]) -> Optional[float]:
+    """Seconds of budget left, or None when the caller set no deadline."""
+    if deadline is None:
+        return None
+    return deadline - time.monotonic()
+
+
+def _request_timeout(deadline: Optional[float],
+                     ceiling: float = PLACE_REQUEST_TIMEOUT) -> Optional[float]:
+    """Socket timeout for the next call, or None if the budget is spent.
+
+    Checking the deadline only at loop boundaries was not a ceiling: a caller
+    with 200ms left still started a request that could block for the full
+    PLACE_REQUEST_TIMEOUT, so a "resolve places within N seconds" budget
+    routinely overran by up to twenty. The remaining budget is the timeout.
+    """
+    remaining = _remaining(deadline)
+    if remaining is None:
+        return ceiling
+    if remaining <= 0:
+        return None
+    return min(ceiling, remaining)
+
+
+def _sleep_within(seconds: float, deadline: Optional[float]) -> bool:
+    """Sleep at most `seconds`, never past the deadline.
+
+    Returns False when there is no time left -- before or after the sleep --
+    which is the caller's signal to stop rather than start more work.
+    """
+    remaining = _remaining(deadline)
+    if remaining is not None:
+        if remaining <= 0:
+            return False
+        seconds = min(seconds, remaining)
+    if seconds > 0:
+        time.sleep(seconds)
+    remaining = _remaining(deadline)
+    return remaining is None or remaining > 0
+
+
+def _fetch_place_batch(place_ids: Sequence[int],
+                       timeout: float = PLACE_REQUEST_TIMEOUT
+                       ) -> Dict[int, Dict[str, Any]]:
+    """Resolve one batch of place ids. Returns {} on any upstream problem.
+
+    `timeout` is capped by the caller against whatever is left of its deadline,
+    so it is a parameter rather than always PLACE_REQUEST_TIMEOUT.
+    """
     url = (f"{PLACES_API_BASE}{','.join(str(i) for i in place_ids)}"
            f"?fields={PLACE_FIELDS}")
     request = urllib.request.Request(url, headers={
@@ -150,7 +197,7 @@ def _fetch_place_batch(place_ids: Sequence[int]) -> Dict[int, Dict[str, Any]]:
         "Accept": "application/json",
     })
     try:
-        with urllib.request.urlopen(request, timeout=PLACE_REQUEST_TIMEOUT) as response:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
             payload = json.loads(response.read().decode("utf-8"))
     except (urllib.error.URLError, urllib.error.HTTPError, OSError,
             json.JSONDecodeError, ValueError) as exc:
@@ -276,15 +323,22 @@ def resolve_place_labels(observations: Sequence[Dict[str, Any]],
     batches = 0
     fetched_all = True
     for start in range(0, len(pending), PLACE_BATCH_SIZE):
-        if batches >= MAX_PLACE_BATCHES or (
-                deadline is not None and time.monotonic() >= deadline):
+        if batches >= MAX_PLACE_BATCHES:
             fetched_all = False
             break
-        if batches:
-            time.sleep(PLACE_BATCH_DELAY)
+        # The courtesy delay comes out of the same budget as the requests, and
+        # the deadline is rechecked after it -- sleeping a second and then
+        # opening a twenty-second request is how the budget used to be blown.
+        if batches and not _sleep_within(PLACE_BATCH_DELAY, deadline):
+            fetched_all = False
+            break
+        timeout = _request_timeout(deadline)
+        if timeout is None:
+            fetched_all = False
+            break
         batch = pending[start:start + PLACE_BATCH_SIZE]
         batches += 1
-        resolved = _fetch_place_batch(batch)
+        resolved = _fetch_place_batch(batch, timeout=timeout)
         if not resolved:
             fetched_all = False
             continue
@@ -337,7 +391,7 @@ def fetch_observation_places(observation_ids: Iterable[int],
     ordered = sorted({int(value) for value in observation_ids})
     observations: List[Dict[str, Any]] = []
     for start in range(0, len(ordered), OBSERVATION_BATCH_SIZE):
-        if deadline is not None and time.monotonic() >= deadline:
+        if _request_timeout(deadline) is None:
             break
         batch = ordered[start:start + OBSERVATION_BATCH_SIZE]
         url = (f"{OBSERVATIONS_API_BASE}?id={','.join(str(i) for i in batch)}"
@@ -348,8 +402,15 @@ def fetch_observation_places(observation_ids: Iterable[int],
         })
         payload = None
         for attempt in range(1, OBSERVATION_FETCH_ATTEMPTS + 1):
+            # Recomputed per attempt: the previous attempt's own timeout and
+            # the backoff before it both spent part of the budget.
+            timeout = _request_timeout(deadline)
+            if timeout is None:
+                logger.warning("iNaturalist observation lookup ran out of time "
+                               "for %d ids after %d attempt(s)", len(batch), attempt - 1)
+                break
             try:
-                with urllib.request.urlopen(request, timeout=PLACE_REQUEST_TIMEOUT) as response:
+                with urllib.request.urlopen(request, timeout=timeout) as response:
                     payload = json.loads(response.read().decode("utf-8"))
                 break
             except Exception as exc:  # includes IncompleteRead, which is not a URLError
@@ -357,11 +418,17 @@ def fetch_observation_places(observation_ids: Iterable[int],
                     logger.warning("iNaturalist observation lookup failed for %d ids: %s",
                                    len(batch), exc)
                     break
-                time.sleep(2 ** attempt)
+                # Exponential backoff reaches eight seconds, which on its own
+                # could outlast the whole budget.
+                if not _sleep_within(2 ** attempt, deadline):
+                    logger.warning("iNaturalist observation lookup abandoned for %d "
+                                   "ids: no time left to retry (%s)", len(batch), exc)
+                    break
         if payload:
             observations.extend(payload.get("results") or [])
-        if start + OBSERVATION_BATCH_SIZE < len(ordered):
-            time.sleep(PLACE_BATCH_DELAY)
+        if (start + OBSERVATION_BATCH_SIZE < len(ordered)
+                and not _sleep_within(PLACE_BATCH_DELAY, deadline)):
+            break
     return observations
 
 

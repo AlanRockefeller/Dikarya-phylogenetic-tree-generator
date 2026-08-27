@@ -1658,6 +1658,37 @@
     }
 
     // =========================================================================
+    // Location de-duplication
+    //
+    // Alan 8/27/26 - Both the queue row and the FASTA header ask "does this text
+    // already say where the specimen came from?", and both used to ask it with a
+    // bare .includes(). A two-letter location is a substring of ordinary words --
+    // "OR" sits inside "Cortinarius", "CA" inside "Cantharellus", "IN" inside
+    // "Inocybe" -- so every Oregon and California record silently lost its
+    // location. The match has to land on a whole field/token, not anywhere.
+    //
+    // One helper backs both call sites so the two cannot drift into disagreeing
+    // about whether a header already carries its location.
+    // =========================================================================
+    function normalizeLocationText(value) {
+        return String(value ?? '').replace(/\s+/g, ' ').trim().toLocaleLowerCase();
+    }
+
+    function headerAlreadyHasLocation(text, location) {
+        const needle = normalizeLocationText(location);
+        if (!needle) return true;   // nothing to add
+        const haystack = normalizeLocationText(text);
+        if (!haystack) return false;
+        // Letters and digits on either side mean the hit is inside a longer word.
+        // Everything else -- space, comma, underscore, pipe, start/end of string --
+        // is a real field separator in these headers.
+        const escaped = needle.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+        return new RegExp(
+            `(?<![\\p{L}\\p{N}])${escaped}(?![\\p{L}\\p{N}])`, 'u'
+        ).test(haystack);
+    }
+
+    // =========================================================================
     // Sequence Queue State
     // =========================================================================
     let sequenceQueue = [];
@@ -1713,7 +1744,7 @@
                 // the name, so show it here rather than only in the FASTA header.
                 const locationText = String(seq.location || '').trim();
                 const location = locationText
-                    && !`${name} ${organism}`.toLocaleLowerCase().includes(locationText.toLocaleLowerCase())
+                    && !headerAlreadyHasLocation(`${name} ${organism}`, locationText)
                     ? locationText : '';
                 const length = String(seq.sequence || '').length;
                 const isOutgroup = selectedOutgroup && selectedOutgroup === name;
@@ -4630,7 +4661,7 @@
             || LOCATION_AFTER_ORGANISM_SOURCES.has(String(seq.source || ''));
         const location = String(seq.location || '').trim().replace(/\s+/g, ' ');
         if (isObservationImport && location
-            && !header.toLocaleLowerCase().includes(location.toLocaleLowerCase())) {
+            && !headerAlreadyHasLocation(header, location)) {
             header = `${header} ${location}`;
         }
         return header;

@@ -51,6 +51,7 @@ def run_node(harness, script, *args, expect_json=True):
             [node, str(JS_DIR / harness), str(path), *args],
             capture_output=True,
             text=True,
+            timeout=120,
         )
     if proc.returncode != 0:
         raise AssertionError(
@@ -390,7 +391,8 @@ class AuthorFeePolicyTests(unittest.TestCase):
 class WhitespaceHygieneTests(unittest.TestCase):
     def test_git_diff_check_is_clean(self):
         proc = subprocess.run(
-            ["git", "diff", "--check"], cwd=REPO, capture_output=True, text=True
+            ["git", "diff", "--check"], cwd=REPO, capture_output=True, text=True,
+            timeout=60,
         )
         self.assertEqual(
             proc.returncode, 0, "git diff --check reported:\n" + proc.stdout

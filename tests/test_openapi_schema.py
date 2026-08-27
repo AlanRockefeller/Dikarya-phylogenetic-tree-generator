@@ -39,8 +39,8 @@ class OpenAPISchemaTests(unittest.TestCase):
                 # The advertised bounds are the ones validation enforces.
                 self.assertEqual(field["minimum"], low)
                 self.assertEqual(field["maximum"], high)
-                self.assertIn("{:,}".format(low), description)
-                self.assertIn("{:,}".format(high), description)
+                self.assertIn(f"{low:,}", description)
+                self.assertIn(f"{high:,}", description)
 
                 self.assertIn("rejected", description)
                 self.assertNotIn("always used as given", description)

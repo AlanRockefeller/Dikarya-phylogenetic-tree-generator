@@ -1393,14 +1393,18 @@ document.addEventListener('DOMContentLoaded', async () => {
         return NON_EPITHET_WORDS.has(word) ? null : word;
     }
 
+    // The pattern is fixed, so it is built once rather than per call. No /g flag, so
+    // there is no lastIndex to carry between calls.
+    const SPECIES_QUOTED_EPITHET_RE = new RegExp(
+        `^[${SPECIES_QUOTE_CHARS}]+([A-Za-z][A-Za-z0-9.-]{1,})[${SPECIES_QUOTE_CHARS}]+$`
+    );
+
     // Provisional names travel quoted -- Amanita sp. 'albemarlensis', Amanita "albemarlensis" --
     // and both spellings have to reduce to the same suggestion so they count as one species.
     // Informal codes (Russula "sp-IN67", Tricholoma "moseri-CA01") are quoted the same way and
     // are kept as they are written, because they are what separates two species in these trees.
     function speciesQuotedEpithet(token) {
-        const match = new RegExp(
-            `^[${SPECIES_QUOTE_CHARS}]+([A-Za-z][A-Za-z0-9.-]{1,})[${SPECIES_QUOTE_CHARS}]+$`
-        ).exec(String(token));
+        const match = SPECIES_QUOTED_EPITHET_RE.exec(String(token));
         if (!match) return null;
         const epithet = match[1];
         return /[0-9]/.test(epithet) ? epithet : epithet.toLowerCase();

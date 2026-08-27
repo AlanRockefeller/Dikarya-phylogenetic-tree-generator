@@ -992,6 +992,7 @@ def _wrapper_budget_verdict(value):
         input="",
         capture_output=True,
         text=True,
+        timeout=60,
         env={
             **os.environ,
             "DIKARYA_CLAUDE_MAX_BUDGET": value,

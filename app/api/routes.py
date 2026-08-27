@@ -3976,6 +3976,7 @@ def alignment_view(job_id):
             by_token.setdefault(first_token, []).append(row)
 
     rename_aliases = {}
+    active_renames = {}
     try:
         from app.services.tree_edit_service import load_tree_state
         renames = load_tree_state(job_dir).get("renames") or {}
@@ -3986,6 +3987,7 @@ def alignment_view(job_id):
                 display_name = display_name.strip()
                 if not display_name:
                     continue
+                active_renames[original_name] = display_name
                 existing = rename_aliases.get(display_name)
                 rename_aliases[display_name] = (
                     original_name if existing in (None, original_name) else False
@@ -4026,6 +4028,20 @@ def alignment_view(job_id):
             if row is not None:
                 return row
         return match_alignment_token(name)
+
+    # Alan 8/27/26 - A tip renamed in the viewer still carries its original header in the
+    # alignment file, so display the viewer's label for that row instead of the stale one.
+    display_names = {}
+    for original_name, display_name in active_renames.items():
+        row = match_alignment_name(original_name)
+        if row is not None:
+            display_names[id(row)] = display_name
+
+    def as_response_row(row):
+        display = display_names.get(id(row))
+        if display and display != row["name"]:
+            return {"name": display, "sequence": row["sequence"]}
+        return row
 
     warnings = []
     alignment_length = max((len(r["sequence"]) for r in fasta_rows), default=0)
@@ -4131,7 +4147,7 @@ def alignment_view(job_id):
         "alignment_length": alignment_length,
         "included_pruned_count": included_pruned_count,
         "available_pruned_count": available_pruned_count,
-        "sequences": selected_rows,
+        "sequences": [as_response_row(r) for r in selected_rows],
         "warnings": warnings,
     })
 

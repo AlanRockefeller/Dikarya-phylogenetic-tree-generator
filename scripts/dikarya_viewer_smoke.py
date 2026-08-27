@@ -206,6 +206,54 @@ def mirror_verified_asset(rel, served_bytes, workdir):
     return True
 
 
+HARNESS_TIMEOUT = 180
+
+
+def run_served_harness(results, node, workdir):
+    """Execute the verified bundle through the init harness and record its checks.
+
+    A hung Node process and a harness that printed something other than JSON are
+    both *results* of this smoke test, not crashes of it: a traceback out of here
+    escapes the `report()` path, so `--json` emits nothing parseable and a cron
+    caller sees a stack trace where it expected a verdict. Only the two failures
+    that are actually expected from running a subprocess are caught -- a bare
+    `except Exception` would also swallow bugs in this script.
+    """
+    try:
+        proc = subprocess.run(
+            [node, str(HARNESS), str(workdir), "--json"],
+            capture_output=True, text=True, timeout=HARNESS_TIMEOUT,
+        )
+    except subprocess.TimeoutExpired as exc:
+        stdout = exc.stdout or ""
+        if isinstance(stdout, bytes):
+            stdout = stdout.decode("utf-8", "replace")
+        return check(
+            results, "served-bundle-boots", False,
+            f"the harness exceeded the {HARNESS_TIMEOUT}-second timeout and was "
+            f"killed; the viewer bundle may be hanging during init."
+            + (f"\npartial output:\n{stdout.strip()}" if stdout.strip() else ""),
+        )
+
+    if proc.returncode != 0:
+        return check(results, "served-bundle-boots", False,
+                     f"the harness could not run:\n{proc.stdout}\n{proc.stderr}")
+
+    try:
+        rows = json.loads(proc.stdout)
+    except json.JSONDecodeError as exc:
+        return check(
+            results, "served-bundle-boots", False,
+            f"the harness produced malformed JSON output ({exc}); expected a "
+            f"JSON array of checks from {HARNESS.name}.\n"
+            f"stdout:\n{proc.stdout.strip()}\nstderr:\n{proc.stderr.strip()}",
+        )
+
+    for r in rows:
+        check(results, f"served/{r['name']}", r["ok"], r["detail"])
+    return True
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -303,16 +351,7 @@ def main():
             results, "executable-assets-match-checkout", executable_assets_match,
             "one or more served executable assets failed the integrity gate",
         ):
-            proc = subprocess.run(
-                [node, str(HARNESS), str(workdir), "--json"],
-                capture_output=True, text=True, timeout=180,
-            )
-            if proc.returncode != 0:
-                check(results, "served-bundle-boots", False,
-                      f"the harness could not run:\n{proc.stdout}\n{proc.stderr}")
-            else:
-                for r in json.loads(proc.stdout):
-                    check(results, f"served/{r['name']}", r["ok"], r["detail"])
+            run_served_harness(results, node, workdir)
     finally:
         if args.keep:
             print(f"downloaded bundle kept at {workdir}", file=sys.stderr)
