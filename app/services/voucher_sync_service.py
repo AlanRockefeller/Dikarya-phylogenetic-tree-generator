@@ -116,6 +116,7 @@ class INatClient:
     def fetch_observations(self, user_login: str, created_d1: Optional[str] = None,
                            created_d2: Optional[str] = None,
                            max_observations: Optional[int] = None) -> Iterable[Dict[str, Any]]:
+        """Page a user's observations, oldest first, optionally within a date range."""
         page = 1
         fetched = 0
         total = None
@@ -151,13 +152,38 @@ class INatClient:
             time.sleep(READ_PAUSE)
 
     def fetch_observation(self, observation_id: int) -> Optional[Dict[str, Any]]:
+        """Read a single observation by id."""
         r = self.session.get(f"{API}/observations/{int(observation_id)}",
                              timeout=REQUEST_TIMEOUT)
         r.raise_for_status()
         results = r.json().get("results", [])
         return results[0] if results else None
 
+    def fetch_observations_by_id(self, observation_ids) -> Dict[int, Dict[str, Any]]:
+        """Re-read observations by id, keyed by id.
+
+        Used to revalidate apply targets. iNaturalist accepts a comma-separated
+        `id` filter, so a whole apply set costs a handful of requests rather
+        than one per row.
+        """
+        out: Dict[int, Dict[str, Any]] = {}
+        ids = [int(i) for i in observation_ids]
+        for start in range(0, len(ids), PER_PAGE):
+            chunk = ids[start:start + PER_PAGE]
+            r = self.session.get(f"{API}/observations",
+                                 params={"id": ",".join(str(i) for i in chunk),
+                                         "per_page": PER_PAGE},
+                                 timeout=REQUEST_TIMEOUT)
+            r.raise_for_status()
+            for obs in r.json().get("results", []) or []:
+                if obs.get("id") is not None:
+                    out[int(obs["id"])] = obs
+            if start + PER_PAGE < len(ids):
+                time.sleep(READ_PAUSE)
+        return out
+
     def create_ofv(self, observation_id: int, field_id: int, value: str) -> Dict[str, Any]:
+        """Create an observation field value."""
         body = {"observation_field_value": {
             "observation_id": observation_id,
             "observation_field_id": field_id,
@@ -170,6 +196,7 @@ class INatClient:
 
     def update_ofv(self, ofv_id: int, observation_id: int, field_id: int,
                    value: str) -> Dict[str, Any]:
+        """Replace an existing observation field value."""
         body = {"observation_field_value": {
             "observation_id": observation_id,
             "observation_field_id": field_id,
@@ -181,6 +208,7 @@ class INatClient:
         return r.json()
 
     def download_image(self, url: str) -> bytes:
+        """Fetch photo bytes from iNaturalist's CDN."""
         r = self.session.get(url, timeout=60)
         r.raise_for_status()
         return r.content
@@ -204,6 +232,7 @@ class INatClient:
 # Photo selection
 # ---------------------------------------------------------------------------
 def last_photo_url(obs: Dict[str, Any], size: str = "original") -> Optional[str]:
+    """URL of the observation's last photo at the requested size, or None."""
     ophotos = obs.get("observation_photos") or []
     if not ophotos:
         return None
@@ -249,6 +278,7 @@ def _get_candidates(img, cache: Dict[str, Any]):
 
 
 def decode_qr(img, cache: Dict[str, Any]) -> Tuple[Optional[str], Optional[str]]:
+    """Read a QR code from `img`, trying whole-frame variants then label crops."""
     import cv2
 
     detector = cv2.QRCodeDetector()
@@ -296,6 +326,7 @@ def decode_qr(img, cache: Dict[str, Any]) -> Tuple[Optional[str], Optional[str]]
 
 
 def extract_voucher(text: Optional[str], voucher_re) -> Optional[str]:
+    """First substring of `text` matching the voucher pattern, upper-cased."""
     if text is None:
         return None
     m = voucher_re.search(text[:MAX_MATCH_TEXT])
@@ -402,6 +433,7 @@ def _rapidocr_engine():
 
 
 def ocr_engine_available() -> bool:
+    """Whether the OCR engine is installed in this process."""
     import importlib.util
     return importlib.util.find_spec("rapidocr_onnxruntime") is not None
 
@@ -457,6 +489,7 @@ def ocr_fallback(img, cache: Dict[str, Any], voucher_re):
 # Observation helpers
 # ---------------------------------------------------------------------------
 def existing_ofv(obs: Dict[str, Any], field_id: int):
+    """The observation's current (value, id) for `field_id`, or (None, None)."""
     for ofv in obs.get("ofvs") or []:
         if ofv.get("field_id") == field_id:
             return ofv.get("value"), ofv.get("id")
@@ -464,6 +497,7 @@ def existing_ofv(obs: Dict[str, Any], field_id: int):
 
 
 def taxon_label(obs: Dict[str, Any]) -> str:
+    """Display name for the observation's taxon."""
     taxon = obs.get("taxon") or {}
     name = taxon.get("name") or "Unknown"
     common = taxon.get("preferred_common_name")
@@ -471,6 +505,7 @@ def taxon_label(obs: Dict[str, Any]) -> str:
 
 
 def upload_date(obs: Dict[str, Any]) -> str:
+    """ISO date the observation was uploaded to iNaturalist."""
     details = obs.get("created_at_details") or {}
     return details.get("date") or (obs.get("created_at") or "")[:10]
 
@@ -498,6 +533,13 @@ def _base_row(obs: Dict[str, Any]) -> Dict[str, Any]:
 # ---------------------------------------------------------------------------
 def build_row(client: INatClient, obs: Dict[str, Any], field_id: int, voucher_re,
               allow_overwrite: bool, use_ocr: bool = False) -> Dict[str, Any]:
+    """Decide what should happen to one observation.
+
+    Downloads the last photo, decodes a voucher from it (QR, then OCR when
+    enabled), and compares that with the observation field's current value.
+    Returns the row dict the review queue and the apply step both work from;
+    `action` is one of UPDATE, SKIP or FLAG and `reason` says why.
+    """
     row = _base_row(obs)
 
     current_value, ofv_id = existing_ofv(obs, field_id)
@@ -564,6 +606,7 @@ def build_row(client: INatClient, obs: Dict[str, Any], field_id: int, voucher_re
 
 
 def summarize_rows(rows: Iterable[Dict[str, Any]]) -> Dict[str, int]:
+    """Count rows by action, plus how many came from OCR."""
     summary = {"update": 0, "skip": 0, "flag": 0, "ocr": 0, "total": 0}
     for r in rows:
         summary["total"] += 1
@@ -600,9 +643,9 @@ def scan_observations(client: INatClient, obs_list: List[Dict[str, Any]], *,
     }
     try:
         for fut in as_completed(future_to_idx):
-            if should_cancel():
-                cancelled = True
-                break
+            # Record the finished row *before* honouring a cancel: this future
+            # has already done its download and decode, and dropping it would
+            # throw that work away and leave a gap in the queue.
             idx = future_to_idx[fut]
             obs = obs_list[idx]
             try:
@@ -617,6 +660,9 @@ def scan_observations(client: INatClient, obs_list: List[Dict[str, Any]], *,
             done += 1
             if on_row:
                 on_row(done, total, row)
+            if should_cancel():
+                cancelled = True
+                break
     finally:
         pool.shutdown(wait=False, cancel_futures=True)
 
@@ -668,6 +714,38 @@ def _parse_iso_date(value: Any) -> Optional[date]:
     return date.fromisoformat(value)
 
 
+# Probe lengths are deliberately small. Catastrophic backtracking is
+# exponential in the length of the run, so it is already unmistakable at 20
+# characters (~10^6 steps) while a linear pattern still finishes in
+# microseconds. Probing at MAX_MATCH_TEXT instead would mean *running* the
+# pathological match we are trying to detect, which is precisely the hang this
+# guard exists to prevent.
+_REDOS_PROBE_LENGTHS = (12, 16, 20)
+_REDOS_BUDGET_SECONDS = 0.03
+
+
+def _pattern_is_slow(compiled) -> bool:
+    """True if `compiled` backtracks pathologically on adversarial input.
+
+    A user-supplied pattern is matched by the RQ worker, which also runs
+    alignment and tree jobs, so a pattern like ``(a+)+b`` would not merely hurt
+    its own scan. Python's `re` has no match timeout, so the pattern is probed
+    here -- in the web process, before the run is saved -- against short strings
+    that end in a character forcing the match to fail and unwind.
+    """
+    import time as _time
+    for n in _REDOS_PROBE_LENGTHS:
+        probe = "a" * n + "!"
+        start = _time.perf_counter()
+        try:
+            compiled.search(probe)
+        except (RecursionError, MemoryError, OverflowError):
+            return True
+        if (_time.perf_counter() - start) > _REDOS_BUDGET_SECONDS:
+            return True
+    return False
+
+
 def validate_scan_params(data: Dict[str, Any]) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
     """Normalize a scan request. Returns ``(params, None)`` or ``(None, error)``."""
     data = data or {}
@@ -684,9 +762,15 @@ def validate_scan_params(data: Dict[str, Any]) -> Tuple[Optional[Dict[str, Any]]
     else:
         pattern = presets[fmt]
     try:
-        re.compile(pattern, re.IGNORECASE)
+        compiled = re.compile(pattern, re.IGNORECASE)
     except re.error as exc:
         return None, f"Voucher pattern error: {exc}"
+    if fmt == "Custom":
+        slow = _pattern_is_slow(compiled)
+        if slow:
+            return None, ("That pattern is too slow to run safely (it backtracks "
+                          "excessively). Simplify it - avoid nested repeats such "
+                          "as (a+)+.")
 
     try:
         field_id = int(data.get("field_id") or DEFAULT_FIELD_ID)
@@ -723,11 +807,25 @@ def validate_scan_params(data: Dict[str, Any]) -> Tuple[Optional[Dict[str, Any]]
     return params, None
 
 
+# Excel, LibreOffice and Sheets treat a cell opening with any of these as a
+# formula. raw_qr/raw_ocr are decoded straight from a photo, so an attacker who
+# can get a label in front of the camera controls that text.
+_CSV_FORMULA_PREFIXES = ("=", "+", "-", "@", "\t", "\r")
+
+
+def _csv_safe(value: Any) -> Any:
+    """Stop a decoded cell value being run as a spreadsheet formula."""
+    if isinstance(value, str) and value.startswith(_CSV_FORMULA_PREFIXES):
+        return "'" + value
+    return value
+
+
 def rows_to_csv_text(rows: Iterable[Dict[str, Any]]) -> str:
+    """Render scan rows as CSV text, with formula-injection neutralised."""
     buf = io.StringIO()
     writer = csv.DictWriter(buf, fieldnames=CSV_COLUMNS, extrasaction="ignore",
                             lineterminator="\n")
     writer.writeheader()
     for r in rows:
-        writer.writerow(r)
+        writer.writerow({k: _csv_safe(v) for k, v in r.items()})
     return buf.getvalue()

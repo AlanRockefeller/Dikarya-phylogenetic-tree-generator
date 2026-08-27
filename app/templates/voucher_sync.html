@@ -258,8 +258,10 @@
                         <button type="button" id="vs_field_id_pill" class="vs-pill" title="Click to edit the numeric field ID">ID <span id="vs_field_id_text">{{ default_field_id }}</span></button>
                         <input id="vs_field_id" type="number" min="1" value="{{ default_field_id }}" class="vs-pill vs-pill-input hidden" aria-label="Observation field ID">
                     </div>
-                    <input id="vs_field_name" type="text" value="{{ default_field_name }}" autocomplete="off" class="vs-input">
-                    <ul id="vs_field_suggest" class="hidden absolute z-20 mt-1 w-full rounded-lg border border-gray-200 dark:border-gray-600 bg-white dark:bg-journal-dark shadow-lg text-sm"></ul>
+                    <input id="vs_field_name" type="text" value="{{ default_field_name }}" autocomplete="off" class="vs-input"
+                        role="combobox" aria-expanded="false" aria-controls="vs_field_suggest" aria-autocomplete="list">
+                <ul id="vs_field_suggest" role="listbox" aria-label="Matching observation fields"
+                        class="hidden absolute z-20 mt-1 w-full rounded-lg border border-gray-200 dark:border-gray-600 bg-white dark:bg-journal-dark shadow-lg text-sm"></ul>
                 </div>
 
                 <div class="vs-divider"></div>
@@ -391,7 +393,7 @@
                     </table>
                 </div>
                 <div id="vs_empty" class="px-4 py-10 text-center text-sm text-gray-500 dark:text-gray-400">
-                    No results yet. Choose a date and press <strong>Preview run</strong>.
+                    No results yet. Choose a date and press <strong>Preview</strong>.
                 </div>
             </section>
 
@@ -418,9 +420,10 @@
 </div>
 
 <!-- Apply confirmation modal -->
-<div id="vs_apply_modal" class="hidden fixed inset-0 z-50 flex items-center justify-center bg-black/50 px-4">
+<div id="vs_apply_modal" class="hidden fixed inset-0 z-50 flex items-center justify-center bg-black/50 px-4"
+    role="dialog" aria-modal="true" aria-labelledby="vs_apply_modal_title">
     <div class="bg-white dark:bg-journal-green rounded-xl shadow-2xl max-w-md w-full p-6">
-        <h3 class="text-lg font-bold text-journal-dark dark:text-white mb-3"><i class="fas fa-cloud-arrow-up mr-2 text-green-600"></i>Apply updates?</h3>
+        <h3 id="vs_apply_modal_title" class="text-lg font-bold text-journal-dark dark:text-white mb-3"><i class="fas fa-cloud-arrow-up mr-2 text-green-600"></i>Apply updates?</h3>
         <div id="vs_apply_modal_body" class="text-sm text-gray-700 dark:text-gray-200 space-y-2"></div>
         <div class="mt-6 flex justify-end gap-2">
             <button id="vs_apply_cancel" type="button" class="px-4 py-2 rounded-lg text-sm border border-gray-300 dark:border-gray-600 text-gray-700 dark:text-gray-200 hover:bg-gray-100 dark:hover:bg-journal-dark">Cancel</button>
@@ -462,7 +465,16 @@
             headers['Content-Type'] = 'application/json';
             headers['X-CSRFToken'] = CSRF;
         }
-        const resp = await fetch(path, Object.assign({}, opts, { headers, credentials: 'same-origin' }));
+        let resp;
+        try {
+            resp = await fetch(path, Object.assign({}, opts, { headers, credentials: 'same-origin' }));
+        } catch (e) {
+            // A dropped connection (server restart, laptop asleep, flaky wifi)
+            // rejects rather than resolving non-OK. Report it like any other
+            // failure so callers can retry instead of dying on an unhandled
+            // rejection: status 0 marks "never reached the server".
+            return { ok: false, status: 0, data: { error: 'Network error' } };
+        }
         let data = null;
         try { data = await resp.json(); } catch (e) { data = {}; }
         return { ok: resp.ok, status: resp.status, data };
@@ -642,7 +654,7 @@
         state.cursor = 0; state.logCursor = 0;
         rowsBody.innerHTML = ''; logBox.innerHTML = '';
         state.filters.clear();
-        emptyMsg.innerHTML = 'No results yet. Choose a date and press <strong>Preview run</strong>.';
+        emptyMsg.innerHTML = 'No results yet. Choose a date and press <strong>Preview</strong>.';
         emptyMsg.classList.remove('hidden');
         setProgress(0, 0);
         updateChips();
@@ -708,38 +720,98 @@
     fieldInput.addEventListener('input', () => {
         clearTimeout(fieldTimer);
         const q = fieldInput.value.trim();
-        if (q.length < 2) { suggest.classList.add('hidden'); return; }
+        if (q.length < 2) { closeSuggest(); return; }
         fieldTimer = setTimeout(async () => {
             const { ok, data } = await api(`/api/voucher-sync/fields?q=${encodeURIComponent(q)}`);
             suggest.innerHTML = '';
-            if (!ok || !data.fields || !data.fields.length) { suggest.classList.add('hidden'); return; }
-            data.fields.forEach(f => {
+            if (!ok || !data.fields || !data.fields.length) { closeSuggest(); return; }
+            data.fields.forEach((f, i) => {
                 const li = document.createElement('li');
                 li.className = 'px-3 py-2 cursor-pointer hover:bg-gray-100 dark:hover:bg-journal-green';
+                li.setAttribute('role', 'option');
+                li.id = `vs_field_opt_${i}`;
+                li.setAttribute('aria-selected', 'false');
                 li.innerHTML = `${esc(f.name)} <span class="text-xs text-gray-400 font-mono">#${esc(f.id)}</span>`;
-                li.addEventListener('mousedown', () => {
-                    fieldInput.value = f.name; el('vs_field_id').value = f.id; syncFieldIdPill(); suggest.classList.add('hidden');
-                });
+                li.addEventListener('mousedown', (e) => e.preventDefault());  // keep focus on the input
+                li.addEventListener('click', () => chooseField(f));
                 suggest.appendChild(li);
             });
-            suggest.classList.remove('hidden');
+            openSuggest();
         }, 250);
     });
-    fieldInput.addEventListener('blur', () => setTimeout(() => suggest.classList.add('hidden'), 150));
+    fieldInput.addEventListener('blur', () => setTimeout(closeSuggest, 150));
+
+    // Keyboard access for the typeahead: without this the list is mouse-only.
+    let activeOption = -1;
+    function options() { return [...suggest.querySelectorAll('[role="option"]')]; }
+    function openSuggest() {
+        suggest.classList.remove('hidden');
+        fieldInput.setAttribute('aria-expanded', 'true');
+        setActiveOption(-1);
+    }
+    function closeSuggest() {
+        suggest.classList.add('hidden');
+        fieldInput.setAttribute('aria-expanded', 'false');
+        fieldInput.removeAttribute('aria-activedescendant');
+        activeOption = -1;
+    }
+    function setActiveOption(i) {
+        const opts = options();
+        activeOption = i;
+        opts.forEach((o, n) => {
+            const on = n === i;
+            o.setAttribute('aria-selected', on ? 'true' : 'false');
+            o.classList.toggle('bg-gray-100', on);
+            o.classList.toggle('dark:bg-journal-green', on);
+        });
+        if (i >= 0 && opts[i]) {
+            fieldInput.setAttribute('aria-activedescendant', opts[i].id);
+            opts[i].scrollIntoView({ block: 'nearest' });
+        } else {
+            fieldInput.removeAttribute('aria-activedescendant');
+        }
+    }
+    function chooseField(f) {
+        fieldInput.value = f.name;
+        el('vs_field_id').value = f.id;
+        syncFieldIdPill();
+        closeSuggest();
+    }
+    fieldInput.addEventListener('keydown', (e) => {
+        if (suggest.classList.contains('hidden')) return;
+        const opts = options();
+        if (!opts.length) return;
+        if (e.key === 'ArrowDown') { e.preventDefault(); setActiveOption((activeOption + 1) % opts.length); }
+        else if (e.key === 'ArrowUp') { e.preventDefault(); setActiveOption((activeOption - 1 + opts.length) % opts.length); }
+        else if (e.key === 'Enter' && activeOption >= 0) { e.preventDefault(); opts[activeOption].click(); }
+        else if (e.key === 'Escape') { e.preventDefault(); closeSuggest(); }
+    });
 
     // ---------- polling ----------
     function stopPolling() {
         if (state.polling) { clearTimeout(state.polling); state.polling = null; }
         setBusy(false);
     }
+    const POLL_MAX_FAILURES = 5;
     async function pollOnce(runId) {
         const { ok, status, data } = await api(`/api/voucher-sync/runs/${runId}?cursor=${state.cursor}&log_cursor=${state.logCursor}`);
         if (!ok) {
+            // The run keeps going server-side, so giving up on the first bad
+            // response strands the user watching a stale page. A 429 from the
+            // 120/min limit or a restart-window 502 are both transient.
+            state.pollFailures = (state.pollFailures || 0) + 1;
+            if (state.pollFailures < POLL_MAX_FAILURES) {
+                const delay = POLL_MS * Math.pow(2, state.pollFailures - 1);
+                setStatus(`Lost contact - retrying (${state.pollFailures}/${POLL_MAX_FAILURES})...`, 'busy');
+                state.polling = setTimeout(() => pollOnce(runId), delay);
+                return;
+            }
             log(`ERROR: could not read run status (HTTP ${status}).`);
-            setStatus('Lost contact with the run.', 'error');
+            setStatus('Lost contact with the run. Reload to reconnect.', 'error');
             stopPolling();
             return;
         }
+        state.pollFailures = 0;
         (data.rows || []).forEach(renderRow);
         (data.log || []).forEach(log);
         if (data.source === 'live') {
@@ -872,11 +944,41 @@
             ${c.ocr ? `<p class="text-blue-700 dark:text-blue-300"><i class="fas fa-eye mr-1"></i>${c.ocr} value(s) came from OCR - please double-check them in the table.</p>` : ''}
             ${c.overwrite ? `<p class="text-amber-700 dark:text-amber-300"><i class="fas fa-triangle-exclamation mr-1"></i>${c.overwrite} observation(s) already have a different value that will be <strong>overwritten</strong>.</p>` : ''}
             <p class="text-xs text-gray-500 dark:text-gray-400">Writes are paced at about one per second.</p>`;
-        el('vs_apply_modal').classList.remove('hidden');
+        openApplyModal();
     });
-    el('vs_apply_cancel').addEventListener('click', () => el('vs_apply_modal').classList.add('hidden'));
+
+    // ---------- apply modal (dialog semantics) ----------
+    const applyModal = el('vs_apply_modal');
+    let applyModalOpener = null;
+    function openApplyModal() {
+        applyModalOpener = document.activeElement;
+        applyModal.classList.remove('hidden');
+        el('vs_apply_confirm').focus();
+    }
+    function closeApplyModal() {
+        if (applyModal.classList.contains('hidden')) return;
+        applyModal.classList.add('hidden');
+        // Focus has to come back out of the overlay, or a keyboard user is
+        // left tabbing through the page from behind a dialog that is gone.
+        // .focus() on a disabled button is a no-op, and Apply can be disabled
+        // by the time the dialog closes (a poll may have zeroed the count), so
+        // fall back rather than stranding focus inside the hidden dialog.
+        const back = [applyModalOpener, btnApply, el('vs_btn_preview')]
+            .find(node => node && !node.disabled && node.offsetParent !== null);
+        if (back) back.focus(); else document.activeElement.blur();
+        applyModalOpener = null;
+    }
+    applyModal.addEventListener('keydown', (e) => {
+        if (e.key === 'Escape') { e.preventDefault(); closeApplyModal(); return; }
+        if (e.key !== 'Tab') return;
+        const focusables = [el('vs_apply_cancel'), el('vs_apply_confirm')];
+        const first = focusables[0], last = focusables[focusables.length - 1];
+        if (e.shiftKey && document.activeElement === first) { e.preventDefault(); last.focus(); }
+        else if (!e.shiftKey && document.activeElement === last) { e.preventDefault(); first.focus(); }
+    });
+    el('vs_apply_cancel').addEventListener('click', closeApplyModal);
     el('vs_apply_confirm').addEventListener('click', async () => {
-        el('vs_apply_modal').classList.add('hidden');
+        closeApplyModal();
         const c = applyCounts();
         const body = { observation_ids: Array.from(state.selected), confirm_overwrite: c.overwrite > 0 };
         setStatus('Queueing apply...', 'busy');

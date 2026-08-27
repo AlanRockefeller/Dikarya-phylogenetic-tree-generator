@@ -254,6 +254,70 @@ class OrchestrationTests(unittest.TestCase):
                          {"update": 2, "skip": 1, "flag": 1, "ocr": 1, "total": 4})
 
 
+class RedosGuardTests(unittest.TestCase):
+    """A custom pattern runs on the shared RQ worker, so it is probed first."""
+
+    def test_pathological_pattern_is_rejected(self):
+        params, err = vs.validate_scan_params(
+            {"date_start": "2026-08-01", "format": "Custom", "regex": "(a+)+$"})
+        self.assertIsNone(params)
+        self.assertIn("too slow", err)
+
+    def test_ordinary_custom_pattern_is_accepted(self):
+        params, err = vs.validate_scan_params(
+            {"date_start": "2026-08-01", "format": "Custom", "regex": r"\bBT-\d{3}\b"})
+        self.assertIsNone(err)
+        self.assertEqual(params["regex"], r"\bBT-\d{3}\b")
+
+    def test_presets_are_not_probed(self):
+        # The three presets are linear; probing them would only cost time.
+        for name, pattern in vs.VOUCHER_FORMATS:
+            if pattern is None:
+                continue
+            params, err = vs.validate_scan_params(
+                {"date_start": "2026-08-01", "format": name})
+            self.assertIsNone(err, name)
+            self.assertEqual(params["regex"], pattern)
+
+
+class CsvInjectionTests(unittest.TestCase):
+    """Decoded photo text ends up in a spreadsheet; it must not run there."""
+
+    def test_formula_prefixes_are_neutralised(self):
+        row = {"observation_id": 1, "url": "u", "taxon": "t", "upload_date": "d",
+               "detected_voucher": "BT-001", "field_state": "empty", "current_value": None,
+               "action": "update", "reason": "field_empty",
+               "raw_qr": "=HYPERLINK(\"http://evil\",\"click\")", "raw_ocr": "@SUM(A1)"}
+        text = vs.rows_to_csv_text([row])
+        self.assertIn("'=HYPERLINK", text)
+        self.assertIn("'@SUM(A1)", text)
+
+    def test_ordinary_values_are_untouched(self):
+        row = {"observation_id": 1, "url": "u", "taxon": "Amanita", "upload_date": "d",
+               "detected_voucher": "BT-001", "field_state": "empty", "current_value": None,
+               "action": "update", "reason": "field_empty", "raw_qr": "BT-001", "raw_ocr": None}
+        text = vs.rows_to_csv_text([row]).splitlines()[1]
+        self.assertNotIn("'", text)
+
+
+class ScanCancelTests(unittest.TestCase):
+    def test_a_finished_row_is_kept_when_cancel_arrives(self):
+        """The future had already downloaded and decoded; do not discard it."""
+        obs_list = [_obs(1), _obs(2)]
+        seen = []
+
+        with patch.object(vs, "build_row", side_effect=lambda c, o, *a: vs._base_row(o)):
+            rows, cancelled = vs.scan_observations(
+                _StubClient(), obs_list, field_id=1907, voucher_re=re.compile("x"),
+                allow_overwrite=False, use_ocr=False, workers=1,
+                on_row=lambda done, total, row: seen.append(row["observation_id"]),
+                should_cancel=lambda: True)   # cancel demanded from the very first check
+        self.assertTrue(cancelled)
+        # One row completed before the break, and it was reported rather than dropped.
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(len(seen), 1)
+
+
 class ValidationAndExportTests(unittest.TestCase):
     def test_valid_single_date_fills_range(self):
         params, err = vs.validate_scan_params({"date_start": "2026-08-01", "field_id": "1907"})

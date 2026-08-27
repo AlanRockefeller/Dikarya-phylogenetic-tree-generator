@@ -4,7 +4,6 @@ Runs against the real app factory on an in-memory SQLite database with the
 worker, Redis and iNaturalist all mocked. No OpenCV is imported.
 """
 import os
-import unittest
 import uuid
 from unittest.mock import patch
 
@@ -125,6 +124,38 @@ class TestCredentialEncryption:
         assert svc.get_credential(user.id) is None
 
 
+class TestTokenKeyGuard:
+    """Production must not fall back to a key derived from SECRET_KEY."""
+
+    def test_missing_key_fails_closed_outside_dev(self, app):
+        from app.services import inat_user_credential_service as svc
+        from app.services.inaturalist_oauth_service import InatAuthError
+
+        app.config["INAT_TOKEN_ENCRYPTION_KEY"] = ""
+        app.testing = False
+        app.debug = False
+        try:
+            with pytest.raises(InatAuthError, match="INAT_TOKEN_ENCRYPTION_KEY"):
+                svc.encrypt_secret("token")
+        finally:
+            app.testing = True
+
+    def test_explicit_key_is_used_when_set(self, app):
+        from cryptography.fernet import Fernet
+        from app.services import inat_user_credential_service as svc
+
+        key = Fernet.generate_key().decode()
+        app.config["INAT_TOKEN_ENCRYPTION_KEY"] = key
+        app.testing = False
+        app.debug = False
+        try:
+            token = svc.encrypt_secret("token")
+            assert Fernet(key.encode()).decrypt(token.encode()).decode() == "token"
+        finally:
+            app.testing = True
+            app.config["INAT_TOKEN_ENCRYPTION_KEY"] = ""
+
+
 class TestPageAndScan:
     def test_page_requires_login(self, app):
         client = app.test_client()
@@ -149,6 +180,7 @@ class TestPageAndScan:
         assert resp.status_code == 409
 
     def test_scan_validates_and_enqueues_only_the_run_id(self, app):
+        from app.extensions import db
         from app.models import VoucherSyncRun
         client = app.test_client()
         user = _make_user("f@example.org")
@@ -164,7 +196,7 @@ class TestPageAndScan:
         assert resp.status_code == 202, resp.get_json()
         run_id = resp.get_json()["run_id"]
         enq.assert_called_once_with(run_id, "scan")
-        run = VoucherSyncRun.query.get(run_id)
+        run = db.session.get(VoucherSyncRun, run_id)
         assert run.user_id == user.id and run.status == "queued"
         assert "token" not in str(run.params)
 
@@ -195,7 +227,7 @@ class TestRunScopingAndApply:
         run = _scan_run(owner, [_update_row(1)])
         client = app.test_client()
         _login(client, other)
-        with patch("app.api.voucher_sync_routes._live_slice", return_value=([], [], False)):
+        with patch("app.api.voucher_sync_routes._live_slice", return_value=([], [], False, 0)):
             assert client.get(f"/api/voucher-sync/runs/{run.id}").status_code == 404
             assert client.post(f"/api/voucher-sync/runs/{run.id}/apply", json={}).status_code == 404
             assert client.get(f"/api/voucher-sync/runs/{run.id}/export.csv").status_code == 404
@@ -206,7 +238,7 @@ class TestRunScopingAndApply:
         run = _scan_run(owner, [_update_row(1)])
         client = app.test_client()
         _login(client, owner)
-        with patch("app.api.voucher_sync_routes._live_slice", return_value=([], [], False)):
+        with patch("app.api.voucher_sync_routes._live_slice", return_value=([], [], False, 0)):
             resp = client.get(f"/api/voucher-sync/runs/{run.id}")
             body = resp.get_json()
             assert resp.status_code == 200
@@ -238,6 +270,7 @@ class TestRunScopingAndApply:
             enq.assert_called_once()
 
     def test_apply_with_confirmation_creates_child_run(self, app):
+        from app.extensions import db
         from app.models import VoucherSyncRun
         owner = _make_user("l@example.org")
         _connect(owner)
@@ -250,7 +283,7 @@ class TestRunScopingAndApply:
         assert resp.status_code == 202, resp.get_json()
         child_id = resp.get_json()["run_id"]
         enq.assert_called_once_with(child_id, "apply")
-        child = VoucherSyncRun.query.get(child_id)
+        child = db.session.get(VoucherSyncRun, child_id)
         assert child.kind == "apply" and child.parent_run_id == run.id
         assert child.params["allow_overwrite"] is True
         assert child.params["observation_ids"] == [2]
@@ -285,8 +318,83 @@ class TestRunScopingAndApply:
         assert resp.status_code == 409
 
 
+class TestLiveSliceCursor:
+    """A row Redis cannot parse must not pin the cursor behind it."""
+
+    def test_cursor_advances_past_an_unparseable_row(self, app):
+        from app.api import voucher_sync_routes as routes
+
+        class FakeRedis:
+            def lrange(self, key, start, end):
+                if key.endswith(":rows"):
+                    return [b'{"observation_id": 1}', b'not json', b'{"observation_id": 3}']
+                return []
+
+        with patch.object(routes, "_redis", return_value=FakeRedis()):
+            rows, log, ok, consumed = routes._live_slice("run-1", 0, 0)
+        assert ok is True
+        assert [r["observation_id"] for r in rows] == [1, 3]
+        # Three items were read even though only two parsed.
+        assert consumed == 3
+
+
+class TestApplyRevalidation:
+    """Apply must re-read every target, not just the ones already populated."""
+
+    def _ctx(self):
+        class Ctx:
+            def __init__(self):
+                self.lines = []
+            def log(self, text):
+                self.lines.append(text)
+        return Ctx()
+
+    def _rows(self):
+        return [_update_row(1), _update_row(2)]
+
+    def test_row_populated_since_preview_is_dropped(self, app):
+        from app.workers.voucher_sync_tasks import _revalidate_targets
+
+        class FakeClient:
+            def fetch_observations_by_id(self, ids):
+                return {
+                    1: {"id": 1, "ofvs": []},                                              # still empty
+                    2: {"id": 2, "ofvs": [{"field_id": 1907, "value": "SOMEONE-ELSE", "id": 9}]},
+                }
+
+        ctx = self._ctx()
+        kept = _revalidate_targets(ctx, FakeClient(), self._rows(), 1907, allow_overwrite=False)
+        assert [r["observation_id"] for r in kept] == [1]
+        assert any("now holds SOMEONE-ELSE" in line for line in ctx.lines)
+
+    def test_confirmed_overwrite_still_applies_and_refreshes_ofv_id(self, app):
+        from app.workers.voucher_sync_tasks import _revalidate_targets
+
+        class FakeClient:
+            def fetch_observations_by_id(self, ids):
+                return {1: {"id": 1, "ofvs": [{"field_id": 1907, "value": "OLD", "id": 77}]},
+                        2: {"id": 2, "ofvs": []}}
+
+        kept = _revalidate_targets(self._ctx(), FakeClient(), self._rows(), 1907, allow_overwrite=True)
+        assert [r["observation_id"] for r in kept] == [1, 2]
+        assert kept[0]["ofv_id"] == 77 and kept[0]["current_value"] == "OLD"
+
+    def test_unreadable_observation_is_dropped_not_written_from_stale_data(self, app):
+        from app.workers.voucher_sync_tasks import _revalidate_targets
+
+        class FakeClient:
+            def fetch_observations_by_id(self, ids):
+                return {1: {"id": 1, "ofvs": []}}      # observation 2 came back missing
+
+        ctx = self._ctx()
+        kept = _revalidate_targets(ctx, FakeClient(), self._rows(), 1907, allow_overwrite=False)
+        assert [r["observation_id"] for r in kept] == [1]
+        assert any("could not be re-read" in line for line in ctx.lines)
+
+
 class TestWorkerTask:
     def test_scan_job_persists_rows_and_summary(self, app):
+        from app.extensions import db
         from app.models import VoucherSyncRun
         from app.workers import voucher_sync_tasks as tasks
         owner = _make_user("o@example.org")
@@ -333,7 +441,7 @@ class TestWorkerTask:
             result = tasks.run_voucher_scan_job(run_id)
 
         assert result["status"] == "completed"
-        stored = VoucherSyncRun.query.get(run_id)
+        stored = db.session.get(VoucherSyncRun, run_id)
         assert stored.status == "completed"
         assert stored.summary["update"] == 1
         assert stored.rows[0]["detected_voucher"] == "BT-007"
@@ -342,6 +450,7 @@ class TestWorkerTask:
         assert len(fake_redis.lists[tasks.run_keys(run_id)["rows"]]) == 1
 
     def test_scan_job_without_credential_fails_cleanly(self, app):
+        from app.extensions import db
         from app.models import VoucherSyncRun
         from app.workers import voucher_sync_tasks as tasks
         owner = _make_user("p@example.org")
@@ -356,10 +465,6 @@ class TestWorkerTask:
         with patch.object(tasks, "get_redis_connection", return_value=FakeRedis()):
             result = tasks.run_voucher_scan_job(run_id)
         assert result["status"] == "failed"
-        stored = VoucherSyncRun.query.get(run_id)
+        stored = db.session.get(VoucherSyncRun, run_id)
         assert stored.status == "failed"
         assert "Connect your iNaturalist account" in stored.error
-
-
-if __name__ == "__main__":
-    unittest.main()

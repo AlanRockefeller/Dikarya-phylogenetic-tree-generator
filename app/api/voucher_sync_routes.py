@@ -27,6 +27,7 @@ MAX_APPLY_IDS = 5000
 
 
 def _rate_key() -> str:
+    """Rate-limit bucket: per user when signed in, per IP otherwise."""
     from flask_limiter.util import get_remote_address
     if current_user.is_authenticated:
         return f"user:{current_user.id}"
@@ -34,6 +35,7 @@ def _rate_key() -> str:
 
 
 def _scan_rate_limit() -> str:
+    """Per-call rate string for starting scans; admins are effectively unlimited."""
     if current_user.is_authenticated:
         email = (current_user.email or "").strip().lower()
         if email in Config.INAT_OAUTH_ADMIN_EMAILS:
@@ -42,6 +44,7 @@ def _scan_rate_limit() -> str:
 
 
 def _apply_rate_limit() -> str:
+    """Per-call rate string for starting applies; admins are effectively unlimited."""
     if current_user.is_authenticated:
         email = (current_user.email or "").strip().lower()
         if email in Config.INAT_OAUTH_ADMIN_EMAILS:
@@ -50,6 +53,7 @@ def _apply_rate_limit() -> str:
 
 
 def _own_run(run_id: str) -> VoucherSyncRun:
+    """Fetch a run belonging to the current user, or 404. Never leaks another user's run."""
     from flask import abort
     if not validate_job_id(run_id):
         abort(404)
@@ -60,6 +64,7 @@ def _own_run(run_id: str) -> VoucherSyncRun:
 
 
 def _active_run() -> Optional[VoucherSyncRun]:
+    """The caller's queued or running run, if any."""
     return (VoucherSyncRun.query
             .filter(VoucherSyncRun.user_id == current_user.id,
                     VoucherSyncRun.status.in_(VoucherSyncRun.ACTIVE_STATUSES))
@@ -89,11 +94,13 @@ def _reconcile_stale(run: VoucherSyncRun) -> None:
 
 
 def _redis():
+    """The Redis connection the worker publishes run progress to."""
     from app.workers.queue import get_redis_connection
     return get_redis_connection()
 
 
 def _live_slice(run_id: str, cursor_rows: int, cursor_log: int):
+    """Read rows and log lines a run has pushed to Redis since the given cursors."""
     from app.workers.voucher_sync_tasks import run_keys
     keys = run_keys(run_id)
     try:
@@ -102,15 +109,19 @@ def _live_slice(run_id: str, cursor_rows: int, cursor_log: int):
         raw_log = r.lrange(keys["log"], cursor_log, -1)
     except Exception as exc:
         logger.warning("event=voucher_sync.redis_read_failed run=%s error=%s", run_id, exc)
-        return [], [], False
+        return [], [], False, 0
     rows = []
     for item in raw_rows:
         try:
             rows.append(json.loads(item))
         except (TypeError, ValueError):
+            logger.warning("event=voucher_sync.row_unparseable run=%s", run_id)
             continue
     log = [l.decode("utf-8", "replace") if isinstance(l, bytes) else str(l) for l in raw_log]
-    return rows, log, True
+    # len(raw_rows), not len(rows): the cursor counts what was *consumed*. A row
+    # that fails to parse would otherwise pin the cursor behind it and every
+    # later poll would return the same range again.
+    return rows, log, True, len(raw_rows)
 
 
 # ---------------------------------------------------------------------------
@@ -119,6 +130,7 @@ def _live_slice(run_id: str, cursor_rows: int, cursor_log: int):
 @bp.route('/voucher-sync/status', methods=['GET'])
 @login_required
 def voucher_sync_status():
+    """Whether the caller has an iNaturalist account connected, and any live run."""
     from app.services.inat_user_credential_service import credential_status
     status = credential_status(current_user.id)
     active = _active_run()
@@ -134,6 +146,7 @@ def voucher_sync_status():
 @login_required
 @limiter.limit("30 per minute", key_func=_rate_key)
 def voucher_sync_fields():
+    """Typeahead over iNaturalist observation fields (unauthenticated upstream call)."""
     from app.services.voucher_sync_service import INatClient
     q = (request.args.get("q") or "").strip()[:80]
     if len(q) < 2:
@@ -149,6 +162,7 @@ def voucher_sync_fields():
 @bp.route('/voucher-sync/runs', methods=['GET'])
 @login_required
 def voucher_sync_runs():
+    """The caller's ten most recent runs, for resuming the page after a reload."""
     runs = (VoucherSyncRun.query
             .filter_by(user_id=current_user.id)
             .order_by(VoucherSyncRun.created_at.desc())
@@ -165,6 +179,7 @@ def voucher_sync_runs():
 @login_required
 @limiter.limit(_scan_rate_limit, key_func=_rate_key)
 def voucher_sync_scan():
+    """Queue a scan of the caller's observations. Returns 202 and the new run id."""
     from app.services.inat_user_credential_service import get_credential
     from app.services.voucher_sync_service import validate_scan_params
 
@@ -211,6 +226,7 @@ def voucher_sync_scan():
 @login_required
 @limiter.limit("120 per minute", key_func=_rate_key)
 def voucher_sync_run_detail(run_id):
+    """Poll one run: status, progress, and the rows/log added since `cursor`."""
     run = _own_run(run_id)
     _reconcile_stale(run)
     try:
@@ -220,11 +236,11 @@ def voucher_sync_run_detail(run_id):
         return jsonify({"error": "Invalid cursor."}), 400
 
     payload = run.to_dict()
-    live_rows, live_log, live_ok = _live_slice(run.id, cursor_rows, cursor_log)
+    live_rows, live_log, live_ok, rows_consumed = _live_slice(run.id, cursor_rows, cursor_log)
     if run.status in VoucherSyncRun.ACTIVE_STATUSES or live_ok and (live_rows or live_log):
         payload["rows"] = live_rows
         payload["log"] = live_log
-        payload["next_cursor"] = cursor_rows + len(live_rows)
+        payload["next_cursor"] = cursor_rows + rows_consumed
         payload["next_log_cursor"] = cursor_log + len(live_log)
         payload["source"] = "live"
     else:
@@ -248,6 +264,7 @@ def voucher_sync_run_detail(run_id):
 @bp.route('/voucher-sync/runs/<run_id>/cancel', methods=['POST'])
 @login_required
 def voucher_sync_run_cancel(run_id):
+    """Ask a live run to stop; the worker checks this between rows."""
     run = _own_run(run_id)
     if run.status not in VoucherSyncRun.ACTIVE_STATUSES:
         return jsonify({"status": run.status, "cancelled": False})
@@ -264,6 +281,7 @@ def voucher_sync_run_cancel(run_id):
 @login_required
 @limiter.limit(_apply_rate_limit, key_func=_rate_key)
 def voucher_sync_run_apply(run_id):
+    """Queue the writes for a finished preview, gated on overwrite confirmation."""
     from app.services.inat_user_credential_service import get_credential
     from app.services.voucher_sync_service import UPDATE
 
@@ -284,8 +302,11 @@ def voucher_sync_run_apply(run_id):
     ids_raw = data.get("observation_ids")
     selected: Optional[set] = None
     if ids_raw is not None:
-        if not isinstance(ids_raw, list) or len(ids_raw) > MAX_APPLY_IDS:
+        if not isinstance(ids_raw, list):
             return jsonify({"error": "observation_ids must be a list."}), 400
+        if len(ids_raw) > MAX_APPLY_IDS:
+            return jsonify({"error": f"Too many observations selected "
+                                     f"(limit {MAX_APPLY_IDS})."}), 400
         try:
             selected = {int(x) for x in ids_raw}
         except (TypeError, ValueError):
@@ -338,11 +359,12 @@ def voucher_sync_run_apply(run_id):
 @bp.route('/voucher-sync/runs/<run_id>/export.csv', methods=['GET'])
 @login_required
 def voucher_sync_run_export(run_id):
+    """Download a run's rows as CSV."""
     from app.services.voucher_sync_service import rows_to_csv_text
     run = _own_run(run_id)
     rows = run.rows
     if rows is None:
-        live_rows, _, _ = _live_slice(run.id, 0, 0)
+        live_rows, _, _, _ = _live_slice(run.id, 0, 0)
         rows = live_rows
     text = rows_to_csv_text(rows or [])
     filename = f"voucher-sync-{run.id[:8]}.csv"
