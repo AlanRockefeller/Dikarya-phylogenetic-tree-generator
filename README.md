@@ -227,6 +227,14 @@ Please report vulnerabilities privately as described in [SECURITY.md](SECURITY.m
 Do not publish suspected vulnerabilities or proof-of-concept exploits in a
 public issue before a fix is available.
 
+## Credits
+
+Voucher Sync (`/voucher-sync`) was contributed by Bryce Thorson, ported from the
+standalone desktop application
+[inat-voucher-sync](https://github.com/bthorson1029/inat-voucher-sync) (MIT,
+[doi:10.5281/zenodo.22064695](https://doi.org/10.5281/zenodo.22064695)), which
+is still maintained separately.
+
 ## License
 
 Dikarya is released under the [MIT License](LICENSE.md).

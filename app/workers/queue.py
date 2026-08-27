@@ -11,7 +11,13 @@ from typing import Any, Dict, Optional
 
 QUEUE_HIGH = "phylo_high"
 QUEUE_BULK = "phylo_bulk"
-VALID_QUEUE_NAMES = {QUEUE_HIGH, QUEUE_BULK}
+# Voucher Sync scan/apply runs. The shared worker lists this queue last, so a
+# waiting tree job is always picked up first. That is pick-up priority, not
+# pre-emption: RQ runs one job per worker, so a scan already under way holds the
+# work horse until it finishes (up to its 3h timeout) and queued trees wait
+# behind it. Run a dedicated worker for this queue if that matters.
+QUEUE_VOUCHER = "voucher_sync"
+VALID_QUEUE_NAMES = {QUEUE_HIGH, QUEUE_BULK, QUEUE_VOUCHER}
 logger = logging.getLogger(__name__)
 
 # Bound the TCP connect only. Without this, a Redis host that accepts no
@@ -160,6 +166,40 @@ def enqueue_mycomap_blast_refresh_job(params: Dict[str, Any], job_timeout: Any =
         description=safe_job_description("mycomap blast refresh", job_id=job_id),
     )
     return job.id
+
+
+def enqueue_voucher_sync_run(run_id: str, kind: str) -> str:
+    """Enqueue a Voucher Sync scan or apply run. Only the run id travels
+    through Redis; the worker loads params and the user's token from the DB."""
+    from app.workers.voucher_sync_tasks import run_voucher_apply_job, run_voucher_scan_job
+
+    fn = run_voucher_apply_job if kind == "apply" else run_voucher_scan_job
+    job = get_queue(QUEUE_VOUCHER).enqueue(
+        fn,
+        run_id,
+        job_timeout="1h" if kind == "apply" else "3h",
+        meta={},
+        job_id=run_id,
+        description=safe_job_description(f"voucher sync {kind}", job_id=run_id),
+    )
+    return job.id
+
+
+def get_voucher_run_rq_status(run_id: str) -> Optional[str]:
+    """RQ's view of a Voucher Sync run: queued/started/finished/failed/..., or
+    None when Redis no longer has it. Uses Job.fetch rather than
+    Queue.fetch_job because the latter only returns jobs from its own queue."""
+    from rq.job import Job as RQJob
+    from rq.exceptions import NoSuchJobError
+
+    try:
+        job = RQJob.fetch(run_id, connection=get_redis_connection())
+    except NoSuchJobError:
+        return None
+    except Exception as exc:
+        logger.warning("event=voucher_sync.rq_lookup_failed run=%s error=%s", run_id, exc)
+        return "error"
+    return job.get_status(refresh=True)
 
 
 def enqueue_recompute_job(job_id: str, params_dict: Dict[str, Any], *,

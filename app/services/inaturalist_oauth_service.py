@@ -160,11 +160,13 @@ def new_oauth_state() -> str:
     return secrets.token_urlsafe(32)
 
 
-def authorize_url(state: str) -> str:
+def authorize_url(state: str, redirect_uri: Optional[str] = None) -> str:
+    """Build the consent URL. ``redirect_uri`` defaults to the site-wide
+    admin callback; per-user flows (Voucher Sync) pass their own."""
     creds = get_client_credentials()
     params = {
         'client_id': creds['client_id'],
-        'redirect_uri': _require_redirect_uri(),
+        'redirect_uri': redirect_uri or _require_redirect_uri(),
         'response_type': 'code',
         'state': state,
     }
@@ -224,18 +226,27 @@ def _http_post_json(url: str, form: Dict[str, str], *, bearer: Optional[str] = N
         raise InatAuthError("iNaturalist could not be reached.")
 
 
-def exchange_code_for_token(code: str) -> Dict[str, Any]:
+def exchange_code(code: str, redirect_uri: Optional[str] = None) -> Dict[str, Any]:
+    """Exchange an authorization code for the raw token payload.
+
+    Persists nothing; callers decide where the token lives (the site-wide
+    file for the admin flow, a per-user DB row for Voucher Sync)."""
     creds = get_client_credentials()
     form = {
         'client_id': creds['client_id'],
         'client_secret': creds['client_secret'],
         'code': code,
-        'redirect_uri': _require_redirect_uri(),
+        'redirect_uri': redirect_uri or _require_redirect_uri(),
         'grant_type': 'authorization_code',
     }
     payload = _http_post_json(INAT_TOKEN_URL, form)
     if 'access_token' not in payload:
         raise InatAuthError("iNaturalist did not return an access token.")
+    return payload
+
+
+def exchange_code_for_token(code: str) -> Dict[str, Any]:
+    payload = exchange_code(code)
     tokens = load_tokens()
     tokens.update({
         'access_token': payload['access_token'],
@@ -266,6 +277,17 @@ def _http_get_json(url: str, bearer: str) -> Dict[str, Any]:
         raise InatAuthError("iNaturalist could not be reached.")
 
 
+def mint_api_jwt(access_token: str) -> str:
+    """Trade an OAuth access token for a short-lived API JWT via
+    /users/api_token. Raises InatAuthError (HTTP 401 when the grant was
+    revoked)."""
+    payload = _http_get_json(INAT_JWT_URL, bearer=access_token)
+    new_jwt = payload.get('api_token') or payload.get('access_token')
+    if not new_jwt:
+        raise InatAuthError("iNaturalist did not return an API token.")
+    return new_jwt
+
+
 def get_api_jwt() -> str:
     """Return a fresh iNaturalist API JWT, refreshing if needed.
 
@@ -284,10 +306,7 @@ def get_api_jwt() -> str:
     created = tokens.get('jwt_created_at') or 0
     if jwt and (time.time() - created) < JWT_TTL_SECONDS:
         return jwt
-    payload = _http_get_json(INAT_JWT_URL, bearer=access_token)
-    new_jwt = payload.get('api_token') or payload.get('access_token')
-    if not new_jwt:
-        raise InatAuthError("iNaturalist did not return an API token.")
+    new_jwt = mint_api_jwt(access_token)
     tokens['jwt'] = new_jwt
     tokens['jwt_created_at'] = int(time.time())
     save_tokens(tokens)
