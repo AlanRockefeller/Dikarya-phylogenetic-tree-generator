@@ -193,7 +193,12 @@ def voucher_sync_scan():
             return jsonify({"error": "A run is already in progress.",
                             "active_run_id": active.id}), 409
 
-    params, err = validate_scan_params(request.get_json(silent=True) or {})
+    body = request.get_json(silent=True)
+    if body is None:
+        body = {}
+    elif not isinstance(body, dict):
+        return jsonify({"error": "Request body must be a JSON object."}), 400
+    params, err = validate_scan_params(body)
     if err:
         return jsonify({"error": err}), 400
 
@@ -297,7 +302,11 @@ def voucher_sync_run_apply(run_id):
             return jsonify({"error": "A run is already in progress.",
                             "active_run_id": active.id}), 409
 
-    data = request.get_json(silent=True) or {}
+    data = request.get_json(silent=True)
+    if data is None:
+        data = {}
+    elif not isinstance(data, dict):
+        return jsonify({"error": "Request body must be a JSON object."}), 400
     confirm_overwrite = bool(data.get("confirm_overwrite"))
     ids_raw = data.get("observation_ids")
     selected: Optional[set] = None

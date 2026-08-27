@@ -257,17 +257,27 @@ class OrchestrationTests(unittest.TestCase):
 class RedosGuardTests(unittest.TestCase):
     """A custom pattern runs on the shared RQ worker, so it is probed first."""
 
-    def test_pathological_pattern_is_rejected(self):
-        params, err = vs.validate_scan_params(
-            {"date_start": "2026-08-01", "format": "Custom", "regex": "(a+)+$"})
-        self.assertIsNone(params)
-        self.assertIn("too slow", err)
+    def test_pathological_patterns_are_rejected(self):
+        # Several alphabets on purpose: a probe built only from "a" never enters
+        # the repeated group of (\d+)+ or ([A-Z]+)+, so those patterns looked
+        # safe to the guard and would have reached the worker.
+        for pattern in ("(a+)+$", r"(\d+)+$", "([A-Z]+)+!", "([a-z0-9]+)+$",
+                        r"(\s+)+$", "(a|a)*$"):
+            with self.subTest(pattern=pattern):
+                params, err = vs.validate_scan_params(
+                    {"date_start": "2026-08-01", "format": "Custom", "regex": pattern})
+                self.assertIsNone(params, pattern)
+                self.assertIn("too slow", err)
 
-    def test_ordinary_custom_pattern_is_accepted(self):
-        params, err = vs.validate_scan_params(
-            {"date_start": "2026-08-01", "format": "Custom", "regex": r"\bBT-\d{3}\b"})
-        self.assertIsNone(err)
-        self.assertEqual(params["regex"], r"\bBT-\d{3}\b")
+    def test_ordinary_custom_patterns_are_accepted(self):
+        # The guard must not reject the patterns collectors actually write.
+        for pattern in (r"\bBT-\d{3}\b", r"\b[A-Z]{2,4}-\d{3,5}\b", r"\b\d{3,6}\b",
+                        r"\bMO[- ]?\d+\b", r"\b[A-Za-z]+\s+\d+\b"):
+            with self.subTest(pattern=pattern):
+                params, err = vs.validate_scan_params(
+                    {"date_start": "2026-08-01", "format": "Custom", "regex": pattern})
+                self.assertIsNone(err, pattern)
+                self.assertEqual(params["regex"], pattern)
 
     def test_presets_are_not_probed(self):
         # The three presets are linear; probing them would only cost time.

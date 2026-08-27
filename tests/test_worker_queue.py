@@ -97,8 +97,6 @@ class WorkerQueueStatusTests(unittest.TestCase):
         self.assertNotIn("password", str(status))
 
 
-if __name__ == "__main__":
-    unittest.main()
 
 
 class VoucherSyncQueueTests(unittest.TestCase):
@@ -124,3 +122,7 @@ class VoucherSyncQueueTests(unittest.TestCase):
         self.assertEqual(kwargs["job_id"], "run-1")
         self.assertEqual(kwargs["job_timeout"], "3h")
         self.assertNotIn("token", kwargs["description"].lower())
+
+
+if __name__ == "__main__":
+    unittest.main()

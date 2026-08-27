@@ -489,10 +489,15 @@ def ocr_fallback(img, cache: Dict[str, Any], voucher_re):
 # Observation helpers
 # ---------------------------------------------------------------------------
 def existing_ofv(obs: Dict[str, Any], field_id: int):
-    """The observation's current (value, id) for `field_id`, or (None, None)."""
+    """The observation's current (value, id) for `field_id`, or (None, None).
+
+    The value is coerced to `str`: a numeric or date observation field returns
+    a non-string from the API, and callers compare it with `.strip().upper()`.
+    """
     for ofv in obs.get("ofvs") or []:
         if ofv.get("field_id") == field_id:
-            return ofv.get("value"), ofv.get("id")
+            value = ofv.get("value")
+            return (None if value is None else str(value)), ofv.get("id")
     return None, None
 
 
@@ -574,7 +579,7 @@ def build_row(client: INatClient, obs: Dict[str, Any], field_id: int, voucher_re
                 row["detected_voucher"] = voucher
                 if not current_value:
                     row["action"], row["reason"] = UPDATE, "ocr_fallback"
-                elif current_value.strip().upper() == voucher.upper():
+                elif str(current_value).strip().upper() == voucher.upper():
                     row["action"], row["reason"] = SKIP, "already_correct"
                 elif allow_overwrite:
                     row["action"], row["reason"] = UPDATE, "ocr_fallback_overwrite"
@@ -596,7 +601,7 @@ def build_row(client: INatClient, obs: Dict[str, Any], field_id: int, voucher_re
 
     if not current_value:
         row["action"], row["reason"] = UPDATE, "field_empty"
-    elif current_value.strip().upper() == voucher.upper():
+    elif str(current_value).strip().upper() == voucher.upper():
         row["action"], row["reason"] = SKIP, "already_correct"
     elif allow_overwrite:
         row["action"], row["reason"] = UPDATE, "overwrite_existing"
@@ -722,6 +727,18 @@ def _parse_iso_date(value: Any) -> Optional[date]:
 # guard exists to prevent.
 _REDOS_PROBE_LENGTHS = (12, 16, 20)
 _REDOS_BUDGET_SECONDS = 0.03
+# One alphabet is not enough: a probe built only from "a" never enters the
+# repeated group of a pattern like (\d+)+$ or ([A-Z]+)+!, so the match returns
+# immediately and the pattern looks safe. Each alphabet is paired with a suffix
+# that cannot belong to it, which is what forces the failing match to unwind.
+_REDOS_ALPHABETS = (
+    ("a", "!"),          # lowercase
+    ("A", "?"),          # uppercase
+    ("0", "!"),          # digits
+    ("a0", "!"),         # alphanumeric runs
+    ("a-", "!"),         # the hyphen real voucher codes contain
+    (" ", "!"),          # whitespace runs, common in OCR output
+)
 
 
 def _pattern_is_slow(compiled) -> bool:
@@ -731,18 +748,22 @@ def _pattern_is_slow(compiled) -> bool:
     alignment and tree jobs, so a pattern like ``(a+)+b`` would not merely hurt
     its own scan. Python's `re` has no match timeout, so the pattern is probed
     here -- in the web process, before the run is saved -- against short strings
-    that end in a character forcing the match to fail and unwind.
+    over several alphabets, each ending in a character that forces the match to
+    fail and unwind.
     """
     import time as _time
-    for n in _REDOS_PROBE_LENGTHS:
-        probe = "a" * n + "!"
-        start = _time.perf_counter()
-        try:
-            compiled.search(probe)
-        except (RecursionError, MemoryError, OverflowError):
-            return True
-        if (_time.perf_counter() - start) > _REDOS_BUDGET_SECONDS:
-            return True
+    for unit, suffix in _REDOS_ALPHABETS:
+        for n in _REDOS_PROBE_LENGTHS:
+            # repeat the unit to length n, so multi-character units still
+            # produce a run of the right size
+            probe = (unit * n)[:n] + suffix
+            start = _time.perf_counter()
+            try:
+                compiled.search(probe)
+            except (RecursionError, MemoryError, OverflowError):
+                return True
+            if (_time.perf_counter() - start) > _REDOS_BUDGET_SECONDS:
+                return True
     return False
 
 

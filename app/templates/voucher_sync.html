@@ -682,7 +682,11 @@
     }
     document.querySelectorAll('input[name="vs_date_mode"]').forEach(r => r.addEventListener('change', refreshDateUI));
     refreshDateUI();
-    const today = new Date().toISOString().slice(0, 10);
+    // Local calendar date, not toISOString(): west of UTC an evening visit
+    // would otherwise default to tomorrow and scan the wrong day's uploads.
+    const now = new Date();
+    const today = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}`
+                + `-${String(now.getDate()).padStart(2, '0')}`;
     el('vs_date_start').value = today;
 
     // Field ID pill <-> input
@@ -914,6 +918,7 @@
         if (!e.target.classList.contains('vs-pick')) return;
         const id = Number(e.target.dataset.id);
         if (e.target.checked) state.selected.add(id); else state.selected.delete(id);
+        updateChips();   // the Apply pill counts selected rows, not update rows
     });
     el('vs_select_all').addEventListener('change', (e) => {
         rowsBody.querySelectorAll('tr:not(.vs-row-hidden) .vs-pick').forEach(cb => {
@@ -921,6 +926,7 @@
             const id = Number(cb.dataset.id);
             if (cb.checked) state.selected.add(id); else state.selected.delete(id);
         });
+        updateChips();
     });
 
     function applyCounts() {

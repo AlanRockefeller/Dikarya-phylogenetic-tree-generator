@@ -181,7 +181,7 @@ opencv-python==4.12.0.88
     # via
     #   -r requirements.in
     #   rapidocr-onnxruntime
-pillow==11.3.0
+pillow==12.3.0
     # via rapidocr-onnxruntime
 protobuf==6.33.5
     # via onnxruntime

@@ -11,8 +11,11 @@ from typing import Any, Dict, Optional
 
 QUEUE_HIGH = "phylo_high"
 QUEUE_BULK = "phylo_bulk"
-# Voucher Sync scan/apply runs. Listened to last by the shared worker so a
-# photo scan never starves a queued tree.
+# Voucher Sync scan/apply runs. The shared worker lists this queue last, so a
+# waiting tree job is always picked up first. That is pick-up priority, not
+# pre-emption: RQ runs one job per worker, so a scan already under way holds the
+# work horse until it finishes (up to its 3h timeout) and queued trees wait
+# behind it. Run a dedicated worker for this queue if that matters.
 QUEUE_VOUCHER = "voucher_sync"
 VALID_QUEUE_NAMES = {QUEUE_HIGH, QUEUE_BULK, QUEUE_VOUCHER}
 logger = logging.getLogger(__name__)
