@@ -594,6 +594,7 @@ def _creation_wait_details(created: Dict[str, Any], *, title: str,
         "auto_created": True,
         "creation_pending": pending,
         "creation_discovery_attempt": 0,
+        "creation_discovery_elapsed_seconds": 0,
         "created_title": title,
         "created_blast_id": None if pending else str(created.get("blast_id") or ""),
         "created_mycomap_url": "" if pending else str(created.get("url") or ""),
@@ -703,11 +704,11 @@ def prepare_tree_job(preparation: Dict[str, Any], *, defer_after_ncbi_rerun: boo
         _refresh_mycomap_blast_results,
     )
     from app.services.mycomap_service import (
+        advance_mycomap_creation_discovery,
         MycoMapCreateError,
         MycoMapRerunError,
         create_mycomap_blast,
         find_mycomap_blast_by_title,
-        get_mycomap_creation_discovery_max_attempts,
         get_mycomap_creation_discovery_max_seconds,
         validate_mycomap_url,
         validate_mycomap_rerun_limit,
@@ -744,8 +745,8 @@ def prepare_tree_job(preparation: Dict[str, Any], *, defer_after_ncbi_rerun: boo
         discovery_warnings.extend(lookup_warnings)
         discovery_warnings = list(dict.fromkeys(discovery_warnings))
         if not found:
-            attempt = int(details.get("creation_discovery_attempt") or 0) + 1
-            if attempt >= get_mycomap_creation_discovery_max_attempts():
+            details, expired = advance_mycomap_creation_discovery(details)
+            if expired:
                 raise MushroomObserverError(
                     _mycomap_creation_discovery_message(
                         get_mycomap_creation_discovery_max_seconds(),
@@ -753,7 +754,6 @@ def prepare_tree_job(preparation: Dict[str, Any], *, defer_after_ncbi_rerun: boo
                     ),
                     status=504,
                 )
-            details["creation_discovery_attempt"] = attempt
             if discovery_warnings:
                 details["creation_discovery_warnings"] = discovery_warnings
             return {

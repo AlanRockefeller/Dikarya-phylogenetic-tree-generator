@@ -1090,6 +1090,9 @@ def run_phylo_job(job_params: dict) -> dict:
                     )
                 if prepared.get("status") == "waiting_for_ncbi":
                     from app.services.mycomap_service import (
+                        get_mycomap_creation_discovery_max_attempts,
+                        get_mycomap_creation_discovery_max_seconds,
+                        get_mycomap_creation_discovery_poll_interval_seconds,
                         get_mycomap_ncbi_poll_interval_seconds,
                         get_mycomap_ncbi_poll_max_attempts,
                         get_mycomap_ncbi_rerun_wait_seconds,
@@ -1097,12 +1100,23 @@ def run_phylo_job(job_params: dict) -> dict:
 
                     rerun_details = prepared.get("mycomap_rerun_details") or {}
                     auto_created = bool(rerun_details.get("auto_created"))
-                    wait_seconds = (
-                        get_mycomap_ncbi_poll_interval_seconds()
-                        if auto_created else get_mycomap_ncbi_rerun_wait_seconds()
-                    )
+                    creation_pending = bool(rerun_details.get("creation_pending"))
+                    if auto_created and creation_pending:
+                        discovery_elapsed = int(
+                            rerun_details.get("creation_discovery_elapsed_seconds") or 0
+                        )
+                        wait_seconds = get_mycomap_creation_discovery_poll_interval_seconds(
+                            discovery_elapsed
+                        )
+                    else:
+                        wait_seconds = (
+                            get_mycomap_ncbi_poll_interval_seconds()
+                            if auto_created else get_mycomap_ncbi_rerun_wait_seconds()
+                        )
                     max_retry_attempts = (
-                        get_mycomap_ncbi_poll_max_attempts() if auto_created else 1
+                        get_mycomap_creation_discovery_max_attempts()
+                        + get_mycomap_ncbi_poll_max_attempts()
+                        if auto_created else 1
                     )
                     resume_at = datetime.now(timezone.utc) + timedelta(seconds=wait_seconds)
                     refresh_warnings = list(rerun_details.get("warnings") or [])
@@ -1115,20 +1129,31 @@ def run_phylo_job(job_params: dict) -> dict:
                             if queue_position is not None else ""
                         )
                         if rerun_details.get("creation_pending"):
-                            from app.services.mycomap_service import (
-                                get_mycomap_creation_discovery_max_seconds,
+                            max_discovery_seconds = (
+                                get_mycomap_creation_discovery_max_seconds()
                             )
-
-                            discovery_minutes = max(1, round(
-                                get_mycomap_creation_discovery_max_seconds() / 60
-                            ))
+                            if max_discovery_seconds % (24 * 3600) == 0:
+                                max_discovery_value = max_discovery_seconds // (24 * 3600)
+                                max_discovery_label = (
+                                    f"{max_discovery_value} day"
+                                    f"{'s' if max_discovery_value != 1 else ''}"
+                                )
+                            else:
+                                max_discovery_value = max(
+                                    1, round(max_discovery_seconds / 3600)
+                                )
+                                max_discovery_label = (
+                                    f"{max_discovery_value} hour"
+                                    f"{'s' if max_discovery_value != 1 else ''}"
+                                )
+                            next_minutes = max(1, round(wait_seconds / 60))
                             waiting_message = (
                                 "MycoMap accepted the BLAST request and queued it. "
                                 "Dikarya is waiting for the result page to appear and "
-                                "will continue in one minute; if MycoMap's queue has "
-                                f"not produced results within {discovery_minutes} "
-                                f"minute{'s' if discovery_minutes != 1 else ''}, this "
-                                "tree will stop and can be rebuilt later."
+                                f"will check again in {next_minutes} minute"
+                                f"{'s' if next_minutes != 1 else ''}. Checks gradually "
+                                "back off after the first hour, and Dikarya will keep "
+                                f"trying for up to {max_discovery_label}."
                             )
                         else:
                             if tree_preparation_kind == "mo":

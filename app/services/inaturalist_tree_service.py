@@ -1443,10 +1443,18 @@ def _mycomap_creation_discovery_message(waited_seconds: int,
     we never obtained one, so we cannot say anything about how many hits the
     search found - only that we could not find the search itself.
     """
-    minutes = max(1, round(waited_seconds / 60))
+    if waited_seconds >= 24 * 60 * 60:
+        value = max(1, round(waited_seconds / (24 * 60 * 60)))
+        duration = f"{value} day{'s' if value != 1 else ''}"
+    elif waited_seconds >= 60 * 60:
+        value = max(1, round(waited_seconds / (60 * 60)))
+        duration = f"{value} hour{'s' if value != 1 else ''}"
+    else:
+        value = max(1, round(waited_seconds / 60))
+        duration = f"{value} minute{'s' if value != 1 else ''}"
     message = (
         "MycoMap accepted this BLAST request, but its results page had still "
-        f"not appeared {minutes} minute{'s' if minutes != 1 else ''} later, "
+        f"not appeared {duration} later, "
         "so there was no search to read local (MycoBLAST) or NCBI hits from. "
         "This usually means MycoMap's BLAST queue is backed up. Rebuild this "
         "tree once the search appears at "
@@ -1467,10 +1475,10 @@ def _create_mycomap_blast_from_observation(observation: Dict[str, Any],
     """Create a MycoMap search from an observation's ITS and write its URL back."""
     from app.services.fasta_utils import clean_dna_sequence
     from app.services.mycomap_service import (
+        advance_mycomap_creation_discovery,
         MycoMapCreateError,
         create_mycomap_blast,
         find_mycomap_blast_by_title,
-        get_mycomap_creation_discovery_max_attempts,
         get_mycomap_creation_discovery_max_seconds,
         validate_mycomap_rerun_limit,
     )
@@ -1503,10 +1511,10 @@ def _create_mycomap_blast_from_observation(observation: Dict[str, Any],
             "reused_existing": True,
         })
     elif (pending_creation_details or {}).get("creation_pending"):
-        details = dict(pending_creation_details)
-        attempt = int(details.get("creation_discovery_attempt") or 0) + 1
-        max_attempts = get_mycomap_creation_discovery_max_attempts()
-        if attempt >= max_attempts:
+        details, expired = advance_mycomap_creation_discovery(
+            pending_creation_details
+        )
+        if expired:
             raise InatTreeError(
                 _mycomap_creation_discovery_message(
                     get_mycomap_creation_discovery_max_seconds(),
@@ -1514,7 +1522,6 @@ def _create_mycomap_blast_from_observation(observation: Dict[str, Any],
                 ),
                 status=504,
             )
-        details["creation_discovery_attempt"] = attempt
         if discovery_warnings:
             details["creation_discovery_warnings"] = discovery_warnings
         return details
@@ -1541,6 +1548,7 @@ def _create_mycomap_blast_from_observation(observation: Dict[str, Any],
             "auto_created": True,
             "creation_pending": True,
             "creation_discovery_attempt": 0,
+            "creation_discovery_elapsed_seconds": 0,
             "created_title": job_title,
             "created_blast_id": None,
             "created_mycomap_url": "",

@@ -6,6 +6,10 @@
     'use strict';
 
     const DEBUG_MODE = new URLSearchParams(window.location.search).has('debug');
+    // FastTree writes numerical stand-ins such as 6e-9 and 1.2e-8 for branches whose
+    // optimized length is effectively zero. Treating only literal 0 as unresolved would
+    // split one biological polytomy into arbitrary binary nodes in the viewer.
+    const ZERO_LENGTH_POLYTOMY_EPSILON = 1e-7;
 
     // Alan 8/24/26 - Say why a phylotree instance is not usable, or null when it is.
     // phylotree.js does not throw on a truncated or otherwise unparseable Newick: its
@@ -724,6 +728,11 @@
                 throw new Error(parseFailure);
             }
 
+            // FastTree resolves zero-length polytomies into arbitrary binary ladders. Compact
+            // each complete zero-length tip component before recording "original" order, so
+            // Sort -> Original and later reloads both retain the useful grouped presentation.
+            this._groupZeroLengthPolytomies();
+
             // Tag original order per-parent for correct restoration
             this.tree.traverse_and_compute(n => {
                 // Alan 7/15/26 - Hide MAFFT and RiC annotations while retaining the saved tip ID for tree edits.
@@ -985,6 +994,189 @@
             }
             // Alan 5/9/26 - Attach stored BLAST metrics to leaf nodes after names are available.
             this._attachSequenceMetricsToLeaves();
+        }
+
+        _branchLength(node) {
+            const raw = node?.data?.attribute ?? node?.attribute ?? node?.branch_length;
+            if (raw === null || raw === undefined || raw === '') return null;
+            const value = Number(raw);
+            return Number.isFinite(value) ? value : null;
+        }
+
+        _hasZeroLengthIncomingBranch(node) {
+            const length = this._branchLength(node);
+            return length !== null && Math.abs(length) <= ZERO_LENGTH_POLYTOMY_EPSILON;
+        }
+
+        /**
+         * Return the zero-length connected component containing one tip. Contracting these
+         * edges is the viewer's model of a soft polytomy: positive-length side clades are not
+         * members even when FastTree happened to attach them inside its binary resolution.
+         */
+        _zeroLengthPolytomyForTip(tip) {
+            if (!tip) return null;
+            const component = new Set([tip]);
+            const pending = [tip];
+            while (pending.length) {
+                const node = pending.pop();
+                if (node.parent && this._hasZeroLengthIncomingBranch(node)
+                    && !component.has(node.parent)) {
+                    component.add(node.parent);
+                    pending.push(node.parent);
+                }
+                for (const child of (node.children || node.data?.children || [])) {
+                    if (this._hasZeroLengthIncomingBranch(child) && !component.has(child)) {
+                        component.add(child);
+                        pending.push(child);
+                    }
+                }
+            }
+            const tips = Array.from(component).filter((node) => {
+                const children = node.children || node.data?.children || [];
+                return !children.length;
+            });
+            if (tips.length < 2) return null;
+            const memberIds = tips.map((node) => this._getNodeId(node)).filter(Boolean);
+            if (memberIds.length !== tips.length) return null;
+            const anchor = Array.from(component).find((node) => !component.has(node.parent)) || null;
+            return { nodes: component, tips, memberIds, anchor };
+        }
+
+        _zeroLengthPolytomyForMemberIds(memberIds) {
+            const wanted = new Set(Array.isArray(memberIds) ? memberIds.filter(Boolean) : []);
+            if (wanted.size < 2) return null;
+            const tip = this.allNodes.find((node) => {
+                const children = node.children || node.data?.children || [];
+                return !children.length && wanted.has(this._getNodeId(node));
+            });
+            const polytomy = this._zeroLengthPolytomyForTip(tip);
+            if (!polytomy || polytomy.memberIds.length !== wanted.size
+                || !polytomy.memberIds.every((id) => wanted.has(id))) return null;
+            return polytomy;
+        }
+
+        _tipOrderFromModel() {
+            const ids = [];
+            if (!this.tree) return ids;
+            this.tree.traverse_and_compute((node) => {
+                const children = node.children || node.data?.children || [];
+                if (children.length) return;
+                const id = this._getNodeId(node);
+                if (id) ids.push(id);
+            });
+            return ids;
+        }
+
+        _selectionRunCount(order, members) {
+            const wanted = members instanceof Set ? members : new Set(members || []);
+            let runs = 0;
+            let inside = false;
+            for (const id of order) {
+                const selected = wanted.has(id);
+                if (selected && !inside) runs += 1;
+                inside = selected;
+            }
+            return runs;
+        }
+
+        /**
+         * Find the best combination of ordinary node rotations for one member set. The dynamic
+         * program retains only the cheapest ordering for each selected/unselected boundary
+         * state, so a binary FastTree with hundreds of tips stays linear in practice.
+         */
+        _bestRotationsForLeafSet(root, memberIds) {
+            const wanted = memberIds instanceof Set ? memberIds : new Set(memberIds || []);
+            const better = (candidate, current) => !current
+                || candidate.transitions < current.transitions
+                || (candidate.transitions === current.transitions
+                    && candidate.rotations.length < current.rotations.length);
+
+            const solve = (node) => {
+                const children = node.children || node.data?.children || [];
+                if (!children.length) {
+                    const selected = wanted.has(this._getNodeId(node));
+                    return new Map([[`${Number(selected)}:${Number(selected)}`, {
+                        first: selected, last: selected, transitions: 0, rotations: []
+                    }]]);
+                }
+                const childOptions = children.map((child) => Array.from(solve(child).values()));
+                const combinations = [];
+                const collect = (index, chosen) => {
+                    if (index === childOptions.length) {
+                        combinations.push(chosen.slice());
+                        return;
+                    }
+                    childOptions[index].forEach((option) => {
+                        chosen.push(option); collect(index + 1, chosen); chosen.pop();
+                    });
+                };
+                collect(0, []);
+                const result = new Map();
+                const orientations = children.length > 1 ? [false, true] : [false];
+                combinations.forEach((chosen) => orientations.forEach((reversed) => {
+                    const ordered = reversed ? chosen.slice().reverse() : chosen;
+                    let transitions = ordered.reduce((sum, item) => sum + item.transitions, 0);
+                    for (let i = 1; i < ordered.length; i += 1) {
+                        if (ordered[i - 1].last !== ordered[i].first) transitions += 1;
+                    }
+                    const rotations = ordered.flatMap((item) => item.rotations);
+                    if (reversed) rotations.push(node);
+                    const candidate = {
+                        first: ordered[0].first,
+                        last: ordered[ordered.length - 1].last,
+                        transitions,
+                        rotations
+                    };
+                    const key = `${Number(candidate.first)}:${Number(candidate.last)}`;
+                    if (better(candidate, result.get(key))) result.set(key, candidate);
+                }));
+                return result;
+            };
+
+            const options = Array.from(solve(root).values());
+            return options.reduce((best, option) => better(option, best) ? option : best, null);
+        }
+
+        _groupZeroLengthPolytomies() {
+            if (!this.tree) return 0;
+            const nodes = [];
+            this.tree.traverse_and_compute((node) => nodes.push(node));
+            const root = nodes.find((node) => !node.parent);
+            if (!root) return 0;
+
+            const components = new Map();
+            nodes.forEach((node) => {
+                const children = node.children || node.data?.children || [];
+                if (children.length) return;
+                const polytomy = this._zeroLengthPolytomyForTip(node);
+                if (!polytomy) return;
+                const key = this._annotationMembershipKey(polytomy.memberIds);
+                if (key && !components.has(key)) components.set(key, new Set(polytomy.memberIds));
+            });
+            const groups = Array.from(components.values()).sort((a, b) => b.size - a.size);
+            const totalRuns = () => {
+                const order = this._tipOrderFromModel();
+                return groups.reduce((sum, group) => sum + this._selectionRunCount(order, group), 0);
+            };
+
+            let score = totalRuns();
+            let grouped = 0;
+            groups.forEach((group) => {
+                const order = this._tipOrderFromModel();
+                if (this._selectionRunCount(order, group) <= 1) return;
+                const plan = this._bestRotationsForLeafSet(root, group);
+                if (!plan || !plan.rotations.length) return;
+                plan.rotations.forEach((node) => node.children.reverse());
+                const nextScore = totalRuns();
+                if (nextScore < score && this._selectionRunCount(this._tipOrderFromModel(), group) === 1) {
+                    score = nextScore;
+                    grouped += 1;
+                } else {
+                    // Reversing the same nodes again restores the exact prior order.
+                    plan.rotations.slice().reverse().forEach((node) => node.children.reverse());
+                }
+            });
+            return grouped;
         }
 
         _draw() {
@@ -4181,6 +4373,21 @@
                     return ids;
                 }
             }
+            // A FastTree soft polytomy is still one unresolved clade to the user even though
+            // its Newick representation contains arbitrary near-zero binary edges. Honor the
+            // selection only when it is the COMPLETE zero-length component and its tips have
+            // been made adjacent, so unrelated partial/non-contiguous selections stay invalid.
+            const polytomy = this._zeroLengthPolytomyForMemberIds(Array.from(selectedLeafIds));
+            if (polytomy) {
+                const visibleOrder = this.getVisibleTipOrder();
+                const indices = visibleOrder
+                    .map((id, index) => selectedLeafIds.has(id) ? index : -1)
+                    .filter((index) => index >= 0);
+                if (indices.length === selectedLeafIds.size
+                    && indices[indices.length - 1] - indices[0] + 1 === indices.length) {
+                    return visibleOrder.slice(indices[0], indices[indices.length - 1] + 1);
+                }
+            }
             // A single selected tip is its own (one-member) clade.
             if (selectedLeafIds.size === 1) return Array.from(selectedLeafIds);
             return null;
@@ -5039,10 +5246,12 @@
                 const annotationType = this._annotationType(annotation);
                 const isClade = this._annotationIsContiguous(indices)
                     && cladeBlocks.has(blockKey);
+                const softPolytomy = this._annotationIsContiguous(indices)
+                    ? this._zeroLengthPolytomyForMemberIds(members) : null;
                 const hasIncomingBranch = incomingBranchNodes.has(blockKey);
                 // Alan 8/24/26 - Clade lines and clade highlights need only be one clade;
                 // the branch types additionally need a branch to sit on.
-                const valid = isClade
+                const valid = (isClade || Boolean(softPolytomy))
                     && (this._isCladeAnnotationType(annotationType) || hasIncomingBranch);
                 validity.set(annotation.id, { present: indices.length, valid });
                 // Invalid annotations are kept in state and flagged in the manager, but they
@@ -5060,7 +5269,8 @@
                     // Alan 8/24/26 - The node the highlight band starts at. Falls back to the
                     // incoming-branch target, which is the same node everywhere but the root.
                     cladeNode: (cladeNodes && cladeNodes.get(blockKey))
-                        || incomingBranchNodes.get(blockKey) || null,
+                        || incomingBranchNodes.get(blockKey)
+                        || softPolytomy?.anchor || null,
                     savedIndex: this.cladeAnnotations.indexOf(annotation)
                 });
             }

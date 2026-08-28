@@ -7,6 +7,7 @@ cases where the old code told the model something the files did not say.
 
 import gzip
 import json
+import logging
 import shutil
 import subprocess
 from pathlib import Path
@@ -35,6 +36,33 @@ def _gzip_in_place(path: Path) -> Path:
         shutil.copyfileobj(src, dst)
     path.unlink()
     return target
+
+
+def test_claude_429_log_preserves_the_full_provider_message(monkeypatch, caplog):
+    provider_message = (
+        "You've hit your limit · resets 11:30 pm (UTC).\n"
+        'Request id: "req_429_detail"'
+    )
+    completed = subprocess.CompletedProcess(
+        args=[],
+        returncode=1,
+        stdout=json.dumps({
+            "is_error": True,
+            "subtype": "success",
+            "api_error_status": 429,
+            "terminal_reason": "api_error",
+            "result": provider_message,
+        }),
+        stderr="",
+    )
+    monkeypatch.setattr(subprocess, "run", lambda *args, **kwargs: completed)
+
+    with caplog.at_level(logging.WARNING, logger=service.logger.name):
+        with pytest.raises(service.TreeAnalysisRateLimited):
+            service._call_claude_cli({})
+
+    expected = json.dumps(provider_message, ensure_ascii=False)
+    assert f"provider_message={expected}" in caplog.text
 
 
 # ---------------------------------------------------------------------------

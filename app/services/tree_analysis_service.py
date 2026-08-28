@@ -2392,17 +2392,28 @@ def _call_claude_cli(
     # and the user.
     if isinstance(envelope, dict) and envelope.get("is_error"):
         status = envelope.get("api_error_status")
+        result = envelope.get("result")
         # Alan 8/24/26 - A 429 is expected operation, not a defect: the branch
         # below turns it into a user-facing Retry-After and the viewer retries.
         # Logging it at ERROR put it in errors.log and in the log digest's
         # exception list, where routine quota exhaustion read as a bug.
-        logger.log(
-            logging.WARNING if status == 429 else logging.ERROR,
-            "event=claude_review.cli_error subtype=%s status=%s terminal_reason=%s",
-            envelope.get("subtype"), status, envelope.get("terminal_reason"),
-        )
         if status == 429:
-            result = envelope.get("result")
+            # Keep the complete provider text in the raw log. JSON encoding
+            # preserves embedded newlines and quotes on one physical log line,
+            # so a later review can distinguish session exhaustion, account
+            # limits, and ordinary transient throttling without losing detail.
+            logger.warning(
+                "event=claude_review.cli_error subtype=%s status=%s "
+                "terminal_reason=%s provider_message=%s",
+                envelope.get("subtype"), status, envelope.get("terminal_reason"),
+                json.dumps(result, ensure_ascii=False),
+            )
+        else:
+            logger.error(
+                "event=claude_review.cli_error subtype=%s status=%s terminal_reason=%s",
+                envelope.get("subtype"), status, envelope.get("terminal_reason"),
+            )
+        if status == 429:
             reset_match = re.search(
                 r"\bresets?\s+([0-9]{1,2}:[0-9]{2}\s*(?:am|pm)\s*\(UTC\))",
                 result if isinstance(result, str) else "",

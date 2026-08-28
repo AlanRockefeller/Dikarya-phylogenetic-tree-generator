@@ -369,11 +369,12 @@
                         </ul>
                         <p class="mt-3 leading-relaxed">
                             An annotation has to name a <strong>complete clade</strong>&mdash;every descendant of one
-                            node, with nothing left out. If the selection is a scattering of tips that do not descend
-                            from a single node, Dikarya says so rather than drawing a label that makes a claim the tree
-                            does not support. The remedy is normally to select one tip fewer or one tip more, or to
-                            right-click the branch instead. The root itself cannot be annotated with a bracket, but it
-                            can be highlighted.
+                            node, with nothing left out. A complete soft polytomy also counts as one clade: Dikarya
+                            treats FastTree's effectively zero-length binary branches as unresolved and automatically
+                            places the tips together. If the selection is a scattering of tips, or only part of a
+                            polytomy, Dikarya says so rather than drawing a misleading label. The remedy is normally to
+                            select one tip fewer or one tip more, or to right-click the branch instead. The root itself
+                            cannot be annotated with a bracket, but it can be highlighted.
                         </p>
                         <p class="mt-2 leading-relaxed">
                             Labels take up to 500 characters over 10 lines, and line breaks are preserved in both the

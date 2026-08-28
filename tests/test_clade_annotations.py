@@ -1145,28 +1145,40 @@ const viewer = Object.create(sandbox.window.DikaryaTreeViewer.prototype);
 
 
 _RENDER_HARNESS_JS = _HARNESS_PRELUDE_JS + r"""
-// Build a node tree from a nested array spec: a string is a leaf, an array is
-// an internal node. Same shape the viewer walks when it indexes clade blocks.
+// Build a node tree from a nested array spec, or an object carrying a branch
+// length for soft-polytomy cases. Same shape the viewer walks in production.
 const allNodes = [];
 function build(spec, parent) {
-    const node = { parent: parent || null, children: [] };
-    if (typeof spec === 'string') {
-        node.id = spec;
+    const objectSpec = spec && !Array.isArray(spec) && typeof spec === 'object';
+    const node = {
+        parent: parent || null,
+        children: [],
+        data: { attribute: objectSpec ? spec.length : null }
+    };
+    const childrenSpec = Array.isArray(spec) ? spec : (objectSpec ? spec.children : null);
+    if (typeof spec === 'string' || (objectSpec && !childrenSpec)) {
+        node.id = typeof spec === 'string' ? spec : spec.id;
         node.__leafCount = 1;
     } else {
-        node.children = spec.map((child) => build(child, node));
+        node.children = childrenSpec.map((child) => build(child, node));
         node.__leafCount = node.children.reduce((sum, child) => sum + child.__leafCount, 0);
     }
     allNodes.push(node);
     return node;
 }
-build(input.tree, null);
+const root = build(input.tree, null);
 
 const positions = new Map();
 input.tipOrder.forEach((id, index) => positions.set(id, { y: index * 10, index }));
 """ + _HARNESS_VIEWER_JS + r"""
 viewer.allNodes = allNodes;
 viewer._getNodeId = (node) => node.id || null;
+viewer.tree = {
+    traverse_and_compute(fn) {
+        const walk = (node) => { fn(node); node.children.forEach(walk); };
+        walk(root);
+    }
+};
 viewer.annotationLayers = input.layers;
 viewer.cladeAnnotations = input.annotations;
 // Persistent colour groups, exactly as the viewer stores them.
@@ -1202,6 +1214,12 @@ if (input.tipLabelGap !== undefined && input.tipLabelGap !== null) {
         start: viewer._tipLabelDx({ text_align: 'start' }, 2),
         end: viewer._tipLabelDx({ text_align: 'end' }, 2)
     };
+}
+
+let groupedTipOrder = null;
+if (input.autoGroup) {
+    viewer._groupZeroLengthPolytomies();
+    groupedTipOrder = viewer._tipOrderFromModel();
 }
 
 const { cladeBlocks, branchNodes, cladeNodes } =
@@ -1369,6 +1387,7 @@ process.stdout.write(JSON.stringify({
     incomingBranchResult,
     incomingBranchDescendantWalks,
     tipLabelOffsets
+    ,groupedTipOrder
 }));
 """
 
@@ -1396,7 +1415,7 @@ class _RenderHarnessMixin:
                  incoming_branch_members=None, tip_label_gap=None,
                  selection_sets=None, selection_set_colors=None,
                  active_selection_set=None, dark=False, reserve_slot_for=None,
-                 draft_preview=None):
+                 draft_preview=None, auto_group=False):
         layers = layers if layers is not None else [_layer()]
         with tempfile.TemporaryDirectory() as tmp:
             harness = Path(tmp) / "resolve_annotations.js"
@@ -1417,6 +1436,7 @@ class _RenderHarnessMixin:
                 "dark": dark,
                 "reserveSlotFor": reserve_slot_for,
                 "draftPreview": draft_preview,
+                "autoGroup": auto_group,
             })
             result = subprocess.run(
                 ["node", str(harness), str(self.VIEWER_JS)],
@@ -1510,6 +1530,70 @@ class AnnotationRenderDecisionTests(_RenderHarnessMixin, unittest.TestCase):
         out = self._resolve([], selected_ids=["A", "B"])
         self.assertEqual(set(out["selectedClade"]), {"A", "B"})
         self.assertTrue(out["selectedHasIncomingBranch"])
+
+    def test_complete_zero_length_polytomy_resolves_as_one_clade(self):
+        # X hangs from the arbitrary binary resolution on a positive branch. A, B and C
+        # are the complete zero-length connected component and are adjacent on screen.
+        tree = {
+            "children": [
+                {"id": "X", "length": 0.01},
+                {"children": [
+                    {"id": "A", "length": 6e-9},
+                    {"children": [
+                        {"id": "B", "length": 6e-9},
+                        {"id": "C", "length": 1.2e-8},
+                    ], "length": 6e-9},
+                ], "length": 6e-9},
+            ]
+        }
+        out = self._resolve(
+            [_annotation("soft", members=["A", "B", "C"])],
+            tree=tree, tip_order=["X", "A", "B", "C"],
+            selected_ids=["A", "B", "C"],
+        )
+        self.assertEqual(out["selectedClade"], ["A", "B", "C"])
+        self.assertTrue(out["validity"]["soft"]["valid"])
+        self.assertEqual(out["drawn"], ["soft"])
+
+    def test_partial_zero_length_polytomy_is_not_a_clade(self):
+        tree = {
+            "children": [
+                {"id": "X", "length": 0.01},
+                {"children": [
+                    {"id": "A", "length": 6e-9},
+                    {"children": [
+                        {"id": "B", "length": 6e-9},
+                        {"id": "C", "length": 6e-9},
+                    ], "length": 6e-9},
+                ], "length": 6e-9},
+            ]
+        }
+        out = self._resolve(
+            [], tree=tree, tip_order=["X", "A", "B", "C"],
+            selected_ids=["A", "B"],
+        )
+        self.assertIsNone(out["selectedClade"])
+
+    def test_zero_length_polytomy_tips_are_grouped_automatically(self):
+        tree = {
+            "children": [
+                {"children": [
+                    {"id": "A", "length": 6e-9},
+                    {"id": "X", "length": 0.01},
+                ], "length": 6e-9},
+                {"children": [
+                    {"id": "B", "length": 6e-9},
+                    {"id": "C", "length": 6e-9},
+                ], "length": 6e-9},
+            ]
+        }
+        out = self._resolve(
+            [], tree=tree, tip_order=["A", "X", "B", "C"], auto_group=True,
+        )
+        order = out["groupedTipOrder"]
+        selected_indices = sorted(order.index(name) for name in ("A", "B", "C"))
+        self.assertEqual(selected_indices[-1] - selected_indices[0] + 1, 3)
+
 
     def test_whole_tree_branch_check_skips_all_descendant_walks(self):
         out = self._resolve([], incoming_branch_members=["A", "B", "C", "D"])
