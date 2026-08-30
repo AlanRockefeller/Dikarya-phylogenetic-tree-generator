@@ -198,6 +198,14 @@ def sequence_entry():
     return render_template('sequence_entry.html')
 
 
+@bp.route('/inat.finder.py')
+@bp.route('/inat.finder')
+@bp.route('/finder')
+def inat_finder():
+    """Browser-based version of Alan Rockefeller's iNat Finder utility."""
+    return render_template('inat_finder.html')
+
+
 @bp.route('/help')
 def help_page():
     return render_template('help.html')
@@ -230,6 +238,7 @@ SITEMAP_ENDPOINTS = (
     ('journal.contact', 'monthly', '0.5'),
     ('journal.support', 'monthly', '0.5'),
     ('main.sequence_entry', 'weekly', '0.9'),
+    ('main.inat_finder', 'monthly', '0.7'),
     ('main.help_page', 'monthly', '0.7'),
     ('main.whats_new', 'weekly', '0.7'),
     ('main.voucher_labels', 'monthly', '0.5'),

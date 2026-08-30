@@ -1684,7 +1684,7 @@
         // is a real field separator in these headers.
         const escaped = needle.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
         return new RegExp(
-            `(?<![\\p{L}\\p{N}])${escaped}(?![\\p{L}\\p{N}])`, 'u'
+            `(?:^|[^\\p{L}\\p{N}])${escaped}(?![\\p{L}\\p{N}])`, 'u'
         ).test(haystack);
     }
 

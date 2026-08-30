@@ -170,7 +170,7 @@ persisted — a reload shows the whole tree again.
 restoring a file snapshot taken immediately before them. Those operations write
 exactly three files:
 
-```
+```text
 tree_state.json
 tree/tree_pruned.newick
 tree/tree_pruned.nexus

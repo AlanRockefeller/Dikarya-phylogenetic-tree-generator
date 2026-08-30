@@ -1,6 +1,356 @@
 #tree-container {
     overflow: auto;
     position: relative;
+    overscroll-behavior: contain;
+}
+
+.tree-mobile-only {
+    display: none;
+}
+
+/* The mobile viewer is keyed to an actual coarse pointer, not viewport width.
+   A narrow desktop window therefore keeps the established mouse toolbar and gestures. */
+@media (pointer: coarse) {
+    #tree-desktop-controls {
+        display: none;
+    }
+
+    body.mobile-show-desktop-controls #tree-desktop-controls {
+        display: block;
+    }
+
+    #tree-viewer-panel {
+        padding: 0.35rem;
+        border-radius: 0.65rem;
+    }
+
+    #tree-viewer-panel #tree-notices {
+        margin: 0.35rem 0.35rem 0.6rem;
+    }
+
+    .tree-mobile-only {
+        display: flex;
+    }
+
+    #tree-mobile-toolbar {
+        position: sticky;
+        top: 0;
+        z-index: 35;
+        display: grid;
+        grid-template-columns: repeat(7, minmax(0, 1fr));
+        gap: 0.25rem;
+        padding: 0.35rem;
+        background: rgba(255, 255, 255, 0.96);
+        border: 1px solid #e5e7eb;
+        border-radius: 0.6rem;
+        box-shadow: 0 2px 8px rgba(0, 0, 0, 0.12);
+    }
+
+    .dark #tree-mobile-toolbar {
+        color: #f3f4f6;
+        background: rgba(17, 24, 39, 0.97);
+        border-color: #374151;
+    }
+
+    .tree-mobile-tool {
+        min-width: 0;
+        min-height: 46px;
+        padding: 0.25rem 0.1rem;
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        justify-content: center;
+        gap: 0.15rem;
+        border-radius: 0.45rem;
+        color: #374151;
+        font-size: 0.68rem;
+        font-weight: 700;
+        line-height: 1;
+    }
+
+    .dark .tree-mobile-tool {
+        color: #e5e7eb;
+    }
+
+    .tree-mobile-tool:active,
+    .tree-mobile-tool[aria-pressed="true"] {
+        color: #1f2937;
+        background: #c9a962;
+    }
+
+    .tree-mobile-tool:disabled {
+        opacity: 0.35;
+    }
+
+    .tree-mobile-undo:disabled {
+        display: none;
+    }
+
+    .tree-mobile-mode-status {
+        align-items: center;
+        justify-content: center;
+        min-height: 30px;
+        margin: 0.3rem 0;
+        padding: 0.25rem 0.6rem;
+        color: #4b5563;
+        background: #f3f4f6;
+        border-radius: 0.45rem;
+        font-size: 0.75rem;
+        font-weight: 600;
+        text-align: center;
+    }
+
+    .dark .tree-mobile-mode-status {
+        color: #d1d5db;
+        background: #1f2937;
+    }
+
+    #tree-viewer-panel.mobile-select-mode .tree-mobile-mode-status {
+        color: #1f2937;
+        background: #c9a962;
+    }
+
+    #tree-container {
+        width: 100%;
+        min-height: 76dvh !important;
+        height: 76dvh;
+        padding: 0 !important;
+        border-radius: 0.35rem;
+        touch-action: none;
+    }
+
+    #tree-container svg {
+        /* Keep the fixed-step tree's gesture viewport at least as large as its live container.
+           Intrinsically larger trees still scroll, while expanded/oriented views use new space. */
+        min-width: 100%;
+        min-height: 100%;
+        touch-action: none;
+    }
+
+    body.tree-expanded {
+        overflow: hidden;
+        overscroll-behavior: none;
+    }
+
+    body.tree-mobile-sheet-open {
+        overflow: hidden;
+    }
+
+    body.tree-expanded #tree-viewer-panel {
+        position: fixed;
+        inset: 0;
+        z-index: 990;
+        width: 100vw;
+        height: 100dvh;
+        max-width: none;
+        margin: 0;
+        padding: 0.25rem;
+        border-radius: 0;
+        display: flex;
+        flex-direction: column;
+        overflow: hidden;
+        background: #fff;
+    }
+
+    /* Expanded mode sits above the page chrome, but top-level dialogs must still
+       cover it when an action opens one without first collapsing the viewer. */
+    body.tree-expanded main > [role="dialog"][aria-modal="true"] {
+        z-index: 1000;
+    }
+
+    .dark body.tree-expanded #tree-viewer-panel {
+        background: #000;
+    }
+
+    body.tree-expanded #tree-viewer-panel #tree-notices {
+        display: none;
+    }
+
+    body.tree-expanded #tree-container {
+        flex: 1 1 auto;
+        height: auto;
+        min-height: 0 !important;
+    }
+
+    body.tree-expanded #btn-mobile-expand i::before {
+        content: "\f066";
+    }
+
+    .tree-mobile-sheet {
+        position: fixed;
+        inset: 0;
+        z-index: 1100;
+        align-items: flex-end;
+        visibility: hidden;
+        pointer-events: none;
+    }
+
+    .tree-mobile-sheet[aria-hidden="true"] {
+        display: none;
+    }
+
+    .tree-mobile-sheet[aria-hidden="false"] {
+        visibility: visible;
+        pointer-events: auto;
+    }
+
+    .tree-mobile-sheet-backdrop {
+        position: absolute;
+        inset: 0;
+        width: 100%;
+        height: 100%;
+        border: 0;
+        background: rgba(0, 0, 0, 0.55);
+    }
+
+    .tree-mobile-sheet-panel {
+        position: relative;
+        z-index: 1;
+        width: 100%;
+        max-height: min(82dvh, 760px);
+        overflow: hidden;
+        color: #1f2937;
+        background: #fff;
+        border-radius: 1rem 1rem 0 0;
+        box-shadow: 0 -8px 30px rgba(0, 0, 0, 0.25);
+    }
+
+    .dark .tree-mobile-sheet-panel {
+        color: #f3f4f6;
+        background: #111827;
+    }
+
+    .tree-mobile-sheet-header {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        min-height: 54px;
+        padding: 0.55rem 0.9rem;
+        border-bottom: 1px solid #e5e7eb;
+    }
+
+    .dark .tree-mobile-sheet-header {
+        border-color: #374151;
+    }
+
+    .tree-mobile-sheet-header h3,
+    .tree-mobile-sheet-content h4 {
+        margin: 0;
+        font-weight: 700;
+    }
+
+    .tree-mobile-sheet-close,
+    .tree-mobile-setting-row button {
+        min-width: 44px;
+        min-height: 44px;
+        border-radius: 0.5rem;
+    }
+
+    .tree-mobile-sheet-content {
+        display: block;
+        max-height: calc(min(82dvh, 760px) - 54px);
+        padding: 0.8rem;
+        overflow-y: auto;
+        overscroll-behavior: contain;
+    }
+
+    .tree-mobile-sheet-content section + section {
+        margin-top: 1rem;
+        padding-top: 0.8rem;
+        border-top: 1px solid #e5e7eb;
+    }
+
+    .dark .tree-mobile-sheet-content section + section {
+        border-color: #374151;
+    }
+
+    .tree-mobile-action-grid {
+        display: grid;
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+        gap: 0.5rem;
+        margin-top: 0.55rem;
+    }
+
+    .tree-mobile-action-grid button,
+    .tree-mobile-all-controls {
+        min-height: 46px;
+        padding: 0.55rem;
+        border: 1px solid #d1d5db;
+        border-radius: 0.55rem;
+        font-size: 0.82rem;
+        font-weight: 600;
+    }
+
+    .dark .tree-mobile-action-grid button,
+    .dark .tree-mobile-all-controls {
+        border-color: #4b5563;
+        background: #1f2937;
+    }
+
+    .tree-mobile-action-grid button:disabled {
+        opacity: 0.4;
+    }
+
+    .tree-mobile-setting-row {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        min-height: 48px;
+        border-bottom: 1px solid #f3f4f6;
+        font-size: 0.88rem;
+    }
+
+    .dark .tree-mobile-setting-row {
+        border-color: #374151;
+    }
+
+    .tree-mobile-setting-row button {
+        margin-left: 0.3rem;
+        border: 1px solid #d1d5db;
+    }
+
+    .dark .tree-mobile-setting-row button {
+        border-color: #4b5563;
+    }
+
+    .tree-mobile-sheet-content p {
+        margin-top: 0.45rem;
+        color: #4b5563;
+        font-size: 0.83rem;
+        line-height: 1.35;
+    }
+
+    .dark .tree-mobile-sheet-content p {
+        color: #d1d5db;
+    }
+
+    .tree-mobile-all-controls {
+        width: 100%;
+        margin-top: 1rem;
+        color: #1f2937;
+        background: #c9a962;
+    }
+
+    body.tree-mobile-node-menu-open .phylotree-context-menu {
+        position: fixed !important;
+        left: 0.5rem !important;
+        right: 0.5rem !important;
+        top: auto !important;
+        bottom: max(0.5rem, env(safe-area-inset-bottom)) !important;
+        width: auto;
+        max-height: 72dvh;
+        overflow-y: auto;
+        padding: 0.45rem 0;
+        border-radius: 0.8rem;
+        z-index: 1200;
+        box-shadow: 0 0 0 100vmax rgba(0, 0, 0, 0.48), 0 -6px 24px rgba(0, 0, 0, 0.25);
+    }
+
+    body.tree-mobile-node-menu-open .phylotree-menu-item {
+        min-height: 46px;
+        padding: 0.75rem 1rem;
+        white-space: normal;
+    }
 }
 
 .node circle {

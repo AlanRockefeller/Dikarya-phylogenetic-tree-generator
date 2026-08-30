@@ -72,7 +72,8 @@ def _tip_labels(job_dir: Path, state: dict):
     # Backstop for tips in neither place (an older state, a partial structure).
     original_newick = job_dir / "tree" / "tree_original.newick"
     if original_newick.is_file():
-        for match in re.findall(r"'([^']+)'", original_newick.read_text()):
+        for match in re.findall(
+                r"'([^']+)'", original_newick.read_text(encoding="utf-8")):
             add(match)
     return labels
 
@@ -84,7 +85,7 @@ def plan_renames(job_dir: Path, state: dict):
         resolve_place_labels,
     )
 
-    info = json.loads((job_dir / "input_info.json").read_text())
+    info = json.loads((job_dir / "input_info.json").read_text(encoding="utf-8"))
     metadata = {}
     for record in info.get("sequence_metadata") or []:
         header = str(record.get("fasta_header") or record.get("name") or "").strip()
@@ -172,21 +173,30 @@ def main():
 
     with tree_state_lock(job_dir):
         state = load_tree_state(job_dir)
-        renames, skipped = plan_renames(job_dir, state)
+    renames, skipped = plan_renames(job_dir, state)
 
-        for label, reason in skipped:
-            print(f"  skip  {label}\n        ({reason})")
-        if not renames:
-            print("Nothing to relabel.")
-            return
-        pairs = [validate_tip_rename(old, new) for old, new in renames.items()]
-        for old, new in pairs:
-            print(f"  {old}\n    -> {new}")
-        print(f"\n{len(pairs)} tip(s) to relabel"
-              f"{'' if args.apply else ' (dry run -- pass --apply to write)'}")
-        if not args.apply:
-            return
+    for label, reason in skipped:
+        print(f"  skip  {label}\n        ({reason})")
+    if not renames:
+        print("Nothing to relabel.")
+        return
+    pairs = [validate_tip_rename(old, new) for old, new in renames.items()]
+    for old, new in pairs:
+        print(f"  {old}\n    -> {new}")
+    print(f"\n{len(pairs)} tip(s) to relabel"
+          f"{'' if args.apply else ' (dry run -- pass --apply to write)'}")
+    if not args.apply:
+        return
 
+    with tree_state_lock(job_dir):
+        state = load_tree_state(job_dir)
+        unchanged_labels = set(_tip_labels(job_dir, state)) - set(renames)
+        collisions = sorted(set(renames.values()) & unchanged_labels)
+        if collisions:
+            raise SystemExit(
+                "Refusing to apply: these new labels would collide -- "
+                + ", ".join(collisions)
+            )
         from app.services.tree_edit_service import rename_tip
         label = f"rename of {len(pairs)} sequences"
         with undo_checkpoint(job_dir, "rename", label) as checkpoint:

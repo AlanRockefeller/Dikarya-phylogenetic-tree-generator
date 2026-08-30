@@ -12118,6 +12118,9 @@
       this.svg = null;
       this._selectionCallback = null;
       this._eventListeners = {};
+      // Alan 8/28/26 - Retain D3's one authoritative camera behavior so toolbar zoom
+      // can use the same state as touch pinch and the next gesture cannot jump.
+      this.zoom_behavior = null;
       this.scales = [1, 1];
       this.size = [1, 1];
       this.fixed_width = [14, 30];
@@ -12580,24 +12583,28 @@
               if (event.button !== 2) return false;
               return !(event.target && event.target.closest && event.target.closest(".node, .internal-node"));
             }
+            // Alan 8/28/26 - Dikarya mobile Select mode owns touch taps and background box
+            // selection; Navigate mode must continue through D3 for camera pan and pinch zoom.
+            if (event.type.indexOf("touch") === 0
+                && event.target && event.target.closest
+                && event.target.closest("#tree-container.mobile-select-mode")) return false;
             return !event.ctrlKey || event.type === "wheel";
           })
           .on("zoom", (event) => {
 
-            select("." + css_classes["tree-container"]).attr("transform", d => {
-              let toTransform = event.transform;
-              return toTransform;
-            });
+            select("." + css_classes["tree-container"]).attr("transform", event.transform);
 
-            // Give some extra room
-            select("." + css_classes["tree-scale-bar"]).attr("transform", d => {
-              let toTransform = event.transform;
-              toTransform.y -= 10; 
-              return toTransform;
-            });
+            // Alan 8/28/26 - The D3 transform above is authoritative camera state. The old
+            // scale-bar callback aliased event.transform and subtracted from y in place, so
+            // every pan/pinch/button event accumulated a phantom offset in D3 itself.
+            const scaleBarTransform = `translate(${event.transform.x},${event.transform.y - 10}) scale(${event.transform.k})`;
+            select("." + css_classes["tree-scale-bar"]).attr("transform", scaleBarTransform);
             
           });
 
+        // Alan 8/28/26 - Expose this exact behavior to supported programmatic camera controls;
+        // creating or simulating a second zoom path would desynchronize D3's __zoom state.
+        this.zoom_behavior = zoom$1;
         this.svg.call(zoom$1);
       }
 
@@ -13421,6 +13428,22 @@
 
     handle_node_click(node, event) {
       this.nodeDropdownMenu(node, this.container, this, this.options, event);
+    }
+
+    // Alan 8/28/26 - Scale through D3's supported API around the visible viewport centre, sharing
+    // the transform used by touch pinch, touch pan, and subsequent desktop camera gestures.
+    zoom_by(factor) {
+      if (!this.svg || !this.zoom_behavior || !Number.isFinite(factor) || factor <= 0) return false;
+      const svgNode = this.svg.node();
+      if (!svgNode) return false;
+      const svgRect = svgNode.getBoundingClientRect();
+      const viewportRect = document.querySelector(this.container)?.getBoundingClientRect() || svgRect;
+      const point = [
+        viewportRect.left + viewportRect.width / 2 - svgRect.left,
+        viewportRect.top + viewportRect.height / 2 - svgRect.top
+      ];
+      this.svg.call(this.zoom_behavior.scaleBy, factor, point);
+      return true;
     }
 
     refresh() {

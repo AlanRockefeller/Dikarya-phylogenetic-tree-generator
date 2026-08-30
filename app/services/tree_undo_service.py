@@ -275,14 +275,29 @@ def undo_checkpoint(job_dir: Path, operation: str, label: str):
         return
 
     manifest["label"] = handle.label
+    active = _undo_dir(job_dir)
+    backup: Optional[Path] = None
     try:
         with open(staging / MANIFEST_NAME, "w") as f:
             json.dump(manifest, f)
-        clear_undo_checkpoint(job_dir)
-        os.replace(staging, _undo_dir(job_dir))
+        if active.exists():
+            backup = job_dir / f"{PENDING_PREFIX}backup.{time.time_ns()}"
+            os.replace(active, backup)
+        os.replace(staging, active)
     except OSError as exc:
         logger.warning("Could not activate the undo checkpoint: %s", exc)
         shutil.rmtree(staging, ignore_errors=True)
+        if backup is not None and backup.exists():
+            try:
+                os.replace(backup, active)
+            except OSError as rollback_exc:
+                logger.error(
+                    "Could not restore the previous undo checkpoint: %s",
+                    rollback_exc,
+                )
+    else:
+        if backup is not None:
+            shutil.rmtree(backup, ignore_errors=True)
 
 
 class UndoUnavailable(RuntimeError):
@@ -312,6 +327,52 @@ def _restore_file(source: Path, destination: Path) -> None:
     # because artifact_storage resolves the compressed form when the plain one
     # is missing and the plain one wins only while it exists.
     discard_gzipped_form(destination)
+
+
+def _restore_snapshot(job_dir: Path, checkpoint: Path,
+                      present: List[str], absent: List[str]) -> None:
+    """Restore all snapshot paths, rolling every changed path back on failure."""
+    rollback = Path(tempfile.mkdtemp(dir=str(job_dir), prefix=PENDING_PREFIX + "restore."))
+    paths = list(dict.fromkeys(present + absent))
+    previously_present = set()
+    changed: List[str] = []
+    try:
+        # Capture every destination before changing any of them. This makes a
+        # failure during staging harmless and gives the restore loop a complete
+        # rollback set before its first replacement.
+        for relative in paths:
+            destination = job_dir / relative
+            if destination.is_file():
+                shutil.copy2(destination, rollback / _flat_name(relative))
+                previously_present.add(relative)
+
+        for relative in present:
+            changed.append(relative)
+            _restore_file(checkpoint / _flat_name(relative), job_dir / relative)
+
+        for relative in absent:
+            changed.append(relative)
+            target = job_dir / relative
+            if target.is_file():
+                target.unlink()
+    except BaseException:
+        rollback_failed = False
+        for relative in reversed(changed):
+            destination = job_dir / relative
+            try:
+                if relative in previously_present:
+                    os.replace(rollback / _flat_name(relative), destination)
+                elif destination.is_file():
+                    destination.unlink()
+            except OSError as rollback_exc:
+                rollback_failed = True
+                logger.error("Could not roll back %s after undo failed: %s",
+                             relative, rollback_exc)
+        if not rollback_failed:
+            shutil.rmtree(rollback, ignore_errors=True)
+        raise
+    else:
+        shutil.rmtree(rollback, ignore_errors=True)
 
 
 def undo_last_edit(job_dir: Path) -> Dict[str, Any]:
@@ -349,16 +410,7 @@ def undo_last_edit(job_dir: Path) -> Dict[str, Any]:
             clear_undo_checkpoint(job_dir)
             raise UndoUnavailable("The saved undo point is incomplete.")
 
-    for relative in present:
-        _restore_file(checkpoint / _flat_name(relative), job_dir / relative)
-
-    for relative in absent:
-        target = job_dir / relative
-        try:
-            if target.is_file():
-                target.unlink()
-        except OSError as exc:
-            logger.warning("Could not remove %s during undo: %s", relative, exc)
+    _restore_snapshot(job_dir, checkpoint, present, absent)
 
     result = {
         "operation": manifest.get("operation") or "edit",

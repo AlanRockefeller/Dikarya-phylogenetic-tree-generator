@@ -54,6 +54,15 @@ document.addEventListener('DOMContentLoaded', async () => {
     const btnClaudeReviewClose = getEl('btn-claude-review-close');
     const btnClaudeReviewDone = getEl('btn-claude-review-done');
     const btnClaudeReviewRefresh = getEl('btn-claude-review-refresh');
+    // Alan 8/28/26 - Cache the mobile viewer controls so their visual, ARIA, and body state stay synchronized.
+    const treeViewerPanel = getEl('tree-viewer-panel');
+    const btnMobileSelect = getEl('btn-mobile-select');
+    const btnMobileMore = getEl('btn-mobile-more');
+    const mobileMore = getEl('tree-mobile-more');
+    const btnMobileExpand = getEl('btn-mobile-expand');
+    const btnMobileUndo = getEl('btn-mobile-undo');
+    const btnMobileNodeActions = getEl('btn-mobile-node-actions');
+    const mobileModeStatus = getEl('tree-mobile-mode-status');
 
     // --- HELPER: STATUS MESSAGE ---
     let currentStatusType = null;
@@ -135,15 +144,17 @@ document.addEventListener('DOMContentLoaded', async () => {
     }
 
     function updateUndoButton() {
-        if (!btnUndo) return;
         const target = currentUndoTarget();
         const disabled = !target || isProcessing;
-        btnUndo.disabled = disabled;
-        btnUndo.classList.toggle('opacity-50', disabled);
-        btnUndo.classList.toggle('cursor-not-allowed', disabled);
-        btnUndo.title = target
-            ? `Undo ${target.label} (Ctrl/Cmd+Z)`
-            : "Nothing to undo yet (Ctrl/Cmd+Z)";
+        // Alan 8/28/26 - Mirror the established Undo state onto the coarse-pointer toolbar button.
+        const title = target ? `Undo ${target.label} (Ctrl/Cmd+Z)` : "Nothing to undo yet (Ctrl/Cmd+Z)";
+        [btnUndo, btnMobileUndo].forEach((button) => {
+            if (!button) return;
+            button.disabled = disabled;
+            button.classList.toggle('opacity-50', disabled);
+            button.classList.toggle('cursor-not-allowed', disabled);
+            button.title = title;
+        });
     }
 
     // Ask the server whether a persisted checkpoint is available. Cheap, and
@@ -2715,9 +2726,97 @@ document.addEventListener('DOMContentLoaded', async () => {
     }
 
     // --- 3. UI EVENT WIRING (SINGLETON) ---
+    // Alan 8/28/26 - Keep coarse-pointer interaction mode, sheets, expansion, and cleanup in one state boundary.
+    function setMobileInteractionMode(mode) {
+        const next = viewer?.setMobileInteractionMode(mode) || (mode === 'select' ? 'select' : 'navigate');
+        const selecting = next === 'select';
+        treeViewerPanel?.classList.toggle('mobile-select-mode', selecting);
+        btnMobileSelect?.setAttribute('aria-pressed', selecting ? 'true' : 'false');
+        if (btnMobileSelect) {
+            btnMobileSelect.querySelector('span').textContent = selecting ? 'Done' : 'Select';
+            btnMobileSelect.title = selecting ? 'Done selecting; return to Navigate mode' : 'Enter Select mode';
+        }
+        if (mobileModeStatus) {
+            mobileModeStatus.textContent = selecting
+                ? 'Select mode: tap tips or drag empty background to box-select'
+                : 'Navigate mode: drag to pan, pinch to zoom';
+        }
+    }
+
+    function setMobileMoreOpen(open) {
+        if (!mobileMore || !btnMobileMore) return;
+        mobileMore.setAttribute('aria-hidden', open ? 'false' : 'true');
+        mobileMore.classList.toggle('hidden', !open);
+        btnMobileMore.setAttribute('aria-expanded', open ? 'true' : 'false');
+        document.body.classList.toggle('tree-mobile-sheet-open', open);
+    }
+
+    function setExpandedTree(open) {
+        setMobileMoreOpen(false);
+        document.body.classList.toggle('tree-expanded', open);
+        btnMobileExpand?.setAttribute('aria-pressed', open ? 'true' : 'false');
+        if (btnMobileExpand) {
+            btnMobileExpand.querySelector('span').textContent = open ? 'Exit' : 'Expand';
+            btnMobileExpand.title = open ? 'Exit expanded tree view' : 'Expand tree';
+        }
+    }
+
+    function cleanupMobileViewerUI() {
+        setMobileMoreOpen(false);
+        setExpandedTree(false);
+        setMobileInteractionMode('navigate');
+        viewer?.closeMobileNodeActions();
+        document.body.classList.remove('tree-mobile-node-menu-open', 'mobile-show-desktop-controls');
+        const allControlsButton = getEl('btn-mobile-all-controls');
+        if (allControlsButton) allControlsButton.textContent = 'Show all advanced controls';
+    }
+
+    function wireMobileUI() {
+        document.querySelectorAll('[data-mobile-trigger]').forEach((proxy) => {
+            proxy.addEventListener('click', () => {
+                const target = getEl(proxy.dataset.mobileTrigger);
+                if (!target || target.disabled) return;
+                setMobileMoreOpen(false);
+                target.click();
+            });
+        });
+        btnMobileSelect?.addEventListener('click', () => {
+            setMobileInteractionMode(viewer?.mobileInteractionMode === 'select' ? 'navigate' : 'select');
+        });
+        btnMobileMore?.addEventListener('click', () => {
+            setMobileMoreOpen(btnMobileMore.getAttribute('aria-expanded') !== 'true');
+        });
+        getEl('btn-mobile-more-close')?.addEventListener('click', () => setMobileMoreOpen(false));
+        getEl('tree-mobile-more-backdrop')?.addEventListener('click', () => setMobileMoreOpen(false));
+        btnMobileExpand?.addEventListener('click', () => setExpandedTree(!document.body.classList.contains('tree-expanded')));
+        btnMobileNodeActions?.addEventListener('click', () => {
+            setMobileMoreOpen(false);
+            if (!viewer?.openMobileNodeActions()) {
+                showStatus('Select a tip or node first.', 'info', 1800);
+            }
+        });
+        container?.addEventListener('dikarya:mobile-target-change', (event) => {
+            if (btnMobileNodeActions) btnMobileNodeActions.disabled = !event.detail?.available;
+        });
+        getEl('btn-mobile-all-controls')?.addEventListener('click', () => {
+            const show = !document.body.classList.contains('mobile-show-desktop-controls');
+            document.body.classList.toggle('mobile-show-desktop-controls', show);
+            setMobileMoreOpen(false);
+            if (show) setExpandedTree(false);
+            const button = getEl('btn-mobile-all-controls');
+            if (button) button.textContent = show ? 'Hide all advanced controls' : 'Show all advanced controls';
+            if (show) getEl('tree-desktop-controls')?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+        });
+        window.addEventListener('pagehide', cleanupMobileViewerUI);
+        setMobileInteractionMode('navigate');
+    }
+
     function wireUI() {
         if (uiWired) return;
         uiWired = true;
+
+        // Alan 8/28/26 - Wire the mobile controls once alongside the existing singleton desktop controls.
+        wireMobileUI();
 
         // Alan 5/11/26 - Wire rename modal controls for current clicked selections.
         btnRenameModalSave?.addEventListener('click', submitRenameModal);
@@ -3647,6 +3746,22 @@ document.addEventListener('DOMContentLoaded', async () => {
             }
         });
 
+        // PNG Save
+        getEl('btn-save-png')?.addEventListener('click', async (e) => {
+            e.preventDefault();
+            if (!viewer) { showStatus("Tree not loaded yet.", "warning", 2000); return; }
+            showStatus("Preparing PNG download\u2026", "info");
+            try {
+                await viewer.exportPNG();
+                showStatus("PNG downloaded.", "success", 2500);
+            } catch (err) {
+                console.error("PNG export error:", err);
+                window.reportClientError?.('tree_viewer.export_png', err);
+                const msg = err instanceof Error ? err.message : String(err);
+                showStatus("PNG export failed: " + msg, "danger", 5000);
+            }
+        });
+
         // Tree Edit Actions (Backend)
         wireBackendActions();
     }
@@ -3655,15 +3770,10 @@ document.addEventListener('DOMContentLoaded', async () => {
     // wired to the zoom buttons ~800 lines above this point. The body uses no `this`,
     // so the arrow form bought nothing.
     function triggerZoom(delta) {
-        const svg = container?.querySelector('svg');
-        if (!svg) return;
-        const rect = svg.getBoundingClientRect();
-        const cx = rect.left + rect.width / 2;
-        const cy = rect.top + rect.height / 2;
-        svg.dispatchEvent(new WheelEvent('wheel', {
-            clientX: cx, clientY: cy, deltaY: delta,
-            bubbles: true, cancelable: true, view: window
-        }));
+        // Alan 8/28/26 - Use the same D3 camera behavior as pinch instead of synthesizing a
+        // wheel event; reciprocal factors make one + followed by one - restore the scale.
+        const factor = delta < 0 ? 1.25 : 1 / 1.25;
+        viewer?.zoomCamera(factor);
     }
 
     function wireBackendActions() {
@@ -3886,6 +3996,17 @@ document.addEventListener('DOMContentLoaded', async () => {
         );
 
         document.addEventListener('keydown', (e) => {
+            // Alan 8/28/26 - Escape dismisses the topmost mobile surface and restores its ARIA/body state.
+            if (e.key === 'Escape' && document.body.classList.contains('tree-mobile-node-menu-open')) {
+                viewer?.closeMobileNodeActions();
+                btnMobileMore?.focus();
+                return;
+            }
+            if (e.key === 'Escape' && mobileMore?.getAttribute('aria-hidden') === 'false') {
+                setMobileMoreOpen(false);
+                btnMobileMore?.focus();
+                return;
+            }
             // Alan 7/20/26 - Close keyboard help before handling viewer modes or other Escape behavior.
             if (e.key === 'Escape' && shortcutHelpModal && !shortcutHelpModal.classList.contains('hidden')) {
                 closeShortcutHelp();
@@ -3921,6 +4042,14 @@ document.addEventListener('DOMContentLoaded', async () => {
             // Alan 5/11/26 - Escape closes the rename modal before handling reroot cancellation.
             if (e.key === "Escape" && renameModal && !renameModal.classList.contains('hidden')) {
                 closeRenameModal();
+                return;
+            }
+            // Dialogs are above expanded mode, so Escape belongs to the visible dialog first.
+            // Unknown dialogs (such as Alignment Viewer) own their own Escape listener.
+            if (e.key === 'Escape' && anyModalOpen()) return;
+            if (e.key === 'Escape' && document.body.classList.contains('tree-expanded')) {
+                setExpandedTree(false);
+                btnMobileExpand?.focus();
                 return;
             }
             if (e.key === "Escape" && rerootMode) {

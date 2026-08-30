@@ -509,6 +509,40 @@ def test_pipeline_quality_recognizes_iqtree_dual_support_labels(caplog):
     assert "tree_without_support_values" not in caplog.text
 
 
+def test_pipeline_quality_explains_duplicate_zero_length_terminals(caplog):
+    from app.workers.tasks import _summarize_tree_quality
+
+    tree = Phylo.read(
+        StringIO("((A:0,B:0,C:0,D:0):0.2,E:0.1);"),
+        "newick",
+    )
+    with caplog.at_level(logging.INFO):
+        summary = _summarize_tree_quality(
+            tree,
+            LOGGER,
+            duplicate_alignment_names={"A", "B", "C", "D"},
+        )
+
+    assert summary["duplicate_aligned_records"] == 4
+    assert summary["zero_length_terminal_branches"] == 4
+    assert "tree.zero_length_branches_explained" in caplog.text
+    assert "DEGRADED tree_many_zero_length_branches" not in caplog.text
+
+
+def test_pipeline_quality_keeps_unexplained_zero_lengths_degraded(caplog):
+    from app.workers.tasks import _summarize_tree_quality
+
+    tree = Phylo.read(StringIO("((A:0,B:0,C:0,D:0):0,E:0.1);"), "newick")
+    with caplog.at_level(logging.WARNING):
+        _summarize_tree_quality(
+            tree,
+            LOGGER,
+            duplicate_alignment_names={"A", "B", "C", "D"},
+        )
+
+    assert "DEGRADED tree_many_zero_length_branches" in caplog.text
+
+
 @pytest.mark.parametrize(
     ("requested_model", "moose_enabled"),
     [("NOT_A_MODEL", False), ("", True)],

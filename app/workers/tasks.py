@@ -199,11 +199,29 @@ def validate_pipeline_outputs(job_dir, job_params, logger_obj=logger,
             failures.append(f"missing_or_empty:{path.relative_to(job_dir)}")
 
     fasta_counts = {}
+    duplicate_alignment_names = None
     for path in required[:3]:
         if artifact_exists(path) and artifact_size(path):
             try:
                 with open_artifact(path, "rt") as handle:
-                    fasta_counts[path.name] = sum(1 for _ in SeqIO.parse(handle, "fasta"))
+                    if path == required[2]:
+                        seen_sequences = {}
+                        duplicate_alignment_names = set()
+                        count = 0
+                        for record in SeqIO.parse(handle, "fasta"):
+                            count += 1
+                            sequence = str(record.seq).upper()
+                            name = (record.description or record.id or "").strip()
+                            if sequence in seen_sequences:
+                                duplicate_alignment_names.add(seen_sequences[sequence])
+                                duplicate_alignment_names.add(name)
+                            else:
+                                seen_sequences[sequence] = name
+                        fasta_counts[path.name] = count
+                    else:
+                        fasta_counts[path.name] = sum(
+                            1 for _ in SeqIO.parse(handle, "fasta")
+                        )
                 if fasta_counts[path.name] == 0:
                     failures.append(f"unparseable_fasta:{path.name}")
             except Exception as exc:
@@ -219,6 +237,7 @@ def validate_pipeline_outputs(job_dir, job_params, logger_obj=logger,
             tree_quality = _summarize_tree_quality(
                 tree, logger_obj,
                 support_expected=_support_expected(job_params),
+                duplicate_alignment_names=duplicate_alignment_names,
             )
         except Exception as exc:
             failures.append(f"unparseable_newick:{type(exc).__name__}")
@@ -355,8 +374,12 @@ def _support_expected(job_params) -> Optional[bool]:
     return None
 
 
-def _summarize_tree_quality(tree, logger_obj,
-                            support_expected: Optional[bool] = None) -> dict:
+def _summarize_tree_quality(
+    tree,
+    logger_obj,
+    support_expected: Optional[bool] = None,
+    duplicate_alignment_names: Optional[set[str]] = None,
+) -> dict:
     """Report the tree-shaped failure modes this pipeline actually produces.
 
     The invariant check counted records and confirmed the Newick parsed, which
@@ -369,6 +392,8 @@ def _summarize_tree_quality(tree, logger_obj,
 
     branch_lengths = []
     zero_branches = 0
+    zero_terminal_names = []
+    zero_internal_branches = 0
     supported = 0
     internal = 0
     max_children = 0
@@ -378,6 +403,10 @@ def _summarize_tree_quality(tree, logger_obj,
             branch_lengths.append(clade.branch_length)
             if clade.branch_length == 0:
                 zero_branches += 1
+                if clade.is_terminal():
+                    zero_terminal_names.append(clade.name)
+                else:
+                    zero_internal_branches += 1
         if clade.clades:
             internal += 1
             max_children = max(max_children, len(clade.clades))
@@ -398,17 +427,45 @@ def _summarize_tree_quality(tree, logger_obj,
         "terminals": terminals,
         "internal_nodes": internal,
         "zero_length_branches": zero_branches,
+        "zero_length_terminal_branches": len(zero_terminal_names),
+        "duplicate_aligned_records": (
+            len(duplicate_alignment_names)
+            if duplicate_alignment_names is not None else None
+        ),
         "branches_with_length": len(branch_lengths),
         "internal_nodes_with_support": supported,
         "max_polytomy": max_children,
     }
 
     if branch_lengths and zero_branches / len(branch_lengths) > 0.25:
-        log_degradation(
-            logger_obj, "tree_many_zero_length_branches",
-            "More than a quarter of branches have length exactly zero",
-            zero_branches=zero_branches, total=len(branch_lengths),
+        duplicates_explain_zeros = (
+            duplicate_alignment_names is not None
+            and zero_internal_branches == 0
+            and None not in zero_terminal_names
+            and set(zero_terminal_names) == duplicate_alignment_names
+            and len(zero_terminal_names) == len(duplicate_alignment_names)
         )
+        if duplicates_explain_zeros:
+            logger_obj.info(
+                "event=tree.zero_length_branches_explained "
+                "Zero-length terminal branches are fully explained by identical "
+                "aligned sequences duplicate_records=%s total_branches=%s",
+                len(duplicate_alignment_names), len(branch_lengths),
+            )
+        else:
+            log_degradation(
+                logger_obj, "tree_many_zero_length_branches",
+                "More than a quarter of branches have length exactly zero and "
+                "the final alignment does not fully explain them as duplicates",
+                zero_branches=zero_branches,
+                zero_terminal_branches=len(zero_terminal_names),
+                zero_internal_branches=zero_internal_branches,
+                duplicate_aligned_records=(
+                    len(duplicate_alignment_names)
+                    if duplicate_alignment_names is not None else "unknown"
+                ),
+                total=len(branch_lengths),
+            )
     # "no support values where the method should have produced them" -- NJ never
     # would, and _strip_generated_inner_labels() now clears the InnerN names that
     # used to make this look satisfied, so without the method check every single

@@ -62,6 +62,11 @@ SCANNER_EXACT_PATHS = frozenset({
     # out the real 4xx entries. Dikarya's own auth lives at /auth/login.
     "/signup", "/register", "/dashboard", "/admin", "/account",
     "/auth/callback", "/api/auth/signin", "/login.html", "/sftp-config.json",
+    # Generic fetch/proxy/config endpoints from a burst scanner that rotated
+    # dozens of fake crawler user agents. Dikarya has never exposed these exact
+    # routes; real downloads and previews live under scoped resource paths.
+    "/fetch", "/proxy", "/api/proxy", "/api/v1/fetch", "/api/download",
+    "/api/image", "/api/preview", "/api/v2/settings", "/api/v2/config",
 })
 # Scanner probes hide the extension behind a version digit -- /randkeyword.PhP7,
 # /zup.php73, /baxa1.phP8 all arrived in one sweep and were filed as

@@ -993,6 +993,62 @@ def test_digest_classifies_query_suffixed_and_credential_probing_paths_as_noise(
     assert result["server_errors"] == {}
 
 
+def test_digest_classifies_generic_fetch_proxy_sweep_as_scanner_noise(tmp_path):
+    digest = _digest_module()
+    digest.LOG_DIR = tmp_path
+    timestamp = datetime.now().strftime("%d/%b/%Y:%H:%M:%S +0000")
+    probes = [
+        "/fetch", "/proxy", "/api/proxy", "/api/v1/fetch", "/api/download",
+        "/api/image", "/api/preview", "/api/v2/settings", "/api/v2/config",
+    ]
+    (tmp_path / "access.log").write_text("".join(
+        f'9.9.9.9 - - [{timestamp}] "GET {path} HTTP/1.0" 404 10 "-" '
+        f'"Mozilla/5.0" 900 req=r\n'
+        for path in probes
+    ))
+
+    result = digest.analyze_access(datetime.now() - timedelta(hours=1))
+
+    assert sum(result["noise_4xx"].values()) == len(probes)
+    assert result["product_4xx"] == {}
+
+
+def test_missing_route_burst_is_throttled_without_limiting_known_routes(
+    tmp_path, monkeypatch
+):
+    import app as app_module
+
+    class FakeRedis:
+        def __init__(self):
+            self.values = {}
+
+        def get(self, key):
+            return self.values.get(key)
+
+        def incr(self, key):
+            self.values[key] = self.values.get(key, 0) + 1
+            return self.values[key]
+
+        def expire(self, key, seconds):
+            return True
+
+    fake_redis = FakeRedis()
+    monkeypatch.setattr(app_module, "_scanner_404_redis", lambda: fake_redis)
+    app = _make_app(tmp_path)
+    app.config["RATELIMIT_ENABLED"] = True
+    client = app.test_client()
+
+    for index in range(app_module.SCANNER_404_LIMIT):
+        assert client.get(f"/definitely-missing-{index}").status_code == 404
+
+    throttled = client.get("/one-probe-too-many")
+    assert throttled.status_code == 429
+    assert throttled.headers["Retry-After"] == str(
+        app_module.SCANNER_404_WINDOW_SECONDS
+    )
+    assert client.get("/health").status_code == 200
+
+
 def test_digest_window_selects_only_overlapping_rotations(tmp_path):
     digest = _digest_module()
     digest.LOG_DIR = tmp_path

@@ -155,6 +155,30 @@ class CheckpointLifecycleTests(unittest.TestCase):
                 "an abandoned capture left staging behind",
             )
 
+    def test_failed_checkpoint_publication_restores_the_previous_checkpoint(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            job_dir = _make_job(Path(tmp))
+            with undo_checkpoint(job_dir, "prune", "previous checkpoint") as checkpoint:
+                checkpoint.commit()
+
+            real_replace = os.replace
+
+            def fail_new_publication(source, destination):
+                if (Path(source).name.startswith(".tree_undo.pending.")
+                        and "backup." not in Path(source).name
+                        and Path(destination).name == UNDO_DIR_NAME):
+                    raise OSError("simulated publication failure")
+                return real_replace(source, destination)
+
+            with patch("app.services.tree_undo_service.os.replace",
+                       side_effect=fail_new_publication):
+                with undo_checkpoint(job_dir, "rename", "new checkpoint") as checkpoint:
+                    checkpoint.commit()
+
+            self.assertEqual(
+                describe_undo_checkpoint(job_dir)["label"], "previous checkpoint"
+            )
+
     def test_an_uncommitted_edit_does_not_replace_a_valid_checkpoint(self):
         # A handler can decide the edit was a no-op and simply never commit.
         with tempfile.TemporaryDirectory() as tmp:
@@ -273,6 +297,39 @@ class CheckpointLifecycleTests(unittest.TestCase):
             # Refused AND cleared, so the button stops offering a restore that
             # can never complete.
             self.assertEqual(describe_undo_checkpoint(job_dir), {"available": False})
+
+    def test_failed_restore_rolls_back_every_destination(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            job_dir = _make_job(Path(tmp))
+            with undo_checkpoint(job_dir, "prune", "prune") as checkpoint:
+                checkpoint.commit()
+
+            destinations = [job_dir / relative for relative in SNAPSHOT_PATHS]
+            edited = {}
+            for index, destination in enumerate(destinations):
+                content = f"edited-{index}".encode("utf-8")
+                destination.write_bytes(content)
+                edited[destination] = content
+
+            from app.services import tree_undo_service
+            real_restore = tree_undo_service._restore_file
+            calls = 0
+
+            def fail_second_restore(source, destination):
+                nonlocal calls
+                calls += 1
+                if calls == 2:
+                    raise OSError("simulated restore failure")
+                return real_restore(source, destination)
+
+            with patch("app.services.tree_undo_service._restore_file",
+                       side_effect=fail_second_restore):
+                with self.assertRaises(OSError):
+                    undo_last_edit(job_dir)
+
+            for destination, content in edited.items():
+                self.assertEqual(destination.read_bytes(), content)
+            self.assertTrue(describe_undo_checkpoint(job_dir)["available"])
 
     def test_staging_left_by_an_interrupted_capture_is_swept_up(self):
         with tempfile.TemporaryDirectory() as tmp:

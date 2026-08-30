@@ -4,7 +4,7 @@
 {% block subtitle %}Tree Viewer{% endblock %}
 
 {% block head %}
-<link rel="stylesheet" href="{{ url_for('static', filename='css/tree_viewer.css') }}?v=10">
+<link rel="stylesheet" href="{{ url_for('static', filename='css/tree_viewer.css') }}?v=11">
 <link rel="stylesheet" href="{{ url_for('static', filename='css/phylotree.css') }}?v=2">
 <link rel="stylesheet" href="{{ url_for('static', filename='css/phylotree-menus.css') }}?v=3">
 <link rel="preconnect" href="https://fonts.googleapis.com">
@@ -66,7 +66,7 @@
 </div>
 
 <!-- Controls Panel -->
-<div class="bg-white dark:bg-journal-green rounded-xl shadow-lg p-4 mb-6 transition-colors">
+<div id="tree-desktop-controls" class="bg-white dark:bg-journal-green rounded-xl shadow-lg p-4 mb-6 transition-colors">
     <!-- Main Toolbar -->
     <div class="space-y-4">
         <!-- Row 1: Primary Controls (Layout, Zoom, Display) -->
@@ -631,6 +631,10 @@
                 class="text-journal-gold hover:text-journal-gold-light transition-colors flex items-center gap-1">
                 <i class="fas fa-image text-xs"></i> Download JPG
             </a>
+            <a id="btn-save-png" href="#"
+                class="text-journal-gold hover:text-journal-gold-light transition-colors flex items-center gap-1">
+                <i class="fas fa-image text-xs"></i> Download PNG
+            </a>
         </div>
     </div>
 
@@ -1027,7 +1031,7 @@
 {% endif %}
 
 <!-- Tree Container -->
-<div class="bg-white dark:bg-journal-green rounded-xl shadow-lg p-6 transition-colors">
+<div id="tree-viewer-panel" class="bg-white dark:bg-journal-green rounded-xl shadow-lg p-6 transition-colors">
     {# Persistent notices. The rooting line was previously only a sticky toast, which
        vanished on the next action; the duplicate line points at the table further down. #}
     {% set dup_filters = (job_details.get('import_filter_details') or {}).get('duplicates') %}
@@ -1055,10 +1059,79 @@
         </div>
         {% endif %}
     </div>
+    <div id="tree-mobile-toolbar" class="tree-mobile-only" aria-label="Tree navigation controls">
+        <button type="button" class="tree-mobile-tool" data-mobile-trigger="btn-fit" aria-label="Fit tree">
+            <i class="fa fa-compress-arrows-alt"></i><span>Fit</span>
+        </button>
+        <button type="button" class="tree-mobile-tool" data-mobile-trigger="btn-zoom-out" aria-label="Zoom out">
+            <i class="fa fa-minus"></i><span>Out</span>
+        </button>
+        <button type="button" class="tree-mobile-tool" data-mobile-trigger="btn-zoom-in" aria-label="Zoom in">
+            <i class="fa fa-plus"></i><span>In</span>
+        </button>
+        <button type="button" id="btn-mobile-select" class="tree-mobile-tool tree-mobile-mode" aria-pressed="false">
+            <i class="fa fa-hand-pointer"></i><span>Select</span>
+        </button>
+        <button type="button" id="btn-mobile-more" class="tree-mobile-tool" aria-expanded="false" aria-controls="tree-mobile-more">
+            <i class="fa fa-ellipsis-h"></i><span>More</span>
+        </button>
+        <button type="button" id="btn-mobile-expand" class="tree-mobile-tool" aria-pressed="false">
+            <i class="fa fa-expand"></i><span>Expand</span>
+        </button>
+        <button type="button" id="btn-mobile-undo" class="tree-mobile-tool tree-mobile-undo" data-mobile-trigger="btn-undo" disabled>
+            <i class="fa fa-rotate-left"></i><span>Undo</span>
+        </button>
+    </div>
+    <div id="tree-mobile-mode-status" class="tree-mobile-only tree-mobile-mode-status" role="status">
+        Navigate mode: drag to pan, pinch to zoom
+    </div>
     <div id="tree-container" class="bg-white dark:bg-black rounded-lg p-4" style="min-height: 600px;">
         <div class="text-center text-gray-400 dark:text-gray-500 mt-20">
             <i class="fas fa-spinner fa-spin text-3xl mb-3"></i>
             <p>Loading tree...</p>
+        </div>
+    </div>
+</div>
+
+<div id="tree-mobile-more" class="tree-mobile-only tree-mobile-sheet hidden" aria-hidden="true">
+    <button type="button" id="tree-mobile-more-backdrop" class="tree-mobile-sheet-backdrop" aria-label="Close tree controls"></button>
+    <div class="tree-mobile-sheet-panel" role="dialog" aria-modal="true" aria-labelledby="tree-mobile-more-title">
+        <div class="tree-mobile-sheet-header">
+            <h3 id="tree-mobile-more-title">Tree controls</h3>
+            <button type="button" id="btn-mobile-more-close" class="tree-mobile-sheet-close" aria-label="Close tree controls"><i class="fa fa-times"></i></button>
+        </div>
+        <div class="tree-mobile-sheet-content">
+            <section>
+                <h4>Selection actions</h4>
+                <div class="tree-mobile-action-grid">
+                    <button type="button" id="btn-mobile-node-actions" disabled><i class="fa fa-ellipsis-v"></i> Node actions</button>
+                    <button type="button" data-mobile-trigger="btn-rename"><i class="fa fa-edit"></i> Rename</button>
+                    <button type="button" data-mobile-trigger="btn-prune"><i class="fa fa-cut"></i> Prune</button>
+                    <button type="button" data-mobile-trigger="btn-deselect"><i class="fa fa-mouse-pointer"></i> Deselect</button>
+                    <button type="button" data-mobile-trigger="btn-annotations"><i class="fa fa-tags"></i> Annotations</button>
+                    <button type="button" data-mobile-trigger="btn-alignment-viewer"><i class="fa fa-stream"></i> Alignment</button>
+                </div>
+            </section>
+            <section>
+                <h4>Tree layout</h4>
+                <div class="tree-mobile-setting-row"><span>Horizontal spacing</span><span><button type="button" data-mobile-trigger="btn-spacing-x-dec" aria-label="Decrease horizontal spacing"><i class="fa fa-minus"></i></button><button type="button" data-mobile-trigger="btn-spacing-x-inc" aria-label="Increase horizontal spacing"><i class="fa fa-plus"></i></button></span></div>
+                <div class="tree-mobile-setting-row"><span>Vertical spacing</span><span><button type="button" data-mobile-trigger="btn-spacing-y-dec" aria-label="Decrease vertical spacing"><i class="fa fa-minus"></i></button><button type="button" data-mobile-trigger="btn-spacing-y-inc" aria-label="Increase vertical spacing"><i class="fa fa-plus"></i></button></span></div>
+                <div class="tree-mobile-setting-row"><span>Tip label gap</span><span><button type="button" data-mobile-trigger="btn-tip-label-gap-dec" aria-label="Decrease tip label gap"><i class="fa fa-minus"></i></button><button type="button" data-mobile-trigger="btn-tip-label-gap-inc" aria-label="Increase tip label gap"><i class="fa fa-plus"></i></button></span></div>
+                <div class="tree-mobile-action-grid mt-3">
+                    <button type="button" data-mobile-trigger="btn-layout-linear">Linear</button>
+                    <button type="button" data-mobile-trigger="btn-layout-radial">Radial</button>
+                    <button type="button" data-mobile-trigger="btn-align-tips">Align tips</button>
+                    <button type="button" data-mobile-trigger="btn-ladderize">Sort</button>
+                    <button type="button" data-mobile-trigger="btn-toggle-support">Node support</button>
+                    <button type="button" data-mobile-trigger="btn-midpoint">Midpoint root</button>
+                </div>
+            </section>
+            <section>
+                <h4>Touch controls</h4>
+                <p><strong>Navigate:</strong> drag to pan; pinch to zoom. Camera gestures never change tree spacing.</p>
+                <p><strong>Select:</strong> tap a tip to toggle it; drag empty tree background to box-select. Tap Node actions for the existing Rename, Prune, Copy, Collapse/Expand, Rotate, annotation, and related actions available for that target.</p>
+            </section>
+            <button type="button" id="btn-mobile-all-controls" class="tree-mobile-all-controls">Show all advanced controls</button>
         </div>
     </div>
 </div>
@@ -1401,13 +1474,13 @@
 
 <script src="{{ url_for('static', filename='vendor/underscore-1.13.6-min.js') }}"></script>
 
-<script src="{{ url_for('static', filename='js/phylotree.js') }}?v=10"></script>
+<script src="{{ url_for('static', filename='js/phylotree.js') }}?v=12"></script>
 
-<script src="{{ url_for('static', filename='js/tree_viewer_phylotree_v2.js') }}?v=78"></script>
+<script src="{{ url_for('static', filename='js/tree_viewer_phylotree_v2.js') }}?v=81"></script>
 
 <script src="{{ url_for('static', filename='js/tree_viewer_api.js') }}?v=8"></script>
 
-<script src="{{ url_for('static', filename='js/tree_viewer_controller.js') }}?v=73"></script>
+<script src="{{ url_for('static', filename='js/tree_viewer_controller.js') }}?v=76"></script>
 
 {% include 'partials/alignment_viewer_modal.html' %}
 

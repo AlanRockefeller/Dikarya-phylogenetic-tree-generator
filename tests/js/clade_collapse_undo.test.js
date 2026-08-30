@@ -256,6 +256,26 @@ function test(group, name, fn) {
     return Promise.resolve();
 }
 
+function waitFor(condition, description, timeoutMs = 2000) {
+    const deadline = Date.now() + timeoutMs;
+    return new Promise((resolve, reject) => {
+        const poll = () => {
+            try {
+                if (condition()) { resolve(); return; }
+            } catch (error) {
+                reject(error);
+                return;
+            }
+            if (Date.now() >= deadline) {
+                reject(new Error(`timed out waiting for ${description}`));
+                return;
+            }
+            setTimeout(poll, 5);
+        };
+        poll();
+    });
+}
+
 function main() {
     if (SELF_TEST_ASYNC_FAILURE) {
         test('async-accounting', 'a rejected async assertion keeps its test name', async () => {
@@ -525,18 +545,26 @@ function main() {
 function keyboardTests() {
     const JOB = '00000000-0000-0000-0000-000000000000';
     const posts = [];
+    let treeStateReads = 0;
+    let undoStateReads = 0;
     let persistedState = {
         renames: {}, pruned_taxa: [], root_mode: 'MIDPOINT', is_midpoint_rooted: true,
         selection_sets: { Stale: ['B'] }, active_selection_set: 'Stale',
         selection_set_colors: { Stale: '#ff0000' },
     };
 
-    function jsonResponse(body) {
+    function jsonResponse(body, onRead) {
         return Promise.resolve({
             ok: true,
             status: 200,
-            json: () => Promise.resolve(body),
-            text: () => Promise.resolve(JSON.stringify(body)),
+            json: () => {
+                if (onRead) onRead();
+                return Promise.resolve(body);
+            },
+            text: () => {
+                if (onRead) onRead();
+                return Promise.resolve(JSON.stringify(body));
+            },
         });
     }
 
@@ -547,7 +575,7 @@ function keyboardTests() {
             return jsonResponse({
                 status: 'success', available: true, can_undo: true,
                 operation: 'prune', label: 'prune of 18 sequences',
-            });
+            }, () => { undoStateReads += 1; });
         }
         if (url.endsWith('/tree/undo')) {
             persistedState = {
@@ -571,7 +599,7 @@ function keyboardTests() {
             return Promise.resolve({ ok: true, status: 200, text: () => Promise.resolve(NEWICK) });
         }
         if (url.includes('/tree/state')) {
-            return jsonResponse(persistedState);
+            return jsonResponse(persistedState, () => { treeStateReads += 1; });
         }
         return jsonResponse({ status: 'ok' });
     };
@@ -591,8 +619,13 @@ function keyboardTests() {
     }
     domReady.forEach((fn) => { try { fn.call(ctx, new ctx.Event('DOMContentLoaded')); } catch (e) { /* reported below */ } });
 
-    // Let the async bootstrap (tree load + undo-state fetch) settle.
-    return new Promise((resolve) => setTimeout(resolve, 60)).then(() => {
+    // Wait for the async bootstrap's tree state and undo state, rather than
+    // assuming a fixed delay is long enough on every test host.
+    return waitFor(
+        () => docListeners.some(([type]) => type === 'keydown')
+            && treeStateReads >= 1 && undoStateReads >= 1,
+        'tree viewer bootstrap'
+    ).then(() => {
         const keydowns = docListeners.filter(([t]) => t === 'keydown').map(([, fn]) => fn);
         test('keyboard', 'the controller registers a keydown handler', () => {
             assert.ok(keydowns.length > 0);
@@ -671,8 +704,15 @@ function keyboardTests() {
                 assert.strictEqual(persistedState.selection_set_colors.Restored, '#00ff00');
             });
             const before = undoPosts();
+            const stateReadsBefore = treeStateReads;
+            const undoReadsBefore = undoStateReads;
             fire({ metaKey: true, target: bodyTarget });
-            return new Promise((r2) => setTimeout(r2, 60)).then(() => {
+            return waitFor(
+                () => undoPosts() > before
+                    && treeStateReads > stateReadsBefore
+                    && undoStateReads > undoReadsBefore,
+                'Cmd+Z undo persistence'
+            ).then(() => {
                 test('keyboard', 'Cmd+Z works the same as Ctrl+Z', () => {
                     assert.ok(undoPosts() > before, 'Cmd+Z did not reach the undo endpoint');
                 });

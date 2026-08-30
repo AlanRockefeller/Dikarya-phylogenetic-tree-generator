@@ -444,8 +444,21 @@
          */
         updateSpacing(xDelta, yDelta) { }
 
+        // Alan 8/28/26 - Camera zoom is separate from figure spacing and shares D3 touch state.
+        zoomCamera(factor) { return false; }
+
         // Alan 7/17/26 - Let saved display preferences replace spacing instead of accumulating it across tree redraws.
         setSpacingState(x, y) { }
+
+        // Alan 8/28/26 - Expose the mobile mode and node-menu bridge through the common viewer contract.
+        /** Switch touch interaction between camera navigation and deliberate selection. */
+        setMobileInteractionMode(mode) { }
+
+        /** Open the existing node action menu for the most recently tapped touch target. */
+        openMobileNodeActions() { return false; }
+
+        /** Close the touch-oriented presentation of the existing node action menu. */
+        closeMobileNodeActions() { }
 
         /**
          * Set viewer options.
@@ -515,6 +528,11 @@
          * Export tree visualization as SVG.
          */
         exportSVG() { }
+
+        /**
+         * Export tree visualization as PNG.
+         */
+        exportPNG() { }
     }
 
     // Expose the base class globally for potential extension
@@ -613,6 +631,16 @@
             // Alan 8/16/26 - Track active box-drag state, modifier memory, and removable listeners in one place.
             // The old toggleable "mode" flag is gone: left-drag on empty background always draws the box.
             this.boxSelectState = { drag: null, pointerDownListener: null, contextMenuListener: null, modifierKeyDownListener: null, modifierKeyUpListener: null, modifiers: { alt: false, ctrl: false, meta: false, lastAltDownAt: 0, lastCtrlDownAt: 0, lastMetaDownAt: 0 }, suppressContextMenuUntil: 0 };
+            // Alan 8/28/26 - Touch defaults to map-like navigation; explicit Select mode owns
+            // selection gestures without feeding camera movement back into spacingState.
+            this.mobileInteractionMode = 'navigate';
+            this.mobileTouchState = {
+                pointers: new Map(), pointerDownListener: null, pointerMoveListener: null,
+                pointerUpListener: null, pointerCancelListener: null,
+                suppressClickUntil: 0, suppressClickTarget: null, lastTargetNode: null,
+                menuDismissListener: null,
+                menuActionListener: null
+            };
             // Alan 6/2/26 - Controller-supplied handler invoked by the native menu's "Rotate node" item.
             this._onRotateNode = null;
             // Alan 7/17/26 - Controller-supplied handler receives the clicked node and the exact context-menu prune targets.
@@ -685,6 +713,66 @@
         // Alan 7/16/26 - Let the controller own API-backed Mycomap refreshes from the native tip menu.
         setRefreshMycomapRecordsHandler(fn) {
             this._onRefreshMycomapRecords = typeof fn === 'function' ? fn : null;
+        }
+
+        // Alan 8/28/26 - Coordinate the wrapper touch mode and reuse phylotree's existing node action menu.
+        setMobileInteractionMode(mode) {
+            const next = mode === 'select' ? 'select' : 'navigate';
+            this.mobileInteractionMode = next;
+            this._cancelBoxSelectDrag();
+            this.mobileTouchState?.pointers?.clear();
+            this.container?.classList.toggle('mobile-select-mode', next === 'select');
+            return next;
+        }
+
+        openMobileNodeActions() {
+            const node = this.mobileTouchState?.lastTargetNode;
+            if (!node || !this.tree?.display?.handle_node_click || !this.container) return false;
+            const rect = this.container.getBoundingClientRect();
+            document.body.classList.add('tree-mobile-node-menu-open');
+            this.tree.display.handle_node_click(node, {
+                clientX: rect.left + Math.min(rect.width * 0.5, 240),
+                clientY: rect.top + Math.min(rect.height * 0.5, 240)
+            });
+            this._attachMobileMenuDismissListener();
+            return true;
+        }
+
+        closeMobileNodeActions() {
+            this._closeMobileNodeMenu();
+        }
+
+        _attachMobileMenuDismissListener() {
+            const state = this.mobileTouchState;
+            if (!state || state.menuDismissListener) return;
+            state.menuDismissListener = (event) => {
+                const menu = this.container?.querySelector('.phylotree-context-menu');
+                if (menu?.contains(event.target)) return;
+                this._closeMobileNodeMenu();
+            };
+            state.menuActionListener = (event) => {
+                const menu = this.container?.querySelector('.phylotree-context-menu');
+                if (!menu?.contains(event.target)) return;
+                // Let phylotree's action handler finish before removing the shared mobile state.
+                setTimeout(() => this._closeMobileNodeMenu(), 0);
+            };
+            setTimeout(() => document.addEventListener('pointerdown', state.menuDismissListener, true), 0);
+            document.addEventListener('click', state.menuActionListener);
+        }
+
+        _closeMobileNodeMenu() {
+            const menu = this.container?.querySelector('.phylotree-context-menu');
+            if (menu) menu.style.display = 'none';
+            document.body.classList.remove('tree-mobile-node-menu-open');
+            const state = this.mobileTouchState;
+            if (state?.menuDismissListener) {
+                document.removeEventListener('pointerdown', state.menuDismissListener, true);
+                state.menuDismissListener = null;
+            }
+            if (state?.menuActionListener) {
+                document.removeEventListener('click', state.menuActionListener);
+                state.menuActionListener = null;
+            }
         }
 
         // Alan 6/2/26 - Highlight the focal/sequence-of-interest tip directly from durable state,
@@ -1185,6 +1273,15 @@
             // Cleanup observers
             this._cleanupZoomObserver();
             this.cachedZoomNode = null; // Clear cached node on redraw
+            // Alan 8/28/26 - A node object belongs to one render, so clear the mobile action
+            // target and close its menu before replacing the topology/layout DOM.
+            if (this.mobileTouchState) {
+                this.mobileTouchState.lastTargetNode = null;
+                this.container.dispatchEvent(new CustomEvent('dikarya:mobile-target-change', {
+                    detail: { available: false }
+                }));
+            }
+            this._closeMobileNodeMenu();
             if (this.supportLabelsTimer) {
                 clearTimeout(this.supportLabelsTimer);
                 this.supportLabelsTimer = null;
@@ -1243,6 +1340,8 @@
                 this._overrideClickBehavior();
                 // Alan 5/11/26 - Attach background box-select after phylotree handlers so it can suppress pan only for box gestures.
                 this._attachBoxSelectHandlers();
+                // Alan 8/28/26 - Reattach the removable touch wrapper after phylotree replaces the SVG.
+                this._attachTouchInteractionHandlers();
                 // Alan 5/12/26 - Repaint labels immediately so selection-set colors beat base light/dark label CSS.
                 this._updateNodeStylesOnly();
 
@@ -1382,6 +1481,13 @@
 
             // Fallback: full redraw
             this._draw();
+        }
+
+        // Alan 8/28/26 - Keep +/- on phylotree's D3 behavior so buttons and pinch update the
+        // same __zoom transform; no spacing state or redraw participates in camera zoom.
+        zoomCamera(factor) {
+            const display = this.tree?.display;
+            return Boolean(display && typeof display.zoom_by === 'function' && display.zoom_by(factor));
         }
 
         // Alan 7/17/26 - Replace the relative spacing state so persisted preferences do not compound after redraws.
@@ -1763,6 +1869,27 @@
          * @returns {Promise<void>}
          */
         exportJPG(quality = 0.95) {
+            return this._exportRasterImage('image/jpeg', 'jpg', quality);
+        }
+
+        /**
+         * Export the current tree visualization as a PNG image.
+         *
+         * @returns {Promise<void>}
+         */
+        exportPNG() {
+            return this._exportRasterImage('image/png', 'png');
+        }
+
+        /**
+         * Rasterize the prepared SVG clone and download it in the requested format.
+         *
+         * @param {string} mimeType
+         * @param {string} extension
+         * @param {number|undefined} quality
+         * @returns {Promise<void>}
+         */
+        _exportRasterImage(mimeType, extension, quality) {
             return new Promise((resolve, reject) => {
                 const svg = this.container.querySelector('svg');
                 if (!svg) { reject(new Error('No SVG found in tree container.')); return; }
@@ -1800,25 +1927,25 @@
                             return;
                         }
 
-                        // Alan 7/16/26 - Clarify why JPEG export needs a white background.
-                        // Use a white background because JPEG has no alpha channel.
-                        ctx.fillStyle = '#ffffff';
-                        ctx.fillRect(0, 0, canvas.width, canvas.height);
+                        // JPEG has no alpha channel; PNG deliberately retains transparency.
+                        if (mimeType === 'image/jpeg') {
+                            ctx.fillStyle = '#ffffff';
+                            ctx.fillRect(0, 0, canvas.width, canvas.height);
+                        }
                         ctx.scale(scale, scale);
                         ctx.drawImage(img, 0, 0, width, height);
 
-                        canvas.toBlob(jpgBlob => {
-                            if (!jpgBlob) {
-                                // Alan 7/16/26 - Reword the JPEG export error without an em dash.
-                                reject(new Error('canvas.toBlob() returned null, so JPEG encoding failed.'));
+                        canvas.toBlob(imageBlob => {
+                            if (!imageBlob) {
+                                reject(new Error(`canvas.toBlob() returned null, so ${extension.toUpperCase()} encoding failed.`));
                                 return;
                             }
-                            let jpgUrl;
+                            let imageUrl;
                             try {
-                                jpgUrl = URL.createObjectURL(jpgBlob);
+                                imageUrl = URL.createObjectURL(imageBlob);
                                 const link = document.createElement('a');
-                                link.href = jpgUrl;
-                                link.download = `tree_${Date.now()}.jpg`;
+                                link.href = imageUrl;
+                                link.download = `tree_${Date.now()}.${extension}`;
                                 document.body.appendChild(link);
                                 link.click();
                                 document.body.removeChild(link);
@@ -1826,9 +1953,9 @@
                             } catch (err) {
                                 reject(err);
                             } finally {
-                                if (jpgUrl) URL.revokeObjectURL(jpgUrl);
+                                if (imageUrl) URL.revokeObjectURL(imageUrl);
                             }
-                        }, 'image/jpeg', quality);
+                        }, mimeType, quality);
 
                     } catch (err) { reject(err); }
                 };
@@ -2668,6 +2795,9 @@
         _applyTextSizingFromZoom() {
             if (!this.cachedZoomNode) return;
             const { k } = this._getSvgAndZoomGroup();
+            // Alan 8/28/26 - Coarse-pointer users expect the complete tree to zoom like one
+            // image. Desktop retains its established counter-scaled labels and annotations.
+            const visualK = window.matchMedia?.('(pointer: coarse)')?.matches ? 1 : k;
 
             // Base sizes
             let supportBase = this.options.supportBasePx;
@@ -2679,9 +2809,9 @@
             if (tIn && !isNaN(tIn.value)) tipBase = Number(tIn.value);
 
             // Limit text size to be readable
-            const tipFontSvgPx = Math.max(1, tipBase / k);
-            const supportFontSvgPx = Math.max(1, supportBase / k);
-            const haloSvgPx = Math.max(0.75, 3 / k);
+            const tipFontSvgPx = Math.max(1, tipBase / visualK);
+            const supportFontSvgPx = Math.max(1, supportBase / visualK);
+            const haloSvgPx = Math.max(0.75, 3 / visualK);
 
             const svg = window.d3v7.select(this.container).select("svg");
 
@@ -2700,10 +2830,10 @@
                     if (isTipZone) { offRoot += 8; finalSize = Math.max(6, supportBase - 1); }
                 } else if (isTipZone) { offRoot += 20; offPerp += 14; finalSize = Math.max(6, supportBase - 1); }
 
-                const sz = Math.max(1, finalSize / k);
-                const xOff = (ux * offRoot + px * offPerp) / k;
+                const sz = Math.max(1, finalSize / visualK);
+                const xOff = (ux * offRoot + px * offPerp) / visualK;
                 // Vertical adjust
-                const yOff = (uy * offRoot + py * offPerp) / k;
+                const yOff = (uy * offRoot + py * offPerp) / visualK;
 
                 window.d3v7.select(this)
                     .attr("x", xOff).attr("y", yOff)
@@ -2716,12 +2846,12 @@
             svg.selectAll("text.phylotree-node-text")
                 .style("font-size", `${tipFontSvgPx}px`)
                 // Alan 8/17/26 - Preserve phylotree's outward sign for end-aligned radial labels.
-                .attr("dx", d => this._tipLabelDx(d, k))
-                .attr("dy", 1.9 / k);
+                .attr("dx", d => this._tipLabelDx(d, visualK))
+                .attr("dy", 1.9 / visualK);
 
-            // Alan 8/15/26 - Tip labels keep a constant screen size across zoom, so the label
-            // edge the annotations sit beside moves with k. Redraw them on the same trailing
-            // debounce rather than every animation frame; trees without annotations no-op here.
+            // Alan 8/28/26 - Desktop labels keep a constant screen size; coarse-pointer labels
+            // zoom uniformly. Either way annotations follow the final label geometry on the
+            // same trailing debounce; trees without annotations no-op here.
             this._scheduleAnnotationRedraw();
         }
 
@@ -2852,13 +2982,40 @@
 
             // Define click listener (for selection)
             this._clickListener = function (event) {
+                // Alan 8/30/26 - Native node-menu items are controls, not tree selection
+                // gestures. In Navigate mode the touch click guard below must not swallow
+                // their D3 callbacks (Prune, Rename, Collapse, and so on) before they bubble
+                // to the menu item. The pointer bookkeeping has the same exemption.
+                const target = event.target;
+                if (target?.closest?.('.phylotree-context-menu')) return;
+
                 // Only intercept Left Click without modifiers (simple select)
                 const isSimpleClick = event.button === 0 && !event.shiftKey && !event.ctrlKey && !event.metaKey && !event.altKey;
 
                 if (!isSimpleClick) return; // Let phylotree handle shift+click, etc.
 
+                // Alan 8/28/26 - Touch selection is handled from pointerup after movement is measured.
+                // This blocks both navigate-mode taps and the compatibility click following a
+                // select-mode tap without changing genuine mouse clicks.
+                const touchState = self.mobileTouchState;
+                const touchGenerated = event.pointerType === 'touch'
+                    || Boolean(event.sourceCapabilities?.firesTouchEvents);
+                const suppressedTarget = touchState?.suppressClickTarget;
+                const sameSuppressedTarget = suppressedTarget && (
+                    event.target === suppressedTarget
+                    || suppressedTarget.contains?.(event.target)
+                    || event.target.contains?.(suppressedTarget)
+                );
+                const recentTouchOnSameTarget = Date.now() < (touchState?.suppressClickUntil || 0)
+                    && sameSuppressedTarget;
+                if ((touchGenerated && self.mobileInteractionMode !== 'select')
+                    || recentTouchOnSameTarget) {
+                    event.preventDefault();
+                    event.stopPropagation();
+                    return;
+                }
+
                 // Check if target is a node text or part of a node
-                const target = event.target;
                 if (target.classList.contains('phylotree-node-text') || target.tagName === 'circle') {
 
                     // Stop phylotree directly!
@@ -2937,10 +3094,113 @@
             window.addEventListener('keyup', this.boxSelectState.modifierKeyUpListener, true);
         }
 
+        // Alan 8/28/26 - Track touch pointers independently of D3. Navigate gestures pass through untouched;
+        // Select-mode node gestures are measured here so a drag can never become a tap.
+        _attachTouchInteractionHandlers() {
+            const state = this.mobileTouchState;
+            if (!this.container || !state) return;
+            if (state.pointerDownListener) this.container.removeEventListener('pointerdown', state.pointerDownListener, true);
+            if (state.pointerMoveListener) window.removeEventListener('pointermove', state.pointerMoveListener, true);
+            if (state.pointerUpListener) window.removeEventListener('pointerup', state.pointerUpListener, true);
+            if (state.pointerCancelListener) window.removeEventListener('pointercancel', state.pointerCancelListener, true);
+
+            state.pointers.clear();
+            state.pointerDownListener = (event) => this._handleTouchPointerDown(event);
+            state.pointerMoveListener = (event) => this._handleTouchPointerMove(event);
+            state.pointerUpListener = (event) => this._handleTouchPointerEnd(event, false);
+            state.pointerCancelListener = (event) => this._handleTouchPointerEnd(event, true);
+            this.container.addEventListener('pointerdown', state.pointerDownListener, true);
+            window.addEventListener('pointermove', state.pointerMoveListener, true);
+            window.addEventListener('pointerup', state.pointerUpListener, true);
+            window.addEventListener('pointercancel', state.pointerCancelListener, true);
+        }
+
+        _handleTouchPointerDown(event) {
+            if (event.pointerType !== 'touch' || !this.mobileTouchState) return;
+            // Alan 8/28/26 - The native action menu is inside the tree container, but its taps
+            // are controls, not tree gestures. Tracking them used to suppress the compatibility
+            // click before phylotree's shared Prune/Copy/Collapse callback could execute.
+            if (event.target?.closest?.('.phylotree-context-menu')) return;
+            const node = this._getContextMenuNode(event.target);
+            const pointer = {
+                pointerId: event.pointerId,
+                startX: event.clientX,
+                startY: event.clientY,
+                moved: false,
+                target: event.target,
+                node,
+                boxSelecting: Boolean(this.boxSelectState.drag?.pointerId === event.pointerId)
+            };
+            this.mobileTouchState.pointers.set(event.pointerId, pointer);
+            if (this.mobileTouchState.pointers.size > 1) {
+                this.mobileTouchState.pointers.forEach(active => { active.moved = true; });
+            }
+            // Alan 8/28/26 - Empty-background Select gestures belong to the box selector. Node
+            // gestures are owned here; phylotree's zoom filter also rejects Select-mode touch.
+            if (this.mobileInteractionMode === 'select' && node) {
+                event.preventDefault();
+                event.stopPropagation();
+                try { this.container.setPointerCapture(event.pointerId); } catch (_) { }
+            }
+        }
+
+        _handleTouchPointerMove(event) {
+            if (event.pointerType !== 'touch' || !this.mobileTouchState) return;
+            const pointer = this.mobileTouchState.pointers.get(event.pointerId);
+            if (!pointer) return;
+            if (Math.hypot(event.clientX - pointer.startX, event.clientY - pointer.startY) >= 9) {
+                pointer.moved = true;
+            }
+            if (this.mobileTouchState.pointers.size > 1) {
+                this.mobileTouchState.pointers.forEach(active => { active.moved = true; });
+            }
+            if (this.mobileInteractionMode === 'select' && pointer.node) {
+                event.preventDefault();
+                event.stopPropagation();
+            }
+        }
+
+        _handleTouchPointerEnd(event, cancelled) {
+            if (event.pointerType !== 'touch' || !this.mobileTouchState) return;
+            const state = this.mobileTouchState;
+            const pointer = state.pointers.get(event.pointerId);
+            if (!pointer) return;
+            if (Math.hypot(event.clientX - pointer.startX, event.clientY - pointer.startY) >= 9) {
+                pointer.moved = true;
+            }
+            const wasMultiTouch = state.pointers.size > 1;
+            state.pointers.delete(event.pointerId);
+            state.suppressClickUntil = Date.now() + 700;
+            state.suppressClickTarget = pointer.target;
+
+            if (!cancelled && !wasMultiTouch && !pointer.moved
+                && this.mobileInteractionMode === 'select' && pointer.node) {
+                const id = this._getNodeId(pointer.node);
+                if (id) {
+                    const nowSelected = this._toggleVisibleSelection(id);
+                    this._syncCladeSelection(pointer.node, nowSelected);
+                    state.lastTargetNode = pointer.node;
+                    this._updateNodeStylesOnly();
+                    this._updateStats();
+                    this.container.dispatchEvent(new CustomEvent('dikarya:mobile-target-change', {
+                        detail: { available: true }
+                    }));
+                }
+            }
+            if (this.mobileInteractionMode === 'select' && pointer.node) {
+                event.preventDefault();
+                event.stopPropagation();
+            }
+            try { this.container.releasePointerCapture(event.pointerId); } catch (_) { }
+        }
+
         // Alan 5/11/26 - Start box-select only from empty tree background or toolbar mode.
         _handleBoxSelectPointerDown(event) {
             // Alan 5/11/26 - Leave node right-click and normal node selection behavior untouched.
             if (!this._isBoxSelectBackgroundTarget(event.target)) return;
+            // Alan 8/28/26 - Touch navigation belongs to D3. Only explicit Select mode may claim
+            // a touch background drag for a selection rectangle.
+            if (event.pointerType === 'touch' && this.mobileInteractionMode !== 'select') return;
             // Alan 8/16/26 - Mouse buttons swapped: left-drag on empty background now draws the
             // selection box, and panning moved to the right button (see the zoom filter in phylotree.js).
             const leftDrag = event.button === 0;
@@ -3040,6 +3300,8 @@
                 overlay,
                 moveListener: null,
                 upListener: null,
+                // Alan 8/28/26 - Pointer cancellation must share the drag's idempotent cleanup path.
+                cancelListener: null,
                 keyListener: null
             };
             // Alan 5/11/26 - Store the active drag so movement, release, and Esc can coordinate.
@@ -3052,6 +3314,10 @@
             drag.moveListener = (moveEvent) => this._updateBoxSelectDrag(moveEvent);
             // Alan 5/11/26 - Finish on pointerup anywhere in the viewport.
             drag.upListener = (upEvent) => this._finishBoxSelectDrag(upEvent);
+            // Alan 8/28/26 - Abort a box selection when the browser cancels its touch pointer.
+            drag.cancelListener = (cancelEvent) => {
+                if (cancelEvent.pointerId === drag.pointerId) this._cancelBoxSelectDrag();
+            };
             // Alan 5/11/26 - Let Escape cancel a rectangle before it changes selection.
             drag.keyListener = (keyEvent) => {
                 // Alan 5/11/26 - Cancel only the active box-select drag on Escape.
@@ -3061,6 +3327,8 @@
             window.addEventListener('pointermove', drag.moveListener, true);
             // Alan 5/11/26 - Register temporary pointerup listener for cleanup and selection.
             window.addEventListener('pointerup', drag.upListener, true);
+            // Alan 8/28/26 - Listen for browser gesture cancellation for the lifetime of this drag only.
+            window.addEventListener('pointercancel', drag.cancelListener, true);
             // Alan 5/11/26 - Register temporary Escape listener for keyboard cancellation.
             window.addEventListener('keydown', drag.keyListener, true);
             // Alan 5/11/26 - Capture the pointer when possible to keep drag updates steady.
@@ -3144,6 +3412,8 @@
             if (drag.moveListener) window.removeEventListener('pointermove', drag.moveListener, true);
             // Alan 5/11/26 - Remove the temporary pointerup listener.
             if (drag.upListener) window.removeEventListener('pointerup', drag.upListener, true);
+            // Alan 8/28/26 - Remove the temporary cancel listener with the rest of the drag listeners.
+            if (drag.cancelListener) window.removeEventListener('pointercancel', drag.cancelListener, true);
             // Alan 5/11/26 - Remove the temporary Escape listener.
             if (drag.keyListener) window.removeEventListener('keydown', drag.keyListener, true);
             // Alan 5/11/26 - Release pointer capture if the browser accepted it.
@@ -5353,10 +5623,13 @@
             const { cladeBlocks, branchNodes, cladeNodes } =
                 this._buildAnnotationTopologyIndexes(positions);
 
-            // Tip labels are kept at constant screen size by _applyTextSizingFromZoom, so scale
-            // annotation text the same way and the bracket keeps its relationship to the labels.
+            // Scale annotation text with the matching desktop/mobile tip-label behavior so the
+            // bracket keeps its relationship to the labels.
             const { k } = this._getSvgAndZoomGroup();
-            const scale = 1 / (k || 1);
+            // Alan 8/28/26 - Match coarse-pointer annotations to the uniform mobile tree zoom;
+            // desktop annotations keep following desktop's constant-screen-size labels.
+            const uniformMobileZoom = window.matchMedia?.('(pointer: coarse)')?.matches;
+            const scale = uniformMobileZoom ? 1 : 1 / (k || 1);
 
             const {
                 GAP_FROM_TREE, GAP_BETWEEN_LANES, LINE_TO_TEXT_GAP,

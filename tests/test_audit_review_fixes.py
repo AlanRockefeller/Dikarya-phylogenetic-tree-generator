@@ -588,6 +588,7 @@ def _config_timeouts(env):
     import os as _os
 
     child_env = dict(_os.environ)
+    child_env["DIKARYA_ENV_FILE"] = _os.devnull
     # A stale .env or inherited value would mask what the test is setting.
     for name in _TIMEOUT_ENV_DEFAULTS:
         child_env.pop(name, None)

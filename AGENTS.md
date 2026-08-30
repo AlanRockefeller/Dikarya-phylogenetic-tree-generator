@@ -13,6 +13,11 @@ Dikarya is a Flask web application for fungal phylogenetic analysis. Users submi
 # Activate the virtual environment first
 source .venv/bin/activate
 
+# Tests: always invoke pytest through the project interpreter. Calling
+# .venv/bin/pytest directly can omit the repository root from sys.path and make
+# collection fail with "ModuleNotFoundError: No module named 'app'".
+.venv/bin/python -m pytest
+
 # Database migrations
 flask db migrate -m "description"
 flask db upgrade
