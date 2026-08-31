@@ -102,6 +102,31 @@ async function main() {
     if (matching({taxon: {id: 999, name: 'Amanita homonym', ancestor_ids: []}}, 'genus', taxonCriteria)) {
         throw new Error('The removed genus-name heuristic still matched');
     }
+    // The CLI's _taxon_id_matches() also consults the expanded `ancestors`
+    // objects. The browser used to check ancestor_ids alone, so a record that
+    // carried only `ancestors` was a false negative here and a match in the CLI.
+    if (!matching({taxon: {id: 999, ancestors: [{id: 1}, {id: 48419}]}}, 'genus', taxonCriteria)) {
+        throw new Error('An ancestors[] taxon ID did not match the way the CLI does');
+    }
+    if (matching({taxon: {id: 999, ancestors: [{id: 1}, null, {}]}}, 'genus', taxonCriteria)) {
+        throw new Error('An unrelated ancestors[] list matched');
+    }
+    // A malformed list must cost one observation at most, never the whole batch:
+    // .some() on a non-array throws out of checkBatch().
+    [
+        {taxon: {id: 999, ancestor_ids: 'not-an-array'}},
+        {taxon: {id: 999, ancestors: 'not-an-array'}},
+        {taxon: null},
+        {},
+        null,
+    ].forEach(observation => {
+        if (matching(observation, 'genus', taxonCriteria)) {
+            throw new Error('A malformed observation matched');
+        }
+    });
+    if (matching(null, 'user', {label: 'someone'})) {
+        throw new Error('A null observation matched in user mode');
+    }
 
     const criteriaCode = section('    async function resolveCriteria', '    function observationMatches');
     const lookupCalls = [];

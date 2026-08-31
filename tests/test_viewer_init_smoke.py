@@ -358,5 +358,112 @@ class HarnessFailureReportingTests(unittest.TestCase):
 
 
 
+class HarnessResultShapeTests(unittest.TestCase):
+    """Valid JSON of the wrong SHAPE is a FAIL, not a traceback either.
+
+    `json.loads()` succeeding only means the bytes parsed. The harness is a
+    separate program, so its output is untrusted input here: indexing
+    `r["name"]` / `r["ok"]` on whatever came back raised TypeError or KeyError
+    straight out of `run_served_harness()`, which escapes `report()` -- the
+    exact failure the JSONDecodeError branch above already exists to prevent,
+    reached one step later.
+    """
+
+    def _run(self, payload):
+        results = []
+        stdout = payload if isinstance(payload, str) else json.dumps(payload)
+        with patch.object(live_smoke.subprocess, "run", side_effect=(
+                lambda *a, **kw: subprocess.CompletedProcess(a[0], 0,
+                                                             stdout=stdout,
+                                                             stderr=""))):
+            live_smoke.run_served_harness(
+                results, "/usr/bin/node", Path("/nonexistent"))
+        return results
+
+    def _assert_reported_as_failed_boot(self, payload):
+        results = self._run(payload)
+        by_name = {r["name"]: r for r in results}
+        self.assertIn("served-bundle-boots", by_name)
+        self.assertFalse(by_name["served-bundle-boots"]["ok"])
+        # Nothing may be recorded as a passing served/ check from a payload we
+        # could not read: a half-consumed array must not look like coverage.
+        self.assertEqual(
+            [r["name"] for r in results if r["name"].startswith("served/")], [])
+        return by_name["served-bundle-boots"]["detail"]
+
+    def test_a_json_object_instead_of_an_array_is_a_failed_check(self):
+        detail = self._assert_reported_as_failed_boot({"name": "boots", "ok": True})
+        self.assertIn("wrong shape", detail)
+        self.assertIn("not an array", detail)
+
+    def test_an_array_containing_a_string_is_a_failed_check(self):
+        detail = self._assert_reported_as_failed_boot(
+            [{"name": "boots", "ok": True, "detail": ""}, "boots"])
+        self.assertIn("row 1", detail)
+        self.assertIn("not an object", detail)
+
+    def test_a_row_missing_name_is_a_failed_check(self):
+        detail = self._assert_reported_as_failed_boot([{"ok": True, "detail": ""}])
+        self.assertIn("name", detail)
+
+    def test_a_row_with_an_unusable_name_is_a_failed_check(self):
+        for name in (None, "", "   ", 7, ["boots"]):
+            with self.subTest(name=name):
+                detail = self._assert_reported_as_failed_boot(
+                    [{"name": name, "ok": True, "detail": ""}])
+                self.assertIn("name", detail)
+
+    def test_a_row_missing_ok_is_a_failed_check(self):
+        detail = self._assert_reported_as_failed_boot(
+            [{"name": "boots", "detail": "ran"}])
+        self.assertIn("ok", detail)
+
+    def test_a_non_boolean_ok_is_a_failed_check_rather_than_coerced(self):
+        """`check()` does bool(ok), so "false" would have recorded a PASS."""
+        for ok in ("false", 0, 1, None):
+            with self.subTest(ok=ok):
+                detail = self._assert_reported_as_failed_boot(
+                    [{"name": "boots", "ok": ok, "detail": ""}])
+                self.assertIn("ok", detail)
+
+    def test_a_missing_detail_defaults_to_empty_rather_than_raising(self):
+        """detail is explanatory only, so its absence is not a broken harness."""
+        results = self._run([{"name": "boots", "ok": True},
+                             {"name": "wires", "ok": False, "detail": None}])
+        by_name = {r["name"]: r for r in results}
+
+        self.assertNotIn("served-bundle-boots", by_name)
+        self.assertTrue(by_name["served/boots"]["ok"])
+        self.assertEqual(by_name["served/boots"]["detail"], "")
+        self.assertFalse(by_name["served/wires"]["ok"])
+        self.assertEqual(by_name["served/wires"]["detail"], "")
+
+    def test_a_non_string_detail_is_a_failed_check(self):
+        detail = self._assert_reported_as_failed_boot(
+            [{"name": "boots", "ok": False, "detail": {"stack": "..."}}])
+        self.assertIn("detail", detail)
+
+    def test_an_empty_array_is_accepted_and_records_nothing(self):
+        self.assertEqual(self._run([]), [])
+
+    def test_json_mode_still_emits_parseable_json_for_a_misshapen_payload(self):
+        """--json has to answer even when the harness output was unreadable."""
+        for payload in ({"name": "boots"}, ["boots"], [{"ok": True}],
+                        [{"name": "boots"}], "3", "null"):
+            with self.subTest(payload=payload):
+                results = self._run(payload)
+
+                buf = io.StringIO()
+                with contextlib.redirect_stdout(buf):
+                    code = live_smoke.report(
+                        results, SimpleNamespace(json=True, quiet=True))
+
+                self.assertEqual(code, 1)
+                parsed = json.loads(buf.getvalue())
+                self.assertEqual(parsed[0]["name"], "served-bundle-boots")
+                self.assertFalse(parsed[0]["ok"])
+                self.assertIsInstance(parsed[0]["detail"], str)
+
+
 if __name__ == "__main__":
     unittest.main()

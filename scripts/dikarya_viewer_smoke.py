@@ -249,9 +249,65 @@ def run_served_harness(results, node, workdir):
             f"stdout:\n{proc.stdout.strip()}\nstderr:\n{proc.stderr.strip()}",
         )
 
-    for r in rows:
-        check(results, f"served/{r['name']}", r["ok"], r["detail"])
+    rows, shape_error = _harness_rows(rows)
+    if shape_error:
+        return check(
+            results, "served-bundle-boots", False,
+            f"the harness produced JSON of the wrong shape ({shape_error}); "
+            f"expected a JSON array of "
+            f"{{\"name\": str, \"ok\": bool, \"detail\": str}} objects from "
+            f"{HARNESS.name}.\nstdout:\n{proc.stdout.strip()}",
+        )
+
+    for name, ok, detail in rows:
+        check(results, f"served/{name}", ok, detail)
     return True
+
+
+def _harness_rows(decoded):
+    """Validate the harness's decoded JSON, returning (rows, error).
+
+    The harness is a separate program, so its output is input to this one: a
+    payload that parses as JSON but is not the array of checks we expect must be
+    reported through `check()` like any other failure. Indexing it directly
+    raised TypeError/KeyError out of run_served_harness(), which escapes
+    `report()` -- so `--json` printed a traceback instead of parseable results
+    and a cron caller got a stack trace where it expected a verdict.
+
+    `detail` is optional and defaults to "" because it is purely explanatory;
+    `name` and `ok` are not, because a check with no identity or no verdict
+    cannot be reported at all.
+    """
+    if not isinstance(decoded, list):
+        return None, f"top level is {type(decoded).__name__}, not an array"
+
+    rows = []
+    for index, row in enumerate(decoded):
+        where = f"row {index}"
+        if not isinstance(row, dict):
+            return None, f"{where} is {type(row).__name__}, not an object"
+
+        name = row.get("name")
+        if not isinstance(name, str) or not name.strip():
+            return None, (f"{where} has no usable \"name\" "
+                          f"({name!r})")
+
+        if "ok" not in row:
+            return None, f"{where} ({name!r}) has no \"ok\" field"
+        ok = row["ok"]
+        if not isinstance(ok, bool):
+            return None, (f"{where} ({name!r}) has a non-boolean \"ok\" "
+                          f"({ok!r})")
+
+        detail = row.get("detail", "")
+        if detail is None:
+            detail = ""
+        if not isinstance(detail, str):
+            return None, (f"{where} ({name!r}) has a non-string \"detail\" "
+                          f"({detail!r})")
+
+        rows.append((name.strip(), ok, detail))
+    return rows, None
 
 
 def main():

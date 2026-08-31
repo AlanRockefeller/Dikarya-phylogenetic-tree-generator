@@ -296,6 +296,25 @@ The tree viewer's **Analyze with Claude** button posts to
   `summarize_alignment()` / `summarize_tree()` and only that summary is sent.
   This is what keeps the call fast and the numbers correct — do not "simplify"
   it by pasting FASTA into the prompt.
+
+  The one sanctioned exception is `build_alignment_excerpt()`: at most two
+  windows of at most `EXCERPT_MAX_COLUMNS` columns, cut around the largest
+  interior gap of the most internally gapped rows, with a few clean neighbours
+  beside them. It exists because no statistic separates a real indel from a row
+  that has slipped out of register, and the fix differs. It is bounded on
+  purpose and the prompt forbids counting anything from it — widening it into
+  "just send the whole alignment" is the change this rule is here to prevent.
+- **The review sees more than statistics now, and each extra block has a rule
+  attached.** `tree.clade_structure` is the only thing that says which tips
+  group together (strongly supported clades, outermost first, with a
+  shape-only fallback that must never be described as supported), and
+  `provenance` carries each sequence's origin from
+  `input_info.json["sequence_metadata"]` — including the `identity` of the
+  search that retrieved a reference, which is **not** a distance on this
+  alignment. Taxon labels there are unverified: the reviewer may report that
+  the labels and the tree disagree, never resolve which is right. If you change
+  what these blocks contain, change the matching section of `SYSTEM_PROMPT`
+  in the same edit.
 - **Support classification must stay in step with the viewer.**
   `_classify_support()` mirrors `window.classifySupportType()` in
   `tree_viewer_phylotree_v2.js`. Change one and you must change the other, or

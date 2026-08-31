@@ -221,21 +221,60 @@ renames, so undoing "Rename 3 sequences" would give back one of them.
 Claude** button (`POST /api/job/<id>/analysis/review`). It answers one question
 for the user: is this tree worth trusting?
 
-The design point is that **the model never sees the sequences**. Every number —
+The design point is that **the model does not see the alignment**. Every number —
 gap fraction, column occupancy, parsimony-informative count, mean pairwise
 identity, support distribution, long-branch outliers — is computed here from
 `alignment/alignment_trimmed.fasta` and the current Newick, and only that
-summary (median 27 KB, max 30 KB over a 60-job sample) goes to the API. The
+summary (median 40 KB, p95 46 KB over an 80-job sample) goes to the API. The
 summary is bounded by construction — every list in it is capped at TOP_N — so
 prompt size does not grow with alignment size. Counting is work
 code does exactly and a language model does slowly; the model is used only for
 the judgement of reading those numbers together.
 
+Three blocks beyond the raw statistics carry that judgement further, and each
+has its own section in `SYSTEM_PROMPT`; the two must be changed together.
+
+- **`tree.clade_structure` — which tips group with which.** Without it the
+  review could report that a tree was well supported but never say *what* it
+  supported, which is the question the user opened the viewer to ask. It lists
+  strongly supported clades, outermost first so none contains another, each
+  with its support, subtending branch length and up to `CLADE_TIP_LIMIT`
+  members. A group holding more than half the tree is reopened into the
+  supported clades inside it: a 2409-tip FastTree job otherwise reduced to one
+  group of 2383 tips, true and useless. Reopening costs coverage — tips in no
+  supported subclade become unplaced — so the bar is high, and `basis` reports
+  which rule produced the groups. A tree with nothing above its support
+  threshold falls back to `basis: "topology_only"`, and the prompt forbids
+  describing those groups as clades the tree establishes.
+- **`provenance` — where each sequence came from.** Read from
+  `input_info.json["sequence_metadata"]`, which already records source
+  (a user's own read, MycoMap, NCBI), accession, taxon label, locality, and for
+  retrieved records the `identity` of the search that pulled them in. Joined
+  onto every list that names a sequence, so "three tips have long terminal
+  branches" can become "the three long-branch tips are the only user-submitted
+  collections in the job". `identity` is a search statistic, **not** a distance
+  on this alignment, and taxon labels are unverified: the reviewer may report
+  that the dataset's labels and its tree disagree
+  (`taxon_labels_in_multiple_groups`, computed over determinate binomials only —
+  a `sp.`/`cf.` label in two clades means nothing), but never resolve which is
+  right. Absent metadata is reported as absent rather than guessed from names.
+- **`alignment.excerpts` — the one place residues are sent.** At most two
+  windows of at most `EXCERPT_MAX_COLUMNS` columns, cut around the largest
+  interior gap of the most internally gapped rows, with clean neighbours beside
+  them for contrast. `internal_gap_percent` can say a row has interior gaps;
+  nothing computable here says whether they fall at a plausible indel or whether
+  the row has slipped out of register against its neighbours, and the advice
+  differs. The prompt allows that one judgement and forbids counting,
+  estimating or generalising anything from the window.
+
 Three consequences follow:
 
 - **Response time is independent of alignment size.** Metric assembly is ~2 s on
-  the largest job in `var/jobs` (2400 sequences x 3300 columns); everything after
-  that is model latency. Alignments past ~12M cells switch to evenly spaced
+  the largest job in `var/jobs` (2400 sequences x 3300 columns) and a median of
+  0.08 s; everything after that is model latency. The clade digest reads tip
+  membership in one post-order pass (`_tip_names_by_clade`) rather than calling
+  `get_terminals()` per node, which on that tree would be four million
+  operations inside a request slot. Alignments past ~12M cells switch to evenly spaced
   column sampling, reported as `column_sampling_applied`.
 - **The alignment is restricted to the tips currently in the tree**, so a review
   of a pruned tree does not report statistics for sequences the user removed.

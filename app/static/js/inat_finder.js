@@ -529,12 +529,25 @@
 
     function observationMatches(observation, mode, criteria) {
         if (mode === 'project') return true;
+        const record = observation || {};
         if (mode === 'user') {
-            return String(observation.user?.login || '').toLowerCase() === criteria.label.toLowerCase();
+            return String(record.user?.login || '').toLowerCase() === criteria.label.toLowerCase();
         }
-        const taxon = observation.taxon || {};
+        const taxon = record.taxon || {};
         if (Number(taxon.id) === criteria.taxonId) return true;
-        return (taxon.ancestor_ids || []).some(id => Number(id) === criteria.taxonId);
+        // Alan 8/31/26 - The same ancestry test as _taxon_id_matches() in
+        // inat_finder.py. ancestor_ids is what /v1/observations normally carries,
+        // but a record that omits it and supplies the expanded `ancestors` objects
+        // instead used to read as "not in this genus" here while the CLI matched
+        // it -- and a false negative in this direction is a match the searcher
+        // never sees. Both lists are type-checked because .some() on a non-array
+        // throws, which would fail the whole batch rather than one observation.
+        const ancestorIds = Array.isArray(taxon.ancestor_ids) ? taxon.ancestor_ids : [];
+        if (ancestorIds.some(id => Number(id) === criteria.taxonId)) return true;
+        const ancestors = Array.isArray(taxon.ancestors) ? taxon.ancestors : [];
+        return ancestors.some(
+            ancestor => ancestor && Number(ancestor.id) === criteria.taxonId
+        );
     }
 
     async function checkBatch(ids, mode, criteria, search) {
