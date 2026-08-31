@@ -840,6 +840,22 @@ document.addEventListener('DOMContentLoaded', async () => {
         return ALL_ANNOTATION_TYPES.includes(value) ? value : 'clade_line';
     }
 
+    // Alan 8/30/26 - The type a NEW annotation opens with: the one most recently added,
+    // falling back to the newest annotation already on this tree (so the preference survives a
+    // reload) and finally to Clade highlight when the tree has none yet. The caller's
+    // structural suggestion is deliberately not consulted - repeating the last type is what
+    // makes a run of highlights or brackets one keystroke each.
+    let lastAddedAnnotationType = null;
+    function preferredNewAnnotationType() {
+        if (lastAddedAnnotationType) return canonicalAnnotationType(lastAddedAnnotationType);
+        for (let i = cladeAnnotations.length - 1; i >= 0; i--) {
+            if (cladeAnnotations[i]?.annotation_type) {
+                return canonicalAnnotationType(cladeAnnotations[i].annotation_type);
+            }
+        }
+        return 'clade_highlight';
+    }
+
     const annotationsEditable = () => !window.VIEW_ONLY;
     const annotationConfig = () => window.DikaryaCladeAnnotations || {
         FONT_FAMILIES: ['Arial'], MIN_FONT_SIZE: 6, MAX_FONT_SIZE: 72,
@@ -1561,7 +1577,7 @@ document.addEventListener('DOMContentLoaded', async () => {
         annotationEditorState.hasIncomingBranch = viewer?.hasIncomingBranchForMemberIds
             ? viewer.hasIncomingBranchForMemberIds(annotationEditorState.memberIds)
             : true;
-        annotationEditorState.defaultType = options.defaultType || 'clade_line';
+        annotationEditorState.defaultType = preferredNewAnnotationType();
 
         if (!annotationLayers.length) {
             // First use: give them a sensible layer rather than a dead-end dropdown.
@@ -1606,6 +1622,10 @@ document.addEventListener('DOMContentLoaded', async () => {
                 && !CLADE_ANNOTATION_TYPES.includes(option.value);
         });
         typeSelect.value = savedType || annotationEditorState.defaultType;
+        // Alan 8/30/26 - The remembered type may be branch-only while this membership resolves
+        // to the root, which has no incoming branch; fall back rather than opening on a
+        // disabled option the user cannot save.
+        if (typeSelect.selectedOptions[0]?.disabled) typeSelect.value = 'clade_line';
         getEl('btn-annotation-save-text').textContent = mode === 'edit' ? 'Save changes' : 'Save';
         getEl('btn-annotation-delete').classList.toggle('hidden', mode !== 'edit');
         getEl('annotation-style-details').open = false;
@@ -1688,6 +1708,8 @@ document.addEventListener('DOMContentLoaded', async () => {
             if (index >= 0) cladeAnnotations[index] = payload;
         } else {
             cladeAnnotations.push(payload);
+            // Alan 8/30/26 - Remember the type so the next Add opens on it.
+            lastAddedAnnotationType = payload.annotation_type;
         }
 
         // Alan 8/15/26 - Commit the editor transaction: any layer created in this session is
@@ -3991,8 +4013,16 @@ document.addEventListener('DOMContentLoaded', async () => {
         // annotation label box or any contenteditable exactly as the browser intends.
         const isTextEntryTarget = (target) => target instanceof HTMLElement
             && (target.isContentEditable || ['INPUT', 'TEXTAREA', 'SELECT'].includes(target.tagName));
-        const anyModalOpen = () => Boolean(
-            document.querySelector('[role="dialog"][aria-modal="true"]:not(.hidden)')
+        // Alan 8/30/26 - A dialog counts as open only if it is actually rendered. The mobile
+        // controls sheet carries role="dialog" on its inner panel while `hidden` lives on the
+        // wrapper, so a `:not(.hidden)` selector alone matched it on every page load and
+        // swallowed every viewer hotkey. getClientRects() is empty for anything display:none,
+        // whether that comes from the class, an ancestor, or the mobile-only media query.
+        const anyModalOpen = () => Array.prototype.some.call(
+            document.querySelectorAll('[role="dialog"][aria-modal="true"]'),
+            (el) => !el.classList.contains('hidden')
+                && !el.closest('.hidden')
+                && el.getClientRects().length > 0
         );
 
         document.addEventListener('keydown', (e) => {

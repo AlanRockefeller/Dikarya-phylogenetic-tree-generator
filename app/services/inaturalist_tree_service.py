@@ -897,10 +897,26 @@ DEFAULT_TREE_PARAMS = {
 }
 
 
+def _report_progress(progress, message: str, icon: str = "running") -> None:
+    """Send a human-readable step note to the caller's Activity Feed, if any.
+
+    ``icon`` is one of the feed's four states (running/done/skipped/failed).
+    Progress reporting is decoration: a broken callback must never fail the
+    MycoMap refresh it is describing.
+    """
+    if not progress:
+        return
+    try:
+        progress(message, icon=icon)
+    except Exception:  # pragma: no cover - never break a job over a feed message
+        logger.debug("progress callback failed for message: %s", message, exc_info=True)
+
+
 def _refresh_mycomap_blast_results(blast_id: str, *, rebuild_ncbi_blast: bool = False,
                                    rebuild_local_blast: bool = True,
                                    mycomap_local_limit=None,
-                                   mycomap_ncbi_limit=None) -> Dict[str, Any]:
+                                   mycomap_ncbi_limit=None,
+                                   progress=None) -> Dict[str, Any]:
     """Refresh MycoMap BLAST results before importing FASTA for a tree job.
 
     The automatic local refresh is best-effort so a missing API key or a
@@ -928,11 +944,20 @@ def _refresh_mycomap_blast_results(blast_id: str, *, rebuild_ncbi_blast: bool = 
         "warnings": [],
     }
     if rebuild_local_blast:
+        # Alan 8/31/26 - The local rerun is a synchronous MycoMap round trip that can
+        # take a while; without these the Activity Feed sits silent on the input step.
+        _report_progress(
+            progress,
+            f"Refreshing MycoMap local BLAST results (top {local_limit})...",
+        )
         try:
             result["local"] = rerun_mycomap_blast(
                 blast_id, result_type="local", limit=local_limit
             )
             result["local_status"] = "completed"
+            _report_progress(
+                progress, "MycoMap local BLAST results refreshed.", icon="done"
+            )
         except MycoMapRerunError as exc:
             warning = (
                 "MycoMap local BLAST could not be refreshed; Dikarya will use "
@@ -943,6 +968,10 @@ def _refresh_mycomap_blast_results(blast_id: str, *, rebuild_ncbi_blast: bool = 
             result["local_error"] = str(exc)
             result["warnings"].append(warning)
     if rebuild_ncbi_blast:
+        _report_progress(
+            progress,
+            f"Requesting a MycoMap NCBI BLAST rebuild (top {ncbi_limit})...",
+        )
         result["ncbi"] = rerun_mycomap_blast(blast_id, result_type="ncbi", limit=ncbi_limit)
         result["ncbi_status"] = "queued"
     return result
@@ -1947,7 +1976,8 @@ def prepare_inat_tree_job(observation_id: int, *, include_ncbi: bool = True,
                           mycomap_ncbi_limit=None,
                           defer_after_ncbi_rerun: bool = False,
                           skip_mycomap_refresh: bool = False,
-                          mycomap_rerun_details: Optional[Dict[str, Any]] = None
+                          mycomap_rerun_details: Optional[Dict[str, Any]] = None,
+                          progress=None
                           ) -> Dict[str, Any]:
     """Fetch, refresh, and import an iNaturalist observation's MycoMap input.
 
@@ -2053,6 +2083,7 @@ def prepare_inat_tree_job(observation_id: int, *, include_ncbi: bool = True,
                 rebuild_ncbi_blast=bool(rebuild_ncbi_blast),
                 mycomap_local_limit=mycomap_local_limit,
                 mycomap_ncbi_limit=mycomap_ncbi_limit,
+                progress=progress,
             )
         except MycoMapRerunError as e:
             raise InatTreeError(str(e), status=502)

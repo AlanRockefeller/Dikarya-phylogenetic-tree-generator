@@ -307,6 +307,40 @@
         font-weight: 700;
     }
 
+    #job-status-page .overview-message {
+        flex: 1 1 auto;
+        min-width: 0;
+        overflow-wrap: anywhere;
+    }
+
+    /* Clock time for each entry: present but never competing with the message. */
+    #job-status-page .overview-time {
+        flex: 0 0 auto;
+        margin-left: auto;
+        font-size: 0.6875rem;
+        line-height: 1.25rem;
+        font-variant-numeric: tabular-nums;
+        color: #9ca3af;
+    }
+
+    .dark #job-status-page .overview-time {
+        color: #6b7280;
+    }
+
+    /* "— running 4m 12s, worker active" on the step currently in progress. */
+    #job-status-page .overview-live {
+        color: #6b7280;
+        font-variant-numeric: tabular-nums;
+    }
+
+    .dark #job-status-page .overview-live {
+        color: #9ca3af;
+    }
+
+    #job-status-page .overview-icon {
+        flex: 0 0 auto;
+    }
+
     #job-status-page .overview-icon.done {
         color: #22c55e;
     }
@@ -419,6 +453,12 @@
                     <span class="step-label">BLAST</span>
                 </div>
 
+                <!-- Step: ITS Extraction (Optional) -->
+                <div id="step-its" class="flex flex-col items-center flex-1" style="display: none;">
+                    <div class="step-indicator bg-white dark:bg-journal-green">○</div>
+                    <span class="step-label">ITS</span>
+                </div>
+
                 <!-- Step: Align -->
                 <div id="step-align" class="flex flex-col items-center flex-1">
                     <div class="step-indicator bg-white dark:bg-journal-green">○</div>
@@ -523,9 +563,9 @@
                     </h3>
                     <div id="overview-feed"
                         class="space-y-3 max-h-[300px] overflow-y-auto pr-2 custom-scrollbar text-sm">
-                        <div class="overview-item flex gap-3 text-gray-600 dark:text-gray-300">
+                        <div class="overview-item overview-placeholder flex gap-3 text-gray-600 dark:text-gray-300">
                             <span class="overview-icon text-blue-500">⋯</span>
-                            <span>Waiting for job to start...</span>
+                            <span class="overview-message">Waiting for job to start...</span>
                         </div>
                     </div>
                 </div>
@@ -716,7 +756,7 @@
 {% endblock %}
 
 {% block scripts %}
-<script src="{{ url_for('static', filename='js/job_status.js') }}?v=18"></script>
+<script src="{{ url_for('static', filename='js/job_status.js') }}?v=19"></script>
 <script>
     // Downloads dropdown. The completed job's downloads are its primary output, so
     // they must be reachable with a mouse, a keyboard and a finger alike.

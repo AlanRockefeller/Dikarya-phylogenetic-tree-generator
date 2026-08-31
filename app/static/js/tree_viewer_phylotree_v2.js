@@ -5937,7 +5937,13 @@
                 || ((a.savedIndex || 0) - (b.savedIndex || 0)));
             const lanes = [];
             for (const item of ordered) {
-                const padding = Math.max(item.scaledFontSize || 0, rowPitch) * 0.6;
+                // Alan 8/30/26 - A small typographic gap, not a whole row. renderTop/renderBottom
+                // already span the label's full line height, so this is only the breathing room
+                // BETWEEN two stacked labels; at 0.6 of a row it manufactured collisions between
+                // annotations whose labels clear each other easily, and the loser was pushed into
+                // a second lane starting past the widest label in the first - which is how a
+                // single-tip highlight ended up stranded far to the right of its neighbours.
+                const padding = Math.max(item.scaledFontSize || 0, rowPitch) * 0.15;
                 const top = item.metrics.renderTop;
                 const bottom = item.metrics.renderBottom;
                 let placed = null;

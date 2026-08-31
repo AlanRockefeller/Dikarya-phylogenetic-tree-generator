@@ -673,12 +673,15 @@
                         </p>
                     </div>
                     <div>
-                        <div class="flex items-center gap-2 mb-1">
+                        <div id="inaturalist_rebuild_ncbi_option" class="flex items-center gap-2 mb-1">
                             <input type="checkbox" id="inaturalist_rebuild_ncbi"
                                    class="w-4 h-4 text-journal-gold bg-gray-100 border-gray-300 rounded focus:ring-journal-gold"
                                    title="Rebuild MycoMap NCBI BLAST and schedule this tree to resume in about 10 minutes.">
                             <label for="inaturalist_rebuild_ncbi" class="font-medium">Rebuild NCBI BLAST</label>
                         </div>
+                        <!-- Alan 8/31/26 - Label the hit count when the rebuild choice is hidden because a new Mycomap BLAST is automatic. -->
+                        <label id="inaturalist_ncbi_limit_label" for="inaturalist_ncbi_limit"
+                               class="hidden block font-medium mb-1">NCBI BLAST hits</label>
                         <input type="number" id="inaturalist_ncbi_limit" min="1" max="500" step="1" value="100"
                                class="w-full px-3 py-2 border border-gray-300 dark:border-journal-dark rounded-lg bg-white dark:bg-journal-dark text-gray-900 dark:text-gray-100 focus:ring-2 focus:ring-journal-gold focus:border-transparent">
                         <p id="inaturalist_ncbi_wait_hint" class="hidden mt-1 text-xs text-gray-500 dark:text-gray-400">
@@ -1352,6 +1355,25 @@
             </select>
             <p class="text-xs text-gray-500 dark:text-gray-400 mt-1">
                 Select a sequence to root the tree. If selected, tree will NOT be midpoint rooted.
+            </p>
+
+            <!-- Alan 8/31/26 - Let an outgroup be pulled straight from GenBank instead of
+                 requiring it to already be sitting in the queue. -->
+            <div class="mt-3 flex flex-col sm:flex-row gap-2">
+                <input type="text" id="outgroup_accession" autocomplete="off"
+                       placeholder="Or add a GenBank accession, e.g. MH937541"
+                       class="flex-1 px-4 py-2 border border-gray-300 dark:border-journal-dark rounded-lg
+                              bg-white dark:bg-journal-dark text-gray-900 dark:text-gray-100
+                              focus:ring-2 focus:ring-journal-gold focus:border-transparent transition-all">
+                <button type="button" id="outgroup_accession_btn"
+                        class="px-4 py-2 rounded-lg border border-gray-300 dark:border-journal-dark
+                               bg-gray-50 dark:bg-journal-dark text-gray-700 dark:text-gray-200
+                               hover:bg-gray-100 dark:hover:bg-gray-700 transition-all whitespace-nowrap">
+                    <i class="fas fa-plus mr-2"></i>Add as Outgroup
+                </button>
+            </div>
+            <p class="text-xs text-gray-500 dark:text-gray-400 mt-1">
+                The sequence is fetched from GenBank, added to the queue, and selected as the outgroup.
             </p>
         </div>
 
@@ -2861,6 +2883,9 @@
     // Alan 7/10/26 - Let single-observation one-click trees control the queued local MycoMap BLAST size.
     const inaturalistTreeOptions = document.getElementById('inaturalist_tree_options');
     const inaturalistRebuildNcbiCheckbox = document.getElementById('inaturalist_rebuild_ncbi');
+    // Alan 8/31/26 - Hide the rebuild choice when the tree job will run a new Mycomap BLAST regardless.
+    const inaturalistRebuildNcbiOption = document.getElementById('inaturalist_rebuild_ncbi_option');
+    const inaturalistNcbiLimitLabel = document.getElementById('inaturalist_ncbi_limit_label');
     const inaturalistLocalLimitInput = document.getElementById('inaturalist_local_limit');
     const inaturalistNcbiLimitInput = document.getElementById('inaturalist_ncbi_limit');
     const inaturalistNcbiWaitHint = document.getElementById('inaturalist_ncbi_wait_hint');
@@ -2941,6 +2966,20 @@
         return Math.max(1, Math.min(500, parsed));
     }
 
+    // Alan 8/31/26 - Keep the hit-count field labeled when the rebuild checkbox is hidden.
+    function setInaturalistRebuildNcbiVisible(visible) {
+        if (inaturalistRebuildNcbiOption) {
+            inaturalistRebuildNcbiOption.classList.toggle('hidden', !visible);
+        }
+        if (inaturalistNcbiLimitLabel) {
+            inaturalistNcbiLimitLabel.classList.toggle('hidden', visible);
+        }
+        if (!visible && inaturalistRebuildNcbiCheckbox) {
+            inaturalistRebuildNcbiCheckbox.checked = false;
+        }
+        updateInaturalistNcbiWaitHint();
+    }
+
     function updateInaturalistNcbiWaitHint() {
         if (!inaturalistNcbiWaitHint || !inaturalistRebuildNcbiCheckbox) return;
         inaturalistNcbiWaitHint.classList.toggle('hidden', !inaturalistRebuildNcbiCheckbox.checked);
@@ -3018,6 +3057,12 @@
             inaturalistRebuildNcbiCheckbox.checked = false;
             updateInaturalistNcbiWaitHint();
         }
+        // Alan 8/31/26 - A missing Mycomap BLAST is created from DNA Barcode ITS either way, so hide the rebuild choice.
+        const autoCreatesMycomapBlast = Boolean(
+            showBlastOptions && previewMatches &&
+            currentInaturalistTreePreview.will_create_mycomap_blast
+        );
+        setInaturalistRebuildNcbiVisible(!autoCreatesMycomapBlast);
         if (!show) return;
         if (hasExistingTree) {
             const replaceChosen = Boolean(
@@ -3064,6 +3109,7 @@
         // Alan 7/3/26 - Keep the MycoMap BLAST controls reset with the iNat tree action.
         if (inaturalistTreeOptions) inaturalistTreeOptions.classList.add('hidden');
         if (inaturalistRebuildNcbiCheckbox) inaturalistRebuildNcbiCheckbox.checked = false;
+        setInaturalistRebuildNcbiVisible(true);
         if (inaturalistLocalLimitInput) inaturalistLocalLimitInput.value = '50';
         if (inaturalistNcbiLimitInput) inaturalistNcbiLimitInput.value = '100';
         updateInaturalistNcbiWaitHint();
@@ -4504,6 +4550,95 @@
         selectedQueueOutgroup = this.value;
         updateQueueDisplay();
         refreshAdvancedSummary();
+    });
+
+    // Alan 8/31/26 - Fetch an outgroup straight from GenBank. The accession is added to
+    // the queue like any other sequence and then selected in the dropdown, so submission,
+    // dedup and the queue badge all behave exactly as they do for a pasted sequence.
+    async function addOutgroupFromAccession() {
+        const input = document.getElementById('outgroup_accession');
+        const btn = document.getElementById('outgroup_accession_btn');
+        if (!input || !btn || btn.disabled) return;
+
+        const raw = input.value.trim();
+        if (!raw) {
+            showStatus('Enter a GenBank accession to use as the outgroup.', 'error');
+            return;
+        }
+
+        const accessions = parseGenBankAccessions(raw);
+        if (accessions.length === 0) {
+            showStatus(`"${raw}" is not a valid GenBank accession.`, 'error');
+            return;
+        }
+        if (accessions.length > 1) {
+            showStatus('Enter a single accession - a tree can only be rooted on one outgroup.', 'error');
+            return;
+        }
+        const accession = accessions[0];
+
+        const originalHtml = btn.innerHTML;
+        btn.disabled = true;
+        btn.innerHTML = '<i class="fas fa-spinner fa-spin mr-2"></i>Fetching...';
+        showStatus(`Fetching ${accession} from GenBank...`, 'info');
+
+        try {
+            const csrfToken = document.querySelector('meta[name="csrf-token"]').getAttribute('content');
+            const resp = await fetch('/api/genbank/accessions', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                    'X-CSRFToken': csrfToken
+                },
+                body: JSON.stringify({ accessions: [accession] })
+            });
+
+            const data = await resp.json();
+            if (!resp.ok) {
+                throw httpError(resp, data.error || 'GenBank lookup failed');
+            }
+
+            const fetched = data.sequences || [];
+            if (fetched.length === 0) {
+                showStatus(`GenBank returned no sequence for ${accession}.`, 'error');
+                return;
+            }
+
+            const seq = fetched[0];
+            const added = addSequences([seq]);
+
+            // The accession may already be queued, in which case addSequences() dropped it
+            // as a duplicate - root on the copy that is actually in the queue.
+            const queued = sequenceQueue.find(q => q.name === seq.name)
+                || sequenceQueue.find(q => (q.sequence || '') === (seq.sequence || ''));
+            if (!queued) {
+                showStatus(`Could not add ${accession} to the queue.`, 'error');
+                return;
+            }
+
+            selectedQueueOutgroup = queued.name;
+            populateOutgroupDropdown();
+            updateQueueDisplay();
+            refreshAdvancedSummary();
+
+            input.value = '';
+            const queuedNote = added ? 'added to the queue and ' : 'already in the queue; ';
+            showStatus(`${queued.name} ${queuedNote}set as the outgroup.`, 'success');
+        } catch (e) {
+            reportWorkflowFailure('tree_builder.genbank_lookup', e);
+            showStatus('GenBank lookup error: ' + e.message, 'error');
+        } finally {
+            btn.disabled = false;
+            btn.innerHTML = originalHtml;
+        }
+    }
+
+    document.getElementById('outgroup_accession_btn')?.addEventListener('click', addOutgroupFromAccession);
+    document.getElementById('outgroup_accession')?.addEventListener('keydown', function(e) {
+        if (e.key === 'Enter') {
+            e.preventDefault();
+            addOutgroupFromAccession();
+        }
     });
 
     document.getElementById('alignment_method')?.addEventListener('change', updateOrientationVisibility);

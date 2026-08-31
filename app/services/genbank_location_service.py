@@ -71,6 +71,77 @@ def _clean_location_text(value: str) -> str:
     return text.strip(" ,;:")
 
 
+# US states and Canadian provinces, lowercased. GenBank does not order the
+# segments below the country consistently -- "USA: Seattle, King County,
+# Washington" and "USA: Washington, Seattle" are both written -- so when one of
+# these appears anywhere in the value it is the segment worth keeping.
+_ADMIN_REGION_NAMES = frozenset({
+    "alabama", "alaska", "arizona", "arkansas", "california", "colorado",
+    "connecticut", "delaware", "florida", "georgia", "hawaii", "idaho",
+    "illinois", "indiana", "iowa", "kansas", "kentucky", "louisiana", "maine",
+    "maryland", "massachusetts", "michigan", "minnesota", "mississippi",
+    "missouri", "montana", "nebraska", "nevada", "new hampshire", "new jersey",
+    "new mexico", "new york", "north carolina", "north dakota", "ohio",
+    "oklahoma", "oregon", "pennsylvania", "rhode island", "south carolina",
+    "south dakota", "tennessee", "texas", "utah", "vermont", "virginia",
+    "washington", "west virginia", "wisconsin", "wyoming",
+    "alberta", "british columbia", "manitoba", "new brunswick",
+    "newfoundland and labrador", "northwest territories", "nova scotia",
+    "nunavut", "ontario", "prince edward island", "quebec", "saskatchewan",
+    "yukon",
+})
+
+# A region name is a couple of words ("British Columbia", "Baja California
+# Sur"); anything longer is prose about the collection site.
+_MAX_REGION_WORDS = 3
+
+# Past this many segments the value is a descent through a locality rather than
+# an administrative region, and only the country can be trusted.
+_MAX_SEGMENTS_KEEPING_FIRST = 2
+
+
+def shorten_location(value: str) -> str:
+    """Trim a GenBank collection site to what is useful in a tree tip label.
+
+    GenBank writes the site as ``Country: region, finer, finer still``, and the
+    tail can run to four segments of village and valley names --
+    ``Switzerland: Stein, Mastrils, Landquart, Graubuenden`` -- which is far
+    more than a tip label can carry. Keep the country, plus one region below it
+    when the value actually identifies one:
+
+    ``USA: Colorado, Jefferson County``           -> ``USA: Colorado``
+    ``USA: Seattle, King County, Washington``     -> ``USA: Washington``
+    ``Switzerland: Stein, Mastrils, Landquart, Graubuenden`` -> ``Switzerland``
+
+    Returns the cleaned original when it has no country/region structure to
+    trim, so a value that is already short passes through untouched.
+    """
+    text = _clean_location_text(value)
+    if not text:
+        return ""
+
+    country, separator, remainder = text.partition(":")
+    country = _clean_location_text(country)
+    if not separator or not country:
+        return text
+
+    segments = [_clean_location_text(part) for part in remainder.split(",")]
+    segments = [part for part in segments if part]
+    if not segments:
+        return country
+
+    for segment in segments:
+        if segment.casefold() in _ADMIN_REGION_NAMES:
+            return f"{country}: {segment}"
+
+    first = segments[0]
+    if (len(segments) <= _MAX_SEGMENTS_KEEPING_FIRST
+            and len(first.split()) <= _MAX_REGION_WORDS):
+        return f"{country}: {first}"
+
+    return country
+
+
 def parse_lat_lon(value: str) -> Optional[Tuple[float, float]]:
     """Parse a GenBank ``lat_lon`` value (``39.53 N 105.28 W``) to decimals."""
     match = _LAT_LON_RE.match(str(value or ""))

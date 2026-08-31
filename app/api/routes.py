@@ -1291,7 +1291,7 @@ def fetch_genbank_locations():
 
     Request: { "accessions": ["OR807397", "MJ505555.1"] }
     Response: { "status": "success",
-                "locations": {"OR807397": "USA: Arizona, Greenlee County"},
+                "locations": {"OR807397": "USA: Arizona"},
                 "missing": [...],      # NCBI answered; the record has no location
                 "unavailable": [...] } # NCBI could not be reached for these
     """
@@ -1312,9 +1312,24 @@ def fetch_genbank_locations():
         }), 400
 
     try:
-        from app.services.genbank_location_service import lookup_locations
+        from app.services.genbank_location_service import (
+            lookup_locations,
+            shorten_location,
+        )
 
         locations, missing, unavailable = lookup_locations(accessions)
+        # GenBank's raw qualifier can run to four segments of village and valley
+        # names ("Switzerland: Stein, Mastrils, Landquart, Graubuenden"), which
+        # is unreadable once it is appended to a FASTA header and carried into a
+        # tree tip. Trim to the country plus at most one region below it.
+        locations = {
+            accession: shortened
+            for accession, shortened in (
+                (accession, shorten_location(value))
+                for accession, value in locations.items()
+            )
+            if shortened
+        }
         return jsonify({
             "status": "success",
             "locations": locations,
@@ -1326,6 +1341,63 @@ def fetch_genbank_locations():
         })
     except Exception as e:
         return _server_error(e, where="genbank_locations")
+
+
+def _fill_missing_genbank_locations(sequences):
+    """Give still-locationless GenBank-accession records a location from GenBank.
+
+    Runs after the MycoMap and iNaturalist fills, so it only sees records those
+    two could not place. GenBank's own value is trimmed with
+    ``shorten_location()`` first: the raw qualifier can read "Switzerland:
+    Stein, Mastrils, Landquart, Graubuenden", which is a paragraph in a tree
+    tip. Returns how many were filled.
+    """
+    from app.services.genbank_location_service import (
+        lookup_locations,
+        shorten_location,
+    )
+
+    targets = []
+    for seq in sequences or []:
+        if str(seq.get('location') or '').strip():
+            continue
+        name = str(seq.get('name') or '')
+        if _location_from_sequence_label(name):
+            continue
+        token = str(seq.get('accession') or '').strip() or (name.split() or [''])[0]
+        accession = token.strip().upper()
+        if accession and _is_genbank_accession(accession):
+            targets.append((seq, accession))
+
+    if not targets:
+        return 0
+
+    # The same ceiling the /api/genbank/locations endpoint enforces. An import
+    # this large is already slow; do not add an unbounded NCBI round trip to it.
+    accessions = []
+    for _seq, accession in targets:
+        if accession not in accessions:
+            accessions.append(accession)
+        if len(accessions) >= MAX_CUSTOM_GENBANK_ACCESSIONS:
+            break
+
+    locations, _missing, _unavailable = lookup_locations(accessions)
+
+    filled = 0
+    for seq, accession in targets:
+        raw = locations.get(accession) or locations.get(accession.split('.')[0]) or ''
+        location = shorten_location(raw)
+        if not location:
+            continue
+        seq['location'] = location
+        name = str(seq.get('name') or '').strip()
+        if name and location.casefold() not in name.casefold():
+            seq['name'] = f"{name} {location}"
+        filled += 1
+
+    if filled:
+        logger.info("Filled %d MycoMap hit location(s) from GenBank", filled)
+    return filled
 
 
 def gather_mycomap_sequences_for_queue(url, include_ncbi=True, include_local=True,
@@ -1666,6 +1738,15 @@ def gather_mycomap_sequences_for_queue(url, include_ncbi=True, include_local=Tru
     except Exception:
         # A location is a nicety; never fail an import over one.
         logger.warning("iNaturalist place fill failed for MycoMap hits", exc_info=True)
+    # MycoMap's own record is authoritative and iNaturalist covers the hits that
+    # carry an observation number, but a plain GenBank hit has neither -- and
+    # GenBank itself knows where the type was collected. Fill those last, from
+    # the accession, so a record like "PP910301 Eupezizella britannica voucher
+    # U.R. 1067" stops arriving with no place at all.
+    try:
+        _fill_missing_genbank_locations(sequences)
+    except Exception:
+        logger.warning("GenBank location fill failed for MycoMap hits", exc_info=True)
     sequences = uniquify_mycomap_sequence_names(sequences)
     for seq in sequences:
         seq.pop('_mycomap_original_name', None)
@@ -2322,6 +2403,19 @@ def fetch_inaturalist():
 
 
 
+def _mushroom_observer_error_payload(exc) -> dict:
+    """JSON body for a Mushroom Observer failure, with any structured detail.
+
+    `details` carries the iNaturalist observation summary when a nine-digit
+    "MO number" turns out to be an iNaturalist observation.
+    """
+    payload = {"status": "error", "error": str(exc)}
+    details = getattr(exc, "details", None)
+    if isinstance(details, dict):
+        payload.update(details)
+    return payload
+
+
 @bp.route('/mushroom-observer', methods=['POST'])
 @limiter.limit("40 per minute; 600 per hour")
 def fetch_mushroom_observer():
@@ -2347,7 +2441,7 @@ def fetch_mushroom_observer():
             "message": "Fetched the selected ITS sequence from Mushroom Observer.",
         })
     except MushroomObserverError as exc:
-        return jsonify({"status": "error", "error": str(exc)}), exc.status
+        return jsonify(_mushroom_observer_error_payload(exc)), exc.status
     except Exception as exc:
         return _server_error(exc, where="mushroom_observer")
 
@@ -2387,7 +2481,7 @@ def mushroom_observer_tree():
         )
         return jsonify(result), 202
     except MushroomObserverError as exc:
-        return jsonify({"status": "error", "error": str(exc)}), exc.status
+        return jsonify(_mushroom_observer_error_payload(exc)), exc.status
     except Exception as exc:
         return _server_error(exc, where="mushroom_observer_tree")
 

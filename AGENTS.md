@@ -341,6 +341,28 @@ The tree viewer's **Analyze with Claude** button posts to
 
 ## Key Conventions & UI Patterns
 
+### Updating the browser iNaturalist Observation Finder
+
+The browser port is rendered by `app/templates/inat_finder.html`; its vanilla
+JavaScript lives in `app/static/js/inat_finder.js`. The upstream CLI is
+`https://github.com/AlanRockefeller/inat.finder.py` and evolves independently.
+When a new CLI version is published:
+
+1. Compare the released CLI source, changelog, and tests with the browser port.
+   Port the behavior intentionally rather than copying Python request/UI code.
+2. Preserve the browser security boundary: requests go directly from the browser
+   to `https://api.inaturalist.org/v1`; Flask must not proxy or store searches.
+3. Keep API-derived DOM content on `textContent`/`createElement` paths, and retain
+   cancellation, request timeouts, retry delays, progress, dark mode, and mobile
+   behavior when changing the search flow.
+4. Update the version credited in the page footer only after the matching browser
+   behavior has been implemented and checked. Update the focused Node coverage in
+   `tests/js/inat_finder_variation_limit.test.js` for changed parsing, matching,
+   variation, or request behavior.
+5. Run `.venv/bin/python -m pytest tests/test_inat_finder.py`, run
+   `node --check app/static/js/inat_finder.js`, and spot-check the affected modes
+   against live iNaturalist API responses before deploying.
+
 - Flask app factory in `app/__init__.py`; extensions initialized in `app/extensions.py`.
 - All API responses use JSON; the frontend is a SPA-style UI talking to `/api/` endpoints.
 - FASTA sequence headers are sanitized on input and restored on download/display (see `fasta_utils.py`).
