@@ -25,7 +25,7 @@ from app.services.artifact_storage import (
 from app.services.log_context import (
     JobContextFilter, background_job_context, bind_background_context,
     background_user_identity,
-    stable_fingerprint,
+    stable_fingerprint, utc_formatter,
 )
 from app.services.tree_parameter_validation import validate_iqtree_ufboot_count
 from app.services.subprocess_utils import ToolExecutionError, log_tool_failure
@@ -35,6 +35,7 @@ from app.workers.events import (
     get_initial_steps_meta,
     publish_job_running, publish_job_queued, publish_job_completed, publish_job_failed,
     publish_step_start, publish_step_done, publish_step_failed,
+    step_heartbeat,
     publish_overview, publish_log, publish_metric,
     update_job_meta, update_step_meta,
 )
@@ -150,7 +151,9 @@ def _add_job_log_handler(job_id, log_file):
     """Capture all service logs for this job, without cross-job leakage."""
     handler = logging.FileHandler(log_file)
     handler.addFilter(JobContextFilter(job_id))
-    handler.setFormatter(logging.Formatter(
+    # UTC, matching every other Dikarya log timestamp and what the log digest
+    # assumes when it reads a timestamp carrying no offset.
+    handler.setFormatter(utc_formatter(
         "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
     ))
     logging.getLogger().addHandler(handler)
@@ -197,11 +200,29 @@ def validate_pipeline_outputs(job_dir, job_params, logger_obj=logger,
             failures.append(f"missing_or_empty:{path.relative_to(job_dir)}")
 
     fasta_counts = {}
+    duplicate_alignment_names = None
     for path in required[:3]:
         if artifact_exists(path) and artifact_size(path):
             try:
                 with open_artifact(path, "rt") as handle:
-                    fasta_counts[path.name] = sum(1 for _ in SeqIO.parse(handle, "fasta"))
+                    if path == required[2]:
+                        seen_sequences = {}
+                        duplicate_alignment_names = set()
+                        count = 0
+                        for record in SeqIO.parse(handle, "fasta"):
+                            count += 1
+                            sequence = str(record.seq).upper()
+                            name = (record.description or record.id or "").strip()
+                            if sequence in seen_sequences:
+                                duplicate_alignment_names.add(seen_sequences[sequence])
+                                duplicate_alignment_names.add(name)
+                            else:
+                                seen_sequences[sequence] = name
+                        fasta_counts[path.name] = count
+                    else:
+                        fasta_counts[path.name] = sum(
+                            1 for _ in SeqIO.parse(handle, "fasta")
+                        )
                 if fasta_counts[path.name] == 0:
                     failures.append(f"unparseable_fasta:{path.name}")
             except Exception as exc:
@@ -217,6 +238,7 @@ def validate_pipeline_outputs(job_dir, job_params, logger_obj=logger,
             tree_quality = _summarize_tree_quality(
                 tree, logger_obj,
                 support_expected=_support_expected(job_params),
+                duplicate_alignment_names=duplicate_alignment_names,
             )
         except Exception as exc:
             failures.append(f"unparseable_newick:{type(exc).__name__}")
@@ -353,8 +375,12 @@ def _support_expected(job_params) -> Optional[bool]:
     return None
 
 
-def _summarize_tree_quality(tree, logger_obj,
-                            support_expected: Optional[bool] = None) -> dict:
+def _summarize_tree_quality(
+    tree,
+    logger_obj,
+    support_expected: Optional[bool] = None,
+    duplicate_alignment_names: Optional[set[str]] = None,
+) -> dict:
     """Report the tree-shaped failure modes this pipeline actually produces.
 
     The invariant check counted records and confirmed the Newick parsed, which
@@ -367,6 +393,8 @@ def _summarize_tree_quality(tree, logger_obj,
 
     branch_lengths = []
     zero_branches = 0
+    zero_terminal_names = []
+    zero_internal_branches = 0
     supported = 0
     internal = 0
     max_children = 0
@@ -376,6 +404,10 @@ def _summarize_tree_quality(tree, logger_obj,
             branch_lengths.append(clade.branch_length)
             if clade.branch_length == 0:
                 zero_branches += 1
+                if clade.is_terminal():
+                    zero_terminal_names.append(clade.name)
+                else:
+                    zero_internal_branches += 1
         if clade.clades:
             internal += 1
             max_children = max(max_children, len(clade.clades))
@@ -396,17 +428,45 @@ def _summarize_tree_quality(tree, logger_obj,
         "terminals": terminals,
         "internal_nodes": internal,
         "zero_length_branches": zero_branches,
+        "zero_length_terminal_branches": len(zero_terminal_names),
+        "duplicate_aligned_records": (
+            len(duplicate_alignment_names)
+            if duplicate_alignment_names is not None else None
+        ),
         "branches_with_length": len(branch_lengths),
         "internal_nodes_with_support": supported,
         "max_polytomy": max_children,
     }
 
     if branch_lengths and zero_branches / len(branch_lengths) > 0.25:
-        log_degradation(
-            logger_obj, "tree_many_zero_length_branches",
-            "More than a quarter of branches have length exactly zero",
-            zero_branches=zero_branches, total=len(branch_lengths),
+        duplicates_explain_zeros = (
+            duplicate_alignment_names is not None
+            and zero_internal_branches == 0
+            and None not in zero_terminal_names
+            and set(zero_terminal_names) == duplicate_alignment_names
+            and len(zero_terminal_names) == len(duplicate_alignment_names)
         )
+        if duplicates_explain_zeros:
+            logger_obj.info(
+                "event=tree.zero_length_branches_explained "
+                "Zero-length terminal branches are fully explained by identical "
+                "aligned sequences duplicate_records=%s total_branches=%s",
+                len(duplicate_alignment_names), len(branch_lengths),
+            )
+        else:
+            log_degradation(
+                logger_obj, "tree_many_zero_length_branches",
+                "More than a quarter of branches have length exactly zero and "
+                "the final alignment does not fully explain them as duplicates",
+                zero_branches=zero_branches,
+                zero_terminal_branches=len(zero_terminal_names),
+                zero_internal_branches=zero_internal_branches,
+                duplicate_aligned_records=(
+                    len(duplicate_alignment_names)
+                    if duplicate_alignment_names is not None else "unknown"
+                ),
+                total=len(branch_lengths),
+            )
     # "no support values where the method should have produced them" -- NJ never
     # would, and _strip_generated_inner_labels() now clears the InnerN names that
     # used to make this look satisfied, so without the method check every single
@@ -617,6 +677,44 @@ def _count_alignment_stats(fasta_path) -> tuple[int, int]:
         return 0, 0
 
 
+def _resolved_alignment_method(job_params: dict) -> str:
+    """Return the alignment method this job will actually run, lowercased.
+
+    ``"default"`` (and a missing value) resolve to the configured beginner
+    aligner. Steps that need to know whether the input is already aligned --
+    ORIENT, which runs long before STEP_ALIGN -- must use this rather than
+    reading ``alignment_method`` raw, or a job submitted with ``"default"``
+    would be classified differently in the two places.
+    """
+    method = job_params.get("alignment_method") or "default"
+    method = str(method).strip().lower()
+    if method == "default":
+        method = str(Config.BEGINNER_DEFAULT_ALIGNER).lower()
+    return method
+
+
+def _resolve_orientation_plan(job_params: dict):
+    """Return ``(requested, effective)`` orientation correction for this job.
+
+    ``requested`` is the user's own setting, coerced through the project-wide
+    `coerce_bool` -- ``bool("false")`` is True, so a stored string form of the
+    flag used to silently re-enable correction for a user who had turned it off.
+
+    ``effective`` additionally accounts for ``alignment_method="none"``, which
+    asserts the submitted records are ALREADY ALIGNED. Reverse-complementing one
+    row of an existing alignment destroys the column correspondence that makes
+    it an alignment, so no correction happens for such a job however the flag is
+    set. `run_alignment` already declines to correct direction for ``none``; the
+    ORIENT step runs much earlier and used to rewrite input_raw.fasta anyway.
+    """
+    from app.services.security_utils import coerce_bool
+
+    params = job_params or {}
+    requested = coerce_bool(params.get("fix_orientation"), True)[0]
+    prealigned = _resolved_alignment_method(params) == "none"
+    return requested, (requested and not prealigned)
+
+
 def _check_and_maybe_fix_orientation(input_path, fix_orientation: bool) -> dict:
     """Classify orientations, only rewriting the FASTA when correction is on."""
     from app.services.orientation_service import fix_sequence_orientation
@@ -704,7 +802,7 @@ def run_recompute_job(job_id: str, params_dict: dict) -> dict:
                    if artifact_exists(job_dir / "alignment" / "alignment_trimmed_report.html") else {}),
             }
         )
-        publish_overview(job_id, "Recompute complete! Redirecting to tree viewer...")
+        publish_overview(job_id, "Recompute complete! Redirecting to tree viewer...", icon=STATE_DONE)
 
         return {
             "job_id": job_id,
@@ -897,6 +995,12 @@ def run_phylo_job(job_params: dict) -> dict:
     job_params["trim_terminal_overhangs"] = coerce_bool(
         job_params.get("trim_terminal_overhangs"), True
     )[0]
+    # Same treatment for fix_orientation: bool("false") is True, so a stored
+    # string form of the flag used to re-enable orientation correction for a
+    # user who had switched it off.
+    job_params["fix_orientation"] = coerce_bool(
+        job_params.get("fix_orientation"), True
+    )[0]
 
     # 1. Create Job Directory
     job_dir = Config.JOB_DIR / job_id
@@ -956,12 +1060,10 @@ def run_phylo_job(job_params: dict) -> dict:
                 # This ensures the UI shows correct pipeline from the start
                 input_type = _normalize_input_type(job_params.get("input_type"))
                 blast_mode = _normalize_blast_mode(job_params.get("blast_mode"))
-                from app.services.trimming_service import describe_trim_step
-                trim_method = job_params.get(
-                    "trimming_method", Config.DEFAULT_TRIMMING_METHOD
+                from app.services.trimming_service import (
+                    describe_trim_step, resolve_trimming_method,
                 )
-                if trim_method == "default":
-                    trim_method = Config.BEGINNER_DEFAULT_TRIMMING
+                trim_method = resolve_trimming_method(job_params)
                 # Already normalized to a bool near the top of run_phylo_job.
                 trim_terminal_overhangs = bool(job_params.get("trim_terminal_overhangs", True))
 
@@ -972,12 +1074,16 @@ def run_phylo_job(job_params: dict) -> dict:
                 if blast_expected_at_start(input_type, blast_mode) is False:
                     job.meta["steps"][STEP_BLAST]["state"] = STATE_SKIPPED
                     job.meta["steps"][STEP_BLAST]["label"] = "BLAST Search (skipped)"
+                    job.meta["steps"][STEP_BLAST]["detail"] = (
+                        "BLAST skipped (not requested for this input)"
+                    )
 
                 # Trim is skipped only when both external and terminal trimming are disabled.
                 should_trim, _trim_label, _trim_tool = describe_trim_step(trim_method, trim_terminal_overhangs)
                 if not should_trim:
                     job.meta["steps"][STEP_TRIM]["state"] = STATE_SKIPPED
                     job.meta["steps"][STEP_TRIM]["label"] = "Trimming (skipped)"
+                    job.meta["steps"][STEP_TRIM]["detail"] = "Trimming skipped (method: none)"
 
                 if tree_preparation_pending:
                     job.meta["steps"][STEP_INPUT]["label"] = "MycoMap Input Preparation"
@@ -1011,41 +1117,52 @@ def run_phylo_job(job_params: dict) -> dict:
                     "Checking the source observation for ITS data and MycoMap BLAST results...",
                 )
 
-                if tree_preparation_kind == "mo":
-                    from app.services.mushroom_observer_service import prepare_tree_job
+                # Alan 8/31/26 - The MycoMap reruns inside prepare_*_tree_job are the
+                # slowest part of this step; report each one to the Activity Feed.
+                def _mycomap_progress(message, icon=STATE_RUNNING, _job_id=job_id):
+                    publish_overview(_job_id, message, icon=icon)
 
-                    prepared = prepare_tree_job(
-                        tree_preparation,
-                        defer_after_ncbi_rerun=not tree_resuming_after_ncbi,
-                        skip_mycomap_refresh=tree_resuming_after_ncbi,
-                        mycomap_rerun_details=(
-                            job.meta.get("mycomap_rerun_details") if job else None
-                        ),
-                    )
-                else:
-                    from app.services.inaturalist_tree_service import prepare_inat_tree_job
+                with step_heartbeat(job_id, STEP_INPUT, current_step_label):
+                    if tree_preparation_kind == "mo":
+                        from app.services.mushroom_observer_service import prepare_tree_job
 
-                    prepared = prepare_inat_tree_job(
-                        int(tree_preparation["observation_id"]),
-                        include_ncbi=bool(tree_preparation.get("include_ncbi", True)),
-                        include_local=bool(tree_preparation.get("include_local", True)),
-                        rebuild_ncbi_blast=bool(tree_preparation.get("rebuild_ncbi_blast")),
-                        recreate_existing_tree=bool(
-                            tree_preparation.get("recreate_existing_tree")
-                        ),
-                        keep_existing_tree_url=bool(
-                            tree_preparation.get("keep_existing_tree_url")
-                        ),
-                        mycomap_local_limit=tree_preparation.get("mycomap_local_limit"),
-                        mycomap_ncbi_limit=tree_preparation.get("mycomap_ncbi_limit"),
-                        defer_after_ncbi_rerun=not tree_resuming_after_ncbi,
-                        skip_mycomap_refresh=tree_resuming_after_ncbi,
-                        mycomap_rerun_details=(
-                            job.meta.get("mycomap_rerun_details") if job else None
-                        ),
-                    )
+                        prepared = prepare_tree_job(
+                            tree_preparation,
+                            defer_after_ncbi_rerun=not tree_resuming_after_ncbi,
+                            skip_mycomap_refresh=tree_resuming_after_ncbi,
+                            mycomap_rerun_details=(
+                                job.meta.get("mycomap_rerun_details") if job else None
+                            ),
+                            progress=_mycomap_progress,
+                        )
+                    else:
+                        from app.services.inaturalist_tree_service import prepare_inat_tree_job
+
+                        prepared = prepare_inat_tree_job(
+                            int(tree_preparation["observation_id"]),
+                            include_ncbi=bool(tree_preparation.get("include_ncbi", True)),
+                            include_local=bool(tree_preparation.get("include_local", True)),
+                            rebuild_ncbi_blast=bool(tree_preparation.get("rebuild_ncbi_blast")),
+                            recreate_existing_tree=bool(
+                                tree_preparation.get("recreate_existing_tree")
+                            ),
+                            keep_existing_tree_url=bool(
+                                tree_preparation.get("keep_existing_tree_url")
+                            ),
+                            mycomap_local_limit=tree_preparation.get("mycomap_local_limit"),
+                            mycomap_ncbi_limit=tree_preparation.get("mycomap_ncbi_limit"),
+                            defer_after_ncbi_rerun=not tree_resuming_after_ncbi,
+                            skip_mycomap_refresh=tree_resuming_after_ncbi,
+                            mycomap_rerun_details=(
+                                job.meta.get("mycomap_rerun_details") if job else None
+                            ),
+                            progress=_mycomap_progress,
+                        )
                 if prepared.get("status") == "waiting_for_ncbi":
                     from app.services.mycomap_service import (
+                        get_mycomap_creation_discovery_max_attempts,
+                        get_mycomap_creation_discovery_max_seconds,
+                        get_mycomap_creation_discovery_poll_interval_seconds,
                         get_mycomap_ncbi_poll_interval_seconds,
                         get_mycomap_ncbi_poll_max_attempts,
                         get_mycomap_ncbi_rerun_wait_seconds,
@@ -1053,12 +1170,23 @@ def run_phylo_job(job_params: dict) -> dict:
 
                     rerun_details = prepared.get("mycomap_rerun_details") or {}
                     auto_created = bool(rerun_details.get("auto_created"))
-                    wait_seconds = (
-                        get_mycomap_ncbi_poll_interval_seconds()
-                        if auto_created else get_mycomap_ncbi_rerun_wait_seconds()
-                    )
+                    creation_pending = bool(rerun_details.get("creation_pending"))
+                    if auto_created and creation_pending:
+                        discovery_elapsed = int(
+                            rerun_details.get("creation_discovery_elapsed_seconds") or 0
+                        )
+                        wait_seconds = get_mycomap_creation_discovery_poll_interval_seconds(
+                            discovery_elapsed
+                        )
+                    else:
+                        wait_seconds = (
+                            get_mycomap_ncbi_poll_interval_seconds()
+                            if auto_created else get_mycomap_ncbi_rerun_wait_seconds()
+                        )
                     max_retry_attempts = (
-                        get_mycomap_ncbi_poll_max_attempts() if auto_created else 1
+                        get_mycomap_creation_discovery_max_attempts()
+                        + get_mycomap_ncbi_poll_max_attempts()
+                        if auto_created else 1
                     )
                     resume_at = datetime.now(timezone.utc) + timedelta(seconds=wait_seconds)
                     refresh_warnings = list(rerun_details.get("warnings") or [])
@@ -1071,20 +1199,31 @@ def run_phylo_job(job_params: dict) -> dict:
                             if queue_position is not None else ""
                         )
                         if rerun_details.get("creation_pending"):
-                            from app.services.mycomap_service import (
-                                get_mycomap_creation_discovery_max_seconds,
+                            max_discovery_seconds = (
+                                get_mycomap_creation_discovery_max_seconds()
                             )
-
-                            discovery_minutes = max(1, round(
-                                get_mycomap_creation_discovery_max_seconds() / 60
-                            ))
+                            if max_discovery_seconds % (24 * 3600) == 0:
+                                max_discovery_value = max_discovery_seconds // (24 * 3600)
+                                max_discovery_label = (
+                                    f"{max_discovery_value} day"
+                                    f"{'s' if max_discovery_value != 1 else ''}"
+                                )
+                            else:
+                                max_discovery_value = max(
+                                    1, round(max_discovery_seconds / 3600)
+                                )
+                                max_discovery_label = (
+                                    f"{max_discovery_value} hour"
+                                    f"{'s' if max_discovery_value != 1 else ''}"
+                                )
+                            next_minutes = max(1, round(wait_seconds / 60))
                             waiting_message = (
                                 "MycoMap accepted the BLAST request and queued it. "
                                 "Dikarya is waiting for the result page to appear and "
-                                "will continue in one minute; if MycoMap's queue has "
-                                f"not produced results within {discovery_minutes} "
-                                f"minute{'s' if discovery_minutes != 1 else ''}, this "
-                                "tree will stop and can be rebuilt later."
+                                f"will check again in {next_minutes} minute"
+                                f"{'s' if next_minutes != 1 else ''}. Checks gradually "
+                                "back off after the first hour, and Dikarya will keep "
+                                f"trying for up to {max_discovery_label}."
                             )
                         else:
                             if tree_preparation_kind == "mo":
@@ -1147,7 +1286,7 @@ def run_phylo_job(job_params: dict) -> dict:
                         job.save_meta()
 
                     for warning in refresh_warnings:
-                        publish_overview(job_id, warning)
+                        publish_overview(job_id, warning, icon=STATE_FAILED)
                     publish_overview(job_id, waiting_message)
                     publish_job_queued(job_id)
                     return Retry(max=max_retry_attempts, interval=wait_seconds)
@@ -1173,10 +1312,11 @@ def run_phylo_job(job_params: dict) -> dict:
                         job.meta["mycomap_refresh_warnings"] = refresh_warnings
                     job.save_meta()
                 for warning in refresh_warnings:
-                    publish_overview(job_id, warning)
+                    publish_overview(job_id, warning, icon=STATE_FAILED)
                 publish_overview(
                     job_id,
                     "MycoMap results imported. Validating the tree input...",
+                    icon=STATE_DONE,
                 )
             
             # =========================================================
@@ -1281,9 +1421,12 @@ def run_phylo_job(job_params: dict) -> dict:
             else:
                 raise ValueError(f"Unknown input type: {input_type}")
 
-            publish_step_done(job_id, STEP_INPUT, f"{n_records} sequence(s) validated")
-            publish_overview(job_id, f"Input validated: {n_records} sequence(s)")
-            update_step_meta(job, STEP_INPUT, {"state": STATE_DONE, "detail": f"{n_records} sequences"})
+            # Alan 8/31/26 - One completion message per step, used for the SSE event
+            # and the stored meta alike. These used to be three different strings, so
+            # the feed showed each completion twice live and a third wording on reload.
+            input_detail = f"Input validated: {n_records} sequence(s)"
+            publish_step_done(job_id, STEP_INPUT, input_detail)
+            update_step_meta(job, STEP_INPUT, {"state": STATE_DONE, "detail": input_detail})
 
             # =========================================================
             # STEP: BLAST (optional)
@@ -1299,14 +1442,15 @@ def run_phylo_job(job_params: dict) -> dict:
                 publish_step_start(job_id, STEP_BLAST, "BLAST Search", "Searching NCBI database")
                 update_step_meta(job, STEP_BLAST, {"state": STATE_RUNNING})
                 
-                if input_type == "accession_list":
-                    accessions = job_params.get("accessions", [])
-                    from app.services.blast_service import blast_from_accessions
-                    blast_result = blast_from_accessions(accessions, Config, logger)
-                else:
-                    sequence = input_raw_path.read_text(encoding="utf-8")
-                    from app.services.blast_service import blast_from_sequence
-                    blast_result = blast_from_sequence(sequence, Config, logger)
+                with step_heartbeat(job_id, STEP_BLAST, "BLAST Search"):
+                    if input_type == "accession_list":
+                        accessions = job_params.get("accessions", [])
+                        from app.services.blast_service import blast_from_accessions
+                        blast_result = blast_from_accessions(accessions, Config, logger)
+                    else:
+                        sequence = input_raw_path.read_text(encoding="utf-8")
+                        from app.services.blast_service import blast_from_sequence
+                        blast_result = blast_from_sequence(sequence, Config, logger)
                 
                 if blast_result:
                     with open(job_dir / "blast" / "blast_results.json", "w") as f:
@@ -1321,14 +1465,21 @@ def run_phylo_job(job_params: dict) -> dict:
                         logger.info(f"Replaced input FASTA with BLAST-expanded dataset from {fasta_path}")
                     
                     hit_count = blast_result.get("sequence_count", 0)
-                    publish_step_done(job_id, STEP_BLAST, f"{hit_count} sequences found")
-                    publish_overview(job_id, f"BLAST complete: {hit_count} related sequences found")
-                    update_step_meta(job, STEP_BLAST, {"state": STATE_DONE, "detail": f"{hit_count} sequences"})
+                    blast_detail = f"BLAST complete: {hit_count} related sequences found"
+                    publish_step_done(job_id, STEP_BLAST, blast_detail)
+                    update_step_meta(job, STEP_BLAST, {"state": STATE_DONE, "detail": blast_detail})
             else:
                 # BLAST skipped
                 skip_reason = "multi-sequence input" if n_records > 1 else "disabled"
-                update_step_meta(job, STEP_BLAST, {"state": STATE_SKIPPED, "label": "BLAST Search (skipped)"})
-                publish_overview(job_id, f"BLAST skipped ({skip_reason})")
+                blast_skip_detail = f"BLAST skipped ({skip_reason})"
+                update_step_meta(job, STEP_BLAST, {
+                    "state": STATE_SKIPPED,
+                    "label": "BLAST Search (skipped)",
+                    "detail": blast_skip_detail,
+                })
+                publish_overview(
+                    job_id, blast_skip_detail, icon=STATE_SKIPPED, key=f"skip:{STEP_BLAST}"
+                )
                 logger.info(f"Skipping BLAST ({skip_reason})")
 
             # Final guard: alignment requires input_raw.fasta
@@ -1375,15 +1526,28 @@ def run_phylo_job(job_params: dict) -> dict:
             publish_step_start(job_id, STEP_ORIENT, "Orientation Check", "Checking sequence orientations")
             update_step_meta(job, STEP_ORIENT, {"state": STATE_RUNNING})
             
-            fix_orientation = bool(job_params.get("fix_orientation", True))
+            # One helper resolves both the flag and the already-aligned case, so
+            # ORIENT and STEP_ALIGN cannot disagree about either.
+            fix_orientation, correct_orientation = _resolve_orientation_plan(
+                job_params
+            )
+            input_is_prealigned = _resolved_alignment_method(job_params) == "none"
             orient_stats = _check_and_maybe_fix_orientation(
-                input_raw_path, fix_orientation
+                input_raw_path, correct_orientation
             )
             
             reversed_count = orient_stats.get("reverse", 0)
             uncertain_count = orient_stats.get("uncertain", 0)
             
-            if not fix_orientation:
+            if input_is_prealigned:
+                orient_detail = (
+                    "Orientation correction skipped (input is already aligned)"
+                )
+                if reversed_count > 0:
+                    orient_detail += f"; {reversed_count} reverse sequence(s) detected"
+                if uncertain_count > 0:
+                    orient_detail += f", {uncertain_count} uncertain"
+            elif not fix_orientation:
                 orient_detail = "Orientation correction disabled"
                 if reversed_count > 0:
                     orient_detail += f"; {reversed_count} reverse sequence(s) detected"
@@ -1400,17 +1564,20 @@ def run_phylo_job(job_params: dict) -> dict:
             
             logger.info(
                 "Orientation check: correction_enabled=%s total=%s forward=%s reverse=%s uncertain=%s",
-                fix_orientation,
+                correct_orientation,
                 orient_stats.get("total", 0),
                 orient_stats.get("forward", 0),
                 reversed_count,
                 uncertain_count,
             )
             
+            # Alan 8/31/26 - Name the step in the feed line the way every other step
+            # does; "All sequences correctly oriented" on its own read like a stray note.
+            orient_detail = f"Orientation check: {orient_detail}"
             publish_step_done(job_id, STEP_ORIENT, orient_detail)
             update_step_meta(job, STEP_ORIENT, {"state": STATE_DONE, "detail": orient_detail})
             
-            if fix_orientation and reversed_count > 0:
+            if correct_orientation and reversed_count > 0:
                 publish_metric(job_id, STEP_ORIENT, "reversed", reversed_count)
 
             # =========================================================
@@ -1446,24 +1613,24 @@ def run_phylo_job(job_params: dict) -> dict:
                 })
 
                 its_output_path = job_dir / "input" / "its_extracted.fasta"
-                its_stats = run_its_extraction(
-                    input_raw_path,
-                    its_output_path,
-                    its_region,
-                    Config,
-                    logger,
-                    min_length=its_min_length,
-                    job_id=job_id,
-                )
+                with step_heartbeat(job_id, STEP_ITS, current_step_label):
+                    its_stats = run_its_extraction(
+                        input_raw_path,
+                        its_output_path,
+                        its_region,
+                        Config,
+                        logger,
+                        min_length=its_min_length,
+                        job_id=job_id,
+                    )
                 # Downstream steps all read input_raw_path, so swap in the
                 # extracted sequences the same way the orientation step does.
                 input_raw_path.write_text(
                     its_output_path.read_text(encoding="utf-8"), encoding="utf-8"
                 )
 
-                its_detail = format_its_detail(its_stats)
+                its_detail = f"ITS region extraction: {format_its_detail(its_stats)}"
                 publish_step_done(job_id, STEP_ITS, its_detail)
-                publish_overview(job_id, f"ITS region extraction: {its_detail}")
                 update_step_meta(job, STEP_ITS, {
                     "state": STATE_DONE,
                     "label": current_step_label,
@@ -1475,6 +1642,7 @@ def run_phylo_job(job_params: dict) -> dict:
                 update_step_meta(job, STEP_ITS, {
                     "state": STATE_SKIPPED,
                     "label": current_step_label,
+                    "detail": "ITS extraction skipped (not requested)",
                 })
 
             # Persist for the job viewer's Generation Details panel.
@@ -1485,9 +1653,9 @@ def run_phylo_job(job_params: dict) -> dict:
             # STEP: ALIGNMENT
             # =========================================================
             current_step = STEP_ALIGN
-            align_method = job_params.get("alignment_method", "default")
-            if align_method == "default":
-                align_method = Config.BEGINNER_DEFAULT_ALIGNER
+            # Resolved by the same helper the ORIENT step used, so the two
+            # steps can never disagree about whether this job skips alignment.
+            align_method = _resolved_alignment_method(job_params)
             
             current_tool = align_method.lower()
             current_step_label = f"Alignment ({align_method.upper()})"
@@ -1529,12 +1697,13 @@ def run_phylo_job(job_params: dict) -> dict:
                 fix_orientation=fix_orientation,
                 advanced_options=align_opts,
             )
-            align_stats = run_alignment(
-                input_raw_path, alignment_raw_path, align_params, Config, logger, job_id=job_id,
-                # ORIENT still classifies sequences when correction is disabled,
-                # but both it and the aligner leave the sequence data untouched.
-                orient_uncertain=uncertain_count,
-            ) or {}
+            with step_heartbeat(job_id, STEP_ALIGN, current_step_label):
+                align_stats = run_alignment(
+                    input_raw_path, alignment_raw_path, align_params, Config, logger, job_id=job_id,
+                    # ORIENT still classifies sequences when correction is disabled,
+                    # but both it and the aligner leave the sequence data untouched.
+                    orient_uncertain=uncertain_count,
+                ) or {}
 
             n_seqs, n_cols = _count_alignment_stats(alignment_raw_path)
             detail = f"{n_seqs} sequences, {n_cols} columns"
@@ -1548,8 +1717,8 @@ def run_phylo_job(job_params: dict) -> dict:
                 detail += f", {aligner_reversed} reverse-complemented by the aligner"
                 publish_metric(job_id, STEP_ALIGN, "reversed_by_aligner", aligner_reversed)
 
+            detail = f"Alignment complete: {detail}"
             publish_step_done(job_id, STEP_ALIGN, detail)
-            publish_overview(job_id, f"Alignment complete: {detail}")
             update_step_meta(job, STEP_ALIGN, {"state": STATE_DONE, "detail": detail})
             publish_metric(job_id, STEP_ALIGN, "sequences", n_seqs)
             publish_metric(job_id, STEP_ALIGN, "columns", n_cols)
@@ -1558,12 +1727,11 @@ def run_phylo_job(job_params: dict) -> dict:
             # STEP: TRIMMING
             # =========================================================
             current_step = STEP_TRIM
-            from app.services.trimming_service import run_trimming, describe_trim_step, format_trimming_detail
-            trim_method = job_params.get(
-                "trimming_method", Config.DEFAULT_TRIMMING_METHOD
+            from app.services.trimming_service import (
+                run_trimming, describe_trim_step, format_trimming_detail,
+                resolve_trimming_method,
             )
-            if trim_method == "default":
-                trim_method = Config.BEGINNER_DEFAULT_TRIMMING
+            trim_method = resolve_trimming_method(job_params)
             # Already normalized to a bool near the top of run_phylo_job.
             trim_terminal_overhangs = bool(job_params.get("trim_terminal_overhangs", True))
             should_trim, current_step_label, current_tool = describe_trim_step(trim_method, trim_terminal_overhangs)
@@ -1581,23 +1749,24 @@ def run_phylo_job(job_params: dict) -> dict:
                     "tool": current_tool
                 })
 
-                trim_stats = run_trimming(
-                    alignment_raw_path,
-                    alignment_trimmed_path,
-                    trim_method,
-                    Config,
-                    logger,
-                    job_id=job_id,
-                    trim_terminal_overhangs=trim_terminal_overhangs,
-                )
+                with step_heartbeat(job_id, STEP_TRIM, current_step_label):
+                    trim_stats = run_trimming(
+                        alignment_raw_path,
+                        alignment_trimmed_path,
+                        trim_method,
+                        Config,
+                        logger,
+                        job_id=job_id,
+                        trim_terminal_overhangs=trim_terminal_overhangs,
+                    )
 
                 _, trimmed_cols = _count_alignment_stats(alignment_trimmed_path)
                 detail = format_trimming_detail(trim_method, trim_stats, trimmed_cols)
                 job_params["trimming_details"] = trim_stats
                 _save_job_params(input_info_path, job_params)
                 
+                detail = f"Trimming complete: {detail}"
                 publish_step_done(job_id, STEP_TRIM, detail)
-                publish_overview(job_id, f"Trimming complete: {detail}")
                 update_step_meta(job, STEP_TRIM, {"state": STATE_DONE, "detail": detail})
             else:
                 # Trimming skipped
@@ -1612,8 +1781,15 @@ def run_phylo_job(job_params: dict) -> dict:
                     },
                 }
                 _save_job_params(input_info_path, job_params)
-                update_step_meta(job, STEP_TRIM, {"state": STATE_SKIPPED, "label": "Trimming (skipped)"})
-                publish_overview(job_id, "Trimming skipped (method: none)")
+                update_step_meta(job, STEP_TRIM, {
+                    "state": STATE_SKIPPED,
+                    "label": "Trimming (skipped)",
+                    "detail": "Trimming skipped (method: none)",
+                })
+                publish_overview(
+                    job_id, "Trimming skipped (method: none)",
+                    icon=STATE_SKIPPED, key=f"skip:{STEP_TRIM}",
+                )
                 current_tool = None
                 current_step_label = "Trimming (skipped)"
 
@@ -1734,15 +1910,16 @@ def run_phylo_job(job_params: dict) -> dict:
                 outgroup=job_params.get("outgroup")
             )
 
-            metadata = run_tree_builder(
-                alignment_trimmed_path,
-                tree_newick_path,
-                tree_nexus_path,
-                tree_params,
-                Config,
-                logger,
-                job_id=job_id,
-            )
+            with step_heartbeat(job_id, STEP_TREE, current_step_label):
+                metadata = run_tree_builder(
+                    alignment_trimmed_path,
+                    tree_newick_path,
+                    tree_nexus_path,
+                    tree_params,
+                    Config,
+                    logger,
+                    job_id=job_id,
+                )
 
             with open(tree_metadata_path, "w") as f:
                 json.dump(metadata, f, indent=2)
@@ -1752,9 +1929,9 @@ def run_phylo_job(job_params: dict) -> dict:
 
             require_valid_pipeline_outputs(job_dir, job_params, logger)
 
-            publish_step_done(job_id, STEP_TREE, "Tree generated")
-            publish_overview(job_id, f"Tree built using {tree_method.upper()}")
-            update_step_meta(job, STEP_TREE, {"state": STATE_DONE, "detail": "Tree generated"})
+            tree_detail = f"Tree built using {tree_method.upper()}"
+            publish_step_done(job_id, STEP_TREE, tree_detail)
+            update_step_meta(job, STEP_TREE, {"state": STATE_DONE, "detail": tree_detail})
 
             # =========================================================
             # STEP: POST-PROCESSING
@@ -1875,13 +2052,15 @@ def run_phylo_job(job_params: dict) -> dict:
                     if inat_result.get("status") == "success":
                         publish_overview(
                             job_id,
-                            "Posted Phylogenetic Tree link to iNaturalist observation."
+                            "Posted Phylogenetic Tree link to iNaturalist observation.",
+                            icon=STATE_DONE,
                         )
                     else:
                         publish_overview(
                             job_id,
                             "Tree built; iNaturalist update did not succeed "
-                            "(tree is still available)."
+                            "(tree is still available).",
+                            icon=STATE_FAILED,
                         )
             except Exception as _inat_err:
                 from app.services.log_context import log_degradation
@@ -1934,13 +2113,15 @@ def run_phylo_job(job_params: dict) -> dict:
                     if mo_result.get("status") == "success":
                         publish_overview(
                             job_id,
-                            "Posted the phylogenetic tree link to Mushroom Observer."
+                            "Posted the phylogenetic tree link to Mushroom Observer.",
+                            icon=STATE_DONE,
                         )
                     else:
                         publish_overview(
                             job_id,
                             "Tree built; the Mushroom Observer comment did not succeed "
-                            "(the tree is still available)."
+                            "(the tree is still available).",
+                            icon=STATE_FAILED,
                         )
             except Exception as _mo_err:
                 from app.services.log_context import log_degradation
@@ -1964,7 +2145,9 @@ def run_phylo_job(job_params: dict) -> dict:
                        if artifact_exists(job_dir / "alignment" / "alignment_trimmed_report.html") else {}),
                 }
             )
-            publish_overview(job_id, "Pipeline complete! Redirecting to tree viewer...")
+            publish_overview(
+                job_id, "Pipeline complete! Redirecting to tree viewer...", icon=STATE_DONE
+            )
 
             return {
                 "job_id": job_id,

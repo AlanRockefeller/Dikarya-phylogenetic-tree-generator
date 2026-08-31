@@ -191,6 +191,16 @@ def _log_upstream_error(method: str, url: str, exc) -> None:
         body = exc.read() or b''
     except Exception:
         pass
+    finally:
+        # An HTTPError *is* the response object, and urlopen's context manager
+        # never saw it -- the exception escaped instead. Left unclosed, its
+        # socket lingers until the garbage collector gets to it, which under a
+        # failing upstream means a slow leak of connections out of a Gunicorn
+        # worker.
+        try:
+            exc.close()
+        except Exception:
+            pass
     logger.warning(
         "event=inat_oauth.upstream_error method=%s url=%s status=%s "
         "body_bytes=%s body_fingerprint=%s",

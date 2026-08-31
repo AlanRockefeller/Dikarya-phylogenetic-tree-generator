@@ -1,0 +1,235 @@
+{% extends "base_modern.html" %}
+
+{% block title %}iNat Finder - Dikarya{% endblock %}
+{% block description %}Find an iNaturalist observation when its observation number contains a typo.{% endblock %}
+{% block subtitle %}iNaturalist Observation Finder{% endblock %}
+{% block nav_inat_finder %}text-journal-gold{% endblock %}
+
+{% block head %}
+<style>
+    .finder-mode:checked + label {
+        border-color: var(--journal-gold);
+        background: rgb(201 169 98 / 0.12);
+        box-shadow: 0 0 0 1px var(--journal-gold);
+    }
+    .finder-mode:focus-visible + label {
+        outline: 2px solid var(--journal-gold);
+        outline-offset: 3px;
+    }
+    .finder-progress-fill {
+        transition: width 300ms ease;
+    }
+    @media (prefers-reduced-motion: reduce) {
+        .finder-progress-fill { transition: none; }
+    }
+</style>
+{% endblock %}
+
+{% block content %}
+<div class="max-w-6xl mx-auto">
+    <header class="mb-8 grid gap-6 lg:grid-cols-[minmax(0,1fr)_320px] lg:items-end">
+        <div>
+            <div class="inline-flex items-center gap-2 rounded-full bg-journal-gold/15 px-3 py-1 text-xs font-semibold uppercase tracking-widest text-journal-green dark:text-journal-gold">
+                <i class="fas fa-binoculars"></i> Field data rescue
+            </div>
+            <h1 class="mt-4 font-serif text-4xl sm:text-5xl font-semibold leading-tight text-journal-dark dark:text-white">
+                iNaturalist Observation Finder
+            </h1>
+            <p class="mt-3 max-w-3xl text-base sm:text-lg leading-relaxed text-gray-600 dark:text-gray-300">
+                Recover an observation when one or more digits were transcribed incorrectly. Search by the expected genus, family, taxon ID, observer, or iNaturalist project.
+            </p>
+        </div>
+        <div class="rounded-2xl border border-journal-gold/40 bg-white/70 dark:bg-journal-green/60 p-4 text-sm text-gray-600 dark:text-gray-300">
+            <div class="flex items-start gap-3">
+                <i class="fas fa-shield-halved mt-0.5 text-journal-gold"></i>
+                <p>The search runs in your browser and talks directly to iNaturalist. Dikarya does not store your query.</p>
+            </div>
+        </div>
+    </header>
+
+    <div class="grid gap-6 lg:grid-cols-[minmax(0,1fr)_340px]">
+        <section class="rounded-2xl border border-gray-200 dark:border-gray-700 bg-white dark:bg-journal-green shadow-sm overflow-hidden">
+            <form id="finder-form" class="p-5 sm:p-7" novalidate>
+                <fieldset>
+                    <legend class="text-sm font-semibold uppercase tracking-wider text-gray-500 dark:text-gray-400">1. What should match?</legend>
+                    <div class="mt-3 grid gap-3 sm:grid-cols-2 lg:grid-cols-5">
+                        <input class="finder-mode sr-only" type="radio" name="mode" value="genus" id="mode-genus" checked>
+                        <label for="mode-genus" class="cursor-pointer rounded-xl border border-gray-200 dark:border-gray-600 p-4 transition-colors hover:border-journal-gold">
+                            <i class="fas fa-leaf text-journal-gold"></i>
+                            <span class="ml-2 font-semibold text-journal-dark dark:text-white">Genus</span>
+                            <span class="mt-1 block text-xs text-gray-500 dark:text-gray-400">Expected taxonomy</span>
+                        </label>
+                        <input class="finder-mode sr-only" type="radio" name="mode" value="family" id="mode-family">
+                        <label for="mode-family" class="cursor-pointer rounded-xl border border-gray-200 dark:border-gray-600 p-4 transition-colors hover:border-journal-gold">
+                            <i class="fas fa-sitemap text-journal-gold"></i>
+                            <span class="ml-2 font-semibold text-journal-dark dark:text-white">Family</span>
+                            <span class="mt-1 block text-xs text-gray-500 dark:text-gray-400">Expected family</span>
+                        </label>
+                        <input class="finder-mode sr-only" type="radio" name="mode" value="taxon" id="mode-taxon">
+                        <label for="mode-taxon" class="cursor-pointer rounded-xl border border-gray-200 dark:border-gray-600 p-4 transition-colors hover:border-journal-gold">
+                            <i class="fas fa-fingerprint text-journal-gold"></i>
+                            <span class="ml-2 font-semibold text-journal-dark dark:text-white">Taxon ID</span>
+                            <span class="mt-1 block text-xs text-gray-500 dark:text-gray-400">Any rank, exact taxon</span>
+                        </label>
+                        <input class="finder-mode sr-only" type="radio" name="mode" value="user" id="mode-user">
+                        <label for="mode-user" class="cursor-pointer rounded-xl border border-gray-200 dark:border-gray-600 p-4 transition-colors hover:border-journal-gold">
+                            <i class="fas fa-user text-journal-gold"></i>
+                            <span class="ml-2 font-semibold text-journal-dark dark:text-white">Observer</span>
+                            <span class="mt-1 block text-xs text-gray-500 dark:text-gray-400">iNaturalist username</span>
+                        </label>
+                        <input class="finder-mode sr-only" type="radio" name="mode" value="project" id="mode-project">
+                        <label for="mode-project" class="cursor-pointer rounded-xl border border-gray-200 dark:border-gray-600 p-4 transition-colors hover:border-journal-gold">
+                            <i class="fas fa-people-group text-journal-gold"></i>
+                            <span class="ml-2 font-semibold text-journal-dark dark:text-white">Project</span>
+                            <span class="mt-1 block text-xs text-gray-500 dark:text-gray-400">ID, slug, URL, or title</span>
+                        </label>
+                    </div>
+                </fieldset>
+
+                <div class="mt-7">
+                    <label for="search-term" id="search-term-label" class="block text-sm font-semibold uppercase tracking-wider text-gray-500 dark:text-gray-400">2. Expected genus</label>
+                    <div class="mt-2 relative">
+                        <i id="search-term-icon" class="fas fa-leaf absolute left-4 top-1/2 -translate-y-1/2 text-gray-400"></i>
+                        <input id="search-term" type="text" maxlength="160" autocomplete="off" placeholder="e.g. Amanita" required
+                            role="combobox" aria-expanded="false" aria-autocomplete="list" aria-controls="taxon-suggestions"
+                            class="w-full rounded-xl border border-gray-300 dark:border-gray-600 bg-white dark:bg-journal-dark py-3 pl-11 pr-4 text-journal-dark dark:text-white placeholder:text-gray-400 focus:border-journal-gold focus:ring-journal-gold">
+                        <ul id="taxon-suggestions" role="listbox" aria-label="Matching taxa"
+                            class="hidden absolute left-0 right-0 top-full z-20 mt-1 max-h-80 overflow-auto rounded-xl border border-gray-200 dark:border-gray-600 bg-white dark:bg-journal-dark py-1 shadow-lg"></ul>
+                    </div>
+                    <p id="taxon-suggestion-status" class="sr-only" aria-live="polite"></p>
+                    <div id="taxon-pinned" class="hidden mt-2 flex items-center gap-2 rounded-xl border border-gray-200 dark:border-gray-600 bg-gray-50 dark:bg-journal-dark/60 px-3 py-2 text-sm">
+                        <span id="taxon-pinned-swatch" class="inline-block h-3 w-3 flex-none rounded-full"></span>
+                        <span id="taxon-pinned-label" class="min-w-0 flex-1 truncate text-gray-700 dark:text-gray-200"></span>
+                        <button id="taxon-pinned-clear" type="button" aria-label="Clear the selected taxon"
+                            class="flex-none rounded-lg px-2 py-1 text-xs font-semibold text-gray-500 hover:text-red-600 dark:text-gray-400 dark:hover:text-red-400">
+                            <i class="fas fa-xmark"></i>
+                        </button>
+                    </div>
+                </div>
+
+                <div class="mt-6">
+                    <label for="observation-input" class="block text-sm font-semibold uppercase tracking-wider text-gray-500 dark:text-gray-400">3. Mistyped observation number</label>
+                    <div class="mt-2 relative">
+                        <i class="fas fa-hashtag absolute left-4 top-1/2 -translate-y-1/2 text-gray-400"></i>
+                        <input id="observation-input" type="text" inputmode="url" maxlength="200" autocomplete="off"
+                            placeholder="187067126 or an iNaturalist observation URL" required
+                            class="w-full rounded-xl border border-gray-300 dark:border-gray-600 bg-white dark:bg-journal-dark py-3 pl-11 pr-4 font-mono text-journal-dark dark:text-white placeholder:font-sans placeholder:text-gray-400 focus:border-journal-gold focus:ring-journal-gold">
+                    </div>
+                    <p id="short-id-note" class="hidden mt-2 rounded-lg bg-amber-50 dark:bg-amber-950/40 px-3 py-2 text-sm text-amber-800 dark:text-amber-200">
+                        <i class="fas fa-circle-info mr-1"></i> Five digits or fewer may be a Mushroom Observer number.
+                    </p>
+                </div>
+
+                <div class="mt-6 grid gap-4 sm:grid-cols-2 sm:items-end">
+                    <label class="block">
+                        <span class="block text-sm font-semibold text-gray-700 dark:text-gray-200 mb-2">Maximum wrong digits</span>
+                        <select id="digits-off" class="w-full rounded-xl border border-gray-300 dark:border-gray-600 bg-white dark:bg-journal-dark px-4 py-3 text-journal-dark dark:text-white focus:border-journal-gold focus:ring-journal-gold">
+                            <option value="1" selected>Up to 1 digit (fast)</option>
+                            <option value="2">Up to 2 digits</option>
+                            <option value="3">Up to 3 digits (can take several minutes)</option>
+                        </select>
+                    </label>
+                    <label class="flex items-center gap-3 rounded-xl border border-gray-200 dark:border-gray-600 px-4 py-3 min-h-[50px]">
+                        <input id="verbose" type="checkbox" class="rounded border-gray-300 text-journal-green focus:ring-journal-gold">
+                        <span class="text-sm text-gray-700 dark:text-gray-200">Show detailed search log</span>
+                    </label>
+                </div>
+
+                <div id="form-error" role="alert" class="hidden mt-5 rounded-xl border border-red-200 dark:border-red-800 bg-red-50 dark:bg-red-950/40 px-4 py-3 text-sm text-red-700 dark:text-red-200"></div>
+
+                <div id="taxon-choices" class="hidden mt-3 rounded-xl border border-journal-gold/50 bg-journal-gold/5 p-4">
+                    <p class="text-sm font-semibold text-journal-dark dark:text-white">Which taxon did you mean?</p>
+                    <p class="mt-1 text-xs text-gray-500 dark:text-gray-400">Choosing one searches by its iNaturalist taxon ID, which also matches everything below it.</p>
+                    <div id="taxon-choice-list" class="mt-3 space-y-2"></div>
+                </div>
+
+                <div class="mt-7 flex flex-col-reverse gap-3 sm:flex-row sm:items-center">
+                    <button id="cancel-button" type="button" disabled
+                        class="hidden rounded-xl border border-gray-300 dark:border-gray-600 px-5 py-3 font-semibold text-gray-700 dark:text-gray-200 hover:border-red-400 hover:text-red-600 disabled:opacity-50">
+                        Cancel search
+                    </button>
+                    <button id="search-button" type="submit"
+                        class="inline-flex flex-1 items-center justify-center gap-2 rounded-xl bg-journal-gold px-6 py-3 font-bold text-journal-dark shadow-sm transition hover:bg-journal-gold-light focus:outline-none focus:ring-2 focus:ring-journal-gold focus:ring-offset-2">
+                        <i class="fas fa-magnifying-glass"></i>
+                        <span>Find observation</span>
+                    </button>
+                </div>
+            </form>
+        </section>
+
+        <aside class="space-y-6">
+            <section id="progress-panel" class="rounded-2xl border border-gray-200 dark:border-gray-700 bg-white dark:bg-journal-green p-5 shadow-sm">
+                <div class="flex items-center justify-between gap-3">
+                    <h2 class="font-semibold text-journal-dark dark:text-white">Search progress</h2>
+                    <span id="progress-percent" class="font-mono text-sm font-semibold text-journal-gold">0%</span>
+                </div>
+                <div class="mt-4 h-3 overflow-hidden rounded-full bg-gray-200 dark:bg-journal-dark" role="progressbar" aria-label="Search progress" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0" id="progress-track">
+                    <div id="progress-fill" class="finder-progress-fill h-full w-0 rounded-full bg-gradient-to-r from-journal-green to-journal-gold"></div>
+                </div>
+                <p id="progress-status" aria-live="polite" aria-atomic="true" class="mt-4 text-sm font-medium text-gray-700 dark:text-gray-200">Ready to search</p>
+                <div class="mt-3 grid grid-cols-2 gap-3 text-xs">
+                    <div class="rounded-lg bg-gray-50 dark:bg-journal-dark/50 p-3">
+                        <span class="block text-gray-500 dark:text-gray-400">Checked</span>
+                        <span id="progress-count" class="mt-1 block font-mono font-semibold text-journal-dark dark:text-white">0 / 0</span>
+                    </div>
+                    <div class="rounded-lg bg-gray-50 dark:bg-journal-dark/50 p-3">
+                        <span class="block text-gray-500 dark:text-gray-400">Estimated time</span>
+                        <span id="progress-eta" class="mt-1 block font-mono font-semibold text-journal-dark dark:text-white">—</span>
+                    </div>
+                </div>
+            </section>
+
+            <section class="rounded-2xl border border-gray-200 dark:border-gray-700 bg-white dark:bg-journal-green p-5 text-sm shadow-sm">
+                <h2 class="font-semibold text-journal-dark dark:text-white"><i class="fas fa-palette mr-2 text-journal-gold"></i>Result colours</h2>
+                <p class="mt-2 text-xs text-gray-500 dark:text-gray-400">Each match is marked with its iNaturalist iconic-taxon colour.</p>
+                <ul class="mt-3 grid grid-cols-2 gap-2 text-xs text-gray-700 dark:text-gray-200">
+                    <li class="flex items-center gap-2"><span class="inline-block h-3 w-3 rounded-full" style="background:#FF1493"></span>Fungi</li>
+                    <li class="flex items-center gap-2"><span class="inline-block h-3 w-3 rounded-full" style="background:#73AC13"></span>Plantae</li>
+                    <li class="flex items-center gap-2"><span class="inline-block h-3 w-3 rounded-full" style="background:#1E90FF"></span>Animalia</li>
+                    <li class="flex items-center gap-2"><span class="inline-block h-3 w-3 rounded-full" style="background:#FF4500"></span>Insecta, Arachnida, Mollusca</li>
+                    <li class="flex items-center gap-2"><span class="inline-block h-3 w-3 rounded-full" style="background:#691776"></span>Protozoa</li>
+                    <li class="flex items-center gap-2"><span class="inline-block h-3 w-3 rounded-full" style="background:#993300"></span>Chromista</li>
+                </ul>
+            </section>
+
+            <section class="rounded-2xl border border-journal-gold/40 bg-journal-gold/10 p-5 text-sm text-gray-700 dark:text-gray-200">
+                <h2 class="font-semibold text-journal-dark dark:text-white"><i class="fas fa-wand-magic-sparkles mr-2 text-journal-gold"></i>What gets checked</h2>
+                <ul class="mt-3 space-y-2 text-sm">
+                    <li>Changed digits at every position</li>
+                    <li>A missing digit at any position for short IDs</li>
+                    <li>One or two extra digits in long IDs</li>
+                    <li>Two adjacent digits typed the wrong way round</li>
+                    <li>The original ID, in case it already matches</li>
+                </ul>
+            </section>
+        </aside>
+    </div>
+
+    <section id="results-section" class="hidden mt-8" aria-live="polite">
+        <div class="flex flex-wrap items-end justify-between gap-3">
+            <div>
+                <p class="text-sm font-semibold uppercase tracking-wider text-journal-gold">Results</p>
+                <h2 id="results-heading" class="mt-1 font-serif text-3xl font-semibold text-journal-dark dark:text-white"></h2>
+            </div>
+            <p id="results-summary" class="text-sm text-gray-500 dark:text-gray-400"></p>
+        </div>
+        <div id="results-list" class="mt-5 grid gap-4 md:grid-cols-2"></div>
+    </section>
+
+    <section id="log-section" class="hidden mt-8 rounded-2xl border border-gray-200 dark:border-gray-700 bg-journal-dark overflow-hidden shadow-sm">
+        <div class="flex items-center justify-between border-b border-gray-700 px-5 py-3">
+            <h2 class="font-semibold text-white"><i class="fas fa-terminal mr-2 text-journal-gold"></i>Search log</h2>
+            <button id="clear-log" type="button" class="text-xs text-gray-400 hover:text-white">Clear</button>
+        </div>
+        <pre id="search-log" class="max-h-80 overflow-auto whitespace-pre-wrap p-5 font-mono text-xs leading-6 text-gray-300"></pre>
+    </section>
+
+    <footer class="mt-8 text-center text-xs text-gray-500 dark:text-gray-400">
+        Web interface based on <a href="https://github.com/AlanRockefeller/inat.finder.py" target="_blank" rel="noopener" class="font-semibold text-journal-green dark:text-journal-gold hover:underline">inat.finder.py v1.7.5</a> by Alan Rockefeller. iNaturalist data is provided by the iNaturalist API.
+    </footer>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script src="{{ url_for('static', filename='js/inat_finder.js') }}?v=4" defer></script>
+{% endblock %}

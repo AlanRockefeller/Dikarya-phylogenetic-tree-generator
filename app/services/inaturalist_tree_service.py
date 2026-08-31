@@ -96,14 +96,32 @@ def _pacing_redis():
     return _pacing_client
 
 
-def _reserve_slot_local(interval: float) -> float:
-    """Process-local fallback reservation. Returns seconds to wait."""
+def _reserve_slot_local(interval: float,
+                        max_wait: Optional[float] = None) -> float:
+    """Process-local fallback reservation. Returns seconds to wait.
+
+    Mirrors the Redis Lua path exactly: the prospective wait is checked against
+    ``max_wait`` *before* the cursor is committed, so a rejected caller does not
+    consume a slot. Advancing first and rejecting afterwards pushed the cursor
+    further into the future on every refusal, which made each subsequent
+    interactive request wait longer than the last for requests that were never
+    actually sent.
+
+    Raises InatTreeError when the wait exceeds ``max_wait``.
+    """
     global _local_next_slot
     with _pacing_lock:
         now = time.monotonic()
         slot = max(_local_next_slot, now)
+        wait = max(0.0, slot - now)
+        if max_wait is not None and wait > max_wait:
+            raise InatTreeError(
+                "iNaturalist requests are busy right now. Please try again shortly.",
+                status=503,
+                details={"retry_after_seconds": max(1, int(wait))},
+            )
         _local_next_slot = slot + interval
-        return max(0.0, slot - now)
+        return wait
 
 
 def _reserve_inat_slot(interval: float = RATE_LIMIT_DELAY,
@@ -140,13 +158,7 @@ def _reserve_inat_slot(interval: float = RATE_LIMIT_DELAY,
             "iNaturalist request pacing fell back to per-process timing",
             exception=type(exc).__name__,
         )
-        wait = _reserve_slot_local(interval)
-        if max_wait is not None and wait > max_wait:
-            raise InatTreeError(
-                "iNaturalist requests are busy right now. Please try again shortly.",
-                status=503,
-                details={"retry_after_seconds": max(1, int(wait))},
-            )
+        wait = _reserve_slot_local(interval, max_wait)
     return wait
 
 
@@ -885,10 +897,26 @@ DEFAULT_TREE_PARAMS = {
 }
 
 
+def _report_progress(progress, message: str, icon: str = "running") -> None:
+    """Send a human-readable step note to the caller's Activity Feed, if any.
+
+    ``icon`` is one of the feed's four states (running/done/skipped/failed).
+    Progress reporting is decoration: a broken callback must never fail the
+    MycoMap refresh it is describing.
+    """
+    if not progress:
+        return
+    try:
+        progress(message, icon=icon)
+    except Exception:  # pragma: no cover - never break a job over a feed message
+        logger.debug("progress callback failed for message: %s", message, exc_info=True)
+
+
 def _refresh_mycomap_blast_results(blast_id: str, *, rebuild_ncbi_blast: bool = False,
                                    rebuild_local_blast: bool = True,
                                    mycomap_local_limit=None,
-                                   mycomap_ncbi_limit=None) -> Dict[str, Any]:
+                                   mycomap_ncbi_limit=None,
+                                   progress=None) -> Dict[str, Any]:
     """Refresh MycoMap BLAST results before importing FASTA for a tree job.
 
     The automatic local refresh is best-effort so a missing API key or a
@@ -916,11 +944,20 @@ def _refresh_mycomap_blast_results(blast_id: str, *, rebuild_ncbi_blast: bool = 
         "warnings": [],
     }
     if rebuild_local_blast:
+        # Alan 8/31/26 - The local rerun is a synchronous MycoMap round trip that can
+        # take a while; without these the Activity Feed sits silent on the input step.
+        _report_progress(
+            progress,
+            f"Refreshing MycoMap local BLAST results (top {local_limit})...",
+        )
         try:
             result["local"] = rerun_mycomap_blast(
                 blast_id, result_type="local", limit=local_limit
             )
             result["local_status"] = "completed"
+            _report_progress(
+                progress, "MycoMap local BLAST results refreshed.", icon="done"
+            )
         except MycoMapRerunError as exc:
             warning = (
                 "MycoMap local BLAST could not be refreshed; Dikarya will use "
@@ -931,6 +968,10 @@ def _refresh_mycomap_blast_results(blast_id: str, *, rebuild_ncbi_blast: bool = 
             result["local_error"] = str(exc)
             result["warnings"].append(warning)
     if rebuild_ncbi_blast:
+        _report_progress(
+            progress,
+            f"Requesting a MycoMap NCBI BLAST rebuild (top {ncbi_limit})...",
+        )
         result["ncbi"] = rerun_mycomap_blast(blast_id, result_type="ncbi", limit=ncbi_limit)
         result["ncbi_status"] = "queued"
     return result
@@ -1263,51 +1304,14 @@ def _build_inat_job_title(observation_id: int, genus: Optional[str] = None) -> s
     return f"iNat # {int(observation_id)} - {genus_label} → Phylogenetic Tree"
 
 
-def _normalize_location_piece(piece: str) -> str:
-    """Collapse common country variants so labels stay short."""
-    cleaned = _clean_display_text(piece)
-    if not cleaned:
-        return ""
-    lowered = cleaned.casefold()
-    if lowered in {
-        "united states",
-        "united states of america",
-        "usa",
-        "u.s.a.",
-        "u.s.",
-    }:
-        return "US"
-    return cleaned
-
-
 def _extract_inat_location_label(observation: Dict[str, Any]) -> str:
-    """Return a compact place label like `New Mexico US`."""
-    for key in (
-        "private_place_guess",
-        "place_guess",
-        "private_locality",
-        "locality",
-    ):
-        raw = observation.get(key)
-        if not raw:
-            continue
-        parts = [
-            _normalize_location_piece(part)
-            for part in str(raw).split(",")
-        ]
-        parts = [part for part in parts if part]
-        if not parts:
-            continue
-        # Prefer the human-readable region name when iNat returns nested
-        # place text like "New Mexico, NM, United States". In that case the
-        # middle component is just an abbreviation and the first + last
-        # components are the label people expect to see.
-        if len(parts) >= 3 and len(parts[-2]) <= 3:
-            return f"{parts[0]} {parts[-1]}".strip()
-        if len(parts) >= 2:
-            return " ".join(parts[-2:])
-        return parts[0]
-    return ""
+    """Return a compact place label like `Pike Co. MS US`.
+
+    Uses iNaturalist's standardized places (derived from the coordinates) and
+    falls back to parsing the observer's free-text place_guess.
+    """
+    from app.services.inaturalist_places import location_label_for_observation
+    return location_label_for_observation(observation)
 
 
 def _build_inat_source_display_name(observation: Dict[str, Any], observation_id: int) -> str:
@@ -1468,10 +1472,18 @@ def _mycomap_creation_discovery_message(waited_seconds: int,
     we never obtained one, so we cannot say anything about how many hits the
     search found - only that we could not find the search itself.
     """
-    minutes = max(1, round(waited_seconds / 60))
+    if waited_seconds >= 24 * 60 * 60:
+        value = max(1, round(waited_seconds / (24 * 60 * 60)))
+        duration = f"{value} day{'s' if value != 1 else ''}"
+    elif waited_seconds >= 60 * 60:
+        value = max(1, round(waited_seconds / (60 * 60)))
+        duration = f"{value} hour{'s' if value != 1 else ''}"
+    else:
+        value = max(1, round(waited_seconds / 60))
+        duration = f"{value} minute{'s' if value != 1 else ''}"
     message = (
         "MycoMap accepted this BLAST request, but its results page had still "
-        f"not appeared {minutes} minute{'s' if minutes != 1 else ''} later, "
+        f"not appeared {duration} later, "
         "so there was no search to read local (MycoBLAST) or NCBI hits from. "
         "This usually means MycoMap's BLAST queue is backed up. Rebuild this "
         "tree once the search appears at "
@@ -1492,10 +1504,10 @@ def _create_mycomap_blast_from_observation(observation: Dict[str, Any],
     """Create a MycoMap search from an observation's ITS and write its URL back."""
     from app.services.fasta_utils import clean_dna_sequence
     from app.services.mycomap_service import (
+        advance_mycomap_creation_discovery,
         MycoMapCreateError,
         create_mycomap_blast,
         find_mycomap_blast_by_title,
-        get_mycomap_creation_discovery_max_attempts,
         get_mycomap_creation_discovery_max_seconds,
         validate_mycomap_rerun_limit,
     )
@@ -1528,10 +1540,10 @@ def _create_mycomap_blast_from_observation(observation: Dict[str, Any],
             "reused_existing": True,
         })
     elif (pending_creation_details or {}).get("creation_pending"):
-        details = dict(pending_creation_details)
-        attempt = int(details.get("creation_discovery_attempt") or 0) + 1
-        max_attempts = get_mycomap_creation_discovery_max_attempts()
-        if attempt >= max_attempts:
+        details, expired = advance_mycomap_creation_discovery(
+            pending_creation_details
+        )
+        if expired:
             raise InatTreeError(
                 _mycomap_creation_discovery_message(
                     get_mycomap_creation_discovery_max_seconds(),
@@ -1539,7 +1551,6 @@ def _create_mycomap_blast_from_observation(observation: Dict[str, Any],
                 ),
                 status=504,
             )
-        details["creation_discovery_attempt"] = attempt
         if discovery_warnings:
             details["creation_discovery_warnings"] = discovery_warnings
         return details
@@ -1566,6 +1577,7 @@ def _create_mycomap_blast_from_observation(observation: Dict[str, Any],
             "auto_created": True,
             "creation_pending": True,
             "creation_discovery_attempt": 0,
+            "creation_discovery_elapsed_seconds": 0,
             "created_title": job_title,
             "created_blast_id": None,
             "created_mycomap_url": "",
@@ -1964,7 +1976,8 @@ def prepare_inat_tree_job(observation_id: int, *, include_ncbi: bool = True,
                           mycomap_ncbi_limit=None,
                           defer_after_ncbi_rerun: bool = False,
                           skip_mycomap_refresh: bool = False,
-                          mycomap_rerun_details: Optional[Dict[str, Any]] = None
+                          mycomap_rerun_details: Optional[Dict[str, Any]] = None,
+                          progress=None
                           ) -> Dict[str, Any]:
     """Fetch, refresh, and import an iNaturalist observation's MycoMap input.
 
@@ -2070,6 +2083,7 @@ def prepare_inat_tree_job(observation_id: int, *, include_ncbi: bool = True,
                 rebuild_ncbi_blast=bool(rebuild_ncbi_blast),
                 mycomap_local_limit=mycomap_local_limit,
                 mycomap_ncbi_limit=mycomap_ncbi_limit,
+                progress=progress,
             )
         except MycoMapRerunError as e:
             raise InatTreeError(str(e), status=502)

@@ -1,5 +1,6 @@
 import subprocess
 import logging
+import math
 import os
 import re
 import shutil
@@ -190,14 +191,39 @@ _TOOL_TIME_LIMIT_HOURS = {
 }
 
 
+def resolve_positive_number(value, default: float) -> float:
+    """Coerce a configured numeric limit to a finite, positive float.
+
+    The single parser for every timeout Dikarya reads out of configuration.
+    Environment variables reach `Config` as ``float(os.environ[...])``, and
+    ``float()`` happily accepts ``"nan"`` and ``"inf"`` -- an infinite budget
+    then propagates into ``int(hours * 3600)``, which raises OverflowError, and
+    a NaN one silently compares False against every bound. Missing, malformed,
+    non-finite and non-positive values all fall back to the documented default.
+    """
+    if isinstance(value, bool):
+        # True would otherwise mean "one", which no operator ever intends.
+        return float(default)
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return float(default)
+    if not math.isfinite(number) or number <= 0:
+        return float(default)
+    return number
+
+
+def resolve_time_limit_hours(value, default: float) -> float:
+    """`resolve_positive_number`, named for the wall-clock-budget call sites."""
+    return resolve_positive_number(value, default)
+
+
 def configured_tool_time_limit_hours(config, tool: str) -> float:
     """Return a positive, operator-overridable wall-clock budget in hours."""
     attr, default = _TOOL_TIME_LIMIT_HOURS.get(tool, (None, 8.0))
-    try:
-        value = float(getattr(config, attr, default)) if attr else default
-    except (TypeError, ValueError):
-        value = default
-    return value if value > 0 else default
+    if not attr:
+        return float(default)
+    return resolve_time_limit_hours(getattr(config, attr, default), default)
 
 
 def configured_tool_timeout_seconds(config, tool: str) -> int:

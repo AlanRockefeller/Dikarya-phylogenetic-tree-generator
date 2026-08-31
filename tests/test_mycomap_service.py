@@ -93,6 +93,37 @@ class TestMycomapUrlValidation(unittest.TestCase):
         self.assertIsNone(result)
 
 
+class TestMycomapCreationDiscoveryBackoff(unittest.TestCase):
+    def test_polling_backs_off_after_one_hour_six_hours_and_one_day(self):
+        interval = mycomap_service.get_mycomap_creation_discovery_poll_interval_seconds
+
+        self.assertEqual(interval(0), 60)
+        self.assertEqual(interval(3599), 60)
+        self.assertEqual(interval(3600), 5 * 60)
+        self.assertEqual(interval(6 * 3600), 15 * 60)
+        self.assertEqual(interval(24 * 3600), 60 * 60)
+
+    @patch.dict(
+        "os.environ",
+        {"MYCOMAP_CREATION_DISCOVERY_MAX_SECONDS": str(4 * 24 * 3600)},
+    )
+    def test_four_day_backoff_fits_in_a_bounded_number_of_rq_retries(self):
+        self.assertEqual(
+            mycomap_service.get_mycomap_creation_discovery_max_attempts(),
+            264,
+        )
+
+    def test_legacy_one_hour_job_moves_to_five_minute_checks(self):
+        details, expired = mycomap_service.advance_mycomap_creation_discovery({
+            "creation_pending": True,
+            "creation_discovery_attempt": 60,
+        })
+
+        self.assertFalse(expired)
+        self.assertEqual(details["creation_discovery_elapsed_seconds"], 65 * 60)
+        self.assertEqual(details["creation_discovery_next_interval_seconds"], 5 * 60)
+
+
 class TestMycomapBlastMetrics(unittest.TestCase):
     """Test local/MycoBLAST metric key parsing without network access."""
 

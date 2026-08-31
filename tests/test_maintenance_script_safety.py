@@ -738,7 +738,7 @@ def run_backfill(backfill, tmp_path, monkeypatch):
     from app.config import Config
     from app.extensions import db
 
-    def _run(jobs, observations, argv):
+    def _run(jobs, observations, argv, commit=None):
         app = Flask(__name__)
         commits = []
 
@@ -751,8 +751,13 @@ def run_backfill(backfill, tmp_path, monkeypatch):
             },
         )
         monkeypatch.setattr(Config, "JOB_DIR", tmp_path / "jobs")
+        def _commit():
+            commits.append(True)
+            if commit is not None:
+                commit()
+
         monkeypatch.setattr(
-            db, "session", SimpleNamespace(commit=lambda: commits.append(True))
+            db, "session", SimpleNamespace(commit=_commit, rollback=lambda: None)
         )
 
         printed = []
@@ -885,10 +890,14 @@ def test_a_legacy_title_still_supplies_the_observation_id(run_backfill, tmp_path
 
 
 def test_apply_returns_nonzero_when_an_input_info_write_fails(run_backfill, tmp_path):
-    """The database is already committed, so a partial run must not report success.
+    """A partial run must not report success -- and must not half-apply either.
 
-    A job whose input_info.json did not follow leaves the two stores disagreeing
-    about the same job's title, and cron can only see that through the exit code.
+    The artifact is written first and the database row only follows for a job
+    whose file actually changed. A job whose input_info.json could not be
+    rewritten therefore keeps its old title in *both* stores rather than being
+    renamed in the database alone, which used to leave the two permanently
+    disagreeing with nothing to undo it with. Cron still sees the shortfall
+    through the exit code.
     """
     good = _make_job(tmp_path, "0123abcd-0123-0123-0123-00000000000e", {
         "via": "inat_phylogenetic_tree", "inat_observation_id": 111,
@@ -908,10 +917,11 @@ def test_apply_returns_nonzero_when_an_input_info_write_fails(run_backfill, tmp_
 
     assert code == 1, "a partial apply reported success"
     assert summary["input_info"] == {"missing": 1, "updated": 1}
-    assert summary["database_jobs_updated"] == 2
-    # The database half did happen; that is exactly why the exit code matters.
+    # Only the job whose artifact followed was renamed in the database.
+    assert summary["database_jobs_updated"] == 1
     assert commits == [True]
-    assert broken.metrics["notes"] == "iNat # 222 - Russula → Phylogenetic Tree"
+    assert "notes" not in (broken.metrics or {})
+    assert good.metrics["notes"] == "iNat # 111 - Amanita → Phylogenetic Tree"
 
 
 def test_input_info_failure_removes_its_temporary_file(
@@ -967,6 +977,207 @@ def test_an_unresolvable_observation_stops_the_run_before_any_write(
     )["notes"] == "old title"
 
 
+# --- backfill rollback journal ----------------------------------------------
+#
+# The transaction is artifact-first, database-second, so between the first
+# rewrite and the commit there is a window where input_info.json files on disk
+# disagree with the database. The journal is what closes that window. It used to
+# hold each file's original *bytes*, so a run across the whole job corpus kept
+# every rewritten input_info.json -- submitted FASTA and all -- resident until it
+# committed. These pin the disk-backed replacement: same transactional
+# behaviour, memory that does not grow with the artifacts.
+
+def _backup_files(tmp_path):
+    return sorted(
+        path.name for path in (tmp_path / "jobs").rglob("*" + _BACKUP_SUFFIX)
+    )
+
+
+_BACKUP_SUFFIX = ".backfill-backup"
+
+
+def test_the_journal_holds_paths_rather_than_artifact_contents(backfill, tmp_path, monkeypatch):
+    """O(1) memory per job: the journal must not grow with the file's size."""
+    from app.config import Config
+
+    monkeypatch.setattr(Config, "JOB_DIR", tmp_path / "jobs")
+    job = _make_job(tmp_path, "0123abcd-0123-0123-0123-000000000020", {
+        "via": "inat_phylogenetic_tree", "inat_observation_id": 111,
+    })
+    # A megabyte-scale artifact, the way a real submitted FASTA is.
+    payload = {"notes": "old title", "sequence": ">A\n" + ("ACGT" * 300_000)}
+    (tmp_path / "jobs" / job.id / "input_info.json").write_text(
+        json.dumps(payload), encoding="utf-8")
+
+    journal = []
+    assert backfill._update_input_info(job, "new title", journal=journal) == "updated"
+
+    assert len(journal) == 1
+    entry = journal[0]
+    assert all(isinstance(item, Path) for item in entry), entry
+    # Nothing in the journal is anywhere near the size of the artifact.
+    assert sum(len(str(item)) for item in entry) < 1000
+
+
+def test_a_committed_run_leaves_no_rollback_files_behind(run_backfill, tmp_path):
+    """Backups exist only for the life of the transaction."""
+    jobs = [
+        _make_job(tmp_path, f"0123abcd-0123-0123-0123-00000000002{index}", {
+            "via": "inat_phylogenetic_tree", "inat_observation_id": 100 + index,
+        })
+        for index in (1, 2, 3)
+    ]
+    observations = {100 + index: _observation(100 + index) for index in (1, 2, 3)}
+
+    code, summary, commits = run_backfill(jobs, observations, ["--apply"])
+
+    assert code == 0
+    assert commits == [True]
+    assert summary["input_info"] == {"updated": 3}
+    assert "input_info_backups_left" not in summary
+    assert _backup_files(tmp_path) == []
+    for job in jobs:
+        assert json.loads(
+            (tmp_path / "jobs" / job.id / "input_info.json").read_text()
+        )["notes"] == job.metrics["notes"]
+
+
+def test_a_failed_commit_restores_every_file_the_run_had_rewritten(
+    run_backfill, tmp_path
+):
+    """The point of the journal: no artifact may outlive a rolled-back commit."""
+    jobs = [
+        _make_job(tmp_path, f"0123abcd-0123-0123-0123-00000000003{index}", {
+            "via": "inat_phylogenetic_tree", "inat_observation_id": 200 + index,
+        })
+        for index in (1, 2, 3)
+    ]
+    observations = {200 + index: _observation(200 + index) for index in (1, 2, 3)}
+    before = {
+        job.id: (tmp_path / "jobs" / job.id / "input_info.json").read_text()
+        for job in jobs
+    }
+
+    def explode():
+        raise RuntimeError("simulated commit failure")
+
+    code, summary, commits = run_backfill(
+        jobs, observations, ["--apply"], commit=explode)
+
+    assert code == 1
+    assert commits == [True], "the commit was attempted"
+    assert summary["database_jobs_updated"] == 0
+    assert summary["error"] == "database commit failed: RuntimeError"
+    assert summary["input_info_restore_failures"] == []
+
+    # Every artifact is byte-for-byte what it was, and the sequence survived.
+    for job in jobs:
+        path = tmp_path / "jobs" / job.id / "input_info.json"
+        assert path.read_text() == before[job.id]
+        assert json.loads(path.read_text())["notes"] == "old title"
+    # A successful rollback consumes its own backups.
+    assert _backup_files(tmp_path) == []
+
+
+def test_a_backup_that_cannot_be_restored_is_reported_and_kept(
+    backfill, tmp_path, monkeypatch
+):
+    """A failed rollback must not also delete the only surviving original."""
+    from app.config import Config
+
+    monkeypatch.setattr(Config, "JOB_DIR", tmp_path / "jobs")
+    job = _make_job(tmp_path, "0123abcd-0123-0123-0123-000000000040", {
+        "via": "inat_phylogenetic_tree", "inat_observation_id": 111,
+    })
+    journal = []
+    assert backfill._update_input_info(job, "new title", journal=journal) == "updated"
+    backup_path = journal[0][1]
+    assert backup_path.is_file()
+
+    def fail_replace(source, target):
+        raise OSError("simulated restore failure")
+
+    monkeypatch.setattr(backfill.os, "replace", fail_replace)
+    failures = backfill._restore_input_info(journal)
+
+    assert failures == [str(tmp_path / "jobs" / job.id / "input_info.json")]
+    # The original is still recoverable by hand.
+    assert json.loads(backup_path.read_text())["notes"] == "old title"
+
+
+def test_a_stale_backup_is_refused_rather_than_overwritten(
+    backfill, tmp_path, monkeypatch
+):
+    """That file holds a previous crashed run's original; it is not ours to lose."""
+    from app.config import Config
+
+    monkeypatch.setattr(Config, "JOB_DIR", tmp_path / "jobs")
+    job = _make_job(tmp_path, "0123abcd-0123-0123-0123-000000000041", {
+        "via": "inat_phylogenetic_tree", "inat_observation_id": 111,
+    })
+    input_info = tmp_path / "jobs" / job.id / "input_info.json"
+    stale = input_info.with_name(input_info.name + _BACKUP_SUFFIX)
+    stale.write_text(json.dumps({"notes": "the true original"}), encoding="utf-8")
+    current = input_info.read_text()
+
+    journal = []
+    assert backfill._update_input_info(job, "new title", journal=journal) == "stale_backup"
+
+    assert journal == []
+    assert input_info.read_text() == current, "the artifact was rewritten anyway"
+    assert json.loads(stale.read_text())["notes"] == "the true original"
+
+
+def test_a_failed_write_leaves_neither_a_temp_file_nor_a_backup(
+    backfill, tmp_path, monkeypatch
+):
+    """Nothing was changed, so there is nothing to roll back to."""
+    from app.config import Config
+
+    monkeypatch.setattr(Config, "JOB_DIR", tmp_path / "jobs")
+    job = _make_job(tmp_path, "0123abcd-0123-0123-0123-000000000042", {
+        "via": "inat_phylogenetic_tree", "inat_observation_id": 111,
+    })
+    original_replace = Path.replace
+
+    def fail_replace(self, target):
+        if self.name == "input_info.json.tmp":
+            raise OSError("simulated replace failure")
+        return original_replace(self, target)
+
+    monkeypatch.setattr(Path, "replace", fail_replace)
+
+    journal = []
+    assert backfill._update_input_info(job, "new title", journal=journal) == "write_failed"
+
+    assert journal == []
+    assert _backup_files(tmp_path) == []
+    assert not (Path(job.job_dir) / "input_info.json.tmp").exists()
+
+
+def test_the_rewrite_preserves_the_artifacts_permissions(
+    backfill, tmp_path, monkeypatch
+):
+    """os.replace() hands the target the temp file's mode.
+
+    input_info.json is rewritten in place by ordinary user actions running as
+    the dikarya services, so a maintenance run that dropped it to 0644 would
+    quietly take that away -- the tree_state.json failure in AGENTS.md.
+    """
+    from app.config import Config
+
+    monkeypatch.setattr(Config, "JOB_DIR", tmp_path / "jobs")
+    job = _make_job(tmp_path, "0123abcd-0123-0123-0123-000000000043", {
+        "via": "inat_phylogenetic_tree", "inat_observation_id": 111,
+    })
+    input_info = tmp_path / "jobs" / job.id / "input_info.json"
+    input_info.chmod(0o664)
+
+    assert backfill._update_input_info(job, "new title", journal=[]) == "updated"
+
+    assert input_info.stat().st_mode & 0o777 == 0o664
+
+
 # --------------------------------------------------------------------------
 # scripts/dikarya-claude-review: the spend boundary
 # --------------------------------------------------------------------------
@@ -987,6 +1198,7 @@ def _wrapper_budget_verdict(value):
         input="",
         capture_output=True,
         text=True,
+        timeout=60,
         env={
             **os.environ,
             "DIKARYA_CLAUDE_MAX_BUDGET": value,
@@ -1084,7 +1296,7 @@ def test_the_hard_cap_is_the_same_number_on_both_sides():
     assert "$2.00" in (REPO_ROOT / "ARCHITECTURE.md").read_text()
 
 
-def test_everything_the_app_can_emit_is_accepted_by_the_wrapper():
+def test_everything_the_app_can_emit_is_accepted_by_the_wrapper(monkeypatch):
     """The invariant that actually matters across the privilege boundary.
 
     The two layers are not the same grammar: the app canonicalizes (it tolerates
@@ -1101,13 +1313,12 @@ def test_everything_the_app_can_emit_is_accepted_by_the_wrapper():
         "1.00; rm -rf /", "",
     ]
     for candidate in candidates:
-        os.environ["BUDGET_PROBE"] = candidate
+        monkeypatch.setenv("BUDGET_PROBE", candidate)
         emitted = config.budget_env("BUDGET_PROBE", "1.00")
         assert _wrapper_budget_verdict(emitted) == "accept", (candidate, emitted)
-    os.environ.pop("BUDGET_PROBE", None)
 
 
-def test_the_app_canonicalizes_and_clamps_out_of_range_values():
+def test_the_app_canonicalizes_and_clamps_out_of_range_values(monkeypatch):
     config = _app_config()
     cases = {
         "1": "1.00", "1.5": "1.50", " 1.25 ": "1.25", "01.50": "1.50",
@@ -1117,12 +1328,11 @@ def test_the_app_canonicalizes_and_clamps_out_of_range_values():
         "-1": "1.00", "1e9": "1.00", "NaN": "1.00", "": "1.00",
     }
     for raw, expected in cases.items():
-        os.environ["BUDGET_PROBE"] = raw
+        monkeypatch.setenv("BUDGET_PROBE", raw)
         assert config.budget_env("BUDGET_PROBE", "1.00") == expected, raw
-    os.environ.pop("BUDGET_PROBE", None)
 
     # Unset is left to the caller's default rather than canonicalized.
-    os.environ.pop("BUDGET_PROBE", None)
+    monkeypatch.delenv("BUDGET_PROBE", raising=False)
     assert config.budget_env("BUDGET_PROBE", "1.00") == "1.00"
 
 

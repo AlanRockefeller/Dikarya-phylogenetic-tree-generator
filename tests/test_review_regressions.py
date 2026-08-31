@@ -3,7 +3,9 @@
 import fcntl
 import gzip
 import inspect
+import json
 import threading
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
@@ -37,6 +39,7 @@ def _undecorated(view):
 
 
 JOB_ID = "12345678-1234-1234-1234-123456789abc"
+V1_JOB_ID = "12345678-1234-4234-8234-123456789abc"
 
 
 def _annotation_state():
@@ -156,6 +159,39 @@ def test_unchanged_duplicate_recompute_remains_idempotent(tmp_path):
 
     assert status == 202
     assert response.get_json()["status"] == "already_queued"
+
+
+@pytest.mark.parametrize(("created", "checkpoint_survives"), [(True, False), (False, True)])
+def test_v1_recompute_clears_undo_only_when_a_new_job_is_created(
+    tmp_path, created, checkpoint_survives
+):
+    from app.api_v1 import routes as v1_routes
+
+    job_dir = tmp_path / V1_JOB_ID
+    checkpoint = job_dir / ".tree_undo"
+    checkpoint.mkdir(parents=True)
+    (checkpoint / "sentinel").write_text("old topology")
+    (job_dir / "input_info.json").write_text(json.dumps({"tree_method": "raxml"}))
+    job = SimpleNamespace(status="completed", metrics={})
+
+    app = Flask(__name__)
+    with (
+        app.test_request_context(method="POST", json={}),
+        patch.object(Config, "JOB_DIR", tmp_path),
+        patch.object(v1_routes, "get_owned_job_or_404", return_value=job),
+        patch.object(
+            v1_routes, "enqueue_recompute_job", return_value=("rq-job", created)
+        ),
+        patch.object(v1_routes, "url_for", return_value="/api/v1/job"),
+        patch.object(v1_routes, "db"),
+    ):
+        response = _undecorated(v1_routes.recompute_job)(V1_JOB_ID)
+
+    assert response.status_code == 202
+    assert response.get_json()["data"]["status"] == (
+        "queued" if created else "already_queued"
+    )
+    assert checkpoint.exists() is checkpoint_survives
 
 
 @pytest.mark.parametrize(

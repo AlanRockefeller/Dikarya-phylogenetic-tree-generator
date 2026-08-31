@@ -160,44 +160,15 @@ def _clean_display_text(value: Any) -> str:
     return text.strip(" ,;:-_")
 
 
-def _normalize_location_piece(piece: str) -> str:
-    """Collapse common country variants so location labels stay short."""
-    cleaned = _clean_display_text(piece)
-    if not cleaned:
-        return ""
-    lowered = cleaned.casefold()
-    if lowered in {
-        "united states",
-        "united states of america",
-        "usa",
-        "u.s.a.",
-        "u.s.",
-    }:
-        return "US"
-    return cleaned
-
-
 def _extract_location_label(observation_data: Dict) -> str:
-    """Return a compact iNaturalist location label like `New Mexico US`."""
-    for key in (
-        "private_place_guess",
-        "place_guess",
-        "private_locality",
-        "locality",
-    ):
-        raw = observation_data.get(key)
-        if not raw:
-            continue
-        parts = [_normalize_location_piece(part) for part in str(raw).split(",")]
-        parts = [part for part in parts if part]
-        if not parts:
-            continue
-        if len(parts) >= 3 and len(parts[-2]) <= 3:
-            return f"{parts[0]} {parts[-1]}".strip()
-        if len(parts) >= 2:
-            return " ".join(parts[-2:])
-        return parts[0]
-    return ""
+    """Return a compact iNaturalist location label like `New Mexico US`.
+
+    Parsed from the observer's free-text place. Prefer the standardized places
+    (`inaturalist_places.resolve_place_labels`); this is the fallback for when
+    those cannot be resolved.
+    """
+    from app.services.inaturalist_places import location_label_from_place_guess
+    return location_label_from_place_guess(observation_data)
 
 
 def _make_api_request(url: str, max_retries: int = 3) -> Dict:
@@ -546,18 +517,33 @@ def analyze_provisional_species(observations: List[Dict]) -> List[Dict]:
     ]
 
 
-def extract_sequences_from_observations(dna_observations: List[Dict]) -> List[Dict]:
+def extract_sequences_from_observations(dna_observations: List[Dict],
+                                        deadline: Optional[float] = None,
+                                        resolve_places: bool = True) -> List[Dict]:
     """
     Convert analyzed observations to sequence dicts for the queue.
     
     Args:
         dna_observations: List of observation analysis dicts
+        deadline: Optional time.monotonic() cutoff for the standardized place
+            lookup, so a slow iNaturalist does not hold a request open. When it
+            passes, the remaining observations fall back to place_guess.
+        resolve_places: Look the standardized places up. Callers that only need
+            counts or the raw DNA can pass False and skip the upstream calls.
         
     Returns:
         List of sequence dicts compatible with the sequence queue
     """
+    from app.services.inaturalist_places import resolve_place_labels
+
     sequences = []
-    
+    # One batched place lookup for the whole import: an observation carries
+    # ~20 place ids, and the states and counties repeat heavily across a tree.
+    place_labels = resolve_place_labels(
+        [obs_data['observation'] for obs_data in dna_observations],
+        deadline=deadline,
+    ) if resolve_places else {}
+
     for obs_data in dna_observations:
         obs = obs_data['observation']
         cleaned_dna = obs_data['cleaned_dna']
@@ -581,13 +567,15 @@ def extract_sequences_from_observations(dna_observations: List[Dict]) -> List[Di
         
         # Sanitize species name
         species_name = re.sub(r'[<>"\']', '', str(species_name or '')).strip()
-        location_label = _extract_location_label(obs)
+        # Prefer iNaturalist's standardized places over the observer's
+        # free-text place_guess, which is often a road or a zip code.
+        location_label = (place_labels.get(obs_id)
+                          or _extract_location_label(obs))
         
-        # Build sequence name with the observation ID and location visible in tree labels.
-        seq_name_parts = [f"iNat{obs_id}"]
-        if location_label:
-            seq_name_parts.append(location_label)
-        seq_name = " ".join(seq_name_parts)
+        # The observation ID alone; the species and then the location are
+        # appended to the FASTA header downstream, so a tip reads
+        # "iNat13923264 Cyanoboletus bessettei Madison Co. MS US".
+        seq_name = f"iNat{obs_id}"
         
         sequences.append({
             'name': seq_name,
@@ -649,6 +637,11 @@ def fetch_inaturalist_data(url: str, mode: str = 'all',
     }
 
     deadline = None if time_budget is None else time.monotonic() + time_budget
+    # 'all' is the analyze pass behind the Fetch button: it reports counts and,
+    # for a single observation, the raw DNA to BLAST. Nothing there shows a tip
+    # label, so the standardized place lookup is left for the 'its_only' pass
+    # that actually fills the queue.
+    label_places = mode != 'all'
     
     if url_info['type'] == 'single_observation':
         # Single observation: fetch once, analyze for both
@@ -656,7 +649,9 @@ def fetch_inaturalist_data(url: str, mode: str = 'all',
         
         # Analyze ITS
         analysis = analyze_observations([observation])
-        sequences = extract_sequences_from_observations(analysis['dna_observations'])
+        sequences = extract_sequences_from_observations(
+            analysis['dna_observations'], deadline=deadline,
+            resolve_places=label_places)
         
         # Analyze PSN independently (regardless of whether ITS exists)
         psn_histogram = analyze_provisional_species([observation])
@@ -688,7 +683,9 @@ def fetch_inaturalist_data(url: str, mode: str = 'all',
         
         # Analyze ITS results
         its_analysis = analyze_observations(its_obs)
-        sequences = extract_sequences_from_observations(its_analysis['dna_observations'])
+        sequences = extract_sequences_from_observations(
+            its_analysis['dna_observations'], deadline=deadline,
+            resolve_places=label_places)
         
         final_result.update({
              # Use ITS available count as primary "match" metric for sequences

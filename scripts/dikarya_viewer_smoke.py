@@ -1,0 +1,441 @@
+#!/usr/bin/env python3
+"""End-to-end smoke test for the tree viewer, against a live server, via curl.
+
+WHY
+---
+On 2026-08-24 the viewer bootstrap died on a temporal-dead-zone ReferenceError
+and /job/<id>/view hung on "loading" forever for every visitor. Note what an
+ordinary uptime check saw during the outage:
+
+    $ curl -o /dev/null -w '%{http_code}' https://dikarya.us/job/<id>/view
+    200
+
+The page was fine. The JavaScript was broken. Any check that stops at the HTTP
+status of the HTML is blind to the entire class of failure that actually takes
+this viewer down, because the viewer is a client-side application and the server
+is merely handing over its parts.
+
+So this script fetches the page, then fetches every same-origin static script
+the page references at the exact ?v= URL production serves. It first requires
+every executable response to match the trusted local checkout byte-for-byte,
+then executes the verified bundle through the same init harness the unit tests
+use (tests/js/viewer_init_smoke.test.js). Mismatched remote bytes are reported
+and never executed.
+
+That last step is the point. The unit tests check your working tree; this
+checks what users are being served. Those differ exactly when it matters most -
+during the 2026-08-24 incident the working tree was already fixed while
+production still served the broken file, and a stale ?v= cache-buster can keep
+serving a fixed file's old version indefinitely.
+
+USAGE
+    scripts/dikarya_viewer_smoke.py                          # default job
+    scripts/dikarya_viewer_smoke.py --job <uuid>
+    scripts/dikarya_viewer_smoke.py --base-url https://dikarya.us
+    scripts/dikarya_viewer_smoke.py --quiet                  # cron/CI mode
+
+Exits 0 if the viewer boots, 1 otherwise. Needs network egress, so agents run
+it outside the sandbox.
+"""
+
+import argparse
+import json
+import shutil
+import subprocess
+import sys
+import tempfile
+from html.parser import HTMLParser
+from pathlib import Path
+from urllib.parse import urljoin, urlparse
+
+REPO = Path(__file__).resolve().parents[1]
+HARNESS = REPO / "tests" / "js" / "viewer_init_smoke.test.js"
+
+DEFAULT_BASE = "https://dikarya.us"
+# A small, public, long-lived job. Anything anonymous and viewable works; this
+# is only the default so the script is runnable with no arguments.
+DEFAULT_JOB = "3abfc9b9-5aea-4db6-acde-323148f41361"
+
+# DOM anchors the controller reaches for during bootstrap. If the template stops
+# emitting these, the viewer wires itself to nothing and silently does nothing.
+REQUIRED_ELEMENT_IDS = ["tree-container", "status-message"]
+
+
+class _ScriptSrcExtractor(HTMLParser):
+    """Collect the src of every external <script> the page references.
+
+    A regex cannot do this correctly. `<script src=/static/js/x.js></script>`
+    is valid unquoted-attribute HTML, and the pattern this replaced matched
+    only quoted values -- so an unquoted asset was silently never fetched,
+    never integrity-checked, and never executed. HTMLParser also lowercases
+    tag and attribute names for us, tolerates any attribute order, and treats
+    a <script> body as CDATA, so a "<script>" inside a JS string cannot be
+    mistaken for a tag.
+    """
+
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.srcs = []
+
+    def handle_starttag(self, tag, attrs):
+        if tag != "script":
+            return
+        for name, value in attrs:
+            # A valueless `src` yields None; an inline script has no src at
+            # all. Neither is an external asset.
+            if name == "src" and value and value.strip():
+                self.srcs.append(value.strip())
+                return
+
+
+def script_srcs(html):
+    """Return the src of every external script tag, in document order."""
+    parser = _ScriptSrcExtractor()
+    parser.feed(html)
+    parser.close()
+    return parser.srcs
+
+
+class Failure(Exception):
+    pass
+
+
+def curl(url, *, binary=False, timeout=45):
+    """Fetch a URL with curl, returning (http_code, body, content_type)."""
+    # Body and metadata are separated by a sentinel rather than parsed from
+    # headers, so a Set-Cookie with a newline cannot confuse the split.
+    sentinel = "===CURLMETA==="
+    proc = subprocess.run(
+        [
+            "curl", "-sS", "--compressed", "--max-time", str(timeout),
+            "-w", f"{sentinel}%{{http_code}}\t%{{content_type}}\t%{{size_download}}",
+            url,
+        ],
+        capture_output=True,
+        timeout=timeout + 15,
+    )
+    if proc.returncode != 0:
+        raise Failure(
+            f"curl failed for {url}: exit {proc.returncode}: "
+            f"{proc.stderr.decode('utf-8', 'replace').strip()}"
+        )
+    raw = proc.stdout
+    idx = raw.rfind(sentinel.encode())
+    if idx == -1:
+        raise Failure(f"curl produced no status line for {url}")
+    body = raw[:idx]
+    meta = raw[idx + len(sentinel):].decode("utf-8", "replace").split("\t")
+    code, ctype = meta[0], (meta[1] if len(meta) > 1 else "")
+    if not binary:
+        body = body.decode("utf-8", "replace")
+    return code, body, ctype
+
+
+def check(results, name, ok, detail=""):
+    results.append({"name": name, "ok": bool(ok), "detail": detail})
+    return ok
+
+
+def _verified_static_path(rel):
+    """Resolve a repo-relative asset path, or None if it escapes app/static.
+
+    Defence in depth for the two callers below: an absolute or escaping `rel`
+    would make `REPO / rel` and `workdir / rel` name the SAME file outside the
+    checkout, so copyfile would be handed its own source and an arbitrary
+    local file could be read as though it were a trusted repository asset.
+    """
+    static_root = (REPO / "app" / "static").resolve()
+    try:
+        candidate = (REPO / rel).resolve()
+    except OSError:
+        return None
+    if candidate != static_root and static_root not in candidate.parents:
+        return None
+    return candidate
+
+
+def local_path_for(src_url, base_url):
+    """Map a served /static/... URL back onto its repo-relative path.
+
+    Only same-origin repository assets are eligible. An unrelated host can use
+    a path containing /static/ too; that does not make its JavaScript trusted.
+    """
+    parsed = urlparse(src_url)
+    origin = urlparse(base_url)
+    if (parsed.scheme.lower(), parsed.netloc.lower()) != (
+        origin.scheme.lower(), origin.netloc.lower()
+    ):
+        return None
+    marker = "/static/"
+    if not parsed.path.startswith(marker):
+        return None
+    # Split the URL path on "/" rather than handing it to Path. "/static//tmp/
+    # evil.js" leaves the suffix "/tmp/evil.js", whose first Path part is "/" --
+    # which joinpath() honours as an absolute path, discarding "app/static" and
+    # escaping the repository entirely. As plain segments the leading "" is
+    # visible and refused, along with ".", ".." and empty interior segments.
+    parts = parsed.path[len(marker):].split("/")
+    if any(part in ("", ".", "..") or "\\" in part or "\0" in part
+           for part in parts):
+        return None
+    rel = str(Path("app/static").joinpath(*parts))
+    if _verified_static_path(rel) is None:
+        return None
+    return rel
+
+
+def served_asset_matches_local(rel, served_bytes):
+    """Return whether executable served bytes equal the trusted checkout."""
+    trusted = _verified_static_path(rel)
+    if trusted is None:
+        return False
+    try:
+        return trusted.is_file() and trusted.read_bytes() == served_bytes
+    except OSError:
+        return False
+
+
+def mirror_verified_asset(rel, served_bytes, workdir):
+    """Mirror only an executable asset proven identical to the checkout."""
+    trusted = _verified_static_path(rel)
+    if trusted is None or not served_asset_matches_local(rel, served_bytes):
+        return False
+    destination = Path(workdir) / rel
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copyfile(trusted, destination)
+    return True
+
+
+HARNESS_TIMEOUT = 180
+
+
+def run_served_harness(results, node, workdir):
+    """Execute the verified bundle through the init harness and record its checks.
+
+    A hung Node process and a harness that printed something other than JSON are
+    both *results* of this smoke test, not crashes of it: a traceback out of here
+    escapes the `report()` path, so `--json` emits nothing parseable and a cron
+    caller sees a stack trace where it expected a verdict. Only the two failures
+    that are actually expected from running a subprocess are caught -- a bare
+    `except Exception` would also swallow bugs in this script.
+    """
+    try:
+        proc = subprocess.run(
+            [node, str(HARNESS), str(workdir), "--json"],
+            capture_output=True, text=True, timeout=HARNESS_TIMEOUT,
+        )
+    except subprocess.TimeoutExpired as exc:
+        stdout = exc.stdout or ""
+        if isinstance(stdout, bytes):
+            stdout = stdout.decode("utf-8", "replace")
+        return check(
+            results, "served-bundle-boots", False,
+            f"the harness exceeded the {HARNESS_TIMEOUT}-second timeout and was "
+            f"killed; the viewer bundle may be hanging during init."
+            + (f"\npartial output:\n{stdout.strip()}" if stdout.strip() else ""),
+        )
+
+    if proc.returncode != 0:
+        return check(results, "served-bundle-boots", False,
+                     f"the harness could not run:\n{proc.stdout}\n{proc.stderr}")
+
+    try:
+        rows = json.loads(proc.stdout)
+    except json.JSONDecodeError as exc:
+        return check(
+            results, "served-bundle-boots", False,
+            f"the harness produced malformed JSON output ({exc}); expected a "
+            f"JSON array of checks from {HARNESS.name}.\n"
+            f"stdout:\n{proc.stdout.strip()}\nstderr:\n{proc.stderr.strip()}",
+        )
+
+    rows, shape_error = _harness_rows(rows)
+    if shape_error:
+        return check(
+            results, "served-bundle-boots", False,
+            f"the harness produced JSON of the wrong shape ({shape_error}); "
+            f"expected a JSON array of "
+            f"{{\"name\": str, \"ok\": bool, \"detail\": str}} objects from "
+            f"{HARNESS.name}.\nstdout:\n{proc.stdout.strip()}",
+        )
+
+    for name, ok, detail in rows:
+        check(results, f"served/{name}", ok, detail)
+    return True
+
+
+def _harness_rows(decoded):
+    """Validate the harness's decoded JSON, returning (rows, error).
+
+    The harness is a separate program, so its output is input to this one: a
+    payload that parses as JSON but is not the array of checks we expect must be
+    reported through `check()` like any other failure. Indexing it directly
+    raised TypeError/KeyError out of run_served_harness(), which escapes
+    `report()` -- so `--json` printed a traceback instead of parseable results
+    and a cron caller got a stack trace where it expected a verdict.
+
+    `detail` is optional and defaults to "" because it is purely explanatory;
+    `name` and `ok` are not, because a check with no identity or no verdict
+    cannot be reported at all.
+    """
+    if not isinstance(decoded, list):
+        return None, f"top level is {type(decoded).__name__}, not an array"
+
+    rows = []
+    for index, row in enumerate(decoded):
+        where = f"row {index}"
+        if not isinstance(row, dict):
+            return None, f"{where} is {type(row).__name__}, not an object"
+
+        name = row.get("name")
+        if not isinstance(name, str) or not name.strip():
+            return None, (f"{where} has no usable \"name\" "
+                          f"({name!r})")
+
+        if "ok" not in row:
+            return None, f"{where} ({name!r}) has no \"ok\" field"
+        ok = row["ok"]
+        if not isinstance(ok, bool):
+            return None, (f"{where} ({name!r}) has a non-boolean \"ok\" "
+                          f"({ok!r})")
+
+        detail = row.get("detail", "")
+        if detail is None:
+            detail = ""
+        if not isinstance(detail, str):
+            return None, (f"{where} ({name!r}) has a non-string \"detail\" "
+                          f"({detail!r})")
+
+        rows.append((name.strip(), ok, detail))
+    return rows, None
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--base-url", default=DEFAULT_BASE)
+    ap.add_argument("--job", default=DEFAULT_JOB)
+    ap.add_argument("--quiet", action="store_true",
+                    help="print only failures and a one-line verdict")
+    ap.add_argument("--json", action="store_true", help="emit results as JSON")
+    ap.add_argument("--keep", action="store_true",
+                    help="keep the downloaded bundle for inspection")
+    args = ap.parse_args()
+
+    node = shutil.which("node")
+    if not node:
+        print("node is not installed; cannot execute the served bundle", file=sys.stderr)
+        return 2
+
+    results = []
+    view_url = f"{args.base_url.rstrip('/')}/job/{args.job}/view"
+
+    # --- 1. The page itself.
+    try:
+        code, html, ctype = curl(view_url)
+    except Failure as exc:
+        check(results, "fetch-viewer-page", False, str(exc))
+        return report(results, args)
+
+    if not check(results, "fetch-viewer-page", code == "200",
+                 f"{view_url} returned HTTP {code}"):
+        return report(results, args)
+    check(results, "page-is-html", "html" in ctype.lower(),
+          f"unexpected content-type: {ctype!r}")
+
+    # --- 2. The DOM anchors the controller binds to.
+    for el_id in REQUIRED_ELEMENT_IDS:
+        check(results, f"page-has-#{el_id}",
+              f'id="{el_id}"' in html or f"id='{el_id}'" in html,
+              f"the template no longer emits #{el_id}; the controller would "
+              f"bind to nothing")
+
+    # --- 3. Every script tag, at the exact URL production serves.
+    srcs = script_srcs(html)
+    if not check(results, "page-references-scripts", bool(srcs),
+                 "the page referenced no external scripts at all"):
+        return report(results, args)
+
+    workdir = Path(tempfile.mkdtemp(prefix="dikarya-viewer-smoke-"))
+    fetched = []
+    executable_assets_match = True
+    try:
+        for src in srcs:
+            url = urljoin(view_url, src)
+            rel = local_path_for(url, args.base_url)
+            if rel is None:
+                continue  # a CDN or inline-adjacent script; not ours to mirror
+            try:
+                code, body, ctype = curl(url, binary=True)
+            except Failure as exc:
+                check(results, f"fetch:{rel}", False, str(exc))
+                continue
+            ok = check(results, f"fetch:{rel}", code == "200",
+                       f"{url} returned HTTP {code} - the page references an "
+                       f"asset the server will not serve")
+            if not ok:
+                continue
+            check(results, f"nonempty:{rel}", len(body) > 0,
+                  f"{url} served an empty body")
+            matches = mirror_verified_asset(rel, body, workdir)
+            check(results, f"integrity:{rel}", matches,
+                  f"the served executable {rel} differs from the trusted "
+                  "local checkout; refusing to execute remote bytes")
+            if not matches:
+                executable_assets_match = False
+                continue
+            dest = workdir / rel
+            fetched.append(rel)
+
+            # Syntax-check the trusted copy after proving byte equality. A
+            # truncated or half-deployed response fails the integrity check
+            # above and never reaches Node.
+            proc = subprocess.run([node, "--check", str(dest)],
+                                  capture_output=True, text=True)
+            check(results, f"parses:{rel}", proc.returncode == 0,
+                  f"the SERVED copy of {rel} is not valid JavaScript:\n"
+                  f"{proc.stderr.strip()}")
+
+        # --- 4. Execute the served bundle. The actual test.
+        missing = [p for p in ("app/static/js/tree_viewer_controller.js",)
+                   if p not in fetched]
+        controller_served = check(
+            results, "controller-was-served", not missing,
+            f"the page never referenced {missing}",
+        )
+        if controller_served and check(
+            results, "executable-assets-match-checkout", executable_assets_match,
+            "one or more served executable assets failed the integrity gate",
+        ):
+            run_served_harness(results, node, workdir)
+    finally:
+        if args.keep:
+            print(f"downloaded bundle kept at {workdir}", file=sys.stderr)
+        else:
+            shutil.rmtree(workdir, ignore_errors=True)
+
+    return report(results, args)
+
+
+def report(results, args):
+    if args.json:
+        print(json.dumps(results, indent=2))
+        return 0 if all(r["ok"] for r in results) else 1
+
+    bad = [r for r in results if not r["ok"]]
+    if not args.quiet:
+        for r in results:
+            print(f"  {'ok  ' if r['ok'] else 'FAIL'}  {r['name']}")
+    for r in bad:
+        print(f"\nFAIL {r['name']}\n{r['detail']}", file=sys.stderr)
+
+    if bad:
+        print(f"\nviewer smoke FAILED: {len(bad)} of {len(results)} checks",
+              file=sys.stderr)
+        return 1
+    print(f"\nviewer smoke OK: {len(results)} checks passed")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

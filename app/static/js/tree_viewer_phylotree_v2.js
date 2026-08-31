@@ -6,6 +6,10 @@
     'use strict';
 
     const DEBUG_MODE = new URLSearchParams(window.location.search).has('debug');
+    // FastTree writes numerical stand-ins such as 6e-9 and 1.2e-8 for branches whose
+    // optimized length is effectively zero. Treating only literal 0 as unresolved would
+    // split one biological polytomy into arbitrary binary nodes in the viewer.
+    const ZERO_LENGTH_POLYTOMY_EPSILON = 1e-7;
 
     // Alan 8/24/26 - Say why a phylotree instance is not usable, or null when it is.
     // phylotree.js does not throw on a truncated or otherwise unparseable Newick: its
@@ -28,6 +32,33 @@
 
     // Exported so the Node regression harness can drive it without a DOM.
     window.describeTreeParseFailure = describeTreeParseFailure;
+
+    // Alan 8/24/26 - The same stable internal-node ID the backend computes in
+    // tree_edit_service._stable_internal_node_id_from_names() and the controller computes in
+    // stableInternalNodeIdFromTipNames(): FNV-1a over the sorted descendant tip names. Two
+    // distinct clades can only collide by having identical tip sets, which in a tree means a
+    // unary chain -- and those are excluded from collapse targets below. Sorting is by Unicode
+    // code point (not UTF-16 unit) so it agrees with Python's sorted()/ord() on non-BMP names.
+    function stableCladeIdFromTipNames(tipNames) {
+        const names = (Array.isArray(tipNames) ? tipNames : [])
+            .filter(Boolean)
+            .map(String)
+            .sort((a, b) => {
+                const ca = Array.from(a), cb = Array.from(b);
+                const n = Math.min(ca.length, cb.length);
+                for (let i = 0; i < n; i += 1) {
+                    const d = ca[i].codePointAt(0) - cb[i].codePointAt(0);
+                    if (d !== 0) return d;
+                }
+                return ca.length - cb.length;
+            });
+        let hash = 2166136261;
+        for (const ch of names.join('\x1f')) {
+            hash ^= ch.codePointAt(0);
+            hash = Math.imul(hash, 16777619) >>> 0;
+        }
+        return `internal:${hash.toString(16).padStart(8, '0')}`;
+    }
 
     // Alan 7/15/26 - Hide pipeline-only MAFFT and RiC annotations from tip labels while preserving stable tree IDs.
     function cleanTipDisplayName(name) {
@@ -67,9 +98,81 @@
             // Alan 8/17/26 - Supply default border, fill, and opacity for branch bubbles.
             line_color: '#1f2937',
             fill_color: '#ffffff',
-            fill_opacity: 0.9
+            fill_opacity: 0.9,
+            // Alan 8/24/26 - Clade highlights get their OWN fill fields. Reusing the bubble's
+            // fill_color/fill_opacity would paint every highlight near-opaque white and hide
+            // the tree underneath it. journal-gold at 0.15 tints both themes without dominating.
+            highlight_color: '#c9a962',
+            // Alan 8/24/26 - Automatic means "work the colour out from the tree": the clade's
+            // own persistent colour group when it has one, otherwise the next palette colour.
+            highlight_color_mode: 'auto',
+            // Alan 8/24/26 - Equal to AUTO_HIGHLIGHT_OPACITY.light below, and it must stay
+            // equal: an untouched highlight is drawn with the automatic, theme-aware opacity,
+            // so a shared default that differed from it made the layer card report a number
+            // the figure never used. Mirrors DEFAULT_HIGHLIGHT_OPACITY in the service.
+            highlight_opacity: 0.2
         }
     };
+
+    // Alan 8/24/26 - The style properties every annotation resolves, in one place: the live
+    // renderer and the editor preview used to carry two copies of this list, so adding the
+    // highlight fields to one and not the other would have silently unstyled the preview.
+    // Mirrors _LAYER_STYLE_FIELDS in tree_annotation_service.py.
+    const ANNOTATION_STYLE_FIELDS = [
+        'font_family', 'font_size', 'font_style', 'font_weight', 'text_color',
+        'line_color', 'fill_color', 'fill_opacity', 'highlight_color',
+        'highlight_color_mode', 'highlight_opacity'
+    ];
+    const ANNOTATION_NUMERIC_STYLE_FIELDS = new Set([
+        'font_size', 'fill_opacity', 'highlight_opacity'
+    ]);
+    // Alan 8/24/26 - Layer fields the server leaves absent rather than backfilling with the
+    // shared default, so absence really means "nobody chose this". Mirrors
+    // _LAYER_OPTIONAL_STYLE_FIELDS in tree_annotation_service.py.
+    const ANNOTATION_OPTIONAL_LAYER_STYLE_FIELDS = new Set(['highlight_opacity']);
+
+    // Alan 8/24/26 - Curated fills for LARGE translucent clade backgrounds, which is a very
+    // different job from the categorical line colours in _selectionColors: those are chosen to
+    // be legible as a 1px stroke and read as neon poster paint when spread over a third of a
+    // figure. These are mid-tone and slightly desaturated so that, at the automatic opacities
+    // below, a light theme gets a pale tint that black tip labels stay readable on and a dark
+    // theme gets a deep tint that white ones do. Order is the assignment order for successive
+    // unstyled highlights, arranged so the first four are maximally distinct.
+    const HIGHLIGHT_PALETTE = [
+        '#3b6fb6',  // blue
+        '#7a5aa6',  // purple
+        '#2f8f83',  // teal
+        '#b8536b',  // rose
+        '#c08a2e',  // amber
+        '#4a8b4a',  // green
+        '#a8503c',  // muted red
+        '#2b7f9e'   // cyan
+    ];
+
+    // Alan 8/24/26 - The opacity an UNSTYLED highlight is drawn at. A pale wash that reads
+    // clearly on white is nearly invisible on black, so the automatic value differs by theme --
+    // but it is resolved here and written inline, never applied as a CSS override, so the
+    // exported SVG carries exactly what was on screen. An opacity the user chose is used
+    // verbatim in both themes.
+    const AUTO_HIGHLIGHT_OPACITY = { light: 0.2, dark: 0.26 };
+
+    // Alan 8/26/26 - Minimum HSL lightness a colour-group / marker colour is DRAWN at in dark
+    // mode. The categorical group colours are picked to read against white and were then used
+    // verbatim in both themes, but the dark tree panel is #2d4a3e: the Blue group (#2563eb)
+    // sat at 1.88:1 against bare canvas, and 1.06:1 where it crossed a light user-picked clade
+    // highlight -- text that is effectively not on the page. 0.76 roughly doubles that worst
+    // case while leaving the closest pair of group colours about 7 CIE76 units apart, so the
+    // groups stay tellable apart. See _displayColorForTheme().
+    const DARK_LABEL_MIN_LIGHTNESS = 0.76;
+
+    // Alan 8/24/26 - Published on the shared config so the editor and the regression harness
+    // resolve styles through the same list the renderer uses, instead of their own copies.
+    window.DikaryaCladeAnnotations.STYLE_FIELDS = ANNOTATION_STYLE_FIELDS;
+    window.DikaryaCladeAnnotations.NUMERIC_STYLE_FIELDS = Array.from(
+        ANNOTATION_NUMERIC_STYLE_FIELDS
+    );
+    window.DikaryaCladeAnnotations.HIGHLIGHT_PALETTE = HIGHLIGHT_PALETTE;
+    window.DikaryaCladeAnnotations.AUTO_HIGHLIGHT_OPACITY = AUTO_HIGHLIGHT_OPACITY;
 
     // Alan 8/15/26 - Map a validated family name onto its fallback stack; anything unknown
     // falls back to the default rather than reaching the SVG verbatim.
@@ -226,6 +329,19 @@
         // Alan 5/11/26 - Clear visible active selections without mutating saved selection sets.
         deselectCurrentSelection() { return 0; }
 
+        // Alan 8/24/26 - Viewer-only clade collapse. Non-destructive: no tips are removed, no
+        // topology or branch length changes, nothing is persisted and nothing is recomputed.
+        getSelectedCladeNodes() { return []; }
+        getSelectedCladeCount() { return 0; }
+        getBulkCollapseTargets() { return []; }
+        getBulkExpandTargets() { return []; }
+        collapseSelectedClades() { return 0; }
+        expandSelectedClades() { return 0; }
+        hasCollapseUndo() { return false; }
+        getCollapseUndoLabel() { return null; }
+        undoLastCollapseChange() { return null; }
+        clearCollapseUndo() { }
+
         // Alan 5/12/26 - Remove pruned IDs from saved selection sets without clearing unrelated colors.
         removeIdsFromSelectionSets(ids) { return 0; }
 
@@ -328,8 +444,21 @@
          */
         updateSpacing(xDelta, yDelta) { }
 
+        // Alan 8/28/26 - Camera zoom is separate from figure spacing and shares D3 touch state.
+        zoomCamera(factor) { return false; }
+
         // Alan 7/17/26 - Let saved display preferences replace spacing instead of accumulating it across tree redraws.
         setSpacingState(x, y) { }
+
+        // Alan 8/28/26 - Expose the mobile mode and node-menu bridge through the common viewer contract.
+        /** Switch touch interaction between camera navigation and deliberate selection. */
+        setMobileInteractionMode(mode) { }
+
+        /** Open the existing node action menu for the most recently tapped touch target. */
+        openMobileNodeActions() { return false; }
+
+        /** Close the touch-oriented presentation of the existing node action menu. */
+        closeMobileNodeActions() { }
 
         /**
          * Set viewer options.
@@ -399,6 +528,11 @@
          * Export tree visualization as SVG.
          */
         exportSVG() { }
+
+        /**
+         * Export tree visualization as PNG.
+         */
+        exportPNG() { }
     }
 
     // Expose the base class globally for potential extension
@@ -450,6 +584,25 @@
             this.currentSelectionIds = new Set();
             // Alan 5/11/26 - Track locally hidden current selections so Deselect does not mutate color groups.
             this.hiddenSelectionIds = new Set();
+            // Alan 8/24/26 - Selected INTERNAL nodes are tracked separately, by the same stable
+            // descendant-tip ID the backend uses for rotate/prune/reroot. currentSelectionIds keys
+            // on _getNodeId(), which for an internal node is its support label ("100") and is
+            // therefore shared by dozens of unrelated clades -- fine for highlighting, useless as
+            // an identity for "collapse exactly the clades I picked".
+            this.selectedCladeIds = new Set();
+            // Alan 8/24/26 - Resolving those IDs back to nodes costs a traversal that hashes
+            // each clade's descendant tips, and the context menu asks for the target set once
+            // per label and per enabled/disabled check. The revision counter lets one menu
+            // open share a single resolution; it is bumped wherever the selection or the
+            // parsed tree changes.
+            this._cladeSelectionRevision = 0;
+            this._cladeNodeCache = null;
+            // Alan 8/24/26 - One-slot record of the last collapse/expand so the viewer can undo it.
+            // Collapse is transient display state (node.collapsed), so this never touches the server.
+            this._collapseUndo = null;
+            // Alan 8/24/26 - Set while a bulk collapse/expand runs so phylotree's per-node
+            // 'collapsed' event does not record N single-node undo entries over the bulk one.
+            this._bulkCollapseInProgress = false;
             // Color palette from d3.schemeCategory10 for persistent color groups
             this._selectionColors = [
                 '#1f77b4', '#ff7f0e', '#2ca02c', '#d62728', '#9467bd',
@@ -478,6 +631,16 @@
             // Alan 8/16/26 - Track active box-drag state, modifier memory, and removable listeners in one place.
             // The old toggleable "mode" flag is gone: left-drag on empty background always draws the box.
             this.boxSelectState = { drag: null, pointerDownListener: null, contextMenuListener: null, modifierKeyDownListener: null, modifierKeyUpListener: null, modifiers: { alt: false, ctrl: false, meta: false, lastAltDownAt: 0, lastCtrlDownAt: 0, lastMetaDownAt: 0 }, suppressContextMenuUntil: 0 };
+            // Alan 8/28/26 - Touch defaults to map-like navigation; explicit Select mode owns
+            // selection gestures without feeding camera movement back into spacingState.
+            this.mobileInteractionMode = 'navigate';
+            this.mobileTouchState = {
+                pointers: new Map(), pointerDownListener: null, pointerMoveListener: null,
+                pointerUpListener: null, pointerCancelListener: null,
+                suppressClickUntil: 0, suppressClickTarget: null, lastTargetNode: null,
+                menuDismissListener: null,
+                menuActionListener: null
+            };
             // Alan 6/2/26 - Controller-supplied handler invoked by the native menu's "Rotate node" item.
             this._onRotateNode = null;
             // Alan 7/17/26 - Controller-supplied handler receives the clicked node and the exact context-menu prune targets.
@@ -552,6 +715,66 @@
             this._onRefreshMycomapRecords = typeof fn === 'function' ? fn : null;
         }
 
+        // Alan 8/28/26 - Coordinate the wrapper touch mode and reuse phylotree's existing node action menu.
+        setMobileInteractionMode(mode) {
+            const next = mode === 'select' ? 'select' : 'navigate';
+            this.mobileInteractionMode = next;
+            this._cancelBoxSelectDrag();
+            this.mobileTouchState?.pointers?.clear();
+            this.container?.classList.toggle('mobile-select-mode', next === 'select');
+            return next;
+        }
+
+        openMobileNodeActions() {
+            const node = this.mobileTouchState?.lastTargetNode;
+            if (!node || !this.tree?.display?.handle_node_click || !this.container) return false;
+            const rect = this.container.getBoundingClientRect();
+            document.body.classList.add('tree-mobile-node-menu-open');
+            this.tree.display.handle_node_click(node, {
+                clientX: rect.left + Math.min(rect.width * 0.5, 240),
+                clientY: rect.top + Math.min(rect.height * 0.5, 240)
+            });
+            this._attachMobileMenuDismissListener();
+            return true;
+        }
+
+        closeMobileNodeActions() {
+            this._closeMobileNodeMenu();
+        }
+
+        _attachMobileMenuDismissListener() {
+            const state = this.mobileTouchState;
+            if (!state || state.menuDismissListener) return;
+            state.menuDismissListener = (event) => {
+                const menu = this.container?.querySelector('.phylotree-context-menu');
+                if (menu?.contains(event.target)) return;
+                this._closeMobileNodeMenu();
+            };
+            state.menuActionListener = (event) => {
+                const menu = this.container?.querySelector('.phylotree-context-menu');
+                if (!menu?.contains(event.target)) return;
+                // Let phylotree's action handler finish before removing the shared mobile state.
+                setTimeout(() => this._closeMobileNodeMenu(), 0);
+            };
+            setTimeout(() => document.addEventListener('pointerdown', state.menuDismissListener, true), 0);
+            document.addEventListener('click', state.menuActionListener);
+        }
+
+        _closeMobileNodeMenu() {
+            const menu = this.container?.querySelector('.phylotree-context-menu');
+            if (menu) menu.style.display = 'none';
+            document.body.classList.remove('tree-mobile-node-menu-open');
+            const state = this.mobileTouchState;
+            if (state?.menuDismissListener) {
+                document.removeEventListener('pointerdown', state.menuDismissListener, true);
+                state.menuDismissListener = null;
+            }
+            if (state?.menuActionListener) {
+                document.removeEventListener('click', state.menuActionListener);
+                state.menuActionListener = null;
+            }
+        }
+
         // Alan 6/2/26 - Highlight the focal/sequence-of-interest tip directly from durable state,
         // independent of the user-editable color groups. Re-styles in place (no full redraw).
         setFocalTip(name) {
@@ -592,6 +815,11 @@
                 this.allNodes = [];
                 throw new Error(parseFailure);
             }
+
+            // FastTree resolves zero-length polytomies into arbitrary binary ladders. Compact
+            // each complete zero-length tip component before recording "original" order, so
+            // Sort -> Original and later reloads both retain the useful grouped presentation.
+            this._groupZeroLengthPolytomies();
 
             // Tag original order per-parent for correct restoration
             this.tree.traverse_and_compute(n => {
@@ -733,6 +961,50 @@
                             (node) => { if (typeof this._onRotateNode === 'function') this._onRotateNode(node); },
                             (node) => Boolean(node.children && node.children.length >= 2)
                         ]);
+                        // Alan 8/24/26 - Bulk collapse/expand of the SELECTED clades. These act on
+                        // the selection, not on the clicked node, so they are registered on every
+                        // internal node and only appear once two or more clades are selected -- a
+                        // single clade is already served by phylotree's own Collapse Clade item.
+                        // They are priority items so they sit next to it rather than at the bottom.
+                        //
+                        // Three items rather than one toggle: when the selected clades are all
+                        // expanded (or all collapsed) one unambiguous counted action is clearer,
+                        // and when the selection is MIXED a toggle would have to guess, so both
+                        // directions are offered explicitly.
+                        n.menu_items.push([
+                            () => {
+                                const collapseCount = this.getBulkCollapseTargets().length;
+                                if (collapseCount) {
+                                    return `Collapse ${collapseCount} Clade${collapseCount === 1 ? '' : 's'}`;
+                                }
+                                const expandCount = this.getBulkExpandTargets().length;
+                                return `Expand ${expandCount} Clade${expandCount === 1 ? '' : 's'}`;
+                            },
+                            () => {
+                                if (this.getBulkCollapseTargets().length) this.collapseSelectedClades();
+                                else this.expandSelectedClades();
+                            },
+                            () => this.getSelectedCladeCount() >= 2
+                                && !(this.getBulkCollapseTargets().length && this.getBulkExpandTargets().length),
+                            false,
+                            true
+                        ], [
+                            () => 'Collapse Selected Clades',
+                            () => this.collapseSelectedClades(),
+                            () => this.getSelectedCladeCount() >= 2
+                                && Boolean(this.getBulkCollapseTargets().length)
+                                && Boolean(this.getBulkExpandTargets().length),
+                            () => this.getBulkCollapseTargets().length === 0,
+                            true
+                        ], [
+                            () => 'Expand Selected Clades',
+                            () => this.expandSelectedClades(),
+                            () => this.getSelectedCladeCount() >= 2
+                                && Boolean(this.getBulkCollapseTargets().length)
+                                && Boolean(this.getBulkExpandTargets().length),
+                            () => this.getBulkExpandTargets().length === 0,
+                            true
+                        ]);
                         // Alan 8/17/26 - Annotation creation now stays in the shared priority menu above.
                     }
                 }
@@ -749,6 +1021,11 @@
             this.currentSelectionIds.clear();
             // Alan 5/12/26 - Reset transient hidden state tied to temporary action selection.
             this.hiddenSelectionIds.clear();
+            // Alan 8/24/26 - A reload replaces every node object, so both the clade registry and
+            // the collapse undo entry (which holds node references) describe a tree that is gone.
+            this.selectedCladeIds.clear();
+            this._collapseUndo = null;
+            this._invalidateCladeSelection();
 
             // 3. COMPUTE STATS
             this.lastStats = this._computeSupportStats();
@@ -807,12 +1084,204 @@
             this._attachSequenceMetricsToLeaves();
         }
 
+        _branchLength(node) {
+            const raw = node?.data?.attribute ?? node?.attribute ?? node?.branch_length;
+            if (raw === null || raw === undefined || raw === '') return null;
+            const value = Number(raw);
+            return Number.isFinite(value) ? value : null;
+        }
+
+        _hasZeroLengthIncomingBranch(node) {
+            const length = this._branchLength(node);
+            return length !== null && Math.abs(length) <= ZERO_LENGTH_POLYTOMY_EPSILON;
+        }
+
+        /**
+         * Return the zero-length connected component containing one tip. Contracting these
+         * edges is the viewer's model of a soft polytomy: positive-length side clades are not
+         * members even when FastTree happened to attach them inside its binary resolution.
+         */
+        _zeroLengthPolytomyForTip(tip) {
+            if (!tip) return null;
+            const component = new Set([tip]);
+            const pending = [tip];
+            while (pending.length) {
+                const node = pending.pop();
+                if (node.parent && this._hasZeroLengthIncomingBranch(node)
+                    && !component.has(node.parent)) {
+                    component.add(node.parent);
+                    pending.push(node.parent);
+                }
+                for (const child of (node.children || node.data?.children || [])) {
+                    if (this._hasZeroLengthIncomingBranch(child) && !component.has(child)) {
+                        component.add(child);
+                        pending.push(child);
+                    }
+                }
+            }
+            const tips = Array.from(component).filter((node) => {
+                const children = node.children || node.data?.children || [];
+                return !children.length;
+            });
+            if (tips.length < 2) return null;
+            const memberIds = tips.map((node) => this._getNodeId(node)).filter(Boolean);
+            if (memberIds.length !== tips.length) return null;
+            const anchor = Array.from(component).find((node) => !component.has(node.parent)) || null;
+            return { nodes: component, tips, memberIds, anchor };
+        }
+
+        _zeroLengthPolytomyForMemberIds(memberIds) {
+            const wanted = new Set(Array.isArray(memberIds) ? memberIds.filter(Boolean) : []);
+            if (wanted.size < 2) return null;
+            const tip = this.allNodes.find((node) => {
+                const children = node.children || node.data?.children || [];
+                return !children.length && wanted.has(this._getNodeId(node));
+            });
+            const polytomy = this._zeroLengthPolytomyForTip(tip);
+            if (!polytomy || polytomy.memberIds.length !== wanted.size
+                || !polytomy.memberIds.every((id) => wanted.has(id))) return null;
+            return polytomy;
+        }
+
+        _tipOrderFromModel() {
+            const ids = [];
+            if (!this.tree) return ids;
+            this.tree.traverse_and_compute((node) => {
+                const children = node.children || node.data?.children || [];
+                if (children.length) return;
+                const id = this._getNodeId(node);
+                if (id) ids.push(id);
+            });
+            return ids;
+        }
+
+        _selectionRunCount(order, members) {
+            const wanted = members instanceof Set ? members : new Set(members || []);
+            let runs = 0;
+            let inside = false;
+            for (const id of order) {
+                const selected = wanted.has(id);
+                if (selected && !inside) runs += 1;
+                inside = selected;
+            }
+            return runs;
+        }
+
+        /**
+         * Find the best combination of ordinary node rotations for one member set. The dynamic
+         * program retains only the cheapest ordering for each selected/unselected boundary
+         * state, so a binary FastTree with hundreds of tips stays linear in practice.
+         */
+        _bestRotationsForLeafSet(root, memberIds) {
+            const wanted = memberIds instanceof Set ? memberIds : new Set(memberIds || []);
+            const better = (candidate, current) => !current
+                || candidate.transitions < current.transitions
+                || (candidate.transitions === current.transitions
+                    && candidate.rotations.length < current.rotations.length);
+
+            const solve = (node) => {
+                const children = node.children || node.data?.children || [];
+                if (!children.length) {
+                    const selected = wanted.has(this._getNodeId(node));
+                    return new Map([[`${Number(selected)}:${Number(selected)}`, {
+                        first: selected, last: selected, transitions: 0, rotations: []
+                    }]]);
+                }
+                const childOptions = children.map((child) => Array.from(solve(child).values()));
+                const combinations = [];
+                const collect = (index, chosen) => {
+                    if (index === childOptions.length) {
+                        combinations.push(chosen.slice());
+                        return;
+                    }
+                    childOptions[index].forEach((option) => {
+                        chosen.push(option); collect(index + 1, chosen); chosen.pop();
+                    });
+                };
+                collect(0, []);
+                const result = new Map();
+                const orientations = children.length > 1 ? [false, true] : [false];
+                combinations.forEach((chosen) => orientations.forEach((reversed) => {
+                    const ordered = reversed ? chosen.slice().reverse() : chosen;
+                    let transitions = ordered.reduce((sum, item) => sum + item.transitions, 0);
+                    for (let i = 1; i < ordered.length; i += 1) {
+                        if (ordered[i - 1].last !== ordered[i].first) transitions += 1;
+                    }
+                    const rotations = ordered.flatMap((item) => item.rotations);
+                    if (reversed) rotations.push(node);
+                    const candidate = {
+                        first: ordered[0].first,
+                        last: ordered[ordered.length - 1].last,
+                        transitions,
+                        rotations
+                    };
+                    const key = `${Number(candidate.first)}:${Number(candidate.last)}`;
+                    if (better(candidate, result.get(key))) result.set(key, candidate);
+                }));
+                return result;
+            };
+
+            const options = Array.from(solve(root).values());
+            return options.reduce((best, option) => better(option, best) ? option : best, null);
+        }
+
+        _groupZeroLengthPolytomies() {
+            if (!this.tree) return 0;
+            const nodes = [];
+            this.tree.traverse_and_compute((node) => nodes.push(node));
+            const root = nodes.find((node) => !node.parent);
+            if (!root) return 0;
+
+            const components = new Map();
+            nodes.forEach((node) => {
+                const children = node.children || node.data?.children || [];
+                if (children.length) return;
+                const polytomy = this._zeroLengthPolytomyForTip(node);
+                if (!polytomy) return;
+                const key = this._annotationMembershipKey(polytomy.memberIds);
+                if (key && !components.has(key)) components.set(key, new Set(polytomy.memberIds));
+            });
+            const groups = Array.from(components.values()).sort((a, b) => b.size - a.size);
+            const totalRuns = () => {
+                const order = this._tipOrderFromModel();
+                return groups.reduce((sum, group) => sum + this._selectionRunCount(order, group), 0);
+            };
+
+            let score = totalRuns();
+            let grouped = 0;
+            groups.forEach((group) => {
+                const order = this._tipOrderFromModel();
+                if (this._selectionRunCount(order, group) <= 1) return;
+                const plan = this._bestRotationsForLeafSet(root, group);
+                if (!plan || !plan.rotations.length) return;
+                plan.rotations.forEach((node) => node.children.reverse());
+                const nextScore = totalRuns();
+                if (nextScore < score && this._selectionRunCount(this._tipOrderFromModel(), group) === 1) {
+                    score = nextScore;
+                    grouped += 1;
+                } else {
+                    // Reversing the same nodes again restores the exact prior order.
+                    plan.rotations.slice().reverse().forEach((node) => node.children.reverse());
+                }
+            });
+            return grouped;
+        }
+
         _draw() {
             if (!this.tree) return;
 
             // Cleanup observers
             this._cleanupZoomObserver();
             this.cachedZoomNode = null; // Clear cached node on redraw
+            // Alan 8/28/26 - A node object belongs to one render, so clear the mobile action
+            // target and close its menu before replacing the topology/layout DOM.
+            if (this.mobileTouchState) {
+                this.mobileTouchState.lastTargetNode = null;
+                this.container.dispatchEvent(new CustomEvent('dikarya:mobile-target-change', {
+                    detail: { available: false }
+                }));
+            }
+            this._closeMobileNodeMenu();
             if (this.supportLabelsTimer) {
                 clearTimeout(this.supportLabelsTimer);
                 this.supportLabelsTimer = null;
@@ -863,10 +1332,16 @@
                 // Hook into phylotree's native selection system
                 this._hookPhylotreeSelection();
 
+                // Alan 8/24/26 - Watch the native Collapse/Expand Clade menu item so a single
+                // collapse is undoable and so Dikarya's support labels repaint with it.
+                this._hookNativeCollapseEvents();
+
                 // Override click behavior: left-click = select, shift/right = menu
                 this._overrideClickBehavior();
                 // Alan 5/11/26 - Attach background box-select after phylotree handlers so it can suppress pan only for box gestures.
                 this._attachBoxSelectHandlers();
+                // Alan 8/28/26 - Reattach the removable touch wrapper after phylotree replaces the SVG.
+                this._attachTouchInteractionHandlers();
                 // Alan 5/12/26 - Repaint labels immediately so selection-set colors beat base light/dark label CSS.
                 this._updateNodeStylesOnly();
 
@@ -1006,6 +1481,13 @@
 
             // Fallback: full redraw
             this._draw();
+        }
+
+        // Alan 8/28/26 - Keep +/- on phylotree's D3 behavior so buttons and pinch update the
+        // same __zoom transform; no spacing state or redraw participates in camera zoom.
+        zoomCamera(factor) {
+            const display = this.tree?.display;
+            return Boolean(display && typeof display.zoom_by === 'function' && display.zoom_by(factor));
         }
 
         // Alan 7/17/26 - Replace the relative spacing state so persisted preferences do not compound after redraws.
@@ -1387,6 +1869,27 @@
          * @returns {Promise<void>}
          */
         exportJPG(quality = 0.95) {
+            return this._exportRasterImage('image/jpeg', 'jpg', quality);
+        }
+
+        /**
+         * Export the current tree visualization as a PNG image.
+         *
+         * @returns {Promise<void>}
+         */
+        exportPNG() {
+            return this._exportRasterImage('image/png', 'png');
+        }
+
+        /**
+         * Rasterize the prepared SVG clone and download it in the requested format.
+         *
+         * @param {string} mimeType
+         * @param {string} extension
+         * @param {number|undefined} quality
+         * @returns {Promise<void>}
+         */
+        _exportRasterImage(mimeType, extension, quality) {
             return new Promise((resolve, reject) => {
                 const svg = this.container.querySelector('svg');
                 if (!svg) { reject(new Error('No SVG found in tree container.')); return; }
@@ -1424,25 +1927,25 @@
                             return;
                         }
 
-                        // Alan 7/16/26 - Clarify why JPEG export needs a white background.
-                        // Use a white background because JPEG has no alpha channel.
-                        ctx.fillStyle = '#ffffff';
-                        ctx.fillRect(0, 0, canvas.width, canvas.height);
+                        // JPEG has no alpha channel; PNG deliberately retains transparency.
+                        if (mimeType === 'image/jpeg') {
+                            ctx.fillStyle = '#ffffff';
+                            ctx.fillRect(0, 0, canvas.width, canvas.height);
+                        }
                         ctx.scale(scale, scale);
                         ctx.drawImage(img, 0, 0, width, height);
 
-                        canvas.toBlob(jpgBlob => {
-                            if (!jpgBlob) {
-                                // Alan 7/16/26 - Reword the JPEG export error without an em dash.
-                                reject(new Error('canvas.toBlob() returned null, so JPEG encoding failed.'));
+                        canvas.toBlob(imageBlob => {
+                            if (!imageBlob) {
+                                reject(new Error(`canvas.toBlob() returned null, so ${extension.toUpperCase()} encoding failed.`));
                                 return;
                             }
-                            let jpgUrl;
+                            let imageUrl;
                             try {
-                                jpgUrl = URL.createObjectURL(jpgBlob);
+                                imageUrl = URL.createObjectURL(imageBlob);
                                 const link = document.createElement('a');
-                                link.href = jpgUrl;
-                                link.download = `tree_${Date.now()}.jpg`;
+                                link.href = imageUrl;
+                                link.download = `tree_${Date.now()}.${extension}`;
                                 document.body.appendChild(link);
                                 link.click();
                                 document.body.removeChild(link);
@@ -1450,9 +1953,9 @@
                             } catch (err) {
                                 reject(err);
                             } finally {
-                                if (jpgUrl) URL.revokeObjectURL(jpgUrl);
+                                if (imageUrl) URL.revokeObjectURL(imageUrl);
                             }
-                        }, 'image/jpeg', quality);
+                        }, mimeType, quality);
 
                     } catch (err) { reject(err); }
                 };
@@ -1813,6 +2316,10 @@
             const visibleIds = this._getVisibleSelectionIds();
             this.currentSelectionIds.clear();
             this.hiddenSelectionIds.clear();
+            // Alan 8/24/26 - Deselect drops selected clades along with selected tips. Collapsed
+            // clades stay collapsed: this clears the selection, not the display state.
+            this.selectedCladeIds.clear();
+            this._invalidateCladeSelection();
             // Alan 5/11/26 - Clear phylotree's native selected styling so deselected labels stop looking selected.
             this._clearNativeSelectionForIds(visibleIds);
             this._updateStats();
@@ -1888,6 +2395,23 @@
                 // Alan 5/12/26 - Remove inline fill for ordinary labels so light/dark base CSS controls them.
                 else labelText.style("fill", null);
             });
+        }
+
+        /**
+         * Alan 8/24/26 - Repaint everything a persistent colour group controls.
+         *
+         * Group membership, group precedence and group colour all feed BOTH the tip/node
+         * styling and the automatic clade-highlight colour. Only the first was being
+         * repainted, so recolouring a group turned its labels blue immediately while the
+         * band behind them kept its old palette colour until some unrelated redraw happened.
+         *
+         * The annotation redraw is the existing debounced one and no-ops entirely on trees
+         * that have no annotations, so this stays as cheap as the label repaint it replaces.
+         * Nothing here rebuilds the tree.
+         */
+        _refreshPersistentColorVisuals() {
+            this._updateNodeStylesOnly();
+            this._scheduleAnnotationRedraw();
         }
 
         // Alan 5/12/26 - Normalize user-provided group colors before saving them.
@@ -1967,37 +2491,24 @@
         _getNodeDisplayColor(id, node) {
             // Alan 5/12/26 - Missing IDs cannot belong to selection sets.
             if (!id) return null;
-            // Alan 5/12/26 - Find which set(s) this node belongs to.
-            const setNames = Object.keys(this.selectionSets);
-            // Alan 5/12/26 - Track which one-color group controls this label.
-            let matchingSetName = null;
-            // Alan 5/12/26 - Prefer the active set's color so adding a previously selected tip visibly changes color.
-            const activeSetIndex = setNames.indexOf(this.activeSelectionSet);
-            // Alan 5/12/26 - Use active color-group membership first; temporary Deselect no longer hides colors.
-            if (activeSetIndex >= 0 && this.selectionSets[this.activeSelectionSet]?.has(id)) {
-                // Alan 5/12/26 - Store the active set index for palette lookup.
-                matchingSetName = this.activeSelectionSet;
-            }
-            // Alan 5/12/26 - Fall back to the first non-active saved set containing this node.
-            for (let i = 0; i < setNames.length; i++) {
-                // Alan 5/12/26 - Stop scanning if the active set already supplied the display color.
-                if (matchingSetName) break;
-                // Alan 5/12/26 - Active set was already considered before lower-priority saved sets.
-                if (setNames[i] === this.activeSelectionSet) continue;
-                // Alan 5/12/26 - Use the first saved-set membership as the fallback color.
-                if (this.selectionSets[setNames[i]].has(id)) {
-                    // Alan 5/12/26 - Store the fallback set index for palette lookup.
-                    matchingSetName = setNames[i];
-                    break;
-                }
-            }
+            // Alan 8/24/26 - Group membership now resolves in one place, shared with the
+            // automatic clade-highlight colour, so a highlight and the labels it sits behind
+            // can never disagree about which group a tip belongs to.
+            const matchingSetName = this._persistentGroupNameForTip(id);
+            // Alan 8/26/26 - Every colour leaving here is a DRAWN colour, so each one goes
+            // through the dark-mode lift. This is the one place both the node marks and the
+            // label text resolve through, so they cannot disagree about the adjustment.
             // Alan 5/12/26 - Return selection-set color when membership is visible.
-            if (matchingSetName) return this.getSelectionSetColor(matchingSetName);
+            if (matchingSetName) {
+                return this._displayColorForTheme(this.getSelectionSetColor(matchingSetName));
+            }
             // Alan 5/12/26 - Search matches remain blue when no selection set controls the color.
-            if (node?.__search_match) return "#0EA5E9";
+            if (node?.__search_match) return this._displayColorForTheme("#0EA5E9");
             // Alan 6/2/26 - Focal/sequence-of-interest tip highlights blue directly from state,
             // so a user-set SOI shows without mutating the user's Default color group.
-            if (this.focalTipName && id === this.focalTipName) return "#1f77b4";
+            if (this.focalTipName && id === this.focalTipName) {
+                return this._displayColorForTheme("#1f77b4");
+            }
             // Alan 5/12/26 - Ordinary labels should use CSS light/dark colors.
             return null;
         }
@@ -2284,6 +2795,9 @@
         _applyTextSizingFromZoom() {
             if (!this.cachedZoomNode) return;
             const { k } = this._getSvgAndZoomGroup();
+            // Alan 8/28/26 - Coarse-pointer users expect the complete tree to zoom like one
+            // image. Desktop retains its established counter-scaled labels and annotations.
+            const visualK = window.matchMedia?.('(pointer: coarse)')?.matches ? 1 : k;
 
             // Base sizes
             let supportBase = this.options.supportBasePx;
@@ -2295,9 +2809,9 @@
             if (tIn && !isNaN(tIn.value)) tipBase = Number(tIn.value);
 
             // Limit text size to be readable
-            const tipFontSvgPx = Math.max(1, tipBase / k);
-            const supportFontSvgPx = Math.max(1, supportBase / k);
-            const haloSvgPx = Math.max(0.75, 3 / k);
+            const tipFontSvgPx = Math.max(1, tipBase / visualK);
+            const supportFontSvgPx = Math.max(1, supportBase / visualK);
+            const haloSvgPx = Math.max(0.75, 3 / visualK);
 
             const svg = window.d3v7.select(this.container).select("svg");
 
@@ -2316,10 +2830,10 @@
                     if (isTipZone) { offRoot += 8; finalSize = Math.max(6, supportBase - 1); }
                 } else if (isTipZone) { offRoot += 20; offPerp += 14; finalSize = Math.max(6, supportBase - 1); }
 
-                const sz = Math.max(1, finalSize / k);
-                const xOff = (ux * offRoot + px * offPerp) / k;
+                const sz = Math.max(1, finalSize / visualK);
+                const xOff = (ux * offRoot + px * offPerp) / visualK;
                 // Vertical adjust
-                const yOff = (uy * offRoot + py * offPerp) / k;
+                const yOff = (uy * offRoot + py * offPerp) / visualK;
 
                 window.d3v7.select(this)
                     .attr("x", xOff).attr("y", yOff)
@@ -2332,12 +2846,12 @@
             svg.selectAll("text.phylotree-node-text")
                 .style("font-size", `${tipFontSvgPx}px`)
                 // Alan 8/17/26 - Preserve phylotree's outward sign for end-aligned radial labels.
-                .attr("dx", d => this._tipLabelDx(d, k))
-                .attr("dy", 1.9 / k);
+                .attr("dx", d => this._tipLabelDx(d, visualK))
+                .attr("dy", 1.9 / visualK);
 
-            // Alan 8/15/26 - Tip labels keep a constant screen size across zoom, so the label
-            // edge the annotations sit beside moves with k. Redraw them on the same trailing
-            // debounce rather than every animation frame; trees without annotations no-op here.
+            // Alan 8/28/26 - Desktop labels keep a constant screen size; coarse-pointer labels
+            // zoom uniformly. Either way annotations follow the final label geometry on the
+            // same trailing debounce; trees without annotations no-op here.
             this._scheduleAnnotationRedraw();
         }
 
@@ -2405,6 +2919,9 @@
                             self.hiddenSelectionIds.delete(id);
                             self.selectedIds.add(id);
                         }
+                        // Alan 8/24/26 - "All internal branches" and friends hand over real node
+                        // objects, so register their stable clade IDs here too.
+                        self._syncCladeSelection(node, true);
                     });
 
                     // Update our styling
@@ -2423,6 +2940,8 @@
                             self.hiddenSelectionIds.delete(id);
                             self.selectedIds.add(id);
                         }
+                        // Alan 8/24/26 - Keep the stable clade registry in step with native selection events.
+                        self._syncCladeSelection(node, true);
                     });
                     self._updateNodeStylesOnly();
                     self._updateStats();
@@ -2463,13 +2982,40 @@
 
             // Define click listener (for selection)
             this._clickListener = function (event) {
+                // Alan 8/30/26 - Native node-menu items are controls, not tree selection
+                // gestures. In Navigate mode the touch click guard below must not swallow
+                // their D3 callbacks (Prune, Rename, Collapse, and so on) before they bubble
+                // to the menu item. The pointer bookkeeping has the same exemption.
+                const target = event.target;
+                if (target?.closest?.('.phylotree-context-menu')) return;
+
                 // Only intercept Left Click without modifiers (simple select)
                 const isSimpleClick = event.button === 0 && !event.shiftKey && !event.ctrlKey && !event.metaKey && !event.altKey;
 
                 if (!isSimpleClick) return; // Let phylotree handle shift+click, etc.
 
+                // Alan 8/28/26 - Touch selection is handled from pointerup after movement is measured.
+                // This blocks both navigate-mode taps and the compatibility click following a
+                // select-mode tap without changing genuine mouse clicks.
+                const touchState = self.mobileTouchState;
+                const touchGenerated = event.pointerType === 'touch'
+                    || Boolean(event.sourceCapabilities?.firesTouchEvents);
+                const suppressedTarget = touchState?.suppressClickTarget;
+                const sameSuppressedTarget = suppressedTarget && (
+                    event.target === suppressedTarget
+                    || suppressedTarget.contains?.(event.target)
+                    || event.target.contains?.(suppressedTarget)
+                );
+                const recentTouchOnSameTarget = Date.now() < (touchState?.suppressClickUntil || 0)
+                    && sameSuppressedTarget;
+                if ((touchGenerated && self.mobileInteractionMode !== 'select')
+                    || recentTouchOnSameTarget) {
+                    event.preventDefault();
+                    event.stopPropagation();
+                    return;
+                }
+
                 // Check if target is a node text or part of a node
-                const target = event.target;
                 if (target.classList.contains('phylotree-node-text') || target.tagName === 'circle') {
 
                     // Stop phylotree directly!
@@ -2482,7 +3028,11 @@
                     const id = self._getNodeId(d);
                     if (id) {
                         // Alan 5/11/26 - Toggle visible selection state while preserving Deselect-hidden set membership.
-                        self._toggleVisibleSelection(id);
+                        const nowSelected = self._toggleVisibleSelection(id);
+                        // Alan 8/24/26 - Mirror internal-node clicks into the stable clade registry
+                        // so bulk collapse targets exactly the clades that were clicked, not every
+                        // clade that happens to share this one's support label.
+                        self._syncCladeSelection(d, nowSelected);
                         self._updateNodeStylesOnly();
                         self._updateStats();
                     }
@@ -2544,10 +3094,113 @@
             window.addEventListener('keyup', this.boxSelectState.modifierKeyUpListener, true);
         }
 
+        // Alan 8/28/26 - Track touch pointers independently of D3. Navigate gestures pass through untouched;
+        // Select-mode node gestures are measured here so a drag can never become a tap.
+        _attachTouchInteractionHandlers() {
+            const state = this.mobileTouchState;
+            if (!this.container || !state) return;
+            if (state.pointerDownListener) this.container.removeEventListener('pointerdown', state.pointerDownListener, true);
+            if (state.pointerMoveListener) window.removeEventListener('pointermove', state.pointerMoveListener, true);
+            if (state.pointerUpListener) window.removeEventListener('pointerup', state.pointerUpListener, true);
+            if (state.pointerCancelListener) window.removeEventListener('pointercancel', state.pointerCancelListener, true);
+
+            state.pointers.clear();
+            state.pointerDownListener = (event) => this._handleTouchPointerDown(event);
+            state.pointerMoveListener = (event) => this._handleTouchPointerMove(event);
+            state.pointerUpListener = (event) => this._handleTouchPointerEnd(event, false);
+            state.pointerCancelListener = (event) => this._handleTouchPointerEnd(event, true);
+            this.container.addEventListener('pointerdown', state.pointerDownListener, true);
+            window.addEventListener('pointermove', state.pointerMoveListener, true);
+            window.addEventListener('pointerup', state.pointerUpListener, true);
+            window.addEventListener('pointercancel', state.pointerCancelListener, true);
+        }
+
+        _handleTouchPointerDown(event) {
+            if (event.pointerType !== 'touch' || !this.mobileTouchState) return;
+            // Alan 8/28/26 - The native action menu is inside the tree container, but its taps
+            // are controls, not tree gestures. Tracking them used to suppress the compatibility
+            // click before phylotree's shared Prune/Copy/Collapse callback could execute.
+            if (event.target?.closest?.('.phylotree-context-menu')) return;
+            const node = this._getContextMenuNode(event.target);
+            const pointer = {
+                pointerId: event.pointerId,
+                startX: event.clientX,
+                startY: event.clientY,
+                moved: false,
+                target: event.target,
+                node,
+                boxSelecting: Boolean(this.boxSelectState.drag?.pointerId === event.pointerId)
+            };
+            this.mobileTouchState.pointers.set(event.pointerId, pointer);
+            if (this.mobileTouchState.pointers.size > 1) {
+                this.mobileTouchState.pointers.forEach(active => { active.moved = true; });
+            }
+            // Alan 8/28/26 - Empty-background Select gestures belong to the box selector. Node
+            // gestures are owned here; phylotree's zoom filter also rejects Select-mode touch.
+            if (this.mobileInteractionMode === 'select' && node) {
+                event.preventDefault();
+                event.stopPropagation();
+                try { this.container.setPointerCapture(event.pointerId); } catch (_) { }
+            }
+        }
+
+        _handleTouchPointerMove(event) {
+            if (event.pointerType !== 'touch' || !this.mobileTouchState) return;
+            const pointer = this.mobileTouchState.pointers.get(event.pointerId);
+            if (!pointer) return;
+            if (Math.hypot(event.clientX - pointer.startX, event.clientY - pointer.startY) >= 9) {
+                pointer.moved = true;
+            }
+            if (this.mobileTouchState.pointers.size > 1) {
+                this.mobileTouchState.pointers.forEach(active => { active.moved = true; });
+            }
+            if (this.mobileInteractionMode === 'select' && pointer.node) {
+                event.preventDefault();
+                event.stopPropagation();
+            }
+        }
+
+        _handleTouchPointerEnd(event, cancelled) {
+            if (event.pointerType !== 'touch' || !this.mobileTouchState) return;
+            const state = this.mobileTouchState;
+            const pointer = state.pointers.get(event.pointerId);
+            if (!pointer) return;
+            if (Math.hypot(event.clientX - pointer.startX, event.clientY - pointer.startY) >= 9) {
+                pointer.moved = true;
+            }
+            const wasMultiTouch = state.pointers.size > 1;
+            state.pointers.delete(event.pointerId);
+            state.suppressClickUntil = Date.now() + 700;
+            state.suppressClickTarget = pointer.target;
+
+            if (!cancelled && !wasMultiTouch && !pointer.moved
+                && this.mobileInteractionMode === 'select' && pointer.node) {
+                const id = this._getNodeId(pointer.node);
+                if (id) {
+                    const nowSelected = this._toggleVisibleSelection(id);
+                    this._syncCladeSelection(pointer.node, nowSelected);
+                    state.lastTargetNode = pointer.node;
+                    this._updateNodeStylesOnly();
+                    this._updateStats();
+                    this.container.dispatchEvent(new CustomEvent('dikarya:mobile-target-change', {
+                        detail: { available: true }
+                    }));
+                }
+            }
+            if (this.mobileInteractionMode === 'select' && pointer.node) {
+                event.preventDefault();
+                event.stopPropagation();
+            }
+            try { this.container.releasePointerCapture(event.pointerId); } catch (_) { }
+        }
+
         // Alan 5/11/26 - Start box-select only from empty tree background or toolbar mode.
         _handleBoxSelectPointerDown(event) {
             // Alan 5/11/26 - Leave node right-click and normal node selection behavior untouched.
             if (!this._isBoxSelectBackgroundTarget(event.target)) return;
+            // Alan 8/28/26 - Touch navigation belongs to D3. Only explicit Select mode may claim
+            // a touch background drag for a selection rectangle.
+            if (event.pointerType === 'touch' && this.mobileInteractionMode !== 'select') return;
             // Alan 8/16/26 - Mouse buttons swapped: left-drag on empty background now draws the
             // selection box, and panning moved to the right button (see the zoom filter in phylotree.js).
             const leftDrag = event.button === 0;
@@ -2574,7 +3227,12 @@
             }
             // Alan 8/17/26 - Preserve node and incoming-branch context menus. Branch paths are bound to
             // {source,target}; the bubble-phase listener resolves their distal target.
-            if (event.target?.closest?.('.node, .internal-node, path.branch')) return;
+            // Alan 8/25/26 - A drawn annotation's own right-click-to-edit target has to be let
+            // through here too. This listener is on the CONTAINER in the capture phase, so its
+            // stopPropagation() ran before the event ever reached the g.clade-annotation the
+            // edit handler is attached to -- right-clicking a bracket, label or branch bubble
+            // did nothing at all, not even open the browser menu.
+            if (event.target?.closest?.('.node, .internal-node, path.branch, .clade-annotation')) return;
             // Alan 8/16/26 - Background right-drag now pans the tree, so the browser menu must stay closed.
             event.preventDefault();
             // Alan 5/11/26 - Keep background context clicks from bubbling into unrelated handlers.
@@ -2642,6 +3300,8 @@
                 overlay,
                 moveListener: null,
                 upListener: null,
+                // Alan 8/28/26 - Pointer cancellation must share the drag's idempotent cleanup path.
+                cancelListener: null,
                 keyListener: null
             };
             // Alan 5/11/26 - Store the active drag so movement, release, and Esc can coordinate.
@@ -2654,6 +3314,10 @@
             drag.moveListener = (moveEvent) => this._updateBoxSelectDrag(moveEvent);
             // Alan 5/11/26 - Finish on pointerup anywhere in the viewport.
             drag.upListener = (upEvent) => this._finishBoxSelectDrag(upEvent);
+            // Alan 8/28/26 - Abort a box selection when the browser cancels its touch pointer.
+            drag.cancelListener = (cancelEvent) => {
+                if (cancelEvent.pointerId === drag.pointerId) this._cancelBoxSelectDrag();
+            };
             // Alan 5/11/26 - Let Escape cancel a rectangle before it changes selection.
             drag.keyListener = (keyEvent) => {
                 // Alan 5/11/26 - Cancel only the active box-select drag on Escape.
@@ -2663,6 +3327,8 @@
             window.addEventListener('pointermove', drag.moveListener, true);
             // Alan 5/11/26 - Register temporary pointerup listener for cleanup and selection.
             window.addEventListener('pointerup', drag.upListener, true);
+            // Alan 8/28/26 - Listen for browser gesture cancellation for the lifetime of this drag only.
+            window.addEventListener('pointercancel', drag.cancelListener, true);
             // Alan 5/11/26 - Register temporary Escape listener for keyboard cancellation.
             window.addEventListener('keydown', drag.keyListener, true);
             // Alan 5/11/26 - Capture the pointer when possible to keep drag updates steady.
@@ -2746,6 +3412,8 @@
             if (drag.moveListener) window.removeEventListener('pointermove', drag.moveListener, true);
             // Alan 5/11/26 - Remove the temporary pointerup listener.
             if (drag.upListener) window.removeEventListener('pointerup', drag.upListener, true);
+            // Alan 8/28/26 - Remove the temporary cancel listener with the rest of the drag listeners.
+            if (drag.cancelListener) window.removeEventListener('pointercancel', drag.cancelListener, true);
             // Alan 5/11/26 - Remove the temporary Escape listener.
             if (drag.keyListener) window.removeEventListener('keydown', drag.keyListener, true);
             // Alan 5/11/26 - Release pointer capture if the browser accepted it.
@@ -3042,6 +3710,9 @@
             this.currentSelectionIds.clear();
             // Alan 5/12/26 - Clear transient Deselect state when current selection is removed.
             this.hiddenSelectionIds.clear();
+            // Alan 8/24/26 - Selected clades are part of the same transient selection.
+            this.selectedCladeIds.clear();
+            this._invalidateCladeSelection();
             this._updateStats();
             this._updateNodeStylesOnly();
         }
@@ -3069,7 +3740,8 @@
             // Alan 5/12/26 - Clear temporary action selections for pruned tips only.
             for (const id of removedIds) this.currentSelectionIds.delete(id);
             // Alan 5/12/26 - Refresh labels so remaining set colors stay visible.
-            this._updateNodeStylesOnly();
+            // Alan 8/24/26 - Also repaints automatic highlights derived from this group.
+            this._refreshPersistentColorVisuals();
             // Alan 5/12/26 - Refresh toolbar counts after pruning selection memberships.
             this._updateStats();
             // Alan 5/12/26 - Return how many saved set memberships were removed.
@@ -3096,7 +3768,8 @@
                 changed += 1;
             });
             // Alan 5/12/26 - Repaint labels so applied color is visible immediately.
-            this._updateNodeStylesOnly();
+            // Alan 8/24/26 - Also repaints automatic highlights derived from this group.
+            this._refreshPersistentColorVisuals();
             // Alan 5/12/26 - Keep action button counts synchronized.
             this._updateStats();
             // Alan 5/12/26 - Return new membership count for status text.
@@ -3110,7 +3783,8 @@
             // Alan 5/12/26 - Remove selected tips from all groups because colors are mutually exclusive.
             const changed = this._removeIdsFromAllColorGroups(ids);
             // Alan 5/12/26 - Repaint labels so cleared colors disappear immediately.
-            this._updateNodeStylesOnly();
+            // Alan 8/24/26 - Also repaints automatic highlights derived from this group.
+            this._refreshPersistentColorVisuals();
             // Alan 5/12/26 - Keep action button counts synchronized.
             this._updateStats();
             // Alan 5/12/26 - Return removed membership count for status text.
@@ -3294,6 +3968,8 @@
                     this.hiddenSelectionIds.delete(id);
                     this.selectedIds.add(id);
                 }
+                // Alan 8/24/26 - Register internal descendants as selected clades too.
+                this._syncCladeSelection(node, true);
 
                 if (node.children && node.children.length) {
                     for (const child of node.children) {
@@ -3361,6 +4037,247 @@
             return names;
         }
 
+        // ==================================================================
+        // Alan 8/24/26 - CLADE COLLAPSE (viewer-only, never persisted)
+        //
+        // Collapsing folds a monophyletic group into a wedge. It is purely a
+        // display state (phylotree's transient `node.collapsed`): every tip,
+        // branch length and support value stays in the model, nothing is written
+        // to tree_state.json, no tree-edit API is called, and the edited FASTA is
+        // untouched. It is therefore NOT persisted across a page reload.
+        // ==================================================================
+
+        // Is this a collapsible clade? Leaves are not, and neither is a unary
+        // pass-through node, whose descendant tip set -- and therefore stable ID --
+        // is identical to its only child's.
+        _isCollapsibleClade(node) {
+            const children = node?.children || node?.data?.children || [];
+            return Boolean(children && children.length >= 2);
+        }
+
+        // Stable ID for an internal node, or null for anything that is not a
+        // collapsible clade.
+        _getCladeId(node) {
+            if (!this._isCollapsibleClade(node)) return null;
+            const tipIds = this.getDescendantLeafIds(node);
+            if (!tipIds.length) return null;
+            return stableCladeIdFromTipNames(tipIds);
+        }
+
+        // Keep the clade registry in step with a selection change made against a
+        // real node object. Called from every place that selects/deselects one.
+        _syncCladeSelection(node, selected) {
+            const cladeId = this._getCladeId(node);
+            if (!cladeId) return;
+            const before = this.selectedCladeIds.size;
+            if (selected) this.selectedCladeIds.add(cladeId);
+            else this.selectedCladeIds.delete(cladeId);
+            if (this.selectedCladeIds.size !== before) this._invalidateCladeSelection();
+        }
+
+        // Called wherever the selected-clade set or the parsed tree changes.
+        _invalidateCladeSelection() {
+            this._cladeSelectionRevision = (this._cladeSelectionRevision || 0) + 1;
+            this._cladeNodeCache = null;
+        }
+
+        // Resolve the registry back to live nodes in the CURRENT tree, dropping
+        // IDs whose clade no longer exists (after a prune, say). The root is
+        // excluded: collapsing it would blank the whole tree, and no bulk action
+        // should ever be able to do that by accident.
+        getSelectedCladeNodes() {
+            if (!this.tree || this.selectedCladeIds.size === 0) return [];
+            if (this._cladeNodeCache
+                && this._cladeNodeCache.revision === this._cladeSelectionRevision) {
+                return this._cladeNodeCache.nodes;
+            }
+            const wanted = new Set(this.selectedCladeIds);
+            const found = new Map();
+            this.tree.traverse_and_compute((node) => {
+                if (node.parent === undefined || node.parent === null) return;
+                const cladeId = this._getCladeId(node);
+                if (cladeId && wanted.has(cladeId) && !found.has(cladeId)) {
+                    found.set(cladeId, node);
+                }
+            });
+            const nodes = Array.from(found.values());
+            // Cached by object identity, not by collapsed state: the callers below
+            // re-read node.collapsed on every call, so a collapse never needs to
+            // invalidate this.
+            this._cladeNodeCache = { revision: this._cladeSelectionRevision, nodes };
+            return nodes;
+        }
+
+        // Reduce a set of clades to the MAXIMAL non-overlapping ones: a clade with
+        // a selected ancestor in the same set is dropped. Selecting a clade and one
+        // of its descendants and asking to collapse both means one visible collapse,
+        // not two, and the descendant would vanish under the ancestor's wedge anyway.
+        _maximalClades(nodes) {
+            const members = new Set(nodes);
+            const hasSelectedAncestor = (node) => {
+                let cursor = node.parent;
+                while (cursor) {
+                    if (members.has(cursor)) return true;
+                    cursor = cursor.parent;
+                }
+                return false;
+            };
+            return nodes.filter((node) => !hasSelectedAncestor(node));
+        }
+
+        // What a bulk collapse would fold: maximal selected clades not already
+        // collapsed. Deliberately deterministic and order-preserving.
+        getBulkCollapseTargets() {
+            const selected = this.getSelectedCladeNodes();
+            if (selected.length === 0) return [];
+            return this._maximalClades(selected).filter((node) => !node.collapsed);
+        }
+
+        // What a bulk expand would unfold: every selected clade that is collapsed,
+        // WITHOUT the maximal-clade reduction. Expanding is idempotent and cannot
+        // hide anything, and reducing here would strand a nested collapsed clade
+        // permanently behind its expanded ancestor.
+        getBulkExpandTargets() {
+            return this.getSelectedCladeNodes().filter((node) => Boolean(node.collapsed));
+        }
+
+        // Count of clades a bulk action currently has to work with, for menu labels.
+        getSelectedCladeCount() {
+            return this.getSelectedCladeNodes().length;
+        }
+
+        // Repaint after a collapse change. phylotree's own menu item only calls
+        // update(), which leaves Dikarya's support labels, event handlers and
+        // selection colors describing the pre-collapse SVG.
+        _refreshAfterCollapse() {
+            const display = this.tree?.display;
+            if (!display || typeof display.update !== 'function') {
+                this._draw();
+                return;
+            }
+            display.update();
+            this._addSupportLabels();
+            this._attachEventHandlers();
+            this._updateNodeStylesOnly();
+            this._applyTextSizingFromZoom();
+            this._scheduleAnnotationRedraw();
+        }
+
+        // Record the one-slot undo entry and tell the controller a collapse happened.
+        // `collapsed` is the direction the action moved in, so the controller can word
+        // its message without parsing the undo label.
+        _recordCollapseUndo(entries, label, collapsed) {
+            if (!entries.length) return;
+            this._collapseUndo = { entries, label };
+            if (typeof this.callbacks.onCollapseChange === 'function') {
+                this.callbacks.onCollapseChange({ label, count: entries.length, collapsed });
+            }
+        }
+
+        // Apply one collapsed state to a list of clades in a single repaint.
+        // Returns the number of clades actually changed.
+        _setCladesCollapsed(nodes, collapsed, label) {
+            const display = this.tree?.display;
+            if (!display || typeof display.toggleCollapse !== 'function') return 0;
+            const changed = nodes.filter((node) => Boolean(node.collapsed) !== collapsed);
+            if (changed.length === 0) return 0;
+            this._bulkCollapseInProgress = true;
+            try {
+                changed.forEach((node) => display.toggleCollapse(node));
+            } finally {
+                this._bulkCollapseInProgress = false;
+            }
+            this._refreshAfterCollapse();
+            this._recordCollapseUndo(
+                changed.map((node) => ({ node, collapsed: !collapsed })),
+                label || `${collapsed ? 'collapse' : 'expand'} of ${changed.length} clade${changed.length === 1 ? '' : 's'}`,
+                collapsed
+            );
+            return changed.length;
+        }
+
+        // Collapse the current bulk target set. Returns how many clades folded.
+        collapseSelectedClades() {
+            const targets = this.getBulkCollapseTargets();
+            const count = targets.length;
+            return this._setCladesCollapsed(
+                targets, true,
+                `collapse of ${count} clade${count === 1 ? '' : 's'}`
+            );
+        }
+
+        // Expand every selected clade that is currently collapsed.
+        expandSelectedClades() {
+            const targets = this.getBulkExpandTargets();
+            const count = targets.length;
+            return this._setCladesCollapsed(
+                targets, false,
+                `expand of ${count} clade${count === 1 ? '' : 's'}`
+            );
+        }
+
+        // Is a collapse/expand available to undo?
+        hasCollapseUndo() {
+            return Boolean(this._collapseUndo && this._collapseUndo.entries.length);
+        }
+
+        // Label for the pending collapse undo, e.g. "collapse of 4 clades".
+        getCollapseUndoLabel() {
+            return this._collapseUndo ? this._collapseUndo.label : null;
+        }
+
+        // Restore the collapse state captured before the last collapse/expand and
+        // consume the entry. Returns the label of what was undone, or null.
+        undoLastCollapseChange() {
+            if (!this.hasCollapseUndo()) return null;
+            const { entries, label } = this._collapseUndo;
+            this._collapseUndo = null;
+            const display = this.tree?.display;
+            if (!display || typeof display.toggleCollapse !== 'function') return null;
+            this._bulkCollapseInProgress = true;
+            try {
+                entries.forEach(({ node, collapsed }) => {
+                    if (Boolean(node.collapsed) !== Boolean(collapsed)) display.toggleCollapse(node);
+                });
+            } finally {
+                this._bulkCollapseInProgress = false;
+            }
+            this._refreshAfterCollapse();
+            return label;
+        }
+
+        // Forget the pending collapse undo (the tree it referred to is gone).
+        clearCollapseUndo() {
+            this._collapseUndo = null;
+        }
+
+        // Watch phylotree's own collapse item so a single "Collapse Clade" from the
+        // context menu is undoable too. The event carries the node and its NEW
+        // state, so the previous state is simply its negation.
+        _hookNativeCollapseEvents() {
+            const display = this.tree?.display;
+            if (!display || typeof display.on !== 'function') return;
+            if (this._nativeCollapseHandler) display.off?.('collapsed', this._nativeCollapseHandler);
+            this._nativeCollapseHandler = (node, collapsed) => {
+                if (this._bulkCollapseInProgress) return;
+                this._recordCollapseUndo(
+                    [{ node, collapsed: !collapsed }],
+                    collapsed ? 'collapse of 1 clade' : 'expand of 1 clade',
+                    collapsed
+                );
+                // toggleCollapse() emits BEFORE phylotree's own menu handler calls
+                // update(), so refreshing inline would rebuild support labels and
+                // event handlers against the pre-collapse SVG and then have them
+                // wiped by that update. Deferring one turn puts this last.
+                if (this._nativeCollapseRefreshTimer) clearTimeout(this._nativeCollapseRefreshTimer);
+                this._nativeCollapseRefreshTimer = setTimeout(() => {
+                    this._nativeCollapseRefreshTimer = null;
+                    this._refreshAfterCollapse();
+                }, 0);
+            };
+            display.on('collapsed', this._nativeCollapseHandler);
+        }
+
         // --- SELECTION SET MANAGEMENT (CRUD) ---
 
         /**
@@ -3399,7 +4316,8 @@
             }
 
             // Alan 5/12/26 - Deleting a color group should preserve temporary action selection.
-            this._updateNodeStylesOnly();
+            // Alan 8/24/26 - Also repaints automatic highlights derived from this group.
+            this._refreshPersistentColorVisuals();
             this._updateStats();
             return true;
         }
@@ -3414,7 +4332,8 @@
             this.activeSelectionSet = name;
             // Alan 5/12/26 - Switching color groups should not clear temporary action selection.
             // Alan 5/12/26 - Repaint immediately because active set membership now controls color priority.
-            this._updateNodeStylesOnly();
+            // Alan 8/24/26 - Also repaints automatic highlights derived from this group.
+            this._refreshPersistentColorVisuals();
             this._updateStats();
             return true;
         }
@@ -3450,7 +4369,8 @@
             // Alan 5/12/26 - Normalize before storing so inline styles stay safe.
             this.selectionSetColors[name] = this._normalizeColor(color, this.getSelectionSetColor(name) || '#1f77b4');
             // Alan 5/12/26 - Repaint labels immediately after a color edit.
-            this._updateNodeStylesOnly();
+            // Alan 8/24/26 - Also repaints automatic highlights derived from this group.
+            this._refreshPersistentColorVisuals();
             // Alan 5/12/26 - Report a successful color edit.
             return true;
         }
@@ -3519,7 +4439,8 @@
             this.hiddenSelectionIds.clear();
             // Alan 5/10/26 - Do not restore saved selections for nodes removed by pruning.
             this._trimSelectionSetsToCurrentTree();
-            this._updateNodeStylesOnly();
+            // Alan 8/24/26 - Restored groups change automatic highlight colours too.
+            this._refreshPersistentColorVisuals();
             this._updateStats();
         }
 
@@ -3581,6 +4502,27 @@
             };
             visit(node);
             return ids;
+        }
+
+        /**
+         * Alan 8/26/26 - Resolve canonical leaf IDs to the labels currently ON SCREEN.
+         * The annotation editor uses these to suggest a default label, and a tip the user has
+         * renamed should contribute the name they gave it, not the original FASTA header.
+         * IDs with no matching tip (a pruned member of a stale annotation) are skipped.
+         */
+        getDisplayLabelsForLeafIds(ids) {
+            const wanted = new Set(Array.isArray(ids) ? ids.filter(Boolean) : []);
+            if (!wanted.size || !Array.isArray(this.allNodes)) return [];
+            const labels = [];
+            this.allNodes.forEach((node) => {
+                const children = node.children || node.data?.children || [];
+                if (children && children.length) return;
+                const id = this._getNodeId(node);
+                if (!id || !wanted.has(id)) return;
+                const label = node.data?.name || node.name || id;
+                if (label) labels.push(String(label));
+            });
+            return labels;
         }
 
         // Alan 8/17/26 - Compare annotations by canonical descendant membership rather than
@@ -3701,6 +4643,21 @@
                     return ids;
                 }
             }
+            // A FastTree soft polytomy is still one unresolved clade to the user even though
+            // its Newick representation contains arbitrary near-zero binary edges. Honor the
+            // selection only when it is the COMPLETE zero-length component and its tips have
+            // been made adjacent, so unrelated partial/non-contiguous selections stay invalid.
+            const polytomy = this._zeroLengthPolytomyForMemberIds(Array.from(selectedLeafIds));
+            if (polytomy) {
+                const visibleOrder = this.getVisibleTipOrder();
+                const indices = visibleOrder
+                    .map((id, index) => selectedLeafIds.has(id) ? index : -1)
+                    .filter((index) => index >= 0);
+                if (indices.length === selectedLeafIds.size
+                    && indices[indices.length - 1] - indices[0] + 1 === indices.length) {
+                    return visibleOrder.slice(indices[0], indices[indices.length - 1] + 1);
+                }
+            }
             // A single selected tip is its own (one-member) clade.
             if (selectedLeafIds.size === 1) return Array.from(selectedLeafIds);
             return null;
@@ -3713,6 +4670,9 @@
             const wanted = new Set(Array.isArray(ids) ? ids.filter(Boolean) : []);
             this.currentSelectionIds.clear();
             this.hiddenSelectionIds.clear();
+            // Alan 8/24/26 - This REPLACES the selection with a leaf set, so no clade stays selected.
+            this.selectedCladeIds.clear();
+            this._invalidateCladeSelection();
             let matched = 0;
             for (const node of this.allNodes) {
                 const id = this._getNodeId(node);
@@ -3758,9 +4718,15 @@
             }
             const inherited = layer ? layer['default_' + field] : null;
             if (inherited !== null && inherited !== undefined && inherited !== '') {
-                // A layer always stores a concrete value (the server fills the shared default
-                // in when none was sent), so "the layer still carries the shared default" is
-                // the closest thing to "untouched" that exists at layer level.
+                // Alan 8/24/26 - A layer that stores this field at all has had it chosen: the
+                // server leaves it absent otherwise. No value-as-sentinel, so a user who types
+                // the shared default gets exactly that and not the automatic value.
+                if (ANNOTATION_OPTIONAL_LAYER_STYLE_FIELDS.has(field)) {
+                    return { value: inherited, isDefault: false };
+                }
+                // Every other layer field always stores a concrete value (the server fills the
+                // shared default in when none was sent), so "the layer still carries the shared
+                // default" is the closest thing to "untouched" that exists at layer level.
                 return { value: inherited, isDefault: inherited === defaults[field] };
             }
             return { value: defaults[field], isDefault: true };
@@ -3785,7 +4751,501 @@
             const type = annotation?.annotation_type;
             if (type === 'branch_text') return 'branch_text';
             if (type === 'branch_bubble' || type === 'bubble') return 'branch_bubble';
+            // Alan 8/24/26 - Highlights are a clade annotation, so they keep the clade lane,
+            // the bracket and the label, and add a band behind the clade.
+            if (type === 'clade_highlight') return 'clade_highlight';
             return 'clade_line';
+        }
+
+        // ==================================================================
+        // Alan 8/24/26 - AUTOMATIC HIGHLIGHT COLOURS
+        //
+        // A clade highlight that the user has not styled does not fall back to one shared
+        // colour. It resolves, in order, to:
+        //   1. the persistent colour group its tips already belong to, softened for use as a
+        //      large translucent area;
+        //   2. a palette colour chosen so successive highlights differ from one another.
+        //
+        // Everything here is a pure function of the saved annotations plus the existing
+        // selection-set state, so the same tree always produces the same colours, and the
+        // editor preview can show exactly what the figure will draw before anything is saved.
+        // ==================================================================
+
+        _hexToRgb(hex) {
+            const value = typeof hex === 'string' ? hex.trim() : '';
+            if (!/^#[0-9a-fA-F]{6}$/.test(value)) return null;
+            return {
+                r: parseInt(value.slice(1, 3), 16),
+                g: parseInt(value.slice(3, 5), 16),
+                b: parseInt(value.slice(5, 7), 16)
+            };
+        }
+
+        _rgbToHex(r, g, b) {
+            const channel = (v) => Math.max(0, Math.min(255, Math.round(v)))
+                .toString(16).padStart(2, '0');
+            return `#${channel(r)}${channel(g)}${channel(b)}`;
+        }
+
+        // Alan 8/24/26 - Standard sRGB <-> HSL, kept local so softening a group colour needs
+        // no colour library and stays byte-for-byte reproducible across browsers.
+        _hexToHsl(hex) {
+            const rgb = this._hexToRgb(hex);
+            if (!rgb) return null;
+            const r = rgb.r / 255, g = rgb.g / 255, b = rgb.b / 255;
+            const max = Math.max(r, g, b), min = Math.min(r, g, b);
+            const l = (max + min) / 2;
+            const d = max - min;
+            if (d === 0) return { h: 0, s: 0, l };
+            const s = l > 0.5 ? d / (2 - max - min) : d / (max + min);
+            let h;
+            if (max === r) h = ((g - b) / d + (g < b ? 6 : 0)) / 6;
+            else if (max === g) h = ((b - r) / d + 2) / 6;
+            else h = ((r - g) / d + 4) / 6;
+            return { h, s, l };
+        }
+
+        _hslToHex(h, s, l) {
+            if (s === 0) return this._rgbToHex(l * 255, l * 255, l * 255);
+            const q = l < 0.5 ? l * (1 + s) : l + s - l * s;
+            const p = 2 * l - q;
+            const toChannel = (t) => {
+                let value = t;
+                if (value < 0) value += 1;
+                if (value > 1) value -= 1;
+                if (value < 1 / 6) return p + (q - p) * 6 * value;
+                if (value < 1 / 2) return q;
+                if (value < 2 / 3) return p + (q - p) * (2 / 3 - value) * 6;
+                return p;
+            };
+            return this._rgbToHex(
+                toChannel(h + 1 / 3) * 255, toChannel(h) * 255, toChannel(h - 1 / 3) * 255
+            );
+        }
+
+        /**
+         * Alan 8/24/26 - Turn a group's line colour into a background of the same hue.
+         *
+         * The categorical colours the colour groups use are picked to be legible as thin
+         * marks; spread over a whole clade at any useful opacity they read as neon. Keeping
+         * the hue and capping saturation and lightness gives an area fill that is recognisably
+         * "the blue group" without shouting. Deterministic, so the same group always softens
+         * to the same fill.
+         */
+        _softenHighlightColor(hex) {
+            const hsl = this._hexToHsl(hex);
+            if (!hsl) return null;
+            return this._hslToHex(hsl.h, Math.min(hsl.s, 0.5), 0.45);
+        }
+
+        /**
+         * Alan 8/26/26 - The colour a group mark or tip label is actually PAINTED with.
+         *
+         * Hue and saturation are kept, so a tip still reads as "the blue group"; only lightness
+         * is floored, and only in dark mode. Light mode is untouched.
+         *
+         * Deliberately NOT folded into getSelectionSetColor(): that value is the user's stored
+         * choice and has to keep flowing unchanged to the swatches, the group editor and
+         * _persistentGroupColorForTips(), which derives clade-highlight fills from it. Lifting
+         * it there would make saved state and highlight fills drift with the theme.
+         *
+         * Resolved here and written inline by the caller, never as a CSS override, for the same
+         * reason the highlight styles are: the export path clones the live SVG without the
+         * page stylesheet, so a themed CSS rule would make the exported figure differ from the
+         * one on screen.
+         */
+        _displayColorForTheme(hex) {
+            if (!hex || !this._isDarkTheme()) return hex;
+            const hsl = this._hexToHsl(hex);
+            if (!hsl) return hex;
+            if (hsl.l >= DARK_LABEL_MIN_LIGHTNESS) return hex;
+            return this._hslToHex(hsl.h, hsl.s, DARK_LABEL_MIN_LIGHTNESS);
+        }
+
+        /**
+         * Alan 8/24/26 - Which persistent colour group owns this tip, or null.
+         *
+         * Split out of _getNodeDisplayColor so the highlight and the tip label agree about
+         * group membership by construction. Deliberately stops before that method's search-match
+         * and sequence-of-interest colours: those are transient view state, not a statement that
+         * these taxa are a group, and a highlight derived from them would change colour when the
+         * user typed in the search box.
+         */
+        _persistentGroupNameForTip(id) {
+            if (!id || !this.selectionSets) return null;
+            const setNames = Object.keys(this.selectionSets);
+            // The active group wins, so adding a tip to a group visibly recolours it.
+            if (setNames.includes(this.activeSelectionSet)
+                && this.selectionSets[this.activeSelectionSet]?.has(id)) {
+                return this.activeSelectionSet;
+            }
+            for (const name of setNames) {
+                if (name === this.activeSelectionSet) continue;
+                if (this.selectionSets[name]?.has(id)) return name;
+            }
+            return null;
+        }
+
+        /**
+         * Alan 8/24/26 - The shared group colour for a whole clade, or null.
+         *
+         * Requires EVERY member to be in the same group. A clade of 18 blue tips and 5 orange
+         * ones has no single group colour, and averaging them would invent a muddy brown that
+         * corresponds to nothing in the figure, so mixed membership falls through to the
+         * palette instead.
+         */
+        _persistentGroupColorForTips(memberIds) {
+            const ids = Array.isArray(memberIds) ? memberIds.filter(Boolean) : [];
+            if (!ids.length) return null;
+            let groupName = null;
+            for (const id of ids) {
+                const name = this._persistentGroupNameForTip(id);
+                if (!name) return null;
+                if (groupName === null) groupName = name;
+                else if (groupName !== name) return null;
+            }
+            const color = groupName ? this.getSelectionSetColor(groupName) : null;
+            return color ? this._softenHighlightColor(color) : null;
+        }
+
+        /**
+         * Alan 8/24/26 - Is this highlight's colour chosen, or worked out from the tree?
+         *
+         * An annotation-level colour is always a choice. Otherwise the stored mode decides,
+         * annotation first and then layer. When neither carries a mode -- state saved before
+         * the field existed -- fall back to the old rule that a layer still holding the shared
+         * default gold was never styled, so those keep behaving exactly as they did.
+         */
+        _resolveHighlightColorIntent(annotation, layer) {
+            const defaults = window.DikaryaCladeAnnotations.DEFAULTS;
+            const own = annotation ? annotation.highlight_color : null;
+            if (own !== null && own !== undefined && own !== '') {
+                return { mode: 'fixed', color: own };
+            }
+            const layerColor = layer ? layer.default_highlight_color : null;
+            const fixedColor = (layerColor !== null && layerColor !== undefined && layerColor !== '')
+                ? layerColor : defaults.highlight_color;
+
+            const ownMode = annotation ? annotation.highlight_color_mode : null;
+            if (ownMode === 'fixed') return { mode: 'fixed', color: fixedColor };
+            if (ownMode === 'auto') return { mode: 'auto', color: null };
+
+            const layerMode = layer ? layer.default_highlight_color_mode : null;
+            if (layerMode === 'fixed') return { mode: 'fixed', color: fixedColor };
+            if (layerMode === 'auto') return { mode: 'auto', color: null };
+
+            // No mode stored anywhere: the legacy reading of the colour value.
+            return (layerColor === null || layerColor === undefined || layerColor === ''
+                || layerColor === defaults.highlight_color)
+                ? { mode: 'auto', color: null }
+                : { mode: 'fixed', color: layerColor };
+        }
+
+        _highlightColorIsAutomatic(annotation, layer) {
+            return this._resolveHighlightColorIntent(annotation, layer).mode === 'auto';
+        }
+
+        /**
+         * Alan 8/24/26 - Are two candidate band colours close enough to read as the same wash?
+         *
+         * Spread over a clade at 0.2 opacity, two colours 10 degrees of hue apart are simply
+         * one colour with a wobble -- which is what a softened group blue (#397dac) and the
+         * first palette blue (#3b6fb6) were. Compares hue first, but only calls it a clash when
+         * lightness and saturation are also close, so a deliberately pale and a deliberately
+         * deep version of one hue still read as two regions. Near-greys have no usable hue and
+         * are compared on lightness alone.
+         */
+        _highlightColorsAreTooClose(a, b) {
+            const x = this._hexToHsl(a);
+            const y = this._hexToHsl(b);
+            if (!x || !y) return false;
+            const dl = Math.abs(x.l - y.l);
+            const ds = Math.abs(x.s - y.s);
+            if (x.s < 0.12 || y.s < 0.12) return dl < 0.15 && ds < 0.2;
+            let dh = Math.abs(x.h - y.h);
+            if (dh > 0.5) dh = 1 - dh;
+            // 0.055 of the hue circle is about 20 degrees.
+            return dh < 0.055 && dl < 0.25 && ds < 0.4;
+        }
+
+        /**
+         * Alan 8/24/26 - Work out the fill for every clade highlight in one pass.
+         *
+         * Two passes, because a colour that is already decided must be visible to a colour
+         * that is still being chosen:
+         *
+         *   Pass 1 places everything whose colour is already settled -- a colour the user
+         *   fixed, a colour derived from the clade's persistent colour group, and a palette
+         *   slot that was stored when the annotation was first saved. These are never changed.
+         *
+         *   Pass 2 chooses palette colours for the rest, avoiding any colour that would read
+         *   as the same wash as a neighbouring band, whichever pass placed it. Fixed and
+         *   derived colours therefore take part in clash avoidance without consuming a palette
+         *   slot -- the palette exists for clades with no colour of their own.
+         *
+         * Every clade_highlight is walked, including ones the current rooting cannot resolve
+         * and ones on hidden layers, so neither a reroot nor a hidden layer can renumber the
+         * colours of anything else.
+         *
+         * @param {Map} positions   canonical leaf id -> {index}, for the adjacency rule. Optional.
+         * @param {Object} pending  an unsaved annotation being previewed, appended at the end.
+         * @returns {{colors: Map, slots: Map}} id -> hex, and id -> palette index for the
+         *          highlights that were given one in pass 2.
+         */
+        _automaticHighlightAssignments(positions = null, pending = null) {
+            const layerById = new Map();
+            for (const layer of this.annotationLayers || []) {
+                if (layer && layer.id) layerById.set(layer.id, layer);
+            }
+
+            const entries = [];
+            for (const annotation of this.cladeAnnotations || []) {
+                if (!annotation || !annotation.id) continue;
+                if (this._annotationType(annotation) !== 'clade_highlight') continue;
+                const layer = layerById.get(annotation.layer_id) || null;
+                const intent = this._resolveHighlightColorIntent(annotation, layer);
+                entries.push({
+                    id: annotation.id,
+                    members: annotation.member_tip_ids || [],
+                    intent,
+                    slot: Number.isInteger(annotation.automatic_highlight_slot)
+                        ? annotation.automatic_highlight_slot : null
+                });
+            }
+            if (pending && (pending.id || pending.annotation?.id)) {
+                // Alan 8/24/26 - A draft may arrive either as the bare (id, members, slot)
+                // triple the swatch asks with, or as the whole annotation object the editor is
+                // about to save. When the object is given, its OWN colour intent, membership
+                // and slot are used, because those -- not the pre-edit ones still sitting in
+                // this.cladeAnnotations -- are what the save will write.
+                const draftAnnotation = pending.annotation || null;
+                const draftLayer = draftAnnotation
+                    ? (pending.layer || layerById.get(draftAnnotation.layer_id) || null)
+                    : null;
+                const draftId = pending.id || draftAnnotation.id;
+                const draftMembers = pending.memberIds
+                    || (draftAnnotation && draftAnnotation.member_tip_ids) || [];
+                const draftSlot = Number.isInteger(pending.slot)
+                    ? pending.slot
+                    : (draftAnnotation
+                        && Number.isInteger(draftAnnotation.automatic_highlight_slot)
+                        ? draftAnnotation.automatic_highlight_slot : null);
+                const draft = {
+                    id: draftId,
+                    members: draftMembers,
+                    intent: draftAnnotation
+                        ? this._resolveHighlightColorIntent(draftAnnotation, draftLayer)
+                        : { mode: 'auto', color: null },
+                    // A slot the editor is reserving is one the annotation does not hold yet,
+                    // so forcing the palette path also means ignoring any stored slot; that is
+                    // what lets the editor ask for the slot a clade would get even while it
+                    // derives a group colour.
+                    slot: pending.forcePalette ? null : draftSlot,
+                    forcePalette: !!pending.forcePalette
+                };
+                // Alan 8/24/26 - In edit mode the pending id names an annotation that is
+                // already saved. The edited membership and colour intent are what the user is
+                // looking at, so they REPLACE the saved entry instead of being discarded --
+                // dropping them made the preview resolve against the pre-edit annotation and
+                // show a colour the save would not produce.
+                const index = entries.findIndex((entry) => entry.id === draftId);
+                if (index >= 0) entries[index] = draft;
+                else entries.push(draft);
+            }
+
+            const span = (members) => {
+                if (!positions) return null;
+                let min = Infinity;
+                let max = -Infinity;
+                for (const member of members) {
+                    const entry = positions.get(member);
+                    if (!entry) continue;
+                    if (entry.index < min) min = entry.index;
+                    if (entry.index > max) max = entry.index;
+                }
+                return min === Infinity ? null : { min, max };
+            };
+            // Touching counts as adjacent, so two clades stacked one directly above the other
+            // do not come out the same colour.
+            const touches = (a, b) => !!a && !!b && a.min <= b.max + 1 && b.min <= a.max + 1;
+
+            const colors = new Map();
+            const slots = new Map();
+            const placed = [];
+            const useCount = HIGHLIGHT_PALETTE.map(() => 0);
+            const deferred = [];
+
+            for (const entry of entries) {
+                entry.span = span(entry.members);
+                if (entry.intent.mode === 'fixed') {
+                    // Never altered, but still blocks a neighbour from picking its twin.
+                    placed.push({ color: entry.intent.color, span: entry.span });
+                    continue;
+                }
+                const group = entry.forcePalette
+                    ? null : this._persistentGroupColorForTips(entry.members);
+                if (group) {
+                    colors.set(entry.id, group);
+                    placed.push({ color: group, span: entry.span });
+                    continue;
+                }
+                if (entry.slot !== null) {
+                    const index = ((entry.slot % HIGHLIGHT_PALETTE.length)
+                        + HIGHLIGHT_PALETTE.length) % HIGHLIGHT_PALETTE.length;
+                    const color = HIGHLIGHT_PALETTE[index];
+                    colors.set(entry.id, color);
+                    slots.set(entry.id, entry.slot);
+                    useCount[index] += 1;
+                    placed.push({ color, span: entry.span });
+                    continue;
+                }
+                deferred.push(entry);
+            }
+
+            for (const entry of deferred) {
+                const neighbourColors = placed
+                    .filter((other) => touches(entry.span, other.span))
+                    .map((other) => other.color);
+                const order = HIGHLIGHT_PALETTE
+                    .map((_, index) => index)
+                    .sort((a, b) => (useCount[a] - useCount[b]) || (a - b));
+                let chosen = order.find((index) => !neighbourColors.some(
+                    (color) => this._highlightColorsAreTooClose(HIGHLIGHT_PALETTE[index], color)
+                ));
+                // Every colour clashes with something next door: take the least-used one, so
+                // the outcome is still deterministic rather than arbitrary.
+                if (chosen === undefined) chosen = order[0];
+                useCount[chosen] += 1;
+                colors.set(entry.id, HIGHLIGHT_PALETTE[chosen]);
+                slots.set(entry.id, chosen);
+                placed.push({ color: HIGHLIGHT_PALETTE[chosen], span: entry.span });
+            }
+
+            return { colors, slots };
+        }
+
+        /**
+         * Alan 8/24/26 - The colour one highlight would receive with nothing chosen for it.
+         *
+         * Used by the renderer and by the editor's live preview, so what the user sees before
+         * saving is what gets drawn. `annotationId` may name an annotation that does not exist
+         * yet; it is then assigned last, which is where saving will put it.
+         */
+        resolveAutomaticHighlightColor(annotationId, memberIds, slot = null, draft = null) {
+            const { colors } = this._automaticHighlightAssignments(
+                this._lastAnnotationPositions || null,
+                { id: annotationId, memberIds, slot,
+                  annotation: draft?.annotation || null, layer: draft?.layer || null }
+            );
+            return colors.get(annotationId) || HIGHLIGHT_PALETTE[0];
+        }
+
+        /**
+         * Alan 8/24/26 - The colour a DRAFT highlight would be painted with, resolved from the
+         * draft itself rather than from whatever is currently saved under the same id.
+         *
+         * The editor mutates a copy: while "Fixed red" is being switched to "Automatic", the
+         * saved annotation still says fixed. Feeding the saved object into the assignment made
+         * the preview and the swatch show a colour the save would not produce, because a fixed
+         * entry takes no palette slot and a draft that is now automatic needs one. The draft
+         * carries its own id, membership, layer, colour, mode and stored slot, so it can stand
+         * in for the future saved state exactly -- and it REPLACES the saved entry rather than
+         * being appended, so the annotation is never counted twice.
+         */
+        resolveDraftHighlightColor(annotation, layer = null) {
+            if (!annotation || !annotation.id) return HIGHLIGHT_PALETTE[0];
+            const { colors } = this._automaticHighlightAssignments(
+                this._lastAnnotationPositions || null, { annotation, layer }
+            );
+            return colors.get(annotation.id) || HIGHLIGHT_PALETTE[0];
+        }
+
+        /**
+         * Alan 8/24/26 - The palette slot a new automatic highlight should be saved with.
+         *
+         * Stored on the annotation so its colour survives other annotations being deleted or
+         * added. Deliberately computed as if the clade had no colour group: a clade that is in
+         * one today takes its fill from the group, but if it later leaves the group the stored
+         * slot is what stops it jumping to whatever colour is free at that moment.
+         */
+        reserveAutomaticHighlightSlot(annotationId, memberIds) {
+            const { slots } = this._automaticHighlightAssignments(
+                this._lastAnnotationPositions || null,
+                { id: annotationId, memberIds, forcePalette: true }
+            );
+            const slot = slots.get(annotationId);
+            // Alan 8/24/26 - No slot means "nothing was reserved", which must NOT collapse to
+            // 0: 0 is a real palette slot, and a stored slot beats the clash-avoidance pass, so
+            // returning it here used to pin the highlight to the first palette blue forever --
+            // even directly beside another blue band. Null lets the renderer choose each time.
+            return Number.isInteger(slot) ? slot : null;
+        }
+
+        // Alan 8/24/26 - True when the page is in dark mode. Guarded: the annotation code also
+        // runs under Node in the regression harness, which has no documentElement.
+        _isDarkTheme() {
+            try {
+                return !!document.documentElement?.classList?.contains('dark');
+            } catch (_) {
+                return false;
+            }
+        }
+
+        /**
+         * Alan 8/24/26 - The colour and opacity a highlight is actually drawn with.
+         *
+         * Both are resolved here and written inline by the caller. Nothing about a highlight's
+         * appearance may live in a stylesheet: the export path clones the live SVG without the
+         * page's CSS, so a themed CSS override would silently make the exported figure differ
+         * from the one the user was looking at.
+         */
+        _effectiveHighlightStyle(item, assignments = null) {
+            const style = item.style || {};
+            const intent = this._resolveHighlightColorIntent(item.annotation, item.layer);
+            const color = intent.mode === 'fixed'
+                ? intent.color
+                : ((assignments && assignments.get(item.annotation?.id))
+                    // Alan 8/24/26 - No precomputed assignment means this is a one-off
+                    // resolution -- the editor preview. Resolve it from the item's OWN
+                    // annotation and layer, which in the editor is the unsaved draft.
+                    || this.resolveDraftHighlightColor(item.annotation, item.layer));
+            // An opacity the user picked is theirs in both themes; only the automatic one
+            // adapts, because a wash tuned for white is invisible on black.
+            const opacity = style.highlight_opacity_is_default
+                ? (this._isDarkTheme() ? AUTO_HIGHLIGHT_OPACITY.dark : AUTO_HIGHLIGHT_OPACITY.light)
+                : style.highlight_opacity;
+            return { color, opacity };
+        }
+
+        // Alan 8/24/26 - Automatic highlight opacity depends on the theme, and the theme can be
+        // toggled while a tree is on screen, so repaint when the class changes. One observer per
+        // viewer; harmless where there is no DOM to observe.
+        // Alan 8/26/26 - Group mark/label colours are theme-dependent too now
+        // (_displayColorForTheme), and they are written inline, so a toggle has to restyle the
+        // nodes as well or the labels keep the previous theme's colours until an unrelated
+        // redraw. Guarded on this.tree the same way the other out-of-band callers are.
+        _watchThemeChanges() {
+            if (this._themeObserver || typeof MutationObserver !== 'function') return;
+            try {
+                const root = document.documentElement;
+                if (!root) return;
+                this._themeObserver = new MutationObserver(() => {
+                    if (this.tree && typeof this._updateNodeStylesOnly === 'function') {
+                        this._updateNodeStylesOnly();
+                    }
+                    this._scheduleAnnotationRedraw();
+                });
+                this._themeObserver.observe(root, {
+                    attributes: true, attributeFilter: ['class']
+                });
+            } catch (_) { /* no DOM to watch; inline styles are still correct as drawn */ }
+        }
+
+        // Alan 8/24/26 - True for the types that annotate a clade as a whole rather than one
+        // incoming branch. These are the ones that occupy a right-hand lane and that remain
+        // valid on the root, which has no incoming branch to hang a label on.
+        _isCladeAnnotationType(type) {
+            return type === 'clade_line' || type === 'clade_highlight';
         }
 
         // Alan 8/15/26 - Measure rendered label width with a throwaway <text> in the live SVG,
@@ -3833,6 +5293,7 @@
             const positions = new Map();
             const leaves = [];
             let labelRight = -Infinity;
+            const self = this;
 
             svg.selectAll('g.node, g.internal-node').each(function (d) {
                 if (!d) return;
@@ -3841,20 +5302,19 @@
                 const x = (typeof d.screen_x === 'number') ? d.screen_x : d.y;
                 const y = (typeof d.screen_y === 'number') ? d.screen_y : d.x;
                 if (typeof x !== 'number' || typeof y !== 'number') return;
-                let right = x;
-                try {
-                    const box = this.getBBox();
-                    right = x + box.x + box.width;
-                } catch (_) { /* detached node; keep the branch tip as the edge */ }
-                if (right > labelRight) labelRight = right;
-                leaves.push({ node: d, y });
+                const right = self._tipLabelRightEdge(this, x);
+                if (Number.isFinite(right) && right > labelRight) labelRight = right;
+                leaves.push({ node: d, y, right });
             });
 
             if (!leaves.length) return null;
 
-            const self = this;
             leaves.sort((a, b) => a.y - b.y);
             const tipOrder = [];
+            // Alan 8/24/26 - The right edge of EACH row's own label, in tip order. A clade
+            // annotation is placed from the labels of its own descendants, so one very long
+            // name elsewhere in the tree cannot push a small local annotation across the page.
+            const tipRights = [];
             leaves.forEach((leaf, index) => {
                 const id = self._getNodeId(leaf.node);
                 if (!id) return;
@@ -3862,6 +5322,7 @@
                 // membership for it, so the first occurrence here is never load-bearing.
                 if (!positions.has(id)) positions.set(id, { y: leaf.y, index: tipOrder.length });
                 tipOrder.push(id);
+                tipRights.push(Number.isFinite(leaf.right) ? leaf.right : null);
             });
 
             // Row pitch from the median gap, so uneven spacing does not produce silly ticks.
@@ -3870,12 +5331,67 @@
             gaps.sort((a, b) => a - b);
             const rowPitch = gaps.length ? (gaps[Math.floor(gaps.length / 2)] || 10) : 10;
 
+            // Alan 8/24/26 - Kept so the editor's live preview can work out which automatic
+            // colour a not-yet-saved highlight will get, including the adjacency rule, without
+            // re-measuring the DOM on every keystroke.
+            this._lastAnnotationPositions = positions;
+
             return {
                 positions,
                 tipOrder,
+                tipRights,
                 labelRight: Number.isFinite(labelRight) ? labelRight : 0,
                 rowPitch: Math.max(4, rowPitch)
             };
+        }
+
+        /**
+         * Alan 8/24/26 - The right-hand edge of one leaf's VISIBLE tip label.
+         *
+         * Was the bounding box of the whole leaf <g>. That box is the union of everything the
+         * group happens to contain, which is not only the label: phylotree puts the node bubble
+         * in there, and it appends a branch-tracer <line> running all the way out to
+         * right_most_leaf when tip alignment is on -- and never removes that line for a leaf
+         * when alignment is switched back off. Any of those makes the measured edge far wider
+         * than the text, and since this value is where the annotation lane starts, the result
+         * was a large empty band between the tip labels and the bracket.
+         *
+         * Measuring the label element itself is exact whichever of those is responsible. The
+         * text carries its own transform when tips are aligned, and getBBox() reports a child's
+         * geometry before its own transform, so that translation is added back here. Falls back
+         * to the old group measurement for anything without a rendered label.
+         */
+        _tipLabelRightEdge(groupElement, nodeX) {
+            const measure = (element, offsetX) => {
+                try {
+                    const box = element.getBBox();
+                    if (!box || !(box.width > 0)) return null;
+                    return nodeX + offsetX + box.x + box.width;
+                } catch (_) {
+                    return null;
+                }
+            };
+
+            let label = null;
+            try {
+                label = groupElement.querySelector('text.phylotree-node-text');
+            } catch (_) { /* fall through to the group measurement */ }
+
+            if (label) {
+                let offsetX = 0;
+                try {
+                    // Rectangular layout only translates; radial rotation is out of scope for
+                    // annotations, and consolidate() returns null when there is no transform.
+                    const matrix = label.transform?.baseVal?.consolidate()?.matrix;
+                    if (matrix && Number.isFinite(matrix.e)) offsetX = matrix.e;
+                } catch (_) { /* untransformed label */ }
+                const right = measure(label, offsetX);
+                if (right !== null) return right;
+            }
+
+            const fallback = measure(groupElement, 0);
+            // A leaf with no drawn label at all still occupies its own branch tip.
+            return fallback !== null ? fallback : nodeX;
         }
 
         /**
@@ -3888,6 +5404,10 @@
         _buildAnnotationTopologyIndexes(positions) {
             const cladeBlocks = new Set();
             const branchNodes = new Map();
+            // Alan 8/24/26 - Also keep the node ITSELF for every clade block, root included.
+            // A clade highlight starts at its internal node's x coordinate, and the root has
+            // no incoming branch, so branchNodes alone cannot supply it.
+            const cladeNodes = new Map();
             const visit = (node) => {
                 const children = node.children || [];
                 if (!children.length) {
@@ -3897,6 +5417,7 @@
                     // Alan 8/17/26 - Index terminal clades while excluding only a root branch target.
                     const key = `${entry.index}:${entry.index}`;
                     cladeBlocks.add(key);
+                    if (!cladeNodes.has(key)) cladeNodes.set(key, node);
                     if (node.parent) branchNodes.set(key, node);
                     return { min: entry.index, max: entry.index };
                 }
@@ -3913,13 +5434,19 @@
                 // Alan 8/17/26 - Every node, including the root, is a valid clade block for
                 // a publication bracket; only non-root nodes own an incoming branch.
                 cladeBlocks.add(key);
+                // Alan 8/24/26 - A knuckle (one child) repeats its child's descendant block.
+                // Children are visited before this line, so the first writer for a key is
+                // always the deepest node carrying it -- the one drawn closest to the clade it
+                // labels. An unconditional set() here put the SHALLOWEST node back, which
+                // started the band out at the top of the unary chain instead.
+                if (!cladeNodes.has(key)) cladeNodes.set(key, node);
                 if (node.parent) branchNodes.set(key, node);
                 return { min, max };
             };
             for (const root of this.allNodes) {
                 if (!root.parent) visit(root);
             }
-            return { cladeBlocks, branchNodes };
+            return { cladeBlocks, branchNodes, cladeNodes };
         }
 
         // Alan 8/17/26 - Retain the incoming-branch index helper for renderer compatibility.
@@ -3956,7 +5483,10 @@
          * where the set is a clade again makes it render again on the next redraw.
          */
         // Alan 8/17/26 - Accept a precomputed incoming-branch index for type-aware resolution.
-        _resolveAnnotationsForRender(positions, cladeBlocks, layerById, branchNodes = null) {
+        // Alan 8/24/26 - Accept the clade-node index too, so a highlight knows where its
+        // internal node is drawn. Optional, so existing four-argument callers still work.
+        _resolveAnnotationsForRender(positions, cladeBlocks, layerById, branchNodes = null,
+                                     cladeNodes = null) {
             const validity = new Map();
             const resolved = [];
             // Alan 8/17/26 - Accept the precomputed branch index, with compatibility fallbacks.
@@ -3986,9 +5516,13 @@
                 const annotationType = this._annotationType(annotation);
                 const isClade = this._annotationIsContiguous(indices)
                     && cladeBlocks.has(blockKey);
+                const softPolytomy = this._annotationIsContiguous(indices)
+                    ? this._zeroLengthPolytomyForMemberIds(members) : null;
                 const hasIncomingBranch = incomingBranchNodes.has(blockKey);
-                const valid = isClade
-                    && (annotationType === 'clade_line' || hasIncomingBranch);
+                // Alan 8/24/26 - Clade lines and clade highlights need only be one clade;
+                // the branch types additionally need a branch to sit on.
+                const valid = (isClade || Boolean(softPolytomy))
+                    && (this._isCladeAnnotationType(annotationType) || hasIncomingBranch);
                 validity.set(annotation.id, { present: indices.length, valid });
                 // Invalid annotations are kept in state and flagged in the manager, but they
                 // are never drawn: any line beside the tips would imply a clade that the
@@ -4002,6 +5536,11 @@
                     layer,
                     indices,
                     targetNode: incomingBranchNodes.get(blockKey) || null,
+                    // Alan 8/24/26 - The node the highlight band starts at. Falls back to the
+                    // incoming-branch target, which is the same node everywhere but the root.
+                    cladeNode: (cladeNodes && cladeNodes.get(blockKey))
+                        || incomingBranchNodes.get(blockKey)
+                        || softPolytomy?.anchor || null,
                     savedIndex: this.cladeAnnotations.indexOf(annotation)
                 });
             }
@@ -4023,6 +5562,9 @@
             if (enclosure.empty()) return;
 
             enclosure.selectAll('g.clade-annotations').remove();
+            // Alan 8/24/26 - Highlight bands live in their own group so they can sit BEHIND
+            // the branches, node/support labels and tip labels rather than on top of them.
+            enclosure.selectAll('g.clade-annotation-highlights').remove();
             this.annotationValidity = new Map();
 
             // Remember the width phylotree itself wants, so hiding a layer gives the space
@@ -4070,23 +5612,29 @@
                 return;
             }
 
+            // Alan 8/24/26 - Automatic opacity follows the theme, which can be toggled with a
+            // tree on screen; repaint when it changes.
+            this._watchThemeChanges();
             const geometry = this._buildAnnotationGeometry(svg);
             if (!geometry) { this._annotationsDrawn = false; restoreWidth(); return; }
             const { positions, labelRight, rowPitch } = geometry;
             // Alan 8/17/26 - Build clade validity and incoming-branch targets in the same pass.
-            const { cladeBlocks, branchNodes } = this._buildAnnotationTopologyIndexes(positions);
+            // Alan 8/24/26 - cladeNodes additionally covers the root, which highlights allow.
+            const { cladeBlocks, branchNodes, cladeNodes } =
+                this._buildAnnotationTopologyIndexes(positions);
 
-            // Tip labels are kept at constant screen size by _applyTextSizingFromZoom, so scale
-            // annotation text the same way and the bracket keeps its relationship to the labels.
+            // Scale annotation text with the matching desktop/mobile tip-label behavior so the
+            // bracket keeps its relationship to the labels.
             const { k } = this._getSvgAndZoomGroup();
-            const scale = 1 / (k || 1);
+            // Alan 8/28/26 - Match coarse-pointer annotations to the uniform mobile tree zoom;
+            // desktop annotations keep following desktop's constant-screen-size labels.
+            const uniformMobileZoom = window.matchMedia?.('(pointer: coarse)')?.matches;
+            const scale = uniformMobileZoom ? 1 : 1 / (k || 1);
 
-            const GAP_FROM_TREE = 18 * scale;
-            const GAP_BETWEEN_LANES = 14 * scale;
-            const LINE_TO_TEXT_GAP = 6 * scale;
-            const LINE_WIDTH = Math.max(0.5, 1.5 * scale);
-            // Alan 8/17/26 - Keep stacked branch labels clear of their branch and each other.
-            const BRANCH_GAP = 5 * scale;
+            const {
+                GAP_FROM_TREE, GAP_BETWEEN_LANES, LINE_TO_TEXT_GAP,
+                LINE_WIDTH, BRANCH_GAP, HIGHLIGHT_PAD_X
+            } = this._annotationLaneMetrics(scale);
 
             // Alan 8/15/26 - Resolve each annotation against the current tree once. Only the
             // ones that are still exactly one clade come back for drawing; the rest are
@@ -4094,7 +5642,7 @@
             // Alan 8/17/26 - Pass the shared incoming-branch index into type-aware validation.
             const { validity, resolved } = this._resolveAnnotationsForRender(
                 // Alan 8/17/26 - Reuse branch targets built with the clade-block index.
-                positions, cladeBlocks, layerById, branchNodes
+                positions, cladeBlocks, layerById, branchNodes, cladeNodes
             );
             this.annotationValidity = validity;
 
@@ -4105,6 +5653,13 @@
             }
 
             const group = enclosure.append('g').attr('class', 'clade-annotations');
+            // Alan 8/24/26 - Behind EVERYTHING phylotree drew: first child of the same
+            // container group, so it shares the tree's coordinate space and zoom transform
+            // while painting under the branches. pointer-events is off here as well as in
+            // CSS, because an exported/cloned SVG carries no stylesheet.
+            const highlightGroup = enclosure.insert('g', ':first-child')
+                .attr('class', 'clade-annotation-highlights')
+                .style('pointer-events', 'none');
 
             const orderedLayers = this.annotationLayers
                 .filter((layer) => layer && layer.visible !== false && layerById.has(layer.id))
@@ -4121,11 +5676,9 @@
             // annotations consume this exact item shape and the same SVG text primitive.
             for (const item of resolved) {
                 const style = {};
-                for (const field of ['font_family', 'font_size', 'font_style',
-                    'font_weight', 'text_color', 'line_color', 'fill_color',
-                    'fill_opacity']) {
+                for (const field of ANNOTATION_STYLE_FIELDS) {
                     const entry = this._resolveAnnotationStyleEntry(item.annotation, item.layer, field);
-                    style[field] = (field === 'font_size' || field === 'fill_opacity')
+                    style[field] = ANNOTATION_NUMERIC_STYLE_FIELDS.has(field)
                         ? Number(entry.value) : entry.value;
                     style[field + '_is_default'] = entry.isDefault;
                 }
@@ -4140,41 +5693,46 @@
                 item.metrics = this._annotationLayoutMetrics(item, LINE_TO_TEXT_GAP);
             }
 
-            let cursorX = labelRight + GAP_FROM_TREE;
+            // Alan 8/24/26 - Each clade annotation is placed from ITS OWN descendants' tip
+            // labels, not from the longest label anywhere in the tree. One long name in an
+            // unrelated part of the figure used to drag every bracket out with it, which is
+            // what left a small nested annotation such as "sensu stricto" stranded hundreds of
+            // pixels from the sequences it names.
+            for (const item of resolved) {
+                item.localLabelRight = this._localTipLabelRight(item.indices, geometry);
+                item.preferredLaneX = item.localLabelRight + GAP_FROM_TREE;
+            }
+
+            // Not seeded from labelRight: the first lane is allowed to sit beside its own
+            // clade. Later lanes are pushed out only as far as clearing the earlier ones needs.
+            let cursorX = -Infinity;
 
             for (const layer of orderedLayers) {
                 // Alan 8/17/26 - Reserve right-side lanes only for publication-style clade lines.
+                // Alan 8/24/26 - Highlights keep the bracket and label, so they share the
+                // clade lane with clade lines; only the band behind them is extra.
                 const items = resolved.filter((item) => item.layer.id === layer.id
-                    && item.type === 'clade_line');
+                    && this._isCladeAnnotationType(item.type));
                 if (!items.length) continue;
 
-                // Alan 8/17/26 - Item preparation moved above so branch and clade renderers share it.
-                // Greedy interval packing into sub-lanes so nested or overlapping annotations
-                // in one layer never draw on top of each other. The extents are the DRAWN
-                // ones, so a bubble packs by its box and a tall multiline label reserves the
-                // room its text really needs.
-                items.sort((a, b) => (a.metrics.renderTop - b.metrics.renderTop)
-                    || (b.metrics.renderBottom - a.metrics.renderBottom));
-                const lanes = [];
-                for (const item of items) {
-                    const padding = Math.max(item.scaledFontSize, rowPitch) * 0.6;
-                    let placed = false;
-                    for (const lane of lanes) {
-                        if (lane.lastBottom + padding < item.metrics.renderTop) {
-                            lane.items.push(item);
-                            lane.lastBottom = Math.max(lane.lastBottom, item.metrics.renderBottom);
-                            placed = true;
-                            break;
-                        }
-                    }
-                    if (!placed) lanes.push({ items: [item], lastBottom: item.metrics.renderBottom });
-                }
+                const placement = this._layoutAnnotationLanes(
+                    items, rowPitch, GAP_BETWEEN_LANES, cursorX
+                );
+                cursorX = placement.cursorX;
 
-                for (const lane of lanes) {
-                    const laneX = cursorX;
-                    let laneWidth = 0;
+                placement.lanes.forEach((lane, laneIndex) => {
+                    const laneX = lane.x;
+                    // Alan 8/24/26 - Bands are flushed per LANE, not per layer: two lanes are
+                    // separate columns, and stretching one out to the other's longest label
+                    // smears it across the gap between them.
+                    const laneKey = `${layer.id}#${laneIndex}`;
                     for (const item of lane.items) {
-                        laneWidth = Math.max(laneWidth, item.metrics.laneWidth);
+                        item.laneX = laneX;
+                        // Alan 8/24/26 - The band has to reach past the label it belongs to,
+                        // which is only known once the lane this item landed in is placed.
+                        item.highlightRight = laneX + item.metrics.laneWidth + HIGHLIGHT_PAD_X;
+                        item.highlightLayerId = layer.id;
+                        item.highlightLaneId = laneKey;
                         const entry = this._drawOneAnnotation(
                             group, item, laneX, LINE_TO_TEXT_GAP, LINE_WIDTH, rowPitch
                         );
@@ -4189,7 +5747,45 @@
                             )
                         });
                     }
-                    cursorX += laneWidth + GAP_BETWEEN_LANES;
+                });
+            }
+
+            // Alan 8/24/26 - Paint the highlight bands now that every lane is placed, so each
+            // band knows how far right its own label reaches. Larger clades are painted first
+            // and nested ones on top of them, so a section inside a section stays legible; the
+            // order is taken from the descendant span rather than from creation order, which
+            // would otherwise make the hierarchy depend on the order the user happened to add
+            // the annotations in.
+            const highlightItems = this._orderCladeHighlights(resolved);
+            this._alignHighlightRightEdges(highlightItems);
+            // Alan 8/24/26 - Work the automatic colours out once for the whole tree rather than
+            // per band, so the "second highlight gets a different colour" rule can see them all.
+            const highlightColors = highlightItems.length
+                ? this._automaticHighlightAssignments(positions).colors
+                : null;
+            for (const item of highlightItems) {
+                const fallbackRight = Number.isFinite(item.preferredLaneX)
+                    ? item.preferredLaneX : labelRight + GAP_FROM_TREE;
+                const { band, label } = this._cladeHighlightRects(
+                    item, rowPitch, HIGHLIGHT_PAD_X, fallbackRight
+                );
+                if (!band) continue;
+                // Alan 8/24/26 - Resolve the colour and opacity that are actually visible and
+                // write both inline. Nothing themed may be left to CSS: the export clones this
+                // SVG without the page stylesheet, so a CSS-only dark-mode opacity used to make
+                // the exported figure paler than the one the user was looking at.
+                const effective = this._effectiveHighlightStyle(item, highlightColors);
+                this._appendHighlightRect(
+                    highlightGroup, band, effective, item.annotation.id
+                );
+                // Alan 8/24/26 - A label taller than its clade gets its own backing piece in
+                // the annotation lane, at the same colour and opacity. It never reaches back
+                // across the tip labels, so a three-line note on one sequence cannot make the
+                // rows above and below it look like members of the clade.
+                if (label) {
+                    this._appendHighlightRect(
+                        highlightGroup, label, effective, item.annotation.id
+                    );
                 }
             }
 
@@ -4197,7 +5793,9 @@
             // descendant set. Layer order affects only stacking on that SAME branch.
             const layerOrder = new Map(orderedLayers.map((layer, index) => [layer.id, index]));
             const branchItems = resolved
-                .filter((item) => item.type !== 'clade_line' && item.targetNode?.parent)
+                // Alan 8/24/26 - Only the branch types go here; both clade types were already
+                // drawn in their lane, and a highlight must not also stack over the branch.
+                .filter((item) => !this._isCladeAnnotationType(item.type) && item.targetNode?.parent)
                 .sort((a, b) => (layerOrder.get(a.layer.id) - layerOrder.get(b.layer.id))
                     || (a.savedIndex - b.savedIndex));
             const branchCursors = new Map();
@@ -4234,12 +5832,27 @@
 
             // Grow the canvas so long labels and large fonts are never clipped. The tree
             // itself is untouched -- shrinking it to fit would make the biology unreadable.
-            let requiredRight = cursorX;
+            let requiredRight = Number.isFinite(cursorX)
+                ? cursorX : labelRight + GAP_FROM_TREE;
             // Alan 8/17/26 - Capture the full annotation bounds for width and viewBox expansion.
             let annotationBox = null;
             try {
                 // Alan 8/17/26 - Measure once and reuse the same bounds for all viewport axes.
                 annotationBox = group.node().getBBox();
+                // Alan 8/24/26 - Union in the highlight bands, which extend half a row above
+                // the first tip and below the last one and would otherwise be clipped.
+                if (highlightItems.length) {
+                    const bandBox = highlightGroup.node().getBBox();
+                    if (bandBox && bandBox.width && bandBox.height) {
+                        const minX = Math.min(annotationBox.x, bandBox.x);
+                        const minY = Math.min(annotationBox.y, bandBox.y);
+                        const maxX = Math.max(annotationBox.x + annotationBox.width,
+                            bandBox.x + bandBox.width);
+                        const maxY = Math.max(annotationBox.y + annotationBox.height,
+                            bandBox.y + bandBox.height);
+                        annotationBox = { x: minX, y: minY, width: maxX - minX, height: maxY - minY };
+                    }
+                }
                 requiredRight = Math.max(requiredRight, annotationBox.x + annotationBox.width);
             } catch (_) { /* fall back to the layout cursor */ }
             // The container group carries translate(...) alone before any zoom, and
@@ -4278,6 +5891,107 @@
             }
         }
 
+        /**
+         * Alan 8/24/26 - The right edge of the tip labels belonging to ONE clade.
+         *
+         * This, not the tree-wide `labelRight`, is where that clade's annotation lane wants to
+         * begin. A single very long sequence name somewhere else in the figure used to define
+         * the lane for every annotation, so a small nested clade with short labels got its
+         * bracket pushed across a wide empty band.
+         *
+         * A label that could not be measured contributes nothing; if none of the clade's rows
+         * could be measured at all, the tree-wide edge is used, which is never narrower than
+         * this clade's own labels and therefore cannot draw over the tips.
+         */
+        _localTipLabelRight(indices, geometry) {
+            const rights = geometry && geometry.tipRights;
+            let right = -Infinity;
+            if (Array.isArray(rights)) {
+                for (const index of indices || []) {
+                    const value = rights[index];
+                    if (Number.isFinite(value) && value > right) right = value;
+                }
+            }
+            return Number.isFinite(right)
+                ? right
+                : ((geometry && Number.isFinite(geometry.labelRight)) ? geometry.labelRight : 0);
+        }
+
+        /**
+         * Alan 8/24/26 - Pack one layer's clade annotations into non-overlapping lanes.
+         *
+         * Smallest clade first, so a nested annotation takes the lane NEAREST the tree and its
+         * containing clade is the one pushed outward. The other way round (which is what
+         * sorting by vertical extent produced) put the outer clade's long label in the inner
+         * lane and shoved the short inner label past it -- the "sensu stricto stranded far to
+         * the right" case.
+         *
+         * Overlap is tested against every annotation already in a lane rather than against a
+         * running low-water mark, because the order the items arrive in is no longer sorted by
+         * vertical position.
+         */
+        _packAnnotationLanes(items, rowPitch) {
+            const ordered = (items || []).slice().sort((a, b) =>
+                (a.indices.length - b.indices.length)
+                || (a.metrics.renderTop - b.metrics.renderTop)
+                || ((a.savedIndex || 0) - (b.savedIndex || 0)));
+            const lanes = [];
+            for (const item of ordered) {
+                // Alan 8/30/26 - A small typographic gap, not a whole row. renderTop/renderBottom
+                // already span the label's full line height, so this is only the breathing room
+                // BETWEEN two stacked labels; at 0.6 of a row it manufactured collisions between
+                // annotations whose labels clear each other easily, and the loser was pushed into
+                // a second lane starting past the widest label in the first - which is how a
+                // single-tip highlight ended up stranded far to the right of its neighbours.
+                const padding = Math.max(item.scaledFontSize || 0, rowPitch) * 0.15;
+                const top = item.metrics.renderTop;
+                const bottom = item.metrics.renderBottom;
+                let placed = null;
+                for (const lane of lanes) {
+                    const clashes = lane.items.some((other) =>
+                        other.metrics.renderTop - padding < bottom
+                        && top - padding < other.metrics.renderBottom);
+                    if (!clashes) { placed = lane; break; }
+                }
+                if (placed) placed.items.push(item);
+                else lanes.push({ items: [item] });
+            }
+            return lanes;
+        }
+
+        /**
+         * Alan 8/24/26 - Pack one layer's clade annotations into lanes and give each lane its
+         * horizontal position. Pure, so the placement rule is pinned by a test rather than only
+         * by reading the draw loop.
+         *
+         * A lane begins where the annotations IN IT want it -- just past their own clades' tip
+         * labels -- and is moved right only as far as clearing the lanes already placed
+         * requires. `cursorX` is that running floor and may be -Infinity for the first lane,
+         * which is what lets the innermost lane sit beside its own labels no matter how wide
+         * the rest of the figure is.
+         */
+        _layoutAnnotationLanes(items, rowPitch, gapBetweenLanes, cursorX = -Infinity) {
+            const lanes = this._packAnnotationLanes(items, rowPitch);
+            let cursor = cursorX;
+            lanes.forEach((lane, index) => {
+                let laneX = -Infinity;
+                let laneWidth = 0;
+                for (const item of lane.items) {
+                    if (Number.isFinite(item.preferredLaneX)) {
+                        laneX = Math.max(laneX, item.preferredLaneX);
+                    }
+                    laneWidth = Math.max(laneWidth, item.metrics.laneWidth || 0);
+                }
+                if (Number.isFinite(cursor)) laneX = Math.max(laneX, cursor);
+                if (!Number.isFinite(laneX)) laneX = 0;
+                lane.index = index;
+                lane.x = laneX;
+                lane.width = laneWidth;
+                cursor = laneX + laneWidth + gapBetweenLanes;
+            });
+            return { lanes, cursorX: cursor };
+        }
+
         // Alan 8/17/26 - Keep pure multiline clade-line geometry shared by preview and rendering.
         _annotationLayoutMetrics(item, textGap) {
             const fontSize = item.scaledFontSize || 0;
@@ -4295,6 +6009,216 @@
                 laneWidth: textGap + item.textWidth,
                 renderTop: Math.min(item.top, midY - blockHeight / 2),
                 renderBottom: Math.max(item.bottom, midY + blockHeight / 2)
+            };
+        }
+
+        /**
+         * Alan 8/24/26 - The layout constants, converted from screen pixels into the tree's
+         * own units for the current zoom.
+         *
+         * Annotation text is held at a constant SCREEN size, so every gap beside it has to be
+         * divided by the zoom factor to keep the same apparent distance. Pulled out of the
+         * renderer so the relationship between the lane and the tip labels -- a modest gap
+         * after the longest label, not a band of empty figure -- is pinned by a test rather
+         * than only by reading the draw code.
+         */
+        _annotationLaneMetrics(scale) {
+            return {
+                // Distance from the right edge of the longest DRAWN tip label to the bracket.
+                GAP_FROM_TREE: 18 * scale,
+                GAP_BETWEEN_LANES: 14 * scale,
+                LINE_TO_TEXT_GAP: 6 * scale,
+                LINE_WIDTH: Math.max(0.5, 1.5 * scale),
+                // Alan 8/17/26 - Keep stacked branch labels clear of their branch and each other.
+                BRANCH_GAP: 5 * scale,
+                // Alan 8/24/26 - Breathing room around a highlight band, so it reads as a
+                // deliberate region rather than a rectangle clipped onto the branch strokes.
+                HIGHLIGHT_PAD_X: 8 * scale
+            };
+        }
+
+        /**
+         * Alan 8/24/26 - Append one highlight band. Shared by the tree and the editor preview
+         * so they cannot drift apart, and so the drawn attributes can be asserted without a DOM.
+         *
+         * Square corners on purpose: a rounded rectangle behind a clade reads as a UI card
+         * rather than as a region of a figure. No rx attribute is set at all.
+         *
+         * Colour and opacity arrive already resolved and are written inline, because the export
+         * path clones this SVG without the page stylesheet.
+         */
+        _appendHighlightRect(parent, rect, effective, annotationId) {
+            const band = parent.append('rect')
+                .attr('class', 'clade-annotation-highlight')
+                .attr('x', rect.x)
+                .attr('y', rect.y)
+                .attr('width', rect.width)
+                .attr('height', rect.height)
+                .style('fill', effective.color)
+                .style('fill-opacity', effective.opacity)
+                // No border by default: an outline around a translucent band competes with
+                // the branches it is supposed to sit quietly behind.
+                .style('stroke', 'none')
+                .style('pointer-events', 'none');
+            if (annotationId) band.attr('data-annotation-id', annotationId);
+            return band;
+        }
+
+        /**
+         * Alan 8/24/26 - Give every band in one LANE the same right edge.
+         *
+         * Each band is first sized to clear its OWN label, which left bands sharing a lane
+         * ragged: a clade whose name happens to be longer than its neighbour's stuck out past
+         * it for no reason the reader can see. Flushing them to the widest edge in the lane
+         * restores the publication look and still clears the longest label, so nothing is
+         * clipped.
+         *
+         * Per lane and not per layer. A layer can hold several lanes -- that is how nested
+         * annotations avoid each other -- and flushing a whole layer stretched an inner band
+         * out to an outer lane's long label, dragging it across the lane in between and
+         * undoing exactly the compactness the local lane placement is there to give.
+         *
+         * The lane identity is ephemeral, assigned while drawing. Nothing about horizontal
+         * position is ever persisted: every redraw recomputes it from the live layout.
+         */
+        _alignHighlightRightEdges(items) {
+            const laneKey = (item) => item.highlightLaneId
+                || item.highlightLayerId || item.layer?.id || '';
+            const widest = new Map();
+            for (const item of items || []) {
+                if (!Number.isFinite(item.highlightRight)) continue;
+                const key = laneKey(item);
+                const current = widest.get(key);
+                if (current === undefined || item.highlightRight > current) {
+                    widest.set(key, item.highlightRight);
+                }
+            }
+            for (const item of items || []) {
+                const shared = widest.get(laneKey(item));
+                if (Number.isFinite(shared)) item.highlightRight = shared;
+            }
+            return items;
+        }
+
+        /**
+         * Alan 8/24/26 - Paint order for the highlight bands: the largest clade first and
+         * nested ones over it, so a section inside a section still reads as nested.
+         *
+         * Deliberately NOT creation order: which annotation the user happened to add first
+         * says nothing about the hierarchy, and clade size does, so two trees with the same
+         * annotations always paint the same way.
+         */
+        _orderCladeHighlights(resolved) {
+            return (resolved || [])
+                .filter((item) => item && item.type === 'clade_highlight')
+                .sort((a, b) => (b.indices.length - a.indices.length)
+                    || (a.indices[0] - b.indices[0])
+                    || (a.savedIndex - b.savedIndex));
+        }
+
+        /**
+         * Alan 8/24/26 - The band behind one highlighted clade, in the tree's own coordinates.
+         *
+         * Pure geometry, so it is testable without a DOM. Every input is derived from the
+         * live layout on each redraw, exactly like the brackets, which is why rotation,
+         * spacing changes, pruning and rerooting need no stored coordinates.
+         *
+         *   left   the clade's internal node, nudged slightly back so the band does not
+         *          clip the node itself. The nudge is capped at a quarter of the incoming
+         *          branch: covering that branch would say the ancestral lineage is part of
+         *          the highlighted clade, which is a different phylogenetic claim.
+         *   top    half a row above the FIRST DESCENDANT TIP.
+         *   bottom half a row below the LAST DESCENDANT TIP.
+         *   right  past the annotation's own label, so the band covers the clade AND the
+         *          thing naming it. Falls back to just outside the tip labels when the item
+         *          never got a lane.
+         *
+         * The vertical extent comes from the descendant rows and from nothing else. It used to
+         * be the union of those rows with the annotation TEXT block, which meant a three-line
+         * label on a single sequence painted the rows above and below it too -- the band across
+         * the tree is a statement about which taxa are in the clade, so a longer caption must
+         * never add taxa to it. The text is covered by a separate piece instead; see
+         * _cladeHighlightRects.
+         */
+        _cladeHighlightRect(item, rowPitch, padX, fallbackRight) {
+            return this._cladeHighlightRects(item, rowPitch, padX, fallbackRight).band;
+        }
+
+        /**
+         * Alan 8/24/26 - The one or two rectangles a highlight is drawn from.
+         *
+         *   band   the biological clade: its height is the descendant tip rows plus about half
+         *          a row at each end, whatever the label says.
+         *   label  present only when the annotation's text block is taller than that band. It
+         *          backs the text in the ANNOTATION LANE only, starting just left of the
+         *          bracket, so the two pieces meet edge to edge and read as one stepped region
+         *          without ever reaching back across the tip labels.
+         *
+         * The two never overlap: where a label piece exists the band stops at the lane, so a
+         * translucent wash is never painted twice over the same pixels and the drawn colour is
+         * exactly the resolved one. With a one-line label there is no second rectangle at all.
+         */
+        _cladeHighlightRects(item, rowPitch, padX, fallbackRight) {
+            const empty = { band: null, label: null };
+            const point = this._annotationNodePoint(item?.cladeNode);
+            if (!point) return empty;
+            const parentPoint = this._annotationNodePoint(item.cladeNode.parent);
+            const backward = parentPoint
+                ? Math.max(0, Math.min(padX, (point.x - parentPoint.x) * 0.25))
+                : padX;
+            const left = point.x - backward;
+            const right = Number.isFinite(item.highlightRight) ? item.highlightRight : fallbackRight;
+            const metrics = item.metrics || {};
+            const padY = rowPitch * 0.5;
+            // Biological extent only. renderTop/renderBottom describe the text block and are
+            // deliberately not consulted here.
+            const top = item.top - padY;
+            const bottom = item.bottom + padY;
+
+            const labelTop = Number.isFinite(metrics.renderTop) ? metrics.renderTop : top;
+            const labelBottom = Number.isFinite(metrics.renderBottom) ? metrics.renderBottom : bottom;
+            // A little air around the text, but a small fraction of a row: the backing sits in
+            // the lane, where being generous costs nothing, yet it should still look attached.
+            // It is DECORATION on a piece that is already needed -- it must never be what
+            // decides the piece exists. Adding it before this comparison made an ordinary
+            // one-line label on a single tip (a ~15px text block inside a 20px row) test as
+            // overflowing by exactly the padding, so every such highlight was split into two
+            // rectangles for no visible reason.
+            const labelPadY = padY * 0.5;
+            // The actual text bounds against the actual band, with no tolerance: an exact fit
+            // (labelTop === top) is a fit, and float noise at that boundary would only decide
+            // between two renderings that are within a fraction of a pixel of each other.
+            const overflows = labelTop < top || labelBottom > bottom;
+
+            // Where the lane begins. The bracket is drawn at laneX, so backing it from a little
+            // left of that is what makes the step touch the band.
+            let laneLeft = Number.isFinite(item.laneX) ? item.laneX - padX : NaN;
+            if (!Number.isFinite(laneLeft) && Number.isFinite(metrics.laneWidth)) {
+                laneLeft = right - metrics.laneWidth - padX;
+            }
+            const canSplit = overflows && Number.isFinite(laneLeft)
+                && laneLeft > left && laneLeft < right;
+
+            const band = {
+                x: left,
+                y: top,
+                // With a label piece the band stops where that piece starts, so the two abut
+                // instead of overlapping; otherwise it runs the whole way as before.
+                width: Math.max(1, (canSplit ? laneLeft : right) - left),
+                height: Math.max(1, bottom - top)
+            };
+            if (!canSplit) return { band, label: null };
+
+            const labelY = Math.min(top, labelTop - labelPadY);
+            const labelEnd = Math.max(bottom, labelBottom + labelPadY);
+            return {
+                band,
+                label: {
+                    x: laneLeft,
+                    y: labelY,
+                    width: Math.max(1, right - laneLeft),
+                    height: Math.max(1, labelEnd - labelY)
+                }
             };
         }
 
@@ -4422,8 +6346,38 @@
             return entry;
         }
 
+        /**
+         * Alan 8/24/26 - The stand-in clade a highlight preview is drawn over.
+         *
+         * The preview has no topology, so it invents one -- but it has to invent something the
+         * tree could plausibly draw. It used to span the whole preview box (24 .. height-24),
+         * i.e. a clade far taller than any label, so a three-line annotation never reached
+         * outside the band and the stepped backing the figure would draw was never previewed.
+         * A small clade of two rows, centred, shows the difference: a one-line label sits
+         * inside the band, a three-line one does not.
+         *
+         * This is a STYLE preview, not a miniature of the selected clade -- it deliberately
+         * knows nothing about the live tree and draws no neighbouring taxa.
+         */
+        _previewHighlightGeometry(width, height) {
+            const rowPitch = 20;
+            const midY = height / 2;
+            return {
+                rowPitch,
+                padX: 8,
+                // Two tip rows, so the band is rowPitch * 2 tall once padded.
+                top: midY - rowPitch / 2,
+                bottom: midY + rowPitch / 2,
+                nodeX: 12,
+                laneX: 24,
+                fallbackRight: width - 12
+            };
+        }
+
         // Alan 8/17/26 - Render the editor preview with the same primitives used by the tree.
-        renderAnnotationPreview(svgElement, annotation, layer) {
+        // Alan 8/24/26 - `options` carries the editor session's membership and annotation id so
+        // an unsaved highlight previews the automatic colour it will actually be given.
+        renderAnnotationPreview(svgElement, annotation, layer, options = {}) {
             if (!svgElement || !window.d3v7) return;
             const svg = window.d3v7.select(svgElement);
             svg.selectAll('*').remove();
@@ -4432,29 +6386,67 @@
             svg.attr('viewBox', `0 0 ${width} ${height}`)
                 .attr('width', '100%').attr('height', height);
             const style = {};
-            for (const field of ['font_family', 'font_size', 'font_style', 'font_weight',
-                'text_color', 'line_color', 'fill_color', 'fill_opacity']) {
+            for (const field of ANNOTATION_STYLE_FIELDS) {
                 const entry = this._resolveAnnotationStyleEntry(annotation, layer, field);
-                style[field] = (field === 'font_size' || field === 'fill_opacity')
+                style[field] = ANNOTATION_NUMERIC_STYLE_FIELDS.has(field)
                     ? Number(entry.value) : entry.value;
                 style[field + '_is_default'] = entry.isDefault;
             }
             const lines = this._annotationLabelLines(annotation.label || 'Annotation preview');
+            const previewId = options.annotationId || 'preview';
+            const previewType = this._annotationType(annotation);
+            const geom = previewType === 'clade_highlight'
+                ? this._previewHighlightGeometry(width, height) : null;
             const item = {
-                annotation: Object.assign({ id: 'preview' }, annotation),
+                annotation: Object.assign({ id: previewId }, annotation, {
+                    member_tip_ids: options.memberIds || annotation.member_tip_ids || []
+                }),
+                // Alan 8/24/26 - The layer is part of the item, not just of `style`:
+                // _effectiveHighlightStyle() resolves the colour intent from (annotation,
+                // layer), so omitting it here made a layer-level Fixed colour invisible in the
+                // preview while the saved figure drew it.
+                layer: layer || null,
                 style,
                 lines,
-                type: this._annotationType(annotation),
+                type: previewType,
                 scaledFontSize: style.font_size,
                 textWidth: this._measureAnnotationLabel(svgElement, lines, style),
-                top: 24,
-                bottom: height - 24
+                top: geom ? geom.top : 24,
+                bottom: geom ? geom.bottom : height - 24
             };
             const group = svg.append('g').attr('class', 'clade-annotations annotation-preview-svg');
             const lineWidth = 1.5;
-            if (item.type === 'clade_line') {
+            // Alan 8/24/26 - Highlights preview through the clade-line primitives plus their
+            // band, so what the editor shows is what the figure will draw.
+            if (this._isCladeAnnotationType(item.type)) {
                 item.metrics = this._annotationLayoutMetrics(item, 7);
-                this._drawOneAnnotation(group, item, 24, 7, lineWidth, 20);
+                if (item.type === 'clade_highlight') {
+                    // A stand-in for the clade's internal node; the preview has no topology.
+                    item.cladeNode = { screen_x: geom.nodeX, screen_y: (item.top + item.bottom) / 2 };
+                    item.laneX = geom.laneX;
+                    item.highlightRight = geom.laneX + item.metrics.laneWidth + geom.padX;
+                    // Alan 8/24/26 - The same stepped primitive the figure uses, so a multiline
+                    // label previews with its own backing piece rather than with one tall band
+                    // the tree would never draw.
+                    const { band, label } = this._cladeHighlightRects(
+                        item, geom.rowPitch, geom.padX, geom.fallbackRight
+                    );
+                    if (band) {
+                        // Alan 8/24/26 - Exactly the resolution the tree uses, so the swatch the
+                        // user approves is the fill the figure gets -- automatic group colour,
+                        // automatic palette colour, or their own override.
+                        const effective = this._effectiveHighlightStyle(item);
+                        // Appended before the bracket, so the band is behind it here too.
+                        this._appendHighlightRect(group, band, effective, null);
+                        if (label) this._appendHighlightRect(group, label, effective, null);
+                    }
+                }
+                // Alan 8/24/26 - Same lane and row pitch the band above was built from, so a
+                // later change to _previewHighlightGeometry() cannot slide the bracket off it.
+                this._drawOneAnnotation(
+                    group, item, geom ? geom.laneX : 24, 7, lineWidth,
+                    geom ? geom.rowPitch : 20
+                );
             } else {
                 const branchY = height - 20;
                 group.append('line')

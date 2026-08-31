@@ -155,27 +155,126 @@ iNaturalist/Mushroom Observer source-tip highlighters follow the same pattern:
 the remote lookup happens first, the state is read and written under the lock
 afterwards.
 
+## Single-level undo of a tree edit (`tree_undo_service.py`)
+
+The viewer's **Undo** button and Ctrl/Cmd+Z take back the last change. There are
+two kinds, sharing one visible slot in the toolbar:
+
+**Viewer-only.** Collapsing and expanding clades is phylotree's transient
+`node.collapsed` and nothing else. `tree_viewer_phylotree_v2.js` keeps a
+one-entry record of the clades a collapse/expand changed and restores it
+locally. Nothing reaches the server, and collapse is deliberately **not**
+persisted — a reload shows the whole tree again.
+
+**Persisted.** Prune, rename, rotate and every rooting change are undone by
+restoring a file snapshot taken immediately before them. Those operations write
+exactly three files:
+
+```text
+tree_state.json
+tree/tree_pruned.newick
+tree/tree_pruned.nexus
+```
+
+and everything the viewer shows — topology, pruned membership, renames, rooting,
+selection colours, annotations — is derived from them, including the Edited FASTA
+download, which `build_edited_fasta_text()` generates on demand from the ORIGINAL
+input plus `tree_state.json`. Copying those three files back therefore restores
+the whole visible state, and cannot get a branch length wrong the way inverting a
+prune (whose unifurcations were spliced out by `_collapse_unifurcations()`) would.
+
+**If you add a file that a tree edit writes, add it to `SNAPSHOT_PATHS`.** An
+edit that writes a fourth file would otherwise be half-undone, which is worse
+than not being undoable at all. `tests/test_tree_undo.py` pins the list.
+
+Rules the implementation depends on:
+
+- The checkpoint is captured **after** `load_tree_state()` (which may initialize
+  and midpoint-root a job that has none yet) and **before** the mutation, and it
+  only replaces the previous checkpoint if the mutation succeeded and the handler
+  called `checkpoint.commit()`. A failed or no-op edit leaves the earlier, still
+  useful checkpoint alone.
+- Undo restores the whole snapshot, so any operation that writes tree state and is
+  *not* undoable must call `clear_undo_checkpoint()` rather than let a later Undo
+  silently revert it. Annotations, the MycoMap label refresh, the focal sequence,
+  every `/api/v1` tree mutation and recompute all do.
+  `/tree/selection_sets` deliberately does not: the viewer saves selections
+  automatically right after every prune, so clearing there would disable Undo the
+  instant it became useful.
+- Recompute is never undoable. It clears the checkpoint when a run is created and
+  again in `commit_recompute_tree_state()`, because the new topology is no longer
+  the tree the snapshot describes.
+- `GET /api/job/<id>/tree/undo` reports `available` (a checkpoint exists) and
+  `can_undo` (this caller may apply it) separately, so a read-only visitor is
+  never shown an Undo that promises a persisted edit they cannot make. `POST` is
+  `mode="edit"`, i.e. the same ownership check as prune.
+- One checkpoint per job, consumed on use, expired after seven days on the next
+  read. There is no redo.
+
+The Rename modal posts every changed name in **one** request (`{"renames": {...}}`)
+for this reason: one request per name would put the checkpoint between the
+renames, so undoing "Rename 3 sequences" would give back one of them.
+
 ## Claude Review of a Finished Tree
 
 `app/services/tree_analysis_service.py` backs the tree viewer's **Analyze with
 Claude** button (`POST /api/job/<id>/analysis/review`). It answers one question
 for the user: is this tree worth trusting?
 
-The design point is that **the model never sees the sequences**. Every number —
+The design point is that **the model does not see the alignment**. Every number —
 gap fraction, column occupancy, parsimony-informative count, mean pairwise
 identity, support distribution, long-branch outliers — is computed here from
 `alignment/alignment_trimmed.fasta` and the current Newick, and only that
-summary (median 27 KB, max 30 KB over a 60-job sample) goes to the API. The
+summary (median 40 KB, p95 46 KB over an 80-job sample) goes to the API. The
 summary is bounded by construction — every list in it is capped at TOP_N — so
 prompt size does not grow with alignment size. Counting is work
 code does exactly and a language model does slowly; the model is used only for
 the judgement of reading those numbers together.
 
+Three blocks beyond the raw statistics carry that judgement further, and each
+has its own section in `SYSTEM_PROMPT`; the two must be changed together.
+
+- **`tree.clade_structure` — which tips group with which.** Without it the
+  review could report that a tree was well supported but never say *what* it
+  supported, which is the question the user opened the viewer to ask. It lists
+  strongly supported clades, outermost first so none contains another, each
+  with its support, subtending branch length and up to `CLADE_TIP_LIMIT`
+  members. A group holding more than half the tree is reopened into the
+  supported clades inside it: a 2409-tip FastTree job otherwise reduced to one
+  group of 2383 tips, true and useless. Reopening costs coverage — tips in no
+  supported subclade become unplaced — so the bar is high, and `basis` reports
+  which rule produced the groups. A tree with nothing above its support
+  threshold falls back to `basis: "topology_only"`, and the prompt forbids
+  describing those groups as clades the tree establishes.
+- **`provenance` — where each sequence came from.** Read from
+  `input_info.json["sequence_metadata"]`, which already records source
+  (a user's own read, MycoMap, NCBI), accession, taxon label, locality, and for
+  retrieved records the `identity` of the search that pulled them in. Joined
+  onto every list that names a sequence, so "three tips have long terminal
+  branches" can become "the three long-branch tips are the only user-submitted
+  collections in the job". `identity` is a search statistic, **not** a distance
+  on this alignment, and taxon labels are unverified: the reviewer may report
+  that the dataset's labels and its tree disagree
+  (`taxon_labels_in_multiple_groups`, computed over determinate binomials only —
+  a `sp.`/`cf.` label in two clades means nothing), but never resolve which is
+  right. Absent metadata is reported as absent rather than guessed from names.
+- **`alignment.excerpts` — the one place residues are sent.** At most two
+  windows of at most `EXCERPT_MAX_COLUMNS` columns, cut around the largest
+  interior gap of the most internally gapped rows, with clean neighbours beside
+  them for contrast. `internal_gap_percent` can say a row has interior gaps;
+  nothing computable here says whether they fall at a plausible indel or whether
+  the row has slipped out of register against its neighbours, and the advice
+  differs. The prompt allows that one judgement and forbids counting,
+  estimating or generalising anything from the window.
+
 Three consequences follow:
 
 - **Response time is independent of alignment size.** Metric assembly is ~2 s on
-  the largest job in `var/jobs` (2400 sequences x 3300 columns); everything after
-  that is model latency. Alignments past ~12M cells switch to evenly spaced
+  the largest job in `var/jobs` (2400 sequences x 3300 columns) and a median of
+  0.08 s; everything after that is model latency. The clade digest reads tip
+  membership in one post-order pass (`_tip_names_by_clade`) rather than calling
+  `get_terminals()` per node, which on that tree would be four million
+  operations inside a request slot. Alignments past ~12M cells switch to evenly spaced
   column sampling, reported as `column_sampling_applied`.
 - **The alignment is restricted to the tips currently in the tree**, so a review
   of a pruned tree does not report statistics for sequences the user removed.

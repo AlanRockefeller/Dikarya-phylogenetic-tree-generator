@@ -26,13 +26,20 @@ BOOTSTRAP_PRESETS = {
 }
 
 # Supported Models (Base matrices)
+# Uppercased on the way in, like VALID_AA_MODELS below, because the parser
+# compares against the *uppercased* base name. Without that, every mixed-case
+# entry here -- K81uf, TN93ef, TPM2uf, TPM3uf, TIM1uf, TIM2uf, TIM3uf, TVMef --
+# failed its own allowlist check and the user's explicitly chosen model was
+# silently replaced by GTR+G.
 VALID_DNA_MODELS = {
-    'JC', 'K80', 'F81', 'HKY', 'TN93ef', 'TN93', 'K81', 'K81uf', 
-    'TPM2', 'TPM2uf', 'TPM3', 'TPM3uf', 'TIM1', 'TIM1uf', 'TIM2', 'TIM2uf', 
-    'TIM3', 'TIM3uf', 'TVMef', 'TVM', 'SYM', 'GTR', 'BIN', 'DNA010010',
-    # Diploid / specialized models
-    'GT10', 'GTGTR4', 'GTJC', 'GTHKY4', 'GTGTR', 
-    'GT16', 'GT16JC', 'GT16GTR'
+    m.upper() for m in {
+        'JC', 'K80', 'F81', 'HKY', 'TN93ef', 'TN93', 'K81', 'K81uf',
+        'TPM2', 'TPM2uf', 'TPM3', 'TPM3uf', 'TIM1', 'TIM1uf', 'TIM2', 'TIM2uf',
+        'TIM3', 'TIM3uf', 'TVMef', 'TVM', 'SYM', 'GTR', 'BIN', 'DNA010010',
+        # Diploid / specialized models
+        'GT10', 'GTGTR4', 'GTJC', 'GTHKY4', 'GTGTR',
+        'GT16', 'GT16JC', 'GT16GTR'
+    }
 }
 
 VALID_AA_MODELS = {
@@ -378,7 +385,12 @@ def validate_and_resolve_raxml_params(params: Dict[str, Any], data_type: str = '
             modifiers = model_parts[1:]
             
             # 2. Validate Base
-            base_name_match = re.fullmatch(r"([A-Za-z0-9_\.]+)(\{[^{}]+\})?", base_part)
+            # ``-`` belongs in the base-name class: RAxML-NG's own allowlisted
+            # amino-acid matrix JTT-DCMut carries one, and without it the
+            # explicitly requested model failed to parse and was replaced by the
+            # default. The name is still checked against VALID_*_MODELS below,
+            # so widening the character class does not admit arbitrary strings.
+            base_name_match = re.fullmatch(r"([A-Za-z0-9_\.\-]+)(\{[^{}]+\})?", base_part)
             
             part_is_valid = True
             

@@ -7,6 +7,7 @@ cases where the old code told the model something the files did not say.
 
 import gzip
 import json
+import logging
 import shutil
 import subprocess
 from pathlib import Path
@@ -35,6 +36,33 @@ def _gzip_in_place(path: Path) -> Path:
         shutil.copyfileobj(src, dst)
     path.unlink()
     return target
+
+
+def test_claude_429_log_preserves_the_full_provider_message(monkeypatch, caplog):
+    provider_message = (
+        "You've hit your limit · resets 11:30 pm (UTC).\n"
+        'Request id: "req_429_detail"'
+    )
+    completed = subprocess.CompletedProcess(
+        args=[],
+        returncode=1,
+        stdout=json.dumps({
+            "is_error": True,
+            "subtype": "success",
+            "api_error_status": 429,
+            "terminal_reason": "api_error",
+            "result": provider_message,
+        }),
+        stderr="",
+    )
+    monkeypatch.setattr(subprocess, "run", lambda *args, **kwargs: completed)
+
+    with caplog.at_level(logging.WARNING, logger=service.logger.name):
+        with pytest.raises(service.TreeAnalysisRateLimited):
+            service._call_claude_cli({})
+
+    expected = json.dumps(provider_message, ensure_ascii=False)
+    assert f"provider_message={expected}" in caplog.text
 
 
 # ---------------------------------------------------------------------------
@@ -1353,3 +1381,311 @@ def test_the_prompt_rename_cap_does_not_narrow_the_accepted_names(tmp_path, monk
              sequences_to_inspect=[{"name": "four", "reason": "Long branch."}]),
         displayed,
     )
+
+
+# ---------------------------------------------------------------------------
+# Topology digest, provenance and alignment excerpts
+#
+# These three are what the review is told about the tree beyond its aggregate
+# numbers: which tips group together, where each sequence came from, and -- the
+# one place raw residues are sent -- a narrow window around the worst interior
+# gaps. Each has a failure mode that produces a confident, wrong review rather
+# than an error, so they are pinned here.
+# ---------------------------------------------------------------------------
+
+
+def _newick_tree(text):
+    """Parse a Newick string the way summarize_tree does."""
+    import io
+
+    from Bio import Phylo
+
+    return Phylo.read(io.StringIO(text), "newick")
+
+
+def test_topology_digest_reports_outermost_supported_clades():
+    tree = _newick_tree("(((a:1,b:1)100:1,(c:1,d:1)100:1)40:1,(e:1,f:1)100:1);")
+    names = service._tip_names_by_clade(tree)
+    digest = service._topology_digest(tree, names, 70.0)
+
+    assert digest["basis"] == "strong_support"
+    assert {tuple(sorted(g["tip_names"])) for g in digest["groups"]} == {
+        ("a", "b"), ("c", "d"), ("e", "f"),
+    }
+    assert digest["tips_not_in_any_listed_group"] == 0
+
+
+def test_topology_digest_does_not_nest_a_supported_clade_inside_another():
+    # The inner (a,b) is strongly supported but its parent already is, so
+    # reporting both would state the same membership twice.
+    tree = _newick_tree("(((a:1,b:1)100:1,c:1)99:1,(d:1,e:1)10:1);")
+    digest = service._topology_digest(
+        tree, service._tip_names_by_clade(tree), 70.0
+    )
+
+    assert len(digest["groups"]) == 1
+    assert sorted(digest["groups"][0]["tip_names"]) == ["a", "b", "c"]
+    # d and e are in no supported clade, and are reported as unplaced rather
+    # than quietly folded into one.
+    assert digest["tips_not_in_any_listed_group"] == 2
+
+
+def test_an_oversized_supported_group_is_reopened(monkeypatch):
+    """A tree whose deepest split is supported must not reduce to one group.
+
+    This is the 2409-tip FastTree case from the job archive: every strongly
+    supported clade nested inside one that held all but a handful of the tips,
+    so the digest was true and useless.
+    """
+    monkeypatch.setattr(service, "MAX_CLADE_GROUPS", 6)
+    tree = _newick_tree(
+        "((((a:1,b:1)100:1,(c:1,d:1)100:1)100:1,((e:1,f:1)100:1,"
+        "(g:1,h:1)100:1)100:1)100:1,z:1);"
+    )
+    digest = service._topology_digest(
+        tree, service._tip_names_by_clade(tree), 70.0
+    )
+
+    assert len(digest["groups"]) > 1
+    assert max(g["tips"] for g in digest["groups"]) < 8
+
+
+def test_topology_digest_falls_back_to_shape_and_says_so():
+    tree = _newick_tree("(((a:1,b:1)10:1,(c:1,d:1)12:1)8:1,(e:1,f:1)9:1);")
+    digest = service._topology_digest(
+        tree, service._tip_names_by_clade(tree), 70.0
+    )
+
+    assert digest["basis"] == "topology_only"
+    assert "not supported groupings" in digest["definition"]
+    # Nothing is claimed as supported on a tree where nothing is.
+    assert digest["outermost_strongly_supported_clades_total"] == 0
+    assert digest["tips_not_in_any_listed_group"] == 0
+
+
+def test_a_dual_labelled_node_needs_both_halves_to_group_tips():
+    # SH-aLRT 20 / UFBoot 99: the UFBoot half alone would call this supported,
+    # which is exactly the disagreement the dual rule exists to catch.
+    tree = _newick_tree("((a:1,b:1)20/99:1,(c:1,d:1)95/99:1);")
+    digest = service._topology_digest(
+        tree, service._tip_names_by_clade(tree), None
+    )
+
+    grouped = {name for g in digest["groups"] for name in g["tip_names"]}
+    assert grouped == {"c", "d"}
+
+
+def test_a_single_tip_tree_produces_no_groups():
+    digest = service._topology_digest(
+        _newick_tree("(a:1);"), {}, 70.0
+    )
+    assert digest["groups"] == []
+
+
+def test_provenance_omits_blast_metrics_that_were_never_computed():
+    index = service._provenance_index({
+        "sequence_metadata": [
+            {"name": "a", "source": "user", "identity": 0.0,
+             "blast_metrics_available": False},
+            {"name": "b", "source": "mycomap", "identity": 97.5,
+             "query_cover": 100.0, "blast_metrics_available": True},
+        ]
+    })
+
+    # A leftover 0.0 would read as a sequence sharing no identity with anything.
+    assert "identity" not in index["a"]
+    assert index["b"]["identity"] == 97.5
+
+
+def test_provenance_is_indexed_under_every_spelling_of_the_name():
+    index = service._provenance_index({
+        "sequence_metadata": [{
+            "name": "KY099600 Caliciopsis pinea",
+            "fasta_header": "KY099600_Caliciopsis_pinea",
+            "accession": "KY099600",
+            "taxon": "Caliciopsis pinea",
+        }]
+    })
+
+    for spelling in (
+        "KY099600 Caliciopsis pinea", "KY099600_Caliciopsis_pinea", "KY099600"
+    ):
+        assert index[service._normalize_name(spelling)]["taxon"] == "Caliciopsis pinea"
+
+
+def test_provenance_summary_describes_only_tips_still_in_the_tree():
+    index = service._provenance_index({
+        "sequence_metadata": [
+            {"name": "a", "source": "user"},
+            {"name": "b", "source": "mycomap"},
+            {"name": "pruned", "source": "mycomap"},
+        ]
+    })
+    summary = service._provenance_summary(index, ["a", "b"])
+
+    assert summary["sequences_with_metadata"] == 2
+    assert summary["by_source"] == {"user": 1, "mycomap": 1}
+
+
+def test_provenance_summary_names_low_identity_references():
+    index = service._provenance_index({
+        "sequence_metadata": [
+            {"name": "close", "identity": 99.4, "blast_metrics_available": True},
+            {"name": "distant", "identity": 84.0, "taxon": "Amanita muscaria",
+             "accession": "XX000001", "blast_metrics_available": True},
+        ]
+    })
+    summary = service._provenance_summary(index, ["close", "distant"])
+
+    assert summary["references_below_90_percent_identity_total"] == 1
+    assert summary["references_below_90_percent_identity"][0]["identity"] == 84.0
+
+
+def test_a_job_without_provenance_says_so_rather_than_inviting_a_guess():
+    summary = service._provenance_summary({}, ["a", "b"])
+    assert summary["sequences_with_metadata"] == 0
+    assert "Do not infer it" in summary["note"]
+
+
+@pytest.mark.parametrize(
+    "label",
+    ["Amanita", "Tyromyces sp. DLL2010", "Amanita cf. muscaria",
+     "Environmental Sample", "Uncultured Sebacina", ""],
+)
+def test_labels_that_name_nothing_are_not_split_taxa(label):
+    """Undetermined and placeholder labels in two clades mean nothing.
+
+    Keying this on the genus reported, of a dataset that was entirely
+    Tyromyces, that Tyromyces appeared in seven groups.
+    """
+    assert service._determinate_taxon(label) is None
+
+
+def test_a_determinate_binomial_in_two_groups_is_reported():
+    structure = {
+        "basis": "strong_support",
+        "groups": [
+            {"id": "C1", "tip_names": ["a", "b"], "tip_names_truncated": False},
+            {"id": "C2", "tip_names": ["c"], "tip_names_truncated": False},
+        ],
+    }
+    index = {
+        "a": {"taxon": "Cortinarius croceus"},
+        "b": {"taxon": "Cortinarius thiersii"},
+        "c": {"taxon": "Cortinarius croceus"},
+    }
+    split = service._labels_split_across_clades(structure, index)
+
+    assert split == [
+        {"taxon_label": "Cortinarius croceus", "groups": ["C1", "C2"],
+         "group_count": 2}
+    ]
+
+
+def test_split_labels_are_not_computed_on_a_shape_only_digest():
+    structure = {
+        "basis": "topology_only",
+        "groups": [
+            {"id": "C1", "tip_names": ["a"], "tip_names_truncated": False},
+            {"id": "C2", "tip_names": ["b"], "tip_names_truncated": False},
+        ],
+    }
+    index = {"a": {"taxon": "Cortinarius croceus"},
+             "b": {"taxon": "Cortinarius croceus"}}
+
+    assert service._labels_split_across_clades(structure, index) == []
+
+
+def test_split_labels_ignore_a_group_whose_members_were_truncated():
+    # An absence from a sampled member list is not evidence of absence.
+    structure = {
+        "basis": "strong_support",
+        "groups": [
+            {"id": "C1", "tip_names": ["a"], "tip_names_truncated": True},
+            {"id": "C2", "tip_names": ["b"], "tip_names_truncated": False},
+        ],
+    }
+    index = {"a": {"taxon": "Cortinarius croceus"},
+             "b": {"taxon": "Cortinarius croceus"}}
+
+    assert service._labels_split_across_clades(structure, index) == []
+
+
+def test_the_largest_internal_gap_ignores_terminal_padding():
+    # 12 leading gaps, an interior run of 4, then 8 trailing.
+    sequence = "------------ACGT----ACGT--------"
+    assert service._largest_internal_gap_run(sequence) == (16, 20)
+
+
+def test_a_row_that_is_all_gaps_has_no_internal_gap_run():
+    assert service._largest_internal_gap_run("--------") is None
+
+
+def test_an_excerpt_shows_the_flagged_row_against_clean_neighbours():
+    clean = "ACGT" * 40
+    flagged = clean[:60] + "-" * 20 + clean[80:]
+    records = [
+        ("flagged", flagged),
+        ("clean1", clean),
+        ("clean2", clean),
+        ("clean3", clean),
+    ]
+    rows = [service._sequence_row(name, seq) for name, seq in records]
+    excerpts = service.build_alignment_excerpt(records, rows)
+
+    assert len(excerpts) == 1
+    excerpt = excerpts[0]
+    assert excerpt["flagged_sequence"] == "flagged"
+    assert excerpt["largest_internal_gap_columns"] == 20
+    assert [row["role"] for row in excerpt["rows"]][0] == "flagged"
+    assert {row["role"] for row in excerpt["rows"][1:]} == {"contrast"}
+    # Every row is the same window of the same alignment.
+    assert len({len(row["residues"]) for row in excerpt["rows"]}) == 1
+    assert excerpt["columns_shown"] <= service.EXCERPT_MAX_COLUMNS
+    assert excerpt["first_column"] >= 1
+
+
+def test_a_clean_alignment_produces_no_excerpt():
+    clean = "ACGT" * 40
+    records = [("a", clean), ("b", clean), ("c", clean)]
+    rows = [service._sequence_row(name, seq) for name, seq in records]
+
+    assert service.build_alignment_excerpt(records, rows) == []
+
+
+def test_an_excerpt_window_is_capped_on_a_huge_deletion():
+    clean = "ACGT" * 500
+    flagged = clean[:100] + "-" * 1200 + clean[1300:]
+    records = [("flagged", flagged)] + [
+        (f"clean{i}", clean) for i in range(3)
+    ]
+    rows = [service._sequence_row(name, seq) for name, seq in records]
+    excerpt = service.build_alignment_excerpt(records, rows)[0]
+
+    assert excerpt["columns_shown"] <= service.EXCERPT_MAX_COLUMNS
+    assert excerpt["columns_in_alignment"] == 2000
+
+
+def test_excerpts_are_bounded_in_number_and_do_not_repeat_a_region():
+    clean = "ACGT" * 100
+    records = [("clean%d" % i, clean) for i in range(4)]
+    # Five separate offenders, all with their gap in the same place.
+    for i in range(5):
+        records.append((f"flagged{i}", clean[:100] + "-" * 30 + clean[130:]))
+    rows = [service._sequence_row(name, seq) for name, seq in records]
+    excerpts = service.build_alignment_excerpt(records, rows)
+
+    assert len(excerpts) == 1
+    assert len(excerpts) <= service.EXCERPT_MAX_WINDOWS
+
+
+def test_an_excerpt_is_dropped_when_no_neighbour_covers_the_window():
+    # A single flagged row with nothing to compare it against says nothing
+    # about register, which is the only judgement an excerpt exists to support.
+    clean = "ACGT" * 40
+    flagged = clean[:60] + "-" * 20 + clean[80:]
+    padded = "-" * 160
+    records = [("flagged", flagged), ("padded", padded)]
+    rows = [service._sequence_row(name, seq) for name, seq in records]
+
+    assert service.build_alignment_excerpt(records, rows) == []

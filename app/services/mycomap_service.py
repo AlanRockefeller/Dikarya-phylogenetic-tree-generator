@@ -18,7 +18,7 @@ import time
 import urllib.request
 import urllib.parse
 import urllib.error
-from typing import Optional, Tuple
+from typing import Any, Dict, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -60,10 +60,10 @@ MYCOMAP_NCBI_RECHECK_MAX_HOURS = 48
 # giving up. MycoMap answers the create POST with "Job added to queue" and no
 # ID, so the record only becomes discoverable once its queue reaches the job.
 # MycoMap can leave an accepted search in its queue for well over ten minutes.
-# RQ retries do not occupy a worker slot, so keep discovering for an hour
-# before asking the user to rebuild instead of turning ordinary queue backlog
-# into a failed tree.
-MYCOMAP_CREATION_DISCOVERY_MAX_SECONDS = 3600
+# RQ retries do not occupy a worker slot. Check frequently for the first hour,
+# then back off while keeping the accepted search alive for four days so a large
+# MycoMap backlog does not turn into a failed tree that must be rebuilt by hand.
+MYCOMAP_CREATION_DISCOVERY_MAX_SECONDS = 4 * 24 * 60 * 60
 MYCOMAP_NEAR_DUPLICATE_MAX_DIFFERENCES = 4
 
 _CONCRETE_DNA_BASES = frozenset("ACGT")
@@ -436,15 +436,55 @@ def get_mycomap_creation_discovery_max_seconds() -> int:
         "MYCOMAP_CREATION_DISCOVERY_MAX_SECONDS",
         MYCOMAP_CREATION_DISCOVERY_MAX_SECONDS,
         min_value=60,
-        max_value=7200,
+        max_value=7 * 24 * 60 * 60,
     )
 
 
+def get_mycomap_creation_discovery_poll_interval_seconds(
+        elapsed_seconds: int) -> int:
+    """Return the next non-blocking discovery interval for an accepted search."""
+    elapsed = max(0, int(elapsed_seconds or 0))
+    if elapsed < 60 * 60:
+        return get_mycomap_ncbi_poll_interval_seconds()
+    if elapsed < 6 * 60 * 60:
+        return 5 * 60
+    if elapsed < 24 * 60 * 60:
+        return 15 * 60
+    return 60 * 60
+
+
+def advance_mycomap_creation_discovery(
+        details: Dict[str, Any]) -> Tuple[Dict[str, Any], bool]:
+    """Record one completed discovery wait and whether its total budget expired."""
+    details = dict(details or {})
+    attempt = int(details.get("creation_discovery_attempt") or 0)
+    base_interval = get_mycomap_ncbi_poll_interval_seconds()
+    elapsed = details.get("creation_discovery_elapsed_seconds")
+    if elapsed is None:
+        # Compatibility with jobs queued before elapsed time was persisted.
+        elapsed = attempt * base_interval
+    elapsed = max(0, int(elapsed))
+    waited = int(details.get("creation_discovery_next_interval_seconds") or 0)
+    if waited <= 0:
+        waited = get_mycomap_creation_discovery_poll_interval_seconds(elapsed)
+    elapsed += waited
+    details["creation_discovery_attempt"] = attempt + 1
+    details["creation_discovery_elapsed_seconds"] = elapsed
+    details["creation_discovery_next_interval_seconds"] = (
+        get_mycomap_creation_discovery_poll_interval_seconds(elapsed)
+    )
+    return details, elapsed >= get_mycomap_creation_discovery_max_seconds()
+
+
 def get_mycomap_creation_discovery_max_attempts() -> int:
-    """Return the discovery budget expressed as one-per-poll-interval checks."""
-    interval = max(1, get_mycomap_ncbi_poll_interval_seconds())
+    """Return the number of RQ retries required by the rolling backoff."""
     max_seconds = get_mycomap_creation_discovery_max_seconds()
-    return max(1, -(-max_seconds // interval))
+    elapsed = 0
+    attempts = 0
+    while elapsed < max_seconds:
+        elapsed += get_mycomap_creation_discovery_poll_interval_seconds(elapsed)
+        attempts += 1
+    return max(1, attempts)
 
 
 def get_mycomap_ncbi_recheck_max_hours() -> int:

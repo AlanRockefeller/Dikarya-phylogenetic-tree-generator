@@ -62,6 +62,11 @@ SCANNER_EXACT_PATHS = frozenset({
     # out the real 4xx entries. Dikarya's own auth lives at /auth/login.
     "/signup", "/register", "/dashboard", "/admin", "/account",
     "/auth/callback", "/api/auth/signin", "/login.html", "/sftp-config.json",
+    # Generic fetch/proxy/config endpoints from a burst scanner that rotated
+    # dozens of fake crawler user agents. Dikarya has never exposed these exact
+    # routes; real downloads and previews live under scoped resource paths.
+    "/fetch", "/proxy", "/api/proxy", "/api/v1/fetch", "/api/download",
+    "/api/image", "/api/preview", "/api/v2/settings", "/api/v2/config",
 })
 # Scanner probes hide the extension behind a version digit -- /randkeyword.PhP7,
 # /zup.php73, /baxa1.phP8 all arrived in one sweep and were filed as
@@ -202,8 +207,22 @@ def write_review_checkpoint(path, reviewed_through):
             f"{format_window_timestamp(now)})."
         )
     if path.exists():
-        previous = read_review_checkpoint(path)
-        if reviewed_through < previous:
+        # Reads stay strict everywhere else -- a review must never silently
+        # start from a boundary nobody can vouch for. Here the operator is
+        # explicitly reseeding the file, and refusing to overwrite a corrupt
+        # checkpoint made --mark-reviewed, the documented recovery, unable to
+        # recover it. An unreadable file therefore means "no valid previous
+        # boundary", which cannot be moved backwards.
+        try:
+            previous = read_review_checkpoint(path)
+        except ValueError as exc:
+            print(
+                f"warning: replacing an unreadable log-review checkpoint at "
+                f"{path} ({exc})",
+                file=sys.stderr,
+            )
+            previous = None
+        if previous is not None and reviewed_through < previous:
             raise ValueError(
                 "Refusing to move the log-review checkpoint backwards "
                 f"({format_window_timestamp(previous)} -> "

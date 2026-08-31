@@ -4,7 +4,7 @@
 {% block subtitle %}Tree Viewer{% endblock %}
 
 {% block head %}
-<link rel="stylesheet" href="{{ url_for('static', filename='css/tree_viewer.css') }}?v=9">
+<link rel="stylesheet" href="{{ url_for('static', filename='css/tree_viewer.css') }}?v=11">
 <link rel="stylesheet" href="{{ url_for('static', filename='css/phylotree.css') }}?v=2">
 <link rel="stylesheet" href="{{ url_for('static', filename='css/phylotree-menus.css') }}?v=3">
 <link rel="preconnect" href="https://fonts.googleapis.com">
@@ -66,7 +66,7 @@
 </div>
 
 <!-- Controls Panel -->
-<div class="bg-white dark:bg-journal-green rounded-xl shadow-lg p-4 mb-6 transition-colors">
+<div id="tree-desktop-controls" class="bg-white dark:bg-journal-green rounded-xl shadow-lg p-4 mb-6 transition-colors">
     <!-- Main Toolbar -->
     <div class="space-y-4">
         <!-- Row 1: Primary Controls (Layout, Zoom, Display) -->
@@ -126,7 +126,7 @@
                         id="btn-toggle-support" title="Toggle Support Values">Hide Node Support</button>
                     <button type="button"
                         class="px-3 py-2 text-sm font-medium text-gray-700 dark:text-gray-200 bg-white dark:bg-journal-dark hover:bg-journal-gold hover:text-journal-dark transition-colors flex items-center gap-1.5 border-l border-gray-300 dark:border-journal-dark"
-                        id="btn-tree-shortcuts-help" title="View Tree Viewer Keyboard Shortcuts (?)">
+                        id="btn-tree-shortcuts-help" title="Shortcuts, and how Collapse, Prune, Recompute and Undo differ (?)">
                         <i class="fas fa-keyboard"></i> Keyboard Shortcuts
                     </button>
                 </div>
@@ -520,6 +520,17 @@
                 id="btn-midpoint">
                 <i class="fa fa-balance-scale"></i> Midpoint
             </button>
+            <!-- Alan 8/24/26 - Single-level undo. Rendered in view-only mode too, because
+                 collapsing a clade is a viewer-only display change that read-only visitors
+                 may make and therefore may also take back; the button stays disabled unless
+                 something is actually undoable. -->
+            <button type="button"
+                class="px-4 py-2 text-sm font-semibold rounded-lg bg-slate-600 hover:bg-slate-700 text-white transition-colors shadow-sm flex items-center gap-2 disabled:opacity-50 disabled:cursor-not-allowed"
+                id="btn-undo"
+                title="Nothing to undo yet (Ctrl/Cmd+Z)"
+                disabled>
+                <i class="fa fa-rotate-left"></i> Undo
+            </button>
             <div class="flex items-center gap-1 px-2 py-1 rounded-lg bg-gray-100 dark:bg-journal-dark border border-gray-300 dark:border-gray-600"
                  title="Auto root chooses a useful display root for BLAST-result trees; it is not necessarily the true evolutionary root.">
                 <label for="rooting-mode-select" class="text-sm font-semibold text-gray-700 dark:text-gray-200">Root:</label>
@@ -552,7 +563,7 @@
             </button>
             <button type="button"
                 class="px-4 py-2 text-sm font-semibold rounded-lg bg-purple-600 hover:bg-purple-700 text-white transition-colors shadow-sm flex items-center gap-2 disabled:opacity-50 disabled:cursor-not-allowed"
-                id="btn-alignment-viewer" title="Open the Alignment Viewer for visible/selected tree sequences (V)">
+                id="btn-alignment-viewer" title="Open the Alignment Viewer for visible/selected tree sequences (A)">
                 <i class="fa fa-stream"></i> Alignment Viewer
             </button>
         </div>
@@ -620,6 +631,10 @@
                 class="text-journal-gold hover:text-journal-gold-light transition-colors flex items-center gap-1">
                 <i class="fas fa-image text-xs"></i> Download JPG
             </a>
+            <a id="btn-save-png" href="#"
+                class="text-journal-gold hover:text-journal-gold-light transition-colors flex items-center gap-1">
+                <i class="fas fa-image text-xs"></i> Download PNG
+            </a>
         </div>
     </div>
 
@@ -642,10 +657,10 @@
     <div class="fixed inset-0 z-10 overflow-y-auto">
         <div class="flex min-h-full items-center justify-center p-4">
             <div
-                class="relative w-full max-w-md rounded-xl bg-white dark:bg-journal-green shadow-2xl border border-gray-200 dark:border-journal-dark overflow-hidden">
+                class="relative w-full max-w-2xl max-h-[85vh] overflow-y-auto rounded-xl bg-white dark:bg-journal-green shadow-2xl border border-gray-200 dark:border-journal-dark">
                 <div class="px-5 py-4 border-b border-gray-200 dark:border-journal-dark flex items-center justify-between">
                     <h3 id="tree-shortcuts-title" class="text-lg font-bold text-journal-dark dark:text-gray-100">
-                        Tree Viewer Keyboard Shortcuts
+                        Tree Viewer Shortcuts &amp; Editing Guide
                     </h3>
                     <button type="button" id="btn-tree-shortcuts-close"
                         class="p-2 rounded-lg text-gray-500 hover:text-gray-800 hover:bg-gray-100 dark:text-gray-300 dark:hover:text-white dark:hover:bg-journal-dark"
@@ -656,8 +671,8 @@
                 <dl class="grid grid-cols-[auto,1fr] gap-x-4 gap-y-3 px-5 py-4 text-sm text-gray-700 dark:text-gray-200">
                     <dt><kbd class="rounded border border-gray-300 bg-gray-100 px-2 py-0.5 font-mono dark:border-gray-600 dark:bg-journal-dark">D</kbd></dt>
                     <dd>Deselect all sequences</dd>
-                    <dt><kbd class="rounded border border-gray-300 bg-gray-100 px-2 py-0.5 font-mono dark:border-gray-600 dark:bg-journal-dark">V</kbd></dt>
-                    <dd>Open the Alignment Viewer</dd>
+                    <dt><kbd class="rounded border border-gray-300 bg-gray-100 px-2 py-0.5 font-mono dark:border-gray-600 dark:bg-journal-dark">A</kbd></dt>
+                    <dd>Open the Alignment Viewer (<kbd class="rounded border border-gray-300 bg-gray-100 px-2 py-0.5 font-mono dark:border-gray-600 dark:bg-journal-dark">V</kbd> also works)</dd>
                     <dt><kbd class="rounded border border-gray-300 bg-gray-100 px-2 py-0.5 font-mono dark:border-gray-600 dark:bg-journal-dark">S</kbd></dt>
                     <dd>Cycle node sorting</dd>
                     <dt><kbd class="rounded border border-gray-300 bg-gray-100 px-2 py-0.5 font-mono dark:border-gray-600 dark:bg-journal-dark">Left-drag</kbd></dt>
@@ -672,9 +687,63 @@
                     <dd>Save names in the Rename modal</dd>
                     <dt><kbd class="rounded border border-gray-300 bg-gray-100 px-2 py-0.5 font-mono dark:border-gray-600 dark:bg-journal-dark">Esc</kbd></dt>
                     <dd>Close or cancel the current mode</dd>
+                    <dt><kbd class="rounded border border-gray-300 bg-gray-100 px-2 py-0.5 font-mono dark:border-gray-600 dark:bg-journal-dark">Ctrl/Cmd + Z</kbd></dt>
+                    <dd>Undo the last tree edit or clade collapse (same as the <strong>Undo</strong> button; ignored while you are typing in a field)</dd>
                     <dt><kbd class="rounded border border-gray-300 bg-gray-100 px-2 py-0.5 font-mono dark:border-gray-600 dark:bg-journal-dark">?</kbd></dt>
                     <dd>Show this shortcut list</dd>
                 </dl>
+
+                <!-- Alan 8/24/26 - Collapse / Prune / Recompute get confused with one another
+                     constantly, and the difference is the difference between a redraw and a
+                     re-analysis. Explaining it here keeps one help surface instead of two. -->
+                <div class="border-t border-gray-200 dark:border-journal-dark px-5 py-4 space-y-4 text-sm text-gray-700 dark:text-gray-200">
+                    <div>
+                        <h4 class="font-semibold text-journal-dark dark:text-gray-100 mb-1">Collapse a clade</h4>
+                        <p>
+                            Right-click an internal branch or node and choose <strong>Collapse Clade</strong> to
+                            fold that clade into a single wedge. Collapsing is a display change only: it does
+                            <em>not</em> remove sequences, does <em>not</em> change the phylogeny, and does
+                            <em>not</em> recompute anything. Choose <strong>Expand Clade</strong> on the same
+                            node to unfold it again.
+                        </p>
+                        <p class="mt-1">
+                            Select two or more internal nodes (click their circles) and the menu also offers
+                            <strong>Collapse&nbsp;N&nbsp;Clades</strong> / <strong>Expand&nbsp;N&nbsp;Clades</strong>.
+                            If you select a clade and a clade nested inside it, only the outer one is collapsed —
+                            collapsing both would be the same single wedge. Collapsed clades are not saved:
+                            reloading the page shows the whole tree again.
+                        </p>
+                    </div>
+                    <div>
+                        <h4 class="font-semibold text-journal-dark dark:text-gray-100 mb-1">Prune</h4>
+                        <p>
+                            Pruning removes the selected sequences (or a whole clade) from the
+                            <strong>edited tree</strong> and from the Edited FASTA download. It does
+                            <em>not</em> re-infer the phylogeny: the remaining branches keep the lengths and
+                            support values they were given when the tree was built.
+                        </p>
+                    </div>
+                    <div>
+                        <h4 class="font-semibold text-journal-dark dark:text-gray-100 mb-1">Recompute</h4>
+                        <p>
+                            Recompute takes the sequences that are left and re-runs alignment, trimming and
+                            tree inference. Topology, branch lengths and support values may all change.
+                            Recompute cannot be undone.
+                        </p>
+                    </div>
+                    <div>
+                        <h4 class="font-semibold text-journal-dark dark:text-gray-100 mb-1">Undo</h4>
+                        <p>
+                            The <strong>Undo</strong> button (or <kbd class="rounded border border-gray-300 bg-gray-100 px-1.5 py-0.5 font-mono dark:border-gray-600 dark:bg-journal-dark">Ctrl/Cmd&nbsp;+&nbsp;Z</kbd>)
+                            takes back the most recent change: a collapse or expand, or the last prune,
+                            rename, rotation or rooting change. It is a single step, not a full history —
+                            after you undo, there is nothing further to undo, and there is no redo. The button
+                            is disabled and its tooltip says so whenever nothing can be undone. Starting a
+                            Recompute clears the undo point, because the new tree is no longer the tree the
+                            saved state describes.
+                        </p>
+                    </div>
+                </div>
             </div>
         </div>
     </div>
@@ -841,6 +910,7 @@
                             <option value="clade_line">Clade line — bracket beside descendant tips</option>
                             <option value="branch_text">Branch text — multiline text above the branch</option>
                             <option value="branch_bubble">Branch bubble — rounded callout above the branch</option>
+                            <option value="clade_highlight">Clade highlight — translucent band behind the clade</option>
                         </select>
                     </div>
 
@@ -961,7 +1031,7 @@
 {% endif %}
 
 <!-- Tree Container -->
-<div class="bg-white dark:bg-journal-green rounded-xl shadow-lg p-6 transition-colors">
+<div id="tree-viewer-panel" class="bg-white dark:bg-journal-green rounded-xl shadow-lg p-6 transition-colors">
     {# Persistent notices. The rooting line was previously only a sticky toast, which
        vanished on the next action; the duplicate line points at the table further down. #}
     {% set dup_filters = (job_details.get('import_filter_details') or {}).get('duplicates') %}
@@ -989,10 +1059,79 @@
         </div>
         {% endif %}
     </div>
+    <div id="tree-mobile-toolbar" class="tree-mobile-only" aria-label="Tree navigation controls">
+        <button type="button" class="tree-mobile-tool" data-mobile-trigger="btn-fit" aria-label="Fit tree">
+            <i class="fa fa-compress-arrows-alt"></i><span>Fit</span>
+        </button>
+        <button type="button" class="tree-mobile-tool" data-mobile-trigger="btn-zoom-out" aria-label="Zoom out">
+            <i class="fa fa-minus"></i><span>Out</span>
+        </button>
+        <button type="button" class="tree-mobile-tool" data-mobile-trigger="btn-zoom-in" aria-label="Zoom in">
+            <i class="fa fa-plus"></i><span>In</span>
+        </button>
+        <button type="button" id="btn-mobile-select" class="tree-mobile-tool tree-mobile-mode" aria-pressed="false">
+            <i class="fa fa-hand-pointer"></i><span>Select</span>
+        </button>
+        <button type="button" id="btn-mobile-more" class="tree-mobile-tool" aria-expanded="false" aria-controls="tree-mobile-more">
+            <i class="fa fa-ellipsis-h"></i><span>More</span>
+        </button>
+        <button type="button" id="btn-mobile-expand" class="tree-mobile-tool" aria-pressed="false">
+            <i class="fa fa-expand"></i><span>Expand</span>
+        </button>
+        <button type="button" id="btn-mobile-undo" class="tree-mobile-tool tree-mobile-undo" data-mobile-trigger="btn-undo" disabled>
+            <i class="fa fa-rotate-left"></i><span>Undo</span>
+        </button>
+    </div>
+    <div id="tree-mobile-mode-status" class="tree-mobile-only tree-mobile-mode-status" role="status">
+        Navigate mode: drag to pan, pinch to zoom
+    </div>
     <div id="tree-container" class="bg-white dark:bg-black rounded-lg p-4" style="min-height: 600px;">
         <div class="text-center text-gray-400 dark:text-gray-500 mt-20">
             <i class="fas fa-spinner fa-spin text-3xl mb-3"></i>
             <p>Loading tree...</p>
+        </div>
+    </div>
+</div>
+
+<div id="tree-mobile-more" class="tree-mobile-only tree-mobile-sheet hidden" aria-hidden="true">
+    <button type="button" id="tree-mobile-more-backdrop" class="tree-mobile-sheet-backdrop" aria-label="Close tree controls"></button>
+    <div class="tree-mobile-sheet-panel" role="dialog" aria-modal="true" aria-labelledby="tree-mobile-more-title">
+        <div class="tree-mobile-sheet-header">
+            <h3 id="tree-mobile-more-title">Tree controls</h3>
+            <button type="button" id="btn-mobile-more-close" class="tree-mobile-sheet-close" aria-label="Close tree controls"><i class="fa fa-times"></i></button>
+        </div>
+        <div class="tree-mobile-sheet-content">
+            <section>
+                <h4>Selection actions</h4>
+                <div class="tree-mobile-action-grid">
+                    <button type="button" id="btn-mobile-node-actions" disabled><i class="fa fa-ellipsis-v"></i> Node actions</button>
+                    <button type="button" data-mobile-trigger="btn-rename"><i class="fa fa-edit"></i> Rename</button>
+                    <button type="button" data-mobile-trigger="btn-prune"><i class="fa fa-cut"></i> Prune</button>
+                    <button type="button" data-mobile-trigger="btn-deselect"><i class="fa fa-mouse-pointer"></i> Deselect</button>
+                    <button type="button" data-mobile-trigger="btn-annotations"><i class="fa fa-tags"></i> Annotations</button>
+                    <button type="button" data-mobile-trigger="btn-alignment-viewer"><i class="fa fa-stream"></i> Alignment</button>
+                </div>
+            </section>
+            <section>
+                <h4>Tree layout</h4>
+                <div class="tree-mobile-setting-row"><span>Horizontal spacing</span><span><button type="button" data-mobile-trigger="btn-spacing-x-dec" aria-label="Decrease horizontal spacing"><i class="fa fa-minus"></i></button><button type="button" data-mobile-trigger="btn-spacing-x-inc" aria-label="Increase horizontal spacing"><i class="fa fa-plus"></i></button></span></div>
+                <div class="tree-mobile-setting-row"><span>Vertical spacing</span><span><button type="button" data-mobile-trigger="btn-spacing-y-dec" aria-label="Decrease vertical spacing"><i class="fa fa-minus"></i></button><button type="button" data-mobile-trigger="btn-spacing-y-inc" aria-label="Increase vertical spacing"><i class="fa fa-plus"></i></button></span></div>
+                <div class="tree-mobile-setting-row"><span>Tip label gap</span><span><button type="button" data-mobile-trigger="btn-tip-label-gap-dec" aria-label="Decrease tip label gap"><i class="fa fa-minus"></i></button><button type="button" data-mobile-trigger="btn-tip-label-gap-inc" aria-label="Increase tip label gap"><i class="fa fa-plus"></i></button></span></div>
+                <div class="tree-mobile-action-grid mt-3">
+                    <button type="button" data-mobile-trigger="btn-layout-linear">Linear</button>
+                    <button type="button" data-mobile-trigger="btn-layout-radial">Radial</button>
+                    <button type="button" data-mobile-trigger="btn-align-tips">Align tips</button>
+                    <button type="button" data-mobile-trigger="btn-ladderize">Sort</button>
+                    <button type="button" data-mobile-trigger="btn-toggle-support">Node support</button>
+                    <button type="button" data-mobile-trigger="btn-midpoint">Midpoint root</button>
+                </div>
+            </section>
+            <section>
+                <h4>Touch controls</h4>
+                <p><strong>Navigate:</strong> drag to pan; pinch to zoom. Camera gestures never change tree spacing.</p>
+                <p><strong>Select:</strong> tap a tip to toggle it; drag empty tree background to box-select. Tap Node actions for the existing Rename, Prune, Copy, Collapse/Expand, Rotate, annotation, and related actions available for that target.</p>
+            </section>
+            <button type="button" id="btn-mobile-all-controls" class="tree-mobile-all-controls">Show all advanced controls</button>
         </div>
     </div>
 </div>
@@ -1335,13 +1474,13 @@
 
 <script src="{{ url_for('static', filename='vendor/underscore-1.13.6-min.js') }}"></script>
 
-<script src="{{ url_for('static', filename='js/phylotree.js') }}?v=9"></script>
+<script src="{{ url_for('static', filename='js/phylotree.js') }}?v=12"></script>
 
-<script src="{{ url_for('static', filename='js/tree_viewer_phylotree_v2.js') }}?v=69"></script>
+<script src="{{ url_for('static', filename='js/tree_viewer_phylotree_v2.js') }}?v=82"></script>
 
-<script src="{{ url_for('static', filename='js/tree_viewer_api.js') }}?v=7"></script>
+<script src="{{ url_for('static', filename='js/tree_viewer_api.js') }}?v=8"></script>
 
-<script src="{{ url_for('static', filename='js/tree_viewer_controller.js') }}?v=64"></script>
+<script src="{{ url_for('static', filename='js/tree_viewer_controller.js') }}?v=77"></script>
 
 {% include 'partials/alignment_viewer_modal.html' %}
 

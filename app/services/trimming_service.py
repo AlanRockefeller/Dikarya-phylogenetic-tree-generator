@@ -178,6 +178,26 @@ def run_trimming(
             terminal_tmp.unlink()
 
 
+def resolve_trimming_method(job_params: Dict[str, Any]) -> str:
+    """Return the trimming method this job will actually run, lowercased.
+
+    An absent key resolves to ``Config.DEFAULT_TRIMMING_METHOD`` and the literal
+    ``"default"`` resolves to ``Config.BEGINNER_DEFAULT_TRIMMING``; the two are
+    separate settings and are not interchangeable. This lives here, beside the
+    `run_trimming` dispatcher it describes, because the RQ deadline in
+    `app/workers/queue.py` has to budget for exactly the trimmer the worker
+    will launch. When the two resolved it separately, a job submitted with no
+    ``trimming_method`` was budgeted as "no trimming" while the worker ran
+    trimAl, so the RQ deadline could fire while trimAl was still inside its own
+    (legal) four-hour limit.
+    """
+    method = (job_params or {}).get("trimming_method", Config.DEFAULT_TRIMMING_METHOD)
+    method = str(method or "none").strip().lower()
+    if method == "default":
+        method = str(Config.BEGINNER_DEFAULT_TRIMMING or "none").strip().lower()
+    return method or "none"
+
+
 def describe_trim_step(trim_method: Optional[str], trim_terminal_overhangs: bool):
     """Return (should_run, step_label, tool_token) for the trim pipeline step.
 

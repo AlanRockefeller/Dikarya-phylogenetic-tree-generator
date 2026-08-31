@@ -16,6 +16,8 @@ document.addEventListener('DOMContentLoaded', async () => {
     const btnMidpoint = getEl('btn-midpoint');
     // Alan 5/11/26 - Track the viewer-only deselect control separately from persistent selection-set actions.
     const btnDeselect = getEl('btn-deselect');
+    // Alan 8/24/26 - Single-level Undo control (toolbar button plus Ctrl/Cmd+Z).
+    const btnUndo = getEl('btn-undo');
     // Alan 5/13/26 - Cache the Alignment Viewer launcher so its count stays synced to tree state.
     const btnAlignmentViewer = getEl('btn-alignment-viewer');
     // Alan 5/29/26 - Cache new rooting-mode dropdown + sequence-of-interest button.
@@ -52,6 +54,15 @@ document.addEventListener('DOMContentLoaded', async () => {
     const btnClaudeReviewClose = getEl('btn-claude-review-close');
     const btnClaudeReviewDone = getEl('btn-claude-review-done');
     const btnClaudeReviewRefresh = getEl('btn-claude-review-refresh');
+    // Alan 8/28/26 - Cache the mobile viewer controls so their visual, ARIA, and body state stay synchronized.
+    const treeViewerPanel = getEl('tree-viewer-panel');
+    const btnMobileSelect = getEl('btn-mobile-select');
+    const btnMobileMore = getEl('btn-mobile-more');
+    const mobileMore = getEl('tree-mobile-more');
+    const btnMobileExpand = getEl('btn-mobile-expand');
+    const btnMobileUndo = getEl('btn-mobile-undo');
+    const btnMobileNodeActions = getEl('btn-mobile-node-actions');
+    const mobileModeStatus = getEl('tree-mobile-mode-status');
 
     // --- HELPER: STATUS MESSAGE ---
     let currentStatusType = null;
@@ -99,6 +110,95 @@ document.addEventListener('DOMContentLoaded', async () => {
     // Alan 5/11/26 - Hold only the clicked/current selection being edited in the rename modal.
     let pendingRenameItems = [];
     let updateSelectionSetUI = () => {}; // assigned in wireUI()
+    // ======================================================================
+    // Alan 8/24/26 - SINGLE-LEVEL UNDO
+    //
+    // Two kinds of undoable action share one visible slot:
+    //
+    //   viewer  collapse/expand of clades. Pure display state living on the
+    //           phylotree nodes, so undoing it is local and instant.
+    //   server  the last persisted edit (prune / rename / rotate / reroot /
+    //           rooting change). The checkpoint is a file snapshot held by
+    //           app/services/tree_undo_service.py; `serverUndoState` is only
+    //           this tab's view of whether one exists.
+    //
+    // The newer of the two wins, so the button always describes the thing the
+    // user just did. Undoing a collapse falls back to the persisted checkpoint
+    // if one is still there, which is why prune -> collapse -> Undo -> Undo
+    // walks back the way a user expects. There is no redo.
+    // ======================================================================
+    let serverUndoState = null;
+
+    // What Undo would do right now, or null when there is nothing to undo.
+    function currentUndoTarget() {
+        if (viewer && typeof viewer.hasCollapseUndo === 'function' && viewer.hasCollapseUndo()) {
+            return { kind: 'viewer', label: viewer.getCollapseUndoLabel() || 'the last collapse' };
+        }
+        // A persisted undo is offered only where a persisted edit is allowed:
+        // can_undo is false for a read-only visitor even though the checkpoint
+        // itself exists, so a shared link never advertises an edit it cannot make.
+        if (serverUndoState && serverUndoState.can_undo) {
+            return { kind: 'server', label: serverUndoState.label || 'the last edit' };
+        }
+        return null;
+    }
+
+    function updateUndoButton() {
+        const target = currentUndoTarget();
+        const disabled = !target || isProcessing;
+        // Alan 8/28/26 - Mirror the established Undo state onto the coarse-pointer toolbar button.
+        const title = target ? `Undo ${target.label} (Ctrl/Cmd+Z)` : "Nothing to undo yet (Ctrl/Cmd+Z)";
+        [btnUndo, btnMobileUndo].forEach((button) => {
+            if (!button) return;
+            button.disabled = disabled;
+            button.classList.toggle('opacity-50', disabled);
+            button.classList.toggle('cursor-not-allowed', disabled);
+            button.title = title;
+        });
+    }
+
+    // Ask the server whether a persisted checkpoint is available. Cheap, and
+    // called after every edit so the button never claims more than is true.
+    async function refreshServerUndoState() {
+        if (JOB_ID === 'unknown') { serverUndoState = null; updateUndoButton(); return; }
+        try {
+            serverUndoState = await TreeEditActions.getUndoState(JOB_ID);
+        } catch (err) {
+            // An unreadable undo state is not an error worth interrupting for;
+            // it just means Undo is not offered.
+            serverUndoState = null;
+        }
+        updateUndoButton();
+    }
+
+    // Apply whatever the single Undo slot currently holds.
+    async function performUndo() {
+        const target = currentUndoTarget();
+        if (!target || isProcessing) return;
+
+        if (target.kind === 'viewer') {
+            const label = viewer.undoLastCollapseChange();
+            if (label) showStatus(`Undid ${label}.`, "success", 2500);
+            // Consuming the collapse entry can uncover a persisted checkpoint
+            // underneath it, so the button is re-derived rather than just disabled.
+            updateButtons();
+            return;
+        }
+
+        // A queued selection-set write contains the state from before Undo.
+        // Cancel it before the restore request, then skip runBackendAction's
+        // normal post-edit selection cleanup so the restored checkpoint stays
+        // authoritative until loadTree() reads it back.
+        cancelPendingSelectionSetSave();
+        await runBackendAction("Undo", async () => {
+            const data = await TreeEditActions.undoLastEdit(JOB_ID);
+            // The reply carries the restored state, so the Edited FASTA link is
+            // correct before the tree finishes reloading.
+            updateEditedFastaAvailability(data);
+            const label = data?.undone?.label || target.label;
+            return { finalStatus: { msg: `Undid ${label}.`, type: "success", timeout: 3500 } };
+        }, { suppressUndoHint: true, clearSelections: false });
+    }
 
     // Alan 7/20/26 - Toggle the advanced selection menu through both mouse and keyboard-accessible state.
     function setSelectionMoreMenuOpen(open) {
@@ -559,6 +659,14 @@ document.addEventListener('DOMContentLoaded', async () => {
         return names;
     }
 
+    // Alan 8/25/26 - Is this node a terminal sequence rather than a clade? Uses the same
+    // children test the surrounding helpers already apply inline, so the answer never
+    // disagrees with getDescendantTipNames or getPruneTargetForNode.
+    function isTipNode(node) {
+        const children = node?.children || node?.data?.children || [];
+        return !children || children.length === 0;
+    }
+
     // Alan 6/4/26 - Resolve a right-clicked node into the backend prune target for leaves or internal subtrees.
     function getPruneTargetForNode(node) {
         const data = node?.data || node || {};
@@ -623,15 +731,16 @@ document.addEventListener('DOMContentLoaded', async () => {
         selectionSaveDebounce = setTimeout(saveSelectionSets, 800);
     }
 
+    function cancelPendingSelectionSetSave() {
+        if (!selectionSaveDebounce) return;
+        clearTimeout(selectionSaveDebounce);
+        selectionSaveDebounce = null;
+    }
+
     // Alan 5/12/26 - Save selection/color sets immediately after destructive prune cleanup.
     async function saveSelectionSetsNow() {
         // Alan 5/12/26 - Cancel pending debounced saves so stale pre-prune colors cannot overwrite cleanup.
-        if (selectionSaveDebounce) {
-            // Alan 5/12/26 - Clear the pending save timer before forcing a fresh save.
-            clearTimeout(selectionSaveDebounce);
-            // Alan 5/12/26 - Reset the timer handle after cancellation.
-            selectionSaveDebounce = null;
-        }
+        cancelPendingSelectionSetSave();
         // Alan 5/12/26 - Persist the viewer's current selection/color state.
         await saveSelectionSets();
     }
@@ -688,14 +797,71 @@ document.addEventListener('DOMContentLoaded', async () => {
         // Alan 8/17/26 - Expose bubble fill controls alongside the shared line and text styles.
         { field: 'line_color', label: 'Line / border color' },
         { field: 'fill_color', label: 'Bubble fill' },
-        { field: 'fill_opacity', label: 'Bubble opacity' }
+        { field: 'fill_opacity', label: 'Bubble opacity' },
+        // Alan 8/24/26 - Clade highlights get their own fill fields; sharing the bubble's
+        // would give every band the bubble default of near-opaque white.
+        { field: 'highlight_color', label: 'Highlight color' },
+        { field: 'highlight_opacity', label: 'Highlight opacity' }
     ];
+    // Alan 8/24/26 - "Automatic" is a real, stored choice, not the absence of one: an
+    // automatic highlight takes the colour of the clade's persistent colour group when it has
+    // one and a palette colour otherwise. Keeping it as an explicit mode is what lets a user
+    // deliberately pick the historical gold #c9a962 as a fixed colour and keep it.
+    const HIGHLIGHT_COLOR_MODE_FIELD = 'highlight_color_mode';
+    const LEGACY_AUTO_HIGHLIGHT_COLOR = '#c9a962';
+
+    // Alan 8/24/26 - Carried alongside highlight_color but never given a row of its own; the
+    // highlight-color row's Auto/Fixed select writes it.
+    const ANNOTATION_HIDDEN_STYLE_FIELDS = [HIGHLIGHT_COLOR_MODE_FIELD];
+
+    // Alan 8/24/26 - The bounded 0..1 style fields, so an opacity control is never built
+    // with font-size bounds. Mirrors the renderer's ANNOTATION_NUMERIC_STYLE_FIELDS.
+    const ANNOTATION_OPACITY_FIELDS = new Set(['fill_opacity', 'highlight_opacity']);
+    const isNumericAnnotationField = (field) =>
+        field === 'font_size' || ANNOTATION_OPACITY_FIELDS.has(field);
+    // Alan 8/24/26 - Types that annotate a clade as a whole. They occupy a right-hand lane
+    // and stay valid on the root, which has no incoming branch to hang a label on.
+    const CLADE_ANNOTATION_TYPES = ['clade_line', 'clade_highlight'];
+    const ALL_ANNOTATION_TYPES = CLADE_ANNOTATION_TYPES.concat(['branch_text', 'branch_bubble']);
+
+    // Alan 8/24/26 - Read the effective mode for a layer, inferring it for layers saved
+    // before the field existed: those said "automatic" by still carrying the shared default.
+    function layerHighlightColorMode(layer) {
+        const stored = layer ? layer['default_' + HIGHLIGHT_COLOR_MODE_FIELD] : null;
+        if (stored === 'auto' || stored === 'fixed') return stored;
+        const color = layer ? layer.default_highlight_color : null;
+        return (!color || color === LEGACY_AUTO_HIGHLIGHT_COLOR) ? 'auto' : 'fixed';
+    }
+
+    // Alan 8/24/26 - Map the short-lived old aliases onto the canonical type in one place.
+    function canonicalAnnotationType(value) {
+        if (value === 'line') return 'clade_line';
+        if (value === 'bubble') return 'branch_bubble';
+        return ALL_ANNOTATION_TYPES.includes(value) ? value : 'clade_line';
+    }
+
+    // Alan 8/30/26 - The type a NEW annotation opens with: the one most recently added,
+    // falling back to the newest annotation already on this tree (so the preference survives a
+    // reload) and finally to Clade highlight when the tree has none yet. The caller's
+    // structural suggestion is deliberately not consulted - repeating the last type is what
+    // makes a run of highlights or brackets one keystroke each.
+    let lastAddedAnnotationType = null;
+    function preferredNewAnnotationType() {
+        if (lastAddedAnnotationType) return canonicalAnnotationType(lastAddedAnnotationType);
+        for (let i = cladeAnnotations.length - 1; i >= 0; i--) {
+            if (cladeAnnotations[i]?.annotation_type) {
+                return canonicalAnnotationType(cladeAnnotations[i].annotation_type);
+            }
+        }
+        return 'clade_highlight';
+    }
 
     const annotationsEditable = () => !window.VIEW_ONLY;
     const annotationConfig = () => window.DikaryaCladeAnnotations || {
         FONT_FAMILIES: ['Arial'], MIN_FONT_SIZE: 6, MAX_FONT_SIZE: 72,
         // Alan 8/17/26 - Keep the controller fallback complete when server configuration is absent.
-        DEFAULTS: { font_family: 'Arial', font_size: 12, font_style: 'normal', font_weight: 'normal', text_color: '#1f2937', line_color: '#1f2937', fill_color: '#ffffff', fill_opacity: 0.9 }
+        DEFAULTS: { font_family: 'Arial', font_size: 12, font_style: 'normal', font_weight: 'normal', text_color: '#1f2937', line_color: '#1f2937', fill_color: '#ffffff', fill_opacity: 0.9,
+            highlight_color: '#c9a962', highlight_opacity: 0.2 }
     };
 
     // Alan 8/15/26 - Short, URL/attribute-safe IDs inside the server's 64-char limit.
@@ -713,8 +879,12 @@ document.addEventListener('DOMContentLoaded', async () => {
         const own = annotation ? annotation[field] : null;
         if (own !== null && own !== undefined && own !== '') return own;
         const inherited = layer ? layer['default_' + field] : null;
+        const defaults = annotationConfig().DEFAULTS;
+        // Alan 8/24/26 - highlight_color deliberately does NOT pass through here: its three
+        // states (inherit / automatic / fixed) cannot be expressed as one value, so it has its
+        // own control in highlightColorRow() and layerHighlightColorControl().
         if (inherited !== null && inherited !== undefined && inherited !== '') return inherited;
-        return annotationConfig().DEFAULTS[field];
+        return defaults[field];
     }
 
     // Alan 8/17/26 - Render the same plain text, line breaks, type, and resolved whole-label
@@ -735,8 +905,23 @@ document.addEventListener('DOMContentLoaded', async () => {
             // Alan 8/17/26 - Keep inheritance explicit by passing null for unchecked overrides.
             draft[field] = annotationEditorState.style[field] ?? null;
         });
+        // Alan 8/24/26 - The preview resolves the highlight colour exactly as the tree does,
+        // so it needs the mode and the saved palette slot as well as the colour itself.
+        ANNOTATION_HIDDEN_STYLE_FIELDS.forEach(field => {
+            draft[field] = annotationEditorState.style[field] ?? null;
+        });
+        draft.automatic_highlight_slot = Number.isInteger(annotationEditorState.automaticSlot)
+            ? annotationEditorState.automaticSlot : null;
         // Alan 8/17/26 - Replace the old CSS-only preview with the shared SVG primitive.
-        if (viewer?.renderAnnotationPreview) viewer.renderAnnotationPreview(preview, draft, layer);
+        // Alan 8/24/26 - Hand it the session's membership and id so an unstyled clade highlight
+        // previews the automatic colour it will really be assigned, not a placeholder.
+        if (viewer?.renderAnnotationPreview) {
+            viewer.renderAnnotationPreview(preview, draft, layer, {
+                memberIds: annotationEditorState.memberIds,
+                annotationId: annotationEditorState.annotationId
+                    || annotationEditorState.pendingId
+            });
+        }
     }
 
     // Alan 8/15/26 - Adopt a configuration (ours or the server's) into state, renderer and UI.
@@ -897,7 +1082,18 @@ document.addEventListener('DOMContentLoaded', async () => {
             // Alan 8/17/26 - New layers inherit bubble fill styling as concrete defaults.
             default_line_color: defaults.line_color,
             default_fill_color: defaults.fill_color,
-            default_fill_opacity: defaults.fill_opacity
+            default_fill_opacity: defaults.fill_opacity,
+            // Alan 8/24/26 - Seed the highlight defaults too, so a new layer's bands are
+            // the subtle gold tint rather than the bubble's near-opaque white.
+            default_highlight_color: defaults.highlight_color,
+            // Alan 8/24/26 - A fresh layer is Automatic, stated outright rather than implied
+            // by the colour it happens to carry.
+            default_highlight_color_mode: 'auto',
+            // Alan 8/24/26 - Deliberately NOT seeded: an untouched highlight opacity has to
+            // be absent, not a copy of the shared default, or the layer's opacity control
+            // would be inert at exactly the value it displays. The renderer resolves the
+            // absent value to the theme-aware automatic opacity.
+            default_highlight_opacity: null
         };
         if (fromEditorSession) layer.__editorSession = true;
         annotationLayers.push(layer);
@@ -965,6 +1161,14 @@ document.addEventListener('DOMContentLoaded', async () => {
         host.textContent = '';
 
         ANNOTATION_STYLE_FIELDS.forEach(({ field, label }) => {
+            // Alan 8/24/26 - Highlight colour is not a plain override: its three states are
+            // "inherit from the layer", "work it out from the tree" and "this exact colour",
+            // and showing a gold swatch for the first two while drawing blue was misleading.
+            if (field === 'highlight_color') {
+                host.appendChild(highlightColorRow(layer, draft, label));
+                return;
+            }
+
             const row = document.createElement('div');
             row.className = 'annotation-style-row';
 
@@ -997,13 +1201,14 @@ document.addEventListener('DOMContentLoaded', async () => {
                 });
                 control.value = effective;
             // Alan 8/17/26 - Treat opacity as a bounded numeric override like font size.
-            } else if (field === 'font_size' || field === 'fill_opacity') {
+            } else if (isNumericAnnotationField(field)) {
+                const isOpacity = ANNOTATION_OPACITY_FIELDS.has(field);
                 control = document.createElement('input');
                 control.type = 'number';
                 // Alan 8/17/26 - Bound opacity to 0–1 while retaining configured font-size bounds.
-                control.min = field === 'fill_opacity' ? '0' : String(cfg.MIN_FONT_SIZE);
-                control.max = field === 'fill_opacity' ? '1' : String(cfg.MAX_FONT_SIZE);
-                control.step = field === 'fill_opacity' ? '0.05' : '1';
+                control.min = isOpacity ? '0' : String(cfg.MIN_FONT_SIZE);
+                control.max = isOpacity ? '1' : String(cfg.MAX_FONT_SIZE);
+                control.step = isOpacity ? '0.05' : '1';
                 control.className = 'w-24 rounded border border-gray-300 bg-white px-2 py-1 text-xs text-gray-900 dark:border-gray-700 dark:bg-journal-dark dark:text-gray-100';
                 control.value = String(effective);
             } else {
@@ -1017,7 +1222,7 @@ document.addEventListener('DOMContentLoaded', async () => {
             const commit = () => {
                 if (!toggle.checked) { draft[field] = null; return; }
                 // Alan 8/17/26 - Store numeric opacity without string coercion in the draft.
-                draft[field] = (field === 'font_size' || field === 'fill_opacity')
+                draft[field] = isNumericAnnotationField(field)
                     ? Number(control.value) : control.value;
                 renderAnnotationLivePreview();
             };
@@ -1036,6 +1241,122 @@ document.addEventListener('DOMContentLoaded', async () => {
         });
     }
 
+    /**
+     * Alan 8/24/26 - The annotation-level highlight colour control.
+     *
+     * One select for the mode and one picker for the colour. The picker stays visible while
+     * the mode is Inherit or Automatic, showing the colour that will actually be drawn, but
+     * is disabled so it reads as a preview rather than a choice.
+     */
+    function highlightColorRow(layer, draft, labelText) {
+        const row = document.createElement('div');
+        row.className = 'annotation-style-row';
+
+        const caption = document.createElement('label');
+        caption.className = 'text-xs text-gray-600 dark:text-gray-300';
+        caption.textContent = labelText;
+
+        const mode = document.createElement('select');
+        mode.className = 'rounded border border-gray-300 bg-white px-2 py-1 text-xs text-gray-900 dark:border-gray-700 dark:bg-journal-dark dark:text-gray-100';
+        [
+            ['inherit', 'Layer default'],
+            ['auto', 'Automatic'],
+            ['fixed', 'Fixed color']
+        ].forEach(([value, text]) => {
+            const option = document.createElement('option');
+            option.value = value;
+            option.textContent = text;
+            mode.appendChild(option);
+        });
+
+        const picker = document.createElement('input');
+        picker.type = 'color';
+        picker.className = 'h-7 w-14 rounded border border-gray-300 bg-transparent p-0 dark:border-gray-700';
+
+        // Inherit is "no annotation-level opinion at all": neither a colour nor a mode.
+        const current = () => {
+            if (draft.highlight_color) return 'fixed';
+            if (draft[HIGHLIGHT_COLOR_MODE_FIELD] === 'auto') return 'auto';
+            if (draft[HIGHLIGHT_COLOR_MODE_FIELD] === 'fixed') return 'fixed';
+            return 'inherit';
+        };
+        mode.value = current();
+
+        // Alan 8/24/26 - Ask with the DRAFT, not with the annotation id alone. While an
+        // existing Fixed highlight is being switched to Automatic the saved annotation still
+        // says fixed and still carries its palette slot, and resolving against that stale
+        // object showed a swatch the save would not reproduce. The draft below is exactly what
+        // saving would write for an Automatic highlight, so the swatch and the saved figure
+        // agree -- including the stored slot, which the save keeps.
+        const automaticColor = () => {
+            if (!viewer?.resolveDraftHighlightColor || !annotationEditorState) {
+                return annotationConfig().DEFAULTS.highlight_color;
+            }
+            return viewer.resolveDraftHighlightColor({
+                id: annotationEditorState.annotationId || annotationEditorState.pendingId,
+                layer_id: layer?.id || null,
+                annotation_type: 'clade_highlight',
+                member_tip_ids: annotationEditorState.memberIds,
+                highlight_color: null,
+                [HIGHLIGHT_COLOR_MODE_FIELD]: 'auto',
+                automatic_highlight_slot: Number.isInteger(annotationEditorState.automaticSlot)
+                    ? annotationEditorState.automaticSlot : null
+            }, layer);
+        };
+
+        const sync = () => {
+            const selected = mode.value;
+            picker.disabled = selected !== 'fixed' || !annotationsEditable();
+            picker.title = selected === 'fixed'
+                ? 'Highlight color for this annotation'
+                : 'The color this highlight will be drawn with';
+            if (selected === 'fixed') {
+                picker.value = draft.highlight_color
+                    || (layerHighlightColorMode(layer) === 'fixed'
+                        && layer?.default_highlight_color)
+                    || automaticColor();
+            } else if (selected === 'auto') {
+                picker.value = automaticColor();
+            } else {
+                picker.value = layerHighlightColorMode(layer) === 'fixed'
+                    ? (layer?.default_highlight_color
+                        || annotationConfig().DEFAULTS.highlight_color)
+                    : automaticColor();
+            }
+        };
+
+        const commit = () => {
+            const selected = mode.value;
+            if (selected === 'fixed') {
+                draft.highlight_color = picker.value;
+                draft[HIGHLIGHT_COLOR_MODE_FIELD] = 'fixed';
+            } else if (selected === 'auto') {
+                // No colour, and an explicit auto, so an Auto annotation stays automatic even
+                // on a layer whose default is a fixed colour.
+                draft.highlight_color = null;
+                draft[HIGHLIGHT_COLOR_MODE_FIELD] = 'auto';
+            } else {
+                draft.highlight_color = null;
+                draft[HIGHLIGHT_COLOR_MODE_FIELD] = null;
+            }
+            renderAnnotationLivePreview();
+            // The automatic colour is only known after the draft settles, so refresh the
+            // swatch from the value the renderer just resolved.
+            sync();
+        };
+
+        mode.disabled = !annotationsEditable();
+        mode.addEventListener('change', commit);
+        picker.addEventListener('change', commit);
+        picker.addEventListener('input', commit);
+        sync();
+
+        row.appendChild(mode);
+        row.appendChild(caption);
+        row.appendChild(picker);
+        return row;
+    }
+
     function populateAnnotationLayerSelect(selectedLayerId) {
         const select = getEl('select-annotation-layer');
         if (!select) return;
@@ -1050,6 +1371,172 @@ document.addEventListener('DOMContentLoaded', async () => {
                 select.appendChild(option);
             });
         if (selectedLayerId) select.value = selectedLayerId;
+    }
+
+    // Alan 8/26/26 - Suggesting a default annotation label.
+    //
+    // Tip labels here are FASTA headers, not taxon names: an accession or iNat number, the
+    // binomial, then a voucher, a locality and sometimes a RiC count, in any of several
+    // orders and joined by spaces, underscores or pipes. The binomial is found positionally
+    // -- a capitalised genus-shaped word immediately followed by a lowercase epithet -- which
+    // is what keeps a locality ("Ovid Township", "Metamora-Hadley Recreation Area") from being
+    // read as a name: those are followed by another capitalised word, never by an epithet.
+
+    // Genus-shaped words that are never a genus.
+    const NON_GENUS_WORDS = new Set([
+        'uncultured', 'unidentified', 'unclassified', 'fungal', 'fungus', 'voucher',
+        'isolate', 'strain', 'clone', 'culture', 'specimen', 'sequence', 'sample',
+        'environmental', 'herbarium', 'unite', 'genbank', 'type', 'note', 'fungi'
+    ]);
+
+    // Lowercase words that follow a genus without being its epithet.
+    const NON_EPITHET_WORDS = new Set([
+        'voucher', 'isolate', 'strain', 'clone', 'culture', 'specimen', 'sequence',
+        'internal', 'transcribed', 'spacer', 'small', 'large', 'subunit', 'ribosomal',
+        'partial', 'complete', 'gene', 'genes', 'and', 'from', 'the', 'group', 'clade',
+        'complex', 'sensu', 'locked', 'unite', 'sequences'
+    ]);
+
+    const SPECIES_RANK_MARKERS = {
+        sp: 'sp.', spp: 'sp.', cf: 'cf.', aff: 'aff.', nr: 'nr.'
+    };
+
+    const SPECIES_QUOTE_CHARS = '"\u2018\u2019\u201c\u201d\'';
+
+    function speciesTokens(label) {
+        return String(label || '').replace(/[_|]+/g, ' ').trim().split(/\s+/).filter(Boolean);
+    }
+
+    // "AG25041-Bullatosporium" is one token but two things; the name is the trailing part.
+    function speciesGenusCandidate(token) {
+        const word = String(token).split(/[-\u2013]/).pop().replace(/[^A-Za-z]/g, '');
+        if (!/^[A-Z][a-z]{2,}$/.test(word)) return null;
+        return NON_GENUS_WORDS.has(word.toLowerCase()) ? null : word;
+    }
+
+    function speciesEpithetCandidate(token) {
+        const word = String(token).replace(/[^A-Za-z-]/g, '');
+        if (!/^[a-z][a-z-]{2,}$/.test(word)) return null;
+        return NON_EPITHET_WORDS.has(word) ? null : word;
+    }
+
+    // The pattern is fixed, so it is built once rather than per call. No /g flag, so
+    // there is no lastIndex to carry between calls.
+    const SPECIES_QUOTED_EPITHET_RE = new RegExp(
+        `^[${SPECIES_QUOTE_CHARS}]+([A-Za-z][A-Za-z0-9.-]{1,})[${SPECIES_QUOTE_CHARS}]+$`
+    );
+
+    // Provisional names travel quoted -- Amanita sp. 'albemarlensis', Amanita "albemarlensis" --
+    // and both spellings have to reduce to the same suggestion so they count as one species.
+    // Informal codes (Russula "sp-IN67", Tricholoma "moseri-CA01") are quoted the same way and
+    // are kept as they are written, because they are what separates two species in these trees.
+    function speciesQuotedEpithet(token) {
+        const match = SPECIES_QUOTED_EPITHET_RE.exec(String(token));
+        if (!match) return null;
+        const epithet = match[1];
+        return /[0-9]/.test(epithet) ? epithet : epithet.toLowerCase();
+    }
+
+    function speciesRankMarker(token) {
+        const word = String(token).replace(/[^A-Za-z]/g, '').toLowerCase();
+        return Object.prototype.hasOwnProperty.call(SPECIES_RANK_MARKERS, word)
+            ? SPECIES_RANK_MARKERS[word]
+            : null;
+    }
+
+    /**
+     * Alan 8/26/26 - Pull just the taxon name out of one tip label, or null when the label
+     * carries none. Never returns an accession, an iNat number, a voucher or a locality.
+     */
+    function extractSpeciesName(label) {
+        const tokens = speciesTokens(label);
+        for (let i = 0; i < tokens.length - 1; i++) {
+            const genus = speciesGenusCandidate(tokens[i]);
+            if (!genus) continue;
+            // A duplicate suffix can sit between the two halves: "Stropharia_2 pseudocyanea".
+            let j = i + 1;
+            while (j < tokens.length && /^\d+$/.test(tokens[j])) j++;
+            if (j >= tokens.length) break;
+
+            const marker = speciesRankMarker(tokens[j]);
+            if (marker) {
+                const next = j + 1 < tokens.length ? tokens[j + 1] : '';
+                const provisional = speciesQuotedEpithet(next);
+                if (provisional) return `${genus} '${provisional}'`;
+                if (marker === 'sp.') return `${genus} sp.`;
+                const qualified = speciesEpithetCandidate(next);
+                if (qualified) return `${genus} ${marker} ${qualified}`;
+                continue;
+            }
+            const provisional = speciesQuotedEpithet(tokens[j]);
+            if (provisional) return `${genus} '${provisional}'`;
+            const epithet = speciesEpithetCandidate(tokens[j]);
+            if (epithet) return `${genus} ${epithet}`;
+        }
+        return null;
+    }
+
+    // An accession or iNat id, i.e. the token a bare genus name follows in these headers.
+    function isSpeciesIdentifierToken(token) {
+        return /[0-9]/.test(String(token));
+    }
+
+    /**
+     * Alan 8/26/26 - Fallback for labels identified only to genus ("KT334709 uncultured Russula
+     * Poland", "iNat174588914 Russula Ravenna Ohio US RiC 30"). Only the taxon SLOT is read --
+     * the start of the label, or just past the record id and at most one qualifier word -- and
+     * anything further right is ignored, because a bare capitalised word later in the header is
+     * far more often a locality ("uncultured fungus Yunnan CN"). The occasional label whose
+     * taxon slot really does hold a place name is absorbed by the majority vote over the clade.
+     */
+    function extractGenusName(label) {
+        const tokens = speciesTokens(label);
+        let slot = 0;
+        if (tokens.length > 1 && isSpeciesIdentifierToken(tokens[0])) slot += 1;
+        const qualifier = tokens[slot] ? tokens[slot].replace(/[^A-Za-z]/g, '').toLowerCase() : '';
+        if (qualifier && NON_GENUS_WORDS.has(qualifier)) slot += 1;
+        return slot < tokens.length ? speciesGenusCandidate(tokens[slot]) : null;
+    }
+
+    /**
+     * Alan 8/26/26 - The default label for a NEW annotation: the species name held by the most
+     * tips in the clade. Ties go to a determinate binomial over "Genus sp." or a provisional
+     * name, then to whichever appeared first, so a mixed clade never suggests the vaguer name.
+     * A clade whose tips carry no species name at all falls back to the dominant genus, and
+     * failing that the field is left empty exactly as before.
+     */
+    function mostCommonName(labels, extract) {
+        const counts = new Map();
+        labels.forEach((label) => {
+            const name = extract(label);
+            if (!name) return;
+            let entry = counts.get(name);
+            if (!entry) {
+                entry = {
+                    name,
+                    count: 0,
+                    order: counts.size,
+                    determinate: !name.endsWith(' sp.') && !name.includes("'")
+                };
+                counts.set(name, entry);
+            }
+            entry.count += 1;
+        });
+        const best = Array.from(counts.values()).sort((a, b) =>
+            (b.count - a.count)
+            || (Number(b.determinate) - Number(a.determinate))
+            || (a.order - b.order))[0];
+        return best ? best.name : '';
+    }
+
+    function suggestedAnnotationLabel(memberIds) {
+        if (!Array.isArray(memberIds) || !memberIds.length) return '';
+        const labels = viewer?.getDisplayLabelsForLeafIds
+            ? viewer.getDisplayLabelsForLeafIds(memberIds)
+            : [];
+        if (!labels.length) return '';
+        return mostCommonName(labels, extractSpeciesName)
+            || mostCommonName(labels, extractGenusName);
     }
 
     /**
@@ -1081,12 +1568,16 @@ document.addEventListener('DOMContentLoaded', async () => {
             // untouched by a cancel.
             createdLayerIds: []
         };
+        // Alan 8/24/26 - Reserve the id for a new annotation now rather than at save time. The
+        // automatic highlight colour is assigned per annotation id, so the preview and the saved
+        // annotation have to be talking about the same one.
+        if (mode !== 'edit') annotationEditorState.pendingId = newAnnotationId('annotation');
         // Alan 8/17/26 - Whole-tree clades may use a bracket, but the root has no incoming
         // segment on which branch text or a branch bubble could be placed.
         annotationEditorState.hasIncomingBranch = viewer?.hasIncomingBranchForMemberIds
             ? viewer.hasIncomingBranchForMemberIds(annotationEditorState.memberIds)
             : true;
-        annotationEditorState.defaultType = options.defaultType || 'clade_line';
+        annotationEditorState.defaultType = preferredNewAnnotationType();
 
         if (!annotationLayers.length) {
             // First use: give them a sensible layer rather than a dead-end dropdown.
@@ -1096,6 +1587,17 @@ document.addEventListener('DOMContentLoaded', async () => {
         ANNOTATION_STYLE_FIELDS.forEach(({ field }) => {
             annotationEditorState.style[field] = existing ? (existing[field] ?? null) : null;
         });
+        // Alan 8/24/26 - Carried but not shown as its own row; the highlight-color row owns it.
+        ANNOTATION_HIDDEN_STYLE_FIELDS.forEach(field => {
+            annotationEditorState.style[field] = existing ? (existing[field] ?? null) : null;
+        });
+        // Alan 8/24/26 - An automatic highlight keeps the palette slot it was saved with, so
+        // deleting or adding OTHER annotations never recolours it. Editing preserves it; a new
+        // annotation reserves one now so the preview shows the colour it will really get.
+        annotationEditorState.automaticSlot = existing
+            ? (Number.isInteger(existing.automatic_highlight_slot)
+                ? existing.automatic_highlight_slot : null)
+            : null;
 
         // Alan 8/17/26 - Use branch-oriented copy and restrict root annotations to clade lines.
         getEl('annotation-editor-title').textContent = mode === 'edit'
@@ -1106,16 +1608,24 @@ document.addEventListener('DOMContentLoaded', async () => {
         getEl('annotation-editor-subtitle').textContent =
             // Alan 8/17/26 - Use branch-relative descendant wording for the membership count.
             `${count} descendant tip${count === 1 ? '' : 's'} on this branch.`;
-        getEl('input-annotation-label').value = existing ? existing.label : '';
+        // Alan 8/26/26 - A new annotation opens pre-filled with the clade's dominant species
+        // name; it is selected below so typing replaces it outright.
+        const suggestedLabel = existing ? '' : suggestedAnnotationLabel(annotationEditorState.memberIds);
+        getEl('input-annotation-label').value = existing ? existing.label : suggestedLabel;
         // Alan 8/17/26 - Map short-lived aliases and disable branch-only root choices.
-        const savedType = existing?.annotation_type === 'line' ? 'clade_line'
-            : (existing?.annotation_type === 'bubble' ? 'branch_bubble' : existing?.annotation_type);
+        const savedType = existing ? canonicalAnnotationType(existing.annotation_type) : null;
         const typeSelect = getEl('select-annotation-type');
         typeSelect.querySelectorAll('option').forEach(option => {
+            // Alan 8/24/26 - Clade line AND clade highlight annotate the clade itself, so both
+            // remain available on the root; only the branch types need an incoming branch.
             option.disabled = !annotationEditorState.hasIncomingBranch
-                && option.value !== 'clade_line';
+                && !CLADE_ANNOTATION_TYPES.includes(option.value);
         });
         typeSelect.value = savedType || annotationEditorState.defaultType;
+        // Alan 8/30/26 - The remembered type may be branch-only while this membership resolves
+        // to the root, which has no incoming branch; fall back rather than opening on a
+        // disabled option the user cannot save.
+        if (typeSelect.selectedOptions[0]?.disabled) typeSelect.value = 'clade_line';
         getEl('btn-annotation-save-text').textContent = mode === 'edit' ? 'Save changes' : 'Save';
         getEl('btn-annotation-delete').classList.toggle('hidden', mode !== 'edit');
         getEl('annotation-style-details').open = false;
@@ -1125,7 +1635,9 @@ document.addEventListener('DOMContentLoaded', async () => {
         renderAnnotationLivePreview();
         setAnnotationEditorError('');
         modal.classList.remove('hidden');
-        getEl('input-annotation-label')?.focus();
+        const labelInput = getEl('input-annotation-label');
+        labelInput?.focus();
+        if (labelInput && suggestedLabel) labelInput.select();
     }
 
     async function submitAnnotationEditor() {
@@ -1153,30 +1665,51 @@ document.addEventListener('DOMContentLoaded', async () => {
         }
         // Alan 8/17/26 - Refuse branch-only types when the selected membership resolves to the root.
         const requestedType = getEl('select-annotation-type')?.value || 'clade_line';
-        if (!annotationEditorState.hasIncomingBranch && requestedType !== 'clade_line') {
-            setAnnotationEditorError('The whole-tree root has no incoming branch. Use Clade line.');
+        if (!annotationEditorState.hasIncomingBranch
+            && !CLADE_ANNOTATION_TYPES.includes(requestedType)) {
+            setAnnotationEditorError(
+                'The whole-tree root has no incoming branch. Use Clade line or Clade highlight.'
+            );
             return;
         }
 
         const payload = {
-            id: annotationEditorState.annotationId || newAnnotationId('annotation'),
+            // Alan 8/24/26 - Reuse the id the preview reserved, so the automatic colour the
+            // user just approved is the one this annotation is assigned once saved.
+            id: annotationEditorState.annotationId || annotationEditorState.pendingId
+                || newAnnotationId('annotation'),
             layer_id: layerId,
             label,
-            // Alan 8/17/26 - Save only the three supported canonical annotation types.
-            annotation_type: ['clade_line', 'branch_text', 'branch_bubble'].includes(
-                requestedType
-            ) ? requestedType : 'clade_line',
+            // Alan 8/24/26 - Save only the supported canonical annotation types.
+            annotation_type: canonicalAnnotationType(requestedType),
             member_tip_ids: annotationEditorState.memberIds.slice()
         };
         ANNOTATION_STYLE_FIELDS.forEach(({ field }) => {
             payload[field] = annotationEditorState.style[field] ?? null;
         });
+        ANNOTATION_HIDDEN_STYLE_FIELDS.forEach(field => {
+            payload[field] = annotationEditorState.style[field] ?? null;
+        });
+        // Alan 8/24/26 - Pin the automatic palette slot on first save (and backfill it for
+        // annotations saved before slots existed), so this highlight keeps the colour it was
+        // published with no matter what happens to the annotations around it. It stays an
+        // Automatic highlight: it still follows a colour group if its clade joins one, and it
+        // still takes the theme-aware automatic opacity.
+        if (payload.annotation_type === 'clade_highlight') {
+            let slot = annotationEditorState.automaticSlot;
+            if (!Number.isInteger(slot) && viewer?.reserveAutomaticHighlightSlot) {
+                slot = viewer.reserveAutomaticHighlightSlot(payload.id, payload.member_tip_ids);
+            }
+            payload.automatic_highlight_slot = Number.isInteger(slot) ? slot : null;
+        }
 
         if (annotationEditorState.mode === 'edit') {
             const index = cladeAnnotations.findIndex(a => a.id === payload.id);
             if (index >= 0) cladeAnnotations[index] = payload;
         } else {
             cladeAnnotations.push(payload);
+            // Alan 8/30/26 - Remember the type so the next Add opens on it.
+            lastAddedAnnotationType = payload.annotation_type;
         }
 
         // Alan 8/15/26 - Commit the editor transaction: any layer created in this session is
@@ -1278,10 +1811,12 @@ document.addEventListener('DOMContentLoaded', async () => {
             meta.className = 'annotation-row-meta text-gray-500 dark:text-gray-400';
             const memberCount = (annotation.member_tip_ids || []).length;
             // Alan 8/17/26 - Show canonical branch and clade type names in the manager.
-            const type = annotation.annotation_type === 'line' ? 'clade_line'
-                : (annotation.annotation_type === 'bubble' ? 'branch_bubble' : annotation.annotation_type);
-            const typeLabel = type === 'branch_text' ? 'Branch text'
-                : (type === 'branch_bubble' ? 'Branch bubble' : 'Clade line');
+            const type = canonicalAnnotationType(annotation.annotation_type);
+            const typeLabel = {
+                branch_text: 'Branch text',
+                branch_bubble: 'Branch bubble',
+                clade_highlight: 'Clade highlight'
+            }[type] || 'Clade line';
             meta.textContent = `${typeLabel} · ${layer ? layer.name : 'Unknown layer'} · ${memberCount} tip${memberCount === 1 ? '' : 's'}`;
             main.appendChild(meta);
 
@@ -1328,6 +1863,63 @@ document.addEventListener('DOMContentLoaded', async () => {
     }
 
     // Alan 8/15/26 - Build one labelled control for a layer's default style.
+    /**
+     * Alan 8/24/26 - A layer's default highlight colour: Automatic, or one fixed colour.
+     *
+     * Same reasoning as the annotation-level row. A layer set to Automatic hands each of its
+     * highlights its own colour, so there is no single swatch to show for it and the picker is
+     * disabled until the user says Fixed.
+     */
+    function layerHighlightColorControl(layer) {
+        const wrap = document.createElement('label');
+        wrap.className = 'annotation-layer-style text-gray-600 dark:text-gray-300';
+        const caption = document.createElement('span');
+        caption.textContent = 'Highlight';
+        wrap.appendChild(caption);
+
+        const mode = document.createElement('select');
+        mode.className = 'rounded border border-gray-300 bg-white px-1 py-0.5 text-xs text-gray-900 dark:border-gray-700 dark:bg-journal-dark dark:text-gray-100';
+        [['auto', 'Auto'], ['fixed', 'Fixed']].forEach(([value, text]) => {
+            const option = document.createElement('option');
+            option.value = value;
+            option.textContent = text;
+            mode.appendChild(option);
+        });
+        mode.value = layerHighlightColorMode(layer);
+
+        const picker = document.createElement('input');
+        picker.type = 'color';
+        picker.className = 'h-6 w-10 rounded border border-gray-300 bg-transparent p-0 dark:border-gray-700';
+        picker.value = layer.default_highlight_color
+            || annotationConfig().DEFAULTS.highlight_color;
+
+        const sync = () => {
+            picker.disabled = mode.value !== 'fixed' || !annotationsEditable();
+            picker.title = mode.value === 'fixed'
+                ? 'Default highlight color for this layer'
+                : 'Each highlight picks its own color from its clade or the palette';
+        };
+        mode.disabled = !annotationsEditable();
+
+        const commit = () => {
+            layer['default_' + HIGHLIGHT_COLOR_MODE_FIELD] = mode.value;
+            // The colour is kept even while Automatic is selected, so switching back to Fixed
+            // returns the colour the user last chose rather than a reset one.
+            layer.default_highlight_color = picker.value;
+            sync();
+            if (viewer?.setCladeAnnotations) viewer.setCladeAnnotations(annotationLayers, cladeAnnotations);
+            debouncedSaveAnnotations();
+        };
+        mode.addEventListener('change', commit);
+        picker.addEventListener('change', commit);
+        picker.addEventListener('input', commit);
+        sync();
+
+        wrap.appendChild(mode);
+        wrap.appendChild(picker);
+        return wrap;
+    }
+
     function layerStyleControl(layer, field, labelText) {
         const cfg = annotationConfig();
         const wrap = document.createElement('label');
@@ -1350,13 +1942,14 @@ document.addEventListener('DOMContentLoaded', async () => {
                 control.appendChild(option);
             });
         // Alan 8/17/26 - Layer opacity uses the same bounded numeric control as font size.
-        } else if (field === 'font_size' || field === 'fill_opacity') {
+        } else if (isNumericAnnotationField(field)) {
             control = document.createElement('input');
             control.type = 'number';
             // Alan 8/17/26 - Bound layer opacity to 0–1 while retaining font-size bounds.
-            control.min = field === 'fill_opacity' ? '0' : String(cfg.MIN_FONT_SIZE);
-            control.max = field === 'fill_opacity' ? '1' : String(cfg.MAX_FONT_SIZE);
-            control.step = field === 'fill_opacity' ? '0.05' : '1';
+            const isOpacity = ANNOTATION_OPACITY_FIELDS.has(field);
+            control.min = isOpacity ? '0' : String(cfg.MIN_FONT_SIZE);
+            control.max = isOpacity ? '1' : String(cfg.MAX_FONT_SIZE);
+            control.step = isOpacity ? '0.05' : '1';
             control.className = 'w-16 rounded border border-gray-300 bg-white px-1 py-0.5 text-xs text-gray-900 dark:border-gray-700 dark:bg-journal-dark dark:text-gray-100';
         } else {
             control = document.createElement('input');
@@ -1371,7 +1964,7 @@ document.addEventListener('DOMContentLoaded', async () => {
 
         const commit = () => {
             // Alan 8/17/26 - Persist opacity as a number so layer defaults round-trip cleanly.
-            layer['default_' + field] = (field === 'font_size' || field === 'fill_opacity')
+            layer['default_' + field] = isNumericAnnotationField(field)
                 ? Number(control.value) : control.value;
             // Repaint immediately so inheriting annotations restyle without waiting for the
             // debounced save round-trip.
@@ -1495,6 +2088,9 @@ document.addEventListener('DOMContentLoaded', async () => {
             // Alan 8/17/26 - Let managers edit the default fill and opacity for bubble annotations.
             styles.appendChild(layerStyleControl(layer, 'fill_color', 'Fill'));
             styles.appendChild(layerStyleControl(layer, 'fill_opacity', 'Opacity'));
+            // Alan 8/24/26 - Layer-level defaults for the clade-highlight band.
+            styles.appendChild(layerHighlightColorControl(layer));
+            styles.appendChild(layerStyleControl(layer, 'highlight_opacity', 'Highlight opacity'));
             card.appendChild(styles);
 
             host.appendChild(card);
@@ -1622,13 +2218,26 @@ document.addEventListener('DOMContentLoaded', async () => {
     // Alan 5/11/26 - Open a modal for renaming the current visible clicked selections only.
     function openRenameModal(nodes) {
         if (!renameModal || !renameModalRows || !Array.isArray(nodes) || nodes.length === 0) return;
-        pendingRenameItems = nodes.map((node, index) => {
+        // Alan 8/25/26 - Rename tips only. getSelectedNodes() traverses the whole tree, so a
+        // selected clade arrived here as an internal node whose data.name is its RENDERED
+        // SUPPORT LABEL, offering a rename row called "0.85". Accepting it was worse than
+        // cosmetic: rename_tip() keys the flat `renames` dict by name, and
+        // apply_state_to_structure() applies that entry to EVERY node whose original_name
+        // matches, so renaming one clade would relabel every other clade sharing its support
+        // value -- and persist that in tree_state.json.
+        const tipNodes = nodes.filter(isTipNode);
+        pendingRenameItems = tipNodes.map((node, index) => {
             const data = node?.data || node || {};
             const originalName = data.__original_name || data.original_name || data.name || node?.name || "";
             const displayName = data.name || data.display_name || originalName;
             return { index, originalName, displayName };
         }).filter(item => item.originalName);
-        if (pendingRenameItems.length === 0) return;
+        // Alan 8/25/26 - Say why nothing opened when the selection was all clades, rather
+        // than having the Rename button appear inert.
+        if (pendingRenameItems.length === 0) {
+            if (nodes.length) showStatus("Rename applies to sequences; select at least one tip.", "warning", 3000);
+            return;
+        }
 
         renameModalRows.innerHTML = "";
         pendingRenameItems.forEach(item => {
@@ -1701,12 +2310,15 @@ document.addEventListener('DOMContentLoaded', async () => {
         closeRenameModal();
         const count = changes.length;
         runBackendAction(`Renaming ${count} sequence${count === 1 ? '' : 's'}`, async () => {
-            for (const change of changes) {
-                const renameResult = await TreeEditActions.renameTip(JOB_ID, change.oldName, change.newName);
-                // Alan 8/15/26 - The rename response is the saved tree state, so enable Edited
-                // FASTA as soon as the first rename lands.
-                updateEditedFastaAvailability(renameResult);
-            }
+            // Alan 8/24/26 - Send the whole batch in one request. One request per name
+            // wrote the tree state once per name, and put an undo checkpoint between
+            // them, so undoing a three-tip rename handed back only the third.
+            const renames = {};
+            for (const change of changes) renames[change.oldName] = change.newName;
+            const renameResult = await TreeEditActions.renameTips(JOB_ID, renames);
+            // Alan 8/15/26 - The rename response is the saved tree state, so enable Edited
+            // FASTA as soon as the rename lands.
+            updateEditedFastaAvailability(renameResult);
         // Alan 5/11/26 - Renaming changes labels only, so saved selection sets should not be cleared.
         }, { clearSelections: false });
     }
@@ -1785,9 +2397,7 @@ document.addEventListener('DOMContentLoaded', async () => {
                 // Alan 5/10/26 - Persist cleared selections before reload so pruned nodes cannot reappear as selected.
                 viewer.clearSelection();
                 // Alan 5/10/26 - Cancel pending selection saves that may still contain pre-prune IDs.
-                if (selectionSaveDebounce) {
-                    selectionSaveDebounce = clearTimeout(selectionSaveDebounce);
-                }
+                cancelPendingSelectionSetSave();
                 // Alan 5/10/26 - Save the empty selection state before fetching tree_state again.
                 await saveSelectionSets();
             }
@@ -1796,11 +2406,20 @@ document.addEventListener('DOMContentLoaded', async () => {
 
             await loadTree({ fromAction: true });
 
+            // Alan 8/24/26 - Re-read the persisted checkpoint after every action, so the
+            // Undo button describes what actually landed rather than what was attempted.
+            await refreshServerUndoState();
+
             // Alan 5/31/26 - Show the action's own final status after the reload so
             // it persists instead of being overwritten by the interim message.
             if (actionResult && actionResult.finalStatus && actionResult.finalStatus.msg) {
                 const fs = actionResult.finalStatus;
                 showStatus(fs.msg, fs.type || "info", fs.timeout != null ? fs.timeout : 4000);
+            } else if (!options.suppressUndoHint && serverUndoState && serverUndoState.can_undo) {
+                // Alan 8/24/26 - Say so in plain text rather than injecting a link:
+                // showStatus() renders text only, and an enabled Undo button is the
+                // affordance. This is what makes a destructive-looking edit feel safe.
+                showStatus(name + " completed. Undo is available.", "success", 4000);
             }
         } catch (err) {
             console.error(err);
@@ -1841,6 +2460,15 @@ document.addEventListener('DOMContentLoaded', async () => {
             onSelectionChange: (count) => {
                 // Alan 5/12/26 - Current selection is transient, so selection changes only refresh action controls.
                 updateButtons();
+            },
+            // Alan 8/24/26 - A collapse/expand is a viewer-only change, so it never touches the
+            // server; it only claims the single Undo slot and reports what it folded.
+            onCollapseChange: (change) => {
+                updateButtons();
+                if (!change || !change.count) return;
+                const verb = change.collapsed ? 'Collapsed' : 'Expanded';
+                const what = change.count === 1 ? '1 clade' : `${change.count} clades`;
+                showStatus(`${verb} ${what}. Undo is available.`, "success", 2500);
             },
             // Alan 5/11/26 - Let the viewer report completed box-select gestures for concise feedback.
             onBoxSelect: (result) => {
@@ -2002,6 +2630,11 @@ document.addEventListener('DOMContentLoaded', async () => {
                 console.warn("Could not fetch tree state:", stateErr);
             }
 
+            // Alan 8/24/26 - viewer.render() replaced every node object, so any collapse the
+            // viewer was holding an undo entry for no longer exists; the persisted checkpoint,
+            // which is a file snapshot, does survive and is re-read here.
+            await refreshServerUndoState();
+
             // Restore display preferences (font sizes, spacing) from localStorage
             restoreDisplayPrefs();
 
@@ -2115,9 +2748,97 @@ document.addEventListener('DOMContentLoaded', async () => {
     }
 
     // --- 3. UI EVENT WIRING (SINGLETON) ---
+    // Alan 8/28/26 - Keep coarse-pointer interaction mode, sheets, expansion, and cleanup in one state boundary.
+    function setMobileInteractionMode(mode) {
+        const next = viewer?.setMobileInteractionMode(mode) || (mode === 'select' ? 'select' : 'navigate');
+        const selecting = next === 'select';
+        treeViewerPanel?.classList.toggle('mobile-select-mode', selecting);
+        btnMobileSelect?.setAttribute('aria-pressed', selecting ? 'true' : 'false');
+        if (btnMobileSelect) {
+            btnMobileSelect.querySelector('span').textContent = selecting ? 'Done' : 'Select';
+            btnMobileSelect.title = selecting ? 'Done selecting; return to Navigate mode' : 'Enter Select mode';
+        }
+        if (mobileModeStatus) {
+            mobileModeStatus.textContent = selecting
+                ? 'Select mode: tap tips or drag empty background to box-select'
+                : 'Navigate mode: drag to pan, pinch to zoom';
+        }
+    }
+
+    function setMobileMoreOpen(open) {
+        if (!mobileMore || !btnMobileMore) return;
+        mobileMore.setAttribute('aria-hidden', open ? 'false' : 'true');
+        mobileMore.classList.toggle('hidden', !open);
+        btnMobileMore.setAttribute('aria-expanded', open ? 'true' : 'false');
+        document.body.classList.toggle('tree-mobile-sheet-open', open);
+    }
+
+    function setExpandedTree(open) {
+        setMobileMoreOpen(false);
+        document.body.classList.toggle('tree-expanded', open);
+        btnMobileExpand?.setAttribute('aria-pressed', open ? 'true' : 'false');
+        if (btnMobileExpand) {
+            btnMobileExpand.querySelector('span').textContent = open ? 'Exit' : 'Expand';
+            btnMobileExpand.title = open ? 'Exit expanded tree view' : 'Expand tree';
+        }
+    }
+
+    function cleanupMobileViewerUI() {
+        setMobileMoreOpen(false);
+        setExpandedTree(false);
+        setMobileInteractionMode('navigate');
+        viewer?.closeMobileNodeActions();
+        document.body.classList.remove('tree-mobile-node-menu-open', 'mobile-show-desktop-controls');
+        const allControlsButton = getEl('btn-mobile-all-controls');
+        if (allControlsButton) allControlsButton.textContent = 'Show all advanced controls';
+    }
+
+    function wireMobileUI() {
+        document.querySelectorAll('[data-mobile-trigger]').forEach((proxy) => {
+            proxy.addEventListener('click', () => {
+                const target = getEl(proxy.dataset.mobileTrigger);
+                if (!target || target.disabled) return;
+                setMobileMoreOpen(false);
+                target.click();
+            });
+        });
+        btnMobileSelect?.addEventListener('click', () => {
+            setMobileInteractionMode(viewer?.mobileInteractionMode === 'select' ? 'navigate' : 'select');
+        });
+        btnMobileMore?.addEventListener('click', () => {
+            setMobileMoreOpen(btnMobileMore.getAttribute('aria-expanded') !== 'true');
+        });
+        getEl('btn-mobile-more-close')?.addEventListener('click', () => setMobileMoreOpen(false));
+        getEl('tree-mobile-more-backdrop')?.addEventListener('click', () => setMobileMoreOpen(false));
+        btnMobileExpand?.addEventListener('click', () => setExpandedTree(!document.body.classList.contains('tree-expanded')));
+        btnMobileNodeActions?.addEventListener('click', () => {
+            setMobileMoreOpen(false);
+            if (!viewer?.openMobileNodeActions()) {
+                showStatus('Select a tip or node first.', 'info', 1800);
+            }
+        });
+        container?.addEventListener('dikarya:mobile-target-change', (event) => {
+            if (btnMobileNodeActions) btnMobileNodeActions.disabled = !event.detail?.available;
+        });
+        getEl('btn-mobile-all-controls')?.addEventListener('click', () => {
+            const show = !document.body.classList.contains('mobile-show-desktop-controls');
+            document.body.classList.toggle('mobile-show-desktop-controls', show);
+            setMobileMoreOpen(false);
+            if (show) setExpandedTree(false);
+            const button = getEl('btn-mobile-all-controls');
+            if (button) button.textContent = show ? 'Hide all advanced controls' : 'Show all advanced controls';
+            if (show) getEl('tree-desktop-controls')?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+        });
+        window.addEventListener('pagehide', cleanupMobileViewerUI);
+        setMobileInteractionMode('navigate');
+    }
+
     function wireUI() {
         if (uiWired) return;
         uiWired = true;
+
+        // Alan 8/28/26 - Wire the mobile controls once alongside the existing singleton desktop controls.
+        wireMobileUI();
 
         // Alan 5/11/26 - Wire rename modal controls for current clicked selections.
         btnRenameModalSave?.addEventListener('click', submitRenameModal);
@@ -3047,21 +3768,35 @@ document.addEventListener('DOMContentLoaded', async () => {
             }
         });
 
+        // PNG Save
+        getEl('btn-save-png')?.addEventListener('click', async (e) => {
+            e.preventDefault();
+            if (!viewer) { showStatus("Tree not loaded yet.", "warning", 2000); return; }
+            showStatus("Preparing PNG download\u2026", "info");
+            try {
+                await viewer.exportPNG();
+                showStatus("PNG downloaded.", "success", 2500);
+            } catch (err) {
+                console.error("PNG export error:", err);
+                window.reportClientError?.('tree_viewer.export_png', err);
+                const msg = err instanceof Error ? err.message : String(err);
+                showStatus("PNG export failed: " + msg, "danger", 5000);
+            }
+        });
+
         // Tree Edit Actions (Backend)
         wireBackendActions();
     }
 
-    const triggerZoom = (delta) => {
-        const svg = container?.querySelector('svg');
-        if (!svg) return;
-        const rect = svg.getBoundingClientRect();
-        const cx = rect.left + rect.width / 2;
-        const cy = rect.top + rect.height / 2;
-        svg.dispatchEvent(new WheelEvent('wheel', {
-            clientX: cx, clientY: cy, deltaY: delta,
-            bubbles: true, cancelable: true, view: window
-        }));
-    };
+    // Alan 8/24/26 - A function declaration, not a const arrow, so it hoists: it is
+    // wired to the zoom buttons ~800 lines above this point. The body uses no `this`,
+    // so the arrow form bought nothing.
+    function triggerZoom(delta) {
+        // Alan 8/28/26 - Use the same D3 camera behavior as pinch instead of synthesizing a
+        // wheel event; reciprocal factors make one + followed by one - restore the scale.
+        const factor = delta < 0 ? 1.25 : 1 / 1.25;
+        viewer?.zoomCamera(factor);
+    }
 
     function wireBackendActions() {
         if (btnPrune) btnPrune.addEventListener('click', () => {
@@ -3069,13 +3804,30 @@ document.addEventListener('DOMContentLoaded', async () => {
             const nodes = viewer.getSelectedNodes();
             if (nodes.length === 0) return;
 
-            const names = nodes.map(n => n.data.__original_name || n.data.name);
-            const displayNames = nodes.map(n => n.data.name).join(", ");
-            // No confirmation requested
+            // Alan 8/25/26 - Resolve every selection through getPruneTargetForNode instead of
+            // reading data.name directly. getSelectedNodes() traverses the whole tree, so a
+            // selected clade arrives here as an internal node whose data.name is its RENDERED
+            // SUPPORT LABEL ("0.85"). Support lives in confidence rather than name, so the
+            // backend could never match it: the clade silently survived while the user was
+            // told a node "was not found in the tree". Internal nodes now become the same
+            // stable descendant-tip ID the context-menu prune has always sent.
+            const targets = Array.from(new Set(nodes.map(getPruneTargetForNode).filter(Boolean)));
+            // Alan 8/25/26 - Mirror the context-menu guard for selections with no stable ID.
+            if (!targets.length) {
+                showStatus("Can't prune: no stable node ID.", "warning", 2500);
+                return;
+            }
+            // Alan 8/25/26 - Clean selection colors off the pruned clades' descendant tips too,
+            // not just the targets, so a pruned clade leaves no colored orphans behind.
+            const descendantTips = nodes.reduce((names, node) => names.concat(getDescendantTipNames(node)), []);
+            const cleanupNames = Array.from(new Set([...targets, ...descendantTips]));
+            // Alan 8/25/26 - Count terminal sequences, matching the context menu. The old
+            // nodes.length undercounted a clade selection as a single node.
+            const sequenceCount = new Set(descendantTips).size || nodes.length;
 
-            runBackendAction(`Pruning ${nodes.length} nodes`, async () => {
+            runBackendAction(`Pruning ${sequenceCount} node${sequenceCount === 1 ? '' : 's'}`, async () => {
                 // Alan 5/12/26 - Prune selected names without clearing unrelated selection-set colors.
-                await pruneTaxaPreservingSelectionColors(names);
+                await pruneTaxaPreservingSelectionColors(targets, cleanupNames);
             // Alan 5/12/26 - Selection-set cleanup is handled inside pruneTaxaPreservingSelectionColors.
             }, { clearSelections: false });
         });
@@ -3161,11 +3913,25 @@ document.addEventListener('DOMContentLoaded', async () => {
         // Alan 7/20/26 - Route button clicks through the same reliable deselect action used by the D hotkey.
         if (btnDeselect) btnDeselect.addEventListener('click', deselectCurrentTreeSelection);
 
+        // Alan 8/24/26 - Toolbar Undo. Kept in sync with Ctrl/Cmd+Z through the same
+        // performUndo(), so there is one code path and one notion of what is undoable.
+        if (btnUndo) btnUndo.addEventListener('click', () => { performUndo(); });
+
         if (btnRecompute) btnRecompute.addEventListener('click', async () => {
             if (!confirm("Recompute tree?")) return;
             btnRecompute.disabled = true;
             try {
                 const result = await TreeEditActions.recomputeTree(JOB_ID);
+                // Alan 8/24/26 - Recompute is not undoable and the server drops the
+                // checkpoint the moment a run is created, so stop offering it here too
+                // rather than leaving a button that would 409 on the next click. Only
+                // for a run this click actually created: a duplicate click reports
+                // already_queued and cleared nothing server-side.
+                if (result && result.status === 'queued') {
+                    serverUndoState = null;
+                    if (viewer && typeof viewer.clearCollapseUndo === 'function') viewer.clearCollapseUndo();
+                    updateButtons();
+                }
                 showStatus(result.message || "Tree recompute queued.", "success", 2500);
                 setTimeout(() => {
                     window.location.href = result.redirect_url || `/job/${JOB_ID}`;
@@ -3242,7 +4008,35 @@ document.addEventListener('DOMContentLoaded', async () => {
 
 
 
+        // Alan 8/24/26 - A keystroke belongs to a text control, not to the tree, whenever
+        // focus is in one. This is what keeps Ctrl/Cmd+Z editing the rename field, the
+        // annotation label box or any contenteditable exactly as the browser intends.
+        const isTextEntryTarget = (target) => target instanceof HTMLElement
+            && (target.isContentEditable || ['INPUT', 'TEXTAREA', 'SELECT'].includes(target.tagName));
+        // Alan 8/30/26 - A dialog counts as open only if it is actually rendered. The mobile
+        // controls sheet carries role="dialog" on its inner panel while `hidden` lives on the
+        // wrapper, so a `:not(.hidden)` selector alone matched it on every page load and
+        // swallowed every viewer hotkey. getClientRects() is empty for anything display:none,
+        // whether that comes from the class, an ancestor, or the mobile-only media query.
+        const anyModalOpen = () => Array.prototype.some.call(
+            document.querySelectorAll('[role="dialog"][aria-modal="true"]'),
+            (el) => !el.classList.contains('hidden')
+                && !el.closest('.hidden')
+                && el.getClientRects().length > 0
+        );
+
         document.addEventListener('keydown', (e) => {
+            // Alan 8/28/26 - Escape dismisses the topmost mobile surface and restores its ARIA/body state.
+            if (e.key === 'Escape' && document.body.classList.contains('tree-mobile-node-menu-open')) {
+                viewer?.closeMobileNodeActions();
+                btnMobileMore?.focus();
+                return;
+            }
+            if (e.key === 'Escape' && mobileMore?.getAttribute('aria-hidden') === 'false') {
+                setMobileMoreOpen(false);
+                btnMobileMore?.focus();
+                return;
+            }
             // Alan 7/20/26 - Close keyboard help before handling viewer modes or other Escape behavior.
             if (e.key === 'Escape' && shortcutHelpModal && !shortcutHelpModal.classList.contains('hidden')) {
                 closeShortcutHelp();
@@ -3280,17 +4074,40 @@ document.addEventListener('DOMContentLoaded', async () => {
                 closeRenameModal();
                 return;
             }
+            // Dialogs are above expanded mode, so Escape belongs to the visible dialog first.
+            // Unknown dialogs (such as Alignment Viewer) own their own Escape listener.
+            if (e.key === 'Escape' && anyModalOpen()) return;
+            if (e.key === 'Escape' && document.body.classList.contains('tree-expanded')) {
+                setExpandedTree(false);
+                btnMobileExpand?.focus();
+                return;
+            }
             if (e.key === "Escape" && rerootMode) {
                 rerootMode = false; removeRerootCapture();
                 showStatus("Reroot cancelled.", "info", 1000); updateButtons();
                 return;
             }
 
+            // Alan 8/24/26 - Ctrl+Z / Cmd+Z is the one deliberately modified hotkey, so it is
+            // handled before the guard below rejects every modified keystroke. Shift+Ctrl+Z is
+            // left alone: it is the browser's redo, and there is no tree redo to claim it for.
+            if ((e.key === 'z' || e.key === 'Z') && (e.ctrlKey || e.metaKey)
+                && !e.altKey && !e.shiftKey && !e.repeat) {
+                // Inside a text control the browser's own undo must win, untouched.
+                if (isTextEntryTarget(e.target) || anyModalOpen()) return;
+                // Mid-edit the tree is about to be replaced; taking an undo now would
+                // race the mutation that is still running.
+                if (isProcessing) return;
+                if (!currentUndoTarget()) return;
+                e.preventDefault();
+                performUndo();
+                return;
+            }
+
             // Alan 7/20/26 - Handle safe viewer hotkeys only outside text controls, dialogs, and modified browser shortcuts.
             const target = e.target;
-            const isTyping = target instanceof HTMLElement
-                && (target.isContentEditable || ['INPUT', 'TEXTAREA', 'SELECT'].includes(target.tagName));
-            const modalOpen = Boolean(document.querySelector('[role="dialog"][aria-modal="true"]:not(.hidden)'));
+            const isTyping = isTextEntryTarget(target);
+            const modalOpen = anyModalOpen();
             if (e.repeat || e.ctrlKey || e.metaKey || e.altKey || isTyping || modalOpen) return;
 
             const key = e.key.length === 1 ? e.key.toLowerCase() : e.key;
@@ -3299,8 +4116,8 @@ document.addEventListener('DOMContentLoaded', async () => {
             if (key === 'd' && viewer && !isProcessing) {
                 deselectCurrentTreeSelection();
                 handled = true;
-            // Alan 7/20/26 - V opens the existing Alignment Viewer through its established click handler.
-            } else if (key === 'v' && viewer && btnAlignmentViewer && !btnAlignmentViewer.disabled) {
+            // Alan 8/24/26 - A opens the Alignment Viewer; V stays as the original alias.
+            } else if ((key === 'a' || key === 'v') && viewer && btnAlignmentViewer && !btnAlignmentViewer.disabled) {
                 btnAlignmentViewer.click();
                 handled = true;
             // Alan 7/20/26 - S cycles the existing original, ascending, and descending node sort modes.
@@ -3363,6 +4180,10 @@ document.addEventListener('DOMContentLoaded', async () => {
     }
 
     function updateButtons() {
+        // Alan 8/24/26 - Refreshed before the viewer guard and before every early
+        // return below, so the Undo button is correct in view-only mode, while an
+        // action is in flight, and before a tree has finished loading.
+        updateUndoButton();
         if (!viewer) return;
 
         // Multi-select check
@@ -3499,8 +4320,8 @@ document.addEventListener('DOMContentLoaded', async () => {
         btnAlignmentViewer.classList.toggle('cursor-not-allowed', disabled);
         // Alan 7/20/26 - Preserve V shortcut discoverability when the count-aware Alignment Viewer tooltip refreshes.
         btnAlignmentViewer.title = selected.length > 0
-            ? `Open Alignment Viewer for ${selected.length} selected sequence${selected.length === 1 ? '' : 's'} (V)`
-            : `Open Alignment Viewer for ${visible.length} visible sequence${visible.length === 1 ? '' : 's'} (V)`;
+            ? `Open Alignment Viewer for ${selected.length} selected sequence${selected.length === 1 ? '' : 's'} (A)`
+            : `Open Alignment Viewer for ${visible.length} visible sequence${visible.length === 1 ? '' : 's'} (A)`;
         btnAlignmentViewer.innerHTML = count > 0
             ? `<i class="fa fa-stream"></i> Alignment Viewer (${count})`
             : '<i class="fa fa-stream"></i> Alignment Viewer';

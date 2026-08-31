@@ -13,6 +13,11 @@ Dikarya is a Flask web application for fungal phylogenetic analysis. Users submi
 # Activate the virtual environment first
 source .venv/bin/activate
 
+# Tests: always invoke pytest through the project interpreter. Calling
+# .venv/bin/pytest directly can omit the repository root from sys.path and make
+# collection fail with "ModuleNotFoundError: No module named 'app'".
+.venv/bin/python -m pytest
+
 # Database migrations
 flask db migrate -m "description"
 flask db upgrade
@@ -121,20 +126,43 @@ and the aligned/trimmed FASTAs. Deliberately left plain: `input_raw.fasta`,
 normal user action (add sequences, every viewer edit, recompute).
 
 `scripts/dikarya_reclaim_job_space.py` applies all of this retroactively and
-runs weekly from `ops/cron/dikarya-reclaim-job-space`. It **must run as the
-`dikarya` user** — `var/jobs` is dikarya-owned and the `tree` user cannot write
-there, so agents cannot run it and must ask the human:
+runs weekly from `ops/cron/dikarya-reclaim-job-space`:
 
 ```bash
-sudo -u dikarya /var/www/dikarya/.venv/bin/python \
-  scripts/dikarya_reclaim_job_space.py --dry-run     # always dry-run first
-sudo -u dikarya /var/www/dikarya/.venv/bin/python \
-  scripts/dikarya_reclaim_job_space.py --apply
+.venv/bin/python scripts/dikarya_reclaim_job_space.py --dry-run   # always first
+.venv/bin/python scripts/dikarya_reclaim_job_space.py --apply
 ```
 
 Jobs touched within `--min-age-hours` (default 24) are skipped, so a live run is
 never disturbed. The passes (`scratch`, `logs`, `json`, `reports`, `alignments`)
 are independent and individually selectable with `--passes`.
+
+### Writing to var/jobs
+
+`var/jobs` is `dikarya`-owned but **group-writable**, and the `tree` account is
+in the `dikarya` group, so agents can run maintenance scripts against it
+directly. Two things make that hold:
+
+- Directories carry setgid (`chmod g+ws`), so a new job directory inherits group
+  `dikarya` rather than the creating process's primary group.
+- `dikarya-web`, `dikarya-worker` and `dikarya-metrics` run with `UMask=0002`
+  via `/etc/systemd/system/<unit>.service.d/umask.conf` (source:
+  `scripts/dikarya-umask.conf`), so the files they create are 0664 / 2775
+  instead of 0644 / 0755. Without it a chmod pass would be undone by the next
+  thing the pipeline wrote.
+
+**A session that predates the group grant will still be denied.** Supplementary
+groups are stamped at login, so an agent started from an older shell inherits
+the old set — restarting the CLI inside that shell changes nothing, it takes a
+fresh login. Check with `id` before concluding the permissions are wrong.
+
+Code that writes a job artifact atomically (mkstemp → `os.replace`) must set the
+mode explicitly, because mkstemp creates 0600. Preserve the target's existing
+mode when it has one and fall back to `default_file_mode()` from
+`app/services/artifact_storage.py` when it does not — never a hardcoded 0644.
+`tree_state.json` is the cautionary tale: its creation path hardcoded 0644 and
+every later save *preserved* that, so the one file every viewer edit rewrites
+stayed group-unwritable in a job directory where everything else was 0664.
 
 ## Restarting Dikarya services
 
@@ -155,6 +183,33 @@ sudo /usr/local/sbin/restart-dikarya-web
 Run this after changes that affect the web application runtime, routes, views/templates, Python application code, configuration read by the web process, dependencies, or other behavior served by the Dikarya web app.
 
 Use the worker or metrics restart wrappers only when the change affects those specific background services.
+
+### Always check the restart wrapper's exit code
+
+`restart-dikarya-web` does not just restart the unit — it then polls
+`http://127.0.0.1:8000/health` until the app actually serves, and **exits
+non-zero if it does not**. That check exists because `systemctl restart` returns
+when *systemd* is satisfied, which is not the same as Dikarya being able to
+answer a request: Gunicorn does not import the application until traffic
+arrives, so a module that fails to import survives a "successful" restart (this
+is the 2026-08-14 incident described below). The wrapper's curl forces that
+first import while you are still watching.
+
+A non-zero exit means **the site may be down right now**. Do not move on, and do
+not simply re-run it:
+
+| Exit | Meaning | What to do |
+|---|---|---|
+| 0 | Restarted and healthy | Continue. |
+| 64 | Arguments were passed | The wrapper takes none, by design. |
+| 69 | Restarted but never became healthy | **The site is down.** Read the journal lines the wrapper printed, then `sudo /usr/local/sbin/dikarya-journal web 200`. Usually an import error or a bad config value — fix it and restart again. |
+| 70 | `systemctl restart` itself failed | Check whether you ran it under `sudo`. |
+| 75 | Serving, but `/health` reports 503 | The restart worked and the code imported; a dependency (database, filesystem) is unhealthy. Restarting again will not fix it. |
+| 77 | Not run as root | Re-run as `sudo /usr/local/sbin/restart-dikarya-web`. |
+
+Do not mask the exit code — no `|| true`, and if you pipe the output, keep
+stderr and check `${PIPESTATUS[0]}`.
+
 
 ### Run the preflight import check before any restart
 
@@ -241,6 +296,25 @@ The tree viewer's **Analyze with Claude** button posts to
   `summarize_alignment()` / `summarize_tree()` and only that summary is sent.
   This is what keeps the call fast and the numbers correct — do not "simplify"
   it by pasting FASTA into the prompt.
+
+  The one sanctioned exception is `build_alignment_excerpt()`: at most two
+  windows of at most `EXCERPT_MAX_COLUMNS` columns, cut around the largest
+  interior gap of the most internally gapped rows, with a few clean neighbours
+  beside them. It exists because no statistic separates a real indel from a row
+  that has slipped out of register, and the fix differs. It is bounded on
+  purpose and the prompt forbids counting anything from it — widening it into
+  "just send the whole alignment" is the change this rule is here to prevent.
+- **The review sees more than statistics now, and each extra block has a rule
+  attached.** `tree.clade_structure` is the only thing that says which tips
+  group together (strongly supported clades, outermost first, with a
+  shape-only fallback that must never be described as supported), and
+  `provenance` carries each sequence's origin from
+  `input_info.json["sequence_metadata"]` — including the `identity` of the
+  search that retrieved a reference, which is **not** a distance on this
+  alignment. Taxon labels there are unverified: the reviewer may report that
+  the labels and the tree disagree, never resolve which is right. If you change
+  what these blocks contain, change the matching section of `SYSTEM_PROMPT`
+  in the same edit.
 - **Support classification must stay in step with the viewer.**
   `_classify_support()` mirrors `window.classifySupportType()` in
   `tree_viewer_phylotree_v2.js`. Change one and you must change the other, or
@@ -286,6 +360,28 @@ The tree viewer's **Analyze with Claude** button posts to
 
 ## Key Conventions & UI Patterns
 
+### Updating the browser iNaturalist Observation Finder
+
+The browser port is rendered by `app/templates/inat_finder.html`; its vanilla
+JavaScript lives in `app/static/js/inat_finder.js`. The upstream CLI is
+`https://github.com/AlanRockefeller/inat.finder.py` and evolves independently.
+When a new CLI version is published:
+
+1. Compare the released CLI source, changelog, and tests with the browser port.
+   Port the behavior intentionally rather than copying Python request/UI code.
+2. Preserve the browser security boundary: requests go directly from the browser
+   to `https://api.inaturalist.org/v1`; Flask must not proxy or store searches.
+3. Keep API-derived DOM content on `textContent`/`createElement` paths, and retain
+   cancellation, request timeouts, retry delays, progress, dark mode, and mobile
+   behavior when changing the search flow.
+4. Update the version credited in the page footer only after the matching browser
+   behavior has been implemented and checked. Update the focused Node coverage in
+   `tests/js/inat_finder_variation_limit.test.js` for changed parsing, matching,
+   variation, or request behavior.
+5. Run `.venv/bin/python -m pytest tests/test_inat_finder.py`, run
+   `node --check app/static/js/inat_finder.js`, and spot-check the affected modes
+   against live iNaturalist API responses before deploying.
+
 - Flask app factory in `app/__init__.py`; extensions initialized in `app/extensions.py`.
 - All API responses use JSON; the frontend is a SPA-style UI talking to `/api/` endpoints.
 - FASTA sequence headers are sanitized on input and restored on download/display (see `fasta_utils.py`).
@@ -311,6 +407,15 @@ The tree viewer's **Analyze with Claude** button posts to
   stricter than Newick alone needs and deliberately so: the same helper backs
   `restore_tree_names()`, which also rewrites NEXUS files, where `-` and `=`
   are punctuation and a bare `_` reads as a space.
+- **Any file a tree edit writes must be listed in `SNAPSHOT_PATHS`** in
+  `app/services/tree_undo_service.py`. Undo restores a snapshot of
+  `tree_state.json` and `tree/tree_pruned.{newick,nexus}` taken before the edit;
+  a fourth file left out of that list would be half-undone. Conversely, a NEW
+  endpoint that writes tree state but is not undoable must call
+  `clear_undo_checkpoint()`, or a later Undo silently reverts it. See the
+  "Single-level undo of a tree edit" section of `ARCHITECTURE.md`.
+- Collapsing a clade in the viewer is display state only (phylotree's transient
+  `node.collapsed`). It must never prune, persist, or trigger a recompute.
 - Use existing Tailwind utility style patterns from `templates/sequence_entry.html` and `templates/partials/*.html`.
 - Reuse modal structure from `templates/partials/add_sequences_modal.html`.
 - Support dark mode (`dark:*` classes) for all new UI.
@@ -500,8 +605,9 @@ logrotate in `app/services/log_rotation.py` can truncate it.
   same pattern as `dikarya-journal`, e.g. `/usr/local/sbin/dikarya-pyspy <pid>`,
   validating the PID argument rather than forwarding it blindly.
 
-  Gunicorn runs `--workers 4 --threads 2`, so only **8 requests can be in flight at
-  once**. A hang where workers are alive but idle (low CPU, few established sockets
+  Gunicorn runs `--workers 4 --threads 8` (verified against
+  `/etc/systemd/system/dikarya-web.service` on 2026-08-24; this file previously
+  said `--threads 2`), so **32 requests can be in flight at once**. A hang where workers are alive but idle (low CPU, few established sockets
   on `:8000`) means those slots are held by handlers that are sleeping rather than
   working — dump the threads to find which handler. Long-lived streaming endpoints
   such as `/api/job/<id>/events` (SSE) are the usual suspects.

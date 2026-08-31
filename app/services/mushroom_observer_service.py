@@ -26,9 +26,10 @@ MO_COMMENT_SUMMARY = "Phylogenetic tree"
 class MushroomObserverError(Exception):
     """User-facing Mushroom Observer error with an HTTP status."""
 
-    def __init__(self, message: str, status: int = 400):
+    def __init__(self, message: str, status: int = 400, details: Optional[Dict[str, Any]] = None):
         super().__init__(message)
         self.status = status
+        self.details = details
 
 
 def parse_mushroom_observer_input(raw_input: str) -> int:
@@ -169,12 +170,115 @@ def _api_request(table: str, *, params: Optional[Dict[str, Any]] = None,
     return payload
 
 
+# Mushroom Observer observation numbers are six digits as of 2026; iNaturalist
+# is up to nine. So a nine-digit "MO number" that Mushroom Observer does not
+# have is almost always an iNaturalist observation pasted into the wrong box —
+# see _inaturalist_misplaced_error().
+INAT_LIKE_MIN_OBSERVATION_ID = 100_000_000
+
+
+def _looks_like_inaturalist_observation_id(observation_id: int) -> bool:
+    return int(observation_id) >= INAT_LIKE_MIN_OBSERVATION_ID
+
+
+def _is_not_found_error(exc: MushroomObserverError) -> bool:
+    """True when Mushroom Observer said the observation does not exist.
+
+    A deleted or never-existent observation comes back as a 404 from some code
+    paths and as an `errors` payload (mapped to 502) from the API2 parser, so
+    both shapes have to count.
+    """
+    if getattr(exc, "status", 0) == 404:
+        return True
+    text = str(exc).lower()
+    return "does not exist" in text or "not found" in text
+
+
+def _inaturalist_observation_summary(observation_id: int) -> Optional[Dict[str, Any]]:
+    """Return a short description of an iNaturalist observation, or None."""
+    try:
+        from app.services.inaturalist_tree_service import fetch_observation as fetch_inat
+
+        observation = fetch_inat(int(observation_id))
+    except Exception as exc:  # any failure just means "no hint to offer"
+        logger.info(
+            "iNaturalist fallback lookup failed for id=%s: %s", observation_id, exc
+        )
+        return None
+    if not isinstance(observation, dict):
+        return None
+    taxon = observation.get("taxon") or {}
+    user = observation.get("user") or {}
+    return {
+        "observation_id": int(observation_id),
+        "url": f"https://www.inaturalist.org/observations/{int(observation_id)}",
+        "consensus_name": _clean_text(taxon.get("name"), 300),
+        "common_name": _clean_text(taxon.get("preferred_common_name"), 300),
+        "rank": _clean_text(taxon.get("rank"), 50),
+        "quality_grade": _clean_text(observation.get("quality_grade"), 50),
+        "observed_on": _clean_text(
+            observation.get("observed_on") or observation.get("observed_on_string"), 100
+        ),
+        "place_guess": _clean_text(observation.get("place_guess"), 300),
+        "user_login": _clean_text(user.get("login"), 100),
+    }
+
+
+def _inaturalist_misplaced_error(observation_id: int) -> Optional[MushroomObserverError]:
+    """Build the "that is an iNaturalist observation" error, if it is one."""
+    if not _looks_like_inaturalist_observation_id(observation_id):
+        return None
+    summary = _inaturalist_observation_summary(observation_id)
+    if not summary:
+        return None
+
+    name = summary["consensus_name"] or "no identification yet"
+    if summary["common_name"]:
+        name = f"{name} ({summary['common_name']})"
+    bits = []
+    if summary["user_login"]:
+        bits.append(f"observed by {summary['user_login']}")
+    if summary["observed_on"]:
+        bits.append(f"on {summary['observed_on']}")
+    if summary["place_guess"]:
+        bits.append(f"in {summary['place_guess']}")
+    if summary["quality_grade"]:
+        bits.append(f"({summary['quality_grade'].replace('_', ' ')} grade)")
+    detail = f" \u2014 {' '.join(bits)}" if bits else ""
+
+    error = MushroomObserverError(
+        f"Observation {int(observation_id)} does not exist on Mushroom Observer, "
+        f"but it is an iNaturalist observation: {name}{detail}. "
+        "Enter it in the iNaturalist box instead of the Mushroom Observer box.",
+        status=404,
+    )
+    error.details = {"inaturalist_observation": summary}
+    return error
+
+
 def fetch_observation(observation_id: int) -> Dict[str, Any]:
-    payload = _api_request("observations", params={
-        "id": int(observation_id), "detail": "high", "format": "json"
-    })
+    try:
+        payload = _api_request("observations", params={
+            "id": int(observation_id), "detail": "high", "format": "json"
+        })
+    except MushroomObserverError as exc:
+        if _is_not_found_error(exc):
+            misplaced = _inaturalist_misplaced_error(observation_id)
+            if misplaced is not None:
+                raise misplaced from exc
+            # The API2 parser reports a deleted/never-existent observation as an
+            # `errors` payload, which _api_request maps to 502. That is a
+            # not-found, not an integration fault.
+            raise MushroomObserverError(
+                f"Mushroom Observer observation {int(observation_id)} was not found.",
+                status=404,
+            ) from exc
+        raise
     results = payload.get("results") or []
     if not results:
+        misplaced = _inaturalist_misplaced_error(observation_id)
+        if misplaced is not None:
+            raise misplaced
         raise MushroomObserverError(
             f"Mushroom Observer observation {int(observation_id)} was not found.", status=404
         )
@@ -249,14 +353,69 @@ def _location_name(observation: Dict[str, Any]) -> str:
     return _clean_text((observation.get("location") or {}).get("name"), 300)
 
 
+# Country spellings collapsed so a tip label stays short and matches the ones
+# the iNaturalist importer writes.
+_US_COUNTRY_NAMES = {
+    "united states", "united states of america", "usa", "u.s.a.", "u.s.",
+}
+# "near 8537 Nussbaumen" -> "Nussbaumen": Mushroom Observer localities often
+# carry an approximation marker and a postal code that mean nothing on a tree.
+_LOCALITY_NOISE_RE = re.compile(r"^(?:near|nr\.?)\s+|^[0-9][0-9A-Za-z-]*\s+",
+                                re.IGNORECASE)
+
+
+def _normalize_country(piece: str) -> str:
+    cleaned = _clean_text(piece, 60)
+    if cleaned.casefold() in _US_COUNTRY_NAMES:
+        return "US"
+    return cleaned
+
+
+def _clean_locality(piece: str) -> str:
+    cleaned = _clean_text(piece, 120)
+    previous = None
+    while cleaned != previous:
+        previous = cleaned
+        cleaned = _LOCALITY_NOISE_RE.sub("", cleaned).strip()
+    return cleaned or _clean_text(piece, 120)
+
+
 def _compact_location(observation: Dict[str, Any]) -> str:
+    """Compact a Mushroom Observer location into a tip label.
+
+    MO writes locations in postal order, most specific first:
+    "Mount Leconte, Great Smoky Mountains National Park, Sevier Co., Tennessee,
+    USA". Taking the last two components kept the country and threw the county
+    away, so every US observation collapsed to "<State> USA" -- MO hands us the
+    county and we were discarding it. Split the country off first, then take
+    two components from what is left:
+
+        Sevier Co., Tennessee, USA        -> Sevier Co. Tennessee US
+        Aullwood ..., Englewood, Ohio, US -> Englewood Ohio US
+        near 8537 Nussbaumen, Switzerland -> Nussbaumen Switzerland
+    """
     raw = _location_name(observation)
     if not raw:
         return ""
     parts = [part.strip() for part in raw.split(",") if part.strip()]
-    if len(parts) >= 2:
-        return _clean_text(" ".join(parts[-2:]), 120)
-    return _clean_text(parts[0], 120)
+    if not parts:
+        return ""
+
+    country = _normalize_country(parts[-1])
+    # A lone component is a country only when it reads like one; otherwise it
+    # is the locality and there is no country to split off.
+    if len(parts) == 1 and country == parts[0]:
+        country = ""
+    rest = parts[:-1] if country else parts
+    if not rest:
+        return _clean_text(country, 120)
+
+    tail = rest[-2:]
+    # The last remaining component is the state/region; the one before it is
+    # the county or town, and only that one carries the observer's noise.
+    tail[0] = _clean_locality(tail[0])
+    tail = [part for part in tail if part]
+    return _clean_text(" ".join(tail + ([country] if country else [])), 120)
 
 
 def _sequence_candidate(record: Dict[str, Any], observation_id: int) -> Optional[Dict[str, Any]]:
@@ -385,9 +544,11 @@ def build_queue_sequence(raw_input: str, sequence_id: Any) -> Dict[str, Any]:
     analysis, candidate = _selected_candidate(raw_input, sequence_id)
     observation = analysis["observation"]
     location = _compact_location({"location": {"name": observation.get("location")}})
+    # The observation number alone. The species and then the location are
+    # appended when the FASTA header is built, so a tip reads
+    # "MO490001 Gymnopilus Alachua Co. Florida US" rather than burying the
+    # species behind the place.
     name = f"MO{observation['id']}"
-    if location:
-        name = f"{name} {location}"
     return {
         "name": name,
         "organism": observation.get("consensus_name") or "",
@@ -537,6 +698,7 @@ def _creation_wait_details(created: Dict[str, Any], *, title: str,
         "auto_created": True,
         "creation_pending": pending,
         "creation_discovery_attempt": 0,
+        "creation_discovery_elapsed_seconds": 0,
         "created_title": title,
         "created_blast_id": None if pending else str(created.get("blast_id") or ""),
         "created_mycomap_url": "" if pending else str(created.get("url") or ""),
@@ -634,7 +796,8 @@ def _ensure_source_sequence(sequences: List[Dict[str, Any]], preparation: Dict[s
 
 def prepare_tree_job(preparation: Dict[str, Any], *, defer_after_ncbi_rerun: bool = False,
                      skip_mycomap_refresh: bool = False,
-                     mycomap_rerun_details: Optional[Dict[str, Any]] = None
+                     mycomap_rerun_details: Optional[Dict[str, Any]] = None,
+                     progress=None
                      ) -> Dict[str, Any]:
     from app.api.routes import gather_mycomap_sequences_for_queue
     from app.services.inaturalist_tree_service import (
@@ -646,11 +809,11 @@ def prepare_tree_job(preparation: Dict[str, Any], *, defer_after_ncbi_rerun: boo
         _refresh_mycomap_blast_results,
     )
     from app.services.mycomap_service import (
+        advance_mycomap_creation_discovery,
         MycoMapCreateError,
         MycoMapRerunError,
         create_mycomap_blast,
         find_mycomap_blast_by_title,
-        get_mycomap_creation_discovery_max_attempts,
         get_mycomap_creation_discovery_max_seconds,
         validate_mycomap_url,
         validate_mycomap_rerun_limit,
@@ -687,8 +850,8 @@ def prepare_tree_job(preparation: Dict[str, Any], *, defer_after_ncbi_rerun: boo
         discovery_warnings.extend(lookup_warnings)
         discovery_warnings = list(dict.fromkeys(discovery_warnings))
         if not found:
-            attempt = int(details.get("creation_discovery_attempt") or 0) + 1
-            if attempt >= get_mycomap_creation_discovery_max_attempts():
+            details, expired = advance_mycomap_creation_discovery(details)
+            if expired:
                 raise MushroomObserverError(
                     _mycomap_creation_discovery_message(
                         get_mycomap_creation_discovery_max_seconds(),
@@ -696,7 +859,6 @@ def prepare_tree_job(preparation: Dict[str, Any], *, defer_after_ncbi_rerun: boo
                     ),
                     status=504,
                 )
-            details["creation_discovery_attempt"] = attempt
             if discovery_warnings:
                 details["creation_discovery_warnings"] = discovery_warnings
             return {
@@ -726,6 +888,7 @@ def prepare_tree_job(preparation: Dict[str, Any], *, defer_after_ncbi_rerun: boo
                     rebuild_ncbi_blast=bool(preparation.get("rebuild_ncbi_blast")),
                     mycomap_local_limit=local_limit,
                     mycomap_ncbi_limit=ncbi_limit,
+                    progress=progress,
                 )
             except MycoMapRerunError as exc:
                 raise MushroomObserverError(str(exc), status=502)

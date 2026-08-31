@@ -159,7 +159,7 @@ def background_job_context(job_id_arg=None, *, pipeline_log=False):
                         log_path.parent.mkdir(parents=True, exist_ok=True)
                         handler = logging.FileHandler(log_path)
                         handler.addFilter(JobContextFilter(app_job))
-                        handler.setFormatter(logging.Formatter(
+                        handler.setFormatter(utc_formatter(
                             "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
                         ))
                         logging.getLogger().addHandler(handler)
@@ -221,8 +221,31 @@ def install_record_factory():
     _FACTORY_INSTALLED = True
 
 
+# Every timestamp Dikarya writes into a log file is UTC, explicitly.
+#
+# logging.Formatter defaults its converter to time.localtime, while
+# scripts/dikarya_log_digest.py reads a timestamp with no offset as UTC -- the
+# convention its own window arithmetic uses. On a server whose TZ is not UTC
+# those two beliefs differ by the offset, which silently shifts every "is this
+# job stale?" and "is this record in the review window?" decision. These logs
+# are machine-consumed, so the fix is to make the emitted convention match the
+# one the reader documents rather than to teach the reader about local time.
+# User-facing date rendering elsewhere is deliberately untouched.
+_UTC_LOG_CONVERTER = time.gmtime
+
+
+def utc_formatter(fmt: str, datefmt=None) -> logging.Formatter:
+    """A plain logging.Formatter that renders %(asctime)s in UTC."""
+    formatter = logging.Formatter(fmt, datefmt)
+    formatter.converter = _UTC_LOG_CONVERTER
+    return formatter
+
+
 class ContextFormatter(logging.Formatter):
     """Append correlation fields to the first line, before any traceback."""
+
+    converter = _UTC_LOG_CONVERTER
+
     def format(self, record):
         base = super().format(record)
         values = {key: getattr(record, key, _UNSET) for key in (

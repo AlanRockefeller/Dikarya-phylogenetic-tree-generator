@@ -45,7 +45,7 @@ logger = logging.getLogger(__name__)
 
 # Bump when the prompt or the metric set changes in a way that would make a
 # stored review misleading. Cached reviews with a different version are ignored.
-REVIEW_SCHEMA_VERSION = 4
+REVIEW_SCHEMA_VERSION = 5
 
 CACHE_RELATIVE_PATH = Path("analysis") / "claude_review.json"
 
@@ -80,6 +80,49 @@ NEAR_ZERO_BRANCH_LENGTH = 1e-6
 # How many worst-offender rows to name. Long enough to see a pattern, short
 # enough that the prompt stays compact on a 2000-tip tree.
 TOP_N = 12
+
+# --- Topology digest ---------------------------------------------------------
+# Every other metric here describes the tree in aggregate. None of them say
+# which tips group with which, which is the one thing a user opens the viewer
+# to find out, so the review could report that a tree was well supported
+# without ever being able to say what it supported. The digest is a bounded
+# answer to that: the maximal well-supported clades and their members.
+MAX_CLADE_GROUPS = 20
+CLADE_TIP_LIMIT = 8
+# Ceiling on how many times an oversized group may be reopened. A chain of
+# nested strong clades is descended one level per attempt, and each attempt
+# rescans that subtree, so an unbounded descent down a 2000-deep caterpillar
+# tree would be quadratic work inside a Gunicorn request slot.
+MAX_CLADE_REOPEN_ATTEMPTS = 200
+# A taxon label scattered across more groups than this is not a polyphyly
+# finding, it is a label being used loosely across the whole tree.
+MAX_SPLIT_LABELS = 8
+
+# --- Alignment excerpt -------------------------------------------------------
+# The one place actual residues are sent. No summary statistic can separate a
+# real indel from a misalignment -- internal_gap_percent says a row has interior
+# gaps, not whether they sit where a biologist would expect -- so the worst
+# offenders get a narrow window of the alignment around their largest gap, with
+# well-behaved neighbours beside them for contrast. Deliberately tiny: a couple
+# of windows of a few hundred columns, never the alignment.
+EXCERPT_MAX_WINDOWS = 2
+EXCERPT_MAX_COLUMNS = 160
+EXCERPT_FLANK_COLUMNS = 40
+EXCERPT_MAX_ROWS = 8
+EXCERPT_CONTRAST_ROWS = 3
+# Two windows landing on the same region of the alignment say the same thing
+# twice; the second is dropped once this much of it is already covered.
+EXCERPT_OVERLAP_REJECT = 0.5
+
+# --- Provenance --------------------------------------------------------------
+# Fields copied from input_info.json["sequence_metadata"] onto a flagged row.
+# `identity` and `query_cover` are the submitted sequence's BLAST metrics
+# against the record it pulled in, and are published only where the entry says
+# they were actually computed.
+_PROVENANCE_FIELDS = ("source", "hit_source", "accession", "taxon", "location")
+_PROVENANCE_BLAST_FIELDS = ("identity", "query_cover", "subject_cover")
+# Below this a reference is far enough from the query set to be worth naming.
+LOW_REFERENCE_IDENTITY_PERCENT = 90.0
 
 
 class TreeAnalysisError(Exception):
@@ -303,6 +346,181 @@ def _scaled_to_full_alignment(
     if not scored or not n_columns:
         return None
     return int(round(sample_count * (n_columns / scored)))
+
+
+def _largest_internal_gap_run(sequence: str) -> Optional[Tuple[int, int]]:
+    """Half-open bounds of the longest run of gaps inside a row's own residues.
+
+    Terminal padding is excluded deliberately: a barcode padded at both ends is
+    missing data, and a window centred on that padding shows the model a column
+    of nothing. Only gaps between the sequence's own first and last residue can
+    be an indel or a misalignment, and those are the ones worth looking at.
+    """
+    leading = len(sequence) - len(sequence.lstrip(_GAP_STRING))
+    if leading >= len(sequence):
+        return None
+    trailing = len(sequence) - len(sequence.rstrip(_GAP_STRING))
+    end = len(sequence) - trailing
+
+    best: Optional[Tuple[int, int]] = None
+    best_length = 0
+    run_start: Optional[int] = None
+    for index in range(leading, end):
+        if sequence[index] in GAP_CHARS:
+            if run_start is None:
+                run_start = index
+        elif run_start is not None:
+            if index - run_start > best_length:
+                best_length = index - run_start
+                best = (run_start, index)
+            run_start = None
+    if run_start is not None and end - run_start > best_length:
+        best = (run_start, end)
+    return best
+
+
+def _excerpt_window(
+    gap_run: Tuple[int, int], n_columns: int
+) -> Tuple[int, int]:
+    """A bounded window of columns around one gap run.
+
+    Padded on both sides so the model sees the residues the gap interrupts --
+    a gap shown on its own is uninterpretable -- and capped so a single
+    thousand-column deletion cannot pull the whole alignment into the prompt.
+    """
+    start = max(0, gap_run[0] - EXCERPT_FLANK_COLUMNS)
+    end = min(n_columns, gap_run[1] + EXCERPT_FLANK_COLUMNS)
+    if end - start > EXCERPT_MAX_COLUMNS:
+        # Keep the start of the run in view rather than a slice of its middle:
+        # where a gap opens is what says whether it is an indel or a row that
+        # slipped out of register.
+        end = start + EXCERPT_MAX_COLUMNS
+    return start, end
+
+
+def _window_occupancy(sequence: str, start: int, end: int) -> float:
+    """Fraction of a window a row actually holds residues in."""
+    window = sequence[start:end]
+    if not window:
+        return 0.0
+    return len(_strip_gaps(window)) / float(end - start)
+
+
+def build_alignment_excerpt(
+    records: List[Tuple[str, str]], per_sequence_rows: List[Dict[str, Any]]
+) -> List[Dict[str, Any]]:
+    """Narrow windows of real residues around the worst interior gaps.
+
+    Everything else this module sends is a precomputed number, for the reasons
+    in the module docstring. This is the one exception, and it is narrow on
+    purpose. `internal_gap_percent` can tell the reviewer that a row carries
+    interior gaps; nothing computable here can tell it whether those gaps fall
+    at a plausible indel or whether the row has simply slipped out of register
+    against its neighbours, and those two findings call for different advice.
+    Seeing forty columns either side of the gap settles it.
+
+    At most EXCERPT_MAX_WINDOWS windows of at most EXCERPT_MAX_COLUMNS columns,
+    each carrying the offending row plus a few well-occupied neighbours for
+    contrast -- a few kB, not a FASTA.
+    """
+    if not records:
+        return []
+    n_columns = max((len(seq) for _, seq in records), default=0)
+    if not n_columns:
+        return []
+
+    candidates = sorted(
+        (
+            row for row in per_sequence_rows
+            if row.get("internal_gap_percent", 0.0)
+            >= NOTEWORTHY_INTERNAL_GAP_PERCENT
+        ),
+        key=lambda row: row["internal_gap_percent"],
+        reverse=True,
+    )
+    if not candidates:
+        return []
+
+    sequences = {_normalize_name(header): seq for header, seq in records}
+    # Contrast rows are chosen once, from the cleanest interiors: a window
+    # showing only gappy rows cannot show that a gap is out of register.
+    cleanest = sorted(
+        per_sequence_rows, key=lambda row: row.get("internal_gap_percent", 0.0)
+    )
+
+    excerpts: List[Dict[str, Any]] = []
+    covered: List[Tuple[int, int]] = []
+    for candidate in candidates:
+        if len(excerpts) >= EXCERPT_MAX_WINDOWS:
+            break
+        key = _normalize_name(candidate["name"])
+        sequence = sequences.get(key)
+        if not sequence:
+            continue
+        gap_run = _largest_internal_gap_run(sequence)
+        if gap_run is None:
+            continue
+        start, end = _excerpt_window(gap_run, n_columns)
+        span = end - start
+        if span <= 0:
+            continue
+        if any(
+            max(0, min(end, done_end) - max(start, done_start))
+            > EXCERPT_OVERLAP_REJECT * span
+            for done_start, done_end in covered
+        ):
+            continue
+
+        rows: List[Dict[str, Any]] = [{
+            "name": candidate["name"],
+            "role": "flagged",
+            "internal_gap_percent": candidate.get("internal_gap_percent"),
+            "residues": sequence[start:end],
+        }]
+        for other in cleanest:
+            if len(rows) >= min(EXCERPT_MAX_ROWS, 1 + EXCERPT_CONTRAST_ROWS):
+                break
+            other_key = _normalize_name(other["name"])
+            if other_key == key:
+                continue
+            other_sequence = sequences.get(other_key)
+            if not other_sequence:
+                continue
+            # A neighbour that is itself mostly padding here shows nothing.
+            if _window_occupancy(other_sequence, start, end) < 0.5:
+                continue
+            rows.append({
+                "name": other["name"],
+                "role": "contrast",
+                "internal_gap_percent": other.get("internal_gap_percent"),
+                "residues": other_sequence[start:end],
+            })
+        if len(rows) < 2:
+            # One row in isolation says nothing about register.
+            continue
+
+        covered.append((start, end))
+        excerpts.append({
+            "flagged_sequence": candidate["name"],
+            "first_column": start + 1,
+            "last_column": end,
+            "columns_shown": span,
+            "columns_in_alignment": n_columns,
+            "largest_internal_gap_columns": gap_run[1] - gap_run[0],
+            "rows": rows,
+        })
+    for excerpt in excerpts:
+        excerpt["reading_note"] = (
+            "Columns are 1-based positions in the current alignment. The "
+            "`flagged` row is one of the most internally gapped sequences; "
+            "the `contrast` rows are among the least internally gapped and "
+            "are shown so the flagged row can be read against its "
+            "neighbours. This window is a fragment of the alignment chosen "
+            "around one gap, so nothing may be counted or generalised from "
+            "it -- use it only to judge whether that gap looks like an "
+            "indel or like a row out of register."
+        )
+    return excerpts
 
 
 def summarize_alignment(
@@ -832,6 +1050,213 @@ def _support_partition(
     return partition
 
 
+def _tip_names_by_clade(tree) -> Dict[int, List[str]]:
+    """Tip names under every clade, in a single post-order pass.
+
+    `clade.get_terminals()` per node is O(tips) each, which on a 2000-tip tree
+    is four million operations inside a Gunicorn request slot. Level order
+    reversed visits every child before its parent, so each clade only has to
+    concatenate what its children already produced.
+    """
+    names: Dict[int, List[str]] = {}
+    for clade in reversed(list(tree.find_clades(order="level"))):
+        if clade.is_terminal():
+            names[id(clade)] = [str(clade.name or "")]
+            continue
+        collected: List[str] = []
+        for child in clade.clades:
+            collected.extend(names.get(id(child), ()))
+        names[id(clade)] = collected
+    return names
+
+
+def _is_strongly_supported(
+    value: Optional[float],
+    dual: Optional[Tuple[float, float]],
+    strong_threshold: Optional[float],
+) -> bool:
+    """Whether one node clears the conventional bar for its own support scale.
+
+    A dual SH-aLRT/UFBoot label must clear both halves, exactly as
+    `_dual_strong_count` requires: thresholding the scalar alone would call a
+    node at SH-aLRT 20 / UFBoot 99 well supported.
+    """
+    if dual is not None:
+        return dual[0] >= DUAL_ALRT_STRONG and dual[1] >= DUAL_UFBOOT_STRONG
+    if strong_threshold is None or value is None:
+        return False
+    return value >= strong_threshold
+
+
+def _clade_entry(
+    index: int, clade, tip_names: List[str], basis: str
+) -> Dict[str, Any]:
+    """One group in the topology digest."""
+    value, dual = _clade_support(clade)
+    entry: Dict[str, Any] = {
+        "id": f"C{index}",
+        "tips": len(tip_names),
+        "tip_names": tip_names[:CLADE_TIP_LIMIT],
+        "tip_names_truncated": len(tip_names) > CLADE_TIP_LIMIT,
+        "basis": basis,
+    }
+    if value is not None:
+        entry["support"] = value
+    if dual is not None:
+        entry["dual_support_alrt_ufboot"] = [dual[0], dual[1]]
+    if clade.branch_length is not None:
+        entry["subtending_branch_length"] = _round_metric(float(clade.branch_length))
+    return entry
+
+
+def _maximal_strong_clades(
+    roots: Sequence[Any], strong_threshold: Optional[float]
+) -> List[Any]:
+    """Strongly supported clades below `roots` that no such clade contains.
+
+    Descends only through nodes that fail the support test, so the first
+    strongly supported node on each path is taken and its strongly supported
+    descendants are not: nested groups would repeat the same membership at
+    every depth and say nothing the outermost one does not.
+    """
+    found: List[Any] = []
+    queue = list(roots)
+    while queue:
+        clade = queue.pop()
+        if clade.is_terminal():
+            continue
+        value, dual = _clade_support(clade)
+        if _is_strongly_supported(value, dual, strong_threshold):
+            found.append(clade)
+            continue
+        queue.extend(clade.clades)
+    return found
+
+
+def _topology_digest(
+    tree, tip_names_by_id: Dict[int, List[str]], strong_threshold: Optional[float]
+) -> Dict[str, Any]:
+    """Which tips group with which, as a bounded list of groups.
+
+    Preferred basis is support: strongly supported clades, taken outermost
+    first so no group is contained in another. Nested strong clades would
+    repeat the same membership at every depth and blow the prompt out on a
+    large tree, while the outermost ones partition the tips into the groups the
+    support justifies and leave the rest explicitly unplaced.
+
+    Taking ONLY the outermost ones is not enough on its own. A tree whose
+    deepest split is strongly supported has exactly one maximal strong clade
+    holding almost every tip, which is true and useless -- a 2409-tip tree in
+    the job archive reduced to two groups, one of 2300 tips. So an oversized
+    group is reopened and replaced by the strongly supported clades inside it,
+    largest first, until the digest is either informative or genuinely cannot
+    be subdivided any further. Everything stays support-based; reopening a
+    group can leave some of its tips in none of the replacements, and those
+    become unplaced, which is the honest description of them.
+
+    A tree with no support values, or none that clear the bar, still has a
+    topology worth describing, so it falls back to splitting the largest group
+    repeatedly from the root. That basis is reported, because a group held
+    together by nothing but the shape of the file is not a finding.
+    """
+    root = tree.root
+    all_tips = tip_names_by_id.get(id(root), [])
+
+    def size(clade) -> int:
+        return len(tip_names_by_id.get(id(clade), []))
+
+    basis = "strong_support"
+    groups = _maximal_strong_clades(root.clades, strong_threshold)
+    supported_total = len(groups)
+
+    if groups:
+        # Reopening is a repair for a degenerate digest, not a general
+        # refinement, so the bar is deliberately high: a group has to hold more
+        # than half the tree before it counts as describing the whole tree
+        # rather than a part of it. Reopening always costs coverage -- tips of
+        # the old group that sit in no supported subclade become unplaced -- and
+        # at a lower bar that trade is a bad one. A 324-tip job in the archive
+        # went from 11 groups leaving 52 tips unplaced to 20 groups leaving 116,
+        # which is more groups and less information. The second floor leaves
+        # small trees alone entirely, where any group is a large share of a
+        # small total.
+        oversized = max(MAX_CLADE_GROUPS, len(all_tips) // 2)
+        settled: List[Any] = []
+        attempts = 0
+        while (
+            len(groups) + len(settled) < MAX_CLADE_GROUPS
+            and attempts < MAX_CLADE_REOPEN_ATTEMPTS
+        ):
+            candidates = [c for c in groups if size(c) > oversized]
+            if not candidates:
+                break
+            largest = max(candidates, key=size)
+            attempts += 1
+            inner = _maximal_strong_clades(largest.clades, strong_threshold)
+            groups.remove(largest)
+            if inner:
+                # A single result is not a dead end: strongly supported clades
+                # nest, and a 2409-tip FastTree job in the archive had its whole
+                # tree inside a chain of them. Descending through the chain is
+                # what eventually reaches the level that actually branches.
+                # Tips left outside the replacements were in no supported clade
+                # at that level and are correctly reported as unplaced.
+                groups.extend(inner)
+            else:
+                # Nothing inside it is separately supported; it stays whole.
+                settled.append(largest)
+        groups.extend(settled)
+    else:
+        # Nothing clears the support bar (or the tree carries no support at
+        # all). Split the largest group repeatedly instead, and say so.
+        basis = "topology_only"
+        supported_total = 0
+        frontier = [root]
+        while len(frontier) < MAX_CLADE_GROUPS:
+            splittable = [
+                clade for clade in frontier
+                if not clade.is_terminal() and len(clade.clades) > 1
+                and size(clade) > 2
+            ]
+            if not splittable:
+                break
+            largest = max(splittable, key=size)
+            frontier.remove(largest)
+            frontier.extend(largest.clades)
+        groups = [clade for clade in frontier if size(clade) >= 2]
+
+    groups.sort(key=size, reverse=True)
+    groups = groups[:MAX_CLADE_GROUPS]
+    placed = sum(size(clade) for clade in groups)
+    entries = [
+        _clade_entry(position, clade, tip_names_by_id.get(id(clade), []), basis)
+        for position, clade in enumerate(groups, start=1)
+    ]
+
+    return {
+        "basis": basis,
+        "definition": (
+            "Strongly supported clades, taken outermost first so none contains "
+            "another, with any group large enough to describe the whole tree "
+            "reopened into the supported clades inside it. Together they "
+            "partition the tips the support justifies grouping; every other "
+            "tip is unplaced."
+            if basis == "strong_support" else
+            "No clade in this tree clears the conventional support threshold "
+            "for its scale, so these groups come from the SHAPE of the tree "
+            "alone -- the largest clade split repeatedly from the root. They "
+            "are not supported groupings and must not be described as clades "
+            "the tree establishes."
+        ),
+        "groups_listed": len(entries),
+        "outermost_strongly_supported_clades_total": supported_total,
+        "tips_in_listed_groups": placed,
+        "tips_not_in_any_listed_group": len(all_tips) - placed,
+        "tip_names_truncated_per_group_at": CLADE_TIP_LIMIT,
+        "groups": entries,
+    }
+
+
 def summarize_tree(
     newick_path: Path, tree_method: str, alrt_only: bool = False
 ) -> Tuple[Dict[str, Any], List[str]]:
@@ -1133,6 +1558,12 @@ def summarize_tree(
             ),
             "branches_without_length": len(unknown_length_splits),
         },
+        # Which tips group with which. Everything above describes the tree in
+        # aggregate; without this the review can say a tree is well supported
+        # but never what it supports.
+        "clade_structure": _topology_digest(
+            tree, _tip_names_by_clade(tree), strong_threshold
+        ),
         "longest_terminal_branches": longest_listed,
         "longest_terminal_branches_share_of_total_percent": longest_share,
         "longest_terminal_branches_listed": len(longest_listed),
@@ -1525,6 +1956,234 @@ def _join_sequence_metrics(
                 row[field] = source[field]
 
 
+def _provenance_index(job_details: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
+    """Per-sequence provenance from input_info.json, keyed for name matching.
+
+    The submission already records, for every sequence, where it came from
+    (a user's own read, a MycoMap record, an NCBI hit), its accession, the
+    taxon label it arrived with, its collection locality, and -- for records
+    pulled in by similarity -- how close it actually was to the query. None of
+    that reached the review, so a long-branch tip could only ever be reported
+    as a long-branch tip, never as "the only user-submitted collection among
+    twelve references" or "a reference that matched at 87%".
+
+    Every candidate spelling of the name is indexed, because the Newick label,
+    the FASTA header and the viewer's display label are not always the same
+    string and any of the three may be what a metrics row carries.
+    """
+    entries = job_details.get("sequence_metadata")
+    if not isinstance(entries, list):
+        return {}
+    index: Dict[str, Dict[str, Any]] = {}
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        record: Dict[str, Any] = {}
+        for field in _PROVENANCE_FIELDS:
+            value = entry.get(field)
+            if isinstance(value, str) and value.strip():
+                record[field] = value.strip()
+            elif value not in (None, "", []):
+                record[field] = value
+        # Only where the submission says the comparison was actually made. A
+        # bare 0.0 left over from an entry that never ran BLAST would read as
+        # a sequence sharing no identity with anything.
+        if entry.get("blast_metrics_available"):
+            for field in _PROVENANCE_BLAST_FIELDS:
+                value = entry.get(field)
+                if isinstance(value, (int, float)):
+                    record[field] = value
+        if not record:
+            continue
+        for key_field in (
+            "name", "fasta_header", "display_label", "raw_fasta_header",
+            "internal_id", "accession",
+        ):
+            candidate = entry.get(key_field)
+            if isinstance(candidate, str) and candidate.strip():
+                index.setdefault(_normalize_name(candidate), record)
+    return index
+
+
+def _join_provenance(
+    rows: Sequence[Dict[str, Any]], index: Dict[str, Dict[str, Any]]
+) -> None:
+    """Attach provenance to every flagged row, in place."""
+    if not index:
+        return
+    for row in rows:
+        record = index.get(_normalize_name(row.get("name", "")))
+        if record:
+            row["provenance"] = dict(record)
+
+
+def _genus_of(taxon: Any) -> Optional[str]:
+    """First word of a taxon label, which is the genus when it is a binomial.
+
+    A label, not a determination -- see the note published beside it.
+    """
+    text = str(taxon or "").strip()
+    if not text:
+        return None
+    first = text.split()[0]
+    return first if first[:1].isalpha() else None
+
+
+def _provenance_summary(
+    index: Dict[str, Dict[str, Any]], tip_names: Sequence[str]
+) -> Dict[str, Any]:
+    """What the current tree's sequences are, in aggregate.
+
+    Restricted to tips actually in the displayed tree, so a job whose viewer
+    pruning removed every one of its references does not still report them.
+    """
+    records = [
+        record for record in (
+            index.get(_normalize_name(name)) for name in tip_names if name
+        ) if record
+    ]
+    if not records:
+        return {
+            "sequences_with_metadata": 0,
+            "note": (
+                "This job carries no per-sequence provenance, so nothing is "
+                "known about where its sequences came from. Do not infer it "
+                "from the names."
+            ),
+        }
+
+    by_source: Dict[str, int] = {}
+    for record in records:
+        key = str(record.get("source") or "unspecified")
+        by_source[key] = by_source.get(key, 0) + 1
+    by_hit_source: Dict[str, int] = {}
+    for record in records:
+        hit = record.get("hit_source")
+        if hit:
+            by_hit_source[str(hit)] = by_hit_source.get(str(hit), 0) + 1
+
+    identities = [
+        float(record["identity"]) for record in records
+        if isinstance(record.get("identity"), (int, float))
+    ]
+    genera = {
+        genus for genus in (_genus_of(record.get("taxon")) for record in records)
+        if genus
+    }
+    taxa = {
+        str(record["taxon"]) for record in records if record.get("taxon")
+    }
+
+    low_identity = sorted(
+        (
+            {
+                "taxon": record.get("taxon"),
+                "accession": record.get("accession"),
+                "identity": record["identity"],
+                "query_cover": record.get("query_cover"),
+            }
+            for record in records
+            if isinstance(record.get("identity"), (int, float))
+            and record["identity"] < LOW_REFERENCE_IDENTITY_PERCENT
+        ),
+        key=lambda row: row["identity"],
+    )
+
+    summary: Dict[str, Any] = {
+        "sequences_with_metadata": len(records),
+        "tips_in_tree": len([name for name in tip_names if name]),
+        "by_source": by_source,
+        "by_hit_source": by_hit_source or None,
+        "distinct_taxon_labels": len(taxa),
+        "distinct_genus_labels": len(genera),
+        "label_note": (
+            "taxon, genus and location are USER- AND DATABASE-SUPPLIED LABELS "
+            "carried in with each sequence. They are not verified "
+            "determinations and this analysis did not check them. Use them to "
+            "describe what the dataset claims to contain and to point out "
+            "where the tree disagrees with those claims; never present one as "
+            "an identification, and never identify anything yourself."
+        ),
+    }
+    if identities:
+        summary["reference_identity_to_query_percent"] = _quantiles(identities)
+        summary["sequences_with_identity_metrics"] = len(identities)
+        summary["identity_definition"] = (
+            "Percent identity recorded when the sequence was pulled into the "
+            "job by similarity search, against the query that retrieved it. "
+            "It is not a distance measured on this alignment or this tree."
+        )
+    if low_identity:
+        summary["references_below_90_percent_identity"] = low_identity[:TOP_N]
+        summary["references_below_90_percent_identity_total"] = len(low_identity)
+    return summary
+
+
+# A label carrying one of these is an explicit statement that the sequence was
+# NOT identified to species, so finding two of them in different groups says
+# nothing at all -- two records both labelled "sp." need not be the same thing.
+_UNDETERMINED_LABEL_RE = re.compile(r"\b(?:sp|spp|cf|aff|indet)\.?(?:\s|$)", re.I)
+
+# GenBank placeholders that read as a binomial but name nothing. Two records
+# both labelled "Environmental Sample" landing in different groups is not a
+# taxonomic inconsistency, and one was being reported as one.
+_PLACEHOLDER_LABEL_RE = re.compile(
+    r"^(?:environmental\s+sample|uncultured\b|unidentified\b|unclassified\b|"
+    r"fungal\s+(?:sp|endophyte|sample)\b|no\s+match\b)",
+    re.I,
+)
+
+
+def _determinate_taxon(taxon: Any) -> Optional[str]:
+    """A taxon label specific enough that finding it twice means something.
+
+    Genus alone is not it. An earlier version keyed this check on the genus and
+    reported, of a dataset that was entirely Tyromyces, that Tyromyces appeared
+    in seven groups -- true, trivial, and exactly the kind of padding the prompt
+    tells the reviewer not to produce. A binomial is the level at which two
+    records in unrelated parts of the tree is a real inconsistency.
+    """
+    text = re.sub(r"\s+", " ", str(taxon or "")).strip()
+    if not text or len(text.split()) < 2:
+        return None
+    if _UNDETERMINED_LABEL_RE.search(text) or _PLACEHOLDER_LABEL_RE.match(text):
+        return None
+    return text
+
+
+def _labels_split_across_clades(
+    clade_structure: Dict[str, Any], index: Dict[str, Dict[str, Any]]
+) -> List[Dict[str, Any]]:
+    """Taxon labels whose members land in more than one supported group.
+
+    The single most useful thing the topology and the labels can say together:
+    a named species sitting in two unrelated supported groups is either a
+    misidentification in the dataset or a genuinely non-monophyletic taxon, and
+    both are worth the user's attention. Computed only from groups whose
+    membership the SUPPORT justifies -- on a shape-only digest a label appearing
+    in two groups means nothing at all.
+    """
+    if not index or clade_structure.get("basis") != "strong_support":
+        return []
+    placement: Dict[str, Set[str]] = {}
+    for group in clade_structure.get("groups", []):
+        if group.get("tip_names_truncated"):
+            # The listed names are a sample, so an absence here is not evidence
+            # that the label is missing from the group.
+            continue
+        for name in group.get("tip_names", []):
+            record = index.get(_normalize_name(name))
+            label = _determinate_taxon((record or {}).get("taxon"))
+            if label:
+                placement.setdefault(label, set()).add(group["id"])
+    split = [
+        {"taxon_label": label, "groups": sorted(ids), "group_count": len(ids)}
+        for label, ids in placement.items() if len(ids) > 1
+    ]
+    split.sort(key=lambda row: (-row["group_count"], row["taxon_label"]))
+    return split[:MAX_SPLIT_LABELS]
+
+
 def build_context(
     job_dir: Path, *, displayed_names_out: Optional[set] = None
 ) -> Dict[str, Any]:
@@ -1584,6 +2243,41 @@ def build_context(
     by_name = {_normalize_name(row["name"]): row for row in per_sequence_rows}
     _join_sequence_metrics(tree["longest_terminal_branches"], by_name)
     _join_sequence_metrics(tree["outlier_long_branch_tips"], by_name)
+
+    # Where each sequence came from, joined onto every list that names one.
+    # "Three tips have long terminal branches" and "the three long-branch tips
+    # are the only user-submitted collections in the job" are different
+    # findings, and only the second one tells the user what to do next.
+    provenance_index = _provenance_index(job_details)
+    for flagged in (
+        tree["longest_terminal_branches"],
+        tree["outlier_long_branch_tips"],
+        alignment["gappiest_sequences"],
+        alignment["most_internally_gapped_sequences"],
+        alignment["most_ambiguous_sequences"],
+        alignment["shortest_sequences"],
+    ):
+        _join_provenance(flagged, provenance_index)
+
+    excerpts = build_alignment_excerpt(records, per_sequence_rows)
+    if excerpts:
+        alignment["excerpts"] = excerpts
+
+    split_labels = _labels_split_across_clades(
+        tree["clade_structure"], provenance_index
+    )
+    if split_labels:
+        tree["clade_structure"]["taxon_labels_in_multiple_groups"] = split_labels
+        tree["clade_structure"]["taxon_labels_in_multiple_groups_note"] = (
+            "Taxon labels, taken from the submitted metadata, whose members "
+            "fall in more than one strongly supported group. Computed only "
+            "over groups whose member list was not truncated, and only over "
+            "labels determined to species: a label reading sp., cf. or aff. is "
+            "an explicit statement that the sequence was not identified, so two "
+            "of them in different groups mean nothing. A label is not a "
+            "determination, so this is evidence that the dataset's labels and "
+            "its tree disagree, not proof of non-monophyly."
+        )
 
     alignment["source_file"] = alignment_path.name
     # Named for what the calculation actually establishes rather than for the
@@ -1671,7 +2365,12 @@ def build_context(
         "orientation_enabled": bool(job_details.get("run_orient")),
     }
 
-    return {"pipeline": pipeline, "alignment": alignment, "tree": tree}
+    return {
+        "pipeline": pipeline,
+        "provenance": _provenance_summary(provenance_index, all_tip_names),
+        "alignment": alignment,
+        "tree": tree,
+    }
 
 
 def _alignment_scope_note(
@@ -1755,11 +2454,13 @@ or TEF1) for a mycologist who is competent with the biology but is not a \
 specialist in alignment or model selection. The dataset is typically a mix of \
 field collections and GenBank reference sequences.
 
-You are given precomputed statistics for one job: the pipeline settings, the \
-alignment, and the tree. You are not given the sequences themselves, so every \
-claim you make must follow from a number you were given. Do not guess at \
-taxonomy, sequence identity, or what a named sequence is - the names are \
-user-supplied labels, not verified determinations.
+You are given precomputed statistics for one job: the pipeline settings, where \
+each sequence came from, the alignment, and the tree. You are not given the \
+sequences themselves, apart from the narrow windows described under ALIGNMENT \
+EXCERPTS below. Every claim you make must therefore follow from a number you \
+were given, or from what one of those windows plainly shows. Do not guess at \
+taxonomy, sequence identity, or what a named sequence is - the names and taxon \
+labels are user- and database-supplied, not verified determinations.
 
 Judge the analysis on whether its conclusions can be trusted, not on whether \
 it followed a textbook procedure. What matters:
@@ -1773,7 +2474,13 @@ it followed a textbook procedure. What matters:
 - Is the support real? Say plainly what the support scale is and what it does \
   and does not establish. Interpret the values on their own scale.
 - Are individual sequences suspect? Long terminal branches, high ambiguity, and \
-  unusually short sequences are the ones the user should look at, by name.
+  unusually short sequences are the ones the user should look at, by name. Say \
+  what they are as well as what is wrong with them: a user's own collection on \
+  a long branch and a distant reference on a long branch mean different things.
+- What does the tree actually group? tree.clade_structure is the only thing you \
+  are given about which tips sit together. Where the dataset's own labels \
+  disagree with those groups, that is usually the most useful thing you can \
+  tell the user.
 - Do the settings fit the data? Note a mismatch only when it plausibly changed \
   the result.
 
@@ -1898,6 +2605,83 @@ tree.outlier_tip_count, alignment.identical_sequence_group_count, \
 alignment.sequences_in_identical_groups_total, a group's own `count`, a \
 group's names_truncated flag - quote the total and describe the named rows \
 as examples.
+
+TOPOLOGY
+
+tree.clade_structure lists groups of tips, each with an id such as C3. Read \
+tree.clade_structure.basis first and obey it:
+
+- `strong_support`: the groups are strongly supported clades - each clears the \
+  conventional threshold for this support scale and none contains another. \
+  These are real, citable groupings. tips_not_in_any_listed_group is how much \
+  of the tree the support does not place; a large number there is a finding in \
+  itself.
+- `topology_only`: NOTHING in this tree clears its support threshold and the \
+  groups come from the shape of the file alone. Do not call them clades, do not \
+  say the tree groups anything, and do not name their members as related. Report \
+  that the tree is unresolved and use the groups only to describe the shape.
+
+Membership lists are truncated at tip_names_truncated_per_group_at. When \
+tip_names_truncated is true the names you see are examples, and a tip's absence \
+from the list is not evidence it is outside the group. `tips` is the group's \
+true size; groups_listed is how many groups you were shown, and \
+outermost_strongly_supported_clades_total counts the supported clades found \
+before any oversized one was reopened - do not report either as a count of \
+clades in the tree.
+
+tree.clade_structure.taxon_labels_in_multiple_groups, where present, names \
+taxon labels whose members land in more than one supported group. Report it as \
+a disagreement between the dataset's labels and its tree - a possible \
+misidentification among the submitted sequences, or a genuinely non-monophyletic \
+taxon - and say which groups are involved. Never resolve it: do not decide which \
+placement is correct, and do not re-identify a sequence. Its absence is not \
+evidence that the labels agree with the tree; it is computed only over the \
+groups whose membership was listed in full.
+
+WHERE THE SEQUENCES CAME FROM
+
+The `provenance` block, and the `provenance` field on individual flagged rows, \
+describe each sequence's origin: `source`/`hit_source` (a user's own submission \
+versus a record pulled from MycoMap or NCBI), `accession`, `taxon`, `location`, \
+and for retrieved records the `identity` and `query_cover` of the search that \
+retrieved them. Use it to make a finding actionable - which of the suspect \
+sequences are the user's own material and which are references, whether a clade \
+is references only, whether a reference was pulled in at low identity \
+(provenance.references_below_90_percent_identity) and may not belong in the \
+analysis at all.
+
+`identity` is the percent identity from the search that retrieved the record, \
+against the query that retrieved it. It is NOT a distance measured on this \
+alignment or this tree, so never compare it with a branch length, present it as \
+alignment identity, or contrast it with mean_pairwise_identity_percent.
+
+Obey provenance.label_note. `taxon`, its genus and `location` are labels the \
+sequences arrived with; this analysis verified none of them. You may say the \
+dataset's labels are inconsistent with its tree. You may not say what anything \
+is, confirm or reject an identification, or infer relatedness from a shared \
+label. When provenance.sequences_with_metadata is 0, nothing is known about \
+origin and you must not infer it from the names.
+
+ALIGNMENT EXCERPTS
+
+alignment.excerpts, when present, is the only raw sequence you are given: at \
+most two windows of at most a couple of hundred columns, chosen around the \
+largest interior gap of the most internally gapped sequences. Each window \
+carries the `flagged` row and `contrast` rows drawn from the least internally \
+gapped sequences.
+
+Use them for exactly one judgement: whether the flagged row's gap looks like a \
+plausible indel - a clean block, with the row in register with its neighbours \
+either side of it - or like a row that has slipped out of register, where its \
+residues no longer line up with the contrast rows across the window. That \
+distinction changes the advice, and no statistic in this context can make it.
+
+Nothing else may be drawn from a window. It is a fragment chosen for being \
+unusual, so do not count columns, estimate a percentage, judge overall \
+alignment quality, compare sequences base by base, or describe the contrast \
+rows as representative. Every quantitative claim still comes from the alignment \
+statistics. The absence of alignment.excerpts means no sequence had interior \
+gaps worth showing, which is mildly good news, not a gap in the evidence.
 
 RATING
 
@@ -2392,17 +3176,28 @@ def _call_claude_cli(
     # and the user.
     if isinstance(envelope, dict) and envelope.get("is_error"):
         status = envelope.get("api_error_status")
+        result = envelope.get("result")
         # Alan 8/24/26 - A 429 is expected operation, not a defect: the branch
         # below turns it into a user-facing Retry-After and the viewer retries.
         # Logging it at ERROR put it in errors.log and in the log digest's
         # exception list, where routine quota exhaustion read as a bug.
-        logger.log(
-            logging.WARNING if status == 429 else logging.ERROR,
-            "event=claude_review.cli_error subtype=%s status=%s terminal_reason=%s",
-            envelope.get("subtype"), status, envelope.get("terminal_reason"),
-        )
         if status == 429:
-            result = envelope.get("result")
+            # Keep the complete provider text in the raw log. JSON encoding
+            # preserves embedded newlines and quotes on one physical log line,
+            # so a later review can distinguish session exhaustion, account
+            # limits, and ordinary transient throttling without losing detail.
+            logger.warning(
+                "event=claude_review.cli_error subtype=%s status=%s "
+                "terminal_reason=%s provider_message=%s",
+                envelope.get("subtype"), status, envelope.get("terminal_reason"),
+                json.dumps(result, ensure_ascii=False),
+            )
+        else:
+            logger.error(
+                "event=claude_review.cli_error subtype=%s status=%s terminal_reason=%s",
+                envelope.get("subtype"), status, envelope.get("terminal_reason"),
+            )
+        if status == 429:
             reset_match = re.search(
                 r"\bresets?\s+([0-9]{1,2}:[0-9]{2}\s*(?:am|pm)\s*\(UTC\))",
                 result if isinstance(result, str) else "",
