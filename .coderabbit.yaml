@@ -10,4 +10,4 @@ reviews:
       - "review-base"
 
   path_filters:
-      - "tests/**"
+      - "!app/static/vendor/**"
