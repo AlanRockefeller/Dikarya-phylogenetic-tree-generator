@@ -11,3 +11,5 @@ reviews:
 
   path_filters:
     - "!app/static/vendor/**"
+    - "!tests/**"
+    - "!**/package-lock.json"
