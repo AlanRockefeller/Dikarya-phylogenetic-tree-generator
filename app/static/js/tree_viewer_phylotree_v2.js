@@ -1899,6 +1899,13 @@
                     ({ clone, width, height } = this._buildExportClone(svg));
                 } catch (err) { reject(err); return; }
 
+                // Alan 9/4/26 - PNG is exported with a transparent background, so strip any
+                // background paint the page put on the SVG (or on rules copied into it) before
+                // rasterising. JPEG has no alpha channel and still gets a white fill below.
+                if (mimeType !== 'image/jpeg') {
+                    try { this._makeExportCloneTransparent(clone); } catch (_) { /* non-fatal */ }
+                }
+
                 let svgUrl;
                 try {
                     const svgData = (new XMLSerializer()).serializeToString(clone);
@@ -1962,6 +1969,47 @@
 
                 img.src = svgUrl;
             });
+        }
+
+        /**
+         * Remove opaque page background from an export clone so PNG keeps its alpha channel.
+         * Drops background declarations from the root element, from any embedded stylesheet,
+         * and from full-bleed rects the page may have painted behind the tree.
+         *
+         * @param {SVGSVGElement} clone
+         */
+        _makeExportCloneTransparent(clone) {
+            const stripBackground = (styleText) =>
+                String(styleText || '').replace(/(^|;)\s*background(-color|-image)?\s*:[^;]*/gi, '$1');
+
+            const clean = (el) => {
+                const style = el.getAttribute && el.getAttribute('style');
+                if (style) {
+                    const cleaned = stripBackground(style).replace(/^;+|;+$/g, '').trim();
+                    if (cleaned) el.setAttribute('style', cleaned);
+                    else el.removeAttribute('style');
+                }
+            };
+
+            clean(clone);
+            clone.querySelectorAll('[style*="background"]').forEach(clean);
+            clone.querySelectorAll('style').forEach(styleEl => {
+                styleEl.textContent = stripBackground(styleEl.textContent);
+            });
+            clone.style.background = 'transparent';
+
+            // Any rect that covers the whole drawing and is not part of the tree itself is a
+            // backdrop, not data; the tree's own shapes live under .node / .branch groups.
+            const width = parseFloat(clone.getAttribute('width')) || 0;
+            const height = parseFloat(clone.getAttribute('height')) || 0;
+            if (width && height) {
+                clone.querySelectorAll('rect').forEach(rect => {
+                    if (rect.closest('.node, .branch, .phylotree-clade-annotation')) return;
+                    const rw = parseFloat(rect.getAttribute('width')) || 0;
+                    const rh = parseFloat(rect.getAttribute('height')) || 0;
+                    if (rw >= width - 1 && rh >= height - 1) rect.remove();
+                });
+            }
         }
 
         // --- INTERNAL HELPERS ---
@@ -4575,7 +4623,7 @@
          * Alan 8/21/26 - Resolve which tips a context-menu annotation should cover.
          *
          * Normally that is the clicked branch's descendants. The exception is right-clicking
-         * a TIP that belongs to a multi-tip selection which is itself exactly one clade: the
+         * a TIP that belongs to a multi-tip selection: the
          * user has already said what group they mean, so annotate that group rather than the
          * single tip under the cursor. Requiring the clicked tip to be inside the selection
          * keeps a click on an unrelated branch acting on that branch, and restricting this to
@@ -4591,7 +4639,7 @@
             if (children.length || this.getSelectedLeafCount() < 2) return null;
             const id = this._getNodeId(node);
             if (!id) return null;
-            const selectedClade = this.getSelectedCladeLeafIds();
+            const selectedClade = this.getSelectedAnnotationLeafIds();
             if (!selectedClade || selectedClade.length < 2) return null;
             return selectedClade.includes(id) ? selectedClade : null;
         }
@@ -4599,6 +4647,40 @@
         // Alan 8/21/26 - True when the context menu will annotate the selection, not the click.
         _isSelectionAnnotationTarget(node) {
             return Boolean(this._selectionAnnotationLeafIds(node));
+        }
+
+        getSelectedAnnotationLeafIds() {
+            return Array.from(new Set(this.getSelectedNodes()
+                .filter(node => !(node?.children || node?.data?.children || []).length)
+                .map(node => this._getNodeId(node)).filter(Boolean)));
+        }
+
+        // Cover precisely the requested tips with maximal complete clades. Separate
+        // clades receive the same label without enclosing unselected neighbours.
+        getAnnotationMemberGroups(memberIds) {
+            const wanted = new Set(memberIds);
+            const polytomy = this._zeroLengthPolytomyForMemberIds(memberIds);
+            if (polytomy) {
+                const order = this.getVisibleTipOrder();
+                const indices = order.map((id, index) => wanted.has(id) ? index : -1)
+                    .filter(index => index >= 0);
+                if (indices.length === wanted.size
+                    && indices[indices.length - 1] - indices[0] + 1 === wanted.size) {
+                    return [memberIds.slice()];
+                }
+            }
+            const candidates = this.allNodes.map(node => ({
+                node, ids: this.getDescendantLeafIds(node)
+            })).filter(({ ids }) => ids.length && ids.every(id => wanted.has(id)))
+                .sort((a, b) => b.ids.length - a.ids.length);
+            const covered = new Set();
+            const groups = [];
+            for (const { ids } of candidates) {
+                if (ids.some(id => covered.has(id))) continue;
+                groups.push(ids);
+                ids.forEach(id => covered.add(id));
+            }
+            return groups;
         }
 
         /**
@@ -5521,7 +5603,9 @@
                 const hasIncomingBranch = incomingBranchNodes.has(blockKey);
                 // Alan 8/24/26 - Clade lines and clade highlights need only be one clade;
                 // the branch types additionally need a branch to sit on.
-                const valid = (isClade || Boolean(softPolytomy))
+                const selectedGroup = annotation.membership_mode === 'selection'
+                    && this._isCladeAnnotationType(annotationType);
+                const valid = selectedGroup || (isClade || Boolean(softPolytomy))
                     && (this._isCladeAnnotationType(annotationType) || hasIncomingBranch);
                 validity.set(annotation.id, { present: indices.length, valid });
                 // Invalid annotations are kept in state and flagged in the manager, but they
@@ -5535,6 +5619,14 @@
                     annotation,
                     layer,
                     indices,
+                    memberParts: selectedGroup ? this.getAnnotationMemberGroups(members)
+                        .map(ids => {
+                            const partIndices = ids.map(id => positions.get(id)?.index)
+                                .filter(index => index !== undefined).sort((a, b) => a - b);
+                            const key = `${partIndices[0]}:${partIndices[partIndices.length - 1]}`;
+                            return { indices: partIndices, cladeNode: cladeNodes?.get(key)
+                                || incomingBranchNodes.get(key) || null };
+                        }).filter(part => part.indices.length) : null,
                     targetNode: incomingBranchNodes.get(blockKey) || null,
                     // Alan 8/24/26 - The node the highlight band starts at. Falls back to the
                     // incoming-branch target, which is the same node everywhere but the root.
@@ -5688,6 +5780,10 @@
                 item.type = this._annotationType(item.annotation);
                 item.top = yOf(item.indices[0]);
                 item.bottom = yOf(item.indices[item.indices.length - 1]);
+                if (item.memberParts) item.memberParts.forEach(part => {
+                    part.top = yOf(part.indices[0]);
+                    part.bottom = yOf(part.indices[part.indices.length - 1]);
+                });
                 item.textWidth = this._measureAnnotationLabel(svgNode, item.lines, style) * scale;
                 item.scaledFontSize = style.font_size * scale;
                 item.metrics = this._annotationLayoutMetrics(item, LINE_TO_TEXT_GAP);
@@ -5766,6 +5862,15 @@
             for (const item of highlightItems) {
                 const fallbackRight = Number.isFinite(item.preferredLaneX)
                     ? item.preferredLaneX : labelRight + GAP_FROM_TREE;
+                if (item.memberParts) {
+                    const effective = this._effectiveHighlightStyle(item, highlightColors);
+                    for (const band of this._selectedGroupHighlightRects(
+                        item, rowPitch, HIGHLIGHT_PAD_X, fallbackRight
+                    )) {
+                        this._appendHighlightRect(highlightGroup, band, effective, item.annotation.id);
+                    }
+                    continue;
+                }
                 const { band, label } = this._cladeHighlightRects(
                     item, rowPitch, HIGHLIGHT_PAD_X, fallbackRight
                 );
@@ -6158,6 +6263,31 @@
          * translucent wash is never painted twice over the same pixels and the drawn colour is
          * exactly the resolved one. With a one-line label there is no second rectangle at all.
          */
+        _selectedGroupHighlightRects(item, rowPitch, padX, fallbackRight) {
+            const bands = item.memberParts.map(part => this._cladeHighlightRects({
+                ...item, ...part,
+                metrics: { renderTop: part.top, renderBottom: part.bottom }
+            }, rowPitch, padX, fallbackRight).band).filter(Boolean);
+            if (!bands.length) return [];
+            // One specimen has common horizontal edges, even when its constituent
+            // clades start at slightly different branch positions. Merge touching
+            // rows into one rectangle to avoid seams and doubled translucent fill.
+            const left = Math.min(...bands.map(band => band.x));
+            const right = Math.max(...bands.map(band => band.x + band.width));
+            bands.sort((a, b) => a.y - b.y);
+            const merged = [];
+            for (const band of bands) {
+                const previous = merged[merged.length - 1];
+                if (previous && band.y <= previous.y + previous.height + 0.001) {
+                    previous.height = Math.max(previous.y + previous.height,
+                        band.y + band.height) - previous.y;
+                } else {
+                    merged.push({ x: left, y: band.y, width: right - left, height: band.height });
+                }
+            }
+            return merged;
+        }
+
         _cladeHighlightRects(item, rowPitch, padX, fallbackRight) {
             const empty = { band: null, label: null };
             const point = this._annotationNodePoint(item?.cladeNode);
@@ -6477,7 +6607,8 @@
             const inkClass = (base, isDefault) =>
                 isDefault ? `${base} clade-annotation-default-ink` : base;
 
-            // Alan 8/17/26 - Clade lines always draw as a bracket, including a short one-tip tick.
+            // One annotation has one continuous bracket spanning all its members.
+            // Highlight bands still follow the individual member parts.
             const singleTip = item.top === item.bottom;
             entry.append('line')
                 .attr('class', inkClass('clade-annotation-line', item.style.line_color_is_default))

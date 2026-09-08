@@ -545,8 +545,10 @@ class OtherEditUndoTests(_RouteHarness):
             job_dir = _make_job(root)
 
             status, payload = self._call(root, routes.rename_tree_tip, body={
-                # A semicolon would be Newick punctuation in a written label.
-                "renames": {"A": "Alpha", "B": "Bad;Name"},
+                # Punctuation is fine now -- quoting carries it through every
+                # export -- so the rejected name here is one that is nothing
+                # but control characters, which no format can represent.
+                "renames": {"A": "Alpha", "B": "\x00\x01"},
             })
             self.assertEqual(status, 400)
             self.assertEqual(payload["status"], "error")

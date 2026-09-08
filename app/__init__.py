@@ -118,6 +118,9 @@ def _install_logging(app, under_gunicorn=False):
         from flask import g
         g.request_id = new_request_id()
 
+    from app.services.request_diagnostics import install_request_diagnostics
+    install_request_diagnostics(app)
+
 
 def create_app(config_name='default'):
     app = Flask(__name__)
@@ -186,6 +189,10 @@ def create_app(config_name='default'):
 
     @app.route('/favicon.ico/<path:filename>')
     def favicon_asset(filename):
+        if filename == 'favicon.svg':
+            # Legacy pages/bookmarks still ask for the raster-embedded SVG.
+            from flask import redirect, url_for
+            return redirect(url_for('static', filename='favicon.ico/favicon-96x96.png'), code=302)
         return send_from_directory(os.path.join(app.static_folder, 'favicon.ico'), filename)
 
     # Browsers and pinned/mobile launchers probe these conventional root URLs
@@ -251,6 +258,8 @@ def create_app(config_name='default'):
     # one minute, reject further unknown routes from that IP until the window
     # expires. Known routes and successful API traffic never enter this gate.
     from werkzeug.exceptions import NotFound
+    from app.services.scanner_burst import ScannerBurstFallback, INCREMENT_SCRIPT
+    scanner_fallback = ScannerBurstFallback(SCANNER_404_WINDOW_SECONDS)
 
     @app.before_request
     def _throttle_missing_route_bursts():
@@ -260,24 +269,24 @@ def create_app(config_name='default'):
             return None
         if not isinstance(request.routing_exception, NotFound):
             return None
+        key = _scanner_404_key(request.remote_addr)
+        misses = scanner_fallback.count(key)
         try:
-            misses = _scanner_404_redis().get(
-                _scanner_404_key(request.remote_addr)
-            )
-            if misses is not None and int(misses) >= SCANNER_404_LIMIT:
-                return (
-                    "Too many missing routes",
-                    429,
-                    {"Retry-After": str(SCANNER_404_WINDOW_SECONDS)},
-                )
+            misses = max(misses, int(_scanner_404_redis().get(key) or 0))
         except Exception as exc:
             from app.services.log_context import log_degradation_rate_limited
 
             log_degradation_rate_limited(
                 current_app.logger,
                 "scanner_404_limiter_unavailable",
-                "Missing-route burst limiter failed open",
+                "Shared missing-route limiter unavailable; using per-process fallback",
                 exception=type(exc).__name__,
+            )
+        if misses >= SCANNER_404_LIMIT:
+            return (
+                "Too many missing routes", 429,
+                {"Retry-After": str(SCANNER_404_WINDOW_SECONDS),
+                 "X-Dikarya-Noise": "scanner"},
             )
         return None
 
@@ -290,19 +299,18 @@ def create_app(config_name='default'):
             or not current_app.config.get("RATELIMIT_ENABLED", True)
         ):
             return response
+        key = _scanner_404_key(request.remote_addr)
+        scanner_fallback.count(key, increment=True)
         try:
             client = _scanner_404_redis()
-            key = _scanner_404_key(request.remote_addr)
-            misses = int(client.incr(key))
-            if misses == 1:
-                client.expire(key, SCANNER_404_WINDOW_SECONDS)
+            client.eval(INCREMENT_SCRIPT, 1, key, SCANNER_404_WINDOW_SECONDS)
         except Exception as exc:
             from app.services.log_context import log_degradation_rate_limited
 
             log_degradation_rate_limited(
                 current_app.logger,
                 "scanner_404_limiter_unavailable",
-                "Missing-route burst limiter failed open",
+                "Shared missing-route limiter unavailable; using per-process fallback",
                 exception=type(exc).__name__,
             )
         return response
@@ -313,6 +321,13 @@ def create_app(config_name='default'):
 
     @app.errorhandler(CSRFError)
     def handle_csrf_error(e):
+        from app.services.request_diagnostics import note_request_failure
+        note_request_failure({
+            "The CSRF token is missing.": "csrf_token_missing",
+            "The CSRF session token is missing.": "csrf_session_missing",
+            "The CSRF token has expired.": "csrf_token_expired",
+            "The CSRF tokens do not match.": "csrf_token_mismatch",
+        }.get(e.description, "csrf_token_invalid"))
         if request.path.startswith("/api/"):
             return jsonify(error="CSRF token missing or invalid", message=e.description), 400
         return "CSRF error", 400

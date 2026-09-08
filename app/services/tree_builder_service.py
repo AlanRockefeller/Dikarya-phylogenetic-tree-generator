@@ -32,7 +32,12 @@ from app.services.subprocess_utils import (
     ToolExecutionError,
     tool_failure_message,
 )
-from app.services.fasta_utils import sanitize_fasta_headers, restore_tree_names
+from app.services.fasta_utils import (
+    NAME_MAP_FILENAME,
+    restore_tree_names,
+    sanitize_fasta_headers,
+    write_name_map,
+)
 from app.services.tree_parameter_validation import validate_iqtree_ufboot_count
 from app.services.tree_io import (
     newick_file_to_nexus,
@@ -272,7 +277,11 @@ def _discard_scratch_inputs(tree_dir: Path, task_logger) -> None:
 def _get_thread_count(params: TreeBuilderParams) -> int:
     if params.threads:
         return params.threads
-    return min(8, os.cpu_count() or 1)
+    # Shared with the aligner so a worker's DIKARYA_WORKER_THREADS budget
+    # applies to every stage of its pipeline, not just alignment.
+    from app.services.alignment_service import worker_thread_budget
+
+    return worker_thread_budget()
 
 
 def _make_log_callback(job_id: Optional[str], step: str, stream: str):
@@ -1507,6 +1516,14 @@ def _run_mrbayes(
     # Sanitize FASTA to create safe IDs before converting to NEXUS
     sanitized_fasta = output_newick.parent / "mrbayes_input_sanitized.fasta"
     name_mapping = sanitize_fasta_headers(alignment_fasta, sanitized_fasta)
+
+    # The MrBayes files are a user-facing download, and every taxon in them is
+    # a SEQnnnnnn id because a NEXUS matrix label cannot hold a space. Keep the
+    # key beside the run so the download can ship it.
+    try:
+        write_name_map(name_mapping, output_newick.parent / NAME_MAP_FILENAME)
+    except OSError as exc:
+        task_logger.warning("Could not write the MrBayes name map: %s", exc)
 
     # MrBayes requires Nexus input with a block
     nexus_input = output_newick.parent / "mrbayes_input.nex"

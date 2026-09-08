@@ -205,7 +205,7 @@ class TestInaturalistTreeSourceLabel(unittest.TestCase):
         self.assertEqual(node["display_name"], "new tip")
         self.assertEqual(tree_json["renames"]["old tip"], "new tip")
 
-    def test_ncbi_rebuild_queues_before_observation_fetch(self):
+    def test_ncbi_rebuild_validates_before_queueing(self):
         """The NCBI grace period must never run in the HTTP request process."""
         class FakeSession:
             def __init__(self):
@@ -233,7 +233,7 @@ class TestInaturalistTreeSourceLabel(unittest.TestCase):
             patch.object(
                 inaturalist_tree_service,
                 "fetch_observation",
-                side_effect=AssertionError("request path must not fetch the observation"),
+                return_value={"ofvs": [{"name": "DNA Barcode ITS", "value": "ACGT" * 100}]},
             ),
             patch("app.extensions.db", fake_db),
             patch("app.models.Job", FakeJob),
@@ -254,7 +254,7 @@ class TestInaturalistTreeSourceLabel(unittest.TestCase):
         # same general/RAxML allowance as every other submission path.
         self.assertNotIn("job_timeout", enqueue_job.call_args.kwargs)
 
-    def test_local_refresh_queues_before_observation_fetch(self):
+    def test_local_refresh_validates_before_queueing(self):
         """The automatic local rerun must not run in the HTTP request process."""
         class FakeSession:
             def __init__(self):
@@ -278,7 +278,7 @@ class TestInaturalistTreeSourceLabel(unittest.TestCase):
             patch.object(
                 inaturalist_tree_service,
                 "fetch_observation",
-                side_effect=AssertionError("request path must not fetch the observation"),
+                return_value={"ofvs": [{"name": "DNA Barcode ITS", "value": "ACGT" * 100}]},
             ),
             patch("app.extensions.db", fake_db),
             patch("app.models.Job", FakeJob),
@@ -421,10 +421,10 @@ class TestInaturalistTreeSourceLabel(unittest.TestCase):
             inaturalist_tree_service, "fetch_observation", return_value=observation
         ):
             with self.assertRaises(inaturalist_tree_service.InatTreeError) as raised:
-                inaturalist_tree_service.prepare_inat_tree_job(123456789)
+                inaturalist_tree_service.create_job_from_inat_observation("123456789")
 
         self.assertEqual(raised.exception.status, 409)
-        self.assertIn("Re-create phylogenetic tree", str(raised.exception))
+        self.assertIn("Replace existing tree URL", str(raised.exception))
 
     def test_missing_mycomap_url_creates_blast_and_updates_inaturalist(self):
         observation = {

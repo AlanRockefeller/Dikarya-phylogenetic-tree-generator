@@ -532,6 +532,14 @@ def _normalize_annotation(raw: Any, layer_ids: Set[str],
             f"Annotation '{annotation['label']}' has no members in the current tree"
         )
     annotation["member_tip_ids"] = normalized_members
+    # An explicitly selected specimen/taxon group need not be one rooted clade.
+    # Legacy annotations retain their topology-based validity rules.
+    if raw.get("membership_mode") is not None:
+        if raw["membership_mode"] != "selection":
+            raise AnnotationValidationError("Unknown annotation membership mode")
+        if annotation["annotation_type"] not in ("clade_line", "clade_highlight"):
+            raise AnnotationValidationError("Selected groups require a clade line or highlight")
+        annotation["membership_mode"] = "selection"
 
     # null / missing means "inherit from the layer", so keep the key present and
     # null rather than baking the layer's current value into the annotation.

@@ -544,6 +544,25 @@ def create_job():
             details={"fields": ["sequence", "accessions"]},
         )
 
+    # Reject an unalignable submission here rather than in the worker. The
+    # string cap above bounds only the payload size; it says nothing about
+    # per-sequence length or record count, so a set of ~80 contigs of 56 kb
+    # fits inside sequence_max_bytes while still being genome-scale input that
+    # MAFFT cannot align. The browser path applies the same check in
+    # app/api/routes.py; this keeps the two APIs telling the user the same
+    # story instead of the API accepting what the website refuses.
+    if sequence_text:
+        from app.services.fasta_utils import validate_dna_fasta
+        try:
+            validate_dna_fasta(sequence_text)
+        except ValueError as exc:
+            return error_response(
+                code="validation_failed",
+                message=str(exc),
+                status=422,
+                details={"field": "sequence"},
+            )
+
     # `alignment_options` is a free-form dict consumed by the worker; we cap
     # only its shape and a rough byte size to keep it from being abused as
     # an exfiltration channel into stored job params.
@@ -646,6 +665,7 @@ def create_job():
     # ownership, status and metrics bookkeeping were simply skipped for that
     # job -- it ran, but the submitter could not see or own it.
     job_id = str(uuid.uuid4())
+    g.job_id = job_id
     job_record = Job(
         id=job_id,
         user_id=g.api_user.id,
@@ -1211,8 +1231,30 @@ def download_job_file(job_id, name):
             message=f"Unknown artifact. Valid names: {sorted(DOWNLOADABLE_ARTIFACTS)}",
             status=404,
         )
-    p = artifact_path(job_id, name)
     job_dir = Config.JOB_DIR / job_id
+
+    if name == "tree.nexus":
+        # Regenerated from the Newick when the stored file is stale or was
+        # written by Biopython's TAXLABELS writer, which mangles any label
+        # containing a space or a parenthesis. Same helper the browser
+        # download uses, so the two agree about which tree and which labels.
+        from io import BytesIO
+
+        from app.services.tree_io import build_nexus_download
+
+        built = build_nexus_download(job_dir)
+        if built is None:
+            return error_response(
+                code="not_found", message="File not available yet.", status=404
+            )
+        return send_file(
+            BytesIO(built[0]),
+            as_attachment=True,
+            download_name=name,
+            mimetype=_guess_mime(name),
+        )
+
+    p = artifact_path(job_id, name)
     if p is None or not validate_safe_file_path(p, job_dir):
         return error_response(code="not_found", message="File not available yet.", status=404)
     if p.suffix == ".gz":
@@ -1373,6 +1415,7 @@ def job_events(job_id):
             last_db_poll = 0.0
             last_token_check = time.monotonic()
             last_activity = started
+            last_registry_touch = started
             while True:
                 # Hard duration cap. Clients should reconnect.
                 if time.monotonic() - started > max_stream_seconds:
@@ -1424,6 +1467,12 @@ def job_events(job_id):
                     except json.JSONDecodeError:
                         pass
                 now = time.monotonic()
+                # Renew the registry lease on its own timer, ahead of the ping
+                # yield, so a stream whose client has stopped reading still
+                # counts against the site-wide census.
+                if now - last_registry_touch >= sse_registry.RENEW_INTERVAL_SECONDS:
+                    last_registry_touch = now
+                    sse_registry.touch_stream(registry_conn, stream_token)
                 if now - last_ping >= SSE_HEARTBEAT_SECONDS:
                     yield "event: ping\ndata: {}\n\n"
                     last_ping = now
@@ -1521,9 +1570,15 @@ TREE_MUTATION_LIMITS = {
     "max_name_len":  MAX_TREE_TIP_NAME_LENGTH,
 }
 
-# Characters that would corrupt Newick syntax if written verbatim as a tip
-# name. Reject these in *new* tip names (rename target, prune target list)
-# so a malformed name can't break tree exports.
+# Characters that no download can carry, whatever the quoting: a line break or
+# a NUL ends a FASTA header and a Newick label wherever it occurs. Structural
+# punctuation is deliberately NOT in here -- see NEWICK_UNSAFE_TIP_CHARS in
+# tree_edit_service for why parentheses, colons, commas and the rest survive
+# every format this site exports.
+#
+# A tab is rejected rather than folded because this is a programmatic client
+# with no one to see a "we cleaned that up for you" notice; the browser rename
+# path folds it instead, via normalize_tip_name().
 _NEWICK_UNSAFE = set(NEWICK_UNSAFE_TIP_CHARS) | set("\t\n\r")
 
 
@@ -1534,7 +1589,7 @@ def _validate_tip_name(field, value, *, allow_newick_unsafe=False):
     must match what already exists in the tree (those values came from the
     pipeline itself, not from the caller, so we only length-bound them).
     For new names introduced by the caller (`new_name`), we additionally
-    reject Newick-unsafe characters.
+    reject the characters no export format can represent.
     """
     s, err = _validate_string(
         field, value,
@@ -1549,10 +1604,11 @@ def _validate_tip_name(field, value, *, allow_newick_unsafe=False):
             return None, error_response(
                 code="validation_failed",
                 message=(
-                    f"`{field}` contains characters that are invalid in "
-                    f"Newick tip names: {bad}. Avoid parentheses, brackets, "
-                    f"commas, colons, semicolons, and whitespace other than "
-                    f"spaces."
+                    f"`{field}` contains characters that cannot appear in a "
+                    f"tip name: {[repr(c) for c in bad]}. Line breaks, tabs "
+                    f"and NUL end a FASTA header and a Newick label; every "
+                    f"other printable character, punctuation included, is "
+                    f"accepted."
                 ),
                 status=422,
                 details={"field": field, "invalid_chars": bad},

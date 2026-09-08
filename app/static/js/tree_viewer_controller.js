@@ -1572,10 +1572,16 @@ document.addEventListener('DOMContentLoaded', async () => {
         // automatic highlight colour is assigned per annotation id, so the preview and the saved
         // annotation have to be talking about the same one.
         if (mode !== 'edit') annotationEditorState.pendingId = newAnnotationId('annotation');
+        annotationEditorState.memberGroups = viewer?.getAnnotationMemberGroups
+            ? viewer.getAnnotationMemberGroups(annotationEditorState.memberIds)
+            : [annotationEditorState.memberIds];
+        annotationEditorState.membershipMode = existing?.membership_mode
+            || (!existing && annotationEditorState.memberGroups.length > 1 ? 'selection' : null);
         // Alan 8/17/26 - Whole-tree clades may use a bracket, but the root has no incoming
         // segment on which branch text or a branch bubble could be placed.
         annotationEditorState.hasIncomingBranch = viewer?.hasIncomingBranchForMemberIds
-            ? viewer.hasIncomingBranchForMemberIds(annotationEditorState.memberIds)
+            ? !annotationEditorState.membershipMode
+                && viewer.hasIncomingBranchForMemberIds(annotationEditorState.memberIds)
             : true;
         annotationEditorState.defaultType = preferredNewAnnotationType();
 
@@ -1607,7 +1613,9 @@ document.addEventListener('DOMContentLoaded', async () => {
         // Alan 8/17/26 - Describe saved membership as descendants of the annotated branch.
         getEl('annotation-editor-subtitle').textContent =
             // Alan 8/17/26 - Use branch-relative descendant wording for the membership count.
-            `${count} descendant tip${count === 1 ? '' : 's'} on this branch.`;
+            annotationEditorState.memberGroups.length > 1
+                ? `${count} selected tips across ${annotationEditorState.memberGroups.length} clades, sharing one annotation and label.`
+                : `${count} descendant tip${count === 1 ? '' : 's'} on this branch.`;
         // Alan 8/26/26 - A new annotation opens pre-filled with the clade's dominant species
         // name; it is selected below so typing replaces it outright.
         const suggestedLabel = existing ? '' : suggestedAnnotationLabel(annotationEditorState.memberIds);
@@ -1668,7 +1676,7 @@ document.addEventListener('DOMContentLoaded', async () => {
         if (!annotationEditorState.hasIncomingBranch
             && !CLADE_ANNOTATION_TYPES.includes(requestedType)) {
             setAnnotationEditorError(
-                'The whole-tree root has no incoming branch. Use Clade line or Clade highlight.'
+                'This group has no single incoming branch. Use Clade line or Clade highlight.'
             );
             return;
         }
@@ -1684,6 +1692,7 @@ document.addEventListener('DOMContentLoaded', async () => {
             annotation_type: canonicalAnnotationType(requestedType),
             member_tip_ids: annotationEditorState.memberIds.slice()
         };
+        if (annotationEditorState.membershipMode) payload.membership_mode = annotationEditorState.membershipMode;
         ANNOTATION_STYLE_FIELDS.forEach(({ field }) => {
             payload[field] = annotationEditorState.style[field] ?? null;
         });
@@ -2161,15 +2170,13 @@ document.addEventListener('DOMContentLoaded', async () => {
         });
     }
 
-    // Alan 8/15/26 - Secondary workflow: annotate whatever is selected, but only when the
-    // selection is exactly one clade. Anything else would draw a bracket across taxa that
-    // do not belong to it, so refuse with an explanation instead.
+    // Apply one label to all selected tips, splitting into complete clades as needed.
     function annotateCurrentSelection() {
-        if (!annotationsEditable() || !viewer?.getSelectedCladeLeafIds) return;
-        const memberIds = viewer.getSelectedCladeLeafIds();
-        if (!memberIds) {
+        if (!annotationsEditable() || !viewer?.getSelectedAnnotationLeafIds) return;
+        const memberIds = viewer.getSelectedAnnotationLeafIds();
+        if (!memberIds.length) {
             showStatus(
-                'The selected sequences do not form a single clade. Select a complete clade or right-click its branch.',
+                'Select the sequences you want to annotate.',
                 'warning', 6000
             );
             return;

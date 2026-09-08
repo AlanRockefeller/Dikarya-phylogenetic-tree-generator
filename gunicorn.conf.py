@@ -32,4 +32,4 @@ stay authoritative there; keep this file to settings the unit does not pass.
 # %(D)s is appended last so existing log parsing that counts fields from the
 # left keeps working.
 # Referrer is intentionally omitted: it can itself contain OAuth/query values.
-access_log_format = '%(h)s %(l)s %(u)s %(t)s "%(m)s %(U)s %(H)s" %(s)s %(b)s "-" "%(a)s" %(D)s req=%({x-request-id}o)s'
+access_log_format = '%(h)s %(l)s %(u)s %(t)s "%(m)s %(U)s %(H)s" %(s)s %(b)s "-" "%(a)s" %(D)s req=%({x-request-id}o)s noise=%({x-dikarya-noise}o)s'

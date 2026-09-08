@@ -1,0 +1,14 @@
+#!/usr/bin/python3 -I
+"""Schedule a bulk restart after the active job. No arguments or force mode."""
+import runpy
+import sys
+
+
+if __name__ == "__main__":
+    try:
+        guard = runpy.run_path("/usr/local/libexec/dikarya-worker-restart")
+        sys.exit(guard["main"](bulk=True, after_current=True))
+    except Exception as exc:
+        print("Graceful restart could not be confirmed (" + type(exc).__name__
+              + "). Check bulk service status before retrying.", file=sys.stderr)
+        sys.exit(78)

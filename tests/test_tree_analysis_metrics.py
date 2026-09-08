@@ -1450,6 +1450,45 @@ def test_an_oversized_supported_group_is_reopened(monkeypatch):
     assert max(g["tips"] for g in digest["groups"]) < 8
 
 
+def test_only_the_reopened_groups_are_marked_as_nested():
+    """Reopening one oversized clade says nothing about the other clades.
+
+    A 30-tip supported clade beside an independent 10-tip one is reopened into
+    two 15-tip groups. All three are listed and the reopening flag is set, but
+    only the two replacements descend from a common supported clade -- the
+    prompt used to tell the reviewer all three did.
+    """
+    def group(prefix, count):
+        tips = ",".join(f"{prefix}{i}:1" for i in range(count))
+        return f"({tips})100:1"
+
+    tree = _newick_tree(
+        f"(({group('p', 15)},{group('q', 15)})100:1,{group('r', 10)});"
+    )
+    digest = service._topology_digest(
+        tree, service._tip_names_by_clade(tree), 70.0
+    )
+
+    assert digest["one_clade_held_most_of_the_tree"] is True
+    marked = {
+        g["tips"]: g.get("nested_inside_a_larger_supported_clade")
+        for g in digest["groups"]
+    }
+    assert marked == {15: True, 10: None}
+
+
+def test_shape_only_groups_are_never_marked_as_nested():
+    tree = _newick_tree("(((a:1,b:1)10:1,(c:1,d:1)12:1)8:1,(e:1,f:1)9:1);")
+    digest = service._topology_digest(
+        tree, service._tip_names_by_clade(tree), 70.0
+    )
+
+    assert digest["basis"] == "topology_only"
+    assert all(
+        "nested_inside_a_larger_supported_clade" not in g for g in digest["groups"]
+    )
+
+
 def test_topology_digest_falls_back_to_shape_and_says_so():
     tree = _newick_tree("(((a:1,b:1)10:1,(c:1,d:1)12:1)8:1,(e:1,f:1)9:1);")
     digest = service._topology_digest(
@@ -1459,7 +1498,7 @@ def test_topology_digest_falls_back_to_shape_and_says_so():
     assert digest["basis"] == "topology_only"
     assert "not supported groupings" in digest["definition"]
     # Nothing is claimed as supported on a tree where nothing is.
-    assert digest["outermost_strongly_supported_clades_total"] == 0
+    assert digest["one_clade_held_most_of_the_tree"] is False
     assert digest["tips_not_in_any_listed_group"] == 0
 
 
@@ -1596,19 +1635,69 @@ def test_split_labels_are_not_computed_on_a_shape_only_digest():
     assert service._labels_split_across_clades(structure, index) == []
 
 
-def test_split_labels_ignore_a_group_whose_members_were_truncated():
-    # An absence from a sampled member list is not evidence of absence.
+def test_split_labels_see_past_a_truncated_member_list():
+    """The evidence is the full membership, not the published sample.
+
+    Reading `tip_names` meant a large clade -- exactly the kind that gets
+    truncated -- contributed nothing to this check.
+    """
     structure = {
         "basis": "strong_support",
         "groups": [
-            {"id": "C1", "tip_names": ["a"], "tip_names_truncated": True},
-            {"id": "C2", "tip_names": ["b"], "tip_names_truncated": False},
+            {"id": "C1", "tip_names": ["a"], "tip_names_truncated": True,
+             "_all_tip_names": ["a", "hidden"]},
+            {"id": "C2", "tip_names": ["b"], "tip_names_truncated": False,
+             "_all_tip_names": ["b"]},
         ],
     }
-    index = {"a": {"taxon": "Cortinarius croceus"},
+    index = {"a": {"taxon": "Amanita muscaria"},
+             "hidden": {"taxon": "Cortinarius croceus"},
              "b": {"taxon": "Cortinarius croceus"}}
 
-    assert service._labels_split_across_clades(structure, index) == []
+    assert service._labels_split_across_clades(structure, index) == [
+        {"taxon_label": "Cortinarius croceus", "groups": ["C1", "C2"],
+         "group_count": 2}
+    ]
+
+
+def test_a_mixed_genus_group_is_reported_even_when_the_minority_is_truncated():
+    """The 19-tip clade whose 15th member was labelled Psathyrellaceae.
+
+    Eight names were published, all Inocybe, so nothing in the digest said the
+    group was mixed.
+    """
+    index = {f"inocybe {i}": {"taxon": f"Inocybe species{i}"} for i in range(14)}
+    index["odd one"] = {"taxon": "Psathyrellaceae something"}
+    tips = [f"inocybe {i}" for i in range(14)] + ["odd one", "unlabelled tip"]
+
+    composition = service._group_label_composition(tips, index)
+
+    assert composition["top_rank_label_counts"] == {"Inocybe": 14,
+                                                   "Psathyrellaceae": 1}
+    assert composition["above_genus"] == ["Psathyrellaceae"]
+    assert composition["tips_without_a_usable_label"] == 1
+
+
+def test_a_homogeneous_group_carries_no_composition():
+    index = {"a": {"taxon": "Inocybe lacera"}, "b": {"taxon": "Inocybe leptophylla"}}
+    assert service._group_label_composition(["a", "b"], index) is None
+
+
+@pytest.mark.parametrize(
+    "label", ["uncultured Sebacina", "Environmental Sample", "PZ355852", ""],
+)
+def test_a_label_that_names_nothing_is_not_a_top_rank_label(label):
+    assert service._leading_taxon_label(label) is None
+
+
+@pytest.mark.parametrize(
+    "label,expected",
+    [("Inocybe lacera", "Inocybe"), ("Psathyrellaceae", "Psathyrellaceae"),
+     ("Inocybaceae sp.", "Inocybaceae")],
+)
+def test_a_higher_rank_label_still_counts_as_a_label(label, expected):
+    # Dropping these lost the Psathyrellaceae-inside-Inocybe finding entirely.
+    assert service._leading_taxon_label(label) == expected
 
 
 def test_the_largest_internal_gap_ignores_terminal_padding():

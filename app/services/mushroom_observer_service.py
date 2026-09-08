@@ -8,6 +8,7 @@ import re
 import urllib.error
 import urllib.parse
 import urllib.request
+from app.services.api_diagnostics import diagnostic_urlopen, record_api_failure
 import uuid
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -119,7 +120,7 @@ def _api_request(table: str, *, params: Optional[Dict[str, Any]] = None,
         headers["Content-Type"] = "application/x-www-form-urlencoded"
     request = urllib.request.Request(url, data=data, headers=headers, method=method)
     try:
-        with urllib.request.urlopen(request, timeout=REQUEST_TIMEOUT) as response:
+        with diagnostic_urlopen(request, timeout=REQUEST_TIMEOUT) as response:
             import json
 
             payload = json.loads(response.read().decode("utf-8", errors="replace") or "{}")
@@ -154,6 +155,8 @@ def _api_request(table: str, *, params: Optional[Dict[str, Any]] = None,
 
     errors = payload.get("errors") if isinstance(payload, dict) else None
     if errors:
+        record_api_failure(url, reason="api_error_payload", status=200, body=payload,
+                           method=method, req=request)
         detail = str((errors[0] or {}).get("details") or "Mushroom Observer API error.")
         safe_detail = _clean_text(detail, 300)
         logger.warning(
@@ -162,6 +165,8 @@ def _api_request(table: str, *, params: Optional[Dict[str, Any]] = None,
         )
         raise MushroomObserverError(safe_detail, status=502)
     if not isinstance(payload, dict):
+        record_api_failure(url, reason="invalid_response_object", status=200, body=payload,
+                           method=method, req=request)
         logger.warning(
             "Mushroom Observer API returned non-object JSON table=%s method=%s type=%s",
             table, method, type(payload).__name__,

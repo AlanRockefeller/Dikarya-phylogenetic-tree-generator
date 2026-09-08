@@ -1,0 +1,169 @@
+#!/usr/bin/python3 -I
+"""Root-owned entry point. No arguments; JSON report and exact-job consent on stdin.
+
+Install the same file as restart-dikarya-worker-bulk for the bulk queue.
+Exit 75 means active jobs need a human decision; 78 means unsafe configuration.
+Noninteractive callers must not synthesize consent without asking the user.
+"""
+import json
+import fcntl
+import os
+import shlex
+import subprocess
+import sys
+
+
+def run(*args):
+    return subprocess.check_output(args, text=True, timeout=15).strip()
+
+
+def _bulk_restart_state():
+    unit = "dikarya-worker-bulk.service"
+    properties = (
+        "LoadState", "ActiveState", "SubState", "MainPID", "Job",
+        "KillMode", "KillSignal", "TimeoutStopUSec",
+    )
+    text = run("/usr/bin/systemctl", "show", unit, "--all",
+               "--property=" + ",".join(properties))
+    state = dict(line.split("=", 1) for line in text.splitlines() if "=" in line)
+    # systemd can omit an empty ExecStop array even with --all.
+    state["ExecStop"] = run("/usr/bin/systemctl", "show", unit, "-p", "ExecStop", "--value")
+    if not all(key in state for key in properties) or any(
+        state.get(key) != value for key, value in {
+            "LoadState": "loaded", "KillMode": "mixed", "KillSignal": "15",
+            "TimeoutStopUSec": "infinity", "ExecStop": "",
+        }.items()
+    ):
+        raise ValueError("Bulk worker requires mixed/SIGTERM shutdown, an unlimited stop timeout, and no ExecStop")
+    return state
+
+
+def _bulk_restart_pending(state):
+    if state["Job"] not in ("", "0") or state["ActiveState"] in ("deactivating", "activating"):
+        print("A bulk service operation is already pending or in progress; no additional signal sent.")
+        print("Check: systemctl status dikarya-worker-bulk.service")
+        return True
+    return False
+
+
+def _restart_bulk_after_current():
+    # Root-owned, outside the writable checkout. Serialize graceful requests so
+    # repeated invocations cannot deliver RQ's second (force-stop) signal.
+    fd = os.open("/run/dikarya-worker-bulk-restart.lock",
+                 os.O_CREAT | os.O_RDWR | os.O_CLOEXEC | os.O_NOFOLLOW, 0o600)
+    with os.fdopen(fd, "w") as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            print("Another graceful bulk restart request is being checked; retry after it returns.")
+            return 75
+        state = _bulk_restart_state()
+        if _bulk_restart_pending(state):
+            return 0
+        # The checkout and its interpreter are writable by the application
+        # accounts. Import them as dikarya, never as root, with a clean env.
+        check = subprocess.run([
+            "/usr/sbin/runuser", "-u", "dikarya", "--",
+            "/var/www/dikarya/scripts/dikarya-preflight",
+        ], env={"PATH": "/usr/bin:/bin", "LANG": "C.UTF-8"}, timeout=60)
+        if check.returncode:
+            print("Preflight failed; no restart requested.")
+            return 78
+        state = _bulk_restart_state()
+        if _bulk_restart_pending(state):
+            return 0
+        # systemd owns the wait, not this terminal. --job-mode=fail also refuses
+        # to replace a conflicting service operation arriving after the check.
+        result = subprocess.run([
+            "/usr/bin/systemctl", "restart", "--no-block", "--job-mode=fail",
+            "dikarya-worker-bulk.service",
+        ], timeout=15)
+        if result.returncode:
+            print("systemd did not accept the restart request; check service status.")
+            return 70
+        print("Bulk restart scheduled. The current job will finish before the worker restarts; queued jobs will then resume.")
+        print("You can close this terminal. Scheduling succeeded; restart completion is still pending.")
+        print("Previous MainPID: " + state["MainPID"])
+        print("Check: systemctl show dikarya-worker-bulk.service -p ActiveState -p SubState -p MainPID")
+        print("Logs: tail -n 30 /var/www/dikarya/var/logs/worker-bulk.log")
+        return 0
+
+
+def main(*, bulk=None, after_current=False):
+    if len(sys.argv) != 1 or os.geteuid() != 0:
+        return 64
+    if bulk is None:
+        bulk = os.path.basename(sys.argv[0]) == "restart-dikarya-worker-bulk"
+    if after_current:
+        if not bulk:
+            return 64
+        return _restart_bulk_after_current()
+    unit = "dikarya-worker-bulk.service" if bulk else "dikarya-worker.service"
+    queue = "phylo_bulk" if bulk else "phylo_high"
+    # Safe default even if a job arrives between the check and systemctl restart.
+    mode = run("/usr/bin/systemctl", "show", unit, "-p", "KillMode", "--value")
+    timeout = run("/usr/bin/systemctl", "show", unit, "-p", "TimeoutStopUSec", "--value")
+    if mode != "mixed" or timeout != "infinity":
+        print("Install dikarya-worker-graceful.conf and daemon-reload first; refusing unsafe restart.")
+        return 78
+    # Read only the two required settings; never execute environment-file text.
+    env = {"PATH": "/usr/bin:/bin", "LANG": "C.UTF-8"}
+    with open("/etc/dikarya/dikarya.environment.live") as stream:
+        for line in stream:
+            if "=" not in line or line.lstrip().startswith("#"):
+                continue
+            key, value = line.strip().split("=", 1)
+            if key in ("DATABASE_URL", "REDIS_URL"):
+                values = shlex.split(value, comments=True)
+                if len(values) != 1:
+                    raise ValueError("Unsupported environment value")
+                env[key] = values[0]
+
+    def report():
+        result = subprocess.check_output([
+            "/usr/sbin/runuser", "-u", "dikarya", "--",
+            "/var/www/dikarya/.venv/bin/python",
+            "/var/www/dikarya/scripts/dikarya_worker_restart_report.py", queue,
+        ], env=env, text=True, timeout=30)
+        return json.loads(result)
+
+    state = report()
+    print(json.dumps(state, indent=2), flush=True)
+    ids = sorted(job["id"] for job in state["jobs"])
+    if ids:
+        token = "INTERRUPT " + ",".join(ids)
+        print("Running work will be lost by immediate restart. Default: leave worker running.")
+        print("Agents: show this report to the user, ask whether to interrupt or wait, then stop.")
+        print("After explicit approval, provide this exact line on stdin: " + token, flush=True)
+        if sys.stdin.isatty():
+            answer = input("Type that line to interrupt, or press Enter to cancel: ")
+        else:
+            # Never block an agent waiting for an input that will not arrive.
+            import select
+            answer = sys.stdin.readline().strip() if select.select([sys.stdin], [], [], 0)[0] else ""
+        if answer != token:
+            return 75
+        # Stop assignment before acting on consent so a different job cannot
+        # replace the approved one between the final census and the kill.
+        subprocess.run(["/usr/bin/systemctl", "freeze", unit], check=True)
+        try:
+            current = report()
+            if sorted(job["id"] for job in current["jobs"]) != ids:
+                print("Job set changed; obtain a fresh report and approval.")
+                return 75
+            subprocess.run(["/usr/bin/systemctl", "kill", "--kill-whom=all", "--signal=SIGKILL", unit], check=True)
+        finally:
+            subprocess.run(["/usr/bin/systemctl", "thaw", unit], check=False)
+    # --no-block: an idle-check race drains safely in the background; do not
+    # hold an agent tool call open for the duration of a newly started job.
+    subprocess.run(["/usr/bin/systemctl", "restart", "--no-block", unit], check=True)
+    print("Restart requested. Check ActiveState/MainPID and worker logs for completion.")
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except Exception as exc:
+        print("Restart refused: safety check failed (" + type(exc).__name__ + ").", file=sys.stderr)
+        sys.exit(78)

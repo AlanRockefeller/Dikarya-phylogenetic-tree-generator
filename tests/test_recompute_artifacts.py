@@ -158,3 +158,40 @@ def test_malformed_staged_recompute_does_not_replace_live_tree(tmp_path, monkeyp
     assert installed == []
     assert live_newick.read_text() == "(A:0.1,B:0.1);\n"
     assert live_nexus.read_text() == "last usable nexus\n"
+
+
+def test_install_recompute_outputs_replaces_the_mrbayes_name_map(recompute_dirs):
+    """The decoder ring belongs to the generation it was written beside.
+
+    Pruning renumbers the SEQnnnnnn ids, so a map left by the original run
+    decodes the recomputed run's taxa to the wrong sequences.
+    """
+    from app.services.fasta_utils import NAME_MAP_FILENAME
+    from app.services.tree_edit_service import _install_recompute_outputs
+
+    job_dir, output_dir = recompute_dirs
+    (output_dir / "tree" / "mrbayes_input.nex").write_text("new")
+    (output_dir / "tree" / NAME_MAP_FILENAME).write_text("SEQ000001\tKept two\n")
+    (job_dir / "tree" / "mrbayes_input.nex").write_text("old")
+    (job_dir / "tree" / NAME_MAP_FILENAME).write_text(
+        "SEQ000001\tDropped one\nSEQ000002\tKept two\n"
+    )
+
+    _install_recompute_outputs(job_dir, output_dir)
+
+    assert (job_dir / "tree" / NAME_MAP_FILENAME).read_text() == "SEQ000001\tKept two\n"
+
+
+def test_install_recompute_outputs_drops_a_name_map_with_no_mrbayes_run(recompute_dirs):
+    """Recomputing with another builder must not leave the old key behind."""
+    from app.services.fasta_utils import NAME_MAP_FILENAME
+    from app.services.tree_edit_service import _install_recompute_outputs
+
+    job_dir, output_dir = recompute_dirs
+    (job_dir / "tree" / "mrbayes_input.nex").write_text("old")
+    (job_dir / "tree" / NAME_MAP_FILENAME).write_text("SEQ000001\tDropped one\n")
+
+    _install_recompute_outputs(job_dir, output_dir)
+
+    assert not (job_dir / "tree" / NAME_MAP_FILENAME).exists()
+    assert not (job_dir / "tree" / "mrbayes_input.nex").exists()

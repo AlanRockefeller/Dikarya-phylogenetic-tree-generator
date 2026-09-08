@@ -913,6 +913,15 @@ def run_mycomap_blast_refresh_job(params: dict) -> dict:
                     job.meta["mycomap_refresh_stage"] = "waiting_for_ncbi"
                     job.meta["mycomap_refresh_warnings"] = warnings
                     job.save_meta()
+                # The resumption RQ schedules here emits another job.started,
+                # which reads exactly like the restart of a failed attempt. Say
+                # so explicitly, or the log digest reports a planned wait for
+                # MycoMap as a retry.
+                logger.info(
+                    "event=job.deferred Waiting for MycoMap NCBI results "
+                    "reason=mycomap_ncbi_rerun resume_in_seconds=%s",
+                    wait_seconds,
+                )
                 return Retry(max=1, interval=wait_seconds)
             except MycoMapRerunError as exc:
                 warning = f"MycoMap NCBI BLAST could not be rebuilt; using saved results instead. {exc}"
@@ -1075,7 +1084,7 @@ def run_phylo_job(job_params: dict) -> dict:
                     job.meta["steps"][STEP_BLAST]["state"] = STATE_SKIPPED
                     job.meta["steps"][STEP_BLAST]["label"] = "BLAST Search (skipped)"
                     job.meta["steps"][STEP_BLAST]["detail"] = (
-                        "BLAST skipped (not requested for this input)"
+                        "BLAST skipped (no NCBI refresh requested)"
                     )
 
                 # Trim is skipped only when both external and terminal trimming are disabled.
@@ -1289,6 +1298,13 @@ def run_phylo_job(job_params: dict) -> dict:
                         publish_overview(job_id, warning, icon=STATE_FAILED)
                     publish_overview(job_id, waiting_message)
                     publish_job_queued(job_id)
+                    # Same as the refresh task: mark the wait so the resumed
+                    # job.started is not counted as a failure retry.
+                    logger.info(
+                        "event=job.deferred Waiting for MycoMap NCBI results "
+                        "reason=mycomap_ncbi_rerun resume_in_seconds=%s attempts_left=%s",
+                        wait_seconds, max_retry_attempts,
+                    )
                     return Retry(max=max_retry_attempts, interval=wait_seconds)
 
                 job_params = prepared["job_params"]

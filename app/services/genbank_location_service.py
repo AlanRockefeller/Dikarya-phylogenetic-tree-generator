@@ -18,6 +18,7 @@ from typing import Dict, List, Optional, Tuple
 import requests
 
 from app.config import Config
+from app.services.api_diagnostics import record_requests_failure
 from app.services.blast_service import (
     NCBI_EFETCH_URL,
     _ncbi_request,
@@ -196,6 +197,7 @@ def reverse_geocode(lat: float, lon: float) -> str:
         if elapsed < _GEOCODE_MIN_GAP_SECONDS:
             time.sleep(_GEOCODE_MIN_GAP_SECONDS - elapsed)
 
+        response = None
         try:
             response = requests.get(
                 Config.REVERSE_GEOCODE_URL,
@@ -214,6 +216,7 @@ def reverse_geocode(lat: float, lon: float) -> str:
             response.raise_for_status()
             payload = response.json()
         except Exception as e:
+            record_requests_failure(response, reason=type(e).__name__)
             logger.warning(f"Reverse geocode failed for {lat},{lon}: {e}")
             return ""
         finally:

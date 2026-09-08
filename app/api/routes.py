@@ -1,4 +1,4 @@
-from flask import jsonify, request, send_file, url_for
+from flask import g, jsonify, request, send_file, url_for
 from flask_login import current_user
 from app.api import bp
 from app.workers.queue import (
@@ -36,6 +36,7 @@ from app.services.its_extraction_service import (
     resolve_min_length as resolve_its_min_length,
 )
 from app.services.access_control import check_job_access
+from app.services.request_diagnostics import note_request_failure
 from app.services.tree_undo_service import (
     UndoUnavailable,
     clear_undo_checkpoint,
@@ -942,6 +943,32 @@ def _normalize_import_filter_details(raw):
             },
         }
 
+    # Alan 9/6/26 - Duplicates the Tree Builder queue collapsed before submitting.
+    # These never reach any server-side filter, so without carrying them through
+    # here the viewer would have no record that they existed.
+    queue_duplicates = raw.get("queue_duplicates")
+    if isinstance(queue_duplicates, dict):
+        rows = []
+        for item in (queue_duplicates.get("removed_records") or [])[:MAX_IMPORT_FILTER_DETAIL_RECORDS]:
+            if not isinstance(item, dict):
+                continue
+            rows.append({
+                "name": str(item.get("name") or "")[:500],
+                "kept_as": str(item.get("kept_as") or "")[:500],
+                "identifier": str(item.get("identifier") or "")[:100],
+                "location": str(item.get("location") or "")[:200],
+                "reason": str(item.get("reason") or "")[:80],
+                "reason_label": str(item.get("reason_label") or "")[:200],
+                "removed_length": _count(item.get("removed_length")),
+                "kept_length": _count(item.get("kept_length")),
+            })
+        if rows or queue_duplicates.get("removed_count"):
+            normalized["queue_duplicates"] = {
+                "label": str(queue_duplicates.get("label") or "Duplicates not added")[:100],
+                "removed_count": _count(queue_duplicates.get("removed_count")) or len(rows),
+                "removed_records": rows,
+            }
+
     return normalized
 
 
@@ -1048,6 +1075,123 @@ def _sequence_exact_key(seq):
     return header, sequence
 
 
+# Cap header lengths to prevent abuse (e.g., 200KB pasted headers).
+MAX_SEQ_ID_LEN = 100
+MAX_DESC_LEN = 300
+
+
+def _record_identity(seq):
+    """(uppercased sequence ID, uppercased sequence) as this record will be stored.
+
+    Mirrors the sanitizing and truncation _format_fasta_record_for_job() applies,
+    so a duplicate check compares the ID the file will actually carry.
+    """
+    raw_header = seq.get('name', '') or ''
+    sanitized_header = "".join(ch for ch in raw_header if ord(ch) >= 32 or ch == '\t')
+    seq_id, _rest = _split_fasta_header(sanitized_header)
+    sequence = ''.join(str(seq.get('sequence') or '').split())
+    return seq_id[:MAX_SEQ_ID_LEN].upper(), sequence.upper()
+
+
+def _find_duplicate_record(seq_id, sequence, records_by_id):
+    """The already-present record this one duplicates, or None.
+
+    Allows for trim differences.
+
+    Alan 9/6/26 - MycoMap trims each NCBI BLAST hit to the region that aligned
+    with that search's query, so pulling the same accession from a second BLAST
+    returns the same record a few bases longer or shorter -- 704 vs 707 is
+    typical -- and sometimes with a relabelled taxon after a MycoMap taxonomy
+    update. _sequence_exact_key() compares header plus sequence, so it read
+    those as new records and _make_unique_id() filed them as `ACC_added`. One
+    Entoloma job reached 423 records for 334 accessions that way: 88 of its 89
+    `_added` records were the same accession with one sequence a substring of
+    the other, and each one drew its own tip.
+
+    Same identifier plus a nested sequence is the same record. Two genuinely
+    different sequences under one identifier still get the _added suffix, which
+    is what that suffix is for.
+    """
+    if not seq_id or not sequence:
+        return None
+    for existing in records_by_id.get(seq_id, ()):
+        stored = existing.get("sequence") or ""
+        if stored and (stored in sequence or sequence in stored):
+            return existing
+    return None
+
+
+def _describe_skipped_duplicate(seq, kept, reason):
+    """One row for the viewer's "Duplicates Not Added" table.
+
+    Records what was dropped, what it was dropped in favour of, and the two
+    lengths, so a reader can see the trim difference that made the two copies
+    look like different records in the first place.
+    """
+    removed_header = str(seq.get('name') or '').strip()
+    removed_sequence = ''.join(str(seq.get('sequence') or '').split())
+    kept = kept or {}
+    kept_sequence = str(kept.get('sequence') or '')
+    labels = {
+        'same_record_refetched': (
+            "Same record from another BLAST, trimmed to a different length"
+        ),
+        'exact_duplicate': "Identical header and sequence",
+    }
+    return {
+        "name": removed_header[:500],
+        "kept_as": str(kept.get('header') or '')[:500],
+        "identifier": str(kept.get('identifier') or '')[:100],
+        "reason": reason[:80],
+        "reason_label": labels.get(reason, reason)[:200],
+        "removed_length": len(removed_sequence),
+        "kept_length": len(kept_sequence),
+    }
+
+
+def _merge_queue_duplicate_details(job_dir, removed_records):
+    """Append skipped-duplicate rows to the job's stored import diagnostics.
+
+    The viewer reads its provenance panels straight out of input_info.json, so a
+    duplicate dropped after submission has to be written back there or it is
+    dropped silently -- which is the thing that made this class of bug invisible
+    for as long as it was.
+    """
+    if not removed_records:
+        return
+    import json  # module-level import is deliberately avoided in this file
+    input_info_path = job_dir / "input_info.json"
+    if not validate_safe_file_path(input_info_path, job_dir) or not input_info_path.exists():
+        return
+    try:
+        with open(input_info_path, "r") as handle:
+            stored = json.load(handle)
+        if not isinstance(stored, dict):
+            return
+        details = stored.setdefault("import_filter_details", {})
+        if not isinstance(details, dict):
+            details = {}
+            stored["import_filter_details"] = details
+        block = details.get("queue_duplicates")
+        if not isinstance(block, dict):
+            block = {"label": "Duplicates not added", "removed_count": 0, "removed_records": []}
+        existing = block.get("removed_records")
+        if not isinstance(existing, list):
+            existing = []
+        combined = (existing + removed_records)[:MAX_IMPORT_FILTER_DETAIL_RECORDS]
+        block["label"] = "Duplicates not added"
+        block["removed_records"] = combined
+        # Count every one that was skipped, even past the row cap.
+        block["removed_count"] = int(block.get("removed_count") or 0) + len(removed_records)
+        details["queue_duplicates"] = block
+        with open(input_info_path, "w") as handle:
+            json.dump(stored, handle, separators=(",", ":"))
+    except (OSError, ValueError, TypeError) as exc:
+        # Losing the diagnostic must never fail the add, which has already
+        # written the sequences the user asked for.
+        logger.warning("Could not record skipped duplicates for %s: %s", job_dir.name, exc)
+
+
 def _format_fasta_record_for_job(seq, used_ids, fallback_index):
     # Sanitize header: remove control chars including \0
     raw_header = seq.get('name', '')
@@ -1056,9 +1200,6 @@ def _format_fasta_record_for_job(seq, used_ids, fallback_index):
     # Split header to dedupe by ID properly
     seq_id, rest = _split_fasta_header(sanitized_header)
 
-    # Cap header lengths to prevent abuse (e.g., 200KB pasted headers)
-    MAX_SEQ_ID_LEN = 100
-    MAX_DESC_LEN = 300
     seq_id = seq_id[:MAX_SEQ_ID_LEN]
     rest = rest[:MAX_DESC_LEN]
 
@@ -2612,6 +2753,7 @@ def create_job():
             tree_method, requested_bootstrap
         )
     except ValueError as exc:
+        note_request_failure("invalid_iqtree_bootstrap")
         return jsonify({"status": "error", "error": str(exc)}), 400
     job_params["bootstrap"] = _clamp_int(requested_bootstrap, 1000, 0, 10_000)
     job_params["mcmc_generations"] = _clamp_int(
@@ -2654,6 +2796,7 @@ def create_job():
         try:
             validate_dna_fasta(job_params["sequence"])
         except ValueError as e:
+            note_request_failure("invalid_dna_fasta")
             return jsonify({"status": "error", "error": str(e)}), 400
 
     # Apply the same submission-wide dedup/warning logic enqueue_job normally
@@ -2661,6 +2804,7 @@ def create_job():
     # preserves the observable params while ensuring RQ cannot run first.
     prepare_phylo_job_params(job_params)
     job_id = str(uuid.uuid4())
+    g.job_id = job_id
     job_record = Job(
         id=job_id,
         status="queued",
@@ -3802,18 +3946,169 @@ def download_nexus(job_id):
     if error_msg:
         return jsonify({"status": "error", "error": error_msg}), status_code
 
+    from io import BytesIO
+
+    from app.services.tree_io import build_nexus_download
+
+    if not validate_job_id(job_id):
+        return jsonify({"status": "error", "error": "Invalid job id"}), 400
+
     job_dir = Config.JOB_DIR / job_id
-        
-    pruned_path = job_dir / "tree" / "tree_pruned.nexus"
-    original_path = job_dir / "tree" / "tree_original.nexus"
-    
-    path = pruned_path if pruned_path.exists() else original_path
-    if not validate_safe_file_path(path, job_dir):
+    # Rebuilt from the Newick whenever the stored NEXUS is stale or was written
+    # by Biopython's writer, which mangles any label containing a space or a
+    # parenthesis -- see build_nexus_download().
+    built = build_nexus_download(job_dir)
+    if built is None:
         return jsonify({"status": "error", "error": "Tree file not found or invalid"}), 404
-        
-    response = send_file(path, as_attachment=True, download_name="tree.nexus")
+
+    content, source = built
+    logger.info("Serving NEXUS for job %s from %s", job_id, source)
+    response = send_file(
+        BytesIO(content),
+        as_attachment=True,
+        download_name="tree.nexus",
+        mimetype="text/plain",
+    )
     response.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
     return response
+
+
+def _mrbayes_name_map_text(job_dir):
+    """The SEQnnnnnn -> real name key for a job's MrBayes files, or None.
+
+    Every taxon in a MrBayes run is a SEQnnnnnn id, because a NEXUS matrix
+    label is whitespace-delimited and MrBayes rejects most punctuation on top
+    of that. Unlike the Newick and NEXUS tree files, where quoting carries the
+    real label through, this one is a restriction of the format that cannot be
+    worked around -- so the download ships the key instead of leaving the user
+    with anonymous numbers.
+
+    Newer runs write the map beside themselves. Older ones are reconstructed
+    from the alignment the run consumed: sanitize_fasta_headers() numbers
+    records by position, so reading the same file back in order reproduces it.
+    On a recomputed job that alignment is the recompute's own pruned,
+    realigned set -- reading the original alignment there would shift every id
+    after the first pruned sequence.
+
+    A stored map is served only when it AGREES with that alignment, row for
+    row. A map left behind by an earlier generation is not made current by
+    holding the right number of rows: a recompute that drops one sequence and
+    adds another leaves the count unchanged while every id after the drop now
+    stands for a different sequence.
+    """
+    from app.services.fasta_utils import (
+        NAME_MAP_FILENAME as _map_name,
+        format_name_map,
+    )
+
+    declared = _nexus_declared_ntax(job_dir / "tree" / "mrbayes_input.nex")
+    reconstructed, confirmed = _reconstructed_mrbayes_name_map(job_dir, declared)
+
+    stored_text = None
+    stored = job_dir / "tree" / _map_name
+    if validate_safe_file_path(stored, job_dir):
+        try:
+            stored_text = stored.read_text(encoding="utf-8")
+        except OSError:
+            logger.warning("Could not read the stored MrBayes name map at %s", stored)
+
+    if stored_text is not None:
+        rows = _parse_name_map(stored_text)
+        if confirmed:
+            # The alignment is the ground truth here: it is the file this
+            # generation of the run was sanitized from, and it is selected by
+            # the same rules that decide which alignment built the current tree.
+            if rows == _parse_name_map(format_name_map(reconstructed)):
+                return stored_text
+            logger.warning(
+                "Ignoring the stored MrBayes name map for %s: it does not "
+                "describe the alignment this run was built from", job_dir.name,
+            )
+        elif declared is None or len(rows) == declared:
+            # Nothing to check it against -- the alignments are gone, or none
+            # of them holds the run's taxon count. The map is then the best
+            # evidence available.
+            return stored_text
+        else:
+            logger.warning(
+                "Ignoring the stored MrBayes name map for %s: it describes %d "
+                "taxa but the run declares %d", job_dir.name, len(rows), declared,
+            )
+
+    return format_name_map(reconstructed) if reconstructed else None
+
+
+def _reconstructed_mrbayes_name_map(job_dir, declared):
+    """Rebuild the key from the alignment this generation of the run consumed.
+
+    Returns ``(mapping, confirmed)``. `confirmed` means the alignment holds
+    exactly the number of taxa the run declares, which is what licenses using
+    it to overrule a stored map.
+    """
+    from app.services.artifact_storage import artifact_exists
+    from app.services.fasta_utils import reconstruct_name_map
+
+    # A recompute rebuilds the tree from its own realigned, pruned alignment,
+    # and that is the file its MrBayes run was sanitized from -- the original
+    # alignment would renumber every sequence after the first pruned one.
+    tree_dir = job_dir / "tree"
+    recomputed = artifact_exists(tree_dir / "tree_pruned.newick") and artifact_exists(
+        tree_dir / "tree_pruned_metadata.json"
+    )
+    candidates = []
+    if recomputed:
+        # recompute_tree() always builds from alignment_pruned_trimmed.fasta;
+        # with trimming off the trim step still copies the realigned set into
+        # it, so the aligned file is only a fallback.
+        candidates += [
+            job_dir / "alignment" / "alignment_pruned_trimmed.fasta",
+            job_dir / "alignment" / "alignment_pruned_aligned.fasta",
+        ]
+    candidates += [
+        job_dir / "alignment" / "alignment_trimmed.fasta",
+        job_dir / "alignment" / "alignment_raw.fasta",
+    ]
+
+    fallback = None
+    for path in candidates:
+        if not artifact_exists(path):
+            continue
+        try:
+            mapping = reconstruct_name_map(path)
+        except Exception:
+            logger.warning("Could not reconstruct a MrBayes name map from %s", path)
+            continue
+        if not mapping:
+            continue
+        if declared is not None and len(mapping) == declared:
+            return mapping, True
+        if fallback is None:
+            fallback = mapping
+
+    return fallback, False
+
+
+def _parse_name_map(text):
+    """A stored name map's ``id -> name`` rows, ignoring its comment header."""
+    rows = {}
+    for line in text.splitlines():
+        if not line.strip() or line.lstrip().startswith("#"):
+            continue
+        safe_id, _, original = line.partition("\t")
+        rows[safe_id.strip()] = original.strip()
+    return rows
+
+
+def _nexus_declared_ntax(path):
+    """NTAX from a NEXUS DIMENSIONS line, or None if it cannot be read."""
+    if not path.is_file():
+        return None
+    try:
+        head = path.read_text(errors="replace")[:4000]
+    except OSError:
+        return None
+    match = re.search(r"ntax\s*=\s*(\d+)", head, re.IGNORECASE)
+    return int(match.group(1)) if match else None
 
 
 @bp.route('/job/<job_id>/download/mrbayes', methods=['GET'])
@@ -3825,6 +4120,8 @@ def download_mrbayes_files(job_id):
 
     from io import BytesIO
     from zipfile import ZIP_DEFLATED, ZipFile
+
+    from app.services.fasta_utils import NAME_MAP_FILENAME
 
     job_dir = Config.JOB_DIR / job_id
     tree_dir = job_dir / "tree"
@@ -3844,6 +4141,9 @@ def download_mrbayes_files(job_id):
     with ZipFile(archive, "w", compression=ZIP_DEFLATED) as zip_file:
         for path in files:
             zip_file.write(path, arcname=path.name)
+        name_map = _mrbayes_name_map_text(job_dir)
+        if name_map:
+            zip_file.writestr(NAME_MAP_FILENAME, name_map)
     archive.seek(0)
 
     response = send_file(
@@ -3854,6 +4154,36 @@ def download_mrbayes_files(job_id):
     )
     response.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
     return response
+
+@bp.route('/job/<job_id>/downloads/available', methods=['GET'])
+def available_job_downloads(job_id):
+    """Cheap availability check; never read or decompress large downloads."""
+    _, error_msg, status_code = check_job_access(job_id)
+    if error_msg:
+        return jsonify({"error": error_msg}), status_code
+    job_dir = Config.JOB_DIR / job_id
+
+    def exists(relative):
+        stored = resolve_artifact(job_dir / relative)
+        return stored is not None and validate_safe_file_path(stored, job_dir)
+
+    available = {
+        "dl-original": exists("input/input_raw.fasta"),
+        "dl-aligned": exists("alignment/alignment_raw.fasta") or exists("alignment/aligned.fasta"),
+        "dl-trimmed": exists("alignment/alignment_trimmed.fasta"),
+        "dl-pipeline-log": exists("logs/pipeline.log"),
+        "dl-alignment-log": exists("logs/alignment.log"),
+        "dl-tree-log": exists("logs/tree_builder.log"),
+        "dl-mrbayes": exists("tree/mrbayes_input.nex"),
+    }
+    available["dl-alignment-inspection"] = (
+        available["dl-aligned"] and available["dl-trimmed"]
+        and exists("alignment/alignment_trimmed_report.html")
+    )
+    response = jsonify(available)
+    response.headers["Cache-Control"] = "no-store"
+    return response
+
 
 @bp.route('/job/<job_id>/download/fasta/original', methods=['GET'])
 def download_fasta_original(job_id):
@@ -4732,6 +5062,7 @@ def job_events_stream(job_id):
             # Throttle timers (use monotonic clock for reliable intervals)
             last_ping = stream_started
             last_db_poll = 0.0  # Start at 0 to trigger immediate first poll
+            last_registry_touch = stream_started
 
             # Tunable interval for DB polling (seconds)
             DB_POLL_INTERVAL = 1.0
@@ -4809,7 +5140,15 @@ def job_events_stream(job_id):
                         pass
                 
                 now = time.monotonic()
-                
+
+                # Renew this stream's registry lease. Kept on its own timer and
+                # ahead of the ping yield: the census must stay accurate even
+                # for a stream whose client has stopped reading, which is
+                # precisely the kind that strands a worker thread.
+                if now - last_registry_touch >= sse_registry.RENEW_INTERVAL_SECONDS:
+                    last_registry_touch = now
+                    sse_registry.touch_stream(registry_conn, stream_token)
+
                 # Send keepalive ping every 15 seconds
                 if now - last_ping >= 15:
                     yield "event: ping\ndata: {}\n\n"
@@ -4951,6 +5290,17 @@ def download_log(job_id, log_name):
         download_name=f"{job_id}_{log_files[log_name]}"
     )
 
+@bp.get('/log/client/csrf')
+@limiter.limit("10 per minute")
+def client_log_csrf():
+    """Refresh this browser session's token after a rejected telemetry POST."""
+    from flask_wtf.csrf import generate_csrf
+    response = jsonify(csrf_token=generate_csrf())
+    response.headers['Cache-Control'] = 'no-store'
+    response.headers['Vary'] = 'Cookie'
+    return response
+
+
 @bp.route('/log/client', methods=['POST'])
 @limiter.limit("30 per minute; 500 per day")
 def log_client_error():
@@ -4963,6 +5313,8 @@ def log_client_error():
         return jsonify({"status": "ignored", "error": "payload too large"}), 413
 
     data = request.get_json(silent=True) or {}
+    if not isinstance(data, dict):
+        return jsonify({"status": "ignored"}), 200
     allowed_events = {
         "window_error", "unhandled_rejection", "resource_load_failed",
         "api_non_2xx", "ui_action_failed",
@@ -4987,17 +5339,40 @@ def log_client_error():
     if job_id and not validate_job_id(job_id):
         job_id = ""
     stack = sanitize_telemetry_text(data.get("stack"), 2000)
-    supplied_fingerprint = _client_log_value(data.get("fingerprint"), 80)
-    fingerprint = supplied_fingerprint or hashlib.sha256(
+    server_request_id = data.get("server_request_id")
+    if not isinstance(server_request_id, str) or not re.fullmatch(r"[0-9a-f]{12}", server_request_id):
+        server_request_id = "-"
+
+    def bounded_integer(key, maximum):
+        value = data.get(key)
+        return value if type(value) is int and 0 <= value <= maximum else "-"
+
+    http_status = bounded_integer("http_status", 599)
+    method = data.get("method")
+    if not isinstance(method, str) or method not in {"GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"}:
+        method = "-"
+    online = data.get("online")
+    online = str(online).lower() if type(online) is bool else "unknown"
+    visibility = data.get("visibility")
+    if not isinstance(visibility, str) or visibility not in {"visible", "hidden", "prerender"}:
+        visibility = "unknown"
+    client_release = sanitize_telemetry_text(data.get("release"), 80) or "unknown"
+    # Compute grouping on the server: a supplied fingerprint must not suppress
+    # someone else's error. Distinct users and failing requests stay visible.
+    fingerprint = hashlib.sha256(
         f"{event}|{pathname}|{action}|{message}|{stack[:300]}".encode()
     ).hexdigest()[:16]
+    identity = f"user:{current_user.id}" if current_user.is_authenticated else f"anon:{request.remote_addr}"
+    dedup_key = hashlib.sha256(
+        f"{identity}|{fingerprint}|{server_request_id}|{client_release}".encode()
+    ).hexdigest()
 
     # Cross-process short-window dedup. Telemetry remains fail-open if Redis is
     # unavailable; the endpoint's existing rate limit and size bounds still apply.
     try:
         from app.workers.queue import get_redis_connection
         if not get_redis_connection().set(
-            f"client-telemetry:{fingerprint}", "1", nx=True, ex=120
+            f"client-telemetry:{dedup_key}", "1", nx=True, ex=120
         ):
             return jsonify({"status": "duplicate"}), 200
     except Exception:
@@ -5005,9 +5380,13 @@ def log_client_error():
 
     current_app.logger.error(
         "event=client.%s Browser failure pathname=%s job_id=%s action=%s "
-        "message=%s fingerprint=%s release=%s browser=%s stack=%s",
+        "message=%s fingerprint=%s release=%s client_release=%s "
+        "server_request_id=%s method=%s http_status=%s duration_ms=%s "
+        "online=%s visibility=%s browser=%s stack=%s",
         event, pathname, job_id or "-", action or "-", message, fingerprint,
         current_app.config.get("RELEASE_VERSION", "unknown"),
+        client_release, server_request_id, method, http_status,
+        bounded_integer("duration_ms", 3_600_000), online, visibility,
         sanitize_telemetry_text(request.headers.get("User-Agent"), 200), stack or "-",
     )
     return jsonify({"status": "logged"}), 200
@@ -5104,26 +5483,53 @@ def add_sequences_to_job(job_id):
         if replace_existing:
             used_ids = set()
             seen_records = set()
+            seen_by_id = {}
+            exact_headers = {}
+            duplicate_records = []
             added_count = 0
+            duplicate_count = 0
             output_records = []
 
             for seq in sequences_to_add:
+                record_id, record_sequence = _record_identity(seq)
                 exact_key = _sequence_exact_key(seq)
                 if exact_key in seen_records:
+                    duplicate_count += 1
+                    duplicate_records.append(_describe_skipped_duplicate(
+                        seq, exact_headers.get(exact_key), 'exact_duplicate'))
+                    continue
+                matched = _find_duplicate_record(record_id, record_sequence, seen_by_id)
+                if matched:
+                    duplicate_count += 1
+                    duplicate_records.append(_describe_skipped_duplicate(
+                        seq, matched, 'same_record_refetched'))
                     continue
                 seen_records.add(exact_key)
+                exact_headers[exact_key] = {
+                    "header": str(seq.get('name') or ''),
+                    "identifier": record_id,
+                    "sequence": record_sequence,
+                }
+                seen_by_id.setdefault(record_id, []).append(exact_headers[exact_key])
                 output_records.append(_format_fasta_record_for_job(seq, used_ids, added_count + 1))
                 added_count += 1
 
             input_path.write_text("\n".join(record.rstrip() for record in output_records) + "\n")
+            _merge_queue_duplicate_details(job_dir, duplicate_records)
 
             message = f"Saved {added_count} queued sequence{'s' if added_count != 1 else ''}."
+            if duplicate_count:
+                message += (
+                    f" {duplicate_count} duplicate"
+                    f"{'s' if duplicate_count != 1 else ''} skipped."
+                )
             if skipped:
                 message += f" {len(skipped)} accession{'s' if len(skipped) != 1 else ''} skipped."
 
             return jsonify({
                 "status": "success",
                 "count": added_count,
+                "duplicates": duplicate_count,
                 "skipped": skipped,
                 "mode": "replace",
                 "message": message
@@ -5132,6 +5538,9 @@ def add_sequences_to_job(job_id):
         # Read existing IDs to check for duplicates
         existing_ids = set()
         existing_records = set()
+        existing_by_id = {}
+        exact_headers = {}
+        duplicate_records = []
         if input_path.exists():
             try:
                 existing_seqs = _parse_fasta_sequences(input_path.read_text())
@@ -5139,32 +5548,71 @@ def add_sequences_to_job(job_id):
                     sid, _ = _split_fasta_header(s['name'])
                     if sid:
                         existing_ids.add(sid)
-                    existing_records.add(_sequence_exact_key(s))
+                    exact_key = _sequence_exact_key(s)
+                    existing_records.add(exact_key)
+                    # An already-stored record may itself carry an _added suffix
+                    # from before this check existed; index it under the base
+                    # accession so a third pull of the same record still matches.
+                    record_id, record_sequence = _record_identity(s)
+                    base_id = record_id.split('_ADDED')[0] if '_ADDED' in record_id else record_id
+                    entry = {
+                        "header": str(s.get('name') or ''),
+                        "identifier": base_id,
+                        "sequence": record_sequence,
+                    }
+                    existing_by_id.setdefault(base_id, []).append(entry)
+                    exact_headers[exact_key] = entry
             except Exception as e:
                 logger.warning(f"Failed to parse existing FASTA for deduplication: {e}")
                 pass # Continue anyway - will allow duplicates but won't crash
-            
+
         added_count = 0
+        duplicate_count = 0
         with open(input_path, "a") as f:
             # Ensure newline at end of file before appending
             if input_path.stat().st_size > 0:
                 f.write("\n")
-                 
+
             for seq in sequences_to_add:
                 exact_key = _sequence_exact_key(seq)
                 if exact_key in existing_records:
+                    duplicate_count += 1
+                    duplicate_records.append(_describe_skipped_duplicate(
+                        seq, exact_headers.get(exact_key), 'exact_duplicate'))
+                    continue
+                record_id, record_sequence = _record_identity(seq)
+                matched = _find_duplicate_record(record_id, record_sequence, existing_by_id)
+                if matched:
+                    duplicate_count += 1
+                    duplicate_records.append(_describe_skipped_duplicate(
+                        seq, matched, 'same_record_refetched'))
                     continue
                 f.write(_format_fasta_record_for_job(seq, existing_ids, added_count + 1))
                 existing_records.add(exact_key)
+                entry = {
+                    "header": str(seq.get('name') or ''),
+                    "identifier": record_id,
+                    "sequence": record_sequence,
+                }
+                existing_by_id.setdefault(record_id, []).append(entry)
+                exact_headers[exact_key] = entry
                 added_count += 1
-                    
+
+        _merge_queue_duplicate_details(job_dir, duplicate_records)
+
         message = f"Added {added_count} sequences."
+        if duplicate_count:
+            message += (
+                f" {duplicate_count} duplicate"
+                f"{'s' if duplicate_count != 1 else ''} already present."
+            )
         if skipped:
             message += f" {len(skipped)} accession{'s' if len(skipped) != 1 else ''} skipped."
 
         return jsonify({
-            "status": "success", 
+            "status": "success",
             "count": added_count,
+            "duplicates": duplicate_count,
             "skipped": skipped,
             "message": message
         })

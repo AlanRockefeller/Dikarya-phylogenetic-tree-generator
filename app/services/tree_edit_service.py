@@ -37,10 +37,10 @@ _tree_state_lock_context = threading.local()
 MAX_SEQUENCE_OF_INTEREST_LENGTH = 1000
 MAX_SEQUENCE_OF_INTEREST_SOURCE_LENGTH = 64
 MAX_TREE_TIP_NAME_LENGTH = 256
-# Structural Newick punctuation, rejected in *new* tip names so a rename cannot
-# produce a tree file no parser will read.
+# Characters a *new* tip name may never contain, because no download this site
+# produces can carry them.
 #
-# Alan 8/24/26 - Quote characters used to be in here too, which rejected the
+# Alan 8/24/26 - Quote characters used to be in here, which rejected the
 # apostrophes that provisional fungal names are full of ("Cortinarius sp.
 # 'olivaceofuscus'"). Nothing downstream needed that ban: renames live in
 # tree_state.json and are applied client-side by applyRenames() in
@@ -48,9 +48,31 @@ MAX_TREE_TIP_NAME_LENGTH = 256
 # becomes Newick syntax at all -- the tree files on disk carry the original
 # names. Even on the paths that do write a label, quote_tree_label() wraps
 # anything non-alphanumeric in '...' and doubles an interior apostrophe, so both
-# quote characters were already safe. The structural characters below stay
-# banned: they are legible-looking but genuinely ambiguous in a tip label.
-NEWICK_UNSAFE_TIP_CHARS = frozenset("()[];,:")
+# quote characters were already safe.
+#
+# 9/3/26 - The same argument retires the structural set "()[];,:" that lived
+# here. It was never protecting a download:
+#
+#   * The pipeline itself puts every one of those characters into tip labels --
+#     96% of jobs on disk have at least one, and ':' appears in 131k headers,
+#     '(' in 51k, ',' in 27k -- so the ban only stopped a user from *retyping*
+#     a name the tree already displays.
+#   * Newick and NEXUS both round-trip all of them through quote_tree_label()
+#     and write_nexus_tree(); verified by reparsing the emitted files.
+#   * FASTA headers (the Edited FASTA download) restrict nothing but the line
+#     break, and SVG/PNG go out through the DOM, which escapes on its own.
+#
+# What remains is the genuinely un-carryable set: a line break or a NUL ends a
+# FASTA header and a Newick label wherever it appears, and no quoting rescues
+# it. Those arrive only by paste, so validate_tip_rename() folds the whitespace
+# ones into spaces rather than refusing the edit -- see NEWICK_UNSAFE_TIP_CHARS
+# consumers in app/api_v1/routes.py, which report them instead.
+NEWICK_UNSAFE_TIP_CHARS = frozenset("\r\n\x00")
+
+# Control characters that carry no glyph but are not whitespace either. A
+# rename containing one is almost always an invisible artifact of a paste, so
+# it is dropped rather than treated as a reason to reject the whole edit.
+_TIP_NAME_WHITESPACE_CONTROLS = frozenset("\t\n\r\v\f")
 
 
 # Both writers live in tree_io so the tree builders can share them without
@@ -302,8 +324,36 @@ def _has_control_chars(value: str) -> bool:
     return any(ord(ch) < 32 or ord(ch) == 127 for ch in value)
 
 
+def normalize_tip_name(value: str) -> str:
+    """Fold a pasted tip name into something every download can carry.
+
+    Only control characters are touched, and every printable character survives
+    -- parentheses, colons, commas, semicolons, brackets, quotes and non-ASCII
+    alike (see NEWICK_UNSAFE_TIP_CHARS for why none of those need removing).
+    A tab or a line break becomes a space, other control characters are
+    dropped, runs of whitespace collapse, and the result is stripped.
+
+    Refusing a name over an invisible character the user cannot see is the
+    least useful thing this could do, and a pasted spreadsheet cell routinely
+    carries a trailing newline. Folding is safe because the outcome is a single
+    line with no control characters -- exactly what the reject was protecting.
+    """
+    folded = [
+        " " if ch in _TIP_NAME_WHITESPACE_CONTROLS
+        else "" if (ord(ch) < 32 or ord(ch) == 127)
+        else ch
+        for ch in value
+    ]
+    return " ".join("".join(folded).split())
+
+
 def validate_tip_rename(old_name: Any, new_name: Any) -> Tuple[str, str]:
-    """Validate external rename inputs before they enter persisted tree state."""
+    """Validate external rename inputs before they enter persisted tree state.
+
+    `old_name` has to match a label already in the tree, so it is checked but
+    never rewritten. `new_name` is the one the caller invented, and it is
+    normalized rather than rejected wherever that is possible.
+    """
     for field, value in (("old_name", old_name), ("new_name", new_name)):
         if not isinstance(value, str):
             raise ValueError(f"`{field}` must be a string.")
@@ -314,17 +364,17 @@ def validate_tip_rename(old_name: Any, new_name: Any) -> Tuple[str, str]:
                 f"`{field}` is {len(value):,} characters; the maximum is "
                 f"{MAX_TREE_TIP_NAME_LENGTH:,}."
             )
-        if _has_control_chars(value):
-            raise ValueError(f"`{field}` contains control characters.")
 
-    bad = sorted(set(new_name) & NEWICK_UNSAFE_TIP_CHARS)
-    if bad:
+    if _has_control_chars(old_name):
+        raise ValueError("`old_name` contains control characters.")
+
+    cleaned = normalize_tip_name(new_name)
+    if not cleaned:
         raise ValueError(
-            f"`new_name` contains characters that are invalid in Newick tip "
-            f"names: {bad}. Avoid parentheses, brackets, commas, colons, "
-            f"and semicolons."
+            "`new_name` is only control characters, so there is no label left "
+            "after removing them."
         )
-    return old_name, new_name
+    return old_name, cleaned
 
 
 def _validate_sequence_of_interest(tree_json: Dict[str, Any],
@@ -1639,6 +1689,19 @@ def _install_recompute_outputs(job_dir: Path, output_dir: Path) -> None:
             old_path.unlink()
     for name, staged in staged_mrbayes.items():
         os.replace(staged, live_tree / name)
+
+    # The SEQnnnnnn -> real-name key belongs to the generation it was written
+    # beside. Pruning renumbers the ids, so a map left behind by the original
+    # run decodes this run's taxa to the wrong sequences. Install it with the
+    # rest of the family, and drop a stale one when this run produced none.
+    from app.services.fasta_utils import NAME_MAP_FILENAME
+
+    staged_name_map = staged_tree / NAME_MAP_FILENAME
+    live_name_map = live_tree / NAME_MAP_FILENAME
+    if staged_name_map.is_file():
+        os.replace(staged_name_map, live_name_map)
+    elif live_name_map.is_file():
+        live_name_map.unlink()
 
 
 def _recompute_tree_staged(

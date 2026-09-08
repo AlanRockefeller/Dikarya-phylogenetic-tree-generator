@@ -209,6 +209,60 @@ def prepare_phylo_job_params(job_params: Dict[str, Any]) -> None:
         job_params["input_warnings"] = input_warnings
 
 
+# Which submissions belong on the slow lane.
+#
+# Both queues used to be served by the single worker, so this classification
+# had nowhere to take effect: RQ simply drained phylo_high first with one slot,
+# and a long job blocked every short one behind it regardless of queue. With a
+# worker dedicated to each queue the split finally isolates them.
+#
+# The thresholds come from 296 completed jobs joined against their worker.log
+# durations. Tree method dominates and size is secondary:
+#
+#     fasttree   n=181   p50=   25s   p90=  57s   max=  143s
+#     none       n= 94   p50=   58s   p90=  81s   max=  190s
+#     iqtree     n= 14   p50=  124s   p90=1292s   max= 2554s
+#     raxml      n=  7   p50= 1279s   p90=9276s   max= 9276s
+#
+#     <200 records            max= 1279s
+#     200+ records            max= 9276s
+#
+# So RAxML and MrBayes are slow at any size -- a 21-minute median is already
+# long enough to stall a stream of 25-second FastTree jobs -- while IQ-TREE
+# only becomes slow with a large set. Everything else is bounded by size alone.
+BULK_ALWAYS_TREE_METHODS = frozenset({"raxml", "mrbayes"})
+BULK_IF_LARGE_TREE_METHODS = frozenset({"iqtree"})
+BULK_IQTREE_RECORD_COUNT = 150
+BULK_RECORD_COUNT = 400
+BULK_TOTAL_BASES = 1_000_000
+
+
+def classify_queue_for_params(job_params: Dict[str, Any]) -> str:
+    """Return the queue a submission belongs on, by expected runtime.
+
+    Deliberately conservative: misrouting a slow job onto phylo_high only
+    restores the old blocking behaviour, while misrouting a fast one onto
+    phylo_bulk makes a single user wait behind the slow lane. Both are
+    recoverable, neither is silent.
+    """
+    tree_method = str(job_params.get("tree_method") or "").strip().lower()
+
+    if tree_method in BULK_ALWAYS_TREE_METHODS:
+        return QUEUE_BULK
+
+    # Count what the pipeline will actually align. The sequence payload is the
+    # submitted FASTA; accessions are fetched later but each yields one record.
+    sequence = job_params.get("sequence") or ""
+    record_count = sequence.count(">") + len(job_params.get("accessions") or [])
+    total_bases = max(0, len(sequence) - record_count)
+
+    if tree_method in BULK_IF_LARGE_TREE_METHODS and record_count > BULK_IQTREE_RECORD_COUNT:
+        return QUEUE_BULK
+    if record_count > BULK_RECORD_COUNT or total_bases > BULK_TOTAL_BASES:
+        return QUEUE_BULK
+    return QUEUE_HIGH
+
+
 def enqueue_job(job_params: Dict[str, Any], queue_name: str = QUEUE_HIGH,
                 meta: Optional[Dict[str, Any]] = None,
                 job_id: Optional[str] = None,
@@ -220,6 +274,18 @@ def enqueue_job(job_params: Dict[str, Any], queue_name: str = QUEUE_HIGH,
 
     if job_timeout is None:
         job_timeout = resolve_job_timeout(job_params)
+
+    # Auto-route only when the caller took the default. A caller that named a
+    # queue outright (the iNaturalist auto-tree path picks phylo_bulk for its
+    # own reasons) keeps the queue it asked for.
+    if queue_name == QUEUE_HIGH:
+        routed = classify_queue_for_params(job_params)
+        if routed != queue_name:
+            logger.info(
+                "Routing job to %s (tree_method=%s)",
+                routed, job_params.get("tree_method"),
+            )
+            queue_name = routed
 
     q = get_queue(queue_name)
     from app.workers.tasks import run_phylo_job
@@ -259,7 +325,7 @@ def enqueue_recompute_job(job_id: str, params_dict: Dict[str, Any], *,
     optional tuple return lets HTTP callers distinguish a new request from a
     harmless duplicate without changing older internal callers.
     """
-    q = get_queue(QUEUE_HIGH)
+    q = get_queue(classify_queue_for_params(params_dict))
     from app.workers.events import (
         STEP_INPUT, STEP_ORIENT, STEP_BLAST, STEP_ITS,
         STATE_QUEUED, STATE_SKIPPED, get_initial_steps_meta,
@@ -300,7 +366,8 @@ def enqueue_recompute_job(job_id: str, params_dict: Dict[str, Any], *,
         )
 
     try:
-        existing = q.fetch_job(job_id)
+        existing = (get_queue(QUEUE_HIGH).fetch_job(job_id)
+                    or get_queue(QUEUE_BULK).fetch_job(job_id))
         if existing is not None:
             existing_status = existing.get_status(refresh=True)
             if existing_status in {"queued", "started", "scheduled", "deferred"}:
@@ -345,7 +412,8 @@ def active_recompute_snapshot_mtime(job_id: str):
     hiccup, all of which should fall through to the normal idempotent path.
     """
     try:
-        job = get_queue(QUEUE_HIGH).fetch_job(job_id)
+        job = (get_queue(QUEUE_HIGH).fetch_job(job_id)
+               or get_queue(QUEUE_BULK).fetch_job(job_id))
         if job is None:
             return None
         if job.get_status(refresh=True) not in {"queued", "started", "scheduled", "deferred"}:

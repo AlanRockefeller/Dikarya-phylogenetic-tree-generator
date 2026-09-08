@@ -639,7 +639,7 @@
                                    class="mt-1 w-4 h-4 text-journal-gold bg-white dark:bg-journal-dark border-gray-300 dark:border-gray-600 focus:ring-journal-gold">
                             <span>
                                 <span class="block text-sm font-medium text-journal-dark dark:text-gray-100">
-                                    Re-create phylogenetic tree
+                                    Replace existing tree URL
                                 </span>
                                 <span class="block mt-1 text-xs text-gray-600 dark:text-gray-300">
                                     Build a new tree and replace the observation's current Phylogenetic Tree field URL when it finishes.
@@ -652,7 +652,7 @@
                                    class="mt-1 w-4 h-4 text-journal-gold bg-white dark:bg-journal-dark border-gray-300 dark:border-gray-600 focus:ring-journal-gold">
                             <span>
                                 <span class="block text-sm font-medium text-journal-dark dark:text-gray-100">
-                                    Build a new tree without replacing
+                                    Keep existing URL
                                 </span>
                                 <span class="block mt-1 text-xs text-gray-600 dark:text-gray-300">
                                     Build a new tree here and leave the observation's current Phylogenetic Tree field URL unchanged.
@@ -1016,6 +1016,10 @@
                     <div class="flex flex-wrap items-center justify-between gap-x-4 gap-y-2 mt-2">
                         <p class="field-help text-xs">
                             Enter FASTA sequences or one or more GenBank accessions.
+                            Works best with barcode markers (ITS, LSU, RPB2) up to about
+                            50,000&nbsp;bp each &mdash; for whole-genome or long-read
+                            contigs, use the &ldquo;ITS Region&rdquo; setting below to
+                            extract the barcode region first.
                         </p>
                         <div id="genbank_location_option" class="hidden">
                             <label class="inline-flex items-center space-x-2 cursor-pointer"
@@ -1902,6 +1906,42 @@
         const location = explicitLocation
             ? normalizeDedupLocation(explicitLocation, true)
             : normalizeDedupLocation(extractLocationFromSequenceName(seq?.name));
+        // Alan 9/6/26 - MycoMap BLAST hit sets overlap heavily: 12 of the 100 NCBI hits in
+        // one Entoloma BLAST were byte-identical to another hit under a different
+        // accession, and stacking several BLASTs multiplies that. Collapse those --
+        // collapseIdenticalMycomapRecord() keeps every accession in the label, so nothing
+        // is lost the way a plain drop would lose it.
+        //
+        // The SAME sequence from a DIFFERENT place is a separate collection and stays a
+        // separate tip, so this requires a matching normalized location and is not
+        // emitted at all when the location is unknown. It is an ADDITIONAL key rather
+        // than a relaxation of the NCBI-hit exemption below, which still governs how
+        // these records compare against non-MycoMap ones -- there is no accession to
+        // merge into there, so a match would silently drop the record instead.
+        if (source === 'mycomap' && sequence && location) {
+            keys.push(`mycomap-identical-sequence-location\u0000${sequence}\u0000${location}`);
+        }
+        // Alan 9/6/26 - Same MycoMap record pulled from a second BLAST. MycoMap trims each
+        // NCBI hit to the region that aligned with that search's query, so the same
+        // accession comes back a few bases longer or shorter (704 vs 707 is typical) and
+        // occasionally under a taxon name MycoMap has since revised. Every key above
+        // carries the sequence text, so none of them matched, the record was queued
+        // again, the server stored it as `ACC_added` and the viewer drew a second tip.
+        // The accession identifies the record; the trim does not.
+        //
+        // uniquify_mycomap_sequence_names() has already suffixed genuinely repeated
+        // identifiers within one fetch (ACC, ACC_2), so those stay distinct.
+        //
+        // Alan 9/6/26 - Every accession a collapsed group carries is an identifier that
+        // group answers to, so all of them are indexed. Keying only the primary meant a
+        // third fetch of an accession already folded in -- AB123 and NR_123 collapse to
+        // "NR_123 / AB123", then AB123 comes back at a different trim -- matched neither
+        // an identifier nor a sequence, and drew a second tip for a record already there.
+        if (source === 'mycomap') {
+            mycomapRecordIds(seq).forEach(id => {
+                keys.push(`mycomap-record\u0000${id.toLocaleUpperCase()}`);
+            });
+        }
         if (location && !preserveMycomapNcbiHit) {
             keys.push(`sequence-location\u0000${sequence}\u0000${location}`);
         } else {
@@ -1921,21 +1961,183 @@
         return keys;
     }
 
+    // Alan 9/6/26 - The MycoMap accession a collapsed group is labelled with.
+    function mycomapRecordId(seq) {
+        const explicit = String(seq?.internal_id || '').trim();
+        if (explicit) return explicit;
+        return String(seq?.name || '').trim().split(/\s+/)[0] || '';
+    }
+
+    // Alan 9/6/26 - Every accession a queued record answers to: the one it is named
+    // after, plus any that collapseIdenticalMycomapRecord() folded into it. A record that
+    // has never been merged has no merged_ids and yields just its primary id.
+    function mycomapRecordIds(seq) {
+        const ids = [];
+        const seen = new Set();
+        const add = (value) => {
+            const id = String(value || '').trim();
+            if (!id) return;
+            const key = id.toLocaleUpperCase();
+            if (seen.has(key)) return;
+            seen.add(key);
+            ids.push(id);
+        };
+        add(seq?.dedup_primary_id);
+        add(mycomapRecordId(seq));
+        (Array.isArray(seq?.merged_ids) ? seq.merged_ids : []).forEach(add);
+        return ids;
+    }
+
+    // A RefSeq NR_ accession is a type sequence, so it is the accession the collapsed
+    // record should be named after even when an ordinary accession arrived first.
+    function isTypeSequenceId(id) {
+        return /^NR_/i.test(String(id || '').trim());
+    }
+
+    function stripLeadingRecordId(name, id) {
+        const text = String(name || '').trim();
+        const token = String(id || '');
+        if (!token) return text;
+        return text.slice(0, token.length).toLocaleUpperCase() === token.toLocaleUpperCase()
+            ? text.slice(token.length).trim()
+            : text;
+    }
+
+    // Fold a MycoMap record into the queued record it duplicates, and return the record
+    // that should occupy the queue slot. Every accession stays in the label, so a
+    // collapsed group still says which GenBank records shared the sequence.
+    function collapseIdenticalMycomapRecord(existing, incoming) {
+        const existingPrimaryId = existing.dedup_primary_id || mycomapRecordId(existing);
+        const incomingId = mycomapRecordId(incoming);
+        const ids = (existing.merged_ids && existing.merged_ids.length
+            ? existing.merged_ids.slice()
+            : [existingPrimaryId]).filter(Boolean);
+        if (incomingId && !ids.some(id => id.toLocaleUpperCase() === incomingId.toLocaleUpperCase())) {
+            ids.push(incomingId);
+        }
+
+        const takeover = isTypeSequenceId(incomingId) && !isTypeSequenceId(existingPrimaryId);
+        const base = takeover ? Object.assign({}, incoming) : existing;
+        const primaryId = takeover ? incomingId : existingPrimaryId;
+        const primaryName = takeover
+            ? String(incoming.name || '')
+            : (existing.dedup_primary_name || String(existing.name || ''));
+
+        const ordered = [primaryId].concat(
+            ids.filter(id => id.toLocaleUpperCase() !== String(primaryId).toLocaleUpperCase())
+        ).filter(Boolean);
+
+        // Alan 9/6/26 - When the two copies are the same record at different MycoMap trim
+        // lengths, keep the longer read: it is the same sequence with more of the flanks
+        // intact, and dropping it would hand the aligner fewer columns than we were given.
+        const longestSequence = [String(existing.sequence || ''), String(incoming.sequence || '')]
+            .reduce((longest, candidate) => (candidate.length > longest.length ? candidate : longest));
+        if (longestSequence.length > String(base.sequence || '').length) {
+            base.sequence = longestSequence;
+        }
+
+        base.dedup_primary_id = primaryId;
+        base.dedup_primary_name = primaryName;
+        base.merged_ids = ordered;
+        base.name = [ordered.join(' / '), stripLeadingRecordId(primaryName, primaryId)]
+            .filter(Boolean)
+            .join(' ');
+        return base;
+    }
+
+    // Alan 9/6/26 - One row of provenance for a queue collapse, matching the shape the
+    // viewer's other import-filter panels use. The queue drops these before submission,
+    // so if they are not recorded here nothing downstream can ever report them.
+    const QUEUE_DUPLICATE_REASON_LABELS = {
+        same_record_refetched: 'Same record from another BLAST, trimmed to a different length',
+        identical_sequence_same_location: 'Identical sequence already queued from the same location',
+        already_queued: 'Already in the queue'
+    };
+
+    function describeQueueDuplicate(removed, kept, reason) {
+        const removedSequence = String(removed?.sequence || '');
+        const keptSequence = String(kept?.sequence || '');
+        return {
+            name: String(removed?.name || ''),
+            kept_as: String(kept?.name || ''),
+            identifier: mycomapRecordId(removed),
+            location: String(removed?.location || removed?.mycomap_location || ''),
+            reason: reason,
+            reason_label: QUEUE_DUPLICATE_REASON_LABELS[reason] || reason,
+            removed_length: removedSequence.length,
+            kept_length: keptSequence.length
+        };
+    }
+
+    // Which of the two collapse rules fired, so the viewer can say which one it was.
+    function queueDuplicateReason(existing, incoming) {
+        const existingId = String(existing?.dedup_primary_id || mycomapRecordId(existing) || '');
+        const incomingId = String(mycomapRecordId(incoming) || '');
+        const sameRecord = existingId && incomingId
+            && (existingId.toLocaleUpperCase() === incomingId.toLocaleUpperCase()
+                || (existing?.merged_ids || []).some(
+                    id => String(id).toLocaleUpperCase() === incomingId.toLocaleUpperCase()));
+        if (sameRecord) return 'same_record_refetched';
+        const a = String(existing?.sequence || '').toUpperCase();
+        const b = String(incoming?.sequence || '').toUpperCase();
+        if (a && b && a === b) return 'identical_sequence_same_location';
+        return 'already_queued';
+    }
+
+    // How many records the last addSequences() call folded into an existing queue entry
+    // rather than simply discarding, so the import status line can say so.
+    let lastCollapsedDuplicateCount = 0;
+
     function addSequences(sequences, removeDuplicates = true) {
-        const existingKeys = new Set(sequenceQueue.flatMap(sequenceDedupKeys));
+        // A map rather than a set: collapsing a duplicate needs the record it matched.
+        const keyToIndex = new Map();
+        const rememberKeys = (seq, index) => {
+            sequenceDedupKeys(seq).forEach(key => {
+                if (!keyToIndex.has(key)) keyToIndex.set(key, index);
+            });
+        };
+        sequenceQueue.forEach(rememberKeys);
+
         let added = 0;
+        lastCollapsedDuplicateCount = 0;
         for (const seq of sequences) {
             // Normalize inputs
             seq.name = String(seq.name);
             seq.sequence = String(seq.sequence || '');
             const dedupKeys = sequenceDedupKeys(seq);
-            const isDuplicate = dedupKeys.some(key => existingKeys.has(key));
+            const matchedKey = removeDuplicates
+                ? dedupKeys.find(key => keyToIndex.has(key))
+                : undefined;
 
-            if (!removeDuplicates || !isDuplicate) {
-                sequenceQueue.push(seq);
-                dedupKeys.forEach(key => existingKeys.add(key));
-                added++;
+            if (matchedKey !== undefined) {
+                const index = keyToIndex.get(matchedKey);
+                const existing = sequenceQueue[index];
+                const bothFromMycomap = String(existing?.source || '').toLowerCase() === 'mycomap'
+                    && String(seq.source || '').toLowerCase() === 'mycomap';
+                // Describe the pair before anything mutates, so the row reflects the
+                // record as it arrived rather than as the merge left it.
+                const duplicateRow = describeQueueDuplicate(
+                    seq, existing, queueDuplicateReason(existing, seq));
+                if (bothFromMycomap) {
+                    // Capture first: a non-takeover merge mutates `existing` in place.
+                    const previousName = String(existing.name || '');
+                    const merged = collapseIdenticalMycomapRecord(existing, seq);
+                    if (merged.name !== previousName) lastCollapsedDuplicateCount++;
+                    sequenceQueue[index] = merged;
+                    // The merged label changes the record's exact-record key.
+                    rememberKeys(merged, index);
+                    // A type-sequence takeover renames the kept tip and a trim merge can
+                    // lengthen it, so report what the tree actually ends up carrying.
+                    duplicateRow.kept_as = String(merged.name || '');
+                    duplicateRow.kept_length = String(merged.sequence || '').length;
+                }
+                recordQueueDuplicate(duplicateRow);
+                continue;
             }
+
+            sequenceQueue.push(seq);
+            rememberKeys(seq, sequenceQueue.length - 1);
+            added++;
         }
         updateQueueDisplay();
         return added;
@@ -2550,6 +2752,29 @@
             ].slice(0, 100);
             importFilterDetails.mycomap = current;
         }
+        if (details.queue_duplicates) {
+            (details.queue_duplicates.removed_records || []).forEach(recordQueueDuplicate);
+        }
+    }
+
+    // Alan 9/6/26 - Duplicates the queue collapsed on the way in, carried through to the
+    // job so Generation Details can list them. Nothing server-side ever sees these
+    // records, so this is the only place they can be reported from. Same 100-row cap as
+    // the MycoMap block above; the count keeps rising past it so the total stays honest.
+    function recordQueueDuplicate(row) {
+        if (!row) return;
+        const current = importFilterDetails.queue_duplicates || {
+            label: 'Duplicates not added',
+            removed_count: 0,
+            removed_records: []
+        };
+        current.removed_count = (current.removed_count || 0) + 1;
+        const rows = current.removed_records || [];
+        if (rows.length < 100) {
+            rows.push(row);
+        }
+        current.removed_records = rows;
+        importFilterDetails.queue_duplicates = current;
     }
 
     function checkMycomapState() {
@@ -2768,7 +2993,13 @@
 
             let statusMsg = `${data.message}. Added ${added} new sequences to queue.`;
             if (skipped > 0 && removeDuplicates) {
-                statusMsg += ` (${skipped} duplicate${skipped !== 1 ? 's' : ''} already in queue)`;
+                statusMsg += ` (${skipped} duplicate${skipped !== 1 ? 's' : ''} already in queue`;
+                // Alan 9/6/26 - Separate "we already had this exact record" from "this was an
+                // identical sequence under another accession", which is folded into the label.
+                if (lastCollapsedDuplicateCount > 0) {
+                    statusMsg += `; ${lastCollapsedDuplicateCount} identical sequence${lastCollapsedDuplicateCount !== 1 ? 's' : ''} merged into existing labels`;
+                }
+                statusMsg += ')';
             }
             // Alan 5/8/26 - Tell users when imported MycoMap hits carry metrics so they can use the filter right away.
             if (data.blast_metrics_count > 0) {
@@ -3601,7 +3832,7 @@
             if (hasExistingTree && !recreateExistingTree && !keepExistingTreeUrl) {
                 showStatus(
                     preview.message ||
-                    'Choose Re-create phylogenetic tree or Build a new tree without replacing before continuing.',
+                    'Choose Replace existing tree URL or Keep existing URL before continuing.',
                     'info'
                 );
                 updateInaturalistTreeButtonForInput();

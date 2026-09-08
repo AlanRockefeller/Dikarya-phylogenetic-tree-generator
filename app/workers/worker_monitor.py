@@ -210,9 +210,16 @@ class HeartbeatWorker(Worker):
         except Exception as e:
             logger.warning("Could not clean up heartbeat %s: %s", filepath, e)
 
-def run_worker_with_heartbeat(app):
+def run_worker_with_heartbeat(app, queue_names=None):
     """
     Entry point to run this worker.
+
+    ``queue_names`` selects which queues this process serves, in priority
+    order. The default keeps the historical both-queues behaviour so a single
+    worker still drains everything -- important because it means an operator
+    who starts only ``dikarya-worker`` is never left with an unserved queue.
+    Running one worker per queue instead (see scripts/dikarya-worker-*) is what actually
+    isolates a long job from the short ones behind it.
     """
     from app.workers.queue import get_queue
     from app.workers.queue import get_redis_connection
@@ -241,7 +248,17 @@ def run_worker_with_heartbeat(app):
             logger.exception("Startup job reconciliation skipped")
 
         conn = get_redis_connection()
-        queues = [get_queue("phylo_high"), get_queue("phylo_bulk")]
+        from app.workers.queue import QUEUE_BULK, QUEUE_HIGH, VALID_QUEUE_NAMES
+
+        selected = list(queue_names or (QUEUE_HIGH, QUEUE_BULK))
+        unknown = [name for name in selected if name not in VALID_QUEUE_NAMES]
+        if unknown:
+            raise ValueError(
+                f"Unknown queue name(s): {', '.join(unknown)}. "
+                f"Valid queues are: {', '.join(sorted(VALID_QUEUE_NAMES))}."
+            )
+        logger.info("Worker serving queue(s): %s", ", ".join(selected))
+        queues = [get_queue(name) for name in selected]
         # RQ must first expire and clean an abandoned StartedJobRegistry entry
         # before reconciliation has positive AbandonedJobError evidence. A
         # short default bounds restart recovery latency without guessing from

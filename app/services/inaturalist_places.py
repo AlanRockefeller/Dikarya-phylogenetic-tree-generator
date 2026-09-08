@@ -27,6 +27,7 @@ import threading
 import time
 import urllib.error
 import urllib.request
+from app.services.api_diagnostics import diagnostic_urlopen
 from typing import Any, Dict, Iterable, List, Optional, Sequence
 
 logger = logging.getLogger(__name__)
@@ -197,7 +198,7 @@ def _fetch_place_batch(place_ids: Sequence[int],
         "Accept": "application/json",
     })
     try:
-        with urllib.request.urlopen(request, timeout=timeout) as response:
+        with diagnostic_urlopen(request, timeout=timeout) as response:
             payload = json.loads(response.read().decode("utf-8"))
     except (urllib.error.URLError, urllib.error.HTTPError, OSError,
             json.JSONDecodeError, ValueError) as exc:
@@ -410,7 +411,7 @@ def fetch_observation_places(observation_ids: Iterable[int],
                                "for %d ids after %d attempt(s)", len(batch), attempt - 1)
                 break
             try:
-                with urllib.request.urlopen(request, timeout=timeout) as response:
+                with diagnostic_urlopen(request, timeout=timeout) as response:
                     payload = json.loads(response.read().decode("utf-8"))
                 break
             except Exception as exc:  # includes IncompleteRead, which is not a URLError

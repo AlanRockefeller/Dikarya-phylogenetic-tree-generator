@@ -29,8 +29,9 @@ at 4x8 that takes 8 streams landing on the same worker, where at 4x2 it took 2.
 Gunicorn's access log cannot show this on its own -- it only records requests that
 *completed*, so a stranded connection leaves no trace there.
 
-The registry is a Redis sorted set of stream ids scored by expiry, so a worker
-that is SIGKILLed cannot leak a permanent count: its entries simply age out.
+The registry is a Redis sorted set of stream ids scored by the time each stream
+last renewed its lease, so a worker that is SIGKILLed cannot leak a permanent
+count: it stops renewing and its entries age out within _ENTRY_TTL_SECONDS.
 Every operation is best-effort -- observability must never take down the stream
 it is observing.
 """
@@ -43,10 +44,21 @@ logger = logging.getLogger(__name__)
 
 _REGISTRY_KEY = "sse:open_streams"
 
-# Entries older than this are treated as dead. Comfortably longer than
-# SSE_MAX_STREAM_SECONDS would ever leave a live stream unrefreshed, so a
-# healthy stream is never miscounted as expired.
-_ENTRY_TTL_SECONDS = 60 * 60 * 8
+# Entries are a renewable lease, not a lifetime: every live stream re-scores
+# its own token from the heartbeat loop (touch_stream below, every
+# RENEW_INTERVAL_SECONDS), so the TTL only has to outlast a run of missed
+# heartbeats -- 20 of them here.
+#
+# Alan 9/7/26 - It used to be 8 hours with no renewal, which made the count
+# unusable across a restart: four web restarts on 9/6 left five entries from
+# SIGKILLed processes sitting in the set for the rest of the evening, so
+# _pressure_threshold() was being measured against streams that no longer
+# existed. Do NOT shorten this without keeping the renewal -- a real stream can
+# legitimately run for SSE_MAX_STREAM_SECONDS (6 hours), and a TTL shorter than
+# a stream's life without renewal would undercount exactly the long streams
+# that cause the pressure this registry exists to detect.
+_ENTRY_TTL_SECONDS = 300
+RENEW_INTERVAL_SECONDS = 30
 
 
 def _capacity():
@@ -97,9 +109,35 @@ def open_stream(redis_conn, job_id):
     return token, count
 
 
+def touch_stream(redis_conn, token):
+    """Renew a stream's lease. Best effort; returns True when the lease was renewed.
+
+    Called from the SSE heartbeat loop. Re-scoring is a plain ZADD, so a stream
+    whose process dies simply stops renewing and ages out of the census within
+    _ENTRY_TTL_SECONDS instead of inflating it until the next restart.
+    """
+    if token is None:
+        return False
+    try:
+        now = time.time()
+        redis_conn.zremrangebyscore(_REGISTRY_KEY, "-inf", now - _ENTRY_TTL_SECONDS)
+        # A plain ZADD, not xx=True: only the owning generator calls this, so a
+        # token that was pruned during a heartbeat stall belongs to a stream
+        # that is still alive and still holding a request slot. Re-adding it
+        # restores the count instead of leaving that stream invisible.
+        redis_conn.zadd(_REGISTRY_KEY, {token: now})
+        return True
+    except Exception:
+        return False
+
+
 def close_stream(redis_conn, token):
     """Deregister a stream. Returns the remaining count, or 0 if unavailable."""
     try:
+        # Prune here as well as in open_stream: a quiet site closes streams long
+        # before it opens the next one, and expired entries left in the set are
+        # what the pressure warning would otherwise be measured against.
+        redis_conn.zremrangebyscore(_REGISTRY_KEY, "-inf", time.time() - _ENTRY_TTL_SECONDS)
         redis_conn.zrem(_REGISTRY_KEY, token)
         return int(redis_conn.zcard(_REGISTRY_KEY))
     except Exception:

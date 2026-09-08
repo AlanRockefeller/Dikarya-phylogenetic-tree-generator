@@ -1,0 +1,13 @@
+#!/usr/bin/python3 -I
+"""Bulk-only entry point; the shared implementation must be installed root-owned."""
+import runpy
+import sys
+
+
+if __name__ == "__main__":
+    try:
+        guard = runpy.run_path("/usr/local/libexec/dikarya-worker-restart")
+        sys.exit(guard["main"](bulk=True))
+    except Exception as exc:
+        print("Restart refused: safety check failed (" + type(exc).__name__ + ").", file=sys.stderr)
+        sys.exit(78)

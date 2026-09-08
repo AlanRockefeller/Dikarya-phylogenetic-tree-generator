@@ -230,9 +230,8 @@ def test_recompute_rejects_invalid_iqtree_ufboot_before_enqueue(
         ("A", ""),
         ("A", "   "),
         ("A", "x" * 257),
-        ("A", "broken\nheader"),
-        ("A", "broken\x7fheader"),
-        ("A", "A:0.5"),
+        ("A", "\x00\x01"),
+        ("A\n", "Safe name"),
     ],
 )
 def test_tip_rename_validation_rejects_unsafe_external_values(old_name, new_name):
@@ -240,29 +239,96 @@ def test_tip_rename_validation_rejects_unsafe_external_values(old_name, new_name
         validate_tip_rename(old_name, new_name)
 
 
-def test_browser_rename_rejects_invalid_label_without_changing_state(tmp_path):
+@pytest.mark.parametrize(
+    "new_name",
+    [
+        "Amanita sp. (PNW-01)",
+        "Cortinarius sp. 'olivaceofuscus'",
+        "Boletus sp; voucher AR12,3",
+        "Russula [type: ITS]",
+        "A:0.5",
+        "\u00c9mile M\u00fcller 2024",
+    ],
+)
+def test_tip_rename_accepts_the_punctuation_the_pipeline_itself_produces(new_name):
+    """96% of jobs on disk already carry these characters in their tip labels.
+
+    Rejecting them in a rename stopped a user from retyping a name the tree was
+    showing them, and protected nothing: quote_tree_label() carries every one
+    of them through Newick and NEXUS, and a FASTA header restricts nothing but
+    the line break.
+    """
+    assert validate_tip_rename("A", new_name) == ("A", new_name)
+
+
+@pytest.mark.parametrize(
+    ("pasted", "expected"),
+    [
+        ("broken\nheader", "broken header"),
+        ("cell\tvalue\n", "cell value"),
+        ("  padded  name  ", "padded name"),
+        ("soft\x7fhyphenish", "softhyphenish"),
+    ],
+)
+def test_tip_rename_folds_pasted_control_characters_instead_of_refusing(pasted, expected):
+    """A line break or a tab is the one thing no download can carry.
+
+    It is also the one thing a paste routinely brings along, so it is folded to
+    a space rather than treated as a reason to reject the whole edit. The
+    result is still a single line with no control characters, which is what the
+    old rejection was protecting.
+    """
+    assert validate_tip_rename("A", pasted) == ("A", expected)
+
+
+def _rename_via_browser_endpoint(tmp_path, new_name):
     job_dir = tmp_path / JOB_ID
-    job_dir.mkdir()
-    original = {
+    job_dir.mkdir(exist_ok=True)
+    save_tree_state(job_dir, {
         "tree_structure": {"name": "A", "original_name": "A"},
         "renames": {},
-    }
-    save_tree_state(job_dir, original)
+    })
 
     app = Flask(__name__)
     with (
         app.test_request_context(
             method="POST",
-            json={"old_name": "A", "new_name": "broken\n>injected"},
+            json={"old_name": "A", "new_name": new_name},
         ),
         patch.object(Config, "JOB_DIR", tmp_path),
         patch.object(routes, "check_job_access", return_value=(None, None, 200)),
     ):
-        response, status = routes.rename_tree_tip(JOB_ID)
+        result = routes.rename_tree_tip(JOB_ID)
+    return result, load_tree_state(job_dir)
 
+
+def test_browser_rename_stores_a_pasted_multiline_label_as_one_line(tmp_path):
+    """A pasted line break must not survive into the state, but must not 400 either.
+
+    The name goes on to be a FASTA header in the Edited FASTA download, where a
+    line break would start a second record. Folding it to a space is what keeps
+    that impossible while still doing what the user asked.
+    """
+    result, state = _rename_via_browser_endpoint(tmp_path, "broken\n>injected")
+
+    assert not isinstance(result, tuple), result
+    assert state["renames"] == {"A": "broken >injected"}
+
+
+def test_browser_rename_rejects_an_all_control_label_without_changing_state(tmp_path):
+    result, state = _rename_via_browser_endpoint(tmp_path, "\x00\x01\x02")
+
+    response, status = result
     assert status == 400
     assert "control characters" in response.get_json()["error"]
-    assert load_tree_state(job_dir) == original
+    assert state["renames"] == {}
+
+
+def test_browser_rename_keeps_punctuation_a_fasta_header_can_carry(tmp_path):
+    result, state = _rename_via_browser_endpoint(tmp_path, "Amanita sp. (PNW-01); ITS")
+
+    assert not isinstance(result, tuple), result
+    assert state["renames"] == {"A": "Amanita sp. (PNW-01); ITS"}
 
 
 def test_v1_nexus_prefers_pruned_tree_and_falls_back_to_original(tmp_path):

@@ -166,6 +166,31 @@ stayed group-unwritable in a job directory where everything else was 0664.
 
 ## Restarting Dikarya services
 
+### Guarded worker wrapper (installation required)
+
+`scripts/WORKER_RESTART.md` documents the new root-owned replacement wrapper
+and graceful-shutdown drop-in. Until those are installed, the legacy safety
+checks below still apply. After installation, use the same high-worker wrapper;
+the separately granted `restart-dikarya-worker-bulk` handles bulk jobs.
+
+The guarded wrapper prints JSON with owners, job details, elapsed time and a
+timeout budget (not an ETA). Exit 75 means **show the report to the user and ask
+whether to interrupt or wait**. Do not automatically confirm. Only after the
+user explicitly approves losing those jobs' current work, send the exact
+printed `INTERRUPT <job-ids>` line on stdin. Changed IDs require a fresh choice.
+Exit 78 means a failed safety/configuration check; do not bypass it. Exit 0
+means restart requested, not necessarily finished: verify worker state/logs.
+An idle-check race drains the newly started job safely in the background.
+
+For a requested restart **after the current bulk job**, use
+`sudo /usr/local/sbin/restart-dikarya-worker-bulk-when-idle` once installed
+(see `scripts/WORKER_RESTART.md`). It schedules a graceful systemd restart,
+returns immediately, and never authorizes interrupting work. Queued jobs resume
+after restart. Its exit 75 means another scheduling request is being checked,
+not a request for interruption approval. Exit 0 means scheduled or an existing
+service operation is pending; verify the new MainPID and worker startup logs.
+Do not repeatedly signal a draining RQ worker: its second SIGTERM forces exit.
+
 Agents may restart the Dikarya systemd services when needed after making changes. The `tree` user has limited passwordless sudo access to three root-owned wrapper scripts only:
 
 ```bash
@@ -353,7 +378,8 @@ The tree viewer's **Analyze with Claude** button posts to
   installed). `CLAUDE_REVIEW_BACKEND=api` uses `ANTHROPIC_API_KEY` instead —
   put that in `/etc/dikarya/dikarya.environment.live`, **not** in a `.env` at
   the repo root, which crashes Gunicorn.
-- The call is synchronous and holds a Gunicorn request slot for ~60–90s, inside
+- The call is synchronous and holds a Gunicorn request slot for ~90–100s (a
+  measured 119-tip review took 96s), inside
   nginx's `proxy_read_timeout 300`. The timeout chain (wrapper 240s < subprocess
   260s < nginx 300s) and the Redis concurrency ceiling are load-bearing. Do not
   remove them or raise the timeout past nginx.
@@ -407,6 +433,33 @@ When a new CLI version is published:
   stricter than Newick alone needs and deliberately so: the same helper backs
   `restore_tree_names()`, which also rewrites NEXUS files, where `-` and `=`
   are punctuation and a bare `_` reads as a space.
+- **Do not add characters to `NEWICK_UNSAFE_TIP_CHARS`.** It holds only
+  `\r\n\0` — the characters no download can carry under any quoting, because
+  they end a FASTA header and a Newick label outright. Structural punctuation
+  is deliberately absent: `quote_tree_label()` carries `()[];,:` and both quote
+  characters through Newick and NEXUS, a FASTA header restricts nothing but the
+  line break, and the pipeline itself puts all of them into labels (96% of jobs
+  on disk have at least one). Banning them only stopped a user from retyping a
+  name the tree was already showing. `validate_tip_rename()` folds a pasted tab
+  or newline into a space rather than refusing the edit; only an all-control
+  name is rejected. The v1 API's `_validate_tip_name` mirrors this and must
+  change with it.
+- **The NEXUS download is rebuilt, not served off disk** — see
+  `build_nexus_download()` in `tree_io.py`, used by both `/api/job/<id>/download/tree/nexus`
+  and v1's `tree.nexus`. 82% of the `tree_*.nexus` files in `var/jobs` were
+  written by Biopython's TAXLABELS writer and do not parse, and
+  `tree_pruned.nexus` exists for only ~5% of the jobs that have a
+  `tree_pruned.newick`, so the old code also served the *unpruned* tree under
+  the current tree's name. The Newick beside it is the source of truth; the
+  stored NEXUS is used only when it is valid and no older. Nothing is written
+  back, so this stays clear of `tree_state` locking and the undo snapshot.
+- **A format that genuinely cannot hold a label must ship the key.** MrBayes is
+  the only one: a NEXUS matrix label is whitespace-delimited, so the run uses
+  `SEQnnnnnn` ids from `sanitize_fasta_headers()`. The download bundles
+  `sequence_names.tsv` mapping them back — written beside the run by
+  `_run_mrbayes`, and reconstructed by position from the alignment
+  (`reconstruct_name_map()`) for jobs that predate it. Do not drop a user's
+  labels from a download without including a decoder.
 - **Any file a tree edit writes must be listed in `SNAPSHOT_PATHS`** in
   `app/services/tree_undo_service.py`. Undo restores a snapshot of
   `tree_state.json` and `tree/tree_pruned.{newick,nexus}` taken before the edit;
@@ -448,7 +501,7 @@ journal, including sshd auth records). Use these instead, in this order:
 | Daily summary of failures/degradations | `~/.dikarya/log-digests/<date>.txt` | yes |
 | Per-job pipeline detail | `var/jobs/<id>/logs/{pipeline,alignment,tree_builder}.log` | yes |
 | Gunicorn access/errors | `var/logs/{access,error}.log` | yes |
-| Worker app output | `var/logs/worker.log` | yes |
+| Worker app output | `var/logs/worker.log` (phylo_high), `var/logs/worker-bulk.log` (phylo_bulk) | yes |
 | Unit lifecycle, OOM kills, start failures | journal, via the wrapper below | wrapper only |
 
 **Start with `errors.log`, not `error.log`.** Despite its name, `error.log` is
@@ -456,6 +509,25 @@ Gunicorn's combined stream and runs ~98% INFO — real failures are buried in it
 `errors.log` receives WARNING and above only. Nothing is removed from
 `error.log`, so the full history is still there when you need context around a
 failure.
+
+**Failed upstream API responses are retained separately.** Search `errors.log`
+for `event=api.response_failed diagnostic=<id>`, then read
+`var/logs/api-responses/<UTC-date>/<id>.json.gz` with `gzip -dc`. Each archive
+contains the full redacted response body, HTTP status, selected response headers,
+timestamp, endpoint (without query credentials), and request/job context.
+HTTP 200 responses rejected by observation validation are included, as are failed
+HTTP retry attempts. Network failures record that no response body was available.
+Credentials are redacted; request bodies and authorization/cookie headers are
+never archived. Archives are compressed, not truncated or automatically expired.
+They are outside the static/download trees. Do not paste an entire archive into
+a public issue; it can contain observation data and account context.
+
+New upstream calls should use `diagnostic_urlopen` from
+`app/services/api_diagnostics.py`, or `record_requests_failure` for requests/httpx
+responses. When HTTP succeeds but semantic validation fails later, explicitly
+call `record_api_failure` with the response that failed validation. Do not
+re-fetch the observation for diagnostics: it may have changed. Archive failures
+emit `event=api.diagnostic_write_failed` and must never mask the original error.
 
 Every log line emitted inside a request carries its origin:
 
@@ -490,6 +562,20 @@ heaviest clients:
 # (default 60 minutes), so a running RAxML job is never called orphaned.
 .venv/bin/python scripts/dikarya_log_digest.py --hours 24 --unterminated-grace-minutes 240
 ```
+
+The worker section reads **both** worker streams — `worker.log*` and
+`worker-bulk.log*` — merged by timestamp. It globbed `worker.log*` alone until
+2026-09-07, so every job that ran on the bulk queue was simply absent from the
+digest, successes and stalls alike. A new stream needs adding to `WORKER_STEMS`
+in the script.
+
+`retried` counts reattempts; `deferred` counts planned waits, where the task
+returned `rq.Retry` on purpose to wait for an upstream result and logged
+`event=job.deferred` before doing so (the MycoMap NCBI rerun is the only one
+today). Both produce a second `event=job.started`, which is why the marker is
+needed to tell them apart — without it a normal MycoMap wait was reported as a
+retry. A new deliberate `rq.Retry` must log `event=job.deferred` in the same
+edit, or it will be counted as a failure reattempt.
 
 ### Reviewing only logs not reviewed before
 
@@ -580,6 +666,32 @@ still appearing in the journal, the running worker predates the config and needs
 a restart (check for in-flight jobs first). Rotation is handled by
 `ops/logrotate/dikarya`; the file must stay `dikarya`-owned so the in-process
 logrotate in `app/services/log_rotation.py` can truncate it.
+
+## The monitoring dashboard
+
+`/admin/monitoring` shows live pipeline detail for every running and queued
+job: which step each one is on and for how long, the tool's own progress
+counter (RAxML bootstrap replicate, IQ-TREE iteration, MrBayes generation),
+CPU/RSS of the processes on the worker, the last file the job wrote, how much
+of its RQ timeout budget is gone, queue depths and per-worker state. It is
+rendered by one JavaScript renderer fed by `/health/jobs`, from an inline
+snapshot on first paint and from a 5-second poll after that, so the two views
+cannot drift apart.
+
+**The page and `/health/jobs` are unauthenticated, and a job UUID is a
+capability token** — `check_job_access(mode="view")` opens the tree for anyone
+holding it. So nothing here may emit a full job id (`_job_ref()` truncates to
+8 characters, which is a label, not a key), and nothing may emit anything
+derived from a submission: no sequence headers, no notes, no `outgroup`, no
+file contents. Options come from `PUBLIC_JOB_OPTION_KEYS`, a whitelist rather
+than a filter, because `input_info.json` holds the submitter's own text right
+beside them; progress lines are matched by regexes that capture numbers only,
+because the tool logs they come from also contain taxon labels. Keep new
+fields on that side of the line.
+
+A queued job has no job directory yet — the worker creates it — so its summary
+falls back to the description RQ already stored, which `safe_job_description()`
+built from counts and option names for this same reason.
 
 ## Ops / Debugging Notes
 

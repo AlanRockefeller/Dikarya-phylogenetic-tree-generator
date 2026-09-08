@@ -96,6 +96,16 @@ def timeout_env(name, default):
     return float(default)
 
 
+def count_env(name, default):
+    """Read a positive integer size limit, or ``default`` if unusable.
+
+    Reuses ``timeout_env``'s validation -- missing, malformed, non-finite and
+    non-positive all fall back to the documented default with a warning rather
+    than raising at import time. Only the return type differs.
+    """
+    return int(timeout_env(name, default))
+
+
 # Ceiling on CLAUDE_REVIEW_MAX_BUDGET_USD, which is the only setting that spends
 # money and which travels through sudo into a root-owned wrapper as a plain
 # string. Without a ceiling the per-invocation cap could simply be configured
@@ -295,6 +305,25 @@ class Config:
     )
     TRIMAL_TIME_LIMIT_HOURS = timeout_env('TRIMAL_TIME_LIMIT_HOURS', 4)
     BMGE_TIME_LIMIT_HOURS = timeout_env('BMGE_TIME_LIMIT_HOURS', 4)
+
+    # MAFFT's --adjustdirectionaccurately decides strand by comparing every
+    # sequence against the others, so its cost grows with BOTH the number of
+    # sequences and their length. On barcode-length input that is cheap and
+    # worth doing; on assembled contigs it is not. On 2026-09-04 a 205-sequence
+    # submission of complete phage genomes (11.6 Mbp, mean 56.8 kb/sequence)
+    # spent 7.5 hours inside makedirectionlist without ever reaching the
+    # alignment itself, holding the only worker slot and stalling 12 queued
+    # jobs behind it.
+    #
+    # Measured over all 10,544 jobs on disk: median input is 0.10 MB and p99.9
+    # is 0.81 MB. This ceiling is ~6x above p99.9 and excludes exactly the two
+    # genome-scale submissions (0.019%); the largest legitimate datasets -- a
+    # 2,409-sequence/1.6 Mbp barcode set and a 996-sequence/3.7 Mbp set -- stay
+    # under it. Above the ceiling the direction check is skipped and logged as
+    # a degradation; the alignment itself still runs.
+    MAFFT_ADJUSTDIRECTION_MAX_BASES = count_env(
+        'MAFFT_ADJUSTDIRECTION_MAX_BASES', 5_000_000
+    )
 
 
     # Paths

@@ -16,6 +16,7 @@ import re
 import shlex
 import time
 import urllib.request
+from app.services.api_diagnostics import diagnostic_urlopen, record_api_failure
 import urllib.parse
 import urllib.error
 from typing import Any, Dict, Optional, Tuple
@@ -643,7 +644,7 @@ def _fetch_mycomap_blast_listing(warnings: Optional[list] = None) -> str:
         method="GET",
     )
     try:
-        with urllib.request.urlopen(request, timeout=REQUEST_TIMEOUT) as resp:
+        with diagnostic_urlopen(request, timeout=REQUEST_TIMEOUT) as resp:
             return resp.read().decode("utf-8", errors="replace")
     except Exception as exc:
         logger.warning("Could not read the MycoMap BLAST listing page: %s", exc)
@@ -897,7 +898,7 @@ def create_mycomap_blast(sequence: str, *, title: str = "",
     )
 
     try:
-        with urllib.request.urlopen(request, timeout=MYCOMAP_RERUN_REQUEST_TIMEOUT) as resp:
+        with diagnostic_urlopen(request, timeout=MYCOMAP_RERUN_REQUEST_TIMEOUT) as resp:
             status_code = getattr(resp, "status", resp.getcode())
             raw_body = resp.read().decode("utf-8", errors="replace")
             response_url = resp.geturl() or ""
@@ -1035,7 +1036,7 @@ def rerun_mycomap_blast(blast_id: str, result_type: str = "local",
     )
 
     try:
-        with urllib.request.urlopen(request, timeout=MYCOMAP_RERUN_REQUEST_TIMEOUT) as resp:
+        with diagnostic_urlopen(request, timeout=MYCOMAP_RERUN_REQUEST_TIMEOUT) as resp:
             status_code = getattr(resp, "status", resp.getcode())
             raw_body = resp.read().decode("utf-8", errors="replace")
     except urllib.error.HTTPError as e:
@@ -1111,7 +1112,7 @@ def _mycomap_refresh_request(path: str, *, method: str = "GET",
         method=method,
     )
     try:
-        with urllib.request.urlopen(request, timeout=MYCOMAP_RERUN_REQUEST_TIMEOUT) as resp:
+        with diagnostic_urlopen(request, timeout=MYCOMAP_RERUN_REQUEST_TIMEOUT) as resp:
             raw_body = resp.read().decode("utf-8", errors="replace")
     except urllib.error.HTTPError as exc:
         raw_body = exc.read().decode("utf-8", errors="replace")
@@ -1145,6 +1146,8 @@ def _mycomap_refresh_request(path: str, *, method: str = "GET",
         return json.loads(raw_body) if raw_body else {}
     except json.JSONDecodeError:
         logger.error("MycoMap refresh API returned non-JSON for %s", path)
+        record_api_failure(request.full_url, reason="invalid_json", status=200,
+                           body=raw_body, method=method, req=request)
         raise MycoMapRefreshError("MycoMap refresh returned an invalid response.")
 
 
@@ -1641,7 +1644,7 @@ def get_mycomap_ncbi_queue_position(mycomap_url: str) -> Optional[int]:
         },
     )
     try:
-        with urllib.request.urlopen(request, timeout=REQUEST_TIMEOUT) as resp:
+        with diagnostic_urlopen(request, timeout=REQUEST_TIMEOUT) as resp:
             content = resp.read().decode('utf-8', errors='replace')
     except Exception as e:
         # Queue position is best-effort context. The actual result fetch still
@@ -1733,7 +1736,7 @@ def _fetch_fasta(
                 break
             timeout = min(REQUEST_TIMEOUT, remaining)
         try:
-            with urllib.request.urlopen(request, timeout=timeout) as resp:
+            with diagnostic_urlopen(request, timeout=timeout) as resp:
                 content = resp.read()
             if attempt:
                 logger.info(
@@ -2601,7 +2604,7 @@ def fetch_mycomap_blast_metrics(blast_id: str, source_url: Optional[str] = None)
     content = ''
     for url in _metrics_page_urls(blast_id, source_url):
         try:
-            with opener.open(url, timeout=REQUEST_TIMEOUT) as resp:
+            with diagnostic_urlopen(url, timeout=REQUEST_TIMEOUT, opener=opener.open) as resp:
                 content = resp.read().decode('utf-8', errors='replace')
             break
         except Exception as e:
@@ -2623,4 +2626,5 @@ def fetch_mycomap_blast_metrics(blast_id: str, source_url: Optional[str] = None)
         return combined
     except Exception as e:
         logger.warning(f"fetch_mycomap_blast_metrics: parse error: {e}", exc_info=True)
+        record_api_failure(url, reason="invalid_blast_metrics_html", status=200, body=content)
         return {}

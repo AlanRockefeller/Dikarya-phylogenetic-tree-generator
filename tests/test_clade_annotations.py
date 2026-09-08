@@ -118,6 +118,23 @@ class BackwardCompatibilityTests(unittest.TestCase):
 
 
 class NormalizationTests(unittest.TestCase):
+    def test_selected_group_round_trips_as_one_annotation(self):
+        state = _state_with_tips(["A", "B", "C"])
+        config = normalize_annotation_config(state, {
+            "layers": [_layer()],
+            "annotations": [_annotation(members=["A", "C"],
+                membership_mode="selection", annotation_type="clade_highlight")]
+        })
+        self.assertEqual(len(config[CLADE_ANNOTATIONS_KEY]), 1)
+        self.assertEqual(config[CLADE_ANNOTATIONS_KEY][0]["membership_mode"], "selection")
+        self.assertEqual(config[CLADE_ANNOTATIONS_KEY][0]["member_tip_ids"], ["A", "C"])
+        with self.assertRaises(AnnotationValidationError):
+            normalize_annotation_config(state, {
+                "layers": [_layer()],
+                "annotations": [_annotation(members=["A", "C"],
+                    membership_mode="selection", annotation_type="branch_text")]
+            })
+
     def setUp(self):
         self.state = _state_with_tips(["A", "B", "C", "D"])
 
@@ -1341,6 +1358,7 @@ process.stdout.write(JSON.stringify({
     validity: Object.fromEntries(validity),
     drawn: resolved.map((item) => item.annotation.id),
     drawnTypes: resolved.map((item) => viewer._annotationType(item.annotation)),
+    memberParts: resolved.map(item => item.memberParts?.map(part => part.indices) || null),
     highlightOrder: viewer._orderCladeHighlights(resolved)
         .map((item) => item.annotation.id),
     // A highlight has to know which node it starts at, root included.
@@ -1379,6 +1397,11 @@ process.stdout.write(JSON.stringify({
         : null,
     annotationsForNode,
     selectedClade: input.selectedIds ? viewer.getSelectedCladeLeafIds() : null,
+    selectedAnnotationGroups: input.selectedIds
+        ? viewer.getAnnotationMemberGroups(viewer.getSelectedAnnotationLeafIds()) : null,
+    selectedAnnotationTargets: input.selectedIds
+        ? allNodes.filter(node => !(node.children || []).length)
+            .map(node => viewer.getAnnotationTargetLeafIds(node)) : null,
     selectedHasIncomingBranch: input.selectedIds
         ? viewer.hasIncomingBranchForMemberIds(input.selectedIds) : null,
     draftPreview,
@@ -1457,6 +1480,31 @@ class AnnotationRenderDecisionTests(_RenderHarnessMixin, unittest.TestCase):
     left off the figure entirely, and they come back by themselves when the
     topology makes them a clade again.
     """
+
+    def test_selection_across_clades_covers_every_selected_tip(self):
+        out = self._resolve([], selected_ids=["A", "B", "D"])
+        self.assertEqual(out["selectedAnnotationGroups"], [["A", "B"], ["D"]])
+        self.assertEqual(out["selectedAnnotationTargets"], [
+            ["A", "B", "D"], ["A", "B", "D"], ["C"], ["A", "B", "D"]
+        ])
+
+    def test_one_selected_group_renders_once_with_only_its_member_parts(self):
+        for kind in ("clade_line", "clade_highlight"):
+            out = self._resolve([_annotation("specimen", members=["A", "B", "D"],
+                membership_mode="selection", annotation_type=kind)])
+            self.assertEqual(out["drawn"], ["specimen"])
+            self.assertEqual(out["memberParts"], [[[0, 1], [3]]])
+            self.assertTrue(out["validity"]["specimen"]["valid"])
+
+    def test_selected_group_follows_reordered_and_pruned_members(self):
+        out = self._resolve([_annotation("specimen", members=["A", "B", "D"],
+            membership_mode="selection")], tree=[["D", "C"], "A"], tip_order=["D", "C", "A"])
+        self.assertEqual(out["drawn"], ["specimen"])
+        self.assertEqual(out["memberParts"], [[[0], [2]]])
+
+    def test_separated_selected_tips_do_not_include_neighbours(self):
+        out = self._resolve([], selected_ids=["A", "C"])
+        self.assertEqual(out["selectedAnnotationGroups"], [["A"], ["C"]])
 
     def test_clade_block_index_matches_the_topology(self):
         out = self._resolve([_annotation(members=["A", "B"])])

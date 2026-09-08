@@ -16,6 +16,7 @@ import time
 import urllib.request
 import urllib.parse
 import urllib.error
+from app.services.api_diagnostics import diagnostic_urlopen
 import json
 from typing import Optional, List, Dict, Tuple, Any
 from urllib.parse import urlparse, parse_qs
@@ -196,7 +197,7 @@ def _make_api_request(url: str, max_retries: int = 3) -> Dict:
     attempts = 0
     while attempts <= max_retries:
         try:
-            with opener.open(url, timeout=REQUEST_TIMEOUT) as resp:
+            with diagnostic_urlopen(url, timeout=REQUEST_TIMEOUT, opener=opener.open) as resp:
                 content = resp.read()
                 return json.loads(content.decode('utf-8'))
                 

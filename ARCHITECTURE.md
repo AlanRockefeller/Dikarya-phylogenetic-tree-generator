@@ -239,9 +239,21 @@ has its own section in `SYSTEM_PROMPT`; the two must be changed together.
   supported, which is the question the user opened the viewer to ask. It lists
   strongly supported clades, outermost first so none contains another, each
   with its support, subtending branch length and up to `CLADE_TIP_LIMIT`
-  members. A group holding more than half the tree is reopened into the
+  members. Because that member list is truncated, each group also carries a
+  `taxon_label_composition` counted over **all** its tips whenever it is not
+  label-homogeneous — a 19-tip clade published eight names, all *Inocybe*,
+  while its 15th tip was labelled *Psathyrellaceae*, and nothing in the digest
+  said so. Higher-rank labels are counted but marked `above_genus`, because
+  *Inocybaceae* inside an *Inocybe* clade is an imprecise label and
+  *Psathyrellaceae* is a different family; the code has no hierarchy to tell
+  those apart, so it publishes the counts and the prompt asks the reviewer to
+  judge. Across 60 jobs, 15% of supported groups are mixed and 69 of those 73
+  carry two genus-rank labels rather than one dismissible higher-rank one.
+  A group holding more than half the tree is reopened into the
   supported clades inside it: a 2409-tip FastTree job otherwise reduced to one
-  group of 2383 tips, true and useless. Reopening costs coverage — tips in no
+  group of 2383 tips, true and useless. `one_clade_held_most_of_the_tree`
+  records that this happened, so the reviewer knows the groups are
+  subdivisions of one clade rather than separate lineages. Reopening costs coverage — tips in no
   supported subclade become unplaced — so the bar is high, and `basis` reports
   which rule produced the groups. A tree with nothing above its support
   threshold falls back to `basis: "topology_only"`, and the prompt forbids
@@ -258,6 +270,9 @@ has its own section in `SYSTEM_PROMPT`; the two must be changed together.
   (`taxon_labels_in_multiple_groups`, computed over determinate binomials only —
   a `sp.`/`cf.` label in two clades means nothing), but never resolve which is
   right. Absent metadata is reported as absent rather than guessed from names.
+  Both label checks read each group's full membership, not its published
+  sample; keying them on `tip_names` silently excluded every large clade,
+  which is exactly where a mixed label hides.
 - **`alignment.excerpts` — the one place residues are sent.** At most two
   windows of at most `EXCERPT_MAX_COLUMNS` columns, cut around the largest
   interior gap of the most internally gapped rows, with clean neighbours beside
@@ -282,7 +297,10 @@ Three consequences follow:
 - **Reviews are cached on a fingerprint of the metrics**, at
   `var/jobs/<id>/analysis/claude_review.json`. Re-opening the viewer replays the
   stored review; only a real change to the tree or alignment, or an explicit
-  Re-run, costs a call.
+  Re-run, costs a call. A live review of a 119-tip job took **96 s** end to end
+  and cost about $0.55 — comfortably inside the 240 s wrapper timeout, but
+  above the 60–90 s this document used to quote, so budget accordingly when
+  changing the timeout chain.
 
 Support values are classified with the same rules as the viewer's support badge
 (`tree_viewer_phylotree_v2.js`), including resolving IQ-TREE's dual
@@ -604,8 +622,54 @@ rq worker -u redis://localhost:6379 dikarya-tasks
 ## Debugging & Logging
 
 ### Logs
+- **Failures (WARNING+)**: `/var/www/dikarya/var/logs/errors.log` — start here.
 - **Error Log**: `/var/www/dikarya/var/logs/error.log`
 - **Access Log**: `/var/www/dikarya/var/logs/access.log`
+
+`app/services/request_diagnostics.py` records `event=http.request_failed` for
+4xx responses on registered application routes and all 5xx responses. Each
+record includes method, route template, status, reason code, handler duration,
+request size, and the existing request/user/job context. Unknown scanner routes
+and static misses are excluded. Collector rejections retain their reason codes,
+including CSRF failures before the collector handler runs. It never reads request
+or response bodies, query strings, cookies, or authorization headers, and never
+consumes streaming responses. Duration covers the handler through response
+creation; Gunicorn and the existing SSE events record stream lifetimes.
+
+The browser collector refreshes its CSRF token once through the rate-limited,
+non-cacheable `/api/log/client/csrf` endpoint after a 400, then retries the same
+bounded report. Persistent delivery failures back off without recursively
+reporting themselves. CSRF protection remains enabled on the collector.
+
+The missing-route limiter increments and expires its Redis counter atomically.
+A bounded per-process counter provides weaker local protection during Redis
+failures. Limiter-generated 429s carry `X-Dikarya-Noise: scanner`, recorded as
+`noise=scanner` in Gunicorn access logs so the digest can separate them from
+rate limits on real product endpoints without relying on user agents.
+
+Reason codes default to the HTTP status name. CSRF failures distinguish missing,
+expired, mismatched, and invalid tokens; v1 errors retain their structured code;
+submission validation distinguishes invalid DNA FASTA and IQ-TREE bootstrap
+counts. New rejection paths can call `note_request_failure("stable_reason")`
+before returning. Pass only developer-defined codes, never exception messages
+or submitted values. Both submission endpoints bind the newly minted job id
+before database persistence and enqueueing, so failures there remain traceable.
+
+`event=auth.login_failed` and `event=auth.registration_failed` expose failures
+that return 200 or redirect instead of an HTTP error. Known login accounts use
+their internal id; submitted email/password values are not logged. Successful
+sign-ins and registrations have corresponding INFO events.
+
+Browser reports include `server_request_id` from a failed same-origin API
+response's `X-Request-Id`, separately from the collector request's `req`. Search
+that id in `errors.log` and `access.log` to link the browser and server failures.
+They also carry `client_release`, HTTP method/status, elapsed milliseconds,
+browser-reported online state and page visibility. These are bounded,
+untrusted diagnostic hints; `online=true` does not prove server reachability.
+The existing expected-4xx exclusions remain in the browser collector because
+the server now records those outcomes. Deduplication is scoped to the client,
+failed request and page release, so one user's error cannot suppress another
+user's report (anonymous clients sharing an IP still share a dedup scope).
 
 ### Troubleshooting
 - **500 Server Errors**: Check the error log for stack traces.

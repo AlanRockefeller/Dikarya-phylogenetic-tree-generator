@@ -18,6 +18,7 @@ import threading
 import time
 import urllib.parse
 import urllib.request
+from app.services.api_diagnostics import diagnostic_urlopen, record_api_failure
 import urllib.error
 import uuid
 from datetime import datetime, timezone
@@ -329,6 +330,19 @@ def _retry_delay(error, attempt: int) -> float:
     return min(RETRY_BACKOFF_BASE ** attempt, RETRY_BACKOFF_CAP)
 
 
+class _APIResponse(dict):
+    """Carry response evidence in memory until semantic validation finishes."""
+
+
+def _observation_failure(observation, observation_id, reason):
+    payload = getattr(observation, "response_payload", observation)
+    record_api_failure(
+        f"{INAT_API_BASE}/observations/{int(observation_id)}", reason=reason,
+        status=200, body=getattr(payload, "response_raw", payload),
+        headers=getattr(payload, "response_headers", None),
+    )
+
+
 def _http_request(url: str, *, method: str = "GET", body: Optional[Dict[str, Any]] = None,
                    bearer: Optional[str] = None) -> Dict[str, Any]:
     data = None
@@ -355,9 +369,16 @@ def _http_request(url: str, *, method: str = "GET", body: Optional[Dict[str, Any
         # retry is another request to iNaturalist and must not jump the queue.
         _pace_inat_request()
         try:
-            with urllib.request.urlopen(req, timeout=REQUEST_TIMEOUT) as resp:
-                raw = resp.read().decode('utf-8') or '{}'
-                return json.loads(raw) if raw.strip() else {}
+            with diagnostic_urlopen(req, timeout=REQUEST_TIMEOUT) as resp:
+                wire = resp.read()
+                raw = wire.decode('utf-8') or '{}'
+                parsed = json.loads(raw) if raw.strip() else {}
+                if not isinstance(parsed, dict):
+                    raise InatTreeError("iNaturalist returned an invalid response object.", status=502)
+                payload = _APIResponse(parsed)
+                payload.response_headers = dict(getattr(resp, "headers", None) or {})
+                payload.response_raw = wire
+                return payload
         except urllib.error.HTTPError as e:
             if e.code in RETRYABLE_HTTP_STATUSES and attempt <= MAX_HTTP_ATTEMPTS:
                 delay = _retry_delay(e, attempt)
@@ -411,8 +432,16 @@ def fetch_observation(observation_id: int) -> Dict[str, Any]:
     payload = _http_request(url)
     results = (payload or {}).get('results') or []
     if not results:
+        record_api_failure(url, reason="observation_not_found", status=200,
+                           body=getattr(payload, "response_raw", payload),
+                           headers=getattr(payload, "response_headers", None))
         raise InatTreeError(f"iNaturalist observation {observation_id} was not found.", status=404)
-    return results[0]
+    if not isinstance(results, list) or not isinstance(results[0], dict):
+        record_api_failure(url, reason="invalid_observation_results", status=200, body=payload)
+        raise InatTreeError("iNaturalist returned invalid observation results.", status=502)
+    observation = _APIResponse(results[0])
+    observation.response_payload = payload
+    return observation
 
 
 def _clean_candidate(value: Any) -> str:
@@ -734,9 +763,9 @@ def preview_inaturalist_tree_input(raw_input: str,
         if can_recreate_tree:
             message = (
                 f"Found observation {observation_id}. It already has a "
-                "Phylogenetic Tree field. Select Re-create phylogenetic tree "
+                "Phylogenetic Tree field. Select Replace existing tree URL "
                 "to build a new tree and replace the field's current URL, or "
-                "Build a new tree without replacing to leave the field alone."
+                "Keep existing URL to leave the field alone."
             )
         elif has_tree:
             message = (
@@ -759,7 +788,9 @@ def preview_inaturalist_tree_input(raw_input: str,
         else:
             message = (
                 f"Found observation {observation_id}, but it has neither a "
-                "Mycomap BLAST Results field nor a DNA Barcode ITS field."
+                "Mycomap BLAST Results field nor a DNA Barcode ITS field. "
+                "Add a DNA Barcode ITS sequence or a public MycoMap results URL "
+                "to the observation, then try again."
             )
         eligible = bool(not has_tree and (has_mycomap or has_its))
         return {
@@ -1515,6 +1546,7 @@ def _create_mycomap_blast_from_observation(observation: Dict[str, Any],
     raw_its = extract_observation_field_value(observation, DNA_BARCODE_ITS_FIELD_NAME)
     cleaned_its = clean_dna_sequence(raw_its or "") or ""
     if not cleaned_its:
+        _observation_failure(observation, observation_id, "missing_or_unusable_its")
         raise InatTreeError(
             "This observation has no usable DNA Barcode ITS sequence and no "
             "Mycomap BLAST Results URL.",
@@ -2003,12 +2035,10 @@ def prepare_inat_tree_job(observation_id: int, *, include_ncbi: bool = True,
         # Alan 8/4/26 - Building without replacing is also explicit consent.
         and not keep_existing_tree_url
     ):
-        raise InatTreeError(
-            "This observation already has a Phylogenetic Tree field. Select "
-            "Re-create phylogenetic tree to replace its URL with a new tree, "
-            "or Build a new tree without replacing to keep the current URL.",
-            status=409,
-        )
+        # A prior submission may finish while this job waits. Continue building;
+        # the completion hook rechecks the field and preserves it unless the
+        # submission explicitly requested replacement.
+        _report_progress(progress, "An existing tree URL will be preserved while this new tree is built.")
     mycomap_url = extract_observation_field_value(observation, MYCOMAP_BLAST_FIELD_NAME)
     if not mycomap_url:
         saved_created_url = str(
@@ -2228,7 +2258,8 @@ def create_job_from_inat_observation(raw_input: str, user=None,
                                       queue_name: str = "phylo_high",
                                       queue_class: str = "high",
                                       source: str = "inaturalist_single_tree",
-                                      extra_metrics: Optional[Dict[str, Any]] = None
+                                      extra_metrics: Optional[Dict[str, Any]] = None,
+                                      observation_data: Optional[Dict[str, Any]] = None
                                       ) -> Dict[str, Any]:
     """Validate the iNat input and queue preparation for a one-click tree job.
 
@@ -2245,6 +2276,27 @@ def create_job_from_inat_observation(raw_input: str, user=None,
     keep_existing_tree_url = bool(keep_existing_tree_url)
     if keep_existing_tree_url:
         recreate_existing_tree = False
+    # Validate fresh server-side data before creating a database row or RQ job.
+    # Browser previews can be stale, and API callers need the same validation.
+    observation = observation_data if observation_data is not None else fetch_observation(observation_id)
+    if (_has_nonempty_field(observation, PHYLOGENETIC_TREE_FIELD_NAME)
+            and not recreate_existing_tree and not keep_existing_tree_url):
+        _observation_failure(observation, observation_id, "existing_tree_without_choice")
+        raise InatTreeError(
+            "This observation already has a tree. Choose Replace existing tree URL "
+            "or Keep existing URL before building a new tree.", status=409,
+        )
+    from app.services.fasta_utils import clean_dna_sequence
+    if not (_has_nonempty_field(observation, MYCOMAP_BLAST_FIELD_NAME)
+            or clean_dna_sequence(extract_observation_field_value(
+                observation, DNA_BARCODE_ITS_FIELD_NAME) or "")):
+        _observation_failure(observation, observation_id, "missing_sequence_inputs")
+        raise InatTreeError(
+            "Add a DNA Barcode ITS observation field containing a DNA sequence, "
+            "or a MycoMap BLAST Results field containing the public results URL, "
+            "then try again. A GenBank accession alone cannot start this workflow.",
+            status=422,
+        )
     initial_genus = _clean_display_text((extra_metrics or {}).get("inat_genus"))
     rq_meta = {
         "queue_class": queue_class,
@@ -2398,6 +2450,7 @@ def create_jobs_from_inat_scope(raw_input: str, resolved_type: str, user=None,
                     "batch_scope_value": scope.get("value"),
                     "inat_genus": _extract_inat_genus(observation),
                 },
+                observation_data=observation,
             )
             job_ids.append(result["job_id"])
         except InatTreeError as exc:
@@ -2695,6 +2748,13 @@ def post_completed_tree_to_inaturalist(job_id: str, metrics: Dict[str, Any]) -> 
             out["status"] = "skipped"
             out["skipped_reason"] = "kept existing Phylogenetic Tree field URL"
             return out
+
+        if not metrics.get("inat_replace_existing_tree"):
+            observation = fetch_observation(observation_id)
+            if _has_nonempty_field(observation, PHYLOGENETIC_TREE_FIELD_NAME):
+                out["status"] = "skipped"
+                out["skipped_reason"] = "preserved tree URL added since submission"
+                return out
 
         # Build the external tree URL. Prefer url_for(_external=True) when
         # SERVER_NAME is configured; otherwise fall back to the configured

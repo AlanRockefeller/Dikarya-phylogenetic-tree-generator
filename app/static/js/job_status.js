@@ -10,6 +10,14 @@ class JobStatusClient {
     // Upper bound on retained terminal rows (see _trimTerminal).
     static MAX_LOG_LINES = 2000;
 
+    // Alan 9/7/26 - Fallback interval for /downloads/available, not the primary
+    // signal. Downloads appear as pipeline steps finish, and every one of those
+    // arrives over SSE, so handleStepDone() refreshes immediately and this poll
+    // only has to cover a missed event. It used to be 5s unconditionally: one
+    // browser watching two RAxML runs made 2,543 requests to that endpoint in
+    // four hours -- 37.7% of all application requests that evening.
+    static DOWNLOADS_POLL_MS = 30000;
+
     // Alan 8/23/26 - The only stream values that may become a CSS class. 'cmd' is
     // what publish_command() emits and is what makes the "$ mafft ..." lines green;
     // whitelisting rather than passing event.stream through keeps a hostile value
@@ -82,6 +90,9 @@ class JobStatusClient {
     }
 
     connect() {
+        this._downloadsStopped = false;
+        this._bindDownloadsVisibility();
+        this.refreshDownloads();
         // Alan 8/23/26 - Never leave a second stream open: each one holds a server
         // request slot, and the pageshow reconnect below can call this again.
         if (this.eventSource) {
@@ -128,6 +139,8 @@ class JobStatusClient {
     }
 
     disconnect() {
+        this._downloadsStopped = true;
+        clearTimeout(this._downloadsTimer);
         this._freezeLiveEntry();
         if (this.eventSource) {
             this.eventSource.close();
@@ -152,6 +165,82 @@ class JobStatusClient {
             indicator.classList.add('disconnected');
             text.textContent = 'Reconnecting...';
         }
+    }
+
+    async refreshDownloads() {
+        if (this._downloadsLoading) {
+            this._downloadsRefreshPending = true;
+            return;
+        }
+        clearTimeout(this._downloadsTimer);
+        this._downloadsLoading = true;
+        try {
+            const response = await fetch(`/api/job/${this.jobId}/downloads/available`, {
+                cache: 'no-store', signal: AbortSignal.timeout(10000),
+            });
+            if (!response.ok) return;
+            const available = await response.json();
+            let added = 0;
+            for (const [id, ready] of Object.entries(available)) {
+                const link = document.getElementById(id);
+                if (!link) continue;
+                const newlyReady = ready && link.style.display === 'none';
+                link.style.display = ready ? '' : 'none';
+                if (newlyReady) {
+                    added++;
+                    if (!window.matchMedia('(prefers-reduced-motion: reduce)').matches) {
+                        link.animate([
+                            { opacity: 0, transform: 'translateY(8px)', backgroundColor: 'rgba(212,175,55,.35)' },
+                            { opacity: 1, transform: 'translateY(0)', backgroundColor: 'transparent' },
+                        ], { duration: 650, delay: (added - 1) * 65, easing: 'ease-out' });
+                    }
+                }
+            }
+            document.getElementById('dl-mrbayes-heading').style.display = available['dl-mrbayes'] ? '' : 'none';
+            const count = Object.values(available).filter(Boolean).length;
+            const badge = document.getElementById('downloads-ready-count');
+            badge.textContent = count ? `${count} ready` : '';
+            if (added && this._downloadsInitialized) {
+                document.getElementById('downloads-announcement').textContent = `${added} new download${added === 1 ? '' : 's'} ready`;
+                if (!window.matchMedia('(prefers-reduced-motion: reduce)').matches) {
+                    badge.animate([{ transform: 'scale(1)' }, { transform: 'scale(1.2)' }, { transform: 'scale(1)' }], { duration: 550 });
+                }
+            }
+            this._downloadsInitialized = true;
+        } catch (error) {
+            // A transient outage leaves the last known availability intact.
+        } finally {
+            this._downloadsLoading = false;
+            if (this._downloadsRefreshPending) {
+                this._downloadsRefreshPending = false;
+                this.refreshDownloads();
+            } else {
+                this._scheduleDownloadsPoll();
+            }
+        }
+    }
+
+    _scheduleDownloadsPoll() {
+        clearTimeout(this._downloadsTimer);
+        // A hidden tab is not watching downloads appear. Nothing is lost by
+        // waiting: becoming visible refreshes immediately, and the terminal
+        // paths below refresh regardless of visibility.
+        if (this._downloadsStopped || document.hidden) return;
+        this._downloadsTimer = setTimeout(() => this.refreshDownloads(), JobStatusClient.DOWNLOADS_POLL_MS);
+    }
+
+    _bindDownloadsVisibility() {
+        if (this._downloadsVisibilityBound) return;
+        this._downloadsVisibilityBound = true;
+        document.addEventListener('visibilitychange', () => {
+            if (document.hidden) {
+                clearTimeout(this._downloadsTimer);
+                return;
+            }
+            // Catch up on anything that became available while hidden, then
+            // resume the fallback poll from here.
+            if (!this._downloadsStopped) this.refreshDownloads();
+        });
     }
 
     handleSnapshot(data) {
@@ -186,16 +275,6 @@ class JobStatusClient {
         if (job.meta && job.meta.steps) {
             this.updateTimeline(job.meta.steps);
 
-            // Show/hide trimmed FASTA download based on whether trimming was performed
-            const trimStep = job.meta.steps.trim;
-            const trimmedLink = document.getElementById('dl-trimmed');
-            if (trimmedLink) {
-                if (trimStep && trimStep.state && trimStep.state !== 'skipped') {
-                    trimmedLink.style.display = '';
-                } else {
-                    trimmedLink.style.display = 'none';
-                }
-            }
         }
 
         // Update current step
@@ -343,6 +422,7 @@ class JobStatusClient {
         // reconnecting every few seconds.
         if (job.status === 'completed' || job.status === 'failed') {
             this.disconnect();
+            this.refreshDownloads();
         }
 
         this.lastStatus = job.status;
@@ -419,6 +499,7 @@ class JobStatusClient {
         // request slot behind it) as soon as the job reaches a terminal state.
         if (event.status === 'completed' || event.status === 'failed') {
             this.disconnect();
+            this.refreshDownloads();
         }
     }
 
@@ -470,6 +551,10 @@ class JobStatusClient {
     handleStepDone(event) {
         // Update timeline
         this.updateStepState(event.step, 'done');
+
+        // A finished step is what makes new artifacts downloadable, so refresh
+        // on the event rather than waiting out the fallback poll.
+        this.refreshDownloads();
 
         // Add to overview
         this._noteActivity();
@@ -819,29 +904,6 @@ class JobStatusClient {
             btn.setAttribute('aria-disabled', 'false');
             btn.href = resultFiles.tree_newick?.replace('/api/job', '/job').replace('/download/tree/newick', '/view')
                 || `/job/${this.jobId}/view`;
-        }
-
-        // Alan 7/15/26 - Offer raw MrBayes command and trace files only when this completed job produced them.
-        const mrbayesLink = document.getElementById('dl-mrbayes');
-        // Alan 7/15/26 - Keep the matching dropdown heading synchronized with the conditional analysis download.
-        const mrbayesHeading = document.getElementById('dl-mrbayes-heading');
-        // Alan 7/15/26 - Use the completion payload to avoid showing a dead MrBayes link for other tree methods.
-        if (mrbayesLink && mrbayesHeading && resultFiles?.mrbayes) {
-            // Alan 7/15/26 - Point the visible link at the access-controlled archive endpoint supplied by the server.
-            mrbayesLink.href = resultFiles.mrbayes;
-            // Alan 7/15/26 - Reveal both Bayesian download elements together after successful completion.
-            mrbayesLink.style.display = '';
-            mrbayesHeading.style.display = '';
-        }
-
-        // Alan 7/15/26 - Find the optional bundle that pairs before/after FASTA files with the trimmer's marked report.
-        const alignmentInspectionLink = document.getElementById('dl-alignment-inspection');
-        // Alan 7/15/26 - Show the inspection download only when this completed job actually produced a trimming report.
-        if (alignmentInspectionLink && resultFiles?.alignment_inspection) {
-            // Alan 7/15/26 - Use the access-controlled archive URL supplied by the completion payload.
-            alignmentInspectionLink.href = resultFiles.alignment_inspection;
-            // Alan 7/15/26 - Reveal the inspection bundle alongside the aligned and trimmed FASTA downloads.
-            alignmentInspectionLink.style.display = '';
         }
 
         // Add success to overview

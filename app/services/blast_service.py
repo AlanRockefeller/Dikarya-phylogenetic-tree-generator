@@ -8,6 +8,7 @@ import threading
 import xml.etree.ElementTree as ET
 from typing import Dict, List, Optional, Tuple, Any
 from app.config import Config
+from app.services.api_diagnostics import record_requests_failure, record_api_failure
 
 logger = logging.getLogger(__name__)
 
@@ -79,6 +80,8 @@ def _ncbi_request(method: str, url: str, max_retries: int = 5, **kwargs) -> requ
         last_attempt = attempt == max_retries - 1
         try:
             response = requests.request(method, url, **kwargs)
+            if response.status_code >= 400:
+                record_requests_failure(response)
             
             # Check for 429 Too Many Requests
             if response.status_code == 429:
@@ -114,6 +117,7 @@ def _ncbi_request(method: str, url: str, max_retries: int = 5, **kwargs) -> requ
             return response
             
         except (requests.ConnectionError, requests.Timeout) as e:
+            record_api_failure(url, reason=type(e).__name__, method=method)
             if last_attempt:
                 logger.warning(f"NCBI Connection/Timeout error on final attempt {attempt + 1}/{max_retries}: {e}. Giving up.")
                 break
@@ -324,6 +328,7 @@ def _submit_blast_request(seq: str, config: Config = None, min_identity: float =
                 pass
                 
     if not rid:
+        record_requests_failure(response, reason="missing_blast_rid")
         raise ValueError(f"Could not retrieve RID from NCBI BLAST submission. Response: {response.text[:500]}")
     
     logger.info(f"BLAST submission successful. RID={rid}, RTOE={rtoe}")
@@ -400,9 +405,11 @@ def _poll_blast(rid: str, rtoe: int, config: Config, logger,
                 continue
             
             if "Status=FAILED" in content:
+                record_requests_failure(response, reason="blast_search_failed")
                 raise RuntimeError(f"BLAST failed for RID {rid}")
                 
             if "Status=UNKNOWN" in content:
+                record_requests_failure(response, reason="blast_search_unknown")
                 raise RuntimeError(f"BLAST RID {rid} expired or unknown")
                 
             if "Status=READY" in content:
@@ -476,6 +483,7 @@ def _fetch_blast_results(rid: str, max_sequences: int = DEFAULT_MAX_SEQUENCES) -
                 content = zf.read(main_json).decode('utf-8')
         except Exception as e:
             logger.error(f"Failed to extract ZIP: {e}")
+            record_requests_failure(response, reason="invalid_blast_zip")
             return {"accessions": [], "hit_details": []}
     else:
         content = response.text
@@ -512,11 +520,8 @@ def _fetch_blast_results(rid: str, max_sequences: int = DEFAULT_MAX_SEQUENCES) -
         blast_output = data.get("BlastOutput2", {})
         
         if not blast_output:
-            # Deliberately no debug dump. This used to write the decoded NCBI
-            # response to a fixed /tmp/blast_debug_response.json, which every
-            # concurrent job overwrote and which put upstream response data
-            # outside the normal logging controls. The bounded fingerprint plus
-            # the key list is enough to recognise a recurring malformed shape.
+            # Unique redacted archives preserve evidence across concurrent jobs.
+            record_requests_failure(response, reason="missing_blastoutput2")
             from app.services.log_context import stable_fingerprint
             logger.warning(
                 "event=blast.no_blastoutput2 BLAST response carried no "
@@ -570,6 +575,7 @@ def _fetch_blast_results(rid: str, max_sequences: int = DEFAULT_MAX_SEQUENCES) -
         return {"accessions": accessions[:limit], "hit_details": hit_details[:limit]}
         
     except json.JSONDecodeError as e:
+        record_requests_failure(response, reason="invalid_blast_json")
         from app.services.log_context import stable_fingerprint
         logger.error(
             "event=blast.response_parse_failed JSON decode failed exception=%s "
@@ -749,6 +755,7 @@ def _parse_genbank_xml(xml_text: str) -> Dict[str, Dict]:
     }
     """
     result = {"by_acc": {}, "by_ver": {}}
+    original_xml = xml_text
     
     try:
         # Remove namespace prefixes if present to simplify parsing
@@ -824,6 +831,7 @@ def _parse_genbank_xml(xml_text: str) -> Dict[str, Dict]:
                 result["by_ver"][ver] = record
                 
     except ET.ParseError as e:
+        record_api_failure(NCBI_EFETCH_URL, reason="invalid_genbank_xml", status=200, body=original_xml)
         logger.error(f"XML Parse Error: {e}")
     except Exception as e:
         logger.error(f"Error parsing GenBank XML: {e}")

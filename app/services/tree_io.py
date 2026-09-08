@@ -391,12 +391,101 @@ def newick_file_to_nexus(newick_path, nexus_path, comment: Optional[str] = None)
     re-quotes them under the stricter rule, so this is also what repairs a
     Newick that was quoted for Newick only.
     """
-    if not HAS_BIOPYTHON:
+    text = newick_file_to_nexus_text(newick_path, comment=comment)
+    if text is None:
         return False
+    Path(nexus_path).write_text(text, encoding="utf-8")
+    return True
+
+
+def newick_file_to_nexus_text(newick_path, comment: Optional[str] = None) -> Optional[str]:
+    """Render a Newick file as NEXUS text, or None if it cannot be read.
+
+    The in-memory half of `newick_file_to_nexus`, for callers that want to hand
+    the result straight to a client instead of putting it on disk.
+    """
+    if not HAS_BIOPYTHON:
+        return None
+    import tempfile
+
     try:
         tree = Phylo.read(str(newick_path), "newick")
-        write_nexus_tree(tree, nexus_path, comment=comment)
-        return True
+        # write_nexus_tree writes a path; there is no string form of it, and
+        # duplicating its body to make one would be two writers to keep in step.
+        with tempfile.TemporaryDirectory() as scratch:
+            staged = Path(scratch) / "tree.nexus"
+            write_nexus_tree(tree, staged, comment=comment)
+            return staged.read_text(encoding="utf-8")
     except Exception as exc:
         logger.error("Failed to convert %s to NEXUS: %s", newick_path, exc)
-        return False
+        return None
+
+
+def build_nexus_download(job_dir) -> Optional[tuple]:
+    """Return ``(nexus_bytes, source_filename)`` for a job's NEXUS download.
+
+    Serving ``tree/*.nexus`` off disk directly is not safe, for two reasons
+    that both show up as "my NEXUS file will not open":
+
+    * Almost every stored NEXUS predates `write_nexus_tree` and was produced by
+      Biopython's writer, which emits TAXLABELS unquoted and space-separated.
+      Any label with a space -- i.e. essentially all of them -- inflates the
+      token count past the declared NTAX, and a label containing ``(`` or ``;``
+      truncates the block outright. 82% of the ~10,500 files on disk fail
+      `validate_nexus_file`; regenerating from the sibling Newick repairs all
+      of them, because the Newick carries the same labels correctly quoted.
+    * `tree_pruned.nexus` exists for only ~5% of jobs that have a
+      `tree_pruned.newick`, so a job whose tree has been edited served the
+      *unpruned* original under a name that promised the current tree, while
+      the Newick download beside it served the pruned one.
+
+    So the Newick is treated as the source of truth and the stored NEXUS is
+    used only when it is both valid and no older than that Newick. Nothing is
+    written back: a download is not a tree edit, and regenerating in memory
+    keeps it clear of tree_state locking and of the undo snapshot.
+    """
+    job_dir = Path(job_dir)
+    tree_dir = job_dir / "tree"
+
+    def usable(path) -> bool:
+        # The same containment rule validate_safe_file_path() applies at the
+        # route: a real file, never a symlink, resolving inside the job dir.
+        try:
+            if path.is_symlink() or not path.is_file():
+                return False
+            return path.resolve().is_relative_to(job_dir.resolve())
+        except OSError:
+            return False
+
+    # Same preference order as /download/tree/newick, so the two downloads can
+    # never describe different trees.
+    for nexus_name, newick_name in (
+        ("tree_pruned.nexus", "tree_pruned.newick"),
+        ("tree_original.nexus", "tree_original.newick"),
+    ):
+        nexus_path = tree_dir / nexus_name
+        newick_path = tree_dir / newick_name
+        has_nexus = usable(nexus_path)
+        has_newick = usable(newick_path)
+        if not has_nexus and not has_newick:
+            continue
+
+        if has_nexus and validate_nexus_file(nexus_path)[0]:
+            fresh = not has_newick or (
+                nexus_path.stat().st_mtime >= newick_path.stat().st_mtime
+            )
+            if fresh:
+                return nexus_path.read_bytes(), nexus_name
+
+        if has_newick:
+            text = newick_file_to_nexus_text(newick_path)
+            if text is not None:
+                return text.encode("utf-8"), newick_name
+
+        if has_nexus:
+            # Unparseable and unrepairable. Handing back what we have beats a
+            # 404 -- the user can still see the labels in it.
+            logger.warning("Serving unrepaired NEXUS %s", nexus_path)
+            return nexus_path.read_bytes(), nexus_name
+
+    return None

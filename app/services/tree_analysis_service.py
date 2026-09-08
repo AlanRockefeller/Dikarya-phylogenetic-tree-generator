@@ -45,7 +45,7 @@ logger = logging.getLogger(__name__)
 
 # Bump when the prompt or the metric set changes in a way that would make a
 # stored review misleading. Cached reviews with a different version are ignored.
-REVIEW_SCHEMA_VERSION = 5
+REVIEW_SCHEMA_VERSION = 7
 
 CACHE_RELATIVE_PATH = Path("analysis") / "claude_review.json"
 
@@ -1099,6 +1099,10 @@ def _clade_entry(
         "tip_names": tip_names[:CLADE_TIP_LIMIT],
         "tip_names_truncated": len(tip_names) > CLADE_TIP_LIMIT,
         "basis": basis,
+        # Full membership, for the label checks in build_context. Stripped
+        # before the context is returned: a 35-tip roster per group would
+        # undo the point of truncating the published list.
+        "_all_tip_names": tip_names,
     }
     if value is not None:
         entry["support"] = value
@@ -1168,6 +1172,12 @@ def _topology_digest(
     basis = "strong_support"
     groups = _maximal_strong_clades(root.clades, strong_threshold)
     supported_total = len(groups)
+    # Which groups came OUT of a reopening. Reopening replaces one oversized
+    # clade and leaves every other outermost supported clade of the tree
+    # standing beside the replacements -- so "these groups are subdivisions of
+    # one larger clade" is true of the replacements only, and asserting it of
+    # the whole list invents a supported ancestor the tree does not have.
+    reopened_ids: Set[int] = set()
 
     if groups:
         # Reopening is a repair for a degenerate digest, not a general
@@ -1195,6 +1205,7 @@ def _topology_digest(
             inner = _maximal_strong_clades(largest.clades, strong_threshold)
             groups.remove(largest)
             if inner:
+                reopened_ids.update(id(clade) for clade in inner)
                 # A single result is not a dead end: strongly supported clades
                 # nest, and a 2409-tip FastTree job in the archive had its whole
                 # tree inside a chain of them. Descending through the chain is
@@ -1232,6 +1243,10 @@ def _topology_digest(
         _clade_entry(position, clade, tip_names_by_id.get(id(clade), []), basis)
         for position, clade in enumerate(groups, start=1)
     ]
+    if basis == "strong_support":
+        for entry, clade in zip(entries, groups):
+            if id(clade) in reopened_ids:
+                entry["nested_inside_a_larger_supported_clade"] = True
 
     return {
         "basis": basis,
@@ -1249,7 +1264,13 @@ def _topology_digest(
             "the tree establishes."
         ),
         "groups_listed": len(entries),
-        "outermost_strongly_supported_clades_total": supported_total,
+        # Whether the outermost supported clades had to be reopened, rather
+        # than how many there were before that happened. The old field reported
+        # a pre-reopen count -- "1" on a tree that yielded ten usable groups --
+        # which was true, unreadable, and existed only to be ignored.
+        "one_clade_held_most_of_the_tree": bool(
+            basis == "strong_support" and supported_total < len(entries)
+        ),
         "tips_in_listed_groups": placed,
         "tips_not_in_any_listed_group": len(all_tips) - placed,
         "tip_names_truncated_per_group_at": CLADE_TIP_LIMIT,
@@ -2151,6 +2172,77 @@ def _determinate_taxon(taxon: Any) -> Optional[str]:
     return text
 
 
+# Rank suffixes that mark a label as family or above. Such a label is not a
+# conflict on its own -- it is usually the same organism named less precisely --
+# so it is counted but flagged, and the prompt tells the reviewer to weigh it.
+_ABOVE_GENUS_SUFFIXES = ("aceae", "ales", "mycota", "mycetes", "ineae", "idae")
+
+
+def _leading_taxon_label(taxon: Any) -> Optional[str]:
+    """The top-rank name a label carries: a genus, or a family and above.
+
+    Restricting this to genera looked tidier and silently discarded the finding
+    it exists for. In a real job a clade of 14 sequences labelled Inocybe held
+    one labelled Psathyrellaceae -- a different family, and the single most
+    useful thing in that review -- which a genus-only rule dropped because
+    "Psathyrellaceae" is not a genus.
+
+    Deciding whether a higher-rank label actually conflicts needs taxonomy this
+    module does not have: Inocybaceae inside an Inocybe clade is simply a
+    less-determined label, while Psathyrellaceae is a different family. So both
+    are counted, `above_genus` records which are not genus names, and the
+    reviewer -- which does know the hierarchy -- is told to judge it.
+    """
+    text = re.sub(r"\s+", " ", str(taxon or "")).strip()
+    if not text or _PLACEHOLDER_LABEL_RE.match(text):
+        return None
+    first = text.split()[0]
+    if not first[:1].isupper() or not first.isalpha():
+        return None
+    return first
+
+
+def _group_label_composition(
+    tip_names: Sequence[str], index: Dict[str, Dict[str, Any]]
+) -> Optional[Dict[str, Any]]:
+    """Genus labels inside one group, counted over ALL its tips.
+
+    The published `tip_names` are truncated at CLADE_TIP_LIMIT, and a mixed
+    label hiding past that cut is invisible to a reviewer reading the list. In
+    a real job this mattered: a clade of 19 tips showed 8 names, all Inocybe,
+    while an 11th tip was labelled Psathyrellaceae -- exactly the finding the
+    reviewer made unaided about a smaller clade whose members all fit.
+
+    Returns None for a group carrying one genus label or none, because a
+    homogeneous group is what the reader already assumes.
+    """
+    counts: Dict[str, int] = {}
+    unlabelled = 0
+    for name in tip_names:
+        label = _leading_taxon_label(
+            (index.get(_normalize_name(name)) or {}).get("taxon")
+        )
+        if label:
+            counts[label] = counts.get(label, 0) + 1
+        else:
+            unlabelled += 1
+    if len(counts) < 2:
+        return None
+    ordered = sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))
+    composition: Dict[str, Any] = {
+        "top_rank_label_counts": dict(ordered[:MAX_SPLIT_LABELS]),
+        "distinct_top_rank_labels": len(counts),
+    }
+    above_genus = sorted(
+        label for label in counts if label.endswith(_ABOVE_GENUS_SUFFIXES)
+    )
+    if above_genus:
+        composition["above_genus"] = above_genus
+    if unlabelled:
+        composition["tips_without_a_usable_label"] = unlabelled
+    return composition
+
+
 def _labels_split_across_clades(
     clade_structure: Dict[str, Any], index: Dict[str, Dict[str, Any]]
 ) -> List[Dict[str, Any]]:
@@ -2159,21 +2251,20 @@ def _labels_split_across_clades(
     The single most useful thing the topology and the labels can say together:
     a named species sitting in two unrelated supported groups is either a
     misidentification in the dataset or a genuinely non-monophyletic taxon, and
-    both are worth the user's attention. Computed only from groups whose
-    membership the SUPPORT justifies -- on a shape-only digest a label appearing
-    in two groups means nothing at all.
+    both are worth the user's attention. Computed only on a support-based
+    digest -- on a shape-only one a label appearing in two groups means nothing.
+
+    Runs over each group's FULL membership. An earlier version read the
+    published `tip_names`, which are truncated, and had to skip any group whose
+    list was cut short; on a tree whose large clades are exactly the ones that
+    get truncated that discarded most of the evidence.
     """
     if not index or clade_structure.get("basis") != "strong_support":
         return []
     placement: Dict[str, Set[str]] = {}
     for group in clade_structure.get("groups", []):
-        if group.get("tip_names_truncated"):
-            # The listed names are a sample, so an absence here is not evidence
-            # that the label is missing from the group.
-            continue
-        for name in group.get("tip_names", []):
-            record = index.get(_normalize_name(name))
-            label = _determinate_taxon((record or {}).get("taxon"))
+        for name in group.get("_all_tip_names", group.get("tip_names", [])):
+            label = _determinate_taxon((index.get(_normalize_name(name)) or {}).get("taxon"))
             if label:
                 placement.setdefault(label, set()).add(group["id"])
     split = [
@@ -2263,9 +2354,19 @@ def build_context(
     if excerpts:
         alignment["excerpts"] = excerpts
 
+    for group in tree["clade_structure"]["groups"]:
+        composition = _group_label_composition(
+            group.get("_all_tip_names", ()), provenance_index
+        )
+        if composition:
+            group["taxon_label_composition"] = composition
+
     split_labels = _labels_split_across_clades(
         tree["clade_structure"], provenance_index
     )
+    for group in tree["clade_structure"]["groups"]:
+        group.pop("_all_tip_names", None)
+
     if split_labels:
         tree["clade_structure"]["taxon_labels_in_multiple_groups"] = split_labels
         tree["clade_structure"]["taxon_labels_in_multiple_groups_note"] = (
@@ -2624,19 +2725,37 @@ tree.clade_structure.basis first and obey it:
 Membership lists are truncated at tip_names_truncated_per_group_at. When \
 tip_names_truncated is true the names you see are examples, and a tip's absence \
 from the list is not evidence it is outside the group. `tips` is the group's \
-true size; groups_listed is how many groups you were shown, and \
-outermost_strongly_supported_clades_total counts the supported clades found \
-before any oversized one was reopened - do not report either as a count of \
-clades in the tree.
+true size and groups_listed is how many groups you were shown; neither is a \
+count of clades in the tree. When one_clade_held_most_of_the_tree is true, at \
+least one supported clade held most of the tree and was reopened into the \
+supported clades inside it. Only the groups marked \
+nested_inside_a_larger_supported_clade came out of that reopening and are \
+subdivisions of a larger supported clade rather than separate lineages; a group \
+without that mark is an outermost supported clade in its own right. Do not \
+describe every listed group as sharing one supported ancestor.
+
+A group's taxon_label_composition, where present, counts the top-rank taxon \
+labels across ALL its tips, including the ones truncated out of tip_names. Its \
+presence means the group carries more than one such label. This is the reliable \
+way to spot a mixed group: do NOT conclude a group is label-homogeneous from \
+the names you can see, because a minority label is usually past the truncation.
+
+Weigh a mixed group before reporting it. A label listed in `above_genus` is at \
+family rank or higher, and a sequence labelled only to family sitting inside a \
+genus it BELONGS to is an imprecise label, not a conflict - say so briefly or \
+not at all. A label naming a different genus, or a family that does not contain \
+the group's majority genus, is a real disagreement between the dataset and the \
+tree and should be reported as one. You are expected to know the hierarchy well \
+enough to tell these apart; this analysis does not, which is why it gives you \
+the counts rather than a verdict. As everywhere else, report the disagreement \
+and never resolve it.
 
 tree.clade_structure.taxon_labels_in_multiple_groups, where present, names \
 taxon labels whose members land in more than one supported group. Report it as \
 a disagreement between the dataset's labels and its tree - a possible \
 misidentification among the submitted sequences, or a genuinely non-monophyletic \
 taxon - and say which groups are involved. Never resolve it: do not decide which \
-placement is correct, and do not re-identify a sequence. Its absence is not \
-evidence that the labels agree with the tree; it is computed only over the \
-groups whose membership was listed in full.
+placement is correct, and do not re-identify a sequence.
 
 WHERE THE SEQUENCES CAME FROM
 
@@ -3334,16 +3453,22 @@ def _call_claude(
             "Claude did not respond in time. Try again in a moment."
         ) from exc
     except anthropic.RateLimitError as exc:
+        from app.services.api_diagnostics import record_requests_failure
+        record_requests_failure(exc.response)
         raise TreeAnalysisRateLimited(
             "Claude is rate limiting requests right now. Try again shortly.",
             60,
         ) from exc
     except anthropic.AuthenticationError as exc:
+        from app.services.api_diagnostics import record_requests_failure
+        record_requests_failure(exc.response)
         logger.error("Claude review rejected the configured API key")
         raise TreeAnalysisUnavailable(
             "Claude review is not configured correctly on this server."
         ) from exc
     except anthropic.APIStatusError as exc:
+        from app.services.api_diagnostics import record_requests_failure
+        record_requests_failure(exc.response)
         logger.error(
             "Claude review failed: status=%s type=%s", exc.status_code, exc.type
         )

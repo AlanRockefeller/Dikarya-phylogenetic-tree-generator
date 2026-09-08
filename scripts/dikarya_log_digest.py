@@ -18,7 +18,7 @@ ACCESS_RE = re.compile(
     r'^(?P<ip>\S+) \S+ \S+ \[(?P<ts>[^\]]+)\] '
     r'"(?P<method>[A-Z]+) (?P<path>\S+) (?P<proto>[^"]+)" '
     r'(?P<status>\d{3}) (?P<size>\S+) "(?P<ref>[^"]*)" "(?P<ua>[^"]*)"'
-    r'(?: (?P<micros>\d+))?(?: req=(?P<req>\S+))?'
+    r'(?: (?P<micros>\d+))?(?: req=(?P<req>\S+))?(?: noise=(?P<noise>\S+))?'
 )
 UUID_RE = re.compile(r'(?i)[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}')
 NUMERIC_SEG_RE = re.compile(r'/\d+(?=/|$|\.)')
@@ -67,6 +67,14 @@ SCANNER_EXACT_PATHS = frozenset({
     # routes; real downloads and previews live under scoped resource paths.
     "/fetch", "/proxy", "/api/proxy", "/api/v1/fetch", "/api/download",
     "/api/image", "/api/preview", "/api/v2/settings", "/api/v2/config",
+    # Historical credential/PHP probes predate the explicit limiter noise tag.
+    "/phpinfo", "/_profiler/phpinfo", "/_environment",
+    "/webroot/index.php/_environment", "/phpinfo.php.old", "/phpinfo.php~",
+    "/phpinfo.php.save", "/application_default_credentials.json", "/key.json",
+    "/service-account.json", "/sa.json", "/gcp-key.json", "/gcp-credentials.json",
+    "/gcp-sa.json", "/google-credentials.json", "/google-key.json",
+    "/.config/gcloud/application_default_credentials.json", "/keyfile.json",
+    "/firebase-adminsdk.json", "/firebase-key.json",
 })
 # Scanner probes hide the extension behind a version digit -- /randkeyword.PhP7,
 # /zup.php73, /baxa1.phP8 all arrived in one sweep and were filed as
@@ -329,7 +337,7 @@ def analyze_access(cutoff, until=None):
                 if status >= 500:
                     server_errors[(status, endpoint)] += 1
                 elif status >= 400:
-                    target = noise_4xx if is_noise_4xx(
+                    target = noise_4xx if match.group('noise') == 'scanner' or is_noise_4xx(
                         normalized, match.group("ua"), status, match.group("method")
                     ) else product_4xx
                     target[(status, endpoint)] += 1
@@ -386,6 +394,7 @@ def meaningful_error_key(record):
     first = lines[0] if lines else record
     message = formatted_log_message(first)
     message = UUID_RE.sub("<id>", message)
+    message = re.sub(r'\bdiagnostic=[0-9a-f]{32}\b', 'diagnostic=<id>', message)
     message = re.sub(r'\b\d+\b', '<n>', message)
     return message.strip()[:180]
 
@@ -519,7 +528,12 @@ def analyze_errors(cutoff, until=None):
 # ordinary job therefore looked like a "start without terminal event", which made
 # the whole section noise and hid the handful of genuinely stranded jobs it exists
 # to surface.
-STABLE_EVENT_RE = re.compile(r'event=job\.(started|completed|failed)\b')
+STABLE_EVENT_RE = re.compile(r'event=job\.(started|completed|failed|deferred)\b')
+# job.deferred is emitted by the task itself when it returns rq.Retry to wait
+# for an upstream result (MycoMap publishing an NCBI BLAST). The resumption
+# that follows is another job.started, indistinguishable from the restart of a
+# failed attempt without this marker -- which is why two planned waits used to
+# be reported as two retries.
 # "phylo_high: <description> (<uuid>)" -- RQ's start line.
 # The trailing "[release=... job=...]" group is ContextFormatter's suffix, which
 # is appended to RQ's own records once they go through Dikarya's root handler.
@@ -573,16 +587,25 @@ def _is_record_continuation(line):
     return bool(EXCEPTION_RE.match(line.strip()))
 
 
-def analyze_worker(cutoff, grace=timedelta(minutes=60), until=None):
-    """Summarize worker job lifecycle from worker.log alone (no Redis, no DB)."""
-    files = log_files("worker", cutoff)
-    counts = collections.Counter()
-    started = {}
-    terminal = set()
-    last_start = {}
-    retry_markers = collections.Counter()
-    oldest = newest = None
-    lines = unparsed = contextual = window_lines = 0
+# The worker streams, in the order their files are read. Each RQ worker writes
+# its own file via StandardOutput=append: in its systemd drop-in.
+WORKER_STEMS = ("worker", "worker-bulk")
+
+
+def _timestamped_worker_lines(files, cutoff, until):
+    """Return (records, lines, unparsed) for one stream.
+
+    Each record is (when, sequence, line), in-window only; ``sequence`` is the
+    record's position in the stream, which breaks timestamp ties back into the
+    order the worker wrote them. Continuation lines never reach the
+    lifecycle logic -- the caller only ever looked at timestamped records -- so
+    they are counted here and dropped, which is what lets records from two
+    streams be merged by timestamp without splitting a traceback from its
+    header.
+    """
+    records = []
+    lines = unparsed = 0
+    sequence = 0
     for path in files:
         with open_maybe_gz(path) as handle:
             for line in handle:
@@ -597,96 +620,157 @@ def analyze_worker(cutoff, grace=timedelta(minutes=60), until=None):
                     if not _is_record_continuation(line):
                         unparsed += 1
                     continue
+                sequence += 1
                 if when < cutoff or (until is not None and when >= until):
                     continue
-                window_lines += 1
-                oldest = when if oldest is None or when < oldest else oldest
-                newest = when if newest is None or when > newest else newest
-                fields = context_fields(line)
-                if fields:
-                    contextual += 1
-                if "DEGRADED" in line:
-                    counts["degraded"] += 1
+                records.append((when, sequence, line))
+    return records, lines, unparsed
 
-                # 1. Dikarya's own stable events win: they carry the application
-                #    job id, which is what an operator can act on.
-                event_match = STABLE_EVENT_RE.search(line)
-                if event_match and fields.get("job"):
-                    state = event_match.group(1)
-                    if state == "started":
-                        job_id = fields["job"]
-                        if job_id in terminal:
-                            # Application job UUIDs are deliberately reused as
-                            # RQ IDs for later recomputes. A start after a
-                            # terminal event is a new lifecycle.
-                            terminal.remove(job_id)
-                            started.pop(job_id, None)
-                            last_start.pop(job_id, None)
-                            retry_markers.pop(job_id, None)
-                        previous = last_start.get(job_id)
-                        if job_id not in started:
-                            counts["started"] += 1
-                            started[job_id] = when
-                        elif retry_markers[job_id]:
-                            # The RQ retry record already counted this attempt.
-                            retry_markers[job_id] -= 1
-                        elif not (
-                            previous
-                            and previous[1] == "rq"
-                            and abs((when - previous[0]).total_seconds()) <= 30
-                        ):
-                            # RQ does not consistently emit its retry wording,
-                            # but each resumed task emits another stable start.
-                            counts["retried"] += 1
-                        last_start[job_id] = (when, "stable")
-                    else:
-                        job_id = fields["job"]
-                        if job_id not in terminal:
-                            counts[state] += 1
-                            terminal.add(job_id)
-                    continue
 
-                # 2. RQ terminal lines. Checked before starts because "Job OK
-                #    (uuid)" also matches the start line's shape.
-                matched = False
-                for state, patterns in RQ_TERMINAL_RES.items():
-                    job_id = _first_match(patterns, line)
-                    if job_id:
-                        if job_id not in terminal:
-                            counts[state] += 1
-                            terminal.add(job_id)
-                        matched = True
-                        break
-                if matched:
-                    continue
+def analyze_worker(cutoff, grace=timedelta(minutes=60), until=None):
+    """Summarize worker job lifecycle from the worker logs (no Redis, no DB).
 
-                job_id = _first_match(RQ_RETRY_RES, line)
-                if job_id:
+    Alan 9/7/26 - Both queues are read, not just phylo_high. This used to glob
+    worker.log* alone, so every job that ran on the bulk worker was invisible:
+    the 9/6 review found two RAxML runs and an IQ-TREE run in worker-bulk.log
+    that the digest never reported, and a bulk job that stopped progressing
+    would have been missed the same way.
+
+    The two streams are merged by timestamp rather than concatenated. A job
+    normally lives on one worker, so per-job order survives either way, but a
+    requeue that lands on the other queue would otherwise be read out of order
+    and counted as a fresh lifecycle.
+    """
+    streams = [log_files(stem, cutoff) for stem in WORKER_STEMS]
+    files = [path for stream in streams for path in stream]
+    counts = collections.Counter()
+    started = {}
+    terminal = set()
+    last_start = {}
+    retry_markers = collections.Counter()
+    deferred_markers = collections.Counter()
+    oldest = newest = None
+    lines = unparsed = contextual = window_lines = 0
+    merged = []
+    for index, stream in enumerate(streams):
+        records, stream_lines, stream_unparsed = _timestamped_worker_lines(
+            stream, cutoff, until
+        )
+        lines += stream_lines
+        unparsed += stream_unparsed
+        merged.extend((when, index, sequence, line) for when, sequence, line in records)
+    # Ties break on stream then file position, so a second's worth of records
+    # from one worker stays in the order that worker wrote them.
+    merged.sort(key=lambda record: record[:3])
+
+    for when, _stream, _sequence, line in merged:
+        window_lines += 1
+        oldest = when if oldest is None or when < oldest else oldest
+        newest = when if newest is None or when > newest else newest
+        fields = context_fields(line)
+        if fields:
+            contextual += 1
+        if "DEGRADED" in line:
+            counts["degraded"] += 1
+
+        # 1. Dikarya's own stable events win: they carry the application
+        #    job id, which is what an operator can act on.
+        event_match = STABLE_EVENT_RE.search(line)
+        if event_match and fields.get("job"):
+            state = event_match.group(1)
+            if state == "started":
+                job_id = fields["job"]
+                if job_id in terminal:
+                    # Application job UUIDs are deliberately reused as
+                    # RQ IDs for later recomputes. A start after a
+                    # terminal event is a new lifecycle.
+                    terminal.remove(job_id)
+                    started.pop(job_id, None)
+                    last_start.pop(job_id, None)
+                    retry_markers.pop(job_id, None)
+                    deferred_markers.pop(job_id, None)
+                previous = last_start.get(job_id)
+                if job_id not in started:
+                    counts["started"] += 1
+                    started[job_id] = when
+                elif deferred_markers[job_id]:
+                    # The job asked to be resumed; this start is that
+                    # resumption, not a reattempt of failed work.
+                    deferred_markers[job_id] -= 1
+                    retry_markers[job_id] = max(0, retry_markers[job_id] - 1)
+                elif retry_markers[job_id]:
+                    # The RQ retry record already counted this attempt.
+                    retry_markers[job_id] -= 1
+                elif not (
+                    previous
+                    and previous[1] == "rq"
+                    and abs((when - previous[0]).total_seconds()) <= 30
+                ):
+                    # RQ does not consistently emit its retry wording,
+                    # but each resumed task emits another stable start.
                     counts["retried"] += 1
-                    retry_markers[job_id] += 1
-                    continue
+                last_start[job_id] = (when, "stable")
+            elif state == "deferred":
+                # A planned wait, not an outcome: the job is still alive and
+                # will report again when it resumes.
+                counts["deferred"] += 1
+                deferred_markers[fields["job"]] += 1
+            else:
+                job_id = fields["job"]
+                if job_id not in terminal:
+                    counts[state] += 1
+                    terminal.add(job_id)
+            continue
 
-                start_match = RQ_START_RE.search(line)
-                if start_match and start_match.group("desc").strip() != "Job OK":
-                    job_id = start_match.group("id")
-                    if job_id in terminal:
-                        terminal.remove(job_id)
-                        started.pop(job_id, None)
-                        last_start.pop(job_id, None)
-                        retry_markers.pop(job_id, None)
-                    previous = last_start.get(job_id)
-                    if job_id not in started:
-                        counts["started"] += 1
-                        started[job_id] = when
-                    elif retry_markers[job_id]:
-                        retry_markers[job_id] -= 1
-                    elif not (
-                        previous
-                        and previous[1] == "stable"
-                        and abs((when - previous[0]).total_seconds()) <= 30
-                    ):
-                        counts["retried"] += 1
-                    last_start[job_id] = (when, "rq")
+        # 2. RQ terminal lines. Checked before starts because "Job OK
+        #    (uuid)" also matches the start line's shape.
+        matched = False
+        for state, patterns in RQ_TERMINAL_RES.items():
+            job_id = _first_match(patterns, line)
+            if job_id:
+                if job_id not in terminal:
+                    counts[state] += 1
+                    terminal.add(job_id)
+                matched = True
+                break
+        if matched:
+            continue
+
+        job_id = _first_match(RQ_RETRY_RES, line)
+        if job_id:
+            # RQ reports a deliberate rq.Retry the same way it reports a
+            # reattempt after a failure. The task's own job.deferred record is
+            # what separates them.
+            if not deferred_markers[job_id]:
+                counts["retried"] += 1
+            retry_markers[job_id] += 1
+            continue
+
+        start_match = RQ_START_RE.search(line)
+        if start_match and start_match.group("desc").strip() != "Job OK":
+            job_id = start_match.group("id")
+            if job_id in terminal:
+                terminal.remove(job_id)
+                started.pop(job_id, None)
+                last_start.pop(job_id, None)
+                retry_markers.pop(job_id, None)
+                deferred_markers.pop(job_id, None)
+            previous = last_start.get(job_id)
+            if job_id not in started:
+                counts["started"] += 1
+                started[job_id] = when
+            elif deferred_markers[job_id]:
+                deferred_markers[job_id] -= 1
+                retry_markers[job_id] = max(0, retry_markers[job_id] - 1)
+            elif retry_markers[job_id]:
+                retry_markers[job_id] -= 1
+            elif not (
+                previous
+                and previous[1] == "stable"
+                and abs((when - previous[0]).total_seconds()) <= 30
+            ):
+                counts["retried"] += 1
+            last_start[job_id] = (when, "rq")
 
     # "Unterminated" only means something once a job has had time to finish.
     # Anything younger than the grace period is simply still running.
@@ -833,9 +917,11 @@ def main():
     rows([f"{count:>5}  {key}" for key, count in errors["degradations"].most_common(args.top)])
     section("Worker lifecycle")
     print("  " + "  ".join(
-        f"{key}={worker_counts.get(key, 0)}"
-        for key in ("started", "completed", "failed", "retried", "active", "degraded")
+        f"{'recent_unterminated' if key == 'active' else key}={worker_counts.get(key, 0)}"
+        for key in ("started", "completed", "failed", "retried", "deferred",
+                    "active", "degraded")
     ))
+    print("  Log-only lifecycle: older unterminated jobs may still be running; check /health/jobs for live activity.")
     reference = until
     rows(
         [f"no terminal event observed: {job} (started {when:%Y-%m-%d %H:%M}, age {format_age(reference - when)})"

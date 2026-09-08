@@ -504,6 +504,198 @@ def test_telemetry_endpoint_ignores_unknown_events(tmp_path, clean_logging, no_t
     assert "hello" not in capture.text
 
 
+def test_telemetry_links_failed_request_and_client_environment(tmp_path, clean_logging, no_telemetry_dedup):
+    app = _make_app(tmp_path)
+    capture = _Capture()
+    logging.getLogger().addHandler(capture)
+    response = app.test_client().post("/api/log/client", json={
+        "event": "api_non_2xx", "message": "HTTP 500", "pathname": "/tree",
+        "server_request_id": "abcdef123456", "method": "POST", "http_status": 500,
+        "duration_ms": 2350, "online": False, "visibility": "hidden",
+        "release": "git:old-page",
+    })
+    assert response.status_code == 200
+    for field in (
+        "server_request_id=abcdef123456", "method=POST", "http_status=500",
+        "duration_ms=2350", "online=false", "visibility=hidden", "client_release=git:old-page",
+    ):
+        assert field in capture.text
+    record = next(r for r in capture.records if "event=client.api_non_2xx" in r.getMessage())
+    assert record.req == response.headers["X-Request-Id"]
+    assert record.req != "abcdef123456"  # Collector request and failed request are distinct.
+
+
+def test_telemetry_rejects_malformed_metadata_and_non_object_payload(tmp_path, clean_logging, no_telemetry_dedup):
+    app = _make_app(tmp_path)
+    capture = _Capture()
+    logging.getLogger().addHandler(capture)
+    client = app.test_client()
+    assert client.post("/api/log/client", json=["invalid"]).get_json() == {"status": "ignored"}
+    response = client.post("/api/log/client", json={
+        "event": "api_non_2xx", "server_request_id": "secret\nevent=forged",
+        "method": ["POST"], "http_status": True, "duration_ms": 10**30,
+        "online": "secret", "visibility": {"secret": 1},
+        "release": "https://dikarya.us/?token=secret",
+    })
+    assert response.status_code == 200
+    assert "secret" not in capture.text
+    assert "event=forged" not in capture.text
+    for field in ("server_request_id=-", "http_status=-", "duration_ms=-", "online=unknown", "visibility=unknown"):
+        assert field in capture.text
+
+
+def test_telemetry_dedup_keeps_different_clients_and_failed_requests(tmp_path, clean_logging, no_telemetry_dedup):
+    app = _make_app(tmp_path)
+    keys = set()
+
+    def set_once(key, *args, **kwargs):
+        if key in keys:
+            return False
+        keys.add(key)
+        return True
+
+    no_telemetry_dedup.set.side_effect = set_once
+    client = app.test_client()
+    payload = {"event": "api_non_2xx", "message": "HTTP 500", "server_request_id": "abcdef123456"}
+
+    def report(ip):
+        return client.post("/api/log/client", json=payload, environ_base={"REMOTE_ADDR": ip}).get_json()["status"]
+
+    assert report("192.0.2.1") == "logged"
+    assert report("192.0.2.1") == "duplicate"
+    payload["fingerprint"] = "cannot-bypass-dedup"
+    assert report("192.0.2.1") == "duplicate"
+    assert report("192.0.2.2") == "logged"
+    payload["server_request_id"] = "abcdef654321"
+    assert report("192.0.2.1") == "logged"
+
+
+@pytest.mark.parametrize("status", [400, 401, 403, 404, 409, 413, 422, 429, 500, 503])
+def test_failed_requests_have_context_without_payloads(tmp_path, clean_logging, status):
+    from flask import jsonify
+
+    app = _make_app(tmp_path)
+    capture = _Capture()
+    logging.getLogger().addHandler(capture)
+    secret = "private-voucher-and-password"
+
+    @app.route("/diagnostic/<job_id>", methods=["POST"])
+    def diagnostic(job_id):
+        return jsonify(error=secret), status
+
+    response = app.test_client().post(
+        f"/diagnostic/{JOB_A}?token={secret}", json={"sequence": secret},
+        headers={"Authorization": f"Bearer {secret}"},
+    )
+    assert response.status_code == status
+    assert response.get_json()["error"] == secret
+    records = [r for r in capture.records if "event=http.request_failed" in r.getMessage()]
+    assert len(records) == 1
+    assert records[0].req == response.headers["X-Request-Id"]
+    assert records[0].job == JOB_A
+    assert f"route=/diagnostic/<job_id> status={status}" in records[0].getMessage()
+    assert "duration_ms=" in records[0].getMessage()
+    assert secret not in capture.text
+
+
+def test_failed_request_logging_skips_scanner_and_static_noise(tmp_path, clean_logging):
+    app = _make_app(tmp_path)
+    capture = _Capture()
+    logging.getLogger().addHandler(capture)
+    client = app.test_client()
+    assert client.get("/scanner-missing").status_code == 404
+    assert client.get("/static/nonexistent.js").status_code == 404
+    assert "event=http.request_failed" not in capture.text
+
+
+def test_telemetry_csrf_rejection_is_logged_and_token_can_be_refreshed(
+    tmp_path, clean_logging, no_telemetry_dedup
+):
+    app = _make_app(tmp_path)
+    app.config['WTF_CSRF_ENABLED'] = True
+    capture = _Capture()
+    logging.getLogger().addHandler(capture)
+    client = app.test_client()
+    payload = {'event': 'window_error', 'message': 'test failure'}
+    assert client.post('/api/log/client', json=payload).status_code == 400
+    assert 'reason=csrf_token_missing' in capture.text
+    refreshed = client.get('/api/log/client/csrf')
+    assert refreshed.status_code == 200
+    assert refreshed.headers['Cache-Control'] == 'no-store'
+    assert client.post('/api/log/client', json=payload, headers={
+        'X-CSRFToken': refreshed.json['csrf_token']
+    }).status_code == 200
+
+
+def test_legacy_svg_favicon_redirects_to_small_static_png(tmp_path):
+    app = _make_app(tmp_path)
+    response = app.test_client().get('/favicon.ico/favicon.svg')
+    assert response.status_code == 302
+    assert response.headers['Location'] == '/static/favicon.ico/favicon-96x96.png'
+
+
+@pytest.mark.parametrize("status", [200, 500])
+def test_request_diagnostics_do_not_consume_streams(tmp_path, clean_logging, status):
+    from flask import Response
+
+    app = _make_app(tmp_path)
+    yielded = []
+
+    @app.route("/diagnostic-stream")
+    def diagnostic():
+        def chunks():
+            yielded.append("first")
+            yield "first"
+            yielded.append("second")
+            yield "second"
+        return Response(chunks(), status=status)
+
+    response = app.test_client().get("/diagnostic-stream", buffered=False)
+    assert response.status_code == status
+    assert yielded == ["first"]
+    response.close()
+
+
+def test_csrf_and_api_reason_codes_reach_failure_log(tmp_path, clean_logging):
+    from app.api_v1.envelope import error_response
+
+    app = _make_app(tmp_path)
+    app.config["WTF_CSRF_ENABLED"] = True
+    capture = _Capture()
+    logging.getLogger().addHandler(capture)
+
+    @app.route("/diagnostic-code")
+    def diagnostic():
+        return error_response(code="scope_required", message="private detail", status=403)
+
+    client = app.test_client()
+    assert client.post("/api/job", json={}).status_code == 400
+    assert "reason=csrf_token_missing" in capture.text
+    assert client.get("/diagnostic-code").status_code == 403
+    assert "reason=scope_required" in capture.text
+    assert "private detail" not in capture.text
+
+
+def test_failed_login_and_registration_are_visible_despite_200_and_302(tmp_path, clean_logging):
+    from types import SimpleNamespace
+
+    app = _make_app(tmp_path)
+    capture = _Capture()
+    logging.getLogger().addHandler(capture)
+    account = SimpleNamespace(id=17, check_password=lambda _: False)
+    with patch("app.auth.routes.find_user_by_email", return_value=account), patch(
+        "app.auth.routes.render_template", return_value="login form"
+    ):
+        client = app.test_client()
+        response = client.post("/auth/login", data={"email": "private@example.test", "password": "private-password"})
+        assert response.status_code == 200
+        assert "event=auth.login_failed reason=invalid_credentials account_id=17" in capture.text
+        assert client.post("/auth/register", data={"email": "private@example.test"}).status_code == 302
+        assert "event=auth.registration_failed reason=missing_credentials" in capture.text
+    assert "private@example.test" not in capture.text
+    assert "private-password" not in capture.text
+
+
 # ---------------------------------------------------------------------------
 # Safe RQ descriptions
 # ---------------------------------------------------------------------------
@@ -1032,6 +1224,12 @@ def test_missing_route_burst_is_throttled_without_limiting_known_routes(
         def expire(self, key, seconds):
             return True
 
+        def eval(self, script, numkeys, key, seconds):
+            assert numkeys == 1
+            assert "EXPIRE" in script
+            assert seconds == 60
+            return self.incr(key)
+
     fake_redis = FakeRedis()
     monkeypatch.setattr(app_module, "_scanner_404_redis", lambda: fake_redis)
     app = _make_app(tmp_path)
@@ -1043,10 +1241,41 @@ def test_missing_route_burst_is_throttled_without_limiting_known_routes(
 
     throttled = client.get("/one-probe-too-many")
     assert throttled.status_code == 429
+    assert throttled.headers['X-Dikarya-Noise'] == 'scanner'
     assert throttled.headers["Retry-After"] == str(
         app_module.SCANNER_404_WINDOW_SECONDS
     )
     assert client.get("/health").status_code == 200
+
+
+def test_missing_route_limit_survives_redis_timeout(tmp_path, monkeypatch):
+    import app as app_module
+    broken = Mock()
+    broken.get.side_effect = TimeoutError
+    broken.eval.side_effect = TimeoutError
+    monkeypatch.setattr(app_module, '_scanner_404_redis', lambda: broken)
+    app = _make_app(tmp_path)
+    app.config['RATELIMIT_ENABLED'] = True
+    client = app.test_client()
+    for index in range(app_module.SCANNER_404_LIMIT):
+        assert client.get(f'/missing-{index}').status_code == 404
+    assert client.get('/missing-last').status_code == 429
+    assert client.get('/health').status_code == 200
+
+
+def test_digest_keeps_tagged_scanner_429_out_of_product_errors(tmp_path):
+    digest = _digest_module()
+    digest.LOG_DIR = tmp_path
+    stamp = datetime.now().strftime('%d/%b/%Y:%H:%M:%S +0000')
+    (tmp_path / 'access.log').write_text(
+        f'1.2.3.4 - - [{stamp}] "GET /random-secret HTTP/1.0" 429 10 "-" "browser" 100 req=r1 noise=scanner\n'
+        f'1.2.3.4 - - [{stamp}] "POST /api/job HTTP/1.0" 429 10 "-" "browser" 100 req=r2 noise=-\n'
+    )
+    result = digest.analyze_access(datetime.now() - timedelta(hours=1))
+    assert result['noise_4xx'][(429, 'GET /random-secret')] == 1
+    assert result['product_4xx'][(429, 'POST /api/job')] == 1
+    for path in ('/phpinfo', '/gcp-key.json', '/application_default_credentials.json'):
+        assert digest.is_noise_4xx(path, 'browser', 429)
 
 
 def test_digest_window_selects_only_overlapping_rotations(tmp_path):
@@ -1196,6 +1425,157 @@ def test_worker_lifecycle_separates_active_jobs_from_genuinely_stale_ones(tmp_pa
     assert [job for job, _ in stale] == [JOB_E]
     age = stale[0][1]
     assert digest.format_age(datetime.now() - age).endswith("m")
+
+
+class _FakeSortedSet:
+    """The three Redis calls sse_registry makes, over a plain dict."""
+
+    def __init__(self):
+        self.entries = {}
+
+    def zadd(self, _key, mapping):
+        self.entries.update(mapping)
+
+    def zrem(self, _key, member):
+        self.entries.pop(member, None)
+
+    def zcard(self, _key):
+        return len(self.entries)
+
+    def zremrangebyscore(self, _key, _low, high):
+        for member in [m for m, score in self.entries.items() if score <= high]:
+            del self.entries[member]
+
+
+def test_a_stream_that_stops_renewing_ages_out_of_the_census(monkeypatch):
+    """Entries are a lease, not a lifetime.
+
+    Four web restarts on 2026-09-06 left five entries from SIGKILLed processes
+    in the set, and with no renewal and an eight-hour TTL the pressure warning
+    was measured against streams that no longer existed for the rest of the
+    evening.
+    """
+    from app.services import sse_registry
+
+    import time as _time
+
+    conn = _FakeSortedSet()
+    live, _ = sse_registry.open_stream(conn, "job-live")
+    dead, _ = sse_registry.open_stream(conn, "job-dead")
+    assert conn.zcard(None) == 2
+
+    # Both leases go stale; only the live stream renews its own.
+    later = _time.time() + sse_registry._ENTRY_TTL_SECONDS + 1
+    monkeypatch.setattr(sse_registry.time, "time", lambda: later)
+    assert sse_registry.touch_stream(conn, live) is True
+
+    assert list(conn.entries) == [live], "the killed process's entry must not persist"
+    assert dead not in conn.entries
+    assert sse_registry.close_stream(conn, live) == 0
+
+
+def test_a_renewal_after_a_stall_restores_the_stream_to_the_census(monkeypatch):
+    """Only the owning generator renews, so a pruned token is a live stream."""
+    from app.services import sse_registry
+
+    conn = _FakeSortedSet()
+    token, _ = sse_registry.open_stream(conn, "job-stalled")
+    conn.entries.clear()  # lease expired during a long blocked yield and was pruned
+
+    sse_registry.touch_stream(conn, token)
+
+    assert list(conn.entries) == [token]
+
+
+def test_the_lease_outlasts_a_long_run_of_missed_renewals():
+    """Guard the ratio, not the numbers: shortening the TTL alone undercounts."""
+    from app.services import sse_registry
+
+    assert sse_registry._ENTRY_TTL_SECONDS >= 5 * sse_registry.RENEW_INTERVAL_SECONDS
+
+
+def test_worker_lifecycle_reads_the_bulk_stream_and_merges_it_by_timestamp(tmp_path):
+    """A job on phylo_bulk is reported, and interleaving does not split a lifecycle.
+
+    The digest globbed worker.log* alone until 2026-09-07, so bulk jobs -- the
+    long RAxML and IQ-TREE runs, exactly the ones whose stalls matter -- were
+    absent from every report.
+    """
+    digest = _digest_module()
+    digest.LOG_DIR = tmp_path
+    _worker_log(tmp_path, [
+        f"[{_stamp(90)}] [INFO] [app.workers.tasks] event=job.started Starting job summary={{}} [job={JOB_A} rq={JOB_A} release=git:abc]\n",
+        f"[{_stamp(50)}] [INFO] [app.workers.tasks] event=job.completed Job completed successfully [job={JOB_A} rq={JOB_A} release=git:abc]\n",
+    ])
+    # Straddles the high-queue job in time, so concatenation and merge differ.
+    (tmp_path / "worker-bulk.log").write_text("".join([
+        f"[{_stamp(80)}] [INFO] [app.workers.tasks] event=job.started Starting job summary={{}} [job={JOB_B} rq={JOB_B} release=git:abc]\n",
+        f"[{_stamp(70)}] [INFO] [app.workers.tasks] event=job.completed Job completed successfully [job={JOB_B} rq={JOB_B} release=git:abc]\n",
+    ]))
+
+    counts, stale, coverage = digest.analyze_worker(
+        datetime.now() - timedelta(hours=6), grace=timedelta(minutes=30)
+    )
+
+    assert counts["started"] == 2
+    assert counts["completed"] == 2
+    assert counts["retried"] == 0
+    assert stale == []
+    assert sorted(coverage["files"]) == ["worker-bulk.log", "worker.log"]
+
+
+def test_a_declared_wait_for_an_upstream_result_is_not_reported_as_a_retry(tmp_path):
+    """job.deferred marks a planned rq.Retry, so its resumption is not a reattempt.
+
+    A MycoMap NCBI rerun returns rq.Retry on purpose and resumes with a second
+    job.started, which is shaped exactly like the restart of a failed attempt.
+    Two such waits were reported as two retries on 2026-09-06.
+    """
+    digest = _digest_module()
+    digest.LOG_DIR = tmp_path
+    _worker_log(tmp_path, [
+        f"[{_stamp(90)}] [INFO] [app.workers.tasks] event=job.started Starting job summary={{}} [job={JOB_A} rq={JOB_A} release=git:abc]\n",
+        f"[{_stamp(89)}] [INFO] [app.workers.tasks] event=job.deferred Waiting for MycoMap NCBI results reason=mycomap_ncbi_rerun resume_in_seconds=60 [job={JOB_A} rq={JOB_A} release=git:abc]\n",
+        f"[{_stamp(88)}] [INFO] [app.workers.tasks] event=job.started Starting job summary={{}} [job={JOB_A} rq={JOB_A} release=git:abc]\n",
+        f"[{_stamp(87)}] [INFO] [app.workers.tasks] event=job.completed Job completed successfully [job={JOB_A} rq={JOB_A} release=git:abc]\n",
+        # B has no deferral marker: its second start is still a retry.
+        f"[{_stamp(80)}] [INFO] [app.workers.tasks] event=job.started Starting job summary={{}} [job={JOB_B} rq={JOB_B} release=git:abc]\n",
+        f"[{_stamp(78)}] [INFO] [app.workers.tasks] event=job.started Starting job summary={{}} [job={JOB_B} rq={JOB_B} release=git:abc]\n",
+        f"[{_stamp(77)}] [INFO] [app.workers.tasks] event=job.completed Job completed successfully [job={JOB_B} rq={JOB_B} release=git:abc]\n",
+    ])
+
+    counts, stale, _coverage = digest.analyze_worker(
+        datetime.now() - timedelta(hours=6), grace=timedelta(minutes=30)
+    )
+
+    assert counts["deferred"] == 1
+    assert counts["retried"] == 1, "only B's unexplained restart is a retry"
+    assert counts["started"] == 2, "a resumption is not a new job"
+    assert counts["completed"] == 2
+    assert stale == []
+
+
+def test_rq_retry_wording_for_a_declared_wait_is_also_counted_as_deferred(tmp_path):
+    """RQ words a deliberate rq.Retry exactly like a post-failure reattempt."""
+    digest = _digest_module()
+    digest.LOG_DIR = tmp_path
+    _worker_log(tmp_path, [
+        f"[{_stamp(90)}] [INFO] [app.workers.tasks] event=job.started Starting job summary={{}} [job={JOB_A} rq={JOB_A} release=git:abc]\n",
+        f"[{_stamp(89)}] [INFO] [app.workers.tasks] event=job.deferred Waiting for MycoMap NCBI results reason=mycomap_ncbi_rerun resume_in_seconds=60 [job={JOB_A} rq={JOB_A} release=git:abc]\n",
+        f"[{_stamp(89)}] [INFO] [rq.worker] Worker w1: job {JOB_A} scheduled for retry\n",
+        f"[{_stamp(88)}] [INFO] [app.workers.tasks] event=job.started Starting job summary={{}} [job={JOB_A} rq={JOB_A} release=git:abc]\n",
+        f"[{_stamp(87)}] [INFO] [app.workers.tasks] event=job.completed Job completed successfully [job={JOB_A} rq={JOB_A} release=git:abc]\n",
+    ])
+
+    counts, stale, _coverage = digest.analyze_worker(
+        datetime.now() - timedelta(hours=6), grace=timedelta(minutes=30)
+    )
+
+    assert counts["retried"] == 0
+    assert counts["deferred"] == 1
+    assert counts["started"] == 1
+    assert counts["completed"] == 1
+    assert stale == []
 
 
 def test_worker_lifecycle_ignores_stale_starts_outside_the_window(tmp_path):
