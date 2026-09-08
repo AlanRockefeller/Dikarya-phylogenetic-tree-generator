@@ -25,6 +25,7 @@ import json
 import logging
 import time
 import threading
+from contextlib import contextmanager
 from typing import Optional, List, Dict, Any
 
 import redis
@@ -58,6 +59,7 @@ STATE_FAILED = "failed"
 
 # Event types
 EVENT_JOB_STATE = "job_state"
+EVENT_HEARTBEAT = "heartbeat"
 EVENT_STEP_START = "step_start"
 EVENT_STEP_DONE = "step_done"
 EVENT_STEP_FAILED = "step_failed"
@@ -397,7 +399,15 @@ def publish_step_failed(
     publish_event(job_id, payload)
 
 
-def publish_overview(job_id: str, message: str) -> None:
+# Alan 8/31/26 - The Activity Feed draws one of these four icons per line and
+# defaults to "running" for anything it does not recognise. Overview messages
+# used to carry no icon at all, so completions and warnings alike rendered as
+# still-in-progress; senders now say which one they mean.
+OVERVIEW_ICONS = (STATE_DONE, STATE_RUNNING, STATE_SKIPPED, STATE_FAILED)
+
+
+def publish_overview(job_id: str, message: str, icon: str = STATE_RUNNING,
+                     key: str = "") -> None:
     """
     Publish a human-friendly overview message.
     
@@ -406,11 +416,65 @@ def publish_overview(job_id: str, message: str) -> None:
     Args:
         job_id: Job identifier
         message: Human-readable message
+        icon: One of OVERVIEW_ICONS; anything else falls back to "running"
+        key: Optional stable identity for the feed line. Pass one when the same
+            fact is also reconstructible from job.meta, so the page shows it once
+            whether it arrived live or was backfilled after a reload.
     """
-    publish_event(job_id, {
+    payload = {
         "type": EVENT_OVERVIEW,
         "message": message,
+        "icon": icon if icon in OVERVIEW_ICONS else STATE_RUNNING,
+    }
+    if key:
+        payload["key"] = key
+    publish_event(job_id, payload)
+
+
+# Alan 8/31/26 - How often a long-running step tells the page it is still alive.
+# Alignment and tree building can run for hours between events, which is
+# indistinguishable from a dead worker on the status page. It also keeps the SSE
+# stream from tripping its SSE_MAX_IDLE_SECONDS cut during a quiet RAxML run.
+HEARTBEAT_INTERVAL_SECONDS = 30
+
+
+def publish_heartbeat(job_id: str, step: str, label: str, elapsed_seconds: float) -> None:
+    """Publish a still-working signal for a step that produces no output."""
+    publish_event(job_id, {
+        "type": EVENT_HEARTBEAT,
+        "step": step,
+        "label": label,
+        "elapsed_seconds": round(float(elapsed_seconds), 1),
     })
+
+
+@contextmanager
+def step_heartbeat(job_id: str, step: str, label: str = "",
+                   interval: float = HEARTBEAT_INTERVAL_SECONDS):
+    """Emit a heartbeat every ``interval`` seconds for the duration of a block.
+
+    The thread is a daemon and every publish is already best-effort, so a
+    failing heartbeat can neither hold up nor break the step it describes.
+    """
+    started = time.time()
+    stop = threading.Event()
+
+    def _beat():
+        while not stop.wait(interval):
+            try:
+                publish_heartbeat(job_id, step, label, time.time() - started)
+            except Exception:  # pragma: no cover - never disturb the pipeline
+                logger.debug("heartbeat publish failed for job %s", job_id, exc_info=True)
+
+    thread = threading.Thread(
+        target=_beat, name=f"heartbeat-{step}-{job_id[:8]}", daemon=True
+    )
+    thread.start()
+    try:
+        yield
+    finally:
+        stop.set()
+        thread.join(timeout=1)
 
 
 def publish_metric(job_id: str, step: str, key: str, value: Any) -> None:
@@ -574,5 +638,17 @@ def update_step_meta(job, step: str, patch: dict) -> None:
         job.meta["steps"][step].update(patch)
     else:
         job.meta["steps"][step] = patch
-    
+
+    # Alan 8/31/26 - Stamp step transitions here rather than at ~30 call sites.
+    # The status page reconstructs its Activity Feed from this meta after a
+    # reload or an SSE reconnect, and without these it could only say what
+    # happened, never when or for how long.
+    entry = job.meta["steps"][step]
+    now = time.time()
+    state = patch.get("state")
+    if state == STATE_RUNNING and not entry.get("started_at"):
+        entry["started_at"] = now
+    elif state in (STATE_DONE, STATE_FAILED, STATE_SKIPPED) and not entry.get("ended_at"):
+        entry["ended_at"] = now
+
     job.save_meta()

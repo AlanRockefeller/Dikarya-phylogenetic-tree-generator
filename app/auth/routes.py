@@ -1,3 +1,5 @@
+import logging
+
 from flask import render_template, redirect, url_for, flash, request
 from flask_login import login_user, logout_user, current_user
 from sqlalchemy import func
@@ -6,6 +8,8 @@ from app.auth import bp
 from app.extensions import db, limiter
 from app.models import User
 from app.services.security_utils import safe_next_url
+
+logger = logging.getLogger(__name__)
 
 
 def _safe_next(next_page):
@@ -68,12 +72,14 @@ def register():
         password = request.form.get('password')
 
         if not email or not password:
+            logger.warning("event=auth.registration_failed reason=missing_credentials")
             flash('Email and password are required.', 'danger')
             return redirect(url_for('auth.register'))
 
         # Case-insensitive, so `Alan@x.com` cannot become a second account
         # alongside `alan@x.com`.
         if User.query.filter(func.lower(User.email) == email).first():
+            logger.warning("event=auth.registration_failed reason=already_registered")
             flash('Email already registered. Please log in.', 'warning')
             return redirect(url_for('auth.login'))
 
@@ -88,10 +94,12 @@ def register():
             # what actually guarantees uniqueness, so the loser is told to log
             # in rather than being handed a 500.
             db.session.rollback()
+            logger.warning("event=auth.registration_failed reason=registration_conflict")
             flash('Email already registered. Please log in.', 'warning')
             return redirect(url_for('auth.login'))
 
         login_user(user, remember=True)
+        logger.info("event=auth.registered account_id=%s", user.id)
         flash('Registration successful!', 'success')
         return redirect(url_for('user.user_jobs'))
 
@@ -110,10 +118,18 @@ def login():
         user = find_user_by_email(email)
         if user and password and user.check_password(password):
             login_user(user, remember=True)
+            logger.info("event=auth.login_succeeded account_id=%s", user.id)
             flash('Logged in successfully.', 'success')
             next_page = _safe_next(request.args.get('next'))
             return redirect(next_page or url_for('user.user_jobs'))
         else:
+            # Login failures return HTTP 200, so access/error-status logging
+            # cannot see them. A known account id permits follow-up without
+            # recording either credential or an unverified email address.
+            logger.warning(
+                "event=auth.login_failed reason=invalid_credentials account_id=%s",
+                user.id if user else "-",
+            )
             flash('Invalid email or password.', 'danger')
 
     return render_template('auth/login.html')

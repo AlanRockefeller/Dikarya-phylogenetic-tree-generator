@@ -1,4 +1,5 @@
 import logging
+import math
 import os
 import re
 from datetime import timedelta
@@ -50,6 +51,59 @@ def bool_env(name, default=False):
     if clean in _BOOL_ENV_FALSE:
         return False
     return default
+
+
+def timeout_env(name, default):
+    """Read a wall-clock budget from the environment, or ``default`` if unusable.
+
+    Every timeout Dikarya reads used to be ``float(os.environ.get(NAME, '8'))``,
+    which has two failure modes and both of them are real:
+
+    * ``NAME=abc`` raises ValueError *while importing this module*. Gunicorn
+      does not import the app until the first request arrives, so a typo in one
+      optional variable produced a site that started "successfully" and then
+      500ed on every request -- exactly the 2026-08-14 shape described in
+      CLAUDE.md.
+    * ``NAME=inf`` and ``NAME=nan`` parse fine and propagate. ``int(inf * 3600)``
+      raises OverflowError inside the enqueue path, and NaN compares False
+      against every bound, so a NaN budget silently disables the limit it was
+      supposed to impose.
+
+    So the policy for timeouts matches `bool_env` and `budget_env`: an
+    unusable value is reported and the documented default is used. Missing,
+    malformed, non-finite and non-positive all resolve the same way, which is
+    also exactly what `subprocess_utils.resolve_positive_number` does for a
+    value that reaches the runtime through some other route. The two are kept
+    in agreement by tests/test_audit_review_fixes.py.
+    """
+    raw = os.environ.get(name)
+    if raw is None:
+        return float(default)
+    try:
+        value = float(str(raw).strip())
+    except (TypeError, ValueError):
+        rejection = "not a number"
+    else:
+        if not math.isfinite(value):
+            rejection = "not finite"
+        elif value <= 0:
+            rejection = "must be greater than zero"
+        else:
+            return value
+    logging.getLogger(__name__).warning(
+        "%s=%r ignored (%s); using %s", name, raw, rejection, default
+    )
+    return float(default)
+
+
+def count_env(name, default):
+    """Read a positive integer size limit, or ``default`` if unusable.
+
+    Reuses ``timeout_env``'s validation -- missing, malformed, non-finite and
+    non-positive all fall back to the documented default with a warning rather
+    than raising at import time. Only the return type differs.
+    """
+    return int(timeout_env(name, default))
 
 
 # Ceiling on CLAUDE_REVIEW_MAX_BUDGET_USD, which is the only setting that spends
@@ -218,7 +272,7 @@ class Config:
     # Ordinary jobs previously had a one-hour RQ deadline. That was too short
     # for legitimate large MUSCLE/MAFFT alignments even though the host still
     # had ample memory. RAxML keeps its separate, longer allowance below.
-    GENERAL_JOB_TIME_LIMIT_HOURS = float(os.environ.get('GENERAL_JOB_TIME_LIMIT_HOURS', '8'))
+    GENERAL_JOB_TIME_LIMIT_HOURS = timeout_env('GENERAL_JOB_TIME_LIMIT_HOURS', 8)
 
     # RAxML-NG with --all and autoMRE bootstrapping routinely needs far more
     # than the default 1h wall clock, and used to die at exactly one hour with
@@ -227,7 +281,7 @@ class Config:
     #   1. the RQ job_timeout   (app/workers/queue.py)
     #   2. the subprocess wait  (_run_raxml)
     #   3. RLIMIT_CPU via prlimit (_run_raxml, scaled by thread count)
-    RAXML_TIME_LIMIT_HOURS = float(os.environ.get('RAXML_TIME_LIMIT_HOURS', '15'))
+    RAXML_TIME_LIMIT_HOURS = timeout_env('RAXML_TIME_LIMIT_HOURS', 15)
 
     # The same budget for the other tree builders. Previously only RAxML had
     # one, so IQ-TREE, MrBayes and FastTree could run forever; the worker is
@@ -236,21 +290,40 @@ class Config:
     # literal: it reads them with getattr(), so an operator raising the cap for
     # a large job by setting IQTREE_TIME_LIMIT_HOURS in the environment would
     # otherwise have it silently ignored and the job killed at 15h anyway.
-    IQTREE_TIME_LIMIT_HOURS = float(os.environ.get('IQTREE_TIME_LIMIT_HOURS', '15'))
-    MRBAYES_TIME_LIMIT_HOURS = float(os.environ.get('MRBAYES_TIME_LIMIT_HOURS', '15'))
-    FASTTREE_TIME_LIMIT_HOURS = float(os.environ.get('FASTTREE_TIME_LIMIT_HOURS', '6'))
+    IQTREE_TIME_LIMIT_HOURS = timeout_env('IQTREE_TIME_LIMIT_HOURS', 15)
+    MRBAYES_TIME_LIMIT_HOURS = timeout_env('MRBAYES_TIME_LIMIT_HOURS', 15)
+    FASTTREE_TIME_LIMIT_HOURS = timeout_env('FASTTREE_TIME_LIMIT_HOURS', 6)
 
     # Alignment and trimming tools need their own subprocess deadlines too. The
     # RQ job deadline is only a backstop for the entire pipeline; without these,
     # a wedged early step can consume that whole allowance and hold the worker.
-    MAFFT_TIME_LIMIT_HOURS = float(os.environ.get('MAFFT_TIME_LIMIT_HOURS', '8'))
-    MUSCLE_TIME_LIMIT_HOURS = float(os.environ.get('MUSCLE_TIME_LIMIT_HOURS', '8'))
-    CLUSTALO_TIME_LIMIT_HOURS = float(os.environ.get('CLUSTALO_TIME_LIMIT_HOURS', '8'))
-    IQTREE_ALIGNMENT_TIME_LIMIT_HOURS = float(
-        os.environ.get('IQTREE_ALIGNMENT_TIME_LIMIT_HOURS', '8')
+    MAFFT_TIME_LIMIT_HOURS = timeout_env('MAFFT_TIME_LIMIT_HOURS', 8)
+    MUSCLE_TIME_LIMIT_HOURS = timeout_env('MUSCLE_TIME_LIMIT_HOURS', 8)
+    CLUSTALO_TIME_LIMIT_HOURS = timeout_env('CLUSTALO_TIME_LIMIT_HOURS', 8)
+    IQTREE_ALIGNMENT_TIME_LIMIT_HOURS = timeout_env(
+        'IQTREE_ALIGNMENT_TIME_LIMIT_HOURS', 8
     )
-    TRIMAL_TIME_LIMIT_HOURS = float(os.environ.get('TRIMAL_TIME_LIMIT_HOURS', '4'))
-    BMGE_TIME_LIMIT_HOURS = float(os.environ.get('BMGE_TIME_LIMIT_HOURS', '4'))
+    TRIMAL_TIME_LIMIT_HOURS = timeout_env('TRIMAL_TIME_LIMIT_HOURS', 4)
+    BMGE_TIME_LIMIT_HOURS = timeout_env('BMGE_TIME_LIMIT_HOURS', 4)
+
+    # MAFFT's --adjustdirectionaccurately decides strand by comparing every
+    # sequence against the others, so its cost grows with BOTH the number of
+    # sequences and their length. On barcode-length input that is cheap and
+    # worth doing; on assembled contigs it is not. On 2026-09-04 a 205-sequence
+    # submission of complete phage genomes (11.6 Mbp, mean 56.8 kb/sequence)
+    # spent 7.5 hours inside makedirectionlist without ever reaching the
+    # alignment itself, holding the only worker slot and stalling 12 queued
+    # jobs behind it.
+    #
+    # Measured over all 10,544 jobs on disk: median input is 0.10 MB and p99.9
+    # is 0.81 MB. This ceiling is ~6x above p99.9 and excludes exactly the two
+    # genome-scale submissions (0.019%); the largest legitimate datasets -- a
+    # 2,409-sequence/1.6 Mbp barcode set and a 996-sequence/3.7 Mbp set -- stay
+    # under it. Above the ceiling the direction check is skipped and logged as
+    # a degradation; the alignment itself still runs.
+    MAFFT_ADJUSTDIRECTION_MAX_BASES = count_env(
+        'MAFFT_ADJUSTDIRECTION_MAX_BASES', 5_000_000
+    )
 
 
     # Paths
@@ -278,11 +351,17 @@ class Config:
     # Progress publication is best-effort and must never stall a phylogeny job
     # behind a blackholed Redis connection. RQ/SSE clients have different
     # blocking semantics and deliberately do not use these values.
-    EVENT_REDIS_CONNECT_TIMEOUT_SECONDS = float(
-        os.environ.get('EVENT_REDIS_CONNECT_TIMEOUT_SECONDS', '2')
+    EVENT_REDIS_CONNECT_TIMEOUT_SECONDS = timeout_env(
+        'EVENT_REDIS_CONNECT_TIMEOUT_SECONDS', 2
     )
-    EVENT_REDIS_SOCKET_TIMEOUT_SECONDS = float(
-        os.environ.get('EVENT_REDIS_SOCKET_TIMEOUT_SECONDS', '2')
+    EVENT_REDIS_SOCKET_TIMEOUT_SECONDS = timeout_env(
+        'EVENT_REDIS_SOCKET_TIMEOUT_SECONDS', 2
+    )
+
+    # Command round-trip ceiling for the v1 API's Idempotency-Key bookkeeping,
+    # which runs plain SET/GET/SETEX/EXPIRE inside a Gunicorn request slot.
+    IDEMPOTENCY_REDIS_TIMEOUT_SECONDS = timeout_env(
+        'IDEMPOTENCY_REDIS_TIMEOUT_SECONDS', 5
     )
 
     # Claude review of a finished alignment + tree (app/services/tree_analysis_service.py).
@@ -308,7 +387,7 @@ class Config:
     # Hard wall-clock cap. A review runs inside a Gunicorn request slot (4 workers
     # x 2 threads = 8 total) and behind nginx's proxy_read_timeout 300s, so it must
     # finish well inside that or the user gets a 504 instead of an error.
-    CLAUDE_REVIEW_TIMEOUT_SECONDS = float(os.environ.get('CLAUDE_REVIEW_TIMEOUT_SECONDS', '240'))
+    CLAUDE_REVIEW_TIMEOUT_SECONDS = timeout_env('CLAUDE_REVIEW_TIMEOUT_SECONDS', 240)
     # Per-invocation spend ceiling, enforced by the CLI's own --max-budget-usd.
     CLAUDE_REVIEW_MAX_BUDGET_USD = budget_env('CLAUDE_REVIEW_MAX_BUDGET_USD', '1.00')
     # Ceiling on reviews running at once, enforced with a Redis counter. Rate limits

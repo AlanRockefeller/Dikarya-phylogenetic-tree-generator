@@ -5,6 +5,7 @@ Phase 2 endpoints: /jobs (+ mutation), /jobs/{id}/files, /jobs/{id}/logs, /tools
 """
 import json
 import math
+import numbers
 import re
 import logging
 import uuid
@@ -35,7 +36,10 @@ from app.extensions import db, limiter
 from app.models import ApiToken, Job
 from app.services.artifact_storage import read_artifact_bytes
 from app.services.security_utils import validate_safe_file_path, coerce_bool
-from app.services.tree_parameter_validation import validate_iqtree_ufboot_count
+from app.services.tree_parameter_validation import (
+    normalize_inherited_iqtree_ufboot_count,
+    validate_iqtree_ufboot_count,
+)
 from app.services.tree_edit_service import (
     MAX_TREE_TIP_NAME_LENGTH,
     NEWICK_UNSAFE_TIP_CHARS,
@@ -216,28 +220,73 @@ def _validate_categorical(field, value, allowed):
     return value, None
 
 
-def _validate_clamped_int(field, value, *, default):
-    """Validate-and-clamp; reject non-numeric values with a clear 422.
+def _json_integer(value):
+    """Return `value` as an exact int, or None if it is not a JSON integer.
 
-    If the value is missing (None) we substitute the default. If present
-    but not coercible to int, we 422 instead of silently substituting --
-    silent substitution hides typos like `"bootstrap": "many"`.
+    The OpenAPI schema documents these fields as `type: integer`, so the
+    runtime has to mean it. `int()` did not: it truncated 1000.5 to 1000,
+    parsed the string "1000", and turned True into 1 -- three values the
+    schema calls invalid, silently accepted as three different numbers.
+
+    JSON has a single number type and many clients spell an integer 1000.0,
+    so an integer-valued float is accepted; a fractional or non-finite one is
+    not. Booleans are rejected before the Integral check, because bool is a
+    subclass of int and `True` has never meant "one replicate".
+    """
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, numbers.Integral):
+        return int(value)
+    if isinstance(value, numbers.Real):
+        numeric_value = float(value)
+        if math.isfinite(numeric_value) and numeric_value.is_integer():
+            return int(numeric_value)
+    return None
+
+
+def _not_an_integer_error(field, value):
+    """The shared 422 for a value the `type: integer` contract excludes."""
+    lo, hi = LIMITS[field]
+    return error_response(
+        code="validation_failed",
+        message=(
+            f"`{field}` must be an integer between {lo:,} and {hi:,}. "
+            f"Received {value!r} ({type(value).__name__})."
+        ),
+        status=422,
+        details={"field": field, "value": value, "min": lo, "max": hi},
+    )
+
+
+def _reject_non_integer(field, value):
+    """Pre-check for a field whose raw value meets a domain validator first.
+
+    `bootstrap` is normalized by `validate_iqtree_ufboot_count` before
+    `_validate_clamped_int` ever sees it, and that normalizer deliberately
+    accepts the string forms stored by old jobs. Screening the caller's raw
+    value here keeps the public API strict without loosening -- or tightening
+    -- what an inherited value is allowed to be. Returns an error response or
+    None.
+    """
+    if value is None or _json_integer(value) is not None:
+        return None
+    return _not_an_integer_error(field, value)
+
+
+def _validate_clamped_int(field, value, *, default):
+    """Validate-and-clamp; reject non-integer values with a clear 422.
+
+    If the value is missing (None) we substitute the default. If present but
+    not an integer, we 422 instead of silently coercing -- silent coercion
+    hides typos like `"bootstrap": "many"`, and silent truncation would build
+    a tree with a replicate count the caller never asked for.
     """
     lo, hi = LIMITS[field]
     if value is None:
         return default, None
-    try:
-        n = int(value)
-    except (TypeError, ValueError):
-        return None, error_response(
-            code="validation_failed",
-            message=(
-                f"`{field}` must be an integer between {lo:,} and {hi:,}. "
-                f"Received {value!r} ({type(value).__name__})."
-            ),
-            status=422,
-            details={"field": field, "value": value, "min": lo, "max": hi},
-        )
+    n = _json_integer(value)
+    if n is None:
+        return None, _not_an_integer_error(field, value)
     if n < lo or n > hi:
         return None, error_response(
             code="validation_failed",
@@ -408,6 +457,10 @@ def create_job():
     if err: return err
 
     # Clamped integers.
+    # `validate_iqtree_ufboot_count` normalizes the string forms old stored
+    # jobs carry, so screen what the caller actually sent before it gets there.
+    err = _reject_non_integer("bootstrap", data.get("bootstrap"))
+    if err: return err
     try:
         requested_bootstrap = data.get("bootstrap")
         if requested_bootstrap is None:
@@ -490,6 +543,25 @@ def create_job():
             status=422,
             details={"fields": ["sequence", "accessions"]},
         )
+
+    # Reject an unalignable submission here rather than in the worker. The
+    # string cap above bounds only the payload size; it says nothing about
+    # per-sequence length or record count, so a set of ~80 contigs of 56 kb
+    # fits inside sequence_max_bytes while still being genome-scale input that
+    # MAFFT cannot align. The browser path applies the same check in
+    # app/api/routes.py; this keeps the two APIs telling the user the same
+    # story instead of the API accepting what the website refuses.
+    if sequence_text:
+        from app.services.fasta_utils import validate_dna_fasta
+        try:
+            validate_dna_fasta(sequence_text)
+        except ValueError as exc:
+            return error_response(
+                code="validation_failed",
+                message=str(exc),
+                status=422,
+                details={"field": "sequence"},
+            )
 
     # `alignment_options` is a free-form dict consumed by the worker; we cap
     # only its shape and a rough byte size to keep it from being abused as
@@ -593,6 +665,7 @@ def create_job():
     # ownership, status and metrics bookkeeping were simply skipped for that
     # job -- it ran, but the submitter could not see or own it.
     job_id = str(uuid.uuid4())
+    g.job_id = job_id
     job_record = Job(
         id=job_id,
         user_id=g.api_user.id,
@@ -1019,7 +1092,11 @@ def recompute_job(job_id):
         if "bootstrap" in body:
             # The effective tree method is resolved after all overrides merge;
             # preserve the raw value until the IQ-TREE-specific validator sees
-            # it so a fractional count cannot be truncated by int().
+            # it so a fractional count cannot be truncated by int(). That
+            # validator accepts the representations old jobs stored, so the
+            # caller's own value is type-checked here instead.
+            err = _reject_non_integer("bootstrap", body["bootstrap"])
+            if err: return err
             overrides["bootstrap"] = body["bootstrap"]
         if "mcmc_burnin_fraction" in body:
             v, err = _validate_fraction(
@@ -1053,10 +1130,22 @@ def recompute_job(job_id):
             overrides["notes"] = v
 
         params.update(overrides)
+        # Same split as the web recompute route: strict for a value the caller
+        # supplied (or for an IQ-TREE configuration newly requested through a
+        # tree_method override), lenient for one inherited from a job that
+        # predates the -B >= 1000 rule.
+        caller_chose_bootstrap = (
+            "bootstrap" in overrides or "tree_method" in overrides
+        )
         try:
-            requested_bootstrap = validate_iqtree_ufboot_count(
-                params.get("tree_method"), params.get("bootstrap", DEFAULT_BOOTSTRAP)
-            )
+            if caller_chose_bootstrap:
+                requested_bootstrap = validate_iqtree_ufboot_count(
+                    params.get("tree_method"), params.get("bootstrap", DEFAULT_BOOTSTRAP)
+                )
+            else:
+                requested_bootstrap = normalize_inherited_iqtree_ufboot_count(
+                    params.get("tree_method"), params.get("bootstrap", DEFAULT_BOOTSTRAP)
+                )
         except ValueError as exc:
             return error_response(
                 code="validation_failed", message=str(exc), status=422,
@@ -1088,6 +1177,8 @@ def recompute_job(job_id):
                          "ignored_fields": sorted(overrides)},
             )
         if created:
+            from app.services.tree_undo_service import clear_undo_checkpoint
+            clear_undo_checkpoint(job_dir)
             job.status = "queued"
             metrics = job.metrics or {}
             metrics["recompute_requested_at"] = datetime.utcnow().isoformat()
@@ -1140,8 +1231,30 @@ def download_job_file(job_id, name):
             message=f"Unknown artifact. Valid names: {sorted(DOWNLOADABLE_ARTIFACTS)}",
             status=404,
         )
-    p = artifact_path(job_id, name)
     job_dir = Config.JOB_DIR / job_id
+
+    if name == "tree.nexus":
+        # Regenerated from the Newick when the stored file is stale or was
+        # written by Biopython's TAXLABELS writer, which mangles any label
+        # containing a space or a parenthesis. Same helper the browser
+        # download uses, so the two agree about which tree and which labels.
+        from io import BytesIO
+
+        from app.services.tree_io import build_nexus_download
+
+        built = build_nexus_download(job_dir)
+        if built is None:
+            return error_response(
+                code="not_found", message="File not available yet.", status=404
+            )
+        return send_file(
+            BytesIO(built[0]),
+            as_attachment=True,
+            download_name=name,
+            mimetype=_guess_mime(name),
+        )
+
+    p = artifact_path(job_id, name)
     if p is None or not validate_safe_file_path(p, job_dir):
         return error_response(code="not_found", message="File not available yet.", status=404)
     if p.suffix == ".gz":
@@ -1302,6 +1415,7 @@ def job_events(job_id):
             last_db_poll = 0.0
             last_token_check = time.monotonic()
             last_activity = started
+            last_registry_touch = started
             while True:
                 # Hard duration cap. Clients should reconnect.
                 if time.monotonic() - started > max_stream_seconds:
@@ -1353,6 +1467,12 @@ def job_events(job_id):
                     except json.JSONDecodeError:
                         pass
                 now = time.monotonic()
+                # Renew the registry lease on its own timer, ahead of the ping
+                # yield, so a stream whose client has stopped reading still
+                # counts against the site-wide census.
+                if now - last_registry_touch >= sse_registry.RENEW_INTERVAL_SECONDS:
+                    last_registry_touch = now
+                    sse_registry.touch_stream(registry_conn, stream_token)
                 if now - last_ping >= SSE_HEARTBEAT_SECONDS:
                     yield "event: ping\ndata: {}\n\n"
                     last_ping = now
@@ -1450,9 +1570,15 @@ TREE_MUTATION_LIMITS = {
     "max_name_len":  MAX_TREE_TIP_NAME_LENGTH,
 }
 
-# Characters that would corrupt Newick syntax if written verbatim as a tip
-# name. Reject these in *new* tip names (rename target, prune target list)
-# so a malformed name can't break tree exports.
+# Characters that no download can carry, whatever the quoting: a line break or
+# a NUL ends a FASTA header and a Newick label wherever it occurs. Structural
+# punctuation is deliberately NOT in here -- see NEWICK_UNSAFE_TIP_CHARS in
+# tree_edit_service for why parentheses, colons, commas and the rest survive
+# every format this site exports.
+#
+# A tab is rejected rather than folded because this is a programmatic client
+# with no one to see a "we cleaned that up for you" notice; the browser rename
+# path folds it instead, via normalize_tip_name().
 _NEWICK_UNSAFE = set(NEWICK_UNSAFE_TIP_CHARS) | set("\t\n\r")
 
 
@@ -1463,7 +1589,7 @@ def _validate_tip_name(field, value, *, allow_newick_unsafe=False):
     must match what already exists in the tree (those values came from the
     pipeline itself, not from the caller, so we only length-bound them).
     For new names introduced by the caller (`new_name`), we additionally
-    reject Newick-unsafe characters.
+    reject the characters no export format can represent.
     """
     s, err = _validate_string(
         field, value,
@@ -1478,10 +1604,11 @@ def _validate_tip_name(field, value, *, allow_newick_unsafe=False):
             return None, error_response(
                 code="validation_failed",
                 message=(
-                    f"`{field}` contains characters that are invalid in "
-                    f"Newick tip names: {bad}. Avoid parentheses, brackets, "
-                    f"commas, colons, semicolons, and whitespace other than "
-                    f"spaces."
+                    f"`{field}` contains characters that cannot appear in a "
+                    f"tip name: {[repr(c) for c in bad]}. Line breaks, tabs "
+                    f"and NUL end a FASTA header and a Newick label; every "
+                    f"other printable character, punctuation included, is "
+                    f"accepted."
                 ),
                 status=422,
                 details={"field": field, "invalid_chars": bad},
@@ -1527,6 +1654,12 @@ def _mutation(handler, job_id, *, where, scope="jobs:write"):
 
         with tree_state_lock(job_dir):
             result = handler(job_dir, body)
+            # The v1 API is a separate client from the tree viewer, so it does
+            # not get the viewer's Undo affordance -- but it does write the same
+            # files. Leaving a viewer checkpoint from before this mutation would
+            # let a later Undo silently revert an API edit, so drop it.
+            from app.services.tree_undo_service import clear_undo_checkpoint
+            clear_undo_checkpoint(job_dir)
         return ok(result)
     except ValueError as e:
         return error_response(code="validation_failed", message=str(e), status=422)

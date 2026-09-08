@@ -3,10 +3,12 @@
 Split from tests/test_coderabbit_probably_fix.py only for length; the same
 convention applies, with each class naming the finding it covers.
 """
+import contextlib
 import logging
 import time
 import unittest
 import urllib.error
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -344,10 +346,15 @@ class FallbackFastaBatchingTests(unittest.TestCase):
 
         def _request(method, url, **kwargs):
             ids = kwargs.get("data", {}).get("id", "")
-            posted.append(ids.split(","))
-            # Fail one chunk to prove the others survive it.
-            status = 500 if len(posted) == 2 else 200
-            return SimpleNamespace(status_code=status, text=">x\nACGT")
+            chunk = ids.split(",")
+            posted.append(chunk)
+            # Fail one chunk to prove the others survive it. A successful chunk
+            # answers with the records it was asked for, which is how the caller
+            # now decides what was actually recovered.
+            if len(posted) == 2:
+                return SimpleNamespace(status_code=500, text="")
+            body = "\n".join(f">{acc}.1 Fungal sp.\nACGT" for acc in chunk)
+            return SimpleNamespace(status_code=200, text=body)
 
         reported = []
         with patch.object(blast_service, "_fetch_genbank_xml_batch", return_value=[]), \
@@ -394,10 +401,12 @@ class GenBankLocationAvailabilityTests(unittest.TestCase):
         self.assertEqual(unavailable, [])
         self.assertEqual(missing, ["OR807397"])
 
-    def test_a_record_answered_with_no_location_is_neither(self):
+    def test_a_record_answered_with_no_location_is_missing(self):
         # NCBI answered and the record genuinely carries no collection site.
-        # Nothing failed, so this is not "unavailable"; the record was found,
-        # so it is not "missing" either.
+        # Nothing failed, so this is not "unavailable" -- it is a fact about the
+        # record, which is what `missing` means. It previously fell out of all
+        # three result sets (the empty string is cached, and only a cache miss
+        # counted as absent), so a caller could not report it at all.
         parsed = {"by_acc": {"OR807397": {"accession": "OR807397",
                                           "version": "OR807397.1",
                                           "source_features": {}}}}
@@ -406,7 +415,7 @@ class GenBankLocationAvailabilityTests(unittest.TestCase):
             locations, missing, unavailable = self.svc.lookup_locations(["OR807397"])
 
         self.assertEqual(locations, {})
-        self.assertEqual(missing, [])
+        self.assertEqual(missing, ["OR807397"])
         self.assertEqual(unavailable, [])
 
     def test_a_found_location_is_returned_under_both_forms(self):
@@ -578,50 +587,223 @@ class MushroomObserverMalformedSequenceTests(unittest.TestCase):
 # ---------------------------------------------------------------------------
 
 class ClearJobsReportingTests(unittest.TestCase):
-    def _run(self, rmtree_error=None):
+    """Clear-all reports what actually happened, and cannot lose artifacts.
+
+    The directories are moved into var/jobs/.trash before the rows are deleted,
+    so a failed commit can put them back. Committing first and destroying the
+    files afterwards left every surviving history row pointing at artifacts that
+    were already gone.
+    """
+
+    def _run(self, *, rmtree_error=None, commit_error=None, rename_error=None,
+             outside_job_dir=False, restore_error=None, restore_fails_for=None,
+             corrupt_rows=None):
+        import shutil
+        import tempfile
+        from pathlib import Path as _Path
+
+        from app.config import Config
         from app.user import routes
 
-        jobs = [SimpleNamespace(id="job-a", job_dir="/tmp/does-not-matter/a"),
-                SimpleNamespace(id="job-b", job_dir="/tmp/does-not-matter/b")]
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp, True)
+        job_root = _Path(tmp) / "jobs"
+        job_root.mkdir()
+        outside = _Path(tmp) / "elsewhere"
+        outside.mkdir()
+
+        if corrupt_rows is not None:
+            jobs = corrupt_rows(job_root, outside)
+        else:
+            jobs = []
+            for name in (
+                "11111111-1111-4111-8111-111111111111",
+                "22222222-2222-4222-8222-222222222222",
+            ):
+                parent = outside if outside_job_dir else job_root
+                directory = parent / name
+                directory.mkdir()
+                (directory / "tree_state.json").write_text("{}")
+                jobs.append(SimpleNamespace(id=name, job_dir=str(directory)))
+
         flashes = []
         db = MagicMock()
+        if commit_error is not None:
+            db.session.commit.side_effect = commit_error
+
+        patches = [
+            patch.object(routes, "Job"),
+            patch.object(routes, "db", db),
+            patch.object(routes, "current_user", SimpleNamespace(id=1)),
+            patch.object(routes, "flash",
+                         side_effect=lambda msg, cat="message": flashes.append((msg, cat))),
+            patch.object(routes, "redirect", side_effect=lambda target: target),
+            patch.object(routes, "url_for", side_effect=lambda endpoint: endpoint),
+            patch.object(Config, "JOB_DIR", job_root),
+        ]
+        if rmtree_error is not None:
+            patches.append(patch("shutil.rmtree", side_effect=rmtree_error))
+        if rename_error is not None:
+            patches.append(patch.object(_Path, "rename", side_effect=rename_error))
+        elif restore_error is not None:
+            # Stage everything normally, then fail the move *back* for one job.
+            # That is the recovery path: the rows survive the rollback, but one
+            # job's artifacts are left sitting in .trash rather than at the
+            # path its surviving row points to.
+            real_rename = _Path.rename
+
+            def _rename(self, target):
+                if (self.parent.name == ".trash"
+                        and self.name.startswith(f"{restore_fails_for}.")):
+                    raise restore_error
+                return real_rename(self, target)
+
+            patches.append(patch.object(_Path, "rename", _rename))
 
         app = Flask(__name__)
-        with app.test_request_context(), \
-                patch.object(routes, "Job") as job_model, \
-                patch.object(routes, "db", db), \
-                patch.object(routes, "current_user", SimpleNamespace(id=1)), \
-                patch.object(routes, "flash",
-                             side_effect=lambda msg, cat="message": flashes.append((msg, cat))), \
-                patch.object(routes, "redirect", side_effect=lambda target: target), \
-                patch.object(routes, "url_for", side_effect=lambda endpoint: endpoint), \
-                patch("os.path.exists", return_value=True), \
-                patch("os.path.isdir", return_value=True), \
-                patch("shutil.rmtree", side_effect=rmtree_error):
-            job_model.query.filter_by.return_value.all.return_value = jobs
-            with patch.object(routes.logger, "warning") as warn:
-                routes.clear_jobs.__wrapped__()
-        return flashes, db, warn
+        with app.test_request_context():
+            with contextlib.ExitStack() as stack:
+                entered = [stack.enter_context(item) for item in patches]
+                entered[0].query.filter_by.return_value.all.return_value = jobs
+                with patch.object(routes.logger, "warning") as warn:
+                    with patch.object(routes.logger, "exception") as exception:
+                        routes.clear_jobs.__wrapped__()
+        return SimpleNamespace(
+            flashes=flashes, db=db, warn=warn, exception=exception,
+            jobs=jobs, job_root=job_root,
+        )
 
     def test_a_clean_run_reports_success(self):
-        flashes, db, warn = self._run()
-        message, category = flashes[0]
+        result = self._run()
+        message, category = result.flashes[0]
         self.assertEqual(category, "success")
         self.assertIn("2 job(s) cleared", message)
-        self.assertEqual(db.session.delete.call_count, 2)
-        warn.assert_not_called()
+        self.assertEqual(result.db.session.delete.call_count, 2)
+        result.warn.assert_not_called()
+        # Both the job directories and the staging area are gone.
+        for job in result.jobs:
+            self.assertFalse(Path(job.job_dir).exists())
+        trash = result.job_root / ".trash"
+        self.assertEqual(list(trash.iterdir()) if trash.exists() else [], [])
 
     def test_a_failed_directory_removal_is_not_reported_as_success(self):
-        flashes, db, warn = self._run(rmtree_error=PermissionError("nope"))
-        message, category = flashes[0]
+        result = self._run(rmtree_error=PermissionError("nope"))
+        message, category = result.flashes[0]
         self.assertEqual(category, "warning")
         self.assertIn("still", message)
         self.assertIn("could not be deleted", message)
         # The history rows are still removed; that half did succeed.
-        self.assertEqual(db.session.delete.call_count, 2)
+        self.assertEqual(result.db.session.delete.call_count, 2)
         # And the failure goes to the application logger, not to print().
-        self.assertEqual(warn.call_count, 2)
-        self.assertIn("jobs.clear_dir_failed", warn.call_args[0][0])
+        self.assertEqual(result.warn.call_count, 2)
+        # log_degradation formats lazily, so the event name is an argument.
+        self.assertIn("job_trash_cleanup_failed", result.warn.call_args[0])
+
+    def test_a_path_outside_the_job_directory_is_never_touched(self):
+        result = self._run(outside_job_dir=True)
+        message, category = result.flashes[0]
+        self.assertEqual(category, "warning")
+        for job in result.jobs:
+            self.assertTrue(Path(job.job_dir).is_dir())
+        self.assertIn("jobs.clear_invalid_job_path", result.warn.call_args[0][0])
+
+    def test_a_traversal_job_id_cannot_shape_a_staging_or_deletion_path(self):
+        def corrupt_rows(job_root, outside):
+            victim = outside / "victim"
+            victim.mkdir()
+            (victim / "keep.txt").write_text("keep")
+            return [SimpleNamespace(id="../victim", job_dir=str(victim))]
+
+        result = self._run(corrupt_rows=corrupt_rows)
+
+        victim = Path(result.jobs[0].job_dir)
+        self.assertEqual((victim / "keep.txt").read_text(), "keep")
+        trash = result.job_root / ".trash"
+        self.assertEqual(list(trash.iterdir()) if trash.exists() else [], [])
+        self.assertEqual(result.db.session.delete.call_count, 1)
+        self.assertIn("jobs.clear_invalid_job_path", result.warn.call_args[0][0])
+
+    def test_a_row_pointing_at_another_jobs_directory_cannot_delete_it(self):
+        def corrupt_rows(job_root, _outside):
+            row_id = "11111111-1111-4111-8111-111111111111"
+            other_id = "22222222-2222-4222-8222-222222222222"
+            other = job_root / other_id
+            other.mkdir()
+            (other / "keep.txt").write_text("keep")
+            return [SimpleNamespace(id=row_id, job_dir=str(other))]
+
+        result = self._run(corrupt_rows=corrupt_rows)
+
+        other = Path(result.jobs[0].job_dir)
+        self.assertEqual((other / "keep.txt").read_text(), "keep")
+        trash = result.job_root / ".trash"
+        self.assertEqual(list(trash.iterdir()) if trash.exists() else [], [])
+        self.assertIn("jobs.clear_invalid_job_path", result.warn.call_args[0][0])
+
+    def test_a_commit_failure_puts_every_artifact_back(self):
+        result = self._run(commit_error=RuntimeError("db is down"))
+        message, category = result.flashes[0]
+        self.assertEqual(category, "error")
+        self.assertIn("Nothing was deleted", message)
+        result.db.session.rollback.assert_called_once()
+        # This is the whole point: the rows survive, so the files must too.
+        for job in result.jobs:
+            self.assertTrue(Path(job.job_dir).is_dir())
+            self.assertTrue((Path(job.job_dir) / "tree_state.json").is_file())
+
+    def test_an_unrestorable_artifact_is_never_reported_as_nothing_deleted(self):
+        """The remaining defect: rollback succeeded, restore did not.
+
+        The row was kept, but its directory is still in .trash rather than at
+        the path the row names -- so the user has a job that cannot open its
+        own files. Telling them "Nothing was deleted" sends them away with no
+        reason to report it.
+        """
+        result = self._run(
+            commit_error=RuntimeError("db is down"),
+            restore_error=OSError("cross-device link"),
+            restore_fails_for="11111111-1111-4111-8111-111111111111",
+        )
+
+        message, category = result.flashes[0]
+        self.assertEqual(category, "error")
+        self.assertNotIn("Nothing was deleted", message)
+        self.assertIn("kept", message)
+        self.assertIn("could not be put back", message)
+        # No var/jobs internals in what the user is shown.
+        self.assertNotIn(".trash", message)
+        self.assertNotIn(str(result.job_root), message)
+
+        result.db.session.rollback.assert_called_once()
+
+        # The second job restored cleanly; the first did not and its bytes are still staged.
+        job_a, job_b = result.jobs
+        self.assertTrue(Path(job_b.job_dir).is_dir())
+        self.assertFalse(Path(job_a.job_dir).exists())
+        staged = list((result.job_root / ".trash").iterdir())
+        self.assertTrue(staged[0].name.startswith(job_a.id + "."))
+        # Left intact for manual recovery, not cleaned up.
+        self.assertTrue((staged[0] / "tree_state.json").is_file())
+
+        # And the log carries both ends of the move plus the job id.
+        recovery = [call for call in result.exception.call_args_list
+                    if "jobs.clear_restore_failed" in call[0][0]]
+        self.assertEqual(len(recovery), 1)
+        template, job_id, staged_path, source_path = recovery[0][0]
+        self.assertEqual(job_id, job_a.id)
+        self.assertEqual(Path(staged_path), staged[0])
+        self.assertEqual(Path(source_path), Path(job_a.job_dir))
+        # The degradation line is countable by `grep DEGRADED`.
+        self.assertIn("job_clear_rollback_incomplete", result.warn.call_args[0])
+
+    def test_a_staging_failure_deletes_nothing_from_disk(self):
+        result = self._run(rename_error=OSError("cross-device"))
+        message, category = result.flashes[0]
+        self.assertEqual(category, "warning")
+        self.assertIn("could not be deleted", message)
+        for job in result.jobs:
+            self.assertTrue(Path(job.job_dir).is_dir())
+        self.assertIn("jobs.clear_dir_failed", result.warn.call_args[0][0])
 
     def test_failures_go_to_the_logger_not_to_stdout(self):
         import inspect

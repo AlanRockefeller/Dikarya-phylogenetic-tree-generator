@@ -8,12 +8,20 @@ from flask import current_app
 logger = logging.getLogger(__name__)
 
 @click.command("run-worker")
+@click.option(
+    "--queues", "queues", default=None,
+    help="Comma-separated queues to serve, in priority order "
+         "(phylo_high, phylo_bulk). Defaults to both.",
+)
 @with_appcontext
-def run_worker_command():
+def run_worker_command(queues):
     """Run the worker with heartbeat monitoring."""
     from app.workers.worker_monitor import run_worker_with_heartbeat
-    print("Starting worker with heartbeat...")
-    run_worker_with_heartbeat(current_app)
+    queue_names = None
+    if queues:
+        queue_names = [name.strip() for name in queues.split(",") if name.strip()]
+    print(f"Starting worker with heartbeat (queues: {queue_names or 'all'})...")
+    run_worker_with_heartbeat(current_app, queue_names=queue_names)
 
 @click.command("run-metrics")
 @with_appcontext

@@ -1,4 +1,4 @@
-from flask import jsonify, request, send_file, url_for
+from flask import g, jsonify, request, send_file, url_for
 from flask_login import current_user
 from app.api import bp
 from app.workers.queue import (
@@ -21,7 +21,10 @@ from difflib import SequenceMatcher
 from datetime import datetime
 
 from app.services.security_utils import validate_job_id, validate_safe_file_path, coerce_bool
-from app.services.tree_parameter_validation import validate_iqtree_ufboot_count
+from app.services.tree_parameter_validation import (
+    normalize_inherited_iqtree_ufboot_count,
+    validate_iqtree_ufboot_count,
+)
 from app.services.artifact_storage import (
     artifact_exists,
     open_artifact,
@@ -33,6 +36,14 @@ from app.services.its_extraction_service import (
     resolve_min_length as resolve_its_min_length,
 )
 from app.services.access_control import check_job_access
+from app.services.request_diagnostics import note_request_failure
+from app.services.tree_undo_service import (
+    UndoUnavailable,
+    clear_undo_checkpoint,
+    describe_undo_checkpoint,
+    undo_checkpoint,
+    undo_last_edit,
+)
 from app.extensions import csrf, limiter
 
 logger = logging.getLogger(__name__)
@@ -60,6 +71,19 @@ def _server_error(exc, *, where=""):
         "error": "Internal server error",
         "request_id": request_id,
     }), 500
+
+
+def _with_undo_state(state, job_dir):
+    """Echo the job's Undo availability alongside a saved tree state.
+
+    The viewer's toolbar has to know whether Undo is now offered and what it
+    would undo. Piggy-backing on the reply the edit already returns keeps that
+    to zero extra round trips; the keys are namespaced so they cannot collide
+    with tree-state fields.
+    """
+    payload = dict(state) if isinstance(state, dict) else {"status": "success"}
+    payload["undo"] = describe_undo_checkpoint(job_dir)
+    return payload
 
 
 def _client_log_value(value, max_length=CLIENT_LOG_MAX_STR):
@@ -193,6 +217,17 @@ RECOMPUTE_BOOLEAN_FIELDS = frozenset({
 # Settings the viewer's Advanced panel reads back so it can open pre-filled with
 # what the job actually ran. Same list, minus free-text notes.
 RECOMPUTE_READABLE_FIELDS = RECOMPUTE_OVERRIDABLE_FIELDS - {"notes"}
+
+# Wall clock the blank-location fill may spend on iNaturalist inside a request.
+# The lookup is a nicety on top of an import that has already done its upstream
+# work, so it gets a small slice of its own rather than a share of the FASTA
+# budget: worst case it resolves what it can and leaves the rest blank.
+MYCOMAP_PLACE_FILL_BUDGET_SECONDS = 12
+
+# Same idea for the GenBank fallback that runs after it. NCBI's retry schedule
+# is generous enough to outlive the whole request on its own, so the efetch
+# batches get their own ceiling rather than whatever is left over.
+GENBANK_PLACE_FILL_BUDGET_SECONDS = 12
 
 US_STATE_TO_ABBR = {
     "alabama": "al", "alaska": "ak", "arizona": "az", "arkansas": "ar",
@@ -913,6 +948,32 @@ def _normalize_import_filter_details(raw):
             },
         }
 
+    # Alan 9/6/26 - Duplicates the Tree Builder queue collapsed before submitting.
+    # These never reach any server-side filter, so without carrying them through
+    # here the viewer would have no record that they existed.
+    queue_duplicates = raw.get("queue_duplicates")
+    if isinstance(queue_duplicates, dict):
+        rows = []
+        for item in (queue_duplicates.get("removed_records") or [])[:MAX_IMPORT_FILTER_DETAIL_RECORDS]:
+            if not isinstance(item, dict):
+                continue
+            rows.append({
+                "name": str(item.get("name") or "")[:500],
+                "kept_as": str(item.get("kept_as") or "")[:500],
+                "identifier": str(item.get("identifier") or "")[:100],
+                "location": str(item.get("location") or "")[:200],
+                "reason": str(item.get("reason") or "")[:80],
+                "reason_label": str(item.get("reason_label") or "")[:200],
+                "removed_length": _count(item.get("removed_length")),
+                "kept_length": _count(item.get("kept_length")),
+            })
+        if rows or queue_duplicates.get("removed_count"):
+            normalized["queue_duplicates"] = {
+                "label": str(queue_duplicates.get("label") or "Duplicates not added")[:100],
+                "removed_count": _count(queue_duplicates.get("removed_count")) or len(rows),
+                "removed_records": rows,
+            }
+
     return normalized
 
 
@@ -1019,6 +1080,123 @@ def _sequence_exact_key(seq):
     return header, sequence
 
 
+# Cap header lengths to prevent abuse (e.g., 200KB pasted headers).
+MAX_SEQ_ID_LEN = 100
+MAX_DESC_LEN = 300
+
+
+def _record_identity(seq):
+    """(uppercased sequence ID, uppercased sequence) as this record will be stored.
+
+    Mirrors the sanitizing and truncation _format_fasta_record_for_job() applies,
+    so a duplicate check compares the ID the file will actually carry.
+    """
+    raw_header = seq.get('name', '') or ''
+    sanitized_header = "".join(ch for ch in raw_header if ord(ch) >= 32 or ch == '\t')
+    seq_id, _rest = _split_fasta_header(sanitized_header)
+    sequence = ''.join(str(seq.get('sequence') or '').split())
+    return seq_id[:MAX_SEQ_ID_LEN].upper(), sequence.upper()
+
+
+def _find_duplicate_record(seq_id, sequence, records_by_id):
+    """The already-present record this one duplicates, or None.
+
+    Allows for trim differences.
+
+    Alan 9/6/26 - MycoMap trims each NCBI BLAST hit to the region that aligned
+    with that search's query, so pulling the same accession from a second BLAST
+    returns the same record a few bases longer or shorter -- 704 vs 707 is
+    typical -- and sometimes with a relabelled taxon after a MycoMap taxonomy
+    update. _sequence_exact_key() compares header plus sequence, so it read
+    those as new records and _make_unique_id() filed them as `ACC_added`. One
+    Entoloma job reached 423 records for 334 accessions that way: 88 of its 89
+    `_added` records were the same accession with one sequence a substring of
+    the other, and each one drew its own tip.
+
+    Same identifier plus a nested sequence is the same record. Two genuinely
+    different sequences under one identifier still get the _added suffix, which
+    is what that suffix is for.
+    """
+    if not seq_id or not sequence:
+        return None
+    for existing in records_by_id.get(seq_id, ()):
+        stored = existing.get("sequence") or ""
+        if stored and (stored in sequence or sequence in stored):
+            return existing
+    return None
+
+
+def _describe_skipped_duplicate(seq, kept, reason):
+    """One row for the viewer's "Duplicates Not Added" table.
+
+    Records what was dropped, what it was dropped in favour of, and the two
+    lengths, so a reader can see the trim difference that made the two copies
+    look like different records in the first place.
+    """
+    removed_header = str(seq.get('name') or '').strip()
+    removed_sequence = ''.join(str(seq.get('sequence') or '').split())
+    kept = kept or {}
+    kept_sequence = str(kept.get('sequence') or '')
+    labels = {
+        'same_record_refetched': (
+            "Same record from another BLAST, trimmed to a different length"
+        ),
+        'exact_duplicate': "Identical header and sequence",
+    }
+    return {
+        "name": removed_header[:500],
+        "kept_as": str(kept.get('header') or '')[:500],
+        "identifier": str(kept.get('identifier') or '')[:100],
+        "reason": reason[:80],
+        "reason_label": labels.get(reason, reason)[:200],
+        "removed_length": len(removed_sequence),
+        "kept_length": len(kept_sequence),
+    }
+
+
+def _merge_queue_duplicate_details(job_dir, removed_records):
+    """Append skipped-duplicate rows to the job's stored import diagnostics.
+
+    The viewer reads its provenance panels straight out of input_info.json, so a
+    duplicate dropped after submission has to be written back there or it is
+    dropped silently -- which is the thing that made this class of bug invisible
+    for as long as it was.
+    """
+    if not removed_records:
+        return
+    import json  # module-level import is deliberately avoided in this file
+    input_info_path = job_dir / "input_info.json"
+    if not validate_safe_file_path(input_info_path, job_dir) or not input_info_path.exists():
+        return
+    try:
+        with open(input_info_path, "r") as handle:
+            stored = json.load(handle)
+        if not isinstance(stored, dict):
+            return
+        details = stored.setdefault("import_filter_details", {})
+        if not isinstance(details, dict):
+            details = {}
+            stored["import_filter_details"] = details
+        block = details.get("queue_duplicates")
+        if not isinstance(block, dict):
+            block = {"label": "Duplicates not added", "removed_count": 0, "removed_records": []}
+        existing = block.get("removed_records")
+        if not isinstance(existing, list):
+            existing = []
+        combined = (existing + removed_records)[:MAX_IMPORT_FILTER_DETAIL_RECORDS]
+        block["label"] = "Duplicates not added"
+        block["removed_records"] = combined
+        # Count every one that was skipped, even past the row cap.
+        block["removed_count"] = int(block.get("removed_count") or 0) + len(removed_records)
+        details["queue_duplicates"] = block
+        with open(input_info_path, "w") as handle:
+            json.dump(stored, handle, separators=(",", ":"))
+    except (OSError, ValueError, TypeError) as exc:
+        # Losing the diagnostic must never fail the add, which has already
+        # written the sequences the user asked for.
+        logger.warning("Could not record skipped duplicates for %s: %s", job_dir.name, exc)
+
+
 def _format_fasta_record_for_job(seq, used_ids, fallback_index):
     # Sanitize header: remove control chars including \0
     raw_header = seq.get('name', '')
@@ -1027,9 +1205,6 @@ def _format_fasta_record_for_job(seq, used_ids, fallback_index):
     # Split header to dedupe by ID properly
     seq_id, rest = _split_fasta_header(sanitized_header)
 
-    # Cap header lengths to prevent abuse (e.g., 200KB pasted headers)
-    MAX_SEQ_ID_LEN = 100
-    MAX_DESC_LEN = 300
     seq_id = seq_id[:MAX_SEQ_ID_LEN]
     rest = rest[:MAX_DESC_LEN]
 
@@ -1262,7 +1437,7 @@ def fetch_genbank_locations():
 
     Request: { "accessions": ["OR807397", "MJ505555.1"] }
     Response: { "status": "success",
-                "locations": {"OR807397": "USA: Arizona, Greenlee County"},
+                "locations": {"OR807397": "USA: Arizona"},
                 "missing": [...],      # NCBI answered; the record has no location
                 "unavailable": [...] } # NCBI could not be reached for these
     """
@@ -1283,9 +1458,24 @@ def fetch_genbank_locations():
         }), 400
 
     try:
-        from app.services.genbank_location_service import lookup_locations
+        from app.services.genbank_location_service import (
+            lookup_locations,
+            shorten_location,
+        )
 
         locations, missing, unavailable = lookup_locations(accessions)
+        # GenBank's raw qualifier can run to four segments of village and valley
+        # names ("Switzerland: Stein, Mastrils, Landquart, Graubuenden"), which
+        # is unreadable once it is appended to a FASTA header and carried into a
+        # tree tip. Trim to the country plus at most one region below it.
+        locations = {
+            accession: shortened
+            for accession, shortened in (
+                (accession, shorten_location(value))
+                for accession, value in locations.items()
+            )
+            if shortened
+        }
         return jsonify({
             "status": "success",
             "locations": locations,
@@ -1297,6 +1487,67 @@ def fetch_genbank_locations():
         })
     except Exception as e:
         return _server_error(e, where="genbank_locations")
+
+
+def _fill_missing_genbank_locations(sequences, deadline=None):
+    """Give still-locationless GenBank-accession records a location from GenBank.
+
+    ``deadline`` (a ``time.monotonic()`` instant) bounds the NCBI round trips,
+    so an unresponsive efetch cannot keep retrying after the import's fetch
+    budget is gone; whatever is not resolved by then simply stays blank.
+
+    Runs after the MycoMap and iNaturalist fills, so it only sees records those
+    two could not place. GenBank's own value is trimmed with
+    ``shorten_location()`` first: the raw qualifier can read "Switzerland:
+    Stein, Mastrils, Landquart, Graubuenden", which is a paragraph in a tree
+    tip. Returns how many were filled.
+    """
+    from app.services.genbank_location_service import (
+        lookup_locations,
+        shorten_location,
+    )
+
+    targets = []
+    for seq in sequences or []:
+        if str(seq.get('location') or '').strip():
+            continue
+        name = str(seq.get('name') or '')
+        if _location_from_sequence_label(name):
+            continue
+        token = str(seq.get('accession') or '').strip() or (name.split() or [''])[0]
+        accession = token.strip().upper()
+        if accession and _is_genbank_accession(accession):
+            targets.append((seq, accession))
+
+    if not targets:
+        return 0
+
+    # The same ceiling the /api/genbank/locations endpoint enforces. An import
+    # this large is already slow; do not add an unbounded NCBI round trip to it.
+    accessions = []
+    for _seq, accession in targets:
+        if accession not in accessions:
+            accessions.append(accession)
+        if len(accessions) >= MAX_CUSTOM_GENBANK_ACCESSIONS:
+            break
+
+    locations, _missing, _unavailable = lookup_locations(accessions, deadline=deadline)
+
+    filled = 0
+    for seq, accession in targets:
+        raw = locations.get(accession) or locations.get(accession.split('.')[0]) or ''
+        location = shorten_location(raw)
+        if not location:
+            continue
+        seq['location'] = location
+        name = str(seq.get('name') or '').strip()
+        if name and location.casefold() not in name.casefold():
+            seq['name'] = f"{name} {location}"
+        filled += 1
+
+    if filled:
+        logger.info("Filled %d MycoMap hit location(s) from GenBank", filled)
+    return filled
 
 
 def gather_mycomap_sequences_for_queue(url, include_ncbi=True, include_local=True,
@@ -1611,6 +1862,45 @@ def gather_mycomap_sequences_for_queue(url, include_ncbi=True, include_local=Tru
         sequences,
         filtered_records,
     )
+    # MycoMap supplies a location for most hits and that one is authoritative --
+    # it is what "Refresh MycoMap records" syncs to. Only the blanks are filled,
+    # from iNaturalist's standardized places, and only for hits whose label
+    # carries an observation number. Deliberately after the dedup passes: those
+    # key on the location, and giving records a location they did not have when
+    # the rule was written would silently change what collapses.
+    try:
+        from app.services.inaturalist_places import fill_missing_inat_locations
+        place_deadline = (None if fetch_time_budget is None
+                          else time.monotonic() + MYCOMAP_PLACE_FILL_BUDGET_SECONDS)
+        # A blank `location` field does not mean the label lacks a place: a
+        # MycoMap header can read "... Amanita example California US" with
+        # nothing in the metric. Appending a second place to those is exactly
+        # the doubled-up location this is meant to avoid.
+        fillable = [
+            seq for seq in sequences
+            if not str(seq.get('location') or '').strip()
+            and not _location_from_sequence_label(seq.get('name'))
+        ]
+        filled_locations = fill_missing_inat_locations(fillable, deadline=place_deadline)
+        if filled_locations:
+            logger.info("Filled %d MycoMap hit location(s) from iNaturalist places",
+                        filled_locations)
+    except Exception:
+        # A location is a nicety; never fail an import over one.
+        logger.warning("iNaturalist place fill failed for MycoMap hits", exc_info=True)
+    # MycoMap's own record is authoritative and iNaturalist covers the hits that
+    # carry an observation number, but a plain GenBank hit has neither -- and
+    # GenBank itself knows where the type was collected. Fill those last, from
+    # the accession, so a record like "PP910301 Eupezizella britannica voucher
+    # U.R. 1067" stops arriving with no place at all.
+    try:
+        _fill_missing_genbank_locations(
+            sequences,
+            deadline=(None if fetch_time_budget is None
+                      else time.monotonic() + GENBANK_PLACE_FILL_BUDGET_SECONDS),
+        )
+    except Exception:
+        logger.warning("GenBank location fill failed for MycoMap hits", exc_info=True)
     sequences = uniquify_mycomap_sequence_names(sequences)
     for seq in sequences:
         seq.pop('_mycomap_original_name', None)
@@ -2267,6 +2557,19 @@ def fetch_inaturalist():
 
 
 
+def _mushroom_observer_error_payload(exc) -> dict:
+    """JSON body for a Mushroom Observer failure, with any structured detail.
+
+    `details` carries the iNaturalist observation summary when a nine-digit
+    "MO number" turns out to be an iNaturalist observation.
+    """
+    payload = {"status": "error", "error": str(exc)}
+    details = getattr(exc, "details", None)
+    if isinstance(details, dict):
+        payload.update(details)
+    return payload
+
+
 @bp.route('/mushroom-observer', methods=['POST'])
 @limiter.limit("40 per minute; 600 per hour")
 def fetch_mushroom_observer():
@@ -2292,7 +2595,7 @@ def fetch_mushroom_observer():
             "message": "Fetched the selected ITS sequence from Mushroom Observer.",
         })
     except MushroomObserverError as exc:
-        return jsonify({"status": "error", "error": str(exc)}), exc.status
+        return jsonify(_mushroom_observer_error_payload(exc)), exc.status
     except Exception as exc:
         return _server_error(exc, where="mushroom_observer")
 
@@ -2332,7 +2635,7 @@ def mushroom_observer_tree():
         )
         return jsonify(result), 202
     except MushroomObserverError as exc:
-        return jsonify({"status": "error", "error": str(exc)}), exc.status
+        return jsonify(_mushroom_observer_error_payload(exc)), exc.status
     except Exception as exc:
         return _server_error(exc, where="mushroom_observer_tree")
 
@@ -2463,6 +2766,7 @@ def create_job():
             tree_method, requested_bootstrap
         )
     except ValueError as exc:
+        note_request_failure("invalid_iqtree_bootstrap")
         return jsonify({"status": "error", "error": str(exc)}), 400
     job_params["bootstrap"] = _clamp_int(requested_bootstrap, 1000, 0, 10_000)
     job_params["mcmc_generations"] = _clamp_int(
@@ -2505,6 +2809,7 @@ def create_job():
         try:
             validate_dna_fasta(job_params["sequence"])
         except ValueError as e:
+            note_request_failure("invalid_dna_fasta")
             return jsonify({"status": "error", "error": str(e)}), 400
 
     # Apply the same submission-wide dedup/warning logic enqueue_job normally
@@ -2512,6 +2817,7 @@ def create_job():
     # preserves the observable params while ensuring RQ cannot run first.
     prepare_phylo_job_params(job_params)
     job_id = str(uuid.uuid4())
+    g.job_id = job_id
     job_record = Job(
         id=job_id,
         status="queued",
@@ -2620,12 +2926,27 @@ def prune_tree(job_id):
         return jsonify({"status": "error", "error": "No tips specified"}), 400
     
     try:
-        from app.services.tree_edit_service import load_tree_state, prune_taxa, save_tree_state, tree_state_lock
+        from app.services.tree_edit_service import (
+            _tree_tip_set, load_tree_state, prune_taxa, save_tree_state, tree_state_lock,
+        )
         with tree_state_lock(job_dir):
             state = load_tree_state(job_dir)
-            state = prune_taxa(job_dir, state, tip_names)
-            save_tree_state(job_dir, state)
-        return jsonify(state)
+            # Captured after load_tree_state(), which initializes (and midpoint
+            # roots) a job that has no state yet -- snapshotting before that
+            # would record a directory the viewer never showed anybody.
+            with undo_checkpoint(job_dir, "prune", "the last prune") as checkpoint:
+                before_tips = _tree_tip_set(state)
+                state = prune_taxa(job_dir, state, tip_names)
+                save_tree_state(job_dir, state)
+                removed = len(before_tips - _tree_tip_set(state))
+                # Only a prune that actually removed something is worth undoing;
+                # an already-applied duplicate would otherwise replace a real
+                # checkpoint with a no-op one.
+                if removed:
+                    checkpoint.commit(
+                        f"prune of {removed} sequence{'' if removed == 1 else 's'}"
+                    )
+        return jsonify(_with_undo_state(state, job_dir))
     except Exception as e:
         return _server_error(e)
 
@@ -2647,7 +2968,7 @@ def rename_tree_tip(job_id):
     try:
         from app.services.tree_edit_service import (
             load_tree_state,
-            rename_tip,
+            rename_tips,
             save_tree_state,
             tree_state_lock,
             validate_tip_rename,
@@ -2655,19 +2976,46 @@ def rename_tree_tip(job_id):
     except Exception as e:
         return _server_error(e)
 
+    # Alan 8/24/26 - The Rename modal renames the whole current selection, so it
+    # sends every change in one request. Renaming one tip per request wrote the
+    # state N times and, once Undo existed, left a checkpoint taken between the
+    # renames -- so undoing a "Rename 3 sequences" gave back exactly one of them.
+    # The single-pair form is unchanged and still accepted.
+    batch = data.get("renames")
+    pairs = []
     try:
-        old_name, new_name = validate_tip_rename(
-            data.get("old_name"), data.get("new_name")
-        )
+        if batch is not None:
+            if not isinstance(batch, dict) or not batch:
+                return jsonify({
+                    "status": "error",
+                    "error": "`renames` must be a non-empty object of old-name to new-name.",
+                }), 400
+            if len(batch) > 1000:
+                return jsonify({
+                    "status": "error",
+                    "error": "No more than 1000 tips can be renamed in one request.",
+                }), 400
+            for old_value, new_value in batch.items():
+                pairs.append(validate_tip_rename(old_value, new_value))
+        else:
+            pairs.append(validate_tip_rename(data.get("old_name"), data.get("new_name")))
     except ValueError as e:
         return jsonify({"status": "error", "error": str(e)}), 400
 
     try:
         with tree_state_lock(job_dir):
             state = load_tree_state(job_dir)
-            state = rename_tip(state, old_name, new_name)
-            save_tree_state(job_dir, state)
-        return jsonify(state)
+            label = "rename" if len(pairs) == 1 else f"rename of {len(pairs)} sequences"
+            with undo_checkpoint(job_dir, "rename", label) as checkpoint:
+                # One resolution pass for the whole batch: renaming the pairs in
+                # sequence let a later pair match a tip an earlier one had just
+                # renamed, so {A: B, B: C} came out with A named C.
+                state = rename_tips(state, pairs)
+                # One save for the whole batch: a partial write would leave the
+                # viewer showing some of the new names and none of the rest.
+                save_tree_state(job_dir, state)
+                checkpoint.commit()
+        return jsonify(_with_undo_state(state, job_dir))
     except Exception as e:
         return _server_error(e)
 
@@ -2762,6 +3110,9 @@ def refresh_tree_mycomap_records(job_id):
             changes = label_result["changes"]
             if changes:
                 save_tree_state(job_dir, label_result["tree_state"])
+                # Refreshed labels are not undoable; an older checkpoint would
+                # revert them along with whatever it does undo.
+                clear_undo_checkpoint(job_dir)
         return jsonify({
             "status": "success",
             "refreshed_count": len(references),
@@ -2775,6 +3126,66 @@ def refresh_tree_mycomap_records(job_id):
         return jsonify({"status": "error", "error": str(exc)}), 502
     except Exception as exc:
         return _server_error(exc, where="refresh_tree_mycomap_records")
+
+@bp.route('/job/<job_id>/tree/undo', methods=['GET'])
+def get_tree_undo_state(job_id):
+    """Report whether a persisted tree edit can be undone, and by this caller.
+
+    Deliberately readable by anyone who can view the job (the viewer asks on
+    every load, including for shared read-only links) but it separates "a
+    checkpoint exists" from "you may apply it", so a read-only viewer is never
+    shown an Undo button that promises a persisted edit it cannot make.
+    """
+    if not validate_job_id(job_id):
+        return jsonify({"status": "error", "error": "Invalid job ID format"}), 400
+
+    _, error_msg, status_code = check_job_access(job_id)
+    if error_msg:
+        return jsonify({"status": "error", "error": error_msg}), status_code
+
+    job_dir = Config.JOB_DIR / job_id
+    if not job_dir.exists():
+        return jsonify({"status": "error", "error": "Job not found"}), 404
+
+    _, edit_error, _ = check_job_access(job_id, mode="edit")
+    payload = dict(describe_undo_checkpoint(job_dir))
+    payload["can_undo"] = bool(payload.get("available")) and not edit_error
+    payload["status"] = "success"
+    return jsonify(payload)
+
+
+@bp.route('/job/<job_id>/tree/undo', methods=['POST'])
+def undo_tree_edit(job_id):
+    """Restore the single checkpoint taken before the last supported edit."""
+    if not validate_job_id(job_id):
+        return jsonify({"status": "error", "error": "Invalid job ID format"}), 400
+
+    _, error_msg, status_code = check_job_access(job_id, mode="edit")
+    if error_msg:
+        return jsonify({"status": "error", "error": error_msg}), status_code
+
+    job_dir = Config.JOB_DIR / job_id
+    if not job_dir.exists():
+        return jsonify({"status": "error", "error": "Job not found"}), 404
+
+    try:
+        from app.services.tree_edit_service import load_tree_state, tree_state_lock
+        with tree_state_lock(job_dir):
+            result = undo_last_edit(job_dir)
+            state = load_tree_state(job_dir)
+        payload = _with_undo_state(state, job_dir)
+        payload["undone"] = {
+            "operation": result["operation"],
+            "label": result["label"],
+        }
+        return jsonify(payload)
+    except UndoUnavailable as exc:
+        # 409, not 500: the state is simply not what the client believed. The
+        # viewer turns this back into a disabled Undo button.
+        return jsonify({"status": "error", "error": str(exc)}), 409
+    except Exception as e:
+        return _server_error(e)
+
 
 @bp.route('/job/<job_id>/tree/rotate', methods=['POST'])
 def rotate_tree_node(job_id):
@@ -2798,9 +3209,11 @@ def rotate_tree_node(job_id):
         from app.services.tree_edit_service import load_tree_state, rotate_node, save_tree_state, tree_state_lock
         with tree_state_lock(job_dir):
             state = load_tree_state(job_dir)
-            state = rotate_node(job_dir, state, node_id)
-            save_tree_state(job_dir, state)
-        return jsonify(state)
+            with undo_checkpoint(job_dir, "rotate", "node rotation") as checkpoint:
+                state = rotate_node(job_dir, state, node_id)
+                save_tree_state(job_dir, state)
+                checkpoint.commit()
+        return jsonify(_with_undo_state(state, job_dir))
     except ValueError as e:
         return jsonify({"status": "error", "error": str(e)}), 400
     except Exception as e:
@@ -2824,9 +3237,11 @@ def reroot_tree_endpoint(job_id):
         from app.services.tree_edit_service import load_tree_state, reroot_tree, save_tree_state, tree_state_lock
         with tree_state_lock(job_dir):
             state = load_tree_state(job_dir)
-            state = reroot_tree(job_dir, state, target)
-            save_tree_state(job_dir, state)
-        return jsonify(state)
+            with undo_checkpoint(job_dir, "reroot", "reroot") as checkpoint:
+                state = reroot_tree(job_dir, state, target)
+                save_tree_state(job_dir, state)
+                checkpoint.commit()
+        return jsonify(_with_undo_state(state, job_dir))
     except ValueError as e:
         return jsonify({"status": "error", "error": str(e)}), 400
     except Exception as e:
@@ -2844,9 +3259,11 @@ def midpoint_root_endpoint(job_id):
         from app.services.tree_edit_service import load_tree_state, midpoint_root, save_tree_state, tree_state_lock
         with tree_state_lock(job_dir):
             state = load_tree_state(job_dir)
-            state = midpoint_root(job_dir, state)
-            save_tree_state(job_dir, state)
-        return jsonify(state)
+            with undo_checkpoint(job_dir, "reroot", "midpoint rooting") as checkpoint:
+                state = midpoint_root(job_dir, state)
+                save_tree_state(job_dir, state)
+                checkpoint.commit()
+        return jsonify(_with_undo_state(state, job_dir))
     except ValueError as e:
         return jsonify({"status": "error", "error": str(e)}), 400
     except Exception as e:
@@ -2869,16 +3286,23 @@ def midpoint_root_toggle_endpoint(job_id):
         with tree_state_lock(job_dir):
             state = load_tree_state(job_dir)
 
-            # Check current state and toggle
-            if state.get("is_midpoint_rooted", False):
-                # Currently midpoint rooted - undo it
-                state = undo_midpoint_root(job_dir, state)
-            else:
-                # Not midpoint rooted - apply it
-                state = midpoint_root(job_dir, state)
+            # The midpoint toggle is its own inverse, but it still gets a
+            # checkpoint so the generic Undo button describes the same action
+            # the user just performed instead of skipping back past it.
+            with undo_checkpoint(job_dir, "reroot", "rooting change") as checkpoint:
+                # Check current state and toggle
+                if state.get("is_midpoint_rooted", False):
+                    # Currently midpoint rooted - undo it
+                    state = undo_midpoint_root(job_dir, state)
+                    label = "turning midpoint rooting off"
+                else:
+                    # Not midpoint rooted - apply it
+                    state = midpoint_root(job_dir, state)
+                    label = "midpoint rooting"
 
-            save_tree_state(job_dir, state)
-        return jsonify(state)
+                save_tree_state(job_dir, state)
+                checkpoint.commit(label)
+        return jsonify(_with_undo_state(state, job_dir))
     except ValueError as e:
         return jsonify({"status": "error", "error": str(e)}), 400
     except Exception as e:
@@ -2919,12 +3343,14 @@ def set_rooting_mode_endpoint(job_id):
         )
         with tree_state_lock(job_dir):
             state = load_tree_state(job_dir)
-            if soi:
-                state = set_sequence_of_interest(state, soi, source="user_selected")
-            state = apply_rooting_mode(job_dir, state, mode, target=target,
-                                       sequence_of_interest=soi)
-            save_tree_state(job_dir, state)
-        return jsonify(state)
+            with undo_checkpoint(job_dir, "reroot", "rooting change") as checkpoint:
+                if soi:
+                    state = set_sequence_of_interest(state, soi, source="user_selected")
+                state = apply_rooting_mode(job_dir, state, mode, target=target,
+                                           sequence_of_interest=soi)
+                save_tree_state(job_dir, state)
+                checkpoint.commit()
+        return jsonify(_with_undo_state(state, job_dir))
     except ValueError as e:
         return jsonify({"status": "error", "error": str(e)}), 400
     except Exception as e:
@@ -2954,6 +3380,10 @@ def set_sequence_of_interest_endpoint(job_id):
             state = load_tree_state(job_dir)
             state = set_sequence_of_interest(state, tip_name, source=source)
             save_tree_state(job_dir, state)
+            # Not undoable, and undo restores the WHOLE tree state, so leaving a
+            # checkpoint here would let a later Undo silently discard the focal
+            # tip the user just picked.
+            clear_undo_checkpoint(job_dir)
         return jsonify({
             "status": "ok",
             "sequence_of_interest": state.get("sequence_of_interest"),
@@ -3049,6 +3479,10 @@ def save_clade_annotations(job_id):
 
             apply_annotation_config(state, config)
             save_tree_state(job_dir, state)
+            # Annotations are deliberate authoring work and are not undoable.
+            # An undo checkpoint older than this save would roll them back with
+            # the edit it does undo, so drop it rather than offer that.
+            clear_undo_checkpoint(job_dir)
         return jsonify({
             "status": "ok",
             "layers": config[ANNOTATION_LAYERS_KEY],
@@ -3209,16 +3643,32 @@ def rebuild_with_duplicates(job_id):
         try:
             enqueue_job(job_params, job_id=new_job_id, prepare=False)
         except Exception as exc:
-            new_record.status = "failed"
-            failed_metrics = dict(new_record.metrics or {})
-            failed_metrics["error"] = (
-                "This rebuild could not be added to the processing queue and "
-                "was never started. Please try again."
+            logger.exception(
+                "event=web.rebuild_enqueue_failed job=%s could not be queued "
+                "after its DB row was committed", new_job_id,
             )
-            failed_metrics["enqueue_error"] = type(exc).__name__
-            failed_metrics["failed_at"] = datetime.utcnow().isoformat()
-            new_record.metrics = failed_metrics
-            db.session.commit()
+            # Recording the failure must not itself be able to break the error
+            # path: an exception from this commit left the session in a
+            # rollback-required state, so the outer handler's own database work
+            # raised PendingRollbackError and the user got that instead of the
+            # real enqueue failure.
+            try:
+                new_record.status = "failed"
+                failed_metrics = dict(new_record.metrics or {})
+                failed_metrics["error"] = (
+                    "This rebuild could not be added to the processing queue and "
+                    "was never started. Please try again."
+                )
+                failed_metrics["enqueue_error"] = type(exc).__name__
+                failed_metrics["failed_at"] = datetime.utcnow().isoformat()
+                new_record.metrics = failed_metrics
+                db.session.commit()
+            except Exception:
+                db.session.rollback()
+                logger.exception(
+                    "event=web.rebuild_enqueue_failure_unrecorded job=%s",
+                    new_job_id,
+                )
             raise
 
         return jsonify({
@@ -3338,10 +3788,23 @@ def recompute_tree_job(job_id):
                     "error": f"Unsupported tree method. Choose one of: {', '.join(sorted(VALID_TREE_METHODS))}"
                 }), 400
             params_dict.update(overrides)
+        # A value the caller actually supplied -- or an IQ-TREE configuration
+        # the caller is newly requesting by overriding tree_method -- obeys the
+        # current rule. A count merely inherited from a job that predates that
+        # rule is lifted to the supported minimum instead, so an old job stays
+        # recomputable rather than 400ing on a field nobody touched.
+        caller_chose_bootstrap = (
+            "bootstrap" in overrides or "tree_method" in overrides
+        )
         try:
-            params_dict["bootstrap"] = validate_iqtree_ufboot_count(
-                params_dict.get("tree_method"), params_dict.get("bootstrap", 1000)
-            )
+            if caller_chose_bootstrap:
+                params_dict["bootstrap"] = validate_iqtree_ufboot_count(
+                    params_dict.get("tree_method"), params_dict.get("bootstrap", 1000)
+                )
+            else:
+                params_dict["bootstrap"] = normalize_inherited_iqtree_ufboot_count(
+                    params_dict.get("tree_method"), params_dict.get("bootstrap", 1000)
+                )
         except ValueError as exc:
             return jsonify({"status": "error", "error": str(exc)}), 400
         persisted_params = dict(params_dict)
@@ -3394,6 +3857,10 @@ def recompute_tree_job(job_id):
                 "redirect_url": url_for('main.job_status', job_id=job_id),
             }), 409
         if created:
+            # Recompute is not undoable, and it replaces the topology outright:
+            # a checkpoint taken against the previous tree would restore a state
+            # that no longer describes what the user is looking at.
+            clear_undo_checkpoint(job_dir)
             # Only the request that actually created this run may update its
             # reported settings. A duplicate request cannot alter the params
             # already captured by the active RQ task.
@@ -3494,18 +3961,169 @@ def download_nexus(job_id):
     if error_msg:
         return jsonify({"status": "error", "error": error_msg}), status_code
 
+    from io import BytesIO
+
+    from app.services.tree_io import build_nexus_download
+
+    if not validate_job_id(job_id):
+        return jsonify({"status": "error", "error": "Invalid job id"}), 400
+
     job_dir = Config.JOB_DIR / job_id
-        
-    pruned_path = job_dir / "tree" / "tree_pruned.nexus"
-    original_path = job_dir / "tree" / "tree_original.nexus"
-    
-    path = pruned_path if pruned_path.exists() else original_path
-    if not validate_safe_file_path(path, job_dir):
+    # Rebuilt from the Newick whenever the stored NEXUS is stale or was written
+    # by Biopython's writer, which mangles any label containing a space or a
+    # parenthesis -- see build_nexus_download().
+    built = build_nexus_download(job_dir)
+    if built is None:
         return jsonify({"status": "error", "error": "Tree file not found or invalid"}), 404
-        
-    response = send_file(path, as_attachment=True, download_name="tree.nexus")
+
+    content, source = built
+    logger.info("Serving NEXUS for job %s from %s", job_id, source)
+    response = send_file(
+        BytesIO(content),
+        as_attachment=True,
+        download_name="tree.nexus",
+        mimetype="text/plain",
+    )
     response.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
     return response
+
+
+def _mrbayes_name_map_text(job_dir):
+    """The SEQnnnnnn -> real name key for a job's MrBayes files, or None.
+
+    Every taxon in a MrBayes run is a SEQnnnnnn id, because a NEXUS matrix
+    label is whitespace-delimited and MrBayes rejects most punctuation on top
+    of that. Unlike the Newick and NEXUS tree files, where quoting carries the
+    real label through, this one is a restriction of the format that cannot be
+    worked around -- so the download ships the key instead of leaving the user
+    with anonymous numbers.
+
+    Newer runs write the map beside themselves. Older ones are reconstructed
+    from the alignment the run consumed: sanitize_fasta_headers() numbers
+    records by position, so reading the same file back in order reproduces it.
+    On a recomputed job that alignment is the recompute's own pruned,
+    realigned set -- reading the original alignment there would shift every id
+    after the first pruned sequence.
+
+    A stored map is served only when it AGREES with that alignment, row for
+    row. A map left behind by an earlier generation is not made current by
+    holding the right number of rows: a recompute that drops one sequence and
+    adds another leaves the count unchanged while every id after the drop now
+    stands for a different sequence.
+    """
+    from app.services.fasta_utils import (
+        NAME_MAP_FILENAME as _map_name,
+        format_name_map,
+    )
+
+    declared = _nexus_declared_ntax(job_dir / "tree" / "mrbayes_input.nex")
+    reconstructed, confirmed = _reconstructed_mrbayes_name_map(job_dir, declared)
+
+    stored_text = None
+    stored = job_dir / "tree" / _map_name
+    if validate_safe_file_path(stored, job_dir):
+        try:
+            stored_text = stored.read_text(encoding="utf-8")
+        except OSError:
+            logger.warning("Could not read the stored MrBayes name map at %s", stored)
+
+    if stored_text is not None:
+        rows = _parse_name_map(stored_text)
+        if confirmed:
+            # The alignment is the ground truth here: it is the file this
+            # generation of the run was sanitized from, and it is selected by
+            # the same rules that decide which alignment built the current tree.
+            if rows == _parse_name_map(format_name_map(reconstructed)):
+                return stored_text
+            logger.warning(
+                "Ignoring the stored MrBayes name map for %s: it does not "
+                "describe the alignment this run was built from", job_dir.name,
+            )
+        elif declared is None or len(rows) == declared:
+            # Nothing to check it against -- the alignments are gone, or none
+            # of them holds the run's taxon count. The map is then the best
+            # evidence available.
+            return stored_text
+        else:
+            logger.warning(
+                "Ignoring the stored MrBayes name map for %s: it describes %d "
+                "taxa but the run declares %d", job_dir.name, len(rows), declared,
+            )
+
+    return format_name_map(reconstructed) if reconstructed else None
+
+
+def _reconstructed_mrbayes_name_map(job_dir, declared):
+    """Rebuild the key from the alignment this generation of the run consumed.
+
+    Returns ``(mapping, confirmed)``. `confirmed` means the alignment holds
+    exactly the number of taxa the run declares, which is what licenses using
+    it to overrule a stored map.
+    """
+    from app.services.artifact_storage import artifact_exists
+    from app.services.fasta_utils import reconstruct_name_map
+
+    # A recompute rebuilds the tree from its own realigned, pruned alignment,
+    # and that is the file its MrBayes run was sanitized from -- the original
+    # alignment would renumber every sequence after the first pruned one.
+    tree_dir = job_dir / "tree"
+    recomputed = artifact_exists(tree_dir / "tree_pruned.newick") and artifact_exists(
+        tree_dir / "tree_pruned_metadata.json"
+    )
+    candidates = []
+    if recomputed:
+        # recompute_tree() always builds from alignment_pruned_trimmed.fasta;
+        # with trimming off the trim step still copies the realigned set into
+        # it, so the aligned file is only a fallback.
+        candidates += [
+            job_dir / "alignment" / "alignment_pruned_trimmed.fasta",
+            job_dir / "alignment" / "alignment_pruned_aligned.fasta",
+        ]
+    candidates += [
+        job_dir / "alignment" / "alignment_trimmed.fasta",
+        job_dir / "alignment" / "alignment_raw.fasta",
+    ]
+
+    fallback = None
+    for path in candidates:
+        if not artifact_exists(path):
+            continue
+        try:
+            mapping = reconstruct_name_map(path)
+        except Exception:
+            logger.warning("Could not reconstruct a MrBayes name map from %s", path)
+            continue
+        if not mapping:
+            continue
+        if declared is not None and len(mapping) == declared:
+            return mapping, True
+        if fallback is None:
+            fallback = mapping
+
+    return fallback, False
+
+
+def _parse_name_map(text):
+    """A stored name map's ``id -> name`` rows, ignoring its comment header."""
+    rows = {}
+    for line in text.splitlines():
+        if not line.strip() or line.lstrip().startswith("#"):
+            continue
+        safe_id, _, original = line.partition("\t")
+        rows[safe_id.strip()] = original.strip()
+    return rows
+
+
+def _nexus_declared_ntax(path):
+    """NTAX from a NEXUS DIMENSIONS line, or None if it cannot be read."""
+    if not path.is_file():
+        return None
+    try:
+        head = path.read_text(errors="replace")[:4000]
+    except OSError:
+        return None
+    match = re.search(r"ntax\s*=\s*(\d+)", head, re.IGNORECASE)
+    return int(match.group(1)) if match else None
 
 
 @bp.route('/job/<job_id>/download/mrbayes', methods=['GET'])
@@ -3517,6 +4135,8 @@ def download_mrbayes_files(job_id):
 
     from io import BytesIO
     from zipfile import ZIP_DEFLATED, ZipFile
+
+    from app.services.fasta_utils import NAME_MAP_FILENAME
 
     job_dir = Config.JOB_DIR / job_id
     tree_dir = job_dir / "tree"
@@ -3536,6 +4156,9 @@ def download_mrbayes_files(job_id):
     with ZipFile(archive, "w", compression=ZIP_DEFLATED) as zip_file:
         for path in files:
             zip_file.write(path, arcname=path.name)
+        name_map = _mrbayes_name_map_text(job_dir)
+        if name_map:
+            zip_file.writestr(NAME_MAP_FILENAME, name_map)
     archive.seek(0)
 
     response = send_file(
@@ -3546,6 +4169,36 @@ def download_mrbayes_files(job_id):
     )
     response.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
     return response
+
+@bp.route('/job/<job_id>/downloads/available', methods=['GET'])
+def available_job_downloads(job_id):
+    """Cheap availability check; never read or decompress large downloads."""
+    _, error_msg, status_code = check_job_access(job_id)
+    if error_msg:
+        return jsonify({"error": error_msg}), status_code
+    job_dir = Config.JOB_DIR / job_id
+
+    def exists(relative):
+        stored = resolve_artifact(job_dir / relative)
+        return stored is not None and validate_safe_file_path(stored, job_dir)
+
+    available = {
+        "dl-original": exists("input/input_raw.fasta"),
+        "dl-aligned": exists("alignment/alignment_raw.fasta") or exists("alignment/aligned.fasta"),
+        "dl-trimmed": exists("alignment/alignment_trimmed.fasta"),
+        "dl-pipeline-log": exists("logs/pipeline.log"),
+        "dl-alignment-log": exists("logs/alignment.log"),
+        "dl-tree-log": exists("logs/tree_builder.log"),
+        "dl-mrbayes": exists("tree/mrbayes_input.nex"),
+    }
+    available["dl-alignment-inspection"] = (
+        available["dl-aligned"] and available["dl-trimmed"]
+        and exists("alignment/alignment_trimmed_report.html")
+    )
+    response = jsonify(available)
+    response.headers["Cache-Control"] = "no-store"
+    return response
+
 
 @bp.route('/job/<job_id>/download/fasta/original', methods=['GET'])
 def download_fasta_original(job_id):
@@ -3762,6 +4415,7 @@ def alignment_view(job_id):
             by_token.setdefault(first_token, []).append(row)
 
     rename_aliases = {}
+    active_renames = {}
     try:
         from app.services.tree_edit_service import load_tree_state
         renames = load_tree_state(job_dir).get("renames") or {}
@@ -3772,6 +4426,7 @@ def alignment_view(job_id):
                 display_name = display_name.strip()
                 if not display_name:
                     continue
+                active_renames[original_name] = display_name
                 existing = rename_aliases.get(display_name)
                 rename_aliases[display_name] = (
                     original_name if existing in (None, original_name) else False
@@ -3812,6 +4467,20 @@ def alignment_view(job_id):
             if row is not None:
                 return row
         return match_alignment_token(name)
+
+    # Alan 8/27/26 - A tip renamed in the viewer still carries its original header in the
+    # alignment file, so display the viewer's label for that row instead of the stale one.
+    display_names = {}
+    for original_name, display_name in active_renames.items():
+        row = match_alignment_name(original_name)
+        if row is not None:
+            display_names[id(row)] = display_name
+
+    def as_response_row(row):
+        display = display_names.get(id(row))
+        if display and display != row["name"]:
+            return {"name": display, "sequence": row["sequence"]}
+        return row
 
     warnings = []
     alignment_length = max((len(r["sequence"]) for r in fasta_rows), default=0)
@@ -3917,7 +4586,7 @@ def alignment_view(job_id):
         "alignment_length": alignment_length,
         "included_pruned_count": included_pruned_count,
         "available_pruned_count": available_pruned_count,
-        "sequences": selected_rows,
+        "sequences": [as_response_row(r) for r in selected_rows],
         "warnings": warnings,
     })
 
@@ -4408,6 +5077,7 @@ def job_events_stream(job_id):
             # Throttle timers (use monotonic clock for reliable intervals)
             last_ping = stream_started
             last_db_poll = 0.0  # Start at 0 to trigger immediate first poll
+            last_registry_touch = stream_started
 
             # Tunable interval for DB polling (seconds)
             DB_POLL_INTERVAL = 1.0
@@ -4485,7 +5155,15 @@ def job_events_stream(job_id):
                         pass
                 
                 now = time.monotonic()
-                
+
+                # Renew this stream's registry lease. Kept on its own timer and
+                # ahead of the ping yield: the census must stay accurate even
+                # for a stream whose client has stopped reading, which is
+                # precisely the kind that strands a worker thread.
+                if now - last_registry_touch >= sse_registry.RENEW_INTERVAL_SECONDS:
+                    last_registry_touch = now
+                    sse_registry.touch_stream(registry_conn, stream_token)
+
                 # Send keepalive ping every 15 seconds
                 if now - last_ping >= 15:
                     yield "event: ping\ndata: {}\n\n"
@@ -4627,6 +5305,17 @@ def download_log(job_id, log_name):
         download_name=f"{job_id}_{log_files[log_name]}"
     )
 
+@bp.get('/log/client/csrf')
+@limiter.limit("10 per minute")
+def client_log_csrf():
+    """Refresh this browser session's token after a rejected telemetry POST."""
+    from flask_wtf.csrf import generate_csrf
+    response = jsonify(csrf_token=generate_csrf())
+    response.headers['Cache-Control'] = 'no-store'
+    response.headers['Vary'] = 'Cookie'
+    return response
+
+
 @bp.route('/log/client', methods=['POST'])
 @limiter.limit("30 per minute; 500 per day")
 def log_client_error():
@@ -4639,6 +5328,8 @@ def log_client_error():
         return jsonify({"status": "ignored", "error": "payload too large"}), 413
 
     data = request.get_json(silent=True) or {}
+    if not isinstance(data, dict):
+        return jsonify({"status": "ignored"}), 200
     allowed_events = {
         "window_error", "unhandled_rejection", "resource_load_failed",
         "api_non_2xx", "ui_action_failed",
@@ -4663,17 +5354,40 @@ def log_client_error():
     if job_id and not validate_job_id(job_id):
         job_id = ""
     stack = sanitize_telemetry_text(data.get("stack"), 2000)
-    supplied_fingerprint = _client_log_value(data.get("fingerprint"), 80)
-    fingerprint = supplied_fingerprint or hashlib.sha256(
+    server_request_id = data.get("server_request_id")
+    if not isinstance(server_request_id, str) or not re.fullmatch(r"[0-9a-f]{12}", server_request_id):
+        server_request_id = "-"
+
+    def bounded_integer(key, maximum):
+        value = data.get(key)
+        return value if type(value) is int and 0 <= value <= maximum else "-"
+
+    http_status = bounded_integer("http_status", 599)
+    method = data.get("method")
+    if not isinstance(method, str) or method not in {"GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"}:
+        method = "-"
+    online = data.get("online")
+    online = str(online).lower() if type(online) is bool else "unknown"
+    visibility = data.get("visibility")
+    if not isinstance(visibility, str) or visibility not in {"visible", "hidden", "prerender"}:
+        visibility = "unknown"
+    client_release = sanitize_telemetry_text(data.get("release"), 80) or "unknown"
+    # Compute grouping on the server: a supplied fingerprint must not suppress
+    # someone else's error. Distinct users and failing requests stay visible.
+    fingerprint = hashlib.sha256(
         f"{event}|{pathname}|{action}|{message}|{stack[:300]}".encode()
     ).hexdigest()[:16]
+    identity = f"user:{current_user.id}" if current_user.is_authenticated else f"anon:{request.remote_addr}"
+    dedup_key = hashlib.sha256(
+        f"{identity}|{fingerprint}|{server_request_id}|{client_release}".encode()
+    ).hexdigest()
 
     # Cross-process short-window dedup. Telemetry remains fail-open if Redis is
     # unavailable; the endpoint's existing rate limit and size bounds still apply.
     try:
         from app.workers.queue import get_redis_connection
         if not get_redis_connection().set(
-            f"client-telemetry:{fingerprint}", "1", nx=True, ex=120
+            f"client-telemetry:{dedup_key}", "1", nx=True, ex=120
         ):
             return jsonify({"status": "duplicate"}), 200
     except Exception:
@@ -4681,9 +5395,13 @@ def log_client_error():
 
     current_app.logger.error(
         "event=client.%s Browser failure pathname=%s job_id=%s action=%s "
-        "message=%s fingerprint=%s release=%s browser=%s stack=%s",
+        "message=%s fingerprint=%s release=%s client_release=%s "
+        "server_request_id=%s method=%s http_status=%s duration_ms=%s "
+        "online=%s visibility=%s browser=%s stack=%s",
         event, pathname, job_id or "-", action or "-", message, fingerprint,
         current_app.config.get("RELEASE_VERSION", "unknown"),
+        client_release, server_request_id, method, http_status,
+        bounded_integer("duration_ms", 3_600_000), online, visibility,
         sanitize_telemetry_text(request.headers.get("User-Agent"), 200), stack or "-",
     )
     return jsonify({"status": "logged"}), 200
@@ -4780,26 +5498,53 @@ def add_sequences_to_job(job_id):
         if replace_existing:
             used_ids = set()
             seen_records = set()
+            seen_by_id = {}
+            exact_headers = {}
+            duplicate_records = []
             added_count = 0
+            duplicate_count = 0
             output_records = []
 
             for seq in sequences_to_add:
+                record_id, record_sequence = _record_identity(seq)
                 exact_key = _sequence_exact_key(seq)
                 if exact_key in seen_records:
+                    duplicate_count += 1
+                    duplicate_records.append(_describe_skipped_duplicate(
+                        seq, exact_headers.get(exact_key), 'exact_duplicate'))
+                    continue
+                matched = _find_duplicate_record(record_id, record_sequence, seen_by_id)
+                if matched:
+                    duplicate_count += 1
+                    duplicate_records.append(_describe_skipped_duplicate(
+                        seq, matched, 'same_record_refetched'))
                     continue
                 seen_records.add(exact_key)
+                exact_headers[exact_key] = {
+                    "header": str(seq.get('name') or ''),
+                    "identifier": record_id,
+                    "sequence": record_sequence,
+                }
+                seen_by_id.setdefault(record_id, []).append(exact_headers[exact_key])
                 output_records.append(_format_fasta_record_for_job(seq, used_ids, added_count + 1))
                 added_count += 1
 
             input_path.write_text("\n".join(record.rstrip() for record in output_records) + "\n")
+            _merge_queue_duplicate_details(job_dir, duplicate_records)
 
             message = f"Saved {added_count} queued sequence{'s' if added_count != 1 else ''}."
+            if duplicate_count:
+                message += (
+                    f" {duplicate_count} duplicate"
+                    f"{'s' if duplicate_count != 1 else ''} skipped."
+                )
             if skipped:
                 message += f" {len(skipped)} accession{'s' if len(skipped) != 1 else ''} skipped."
 
             return jsonify({
                 "status": "success",
                 "count": added_count,
+                "duplicates": duplicate_count,
                 "skipped": skipped,
                 "mode": "replace",
                 "message": message
@@ -4808,6 +5553,9 @@ def add_sequences_to_job(job_id):
         # Read existing IDs to check for duplicates
         existing_ids = set()
         existing_records = set()
+        existing_by_id = {}
+        exact_headers = {}
+        duplicate_records = []
         if input_path.exists():
             try:
                 existing_seqs = _parse_fasta_sequences(input_path.read_text())
@@ -4815,32 +5563,71 @@ def add_sequences_to_job(job_id):
                     sid, _ = _split_fasta_header(s['name'])
                     if sid:
                         existing_ids.add(sid)
-                    existing_records.add(_sequence_exact_key(s))
+                    exact_key = _sequence_exact_key(s)
+                    existing_records.add(exact_key)
+                    # An already-stored record may itself carry an _added suffix
+                    # from before this check existed; index it under the base
+                    # accession so a third pull of the same record still matches.
+                    record_id, record_sequence = _record_identity(s)
+                    base_id = record_id.split('_ADDED')[0] if '_ADDED' in record_id else record_id
+                    entry = {
+                        "header": str(s.get('name') or ''),
+                        "identifier": base_id,
+                        "sequence": record_sequence,
+                    }
+                    existing_by_id.setdefault(base_id, []).append(entry)
+                    exact_headers[exact_key] = entry
             except Exception as e:
                 logger.warning(f"Failed to parse existing FASTA for deduplication: {e}")
                 pass # Continue anyway - will allow duplicates but won't crash
-            
+
         added_count = 0
+        duplicate_count = 0
         with open(input_path, "a") as f:
             # Ensure newline at end of file before appending
             if input_path.stat().st_size > 0:
                 f.write("\n")
-                 
+
             for seq in sequences_to_add:
                 exact_key = _sequence_exact_key(seq)
                 if exact_key in existing_records:
+                    duplicate_count += 1
+                    duplicate_records.append(_describe_skipped_duplicate(
+                        seq, exact_headers.get(exact_key), 'exact_duplicate'))
+                    continue
+                record_id, record_sequence = _record_identity(seq)
+                matched = _find_duplicate_record(record_id, record_sequence, existing_by_id)
+                if matched:
+                    duplicate_count += 1
+                    duplicate_records.append(_describe_skipped_duplicate(
+                        seq, matched, 'same_record_refetched'))
                     continue
                 f.write(_format_fasta_record_for_job(seq, existing_ids, added_count + 1))
                 existing_records.add(exact_key)
+                entry = {
+                    "header": str(seq.get('name') or ''),
+                    "identifier": record_id,
+                    "sequence": record_sequence,
+                }
+                existing_by_id.setdefault(record_id, []).append(entry)
+                exact_headers[exact_key] = entry
                 added_count += 1
-                    
+
+        _merge_queue_duplicate_details(job_dir, duplicate_records)
+
         message = f"Added {added_count} sequences."
+        if duplicate_count:
+            message += (
+                f" {duplicate_count} duplicate"
+                f"{'s' if duplicate_count != 1 else ''} already present."
+            )
         if skipped:
             message += f" {len(skipped)} accession{'s' if len(skipped) != 1 else ''} skipped."
 
         return jsonify({
-            "status": "success", 
+            "status": "success",
             "count": added_count,
+            "duplicates": duplicate_count,
             "skipped": skipped,
             "message": message
         })

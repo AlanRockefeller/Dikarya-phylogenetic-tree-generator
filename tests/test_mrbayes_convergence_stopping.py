@@ -401,9 +401,19 @@ def test_worker_treats_a_missing_setting_as_the_old_behaviour():
 def test_openapi_documents_the_new_default_and_semantics():
     from app.api_v1.openapi import _schemas
 
+    from app.config import Config
+
     create = _schemas()["CreateJobRequest"]["properties"]
-    assert create["mcmc_generations"]["default"] == 1_000_000
-    assert "maximum" in create["mcmc_generations"]["description"]
+    generations = create["mcmc_generations"]
+    # No unconditional schema default: which value an omitted mcmc_generations
+    # takes depends on mcmc_stop_early and mcmc_nruns, so advertising one number
+    # told callers the server would use a count it often does not. Both are
+    # named in the description instead, as RecomputeRequest already did.
+    assert "default" not in generations
+    assert "maximum" in generations["description"]
+    assert str(Config.DEFAULT_MCMC_GENERATIONS) in generations["description"]
+    assert str(Config.DEFAULT_MCMC_GENERATIONS_FIXED_RUN) in generations["description"]
+    assert "mcmc_nruns 1" in generations["description"]
 
     stop_early = create["mcmc_stop_early"]
     assert stop_early["type"] == "boolean"

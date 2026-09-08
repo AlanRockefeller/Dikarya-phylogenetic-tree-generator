@@ -1,0 +1,115 @@
+# Dikarya bulk worker -- the slow lane.
+#
+# Serves phylo_bulk only, so RAxML, MrBayes and large IQ-TREE runs cannot block
+# the 38-second FastTree jobs that make up most of the site's traffic. Routing
+# is decided by classify_queue_for_params() in app/workers/queue.py.
+#
+# Derived from dikarya-worker.service (User/Group/WorkingDirectory/
+# EnvironmentFile/Restart match it exactly). The differences are the --queues
+# argument and the scheduling priority below.
+#
+# Install as root:
+#   cp scripts/dikarya-worker-bulk.service \
+#      /etc/systemd/system/dikarya-worker-bulk.service
+#
+#   # Reuse the existing worker's drop-ins -- umask, logging, hardening. These
+#   # are NOT inherited; a new unit gets none of them.
+#   mkdir -p /etc/systemd/system/dikarya-worker-bulk.service.d
+#   cp scripts/dikarya-umask.conf \
+#      /etc/systemd/system/dikarya-worker-bulk.service.d/umask.conf
+#   cp /etc/systemd/system/dikarya-worker.service.d/hardening.conf \
+#      /etc/systemd/system/dikarya-worker-bulk.service.d/hardening.conf
+#
+#   # Memory ceiling. Must come after hardening.conf, which would otherwise
+#   # impose the single-worker 8G/10G -- see the file for why.
+#   cp scripts/dikarya-worker-bulk-memory.conf \
+#      /etc/systemd/system/dikarya-worker-bulk.service.d/zz-memory.conf
+#
+#   # Its own log file, dikarya-owned so the in-process logrotate can truncate
+#   # it (see app/services/log_rotation.py and ops/logrotate/dikarya).
+#   install -o dikarya -g dikarya -m 0664 /dev/null \
+#      /var/www/dikarya/var/logs/worker-bulk.log
+#
+#   systemctl daemon-reload
+#   systemctl enable --now dikarya-worker-bulk
+#
+# Verify:
+#   grep "Worker serving queue" /var/www/dikarya/var/logs/worker-bulk.log
+#   systemctl show dikarya-worker-bulk -p Nice -p CPUWeight
+#
+# Restart safety: this worker runs the LONG jobs, so a restart is the expensive
+# one. Check before restarting it:
+#   redis-cli ZCARD rq:wip:phylo_bulk     # must print 0
+
+[Unit]
+Description=Dikarya bulk phylogenetics worker (slow lane)
+After=network.target redis-server.service
+Wants=redis-server.service
+
+[Service]
+Type=simple
+User=dikarya
+Group=dikarya
+WorkingDirectory=/var/www/dikarya
+EnvironmentFile=/etc/dikarya/dikarya.environment.live
+ExecStart=/var/www/dikarya/.venv/bin/flask run-worker --queues phylo_bulk
+Restart=always
+RestartSec=5
+KillSignal=SIGTERM
+
+StandardOutput=append:/var/www/dikarya/var/logs/worker-bulk.log
+StandardError=append:/var/www/dikarya/var/logs/worker-bulk.log
+
+# --- Scheduling priority -----------------------------------------------
+# The point of all three settings below: a bulk job should run at FULL SPEED
+# on an idle box and yield only when interactive work actually arrives. None
+# of them impose a cap -- they are all purely relative, and take effect only
+# under contention. With the worker idle 95% of the time (measured: 5.3% duty
+# cycle over 14 days), the common case is a bulk job with the machine to
+# itself, running exactly as fast as it would have before.
+#
+# Nice is inherited across fork() and exec(), so the RQ work horse and the
+# MAFFT/RAxML/IQ-TREE children it spawns all run at this priority. That
+# inheritance is what makes this work at all -- the Python worker process
+# itself uses almost no CPU; the tools it spawns are the entire load.
+Nice=10
+
+# CPUWeight is the cgroup-v2 equivalent and is the more precise control: it
+# applies to the unit's whole process tree as a single aggregate share, so a
+# bulk job with N threads cannot out-schedule the interactive worker simply by
+# having more runnable threads than it -- which is exactly the hole plain nice
+# leaves. Default is 100; 20 gives phylo_high roughly a 5:1 share when both are
+# busy. Requires the cpu controller on the service slice; without it this line
+# is inert and Nice alone still applies.
+CPUWeight=20
+
+# MAFFT is I/O-heavy on large inputs and can starve the interactive worker at
+# the disk before it ever contends for CPU.
+IOWeight=50
+
+# --- Threads -----------------------------------------------------------
+# One thread, so the two workers together request 3 threads on 2 cores rather
+# than 4. Read by worker_thread_budget() in app/services/alignment_service.py,
+# which applies it to alignment and tree building alike.
+Environment=DIKARYA_WORKER_THREADS=1
+
+# Silence the OpenMP runtime's OMPT tool probe. IQ-TREE is built against LLVM
+# OpenMP, which dlopen()s libarcher.so (the data-race detector) at startup and
+# prints the failure to stderr when it is not installed -- landing a bogus
+# "cannot open shared object file" line in tree_builder.log directly beneath a
+# successful "Exit code: 0". Nothing loads the tool and nothing wants it.
+Environment=OMP_TOOL=disabled
+
+# --- Memory ------------------------------------------------------------
+# Deliberately NOT set here. hardening.conf, copied from dikarya-worker and
+# sized for a single worker at 8G/10G, is a drop-in and therefore applies
+# after this file -- it overrode the 4G/5G that used to live on these lines.
+# The real ceiling is in scripts/dikarya-worker-bulk-memory.conf, installed as
+# zz-memory.conf so it sorts last. See that file for the sizing argument.
+#
+# TasksMax stays here because hardening.conf does not set it (verified: the
+# unit reports 256).
+TasksMax=256
+
+[Install]
+WantedBy=multi-user.target

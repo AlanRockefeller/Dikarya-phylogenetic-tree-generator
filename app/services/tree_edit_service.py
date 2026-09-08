@@ -14,6 +14,7 @@ from typing import Dict, Any, List, Optional, Set, Tuple
 from app.config import Config
 from app.models import JobParams, AlignmentParams, TrimmingParams, TreeBuilderParams
 from app.services.artifact_storage import (
+    default_file_mode,
     discard_artifact,
     discard_gzipped_form,
     gz_path,
@@ -36,10 +37,10 @@ _tree_state_lock_context = threading.local()
 MAX_SEQUENCE_OF_INTEREST_LENGTH = 1000
 MAX_SEQUENCE_OF_INTEREST_SOURCE_LENGTH = 64
 MAX_TREE_TIP_NAME_LENGTH = 256
-# Structural Newick punctuation, rejected in *new* tip names so a rename cannot
-# produce a tree file no parser will read.
+# Characters a *new* tip name may never contain, because no download this site
+# produces can carry them.
 #
-# Alan 8/24/26 - Quote characters used to be in here too, which rejected the
+# Alan 8/24/26 - Quote characters used to be in here, which rejected the
 # apostrophes that provisional fungal names are full of ("Cortinarius sp.
 # 'olivaceofuscus'"). Nothing downstream needed that ban: renames live in
 # tree_state.json and are applied client-side by applyRenames() in
@@ -47,9 +48,31 @@ MAX_TREE_TIP_NAME_LENGTH = 256
 # becomes Newick syntax at all -- the tree files on disk carry the original
 # names. Even on the paths that do write a label, quote_tree_label() wraps
 # anything non-alphanumeric in '...' and doubles an interior apostrophe, so both
-# quote characters were already safe. The structural characters below stay
-# banned: they are legible-looking but genuinely ambiguous in a tip label.
-NEWICK_UNSAFE_TIP_CHARS = frozenset("()[];,:")
+# quote characters were already safe.
+#
+# 9/3/26 - The same argument retires the structural set "()[];,:" that lived
+# here. It was never protecting a download:
+#
+#   * The pipeline itself puts every one of those characters into tip labels --
+#     96% of jobs on disk have at least one, and ':' appears in 131k headers,
+#     '(' in 51k, ',' in 27k -- so the ban only stopped a user from *retyping*
+#     a name the tree already displays.
+#   * Newick and NEXUS both round-trip all of them through quote_tree_label()
+#     and write_nexus_tree(); verified by reparsing the emitted files.
+#   * FASTA headers (the Edited FASTA download) restrict nothing but the line
+#     break, and SVG/PNG go out through the DOM, which escapes on its own.
+#
+# What remains is the genuinely un-carryable set: a line break or a NUL ends a
+# FASTA header and a Newick label wherever it appears, and no quoting rescues
+# it. Those arrive only by paste, so validate_tip_rename() folds the whitespace
+# ones into spaces rather than refusing the edit -- see NEWICK_UNSAFE_TIP_CHARS
+# consumers in app/api_v1/routes.py, which report them instead.
+NEWICK_UNSAFE_TIP_CHARS = frozenset("\r\n\x00")
+
+# Control characters that carry no glyph but are not whitespace either. A
+# rename containing one is almost always an invisible artifact of a paste, so
+# it is dropped rather than treated as a reason to reject the whole edit.
+_TIP_NAME_WHITESPACE_CONTROLS = frozenset("\t\n\r\v\f")
 
 
 # Both writers live in tree_io so the tree builders can share them without
@@ -262,11 +285,14 @@ def save_tree_state(job_dir: Path, tree_json: Dict) -> None:
                 os.fsync(f.fileno())
             # mkstemp() creates 0600; the previous truncate-in-place kept whatever
             # mode the file already had (0644 in production). Preserve it so the
-            # rename does not silently tighten permissions on every job.
+            # rename does not silently tighten permissions on every job. On a
+            # job whose state does not exist yet, fall back to what a plain
+            # create would give under this process's umask -- NOT a hardcoded
+            # 0644, which this file then preserved forever.
             try:
                 os.chmod(temp_name, state_path.stat().st_mode & 0o7777)
             except OSError:
-                os.chmod(temp_name, 0o644)
+                os.chmod(temp_name, default_file_mode())
             os.replace(temp_name, state_path)
         except BaseException:
             try:
@@ -298,8 +324,36 @@ def _has_control_chars(value: str) -> bool:
     return any(ord(ch) < 32 or ord(ch) == 127 for ch in value)
 
 
+def normalize_tip_name(value: str) -> str:
+    """Fold a pasted tip name into something every download can carry.
+
+    Only control characters are touched, and every printable character survives
+    -- parentheses, colons, commas, semicolons, brackets, quotes and non-ASCII
+    alike (see NEWICK_UNSAFE_TIP_CHARS for why none of those need removing).
+    A tab or a line break becomes a space, other control characters are
+    dropped, runs of whitespace collapse, and the result is stripped.
+
+    Refusing a name over an invisible character the user cannot see is the
+    least useful thing this could do, and a pasted spreadsheet cell routinely
+    carries a trailing newline. Folding is safe because the outcome is a single
+    line with no control characters -- exactly what the reject was protecting.
+    """
+    folded = [
+        " " if ch in _TIP_NAME_WHITESPACE_CONTROLS
+        else "" if (ord(ch) < 32 or ord(ch) == 127)
+        else ch
+        for ch in value
+    ]
+    return " ".join("".join(folded).split())
+
+
 def validate_tip_rename(old_name: Any, new_name: Any) -> Tuple[str, str]:
-    """Validate external rename inputs before they enter persisted tree state."""
+    """Validate external rename inputs before they enter persisted tree state.
+
+    `old_name` has to match a label already in the tree, so it is checked but
+    never rewritten. `new_name` is the one the caller invented, and it is
+    normalized rather than rejected wherever that is possible.
+    """
     for field, value in (("old_name", old_name), ("new_name", new_name)):
         if not isinstance(value, str):
             raise ValueError(f"`{field}` must be a string.")
@@ -310,17 +364,17 @@ def validate_tip_rename(old_name: Any, new_name: Any) -> Tuple[str, str]:
                 f"`{field}` is {len(value):,} characters; the maximum is "
                 f"{MAX_TREE_TIP_NAME_LENGTH:,}."
             )
-        if _has_control_chars(value):
-            raise ValueError(f"`{field}` contains control characters.")
 
-    bad = sorted(set(new_name) & NEWICK_UNSAFE_TIP_CHARS)
-    if bad:
+    if _has_control_chars(old_name):
+        raise ValueError("`old_name` contains control characters.")
+
+    cleaned = normalize_tip_name(new_name)
+    if not cleaned:
         raise ValueError(
-            f"`new_name` contains characters that are invalid in Newick tip "
-            f"names: {bad}. Avoid parentheses, brackets, commas, colons, "
-            f"and semicolons."
+            "`new_name` is only control characters, so there is no label left "
+            "after removing them."
         )
-    return old_name, new_name
+    return old_name, cleaned
 
 
 def _validate_sequence_of_interest(tree_json: Dict[str, Any],
@@ -373,8 +427,14 @@ def build_recompute_job_params(params_dict: Dict[str, Any]) -> JobParams:
         advanced_options=params_dict.get("alignment_options", {}) or {}
     )
 
+    # Through the shared resolver, so an absent key and the literal "default"
+    # land where the worker's own trim step puts them. Passing "default"
+    # straight through reached run_trimming, whose dispatcher has no such
+    # branch and raises "Unsupported trimming method: default".
+    from app.services.trimming_service import resolve_trimming_method
+
     trim_params = TrimmingParams(
-        method=params_dict.get("trimming_method", Config.DEFAULT_TRIMMING_METHOD),
+        method=resolve_trimming_method(params_dict),
         trim_terminal_overhangs=_bool_param(params_dict, "trim_terminal_overhangs", True),
     )
 
@@ -731,31 +791,67 @@ def rename_tip(tree_json: Dict, old_name: str, new_name: str) -> Dict:
     """
     Change display_name of a tip. Preserve original_name.
     """
+    return rename_tips(tree_json, [(old_name, new_name)])
+
+
+def rename_tips(tree_json: Dict, pairs) -> Dict:
+    """Apply one or more renames, all keyed on the tree as it stands NOW.
+
+    Alan 9/8/26 - Applying a batch one tip at a time cascaded: the Rename modal
+    sends the whole selection in one request, so a swap such as
+    ``{A: B, B: C}`` renamed A to B and then matched that same node again on
+    its new name, leaving A called C. Every old name is resolved against the
+    pre-rename tree first, and the writes happen afterwards.
+
+    ``renames`` is keyed on the ORIGINAL name, the way
+    ``apply_state_to_structure()`` reads it back, so renaming an
+    already-renamed tip updates its existing entry instead of adding a second
+    one keyed on the display name.
+    """
     if "renames" not in tree_json:
         tree_json["renames"] = {}
-        
-    tree_json["renames"][old_name] = new_name
 
     # Alan 6/2/26 - Do NOT rewrite sequence_of_interest to the new display name: the focal
     # tip is tracked by its ORIGINAL name (selection sets, patristic distances and the
     # alignment all key on original names), so syncing to the display name broke auto-root
     # resolution for a renamed focal tip. Leaving it as the original name keeps it resolvable.
 
-    def apply_rename(node):
-        if node.get("name") == old_name or node.get("original_name") == old_name:
+    nodes_by_label: Dict[str, List[Dict]] = {}
+
+    def index_node(node):
+        if not isinstance(node, dict):
+            return
+        for key in (node.get("original_name"), node.get("name")):
+            if not key:
+                continue
+            bucket = nodes_by_label.setdefault(str(key), [])
+            if not any(existing is node for existing in bucket):
+                bucket.append(node)
+        for child in node.get("children") or []:
+            index_node(child)
+
+    if "tree_structure" in tree_json:
+        index_node(tree_json["tree_structure"])
+
+    planned = []
+    for old_name, new_name in pairs:
+        targets = nodes_by_label.get(old_name) or []
+        stable = old_name
+        for node in targets:
+            original = node.get("original_name")
+            if original:
+                stable = str(original)
+                break
+        planned.append((stable, new_name, targets))
+
+    for stable, new_name, targets in planned:
+        tree_json["renames"][stable] = new_name
+        for node in targets:
             node["name"] = new_name
             node["display_name"] = new_name
             # Preserve original_name as the stable edit identifier while
             # making the visible node label update immediately.
-            return True
-        if "children" in node:
-            for child in node["children"]:
-                apply_rename(child)
-        return False
 
-    if "tree_structure" in tree_json:
-        apply_rename(tree_json["tree_structure"])
-        
     return tree_json
 
 
@@ -1484,6 +1580,12 @@ def commit_recompute_tree_state(job_dir: Path,
             task_logger=task_logger or logger,
         )
         save_tree_state(job_dir, state)
+        # A new inferred topology invalidates any single-level undo checkpoint
+        # taken against the old one. The recompute endpoint already clears it at
+        # enqueue time; this is the backstop for every other path into a commit
+        # (the worker, a resumed run, a direct call from a script).
+        from app.services.tree_undo_service import clear_undo_checkpoint
+        clear_undo_checkpoint(job_dir)
         return state
 
 
@@ -1623,6 +1725,19 @@ def _install_recompute_outputs(job_dir: Path, output_dir: Path) -> None:
             old_path.unlink()
     for name, staged in staged_mrbayes.items():
         os.replace(staged, live_tree / name)
+
+    # The SEQnnnnnn -> real-name key belongs to the generation it was written
+    # beside. Pruning renumbers the ids, so a map left behind by the original
+    # run decodes this run's taxa to the wrong sequences. Install it with the
+    # rest of the family, and drop a stale one when this run produced none.
+    from app.services.fasta_utils import NAME_MAP_FILENAME
+
+    staged_name_map = staged_tree / NAME_MAP_FILENAME
+    live_name_map = live_tree / NAME_MAP_FILENAME
+    if staged_name_map.is_file():
+        os.replace(staged_name_map, live_name_map)
+    elif live_name_map.is_file():
+        live_name_map.unlink()
 
 
 def _recompute_tree_staged(
@@ -2032,6 +2147,28 @@ def _clade_to_json(clade):
     return node
 
 
+def _carry_collapsed_annotation(removed, survivor) -> None:
+    """Move a collapsed node's internal annotation onto its surviving child.
+
+    A node with exactly one child defines the same bipartition as that child,
+    so the annotation describes the surviving split and is carried down rather
+    than discarded. ``name`` and ``confidence`` are treated as **mutually
+    exclusive** here: Newick has no representation for an internal node holding
+    both (Biopython concatenates them into an invented label such as
+    ``CladeA95``, which is why `tree_to_newick_string` refuses to serialize
+    one). So the survivor's own annotation always wins, and the collapsed
+    node's is used only when the survivor carries neither.
+    """
+    if survivor.confidence is not None or survivor.name is not None:
+        return
+    if removed.confidence is not None:
+        survivor.confidence = removed.confidence
+    elif removed.name is not None:
+        # IQ-TREE dual SH-aLRT/UFBoot support is parsed as an internal name
+        # rather than as ``confidence``, so the label is worth carrying too.
+        survivor.name = removed.name
+
+
 def _collapse_unifurcations(tree) -> None:
     """
     Collapse internal nodes that have exactly one child (unifurcations).
@@ -2049,7 +2186,8 @@ def _collapse_unifurcations(tree) -> None:
     same split and the collapsed node's confidence is the surviving node's
     confidence. Dropping it silently deleted support values from clades that
     had them, which is why pruning could turn a well-supported branch into an
-    unlabelled one.
+    unlabelled one. The transfer goes through `_carry_collapsed_annotation`,
+    which never lets a survivor end up holding both a name and a confidence.
 
     Modifies tree in-place.
     """
@@ -2062,10 +2200,7 @@ def _collapse_unifurcations(tree) -> None:
             only_child.branch_length += tree.root.branch_length
         elif tree.root.branch_length:
             only_child.branch_length = tree.root.branch_length
-        if only_child.confidence is None and tree.root.confidence is not None:
-            only_child.confidence = tree.root.confidence
-        if only_child.name is None and tree.root.name is not None:
-            only_child.name = tree.root.name
+        _carry_collapsed_annotation(tree.root, only_child)
         # Promote child to root
         tree.root = only_child
         # Continue loop in case the new root is also a unifurcation
@@ -2102,14 +2237,7 @@ def _collapse_unifurcations(tree) -> None:
 
             # The collapsed node and its only child define the same split, so
             # the support value survives the collapse.
-            if only_child.confidence is None and clade.confidence is not None:
-                only_child.confidence = clade.confidence
-            if only_child.name is None and clade.name is not None:
-                # IQ-TREE dual SH-aLRT/UFBoot support is parsed as an internal
-                # name rather than as ``confidence``. A collapsed unary node and
-                # its child define the same surviving split, so carry that label
-                # when the child has no annotation of its own.
-                only_child.name = clade.name
+            _carry_collapsed_annotation(clade, only_child)
 
             # Replace clade with only_child in parent's children list
             idx = parent.clades.index(clade)

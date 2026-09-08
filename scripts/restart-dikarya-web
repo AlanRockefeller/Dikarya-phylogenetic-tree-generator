@@ -1,0 +1,99 @@
+#!/bin/sh
+# Source for /usr/local/sbin/restart-dikarya-web (root-owned, installed
+# separately; see "Restarting Dikarya services" in AGENTS.md).
+#
+# WHY THIS VERIFIES RATHER THAN JUST RESTARTING
+# ---------------------------------------------
+# `systemctl restart` returns when systemd is satisfied the unit started, which
+# is not the same as Dikarya being able to serve a request. Gunicorn does not
+# import the application until a request arrives, so a module that fails to
+# import survives a "successful" restart and only breaks when the first real
+# user shows up. That is exactly the 2026-08-14 incident recorded in AGENTS.md:
+# POST /api/job returned 500 for 3.5 hours after a restart systemd called fine.
+#
+# Curling /health after the restart forces that first request ourselves, so the
+# import happens here, in front of whoever ran the restart, instead of in front
+# of a user. /health also exercises the database and filesystem checks.
+#
+# Exit codes:
+#   0   restarted and healthy
+#   64  arguments were passed (this wrapper accepts none, by design)
+#   69  restarted but never became healthy   <- look at the journal output
+#   70  systemctl restart itself failed
+#   77  not run as root (re-run with sudo)
+#   75  serving, but /health reports degraded (503)
+set -eu
+
+[ "$#" -eq 0 ] || exit 64
+
+# Without this, a non-root caller falls through to polkit, which answers "you
+# forgot sudo" with an interactive identity picker listing every admin on the
+# box and then a password prompt that cannot succeed. Fail fast with the actual
+# remedy instead.
+if [ "$(id -u)" -ne 0 ]; then
+    echo "restart-dikarya-web: must run as root. Re-run:" >&2
+    echo "    sudo /usr/local/sbin/restart-dikarya-web" >&2
+    exit 77
+fi
+
+UNIT=dikarya-web.service
+HEALTH_URL=http://127.0.0.1:8000/health
+DEADLINE_SECONDS=45  # wall-clock seconds to allow the app to start serving
+
+if ! /usr/bin/systemctl restart "$UNIT"; then
+    echo "restart-dikarya-web: systemctl restart $UNIT failed" >&2
+    /usr/bin/systemctl status --no-pager --lines=20 "$UNIT" >&2 || true
+    exit 70
+fi
+
+# Poll rather than sleeping a fixed interval: a healthy restart is usually
+# serving in 3-4 seconds and there is no reason to wait longer than it takes.
+started_at=$(/bin/date +%s)
+deadline_at=$((started_at + DEADLINE_SECONDS))
+last_code=000
+while :; do
+    now=$(/bin/date +%s)
+    remaining=$((deadline_at - now))
+    [ "$remaining" -gt 0 ] || break
+    curl_timeout=5
+    [ "$remaining" -ge "$curl_timeout" ] || curl_timeout=$remaining
+    if last_code=$(/usr/bin/curl -sS -o /dev/null -w '%{http_code}' \
+        --max-time "$curl_timeout" "$HEALTH_URL" 2>/dev/null); then
+        :
+    else
+        last_code=000
+    fi
+    case "$last_code" in
+        200)
+            elapsed=$(( $(/bin/date +%s) - started_at ))
+            echo "restart-dikarya-web: $UNIT restarted and healthy (${elapsed}s)"
+            exit 0
+            ;;
+        503)
+            # Serving, so the restart worked and the code imported; the app
+            # itself is reporting a sick dependency. Distinct from a failure to
+            # come back at all, and needs a different fix, so say so.
+            echo "restart-dikarya-web: $UNIT is serving but /health reports" \
+                 "DEGRADED (503). The restart succeeded; something the app" \
+                 "depends on is unhealthy:" >&2
+            now=$(/bin/date +%s)
+            remaining=$((deadline_at - now))
+            if [ "$remaining" -gt 0 ]; then
+                curl_timeout=5
+                [ "$remaining" -ge "$curl_timeout" ] || curl_timeout=$remaining
+                /usr/bin/curl -sS --max-time "$curl_timeout" "$HEALTH_URL" >&2 || true
+            fi
+            echo >&2
+            exit 75
+            ;;
+    esac
+    now=$(/bin/date +%s)
+    remaining=$((deadline_at - now))
+    [ "$remaining" -gt 0 ] || break
+    sleep 1
+done
+
+echo "restart-dikarya-web: $UNIT did NOT come back within ${DEADLINE_SECONDS}s" \
+     "(last HTTP status: $last_code). Recent journal:" >&2
+/usr/bin/journalctl -u "$UNIT" --no-pager --lines=40 >&2 || true
+exit 69

@@ -35,35 +35,123 @@ def get_queue(name=QUEUE_HIGH) -> Queue:
     conn = get_redis_connection()
     return Queue(name, connection=conn)
 
-def resolve_job_timeout(job_params: Dict[str, Any]) -> str:
-    """Pick the RQ job_timeout for a job based on the tree method it will run.
+# Which externally-timed tool bounds each pipeline stage. The names are the
+# keys `configured_tool_time_limit_hours` understands, so the RQ backstop and
+# the per-subprocess limits can never drift apart. ``None`` means the stage runs
+# no external tool and therefore consumes only the general allowance.
+_ALIGNMENT_STAGE_TOOL = {
+    "mafft": "MAFFT",
+    "muscle": "MUSCLE",
+    "clustalo": "Clustal Omega",
+    "iqtree_builtin": "IQ-TREE alignment",
+    "none": None,
+}
+# Keyed by the exact method names `trimming_service.run_trimming` dispatches on.
+# `trimal_gappy` is Dikarya's shipped default (DEFAULT_TRIMMING_METHOD) and the
+# /tree form's preselected option; it was missing here, so an ordinary default
+# pipeline was budgeted as if it did no external trimming at all while the
+# worker went on to run trimAl under its own four-hour limit.
+_TRIMMING_STAGE_TOOL = {
+    "trimal_gappy": "trimAl",
+    "trimal": "trimAl",
+    "bmge": "BMGE",
+    "none": None,
+    "": None,
+}
+_TREE_STAGE_TOOL = {
+    "raxml": "RAxML",
+    "iqtree": "IQ-TREE",
+    "mrbayes": "MrBayes",
+    "fasttree": "FastTree",
+    # Neighbour-joining is computed in-process, so it has no tool budget of its
+    # own and lives inside the general allowance.
+    "nj": None,
+}
 
-    Tree-builder subprocess limits apply after input preparation, BLAST,
-    alignment and trimming. Give recognized builders their complete tool limit
-    in addition to the general pipeline allowance so RQ cannot kill the work
-    horse before the subprocess timeout produces a structured error. This lives
-    here, rather than at each submission site, so every enqueue path gets the
-    same budget.
+# Grace on top of the summed stage budgets, so a tool's own timeout fires first
+# and produces a structured, user-facing error instead of RQ killing the work
+# horse mid-run.
+JOB_TIMEOUT_GRACE_SECONDS = 600
+
+
+def _resolved_method(value, default: str) -> str:
+    method = str(value or "default").strip().lower()
+    if method == "default":
+        method = str(default or "").strip().lower()
+    return method
+
+
+def resolve_job_timeout(job_params: Dict[str, Any]) -> str:
+    """Pick the RQ job_timeout covering every independently bounded stage.
+
+    Each external tool carries its own wall-clock limit (MAFFT 8h, trimAl 4h,
+    RAxML 15h, ...), and they run one after another. A backstop of "general
+    allowance + tree builder" therefore did not cover a legal pipeline: a job
+    could stay inside every subprocess timeout it was given and still be killed
+    by RQ before the tree builder's own limit was reached, which loses the work
+    with no structured error. So the budget is the sum of the stages this
+    particular job will run -- not of every tool Dikarya can run -- plus the
+    general allowance for the non-tool work (input handling, BLAST, NCBI
+    fetches, tree post-processing) and a grace period.
+
+    This lives here, rather than at each submission site, so every enqueue path
+    gets the same budget.
     """
     from app.config import Config
+    from app.services.subprocess_utils import (
+        configured_tool_time_limit_hours,
+        resolve_time_limit_hours,
+    )
+    from app.services.security_utils import coerce_bool
 
-    general_hours = float(getattr(Config, "GENERAL_JOB_TIME_LIMIT_HOURS", 8) or 8)
-    method = str((job_params or {}).get("tree_method") or "").lower()
-    tree_limits = {
-        "raxml": ("RAXML_TIME_LIMIT_HOURS", 15),
-        "iqtree": ("IQTREE_TIME_LIMIT_HOURS", 15),
-        "mrbayes": ("MRBAYES_TIME_LIMIT_HOURS", 15),
-        "fasttree": ("FASTTREE_TIME_LIMIT_HOURS", 6),
-    }
-    limit = tree_limits.get(method)
-    if limit:
-        attr, default = limit
-        general_hours += float(getattr(Config, attr, default) or default)
+    params = job_params or {}
+    hours = resolve_time_limit_hours(
+        getattr(Config, "GENERAL_JOB_TIME_LIMIT_HOURS", 8), 8.0
+    )
 
-    # Generic subprocess CPU limiting is disabled by default because CPU time
-    # accumulates across threads. The ten-minute grace ensures a subprocess
-    # timeout is handled before RQ reaches this wall-clock backstop.
-    return f"{int(general_hours * 3600) + 600}s"
+    align_method = _resolved_method(
+        params.get("alignment_method"),
+        getattr(Config, "BEGINNER_DEFAULT_ALIGNER", "mafft"),
+    )
+    # Resolved by the same helper the worker's trim step uses, so an absent
+    # key lands on DEFAULT_TRIMMING_METHOD and the literal "default" on
+    # BEGINNER_DEFAULT_TRIMMING exactly as run_phylo_job does.
+    from app.services.trimming_service import resolve_trimming_method
+
+    trim_method = resolve_trimming_method(params)
+    tree_method = str(params.get("tree_method") or "").strip().lower()
+
+    stage_tools = []
+    # An unrecognized aligner fails fast in run_alignment, but budget it as the
+    # configured default rather than as nothing.
+    if align_method in _ALIGNMENT_STAGE_TOOL:
+        stage_tools.append(_ALIGNMENT_STAGE_TOOL[align_method])
+    else:
+        stage_tools.append(_ALIGNMENT_STAGE_TOOL.get(
+            _resolved_method(None, getattr(Config, "BEGINNER_DEFAULT_ALIGNER", "mafft")),
+            "MAFFT",
+        ))
+
+    # MUSCLE, Clustal Omega and IQ-TREE's aligner are direction-blind, so
+    # run_alignment runs a separate MAFFT pass over the input first. That pass
+    # carries MAFFT's full budget, so it is a stage in its own right.
+    if (
+        align_method not in ("none", "mafft")
+        and stage_tools[0] is not None
+        and coerce_bool(params.get("fix_orientation"), True)[0]
+    ):
+        stage_tools.append("MAFFT")
+
+    # An unrecognised trimmer raises in run_trimming before any executable is
+    # spawned, so it genuinely gets no tool budget.
+    stage_tools.append(_TRIMMING_STAGE_TOOL.get(trim_method))
+    stage_tools.append(_TREE_STAGE_TOOL.get(tree_method))
+
+    for tool in stage_tools:
+        if tool:
+            hours += configured_tool_time_limit_hours(Config, tool)
+
+    return f"{int(hours * 3600) + JOB_TIMEOUT_GRACE_SECONDS}s"
 
 
 def safe_job_description(kind: str, job_params: Optional[Dict[str, Any]] = None,
@@ -121,6 +209,60 @@ def prepare_phylo_job_params(job_params: Dict[str, Any]) -> None:
         job_params["input_warnings"] = input_warnings
 
 
+# Which submissions belong on the slow lane.
+#
+# Both queues used to be served by the single worker, so this classification
+# had nowhere to take effect: RQ simply drained phylo_high first with one slot,
+# and a long job blocked every short one behind it regardless of queue. With a
+# worker dedicated to each queue the split finally isolates them.
+#
+# The thresholds come from 296 completed jobs joined against their worker.log
+# durations. Tree method dominates and size is secondary:
+#
+#     fasttree   n=181   p50=   25s   p90=  57s   max=  143s
+#     none       n= 94   p50=   58s   p90=  81s   max=  190s
+#     iqtree     n= 14   p50=  124s   p90=1292s   max= 2554s
+#     raxml      n=  7   p50= 1279s   p90=9276s   max= 9276s
+#
+#     <200 records            max= 1279s
+#     200+ records            max= 9276s
+#
+# So RAxML and MrBayes are slow at any size -- a 21-minute median is already
+# long enough to stall a stream of 25-second FastTree jobs -- while IQ-TREE
+# only becomes slow with a large set. Everything else is bounded by size alone.
+BULK_ALWAYS_TREE_METHODS = frozenset({"raxml", "mrbayes"})
+BULK_IF_LARGE_TREE_METHODS = frozenset({"iqtree"})
+BULK_IQTREE_RECORD_COUNT = 150
+BULK_RECORD_COUNT = 400
+BULK_TOTAL_BASES = 1_000_000
+
+
+def classify_queue_for_params(job_params: Dict[str, Any]) -> str:
+    """Return the queue a submission belongs on, by expected runtime.
+
+    Deliberately conservative: misrouting a slow job onto phylo_high only
+    restores the old blocking behaviour, while misrouting a fast one onto
+    phylo_bulk makes a single user wait behind the slow lane. Both are
+    recoverable, neither is silent.
+    """
+    tree_method = str(job_params.get("tree_method") or "").strip().lower()
+
+    if tree_method in BULK_ALWAYS_TREE_METHODS:
+        return QUEUE_BULK
+
+    # Count what the pipeline will actually align. The sequence payload is the
+    # submitted FASTA; accessions are fetched later but each yields one record.
+    sequence = job_params.get("sequence") or ""
+    record_count = sequence.count(">") + len(job_params.get("accessions") or [])
+    total_bases = max(0, len(sequence) - record_count)
+
+    if tree_method in BULK_IF_LARGE_TREE_METHODS and record_count > BULK_IQTREE_RECORD_COUNT:
+        return QUEUE_BULK
+    if record_count > BULK_RECORD_COUNT or total_bases > BULK_TOTAL_BASES:
+        return QUEUE_BULK
+    return QUEUE_HIGH
+
+
 def enqueue_job(job_params: Dict[str, Any], queue_name: str = QUEUE_HIGH,
                 meta: Optional[Dict[str, Any]] = None,
                 job_id: Optional[str] = None,
@@ -132,6 +274,18 @@ def enqueue_job(job_params: Dict[str, Any], queue_name: str = QUEUE_HIGH,
 
     if job_timeout is None:
         job_timeout = resolve_job_timeout(job_params)
+
+    # Auto-route only when the caller took the default. A caller that named a
+    # queue outright (the iNaturalist auto-tree path picks phylo_bulk for its
+    # own reasons) keeps the queue it asked for.
+    if queue_name == QUEUE_HIGH:
+        routed = classify_queue_for_params(job_params)
+        if routed != queue_name:
+            logger.info(
+                "Routing job to %s (tree_method=%s)",
+                routed, job_params.get("tree_method"),
+            )
+            queue_name = routed
 
     q = get_queue(queue_name)
     from app.workers.tasks import run_phylo_job
@@ -171,7 +325,7 @@ def enqueue_recompute_job(job_id: str, params_dict: Dict[str, Any], *,
     optional tuple return lets HTTP callers distinguish a new request from a
     harmless duplicate without changing older internal callers.
     """
-    q = get_queue(QUEUE_HIGH)
+    q = get_queue(classify_queue_for_params(params_dict))
     from app.workers.events import (
         STEP_INPUT, STEP_ORIENT, STEP_BLAST, STEP_ITS,
         STATE_QUEUED, STATE_SKIPPED, get_initial_steps_meta,
@@ -212,7 +366,8 @@ def enqueue_recompute_job(job_id: str, params_dict: Dict[str, Any], *,
         )
 
     try:
-        existing = q.fetch_job(job_id)
+        existing = (get_queue(QUEUE_HIGH).fetch_job(job_id)
+                    or get_queue(QUEUE_BULK).fetch_job(job_id))
         if existing is not None:
             existing_status = existing.get_status(refresh=True)
             if existing_status in {"queued", "started", "scheduled", "deferred"}:
@@ -257,7 +412,8 @@ def active_recompute_snapshot_mtime(job_id: str):
     hiccup, all of which should fall through to the normal idempotent path.
     """
     try:
-        job = get_queue(QUEUE_HIGH).fetch_job(job_id)
+        job = (get_queue(QUEUE_HIGH).fetch_job(job_id)
+               or get_queue(QUEUE_BULK).fetch_job(job_id))
         if job is None:
             return None
         if job.get_status(refresh=True) not in {"queued", "started", "scheduled", "deferred"}:

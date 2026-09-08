@@ -76,7 +76,7 @@
             const seen = new Map();
             let sending = false;
             const release = document.querySelector('meta[name="dikarya-release"]')?.content || 'unknown';
-            const csrf = document.querySelector('meta[name="csrf-token"]')?.content || '';
+            let csrf = document.querySelector('meta[name="csrf-token"]')?.content || '';
             const jobMatch = location.pathname.match(/[0-9a-f]{8}-[0-9a-f-]{27,}/i);
             const clean = (value, limit) => String(value || '')
                 .replace(/https?:\/\/[^\s?]+\?[^\s]+/gi, match => match.split('?')[0] + '?<redacted>')
@@ -87,7 +87,11 @@
                 const payload = {
                     event, pathname: location.pathname, job_id: jobMatch?.[0] || '',
                     action: clean(details.action, 100), message: clean(details.message, 500),
-                    stack: clean(details.stack, 2000), release
+                    stack: clean(details.stack, 2000), release,
+                    server_request_id: clean(details.server_request_id, 12),
+                    http_status: details.http_status, method: details.method,
+                    duration_ms: details.duration_ms,
+                    online: navigator.onLine, visibility: document.visibilityState
                 };
                 const key = [payload.event, payload.pathname, payload.action, payload.message, payload.stack.slice(0, 200)].join('|');
                 const now = Date.now();
@@ -96,11 +100,30 @@
                 if (seen.size > 100) for (const [item, at] of seen) if (now - at > 120000) seen.delete(item);
                 sending = true;
                 try {
-                    await window.fetch(endpoint, {
+                    const send = () => window.fetch(endpoint, {
                         method: 'POST', headers: {'Content-Type': 'application/json', 'X-CSRFToken': csrf},
                         credentials: 'same-origin', body: JSON.stringify(payload), keepalive: true
                     });
-                } catch (_) { /* telemetry must never recurse */ }
+                    let response = await send();
+                    if (response.status === 400) {
+                        const refreshed = await window.fetch(endpoint + '/csrf', {
+                            credentials: 'same-origin', cache: 'no-store'
+                        });
+                        if (refreshed.ok) {
+                            const data = await refreshed.json();
+                            if (typeof data.csrf_token === 'string' && data.csrf_token) {
+                                csrf = data.csrf_token;
+                                response = await send();
+                            }
+                        }
+                    }
+                    if (!response.ok) throw new Error('Telemetry delivery rejected');
+                } catch (_) {
+                    // Allow a later occurrence after a short backoff. Never
+                    // report collector failures through the collector itself.
+                    seen.set(key, Date.now() - 90000);
+                    window.console?.warn('Dikarya error report could not be delivered.');
+                }
                 finally { sending = false; }
             }
             // Call sites pass a STABLE action identifier (e.g. 'tree.export_svg'),
@@ -135,9 +158,18 @@
             });
             const originalFetch = window.fetch.bind(window);
             window.fetch = async (...args) => {
-                const raw = typeof args[0] === 'string' ? args[0] : args[0]?.url;
+                const raw = typeof args[0] === 'string' || args[0] instanceof URL ? String(args[0]) : args[0]?.url;
                 let path = '';
-                try { path = raw ? new URL(raw, location.href).pathname : ''; } catch (_) { path = ''; }
+                let sameOrigin = false;
+                try {
+                    const url = new URL(raw, location.href);
+                    path = url.pathname;
+                    sameOrigin = url.origin === location.origin;
+                } catch (_) { path = ''; }
+                const method = String(args[1]?.method || args[0]?.method || 'GET').toUpperCase();
+                const started = performance.now();
+                const isAppRequest = sameOrigin && path.startsWith('/api/')
+                    && path !== endpoint && path !== endpoint + '/csrf';
                 let response;
                 try {
                     response = await originalFetch(...args);
@@ -146,16 +178,22 @@
                     // produced a status, so the api_non_2xx path below cannot see it.
                     // Report it, then rethrow untouched so every existing catch block
                     // behaves exactly as before.
-                    if (err?.name !== 'AbortError' && path !== endpoint) {
+                    if (err?.name !== 'AbortError' && isAppRequest) {
                         report('ui_action_failed', {
                             action: `network:${path || 'unknown'}`,
-                            message: err?.message || err, stack: err?.stack
+                            message: err?.message || err, stack: err?.stack,
+                            method, duration_ms: Math.round(performance.now() - started)
                         });
                     }
                     throw err;
                 }
-                if (!response.ok && path.startsWith('/api/') && path !== endpoint && ![400, 401, 403, 404, 409, 422, 429].includes(response.status)) {
-                    report('api_non_2xx', {action: path, message: `HTTP ${response.status}`});
+                if (!response.ok && isAppRequest && ![400, 401, 403, 404, 409, 422, 429].includes(response.status)) {
+                    report('api_non_2xx', {
+                        action: path, message: `HTTP ${response.status}`, method,
+                        http_status: response.status,
+                        server_request_id: response.headers.get('X-Request-Id') || '',
+                        duration_ms: Math.round(performance.now() - started)
+                    });
                 }
                 return response;
             };
@@ -194,6 +232,10 @@
                     <a href="{{ url_for('main.sequence_entry') }}"
                         class="text-gray-300 hover:text-journal-gold transition-colors text-sm font-medium {% block nav_tree_builder %}{% endblock %}">
                         <i class="fas fa-tree mr-1"></i> Tree Builder
+                    </a>
+                    <a href="{{ url_for('main.inat_finder') }}"
+                        class="text-gray-300 hover:text-journal-gold transition-colors text-sm font-medium {% block nav_inat_finder %}{% endblock %}">
+                        <i class="fas fa-magnifying-glass mr-1"></i> iNat Finder
                     </a>
                     <a href="{{ url_for('main.help_page') }}"
                         class="text-gray-300 hover:text-journal-gold transition-colors text-sm font-medium {% block nav_help %}{% endblock %}">
@@ -267,6 +309,10 @@
                 <a href="{{ url_for('main.sequence_entry') }}"
                     class="block text-gray-200 hover:text-journal-gold transition-colors font-medium py-2">
                     <i class="fas fa-tree mr-2 w-5"></i> Tree Builder
+                </a>
+                <a href="{{ url_for('main.inat_finder') }}"
+                    class="block text-gray-200 hover:text-journal-gold transition-colors font-medium py-2">
+                    <i class="fas fa-magnifying-glass mr-2 w-5"></i> iNat Finder
                 </a>
                 <a href="{{ url_for('main.help_page') }}"
                     class="block text-gray-200 hover:text-journal-gold transition-colors font-medium py-2">

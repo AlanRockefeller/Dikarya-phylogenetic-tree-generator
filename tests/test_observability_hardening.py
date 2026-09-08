@@ -504,6 +504,198 @@ def test_telemetry_endpoint_ignores_unknown_events(tmp_path, clean_logging, no_t
     assert "hello" not in capture.text
 
 
+def test_telemetry_links_failed_request_and_client_environment(tmp_path, clean_logging, no_telemetry_dedup):
+    app = _make_app(tmp_path)
+    capture = _Capture()
+    logging.getLogger().addHandler(capture)
+    response = app.test_client().post("/api/log/client", json={
+        "event": "api_non_2xx", "message": "HTTP 500", "pathname": "/tree",
+        "server_request_id": "abcdef123456", "method": "POST", "http_status": 500,
+        "duration_ms": 2350, "online": False, "visibility": "hidden",
+        "release": "git:old-page",
+    })
+    assert response.status_code == 200
+    for field in (
+        "server_request_id=abcdef123456", "method=POST", "http_status=500",
+        "duration_ms=2350", "online=false", "visibility=hidden", "client_release=git:old-page",
+    ):
+        assert field in capture.text
+    record = next(r for r in capture.records if "event=client.api_non_2xx" in r.getMessage())
+    assert record.req == response.headers["X-Request-Id"]
+    assert record.req != "abcdef123456"  # Collector request and failed request are distinct.
+
+
+def test_telemetry_rejects_malformed_metadata_and_non_object_payload(tmp_path, clean_logging, no_telemetry_dedup):
+    app = _make_app(tmp_path)
+    capture = _Capture()
+    logging.getLogger().addHandler(capture)
+    client = app.test_client()
+    assert client.post("/api/log/client", json=["invalid"]).get_json() == {"status": "ignored"}
+    response = client.post("/api/log/client", json={
+        "event": "api_non_2xx", "server_request_id": "secret\nevent=forged",
+        "method": ["POST"], "http_status": True, "duration_ms": 10**30,
+        "online": "secret", "visibility": {"secret": 1},
+        "release": "https://dikarya.us/?token=secret",
+    })
+    assert response.status_code == 200
+    assert "secret" not in capture.text
+    assert "event=forged" not in capture.text
+    for field in ("server_request_id=-", "http_status=-", "duration_ms=-", "online=unknown", "visibility=unknown"):
+        assert field in capture.text
+
+
+def test_telemetry_dedup_keeps_different_clients_and_failed_requests(tmp_path, clean_logging, no_telemetry_dedup):
+    app = _make_app(tmp_path)
+    keys = set()
+
+    def set_once(key, *args, **kwargs):
+        if key in keys:
+            return False
+        keys.add(key)
+        return True
+
+    no_telemetry_dedup.set.side_effect = set_once
+    client = app.test_client()
+    payload = {"event": "api_non_2xx", "message": "HTTP 500", "server_request_id": "abcdef123456"}
+
+    def report(ip):
+        return client.post("/api/log/client", json=payload, environ_base={"REMOTE_ADDR": ip}).get_json()["status"]
+
+    assert report("192.0.2.1") == "logged"
+    assert report("192.0.2.1") == "duplicate"
+    payload["fingerprint"] = "cannot-bypass-dedup"
+    assert report("192.0.2.1") == "duplicate"
+    assert report("192.0.2.2") == "logged"
+    payload["server_request_id"] = "abcdef654321"
+    assert report("192.0.2.1") == "logged"
+
+
+@pytest.mark.parametrize("status", [400, 401, 403, 404, 409, 413, 422, 429, 500, 503])
+def test_failed_requests_have_context_without_payloads(tmp_path, clean_logging, status):
+    from flask import jsonify
+
+    app = _make_app(tmp_path)
+    capture = _Capture()
+    logging.getLogger().addHandler(capture)
+    secret = "private-voucher-and-password"
+
+    @app.route("/diagnostic/<job_id>", methods=["POST"])
+    def diagnostic(job_id):
+        return jsonify(error=secret), status
+
+    response = app.test_client().post(
+        f"/diagnostic/{JOB_A}?token={secret}", json={"sequence": secret},
+        headers={"Authorization": f"Bearer {secret}"},
+    )
+    assert response.status_code == status
+    assert response.get_json()["error"] == secret
+    records = [r for r in capture.records if "event=http.request_failed" in r.getMessage()]
+    assert len(records) == 1
+    assert records[0].req == response.headers["X-Request-Id"]
+    assert records[0].job == JOB_A
+    assert f"route=/diagnostic/<job_id> status={status}" in records[0].getMessage()
+    assert "duration_ms=" in records[0].getMessage()
+    assert secret not in capture.text
+
+
+def test_failed_request_logging_skips_scanner_and_static_noise(tmp_path, clean_logging):
+    app = _make_app(tmp_path)
+    capture = _Capture()
+    logging.getLogger().addHandler(capture)
+    client = app.test_client()
+    assert client.get("/scanner-missing").status_code == 404
+    assert client.get("/static/nonexistent.js").status_code == 404
+    assert "event=http.request_failed" not in capture.text
+
+
+def test_telemetry_csrf_rejection_is_logged_and_token_can_be_refreshed(
+    tmp_path, clean_logging, no_telemetry_dedup
+):
+    app = _make_app(tmp_path)
+    app.config['WTF_CSRF_ENABLED'] = True
+    capture = _Capture()
+    logging.getLogger().addHandler(capture)
+    client = app.test_client()
+    payload = {'event': 'window_error', 'message': 'test failure'}
+    assert client.post('/api/log/client', json=payload).status_code == 400
+    assert 'reason=csrf_token_missing' in capture.text
+    refreshed = client.get('/api/log/client/csrf')
+    assert refreshed.status_code == 200
+    assert refreshed.headers['Cache-Control'] == 'no-store'
+    assert client.post('/api/log/client', json=payload, headers={
+        'X-CSRFToken': refreshed.json['csrf_token']
+    }).status_code == 200
+
+
+def test_legacy_svg_favicon_redirects_to_small_static_png(tmp_path):
+    app = _make_app(tmp_path)
+    response = app.test_client().get('/favicon.ico/favicon.svg')
+    assert response.status_code == 302
+    assert response.headers['Location'] == '/static/favicon.ico/favicon-96x96.png'
+
+
+@pytest.mark.parametrize("status", [200, 500])
+def test_request_diagnostics_do_not_consume_streams(tmp_path, clean_logging, status):
+    from flask import Response
+
+    app = _make_app(tmp_path)
+    yielded = []
+
+    @app.route("/diagnostic-stream")
+    def diagnostic():
+        def chunks():
+            yielded.append("first")
+            yield "first"
+            yielded.append("second")
+            yield "second"
+        return Response(chunks(), status=status)
+
+    response = app.test_client().get("/diagnostic-stream", buffered=False)
+    assert response.status_code == status
+    assert yielded == ["first"]
+    response.close()
+
+
+def test_csrf_and_api_reason_codes_reach_failure_log(tmp_path, clean_logging):
+    from app.api_v1.envelope import error_response
+
+    app = _make_app(tmp_path)
+    app.config["WTF_CSRF_ENABLED"] = True
+    capture = _Capture()
+    logging.getLogger().addHandler(capture)
+
+    @app.route("/diagnostic-code")
+    def diagnostic():
+        return error_response(code="scope_required", message="private detail", status=403)
+
+    client = app.test_client()
+    assert client.post("/api/job", json={}).status_code == 400
+    assert "reason=csrf_token_missing" in capture.text
+    assert client.get("/diagnostic-code").status_code == 403
+    assert "reason=scope_required" in capture.text
+    assert "private detail" not in capture.text
+
+
+def test_failed_login_and_registration_are_visible_despite_200_and_302(tmp_path, clean_logging):
+    from types import SimpleNamespace
+
+    app = _make_app(tmp_path)
+    capture = _Capture()
+    logging.getLogger().addHandler(capture)
+    account = SimpleNamespace(id=17, check_password=lambda _: False)
+    with patch("app.auth.routes.find_user_by_email", return_value=account), patch(
+        "app.auth.routes.render_template", return_value="login form"
+    ):
+        client = app.test_client()
+        response = client.post("/auth/login", data={"email": "private@example.test", "password": "private-password"})
+        assert response.status_code == 200
+        assert "event=auth.login_failed reason=invalid_credentials account_id=17" in capture.text
+        assert client.post("/auth/register", data={"email": "private@example.test"}).status_code == 302
+        assert "event=auth.registration_failed reason=missing_credentials" in capture.text
+    assert "private@example.test" not in capture.text
+    assert "private-password" not in capture.text
+
+
 # ---------------------------------------------------------------------------
 # Safe RQ descriptions
 # ---------------------------------------------------------------------------
@@ -610,34 +802,201 @@ def test_enqueue_job_preserves_queue_selection_ids_and_timeouts():
     assert kwargs["job_timeout"].endswith("s")
 
 
+# The RQ backstop has to outlast every independently bounded stage the job will
+# actually run. Each external tool carries its own wall-clock limit and they run
+# one after another, so "general allowance + tree builder" left a legal pipeline
+# -- MAFFT 8h then trimAl 4h then RAxML 15h -- killable by RQ while every
+# subprocess was still inside its own timeout.
+_STAGE_LIMITS = {
+    "RAXML_TIME_LIMIT_HOURS": 15,
+    "IQTREE_TIME_LIMIT_HOURS": 14,
+    "MRBAYES_TIME_LIMIT_HOURS": 13,
+    "FASTTREE_TIME_LIMIT_HOURS": 6,
+    "MAFFT_TIME_LIMIT_HOURS": 8,
+    "MUSCLE_TIME_LIMIT_HOURS": 7,
+    "CLUSTALO_TIME_LIMIT_HOURS": 7,
+    "IQTREE_ALIGNMENT_TIME_LIMIT_HOURS": 7,
+    "TRIMAL_TIME_LIMIT_HOURS": 4,
+    "BMGE_TIME_LIMIT_HOURS": 3,
+}
+
+
+def _resolved_timeout(params, general=8, **config_defaults):
+    """Resolve the RQ deadline against a known set of configured limits.
+
+    The three method defaults are pinned rather than inherited from the live
+    config, so what an omitted field costs is stated here rather than read out
+    of app/config.py:
+
+    * an omitted ``alignment_method`` resolves to MAFFT and therefore *does*
+      buy an 8h aligner stage, which is what production does too;
+    * an omitted or ``"default"`` ``trimming_method`` resolves to no trimming,
+      so a case that does not mention trimming means "no trimmer stage".
+
+    The cases that exercise the shipped trimming default (``trimal_gappy``)
+    override ``DEFAULT_TRIMMING_METHOD``/``BEGINNER_DEFAULT_TRIMMING``
+    explicitly, so the setting under test is visible in the case itself.
+    """
+    from app.config import Config
+    from app.workers.queue import resolve_job_timeout
+
+    defaults = {
+        "BEGINNER_DEFAULT_ALIGNER": "mafft",
+        "BEGINNER_DEFAULT_TRIMMING": "none",
+        "DEFAULT_TRIMMING_METHOD": "none",
+    }
+    defaults.update(config_defaults)
+    with patch.object(Config, "GENERAL_JOB_TIME_LIMIT_HOURS", general), \
+            patch.multiple(Config, **defaults), \
+            patch.multiple(Config, **_STAGE_LIMITS):
+        return resolve_job_timeout(params)
+
+
 @pytest.mark.parametrize(
     ("tree_method", "tree_hours"),
     [("raxml", 15), ("iqtree", 14), ("mrbayes", 13), ("fasttree", 6)],
 )
 def test_job_timeout_allows_pipeline_stages_before_tree_builder(tree_method, tree_hours):
+    # Alignment defaults to MAFFT here, so its 8h stage is part of the budget.
+    timeout = _resolved_timeout({"tree_method": tree_method})
+    assert timeout == f"{int((8 + 8 + tree_hours) * 3600) + 600}s"
+
+
+@pytest.mark.parametrize(
+    ("params", "stage_hours"),
+    [
+        # MAFFT + trimAl + FastTree
+        ({"alignment_method": "mafft", "trimming_method": "trimal",
+          "tree_method": "fasttree"}, 8 + 4 + 6),
+        # trimal_gappy is the *shipped default* trimmer and runs the same
+        # executable under the same limit. It was missing from the stage map,
+        # so an ordinary default pipeline got a deadline shorter than the sum
+        # of the subprocess limits it is legally allowed to consume.
+        ({"alignment_method": "mafft", "trimming_method": "trimal_gappy",
+          "tree_method": "raxml"}, 8 + 4 + 15),
+        ({"alignment_method": "mafft", "trimming_method": "trimal_gappy",
+          "tree_method": "fasttree"}, 8 + 4 + 6),
+        # Case is not the caller's problem; run_trimming lowercases too.
+        ({"alignment_method": "mafft", "trimming_method": "TrimAl_Gappy",
+          "tree_method": "fasttree"}, 8 + 4 + 6),
+        # MAFFT + BMGE + IQ-TREE
+        ({"alignment_method": "mafft", "trimming_method": "bmge",
+          "tree_method": "iqtree"}, 8 + 3 + 14),
+        # No trimming at all.
+        ({"alignment_method": "mafft", "trimming_method": "none",
+          "tree_method": "raxml"}, 8 + 15),
+        # alignment_method="none": the input is already aligned, so no aligner
+        # stage exists to budget for.
+        ({"alignment_method": "none", "trimming_method": "trimal",
+          "tree_method": "fasttree"}, 4 + 6),
+        # Neighbour-joining runs in-process: no tree-builder stage.
+        ({"alignment_method": "mafft", "trimming_method": "none",
+          "tree_method": "nj"}, 8),
+        # MUSCLE is direction-blind, so run_alignment runs a full MAFFT pass
+        # over the input first; that pass carries MAFFT's own budget.
+        ({"alignment_method": "muscle", "trimming_method": "none",
+          "tree_method": "fasttree"}, 7 + 8 + 6),
+        # ... and not when the user turned orientation correction off.
+        ({"alignment_method": "muscle", "trimming_method": "none",
+          "tree_method": "fasttree", "fix_orientation": False}, 7 + 6),
+        # The string form of that flag counts the same way the worker reads it.
+        ({"alignment_method": "muscle", "trimming_method": "none",
+          "tree_method": "fasttree", "fix_orientation": "false"}, 7 + 6),
+    ],
+)
+def test_job_timeout_covers_every_stage_the_job_will_run(params, stage_hours):
+    assert _resolved_timeout(params) == f"{int((8 + stage_hours) * 3600) + 600}s"
+
+
+def test_the_stage_maps_cover_every_method_the_dispatchers_accept():
+    """A method the pipeline can run but the map cannot name gets no budget."""
+    from app.api_v1 import routes as v1_routes
+    from app.workers import queue as queue_module
+
+    # VALID_* are what the public API accepts; "default" is resolved before
+    # the map is consulted and so is deliberately not a key.
+    assert (v1_routes.VALID_ALIGNERS - {"default"}) <= set(
+        queue_module._ALIGNMENT_STAGE_TOOL)
+    assert v1_routes.VALID_TRIMMERS <= set(queue_module._TRIMMING_STAGE_TOOL)
+    assert v1_routes.VALID_TREE_METHODS <= set(queue_module._TREE_STAGE_TOOL)
+
+
+def test_an_omitted_trimmer_is_budgeted_as_the_shipped_default():
+    # The worker reads an absent trimming_method as DEFAULT_TRIMMING_METHOD,
+    # which ships as trimal_gappy. Resolving it as "no trimming" here was the
+    # bug: the job ran trimAl on a deadline that never accounted for it.
+    assert _resolved_timeout(
+        {"alignment_method": "mafft", "tree_method": "raxml"},
+        DEFAULT_TRIMMING_METHOD="trimal_gappy",
+    ) == f"{int((8 + 8 + 4 + 15) * 3600) + 600}s"
+
+
+def test_the_literal_default_trimmer_resolves_through_beginner_default():
+    # "default" is the beginner mode's token and goes through a *different*
+    # setting from an absent key. Both must reach trimAl when configured to.
+    assert _resolved_timeout(
+        {"alignment_method": "mafft", "trimming_method": "default",
+         "tree_method": "raxml"},
+        BEGINNER_DEFAULT_TRIMMING="trimal_gappy",
+        DEFAULT_TRIMMING_METHOD="none",
+    ) == f"{int((8 + 8 + 4 + 15) * 3600) + 600}s"
+
+
+def test_omitted_alignment_and_trimming_both_resolve_to_their_defaults():
+    assert _resolved_timeout(
+        {"tree_method": "raxml"},
+        BEGINNER_DEFAULT_ALIGNER="mafft",
+        DEFAULT_TRIMMING_METHOD="trimal_gappy",
+    ) == f"{int((8 + 8 + 4 + 15) * 3600) + 600}s"
+
+
+def test_no_trimming_never_buys_a_trimal_budget():
+    for value in ("none", "", None):
+        assert _resolved_timeout(
+            {"alignment_method": "mafft", "trimming_method": value,
+             "tree_method": "raxml"},
+            DEFAULT_TRIMMING_METHOD="trimal_gappy",
+        ) == f"{int((8 + 8 + 15) * 3600) + 600}s"
+
+
+def test_the_queue_and_the_worker_resolve_the_same_trimmer():
+    """The RQ budget and the trim step must not disagree about the method."""
     from app.config import Config
-    from app.workers.queue import resolve_job_timeout
+    from app.services.trimming_service import resolve_trimming_method
+    from app.workers.queue import _TRIMMING_STAGE_TOOL
 
-    limits = {
-        "RAXML_TIME_LIMIT_HOURS": 15,
-        "IQTREE_TIME_LIMIT_HOURS": 14,
-        "MRBAYES_TIME_LIMIT_HOURS": 13,
-        "FASTTREE_TIME_LIMIT_HOURS": 6,
-    }
-    with patch.object(Config, "GENERAL_JOB_TIME_LIMIT_HOURS", 8), patch.multiple(
-        Config, **limits
-    ):
-        timeout = resolve_job_timeout({"tree_method": tree_method})
-
-    assert timeout == f"{int((8 + tree_hours) * 3600) + 600}s"
+    with patch.object(Config, "DEFAULT_TRIMMING_METHOD", "trimal_gappy"), \
+            patch.object(Config, "BEGINNER_DEFAULT_TRIMMING", "bmge"):
+        assert resolve_trimming_method({}) == "trimal_gappy"
+        assert resolve_trimming_method({"trimming_method": "default"}) == "bmge"
+        assert resolve_trimming_method({"trimming_method": None}) == "none"
+        assert resolve_trimming_method({"trimming_method": " BMGE "}) == "bmge"
+    # Every method run_trimming dispatches on is a key here, so a new trimmer
+    # cannot be added to the dispatcher without a budget decision.
+    for method in ("none", "trimal_gappy", "trimal", "bmge"):
+        assert method in _TRIMMING_STAGE_TOOL
+    assert _TRIMMING_STAGE_TOOL["trimal_gappy"] == "trimAl"
 
 
 def test_job_timeout_uses_general_allowance_without_a_limited_tree_builder():
-    from app.config import Config
-    from app.workers.queue import resolve_job_timeout
+    assert _resolved_timeout(
+        {"tree_method": "nj", "alignment_method": "none",
+         "trimming_method": "none"}
+    ) == "29400s"
 
-    with patch.object(Config, "GENERAL_JOB_TIME_LIMIT_HOURS", 8):
-        assert resolve_job_timeout({"tree_method": "nj"}) == "29400s"
+
+@pytest.mark.parametrize(
+    "general", [None, "", "abc", float("nan"), float("inf"), float("-inf"), 0, -4, True],
+)
+def test_job_timeout_falls_back_on_unusable_configuration(general):
+    # float("inf") reaches int(hours * 3600) as OverflowError and NaN compares
+    # False against every bound, so an unusable configured value must resolve to
+    # the documented default rather than propagate.
+    assert _resolved_timeout(
+        {"tree_method": "nj", "alignment_method": "none",
+         "trimming_method": "none"},
+        general=general,
+    ) == "29400s"
 
 
 # ---------------------------------------------------------------------------
@@ -826,6 +1185,99 @@ def test_digest_classifies_query_suffixed_and_credential_probing_paths_as_noise(
     assert result["server_errors"] == {}
 
 
+def test_digest_classifies_generic_fetch_proxy_sweep_as_scanner_noise(tmp_path):
+    digest = _digest_module()
+    digest.LOG_DIR = tmp_path
+    timestamp = datetime.now().strftime("%d/%b/%Y:%H:%M:%S +0000")
+    probes = [
+        "/fetch", "/proxy", "/api/proxy", "/api/v1/fetch", "/api/download",
+        "/api/image", "/api/preview", "/api/v2/settings", "/api/v2/config",
+    ]
+    (tmp_path / "access.log").write_text("".join(
+        f'9.9.9.9 - - [{timestamp}] "GET {path} HTTP/1.0" 404 10 "-" '
+        f'"Mozilla/5.0" 900 req=r\n'
+        for path in probes
+    ))
+
+    result = digest.analyze_access(datetime.now() - timedelta(hours=1))
+
+    assert sum(result["noise_4xx"].values()) == len(probes)
+    assert result["product_4xx"] == {}
+
+
+def test_missing_route_burst_is_throttled_without_limiting_known_routes(
+    tmp_path, monkeypatch
+):
+    import app as app_module
+
+    class FakeRedis:
+        def __init__(self):
+            self.values = {}
+
+        def get(self, key):
+            return self.values.get(key)
+
+        def incr(self, key):
+            self.values[key] = self.values.get(key, 0) + 1
+            return self.values[key]
+
+        def expire(self, key, seconds):
+            return True
+
+        def eval(self, script, numkeys, key, seconds):
+            assert numkeys == 1
+            assert "EXPIRE" in script
+            assert seconds == 60
+            return self.incr(key)
+
+    fake_redis = FakeRedis()
+    monkeypatch.setattr(app_module, "_scanner_404_redis", lambda: fake_redis)
+    app = _make_app(tmp_path)
+    app.config["RATELIMIT_ENABLED"] = True
+    client = app.test_client()
+
+    for index in range(app_module.SCANNER_404_LIMIT):
+        assert client.get(f"/definitely-missing-{index}").status_code == 404
+
+    throttled = client.get("/one-probe-too-many")
+    assert throttled.status_code == 429
+    assert throttled.headers['X-Dikarya-Noise'] == 'scanner'
+    assert throttled.headers["Retry-After"] == str(
+        app_module.SCANNER_404_WINDOW_SECONDS
+    )
+    assert client.get("/health").status_code == 200
+
+
+def test_missing_route_limit_survives_redis_timeout(tmp_path, monkeypatch):
+    import app as app_module
+    broken = Mock()
+    broken.get.side_effect = TimeoutError
+    broken.eval.side_effect = TimeoutError
+    monkeypatch.setattr(app_module, '_scanner_404_redis', lambda: broken)
+    app = _make_app(tmp_path)
+    app.config['RATELIMIT_ENABLED'] = True
+    client = app.test_client()
+    for index in range(app_module.SCANNER_404_LIMIT):
+        assert client.get(f'/missing-{index}').status_code == 404
+    assert client.get('/missing-last').status_code == 429
+    assert client.get('/health').status_code == 200
+
+
+def test_digest_keeps_tagged_scanner_429_out_of_product_errors(tmp_path):
+    digest = _digest_module()
+    digest.LOG_DIR = tmp_path
+    stamp = datetime.now().strftime('%d/%b/%Y:%H:%M:%S +0000')
+    (tmp_path / 'access.log').write_text(
+        f'1.2.3.4 - - [{stamp}] "GET /random-secret HTTP/1.0" 429 10 "-" "browser" 100 req=r1 noise=scanner\n'
+        f'1.2.3.4 - - [{stamp}] "POST /api/job HTTP/1.0" 429 10 "-" "browser" 100 req=r2 noise=-\n'
+    )
+    result = digest.analyze_access(datetime.now() - timedelta(hours=1))
+    assert result['noise_4xx'][(429, 'GET /random-secret')] == 1
+    assert result['product_4xx'][(429, 'POST /api/job')] == 1
+    for path in ('/phpinfo', '/gcp-key.json', '/application_default_credentials.json'):
+        assert digest.is_noise_4xx(path, 'browser', 429)
+
+
 def test_digest_window_selects_only_overlapping_rotations(tmp_path):
     digest = _digest_module()
     digest.LOG_DIR = tmp_path
@@ -973,6 +1425,157 @@ def test_worker_lifecycle_separates_active_jobs_from_genuinely_stale_ones(tmp_pa
     assert [job for job, _ in stale] == [JOB_E]
     age = stale[0][1]
     assert digest.format_age(datetime.now() - age).endswith("m")
+
+
+class _FakeSortedSet:
+    """The three Redis calls sse_registry makes, over a plain dict."""
+
+    def __init__(self):
+        self.entries = {}
+
+    def zadd(self, _key, mapping):
+        self.entries.update(mapping)
+
+    def zrem(self, _key, member):
+        self.entries.pop(member, None)
+
+    def zcard(self, _key):
+        return len(self.entries)
+
+    def zremrangebyscore(self, _key, _low, high):
+        for member in [m for m, score in self.entries.items() if score <= high]:
+            del self.entries[member]
+
+
+def test_a_stream_that_stops_renewing_ages_out_of_the_census(monkeypatch):
+    """Entries are a lease, not a lifetime.
+
+    Four web restarts on 2026-09-06 left five entries from SIGKILLed processes
+    in the set, and with no renewal and an eight-hour TTL the pressure warning
+    was measured against streams that no longer existed for the rest of the
+    evening.
+    """
+    from app.services import sse_registry
+
+    import time as _time
+
+    conn = _FakeSortedSet()
+    live, _ = sse_registry.open_stream(conn, "job-live")
+    dead, _ = sse_registry.open_stream(conn, "job-dead")
+    assert conn.zcard(None) == 2
+
+    # Both leases go stale; only the live stream renews its own.
+    later = _time.time() + sse_registry._ENTRY_TTL_SECONDS + 1
+    monkeypatch.setattr(sse_registry.time, "time", lambda: later)
+    assert sse_registry.touch_stream(conn, live) is True
+
+    assert list(conn.entries) == [live], "the killed process's entry must not persist"
+    assert dead not in conn.entries
+    assert sse_registry.close_stream(conn, live) == 0
+
+
+def test_a_renewal_after_a_stall_restores_the_stream_to_the_census(monkeypatch):
+    """Only the owning generator renews, so a pruned token is a live stream."""
+    from app.services import sse_registry
+
+    conn = _FakeSortedSet()
+    token, _ = sse_registry.open_stream(conn, "job-stalled")
+    conn.entries.clear()  # lease expired during a long blocked yield and was pruned
+
+    sse_registry.touch_stream(conn, token)
+
+    assert list(conn.entries) == [token]
+
+
+def test_the_lease_outlasts_a_long_run_of_missed_renewals():
+    """Guard the ratio, not the numbers: shortening the TTL alone undercounts."""
+    from app.services import sse_registry
+
+    assert sse_registry._ENTRY_TTL_SECONDS >= 5 * sse_registry.RENEW_INTERVAL_SECONDS
+
+
+def test_worker_lifecycle_reads_the_bulk_stream_and_merges_it_by_timestamp(tmp_path):
+    """A job on phylo_bulk is reported, and interleaving does not split a lifecycle.
+
+    The digest globbed worker.log* alone until 2026-09-07, so bulk jobs -- the
+    long RAxML and IQ-TREE runs, exactly the ones whose stalls matter -- were
+    absent from every report.
+    """
+    digest = _digest_module()
+    digest.LOG_DIR = tmp_path
+    _worker_log(tmp_path, [
+        f"[{_stamp(90)}] [INFO] [app.workers.tasks] event=job.started Starting job summary={{}} [job={JOB_A} rq={JOB_A} release=git:abc]\n",
+        f"[{_stamp(50)}] [INFO] [app.workers.tasks] event=job.completed Job completed successfully [job={JOB_A} rq={JOB_A} release=git:abc]\n",
+    ])
+    # Straddles the high-queue job in time, so concatenation and merge differ.
+    (tmp_path / "worker-bulk.log").write_text("".join([
+        f"[{_stamp(80)}] [INFO] [app.workers.tasks] event=job.started Starting job summary={{}} [job={JOB_B} rq={JOB_B} release=git:abc]\n",
+        f"[{_stamp(70)}] [INFO] [app.workers.tasks] event=job.completed Job completed successfully [job={JOB_B} rq={JOB_B} release=git:abc]\n",
+    ]))
+
+    counts, stale, coverage = digest.analyze_worker(
+        datetime.now() - timedelta(hours=6), grace=timedelta(minutes=30)
+    )
+
+    assert counts["started"] == 2
+    assert counts["completed"] == 2
+    assert counts["retried"] == 0
+    assert stale == []
+    assert sorted(coverage["files"]) == ["worker-bulk.log", "worker.log"]
+
+
+def test_a_declared_wait_for_an_upstream_result_is_not_reported_as_a_retry(tmp_path):
+    """job.deferred marks a planned rq.Retry, so its resumption is not a reattempt.
+
+    A MycoMap NCBI rerun returns rq.Retry on purpose and resumes with a second
+    job.started, which is shaped exactly like the restart of a failed attempt.
+    Two such waits were reported as two retries on 2026-09-06.
+    """
+    digest = _digest_module()
+    digest.LOG_DIR = tmp_path
+    _worker_log(tmp_path, [
+        f"[{_stamp(90)}] [INFO] [app.workers.tasks] event=job.started Starting job summary={{}} [job={JOB_A} rq={JOB_A} release=git:abc]\n",
+        f"[{_stamp(89)}] [INFO] [app.workers.tasks] event=job.deferred Waiting for MycoMap NCBI results reason=mycomap_ncbi_rerun resume_in_seconds=60 [job={JOB_A} rq={JOB_A} release=git:abc]\n",
+        f"[{_stamp(88)}] [INFO] [app.workers.tasks] event=job.started Starting job summary={{}} [job={JOB_A} rq={JOB_A} release=git:abc]\n",
+        f"[{_stamp(87)}] [INFO] [app.workers.tasks] event=job.completed Job completed successfully [job={JOB_A} rq={JOB_A} release=git:abc]\n",
+        # B has no deferral marker: its second start is still a retry.
+        f"[{_stamp(80)}] [INFO] [app.workers.tasks] event=job.started Starting job summary={{}} [job={JOB_B} rq={JOB_B} release=git:abc]\n",
+        f"[{_stamp(78)}] [INFO] [app.workers.tasks] event=job.started Starting job summary={{}} [job={JOB_B} rq={JOB_B} release=git:abc]\n",
+        f"[{_stamp(77)}] [INFO] [app.workers.tasks] event=job.completed Job completed successfully [job={JOB_B} rq={JOB_B} release=git:abc]\n",
+    ])
+
+    counts, stale, _coverage = digest.analyze_worker(
+        datetime.now() - timedelta(hours=6), grace=timedelta(minutes=30)
+    )
+
+    assert counts["deferred"] == 1
+    assert counts["retried"] == 1, "only B's unexplained restart is a retry"
+    assert counts["started"] == 2, "a resumption is not a new job"
+    assert counts["completed"] == 2
+    assert stale == []
+
+
+def test_rq_retry_wording_for_a_declared_wait_is_also_counted_as_deferred(tmp_path):
+    """RQ words a deliberate rq.Retry exactly like a post-failure reattempt."""
+    digest = _digest_module()
+    digest.LOG_DIR = tmp_path
+    _worker_log(tmp_path, [
+        f"[{_stamp(90)}] [INFO] [app.workers.tasks] event=job.started Starting job summary={{}} [job={JOB_A} rq={JOB_A} release=git:abc]\n",
+        f"[{_stamp(89)}] [INFO] [app.workers.tasks] event=job.deferred Waiting for MycoMap NCBI results reason=mycomap_ncbi_rerun resume_in_seconds=60 [job={JOB_A} rq={JOB_A} release=git:abc]\n",
+        f"[{_stamp(89)}] [INFO] [rq.worker] Worker w1: job {JOB_A} scheduled for retry\n",
+        f"[{_stamp(88)}] [INFO] [app.workers.tasks] event=job.started Starting job summary={{}} [job={JOB_A} rq={JOB_A} release=git:abc]\n",
+        f"[{_stamp(87)}] [INFO] [app.workers.tasks] event=job.completed Job completed successfully [job={JOB_A} rq={JOB_A} release=git:abc]\n",
+    ])
+
+    counts, stale, _coverage = digest.analyze_worker(
+        datetime.now() - timedelta(hours=6), grace=timedelta(minutes=30)
+    )
+
+    assert counts["retried"] == 0
+    assert counts["deferred"] == 1
+    assert counts["started"] == 1
+    assert counts["completed"] == 1
+    assert stale == []
 
 
 def test_worker_lifecycle_ignores_stale_starts_outside_the_window(tmp_path):

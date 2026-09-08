@@ -1,0 +1,4 @@
+# No arguments are permitted; job-specific approval is read from stdin.
+tree ALL=(root) NOPASSWD: /usr/local/sbin/restart-dikarya-worker-bulk ""
+# Graceful scheduling only: no arguments, no interruption consent.
+tree ALL=(root) NOPASSWD: /usr/local/sbin/restart-dikarya-worker-bulk-when-idle ""

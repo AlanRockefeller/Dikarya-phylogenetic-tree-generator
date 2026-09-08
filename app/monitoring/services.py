@@ -1,5 +1,6 @@
 import json
 import os
+import re
 import time
 import psutil
 from datetime import datetime, timedelta
@@ -401,3 +402,593 @@ def get_ai_usage(days=30):
         "models": models,
         "last_review": datetime.utcfromtimestamp(latest["ts"]).strftime("%Y-%m-%d %H:%M UTC"),
     }
+
+
+# -----------------------------------------------------------------------------
+# Live job detail
+#
+# Everything below is rendered on /admin/monitoring and served by /health/jobs,
+# both of which are unauthenticated. A Dikarya job UUID is a capability token --
+# `check_job_access(mode="view")` hands the tree to anyone holding it -- so no
+# function here may emit a full job id, and none may emit anything derived from
+# the submitted payload: no sequence headers, no notes, no outgroup name, no
+# file contents. What is safe is the shape of the work: counts, option names,
+# pipeline step states, tool names, timings and process statistics. Keep new
+# fields on that side of the line.
+# -----------------------------------------------------------------------------
+
+# Options copied verbatim out of input_info.json. Whitelisted rather than
+# filtered, because the same file holds `sequence`, `notes`, `outgroup` and
+# `sequence_metadata`, all of which are the submitter's own text.
+PUBLIC_JOB_OPTION_KEYS = (
+    "input_type", "alignment_method", "trimming_method",
+    "trim_terminal_overhangs", "fix_orientation", "its_region",
+    "tree_method", "tree_model", "bootstrap", "bootstrap_cap",
+    "enable_bootstrap", "alrt_replicates", "run_preset", "bootstrap_preset",
+    "mcmc_generations", "mcmc_nruns", "mcmc_nchains", "mcmc_stop_early",
+    "moose_enabled", "early_stopping", "blast_mode", "include_ncbi",
+    "include_local",
+)
+
+# Job-directory files worth watching for liveness, most specific first. A tool
+# that is working rewrites one of these every few seconds even when the step it
+# is in reports no progress of its own.
+JOB_ACTIVITY_GLOBS = (
+    "tree/*.log", "tree/*.raxml.*", "tree/*.ckp", "tree/*.treefile",
+    "alignment/*", "blast/*", "logs/*.log",
+)
+MAX_ACTIVITY_FILES = 400
+# How much of a tool log to read when looking for a progress line.
+PROGRESS_TAIL_BYTES = 8192
+
+
+def _job_ref(job_id):
+    """The short, non-actionable handle shown in place of a job UUID."""
+    return str(job_id or "")[:8]
+
+
+def _iso(value):
+    if isinstance(value, datetime):
+        return value.isoformat()
+    return None
+
+
+def _age_seconds(value, now=None):
+    """Seconds since a naive-UTC datetime, or None."""
+    if not isinstance(value, datetime):
+        return None
+    now = now or datetime.utcnow()
+    if value.tzinfo is not None:
+        value = value.replace(tzinfo=None)
+    return round(max(0.0, (now - value).total_seconds()), 1)
+
+
+def _read_job_option_summary(job_id):
+    """Bounded submission summary read off disk for a queued or running job."""
+    summary = {"options": {}, "sequence_count": None, "accession_count": None,
+               "total_bases": None, "warnings": 0}
+    try:
+        path = Path(current_app.config["JOB_DIR"]) / str(job_id) / "input_info.json"
+        if not path.is_file():
+            return summary
+        with open(path, "r") as handle:
+            data = json.load(handle)
+    except (OSError, ValueError):
+        return summary
+    if not isinstance(data, dict):
+        return summary
+
+    for key in PUBLIC_JOB_OPTION_KEYS:
+        value = data.get(key)
+        if isinstance(value, bool) or isinstance(value, (int, float)):
+            summary["options"][key] = value
+        elif isinstance(value, str) and value:
+            # Truncated: every whitelisted key is a short enum in practice, so
+            # a long value means something unexpected landed in it.
+            summary["options"][key] = value[:60]
+
+    sequence = data.get("sequence")
+    if isinstance(sequence, str):
+        count = sequence.count(">")
+        summary["sequence_count"] = count
+        summary["total_bases"] = max(0, len(sequence) - count)
+    accessions = data.get("accessions")
+    if isinstance(accessions, list):
+        summary["accession_count"] = len(accessions)
+    warnings = data.get("validation_warnings")
+    if isinstance(warnings, list):
+        summary["warnings"] = len(warnings)
+    return summary
+
+
+def _describe_from_rq_description(description):
+    """Fall back to the bounded description RQ already stores for the job.
+
+    A job directory does not exist until the worker starts, so a queued job has
+    no input_info.json to read. `safe_job_description` builds exactly the
+    summary needed here -- kind, input type, sequence/accession counts, tree
+    method -- and is already guaranteed to contain no payload.
+    """
+    text_value = str(description or "")
+    kind, _, rest = text_value.partition(" job=")
+    parsed = {"kind": kind.strip()[:40] or "job", "sequence_count": None,
+              "accession_count": None, "options": {}}
+    for token in rest.split(" ")[1:]:
+        key, _, value = token.partition("=")
+        if not value:
+            continue
+        if key == "sequences" and value.isdigit():
+            parsed["sequence_count"] = int(value)
+        elif key == "accessions" and value.isdigit():
+            parsed["accession_count"] = int(value)
+        elif key == "input":
+            parsed["options"]["input_type"] = value[:40]
+        elif key == "tree":
+            parsed["options"]["tree_method"] = value[:40]
+    return parsed
+
+
+def _job_work_dir(job_dir):
+    """Watch the isolated recompute workspace while its outputs are staged."""
+    stages = [p for p in job_dir.glob('.recompute-*')
+              if p.is_dir() and not p.is_symlink()]
+    return max(stages, key=lambda p: p.stat().st_mtime) if stages else job_dir
+
+
+def _job_activity(job_id):
+    """Newest touched file in the job directory, as a liveness signal.
+
+    Only the path, size and age are reported -- never the contents, and the
+    paths themselves are pipeline-generated names, not the submitter's.
+    """
+    try:
+        job_dir = Path(current_app.config["JOB_DIR"]) / str(job_id)
+        if not job_dir.is_dir():
+            return None
+        newest = None
+        seen = 0
+        work_dir = _job_work_dir(job_dir)
+        for pattern in JOB_ACTIVITY_GLOBS:
+            for path in work_dir.glob(pattern):
+                seen += 1
+                if seen > MAX_ACTIVITY_FILES:
+                    break
+                try:
+                    stat = path.stat()
+                except OSError:
+                    continue
+                if not path.is_file():
+                    continue
+                if newest is None or stat.st_mtime > newest[1]:
+                    newest = (path, stat.st_mtime, stat.st_size)
+        if newest is None:
+            return None
+        path, mtime, size = newest
+        return {
+            "file": str(path.relative_to(job_dir)),
+            "size_bytes": size,
+            "age_seconds": round(max(0.0, time.time() - mtime), 1),
+        }
+    except Exception:
+        return None
+
+
+# Progress lines emitted by the long-running tree builders. Each pattern must
+# capture numbers only: these logs also contain taxon labels, and nothing but
+# the counts may leave this function.
+_PROGRESS_PATTERNS = (
+    # RAxML-NG: "[00:12:03] Bootstrap tree #850, logLikelihood: -3156.4"
+    ("raxml", re.compile(r"Bootstrap tree #(\d+)"), "Bootstrap replicate", "bootstrap"),
+    ("raxml", re.compile(r"ML tree search #(\d+)"), "ML tree search", "ml_search"),
+    # IQ-TREE: "BOOTSTRAP REPLICATE 120" / "Iteration 250 / LogL: ..."
+    ("iqtree", re.compile(r"BOOTSTRAP REPLICATE (\d+)"), "Bootstrap replicate", "bootstrap"),
+    ("iqtree", re.compile(r"Iteration (\d+) / LogL"), "Search iteration", "iteration"),
+    # MrBayes: "      500000 -- (-3211.123) ..."
+    ("mrbayes", re.compile(r"^\s*(\d+) -- "), "MCMC generation", "generation"),
+)
+_PROGRESS_LOG_GLOBS = ("tree/*.raxml.log", "tree/*.iqtree.log", "tree/*.log",
+                       "logs/tree_builder.log")
+
+
+def _tool_progress(job_id, options):
+    """Best-effort "how far along is the tree builder" reading.
+
+    Tails the tool's own log for a counter line. Returns None when the running
+    tool publishes no countable progress (FastTree, MAFFT, trimAl), which is
+    normal and not an error.
+    """
+    try:
+        job_dir = Path(current_app.config["JOB_DIR"]) / str(job_id)
+        if not job_dir.is_dir():
+            return None
+        work_dir = _job_work_dir(job_dir)
+        candidates = []
+        for pattern in _PROGRESS_LOG_GLOBS:
+            for path in work_dir.glob(pattern):
+                try:
+                    if path.is_file() and path.stat().st_size:
+                        candidates.append((path.stat().st_mtime, path))
+                except OSError:
+                    continue
+        if not candidates:
+            return None
+        candidates.sort(reverse=True)
+        path = candidates[0][1]
+        from app.services.artifact_storage import open_artifact
+        with open_artifact(path, "rb") as handle:
+            handle.seek(0, os.SEEK_END)
+            size = handle.tell()
+            handle.seek(max(0, size - PROGRESS_TAIL_BYTES))
+            tail = handle.read().decode("utf-8", "replace")
+    except OSError:
+        return None
+
+    best = None
+    for line in reversed(tail.splitlines()):
+        for tool, pattern, label, kind in _PROGRESS_PATTERNS:
+            match = pattern.search(line)
+            if match:
+                best = (tool, label, kind, int(match.group(1)))
+                break
+        if best:
+            break
+    if not best:
+        return None
+
+    tool, label, kind, current = best
+    total = None
+    options = options or {}
+    if kind == "bootstrap":
+        for key in ("bootstrap_cap", "bootstrap", "alrt_replicates"):
+            value = options.get(key)
+            if isinstance(value, int) and value > 0:
+                total = value
+                break
+    elif kind == "generation":
+        value = options.get("mcmc_generations")
+        if isinstance(value, int) and value > 0:
+            total = value
+
+    percent = None
+    if total:
+        percent = round(min(100.0, current / total * 100), 1)
+    return {
+        "tool": tool,
+        "label": label,
+        "current": current,
+        "total": total,
+        "percent": percent,
+        "source": str(path.name)[:80],
+    }
+
+
+def _process_stats(pid):
+    """CPU/memory for a worker's work horse and the tool it spawned.
+
+    Average CPU is derived from cpu_times over the process lifetime rather than
+    sampled, so this costs no wall-clock delay in the request.
+    """
+    processes = []
+    try:
+        parent = psutil.Process(int(pid))
+    except (psutil.Error, TypeError, ValueError):
+        return processes
+    try:
+        candidates = [parent] + parent.children(recursive=True)
+    except psutil.Error:
+        candidates = [parent]
+    now = time.time()
+    for proc in candidates[:20]:
+        try:
+            with proc.oneshot():
+                cpu_times = proc.cpu_times()
+                runtime = max(0.001, now - proc.create_time())
+                cpu_seconds = cpu_times.user + cpu_times.system
+                processes.append({
+                    # Executable name only. The command line carries job paths
+                    # and, for some tools, label arguments.
+                    "name": proc.name()[:40],
+                    "pid": proc.pid,
+                    "role": "worker" if proc.pid == parent.pid else "tool",
+                    "status": proc.status(),
+                    "threads": proc.num_threads(),
+                    "rss_bytes": proc.memory_info().rss,
+                    "cpu_seconds": round(cpu_seconds, 1),
+                    "avg_cpu_percent": round(cpu_seconds / runtime * 100, 1),
+                    "runtime_seconds": round(runtime, 1),
+                })
+        except psutil.Error:
+            continue
+    # The work horse's own siblings (RQ scheduler, the previous fork) show up
+    # here too and are indistinguishable by name, so order by how much CPU each
+    # has actually consumed: the tool doing the job sorts to the top.
+    processes.sort(key=lambda proc: (proc["role"] != "worker", -proc["cpu_seconds"]))
+    return processes[:8]
+
+
+def _steps_from_meta(meta, now=None):
+    """Flatten job.meta['steps'] into an ordered list with durations."""
+    from app.workers.events import PIPELINE_STEPS
+
+    now = now if now is not None else time.time()
+    raw = meta.get("steps") if isinstance(meta, dict) else None
+    if not isinstance(raw, dict):
+        return []
+    ordered = [key for key in PIPELINE_STEPS if key in raw]
+    ordered += [key for key in raw if key not in ordered]
+    steps = []
+    for key in ordered:
+        entry = raw.get(key)
+        if not isinstance(entry, dict):
+            continue
+        started = entry.get("started_at")
+        ended = entry.get("ended_at")
+        duration = None
+        if isinstance(started, (int, float)):
+            end = ended if isinstance(ended, (int, float)) else now
+            duration = round(max(0.0, end - started), 1)
+        steps.append({
+            "key": key,
+            "label": str(entry.get("label") or key)[:80],
+            "state": str(entry.get("state") or "queued")[:20],
+            # Step details are counts and option names by construction (see
+            # tasks.py); bounded anyway so a future one cannot run long.
+            "detail": str(entry.get("detail") or "")[:200],
+            "tool": str(entry.get("tool") or "")[:40] or None,
+            "started_at": started if isinstance(started, (int, float)) else None,
+            "ended_at": ended if isinstance(ended, (int, float)) else None,
+            "duration_seconds": duration,
+        })
+    return steps
+
+
+def _describe_rq_job(rq_job, state, now=None, worker=None, position=None,
+                     include_processes=True):
+    """Render one RQ job as the public live-job record."""
+    now_dt = now or datetime.utcnow()
+    job_id = rq_job.id
+    meta = rq_job.meta if isinstance(rq_job.meta, dict) else {}
+    summary = _read_job_option_summary(job_id)
+    described = _describe_from_rq_description(rq_job.description)
+    if summary["sequence_count"] is None:
+        summary["sequence_count"] = described["sequence_count"]
+    if summary["accession_count"] is None:
+        summary["accession_count"] = described["accession_count"]
+    for key, value in described["options"].items():
+        summary["options"].setdefault(key, value)
+    steps = _steps_from_meta(meta)
+    current_key = meta.get("current_step")
+    current = next((s for s in steps if s["key"] == current_key), None)
+    if current is None:
+        current = next((s for s in steps if s["state"] == "running"), None)
+
+    elapsed = _age_seconds(rq_job.started_at, now_dt) if rq_job.started_at else None
+    timeout = rq_job.timeout if isinstance(rq_job.timeout, (int, float)) else None
+
+    record = {
+        "ref": _job_ref(job_id),
+        "state": state,
+        "queue": str(rq_job.origin or "")[:40],
+        "position": position,
+        "worker": _job_ref(rq_job.worker_name) if rq_job.worker_name else None,
+        "kind": described["kind"],
+        "enqueued_at": _iso(rq_job.enqueued_at),
+        "started_at": _iso(rq_job.started_at),
+        "wait_seconds": None,
+        "elapsed_seconds": elapsed,
+        "timeout_seconds": timeout,
+        "timeout_used_percent": (
+            round(min(100.0, elapsed / timeout * 100), 1)
+            if timeout and elapsed is not None else None
+        ),
+        "input": {
+            "sequence_count": summary["sequence_count"],
+            "accession_count": summary["accession_count"],
+            "total_bases": summary["total_bases"],
+            "warnings": summary["warnings"],
+        },
+        "options": summary["options"],
+        "steps": steps,
+        "steps_done": sum(1 for s in steps if s["state"] in ("done", "skipped")),
+        "steps_total": len(steps),
+        "current_step": current["key"] if current else None,
+        "current_step_label": current["label"] if current else None,
+        "current_step_seconds": current["duration_seconds"] if current else None,
+        "current_tool": str(meta.get("current_tool") or "")[:40] or None,
+        "activity": None,
+        "progress": None,
+        "processes": [],
+    }
+
+    # Queue wait: enqueued -> started for a running job, enqueued -> now for one
+    # still waiting.
+    if rq_job.enqueued_at:
+        end = rq_job.started_at if rq_job.started_at else None
+        if end is not None:
+            record["wait_seconds"] = round(
+                max(0.0, (end - rq_job.enqueued_at).total_seconds()), 1
+            )
+        else:
+            record["wait_seconds"] = _age_seconds(rq_job.enqueued_at, now_dt)
+
+    if state == "running":
+        record["activity"] = _job_activity(job_id)
+        record["progress"] = _tool_progress(job_id, summary["options"])
+        if include_processes and worker is not None and getattr(worker, "pid", None):
+            record["processes"] = _process_stats(worker.pid)
+    return record
+
+
+def get_active_jobs(max_queued=25):
+    """Everything currently running or waiting, in pipeline-level detail.
+
+    Reads RQ directly rather than the database: the database knows a job is
+    "running", RQ knows which worker has it, which pipeline step it is on, how
+    long that step has taken and how much of its timeout budget is gone.
+    """
+    from app.workers.queue import get_redis_connection, QUEUE_HIGH, QUEUE_BULK
+    from rq import Queue, Worker
+    from rq.registry import StartedJobRegistry
+
+    payload = {
+        "generated_at": datetime.utcnow().isoformat(),
+        "available": False,
+        "error": None,
+        "running": [],
+        "queued": [],
+        "queued_total": 0,
+        "queues": [],
+    }
+
+    try:
+        conn = get_redis_connection()
+        conn.ping()
+        workers = Worker.all(connection=conn)
+    except Exception as exc:
+        logger.warning("live jobs: redis unavailable: %s", exc)
+        payload["error"] = "Queue backend unavailable"
+        return payload
+
+    payload["available"] = True
+    workers_by_name = {worker.name: worker for worker in workers}
+    now = datetime.utcnow()
+
+    for queue_name in (QUEUE_HIGH, QUEUE_BULK):
+        try:
+            queue = Queue(queue_name, connection=conn)
+            registry = StartedJobRegistry(name=queue_name, connection=conn)
+            started_ids = registry.get_job_ids()
+            queued_jobs = queue.get_jobs(0, max_queued)
+            serving = [w.name for w in workers if queue_name in
+                       {q.name for q in getattr(w, "queues", [])}]
+            oldest = None
+
+            for rq_job in queue.get_jobs(0, 1):
+                oldest = _age_seconds(rq_job.enqueued_at, now)
+
+            payload["queues"].append({
+                "name": queue_name,
+                "queued": queue.count,
+                "running": len(started_ids),
+                "workers": len(serving),
+                "failed": len(queue.failed_job_registry.get_job_ids()),
+                "deferred": queue.deferred_job_registry.count,
+                "scheduled": queue.scheduled_job_registry.count,
+                "oldest_wait_seconds": oldest,
+            })
+            payload["queued_total"] += queue.count
+
+            for job_id in started_ids:
+                try:
+                    rq_job = queue.fetch_job(job_id)
+                except Exception:
+                    rq_job = None
+                if rq_job is None:
+                    continue
+                worker = workers_by_name.get(rq_job.worker_name)
+                payload["running"].append(
+                    _describe_rq_job(rq_job, "running", now=now, worker=worker)
+                )
+
+            for position, rq_job in enumerate(queued_jobs, start=1):
+                if rq_job is None:
+                    continue
+                payload["queued"].append(
+                    _describe_rq_job(rq_job, "queued", now=now, position=position)
+                )
+        except Exception as exc:
+            logger.warning("live jobs: queue %s unreadable: %s", queue_name, exc)
+
+    payload["running"].sort(key=lambda job: -(job["elapsed_seconds"] or 0))
+    payload["queued"].sort(key=lambda job: -(job["wait_seconds"] or 0))
+    return payload
+
+
+def get_worker_details():
+    """Heartbeat files joined with what RQ knows about each worker process."""
+    status = get_worker_status()
+    workers = {entry["id"]: dict(entry) for entry in status.get("workers", [])}
+
+    try:
+        from app.workers.queue import get_redis_connection
+        from rq import Worker
+
+        conn = get_redis_connection()
+        now = datetime.utcnow()
+        for worker in Worker.all(connection=conn):
+            entry = workers.setdefault(worker.name, {
+                "id": worker.name,
+                "status": "no_heartbeat_file",
+                "last_heartbeat": None,
+                "age_seconds": None,
+            })
+            entry.update({
+                "ref": _job_ref(worker.name),
+                "pid": worker.pid,
+                "hostname": str(getattr(worker, "hostname", "") or "")[:60],
+                "queues": [q.name for q in getattr(worker, "queues", [])],
+                "rq_state": str(worker.get_state() or "")[:20],
+                "birth_age_seconds": _age_seconds(worker.birth_date, now),
+                "successful_jobs": worker.successful_job_count,
+                "failed_jobs": worker.failed_job_count,
+                "total_working_seconds": round(worker.total_working_time or 0, 1),
+                "current_job": _job_ref(worker.get_current_job_id()),
+                "current_job_seconds": (
+                    round(worker.current_job_working_time, 1)
+                    if getattr(worker, "current_job_working_time", None) else None
+                ),
+                "rq_version": str(getattr(worker, "version", "") or "")[:20],
+            })
+    except Exception as exc:
+        logger.warning("worker details: RQ registry unreadable: %s", exc)
+
+    for entry in workers.values():
+        entry.setdefault("ref", _job_ref(entry.get("id")))
+        entry.setdefault("queues", [])
+
+    rank = {"healthy": 0, "stale": 1, "dead": 2}
+    result = {"workers": sorted(
+        workers.values(),
+        key=lambda w: (rank.get(w.get("status"), 9), w.get("age_seconds") or 0),
+    )}
+    # Preserve the "no_workers_dir" signal the template distinguishes from
+    # "the directory is there and empty".
+    if status.get("status") and not result["workers"]:
+        result["status"] = status["status"]
+    return result
+
+
+def get_recent_jobs(limit=12):
+    """The last handful of finished jobs, for context under the live list."""
+    try:
+        rows = (
+            Job.query
+            .filter(Job.status.notin_(("queued", "running")))
+            .order_by(Job.updated_at.desc().nullslast())
+            .limit(limit)
+            .all()
+        )
+    except Exception as exc:
+        logger.warning("recent jobs: query failed: %s", exc)
+        try:
+            db.session.rollback()
+        except Exception:
+            pass
+        return []
+
+    recent = []
+    for job in rows:
+        duration = None
+        if job.created_at and job.updated_at:
+            duration = round(max(0.0, (job.updated_at - job.created_at).total_seconds()), 1)
+        metrics = job.metrics if isinstance(job.metrics, dict) else {}
+        recent.append({
+            "ref": _job_ref(job.id),
+            "status": job.status,
+            "input_type": str(job.input_type or "")[:40],
+            "finished_age_seconds": _age_seconds(job.updated_at),
+            "duration_seconds": duration,
+            # A bounded, non-payload field the worker already writes.
+            "failed_step": str(metrics.get("failed_step") or "")[:40] or None,
+        })
+    return recent

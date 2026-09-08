@@ -32,10 +32,13 @@ A third Biopython default is corrected here for the same reason as the first:
 ``tree_edit_service`` under the name the rest of the codebase already uses.
 """
 
+import logging
 import re
 from io import StringIO
 from pathlib import Path
 from typing import Optional
+
+logger = logging.getLogger(__name__)
 
 try:
     from Bio import Phylo
@@ -258,9 +261,14 @@ def write_tree_file(tree, path, fmt: str = "newick") -> None:
         write_nexus_tree(tree, path)
         return
     if fmt == "newick":
-        # Through the shared renderer, so a file on disk and a string in memory
-        # agree about clades that carry no branch length.
-        Path(path).write_text(_render_newick(tree) + "\n", encoding="utf-8")
+        # Through `tree_to_newick_string`, not `_render_newick` directly, so a
+        # file on disk and a string in memory agree about clades that carry no
+        # branch length *and* are subject to the same guard against an internal
+        # node carrying both a name and a confidence. Rendering fully before
+        # touching the path means a rejected tree leaves no truncated file
+        # behind.
+        text = tree_to_newick_string(tree)
+        Path(path).write_text(text + "\n", encoding="utf-8")
         return
     Phylo.write(
         tree, str(path), fmt,
@@ -268,10 +276,61 @@ def write_tree_file(tree, path, fmt: str = "newick") -> None:
     )
 
 
-_NTAX_TAXLABELS_RE = re.compile(
-    r"dimensions\s+ntax\s*=\s*(\d+)\s*;\s*taxlabels\s+([^;]*);",
-    re.IGNORECASE,
-)
+_NTAX_RE = re.compile(r"dimensions\s+ntax\s*=\s*(\d+)\s*;", re.IGNORECASE)
+_TAXLABELS_RE = re.compile(r"taxlabels\b", re.IGNORECASE)
+
+
+def _parse_taxlabels(text: str):
+    """Return ``(declared_ntax, [label, ...])`` for a TAXA block, or None.
+
+    Hand-scanned rather than matched with a regex because the block terminates
+    at a semicolon *outside* quotes, and fungal labels are full of semicolons
+    inside them -- a GenBank description reads "... partial sequence; 5.8S
+    ribosomal RNA gene, complete sequence; and ...". A ``[^;]*`` capture stops
+    at the first of those, truncating the list and reporting a bogus token
+    count for a perfectly valid file.
+    """
+    ntax_match = _NTAX_RE.search(text)
+    if not ntax_match:
+        return None
+    labels_match = _TAXLABELS_RE.search(text, ntax_match.end())
+    if not labels_match:
+        return None
+
+    tokens: list[str] = []
+    current = ""
+    index, end = labels_match.end(), len(text)
+    while index < end:
+        char = text[index]
+        if char == "'":
+            # Quoted label; a doubled '' is an escaped quote, not the end.
+            index += 1
+            buffer = []
+            while index < end:
+                if text[index] == "'":
+                    if index + 1 < end and text[index + 1] == "'":
+                        buffer.append("'")
+                        index += 2
+                        continue
+                    index += 1
+                    break
+                buffer.append(text[index])
+                index += 1
+            tokens.append("".join(buffer))
+            continue
+        if char == ";":
+            if current:
+                tokens.append(current)
+            return int(ntax_match.group(1)), tokens
+        if char.isspace():
+            if current:
+                tokens.append(current)
+                current = ""
+            index += 1
+            continue
+        current += char
+        index += 1
+    return None  # unterminated block
 
 
 def validate_nexus_file(path) -> tuple:
@@ -307,11 +366,9 @@ def validate_nexus_file(path) -> tuple:
     if not re.search(r"^\s*tree\s+\S+\s*=", text, re.IGNORECASE | re.MULTILINE):
         return False, "no_tree_statement"
 
-    match = _NTAX_TAXLABELS_RE.search(text)
-    if match:
-        declared = int(match.group(1))
-        # Quoted labels are one token each however much whitespace they hold.
-        tokens = re.findall(r"'(?:[^']|'')*'|\S+", match.group(2))
+    parsed = _parse_taxlabels(text)
+    if parsed:
+        declared, tokens = parsed
         if len(tokens) != declared:
             return False, f"taxlabels_{len(tokens)}_vs_ntax_{declared}"
 
@@ -334,12 +391,101 @@ def newick_file_to_nexus(newick_path, nexus_path, comment: Optional[str] = None)
     re-quotes them under the stricter rule, so this is also what repairs a
     Newick that was quoted for Newick only.
     """
-    if not HAS_BIOPYTHON:
+    text = newick_file_to_nexus_text(newick_path, comment=comment)
+    if text is None:
         return False
+    Path(nexus_path).write_text(text, encoding="utf-8")
+    return True
+
+
+def newick_file_to_nexus_text(newick_path, comment: Optional[str] = None) -> Optional[str]:
+    """Render a Newick file as NEXUS text, or None if it cannot be read.
+
+    The in-memory half of `newick_file_to_nexus`, for callers that want to hand
+    the result straight to a client instead of putting it on disk.
+    """
+    if not HAS_BIOPYTHON:
+        return None
+    import tempfile
+
     try:
         tree = Phylo.read(str(newick_path), "newick")
-        write_nexus_tree(tree, nexus_path, comment=comment)
-        return True
+        # write_nexus_tree writes a path; there is no string form of it, and
+        # duplicating its body to make one would be two writers to keep in step.
+        with tempfile.TemporaryDirectory() as scratch:
+            staged = Path(scratch) / "tree.nexus"
+            write_nexus_tree(tree, staged, comment=comment)
+            return staged.read_text(encoding="utf-8")
     except Exception as exc:
         logger.error("Failed to convert %s to NEXUS: %s", newick_path, exc)
-        return False
+        return None
+
+
+def build_nexus_download(job_dir) -> Optional[tuple]:
+    """Return ``(nexus_bytes, source_filename)`` for a job's NEXUS download.
+
+    Serving ``tree/*.nexus`` off disk directly is not safe, for two reasons
+    that both show up as "my NEXUS file will not open":
+
+    * Almost every stored NEXUS predates `write_nexus_tree` and was produced by
+      Biopython's writer, which emits TAXLABELS unquoted and space-separated.
+      Any label with a space -- i.e. essentially all of them -- inflates the
+      token count past the declared NTAX, and a label containing ``(`` or ``;``
+      truncates the block outright. 82% of the ~10,500 files on disk fail
+      `validate_nexus_file`; regenerating from the sibling Newick repairs all
+      of them, because the Newick carries the same labels correctly quoted.
+    * `tree_pruned.nexus` exists for only ~5% of jobs that have a
+      `tree_pruned.newick`, so a job whose tree has been edited served the
+      *unpruned* original under a name that promised the current tree, while
+      the Newick download beside it served the pruned one.
+
+    So the Newick is treated as the source of truth and the stored NEXUS is
+    used only when it is both valid and no older than that Newick. Nothing is
+    written back: a download is not a tree edit, and regenerating in memory
+    keeps it clear of tree_state locking and of the undo snapshot.
+    """
+    job_dir = Path(job_dir)
+    tree_dir = job_dir / "tree"
+
+    def usable(path) -> bool:
+        # The same containment rule validate_safe_file_path() applies at the
+        # route: a real file, never a symlink, resolving inside the job dir.
+        try:
+            if path.is_symlink() or not path.is_file():
+                return False
+            return path.resolve().is_relative_to(job_dir.resolve())
+        except OSError:
+            return False
+
+    # Same preference order as /download/tree/newick, so the two downloads can
+    # never describe different trees.
+    for nexus_name, newick_name in (
+        ("tree_pruned.nexus", "tree_pruned.newick"),
+        ("tree_original.nexus", "tree_original.newick"),
+    ):
+        nexus_path = tree_dir / nexus_name
+        newick_path = tree_dir / newick_name
+        has_nexus = usable(nexus_path)
+        has_newick = usable(newick_path)
+        if not has_nexus and not has_newick:
+            continue
+
+        if has_nexus and validate_nexus_file(nexus_path)[0]:
+            fresh = not has_newick or (
+                nexus_path.stat().st_mtime >= newick_path.stat().st_mtime
+            )
+            if fresh:
+                return nexus_path.read_bytes(), nexus_name
+
+        if has_newick:
+            text = newick_file_to_nexus_text(newick_path)
+            if text is not None:
+                return text.encode("utf-8"), newick_name
+
+        if has_nexus:
+            # Unparseable and unrepairable. Handing back what we have beats a
+            # 404 -- the user can still see the labels in it.
+            logger.warning("Serving unrepaired NEXUS %s", nexus_path)
+            return nexus_path.read_bytes(), nexus_name
+
+    return None

@@ -7,6 +7,8 @@ hundreds of zero-length branches that the tree builder never produced -- and a
 zero-length terminal branch reads as "these sequences are identical".
 """
 
+import os
+import time
 from io import StringIO
 
 import pytest
@@ -389,3 +391,101 @@ def test_nexus_writer_round_trips_ordinary_taxa_exactly(tmp_path):
 
     reloaded = Phylo.read(str(path), "nexus")
     assert [tip.name for tip in reloaded.get_terminals()] == ["Alpha", "Beta", "Gamma"]
+
+
+# ---------------------------------------------------------------------------
+# The NEXUS download is rebuilt rather than served off disk.
+#
+# ~82% of the tree_original.nexus files in var/jobs were written by Biopython's
+# NEXUS writer, which emits TAXLABELS unquoted and space-separated: a label
+# with a space inflates the token count past NTAX and one containing "(" or ";"
+# truncates the block. Separately, tree_pruned.nexus exists for only ~5% of the
+# jobs that have a tree_pruned.newick, so an edited tree's NEXUS download used
+# to hand back the unpruned original.
+# ---------------------------------------------------------------------------
+
+_BROKEN_NEXUS = """#NEXUS
+
+BEGIN TAXA;
+    DIMENSIONS NTAX=2;
+    TAXLABELS Amanita sp. (PNW-01) Boletus edulis ;
+END;
+
+BEGIN TREES;
+    TREE tree1 = [&U] (Amanita sp. (PNW-01):0.1,Boletus edulis:0.2);
+END;
+"""
+
+
+def _job_with_trees(tmp_path, *, pruned_newick=None, original_nexus=None,
+                    pruned_nexus=None):
+    tree_dir = tmp_path / "tree"
+    tree_dir.mkdir(parents=True, exist_ok=True)
+    (tree_dir / "tree_original.newick").write_text(
+        "('Amanita sp. (PNW-01)':0.1,'Boletus; edulis, 2024':0.2,'C':0.3);\n"
+    )
+    if pruned_newick is not None:
+        (tree_dir / "tree_pruned.newick").write_text(pruned_newick)
+    if original_nexus is not None:
+        (tree_dir / "tree_original.nexus").write_text(original_nexus)
+    if pruned_nexus is not None:
+        (tree_dir / "tree_pruned.nexus").write_text(pruned_nexus)
+    return tmp_path
+
+
+def test_nexus_download_repairs_a_nexus_written_by_biopythons_writer(tmp_path):
+    from app.services.tree_io import build_nexus_download
+
+    job_dir = _job_with_trees(tmp_path, original_nexus=_BROKEN_NEXUS)
+    assert validate_nexus_file(job_dir / "tree" / "tree_original.nexus")[0] is False
+
+    content, source = build_nexus_download(job_dir)
+    rebuilt = tmp_path / "served.nexus"
+    rebuilt.write_bytes(content)
+
+    assert source == "tree_original.newick"
+    assert validate_nexus_file(rebuilt)[0] is True
+    text = rebuilt.read_text()
+    # The punctuation the old writer lost survives, quoted, in both blocks.
+    assert "'Amanita sp. (PNW-01)'" in text
+    assert "'Boletus; edulis, 2024'" in text
+    assert "NTAX=3" in text
+
+
+def test_nexus_download_follows_the_pruned_tree_like_the_newick_download(tmp_path):
+    from app.services.tree_io import build_nexus_download
+
+    job_dir = _job_with_trees(
+        tmp_path,
+        pruned_newick="('Amanita sp. (PNW-01)':0.1,'C':0.3);\n",
+        original_nexus=_BROKEN_NEXUS,
+    )
+
+    content, source = build_nexus_download(job_dir)
+    text = content.decode()
+
+    assert source == "tree_pruned.newick"
+    assert "NTAX=2" in text
+    assert "Boletus" not in text
+
+
+def test_nexus_download_keeps_a_valid_stored_file(tmp_path):
+    from app.services.tree_io import build_nexus_download
+
+    tree = Phylo.read(StringIO("('A b':0.1,'C d':0.2);"), "newick")
+    job_dir = _job_with_trees(tmp_path, pruned_newick="('A b':0.1,'C d':0.2);\n")
+    stored = job_dir / "tree" / "tree_pruned.nexus"
+    write_nexus_tree(tree, stored)
+    os.utime(stored, (time.time() + 10, time.time() + 10))
+
+    content, source = build_nexus_download(job_dir)
+
+    assert source == "tree_pruned.nexus"
+    assert content == stored.read_bytes()
+
+
+def test_nexus_download_reports_nothing_when_no_tree_exists(tmp_path):
+    from app.services.tree_io import build_nexus_download
+
+    (tmp_path / "tree").mkdir()
+    assert build_nexus_download(tmp_path) is None

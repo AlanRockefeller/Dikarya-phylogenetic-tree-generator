@@ -203,6 +203,43 @@ def discard_gzipped_form(path: PathLike) -> int:
     return 0
 
 
+_DEFAULT_FILE_MODE: Optional[int] = None
+
+
+def default_file_mode() -> int:
+    """The mode a plain `open(path, "w")` would produce in this process.
+
+    Files written atomically -- write a `tempfile.mkstemp()` file, then
+    `os.replace()` it over the target -- do not get this for free: mkstemp
+    creates 0600 by design, so the mode has to be set explicitly. Where the
+    target already exists its mode is preserved; where it does not, the
+    fallback used to be a hardcoded 0644, which silently ignored the service
+    UMask. That mattered once the units set `UMask=0002` so the `dikarya`
+    group can maintain jobs: every other file in a new job directory came out
+    0664 while `tree_state.json` -- created by this path, and then *kept* at
+    its existing mode by every later save -- stayed 0644 forever.
+
+    `os.umask()` is a process-wide read-modify-write and Gunicorn runs
+    `--threads 8`, so the value is read from /proc rather than toggled: a
+    concurrent request creating a file inside the toggle window would get the
+    wrong mode. The umask does not change over a process's life, so it is read
+    once.
+    """
+    global _DEFAULT_FILE_MODE
+    if _DEFAULT_FILE_MODE is None:
+        mode = 0o644
+        try:
+            with open("/proc/self/status", "r") as status:
+                for line in status:
+                    if line.startswith("Umask:"):
+                        mode = 0o666 & ~int(line.split()[1], 8)
+                        break
+        except (OSError, ValueError, IndexError):
+            pass
+        _DEFAULT_FILE_MODE = mode
+    return _DEFAULT_FILE_MODE
+
+
 def discard_artifact(path: PathLike) -> int:
     """
     Delete an artifact in whichever form it exists. Returns bytes reclaimed.

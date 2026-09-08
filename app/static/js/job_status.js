@@ -10,6 +10,14 @@ class JobStatusClient {
     // Upper bound on retained terminal rows (see _trimTerminal).
     static MAX_LOG_LINES = 2000;
 
+    // Alan 9/7/26 - Fallback interval for /downloads/available, not the primary
+    // signal. Downloads appear as pipeline steps finish, and every one of those
+    // arrives over SSE, so handleStepDone() refreshes immediately and this poll
+    // only has to cover a missed event. It used to be 5s unconditionally: one
+    // browser watching two RAxML runs made 2,543 requests to that endpoint in
+    // four hours -- 37.7% of all application requests that evening.
+    static DOWNLOADS_POLL_MS = 30000;
+
     // Alan 8/23/26 - The only stream values that may become a CSS class. 'cmd' is
     // what publish_command() emits and is what makes the "$ mafft ..." lines green;
     // whitelisting rather than passing event.stream through keeps a hostile value
@@ -24,6 +32,19 @@ class JobStatusClient {
         this.elapsedTimer = null;
         this.lastStatus = null;
         this.isRedirecting = false;
+
+        // Alan 8/31/26 - Activity Feed bookkeeping. Every line is filed under a
+        // stable key so a snapshot (sent on first connect AND on every SSE
+        // reconnect) can top up the feed instead of clearing it: the old code
+        // wiped the feed and rebuilt it from job.meta, silently dropping every
+        // message that meta does not record -- MycoMap progress, NCBI waits,
+        // "posted to iNaturalist" -- each time a stream was cut and retried.
+        this._feedItems = new Map();
+        this._stepStarts = {};
+        this._stepLabels = {};
+        this._liveEntry = null;
+        this._lastActivityAt = null;
+        this._feedTicker = null;
 
         // DOM elements
         this.elements = {
@@ -47,6 +68,7 @@ class JobStatusClient {
             orient: document.getElementById('step-orient'),
             blast: document.getElementById('step-blast'),
             align: document.getElementById('step-align'),
+            its: document.getElementById('step-its'),
             trim: document.getElementById('step-trim'),
             tree: document.getElementById('step-tree'),
             post: document.getElementById('step-post'),
@@ -68,6 +90,9 @@ class JobStatusClient {
     }
 
     connect() {
+        this._downloadsStopped = false;
+        this._bindDownloadsVisibility();
+        this.refreshDownloads();
         // Alan 8/23/26 - Never leave a second stream open: each one holds a server
         // request slot, and the pageshow reconnect below can call this again.
         if (this.eventSource) {
@@ -114,6 +139,9 @@ class JobStatusClient {
     }
 
     disconnect() {
+        this._downloadsStopped = true;
+        clearTimeout(this._downloadsTimer);
+        this._freezeLiveEntry();
         if (this.eventSource) {
             this.eventSource.close();
             this.eventSource = null;
@@ -137,6 +165,82 @@ class JobStatusClient {
             indicator.classList.add('disconnected');
             text.textContent = 'Reconnecting...';
         }
+    }
+
+    async refreshDownloads() {
+        if (this._downloadsLoading) {
+            this._downloadsRefreshPending = true;
+            return;
+        }
+        clearTimeout(this._downloadsTimer);
+        this._downloadsLoading = true;
+        try {
+            const response = await fetch(`/api/job/${this.jobId}/downloads/available`, {
+                cache: 'no-store', signal: AbortSignal.timeout(10000),
+            });
+            if (!response.ok) return;
+            const available = await response.json();
+            let added = 0;
+            for (const [id, ready] of Object.entries(available)) {
+                const link = document.getElementById(id);
+                if (!link) continue;
+                const newlyReady = ready && link.style.display === 'none';
+                link.style.display = ready ? '' : 'none';
+                if (newlyReady) {
+                    added++;
+                    if (!window.matchMedia('(prefers-reduced-motion: reduce)').matches) {
+                        link.animate([
+                            { opacity: 0, transform: 'translateY(8px)', backgroundColor: 'rgba(212,175,55,.35)' },
+                            { opacity: 1, transform: 'translateY(0)', backgroundColor: 'transparent' },
+                        ], { duration: 650, delay: (added - 1) * 65, easing: 'ease-out' });
+                    }
+                }
+            }
+            document.getElementById('dl-mrbayes-heading').style.display = available['dl-mrbayes'] ? '' : 'none';
+            const count = Object.values(available).filter(Boolean).length;
+            const badge = document.getElementById('downloads-ready-count');
+            badge.textContent = count ? `${count} ready` : '';
+            if (added && this._downloadsInitialized) {
+                document.getElementById('downloads-announcement').textContent = `${added} new download${added === 1 ? '' : 's'} ready`;
+                if (!window.matchMedia('(prefers-reduced-motion: reduce)').matches) {
+                    badge.animate([{ transform: 'scale(1)' }, { transform: 'scale(1.2)' }, { transform: 'scale(1)' }], { duration: 550 });
+                }
+            }
+            this._downloadsInitialized = true;
+        } catch (error) {
+            // A transient outage leaves the last known availability intact.
+        } finally {
+            this._downloadsLoading = false;
+            if (this._downloadsRefreshPending) {
+                this._downloadsRefreshPending = false;
+                this.refreshDownloads();
+            } else {
+                this._scheduleDownloadsPoll();
+            }
+        }
+    }
+
+    _scheduleDownloadsPoll() {
+        clearTimeout(this._downloadsTimer);
+        // A hidden tab is not watching downloads appear. Nothing is lost by
+        // waiting: becoming visible refreshes immediately, and the terminal
+        // paths below refresh regardless of visibility.
+        if (this._downloadsStopped || document.hidden) return;
+        this._downloadsTimer = setTimeout(() => this.refreshDownloads(), JobStatusClient.DOWNLOADS_POLL_MS);
+    }
+
+    _bindDownloadsVisibility() {
+        if (this._downloadsVisibilityBound) return;
+        this._downloadsVisibilityBound = true;
+        document.addEventListener('visibilitychange', () => {
+            if (document.hidden) {
+                clearTimeout(this._downloadsTimer);
+                return;
+            }
+            // Catch up on anything that became available while hidden, then
+            // resume the fallback poll from here.
+            if (!this._downloadsStopped) this.refreshDownloads();
+        });
     }
 
     handleSnapshot(data) {
@@ -171,16 +275,6 @@ class JobStatusClient {
         if (job.meta && job.meta.steps) {
             this.updateTimeline(job.meta.steps);
 
-            // Show/hide trimmed FASTA download based on whether trimming was performed
-            const trimStep = job.meta.steps.trim;
-            const trimmedLink = document.getElementById('dl-trimmed');
-            if (trimmedLink) {
-                if (trimStep && trimStep.state && trimStep.state !== 'skipped') {
-                    trimmedLink.style.display = '';
-                } else {
-                    trimmedLink.style.display = 'none';
-                }
-            }
         }
 
         // Update current step
@@ -196,16 +290,16 @@ class JobStatusClient {
         // Populate logs
         this.populateLogTails(logTails);
 
-        // Sync Overview Feed with historical steps
-        // 1. Clear default "Waiting..." message
-        this.elements.overviewFeed.innerHTML = '';
+        // Sync Overview Feed with historical steps. Entries already on screen are
+        // matched by key and left alone, so this both backfills a fresh page load
+        // and fills in whatever was missed while a dropped stream reconnected.
 
         // Alan 7/10/26 - Restore MycoMap refresh fallback warnings when a user opens or reloads the status page.
         const mycomapRefreshWarnings = Array.isArray(job.meta?.mycomap_refresh_warnings)
             ? job.meta.mycomap_refresh_warnings
             : [];
         mycomapRefreshWarnings.forEach(message => {
-            this.appendOverview({ message, icon: 'failed' });
+            this.appendOverview({ message, icon: 'failed', key: `msg:${message}` });
         });
 
         // Alan 8/5/26 - Tell the user when a job was auto-resubmitted after a server
@@ -213,42 +307,93 @@ class JobStatusClient {
         // like it stalled or lost progress.
         if (job.interrupted_notice && !this._noticedRequeue) {
             this._noticedRequeue = true;
-            this.appendOverview({ message: job.interrupted_notice, icon: 'running' });
+            this.appendOverview({
+                message: job.interrupted_notice, icon: 'running', key: 'job:interrupted',
+            });
         }
 
-        // 2. Add "Job started" if applicable
+        // 2. Queue wait, then "Job started". The wait is measured by the server and
+        // was previously computed and thrown away.
+        if (job.started_at && Number.isFinite(job.queue_wait_seconds) && job.queue_wait_seconds >= 1) {
+            this.appendOverview({
+                message: `Waited ${this._formatDuration(job.queue_wait_seconds)} in the queue`,
+                icon: 'skipped',
+                // Stamped with the moment the wait ended, not with "now".
+                ts: this._parseTimestamp(job.started_at),
+                key: 'job:queue_wait',
+            });
+        }
         if (job.started_at) {
-            this.appendOverview({ message: 'Job started', icon: 'running' });
+            this.appendOverview({
+                message: 'Job started',
+                icon: 'running',
+                ts: this._parseTimestamp(job.started_at),
+                key: 'job:started',
+            });
         }
 
-        // 3. Backfill step events
-        // We iterate through a logical order of steps to reconstruct the feed
+        // 3. Backfill step events, in pipeline order, using the same keys the live
+        // events use so nothing is shown twice.
         const stepOrder = ['input', 'orient', 'blast', 'its', 'align', 'trim', 'tree', 'post'];
         stepOrder.forEach(stepKey => {
             const step = job.meta?.steps?.[stepKey];
             if (!step) return;
+            const label = step.label || stepKey;
+            this._stepLabels[stepKey] = label;
+            if (step.started_at) this._stepStarts[stepKey] = step.started_at * 1000;
 
-            // Skipping 'skipped' steps in the feed to avoid clutter, or maybe show them as skipped?
-            // Let's show done/running/failed
+            if (step.state === 'skipped') {
+                this.appendOverview({
+                    message: step.detail || `${label} skipped`,
+                    icon: 'skipped',
+                    key: `skip:${stepKey}`,
+                });
+                return;
+            }
+
+            if (step.state === 'running' || step.state === 'done' || step.state === 'failed') {
+                const startItem = this.appendOverview({
+                    message: `Starting ${label}...`,
+                    icon: 'running',
+                    ts: step.started_at,
+                    key: `start:${stepKey}`,
+                });
+                // A step still marked running on a live job gets the elapsed ticker,
+                // so a long alignment reads as working rather than stalled.
+                if (step.state === 'running' && job.status === 'running') {
+                    this._setLiveEntry(startItem, step.started_at ? step.started_at * 1000 : null);
+                }
+            }
+
             if (step.state === 'done') {
-                // Use step.detail if available (e.g., "2 sequence(s) reverse complemented")
-                const doneMessage = step.detail || `${step.label || stepKey} complete`;
-                this.appendOverview({ message: doneMessage, icon: 'done' });
-            } else if (step.state === 'running') {
-                this.appendOverview({ message: `Starting ${step.label || stepKey}...`, icon: 'running' });
+                this.appendOverview({
+                    message: step.detail || `${label} complete`,
+                    icon: 'done',
+                    ts: step.ended_at,
+                    duration: this._stepDuration(step),
+                    key: `done:${stepKey}`,
+                });
             } else if (step.state === 'failed') {
-                this.appendOverview({ message: `${step.label || stepKey} failed`, icon: 'failed' }); // using 'failed' icon class
+                this.appendOverview({
+                    message: step.error ? `${label} failed: ${step.error}` : `${label} failed`,
+                    icon: 'failed',
+                    ts: step.ended_at,
+                    key: `failed:${stepKey}`,
+                });
             }
         });
 
         // Alan 7/18/26 - Explain the otherwise silent wait before a queued Mushroom Observer job starts.
-        if (job.status === 'queued' && this.elements.overviewFeed.children.length === 0) {
+        // Alan 8/31/26 - Count real entries, not DOM children: the placeholder row
+        // now survives until the first entry arrives, and counting it here would
+        // suppress this message on exactly the jobs that need it.
+        if (job.status === 'queued' && this._feedItems.size === 0) {
             // Alan 7/18/26 - Identify the high-priority Mushroom Observer lane without claiming the current task can be preempted.
             const waitingMessage = job.meta?.source === 'mushroom_observer_single_tree'
                 ? 'Mushroom Observer tree queued in the high-priority lane; waiting for the worker to finish its current task.'
                 : 'Job queued; waiting for a worker to start it.';
             // Alan 7/18/26 - Keep the queue state visible until normal worker overview events arrive.
-            this.appendOverview({ message: waitingMessage, icon: 'running' });
+            this.appendOverview({ message: waitingMessage, icon: 'running', key: 'job:queued' });
         }
 
         // 4. Handle terminal states
@@ -277,6 +422,7 @@ class JobStatusClient {
         // reconnecting every few seconds.
         if (job.status === 'completed' || job.status === 'failed') {
             this.disconnect();
+            this.refreshDownloads();
         }
 
         this.lastStatus = job.status;
@@ -305,7 +451,15 @@ class JobStatusClient {
                 this.appendLog(event);
                 break;
             case 'overview':
-                this.appendOverview(event);
+                // Server-sent messages carry their own key when they have a
+                // meta-backed twin (the skip notices); otherwise dedupe on text.
+                this.appendOverview({
+                    ...event,
+                    key: event.key || `msg:${event.message}`,
+                });
+                break;
+            case 'heartbeat':
+                this.handleHeartbeat(event);
                 break;
             case 'metric':
                 // Optional: could update specific UI elements
@@ -345,6 +499,7 @@ class JobStatusClient {
         // request slot behind it) as soon as the job reaches a terminal state.
         if (event.status === 'completed' || event.status === 'failed') {
             this.disconnect();
+            this.refreshDownloads();
         }
     }
 
@@ -354,7 +509,8 @@ class JobStatusClient {
 
         this.appendOverview({
             message: 'Redirecting to tree viewer...',
-            icon: 'running'
+            icon: 'running',
+            key: 'job:redirecting',
         });
 
         setTimeout(() => {
@@ -364,7 +520,7 @@ class JobStatusClient {
 
     handleStepStart(event) {
         // Show optional steps when they start (blast, trim)
-        const optionalSteps = ['blast', 'trim'];
+        const optionalSteps = ['blast', 'its', 'trim'];
         if (optionalSteps.includes(event.step)) {
             const stepEl = this.stepElements[event.step];
             if (stepEl) {
@@ -379,20 +535,37 @@ class JobStatusClient {
         this.updateCurrentStep(event.label, event.detail || '', 'running');
 
         // Add to overview
-        this.appendOverview({
+        this._stepLabels[event.step] = event.label || event.step;
+        const startedAt = event.ts ? event.ts * 1000 : Date.now();
+        this._stepStarts[event.step] = startedAt;
+        this._noteActivity();
+        const item = this.appendOverview({
             message: `Starting ${event.label}...`,
-            icon: 'running'
+            icon: 'running',
+            ts: event.ts,
+            key: `start:${event.step}`,
         });
+        this._setLiveEntry(item, startedAt);
     }
 
     handleStepDone(event) {
         // Update timeline
         this.updateStepState(event.step, 'done');
 
+        // A finished step is what makes new artifacts downloadable, so refresh
+        // on the event rather than waiting out the fallback poll.
+        this.refreshDownloads();
+
         // Add to overview
+        this._noteActivity();
+        this._freezeLiveEntry();
+        const started = this._stepStarts[event.step];
         this.appendOverview({
-            message: event.detail || `${event.step} complete`,
-            icon: 'done'
+            message: event.detail || `${this._stepLabels[event.step] || event.step} complete`,
+            icon: 'done',
+            ts: event.ts,
+            duration: started ? ((event.ts ? event.ts * 1000 : Date.now()) - started) / 1000 : null,
+            key: `done:${event.step}`,
         });
     }
 
@@ -400,8 +573,31 @@ class JobStatusClient {
         // Update timeline
         this.updateStepState(event.step, 'failed');
 
+        // Alan 8/31/26 - The feed used to go silent on a failure: only the card and
+        // the error panel changed, and the ✗ line appeared solely after a reload.
+        this._noteActivity();
+        this._freezeLiveEntry();
+        const label = this._stepLabels[event.step] || event.step;
+        this.appendOverview({
+            message: event.error ? `${label} failed: ${event.error}` : `${label} failed`,
+            icon: 'failed',
+            ts: event.ts,
+            key: `failed:${event.step}`,
+        });
+
         // Update current step card
         this.updateCurrentStepFailed(event);
+    }
+
+    // Alan 8/31/26 - Long steps publish these every 30s (see step_heartbeat in
+    // app/workers/events.py). They carry no new information beyond "the worker is
+    // alive", which is exactly what a two-hour RAxML run needs the page to say.
+    handleHeartbeat(event) {
+        this._noteActivity();
+        if (event.step && event.elapsed_seconds != null && !this._stepStarts[event.step]) {
+            this._stepStarts[event.step] = Date.now() - event.elapsed_seconds * 1000;
+        }
+        this._updateLiveEntry();
     }
 
     updateStatusBadge(status) {
@@ -420,7 +616,7 @@ class JobStatusClient {
 
     updateTimeline(steps) {
         // Optional steps that should only be shown if they're actually being used
-        const optionalSteps = ['blast', 'trim'];
+        const optionalSteps = ['blast', 'its', 'trim'];
 
         for (const [stepKey, stepInfo] of Object.entries(steps)) {
             const stepEl = this.stepElements[stepKey];
@@ -509,6 +705,7 @@ class JobStatusClient {
         // Alan 8/23/26 - event.step is absent on some worker log events; String() keeps
         // this from throwing the way `event.step.toUpperCase()` did.
         const step = String(event.step || 'log').toUpperCase();
+        this._noteActivity();
         container.appendChild(this._buildLogLine(`[${step}]`, event.line, event.stream));
         this._trimTerminal(container);
 
@@ -518,11 +715,62 @@ class JobStatusClient {
         }
     }
 
+    // ------------------------------------------------------------------
+    // Activity Feed
+    // ------------------------------------------------------------------
+
+    _parseTimestamp(value) {
+        if (value == null) return null;
+        if (typeof value === 'number') return value;          // worker events: unix seconds
+        const parsed = Date.parse(String(value));
+        return Number.isNaN(parsed) ? null : parsed / 1000;
+    }
+
+    _formatClock(tsSeconds) {
+        const ts = this._parseTimestamp(tsSeconds);
+        if (ts == null) return '';
+        return new Date(ts * 1000).toLocaleTimeString([], {
+            hour: '2-digit', minute: '2-digit', second: '2-digit',
+        });
+    }
+
+    _formatDuration(seconds) {
+        const total = Math.max(0, Math.round(Number(seconds) || 0));
+        if (total < 60) return `${total}s`;
+        const mins = Math.floor(total / 60);
+        const secs = total % 60;
+        if (mins < 60) return `${mins}m ${String(secs).padStart(2, '0')}s`;
+        return `${Math.floor(mins / 60)}h ${String(mins % 60).padStart(2, '0')}m`;
+    }
+
+    _stepDuration(step) {
+        if (!step || !step.started_at || !step.ended_at) return null;
+        return step.ended_at - step.started_at;
+    }
+
+    // The template ships one placeholder row; drop it the first time real
+    // content arrives rather than clearing the whole feed on every snapshot.
+    _clearFeedPlaceholder() {
+        const placeholder = this.elements.overviewFeed.querySelector('.overview-placeholder');
+        if (placeholder) placeholder.remove();
+    }
+
+    _noteActivity() {
+        this._lastActivityAt = Date.now();
+    }
+
     appendOverview(event) {
         const feed = this.elements.overviewFeed;
+        const key = event.key || null;
+
+        // A reconnect re-sends the snapshot; anything already on screen stays put.
+        if (key && this._feedItems.has(key)) {
+            return this._feedItems.get(key);
+        }
+        this._clearFeedPlaceholder();
 
         const item = document.createElement('div');
-        item.className = 'overview-item';
+        item.className = 'overview-item flex gap-3 text-gray-600 dark:text-gray-300';
 
         const iconMap = {
             done: '✓',
@@ -538,14 +786,75 @@ class JobStatusClient {
         iconEl.textContent = iconMap[iconClass];
 
         const msgEl = document.createElement('span');
-        msgEl.textContent = event.message == null ? '' : String(event.message);
+        msgEl.className = 'overview-message';
+        let message = event.message == null ? '' : String(event.message);
+        if (event.duration != null) {
+            message += ` (${this._formatDuration(event.duration)})`;
+        }
+        msgEl.textContent = message;
+
+        // Filled in by the ticker while this entry is the one in progress.
+        const liveEl = document.createElement('span');
+        liveEl.className = 'overview-live';
+        msgEl.appendChild(liveEl);
+
+        const timeEl = document.createElement('span');
+        timeEl.className = 'overview-time';
+        timeEl.textContent = this._formatClock(event.ts != null ? event.ts : Date.now() / 1000);
 
         item.appendChild(iconEl);
         item.appendChild(msgEl);
+        item.appendChild(timeEl);
+        item._liveEl = liveEl;
         feed.appendChild(item);
+        if (key) this._feedItems.set(key, item);
 
         // Scroll to bottom
         feed.scrollTop = feed.scrollHeight;
+        return item;
+    }
+
+    // Alan 8/31/26 - "Starting Tree Building..." on its own is indistinguishable
+    // from a hung worker after the first few minutes. The entry for the step in
+    // progress carries a running clock, plus how long ago the worker last said
+    // anything (tool output or a heartbeat), so a slow step and a dead one look
+    // different on screen.
+    _setLiveEntry(item, startedAtMs) {
+        if (!item) return;
+        this._liveEntry = item;
+        item._liveStart = startedAtMs || Date.now();
+        this._updateLiveEntry();
+        if (!this._feedTicker) {
+            this._feedTicker = setInterval(() => this._updateLiveEntry(), 1000);
+        }
+    }
+
+    _freezeLiveEntry() {
+        if (this._liveEntry && this._liveEntry._liveEl) {
+            this._liveEntry._liveEl.textContent = '';
+        }
+        this._liveEntry = null;
+        if (this._feedTicker) {
+            clearInterval(this._feedTicker);
+            this._feedTicker = null;
+        }
+    }
+
+    _updateLiveEntry() {
+        const item = this._liveEntry;
+        if (!item || !item._liveEl || !item.isConnected) return;
+
+        const elapsed = (Date.now() - item._liveStart) / 1000;
+        let text = ` — running ${this._formatDuration(elapsed)}`;
+        if (this._lastActivityAt) {
+            const quietFor = (Date.now() - this._lastActivityAt) / 1000;
+            // Heartbeats arrive every 30s, so three missed ones is a real silence
+            // worth showing rather than a gap between them.
+            text += quietFor < 95
+                ? ', worker active'
+                : `, no output for ${this._formatDuration(quietFor)}`;
+        }
+        item._liveEl.textContent = text;
     }
 
     populateLogTails(logTails) {
@@ -595,29 +904,6 @@ class JobStatusClient {
             btn.setAttribute('aria-disabled', 'false');
             btn.href = resultFiles.tree_newick?.replace('/api/job', '/job').replace('/download/tree/newick', '/view')
                 || `/job/${this.jobId}/view`;
-        }
-
-        // Alan 7/15/26 - Offer raw MrBayes command and trace files only when this completed job produced them.
-        const mrbayesLink = document.getElementById('dl-mrbayes');
-        // Alan 7/15/26 - Keep the matching dropdown heading synchronized with the conditional analysis download.
-        const mrbayesHeading = document.getElementById('dl-mrbayes-heading');
-        // Alan 7/15/26 - Use the completion payload to avoid showing a dead MrBayes link for other tree methods.
-        if (mrbayesLink && mrbayesHeading && resultFiles?.mrbayes) {
-            // Alan 7/15/26 - Point the visible link at the access-controlled archive endpoint supplied by the server.
-            mrbayesLink.href = resultFiles.mrbayes;
-            // Alan 7/15/26 - Reveal both Bayesian download elements together after successful completion.
-            mrbayesLink.style.display = '';
-            mrbayesHeading.style.display = '';
-        }
-
-        // Alan 7/15/26 - Find the optional bundle that pairs before/after FASTA files with the trimmer's marked report.
-        const alignmentInspectionLink = document.getElementById('dl-alignment-inspection');
-        // Alan 7/15/26 - Show the inspection download only when this completed job actually produced a trimming report.
-        if (alignmentInspectionLink && resultFiles?.alignment_inspection) {
-            // Alan 7/15/26 - Use the access-controlled archive URL supplied by the completion payload.
-            alignmentInspectionLink.href = resultFiles.alignment_inspection;
-            // Alan 7/15/26 - Reveal the inspection bundle alongside the aligned and trimmed FASTA downloads.
-            alignmentInspectionLink.style.display = '';
         }
 
         // Add success to overview

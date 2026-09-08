@@ -57,12 +57,29 @@ def _log_fail_open(stage, exc=None):
     )
 
 
+# Bound the command round-trip, not just the connect. Every call this module
+# makes is an ordinary SET/GET/SETEX/EXPIRE on a Gunicorn request path, so a
+# Redis that accepts the connection and then stops answering would otherwise
+# park a request slot until nginx gave up on the client. This is the opposite
+# situation from the SSE/pubsub connection, which deliberately sets no
+# socket_timeout because it blocks on reads for the life of a stream.
+DEFAULT_REDIS_COMMAND_TIMEOUT_SECONDS = 5.0
+
+
 def _redis():
     import redis as _r
     from app.config import Config
+    from app.services.subprocess_utils import resolve_positive_number
     from app.workers.queue import REDIS_CONNECT_TIMEOUT_SECONDS
+    command_timeout = resolve_positive_number(
+        getattr(Config, "IDEMPOTENCY_REDIS_TIMEOUT_SECONDS",
+                DEFAULT_REDIS_COMMAND_TIMEOUT_SECONDS),
+        DEFAULT_REDIS_COMMAND_TIMEOUT_SECONDS,
+    )
     return _r.from_url(
-        Config.REDIS_URL, socket_connect_timeout=REDIS_CONNECT_TIMEOUT_SECONDS
+        Config.REDIS_URL,
+        socket_connect_timeout=REDIS_CONNECT_TIMEOUT_SECONDS,
+        socket_timeout=command_timeout,
     )
 
 

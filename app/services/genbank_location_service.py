@@ -18,6 +18,7 @@ from typing import Dict, List, Optional, Tuple
 import requests
 
 from app.config import Config
+from app.services.api_diagnostics import record_requests_failure
 from app.services.blast_service import (
     NCBI_EFETCH_URL,
     _ncbi_request,
@@ -69,6 +70,77 @@ def _clean_location_text(value: str) -> str:
     """Collapse whitespace and drop trailing punctuation from a location."""
     text = " ".join(str(value or "").split())
     return text.strip(" ,;:")
+
+
+# US states and Canadian provinces, lowercased. GenBank does not order the
+# segments below the country consistently -- "USA: Seattle, King County,
+# Washington" and "USA: Washington, Seattle" are both written -- so when one of
+# these appears anywhere in the value it is the segment worth keeping.
+_ADMIN_REGION_NAMES = frozenset({
+    "alabama", "alaska", "arizona", "arkansas", "california", "colorado",
+    "connecticut", "delaware", "florida", "georgia", "hawaii", "idaho",
+    "illinois", "indiana", "iowa", "kansas", "kentucky", "louisiana", "maine",
+    "maryland", "massachusetts", "michigan", "minnesota", "mississippi",
+    "missouri", "montana", "nebraska", "nevada", "new hampshire", "new jersey",
+    "new mexico", "new york", "north carolina", "north dakota", "ohio",
+    "oklahoma", "oregon", "pennsylvania", "rhode island", "south carolina",
+    "south dakota", "tennessee", "texas", "utah", "vermont", "virginia",
+    "washington", "west virginia", "wisconsin", "wyoming",
+    "alberta", "british columbia", "manitoba", "new brunswick",
+    "newfoundland and labrador", "northwest territories", "nova scotia",
+    "nunavut", "ontario", "prince edward island", "quebec", "saskatchewan",
+    "yukon",
+})
+
+# A region name is a couple of words ("British Columbia", "Baja California
+# Sur"); anything longer is prose about the collection site.
+_MAX_REGION_WORDS = 3
+
+# Past this many segments the value is a descent through a locality rather than
+# an administrative region, and only the country can be trusted.
+_MAX_SEGMENTS_KEEPING_FIRST = 2
+
+
+def shorten_location(value: str) -> str:
+    """Trim a GenBank collection site to what is useful in a tree tip label.
+
+    GenBank writes the site as ``Country: region, finer, finer still``, and the
+    tail can run to four segments of village and valley names --
+    ``Switzerland: Stein, Mastrils, Landquart, Graubuenden`` -- which is far
+    more than a tip label can carry. Keep the country, plus one region below it
+    when the value actually identifies one:
+
+    ``USA: Colorado, Jefferson County``           -> ``USA: Colorado``
+    ``USA: Seattle, King County, Washington``     -> ``USA: Washington``
+    ``Switzerland: Stein, Mastrils, Landquart, Graubuenden`` -> ``Switzerland``
+
+    Returns the cleaned original when it has no country/region structure to
+    trim, so a value that is already short passes through untouched.
+    """
+    text = _clean_location_text(value)
+    if not text:
+        return ""
+
+    country, separator, remainder = text.partition(":")
+    country = _clean_location_text(country)
+    if not separator or not country:
+        return text
+
+    segments = [_clean_location_text(part) for part in remainder.split(",")]
+    segments = [part for part in segments if part]
+    if not segments:
+        return country
+
+    for segment in segments:
+        if segment.casefold() in _ADMIN_REGION_NAMES:
+            return f"{country}: {segment}"
+
+    first = segments[0]
+    if (len(segments) <= _MAX_SEGMENTS_KEEPING_FIRST
+            and len(first.split()) <= _MAX_REGION_WORDS):
+        return f"{country}: {first}"
+
+    return country
 
 
 def parse_lat_lon(value: str) -> Optional[Tuple[float, float]]:
@@ -125,6 +197,7 @@ def reverse_geocode(lat: float, lon: float) -> str:
         if elapsed < _GEOCODE_MIN_GAP_SECONDS:
             time.sleep(_GEOCODE_MIN_GAP_SECONDS - elapsed)
 
+        response = None
         try:
             response = requests.get(
                 Config.REVERSE_GEOCODE_URL,
@@ -143,6 +216,7 @@ def reverse_geocode(lat: float, lon: float) -> str:
             response.raise_for_status()
             payload = response.json()
         except Exception as e:
+            record_requests_failure(response, reason=type(e).__name__)
             logger.warning(f"Reverse geocode failed for {lat},{lon}: {e}")
             return ""
         finally:
@@ -172,8 +246,15 @@ def _location_from_record(record: Dict) -> str:
     return ""
 
 
-def _fetch_annotation_xml(accessions: List[str]) -> Optional[str]:
-    """Fetch GenBank XML for a batch, without the sequence data."""
+def _fetch_annotation_xml(accessions: List[str],
+                          deadline: Optional[float] = None) -> Optional[str]:
+    """Fetch GenBank XML for a batch, without the sequence data.
+
+    ``deadline`` is a ``time.monotonic()`` instant this call must not run past.
+    It shortens the read timeout and drops the retry schedule to a single
+    attempt when little budget is left, because NCBI's exponential backoff can
+    otherwise keep working long after the caller's request budget is gone.
+    """
     params = {
         "db": "nuccore",
         "id": ",".join(accessions),
@@ -185,8 +266,22 @@ def _fetch_annotation_xml(accessions: List[str]) -> Optional[str]:
         "seq_stop": "1",
     }
 
+    connect_timeout, read_timeout = 15, 90
+    max_retries = 5
+    if deadline is not None:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return None
+        connect_timeout = min(connect_timeout, max(1.0, remaining))
+        read_timeout = min(read_timeout, max(1.0, remaining))
+        # One attempt once the budget is thin: a retry sleeps before it helps.
+        if remaining < read_timeout * 2:
+            max_retries = 1
+
     try:
-        response = _ncbi_request("POST", NCBI_EFETCH_URL, data=params, timeout=(15, 90))
+        response = _ncbi_request("POST", NCBI_EFETCH_URL, data=params,
+                                 max_retries=max_retries,
+                                 timeout=(connect_timeout, read_timeout))
         response.raise_for_status()
         return response.text
     except Exception as e:
@@ -194,7 +289,8 @@ def _fetch_annotation_xml(accessions: List[str]) -> Optional[str]:
         return None
 
 
-def lookup_locations(accessions: List[str]) -> Tuple[Dict[str, str], List[str], List[str]]:
+def lookup_locations(accessions: List[str], deadline: Optional[float] = None
+                     ) -> Tuple[Dict[str, str], List[str], List[str]]:
     """Look up collection locations for GenBank accessions.
 
     Returns ``(locations, missing, unavailable)``.
@@ -211,6 +307,10 @@ def lookup_locations(accessions: List[str]) -> Tuple[Dict[str, str], List[str], 
     an NCBI outage into the claim that a hundred records have no collection
     site: wrong, and wrong in the direction that makes a user stop asking. A
     caller should say "could not be checked" and offer a retry.
+
+    ``deadline`` (a ``time.monotonic()`` instant) bounds the whole lookup.
+    Anything not fetched by then is reported as ``unavailable`` rather than
+    ``missing`` -- it was never asked about -- and no further batch is sent.
     """
     requested = []
     seen = set()
@@ -232,7 +332,11 @@ def lookup_locations(accessions: List[str]) -> Tuple[Dict[str, str], List[str], 
     unavailable_set = set()
     for start in range(0, len(to_fetch), EFETCH_BATCH_SIZE):
         batch = to_fetch[start:start + EFETCH_BATCH_SIZE]
-        xml_text = _fetch_annotation_xml(batch)
+        if deadline is not None and time.monotonic() >= deadline:
+            # Out of budget: every remaining id is unasked, not answered-empty.
+            unavailable_set.update(to_fetch[start:])
+            break
+        xml_text = _fetch_annotation_xml(batch, deadline=deadline)
         if not xml_text:
             # The request failed; nothing was learned about any id in it.
             unavailable_set.update(batch)
@@ -260,11 +364,17 @@ def lookup_locations(accessions: List[str]) -> Tuple[Dict[str, str], List[str], 
         base = accession.split(".")[0]
         if accession not in locations and base in locations:
             locations[accession] = locations[base]
-        if accession not in locations and _cache_get(accession) is None and _cache_get(base) is None:
-            if accession in unavailable_set:
-                unavailable.append(accession)
-            else:
-                missing.append(accession)
+        if accession in locations:
+            continue
+        # Every requested accession that produced no location lands in exactly
+        # one bucket. The cache is deliberately not consulted here: a record
+        # NCBI answered about but had no usable location for is cached as "",
+        # and testing the cache for None made those records fall out of all
+        # three result sets -- so the caller could not report them at all.
+        if accession in unavailable_set:
+            unavailable.append(accession)
+        else:
+            missing.append(accession)
 
     if unavailable:
         from app.services.log_context import log_degradation

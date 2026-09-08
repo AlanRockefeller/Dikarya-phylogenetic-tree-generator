@@ -176,16 +176,31 @@ def _record_failed_auth():
 
 
 def _pre_auth_lookup_allowed():
-    """Charge the high-volume lookup bucket, failing open on backend errors."""
+    """Charge the high-volume lookup bucket, failing open on backend errors.
+
+    Every configured window is charged before the results are combined. ``all()``
+    over a generator short-circuits, so when the per-minute bucket refused, the
+    per-hour bucket never saw the request at all -- a caller held just under the
+    minute limit could keep hammering indefinitely without the hourly ceiling
+    ever filling up.
+    """
     from app.extensions import limiter
     try:
         strategy = limiter.limiter
         address = _client_address()
-        return all(
+        results = [
             strategy.hit(item, _PRE_AUTH_LOOKUP_NAMESPACE, address)
             for item in _pre_auth_lookup_limit_items()
+        ]
+        return all(results)
+    except Exception as exc:
+        from app.services.log_context import log_degradation_rate_limited
+        log_degradation_rate_limited(
+            logger, "pre_auth_lookup_limiter_unavailable",
+            "API token lookups ran without pre-auth rate limiting because the "
+            "limiter backend failed",
+            exception=type(exc).__name__,
         )
-    except Exception:
         return True
 
 

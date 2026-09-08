@@ -1,6 +1,8 @@
 """Focused regressions for the eight CodeRabbit reliability findings."""
 
+import os
 import subprocess
+import time
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
@@ -319,9 +321,14 @@ def test_heartbeat_touch_updates_existing_file(tmp_path):
     worker = _bare_heartbeat_worker(tmp_path)
     heartbeat = tmp_path / "test-worker.heartbeat"
     heartbeat.touch()
+    # Backdate explicitly. Two touches inside one filesystem timestamp tick are
+    # equal, so ">=" passed even when touch_heartbeat_file() did nothing at all
+    # -- the staleness check this file exists to protect would then never fire.
+    stale = time.time() - 3600
+    os.utime(heartbeat, (stale, stale))
     before = heartbeat.stat().st_mtime_ns
     worker.touch_heartbeat_file()
-    assert heartbeat.stat().st_mtime_ns >= before
+    assert heartbeat.stat().st_mtime_ns > before
 
 
 def test_heartbeat_touch_recreates_missing_directory(tmp_path):

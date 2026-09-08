@@ -48,11 +48,29 @@ class _Clock:
         return self.now
 
 
-class RedisReservationTests(unittest.TestCase):
+class _LocalSlotIsolation:
+    """Restore the module-global pacing cursor after each test.
+
+    `_local_next_slot` is process-wide state. Tests that set it and never put it
+    back leaked a future cursor into every later test in the session -- and an
+    assertion failure skipped any cleanup written at the end of a test body.
+    """
+
     def setUp(self):
+        super().setUp()
+        self._saved_local_next_slot = svc._local_next_slot
+        self.addCleanup(self._restore_local_next_slot)
+        svc._local_next_slot = 0.0
+
+    def _restore_local_next_slot(self):
+        svc._local_next_slot = self._saved_local_next_slot
+
+
+class RedisReservationTests(_LocalSlotIsolation, unittest.TestCase):
+    def setUp(self):
+        super().setUp()
         self.redis = FakeRedis()
         self.clock = _Clock()
-        svc._local_next_slot = 0.0
 
     def _reserve(self, interval=1.0, max_wait=None):
         with (
@@ -116,11 +134,8 @@ class RedisReservationTests(unittest.TestCase):
         )
 
 
-class RedisFailureFallbackTests(unittest.TestCase):
+class RedisFailureFallbackTests(_LocalSlotIsolation, unittest.TestCase):
     """A brief Redis problem must slow imports down, not make them impossible."""
-
-    def setUp(self):
-        svc._local_next_slot = 0.0
 
     def test_reservation_falls_back_to_process_local_pacing(self):
         monotonic = [500.0]
@@ -145,6 +160,37 @@ class RedisFailureFallbackTests(unittest.TestCase):
         ):
             with self.assertRaises(svc.InatTreeError):
                 svc._reserve_inat_slot(1.0, max_wait=30.0)
+
+    def test_a_rejected_interactive_request_does_not_consume_a_slot(self):
+        """Match the Redis Lua path: check the wait, *then* commit the cursor.
+
+        The local fallback advanced `_local_next_slot` before deciding whether
+        the caller was allowed to wait that long, so every refusal pushed the
+        cursor a further interval into the future -- for requests that were
+        never sent. Ten refused clicks left the next legitimate caller a hundred
+        seconds behind for no reason.
+        """
+        svc._local_next_slot = 1000.0
+        with (
+            patch.object(svc, "_pacing_redis", side_effect=OSError("no redis")),
+            patch.object(svc.time, "monotonic", return_value=900.0),
+        ):
+            for _ in range(10):
+                with self.assertRaises(svc.InatTreeError):
+                    svc._reserve_inat_slot(10.0, max_wait=30.0)
+
+        self.assertEqual(svc._local_next_slot, 1000.0)
+
+    def test_an_accepted_interactive_request_still_commits_its_slot(self):
+        svc._local_next_slot = 905.0
+        with (
+            patch.object(svc, "_pacing_redis", side_effect=OSError("no redis")),
+            patch.object(svc.time, "monotonic", return_value=900.0),
+        ):
+            wait = svc._reserve_inat_slot(1.0, max_wait=30.0)
+
+        self.assertAlmostEqual(wait, 5.0, places=3)
+        self.assertEqual(svc._local_next_slot, 906.0)
 
 
 class RequestPathTests(unittest.TestCase):

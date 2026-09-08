@@ -502,6 +502,68 @@ test('hiding every tip makes low-level serialization an explicit failure', () =>
     );
 });
 
+test('a supplied subtree with no visible tips is rejected independently', () => {
+    const tree = new Phylotree('((A:0.1,B:0.2)I:0.05,C:0.3);');
+    ['A', 'B'].forEach(n => { tree.getNodeByName(n).notshown = true; });
+
+    assert.throws(
+        () => tree.getNewick(null, tree.getNodeByName('I')),
+        /No visible sequences remain to export\./,
+        'a visible tip outside the requested subtree affected its visibility'
+    );
+    assertSameList(newickTips(tree.getNewick()), ['C'],
+        'the whole-tree export did not retain the visible sibling');
+});
+
+test('a supplied visible subtree is indexed without visiting siblings', () => {
+    const tree = new Phylotree('((A:0.1,B:0.2)I:0.05,C:0.3);');
+    const sibling = tree.getNodeByName('C');
+    Object.defineProperty(sibling, 'notshown', {
+        configurable: true,
+        get() { throw new Error('visibility escaped the requested subtree'); }
+    });
+
+    const out = tree.getNewick(null, tree.getNodeByName('I'));
+    assertSameList(newickTips(out), ['A', 'B']);
+    assert.ok(out.includes('I:0.05'), 'the subtree root label or length was lost: ' + out);
+});
+
+test('caterpillar visibility is indexed once per node', () => {
+    const tipCount = 1200;
+    let newick = 'T0:1';
+    for (let i = 1; i < tipCount; i++) {
+        newick = '(' + newick + ',T' + i + ':1)I' + i + ':1';
+    }
+
+    const tree = new Phylotree(newick + ';');
+    const expectedTips = [];
+    for (let i = 0; i < tipCount; i++) {
+        const tip = tree.getNodeByName('T' + i);
+        if (i % 4 === 0) {
+            tip.notshown = true;
+        } else {
+            expectedTips.push('T' + i);
+        }
+    }
+
+    const nodes = tree.getNodes().descendants();
+    let visibilityChecks = 0;
+    nodes.forEach(node => {
+        let hidden = node.notshown;
+        Object.defineProperty(node, 'notshown', {
+            configurable: true,
+            get() { visibilityChecks++; return hidden; },
+            set(value) { hidden = value; }
+        });
+    });
+
+    const out = tree.getNewick();
+    assertSameList(newickTips(out), expectedTips.sort(),
+        'the large caterpillar export lost or invented tips');
+    assert.strictEqual(visibilityChecks, nodes.length,
+        'visibility was recomputed while serializing the caterpillar tree');
+});
+
 test('one visible tip remains a valid one-taxon export', () => {
     const out = hiddenCase('(A:0.1,B:0.2,C:0.3);', ['A', 'B'], ['C']);
     assert.ok(!/\(\s*\)/.test(out), 'produced an empty group: ' + out);

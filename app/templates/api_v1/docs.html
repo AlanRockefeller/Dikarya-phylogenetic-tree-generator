@@ -378,8 +378,13 @@ MAX_WAIT_SECONDS="${MAX_WAIT_SECONDS:-3600}"
 STATUS=""
 deadline=$((SECONDS + MAX_WAIT_SECONDS))
 while (( SECONDS &lt; deadline )); do
+  # Bound each request by what is left of the deadline, so a single hung
+  # connection cannot outlast MAX_WAIT_SECONDS on its own.
+  remaining=$(( deadline - SECONDS ))
+  (( remaining &lt; 1 )) &amp;&amp; break
   STATUS=$(
-    curl -s -H "Authorization: Bearer $TOKEN" \
+    curl -s --connect-timeout 10 --max-time "$remaining" \
+      -H "Authorization: Bearer $TOKEN" \
       "https://dikarya.us/api/v1/jobs/$JOB_ID" | jq -r '.data.status // .error.message'
   )
 

@@ -91,15 +91,18 @@ def _schemas():
                             "type": ["boolean", "null"],
                             "description": (
                                 "Whether terminal-overhang trimming was applied. "
-                                "Null for jobs stored before the option existed."
+                                "Null when the option was not recorded (including "
+                                "legacy jobs) or its stored value is not a "
+                                "recognized boolean."
                             ),
                         },
                         "fix_orientation": {
                             "type": ["boolean", "null"],
                             "description": (
                                 "Whether backwards sequences were reverse-complemented before "
-                                "alignment. Null for jobs stored before the option existed; "
-                                "those ran with it on."
+                                "alignment. Null when the option was not recorded "
+                                "(including legacy jobs, which ran with it on) or "
+                                "its stored value is not a recognized boolean."
                             ),
                         },
                         "tree_method": {"type": "string"},
@@ -197,7 +200,10 @@ def _schemas():
                         f"rule applies (mcmc_stop_early false, or mcmc_nruns 1) "
                         f"this is the full length of the run and the default "
                         f"drops to {Config.DEFAULT_MCMC_GENERATIONS_FIXED_RUN}. "
-                        "An explicitly supplied value is always used as given."
+                        "An explicitly supplied integer from 1,000 through "
+                        "100,000,000 is used as given; a value outside that "
+                        "range, or one that is not an integer, is rejected "
+                        "with 422 rather than clamped."
                     ),
                 },
                 "mcmc_nruns": {"type": "integer", "minimum": 1, "maximum": 8},
@@ -324,12 +330,25 @@ def _schemas():
                 },
                 "mcmc_generations": {
                     "type": "integer", "minimum": 1000, "maximum": 100000000,
-                    "default": DEFAULT_MCMC_GENERATIONS,
+                    # Deliberately no "default": the effective one depends on
+                    # mcmc_stop_early and mcmc_nruns, and advertising a single
+                    # unconditional value told callers the server would use a
+                    # number it often does not.
                     "description": (
-                        "MrBayes MCMC generations. With mcmc_stop_early enabled "
-                        "(the default) this is the maximum: the run may finish "
-                        "substantially earlier. Server-side job runtime limits "
-                        "still apply."
+                        "MrBayes MCMC generations. Whenever the convergence "
+                        "stop rule applies -- mcmc_stop_early enabled (the "
+                        "default) together with mcmc_nruns >= 2 -- this is a "
+                        "maximum, the run may finish substantially earlier, and "
+                        f"an omitted value defaults to {DEFAULT_MCMC_GENERATIONS}. "
+                        "When no stop rule applies (mcmc_stop_early false, or "
+                        "mcmc_nruns 1) this is the full length of the run, and "
+                        "an omitted value instead defaults to "
+                        f"{Config.DEFAULT_MCMC_GENERATIONS_FIXED_RUN}. An "
+                        "explicitly supplied integer from 1,000 through "
+                        "100,000,000 is used as given; a value outside that "
+                        "range, or one that is not an integer, is rejected "
+                        "with 422 rather than clamped. Server-side job "
+                        "runtime limits still apply."
                     ),
                 },
                 "mcmc_nruns": {

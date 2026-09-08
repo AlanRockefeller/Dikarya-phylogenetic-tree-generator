@@ -19,6 +19,7 @@ from typing import Optional
 
 from app.config import Config
 from app.models import AlignmentParams
+from app.services.artifact_storage import open_artifact
 from app.services.subprocess_utils import (
     configured_tool_limits,
     configured_tool_time_limit_hours,
@@ -28,6 +29,48 @@ from app.services.subprocess_utils import (
     ToolExecutionError,
     tool_failure_message,
 )
+
+
+def _orientation_input_too_large(input_fasta: Path, config: Config, logger) -> bool:
+    """True when the input is too big for MAFFT's direction check to be worth it.
+
+    ``--adjustdirectionaccurately`` compares every sequence against the others,
+    so its cost scales with sequence count *and* sequence length. It is cheap on
+    barcode-length reads and pathological on assembled contigs -- see
+    MAFFT_ADJUSTDIRECTION_MAX_BASES in app/config.py for the incident and the
+    measurements behind the ceiling.
+
+    Fails open: an unreadable input returns False and lets the normal path run,
+    because the aligner is about to report the same problem far more clearly.
+    """
+    limit = getattr(config, "MAFFT_ADJUSTDIRECTION_MAX_BASES", 5_000_000)
+    if limit <= 0:
+        # Operator opt-out: no ceiling, original behaviour.
+        return False
+
+    total = 0
+    try:
+        with open_artifact(input_fasta, "rt") as handle:
+            for line in handle:
+                if not line.startswith(">"):
+                    total += len(line.strip())
+                    if total > limit:
+                        break
+    except OSError:
+        return False
+
+    if total <= limit:
+        return False
+
+    from app.services.log_context import log_degradation
+
+    log_degradation(
+        logger, "direction_check_skipped_large_input",
+        "input exceeds the direction-check ceiling; sequences go to the aligner "
+        "as submitted",
+        total_bases_at_least=total, limit_bases=limit,
+    )
+    return True
 
 
 def _verify_already_aligned(input_fasta: Path, logger) -> None:
@@ -124,6 +167,10 @@ def run_alignment(
     method = params.method.lower()
     stats = {"method": method, "reversed_by_aligner": 0}
     fix_orientation = getattr(params, "fix_orientation", True)
+    if fix_orientation and _orientation_input_too_large(input_fasta, config, logger):
+        # Covers both routes below: MAFFT's native flag and the
+        # fix_direction_with_mafft pre-pass the other aligners use.
+        fix_orientation = False
     
     if method == "default":
         # Beginner mode default: use configured default aligner (e.g. mafft)
@@ -175,8 +222,37 @@ def run_alignment(
         raise
 
 
-def _get_thread_count():
+def worker_thread_budget() -> int:
+    """Threads an external tool may use, honouring a per-worker override.
+
+    With one worker per queue on a 2-core box, both processes asking for
+    ``cpu_count()`` threads oversubscribes 2:1 and the interactive job loses
+    as much throughput as the bulk one. ``DIKARYA_WORKER_THREADS`` lets each
+    systemd unit state its own share, so the bulk worker can be pinned to 1
+    thread while phylo_high keeps both cores. Unset, the historical
+    ``min(8, cpu_count())`` is preserved.
+    """
+    raw = os.environ.get("DIKARYA_WORKER_THREADS", "").strip()
+    if raw:
+        try:
+            configured = int(raw)
+        except ValueError:
+            # This module takes `logger` as a function parameter rather than
+            # holding one at module scope, so name a logger explicitly here.
+            logging.getLogger(__name__).warning(
+                "Ignoring non-integer DIKARYA_WORKER_THREADS=%r", raw
+            )
+        else:
+            if configured >= 1:
+                return min(configured, os.cpu_count() or 1)
+            logging.getLogger(__name__).warning(
+                "Ignoring DIKARYA_WORKER_THREADS=%r; must be >= 1", raw
+            )
     return min(8, os.cpu_count() or 1)
+
+
+def _get_thread_count():
+    return worker_thread_budget()
 
 
 def _make_log_callback(job_id: Optional[str], step: str, stream: str):
@@ -244,7 +320,7 @@ def _restore_mafft_direction_headers(
     input_fasta: Path,
     output_fasta: Path,
     logger,
-) -> int:
+) -> set:
     """Remove MAFFT's ``_R_`` marker while preserving genuine input headers.
 
     The marker has to go -- every downstream step matches on the exact input
@@ -253,8 +329,9 @@ def _restore_mafft_direction_headers(
     has already made its own orientation call by the time MAFFT runs. When the
     two disagree the alignment ends up holding a sequence in the opposite
     orientation to ``input/input_raw.fasta``, which is what recompute
-    re-derives from. The count is returned, logged as a degradation, and
-    surfaced to the user by the caller.
+    re-derives from. The restored headers are returned so the caller can both
+    re-check the call and report it: the count is logged as a degradation and
+    surfaced to the user.
     """
     input_headers = {
         line[1:].strip()
@@ -262,7 +339,7 @@ def _restore_mafft_direction_headers(
         if line.startswith(">")
     }
     output_lines = output_fasta.read_text(encoding="utf-8", errors="replace").splitlines(keepends=True)
-    restored_count = 0
+    restored = set()
 
     for index, line in enumerate(output_lines):
         header_line = line.rstrip("\r\n")
@@ -275,13 +352,13 @@ def _restore_mafft_direction_headers(
 
         newline = line[len(header_line):]
         output_lines[index] = f">{restored_header}{newline}"
-        restored_count += 1
+        restored.add(restored_header)
 
-    if restored_count:
+    if restored:
         output_fasta.write_text("".join(output_lines), encoding="utf-8")
-        logger.info("Restored %s MAFFT direction-marked header(s)", restored_count)
+        logger.info("Restored %s MAFFT direction-marked header(s)", len(restored))
 
-    return restored_count
+    return restored
 
 
 def _flipped_headers_from_mafft(aligned_text: str, input_headers: set) -> set:
@@ -300,6 +377,114 @@ def _flipped_headers_from_mafft(aligned_text: str, input_headers: set) -> set:
         if header in input_headers:
             flipped.add(header)
     return flipped
+
+
+KMER_VETO_K = 12
+KMER_VETO_MAX_REFERENCES = 100
+KMER_VETO_MAX_REFERENCE_BASES = 1_000_000
+KMER_VETO_MIN_FORWARD_HITS = 25
+KMER_VETO_RATIO = 4.0
+
+_KMER_BASE_CODES = {"A": 0, "C": 1, "G": 2, "T": 3, "U": 3,
+                    "a": 0, "c": 1, "g": 2, "t": 3, "u": 3}
+
+
+def _encode_kmers(seq: str, k: int = KMER_VETO_K) -> set:
+    """Distinct k-mers of ``seq`` as 2-bit-packed integers.
+
+    Integers rather than substrings because the reference pool can hold a
+    million of them and a set of 12-character Python strings costs roughly ten
+    times the memory of a set of ints. Gaps, N and every other ambiguity code
+    simply end the current run: an ambiguous base cannot be packed into two
+    bits, and a k-mer spanning one is not evidence of anything either way.
+    """
+    kmers = set()
+    code = 0
+    run = 0
+    mask = (1 << (2 * k)) - 1
+    for char in seq:
+        bits = _KMER_BASE_CODES.get(char)
+        if bits is None:
+            run = 0
+            continue
+        code = ((code << 2) | bits) & mask
+        run += 1
+        if run >= k:
+            kmers.add(code)
+    return kmers
+
+
+def _reference_kmer_pool(records, flipped_headers: set) -> set:
+    """k-mers of the sequences MAFFT did *not* flip, subsampled and capped.
+
+    The sequences MAFFT left alone are by definition mutually consistent in
+    orientation, which makes them the reference frame to test a flip against.
+    Sampling with a stride rather than taking a prefix keeps the pool
+    representative of the whole submission -- inputs arrive grouped by source,
+    so the first hundred records are often a hundred sequences from one clade.
+    """
+    references = [seq for header, seq in records if header not in flipped_headers]
+    if len(references) < 2:
+        # Nothing consistent to compare against; the caller falls back to
+        # trusting MAFFT, which is what happened before this check existed.
+        return set()
+
+    stride = max(1, len(references) // KMER_VETO_MAX_REFERENCES)
+    pool = set()
+    bases = 0
+    for seq in references[::stride][:KMER_VETO_MAX_REFERENCES]:
+        pool |= _encode_kmers(seq)
+        bases += len(seq)
+        if bases >= KMER_VETO_MAX_REFERENCE_BASES:
+            break
+    return pool
+
+
+def kmer_orientation_veto(records, flipped_headers: set, logger) -> set:
+    """Flips contradicted by direct k-mer evidence, which must not be applied.
+
+    MAFFT's ``--adjustdirectionaccurately`` scores whole sequences, so a record
+    whose homology to the dataset is confined to a fraction of its length can
+    be called backwards: the non-homologous remainder dilutes the forward
+    signal past the flip threshold. Job e4d73c31 hit exactly this -- a 1742 bp
+    rDNA read in a dataset of ~512 bp ITS barcodes, homologous over its first
+    530 bp and nothing after, flipped despite sharing 52,820 forward 12-mers
+    with the other 134 sequences and 2 reverse-complement ones. It reached the
+    tree as a 0.854 terminal branch against a next-longest of 0.017.
+
+    So the flip is re-checked against the one measurement that does not care
+    about length: how many of the sequence's k-mers occur in the rest of the
+    submission, forward versus reverse-complemented. The asymmetry is enormous
+    when MAFFT is right and enormous the other way when it is wrong, which is
+    why a plain ratio test settles it. Overruling is deliberately conservative
+    -- it needs both an absolute floor of matches and a clear majority -- since
+    the failure mode it guards against is rare and MAFFT is usually correct.
+
+    Returns the subset of ``flipped_headers`` to leave forward. Never raises:
+    on any doubt it returns an empty set and MAFFT's call stands.
+    """
+    from app.services.orientation_service import revcomp
+
+    if not flipped_headers:
+        return set()
+
+    pool = _reference_kmer_pool(records, flipped_headers)
+    if not pool:
+        return set()
+
+    vetoed = set()
+    for header, seq in records:
+        if header not in flipped_headers:
+            continue
+        forward = len(_encode_kmers(seq) & pool)
+        reverse = len(_encode_kmers(revcomp(seq)) & pool)
+        if forward >= KMER_VETO_MIN_FORWARD_HITS and forward > KMER_VETO_RATIO * reverse:
+            vetoed.add(header)
+            logger.info(
+                "Overruling MAFFT reversal of %r: %s forward k-mer matches vs %s "
+                "reverse-complement", header, forward, reverse,
+            )
+    return vetoed
 
 
 def fix_direction_with_mafft(
@@ -388,6 +573,20 @@ def fix_direction_with_mafft(
     if not flipped:
         return 0
 
+    vetoed = kmer_orientation_veto(records, flipped, logger)
+    if vetoed:
+        from app.services.log_context import log_degradation
+
+        log_degradation(
+            logger, "aligner_reversal_overruled",
+            "k-mer evidence contradicted MAFFT's direction call; left forward",
+            count=len(vetoed), of=len(flipped),
+            headers="; ".join(sorted(vetoed))[:300],
+        )
+        flipped -= vetoed
+        if not flipped:
+            return 0
+
     rewritten = [
         format_fasta(header, revcomp(seq) if header in flipped else seq)
         for header, seq in records
@@ -398,6 +597,71 @@ def fix_direction_with_mafft(
         len(flipped), len(records),
     )
     return len(flipped)
+
+
+def _apply_direction_veto_and_realign(
+    input_fasta: Path,
+    output_fasta: Path,
+    params: AlignmentParams,
+    config: Config,
+    logger,
+    job_id: Optional[str],
+    reversed_headers: set,
+    orient_uncertain: Optional[int],
+) -> set:
+    """Re-check MAFFT's flips and, if any is overruled, align again without it.
+
+    Unlike the pre-pass the other aligners use, MAFFT's native adjustment has
+    already baked the flip into the alignment by the time we see the ``_R_``
+    markers, and a row of an alignment cannot simply be reverse-complemented
+    back -- that would reorder one row against the columns of every other. So
+    the only way to honour the veto is to align a second time with the
+    direction check off, having first applied the flips we *did* accept to the
+    input ourselves. That leaves input/input_raw.fasta and the alignment in
+    agreement, which the native adjustment does not.
+
+    The second MAFFT run is the reason the veto is conservative: it doubles the
+    alignment cost, and it is worth paying only for a call we have direct
+    evidence against. Nothing happens in the overwhelmingly common case where
+    the k-mer check agrees with MAFFT.
+
+    Returns the flips that stand.
+    """
+    from app.services.orientation_service import fasta_reader, format_fasta, revcomp
+
+    records = fasta_reader(input_fasta.read_text(encoding="utf-8", errors="replace"))
+    vetoed = kmer_orientation_veto(records, reversed_headers, logger)
+    if not vetoed:
+        return reversed_headers
+
+    from app.services.log_context import log_degradation
+
+    accepted = reversed_headers - vetoed
+    log_degradation(
+        logger, "aligner_reversal_overruled",
+        "k-mer evidence contradicted MAFFT's direction call; realigning with the "
+        "sequence left forward",
+        count=len(vetoed), of=len(reversed_headers),
+        headers="; ".join(sorted(vetoed))[:300],
+    )
+
+    if accepted:
+        # The flips we agree with have to survive the rerun, and the rerun has
+        # no direction check of its own, so they are applied to the input the
+        # same way fix_direction_with_mafft applies its own.
+        input_fasta.write_text(
+            "\n".join(
+                format_fasta(header, revcomp(seq) if header in accepted else seq)
+                for header, seq in records
+            ) + "\n",
+            encoding="utf-8",
+        )
+
+    _run_mafft(
+        input_fasta, output_fasta, params, config, logger, job_id,
+        orient_uncertain=orient_uncertain, fix_orientation=False,
+    )
+    return accepted
 
 
 def _run_mafft(
@@ -484,7 +748,14 @@ def _run_mafft(
         with open(output_fasta, "w") as f:
             f.write(stdout)
 
-    reversed_count = _restore_mafft_direction_headers(input_fasta, output_fasta, logger)
+    reversed_headers = _restore_mafft_direction_headers(input_fasta, output_fasta, logger)
+    if reversed_headers and fix_orientation:
+        reversed_headers = _apply_direction_veto_and_realign(
+            input_fasta, output_fasta, params, config, logger, job_id,
+            reversed_headers, orient_uncertain,
+        )
+
+    reversed_count = len(reversed_headers)
     if reversed_count:
         # ORIENT already ran its own motif-based orientation check over this
         # same input, so a MAFFT flip here means the alignment now holds those

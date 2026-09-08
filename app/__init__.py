@@ -9,6 +9,30 @@ except ImportError:
 from flask import Flask, abort, send_from_directory
 from app.config import config
 
+SCANNER_404_LIMIT = 60
+SCANNER_404_WINDOW_SECONDS = 60
+
+
+def _scanner_404_redis():
+    """Return the short-timeout Redis client used by the missing-route gate."""
+    import redis
+    from flask import current_app
+
+    extension_key = "scanner_404_redis"
+    client = current_app.extensions.get(extension_key)
+    if client is None:
+        client = redis.from_url(
+            current_app.config.get("REDIS_URL", "redis://localhost:6379/0"),
+            socket_connect_timeout=0.1,
+            socket_timeout=0.1,
+        )
+        current_app.extensions[extension_key] = client
+    return client
+
+
+def _scanner_404_key(remote_addr):
+    return f"dikarya:scanner-404:{remote_addr or 'unknown'}"
+
 
 def _install_logging(app, under_gunicorn=False):
     """Attach request context to log records and split WARNING+ into its own file.
@@ -94,6 +118,9 @@ def _install_logging(app, under_gunicorn=False):
         from flask import g
         g.request_id = new_request_id()
 
+    from app.services.request_diagnostics import install_request_diagnostics
+    install_request_diagnostics(app)
+
 
 def create_app(config_name='default'):
     app = Flask(__name__)
@@ -162,6 +189,10 @@ def create_app(config_name='default'):
 
     @app.route('/favicon.ico/<path:filename>')
     def favicon_asset(filename):
+        if filename == 'favicon.svg':
+            # Legacy pages/bookmarks still ask for the raster-embedded SVG.
+            from flask import redirect, url_for
+            return redirect(url_for('static', filename='favicon.ico/favicon-96x96.png'), code=302)
         return send_from_directory(os.path.join(app.static_folder, 'favicon.ico'), filename)
 
     # Browsers and pinned/mobile launchers probe these conventional root URLs
@@ -220,12 +251,83 @@ def create_app(config_name='default'):
         app.config["RATELIMIT_STORAGE_URI"] = app.config['REDIS_URL']
     limiter.init_app(app)
 
+    # Unknown routes are cheap individually but arrive in large vulnerability
+    # sweeps. One scanner generated 1,769 misses in 166 seconds while rotating
+    # fake bot user agents, so user-agent blocks cannot contain it. Count only
+    # 404 responses, shared across Gunicorn workers in Redis; after 60 misses in
+    # one minute, reject further unknown routes from that IP until the window
+    # expires. Known routes and successful API traffic never enter this gate.
+    from werkzeug.exceptions import NotFound
+    from app.services.scanner_burst import ScannerBurstFallback, INCREMENT_SCRIPT
+    scanner_fallback = ScannerBurstFallback(SCANNER_404_WINDOW_SECONDS)
+
+    @app.before_request
+    def _throttle_missing_route_bursts():
+        from flask import current_app, request
+
+        if not current_app.config.get("RATELIMIT_ENABLED", True):
+            return None
+        if not isinstance(request.routing_exception, NotFound):
+            return None
+        key = _scanner_404_key(request.remote_addr)
+        misses = scanner_fallback.count(key)
+        try:
+            misses = max(misses, int(_scanner_404_redis().get(key) or 0))
+        except Exception as exc:
+            from app.services.log_context import log_degradation_rate_limited
+
+            log_degradation_rate_limited(
+                current_app.logger,
+                "scanner_404_limiter_unavailable",
+                "Shared missing-route limiter unavailable; using per-process fallback",
+                exception=type(exc).__name__,
+            )
+        if misses >= SCANNER_404_LIMIT:
+            return (
+                "Too many missing routes", 429,
+                {"Retry-After": str(SCANNER_404_WINDOW_SECONDS),
+                 "X-Dikarya-Noise": "scanner"},
+            )
+        return None
+
+    @app.after_request
+    def _count_missing_route_for_burst_limit(response):
+        from flask import current_app, request
+
+        if (
+            response.status_code != 404
+            or not current_app.config.get("RATELIMIT_ENABLED", True)
+        ):
+            return response
+        key = _scanner_404_key(request.remote_addr)
+        scanner_fallback.count(key, increment=True)
+        try:
+            client = _scanner_404_redis()
+            client.eval(INCREMENT_SCRIPT, 1, key, SCANNER_404_WINDOW_SECONDS)
+        except Exception as exc:
+            from app.services.log_context import log_degradation_rate_limited
+
+            log_degradation_rate_limited(
+                current_app.logger,
+                "scanner_404_limiter_unavailable",
+                "Shared missing-route limiter unavailable; using per-process fallback",
+                exception=type(exc).__name__,
+            )
+        return response
+
     # CSRF error handler - return JSON for API routes
     from flask_wtf.csrf import CSRFError
     from flask import request, jsonify
 
     @app.errorhandler(CSRFError)
     def handle_csrf_error(e):
+        from app.services.request_diagnostics import note_request_failure
+        note_request_failure({
+            "The CSRF token is missing.": "csrf_token_missing",
+            "The CSRF session token is missing.": "csrf_session_missing",
+            "The CSRF token has expired.": "csrf_token_expired",
+            "The CSRF tokens do not match.": "csrf_token_mismatch",
+        }.get(e.description, "csrf_token_invalid"))
         if request.path.startswith("/api/"):
             return jsonify(error="CSRF token missing or invalid", message=e.description), 400
         return "CSRF error", 400

@@ -8,6 +8,7 @@ import threading
 import xml.etree.ElementTree as ET
 from typing import Dict, List, Optional, Tuple, Any
 from app.config import Config
+from app.services.api_diagnostics import record_requests_failure, record_api_failure
 
 logger = logging.getLogger(__name__)
 
@@ -79,6 +80,8 @@ def _ncbi_request(method: str, url: str, max_retries: int = 5, **kwargs) -> requ
         last_attempt = attempt == max_retries - 1
         try:
             response = requests.request(method, url, **kwargs)
+            if response.status_code >= 400:
+                record_requests_failure(response)
             
             # Check for 429 Too Many Requests
             if response.status_code == 429:
@@ -114,6 +117,7 @@ def _ncbi_request(method: str, url: str, max_retries: int = 5, **kwargs) -> requ
             return response
             
         except (requests.ConnectionError, requests.Timeout) as e:
+            record_api_failure(url, reason=type(e).__name__, method=method)
             if last_attempt:
                 logger.warning(f"NCBI Connection/Timeout error on final attempt {attempt + 1}/{max_retries}: {e}. Giving up.")
                 break
@@ -324,6 +328,7 @@ def _submit_blast_request(seq: str, config: Config = None, min_identity: float =
                 pass
                 
     if not rid:
+        record_requests_failure(response, reason="missing_blast_rid")
         raise ValueError(f"Could not retrieve RID from NCBI BLAST submission. Response: {response.text[:500]}")
     
     logger.info(f"BLAST submission successful. RID={rid}, RTOE={rtoe}")
@@ -400,9 +405,11 @@ def _poll_blast(rid: str, rtoe: int, config: Config, logger,
                 continue
             
             if "Status=FAILED" in content:
+                record_requests_failure(response, reason="blast_search_failed")
                 raise RuntimeError(f"BLAST failed for RID {rid}")
                 
             if "Status=UNKNOWN" in content:
+                record_requests_failure(response, reason="blast_search_unknown")
                 raise RuntimeError(f"BLAST RID {rid} expired or unknown")
                 
             if "Status=READY" in content:
@@ -476,6 +483,7 @@ def _fetch_blast_results(rid: str, max_sequences: int = DEFAULT_MAX_SEQUENCES) -
                 content = zf.read(main_json).decode('utf-8')
         except Exception as e:
             logger.error(f"Failed to extract ZIP: {e}")
+            record_requests_failure(response, reason="invalid_blast_zip")
             return {"accessions": [], "hit_details": []}
     else:
         content = response.text
@@ -512,11 +520,8 @@ def _fetch_blast_results(rid: str, max_sequences: int = DEFAULT_MAX_SEQUENCES) -
         blast_output = data.get("BlastOutput2", {})
         
         if not blast_output:
-            # Deliberately no debug dump. This used to write the decoded NCBI
-            # response to a fixed /tmp/blast_debug_response.json, which every
-            # concurrent job overwrote and which put upstream response data
-            # outside the normal logging controls. The bounded fingerprint plus
-            # the key list is enough to recognise a recurring malformed shape.
+            # Unique redacted archives preserve evidence across concurrent jobs.
+            record_requests_failure(response, reason="missing_blastoutput2")
             from app.services.log_context import stable_fingerprint
             logger.warning(
                 "event=blast.no_blastoutput2 BLAST response carried no "
@@ -570,6 +575,7 @@ def _fetch_blast_results(rid: str, max_sequences: int = DEFAULT_MAX_SEQUENCES) -
         return {"accessions": accessions[:limit], "hit_details": hit_details[:limit]}
         
     except json.JSONDecodeError as e:
+        record_requests_failure(response, reason="invalid_blast_json")
         from app.services.log_context import stable_fingerprint
         logger.error(
             "event=blast.response_parse_failed JSON decode failed exception=%s "
@@ -684,6 +690,37 @@ def _fetch_genbank_xml_individually(accessions: List[str]) -> List[str]:
     return documents
 
 
+def _fasta_accession_tokens(fasta_text: str) -> set:
+    """Return every accession-ish identifier appearing in FASTA headers.
+
+    Both the versioned and the bare form of each identifier are included, so a
+    caller that asked for ``MJ505555`` matches a record NCBI labelled
+    ``MJ505555.1`` and vice versa. NCBI's older pipe-delimited header form
+    (``gi|...|gb|MJ505555.1|``) is handled by splitting the first token on
+    ``|``.
+    """
+    from app.services.fasta_utils import parse_fasta_records
+
+    tokens = set()
+    for header, _sequence in parse_fasta_records(fasta_text or ""):
+        first = str(header or "").strip().split()[0] if str(header or "").strip() else ""
+        for piece in first.split("|"):
+            piece = piece.strip().upper()
+            if not piece:
+                continue
+            tokens.add(piece)
+            tokens.add(piece.split(".")[0])
+    return tokens
+
+
+def _accession_is_present(accession: str, tokens: set) -> bool:
+    """True when a requested accession is among the identifiers returned."""
+    value = str(accession or "").strip().upper()
+    if not value:
+        return False
+    return value in tokens or value.split(".")[0] in tokens
+
+
 def _report_unresolved_accessions(failed: List[str], recovered: int) -> None:
     """Mark accessions NCBI would not return as a degradation, not a silent gap.
 
@@ -718,6 +755,7 @@ def _parse_genbank_xml(xml_text: str) -> Dict[str, Dict]:
     }
     """
     result = {"by_acc": {}, "by_ver": {}}
+    original_xml = xml_text
     
     try:
         # Remove namespace prefixes if present to simplify parsing
@@ -793,6 +831,7 @@ def _parse_genbank_xml(xml_text: str) -> Dict[str, Dict]:
                 result["by_ver"][ver] = record
                 
     except ET.ParseError as e:
+        record_api_failure(NCBI_EFETCH_URL, reason="invalid_genbank_xml", status=200, body=original_xml)
         logger.error(f"XML Parse Error: {e}")
     except Exception as e:
         logger.error(f"Error parsing GenBank XML: {e}")
@@ -1069,23 +1108,48 @@ def fetch_fasta_for_accessions(accessions: List[str]) -> str:
                 "rettype": "fasta",
                 "retmode": "text"
             }
+            recovered_text = ""
             try:
                 response = _ncbi_request("POST", NCBI_EFETCH_URL, data=params, timeout=(10, 60))
                 if response.status_code == 200:
-                    text = response.text.strip()
-                    if text:
-                        final_lines.append(text)
-                    continue
-                logger.error(
-                    "event=ncbi.fallback_failed Fallback FASTA fetch failed "
-                    "status=%s count=%s",
-                    response.status_code, len(chunk),
-                )
+                    # A 200 with an empty body is NCBI answering "nothing" --
+                    # it is not a recovery. Continuing on every 200 dropped
+                    # those accessions out of the result *and* out of the
+                    # unresolved report, so the run looked entirely successful.
+                    recovered_text = (response.text or "").strip()
+                    if not recovered_text:
+                        logger.error(
+                            "event=ncbi.fallback_empty Fallback FASTA fetch "
+                            "returned an empty body status=200 count=%s",
+                            len(chunk),
+                        )
+                else:
+                    logger.error(
+                        "event=ncbi.fallback_failed Fallback FASTA fetch failed "
+                        "status=%s count=%s",
+                        response.status_code, len(chunk),
+                    )
             except Exception as e:
                 logger.error(f"Fallback FASTA fetch exception: {e}")
-            # These accessions are now definitively absent from the result.
-            # Silently returning without them produced a tree missing its
-            # references that looked like a completely successful run.
-            _report_unresolved_accessions(chunk, len(final_lines))
+
+            # NCBI can answer a multi-id efetch with only some of the records,
+            # so which accessions were recovered is read back off the FASTA it
+            # actually returned rather than assumed to be all or none.
+            returned = _fasta_accession_tokens(recovered_text)
+            if returned:
+                final_lines.append(recovered_text)
+            unresolved = [
+                acc for acc in chunk
+                if not _accession_is_present(acc, returned)
+            ]
+            if unresolved:
+                # These accessions are now definitively absent from the result.
+                # Silently returning without them produced a tree missing its
+                # references that looked like a completely successful run. The
+                # recovered count is this chunk's own, not the length of the
+                # whole accumulated output.
+                _report_unresolved_accessions(
+                    unresolved, len(chunk) - len(unresolved)
+                )
 
     return "\n".join(final_lines)

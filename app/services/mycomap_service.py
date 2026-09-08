@@ -16,9 +16,10 @@ import re
 import shlex
 import time
 import urllib.request
+from app.services.api_diagnostics import diagnostic_urlopen, record_api_failure
 import urllib.parse
 import urllib.error
-from typing import Optional, Tuple
+from typing import Any, Dict, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -60,10 +61,10 @@ MYCOMAP_NCBI_RECHECK_MAX_HOURS = 48
 # giving up. MycoMap answers the create POST with "Job added to queue" and no
 # ID, so the record only becomes discoverable once its queue reaches the job.
 # MycoMap can leave an accepted search in its queue for well over ten minutes.
-# RQ retries do not occupy a worker slot, so keep discovering for an hour
-# before asking the user to rebuild instead of turning ordinary queue backlog
-# into a failed tree.
-MYCOMAP_CREATION_DISCOVERY_MAX_SECONDS = 3600
+# RQ retries do not occupy a worker slot. Check frequently for the first hour,
+# then back off while keeping the accepted search alive for four days so a large
+# MycoMap backlog does not turn into a failed tree that must be rebuilt by hand.
+MYCOMAP_CREATION_DISCOVERY_MAX_SECONDS = 4 * 24 * 60 * 60
 MYCOMAP_NEAR_DUPLICATE_MAX_DIFFERENCES = 4
 
 _CONCRETE_DNA_BASES = frozenset("ACGT")
@@ -436,15 +437,55 @@ def get_mycomap_creation_discovery_max_seconds() -> int:
         "MYCOMAP_CREATION_DISCOVERY_MAX_SECONDS",
         MYCOMAP_CREATION_DISCOVERY_MAX_SECONDS,
         min_value=60,
-        max_value=7200,
+        max_value=7 * 24 * 60 * 60,
     )
 
 
+def get_mycomap_creation_discovery_poll_interval_seconds(
+        elapsed_seconds: int) -> int:
+    """Return the next non-blocking discovery interval for an accepted search."""
+    elapsed = max(0, int(elapsed_seconds or 0))
+    if elapsed < 60 * 60:
+        return get_mycomap_ncbi_poll_interval_seconds()
+    if elapsed < 6 * 60 * 60:
+        return 5 * 60
+    if elapsed < 24 * 60 * 60:
+        return 15 * 60
+    return 60 * 60
+
+
+def advance_mycomap_creation_discovery(
+        details: Dict[str, Any]) -> Tuple[Dict[str, Any], bool]:
+    """Record one completed discovery wait and whether its total budget expired."""
+    details = dict(details or {})
+    attempt = int(details.get("creation_discovery_attempt") or 0)
+    base_interval = get_mycomap_ncbi_poll_interval_seconds()
+    elapsed = details.get("creation_discovery_elapsed_seconds")
+    if elapsed is None:
+        # Compatibility with jobs queued before elapsed time was persisted.
+        elapsed = attempt * base_interval
+    elapsed = max(0, int(elapsed))
+    waited = int(details.get("creation_discovery_next_interval_seconds") or 0)
+    if waited <= 0:
+        waited = get_mycomap_creation_discovery_poll_interval_seconds(elapsed)
+    elapsed += waited
+    details["creation_discovery_attempt"] = attempt + 1
+    details["creation_discovery_elapsed_seconds"] = elapsed
+    details["creation_discovery_next_interval_seconds"] = (
+        get_mycomap_creation_discovery_poll_interval_seconds(elapsed)
+    )
+    return details, elapsed >= get_mycomap_creation_discovery_max_seconds()
+
+
 def get_mycomap_creation_discovery_max_attempts() -> int:
-    """Return the discovery budget expressed as one-per-poll-interval checks."""
-    interval = max(1, get_mycomap_ncbi_poll_interval_seconds())
+    """Return the number of RQ retries required by the rolling backoff."""
     max_seconds = get_mycomap_creation_discovery_max_seconds()
-    return max(1, -(-max_seconds // interval))
+    elapsed = 0
+    attempts = 0
+    while elapsed < max_seconds:
+        elapsed += get_mycomap_creation_discovery_poll_interval_seconds(elapsed)
+        attempts += 1
+    return max(1, attempts)
 
 
 def get_mycomap_ncbi_recheck_max_hours() -> int:
@@ -603,7 +644,7 @@ def _fetch_mycomap_blast_listing(warnings: Optional[list] = None) -> str:
         method="GET",
     )
     try:
-        with urllib.request.urlopen(request, timeout=REQUEST_TIMEOUT) as resp:
+        with diagnostic_urlopen(request, timeout=REQUEST_TIMEOUT) as resp:
             return resp.read().decode("utf-8", errors="replace")
     except Exception as exc:
         logger.warning("Could not read the MycoMap BLAST listing page: %s", exc)
@@ -857,7 +898,7 @@ def create_mycomap_blast(sequence: str, *, title: str = "",
     )
 
     try:
-        with urllib.request.urlopen(request, timeout=MYCOMAP_RERUN_REQUEST_TIMEOUT) as resp:
+        with diagnostic_urlopen(request, timeout=MYCOMAP_RERUN_REQUEST_TIMEOUT) as resp:
             status_code = getattr(resp, "status", resp.getcode())
             raw_body = resp.read().decode("utf-8", errors="replace")
             response_url = resp.geturl() or ""
@@ -995,7 +1036,7 @@ def rerun_mycomap_blast(blast_id: str, result_type: str = "local",
     )
 
     try:
-        with urllib.request.urlopen(request, timeout=MYCOMAP_RERUN_REQUEST_TIMEOUT) as resp:
+        with diagnostic_urlopen(request, timeout=MYCOMAP_RERUN_REQUEST_TIMEOUT) as resp:
             status_code = getattr(resp, "status", resp.getcode())
             raw_body = resp.read().decode("utf-8", errors="replace")
     except urllib.error.HTTPError as e:
@@ -1071,7 +1112,7 @@ def _mycomap_refresh_request(path: str, *, method: str = "GET",
         method=method,
     )
     try:
-        with urllib.request.urlopen(request, timeout=MYCOMAP_RERUN_REQUEST_TIMEOUT) as resp:
+        with diagnostic_urlopen(request, timeout=MYCOMAP_RERUN_REQUEST_TIMEOUT) as resp:
             raw_body = resp.read().decode("utf-8", errors="replace")
     except urllib.error.HTTPError as exc:
         raw_body = exc.read().decode("utf-8", errors="replace")
@@ -1105,6 +1146,8 @@ def _mycomap_refresh_request(path: str, *, method: str = "GET",
         return json.loads(raw_body) if raw_body else {}
     except json.JSONDecodeError:
         logger.error("MycoMap refresh API returned non-JSON for %s", path)
+        record_api_failure(request.full_url, reason="invalid_json", status=200,
+                           body=raw_body, method=method, req=request)
         raise MycoMapRefreshError("MycoMap refresh returned an invalid response.")
 
 
@@ -1601,7 +1644,7 @@ def get_mycomap_ncbi_queue_position(mycomap_url: str) -> Optional[int]:
         },
     )
     try:
-        with urllib.request.urlopen(request, timeout=REQUEST_TIMEOUT) as resp:
+        with diagnostic_urlopen(request, timeout=REQUEST_TIMEOUT) as resp:
             content = resp.read().decode('utf-8', errors='replace')
     except Exception as e:
         # Queue position is best-effort context. The actual result fetch still
@@ -1693,7 +1736,7 @@ def _fetch_fasta(
                 break
             timeout = min(REQUEST_TIMEOUT, remaining)
         try:
-            with urllib.request.urlopen(request, timeout=timeout) as resp:
+            with diagnostic_urlopen(request, timeout=timeout) as resp:
                 content = resp.read()
             if attempt:
                 logger.info(
@@ -2561,7 +2604,7 @@ def fetch_mycomap_blast_metrics(blast_id: str, source_url: Optional[str] = None)
     content = ''
     for url in _metrics_page_urls(blast_id, source_url):
         try:
-            with opener.open(url, timeout=REQUEST_TIMEOUT) as resp:
+            with diagnostic_urlopen(url, timeout=REQUEST_TIMEOUT, opener=opener.open) as resp:
                 content = resp.read().decode('utf-8', errors='replace')
             break
         except Exception as e:
@@ -2583,4 +2626,5 @@ def fetch_mycomap_blast_metrics(blast_id: str, source_url: Optional[str] = None)
         return combined
     except Exception as e:
         logger.warning(f"fetch_mycomap_blast_metrics: parse error: {e}", exc_info=True)
+        record_api_failure(url, reason="invalid_blast_metrics_html", status=200, body=content)
         return {}

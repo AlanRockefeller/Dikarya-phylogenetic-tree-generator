@@ -129,57 +129,116 @@
 
     </div>
 
-    <!-- Workers Table -->
+    <!-- Live job activity.
+         Rendered entirely by the script at the bottom of this page, from the
+         JSON below on first paint and from /health/jobs on every refresh, so
+         there is exactly one renderer and the two can never disagree. -->
+    <div class="flex items-center justify-between flex-wrap gap-3">
+        <h3 class="text-lg font-bold text-journal-dark dark:text-gray-100 flex items-center">
+            <i class="fas fa-bolt text-journal-gold mr-2"></i>Live Activity
+            <span id="live-updated" class="ml-3 text-xs font-normal text-gray-500 dark:text-gray-400"></span>
+        </h3>
+        <label class="flex items-center gap-2 text-xs text-gray-600 dark:text-gray-300 select-none">
+            <input type="checkbox" id="live-autorefresh" checked
+                   class="rounded border-gray-300 text-journal-gold focus:ring-journal-gold">
+            Auto-refresh every 5s
+        </label>
+    </div>
+
+    <div id="live-error" class="hidden bg-red-50 dark:bg-red-900/30 border border-red-200 dark:border-red-800 text-red-800 dark:text-red-200 rounded-xl px-4 py-3 text-sm"></div>
+
+    <!-- Queues -->
+    <div class="bg-white dark:bg-journal-green rounded-xl shadow-lg overflow-hidden transition-colors">
+        <div class="bg-journal-dark px-5 py-3 border-b border-journal-green">
+            <h3 class="text-white font-semibold flex items-center">
+                <i class="fas fa-list-ol text-journal-gold mr-2"></i>Queues
+            </h3>
+        </div>
+        <div class="p-5 overflow-x-auto" id="queue-table"></div>
+    </div>
+
+    <!-- Running jobs -->
+    <div class="bg-white dark:bg-journal-green rounded-xl shadow-lg overflow-hidden transition-colors">
+        <div class="bg-journal-dark px-5 py-3 border-b border-journal-green">
+            <h3 class="text-white font-semibold flex items-center">
+                <i class="fas fa-gears text-journal-gold mr-2"></i>Running Jobs
+                <span id="running-count" class="ml-2 text-xs font-normal text-gray-400"></span>
+            </h3>
+        </div>
+        <div class="p-5 space-y-5" id="running-jobs"></div>
+    </div>
+
+    <!-- Waiting jobs -->
+    <div class="bg-white dark:bg-journal-green rounded-xl shadow-lg overflow-hidden transition-colors">
+        <div class="bg-journal-dark px-5 py-3 border-b border-journal-green">
+            <h3 class="text-white font-semibold flex items-center">
+                <i class="fas fa-hourglass-half text-journal-gold mr-2"></i>Waiting in Queue
+                <span id="queued-count" class="ml-2 text-xs font-normal text-gray-400"></span>
+            </h3>
+        </div>
+        <div class="p-5 overflow-x-auto" id="queued-jobs"></div>
+    </div>
+
+    <!-- Workers -->
     <div class="bg-white dark:bg-journal-green rounded-xl shadow-lg overflow-hidden transition-colors">
         <div class="bg-journal-dark px-5 py-3 border-b border-journal-green">
             <h3 class="text-white font-semibold flex items-center">
                 <i class="fas fa-users-gear text-journal-gold mr-2"></i>Worker Nodes
-                <span class="ml-2 text-xs text-gray-400">({{ workers.workers|length }} found)</span>
+                <span id="worker-count" class="ml-2 text-xs font-normal text-gray-400"></span>
             </h3>
         </div>
-        <div class="p-5">
-            {% if workers.workers %}
-            <div class="overflow-x-auto">
-                <table class="w-full text-sm">
-                    <thead>
-                        <tr class="border-b border-gray-200 dark:border-journal-dark text-left">
-                            <th class="py-2 pr-4 font-semibold text-gray-700 dark:text-gray-200">Worker ID</th>
-                            <th class="py-2 pr-4 font-semibold text-gray-700 dark:text-gray-200">Status</th>
-                            <th class="py-2 pr-4 font-semibold text-gray-700 dark:text-gray-200">Last Heartbeat</th>
-                            <th class="py-2 pr-4 font-semibold text-gray-700 dark:text-gray-200 text-right">Age (s)</th>
-                        </tr>
-                    </thead>
-                    <tbody>
-                        {% for worker in workers.workers %}
-                        <tr class="border-b border-gray-100 dark:border-journal-dark last:border-0 hover:bg-gray-50 dark:hover:bg-journal-dark/40 transition-colors">
-                            <td class="py-2 pr-4 font-mono text-xs text-gray-700 dark:text-gray-200">{{ worker.id }}</td>
-                            <td class="py-2 pr-4">
-                                {% if worker.status == 'healthy' %}
-                                <span class="px-2 py-0.5 rounded-full text-xs font-bold bg-green-100 text-green-800 dark:bg-green-900 dark:text-green-200">Healthy</span>
-                                {% elif worker.status == 'stale' %}
-                                <span class="px-2 py-0.5 rounded-full text-xs font-bold bg-yellow-100 text-yellow-800 dark:bg-yellow-900 dark:text-yellow-200">Stale</span>
-                                {% else %}
-                                <span class="px-2 py-0.5 rounded-full text-xs font-bold bg-red-100 text-red-800 dark:bg-red-900 dark:text-red-200">Dead</span>
-                                {% endif %}
-                            </td>
-                            <td class="py-2 pr-4 font-mono text-xs text-gray-600 dark:text-gray-300">{{ worker.last_heartbeat }}</td>
-                            <td class="py-2 pr-4 font-mono text-right text-gray-700 dark:text-gray-200">{{ worker.age_seconds }}</td>
-                        </tr>
-                        {% endfor %}
-                    </tbody>
-                </table>
-            </div>
-            {% else %}
-            <p class="text-gray-500 dark:text-gray-400 italic">
-                {% if workers.status == 'no_workers_dir' %}
-                Worker directory not found. Is the worker service running?
-                {% else %}
-                No worker heartbeats detected.
-                {% endif %}
+        <div class="p-5 overflow-x-auto" id="worker-table"></div>
+    </div>
+
+    <!-- Recently finished -->
+    <div class="bg-white dark:bg-journal-green rounded-xl shadow-lg overflow-hidden transition-colors">
+        <div class="bg-journal-dark px-5 py-3 border-b border-journal-green">
+            <h3 class="text-white font-semibold flex items-center">
+                <i class="fas fa-clock-rotate-left text-journal-gold mr-2"></i>Recently Finished
+                <span class="ml-2 text-xs font-normal text-gray-400">({{ recent_jobs|length }})</span>
+            </h3>
+        </div>
+        <div class="p-5 overflow-x-auto">
+            {% if recent_jobs %}
+            <table class="w-full text-sm">
+                <thead>
+                    <tr class="border-b border-gray-200 dark:border-journal-dark text-left text-gray-700 dark:text-gray-200">
+                        <th class="py-2 pr-4 font-semibold">Job</th>
+                        <th class="py-2 pr-4 font-semibold">Status</th>
+                        <th class="py-2 pr-4 font-semibold">Input</th>
+                        <th class="py-2 pr-4 font-semibold text-right">Duration</th>
+                        <th class="py-2 pr-4 font-semibold text-right">Finished</th>
+                        <th class="py-2 pr-4 font-semibold">Failed step</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {% for job in recent_jobs %}
+                    <tr class="border-b border-gray-100 dark:border-journal-dark last:border-0">
+                        <td class="py-2 pr-4 font-mono text-xs text-gray-700 dark:text-gray-200">{{ job.ref }}</td>
+                        <td class="py-2 pr-4">
+                            <span class="px-2 py-0.5 rounded-full text-xs font-bold
+                                {% if job.status == 'completed' %}bg-green-100 text-green-800 dark:bg-green-900 dark:text-green-200
+                                {% elif job.status == 'failed' %}bg-red-100 text-red-800 dark:bg-red-900 dark:text-red-200
+                                {% else %}bg-gray-200 text-gray-700 dark:bg-journal-dark dark:text-gray-300{% endif %}">{{ job.status }}</span>
+                        </td>
+                        <td class="py-2 pr-4 text-gray-600 dark:text-gray-300">{{ job.input_type }}</td>
+                        <td class="py-2 pr-4 font-mono text-right text-gray-700 dark:text-gray-200 live-duration" data-seconds="{{ job.duration_seconds if job.duration_seconds is not none else '' }}">{{ job.duration_seconds }}</td>
+                        <td class="py-2 pr-4 font-mono text-right text-gray-600 dark:text-gray-300 live-duration" data-seconds="{{ job.finished_age_seconds if job.finished_age_seconds is not none else '' }}">{{ job.finished_age_seconds }}</td>
+                        <td class="py-2 pr-4 text-xs text-gray-600 dark:text-gray-300">{{ job.failed_step or '—' }}</td>
+                    </tr>
+                    {% endfor %}
+                </tbody>
+            </table>
+            <p class="mt-2 text-[11px] text-gray-500 dark:text-gray-400">
+                Duration is submission to final status, so it includes time spent waiting in the queue.
             </p>
+            {% else %}
+            <p class="text-gray-500 dark:text-gray-400 italic">No finished jobs recorded.</p>
             {% endif %}
         </div>
     </div>
+
+    <script id="live-data" type="application/json">{{ live|tojson }}</script>
 
     <!-- Claude Review (AI) usage -->
     <div class="bg-white dark:bg-journal-green rounded-xl shadow-lg overflow-hidden transition-colors">
@@ -306,7 +365,387 @@
         JSON endpoints:
         <a href="{{ url_for('monitoring.health_check') }}" class="font-mono hover:text-journal-gold mx-2">/health</a> |
         <a href="{{ url_for('monitoring.worker_health') }}" class="font-mono hover:text-journal-gold mx-2">/health/workers</a> |
+        <a href="{{ url_for('monitoring.job_activity') }}" class="font-mono hover:text-journal-gold mx-2">/health/jobs</a> |
         <a href="{{ url_for('monitoring.metrics') }}" class="font-mono hover:text-journal-gold mx-2">/metrics</a>
     </div>
 </div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+// Live job rendering for /admin/monitoring.
+//
+// One renderer drives both the server-rendered first paint (from #live-data)
+// and every polled refresh (from /health/jobs), so the two views cannot drift.
+// Everything the endpoint returns is already bounded and redacted server-side
+// (no full job UUIDs, no submitted sequences); esc() is here because building
+// HTML strings from any server value without it is how that stops being true.
+(function () {
+    const REFRESH_MS = 5000;
+    const el = (id) => document.getElementById(id);
+
+    function esc(value) {
+        if (value === null || value === undefined) return '';
+        return String(value).replace(/[&<>"']/g, (c) => ({
+            '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
+        }[c]));
+    }
+
+    function fmtDuration(seconds) {
+        if (seconds === null || seconds === undefined || isNaN(seconds)) return '—';
+        const s = Math.max(0, Math.round(Number(seconds)));
+        if (s < 60) return s + 's';
+        const m = Math.floor(s / 60), rs = s % 60;
+        if (m < 60) return m + 'm ' + rs + 's';
+        const h = Math.floor(m / 60), rm = m % 60;
+        if (h < 24) return h + 'h ' + rm + 'm';
+        return Math.floor(h / 24) + 'd ' + (h % 24) + 'h';
+    }
+
+    function fmtBytes(bytes) {
+        if (bytes === null || bytes === undefined || isNaN(bytes)) return '—';
+        const units = ['B', 'KB', 'MB', 'GB', 'TB'];
+        let value = Number(bytes), i = 0;
+        while (value >= 1024 && i < units.length - 1) { value /= 1024; i += 1; }
+        return (i === 0 ? value : value.toFixed(1)) + ' ' + units[i];
+    }
+
+    function fmtNumber(value) {
+        if (value === null || value === undefined || value === '') return '—';
+        return Number(value).toLocaleString();
+    }
+
+    function pill(text, tone) {
+        const tones = {
+            green: 'bg-green-100 text-green-800 dark:bg-green-900 dark:text-green-200',
+            blue: 'bg-blue-100 text-blue-800 dark:bg-blue-900 dark:text-blue-200',
+            yellow: 'bg-yellow-100 text-yellow-800 dark:bg-yellow-900 dark:text-yellow-200',
+            red: 'bg-red-100 text-red-800 dark:bg-red-900 dark:text-red-200',
+            gray: 'bg-gray-200 text-gray-700 dark:bg-journal-dark dark:text-gray-300'
+        };
+        return '<span class="px-2 py-0.5 rounded-full text-xs font-bold ' +
+            (tones[tone] || tones.gray) + '">' + esc(text) + '</span>';
+    }
+
+    const STEP_TONE = {
+        done: 'text-green-600 dark:text-green-400',
+        running: 'text-blue-600 dark:text-blue-400',
+        failed: 'text-red-600 dark:text-red-400',
+        skipped: 'text-gray-400 dark:text-gray-500',
+        queued: 'text-gray-400 dark:text-gray-500'
+    };
+    const STEP_ICON = {
+        done: 'fa-circle-check',
+        running: 'fa-spinner fa-spin',
+        failed: 'fa-circle-xmark',
+        skipped: 'fa-circle-minus',
+        queued: 'fa-circle'
+    };
+
+    function bar(percent, tone) {
+        const width = Math.max(0, Math.min(100, Number(percent) || 0));
+        return '<div class="w-full bg-gray-200 dark:bg-journal-dark rounded-full h-2">' +
+            '<div class="' + tone + ' h-2 rounded-full transition-all" style="width:' +
+            width + '%"></div></div>';
+    }
+
+    function fact(label, value) {
+        return '<div><p class="text-[11px] uppercase tracking-wider text-gray-500 dark:text-gray-400">' +
+            esc(label) + '</p><p class="font-mono text-sm text-journal-dark dark:text-gray-100">' +
+            value + '</p></div>';
+    }
+
+    function optionChips(options) {
+        const interesting = ['tree_method', 'tree_model', 'alignment_method',
+            'trimming_method', 'its_region', 'blast_mode', 'run_preset',
+            'bootstrap_cap', 'bootstrap', 'alrt_replicates', 'mcmc_generations',
+            'moose_enabled'];
+        const chips = [];
+        interesting.forEach((key) => {
+            const value = options ? options[key] : undefined;
+            if (value === undefined || value === null || value === '' ||
+                value === false || value === 'none') return;
+            chips.push('<span class="px-2 py-0.5 rounded bg-gray-100 dark:bg-journal-dark text-[11px] font-mono text-gray-700 dark:text-gray-300">' +
+                esc(key.replace(/_/g, ' ')) + ': ' + esc(value) + '</span>');
+        });
+        return chips.join(' ');
+    }
+
+    function renderSteps(job) {
+        if (!job.steps || !job.steps.length) {
+            return '<p class="text-xs text-gray-500 dark:text-gray-400 italic">No pipeline detail reported yet.</p>';
+        }
+        const rows = job.steps.map((step) => {
+            const tone = STEP_TONE[step.state] || STEP_TONE.queued;
+            const icon = STEP_ICON[step.state] || STEP_ICON.queued;
+            const running = step.state === 'running';
+            return '<div class="flex items-start gap-3 py-1.5 border-b border-gray-100 dark:border-journal-dark last:border-0">' +
+                '<i class="fas ' + icon + ' ' + tone + ' mt-1 w-4 text-center"></i>' +
+                '<div class="flex-1 min-w-0">' +
+                '<p class="text-sm ' + (running ? 'font-semibold text-journal-dark dark:text-gray-100' : 'text-gray-700 dark:text-gray-200') + '">' +
+                esc(step.label) + '</p>' +
+                (step.detail ? '<p class="text-xs text-gray-500 dark:text-gray-400">' + esc(step.detail) + '</p>' : '') +
+                '</div>' +
+                '<span class="font-mono text-xs text-gray-600 dark:text-gray-300 whitespace-nowrap">' +
+                (step.duration_seconds === null ? '' : fmtDuration(step.duration_seconds)) + '</span>' +
+                '</div>';
+        }).join('');
+        return rows;
+    }
+
+    function renderProcesses(job) {
+        if (!job.processes || !job.processes.length) return '';
+        const rows = job.processes.map((proc) => (
+            '<tr class="border-t border-gray-100 dark:border-journal-dark">' +
+            '<td class="py-1 pr-3 font-mono text-xs text-gray-700 dark:text-gray-200">' + esc(proc.name) + '</td>' +
+            '<td class="py-1 pr-3 font-mono text-xs text-gray-500 dark:text-gray-400">' + esc(proc.pid) + '</td>' +
+            '<td class="py-1 pr-3 text-xs text-gray-500 dark:text-gray-400">' + esc(proc.status) + '</td>' +
+            '<td class="py-1 pr-3 font-mono text-xs text-right text-gray-700 dark:text-gray-200">' + esc(proc.avg_cpu_percent) + '%</td>' +
+            '<td class="py-1 pr-3 font-mono text-xs text-right text-gray-700 dark:text-gray-200">' + fmtDuration(proc.cpu_seconds) + '</td>' +
+            '<td class="py-1 pr-3 font-mono text-xs text-right text-gray-700 dark:text-gray-200">' + fmtBytes(proc.rss_bytes) + '</td>' +
+            '<td class="py-1 font-mono text-xs text-right text-gray-500 dark:text-gray-400">' + esc(proc.threads) + '</td>' +
+            '</tr>'
+        )).join('');
+        return '<div class="mt-4">' +
+            '<p class="text-[11px] uppercase tracking-wider text-gray-500 dark:text-gray-400 mb-1">Processes on the worker</p>' +
+            '<table class="w-full"><thead><tr class="text-[11px] uppercase tracking-wider text-gray-500 dark:text-gray-400 text-left">' +
+            '<th class="pr-3 font-semibold">Process</th><th class="pr-3 font-semibold">PID</th>' +
+            '<th class="pr-3 font-semibold">State</th><th class="pr-3 font-semibold text-right">Avg CPU</th>' +
+            '<th class="pr-3 font-semibold text-right">CPU time</th><th class="pr-3 font-semibold text-right">RSS</th>' +
+            '<th class="font-semibold text-right">Threads</th></tr></thead><tbody>' + rows + '</tbody></table>' +
+            '<p class="text-[11px] text-gray-500 dark:text-gray-400 mt-1">Average CPU is over each process’s whole lifetime, not an instantaneous sample.</p>' +
+            '</div>';
+    }
+
+    function renderRunningJob(job) {
+        const timeoutPct = job.timeout_used_percent;
+        const timeoutTone = timeoutPct === null ? 'bg-gray-400'
+            : (timeoutPct < 50 ? 'bg-green-500' : (timeoutPct < 85 ? 'bg-yellow-500' : 'bg-red-500'));
+
+        let progressBlock = '';
+        if (job.progress) {
+            const p = job.progress;
+            const text = p.label + ' ' + fmtNumber(p.current) +
+                (p.total ? ' / ' + fmtNumber(p.total) : '') +
+                (p.percent !== null && p.percent !== undefined ? ' (' + p.percent + '%)' : '');
+            progressBlock = '<div class="mt-3">' +
+                '<div class="flex items-center justify-between text-xs mb-1">' +
+                '<span class="text-gray-600 dark:text-gray-300">' + esc(text) + '</span>' +
+                '<span class="font-mono text-gray-500 dark:text-gray-400">' + esc(p.source) + '</span></div>' +
+                (p.percent !== null && p.percent !== undefined ? bar(p.percent, 'bg-journal-gold') : '') +
+                '</div>';
+        }
+
+        let activityBlock = '';
+        if (job.activity) {
+            activityBlock = '<p class="mt-3 text-xs text-gray-500 dark:text-gray-400">' +
+                '<i class="fas fa-pen-to-square mr-1 opacity-70"></i>Last write: <span class="font-mono">' +
+                esc(job.activity.file) + '</span> &middot; ' + fmtBytes(job.activity.size_bytes) +
+                ' &middot; ' + fmtDuration(job.activity.age_seconds) + ' ago</p>';
+        }
+
+        return '<div class="border border-gray-200 dark:border-journal-dark rounded-xl p-4">' +
+            '<div class="flex items-center justify-between flex-wrap gap-2 mb-3">' +
+            '<div class="flex items-center gap-2 flex-wrap">' +
+            '<span class="font-mono text-sm font-bold text-journal-dark dark:text-gray-100">' + esc(job.ref) + '</span>' +
+            pill(job.queue, job.queue === 'phylo_bulk' ? 'yellow' : 'blue') +
+            (job.current_tool ? pill(job.current_tool, 'gray') : '') +
+            (job.input && job.input.warnings ? pill(job.input.warnings + ' input warning(s)', 'yellow') : '') +
+            '</div>' +
+            '<span class="font-mono text-sm text-journal-dark dark:text-gray-100">' +
+            '<i class="fas fa-stopwatch mr-1 opacity-70"></i>' + fmtDuration(job.elapsed_seconds) + '</span>' +
+            '</div>' +
+
+            '<div class="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-3 mb-3">' +
+            fact('Step', esc(job.current_step_label || '—')) +
+            fact('In step', fmtDuration(job.current_step_seconds)) +
+            fact('Steps done', esc(job.steps_done) + ' / ' + esc(job.steps_total)) +
+            fact('Sequences', fmtNumber(job.input ? job.input.sequence_count : null)) +
+            fact('Bases', fmtNumber(job.input ? job.input.total_bases : null)) +
+            fact('Worker', '<span class="text-xs">' + esc(job.worker || '—') + '</span>') +
+            '</div>' +
+
+            '<div class="mb-3">' +
+            '<div class="flex items-center justify-between text-xs mb-1">' +
+            '<span class="text-gray-600 dark:text-gray-300">Timeout budget used</span>' +
+            '<span class="font-mono text-gray-600 dark:text-gray-300">' +
+            (timeoutPct === null ? '—' : timeoutPct + '% of ' + fmtDuration(job.timeout_seconds)) +
+            '</span></div>' + bar(timeoutPct, timeoutTone) + '</div>' +
+
+            (optionChips(job.options) ? '<div class="flex flex-wrap gap-1 mb-3">' + optionChips(job.options) + '</div>' : '') +
+
+            progressBlock +
+            '<div class="mt-4">' +
+            '<p class="text-[11px] uppercase tracking-wider text-gray-500 dark:text-gray-400 mb-1">Pipeline</p>' +
+            renderSteps(job) + '</div>' +
+            renderProcesses(job) +
+            activityBlock +
+            '</div>';
+    }
+
+    function renderQueueTable(queues) {
+        if (!queues || !queues.length) {
+            return '<p class="text-gray-500 dark:text-gray-400 italic">No queue information available.</p>';
+        }
+        const rows = queues.map((q) => (
+            '<tr class="border-b border-gray-100 dark:border-journal-dark last:border-0">' +
+            '<td class="py-2 pr-4 font-mono text-sm text-gray-700 dark:text-gray-200">' + esc(q.name) + '</td>' +
+            '<td class="py-2 pr-4 font-mono text-right text-blue-700 dark:text-blue-300">' + esc(q.running) + '</td>' +
+            '<td class="py-2 pr-4 font-mono text-right text-journal-dark dark:text-gray-100">' + esc(q.queued) + '</td>' +
+            '<td class="py-2 pr-4 font-mono text-right text-gray-700 dark:text-gray-200">' + esc(q.workers) + '</td>' +
+            '<td class="py-2 pr-4 font-mono text-right text-gray-700 dark:text-gray-200">' + fmtDuration(q.oldest_wait_seconds) + '</td>' +
+            '<td class="py-2 pr-4 font-mono text-right text-gray-600 dark:text-gray-300">' + esc(q.scheduled) + '</td>' +
+            '<td class="py-2 pr-4 font-mono text-right text-gray-600 dark:text-gray-300">' + esc(q.deferred) + '</td>' +
+            '<td class="py-2 font-mono text-right text-red-600 dark:text-red-400">' + esc(q.failed) + '</td>' +
+            '</tr>'
+        )).join('');
+        return '<table class="w-full text-sm"><thead>' +
+            '<tr class="border-b border-gray-200 dark:border-journal-dark text-left text-gray-700 dark:text-gray-200">' +
+            '<th class="py-2 pr-4 font-semibold">Queue</th><th class="py-2 pr-4 font-semibold text-right">Running</th>' +
+            '<th class="py-2 pr-4 font-semibold text-right">Waiting</th><th class="py-2 pr-4 font-semibold text-right">Workers</th>' +
+            '<th class="py-2 pr-4 font-semibold text-right">Oldest wait</th><th class="py-2 pr-4 font-semibold text-right">Scheduled</th>' +
+            '<th class="py-2 pr-4 font-semibold text-right">Deferred</th><th class="py-2 font-semibold text-right">Failed registry</th>' +
+            '</tr></thead><tbody>' + rows + '</tbody></table>' +
+            '<p class="mt-2 text-[11px] text-gray-500 dark:text-gray-400">' +
+            'phylo_bulk carries the slow lane (RAxML, MrBayes, large IQ-TREE runs); phylo_high everything else. ' +
+            '&ldquo;Failed registry&rdquo; is RQ’s retained failure history, not a 24-hour count.</p>';
+    }
+
+    function renderQueuedJobs(jobs) {
+        if (!jobs || !jobs.length) {
+            return '<p class="text-gray-500 dark:text-gray-400 italic">Nothing waiting — every submitted job is already running.</p>';
+        }
+        const rows = jobs.map((job) => (
+            '<tr class="border-b border-gray-100 dark:border-journal-dark last:border-0">' +
+            '<td class="py-2 pr-4 font-mono text-xs text-gray-500 dark:text-gray-400">#' + esc(job.position) + '</td>' +
+            '<td class="py-2 pr-4 font-mono text-sm text-gray-700 dark:text-gray-200">' + esc(job.ref) + '</td>' +
+            '<td class="py-2 pr-4">' + pill(job.queue, job.queue === 'phylo_bulk' ? 'yellow' : 'blue') + '</td>' +
+            '<td class="py-2 pr-4 font-mono text-right text-gray-700 dark:text-gray-200">' + fmtDuration(job.wait_seconds) + '</td>' +
+            '<td class="py-2 pr-4 font-mono text-right text-gray-700 dark:text-gray-200">' +
+            fmtNumber(job.input ? job.input.sequence_count : null) + '</td>' +
+            '<td class="py-2 pr-4 text-xs text-gray-600 dark:text-gray-300">' +
+            esc((job.options && job.options.tree_method) || '—') + '</td>' +
+            '<td class="py-2 text-xs text-gray-600 dark:text-gray-300">' +
+            esc((job.options && job.options.alignment_method) || '—') + '</td>' +
+            '</tr>'
+        )).join('');
+        return '<table class="w-full text-sm"><thead>' +
+            '<tr class="border-b border-gray-200 dark:border-journal-dark text-left text-gray-700 dark:text-gray-200">' +
+            '<th class="py-2 pr-4 font-semibold">Pos</th><th class="py-2 pr-4 font-semibold">Job</th>' +
+            '<th class="py-2 pr-4 font-semibold">Queue</th><th class="py-2 pr-4 font-semibold text-right">Waiting</th>' +
+            '<th class="py-2 pr-4 font-semibold text-right">Sequences</th><th class="py-2 pr-4 font-semibold">Tree</th>' +
+            '<th class="py-2 font-semibold">Aligner</th></tr></thead><tbody>' + rows + '</tbody></table>';
+    }
+
+    function renderWorkers(workers) {
+        if (!workers || !workers.length) {
+            return '<p class="text-gray-500 dark:text-gray-400 italic">No worker heartbeats detected. Is the worker service running?</p>';
+        }
+        const rows = workers.map((w) => {
+            const tone = w.status === 'healthy' ? 'green' : (w.status === 'stale' ? 'yellow' : 'red');
+            return '<tr class="border-b border-gray-100 dark:border-journal-dark last:border-0">' +
+                '<td class="py-2 pr-4 font-mono text-xs text-gray-700 dark:text-gray-200">' + esc(w.ref || w.id) + '</td>' +
+                '<td class="py-2 pr-4">' + pill(w.status, tone) +
+                (w.rq_state ? ' <span class="text-xs text-gray-500 dark:text-gray-400">' + esc(w.rq_state) + '</span>' : '') + '</td>' +
+                '<td class="py-2 pr-4 text-xs text-gray-600 dark:text-gray-300">' + esc((w.queues || []).join(', ') || '—') + '</td>' +
+                '<td class="py-2 pr-4 font-mono text-xs text-gray-600 dark:text-gray-300">' +
+                esc(w.hostname || '—') + (w.pid ? ':' + esc(w.pid) : '') + '</td>' +
+                '<td class="py-2 pr-4 font-mono text-xs text-gray-700 dark:text-gray-200">' +
+                (w.current_job ? esc(w.current_job) + ' <span class="text-gray-500 dark:text-gray-400">(' +
+                    fmtDuration(w.current_job_seconds) + ')</span>' : '—') + '</td>' +
+                '<td class="py-2 pr-4 font-mono text-xs text-right text-gray-600 dark:text-gray-300">' +
+                esc(w.successful_jobs === undefined ? '—' : w.successful_jobs) + ' / ' +
+                esc(w.failed_jobs === undefined ? '—' : w.failed_jobs) + '</td>' +
+                '<td class="py-2 pr-4 font-mono text-xs text-right text-gray-600 dark:text-gray-300">' +
+                fmtDuration(w.birth_age_seconds) + '</td>' +
+                '<td class="py-2 font-mono text-xs text-right text-gray-600 dark:text-gray-300">' +
+                fmtDuration(w.age_seconds) + '</td></tr>';
+        }).join('');
+        return '<table class="w-full text-sm"><thead>' +
+            '<tr class="border-b border-gray-200 dark:border-journal-dark text-left text-gray-700 dark:text-gray-200">' +
+            '<th class="py-2 pr-4 font-semibold">Worker</th><th class="py-2 pr-4 font-semibold">Status</th>' +
+            '<th class="py-2 pr-4 font-semibold">Queues</th><th class="py-2 pr-4 font-semibold">Host:PID</th>' +
+            '<th class="py-2 pr-4 font-semibold">Current job</th><th class="py-2 pr-4 font-semibold text-right">Done / failed</th>' +
+            '<th class="py-2 pr-4 font-semibold text-right">Uptime</th><th class="py-2 font-semibold text-right">Heartbeat age</th>' +
+            '</tr></thead><tbody>' + rows + '</tbody></table>' +
+            '<p class="mt-2 text-[11px] text-gray-500 dark:text-gray-400">' +
+            'Done / failed are counts since each worker process started, so a restart resets them. ' +
+            'Job references are the first 8 characters of the job id.</p>';
+    }
+
+    function render(data) {
+        const errorBox = el('live-error');
+        if (!data.available) {
+            errorBox.textContent = data.error || 'Live job data unavailable.';
+            errorBox.classList.remove('hidden');
+        } else {
+            errorBox.classList.add('hidden');
+        }
+
+        el('queue-table').innerHTML = renderQueueTable(data.queues);
+
+        const running = data.running || [];
+        el('running-count').textContent = '(' + running.length + ')';
+        el('running-jobs').innerHTML = running.length
+            ? running.map(renderRunningJob).join('')
+            : '<p class="text-gray-500 dark:text-gray-400 italic">No jobs are running right now.</p>';
+
+        const queued = data.queued || [];
+        el('queued-count').textContent = '(' + (data.queued_total || queued.length) + ')';
+        el('queued-jobs').innerHTML = renderQueuedJobs(queued);
+
+        const workers = data.workers || [];
+        el('worker-count').textContent = '(' + workers.length + ')';
+        el('worker-table').innerHTML = renderWorkers(workers);
+
+        el('live-updated').textContent = 'updated ' + new Date().toLocaleTimeString();
+    }
+
+    function refresh() {
+        fetch('{{ url_for("monitoring.job_activity") }}', { headers: { 'Accept': 'application/json' } })
+            .then((response) => {
+                if (!response.ok) throw new Error('HTTP ' + response.status);
+                return response.json();
+            })
+            .then(render)
+            .catch((err) => {
+                const errorBox = el('live-error');
+                errorBox.textContent = 'Could not refresh live job data: ' + err.message;
+                errorBox.classList.remove('hidden');
+            });
+    }
+
+    // Humanize the server-rendered second counts in the Recently Finished table.
+    document.querySelectorAll('.live-duration').forEach((node) => {
+        const seconds = node.dataset.seconds;
+        node.textContent = seconds === '' ? '—' : fmtDuration(seconds) + (node.cellIndex === 4 ? ' ago' : '');
+    });
+
+    try {
+        render(JSON.parse(el('live-data').textContent));
+    } catch (err) {
+        el('live-error').textContent = 'Could not render live job data.';
+        el('live-error').classList.remove('hidden');
+    }
+
+    let timer = window.setInterval(refresh, REFRESH_MS);
+    el('live-autorefresh').addEventListener('change', (event) => {
+        window.clearInterval(timer);
+        if (event.target.checked) {
+            timer = window.setInterval(refresh, REFRESH_MS);
+            refresh();
+        }
+    });
+    // Polling a hidden tab costs the site a request slot for nothing.
+    document.addEventListener('visibilitychange', () => {
+        if (document.hidden) {
+            window.clearInterval(timer);
+        } else if (el('live-autorefresh').checked) {
+            window.clearInterval(timer);
+            timer = window.setInterval(refresh, REFRESH_MS);
+            refresh();
+        }
+    });
+})();
+</script>
 {% endblock %}

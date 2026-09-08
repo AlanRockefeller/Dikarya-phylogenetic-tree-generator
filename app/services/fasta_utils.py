@@ -353,14 +353,82 @@ def read_fasta_records(path) -> list[tuple[str, str]]:
     return parse_fasta_records(read_artifact_text(path))
 
 
+# Size ceilings for a submitted set. Dikarya aligns barcode markers -- ITS,
+# LSU, RPB2 and friends -- and every limit here sits about 2x above the largest
+# job that has ever actually produced a tree, measured across all 10,483
+# successful runs in var/jobs:
+#
+#     longest sequence   max observed     21,658 bp   ->  limit  50,000 bp
+#     total bases        max observed  3,654,324 bp   ->  limit   8,000,000 bp
+#     record count       max observed      2,409      ->  limit   5,000
+#
+# So nothing that has historically worked is rejected. What they do stop is
+# genomic input: MAFFT's cost grows with the product of length and record
+# count, so a set of 205 contigs of ~43 kb each cannot finish inside the
+# 8-hour step limit no matter how long it is left running. Before this check
+# such a job was accepted, occupied the single worker slot for the full 8
+# hours, failed, and blocked every other user's queued job behind it -- which
+# is exactly what happened on 2026-09-03. Rejecting at submission costs the
+# submitter a clear error instead of a wasted day.
+MAX_SEQUENCE_LENGTH = 50_000
+MAX_TOTAL_BASES = 8_000_000
+MAX_RECORD_COUNT = 5_000
+
+# Shared tail for the size errors, so all three tell the user the same story
+# about what this site is for.
+_SIZE_GUIDANCE = (
+    "Dikarya builds trees from barcode markers such as ITS, LSU or RPB2, "
+    "which are typically 500-1,500 bp per sequence. Whole-genome, "
+    "metagenomic and long-read contig sets cannot be aligned here. Extract "
+    "the barcode region first -- the \"ITS Region\" setting on the Tree "
+    "Builder page will pull ITS1, ITS2 or the full ITS out of longer "
+    "sequences -- then resubmit."
+)
+
+
+def check_fasta_size_limits(records: list[tuple[str, str]]) -> None:
+    """Reject a submission too large to align, before it can occupy a worker.
+
+    Raises ``ValueError`` with the same message the API returns to the user.
+    """
+    if len(records) > MAX_RECORD_COUNT:
+        raise ValueError(
+            f"This submission has {len(records):,} sequences, above the "
+            f"{MAX_RECORD_COUNT:,} limit. Build the tree from a representative "
+            "subset instead. " + _SIZE_GUIDANCE
+        )
+
+    total_bases = 0
+    for index, (header, sequence) in enumerate(records, start=1):
+        total_bases += len(sequence)
+        if len(sequence) > MAX_SEQUENCE_LENGTH:
+            record_name = header or f"record {index}"
+            raise ValueError(
+                f"FASTA record '{record_name[:100]}' is {len(sequence):,} bp, "
+                f"above the {MAX_SEQUENCE_LENGTH:,} bp per-sequence limit. "
+                + _SIZE_GUIDANCE
+            )
+
+    if total_bases > MAX_TOTAL_BASES:
+        raise ValueError(
+            f"This submission totals {total_bases:,} bases across "
+            f"{len(records):,} sequences, above the {MAX_TOTAL_BASES:,} base "
+            "limit. " + _SIZE_GUIDANCE
+        )
+
+
 def validate_dna_fasta(fasta_text: str) -> int:
-    """Validate FASTA structure and DNA symbols, returning the record count."""
+    """Validate FASTA structure, DNA symbols and size, returning the record count."""
     records = parse_fasta_records(fasta_text)
     if not records:
         raise ValueError(
             "No FASTA records were found. Start each record with a header line "
             "beginning with '>', followed by its DNA sequence on the next line."
         )
+
+    # Checked before the per-symbol scan so an oversized set is rejected
+    # without walking every base of it.
+    check_fasta_size_limits(records)
 
     for index, (header, sequence) in enumerate(records, start=1):
         record_name = header or f"record {index}"
@@ -392,3 +460,58 @@ def validate_dna_fasta(fasta_text: str) -> int:
             )
 
     return len(records)
+
+
+# --- Sanitized-ID name maps -------------------------------------------------
+#
+# NEXUS's interleaved MATRIX block is whitespace-delimited, so a taxon label
+# there cannot contain a space -- and MrBayes is stricter still, rejecting most
+# punctuation. That is a real restriction of the format, unlike the ones the
+# tree files carry with quoting, so the pipeline substitutes the SEQnnnnnn ids
+# from sanitize_fasta_headers() before running MrBayes. Those ids then reach
+# the user through the "MrBayes Analysis Files" download, where every taxon
+# label had been replaced by an opaque number with nothing to decode it.
+#
+# These two helpers are the decoder ring: the map is written beside the run for
+# new jobs, and reconstructed from the alignment for jobs that predate that.
+
+NAME_MAP_FILENAME = "sequence_names.tsv"
+
+NAME_MAP_HEADER = (
+    "# MrBayes taxon ids and the sequence names they stand for.\n"
+    "# NEXUS matrix labels cannot contain spaces and MrBayes rejects most\n"
+    "# punctuation, so the pipeline renames each sequence before the run.\n"
+    "# Columns: mrbayes_id<TAB>original_name\n"
+)
+
+
+def format_name_map(mapping: Dict[str, str]) -> str:
+    """Render a ``safe_id -> original header`` map as commented TSV text."""
+    lines = [NAME_MAP_HEADER]
+    for safe_id, original in sorted(mapping.items()):
+        # A header cannot contain a newline, but it can contain a tab; the tab
+        # is the column separator here, so fold it to a space.
+        cleaned = str(original).replace("\t", " ").replace("\n", " ").strip()
+        lines.append(f"{safe_id}\t{cleaned}\n")
+    return "".join(lines)
+
+
+def write_name_map(mapping: Dict[str, str], path: Path) -> None:
+    """Write a ``safe_id -> original header`` map as a commented TSV."""
+    Path(path).write_text(format_name_map(mapping), encoding="utf-8")
+
+
+def reconstruct_name_map(alignment_path) -> Dict[str, str]:
+    """Rebuild the ``SEQnnnnnn -> original header`` map from an alignment file.
+
+    ``sanitize_fasta_headers`` numbers records by position and nothing else, so
+    reading the same FASTA back in order reproduces the map exactly. This is
+    what recovers the labels for the ~10,000 MrBayes jobs that ran before the
+    map was written to disk.
+    """
+    return {
+        f"SEQ{index:06d}": header
+        for index, (header, _sequence) in enumerate(
+            read_fasta_records(alignment_path), start=1
+        )
+    }

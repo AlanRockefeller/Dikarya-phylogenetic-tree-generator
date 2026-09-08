@@ -68,3 +68,6 @@ dosage-calculator/
 mycomap.com.api.md
 chatgpt_project_context*
 mycomap_api_documentation.md
+
+# Node dev tooling (ESLint for the browser-side viewer code). Not served.
+node_modules/

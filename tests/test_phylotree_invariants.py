@@ -37,15 +37,38 @@ GROUPS = {
 }
 
 
+def _decode(stream):
+    """TimeoutExpired hands back whatever was buffered, possibly as bytes."""
+    if stream is None:
+        return ""
+    if isinstance(stream, bytes):
+        return stream.decode("utf-8", errors="replace")
+    return stream
+
+
 def run_harness():
     node = shutil.which("node")
     if not node:
         raise unittest.SkipTest("node is not installed")
-    proc = subprocess.run(
-        [node, str(HARNESS), str(REPO), "--json"],
-        capture_output=True,
-        text=True,
-    )
+    try:
+        proc = subprocess.run(
+            [node, str(HARNESS), str(REPO), "--json"],
+            capture_output=True,
+            text=True,
+            # Same ceiling the other Node harnesses use. Without one, a harness
+            # that hangs -- an infinite loop in the code under test is exactly
+            # the kind of regression this file exists to catch -- blocks the
+            # whole suite instead of failing it.
+            timeout=60,
+        )
+    except subprocess.TimeoutExpired as expired:
+        raise AssertionError(
+            "the phylotree harness did not finish within {}s:\n{}\n{}".format(
+                expired.timeout,
+                _decode(expired.stdout),
+                _decode(expired.stderr),
+            )
+        ) from expired
     if proc.returncode != 0:
         raise AssertionError(
             "the phylotree harness could not run:\n{}\n{}".format(

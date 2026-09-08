@@ -113,3 +113,66 @@ def test_moose_valid_amino_acid_model_is_retained_as_fallback():
         {"model": "WAG+G{0.5}", "moose_enabled": True}, data_type="AA"
     )
     assert resolved.model == "WAG+G{0.5}"
+
+
+# ---------------------------------------------------------------------------
+# The base-name grammar has to admit every name on the allowlist.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize(
+    "model",
+    [
+        # RAxML-NG's own JTT-DCMut matrix. The base-name character class did not
+        # include "-", so the explicitly requested model failed to parse and was
+        # silently replaced by the default.
+        "JTT-DCMut",
+        "JTT-DCMut+G",
+        "JTT-DCMut+G{0.5}+F",
+        # ... and the two other punctuation forms already on the allowlist.
+        "Q.pfam+G",
+        "LG4X",
+    ],
+)
+def test_allowlisted_amino_acid_models_are_accepted_verbatim(model):
+    resolved = validate_and_resolve_raxml_params({"model": model}, data_type="AA")
+
+    assert resolved.model == model
+    assert not any("Unknown substitution model" in w for w in resolved.warnings)
+    assert not any("Invalid model component" in w for w in resolved.warnings)
+
+
+def test_every_allowlisted_model_name_parses():
+    """No allowlisted name may be unreachable through the model parser.
+
+    This is how the second half of the same defect surfaced: the parser
+    compares the *uppercased* base name against the allowlist, and the DNA set
+    was the one set not uppercased -- so K81uf, TN93ef, TVMef and the five
+    other mixed-case entries were rejected by their own allowlist and quietly
+    replaced with GTR+G.
+    """
+    from app.services.raxml_validator import VALID_AA_MODELS, VALID_DNA_MODELS
+
+    for data_type, names in (("AA", VALID_AA_MODELS), ("DNA", VALID_DNA_MODELS)):
+        for name in sorted(names):
+            resolved = validate_and_resolve_raxml_params(
+                {"model": name}, data_type=data_type
+            )
+            assert resolved.model == name, (data_type, name, resolved.warnings)
+
+
+@pytest.mark.parametrize("model", ["K81uf", "TN93ef", "TVMef", "TIM2uf+G"])
+def test_mixed_case_dna_models_are_not_silently_substituted(model):
+    resolved = validate_and_resolve_raxml_params({"model": model})
+
+    assert resolved.model == model
+    assert not any("Unknown substitution model" in w for w in resolved.warnings)
+
+
+def test_a_hyphen_does_not_admit_an_unknown_model():
+    """Widening the character class must not widen what is accepted."""
+    resolved = validate_and_resolve_raxml_params(
+        {"model": "NOT-A-MODEL"}, data_type="AA"
+    )
+
+    assert resolved.model == "LG+G"
+    assert any("Unknown substitution model" in w for w in resolved.warnings)

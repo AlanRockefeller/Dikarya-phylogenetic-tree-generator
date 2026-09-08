@@ -30,6 +30,8 @@ def ok(data, *, status=200, meta=None):
 
 def error_response(*, code, message, status, details=None):
     """Build a structured error response. Always sets X-Request-Id."""
+    from app.services.request_diagnostics import note_request_failure
+    note_request_failure(code)
     err = {
         "code": code,
         "message": message,
