@@ -105,15 +105,26 @@ def curl(url, *, binary=False, timeout=45):
     # Body and metadata are separated by a sentinel rather than parsed from
     # headers, so a Set-Cookie with a newline cannot confuse the split.
     sentinel = "===CURLMETA==="
-    proc = subprocess.run(
-        [
-            "curl", "-sS", "--compressed", "--max-time", str(timeout),
-            "-w", f"{sentinel}%{{http_code}}\t%{{content_type}}\t%{{size_download}}",
-            url,
-        ],
-        capture_output=True,
-        timeout=timeout + 15,
-    )
+    try:
+        proc = subprocess.run(
+            [
+                "curl", "-sS", "--compressed", "--max-time", str(timeout),
+                "-w", f"{sentinel}%{{http_code}}\t%{{content_type}}\t%{{size_download}}",
+                url,
+            ],
+            capture_output=True,
+            timeout=timeout + 15,
+        )
+    except FileNotFoundError as exc:
+        # Both of these used to escape as themselves, past the Failure handling
+        # the checks are written around, so the run died with a traceback and
+        # --json printed nothing a caller could parse. They are ordinary check
+        # failures: record them as such.
+        raise Failure(f"curl is not installed or not on PATH: {exc}") from exc
+    except subprocess.TimeoutExpired as exc:
+        raise Failure(
+            f"curl did not return within {timeout + 15}s for {url}"
+        ) from exc
     if proc.returncode != 0:
         raise Failure(
             f"curl failed for {url}: exit {proc.returncode}: "

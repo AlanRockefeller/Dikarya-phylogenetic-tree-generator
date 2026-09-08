@@ -92,7 +92,9 @@ def _run(tokens):
 class SpeciesQuotedEpithetTests(unittest.TestCase):
     def test_every_documented_case_is_unchanged(self):
         tokens = [token for token, _ in CASES]
-        for (token, expected), actual in zip(CASES, _run(tokens)):
+        # strict=True: a harness that returned fewer results than it was given
+        # used to silently shorten the loop and pass.
+        for (token, expected), actual in zip(CASES, _run(tokens), strict=True):
             with self.subTest(token=token):
                 self.assertEqual(actual, expected)
 

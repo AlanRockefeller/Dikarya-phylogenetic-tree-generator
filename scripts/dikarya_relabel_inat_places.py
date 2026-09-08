@@ -190,18 +190,30 @@ def main():
 
     with tree_state_lock(job_dir):
         state = load_tree_state(job_dir)
-        unchanged_labels = set(_tip_labels(job_dir, state)) - set(renames)
+        current_labels = set(_tip_labels(job_dir, state))
+        # The plan above was built outside the lock, and the iNaturalist queries
+        # between the two take long enough for someone to rename or prune a tip
+        # in the viewer meanwhile. Anything the plan expected to find and no
+        # longer sees would be written back as a NEW rename entry for a label
+        # that is gone, so re-check the sources before touching the state.
+        vanished = sorted(old for old, _new in pairs if old not in current_labels)
+        if vanished:
+            raise SystemExit(
+                "Refusing to apply: the tree changed while this ran and these "
+                "labels are no longer present -- " + ", ".join(vanished)
+                + "\nRe-run the dry run to build a fresh plan."
+            )
+        unchanged_labels = current_labels - set(renames)
         collisions = sorted(set(renames.values()) & unchanged_labels)
         if collisions:
             raise SystemExit(
                 "Refusing to apply: these new labels would collide -- "
                 + ", ".join(collisions)
             )
-        from app.services.tree_edit_service import rename_tip
+        from app.services.tree_edit_service import rename_tips
         label = f"rename of {len(pairs)} sequences"
         with undo_checkpoint(job_dir, "rename", label) as checkpoint:
-            for old, new in pairs:
-                state = rename_tip(state, old, new)
+            state = rename_tips(state, pairs)
             save_tree_state(job_dir, state)
             checkpoint.commit()
     print("Applied. The viewer's Undo will revert the whole batch.")

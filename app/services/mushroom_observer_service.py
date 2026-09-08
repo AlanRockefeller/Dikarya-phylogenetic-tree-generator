@@ -199,12 +199,25 @@ def _is_not_found_error(exc: MushroomObserverError) -> bool:
     return "does not exist" in text or "not found" in text
 
 
+# The iNaturalist hint is a nicety attached to an error we are already going to
+# return, and it runs inside a live Mushroom Observer request. iNat's default
+# schedule retries a 429 four times with backoff, which can add most of a minute
+# to a request whose answer is "that number is not a Mushroom Observer
+# observation" either way -- so this lookup gets one attempt and a short timeout.
+INAT_HINT_MAX_ATTEMPTS = 0  # retries, so: one request and no backoff
+INAT_HINT_TIMEOUT_SECONDS = 6
+
+
 def _inaturalist_observation_summary(observation_id: int) -> Optional[Dict[str, Any]]:
     """Return a short description of an iNaturalist observation, or None."""
     try:
         from app.services.inaturalist_tree_service import fetch_observation as fetch_inat
 
-        observation = fetch_inat(int(observation_id))
+        observation = fetch_inat(
+            int(observation_id),
+            max_attempts=INAT_HINT_MAX_ATTEMPTS,
+            timeout=INAT_HINT_TIMEOUT_SECONDS,
+        )
     except Exception as exc:  # any failure just means "no hint to offer"
         logger.info(
             "iNaturalist fallback lookup failed for id=%s: %s", observation_id, exc

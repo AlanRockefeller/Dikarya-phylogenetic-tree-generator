@@ -14,6 +14,15 @@ function section(start, end) {
     return source.slice(from, to);
 }
 
+// Read the cap out of the implementation rather than restating it: a test that
+// carries its own copy of the constant keeps passing after the shipped limit
+// changes, which is the one thing it exists to notice.
+const MAX_VARIATIONS = (() => {
+    const match = source.match(/const\s+MAX_VARIATIONS\s*=\s*(\d+)\s*;/);
+    if (!match) throw new Error('MAX_VARIATIONS was not found in inat_finder.js');
+    return Number(match[1]);
+})();
+
 function contextWith(code, setup = {}) {
     const context = {
         URL,
@@ -48,7 +57,7 @@ async function main() {
 
     const variationCode = section('    function combinations', '    async function resolveCriteria');
     const variations = contextWith(
-        `const MAX_VARIATIONS = 100000;\n` +
+        `const MAX_VARIATIONS = ${MAX_VARIATIONS};\n` +
         `${section('    function canonicalObservationId', '    function parseObservationId')}\n` +
         variationCode,
         {log() {}, exports: 'estimateVariationCount, buildVariations'},
@@ -66,7 +75,7 @@ async function main() {
     if (new Set(generated).size !== generated.length) throw new Error('Numeric candidates were not deduplicated');
 
     const hostileId = '1'.repeat(200);
-    if (variations.estimateVariationCount(hostileId, 3) <= 100000) {
+    if (variations.estimateVariationCount(hostileId, 3) <= MAX_VARIATIONS) {
         throw new Error('Hostile input was estimated below the cap');
     }
     let rejected = false;

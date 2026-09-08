@@ -640,7 +640,10 @@
         results.forEach((taxon, index) => {
             const item = document.createElement('li');
             item.id = `taxon-suggestion-${index}`;
-            item.role = 'option';
+            // setAttribute, not the `role` IDL property: ARIA reflection is
+            // recent enough that older Safari/Firefox silently drop the
+            // assignment, leaving the listbox options with no role at all.
+            item.setAttribute('role', 'option');
             item.setAttribute('aria-selected', 'false');
             item.className = 'flex cursor-pointer items-center gap-3 px-3 py-2 hover:bg-journal-gold/15';
             item.style.borderLeft = `4px solid ${iconicColor(taxon)}`;

@@ -232,7 +232,8 @@ code does exactly and a language model does slowly; the model is used only for
 the judgement of reading those numbers together.
 
 Three blocks beyond the raw statistics carry that judgement further, and each
-has its own section in `SYSTEM_PROMPT`; the two must be changed together.
+has its own section in `SYSTEM_PROMPT`; a block and its prompt section must be
+changed together.
 
 - **`tree.clade_structure` — which tips group with which.** Without it the
   review could report that a tree was well supported but never say *what* it

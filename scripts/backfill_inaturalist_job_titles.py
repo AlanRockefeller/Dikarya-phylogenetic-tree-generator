@@ -215,6 +215,11 @@ def _update_input_info(job, title, journal=None):
             return "stale_backup"
         try:
             backup_path.write_bytes(original)
+            # Rollback is os.replace(backup, live), so the backup's mode becomes
+            # input_info.json's mode. Without this the restored file would come
+            # back with whatever the umask gave a new file -- 0644 in a job
+            # directory where the pipeline needs 0664 group-writable.
+            os.chmod(backup_path, mode)
         except OSError:
             return "backup_failed"
     # The bytes are on disk now (or not needed); do not carry them any further.

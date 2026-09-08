@@ -863,6 +863,12 @@ class PreAuthRateLimitTests(unittest.TestCase):
 
         limiter = SimpleNamespace(limiter=_Strategy())
         app = Flask(__name__)
+        # log_degradation_rate_limited() suppresses a repeat of the same key for
+        # 300s per PROCESS, so anything earlier in the session that tripped this
+        # fail-open would silence the call this test is asserting on.
+        from app.services import log_context
+        with log_context._DEGRADED_LOCK:
+            log_context._DEGRADED_LAST.pop("pre_auth_lookup_limiter_unavailable", None)
         with app.test_request_context(), \
                 patch.dict("sys.modules"), \
                 patch("app.extensions.limiter", limiter):

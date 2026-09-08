@@ -109,11 +109,16 @@ def location_label_from_place_guess(observation: Dict[str, Any]) -> str:
         parts = [part for part in parts if part]
         if not parts:
             continue
+        # Truncated like the standardized label above: an observer-typed
+        # place_guess is free text and can run to a paragraph, and this value
+        # goes straight into a tree tip label.
         if len(parts) >= 3 and len(parts[-2]) <= 3:
-            return f"{parts[0]} {parts[-1]}".strip()
-        if len(parts) >= 2:
-            return " ".join(parts[-2:])
-        return parts[0]
+            label = f"{parts[0]} {parts[-1]}".strip()
+        elif len(parts) >= 2:
+            label = " ".join(parts[-2:])
+        else:
+            label = parts[0]
+        return label[:MAX_LABEL_LENGTH].strip()
     return ""
 
 

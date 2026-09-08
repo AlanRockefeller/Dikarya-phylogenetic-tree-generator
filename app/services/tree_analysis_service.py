@@ -1050,24 +1050,28 @@ def _support_partition(
     return partition
 
 
-def _tip_names_by_clade(tree) -> Dict[int, List[str]]:
-    """Tip names under every clade, in a single post-order pass.
+def _tip_counts_by_clade(tree) -> Dict[int, int]:
+    """Number of tips under every clade, in a single post-order pass.
 
     `clade.get_terminals()` per node is O(tips) each, which on a 2000-tip tree
     is four million operations inside a Gunicorn request slot. Level order
     reversed visits every child before its parent, so each clade only has to
-    concatenate what its children already produced.
+    add up what its children already produced.
+
+    Counts, not the name lists this used to keep: every clade holding the names
+    of all its descendants stores each tip once per ancestor, which on a
+    ladder-shaped 2400-tip tree is millions of entries held for the whole
+    request. Only the handful of clades that end up in the digest need their
+    names, and `_topology_digest` reads those off the tree once it knows which
+    ones they are.
     """
-    names: Dict[int, List[str]] = {}
+    counts: Dict[int, int] = {}
     for clade in reversed(list(tree.find_clades(order="level"))):
         if clade.is_terminal():
-            names[id(clade)] = [str(clade.name or "")]
+            counts[id(clade)] = 1
             continue
-        collected: List[str] = []
-        for child in clade.clades:
-            collected.extend(names.get(id(child), ()))
-        names[id(clade)] = collected
-    return names
+        counts[id(clade)] = sum(counts.get(id(child), 0) for child in clade.clades)
+    return counts
 
 
 def _is_strongly_supported(
@@ -1138,7 +1142,7 @@ def _maximal_strong_clades(
 
 
 def _topology_digest(
-    tree, tip_names_by_id: Dict[int, List[str]], strong_threshold: Optional[float]
+    tree, tip_counts_by_id: Dict[int, int], strong_threshold: Optional[float]
 ) -> Dict[str, Any]:
     """Which tips group with which, as a bounded list of groups.
 
@@ -1164,10 +1168,10 @@ def _topology_digest(
     together by nothing but the shape of the file is not a finding.
     """
     root = tree.root
-    all_tips = tip_names_by_id.get(id(root), [])
+    total_tips = tip_counts_by_id.get(id(root), 0)
 
     def size(clade) -> int:
-        return len(tip_names_by_id.get(id(clade), []))
+        return tip_counts_by_id.get(id(clade), 0)
 
     basis = "strong_support"
     groups = _maximal_strong_clades(root.clades, strong_threshold)
@@ -1190,7 +1194,7 @@ def _topology_digest(
         # which is more groups and less information. The second floor leaves
         # small trees alone entirely, where any group is a large share of a
         # small total.
-        oversized = max(MAX_CLADE_GROUPS, len(all_tips) // 2)
+        oversized = max(MAX_CLADE_GROUPS, total_tips // 2)
         settled: List[Any] = []
         attempts = 0
         while (
@@ -1239,8 +1243,14 @@ def _topology_digest(
     groups.sort(key=size, reverse=True)
     groups = groups[:MAX_CLADE_GROUPS]
     placed = sum(size(clade) for clade in groups)
+    # Names are collected here, for the listed groups only -- at most
+    # MAX_CLADE_GROUPS subtree walks rather than one name list per clade.
     entries = [
-        _clade_entry(position, clade, tip_names_by_id.get(id(clade), []), basis)
+        _clade_entry(
+            position, clade,
+            [str(tip.name or "") for tip in clade.get_terminals()],
+            basis,
+        )
         for position, clade in enumerate(groups, start=1)
     ]
     if basis == "strong_support":
@@ -1272,7 +1282,7 @@ def _topology_digest(
             basis == "strong_support" and supported_total < len(entries)
         ),
         "tips_in_listed_groups": placed,
-        "tips_not_in_any_listed_group": len(all_tips) - placed,
+        "tips_not_in_any_listed_group": total_tips - placed,
         "tip_names_truncated_per_group_at": CLADE_TIP_LIMIT,
         "groups": entries,
     }
@@ -1583,7 +1593,7 @@ def summarize_tree(
         # aggregate; without this the review can say a tree is well supported
         # but never what it supports.
         "clade_structure": _topology_digest(
-            tree, _tip_names_by_clade(tree), strong_threshold
+            tree, _tip_counts_by_clade(tree), strong_threshold
         ),
         "longest_terminal_branches": longest_listed,
         "longest_terminal_branches_share_of_total_percent": longest_share,

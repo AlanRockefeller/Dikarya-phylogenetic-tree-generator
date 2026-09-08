@@ -1405,7 +1405,7 @@ def _newick_tree(text):
 
 def test_topology_digest_reports_outermost_supported_clades():
     tree = _newick_tree("(((a:1,b:1)100:1,(c:1,d:1)100:1)40:1,(e:1,f:1)100:1);")
-    names = service._tip_names_by_clade(tree)
+    names = service._tip_counts_by_clade(tree)
     digest = service._topology_digest(tree, names, 70.0)
 
     assert digest["basis"] == "strong_support"
@@ -1420,7 +1420,7 @@ def test_topology_digest_does_not_nest_a_supported_clade_inside_another():
     # reporting both would state the same membership twice.
     tree = _newick_tree("(((a:1,b:1)100:1,c:1)99:1,(d:1,e:1)10:1);")
     digest = service._topology_digest(
-        tree, service._tip_names_by_clade(tree), 70.0
+        tree, service._tip_counts_by_clade(tree), 70.0
     )
 
     assert len(digest["groups"]) == 1
@@ -1443,7 +1443,7 @@ def test_an_oversized_supported_group_is_reopened(monkeypatch):
         "(g:1,h:1)100:1)100:1)100:1,z:1);"
     )
     digest = service._topology_digest(
-        tree, service._tip_names_by_clade(tree), 70.0
+        tree, service._tip_counts_by_clade(tree), 70.0
     )
 
     assert len(digest["groups"]) > 1
@@ -1466,7 +1466,7 @@ def test_only_the_reopened_groups_are_marked_as_nested():
         f"(({group('p', 15)},{group('q', 15)})100:1,{group('r', 10)});"
     )
     digest = service._topology_digest(
-        tree, service._tip_names_by_clade(tree), 70.0
+        tree, service._tip_counts_by_clade(tree), 70.0
     )
 
     assert digest["one_clade_held_most_of_the_tree"] is True
@@ -1480,7 +1480,7 @@ def test_only_the_reopened_groups_are_marked_as_nested():
 def test_shape_only_groups_are_never_marked_as_nested():
     tree = _newick_tree("(((a:1,b:1)10:1,(c:1,d:1)12:1)8:1,(e:1,f:1)9:1);")
     digest = service._topology_digest(
-        tree, service._tip_names_by_clade(tree), 70.0
+        tree, service._tip_counts_by_clade(tree), 70.0
     )
 
     assert digest["basis"] == "topology_only"
@@ -1492,7 +1492,7 @@ def test_shape_only_groups_are_never_marked_as_nested():
 def test_topology_digest_falls_back_to_shape_and_says_so():
     tree = _newick_tree("(((a:1,b:1)10:1,(c:1,d:1)12:1)8:1,(e:1,f:1)9:1);")
     digest = service._topology_digest(
-        tree, service._tip_names_by_clade(tree), 70.0
+        tree, service._tip_counts_by_clade(tree), 70.0
     )
 
     assert digest["basis"] == "topology_only"
@@ -1507,7 +1507,7 @@ def test_a_dual_labelled_node_needs_both_halves_to_group_tips():
     # which is exactly the disagreement the dual rule exists to catch.
     tree = _newick_tree("((a:1,b:1)20/99:1,(c:1,d:1)95/99:1);")
     digest = service._topology_digest(
-        tree, service._tip_names_by_clade(tree), None
+        tree, service._tip_counts_by_clade(tree), None
     )
 
     grouped = {name for g in digest["groups"] for name in g["tip_names"]}

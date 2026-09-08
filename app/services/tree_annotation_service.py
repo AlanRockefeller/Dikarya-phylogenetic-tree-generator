@@ -431,9 +431,15 @@ def _normalize_layer(raw: Any, index: int) -> Dict[str, Any]:
     # same gold on purpose gets Fixed and keeps it.
     legacy_layer = raw.get("default_highlight_color_mode") is None
     if legacy_layer:
+        # Compare the NORMALIZED colour: _validate_color() lower-cases, so a
+        # legacy layer that stored the shared default as "#C9A962" would
+        # otherwise look like a deliberate pick and come back as Fixed.
+        stored_color = raw.get("default_highlight_color")
+        if isinstance(stored_color, str):
+            stored_color = stored_color.strip().lower()
         layer["default_highlight_color_mode"] = (
             DEFAULT_HIGHLIGHT_COLOR_MODE
-            if raw.get("default_highlight_color") in (None, DEFAULT_HIGHLIGHT_COLOR)
+            if stored_color in (None, "", DEFAULT_HIGHLIGHT_COLOR)
             else HIGHLIGHT_COLOR_MODE_FIXED
         )
 

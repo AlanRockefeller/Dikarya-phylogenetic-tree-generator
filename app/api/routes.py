@@ -224,6 +224,11 @@ RECOMPUTE_READABLE_FIELDS = RECOMPUTE_OVERRIDABLE_FIELDS - {"notes"}
 # budget: worst case it resolves what it can and leaves the rest blank.
 MYCOMAP_PLACE_FILL_BUDGET_SECONDS = 12
 
+# Same idea for the GenBank fallback that runs after it. NCBI's retry schedule
+# is generous enough to outlive the whole request on its own, so the efetch
+# batches get their own ceiling rather than whatever is left over.
+GENBANK_PLACE_FILL_BUDGET_SECONDS = 12
+
 US_STATE_TO_ABBR = {
     "alabama": "al", "alaska": "ak", "arizona": "az", "arkansas": "ar",
     "california": "ca", "colorado": "co", "connecticut": "ct", "delaware": "de",
@@ -1484,8 +1489,12 @@ def fetch_genbank_locations():
         return _server_error(e, where="genbank_locations")
 
 
-def _fill_missing_genbank_locations(sequences):
+def _fill_missing_genbank_locations(sequences, deadline=None):
     """Give still-locationless GenBank-accession records a location from GenBank.
+
+    ``deadline`` (a ``time.monotonic()`` instant) bounds the NCBI round trips,
+    so an unresponsive efetch cannot keep retrying after the import's fetch
+    budget is gone; whatever is not resolved by then simply stays blank.
 
     Runs after the MycoMap and iNaturalist fills, so it only sees records those
     two could not place. GenBank's own value is trimmed with
@@ -1522,7 +1531,7 @@ def _fill_missing_genbank_locations(sequences):
         if len(accessions) >= MAX_CUSTOM_GENBANK_ACCESSIONS:
             break
 
-    locations, _missing, _unavailable = lookup_locations(accessions)
+    locations, _missing, _unavailable = lookup_locations(accessions, deadline=deadline)
 
     filled = 0
     for seq, accession in targets:
@@ -1885,7 +1894,11 @@ def gather_mycomap_sequences_for_queue(url, include_ncbi=True, include_local=Tru
     # the accession, so a record like "PP910301 Eupezizella britannica voucher
     # U.R. 1067" stops arriving with no place at all.
     try:
-        _fill_missing_genbank_locations(sequences)
+        _fill_missing_genbank_locations(
+            sequences,
+            deadline=(None if fetch_time_budget is None
+                      else time.monotonic() + GENBANK_PLACE_FILL_BUDGET_SECONDS),
+        )
     except Exception:
         logger.warning("GenBank location fill failed for MycoMap hits", exc_info=True)
     sequences = uniquify_mycomap_sequence_names(sequences)
@@ -2955,7 +2968,7 @@ def rename_tree_tip(job_id):
     try:
         from app.services.tree_edit_service import (
             load_tree_state,
-            rename_tip,
+            rename_tips,
             save_tree_state,
             tree_state_lock,
             validate_tip_rename,
@@ -2994,8 +3007,10 @@ def rename_tree_tip(job_id):
             state = load_tree_state(job_dir)
             label = "rename" if len(pairs) == 1 else f"rename of {len(pairs)} sequences"
             with undo_checkpoint(job_dir, "rename", label) as checkpoint:
-                for old_name, new_name in pairs:
-                    state = rename_tip(state, old_name, new_name)
+                # One resolution pass for the whole batch: renaming the pairs in
+                # sequence let a later pair match a tip an earlier one had just
+                # renamed, so {A: B, B: C} came out with A named C.
+                state = rename_tips(state, pairs)
                 # One save for the whole batch: a partial write would leave the
                 # viewer showing some of the new names and none of the rest.
                 save_tree_state(job_dir, state)

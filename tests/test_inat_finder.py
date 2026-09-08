@@ -15,12 +15,22 @@ class InatFinderTests(unittest.TestCase):
         node = shutil.which("node")
         if not node:
             self.skipTest("node is not installed")
-        proc = subprocess.run(
-            [node, str(HARNESS), str(REPO)],
-            capture_output=True,
-            text=True,
-            timeout=10,
-        )
+        try:
+            proc = subprocess.run(
+                [node, str(HARNESS), str(REPO)],
+                capture_output=True,
+                text=True,
+                # The harness runs several vm contexts and a fake-timer search
+                # loop; 10s was tight enough to fail on a loaded box, and a bare
+                # TimeoutExpired reads as an error rather than as this check.
+                timeout=120,
+            )
+        except subprocess.TimeoutExpired as exc:
+            self.fail(
+                f"{HARNESS.name} did not finish within {exc.timeout}s:\n"
+                f"{(exc.stdout or b'').decode('utf-8', 'replace')}\n"
+                f"{(exc.stderr or b'').decode('utf-8', 'replace')}"
+            )
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         self.assertIn("PASS iNat Finder browser regressions", proc.stdout)
 

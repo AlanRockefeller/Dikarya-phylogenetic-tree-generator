@@ -246,8 +246,15 @@ def _location_from_record(record: Dict) -> str:
     return ""
 
 
-def _fetch_annotation_xml(accessions: List[str]) -> Optional[str]:
-    """Fetch GenBank XML for a batch, without the sequence data."""
+def _fetch_annotation_xml(accessions: List[str],
+                          deadline: Optional[float] = None) -> Optional[str]:
+    """Fetch GenBank XML for a batch, without the sequence data.
+
+    ``deadline`` is a ``time.monotonic()`` instant this call must not run past.
+    It shortens the read timeout and drops the retry schedule to a single
+    attempt when little budget is left, because NCBI's exponential backoff can
+    otherwise keep working long after the caller's request budget is gone.
+    """
     params = {
         "db": "nuccore",
         "id": ",".join(accessions),
@@ -259,8 +266,22 @@ def _fetch_annotation_xml(accessions: List[str]) -> Optional[str]:
         "seq_stop": "1",
     }
 
+    connect_timeout, read_timeout = 15, 90
+    max_retries = 5
+    if deadline is not None:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return None
+        connect_timeout = min(connect_timeout, max(1.0, remaining))
+        read_timeout = min(read_timeout, max(1.0, remaining))
+        # One attempt once the budget is thin: a retry sleeps before it helps.
+        if remaining < read_timeout * 2:
+            max_retries = 1
+
     try:
-        response = _ncbi_request("POST", NCBI_EFETCH_URL, data=params, timeout=(15, 90))
+        response = _ncbi_request("POST", NCBI_EFETCH_URL, data=params,
+                                 max_retries=max_retries,
+                                 timeout=(connect_timeout, read_timeout))
         response.raise_for_status()
         return response.text
     except Exception as e:
@@ -268,7 +289,8 @@ def _fetch_annotation_xml(accessions: List[str]) -> Optional[str]:
         return None
 
 
-def lookup_locations(accessions: List[str]) -> Tuple[Dict[str, str], List[str], List[str]]:
+def lookup_locations(accessions: List[str], deadline: Optional[float] = None
+                     ) -> Tuple[Dict[str, str], List[str], List[str]]:
     """Look up collection locations for GenBank accessions.
 
     Returns ``(locations, missing, unavailable)``.
@@ -285,6 +307,10 @@ def lookup_locations(accessions: List[str]) -> Tuple[Dict[str, str], List[str], 
     an NCBI outage into the claim that a hundred records have no collection
     site: wrong, and wrong in the direction that makes a user stop asking. A
     caller should say "could not be checked" and offer a retry.
+
+    ``deadline`` (a ``time.monotonic()`` instant) bounds the whole lookup.
+    Anything not fetched by then is reported as ``unavailable`` rather than
+    ``missing`` -- it was never asked about -- and no further batch is sent.
     """
     requested = []
     seen = set()
@@ -306,7 +332,11 @@ def lookup_locations(accessions: List[str]) -> Tuple[Dict[str, str], List[str], 
     unavailable_set = set()
     for start in range(0, len(to_fetch), EFETCH_BATCH_SIZE):
         batch = to_fetch[start:start + EFETCH_BATCH_SIZE]
-        xml_text = _fetch_annotation_xml(batch)
+        if deadline is not None and time.monotonic() >= deadline:
+            # Out of budget: every remaining id is unasked, not answered-empty.
+            unavailable_set.update(to_fetch[start:])
+            break
+        xml_text = _fetch_annotation_xml(batch, deadline=deadline)
         if not xml_text:
             # The request failed; nothing was learned about any id in it.
             unavailable_set.update(batch)

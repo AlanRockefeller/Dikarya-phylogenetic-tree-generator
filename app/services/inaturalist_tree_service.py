@@ -344,7 +344,9 @@ def _observation_failure(observation, observation_id, reason):
 
 
 def _http_request(url: str, *, method: str = "GET", body: Optional[Dict[str, Any]] = None,
-                   bearer: Optional[str] = None) -> Dict[str, Any]:
+                   bearer: Optional[str] = None,
+                   max_attempts: Optional[int] = None,
+                   timeout: Optional[float] = None) -> Dict[str, Any]:
     data = None
     headers = {
         'Accept': 'application/json',
@@ -361,6 +363,14 @@ def _http_request(url: str, *, method: str = "GET", body: Optional[Dict[str, Any
     # outright: 564 of the failures on record were "iNaturalist API returned
     # HTTP 429", nearly all of them in two days of bulk importing. Retry the
     # transient statuses, honouring Retry-After when iNat sends it.
+    # A caller answering a live request can lower both: the default schedule is
+    # sized for a background import, where waiting out a 429 is better than
+    # failing the job. Inside a request it can outlast the request itself.
+    # The value counts RETRIES, matching MAX_HTTP_ATTEMPTS, so 0 means "one
+    # request, no backoff" and the default schedule is unchanged.
+    max_attempts = MAX_HTTP_ATTEMPTS if max_attempts is None else max(0, int(max_attempts))
+    timeout = REQUEST_TIMEOUT if timeout is None else timeout
+
     attempt = 0
     waited = 0.0
     while True:
@@ -369,7 +379,7 @@ def _http_request(url: str, *, method: str = "GET", body: Optional[Dict[str, Any
         # retry is another request to iNaturalist and must not jump the queue.
         _pace_inat_request()
         try:
-            with diagnostic_urlopen(req, timeout=REQUEST_TIMEOUT) as resp:
+            with diagnostic_urlopen(req, timeout=timeout) as resp:
                 wire = resp.read()
                 raw = wire.decode('utf-8') or '{}'
                 parsed = json.loads(raw) if raw.strip() else {}
@@ -380,11 +390,11 @@ def _http_request(url: str, *, method: str = "GET", body: Optional[Dict[str, Any
                 payload.response_raw = wire
                 return payload
         except urllib.error.HTTPError as e:
-            if e.code in RETRYABLE_HTTP_STATUSES and attempt <= MAX_HTTP_ATTEMPTS:
+            if e.code in RETRYABLE_HTTP_STATUSES and attempt <= max_attempts:
                 delay = _retry_delay(e, attempt)
                 logger.warning(
                     "iNat %s %s: HTTP %s, retrying in %.1fs (attempt %d/%d)",
-                    method, url, e.code, delay, attempt, MAX_HTTP_ATTEMPTS,
+                    method, url, e.code, delay, attempt, max_attempts,
                 )
                 time.sleep(delay)
                 waited += delay
@@ -393,7 +403,7 @@ def _http_request(url: str, *, method: str = "GET", body: Optional[Dict[str, Any
             if e.code == 429:
                 raise InatTreeError(
                     f"iNaturalist is rate-limiting requests right now (HTTP 429). "
-                    f"Dikarya retried {MAX_HTTP_ATTEMPTS} times over about "
+                    f"Dikarya retried {max_attempts} times over about "
                     f"{waited:.0f} seconds and was still refused. Please wait a "
                     f"few minutes and try again; importing fewer observations at "
                     f"once makes this less likely.",
@@ -411,25 +421,26 @@ def _http_request(url: str, *, method: str = "GET", body: Optional[Dict[str, Any
                 status=400,
             )
         except urllib.error.URLError as e:
-            if attempt <= MAX_HTTP_ATTEMPTS:
+            if attempt <= max_attempts:
                 delay = _retry_delay(None, attempt)
                 logger.warning(
                     "iNat %s %s network error (%s), retrying in %.1fs (attempt %d/%d)",
-                    method, url, e.reason, delay, attempt, MAX_HTTP_ATTEMPTS,
+                    method, url, e.reason, delay, attempt, max_attempts,
                 )
                 time.sleep(delay)
                 waited += delay
                 continue
             raise InatTreeError(
-                f"Could not reach iNaturalist after {MAX_HTTP_ATTEMPTS} attempts "
+                f"Could not reach iNaturalist after {attempt} attempt(s) "
                 f"({e.reason}). Please try again shortly.",
                 status=502,
             )
 
 
-def fetch_observation(observation_id: int) -> Dict[str, Any]:
+def fetch_observation(observation_id: int, *, max_attempts: Optional[int] = None,
+                     timeout: Optional[float] = None) -> Dict[str, Any]:
     url = f"{INAT_API_BASE}/observations/{int(observation_id)}"
-    payload = _http_request(url)
+    payload = _http_request(url, max_attempts=max_attempts, timeout=timeout)
     results = (payload or {}).get('results') or []
     if not results:
         record_api_failure(url, reason="observation_not_found", status=200,

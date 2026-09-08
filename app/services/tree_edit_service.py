@@ -791,31 +791,67 @@ def rename_tip(tree_json: Dict, old_name: str, new_name: str) -> Dict:
     """
     Change display_name of a tip. Preserve original_name.
     """
+    return rename_tips(tree_json, [(old_name, new_name)])
+
+
+def rename_tips(tree_json: Dict, pairs) -> Dict:
+    """Apply one or more renames, all keyed on the tree as it stands NOW.
+
+    Alan 9/8/26 - Applying a batch one tip at a time cascaded: the Rename modal
+    sends the whole selection in one request, so a swap such as
+    ``{A: B, B: C}`` renamed A to B and then matched that same node again on
+    its new name, leaving A called C. Every old name is resolved against the
+    pre-rename tree first, and the writes happen afterwards.
+
+    ``renames`` is keyed on the ORIGINAL name, the way
+    ``apply_state_to_structure()`` reads it back, so renaming an
+    already-renamed tip updates its existing entry instead of adding a second
+    one keyed on the display name.
+    """
     if "renames" not in tree_json:
         tree_json["renames"] = {}
-        
-    tree_json["renames"][old_name] = new_name
 
     # Alan 6/2/26 - Do NOT rewrite sequence_of_interest to the new display name: the focal
     # tip is tracked by its ORIGINAL name (selection sets, patristic distances and the
     # alignment all key on original names), so syncing to the display name broke auto-root
     # resolution for a renamed focal tip. Leaving it as the original name keeps it resolvable.
 
-    def apply_rename(node):
-        if node.get("name") == old_name or node.get("original_name") == old_name:
+    nodes_by_label: Dict[str, List[Dict]] = {}
+
+    def index_node(node):
+        if not isinstance(node, dict):
+            return
+        for key in (node.get("original_name"), node.get("name")):
+            if not key:
+                continue
+            bucket = nodes_by_label.setdefault(str(key), [])
+            if not any(existing is node for existing in bucket):
+                bucket.append(node)
+        for child in node.get("children") or []:
+            index_node(child)
+
+    if "tree_structure" in tree_json:
+        index_node(tree_json["tree_structure"])
+
+    planned = []
+    for old_name, new_name in pairs:
+        targets = nodes_by_label.get(old_name) or []
+        stable = old_name
+        for node in targets:
+            original = node.get("original_name")
+            if original:
+                stable = str(original)
+                break
+        planned.append((stable, new_name, targets))
+
+    for stable, new_name, targets in planned:
+        tree_json["renames"][stable] = new_name
+        for node in targets:
             node["name"] = new_name
             node["display_name"] = new_name
             # Preserve original_name as the stable edit identifier while
             # making the visible node label update immediately.
-            return True
-        if "children" in node:
-            for child in node["children"]:
-                apply_rename(child)
-        return False
 
-    if "tree_structure" in tree_json:
-        apply_rename(tree_json["tree_structure"])
-        
     return tree_json
 
 

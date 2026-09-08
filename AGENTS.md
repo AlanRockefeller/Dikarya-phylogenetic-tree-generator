@@ -228,7 +228,7 @@ not simply re-run it:
 | 0 | Restarted and healthy | Continue. |
 | 64 | Arguments were passed | The wrapper takes none, by design. |
 | 69 | Restarted but never became healthy | **The site is down.** Read the journal lines the wrapper printed, then `sudo /usr/local/sbin/dikarya-journal web 200`. Usually an import error or a bad config value — fix it and restart again. |
-| 70 | `systemctl restart` itself failed | Check whether you ran it under `sudo`. |
+| 70 | `systemctl restart` itself failed | systemd refused or failed the restart; read the `systemctl status` lines the wrapper printed, then `sudo /usr/local/sbin/dikarya-journal web 200`. (A missing `sudo` is exit 77, not this.) |
 | 75 | Serving, but `/health` reports 503 | The restart worked and the code imported; a dependency (database, filesystem) is unhealthy. Restarting again will not fix it. |
 | 77 | Not run as root | Re-run as `sudo /usr/local/sbin/restart-dikarya-web`. |
 

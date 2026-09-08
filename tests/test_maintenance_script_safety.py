@@ -993,7 +993,9 @@ def _backup_files(tmp_path):
     )
 
 
-_BACKUP_SUFFIX = ".backfill-backup"
+# Read from the script rather than restated here: a copy of the suffix keeps
+# these tests looking for the old backup files after the script renames them.
+_BACKUP_SUFFIX = _load_script("backfill_inaturalist_job_titles").BACKUP_SUFFIX
 
 
 def test_the_journal_holds_paths_rather_than_artifact_contents(backfill, tmp_path, monkeypatch):

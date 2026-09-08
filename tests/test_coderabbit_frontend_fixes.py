@@ -135,7 +135,9 @@ class JobStatusTemplateTests(unittest.TestCase):
         start = self.html.index('id="downloads-menu-btn"')
         opening = self.html[self.html.rindex("<button", 0, start):]
         opening = opening[:opening.index(">") + 1]
-        self.assertRegex(opening, r'<button\b[^>]*\btype="button"')
+        # \s, not \b: a word boundary also sits inside `data-type="button"`,
+        # so the old pattern passed on an attribute that is not `type`.
+        self.assertRegex(opening, r'<button\b[^>]*\stype="button"')
         # Behaviour itself is covered by DownloadsDropdownBehaviourTests in
         # tests/test_coderabbit_review_fixes.py, which runs the shipped script.
 

@@ -2762,7 +2762,11 @@ document.addEventListener('DOMContentLoaded', async () => {
         treeViewerPanel?.classList.toggle('mobile-select-mode', selecting);
         btnMobileSelect?.setAttribute('aria-pressed', selecting ? 'true' : 'false');
         if (btnMobileSelect) {
-            btnMobileSelect.querySelector('span').textContent = selecting ? 'Done' : 'Select';
+            // Guarded like the support-filter labels below: these run during
+            // viewer init, and a button whose markup no longer carries the
+            // label span would otherwise throw and leave the viewer unwired.
+            const selectLabel = btnMobileSelect.querySelector('span');
+            if (selectLabel) selectLabel.textContent = selecting ? 'Done' : 'Select';
             btnMobileSelect.title = selecting ? 'Done selecting; return to Navigate mode' : 'Enter Select mode';
         }
         if (mobileModeStatus) {
@@ -2785,7 +2789,8 @@ document.addEventListener('DOMContentLoaded', async () => {
         document.body.classList.toggle('tree-expanded', open);
         btnMobileExpand?.setAttribute('aria-pressed', open ? 'true' : 'false');
         if (btnMobileExpand) {
-            btnMobileExpand.querySelector('span').textContent = open ? 'Exit' : 'Expand';
+            const expandLabel = btnMobileExpand.querySelector('span');
+            if (expandLabel) expandLabel.textContent = open ? 'Exit' : 'Expand';
             btnMobileExpand.title = open ? 'Exit expanded tree view' : 'Expand tree';
         }
     }
