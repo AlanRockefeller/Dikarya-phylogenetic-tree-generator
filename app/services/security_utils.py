@@ -4,8 +4,17 @@ from typing import Optional, Tuple
 from urllib.parse import urlparse
 
 
-# Valid job_id pattern: UUID4 format only
+# Valid job_id patterns. Two shapes are accepted, and both are strict enough
+# to make a job_id safe as a path segment (the reason this check exists).
+#
+# UUID4 is the historical form -- every job minted before 2026-09-09, ~11.6k of
+# them on disk. Nothing rewrites those, so it has to stay valid forever.
+#
+# The short form is what new jobs get: lowercase base36, 4 to 12 characters,
+# minted by app/services/job_id_service.py. It is deliberately not anchored to
+# one length, because that module widens the id as the corpus fills up.
 JOB_ID_PATTERN = re.compile(r'^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$', re.IGNORECASE)
+SHORT_JOB_ID_PATTERN = re.compile(r'^[a-z0-9]{4,12}$')
 
 BOOL_TRUE_TOKENS = frozenset({"1", "true", "yes", "on"})
 BOOL_FALSE_TOKENS = frozenset({"0", "false", "no", "off"})
@@ -50,10 +59,13 @@ def coerce_bool(value, default: bool = True) -> Tuple[bool, bool]:
     return bool(value), True
 
 def validate_job_id(job_id: str) -> bool:
-    """Validate job_id is a valid UUID4 format. Prevents directory traversal."""
+    """Validate job_id is a legacy UUID4 or a short base36 id.
+
+    Prevents directory traversal: neither pattern admits a dot or a slash.
+    """
     if not job_id or not isinstance(job_id, str):
         return False
-    return bool(JOB_ID_PATTERN.match(job_id))
+    return bool(JOB_ID_PATTERN.match(job_id) or SHORT_JOB_ID_PATTERN.match(job_id))
 
 def cap_fasta_header(header: str) -> str:
     """Strip control characters from a FASTA header and cap it to a sane length.

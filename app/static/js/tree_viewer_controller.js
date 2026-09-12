@@ -1428,6 +1428,8 @@ document.addEventListener('DOMContentLoaded', async () => {
 
     // Provisional names travel quoted -- Amanita sp. 'albemarlensis', Amanita "albemarlensis" --
     // and both spellings have to reduce to the same suggestion so they count as one species.
+    // They reduce to the CURRENT convention, Genus sp. 'epithet', so the older bare-quoted
+    // spelling is suggested in the newer form rather than the marker being dropped from both.
     // Informal codes (Russula "sp-IN67", Tricholoma "moseri-CA01") are quoted the same way and
     // are kept as they are written, because they are what separates two species in these trees.
     function speciesQuotedEpithet(token) {
@@ -1462,14 +1464,14 @@ document.addEventListener('DOMContentLoaded', async () => {
             if (marker) {
                 const next = j + 1 < tokens.length ? tokens[j + 1] : '';
                 const provisional = speciesQuotedEpithet(next);
-                if (provisional) return `${genus} '${provisional}'`;
+                if (provisional) return `${genus} ${marker} '${provisional}'`;
                 if (marker === 'sp.') return `${genus} sp.`;
                 const qualified = speciesEpithetCandidate(next);
                 if (qualified) return `${genus} ${marker} ${qualified}`;
                 continue;
             }
             const provisional = speciesQuotedEpithet(tokens[j]);
-            if (provisional) return `${genus} '${provisional}'`;
+            if (provisional) return `${genus} sp. '${provisional}'`;
             const epithet = speciesEpithetCandidate(tokens[j]);
             if (epithet) return `${genus} ${epithet}`;
         }
@@ -1725,9 +1727,20 @@ document.addEventListener('DOMContentLoaded', async () => {
         // kept and goes to the server in the same atomic save as the annotation that uses it.
         // If that save fails, saveAnnotationsNow() reloads the persisted configuration, which
         // drops the local-only layer rather than leaving it behind as a fake.
+        const wasAdd = annotationEditorState.mode !== 'edit';
         closeAnnotationEditor(true);
         const saved = await saveAnnotationsNow();
-        if (saved) showStatus(`Annotation "${label}" saved.`, 'success', 2000);
+        if (saved) {
+            // Alan 9/9/26 - Drop the tip selection once a NEW annotation is saved, so the group
+            // that was just annotated is not silently carried into the next Add. Only the
+            // transient selection goes; saved colour groups are untouched, and an edit leaves
+            // the selection alone because it was not opened from one.
+            if (wasAdd && viewer?.deselectCurrentSelection) {
+                viewer.deselectCurrentSelection();
+                updateButtons();
+            }
+            showStatus(`Annotation "${label}" saved.`, 'success', 2000);
+        }
     }
 
     async function deleteCurrentAnnotation() {

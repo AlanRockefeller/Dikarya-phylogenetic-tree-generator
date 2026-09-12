@@ -29,10 +29,19 @@ class TestJobIdValidation(unittest.TestCase):
         self.assertFalse(security_utils.validate_job_id(""))
         self.assertFalse(security_utils.validate_job_id(None))
     
-    def test_random_string_rejected(self):
-        """Random strings should be rejected."""
+    def test_short_job_id_accepted(self):
+        """The short base36 ids new jobs get should pass."""
+        self.assertTrue(security_utils.validate_job_id("aq7c"))
+        self.assertTrue(security_utils.validate_job_id("k3m9x7qp"))
+
+    def test_malformed_short_ids_rejected(self):
+        """Anything outside lowercase base36, 4..12 chars, stays rejected."""
         self.assertFalse(security_utils.validate_job_id("my-job-123"))
-        self.assertFalse(security_utils.validate_job_id("test"))
+        self.assertFalse(security_utils.validate_job_id("abc"))        # too short
+        self.assertFalse(security_utils.validate_job_id("a" * 13))     # too long
+        self.assertFalse(security_utils.validate_job_id("AQ7C"))       # uppercase
+        self.assertFalse(security_utils.validate_job_id("aq.c"))
+        self.assertFalse(security_utils.validate_job_id("aq/c"))
 
 
 class TestBlastRequestSafety(unittest.TestCase):

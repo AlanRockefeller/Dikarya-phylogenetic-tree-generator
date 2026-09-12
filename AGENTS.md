@@ -395,6 +395,9 @@ When a new CLI version is published:
 
 1. Compare the released CLI source, changelog, and tests with the browser port.
    Port the behavior intentionally rather than copying Python request/UI code.
+   **The upstream default branch is `Main`, with a capital M** — a `raw.
+   githubusercontent.com` fetch from `main` or `master` 404s. The vendored
+   `inat_finder.py` is 1.8.1 and byte-identical to `Main`.
 2. Preserve the browser security boundary: requests go directly from the browser
    to `https://api.inaturalist.org/v1`; Flask must not proxy or store searches.
 3. Keep API-derived DOM content on `textContent`/`createElement` paths, and retain
@@ -403,16 +406,58 @@ When a new CLI version is published:
 4. Update the version credited in the page footer only after the matching browser
    behavior has been implemented and checked. Update the focused Node coverage in
    `tests/js/inat_finder_variation_limit.test.js` for changed parsing, matching,
-   variation, or request behavior.
-5. Run `.venv/bin/python -m pytest tests/test_inat_finder.py`, run
-   `node --check app/static/js/inat_finder.js`, and spot-check the affected modes
-   against live iNaturalist API responses before deploying.
+   variation, or request behavior, and `tests/js/inat_finder_auto_mode.test.js`
+   for anything in the auto-mode ladder.
+5. **The auto-mode candidate ladder is pinned to the CLI by fixture.**
+   `tests/fixtures/inat_finder_candidate_parity.json` carries each stage's totals,
+   label and a SHA-256 of its *ordered* candidate sequence, generated from the
+   vendored `inat_finder.py` by `scripts/dikarya_export_finder_parity.py`. Order is
+   load-bearing, not incidental: a paused deep search continues from where it
+   stopped, so a JS plan that yields the same set in a different order silently
+   skips or repeats candidates. After syncing `inat_finder.py`, re-run the export
+   and expect `app/static/js/inat_finder.js` to change in the same commit if the
+   hashes move — `tests/test_inat_finder.py` fails if the fixture and the vendored
+   CLI disagree.
+6. The browser sections the Node harnesses slice are delimited by
+   `// ---- section:<name> ----` banners in `inat_finder.js`. Renaming one breaks
+   the harness with "Finder section was not found", so move the banner with the
+   code rather than deleting it.
+7. Run `.venv/bin/python -m pytest tests/test_inat_finder.py`, run
+   `node --check app/static/js/inat_finder.js` and
+   `npx --no-install eslint app/static/js/inat_finder.js`, and spot-check the
+   affected modes against live iNaturalist API responses before deploying.
 
 - Flask app factory in `app/__init__.py`; extensions initialized in `app/extensions.py`.
 - All API responses use JSON; the frontend is a SPA-style UI talking to `/api/` endpoints.
 - FASTA sequence headers are sanitized on input and restored on download/display (see `fasta_utils.py`).
 - RAxML-NG jobs use named presets (`fast_good`, `standard`, `publication`, `maximum`) defined in `tree_builder_service.py`.
-- Job IDs are UUIDs; always validate with regex before using in file paths.
+- **Job IDs come in two shapes and both stay valid forever.** Jobs minted
+  before 2026-09-09 are UUID4; new ones are a short lowercase base36 string
+  (`/job/aq7c/view`), minted by `generate_job_id()` in
+  `app/services/job_id_service.py`. Nothing rewrites the ~11.6k UUID jobs on
+  disk. Always validate with `validate_job_id()` before using an id in a file
+  path — it accepts both and admits neither a dot nor a slash. The JS mirror is
+  `JOB_ID_RE` in `sequence_entry.html`; change the two together.
+  `generate_job_id()` starts at 4 characters and widens on its own once a
+  length gets crowded, so never assume a fixed length.
+- **Every path that creates a job must mint through `generate_job_id()`.**
+  There are five, not one: `create_job` and the duplicate-rebuild endpoint in
+  `app/api/routes.py`, `app/api_v1/routes.py`, and the iNat and Mushroom
+  Observer preparation flows in `inaturalist_tree_service.py` /
+  `mushroom_observer_service.py`. A path still calling `uuid.uuid4()` keeps
+  handing out long URLs and nothing fails, so the miss is invisible until
+  someone reads a URL -- which is how the iNat flow shipped long ids after the
+  other three were converted. `enqueue_mycomap_blast_refresh_job()` in
+  `workers/queue.py` deliberately keeps a UUID: that id is an internal RQ
+  handle, never a job directory or a URL.
+- **Job ids are not treated as secrets.** A short id is guessable (36**4 =
+  1.7M at 4 characters), and that is a deliberate, accepted trade for short
+  links: there is no guess-rate limit on the job surface, and `_job_ref()` in
+  `app/monitoring/services.py` publishes an 8-character prefix on the
+  unauthenticated monitoring views as it always has. Do not add hashing or
+  throttling back on the theory that an id is a capability token. The rest of
+  the monitoring rules still hold -- no sequence headers, notes, outgroup or
+  other submission-derived text on those views.
 - **Never call `Phylo.write()` for a file under `var/jobs/<id>/tree`.** Use
   `write_tree_file()` from `app/services/tree_io.py` (still re-exported from
   `tree_edit_service.py`). Biopython gets *two* things wrong here:
@@ -678,16 +723,18 @@ rendered by one JavaScript renderer fed by `/health/jobs`, from an inline
 snapshot on first paint and from a 5-second poll after that, so the two views
 cannot drift apart.
 
-**The page and `/health/jobs` are unauthenticated, and a job UUID is a
-capability token** — `check_job_access(mode="view")` opens the tree for anyone
-holding it. So nothing here may emit a full job id (`_job_ref()` truncates to
-8 characters, which is a label, not a key), and nothing may emit anything
-derived from a submission: no sequence headers, no notes, no `outgroup`, no
-file contents. Options come from `PUBLIC_JOB_OPTION_KEYS`, a whitelist rather
-than a filter, because `input_info.json` holds the submitter's own text right
-beside them; progress lines are matched by regexes that capture numbers only,
-because the tool logs they come from also contain taxon labels. Keep new
-fields on that side of the line.
+**The page and `/health/jobs` are unauthenticated, so nothing here may emit
+anything derived from a submission**: no sequence headers, no notes, no
+`outgroup`, no file contents. Options come from `PUBLIC_JOB_OPTION_KEYS`, a
+whitelist rather than a filter, because `input_info.json` holds the submitter's
+own text right beside them; progress lines are matched by regexes that capture
+numbers only, because the tool logs they come from also contain taxon labels.
+Keep new fields on that side of the line.
+
+The job id itself is **not** on that list — ids are not treated as secrets here
+(see the job-id conventions above). `_job_ref()` still truncates to 8
+characters, but that is a display choice that keeps the table readable, not a
+security boundary, so emitting a full id would be untidy rather than a leak.
 
 A queued job has no job directory yet — the worker creates it — so its summary
 falls back to the description RQ already stored, which `safe_job_description()`

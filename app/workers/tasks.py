@@ -487,6 +487,13 @@ def _summarize_tree_quality(
     return summary
 
 
+# How many ORIENT-uncertain headers input_info.json will carry. This file is
+# rewritten on every viewer edit, so the list has to stay bounded; a job with
+# more uncertain records than this falls back to the count comparison, which is
+# what the aligner did for every job before the headers were recorded at all.
+MAX_PERSISTED_ORIENT_HEADERS = 2000
+
+
 def _save_job_params(input_info_path, job_params: dict) -> None:
     # Compact rather than indented. `sequence` (the original submitted FASTA)
     # and `sequence_metadata` are 90% of this file and neither is read by eye.
@@ -657,6 +664,14 @@ def blast_expected_at_start(input_type: str | None, blast_mode: str) -> Optional
         return True
     if input_type in ("pasted_sequence", "fasta_upload"):
         # _should_blast_single_only() needs the record count.
+        return None
+    if input_type in ("inat_tree_preparation", "mo_tree_preparation"):
+        # Alan 9/9/26 - The INPUT step replaces job_params wholesale with the
+        # prepared job (pasted_sequence / fasta), so nothing about BLAST is
+        # decided yet. These used to fall through to the "unknown input type"
+        # branch below and open pre-marked "skipped" for the whole MycoMap
+        # preparation -- which on a one-click iNat tree is exactly while the
+        # BLAST it needs is being run.
         return None
     # Unknown input type: the input step raises before BLAST is reached.
     return False
@@ -1083,9 +1098,10 @@ def run_phylo_job(job_params: dict) -> dict:
                 if blast_expected_at_start(input_type, blast_mode) is False:
                     job.meta["steps"][STEP_BLAST]["state"] = STATE_SKIPPED
                     job.meta["steps"][STEP_BLAST]["label"] = "BLAST Search (skipped)"
-                    job.meta["steps"][STEP_BLAST]["detail"] = (
-                        "BLAST skipped (no NCBI refresh requested)"
-                    )
+                    # Same wording the BLAST step itself uses when it skips, so
+                    # the pre-mark and the final state cannot describe the same
+                    # decision differently.
+                    job.meta["steps"][STEP_BLAST]["detail"] = "BLAST skipped (disabled)"
 
                 # Trim is skipped only when both external and terminal trimming are disabled.
                 should_trim, _trim_label, _trim_tool = describe_trim_step(trim_method, trim_terminal_overhangs)
@@ -1170,11 +1186,13 @@ def run_phylo_job(job_params: dict) -> dict:
                 if prepared.get("status") == "waiting_for_ncbi":
                     from app.services.mycomap_service import (
                         get_mycomap_creation_discovery_max_attempts,
-                        get_mycomap_creation_discovery_max_seconds,
                         get_mycomap_creation_discovery_poll_interval_seconds,
                         get_mycomap_ncbi_poll_interval_seconds,
                         get_mycomap_ncbi_poll_max_attempts,
+                        get_mycomap_ncbi_queue_position,
                         get_mycomap_ncbi_rerun_wait_seconds,
+                        describe_mycomap_queue_position,
+                        record_mycomap_queue_position,
                     )
 
                     rerun_details = prepared.get("mycomap_rerun_details") or {}
@@ -1199,40 +1217,40 @@ def run_phylo_job(job_params: dict) -> dict:
                     )
                     resume_at = datetime.now(timezone.utc) + timedelta(seconds=wait_seconds)
                     refresh_warnings = list(rerun_details.get("warnings") or [])
+                    # A rerun deferral never polls, so it has no queue position of
+                    # its own -- ask once here, since this message is the only thing
+                    # telling the user how long the MycoMap wait is likely to be.
+                    if not auto_created and not creation_pending:
+                        rerun_details = record_mycomap_queue_position(
+                            rerun_details,
+                            get_mycomap_ncbi_queue_position(
+                                prepared.get("mycomap_blast_url")
+                                or rerun_details.get("created_mycomap_url"),
+                                blast_id=rerun_details.get("created_blast_id"),
+                            ),
+                        )
+                    # The queue position is published as its own Activity Feed
+                    # line, and only when it changes, so it reads as news rather
+                    # than as a tail on a message the user has already read.
+                    announced_position = rerun_details.get(
+                        "ncbi_queue_position_announced"
+                    )
+                    current_position = rerun_details.get("ncbi_queue_position")
+                    queue_message = ""
+                    if current_position is not None and current_position != announced_position:
+                        queue_message = describe_mycomap_queue_position(
+                            rerun_details, first=announced_position is None
+                        )
+                        rerun_details["ncbi_queue_position_announced"] = current_position
                     if auto_created:
                         poll_attempt = int(rerun_details.get("ncbi_poll_attempt") or 0)
-                        queue_position = rerun_details.get("ncbi_queue_position")
-                        queue_suffix = (
-                            f" MycoMap reports this search is at position "
-                            f"{queue_position} in its NCBI BLAST queue."
-                            if queue_position is not None else ""
-                        )
                         if rerun_details.get("creation_pending"):
-                            max_discovery_seconds = (
-                                get_mycomap_creation_discovery_max_seconds()
-                            )
-                            if max_discovery_seconds % (24 * 3600) == 0:
-                                max_discovery_value = max_discovery_seconds // (24 * 3600)
-                                max_discovery_label = (
-                                    f"{max_discovery_value} day"
-                                    f"{'s' if max_discovery_value != 1 else ''}"
-                                )
-                            else:
-                                max_discovery_value = max(
-                                    1, round(max_discovery_seconds / 3600)
-                                )
-                                max_discovery_label = (
-                                    f"{max_discovery_value} hour"
-                                    f"{'s' if max_discovery_value != 1 else ''}"
-                                )
-                            next_minutes = max(1, round(wait_seconds / 60))
+                            # Deliberately short. The retry cadence and the
+                            # multi-day discovery budget were noise on a line the
+                            # user re-reads every minute; the queue position is
+                            # published separately, only when it moves.
                             waiting_message = (
-                                "MycoMap accepted the BLAST request and queued it. "
-                                "Dikarya is waiting for the result page to appear and "
-                                f"will check again in {next_minutes} minute"
-                                f"{'s' if next_minutes != 1 else ''}. Checks gradually "
-                                "back off after the first hour, and Dikarya will keep "
-                                f"trying for up to {max_discovery_label}."
+                                "MycoMap accepted the BLAST request and queued it."
                             )
                         else:
                             if tree_preparation_kind == "mo":
@@ -1240,14 +1258,13 @@ def run_phylo_job(job_params: dict) -> dict:
                                     "MycoMap BLAST was created from the selected Mushroom "
                                     "Observer ITS sequence. NCBI results are not ready yet; "
                                     f"check {poll_attempt + 1} will run in one minute."
-                                    f"{queue_suffix}"
                                 )
                             else:
                                 waiting_message = (
                                     "MycoMap BLAST was created from the observation's DNA "
                                     "Barcode ITS and its URL was added to iNaturalist. "
                                     f"NCBI results are not ready yet; check {poll_attempt + 1} "
-                                    f"will run in one minute.{queue_suffix}"
+                                    "will run in one minute."
                                 )
                     else:
                         waiting_message = (
@@ -1297,6 +1314,8 @@ def run_phylo_job(job_params: dict) -> dict:
                     for warning in refresh_warnings:
                         publish_overview(job_id, warning, icon=STATE_FAILED)
                     publish_overview(job_id, waiting_message)
+                    if queue_message:
+                        publish_overview(job_id, queue_message)
                     publish_job_queued(job_id)
                     # Same as the refresh task: mark the wait so the resumed
                     # job.started is not counted as a failure retry.
@@ -1554,7 +1573,9 @@ def run_phylo_job(job_params: dict) -> dict:
             
             reversed_count = orient_stats.get("reverse", 0)
             uncertain_count = orient_stats.get("uncertain", 0)
-            
+            uncertain_headers = list(orient_stats.get("uncertain_headers") or [])
+            chimeric_count = orient_stats.get("self_chimeric", 0)
+
             if input_is_prealigned:
                 orient_detail = (
                     "Orientation correction skipped (input is already aligned)"
@@ -1577,16 +1598,48 @@ def run_phylo_job(job_params: dict) -> dict:
                 orient_detail = f"All forward, {uncertain_count} uncertain orientation"
             else:
                 orient_detail = "All sequences correctly oriented"
-            
+
+            # A read holding its own reverse complement is bad input that the
+            # tree cannot show -- it aligns as one more tip -- so say so where
+            # the user is already watching.
+            if chimeric_count > 0:
+                orient_detail += (
+                    f"; {chimeric_count} sequence(s) appear to contain their own "
+                    "reverse complement (possible chimeric read)"
+                )
+
             logger.info(
-                "Orientation check: correction_enabled=%s total=%s forward=%s reverse=%s uncertain=%s",
+                "Orientation check: correction_enabled=%s total=%s forward=%s reverse=%s uncertain=%s self_chimeric=%s",
                 correct_orientation,
                 orient_stats.get("total", 0),
                 orient_stats.get("forward", 0),
                 reversed_count,
                 uncertain_count,
+                chimeric_count,
             )
-            
+
+            # Persist what ORIENT decided so a later recompute -- which skips
+            # ORIENT entirely and realigns a subset -- can still tell an aligner
+            # flip it declined from one it contradicts. Headers are capped
+            # because this file is read on every viewer edit; past the cap the
+            # aligner falls back to comparing counts.
+            job_params["orientation_details"] = {
+                "correction_enabled": bool(correct_orientation),
+                "total": orient_stats.get("total", 0),
+                "forward": orient_stats.get("forward", 0),
+                "reverse": reversed_count,
+                "uncertain": uncertain_count,
+                "self_chimeric": chimeric_count,
+                "uncertain_headers": uncertain_headers[:MAX_PERSISTED_ORIENT_HEADERS],
+                "uncertain_headers_truncated": (
+                    len(uncertain_headers) > MAX_PERSISTED_ORIENT_HEADERS
+                ),
+                # Records added after this point never saw ORIENT; the
+                # /sequences/add endpoint appends them here.
+                "unclassified_headers": [],
+            }
+            _save_job_params(input_info_path, job_params)
+
             # Alan 8/31/26 - Name the step in the feed line the way every other step
             # does; "All sequences correctly oriented" on its own read like a stray note.
             orient_detail = f"Orientation check: {orient_detail}"
@@ -1719,6 +1772,7 @@ def run_phylo_job(job_params: dict) -> dict:
                     # ORIENT still classifies sequences when correction is disabled,
                     # but both it and the aligner leave the sequence data untouched.
                     orient_uncertain=uncertain_count,
+                    orient_uncertain_headers=set(uncertain_headers),
                 ) or {}
 
             n_seqs, n_cols = _count_alignment_stats(alignment_raw_path)

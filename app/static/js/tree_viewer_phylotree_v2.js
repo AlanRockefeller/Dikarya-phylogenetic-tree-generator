@@ -4068,6 +4068,19 @@
             return names;
         }
 
+        /**
+         * Alan 9/9/26 - The highlight colour behind each tip label, keyed by canonical tip id.
+         *
+         * Filled by the annotation renderer from the bands it actually painted, so hidden
+         * layers, annotations the current rooting cannot resolve, and nesting order are all
+         * already accounted for. The Alignment Viewer uses it to back the sequence names with
+         * the same colour as their clade.
+         */
+        getTipHighlightStyles() {
+            return this._tipHighlightStyles instanceof Map
+                ? new Map(this._tipHighlightStyles) : new Map();
+        }
+
         // Alan 5/13/26 - Expose visible selected tip names so the Alignment Viewer can default to selection.
         getSelectedTipNames() {
             const selected = this.getSelectedNodes();
@@ -5644,6 +5657,10 @@
          * own container group, so they share the tree's coordinate space and zoom/pan transform.
          */
         _renderCladeAnnotations() {
+            // Alan 9/9/26 - Rebuilt on every redraw so the Alignment Viewer's name backgrounds
+            // can never outlive the bands they mirror (a deleted, hidden or no-longer-valid
+            // highlight leaves nothing behind).
+            this._tipHighlightStyles = new Map();
             const svg = window.d3v7.select(this.container).select('svg');
             if (svg.empty()) return;
             const svgNode = svg.node();
@@ -5891,6 +5908,25 @@
                     this._appendHighlightRect(
                         highlightGroup, label, effective, item.annotation.id
                     );
+                }
+            }
+
+            // Alan 9/9/26 - Record the colour each highlighted tip is sitting under, in the
+            // same paint order as the bands above, so a nested clade wins exactly as it does
+            // on screen. The Alignment Viewer reads this to give the sequence names the same
+            // background; it is derived from what was actually drawn rather than recomputed,
+            // so the two views cannot disagree about a colour.
+            for (const item of highlightItems) {
+                const effective = this._effectiveHighlightStyle(item, highlightColors);
+                const members = item.annotation?.member_tip_ids || [];
+                for (const member of members) {
+                    if (!positions.has(member)) continue;
+                    this._tipHighlightStyles.set(member, {
+                        color: effective.color,
+                        opacity: effective.opacity,
+                        label: item.annotation?.label || '',
+                        annotationId: item.annotation?.id || null
+                    });
                 }
             }
 

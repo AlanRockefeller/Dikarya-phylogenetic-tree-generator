@@ -8,7 +8,6 @@ import math
 import numbers
 import re
 import logging
-import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -36,6 +35,7 @@ from app.extensions import db, limiter
 from app.models import ApiToken, Job
 from app.services.artifact_storage import read_artifact_bytes
 from app.services.security_utils import validate_safe_file_path, coerce_bool
+from app.services.job_id_service import generate_job_id
 from app.services.tree_parameter_validation import (
     normalize_inherited_iqtree_ufboot_count,
     validate_iqtree_ufboot_count,
@@ -664,7 +664,7 @@ def create_job():
     # the gap before the row existed; the pipeline tolerates a missing row, so
     # ownership, status and metrics bookkeeping were simply skipped for that
     # job -- it ran, but the submitter could not see or own it.
-    job_id = str(uuid.uuid4())
+    job_id = generate_job_id()
     g.job_id = job_id
     job_record = Job(
         id=job_id,
@@ -1870,6 +1870,81 @@ def tools_genbank():
         })
     except Exception as e:
         return server_error(e, where="tools_genbank")
+
+
+@bp.route('/tools/inaturalist-finder', methods=['POST'])
+@require_api_token(scope='tools:read')
+@limiter.limit("10 per hour; 50 per day", key_func=api_token_key_func)
+@idempotent
+def tools_inaturalist_finder():
+    """Find likely iNaturalist observations for a mistyped observation ID."""
+    from app.services.inat_finder_service import (
+        FinderValidationError,
+        find_observations,
+    )
+    from app.services.inaturalist_tree_service import InatTreeError
+
+    body, body_error = _json_object_body()
+    if body_error:
+        return body_error
+
+    # Two request shapes share this endpoint. `mode` selects the original
+    # single-criterion search and is kept working unchanged for existing
+    # integrations; anything else runs the bounded auto ladder, which accepts any
+    # combination of clues including none. Sending both is ambiguous rather than
+    # a merge of the two, so it is refused.
+    from app.services.inat_finder_service import AUTO_CLUE_KINDS, find_observations_auto
+
+    has_mode = bool(str(body.get("mode") or "").strip())
+    clues = {kind: body.get(kind) for kind in AUTO_CLUE_KINDS}
+    has_clues = any(str(value or "").strip() for value in clues.values())
+
+    try:
+        if has_mode and has_clues:
+            raise FinderValidationError(
+                "Send either `mode`/`term` for a single-criterion search or the "
+                f"individual clue fields ({', '.join(AUTO_CLUE_KINDS)}) for an "
+                "automatic search, not both.",
+                details={"field": "mode", "conflicting": sorted(
+                    kind for kind, value in clues.items() if str(value or "").strip()
+                )},
+            )
+        if has_mode:
+            result = find_observations(
+                observation=body.get("observation"),
+                mode=body.get("mode"),
+                term=body.get("term"),
+                digits_off=body.get("digits_off", 1),
+            )
+        else:
+            result = find_observations_auto(
+                observation=body.get("observation"),
+                clues=clues,
+                digits_off=body.get("digits_off", 3),
+                resume=body.get("resume"),
+                confirm=bool(body.get("confirm")),
+            )
+        return ok(result)
+    except FinderValidationError as exc:
+        return error_response(
+            code="validation_failed",
+            message=str(exc),
+            status=422,
+            details=exc.details,
+        )
+    except InatTreeError as exc:
+        status = int(getattr(exc, "status", 502) or 502)
+        code = "rate_limited" if status == 429 else (
+            "upstream_unavailable" if status >= 500 else "validation_failed"
+        )
+        return error_response(
+            code=code,
+            message=str(exc),
+            status=status,
+            details=getattr(exc, "details", None),
+        )
+    except Exception as exc:
+        return server_error(exc, where="tools_inaturalist_finder")
 
 
 def _inat_tree_v1_rate_key():

@@ -16,6 +16,7 @@ import re
 import shlex
 import time
 import urllib.request
+from datetime import datetime, timezone
 from app.services.api_diagnostics import diagnostic_urlopen, record_api_failure
 import urllib.parse
 import urllib.error
@@ -597,7 +598,10 @@ def _parse_created_mycomap_blast(parsed_body, raw_body: str,
         candidate = str(candidate or "").strip()
         if candidate.startswith("/"):
             candidate = urllib.parse.urljoin("https://mycomap.com", candidate)
-        blast_id = validate_mycomap_url(candidate)
+        # Speculative: url_candidates includes the POST target and the Location
+        # header, which are usually not result URLs at all. A miss just falls
+        # through to the id_keys scan below, so do not log it as a failure.
+        blast_id = validate_mycomap_url(candidate, quiet=True)
         if blast_id:
             return {"blast_id": blast_id, "url": candidate}
 
@@ -682,7 +686,8 @@ def find_mycomap_record_url_by_id(blast_id: str,
 
 
 def find_mycomap_blast_via_history(title: str,
-                                   warnings: Optional[list] = None
+                                   warnings: Optional[list] = None,
+                                   pending_out: Optional[dict] = None
                                    ) -> Optional[dict]:
     """
     Find a BLAST record by title through the authenticated history API.
@@ -697,6 +702,11 @@ def find_mycomap_blast_via_history(title: str,
     reason is appended to ``warnings`` when one is supplied. Callers that give
     up after a timeout can then report why they never found the record instead
     of blaming MycoMap's queue.
+
+    MycoMap knows the record's ID before it publishes its result page, and that
+    ID is enough to read the search's queue position. When ``pending_out`` is
+    supplied it receives that ID under ``blast_id`` so a caller still waiting
+    for the page can tell the user where the search sits in the queue.
     """
     wanted = " ".join(str(title or "").split()).strip()
     if not wanted:
@@ -790,6 +800,8 @@ def find_mycomap_blast_via_history(title: str,
                 "result page URL is not on the listing yet",
                 candidate_id, wanted,
             )
+            if pending_out is not None:
+                pending_out["blast_id"] = candidate_id
             if warnings is not None:
                 warnings.append(
                     f"MycoMap reported BLAST record {candidate_id} for this "
@@ -799,18 +811,22 @@ def find_mycomap_blast_via_history(title: str,
 
 
 def find_mycomap_blast_by_title(title: str,
-                                warnings: Optional[list] = None
+                                warnings: Optional[list] = None,
+                                pending_out: Optional[dict] = None
                                 ) -> Optional[dict]:
     """
     Find the newest MycoMap BLAST record matching an exact job title.
 
     When ``warnings`` is supplied, any reason the lookup could not complete is
-    appended to it -- see ``find_mycomap_blast_via_history``.
+    appended to it -- see ``find_mycomap_blast_via_history``, which also
+    documents ``pending_out``.
     """
     wanted = " ".join(str(title or "").split()).strip()
     if not wanted:
         return None
-    found = find_mycomap_blast_via_history(wanted, warnings=warnings)
+    found = find_mycomap_blast_via_history(
+        wanted, warnings=warnings, pending_out=pending_out
+    )
     if found:
         return found
     page = _fetch_mycomap_blast_listing(warnings)
@@ -1356,7 +1372,7 @@ def refresh_mycomap_observation_records(references: list) -> dict:
     }
 
 
-def validate_mycomap_url(url: str) -> Optional[str]:
+def validate_mycomap_url(url: str, *, quiet: bool = False) -> Optional[str]:
     """
     Validate a Mycomap URL and extract the blast_id.
     
@@ -1366,29 +1382,41 @@ def validate_mycomap_url(url: str) -> Optional[str]:
     
     Args:
         url: The URL to validate (e.g., "https://mycomap.com/...r12345...")
+        quiet: Log rejections at DEBUG instead of WARNING. Set this ONLY on
+            speculative callers that scan a list of candidates and expect most
+            of them to miss -- a rejection there is normal control flow, not a
+            failure. Alan 9/10/26 - the BLAST-creation response scan was feeding
+            its own POST target (https://mycomap.com/api/mycomap/blast) through
+            here, so every auto-created search logged a WARNING into errors.log
+            for something that had not gone wrong. Leave quiet=False wherever
+            the URL came from a user or from stored job state: those rejections
+            are the ones worth seeing. Note this only changes the log level --
+            the hostname and scheme checks still reject exactly as before.
         
     Returns:
         The blast_id (digits only) if valid, None otherwise.
     """
     if not url:
         return None
+
+    reject = logger.debug if quiet else logger.warning
     
     try:
         parsed = urllib.parse.urlparse(url)
     except Exception:
-        logger.warning(f"URL validation failed: could not parse URL: {url}")
+        reject(f"URL validation failed: could not parse URL: {url}")
         return None
     
     # Strict hostname check - must be exactly mycomap.com or www.mycomap.com
     hostname = (parsed.hostname or '').lower()
     valid_hostnames = ['mycomap.com', 'www.mycomap.com']
     if hostname not in valid_hostnames:
-        logger.warning(f"URL validation failed: invalid hostname '{hostname}' (expected mycomap.com): {url}")
+        reject(f"URL validation failed: invalid hostname '{hostname}' (expected mycomap.com): {url}")
         return None
     
     # Enforce http or https protocol
     if parsed.scheme not in ('http', 'https'):
-        logger.warning(f"URL validation failed: invalid scheme '{parsed.scheme}' (expected http/https): {url}")
+        reject(f"URL validation failed: invalid scheme '{parsed.scheme}' (expected http/https): {url}")
         return None
     
     # Extract the r<digits> pattern from path or query
@@ -1417,7 +1445,7 @@ def validate_mycomap_url(url: str) -> Optional[str]:
             r'(?:^|[^a-zA-Z0-9])r(\d+)(?![a-zA-Z0-9])', search_text
         )
         if not loose_matches:
-            logger.warning(f"URL validation failed: no r<digits> pattern found in: {url}")
+            reject(f"URL validation failed: no r<digits> pattern found in: {url}")
             return None
         # Slug-style result URLs may contain earlier r-prefixed specimen or
         # plate tokens before the final BLAST result ID. The result ID is the
@@ -1622,16 +1650,179 @@ _NCBI_QUEUE_POSITION_RE = re.compile(
     r"position of this BLAST search in the queue is:\s*(\d+)", re.IGNORECASE
 )
 
+# The authenticated status endpoint is cheap and is the only place MycoMap
+# publishes the queue position as data rather than as a sentence inside a page,
+# so it is tried first and the HTML scrape is kept only as a fallback.
+MYCOMAP_BLAST_STATUS_TIMEOUT = 15
 
-def get_mycomap_ncbi_queue_position(mycomap_url: str) -> Optional[int]:
+
+def _coerce_queue_position(value) -> Optional[int]:
+    """Return a non-negative int queue position, or None."""
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        position = int(str(value).strip())
+    except (TypeError, ValueError):
+        return None
+    return position if position >= 0 else None
+
+
+def fetch_mycomap_blast_record(blast_id: str) -> Optional[dict]:
+    """
+    Best-effort read of MycoMap's authenticated BLAST status record
+    (``GET /api/mycomap/blast/<id>``), which reports the search status and,
+    while it is waiting, ``ncbi.queue_position``.
+
+    Returns the parsed record, or None if it is unavailable for any reason
+    (no API key, network fault, non-JSON body). Callers treat this as context
+    only, so a failure here must never turn into an error for the user.
+    """
+    blast_id = str(blast_id or "").strip()
+    if not blast_id.isdigit():
+        return None
+
+    api_key = _mycomap_api_key()
+    if not api_key:
+        logger.info(
+            "MycoMap BLAST status skipped: no %s configured", MYCOMAP_COM_API_KEY_ENV
+        )
+        return None
+
+    token = base64.b64encode(f"{api_key}:".encode("utf-8")).decode("ascii")
+    request = urllib.request.Request(
+        f"{MYCOMAP_API_BASE_URL}/blast/{blast_id}",
+        headers={
+            "User-Agent": "Dikarya-TreeBuilder/1.0",
+            "Accept": "application/json",
+            "Authorization": f"Basic {token}",
+            "X-API-Key": api_key,
+        },
+        method="GET",
+    )
+    try:
+        with diagnostic_urlopen(request, timeout=MYCOMAP_BLAST_STATUS_TIMEOUT) as resp:
+            raw_body = resp.read().decode("utf-8", errors="replace")
+    except Exception as e:
+        logger.info("Could not read MycoMap BLAST status for %s: %s", blast_id, e)
+        return None
+
+    try:
+        payload = json.loads(raw_body) if raw_body else None
+    except json.JSONDecodeError:
+        logger.info("MycoMap BLAST status for %s was not JSON", blast_id)
+        return None
+
+    if isinstance(payload, list):
+        payload = next((row for row in payload if isinstance(row, dict)), None)
+    if not isinstance(payload, dict):
+        return None
+    # Some MycoMap endpoints wrap the record in an envelope.
+    for key in ("record", "result", "data", "blast"):
+        nested = payload.get(key)
+        if isinstance(nested, dict) and ("status" in nested or "ncbi" in nested):
+            payload = nested
+            break
+    ncbi = payload.get("ncbi")
+    ncbi = ncbi if isinstance(ncbi, dict) else {}
+    # One line per status read, so "did MycoMap report a queue position?" is a
+    # grep rather than a guess when a wait goes by without one being shown.
+    logger.info(
+        "event=mycomap.blast_status blast_id=%s status=%s ncbi_status=%s "
+        "queue_position=%s keys=%s",
+        blast_id,
+        _api_text_value(payload.get("status")) or "-",
+        _api_text_value(ncbi.get("status")) or "-",
+        ncbi.get("queue_position", payload.get("queue_position")),
+        ",".join(sorted(str(k) for k in payload)) or "-",
+    )
+    return payload
+
+
+_UNFINISHED_BLAST_STATUSES = frozenset(
+    {"queued", "queue", "pending", "waiting", "processing", "running", "in_progress"}
+)
+
+
+def _looks_unfinished(status: Optional[str]) -> bool:
+    """True when MycoMap's reported status means the search has not finished."""
+    return str(status or "").strip().lower().replace("-", "_") in _UNFINISHED_BLAST_STATUSES
+
+
+def get_mycomap_ncbi_queue_status(mycomap_url: Optional[str] = None, *,
+                                  blast_id: Optional[str] = None) -> dict:
+    """
+    Return what MycoMap currently says about an NCBI BLAST search:
+
+        {"queue_position": int|None, "status": str|None,
+         "rid": str|None, "source": "api"|"html"|None}
+
+    ``queue_position`` is None both when the search is not queued and when the
+    position could not be determined, which is why ``source`` is reported: only
+    an answer from the API or the page is evidence about the queue at all.
+    """
+    resolved_id = str(blast_id or "").strip()
+    if not resolved_id.isdigit() and mycomap_url:
+        resolved_id = validate_mycomap_url(mycomap_url) or ""
+
+    if resolved_id.isdigit():
+        record = fetch_mycomap_blast_record(resolved_id)
+        if isinstance(record, dict):
+            ncbi = record.get("ncbi")
+            ncbi = ncbi if isinstance(ncbi, dict) else {}
+            position = _coerce_queue_position(
+                ncbi.get("queue_position", record.get("queue_position"))
+            )
+            status = _api_text_value(ncbi.get("status") or record.get("status")) or None
+            rid = _api_text_value(ncbi.get("rid")) or None
+            if position is None and mycomap_url and _looks_unfinished(status):
+                # MycoMap drops queue_position from the record as soon as the
+                # queue row is removed, which happens before the results exist.
+                # While the search is still unfinished the page may still name a
+                # position, so keep the old scrape as a second opinion.
+                position = _scrape_mycomap_ncbi_queue_position(mycomap_url)
+                if position is not None:
+                    return {
+                        "queue_position": position,
+                        "status": status or "queued",
+                        "rid": rid,
+                        "source": "html",
+                    }
+            return {
+                "queue_position": position,
+                "status": status,
+                "rid": rid,
+                "source": "api",
+            }
+
+    position = _scrape_mycomap_ncbi_queue_position(mycomap_url) if mycomap_url else None
+    return {
+        "queue_position": position,
+        "status": "queued" if position is not None else None,
+        "rid": None,
+        "source": "html" if position is not None else None,
+    }
+
+
+def get_mycomap_ncbi_queue_position(mycomap_url: Optional[str] = None, *,
+                                    blast_id: Optional[str] = None) -> Optional[int]:
+    """
+    Return this search's position in MycoMap's NCBI BLAST queue, or None when
+    it is not queued (or cannot be determined).
+
+    Prefers the authenticated JSON status endpoint and falls back to scraping
+    the result page, which is all MycoMap offered before the API existed.
+    """
+    return get_mycomap_ncbi_queue_status(
+        mycomap_url, blast_id=blast_id
+    )["queue_position"]
+
+
+def _scrape_mycomap_ncbi_queue_position(mycomap_url: str) -> Optional[int]:
     """
     Best-effort scrape of the NCBI BLAST queue position from a Mycomap
     result page (e.g. "The position of this BLAST search in the queue
-    is: 1."). Mycomap does not expose this via a JSON API, so this reads
-    the same page a user would see in their browser.
-
-    Returns None if the page doesn't show a queue position (e.g. results
-    are already ready) or on any fetch error.
+    is: 1."). Fallback for when the authenticated status endpoint is
+    unavailable.
     """
     if not validate_mycomap_url(mycomap_url):
         return None
@@ -1660,6 +1851,83 @@ def get_mycomap_ncbi_queue_position(mycomap_url: str) -> Optional[int]:
         return int(match.group(1))
     except ValueError:
         return None
+
+
+def record_mycomap_queue_position(details: dict, position: Optional[int]) -> dict:
+    """
+    Store the current queue position on a rerun-details dict, keeping the first
+    position seen and when it was seen so the wait can be described as movement
+    rather than as a bare number.
+    """
+    details = dict(details or {})
+    if position is None:
+        details.pop("ncbi_queue_position", None)
+        return details
+
+    details["ncbi_queue_position"] = position
+    details["ncbi_queue_position_seen_at"] = datetime.now(timezone.utc).isoformat()
+    first = _coerce_queue_position(details.get("ncbi_queue_first_position"))
+    if first is None or position > first:
+        # A higher number than anything seen before means a new wait (a rerun
+        # re-queues the search), so restart the movement baseline.
+        details["ncbi_queue_first_position"] = position
+        details["ncbi_queue_first_seen_at"] = details["ncbi_queue_position_seen_at"]
+    return details
+
+
+def _parse_iso_timestamp(value) -> Optional[datetime]:
+    try:
+        parsed = datetime.fromisoformat(str(value))
+    except (TypeError, ValueError):
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed
+
+
+def describe_mycomap_queue_position(details: dict, *, first: bool = True) -> str:
+    """
+    Return a sentence naming where this search sits in MycoMap's NCBI BLAST
+    queue, including how fast the queue has been moving when that is known.
+
+    This is published on its own, separately from whatever the job is waiting
+    on, so it reads as an event when the position changes rather than as a tail
+    on a message the user has already read. ``first`` selects the opening for
+    the first report; later ones lead with "Now at". Returns "" when there is
+    no position to report.
+    """
+    details = details or {}
+    position = _coerce_queue_position(details.get("ncbi_queue_position"))
+    if position is None:
+        return ""
+    if position == 0:
+        return (
+            "MycoMap reports this search has reached the front of its NCBI "
+            "BLAST queue." if first
+            else "Now at the front of MycoMap's NCBI BLAST queue."
+        )
+
+    sentence = (
+        f"MycoMap reports this search is at position {position} in its NCBI "
+        "BLAST queue" if first
+        else f"Now at position {position} in MycoMap's NCBI BLAST queue"
+    )
+
+    started = _coerce_queue_position(details.get("ncbi_queue_first_position"))
+    first_seen = _parse_iso_timestamp(details.get("ncbi_queue_first_seen_at"))
+    seen_at = _parse_iso_timestamp(details.get("ncbi_queue_position_seen_at"))
+    if started is not None and started > position and first_seen and seen_at:
+        elapsed_minutes = (seen_at - first_seen).total_seconds() / 60.0
+        if elapsed_minutes >= 1:
+            minutes_each = elapsed_minutes / (started - position)
+            eta_minutes = max(1, round(minutes_each * position))
+            sentence += (
+                f", down from {started}. At that rate it should start in "
+                f"roughly {eta_minutes} minute{'s' if eta_minutes != 1 else ''}"
+            )
+        else:
+            sentence += f", down from {started}"
+    return sentence + "."
 
 
 def _count_fasta_sequences(fasta_bytes: bytes) -> int:
@@ -2066,6 +2334,7 @@ def _parse_blast_metrics_table(rows: list) -> dict:
         display_info = _build_result_display_info(
             row[desc_col] if desc_col is not None and len(row) > desc_col else '',
             primary_identifier,
+            source=row[source_col] if source_col is not None and len(row) > source_col else '',
         )
         metric = {
             'identity': identity,
@@ -2271,6 +2540,18 @@ def parse_mycomap_ncbi_fasta_header(header: str) -> dict:
     return result
 
 
+def compact_mycomap_ncbi_header(header: str) -> str:
+    """Return the compact display name for a MycoMap/NCBI FASTA header.
+
+    Thin wrapper over parse_mycomap_ncbi_fasta_header() for callers that only
+    write FASTA and have no place to keep the parsed fields. A header that is
+    not in one of the recognized NCBI export formats comes back unchanged, so
+    this is safe to apply to arbitrary pasted FASTA.
+    """
+    details = parse_mycomap_ncbi_fasta_header(header)
+    return details.get('display_name') or str(header or '')
+
+
 def uniquify_mycomap_sequence_names(sequences: list) -> list:
     """Give repeated MycoMap hit identifiers stable occurrence suffixes."""
     used_ids = set()
@@ -2303,7 +2584,37 @@ def uniquify_mycomap_sequence_names(sequences: list) -> list:
     return sequences
 
 
-def _build_result_display_info(description: str, identifier: str = '') -> dict:
+def _source_column_species_name(source: str, description: str = '') -> str:
+    """
+    Recover a taxon from the BLAST table's Source column.
+
+    A MycoMap local hit whose sequence record carries no record-level species
+    has a bare "iNaturalist #<id>" Description with no "Species Name:" badge,
+    and the taxon appears only in the Source column as "<id> - <taxon>" (the
+    linked observation). Rows sourced from an annotation file put a file title
+    there instead, so the "<id> - " prefix is required, and it must agree with
+    any observation id the Description already names.
+    """
+    text = _clean_label_fragment(source)
+    if not text:
+        return ''
+
+    match = re.match(r'^(\d{1,12})\s*[-‐-―]\s*(.+)$', text)
+    if not match:
+        return ''
+
+    source_id, species_name = match.group(1), _clean_label_fragment(match.group(2))
+    if not species_name:
+        return ''
+
+    description_ids = extract_inaturalist_observation_ids(description)
+    if description_ids and source_id not in description_ids:
+        return ''
+    return species_name
+
+
+def _build_result_display_info(description: str, identifier: str = '',
+                               *, source: str = '') -> dict:
     """Extract compact display-name metadata from a MycoMap BLAST result row."""
     text = _clean_label_fragment(description)
     identifier = str(identifier or '').strip()
@@ -2324,6 +2635,22 @@ def _build_result_display_info(description: str, identifier: str = '') -> dict:
     location_match = re.search(r'\bLocation:\s*(.*)$', text, flags=re.IGNORECASE)
     if location_match:
         location = _clean_label_fragment(location_match.group(1))
+
+    if not species_name:
+        # The Source column carries the observation's taxon when the sequence
+        # record itself has none; without this the hit keeps a name-less label.
+        species_name = _source_column_species_name(source, text)
+        if species_name:
+            display_name = _clean_label_fragment(
+                ' '.join(part for part in (identifier, species_name, location) if part)
+            )
+            result = {
+                'species_name': species_name,
+                'mycomap_location': location,
+            }
+            if display_name:
+                result['display_name'] = display_name
+            return result
 
     if not species_name:
         species_name = _infer_species_name(text)

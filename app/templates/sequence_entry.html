@@ -5087,16 +5087,18 @@
     // Initialize & "Add Sequences" Mode Logic
     // =========================================================================
     const urlParams = new URLSearchParams(window.location.search);
-    // Alan 5/10/26 - Strict UUIDv4 validation of edit_job_id/clone_job_id from the URL
+    // Alan 5/10/26 - Strict validation of edit_job_id/clone_job_id from the URL
     // before using them. These values flow into innerHTML and into fetch() URLs,
     // so an attacker-crafted link could otherwise inject markup or hit arbitrary
     // backend paths via the victim's session. Drop the value entirely if it
-    // doesn't match the UUID shape.
-    const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+    // doesn't match a job id shape.
+    // Mirrors validate_job_id() in app/services/security_utils.py: legacy UUID4
+    // jobs, or the short base36 id new jobs get. Change both together.
+    const JOB_ID_RE = /^(?:(?:[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-4[0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12})|[a-z0-9]{4,12})$/;
     const rawEditId = urlParams.get('edit_job_id');
     const rawCloneId = urlParams.get('clone_job_id');
-    const EDIT_JOB_ID = (rawEditId && UUID_RE.test(rawEditId)) ? rawEditId : null;
-    const CLONE_JOB_ID = (rawCloneId && UUID_RE.test(rawCloneId)) ? rawCloneId : null;
+    const EDIT_JOB_ID = (rawEditId && JOB_ID_RE.test(rawEditId)) ? rawEditId : null;
+    const CLONE_JOB_ID = (rawCloneId && JOB_ID_RE.test(rawCloneId)) ? rawCloneId : null;
     const submitBtn = document.getElementById('submit_btn');
 
     // --- HANDLE CLONE JOB (Load sequences from another job) ---
@@ -5305,7 +5307,7 @@
         // --- MODIFY UI FOR "ADD SEQ" MODE ---
         // Alan 5/10/26 - Build the heading via DOM APIs + textContent instead of
         // innerHTML so EDIT_JOB_ID (URL-supplied) can never be parsed as markup.
-        // Defense in depth on top of the UUID regex check above.
+        // Defense in depth on top of the job id regex check above.
         const headingEl = document.querySelector('.tree-page-title');
         if (headingEl) {
             headingEl.textContent = '';

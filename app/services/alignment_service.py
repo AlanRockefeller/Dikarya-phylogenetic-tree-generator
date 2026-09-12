@@ -15,7 +15,7 @@ import os
 import re
 import shutil
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Set
 
 from app.config import Config
 from app.models import AlignmentParams
@@ -139,10 +139,12 @@ def run_alignment(
     logger,
     job_id: Optional[str] = None,
     orient_uncertain: Optional[int] = None,
+    orient_uncertain_headers: Optional[Set[str]] = None,
+    orient_unclassified_headers: Optional[Set[str]] = None,
 ) -> dict:
     """
     Run a multiple sequence alignment according to user-selected or default parameters.
-    
+
     Supported methods:
       - mafft
       - muscle
@@ -160,6 +162,14 @@ def run_alignment(
         orient_uncertain: How many sequences ORIENT declined to call, when it
             ran. Recorded alongside any aligner flip so the degradation line
             explains itself; None means ORIENT did not run (recompute).
+        orient_uncertain_headers: The headers behind that tally. When present
+            the degradation classifies each flip by identity instead of
+            comparing counts, which is the difference between knowing MAFFT
+            flipped a record ORIENT declined and merely knowing the totals
+            allow it.
+        orient_unclassified_headers: Headers ORIENT never saw -- records added
+            to the job after the pipeline ran. A flip there is neither
+            agreement nor disagreement, because there was no first opinion.
 
     Returns:
         Stats dict describing what the aligner actually did.
@@ -192,6 +202,8 @@ def run_alignment(
             stats["reversed_by_aligner"] = _run_mafft(
                 input_fasta, output_fasta, params, config, logger, job_id,
                 orient_uncertain=orient_uncertain,
+                orient_uncertain_headers=orient_uncertain_headers,
+                orient_unclassified_headers=orient_unclassified_headers,
                 fix_orientation=fix_orientation,
             )
         else:
@@ -608,6 +620,8 @@ def _apply_direction_veto_and_realign(
     job_id: Optional[str],
     reversed_headers: set,
     orient_uncertain: Optional[int],
+    orient_uncertain_headers: Optional[Set[str]] = None,
+    orient_unclassified_headers: Optional[Set[str]] = None,
 ) -> set:
     """Re-check MAFFT's flips and, if any is overruled, align again without it.
 
@@ -659,7 +673,10 @@ def _apply_direction_veto_and_realign(
 
     _run_mafft(
         input_fasta, output_fasta, params, config, logger, job_id,
-        orient_uncertain=orient_uncertain, fix_orientation=False,
+        orient_uncertain=orient_uncertain,
+        orient_uncertain_headers=orient_uncertain_headers,
+        orient_unclassified_headers=orient_unclassified_headers,
+        fix_orientation=False,
     )
     return accepted
 
@@ -672,11 +689,13 @@ def _run_mafft(
     logger,
     job_id: Optional[str] = None,
     orient_uncertain: Optional[int] = None,
+    orient_uncertain_headers: Optional[Set[str]] = None,
+    orient_unclassified_headers: Optional[Set[str]] = None,
     fix_orientation: bool = True,
 ):
     """
     Run MAFFT alignment.
-    
+
     MAFFT writes alignment to stdout, so we redirect stdout to file
     and stream stderr to Redis for progress updates.
     """
@@ -753,6 +772,8 @@ def _run_mafft(
         reversed_headers = _apply_direction_veto_and_realign(
             input_fasta, output_fasta, params, config, logger, job_id,
             reversed_headers, orient_uncertain,
+            orient_uncertain_headers=orient_uncertain_headers,
+            orient_unclassified_headers=orient_unclassified_headers,
         )
 
     reversed_count = len(reversed_headers)
@@ -762,20 +783,40 @@ def _run_mafft(
         # sequences in the opposite orientation to input/input_raw.fasta, which
         # is what recompute re-derives from.
         #
-        # Log ORIENT's uncertain tally next to the flip count, because the two
-        # numbers are what distinguish the benign case from the real one.
+        # Classify each flip against ORIENT's own verdict for that same record.
         # ORIENT knows only the three ITS motifs, so a non-ITS marker lands
         # entirely in "uncertain" and MAFFT is simply finishing a call ORIENT
-        # declined to make -- every occurrence in the first week had
-        # flipped <= uncertain (one LSU job was 78/78 uncertain). A flip with
-        # uncertain=0 is the different, worrying case: there the two methods
-        # genuinely disagree about a sequence ORIENT was confident in.
+        # declined to make (one LSU job was 78/78 uncertain). The worrying case
+        # is a flip of a record ORIENT was confident about: there the two
+        # methods genuinely disagree.
+        #
+        # This used to compare the flip count against the uncertain count,
+        # which only approximates the question -- 1 flip against 2 uncertain
+        # reads as benign whether or not the flipped record was one of the two.
+        # Matching headers answers it outright. Records added to the job after
+        # the pipeline ran are a third case: ORIENT never saw them, so a flip
+        # there contradicts nothing.
         from app.services.log_context import log_degradation
 
         context = {"count": reversed_count}
-        if orient_uncertain is not None:
+        if orient_uncertain_headers is not None:
+            unclassified = orient_unclassified_headers or set()
+            declined = sum(1 for h in reversed_headers if h in orient_uncertain_headers)
+            unseen = sum(
+                1 for h in reversed_headers
+                if h not in orient_uncertain_headers and h in unclassified
+            )
+            contested = reversed_count - declined - unseen
+            context["orient_uncertain"] = len(orient_uncertain_headers)
+            context["flips_orient_declined"] = declined
+            context["flips_orient_never_saw"] = unseen
+            context["flips_orient_was_confident"] = contested
+            context["disagreement"] = contested > 0
+            context["basis"] = "headers"
+        elif orient_uncertain is not None:
             context["orient_uncertain"] = orient_uncertain
             context["disagreement"] = reversed_count > orient_uncertain
+            context["basis"] = "counts"
 
         log_degradation(
             logger, "aligner_reversed_sequences",

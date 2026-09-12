@@ -27,6 +27,7 @@ from typing import Any, Dict, Iterator, List, Optional, Tuple
 from flask import current_app
 from app.config import Config
 from app.services.log_context import background_job_context
+from app.services.job_id_service import generate_job_id
 
 logger = logging.getLogger(__name__)
 
@@ -186,6 +187,11 @@ OBS_URL_RE = re.compile(
 )
 PLAIN_TOKEN_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_. -]{0,198}[A-Za-z0-9]$")
 
+# Segments that follow /observations/ but name a tool page rather than a user.
+# Anything else there is a login, which is how iNaturalist writes a user's
+# observation list.
+OBSERVATIONS_SUBPAGES = {"identify", "upload", "export", "new", "search"}
+
 
 class InatTreeError(Exception):
     """User-facing application error with an HTTP status and safe details."""
@@ -258,14 +264,19 @@ def parse_inaturalist_tree_input(raw_input: str) -> Dict[str, Any]:
                     "raw": raw,
                     "normalized": f"https://www.inaturalist.org/observations/{int(token)}",
                 }
-            return {
-                "type": "user_candidate",
-                "value": token,
-                "raw": raw,
-                "normalized": token,
-                "source": "observations_path",
-            }
-        if len(path_parts) == 1 and path_parts[0].lower() == "observations":
+            # /observations/<login> names a user, but /observations/identify and
+            # its siblings are tool pages -- the user there is in the query
+            # string. Reading the sub-page name as a login sent the whole URL
+            # off to look up a user called "identify".
+            if token.lower() not in OBSERVATIONS_SUBPAGES:
+                return {
+                    "type": "user_candidate",
+                    "value": token,
+                    "raw": raw,
+                    "normalized": token,
+                    "source": "observations_path",
+                }
+        if path_parts and path_parts[0].lower() == "observations":
             project_values = query_params.get("project_id") or []
             project_value = _clean_candidate(project_values[0]) if project_values else ""
             if project_value:
@@ -275,6 +286,22 @@ def parse_inaturalist_tree_input(raw_input: str) -> Dict[str, Any]:
                     "raw": raw,
                     "normalized": project_value,
                     "source": "observations_project_id",
+                }
+            # The shape iNaturalist's own filter UI produces, and the one the
+            # Analyze flow beside this has always accepted (see
+            # inaturalist_service.validate_inaturalist_url). Rejecting it here
+            # meant the same pasted URL worked in one half of the page and
+            # errored in the other.
+            user_values = query_params.get("user_id") or []
+            user_value = _clean_candidate(user_values[0]) if user_values else ""
+            if user_value:
+                return {
+                    "type": "user_candidate",
+                    "value": user_value,
+                    "raw": raw,
+                    "normalized": user_value,
+                    "source": "observations_user_id",
+                    "value_kind": "id" if user_value.isdigit() else "login",
                 }
         if len(path_parts) >= 2 and path_parts[0].lower() == "people":
             return {
@@ -567,7 +594,7 @@ def resolve_inaturalist_user_or_project(parsed: Dict[str, Any],
     user_match = None
     project_match = None
     if kind in {"user_candidate", "plain_candidate"} and preferred_type in {None, "user"}:
-        if parsed.get("source") == "people_path" and parsed.get("value_kind") == "id":
+        if parsed.get("source") in {"people_path", "observations_user_id"} and parsed.get("value_kind") == "id":
             user_match = _lookup_inaturalist_user_by_id(value)
         else:
             user_match = _lookup_inaturalist_user_exact(value)
@@ -1567,7 +1594,13 @@ def _create_mycomap_blast_from_observation(observation: Dict[str, Any],
     # Alan 8/5/26 - Collect why a lookup failed so a discovery timeout can say
     # what actually went wrong instead of always blaming MycoMap's queue.
     discovery_warnings: List[str] = []
-    created = find_mycomap_blast_by_title(job_title, warnings=discovery_warnings)
+    # MycoMap knows the record ID before it publishes the result page, and that
+    # ID is all the queue-position lookup needs -- which matters because the
+    # unpublished stretch is exactly when the search is sitting in the queue.
+    pending_creation: Dict[str, Any] = {}
+    created = find_mycomap_blast_by_title(
+        job_title, warnings=discovery_warnings, pending_out=pending_creation
+    )
     if created:
         local_limit, local_error = validate_mycomap_rerun_limit(
             mycomap_local_limit, "local"
@@ -1596,7 +1629,7 @@ def _create_mycomap_blast_from_observation(observation: Dict[str, Any],
             )
         if discovery_warnings:
             details["creation_discovery_warnings"] = discovery_warnings
-        return details
+        return _record_creation_queue_position(details, pending_creation)
     else:
         try:
             created = create_mycomap_blast(
@@ -1609,7 +1642,7 @@ def _create_mycomap_blast_from_observation(observation: Dict[str, Any],
             raise InatTreeError(str(exc), status=502)
 
     if created.get("record_pending"):
-        return {
+        return _record_creation_queue_position({
             "local_limit": created.get("local_limit"),
             "ncbi_limit": created.get("ncbi_limit"),
             "local": created,
@@ -1627,7 +1660,7 @@ def _create_mycomap_blast_from_observation(observation: Dict[str, Any],
             "inat_mycomap_field_status": "pending",
             "inat_mycomap_field_value_id": None,
             "ncbi_poll_attempt": 0,
-        }
+        }, pending_creation)
 
     mycomap_url = str(created.get("url") or "").strip()
     blast_id = str(created.get("blast_id") or "").strip()
@@ -1658,6 +1691,29 @@ def _create_mycomap_blast_from_observation(observation: Dict[str, Any],
     }
 
 
+def _record_creation_queue_position(details: dict, pending: dict) -> dict:
+    """
+    Attach the NCBI queue position to a still-being-discovered BLAST.
+
+    A search whose result page has not been published yet has no ``blast_id``
+    on its details, so the ordinary poll cannot ask where it sits. The history
+    lookup does know the ID, so carry it here and ask once per discovery pass.
+    """
+    from app.services.mycomap_service import (
+        get_mycomap_ncbi_queue_position,
+        record_mycomap_queue_position,
+    )
+
+    details = dict(details or {})
+    pending_id = str((pending or {}).get("blast_id") or "").strip()
+    if not pending_id:
+        return details
+    details["creation_pending_blast_id"] = pending_id
+    return record_mycomap_queue_position(
+        details, get_mycomap_ncbi_queue_position(blast_id=pending_id)
+    )
+
+
 def _check_auto_created_mycomap_ncbi_results(
         blast_id: str, details: Dict[str, Any],
         mycomap_url: Optional[str] = None) -> Tuple[bool, Dict[str, Any]]:
@@ -1670,15 +1726,16 @@ def _check_auto_created_mycomap_ncbi_results(
         get_mycomap_ncbi_poll_max_attempts,
         get_mycomap_ncbi_queue_position,
         get_mycomap_ncbi_result_count,
+        record_mycomap_queue_position,
     )
 
     details = dict(details or {})
     attempt = int(details.get("ncbi_poll_attempt") or 0) + 1
-    # The result page is the authoritative cheap signal that MycoMap has not
+    # MycoMap's status endpoint is the authoritative cheap signal that it has not
     # reached this search yet. Do not hammer its NCBI FASTA export while it says
     # the search is queued; that endpoint returns 500 during a backlog.
-    queue_position = (
-        get_mycomap_ncbi_queue_position(mycomap_url) if mycomap_url else None
+    queue_position = get_mycomap_ncbi_queue_position(
+        mycomap_url, blast_id=blast_id
     )
     if queue_position is None:
         count, warnings = get_mycomap_ncbi_result_count(blast_id)
@@ -1694,10 +1751,7 @@ def _check_auto_created_mycomap_ncbi_results(
     if count > 0:
         details.pop("ncbi_queue_position", None)
         return True, details
-    if queue_position is not None:
-        details["ncbi_queue_position"] = queue_position
-    else:
-        details.pop("ncbi_queue_position", None)
+    details = record_mycomap_queue_position(details, queue_position)
 
     elapsed_seconds = attempt * get_mycomap_ncbi_poll_interval_seconds()
     fallback_seconds = get_mycomap_ncbi_local_fallback_seconds()
@@ -1764,12 +1818,21 @@ def _append_fasta_to_job_input(job_dir, fasta_text: str) -> int:
         _sequence_exact_key,
         _split_fasta_header,
     )
+    from app.services.mycomap_service import compact_mycomap_ncbi_header
 
     sequences_to_add = [
         s for s in _parse_fasta_sequences(fasta_text) if s.get("sequence", "").strip()
     ]
     if not sequences_to_add:
         return 0
+
+    # These headers arrive straight from MycoMap's NCBI export, which is the
+    # same source /api/mycomap compacts before it ever reaches the queue. Do
+    # the same here, or a tree that gained its NCBI hits on the recheck shows
+    # whole GenBank definition lines as tip labels while a tree that got them
+    # up front does not.
+    for seq in sequences_to_add:
+        seq["name"] = compact_mycomap_ncbi_header(seq.get("name", ""))
 
     input_path = job_dir / "input" / "input_raw.fasta"
     input_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1846,6 +1909,7 @@ def reconcile_delayed_ncbi_results(job_id: str) -> Dict[str, Any]:
         get_mycomap_ncbi_recheck_max_hours,
         get_mycomap_ncbi_queue_position,
         get_mycomap_ncbi_result_count,
+        record_mycomap_queue_position,
         validate_mycomap_url,
     )
 
@@ -1895,7 +1959,9 @@ def reconcile_delayed_ncbi_results(job_id: str) -> Dict[str, Any]:
         rerun_details["ncbi_recheck_count"] = recheck_count
         rerun_details["ncbi_last_rechecked_at"] = datetime.now(timezone.utc).isoformat()
 
-        queue_position = get_mycomap_ncbi_queue_position(mycomap_url)
+        queue_position = get_mycomap_ncbi_queue_position(
+            mycomap_url, blast_id=blast_id
+        )
         if queue_position is None:
             count, _warnings = get_mycomap_ncbi_result_count(blast_id)
             rerun_details.pop("ncbi_queue_position", None)
@@ -1903,7 +1969,9 @@ def reconcile_delayed_ncbi_results(job_id: str) -> Dict[str, Any]:
             # A queued search is healthy pending work, not a failed export.
             count, _warnings = 0, []
             rerun_details["ncbi_status"] = "queued"
-            rerun_details["ncbi_queue_position"] = queue_position
+            rerun_details = record_mycomap_queue_position(
+                rerun_details, queue_position
+            )
         if count <= 0:
             max_hours = get_mycomap_ncbi_recheck_max_hours()
             if recheck_count >= max_hours:
@@ -2168,7 +2236,10 @@ def prepare_inat_tree_job(observation_id: int, *, include_ncbi: bool = True,
     if "ncbi" in pending_sources:
         queue_position = (payload or {}).get("ncbi_queue_position")
         mycomap_rerun_details["ncbi_status"] = "queued"
-        mycomap_rerun_details["ncbi_queue_position"] = queue_position
+        from app.services.mycomap_service import record_mycomap_queue_position
+        mycomap_rerun_details = record_mycomap_queue_position(
+            mycomap_rerun_details, queue_position
+        )
         mycomap_rerun_details["ncbi_fallback_local_only"] = True
         queue_suffix = (
             f" at position {queue_position}" if queue_position is not None else ""
@@ -2316,7 +2387,7 @@ def create_job_from_inat_observation(raw_input: str, user=None,
     if extra_metrics:
         rq_meta.update(extra_metrics)
 
-    job_id = str(uuid.uuid4())
+    job_id = generate_job_id()
     job_params = {
         "input_type": "inat_tree_preparation",
         "notes": _build_inat_job_title(observation_id, initial_genus),

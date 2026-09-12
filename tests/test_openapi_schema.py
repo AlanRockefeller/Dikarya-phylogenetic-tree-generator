@@ -1,10 +1,71 @@
 import unittest
 
-from app.api_v1.openapi import _schemas
+from flask import Flask
+
+from app.api_v1.openapi import _schemas, build_spec
 from app.api_v1.routes import LIMITS
 
 
 class OpenAPISchemaTests(unittest.TestCase):
+    def test_inaturalist_finder_is_fully_documented(self):
+        app = Flask(__name__)
+        with app.test_request_context(base_url="https://dikarya.us"):
+            operation = build_spec()["paths"]["/tools/inaturalist-finder"]["post"]
+
+        schema = operation["requestBody"]["content"]["application/json"]["schema"]
+        # Only the observation number is required now: an automatic search may be
+        # run with any combination of clues, including none at all.
+        self.assertEqual(schema["required"], ["observation"])
+        self.assertEqual(schema["properties"]["digits_off"]["maximum"], 3)
+        self.assertEqual(operation["security"], [{"bearerAuth": ["tools:read"]}])
+        self.assertEqual(
+            operation["responses"]["200"]["content"]["application/json"]["schema"]
+            ["properties"]["data"]["$ref"],
+            "#/components/schemas/InaturalistFinderAnyResult",
+        )
+
+    def test_inaturalist_finder_documents_the_automatic_search(self):
+        """The clue fields, the resume contract, and both result shapes."""
+        schemas = _schemas()
+        schema = None
+        app = Flask(__name__)
+        with app.test_request_context(base_url="https://dikarya.us"):
+            operation = build_spec()["paths"]["/tools/inaturalist-finder"]["post"]
+        schema = operation["requestBody"]["content"]["application/json"]["schema"]
+        properties = schema["properties"]
+
+        # Every clue is documented, optional, and not part of a one-of-five choice.
+        for clue in ("genus", "family", "taxon", "user", "project"):
+            with self.subTest(clue=clue):
+                self.assertIn(clue, properties)
+                self.assertNotIn(clue, schema["required"])
+        # The single-criterion shape is still documented rather than removed.
+        self.assertIn("mode", properties)
+        self.assertIn("term", properties)
+
+        # Bounded auto is only usable if resuming is documented alongside it.
+        self.assertIn("resume", properties)
+        self.assertIn("confirm", properties)
+        for word in ("resume", "needs_confirmation", "5,000", "10,000"):
+            self.assertIn(word, operation["description"], word)
+
+        # Both result shapes exist and the union points at them.
+        union = schemas["InaturalistFinderAnyResult"]["oneOf"]
+        self.assertIn({"$ref": "#/components/schemas/InaturalistFinderAutoResult"}, union)
+        self.assertIn({"$ref": "#/components/schemas/InaturalistFinderResult"}, union)
+
+        auto = schemas["InaturalistFinderAutoResult"]["properties"]
+        for field in ("status", "complete", "unusable_clues", "original", "resume", "next_stage"):
+            with self.subTest(field=field):
+                self.assertIn(field, auto)
+        self.assertIn("needs_confirmation", auto["status"]["enum"])
+        self.assertIn("incomplete", auto["status"]["enum"])
+
+        # `unknown` must be documented as its own verdict, not folded into "no".
+        score = schemas["InaturalistFinderScore"]
+        self.assertIn("unknown", score["properties"])
+        self.assertIn("never", score["description"])
+
     def test_tree_model_has_conditional_documentation_and_no_default(self):
         tree_model = _schemas()["CreateJobRequest"]["properties"]["tree_model"]
 

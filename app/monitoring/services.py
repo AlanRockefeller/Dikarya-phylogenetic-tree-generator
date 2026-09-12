@@ -443,7 +443,7 @@ PROGRESS_TAIL_BYTES = 8192
 
 
 def _job_ref(job_id):
-    """The short, non-actionable handle shown in place of a job UUID."""
+    """The short handle shown in place of a full job id."""
     return str(job_id or "")[:8]
 
 

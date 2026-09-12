@@ -1575,10 +1575,15 @@ def _run_mrbayes(
         from app.workers.events import publish_command
         publish_command(job_id, "tree", cmd)
 
-        # MrBayes prints progress to stdout
+        # MrBayes prints progress to stdout, and unlike IQ-TREE (<prefix>.log)
+        # and RAxML-NG (.raxml.log) it writes no log of its own, so without the
+        # tee the run leaves nothing behind: this branch used to produce a
+        # 4-line tree_builder.log holding only the CMD header, which is also
+        # what the status page's Tree tab and the tree-log download served.
         exit_code, stats = run_command_streaming(
             cmd,
             stderr_path=log_file,
+            stdout_tee_path=log_file,
             on_stdout_line=_make_log_callback(job_id, "tree", "stdout"),  # MrBayes uses stdout
             on_stderr_line=_make_log_callback(job_id, "tree", "stderr"),
             **_tool_limits(config, "MrBayes", _get_thread_count(params)),

@@ -15,12 +15,12 @@ import logging
 import re
 import hashlib
 import time
-import uuid
 from urllib.parse import urlsplit
 from difflib import SequenceMatcher
 from datetime import datetime
 
 from app.services.security_utils import validate_job_id, validate_safe_file_path, coerce_bool
+from app.services.job_id_service import generate_job_id
 from app.services.tree_parameter_validation import (
     normalize_inherited_iqtree_ufboot_count,
     validate_iqtree_ufboot_count,
@@ -519,6 +519,11 @@ def _dedupe_sequence_payload(sequence_text, sequence_metadata):
 MYCOMAP_LOCAL_FASTA_QUERY_SIMILARITY_MIN = 99.5
 MYCOMAP_LOCAL_FASTA_REPORTED_IDENTITY_CONFLICT_MAX = 98.5
 MAX_IMPORT_FILTER_DETAIL_RECORDS = 100
+
+# Cap on headers recorded as "added after ORIENT ran". Bounds input_info.json,
+# which every viewer edit rewrites. Past the cap the aligner just reports such a
+# flip as contested, which is what it did before the list existed.
+MAX_UNCLASSIFIED_ORIENT_HEADERS = 2000
 
 
 def _sequence_similarity_percent(a, b):
@@ -1152,6 +1157,56 @@ def _describe_skipped_duplicate(seq, kept, reason):
         "removed_length": len(removed_sequence),
         "kept_length": len(kept_sequence),
     }
+
+
+def _fasta_record_header(record_text):
+    """The header line of a formatted FASTA record, without the '>'."""
+    first_line = (record_text or "").lstrip().split("\n", 1)[0]
+    return first_line[1:].strip() if first_line.startswith(">") else ""
+
+
+def _record_headers_added_after_orient(job_dir, headers, replace=False):
+    """Note records that entered input_raw.fasta without passing through ORIENT.
+
+    A recompute realigns whatever is in input_raw.fasta, and MAFFT makes its own
+    direction call over all of it. Without this list, a flip of a sequence added
+    after the pipeline ran looks identical to a flip that contradicts ORIENT --
+    the record is simply absent from the uncertain list either way. Recording
+    them keeps the aligner's degradation line honest.
+
+    Best-effort: a job that has not run ORIENT yet has no orientation_details to
+    extend, and failing to annotate it must never fail the user's add.
+    """
+    headers = [h for h in (headers or []) if h]
+    if not headers and not replace:
+        return
+    import json  # module-level import is deliberately avoided in this file
+    input_info_path = job_dir / "input_info.json"
+    if not validate_safe_file_path(input_info_path, job_dir) or not input_info_path.exists():
+        return
+    try:
+        with open(input_info_path, "r") as handle:
+            stored = json.load(handle)
+        if not isinstance(stored, dict):
+            return
+        details = stored.get("orientation_details")
+        if not isinstance(details, dict):
+            return
+        existing = [] if replace else list(details.get("unclassified_headers") or [])
+        if replace:
+            # Nothing in the file was classified any more, so the uncertain list
+            # from the old input no longer describes anything present.
+            details["uncertain_headers"] = []
+            details["uncertain_headers_truncated"] = False
+        seen = set(existing)
+        merged = existing + [h for h in headers if h not in seen and not seen.add(h)]
+        details["unclassified_headers"] = merged[:MAX_UNCLASSIFIED_ORIENT_HEADERS]
+        with open(input_info_path, "w") as handle:
+            json.dump(stored, handle, separators=(",", ":"))
+    except (OSError, ValueError, TypeError) as exc:
+        # Losing the diagnostic must never fail the add, which has already
+        # written the sequences the user asked for.
+        logger.warning("Could not record post-ORIENT headers for %s: %s", job_dir.name, exc)
 
 
 def _merge_queue_duplicate_details(job_dir, removed_records):
@@ -2123,7 +2178,7 @@ def start_mycomap_blast_refresh():
         "include_ncbi": true,
         "include_local": true
     }
-    Response: { "status": "success", "job_id": "<uuid>" }
+    Response: { "status": "success", "job_id": "<job id>" }
     """
     data = request.get_json() or {}
     url = data.get('url', '').strip()
@@ -2816,7 +2871,7 @@ def create_job():
     # owns before persisting, then enqueue with that preparation disabled. This
     # preserves the observable params while ensuring RQ cannot run first.
     prepare_phylo_job_params(job_params)
-    job_id = str(uuid.uuid4())
+    job_id = generate_job_id()
     g.job_id = job_id
     job_record = Job(
         id=job_id,
@@ -3620,7 +3675,7 @@ def rebuild_with_duplicates(job_id):
         job_params["rebuilt_from_job_id"] = job_id
 
         prepare_phylo_job_params(job_params)
-        new_job_id = str(uuid.uuid4())
+        new_job_id = generate_job_id()
         new_record = Job(
             id=new_job_id,
             status="queued",
@@ -5317,11 +5372,25 @@ def client_log_csrf():
 
 
 @bp.route('/log/client', methods=['POST'])
+@csrf.exempt
 @limiter.limit("30 per minute; 500 per day")
 def log_client_error():
     """
     Log client-side errors to the server log.
     Accept only bounded, query-free telemetry fields from the shared browser layer.
+
+    CSRF-exempt, like /api/client-log beside it. This is a write-only log sink:
+    it takes no action on behalf of whoever calls it, reads nothing back, and
+    every field is whitelisted and sanitized below, so a forged request buys an
+    attacker one log line that the rate limit above already bounds.
+
+    What the token cost instead was the reports that matter most. A browser
+    sends this with keepalive on page unload, and in-app browsers (Facebook's
+    on Android, seen twice on 2026-09-10 and 2026-09-11) hand that request to a
+    background network layer that omits the session cookie -- so the POST
+    arrives with no CSRF session, is rejected, and the page is already gone, so
+    the /log/client/csrf refresh-and-retry below cannot run. The error report
+    from the user whose page just broke was the one being dropped.
     """
     from flask import current_app
     if request.content_length and request.content_length > 16 * 1024:
@@ -5467,6 +5536,13 @@ def add_sequences_to_job(job_id):
         else:
             # Assume FASTA
             sequences_to_add = _parse_fasta_sequences(input_text)
+            # Pasted MycoMap/NCBI headers carry the whole GenBank definition
+            # line. /api/mycomap compacts those before they reach the queue;
+            # do the same for a paste so both routes produce the same tip
+            # label. Unrecognized headers come back unchanged.
+            from app.services.mycomap_service import compact_mycomap_ncbi_header
+            for seq in sequences_to_add:
+                seq['name'] = compact_mycomap_ncbi_header(seq.get('name', ''))
             
         # Filter out sequences with empty sequence data
         sequences_to_add = [s for s in sequences_to_add if s.get('sequence', '').strip()]
@@ -5530,6 +5606,13 @@ def add_sequences_to_job(job_id):
                 added_count += 1
 
             input_path.write_text("\n".join(record.rstrip() for record in output_records) + "\n")
+            # Replace rewrites the whole input from the queue, so nothing left
+            # in the file carries ORIENT's verdict any more.
+            _record_headers_added_after_orient(
+                job_dir,
+                [_fasta_record_header(record) for record in output_records],
+                replace=True,
+            )
             _merge_queue_duplicate_details(job_dir, duplicate_records)
 
             message = f"Saved {added_count} queued sequence{'s' if added_count != 1 else ''}."
@@ -5583,6 +5666,7 @@ def add_sequences_to_job(job_id):
 
         added_count = 0
         duplicate_count = 0
+        added_headers = []
         with open(input_path, "a") as f:
             # Ensure newline at end of file before appending
             if input_path.stat().st_size > 0:
@@ -5602,7 +5686,9 @@ def add_sequences_to_job(job_id):
                     duplicate_records.append(_describe_skipped_duplicate(
                         seq, matched, 'same_record_refetched'))
                     continue
-                f.write(_format_fasta_record_for_job(seq, existing_ids, added_count + 1))
+                record_text = _format_fasta_record_for_job(seq, existing_ids, added_count + 1)
+                f.write(record_text)
+                added_headers.append(_fasta_record_header(record_text))
                 existing_records.add(exact_key)
                 entry = {
                     "header": str(seq.get('name') or ''),
@@ -5613,6 +5699,7 @@ def add_sequences_to_job(job_id):
                 exact_headers[exact_key] = entry
                 added_count += 1
 
+        _record_headers_added_after_orient(job_dir, added_headers)
         _merge_queue_duplicate_details(job_dir, duplicate_records)
 
         message = f"Added {added_count} sequences."

@@ -466,11 +466,17 @@ def _restore_trimmed_fasta_headers(
     if restored:
         SeqIO.write(output_records, str(output_alignment), "fasta")
 
+    # "Restored 0/499 (0 unmatched)" read like a failure when it is the healthy
+    # case: the trimmer kept every header intact, so there was nothing to put
+    # back. Say what actually happened, and only mention unmatched records when
+    # there are some.
+    unchanged = len(output_records) - restored - missing
     logger.info(
-        "Restored full FASTA headers for %s/%s trimmed records (%s unmatched).",
+        "Trimmed FASTA headers: %s restored, %s already intact%s (of %s records).",
         restored,
+        unchanged,
+        f", {missing} unmatched" if missing else "",
         len(output_records),
-        missing,
     )
 
 

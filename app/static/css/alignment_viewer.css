@@ -328,6 +328,20 @@ body.av-col-resizing {
     color: #93c5fd;
 }
 
+/* Clade-highlight background: the same wash the tree viewer paints behind that clade's
+   tip labels, written inline from the tree's own resolved color and opacity. Full row
+   height and square, so consecutive members of one clade read as a single band rather
+   than as a stack of separate pills; the extra pixel covers the row's bottom border. */
+.alignment-viewer .av-name-text.av-name-highlighted {
+    align-self: flex-start;
+    display: inline-flex;
+    align-items: center;
+    height: calc(100% + 1px);
+    padding: 0 4px;
+    margin: 0 -4px;
+    border-radius: 0;
+}
+
 /* Baseline strip header switches to the reference color when a sequence is the baseline. */
 .alignment-viewer .av-consensus-name.av-ref-header {
     color: #1d4ed8;

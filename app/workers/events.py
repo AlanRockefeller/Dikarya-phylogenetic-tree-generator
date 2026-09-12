@@ -428,6 +428,17 @@ def publish_overview(job_id: str, message: str, icon: str = STATE_RUNNING,
     }
     if key:
         payload["key"] = key
+    # The feed itself is Redis PubSub only, so once the stream closes there is
+    # no record of what the user was told. Mirroring the line into the job's
+    # pipeline.log costs nothing (the root handler installed by
+    # _add_job_log_handler picks it up through the job context) and makes the
+    # Activity Feed replayable when debugging a finished job.
+    logger.info(
+        "event=overview icon=%s%s %s",
+        payload["icon"],
+        f" key={key}" if key else "",
+        message,
+    )
     publish_event(job_id, payload)
 
 

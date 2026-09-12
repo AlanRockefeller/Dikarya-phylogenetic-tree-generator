@@ -116,8 +116,15 @@ def can_edit_whats_new():
     return bool(getattr(current_user, "is_admin", False))
 
 
-def require_whats_new_editor():
+def require_whats_new_editor(post_only=False):
     if not can_edit_whats_new():
+        abort(404)
+    if post_only and request.method != "POST":
+        # Flask answers a GET to a POST-only route with 405, and a 405 confirms
+        # the route exists. /whats-new/edit already 404s for everyone who is not
+        # an editor, so the add/edit/delete endpoints beside it were the ones
+        # telling scanners where to look -- they are probed regularly. Answer a
+        # GET the same way whether or not the caller could have posted.
         abort(404)
 
 
@@ -729,9 +736,9 @@ def whats_new_edit():
     )
 
 
-@bp.route('/whats-new/add', methods=['POST'])
+@bp.route('/whats-new/add', methods=['GET', 'POST'])
 def whats_new_add():
-    require_whats_new_editor()
+    require_whats_new_editor(post_only=True)
 
     from app.models import WhatsNewEntry
 
@@ -753,9 +760,9 @@ def whats_new_add():
     return redirect(url_for("main.whats_new_edit"))
 
 
-@bp.route('/whats-new/<int:entry_id>/edit', methods=['POST'])
+@bp.route('/whats-new/<int:entry_id>/edit', methods=['GET', 'POST'])
 def whats_new_update(entry_id):
-    require_whats_new_editor()
+    require_whats_new_editor(post_only=True)
 
     from app.models import WhatsNewEntry
 
@@ -779,9 +786,9 @@ def whats_new_update(entry_id):
     return redirect(url_for("main.whats_new_edit"))
 
 
-@bp.route('/whats-new/<int:entry_id>/delete', methods=['POST'])
+@bp.route('/whats-new/<int:entry_id>/delete', methods=['GET', 'POST'])
 def whats_new_delete(entry_id):
-    require_whats_new_editor()
+    require_whats_new_editor(post_only=True)
 
     from app.models import WhatsNewEntry
 

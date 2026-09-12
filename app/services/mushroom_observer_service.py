@@ -9,7 +9,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from app.services.api_diagnostics import diagnostic_urlopen, record_api_failure
-import uuid
+from app.services.job_id_service import generate_job_id
 from typing import Any, Dict, List, Optional, Tuple
 
 from flask import current_app
@@ -610,7 +610,7 @@ def create_tree_job(raw_input: str, sequence_id: Any, *, user=None,
         raise MushroomObserverError(local_error or ncbi_error, status=422)
 
     observation_id = int(observation["id"])
-    job_id = str(uuid.uuid4())
+    job_id = generate_job_id()
     title = _job_title(observation_id, observation.get("consensus_name"))
     preparation = {
         "observation_id": observation_id,
@@ -824,6 +824,7 @@ def prepare_tree_job(preparation: Dict[str, Any], *, defer_after_ncbi_rerun: boo
         _build_sequence_metadata,
         _check_auto_created_mycomap_ncbi_results,
         _mycomap_creation_discovery_message,
+        _record_creation_queue_position,
         _refresh_mycomap_blast_results,
     )
     from app.services.mycomap_service import (
@@ -864,7 +865,13 @@ def prepare_tree_job(preparation: Dict[str, Any], *, defer_after_ncbi_rerun: boo
     if skip_mycomap_refresh and details.get("creation_pending"):
         discovery_warnings = list(details.get("creation_discovery_warnings") or [])
         lookup_warnings = []
-        found = find_mycomap_blast_by_title(title, warnings=lookup_warnings)
+        # See _record_creation_queue_position: the history lookup knows the
+        # record ID before the result page exists, which is what lets the wait
+        # message name a queue position during discovery.
+        pending_creation = {}
+        found = find_mycomap_blast_by_title(
+            title, warnings=lookup_warnings, pending_out=pending_creation
+        )
         discovery_warnings.extend(lookup_warnings)
         discovery_warnings = list(dict.fromkeys(discovery_warnings))
         if not found:
@@ -883,7 +890,9 @@ def prepare_tree_job(preparation: Dict[str, Any], *, defer_after_ncbi_rerun: boo
                 "status": "waiting_for_ncbi",
                 "notes": _job_title(observation_id, preparation.get("consensus_name")),
                 "mycomap_blast_url": "",
-                "mycomap_rerun_details": details,
+                "mycomap_rerun_details": _record_creation_queue_position(
+                    details, pending_creation
+                ),
             }
         details["creation_pending"] = False
         details["created_blast_id"] = found["blast_id"]
@@ -892,10 +901,13 @@ def prepare_tree_job(preparation: Dict[str, Any], *, defer_after_ncbi_rerun: boo
 
     if not skip_mycomap_refresh:
         discovery_warnings = []
+        pending_creation = {}
         found = (
             {"blast_id": notes_blast_id, "url": notes_mycomap_url}
             if notes_blast_id
-            else find_mycomap_blast_by_title(title, warnings=discovery_warnings)
+            else find_mycomap_blast_by_title(
+                title, warnings=discovery_warnings, pending_out=pending_creation
+            )
         )
         if found:
             mycomap_url = found["url"]
@@ -939,7 +951,9 @@ def prepare_tree_job(preparation: Dict[str, Any], *, defer_after_ncbi_rerun: boo
                 "status": "waiting_for_ncbi",
                 "notes": _job_title(observation_id, preparation.get("consensus_name")),
                 "mycomap_blast_url": mycomap_url,
-                "mycomap_rerun_details": details,
+                "mycomap_rerun_details": _record_creation_queue_position(
+                    details, pending_creation
+                ),
             }
 
     if details.get("auto_created"):
