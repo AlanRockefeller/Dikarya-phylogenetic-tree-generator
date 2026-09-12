@@ -59,14 +59,95 @@
     }
 
     .tree-card > h3 > i,
+    .import-accordion-toggle > h3 > i,
     .tree-modal h3 > i {
         display: none;
     }
 
-    .tree-card > h3 {
+    .tree-card > h3,
+    .import-accordion-toggle > h3 {
         color: #f7faf8;
         font-size: 28px;
         line-height: 1.1;
+    }
+
+    /* Alan 9/12/26 - Collapsible database import sources. The four source cards
+       are additive rather than exclusive, so each opens independently; tabs
+       would have hidden a card that still owns sequences in the queue. */
+    .import-source-group {
+        display: flex;
+        flex-direction: column;
+        gap: 12px;
+    }
+
+    .import-source-group-header {
+        display: flex;
+        align-items: baseline;
+        flex-wrap: wrap;
+        gap: 4px 10px;
+        padding: 0 2px;
+    }
+
+    .import-source-group-title {
+        color: #f7faf8;
+        font-family: var(--sans);
+        font-size: 13px;
+        font-weight: 600;
+        letter-spacing: .08em;
+        text-transform: uppercase;
+    }
+
+    .import-source-group-hint {
+        color: var(--text-mute);
+        font-family: var(--sans);
+        font-size: 12px;
+    }
+
+    .import-accordion-toggle {
+        align-items: center;
+        background: none;
+        border: 0;
+        cursor: pointer;
+        display: flex;
+        gap: 12px;
+        justify-content: space-between;
+        padding: 18px 24px;
+        text-align: left;
+        transition: background-color .15s ease;
+        width: 100%;
+    }
+
+    .import-accordion-toggle:hover {
+        background: rgba(255, 239, 194, .05);
+    }
+
+    .import-accordion-toggle:focus-visible {
+        outline: 2px solid var(--journal-gold);
+        outline-offset: -2px;
+    }
+
+    .import-accordion-toggle > h3 {
+        font-size: 22px;
+        margin: 0;
+    }
+
+    .import-accordion-chevron {
+        color: var(--journal-gold);
+        flex: none;
+        font-size: 14px;
+        transition: transform .18s ease;
+    }
+
+    .import-accordion.is-open .import-accordion-chevron {
+        transform: rotate(180deg);
+    }
+
+    .import-accordion-panel {
+        padding: 0 24px 24px;
+    }
+
+    .import-accordion-panel[hidden] {
+        display: none;
     }
 
     .eyebrow {
@@ -529,8 +610,17 @@
             0 1px 2px rgba(26, 47, 35, .04);
     }
 
-    html:not(.dark) .tree-builder-page .tree-card > h3 {
+    html:not(.dark) .tree-builder-page .tree-card > h3,
+    html:not(.dark) .tree-builder-page .import-accordion-toggle > h3 {
         color: #1a2f23;
+    }
+
+    html:not(.dark) .tree-builder-page .import-source-group-title {
+        color: #1a2f23;
+    }
+
+    html:not(.dark) .tree-builder-page .import-accordion-toggle:hover {
+        background: rgba(26, 47, 35, .04);
     }
 
     html:not(.dark) .tree-builder-page input[type="url"],
@@ -590,12 +680,26 @@
     <!-- Left Section: 2 columns -->
     <div class="lg:col-span-2 space-y-6">
 
+        <!-- Collapsible database import sources. Alan 9/12/26 - the four source
+             cards below are additive, not exclusive, so they collapse independently
+             rather than becoming tabs; see openImportSection() for auto-expansion. -->
+        <div class="import-source-group" id="import_source_group">
+            <div class="import-source-group-header">
+                <span class="import-source-group-title">Import</span>
+                <span class="import-source-group-hint">iNaturalist &middot; Mushroom Observer &middot; MycoMap &middot; BLAST</span>
+            </div>
         <!-- 1. iNaturalist URL Card -->
-        <div class="tree-card p-6 transition-colors">
-            <h3 class="text-xl font-semibold text-journal-dark dark:text-gray-100 mb-4 flex items-center">
-                <i class="fas fa-leaf text-journal-gold mr-2"></i>
-                Import from iNaturalist
-            </h3>
+        <div class="tree-card import-accordion transition-colors" data-import-section="inaturalist">
+            <button type="button" class="import-accordion-toggle" id="import_toggle_inaturalist"
+                    aria-expanded="false" aria-controls="import_panel_inaturalist">
+                <h3 class="text-xl font-semibold text-journal-dark dark:text-gray-100 flex items-center">
+                    <i class="fas fa-leaf text-journal-gold mr-2"></i>
+                    Import from iNaturalist
+                </h3>
+                <i class="fas fa-chevron-down import-accordion-chevron" aria-hidden="true"></i>
+            </button>
+            <div class="import-accordion-panel" id="import_panel_inaturalist" role="region"
+                 aria-labelledby="import_toggle_inaturalist" hidden>
 
             <div class="space-y-4">
                 <div>
@@ -736,14 +840,21 @@
                     </div>
                 </div>
             </div>
+            </div>
         </div>
 
         <!-- 2. Mushroom Observer Card -->
-        <div class="tree-card p-6 transition-colors">
-            <h3 class="text-xl font-semibold text-journal-dark dark:text-gray-100 mb-4 flex items-center">
-                <i class="fas fa-binoculars text-journal-gold mr-2"></i>
-                Import from Mushroom Observer
-            </h3>
+        <div class="tree-card import-accordion transition-colors" data-import-section="mushroom_observer">
+            <button type="button" class="import-accordion-toggle" id="import_toggle_mushroom_observer"
+                    aria-expanded="false" aria-controls="import_panel_mushroom_observer">
+                <h3 class="text-xl font-semibold text-journal-dark dark:text-gray-100 flex items-center">
+                    <i class="fas fa-binoculars text-journal-gold mr-2"></i>
+                    Import from Mushroom Observer
+                </h3>
+                <i class="fas fa-chevron-down import-accordion-chevron" aria-hidden="true"></i>
+            </button>
+            <div class="import-accordion-panel" id="import_panel_mushroom_observer" role="region"
+                 aria-labelledby="import_toggle_mushroom_observer" hidden>
 
             <div class="space-y-4">
                 <div>
@@ -815,14 +926,21 @@
                     </div>
                 </div>
             </div>
+            </div>
         </div>
 
         <!-- 3. Mycomap URL Card -->
-        <div class="tree-card p-6 transition-colors">
-            <h3 class="text-xl font-semibold text-journal-dark dark:text-gray-100 mb-4 flex items-center">
-                <i class="fas fa-link text-journal-gold mr-2"></i>
-                Import from Mycomap
-            </h3>
+        <div class="tree-card import-accordion transition-colors" data-import-section="mycomap">
+            <button type="button" class="import-accordion-toggle" id="import_toggle_mycomap"
+                    aria-expanded="false" aria-controls="import_panel_mycomap">
+                <h3 class="text-xl font-semibold text-journal-dark dark:text-gray-100 flex items-center">
+                    <i class="fas fa-link text-journal-gold mr-2"></i>
+                    Import from Mycomap
+                </h3>
+                <i class="fas fa-chevron-down import-accordion-chevron" aria-hidden="true"></i>
+            </button>
+            <div class="import-accordion-panel" id="import_panel_mycomap" role="region"
+                 aria-labelledby="import_toggle_mycomap" hidden>
 
             <div class="space-y-4">
                 <div>
@@ -877,14 +995,21 @@
                     </button>
                 </div>
             </div>
+            </div>
         </div>
 
         <!-- 3. BLAST Card -->
-        <div class="tree-card p-6 transition-colors">
-            <h3 class="text-xl font-semibold text-journal-dark dark:text-gray-100 mb-4 flex items-center">
-                <i class="fas fa-search text-journal-gold mr-2"></i>
-                BLAST for Related Sequences
-            </h3>
+        <div class="tree-card import-accordion transition-colors" data-import-section="blast">
+            <button type="button" class="import-accordion-toggle" id="import_toggle_blast"
+                    aria-expanded="false" aria-controls="import_panel_blast">
+                <h3 class="text-xl font-semibold text-journal-dark dark:text-gray-100 flex items-center">
+                    <i class="fas fa-search text-journal-gold mr-2"></i>
+                    BLAST for Related Sequences
+                </h3>
+                <i class="fas fa-chevron-down import-accordion-chevron" aria-hidden="true"></i>
+            </button>
+            <div class="import-accordion-panel" id="import_panel_blast" role="region"
+                 aria-labelledby="import_toggle_blast" hidden>
 
             <div class="space-y-4">
                 <div>
@@ -943,46 +1068,8 @@
                     </button>
                 </div>
             </div>
-        </div>
-
-        <!-- 4. File Upload Card -->
-        <div class="tree-card p-6 transition-colors">
-            <h3 class="text-xl font-semibold text-journal-dark dark:text-gray-100 mb-4 flex items-center">
-                <i class="fas fa-file-upload text-journal-gold mr-2"></i>
-                Or Upload a File
-            </h3>
-
-            <div class="space-y-4">
-                <label for="sequence_file" class="upload-dropzone block w-full border-2 border-dashed border-gray-300 dark:border-gray-600
-                              rounded-lg p-8 text-center cursor-pointer
-                              hover:border-journal-gold dark:hover:border-journal-gold
-                              transition-colors bg-gray-50 dark:bg-journal-dark">
-                    <i class="fas fa-cloud-upload-alt text-4xl text-gray-400 dark:text-gray-500 mb-3"></i>
-                    <p class="text-sm text-gray-600 dark:text-gray-300">
-                        <span class="font-semibold text-journal-gold">Click to upload</span> or drag and drop
-                    </p>
-                    <p class="text-xs text-gray-500 dark:text-gray-400 mt-1">
-                        FASTA files (.fa, .fasta, .fna, .txt)
-                    </p>
-                    <input type="file" id="sequence_file" class="hidden" accept=".fa,.fasta,.fna,.txt">
-                </label>
-
-                <!-- Job Notes -->
-                <div>
-                    <label for="job_notes" class="block text-sm font-medium text-gray-700 dark:text-gray-200 mb-2">
-                        Job Name / Notes
-                    </label>
-                    <input type="text" id="job_notes" class="w-full px-4 py-3 border border-gray-300 dark:border-journal-dark rounded-lg 
-                                  bg-white dark:bg-journal-dark text-gray-900 dark:text-gray-100
-                                  focus:ring-2 focus:ring-journal-gold focus:border-transparent transition-all"
-                        placeholder="e.g. Fungal ITS Analysis">
-                </div>
-
-                <!-- Hidden Add Button for File -->
-                <button id="add_file_btn" class="hidden btn btn-outline-gold w-full">
-                    <i class="fas fa-plus mr-2"></i> Add Sequences from File
-                </button>
             </div>
+        </div>
         </div>
 
         <!-- 5. Paste Sequences Card -->
@@ -1040,6 +1127,46 @@
                     </button>
                     <!-- BLAST button removed from here -->
                 </div>
+            </div>
+        </div>
+
+        <!-- 4. File Upload Card -->
+        <div class="tree-card p-6 transition-colors">
+            <h3 class="text-xl font-semibold text-journal-dark dark:text-gray-100 mb-4 flex items-center">
+                <i class="fas fa-file-upload text-journal-gold mr-2"></i>
+                Or Upload a File
+            </h3>
+
+            <div class="space-y-4">
+                <label for="sequence_file" class="upload-dropzone block w-full border-2 border-dashed border-gray-300 dark:border-gray-600
+                              rounded-lg p-8 text-center cursor-pointer
+                              hover:border-journal-gold dark:hover:border-journal-gold
+                              transition-colors bg-gray-50 dark:bg-journal-dark">
+                    <i class="fas fa-cloud-upload-alt text-4xl text-gray-400 dark:text-gray-500 mb-3"></i>
+                    <p class="text-sm text-gray-600 dark:text-gray-300">
+                        <span class="font-semibold text-journal-gold">Click to upload</span> or drag and drop
+                    </p>
+                    <p class="text-xs text-gray-500 dark:text-gray-400 mt-1">
+                        FASTA files (.fa, .fasta, .fna, .txt)
+                    </p>
+                    <input type="file" id="sequence_file" class="hidden" accept=".fa,.fasta,.fna,.txt">
+                </label>
+
+                <!-- Job Notes -->
+                <div>
+                    <label for="job_notes" class="block text-sm font-medium text-gray-700 dark:text-gray-200 mb-2">
+                        Job Name / Notes
+                    </label>
+                    <input type="text" id="job_notes" class="w-full px-4 py-3 border border-gray-300 dark:border-journal-dark rounded-lg
+                                  bg-white dark:bg-journal-dark text-gray-900 dark:text-gray-100
+                                  focus:ring-2 focus:ring-journal-gold focus:border-transparent transition-all"
+                        placeholder="e.g. Fungal ITS Analysis">
+                </div>
+
+                <!-- Hidden Add Button for File -->
+                <button id="add_file_btn" class="hidden btn btn-outline-gold w-full">
+                    <i class="fas fa-plus mr-2"></i> Add Sequences from File
+                </button>
             </div>
         </div>
 
@@ -1652,6 +1779,116 @@
 
 {% block scripts %}
 <script>
+    // =========================================================================
+    // Import source accordions
+    //
+    // Alan 9/12/26 - The four database import cards (iNaturalist, Mushroom
+    // Observer, MycoMap, BLAST) collapse so the queue and the tree options are
+    // not pushed a full screen down, and so they are not stacked above the queue
+    // on mobile. They are accordions and not tabs on purpose: the sources are
+    // additive, a session routinely draws on several, and a tab would hide a
+    // panel that still owns rows in the queue.
+    //
+    // Nothing here changes a handler or an id -- the panels are the original
+    // cards' contents, only wrapped. A collapsed panel is [hidden], so every
+    // existing getElementById().value read still works unchanged.
+    // =========================================================================
+    (function setupImportAccordions() {
+        const STORAGE_KEY = 'dikarya.treeBuilder.openImportSections';
+        const sections = Array.from(document.querySelectorAll('.import-accordion'));
+        if (sections.length === 0) return;
+
+        function byName(name) {
+            return sections.find(el => el.dataset.importSection === name) || null;
+        }
+
+        function readRemembered() {
+            try {
+                const parsed = JSON.parse(window.localStorage.getItem(STORAGE_KEY));
+                return Array.isArray(parsed) ? parsed : [];
+            } catch (err) {
+                return [];
+            }
+        }
+
+        function remember() {
+            // A private-mode or quota failure must never break the page.
+            try {
+                const open = sections
+                    .filter(el => el.classList.contains('is-open'))
+                    .map(el => el.dataset.importSection);
+                window.localStorage.setItem(STORAGE_KEY, JSON.stringify(open));
+            } catch (err) { /* non-fatal */ }
+        }
+
+        function setOpen(section, open, persist) {
+            if (!section) return;
+            const toggle = section.querySelector('.import-accordion-toggle');
+            const panel = section.querySelector('.import-accordion-panel');
+            if (!toggle || !panel) return;
+            section.classList.toggle('is-open', open);
+            toggle.setAttribute('aria-expanded', open ? 'true' : 'false');
+            panel.hidden = !open;
+            if (persist !== false) remember();
+        }
+
+        // Exposed so any later import flow can reveal its own panel.
+        window.openImportSection = function (name) {
+            setOpen(byName(name), true);
+        };
+
+        sections.forEach(section => {
+            const toggle = section.querySelector('.import-accordion-toggle');
+            if (!toggle) return;
+            toggle.addEventListener('click', () => {
+                setOpen(section, !section.classList.contains('is-open'));
+            });
+        });
+
+        // Restore the sections this browser last used.
+        readRemembered().forEach(name => setOpen(byName(name), true, false));
+
+        // A section holding typed input must never stay hidden -- this covers
+        // back-navigation and Firefox's form restore, which repopulate fields
+        // without firing any event we listen for.
+        sections.forEach(section => {
+            const filled = Array.from(section.querySelectorAll('input, textarea'))
+                .some(el => (el.type === 'text' || el.type === 'url' || el.tagName === 'TEXTAREA')
+                    && el.value.trim() !== '');
+            if (filled) setOpen(section, true, false);
+        });
+
+        // A result panel that reveals itself while its section is collapsed
+        // means an import finished -- open the section so the summary and its
+        // action buttons are reachable.
+        sections.forEach(section => {
+            const results = section.querySelectorAll('[id$="_results"], [id$="_tree_preview"]');
+            if (results.length === 0) return;
+            const observer = new MutationObserver(records => {
+                records.forEach(record => {
+                    if (record.target.classList.contains('hidden')) return;
+                    if (!section.classList.contains('is-open')) setOpen(section, true);
+                });
+            });
+            results.forEach(el => observer.observe(el, { attributes: true, attributeFilter: ['class'] }));
+        });
+
+        // Focus moved into a collapsed panel (a script calling .focus(), a
+        // deep link) opens it rather than leaving the caret somewhere unseen.
+        //
+        // Alan 9/12/26 - This must match the PANEL, not the whole section. The
+        // header button lives in the section too, so matching the section made
+        // the first click on a closed header fire focusin (open) and then click
+        // (toggle shut) -- it flashed open and closed, and only worked on the
+        // second click once the button already held focus.
+        document.addEventListener('focusin', event => {
+            const panel = event.target.closest && event.target.closest('.import-accordion-panel');
+            if (!panel) return;
+            const section = panel.closest('.import-accordion');
+            if (section && !section.classList.contains('is-open')) setOpen(section, true);
+        });
+    })();
+
     // =========================================================================
     // Workflow failure telemetry
     //
