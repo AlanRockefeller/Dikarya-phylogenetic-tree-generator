@@ -547,7 +547,66 @@ journal, including sshd auth records). Use these instead, in this order:
 | Per-job pipeline detail | `var/jobs/<id>/logs/{pipeline,alignment,tree_builder}.log` | yes |
 | Gunicorn access/errors | `var/logs/{access,error}.log` | yes |
 | Worker app output | `var/logs/worker.log` (phylo_high), `var/logs/worker-bulk.log` (phylo_bulk) | yes |
+| Internet-wide scanner sweeps | `var/logs/scanner.log` | yes |
 | Unit lifecycle, OOM kills, start failures | journal, via the wrapper below | wrapper only |
+
+**Nothing in `var/logs/` is deleted any more.** `ops/logrotate/dikarya` used to
+say `rotate 14` with `maxage 30`, and `rotate 14` was what actually bound: every
+stem kept 14 rotations plus the live file, which came to 13 days rather than the
+30 the `maxage` implied, because `maxsize 25M` makes a busy day rotate twice and
+burn two slots. Thirteen days of *all* of these logs was 3.2 MB compressed
+against a 5.3 GB `var/jobs`, so the retention bought nothing and cost history --
+`errors.log` alone is 2.8 KB/day, about 1 MB/year. `rotate` is now set past any
+reachable value and `maxage` is gone. `var/metrics/system_metrics.jsonl` still
+ages out at 30 days on purpose: it is machine telemetry nothing reads back, not
+a record of what happened.
+
+### Scanner noise vs probes aimed at this app
+
+About two thirds of this host's requests are 4xx, and nearly all of that is
+internet-wide vulnerability sweeps. `app/services/security_events.py` splits
+them, and `classify_request_failure()` is the single place that decides:
+
+- **scanner** -- a probe for software this host does not run (`/.env`,
+  `/.git/config`, `/wp-admin/...`, a `PROPFIND`). Written to `var/logs/scanner.log`
+  as `event=security.scanner` on the `dikarya.scanner` logger, which has
+  `propagate = False` so this volume can never reach `errors.log` or the worker
+  console. Kept rather than dropped: a sweep is evidence when the same IP later
+  does something targeted.
+- **targeted** -- someone mapping *this* application: path traversal, a null
+  byte, an injection marker, a malformed job id, or an unmatched path under
+  `/api/` or `/admin/`. Logged at WARNING as `event=security.suspicious`, so it
+  lands in `errors.log`. Find them with
+  `grep security.suspicious var/logs/errors.log`, or read the digest's
+  "App-targeted probes" section.
+- **neither** -- an ordinary user 4xx keeps its existing
+  `event=http.request_failed` line, unchanged.
+
+Three rules when editing this:
+
+- **A plain 401/403 on a real route is not a targeted signal.** It is almost
+  always an ordinary authorization outcome, and an earlier version that treated
+  it as one also *replaced* the normal `http.request_failed` record, so its
+  developer reason code (`scope_required`, `csrf_token_missing`) never reached
+  any log. The security record only ever adds; it must never short-circuit the
+  ordinary diagnostics for a matched route.
+- **A valid-shaped job id that 404s is not a probe.** Ids are short and
+  guessable by design (see the job-id conventions above); only an id
+  `validate_job_id()` refuses is worth reporting.
+- **The query string is classified but never logged.** It carries sequence text
+  and search terms. Only `request.path` is written, scrubbed of control
+  characters so an attacker-controlled path cannot inject a log line.
+
+The scanner path lists live in `security_events.py` and
+`scripts/dikarya_log_digest.py` imports them, so the digest's idea of noise and
+the app's cannot drift. The module is deliberately free of Flask imports to keep
+that import safe.
+
+**RQ's `cleaning registries for queue` heartbeat is filtered out** in
+`install_rq_logging()`. It was 400 of 834 lines in `worker.log` -- 48% of the
+file -- said only that the worker was alive, and dragged the digest's worker
+context coverage down to 60% because RQ's own records carry no job id. A real
+maintenance failure logs at WARNING and is unaffected.
 
 **Start with `errors.log`, not `error.log`.** Despite its name, `error.log` is
 Gunicorn's combined stream and runs ~98% INFO — real failures are buried in it.

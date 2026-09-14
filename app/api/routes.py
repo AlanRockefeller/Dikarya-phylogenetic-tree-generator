@@ -21,6 +21,7 @@ from datetime import datetime
 
 from app.services.security_utils import validate_job_id, validate_safe_file_path, coerce_bool
 from app.services.job_id_service import generate_job_id
+from app.services.fasta_utils import GENBANK_ACCESSION_RE, is_genbank_accession
 from app.services.tree_parameter_validation import (
     normalize_inherited_iqtree_ufboot_count,
     validate_iqtree_ufboot_count,
@@ -136,49 +137,12 @@ def client_log():
 # BLAST API Endpoint
 # =============================================================================
 
-# INSDC nucleotide accessions come in a small number of fixed shapes, and the
-# previous catch-all (1-6 letters + 5-9 digits) was loose enough to accept
-# things that are not accessions at all: an iNaturalist observation id pasted
-# into the accession box ("INAT125467754", 4 letters + 9 digits) matched, was
-# sent to NCBI, and came back as an opaque 400 that took the rest of its batch
-# down with it. Matching the real shapes rejects it here, by name, instead.
-#
-#   1 letter  + 5 digits            e.g. U49845
-#   2 letters + 6 digits            e.g. OR807397, AF123456
-#   2 letters + 8 digits            e.g. KY12345678
-#   RefSeq: 2 letters + '_' + 6, 8 or 9 digits   e.g. NC_012345, NM_001234567
-#   WGS: 4 letters + 2-digit assembly version + 6 or 8 contig digits, so
-#        exactly 4+8 or 4+10 e.g. AAAA01000001. Notably never 4+9, which is
-#        what keeps the observed iNaturalist id from matching this arm.
-#   WGS (6-letter prefix): 6 letters + 2-digit assembly version + 7 or 9
-#        contig digits e.g. AAAAAA010000001. No iNaturalist id has ever had
-#        six leading letters, so this arm costs nothing to allow -- and
-#        without it a perfectly ordinary INSDC accession was rejected as "not
-#        an accession" before any NCBI call.
-#
-# A 4+8 id is genuinely ambiguous -- "INAT12546775" is shape-identical to a
-# real WGS accession, and no pattern can separate them. That case still reaches
-# NCBI, which is why _fetch_genbank_xml_batch also isolates a failing accession
-# rather than letting it void its whole batch.
-_GENBANK_ACCESSION_RE = re.compile(
-    r'^(?:'
-    r'[A-Z]\d{5}'
-    r'|[A-Z]{2}\d{6}'
-    r'|[A-Z]{2}\d{8}'
-    r'|[A-Z]{2}_\d{6}'
-    r'|[A-Z]{2}_\d{8,9}'
-    r'|[A-Z]{4}\d{8}'
-    r'|[A-Z]{4}\d{10}'
-    r'|[A-Z]{6}\d{9}'
-    r'|[A-Z]{6}\d{11}'
-    r')(?:\.\d+)?$',
-    re.IGNORECASE,
-)
-
-
-def _is_genbank_accession(text):
-    """Check if text looks like a GenBank accession number."""
-    return bool(_GENBANK_ACCESSION_RE.match((text or "").strip()))
+# The accession shape check lives in app/services/fasta_utils.py so services can
+# use it without importing this route module; see the comment there for why the
+# INSDC shapes are enumerated rather than matched loosely. Re-exported under the
+# old private names because callers (including app/api_v1/routes.py) import them.
+_GENBANK_ACCESSION_RE = GENBANK_ACCESSION_RE
+_is_genbank_accession = is_genbank_accession
 
 
 MAX_CUSTOM_GENBANK_ACCESSIONS = 200
@@ -1045,6 +1009,23 @@ def _make_unique_id(base_id, used_ids):
     new_id = f"{base_id}_added{i}"
     used_ids.add(new_id)
     return new_id
+
+def _restore_merged_labels(sequence_text, merged_labels):
+    """Rewrite FASTA headers that dedup merged back to their original labels.
+
+    Header lines only: a mapping is applied to the exact header text dedup
+    wrote, so a header the user has since edited is left alone rather than
+    guessed at.
+    """
+    lines = []
+    for line in str(sequence_text or "").split("\n"):
+        if line.startswith(">"):
+            original = merged_labels.get(line[1:].strip())
+            if original:
+                line = f">{original}"
+        lines.append(line)
+    return "\n".join(lines)
+
 
 def _parse_fasta_sequences(text):
     """Parse FASTA text into list of {name, sequence} dicts.
@@ -3581,6 +3562,29 @@ def rebuild_with_duplicates(job_id):
             }), 400
 
         job_params = dict(source_params)
+
+        # A surviving tip may have been relabelled to carry the identifier of
+        # the record collapsed into it ("PX860295 iNat280384724 ..."). Once that
+        # record is back in the tree as its own tip, the merged label is wrong,
+        # so put the original one back before reassembling.
+        merged_labels = duplicates.get("merged_labels") or {}
+        if isinstance(merged_labels, dict) and merged_labels:
+            job_params["sequence"] = _restore_merged_labels(
+                str(job_params.get("sequence") or ""), merged_labels
+            )
+            restored_metadata_rows = []
+            for item in (job_params.get("sequence_metadata") or []):
+                item = dict(item)
+                original = merged_labels.get(
+                    str(item.get("fasta_header") or item.get("name") or "").strip()
+                )
+                if original:
+                    item["name"] = original
+                    item["fasta_header"] = original
+                    item.pop("merged_observation_label", None)
+                restored_metadata_rows.append(item)
+            job_params["sequence_metadata"] = restored_metadata_rows
+
         # Append the removed records back onto the FASTA payload.
         sequence_text = str(job_params.get("sequence") or "").rstrip("\n")
         blocks = [sequence_text] if sequence_text else []

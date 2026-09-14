@@ -1319,14 +1319,39 @@ def run_phylo_job(job_params: dict) -> dict:
                     publish_job_queued(job_id)
                     # Same as the refresh task: mark the wait so the resumed
                     # job.started is not counted as a failure retry.
+                    # RQ counts retries cumulatively on the job itself
+                    # (handle_job_retry compares job.number_of_retries against
+                    # Retry.max), so the budget really does deplete even though
+                    # every deferral returns a fresh Retry with the same max.
+                    # Report the position in that budget rather than the bare
+                    # maximum, which read as a never-decreasing "attempts_left".
+                    retries_done = (getattr(job, "number_of_retries", None) or 0) if job else 0
                     logger.info(
                         "event=job.deferred Waiting for MycoMap NCBI results "
-                        "reason=mycomap_ncbi_rerun resume_in_seconds=%s attempts_left=%s",
-                        wait_seconds, max_retry_attempts,
+                        "reason=mycomap_ncbi_rerun resume_in_seconds=%s "
+                        "attempt=%s/%s attempts_remaining=%s",
+                        wait_seconds, retries_done + 1, max_retry_attempts,
+                        max(max_retry_attempts - retries_done, 0),
                     )
                     return Retry(max=max_retry_attempts, interval=wait_seconds)
 
                 job_params = prepared["job_params"]
+                # The iNaturalist and Mushroom Observer flows assemble their
+                # sequences here, in the worker, so the observation dedup that
+                # prepare_phylo_job_params() runs at submit time saw an empty
+                # payload and did nothing. These are exactly the jobs that mix a
+                # MycoMap local hit with the GenBank deposit of the same
+                # collection, so without this the one flow most likely to
+                # produce duplicate tips was the one flow that never deduped.
+                from app.services.sequence_dedup_service import apply_observation_dedup
+
+                removed_duplicates = apply_observation_dedup(job_params)
+                if removed_duplicates:
+                    logger.info(
+                        "Observation dedup collapsed %d duplicate record(s) from "
+                        "the prepared %s import.",
+                        removed_duplicates, tree_preparation_kind or "source",
+                    )
                 _save_job_params(input_info_path, job_params)
 
                 db_job = Job.query.get(job_id)

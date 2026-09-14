@@ -59,95 +59,83 @@
     }
 
     .tree-card > h3 > i,
-    .import-accordion-toggle > h3 > i,
     .tree-modal h3 > i {
         display: none;
     }
 
-    .tree-card > h3,
-    .import-accordion-toggle > h3 {
+    .tree-card > h3 {
         color: #f7faf8;
         font-size: 28px;
         line-height: 1.1;
     }
 
-    /* Alan 9/12/26 - Collapsible database import sources. The four source cards
-       are additive rather than exclusive, so each opens independently; tabs
-       would have hidden a card that still owns sequences in the queue. */
-    .import-source-group {
+    /* Alan 9/12/26 - Segmented source selector for the single Add Sequences
+       box. Six sources share one card; only the selected panel is shown. */
+    .source-segmented {
+        background: rgba(0, 0, 0, .18);
+        border: 1px solid var(--line);
+        border-radius: 6px;
         display: flex;
-        flex-direction: column;
-        gap: 12px;
-    }
-
-    .import-source-group-header {
-        display: flex;
-        align-items: baseline;
         flex-wrap: wrap;
-        gap: 4px 10px;
-        padding: 0 2px;
+        gap: 2px;
+        margin-bottom: 20px;
+        padding: 3px;
     }
 
-    .import-source-group-title {
-        color: #f7faf8;
-        font-family: var(--sans);
-        font-size: 13px;
-        font-weight: 600;
-        letter-spacing: .08em;
-        text-transform: uppercase;
-    }
-
-    .import-source-group-hint {
-        color: var(--text-mute);
-        font-family: var(--sans);
-        font-size: 12px;
-    }
-
-    .import-accordion-toggle {
+    .source-segment {
         align-items: center;
         background: none;
         border: 0;
+        border-radius: 4px;
+        color: var(--text-mute);
         cursor: pointer;
         display: flex;
-        gap: 12px;
-        justify-content: space-between;
-        padding: 18px 24px;
-        text-align: left;
-        transition: background-color .15s ease;
-        width: 100%;
+        flex: 1 1 auto;
+        font-family: var(--sans);
+        font-size: 13px;
+        font-weight: 600;
+        gap: 7px;
+        justify-content: center;
+        padding: 9px 12px;
+        transition: background-color .15s ease, color .15s ease;
+        white-space: nowrap;
     }
 
-    .import-accordion-toggle:hover {
-        background: rgba(255, 239, 194, .05);
+    .source-segment > i {
+        font-size: 12px;
+        opacity: .85;
     }
 
-    .import-accordion-toggle:focus-visible {
+    .source-segment:hover {
+        color: var(--text);
+    }
+
+    .source-segment:focus-visible {
         outline: 2px solid var(--journal-gold);
         outline-offset: -2px;
     }
 
-    .import-accordion-toggle > h3 {
-        font-size: 22px;
-        margin: 0;
+    .source-segment[aria-selected="true"] {
+        background: linear-gradient(180deg, #2c4a36 0%, #243d2d 100%);
+        box-shadow: inset 0 1px 0 rgba(255, 239, 194, .08);
+        color: #f7faf8;
     }
 
-    .import-accordion-chevron {
-        color: var(--journal-gold);
-        flex: none;
-        font-size: 14px;
-        transition: transform .18s ease;
-    }
-
-    .import-accordion.is-open .import-accordion-chevron {
-        transform: rotate(180deg);
-    }
-
-    .import-accordion-panel {
-        padding: 0 24px 24px;
-    }
-
-    .import-accordion-panel[hidden] {
+    .source-panel[hidden] {
         display: none;
+    }
+
+    /* Below the icon+label pair stops fitting on one row; drop the icons and
+       let the labels wrap to two rows rather than shrinking the hit targets. */
+    @media (max-width: 640px) {
+        .source-segment {
+            flex: 1 1 33%;
+            padding: 9px 8px;
+        }
+
+        .source-segment > i {
+            display: none;
+        }
     }
 
     .eyebrow {
@@ -610,17 +598,18 @@
             0 1px 2px rgba(26, 47, 35, .04);
     }
 
-    html:not(.dark) .tree-builder-page .tree-card > h3,
-    html:not(.dark) .tree-builder-page .import-accordion-toggle > h3 {
+    html:not(.dark) .tree-builder-page .tree-card > h3 {
         color: #1a2f23;
     }
 
-    html:not(.dark) .tree-builder-page .import-source-group-title {
-        color: #1a2f23;
+    html:not(.dark) .tree-builder-page .source-segmented {
+        background: rgba(26, 47, 35, .05);
     }
 
-    html:not(.dark) .tree-builder-page .import-accordion-toggle:hover {
-        background: rgba(26, 47, 35, .04);
+    html:not(.dark) .tree-builder-page .source-segment[aria-selected="true"] {
+        background: #ffffff;
+        box-shadow: 0 1px 2px rgba(26, 47, 35, .14);
+        color: #1a2f23;
     }
 
     html:not(.dark) .tree-builder-page input[type="url"],
@@ -680,26 +669,53 @@
     <!-- Left Section: 2 columns -->
     <div class="lg:col-span-2 space-y-6">
 
-        <!-- Collapsible database import sources. Alan 9/12/26 - the four source
-             cards below are additive, not exclusive, so they collapse independently
-             rather than becoming tabs; see openImportSection() for auto-expansion. -->
-        <div class="import-source-group" id="import_source_group">
-            <div class="import-source-group-header">
-                <span class="import-source-group-title">Import</span>
-                <span class="import-source-group-hint">iNaturalist &middot; Mushroom Observer &middot; MycoMap &middot; BLAST</span>
+        <!-- Alan 9/12/26 - One "Add Sequences" box with a segmented source
+             selector, replacing six stacked cards. Each panel below holds its
+             original card contents verbatim, so every id and handler is
+             unchanged; only the selected panel is shown. The sources stay
+             additive -- switching a segment hides a fetch summary but never
+             touches the queue, which is the durable state. -->
+        <div class="tree-card p-6 transition-colors" id="add_sequences_card">
+            <h3 class="text-xl font-semibold text-journal-dark dark:text-gray-100 mb-4 flex items-center">
+                <i class="fas fa-plus-circle text-journal-gold mr-2"></i>
+                Add Sequences
+            </h3>
+
+            <div class="source-segmented" id="source_segmented" role="tablist" aria-label="Sequence source">
+                <button type="button" class="source-segment" role="tab" tabindex="0"
+                        id="source_tab_inaturalist" data-source-segment="inaturalist"
+                        aria-controls="source_panel_inaturalist" aria-selected="true">
+                    <i class="fas fa-leaf" aria-hidden="true"></i><span>iNaturalist</span>
+                </button>
+                <button type="button" class="source-segment" role="tab" tabindex="-1"
+                        id="source_tab_mycomap" data-source-segment="mycomap"
+                        aria-controls="source_panel_mycomap" aria-selected="false">
+                    <i class="fas fa-link" aria-hidden="true"></i><span>MycoMap</span>
+                </button>
+                <button type="button" class="source-segment" role="tab" tabindex="-1"
+                        id="source_tab_paste" data-source-segment="paste"
+                        aria-controls="source_panel_paste" aria-selected="false">
+                    <i class="fas fa-edit" aria-hidden="true"></i><span>Paste</span>
+                </button>
+                <button type="button" class="source-segment" role="tab" tabindex="-1"
+                        id="source_tab_upload" data-source-segment="upload"
+                        aria-controls="source_panel_upload" aria-selected="false">
+                    <i class="fas fa-file-upload" aria-hidden="true"></i><span>Upload</span>
+                </button>
+                <button type="button" class="source-segment" role="tab" tabindex="-1"
+                        id="source_tab_blast" data-source-segment="blast"
+                        aria-controls="source_panel_blast" aria-selected="false">
+                    <i class="fas fa-search" aria-hidden="true"></i><span>BLAST</span>
+                </button>
+                <button type="button" class="source-segment" role="tab" tabindex="-1"
+                        id="source_tab_mushroom_observer" data-source-segment="mushroom_observer"
+                        aria-controls="source_panel_mushroom_observer" aria-selected="false">
+                    <i class="fas fa-binoculars" aria-hidden="true"></i><span>Mushroom Observer</span>
+                </button>
             </div>
-        <!-- 1. iNaturalist URL Card -->
-        <div class="tree-card import-accordion transition-colors" data-import-section="inaturalist">
-            <button type="button" class="import-accordion-toggle" id="import_toggle_inaturalist"
-                    aria-expanded="false" aria-controls="import_panel_inaturalist">
-                <h3 class="text-xl font-semibold text-journal-dark dark:text-gray-100 flex items-center">
-                    <i class="fas fa-leaf text-journal-gold mr-2"></i>
-                    Import from iNaturalist
-                </h3>
-                <i class="fas fa-chevron-down import-accordion-chevron" aria-hidden="true"></i>
-            </button>
-            <div class="import-accordion-panel" id="import_panel_inaturalist" role="region"
-                 aria-labelledby="import_toggle_inaturalist" hidden>
+
+            <div class="source-panel" id="source_panel_inaturalist" role="tabpanel"
+                 aria-labelledby="source_tab_inaturalist" data-source-panel="inaturalist">
 
             <div class="space-y-4">
                 <div>
@@ -841,20 +857,219 @@
                 </div>
             </div>
             </div>
-        </div>
 
-        <!-- 2. Mushroom Observer Card -->
-        <div class="tree-card import-accordion transition-colors" data-import-section="mushroom_observer">
-            <button type="button" class="import-accordion-toggle" id="import_toggle_mushroom_observer"
-                    aria-expanded="false" aria-controls="import_panel_mushroom_observer">
-                <h3 class="text-xl font-semibold text-journal-dark dark:text-gray-100 flex items-center">
-                    <i class="fas fa-binoculars text-journal-gold mr-2"></i>
-                    Import from Mushroom Observer
-                </h3>
-                <i class="fas fa-chevron-down import-accordion-chevron" aria-hidden="true"></i>
-            </button>
-            <div class="import-accordion-panel" id="import_panel_mushroom_observer" role="region"
-                 aria-labelledby="import_toggle_mushroom_observer" hidden>
+            <div class="source-panel" id="source_panel_mycomap" role="tabpanel"
+                 aria-labelledby="source_tab_mycomap" data-source-panel="mycomap" hidden>
+
+            <div class="space-y-4">
+                <div>
+                    <label for="mycomap_url" class="block text-sm font-medium text-gray-700 dark:text-gray-200 mb-2">
+                        Mycomap BLAST Results URL
+                    </label>
+                    <input type="url" id="mycomap_url" class="w-full px-4 py-3 border border-gray-300 dark:border-journal-dark rounded-lg
+                                  bg-white dark:bg-journal-dark text-gray-900 dark:text-gray-100
+                                  focus:ring-2 focus:ring-journal-gold focus:border-transparent transition-all"
+                        placeholder="https://mycomap.com/...r12345...">
+                    <p class="text-xs text-gray-500 dark:text-gray-400 mt-1">
+                        Paste a Mycomap BLAST result URL to import sequences.
+                    </p>
+                </div>
+
+                <!-- Checkboxes -->
+                <div class="flex flex-wrap gap-4">
+                    <label class="flex items-center space-x-2 cursor-pointer">
+                        <input type="checkbox" id="mycomap_ncbi" checked class="w-4 h-4 text-journal-gold bg-gray-100 border-gray-300 rounded
+                                      focus:ring-journal-gold dark:bg-journal-dark dark:border-gray-600">
+                        <span class="text-sm text-gray-700 dark:text-gray-200">NCBI Results</span>
+                    </label>
+                    <label class="flex items-center space-x-2 cursor-pointer">
+                        <input type="checkbox" id="mycomap_local" checked class="w-4 h-4 text-journal-gold bg-gray-100 border-gray-300 rounded
+                                      focus:ring-journal-gold dark:bg-journal-dark dark:border-gray-600">
+                        <span class="text-sm text-gray-700 dark:text-gray-200">Local Results</span>
+                    </label>
+                    <label class="flex items-center space-x-2 cursor-pointer">
+                        <input type="checkbox" id="mycomap_dedup" checked class="w-4 h-4 text-journal-gold bg-gray-100 border-gray-300 rounded
+                                      focus:ring-journal-gold dark:bg-journal-dark dark:border-gray-600">
+                        <span class="text-sm text-gray-700 dark:text-gray-200">Remove Duplicates</span>
+                    </label>
+                    <label class="flex items-center space-x-2 cursor-pointer" title="Exclude local FASTA records that contradict the MycoMap BLAST table.">
+                        <input type="checkbox" id="mycomap_filter_conflicting_local" class="w-4 h-4 text-journal-gold bg-gray-100 border-gray-300 rounded
+                                      focus:ring-journal-gold dark:bg-journal-dark dark:border-gray-600">
+                        <span class="text-sm text-gray-700 dark:text-gray-200">Filter Conflicting Local FASTA</span>
+                    </label>
+                    <label id="mycomap_allow_identical_locations_option" class="flex items-center space-x-2 cursor-pointer opacity-50" title="Keep exact matching sequences when their known locations differ.">
+                        <input type="checkbox" id="mycomap_allow_identical_locations" checked disabled class="w-4 h-4 text-journal-gold bg-gray-100 border-gray-300 rounded
+                                      focus:ring-journal-gold dark:bg-journal-dark dark:border-gray-600">
+                        <span class="text-sm text-gray-700 dark:text-gray-200">Keep Exact Matches at Different Locations</span>
+                    </label>
+                </div>
+
+                <!-- Fetch / One-Click Tree Buttons -->
+                <div class="flex gap-3">
+                    <button id="fetch_mycomap_btn" data-active-style="outline" class="btn flex-1">
+                        <i class="fas fa-download mr-2"></i> Fetch sequences only
+                    </button>
+                    <button id="mycomap_quick_tree_btn" data-active-style="primary" class="btn flex-1">
+                        <i class="fas fa-magic mr-2"></i> One-Click Tree
+                    </button>
+                </div>
+            </div>
+            </div>
+
+            <div class="source-panel" id="source_panel_paste" role="tabpanel"
+                 aria-labelledby="source_tab_paste" data-source-panel="paste" hidden>
+
+            <div class="space-y-4">
+                <div>
+                    <label for="sequence_text" class="block text-sm font-medium text-gray-700 dark:text-gray-200 mb-2">
+                        Paste FASTA Sequences or GenBank Accessions
+                    </label>
+                    <div class="sequence-input-box" data-sequence-input-box="sequence_text">
+                        <div class="sequence-input-toolbar">
+                            <div class="input-chip-group">
+                                <button type="button" class="input-chip is-active" data-input-chip="sequence_text" data-chip-mode="fasta">FASTA</button>
+                                <button type="button" class="input-chip" data-input-chip="sequence_text" data-chip-mode="accessions">Accessions</button>
+                            </div>
+                            <span id="sequence_text_counter" class="detected-counter">0 sequences detected</span>
+                        </div>
+                        <textarea id="sequence_text" rows="8" class="sequence-textarea"
+                            placeholder="Paste a FASTA record or a list of accession numbers…"></textarea>
+                        <div class="sequence-input-footer">
+                            <span>UTF-8 · plain text</span>
+                            <button type="button" class="paste-example-link" data-paste-example="sequence_text">↳ Paste example</button>
+                        </div>
+                    </div>
+                    <!-- Alan 8/10/26 - Offer GenBank collection locations only once the input actually contains accessions. -->
+                    <div class="flex flex-wrap items-center justify-between gap-x-4 gap-y-2 mt-2">
+                        <p class="field-help text-xs">
+                            Enter FASTA sequences or one or more GenBank accessions.
+                            Works best with barcode markers (ITS, LSU, RPB2) up to about
+                            50,000&nbsp;bp each &mdash; for whole-genome or long-read
+                            contigs, use the &ldquo;ITS Region&rdquo; setting below to
+                            extract the barcode region first.
+                        </p>
+                        <div id="genbank_location_option" class="hidden">
+                            <label class="inline-flex items-center space-x-2 cursor-pointer"
+                                title="Look up each accession on GenBank and append its collection location to the FASTA header.">
+                                <input type="checkbox" id="genbank_add_locations" class="w-4 h-4 text-journal-gold bg-gray-100 border-gray-300 rounded
+                                              focus:ring-journal-gold dark:bg-journal-dark dark:border-gray-600">
+                                <span class="text-xs text-gray-700 dark:text-gray-200">Add locations to FASTA headers</span>
+                            </label>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Action Buttons for Input -->
+                <div class="flex flex-wrap gap-3">
+                    <button id="add_sequences_btn" data-active-style="outline"
+                        class="btn flex-1 min-w-[140px]" disabled>
+                        <i class="fas fa-plus mr-2"></i> Add / Remove Sequences
+                    </button>
+                    <!-- BLAST button removed from here -->
+                </div>
+            </div>
+            </div>
+
+            <div class="source-panel" id="source_panel_upload" role="tabpanel"
+                 aria-labelledby="source_tab_upload" data-source-panel="upload" hidden>
+
+            <div class="space-y-4">
+                <label for="sequence_file" class="upload-dropzone block w-full border-2 border-dashed border-gray-300 dark:border-gray-600
+                              rounded-lg p-8 text-center cursor-pointer
+                              hover:border-journal-gold dark:hover:border-journal-gold
+                              transition-colors bg-gray-50 dark:bg-journal-dark">
+                    <i class="fas fa-cloud-upload-alt text-4xl text-gray-400 dark:text-gray-500 mb-3"></i>
+                    <p class="text-sm text-gray-600 dark:text-gray-300">
+                        <span class="font-semibold text-journal-gold">Click to upload</span> or drag and drop
+                    </p>
+                    <p class="text-xs text-gray-500 dark:text-gray-400 mt-1">
+                        FASTA files (.fa, .fasta, .fna, .txt)
+                    </p>
+                    <input type="file" id="sequence_file" class="hidden" accept=".fa,.fasta,.fna,.txt">
+                </label>
+
+                <!-- Job Notes -->
+                <div>
+                    <label for="job_notes" class="block text-sm font-medium text-gray-700 dark:text-gray-200 mb-2">
+                        Job Name / Notes
+                    </label>
+                    <input type="text" id="job_notes" class="w-full px-4 py-3 border border-gray-300 dark:border-journal-dark rounded-lg
+                                  bg-white dark:bg-journal-dark text-gray-900 dark:text-gray-100
+                                  focus:ring-2 focus:ring-journal-gold focus:border-transparent transition-all"
+                        placeholder="e.g. Fungal ITS Analysis">
+                </div>
+
+                <!-- Hidden Add Button for File -->
+                <button id="add_file_btn" class="hidden btn btn-outline-gold w-full">
+                    <i class="fas fa-plus mr-2"></i> Add Sequences from File
+                </button>
+            </div>
+            </div>
+
+            <div class="source-panel" id="source_panel_blast" role="tabpanel"
+                 aria-labelledby="source_tab_blast" data-source-panel="blast" hidden>
+
+            <div class="space-y-4">
+                <div>
+                    <label for="blast_query" class="block text-sm font-medium text-gray-700 dark:text-gray-200 mb-2">
+                        Enter Single Sequence or Accession
+                    </label>
+                    <div class="sequence-input-box" data-sequence-input-box="blast_query">
+                        <div class="sequence-input-toolbar">
+                            <div class="input-chip-group">
+                                <button type="button" class="input-chip is-active" data-input-chip="blast_query" data-chip-mode="fasta">FASTA</button>
+                                <button type="button" class="input-chip" data-input-chip="blast_query" data-chip-mode="accessions">Accessions</button>
+                            </div>
+                            <span id="blast_query_counter" class="detected-counter">0 sequences detected</span>
+                        </div>
+                        <textarea id="blast_query" rows="4" class="sequence-textarea"
+                            placeholder="Paste a FASTA record or a list of accession numbers…"></textarea>
+                        <div class="sequence-input-footer">
+                            <span>UTF-8 · plain text</span>
+                            <button type="button" class="paste-example-link" data-paste-example="blast_query">↳ Paste example</button>
+                        </div>
+                    </div>
+                    <p class="field-help text-xs mt-2">
+                        Find related sequences on NCBI GenBank.
+                    </p>
+                </div>
+
+                <div class="grid grid-cols-2 gap-4">
+                    <div>
+                        <label for="blast_min_identity"
+                            class="block text-sm font-medium text-gray-700 dark:text-gray-200 mb-2">
+                            Min Identity (%)
+                        </label>
+                        <input type="number" id="blast_min_identity" value="90" min="50" max="100"
+                            class="w-full px-4 py-3 border border-gray-300 dark:border-journal-dark rounded-lg
+                                      bg-white dark:bg-journal-dark text-gray-900 dark:text-gray-100 focus:ring-2 focus:ring-journal-gold">
+                    </div>
+                    <div>
+                        <label for="blast_max_sequences"
+                            class="block text-sm font-medium text-gray-700 dark:text-gray-200 mb-2">
+                            Max Results
+                        </label>
+                        <select id="blast_max_sequences"
+                            class="w-full px-4 py-3 border border-gray-300 dark:border-journal-dark rounded-lg
+                                      bg-white dark:bg-journal-dark text-gray-900 dark:text-gray-100 focus:ring-2 focus:ring-journal-gold">
+                            <option value="10">10</option>
+                            <option value="50" selected>50</option>
+                            <option value="100">100</option>
+                            <option value="200">200</option>
+                        </select>
+                    </div>
+                </div>
+
+                <div class="flex flex-wrap gap-3">
+                    <button id="blast_btn" data-active-style="outline" class="btn w-full" disabled>
+                        <i class="fas fa-search mr-2"></i> BLAST Sequence
+                    </button>
+                </div>
+            </div>
+            </div>
+
+            <div class="source-panel" id="source_panel_mushroom_observer" role="tabpanel"
+                 aria-labelledby="source_tab_mushroom_observer" data-source-panel="mushroom_observer" hidden>
 
             <div class="space-y-4">
                 <div>
@@ -926,247 +1141,6 @@
                     </div>
                 </div>
             </div>
-            </div>
-        </div>
-
-        <!-- 3. Mycomap URL Card -->
-        <div class="tree-card import-accordion transition-colors" data-import-section="mycomap">
-            <button type="button" class="import-accordion-toggle" id="import_toggle_mycomap"
-                    aria-expanded="false" aria-controls="import_panel_mycomap">
-                <h3 class="text-xl font-semibold text-journal-dark dark:text-gray-100 flex items-center">
-                    <i class="fas fa-link text-journal-gold mr-2"></i>
-                    Import from Mycomap
-                </h3>
-                <i class="fas fa-chevron-down import-accordion-chevron" aria-hidden="true"></i>
-            </button>
-            <div class="import-accordion-panel" id="import_panel_mycomap" role="region"
-                 aria-labelledby="import_toggle_mycomap" hidden>
-
-            <div class="space-y-4">
-                <div>
-                    <label for="mycomap_url" class="block text-sm font-medium text-gray-700 dark:text-gray-200 mb-2">
-                        Mycomap BLAST Results URL
-                    </label>
-                    <input type="url" id="mycomap_url" class="w-full px-4 py-3 border border-gray-300 dark:border-journal-dark rounded-lg 
-                                  bg-white dark:bg-journal-dark text-gray-900 dark:text-gray-100
-                                  focus:ring-2 focus:ring-journal-gold focus:border-transparent transition-all"
-                        placeholder="https://mycomap.com/...r12345...">
-                    <p class="text-xs text-gray-500 dark:text-gray-400 mt-1">
-                        Paste a Mycomap BLAST result URL to import sequences.
-                    </p>
-                </div>
-
-                <!-- Checkboxes -->
-                <div class="flex flex-wrap gap-4">
-                    <label class="flex items-center space-x-2 cursor-pointer">
-                        <input type="checkbox" id="mycomap_ncbi" checked class="w-4 h-4 text-journal-gold bg-gray-100 border-gray-300 rounded 
-                                      focus:ring-journal-gold dark:bg-journal-dark dark:border-gray-600">
-                        <span class="text-sm text-gray-700 dark:text-gray-200">NCBI Results</span>
-                    </label>
-                    <label class="flex items-center space-x-2 cursor-pointer">
-                        <input type="checkbox" id="mycomap_local" checked class="w-4 h-4 text-journal-gold bg-gray-100 border-gray-300 rounded 
-                                      focus:ring-journal-gold dark:bg-journal-dark dark:border-gray-600">
-                        <span class="text-sm text-gray-700 dark:text-gray-200">Local Results</span>
-                    </label>
-                    <label class="flex items-center space-x-2 cursor-pointer">
-                        <input type="checkbox" id="mycomap_dedup" checked class="w-4 h-4 text-journal-gold bg-gray-100 border-gray-300 rounded 
-                                      focus:ring-journal-gold dark:bg-journal-dark dark:border-gray-600">
-                        <span class="text-sm text-gray-700 dark:text-gray-200">Remove Duplicates</span>
-                    </label>
-                    <label class="flex items-center space-x-2 cursor-pointer" title="Exclude local FASTA records that contradict the MycoMap BLAST table.">
-                        <input type="checkbox" id="mycomap_filter_conflicting_local" class="w-4 h-4 text-journal-gold bg-gray-100 border-gray-300 rounded
-                                      focus:ring-journal-gold dark:bg-journal-dark dark:border-gray-600">
-                        <span class="text-sm text-gray-700 dark:text-gray-200">Filter Conflicting Local FASTA</span>
-                    </label>
-                    <label id="mycomap_allow_identical_locations_option" class="flex items-center space-x-2 cursor-pointer opacity-50" title="Keep exact matching sequences when their known locations differ.">
-                        <input type="checkbox" id="mycomap_allow_identical_locations" checked disabled class="w-4 h-4 text-journal-gold bg-gray-100 border-gray-300 rounded
-                                      focus:ring-journal-gold dark:bg-journal-dark dark:border-gray-600">
-                        <span class="text-sm text-gray-700 dark:text-gray-200">Keep Exact Matches at Different Locations</span>
-                    </label>
-                </div>
-
-                <!-- Fetch / One-Click Tree Buttons -->
-                <div class="flex gap-3">
-                    <button id="fetch_mycomap_btn" data-active-style="outline" class="btn flex-1">
-                        <i class="fas fa-download mr-2"></i> Fetch sequences only
-                    </button>
-                    <button id="mycomap_quick_tree_btn" data-active-style="primary" class="btn flex-1">
-                        <i class="fas fa-magic mr-2"></i> One-Click Tree
-                    </button>
-                </div>
-            </div>
-            </div>
-        </div>
-
-        <!-- 3. BLAST Card -->
-        <div class="tree-card import-accordion transition-colors" data-import-section="blast">
-            <button type="button" class="import-accordion-toggle" id="import_toggle_blast"
-                    aria-expanded="false" aria-controls="import_panel_blast">
-                <h3 class="text-xl font-semibold text-journal-dark dark:text-gray-100 flex items-center">
-                    <i class="fas fa-search text-journal-gold mr-2"></i>
-                    BLAST for Related Sequences
-                </h3>
-                <i class="fas fa-chevron-down import-accordion-chevron" aria-hidden="true"></i>
-            </button>
-            <div class="import-accordion-panel" id="import_panel_blast" role="region"
-                 aria-labelledby="import_toggle_blast" hidden>
-
-            <div class="space-y-4">
-                <div>
-                    <label for="blast_query" class="block text-sm font-medium text-gray-700 dark:text-gray-200 mb-2">
-                        Enter Single Sequence or Accession
-                    </label>
-                    <div class="sequence-input-box" data-sequence-input-box="blast_query">
-                        <div class="sequence-input-toolbar">
-                            <div class="input-chip-group">
-                                <button type="button" class="input-chip is-active" data-input-chip="blast_query" data-chip-mode="fasta">FASTA</button>
-                                <button type="button" class="input-chip" data-input-chip="blast_query" data-chip-mode="accessions">Accessions</button>
-                            </div>
-                            <span id="blast_query_counter" class="detected-counter">0 sequences detected</span>
-                        </div>
-                        <textarea id="blast_query" rows="4" class="sequence-textarea"
-                            placeholder="Paste a FASTA record or a list of accession numbers…"></textarea>
-                        <div class="sequence-input-footer">
-                            <span>UTF-8 · plain text</span>
-                            <button type="button" class="paste-example-link" data-paste-example="blast_query">↳ Paste example</button>
-                        </div>
-                    </div>
-                    <p class="field-help text-xs mt-2">
-                        Find related sequences on NCBI GenBank.
-                    </p>
-                </div>
-
-                <div class="grid grid-cols-2 gap-4">
-                    <div>
-                        <label for="blast_min_identity"
-                            class="block text-sm font-medium text-gray-700 dark:text-gray-200 mb-2">
-                            Min Identity (%)
-                        </label>
-                        <input type="number" id="blast_min_identity" value="90" min="50" max="100"
-                            class="w-full px-4 py-3 border border-gray-300 dark:border-journal-dark rounded-lg 
-                                      bg-white dark:bg-journal-dark text-gray-900 dark:text-gray-100 focus:ring-2 focus:ring-journal-gold">
-                    </div>
-                    <div>
-                        <label for="blast_max_sequences"
-                            class="block text-sm font-medium text-gray-700 dark:text-gray-200 mb-2">
-                            Max Results
-                        </label>
-                        <select id="blast_max_sequences"
-                            class="w-full px-4 py-3 border border-gray-300 dark:border-journal-dark rounded-lg 
-                                      bg-white dark:bg-journal-dark text-gray-900 dark:text-gray-100 focus:ring-2 focus:ring-journal-gold">
-                            <option value="10">10</option>
-                            <option value="50" selected>50</option>
-                            <option value="100">100</option>
-                            <option value="200">200</option>
-                        </select>
-                    </div>
-                </div>
-
-                <div class="flex flex-wrap gap-3">
-                    <button id="blast_btn" data-active-style="outline" class="btn w-full" disabled>
-                        <i class="fas fa-search mr-2"></i> BLAST Sequence
-                    </button>
-                </div>
-            </div>
-            </div>
-        </div>
-        </div>
-
-        <!-- 5. Paste Sequences Card -->
-        <div class="tree-card p-6 transition-colors">
-            <h3 class="text-xl font-semibold text-journal-dark dark:text-gray-100 mb-4 flex items-center">
-                <i class="fas fa-edit text-journal-gold mr-2"></i>
-                Add Custom Sequences
-            </h3>
-
-            <div class="space-y-4">
-                <div>
-                    <label for="sequence_text" class="block text-sm font-medium text-gray-700 dark:text-gray-200 mb-2">
-                        Paste FASTA Sequences or GenBank Accessions
-                    </label>
-                    <div class="sequence-input-box" data-sequence-input-box="sequence_text">
-                        <div class="sequence-input-toolbar">
-                            <div class="input-chip-group">
-                                <button type="button" class="input-chip is-active" data-input-chip="sequence_text" data-chip-mode="fasta">FASTA</button>
-                                <button type="button" class="input-chip" data-input-chip="sequence_text" data-chip-mode="accessions">Accessions</button>
-                            </div>
-                            <span id="sequence_text_counter" class="detected-counter">0 sequences detected</span>
-                        </div>
-                        <textarea id="sequence_text" rows="8" class="sequence-textarea"
-                            placeholder="Paste a FASTA record or a list of accession numbers…"></textarea>
-                        <div class="sequence-input-footer">
-                            <span>UTF-8 · plain text</span>
-                            <button type="button" class="paste-example-link" data-paste-example="sequence_text">↳ Paste example</button>
-                        </div>
-                    </div>
-                    <!-- Alan 8/10/26 - Offer GenBank collection locations only once the input actually contains accessions. -->
-                    <div class="flex flex-wrap items-center justify-between gap-x-4 gap-y-2 mt-2">
-                        <p class="field-help text-xs">
-                            Enter FASTA sequences or one or more GenBank accessions.
-                            Works best with barcode markers (ITS, LSU, RPB2) up to about
-                            50,000&nbsp;bp each &mdash; for whole-genome or long-read
-                            contigs, use the &ldquo;ITS Region&rdquo; setting below to
-                            extract the barcode region first.
-                        </p>
-                        <div id="genbank_location_option" class="hidden">
-                            <label class="inline-flex items-center space-x-2 cursor-pointer"
-                                title="Look up each accession on GenBank and append its collection location to the FASTA header.">
-                                <input type="checkbox" id="genbank_add_locations" class="w-4 h-4 text-journal-gold bg-gray-100 border-gray-300 rounded
-                                              focus:ring-journal-gold dark:bg-journal-dark dark:border-gray-600">
-                                <span class="text-xs text-gray-700 dark:text-gray-200">Add locations to FASTA headers</span>
-                            </label>
-                        </div>
-                    </div>
-                </div>
-
-                <!-- Action Buttons for Input -->
-                <div class="flex flex-wrap gap-3">
-                    <button id="add_sequences_btn" data-active-style="outline"
-                        class="btn flex-1 min-w-[140px]" disabled>
-                        <i class="fas fa-plus mr-2"></i> Add / Remove Sequences
-                    </button>
-                    <!-- BLAST button removed from here -->
-                </div>
-            </div>
-        </div>
-
-        <!-- 4. File Upload Card -->
-        <div class="tree-card p-6 transition-colors">
-            <h3 class="text-xl font-semibold text-journal-dark dark:text-gray-100 mb-4 flex items-center">
-                <i class="fas fa-file-upload text-journal-gold mr-2"></i>
-                Or Upload a File
-            </h3>
-
-            <div class="space-y-4">
-                <label for="sequence_file" class="upload-dropzone block w-full border-2 border-dashed border-gray-300 dark:border-gray-600
-                              rounded-lg p-8 text-center cursor-pointer
-                              hover:border-journal-gold dark:hover:border-journal-gold
-                              transition-colors bg-gray-50 dark:bg-journal-dark">
-                    <i class="fas fa-cloud-upload-alt text-4xl text-gray-400 dark:text-gray-500 mb-3"></i>
-                    <p class="text-sm text-gray-600 dark:text-gray-300">
-                        <span class="font-semibold text-journal-gold">Click to upload</span> or drag and drop
-                    </p>
-                    <p class="text-xs text-gray-500 dark:text-gray-400 mt-1">
-                        FASTA files (.fa, .fasta, .fna, .txt)
-                    </p>
-                    <input type="file" id="sequence_file" class="hidden" accept=".fa,.fasta,.fna,.txt">
-                </label>
-
-                <!-- Job Notes -->
-                <div>
-                    <label for="job_notes" class="block text-sm font-medium text-gray-700 dark:text-gray-200 mb-2">
-                        Job Name / Notes
-                    </label>
-                    <input type="text" id="job_notes" class="w-full px-4 py-3 border border-gray-300 dark:border-journal-dark rounded-lg
-                                  bg-white dark:bg-journal-dark text-gray-900 dark:text-gray-100
-                                  focus:ring-2 focus:ring-journal-gold focus:border-transparent transition-all"
-                        placeholder="e.g. Fungal ITS Analysis">
-                </div>
-
-                <!-- Hidden Add Button for File -->
-                <button id="add_file_btn" class="hidden btn btn-outline-gold w-full">
-                    <i class="fas fa-plus mr-2"></i> Add Sequences from File
-                </button>
             </div>
         </div>
 
@@ -1780,112 +1754,263 @@
 {% block scripts %}
 <script>
     // =========================================================================
-    // Import source accordions
+    // Add Sequences source selector
     //
-    // Alan 9/12/26 - The four database import cards (iNaturalist, Mushroom
-    // Observer, MycoMap, BLAST) collapse so the queue and the tree options are
-    // not pushed a full screen down, and so they are not stacked above the queue
-    // on mobile. They are accordions and not tabs on purpose: the sources are
-    // additive, a session routinely draws on several, and a tab would hide a
-    // panel that still owns rows in the queue.
+    // Alan 9/12/26 - Six sources (iNaturalist, Mushroom Observer, MycoMap,
+    // BLAST, Paste, Upload) share one box behind a segmented control, so the
+    // queue and the tree options are not pushed a screen down and are not
+    // stacked below six cards on mobile.
     //
-    // Nothing here changes a handler or an id -- the panels are the original
-    // cards' contents, only wrapped. A collapsed panel is [hidden], so every
-    // existing getElementById().value read still works unchanged.
+    // Switching a segment is display only. The queue is the durable state and
+    // lives in its own column, so a fetch summary hidden here is still one
+    // click from being visible again and nothing queued is ever discarded.
+    //
+    // Nothing below renames an id or rebinds a handler -- each panel holds its
+    // original card's markup verbatim. A hidden panel is [hidden], so the
+    // existing getElementById().value reads work exactly as they did.
     // =========================================================================
-    (function setupImportAccordions() {
-        const STORAGE_KEY = 'dikarya.treeBuilder.openImportSections';
-        const sections = Array.from(document.querySelectorAll('.import-accordion'));
-        if (sections.length === 0) return;
+    (function setupSourceSelector() {
+        const STORAGE_KEY = 'dikarya.treeBuilder.sourceSegment';
+        const DEFAULT_SOURCE = 'inaturalist';
+        const tablist = document.getElementById('source_segmented');
+        if (!tablist) return;
 
-        function byName(name) {
-            return sections.find(el => el.dataset.importSection === name) || null;
+        const tabs = Array.from(tablist.querySelectorAll('.source-segment'));
+        const panels = Array.from(document.querySelectorAll('.source-panel'));
+        if (tabs.length === 0) return;
+
+        function panelFor(name) {
+            return panels.find(el => el.dataset.sourcePanel === name) || null;
         }
 
-        function readRemembered() {
-            try {
-                const parsed = JSON.parse(window.localStorage.getItem(STORAGE_KEY));
-                return Array.isArray(parsed) ? parsed : [];
-            } catch (err) {
-                return [];
+        function select(name, persist) {
+            const target = tabs.some(t => t.dataset.sourceSegment === name) ? name : DEFAULT_SOURCE;
+            tabs.forEach(tab => {
+                const active = tab.dataset.sourceSegment === target;
+                tab.setAttribute('aria-selected', active ? 'true' : 'false');
+                tab.tabIndex = active ? 0 : -1;
+            });
+            panels.forEach(panel => {
+                panel.hidden = panel.dataset.sourcePanel !== target;
+            });
+            if (persist !== false) {
+                // A private-mode or quota failure must never break the page.
+                try {
+                    window.localStorage.setItem(STORAGE_KEY, target);
+                } catch (err) { /* non-fatal */ }
             }
         }
 
-        function remember() {
-            // A private-mode or quota failure must never break the page.
-            try {
-                const open = sections
-                    .filter(el => el.classList.contains('is-open'))
-                    .map(el => el.dataset.importSection);
-                window.localStorage.setItem(STORAGE_KEY, JSON.stringify(open));
-            } catch (err) { /* non-fatal */ }
-        }
-
-        function setOpen(section, open, persist) {
-            if (!section) return;
-            const toggle = section.querySelector('.import-accordion-toggle');
-            const panel = section.querySelector('.import-accordion-panel');
-            if (!toggle || !panel) return;
-            section.classList.toggle('is-open', open);
-            toggle.setAttribute('aria-expanded', open ? 'true' : 'false');
-            panel.hidden = !open;
-            if (persist !== false) remember();
-        }
-
-        // Exposed so any later import flow can reveal its own panel.
+        // Kept from the accordion version so any later flow can reveal its own
+        // source without knowing how the selector is built.
         window.openImportSection = function (name) {
-            setOpen(byName(name), true);
+            select(name);
         };
 
-        sections.forEach(section => {
-            const toggle = section.querySelector('.import-accordion-toggle');
-            if (!toggle) return;
-            toggle.addEventListener('click', () => {
-                setOpen(section, !section.classList.contains('is-open'));
-            });
+        tabs.forEach(tab => {
+            tab.addEventListener('click', () => select(tab.dataset.sourceSegment));
         });
 
-        // Restore the sections this browser last used.
-        readRemembered().forEach(name => setOpen(byName(name), true, false));
-
-        // A section holding typed input must never stay hidden -- this covers
-        // back-navigation and Firefox's form restore, which repopulate fields
-        // without firing any event we listen for.
-        sections.forEach(section => {
-            const filled = Array.from(section.querySelectorAll('input, textarea'))
-                .some(el => (el.type === 'text' || el.type === 'url' || el.tagName === 'TEXTAREA')
-                    && el.value.trim() !== '');
-            if (filled) setOpen(section, true, false);
+        // Roving-tabindex keyboard support, which role="tablist" implies.
+        tablist.addEventListener('keydown', event => {
+            const current = tabs.findIndex(t => t.getAttribute('aria-selected') === 'true');
+            if (current === -1) return;
+            let next = null;
+            if (event.key === 'ArrowRight' || event.key === 'ArrowDown') next = (current + 1) % tabs.length;
+            else if (event.key === 'ArrowLeft' || event.key === 'ArrowUp') next = (current - 1 + tabs.length) % tabs.length;
+            else if (event.key === 'Home') next = 0;
+            else if (event.key === 'End') next = tabs.length - 1;
+            if (next === null) return;
+            event.preventDefault();
+            select(tabs[next].dataset.sourceSegment);
+            tabs[next].focus();
         });
 
-        // A result panel that reveals itself while its section is collapsed
-        // means an import finished -- open the section so the summary and its
-        // action buttons are reachable.
-        sections.forEach(section => {
-            const results = section.querySelectorAll('[id$="_results"], [id$="_tree_preview"]');
+        let remembered = null;
+        try {
+            remembered = window.localStorage.getItem(STORAGE_KEY);
+        } catch (err) { /* non-fatal */ }
+        select(remembered || DEFAULT_SOURCE, false);
+
+        // A source holding typed input wins over the remembered segment. This
+        // covers back-navigation and Firefox's form restore, which repopulate
+        // fields without firing any event we listen for.
+        const filled = panels.find(panel => Array.from(panel.querySelectorAll('input, textarea'))
+            .some(el => (el.type === 'text' || el.type === 'url' || el.tagName === 'TEXTAREA')
+                && el.value.trim() !== ''));
+        if (filled) select(filled.dataset.sourcePanel, false);
+
+        // A result panel that reveals itself while its source is not showing
+        // means a fetch finished -- switch to it so the summary and its action
+        // buttons are reachable.
+        panels.forEach(panel => {
+            const results = panel.querySelectorAll('[id$="_results"], [id$="_tree_preview"]');
             if (results.length === 0) return;
             const observer = new MutationObserver(records => {
                 records.forEach(record => {
                     if (record.target.classList.contains('hidden')) return;
-                    if (!section.classList.contains('is-open')) setOpen(section, true);
+                    if (panel.hidden) select(panel.dataset.sourcePanel);
                 });
             });
             results.forEach(el => observer.observe(el, { attributes: true, attributeFilter: ['class'] }));
         });
+    })();
 
-        // Focus moved into a collapsed panel (a script calling .focus(), a
-        // deep link) opens it rather than leaving the caret somewhere unseen.
-        //
-        // Alan 9/12/26 - This must match the PANEL, not the whole section. The
-        // header button lives in the section too, so matching the section made
-        // the first click on a closed header fire focusin (open) and then click
-        // (toggle shut) -- it flashed open and closed, and only worked on the
-        // second click once the button already held focus.
-        document.addEventListener('focusin', event => {
-            const panel = event.target.closest && event.target.closest('.import-accordion-panel');
-            if (!panel) return;
-            const section = panel.closest('.import-accordion');
-            if (section && !section.classList.contains('is-open')) setOpen(section, true);
+    // =========================================================================
+    // Work out which source the user means, and switch to it
+    //
+    // Alan 9/13/26 - The logs show people pasting whatever identifier they have
+    // into whichever box happens to be open: iNaturalist observation URLs went
+    // into the MycoMap box, which rejects them with a MycoMap error that
+    // explains nothing. With one Add Sequences box and a segment per source, we
+    // can read the input and move it to the field that wants it.
+    //
+    // The digit rule is measured, not guessed. Across 9,816 iNaturalist jobs on
+    // disk the smallest observation id is 1,706,015 -- 7 digits -- and 99.5% are
+    // 8 or 9. Not one is 6 digits or fewer. Mushroom Observer is still in the
+    // 6-digit range, so a bare 6-digit number is Mushroom Observer and 7+ is
+    // iNaturalist.
+    //
+    // NOTE: Mushroom Observer will eventually cross 1,000,000 and collide with
+    // the 7-digit rule. When it does, the tie has to break on something other
+    // than length -- at that point iNaturalist's smallest live id will be far
+    // above MO's, so the boundary becomes a threshold rather than a digit count.
+    //
+    // Nothing here is a guess about ambiguous input: 5 digits or fewer routes
+    // nowhere, and sequence data is never moved out of the two boxes that both
+    // legitimately accept it.
+    // =========================================================================
+    (function setupSourceAutoDetect() {
+        const URL_ROUTES = [
+            {
+                source: "inaturalist", label: "iNaturalist",
+                hosts: ["inaturalist.org", "www.inaturalist.org"],
+            },
+            {
+                source: "mushroom_observer", label: "Mushroom Observer",
+                hosts: ["mushroomobserver.org", "www.mushroomobserver.org"],
+            },
+            {
+                source: "mycomap", label: "MycoMap",
+                hosts: ["mycomap.com", "www.mycomap.com", "mycomap.org", "www.mycomap.org"],
+            },
+        ];
+        const TARGET_FIELD = {
+            inaturalist: "inaturalist_url",
+            mushroom_observer: "mushroom_observer_input",
+            mycomap: "mycomap_url",
+            paste: "sequence_text",
+            blast: "blast_query",
+        };
+        const LABEL = {
+            inaturalist: "iNaturalist", mushroom_observer: "Mushroom Observer",
+            mycomap: "MycoMap", paste: "Paste", blast: "BLAST",
+        };
+        // Each watched field and the source it already belongs to.
+        const WATCHED = [
+            ["inaturalist_url", "inaturalist"],
+            ["mushroom_observer_input", "mushroom_observer"],
+            ["mycomap_url", "mycomap"],
+            ["sequence_text", "paste"],
+            ["blast_query", "blast"],
+        ];
+        // The three identifier boxes. Sequence data pasted into one of these is
+        // certainly misplaced; the same data in sequence_text or blast_query is
+        // exactly where it belongs, so it is never moved out of those two.
+        const IDENTIFIER_FIELDS = new Set(["inaturalist", "mushroom_observer", "mycomap"]);
+        const IUPAC_RE = /^[ACGTURYSWKMBDHVN]+$/i;
+
+        function urlSource(token) {
+            let parsed = null;
+            try {
+                parsed = new URL(token);
+            } catch (err) {
+                try {
+                    parsed = new URL(`https://${token}`);
+                } catch (innerErr) {
+                    return null;
+                }
+            }
+            if (!/^https?:$/.test(parsed.protocol)) return null;
+            const host = parsed.hostname.toLowerCase();
+            const route = URL_ROUTES.find(entry => entry.hosts.includes(host));
+            return route ? route.source : null;
+        }
+
+        function looksLikeSequenceData(text) {
+            const trimmed = text.trim();
+            if (trimmed.startsWith(">")) return true;
+            const collapsed = trimmed.replace(/\s+/g, "");
+            return collapsed.length >= 20 && IUPAC_RE.test(collapsed);
+        }
+
+        // Returns the source this text belongs to, or null when it is ambiguous
+        // or already in the right place.
+        function detectSource(text, ownSource) {
+            const trimmed = String(text || "").trim();
+            if (!trimmed) return null;
+            const singleToken = !/\s/.test(trimmed);
+
+            // 1. A URL is unambiguous, wherever it was typed.
+            if (singleToken) {
+                const fromUrl = urlSource(trimmed);
+                if (fromUrl) return fromUrl;
+            }
+
+            // 2. A bare number. See the digit rule above.
+            if (singleToken && /^\d+$/.test(trimmed)) {
+                if (trimmed.length === 6) return "mushroom_observer";
+                if (trimmed.length >= 7) return "inaturalist";
+                return null;  // 5 or fewer: genuinely ambiguous, leave it alone.
+            }
+
+            // 3 & 4. An accession, a FASTA record or a bare sequence. Both the
+            // Paste and BLAST boxes accept all three, so this only rescues data
+            // stranded in one of the identifier boxes -- it never second-guesses
+            // a user who is already in Paste or BLAST.
+            if (!IDENTIFIER_FIELDS.has(ownSource)) return null;
+            if (singleToken && isGenBankAccession(trimmed)) return "paste";
+            if (looksLikeSequenceData(trimmed)) return "paste";
+            return null;
+        }
+
+        function handle(field, ownSource) {
+            const source = detectSource(field.value, ownSource);
+            if (!source || source === ownSource) return;
+            const target = document.getElementById(TARGET_FIELD[source]);
+            if (!target || target === field) return;
+
+            const value = field.value.trim();
+            target.value = value;
+            field.value = "";
+            // Existing handlers (validation, button enable/disable, the detected
+            // counters) are wired to input events, so both fields have to
+            // announce the change or the UI keeps the old state.
+            field.dispatchEvent(new Event("input", { bubbles: true }));
+            target.dispatchEvent(new Event("input", { bubbles: true }));
+
+            if (typeof window.openImportSection === "function") {
+                window.openImportSection(source);
+            }
+            try {
+                target.focus();
+                target.setSelectionRange(value.length, value.length);
+            } catch (err) { /* not every control supports selection */ }
+            if (typeof showStatus === "function") {
+                showStatus(`That looks like ${LABEL[source]} input — switched to ${LABEL[source]}.`, "info");
+            }
+        }
+
+        WATCHED.forEach(([id, ownSource]) => {
+            const field = document.getElementById(id);
+            if (!field) return;
+            // On paste, and on change/blur for a typed or autofilled value. Not
+            // on every keystroke: switching fields mid-type would move the caret
+            // out from under the user, and a half-typed id is not yet decidable.
+            field.addEventListener("paste", () => {
+                window.setTimeout(() => handle(field, ownSource), 0);
+            });
+            field.addEventListener("change", () => handle(field, ownSource));
         });
     })();
 

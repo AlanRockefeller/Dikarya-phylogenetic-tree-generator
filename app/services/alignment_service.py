@@ -818,11 +818,29 @@ def _run_mafft(
             context["disagreement"] = reversed_count > orient_uncertain
             context["basis"] = "counts"
 
-        log_degradation(
-            logger, "aligner_reversed_sequences",
-            "MAFFT reverse-complemented sequences the orientation step had left forward",
-            **context,
-        )
+        # Only a genuine contradiction is a degradation. When every flip landed
+        # on a record ORIENT explicitly declined to call (or never saw), the two
+        # stages agree and MAFFT simply finished the job -- reporting that as
+        # DEGRADED made `grep DEGRADED errors.log` mostly false positives on
+        # non-ITS markers, where ORIENT is uncertain about everything by
+        # construction. The count-based fallback stays a degradation because it
+        # cannot tell which records were flipped.
+        if context.get("basis") == "headers" and not context["disagreement"]:
+            extras = " ".join(
+                f"{key}={str(value)[:200]!r}" for key, value in sorted(context.items())
+            )
+            logger.info(
+                "event=alignment.aligner_completed_orientation MAFFT reverse-"
+                "complemented %d sequence(s) the orientation step had not called; "
+                "no disagreement [%s]",
+                reversed_count, extras,
+            )
+        else:
+            log_degradation(
+                logger, "aligner_reversed_sequences",
+                "MAFFT reverse-complemented sequences the orientation step had left forward",
+                **context,
+            )
     return reversed_count
 
 

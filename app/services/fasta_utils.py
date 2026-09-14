@@ -515,3 +515,51 @@ def reconstruct_name_map(alignment_path) -> Dict[str, str]:
             read_fasta_records(alignment_path), start=1
         )
     }
+
+
+# INSDC nucleotide accessions come in a small number of fixed shapes, and a
+# catch-all (1-6 letters + 5-9 digits) is loose enough to accept things that
+# are not accessions at all: an iNaturalist observation id pasted into the
+# accession box ("INAT125467754", 4 letters + 9 digits) matched, was sent to
+# NCBI, and came back as an opaque 400 that took the rest of its batch down
+# with it. Matching the real shapes rejects it here, by name, instead.
+#
+#   1 letter  + 5 digits            e.g. U49845
+#   2 letters + 6 digits            e.g. OR807397, AF123456
+#   2 letters + 8 digits            e.g. KY12345678
+#   RefSeq: 2 letters + '_' + 6, 8 or 9 digits   e.g. NC_012345, NM_001234567
+#   WGS: 4 letters + 2-digit assembly version + 6 or 8 contig digits, so
+#        exactly 4+8 or 4+10 e.g. AAAA01000001. Notably never 4+9, which is
+#        what keeps the observed iNaturalist id from matching this arm.
+#   WGS (6-letter prefix): 6 letters + 2-digit assembly version + 7 or 9
+#        contig digits e.g. AAAAAA010000001. No iNaturalist id has ever had
+#        six leading letters, so this arm costs nothing to allow -- and
+#        without it a perfectly ordinary INSDC accession was rejected as "not
+#        an accession" before any NCBI call.
+#
+# A 4+8 id is genuinely ambiguous -- "INAT12546775" is shape-identical to a
+# real WGS accession, and no pattern can separate them. That case still reaches
+# NCBI, which is why _fetch_genbank_xml_batch also isolates a failing accession
+# rather than letting it void its whole batch.
+#
+# Lives here rather than in app/api/routes.py so services can use it without
+# importing a route module; routes re-exports it under its old private name.
+GENBANK_ACCESSION_RE = re.compile(
+    r'^(?:'
+    r'[A-Z]\d{5}'
+    r'|[A-Z]{2}\d{6}'
+    r'|[A-Z]{2}\d{8}'
+    r'|[A-Z]{2}_\d{6}'
+    r'|[A-Z]{2}_\d{8,9}'
+    r'|[A-Z]{4}\d{8}'
+    r'|[A-Z]{4}\d{10}'
+    r'|[A-Z]{6}\d{9}'
+    r'|[A-Z]{6}\d{11}'
+    r')(?:\.\d+)?$',
+    re.IGNORECASE,
+)
+
+
+def is_genbank_accession(text: str) -> bool:
+    """Check if text looks like a GenBank accession number."""
+    return bool(GENBANK_ACCESSION_RE.match((text or "").strip()))

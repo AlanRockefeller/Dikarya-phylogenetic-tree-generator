@@ -748,6 +748,7 @@ def _parse_genbank_xml(xml_text: str) -> Dict[str, Dict]:
         "accession": str,
         "version": str,  # "Accession.Version"
         "organism": str,
+        "definition": str, # GBSeq_definition, i.e. the DEFINITION line
         "sequence": str, # Uppercase, clean
         "raw_record": str, # Blob for keyword scanning
         "source_features": Dict[str, str], # qualifier_name -> value
@@ -819,6 +820,7 @@ def _parse_genbank_xml(xml_text: str) -> Dict[str, Dict]:
                 "accession": acc,
                 "version": ver,
                 "organism": organism,
+                "definition": definition,
                 "sequence": clean_seq,
                 "source_features": source_quals,
                 "type_material": type_material,

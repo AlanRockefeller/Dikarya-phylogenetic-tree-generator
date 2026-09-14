@@ -35,52 +35,14 @@ MIRROR_HEAD_RE = re.compile(
     r'\[[^\]]+\]\s*(?P<message>.*)$'
 )
 EXCEPTION_RE = re.compile(r'^([A-Za-z_][\w.]*(?:Error|Exception|Warning|Exit|Interrupt))(?::\s*(.*))?$')
-STATIC_SUFFIXES = (".css", ".js", ".map", ".ico", ".png", ".jpg", ".jpeg", ".gif", ".svg", ".webp", ".woff", ".woff2")
-SCANNER_MARKERS = (
-    "/.env", "/wp-", "/wordpress", "/phpmyadmin", "/xmlrpc", "/cgi-bin", "/.git",
-    "/vendor/php", "/actuator", "/.aws", "/.ssh", "/.svn", "/.hg", "/.docker",
-    "/.vscode", "/.idea", "/.well-known/security", "/config.json", "/credentials",
-    "/id_rsa", "/backup.sql", "/dump.sql", "/database.sql", "/server-status",
-    "/solr/", "/jenkins", "/hudson", "/manager/html", "/struts", "/login.action",
-    "/telescope", "/debug/default", "/geoserver", "/owa/", "/autodiscover",
-    "/boaform", "/hnap1", "/setup.cgi", "/shell", "/eval-stdin", "/wp/",
-    # Appliance / webmail credential probes seen daily against this host.
-    "/+cscoe+", "/remote/login", "/dana-na", "/global-protect", "/ecp/",
-    "/autodiscover", "/onvif", "/device_service", "/mcp",
+# Alan 9/12/26 - These lists used to live here AND in the application, so the
+# digest's idea of "scanner noise" could drift from the classifier that decides
+# which file a request is logged to. One definition now, in the app module,
+# which is deliberately free of Flask imports so this script can load it.
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from app.services.security_events import (  # noqa: E402
+    SCANNER_EXACT_PATHS, SCANNER_MARKERS, SCRIPT_EXT_RE, STATIC_SUFFIXES,
 )
-# Exact paths that only a scanner asks for. Kept as exact matches, not
-# substrings, so a genuine product 404 such as
-# /api/job/<id>/download/fasta/pruned is never swept into the noise bucket.
-SCANNER_EXACT_PATHS = frozenset({
-    "/login", "/logon", "/signin", "/ip", "/sse", "/graphql", "/api/graphql",
-    "/config", "/env", "/settings", "/api/config", "/api/env", "/api/settings",
-    "/api/v1/config", "/api/v1/env", "/api/v1/settings", "/server-info",
-    "/console", "/status", "/info",
-    # Auth/console routes this app has never had. One scanner probed each of
-    # these 88 times in a day, in the same sweep as the /login and /signin
-    # probes above, but they were landing in the product bucket and crowding
-    # out the real 4xx entries. Dikarya's own auth lives at /auth/login.
-    "/signup", "/register", "/dashboard", "/admin", "/account",
-    "/auth/callback", "/api/auth/signin", "/login.html", "/sftp-config.json",
-    # Generic fetch/proxy/config endpoints from a burst scanner that rotated
-    # dozens of fake crawler user agents. Dikarya has never exposed these exact
-    # routes; real downloads and previews live under scoped resource paths.
-    "/fetch", "/proxy", "/api/proxy", "/api/v1/fetch", "/api/download",
-    "/api/image", "/api/preview", "/api/v2/settings", "/api/v2/config",
-    # Historical credential/PHP probes predate the explicit limiter noise tag.
-    "/phpinfo", "/_profiler/phpinfo", "/_environment",
-    "/webroot/index.php/_environment", "/phpinfo.php.old", "/phpinfo.php~",
-    "/phpinfo.php.save", "/application_default_credentials.json", "/key.json",
-    "/service-account.json", "/sa.json", "/gcp-key.json", "/gcp-credentials.json",
-    "/gcp-sa.json", "/google-credentials.json", "/google-key.json",
-    "/.config/gcloud/application_default_credentials.json", "/keyfile.json",
-    "/firebase-adminsdk.json", "/firebase-key.json",
-})
-# Scanner probes hide the extension behind a version digit -- /randkeyword.PhP7,
-# /zup.php73, /baxa1.phP8 all arrived in one sweep and were filed as
-# product-relevant 404s because a plain endswith(".php") does not match them.
-# Case is already folded by the caller; the trailing digits are the whole point.
-SCRIPT_EXT_RE = re.compile(r'\.(?:php|asp|aspx|jsp|cgi|pl|cfm)[0-9]*$')
 # UUID form used for RQ job ids in worker logs.
 UUID_PATTERN = r'[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}'
 
@@ -427,6 +389,15 @@ def record_identity(record):
     return (message.strip(), body, context)
 
 
+SECURITY_RE = re.compile(
+    r'event=security\.suspicious\s+method=(?P<method>\S+)\s+path=(?P<path>\S+)\s+'
+    r'status=(?P<status>\d+)\s+reason=(?P<reason>\w+)\s+client=(?P<client>\S+)'
+)
+SSE_CLOSED_RE = re.compile(
+    r'event=sse\.closed.*?reason=(?P<reason>\w+)\s+duration_seconds=(?P<seconds>[\d.]+)'
+)
+
+
 def analyze_errors(cutoff, until=None):
     # Grouped by stem rather than flattened into one list, because the
     # occurrence counter below has to reset between the two mirrored streams
@@ -443,6 +414,14 @@ def analyze_errors(cutoff, until=None):
     files = [path for stream in streams for path in stream]
     exceptions = collections.Counter()
     degradations = collections.Counter()
+    # Alan 9/12/26 - Probes aimed at this application, and SSE stream lifetimes
+    # taken from the app's own close event rather than inferred from access-log
+    # durations. sse.closed carries the reason a stream ended, which an access
+    # log cannot show, and a stream that outlives its job is the failure mode
+    # that eats Gunicorn request slots.
+    security = collections.Counter()
+    security_clients = collections.defaultdict(set)
+    sse_closes = collections.defaultdict(list)
     affected = collections.defaultdict(set)
     affected_jobs = collections.defaultdict(set)
     seen = set()
@@ -462,11 +441,18 @@ def analyze_errors(cutoff, until=None):
                 if when is None:
                     unparsed += 1
                     continue
-                if (
-                    when < cutoff
-                    or (until is not None and when >= until)
-                    or not LEVEL_RE.search(record.splitlines()[0])
-                ):
+                if when < cutoff or (until is not None and when >= until):
+                    continue
+                # event=sse.closed is INFO, so it has to be collected before the
+                # WARNING+ filter below. It is written only by the app logger,
+                # which means it lands in error.log and NOT in the WARNING+
+                # mirror, so reading both streams cannot double-count it.
+                sse_close = SSE_CLOSED_RE.search(record.splitlines()[0])
+                if sse_close:
+                    sse_closes[sse_close.group("reason")].append(
+                        float(sse_close.group("seconds"))
+                    )
+                if not LEVEL_RE.search(record.splitlines()[0]):
                     continue
                 fields = context_fields(record.splitlines()[0])
                 oldest = when if oldest is None or when < oldest else oldest
@@ -500,6 +486,14 @@ def analyze_errors(cutoff, until=None):
                     contextual += 1
                 user = fields.get("user")
                 job = fields.get("job")
+                first_line = record.splitlines()[0]
+                suspicious = SECURITY_RE.search(first_line)
+                if suspicious:
+                    reason = suspicious.group("reason")
+                    security[reason] += 1
+                    client = suspicious.group("client")
+                    if client and client != "-":
+                        security_clients[reason].add(client)
                 if "DEGRADED" in record:
                     event = re.search(r'event=degraded\.([\w.-]+)', record)
                     slug = event.group(1) if event else record.split("DEGRADED", 1)[-1].strip().split(":", 1)[0]
@@ -516,7 +510,8 @@ def analyze_errors(cutoff, until=None):
                         affected_jobs[key].add(job)
     return {
         "exceptions": exceptions, "degradations": degradations, "affected": affected,
-        "affected_jobs": affected_jobs,
+        "affected_jobs": affected_jobs, "security": security,
+        "security_clients": security_clients, "sse_closes": sse_closes,
         "coverage": coverage_record(files, oldest, newest, lines, unparsed, 0, contextual, len(seen)),
     }
 
@@ -939,6 +934,19 @@ def main():
     rows([text for _, text in sorted(slow_rows, reverse=True)[:args.top]], empty=f"  (nothing slower than {args.slow_threshold:g}s)")
     section("SSE stream lifetimes")
     rows([f"{len(values):>5}  {endpoint}  p50={percentile(values, .5):.1f}s p95={percentile(values, .95):.1f}s max={max(values):.1f}s" for endpoint, values in sorted(access["streams"].items())])
+    section("App-targeted probes (security.suspicious)")
+    rows([
+        f"{count:>5}  {reason:<20} from {len(errors['security_clients'].get(reason, ())) or '?'} client(s)"
+        for reason, count in errors["security"].most_common(args.top)
+    ], empty="  (none -- internet-wide scanner noise goes to var/logs/scanner.log)")
+    section("SSE stream close reasons (from the app, not the access log)")
+    rows([
+        f"{len(values):>5}  {reason:<22} p50={percentile(values, .5):.0f}s "
+        f"p95={percentile(values, .95):.0f}s max={max(values):.0f}s"
+        for reason, values in sorted(
+            errors["sse_closes"].items(), key=lambda kv: -len(kv[1])
+        )
+    ])
     section("Rate-limited clients (429)")
     rows([f"{count:>5}  {ip}" for ip, count in access["rate_limited"].most_common(args.top)])
     section("Heaviest clients / user agents")
