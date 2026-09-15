@@ -73,15 +73,72 @@ def _format_fasta(records: List[Dict[str, str]]) -> str:
     return "\n".join(lines) + "\n" if lines else ""
 
 
+# Metadata values that say a record came from NCBI rather than from an
+# observation site. Both keys are set by the import paths: `source` names the
+# panel the record arrived through, `hit_source` distinguishes a MycoMap
+# local-database hit from a MycoMap NCBI hit, and it wins when the two disagree
+# because it is the more specific of the two.
+_GENBANK_SOURCES = frozenset({"genbank", "ncbi", "blast", "nuccore"})
+_OBSERVATION_SOURCES = frozenset({
+    "inat", "inaturalist", "mo", "mushroom_observer", "mushroomobserver",
+    "mycomap", "mo_observation", "inat_observation", "local",
+})
+
+# "MO123456.1" -- a version suffix is a GenBank thing. Mushroom Observer labels
+# have never carried one, so this shape settles the ambiguity on its own even
+# when the record has no provenance metadata at all.
+_VERSIONED_COMPACT_MO_RE = re.compile(r"^MO\d{5,12}\.\d+$", re.IGNORECASE)
+
+
+def record_provenance(header: str, metadata: Optional[Dict[str, Any]] = None) -> str:
+    """Where a record came from: ``'genbank'``, ``'observation'`` or ``'unknown'``.
+
+    Used to settle the one genuinely ambiguous identifier Dikarya handles: the
+    compact token ``MO123456``, which is simultaneously a Mushroom Observer tip
+    label and a valid two-letter GenBank accession. See
+    ``extract_mycomap_observation_reference`` for why that matters here in
+    particular -- this module *deletes* records that share a reference.
+    """
+    metadata = metadata or {}
+    hit_source = str(metadata.get("hit_source") or "").strip().lower()
+    source = str(metadata.get("source") or "").strip().lower()
+    for value in (hit_source, source):
+        if value in _GENBANK_SOURCES:
+            return "genbank"
+        if value in _OBSERVATION_SOURCES:
+            return "observation"
+
+    first = str(header or "").lstrip(">").strip().split(None, 1)
+    if first and _VERSIONED_COMPACT_MO_RE.match(first[0]):
+        return "genbank"
+
+    if str(metadata.get("observation_id") or "").strip():
+        return "observation"
+    return "unknown"
+
+
 def observation_reference(header: str, metadata: Optional[Dict[str, Any]] = None) -> str:
     """Return an 'inat:123'/'mo:123' reference for a record, or '' if unknown.
 
     Checks the FASTA header first, then falls back to the observation_id /
     internal_id fields that local MycoMap hits carry instead of a header token.
+
+    Only a record known to have come from an observation source yields a
+    reference from the bare ``MO123456`` token. There, the token is ambiguous
+    with a real GenBank accession, and this function feeds a destructive dedup:
+    unknown provenance therefore takes the safe false negative. Explicit
+    Mushroom Observer references still count from any source, so a GenBank
+    record whose ``/isolate`` says "Mushroom Observer 123456" is still linked
+    to that observation -- which is the point of the GenBank annotation lookup.
     """
     from app.services.mycomap_service import extract_mycomap_observation_reference
 
-    reference = extract_mycomap_observation_reference(header or "")
+    provenance = record_provenance(header, metadata)
+    allow_compact_mo = provenance == "observation"
+
+    reference = extract_mycomap_observation_reference(
+        header or "", allow_compact_mo=allow_compact_mo
+    )
     if reference:
         return reference
 
@@ -93,7 +150,9 @@ def observation_reference(header: str, metadata: Optional[Dict[str, Any]] = None
         # A bare numeric observation_id carries no source prefix; iNaturalist is
         # the only source that stores one, so qualify it before extraction.
         candidate = f"iNat{value}" if value.isdigit() else value
-        reference = extract_mycomap_observation_reference(candidate)
+        reference = extract_mycomap_observation_reference(
+            candidate, allow_compact_mo=allow_compact_mo
+        )
         if reference:
             return reference
     return ""
@@ -160,23 +219,44 @@ def _metadata_lookup(
     return positional, by_header
 
 
+_COMPACT_MO_RE = re.compile(r"^MO\d{5,12}(?:\.\d+)?$", re.IGNORECASE)
+
+
 def record_accession(header: str, metadata: Optional[Dict[str, Any]] = None) -> str:
     """Return the GenBank accession for a record, uppercase, or ''.
 
     Prefers the metadata field the import paths fill in, and falls back to the
     first token of the FASTA header, which is where both MycoMap's DB39 export
     and NCBI's own header put it.
+
+    The compact ``MO123456`` token is accession-shaped and is also how every
+    MycoMap local hit is labelled -- 19,661 records on disk carry it as their
+    ``internal_id``. Reading those as accessions sent Mushroom Observer
+    observation numbers to NCBI efetch and, worse, offered them to
+    ``_merge_identifier_into_name`` as "the GenBank accession this tip lacks".
+    So it counts as an accession only when the record is known to have come
+    from GenBank, or when it carries a version suffix (which no Mushroom
+    Observer label does).
     """
     from app.services.fasta_utils import is_genbank_accession
 
     metadata = metadata or {}
+    provenance = record_provenance(header, metadata)
+
+    def usable(text: str) -> bool:
+        if not text or not is_genbank_accession(text):
+            return False
+        if not _COMPACT_MO_RE.match(text):
+            return True
+        return provenance == "genbank"
+
     for value in (metadata.get("accession"), metadata.get("internal_id")):
         text = str(value or "").strip()
-        if text and is_genbank_accession(text):
+        if usable(text):
             return text.upper()
 
     first = str(header or "").lstrip(">").strip().split(None, 1)
-    if first and is_genbank_accession(first[0]):
+    if first and usable(first[0]):
         return first[0].upper()
     return ""
 
@@ -233,9 +313,62 @@ def _identifier_label(reference: str) -> str:
     return f"iNat{number}" if source == "inat" else f"MO{number}"
 
 
+def _normalized_with_positions(value: str):
+    """``(normalized_text, original_index_of_each_normalized_character)``.
+
+    Same normalization as ``_header_key`` -- lowercase, everything that is not
+    a letter or digit dropped -- but keeping the link back to the original
+    string, so a match can be checked against the characters that were removed.
+    """
+    text = str(value or "")
+    chars = []
+    positions = []
+    for index, char in enumerate(text):
+        if char.isalnum():
+            chars.append(char.lower())
+            positions.append(index)
+    return "".join(chars), positions
+
+
 def _contains_identifier(name: str, identifier: str) -> bool:
+    """Is ``identifier`` already present in ``name`` as an identifier?
+
+    Alan 9/14/26 - This used to be a bare substring test over the normalized
+    text, and normalizing strips the punctuation that separates one identifier
+    from the next. "iNat280384724" therefore read as already present inside
+    "iNat2803847241" -- a different observation whose id merely starts with the
+    same digits -- and the merge that should have added it was skipped, so the
+    surviving tip silently lost the identifier of the record collapsed into it.
+
+    Punctuation still has to be ignored, because these two strings are written
+    differently on purpose: headers are sanitized on the way into the FASTA
+    while sequence_metadata keeps the original text, and the same reference is
+    written "iNat280384724", "iNat 280384724" and "iNat #280384724" by different
+    sources. So the search runs over the normalized text and the *boundary* is
+    checked against the original: a hit counts only when the characters
+    immediately either side of it in the original string are not alphanumeric.
+    That accepts "PX860295" inside "PX860295.1" and rejects it inside
+    "PX8602951".
+    """
     key = _header_key(identifier)
-    return bool(key) and key in _header_key(name)
+    if not key:
+        return False
+    haystack, positions = _normalized_with_positions(name)
+    original = str(name or "")
+
+    start = haystack.find(key)
+    while start != -1:
+        end = start + len(key)
+        before_index = positions[start] - 1
+        after_index = positions[end - 1] + 1
+        before_ok = before_index < 0 or not original[before_index].isalnum()
+        after_ok = (
+            after_index >= len(original) or not original[after_index].isalnum()
+        )
+        if before_ok and after_ok:
+            return True
+        start = haystack.find(key, start + 1)
+    return False
 
 
 def _merge_identifier_into_name(kept_name: str, identifier: str) -> str:
@@ -267,7 +400,7 @@ def dedupe_by_observation(
     sequence_text: str,
     sequence_metadata: Optional[List[Dict[str, Any]]] = None,
     max_differences: int = OBSERVATION_NEAR_DUPLICATE_MAX_DIFFERENCES,
-    resolve_genbank_references: bool = True,
+    resolve_genbank_references: bool = False,
 ) -> Tuple[str, List[Dict[str, Any]], List[Dict[str, Any]]]:
     """Collapse near-identical records that share an observation number.
 
@@ -277,8 +410,14 @@ def dedupe_by_observation(
     far worse than leaving a duplicate in.
 
     ``resolve_genbank_references`` allows one NCBI annotation lookup for the
-    accessions whose observation number is not in the FASTA at all; pass False
-    to keep the whole thing offline.
+    accessions whose observation number is not in the FASTA at all.
+
+    Alan 9/14/26 - It defaults to False. This is a pure text function
+    everywhere else, and a default that silently reaches the internet made it
+    impossible to reason about (or test) without knowing which caller you were:
+    the same call was free in the worker and up to DEFAULT_LOOKUP_SECONDS inside
+    a Gunicorn request. The lookup is opted into by the orchestration layer --
+    today only the worker, which has the time budget for it.
     """
     sequence_metadata = list(sequence_metadata or [])
     try:
@@ -469,23 +608,63 @@ def dedupe_by_observation(
 
 
 def record_dedup_details(job_params: Dict[str, Any], removed: List[Dict[str, Any]]) -> None:
-    """Store removed duplicates on job_params so the viewer can list them."""
+    """Store removed duplicates on job_params so the viewer can list them.
+
+    Accumulates rather than replaces. Dedup can run more than once over the
+    same job -- once offline at submit time and once in the worker, where the
+    NCBI annotation lookup is affordable -- and overwriting here would leave the
+    viewer listing only the second pass's removals while the first pass's
+    records were already gone from the FASTA, with nothing to rebuild them from.
+    """
     if not removed:
         return
     details = job_params.setdefault("import_filter_details", {})
     if not isinstance(details, dict):
         details = {}
         job_params["import_filter_details"] = details
-    merged_labels = {
-        str(record.get("merged_into_label")): str(record.get("kept_original_name"))
-        for record in removed
-        if record.get("merged_into_label") and record.get("kept_original_name")
-    }
+
+    existing = details.get("duplicates")
+    if not isinstance(existing, dict):
+        existing = {}
+    previous_records = list(existing.get("removed_records") or [])
+    previous_labels = dict(existing.get("merged_labels") or {})
+
+    # Identify a removal by the record it removed, so a repeated pass over an
+    # already-deduped payload cannot list the same tip twice. Full FASTA headers
+    # are not guaranteed unique at this stage: two distinct records may have
+    # the same name but different sequence or provenance metadata, and both
+    # must remain available to the rebuild action.
+    def removal_identity(record):
+        return (
+            str(record.get("name") or ""),
+            str(record.get("sequence") or ""),
+            str(record.get("observation_reference") or ""),
+            record.get("metadata"),
+        )
+
+    previous_identities = [removal_identity(record) for record in previous_records]
+    combined = previous_records + [
+        record for record in removed
+        if removal_identity(record) not in previous_identities
+    ]
+
+    merged_labels = dict(previous_labels)
+    for record in removed:
+        label = record.get("merged_into_label")
+        original = record.get("kept_original_name")
+        if not label or not original:
+            continue
+        # A tip relabelled twice keeps its FIRST original name: that is the
+        # label a rebuild has to restore, not the intermediate merged form.
+        merged_labels.setdefault(str(label), str(original))
+        if str(original) in merged_labels:
+            merged_labels[str(label)] = merged_labels[str(original)]
+
     details["duplicates"] = {
         "label": "Duplicate observation records",
         "max_differences": OBSERVATION_NEAR_DUPLICATE_MAX_DIFFERENCES,
-        "removed_count": len(removed),
-        "removed_records": removed,
+        "removed_count": len(combined),
+        "removed_records": combined,
         # merged tip label -> the label it had before it absorbed a collapsed
         # record's identifier, so a rebuild that restores the duplicates can put
         # the original label back.
@@ -493,19 +672,31 @@ def record_dedup_details(job_params: Dict[str, Any], removed: List[Dict[str, Any
     }
 
 
-def apply_observation_dedup(job_params: Dict[str, Any]) -> int:
+def apply_observation_dedup(
+    job_params: Dict[str, Any],
+    *,
+    resolve_genbank_references: bool = False,
+) -> int:
     """Run dedup over a job_params dict in place. Returns how many were removed.
 
     Honours job_params['skip_observation_dedup'], which the "rebuild including
     duplicates" action sets so restored records are not immediately re-removed.
+
+    ``resolve_genbank_references`` turns on the NCBI annotation lookup that
+    links a GenBank accession to the observation its submitter recorded. It is
+    off by default because the caller has to be able to afford the network
+    round trip: the submit-time pass runs inside a Gunicorn request slot and
+    must not, the worker's pass runs with the job's own time budget and does.
+    job_params['skip_genbank_observation_lookup'] still disables it outright.
     """
     if job_params.get("skip_observation_dedup"):
         return 0
     text, metadata, removed = dedupe_by_observation(
         job_params.get("sequence", ""),
         job_params.get("sequence_metadata", []),
-        resolve_genbank_references=not job_params.get(
-            "skip_genbank_observation_lookup"
+        resolve_genbank_references=(
+            resolve_genbank_references
+            and not job_params.get("skip_genbank_observation_lookup")
         ),
     )
     if not removed:

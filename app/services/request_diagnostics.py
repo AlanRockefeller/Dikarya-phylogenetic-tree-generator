@@ -9,7 +9,6 @@ from flask import g, has_request_context, request
 
 from app.services.security_events import BUCKET_SCANNER, BUCKET_TARGETED
 
-_KNOWN_METHODS = {"GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"}
 _JOB_PATH_RE = re.compile(r"^/(?:api/)?job/([^/]+)")
 _CONTROL_RE = re.compile(r"[\x00-\x1f\x7f]")
 
@@ -27,7 +26,19 @@ def _safe_path():
 
 
 def _safe_method():
-    return request.method if request.method in _KNOWN_METHODS else "OTHER"
+    """The request method, bounded but not renamed.
+
+    Alan 9/14/26 - This used to collapse everything outside the standard set to
+    the literal "OTHER" before classification, which threw away the scanner
+    signatures that matter most: PROPFIND (WebDAV discovery), TRACE (cross-site
+    tracing) and CONNECT (open-proxy tests) all arrived indistinguishable from
+    each other and from a garbage verb. normalize_method() bounds the untrusted
+    value -- uppercase letters only, length-capped, so it cannot inject a log
+    line -- while leaving PROPFIND saying PROPFIND.
+    """
+    from app.services.security_events import normalize_method
+
+    return normalize_method(request.method if has_request_context() else "GET")
 
 
 def _job_id_validity():
@@ -149,15 +160,23 @@ def install_request_diagnostics(app):
             bucket, reason = _classify(app, status)
             if bucket == BUCKET_TARGETED:
                 _log_targeted(app, status, reason)
+            elif bucket == BUCKET_SCANNER:
+                # Alan 9/14/26 - Filed whether or not a route matched. This used
+                # to sit inside the unmatched-only branch below, so a probe that
+                # happened to land on a real rule -- a PROPFIND that Werkzeug
+                # answers 405 on, a bot fetching a page that 404s -- was never
+                # written to scanner.log at all, and the sweep looked smaller
+                # than it was. It only ADDS a record: a matched route still gets
+                # its ordinary http.request_failed line below, carrying the
+                # developer reason code.
+                _log_scanner(status, reason)
 
         if status < 500 and (
             request.url_rule is None
             or request.endpoint == "static"
         ):
-            # Nothing matched, so there is no route to report. Scanner junk is
-            # filed in its own log; a targeted probe was already reported above.
-            if bucket == BUCKET_SCANNER:
-                _log_scanner(status, reason)
+            # Nothing matched, so there is no route to report; both buckets were
+            # already recorded above.
             return response
 
         code = getattr(g, "request_failure_code", None)
@@ -175,7 +194,7 @@ def install_request_diagnostics(app):
             logging.ERROR if status >= 500 else logging.WARNING,
             "event=http.request_failed method=%s route=%s status=%s reason=%s "
             "duration_ms=%.1f request_bytes=%s",
-            request.method if request.method in {"GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"} else "OTHER",
+            _safe_method(),
             request.url_rule.rule if request.url_rule is not None else "<unmatched>",
             status, code, duration_ms, request.content_length,
         )

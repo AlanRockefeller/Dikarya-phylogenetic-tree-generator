@@ -1843,13 +1843,62 @@
         // A result panel that reveals itself while its source is not showing
         // means a fetch finished -- switch to it so the summary and its action
         // buttons are reachable.
+        //
+        // Alan 9/14/26 - But only while the user is not busy somewhere else. An
+        // iNaturalist search can take tens of seconds; the user moves to Paste,
+        // starts typing a FASTA, and the result arriving used to hide the
+        // textarea mid-keystroke and throw away the selection. A completed
+        // background fetch is worth announcing, not worth seizing the screen
+        // for, so once another panel has been touched the finished source is
+        // marked on its tab and left for the user to open.
+        function markTabReady(name) {
+            const tab = tabs.find(t => t.dataset.sourceSegment === name);
+            if (!tab || tab.querySelector('.source-segment-badge')) return;
+            const badge = document.createElement('span');
+            badge.className = 'source-segment-badge ml-1 text-journal-gold';
+            badge.setAttribute('aria-label', 'results ready');
+            badge.title = 'Results ready';
+            badge.textContent = '\u25CF';
+            tab.appendChild(badge);
+        }
+
+        // Clear the badge when its own tab is opened, so it means "unseen
+        // results" rather than "this tab has ever been used".
+        tabs.forEach(tab => {
+            tab.addEventListener('click', () => {
+                const badge = tab.querySelector('.source-segment-badge');
+                if (badge) badge.remove();
+            });
+        });
+
+        // "Busy elsewhere" = the user has interacted with the panel they are
+        // looking at since the page settled. A first fetch on a page nobody has
+        // touched still auto-switches, which is the common case the behaviour
+        // was written for.
+        let userIsBusyElsewhere = false;
+        panels.forEach(panel => {
+            panel.addEventListener('input', () => {
+                if (!panel.hidden) userIsBusyElsewhere = true;
+            });
+        });
+        tabs.forEach(tab => {
+            // An explicit tab choice is the strongest statement of intent there
+            // is: from then on, nothing moves the user without asking.
+            tab.addEventListener('click', () => { userIsBusyElsewhere = true; });
+        });
+
         panels.forEach(panel => {
             const results = panel.querySelectorAll('[id$="_results"], [id$="_tree_preview"]');
             if (results.length === 0) return;
             const observer = new MutationObserver(records => {
                 records.forEach(record => {
                     if (record.target.classList.contains('hidden')) return;
-                    if (panel.hidden) select(panel.dataset.sourcePanel);
+                    if (!panel.hidden) return;
+                    if (userIsBusyElsewhere) {
+                        markTabReady(panel.dataset.sourcePanel);
+                        return;
+                    }
+                    select(panel.dataset.sourcePanel);
                 });
             });
             results.forEach(el => observer.observe(el, { attributes: true, attributeFilter: ['class'] }));
@@ -1981,6 +2030,30 @@
             if (!target || target === field) return;
 
             const value = field.value.trim();
+
+            // Alan 9/14/26 - Never overwrite something the user already typed.
+            // This used to assign target.value unconditionally, so pasting an
+            // iNaturalist URL into the MycoMap box silently destroyed whatever
+            // was already in the iNaturalist box -- a URL the user had queued up
+            // and had no way to get back. Moving one value is a convenience;
+            // losing the other is not a trade worth making, so when the
+            // destination is occupied the tab is revealed and BOTH values are
+            // left exactly as they are, for the user to resolve.
+            if (target.value.trim() !== "") {
+                if (typeof window.openImportSection === "function") {
+                    window.openImportSection(source);
+                }
+                if (typeof showStatus === "function") {
+                    showStatus(
+                        `That looks like ${LABEL[source]} input, but the `
+                        + `${LABEL[source]} box already has something in it. `
+                        + `Nothing was moved — both entries are still there.`,
+                        "info"
+                    );
+                }
+                return;
+            }
+
             target.value = value;
             field.value = "";
             // Existing handlers (validation, button enable/disable, the detected
@@ -2591,7 +2664,17 @@
     }
 
     function isGenBankAccession(text) {
-        return /^[A-Z]{1,6}_?\d{5,9}(\.\d+)?$/i.test(text.trim());
+        const cleaned = String(text || '').trim();
+        const accessionShape = /^(?:[A-Z]\d{5}|[A-Z]{2}\d{6}|[A-Z]{2}\d{8}|[A-Z]{2}_\d{6}|[A-Z]{2}_\d{8,9}|[A-Z]{4}\d{8,10}|[A-Z]{6}\d{9,11})(?:\.\d+)?$/i;
+        if (!accessionShape.test(cleaned)) return false;
+
+        // Four-letter large-scale accessions overlap exactly with the labels
+        // Dikarya uses for iNaturalist observations (iNat + 8-10 digits).
+        // INAT is not an assigned INSDC project prefix, so mirror the backend's
+        // explicit exclusion instead of sending an observation id to NCBI.
+        const largeScale = /^(?:([A-Z]{4})\d{8,10}|([A-Z]{6})\d{9,11})(?:\.\d+)?$/i.exec(cleaned);
+        const prefix = largeScale && (largeScale[1] || largeScale[2]);
+        return !prefix || prefix.toUpperCase() !== 'INAT';
     }
 
     function parseGenBankAccessions(text) {
@@ -2604,17 +2687,12 @@
     // =========================================================================
     // GenBank Collection Locations
     // =========================================================================
-    // Alan 8/10/26 - Only treat real INSDC accession shapes as accessions when scanning
-    // inside FASTA headers, so identifiers like iNat108887661 are not looked up. Case is
-    // significant here for the same reason; pasted accessions are uppercase by convention.
-    const GENBANK_HEADER_ACCESSION_RE = /^(?:[A-Z]\d{5}|[A-Z]{2}\d{6}|[A-Z]{2}\d{8}|[A-Z]{2}_\d{6,9})(?:\.\d+)?$/;
-
     function extractHeaderAccessions(seq) {
         const header = `${seq?.name || ''} ${seq?.organism || ''}`;
         const found = [];
         for (const token of header.split(/[\s,;|()\[\]]+/)) {
             const normalized = token.trim().replace(/^>+/, '');
-            if (normalized && GENBANK_HEADER_ACCESSION_RE.test(normalized) && !found.includes(normalized)) {
+            if (normalized && isGenBankAccession(normalized) && !found.includes(normalized)) {
                 found.push(normalized);
             }
         }
@@ -3413,6 +3491,13 @@
             return;
         }
 
+        if (!quickTreeLengthCheckPasses()) {
+            mycomapQuickTreeBtn.disabled = false;
+            fetchMycomapBtn.disabled = false;
+            mycomapQuickTreeBtn.innerHTML = '<i class="fas fa-magic mr-2"></i> One-Click Tree';
+            return;
+        }
+
         mycomapQuickTreeBtn.innerHTML = '<i class="fas fa-spinner fa-spin mr-2"></i> Submitting...';
         showStatus('Building tree from Mycomap sequences...', 'info');
 
@@ -3426,7 +3511,15 @@
             trim_terminal_overhangs: true,
             tree_method: 'fasttree',
             tree_model: 'GTR+G',
-            bootstrap: 100,
+            // Says which button this came from, so the server does not have to
+            // infer it from the parameter set. "FastTree" on its own is an
+            // ordinary advanced choice; only the preset carries the 10 kb
+            // per-sequence cap.
+            submission_mode: 'quick_tree',
+            // No bootstrap: FastTree ignores it. It runs a fixed -boot N
+            // SH-like local-support resampling instead, which is what the
+            // viewer reports (support_type "sh_like"). Sending 100 only
+            // persisted a replicate count that never existed.
             import_filter_details: getImportFilterDetailsForPayload(),
             mycomap_blast_url: getMycomapBlastUrlForPayload()
         };
@@ -4639,6 +4732,8 @@
             return;
         }
 
+        if (!quickTreeLengthCheckPasses()) return;
+
         btn.disabled = true;
         btn.innerHTML = '<i class="fas fa-spinner fa-spin mr-2"></i> Submitting...';
         showStatus('Running Quick Tree analysis...', 'info');
@@ -4667,7 +4762,15 @@
             trim_terminal_overhangs: true,
             tree_method: 'fasttree',
             tree_model: 'GTR+G',
-            bootstrap: 100,
+            // Says which button this came from, so the server does not have to
+            // infer it from the parameter set. "FastTree" on its own is an
+            // ordinary advanced choice; only the preset carries the 10 kb
+            // per-sequence cap.
+            submission_mode: 'quick_tree',
+            // No bootstrap: FastTree ignores it. It runs a fixed -boot N
+            // SH-like local-support resampling instead, which is what the
+            // viewer reports (support_type "sh_like"). Sending 100 only
+            // persisted a replicate count that never existed.
             import_filter_details: getImportFilterDetailsForPayload(),
             mycomap_blast_url: getMycomapBlastUrlForPayload()
         };
@@ -5284,6 +5387,12 @@
 
         const payload = {
             input_type: 'sequence',
+            // The advanced builder can reproduce the Quick Tree preset's four
+            // values exactly (mafft + trimAl-gappy + FastTree + GTR+G is a
+            // reasonable thing to choose by hand), so it says which form it is
+            // rather than leaving the server to guess. Advanced submissions
+            // have always accepted long loci and still do.
+            submission_mode: 'advanced',
             sequence: buildFastaFromQueue(),
             sequence_metadata: buildSequenceMetadataFromQueue(),
             notes: notes,
@@ -5394,6 +5503,48 @@
             header = `${header} ${location}`;
         }
         return header;
+    }
+
+    // =========================================================================
+    // Quick Tree per-sequence ceiling
+    //
+    // Quick Tree is the fixed MAFFT --auto / trimAl / FastTree preset, meant for
+    // barcode-length reads. MAFFT --auto's cost grows with sequence length as
+    // well as count, so one pathological record can turn a ten-second job into
+    // one that holds the single worker slot for hours. The advanced tree
+    // builder is untouched: a long locus is a perfectly reasonable RAxML run.
+    //
+    // The same ceiling is enforced in app/api/routes.py, from
+    // QUICK_TREE_MAX_SEQUENCE_BP in app/services/tree_parameter_validation.py.
+    // This check only saves the user a round trip; it is not the boundary. The
+    // two constants are asserted equal by tests/test_quick_tree_limits.py.
+    // =========================================================================
+    const QUICK_TREE_MAX_SEQUENCE_BP = 10000;
+
+    function quickTreeOversizedSequences() {
+        return sequenceQueue
+            .map(seq => ({
+                name: seq.name || '',
+                length: String(seq.sequence || '').replace(/\s+/g, '').length,
+            }))
+            .filter(entry => entry.length > QUICK_TREE_MAX_SEQUENCE_BP);
+    }
+
+    // Returns true when the submission may go ahead; shows the error and
+    // returns false when it may not.
+    function quickTreeLengthCheckPasses() {
+        const oversized = quickTreeOversizedSequences();
+        if (oversized.length === 0) return true;
+        const longest = Math.max(...oversized.map(entry => entry.length));
+        showStatus(
+            `Quick Tree is intended for barcode-length sequences and does not accept `
+            + `individual sequences over ${QUICK_TREE_MAX_SEQUENCE_BP.toLocaleString()} bp. `
+            + `Use the advanced tree builder for longer loci. `
+            + `${oversized.length} sequence(s) exceed the limit; the longest is `
+            + `${longest.toLocaleString()} bp.`,
+            'error'
+        );
+        return false;
     }
 
     function buildFastaFromQueue() {

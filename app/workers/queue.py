@@ -7,7 +7,7 @@ from rq import Queue, Retry
 from rq.exceptions import NoSuchJobError
 from rq.job import Job as RqJob
 from flask import current_app
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 QUEUE_HIGH = "phylo_high"
 QUEUE_BULK = "phylo_bulk"
@@ -185,6 +185,37 @@ def safe_job_description(kind: str, job_params: Optional[Dict[str, Any]] = None,
     return " ".join(str(part) for part in parts)[:200]
 
 
+def apply_input_warnings(job_params: Dict[str, Any]) -> List[str]:
+    """Recompute ``job_params['input_warnings']`` from the current sequences.
+
+    Flags input that cannot produce an informative tree (two sequences, or a
+    set that is all one sequence). Advisory only: it never blocks a job.
+
+    **Must be recomputed after anything that removes records.** The warning
+    text quotes the count ("All 3 submitted sequences are identical"), and the
+    two-sequence warning only exists at a count of exactly two, so a dedup pass
+    that collapses three records to two both adds a warning and invalidates any
+    existing one. The observation dedup now runs twice -- offline at submit
+    time, then again in the worker where the NCBI annotation lookup is
+    affordable -- so this is called from both places rather than only the first.
+
+    Returns the warnings, and clears the key when there are none, so a refresh
+    can retract a warning that no longer applies.
+    """
+    from app.services.fasta_utils import describe_degenerate_input
+
+    input_warnings = describe_degenerate_input(
+        job_params.get("sequence", ""),
+        accession_count=len(job_params.get("accessions") or []),
+        blast_mode=job_params.get("blast_mode"),
+    )
+    if input_warnings:
+        job_params["input_warnings"] = input_warnings
+    else:
+        job_params.pop("input_warnings", None)
+    return input_warnings
+
+
 def prepare_phylo_job_params(job_params: Dict[str, Any]) -> None:
     """Apply submission-wide normalization before persistence or enqueueing."""
     # Collapse near-identical records that share an observation number. This
@@ -194,19 +225,10 @@ def prepare_phylo_job_params(job_params: Dict[str, Any]) -> None:
     from app.services.sequence_dedup_service import apply_observation_dedup
     apply_observation_dedup(job_params)
 
-    # Flag input that cannot produce an informative tree (two sequences, or a set
-    # that is all one sequence). Runs after dedup so the count is the one the
-    # pipeline will actually align, and here rather than in create_job so every
-    # submission path gets it. Callers read it back off job_params to show the
-    # user; it is advisory only and never blocks the job.
-    from app.services.fasta_utils import describe_degenerate_input
-    input_warnings = describe_degenerate_input(
-        job_params.get("sequence", ""),
-        accession_count=len(job_params.get("accessions") or []),
-        blast_mode=job_params.get("blast_mode"),
-    )
-    if input_warnings:
-        job_params["input_warnings"] = input_warnings
+    # After dedup, so the count is the one the pipeline will actually align,
+    # and here rather than in create_job so every submission path gets it.
+    # Callers read it back off job_params to show the user.
+    apply_input_warnings(job_params)
 
 
 # Which submissions belong on the slow lane.

@@ -137,16 +137,46 @@ BUCKET_TARGETED = "targeted"
 BUCKET_SCANNER = "scanner"
 
 
-def _looks_like_scanner(path_lower, user_agent, status, method):
-    """Internet-wide junk: software this host does not run and never has."""
+# The verbs Dikarya's own surface uses. Anything else reaching this host is a
+# probe by definition: the UI calls endpoints it knows, and no browser invents a
+# method. PROPFIND/TRACE/TRACK/CONNECT/SEARCH are the classic ones (WebDAV
+# discovery, cross-site tracing, open-proxy tests) and are worth *naming* rather
+# than folding into a catch-all, because "which verbs is this IP trying" is the
+# question a sweep signature answers.
+#
+# Alan 9/14/26 - request_diagnostics used to map every method outside its known
+# set to the literal string "OTHER" before calling in here, which threw away
+# exactly that signal: a PROPFIND sweep and a garbage verb were indistinguishable
+# once they arrived. The classifier now receives the real method (bounded and
+# stripped to A-Z, but not renamed) and does the mapping itself.
+SERVED_METHODS = frozenset({
+    "GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS",
+})
+
+# Reason codes for the scanner bucket, stable so they can be grepped and counted.
+SCANNER_REASONS = (
+    "known_scanner_path",
+    "unsupported_method",
+    "unknown_route",
+)
+
+
+def _scanner_reason(path_lower, user_agent, status, method):
+    """Why this is internet-wide junk, or None when it is not.
+
+    Software this host does not run and never has, or a verb it does not serve.
+    """
+    # The verb first: it is the more specific signal, and a PROPFIND sweep
+    # answers with 405 on almost every path it tries, so checking the status
+    # first would relabel every one of them as a path probe.
+    if method and method not in SERVED_METHODS:
+        return "unsupported_method"
     # A 405 means the route exists but not for that verb, which the UI never
     # does -- it only calls endpoints it knows. Under /api/ a 405 is instead a
     # real route/frontend mismatch and must stay visible.
     if status == 405 and not path_lower.startswith("/api/"):
-        return True
-    if method in {"PROPFIND", "TRACE", "TRACK", "OTHER"}:
-        return True
-    return (
+        return "known_scanner_path"
+    if (
         path_lower.endswith(STATIC_SUFFIXES)
         or path_lower.endswith((".bak", ".sql", ".yml", ".yaml", ".ini"))
         or SCRIPT_EXT_RE.search(path_lower) is not None
@@ -155,7 +185,22 @@ def _looks_like_scanner(path_lower, user_agent, status, method):
         or path_lower.startswith("/thumb/")
         or any(marker in path_lower for marker in SCANNER_MARKERS)
         or ("bot" in user_agent.lower() and not path_lower.startswith("/api/"))
-    )
+    ):
+        return "known_scanner_path"
+    return None
+
+
+def normalize_method(value):
+    """Bound an untrusted REQUEST_METHOD without changing what it means.
+
+    Kept semantically intact -- PROPFIND stays PROPFIND -- but stripped to
+    uppercase letters and length-capped, so an attacker-controlled verb cannot
+    carry a newline into a log line or blow up a counter key. An empty or
+    entirely non-alphabetic method resolves to "OTHER", which is not a real verb
+    and is therefore treated as unserved.
+    """
+    text = "".join(ch for ch in str(value or "").upper() if "A" <= ch <= "Z")
+    return text[:24] or "OTHER"
 
 
 def _is_app_surface(path_lower, app_segments):
@@ -190,7 +235,7 @@ def classify_request_failure(
     """
     raw = path or "/"
     lower = raw.split("?", 1)[0].lower()
-    method = (method or "GET").upper()
+    method = normalize_method(method or "GET")
     # Match against both the raw and the percent-decoded form: a probe arrives
     # encoded (%3Cscript%3E, %2e%2e%2f) precisely to slip past a literal check,
     # and the traversal patterns below cover only some encodings directly.
@@ -222,8 +267,9 @@ def classify_request_failure(
             return BUCKET_TARGETED, "api_surface_probe"
 
     # --- then internet-wide junk ---
-    if _looks_like_scanner(lower, user_agent or "", status, method):
-        return BUCKET_SCANNER, "known_scanner_path"
+    scanner_reason = _scanner_reason(lower, user_agent or "", status, method)
+    if scanner_reason:
+        return BUCKET_SCANNER, scanner_reason
 
     # An unmatched path that is neither a known probe nor part of this app's
     # surface is still junk rather than a user error: nothing in the UI links

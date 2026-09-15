@@ -20,7 +20,7 @@ from datetime import datetime, timezone
 from app.services.api_diagnostics import diagnostic_urlopen, record_api_failure
 import urllib.parse
 import urllib.error
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -90,30 +90,115 @@ class MycoMapRefreshError(Exception):
 MYCOMAP_OBSERVATION_REF_RE = re.compile(r"^(?:inat|mo):\d{1,12}$")
 
 
-def extract_mycomap_observation_reference(value: str) -> Optional[str]:
-    """Return an ``inat:<id>`` or ``mo:<id>`` reference found in a tip label."""
+_INAT_PATTERNS = (
+    r"\binat\s*:\s*(\d{1,12})\b",
+    r"\b(?:https?://)?(?:www\.)?(?:[a-z0-9-]+\.)*inaturalist(?:\.[a-z0-9-]+)+/observations/(\d{1,12})\b",
+    r"\bi\s*naturalist(?:\s*(?:observation|obs))?\s*[-_#:\s]*(\d{5,12})(?:[_-]\d+)?\b",
+    r"\binaturalist(?:\s*(?:observation|obs))?\s*[-_#:\s]*(\d{5,12})(?:[_-]\d+)?\b",
+    r"\binat(?:uralist)?(?:\s*(?:observation|obs))?\s*[-_#:\s]*(\d{5,12})(?:[_-]\d+)?\b",
+)
+
+# Alan 9/14/26 - "MO" is a real two-letter INSDC accession prefix, so the
+# compact token MO123456 is BOTH the Mushroom Observer label Dikarya prints on
+# tips and a syntactically valid GenBank nucleotide accession (2 letters + 6
+# digits -- the single most common accession shape there is). Reading a real
+# accession as an observation number is not a cosmetic mistake: observation
+# dedup collapses records that share a reference, so a GenBank record and an
+# unrelated Mushroom Observer observation whose numbers happen to match would
+# have one of them deleted from the tree.
+#
+# Every OTHER way of writing a Mushroom Observer reference is unambiguous,
+# because a GenBank accession has no separator between its letters and its
+# digits and never spells the site's name. Those stay in _MO_EXPLICIT_PATTERNS
+# and are honoured wherever they appear, including inside a GenBank record's own
+# qualifiers -- a submitter who wrote "Mushroom Observer 123456" in an /isolate
+# meant it. Only the compact form is gated, by the caller's knowledge of where
+# the sequence came from; see allow_compact_mo below.
+_MO_EXPLICIT_PATTERNS = (
+    r"\bmo\s*:\s*(\d{1,12})\b",
+    r"\b(?:https?://)?(?:www\.)?mushroomobserver\.org/(?:obs/)?(\d{1,12})\b",
+    r"\bmushroom\s*observer(?:\s*(?:observation|obs))?\s*[-_#:\s]*(\d{1,12})(?:[_-]\d+)?\b",
+    # "MO #123456", "MO-123456", "MO 123456": a separator between the prefix and
+    # the digits is exactly what no accession has. The five-digit floor is the
+    # one the compact form has always used, and it is what keeps a voucher such
+    # as "TENN-MO-45" from being read as observation 45.
+    r"\bmo\s*[-_#:/]\s*(\d{5,12})(?:[_-]\d+)?\b",
+    r"\bmo\s+(\d{5,12})(?:[_-]\d+)?\b",
+)
+
+# The ambiguous one: letters immediately followed by digits, no separator.
+_MO_COMPACT_PATTERN = r"\bmo(\d{5,12})(?:[_-]\d+)?\b"
+
+
+def extract_mycomap_observation_references(
+    value: str, *, allow_compact_mo: bool = True
+) -> List[str]:
+    """Every distinct observation reference in one string, best first.
+
+    The singular form below stops at the first match, which is what a caller
+    that only wants to label or fetch something needs. A caller about to
+    *delete* a record needs the whole list: a single ``/note`` reading
+    "sequenced from iNat 280384724; compare iNat 999999999" names two different
+    observations, and taking the first would group the record with one of them
+    on no evidence at all.
+
+    Ordering matches the singular form exactly -- every iNaturalist pattern
+    before every Mushroom Observer one, patterns in declaration order -- so
+    ``extract_mycomap_observation_references(x)[0]`` is always
+    ``extract_mycomap_observation_reference(x)``. Asserted in
+    tests/test_observation_provenance.py.
+    """
+    text = html.unescape(str(value or ""))
+    if not text:
+        return []
+
+    found: List[str] = []
+
+    def _collect(patterns, prefix):
+        for pattern in patterns:
+            for match in re.finditer(pattern, text, flags=re.IGNORECASE):
+                reference = f"{prefix}:{match.group(1)}"
+                # Several patterns match the same occurrence (an id written
+                # "iNat # 280384724" is found by three of them); the same
+                # observation named twice is not a conflict either way.
+                if reference not in found:
+                    found.append(reference)
+
+    _collect(_INAT_PATTERNS, "inat")
+    mo_patterns = _MO_EXPLICIT_PATTERNS
+    if allow_compact_mo:
+        mo_patterns = mo_patterns + (_MO_COMPACT_PATTERN,)
+    _collect(mo_patterns, "mo")
+    return found
+
+
+def extract_mycomap_observation_reference(
+    value: str, *, allow_compact_mo: bool = True
+) -> Optional[str]:
+    """Return an ``inat:<id>`` or ``mo:<id>`` reference found in a tip label.
+
+    ``allow_compact_mo=False`` suppresses the bare ``MO123456`` form, which is
+    shape-identical to a GenBank accession. Pass it when the text is known to
+    have come from GenBank/NCBI, or when the provenance is unknown and the
+    answer is about to be used destructively. Explicit Mushroom Observer
+    references (``mo:123456``, ``MO #123456``, a mushroomobserver.org URL, the
+    site's name spelled out) are unaffected either way.
+
+    The default stays True so display and lookup callers -- which only ever use
+    the answer to label or fetch something -- keep behaving as they did.
+    """
     text = html.unescape(str(value or ""))
     if not text:
         return None
 
-    inat_patterns = (
-        r"\binat\s*:\s*(\d{1,12})\b",
-        r"\b(?:https?://)?(?:www\.)?(?:[a-z0-9-]+\.)*inaturalist(?:\.[a-z0-9-]+)+/observations/(\d{1,12})\b",
-        r"\bi\s*naturalist(?:\s*(?:observation|obs))?\s*[-_#:\s]*(\d{5,12})(?:[_-]\d+)?\b",
-        r"\binaturalist(?:\s*(?:observation|obs))?\s*[-_#:\s]*(\d{5,12})(?:[_-]\d+)?\b",
-        r"\binat(?:uralist)?(?:\s*(?:observation|obs))?\s*[-_#:\s]*(\d{5,12})(?:[_-]\d+)?\b",
-    )
-    for pattern in inat_patterns:
+    for pattern in _INAT_PATTERNS:
         match = re.search(pattern, text, flags=re.IGNORECASE)
         if match:
             return f"inat:{match.group(1)}"
 
-    mo_patterns = (
-        r"\bmo\s*:\s*(\d{1,12})\b",
-        r"\b(?:https?://)?(?:www\.)?mushroomobserver\.org/(?:obs/)?(\d{1,12})\b",
-        r"\bmushroom\s*observer(?:\s*(?:observation|obs))?\s*[-_#:\s]*(\d{1,12})(?:[_-]\d+)?\b",
-        r"\bmo\s*#?\s*(\d{5,12})(?:[_-]\d+)?\b",
-    )
+    mo_patterns = _MO_EXPLICIT_PATTERNS
+    if allow_compact_mo:
+        mo_patterns = mo_patterns + (_MO_COMPACT_PATTERN,)
     for pattern in mo_patterns:
         match = re.search(pattern, text, flags=re.IGNORECASE)
         if match:

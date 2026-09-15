@@ -389,9 +389,16 @@ def record_identity(record):
     return (message.strip(), body, context)
 
 
+# The reason codes come from security_events.TARGETED_REASONS. They are
+# lowercase-with-underscores today, but `\w+` would silently truncate the first
+# one that used a dot or a dash (event slugs elsewhere in this file already do:
+# see the `event=degraded\.([\w.-]+)` pattern), reporting "job" for
+# "job_id.malformed" and splitting one reason across two rows. Match the same
+# character class the other slug parsers use, and assert against the real list
+# in tests/test_log_digest_security.py.
 SECURITY_RE = re.compile(
     r'event=security\.suspicious\s+method=(?P<method>\S+)\s+path=(?P<path>\S+)\s+'
-    r'status=(?P<status>\d+)\s+reason=(?P<reason>\w+)\s+client=(?P<client>\S+)'
+    r'status=(?P<status>\d+)\s+reason=(?P<reason>[\w.-]+)\s+client=(?P<client>\S+)'
 )
 SSE_CLOSED_RE = re.compile(
     r'event=sse\.closed.*?reason=(?P<reason>\w+)\s+duration_seconds=(?P<seconds>[\d.]+)'
@@ -494,6 +501,15 @@ def analyze_errors(cutoff, until=None):
                     client = suspicious.group("client")
                     if client and client != "-":
                         security_clients[reason].add(client)
+                    # Alan 9/14/26 - and nowhere else. A security.suspicious
+                    # record used to fall through into the generic exception
+                    # tally as well, so one probe was reported twice: once in
+                    # "App-targeted probes" and again as a top warning, where
+                    # meaningful_error_key() rendered it as an unreadable
+                    # "event=security.suspicious method=<...>" row that crowded
+                    # out real failures. Every record belongs to exactly one of
+                    # the three sections.
+                    continue
                 if "DEGRADED" in record:
                     event = re.search(r'event=degraded\.([\w.-]+)', record)
                     slug = event.group(1) if event else record.split("DEGRADED", 1)[-1].strip().split(":", 1)[0]

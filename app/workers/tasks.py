@@ -1343,6 +1343,10 @@ def run_phylo_job(job_params: dict) -> dict:
                 # MycoMap local hit with the GenBank deposit of the same
                 # collection, so without this the one flow most likely to
                 # produce duplicate tips was the one flow that never deduped.
+                #
+                # The GenBank-resolving pass below covers every job, prepared or
+                # not, so this one only has to run the offline grouping the
+                # submit path already did for the other flows.
                 from app.services.sequence_dedup_service import apply_observation_dedup
 
                 removed_duplicates = apply_observation_dedup(job_params)
@@ -1390,6 +1394,56 @@ def run_phylo_job(job_params: dict) -> dict:
                 job.meta["current_step"] = current_step
                 job.save_meta()
             
+            # Alan 9/14/26 - The observation dedup pass that is allowed to ask
+            # NCBI which observation a GenBank accession belongs to. It runs
+            # here, not in prepare_phylo_job_params(): that runs inside POST
+            # /api/job, where up to DEFAULT_LOOKUP_SECONDS of efetch held one of
+            # the (workers x threads) request slots for every submission that
+            # contained an accession. The submit path still does the offline
+            # grouping, so the payload reaching here is already deduped on the
+            # references its own FASTA carries; this adds only the ones that
+            # live in GenBank's annotation. Best effort throughout -- a failed
+            # or slow lookup leaves duplicate tips, never a failed job.
+            from app.services.sequence_dedup_service import apply_observation_dedup
+
+            resolved_duplicates = apply_observation_dedup(
+                job_params, resolve_genbank_references=True
+            )
+            if resolved_duplicates:
+                logger.info(
+                    "Observation dedup collapsed %d further duplicate record(s) "
+                    "using GenBank annotation.", resolved_duplicates,
+                )
+                # The degenerate-input warnings were computed at submit time,
+                # before this pass ran, so they describe a set of sequences that
+                # no longer exists: a three-record submission collapsed to two
+                # loses the "a two-sequence tree cannot show grouping" warning
+                # entirely, and an "All 3 submitted sequences are identical"
+                # warning now names the wrong count. The status page reads them
+                # off Job.metrics, so both copies have to be refreshed.
+                from app.workers.queue import apply_input_warnings
+
+                refreshed_warnings = apply_input_warnings(job_params)
+                _save_job_params(input_info_path, job_params)
+                try:
+                    warned_job = Job.query.get(job_id)
+                    if warned_job:
+                        metrics = dict(warned_job.metrics or {})
+                        metrics["input_warnings"] = refreshed_warnings
+                        warned_job.metrics = metrics
+                        db.session.commit()
+                except Exception:
+                    # Advisory metadata. The comment above promises this whole
+                    # pass never fails a job, and bookkeeping after the lookup
+                    # must not be the thing that breaks that promise.
+                    db.session.rollback()
+                    logger.warning(
+                        "event=job.input_warnings_refresh_failed Could not "
+                        "persist refreshed input warnings after observation "
+                        "dedup; the status page may show the pre-dedup set.",
+                        exc_info=True,
+                    )
+
             publish_step_start(job_id, STEP_INPUT, "Input Processing", "Validating input data")
             update_step_meta(job, STEP_INPUT, {
                 "state": STATE_RUNNING,

@@ -426,10 +426,32 @@ def install_scanner_log(path, level=logging.INFO) -> bool:
     The logger does not propagate: the whole point is to keep this volume out
     of errors.log, error.log and the worker console, so a root handler must
     never see it.
+
+    Alan 9/14/26 - The level and propagate=False are set BEFORE the filesystem
+    work, not after it. They used to be the last two statements, so a read-only
+    or full var/logs raised OSError out of mkdir()/WatchedFileHandler() with the
+    logger still propagating and still handler-less -- the exact opposite of the
+    intended fail-safe, and the failure mode where it matters most: sweeps are
+    heaviest when something is already wrong. Configured this way the worst case
+    is that scanner records are dropped (logging's "no handler" path, silenced
+    by the NullHandler), never that tens of thousands of them land in
+    errors.log.
+
+    Idempotent: a second call with a handler already attached still re-asserts
+    the level and propagate=False, so a caller that reconfigured the root
+    logger in between cannot leave this one leaking.
     """
     from logging.handlers import WatchedFileHandler
 
     scanner_logger = logging.getLogger(SCANNER_LOGGER_NAME)
+    scanner_logger.setLevel(level)
+    scanner_logger.propagate = False
+    # Without a handler, logging falls back to lastResort (stderr at WARNING).
+    # These records are INFO so lastResort would not print them, but a
+    # NullHandler makes the intent explicit and survives a level change.
+    if not any(isinstance(h, logging.NullHandler) for h in scanner_logger.handlers):
+        scanner_logger.addHandler(logging.NullHandler())
+
     target = os.path.abspath(str(path))
     already = _has_marked_handler(scanner_logger, SCANNER_LOG_MARKER) or any(
         getattr(handler, "baseFilename", None) == target
@@ -446,8 +468,6 @@ def install_scanner_log(path, level=logging.INFO) -> bool:
     ))
     setattr(handler, SCANNER_LOG_MARKER, True)
     scanner_logger.addHandler(handler)
-    scanner_logger.setLevel(level)
-    scanner_logger.propagate = False
     return True
 
 

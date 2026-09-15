@@ -46,15 +46,22 @@ _CACHE_MAX_ENTRIES = 20000
 _cache_lock = threading.Lock()
 _reference_cache: Dict[str, str] = {}
 
-# Ceiling on how long a submission may spend asking NCBI about accessions. The
-# lookup runs inside the request that creates a job, so it is bounded rather
-# than allowed to hold a Gunicorn slot through NCBI's retry schedule; running
-# out of budget means some duplicates survive, never that the job fails.
+# Ceiling on how long one dedup pass may spend asking NCBI about accessions.
+#
+# Alan 9/14/26 - This budget used to be the thing standing between a submission
+# and NCBI's retry schedule, because the lookup ran inside POST /api/job and so
+# held one of the (workers x threads) Gunicorn slots for every job containing an
+# accession. It no longer runs there: dedupe_by_observation() defaults to
+# resolve_genbank_references=False and only run_phylo_job() opts in, so the wait
+# is spent against the job's own RQ time budget with nobody watching. The
+# ceiling stays anyway -- a worker blocked on efetch is still a worker not
+# building trees -- but it is now a courtesy bound, not a request-latency one.
+# Running out of budget means some duplicates survive, never that the job fails.
 DEFAULT_LOOKUP_SECONDS = 12.0
 
-# Ceiling on how many accessions one submission will ask about. A job with more
+# Ceiling on how many accessions one dedup pass will ask about. A job with more
 # GenBank records than this is a bulk import, where a couple of duplicate tips
-# matter less than several minutes of efetch at submit time.
+# matter less than several minutes of efetch.
 MAX_LOOKUP_ACCESSIONS = 400
 
 
@@ -73,24 +80,82 @@ def _cache_put(keys: Iterable[str], reference: str) -> None:
 
 
 def observation_reference_from_record(record: Dict) -> str:
-    """Return 'inat:<id>'/'mo:<id>' for one parsed GenBank record, or ''."""
-    from app.services.mycomap_service import extract_mycomap_observation_reference
+    """Return 'inat:<id>'/'mo:<id>' for one parsed GenBank record, or ''.
+
+    The answer feeds *destructive* deduplication -- two records that share a
+    reference have one of them removed from the tree -- so "the first field that
+    matched" is not good enough. The trusted fields (the DEFINITION line and the
+    source qualifiers a collector actually writes their own identifier into) are
+    all read, and their distinct references counted:
+
+    * none            -> no reference
+    * exactly one     -> use it, however many fields repeated it
+    * two or more     -> the record contradicts itself. Log it and return ''
+                         rather than guessing which observation it belongs to;
+                         a duplicate tip is recoverable and a deleted record is
+                         not.
+
+    The blob -- definition + organism + every qualifier + the comment, run
+    together -- is consulted only when the trusted fields say nothing, because a
+    match in it means no more than "somewhere in this record", and an incidental
+    number in a /PCR_primers or a citation must not outrank a clean /isolate.
+
+    The bare ``MO123456`` token is never read as an observation here: this is by
+    construction a GenBank record, where that token is an accession. Explicit
+    Mushroom Observer references in the qualifiers still count -- see
+    ``extract_mycomap_observation_reference``.
+    """
+    from app.services.mycomap_service import extract_mycomap_observation_references
 
     source = record.get("source_features") or {}
-    candidates: List[str] = [str(record.get("definition") or "")]
-    candidates.extend(str(source.get(qualifier) or "")
-                      for qualifier in OBSERVATION_QUALIFIERS)
-    # The blob is the fallback rather than the first thing tried: it is
-    # definition + organism + every qualifier + the comment run together, so a
-    # match in it says only "somewhere in this record".
-    candidates.append(str(record.get("blob") or ""))
+    trusted: List[str] = [str(record.get("definition") or "")]
+    trusted.extend(str(source.get(qualifier) or "")
+                   for qualifier in OBSERVATION_QUALIFIERS)
 
-    for candidate in candidates:
+    found: List[str] = []
+    for candidate in trusted:
         if not candidate:
             continue
-        reference = extract_mycomap_observation_reference(candidate)
-        if reference:
-            return reference
+        # Every reference in the field, not just the first. A single /note
+        # reading "sequenced from iNat 280384724; compare iNat 999999999" names
+        # two observations, and stopping at the first would group the record
+        # with one of them on no evidence -- then delete whatever it collided
+        # with. The same observation repeated across isolate/note/definition is
+        # the normal case and is not a conflict; only distinct references are.
+        for reference in extract_mycomap_observation_references(
+            candidate, allow_compact_mo=False
+        ):
+            if reference not in found:
+                found.append(reference)
+
+    if len(found) == 1:
+        return found[0]
+    if len(found) > 1:
+        logger.warning(
+            "event=dedup.genbank_reference_ambiguous accession=%s references=%s "
+            "The record names more than one observation; it will not be used to "
+            "deduplicate.",
+            str(record.get("version") or record.get("accession") or "?"),
+            ",".join(sorted(found)[:5]),
+        )
+        return ""
+
+    blob = str(record.get("blob") or "")
+    if not blob:
+        return ""
+    # Same rule for the fallback: the blob is the whole record run together, so
+    # it is the candidate most likely to name two different things.
+    from_blob = extract_mycomap_observation_references(blob, allow_compact_mo=False)
+    if len(from_blob) == 1:
+        return from_blob[0]
+    if len(from_blob) > 1:
+        logger.warning(
+            "event=dedup.genbank_reference_ambiguous accession=%s references=%s "
+            "source=blob The record names more than one observation; it will "
+            "not be used to deduplicate.",
+            str(record.get("version") or record.get("accession") or "?"),
+            ",".join(sorted(from_blob)[:5]),
+        )
     return ""
 
 

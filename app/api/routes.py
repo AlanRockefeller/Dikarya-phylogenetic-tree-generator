@@ -21,9 +21,14 @@ from datetime import datetime
 
 from app.services.security_utils import validate_job_id, validate_safe_file_path, coerce_bool
 from app.services.job_id_service import generate_job_id
-from app.services.fasta_utils import GENBANK_ACCESSION_RE, is_genbank_accession
+from app.services.fasta_utils import (
+    GENBANK_ACCESSION_RE,
+    is_genbank_accession,
+    is_insdc_master_accession,
+)
 from app.services.tree_parameter_validation import (
     normalize_inherited_iqtree_ufboot_count,
+    quick_tree_length_error,
     validate_iqtree_ufboot_count,
 )
 from app.services.artifact_storage import (
@@ -970,6 +975,31 @@ def _parse_genbank_accession_tokens(value):
     return accessions, invalid
 
 
+def _master_accession_error(accessions):
+    """A user-facing rejection when a WGS/TSA/TLS *project* accession was entered.
+
+    A master record is the project header: it lists the project's contigs and
+    carries no bases, so fetching one returns an empty FASTA and the submission
+    used to fail several steps later as "NCBI could not resolve this
+    accession" -- which is both wrong and unactionable. Said here instead, where
+    the fix ("use an individual sequence accession") is obvious.
+
+    Returns None when nothing in ``accessions`` is a master record.
+    """
+    masters = [a for a in accessions if is_insdc_master_accession(a)]
+    if not masters:
+        return None
+    listed = ", ".join(masters[:10])
+    subject = "This is a project/master accession" if len(masters) == 1 else (
+        "These are project/master accessions"
+    )
+    return (
+        f"{listed}: {subject} and contains no sequence; enter an individual "
+        "sequence accession instead (a master record ends in zeros -- "
+        "AAAA01000000 is the project, AAAA01000001 is its first sequence)."
+    )
+
+
 def _split_fasta_header(header):
     """Split FASTA header into ID (first token) and description."""
     header = (header or "").strip()
@@ -1306,9 +1336,14 @@ def _fetch_genbank_sequences_for_queue(accessions, max_sequence_bp=MAX_CUSTOM_GE
             found = requested in found_bases
 
         if not found:
+            # A master record answers with annotation and no bases, so it lands
+            # here rather than in the length/empty branches above. Name it for
+            # what it is; "not_found" would send the user looking for a typo in
+            # an accession that exists.
             skipped.append({
                 "accession": accession,
-                "reason": "not_found"
+                "reason": "master_record" if is_insdc_master_accession(accession)
+                else "not_found"
             })
 
     return sequences, skipped
@@ -1416,6 +1451,11 @@ def fetch_genbank_accessions():
 
     if not accessions:
         return jsonify({"status": "error", "error": "No GenBank accessions provided"}), 400
+
+    master_error = _master_accession_error(accessions)
+    if master_error:
+        note_request_failure("genbank_master_accession")
+        return jsonify({"status": "error", "error": master_error}), 400
 
     if len(accessions) > MAX_CUSTOM_GENBANK_ACCESSIONS:
         return jsonify({
@@ -2805,6 +2845,16 @@ def create_job():
         note_request_failure("invalid_iqtree_bootstrap")
         return jsonify({"status": "error", "error": str(exc)}), 400
     job_params["bootstrap"] = _clamp_int(requested_bootstrap, 1000, 0, 10_000)
+    if tree_method == "fasttree" and "bootstrap" not in data:
+        # FastTree ignores this entirely -- it runs a fixed -boot N SH-like
+        # local-support resampling (FASTTREE_SH_RESAMPLES), which is why
+        # tree_builder_service already records metadata["bootstrap"] = None for
+        # it. Storing the generic 1000 default in input_info.json only made the
+        # job page claim a replicate count that never existed. The key is
+        # dropped rather than set to None: several readers do
+        # int(job_params.get("bootstrap", <default>)), which a stored None
+        # would break.
+        job_params.pop("bootstrap", None)
     job_params["mcmc_generations"] = _clamp_int(
         job_params.get("mcmc_generations"),
         Config.DEFAULT_MCMC_GENERATIONS, 1_000, 100_000_000
@@ -2847,6 +2897,16 @@ def create_job():
         except ValueError as e:
             note_request_failure("invalid_dna_fasta")
             return jsonify({"status": "error", "error": str(e)}), 400
+
+    # Quick Tree's per-sequence ceiling, enforced here as well as in the
+    # browser so a request built by hand cannot put a 150 kb genome through
+    # MAFFT --auto on the preset that exists for barcode-length reads. Scoped to
+    # the Quick Tree preset shape (see submission_is_quick_tree): the advanced
+    # builder and the v1 API still take whatever length they are given.
+    quick_tree_error = quick_tree_length_error(data, job_params.get("sequence", ""))
+    if quick_tree_error:
+        note_request_failure("quick_tree_sequence_too_long")
+        return jsonify({"status": "error", "error": quick_tree_error}), 400
 
     # Apply the same submission-wide dedup/warning logic enqueue_job normally
     # owns before persisting, then enqueue with that preparation disabled. This
@@ -5527,6 +5587,11 @@ def add_sequences_to_job(job_id):
                     "error": f"Invalid GenBank accession(s): {', '.join(invalid[:10])}"
                 }), 400
             
+            master_error = _master_accession_error(accessions)
+            if master_error:
+                note_request_failure("genbank_master_accession")
+                return jsonify({"status": "error", "error": master_error}), 400
+
             # Security: Limit number of accessions to prevent abuse
             if len(accessions) > MAX_CUSTOM_GENBANK_ACCESSIONS:
                  return jsonify({"status": "error", "error": f"Too many accessions (max {MAX_CUSTOM_GENBANK_ACCESSIONS})"}), 400

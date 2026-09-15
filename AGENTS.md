@@ -431,6 +431,118 @@ When a new CLI version is published:
 - All API responses use JSON; the frontend is a SPA-style UI talking to `/api/` endpoints.
 - FASTA sequence headers are sanitized on input and restored on download/display (see `fasta_utils.py`).
 - RAxML-NG jobs use named presets (`fast_good`, `standard`, `publication`, `maximum`) defined in `tree_builder_service.py`.
+- **`MAFFT_DIRECTION_MODE` chooses which direction check the normal alignment
+  runs**: `fast` (`--adjustdirection`, the default), `accurate`
+  (`--adjustdirectionaccurately`) or `off` (no flag). It is validated at import
+  time and an unrecognised value falls back to `fast` with a warning -- never
+  to `off`, which would silently disable direction correction. It does not
+  override the per-job `fix_orientation` setting: false there still means no
+  direction flag whatever the mode is. `accurate` exists so the change can be
+  rolled back in production by setting one environment variable, without a
+  deploy. Deliberately scoped to `_run_mafft()`; `fix_direction_with_mafft()`,
+  the direction-only pre-pass MUSCLE/Clustal Omega/IQ-TREE depend on, stays on
+  the accurate check because there MAFFT's answer is the only direction signal
+  there is. Every invocation logs `event=alignment.mafft_completed` with its own
+  elapsed time, `outcome` (`success`/`failed`) and `_R_` count. Emitted from a
+  `finally` around the subprocess only, so: a veto rerun is measured
+  separately; a run that times out having produced nothing -- the one whose
+  duration matters most -- is still recorded as `outcome=failed`; a MAFFT run
+  whose `_R_` markers then fail to parse is recorded as `outcome=success` with
+  `aligner_reversed_count=unknown` (never `0`, which would read as "reversed
+  nothing"); and a `publish_command` failure records nothing, because MAFFT
+  never started.
+- **ORIENT-vs-MAFFT disagreement is header-matched, not count-matched.** MAFFT
+  names the records it reversed through its `_R_` headers, so the disagreement
+  is `flipped - orient_uncertain - orient_never_saw` over sets, published as
+  `aligner_reversed_count` / `orient_uncertain_count` /
+  `aligner_orientation_disagreement_count`. Only a genuine contradiction is a
+  `DEGRADED`; a flip of a record ORIENT declined to call is an INFO line. When
+  the ORIENT headers were not persisted the answer is reported as unknown
+  (`disagreement=None`, `basis=counts`) rather than guessed from two totals.
+- **Quick Tree refuses individual sequences over
+  `QUICK_TREE_MAX_SEQUENCE_BP` (10,000 bp).** The constant and the
+  preset-detection live in `app/services/tree_parameter_validation.py`; the
+  browser mirrors it in `sequence_entry.html` and the two are asserted equal by
+  `tests/test_quick_tree_limits.py`. Which submissions are capped is decided by
+  the explicit `submission_mode` the Tree Builder posts -- both Quick Tree
+  buttons send `"quick_tree"`, the advanced form sends `"advanced"` -- with an
+  exact match of `QUICK_TREE_PRESET` as the fallback for a body that carries no
+  marker, or one nobody recognises (a cached page, a script, a typo -- falling
+  back rather than failing open is deliberate, since a mistyped marker would
+  otherwise switch the guardrail off silently). Only an explicit `"advanced"`
+  opts out. "Uses FastTree" is **not** the test: a
+  deliberate FastTree + MUSCLE + no-trimming request is an advanced submission,
+  and the advanced form can reproduce the preset's four values by hand, which
+  is why the marker exists.
+
+  **It is a guardrail, not an abuse boundary.** A caller who declares
+  `advanced` is not capped, deliberately: the advanced builder has always
+  accepted a 150 kb locus, so declaring advanced mode opens nothing that was
+  not already open. What the cap prevents is the accident -- a genome pasted
+  into the two-click preset meant for barcode reads. A real ceiling on pipeline
+  cost would have to be tied to the work itself (total bases x sequence count
+  against the aligner that will run), not to which button was pressed. The v1
+  API is untouched.
+- **Quick Tree sends no `bootstrap`.** FastTree ignores it: `_run_fasttree`
+  hardcodes `-boot FASTTREE_SH_RESAMPLES`, which is SH-like local support, not
+  bootstrap proportions, and `tree_builder_service` already records
+  `bootstrap: None` / `support_type: "sh_like"` for it. `create_job` drops an
+  unsent bootstrap for FastTree rather than persisting the generic 1000
+  default; an explicitly submitted one is still stored.
+- **GenBank accession policy lives in `fasta_utils.GENBANK_ACCESSION_RE`.** The
+  large-scale INSDC families (WGS contigs, TSA transcripts, TLS targeted-locus
+  records) share one accession structure and the string does not say which is
+  which, so Dikarya accepts the syntax rather than the family -- NCBI runs TLS
+  projects for ITS/ITS2, so an individual TLS record is often exactly what this
+  app is for. The real shapes are 4 letters + 8-10 digits and 6 letters + 9-11
+  digits (project code + 2-digit assembly version + contig digits); the
+  intermediate counts are valid and were previously rejected.
+  `_NON_INSDC_LARGE_SCALE_PREFIXES` excludes `INAT` by name, because "iNat" + 9
+  digits is shape-identical to a 4+9 accession and 318,227 records on disk are
+  exactly that against three real large-scale accessions ever submitted.
+  `is_insdc_master_accession()` recognises a project/master record
+  syntactically (every digit after the assembly version is zero); those carry no
+  sequence and are refused at the accession entry points with an explanation
+  rather than failing later as "NCBI could not resolve this". Per-sequence size
+  is bounded by the existing `MAX_CUSTOM_GENBANK_SEQUENCE_BP`, applied on both
+  user-facing accession paths -- no accession-family-specific limit.
+- **`MO123456` is ambiguous and dedup is destructive.** "MO" is a real INSDC
+  prefix, so the compact token is both a Mushroom Observer tip label and a
+  valid 2+6 accession. `extract_mycomap_observation_reference(...,
+  allow_compact_mo=False)` suppresses only that form; `mo:123456`, `MO #123456`,
+  a mushroomobserver.org URL and the spelled-out site name have no accession
+  shape and are always honoured, including inside a GenBank record's
+  qualifiers. `sequence_dedup_service.record_provenance()` decides which to use
+  from `source`/`hit_source` metadata, falling back to the version suffix
+  (`MO123456.1` is GenBank; a Mushroom Observer label never carries one).
+  `record_accession()` uses the same rule, so a MycoMap local hit's `MO######`
+  internal id is never sent to NCBI as an accession.
+- **`observation_reference_from_record()` refuses to guess.** It reads every
+  trusted field (DEFINITION plus the `OBSERVATION_QUALIFIERS`) and uses the
+  answer only when they agree on exactly one observation; two distinct
+  references log `event=dedup.genbank_reference_ambiguous` and yield nothing.
+  "Distinct" is counted *within* a field as well as across fields, via
+  `extract_mycomap_observation_references()` (plural) -- a single `/note`
+  reading "sequenced from iNat 280384724; compare iNat 999999999" is exactly
+  as undecidable as two fields disagreeing. The whole-record blob is a
+  fallback, never an override, and is held to the same rule. The singular
+  `extract_mycomap_observation_reference()` stays on the per-record hot path
+  and short-circuits; the two share one set of patterns and a test asserts
+  `plural[0] == singular`.
+- **The observation dedup's NCBI lookup runs in the worker, not in the
+  request.** `dedupe_by_observation` / `apply_observation_dedup` default to
+  `resolve_genbank_references=False`; `prepare_phylo_job_params` (which runs
+  inside `POST /api/job`) keeps the offline grouping and `run_phylo_job` does
+  the resolving pass before the INPUT step. `record_dedup_details` accumulates
+  across passes, so the second pass cannot erase the first pass's removed
+  records -- which the "rebuild including duplicates" action needs.
+
+  **Anything that removes records must then call `apply_input_warnings()`**
+  (`app/workers/queue.py`). The degenerate-input warnings depend on the record
+  count and quote it in their text, so a pass that collapses three records to
+  two both earns a warning and invalidates any existing one. The worker
+  refreshes `job_params` *and* the `Job.metrics` copy, because
+  `app/main/routes.py` renders the status page from the latter.
 - **Job IDs come in two shapes and both stay valid forever.** Jobs minted
   before 2026-09-09 are UUID4; new ones are a short lowercase base36 string
   (`/job/aq7c/view`), minted by `generate_job_id()` in
@@ -568,7 +680,15 @@ internet-wide vulnerability sweeps. `app/services/security_events.py` splits
 them, and `classify_request_failure()` is the single place that decides:
 
 - **scanner** -- a probe for software this host does not run (`/.env`,
-  `/.git/config`, `/wp-admin/...`, a `PROPFIND`). Written to `var/logs/scanner.log`
+  `/.git/config`, `/wp-admin/...`) or a verb it does not serve. The HTTP method
+  reaches `classify_request_failure()` intact (bounded and stripped to A-Z by
+  `normalize_method()`, never renamed), so `PROPFIND`, `TRACE` and `CONNECT`
+  are reported as `reason=unsupported_method` rather than all collapsing into
+  one anonymous bucket -- the verb is the sweep signature. The verb is checked
+  before the status, because a PROPFIND sweep answers 405 on nearly every path
+  it tries. A scanner classification is filed to `var/logs/scanner.log`
+  whether or not a Flask route matched; a matched route still keeps its
+  ordinary `http.request_failed` line. Written to `var/logs/scanner.log`
   as `event=security.scanner` on the `dikarya.scanner` logger, which has
   `propagate = False` so this volume can never reach `errors.log` or the worker
   console. Kept rather than dropped: a sweep is evidence when the same IP later
@@ -581,6 +701,19 @@ them, and `classify_request_failure()` is the single place that decides:
   "App-targeted probes" section.
 - **neither** -- an ordinary user 4xx keeps its existing
   `event=http.request_failed` line, unchanged.
+
+`install_scanner_log()` sets the logger's level and `propagate = False`
+**before** it touches the filesystem, and re-asserts them on an already
+configured logger. They used to be the last two statements, so a read-only or
+full `var/logs` raised `OSError` out of `mkdir()` with the logger still
+propagating and handler-less -- every scanner record then fell through to the
+root logger, which is the WARNING+ `errors.log` mirror. That is the opposite of
+the intended fail-safe, and it fires exactly when it hurts most.
+
+The digest counts a `security.suspicious` record **once**, in the App-targeted
+probes section. It used to fall through into the generic exception tally as
+well, where `meaningful_error_key()` rendered it as an unreadable
+`event=security.suspicious method=<...>` row that crowded out real failures.
 
 Three rules when editing this:
 

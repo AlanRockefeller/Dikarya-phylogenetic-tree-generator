@@ -6,13 +6,24 @@
 # 5.3 GB var/jobs, so the retention was buying nothing and costing history --
 # errors.log alone is 2.8 KB/day, about 1 MB/year.
 #
-# Nothing is deleted now: `rotate` is set high enough to never be reached and
-# `maxage` is gone. Revisit only if var/logs stops being a rounding error next
-# to var/jobs.
+# Nothing is deleted now: `rotate -1` is logrotate's own "never remove old
+# logs" value (verified against the installed logrotate 3.21.0 with
+# `logrotate --debug`), and `maxage` is gone. It replaced `rotate 99999`, which
+# only approximated the same thing. Revisit only if var/logs stops being a
+# rounding error next to var/jobs.
+#
+# `dateext` matters more with unlimited retention than it did with 14 slots:
+# without it every rotation renames the whole chain (foo.log.1 -> foo.log.2 ->
+# ... ), so keeping years of files would mean thousands of renames per run.
+# With dateext each rotation is written once under its own timestamp and never
+# touched again. Nothing reads these by name -- the digest globs `<stem>.log*`
+# and orders by mtime (scripts/dikarya_log_digest.py:log_files), and
+# scripts/dikarya-nginx-log reads /var/log/nginx, which this file does not
+# manage -- so the naming is free to be the timestamped one.
 /var/www/dikarya/var/logs/access.log /var/www/dikarya/var/logs/error.log /var/www/dikarya/var/logs/errors.log /var/www/dikarya/var/logs/worker.log /var/www/dikarya/var/logs/worker-bulk.log /var/www/dikarya/var/logs/scanner.log {
     daily
     maxsize 25M
-    rotate 99999
+    rotate -1
     missingok
     notifempty
     compress

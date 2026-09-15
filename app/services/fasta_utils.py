@@ -520,30 +520,53 @@ def reconstruct_name_map(alignment_path) -> Dict[str, str]:
 # INSDC nucleotide accessions come in a small number of fixed shapes, and a
 # catch-all (1-6 letters + 5-9 digits) is loose enough to accept things that
 # are not accessions at all: an iNaturalist observation id pasted into the
-# accession box ("INAT125467754", 4 letters + 9 digits) matched, was sent to
-# NCBI, and came back as an opaque 400 that took the rest of its batch down
-# with it. Matching the real shapes rejects it here, by name, instead.
+# accession box ("INAT125467754") matched, was sent to NCBI, and came back as
+# an opaque 400 that took the rest of its batch down with it. Matching the real
+# shapes rejects it here, by name, instead.
 #
 #   1 letter  + 5 digits            e.g. U49845
 #   2 letters + 6 digits            e.g. OR807397, AF123456
 #   2 letters + 8 digits            e.g. KY12345678
 #   RefSeq: 2 letters + '_' + 6, 8 or 9 digits   e.g. NC_012345, NM_001234567
-#   WGS: 4 letters + 2-digit assembly version + 6 or 8 contig digits, so
-#        exactly 4+8 or 4+10 e.g. AAAA01000001. Notably never 4+9, which is
-#        what keeps the observed iNaturalist id from matching this arm.
-#   WGS (6-letter prefix): 6 letters + 2-digit assembly version + 7 or 9
-#        contig digits e.g. AAAAAA010000001. No iNaturalist id has ever had
-#        six leading letters, so this arm costs nothing to allow -- and
-#        without it a perfectly ordinary INSDC accession was rejected as "not
-#        an accession" before any NCBI call.
 #
-# A 4+8 id is genuinely ambiguous -- "INAT12546775" is shape-identical to a
-# real WGS accession, and no pattern can separate them. That case still reaches
-# NCBI, which is why _fetch_genbank_xml_batch also isolates a failing accession
-# rather than letting it void its whole batch.
+# Large-scale INSDC projects -- WGS (assembly contigs), TSA (assembled
+# transcripts) and TLS (Targeted Locus Study) -- share one accession structure,
+# and the accession string does NOT say which of the three it is. Dikarya
+# accepts the syntax rather than the family, because a TLS record is very often
+# exactly what this application is for: NCBI runs TLS projects for ITS/ITS2 and
+# the ribosomal loci, and an individual TLS or WGS record is a single sequence,
+# not a genome. Per NCBI (https://www.ncbi.nlm.nih.gov/genbank/wgs/) and the
+# December 2018 INSDC expansion:
 #
-# Lives here rather than in app/api/routes.py so services can use it without
-# importing a route module; routes re-exports it under its old private name.
+#   4-letter project code + 2-digit assembly version + 6-8 contig digits
+#       => 4 letters + 8, 9 or 10 digits, e.g. AAAA01000001
+#   6-letter project code + 2-digit assembly version + 7-9 contig digits
+#       => 6 letters + 9, 10 or 11 digits, e.g. AAAAAA010000001
+#
+# The intermediate digit counts (4+9, 6+10) are real; an earlier version of this
+# pattern listed only 4+8/4+10 and 6+9/6+11 and so rejected perfectly ordinary
+# accessions as "not an accession" before any NCBI call.
+#
+# Alan 9/14/26 - _NON_INSDC_LARGE_SCALE_PREFIXES is the price of that accuracy.
+# "iNat" + a 9-digit observation id is shape-identical to a 4+9 WGS/TSA/TLS
+# accession, and it is not a hypothetical collision: across the 11,670 job
+# directories on disk, 318,227 submitted records lead with iNat + 9 digits and
+# 25,824 more with iNat + 8 digits, against a grand total of THREE real
+# large-scale accessions ever submitted (AYNK01000855.1 twice and AYNK01002478.1
+# once, both individual contigs of 4,104 and 2,618 bp). Treating those labels as
+# accessions would send hundreds of thousands of them to NCBI and, worse, make
+# record_accession() report an accession for every iNaturalist tip in the tree,
+# which is what the observation dedup groups on. INAT is not an assigned INSDC
+# project code, so excluding it costs nothing real and is checked by name rather
+# than by digit count.
+_NON_INSDC_LARGE_SCALE_PREFIXES = frozenset({"INAT"})
+
+_LARGE_SCALE_ACCESSION_RE = re.compile(
+    r'^(?P<prefix>[A-Z]{4})(?P<digits>\d{8,10})(?:\.\d+)?$'
+    r'|^(?P<prefix6>[A-Z]{6})(?P<digits6>\d{9,11})(?:\.\d+)?$',
+    re.IGNORECASE,
+)
+
 GENBANK_ACCESSION_RE = re.compile(
     r'^(?:'
     r'[A-Z]\d{5}'
@@ -551,15 +574,62 @@ GENBANK_ACCESSION_RE = re.compile(
     r'|[A-Z]{2}\d{8}'
     r'|[A-Z]{2}_\d{6}'
     r'|[A-Z]{2}_\d{8,9}'
-    r'|[A-Z]{4}\d{8}'
-    r'|[A-Z]{4}\d{10}'
-    r'|[A-Z]{6}\d{9}'
-    r'|[A-Z]{6}\d{11}'
+    r'|[A-Z]{4}\d{8,10}'
+    r'|[A-Z]{6}\d{9,11}'
     r')(?:\.\d+)?$',
     re.IGNORECASE,
 )
 
 
+def _large_scale_parts(text: str):
+    """Return ``(prefix, digits)`` for a WGS/TSA/TLS-shaped accession, else None."""
+    match = _LARGE_SCALE_ACCESSION_RE.match((text or "").strip())
+    if not match:
+        return None
+    prefix = match.group("prefix") or match.group("prefix6")
+    digits = match.group("digits") or match.group("digits6")
+    return prefix.upper(), digits
+
+
 def is_genbank_accession(text: str) -> bool:
-    """Check if text looks like a GenBank accession number."""
-    return bool(GENBANK_ACCESSION_RE.match((text or "").strip()))
+    """Check if text looks like a GenBank accession number.
+
+    Shape only. It says nothing about whether NCBI holds the record, and
+    nothing about whether the record carries sequence -- see
+    ``is_insdc_master_accession`` for the one syntactic case that cannot.
+    """
+    cleaned = (text or "").strip()
+    if not GENBANK_ACCESSION_RE.match(cleaned):
+        return False
+    parts = _large_scale_parts(cleaned)
+    if parts and parts[0] in _NON_INSDC_LARGE_SCALE_PREFIXES:
+        return False
+    return True
+
+
+def is_insdc_master_accession(text: str) -> bool:
+    """True for a WGS/TSA/TLS project (master) accession, which has no sequence.
+
+    A master record is the project header: it lists the contigs and carries no
+    bases at all, so fetching one yields an empty FASTA and the submission ends
+    up reporting "NCBI could not resolve this accession", which is both wrong
+    and unhelpful. The shape is unambiguous and needs no network call: after the
+    2-digit assembly version, every remaining digit is zero.
+
+        AAAA00000000     the project
+        AAAA01000000     the project's first assembly version
+        AAAA01000001     an individual contig -- NOT a master record
+
+    Deliberately syntactic and deliberately narrow. WGS, TSA and TLS are not
+    distinguishable from the accession string, and this does not try: it
+    separates "project header" from "individual record", which is the only
+    distinction that changes what Dikarya can do with it.
+    """
+    parts = _large_scale_parts(text)
+    if not parts:
+        return False
+    prefix, digits = parts
+    if prefix in _NON_INSDC_LARGE_SCALE_PREFIXES:
+        return False
+    # digits = 2-digit assembly version + contig id.
+    return set(digits[2:]) == {"0"}
