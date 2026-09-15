@@ -199,10 +199,6 @@ class ObservationDedupTests(unittest.TestCase):
         self.assertEqual(removed, [])
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 class LookupPlacementTests(unittest.TestCase):
     """The NCBI annotation lookup belongs in the worker, not in the request.
 
@@ -394,6 +390,61 @@ class InputWarningRefreshTests(unittest.TestCase):
         # Advisory metadata must never be the thing that fails a job.
         self.assertIn("db.session.rollback()", window)
 
+    def test_a_prepared_import_changed_only_by_the_first_pass_is_refreshed(self):
+        """3 records to 2 offline, and the GenBank pass then removes nothing.
+
+        The iNaturalist and Mushroom Observer flows assemble their sequences in
+        the worker, so the submit-time warnings were computed over an empty
+        payload. Refreshing only when the later GenBank-resolving pass removes
+        something leaves exactly this import with no warning at all.
+        """
+        # No accession here, so the GenBank-resolving pass has nothing to add.
+        job_params = {
+            "sequence": _fasta(
+                ("iNat280384724 Panaeolus cinctulus Greenwood", SEQUENCE),
+                ("mo:123456 Panaeolus cinctulus", SEQUENCE[:-40]),
+                ("iNat 280384724 Panaeolus cinctulus duplicate", SEQUENCE[20:-20]),
+            ),
+            "sequence_metadata": [],
+            "accessions": [],
+        }
+
+        # The prepared import's own pass: offline, and it is what collapses the
+        # two records naming the same observation.
+        removed = dedup.apply_observation_dedup(job_params)
+        self.assertEqual(removed, 1)
+        self.assertEqual(job_params["sequence"].count(">"), 2)
+
+        refreshed = self._warnings(job_params)
+        self.assertEqual(len(refreshed), 1)
+        self.assertIn("Only two sequences", refreshed[0])
+        self.assertEqual(job_params["input_warnings"], refreshed)
+
+        # ...and the later GenBank-resolving pass removes nothing, so it is not
+        # the thing that can be relied on to refresh the warning.
+        self.assertEqual(
+            dedup.apply_observation_dedup(job_params, resolve_genbank_references=True),
+            0,
+        )
+
+    def test_the_worker_refreshes_both_copies_after_a_prepared_import(self):
+        source = open(
+            Path(__file__).resolve().parents[1] / "app" / "workers" / "tasks.py"
+        ).read()
+        index = source.index("removed_duplicates = apply_observation_dedup(job_params)")
+        window = source[index:index + 2500]
+        # Unconditional: the submit-time answer was computed over an empty
+        # payload, so it is stale whether or not this pass removed anything.
+        self.assertIn("refreshed_input_warnings = apply_input_warnings(job_params)",
+                      window)
+        self.assertIn("_save_job_params(input_info_path, job_params)", window)
+        # The Job.metrics copy the status page renders...
+        self.assertIn('metrics["input_warnings"] = refreshed_input_warnings', window)
+        # ...including removing a stale key when nothing warrants a warning now.
+        self.assertIn('metrics.pop("input_warnings", None)', window)
+        # Advisory metadata must never be the thing that fails a valid job.
+        self.assertIn("except Exception:", window)
+
     def test_the_submit_path_uses_the_same_helper(self):
         # One definition of "what counts as degenerate input", so the two
         # passes cannot disagree about it.
@@ -403,3 +454,7 @@ class InputWarningRefreshTests(unittest.TestCase):
         self.assertIn("apply_input_warnings(job_params)", source)
         # Exactly one call site, inside the helper both passes go through.
         self.assertEqual(source.count("describe_degenerate_input("), 1)
+
+
+if __name__ == "__main__":
+    unittest.main()

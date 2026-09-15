@@ -312,7 +312,8 @@ def _schemas():
                     "type": "string",
                     "enum": [
                         "full_match", "exhausted", "no_clues",
-                        "large_stage", "budget_exhausted", "failures",
+                        "large_stage", "budget_exhausted", "deadline_exhausted",
+                        "failures",
                     ],
                 },
                 "message": {"type": ["string", "null"]},
@@ -1147,8 +1148,11 @@ def build_spec():
                         "request; malformed input is still a 422, and an unreachable "
                         "iNaturalist is still an upstream error.\n\n"
                         "**Bounded work, with resume.** A single request checks at most "
-                        "10,000 observation numbers, and never starts a stage wider than "
-                        "5,000 without being asked. When either limit is reached the "
+                        "10,000 observation numbers, spends at most 150 seconds, and never "
+                        "starts a stage wider than 5,000 without being asked. The time "
+                        "limit is separate from the candidate limit because pacing, "
+                        "rate-limit retries and project-membership lookups make a candidate "
+                        "count a poor predictor of duration. When any limit is reached the "
                         "response is `status: \"needs_confirmation\"` with a `resume` cursor "
                         "and a `next_stage` estimate; repeat the request with that cursor "
                         "(and `confirm: true` for a large stage) to continue from exactly "
@@ -1309,7 +1313,7 @@ def build_spec():
                             ),
                             "content": _data_response("InaturalistFinderAnyResult"),
                         },
-                        **{k: v for k, v in COMMON_ERRORS.items() if k in ("401", "403", "409", "413", "422", "429", "500")},
+                        **{k: v for k, v in COMMON_ERRORS.items() if k in ("400", "401", "403", "409", "413", "422", "429", "500")},
                         "502": {"description": "iNaturalist was unavailable", "content": _error_response()},
                         "503": {"description": "The shared iNaturalist request queue was busy", "content": _error_response()},
                     },

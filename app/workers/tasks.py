@@ -1356,12 +1356,41 @@ def run_phylo_job(job_params: dict) -> dict:
                         "the prepared %s import.",
                         removed_duplicates, tree_preparation_kind or "source",
                     )
+                # The degenerate-input warnings on this job were computed at
+                # submit time, when the prepared payload was still empty, and
+                # the dedup above can change the record count again. Recompute
+                # against the populated, deduplicated payload -- including when
+                # this pass removed nothing, because the submit-time answer was
+                # never about these sequences. Advisory bookkeeping only: it
+                # must never be what fails an otherwise valid tree job.
+                refreshed_input_warnings = None
+                input_warnings_refreshed = False
+                try:
+                    from app.workers.queue import apply_input_warnings
+
+                    refreshed_input_warnings = apply_input_warnings(job_params)
+                    input_warnings_refreshed = True
+                except Exception:
+                    logger.warning(
+                        "event=job.input_warnings_refresh_failed Could not "
+                        "recompute input warnings for the prepared %s import; "
+                        "the status page may show the pre-import set.",
+                        tree_preparation_kind or "source", exc_info=True,
+                    )
                 _save_job_params(input_info_path, job_params)
 
                 db_job = Job.query.get(job_id)
                 if db_job:
                     metrics = dict(db_job.metrics or {})
                     metrics.update(prepared["metrics"])
+                    # The status page renders warnings from Job.metrics, so the
+                    # refreshed list has to land there too -- and an empty one
+                    # has to remove the stale key rather than leave it behind.
+                    if input_warnings_refreshed:
+                        if refreshed_input_warnings:
+                            metrics["input_warnings"] = refreshed_input_warnings
+                        else:
+                            metrics.pop("input_warnings", None)
                     db_job.metrics = metrics
                     db_job.input_type = job_params["input_type"]
                     db.session.commit()

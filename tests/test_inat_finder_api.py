@@ -239,10 +239,12 @@ class InatFinderAutoModeTests(unittest.TestCase):
              fail_membership=False, resolve=_fake_resolve, **kwargs):
         self.requested = []
         self.membership_calls = []
+        self.timeouts = []
         calls = {"n": 0}
 
-        def fetch(ids, project_id=None):
+        def fetch(ids, project_id=None, timeout=None):
             calls["n"] += 1
+            self.timeouts.append(timeout)
             if fail_observations and fail_observations(calls["n"]):
                 raise InatTreeError("iNaturalist is unreachable")
             if project_id is not None:
@@ -571,6 +573,148 @@ class InatFinderAutoModeTests(unittest.TestCase):
         self.assertFalse(result["complete"])
         self.assertGreater(result["unchecked_variations"], 0)
         self.assertIsNone(result["resume"])
+
+
+class InatFinderDeadlineTests(unittest.TestCase):
+    """The wall-clock deadline: MAX_REQUEST_CANDIDATES bounds work, not time.
+
+    Pacing, 429 retry schedules, the 20s socket timeout and the extra project
+    membership request all cost seconds a candidate count cannot predict, so a
+    search that stayed inside its candidate budget could still outlive nginx's
+    300s proxy_read_timeout -- and lose the resume cursor with the connection.
+    """
+
+    def _run_clocked(self, universe, *, advance, start=1000.0,
+                     fail_observations=None, membership=None, **kwargs):
+        """Run an auto search on a fake monotonic clock.
+
+        ``advance`` seconds are charged to every observation request, which is
+        where a real search spends the time this deadline exists to bound.
+        """
+        self.requested = []
+        self.timeouts = []
+        now = {"t": start}
+        calls = {"n": 0}
+
+        def fetch(ids, project_id=None, timeout=None):
+            calls["n"] += 1
+            self.timeouts.append(timeout)
+            now["t"] += advance
+            if fail_observations and fail_observations(calls["n"]):
+                raise InatTreeError("iNaturalist is unreachable")
+            if project_id is not None:
+                return [universe[str(i)] for i in ids
+                        if str(i) in universe and str(i) in (membership or set())]
+            self.requested.extend(str(i) for i in ids)
+            return [universe[str(i)] for i in ids if str(i) in universe]
+
+        with (
+            patch.object(finder, "resolve_criteria", side_effect=_fake_resolve),
+            patch.object(finder, "_fetch_observations", side_effect=fetch),
+            patch.object(finder, "_locations", return_value={}),
+            patch.object(finder.time, "monotonic", side_effect=lambda: now["t"]),
+        ):
+            return finder.find_observations_auto(**kwargs)
+
+    def test_the_deadline_stops_the_request_and_issues_a_usable_cursor(self):
+        # 30s per request against a 200s budget: stage 0, then stage 1's single
+        # batch, then stage 2 until less than the batch reserve remains.
+        result = self._run_clocked(
+            {}, advance=30.0, observation="123456789",
+            clues={"genus": "Amanita"}, digits_off=2, time_budget=200.0,
+        )
+        self.assertEqual(result["status"], "needs_confirmation")
+        self.assertEqual(result["stop_reason"], "deadline_exhausted")
+        # Explicitly not a completed search: work remains.
+        self.assertFalse(result["complete"])
+        self.assertIsNotNone(result["resume"])
+        self.assertEqual(result["resume"]["stage"], 2)
+        self.assertGreater(result["resume"]["offset"], 0)
+        self.assertGreater(result["next_stage"]["estimated_candidates"], 0)
+        # It stopped at a batch boundary, so the cursor is a plan position the
+        # next call replays exactly rather than an estimate.
+        self.assertLessEqual(result["resume"]["offset"],
+                             result["stages"][-1]["total"])
+        self.assertEqual(len(self.requested), len(set(self.requested)))
+
+    def test_a_deadline_cursor_resumes_without_repeating_or_skipping(self):
+        first = self._run_clocked(
+            {}, advance=30.0, observation="123456789",
+            clues={"genus": "Amanita"}, digits_off=2, time_budget=200.0,
+        )
+        already = set(self.requested)
+        # A frozen clock: this call is bounded by the candidate budget alone.
+        second = self._run_clocked(
+            {}, advance=0.0, observation="123456789", clues={"genus": "Amanita"},
+            digits_off=2, resume=first["resume"]["token"], budget=400,
+        )
+        self.assertFalse(already & set(self.requested),
+                         "a deadline cursor re-requested IDs the first call checked")
+        self.assertEqual(len(self.requested), len(set(self.requested)))
+        self.assertEqual(second["checked_variations"], 400)
+        self.assertEqual(second["stop_reason"], "budget_exhausted")
+        # And it moved forward from where the first call stopped.
+        self.assertGreater(second["resume"]["offset"], first["resume"]["offset"])
+
+    def test_a_stage_is_never_started_without_time_to_run_a_batch(self):
+        # One very slow stage-0 request spends the whole budget, so stage 1 is
+        # not begun at all and its cursor sits at offset 0.
+        result = self._run_clocked(
+            {}, advance=200.0, observation="123456789",
+            clues={"genus": "Amanita"}, digits_off=1, time_budget=150.0,
+        )
+        self.assertEqual(result["status"], "needs_confirmation")
+        self.assertEqual(result["stop_reason"], "deadline_exhausted")
+        self.assertFalse(result["complete"])
+        self.assertEqual(result["resume"]["stage"], 1)
+        self.assertEqual(result["resume"]["offset"], 0)
+        self.assertEqual(result["checked_variations"], 0)
+        # The candidates it never looked at are not a "no match".
+        self.assertNotEqual(result["status"], "no_match")
+
+    def test_the_remaining_time_bounds_each_individual_request(self):
+        self._run_clocked(
+            {}, advance=30.0, observation="123456789",
+            clues={"genus": "Amanita"}, digits_off=2, time_budget=200.0,
+        )
+        self.assertTrue(self.timeouts)
+        for timeout in self.timeouts:
+            self.assertIsNotNone(timeout)
+            self.assertLessEqual(timeout, finder.INAT_REQUEST_TIMEOUT_SECONDS)
+            self.assertGreaterEqual(timeout, finder.MIN_INAT_REQUEST_TIMEOUT_SECONDS)
+
+    def test_a_failed_batch_still_suppresses_the_deadline_cursor(self):
+        # The existing rule wins over the new one: a cursor issued over a failed
+        # batch would let a later call report a clean "no match" across
+        # candidates nobody ever saw. Calls 3 and 4 are one batch's two attempts.
+        result = self._run_clocked(
+            {}, advance=30.0, observation="123456789",
+            clues={"genus": "Amanita"}, digits_off=2, time_budget=200.0,
+            fail_observations=lambda n: n in (3, 4),
+        )
+        self.assertIsNone(result["resume"])
+        self.assertFalse(result["complete"])
+        self.assertEqual(result["status"], "incomplete")
+        self.assertGreater(result["failed_batches"], 0)
+
+    def test_the_deadline_leaves_comfortable_headroom_under_the_proxy_timeout(self):
+        # nginx's proxy_read_timeout is 300s; a request that reaches it loses the
+        # resume cursor along with the connection.
+        self.assertLessEqual(finder.MAX_REQUEST_SECONDS, 240.0)
+        # A batch is only started with room for both of its attempts.
+        self.assertGreaterEqual(
+            finder.BATCH_TIME_RESERVE_SECONDS,
+            2 * finder.INAT_REQUEST_TIMEOUT_SECONDS,
+        )
+
+    def test_the_candidate_budget_is_still_enforced_independently(self):
+        # A frozen clock cannot exhaust the deadline, so this stops on work.
+        result = self._run_clocked(
+            {}, advance=0.0, observation="123456789",
+            clues={"genus": "Amanita"}, digits_off=2, budget=400,
+        )
+        self.assertEqual(result["stop_reason"], "budget_exhausted")
+        self.assertEqual(result["checked_variations"], 400)
 
 
 class InatFinderAutoRouteTests(unittest.TestCase):

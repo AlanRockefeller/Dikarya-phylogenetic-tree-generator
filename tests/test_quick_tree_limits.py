@@ -353,7 +353,7 @@ class QuickTreeFastTreeSupportTests(unittest.TestCase):
         # The queue's "Run Quick Tree" and MycoMap's "One-Click Tree".
         self.assertEqual(len(payloads), 2)
         for body in payloads:
-            self.assertNotRegex(body, r"^\s*bootstrap:", )
+            self.assertNotRegex(body, re.compile(r"^\s*bootstrap:", re.M))
             self.assertNotIn("bootstrap: 100", body)
 
     def test_both_quick_tree_payloads_declare_the_preset(self):

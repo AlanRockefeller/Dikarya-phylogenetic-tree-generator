@@ -10,6 +10,7 @@ from __future__ import annotations
 import hashlib
 import itertools
 import re
+import time
 import urllib.parse
 from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 
@@ -47,6 +48,25 @@ EARLY_STOP_MIN_CANDIDATES = 5_000
 # runs out the search returns a resume cursor instead of a timeout, and the
 # caller continues with another call.
 MAX_REQUEST_CANDIDATES = 10_000
+# How much TIME one HTTP request may spend. The candidate budget above bounds
+# work, not duration: a batch can sit through the shared iNaturalist pacer, a
+# 429 retry schedule, a 20-second socket timeout and a second membership
+# request, so 10,000 candidates is not a promise about the clock. Without this
+# a deep search could outlive nginx's proxy_read_timeout (300s) and the caller
+# would lose the resume cursor along with the connection - the one thing that
+# makes the search continuable. 150s leaves comfortable headroom under that.
+MAX_REQUEST_SECONDS = 150.0
+# Time reserved before STARTING another batch: two attempts at the socket
+# timeout below, plus pacing. A batch is only begun when this much is left, so
+# the deadline is reached at a batch boundary, where a cursor is exact.
+BATCH_TIME_RESERVE_SECONDS = 45.0
+# Reserved on top of that when a separate project-membership request follows
+# the batch, so membership is never the operation that runs out of time.
+MEMBERSHIP_TIME_RESERVE_SECONDS = 25.0
+# The socket timeout an iNaturalist call gets when time is plentiful, and the
+# floor below which there is no point starting one at all.
+INAT_REQUEST_TIMEOUT_SECONDS = 20.0
+MIN_INAT_REQUEST_TIMEOUT_SECONDS = 5.0
 # Bumped when candidate generation changes in a way that moves plan positions,
 # so an old cursor can never be replayed against a new ladder.
 CANDIDATE_GENERATION_VERSION = 1
@@ -450,11 +470,15 @@ def _api_get(
     *,
     allow_missing: bool = False,
     max_attempts: int = 2,
+    timeout: Optional[float] = None,
 ) -> Optional[dict]:
     query = urllib.parse.urlencode(params or {})
     url = f"{INAT_API_BASE}{path}" + (f"?{query}" if query else "")
     try:
-        return _http_request(url, max_attempts=max_attempts, timeout=20)
+        return _http_request(
+            url, max_attempts=max_attempts,
+            timeout=INAT_REQUEST_TIMEOUT_SECONDS if timeout is None else timeout,
+        )
     except InatTreeError as exc:
         if allow_missing and "HTTP 404" in str(exc):
             return None
@@ -705,16 +729,47 @@ def _serialize_observation(observation: dict, *, original_id: str, location: str
 # the cursor replays candidate generation offline, nothing is ever re-requested.
 
 
-def _fetch_observations(ids: List[str], project_id: Optional[str] = None) -> List[dict]:
-    """Fetch observations by ID. Raises InatTreeError if the request fails."""
+def _fetch_observations(
+    ids: List[str],
+    project_id: Optional[str] = None,
+    timeout: Optional[float] = None,
+) -> List[dict]:
+    """Fetch observations by ID. Raises InatTreeError if the request fails.
+
+    ``timeout`` is the caller's remaining time, so the last request of a
+    deadline-bounded search cannot itself run past that deadline.
+    """
     params = {"id": ",".join(ids), "per_page": len(ids)}
     if project_id:
         params["project_id"] = project_id
-    data = _api_get("/observations", params, max_attempts=1)
+    data = _api_get("/observations", params, max_attempts=1, timeout=timeout)
     return [item for item in (data or {}).get("results", []) if isinstance(item, dict)]
 
 
-def _fetch_project_membership(ids: List[str], project_id: str) -> Set[str]:
+def _remaining_seconds(deadline: Optional[float]) -> Optional[float]:
+    """Seconds left before ``deadline``; ``None`` when there is no deadline."""
+    if deadline is None:
+        return None
+    return deadline - time.monotonic()
+
+
+def _request_timeout(deadline: Optional[float]) -> Optional[float]:
+    """Socket timeout for one call, or ``None`` when there is no time to make it.
+
+    Monotonic throughout: a wall-clock step (NTP, a DST-less but still adjusted
+    system clock) must not be able to lengthen or cancel a request deadline.
+    """
+    remaining = _remaining_seconds(deadline)
+    if remaining is None:
+        return INAT_REQUEST_TIMEOUT_SECONDS
+    if remaining <= MIN_INAT_REQUEST_TIMEOUT_SECONDS:
+        return None
+    return min(INAT_REQUEST_TIMEOUT_SECONDS, remaining)
+
+
+def _fetch_project_membership(
+    ids: List[str], project_id: str, timeout: Optional[float] = None
+) -> Set[str]:
     """Return the subset of ``ids`` belonging to ``project_id``.
 
     Membership has to be answered by iNaturalist rather than read off the
@@ -723,7 +778,7 @@ def _fetch_project_membership(ids: List[str], project_id: str) -> Set[str]:
     """
     return {
         str(item.get("id"))
-        for item in _fetch_observations(ids, project_id=project_id)
+        for item in _fetch_observations(ids, project_id=project_id, timeout=timeout)
         if item.get("id") is not None
     }
 
@@ -874,14 +929,25 @@ def find_observations_auto(
     resume: Optional[str] = None,
     confirm: bool = False,
     budget: int = MAX_REQUEST_CANDIDATES,
+    time_budget: Optional[float] = MAX_REQUEST_SECONDS,
 ) -> dict:
-    """Climb the typo ladder until something matches, or the budget runs out."""
+    """Climb the typo ladder until something matches, or a budget runs out.
+
+    Two budgets bound one synchronous request: ``budget`` caps the candidates
+    checked, and ``time_budget`` caps the seconds spent. Neither implies the
+    other -- pacing, 429 retries, socket timeouts and the extra membership
+    request mean a candidate count is not a duration -- so both are enforced,
+    at batch boundaries, where the resume cursor is exact.
+    """
     if isinstance(digits_off, bool) or not isinstance(digits_off, int) or not 1 <= digits_off <= 3:
         raise FinderValidationError(
             "`digits_off` must be an integer from 1 through 3.",
             details={"field": "digits_off", "minimum": 1, "maximum": 3},
             malformed=True,
         )
+    # Started before clue resolution, which is itself several iNaturalist calls.
+    seconds_allowed = float(time_budget) if time_budget else None
+    deadline = (time.monotonic() + seconds_allowed) if seconds_allowed else None
     observation_id = parse_observation_id(observation)
     normalized = {kind: str(clues.get(kind) or "").strip() for kind in AUTO_CLUE_KINDS}
     resolved = resolve_auto_criteria(normalized)
@@ -962,7 +1028,8 @@ def find_observations_auto(
                 )
         ranked = _rank_auto_matches(matches, observation_id, criteria)
         complete = final_status in ("match_found", "no_match") and final_reason not in (
-            "declined", "large_stage", "budget_exhausted", "too_large",
+            "declined", "large_stage", "budget_exhausted", "deadline_exhausted",
+            "too_large",
         )
         return {
             "query": {
@@ -1008,7 +1075,13 @@ def find_observations_auto(
     # real observation that simply is not a member, reporting it as nonexistent.
     if not resuming:
         try:
-            found = _fetch_observations([observation_id])
+            # Stage 0 is never repeated on a resume, so it always runs; when
+            # clue resolution already spent the budget it runs on the floor
+            # timeout rather than being skipped.
+            found = _fetch_observations(
+                [observation_id],
+                timeout=_request_timeout(deadline) or MIN_INAT_REQUEST_TIMEOUT_SECONDS,
+            )
         except InatTreeError:
             # An outage is not a fact about the observation.
             unchecked += 1
@@ -1023,7 +1096,11 @@ def find_observations_auto(
             project_id = project_id_param or membership_project_id
             if project_id:
                 try:
-                    member_ids = _fetch_project_membership([observation_id], project_id)
+                    member_ids = _fetch_project_membership(
+                        [observation_id], project_id,
+                        timeout=(_request_timeout(deadline)
+                                 or MIN_INAT_REQUEST_TIMEOUT_SECONDS),
+                    )
                 except InatTreeError:
                     # Stage 0 is never repeated on a resume, so an unanswered
                     # question here would be skipped for good.
@@ -1072,9 +1149,27 @@ def find_observations_auto(
                 "`resume` cursor to continue.",
             )
 
+        # Enough time for at least one batch, or do not start the stage at all:
+        # a cursor at offset 0 is exact, and nothing here has been checked.
+        stage_reserve = BATCH_TIME_RESERVE_SECONDS + (
+            MEMBERSHIP_TIME_RESERVE_SECONDS if membership_project_id else 0.0
+        )
+        remaining = _remaining_seconds(deadline)
+        if remaining is not None and remaining < stage_reserve:
+            next_stage = stage_summary
+            cursor = make_cursor(index, 0)
+            return finish(
+                "needs_confirmation",
+                "deadline_exhausted",
+                f"This request reached its {seconds_allowed:.0f}s time limit "
+                f"before stage {index} could be started. Repeat the request with "
+                "the `resume` cursor to continue from here.",
+            )
+
         consecutive_failures = 0
         found_full = False
         budget_exhausted = False
+        deadline_exhausted = False
         iterator = iter(stage)
 
         def take(size: int) -> List[str]:
@@ -1091,13 +1186,26 @@ def find_observations_auto(
             if checked >= budget:
                 budget_exhausted = True
                 break
+            remaining = _remaining_seconds(deadline)
+            if remaining is not None and remaining < stage_reserve:
+                # Stop between batches, where the plan position is exact and a
+                # cursor resumes without re-requesting or skipping anything.
+                deadline_exhausted = True
+                break
             batch = take(min(BATCH_SIZE, budget - checked))
             if not batch:
                 break
             results = None
             for _attempt in range(2):
+                attempt_timeout = _request_timeout(deadline)
+                if attempt_timeout is None:
+                    # Out of time mid-retry. The batch is unchecked, which is
+                    # what make_cursor() refuses to issue a cursor over.
+                    break
                 try:
-                    results = _fetch_observations(batch, project_id=project_id_param)
+                    results = _fetch_observations(
+                        batch, project_id=project_id_param, timeout=attempt_timeout
+                    )
                     break
                 except InatTreeError:
                     continue
@@ -1124,12 +1232,21 @@ def find_observations_auto(
                 # returned is a member and nothing else in the batch is.
                 member_ids = {str(item.get("id")) for item in results if item.get("id") is not None}
             elif membership_project_id and results:
-                try:
-                    member_ids = _fetch_project_membership(batch, membership_project_id)
-                except InatTreeError:
-                    # The observations came back fine. Keep that evidence and
-                    # mark only the project clue unknown for this batch.
+                membership_timeout = _request_timeout(deadline)
+                if membership_timeout is None:
+                    # Out of time. Never guess membership: an unanswered clue is
+                    # "unknown", exactly as a failed membership request is, and
+                    # that also stops a cursor being issued over it.
                     membership_unknown += 1
+                else:
+                    try:
+                        member_ids = _fetch_project_membership(
+                            batch, membership_project_id, timeout=membership_timeout
+                        )
+                    except InatTreeError:
+                        # The observations came back fine. Keep that evidence and
+                        # mark only the project clue unknown for this batch.
+                        membership_unknown += 1
 
             for item in results:
                 matched, unknown = _score_observation(item, member_ids, criteria)
@@ -1186,6 +1303,25 @@ def find_observations_auto(
                 "budget_exhausted",
                 f"This request checked its limit of {budget:,} observation numbers. "
                 "Repeat the request with the `resume` cursor to continue from here.",
+            )
+        if deadline_exhausted:
+            # Same shape as the candidate budget: a paused search, not a failed
+            # one, and never a "no match" over numbers nobody looked at.
+            cursor = make_cursor(index, stage.plan_position)
+            next_stage = {
+                "stage": index,
+                "label": stage.label,
+                "estimated_candidates": max(0, stage.total - stage_checked - stage_unchecked),
+                "estimated_seconds": estimate_stage_seconds(
+                    max(0, stage.total - stage_checked - stage_unchecked), membership_project_id
+                ),
+            }
+            return finish(
+                "needs_confirmation",
+                "deadline_exhausted",
+                f"This request reached its {seconds_allowed:.0f}s time limit after "
+                f"checking {checked:,} observation number(s). Repeat the request "
+                "with the `resume` cursor to continue from here.",
             )
 
     if matches:

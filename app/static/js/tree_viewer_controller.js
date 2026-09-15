@@ -1735,12 +1735,32 @@ document.addEventListener('DOMContentLoaded', async () => {
             // that was just annotated is not silently carried into the next Add. Only the
             // transient selection goes; saved colour groups are untouched, and an edit leaves
             // the selection alone because it was not opened from one.
+            // Alan 9/15/26 - The save above is async, so the user can have selected a
+            // different group while it was in flight. Clear only the selection this
+            // annotation was made from; anything else is the user's newer work.
             if (wasAdd && viewer?.deselectCurrentSelection) {
-                viewer.deselectCurrentSelection();
-                updateButtons();
+                const current = typeof viewer.getSelectedAnnotationLeafIds === 'function'
+                    ? viewer.getSelectedAnnotationLeafIds()
+                    : null;
+                if (current === null || sameTipIdSet(current, payload.member_tip_ids)) {
+                    viewer.deselectCurrentSelection();
+                    updateButtons();
+                }
             }
             showStatus(`Annotation "${label}" saved.`, 'success', 2000);
         }
+    }
+
+    // Alan 9/15/26 - Membership equality by set: the viewer's selection order is not
+    // meaningful, so only the contents decide whether two selections are the same one.
+    function sameTipIdSet(a, b) {
+        const left = new Set(a || []);
+        const right = new Set(b || []);
+        if (left.size !== right.size) return false;
+        for (const id of left) {
+            if (!right.has(id)) return false;
+        }
+        return true;
     }
 
     async function deleteCurrentAnnotation() {
