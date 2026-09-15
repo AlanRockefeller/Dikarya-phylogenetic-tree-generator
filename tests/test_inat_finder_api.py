@@ -1,6 +1,7 @@
 """Public API coverage for the server-side iNaturalist finder."""
 import hashlib
 import unittest
+from contextlib import ExitStack
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -41,7 +42,7 @@ class InatFinderServiceTests(unittest.TestCase):
             "photos": [{"url": "https://static.inaturalist.org/photo.jpg"}],
         }
 
-        def fake_fetch(ids, mode, criteria):
+        def fake_fetch(ids, mode, criteria, deadline=None):
             return [original] if ids == ["123456789"] else []
 
         with (
@@ -222,7 +223,7 @@ def _observation(observation_id, login="alan", taxon_id=48419):
     }
 
 
-def _fake_resolve(mode, term):
+def _fake_resolve(mode, term, deadline=None):
     if mode in ("genus", "family"):
         return {"label": f"{term} (taxon ID 48419)", "taxon_id": 48419, "taxon": TAXON}
     if mode == "taxon":
@@ -239,12 +240,12 @@ class InatFinderAutoModeTests(unittest.TestCase):
              fail_membership=False, resolve=_fake_resolve, **kwargs):
         self.requested = []
         self.membership_calls = []
-        self.timeouts = []
+        self.deadlines = []
         calls = {"n": 0}
 
-        def fetch(ids, project_id=None, timeout=None):
+        def fetch(ids, project_id=None, deadline=None):
             calls["n"] += 1
-            self.timeouts.append(timeout)
+            self.deadlines.append(deadline)
             if fail_observations and fail_observations(calls["n"]):
                 raise InatTreeError("iNaturalist is unreachable")
             if project_id is not None:
@@ -387,7 +388,7 @@ class InatFinderAutoModeTests(unittest.TestCase):
         self.assertEqual(result["matches"][0]["stage"], 1)
 
     def test_an_unresolvable_clue_is_reported_and_the_rest_carry_on(self):
-        def resolve(mode, term):
+        def resolve(mode, term, deadline=None):
             if mode == "genus":
                 raise finder.FinderValidationError(
                     f"Genus `{term}` was not found in the iNaturalist taxonomy.",
@@ -410,7 +411,7 @@ class InatFinderAutoModeTests(unittest.TestCase):
         self.assertTrue(raised.exception.malformed)
 
     def test_an_outage_while_resolving_a_clue_is_not_an_unusable_clue(self):
-        def resolve(mode, term):
+        def resolve(mode, term, deadline=None):
             raise InatTreeError("iNaturalist is unreachable")
 
         with self.assertRaises(InatTreeError):
@@ -429,7 +430,7 @@ class InatFinderAutoModeTests(unittest.TestCase):
         self.assertEqual(resolved["membership_project_id"], "42")
 
     def test_a_supplied_but_unusable_clue_still_rules_out_the_filter(self):
-        def resolve(mode, term):
+        def resolve(mode, term, deadline=None):
             if mode == "genus":
                 raise finder.FinderValidationError("nope", details={})
             return _fake_resolve(mode, term)
@@ -585,20 +586,21 @@ class InatFinderDeadlineTests(unittest.TestCase):
     """
 
     def _run_clocked(self, universe, *, advance, start=1000.0,
-                     fail_observations=None, membership=None, **kwargs):
+                     fail_observations=None, membership=None,
+                     resolve=_fake_resolve, patch_locations=True, **kwargs):
         """Run an auto search on a fake monotonic clock.
 
         ``advance`` seconds are charged to every observation request, which is
         where a real search spends the time this deadline exists to bound.
         """
         self.requested = []
-        self.timeouts = []
+        self.deadlines = []
         now = {"t": start}
         calls = {"n": 0}
 
-        def fetch(ids, project_id=None, timeout=None):
+        def fetch(ids, project_id=None, deadline=None):
             calls["n"] += 1
-            self.timeouts.append(timeout)
+            self.deadlines.append(deadline)
             now["t"] += advance
             if fail_observations and fail_observations(calls["n"]):
                 raise InatTreeError("iNaturalist is unreachable")
@@ -608,12 +610,16 @@ class InatFinderDeadlineTests(unittest.TestCase):
             self.requested.extend(str(i) for i in ids)
             return [universe[str(i)] for i in ids if str(i) in universe]
 
-        with (
-            patch.object(finder, "resolve_criteria", side_effect=_fake_resolve),
+        patches = [
+            patch.object(finder, "resolve_criteria", side_effect=resolve),
             patch.object(finder, "_fetch_observations", side_effect=fetch),
-            patch.object(finder, "_locations", return_value={}),
             patch.object(finder.time, "monotonic", side_effect=lambda: now["t"]),
-        ):
+        ]
+        if patch_locations:
+            patches.append(patch.object(finder, "_locations", return_value={}))
+        with ExitStack() as stack:
+            for item in patches:
+                stack.enter_context(item)
             return finder.find_observations_auto(**kwargs)
 
     def test_the_deadline_stops_the_request_and_issues_a_usable_cursor(self):
@@ -672,16 +678,50 @@ class InatFinderDeadlineTests(unittest.TestCase):
         # The candidates it never looked at are not a "no match".
         self.assertNotEqual(result["status"], "no_match")
 
-    def test_the_remaining_time_bounds_each_individual_request(self):
+    def test_clue_resolution_time_counts_against_the_budget(self):
+        """The deadline starts before the clues are resolved, and binds them.
+
+        Clue resolution is up to five paced, retrying lookups (two apiece for a
+        genus or family) and it runs BEFORE the ladder. A deadline first
+        consulted at the batch loop would already have been spent.
+        """
+        seen = {}
+
+        def slow_resolve(mode, term, deadline=None):
+            seen["deadline"] = deadline
+            return {"label": term, "taxon_id": 48419, "taxon": TAXON}
+
         self._run_clocked(
-            {}, advance=30.0, observation="123456789",
-            clues={"genus": "Amanita"}, digits_off=2, time_budget=200.0,
+            {}, advance=0.0, observation="123456789",
+            clues={"genus": "Amanita"}, digits_off=1, time_budget=150.0,
+            resolve=slow_resolve,
         )
-        self.assertTrue(self.timeouts)
-        for timeout in self.timeouts:
-            self.assertIsNotNone(timeout)
-            self.assertLessEqual(timeout, finder.INAT_REQUEST_TIMEOUT_SECONDS)
-            self.assertGreaterEqual(timeout, finder.MIN_INAT_REQUEST_TIMEOUT_SECONDS)
+        self.assertIsNotNone(
+            seen.get("deadline"),
+            "clue resolution was run without the request's deadline",
+        )
+
+    def test_location_enrichment_does_not_run_past_the_deadline(self):
+        """Serialization is more API calls, after the search has stopped."""
+        called = []
+
+        def places(observations, deadline=None):
+            called.append(deadline)
+            return {}
+
+        with patch.object(finder, "_locations", side_effect=places):
+            result = self._run_clocked(
+                {"123456789": _observation(123456789)}, advance=30.0,
+                observation="123456789", clues={"genus": "Amanita"},
+                digits_off=2, time_budget=200.0, patch_locations=False,
+            )
+        self.assertTrue(result["matches"])
+        self.assertTrue(called, "_locations was never reached")
+        self.assertTrue(
+            all(item is not None for item in called),
+            "the response was serialized without the deadline, so place lookups "
+            "could run past it",
+        )
 
     def test_a_failed_batch_still_suppresses_the_deadline_cursor(self):
         # The existing rule wins over the new one: a cursor issued over a failed
@@ -701,11 +741,55 @@ class InatFinderDeadlineTests(unittest.TestCase):
         # nginx's proxy_read_timeout is 300s; a request that reaches it loses the
         # resume cursor along with the connection.
         self.assertLessEqual(finder.MAX_REQUEST_SECONDS, 240.0)
-        # A batch is only started with room for both of its attempts.
-        self.assertGreaterEqual(
-            finder.BATCH_TIME_RESERVE_SECONDS,
-            2 * finder.INAT_REQUEST_TIMEOUT_SECONDS,
+
+    def test_the_single_criterion_search_is_bounded_too(self):
+        """Same endpoint and the same nginx timeout.
+
+        MAX_API_VARIATIONS caps this mode's candidate COUNT, not its duration:
+        10,000 candidates is still 50 paced, retrying batches. It has no resume
+        cursor, so the deadline is reported through the `complete` /
+        `unchecked_variations` fields it has always carried.
+        """
+        now = {"t": 1000.0}
+
+        def fetch(ids, mode, criteria, deadline=None):
+            now["t"] += 30.0
+            return []
+
+        with (
+            patch.object(finder, "resolve_criteria", side_effect=_fake_resolve),
+            patch.object(finder, "_fetch_matches", side_effect=fetch),
+            patch.object(finder, "_locations", return_value={}),
+            patch.object(finder.time, "monotonic", side_effect=lambda: now["t"]),
+        ):
+            result = finder.find_observations(
+                observation="123456789", mode="genus", term="Amanita",
+                digits_off=2, time_budget=200.0,
+            )
+
+        self.assertFalse(result["complete"],
+                         "ran out of time but reported a complete search")
+        self.assertGreater(result["unchecked_variations"], 0)
+        self.assertEqual(
+            result["checked_variations"] + result["unchecked_variations"],
+            result["total_variations"],
+            "the candidates it never looked at were not accounted for",
         )
+
+    def test_a_batch_is_one_retry_layer_not_two(self):
+        """The reserve can only be honest if a batch is one _fetch call.
+
+        `max_attempts` counts RETRIES, so the `max_attempts=1` here is already
+        two HTTP attempts with a backoff between them. An outer retry loop on
+        top made it four attempts and two backoffs -- a cost no reserve derived
+        from "two attempts at the socket timeout" could cover.
+        """
+        source = Path(finder.__file__).read_text(encoding="utf-8")
+        loop = source[source.index("while True:\n            if checked >= budget"):]
+        loop = loop[:loop.index("stages.append(")]
+        self.assertNotIn("for _attempt in range(", loop,
+                         "the batch loop retries a call that already retries")
+        self.assertEqual(loop.count("_fetch_observations("), 1)
 
     def test_the_candidate_budget_is_still_enforced_independently(self):
         # A frozen clock cannot exhaust the deadline, so this stops on work.

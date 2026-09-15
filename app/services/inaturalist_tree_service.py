@@ -164,13 +164,19 @@ def _reserve_inat_slot(interval: float = RATE_LIMIT_DELAY,
     return wait
 
 
-def _pace_inat_request() -> None:
-    """Block until this process may start its next iNaturalist request."""
+def _pace_inat_request(max_wait: Optional[float] = None) -> None:
+    """Block until this process may start its next iNaturalist request.
+
+    ``max_wait`` lowers the ceiling for one call. A deadline-bounded caller
+    passes its remaining time, so waiting for a slot can never by itself spend
+    more than the caller has left.
+    """
     from flask import has_request_context
 
-    wait = _reserve_inat_slot(
-        max_wait=MAX_PACING_WAIT_SECONDS if has_request_context() else None,
-    )
+    ceiling = MAX_PACING_WAIT_SECONDS if has_request_context() else None
+    if max_wait is not None:
+        ceiling = max_wait if ceiling is None else min(ceiling, max_wait)
+    wait = _reserve_inat_slot(max_wait=ceiling)
     if wait > 0:
         time.sleep(wait)
 
@@ -199,6 +205,30 @@ class InatTreeError(Exception):
         super().__init__(message)
         self.status = status
         self.details = details
+
+
+class InatDeadlineExceeded(InatTreeError):
+    """A caller's wall-clock deadline ran out before this request could finish.
+
+    Subclasses :class:`InatTreeError` on purpose: every existing handler already
+    treats it as "this call produced nothing", which is exactly right. A caller
+    that needs to tell "out of time" from "iNaturalist is down" -- the finder,
+    which must not issue a resume cursor over either -- can catch this first.
+    """
+
+    def __init__(self, message="The request ran out of time.", details=None):
+        super().__init__(message, status=504, details=details)
+
+
+def remaining_seconds(deadline: Optional[float]) -> Optional[float]:
+    """Seconds left before a monotonic ``deadline``; ``None`` when unbounded.
+
+    Monotonic on purpose: a wall-clock step (NTP, an administrator setting the
+    clock) must never be able to lengthen or cancel a request deadline.
+    """
+    if deadline is None:
+        return None
+    return deadline - time.monotonic()
 
 
 # ---------------------------------------------------------------------------
@@ -373,7 +403,8 @@ def _observation_failure(observation, observation_id, reason):
 def _http_request(url: str, *, method: str = "GET", body: Optional[Dict[str, Any]] = None,
                    bearer: Optional[str] = None,
                    max_attempts: Optional[int] = None,
-                   timeout: Optional[float] = None) -> Dict[str, Any]:
+                   timeout: Optional[float] = None,
+                   deadline: Optional[float] = None) -> Dict[str, Any]:
     data = None
     headers = {
         'Accept': 'application/json',
@@ -398,15 +429,42 @@ def _http_request(url: str, *, method: str = "GET", body: Optional[Dict[str, Any
     max_attempts = MAX_HTTP_ATTEMPTS if max_attempts is None else max(0, int(max_attempts))
     timeout = REQUEST_TIMEOUT if timeout is None else timeout
 
+    # An optional absolute monotonic deadline, enforced HERE rather than by the
+    # caller, because this is the only layer that knows about pacing waits,
+    # retry sleeps and per-attempt socket timeouts. A caller that computes a
+    # timeout once and hands it down cannot bound a call that paces, times out,
+    # sleeps and then tries again -- every one of those is re-checked below.
+    # `deadline=None` keeps the historical behaviour exactly.
+    def _left() -> Optional[float]:
+        return remaining_seconds(deadline)
+
+    def _out_of_time(where: str) -> InatDeadlineExceeded:
+        logger.warning("iNat %s %s abandoned at %s: deadline reached", method, url, where)
+        return InatDeadlineExceeded(
+            f"The iNaturalist request ran out of time ({where})."
+        )
+
     attempt = 0
     waited = 0.0
     while True:
         attempt += 1
+        left = _left()
+        if left is not None and left <= 0:
+            raise _out_of_time("before pacing")
         # Every attempt goes through the shared pacer, retries included: a
         # retry is another request to iNaturalist and must not jump the queue.
-        _pace_inat_request()
+        _pace_inat_request(max_wait=left)
+        # Pacing can have slept for most of what was left, so the budget is
+        # recomputed rather than reused: starting a socket read here on the
+        # pre-pacing figure is exactly how a "bounded" call overruns.
+        left = _left()
+        attempt_timeout = timeout
+        if left is not None:
+            if left <= 0:
+                raise _out_of_time("after pacing")
+            attempt_timeout = min(timeout, left)
         try:
-            with diagnostic_urlopen(req, timeout=timeout) as resp:
+            with diagnostic_urlopen(req, timeout=attempt_timeout) as resp:
                 wire = resp.read()
                 raw = wire.decode('utf-8') or '{}'
                 parsed = json.loads(raw) if raw.strip() else {}
@@ -419,13 +477,23 @@ def _http_request(url: str, *, method: str = "GET", body: Optional[Dict[str, Any
         except urllib.error.HTTPError as e:
             if e.code in RETRYABLE_HTTP_STATUSES and attempt <= max_attempts:
                 delay = _retry_delay(e, attempt)
-                logger.warning(
-                    "iNat %s %s: HTTP %s, retrying in %.1fs (attempt %d/%d)",
-                    method, url, e.code, delay, attempt, max_attempts,
-                )
-                time.sleep(delay)
-                waited += delay
-                continue
+                left = _left()
+                if left is not None and delay >= left:
+                    # Sleeping it out would consume the whole remaining budget
+                    # and leave nothing to make the retry with, so report the
+                    # failure now instead of burning the caller's time first.
+                    logger.warning(
+                        "iNat %s %s: HTTP %s, not retrying: %.1fs backoff "
+                        "exceeds the %.1fs left", method, url, e.code, delay, left,
+                    )
+                else:
+                    logger.warning(
+                        "iNat %s %s: HTTP %s, retrying in %.1fs (attempt %d/%d)",
+                        method, url, e.code, delay, attempt, max_attempts,
+                    )
+                    time.sleep(delay)
+                    waited += delay
+                    continue
             logger.warning("iNat %s %s failed: HTTP %s", method, url, e.code)
             if e.code == 429:
                 raise InatTreeError(
@@ -450,13 +518,21 @@ def _http_request(url: str, *, method: str = "GET", body: Optional[Dict[str, Any
         except urllib.error.URLError as e:
             if attempt <= max_attempts:
                 delay = _retry_delay(None, attempt)
-                logger.warning(
-                    "iNat %s %s network error (%s), retrying in %.1fs (attempt %d/%d)",
-                    method, url, e.reason, delay, attempt, max_attempts,
-                )
-                time.sleep(delay)
-                waited += delay
-                continue
+                left = _left()
+                if left is not None and delay >= left:
+                    logger.warning(
+                        "iNat %s %s network error (%s), not retrying: %.1fs "
+                        "backoff exceeds the %.1fs left",
+                        method, url, e.reason, delay, left,
+                    )
+                else:
+                    logger.warning(
+                        "iNat %s %s network error (%s), retrying in %.1fs (attempt %d/%d)",
+                        method, url, e.reason, delay, attempt, max_attempts,
+                    )
+                    time.sleep(delay)
+                    waited += delay
+                    continue
             raise InatTreeError(
                 f"Could not reach iNaturalist after {attempt} attempt(s) "
                 f"({e.reason}). Please try again shortly.",

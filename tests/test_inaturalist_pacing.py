@@ -199,8 +199,10 @@ class RequestPathTests(unittest.TestCase):
     def _run(self, urlopen_side_effect):
         paced = []
         with (
+            # `max_wait` is the deadline ceiling _http_request now passes on
+            # every call; it is None when the caller set no deadline.
             patch.object(svc, "_pace_inat_request",
-                         side_effect=lambda: paced.append(1)),
+                         side_effect=lambda max_wait=None: paced.append(max_wait)),
             patch.object(svc.time, "sleep", lambda _s: None),
             patch.object(svc.urllib.request, "urlopen",
                          side_effect=urlopen_side_effect),
