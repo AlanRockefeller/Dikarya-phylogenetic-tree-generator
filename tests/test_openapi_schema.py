@@ -33,6 +33,27 @@ class OpenAPISchemaTests(unittest.TestCase):
             operation["responses"]["422"]["content"]["application/json"]["schema"]["$ref"],
         )
 
+    def test_inaturalist_finder_documents_the_deadline_504(self):
+        """`InatDeadlineExceeded` carries status 504 and the route propagates it.
+
+        Deadline exhaustion before a resumable search position exists - clue
+        resolution, for instance - reaches the caller as a 504, so the document
+        has to advertise it with the ordinary error body.
+        """
+        app = Flask(__name__)
+        with app.test_request_context(base_url="https://dikarya.us"):
+            operation = build_spec()["paths"]["/tools/inaturalist-finder"]["post"]
+
+        self.assertIn("504", operation["responses"])
+        self.assertEqual(
+            operation["responses"]["504"]["content"]["application/json"]["schema"]["$ref"],
+            operation["responses"]["502"]["content"]["application/json"]["schema"]["$ref"],
+        )
+        self.assertIn("deadline", operation["responses"]["504"]["description"].lower())
+        # And the prose says when a caller should expect it, rather than
+        # promising a cursor for every exhausted limit.
+        self.assertIn("504", operation["description"])
+
     def test_inaturalist_finder_documents_the_automatic_search(self):
         """The clue fields, the resume contract, and both result shapes."""
         schemas = _schemas()

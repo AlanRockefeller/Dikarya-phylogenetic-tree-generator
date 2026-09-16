@@ -1,5 +1,6 @@
 """Public API coverage for the server-side iNaturalist finder."""
 import hashlib
+import itertools
 import unittest
 from contextlib import ExitStack
 from pathlib import Path
@@ -648,7 +649,8 @@ class InatFinderDeadlineTests(unittest.TestCase):
             {}, advance=30.0, observation="123456789",
             clues={"genus": "Amanita"}, digits_off=2, time_budget=200.0,
         )
-        already = set(self.requested)
+        first_requested = list(self.requested)
+        already = set(first_requested)
         # A frozen clock: this call is bounded by the candidate budget alone.
         second = self._run_clocked(
             {}, advance=0.0, observation="123456789", clues={"genus": "Amanita"},
@@ -661,6 +663,34 @@ class InatFinderDeadlineTests(unittest.TestCase):
         self.assertEqual(second["stop_reason"], "budget_exhausted")
         # And it moved forward from where the first call stopped.
         self.assertGreater(second["resume"]["offset"], first["resume"]["offset"])
+
+        # The cursor's plan position must describe EXACTLY the prefix that was
+        # really consumed, which is the property the checks above only imply.
+        # `offset` is a position in stage 2's plan, not a count of requests: the
+        # whole of stage 1's plan sits in `seen` and is skipped while stage 2
+        # replays it, so the expected requests are that prefix with the
+        # already-seen entries dropped, in order, after stage 0's own lookup of
+        # the number as supplied.
+        cumulative = first_requested + self.requested
+        offset = second["resume"]["offset"]
+        self.assertEqual(second["resume"]["stage"], 2)
+        expected, seen = [], set()
+        for candidate in itertools.chain(
+            ["123456789"],
+            finder.build_candidate_plan("123456789", 1),
+            itertools.islice(finder.build_candidate_plan("123456789", 2), offset),
+        ):
+            if candidate in seen:
+                continue
+            seen.add(candidate)
+            expected.append(candidate)
+        self.assertEqual(cumulative, expected)
+        # Same statement through the service's own replay helper, which is what
+        # a resuming call actually uses to rebuild `seen`.
+        self.assertEqual(
+            set(cumulative),
+            finder.restore_seen_ids("123456789", 2, offset) | {"123456789"},
+        )
 
     def test_a_stage_is_never_started_without_time_to_run_a_batch(self):
         # One very slow stage-0 request spends the whole budget, so stage 1 is
