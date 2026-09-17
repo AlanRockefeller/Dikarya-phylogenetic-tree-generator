@@ -3167,6 +3167,13 @@
     function getMycomapBlastUrlForPayload() {
         return sequenceQueue.some(seq => seq && seq.source === 'mycomap') ? lastMycomapBlastUrl : '';
     }
+    function getInaturalistSourceUrlForPayload() {
+        const urls = [...new Set(sequenceQueue
+            .filter(seq => seq && seq.source === 'inaturalist')
+            .map(seq => String(seq.inat_source_url || '').trim())
+            .filter(Boolean))];
+        return urls.length === 1 ? urls[0] : '';
+    }
     // Alan 6/26/26 - Only submit filter diagnostics when the current queue still includes MycoMap records.
     function getImportFilterDetailsForPayload() {
         return sequenceQueue.some(seq => seq && seq.source === 'mycomap') ? importFilterDetails : {};
@@ -3522,7 +3529,8 @@
             // which is what the viewer reports (support_type "alrt"). Sending a
             // replicate count would only persist one that never ran.
             import_filter_details: getImportFilterDetailsForPayload(),
-            mycomap_blast_url: getMycomapBlastUrlForPayload()
+            mycomap_blast_url: getMycomapBlastUrlForPayload(),
+            inat_source_url: getInaturalistSourceUrlForPayload()
         };
 
         try {
@@ -3650,6 +3658,23 @@
             /^(?:www\.)?inaturalist\.org\/observations\/\d+(?:[/?#].*|\.(?:[?#].*)?)?$/i.test(value);
     }
 
+    function isDirectInaturalistSequenceSearchInput(value) {
+        if (!isValidInaturalistInput(value) || isSingleInaturalistObservationInput(value)) {
+            return false;
+        }
+        try {
+            const urlValue = /^https?:\/\//i.test(value) ? value : `https://${value}`;
+            const parsed = new URL(urlValue);
+            // user_id/project_id searches are supported by the separate bulk
+            // MycoMap tree workflow. Other observation searches (taxon, place,
+            // field, dates, etc.) import their ITS records directly instead.
+            return !parsed.searchParams.has('user_id')
+                && !parsed.searchParams.has('project_id');
+        } catch (e) {
+            return false;
+        }
+    }
+
     function getInaturalistBlastLimit(inputEl, fallback) {
         const parsed = parseInt(inputEl?.value, 10);
         if (!Number.isFinite(parsed)) return fallback;
@@ -3717,7 +3742,8 @@
     function updateInaturalistTreeButtonForInput() {
         if (!inaturalistTreeBtn) return;
         const value = inaturalistUrlInput.value.trim();
-        const show = isLikelyInaturalistTreeInput(value);
+        const show = isLikelyInaturalistTreeInput(value)
+            && !isDirectInaturalistSequenceSearchInput(value);
         inaturalistTreeBtn.classList.toggle('hidden', !show);
         const previewMatches = Boolean(
             currentInaturalistTreePreview && currentInaturalistTreePreviewInput === value
@@ -3878,6 +3904,11 @@
         }
         const input = inaturalistUrlInput.value.trim();
         if (!input || !isLikelyInaturalistTreeInput(input)) return;
+        // Search URLs belong to the direct-sequence flow below, not the
+        // observation/MycoMap one-click-tree preview. Previewing them on blur
+        // produced an alarming "not supported" error before Submit was even
+        // clicked, even though the URL is fully supported for sequence import.
+        if (isDirectInaturalistSequenceSearchInput(input)) return;
         previewInaturalistTreeInput();
     });
 
@@ -4227,8 +4258,17 @@
                 throw httpError(resp, data.error || 'Failed to fetch sequences');
             }
 
-            const added = addSequences(data.sequences);
-            showStatus(`${data.message}. Added ${added} new sequences to queue.`, 'success');
+            const sourceUrl = data.inat_source_url || currentInaturalistUrl || '';
+            const sequences = data.sequences.map(sequence => ({
+                ...sequence,
+                inat_source_url: sourceUrl
+            }));
+            const added = addSequences(sequences);
+            showStatus(
+                `${data.message}. Added ${added} new sequences to the queue. `
+                + 'They are ready—click Run Quick Tree, or adjust Advanced settings first.',
+                'success'
+            );
 
             // Clear the URL input on success
             inaturalistUrlInput.value = '';
@@ -4775,7 +4815,8 @@
             // which is what the viewer reports (support_type "alrt"). Sending a
             // replicate count would only persist one that never ran.
             import_filter_details: getImportFilterDetailsForPayload(),
-            mycomap_blast_url: getMycomapBlastUrlForPayload()
+            mycomap_blast_url: getMycomapBlastUrlForPayload(),
+            inat_source_url: getInaturalistSourceUrlForPayload()
         };
 
         try {
@@ -5445,7 +5486,8 @@
             seed: document.getElementById('raxml_seed').value ? parseInt(document.getElementById('raxml_seed').value) : null,
             outgroup: document.getElementById('outgroup_select').value || null,
             import_filter_details: getImportFilterDetailsForPayload(),
-            mycomap_blast_url: getMycomapBlastUrlForPayload()
+            mycomap_blast_url: getMycomapBlastUrlForPayload(),
+            inat_source_url: getInaturalistSourceUrlForPayload()
         };
 
         try {

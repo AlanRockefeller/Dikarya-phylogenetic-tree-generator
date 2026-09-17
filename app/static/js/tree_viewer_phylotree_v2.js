@@ -61,10 +61,21 @@
         return `internal:${hash.toString(16).padStart(8, '0')}`;
     }
 
+    // Older iNaturalist imports stripped the quotes from numbered provisional
+    // species codes. Restore those quotes for display so the species-name
+    // parser can distinguish Pisolithus sp. 'AZ01' from Pisolithus sp. 'PNW01'.
+    // Requiring a digit keeps ordinary unquoted "Genus sp. locality" labels
+    // from being reinterpreted as provisional names.
+    const UNQUOTED_PROVISIONAL_CODE_RE = /\b([A-Z][A-Za-z-]+\s+sp\.?)\s+([A-Za-z][A-Za-z0-9.-]*\d[A-Za-z0-9.-]*)\b/g;
+
     // Alan 7/15/26 - Hide pipeline-only MAFFT and RiC annotations from tip labels while preserving stable tree IDs.
     function cleanTipDisplayName(name) {
         if (typeof name !== 'string') return name;
-        return name.replace(/^_R_/, '').replace(/\s+RiC(?:\s+\d+)?\s*$/i, '').trim();
+        return name
+            .replace(/^_R_/, '')
+            .replace(/\s+RiC(?:\s+\d+)?\s*$/i, '')
+            .replace(UNQUOTED_PROVISIONAL_CODE_RE, "$1 '$2'")
+            .trim();
     }
 
     // Alan 8/15/26 - Curated font list for clade annotations, shared with the controller's

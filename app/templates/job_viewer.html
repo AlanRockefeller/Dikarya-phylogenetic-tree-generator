@@ -147,7 +147,7 @@
                 <button type="button"
                     class="px-3 py-2 text-sm font-semibold rounded-lg border border-journal-gold/60 text-journal-dark dark:text-journal-gold bg-journal-gold/10 hover:bg-journal-gold hover:text-journal-dark dark:hover:text-journal-dark transition-colors flex items-center gap-1.5 shrink-0 disabled:opacity-60 disabled:cursor-not-allowed"
                     id="btn-claude-review" title="Ask Claude to assess this alignment and tree">
-                    <i class="fas fa-wand-magic-sparkles"></i> Analyze with Claude
+                    <i class="fas fa-wand-magic-sparkles"></i> Analyze
                 </button>
                 {% endif %}
             </div>
@@ -1443,7 +1443,7 @@
             {% if job_details.get('inat_source_url') %}
             <a href="{{ job_details.get('inat_source_url') }}" target="_blank" rel="noopener noreferrer"
                 class="font-mono block mt-2 text-journal-gold hover:text-journal-gold-light underline underline-offset-2 break-all">
-                Generated for iNaturalist observation: {{ job_details.get('inat_source_url') }}
+                iNaturalist source: {{ job_details.get('inat_source_url') }}
                 <i class="fas fa-external-link-alt ml-1 text-xs"></i>
             </a>
             {% endif %}

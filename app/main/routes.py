@@ -903,6 +903,17 @@ def job_viewer(job_id):
                 job_details.pop("mycomap_blast_url", None)
         except Exception:
             job_details.pop("mycomap_blast_url", None)
+
+    inat_source_url = job_details.get("inat_source_url")
+    if not inat_source_url and db_job and isinstance(db_job.metrics, dict):
+        inat_source_url = db_job.metrics.get("inat_source_url")
+    if inat_source_url:
+        from app.services.inaturalist_service import canonical_inaturalist_source_url
+        inat_source_url = canonical_inaturalist_source_url(inat_source_url)
+        if inat_source_url:
+            job_details["inat_source_url"] = inat_source_url
+        else:
+            job_details.pop("inat_source_url", None)
             
     # Hide the Claude review control entirely when no API key is configured,
     # rather than offering a button that can only ever answer 503.

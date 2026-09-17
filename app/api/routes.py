@@ -2730,6 +2730,7 @@ def fetch_inaturalist():
                 # For single obs with DNA, include the sequence for BLAST
                 "sequence": seq if can_blast else None,
                 "mycomap_blast_url": result.get('mycomap_blast_url') if is_single_url else None,
+                "inat_source_url": result.get('inat_source_url'),
                 "truncated": result.get('truncated', False),
                 "timed_out": result.get('timed_out', False),
                 "total_available": result.get('total_available', 0),
@@ -2747,6 +2748,7 @@ def fetch_inaturalist():
             return jsonify({
                 "status": "success",
                 "sequences": result['sequences'],
+                "inat_source_url": result.get('inat_source_url'),
                 "truncated": result.get('truncated', False),
                 "timed_out": result.get('timed_out', False),
                 "total_available": result.get('total_available', 0),
@@ -2855,6 +2857,15 @@ def mushroom_observer_tree():
 @limiter.limit("60 per hour; 300 per day")
 def create_job():
     data = request.get_json() or {}
+
+    from app.services.inaturalist_service import canonical_inaturalist_source_url
+    raw_inat_source_url = str(data.get("inat_source_url") or "").strip()
+    inat_source_url = canonical_inaturalist_source_url(raw_inat_source_url)
+    if raw_inat_source_url and not inat_source_url:
+        return jsonify({
+            "status": "error",
+            "error": "inat_source_url must be a supported iNaturalist URL or observation ID.",
+        }), 422
     
     # Extract Tree Params for Validation
     tree_method = data.get("tree_method", "nj")
@@ -2867,6 +2878,7 @@ def create_job():
         "sequence_metadata": _normalize_sequence_metadata(data.get("sequence_metadata", [])),
         "import_filter_details": _normalize_import_filter_details(data.get("import_filter_details", {})),
         "mycomap_blast_url": data.get("mycomap_blast_url") or "",
+        "inat_source_url": inat_source_url,
         "accessions": data.get("accessions", []),
         "alignment_method": data.get("alignment_method", "default"),
         "trimming_method": data.get("trimming_method", Config.DEFAULT_TRIMMING_METHOD),

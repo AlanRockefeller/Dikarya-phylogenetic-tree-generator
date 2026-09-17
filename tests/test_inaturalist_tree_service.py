@@ -109,7 +109,7 @@ class TestInaturalistTreeInputParsing(unittest.TestCase):
             Path(__file__).resolve().parents[1]
             / "app" / "templates" / "sequence_entry.html"
         ).read_text(encoding="utf-8")
-        start = template.index("    function isLikelyInaturalistTreeInput(value) {")
+        start = template.index("    function isValidInaturalistInput(value) {")
         end = template.index("    function getInaturalistBlastLimit", start)
         script = template[start:end] + (
             "\nconsole.log(JSON.stringify([\n"
@@ -118,7 +118,10 @@ class TestInaturalistTreeInputParsing(unittest.TestCase):
             "isSingleInaturalistObservationInput('http://www.inaturalist.org/observations/188948264./activity'),\n"
             "isSingleInaturalistObservationInput('https://www.inaturalist.org/observations/188948264?'),\n"
             "isSingleInaturalistObservationInput('https://www.inaturalist.org/observations/188948264???'),\n"
-            "isSingleInaturalistObservationInput('https://www.inaturalist.org/observations/188948264?fbclid=facebook-junk')\n"
+            "isSingleInaturalistObservationInput('https://www.inaturalist.org/observations/188948264?fbclid=facebook-junk'),\n"
+            "isDirectInaturalistSequenceSearchInput('https://www.inaturalist.org/observations?taxon_id=63839&field:DNA%20Barcode%20ITS='),\n"
+            "isDirectInaturalistSequenceSearchInput('https://www.inaturalist.org/observations?user_id=alan'),\n"
+            "isDirectInaturalistSequenceSearchInput('https://www.inaturalist.org/observations?project_id=123')\n"
             "]));\n"
         )
         proc = subprocess.run(
@@ -127,7 +130,19 @@ class TestInaturalistTreeInputParsing(unittest.TestCase):
 
         self.assertEqual(
             json.loads(proc.stdout),
-            [True, True, False, True, True, True],
+            [True, True, False, True, True, True, True, False, False],
+        )
+
+    def test_every_tree_submission_carries_the_inaturalist_source_url(self):
+        template = (
+            Path(__file__).resolve().parents[1]
+            / "app" / "templates" / "sequence_entry.html"
+        ).read_text(encoding="utf-8")
+        self.assertEqual(
+            template.count(
+                "inat_source_url: getInaturalistSourceUrlForPayload()"
+            ),
+            3,
         )
 
 

@@ -125,6 +125,29 @@ def validate_inaturalist_url(url: str) -> Optional[Dict[str, Any]]:
     return None
 
 
+def canonical_inaturalist_source_url(value: Any) -> str:
+    """Return a safe, clickable URL for the iNaturalist input that made a job."""
+    raw = str(value or "").strip()
+    details = validate_inaturalist_url(raw)
+    if not details:
+        return ""
+    if details["type"] == "single_observation":
+        return (
+            "https://www.inaturalist.org/observations/"
+            f"{details['observation_id']}"
+        )
+
+    parsed = urlparse(raw)
+    if parsed.scheme.lower() not in {"http", "https"}:
+        return ""
+    # Rebuild on the trusted canonical host, retaining the exact search path
+    # and query the user supplied but never a fragment or credentials.
+    path = parsed.path if parsed.path.startswith("/observations") else "/observations"
+    return f"https://www.inaturalist.org{path}" + (
+        f"?{parsed.query}" if parsed.query else ""
+    )
+
+
 from app.services.fasta_utils import clean_dna_sequence
 
 
@@ -566,8 +589,11 @@ def extract_sequences_from_observations(dna_observations: List[Dict],
             if taxon:
                 species_name = taxon.get('name', '')
         
-        # Sanitize species name
-        species_name = re.sub(r'[<>"\']', '', str(species_name or '')).strip()
+        # Strip HTML/attribute-hazard characters, but keep apostrophes. Single
+        # quotes are taxonomically meaningful in provisional fungal names such
+        # as ``Pisolithus sp. 'AZ01'``; deleting them makes otherwise distinct
+        # provisional species collapse to the same ``Genus sp.`` annotation.
+        species_name = _clean_display_text(species_name)
         # Prefer iNaturalist's standardized places over the observer's
         # free-text place_guess, which is often a road or a zip code.
         location_label = (place_labels.get(obs_id)
@@ -636,6 +662,7 @@ def fetch_inaturalist_data(url: str, mode: str = 'all',
         'timed_out': False,
         'total_available': 0
     }
+    final_result['inat_source_url'] = canonical_inaturalist_source_url(url)
 
     deadline = None if time_budget is None else time.monotonic() + time_budget
     # 'all' is the analyze pass behind the Fetch button: it reports counts and,

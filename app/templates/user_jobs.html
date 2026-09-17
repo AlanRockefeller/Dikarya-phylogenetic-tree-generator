@@ -16,6 +16,10 @@
         </div>
 
         <div class="flex flex-wrap gap-3">
+            <a href="{{ url_for('main.sequence_entry') }}"
+                class="bg-journal-gold hover:bg-journal-gold-light text-journal-dark px-5 py-2.5 rounded-lg font-medium shadow-md hover:shadow-lg transition-all flex items-center text-sm">
+                <i class="fas fa-plus mr-2"></i> New Job
+            </a>
             <a href="{{ url_for('user.api_tokens') }}"
                 class="bg-journal-dark hover:bg-journal-green dark:bg-journal-green dark:hover:bg-journal-dark text-white px-5 py-2.5 rounded-lg font-medium shadow-md hover:shadow-lg transition-all flex items-center text-sm">
                 <i class="fas fa-key mr-2"></i> API Tokens
