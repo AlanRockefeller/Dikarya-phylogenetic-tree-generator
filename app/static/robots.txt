@@ -7,20 +7,32 @@
 # that is useless in an index), an API endpoint, or a long-lived stream. Each of
 # those costs one of a small number of Gunicorn request slots, so crawling them
 # degrades the site for real users without producing anything indexable.
+#
+# Alan 9/10/26 - /job and /todo are listed WITHOUT a trailing slash. A Disallow
+# is a literal prefix match, so "/todo/" did not cover the bare "/todo" route,
+# which is a real page (main/routes.py) and was being crawled. Dropping the
+# slash covers both the bare route and everything beneath it. Do not "tidy" the
+# slashes back on. /tree/oauth/ keeps its slash on purpose: /tree itself is a
+# public page that must stay crawlable.
 
 User-agent: *
 Disallow: /api/
 Disallow: /api_v1/
-Disallow: /job/
+Disallow: /job
 Disallow: /auth/
 Disallow: /labels/
 Disallow: /tree/oauth/
 Disallow: /voucher-labels/export
 Disallow: /whats-new/edit
 Disallow: /whats-new/add
-Disallow: /todo/
+Disallow: /todo
 Disallow: /test
 Disallow: /thumb/
+# Not a real route. Nothing links here, no flow reaches it, and a well-behaved
+# crawler obeying this file never requests it -- so a request for it comes from
+# somebody who read this file looking for what we would rather hide. See
+# app/services/security_honeytokens.py. Do not "clean up" this line.
+Disallow: /admin/db-export
 Allow: /
 
 Sitemap: https://dikarya.us/sitemap.xml

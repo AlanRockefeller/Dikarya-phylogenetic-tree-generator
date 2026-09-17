@@ -1632,6 +1632,29 @@ def _discard_abandoned_staging(job_dir: Path, logger) -> None:
             )
 
 
+def _load_orientation_verdict(job_dir: Path, logger):
+    """ORIENT's per-record verdict from the original run, for a later recompute.
+
+    Returns (uncertain_headers, unclassified_headers), or (None, None) when the
+    job predates ``orientation_details`` or the tally was too large to store --
+    in which case the aligner falls back to comparing counts, as it always did.
+    """
+    try:
+        with open(job_dir / "input_info.json") as handle:
+            details = (json.load(handle) or {}).get("orientation_details") or {}
+    except (OSError, ValueError):
+        return None, None
+
+    if not details or details.get("uncertain_headers_truncated"):
+        return None, None
+    if "uncertain_headers" not in details:
+        return None, None
+    return (
+        set(details.get("uncertain_headers") or []),
+        set(details.get("unclassified_headers") or []),
+    )
+
+
 def recompute_tree(
     job_dir: Path,
     job_params: JobParams,
@@ -1841,7 +1864,17 @@ def _recompute_tree_staged(
     align_method = (align_params.method or "default").lower()
     align_label = f"Alignment ({align_method.upper()})" if align_method != "default" else "Alignment"
     start_step("align", align_label, "", tool=align_method)
-    run_alignment(alignment_pruned_path, alignment_pruned_aligned_path, align_params, config, logger, job_id=event_job_id)
+    # Recompute skips ORIENT (see skip_step above), so without this the aligner
+    # has no first opinion to compare its own direction calls against and every
+    # flip logs as unclassifiable. The original run's verdict is still on disk.
+    orient_uncertain, orient_unclassified = _load_orientation_verdict(job_dir, logger)
+    run_alignment(
+        alignment_pruned_path, alignment_pruned_aligned_path, align_params, config, logger,
+        job_id=event_job_id,
+        orient_uncertain=(len(orient_uncertain) if orient_uncertain is not None else None),
+        orient_uncertain_headers=orient_uncertain,
+        orient_unclassified_headers=orient_unclassified,
+    )
     align_detail = f"{_count_fasta_records(alignment_pruned_aligned_path)} sequence(s) aligned"
     finish_step("align", align_detail)
     overview(align_detail)
@@ -1855,7 +1888,7 @@ def _recompute_tree_staged(
     trim_terminal_overhangs = bool(trim_params.trim_terminal_overhangs)
     should_trim, trim_label, trim_tool = describe_trim_step(trim_method, trim_terminal_overhangs)
     if not should_trim:
-        run_trimming(
+        trim_stats = run_trimming(
             alignment_pruned_aligned_path,
             alignment_pruned_trimmed_path,
             trim_method,
@@ -1899,6 +1932,11 @@ def _recompute_tree_staged(
         logger,
         job_id=event_job_id
     )
+    # The displayed tree now belongs to this recomputed alignment, not to the
+    # original job's trimming pass. Keep its stage statistics beside the tree
+    # metadata so Generation Details never combines new final dimensions with
+    # the old terminal-crop counts.
+    metadata["trimming_details"] = trim_stats
     finish_step("tree", "Tree generated")
     overview(f"Tree rebuilt using {tree_method.upper()}")
     

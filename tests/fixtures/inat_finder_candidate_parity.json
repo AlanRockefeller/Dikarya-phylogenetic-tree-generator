@@ -1,0 +1,773 @@
+{
+  "generated_from": "inat_finder.py 1.8.1",
+  "candidate_generation_version": 1,
+  "large_search_threshold": 5000,
+  "auto_default_max_digits": 3,
+  "batch_size": 200,
+  "max_consecutive_failed_batches": 4,
+  "cases": [
+    {
+      "number": "12345",
+      "plans": [
+        {
+          "digits_off": 1,
+          "total": 1812,
+          "yielded": 1812,
+          "replacement_count": 44,
+          "additions": 1764,
+          "removals": 0,
+          "transpositions": 4,
+          "extras": 1768,
+          "label": "one substituted digit, adjacent swaps, and missing digits",
+          "first_candidates": [
+            "22345",
+            "32345",
+            "42345",
+            "52345",
+            "62345",
+            "72345",
+            "82345",
+            "92345",
+            "10345",
+            "11345",
+            "13345",
+            "14345"
+          ],
+          "sha256": "acec32f4481736b1d59d707050964a848b15fa4b08853aea0fba4a9743c448ce"
+        },
+        {
+          "digits_off": 2,
+          "total": 2582,
+          "yielded": 2582,
+          "replacement_count": 818,
+          "additions": 1764,
+          "removals": 0,
+          "transpositions": 0,
+          "extras": 1764,
+          "label": "two substituted digits and missing digits",
+          "first_candidates": [
+            "22345",
+            "32345",
+            "42345",
+            "52345",
+            "62345",
+            "72345",
+            "82345",
+            "92345",
+            "10345",
+            "11345",
+            "13345",
+            "14345"
+          ],
+          "sha256": "8910fb0b9ce3860ae5be29d26eeccb77533223107c4e4d80e002b0334132e586"
+        },
+        {
+          "digits_off": 3,
+          "total": 9386,
+          "yielded": 9386,
+          "replacement_count": 7622,
+          "additions": 1764,
+          "removals": 0,
+          "transpositions": 0,
+          "extras": 1764,
+          "label": "three substituted digits and missing digits",
+          "first_candidates": [
+            "22345",
+            "32345",
+            "42345",
+            "52345",
+            "62345",
+            "72345",
+            "82345",
+            "92345",
+            "10345",
+            "11345",
+            "13345",
+            "14345"
+          ],
+          "sha256": "2860b11f3622002fc7e550dc7966a775e9ac560ce7d1b95eb198903abd103bc6"
+        }
+      ],
+      "stages": [
+        {
+          "index": 1,
+          "total": 1812,
+          "yielded": 1812,
+          "label": "one substituted digit, adjacent swaps, and missing digits",
+          "seen_after": 1812,
+          "sha256": "acec32f4481736b1d59d707050964a848b15fa4b08853aea0fba4a9743c448ce"
+        },
+        {
+          "index": 2,
+          "total": 770,
+          "yielded": 770,
+          "label": "two substituted digits and missing digits",
+          "seen_after": 2582,
+          "sha256": "4692d8552ea41c472d1f13d5174f7c0a48930bf09186702e80663b11fb19763b"
+        },
+        {
+          "index": 3,
+          "total": 6804,
+          "yielded": 6804,
+          "label": "three substituted digits and missing digits",
+          "seen_after": 9386,
+          "sha256": "0e71f7af3308498e969409c187b7cb47351edc4b1cbe144f902a437e53cbc413"
+        }
+      ]
+    },
+    {
+      "number": "123456",
+      "plans": [
+        {
+          "digits_off": 1,
+          "total": 2419,
+          "yielded": 2419,
+          "replacement_count": 53,
+          "additions": 2340,
+          "removals": 21,
+          "transpositions": 5,
+          "extras": 2366,
+          "label": "one substituted digit, adjacent swaps, and missing or extra digits",
+          "first_candidates": [
+            "223456",
+            "323456",
+            "423456",
+            "523456",
+            "623456",
+            "723456",
+            "823456",
+            "923456",
+            "103456",
+            "113456",
+            "133456",
+            "143456"
+          ],
+          "sha256": "8f7eeeb815629f6b746d58d7962df02d726dcd1a34e66e88f3e12a8724a65e8e"
+        },
+        {
+          "digits_off": 2,
+          "total": 3584,
+          "yielded": 3584,
+          "replacement_count": 1223,
+          "additions": 2340,
+          "removals": 21,
+          "transpositions": 0,
+          "extras": 2361,
+          "label": "two substituted digits and missing or extra digits",
+          "first_candidates": [
+            "223456",
+            "323456",
+            "423456",
+            "523456",
+            "623456",
+            "723456",
+            "823456",
+            "923456",
+            "103456",
+            "113456",
+            "133456",
+            "143456"
+          ],
+          "sha256": "758fea29612d552dd188418009017e9e14f4a43d4532a6db1d305c03f76303c9"
+        },
+        {
+          "digits_off": 3,
+          "total": 17354,
+          "yielded": 17354,
+          "replacement_count": 14993,
+          "additions": 2340,
+          "removals": 21,
+          "transpositions": 0,
+          "extras": 2361,
+          "label": "three substituted digits and missing or extra digits",
+          "first_candidates": [
+            "223456",
+            "323456",
+            "423456",
+            "523456",
+            "623456",
+            "723456",
+            "823456",
+            "923456",
+            "103456",
+            "113456",
+            "133456",
+            "143456"
+          ],
+          "sha256": "21c94c479e55f2b894d7ef0183fbd45e844c102fd5b98ae893ba483890655102"
+        }
+      ],
+      "stages": [
+        {
+          "index": 1,
+          "total": 2419,
+          "yielded": 2419,
+          "label": "one substituted digit, adjacent swaps, and missing or extra digits",
+          "seen_after": 2419,
+          "sha256": "8f7eeeb815629f6b746d58d7962df02d726dcd1a34e66e88f3e12a8724a65e8e"
+        },
+        {
+          "index": 2,
+          "total": 1165,
+          "yielded": 1165,
+          "label": "two substituted digits and missing or extra digits",
+          "seen_after": 3584,
+          "sha256": "bd0dfcf958cb50ecffbf158ee0eeac795727909b42f9b23c4f61f96e42766014"
+        },
+        {
+          "index": 3,
+          "total": 13770,
+          "yielded": 13770,
+          "label": "three substituted digits and missing or extra digits",
+          "seen_after": 17354,
+          "sha256": "c623e014ec19f3294ce664ed212f63035c1a0d67d5d3a8a82c7362fff69dbb8c"
+        }
+      ]
+    },
+    {
+      "number": "1223334",
+      "plans": [
+        {
+          "digits_off": 1,
+          "total": 3074,
+          "yielded": 3074,
+          "replacement_count": 62,
+          "additions": 2997,
+          "removals": 12,
+          "transpositions": 3,
+          "extras": 3012,
+          "label": "one substituted digit, adjacent swaps, and missing or extra digits",
+          "first_candidates": [
+            "2223334",
+            "3223334",
+            "4223334",
+            "5223334",
+            "6223334",
+            "7223334",
+            "8223334",
+            "9223334",
+            "1023334",
+            "1123334",
+            "1323334",
+            "1423334"
+          ],
+          "sha256": "f463d40a4de790c3c637bba3702cbe1c36bae4d7fc8f141f0efcc9483c5616df"
+        },
+        {
+          "digits_off": 2,
+          "total": 4718,
+          "yielded": 4718,
+          "replacement_count": 1709,
+          "additions": 2997,
+          "removals": 12,
+          "transpositions": 0,
+          "extras": 3009,
+          "label": "two substituted digits and missing or extra digits",
+          "first_candidates": [
+            "2223334",
+            "3223334",
+            "4223334",
+            "5223334",
+            "6223334",
+            "7223334",
+            "8223334",
+            "9223334",
+            "1023334",
+            "1123334",
+            "1323334",
+            "1423334"
+          ],
+          "sha256": "7b5e75c1bdf51ab7bcf02e854945396eed2903f06fb8cd1c93f272d1daa8bcf0"
+        },
+        {
+          "digits_off": 3,
+          "total": 29018,
+          "yielded": 29018,
+          "replacement_count": 26009,
+          "additions": 2997,
+          "removals": 12,
+          "transpositions": 0,
+          "extras": 3009,
+          "label": "three substituted digits and missing or extra digits",
+          "first_candidates": [
+            "2223334",
+            "3223334",
+            "4223334",
+            "5223334",
+            "6223334",
+            "7223334",
+            "8223334",
+            "9223334",
+            "1023334",
+            "1123334",
+            "1323334",
+            "1423334"
+          ],
+          "sha256": "c2870971bbcbcb2aa17dfb5bf8cadea528d2759a569457e59c5583732875334d"
+        }
+      ],
+      "stages": [
+        {
+          "index": 1,
+          "total": 3074,
+          "yielded": 3074,
+          "label": "one substituted digit, adjacent swaps, and missing or extra digits",
+          "seen_after": 3074,
+          "sha256": "f463d40a4de790c3c637bba3702cbe1c36bae4d7fc8f141f0efcc9483c5616df"
+        },
+        {
+          "index": 2,
+          "total": 1644,
+          "yielded": 1644,
+          "label": "two substituted digits and missing or extra digits",
+          "seen_after": 4718,
+          "sha256": "e72996e0fa9151b9a7175a6bef345e905965ca0e081828a59880596989ae0725"
+        },
+        {
+          "index": 3,
+          "total": 24300,
+          "yielded": 24300,
+          "label": "three substituted digits and missing or extra digits",
+          "seen_after": 29018,
+          "sha256": "05cd123deb0ff2ff343c8ab8b338f3a15ca9f5603c59a8e6e0ac1bfb5f1d29eb"
+        }
+      ]
+    },
+    {
+      "number": "123456789",
+      "plans": [
+        {
+          "digits_off": 1,
+          "total": 133,
+          "yielded": 133,
+          "replacement_count": 80,
+          "additions": 0,
+          "removals": 45,
+          "transpositions": 8,
+          "extras": 53,
+          "label": "one substituted digit, adjacent swaps, and extra digits",
+          "first_candidates": [
+            "223456789",
+            "323456789",
+            "423456789",
+            "523456789",
+            "623456789",
+            "723456789",
+            "823456789",
+            "923456789",
+            "103456789",
+            "113456789",
+            "133456789",
+            "143456789"
+          ],
+          "sha256": "001e1f97bf4e726c7a2f9e6532a952e7b05bc581ae575958a50fbcf3fa1f0990"
+        },
+        {
+          "digits_off": 2,
+          "total": 2969,
+          "yielded": 2969,
+          "replacement_count": 2924,
+          "additions": 0,
+          "removals": 45,
+          "transpositions": 0,
+          "extras": 45,
+          "label": "two substituted digits and extra digits",
+          "first_candidates": [
+            "223456789",
+            "323456789",
+            "423456789",
+            "523456789",
+            "623456789",
+            "723456789",
+            "823456789",
+            "923456789",
+            "103456789",
+            "113456789",
+            "133456789",
+            "143456789"
+          ],
+          "sha256": "b5137bb4578b15204e4300432842be2417c9bd27beee8af5ade527675f2017a2"
+        },
+        {
+          "digits_off": 3,
+          "total": 61937,
+          "yielded": 61937,
+          "replacement_count": 61892,
+          "additions": 0,
+          "removals": 45,
+          "transpositions": 0,
+          "extras": 45,
+          "label": "three substituted digits and extra digits",
+          "first_candidates": [
+            "223456789",
+            "323456789",
+            "423456789",
+            "523456789",
+            "623456789",
+            "723456789",
+            "823456789",
+            "923456789",
+            "103456789",
+            "113456789",
+            "133456789",
+            "143456789"
+          ],
+          "sha256": "5aaf8d6cb5cf726929317f665fd0ab861734834cf851a3d8ca55feb5220c95a5"
+        }
+      ],
+      "stages": [
+        {
+          "index": 1,
+          "total": 133,
+          "yielded": 133,
+          "label": "one substituted digit, adjacent swaps, and extra digits",
+          "seen_after": 133,
+          "sha256": "001e1f97bf4e726c7a2f9e6532a952e7b05bc581ae575958a50fbcf3fa1f0990"
+        },
+        {
+          "index": 2,
+          "total": 2836,
+          "yielded": 2836,
+          "label": "two substituted digits and extra digits",
+          "seen_after": 2969,
+          "sha256": "17b39a8d16243fb528fd26a0fdf97edca7e9114c828bab09706a2661078aad11"
+        },
+        {
+          "index": 3,
+          "total": 58968,
+          "yielded": 58968,
+          "label": "three substituted digits and extra digits",
+          "seen_after": 61937,
+          "sha256": "8067ee4b7844f9a52e3e1205db182ddf19ce6b22bd89609b8bf2b7076a116d44"
+        }
+      ]
+    },
+    {
+      "number": "1000000000",
+      "plans": [
+        {
+          "digits_off": 1,
+          "total": 91,
+          "yielded": 91,
+          "replacement_count": 89,
+          "additions": 0,
+          "removals": 2,
+          "transpositions": 0,
+          "extras": 2,
+          "label": "one substituted digit and extra digits",
+          "first_candidates": [
+            "2000000000",
+            "3000000000",
+            "4000000000",
+            "5000000000",
+            "6000000000",
+            "7000000000",
+            "8000000000",
+            "9000000000",
+            "1100000000",
+            "1200000000",
+            "1300000000",
+            "1400000000"
+          ],
+          "sha256": "1fac5f89b30b8a1a4b2486b4a20c1d936b9cc3d28dba91924b74a3a1d5cf5a56"
+        },
+        {
+          "digits_off": 2,
+          "total": 3655,
+          "yielded": 3655,
+          "replacement_count": 3653,
+          "additions": 0,
+          "removals": 2,
+          "transpositions": 0,
+          "extras": 2,
+          "label": "two substituted digits and extra digits",
+          "first_candidates": [
+            "2000000000",
+            "3000000000",
+            "4000000000",
+            "5000000000",
+            "6000000000",
+            "7000000000",
+            "8000000000",
+            "9000000000",
+            "1100000000",
+            "1200000000",
+            "1300000000",
+            "1400000000"
+          ],
+          "sha256": "65d8ce964038ef71b64392be6645d489c89ec0abbfb055ffa3ade7f213016f5e"
+        },
+        {
+          "digits_off": 3,
+          "total": 88219,
+          "yielded": 88219,
+          "replacement_count": 88217,
+          "additions": 0,
+          "removals": 2,
+          "transpositions": 0,
+          "extras": 2,
+          "label": "three substituted digits and extra digits",
+          "first_candidates": [
+            "2000000000",
+            "3000000000",
+            "4000000000",
+            "5000000000",
+            "6000000000",
+            "7000000000",
+            "8000000000",
+            "9000000000",
+            "1100000000",
+            "1200000000",
+            "1300000000",
+            "1400000000"
+          ],
+          "sha256": "d11f99fb002a85d96ec33c0d62038522292a29965b36558916871dc2b5562e24"
+        }
+      ],
+      "stages": [
+        {
+          "index": 1,
+          "total": 91,
+          "yielded": 91,
+          "label": "one substituted digit and extra digits",
+          "seen_after": 91,
+          "sha256": "1fac5f89b30b8a1a4b2486b4a20c1d936b9cc3d28dba91924b74a3a1d5cf5a56"
+        },
+        {
+          "index": 2,
+          "total": 3564,
+          "yielded": 3564,
+          "label": "two substituted digits and extra digits",
+          "seen_after": 3655,
+          "sha256": "fd910e9fa63eb49505157f776dd1969eb8d27c5a9d400d68a76766a52c3ede01"
+        },
+        {
+          "index": 3,
+          "total": 84564,
+          "yielded": 84564,
+          "label": "three substituted digits and extra digits",
+          "seen_after": 88219,
+          "sha256": "e77ffb42372aea5516862c3f752cd8d35ef778c75933db91dbf8cfad5a57536a"
+        }
+      ]
+    },
+    {
+      "number": "111",
+      "plans": [
+        {
+          "digits_off": 1,
+          "total": 881,
+          "yielded": 881,
+          "replacement_count": 26,
+          "additions": 855,
+          "removals": 0,
+          "transpositions": 0,
+          "extras": 855,
+          "label": "one substituted digit and missing digits",
+          "first_candidates": [
+            "211",
+            "311",
+            "411",
+            "511",
+            "611",
+            "711",
+            "811",
+            "911",
+            "101",
+            "121",
+            "131",
+            "141"
+          ],
+          "sha256": "6b1326e8145215af0b463a2b57e24d59ab6f09aecf5bf701e3914eed03d91f42"
+        },
+        {
+          "digits_off": 2,
+          "total": 1106,
+          "yielded": 1106,
+          "replacement_count": 251,
+          "additions": 855,
+          "removals": 0,
+          "transpositions": 0,
+          "extras": 855,
+          "label": "two substituted digits and missing digits",
+          "first_candidates": [
+            "211",
+            "311",
+            "411",
+            "511",
+            "611",
+            "711",
+            "811",
+            "911",
+            "101",
+            "121",
+            "131",
+            "141"
+          ],
+          "sha256": "110377ffb7d40bf3eaadb713b70a6808c52ade47821b6bfa00319521bb5c28e8"
+        },
+        {
+          "digits_off": 3,
+          "total": 1754,
+          "yielded": 1754,
+          "replacement_count": 899,
+          "additions": 855,
+          "removals": 0,
+          "transpositions": 0,
+          "extras": 855,
+          "label": "three substituted digits and missing digits",
+          "first_candidates": [
+            "211",
+            "311",
+            "411",
+            "511",
+            "611",
+            "711",
+            "811",
+            "911",
+            "101",
+            "121",
+            "131",
+            "141"
+          ],
+          "sha256": "13496a0ef18b3fcd5f6dfa0018e72bfc744d3a2a13f2bf113c2ab46234a64657"
+        }
+      ],
+      "stages": [
+        {
+          "index": 1,
+          "total": 881,
+          "yielded": 881,
+          "label": "one substituted digit and missing digits",
+          "seen_after": 881,
+          "sha256": "6b1326e8145215af0b463a2b57e24d59ab6f09aecf5bf701e3914eed03d91f42"
+        },
+        {
+          "index": 2,
+          "total": 225,
+          "yielded": 225,
+          "label": "two substituted digits and missing digits",
+          "seen_after": 1106,
+          "sha256": "73d2fb224ffffb5d244984edb1be3f84f7db5bf596c2926635d307adc5748b0f"
+        },
+        {
+          "index": 3,
+          "total": 648,
+          "yielded": 648,
+          "label": "three substituted digits and missing digits",
+          "seen_after": 1754,
+          "sha256": "1c3f081743649f9da7a8d29cc8d3dacfad63db818c4ce49609783ecfe89cf40b"
+        }
+      ]
+    },
+    {
+      "number": "987654321",
+      "plans": [
+        {
+          "digits_off": 1,
+          "total": 133,
+          "yielded": 133,
+          "replacement_count": 80,
+          "additions": 0,
+          "removals": 45,
+          "transpositions": 8,
+          "extras": 53,
+          "label": "one substituted digit, adjacent swaps, and extra digits",
+          "first_candidates": [
+            "187654321",
+            "287654321",
+            "387654321",
+            "487654321",
+            "587654321",
+            "687654321",
+            "787654321",
+            "887654321",
+            "907654321",
+            "917654321",
+            "927654321",
+            "937654321"
+          ],
+          "sha256": "f2d0a07bea3a388c7b6ebb5d4dacbb7e3410f9b32e577f49c91ceb164d184879"
+        },
+        {
+          "digits_off": 2,
+          "total": 2969,
+          "yielded": 2969,
+          "replacement_count": 2924,
+          "additions": 0,
+          "removals": 45,
+          "transpositions": 0,
+          "extras": 45,
+          "label": "two substituted digits and extra digits",
+          "first_candidates": [
+            "187654321",
+            "287654321",
+            "387654321",
+            "487654321",
+            "587654321",
+            "687654321",
+            "787654321",
+            "887654321",
+            "907654321",
+            "917654321",
+            "927654321",
+            "937654321"
+          ],
+          "sha256": "c378a3da9928a76f35179adb26032ab38dab68f79b560d84d85e51cce1158494"
+        },
+        {
+          "digits_off": 3,
+          "total": 61937,
+          "yielded": 61937,
+          "replacement_count": 61892,
+          "additions": 0,
+          "removals": 45,
+          "transpositions": 0,
+          "extras": 45,
+          "label": "three substituted digits and extra digits",
+          "first_candidates": [
+            "187654321",
+            "287654321",
+            "387654321",
+            "487654321",
+            "587654321",
+            "687654321",
+            "787654321",
+            "887654321",
+            "907654321",
+            "917654321",
+            "927654321",
+            "937654321"
+          ],
+          "sha256": "94f06540142be2dd0f8f8c016075b29b07eda27ccff6cdbbe69171013832adee"
+        }
+      ],
+      "stages": [
+        {
+          "index": 1,
+          "total": 133,
+          "yielded": 133,
+          "label": "one substituted digit, adjacent swaps, and extra digits",
+          "seen_after": 133,
+          "sha256": "f2d0a07bea3a388c7b6ebb5d4dacbb7e3410f9b32e577f49c91ceb164d184879"
+        },
+        {
+          "index": 2,
+          "total": 2836,
+          "yielded": 2836,
+          "label": "two substituted digits and extra digits",
+          "seen_after": 2969,
+          "sha256": "61b62402bf1223a01a1f30e85a8514994a33af3aaacb97efa54e85b9c012245e"
+        },
+        {
+          "index": 3,
+          "total": 58968,
+          "yielded": 58968,
+          "label": "three substituted digits and extra digits",
+          "seen_after": 61937,
+          "sha256": "4b5047bb1ca4a221c02d5ded12599a53fd08d940938b2743eea405f94d489b9c"
+        }
+      ]
+    }
+  ]
+}

@@ -15,14 +15,20 @@ import logging
 import re
 import hashlib
 import time
-import uuid
 from urllib.parse import urlsplit
 from difflib import SequenceMatcher
 from datetime import datetime
 
 from app.services.security_utils import validate_job_id, validate_safe_file_path, coerce_bool
+from app.services.job_id_service import generate_job_id
+from app.services.fasta_utils import (
+    GENBANK_ACCESSION_RE,
+    is_genbank_accession,
+    is_insdc_master_accession,
+)
 from app.services.tree_parameter_validation import (
     normalize_inherited_iqtree_ufboot_count,
+    quick_tree_length_error,
     validate_iqtree_ufboot_count,
 )
 from app.services.artifact_storage import (
@@ -136,56 +142,19 @@ def client_log():
 # BLAST API Endpoint
 # =============================================================================
 
-# INSDC nucleotide accessions come in a small number of fixed shapes, and the
-# previous catch-all (1-6 letters + 5-9 digits) was loose enough to accept
-# things that are not accessions at all: an iNaturalist observation id pasted
-# into the accession box ("INAT125467754", 4 letters + 9 digits) matched, was
-# sent to NCBI, and came back as an opaque 400 that took the rest of its batch
-# down with it. Matching the real shapes rejects it here, by name, instead.
-#
-#   1 letter  + 5 digits            e.g. U49845
-#   2 letters + 6 digits            e.g. OR807397, AF123456
-#   2 letters + 8 digits            e.g. KY12345678
-#   RefSeq: 2 letters + '_' + 6, 8 or 9 digits   e.g. NC_012345, NM_001234567
-#   WGS: 4 letters + 2-digit assembly version + 6 or 8 contig digits, so
-#        exactly 4+8 or 4+10 e.g. AAAA01000001. Notably never 4+9, which is
-#        what keeps the observed iNaturalist id from matching this arm.
-#   WGS (6-letter prefix): 6 letters + 2-digit assembly version + 7 or 9
-#        contig digits e.g. AAAAAA010000001. No iNaturalist id has ever had
-#        six leading letters, so this arm costs nothing to allow -- and
-#        without it a perfectly ordinary INSDC accession was rejected as "not
-#        an accession" before any NCBI call.
-#
-# A 4+8 id is genuinely ambiguous -- "INAT12546775" is shape-identical to a
-# real WGS accession, and no pattern can separate them. That case still reaches
-# NCBI, which is why _fetch_genbank_xml_batch also isolates a failing accession
-# rather than letting it void its whole batch.
-_GENBANK_ACCESSION_RE = re.compile(
-    r'^(?:'
-    r'[A-Z]\d{5}'
-    r'|[A-Z]{2}\d{6}'
-    r'|[A-Z]{2}\d{8}'
-    r'|[A-Z]{2}_\d{6}'
-    r'|[A-Z]{2}_\d{8,9}'
-    r'|[A-Z]{4}\d{8}'
-    r'|[A-Z]{4}\d{10}'
-    r'|[A-Z]{6}\d{9}'
-    r'|[A-Z]{6}\d{11}'
-    r')(?:\.\d+)?$',
-    re.IGNORECASE,
-)
-
-
-def _is_genbank_accession(text):
-    """Check if text looks like a GenBank accession number."""
-    return bool(_GENBANK_ACCESSION_RE.match((text or "").strip()))
+# The accession shape check lives in app/services/fasta_utils.py so services can
+# use it without importing this route module; see the comment there for why the
+# INSDC shapes are enumerated rather than matched loosely. Re-exported under the
+# old private names because callers (including app/api_v1/routes.py) import them.
+_GENBANK_ACCESSION_RE = GENBANK_ACCESSION_RE
+_is_genbank_accession = is_genbank_accession
 
 
 MAX_CUSTOM_GENBANK_ACCESSIONS = 200
 MAX_CUSTOM_GENBANK_SEQUENCE_BP = 5000
 MAX_SEQUENCE_METADATA_ITEMS = 5000
 
-VALID_TREE_METHODS = {"nj", "raxml", "iqtree", "mrbayes", "fasttree"}
+VALID_TREE_METHODS = {"nj", "raxml", "iqtree", "iqtree_fast", "mrbayes", "fasttree"}
 
 # Settings the tree viewer's Advanced panel may change on a recompute. Anything
 # outside this set (sequences, import provenance, trimming report, job
@@ -520,6 +489,11 @@ MYCOMAP_LOCAL_FASTA_QUERY_SIMILARITY_MIN = 99.5
 MYCOMAP_LOCAL_FASTA_REPORTED_IDENTITY_CONFLICT_MAX = 98.5
 MAX_IMPORT_FILTER_DETAIL_RECORDS = 100
 
+# Cap on headers recorded as "added after ORIENT ran". Bounds input_info.json,
+# which every viewer edit rewrites. Past the cap the aligner just reports such a
+# flip as contested, which is what it did before the list existed.
+MAX_UNCLASSIFIED_ORIENT_HEADERS = 2000
+
 
 def _sequence_similarity_percent(a, b):
     """Return approximate percent similarity for short barcode sequences."""
@@ -747,8 +721,8 @@ def _mycomap_local_fasta_group_conflict_detail(seq, conflict_sequences, query_to
 
 def _append_import_filter_detail(details, *, name, source, reason, reason_label,
                                  hit_source="", reported_identity=None,
-                                 query_similarity=None):
-    """Append a bounded, sequence-free import filter detail row."""
+                                 query_similarity=None, record=None):
+    """Append one bounded import-filter row, retaining restorable DNA when available."""
     if len(details) >= MAX_IMPORT_FILTER_DETAIL_RECORDS:
         return
     row = {
@@ -762,6 +736,16 @@ def _append_import_filter_detail(details, *, name, source, reason, reason_label,
         row["reported_identity"] = reported_identity
     if query_similarity is not None:
         row["query_similarity"] = query_similarity
+    if isinstance(record, dict):
+        sequence = "".join(str(record.get("sequence") or "").split())[:50_000]
+        if sequence:
+            row["sequence"] = sequence
+            metadata = dict(record)
+            metadata["name"] = row["name"]
+            metadata["fasta_header"] = row["name"]
+            normalized_metadata = _normalize_sequence_metadata([metadata])
+            if normalized_metadata:
+                row["metadata"] = normalized_metadata[0]
     details.append(row)
 
 
@@ -904,6 +888,7 @@ def _dedupe_mycomap_observation_records(sequences, filtered_records):
                     f'{observation_id}; {difference_count} non-ambiguous base '
                     f'difference{"s" if difference_count != 1 else ""}'
                 ),
+                record=record,
             )
 
     return [seq for index, seq in enumerate(sequences) if index in keep_indexes], dropped_count
@@ -927,6 +912,7 @@ def _normalize_import_filter_details(raw):
         for item in (mycomap.get("filtered_records") or [])[:MAX_IMPORT_FILTER_DETAIL_RECORDS]:
             if not isinstance(item, dict):
                 continue
+            normalized_metadata = _normalize_sequence_metadata([item.get("metadata")])
             records.append({
                 "name": str(item.get("name") or "")[:500],
                 "source": str(item.get("source") or "")[:50],
@@ -935,6 +921,8 @@ def _normalize_import_filter_details(raw):
                 "reason_label": str(item.get("reason_label") or "")[:200],
                 "reported_identity": _optional_float(item.get("reported_identity")),
                 "query_similarity": _optional_float(item.get("query_similarity")),
+                "sequence": "".join(str(item.get("sequence") or "").split())[:50_000],
+                "metadata": normalized_metadata[0] if normalized_metadata else {},
             })
         counts = mycomap.get("counts") if isinstance(mycomap.get("counts"), dict) else {}
         normalized["mycomap"] = {
@@ -1001,6 +989,31 @@ def _parse_genbank_accession_tokens(value):
     return accessions, invalid
 
 
+def _master_accession_error(accessions):
+    """A user-facing rejection when a WGS/TSA/TLS *project* accession was entered.
+
+    A master record is the project header: it lists the project's contigs and
+    carries no bases, so fetching one returns an empty FASTA and the submission
+    used to fail several steps later as "NCBI could not resolve this
+    accession" -- which is both wrong and unactionable. Said here instead, where
+    the fix ("use an individual sequence accession") is obvious.
+
+    Returns None when nothing in ``accessions`` is a master record.
+    """
+    masters = [a for a in accessions if is_insdc_master_accession(a)]
+    if not masters:
+        return None
+    listed = ", ".join(masters[:10])
+    subject = "This is a project/master accession" if len(masters) == 1 else (
+        "These are project/master accessions"
+    )
+    return (
+        f"{listed}: {subject} and contains no sequence; enter an individual "
+        "sequence accession instead (a master record ends in zeros -- "
+        "AAAA01000000 is the project, AAAA01000001 is its first sequence)."
+    )
+
+
 def _split_fasta_header(header):
     """Split FASTA header into ID (first token) and description."""
     header = (header or "").strip()
@@ -1040,6 +1053,98 @@ def _make_unique_id(base_id, used_ids):
     new_id = f"{base_id}_added{i}"
     used_ids.add(new_id)
     return new_id
+
+def _restore_merged_labels(sequence_text, merged_labels):
+    """Rewrite FASTA headers that dedup merged back to their original labels.
+
+    Header lines only: a mapping is applied to the exact header text dedup
+    wrote, so a header the user has since edited is left alone rather than
+    guessed at.
+    """
+    lines = []
+    for line in str(sequence_text or "").split("\n"):
+        if line.startswith(">"):
+            original = merged_labels.get(line[1:].strip())
+            if original:
+                line = f">{original}"
+        lines.append(line)
+    return "\n".join(lines)
+
+
+def _append_restored_records(job_params, restored_records):
+    """Append recorded filtered rows to a FASTA payload with unique internal IDs."""
+    sequence_text = str(job_params.get("sequence") or "").rstrip("\n")
+    blocks = [sequence_text] if sequence_text else []
+    sequence_metadata = list(job_params.get("sequence_metadata") or [])
+    existing_records = _parse_fasta_sequences(sequence_text)
+    used_ids = {
+        str(record.get("name") or "").strip().split(None, 1)[0]
+        for record in existing_records
+        if str(record.get("name") or "").strip()
+    }
+
+    for record in restored_records:
+        sequence = "".join(str(record.get("sequence") or "").split())
+        wrapped = "\n".join(sequence[index:index + 80] for index in range(0, len(sequence), 80))
+        original_header = str(record.get("name") or "").strip()
+        parts = original_header.split(None, 1) if original_header else ["seq"]
+        base_id = parts[0] or "seq"
+        description = parts[1] if len(parts) > 1 else ""
+        internal_id = base_id
+        suffix = 2
+        while internal_id in used_ids:
+            internal_id = f"{base_id}_{suffix}"
+            suffix += 1
+        used_ids.add(internal_id)
+        internal_header = f"{internal_id} {description}".rstrip()
+        blocks.append(f">{internal_header}\n{wrapped}")
+
+        metadata = dict(record.get("metadata") or {})
+        metadata.setdefault("display_label", metadata.get("name") or original_header)
+        metadata.setdefault("raw_fasta_header", original_header)
+        metadata["name"] = internal_header
+        metadata["fasta_header"] = internal_header
+        sequence_metadata.append(metadata)
+
+    combined_fasta = "\n".join(blocks) + "\n"
+    combined_records = _parse_fasta_sequences(combined_fasta)
+    from app.workers.tasks import uniquify_fasta_identifiers
+
+    unique_fasta, _unique_stats = uniquify_fasta_identifiers(combined_fasta)
+    unique_records = _parse_fasta_sequences(unique_fasta)
+    positional_metadata = (
+        len(sequence_metadata) == len(combined_records)
+        and all(
+            str(sequence_metadata[index].get("fasta_header")
+                or sequence_metadata[index].get("name") or "").strip()
+            == str(record.get("name") or "").strip()
+            for index, record in enumerate(combined_records)
+        )
+    )
+    metadata_by_header = {}
+    if not positional_metadata:
+        for item in sequence_metadata:
+            key = str(item.get("fasta_header") or item.get("name") or "").strip()
+            metadata_by_header.setdefault(key, []).append(item)
+
+    updated_metadata = []
+    for index, (before, after) in enumerate(zip(combined_records, unique_records)):
+        original_header = str(before.get("name") or "").strip()
+        internal_header = str(after.get("name") or "").strip()
+        if positional_metadata:
+            item = dict(sequence_metadata[index])
+        else:
+            candidates = metadata_by_header.get(original_header) or []
+            item = dict(candidates.pop(0)) if candidates else {}
+        item.setdefault("display_label", item.get("name") or original_header)
+        item.setdefault("raw_fasta_header", original_header)
+        item["name"] = internal_header
+        item["fasta_header"] = internal_header
+        updated_metadata.append(item)
+
+    job_params["sequence"] = unique_fasta
+    job_params["sequence_metadata"] = updated_metadata
+
 
 def _parse_fasta_sequences(text):
     """Parse FASTA text into list of {name, sequence} dicts.
@@ -1152,6 +1257,56 @@ def _describe_skipped_duplicate(seq, kept, reason):
         "removed_length": len(removed_sequence),
         "kept_length": len(kept_sequence),
     }
+
+
+def _fasta_record_header(record_text):
+    """The header line of a formatted FASTA record, without the '>'."""
+    first_line = (record_text or "").lstrip().split("\n", 1)[0]
+    return first_line[1:].strip() if first_line.startswith(">") else ""
+
+
+def _record_headers_added_after_orient(job_dir, headers, replace=False):
+    """Note records that entered input_raw.fasta without passing through ORIENT.
+
+    A recompute realigns whatever is in input_raw.fasta, and MAFFT makes its own
+    direction call over all of it. Without this list, a flip of a sequence added
+    after the pipeline ran looks identical to a flip that contradicts ORIENT --
+    the record is simply absent from the uncertain list either way. Recording
+    them keeps the aligner's degradation line honest.
+
+    Best-effort: a job that has not run ORIENT yet has no orientation_details to
+    extend, and failing to annotate it must never fail the user's add.
+    """
+    headers = [h for h in (headers or []) if h]
+    if not headers and not replace:
+        return
+    import json  # module-level import is deliberately avoided in this file
+    input_info_path = job_dir / "input_info.json"
+    if not validate_safe_file_path(input_info_path, job_dir) or not input_info_path.exists():
+        return
+    try:
+        with open(input_info_path, "r") as handle:
+            stored = json.load(handle)
+        if not isinstance(stored, dict):
+            return
+        details = stored.get("orientation_details")
+        if not isinstance(details, dict):
+            return
+        existing = [] if replace else list(details.get("unclassified_headers") or [])
+        if replace:
+            # Nothing in the file was classified any more, so the uncertain list
+            # from the old input no longer describes anything present.
+            details["uncertain_headers"] = []
+            details["uncertain_headers_truncated"] = False
+        seen = set(existing)
+        merged = existing + [h for h in headers if h not in seen and not seen.add(h)]
+        details["unclassified_headers"] = merged[:MAX_UNCLASSIFIED_ORIENT_HEADERS]
+        with open(input_info_path, "w") as handle:
+            json.dump(stored, handle, separators=(",", ":"))
+    except (OSError, ValueError, TypeError) as exc:
+        # Losing the diagnostic must never fail the add, which has already
+        # written the sequences the user asked for.
+        logger.warning("Could not record post-ORIENT headers for %s: %s", job_dir.name, exc)
 
 
 def _merge_queue_duplicate_details(job_dir, removed_records):
@@ -1270,9 +1425,14 @@ def _fetch_genbank_sequences_for_queue(accessions, max_sequence_bp=MAX_CUSTOM_GE
             found = requested in found_bases
 
         if not found:
+            # A master record answers with annotation and no bases, so it lands
+            # here rather than in the length/empty branches above. Name it for
+            # what it is; "not_found" would send the user looking for a typo in
+            # an accession that exists.
             skipped.append({
                 "accession": accession,
-                "reason": "not_found"
+                "reason": "master_record" if is_insdc_master_accession(accession)
+                else "not_found"
             })
 
     return sequences, skipped
@@ -1380,6 +1540,11 @@ def fetch_genbank_accessions():
 
     if not accessions:
         return jsonify({"status": "error", "error": "No GenBank accessions provided"}), 400
+
+    master_error = _master_accession_error(accessions)
+    if master_error:
+        note_request_failure("genbank_master_accession")
+        return jsonify({"status": "error", "error": master_error}), 400
 
     if len(accessions) > MAX_CUSTOM_GENBANK_ACCESSIONS:
         return jsonify({
@@ -1800,6 +1965,17 @@ def gather_mycomap_sequences_for_queue(url, include_ncbi=True, include_local=Tru
             )
         if conflict_detail:
             conflicting_local_dropped_count += 1
+            restorable_record = dict(seq)
+            if metric:
+                restorable_record.update({
+                    'identity': metric.get('identity'),
+                    'query_cover': metric.get('query_cover'),
+                    'subject_cover': metric.get('subject_cover'),
+                    'blast_metrics_available': any(
+                        metric.get(field) is not None
+                        for field in ('identity', 'query_cover', 'subject_cover')
+                    ),
+                })
             _append_import_filter_detail(
                 filtered_records,
                 name=seq.get('name', ''),
@@ -1809,6 +1985,7 @@ def gather_mycomap_sequences_for_queue(url, include_ncbi=True, include_local=Tru
                 reason_label=conflict_detail.get('reason_label'),
                 reported_identity=conflict_detail.get('reported_identity'),
                 query_similarity=conflict_detail.get('query_similarity'),
+                record=restorable_record,
             )
             logger.warning(
                 "Dropped conflicting MycoMap localFasta record: blast_id=%s name=%r reported_identity=%s",
@@ -1819,6 +1996,17 @@ def gather_mycomap_sequences_for_queue(url, include_ncbi=True, include_local=Tru
             continue
         if is_contaminant_sequence(seq, metric):
             contaminant_dropped_count += 1
+            restorable_record = dict(seq)
+            if metric:
+                restorable_record.update({
+                    'identity': metric.get('identity'),
+                    'query_cover': metric.get('query_cover'),
+                    'subject_cover': metric.get('subject_cover'),
+                    'blast_metrics_available': any(
+                        metric.get(field) is not None
+                        for field in ('identity', 'query_cover', 'subject_cover')
+                    ),
+                })
             _append_import_filter_detail(
                 filtered_records,
                 name=seq.get('name', ''),
@@ -1827,6 +2015,7 @@ def gather_mycomap_sequences_for_queue(url, include_ncbi=True, include_local=Tru
                 reason='contaminant',
                 reason_label='Marked as contaminant by MycoMap label or BLAST table',
                 reported_identity=metric.get('identity') if metric else None,
+                record=restorable_record,
             )
             continue
         if metric:
@@ -2123,7 +2312,7 @@ def start_mycomap_blast_refresh():
         "include_ncbi": true,
         "include_local": true
     }
-    Response: { "status": "success", "job_id": "<uuid>" }
+    Response: { "status": "success", "job_id": "<job id>" }
     """
     data = request.get_json() or {}
     url = data.get('url', '').strip()
@@ -2228,6 +2417,18 @@ def _mycomap_rerun_limit_from_request(data, result_type):
     return validate_mycomap_rerun_limit(value, result_type)
 
 
+def _log_inat_tree_rejection(workflow, raw, error):
+    """Log bounded user input for actionable Tree Builder usability failures."""
+    # repr-style logging escapes control characters, preventing a pasted value
+    # with a newline from creating a forged second log entry.
+    logger.warning(
+        "event=inat_tree.input_rejected workflow=%s reason=%s input=%r",
+        workflow,
+        getattr(error, "failure_code", None) or "inat_tree_rejected",
+        str(raw)[:300],
+    )
+
+
 @bp.route('/inaturalist/tree', methods=['POST'])
 @limiter.limit(_inat_tree_rate_limit, key_func=_inat_tree_rate_key)
 def inaturalist_tree():
@@ -2315,6 +2516,8 @@ def inaturalist_tree():
         )
         return jsonify(result), 202
     except InatTreeError as e:
+        note_request_failure(e.failure_code or "inat_tree_rejected")
+        _log_inat_tree_rejection("create", raw, e)
         error_payload = {"status": "error", "error": str(e)}
         if e.details:
             error_payload.update(e.details)
@@ -2337,6 +2540,8 @@ def inaturalist_tree_preview():
     try:
         return jsonify(preview_inaturalist_tree_input(raw, resolved_type=resolved_type))
     except InatTreeError as e:
+        note_request_failure(e.failure_code or "inat_tree_preview_rejected")
+        _log_inat_tree_rejection("preview", raw, e)
         return jsonify({"status": "error", "error": str(e)}), e.status
     except Exception as e:
         return _server_error(e, where="inaturalist_tree_preview")
@@ -2404,6 +2609,8 @@ def inaturalist_tree_batch():
         )
         return jsonify(result), 202
     except InatTreeError as e:
+        note_request_failure(e.failure_code or "inat_tree_batch_rejected")
+        _log_inat_tree_rejection("batch", raw, e)
         error_payload = {"status": "error", "error": str(e)}
         if e.details:
             error_payload.update(e.details)
@@ -2769,6 +2976,19 @@ def create_job():
         note_request_failure("invalid_iqtree_bootstrap")
         return jsonify({"status": "error", "error": str(exc)}), 400
     job_params["bootstrap"] = _clamp_int(requested_bootstrap, 1000, 0, 10_000)
+    if tree_method in ("fasttree", "iqtree_fast") and "bootstrap" not in data:
+        # Neither method runs a bootstrap. FastTree ignores it entirely -- it
+        # runs a fixed -boot N SH-like local-support resampling
+        # (FASTTREE_SH_RESAMPLES) -- and the IQ-TREE Quick Tree preset runs
+        # fixed SH-aLRT support without ultrafast bootstrap. That is why
+        # tree_builder_service already records
+        # metadata["bootstrap"] = None for both. Storing the generic 1000
+        # default in input_info.json only made the
+        # job page claim a replicate count that never existed. The key is
+        # dropped rather than set to None: several readers do
+        # int(job_params.get("bootstrap", <default>)), which a stored None
+        # would break.
+        job_params.pop("bootstrap", None)
     job_params["mcmc_generations"] = _clamp_int(
         job_params.get("mcmc_generations"),
         Config.DEFAULT_MCMC_GENERATIONS, 1_000, 100_000_000
@@ -2812,11 +3032,21 @@ def create_job():
             note_request_failure("invalid_dna_fasta")
             return jsonify({"status": "error", "error": str(e)}), 400
 
+    # Quick Tree's per-sequence ceiling, enforced here as well as in the
+    # browser so a request built by hand cannot put a 150 kb genome through
+    # MAFFT --auto on the preset that exists for barcode-length reads. Scoped to
+    # the Quick Tree preset shape (see submission_is_quick_tree): the advanced
+    # builder and the v1 API still take whatever length they are given.
+    quick_tree_error = quick_tree_length_error(data, job_params.get("sequence", ""))
+    if quick_tree_error:
+        note_request_failure("quick_tree_sequence_too_long")
+        return jsonify({"status": "error", "error": quick_tree_error}), 400
+
     # Apply the same submission-wide dedup/warning logic enqueue_job normally
     # owns before persisting, then enqueue with that preparation disabled. This
     # preserves the observable params while ensuring RQ cannot run first.
     prepare_phylo_job_params(job_params)
-    job_id = str(uuid.uuid4())
+    job_id = generate_job_id()
     g.job_id = job_id
     job_record = Job(
         id=job_id,
@@ -3526,6 +3756,29 @@ def rebuild_with_duplicates(job_id):
             }), 400
 
         job_params = dict(source_params)
+
+        # A surviving tip may have been relabelled to carry the identifier of
+        # the record collapsed into it ("PX860295 iNat280384724 ..."). Once that
+        # record is back in the tree as its own tip, the merged label is wrong,
+        # so put the original one back before reassembling.
+        merged_labels = duplicates.get("merged_labels") or {}
+        if isinstance(merged_labels, dict) and merged_labels:
+            job_params["sequence"] = _restore_merged_labels(
+                str(job_params.get("sequence") or ""), merged_labels
+            )
+            restored_metadata_rows = []
+            for item in (job_params.get("sequence_metadata") or []):
+                item = dict(item)
+                original = merged_labels.get(
+                    str(item.get("fasta_header") or item.get("name") or "").strip()
+                )
+                if original:
+                    item["name"] = original
+                    item["fasta_header"] = original
+                    item.pop("merged_observation_label", None)
+                restored_metadata_rows.append(item)
+            job_params["sequence_metadata"] = restored_metadata_rows
+
         # Append the removed records back onto the FASTA payload.
         sequence_text = str(job_params.get("sequence") or "").rstrip("\n")
         blocks = [sequence_text] if sequence_text else []
@@ -3620,7 +3873,7 @@ def rebuild_with_duplicates(job_id):
         job_params["rebuilt_from_job_id"] = job_id
 
         prepare_phylo_job_params(job_params)
-        new_job_id = str(uuid.uuid4())
+        new_job_id = generate_job_id()
         new_record = Job(
             id=new_job_id,
             status="queued",
@@ -3680,6 +3933,123 @@ def rebuild_with_duplicates(job_id):
         }), 202
     except Exception as e:
         return _server_error(e)
+
+
+@bp.route('/job/<job_id>/rebuild-with-import-filtered', methods=['POST'])
+@limiter.limit("6 per minute")
+def rebuild_with_import_filtered(job_id):
+    """Start a new job with restorable records excluded by MycoMap import filters."""
+    db_job, error_msg, status_code = check_job_access(job_id, mode="edit")
+    if error_msg:
+        return jsonify({"status": "error", "error": error_msg}), status_code
+
+    try:
+        import json as _json
+
+        input_info_path = Config.JOB_DIR / job_id / "input_info.json"
+        if not input_info_path.exists():
+            return jsonify({
+                "status": "error",
+                "error": "Original job inputs are no longer on disk",
+            }), 404
+        with open(input_info_path, "r") as handle:
+            source_params = _json.load(handle)
+
+        mycomap_filters = (
+            (source_params.get("import_filter_details") or {}).get("mycomap") or {}
+        )
+        filtered_records = mycomap_filters.get("filtered_records") or []
+        restored = [
+            record for record in filtered_records
+            if isinstance(record, dict) and str(record.get("sequence") or "").strip()
+        ]
+        if not restored:
+            return jsonify({
+                "status": "error",
+                "error": (
+                    "These import-filter records do not contain restorable sequence data. "
+                    "Older jobs recorded their names and reasons only."
+                ),
+            }), 400
+
+        job_params = dict(source_params)
+        _append_restored_records(job_params, restored)
+        job_params["skip_observation_dedup"] = True
+        job_params["preserve_exact_duplicate_records"] = True
+        import_details = dict(job_params.get("import_filter_details") or {})
+        import_details.pop("mycomap", None)
+        job_params["import_filter_details"] = import_details
+        job_params["input_type"] = "pasted_sequence"
+        job_params["blast_mode"] = "off"
+        job_params["accessions"] = []
+        job_params.pop("_inat_tree_preparation", None)
+        job_params.pop("_mo_tree_preparation", None)
+        job_params["notes"] = (
+            f"Rebuild of {job_id} including {len(restored)} sequence"
+            f"{'' if len(restored) == 1 else 's'} excluded by import filters"
+        )
+        job_params["rebuilt_from_job_id"] = job_id
+        job_params["import_filtered_rebuild"] = True
+
+        prepare_phylo_job_params(job_params)
+        new_job_id = generate_job_id()
+        new_record = Job(
+            id=new_job_id,
+            status="queued",
+            job_dir=str(Config.JOB_DIR / new_job_id),
+            input_type=job_params.get("input_type", "pasted_sequence"),
+            metrics={
+                "tree_method": job_params.get("tree_method"),
+                "notes": job_params.get("notes"),
+                "alignment_method": job_params.get("alignment_method"),
+                "trimming_method": job_params.get("trimming_method"),
+                "rebuilt_from_job_id": job_id,
+                "restored_import_filtered_count": len(restored),
+            },
+        )
+        if db_job is not None and db_job.user_id:
+            new_record.user_id = db_job.user_id
+        elif current_user.is_authenticated:
+            new_record.user_id = current_user.id
+        db.session.add(new_record)
+        db.session.commit()
+        try:
+            enqueue_job(job_params, job_id=new_job_id, prepare=False)
+        except Exception as exc:
+            logger.exception(
+                "event=web.import_filtered_rebuild_enqueue_failed job=%s",
+                new_job_id,
+            )
+            try:
+                new_record.status = "failed"
+                failed_metrics = dict(new_record.metrics or {})
+                failed_metrics.update({
+                    "error": (
+                        "This import-filtered rebuild could not be added to the "
+                        "processing queue and was never started. Please try again."
+                    ),
+                    "enqueue_error": type(exc).__name__,
+                    "failed_at": datetime.utcnow().isoformat(),
+                })
+                new_record.metrics = failed_metrics
+                db.session.commit()
+            except Exception:
+                db.session.rollback()
+                logger.exception(
+                    "event=web.import_filtered_rebuild_failure_unrecorded job=%s",
+                    new_job_id,
+                )
+            raise
+
+        return jsonify({
+            "status": "queued",
+            "job_id": new_job_id,
+            "restored_count": len(restored),
+            "view_url": f"/job/{new_job_id}/view",
+            "status_url": f"/job/{new_job_id}",
+        }), 202
+    except Exception as e:
+        return _server_error(e, where="rebuild_with_import_filtered")
 
 
 @bp.route('/job/<job_id>/params', methods=['GET'])
@@ -5317,11 +5687,25 @@ def client_log_csrf():
 
 
 @bp.route('/log/client', methods=['POST'])
+@csrf.exempt
 @limiter.limit("30 per minute; 500 per day")
 def log_client_error():
     """
     Log client-side errors to the server log.
     Accept only bounded, query-free telemetry fields from the shared browser layer.
+
+    CSRF-exempt, like /api/client-log beside it. This is a write-only log sink:
+    it takes no action on behalf of whoever calls it, reads nothing back, and
+    every field is whitelisted and sanitized below, so a forged request buys an
+    attacker one log line that the rate limit above already bounds.
+
+    What the token cost instead was the reports that matter most. A browser
+    sends this with keepalive on page unload, and in-app browsers (Facebook's
+    on Android, seen twice on 2026-09-10 and 2026-09-11) hand that request to a
+    background network layer that omits the session cookie -- so the POST
+    arrives with no CSRF session, is rejected, and the page is already gone, so
+    the /log/client/csrf refresh-and-retry below cannot run. The error report
+    from the user whose page just broke was the one being dropped.
     """
     from flask import current_app
     if request.content_length and request.content_length > 16 * 1024:
@@ -5454,6 +5838,11 @@ def add_sequences_to_job(job_id):
                     "error": f"Invalid GenBank accession(s): {', '.join(invalid[:10])}"
                 }), 400
             
+            master_error = _master_accession_error(accessions)
+            if master_error:
+                note_request_failure("genbank_master_accession")
+                return jsonify({"status": "error", "error": master_error}), 400
+
             # Security: Limit number of accessions to prevent abuse
             if len(accessions) > MAX_CUSTOM_GENBANK_ACCESSIONS:
                  return jsonify({"status": "error", "error": f"Too many accessions (max {MAX_CUSTOM_GENBANK_ACCESSIONS})"}), 400
@@ -5467,6 +5856,13 @@ def add_sequences_to_job(job_id):
         else:
             # Assume FASTA
             sequences_to_add = _parse_fasta_sequences(input_text)
+            # Pasted MycoMap/NCBI headers carry the whole GenBank definition
+            # line. /api/mycomap compacts those before they reach the queue;
+            # do the same for a paste so both routes produce the same tip
+            # label. Unrecognized headers come back unchanged.
+            from app.services.mycomap_service import compact_mycomap_ncbi_header
+            for seq in sequences_to_add:
+                seq['name'] = compact_mycomap_ncbi_header(seq.get('name', ''))
             
         # Filter out sequences with empty sequence data
         sequences_to_add = [s for s in sequences_to_add if s.get('sequence', '').strip()]
@@ -5530,6 +5926,13 @@ def add_sequences_to_job(job_id):
                 added_count += 1
 
             input_path.write_text("\n".join(record.rstrip() for record in output_records) + "\n")
+            # Replace rewrites the whole input from the queue, so nothing left
+            # in the file carries ORIENT's verdict any more.
+            _record_headers_added_after_orient(
+                job_dir,
+                [_fasta_record_header(record) for record in output_records],
+                replace=True,
+            )
             _merge_queue_duplicate_details(job_dir, duplicate_records)
 
             message = f"Saved {added_count} queued sequence{'s' if added_count != 1 else ''}."
@@ -5583,6 +5986,7 @@ def add_sequences_to_job(job_id):
 
         added_count = 0
         duplicate_count = 0
+        added_headers = []
         with open(input_path, "a") as f:
             # Ensure newline at end of file before appending
             if input_path.stat().st_size > 0:
@@ -5602,7 +6006,9 @@ def add_sequences_to_job(job_id):
                     duplicate_records.append(_describe_skipped_duplicate(
                         seq, matched, 'same_record_refetched'))
                     continue
-                f.write(_format_fasta_record_for_job(seq, existing_ids, added_count + 1))
+                record_text = _format_fasta_record_for_job(seq, existing_ids, added_count + 1)
+                f.write(record_text)
+                added_headers.append(_fasta_record_header(record_text))
                 existing_records.add(exact_key)
                 entry = {
                     "header": str(seq.get('name') or ''),
@@ -5613,6 +6019,7 @@ def add_sequences_to_job(job_id):
                 exact_headers[exact_key] = entry
                 added_count += 1
 
+        _record_headers_added_after_orient(job_dir, added_headers)
         _merge_queue_duplicate_details(job_dir, duplicate_records)
 
         message = f"Added {added_count} sequences."

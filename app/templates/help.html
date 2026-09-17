@@ -370,7 +370,7 @@
                         <p class="mt-3 leading-relaxed">
                             An annotation has to name a <strong>complete clade</strong>&mdash;every descendant of one
                             node, with nothing left out. A complete soft polytomy also counts as one clade: Dikarya
-                            treats FastTree's effectively zero-length binary branches as unresolved and automatically
+                            treats the effectively zero-length binary branches these fast searches emit as unresolved and automatically
                             places the tips together. If the selection is a scattering of tips, or only part of a
                             polytomy, Dikarya says so rather than drawing a misleading label. The remedy is normally to
                             select one tip fewer or one tip more, or to right-click the branch instead. The root itself
@@ -670,12 +670,24 @@ ACGTACGTACGT...</code></pre>
                         </p>
                     </div>
                     <div>
+                        <h3 class="text-lg font-semibold text-journal-dark dark:text-journal-gold-light">IQ-TREE five-iteration search (Quick ML)</h3>
+                        <p class="mt-2 leading-relaxed">
+                            This is what Quick Tree runs and my normal exploratory choice. Dikarya caps IQ-TREE 3's
+                            standard search at five iterations with <code>-n 5</code>, retaining the full
+                            likelihood model while keeping barcode-length exploratory runs quick. It uses GTR+G and reports SH-aLRT
+                            branch support from 1,000 replicates, as percentages from 0 to 100, where 80 is the
+                            conventional cutoff. Those are not bootstrap proportions and not Bayesian posterior
+                            probabilities. This preset omits ultrafast bootstrap; if
+                            you want bootstrap values choose full IQ-TREE or RAxML-NG below.
+                        </p>
+                    </div>
+                    <div>
                         <h3 class="text-lg font-semibold text-journal-dark dark:text-journal-gold-light">FastTree 2.2.0 (Fast ML)</h3>
                         <p class="mt-2 leading-relaxed">
-                            This is the quick method and my normal exploratory choice. It is fast and useful for
-                            identification. Dikarya runs nucleotide GTR+CAT/Gamma settings and reports FastTree's SH-like
-                            local support from 1,000 resamples; those values are not bootstrap proportions or Bayesian
-                            posterior probabilities.
+                            The previous quick method, still available in the advanced form. Dikarya runs
+                            nucleotide GTR+CAT/Gamma settings and reports FastTree's SH-like
+                            local support from 1,000 resamples; those values are on a 0&ndash;1 scale and are not
+                            bootstrap proportions or Bayesian posterior probabilities.
                         </p>
                     </div>
                     <div>

@@ -231,6 +231,47 @@
       "tree_method": "iqtree",
       "alrt_only": true,
       "expected": "none"
+    },
+    {
+      "name": "iqtree quick preset is SH-aLRT, never ultrafast bootstrap",
+      "values": [
+        74.5,
+        87.3,
+        0.0
+      ],
+      "has_dual": false,
+      "tree_method": "iqtree_fast",
+      "expected": "ALRT"
+    },
+    {
+      "name": "iqtree quick preset stays SH-aLRT without the alrt_only flag",
+      "values": [
+        82.0,
+        95.0
+      ],
+      "has_dual": false,
+      "tree_method": "iqtree_fast",
+      "alrt_only": false,
+      "expected": "ALRT"
+    },
+    {
+      "name": "iq-tree fast with a space normalizes to the fast method",
+      "values": [
+        91.0
+      ],
+      "has_dual": false,
+      "tree_method": "IQ-TREE fast",
+      "expected": "ALRT"
+    },
+    {
+      "name": "iqtree fast values below 1 are still SH-aLRT percentages",
+      "values": [
+        0.0,
+        0.0
+      ],
+      "has_dual": false,
+      "tree_method": "iqtree_fast",
+      "expected": "ALRT"
     }
   ]
 }

@@ -28,7 +28,7 @@ def _config(**overrides):
         "MAFFT_BINARY": "mafft",
         "MUSCLE_BINARY": "muscle",
         "CLUSTALO_BINARY": "clustalo",
-        "IQTREE_BINARY": "iqtree2",
+        "IQTREE_BINARY": "iqtree3",
         "RAXML_BINARY": "raxml-ng",
         "TRIMAL_BINARY": "trimal",
         "BMGE_BINARY": "BMGE.jar",
@@ -285,7 +285,7 @@ def test_iqtree_primary_is_always_ml_tree(tmp_path, monkeypatch, bootstrap, alrt
 
     def fake_run(cmd, **kwargs):
         commands.append(cmd)
-        prefix = cmd[cmd.index("-pre") + 1]
+        prefix = cmd[cmd.index("--prefix") + 1]
         records = list(AlignIO.read(cmd[cmd.index("-s") + 1], "fasta"))
         first, second, third = (record.id for record in records)
         Path(prefix + ".treefile").write_text(
@@ -311,7 +311,16 @@ def test_iqtree_primary_is_always_ml_tree(tmp_path, monkeypatch, bootstrap, alrt
     assert ("-B" in commands[0]) is (bootstrap > 0)
     if bootstrap > 0:
         assert commands[0][commands[0].index("-B") + 1] == str(int(bootstrap))
-    assert ("-alrt" in commands[0]) is (alrt > 0)
+        # UFBoot trees are always refined by NNI on the bootstrap alignment.
+        assert "--bnni" in commands[0]
+    else:
+        assert "--bnni" not in commands[0]
+    assert ("--alrt" in commands[0]) is (alrt > 0)
+    # IQ-TREE 3 spellings, not the 2.x short forms.
+    assert "-nt" not in commands[0] and "-pre" not in commands[0]
+    assert "-T" in commands[0] and "--seed" in commands[0] and "--redo" in commands[0]
+    # The full search is never the fast one.
+    assert "--fast" not in commands[0]
 
 
 @pytest.mark.parametrize("bootstrap", [1, 999, "many", 1000.5])
@@ -361,7 +370,7 @@ def test_iqtree_missing_ml_tree_is_not_replaced_by_consensus(tmp_path, monkeypat
     output.parent.mkdir()
 
     def fake_run(cmd, **kwargs):
-        prefix = cmd[cmd.index("-pre") + 1]
+        prefix = cmd[cmd.index("--prefix") + 1]
         Path(prefix + ".contree").write_text("(SEQ1,SEQ2);\n")
         return 0, "", ""
 
@@ -371,6 +380,78 @@ def test_iqtree_missing_ml_tree_is_not_replaced_by_consensus(tmp_path, monkeypat
             alignment, output, nexus,
             TreeBuilderParams(method="iqtree", bootstrap=1000), _config(), LOGGER,
         )
+
+
+def test_iqtree_fast_runs_five_iterations_with_alrt_and_never_ufboot(
+    tmp_path, monkeypatch
+):
+    """Quick Tree fixes the search at five iterations and omits UFBoot."""
+    alignment = tmp_path / "alignment" / "alignment.fasta"
+    output = tmp_path / "tree" / "tree_original.newick"
+    nexus = tmp_path / "tree" / "tree_original.nexus"
+    _write_alignment(alignment)
+    output.parent.mkdir()
+    commands = []
+
+    def fake_run(cmd, **kwargs):
+        commands.append(cmd)
+        prefix = cmd[cmd.index("--prefix") + 1]
+        records = list(AlignIO.read(cmd[cmd.index("-s") + 1], "fasta"))
+        first, second = (record.id for record in records)
+        Path(prefix + ".treefile").write_text(f"({first}:0.1,{second}:0.1);\n")
+        # A fixed-model run writes no Best-fit line, only the model it fit.
+        Path(prefix + ".iqtree").write_text("Model of substitution: GTR+F+G4\n")
+        return 0, "", ""
+
+    monkeypatch.setattr(tree_builder_service, "run_command", fake_run)
+    # The Quick Tree preset ignores stored support controls and runs its fixed
+    # SH-aLRT-only configuration.
+    params = TreeBuilderParams(
+        method="iqtree_fast", bootstrap=1000, alrt_replicates=250, model="GTR+G"
+    )
+    selected_model, seed = tree_builder_service._run_iqtree(
+        alignment, output, nexus, params, _config(), LOGGER, fast=True
+    )
+
+    cmd = commands[0]
+    assert "--fast" not in cmd
+    assert cmd[cmd.index("-n") + 1] == "5"
+    assert "-B" not in cmd and "--bnni" not in cmd
+    assert cmd[cmd.index("--alrt") + 1] == str(
+        tree_builder_service.IQTREE_FAST_ALRT_REPLICATES
+    )
+    assert cmd[cmd.index("--seed") + 1] == str(seed)
+    # A fixed model is still reported concretely, from the report's own line.
+    assert selected_model == "GTR+F+G4"
+
+
+def test_iqtree_fast_metadata_reports_sh_alrt_and_no_bootstrap(tmp_path, monkeypatch):
+    output = tmp_path / "tree.newick"
+
+    def fake_iqtree(*args, **kwargs):
+        assert kwargs.get("fast") is True
+        output.write_text("(A,B);\n")
+        return "GTR+F+G4", 7
+
+    monkeypatch.setattr(tree_builder_service, "_run_iqtree", fake_iqtree)
+    metadata = tree_builder_service.run_tree_builder(
+        tmp_path / "alignment.fasta", output, tmp_path / "tree.nexus",
+        TreeBuilderParams(method="iqtree_fast", bootstrap=1000, model="GTR+G"),
+        _config(), LOGGER,
+    )
+
+    assert metadata["support_type"] == "alrt"
+    assert metadata["support_resamples"] == (
+        tree_builder_service.IQTREE_FAST_ALRT_REPLICATES
+    )
+    assert metadata["alrt_replicates"] == (
+        tree_builder_service.IQTREE_FAST_ALRT_REPLICATES
+    )
+    # Never a bootstrap count: the Quick Tree preset does not run one.
+    assert metadata["bootstrap"] is None
+    assert metadata["model_selected"] == "GTR+F+G4"
+    assert metadata["binary"] == _config().IQTREE_BINARY
+    assert metadata["search"] == "five_iterations"
 
 
 @pytest.mark.parametrize(

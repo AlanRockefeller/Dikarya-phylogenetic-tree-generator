@@ -14,7 +14,7 @@ import logging
 import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 # The single source of truth for what a sequence line may contain. This module
 # used to carry its own character class that omitted 'U' and '?', both of which
@@ -157,6 +157,17 @@ def has_core_and_flank(stats: OrientationStats) -> bool:
     return (CORE_IDX in stats.hit_map) and any(i in stats.hit_map for i in FLANK_IDXS)
 
 
+def looks_self_chimeric(fwd: OrientationStats, rev: OrientationStats) -> bool:
+    """True when a record carries full motif evidence on BOTH strands.
+
+    One sequence cannot be in two orientations, so this is not a read that is
+    forward or reverse -- it is a read that contains its own reverse
+    complement. That is what a Nanopore hairpin/chimeric read looks like: the
+    amplicon, then the same amplicon read back the other way.
+    """
+    return has_core_and_flank(fwd) and has_core_and_flank(rev)
+
+
 def decide_orientation(seq: str, max_mm: int = DEFAULT_MAX_MM) -> Tuple[str, OrientationStats, OrientationStats]:
     """
     Determine sequence orientation based on motif matches.
@@ -169,6 +180,20 @@ def decide_orientation(seq: str, max_mm: int = DEFAULT_MAX_MM) -> Tuple[str, Ori
 
     # No hits at all
     if not fwd.hits and not rev.hits:
+        return "uncertain", fwd, rev
+
+    # A self-chimeric read has to be caught before the winner selection below,
+    # because that selection is a *relative* comparison and both strands here
+    # are absolutely convincing. Job d2sz shipped one: an 898bp ONT read whose
+    # forward strand held ITS1-F and the 5.8S core at 0 mismatches and whose
+    # reverse strand held all three motifs at 0 mismatches, because the second
+    # half of the read was the reverse complement of the first. "More hits
+    # wins" made that 3-vs-2 for reverse, reverse_allowed()'s positional checks
+    # all passed on the reverse-complemented copy, and ORIENT flipped an
+    # already-forward read while reporting uncertain=0 -- fully confident and
+    # wrong. MAFFT then flipped it straight back. Neither strand is the answer,
+    # so decline the call and leave the record alone.
+    if looks_self_chimeric(fwd, rev):
         return "uncertain", fwd, rev
 
     def reverse_allowed() -> bool:
@@ -288,35 +313,42 @@ def format_fasta(header: str, seq: str, wrap_width: int = WRAP_WIDTH) -> str:
 def fix_sequence_orientation(
     fasta_text: str,
     max_mm: int = DEFAULT_MAX_MM,
-) -> Tuple[str, Dict[str, int]]:
+) -> Tuple[str, Dict[str, Any]]:
     """
     Auto-orient ITS sequences using conserved motifs.
-    
+
     This function analyzes each sequence for ITS motifs and reverse-complements
     sequences that appear to be in the wrong orientation. Non-ITS sequences
     (or sequences without strong motif evidence) pass through unchanged.
-    
+
     Args:
         fasta_text: Input FASTA text content
         max_mm: Maximum mismatches per motif (default: 4)
-    
+
     Returns:
         Tuple of (fixed_fasta_text, stats_dict)
-        stats_dict contains: total, forward, reverse, uncertain, empty
+        stats_dict contains: total, forward, reverse, uncertain, empty,
+        self_chimeric, and uncertain_headers -- the headers behind the
+        ``uncertain`` tally. The aligner needs the headers, not just the count:
+        it compares them against the records MAFFT reverse-complemented to tell
+        "MAFFT finished a call ORIENT declined" from "the two genuinely
+        disagree", and a count comparison only approximates that.
     """
     records = fasta_reader(fasta_text)
-    
-    stats = {
+
+    stats: Dict[str, Any] = {
         "total": 0,
         "forward": 0,
         "reverse": 0,
         "uncertain": 0,
         "empty": 0,
+        "self_chimeric": 0,
     }
-    
+
     output_records: List[str] = []
     reversed_headers: List[str] = []
     uncertain_headers: List[str] = []
+    chimeric_headers: List[str] = []
     unexpected_symbols: set = set()
     unexpected_records = 0
 
@@ -340,7 +372,10 @@ def fix_sequence_orientation(
         # Determine orientation
         orientation, fwd_stats, rev_stats = decide_orientation(seq, max_mm)
         stats[orientation] += 1
-        
+        if looks_self_chimeric(fwd_stats, rev_stats):
+            stats["self_chimeric"] += 1
+            chimeric_headers.append(header)
+
         # Track reversed and uncertain sequences
         if orientation == "reverse":
             reversed_headers.append(header)
@@ -351,11 +386,11 @@ def fix_sequence_orientation(
         else:
             # Forward - keep as is
             output_records.append(format_fasta(header, seq.upper()))
-        
+
         # Log uncertain orientations
         if orientation == "uncertain":
             logger.debug(f"Uncertain orientation for '{header}'")
-    
+
     # Log summary
     if unexpected_symbols:
         logger.warning(
@@ -369,9 +404,24 @@ def fix_sequence_orientation(
 
     if uncertain_headers:
         logger.debug(f"Uncertain orientation for {len(uncertain_headers)} sequence(s)")
-    
+
+    # Worth a WARNING rather than a debug line: a read that contains its own
+    # reverse complement is bad input, it is invisible in the tree (it aligns
+    # as one more tip), and the user is the only one who can drop or re-basecall
+    # it. Naming the records is the point of the line.
+    if chimeric_headers:
+        logger.warning(
+            "event=input.self_chimeric records=%s of %s headers=%s",
+            len(chimeric_headers), stats["total"],
+            "; ".join(chimeric_headers[:5])[:300]
+            + ("..." if len(chimeric_headers) > 5 else ""),
+        )
+
+    stats["uncertain_headers"] = uncertain_headers
+    stats["self_chimeric_headers"] = chimeric_headers
+
     output_text = "\n".join(output_records) + "\n" if output_records else ""
-    
+
     return output_text, stats
 
 

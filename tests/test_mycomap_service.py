@@ -197,6 +197,74 @@ class TestMycomapBlastMetrics(unittest.TestCase):
             "Fort Bragg California US",
         )
 
+    def test_parse_local_metrics_falls_back_to_source_column_taxon(self):
+        """A record with no "Species Name:" takes the observation taxon instead."""
+        rows = [
+            [
+                "Hit Number", "Description", "Identity", "Query/Subject Cover",
+                "Gap Openings", "Accession", "Source",
+            ],
+            [
+                "52",
+                "iNaturalist #79684897 Location: Trout Lake Washington US",
+                "81.17 (84.17)",
+                "98%/99%",
+                "52 (31)",
+                "768561",
+                "79684897 - Rhodocybe sp. 'tugrulii-NB01'",
+            ],
+            [
+                "55",
+                "Rhodocybe 'tugrulii-NB01' (4/1/3) Buck#918 WA iNat79684897",
+                "81.17 (84.17)",
+                "98%/99%",
+                "52 (31)",
+                "df-47-72-2682",
+                "Danny Miller WC Annotations",
+            ],
+        ]
+
+        metrics = parse_blast_metrics_table(rows)
+
+        self.assertEqual(
+            metrics["768561"]["species_name"],
+            "Rhodocybe sp. 'tugrulii-NB01'",
+        )
+        self.assertEqual(
+            metrics["768561"]["mycomap_location"],
+            "Trout Lake Washington US",
+        )
+        self.assertEqual(
+            improve_mycomap_sequence_name(
+                "iNat79684897 Washington US", metrics["768561"], "local"
+            ),
+            "iNat79684897 Rhodocybe sp. 'tugrulii-NB01' Trout Lake Washington US",
+        )
+        # An annotation-file source is a file title, not "<id> - <taxon>".
+        self.assertEqual(metrics["df-47-72-2682"].get("species_name", ""), "")
+
+    def test_parse_local_metrics_ignores_source_taxon_for_other_observation(self):
+        """A Source ID that contradicts the Description must not name the hit."""
+        rows = [
+            [
+                "Hit Number", "Description", "Identity", "Query/Subject Cover",
+                "Gap Openings", "Accession", "Source",
+            ],
+            [
+                "52",
+                "iNaturalist #79684897 Location: Trout Lake Washington US",
+                "81.17 (84.17)",
+                "98%/99%",
+                "52 (31)",
+                "768561",
+                "11111111 - Amanita muscaria",
+            ],
+        ]
+
+        metrics = parse_blast_metrics_table(rows)
+
+        self.assertEqual(metrics["768561"].get("species_name", ""), "")
+
     def test_parse_ncbi_metrics_prefers_accession_column(self):
         """GenBank descriptions should not create local keys when accession exists."""
         rows = [

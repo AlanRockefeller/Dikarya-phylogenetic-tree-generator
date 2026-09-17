@@ -10,10 +10,12 @@
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;700&display=swap">
-<link rel="stylesheet" href="{{ url_for('static', filename='css/alignment_viewer.css') }}?v=17">
+<link rel="stylesheet" href="{{ url_for('static', filename='css/alignment_viewer.css') }}?v=18">
 {% endblock %}
 
 {% block content %}
+<!-- Cached viewer state for this job. Superseded by /api/job/q0x9/state in the
+     next viewer release; the legacy path is retained for older bookmarks. -->
 <!-- Page Header -->
 <div class="mb-6">
     <div class="flex flex-col md:flex-row justify-between items-center gap-4">
@@ -32,9 +34,14 @@
             {% set trim_raw = job_details.get('trimming_method', 'none') %}
 
             {% set align = align_raw|upper %}
-            {% set tree = tree_raw|upper %}
+            {% set tree_fallback = {
+                'iqtree_fast': 'IQ-TREE 3 QUICK', 'iqtree': 'IQ-TREE',
+                'raxml': 'RAxML-NG', 'mrbayes': 'MrBayes',
+                'fasttree': 'FastTree 2.2.0', 'nj': 'Neighbor joining'
+            }.get(tree_raw, tree_raw|upper) %}
+            {% set tree = (generation_details or {}).get('tree_method_label', tree_fallback) %}
 
-            {% set is_quick_defaults = ((tree_raw == 'nj' or tree_raw == 'fasttree') and align_raw == 'mafft') %}
+            {% set is_quick_defaults = (tree_raw in ['nj', 'fasttree', 'iqtree_fast'] and align_raw == 'mafft') %}
 
             {% if trim_raw == 'none' or not trim_raw %}
             {% if is_quick_defaults %}
@@ -43,7 +50,11 @@
             {% set trim_display = 'No Trimming' %}
             {% endif %}
             {% else %}
-            {% set trim_display = 'Trimming: ' + trim_raw|upper %}
+            {% set trim_name = {
+                'trimal_gappy': 'trimAl gap filter', 'trimal': 'trimAl automated1',
+                'bmge': 'BMGE'
+            }.get(trim_raw, trim_raw|replace('_', ' ')|title) %}
+            {% set trim_display = 'Trimming: ' + trim_name %}
             {% endif %}
 
             <p class="text-gray-600 dark:text-gray-300 mt-1 font-mono text-sm" title="{{ job_id }}">
@@ -1047,14 +1058,11 @@
             <i class="fas fa-clone mt-0.5 shrink-0"></i>
             <span class="min-w-0">
                 <strong>{{ dup_filters.get('removed_count', 0) }}</strong>
-                duplicate sequence{{ '' if dup_filters.get('removed_count') == 1 else 's' }}
-                removed before this tree was built
-                (same observation, differing by at most
-                {{ dup_filters.get('max_differences', 3) }} base{{ '' if dup_filters.get('max_differences') == 1 else 's' }}
-                where the reads overlap).
+                same-observation record{{ '' if dup_filters.get('removed_count') == 1 else 's' }}
+                excluded after all input sources were merged.
                 <a href="#duplicate-records"
                     class="underline decoration-dotted hover:text-journal-gold font-medium">Scroll
-                    down to see them</a>, or rebuild the tree with them included.
+                    down to see them</a>{% if view_only %}; make an editable copy first if you want to rebuild with them{% else %}, or rebuild the tree with them included{% endif %}.
             </span>
         </div>
         {% endif %}
@@ -1141,139 +1149,84 @@
     <h3 class="text-lg font-bold text-journal-dark dark:text-gray-100 mb-4 flex items-center gap-2">
         <i class="fas fa-info-circle text-journal-gold"></i> Generation Details
     </h3>
-    {% set trimming_details = job_details.get('trimming_details') or {} %}
-    {% set terminal_trim = trimming_details.get('terminal_overhang_trim') or {} %}
+    {% set details = generation_details or {} %}
+    {% set terminal_trim = details.get('terminal_trim') or {} %}
+    {% set raw_shape = details.get('raw_shape') or {} %}
+    {% set final_shape = details.get('final_shape') or {} %}
 
     <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6 text-sm text-gray-700 dark:text-gray-300">
         <!-- Column 1: Core Methods -->
         <div>
             <h4 class="font-semibold text-journal-gold mb-2 uppercase text-xs tracking-wider">Methods</h4>
             <div class="space-y-1">
-                <p><span class="opacity-70 w-24 inline-block">Alignment:</span> <span class="font-medium">{{
-                        job_details.get('alignment_method', 'Unknown')|upper }}</span></p>
-                <p><span class="opacity-70 w-24 inline-block">Trimming:</span> <span class="font-medium">{{
-                        job_details.get('trimming_method', 'None')|title }}</span></p>
-                {% if job_details.get('trim_terminal_overhangs') is not none %}
-                <p><span class="opacity-70 w-24 inline-block">Terminal Ends:</span> <span class="font-medium">{{
-                        'Trimmed' if job_details.get('trim_terminal_overhangs') else 'Kept' }}</span></p>
-                {% endif %}
-                <p><span class="opacity-70 w-24 inline-block">Tree Builder:</span> <span class="font-medium">{{
-                        job_details.get('tree_method', 'Unknown')|upper }}</span></p>
+                <p><span class="opacity-70 w-24 inline-block">Alignment:</span>
+                    <span class="font-medium">{{ details.get('alignment_method_label', 'Unknown') }}</span></p>
+                <p><span class="opacity-70 w-24 inline-block">Trimming:</span>
+                    <span class="font-medium">{{ details.get('trimming_method_label', 'None') }}</span></p>
+                <p><span class="opacity-70 w-24 inline-block">Tree Builder:</span>
+                    <span class="font-medium">{{ details.get('tree_method_label', 'Unknown') }}</span></p>
             </div>
         </div>
 
-        <!-- Column 2: Parameters -->
+        <!-- Column 2: the alignment actually consumed by the tree builder -->
         <div>
-            <h4 class="font-semibold text-journal-gold mb-2 uppercase text-xs tracking-wider">Parameters</h4>
+            <h4 class="font-semibold text-journal-gold mb-2 uppercase text-xs tracking-wider">Alignment Used</h4>
             <div class="space-y-1">
-                {% if job_details.get('tree_model') %}
-                <p><span class="opacity-70 w-32 inline-block">Substitution Model:</span> <span class="font-medium">{{
-                        job_details.get('tree_model') }}</span></p>
+                {% if raw_shape.get('sequences') is not none %}
+                <p><span class="opacity-70 w-28 inline-block">Sequences:</span>
+                    <span class="font-medium">{{ final_shape.get('sequences') or raw_shape.get('sequences') }}</span></p>
                 {% endif %}
-                {% if job_details.get('tree_method') == 'fasttree' %}
-                {# FastTree never runs a bootstrap analysis: -boot sets resamples for the
-                   SH-like local support test, so reporting a bootstrap count here was wrong. #}
-                <p><span class="opacity-70 w-32 inline-block">Node Support:</span>
-                    <span class="font-medium"
-                        title="FastTree's -boot flag sets the number of resamples for its SH-like local support test. These values are not bootstrap proportions and not Bayesian posterior probabilities.">
-                        SH-like local support (1000 resamples), 0&ndash;1 scale
-                    </span>
-                </p>
-                {% elif job_details.get('tree_method') == 'iqtree' and job_details.get('alrt_replicates') %}
-                {# Dual support: node labels are "SH-aLRT/UFBoot", both 0-100. #}
-                <p><span class="opacity-70 w-32 inline-block">Node Support:</span>
-                    <span class="font-medium"
-                        title="Node labels show SH-aLRT/UFBoot, both as percentages. A clade is conventionally called well supported when SH-aLRT is at least 80 and UFBoot is at least 95.">
-                        SH-aLRT ({{ job_details.get('alrt_replicates') }}) / UFBoot ({{ job_details.get('bootstrap') }}),
-                        shown as <span class="font-mono">aLRT/UFBoot</span>
-                    </span>
-                </p>
-                {% elif job_details.get('bootstrap') and job_details.get('tree_method') in ['raxml', 'iqtree'] %}
-                <p><span class="opacity-70 w-32 inline-block">Bootstraps:</span> <span class="font-medium">{{
-                        job_details.get('bootstrap') }}</span></p>
+                {% if raw_shape.get('columns') is not none and final_shape.get('columns') is not none %}
+                <p><span class="opacity-70 w-28 inline-block">Columns:</span>
+                    <span class="font-medium">
+                        {{ raw_shape.get('columns') }} aligned
+                        {% if terminal_trim.get('enabled') %}
+                        &rarr; {{ terminal_trim.get('retained_columns') }} after terminal crop
+                        {% endif %}
+                        &rarr; {{ final_shape.get('columns') }} used for the tree
+                    </span></p>
                 {% endif %}
-                {% if terminal_trim.get('enabled') %}
-                <p><span class="opacity-70 w-44 inline-block">Terminal Coverage Rule:</span>
-                    <span class="font-medium">
-                        keep ends once {{ terminal_trim.get('min_covered_sequences', 3) }} sequences overlap
-                    </span>
-                </p>
-                <p><span class="opacity-70 w-44 inline-block">Columns Used:</span>
-                    <span class="font-medium">
-                        {{ terminal_trim.get('retained_columns') }} / {{ terminal_trim.get('input_columns') }}
-                    </span>
-                </p>
-                <p><span class="opacity-70 w-44 inline-block">Low-Coverage Ends Ignored:</span>
-                    <span class="font-medium">
-                        {{ terminal_trim.get('removed_columns', 0) }} columns
-                    </span>
-                </p>
-                <p class="text-xs text-gray-500 dark:text-gray-400 mt-1">
-                    Removed {{ terminal_trim.get('left_removed', 0) }} leading and
-                    {{ terminal_trim.get('right_removed', 0) }} trailing columns covered by fewer than
-                    {{ terminal_trim.get('min_covered_sequences', 3) }} sequences; internal gaps and
-                    multi-sequence terminal regions were kept.
-                </p>
-                {% endif %}
-                {% if job_details.get('tree_method', '')|lower == 'mrbayes' %}
-                {% set mcmc_stop_early = job_details.get('mcmc_stop_early', False)
-                    and (job_details.get('mcmc_nruns', 2)|int) > 1 %}
-                {# The 50000 fallback is deliberate: it is what a job that stored
-                   no generation count actually ran with, not today's default. #}
-                <p><span class="opacity-70 w-32 inline-block">{{ 'Max MCMC Generations' if mcmc_stop_early else 'MCMC Generations' }}:</span>
-                    <span class="font-medium">{{ job_details.get('mcmc_generations', 50000) }}</span></p>
-                <p><span class="opacity-70 w-32 inline-block">Early Stopping:</span> <span class="font-medium">{{
-                        'stop at split-frequency 0.01' if mcmc_stop_early else 'off (full run)' }}</span></p>
-                <p><span class="opacity-70 w-32 inline-block">Independent Runs:</span> <span class="font-medium">{{
-                        job_details.get('mcmc_nruns', 2) }}</span></p>
-                <p><span class="opacity-70 w-32 inline-block">Chains per Run:</span> <span class="font-medium">{{
-                        job_details.get('mcmc_nchains', 4) }}</span></p>
-                <p><span class="opacity-70 w-32 inline-block">Relative Burn-in:</span> <span class="font-medium">{{
-                        ((job_details.get('mcmc_burnin_fraction', 0.25)|float) * 100)|round(1) }}%</span></p>
+                {% if terminal_trim.get('enabled') and terminal_trim.get('removed_columns', 0) %}
                 <p class="text-xs text-gray-500 dark:text-gray-400 mt-2">
-                    Download the MrBayes analysis files above to inspect the exact NEXUS commands and open each
-                    <code>.p</code> parameter trace in Tracer for convergence and effective sample size assessment.
+                    Terminal crop removed {{ terminal_trim.get('left_removed', 0) }} leading and
+                    {{ terminal_trim.get('right_removed', 0) }} trailing low-coverage columns. The retained span
+                    begins at the first and ends at the last column covered by at least
+                    {{ terminal_trim.get('min_covered_sequences', 3) }} sequences; internal columns were left for the selected trimmer.
                 </p>
+                {% endif %}
+                {% if details.get('advanced_alignment_options') %}
+                <p><span class="opacity-70">Additional alignment options:</span>
+                    <span class="font-mono text-xs">{{ details.get('advanced_alignment_options') }}</span></p>
                 {% endif %}
             </div>
         </div>
 
-        <!-- Column 3: Advanced / Extra -->
+        <!-- Column 3: what the tree builder actually applied -->
         <div>
-            <h4 class="font-semibold text-journal-gold mb-2 uppercase text-xs tracking-wider">Configuration</h4>
+            <h4 class="font-semibold text-journal-gold mb-2 uppercase text-xs tracking-wider">Tree Inference</h4>
             <div class="space-y-1">
-                {% if job_details.get('alignment_options') %}
-                <p><span class="opacity-70">Alignment Options:</span> <span class="font-mono text-xs">{{
-                        job_details.get('alignment_options') }}</span></p>
-                {% endif %}
-
-                {% for key, value in job_details.items() %}
-                {% if key not in ['alignment_method', 'tree_method', 'trimming_method', 'tree_model', 'bootstrap',
-                'mcmc_generations', 'mcmc_nruns', 'mcmc_nchains', 'mcmc_burnin_fraction',
-                'mcmc_stop_early',
-                'sequences', 'accessions', 'sequence', 'notes', 'alignment_options', 'input_type',
-                'trim_terminal_overhangs', 'trimming_details']
-                and value %}
-                {% if key == 'blast_mode' %}
-                <p><span class="opacity-70 w-24 inline-block">BLAST:</span> {{ value|upper }}</p>
+                {% if details.get('model_value') %}
+                <p><span class="opacity-70">{{ details.get('model_label') }}:</span>
+                    <span class="font-medium">{{ details.get('model_value') }}</span></p>
+                {% if details.get('model_note') %}
+                <p class="text-xs text-gray-500 dark:text-gray-400">{{ details.get('model_note') }}</p>
                 {% endif %}
                 {% endif %}
+                {% if details.get('support_value') %}
+                <p><span class="opacity-70">{{ details.get('support_label') }}:</span>
+                    <span class="font-medium">{{ details.get('support_value') }}</span></p>
+                {% if details.get('support_note') %}
+                <p class="text-xs text-gray-500 dark:text-gray-400">{{ details.get('support_note') }}</p>
+                {% endif %}
+                {% endif %}
+                {% for item in details.get('run_details', []) %}
+                <p class="text-xs text-gray-500 dark:text-gray-400">{{ item }}</p>
                 {% endfor %}
-                {% if job_details.get('tree_method') == 'fasttree' %}
-                <div class="mt-4 pt-4 border-t border-gray-100 dark:border-gray-800">
-                    <p class="font-mono text-xs text-gray-500 dark:text-gray-400 break-all">
-                        <span class="font-bold text-journal-gold">Command:</span> fasttree -gtr -nt -gamma -boot 1000
-                        alignment.fasta > tree.newick
-                    </p>
-                    <p class="text-xs text-gray-500 dark:text-gray-400 mt-1">
-                        <strong>FastTree 2.2.0</strong> infers approximately-maximum-likelihood phylogenetic trees.
-                        Arguments: <code>-gtr</code> (Generalized Time Reversible model, CAT approximation),
-                        <code>-nt</code> (Nucleotide
-                        alignment),
-                        <code>-gamma</code> (Rescale branch lengths to optimize Gamma20 likelihood),
-                        <code>-boot 1000</code> (1000 SH-like local supports).
-                    </p>
-                </div>
+                {% if details.get('tree_method') == 'mrbayes' %}
+                <p><span class="opacity-70">Independent runs:</span> {{ job_details.get('mcmc_nruns', 2) }}</p>
+                <p><span class="opacity-70">Chains per run:</span> {{ job_details.get('mcmc_nchains', 4) }}</p>
+                <p><span class="opacity-70">Relative burn-in:</span>
+                    {{ ((job_details.get('mcmc_burnin_fraction', 0.25)|float) * 100)|round(1) }}%</p>
                 {% endif %}
             </div>
         </div>
@@ -1285,7 +1238,7 @@
     <div id="duplicate-records" class="mt-6 pt-4 border-t border-gray-200 dark:border-gray-700 scroll-mt-6">
         <div class="flex flex-wrap items-center justify-between gap-3 mb-2">
             <h4 class="font-semibold text-journal-gold uppercase text-xs tracking-wider">
-                Duplicate Sequences Removed ({{ duplicate_filters.get('removed_count', 0) }})
+                Removed After All Input Sources Were Merged ({{ duplicate_filters.get('removed_count', 0) }})
             </h4>
             {% if not view_only %}
             <button type="button" id="btn-rebuild-with-duplicates"
@@ -1296,7 +1249,8 @@
             {% endif %}
         </div>
         <p class="text-sm text-gray-700 dark:text-gray-300">
-            These records shared an observation number with a sequence that was kept and differed by at most
+            Dikarya compared the combined submitted, NCBI, and MycoMap records. These records shared an observation
+            number with a sequence that was kept and differed by at most
             {{ duplicate_filters.get('max_differences', 3) }}
             base{{ '' if duplicate_filters.get('max_differences') == 1 else 's' }} across the region the two reads
             share, so only one tip per observation was placed in the tree. The longest read of each observation is
@@ -1426,9 +1380,21 @@
     {% set mycomap_filters = import_filters.get('mycomap') if import_filters else None %}
     {% if mycomap_filters and (mycomap_filters.get('filtered_records') or mycomap_filters.get('counts')) %}
     <div class="mt-6 pt-4 border-t border-gray-200 dark:border-gray-700">
-        <h4 class="font-semibold text-journal-gold mb-2 uppercase text-xs tracking-wider">Import Filters</h4>
+        {% set restorable_filtered = mycomap_filters.get('filtered_records', [])|selectattr('sequence')|list %}
+        <div class="flex flex-wrap items-center justify-between gap-3 mb-2">
+            <h4 class="font-semibold text-journal-gold uppercase text-xs tracking-wider">Removed by MycoMap Before Import</h4>
+            {% if not view_only %}
+            <button type="button" id="btn-rebuild-with-import-filtered"
+                class="px-3 py-2 text-sm font-semibold rounded-lg bg-journal-gold hover:bg-journal-gold-light text-journal-dark transition-colors shadow-sm flex items-center gap-2 disabled:opacity-50 disabled:cursor-not-allowed"
+                title="{% if restorable_filtered %}Start a new job with the restorable sequences excluded by these import filters added back in, leaving this tree untouched.{% else %}This older job recorded the filtered names and reasons, but not the DNA needed to rebuild them.{% endif %}"
+                {% if not restorable_filtered %}disabled{% endif %}>
+                <i class="fas fa-rotate-right"></i> Rebuild tree including filtered sequences
+            </button>
+            {% endif %}
+        </div>
         {% set counts = mycomap_filters.get('counts', {}) %}
         <p class="text-sm text-gray-700 dark:text-gray-300">
+            This is an earlier filtering stage than the combined-input duplicate check above.
             <span class="font-medium">{{ mycomap_filters.get('label', 'MycoMap import filters') }}</span>:
             {{ counts.get('invalid_sequence', 0) }} invalid/short,
             {{ counts.get('contaminant', 0) }} contaminant,
@@ -1436,6 +1402,8 @@
             {{ counts.get('duplicate_observation', 0) }} duplicate observation records.
         </p>
         {% if mycomap_filters.get('filtered_records') %}
+        {% set show_identity = details.get('show_import_identity', false) %}
+        {% set show_similarity = details.get('show_import_query_similarity', false) %}
         <div class="mt-3 overflow-x-auto">
             <table class="min-w-full text-xs text-left text-gray-600 dark:text-gray-300">
                 <thead class="text-gray-500 dark:text-gray-400 uppercase border-b border-gray-200 dark:border-gray-700">
@@ -1443,8 +1411,8 @@
                         <th class="py-2 pr-4 font-semibold">Filtered Record</th>
                         <th class="py-2 pr-4 font-semibold">Source</th>
                         <th class="py-2 pr-4 font-semibold">Reason</th>
-                        <th class="py-2 pr-4 font-semibold">Identity</th>
-                        <th class="py-2 pr-4 font-semibold">Query Similarity</th>
+                        {% if show_identity %}<th class="py-2 pr-4 font-semibold">Identity</th>{% endif %}
+                        {% if show_similarity %}<th class="py-2 pr-4 font-semibold">Query Similarity</th>{% endif %}
                     </tr>
                 </thead>
                 <tbody class="divide-y divide-gray-100 dark:divide-gray-800">
@@ -1453,12 +1421,12 @@
                         <td class="py-2 pr-4 font-mono break-all max-w-xl">{{ record.get('name', 'Unknown') }}</td>
                         <td class="py-2 pr-4">{{ record.get('hit_source') or record.get('source') or 'Unknown' }}</td>
                         <td class="py-2 pr-4">{{ record.get('reason_label') or record.get('reason') }}</td>
-                        <td class="py-2 pr-4">
+                        {% if show_identity %}<td class="py-2 pr-4">
                             {% if record.get('reported_identity') is not none %}{{ record.get('reported_identity') }}%{% else %}-{% endif %}
-                        </td>
-                        <td class="py-2 pr-4">
+                        </td>{% endif %}
+                        {% if show_similarity %}<td class="py-2 pr-4">
                             {% if record.get('query_similarity') is not none %}{{ record.get('query_similarity') }}%{% else %}-{% endif %}
-                        </td>
+                        </td>{% endif %}
                     </tr>
                     {% endfor %}
                 </tbody>
@@ -1525,15 +1493,15 @@
 
 <script src="{{ url_for('static', filename='js/phylotree.js') }}?v=12"></script>
 
-<script src="{{ url_for('static', filename='js/tree_viewer_phylotree_v2.js') }}?v=87"></script>
+<script src="{{ url_for('static', filename='js/tree_viewer_phylotree_v2.js') }}?v=90"></script>
 
 <script src="{{ url_for('static', filename='js/tree_viewer_api.js') }}?v=8"></script>
 
-<script src="{{ url_for('static', filename='js/tree_viewer_controller.js') }}?v=80"></script>
+<script src="{{ url_for('static', filename='js/tree_viewer_controller.js') }}?v=84"></script>
 
 {% include 'partials/alignment_viewer_modal.html' %}
 
-<script src="{{ url_for('static', filename='js/alignment_viewer.js') }}?v=15"></script>
+<script src="{{ url_for('static', filename='js/alignment_viewer.js') }}?v=16"></script>
 
 
 

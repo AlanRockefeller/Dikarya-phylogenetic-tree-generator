@@ -35,7 +35,7 @@ class MushroomObserverMycoMapMessageTests(unittest.TestCase):
             "consensus_name": "Example fungus",
         }
 
-        def missing_lookup(_title, warnings=None):
+        def missing_lookup(_title, warnings=None, pending_out=None):
             warnings.append("lookup endpoint returned 503")
             return None
 

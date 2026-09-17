@@ -117,6 +117,15 @@ class TestBlastExpectedAtStart(unittest.TestCase):
                 with self.subTest(input_type=input_type, mode=mode):
                     self.assertIsNone(blast_expected_at_start(input_type, mode))
 
+    def test_tree_preparation_inputs_are_undecided(self):
+        # The INPUT step swaps job_params for the prepared job, so BLAST is not
+        # settled yet -- pre-marking these "skipped" told a one-click iNat tree
+        # that BLAST was skipped while its MycoMap BLAST was actually running.
+        for input_type in ("inat_tree_preparation", "mo_tree_preparation"):
+            for mode in ("auto", "on"):
+                with self.subTest(input_type=input_type, mode=mode):
+                    self.assertIsNone(blast_expected_at_start(input_type, mode))
+
     def test_unknown_input_type_is_not_expected_to_blast(self):
         self.assertIs(blast_expected_at_start("bogus", "auto"), False)
         self.assertIs(blast_expected_at_start(None, "auto"), False)

@@ -1428,6 +1428,8 @@ document.addEventListener('DOMContentLoaded', async () => {
 
     // Provisional names travel quoted -- Amanita sp. 'albemarlensis', Amanita "albemarlensis" --
     // and both spellings have to reduce to the same suggestion so they count as one species.
+    // They reduce to the CURRENT convention, Genus sp. 'epithet', so the older bare-quoted
+    // spelling is suggested in the newer form rather than the marker being dropped from both.
     // Informal codes (Russula "sp-IN67", Tricholoma "moseri-CA01") are quoted the same way and
     // are kept as they are written, because they are what separates two species in these trees.
     function speciesQuotedEpithet(token) {
@@ -1462,14 +1464,14 @@ document.addEventListener('DOMContentLoaded', async () => {
             if (marker) {
                 const next = j + 1 < tokens.length ? tokens[j + 1] : '';
                 const provisional = speciesQuotedEpithet(next);
-                if (provisional) return `${genus} '${provisional}'`;
+                if (provisional) return `${genus} ${marker} '${provisional}'`;
                 if (marker === 'sp.') return `${genus} sp.`;
                 const qualified = speciesEpithetCandidate(next);
                 if (qualified) return `${genus} ${marker} ${qualified}`;
                 continue;
             }
             const provisional = speciesQuotedEpithet(tokens[j]);
-            if (provisional) return `${genus} '${provisional}'`;
+            if (provisional) return `${genus} sp. '${provisional}'`;
             const epithet = speciesEpithetCandidate(tokens[j]);
             if (epithet) return `${genus} ${epithet}`;
         }
@@ -1725,9 +1727,40 @@ document.addEventListener('DOMContentLoaded', async () => {
         // kept and goes to the server in the same atomic save as the annotation that uses it.
         // If that save fails, saveAnnotationsNow() reloads the persisted configuration, which
         // drops the local-only layer rather than leaving it behind as a fake.
+        const wasAdd = annotationEditorState.mode !== 'edit';
         closeAnnotationEditor(true);
         const saved = await saveAnnotationsNow();
-        if (saved) showStatus(`Annotation "${label}" saved.`, 'success', 2000);
+        if (saved) {
+            // Alan 9/9/26 - Drop the tip selection once a NEW annotation is saved, so the group
+            // that was just annotated is not silently carried into the next Add. Only the
+            // transient selection goes; saved colour groups are untouched, and an edit leaves
+            // the selection alone because it was not opened from one.
+            // Alan 9/15/26 - The save above is async, so the user can have selected a
+            // different group while it was in flight. Clear only the selection this
+            // annotation was made from; anything else is the user's newer work.
+            if (wasAdd && viewer?.deselectCurrentSelection) {
+                const current = typeof viewer.getSelectedAnnotationLeafIds === 'function'
+                    ? viewer.getSelectedAnnotationLeafIds()
+                    : null;
+                if (current === null || sameTipIdSet(current, payload.member_tip_ids)) {
+                    viewer.deselectCurrentSelection();
+                    updateButtons();
+                }
+            }
+            showStatus(`Annotation "${label}" saved.`, 'success', 2000);
+        }
+    }
+
+    // Alan 9/15/26 - Membership equality by set: the viewer's selection order is not
+    // meaningful, so only the contents decide whether two selections are the same one.
+    function sameTipIdSet(a, b) {
+        const left = new Set(a || []);
+        const right = new Set(b || []);
+        if (left.size !== right.size) return false;
+        for (const id of left) {
+            if (!right.has(id)) return false;
+        }
+        return true;
     }
 
     async function deleteCurrentAnnotation() {
@@ -3988,6 +4021,38 @@ document.addEventListener('DOMContentLoaded', async () => {
                 showStatus("Could not start the rebuild.", "danger", 5000);
                 btnRebuildDupes.disabled = false;
                 btnRebuildDupes.classList.remove('opacity-50', 'cursor-not-allowed');
+            }
+        });
+
+        // Re-run this import with the sequence-bearing records that its MycoMap filters excluded.
+        const btnRebuildImportFiltered = getEl('btn-rebuild-with-import-filtered');
+        if (btnRebuildImportFiltered) btnRebuildImportFiltered.addEventListener('click', async () => {
+            if (!confirm(
+                "Start a new job with the restorable import-filtered sequences added back in?\n\n" +
+                "Invalid or sequence-free records cannot be restored. This tree is left unchanged."
+            )) return;
+            btnRebuildImportFiltered.disabled = true;
+            btnRebuildImportFiltered.classList.add('opacity-50', 'cursor-not-allowed');
+            try {
+                const csrf = document.querySelector('meta[name="csrf-token"]')?.getAttribute('content');
+                const headers = { 'Content-Type': 'application/json' };
+                if (csrf) headers['X-CSRFToken'] = csrf;
+                const resp = await fetch(`/api/job/${JOB_ID}/rebuild-with-import-filtered`, {
+                    method: 'POST',
+                    credentials: 'same-origin',
+                    headers
+                });
+                const data = await resp.json().catch(() => ({}));
+                if (!resp.ok) throw new Error(data.error || "Could not start the filtered-sequence rebuild.");
+                showStatus(
+                    `Queued a new tree with ${data.restored_count} import-filtered record(s) restored. Opening it now...`,
+                    "success", 0
+                );
+                setTimeout(() => { window.location.href = data.status_url || `/job/${data.job_id}`; }, 1200);
+            } catch (error) {
+                showStatus(error.message || "Could not start the filtered-sequence rebuild.", "danger", 5000);
+                btnRebuildImportFiltered.disabled = false;
+                btnRebuildImportFiltered.classList.remove('opacity-50', 'cursor-not-allowed');
             }
         });
 

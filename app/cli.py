@@ -20,7 +20,13 @@ def run_worker_command(queues):
     queue_names = None
     if queues:
         queue_names = [name.strip() for name in queues.split(",") if name.strip()]
-    print(f"Starting worker with heartbeat (queues: {queue_names or 'all'})...")
+    # Alan 9/12/26 - print() here landed in worker.log without a timestamp or
+    # level, so the digest counted it as an unparsed line every restart. Route
+    # it through logging like everything else the worker emits.
+    current_app.logger.info(
+        "event=worker.starting Starting worker with heartbeat queues=%s",
+        ",".join(queue_names) if queue_names else "all",
+    )
     run_worker_with_heartbeat(current_app, queue_names=queue_names)
 
 @click.command("run-metrics")

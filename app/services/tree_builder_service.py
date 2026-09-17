@@ -54,6 +54,17 @@ except ImportError:
 
 logger = logging.getLogger(__name__)
 
+# SH-aLRT replicates for the limited IQ-TREE Quick Tree search (--alrt N).
+# Fixed rather than read from the submission for the same reason as FastTree's
+# resample count below: the preset has no support control, and a stored
+# `bootstrap` value would otherwise be reported as though it had run.
+IQTREE_FAST_ALRT_REPLICATES = 1000
+
+# Branch support metrics requested from RAxML-NG (--bs-metric). Order matters:
+# the first is what tree_original.newick carries and the viewer displays; the
+# second is written beside it as tree_original_tbe.newick.
+RAXML_BOOTSTRAP_METRICS = ("fbp", "tbe")
+
 # Number of resamples FastTree uses for its SH-like local support test (-boot N).
 # Despite the flag name, these are NOT bootstrap replicates: the resulting node
 # values are SH-like local supports on a 0-1 scale.
@@ -89,6 +100,11 @@ def _validate_iqtree_model(model_str: str) -> str:
         return _IQTREE_DEFAULT_MODEL
     if len(model_str) > _IQTREE_MODEL_MAX_LEN or not _IQTREE_MODEL_ALLOWED_RE.match(model_str):
         logger.warning(f"Rejected IQ-TREE model string '{model_str}'; using default '{_IQTREE_DEFAULT_MODEL}'.")
+        # The value reaches IQ-TREE's argv as -m, so a rejection shaped like a
+        # flag or a path is an attempt on the binary rather than a typo.
+        from app.services.request_diagnostics import note_tool_argument_refusal
+
+        note_tool_argument_refusal("iqtree_model", model_str, logger)
         return _IQTREE_DEFAULT_MODEL
     return model_str
 
@@ -116,7 +132,7 @@ def run_tree_builder(
     """
     Run the selected tree building algorithm.
     
-    Methods: "nj", "raxml", "iqtree", "mrbayes"
+    Methods: "nj", "raxml", "iqtree", "iqtree_fast", "mrbayes", "fasttree"
     
     Args:
         alignment_fasta: Path to aligned FASTA file
@@ -174,6 +190,24 @@ def run_tree_builder(
             metadata["support_type"] = None
         if has_alrt:
             metadata["alrt_replicates"] = params.alrt_replicates
+        if has_ufboot:
+            # _run_iqtree always pairs -B with --bnni (UFBoot trees refined by
+            # NNI on the bootstrap alignment, which reduces UFBoot's
+            # overestimation on alignments with model violations).
+            metadata["bnni"] = True
+    if method == "iqtree_fast":
+        # The Quick Tree engine: IQ-TREE 3 limited to five search iterations
+        # under a fixed GTR+G, with SH-aLRT branch support. The preset does not
+        # run ultrafast bootstrap, so any submitted `bootstrap` is nulled here
+        # rather than echoed back, exactly as for FastTree. Node labels are
+        # SH-aLRT percentages on a 0-100 scale, not FastTree's 0-1 SH-like
+        # values.
+        metadata["model"] = _validate_iqtree_model(params.model)
+        metadata["bootstrap"] = None
+        metadata["support_type"] = "alrt"
+        metadata["support_resamples"] = IQTREE_FAST_ALRT_REPLICATES
+        metadata["alrt_replicates"] = IQTREE_FAST_ALRT_REPLICATES
+        metadata["search"] = "five_iterations"
     if method == "mrbayes":
         burnin_fraction = _normalize_mrbayes_burnin_fraction(
             params.mcmc_burnin_fraction
@@ -211,11 +245,13 @@ def run_tree_builder(
                 metadata["model_selected"] = effective_model
                 if selected_by:
                     metadata["model_selector"] = selected_by
-        elif method == "iqtree":
+        elif method in ("iqtree", "iqtree_fast"):
             selected_model, iqtree_seed = _run_iqtree(
-                alignment_fasta, output_newick, output_nexus, params, config, task_logger, job_id
+                alignment_fasta, output_newick, output_nexus, params, config, task_logger, job_id,
+                fast=(method == "iqtree_fast"),
             )
             metadata["seed"] = iqtree_seed
+            metadata["binary"] = config.IQTREE_BINARY
             if selected_model:
                 # params.model stays as requested ("MFP"); model_selected is what
                 # ModelFinder actually fit. Both matter: one is the setting, the
@@ -703,6 +739,13 @@ def _get_raxml_cmd(
         cmd.append("--all")
         # --bs-trees autoMRE{cap}
         cmd.extend(["--bs-trees", f"autoMRE{{{params.bootstrap_cap}}}"])
+        # Both support metrics from the same replicates: Felsenstein (the
+        # classical proportion the viewer shows) and the transfer bootstrap
+        # (Lemoine et al. 2018), which is far less punishing of one rogue taxon
+        # on a deep branch. RAxML-NG then writes <prefix>.raxml.supportFBP and
+        # .supportTBE instead of a single .raxml.support -- see the output
+        # handling in _run_raxml.
+        cmd.extend(["--bs-metric", ",".join(RAXML_BOOTSTRAP_METRICS)])
     else:
         # ML check only
         # Verified ML-only mode: --search
@@ -814,6 +857,21 @@ def _run_moose(
         f"MOOSE output file not found. Keeping {configured_model}."
     )
     return None, alignment_fasta
+
+def _reroot_tree_file_on_tip(tree_path: Path, tip_name: str) -> bool:
+    """Reroot the Newick file in place on the named tip; False if it is absent.
+
+    Shared by the primary RAxML tree and its TBE companion so both files carry
+    the same rooting.
+    """
+    tree = Phylo.read(str(tree_path), "newick")
+    target_clade = next((c for c in tree.find_clades() if c.name == tip_name), None)
+    if target_clade is None:
+        return False
+    tree.root_with_outgroup(target_clade)
+    write_tree_file(tree, tree_path, "newick")
+    return True
+
 
 def _run_raxml(
     alignment_fasta: Path,
@@ -1006,24 +1064,43 @@ def _run_raxml(
             
     # 6. Output Handling
     best_tree = Path(f"{prefix}.raxml.bestTree")
+    # With --bs-metric fbp,tbe RAxML-NG writes one support tree per metric and
+    # no bare .raxml.support; that name is kept as a fallback for a binary
+    # that ignored the flag. The FBP tree is what the site serves as the
+    # primary tree, so the viewer's "Bootstrap" badge keeps meaning the
+    # Felsenstein proportion it always has.
+    support_fbp = Path(f"{prefix}.raxml.supportFBP")
+    support_tbe = Path(f"{prefix}.raxml.supportTBE")
     support_tree = Path(f"{prefix}.raxml.support")
     
     # Prefer supported tree if available (BS run), else best ML tree
-    source_tree = support_tree if support_tree.exists() else best_tree
+    if support_fbp.exists():
+        source_tree = support_fbp
+    elif support_tree.exists():
+        source_tree = support_tree
+    else:
+        source_tree = best_tree
     
     if not source_tree.exists():
         raise RuntimeError("RAxML output tree not found.")
         
     # Copy to final internal location
     shutil.copy(source_tree, output_newick)
+
+    # The TBE tree sits beside the primary one (tree_original_tbe.newick, or
+    # tree_pruned_tbe.newick for a recompute) and goes through the same
+    # rerooting and name restoration below. Nothing displays it by default.
+    tbe_tree_path = None
+    if resolved.enable_bootstrap and support_tbe.exists():
+        tbe_tree_path = output_newick.with_name(f"{output_newick.stem}_tbe.newick")
+        shutil.copy(support_tbe, tbe_tree_path)
     
     # 7. Post-Processing: Outgroup Rerooting
     applied_outgroup = None
     if resolved.outgroup and HAS_BIOPYTHON:
         try:
             task_logger.info(f"Rerooting tree on outgroup: {resolved.outgroup}")
-            tree = Phylo.read(str(output_newick), "newick")
-            
+
             # RAxML output uses sanitized IDs while the UI supplies an original
             # record ID. Resolve the requested ID before rerooting.
             target_name = resolved.outgroup
@@ -1040,14 +1117,10 @@ def _run_raxml(
                         target_name = safe_id
                         break
 
-            # Find clade
-            target_clade = next((c for c in tree.find_clades() if c.name == target_name), None)
-            
-            if target_clade:
-                tree.root_with_outgroup(target_clade)
-                # Overwrite output_newick with rooted version
-                write_tree_file(tree, output_newick, "newick")
+            if _reroot_tree_file_on_tip(output_newick, target_name):
                 applied_outgroup = resolved.outgroup
+                if tbe_tree_path is not None:
+                    _reroot_tree_file_on_tip(tbe_tree_path, target_name)
             else:
                 task_logger.warning(f"Outgroup {target_name} not found in tree. Skipping reroot.")
                 resolved.warnings.append(
@@ -1069,6 +1142,8 @@ def _run_raxml(
     # 8. Final Name Restoration & Nexus Conversion
     restore_tree_names(output_newick, name_mapping)
     _convert_newick_to_nexus(output_newick, output_nexus)
+    if tbe_tree_path is not None:
+        restore_tree_names(tbe_tree_path, name_mapping)
 
     applied_parameters = {
         "model": resolved.model,
@@ -1081,6 +1156,19 @@ def _run_raxml(
         "early_stopping": resolved.enable_early_stopping,
         "data_type": resolved.data_type,
     }
+    from app.services.raxml_results import read_raxml_bootstrap_summary
+
+    bootstrap_outcome = (
+        read_raxml_bootstrap_summary(
+            output_newick.parent, cap=resolved.bootstrap_cap
+        )
+        if resolved.enable_bootstrap
+        else {
+            "bootstrap_replicates_completed": None,
+            "bootstrap_converged": False,
+            "bootstrap_stopped_early": False,
+        }
+    )
     if resolved.warnings:
         from app.services.log_context import log_degradation
 
@@ -1099,6 +1187,17 @@ def _run_raxml(
             f"autoMRE{{{resolved.bootstrap_cap}}}" if resolved.enable_bootstrap else None
         ),
         "support_type": "bootstrap" if resolved.enable_bootstrap else None,
+        # Unlike the submitted generic `bootstrap` field, this is the number
+        # of replicate trees RAxML-NG actually wrote. AutoMRE convergence is
+        # taken only from the explicit success line in its log; a short output
+        # file by itself could mean an interrupted run.
+        **bootstrap_outcome,
+        # Which --bs-metric values were computed. The primary tree carries the
+        # first; the TBE tree, when RAxML wrote one, is named by tbe_tree.
+        "bootstrap_metrics": (
+            list(RAXML_BOOTSTRAP_METRICS) if resolved.enable_bootstrap else None
+        ),
+        "tbe_tree": tbe_tree_path.name if tbe_tree_path is not None else None,
         "seed": resolved.seed,
         "data_type": resolved.data_type,
         "parameters_requested": requested_parameters,
@@ -1114,10 +1213,21 @@ def _run_iqtree(
     params: TreeBuilderParams,
     config: Config,
     task_logger,
-    job_id: Optional[str] = None
+    job_id: Optional[str] = None,
+    fast: bool = False,
 ):
-    """Run IQ-TREE maximum likelihood tree inference."""
-    bootstrap = validate_iqtree_ufboot_count("iqtree", params.bootstrap)
+    """Run IQ-TREE maximum likelihood tree inference.
+
+    ``fast=True`` is the Quick Tree engine (method ``iqtree_fast``): IQ-TREE 3
+    limited to five search iterations under the submitted fixed model, with
+    ``--alrt`` IQTREE_FAST_ALRT_REPLICATES and no ``-B``. params.bootstrap and
+    params.alrt_replicates are deliberately unused in that preset.
+
+    Flags use the IQ-TREE 3 spellings (-T, --prefix, --seed, --redo, -B,
+    --alrt); 3.1.4 still accepts the old -nt/-pre/-seed forms, but the
+    documented ones are what the tests and the job page's command echo assume.
+    """
+    bootstrap = 0 if fast else validate_iqtree_ufboot_count("iqtree", params.bootstrap)
     prefix = str(output_newick.parent / "iqtree_run")
     threads = _get_thread_count(params)
     
@@ -1130,23 +1240,30 @@ def _run_iqtree(
         config.IQTREE_BINARY,
         "-s", str(sanitized_fasta),
         "-m", _validate_iqtree_model(params.model),
-        "-nt", str(threads),
-        "-pre", prefix,
+        "-T", str(threads),
+        "--prefix", prefix,
         # Without an explicit seed IQ-TREE seeds from the clock and the run
         # cannot be reproduced. The value is recorded in tree_metadata.json.
-        "-seed", str(seed),
-        "-redo"
+        "--seed", str(seed),
+        "--redo",
     ]
 
-    if bootstrap > 0:
-        cmd.extend(["-B", str(bootstrap)])
+    if fast:
+        cmd.extend(["-n", "5"])
 
-    # SH-aLRT branch test. With both -alrt and -B, IQ-TREE writes dual
+    if bootstrap > 0:
+        # --bnni refines each UFBoot tree by NNI on its bootstrap alignment,
+        # which counters UFBoot's known overestimation of support when the
+        # model is violated (Hoang et al. 2018). run_tree_builder records
+        # metadata["bnni"] = True on exactly this condition.
+        cmd.extend(["-B", str(bootstrap), "--bnni"])
+
+    # SH-aLRT branch test. With both --alrt and -B, IQ-TREE writes dual
     # "SH-aLRT/UFBoot" labels (e.g. "82.7/87") into <prefix>.treefile.
-    alrt = params.alrt_replicates or 0
+    alrt = IQTREE_FAST_ALRT_REPLICATES if fast else (params.alrt_replicates or 0)
     use_alrt = alrt > 0
     if use_alrt:
-        cmd.extend(["-alrt", str(alrt)])
+        cmd.extend(["--alrt", str(alrt)])
 
     log_file = output_newick.parent.parent / "logs" / "tree_builder.log"
     
@@ -1208,15 +1325,27 @@ def _run_iqtree(
 _IQTREE_BEST_MODEL_RE = re.compile(
     r"^Best-fit model according to \w+:\s*(\S+)\s*$", re.MULTILINE
 )
+# A fixed-model run has no Best-fit line; the report still names the model
+# IQ-TREE actually fit, in its expanded form ("GTR+G" runs as "GTR+F+G4"):
+#   Model of substitution: GTR+F+G4
+_IQTREE_MODEL_OF_SUBSTITUTION_RE = re.compile(
+    r"^Model of substitution:\s*(\S+)\s*$", re.MULTILINE
+)
 
 
 def _read_iqtree_selected_model(report_path: Path) -> Optional[str]:
-    """Return the model ModelFinder picked, or None if it did not run."""
+    """Return the model IQ-TREE actually fit, or None if it cannot be read.
+
+    ModelFinder's Best-fit line wins when present; otherwise the report's
+    "Model of substitution" line, so a fixed-model run (Quick Tree's GTR+G)
+    still records the concrete, citable form the tree was built under.
+    """
     try:
         report_text = report_path.read_text(errors="replace")
     except OSError:
         return None
-    match = _IQTREE_BEST_MODEL_RE.search(report_text)
+    match = (_IQTREE_BEST_MODEL_RE.search(report_text)
+             or _IQTREE_MODEL_OF_SUBSTITUTION_RE.search(report_text))
     if not match:
         return None
     selected = match.group(1)
@@ -1575,10 +1704,15 @@ def _run_mrbayes(
         from app.workers.events import publish_command
         publish_command(job_id, "tree", cmd)
 
-        # MrBayes prints progress to stdout
+        # MrBayes prints progress to stdout, and unlike IQ-TREE (<prefix>.log)
+        # and RAxML-NG (.raxml.log) it writes no log of its own, so without the
+        # tee the run leaves nothing behind: this branch used to produce a
+        # 4-line tree_builder.log holding only the CMD header, which is also
+        # what the status page's Tree tab and the tree-log download served.
         exit_code, stats = run_command_streaming(
             cmd,
             stderr_path=log_file,
+            stdout_tee_path=log_file,
             on_stdout_line=_make_log_callback(job_id, "tree", "stdout"),  # MrBayes uses stdout
             on_stderr_line=_make_log_callback(job_id, "tree", "stderr"),
             **_tool_limits(config, "MrBayes", _get_thread_count(params)),

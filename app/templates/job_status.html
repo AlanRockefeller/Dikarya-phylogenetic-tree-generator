@@ -534,10 +534,16 @@
                             If retrying does not solve the problem, contact Alan and include job ID
                             <span class="font-mono font-semibold">{{ job_id }}</span> so he can find the exact failure in the logs.
                         </p>
-                        <a href="mailto:alanrockefeller@gmail.com?subject=Dikarya%20job%20{{ job_id }}%20failed"
-                            class="inline-flex items-center mt-3 px-4 py-2 bg-journal-gold text-journal-dark rounded text-sm font-semibold hover:opacity-90 transition-opacity">
-                            <i class="fas fa-envelope mr-2"></i> Contact Alan
-                        </a>
+                        <div class="mt-3 flex flex-wrap items-center gap-3">
+                            <a href="mailto:alanrockefeller@gmail.com?subject=Dikarya%20job%20{{ job_id }}%20failed"
+                                class="inline-flex items-center px-4 py-2 bg-journal-gold text-journal-dark rounded text-sm font-semibold hover:opacity-90 transition-opacity">
+                                <i class="fas fa-envelope mr-2"></i> Contact Alan
+                            </a>
+                            <span class="text-sm text-amber-900 dark:text-amber-100">
+                                or email
+                                <span class="select-all font-mono font-semibold">alanrockefeller@gmail.com</span>
+                            </span>
+                        </div>
                     </div>
 
                     <div class="pt-4 border-t border-gray-100 dark:border-gray-700 flex flex-wrap gap-3">

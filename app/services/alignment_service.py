@@ -14,8 +14,9 @@ import logging
 import os
 import re
 import shutil
+import time
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Set
 
 from app.config import Config
 from app.models import AlignmentParams
@@ -29,6 +30,42 @@ from app.services.subprocess_utils import (
     ToolExecutionError,
     tool_failure_message,
 )
+
+
+# MAFFT's two direction checks, plus "do not check at all". Keyed by
+# Config.MAFFT_DIRECTION_MODE; see the comment beside that setting for why the
+# default is the cheap one and what `accurate` is kept for.
+MAFFT_DIRECTION_FLAGS = {
+    "fast": "--adjustdirection",
+    "accurate": "--adjustdirectionaccurately",
+    "off": None,
+}
+MAFFT_DIRECTION_MODE_FALLBACK = "fast"
+
+
+def resolve_mafft_direction_mode(config: Config, logger=None) -> str:
+    """Return the validated MAFFT direction mode for the normal alignment path.
+
+    Config.choice_env already rejects an unknown value at import time, so this
+    is the second line of defence: a Config subclass, a test double or a runtime
+    ``setattr`` can still put an unrecognised string here, and the one thing
+    that must never happen is for it to be read as "off" by accident -- that
+    silently disables direction correction for every job.
+    """
+    mode = str(getattr(config, "MAFFT_DIRECTION_MODE", MAFFT_DIRECTION_MODE_FALLBACK)
+               or "").strip().lower()
+    if mode in MAFFT_DIRECTION_FLAGS:
+        return mode
+    (logger or globals()["logger"]).warning(
+        "MAFFT_DIRECTION_MODE=%r is not one of %s; using %r",
+        mode, ", ".join(sorted(MAFFT_DIRECTION_FLAGS)), MAFFT_DIRECTION_MODE_FALLBACK,
+    )
+    return MAFFT_DIRECTION_MODE_FALLBACK
+
+
+def mafft_direction_flag(config: Config, logger=None) -> Optional[str]:
+    """The MAFFT direction flag to add, or None when no flag should be added."""
+    return MAFFT_DIRECTION_FLAGS[resolve_mafft_direction_mode(config, logger)]
 
 
 def _orientation_input_too_large(input_fasta: Path, config: Config, logger) -> bool:
@@ -139,10 +176,12 @@ def run_alignment(
     logger,
     job_id: Optional[str] = None,
     orient_uncertain: Optional[int] = None,
+    orient_uncertain_headers: Optional[Set[str]] = None,
+    orient_unclassified_headers: Optional[Set[str]] = None,
 ) -> dict:
     """
     Run a multiple sequence alignment according to user-selected or default parameters.
-    
+
     Supported methods:
       - mafft
       - muscle
@@ -160,6 +199,14 @@ def run_alignment(
         orient_uncertain: How many sequences ORIENT declined to call, when it
             ran. Recorded alongside any aligner flip so the degradation line
             explains itself; None means ORIENT did not run (recompute).
+        orient_uncertain_headers: The headers behind that tally. When present
+            the degradation classifies each flip by identity instead of
+            comparing counts, which is the difference between knowing MAFFT
+            flipped a record ORIENT declined and merely knowing the totals
+            allow it.
+        orient_unclassified_headers: Headers ORIENT never saw -- records added
+            to the job after the pipeline ran. A flip there is neither
+            agreement nor disagreement, because there was no first opinion.
 
     Returns:
         Stats dict describing what the aligner actually did.
@@ -192,6 +239,8 @@ def run_alignment(
             stats["reversed_by_aligner"] = _run_mafft(
                 input_fasta, output_fasta, params, config, logger, job_id,
                 orient_uncertain=orient_uncertain,
+                orient_uncertain_headers=orient_uncertain_headers,
+                orient_unclassified_headers=orient_unclassified_headers,
                 fix_orientation=fix_orientation,
             )
         else:
@@ -608,6 +657,8 @@ def _apply_direction_veto_and_realign(
     job_id: Optional[str],
     reversed_headers: set,
     orient_uncertain: Optional[int],
+    orient_uncertain_headers: Optional[Set[str]] = None,
+    orient_unclassified_headers: Optional[Set[str]] = None,
 ) -> set:
     """Re-check MAFFT's flips and, if any is overruled, align again without it.
 
@@ -659,7 +710,10 @@ def _apply_direction_veto_and_realign(
 
     _run_mafft(
         input_fasta, output_fasta, params, config, logger, job_id,
-        orient_uncertain=orient_uncertain, fix_orientation=False,
+        orient_uncertain=orient_uncertain,
+        orient_uncertain_headers=orient_uncertain_headers,
+        orient_unclassified_headers=orient_unclassified_headers,
+        fix_orientation=False,
     )
     return accepted
 
@@ -672,18 +726,26 @@ def _run_mafft(
     logger,
     job_id: Optional[str] = None,
     orient_uncertain: Optional[int] = None,
+    orient_uncertain_headers: Optional[Set[str]] = None,
+    orient_unclassified_headers: Optional[Set[str]] = None,
     fix_orientation: bool = True,
 ):
     """
     Run MAFFT alignment.
-    
+
     MAFFT writes alignment to stdout, so we redirect stdout to file
     and stream stderr to Redis for progress updates.
     """
     threads = _get_thread_count()
     cmd = [config.MAFFT_BINARY, "--thread", str(threads)]
-    if fix_orientation:
-        cmd.append("--adjustdirectionaccurately")
+    # fix_orientation is the user's own setting and still decides whether MAFFT
+    # is asked about direction at all; MAFFT_DIRECTION_MODE only chooses *which*
+    # check runs when it is on, and "off" is an operator-side kill switch on top
+    # of it. Either one being false means no direction flag.
+    direction_mode = resolve_mafft_direction_mode(config, logger)
+    direction_flag = MAFFT_DIRECTION_FLAGS[direction_mode] if fix_orientation else None
+    if direction_flag:
+        cmd.append(direction_flag)
     
     # Check if this is a fast NJ tree build
     tree_method = params.advanced_options.get("tree_method", "").lower()
@@ -711,48 +773,119 @@ def _run_mafft(
     log_file = output_fasta.parent.parent / "logs" / "alignment.log"
     
     if job_id:
-        # Publish command line (displayed in green)
+        # Publish the command line (displayed in green) BEFORE the clock starts.
+        # This is a Redis publish, not part of the alignment: if it throws,
+        # MAFFT never ran and there is nothing to measure, so no invocation
+        # record should be emitted at all.
         from app.workers.events import publish_command
         publish_command(job_id, "align", cmd)
-        
-        # Use streaming runner: stdout → file, stderr → Redis + log
-        exit_code, stats = run_command_streaming(
-            cmd,
-            stdout_path=output_fasta,  # MAFFT writes alignment to stdout
-            stderr_path=log_file,
-            on_stderr_line=_make_log_callback(job_id, "align", "stderr"),
-            stderr_file_filter=_keep_mafft_log_line,
-            **configured_tool_limits(config, "MAFFT", threads),
+
+    # Timed per invocation rather than per job on purpose. A direction veto
+    # re-runs MAFFT (see _apply_direction_veto_and_realign), and that rerun is a
+    # second, separately measurable alignment -- folding the two into one
+    # elapsed figure would hide exactly the case where the direction handling is
+    # costing the most.
+    #
+    # Emitted from a `finally`, so every path through the subprocess leaves
+    # exactly one record:
+    #
+    #   MAFFT failed or timed out  -> outcome=failed, count unknown. This is the
+    #       run whose duration matters most -- an alignment that burned the
+    #       whole MAFFT_TIME_LIMIT_HOURS budget and produced nothing -- and it
+    #       used to leave no timing record at all.
+    #   MAFFT succeeded            -> outcome=success. If reading the _R_
+    #       markers back then fails, that is a Dikarya-side problem and not a
+    #       MAFFT one, so the outcome stays "success" and only the count
+    #       becomes unknown. The record is still written.
+    #
+    # The clock stops at the subprocess boundary rather than at the end of this
+    # function: the event measures MAFFT, and everything after it -- writing
+    # the alignment out, filtering the log, the _R_ restoration -- is our own
+    # work. That is also why the outcome is settled the moment the exit code
+    # has been checked: a full disk that breaks the FASTA write afterwards is a
+    # Dikarya failure, and recording it as outcome=failed would claim MAFFT
+    # failed when it had already produced a complete alignment.
+    started_at = time.monotonic()
+    outcome = "failed"
+    elapsed_seconds = None
+    reversed_headers = None
+
+    try:
+        if job_id:
+            # Use streaming runner: stdout → file, stderr → Redis + log
+            exit_code, stats = run_command_streaming(
+                cmd,
+                stdout_path=output_fasta,  # MAFFT writes alignment to stdout
+                stderr_path=log_file,
+                on_stderr_line=_make_log_callback(job_id, "align", "stderr"),
+                stderr_file_filter=_keep_mafft_log_line,
+                **configured_tool_limits(config, "MAFFT", threads),
+            )
+            mafft_finished_at = time.monotonic()
+
+            if exit_code != 0:
+                raise ToolExecutionError(
+                    "MAFFT", exit_code, stats, tool_failure_message(
+                        "MAFFT", exit_code, configured_tool_time_limit_hours(config, "MAFFT")))
+
+            # MAFFT itself has succeeded (the streaming runner has already
+            # written the alignment); settle the record here.
+            elapsed_seconds = mafft_finished_at - started_at
+            outcome = "success"
+        else:
+            # Fallback to non-streaming for backward compatibility. log_file is
+            # deliberately not passed to run_command: MAFFT's stdout *is* the
+            # alignment, and run_command's generic handler would write the entire
+            # aligned FASTA into alignment.log a second time (92 existing logs were
+            # inflated this way, some over 1 MB).
+            returncode, stdout, stderr = run_command(
+                cmd, timeout=configured_tool_timeout_seconds(config, "MAFFT")
+            )
+            mafft_finished_at = time.monotonic()
+
+            # Logged before the exit-code check so a failing run still records
+            # its command and exit code.
+            _append_filtered_log(log_file, cmd, stderr, returncode)
+
+            if returncode != 0:
+                raise RuntimeError(tool_failure_message(
+                    "MAFFT", returncode, configured_tool_time_limit_hours(config, "MAFFT")))
+
+            # MAFFT itself has succeeded; settle the record before writing the
+            # alignment, so a failing write is not reported as a MAFFT failure.
+            elapsed_seconds = mafft_finished_at - started_at
+            outcome = "success"
+
+            with open(output_fasta, "w") as f:
+                f.write(stdout)
+
+        reversed_headers = _restore_mafft_direction_headers(
+            input_fasta, output_fasta, logger
         )
-        
-        if exit_code != 0:
-            raise ToolExecutionError(
-                "MAFFT", exit_code, stats, tool_failure_message(
-                    "MAFFT", exit_code, configured_tool_time_limit_hours(config, "MAFFT")))
-    else:
-        # Fallback to non-streaming for backward compatibility. log_file is
-        # deliberately not passed to run_command: MAFFT's stdout *is* the
-        # alignment, and run_command's generic handler would write the entire
-        # aligned FASTA into alignment.log a second time (92 existing logs were
-        # inflated this way, some over 1 MB).
-        returncode, stdout, stderr = run_command(
-            cmd, timeout=configured_tool_timeout_seconds(config, "MAFFT")
+    finally:
+        if elapsed_seconds is None:
+            # MAFFT itself failed; time-to-failure is the measurement.
+            elapsed_seconds = time.monotonic() - started_at
+        # job/request context is appended by ContextFormatter; only counts, the
+        # mode and the outcome are recorded here, never a header or a base. A
+        # count of "unknown" is deliberate where the markers could not be read:
+        # 0 would read as "MAFFT reversed nothing".
+        logger.info(
+            "event=alignment.mafft_completed direction_mode=%s direction_flag=%s "
+            "fix_orientation=%s outcome=%s elapsed_seconds=%.3f elapsed_ms=%d "
+            "aligner_reversed_count=%s",
+            direction_mode, direction_flag or "none",
+            "true" if fix_orientation else "false", outcome,
+            elapsed_seconds, int(elapsed_seconds * 1000),
+            "unknown" if reversed_headers is None else len(reversed_headers),
         )
 
-        _append_filtered_log(log_file, cmd, stderr, returncode)
-
-        if returncode != 0:
-            raise RuntimeError(tool_failure_message(
-                "MAFFT", returncode, configured_tool_time_limit_hours(config, "MAFFT")))
-
-        with open(output_fasta, "w") as f:
-            f.write(stdout)
-
-    reversed_headers = _restore_mafft_direction_headers(input_fasta, output_fasta, logger)
     if reversed_headers and fix_orientation:
         reversed_headers = _apply_direction_veto_and_realign(
             input_fasta, output_fasta, params, config, logger, job_id,
             reversed_headers, orient_uncertain,
+            orient_uncertain_headers=orient_uncertain_headers,
+            orient_unclassified_headers=orient_unclassified_headers,
         )
 
     reversed_count = len(reversed_headers)
@@ -762,26 +895,85 @@ def _run_mafft(
         # sequences in the opposite orientation to input/input_raw.fasta, which
         # is what recompute re-derives from.
         #
-        # Log ORIENT's uncertain tally next to the flip count, because the two
-        # numbers are what distinguish the benign case from the real one.
+        # Classify each flip against ORIENT's own verdict for that same record.
         # ORIENT knows only the three ITS motifs, so a non-ITS marker lands
         # entirely in "uncertain" and MAFFT is simply finishing a call ORIENT
-        # declined to make -- every occurrence in the first week had
-        # flipped <= uncertain (one LSU job was 78/78 uncertain). A flip with
-        # uncertain=0 is the different, worrying case: there the two methods
-        # genuinely disagree about a sequence ORIENT was confident in.
+        # declined to make (one LSU job was 78/78 uncertain). The worrying case
+        # is a flip of a record ORIENT was confident about: there the two
+        # methods genuinely disagree.
+        #
+        # This used to compare the flip count against the uncertain count,
+        # which only approximates the question -- 1 flip against 2 uncertain
+        # reads as benign whether or not the flipped record was one of the two.
+        # Matching headers answers it outright. Records added to the job after
+        # the pipeline ran are a third case: ORIENT never saw them, so a flip
+        # there contradicts nothing.
         from app.services.log_context import log_degradation
 
-        context = {"count": reversed_count}
-        if orient_uncertain is not None:
+        # Field names are deliberately explicit counts. Nothing here carries a
+        # header or a base: the disagreement is *computed* from header identity
+        # and only its size is published, because these lines go to errors.log
+        # and the daily digest, which are read far outside the job.
+        context = {
+            "count": reversed_count,
+            "aligner_reversed_count": reversed_count,
+            "direction_mode": direction_mode,
+        }
+        if orient_uncertain_headers is not None:
+            unclassified = orient_unclassified_headers or set()
+            declined = sum(1 for h in reversed_headers if h in orient_uncertain_headers)
+            unseen = sum(
+                1 for h in reversed_headers
+                if h not in orient_uncertain_headers and h in unclassified
+            )
+            # MAFFT-flipped sequences MINUS the ones ORIENT declined to call
+            # (and minus the ones it never saw) -- set subtraction on headers,
+            # not arithmetic on two independent totals.
+            contested = reversed_count - declined - unseen
+            context["orient_uncertain"] = len(orient_uncertain_headers)
+            context["orient_uncertain_count"] = len(orient_uncertain_headers)
+            context["flips_orient_declined"] = declined
+            context["flips_orient_never_saw"] = unseen
+            context["flips_orient_was_confident"] = contested
+            context["aligner_orientation_disagreement_count"] = contested
+            context["disagreement"] = contested > 0
+            context["basis"] = "headers"
+        elif orient_uncertain is not None:
+            # Fallback for a job whose ORIENT headers were not persisted (they
+            # are truncated above MAX_PERSISTED_ORIENT_HEADERS). This compares
+            # two totals, which does NOT answer the question -- one flip against
+            # two uncertain records reads the same whether or not the flipped
+            # record was one of the two -- so it is reported as an unknown
+            # rather than as an answer, and stays a degradation below.
             context["orient_uncertain"] = orient_uncertain
-            context["disagreement"] = reversed_count > orient_uncertain
+            context["orient_uncertain_count"] = orient_uncertain
+            context["aligner_orientation_disagreement_count"] = None
+            context["disagreement"] = None
+            context["basis"] = "counts"
 
-        log_degradation(
-            logger, "aligner_reversed_sequences",
-            "MAFFT reverse-complemented sequences the orientation step had left forward",
-            **context,
-        )
+        # Only a genuine contradiction is a degradation. When every flip landed
+        # on a record ORIENT explicitly declined to call (or never saw), the two
+        # stages agree and MAFFT simply finished the job -- reporting that as
+        # DEGRADED made `grep DEGRADED errors.log` mostly false positives on
+        # non-ITS markers, where ORIENT is uncertain about everything by
+        # construction. The count-based fallback stays a degradation because it
+        # cannot tell which records were flipped.
+        if context.get("basis") == "headers" and not context["disagreement"]:
+            extras = " ".join(
+                f"{key}={str(value)[:200]!r}" for key, value in sorted(context.items())
+            )
+            logger.info(
+                "event=alignment.aligner_completed_orientation MAFFT reverse-"
+                "complemented %d sequence(s) the orientation step had not called; "
+                "no disagreement [%s]",
+                reversed_count, extras,
+            )
+        else:
+            log_degradation(
+                logger, "aligner_reversed_sequences",
+                "MAFFT reverse-complemented sequences the orientation step had left forward",
+                **context,
+            )
     return reversed_count
 
 
