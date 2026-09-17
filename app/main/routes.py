@@ -908,6 +908,7 @@ def job_viewer(job_id):
     # rather than offering a button that can only ever answer 503.
     from app.services.tree_analysis_service import (
         is_configured as claude_review_enabled,
+        resolve_tree_generation_context,
         resolve_tree_support_context,
     )
 
@@ -922,11 +923,17 @@ def job_viewer(job_id):
             "tree_method": job_details.get("tree_method", "") or "",
             "alrt_only": False,
         }
+    try:
+        generation_details = resolve_tree_generation_context(job_dir, job_details)
+    except Exception:
+        logger.exception("Could not resolve generation details for job %s", job_id)
+        generation_details = {}
 
     return render_template(
         'job_viewer.html', job_id=job_id, job_details=job_details, view_only=view_only,
         claude_review_enabled=claude_review_enabled(),
         tree_support_context=tree_support_context,
+        generation_details=generation_details,
     )
 
 # /health moved to the monitoring blueprint (app/monitoring/routes.py) where

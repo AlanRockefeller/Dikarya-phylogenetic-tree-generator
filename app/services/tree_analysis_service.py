@@ -45,7 +45,7 @@ logger = logging.getLogger(__name__)
 
 # Bump when the prompt or the metric set changes in a way that would make a
 # stored review misleading. Cached reviews with a different version are ignored.
-REVIEW_SCHEMA_VERSION = 7
+REVIEW_SCHEMA_VERSION = 11
 
 CACHE_RELATIVE_PATH = Path("analysis") / "claude_review.json"
 
@@ -883,6 +883,12 @@ _METHOD_SUPPORT_TYPE = {
     # IQ-TREE's single-support form is the ultrafast bootstrap, which is not the
     # classical bootstrap and does not share its 70/95 reading.
     "iqtree": "UFBOOT",
+    # The limited IQ-TREE Quick Tree preset deliberately runs SH-aLRT without
+    # ultrafast bootstrap, so its node labels are always single SH-aLRT
+    # percentages. Declared here rather than left to the
+    # `alrt_only` flag, which exists for a full IQ-TREE run that happened to be
+    # configured without UFBoot.
+    "iqtree_fast": "ALRT",
     "mrbayes": "PP",
 }
 
@@ -894,11 +900,20 @@ _METHOD_ALIASES = {
     "iq-tree": "iqtree",
     "iqtree2": "iqtree",
     "iq-tree2": "iqtree",
+    "iqtree3": "iqtree",
+    "iq-tree3": "iqtree",
     "mr_bayes": "mrbayes",
     "mrbayes3": "mrbayes",
     "fasttree2": "fasttree",
     "neighbor-joining": "nj",
     "neighbour-joining": "nj",
+    # Spellings of the fast method that reach this from user-facing labels.
+    # Whitespace is already removed before the lookup, so "IQ-TREE fast"
+    # arrives as "iq-treefast".
+    "iqtreefast": "iqtree_fast",
+    "iq-treefast": "iqtree_fast",
+    "iq-tree_fast": "iqtree_fast",
+    "iqtree3fast": "iqtree_fast",
 }
 
 
@@ -1925,10 +1940,14 @@ def _iqtree_alrt_only(tree_metadata: Dict[str, Any], job_details: Dict[str, Any]
     -alrt alone the node labels are single SH-aLRT percentages, and reading
     those as bootstrap gives the reader both the wrong test and the wrong
     threshold.
+
+    Always true of the Quick Tree preset, which does not run ultrafast bootstrap.
     """
     method = _normalize_tree_method(
         tree_metadata.get("method") or job_details.get("tree_method")
     )
+    if method == "iqtree_fast":
+        return True
     if method != "iqtree":
         return False
     alrt = _first_positive_int(
@@ -1961,6 +1980,228 @@ def resolve_tree_support_context(job_dir: Path) -> Dict[str, Any]:
         "tree_method": method,
         "normalized_tree_method": _normalize_tree_method(method),
         "alrt_only": _iqtree_alrt_only(tree_metadata, job_details),
+    }
+
+
+_TREE_METHOD_LABELS = {
+    "fasttree": "FastTree 2.2.0",
+    "iqtree": "IQ-TREE",
+    "iqtree_fast": "IQ-TREE 3 limited search",
+    "mrbayes": "MrBayes",
+    "nj": "Neighbor joining",
+    "raxml": "RAxML-NG",
+}
+
+_TRIMMING_METHOD_LABELS = {
+    "none": "None",
+    "trimal_gappy": "trimAl gap filter (>90% gaps removed)",
+    "trimal": "trimAl automated1",
+    "bmge": "BMGE",
+}
+
+
+def _alignment_shape(path: Path) -> Dict[str, Optional[int]]:
+    """Count records and columns in the delivered (possibly gzipped) FASTA."""
+    if not artifact_exists(path):
+        return {"sequences": None, "columns": None}
+    records = 0
+    first_columns = None
+    try:
+        with open_artifact(path, "rt") as handle:
+            sequence_length = 0
+            in_record = False
+            for raw_line in handle:
+                line = raw_line.strip()
+                if not line:
+                    continue
+                if line.startswith(">"):
+                    if in_record and first_columns is None:
+                        first_columns = sequence_length
+                    records += 1
+                    in_record = True
+                    sequence_length = 0
+                elif in_record and first_columns is None:
+                    sequence_length += len(line)
+            if in_record and first_columns is None:
+                first_columns = sequence_length
+    except OSError:
+        return {"sequences": None, "columns": None}
+    return {"sequences": records, "columns": first_columns}
+
+
+def resolve_tree_generation_context(
+    job_dir: Path, job_details: Optional[Dict[str, Any]] = None
+) -> Dict[str, Any]:
+    """Facts for the viewer's Generation Details panel.
+
+    Submitted settings are useful provenance, but they are not evidence that a
+    tool applied them. This resolves the metadata and artifacts for the tree on
+    screen, including old RAxML-NG runs whose exact AutoMRE count can be
+    recovered from their result files.
+    """
+    job_details = job_details or _load_json(job_dir / "input_info.json")
+    tree_dir = job_dir / "tree"
+    recomputed = artifact_exists(tree_dir / "tree_pruned_metadata.json")
+    metadata = _tree_metadata(job_dir, recomputed)
+    raw_method = metadata.get("method") or job_details.get("tree_method") or ""
+    method = _normalize_tree_method(raw_method)
+
+    requested_model = metadata.get("model") or job_details.get("tree_model")
+    fitted_model = metadata.get("model_selected") or requested_model
+    model_label = "Substitution model"
+    model_value = fitted_model
+    model_note = None
+    if method == "nj":
+        model_label = "Distance model"
+        model_value = metadata.get("distance_model") or "Not recorded for this legacy job"
+        requested_model = None
+    elif method == "fasttree":
+        model_label = "Likelihood model"
+        model_value = "GTR+CAT search; Gamma20 branch-length rescaling"
+        requested_model = None
+    elif fitted_model and requested_model and str(fitted_model) != str(requested_model):
+        selector = metadata.get("model_selector")
+        suffix = f" via {selector}" if selector else ""
+        model_note = f"Requested {requested_model}{suffix}; the fitted model is shown above."
+
+    support_label = None
+    support_value = None
+    support_note = None
+    support_type = str(metadata.get("support_type") or "").lower()
+    if method == "fasttree":
+        support_label = "Node support"
+        support_value = "SH-like local support (1,000 resamples; 0–1 scale)"
+        support_note = "These values are not bootstrap proportions or posterior probabilities."
+    elif method == "iqtree_fast":
+        reps = metadata.get("alrt_replicates") or 1000
+        support_label = "Node support"
+        support_value = f"SH-aLRT ({int(reps):,} replicates; 0–100 scale)"
+        support_note = "The Quick Tree preset runs SH-aLRT without ultrafast bootstrap; no bootstrap was performed."
+    elif method == "iqtree":
+        alrt = _first_positive_int(metadata.get("alrt_replicates"), job_details.get("alrt_replicates"))
+        ufboot = _first_positive_int(metadata.get("bootstrap"), job_details.get("bootstrap"))
+        support_label = "Node support"
+        if support_type == "alrt_ufboot" or (alrt and ufboot):
+            support_value = f"SH-aLRT ({alrt:,}) / UFBoot ({ufboot:,}); shown as aLRT/UFBoot"
+        elif support_type == "alrt" or (alrt and not ufboot):
+            support_value = f"SH-aLRT ({alrt:,} replicates; 0–100 scale)"
+        elif support_type == "ufboot" or ufboot:
+            support_value = f"UFBoot ({ufboot:,} replicates; 0–100 scale)"
+    elif method == "raxml" and support_type == "bootstrap":
+        applied = metadata.get("parameters_applied") or {}
+        cap = applied.get("bootstrap_cap")
+        if not cap:
+            match = re.search(r"autoMRE\{(\d+)\}", str(metadata.get("bootstrap_spec") or ""), re.I)
+            cap = int(match.group(1)) if match else None
+        from app.services.raxml_results import read_raxml_bootstrap_summary
+
+        completed = metadata.get("bootstrap_replicates_completed")
+        converged = bool(metadata.get("bootstrap_converged"))
+        if completed is None or "bootstrap_converged" not in metadata:
+            outcome = read_raxml_bootstrap_summary(tree_dir, cap=cap)
+            completed = completed or outcome.get("bootstrap_replicates_completed")
+            converged = bool(converged or outcome.get("bootstrap_converged"))
+        support_label = "Bootstrap analysis"
+        if completed:
+            support_value = f"{int(completed):,} replicates completed"
+        else:
+            support_value = f"Adaptive AutoMRE (cap {int(cap):,})" if cap else "Adaptive AutoMRE"
+        if converged:
+            support_note = (
+                f"AutoMRE convergence was reached"
+                f" before the {int(cap):,}-replicate cap" if cap and completed and int(completed) < int(cap)
+                else "AutoMRE convergence was reached."
+            )
+            if not support_note.endswith("."):
+                support_note += "."
+            support_note += " RAxML-NG stopped because branch-support estimates had stabilized under its convergence criterion, not because work was skipped."
+        elif cap and completed and int(completed) >= int(cap):
+            support_note = "The configured cap was reached before RAxML-NG declared AutoMRE convergence."
+        metrics = metadata.get("bootstrap_metrics") or []
+        if "tbe" in metrics:
+            metric_note = "The displayed tree carries Felsenstein bootstrap support; a companion TBE tree was also generated."
+            support_note = f"{support_note} {metric_note}" if support_note else metric_note
+    elif method == "mrbayes":
+        support_label = "Node support"
+        support_value = "Posterior probabilities (0–1 scale)"
+
+    trimming_details = (
+        metadata.get("trimming_details")
+        or job_details.get("trimming_details")
+        or {}
+    )
+    terminal = trimming_details.get("terminal_overhang_trim") or {}
+    alignment_dir = job_dir / "alignment"
+    if recomputed and artifact_exists(alignment_dir / "alignment_pruned_trimmed.fasta"):
+        raw_path = alignment_dir / "alignment_pruned_aligned.fasta"
+        final_path = alignment_dir / "alignment_pruned_trimmed.fasta"
+    else:
+        raw_path = alignment_dir / "alignment_raw.fasta"
+        final_path = alignment_dir / "alignment_trimmed.fasta"
+    raw_shape = _alignment_shape(raw_path)
+    final_shape = _alignment_shape(final_path)
+
+    trim_method = str(trimming_details.get("method") or job_details.get("trimming_method") or "none").lower()
+    advanced_options = dict(job_details.get("alignment_options") or {})
+    advanced_options.pop("tree_method", None)
+    mycomap_records = (
+        ((job_details.get("import_filter_details") or {}).get("mycomap") or {}).get(
+            "filtered_records"
+        )
+        or []
+    )
+
+    run_details = []
+    if metadata.get("search") == "five_iterations":
+        run_details.append("Limited IQ-TREE search (fixed at five iterations)")
+    elif metadata.get("search") == "fast":
+        run_details.append("Limited IQ-TREE --fast search (NNI search over two initial trees)")
+    if metadata.get("seed") is not None:
+        run_details.append(f"Random seed: {metadata.get('seed')}")
+    if method == "mrbayes":
+        completed = metadata.get("mcmc_generations_completed")
+        maximum = metadata.get("mcmc_max_generations") or metadata.get("mcmc_generations")
+        if completed:
+            run_details.append(f"MCMC generations completed: {int(completed):,}")
+        if maximum:
+            run_details.append(f"Maximum MCMC generations: {int(maximum):,}")
+        if metadata.get("converged"):
+            run_details.append("Convergence criterion reached")
+
+    tree_method_label = _TREE_METHOD_LABELS.get(method, str(raw_method).upper())
+    if method == "iqtree_fast":
+        tree_method_label = (
+            "IQ-TREE 3 fast mode"
+            if metadata.get("search") == "fast"
+            else "IQ-TREE 3 five-iteration search"
+        )
+
+    return {
+        "tree_method": method,
+        "tree_method_label": tree_method_label,
+        "alignment_method_label": str(job_details.get("alignment_method") or "Unknown").upper(),
+        "trimming_method_label": _TRIMMING_METHOD_LABELS.get(trim_method, trim_method.replace("_", " ").title()),
+        "terminal_trim": terminal,
+        "raw_shape": raw_shape,
+        "final_shape": final_shape,
+        "model_label": model_label,
+        "model_value": model_value,
+        "model_note": model_note,
+        "support_label": support_label,
+        "support_value": support_value,
+        "support_note": support_note,
+        "advanced_alignment_options": advanced_options,
+        "show_import_identity": any(
+            isinstance(row, dict) and row.get("reported_identity") is not None
+            for row in mycomap_records
+        ),
+        "show_import_query_similarity": any(
+            isinstance(row, dict) and row.get("query_similarity") is not None
+            for row in mycomap_records
+        ),
+        "run_details": run_details,
+        "requested_model": requested_model,
+        "metadata": metadata,
     }
 
 
@@ -2447,6 +2688,32 @@ def build_context(
             if name in renames:
                 displayed_names_out.add(str(renames[name]))
 
+    raxml_bootstrap = {
+        "bootstrap_replicates_completed": tree_metadata.get(
+            "bootstrap_replicates_completed"
+        ),
+        "bootstrap_converged": bool(tree_metadata.get("bootstrap_converged")),
+    }
+    if _normalize_tree_method(tree_method) == "raxml":
+        from app.services.raxml_results import read_raxml_bootstrap_summary
+
+        applied = tree_metadata.get("parameters_applied") or {}
+        if (
+            raxml_bootstrap["bootstrap_replicates_completed"] is None
+            or "bootstrap_converged" not in tree_metadata
+        ):
+            recovered = read_raxml_bootstrap_summary(
+                job_dir / "tree", cap=applied.get("bootstrap_cap")
+            )
+            raxml_bootstrap["bootstrap_replicates_completed"] = (
+                raxml_bootstrap["bootstrap_replicates_completed"]
+                or recovered.get("bootstrap_replicates_completed")
+            )
+            raxml_bootstrap["bootstrap_converged"] = bool(
+                raxml_bootstrap["bootstrap_converged"]
+                or recovered.get("bootstrap_converged")
+            )
+
     pipeline = {
         "aligner": job_details.get("aligner") or job_details.get("alignment_method"),
         "trimming_method": trimming_method,
@@ -2456,14 +2723,46 @@ def build_context(
         ),
         "tree_method": tree_metadata.get("method") or job_details.get("tree_method"),
         "tree_method_normalized": _normalize_tree_method(tree_method),
-        "substitution_model": tree_metadata.get("model") or job_details.get("tree_model"),
+        # The model that was actually FIT, not the one that was requested.
+        # ModelFinder's "MFP" is not a model name, and the builder expands even
+        # a fixed request (GTR+G runs as GTR+F+G4), so citing the request named
+        # a model the tree had not been built under.
+        "substitution_model": (
+            tree_metadata.get("model_selected")
+            or tree_metadata.get("model")
+            or job_details.get("tree_model")
+        ),
+        # Only present when the two differ, so an ordinary job carries no
+        # redundant field and the reviewer has nothing to reconcile.
+        "substitution_model_requested": _requested_model_if_different(
+            tree_metadata, job_details
+        ),
+        "substitution_model_selector": tree_metadata.get("model_selector"),
+        # "fast" marks a deliberately limited search; the note says what that
+        # does and does not mean for reading the tree.
+        "tree_search": tree_metadata.get("search"),
+        "tree_search_note": _tree_search_note(tree_metadata.get("search")),
         # FastTree ignores the replicate count entirely and emits SH-like local
         # support instead. Passing the requested number through unqualified told
-        # the reviewer 1000 bootstraps had run when none had.
+        # the reviewer 1000 bootstraps had run when none had. RAxML-NG's
+        # adaptive autoMRE cap is the same trap -- see _effective_bootstrap.
         "bootstrap_replicates": _effective_bootstrap(
             tree_metadata.get("method") or job_details.get("tree_method"),
             tree_metadata.get("bootstrap") or job_details.get("bootstrap"),
+            bootstrap_spec=tree_metadata.get("bootstrap_spec"),
+            support_type=tree_metadata.get("support_type"),
+            has_metadata=bool(tree_metadata),
+            completed=raxml_bootstrap["bootstrap_replicates_completed"],
+            converged=raxml_bootstrap["bootstrap_converged"],
         ),
+        # Every branch-support metric the builder computed. Only the first is on
+        # the tree in this context; RAxML-NG also writes a transfer-bootstrap
+        # tree, whose values are deliberately NOT sent.
+        "bootstrap_metrics": tree_metadata.get("bootstrap_metrics") or None,
+        # IQ-TREE --bnni: UFBoot trees refined by NNI on the bootstrap
+        # alignment, which reduces UFBoot's overestimation. None rather than
+        # False where it does not apply, so it reads as "not a UFBoot run".
+        "ufboot_nni_refined": True if tree_metadata.get("bnni") else None,
         "alrt_replicates": (
             tree_metadata.get("alrt_replicates") or job_details.get("alrt_replicates")
         ),
@@ -2513,7 +2812,67 @@ def _alignment_scope_note(
     )
 
 
-def _effective_bootstrap(tree_method: Any, requested: Any) -> Any:
+# What a non-default tree search means for reading the result. Written to be
+# self-contained: it is published in the context itself, so it still steers the
+# review correctly if the installed copy of SYSTEM_PROMPT is older than this
+# field.
+TREE_SEARCH_NOTES = {
+    "five_iterations": (
+        "IQ-TREE ran its standard tree search with -n 5, stopping after five "
+        "iterations rather than searching to its normal stopping condition. "
+        "This is what the Quick Tree preset uses. The likelihood MODEL is not "
+        "approximated, only the SEARCH is limited, so do not describe the model "
+        "or the branch lengths as approximate. A weakly resolved or unstable "
+        "backbone here is partly a property of how long the search ran and not "
+        "only of the data, and re-running the full IQ-TREE search is therefore "
+        "a real remedy worth naming. Branch support was computed on the tree "
+        "this search produced."
+    ),
+    # Kept for reviews of jobs produced by the former --fast Quick Tree preset.
+    "fast": (
+        "IQ-TREE ran with --fast, a deliberately limited tree search: NNI over "
+        "two starting trees rather than the full search. This is what the Quick "
+        "Tree preset uses. The likelihood MODEL is not approximated, only the "
+        "SEARCH is, so do not describe the model or the branch lengths as "
+        "approximate. A weakly resolved or unstable backbone here is partly a "
+        "property of how hard the search looked and not only of the data, and "
+        "re-running the full IQ-TREE search is therefore a real remedy worth "
+        "naming. Branch support was computed on the tree this search produced."
+    ),
+}
+
+
+def _tree_search_note(search: Any) -> Optional[str]:
+    """Plain-language meaning of a non-default tree search, or None."""
+    return TREE_SEARCH_NOTES.get(str(search or "").strip().lower())
+
+
+def _requested_model_if_different(
+    tree_metadata: Dict[str, Any], job_details: Dict[str, Any]
+) -> Optional[str]:
+    """The submitted model string, but only when it is not what was fit.
+
+    Published beside the fitted model rather than instead of it: "MFP" names no
+    model at all, and even a fixed request is expanded by the builder (a GTR+G
+    request runs as GTR+F+G4), so the request alone described a tree that was
+    never built.
+    """
+    fitted = tree_metadata.get("model_selected")
+    requested = tree_metadata.get("model") or job_details.get("tree_model")
+    if not fitted or not requested or str(fitted) == str(requested):
+        return None
+    return str(requested)
+
+
+def _effective_bootstrap(
+    tree_method: Any,
+    requested: Any,
+    bootstrap_spec: Any = None,
+    support_type: Any = None,
+    has_metadata: bool = False,
+    completed: Any = None,
+    converged: bool = False,
+) -> Any:
     """What the tree builder actually did with the requested replicate count.
 
     FastTree has no bootstrap mode; it reports SH-like local support regardless
@@ -2522,14 +2881,53 @@ def _effective_bootstrap(tree_method: Any, requested: Any) -> Any:
     reading the metrics, so it is replaced by an explicit statement of what
     actually happened.
 
+    RAxML-NG is the same problem in a subtler form, and used to slip through.
+    It is always run with ``--bs-trees autoMRE{cap}``: an adaptive count that
+    stops once the replicates converge, so the submitted number is never the
+    number that ran. ``tree_metadata`` records ``bootstrap: None`` for exactly
+    that reason -- and this function's ``metadata or job_details`` caller then
+    fell straight through to the submitted value, telling the reviewer that
+    1000 replicates had run when the run was capped at 500 and usually stopped
+    earlier. New metadata stores the completed count, and old jobs recover it
+    from the one-tree-per-line bootstrap output; the spec is only a fallback.
+
     The method goes through the same normalization as the support classifier, so
     a job recorded as "FastTree2" or "IQ-TREE 2" is recognised here as well.
     Matching on the raw string meant an aliased spelling silently fell through
     and reported FastTree's ignored replicate count as though it had run.
     """
     method = _normalize_tree_method(tree_method)
+    if method == "raxml":
+        completed_count = _first_positive_int(completed)
+        if completed_count:
+            outcome = f"{completed_count} replicates completed"
+            if converged:
+                outcome += (
+                    "; AutoMRE convergence was reached, meaning branch-support "
+                    "estimates had stabilized under RAxML-NG's stopping criterion"
+                )
+            return outcome
+        if bootstrap_spec:
+            return (
+                f"adaptive --bs-trees {bootstrap_spec}: RAxML-NG stopped once "
+                "the replicates converged and may have used fewer than that cap."
+            )
+        if has_metadata and not support_type:
+            # The builder recorded no support type, so no bootstrap ran.
+            return (
+                f"not run ({requested} requested; bootstrapping was not "
+                "performed for this RAxML-NG run)"
+            ) if requested else None
+        return (
+            "not recorded: RAxML-NG uses an adaptive --bs-trees autoMRE cap, "
+            "so the submitted count was not the number of replicates that ran"
+        )
     instead = {
         "fasttree": "FastTree reports SH-like local support instead",
+        "iqtree_fast": (
+            "the IQ-TREE Quick Tree preset reports SH-aLRT branch support "
+            "instead and does not run ultrafast bootstrap"
+        ),
         "mrbayes": "MrBayes reports Bayesian posterior probabilities from MCMC",
         "nj": "neighbour-joining produces no node support",
     }.get(method)
@@ -2710,6 +3108,34 @@ values of 0, 1 or 0.95 are still bootstrap. In particular:
 Where a threshold is published (tree.strong_support_threshold, \
 tree.moderate_support_threshold), use it; a null moderate threshold means that \
 scale has no conventional middle band, so do not invent one.
+
+WHAT THE RUN ACTUALLY DID
+
+Several pipeline fields are deliberately not bare numbers, because the builder \
+did not always do what was asked of it:
+
+- pipeline.substitution_model is the model that was FIT, and is the one to \
+  cite. Where pipeline.substitution_model_requested appears, the request and \
+  the fitted model differ and pipeline.substitution_model_selector names what \
+  chose it. The request is the setting; the fitted model is what the tree was \
+  built under, so never present the request as the model of the tree.
+- a non-null pipeline.tree_search means a deliberately limited tree search, \
+  and pipeline.tree_search_note explains exactly what that does and does not \
+  affect. Read that note before attributing weak resolution to the data alone. \
+  Do not call the likelihood model or the branch lengths approximate on the \
+  strength of it; only the search was limited.
+- pipeline.bootstrap_replicates is a sentence rather than a number whenever the \
+  builder did not run the count that was requested. Quote what it says and \
+  never convert it back into a replicate count, and never describe a count as \
+  having run when that field says it did not.
+- pipeline.bootstrap_metrics lists every branch-support metric the builder \
+  computed. Only the first is on the tree you were given. No values from any \
+  other metric are in this context, so name them at most as also available and \
+  report no numbers from them.
+- pipeline.ufboot_nni_refined true means the ultrafast bootstrap trees were \
+  refined by NNI, which reduces the overestimation described above. The >=95 \
+  cutoff still applies; treat it as one less reason to doubt the values, not \
+  as grounds for lowering the threshold.
 
 Every list of named sequences is truncated. Where a total is given - \
 tree.outlier_tip_count, alignment.identical_sequence_group_count, \

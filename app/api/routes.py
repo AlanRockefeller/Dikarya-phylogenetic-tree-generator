@@ -154,7 +154,7 @@ MAX_CUSTOM_GENBANK_ACCESSIONS = 200
 MAX_CUSTOM_GENBANK_SEQUENCE_BP = 5000
 MAX_SEQUENCE_METADATA_ITEMS = 5000
 
-VALID_TREE_METHODS = {"nj", "raxml", "iqtree", "mrbayes", "fasttree"}
+VALID_TREE_METHODS = {"nj", "raxml", "iqtree", "iqtree_fast", "mrbayes", "fasttree"}
 
 # Settings the tree viewer's Advanced panel may change on a recompute. Anything
 # outside this set (sequences, import provenance, trimming report, job
@@ -721,8 +721,8 @@ def _mycomap_local_fasta_group_conflict_detail(seq, conflict_sequences, query_to
 
 def _append_import_filter_detail(details, *, name, source, reason, reason_label,
                                  hit_source="", reported_identity=None,
-                                 query_similarity=None):
-    """Append a bounded, sequence-free import filter detail row."""
+                                 query_similarity=None, record=None):
+    """Append one bounded import-filter row, retaining restorable DNA when available."""
     if len(details) >= MAX_IMPORT_FILTER_DETAIL_RECORDS:
         return
     row = {
@@ -736,6 +736,16 @@ def _append_import_filter_detail(details, *, name, source, reason, reason_label,
         row["reported_identity"] = reported_identity
     if query_similarity is not None:
         row["query_similarity"] = query_similarity
+    if isinstance(record, dict):
+        sequence = "".join(str(record.get("sequence") or "").split())[:50_000]
+        if sequence:
+            row["sequence"] = sequence
+            metadata = dict(record)
+            metadata["name"] = row["name"]
+            metadata["fasta_header"] = row["name"]
+            normalized_metadata = _normalize_sequence_metadata([metadata])
+            if normalized_metadata:
+                row["metadata"] = normalized_metadata[0]
     details.append(row)
 
 
@@ -878,6 +888,7 @@ def _dedupe_mycomap_observation_records(sequences, filtered_records):
                     f'{observation_id}; {difference_count} non-ambiguous base '
                     f'difference{"s" if difference_count != 1 else ""}'
                 ),
+                record=record,
             )
 
     return [seq for index, seq in enumerate(sequences) if index in keep_indexes], dropped_count
@@ -901,6 +912,7 @@ def _normalize_import_filter_details(raw):
         for item in (mycomap.get("filtered_records") or [])[:MAX_IMPORT_FILTER_DETAIL_RECORDS]:
             if not isinstance(item, dict):
                 continue
+            normalized_metadata = _normalize_sequence_metadata([item.get("metadata")])
             records.append({
                 "name": str(item.get("name") or "")[:500],
                 "source": str(item.get("source") or "")[:50],
@@ -909,6 +921,8 @@ def _normalize_import_filter_details(raw):
                 "reason_label": str(item.get("reason_label") or "")[:200],
                 "reported_identity": _optional_float(item.get("reported_identity")),
                 "query_similarity": _optional_float(item.get("query_similarity")),
+                "sequence": "".join(str(item.get("sequence") or "").split())[:50_000],
+                "metadata": normalized_metadata[0] if normalized_metadata else {},
             })
         counts = mycomap.get("counts") if isinstance(mycomap.get("counts"), dict) else {}
         normalized["mycomap"] = {
@@ -1055,6 +1069,81 @@ def _restore_merged_labels(sequence_text, merged_labels):
                 line = f">{original}"
         lines.append(line)
     return "\n".join(lines)
+
+
+def _append_restored_records(job_params, restored_records):
+    """Append recorded filtered rows to a FASTA payload with unique internal IDs."""
+    sequence_text = str(job_params.get("sequence") or "").rstrip("\n")
+    blocks = [sequence_text] if sequence_text else []
+    sequence_metadata = list(job_params.get("sequence_metadata") or [])
+    existing_records = _parse_fasta_sequences(sequence_text)
+    used_ids = {
+        str(record.get("name") or "").strip().split(None, 1)[0]
+        for record in existing_records
+        if str(record.get("name") or "").strip()
+    }
+
+    for record in restored_records:
+        sequence = "".join(str(record.get("sequence") or "").split())
+        wrapped = "\n".join(sequence[index:index + 80] for index in range(0, len(sequence), 80))
+        original_header = str(record.get("name") or "").strip()
+        parts = original_header.split(None, 1) if original_header else ["seq"]
+        base_id = parts[0] or "seq"
+        description = parts[1] if len(parts) > 1 else ""
+        internal_id = base_id
+        suffix = 2
+        while internal_id in used_ids:
+            internal_id = f"{base_id}_{suffix}"
+            suffix += 1
+        used_ids.add(internal_id)
+        internal_header = f"{internal_id} {description}".rstrip()
+        blocks.append(f">{internal_header}\n{wrapped}")
+
+        metadata = dict(record.get("metadata") or {})
+        metadata.setdefault("display_label", metadata.get("name") or original_header)
+        metadata.setdefault("raw_fasta_header", original_header)
+        metadata["name"] = internal_header
+        metadata["fasta_header"] = internal_header
+        sequence_metadata.append(metadata)
+
+    combined_fasta = "\n".join(blocks) + "\n"
+    combined_records = _parse_fasta_sequences(combined_fasta)
+    from app.workers.tasks import uniquify_fasta_identifiers
+
+    unique_fasta, _unique_stats = uniquify_fasta_identifiers(combined_fasta)
+    unique_records = _parse_fasta_sequences(unique_fasta)
+    positional_metadata = (
+        len(sequence_metadata) == len(combined_records)
+        and all(
+            str(sequence_metadata[index].get("fasta_header")
+                or sequence_metadata[index].get("name") or "").strip()
+            == str(record.get("name") or "").strip()
+            for index, record in enumerate(combined_records)
+        )
+    )
+    metadata_by_header = {}
+    if not positional_metadata:
+        for item in sequence_metadata:
+            key = str(item.get("fasta_header") or item.get("name") or "").strip()
+            metadata_by_header.setdefault(key, []).append(item)
+
+    updated_metadata = []
+    for index, (before, after) in enumerate(zip(combined_records, unique_records)):
+        original_header = str(before.get("name") or "").strip()
+        internal_header = str(after.get("name") or "").strip()
+        if positional_metadata:
+            item = dict(sequence_metadata[index])
+        else:
+            candidates = metadata_by_header.get(original_header) or []
+            item = dict(candidates.pop(0)) if candidates else {}
+        item.setdefault("display_label", item.get("name") or original_header)
+        item.setdefault("raw_fasta_header", original_header)
+        item["name"] = internal_header
+        item["fasta_header"] = internal_header
+        updated_metadata.append(item)
+
+    job_params["sequence"] = unique_fasta
+    job_params["sequence_metadata"] = updated_metadata
 
 
 def _parse_fasta_sequences(text):
@@ -1876,6 +1965,17 @@ def gather_mycomap_sequences_for_queue(url, include_ncbi=True, include_local=Tru
             )
         if conflict_detail:
             conflicting_local_dropped_count += 1
+            restorable_record = dict(seq)
+            if metric:
+                restorable_record.update({
+                    'identity': metric.get('identity'),
+                    'query_cover': metric.get('query_cover'),
+                    'subject_cover': metric.get('subject_cover'),
+                    'blast_metrics_available': any(
+                        metric.get(field) is not None
+                        for field in ('identity', 'query_cover', 'subject_cover')
+                    ),
+                })
             _append_import_filter_detail(
                 filtered_records,
                 name=seq.get('name', ''),
@@ -1885,6 +1985,7 @@ def gather_mycomap_sequences_for_queue(url, include_ncbi=True, include_local=Tru
                 reason_label=conflict_detail.get('reason_label'),
                 reported_identity=conflict_detail.get('reported_identity'),
                 query_similarity=conflict_detail.get('query_similarity'),
+                record=restorable_record,
             )
             logger.warning(
                 "Dropped conflicting MycoMap localFasta record: blast_id=%s name=%r reported_identity=%s",
@@ -1895,6 +1996,17 @@ def gather_mycomap_sequences_for_queue(url, include_ncbi=True, include_local=Tru
             continue
         if is_contaminant_sequence(seq, metric):
             contaminant_dropped_count += 1
+            restorable_record = dict(seq)
+            if metric:
+                restorable_record.update({
+                    'identity': metric.get('identity'),
+                    'query_cover': metric.get('query_cover'),
+                    'subject_cover': metric.get('subject_cover'),
+                    'blast_metrics_available': any(
+                        metric.get(field) is not None
+                        for field in ('identity', 'query_cover', 'subject_cover')
+                    ),
+                })
             _append_import_filter_detail(
                 filtered_records,
                 name=seq.get('name', ''),
@@ -1903,6 +2015,7 @@ def gather_mycomap_sequences_for_queue(url, include_ncbi=True, include_local=Tru
                 reason='contaminant',
                 reason_label='Marked as contaminant by MycoMap label or BLAST table',
                 reported_identity=metric.get('identity') if metric else None,
+                record=restorable_record,
             )
             continue
         if metric:
@@ -2304,6 +2417,18 @@ def _mycomap_rerun_limit_from_request(data, result_type):
     return validate_mycomap_rerun_limit(value, result_type)
 
 
+def _log_inat_tree_rejection(workflow, raw, error):
+    """Log bounded user input for actionable Tree Builder usability failures."""
+    # repr-style logging escapes control characters, preventing a pasted value
+    # with a newline from creating a forged second log entry.
+    logger.warning(
+        "event=inat_tree.input_rejected workflow=%s reason=%s input=%r",
+        workflow,
+        getattr(error, "failure_code", None) or "inat_tree_rejected",
+        str(raw)[:300],
+    )
+
+
 @bp.route('/inaturalist/tree', methods=['POST'])
 @limiter.limit(_inat_tree_rate_limit, key_func=_inat_tree_rate_key)
 def inaturalist_tree():
@@ -2391,6 +2516,8 @@ def inaturalist_tree():
         )
         return jsonify(result), 202
     except InatTreeError as e:
+        note_request_failure(e.failure_code or "inat_tree_rejected")
+        _log_inat_tree_rejection("create", raw, e)
         error_payload = {"status": "error", "error": str(e)}
         if e.details:
             error_payload.update(e.details)
@@ -2413,6 +2540,8 @@ def inaturalist_tree_preview():
     try:
         return jsonify(preview_inaturalist_tree_input(raw, resolved_type=resolved_type))
     except InatTreeError as e:
+        note_request_failure(e.failure_code or "inat_tree_preview_rejected")
+        _log_inat_tree_rejection("preview", raw, e)
         return jsonify({"status": "error", "error": str(e)}), e.status
     except Exception as e:
         return _server_error(e, where="inaturalist_tree_preview")
@@ -2480,6 +2609,8 @@ def inaturalist_tree_batch():
         )
         return jsonify(result), 202
     except InatTreeError as e:
+        note_request_failure(e.failure_code or "inat_tree_batch_rejected")
+        _log_inat_tree_rejection("batch", raw, e)
         error_payload = {"status": "error", "error": str(e)}
         if e.details:
             error_payload.update(e.details)
@@ -2845,11 +2976,14 @@ def create_job():
         note_request_failure("invalid_iqtree_bootstrap")
         return jsonify({"status": "error", "error": str(exc)}), 400
     job_params["bootstrap"] = _clamp_int(requested_bootstrap, 1000, 0, 10_000)
-    if tree_method == "fasttree" and "bootstrap" not in data:
-        # FastTree ignores this entirely -- it runs a fixed -boot N SH-like
-        # local-support resampling (FASTTREE_SH_RESAMPLES), which is why
-        # tree_builder_service already records metadata["bootstrap"] = None for
-        # it. Storing the generic 1000 default in input_info.json only made the
+    if tree_method in ("fasttree", "iqtree_fast") and "bootstrap" not in data:
+        # Neither method runs a bootstrap. FastTree ignores it entirely -- it
+        # runs a fixed -boot N SH-like local-support resampling
+        # (FASTTREE_SH_RESAMPLES) -- and the IQ-TREE Quick Tree preset runs
+        # fixed SH-aLRT support without ultrafast bootstrap. That is why
+        # tree_builder_service already records
+        # metadata["bootstrap"] = None for both. Storing the generic 1000
+        # default in input_info.json only made the
         # job page claim a replicate count that never existed. The key is
         # dropped rather than set to None: several readers do
         # int(job_params.get("bootstrap", <default>)), which a stored None
@@ -3799,6 +3933,123 @@ def rebuild_with_duplicates(job_id):
         }), 202
     except Exception as e:
         return _server_error(e)
+
+
+@bp.route('/job/<job_id>/rebuild-with-import-filtered', methods=['POST'])
+@limiter.limit("6 per minute")
+def rebuild_with_import_filtered(job_id):
+    """Start a new job with restorable records excluded by MycoMap import filters."""
+    db_job, error_msg, status_code = check_job_access(job_id, mode="edit")
+    if error_msg:
+        return jsonify({"status": "error", "error": error_msg}), status_code
+
+    try:
+        import json as _json
+
+        input_info_path = Config.JOB_DIR / job_id / "input_info.json"
+        if not input_info_path.exists():
+            return jsonify({
+                "status": "error",
+                "error": "Original job inputs are no longer on disk",
+            }), 404
+        with open(input_info_path, "r") as handle:
+            source_params = _json.load(handle)
+
+        mycomap_filters = (
+            (source_params.get("import_filter_details") or {}).get("mycomap") or {}
+        )
+        filtered_records = mycomap_filters.get("filtered_records") or []
+        restored = [
+            record for record in filtered_records
+            if isinstance(record, dict) and str(record.get("sequence") or "").strip()
+        ]
+        if not restored:
+            return jsonify({
+                "status": "error",
+                "error": (
+                    "These import-filter records do not contain restorable sequence data. "
+                    "Older jobs recorded their names and reasons only."
+                ),
+            }), 400
+
+        job_params = dict(source_params)
+        _append_restored_records(job_params, restored)
+        job_params["skip_observation_dedup"] = True
+        job_params["preserve_exact_duplicate_records"] = True
+        import_details = dict(job_params.get("import_filter_details") or {})
+        import_details.pop("mycomap", None)
+        job_params["import_filter_details"] = import_details
+        job_params["input_type"] = "pasted_sequence"
+        job_params["blast_mode"] = "off"
+        job_params["accessions"] = []
+        job_params.pop("_inat_tree_preparation", None)
+        job_params.pop("_mo_tree_preparation", None)
+        job_params["notes"] = (
+            f"Rebuild of {job_id} including {len(restored)} sequence"
+            f"{'' if len(restored) == 1 else 's'} excluded by import filters"
+        )
+        job_params["rebuilt_from_job_id"] = job_id
+        job_params["import_filtered_rebuild"] = True
+
+        prepare_phylo_job_params(job_params)
+        new_job_id = generate_job_id()
+        new_record = Job(
+            id=new_job_id,
+            status="queued",
+            job_dir=str(Config.JOB_DIR / new_job_id),
+            input_type=job_params.get("input_type", "pasted_sequence"),
+            metrics={
+                "tree_method": job_params.get("tree_method"),
+                "notes": job_params.get("notes"),
+                "alignment_method": job_params.get("alignment_method"),
+                "trimming_method": job_params.get("trimming_method"),
+                "rebuilt_from_job_id": job_id,
+                "restored_import_filtered_count": len(restored),
+            },
+        )
+        if db_job is not None and db_job.user_id:
+            new_record.user_id = db_job.user_id
+        elif current_user.is_authenticated:
+            new_record.user_id = current_user.id
+        db.session.add(new_record)
+        db.session.commit()
+        try:
+            enqueue_job(job_params, job_id=new_job_id, prepare=False)
+        except Exception as exc:
+            logger.exception(
+                "event=web.import_filtered_rebuild_enqueue_failed job=%s",
+                new_job_id,
+            )
+            try:
+                new_record.status = "failed"
+                failed_metrics = dict(new_record.metrics or {})
+                failed_metrics.update({
+                    "error": (
+                        "This import-filtered rebuild could not be added to the "
+                        "processing queue and was never started. Please try again."
+                    ),
+                    "enqueue_error": type(exc).__name__,
+                    "failed_at": datetime.utcnow().isoformat(),
+                })
+                new_record.metrics = failed_metrics
+                db.session.commit()
+            except Exception:
+                db.session.rollback()
+                logger.exception(
+                    "event=web.import_filtered_rebuild_failure_unrecorded job=%s",
+                    new_job_id,
+                )
+            raise
+
+        return jsonify({
+            "status": "queued",
+            "job_id": new_job_id,
+            "restored_count": len(restored),
+            "view_url": f"/job/{new_job_id}/view",
+            "status_url": f"/job/{new_job_id}",
+        }), 202
+    except Exception as e:
+        return _server_error(e, where="rebuild_with_import_filtered")
 
 
 @bp.route('/job/<job_id>/params', methods=['GET'])

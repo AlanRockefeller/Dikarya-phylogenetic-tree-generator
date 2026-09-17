@@ -43,6 +43,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from app.services.security_events import (  # noqa: E402
     SCANNER_EXACT_PATHS, SCANNER_MARKERS, SCRIPT_EXT_RE, STATIC_SUFFIXES,
 )
+# Imported rather than restated so the threshold printed in the report is the
+# one the app actually escalates at.
+from app.services.security_actors import ESCALATION_THRESHOLD  # noqa: E402
 # UUID form used for RQ job ids in worker logs.
 UUID_PATTERN = r'[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}'
 
@@ -400,6 +403,14 @@ SECURITY_RE = re.compile(
     r'event=security\.suspicious\s+method=(?P<method>\S+)\s+path=(?P<path>\S+)\s+'
     r'status=(?P<status>\d+)\s+reason=(?P<reason>[\w.-]+)\s+client=(?P<client>\S+)'
 )
+# One line per actor per hour, emitted when accumulated behaviour crosses the
+# threshold -- the counterpart to SECURITY_RE, which reports single requests.
+# An escalation carries signal COUNTS only: no path, no query, no agent string.
+ACTOR_RE = re.compile(
+    r'event=security\.actor_escalated\s+actor=(?P<actor>\S+)\s+'
+    r'score=(?P<score>\d+)\s+threshold=(?P<threshold>\d+)\s+'
+    r'signals=(?P<signals>\S+)\s+clients=(?P<clients>\d+)'
+)
 SSE_CLOSED_RE = re.compile(
     r'event=sse\.closed.*?reason=(?P<reason>\w+)\s+duration_seconds=(?P<seconds>[\d.]+)'
 )
@@ -428,6 +439,7 @@ def analyze_errors(cutoff, until=None):
     # that eats Gunicorn request slots.
     security = collections.Counter()
     security_clients = collections.defaultdict(set)
+    actors = {}
     sse_closes = collections.defaultdict(list)
     affected = collections.defaultdict(set)
     affected_jobs = collections.defaultdict(set)
@@ -494,6 +506,24 @@ def analyze_errors(cutoff, until=None):
                 user = fields.get("user")
                 job = fields.get("job")
                 first_line = record.splitlines()[0]
+                escalated = ACTOR_RE.search(first_line)
+                if escalated:
+                    # Keep the highest-scoring escalation per actor rather than
+                    # one row per hour of a long sitting: the question is "who
+                    # got how far", not "how many times did we say so".
+                    actor = escalated.group("actor")
+                    score = int(escalated.group("score"))
+                    previous = actors.get(actor)
+                    if previous is None or score > previous["score"]:
+                        actors[actor] = {
+                            "score": score,
+                            "signals": escalated.group("signals"),
+                            "clients": int(escalated.group("clients")),
+                            "hits": (previous or {}).get("hits", 0) + 1,
+                        }
+                    else:
+                        previous["hits"] += 1
+                    continue
                 suspicious = SECURITY_RE.search(first_line)
                 if suspicious:
                     reason = suspicious.group("reason")
@@ -528,6 +558,7 @@ def analyze_errors(cutoff, until=None):
         "exceptions": exceptions, "degradations": degradations, "affected": affected,
         "affected_jobs": affected_jobs, "security": security,
         "security_clients": security_clients, "sse_closes": sse_closes,
+        "actors": actors,
         "coverage": coverage_record(files, oldest, newest, lines, unparsed, 0, contextual, len(seen)),
     }
 
@@ -950,6 +981,15 @@ def main():
     rows([text for _, text in sorted(slow_rows, reverse=True)[:args.top]], empty=f"  (nothing slower than {args.slow_threshold:g}s)")
     section("SSE stream lifetimes")
     rows([f"{len(values):>5}  {endpoint}  p50={percentile(values, .5):.1f}s p95={percentile(values, .95):.1f}s max={max(values):.1f}s" for endpoint, values in sorted(access["streams"].items())])
+    section(f"Escalated actors (behaviour score >= {ESCALATION_THRESHOLD})")
+    rows([
+        f"{data['score']:>5}  {actor:<20} {data['signals']}"
+        + (f"  [{data['clients']} client(s)]" if data["clients"] > 1 else "")
+        + (f"  x{data['hits']}" if data["hits"] > 1 else "")
+        for actor, data in sorted(
+            errors["actors"].items(), key=lambda kv: -kv[1]["score"]
+        )[:args.top]
+    ], empty="  (none -- no client's accumulated behaviour crossed the threshold)")
     section("App-targeted probes (security.suspicious)")
     rows([
         f"{count:>5}  {reason:<20} from {len(errors['security_clients'].get(reason, ())) or '?'} client(s)"

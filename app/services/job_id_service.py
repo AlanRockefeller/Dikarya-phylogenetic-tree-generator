@@ -39,6 +39,11 @@ RESERVED_JOB_IDS = frozenset({
     "file", "tree", "logs", "help", "user", "jobs", "true", "fals", "root",
     "admin", "api", "www", "cunt", "fuck", "shit", "piss", "twat", "rape",
     "damn", "slut", "cock", "dick", "anus", "turd", "wank", "arse",
+    # The tree viewer's decoy job id. A request for it is reported as a
+    # honeytoken hit, so minting it for a real job would report that job's
+    # owner as an attacker. Keep in step with
+    # security_honeytokens.DECOY_JOB_ID; a test asserts they match.
+    "q0x9",
 })
 
 

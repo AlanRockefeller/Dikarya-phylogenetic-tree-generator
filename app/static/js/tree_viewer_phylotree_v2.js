@@ -6,10 +6,11 @@
     'use strict';
 
     const DEBUG_MODE = new URLSearchParams(window.location.search).has('debug');
-    // FastTree writes numerical stand-ins such as 6e-9 and 1.2e-8 for branches whose
-    // optimized length is effectively zero. Treating only literal 0 as unresolved would
-    // split one biological polytomy into arbitrary binary nodes in the viewer.
-    const ZERO_LENGTH_POLYTOMY_EPSILON = 1e-7;
+    // Tree builders write small positive stand-ins for branches whose optimized length is
+    // effectively zero: FastTree commonly emits values around 1e-8, while IQ-TREE 3 floors
+    // them at 1e-6. Use the same near-zero boundary as the tree-analysis metrics so either
+    // engine's arbitrary binary resolution is presented as one soft polytomy.
+    const ZERO_LENGTH_POLYTOMY_EPSILON = 1e-6;
 
     // Alan 8/24/26 - Say why a phylotree instance is not usable, or null when it is.
     // phylotree.js does not throw on a truncated or otherwise unparseable Newick: its
@@ -240,14 +241,23 @@
     const SUPPORT_METHOD_ALIASES = {
         'raxml-ng': 'raxml', 'raxmlng': 'raxml', 'raxml_ng': 'raxml', 'raxml8': 'raxml',
         'iq-tree': 'iqtree', 'iqtree2': 'iqtree', 'iq-tree2': 'iqtree',
+        'iqtree3': 'iqtree', 'iq-tree3': 'iqtree',
         'mr_bayes': 'mrbayes', 'mrbayes3': 'mrbayes',
         'fasttree2': 'fasttree',
-        'neighbor-joining': 'nj', 'neighbour-joining': 'nj'
+        'neighbor-joining': 'nj', 'neighbour-joining': 'nj',
+        // Spellings of the fast method. Whitespace is already removed before
+        // the lookup, so "IQ-TREE fast" arrives as "iq-treefast".
+        'iqtreefast': 'iqtree_fast', 'iq-treefast': 'iqtree_fast',
+        'iq-tree_fast': 'iqtree_fast', 'iqtree3fast': 'iqtree_fast'
     };
     const SUPPORT_METHOD_TYPES = {
         fasttree: 'SH',
         raxml: 'BS',
         iqtree: 'UFBOOT',
+        // Alan 9/17/26 - The IQ-TREE Quick Tree preset runs fixed SH-aLRT
+        // support without ultrafast bootstrap, so its node labels are always
+        // single SH-aLRT percentages.
+        iqtree_fast: 'ALRT',
         mrbayes: 'PP'
     };
 
@@ -816,7 +826,7 @@
                 throw new Error(parseFailure);
             }
 
-            // FastTree resolves zero-length polytomies into arbitrary binary ladders. Compact
+            // Tree builders resolve zero-length polytomies into arbitrary binary ladders. Compact
             // each complete zero-length tip component before recording "original" order, so
             // Sort -> Original and later reloads both retain the useful grouped presentation.
             this._groupZeroLengthPolytomies();
@@ -1225,6 +1235,66 @@
             return options.reduce((best, option) => better(option, best) ? option : best, null);
         }
 
+        _contractZeroLengthPolytomy(polytomy, originalPositions) {
+            const component = polytomy?.nodes;
+            const anchor = polytomy?.anchor;
+            if (!(component instanceof Set) || !anchor) return false;
+
+            const boundaryChildren = [];
+            component.forEach((node) => {
+                const children = node.children || node.data?.children || [];
+                if (!children.length) {
+                    if (node !== anchor) boundaryChildren.push(node);
+                    return;
+                }
+                children.forEach((child) => {
+                    if (!component.has(child)) boundaryChildren.push(child);
+                });
+            });
+            if (boundaryChildren.length < 2) return false;
+
+            const componentTips = new Set(polytomy.tips || []);
+            const positionCache = new WeakMap();
+            const firstOriginalPosition = (node) => {
+                if (positionCache.has(node)) return positionCache.get(node);
+                const children = node.children || node.data?.children || [];
+                if (!children.length) {
+                    const id = this._getNodeId(node);
+                    const position = originalPositions.get(id) ?? Number.MAX_SAFE_INTEGER;
+                    positionCache.set(node, position);
+                    return position;
+                }
+                const position = Math.min(...children.map(firstOriginalPosition));
+                positionCache.set(node, position);
+                return position;
+            };
+            boundaryChildren.sort((left, right) => {
+                // Once the near-zero edges are contracted, all unresolved tips are peers.
+                // Put those peers in one block and retain source order within each block.
+                const leftTip = componentTips.has(left) ? 0 : 1;
+                const rightTip = componentTips.has(right) ? 0 : 1;
+                return leftTip - rightTip
+                    || firstOriginalPosition(left) - firstOriginalPosition(right);
+            });
+            anchor.children = boundaryChildren;
+            boundaryChildren.forEach((child) => { child.parent = anchor; });
+            return true;
+        }
+
+        _refreshHierarchyMetrics(root) {
+            const visit = (node, depth) => {
+                node.depth = depth;
+                const children = node.children || [];
+                if (!children.length) {
+                    node.height = 0;
+                    return 0;
+                }
+                node.height = 1 + Math.max(...children.map((child) => visit(child, depth + 1)));
+                return node.height;
+            };
+            if (root) visit(root, 0);
+        }
+
         _groupZeroLengthPolytomies() {
             if (!this.tree) return 0;
             const nodes = [];
@@ -1232,6 +1302,9 @@
             const root = nodes.find((node) => !node.parent);
             if (!root) return 0;
 
+            const originalPositions = new Map(
+                this._tipOrderFromModel().map((id, index) => [id, index])
+            );
             const components = new Map();
             nodes.forEach((node) => {
                 const children = node.children || node.data?.children || [];
@@ -1239,16 +1312,26 @@
                 const polytomy = this._zeroLengthPolytomyForTip(node);
                 if (!polytomy) return;
                 const key = this._annotationMembershipKey(polytomy.memberIds);
-                if (key && !components.has(key)) components.set(key, new Set(polytomy.memberIds));
+                if (key && !components.has(key)) components.set(key, polytomy);
             });
-            const groups = Array.from(components.values()).sort((a, b) => b.size - a.size);
+            const polytomies = Array.from(components.values())
+                .sort((a, b) => b.memberIds.length - a.memberIds.length);
+            let grouped = 0;
+            polytomies.forEach((polytomy) => {
+                if (this._contractZeroLengthPolytomy(polytomy, originalPositions)) grouped += 1;
+            });
+            if (grouped) this._refreshHierarchyMetrics(root);
+
+            // A contraction makes the unresolved tips direct siblings and therefore
+            // contiguous. Retain the older rotation pass as a fallback for unusual tree
+            // objects that cannot safely be contracted.
+            const groups = polytomies.map((item) => new Set(item.memberIds));
             const totalRuns = () => {
                 const order = this._tipOrderFromModel();
                 return groups.reduce((sum, group) => sum + this._selectionRunCount(order, group), 0);
             };
 
             let score = totalRuns();
-            let grouped = 0;
             groups.forEach((group) => {
                 const order = this._tipOrderFromModel();
                 if (this._selectionRunCount(order, group) <= 1) return;

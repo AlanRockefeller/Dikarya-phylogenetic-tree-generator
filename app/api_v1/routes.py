@@ -114,7 +114,7 @@ def _clamp_int(value, default, lo, hi):
     return max(lo, min(hi, n))
 
 
-VALID_TREE_METHODS = {"nj", "raxml", "iqtree", "mrbayes", "fasttree"}
+VALID_TREE_METHODS = {"nj", "raxml", "iqtree", "iqtree_fast", "mrbayes", "fasttree"}
 # The input modes the public API accepts, mapped to the canonical value the
 # worker understands. `fasta_upload` is deliberately absent: it expects a file
 # already staged on disk by the web UI and is unreachable over JSON. Anything

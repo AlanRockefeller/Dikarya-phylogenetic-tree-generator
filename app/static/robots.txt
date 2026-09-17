@@ -28,6 +28,11 @@ Disallow: /whats-new/add
 Disallow: /todo
 Disallow: /test
 Disallow: /thumb/
+# Not a real route. Nothing links here, no flow reaches it, and a well-behaved
+# crawler obeying this file never requests it -- so a request for it comes from
+# somebody who read this file looking for what we would rather hide. See
+# app/services/security_honeytokens.py. Do not "clean up" this line.
+Disallow: /admin/db-export
 Allow: /
 
 Sitemap: https://dikarya.us/sitemap.xml

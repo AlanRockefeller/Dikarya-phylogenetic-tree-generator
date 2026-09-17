@@ -1642,6 +1642,38 @@ class AnnotationRenderDecisionTests(_RenderHarnessMixin, unittest.TestCase):
         selected_indices = sorted(order.index(name) for name in ("A", "B", "C"))
         self.assertEqual(selected_indices[-1] - selected_indices[0] + 1, 3)
 
+    def test_iqtree_floored_zero_length_tips_are_grouped_automatically(self):
+        # IQ-TREE 3 writes an optimized zero as 0.000001. Keep those unresolved tips
+        # together even when multiple positive-length side branches split their Newick
+        # order. Rotations alone cannot make A/B/C contiguous in this topology; the
+        # near-zero internal edges have to be contracted for display.
+        tree = {
+            "children": [
+                {"children": [
+                    {"id": "A", "length": 1e-6},
+                    {"id": "X", "length": 0.003},
+                ], "length": 1e-6},
+                {"children": [
+                    {"children": [
+                        {"id": "B", "length": 1e-6},
+                        {"id": "Y", "length": 0.004},
+                    ], "length": 1e-6},
+                    {"children": [
+                        {"id": "C", "length": 1e-6},
+                        {"id": "Z", "length": 0.005},
+                    ], "length": 1e-6},
+                ], "length": 1e-6},
+            ]
+        }
+        out = self._resolve(
+            [], tree=tree, tip_order=["A", "X", "B", "Y", "C", "Z"], auto_group=True,
+        )
+        order = out["groupedTipOrder"]
+        unresolved_indices = sorted(order.index(name) for name in ("A", "B", "C"))
+        self.assertEqual(unresolved_indices[-1] - unresolved_indices[0] + 1, 3)
+        for side_tip in ("X", "Y", "Z"):
+            self.assertNotIn(order.index(side_tip), unresolved_indices)
+
 
     def test_whole_tree_branch_check_skips_all_descendant_walks(self):
         out = self._resolve([], incoming_branch_members=["A", "B", "C", "D"])

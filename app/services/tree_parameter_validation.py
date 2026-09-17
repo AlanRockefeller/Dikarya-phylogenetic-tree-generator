@@ -97,8 +97,8 @@ def normalize_inherited_iqtree_ufboot_count(tree_method, bootstrap):
 # Quick Tree submission limits
 # ---------------------------------------------------------------------------
 
-# Quick Tree is the two-click path: fixed MAFFT --auto / trimAl / FastTree, no
-# parameter form. It exists for barcode-scale exploratory phylogenies, and MAFFT
+# Quick Tree is the two-click path: fixed MAFFT --auto / trimAl / IQ-TREE 3
+# five-iteration search, no parameter form. It exists for barcode-scale exploratory phylogenies, and MAFFT
 # --auto's cost grows with sequence LENGTH as well as count, so one pathological
 # record can turn a ten-second job into one that holds the single worker slot
 # for hours. Measured across the 11,670 job directories on disk: 1,515,220
@@ -123,14 +123,21 @@ QUICK_TREE_TOO_LONG_MESSAGE = (
 )
 
 # What the Quick Tree buttons actually post. Every value, not just the tree
-# method: "FastTree" on its own is a perfectly ordinary advanced choice, and an
-# earlier version of this check treated any FastTree request that omitted the
-# advanced parameter block as the preset -- which misclassified a deliberate
-# FastTree + MUSCLE + no-trimming API request as Quick Tree and capped it.
+# method: the tree method on its own is a perfectly ordinary advanced choice,
+# and an earlier version of this check treated any FastTree request that
+# omitted the advanced parameter block as the preset -- which misclassified a
+# deliberate FastTree + MUSCLE + no-trimming API request as Quick Tree and
+# capped it.
+#
+# "iqtree_fast" is the compatibility identifier for IQ-TREE 3 `-n 5 --alrt 1000` under GTR+G
+# (tree_builder_service._run_iqtree with fast=True). It replaced FastTree as
+# the Quick Tree engine on 2026-09-17: on real job alignments it found trees 10
+# to 200 log-likelihood units better at the same wall time. "fasttree" remains
+# an advanced option, unchanged.
 QUICK_TREE_PRESET = {
     "alignment_method": "mafft",
     "trimming_method": "trimal_gappy",
-    "tree_method": "fasttree",
+    "tree_method": "iqtree_fast",
     "tree_model": "gtr+g",
 }
 
@@ -170,14 +177,14 @@ def _matches_quick_tree_preset(data) -> bool:
     """Does this body carry the Quick Tree preset exactly?
 
     All four fixed values plus terminal-overhang trimming. Narrower than "uses
-    FastTree" by a long way: the advanced form can select FastTree with MUSCLE,
-    or with no trimming, or with a different model, and none of those is the
-    preset.
+    the Quick Tree method" by a long way: the advanced form can select IQ-TREE
+    limited search with MUSCLE, or with no trimming, or with a different model, and
+    none of those is the preset.
 
     The advanced-field check is a second narrowing on top of that, for the one
     case the preset match cannot settle on its own: the advanced form *can*
-    reproduce the preset's four values exactly (mafft + trimAl-gappy + FastTree
-    + GTR+G is a reasonable thing to choose by hand). It always sends the whole
+    reproduce the preset's four values exactly (mafft + trimAl-gappy + IQ-TREE
+    fast + GTR+G is a reasonable thing to choose by hand). It always sends the whole
     parameter block, so their presence distinguishes it. This is why the marker
     exists and why this is only the fallback -- a caller can still dodge the
     fallback by sending `seed: null`, which is exactly as effective as sending

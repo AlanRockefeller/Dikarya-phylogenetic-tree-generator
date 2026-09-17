@@ -79,6 +79,22 @@ _MAX_MODEL_PARAM_LENGTH = 512
 _MULTISTATE_MODEL = re.compile(r"^MULTI(\d+)_(?:MK|GTR)$")
 
 
+def _note_model_refusal(model: str) -> None:
+    """Report a rejected model string that was shaped like a RAxML argument.
+
+    ``--model`` is built straight from this value in ``_get_raxml_cmd``, so a
+    rejection carrying a leading dash, a path or a shell metacharacter is an
+    attempt at the binary. An ordinary misspelled model name is not reported;
+    ``looks_weaponized()`` is what draws that line.
+    """
+    try:
+        from app.services.request_diagnostics import note_tool_argument_refusal
+
+        note_tool_argument_refusal("raxml_model", model)
+    except Exception:
+        pass
+
+
 def _is_safe_model_param(value: str) -> bool:
     """Validate the numeric contents of one RAxML-NG ``{...}`` block.
 
@@ -320,6 +336,7 @@ def validate_and_resolve_raxml_params(params: Dict[str, Any], data_type: str = '
     enable_moose = bool(params.get('moose_enabled', False))
     if model and any(ord(char) < 32 or 127 <= ord(char) <= 159 for char in model):
         warnings.append("Model string contained control characters; reverting to default.")
+        _note_model_refusal(model)
         model = "GTR+G" if data_type == "DNA" else "LG+G"
     
     if not model and not enable_moose:
@@ -451,6 +468,7 @@ def validate_and_resolve_raxml_params(params: Dict[str, Any], data_type: str = '
 
         if not model_valid:
              warnings.append(f"Model string rejected; reverting to default.")
+             _note_model_refusal(model)
              model = "GTR+G" if data_type == "DNA" else "LG+G"
         else:
              # Reconstruct normalized string

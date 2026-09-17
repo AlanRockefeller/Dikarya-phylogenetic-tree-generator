@@ -1457,6 +1457,27 @@ def refresh_mycomap_observation_records(references: list) -> dict:
     }
 
 
+# Alan 9/16/26 - mycomap.org is a real MycoMap host whose admin URLs
+# (https://mycomap.org/admin/blast-results/<observation_id>/<record_id>) this
+# app cannot resolve through the mycomap.com API yet. It is NOT accepted by
+# validate_mycomap_url(), so a saved .org value still falls back to creating a
+# replacement search -- but callers use this helper to recognise the case and
+# leave the user's stored .org value alone instead of overwriting it. Remove
+# this only when real .org support lands and .org URLs validate directly.
+MYCOMAP_ORG_HOSTNAMES = ('mycomap.org', 'www.mycomap.org')
+
+
+def is_mycomap_org_url(url: str) -> bool:
+    """True when ``url`` points at the mycomap.org host (any path)."""
+    if not url:
+        return False
+    try:
+        hostname = (urllib.parse.urlparse(url).hostname or '').lower()
+    except Exception:
+        return False
+    return hostname in MYCOMAP_ORG_HOSTNAMES
+
+
 def validate_mycomap_url(url: str, *, quiet: bool = False) -> Optional[str]:
     """
     Validate a Mycomap URL and extract the blast_id.

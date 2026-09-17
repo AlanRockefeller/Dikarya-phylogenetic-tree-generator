@@ -1183,7 +1183,7 @@
                     </button>
                 </div>
                 <div class="pipeline-summary">
-                    Pipeline: <strong>MAFFT</strong> → <strong>FastTree</strong> · <strong>GTR+CAT</strong> · <strong>1000 BS</strong> · midpoint root
+                    Pipeline: <strong>MAFFT</strong> → <strong>IQ-TREE (5 iterations)</strong> · <strong>GTR+G</strong> · <strong>1000 SH-aLRT</strong> · midpoint root
                 </div>
                 <div class="queue-tools">
                     <button id="clear_queue_btn" class="btn btn-small" disabled>
@@ -1214,7 +1214,7 @@
         <p class="eyebrow">Advanced</p>
         <h3 class="mb-1">Pipeline Configuration</h3>
         <div class="advanced-summary">
-            <p id="advanced_current_summary" class="text-sm">Currently: MAFFT + FastTree 2.2.0, terminal overhang trim, midpoint-rooted, SH-like local support (not bootstrap).</p>
+            <p id="advanced_current_summary" class="text-sm">Currently: MAFFT + IQ-TREE five-iteration search, terminal overhang trim, midpoint-rooted, SH-aLRT branch support (1000 replicates, not bootstrap).</p>
         </div>
     </div>
 
@@ -1366,7 +1366,8 @@
                 <select id="tree_method" class="w-full px-4 py-3 border border-gray-300 dark:border-journal-dark rounded-lg 
                                bg-white dark:bg-journal-dark text-gray-900 dark:text-gray-100
                                focus:ring-2 focus:ring-journal-gold focus:border-transparent transition-all">
-                    <option value="fasttree" selected>FastTree 2.2.0 (Fast ML)</option>
+                    <option value="iqtree_fast" selected>IQ-TREE 5-iteration search (Quick ML)</option>
+                    <option value="fasttree">FastTree 2.2.0 (Fast ML)</option>
                     <option value="raxml">RAxML-NG (High Quality ML)</option>
                     <option value="iqtree">IQ-TREE (Maximum Likelihood)</option>
                     <option value="mrbayes">MrBayes (Bayesian)</option>
@@ -3509,17 +3510,17 @@
             alignment_method: 'mafft',
             trimming_method: 'trimal_gappy',
             trim_terminal_overhangs: true,
-            tree_method: 'fasttree',
+            tree_method: 'iqtree_fast',
             tree_model: 'GTR+G',
             // Says which button this came from, so the server does not have to
-            // infer it from the parameter set. "FastTree" on its own is an
-            // ordinary advanced choice; only the preset carries the 10 kb
+            // infer it from the parameter set. The limited IQ-TREE search on its own is
+            // an ordinary advanced choice; only the preset carries the 10 kb
             // per-sequence cap.
             submission_mode: 'quick_tree',
-            // No bootstrap: FastTree ignores it. It runs a fixed -boot N
-            // SH-like local-support resampling instead, which is what the
-            // viewer reports (support_type "sh_like"). Sending 100 only
-            // persisted a replicate count that never existed.
+            // No bootstrap: the preset reports SH-aLRT branch support instead,
+            // 1000 replicates on a 0-100 scale,
+            // which is what the viewer reports (support_type "alrt"). Sending a
+            // replicate count would only persist one that never ran.
             import_filter_details: getImportFilterDetailsForPayload(),
             mycomap_blast_url: getMycomapBlastUrlForPayload()
         };
@@ -3643,8 +3644,10 @@
     function isSingleInaturalistObservationInput(value) {
         if (!value) return false;
         if (/^\d+$/.test(value)) return true;
-        return /^https?:\/\/(?:www\.)?inaturalist\.org\/observations\/\d+(?:[/?#].*)?$/i.test(value) ||
-            /^(?:www\.)?inaturalist\.org\/observations\/\d+(?:[/?#].*)?$/i.test(value);
+        // A final period is normally sentence punctuation copied with the URL;
+        // the server accepts it only after a numeric observation path too.
+        return /^https?:\/\/(?:www\.)?inaturalist\.org\/observations\/\d+(?:[/?#].*|\.(?:[?#].*)?)?$/i.test(value) ||
+            /^(?:www\.)?inaturalist\.org\/observations\/\d+(?:[/?#].*|\.(?:[?#].*)?)?$/i.test(value);
     }
 
     function getInaturalistBlastLimit(inputEl, fallback) {
@@ -4760,17 +4763,17 @@
             alignment_method: 'mafft',
             trimming_method: 'trimal_gappy',
             trim_terminal_overhangs: true,
-            tree_method: 'fasttree',
+            tree_method: 'iqtree_fast',
             tree_model: 'GTR+G',
             // Says which button this came from, so the server does not have to
-            // infer it from the parameter set. "FastTree" on its own is an
-            // ordinary advanced choice; only the preset carries the 10 kb
+            // infer it from the parameter set. The limited IQ-TREE search on its own is
+            // an ordinary advanced choice; only the preset carries the 10 kb
             // per-sequence cap.
             submission_mode: 'quick_tree',
-            // No bootstrap: FastTree ignores it. It runs a fixed -boot N
-            // SH-like local-support resampling instead, which is what the
-            // viewer reports (support_type "sh_like"). Sending 100 only
-            // persisted a replicate count that never existed.
+            // No bootstrap: the preset reports SH-aLRT branch support instead,
+            // 1000 replicates on a 0-100 scale,
+            // which is what the viewer reports (support_type "alrt"). Sending a
+            // replicate count would only persist one that never ran.
             import_filter_details: getImportFilterDetailsForPayload(),
             mycomap_blast_url: getMycomapBlastUrlForPayload()
         };
@@ -4918,6 +4921,9 @@
             const iqModel = iqtreeModelSelect?.value || 'MFP';
             const modelLabel = iqModel === 'MFP' ? 'ModelFinder' : iqModel;
             advancedCurrentSummary.textContent = `Currently: ${alignment} + ${treeMethod}, ${modelLabel}, ${terminalTrim}, ${rooting}, ${support}.`;
+        } else if (treeMethodSelect.value === 'iqtree_fast') {
+            // Fixed 1000 SH-aLRT replicates and no bootstrap in this preset.
+            advancedCurrentSummary.textContent = `Currently: ${alignment} + ${treeMethod}, ${terminalTrim}, ${rooting}, SH-aLRT branch support (1000 replicates, not bootstrap).`;
         } else if (treeMethodSelect.value === 'fasttree') {
             advancedCurrentSummary.textContent = `Currently: ${alignment} + ${treeMethod}, ${terminalTrim}, ${rooting}, SH-like local support (not bootstrap).`;
         } else if (treeMethodSelect.value === 'nj') {
@@ -5035,6 +5041,14 @@
 
             bootstrapInput.value = 1000;
             treeModelText.value = 'GTR+CAT';
+        } else if (method === 'iqtree_fast') {
+            // The IQ-TREE Quick Tree preset has no support control: it omits
+            // ultrafast bootstrap, and the SH-aLRT replicate count is fixed at
+            // 1000 in tree_builder_service. Only the model is editable, and
+            // GTR+CAT is a FastTree spelling IQ-TREE does not accept.
+            if (!treeModelText.value || treeModelText.value === 'GTR+CAT') {
+                treeModelText.value = 'GTR+G';
+            }
         } else if (method === 'mrbayes') {
             mbOptions.classList.remove('hidden');
             updateMrBayesStopEarlyState();
@@ -5388,7 +5402,7 @@
         const payload = {
             input_type: 'sequence',
             // The advanced builder can reproduce the Quick Tree preset's four
-            // values exactly (mafft + trimAl-gappy + FastTree + GTR+G is a
+            // values exactly (mafft + trimAl-gappy + limited IQ-TREE + GTR+G is a
             // reasonable thing to choose by hand), so it says which form it is
             // rather than leaving the server to guess. Advanced submissions
             // have always accepted long loci and still do.
@@ -5508,7 +5522,7 @@
     // =========================================================================
     // Quick Tree per-sequence ceiling
     //
-    // Quick Tree is the fixed MAFFT --auto / trimAl / FastTree preset, meant for
+    // Quick Tree is the fixed MAFFT --auto / trimAl / IQ-TREE five-iteration preset, meant for
     // barcode-length reads. MAFFT --auto's cost grows with sequence length as
     // well as count, so one pathological record can turn a ten-second job into
     // one that holds the single worker slot for hours. The advanced tree

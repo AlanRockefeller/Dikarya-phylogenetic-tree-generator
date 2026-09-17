@@ -363,7 +363,7 @@ JOB_ID=$(
     -d '{
       "input_type": "pasted_sequence",
       "sequence": ">Sample_A\nATGCGTACGTAGCTAGCTAGCTAGCTAGCTAACGATCGATCGATCGATCGATCGATCGATCGATCGATCGATCGATCGATCGATCGATCGATCGATCG\n>Sample_B\nATGCGTACGTAGCTAGCTAGCTAGCTAGCTAACGATCGATCGATCGATCGATCGATCGATCGATCGATCGATCGATCGATCGTTTGATCGATCGATCG\n>Sample_C\nATGCGTACGTAGCTAGCTAGCTAGCTAGCTAACGATCGATCGATCGATCGATCGATCGATCGATCGATCGATCGATCGATCGATCGTTTGATCG\n>Sample_D\nATGCGTACGTAGCTAGCTAGCTAGCTAGCTAACGATCGATCGATCGATCGATCGATCGATCGATCGATCGATCGTTTGATCGATCGATCGATCGATCG",
-      "tree_method": "fasttree",
+      "tree_method": "iqtree_fast",
       "alignment_method": "mafft",
       "trimming_method": "none",
       "notes": "API test with valid pasted FASTA"
@@ -442,7 +442,7 @@ ATGCGTACGTAGCTAGCTAGCTAGCTAGCTAACGATCGATCGATCGATCGATCGATCGATCGATCGATCGATCGTTTGAT
 payload = {
     "input_type": "pasted_sequence",
     "sequence": sequence,
-    "tree_method": "fasttree",
+    "tree_method": "iqtree_fast",
     "alignment_method": "mafft",
     "trimming_method": "none",
     "notes": "Python API test with valid pasted FASTA",

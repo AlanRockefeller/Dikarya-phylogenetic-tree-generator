@@ -350,12 +350,24 @@ def _pipeline_param(job_params, name, default=None):
     return getattr(tree_params, nested_name, default) if tree_params is not None else default
 
 
+# How a tree method's name is spelled in the step label and the completion
+# line. Only a method whose identifier does not read well upper-cased needs an
+# entry: "iqtree_fast".upper() is "IQTREE_FAST".
+_TREE_METHOD_DISPLAY = {"iqtree_fast": "IQ-TREE QUICK"}
+
+
+def _tree_method_display(method) -> str:
+    text = str(method or "")
+    return _TREE_METHOD_DISPLAY.get(text.lower(), text.upper())
+
+
 def _support_expected(job_params) -> Optional[bool]:
     """Whether the selected method/settings were asked to calculate support."""
     method = str(_pipeline_param(job_params, "tree_method", "") or "").lower()
     if method == "nj":
         return False
-    if method in {"fasttree", "mrbayes"}:
+    if method in {"fasttree", "mrbayes", "iqtree_fast"}:
+        # iqtree_fast always runs the preset's fixed --alrt support without UFBoot.
         return True
     if method == "iqtree":
         try:
@@ -2000,7 +2012,7 @@ def run_phylo_job(job_params: dict) -> dict:
             mcmc_stop_early = coerce_bool(job_params.get("mcmc_stop_early"), False)[0]
             
             current_tool = tree_method.lower()
-            current_step_label = f"Tree Building ({tree_method.upper()})"
+            current_step_label = f"Tree Building ({_tree_method_display(tree_method)})"
             
             if job:
                 job.meta["current_step"] = current_step
@@ -2022,6 +2034,15 @@ def run_phylo_job(job_params: dict) -> dict:
                     alrt_replicates = max(0, min(10_000, int(alrt_replicates)))
                 except (TypeError, ValueError):
                     alrt_replicates = Config.DEFAULT_IQTREE_ALRT
+            elif tree_method == "iqtree_fast":
+                # Fixed, not configurable: the Quick Tree preset has no support control and
+                # _run_iqtree ignores params.alrt_replicates for it. Persisted
+                # anyway so the job page can report what actually ran.
+                from app.services.tree_builder_service import (
+                    IQTREE_FAST_ALRT_REPLICATES,
+                )
+
+                alrt_replicates = IQTREE_FAST_ALRT_REPLICATES
             else:
                 alrt_replicates = 0
 
@@ -2042,8 +2063,10 @@ def run_phylo_job(job_params: dict) -> dict:
             if tree_method in ("raxml", "iqtree") and bootstrap:
                 label = "UFBoot" if tree_method == "iqtree" else "bootstraps"
                 detail_parts.append(f"{bootstrap} {label}")
-            if tree_method == "iqtree" and alrt_replicates:
+            if tree_method in ("iqtree", "iqtree_fast") and alrt_replicates:
                 detail_parts.append(f"{alrt_replicates} SH-aLRT")
+            if tree_method == "iqtree_fast":
+                detail_parts.append("5 search iterations")
             if tree_method == "mrbayes":
                 stop_rule_active = mcmc_stop_early and mcmc_runs > 1
                 detail_parts.append(
@@ -2107,7 +2130,7 @@ def run_phylo_job(job_params: dict) -> dict:
 
             require_valid_pipeline_outputs(job_dir, job_params, logger)
 
-            tree_detail = f"Tree built using {tree_method.upper()}"
+            tree_detail = f"Tree built using {_tree_method_display(tree_method)}"
             publish_step_done(job_id, STEP_TREE, tree_detail)
             update_step_meta(job, STEP_TREE, {"state": STATE_DONE, "detail": tree_detail})
 

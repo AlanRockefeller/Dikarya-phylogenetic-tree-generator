@@ -348,9 +348,27 @@ The tree viewer's **Analyze with Claude** button posts to
   for an unrecognised method, both take the same `alrt_only` flag (IQ-TREE run
   with `-alrt` and no `-B` writes single SH-aLRT values, not UFBoot ones), and
   both are run over `tests/fixtures/support_classification_cases.json` by
-  `tests/test_tree_analysis_metrics.py` — add a case there. The builder itself
+  `tests/test_tree_analysis_metrics.py` — add a case there. `iqtree_fast` is
+  declared `ALRT` outright rather than relying on that flag, because it can
+  never produce a UFBoot value. The builder itself
   is resolved once, by `resolve_tree_support_context()`, which is what fills
   `window.TREE_METHOD`; do not resolve it separately in the template.
+- **The `pipeline` block reports what the builder DID, not what was asked.**
+  Four fields are deliberately not bare numbers, and each has a matching
+  paragraph under "WHAT THE RUN ACTUALLY DID" in `SYSTEM_PROMPT`:
+  `substitution_model` is the model that was *fit* (`model_selected`), with the
+  request published beside it as `substitution_model_requested` only when the
+  two differ — citing the request reported "MFP", which names no model, and
+  called a GTR+G job GTR+G when it ran as GTR+F+G4. `tree_search` plus
+  `tree_search_note` declare a deliberately limited search; the note is written
+  self-contained so it still steers a review when the installed prompt copy is
+  older than the field. `bootstrap_replicates` is a sentence whenever the
+  builder did not run the requested count. For RAxML-NG, it reports the exact
+  number of replicate trees written and whether AutoMRE declared convergence;
+  old jobs recover both from `raxml_run.raxml.bootstraps` and `.log`.
+  `bootstrap_metrics` names every metric computed, but only the
+  first one's values are in the context, so the transfer-bootstrap numbers must
+  never be quoted.
 - **Bump `REVIEW_SCHEMA_VERSION`** whenever the prompt or the metric set changes
   in a way that makes an already-stored review misleading. Cached reviews at a
   different version are ignored rather than shown.
@@ -470,10 +488,10 @@ When a new CLI version is published:
   marker, or one nobody recognises (a cached page, a script, a typo -- falling
   back rather than failing open is deliberate, since a mistyped marker would
   otherwise switch the guardrail off silently). Only an explicit `"advanced"`
-  opts out. "Uses FastTree" is **not** the test: a
-  deliberate FastTree + MUSCLE + no-trimming request is an advanced submission,
-  and the advanced form can reproduce the preset's four values by hand, which
-  is why the marker exists.
+  opts out. "Uses the preset's tree method" is **not** the test: a
+  deliberate limited IQ-TREE + MUSCLE + no-trimming request is an advanced
+  submission, and the advanced form can reproduce the preset's four values by
+  hand, which is why the marker exists.
 
   **It is a guardrail, not an abuse boundary.** A caller who declares
   `advanced` is not capped, deliberately: the advanced builder has always
@@ -483,12 +501,46 @@ When a new CLI version is published:
   cost would have to be tied to the work itself (total bases x sequence count
   against the aligner that will run), not to which button was pressed. The v1
   API is untouched.
-- **Quick Tree sends no `bootstrap`.** FastTree ignores it: `_run_fasttree`
-  hardcodes `-boot FASTTREE_SH_RESAMPLES`, which is SH-like local support, not
-  bootstrap proportions, and `tree_builder_service` already records
-  `bootstrap: None` / `support_type: "sh_like"` for it. `create_job` drops an
-  unsent bootstrap for FastTree rather than persisting the generic 1000
-  default; an explicitly submitted one is still stored.
+- **Quick Tree runs `iqtree_fast`, not FastTree.** Since 2026-09-17 the preset
+  is IQ-TREE 3 `-n 5 --alrt 1000` under a fixed GTR+G, run by `_run_iqtree(…,
+  fast=True)` — on real job alignments it finds trees 10 to 200 log-likelihood
+  units better than FastTree at the same wall time (2-40 s). Node labels are
+  SH-aLRT **percentages (0-100)**, not FastTree's 0-1 SH-like values, so a
+  reader who assumes the old scale is off by two orders of magnitude.
+  `fasttree` remains a selectable advanced method and is unchanged.
+- **Quick Tree deliberately omits UFBoot.** `_run_iqtree` forces `bootstrap = 0`
+  in Quick Tree mode rather than trusting the caller, and the SH-aLRT count is the fixed
+  `IQTREE_FAST_ALRT_REPLICATES` rather than `params.alrt_replicates`, because
+  the preset has no support control to read one from.
+- **Quick Tree sends no `bootstrap`.** Neither engine can run one: FastTree
+  ignores it (`_run_fasttree` hardcodes `-boot FASTTREE_SH_RESAMPLES`, which is
+  SH-like local support, not bootstrap proportions) and the `iqtree_fast`
+  preset omits it. `tree_builder_service` records `bootstrap: None` for
+  both, with `support_type: "sh_like"` and `"alrt"` respectively. `create_job`
+  drops an unsent bootstrap for either method rather than persisting the
+  generic 1000 default; an explicitly submitted one is still stored.
+- **The IQ-TREE binary is `/usr/local/bin/iqtree3` (3.1.4).** `/usr/bin/iqtree2`
+  is 2.0.7 and must not be used. `_run_iqtree` uses the version 3 spellings
+  (`-T`, `--prefix`, `--seed`, `--redo`, `-B`, `--alrt`); 3.1.4 still accepts
+  the 2.x short forms but nothing here should. Every place that normalises
+  `iqtree2` to `iqtree` also normalises `iqtree3`: the method maps in
+  `tree_analysis_service.py` and `tree_viewer_phylotree_v2.js`, and the tool
+  regex in `security_events.py`. A non-fast run always pairs `-B` with
+  `--bnni`, recorded as `bnni: true`.
+- **RAxML-NG bootstrapping computes two support metrics, not one.**
+  `_get_raxml_cmd` passes `--bs-metric fbp,tbe`, so RAxML writes
+  `<prefix>.raxml.supportFBP` and `.supportTBE` and **no** bare
+  `.raxml.support`. The Felsenstein tree is the one served as
+  `tree_original.newick`, so the viewer's Bootstrap badge still means what it
+  always did; the transfer-bootstrap tree is copied beside it as
+  `tree_original_tbe.newick` (`tree_pruned_tbe.newick` after a recompute) and
+  nothing displays it by default. `tree_metadata.json` records
+  `bootstrap_metrics: ["fbp", "tbe"]` and `tbe_tree`. The bare `.raxml.support`
+  name is kept as a fallback for a binary that ignores the flag — do not delete
+  that branch. **The two files are on different scales**: RAxML writes FBP as a
+  percentage (`93`) and TBE as a proportion (`0.930000`), so anything that ever
+  displays the TBE tree must say which it is rather than reusing the bootstrap
+  badge's reading.
 - **GenBank accession policy lives in `fasta_utils.GENBANK_ACCESSION_RE`.** The
   large-scale INSDC families (WGS contigs, TSA transcripts, TLS targeted-locus
   records) share one accession structure and the string does not say which is
@@ -714,6 +766,98 @@ The digest counts a `security.suspicious` record **once**, in the App-targeted
 probes section. It used to fall through into the generic exception tally as
 well, where `meaningful_error_key()` rendered it as an unreadable
 `event=security.suspicious method=<...>` row that crowded out real failures.
+
+### Behaviour scoring: catching someone who is good at this
+
+Everything above judges one request by its URL, which is why it catches sweeps
+and would never catch anyone competent. Somebody who reads `openapi.json`,
+notices job ids are four base36 characters and starts walking
+`/api/job/<id>/download/alignment` sends requests that are individually
+indistinguishable from a real user's. Three mechanisms cover that, and the
+first two share one Redis window (the same short-timeout client the
+missing-route gate uses, so a wedged Redis costs 100ms, never a request):
+
+**`app/services/security_actors.py` scores the actor, not the request.** Each
+signal is worth little once and a lot repeated -- that is what `free` encodes,
+the allowance that scores nothing because that many is ordinary use. One user
+hits one missing job; nobody hits nine. One `WARNING`
+(`event=security.actor_escalated`) fires when the total crosses
+`ESCALATION_THRESHOLD`, then that actor is silent for an hour.
+
+- Actors are scored per **network** (/24 or /64), not per address, because
+  rotation is free otherwise. The exact addresses ride along as the
+  zero-weight `client_ips` signal. A large NAT is therefore one actor: accepted,
+  since the line is a WARNING whose evidence names the addresses.
+- `api_surface_probe` and `admin_probe` **no longer WARN individually** -- they
+  fired 61 times in one ordinary day, essentially all `.env` hunting. They are
+  weight-1 with a hard cap, arranged so both saturated together stay *below*
+  the threshold: a dumb sweep can never escalate on volume alone.
+- An escalation line carries signal **counts only**. No path, no query, no
+  agent string -- same rule as the monitoring views.
+- **A new signal must define `free` deliberately.** `free=0` means "one
+  occurrence is an attack", which is true of a honeytoken and false of almost
+  everything else. Getting that wrong is how this becomes noise again.
+
+**`app/services/security_path_crowd.py` decides what is boring by counting who
+asks.** A path requested by ≥`DICTIONARY_CLIENTS` unrelated clients is sweep
+vocabulary by definition (`/api/.env` came from nine in a day) and scores
+nothing; a path requested by exactly one client, ever, that also looks like
+this app's surface, is a guess about *us* and scores. A scanner cannot produce
+a singleton, because its dictionary is shared with every other scanner on the
+internet. Paths are normalised (ids and digit runs collapsed) and stored only
+as a hash. Without Redis the verdict is `emerging` -- no opinion, never
+`singleton`, so the failure mode is quiet rather than accusatory.
+
+**`app/services/security_honeytokens.py` plants paths that exist only in our
+own output.** A scanner's dictionary was fixed before it ever contacted this
+host, so it cannot ask for something it learned here. Three today: a
+`Disallow:` line in `robots.txt`, a decoy job id in a `job_viewer.html`
+comment, and a deprecated stub in the OpenAPI document. Each is published in
+exactly one place, answers an ordinary 404 so a prober cannot tell it tripped
+one, and escalates on its own. `DECOY_JOB_ID` is in
+`job_id_service.RESERVED_JOB_IDS` and **must stay there** -- minting it for a
+real job would report that job's visitors as attackers.
+`tests/test_security_honeytokens.py` asserts both the reservation and that each
+token is still planted where it is published; a removed plant is a tripwire
+that silently stops working.
+
+### Attacks aimed at Dikarya specifically
+
+Four reason codes exist for attacks on *this* app rather than on whatever
+answers on port 443, and all four WARN immediately:
+
+- `path_traversal_app_surface` -- traversal that starts from a job artifact
+  route rather than the site root. A sweep asks every host for `/etc/passwd`
+  (still reported, as plain `path_traversal`); only someone who has looked at
+  Dikarya climbs out of `/job/<id>/download/`.
+- `artifact_path_probe` -- a request naming the on-disk layout
+  (`input_info.json`, `tree_state.json`, `var/jobs/...`). Those names are in
+  this repository and in no scanner dictionary anywhere.
+- `tool_exploit_probe` -- a request naming the binaries the pipeline executes
+  (MAFFT, RAxML-NG, IQ-TREE, trimAl, MrBayes, BLAST) or shaped like an attempt
+  to smuggle an argument into one. This is the part of Dikarya that actually
+  runs things.
+- `path_escape_refused` / `argument_injection_refused` -- reported by the code
+  that **refused** the attempt, not by reading a URL. The attacks that matter
+  most here are invisible in the request line: a path that only turns out to
+  escape `var/jobs` once resolved, a symlink planted in a job directory, a
+  model string that would have reached a RAxML `--model` argv as a flag.
+
+The last two are why `note_attack_attempt()` and
+`note_tool_argument_refusal()` exist in `request_diagnostics.py`. Anything that
+refuses a weaponized value calls one of them; inside a request it becomes an
+actor signal, and in the worker (where there is no actor) it is written
+straight out as a WARNING with the job and user from the log context. Two rules:
+
+- **The artifact and toolchain checks only run on an UNMATCHED path.** Real
+  routes legitimately carry these words -- `/job/<id>/download/mrbayes` is a
+  download, `/files/<path:filename>` serves arbitrary names -- so testing a
+  matched route would report the app's own traffic as an attack.
+- **Report the attempt, not the typo.** `looks_weaponized()` in
+  `security_events.py` is the line: a leading dash, a shell metacharacter, a
+  traversal sequence, a path separator outside a RAxML brace block. A
+  misspelled model name is a user mistake and must stay silent, or the signal
+  is worthless. Validators refuse plenty of ordinary errors.
 
 Three rules when editing this:
 

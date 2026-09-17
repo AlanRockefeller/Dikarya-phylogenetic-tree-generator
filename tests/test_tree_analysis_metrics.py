@@ -970,6 +970,107 @@ def test_effective_bootstrap_uses_the_shared_method_normalization():
     assert "not run" in service._effective_bootstrap("Neighbour-Joining", 100)
     # IQ-TREE really does run the replicates it is given.
     assert service._effective_bootstrap("IQ-TREE 2", 1000) == 1000
+    assert "not run" in service._effective_bootstrap("iqtree_fast", 1000)
+
+
+def test_raxml_never_reports_the_submitted_replicate_count():
+    """RAxML-NG's autoMRE cap is adaptive, so the request never ran.
+
+    tree_metadata stores `bootstrap: None` for exactly that reason, and the
+    caller's `metadata or job_details` fallback used to slide straight past it
+    onto the submitted 1000 -- reporting a replicate count that never happened,
+    which is the same defect the FastTree entry above exists to prevent.
+    """
+    reported = service._effective_bootstrap(
+        "raxml", 1000, bootstrap_spec="autoMRE{500}",
+        support_type="bootstrap", has_metadata=True,
+    )
+    assert "autoMRE{500}" in reported
+    assert "1000" not in reported
+    # RAxML-NG aliases normalize here too.
+    assert "autoMRE{500}" in service._effective_bootstrap(
+        "RAxML-NG", 1000, bootstrap_spec="autoMRE{500}", has_metadata=True
+    )
+
+
+def test_raxml_without_a_recorded_spec_still_refuses_to_quote_a_count():
+    # Bootstrapping switched off: the builder recorded no support type.
+    disabled = service._effective_bootstrap(
+        "raxml", 1000, bootstrap_spec=None, support_type=None, has_metadata=True
+    )
+    assert "not run" in disabled and "1000 requested" in disabled
+    # A job old enough to predate bootstrap_spec must not be guessed at either.
+    legacy = service._effective_bootstrap(
+        "raxml", 1000, bootstrap_spec=None, support_type="bootstrap",
+        has_metadata=False,
+    )
+    assert "not recorded" in legacy
+    assert "1000" not in legacy
+
+
+def test_raxml_review_reports_completed_automre_count_and_why_it_stopped():
+    reported = service._effective_bootstrap(
+        "raxml", 1000, bootstrap_spec="autoMRE{1000}",
+        support_type="bootstrap", has_metadata=True,
+        completed=450, converged=True,
+    )
+    assert reported.startswith("450 replicates completed")
+    assert "stabilized" in reported
+
+
+def test_the_review_cites_the_fitted_model_not_the_requested_one(tmp_path):
+    """"MFP" names no model, and even GTR+G is expanded to GTR+F+G4."""
+    job = _provenance_job(
+        tmp_path, files={"alignment_trimmed.fasta": _FOUR_ROWS},
+        input_info={"trimming_method": "none", "outgroup": None},
+    )
+    _write(job / "tree" / "tree_metadata.json", json.dumps({
+        "method": "iqtree", "model": "MFP", "model_selected": "TIM2+F+I+G4",
+        "model_selector": "ModelFinder", "bootstrap": 1000, "bnni": True,
+    }))
+    pipeline = service.build_context(job)["pipeline"]
+    assert pipeline["substitution_model"] == "TIM2+F+I+G4"
+    assert pipeline["substitution_model_requested"] == "MFP"
+    assert pipeline["substitution_model_selector"] == "ModelFinder"
+    # --bnni is surfaced so the reviewer knows UFBoot was NNI-refined.
+    assert pipeline["ufboot_nni_refined"] is True
+
+
+def test_a_model_that_was_not_reselected_publishes_no_requested_field(tmp_path):
+    job = _provenance_job(
+        tmp_path, files={"alignment_trimmed.fasta": _FOUR_ROWS},
+        input_info={"trimming_method": "none", "outgroup": None},
+    )
+    _write(job / "tree" / "tree_metadata.json", json.dumps({
+        "method": "raxml", "model": "GTR+G", "model_selected": "GTR+G",
+    }))
+    pipeline = service.build_context(job)["pipeline"]
+    assert pipeline["substitution_model"] == "GTR+G"
+    # Nothing to reconcile, so the field is absent rather than duplicated.
+    assert pipeline["substitution_model_requested"] is None
+    assert pipeline["ufboot_nni_refined"] is None
+
+
+def test_a_five_iteration_search_is_declared_with_its_own_explanation(tmp_path):
+    job = _provenance_job(
+        tmp_path, files={"alignment_trimmed.fasta": _FOUR_ROWS},
+        input_info={"trimming_method": "none", "outgroup": None},
+    )
+    _write(job / "tree" / "tree_metadata.json", json.dumps({
+        "method": "iqtree_fast", "model": "GTR+G", "search": "five_iterations",
+        "alrt_replicates": 1000, "bootstrap": None,
+    }))
+    pipeline = service.build_context(job)["pipeline"]
+    assert pipeline["tree_search"] == "five_iterations"
+    note = pipeline["tree_search_note"]
+    # Self-contained: the note has to steer the review even when the installed
+    # copy of SYSTEM_PROMPT predates the field.
+    assert "-n 5" in note and "SEARCH" in note
+    assert "not approximated" in note
+    # A full search declares nothing, rather than declaring itself normal.
+    _write(job / "tree" / "tree_metadata.json", json.dumps({"method": "iqtree"}))
+    full = service.build_context(job)["pipeline"]
+    assert full["tree_search"] is None and full["tree_search_note"] is None
 
 
 def test_iqtree_single_support_is_ufboot_not_classical_bootstrap(tmp_path):
@@ -1252,6 +1353,86 @@ def test_viewer_and_review_resolve_the_same_tree_method(tmp_path):
     assert context["tree"]["support_type"] == service._classify_support(
         [88.0], False, resolved["tree_method"], resolved["alrt_only"]
     )
+
+
+def test_generation_details_report_artifacts_and_applied_model(tmp_path):
+    job_dir = tmp_path / "job"
+    _write(job_dir / "alignment" / "alignment_raw.fasta", ">A\nACGTACGTAA\n>B\nACGTACGTAA\n")
+    _write(job_dir / "alignment" / "alignment_trimmed.fasta", ">A\nACGTAC\n>B\nACGTAC\n")
+    input_info = {
+        "alignment_method": "mafft",
+        "alignment_options": {"tree_method": "iqtree_fast"},
+        "trimming_method": "trimal_gappy",
+        "tree_method": "iqtree_fast",
+        "tree_model": "GTR+G",
+        "trimming_details": {
+            "method": "trimal_gappy",
+            "terminal_overhang_trim": {
+                "enabled": True, "input_columns": 10,
+                "retained_columns": 8, "removed_columns": 2,
+                "left_removed": 1, "right_removed": 1,
+                "min_covered_sequences": 2,
+            },
+        },
+    }
+    _write(job_dir / "input_info.json", json.dumps(input_info))
+    _write(job_dir / "tree" / "tree_metadata.json", json.dumps({
+        "method": "iqtree_fast", "model": "GTR+G",
+        "model_selected": "GTR+F+G4", "support_type": "alrt",
+        "alrt_replicates": 1000, "search": "five_iterations", "seed": 42,
+    }))
+
+    details = service.resolve_tree_generation_context(job_dir, input_info)
+
+    assert details["raw_shape"] == {"sequences": 2, "columns": 10}
+    assert details["final_shape"] == {"sequences": 2, "columns": 6}
+    assert details["model_value"] == "GTR+F+G4"
+    assert "Requested GTR+G" in details["model_note"]
+    assert details["advanced_alignment_options"] == {}
+    assert "SH-aLRT" in details["support_value"]
+    assert "five iterations" in details["run_details"][0]
+
+
+def test_generation_details_recover_raxml_automre_count_and_convergence(tmp_path):
+    job_dir = tmp_path / "job"
+    _write(job_dir / "input_info.json", json.dumps({
+        "tree_method": "raxml", "tree_model": "GTR+G",
+        "trimming_method": "none",
+    }))
+    _write(job_dir / "tree" / "tree_metadata.json", json.dumps({
+        "method": "raxml", "model": "GTR+G", "support_type": "bootstrap",
+        "bootstrap_spec": "autoMRE{1000}",
+        "parameters_applied": {"bootstrap_cap": 1000},
+    }))
+    _write(
+        job_dir / "tree" / "raxml_run.raxml.bootstraps",
+        "(A,B);\n(A,B);\n(A,B);\n",
+    )
+    _write(
+        job_dir / "tree" / "raxml_run.raxml.log",
+        "[00:01] Bootstrapping converged after 3 replicates.\n",
+    )
+
+    details = service.resolve_tree_generation_context(job_dir)
+
+    assert details["support_value"] == "3 replicates completed"
+    assert "convergence was reached before the 1,000-replicate cap" in details["support_note"]
+    assert "not because work was skipped" in details["support_note"]
+
+
+def test_generation_details_never_call_an_nj_request_a_substitution_model(tmp_path):
+    job_dir = tmp_path / "job"
+    input_info = {"tree_method": "nj", "tree_model": "GTR+G", "trimming_method": "none"}
+    _write(job_dir / "input_info.json", json.dumps(input_info))
+    _write(job_dir / "tree" / "tree_metadata.json", json.dumps({
+        "method": "nj", "model": "GTR+G", "distance_model": "K2P",
+    }))
+
+    details = service.resolve_tree_generation_context(job_dir, input_info)
+
+    assert details["model_label"] == "Distance model"
+    assert details["model_value"] == "K2P"
+    assert details["requested_model"] is None
 
 
 # ---------------------------------------------------------------------------

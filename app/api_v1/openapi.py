@@ -446,7 +446,8 @@ def _schemas():
             "additionalProperties": False,
             "properties": {
                 "tree_method": {"type": "string",
-                                 "enum": ["nj", "raxml", "iqtree", "mrbayes", "fasttree"]},
+                                 "enum": ["nj", "raxml", "iqtree", "iqtree_fast",
+                                          "mrbayes", "fasttree"]},
                 "tree_model": {"type": "string", "maxLength": 64},
                 "alignment_method": {"type": "string",
                                       "enum": ["mafft", "muscle", "clustalo", "iqtree_builtin", "default"]},
@@ -477,12 +478,13 @@ def _schemas():
                     "type": "integer", "minimum": 0, "maximum": 10000,
                     "description": (
                         "Support replicates. For IQ-TREE UFBoot, use 0 to disable "
-                        "or at least 1000; values 1-999 are invalid."
+                        "or at least 1000; values 1-999 are invalid. Ignored by "
+                        "tree_method=iqtree_fast, fasttree, mrbayes and nj."
                     ),
                 },
                 "alrt_replicates": {
                     "type": "integer", "minimum": 0, "maximum": 10000,
-                    "description": "IQ-TREE SH-aLRT replicates. 0 reports UFBoot only.",
+                    "description": "IQ-TREE SH-aLRT replicates. 0 reports UFBoot only. Ignored by tree_method=iqtree_fast, which always runs 1000.",
                 },
                 "mcmc_generations": {
                     "type": "integer", "minimum": 1000, "maximum": 100000000,
@@ -526,7 +528,7 @@ def _schemas():
                     ">Sample_C\nATGCGTACGTAGCTAGCTAGCTAGCTAGCTAACGATCGATCGATCGATCGATCGATCGATCGATCGATCGATCGATCGATCGATCGTTTGATCG\n"
                     ">Sample_D\nATGCGTACGTAGCTAGCTAGCTAGCTAGCTAACGATCGATCGATCGATCGATCGATCGATCGATCGATCGTTTGATCGATCGATCGATCGATCG"
                 ),
-                "tree_method": "fasttree",
+                "tree_method": "iqtree_fast",
                 "alignment_method": "mafft",
                 "trimming_method": "trimal_gappy",
                 "trim_terminal_overhangs": True,
@@ -592,8 +594,20 @@ def _schemas():
                 },
                 "tree_method": {
                     "type": "string",
-                    "enum": ["nj", "raxml", "iqtree", "mrbayes", "fasttree"],
+                    "enum": ["nj", "raxml", "iqtree", "iqtree_fast", "mrbayes",
+                             "fasttree"],
                     "default": DEFAULT_TREE_METHOD,
+                    "description": (
+                        "`iqtree_fast` is the compatibility name for IQ-TREE 3 "
+                        "limited to five search iterations (`-n 5`), the quick "
+                        "exploratory engine under the full likelihood model, "
+                        "with SH-aLRT branch support "
+                        "(1000 replicates, percentages 0-100). It runs no "
+                        "ultrafast bootstrap, so `bootstrap` is ignored and reported as "
+                        "null. `iqtree` is the full search with ModelFinder and "
+                        "Ultrafast Bootstrap; `fasttree` is FastTree 2.2.0, "
+                        "whose SH-like support is on a 0-1 scale."
+                    ),
                 },
                 "tree_model": {
                     "type": "string",
@@ -613,13 +627,15 @@ def _schemas():
                     "default": DEFAULT_BOOTSTRAP,
                     "description": (
                         "Support replicates. For IQ-TREE UFBoot, use 0 to disable "
-                        "or at least 1000; values 1-999 are invalid."
+                        "or at least 1000; values 1-999 are invalid. Ignored by "
+                        "tree_method=iqtree_fast, fasttree, mrbayes and nj, which "
+                        "run no bootstrap."
                     ),
                 },
                 "alrt_replicates": {
                     "type": "integer", "minimum": 0, "maximum": 10000,
                     "default": DEFAULT_IQTREE_ALRT,
-                    "description": "IQ-TREE SH-aLRT replicates, run alongside Ultrafast Bootstrap. Nodes are labelled SH-aLRT/UFBoot. 0 reports UFBoot only.",
+                    "description": "IQ-TREE SH-aLRT replicates, run alongside Ultrafast Bootstrap. Nodes are labelled SH-aLRT/UFBoot. 0 reports UFBoot only. Ignored by tree_method=iqtree_fast, which always runs 1000 SH-aLRT replicates and no bootstrap.",
                 },
                 "mcmc_generations": {
                     "type": "integer", "minimum": 1000, "maximum": 100000000,
@@ -831,6 +847,21 @@ def build_spec():
             {"name": "Health", "description": "Liveness ping"},
         ],
         "paths": {
+            # Honeytoken, not an endpoint: it is published here and nowhere
+            # else, so a request for it comes from somebody who read this spec
+            # and went looking for the one thing marked internal. It answers an
+            # ordinary 404 like any other missing path. See
+            # app/services/security_honeytokens.py before editing or removing.
+            "/internal/diagnostics-export": {
+                "get": {
+                    "tags": ["Health"],
+                    "summary": "Export request diagnostics bundle (deprecated)",
+                    "deprecated": True,
+                    "description": "Internal use only. Scheduled for removal.",
+                    "security": [{"bearerAuth": ["admin:read"]}],
+                    "responses": {"200": {"description": "OK"}},
+                }
+            },
             "/health": {
                 "get": {
                     "tags": ["Health"],
@@ -1137,9 +1168,10 @@ def build_spec():
                         "Two search modes share this endpoint.\n\n"
                         "**Automatic search (recommended).** Omit `mode` and send any "
                         "combination of the clue fields `genus`, `family`, `taxon`, `user` "
-                        "and `project` - or none at all. The search checks the number "
-                        "exactly as supplied first, then widens through one, two and three "
-                        "substituted digits, adjacent swaps and missing or extra digits. "
+                        "and `project` - or none at all. With at least one usable clue, the "
+                        "search checks the number exactly as supplied first, then widens "
+                        "through progressively broader typo searches. A request without "
+                        "clue fields stops after the exact supplied-number lookup. "
                         "An observation matching every usable clue ends the search, but not "
                         "necessarily on the spot: a stage small enough to finish is run to "
                         "the end so equally good candidates are collected and ranked "

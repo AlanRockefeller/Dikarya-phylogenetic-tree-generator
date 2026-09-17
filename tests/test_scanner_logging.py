@@ -187,10 +187,32 @@ class ScannerClassificationTests(unittest.TestCase):
         self.assertEqual((bucket, reason), (BUCKET_SCANNER, "known_scanner_path"))
 
     def test_traversal_still_outranks_the_verb(self):
+        # Traversal beats the sweep signature, whichever traversal reason it
+        # earns. This one starts from /job, so it is the app-surface variant:
+        # climbing out of a job artifact route is aimed at Dikarya, not at
+        # whatever happens to answer on port 443.
         bucket, reason = classify_request_failure(
             path="/job/../../etc/passwd", method="PROPFIND", status=404
         )
-        self.assertEqual((bucket, reason), (BUCKET_TARGETED, "path_traversal"))
+        self.assertEqual(
+            (bucket, reason), (BUCKET_TARGETED, "path_traversal_app_surface")
+        )
+
+    def test_generic_traversal_is_separated_from_traversal_aimed_at_us(self):
+        # A sweep asks every host on the internet for /etc/passwd; only
+        # somebody who has looked at this app climbs out of a job route. The
+        # two are reported under different reasons because they are different
+        # events, and the second one is worth far more to the actor score.
+        generic, generic_reason = classify_request_failure(
+            path="/etc/passwd", status=404
+        )
+        self.assertEqual((generic, generic_reason), (BUCKET_TARGETED, "path_traversal"))
+        aimed, aimed_reason = classify_request_failure(
+            path="/api/job/aq7c/download/../../../../proc/self/environ", status=404
+        )
+        self.assertEqual(
+            (aimed, aimed_reason), (BUCKET_TARGETED, "path_traversal_app_surface")
+        )
 
     def test_an_ordinary_user_error_is_neither(self):
         bucket, reason = classify_request_failure(
@@ -227,9 +249,13 @@ class RequestDiagnosticsWiringTests(unittest.TestCase):
         """
         source = open(request_diagnostics.__file__).read()
         classify_index = source.index("bucket, reason = _classify(app, status)")
-        window = source[classify_index:classify_index + 1200]
-        # The scanner branch sits beside the targeted one, before the
-        # unmatched-route early return.
+        # Widened from 1200: the honeytoken check and the path-crowd lookup sit
+        # between the classify call and the logging branches, and the actor
+        # scoring sits between those branches and the early return. The
+        # invariant under test is unchanged -- the scanner branch is still
+        # beside the targeted one and still ahead of the unmatched-route
+        # early return.
+        window = source[classify_index:classify_index + 4200]
         self.assertIn("elif bucket == BUCKET_SCANNER:", window)
         self.assertLess(
             window.index("elif bucket == BUCKET_SCANNER:"),

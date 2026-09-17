@@ -201,10 +201,13 @@ OBSERVATIONS_SUBPAGES = {"identify", "upload", "export", "new", "search"}
 
 class InatTreeError(Exception):
     """User-facing application error with an HTTP status and safe details."""
-    def __init__(self, message, status=400, details=None):
+    def __init__(self, message, status=400, details=None, failure_code=None):
         super().__init__(message)
         self.status = status
         self.details = details
+        # Stable, input-free diagnostics for expected rejections.  The request
+        # logger deliberately never copies user-entered URLs or response text.
+        self.failure_code = failure_code
 
 
 class InatDeadlineExceeded(InatTreeError):
@@ -255,15 +258,27 @@ def parse_single_observation_input(raw: str) -> int:
 def parse_inaturalist_tree_input(raw_input: str) -> Dict[str, Any]:
     """Classify Tree Builder iNaturalist one-click input without API calls."""
     if raw_input is None:
-        raise InatTreeError("No iNaturalist input provided.")
+        raise InatTreeError(
+            "No iNaturalist input provided.",
+            failure_code="inat_tree_input_missing",
+        )
     raw = str(raw_input).strip()
     if not raw:
-        raise InatTreeError("No iNaturalist input provided.")
+        raise InatTreeError(
+            "No iNaturalist input provided.",
+            failure_code="inat_tree_input_missing",
+        )
     if len(raw) > MAX_RAW_INPUT_LEN:
-        raise InatTreeError("Input is too long.")
+        raise InatTreeError(
+            "Input is too long.",
+            failure_code="inat_tree_input_too_long",
+        )
     if raw.isdigit():
         if len(raw) > 12:
-            raise InatTreeError("iNaturalist observation ID is implausibly long.")
+            raise InatTreeError(
+                "iNaturalist observation ID is implausibly long.",
+                failure_code="inat_tree_observation_id_too_long",
+            )
         return {
             "type": "single_observation",
             "observation_id": int(raw),
@@ -278,7 +293,10 @@ def parse_inaturalist_tree_input(raw_input: str) -> Dict[str, Any]:
         parsed = urllib.parse.urlparse(urlish)
         host = (parsed.hostname or "").lower()
         if host not in {"inaturalist.org", "www.inaturalist.org"}:
-            raise InatTreeError("Only inaturalist.org URLs are accepted.")
+            raise InatTreeError(
+                "Only inaturalist.org URLs are accepted.",
+                failure_code="inat_tree_foreign_url",
+            )
         path_parts = [
             urllib.parse.unquote(part)
             for part in (parsed.path or "").split("/")
@@ -287,12 +305,22 @@ def parse_inaturalist_tree_input(raw_input: str) -> Dict[str, Any]:
         query_params = urllib.parse.parse_qs(parsed.query or "", keep_blank_values=True)
         if len(path_parts) >= 2 and path_parts[0].lower() == "observations":
             token = path_parts[1].strip()
-            if token.isdigit():
+            # A URL copied out of prose commonly carries the sentence's final
+            # period. Observation path components are numeric, so accepting one
+            # terminal period is unambiguous and does not loosen usernames or
+            # any other URL shape.
+            has_terminal_period = (
+                token.endswith(".")
+                and len(path_parts) == 2
+                and (parsed.path or "").endswith(".")
+            )
+            observation_token = token[:-1] if has_terminal_period else token
+            if observation_token.isdigit():
                 return {
                     "type": "single_observation",
-                    "observation_id": int(token),
+                    "observation_id": int(observation_token),
                     "raw": raw,
-                    "normalized": f"https://www.inaturalist.org/observations/{int(token)}",
+                    "normalized": f"https://www.inaturalist.org/observations/{int(observation_token)}",
                 }
             # /observations/<login> names a user, but /observations/identify and
             # its siblings are tool pages -- the user there is in the query
@@ -350,10 +378,16 @@ def parse_inaturalist_tree_input(raw_input: str) -> Dict[str, Any]:
                 "normalized": path_parts[1].strip(),
                 "source": "projects_path",
             }
-        raise InatTreeError("That iNaturalist URL is not supported for one-click trees.")
+        raise InatTreeError(
+            "That iNaturalist URL is not supported for one-click trees.",
+            failure_code="inat_tree_url_unsupported",
+        )
 
     if not PLAIN_TOKEN_RE.match(raw):
-        raise InatTreeError("Enter an observation ID, iNaturalist username, project name, or iNaturalist URL.")
+        raise InatTreeError(
+            "Enter an observation ID, iNaturalist username, project name, or iNaturalist URL.",
+            failure_code="inat_tree_input_invalid",
+        )
     return {
         "type": "plain_candidate",
         "value": re.sub(r"\s+", " ", raw).strip(),
@@ -927,7 +961,23 @@ def preview_inaturalist_tree_input(raw_input: str,
         }
 
     resolved = resolve_inaturalist_user_or_project(parsed, preferred_type=resolved_type)
-    if resolved.get("type") in {"ambiguous", "not_found"}:
+    if resolved.get("type") == "not_found":
+        # This is an HTTP-200 preview outcome, so the ordinary failed-request
+        # logger cannot see it. Record the bounded original input so an operator
+        # can distinguish an actual missing account from a parser/usability bug.
+        # %r escapes newlines and other controls instead of letting input forge
+        # additional log lines.
+        logged_input = str(raw_input)[:MAX_RAW_INPUT_LEN]
+        logger.warning(
+            "event=inat_tree.preview_not_found input_type=%s input_source=%s "
+            "preferred_type=%s input=%r",
+            parsed.get("type") or "unknown",
+            parsed.get("source") or "none",
+            (resolved_type or "none").strip().lower(),
+            logged_input,
+        )
+        return {"status": "success", **resolved}
+    if resolved.get("type") == "ambiguous":
         return {"status": "success", **resolved}
     scope = resolved["scope"]
     counts = count_tree_eligible_observations(scope)
@@ -1034,7 +1084,7 @@ DEFAULT_TREE_PARAMS = {
     "alignment_method": "mafft",
     "trimming_method": "trimal_gappy",
     "trim_terminal_overhangs": True,
-    "tree_method": "fasttree",
+    "tree_method": "iqtree_fast",
     "tree_model": "GTR+G",
     "bootstrap": 1000,
     "mcmc_generations": Config.DEFAULT_MCMC_GENERATIONS,
@@ -1644,9 +1694,17 @@ def _create_mycomap_blast_from_observation(observation: Dict[str, Any],
                                            observation_id: int, *,
                                            mycomap_local_limit=None,
                                            mycomap_ncbi_limit=None,
-                                           pending_creation_details=None
+                                           pending_creation_details=None,
+                                           write_inat_field: bool = True
                                            ) -> Dict[str, Any]:
-    """Create a MycoMap search from an observation's ITS and write its URL back."""
+    """Create a MycoMap search from an observation's ITS and write its URL back.
+
+    ``write_inat_field=False`` creates and uses the search exactly as normal but
+    leaves the observation's Mycomap BLAST Results field untouched. That is for
+    an observation whose saved value is a mycomap.org URL this app cannot
+    resolve yet: the .org value is correct and the user's, so we build the tree
+    from our own replacement .com search rather than overwriting theirs.
+    """
     from app.services.fasta_utils import clean_dna_sequence
     from app.services.mycomap_service import (
         advance_mycomap_creation_discovery,
@@ -1744,12 +1802,13 @@ def _create_mycomap_blast_from_observation(observation: Dict[str, Any],
         raise InatTreeError(
             "MycoMap did not return a usable BLAST Results URL.", status=502
         )
-    set_result = set_observation_field_value(
-        observation_id, MYCOMAP_BLAST_FIELD_NAME, mycomap_url
-    )
     field_value_id = None
-    if isinstance(set_result, dict):
-        field_value_id = set_result.get("id") or set_result.get("uuid")
+    if write_inat_field:
+        set_result = set_observation_field_value(
+            observation_id, MYCOMAP_BLAST_FIELD_NAME, mycomap_url
+        )
+        if isinstance(set_result, dict):
+            field_value_id = set_result.get("id") or set_result.get("uuid")
     return {
         "local_limit": created.get("local_limit"),
         "ncbi_limit": created.get("ncbi_limit"),
@@ -1761,7 +1820,7 @@ def _create_mycomap_blast_from_observation(observation: Dict[str, Any],
         "auto_created": True,
         "created_blast_id": blast_id,
         "created_mycomap_url": mycomap_url,
-        "inat_mycomap_field_status": "success",
+        "inat_mycomap_field_status": "success" if write_inat_field else "preserved",
         "inat_mycomap_field_value_id": field_value_id,
         "ncbi_poll_attempt": 0,
     }
@@ -2225,23 +2284,56 @@ def prepare_inat_tree_job(observation_id: int, *, include_ncbi: bool = True,
         # observation still has its ITS barcode, recover automatically by
         # creating a current search and replacing the field when it appears.
         from app.services.fasta_utils import clean_dna_sequence
+        from app.services.mycomap_service import is_mycomap_org_url
         raw_its = extract_observation_field_value(
             observation, DNA_BARCODE_ITS_FIELD_NAME,
         )
-        if clean_dna_sequence(raw_its or ""):
+        # Alan 9/16/26 - A mycomap.org URL is a CORRECT value that this app
+        # cannot resolve yet, not a broken one. Build the tree from our own
+        # replacement .com search as usual, but never write that .com URL over
+        # the user's .org value -- doing so destroyed the stored value on
+        # observation 333807166 on 2026-09-15. Drop the preserve_saved_url
+        # branch once .org URLs validate directly.
+        preserve_saved_url = is_mycomap_org_url(mycomap_url)
+        # A preserved .org value stays in the field, so this branch is
+        # re-entered on every deferred rerun. Reuse the replacement search the
+        # earlier pass already created instead of creating a second one.
+        saved_created_url = str(
+            (mycomap_rerun_details or {}).get("created_mycomap_url") or ""
+        ).strip()
+        reused_blast_id = (
+            validate_mycomap_url(saved_created_url, quiet=True)
+            if saved_created_url
+            else None
+        )
+        if reused_blast_id:
+            mycomap_url = saved_created_url
+            blast_id = reused_blast_id
+        elif clean_dna_sequence(raw_its or ""):
             from app.services.log_context import log_degradation
-            log_degradation(
-                logger,
-                "invalid_mycomap_url_replaced",
-                "Saved MycoMap URL was unusable; creating a replacement search from ITS",
-                observation_id=observation_id,
-            )
+            if preserve_saved_url:
+                log_degradation(
+                    logger,
+                    "mycomap_org_url_not_supported",
+                    "Saved MycoMap URL is a mycomap.org link this app cannot "
+                    "resolve yet; building from a replacement search and "
+                    "leaving the saved value unchanged",
+                    observation_id=observation_id,
+                )
+            else:
+                log_degradation(
+                    logger,
+                    "invalid_mycomap_url_replaced",
+                    "Saved MycoMap URL was unusable; creating a replacement search from ITS",
+                    observation_id=observation_id,
+                )
             mycomap_rerun_details = _create_mycomap_blast_from_observation(
                 observation,
                 observation_id,
                 mycomap_local_limit=mycomap_local_limit,
                 mycomap_ncbi_limit=mycomap_ncbi_limit,
                 pending_creation_details=mycomap_rerun_details,
+                write_inat_field=not preserve_saved_url,
             )
             return {
                 "status": "waiting_for_ncbi",
@@ -2250,13 +2342,14 @@ def prepare_inat_tree_job(observation_id: int, *, include_ncbi: bool = True,
                 "mycomap_blast_url": mycomap_rerun_details["created_mycomap_url"],
                 "mycomap_rerun_details": mycomap_rerun_details,
             }
-        raise InatTreeError(
-            "The observation's Mycomap BLAST Results field does not "
-            "contain a valid MycoMap BLAST URL. Edit that iNaturalist field "
-            "to contain the complete MycoMap result-page URL ending in an "
-            "r-number, then retry the tree job.",
-            status=422,
-        )
+        else:
+            raise InatTreeError(
+                "The observation's Mycomap BLAST Results field does not "
+                "contain a valid MycoMap BLAST URL. Edit that iNaturalist field "
+                "to contain the complete MycoMap result-page URL ending in an "
+                "r-number, then retry the tree job.",
+                status=422,
+            )
 
     if skip_mycomap_refresh:
         mycomap_rerun_details = dict(mycomap_rerun_details or {})

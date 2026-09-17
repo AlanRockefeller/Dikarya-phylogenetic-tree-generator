@@ -61,6 +61,11 @@ _TRIMMING_STAGE_TOOL = {
 _TREE_STAGE_TOOL = {
     "raxml": "RAxML",
     "iqtree": "IQ-TREE",
+    # Quick Tree is the same executable under the same IQ-TREE budget. It is far
+    # quicker in practice, but the budget is a ceiling, not an estimate, and
+    # giving the Quick Tree engine its own smaller one would only turn a slow
+    # run into a killed one.
+    "iqtree_fast": "IQ-TREE",
     "mrbayes": "MrBayes",
     "fasttree": "FastTree",
     # Neighbour-joining is computed in-process, so it has no tool budget of its
@@ -242,6 +247,9 @@ def prepare_phylo_job_params(job_params: Dict[str, Any]) -> None:
 # durations. Tree method dominates and size is secondary:
 #
 #     fasttree   n=181   p50=   25s   p90=  57s   max=  143s
+#                        (iqtree_fast, which replaced FastTree as the Quick
+#                        Tree engine, benchmarked in the same 2-40s band and
+#                        is routed the same way)
 #     none       n= 94   p50=   58s   p90=  81s   max=  190s
 #     iqtree     n= 14   p50=  124s   p90=1292s   max= 2554s
 #     raxml      n=  7   p50= 1279s   p90=9276s   max= 9276s

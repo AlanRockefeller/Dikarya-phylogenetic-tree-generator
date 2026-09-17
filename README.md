@@ -38,16 +38,16 @@ paths in `.env` when they are not on `PATH`.
 | MAFFT | Default multiple-sequence alignment | `MAFFT_BINARY` |
 | MUSCLE 5 | Optional alignment | `MUSCLE_BINARY` |
 | Clustal Omega | Optional alignment | `CLUSTALO_BINARY` |
-| IQ-TREE 2 | Optional alignment/tree workflows | `IQTREE_BINARY` |
+| IQ-TREE 3 | Quick Tree (five-iteration search), optional alignment/tree workflows | `IQTREE_BINARY` |
 | RAxML-NG | Maximum-likelihood tree building | `RAXML_BINARY` |
 | MrBayes | Bayesian tree building | `MRBAYES_BINARY` |
-| FastTree | Quick tree building | `FASTTREE_BINARY` |
+| FastTree | Optional fast tree building | `FASTTREE_BINARY` |
 | trimAl | Optional alignment trimming | `TRIMAL_BINARY` |
 | BMGE | Optional alignment trimming; a runnable wrapper may be used | `BMGE_BINARY` |
 
 Only the tools selected for a job are invoked. The one-click tree flows use
-MAFFT and FastTree by default, so those two programs are the practical minimum
-for that workflow. NCBI BLAST is accessed remotely and does not require a local
+MAFFT and IQ-TREE's five-iteration search by default, so those two programs are the practical
+minimum for that workflow. NCBI BLAST is accessed remotely and does not require a local
 BLAST+ installation.
 
 ## Installation

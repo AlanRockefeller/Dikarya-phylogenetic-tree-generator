@@ -580,7 +580,8 @@ _PROGRESS_PATTERNS = (
     # RAxML-NG: "[00:12:03] Bootstrap tree #850, logLikelihood: -3156.4"
     ("raxml", re.compile(r"Bootstrap tree #(\d+)"), "Bootstrap replicate", "bootstrap"),
     ("raxml", re.compile(r"ML tree search #(\d+)"), "ML tree search", "ml_search"),
-    # IQ-TREE: "BOOTSTRAP REPLICATE 120" / "Iteration 250 / LogL: ..."
+    # IQ-TREE: "BOOTSTRAP REPLICATE 120" / "Iteration 5 / LogL: ...". The
+    # Quick Tree preset can emit the latter before its fixed five-iteration stop.
     ("iqtree", re.compile(r"BOOTSTRAP REPLICATE (\d+)"), "Bootstrap replicate", "bootstrap"),
     ("iqtree", re.compile(r"Iteration (\d+) / LogL"), "Search iteration", "iteration"),
     # MrBayes: "      500000 -- (-3211.123) ..."
@@ -594,7 +595,7 @@ def _tool_progress(job_id, options):
     """Best-effort "how far along is the tree builder" reading.
 
     Tails the tool's own log for a counter line. Returns None when the running
-    tool publishes no countable progress (FastTree, MAFFT, trimAl), which is
+    tool publishes no countable progress (FastTree, MAFFT, and trimAl), which is
     normal and not an error.
     """
     try:

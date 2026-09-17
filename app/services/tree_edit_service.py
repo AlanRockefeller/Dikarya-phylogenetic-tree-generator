@@ -1888,7 +1888,7 @@ def _recompute_tree_staged(
     trim_terminal_overhangs = bool(trim_params.trim_terminal_overhangs)
     should_trim, trim_label, trim_tool = describe_trim_step(trim_method, trim_terminal_overhangs)
     if not should_trim:
-        run_trimming(
+        trim_stats = run_trimming(
             alignment_pruned_aligned_path,
             alignment_pruned_trimmed_path,
             trim_method,
@@ -1932,6 +1932,11 @@ def _recompute_tree_staged(
         logger,
         job_id=event_job_id
     )
+    # The displayed tree now belongs to this recomputed alignment, not to the
+    # original job's trimming pass. Keep its stage statistics beside the tree
+    # metadata so Generation Details never combines new final dimensions with
+    # the old terminal-crop counts.
+    metadata["trimming_details"] = trim_stats
     finish_step("tree", "Tree generated")
     overview(f"Tree rebuilt using {tree_method.upper()}")
     

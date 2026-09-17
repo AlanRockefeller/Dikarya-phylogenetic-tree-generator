@@ -100,6 +100,51 @@ _TRAVERSAL_RE = re.compile(
     re.IGNORECASE,
 )
 _NULL_BYTE_RE = re.compile(r"(?:%00|\x00)")
+
+# Traversal aimed at *this* app rather than at whatever happens to answer on
+# port 443. A sweep asks for /etc/passwd on every host it can reach; only
+# somebody who has looked at Dikarya walks upward out of a job artifact route.
+# The distinction is worth making because the second one is a person.
+_APP_TRAVERSAL_SURFACE_RE = re.compile(
+    r"^/(?:api/)?(?:job|files|thumb|download|static)\b", re.IGNORECASE,
+)
+
+# Dikarya's own on-disk layout. These names exist in AGENTS.md, in this
+# repository and in the job directories -- and in no vulnerability scanner's
+# dictionary anywhere, because they are not a product anyone else runs. A
+# request naming one is a request from somebody who has read how this app
+# stores its work, so it is reported whatever else the path looks like.
+_ARTIFACT_PATH_RE = re.compile(
+    r"(?:input_info\.json|tree_state\.json|input_raw\.fasta|"
+    r"alignment_raw\.fasta|alignment_trimmed\.fasta|alignment_pruned|"
+    r"tree_original\.(?:newick|nexus)|tree_pruned\.(?:newick|nexus)|"
+    r"tree_metadata\.json|blast_results\.json|sequence_names\.tsv|"
+    r"var/jobs|logs/(?:pipeline|alignment|tree_builder)\.log)",
+    re.IGNORECASE,
+)
+
+# The bioinformatics toolchain this app shells out to. Every one of these runs
+# as a subprocess on the worker with a user-influenced input file, so a probe
+# naming a binary, or shaped like an attempt to smuggle an argument into one,
+# is an attack on the part of Dikarya that actually executes things. Argument
+# injection is the realistic vector: no route takes a command line, but several
+# take values that become one (an outgroup label, a preset name, a model
+# string), and a value that starts with a dash is how that gets tested.
+_TOOL_BINARY_RE = re.compile(
+    r"(?:\b(?:mafft|raxml(?:-ng|hpc)?|iqtree[23]?|fasttree|trimal|muscle|"
+    r"clustalo|clustalw|mrbayes|blastn|blastp|tblastn|makeblastdb|"
+    r"blastdbcmd|efetch|esearch)\b)",
+    re.IGNORECASE,
+)
+_TOOL_ARGUMENT_RE = re.compile(
+    # A flag no route accepts, aimed at the tools that do: the file-redirect
+    # and script-execution options are the ones worth naming, because those
+    # are what turn an argument into an arbitrary write or an arbitrary read.
+    r"(?:(?:^|[?&=/\s])--?(?:out|outfile|output|infile|redo|prefix|"
+    r"tree-file|treefile|post|script|exec|cmd|seed|nt|threads)\b"
+    r"|\$\(|`|\|\s*(?:sh|bash)\b)",
+    re.IGNORECASE,
+)
 # Template, script and SQL injection probes. Deliberately narrow: these are
 # shapes no legitimate Dikarya URL contains, not a general WAF ruleset.
 _INJECTION_RE = re.compile(
@@ -119,11 +164,25 @@ _APP_SURFACE_PREFIXES = ("/api/", "/job/", "/admin/", "/health", "/auth/")
 # Reason codes, stable so they can be grepped and counted.
 TARGETED_REASONS = (
     "path_traversal",
+    # Traversal against Dikarya's own routes rather than a generic host path.
+    "path_traversal_app_surface",
     "null_byte",
     "injection_probe",
+    # Someone naming this app's artifact layout or the binaries it executes.
+    "artifact_path_probe",
+    "tool_exploit_probe",
     "api_surface_probe",
     "admin_probe",
     "job_id_malformed",
+    # A path that only appears in this app's own output (robots.txt trap,
+    # decoy id in the viewer, retired stub in the OpenAPI document), so
+    # fetching one proves the client read a response rather than a dictionary.
+    "honeytoken",
+    # Reported by the code that refused the attempt, not by URL inspection:
+    # a resolved path that escaped var/jobs, an argument smuggled toward a
+    # tool subprocess. See request_diagnostics.note_attack_attempt().
+    "path_escape_refused",
+    "argument_injection_refused",
 )
 
 # Alan 9/12/26 - A plain 401/403 on a real route is deliberately NOT a targeted
@@ -190,6 +249,38 @@ def _scanner_reason(path_lower, user_agent, status, method):
     return None
 
 
+def looks_weaponized(value):
+    """Is this rejected value a typo, or an attempt at the tool behind it?
+
+    The pipeline's validators refuse plenty of ordinary mistakes -- a model
+    name spelled wrong, a preset that no longer exists -- and reporting those
+    as attacks would bury the real ones instantly. A value is only worth
+    reporting when it carries something that has no meaning as a *value* and
+    every meaning as an *argument*: a leading flag, a shell metacharacter, a
+    traversal sequence, a null byte, a path into the filesystem.
+
+    Used by the tree-builder and RAxML validators, which run in the worker as
+    well as in a request, so this stays free of Flask like the rest of the
+    module.
+    """
+    text = str(value or "")
+    if not text:
+        return False
+    if _TRAVERSAL_RE.search(text) or _NULL_BYTE_RE.search(text):
+        return True
+    if _INJECTION_RE.search(text) or _TOOL_ARGUMENT_RE.search(text):
+        return True
+    # A value that begins with a dash is the classic argument smuggle: it is
+    # the one shape that changes meaning when it reaches an argv list.
+    if text.lstrip().startswith("-"):
+        return True
+    # A path separator, but not one inside a RAxML-NG brace block: those are
+    # legitimate vector separators (GTR{1.0/2.0/1.5}), and a rejected model
+    # carrying one is a malformed rate vector, not an attack.
+    outside_braces = re.sub(r"\{[^{}]*\}", "", text)
+    return "/" in outside_braces or "\\" in outside_braces
+
+
 def normalize_method(value):
     """Bound an untrusted REQUEST_METHOD without changing what it means.
 
@@ -247,6 +338,11 @@ def classify_request_failure(
 
     # --- targeted signals first, whatever the path looks like otherwise ---
     if _TRAVERSAL_RE.search(probe_text):
+        # Both are reported; they are separated because they are different
+        # events. Generic traversal is one line in a sweep of thousands of
+        # hosts. Traversal that starts from a job artifact route is aimed here.
+        if _APP_TRAVERSAL_SURFACE_RE.match(lower):
+            return BUCKET_TARGETED, "path_traversal_app_surface"
         return BUCKET_TARGETED, "path_traversal"
     if _NULL_BYTE_RE.search(probe_text):
         return BUCKET_TARGETED, "null_byte"
@@ -261,6 +357,15 @@ def classify_request_failure(
         return BUCKET_TARGETED, "job_id_malformed"
 
     if matched_route is None:
+        # Only on an UNMATCHED path. Dikarya's own routes legitimately carry
+        # these words -- /job/<id>/download/mrbayes is a real download, and
+        # /files/<path:filename> serves arbitrary file names -- so testing a
+        # matched route here would report the app's own traffic as an attack.
+        # Nothing that matched a rule needs guessing about.
+        if _ARTIFACT_PATH_RE.search(probe_text):
+            return BUCKET_TARGETED, "artifact_path_probe"
+        if _TOOL_BINARY_RE.search(probe_text) or _TOOL_ARGUMENT_RE.search(probe_text):
+            return BUCKET_TARGETED, "tool_exploit_probe"
         if lower.startswith("/admin/"):
             return BUCKET_TARGETED, "admin_probe"
         if lower.startswith("/api/") and lower.rstrip("/") not in SCANNER_EXACT_PATHS:

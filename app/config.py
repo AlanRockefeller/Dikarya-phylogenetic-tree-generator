@@ -244,7 +244,10 @@ class Config:
     
     # External Tools
     RAXML_BINARY = os.environ.get('RAXML_BINARY', 'raxml-ng')
-    IQTREE_BINARY = os.environ.get('IQTREE_BINARY', 'iqtree2')
+    # IQ-TREE 3 (3.1.4 at /usr/local/bin). /usr/bin/iqtree2 is the old 2.0.7
+    # and must not be used: the limited search is about twice as quick in 3, and
+    # Quick Tree now runs on it.
+    IQTREE_BINARY = os.environ.get('IQTREE_BINARY', '/usr/local/bin/iqtree3')
     MRBAYES_BINARY = os.environ.get('MRBAYES_BINARY', 'mb')
     MAFFT_BINARY = os.environ.get('MAFFT_BINARY', 'mafft')
     MUSCLE_BINARY = os.environ.get('MUSCLE_BINARY', 'muscle')

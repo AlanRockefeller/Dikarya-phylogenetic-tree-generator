@@ -1,7 +1,7 @@
 """Quick Tree accepts barcodes, not genomes -- and never claimed a bootstrap.
 
-Quick Tree is the two-click preset: fixed MAFFT --auto, trimAl, FastTree, no
-parameter form. MAFFT --auto's cost grows with sequence LENGTH as well as
+Quick Tree is the two-click preset: fixed MAFFT --auto, trimAl, and an IQ-TREE 3
+search capped at five iterations, with no parameter form. MAFFT --auto's cost grows with sequence LENGTH as well as
 count, so one pathological record turns a ten-second job into one that holds
 the single worker slot for hours. Measured across the 11,670 job directories on
 disk: 1,515,220 submitted records, 400 of them over 10 kb, the longest a 149 kb
@@ -44,7 +44,7 @@ QUICK_TREE_BODY = {
     "alignment_method": "mafft",
     "trimming_method": "trimal_gappy",
     "trim_terminal_overhangs": True,
-    "tree_method": "fasttree",
+    "tree_method": "iqtree_fast",
     "tree_model": "GTR+G",
     "submission_mode": QUICK_TREE_SUBMISSION_MODE,
 }
@@ -123,8 +123,8 @@ class QuickTreeDetectionTests(unittest.TestCase):
     def test_a_custom_fasttree_request_is_not_quick_tree(self):
         """The false positive that motivated this rewrite.
 
-        FastTree with MUSCLE and no trimming is a deliberate choice, not the
-        preset, and it must not inherit the preset's 10 kb cap.
+        The preset's tree method with MUSCLE and no trimming is a deliberate
+        choice, not the preset, and it must not inherit the preset's 10 kb cap.
         """
         body = dict(UNMARKED_QUICK_TREE_BODY,
                     alignment_method="muscle", trimming_method="none")
@@ -148,7 +148,7 @@ class QuickTreeDetectionTests(unittest.TestCase):
     def test_the_advanced_form_reproducing_the_preset_is_not_capped(self):
         """The case the marker exists for.
 
-        mafft + trimAl-gappy + FastTree + GTR+G is a reasonable thing to pick by
+        mafft + trimAl-gappy + limited IQ-TREE + GTR+G is a reasonable thing to pick by
         hand in the advanced form, and picking it must not silently impose a
         limit the advanced builder has never had. The marker settles it; the
         advanced parameter block settles it for an unmarked request.
@@ -162,7 +162,7 @@ class QuickTreeDetectionTests(unittest.TestCase):
         self.assertFalse(submission_is_quick_tree(unmarked))
 
     def test_another_tree_method_is_never_quick_tree(self):
-        for method in ("raxml", "iqtree", "mrbayes", "nj"):
+        for method in ("raxml", "iqtree", "mrbayes", "nj", "fasttree"):
             self.assertFalse(
                 submission_is_quick_tree(
                     dict(UNMARKED_QUICK_TREE_BODY, tree_method=method)
@@ -333,8 +333,14 @@ class BrowserEnforcementTests(unittest.TestCase):
         self.assertTrue(result["passes"])
 
 
-class QuickTreeFastTreeSupportTests(unittest.TestCase):
-    """FastTree never had a bootstrap, and Quick Tree no longer claims one."""
+class QuickTreeSupportTests(unittest.TestCase):
+    """Quick Tree's engine never had a bootstrap, and never claims one.
+
+    Alan 9/17/26 - The engine is now IQ-TREE 3, which reports SH-aLRT. The
+    Quick Tree preset intentionally omits ultrafast bootstrap. FastTree, the previous engine, had the
+    same property for a different reason (its -boot is SH-like resampling), and
+    is still selectable in the advanced form -- the tests below keep it honest.
+    """
 
     def setUp(self):
         self.html = TEMPLATE.read_text(encoding="utf-8")
@@ -344,7 +350,7 @@ class QuickTreeFastTreeSupportTests(unittest.TestCase):
         for match in re.finditer(r"const payload = \{(.*?)\n        \};",
                                  self.html, re.S):
             body = match.group(1)
-            if "tree_method: 'fasttree'" in body:
+            if "tree_method: 'iqtree_fast'" in body:
                 payloads.append(body)
         return payloads
 
@@ -371,6 +377,13 @@ class QuickTreeFastTreeSupportTests(unittest.TestCase):
         # Removing it from the preset must not remove it from RAxML/IQ-TREE.
         self.assertIn("bootstrap: parseInt(document.getElementById('bootstrap').value)",
                       self.html)
+
+    def test_the_advanced_form_still_offers_fasttree_and_the_fast_method(self):
+        # The preset moved to a limited IQ-TREE search; FastTree stays selectable, and
+        # the new method must be a real option or loading a Quick Tree job into
+        # the Advanced panel would silently recompute it under another builder.
+        self.assertIn('<option value="fasttree"', self.html)
+        self.assertIn('<option value="iqtree_fast"', self.html)
 
     def test_fasttree_metadata_still_reports_sh_like_support(self):
         """The real run_tree_builder, with only the executable stubbed out."""
@@ -419,19 +432,19 @@ class QuickTreeFastTreeSupportTests(unittest.TestCase):
 
 
 class PersistedBootstrapTests(unittest.TestCase):
-    def test_create_job_drops_an_unsent_bootstrap_for_fasttree(self):
+    MARKER = 'if tree_method in ("fasttree", "iqtree_fast") and "bootstrap" not in data:'
+
+    def test_create_job_drops_an_unsent_bootstrap_for_the_no_bootstrap_methods(self):
         source = (REPO / "app" / "api" / "routes.py").read_text(encoding="utf-8")
-        self.assertIn(
-            'if tree_method == "fasttree" and "bootstrap" not in data:', source
-        )
-        index = source.index('if tree_method == "fasttree" and "bootstrap" not in data:')
-        self.assertIn('job_params.pop("bootstrap", None)', source[index:index + 900])
+        self.assertIn(self.MARKER, source)
+        index = source.index(self.MARKER)
+        self.assertIn('job_params.pop("bootstrap", None)', source[index:index + 1000])
 
     def test_an_explicit_bootstrap_is_still_stored(self):
         # The advanced form sends one; dropping it would change what the job
         # page reports for a deliberate choice.
         source = (REPO / "app" / "api" / "routes.py").read_text(encoding="utf-8")
-        index = source.index('if tree_method == "fasttree" and "bootstrap" not in data:')
+        index = source.index(self.MARKER)
         self.assertIn('"bootstrap" not in data', source[index:index + 120])
 
 

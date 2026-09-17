@@ -4024,6 +4024,38 @@ document.addEventListener('DOMContentLoaded', async () => {
             }
         });
 
+        // Re-run this import with the sequence-bearing records that its MycoMap filters excluded.
+        const btnRebuildImportFiltered = getEl('btn-rebuild-with-import-filtered');
+        if (btnRebuildImportFiltered) btnRebuildImportFiltered.addEventListener('click', async () => {
+            if (!confirm(
+                "Start a new job with the restorable import-filtered sequences added back in?\n\n" +
+                "Invalid or sequence-free records cannot be restored. This tree is left unchanged."
+            )) return;
+            btnRebuildImportFiltered.disabled = true;
+            btnRebuildImportFiltered.classList.add('opacity-50', 'cursor-not-allowed');
+            try {
+                const csrf = document.querySelector('meta[name="csrf-token"]')?.getAttribute('content');
+                const headers = { 'Content-Type': 'application/json' };
+                if (csrf) headers['X-CSRFToken'] = csrf;
+                const resp = await fetch(`/api/job/${JOB_ID}/rebuild-with-import-filtered`, {
+                    method: 'POST',
+                    credentials: 'same-origin',
+                    headers
+                });
+                const data = await resp.json().catch(() => ({}));
+                if (!resp.ok) throw new Error(data.error || "Could not start the filtered-sequence rebuild.");
+                showStatus(
+                    `Queued a new tree with ${data.restored_count} import-filtered record(s) restored. Opening it now...`,
+                    "success", 0
+                );
+                setTimeout(() => { window.location.href = data.status_url || `/job/${data.job_id}`; }, 1200);
+            } catch (error) {
+                showStatus(error.message || "Could not start the filtered-sequence rebuild.", "danger", 5000);
+                btnRebuildImportFiltered.disabled = false;
+                btnRebuildImportFiltered.classList.remove('opacity-50', 'cursor-not-allowed');
+            }
+        });
+
         // Alan 5/13/26 - Open the full-screen Alignment Viewer for selected/visible tree tips.
         if (btnAlignmentViewer) btnAlignmentViewer.addEventListener('click', () => {
             if (!viewer || typeof viewer.getVisibleTipOrder !== 'function') {

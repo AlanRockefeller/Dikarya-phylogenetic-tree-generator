@@ -118,6 +118,7 @@ def validate_safe_file_path(path: Path, base_dir: Path) -> bool:
         # 3. Must NOT be a symlink (check before resolve)
         # We start with this because looking at stats of a symlink that points nowhere is tricky
         if path.is_symlink():
+            _note_path_escape("symlink")
             return False
 
         # 2. Must be a file
@@ -129,9 +130,33 @@ def validate_safe_file_path(path: Path, base_dir: Path) -> bool:
         resolved_base = base_dir.resolve()
         
         # Ensure it is strictly inside
-        return resolved_path.is_relative_to(resolved_base)
+        if not resolved_path.is_relative_to(resolved_base):
+            _note_path_escape("outside_base")
+            return False
+        return True
     except Exception:
         return False
+
+
+def _note_path_escape(kind: str) -> None:
+    """Report a refusal that means somebody aimed a path out of var/jobs.
+
+    Only the two outcomes that require intent. A file that simply does not
+    exist is the overwhelmingly common False from this function -- a stale
+    link, a job whose artifact was never written -- and reporting that would
+    make the signal worthless. A path that resolves outside the base directory,
+    or a symlink planted where a job artifact should be, is somebody trying to
+    read something they were not offered.
+
+    Deliberately best-effort: a path check must never fail because reporting
+    failed, and this function is on the download hot path.
+    """
+    try:
+        from app.services.request_diagnostics import note_attack_attempt
+
+        note_attack_attempt("path_escape_refused", kind)
+    except Exception:
+        pass
 
 
 
