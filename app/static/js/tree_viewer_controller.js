@@ -2555,6 +2555,8 @@ document.addEventListener('DOMContentLoaded', async () => {
 
         const initialOptions = {
             showSupport: true,
+            // Alan 9/23/26 - Fade by support ships checked; honour the box if a cached page differs.
+            supportFade: getEl('cb-fade-by-support') ? getEl('cb-fade-by-support').checked : true,
             layout: 'linear',
             alignTips: false,
             // grab initial DOM values
@@ -3793,6 +3795,12 @@ document.addEventListener('DOMContentLoaded', async () => {
             updateOpts();
         });
 
+        // Alan 9/23/26 - Fade by support. Display only; the export follows the same setting.
+        getEl('cb-fade-by-support')?.addEventListener('change', (event) => {
+            if (!viewer) return;
+            viewer.setOptions({ supportFade: !!event.target.checked });
+        });
+
         // SVG Save
         getEl('btn-save-svg')?.addEventListener('click', (e) => {
             e.preventDefault();
@@ -4555,6 +4563,26 @@ document.addEventListener('DOMContentLoaded', async () => {
             }
             else {
                 badge.classList.add('text-gray-800', 'bg-gray-100', 'ring-gray-400/60', 'dark:text-gray-200', 'dark:bg-gray-700/40');
+            }
+        }
+
+        // Alan 9/23/26 - Fade by support can only bin a known support scale. Explain the bins
+        // in the tooltip, and disable the box on trees with no (or mixed) support.
+        const fadeBox = getEl('cb-fade-by-support');
+        const fadeLabel = getEl('label-fade-by-support');
+        if (fadeBox) {
+            const fade = window.describeSupportFade ? window.describeSupportFade(stats.supportType) : null;
+            fadeBox.disabled = !fade;
+            if (fadeLabel) {
+                fadeLabel.classList.toggle('opacity-40', !fade);
+                fadeLabel.classList.toggle('cursor-not-allowed', !fade);
+                fadeLabel.classList.toggle('cursor-pointer', !!fade);
+                fadeLabel.title = fade
+                    ? `Branch opacity by ${fade.statistic} support. `
+                        + fade.rows.map(row => `${row.level}: ${row.text}`).join('; ')
+                        + '. Selected or hovered branches show at full opacity. '
+                        + 'Display only; the tree is unchanged, and exports carry a legend.'
+                    : 'This tree has no single support scale to fade by.';
             }
         }
 

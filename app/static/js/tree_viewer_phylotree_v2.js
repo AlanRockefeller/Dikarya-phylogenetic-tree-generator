@@ -10,15 +10,13 @@
     // effectively zero: FastTree commonly emits values around 1e-8, while IQ-TREE 3 floors
     // them at 1e-6. Use the same near-zero boundary as the tree-analysis metrics so either
     // engine's arbitrary binary resolution is presented as one soft polytomy.
+    // Alan 9/23/26 - This is the ONE definition of "effectively zero-length" in the viewer:
+    // a branch at or below this numerical floor is treated as zero and contracted into a
+    // polytomy (tip components and internal edges alike), and its support label is not drawn.
+    // Anything longer is a real inferred split and is kept; weak ones are faded by support
+    // instead. Must stay equal to NEAR_ZERO_BRANCH_LENGTH in tree_analysis_service.py, with the
+    // same <= comparison, so the viewer and the review agree on what counts as zero.
     const ZERO_LENGTH_POLYTOMY_EPSILON = 1e-6;
-    // Alan 9/23/26 - Support labels are not drawn on a branch at or below this length. Such a
-    // branch cannot carry a single substitution on any alignment Dikarya builds (it would need
-    // 1e5 columns), so its support scores an arbitrary split of near-identical sequences and is
-    // uninformative -- a Quick Tree of one species printed "0" on 60% of its nodes. Looser than
-    // the polytomy epsilon on purpose: IQ-TREE also leaves such branches at 1-2.5e-6. A label that
-    // displays as zero is dropped too (see _addSupportLabels), since a blank already reads as
-    // unsupported.
-    const SUPPORT_LABEL_MIN_BRANCH_LENGTH = 1e-5;
 
     // Alan 8/24/26 - Say why a phylotree instance is not usable, or null when it is.
     // phylotree.js does not throw on a truncated or otherwise unparseable Newick: its
@@ -241,13 +239,15 @@
             label: 'SH-aLRT',
             tooltip: 'IQ-TREE SH-aLRT branch test (0-100), written when -alrt ran without ultrafast '
                 + 'bootstrap. A likelihood-ratio test of the branch, not a bootstrap proportion; the '
-                + 'conventional cutoff is 80.'
+                + 'conventional cutoff is 80. '
+                + 'SH-aLRT is a local branch-support test; high support indicates strong preference for this split over its local alternatives, not certainty that the overall topology is correct.'
         },
         ALRT_UFBOOT: {
             label: 'SH-aLRT / UFBoot',
             tooltip: 'IQ-TREE dual support, shown as SH-aLRT/UFBoot. Both are percentages (0-100). '
                 + 'A clade is normally called well supported when SH-aLRT is at least 80 AND UFBoot is at least 95. '
-                + 'The threshold filter applies to the UFBoot half.'
+                + 'The threshold filter applies to the UFBoot half. '
+                + 'SH-aLRT is a local branch-support test; high support indicates strong preference for this split over its local alternatives, not certainty that the overall topology is correct.'
         },
         mixed: {
             label: 'Mixed',
@@ -314,6 +314,77 @@
             return values.some(v => v > 0 && v < 1.0) ? 'mixed' : 'BS';
         }
         return 'PP';
+    };
+
+    // Alan 9/23/26 - "Fade by support": each internal branch is drawn in one of three display
+    // classes so a weakly supported split does not carry the same visual weight as a strongly
+    // supported one. Display only -- topology, lengths, support values and the Newick are
+    // untouched. The bins are per scale because the scales do not share conventions: a UFBoot
+    // of 80 is weak, a classical bootstrap of 80 is decent. Opacities live here only; the
+    // viewer applies them inline and the export legend draws its samples from the same table.
+    const SUPPORT_FADE_LEVELS = ['weak', 'intermediate', 'strong'];
+    const SUPPORT_FADE_OPACITY = { strong: 1, intermediate: 0.6, weak: 0.3 };
+    const SUPPORT_FADE_BINS = {
+        ALRT: { strong: 80, intermediate: 50, proportion: false },
+        UFBOOT: { strong: 95, intermediate: 70, proportion: false },
+        BS: { strong: 70, intermediate: 50, proportion: false },
+        PP: { strong: 0.95, intermediate: 0.80, proportion: true },
+        SH: { strong: 0.90, intermediate: 0.70, proportion: true }
+    };
+
+    function supportFadeLevel(value, bins) {
+        if (!Number.isFinite(value) || !bins) return null;
+        if (value >= bins.strong) return 'strong';
+        if (value >= bins.intermediate) return 'intermediate';
+        return 'weak';
+    }
+
+    function formatSupportFadeValue(value, bins) {
+        if (bins && bins.proportion) return value.toFixed(2);
+        return Number.isInteger(value) ? String(value) : value.toFixed(1);
+    }
+
+    // Alan 9/23/26 - Dual SH-aLRT/UFBoot is classified as an intersection of the two
+    // classes, never by comparing the numbers: a branch is strong only when BOTH halves meet
+    // their own strong cutoff, which is IQ-TREE's own reading (SH-aLRT >= 80 AND UFBoot >= 95).
+    // 91/82 therefore follows the UFBoot bin and 62/99 follows the SH-aLRT bin.
+    function dualSupportFadeLevel(alrt, ufboot) {
+        const a = supportFadeLevel(alrt, SUPPORT_FADE_BINS.ALRT);
+        const u = supportFadeLevel(ufboot, SUPPORT_FADE_BINS.UFBOOT);
+        if (!a || !u) return null;
+        return SUPPORT_FADE_LEVELS[Math.min(SUPPORT_FADE_LEVELS.indexOf(a), SUPPORT_FADE_LEVELS.indexOf(u))];
+    }
+
+    // Alan 9/23/26 - What the fading means for one support scale, for the checkbox tooltip and
+    // the export legend. Null for a tree whose scale cannot be binned (none, mixed), which is
+    // also how the viewer knows not to fade it.
+    window.describeSupportFade = function (supportType) {
+        const fmt = (value, bins) => formatSupportFadeValue(value, bins);
+        if (supportType === 'ALRT_UFBOOT') {
+            const a = SUPPORT_FADE_BINS.ALRT;
+            const u = SUPPORT_FADE_BINS.UFBOOT;
+            return {
+                statistic: 'SH-aLRT / UFBoot (a branch takes the weaker of its two classes)',
+                rows: [
+                    { level: 'strong', text: `SH-aLRT ≥ ${a.strong} and UFBoot ≥ ${u.strong}` },
+                    { level: 'intermediate', text: `SH-aLRT ≥ ${a.intermediate} and UFBoot ≥ ${u.intermediate}, not strong` },
+                    { level: 'weak', text: `SH-aLRT < ${a.intermediate} or UFBoot < ${u.intermediate}` }
+                ],
+                opacity: SUPPORT_FADE_OPACITY
+            };
+        }
+        const bins = SUPPORT_FADE_BINS[supportType];
+        if (!bins) return null;
+        const info = (window.SUPPORT_TYPE_INFO || {})[supportType] || { label: supportType };
+        return {
+            statistic: info.label,
+            rows: [
+                { level: 'strong', text: `≥ ${fmt(bins.strong, bins)}` },
+                { level: 'intermediate', text: `${fmt(bins.intermediate, bins)} to < ${fmt(bins.strong, bins)}` },
+                { level: 'weak', text: `< ${fmt(bins.intermediate, bins)}` }
+            ],
+            opacity: SUPPORT_FADE_OPACITY
+        };
     };
 
     // --- ZOOM PANIC STOP ---
@@ -583,6 +654,8 @@
             this.callbacks = callbacks || {};
             this.options = Object.assign({
                 showSupport: true,
+                // Alan 9/23/26 - Fade internal branches by their support class (on by default).
+                supportFade: true,
                 ppThreshold: 0.9,
                 bootstrapThreshold: 70,
                 minTips: 0,
@@ -1322,6 +1395,49 @@
             if (root) visit(root, 0);
         }
 
+        /**
+         * Alan 9/23/26 - Contract every remaining internal branch at or below the zero-length
+         * floor (ZERO_LENGTH_POLYTOMY_EPSILON), including ones between two positive-length
+         * clades, which the tip-component pass above never reaches. Each such node's children
+         * are spliced into its parent at its own position, so tip order is unchanged. Display
+         * only: the tree files, the backend's stable clade ids and every edit endpoint still see
+         * the binary tree, and this reruns on every parse. Children of the root are left alone
+         * so a rooted tree keeps its two-way root split.
+         */
+        _contractZeroLengthInternalBranches(root) {
+            let contracted = 0;
+            // Walk the LIVE hierarchy from the root: the tip-component pass leaves its removed
+            // nodes still linked to one another, so a node list taken before it would splice
+            // children onto detached nodes. Preorder walked backwards contracts the deepest
+            // branches first, so a chain of short branches collapses completely into its
+            // topmost surviving ancestor.
+            const nodes = [];
+            const pending = [root];
+            while (pending.length) {
+                const node = pending.pop();
+                nodes.push(node);
+                (node.children || []).forEach((child) => pending.push(child));
+            }
+            for (let i = nodes.length - 1; i >= 0; i -= 1) {
+                const node = nodes[i];
+                const parent = node.parent;
+                if (!parent || !parent.parent) continue;
+                const children = node.children || [];
+                if (!children.length) continue;
+                // Alan 9/23/26 - Same zero-length test as the tip-component pass and the labels.
+                if (!this._hasZeroLengthIncomingBranch(node)) continue;
+                const siblings = parent.children || [];
+                const index = siblings.indexOf(node);
+                if (index < 0) continue;
+                siblings.splice(index, 1, ...children);
+                children.forEach((child) => { child.parent = parent; });
+                node.children = [];
+                node.parent = null;
+                contracted += 1;
+            }
+            return contracted;
+        }
+
         _groupZeroLengthPolytomies() {
             if (!this.tree) return 0;
             const nodes = [];
@@ -1347,6 +1463,7 @@
             polytomies.forEach((polytomy) => {
                 if (this._contractZeroLengthPolytomy(polytomy, originalPositions)) grouped += 1;
             });
+            if (this._contractZeroLengthInternalBranches(root)) grouped += 1;
             if (grouped) this._refreshHierarchyMetrics(root);
 
             // A contraction makes the unresolved tips direct siblings and therefore
@@ -1413,7 +1530,10 @@
                 'tip-label-gap': this.tipLabelGap,
                 'left-right-spacing': 'fixed-step',
                 'top-bottom-spacing': 'fixed-step',
-                'node-styler': (element, node) => this._styleNode(element, node)
+                'node-styler': (element, node) => this._styleNode(element, node),
+                // Alan 9/23/26 - Runs after phylotree (re)classes and redraws each branch, so the
+                // support fade survives every update() without a separate repaint pass.
+                'edge-styler': (element, edge) => this._styleBranchSupport(element, edge)
             };
 
             // D3 Version Lock
@@ -1942,6 +2062,23 @@
                 }
             }
 
+            // Alan 9/23/26 - 4b. Carry each branch's ON-SCREEN opacity into the figure. The
+            //    stylesheet rules are scoped to #tree-container and do not match inside the
+            //    standalone clone, so the computed value (support fade, minus any selection or
+            //    hover override) is written inline. With fading off every branch computes to 1
+            //    and nothing is written, so the export is unfaded too.
+            const origBranches = svg.querySelectorAll('path.branch');
+            const cloneBranches = clone.querySelectorAll('path.branch');
+            const bn = Math.min(origBranches.length, cloneBranches.length);
+            for (let i = 0; i < bn; i++) {
+                const opacity = parseFloat(window.getComputedStyle(origBranches[i]).strokeOpacity);
+                if (Number.isFinite(opacity) && opacity < 1) {
+                    cloneBranches[i].style.setProperty('stroke-opacity', String(opacity));
+                } else {
+                    cloneBranches[i].style.removeProperty('stroke-opacity');
+                }
+            }
+
             // 5. Resolve pixel dimensions.
             //    Prefer getBoundingClientRect because it is reliable even when SVG attrs use "%" or are unset.
             //    Only fall back to attribute value if it parses as a plain number (no % unit).
@@ -1967,7 +2104,91 @@
             if (vb) clone.setAttribute('viewBox', vb);
             else clone.setAttribute('viewBox', `0 0 ${width} ${height}`);
 
+            // Alan 9/23/26 - 7. A faded branch in a figure is ambiguous without a key, so a
+            //    faded export always carries one. Nothing is added when fading is off.
+            if (this._supportFadeActive()) {
+                ({ width, height } = this._appendSupportFadeLegend(clone, width, height));
+            }
+
             return { clone, width, height };
+        }
+
+        // Alan 9/23/26 - True when the fade is on AND this tree has at least one binnable branch.
+        _supportFadeActive() {
+            if (!this.options.supportFade) return false;
+            if (!window.describeSupportFade(this.lastStats?.supportType)) return false;
+            return (this.allNodes || []).some((node) => this._supportFadeInfo(node));
+        }
+
+        /**
+         * Alan 9/23/26 - Append the support-fade key below the tree in an export clone, growing
+         * the canvas to make room. Drawn in screen pixels and scaled into the clone's viewBox
+         * units. The sample strokes use class "branch" so they pick up exactly the stroke the
+         * exported branches get from the embedded stylesheet.
+         *
+         * @returns {{width: number, height: number}} the new pixel size of the clone
+         */
+        _appendSupportFadeLegend(clone, width, height) {
+            const legend = window.describeSupportFade(this.lastStats?.supportType);
+            if (!legend) return { width, height };
+            const NS = 'http://www.w3.org/2000/svg';
+            const vb = (clone.getAttribute('viewBox') || `0 0 ${width} ${height}`)
+                .split(/[\s,]+/).map(Number);
+            if (vb.length !== 4 || vb.some((v) => !Number.isFinite(v)) || !(vb[2] > 0)) {
+                return { width, height };
+            }
+            const unit = vb[2] / width;
+
+            const FONT = 11;
+            const LINE = 16;
+            const PAD = 12;
+            const SAMPLE = 28;
+            const lines = [
+                { text: `Branch opacity: ${legend.statistic} support`, bold: true },
+                ...legend.rows.map((row) => ({ text: `${row.level}: ${row.text}`, level: row.level })),
+                { text: 'Terminal branches and branches without a support value are drawn solid.', note: true }
+            ];
+            // No DOM to measure in (the clone is detached), so estimate generously.
+            const longest = Math.max(...lines.map((line) => line.text.length * FONT * 0.6
+                + (line.level ? SAMPLE + 8 : 0)));
+            const legendWidth = PAD * 2 + longest;
+            const legendHeight = PAD + lines.length * LINE + PAD / 2;
+
+            const g = document.createElementNS(NS, 'g');
+            g.setAttribute('class', 'support-fade-legend');
+            g.setAttribute('transform',
+                `translate(${vb[0] + PAD * unit},${vb[1] + vb[3] + (PAD / 2) * unit}) scale(${unit})`);
+            lines.forEach((line, index) => {
+                const y = index * LINE + LINE / 2;
+                let x = 0;
+                if (line.level) {
+                    const sample = document.createElementNS(NS, 'path');
+                    sample.setAttribute('class', 'branch');
+                    sample.setAttribute('d', `M0,${y} H${SAMPLE}`);
+                    sample.setAttribute('style', `fill:none;stroke-opacity:${legend.opacity[line.level]}`);
+                    g.appendChild(sample);
+                    x = SAMPLE + 8;
+                }
+                const text = document.createElementNS(NS, 'text');
+                text.setAttribute('x', String(x));
+                text.setAttribute('y', String(y));
+                text.setAttribute('dominant-baseline', 'central');
+                text.setAttribute('style', `font-family:Arial, Helvetica, sans-serif;font-size:${FONT}px;`
+                    + `fill:${line.note ? '#4b5563' : '#1f2937'};stroke:none;`
+                    + `font-weight:${line.bold ? 'bold' : 'normal'};`
+                    + `font-style:${line.note ? 'italic' : 'normal'}`);
+                text.textContent = line.text;
+                g.appendChild(text);
+            });
+            clone.appendChild(g);
+
+            const newWidth = Math.max(width, legendWidth);
+            const newHeight = height + legendHeight;
+            clone.setAttribute('viewBox',
+                `${vb[0]} ${vb[1]} ${vb[2] * (newWidth / width)} ${vb[3] + legendHeight * unit}`);
+            clone.setAttribute('width', newWidth);
+            clone.setAttribute('height', newHeight);
+            return { width: newWidth, height: newHeight };
         }
 
         /**
@@ -2553,6 +2774,99 @@
                 // Alan 5/12/26 - Remove inline fill for ordinary labels so light/dark base CSS controls them.
                 else labelText.style("fill", null);
             });
+            // Alan 9/23/26 - Selection changes arrive here, so re-evaluate which branches are
+            // highlighted (full opacity) and which return to their support fade.
+            this._applySupportFading();
+        }
+
+        /**
+         * Alan 9/23/26 - Display class of the branch leading to `node`, or null when that branch
+         * is not faded at all: a tip (terminal branches carry no support), the root, a node with
+         * no support value, or a tree whose scale cannot be binned (none, mixed).
+         */
+        _supportFadeInfo(node) {
+            if (!node || !node.parent) return null;
+            const children = node.children || [];
+            if (!children.length) return null;
+            const supportType = this.lastStats?.supportType;
+            if (supportType === 'ALRT_UFBOOT') {
+                const dual = this._extractDualSupport(node);
+                if (!dual) return null;
+                const level = dualSupportFadeLevel(dual.alrt, dual.ufboot);
+                if (!level) return null;
+                const a = formatSupportFadeValue(dual.alrt, SUPPORT_FADE_BINS.ALRT);
+                const u = formatSupportFadeValue(dual.ufboot, SUPPORT_FADE_BINS.UFBOOT);
+                return { level, text: `SH-aLRT/UFBoot: ${a}/${u} \u00b7 display class: ${level}` };
+            }
+            const bins = SUPPORT_FADE_BINS[supportType];
+            if (!bins) return null;
+            const value = this._extractSupportValue(node);
+            if (value === null) return null;
+            const level = supportFadeLevel(value, bins);
+            if (!level) return null;
+            const label = ((window.SUPPORT_TYPE_INFO || {})[supportType] || {}).label || supportType;
+            return {
+                level,
+                text: `${label}: ${formatSupportFadeValue(value, bins)} \u00b7 display class: ${level}`
+            };
+        }
+
+        /**
+         * Alan 9/23/26 - Apply (or clear) the support fade on one rendered branch.
+         *
+         * User styling always wins: a branch that is selected, tagged or hovered is restored by
+         * the !important rules in tree_viewer.css, and one leading to a selected clade, carrying
+         * a branch annotation, or given an explicit stroke colour is simply never faded here.
+         * Everything is recomputed on each call, so when a highlight goes away the fade returns.
+         */
+        _styleBranchSupport(element, edge) {
+            // phylotree's refresh() calls the edge styler with select(<display object>) rather
+            // than the path element, so anything without setAttribute is not a branch.
+            const el = element && typeof element.node === 'function' ? element.node() : null;
+            if (!el || typeof el.setAttribute !== 'function') return;
+            const target = edge?.target;
+            const info = this.options.supportFade ? this._supportFadeInfo(target) : null;
+
+            const title = el.querySelector('title');
+            if (title) {
+                // phylotree writes "Length = x" on every draw; keep only that line and re-append.
+                const lengthLine = String(title.textContent || '').split('\n')[0];
+                title.textContent = info ? `${lengthLine}\n${info.text}` : lengthLine;
+            }
+
+            const highlighted = Boolean(info) && (
+                this._supportFadeSelectedClades().has(target)
+                || Boolean(this._annotatedBranchNodes && this._annotatedBranchNodes.has(target))
+                || Boolean(el.style && el.style.stroke)
+            );
+            if (!info || highlighted || info.level === 'strong') {
+                el.removeAttribute('data-support-fade');
+                if (el.style) el.style.removeProperty('stroke-opacity');
+                return;
+            }
+            el.setAttribute('data-support-fade', info.level);
+            el.style.setProperty('stroke-opacity', String(SUPPORT_FADE_OPACITY[info.level]));
+        }
+
+        // Alan 9/23/26 - Selected clades as a Set of live nodes, rebuilt only when the cached
+        // selection array changes, since the edge styler consults it once per branch.
+        _supportFadeSelectedClades() {
+            const nodes = this.getSelectedCladeNodes();
+            if (this._supportFadeSelectionSource !== nodes) {
+                this._supportFadeSelectionSource = nodes;
+                this._supportFadeSelection = new Set(nodes);
+            }
+            return this._supportFadeSelection;
+        }
+
+        _applySupportFading() {
+            if (!this.tree || !this.container) return;
+            const svg = window.d3v7.select(this.container).select("svg");
+            if (svg.empty()) return;
+            const self = this;
+            svg.selectAll("path.branch").each(function (edge) {
+                self._styleBranchSupport(window.d3v7.select(this), edge);
+            });
         }
 
         /**
@@ -2843,12 +3157,11 @@
                         }
                     }
 
-                    if (d.parent) {
-                        const incoming = self._branchLength(d);
-                        if (incoming !== null && Math.abs(incoming) <= SUPPORT_LABEL_MIN_BRANCH_LENGTH) {
-                            group.select("text.node-support-value").remove();
-                            return;
-                        }
+                    // Alan 9/23/26 - No label on an effectively zero-length branch (same floor as
+                    // the polytomy contraction); only the root's children can still have one.
+                    if (d.parent && self._hasZeroLengthIncomingBranch(d)) {
+                        group.select("text.node-support-value").remove();
+                        return;
                     }
 
                     const numVal = self._extractSupportValue(d);
@@ -4659,6 +4972,7 @@
             this.annotationLayers = Array.isArray(layers) ? layers : [];
             this.cladeAnnotations = Array.isArray(annotations) ? annotations : [];
             this._renderCladeAnnotations();
+            this._applySupportFading();
         }
 
         // Alan 8/15/26 - Give the controller the current configuration for saving.
@@ -4918,6 +5232,7 @@
             this.annotationRedrawTimer = setTimeout(() => {
                 this.annotationRedrawTimer = null;
                 this._renderCladeAnnotations();
+                this._applySupportFading();
             }, 60);
         }
 
@@ -5786,6 +6101,9 @@
          * own container group, so they share the tree's coordinate space and zoom/pan transform.
          */
         _renderCladeAnnotations() {
+            // Alan 9/23/26 - Branches carrying a branch annotation are user-styled, so they are
+            // exempt from the support fade; refilled below from the branch items actually drawn.
+            this._annotatedBranchNodes = new Set();
             // Alan 9/9/26 - Rebuilt on every redraw so the Alignment Viewer's name backgrounds
             // can never outlive the bands they mirror (a deleted, hidden or no-longer-valid
             // highlight leaves nothing behind).
@@ -6071,6 +6389,7 @@
             const branchCursors = new Map();
             for (const item of branchItems) {
                 const node = item.targetNode;
+                this._annotatedBranchNodes.add(node);
                 const point = this._annotationNodePoint(node);
                 const parentPoint = this._annotationNodePoint(node.parent);
                 if (!point || !parentPoint) continue;

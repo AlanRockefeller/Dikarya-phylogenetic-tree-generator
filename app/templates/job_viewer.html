@@ -4,7 +4,7 @@
 {% block subtitle %}Tree Viewer{% endblock %}
 
 {% block head %}
-<link rel="stylesheet" href="{{ url_for('static', filename='css/tree_viewer.css') }}?v=12">
+<link rel="stylesheet" href="{{ url_for('static', filename='css/tree_viewer.css') }}?v=13">
 <link rel="stylesheet" href="{{ url_for('static', filename='css/phylotree.css') }}?v=2">
 <link rel="stylesheet" href="{{ url_for('static', filename='css/phylotree-menus.css') }}?v=3">
 <link rel="preconnect" href="https://fonts.googleapis.com">
@@ -197,6 +197,14 @@
                         <input class="rounded border-gray-300 text-journal-gold focus:ring-journal-gold w-3.5 h-3.5"
                             type="checkbox" id="cb-hide-low-support">
                         Apply thresholds (Filter Low)
+                    </label>
+                    <!-- Alan 9/23/26 - Fade internal branches by support class; on by default. Title is set from the support type by updateSupportUI(). -->
+                    <label id="label-fade-by-support"
+                        class="flex items-center gap-1.5 text-xs font-medium text-gray-600 dark:text-gray-300 cursor-pointer select-none"
+                        title="Draw weakly supported branches lighter. Display only; the tree is unchanged.">
+                        <input class="rounded border-gray-300 text-journal-gold focus:ring-journal-gold w-3.5 h-3.5"
+                            type="checkbox" id="cb-fade-by-support" checked>
+                        Fade by support
                     </label>
                 </div>
             </div>
@@ -1493,11 +1501,11 @@
 
 <script src="{{ url_for('static', filename='js/phylotree.js') }}?v=12"></script>
 
-<script src="{{ url_for('static', filename='js/tree_viewer_phylotree_v2.js') }}?v=94"></script>
+<script src="{{ url_for('static', filename='js/tree_viewer_phylotree_v2.js') }}?v=97"></script>
 
 <script src="{{ url_for('static', filename='js/tree_viewer_api.js') }}?v=8"></script>
 
-<script src="{{ url_for('static', filename='js/tree_viewer_controller.js') }}?v=85"></script>
+<script src="{{ url_for('static', filename='js/tree_viewer_controller.js') }}?v=86"></script>
 
 {% include 'partials/alignment_viewer_modal.html' %}
 

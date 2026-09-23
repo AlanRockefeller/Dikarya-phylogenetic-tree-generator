@@ -76,6 +76,9 @@ NOTEWORTHY_INTERNAL_GAP_PERCENT = 1.0
 # branch is in practice anything below the resolution the substitution model
 # could distinguish. Metrics computed with this tolerance are named near_zero_*
 # so an exact-zero tally is never confused with a tolerance-based one.
+# The tree viewer uses the same floor, with the same <= comparison, as
+# ZERO_LENGTH_POLYTOMY_EPSILON in tree_viewer_phylotree_v2.js: at or below it a
+# branch is contracted into a polytomy and gets no support label. Change both.
 NEAR_ZERO_BRANCH_LENGTH = 1e-6
 # How many worst-offender rows to name. Long enough to see a pattern, short
 # enough that the prompt stays compact on a 2000-tip tree.

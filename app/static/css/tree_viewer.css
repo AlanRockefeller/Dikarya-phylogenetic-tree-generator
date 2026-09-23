@@ -457,6 +457,16 @@
     /* Brighter than #999 for better visibility in dark mode */
 }
 
+/* Fade by support. The viewer sets stroke-opacity inline on weak/intermediate branches
+   (values in SUPPORT_FADE_OPACITY, tree_viewer_phylotree_v2.js). A selected, tagged or
+   hovered branch is user styling and wins; removing the class restores the fade. The
+   export copies each branch's computed opacity, so these overrides export as shown. */
+#tree-container path.branch.branch-selected,
+#tree-container path.branch.branch-tagged,
+#tree-container path.branch:hover {
+    stroke-opacity: 1 !important;
+}
+
 
 /* Layered clade annotations.
    Drawn inside the tree SVG (g.clade-annotations) so they export with the figure.
