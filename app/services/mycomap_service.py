@@ -12,6 +12,7 @@ import hashlib
 import json
 import logging
 import os
+import random
 import re
 import shlex
 import time
@@ -52,6 +53,18 @@ MYCOMAP_DEFAULT_NCBI_RERUN_LIMIT = 100
 MYCOMAP_RERUN_LIMIT_MIN = 1
 MYCOMAP_RERUN_LIMIT_MAX = 500
 MYCOMAP_RERUN_REQUEST_TIMEOUT = 60
+# Alan 9/23/26 - The BLAST history lookup used to borrow the 60s rerun timeout.
+# It runs on every discovery poll of every waiting bulk job, and over 5,400
+# logged polls a successful answer took 0.9s median and 3.3s at p90; only ~12
+# answered between 30 and 60s. The 26 that timed out held the only bulk worker
+# for a full minute each, mostly during one MycoMap outage. A missed lookup is
+# harmless -- the job simply looks again on its next poll -- so fail fast.
+MYCOMAP_HISTORY_REQUEST_TIMEOUT = 15
+# After one history lookup times out, every other waiting job would time out
+# too; a batch of 300 jobs then costs 300 x timeout per pass. Skip the lookup
+# for everyone for this long instead. Redis-backed; without Redis it fails open.
+MYCOMAP_HISTORY_BACKOFF_SECONDS = 300
+_HISTORY_BACKOFF_KEY = "dikarya:mycomap:history_backoff"
 MYCOMAP_NCBI_RERUN_WAIT_SECONDS = 600
 MYCOMAP_NCBI_POLL_INTERVAL_SECONDS = 60
 MYCOMAP_NCBI_POLL_MAX_ATTEMPTS = 120
@@ -66,6 +79,10 @@ MYCOMAP_NCBI_RECHECK_MAX_HOURS = 48
 # then back off while keeping the accepted search alive for four days so a large
 # MycoMap backlog does not turn into a failed tree that must be rebuilt by hand.
 MYCOMAP_CREATION_DISCOVERY_MAX_SECONDS = 4 * 24 * 60 * 60
+# A create POST that times out may or may not have reached MycoMap. Such a
+# search is discovered like any other, and re-sent only when the history API
+# answers cleanly without it -- at most this many POSTs in total.
+MYCOMAP_UNCONFIRMED_CREATE_MAX_ATTEMPTS = 3
 MYCOMAP_NEAR_DUPLICATE_MAX_DIFFERENCES = 4
 
 _CONCRETE_DNA_BASES = frozenset("ACGT")
@@ -85,6 +102,10 @@ class MycoMapCreateError(Exception):
 
 class MycoMapRefreshError(Exception):
     """Raised when MycoMap observation records cannot be refreshed or resolved."""
+
+
+class MycoMapRefreshTimeout(MycoMapRefreshError):
+    """A MycoMap refresh-API request ran out of time (MycoMap slow or down)."""
 
 
 MYCOMAP_OBSERVATION_REF_RE = re.compile(r"^(?:inat|mo):\d{1,12}$")
@@ -719,8 +740,52 @@ def _title_matches_blast_label(label: str, wanted: str) -> bool:
     return label == wanted or label.startswith(f"{wanted} - ")
 
 
+# Alan 9/22/26 - The listing page is the only place a new BLAST's result-page
+# URL can be read (the history API's rows carry an id but almost never a url,
+# and the bare r<id>/ form 404s), and it shows only the newest 25 searches. So
+# the cache-busted fetch below has to stay -- MycoMap's 15-minute guest cache
+# would let a new record scroll off before we ever saw it. What it must not do
+# is run once per waiting job per minute: each uncached hit makes MycoMap
+# re-count ~634k rows, and during the 2026-09-22 batch that was a large share
+# of the listing-page timeouts. One fresh copy is shared across every job and
+# worker for this long.
+MYCOMAP_LISTING_SHARED_CACHE_SECONDS = 60
+_MYCOMAP_LISTING_CACHE_KEY = "dikarya:mycomap:blast_listing"
+
+
+def _shared_redis():
+    """Redis for cross-process coordination, or None (callers then fail open)."""
+    try:
+        from app.workers.queue import get_redis_connection
+        return get_redis_connection()
+    except Exception as exc:
+        logger.info("MycoMap coordination skipped; Redis unavailable: %s", exc)
+        return None
+
+
 def _fetch_mycomap_blast_listing(warnings: Optional[list] = None) -> str:
     """Fetch the public BLAST listing page, or "" if it cannot be read."""
+    conn = _shared_redis()
+    if conn is not None:
+        try:
+            cached = conn.get(_MYCOMAP_LISTING_CACHE_KEY)
+            if cached:
+                return cached.decode("utf-8", errors="replace")
+        except Exception as exc:
+            logger.info("MycoMap listing cache read failed: %s", exc)
+    page = _fetch_mycomap_blast_listing_uncached(warnings)
+    if page and conn is not None:
+        try:
+            conn.set(
+                _MYCOMAP_LISTING_CACHE_KEY, page.encode("utf-8"),
+                ex=MYCOMAP_LISTING_SHARED_CACHE_SECONDS,
+            )
+        except Exception as exc:
+            logger.info("MycoMap listing cache write failed: %s", exc)
+    return page
+
+
+def _fetch_mycomap_blast_listing_uncached(warnings: Optional[list] = None) -> str:
     listing_query = urllib.parse.urlencode({"d": "38", "_": str(time.time_ns())})
     request = urllib.request.Request(
         f"https://mycomap.com/genetics/blast-search/?{listing_query}",
@@ -770,6 +835,34 @@ def find_mycomap_record_url_by_id(blast_id: str,
     return url if validate_mycomap_url(url) == blast_id else None
 
 
+def _history_backoff_active() -> bool:
+    conn = _shared_redis()
+    if conn is None:
+        return False
+    try:
+        return bool(conn.exists(_HISTORY_BACKOFF_KEY))
+    except Exception as exc:
+        logger.info("MycoMap history backoff check failed; not skipping: %s", exc)
+        return False
+
+
+def _start_history_backoff() -> None:
+    conn = _shared_redis()
+    if conn is None:
+        return
+    try:
+        # nx: a lookup that times out during an existing window must not
+        # extend it, or a steady trickle of stragglers would keep it shut.
+        if conn.set(_HISTORY_BACKOFF_KEY, "1", nx=True,
+                    ex=MYCOMAP_HISTORY_BACKOFF_SECONDS):
+            logger.warning(
+                "event=mycomap.history_backoff MycoMap BLAST history timed out; "
+                "skipping history lookups for %ss", MYCOMAP_HISTORY_BACKOFF_SECONDS,
+            )
+    except Exception as exc:
+        logger.info("MycoMap history backoff could not be set: %s", exc)
+
+
 def find_mycomap_blast_via_history(title: str,
                                    warnings: Optional[list] = None,
                                    pending_out: Optional[dict] = None
@@ -796,11 +889,25 @@ def find_mycomap_blast_via_history(title: str,
     wanted = " ".join(str(title or "").split()).strip()
     if not wanted:
         return None
+    if _history_backoff_active():
+        logger.info("MycoMap BLAST history lookup skipped for %s: backing off "
+                    "after a recent timeout", wanted)
+        if warnings is not None:
+            warnings.append("MycoMap BLAST history lookup skipped: MycoMap "
+                            "timed out recently")
+        return None
     try:
         payload = _mycomap_refresh_request(
             "blast/history",
             data={"userID": str(get_mycomap_user_id()), "perPage": "100"},
+            timeout=MYCOMAP_HISTORY_REQUEST_TIMEOUT,
         )
+    except MycoMapRefreshTimeout as exc:
+        _start_history_backoff()
+        logger.warning("MycoMap BLAST history lookup failed for %s: %s", wanted, exc)
+        if warnings is not None:
+            warnings.append(f"MycoMap BLAST history lookup failed: {exc}")
+        return None
     except MycoMapRefreshError as exc:
         logger.warning("MycoMap BLAST history lookup failed for %s: %s", wanted, exc)
         if warnings is not None:
@@ -934,6 +1041,273 @@ def find_mycomap_blast_by_title(title: str,
     return None
 
 
+# ---------------------------------------------------------------------------
+# Finding an existing BLAST instead of creating one
+#
+# Alan 9/22/26 - From MycoMap's own investigation of the 2026-09-22 batch:
+#   * A legacy link, index.php?app=genbank&module=genbank&controller=blast
+#     &do=results&db=D&id=N, is NOT a BLAST id. db=42 is the Sequences database,
+#     db=39 is GenBank, and N is a record there. The page lists every BLAST whose
+#     input sequence hashes to that record's sequence. BLAST ids are nearly
+#     contiguous, so treating N as a BLAST id finds a real -- wrong -- search
+#     and imports another specimen's hits with no error. Never do that.
+#   * In 6 of 12 sampled observations a BLAST of the identical sequence already
+#     existed and Dikarya created a duplicate anyway.
+# The rule MycoMap gave: read the r<id> links off the results page and prefer
+# the oldest one that has results; create a new search only when there are none.
+# ---------------------------------------------------------------------------
+_LEGACY_RESULTS_DATABASES = frozenset({"39", "42"})
+MYCOMAP_SEQUENCES_DATABASE = "42"
+# Status reads per lookup. The page lists oldest-first once sorted, and the
+# first complete one wins, so a handful covers every real case seen.
+_MAX_EXISTING_BLAST_STATUS_CHECKS = 5
+
+
+def parse_legacy_mycomap_results_url(url: str) -> Optional[Tuple[str, str]]:
+    """Return (db, record_id) for a legacy do=results link, else None."""
+    try:
+        parsed = urllib.parse.urlparse(str(url or "").strip())
+    except Exception:
+        return None
+    if (parsed.hostname or "").lower() not in ("mycomap.com", "www.mycomap.com"):
+        return None
+    if parsed.scheme not in ("http", "https"):
+        return None
+    if parsed.path not in ("", "/", "/index.php"):
+        return None
+    query = urllib.parse.parse_qs(parsed.query or "")
+
+    def one(name):
+        values = query.get(name) or []
+        return values[0].strip() if len(values) == 1 else ""
+
+    if (one("app").lower(), one("controller").lower(), one("do").lower()) != (
+        "genbank", "blast", "results"
+    ):
+        return None
+    db, record_id = one("db"), one("id")
+    if db not in _LEGACY_RESULTS_DATABASES or not record_id.isdigit():
+        return None
+    return db, record_id
+
+
+def find_mycomap_blasts_for_sequence_record(db: str, record_id: str,
+                                            warnings: Optional[list] = None
+                                            ) -> List[Dict[str, str]]:
+    """List the BLASTs MycoMap has run on one Sequences/GenBank record's
+    sequence, oldest first, as [{"blast_id", "url"}]."""
+    db, record_id = str(db or ""), str(record_id or "")
+    if db not in _LEGACY_RESULTS_DATABASES or not record_id.isdigit():
+        return []
+    query = urllib.parse.urlencode({
+        "app": "genbank", "module": "genbank", "controller": "blast",
+        "do": "results", "db": db, "id": record_id,
+    })
+    request = urllib.request.Request(
+        f"{MYCOMAP_BASE_URL}?{query}",
+        headers={"User-Agent": "Dikarya-TreeBuilder/1.0", "Accept": "text/html,*/*"},
+        method="GET",
+    )
+    try:
+        with diagnostic_urlopen(request, timeout=REQUEST_TIMEOUT) as resp:
+            page = resp.read().decode("utf-8", errors="replace")
+    except Exception as exc:
+        logger.warning(
+            "Could not read MycoMap BLAST results for db=%s record=%s: %s",
+            db, record_id, exc,
+        )
+        if warnings is not None:
+            warnings.append(f"MycoMap BLAST list for record {record_id} could not be read: {exc}")
+        return []
+
+    found: Dict[str, str] = {}
+    for match in re.finditer(
+        r"""href=['"]([^'"]*/genetics/blast-search/[A-Za-z0-9._-]*?-?r\d+/?)['"]""",
+        page, re.IGNORECASE,
+    ):
+        url = urllib.parse.urljoin("https://mycomap.com", html.unescape(match.group(1)))
+        blast_id = validate_mycomap_url(url, quiet=True)
+        if blast_id and blast_id not in found:
+            found[blast_id] = url
+    return [
+        {"blast_id": blast_id, "url": found[blast_id]}
+        for blast_id in sorted(found, key=int)
+    ]
+
+
+def _choose_existing_blast(candidates: List[Dict[str, str]]) -> Optional[Dict[str, str]]:
+    """The oldest candidate MycoMap reports as finished; failing that, the oldest
+    one not known to be unfinished (status unreadable counts as unknown)."""
+    fallback = None
+    for candidate in candidates[:_MAX_EXISTING_BLAST_STATUS_CHECKS]:
+        record = fetch_mycomap_blast_record(candidate["blast_id"])
+        if isinstance(record, dict):
+            ncbi = record.get("ncbi") if isinstance(record.get("ncbi"), dict) else {}
+            status = (_api_text_value(ncbi.get("status"))
+                      or _api_text_value(record.get("status"))).lower()
+            if status == "complete":
+                return dict(candidate, status="complete")
+            if _looks_unfinished(status):
+                continue
+        if fallback is None:
+            fallback = dict(candidate, status="unknown")
+    return fallback
+
+
+def resolve_legacy_mycomap_results_url(url: str,
+                                       warnings: Optional[list] = None
+                                       ) -> Optional[Dict[str, str]]:
+    """Map a legacy do=results link to a current BLAST {"blast_id", "url"}."""
+    parsed = parse_legacy_mycomap_results_url(url)
+    if not parsed:
+        return None
+    candidates = find_mycomap_blasts_for_sequence_record(*parsed, warnings=warnings)
+    chosen = _choose_existing_blast(candidates)
+    logger.info(
+        "event=mycomap.legacy_url_resolved db=%s record=%s candidates=%s "
+        "chosen=%s status=%s",
+        parsed[0], parsed[1], len(candidates),
+        (chosen or {}).get("blast_id", "-"), (chosen or {}).get("status", "-"),
+    )
+    return chosen
+
+
+def _clean_blast_sequence(value: str) -> str:
+    return re.sub(r"[^ACGTNRYSWKMBDHV]", "", str(value or "").upper())
+
+
+def find_existing_mycomap_blast_for_sequence(reference: str, sequence: str,
+                                             warnings: Optional[list] = None
+                                             ) -> Optional[Dict[str, str]]:
+    """Find a BLAST MycoMap has already run on this observation's sequence.
+
+    MycoMap has no lookup-by-sequence endpoint yet, so this goes through the
+    observation's own Sequences record: sequences/batch returns it, and the
+    legacy results page for that record lists the BLASTs of its sequence. Reuse
+    is only offered when the record's sequence is identical to ``sequence`` --
+    otherwise the BLASTs found are of a different sequence. Any failure returns
+    None and the caller creates a search exactly as before.
+    """
+    wanted = _clean_blast_sequence(sequence)
+    if not wanted or not MYCOMAP_OBSERVATION_REF_RE.fullmatch(str(reference or "")):
+        return None
+    try:
+        payload = _mycomap_refresh_request(
+            "sequences/batch", data={"observations": reference}
+        )
+    except Exception as exc:
+        logger.info("MycoMap sequence lookup for %s failed: %s", reference, exc)
+        return None
+
+    rows = _mycomap_result_rows(payload)
+    matched_rows = [row for row in rows if _reference_from_api_record(row) == reference]
+    outcome = "no_record"
+    for row in matched_rows:
+        record_id = _find_api_field(
+            row, ("record_id", "recordid", "primary_id_field", "sequence_id",
+                  "sequenceid", "id"),
+        )
+        record_sequence = _clean_blast_sequence(_find_api_field(
+            row, ("sequence", "dna", "dna_sequence", "its", "its_sequence", "seq"),
+        ))
+        if not record_id.isdigit():
+            outcome = "record_without_id"
+            continue
+        if record_sequence != wanted:
+            outcome = "sequence_differs" if record_sequence else "record_without_sequence"
+            continue
+        chosen = _choose_existing_blast(find_mycomap_blasts_for_sequence_record(
+            MYCOMAP_SEQUENCES_DATABASE, record_id, warnings=warnings,
+        ))
+        if chosen:
+            logger.info(
+                "event=mycomap.blast_reused reference=%s record=%s blast_id=%s status=%s",
+                reference, record_id, chosen["blast_id"], chosen["status"],
+            )
+            return chosen
+        outcome = "no_existing_blast"
+    # Field names are logged so a shape mismatch is diagnosable from the log
+    # rather than silently never matching.
+    logger.info(
+        "event=mycomap.blast_reuse_miss reference=%s outcome=%s rows=%s keys=%s",
+        reference, outcome, len(rows),
+        ",".join(sorted({str(k) for row in rows[:3] for k in row})) or "-",
+    )
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Bulk creation throttle
+#
+# Alan 9/22/26 - One batch created ~354 MycoMap BLASTs in four hours (a normal
+# day is 1-10), 160 of them in a single hour, and left 81 waiting on NCBI for up
+# to 3h43m. MycoMap asked for at most ~20 outstanding and one new search a
+# minute. Applied to the bulk lane only: a single one-click tree never waits
+# behind a batch. Redis-backed so it holds across worker processes, and it fails
+# open -- a Redis fault must never stop a tree from being built.
+# ---------------------------------------------------------------------------
+MYCOMAP_BULK_MAX_OUTSTANDING = 20
+MYCOMAP_BULK_MIN_CREATE_INTERVAL_SECONDS = 60
+# A search that never reports back (job killed, failed elsewhere) stops counting
+# against the cap after this long.
+MYCOMAP_BULK_OUTSTANDING_MAX_AGE_SECONDS = 4 * 60 * 60
+_BULK_OUTSTANDING_KEY = "dikarya:mycomap:bulk_outstanding"
+_BULK_CREATE_SLOT_KEY = "dikarya:mycomap:bulk_create_slot"
+
+
+def get_mycomap_bulk_max_outstanding() -> int:
+    return _env_int("MYCOMAP_BULK_MAX_OUTSTANDING", MYCOMAP_BULK_MAX_OUTSTANDING,
+                    min_value=1, max_value=500)
+
+
+# One day of one-minute checks: how long a bulk job may wait for a slot, on
+# top of its discovery and NCBI polling budgets.
+MYCOMAP_BULK_THROTTLE_MAX_WAIT_ATTEMPTS = 24 * 60
+
+
+def get_mycomap_bulk_throttle_max_wait_attempts() -> int:
+    return _env_int("MYCOMAP_BULK_THROTTLE_MAX_WAIT_ATTEMPTS",
+                    MYCOMAP_BULK_THROTTLE_MAX_WAIT_ATTEMPTS,
+                    min_value=0, max_value=7 * 24 * 60)
+
+
+def reserve_bulk_mycomap_creation(member: str) -> Tuple[bool, str]:
+    """Claim permission to create one bulk BLAST. Returns (allowed, reason)."""
+    member = str(member or "").strip()
+    conn = _shared_redis()
+    if not member or conn is None:
+        return True, "unthrottled"
+    try:
+        now = time.time()
+        conn.zremrangebyscore(
+            _BULK_OUTSTANDING_KEY, "-inf", now - MYCOMAP_BULK_OUTSTANDING_MAX_AGE_SECONDS
+        )
+        if conn.zscore(_BULK_OUTSTANDING_KEY, member) is not None:
+            return True, "already_reserved"
+        if conn.zcard(_BULK_OUTSTANDING_KEY) >= get_mycomap_bulk_max_outstanding():
+            return False, "outstanding_limit"
+        if not conn.set(_BULK_CREATE_SLOT_KEY, member, nx=True,
+                        ex=MYCOMAP_BULK_MIN_CREATE_INTERVAL_SECONDS):
+            return False, "rate_limit"
+        conn.zadd(_BULK_OUTSTANDING_KEY, {member: now})
+        return True, "reserved"
+    except Exception as exc:
+        logger.info("MycoMap bulk throttle unavailable; not throttling: %s", exc)
+        return True, "unthrottled"
+
+
+def release_bulk_mycomap_creation(member: str) -> None:
+    """Stop counting a bulk BLAST against the outstanding cap."""
+    member = str(member or "").strip()
+    conn = _shared_redis() if member else None
+    if conn is None:
+        return
+    try:
+        conn.zrem(_BULK_OUTSTANDING_KEY, member)
+    except Exception as exc:
+        logger.info("MycoMap bulk throttle release failed: %s", exc)
+
+
 def create_mycomap_blast(sequence: str, *, title: str = "",
                           local_limit: Optional[int] = None,
                           ncbi_limit: Optional[int] = None) -> dict:
@@ -1014,11 +1388,12 @@ def create_mycomap_blast(sequence: str, *, title: str = "",
         logger.error("MycoMap BLAST creation failed: HTTP %s %s", exc.code, message)
         raise MycoMapCreateError(f"MycoMap BLAST creation failed: {message}")
     except urllib.error.URLError as exc:
-        logger.error("MycoMap BLAST creation network error: %s", exc)
-        raise MycoMapCreateError("MycoMap BLAST creation network error.")
+        if not isinstance(exc.reason, TimeoutError):
+            logger.error("MycoMap BLAST creation network error: %s", exc)
+            raise MycoMapCreateError("MycoMap BLAST creation network error.")
+        return _unconfirmed_mycomap_creation(job_title, local_limit, ncbi_limit)
     except TimeoutError:
-        logger.error("MycoMap BLAST creation timed out")
-        raise MycoMapCreateError("MycoMap BLAST creation timed out.")
+        return _unconfirmed_mycomap_creation(job_title, local_limit, ncbi_limit)
     except Exception as exc:
         logger.error("Unexpected MycoMap BLAST creation error: %s", exc, exc_info=True)
         raise MycoMapCreateError("MycoMap BLAST creation failed unexpectedly.")
@@ -1055,6 +1430,55 @@ def create_mycomap_blast(sequence: str, *, title: str = "",
     else:
         logger.info("Created MycoMap BLAST %s", created["blast_id"])
     return created
+
+
+def _unconfirmed_mycomap_creation(job_title: str, local_limit: int,
+                                  ncbi_limit: int) -> dict:
+    """Treat a timed-out create POST as a search that may exist.
+
+    Alan 9/23/26 - A timeout used to fail the job outright, although MycoMap
+    had often accepted the request and only answered late. Returning a pending
+    record hands it to the ordinary title discovery, and
+    ``unconfirmed_mycomap_creation_verdict`` re-sends it if it never arrived.
+    """
+    logger.warning(
+        "MycoMap BLAST creation timed out for %s; checking whether MycoMap "
+        "created it before trying again", job_title,
+    )
+    return {
+        "record_pending": True,
+        "creation_unconfirmed": True,
+        "title": job_title,
+        "local_limit": local_limit,
+        "ncbi_limit": ncbi_limit,
+    }
+
+
+def unconfirmed_mycomap_creation_verdict(details: Optional[dict], *,
+                                         lookup_warnings: List[str],
+                                         pending_creation: Optional[dict]) -> str:
+    """Decide what to do with a pending search whose create POST timed out.
+
+    Call only after a title lookup that did not find the search. Returns
+    ``"wait"`` (keep discovering as normal), ``"retry"`` (MycoMap's history
+    answered and has no such search, so the POST never landed) or
+    ``"give_up"`` (it never landed, and the attempts are spent).
+
+    A failed or partial lookup is never evidence of absence, and a history
+    row with an ID means the search exists but is unpublished. Bulk creation
+    is throttled to one a minute, so a search created on the previous pass is
+    always inside the 100 newest history rows the lookup reads.
+    """
+    details = details or {}
+    if not details.get("creation_unconfirmed"):
+        return "wait"
+    if (lookup_warnings or (pending_creation or {}).get("blast_id")
+            or details.get("creation_pending_blast_id")):
+        return "wait"
+    attempts = int(details.get("creation_attempts") or 1)
+    if attempts >= MYCOMAP_UNCONFIRMED_CREATE_MAX_ATTEMPTS:
+        return "give_up"
+    return "retry"
 
 
 def get_mycomap_ncbi_result_count(blast_id: str) -> Tuple[int, list]:
@@ -1184,7 +1608,8 @@ def rerun_mycomap_blast(blast_id: str, result_type: str = "local",
 
 
 def _mycomap_refresh_request(path: str, *, method: str = "GET",
-                             data: Optional[dict] = None):
+                             data: Optional[dict] = None,
+                             timeout: float = MYCOMAP_RERUN_REQUEST_TIMEOUT):
     """Call one authenticated MycoMap refresh-related endpoint and parse JSON."""
     api_key, key_info = _mycomap_api_key_info()
     if not api_key:
@@ -1213,7 +1638,7 @@ def _mycomap_refresh_request(path: str, *, method: str = "GET",
         method=method,
     )
     try:
-        with diagnostic_urlopen(request, timeout=MYCOMAP_RERUN_REQUEST_TIMEOUT) as resp:
+        with diagnostic_urlopen(request, timeout=timeout) as resp:
             raw_body = resp.read().decode("utf-8", errors="replace")
     except urllib.error.HTTPError as exc:
         raw_body = exc.read().decode("utf-8", errors="replace")
@@ -1234,11 +1659,16 @@ def _mycomap_refresh_request(path: str, *, method: str = "GET",
         )
         raise MycoMapRefreshError(f"MycoMap refresh failed: {message}")
     except urllib.error.URLError as exc:
+        # A connect-phase timeout arrives wrapped in URLError; report it as the
+        # timeout it is so callers can back off.
+        if isinstance(exc.reason, TimeoutError):
+            logger.error("MycoMap refresh timed out for %s", path)
+            raise MycoMapRefreshTimeout("MycoMap refresh timed out.")
         logger.error("MycoMap refresh network error for %s: %s", path, exc)
         raise MycoMapRefreshError("MycoMap refresh network error.")
     except TimeoutError:
         logger.error("MycoMap refresh timed out for %s", path)
-        raise MycoMapRefreshError("MycoMap refresh timed out.")
+        raise MycoMapRefreshTimeout("MycoMap refresh timed out.")
     except Exception as exc:
         logger.error("Unexpected MycoMap refresh error for %s: %s", path, exc, exc_info=True)
         raise MycoMapRefreshError("MycoMap refresh failed unexpectedly.")
@@ -2133,7 +2563,12 @@ def _fetch_fasta(
             return b'', last_error
 
         if attempt + 1 < attempts:
-            delay = FASTA_FETCH_RETRY_BASE_SECONDS * (2 ** attempt)
+            # Alan 9/22/26 - Jittered, per MycoMap's own recommendation: when a
+            # batch hits a MycoMap slowdown, un-jittered retries from every job
+            # land on the same seconds and keep the pile-up going.
+            delay = round(
+                FASTA_FETCH_RETRY_BASE_SECONDS * (2 ** attempt) * random.uniform(0.8, 1.6), 1
+            )
             if deadline is not None and time.monotonic() + delay >= deadline:
                 logger.warning(
                     "%s (attempt %s/%s); no time budget left to retry.",

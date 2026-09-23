@@ -10,6 +10,7 @@ import collections
 import json
 import logging
 import re
+import random
 import time
 import traceback
 import hashlib
@@ -24,7 +25,7 @@ from app.services.artifact_storage import (
 )
 from app.services.log_context import (
     JobContextFilter, background_job_context, bind_background_context,
-    background_user_identity,
+    background_user_identity, failure_message_field, note_job_failure_logged,
     stable_fingerprint, utc_formatter,
 )
 from app.services.tree_parameter_validation import validate_iqtree_ufboot_count
@@ -201,6 +202,7 @@ def validate_pipeline_outputs(job_dir, job_params, logger_obj=logger,
 
     fasta_counts = {}
     duplicate_alignment_names = None
+    redundant_duplicate_names = None
     for path in required[:3]:
         if artifact_exists(path) and artifact_size(path):
             try:
@@ -208,6 +210,7 @@ def validate_pipeline_outputs(job_dir, job_params, logger_obj=logger,
                     if path == required[2]:
                         seen_sequences = {}
                         duplicate_alignment_names = set()
+                        redundant_duplicate_names = []
                         count = 0
                         for record in SeqIO.parse(handle, "fasta"):
                             count += 1
@@ -216,6 +219,7 @@ def validate_pipeline_outputs(job_dir, job_params, logger_obj=logger,
                             if sequence in seen_sequences:
                                 duplicate_alignment_names.add(seen_sequences[sequence])
                                 duplicate_alignment_names.add(name)
+                                redundant_duplicate_names.append(name)
                             else:
                                 seen_sequences[sequence] = name
                         fasta_counts[path.name] = count
@@ -239,6 +243,7 @@ def validate_pipeline_outputs(job_dir, job_params, logger_obj=logger,
                 tree, logger_obj,
                 support_expected=_support_expected(job_params),
                 duplicate_alignment_names=duplicate_alignment_names,
+                redundant_duplicate_names=redundant_duplicate_names,
             )
         except Exception as exc:
             failures.append(f"unparseable_newick:{type(exc).__name__}")
@@ -387,11 +392,35 @@ def _support_expected(job_params) -> Optional[bool]:
     return None
 
 
+def _zero_branch_ratio_without_duplicates(tree, redundant_names):
+    """(zero, total) branch counts after pruning all but one of each identical
+    aligned sequence, or None when the names do not all match tree tips (in
+    which case the caller must not treat the zeros as explained)."""
+    import copy
+
+    tip_names = {tip.name for tip in tree.get_terminals()}
+    if not set(redundant_names) <= tip_names:
+        return None
+    if len(tip_names) - len(set(redundant_names)) < 3:
+        return None
+    reduced = copy.deepcopy(tree)
+    for name in redundant_names:
+        reduced.prune(name)
+    lengths = [
+        clade.branch_length for clade in reduced.find_clades()
+        if clade.branch_length is not None
+    ]
+    if not lengths:
+        return None
+    return sum(1 for length in lengths if length == 0), len(lengths)
+
+
 def _summarize_tree_quality(
     tree,
     logger_obj,
     support_expected: Optional[bool] = None,
     duplicate_alignment_names: Optional[set[str]] = None,
+    redundant_duplicate_names: Optional[list[str]] = None,
 ) -> dict:
     """Report the tree-shaped failure modes this pipeline actually produces.
 
@@ -458,6 +487,24 @@ def _summarize_tree_quality(
             and set(zero_terminal_names) == duplicate_alignment_names
             and len(zero_terminal_names) == len(duplicate_alignment_names)
         )
+        # Alan 9/22/26 - The exact-match test above only accepts duplicates that
+        # sit as zero-length terminals, but a tree builder joins a group of
+        # identical sequences with zero-length INTERNAL branches too (a clade of
+        # three, or the ladder IQ-TREE leaves when it re-inserts them). All 39
+        # of these DEGRADED lines in one review window were that, and every one
+        # of those trees had at most one zero branch left once the identical
+        # sequences were reduced to one each. So measure the tree the data can
+        # actually resolve: keep one tip per identical group, and only call it
+        # degraded if more than a quarter of THAT tree's branches are zero.
+        reduced = None
+        if not duplicates_explain_zeros and redundant_duplicate_names:
+            reduced = _zero_branch_ratio_without_duplicates(
+                tree, redundant_duplicate_names
+            )
+            if reduced is not None:
+                summary["zero_length_branches_after_dedup"] = reduced[0]
+                summary["branches_after_dedup"] = reduced[1]
+                duplicates_explain_zeros = reduced[0] / reduced[1] <= 0.25
         if duplicates_explain_zeros:
             logger_obj.info(
                 "event=tree.zero_length_branches_explained "
@@ -468,14 +515,17 @@ def _summarize_tree_quality(
         else:
             log_degradation(
                 logger_obj, "tree_many_zero_length_branches",
-                "More than a quarter of branches have length exactly zero and "
-                "the final alignment does not fully explain them as duplicates",
+                "More than a quarter of branches have length exactly zero, even "
+                "after identical aligned sequences are reduced to one each",
                 zero_branches=zero_branches,
                 zero_terminal_branches=len(zero_terminal_names),
                 zero_internal_branches=zero_internal_branches,
                 duplicate_aligned_records=(
                     len(duplicate_alignment_names)
                     if duplicate_alignment_names is not None else "unknown"
+                ),
+                zero_branches_after_dedup=(
+                    f"{reduced[0]}/{reduced[1]}" if reduced else "unknown"
                 ),
                 total=len(branch_lengths),
             )
@@ -841,7 +891,11 @@ def run_recompute_job(job_id: str, params_dict: dict) -> dict:
     except Exception as e:
         error_msg = str(e)
         tb = traceback.format_exc()
-        logger.exception("event=job.recompute_failed Recompute job failed")
+        logger.exception(
+            "event=job.recompute_failed Recompute job failed exception=%s error=%s",
+            type(e).__name__, failure_message_field(e),
+        )
+        note_job_failure_logged(getattr(get_current_job(), "id", None))
 
         failed_step = "unknown"
         failed_step_label = "Recompute"
@@ -969,6 +1023,74 @@ def run_mycomap_blast_refresh_job(params: dict) -> dict:
     if warnings:
         payload["warnings"] = warnings
     return payload
+
+
+# Alan 9/23/26 - A tree-preparation pass re-reads the iNat observation, and a
+# large bulk run keeps iNaturalist's rate limiter tripped for hours. A 429 that
+# survived _http_request's own backoff used to fail the job outright, even one
+# that was only waiting on MycoMap. Nothing is wrong with the job, so wait the
+# limiter out on RQ's schedule instead -- a deferral holds no worker slot.
+INAT_RATE_LIMIT_DEFER_SECONDS = 60
+INAT_RATE_LIMIT_MAX_DEFERRALS = 60
+# A bulk job parked by the shared iNaturalist cooldown made no request, so it
+# does not spend the allowance above; it gets its own, sized for a throttle
+# that lasts most of a day (144 ten-minute cooldowns).
+INAT_COOLDOWN_MAX_WAITS = 144
+
+
+def _defer_for_inat_rate_limit(job, job_id: str, exc: Exception) -> Optional[Retry]:
+    """Return an rq.Retry for a preparation pass iNaturalist rate-limited.
+
+    None means "fail as before": not a 429, no RQ job, or the allowance spent.
+    The job's preparation meta is left untouched, so the next pass resumes
+    exactly where this one was refused.
+    """
+    if job is None or getattr(exc, "status", None) != 429:
+        return None
+    cooldown = int((getattr(exc, "details", None) or {}).get("inat_cooldown_seconds") or 0)
+    if cooldown > 0:
+        meta_key, limit = "inat_cooldown_waits", INAT_COOLDOWN_MAX_WAITS
+        # Spread the resumptions so the queue does not all return at once.
+        wait_seconds = cooldown + random.randint(0, 30)
+    else:
+        meta_key, limit = "inat_rate_limit_deferrals", INAT_RATE_LIMIT_MAX_DEFERRALS
+        wait_seconds = INAT_RATE_LIMIT_DEFER_SECONDS
+    deferrals = int(job.meta.get(meta_key) or 0)
+    if deferrals >= limit:
+        return None
+    from app.extensions import db
+    from app.models import Job
+
+    job.meta[meta_key] = deferrals + 1
+    job.meta["steps"][STEP_INPUT].update({
+        "state": STATE_QUEUED,
+        "label": "Waiting for iNaturalist",
+        "detail": "iNaturalist is rate-limiting requests right now.",
+    })
+    job.meta["current_step"] = STEP_INPUT
+    job.save_meta()
+    db_job = Job.query.get(job_id)
+    if db_job:
+        db_job.status = "queued"
+        db.session.commit()
+    publish_overview(
+        job_id,
+        "iNaturalist is rate-limiting requests right now. Dikarya will try "
+        + ("again in a minute" if wait_seconds < 120
+           else f"again in about {round(wait_seconds / 60)} minutes")
+        + "; nothing about this job needs to change.",
+    )
+    publish_job_queued(job_id)
+    # RQ counts retries cumulatively on the job, so allow exactly one more
+    # rather than borrowing from a MycoMap wait's budget.
+    retries_done = getattr(job, "number_of_retries", None) or 0
+    logger.info(
+        "event=job.deferred Waiting out the iNaturalist rate limit "
+        "reason=%s resume_in_seconds=%s attempt=%s/%s",
+        "inat_cooldown" if cooldown > 0 else "inat_rate_limited",
+        wait_seconds, deferrals + 1, limit,
+    )
+    return Retry(max=retries_done + 1, interval=wait_seconds)
 
 
 @background_job_context()
@@ -1173,30 +1295,48 @@ def run_phylo_job(job_params: dict) -> dict:
                             progress=_mycomap_progress,
                         )
                     else:
-                        from app.services.inaturalist_tree_service import prepare_inat_tree_job
-
-                        prepared = prepare_inat_tree_job(
-                            int(tree_preparation["observation_id"]),
-                            include_ncbi=bool(tree_preparation.get("include_ncbi", True)),
-                            include_local=bool(tree_preparation.get("include_local", True)),
-                            rebuild_ncbi_blast=bool(tree_preparation.get("rebuild_ncbi_blast")),
-                            recreate_existing_tree=bool(
-                                tree_preparation.get("recreate_existing_tree")
-                            ),
-                            keep_existing_tree_url=bool(
-                                tree_preparation.get("keep_existing_tree_url")
-                            ),
-                            mycomap_local_limit=tree_preparation.get("mycomap_local_limit"),
-                            mycomap_ncbi_limit=tree_preparation.get("mycomap_ncbi_limit"),
-                            defer_after_ncbi_rerun=not tree_resuming_after_ncbi,
-                            skip_mycomap_refresh=tree_resuming_after_ncbi,
-                            mycomap_rerun_details=(
-                                job.meta.get("mycomap_rerun_details") if job else None
-                            ),
-                            progress=_mycomap_progress,
+                        from app.services.inaturalist_tree_service import (
+                            InatTreeError,
+                            prepare_inat_tree_job,
                         )
+
+                        try:
+                            prepared = prepare_inat_tree_job(
+                                int(tree_preparation["observation_id"]),
+                                include_ncbi=bool(tree_preparation.get("include_ncbi", True)),
+                                include_local=bool(tree_preparation.get("include_local", True)),
+                                rebuild_ncbi_blast=bool(tree_preparation.get("rebuild_ncbi_blast")),
+                                recreate_existing_tree=bool(
+                                    tree_preparation.get("recreate_existing_tree")
+                                ),
+                                keep_existing_tree_url=bool(
+                                    tree_preparation.get("keep_existing_tree_url")
+                                ),
+                                mycomap_local_limit=tree_preparation.get("mycomap_local_limit"),
+                                mycomap_ncbi_limit=tree_preparation.get("mycomap_ncbi_limit"),
+                                defer_after_ncbi_rerun=not tree_resuming_after_ncbi,
+                                skip_mycomap_refresh=tree_resuming_after_ncbi,
+                                mycomap_rerun_details=(
+                                    job.meta.get("mycomap_rerun_details") if job else None
+                                ),
+                                progress=_mycomap_progress,
+                                # Batches share MycoMap's capacity; a single tree
+                                # on the high lane is never held back by them.
+                                throttle_mycomap_creation=bool(
+                                    job and getattr(job, "origin", None) == "phylo_bulk"
+                                ),
+                                # Each deferred poll re-enters here; reuse this
+                                # job's own copy of the observation between polls.
+                                observation_reuse_owner=job_id,
+                            )
+                        except InatTreeError as exc:
+                            deferral = _defer_for_inat_rate_limit(job, job_id, exc)
+                            if deferral is None:
+                                raise
+                            return deferral
                 if prepared.get("status") == "waiting_for_ncbi":
                     from app.services.mycomap_service import (
+                        get_mycomap_bulk_throttle_max_wait_attempts,
                         get_mycomap_creation_discovery_max_attempts,
                         get_mycomap_creation_discovery_poll_interval_seconds,
                         get_mycomap_ncbi_poll_interval_seconds,
@@ -1222,11 +1362,32 @@ def run_phylo_job(job_params: dict) -> dict:
                             get_mycomap_ncbi_poll_interval_seconds()
                             if auto_created else get_mycomap_ncbi_rerun_wait_seconds()
                         )
+                    # A bulk job can also wait its turn for a MycoMap creation
+                    # slot before any of that starts; give that wait its own
+                    # allowance so a long batch cannot exhaust the budget.
                     max_retry_attempts = (
                         get_mycomap_creation_discovery_max_attempts()
                         + get_mycomap_ncbi_poll_max_attempts()
+                        + get_mycomap_bulk_throttle_max_wait_attempts()
                         if auto_created else 1
                     )
+                    # Alan 9/23/26 - RQ 2.6.1 only increments number_of_retries on
+                    # the immediate-requeue path (Job._handle_retry_result); a
+                    # Retry with an interval is rescheduled without counting, so
+                    # Retry(max=...) below was never enforced and a search that
+                    # never appeared was polled forever (every deferral logged
+                    # attempt=1). Count the waits ourselves and fail through the
+                    # normal error path, which marks the job row failed.
+                    wait_attempts = (
+                        int(job.meta.get("mycomap_wait_attempts") or 0) if job else 0
+                    ) + 1
+                    if wait_attempts > max_retry_attempts:
+                        raise RuntimeError(
+                            "MycoMap did not return this observation's BLAST "
+                            f"results after {max_retry_attempts} checks. The "
+                            "search may still finish on MycoMap; rebuild the "
+                            "tree to try again."
+                        )
                     resume_at = datetime.now(timezone.utc) + timedelta(seconds=wait_seconds)
                     refresh_warnings = list(rerun_details.get("warnings") or [])
                     # A rerun deferral never polls, so it has no queue position of
@@ -1256,7 +1417,21 @@ def run_phylo_job(job_params: dict) -> dict:
                         rerun_details["ncbi_queue_position_announced"] = current_position
                     if auto_created:
                         poll_attempt = int(rerun_details.get("ncbi_poll_attempt") or 0)
-                        if rerun_details.get("creation_pending"):
+                        if rerun_details.get("creation_throttled"):
+                            waiting_message = (
+                                "Waiting for a MycoMap BLAST slot. Dikarya keeps "
+                                "only a limited number of batch searches running "
+                                "on MycoMap at once; this one starts when a slot "
+                                "frees up."
+                            )
+                        elif (rerun_details.get("creation_unconfirmed")
+                              and not rerun_details.get("creation_pending_blast_id")):
+                            waiting_message = (
+                                "MycoMap did not answer the request to create the "
+                                "BLAST search in time. Dikarya is checking whether "
+                                "it was created, and will send it again if not."
+                            )
+                        elif rerun_details.get("creation_pending"):
                             # Deliberately short. The retry cadence and the
                             # multi-day discovery budget were noise on a line the
                             # user re-reads every minute; the queue position is
@@ -1272,9 +1447,14 @@ def run_phylo_job(job_params: dict) -> dict:
                                     f"check {poll_attempt + 1} will run in one minute."
                                 )
                             else:
+                                url_note = (
+                                    "its URL could not be added to iNaturalist"
+                                    if rerun_details.get("inat_mycomap_field_status") == "failed"
+                                    else "its URL was added to iNaturalist"
+                                )
                                 waiting_message = (
                                     "MycoMap BLAST was created from the observation's DNA "
-                                    "Barcode ITS and its URL was added to iNaturalist. "
+                                    f"Barcode ITS and {url_note}. "
                                     f"NCBI results are not ready yet; check {poll_attempt + 1} "
                                     "will run in one minute."
                                 )
@@ -1310,6 +1490,7 @@ def run_phylo_job(job_params: dict) -> dict:
                         db.session.commit()
 
                     if job:
+                        job.meta["mycomap_wait_attempts"] = wait_attempts
                         job.meta[tree_preparation_meta_key] = "waiting_for_ncbi"
                         job.meta["mycomap_rerun_details"] = rerun_details
                         job.meta["mycomap_ncbi_resume_at"] = resume_at.isoformat()
@@ -1330,20 +1511,14 @@ def run_phylo_job(job_params: dict) -> dict:
                         publish_overview(job_id, queue_message)
                     publish_job_queued(job_id)
                     # Same as the refresh task: mark the wait so the resumed
-                    # job.started is not counted as a failure retry.
-                    # RQ counts retries cumulatively on the job itself
-                    # (handle_job_retry compares job.number_of_retries against
-                    # Retry.max), so the budget really does deplete even though
-                    # every deferral returns a fresh Retry with the same max.
-                    # Report the position in that budget rather than the bare
-                    # maximum, which read as a never-decreasing "attempts_left".
-                    retries_done = (getattr(job, "number_of_retries", None) or 0) if job else 0
+                    # job.started is not counted as a failure retry. The budget
+                    # is our own wait_attempts counter (see above), not RQ's.
                     logger.info(
                         "event=job.deferred Waiting for MycoMap NCBI results "
                         "reason=mycomap_ncbi_rerun resume_in_seconds=%s "
                         "attempt=%s/%s attempts_remaining=%s",
-                        wait_seconds, retries_done + 1, max_retry_attempts,
-                        max(max_retry_attempts - retries_done, 0),
+                        wait_seconds, wait_attempts, max_retry_attempts,
+                        max(max_retry_attempts - wait_attempts, 0),
                     )
                     return Retry(max=max_retry_attempts, interval=wait_seconds)
 
@@ -2371,10 +2546,13 @@ def run_phylo_job(job_params: dict) -> dict:
         error_msg = str(e)
         tb = traceback.format_exc()
         
+        # error= puts the cause on the searchable line itself, so
+        # `grep job.failed` answers "why" without reading each traceback.
         logger.exception(
-            "event=job.failed Job failed at step=%s exception=%s",
-            current_step or "unknown", type(e).__name__,
+            "event=job.failed Job failed at step=%s exception=%s error=%s",
+            current_step or "unknown", type(e).__name__, failure_message_field(e),
         )
+        note_job_failure_logged(getattr(get_current_job(), "id", None))
         
         # A structured tool exception carries data from the failed invocation.
         # Ordinary exceptions deliberately get no process stats: substituting a

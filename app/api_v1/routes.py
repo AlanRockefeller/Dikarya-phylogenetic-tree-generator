@@ -1417,6 +1417,16 @@ def job_events(job_id):
             last_activity = started
             last_registry_touch = started
             while True:
+                # The web service is restarting; let go now rather than hold
+                # the old process (and nginx's 502 window) open.
+                if sse_registry.shutting_down():
+                    yield (
+                        f"retry: {sse_registry.SHUTDOWN_RETRY_MS}\n"
+                        "event: timeout\ndata: {\"reason\": \"server_restart\"}\n\n"
+                    )
+                    close_reason = "server_shutdown"
+                    break
+
                 # Hard duration cap. Clients should reconnect.
                 if time.monotonic() - started > max_stream_seconds:
                     yield (

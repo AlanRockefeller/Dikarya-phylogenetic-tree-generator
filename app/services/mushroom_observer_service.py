@@ -703,9 +703,12 @@ def create_tree_job(raw_input: str, sequence_id: Any, *, user=None,
 
 
 def _creation_wait_details(created: Dict[str, Any], *, title: str,
-                           local_limit: int, ncbi_limit: int) -> Dict[str, Any]:
+                           local_limit: int, ncbi_limit: int,
+                           attempts: int = 1) -> Dict[str, Any]:
     pending = bool(created.get("record_pending"))
     return {
+        "creation_unconfirmed": bool(created.get("creation_unconfirmed")),
+        "creation_attempts": attempts,
         "local_limit": local_limit,
         "ncbi_limit": ncbi_limit,
         "local": created,
@@ -834,6 +837,7 @@ def prepare_tree_job(preparation: Dict[str, Any], *, defer_after_ncbi_rerun: boo
         create_mycomap_blast,
         find_mycomap_blast_by_title,
         get_mycomap_creation_discovery_max_seconds,
+        unconfirmed_mycomap_creation_verdict,
         validate_mycomap_url,
         validate_mycomap_rerun_limit,
     )
@@ -874,6 +878,46 @@ def prepare_tree_job(preparation: Dict[str, Any], *, defer_after_ncbi_rerun: boo
         )
         discovery_warnings.extend(lookup_warnings)
         discovery_warnings = list(dict.fromkeys(discovery_warnings))
+        verdict = "wait" if found else unconfirmed_mycomap_creation_verdict(
+            details, lookup_warnings=lookup_warnings, pending_creation=pending_creation
+        )
+        if verdict == "give_up":
+            raise MushroomObserverError(
+                "MycoMap did not respond when Dikarya tried to create this "
+                "BLAST search, and has no record of it after "
+                f"{details.get('creation_attempts')} attempts. MycoMap may be "
+                "down; try again later.",
+                status=502,
+            )
+        if verdict == "retry":
+            # The timed-out create POST never reached MycoMap: send it again,
+            # keeping the discovery clock running across the re-send.
+            attempts = int(details.get("creation_attempts") or 1) + 1
+            carried, _ = advance_mycomap_creation_discovery(details)
+            logger.info(
+                "event=mycomap.creation_resent observation=mo:%s attempt=%s",
+                observation_id, attempts,
+            )
+            try:
+                created = create_mycomap_blast(
+                    sequence, title=title,
+                    local_limit=local_limit, ncbi_limit=ncbi_limit,
+                )
+            except MycoMapCreateError as exc:
+                raise MushroomObserverError(str(exc), status=502)
+            details = _creation_wait_details(
+                created, title=title, local_limit=local_limit,
+                ncbi_limit=ncbi_limit, attempts=attempts,
+            )
+            for key in ("creation_discovery_attempt",
+                        "creation_discovery_elapsed_seconds"):
+                details[key] = carried.get(key, 0)
+            return {
+                "status": "waiting_for_ncbi",
+                "notes": _job_title(observation_id, preparation.get("consensus_name")),
+                "mycomap_blast_url": str(details.get("created_mycomap_url") or ""),
+                "mycomap_rerun_details": details,
+            }
         if not found:
             details, expired = advance_mycomap_creation_discovery(details)
             if expired:

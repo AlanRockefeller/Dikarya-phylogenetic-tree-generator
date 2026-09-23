@@ -83,6 +83,7 @@ _TIP_NAME_WHITESPACE_CONTROLS = frozenset("\t\n\r\v\f")
 from app.services.tree_io import (  # noqa: E402,F401
     NEWICK_BRANCH_LENGTH_FORMAT,
     quote_tree_label,
+    reroot_preserving_support,
     write_nexus_tree,
     write_tree_file,
 )
@@ -1082,7 +1083,7 @@ def reroot_tree(job_dir: Path, tree_json: Dict, root_target: str) -> Dict:
              )
         
         # Reroot
-        tree.root_with_outgroup(target_clade)
+        reroot_preserving_support(tree, lambda: tree.root_with_outgroup(target_clade))
         return _write_rerooted_tree(job_dir, tree_json, tree, root_target)
         
     except Exception as e:
@@ -1160,7 +1161,7 @@ def reroot_tree_on_best_outgroup_clade(job_dir: Path, tree_json: Dict,
     if target_clade is None:
         raise ValueError(f"Root target not found: {target_tip}")
 
-    tree.root_with_outgroup(target_clade)
+    reroot_preserving_support(tree, lambda: tree.root_with_outgroup(target_clade))
     return _write_rerooted_tree(job_dir, tree_json, tree, target_tip), clade_info
 
 
@@ -1190,7 +1191,7 @@ def midpoint_root(job_dir: Path, tree_json: Dict) -> Dict:
         # This modifies the tree in-place usually, but sometimes returns new tree depending on version.
         # Phylo.NewickIO check: root_at_midpoint modifies in place.
         try:
-            tree.root_at_midpoint()
+            reroot_preserving_support(tree, tree.root_at_midpoint)
         except Exception as e:
             logger.warning(f"Midpoint rooting failed (Math domain or topology?): {e}")
             raise ValueError(f"Midpoint rooting failed: {e}") from e

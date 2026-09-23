@@ -389,6 +389,7 @@
                     <span class="font-mono bg-gray-100 dark:bg-journal-dark px-2 py-1 rounded">ID: {{ job_id }}</span>
                     <span>Elapsed: <span id="elapsed-time" class="font-mono font-bold">--</span></span>
                 </div>
+                <p id="queue-position" class="hidden mt-2 text-sm text-gray-600 dark:text-gray-300" aria-live="polite"></p>
             </div>
 
             <div class="flex flex-col items-end gap-2">
@@ -763,7 +764,7 @@
 {% endblock %}
 
 {% block scripts %}
-<script src="{{ url_for('static', filename='js/job_status.js') }}?v=20"></script>
+<script src="{{ url_for('static', filename='js/job_status.js') }}?v=21"></script>
 <script>
     // Downloads dropdown. The completed job's downloads are its primary output, so
     // they must be reachable with a mouse, a keyboard and a finger alike.

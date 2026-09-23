@@ -48,6 +48,12 @@ from app.services.security_events import (  # noqa: E402
 from app.services.security_actors import ESCALATION_THRESHOLD  # noqa: E402
 # UUID form used for RQ job ids in worker logs.
 UUID_PATTERN = r'[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}'
+# Alan 9/23/26 - Jobs since 2026-09-09 have short base36 ids (job_id_service:
+# 4-12 of [a-z0-9]), which UUID_PATTERN never matched, so RQ's own "work horse
+# killed" line was invisible for every new job. Only used where RQ's wording
+# pins the id's position: in "Successfully completed <description> job in ..."
+# a bare [a-z0-9]{4,12} would match a word of the description.
+JOB_ID_PATTERN = rf'(?:{UUID_PATTERN}|[a-z0-9]{{4,12}})'
 
 
 def open_maybe_gz(path):
@@ -588,12 +594,33 @@ RQ_TERMINAL_RES = {
         re.compile(rf'Successfully completed (?:job )?(?P<id>{UUID_PATTERN})'),
     ),
     "failed": (
-        re.compile(rf'moving job (?P<id>{UUID_PATTERN}) to FailedJobRegistry'),
-        re.compile(rf'job (?P<id>{UUID_PATTERN}) stopped by user'),
-        re.compile(rf'Work horse killed for job (?P<id>{UUID_PATTERN})'),
-        re.compile(rf'job (?P<id>{UUID_PATTERN}) has exceeded maximum retry attempts'),
+        re.compile(rf'moving job (?P<id>{JOB_ID_PATTERN}) to FailedJobRegistry'),
+        re.compile(rf'job (?P<id>{JOB_ID_PATTERN}) stopped by user'),
+        re.compile(rf'Work horse killed for job (?P<id>{JOB_ID_PATTERN}):'),
+        re.compile(rf'job (?P<id>{JOB_ID_PATTERN}) has exceeded maximum retry attempts'),
     ),
 }
+# What each RQ failure line means, for the "Failed jobs" section. Keyed by the
+# index of the pattern in RQ_TERMINAL_RES["failed"].
+RQ_FAILURE_CAUSES = (
+    "RQ moved the job to FailedJobRegistry",
+    "stopped by user",
+    "work horse killed (process died mid-run)",
+    "RQ retry limit exceeded",
+)
+# The task's own failure line: event=job.failed Job failed at step=S
+# exception=E error="...". error= is JSON-quoted (log_context.failure_message_field).
+FAILED_DETAIL_RE = re.compile(
+    r'event=job\.failed\b.*?\bstep=(?P<step>\S+).*?\bexception=(?P<exc>\S+)'
+    r'(?:\s+error=(?P<error>"(?:[^"\\]|\\.)*"))?'
+)
+# Written by job_reconcile_service for a job it failed or requeued after the
+# job's process died without reporting. The worker main process has no job
+# context, so the id is in the message, not the context suffix.
+RECONCILED_RE = re.compile(
+    rf'event=job\.reconciled_(?P<action>failed|requeued)\s+job_id=(?P<id>{JOB_ID_PATTERN})\b'
+    r'.*?\breason=(?P<reason>"(?:[^"\\]|\\.)*")'
+)
 # A retry or a repeat is not an outcome: the job runs again and reports later.
 RQ_RETRY_RES = (
     re.compile(rf'handling retry of job (?P<id>{UUID_PATTERN})'),
@@ -669,7 +696,16 @@ def _timestamped_worker_lines(files, cutoff, until):
     return records, lines, unparsed
 
 
-def analyze_worker(cutoff, grace=timedelta(minutes=60), until=None):
+def _quoted(value):
+    if not value:
+        return ""
+    try:
+        return json.loads(value)
+    except ValueError:
+        return value.strip('"')
+
+
+def analyze_worker(cutoff, grace=timedelta(minutes=60), until=None, details=None):
     """Summarize worker job lifecycle from the worker logs (no Redis, no DB).
 
     Alan 9/7/26 - Both queues are read, not just phylo_high. This used to glob
@@ -682,6 +718,12 @@ def analyze_worker(cutoff, grace=timedelta(minutes=60), until=None):
     normally lives on one worker, so per-job order survives either way, but a
     requeue that lands on the other queue would otherwise be read out of order
     and counted as a fresh lifecycle.
+
+    When ``details`` is a dict it receives ``failures`` -- one entry per
+    failed job with its step, exception and message, never truncated -- and
+    ``waiting``, the stale jobs whose last word was job.deferred. Those are
+    planned waits (MycoMap), not stranded work, so they are left out of the
+    returned stale list and reported as a count.
     """
     streams = [log_files(stem, cutoff) for stem in WORKER_STEMS]
     files = [path for stream in streams for path in stream]
@@ -691,6 +733,8 @@ def analyze_worker(cutoff, grace=timedelta(minutes=60), until=None):
     last_start = {}
     retry_markers = collections.Counter()
     deferred_markers = collections.Counter()
+    last_event = {}
+    failures = {}
     oldest = newest = None
     lines = unparsed = contextual = window_lines = 0
     merged = []
@@ -714,6 +758,22 @@ def analyze_worker(cutoff, grace=timedelta(minutes=60), until=None):
             contextual += 1
         if "DEGRADED" in line:
             counts["degraded"] += 1
+
+        reconciled = RECONCILED_RE.search(line)
+        if reconciled:
+            job_id = reconciled.group("id")
+            if reconciled.group("action") == "failed":
+                if job_id not in terminal:
+                    counts["failed"] += 1
+                    terminal.add(job_id)
+                failures[job_id] = {
+                    "job": job_id, "when": when, "step": "-",
+                    "exception": "reconciled",
+                    "error": _quoted(reconciled.group("reason")),
+                }
+            else:
+                counts["requeued"] += 1
+            continue
 
         # 1. Dikarya's own stable events win: they carry the application
         #    job id, which is what an operator can act on.
@@ -762,6 +822,15 @@ def analyze_worker(cutoff, grace=timedelta(minutes=60), until=None):
                 if job_id not in terminal:
                     counts[state] += 1
                     terminal.add(job_id)
+                if state == "failed":
+                    detail = FAILED_DETAIL_RE.search(line)
+                    failures[job_id] = {
+                        "job": job_id, "when": when,
+                        "step": detail.group("step") if detail else "?",
+                        "exception": detail.group("exc") if detail else "?",
+                        "error": _quoted(detail.group("error")) if detail else "",
+                    }
+            last_event[fields["job"]] = state
             continue
 
         # 2. RQ terminal lines. Checked before starts because "Job OK
@@ -773,6 +842,19 @@ def analyze_worker(cutoff, grace=timedelta(minutes=60), until=None):
                 if job_id not in terminal:
                     counts[state] += 1
                     terminal.add(job_id)
+                if state == "failed" and job_id not in failures:
+                    # Only when the task never reported its own failure: a
+                    # killed work horse, a stop, or a failure outside the
+                    # task's except block.
+                    cause = next(
+                        (RQ_FAILURE_CAUSES[i] for i, pattern in enumerate(patterns)
+                         if pattern.search(line)),
+                        "RQ reported a failure",
+                    )
+                    failures[job_id] = {
+                        "job": job_id, "when": when, "step": "-",
+                        "exception": "rq", "error": cause,
+                    }
                 matched = True
                 break
         if matched:
@@ -825,7 +907,13 @@ def analyze_worker(cutoff, grace=timedelta(minutes=60), until=None):
     unmatched = [(job_id, when) for job_id, when in started.items() if job_id not in terminal]
     active = [item for item in unmatched if reference - item[1] < grace]
     stale = sorted((item for item in unmatched if reference - item[1] >= grace), key=lambda item: item[1])
+    waiting = [item for item in stale if last_event.get(item[0]) == "deferred"]
+    stale = [item for item in stale if last_event.get(item[0]) != "deferred"]
     counts["active"] = len(active)
+    counts["waiting"] = len(waiting)
+    if details is not None:
+        details["failures"] = sorted(failures.values(), key=lambda item: item["when"])
+        details["waiting"] = waiting
     return counts, stale, coverage_record(files, oldest, newest, lines, unparsed, 0, contextual, window_lines)
 
 
@@ -925,8 +1013,10 @@ def main():
 
     access = analyze_access(cutoff, until=until)
     errors = analyze_errors(cutoff, until=until)
+    worker_details = {}
     worker_counts, unterminated, worker_coverage = analyze_worker(
-        cutoff, grace=timedelta(minutes=args.unterminated_grace_minutes), until=until
+        cutoff, grace=timedelta(minutes=args.unterminated_grace_minutes), until=until,
+        details=worker_details,
     )
     print(
         f"Dikarya log digest -- {window_label} "
@@ -961,16 +1051,25 @@ def main():
     print("  " + "  ".join(
         f"{'recent_unterminated' if key == 'active' else key}={worker_counts.get(key, 0)}"
         for key in ("started", "completed", "failed", "retried", "deferred",
-                    "active", "degraded")
+                    "requeued", "waiting", "active", "degraded")
     ))
     print("  Log-only lifecycle: older unterminated jobs may still be running; check /health/jobs for live activity.")
     reference = until
     rows(
         [f"no terminal event observed: {job} (started {when:%Y-%m-%d %H:%M}, age {format_age(reference - when)})"
          for job, when in unterminated[:args.top]],
-        empty=f"  every started job reached a terminal event or is still within the "
-              f"{args.unterminated_grace_minutes:g}-minute grace period",
+        empty=f"  every started job reached a terminal event, is still within the "
+              f"{args.unterminated_grace_minutes:g}-minute grace period, or is waiting "
+              f"on an upstream result (waiting={worker_counts.get('waiting', 0)})",
     )
+    # Alan 9/23/26 - Every failure, never truncated: "failed=11" with the causes
+    # left to the top-N exception groups hid 4 of the 11 on 2026-09-22.
+    section("Failed jobs")
+    rows([
+        f"{item['when']:%Y-%m-%d %H:%M}  {item['job']}  step={item['step']}  "
+        f"{item['exception']}: {item['error'][:200] or '(no message logged)'}"
+        for item in worker_details.get("failures", [])
+    ])
     section(f"Slow requests (> {args.slow_threshold:g}s; streams excluded)")
     slow_rows = []
     for endpoint, values in access["durations"].items():

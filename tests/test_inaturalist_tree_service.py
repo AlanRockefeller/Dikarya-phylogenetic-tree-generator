@@ -692,8 +692,8 @@ class TestInaturalistTreeSourceLabel(unittest.TestCase):
                 return_value=(0, []),
             ),
             patch(
-                "app.services.mycomap_service.get_mycomap_ncbi_queue_position",
-                return_value=None,
+                "app.services.mycomap_service.get_mycomap_ncbi_queue_status",
+                return_value={"queue_position": None, "status": None, "rid": None, "source": None},
             ),
             patch(
                 "app.api.routes.gather_mycomap_sequences_for_queue",
@@ -748,8 +748,8 @@ class TestInaturalistTreeSourceLabel(unittest.TestCase):
                 return_value=(2, []),
             ),
             patch(
-                "app.services.mycomap_service.get_mycomap_ncbi_queue_position",
-                return_value=None,
+                "app.services.mycomap_service.get_mycomap_ncbi_queue_status",
+                return_value={"queue_position": None, "status": None, "rid": None, "source": None},
             ),
             patch(
                 "app.api.routes.gather_mycomap_sequences_for_queue",
@@ -776,8 +776,8 @@ class TestInaturalistTreeSourceLabel(unittest.TestCase):
         }
         with (
             patch(
-                "app.services.mycomap_service.get_mycomap_ncbi_queue_position",
-                return_value=2741,
+                "app.services.mycomap_service.get_mycomap_ncbi_queue_status",
+                return_value={"queue_position": 2741, "status": "queued", "rid": None, "source": "api"},
             ),
             patch(
                 "app.services.mycomap_service.get_mycomap_ncbi_result_count",
@@ -808,8 +808,8 @@ class TestInaturalistTreeSourceLabel(unittest.TestCase):
         }
         with (
             patch(
-                "app.services.mycomap_service.get_mycomap_ncbi_queue_position",
-                return_value=2741,
+                "app.services.mycomap_service.get_mycomap_ncbi_queue_status",
+                return_value={"queue_position": 2741, "status": "queued", "rid": None, "source": "api"},
             ),
             patch(
                 "app.services.mycomap_service.get_mycomap_ncbi_result_count",

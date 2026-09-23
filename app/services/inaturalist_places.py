@@ -188,6 +188,24 @@ def _sleep_within(seconds: float, deadline: Optional[float]) -> bool:
     return remaining is None or remaining > 0
 
 
+def _take_inat_slot(deadline: Optional[float]) -> bool:
+    """Wait for a slot on the shared iNaturalist pacer, within the deadline.
+
+    Alan 9/23/26 - These lookups used to pace only themselves, so they competed
+    with every other iNaturalist caller in Dikarya for the same rate limit.
+    Returns False when the shared queue is too deep to wait out in time, which
+    callers treat like any other failed lookup: the label falls back.
+    """
+    from app.services.inaturalist_tree_service import InatTreeError, _pace_inat_request
+
+    try:
+        _pace_inat_request(max_wait=_remaining(deadline))
+    except InatTreeError as exc:
+        logger.warning("iNaturalist place lookup skipped: %s", exc)
+        return False
+    return True
+
+
 def _fetch_place_batch(place_ids: Sequence[int],
                        timeout: float = PLACE_REQUEST_TIMEOUT
                        ) -> Dict[int, Dict[str, Any]]:
@@ -338,6 +356,9 @@ def resolve_place_labels(observations: Sequence[Dict[str, Any]],
         if batches and not _sleep_within(PLACE_BATCH_DELAY, deadline):
             fetched_all = False
             break
+        if not _take_inat_slot(deadline):
+            fetched_all = False
+            break
         timeout = _request_timeout(deadline)
         if timeout is None:
             fetched_all = False
@@ -408,8 +429,10 @@ def fetch_observation_places(observation_ids: Iterable[int],
         })
         payload = None
         for attempt in range(1, OBSERVATION_FETCH_ATTEMPTS + 1):
-            # Recomputed per attempt: the previous attempt's own timeout and
-            # the backoff before it both spent part of the budget.
+            if not _take_inat_slot(deadline):
+                break
+            # Recomputed per attempt: the previous attempt's own timeout, the
+            # backoff before it and the pacing wait all spent part of the budget.
             timeout = _request_timeout(deadline)
             if timeout is None:
                 logger.warning("iNaturalist observation lookup ran out of time "

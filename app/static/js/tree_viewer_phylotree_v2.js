@@ -11,6 +11,14 @@
     // them at 1e-6. Use the same near-zero boundary as the tree-analysis metrics so either
     // engine's arbitrary binary resolution is presented as one soft polytomy.
     const ZERO_LENGTH_POLYTOMY_EPSILON = 1e-6;
+    // Alan 9/23/26 - Support labels are not drawn on a branch at or below this length. Such a
+    // branch cannot carry a single substitution on any alignment Dikarya builds (it would need
+    // 1e5 columns), so its support scores an arbitrary split of near-identical sequences and is
+    // uninformative -- a Quick Tree of one species printed "0" on 60% of its nodes. Looser than
+    // the polytomy epsilon on purpose: IQ-TREE also leaves such branches at 1-2.5e-6. A label that
+    // displays as zero is dropped too (see _addSupportLabels), since a blank already reads as
+    // unsupported.
+    const SUPPORT_LABEL_MIN_BRANCH_LENGTH = 1e-5;
 
     // Alan 8/24/26 - Say why a phylotree instance is not usable, or null when it is.
     // phylotree.js does not throw on a truncated or otherwise unparseable Newick: its
@@ -68,6 +76,13 @@
     // from being reinterpreted as provisional names.
     const UNQUOTED_PROVISIONAL_CODE_RE = /\b([A-Z][A-Za-z-]+\s+sp\.?)\s+([A-Za-z][A-Za-z0-9.-]*\d[A-Za-z0-9.-]*)\b/g;
 
+    // Danny Miller's provisional codes also travel with no "sp." at all ("OP028476 Hydnellum
+    // PNW10 iNat65285395"). Same species as Hydnellum sp. 'PNW10', so display it that way.
+    // Narrow on purpose (2-4 capitals + 2-3 digits, whole token) so accessions, iNat ids and
+    // vouchers such as REB-49 are never rewritten. Mirrors speciesUnquotedCode() in
+    // tree_viewer_controller.js.
+    const BARE_PROVISIONAL_CODE_RE = /(^|\s)([A-Z][a-z]{2,})\s+([A-Z]{2,4}\d{2,3})(?=\s|$)/g;
+
     // Alan 7/15/26 - Hide pipeline-only MAFFT and RiC annotations from tip labels while preserving stable tree IDs.
     function cleanTipDisplayName(name) {
         if (typeof name !== 'string') return name;
@@ -75,6 +90,7 @@
             .replace(/^_R_/, '')
             .replace(/\s+RiC(?:\s+\d+)?\s*$/i, '')
             .replace(UNQUOTED_PROVISIONAL_CODE_RE, "$1 '$2'")
+            .replace(BARE_PROVISIONAL_CODE_RE, "$1$2 sp. '$3'")
             .trim();
     }
 
@@ -2827,6 +2843,14 @@
                         }
                     }
 
+                    if (d.parent) {
+                        const incoming = self._branchLength(d);
+                        if (incoming !== null && Math.abs(incoming) <= SUPPORT_LABEL_MIN_BRANCH_LENGTH) {
+                            group.select("text.node-support-value").remove();
+                            return;
+                        }
+                    }
+
                     const numVal = self._extractSupportValue(d);
                     if (numVal === null) {
                         group.select("text.node-support-value").remove();
@@ -2868,6 +2892,17 @@
                     } else {
                         if (numVal + EPS < bootThreshold) { group.select("text.node-support-value").remove(); return; }
                         rawLabel = Math.round(numVal).toString();
+                    }
+
+                    // Alan 9/23/26 - Omit a label that displays as zero. Checked on the formatted
+                    // label so a 0.004 printed as "0" is caught too. A dual label is dropped only
+                    // at "0/0": "0/95" says the two tests disagree, which is worth showing.
+                    const isZeroLabel = dualVal
+                        ? /^0(\.0+)?\/0(\.0+)?$/.test(rawLabel)
+                        : Number(rawLabel) === 0;
+                    if (isZeroLabel) {
+                        group.select("text.node-support-value").remove();
+                        return;
                     }
 
                     // Append Text
@@ -6090,13 +6125,12 @@
                 }
                 requiredRight = Math.max(requiredRight, annotationBox.x + annotationBox.width);
             } catch (_) { /* fall back to the layout cursor */ }
-            // The container group carries translate(...) alone before any zoom, and
-            // translate(...) scale(k) afterwards, so convert group units to SVG units.
-            let offsetX = 0;
-            const transform = enclosure.attr('transform') || '';
-            const match = /translate\(\s*(-?[\d.]+)/.exec(transform);
-            if (match) offsetX = parseFloat(match[1]) || 0;
-            const needed = Math.ceil(offsetX + requiredRight * (k || 1) + 24);
+            // Alan 9/23/26 - Size the canvas in the LAYOUT frame, never the camera's. D3's pan/zoom
+            // overwrites the container transform, so reading it here made every right-drag pan
+            // grow the viewBox by the pan distance and the browser shrank the whole tree to fit.
+            const layoutTranslate = this._annotationLayoutTranslate(enclosure);
+            const offsetX = layoutTranslate.x;
+            const needed = Math.ceil(offsetX + requiredRight + 24);
             if (Number.isFinite(baseWidth)) {
                 setWidth(Math.max(baseWidth, needed));
             } else if (needed > 0) {
@@ -6108,13 +6142,13 @@
                 const raw = (baseViewBox || `0 0 ${Number.isFinite(baseWidth) ? baseWidth : needed} ${parseFloat(svgNode.getAttribute('height')) || 800}`)
                     .trim().split(/[\s,]+/).map(Number);
                 if (raw.length === 4 && raw.every(Number.isFinite)) {
-                    const translate = /translate\(\s*(-?[\d.]+)(?:[ ,]+(-?[\d.]+))?/.exec(transform);
-                    const tx = translate ? (parseFloat(translate[1]) || 0) : 0;
-                    const ty = translate ? (parseFloat(translate[2]) || 0) : 0;
-                    const left = tx + annotationBox.x * (k || 1) - 12;
-                    const top = ty + annotationBox.y * (k || 1) - 12;
-                    const right = tx + (annotationBox.x + annotationBox.width) * (k || 1) + 12;
-                    const bottom = ty + (annotationBox.y + annotationBox.height) * (k || 1) + 12;
+                    // Alan 9/23/26 - Camera-independent offsets, so panning/zooming leaves the viewBox alone.
+                    const tx = layoutTranslate.x;
+                    const ty = layoutTranslate.y;
+                    const left = tx + annotationBox.x - 12;
+                    const top = ty + annotationBox.y - 12;
+                    const right = tx + (annotationBox.x + annotationBox.width) + 12;
+                    const bottom = ty + (annotationBox.y + annotationBox.height) + 12;
                     const minX = Math.min(raw[0], left);
                     const minY = Math.min(raw[1], top);
                     const maxX = Math.max(raw[0] + raw[2], right, needed);
@@ -6124,6 +6158,27 @@
                     svgNode.setAttribute('data-annotation-set-viewbox', nextViewBox);
                 }
             }
+        }
+
+        // Alan 9/23/26 - The translate phylotree gives its container at layout time (before any
+        // camera move). Prefer the renderer's own values; the attribute is only trusted while
+        // the D3 camera is still at identity, since any pan/zoom replaces it.
+        _annotationLayoutTranslate(enclosure) {
+            const display = this.tree?.display;
+            if (display && typeof display.pad_height === 'function' && Array.isArray(display.offsets)) {
+                const x = Number(display.offsets[1]) + Number(display.options?.['left-offset'] || 0);
+                const y = Number(display.pad_height());
+                if (Number.isFinite(x) && Number.isFinite(y)) return { x, y };
+            }
+            let camera = null;
+            try { camera = window.d3v7.zoomTransform(enclosure.node().ownerSVGElement); } catch (_) { }
+            if (camera && (camera.k !== 1 || camera.x !== 0 || camera.y !== 0)) return { x: 0, y: 0 };
+            // phylotree writes "translate (x,y)" with a space, so allow one before the paren.
+            const match = /translate\s*\(\s*(-?[\d.]+)(?:[ ,]+(-?[\d.]+))?/.exec(enclosure.attr('transform') || '');
+            return {
+                x: match ? (parseFloat(match[1]) || 0) : 0,
+                y: match ? (parseFloat(match[2]) || 0) : 0
+            };
         }
 
         /**

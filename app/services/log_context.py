@@ -3,6 +3,7 @@
 import contextvars
 import functools
 import hashlib
+import json
 import logging
 import os
 import re
@@ -415,6 +416,41 @@ def _drop_rq_registry_heartbeat(record) -> bool:
     return _RQ_REGISTRY_NOISE_RE.search(str(record.msg)) is None
 
 
+# Alan 9/23/26 - run_phylo_job and run_recompute_job log their own failure
+# (event=job.failed with the traceback) and then re-raise so RQ marks the job
+# failed -- and RQ logs the same traceback again. That doubled errors.log and
+# made the digest count every failure twice. RQ's copy is dropped only for a
+# job whose failure this process has already logged; anything that fails
+# before reaching our handler keeps RQ's line, its only record.
+_SELF_REPORTED_FAILURES: set = set()
+_RQ_EXCEPTION_MSG_PREFIX = "Worker %s: job %s: exception raised while executing"
+
+
+def note_job_failure_logged(rq_job_id) -> None:
+    """Mark that this process has already logged ``rq_job_id``'s failure."""
+    if rq_job_id:
+        _SELF_REPORTED_FAILURES.add(str(rq_job_id))
+
+
+def _drop_rq_duplicate_failure(record) -> bool:
+    """Filter: False drops RQ's traceback for a failure we already logged."""
+    if record.levelno < logging.ERROR:
+        return True
+    if not str(record.msg).startswith(_RQ_EXCEPTION_MSG_PREFIX):
+        return True
+    args = record.args if isinstance(record.args, tuple) else ()
+    job_id = str(args[1]) if len(args) > 1 else ""
+    if job_id in _SELF_REPORTED_FAILURES:
+        _SELF_REPORTED_FAILURES.discard(job_id)
+        return False
+    return True
+
+
+def failure_message_field(exc, max_length: int = 300) -> str:
+    """The exception message as a quoted, single-line, sanitized log value."""
+    return json.dumps(sanitize_telemetry_text(str(exc), max_length=max_length))
+
+
 def install_scanner_log(path, level=logging.INFO) -> bool:
     """Attach var/logs/scanner.log to the dedicated scanner logger, once.
 
@@ -493,6 +529,8 @@ def install_rq_logging(level=logging.INFO) -> None:
     ):
         setattr(_drop_rq_registry_heartbeat, "_dikarya_rq_noise", True)
         worker_logger.addFilter(_drop_rq_registry_heartbeat)
+    if _drop_rq_duplicate_failure not in worker_logger.filters:
+        worker_logger.addFilter(_drop_rq_duplicate_failure)
 
 
 # --------------------------------------------------------------------------

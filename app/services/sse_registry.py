@@ -37,6 +37,7 @@ it is observing.
 """
 
 import logging
+import threading
 import time
 import uuid
 
@@ -59,6 +60,30 @@ _REGISTRY_KEY = "sse:open_streams"
 # that cause the pressure this registry exists to detect.
 _ENTRY_TTL_SECONDS = 300
 RENEW_INTERVAL_SECONDS = 30
+
+# Alan 9/23/26 - Set in each Gunicorn worker when it receives SIGTERM (see
+# post_worker_init in gunicorn.conf.py). The master closes its listening socket
+# *before* it waits for workers, so every second a worker spends draining is a
+# second nginx answers 502 to everyone. Open streams never finish on their own,
+# which made every web restart a full 30s (graceful_timeout) outage. Streams
+# check this flag and close at once; the browser's EventSource reconnects to
+# the new process and receives a fresh snapshot.
+_SHUTTING_DOWN = threading.Event()
+
+
+def begin_shutdown():
+    """Ask every open stream in this process to close. Signal-handler safe."""
+    _SHUTTING_DOWN.set()
+
+
+def shutting_down():
+    return _SHUTTING_DOWN.is_set()
+
+
+# Sent as the last frame of a stream closed for a restart. `retry:` holds the
+# browser's automatic reconnect until the new process is listening -- an
+# EventSource that gets nginx's 502 instead gives up for good.
+SHUTDOWN_RETRY_MS = 5000
 
 
 def _capacity():

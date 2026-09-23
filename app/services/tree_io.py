@@ -151,6 +151,57 @@ def _biopython_newick(tree) -> str:
     return handle.getvalue().strip()
 
 
+def _split_key(clade, all_ids: frozenset, anchor) -> Optional[frozenset]:
+    """The unrooted bipartition below ``clade``, or None if it is trivial.
+
+    Keyed on terminal object identity rather than on names, so duplicate or
+    missing tip labels cannot collide. The side NOT containing ``anchor`` is
+    used, which makes the key independent of where the tree is rooted.
+    """
+    below = frozenset(id(t) for t in clade.get_terminals())
+    if len(below) < 2 or len(all_ids) - len(below) < 2:
+        return None
+    return all_ids - below if anchor in below else below
+
+
+def reroot_preserving_support(tree, reroot) -> None:
+    """Run ``reroot()`` on ``tree`` and keep each support value on its split.
+
+    Newick stores a branch's support on the node *below* that branch.
+    Biopython's ``root_with_outgroup`` (and ``root_at_midpoint``, which calls
+    it) reverses parent/child along the path to the new root but leaves each
+    node's ``confidence`` and ``name`` where they were, so every support on
+    that path ends up describing the neighbouring branch. On real jobs 444 of
+    463 midpoint-rooted trees had shifted values: an SH-aLRT of 83.4 moved from
+    the 91-tip clade it tested onto a 73-tip clade, and the 91-tip clade read 0.
+
+    Support belongs to an unrooted bipartition, not to a node, so it is
+    recorded per split before rerooting and written back per split afterwards.
+    Both children of a bifurcating root share one split and therefore both
+    carry its value; a split that became trivial (an outgroup tip's sibling)
+    carries none. Internal ``name`` values are moved the same way, because
+    IQ-TREE's dual "SH-aLRT/UFBoot" labels do not parse as a float and land in
+    ``name`` rather than ``confidence``.
+    """
+    terminals = tree.get_terminals()
+    all_ids = frozenset(id(t) for t in terminals)
+    anchor = id(terminals[0]) if terminals else None
+
+    labels = {}
+    for clade in tree.get_nonterminals():
+        if clade is tree.root:
+            continue
+        key = _split_key(clade, all_ids, anchor)
+        if key is not None and (clade.confidence is not None or clade.name is not None):
+            labels[key] = (clade.confidence, clade.name)
+
+    reroot()
+
+    for clade in tree.get_nonterminals():
+        key = None if clade is tree.root else _split_key(clade, all_ids, anchor)
+        clade.confidence, clade.name = labels.get(key, (None, None))
+
+
 def tree_to_newick_string(tree) -> str:
     """Return the tree as a Newick string at full branch-length precision."""
     for clade in tree.get_nonterminals():

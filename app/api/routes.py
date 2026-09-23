@@ -1792,6 +1792,24 @@ def gather_mycomap_sequences_for_queue(url, include_ncbi=True, include_local=Tru
             "sequence_url": True,
         }, 400)
 
+    # Alan 9/22/26 - MycoMap's older do=results links name a sequence record,
+    # not a BLAST; follow them to the BLAST MycoMap already ran on it.
+    from app.services.mycomap_service import (
+        parse_legacy_mycomap_results_url, resolve_legacy_mycomap_results_url,
+    )
+    if parse_legacy_mycomap_results_url(url):
+        legacy = resolve_legacy_mycomap_results_url(url)
+        if not legacy:
+            return None, ({
+                "status": "error",
+                "error": (
+                    "That older-style MycoMap link points to a sequence that has no "
+                    "BLAST search yet. Open it on MycoMap, start a BLAST search from "
+                    "it, and paste that search's URL here."
+                ),
+            }, 404)
+        url = legacy["url"]
+
     blast_id = validate_mycomap_url(url)
     if not blast_id:
         return None, ({
@@ -2522,6 +2540,8 @@ def inaturalist_tree():
         if e.details:
             error_payload.update(e.details)
             error_payload["message"] = str(e)
+        if error_payload.get("login_required"):
+            error_payload["login_url"] = url_for('auth.login', next='/tree')
         return jsonify(error_payload), e.status
     except Exception as e:
         return _server_error(e, where="inaturalist_tree")
@@ -2538,7 +2558,9 @@ def inaturalist_tree_preview():
     raw = data.get('input') or data.get('observation') or data.get('url') or ''
     resolved_type = data.get('resolved_type')
     try:
-        return jsonify(preview_inaturalist_tree_input(raw, resolved_type=resolved_type))
+        return jsonify(preview_inaturalist_tree_input(
+            raw, resolved_type=resolved_type, user=current_user,
+        ))
     except InatTreeError as e:
         note_request_failure(e.failure_code or "inat_tree_preview_rejected")
         _log_inat_tree_rejection("preview", raw, e)
@@ -2615,6 +2637,8 @@ def inaturalist_tree_batch():
         if e.details:
             error_payload.update(e.details)
             error_payload["message"] = str(e)
+        if error_payload.get("login_required"):
+            error_payload["login_url"] = url_for('auth.login', next='/tree')
         return jsonify(error_payload), e.status
     except Exception as e:
         return _server_error(e, where="inaturalist_tree_batch")
@@ -2677,6 +2701,7 @@ def fetch_inaturalist():
     try:
         from app.services.inaturalist_service import (
             INTERACTIVE_FETCH_BUDGET_SECONDS,
+            InatRateLimitedError,
             validate_inaturalist_url,
             fetch_inaturalist_data
         )
@@ -2761,6 +2786,14 @@ def fetch_inaturalist():
     except ValueError as e:
         logger.warning(f"iNaturalist API validation error: {e}")
         return jsonify({"status": "error", "error": str(e)}), 400
+    except InatRateLimitedError:
+        response = jsonify({
+            "status": "error",
+            "error": "iNaturalist is rate-limiting requests right now. "
+                     "Please wait a minute and try again.",
+        })
+        response.headers["Retry-After"] = "60"
+        return response, 503
     except Exception as e:
         return _server_error(e, where="inaturalist")
 
@@ -5308,6 +5341,11 @@ def _build_snapshot(job_id: str) -> dict:
             now = datetime.now(timezone.utc)
             job_info["elapsed_seconds"] = (now - live_start).total_seconds()
     
+    job_info["queue_position"] = None
+    if status == 'queued':
+        from app.workers.queue import get_queue_position
+        job_info["queue_position"] = get_queue_position(job_id)
+
     # Get RQ job meta
     try:
         from app.workers.queue import get_queue
@@ -5464,6 +5502,15 @@ def job_events_stream(job_id):
             # Tunable interval for DB polling (seconds)
             DB_POLL_INTERVAL = 1.0
 
+            # Alan 9/22/26 - While the job waits, re-check its place in line and
+            # send it only when it changes. Deliberately not counted as activity:
+            # a queue that is moving is not this job doing work, and the idle
+            # reconnect below must still recycle the stream of a long wait.
+            QUEUE_POSITION_INTERVAL = 10.0
+            last_queue_check = time.monotonic()
+            last_queue_position = snapshot["job"].get("queue_position")
+            tracking_queue = job_status == 'queued'
+
             # Hard lifetime cap. This loop only exits on a terminal job state, and a
             # generator whose client has gone away keeps looping while sleeping --
             # burning almost no CPU but permanently holding one of the
@@ -5481,6 +5528,14 @@ def job_events_stream(job_id):
             last_activity = stream_started
 
             while True:
+                if sse_registry.shutting_down():
+                    yield (
+                        f"retry: {sse_registry.SHUTDOWN_RETRY_MS}\n"
+                        "event: reconnect\ndata: {\"reason\": \"server_restart\"}\n\n"
+                    )
+                    close_reason = "server_shutdown"
+                    break
+
                 if time.monotonic() - stream_started >= MAX_STREAM_SECONDS:
                     # Ask the client to come straight back, then let go of the slot.
                     yield "event: reconnect\ndata: {\"reason\": \"max_stream_age\"}\n\n"
@@ -5551,6 +5606,16 @@ def job_events_stream(job_id):
                     yield "event: ping\ndata: {}\n\n"
                     last_ping = now
                 
+                if tracking_queue and now - last_queue_check >= QUEUE_POSITION_INTERVAL:
+                    last_queue_check = now
+                    from app.workers.queue import get_queue_position
+                    position = get_queue_position(job_id)
+                    if position != last_queue_position:
+                        last_queue_position = position
+                        yield f"event: queue_position\ndata: {json.dumps(position)}\n\n"
+                    if position is None or position.get("state") in ("started", "other"):
+                        tracking_queue = False
+
                 # Poll DB for job status at most once per DB_POLL_INTERVAL
                 if job_status not in ('completed', 'failed'):
                     if now - last_db_poll >= DB_POLL_INTERVAL:

@@ -41,6 +41,7 @@ from app.services.fasta_utils import (
 from app.services.tree_parameter_validation import validate_iqtree_ufboot_count
 from app.services.tree_io import (
     newick_file_to_nexus,
+    reroot_preserving_support,
     write_tree_file,
 )
 
@@ -868,7 +869,7 @@ def _reroot_tree_file_on_tip(tree_path: Path, tip_name: str) -> bool:
     target_clade = next((c for c in tree.find_clades() if c.name == tip_name), None)
     if target_clade is None:
         return False
-    tree.root_with_outgroup(target_clade)
+    reroot_preserving_support(tree, lambda: tree.root_with_outgroup(target_clade))
     write_tree_file(tree, tree_path, "newick")
     return True
 

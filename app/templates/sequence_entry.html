@@ -2024,11 +2024,13 @@
             return null;
         }
 
+        // Returns null when nothing needed moving, otherwise
+        // { source, moved } -- moved is false when the destination was occupied.
         function handle(field, ownSource) {
             const source = detectSource(field.value, ownSource);
-            if (!source || source === ownSource) return;
+            if (!source || source === ownSource) return null;
             const target = document.getElementById(TARGET_FIELD[source]);
-            if (!target || target === field) return;
+            if (!target || target === field) return null;
 
             const value = field.value.trim();
 
@@ -2040,7 +2042,7 @@
             // losing the other is not a trade worth making, so when the
             // destination is occupied the tab is revealed and BOTH values are
             // left exactly as they are, for the user to resolve.
-            if (target.value.trim() !== "") {
+            if (target.value.trim() !== "" && target.value.trim() !== value) {
                 if (typeof window.openImportSection === "function") {
                     window.openImportSection(source);
                 }
@@ -2048,11 +2050,12 @@
                     showStatus(
                         `That looks like ${LABEL[source]} input, but the `
                         + `${LABEL[source]} box already has something in it. `
-                        + `Nothing was moved — both entries are still there.`,
+                        + `Nothing was moved — both entries are still there. `
+                        + `Clear the ${LABEL[source]} box and paste it there to use it.`,
                         "info"
                     );
                 }
-                return;
+                return { source, moved: false };
             }
 
             target.value = value;
@@ -2073,7 +2076,19 @@
             if (typeof showStatus === "function") {
                 showStatus(`That looks like ${LABEL[source]} input — switched to ${LABEL[source]}.`, "info");
             }
+            return { source, moved: true };
         }
+
+        // Alan 9/22/26 - The paste/change listeners below miss input that is
+        // typed and submitted with Enter or a button click before the field
+        // blurs, so an iNaturalist URL still reached the MycoMap fetch and got
+        // a MycoMap error (client_event=mycomap_url_rejected hostname=
+        // www.inaturalist.org). Import buttons call this first: it moves the
+        // value exactly as a paste would and returns what happened.
+        window.routeMisplacedImportInput = function (fieldId, ownSource) {
+            const field = document.getElementById(fieldId);
+            return field ? handle(field, ownSource) : null;
+        };
 
         WATCHED.forEach(([id, ownSource]) => {
             const field = document.getElementById(id);
@@ -3257,6 +3272,13 @@
     function isValidMycomapUrl(url) {
         if (!url) return false;
         const trimmed = url.trim();
+        // Alan 9/22/26 - MycoMap's older results links (index.php?...controller=blast
+        // &do=results&db=..&id=..) are resolved server-side to the BLAST they list.
+        if (/^https?:\/\/(?:www\.)?mycomap\.com\/index\.php\?/i.test(trimmed)
+            && /[?&]controller=blast(?:&|$)/i.test(trimmed)
+            && /[?&]do=results(?:&|$)/i.test(trimmed)) {
+            return true;
+        }
         // Must start with the specific BLAST search path
         if (!trimmed.startsWith('https://mycomap.com/genetics/blast-search')) {
             return false;
@@ -3387,6 +3409,20 @@
         // that single sequence instead of telling the user their URL is invalid.
         if (isMycomapSequenceUrl(url)) {
             return await doFetchMycomapSequence(url);
+        }
+
+        // An iNaturalist or Mushroom Observer link (or a bare observation id)
+        // belongs to that source's importer. Move it there and run that import,
+        // which is what the user was trying to do.
+        const routed = window.routeMisplacedImportInput?.('mycomap_url', 'mycomap');
+        if (routed) {
+            const submitBtnId = {
+                inaturalist: 'fetch_inaturalist_btn',
+                mushroom_observer: 'fetch_mushroom_observer_btn',
+            }[routed.source];
+            const submitBtn = submitBtnId && document.getElementById(submitBtnId);
+            if (routed.moved && submitBtn) submitBtn.click();
+            return false;
         }
 
         if (!isValidMycomapUrl(url)) {
@@ -3605,6 +3641,10 @@
     }
 
     inaturalistUrlInput.addEventListener('input', checkInatState);
+    inaturalistUrlInput.addEventListener('paste', () => {
+        window.setTimeout(rewriteInaturalistTaxonInput, 0);
+    });
+    inaturalistUrlInput.addEventListener('change', rewriteInaturalistTaxonInput);
 
     // Store the current iNaturalist analysis result for use by action buttons
     let currentInaturalistResult = null;
@@ -3632,6 +3672,40 @@
             }
             return false;
         } catch (e) { return false; }
+    }
+
+    // Alan 9/22/26 - People paste taxon pages (inaturalist.org/taxa/906595-Caesareae)
+    // expecting the sequenced observations of that taxon. That is exactly an
+    // observation search on taxon_id with the DNA Barcode ITS field present,
+    // which the direct sequence import already handles, so rewrite it to that
+    // instead of rejecting it as an unsupported one-click-tree URL.
+    function inaturalistTaxonSearchUrl(value) {
+        if (!value) return null;
+        try {
+            const urlValue = /^https?:\/\//i.test(value) ? value : `https://${value}`;
+            const parsed = new URL(urlValue);
+            if (!['inaturalist.org', 'www.inaturalist.org'].includes(parsed.hostname.toLowerCase())) {
+                return null;
+            }
+            const match = parsed.pathname.match(/^\/taxa\/(\d+)(?:[-/]|$)/i);
+            if (!match) return null;
+            return `https://www.inaturalist.org/observations?taxon_id=${match[1]}&field:DNA%20Barcode%20ITS=`;
+        } catch (e) {
+            return null;
+        }
+    }
+
+    function rewriteInaturalistTaxonInput() {
+        const search = inaturalistTaxonSearchUrl(inaturalistUrlInput.value.trim());
+        if (!search) return false;
+        inaturalistUrlInput.value = search;
+        checkInatState();
+        showStatus(
+            'That is a taxon page, so it has been turned into a search for observations '
+            + 'of that taxon with a DNA Barcode ITS sequence. Click Submit to import them.',
+            'info'
+        );
+        return true;
     }
 
     function isLikelyInaturalistTreeInput(value) {
@@ -3806,6 +3880,11 @@
             const type = currentInaturalistTreePreview.type;
             const count = Number(currentInaturalistTreePreview.eligible_tree_count || 0);
             if ((type === 'user' || type === 'project') && count > 0) {
+                if (currentInaturalistTreePreview.login_required) {
+                    inaturalistTreeBtn.innerHTML =
+                        `<i class="fas fa-sign-in-alt mr-2"></i> Log in to create ${count} tree jobs`;
+                    return;
+                }
                 const label = count === 1 ? 'Create 1 tree job' : `Create ${count} bulk tree jobs`;
                 inaturalistTreeBtn.innerHTML = `<i class="fas fa-tree mr-2"></i> ${label}`;
                 return;
@@ -3834,6 +3913,43 @@
         inaturalistSpeciesItems.innerHTML = '';
         currentInaturalistResult = null;
         currentInaturalistUrl = null;
+    }
+
+    // Alan 9/22/26 - Anonymous batches are capped at ANONYMOUS_BATCH_TREE_LIMIT
+    // (inaturalist_tree_service.py). Over the cap, the visitor is sent to log in
+    // and the search is parked in sessionStorage, which survives the round trip
+    // in the same tab, so they come back to /tree with it filled in and
+    // previewed rather than having to find the username again.
+    const PENDING_INAT_BATCH_KEY = 'dikarya.pendingInatBatch';
+    const PENDING_INAT_BATCH_MAX_AGE_MS = 60 * 60 * 1000;
+    const USER_IS_AUTHENTICATED = {{ 'true' if current_user.is_authenticated else 'false' }};
+
+    function sendToLoginForInatBatch(input, resolvedType, loginUrl) {
+        try {
+            window.sessionStorage.setItem(PENDING_INAT_BATCH_KEY, JSON.stringify({
+                input, resolvedType: resolvedType || null, savedAt: Date.now()
+            }));
+        } catch (err) { /* storage blocked: they will just re-enter the search */ }
+        showStatus('Taking you to log in. You will come back here with this search ready to queue.', 'info');
+        window.location.href = loginUrl || {{ url_for('auth.login', next='/tree') | tojson }};
+    }
+
+    function takePendingInatBatch() {
+        let pending = null;
+        try {
+            const raw = window.sessionStorage.getItem(PENDING_INAT_BATCH_KEY);
+            if (!raw) return null;
+            // Only consume it once signed in; an anonymous visitor who backed
+            // out of the login page keeps it for when they do sign in.
+            if (!USER_IS_AUTHENTICATED) return null;
+            window.sessionStorage.removeItem(PENDING_INAT_BATCH_KEY);
+            pending = JSON.parse(raw);
+        } catch (err) {
+            return null;
+        }
+        if (!pending || typeof pending.input !== 'string' || !pending.input.trim()) return null;
+        if (!(Date.now() - Number(pending.savedAt || 0) < PENDING_INAT_BATCH_MAX_AGE_MS)) return null;
+        return pending;
     }
 
     async function previewInaturalistTreeInput(resolvedType = null) {
@@ -3902,6 +4018,7 @@
         )) {
             return;
         }
+        rewriteInaturalistTaxonInput();
         const input = inaturalistUrlInput.value.trim();
         if (!input || !isLikelyInaturalistTreeInput(input)) return;
         // Search URLs belong to the direct-sequence flow below, not the
@@ -3929,7 +4046,20 @@
         inaturalistKeepTreeUrlRadio.addEventListener('change', updateInaturalistTreeButtonForInput);
     }
 
+    (async function resumePendingInatBatch() {
+        const pending = takePendingInatBatch();
+        if (!pending) return;
+        if (typeof window.openImportSection === 'function') window.openImportSection('inaturalist');
+        inaturalistUrlInput.value = pending.input.trim();
+        checkInatState();
+        const preview = await previewInaturalistTreeInput(pending.resolvedType);
+        if (preview && Number(preview.eligible_tree_count || 0) > 0) {
+            showStatus('You are logged in. Review the count below, then click Create to queue the tree jobs.', 'success');
+        }
+    })();
+
     fetchInaturalistBtn.addEventListener('click', async () => {
+        rewriteInaturalistTaxonInput();
         const url = inaturalistUrlInput.value.trim();
 
         // Client-side validation
@@ -4288,6 +4418,9 @@
     // iNaturalist when the job completes. Backed by /api/inaturalist/tree.
     if (inaturalistTreeBtn) {
         inaturalistTreeBtn.addEventListener('click', async () => {
+            // A taxon page is a sequence search, not a one-click-tree scope;
+            // rewriting it hides this button, and the status says to use Submit.
+            if (rewriteInaturalistTaxonInput()) return;
             const input = inaturalistUrlInput.value.trim();
             if (!input || !isLikelyInaturalistTreeInput(input)) {
                 showStatus('Enter an iNaturalist observation, username, or project.', 'error');
@@ -4311,6 +4444,10 @@
                 const count = Number(preview.eligible_tree_count || 0);
                 if (count < 1) {
                     showStatus(preview.message || 'No observations are ready for tree building.', 'info');
+                    return;
+                }
+                if (preview.login_required) {
+                    sendToLoginForInatBatch(input, currentInaturalistTreeResolvedType || preview.type);
                     return;
                 }
             }
@@ -4393,6 +4530,14 @@
                     body: JSON.stringify(payload)
                 });
                 const data = await resp.json();
+                if (!resp.ok && data.login_required) {
+                    sendToLoginForInatBatch(
+                        input,
+                        currentInaturalistTreeResolvedType || preview?.type,
+                        data.login_url
+                    );
+                    return;
+                }
                 if (!resp.ok) {
                     throw new Error(data.error || data.message || 'Server error');
                 }

@@ -52,6 +52,7 @@ class JobStatusClient {
             connectionText: document.getElementById('connection-text'),
             statusBadge: document.getElementById('job-status-badge'),
             elapsedTime: document.getElementById('elapsed-time'),
+            queuePosition: document.getElementById('queue-position'),
             currentStepCard: document.getElementById('current-step-card'),
             currentStepName: document.getElementById('current-step-name'),
             currentStepDetail: document.getElementById('current-step-detail'),
@@ -123,6 +124,15 @@ class JobStatusClient {
                 window.reportClientError?.('job_status.event_parse', err);
             }
         };
+
+        // Named event: queue_position (sent only while queued, and only on change)
+        this.eventSource.addEventListener('queue_position', (e) => {
+            try {
+                this.renderQueuePosition(JSON.parse(e.data));
+            } catch (err) {
+                console.error('Failed to parse queue position:', err);
+            }
+        });
 
         // Named event: ping (keepalive)
         this.eventSource.addEventListener('ping', () => {
@@ -251,6 +261,7 @@ class JobStatusClient {
 
         // Update status badge
         this.updateStatusBadge(job.status);
+        this.renderQueuePosition(job.status === 'queued' ? job.queue_position : null);
 
         // Start elapsed timer
         // Alan 7/18/26 - Count elapsed time from enqueue so queue wait no longer displays as "--".
@@ -471,6 +482,7 @@ class JobStatusClient {
     handleJobState(event) {
         console.log('Job State Event:', event.status, event);
         this.updateStatusBadge(event.status);
+        if (event.status !== 'queued') this.renderQueuePosition(null);
 
         // Update lastStatus tracking
         const oldStatus = this.lastStatus;
@@ -753,6 +765,33 @@ class JobStatusClient {
     _clearFeedPlaceholder() {
         const placeholder = this.elements.overviewFeed.querySelector('.overview-placeholder');
         if (placeholder) placeholder.remove();
+    }
+
+    // Alan 9/22/26 - Show where a queued job stands. `info` comes from
+    // get_queue_position() in app/workers/queue.py; null hides the line.
+    renderQueuePosition(info) {
+        const el = this.elements.queuePosition;
+        if (!el) return;
+        let text = '';
+        if (info && info.state === 'waiting' && Number.isFinite(info.position)) {
+            const lane = info.lane === 'bulk' ? 'bulk queue' : 'queue';
+            const ahead = info.position - 1;
+            if (ahead === 0) {
+                text = `Next in line in the ${lane}.`;
+            } else {
+                text = `Position ${info.position.toLocaleString()} of `
+                    + `${Number(info.queue_length || info.position).toLocaleString()} in the ${lane}: `
+                    + `${ahead.toLocaleString()} job${ahead === 1 ? '' : 's'} ahead of this one.`;
+            }
+            if (info.lane === 'bulk') {
+                text += ' Bulk jobs run one at a time on their own worker, so single trees are not held up by them.';
+            }
+        } else if (info && info.state === 'scheduled') {
+            text = 'Waiting for an outside service (such as MycoMap BLAST) to finish. '
+                + 'This job rejoins the queue automatically when it is ready, at the back of the line.';
+        }
+        el.textContent = text;
+        el.classList.toggle('hidden', !text);
     }
 
     _noteActivity() {

@@ -64,8 +64,12 @@ def find_user_by_email(raw):
 @bp.route('/register', methods=['GET', 'POST'])
 @limiter.limit("5 per minute; 30 per hour", methods=["POST"])
 def register():
+    # Alan 9/22/26 - Carry `next` through registration the same way login does,
+    # so a visitor sent here from the Tree Builder (e.g. to queue a large
+    # iNaturalist batch) lands back where they started.
+    next_page = _safe_next(request.args.get('next'))
     if current_user.is_authenticated:
-        return redirect(url_for('user.user_jobs'))
+        return redirect(next_page or url_for('user.user_jobs'))
 
     if request.method == 'POST':
         email = normalize_email(request.form.get('email'))
@@ -74,14 +78,14 @@ def register():
         if not email or not password:
             logger.warning("event=auth.registration_failed reason=missing_credentials")
             flash('Email and password are required.', 'danger')
-            return redirect(url_for('auth.register'))
+            return redirect(url_for('auth.register', next=next_page))
 
         # Case-insensitive, so `Alan@x.com` cannot become a second account
         # alongside `alan@x.com`.
         if User.query.filter(func.lower(User.email) == email).first():
             logger.warning("event=auth.registration_failed reason=already_registered")
             flash('Email already registered. Please log in.', 'warning')
-            return redirect(url_for('auth.login'))
+            return redirect(url_for('auth.login', next=next_page))
 
         user = User(email=email)
         user.set_password(password)
@@ -96,12 +100,12 @@ def register():
             db.session.rollback()
             logger.warning("event=auth.registration_failed reason=registration_conflict")
             flash('Email already registered. Please log in.', 'warning')
-            return redirect(url_for('auth.login'))
+            return redirect(url_for('auth.login', next=next_page))
 
         login_user(user, remember=True)
         logger.info("event=auth.registered account_id=%s", user.id)
         flash('Registration successful!', 'success')
-        return redirect(url_for('user.user_jobs'))
+        return redirect(next_page or url_for('user.user_jobs'))
 
     return render_template('auth/register.html')
 
@@ -109,7 +113,7 @@ def register():
 @limiter.limit("5 per minute; 30 per hour", methods=["POST"])
 def login():
     if current_user.is_authenticated:
-        return redirect(url_for('user.user_jobs'))
+        return redirect(_safe_next(request.args.get('next')) or url_for('user.user_jobs'))
 
     if request.method == 'POST':
         email = request.form.get('email')

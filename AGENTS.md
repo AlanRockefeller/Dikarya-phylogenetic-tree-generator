@@ -1028,6 +1028,10 @@ journal means a deliberate restart, not a crash.
 Note that a web or worker **restart produces a brief 502** while Gunicorn is
 down (~3-4 seconds). A 502 that succeeds on retry, with a matching
 `Stopping...`/`Started` pair in the journal, is a restart window and not a bug.
+That window stays short only because `post_worker_init` in `gunicorn.conf.py`
+makes SIGTERM raise `sse_registry.begin_shutdown()`, which closes open SSE
+streams at once. The master closes its listener *before* draining workers, so
+without it every restart was a full 30s (`graceful_timeout`) of site-wide 502s.
 
 **Worker and metrics processes get their stdout/stderr handlers from
 `app._install_logging()`, not from `logging.basicConfig()`.** The root logger

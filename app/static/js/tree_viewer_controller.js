@@ -1439,6 +1439,14 @@ document.addEventListener('DOMContentLoaded', async () => {
         return /[0-9]/.test(epithet) ? epithet : epithet.toLowerCase();
     }
 
+    // Danny Miller's unquoted provisional codes -- "Hydnellum PNW10", "Hydnellum sp. CA02" --
+    // are the same species as Hydnellum sp. 'PNW10'. Kept narrow (2-4 capitals + 2-3 digits)
+    // so an accession ("MK602720"), an iNat id or a voucher ("REB-49") is never read as one.
+    function speciesUnquotedCode(token) {
+        const word = String(token);
+        return /^[A-Z]{2,4}\d{2,3}$/.test(word) ? word : null;
+    }
+
     function speciesRankMarker(token) {
         const word = String(token).replace(/[^A-Za-z]/g, '').toLowerCase();
         return Object.prototype.hasOwnProperty.call(SPECIES_RANK_MARKERS, word)
@@ -1465,6 +1473,8 @@ document.addEventListener('DOMContentLoaded', async () => {
                 const next = j + 1 < tokens.length ? tokens[j + 1] : '';
                 const provisional = speciesQuotedEpithet(next);
                 if (provisional) return `${genus} ${marker} '${provisional}'`;
+                const code = marker === 'sp.' ? speciesUnquotedCode(next) : null;
+                if (code) return `${genus} sp. '${code}'`;
                 if (marker === 'sp.') return `${genus} sp.`;
                 const qualified = speciesEpithetCandidate(next);
                 if (qualified) return `${genus} ${marker} ${qualified}`;
@@ -1472,6 +1482,8 @@ document.addEventListener('DOMContentLoaded', async () => {
             }
             const provisional = speciesQuotedEpithet(tokens[j]);
             if (provisional) return `${genus} sp. '${provisional}'`;
+            const code = speciesUnquotedCode(tokens[j]);
+            if (code) return `${genus} sp. '${code}'`;
             const epithet = speciesEpithetCandidate(tokens[j]);
             if (epithet) return `${genus} ${epithet}`;
         }

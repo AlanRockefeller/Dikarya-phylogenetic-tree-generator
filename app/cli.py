@@ -7,6 +7,46 @@ from flask import current_app
 
 logger = logging.getLogger(__name__)
 
+def _preload_app_modules() -> None:
+    """Import every app module before the worker starts forking jobs.
+
+    Alan 9/23/26 - RQ runs each job in a fork of this process, and a module the
+    parent never imported is read from disk inside the fork. So an edit reached
+    running jobs without a restart, half-finished or not, and a fork could mix
+    an old in-memory module with a new one from disk: that is how a new
+    tree_builder_service met an old tree_io on 2026-09-23 and failed with an
+    ImportError. Importing everything here freezes one consistent snapshot,
+    so code changes only on restart.
+
+    Walks the files rather than using pkgutil, which skips directories without
+    an __init__.py. A module that fails to import is logged and skipped: it
+    would only have failed when a job used it, as before. scripts/dikarya-preflight
+    is still the gate before a restart.
+    """
+    import importlib
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parent
+    loaded, failed = 0, []
+    for path in sorted(root.rglob("*.py")):
+        if "__pycache__" in path.parts:
+            continue
+        parts = path.relative_to(root.parent).with_suffix("").parts
+        if parts[-1] == "__init__":
+            parts = parts[:-1]
+        name = ".".join(parts)
+        try:
+            importlib.import_module(name)
+            loaded += 1
+        except Exception as exc:
+            failed.append(name)
+            logger.error("event=worker.preload_failed module=%s error=%s: %s",
+                         name, type(exc).__name__, exc)
+    current_app.logger.info(
+        "event=worker.preloaded modules=%s failed=%s", loaded, len(failed),
+    )
+
+
 @click.command("run-worker")
 @click.option(
     "--queues", "queues", default=None,
@@ -27,6 +67,7 @@ def run_worker_command(queues):
         "event=worker.starting Starting worker with heartbeat queues=%s",
         ",".join(queue_names) if queue_names else "all",
     )
+    _preload_app_modules()
     run_worker_with_heartbeat(current_app, queue_names=queue_names)
 
 @click.command("run-metrics")

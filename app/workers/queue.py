@@ -498,3 +498,60 @@ def get_job_status(job_id: str) -> Dict[str, Any]:
             job_id=job_id, exception=type(e).__name__,
         )
         return {"id": job_id, "status": "error", "error": "Job status unavailable"}
+
+
+def get_queue_position(job_id: str) -> Optional[Dict[str, Any]]:
+    """Where a queued job stands in its RQ queue, for the status page.
+
+    Alan 9/22/26 - A single iNaturalist batch put ~540 jobs on phylo_bulk, and
+    each of those status pages just said "waiting for a worker" for hours.
+
+    Returns None when the job is unknown or Redis is unavailable. Otherwise
+    ``state`` is one of:
+      waiting    -- in the queue; ``position`` is 1 for the next job to start
+      scheduled  -- deliberately parked (a MycoMap/NCBI wait); rejoins later
+      started    -- a worker has picked it up
+      other      -- finished, failed or otherwise not waiting
+    Each queue has its own worker, so only the job's own queue is counted.
+    Nothing here comes from the submission, so it is safe to publish.
+    """
+    try:
+        conn = get_redis_connection()
+        try:
+            job = RqJob.fetch(job_id, connection=conn)
+        except NoSuchJobError:
+            return None
+        status = job.get_status()
+        queue_name = job.origin if job.origin in VALID_QUEUE_NAMES else None
+        info: Dict[str, Any] = {
+            "state": "other",
+            "queue": queue_name,
+            "lane": "bulk" if queue_name == QUEUE_BULK else "high",
+            "position": None,
+            "queue_length": None,
+        }
+        if status == "started":
+            info["state"] = "started"
+            return info
+        if status in ("scheduled", "deferred"):
+            info["state"] = "scheduled"
+            return info
+        if status != "queued" or not queue_name:
+            return info
+        key = f"rq:queue:{queue_name}"
+        index = conn.lpos(key, job_id)
+        info["queue_length"] = int(conn.llen(key))
+        if index is None:
+            # Enqueued but not in the list yet, or just popped by the worker.
+            return info
+        info["state"] = "waiting"
+        info["position"] = int(index) + 1
+        return info
+    except Exception as exc:
+        from app.services.log_context import log_degradation_rate_limited
+        log_degradation_rate_limited(
+            logger, "rq_queue_position_failed",
+            "Queue position lookup failed; the status page shows no position",
+            exception=type(exc).__name__,
+        )
+        return None

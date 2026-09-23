@@ -27,7 +27,7 @@ logger = logging.getLogger(__name__)
 INATURALIST_API_BASE = "https://api.inaturalist.org/v1"
 USER_AGENT = "Dikarya Phylogenetic Tree Builder 1.0 - For questions contact Alan Rockefeller"
 REQUEST_TIMEOUT = 30
-RATE_LIMIT_DELAY = 1.0  # seconds between requests
+RATE_LIMIT_DELAY = 1.0  # seconds between requests (paced by the shared Redis cursor)
 MAX_PER_PAGE = 200  # iNaturalist max per_page value
 MAX_OBSERVATIONS = 10000  # API pagination limit
 
@@ -195,6 +195,16 @@ def _extract_location_label(observation_data: Dict) -> str:
     return location_label_from_place_guess(observation_data)
 
 
+class InatRateLimitedError(Exception):
+    """iNaturalist kept answering HTTP 429 after every retry.
+
+    Alan 9/23/26 - This used to be a bare Exception, which the routes report
+    as a 500. Being throttled is not a server fault, so the route answers 503
+    with Retry-After instead. Subclassing Exception keeps every existing
+    ``except Exception`` caller working unchanged.
+    """
+
+
 def _make_api_request(url: str, max_retries: int = 3) -> Dict:
     """
     Make a request to the iNaturalist API with proper headers and 429 retry logic.
@@ -217,8 +227,19 @@ def _make_api_request(url: str, max_retries: int = 3) -> Dict:
         ('Accept', 'application/json')
     ]
     
+    # Alan 9/23/26 - Every attempt, retries included, takes a slot from the
+    # same Redis-backed pacer the worker uses. This path used to pace only
+    # within its own process, so a Tree Builder import competed blindly with
+    # a bulk run for iNaturalist's limit -- and lost, as a 500.
+    from app.services.inaturalist_tree_service import InatTreeError, _pace_inat_request
+
     attempts = 0
     while attempts <= max_retries:
+        try:
+            _pace_inat_request()
+        except InatTreeError as exc:
+            # The shared queue is too deep to wait out inside a request.
+            raise InatRateLimitedError(str(exc)) from exc
         try:
             with diagnostic_urlopen(url, timeout=REQUEST_TIMEOUT, opener=opener.open) as resp:
                 content = resp.read()
@@ -234,6 +255,11 @@ def _make_api_request(url: str, max_retries: int = 3) -> Dict:
                 continue
                 
             error_msg = f"HTTP error {e.code}: {e.reason}"
+            if e.code == 429:
+                logger.warning(f"iNaturalist API error: {error_msg}")
+                from app.services.inaturalist_tree_service import _start_inat_cooldown
+                _start_inat_cooldown()
+                raise InatRateLimitedError(error_msg)
             logger.error(f"iNaturalist API error: {error_msg}")
             raise Exception(error_msg)
             
@@ -439,7 +465,6 @@ def fetch_observations_with_field_filter(base_params: Dict, field_name: str,
             break
             
         page += 1
-        time.sleep(RATE_LIMIT_DELAY)
         
     truncated = len(all_observations) < total_results and (
         timed_out or len(all_observations) >= MAX_OBSERVATIONS
