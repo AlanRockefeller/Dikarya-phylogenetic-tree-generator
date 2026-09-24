@@ -233,8 +233,13 @@ document.addEventListener('DOMContentLoaded', async () => {
         if (!btnSelectionMore || !selectionMoreMenu) return;
         selectionMoreMenu.classList.toggle('hidden', !open);
         btnSelectionMore.setAttribute('aria-expanded', open ? 'true' : 'false');
-        // Alan 9/23/26 - Only one toolbar dropdown open at a time.
-        if (open) setLayoutMenuOpen(false);
+        // Alan 9/23/26 - Only one toolbar dropdown open at a time. This button's click
+        // stops propagation, so Export's outside-click close never sees it: close it here.
+        if (open) {
+            setLayoutMenuOpen(false);
+            const exportWrap = getEl('export-menu-wrap');
+            if (exportWrap) exportWrap.open = false;
+        }
     }
 
     // Alan 9/23/26 - Show or hide the toolbar's Layout popover.

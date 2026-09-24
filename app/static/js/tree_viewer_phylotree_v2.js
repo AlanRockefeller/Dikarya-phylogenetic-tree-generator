@@ -1844,7 +1844,9 @@
         // Alan 9/23/26 - A tip with a polytomy connector starts its gap where the connector ends.
         _tipLabelDx(node, zoomScale = 1) {
             const direction = node?.text_align === 'end' ? -1 : 1;
-            const connector = this._needsPolytomyConnector(node) ? POLYTOMY_CONNECTOR_PX : 0;
+            // Read the decision _drawPolytomyConnector cached for this draw: the zoom pass calls
+            // this for every tip on every frame, and re-scanning siblings made a polytomy O(k^2).
+            const connector = node && node.__polytomyConnector ? POLYTOMY_CONNECTOR_PX : 0;
             return direction * (this.tipLabelGap + connector) / (zoomScale || 1);
         }
 

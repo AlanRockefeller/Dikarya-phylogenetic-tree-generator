@@ -29,7 +29,7 @@ EXPECTED_LEGACY_VALUES = {
 
 def candidates():
     from app.models import Job
-    from app.services.mycomap_service import validate_mycomap_url
+    from app.services.mycomap_service import resolve_mycomap_result_reference
 
     grouped = defaultdict(list)
     cutoff = datetime.datetime(2026, 9, 23, tzinfo=datetime.timezone.utc).timestamp()
@@ -65,7 +65,7 @@ def candidates():
             if (int(metrics.get('inat_observation_id') or 0) != observation_id
                     or details.get('inat_mycomap_field_status') != 'failed'
                     or info.get('mycomap_blast_url') != url
-                    or str(validate_mycomap_url(url)) != blast_id):
+                    or str((resolve_mycomap_result_reference(url) or {}).get('result_id')) != blast_id):
                 raise RuntimeError(f'Job metadata mismatch for {job_id} / {observation_id}')
             urls.add(url)
         if len(urls) != 1:

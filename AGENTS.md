@@ -550,7 +550,11 @@ When a new CLI version is published:
   (`genbank_type_material.jsonl`, appended by `_parse_genbank_xml()` on every
   GenBank fetch and backfilled by the same script). Both live in
   `Config.TYPE_SPECIMEN_DIR` (`cache/type_specimens`, tree:dikarya 2775 like
-  `cache/blast`). Neither source contains the other: the MycoMap list holds no
+  `cache/blast`). The app never reads the committed raw API dump
+  (`mycomap-type-specimens.json`), so a fresh deployment shows no MycoMap
+  markers until the refresh script has run once; run it by hand after
+  installing rather than waiting for Monday's cron. Neither
+  source contains the other: the MycoMap list holds no
   RefSeq `NR_` records, and 93% of the `NR_` accessions in existing jobs are
   types. Never match on organism name -- that marks every sequence of a species
   as its type -- and resolve accessions through `record_accession()` so a
@@ -745,6 +749,7 @@ journal, including sshd auth records). Use these instead, in this order:
 | Gunicorn access/errors | `var/logs/{access,error}.log` | yes |
 | Worker app output | `var/logs/worker.log` (phylo_high), `var/logs/worker-bulk.log` (phylo_bulk) | yes |
 | Internet-wide scanner sweeps | `var/logs/scanner.log` | yes |
+| Weekly type-specimen refresh (stats, each type accession added/removed/reclassified) | `~/.dikarya/type-specimens/refresh.log` | yes |
 | Unit lifecycle, OOM kills, start failures | journal, via the wrapper below | wrapper only |
 
 **Nothing in `var/logs/` is deleted any more.** `ops/logrotate/dikarya` used to
@@ -1009,6 +1014,16 @@ prints an exact half-open UTC window plus a line such as
 in that window. Capture the candidate exactly as printed; do not substitute the
 time when the investigation finishes, because events arriving during the
 review belong to the next review.
+
+**Always report the digest's "Type specimens (weekly refresh)" section to the
+user**, even when nothing else in the window is wrong: list every accession
+under "New type sequences" (accession, status, organism, source), give the
+run's statistics line, and pass on any removals, status changes, failed pass
+or stale-refresh WARNING. The section is read from the refresh's own log
+(`~/.dikarya/type-specimens/refresh.log`, written by
+`scripts/dikarya_refresh_type_specimens.py` as `event=type_specimens.*` lines),
+because the `tree` user that runs the refresh cannot write to `var/logs`. A
+first snapshot is summarised, not itemised.
 
 Only after the review has completed successfully, advance the checkpoint:
 

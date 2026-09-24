@@ -653,6 +653,8 @@ body.tree-expanded #btn-fullscreen i::before {
     body.mobile-show-desktop-controls #tree-settings-panel:not([hidden]) {
         display: block;
         order: -1;
+        /* In the stacked column the desktop 20rem basis would become a fixed height. */
+        flex: none;
         width: auto;
         margin: 0 0 0.75rem;
         padding: 0;

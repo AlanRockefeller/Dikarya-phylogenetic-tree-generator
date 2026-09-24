@@ -47,3 +47,32 @@ def test_an_unreachable_mycomap_defers_instead_of_failing():
     helper = helper[:helper.index("\ndef ", 1)]
     assert 'details.get("mycomap_unavailable")' in helper
     assert '"mycomap_unavailable_deferrals"' in helper
+
+
+def test_unpublished_mycomap_results_wait_on_the_discovery_backoff():
+    # MycoMap answering "not published yet" (409) waits for the results on the
+    # just-created-search schedule instead of failing an MO or iNat job.
+    from types import SimpleNamespace
+    from unittest.mock import MagicMock, patch
+
+    from app.services.mushroom_observer_service import MushroomObserverError, _mycomap_org_error
+    from app.services.mycomap_org_service import OrgResultError, deferral_details
+    import app.models  # noqa: F401 -- define the models before db is patched
+    from app.workers import tasks
+
+    pending = OrgResultError("MycoMap has not published BLAST results for this sequence yet.", 409)
+    assert deferral_details(pending) == {"mycomap_results_pending": True}
+    assert deferral_details(OrgResultError("gone", 404, retryable=False)) is None
+    exc = _mycomap_org_error(pending)
+    assert isinstance(exc, MushroomObserverError) and exc.status == 409
+    assert exc.details == {"mycomap_results_pending": True}
+
+    job = SimpleNamespace(meta={"steps": {tasks.STEP_INPUT: {}}}, save_meta=MagicMock(),
+                          number_of_retries=0)
+    with patch("app.extensions.db"), patch("app.models.Job"), \
+            patch.object(tasks, "publish_overview"), patch.object(tasks, "publish_job_queued"):
+        retry = tasks._defer_for_inat_rate_limit(job, "abcd", exc)
+    assert retry is not None
+    assert job.meta["mycomap_results_pending_waits"] == 1
+    assert job.meta["mycomap_results_pending_since"]
+    assert job.meta["steps"][tasks.STEP_INPUT]["label"] == "Waiting for MycoMap"

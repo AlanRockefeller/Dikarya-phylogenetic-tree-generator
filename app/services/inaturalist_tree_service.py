@@ -2851,9 +2851,12 @@ def prepare_inat_tree_job(observation_id: int, *, include_ncbi: bool = True,
         try:
             org_reference = resolve_mycomap_result_reference(mycomap_url)
         except OrgResultError as exc:
+            # Unavailable (502) or not published yet (409) waits in the worker.
+            from app.services.mycomap_org_service import deferral_details
+            details = deferral_details(exc)
+            unavailable = bool(details and details.get("mycomap_unavailable"))
             raise InatTreeError(
-                str(exc), status=503 if exc.status == 502 else exc.status,
-                details={"mycomap_unavailable": True} if exc.status == 502 else None,
+                str(exc), status=503 if unavailable else exc.status, details=details,
             ) from exc
         blast_id = org_reference["result_id"]
     else:
@@ -3022,6 +3025,12 @@ def prepare_inat_tree_job(observation_id: int, *, include_ncbi: bool = True,
         if org_reference and status == 502:
             raise InatTreeError(body.get('error', 'MycoMap.org is unavailable.'),
                                 status=503, details={"mycomap_unavailable": True})
+        if status == 409 and body.get('retryable'):
+            # MycoMap has not published this BLAST's results yet: wait for them.
+            raise InatTreeError(
+                body.get('error', 'MycoMap BLAST results are not published yet.'),
+                status=409, details={"mycomap_results_pending": True},
+            )
         raise InatTreeError(
             body.get('error', 'Failed to fetch MycoMap sequences.'),
             # 404 = MycoMap has no such BLAST result. Passing it through keeps the

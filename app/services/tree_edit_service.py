@@ -1506,10 +1506,17 @@ def _reapply_rooting_after_recompute(job_dir: Path, tree_json: Dict[str, Any],
                                      task_logger=None) -> Dict[str, Any]:
     """Reapply the viewer's rooting intent after recompute writes a fresh tree."""
     mode = (previous_mode or "").lower()
-    if not mode or mode == "original":
+    if not mode:
+        return tree_json
+    if mode == "original" and tree_json.get("pre_midpoint_source") != "recompute":
         return tree_json
 
     try:
+        # The builder's root needs no rerooting, but its output still carries
+        # any tip pruned while the recompute ran; restoring the original root
+        # from the recorded builder copy drops them like every other mode does.
+        if mode == "original":
+            return apply_rooting_mode(job_dir, tree_json, "original")
         if mode in ("auto", "most_divergent_hit", "midpoint", "unrooted"):
             return apply_rooting_mode(job_dir, tree_json, mode)
         if mode in ("manual", "tip", "outgroup") and previous_target:

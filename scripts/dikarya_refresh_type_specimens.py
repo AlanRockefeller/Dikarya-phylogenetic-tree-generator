@@ -19,6 +19,11 @@ Two independent passes (see app/services/type_specimen_service.py):
 Output lives in Config.TYPE_SPECIMEN_DIR (cache/type_specimens, group dikarya,
 2775), which the web process reads and the worker appends to.
 
+Every run except --dry-run also appends its log to ~/.dikarya/type-specimens/
+refresh.log (type_specimen_service.REFRESH_LOG_PATH): per-pass statistics plus
+one event=type_specimens.added / removed / reclassified line per accession.
+scripts/dikarya_log_digest.py turns those into its "Type specimens" section.
+
     .venv/bin/python scripts/dikarya_refresh_type_specimens.py --dry-run
     .venv/bin/python scripts/dikarya_refresh_type_specimens.py
     .venv/bin/python scripts/dikarya_refresh_type_specimens.py --passes genbank --since-days 8
@@ -63,8 +68,35 @@ TYPE_WORD_RE = re.compile(
 )
 
 
+# Opened by main() unless --dry-run: every log line is also appended to
+# tss.REFRESH_LOG_PATH, which the log digest reads to report what was added.
+_refresh_log = None
+
+
 def log(message):
-    print(f"[{datetime.now(timezone.utc):%Y-%m-%d %H:%M:%S}Z] {message}", flush=True)
+    line = f"[{datetime.now(timezone.utc):%Y-%m-%d %H:%M:%S}Z] {message}"
+    print(line, flush=True)
+    if _refresh_log is not None:
+        _refresh_log.write(line + "\n")
+        _refresh_log.flush()
+
+
+def _event_value(value):
+    text = " ".join(str(value if value is not None else "").split())
+    # Bare when unambiguous, JSON-quoted otherwise; the digest reads both.
+    return text if text and not re.search(r'[\s"=\\]', text) else json.dumps(text, ensure_ascii=False)
+
+
+def event(name, **fields):
+    """One machine-readable line; scripts/dikarya_log_digest.py parses these."""
+    log(f"event=type_specimens.{name} "
+        + " ".join(f"{key}={_event_value(value)}" for key, value in fields.items()))
+
+
+def marked_accessions():
+    """Accessions the viewer currently marks as types, from either source."""
+    genbank = {acc for acc, entry in tss.genbank_index().items() if entry.get("status")}
+    return genbank | set(tss.mycomap_index())
 
 
 # --------------------------------------------------------------------------
@@ -177,14 +209,17 @@ def run_mycomap(args):
         f"{skipped['not_type_material']} non-type rows)")
 
     path = tss.DATA_DIR / tss.MYCOMAP_SNAPSHOT_NAME
-    previous = len(tss.mycomap_index())
+    old_records = tss.mycomap_index()
+    previous = len(old_records)
     if previous and len(records) < previous * SHRINK_LIMIT and not args.force:
         raise RuntimeError(
             f"new snapshot has {len(records)} accessions against {previous} before; "
             f"refusing to shrink it by more than {100 - SHRINK_LIMIT * 100:.0f}% (use --force)"
         )
+    genbank_types = {acc for acc, entry in tss.genbank_index().items() if entry.get("status")}
     if args.dry_run:
         log(f"mycomap: dry run, would write {path} (previously {previous} accessions)")
+        report_mycomap_changes(old_records, records, len(rows), genbank_types)
         return
     payload = {
         "generated_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
@@ -194,6 +229,38 @@ def run_mycomap(args):
     }
     write_atomically(path, json.dumps(payload, ensure_ascii=False, sort_keys=True))
     log(f"mycomap: wrote {path} ({len(records)} accessions, previously {previous})")
+    report_mycomap_changes(old_records, records, len(rows), genbank_types)
+
+
+def report_mycomap_changes(old_records, records, rows, genbank_types):
+    added = sorted(set(records) - set(old_records))
+    removed = sorted(set(old_records) - set(records))
+    reclassified = sorted(
+        acc for acc in set(records) & set(old_records)
+        if records[acc].get("status") != old_records[acc].get("status")
+    )
+    initial = not old_records
+    event("mycomap_summary", rows=rows, accessions=len(records), previous=len(old_records),
+          added=len(added), removed=len(removed), reclassified=len(reclassified),
+          initial="yes" if initial else "no")
+    if initial:
+        # The first snapshot "adds" the whole list; naming 30,000 accessions
+        # would bury every later report, so only the totals are recorded.
+        return
+    for acc in added:
+        record = records[acc]
+        event("added", source="mycomap", accession=acc, status=record.get("status"),
+              organism=record.get("organism"), voucher=record.get("voucher"),
+              previously_marked="yes" if acc in genbank_types else "no")
+    for acc in removed:
+        record = old_records[acc]
+        event("removed", source="mycomap", accession=acc, status=record.get("status"),
+              organism=record.get("organism"),
+              still_marked="yes" if acc in genbank_types else "no")
+    for acc in reclassified:
+        event("reclassified", source="mycomap", accession=acc,
+              previous_status=old_records[acc].get("status"), status=records[acc].get("status"),
+              organism=records[acc].get("organism"))
 
 
 # --------------------------------------------------------------------------
@@ -243,33 +310,56 @@ def run_genbank(args):
     log(f"genbank: {jobs} jobs scanned, {len(candidates)} candidate accessions, "
         f"{len(todo) - len(stale_missing)} not yet known to either source, "
         f"{len(stale_missing)} missing from NCBI over {MISSING_RETRY_DAYS} days ago")
+    deferred = 0
     if args.max_accessions and len(todo) > args.max_accessions:
         log(f"genbank: limiting this run to {args.max_accessions}; the rest are picked up next time")
+        deferred = len(todo) - args.max_accessions
         todo = todo[:args.max_accessions]
     if args.dry_run or not todo:
+        event("genbank_summary", jobs=jobs, candidates=len(candidates), checked=0,
+              added=0, negatives=0, missing=0, unanswered=0, deferred=deferred)
         return
 
-    found = written = missing = 0
+    found = written = missing = unanswered = 0
+    new_types = {}
     for start in range(0, len(todo), GENBANK_BATCH):
         batch = todo[start:start + GENBANK_BATCH]
-        documents = _fetch_genbank_xml_batch(batch)
+        unchecked = []
+        documents = _fetch_genbank_xml_batch(batch, unchecked=unchecked)
         returned = set()
         for document in documents:
             parsed = _parse_genbank_xml(document)["by_acc"]
             returned.update(tss.accession_root(record.get("accession")) for record in parsed.values())
-            found += sum(1 for record in parsed.values() if tss.genbank_type_entry(record))
+            for record in parsed.values():
+                entry = tss.genbank_type_entry(record)
+                if entry and entry["accession"]:
+                    new_types[entry["accession"]] = entry
+            found = len(new_types)
             # The parser already recorded the types; this adds the "asked, not a
             # type" answers so the next run does not ask NCBI again.
             written += tss.remember_genbank_records(parsed.values(), include_negatives=True)
-        # No documents at all means the fetch failed, not that NCBI lacks every
-        # record; only an answered batch can say which accessions are gone.
-        if documents:
-            missing += tss.remember_missing_accessions(set(batch) - returned)
-        else:
-            log(f"genbank: batch starting {batch[0]} could not be fetched; retried next run")
+        # Only an accession NCBI actually answered for can be recorded as gone.
+        # A failed fetch, or a rejected batch whose one-by-one isolation timed
+        # out or ran out of budget, leaves ids unasked; those are retried next
+        # run rather than parked for MISSING_RETRY_DAYS as "no record".
+        missing += tss.remember_missing_accessions(set(batch) - returned - set(unchecked))
+        unanswered += len(set(unchecked))
+        if unchecked:
+            log(f"genbank: {len(unchecked)} of {len(batch)} accessions in the batch starting "
+                f"{batch[0]} were not answered; retried next run")
         log(f"genbank: {min(start + GENBANK_BATCH, len(todo))}/{len(todo)} fetched, {found} types so far")
     log(f"genbank: done, {found} type accessions found, {written} negative answers recorded, "
         f"{missing} accessions NCBI returned no record for")
+    # Every accession asked about here was unknown to both sources, so each type
+    # found is newly marked.
+    event("genbank_summary", jobs=jobs, candidates=len(candidates), checked=len(todo),
+          added=len(new_types), negatives=written, missing=missing,
+          unanswered=unanswered, deferred=deferred)
+    for acc in sorted(new_types):
+        entry = new_types[acc]
+        event("added", source="genbank", accession=acc, status=entry.get("status"),
+              organism=entry.get("organism"), voucher=entry.get("voucher"),
+              previously_marked="no")
 
 
 def main():
@@ -289,6 +379,18 @@ def main():
     if unknown:
         parser.error(f"unknown pass(es): {', '.join(sorted(unknown))}")
 
+    global _refresh_log
+    if not args.dry_run:
+        try:
+            tss.REFRESH_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+            _refresh_log = open(tss.REFRESH_LOG_PATH, "a", encoding="utf-8")
+        except OSError as exc:
+            # The refresh itself still matters more than its report.
+            print(f"cannot append to {tss.REFRESH_LOG_PATH}: {exc}", file=sys.stderr)
+
+    marked_before = len(marked_accessions())
+    event("refresh_started", passes=",".join(passes), since_days=args.since_days,
+          dry_run="yes" if args.dry_run else "no")
     failed = False
     for name in passes:
         try:
@@ -296,6 +398,9 @@ def main():
         except Exception as exc:
             failed = True
             log(f"{name}: FAILED: {exc}")
+            event("pass_failed", **{"pass": name}, error=exc)
+    event("refresh_finished", outcome="failed" if failed else "ok",
+          marked_before=marked_before, marked_after=len(marked_accessions()))
     return 1 if failed else 0
 
 

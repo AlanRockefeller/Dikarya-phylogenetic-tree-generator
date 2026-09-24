@@ -13,6 +13,7 @@ Pure-state tests run everywhere; the reroot/prune tests need BioPython and use
 a temporary job directory with a tiny Newick tree.
 """
 
+import json
 import os
 import sys
 import tempfile
@@ -411,6 +412,26 @@ class TestBuilderRootKeepsPrunes(unittest.TestCase):
             )
             self.assertEqual(state["pre_midpoint_newick"], self.RECOMPUTED)
             self.assertEqual(state["pre_midpoint_source"], "recompute")
+
+    def test_recompute_commit_in_original_mode_drops_tips_pruned_meanwhile(self):
+        # The user pruned E after the recompute took its snapshot, so the
+        # builder's output still has it; the committed tree must not.
+        with tempfile.TemporaryDirectory() as d:
+            job_dir = Path(d)
+            (job_dir / "tree").mkdir()
+            _write_pruned_tree(job_dir, self.RECOMPUTED)
+            (job_dir / "tree" / "tree_pruned_metadata.json").write_text("{}")
+            structure = parse_newick_to_json(job_dir / "tree" / "tree_pruned.newick")
+            initial = {"root_mode": "ORIGINAL", "pruned_taxa": [], "renames": {}}
+            (job_dir / "tree_state.json").write_text(json.dumps(
+                {"root_mode": "ORIGINAL", "pruned_taxa": ["E"], "renames": {}}
+            ))
+            state = commit_recompute_tree_state(
+                job_dir, structure, initial_state=initial, builder_newick=self.RECOMPUTED,
+            )
+            self.assertEqual(state["root_mode"], "ORIGINAL")
+            self.assertEqual(self._file_tips(job_dir), {"C", "D", "F"})
+            self.assertEqual(set(_json_tip_names(state["tree_structure"])), {"C", "D", "F"})
 
 
 if __name__ == "__main__":

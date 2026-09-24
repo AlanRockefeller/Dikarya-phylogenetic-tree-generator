@@ -33,6 +33,21 @@ class MushroomObserverError(Exception):
         self.details = details
 
 
+def _mycomap_org_error(exc, status: Optional[int] = None) -> "MushroomObserverError":
+    """Map a MycoMap.org failure the way prepare_inat_tree_job does.
+
+    MycoMap.org not answering (503) and BLAST results not published yet (409)
+    carry the marker that makes the worker wait instead of failing the job.
+    """
+    from app.services.mycomap_org_service import deferral_details
+    details = deferral_details(exc)
+    if details and details.get("mycomap_unavailable"):
+        return MushroomObserverError(str(exc), status=503, details=details)
+    if details:
+        return MushroomObserverError(str(exc), status=409, details=details)
+    return MushroomObserverError(str(exc), status=status or exc.status)
+
+
 def parse_mushroom_observer_input(raw_input: str) -> int:
     """Return an observation ID from a bare ID or an official MO URL shape."""
     raw = str(raw_input or "").strip()
@@ -868,7 +883,7 @@ def prepare_tree_job(preparation: Dict[str, Any], *, defer_after_ncbi_rerun: boo
         notes_reference = (resolve_mycomap_result_reference(notes_mycomap_url)
                            if notes_mycomap_url else None)
     except OrgResultError as exc:
-        raise MushroomObserverError(str(exc), status=exc.status) from exc
+        raise _mycomap_org_error(exc) from exc
     notes_blast_id = notes_reference["result_id"] if notes_reference else None
     if not notes_blast_id:
         notes_mycomap_url = ""
@@ -995,7 +1010,9 @@ def prepare_tree_job(preparation: Dict[str, Any], *, defer_after_ncbi_rerun: boo
                     progress=progress,
                     mycomap_url=mycomap_url,
                 )
-            except (MycoMapRerunError, OrgResultError) as exc:
+            except OrgResultError as exc:
+                raise _mycomap_org_error(exc, status=502) from exc
+            except MycoMapRerunError as exc:
                 raise MushroomObserverError(str(exc), status=502)
             details["auto_created"] = False
             details["reused_from_sequence_notes"] = bool(notes_blast_id)
@@ -1037,7 +1054,7 @@ def prepare_tree_job(preparation: Dict[str, Any], *, defer_after_ncbi_rerun: boo
         try:
             still_pending = rerun_pending(details)
         except OrgResultError as exc:
-            raise MushroomObserverError(str(exc), status=exc.status) from exc
+            raise _mycomap_org_error(exc) from exc
         if still_pending:
             return {"status": "waiting_for_ncbi",
                     "notes": _job_title(observation_id, preparation.get("consensus_name")),
@@ -1071,6 +1088,12 @@ def prepare_tree_job(preparation: Dict[str, Any], *, defer_after_ncbi_rerun: boo
     )
     if error is not None:
         body, status = error
+        if status == 409 and body.get("retryable"):
+            # MycoMap has not published this BLAST's results yet: wait for them.
+            raise MushroomObserverError(
+                body.get("error", "MycoMap BLAST results are not published yet."),
+                status=409, details={"mycomap_results_pending": True},
+            )
         raise MushroomObserverError(
             body.get("error", "Failed to fetch MycoMap sequences."),
             # 404 = MycoMap has no such BLAST result. Passing it through keeps the

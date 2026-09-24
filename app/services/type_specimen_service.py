@@ -44,6 +44,15 @@ logger = logging.getLogger(__name__)
 DATA_DIR = Path(Config.TYPE_SPECIMEN_DIR)
 MYCOMAP_SNAPSHOT_NAME = "mycomap_type_specimens.json"
 GENBANK_CACHE_NAME = "genbank_type_material.jsonl"
+# scripts/dikarya_refresh_type_specimens.py appends its statistics and one
+# event=type_specimens.* line per type accession it adds, drops or reclassifies
+# here, and scripts/dikarya_log_digest.py reports them. Under the tree user's
+# home, beside the cron's per-run transcripts, because tree cannot write to
+# var/logs.
+REFRESH_LOG_PATH = Path(
+    os.environ.get("DIKARYA_TYPE_SPECIMEN_REFRESH_LOG")
+    or Path.home() / ".dikarya" / "type-specimens" / "refresh.log"
+)
 
 # Type categories as NCBI's /type_material vocabulary spells them (MycoMap's
 # GenBank rows are copied from that qualifier). The iso-/para- forms are

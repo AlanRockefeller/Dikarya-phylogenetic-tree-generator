@@ -28,6 +28,22 @@ class OrgResultError(Exception):
         self.retryable = retryable
 
 
+def deferral_details(exc):
+    """The worker's wait marker for a MycoMap.org failure, or None to fail.
+
+    A retryable 502 means MycoMap.org did not answer; a 409 means it answered
+    that the BLAST results are not published yet. The worker waits on both
+    (see _defer_for_inat_rate_limit in app/workers/tasks.py).
+    """
+    if not getattr(exc, "retryable", False):
+        return None
+    if exc.status == 502:
+        return {"mycomap_unavailable": True}
+    if exc.status == 409:
+        return {"mycomap_results_pending": True}
+    return None
+
+
 def _read(path, *, limit=MAX_JSON_BYTES, method="GET", body=None,
           authenticated=False, deadline=None):
     """Only fixed API paths are accepted; no URL from a result is fetched."""

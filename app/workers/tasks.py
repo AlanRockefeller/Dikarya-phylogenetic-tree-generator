@@ -1117,9 +1117,10 @@ MYCOMAP_UNAVAILABLE_MAX_DEFERRALS = 30
 def _defer_for_inat_rate_limit(job, job_id: str, exc: Exception) -> Optional[Retry]:
     """Return an rq.Retry for a preparation pass an upstream outage stopped.
 
-    Covers an iNaturalist 429 and MycoMap not answering (``mycomap_unavailable``
-    in the error's details). None means "fail as before": neither of those, no
-    RQ job, or the allowance spent.
+    Covers an iNaturalist 429, MycoMap not answering (``mycomap_unavailable``
+    in the error's details) and MycoMap answering that the BLAST results are
+    not published yet (``mycomap_results_pending``). None means "fail as
+    before": none of those, no RQ job, or the allowance spent.
     This helper leaves the preparation state alone; run_phylo_job puts back a
     saved NCBI wait before returning the deferral, so a pass that was resuming
     one resumes it again rather than starting the MycoMap work over.
@@ -1128,10 +1129,31 @@ def _defer_for_inat_rate_limit(job, job_id: str, exc: Exception) -> Optional[Ret
         return None
     details = getattr(exc, "details", None) or {}
     mycomap_unavailable = bool(details.get("mycomap_unavailable"))
-    if not mycomap_unavailable and getattr(exc, "status", None) != 429:
+    results_pending = bool(details.get("mycomap_results_pending"))
+    if (not mycomap_unavailable and not results_pending
+            and getattr(exc, "status", None) != 429):
         return None
     cooldown = int(details.get("inat_cooldown_seconds") or 0)
-    if mycomap_unavailable:
+    if results_pending:
+        # Not an outage: MycoMap answered, it just has no BLAST results for
+        # this sequence yet. Poll on the same rolling backoff and budget as a
+        # just-created search (1 min, then 5, 15, 60 as the wait grows).
+        from app.services.mycomap_service import (
+            get_mycomap_creation_discovery_max_attempts,
+            get_mycomap_creation_discovery_poll_interval_seconds,
+        )
+        meta_key = "mycomap_results_pending_waits"
+        limit = get_mycomap_creation_discovery_max_attempts()
+        since = float(job.meta.get("mycomap_results_pending_since") or time.time())
+        job.meta["mycomap_results_pending_since"] = since
+        wait_seconds = get_mycomap_creation_discovery_poll_interval_seconds(
+            int(time.time() - since)
+        )
+        service, detail, reason = (
+            "MycoMap", "MycoMap has not published the BLAST results for this sequence yet.",
+            "mycomap_results_pending",
+        )
+    elif mycomap_unavailable:
         meta_key, limit = "mycomap_unavailable_deferrals", MYCOMAP_UNAVAILABLE_MAX_DEFERRALS
         wait_seconds = MYCOMAP_UNAVAILABLE_DEFER_SECONDS + random.randint(0, 30)
         service, detail, reason = (
@@ -1379,24 +1401,30 @@ def run_phylo_job(job_params: dict) -> dict:
 
                 with step_heartbeat(job_id, STEP_INPUT, current_step_label):
                     if tree_preparation_kind == "mo":
-                        from app.services.mushroom_observer_service import prepare_tree_job
-
-                        prepared = prepare_tree_job(
-                            tree_preparation,
-                            defer_after_ncbi_rerun=not tree_resuming_after_ncbi,
-                            skip_mycomap_refresh=tree_resuming_after_ncbi,
-                            mycomap_rerun_details=(
-                                job.meta.get("mycomap_rerun_details") if job else None
-                            ),
-                            progress=_mycomap_progress,
+                        from app.services.mushroom_observer_service import (
+                            MushroomObserverError as PreparationError,
+                            prepare_tree_job,
                         )
                     else:
                         from app.services.inaturalist_tree_service import (
-                            InatTreeError,
+                            InatTreeError as PreparationError,
                             prepare_inat_tree_job,
                         )
 
-                        try:
+                    # MO and iNat preparation defer the same way on a MycoMap
+                    # outage; MO used to fail outright on a MycoMap.org 502.
+                    try:
+                        if tree_preparation_kind == "mo":
+                            prepared = prepare_tree_job(
+                                tree_preparation,
+                                defer_after_ncbi_rerun=not tree_resuming_after_ncbi,
+                                skip_mycomap_refresh=tree_resuming_after_ncbi,
+                                mycomap_rerun_details=(
+                                    job.meta.get("mycomap_rerun_details") if job else None
+                                ),
+                                progress=_mycomap_progress,
+                            )
+                        else:
                             prepared = prepare_inat_tree_job(
                                 int(tree_preparation["observation_id"]),
                                 include_ncbi=bool(tree_preparation.get("include_ncbi", True)),
@@ -1425,20 +1453,20 @@ def run_phylo_job(job_params: dict) -> dict:
                                 # job's own copy of the observation between polls.
                                 observation_reuse_owner=job_id,
                             )
-                        except InatTreeError as exc:
-                            deferral = _defer_for_inat_rate_limit(job, job_id, exc)
-                            if deferral is None:
-                                raise
-                            # Alan 9/23/26 - This pass set the preparation state to
-                            # "running" when it started. If it was resuming an NCBI
-                            # wait, put that back: otherwise the retry would redo the
-                            # MycoMap refresh it already made. A first pass has no
-                            # wait to resume, and marking it waiting would skip the
-                            # refresh that never happened.
-                            if tree_resuming_after_ncbi:
-                                job.meta[tree_preparation_meta_key] = "waiting_for_ncbi"
-                                job.save_meta()
-                            return deferral
+                    except PreparationError as exc:
+                        deferral = _defer_for_inat_rate_limit(job, job_id, exc)
+                        if deferral is None:
+                            raise
+                        # Alan 9/23/26 - This pass set the preparation state to
+                        # "running" when it started. If it was resuming an NCBI
+                        # wait, put that back: otherwise the retry would redo the
+                        # MycoMap refresh it already made. A first pass has no
+                        # wait to resume, and marking it waiting would skip the
+                        # refresh that never happened.
+                        if tree_resuming_after_ncbi:
+                            job.meta[tree_preparation_meta_key] = "waiting_for_ncbi"
+                            job.save_meta()
+                        return deferral
                 if prepared.get("status") == "waiting_for_ncbi":
                     from app.services.mycomap_service import (
                         get_mycomap_bulk_throttle_max_wait_attempts,
