@@ -77,7 +77,7 @@
             let sending = false;
             const release = document.querySelector('meta[name="dikarya-release"]')?.content || 'unknown';
             let csrf = document.querySelector('meta[name="csrf-token"]')?.content || '';
-            const jobMatch = location.pathname.match(/[0-9a-f]{8}-[0-9a-f-]{27,}/i);
+            const jobMatch = location.pathname.match(/\/job\/([0-9a-f]{8}-[0-9a-f-]{27,}|[a-z0-9]{4,12})(?:\/|$)/i);
             const clean = (value, limit) => String(value || '')
                 .replace(/https?:\/\/[^\s?]+\?[^\s]+/gi, match => match.split('?')[0] + '?<redacted>')
                 .replace(/\b(code|state|token|authorization)=\S+/gi, '$1=<redacted>')
@@ -85,7 +85,7 @@
             async function report(event, details = {}) {
                 if (sending || details.name === 'AbortError') return;
                 const payload = {
-                    event, pathname: location.pathname, job_id: jobMatch?.[0] || '',
+                    event, pathname: location.pathname, job_id: jobMatch?.[1] || '',
                     action: clean(details.action, 100), message: clean(details.message, 500),
                     stack: clean(details.stack, 2000), release,
                     server_request_id: clean(details.server_request_id, 12),

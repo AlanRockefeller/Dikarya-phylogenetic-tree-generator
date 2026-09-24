@@ -7,7 +7,11 @@ functions directly.
 """
 
 import importlib.util
+import json
 import os
+from pathlib import Path
+import shutil
+import subprocess
 import unittest
 from unittest.mock import patch
 
@@ -26,6 +30,120 @@ find_observation_source_tip_name = inaturalist_tree_service._find_observation_so
 maybe_add_inat_its_sequence = inaturalist_tree_service._maybe_add_inat_its_sequence
 source_display_label_for_tip = inaturalist_tree_service._source_display_label_for_tip
 from app.services.tree_edit_service import rename_tip
+
+
+class TestInaturalistTreeInputParsing(unittest.TestCase):
+    def test_observation_url_accepts_a_sentence_period(self):
+        parsed = inaturalist_tree_service.parse_inaturalist_tree_input(
+            "http://www.inaturalist.org/observations/188948264."
+        )
+
+        self.assertEqual(parsed["type"], "single_observation")
+        self.assertEqual(parsed["observation_id"], 188948264)
+        self.assertEqual(
+            parsed["normalized"],
+            "https://www.inaturalist.org/observations/188948264",
+        )
+
+    def test_period_is_only_ignored_at_the_end_of_an_observation_url(self):
+        parsed = inaturalist_tree_service.parse_inaturalist_tree_input(
+            "https://www.inaturalist.org/observations/188948264./activity"
+        )
+
+        self.assertNotEqual(parsed["type"], "single_observation")
+
+    def test_observation_url_accepts_question_marks_and_tracking_query(self):
+        for url in (
+            "https://www.inaturalist.org/observations/188948264?",
+            "https://www.inaturalist.org/observations/188948264???",
+            "https://www.inaturalist.org/observations/188948264?fbclid=facebook-junk",
+        ):
+            with self.subTest(url=url):
+                parsed = inaturalist_tree_service.parse_inaturalist_tree_input(url)
+                self.assertEqual(parsed["type"], "single_observation")
+                self.assertEqual(parsed["observation_id"], 188948264)
+
+    def test_input_rejections_have_safe_diagnostic_codes(self):
+        with self.assertRaises(inaturalist_tree_service.InatTreeError) as raised:
+            inaturalist_tree_service.parse_inaturalist_tree_input(
+                "https://example.com/observations/188948264"
+            )
+
+        self.assertEqual(raised.exception.failure_code, "inat_tree_foreign_url")
+
+    def test_not_found_preview_logs_the_exact_user_input(self):
+        private_input = "private-user-name"
+        with (
+            patch.object(
+                inaturalist_tree_service,
+                "parse_inaturalist_tree_input",
+                return_value={
+                    "type": "user_candidate",
+                    "source": "observations_path",
+                    "value": private_input,
+                },
+            ),
+            patch.object(
+                inaturalist_tree_service,
+                "resolve_inaturalist_user_or_project",
+                return_value={"type": "not_found", "message": private_input},
+            ),
+            self.assertLogs(inaturalist_tree_service.logger, level="WARNING") as logs,
+        ):
+            result = inaturalist_tree_service.preview_inaturalist_tree_input(
+                private_input
+            )
+
+        self.assertEqual(result["type"], "not_found")
+        output = "\n".join(logs.output)
+        self.assertIn("event=inat_tree.preview_not_found", output)
+        self.assertIn("input_type=user_candidate", output)
+        self.assertIn("input_source=observations_path", output)
+        self.assertIn(f"input='{private_input}'", output)
+
+    def test_browser_recognizes_the_same_sentence_period_url_as_single(self):
+        node = shutil.which("node")
+        if not node:
+            self.skipTest("node is not installed")
+        template = (
+            Path(__file__).resolve().parents[1]
+            / "app" / "templates" / "sequence_entry.html"
+        ).read_text(encoding="utf-8")
+        start = template.index("    function isValidInaturalistInput(value) {")
+        end = template.index("    function getInaturalistBlastLimit", start)
+        script = template[start:end] + (
+            "\nconsole.log(JSON.stringify([\n"
+            "isLikelyInaturalistTreeInput('http://www.inaturalist.org/observations/188948264.'),\n"
+            "isSingleInaturalistObservationInput('http://www.inaturalist.org/observations/188948264.'),\n"
+            "isSingleInaturalistObservationInput('http://www.inaturalist.org/observations/188948264./activity'),\n"
+            "isSingleInaturalistObservationInput('https://www.inaturalist.org/observations/188948264?'),\n"
+            "isSingleInaturalistObservationInput('https://www.inaturalist.org/observations/188948264???'),\n"
+            "isSingleInaturalistObservationInput('https://www.inaturalist.org/observations/188948264?fbclid=facebook-junk'),\n"
+            "isDirectInaturalistSequenceSearchInput('https://www.inaturalist.org/observations?taxon_id=63839&field:DNA%20Barcode%20ITS='),\n"
+            "isDirectInaturalistSequenceSearchInput('https://www.inaturalist.org/observations?user_id=alan'),\n"
+            "isDirectInaturalistSequenceSearchInput('https://www.inaturalist.org/observations?project_id=123')\n"
+            "]));\n"
+        )
+        proc = subprocess.run(
+            [node, "-e", script], capture_output=True, text=True, check=True,
+        )
+
+        self.assertEqual(
+            json.loads(proc.stdout),
+            [True, True, False, True, True, True, True, False, False],
+        )
+
+    def test_every_tree_submission_carries_the_inaturalist_source_url(self):
+        template = (
+            Path(__file__).resolve().parents[1]
+            / "app" / "templates" / "sequence_entry.html"
+        ).read_text(encoding="utf-8")
+        self.assertEqual(
+            template.count(
+                "inat_source_url: getInaturalistSourceUrlForPayload()"
+            ),
+            3,
+        )
 
 
 class TestInaturalistTreeSourceLabel(unittest.TestCase):
@@ -574,8 +692,8 @@ class TestInaturalistTreeSourceLabel(unittest.TestCase):
                 return_value=(0, []),
             ),
             patch(
-                "app.services.mycomap_service.get_mycomap_ncbi_queue_position",
-                return_value=None,
+                "app.services.mycomap_service.get_mycomap_ncbi_queue_status",
+                return_value={"queue_position": None, "status": None, "rid": None, "source": None},
             ),
             patch(
                 "app.api.routes.gather_mycomap_sequences_for_queue",
@@ -630,8 +748,8 @@ class TestInaturalistTreeSourceLabel(unittest.TestCase):
                 return_value=(2, []),
             ),
             patch(
-                "app.services.mycomap_service.get_mycomap_ncbi_queue_position",
-                return_value=None,
+                "app.services.mycomap_service.get_mycomap_ncbi_queue_status",
+                return_value={"queue_position": None, "status": None, "rid": None, "source": None},
             ),
             patch(
                 "app.api.routes.gather_mycomap_sequences_for_queue",
@@ -658,8 +776,8 @@ class TestInaturalistTreeSourceLabel(unittest.TestCase):
         }
         with (
             patch(
-                "app.services.mycomap_service.get_mycomap_ncbi_queue_position",
-                return_value=2741,
+                "app.services.mycomap_service.get_mycomap_ncbi_queue_status",
+                return_value={"queue_position": 2741, "status": "queued", "rid": None, "source": "api"},
             ),
             patch(
                 "app.services.mycomap_service.get_mycomap_ncbi_result_count",
@@ -690,8 +808,8 @@ class TestInaturalistTreeSourceLabel(unittest.TestCase):
         }
         with (
             patch(
-                "app.services.mycomap_service.get_mycomap_ncbi_queue_position",
-                return_value=2741,
+                "app.services.mycomap_service.get_mycomap_ncbi_queue_status",
+                return_value={"queue_position": 2741, "status": "queued", "rid": None, "source": "api"},
             ),
             patch(
                 "app.services.mycomap_service.get_mycomap_ncbi_result_count",

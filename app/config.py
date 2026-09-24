@@ -96,6 +96,32 @@ def timeout_env(name, default):
     return float(default)
 
 
+def choice_env(name, default, allowed):
+    """Read an environment variable restricted to a fixed set of values.
+
+    Same policy as ``bool_env``/``timeout_env``: an unrecognised value is
+    reported and the documented default is used, rather than raising at import
+    time (Gunicorn does not import the app until the first request, so a typo in
+    one optional variable would otherwise produce a site that starts
+    "successfully" and 500s on every request).
+
+    Deliberately does *not* silently resolve an unknown value to whichever
+    member happens to sort first -- a mistyped MAFFT_DIRECTION_MODE=of would
+    then turn the direction check off without anyone noticing.
+    """
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    clean = str(raw).strip().lower()
+    if clean in allowed:
+        return clean
+    logging.getLogger(__name__).warning(
+        "%s=%r ignored (not one of %s); using %r",
+        name, raw, ", ".join(sorted(allowed)), default,
+    )
+    return default
+
+
 def count_env(name, default):
     """Read a positive integer size limit, or ``default`` if unusable.
 
@@ -218,7 +244,10 @@ class Config:
     
     # External Tools
     RAXML_BINARY = os.environ.get('RAXML_BINARY', 'raxml-ng')
-    IQTREE_BINARY = os.environ.get('IQTREE_BINARY', 'iqtree2')
+    # IQ-TREE 3 (3.1.4 at /usr/local/bin). /usr/bin/iqtree2 is the old 2.0.7
+    # and must not be used: the limited search is about twice as quick in 3, and
+    # Quick Tree now runs on it.
+    IQTREE_BINARY = os.environ.get('IQTREE_BINARY', '/usr/local/bin/iqtree3')
     MRBAYES_BINARY = os.environ.get('MRBAYES_BINARY', 'mb')
     MAFFT_BINARY = os.environ.get('MAFFT_BINARY', 'mafft')
     MUSCLE_BINARY = os.environ.get('MUSCLE_BINARY', 'muscle')
@@ -323,6 +352,35 @@ class Config:
     # a degradation; the alignment itself still runs.
     MAFFT_ADJUSTDIRECTION_MAX_BASES = count_env(
         'MAFFT_ADJUSTDIRECTION_MAX_BASES', 5_000_000
+    )
+
+    # Which direction check the normal MAFFT alignment runs.
+    #
+    #   fast     --adjustdirection            (default)
+    #   accurate --adjustdirectionaccurately
+    #   off      no direction flag at all
+    #
+    # --adjustdirectionaccurately runs a full pairwise comparison of every
+    # sequence against every other before the alignment starts, while
+    # --adjustdirection decides the same question from a 6-mer count. On
+    # barcode-length fungal input the two agree, and the cheap one is a large
+    # fraction of the wall clock back on an ordinary ITS job.
+    #
+    # `accurate` exists so this can be rolled back in production by setting one
+    # environment variable, without a deploy, if the fast check ever disagrees
+    # on real submissions. `off` is an operator escape hatch; it does NOT
+    # replace the per-job fix_orientation setting, which still disables the
+    # check on its own whatever this is set to.
+    #
+    # Deliberately scoped to _run_mafft(). fix_direction_with_mafft() -- the
+    # direction-only pre-pass MUSCLE, Clustal Omega and IQ-TREE's --align-only
+    # depend on, where MAFFT's answer is the *only* direction signal and the
+    # alignment it produces is thrown away -- stays on the accurate check,
+    # because the measurement behind this default was taken on the normal
+    # alignment path and nowhere else.
+    MAFFT_DIRECTION_MODES = ("fast", "accurate", "off")
+    MAFFT_DIRECTION_MODE = choice_env(
+        'MAFFT_DIRECTION_MODE', 'fast', MAFFT_DIRECTION_MODES
     )
 
 

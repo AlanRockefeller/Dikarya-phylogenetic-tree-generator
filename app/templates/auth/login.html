@@ -14,7 +14,7 @@
             <ul class="text-sm text-gray-700 dark:text-gray-300 space-y-2">
                 <li class="flex items-start">
                     <i class="fas fa-shield-halved text-journal-gold mt-1 mr-2 w-4"></i>
-                    <span><strong>Exclusive edit access.</strong> Only you can prune, reroot, rename tips, or recompute your trees. Without an account, anyone who has the job link can modify the tree.</span>
+                    <span><strong>Exclusive edit access.</strong> Only you can prune, reroot, rename tips, or recompute your trees. Without an account, anyone can modify the tree.</span>
                 </li>
                 <li class="flex items-start">
                     <i class="fas fa-tasks text-journal-gold mt-1 mr-2 w-4"></i>
@@ -28,7 +28,7 @@
             <div class="mt-4 pt-3 border-t border-gray-200 dark:border-journal-dark">
                 <p class="text-xs text-gray-600 dark:text-gray-400 leading-relaxed">
                     <i class="fas fa-user-secret text-gray-400 mr-1"></i>
-                    <strong>Prefer not to sign up?</strong> You can use Dikarya anonymously without an account &mdash; build trees, share links, and download results just the same. The only tradeoff is that anyone with a job link can also edit that tree.
+                    <strong>Prefer not to sign up?</strong> You can use Dikarya anonymously without an account &mdash; build trees, share links, and download results just the same.
                 </p>
             </div>
         </div>
@@ -46,7 +46,7 @@
 
         <!-- Card Body -->
         <div class="px-6 py-8">
-            <form method="POST" action="{{ url_for('auth.login') }}" class="space-y-6">
+            <form method="POST" action="{{ url_for('auth.login', next=request.args.get('next')) }}" class="space-y-6">
                 <input type="hidden" name="csrf_token" value="{{ csrf_token() }}" />
                 <!-- Email Field -->
                 <div>
@@ -85,7 +85,7 @@
         <div class="bg-gray-50 dark:bg-journal-dark px-6 py-4 border-t border-gray-200 dark:border-journal-green">
             <p class="text-sm text-gray-600 dark:text-gray-300 text-center">
                 Don't have an account?
-                <a href="{{ url_for('auth.register') }}"
+                <a href="{{ url_for('auth.register', next=request.args.get('next')) }}"
                     class="text-journal-gold hover:text-journal-gold-light font-semibold transition-colors">
                     Register here
                 </a>

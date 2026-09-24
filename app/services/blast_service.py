@@ -748,10 +748,18 @@ def _parse_genbank_xml(xml_text: str) -> Dict[str, Dict]:
         "accession": str,
         "version": str,  # "Accession.Version"
         "organism": str,
-        "sequence": str, # Uppercase, clean
-        "raw_record": str, # Blob for keyword scanning
+        "definition": str, # GBSeq_definition, i.e. the DEFINITION line
+        "sequence": Optional[str], # Uppercase, clean; None for a record with
+                                   # no GBSeq_sequence (a WGS/TSA/TLS master
+                                   # record, or a seq_start/seq_stop-sliced
+                                   # annotation-only fetch)
         "source_features": Dict[str, str], # qualifier_name -> value
-        "type_material": Optional[str] # If found in source qualifiers
+        "type_material": Optional[str], # If found in source qualifiers
+        "blob": str, # definition + organism + every qualifier + comment, run
+                     # together, for keyword scanning. The docstring called this
+                     # "raw_record" for as long as the code has called it
+                     # "blob"; callers (genbank_observation_service,
+                     # fetch_fasta_for_accessions) have always read "blob".
     }
     """
     result = {"by_acc": {}, "by_ver": {}}
@@ -819,6 +827,7 @@ def _parse_genbank_xml(xml_text: str) -> Dict[str, Dict]:
                 "accession": acc,
                 "version": ver,
                 "organism": organism,
+                "definition": definition,
                 "sequence": clean_seq,
                 "source_features": source_quals,
                 "type_material": type_material,

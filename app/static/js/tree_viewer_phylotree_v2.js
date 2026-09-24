@@ -6,10 +6,19 @@
     'use strict';
 
     const DEBUG_MODE = new URLSearchParams(window.location.search).has('debug');
-    // FastTree writes numerical stand-ins such as 6e-9 and 1.2e-8 for branches whose
-    // optimized length is effectively zero. Treating only literal 0 as unresolved would
-    // split one biological polytomy into arbitrary binary nodes in the viewer.
-    const ZERO_LENGTH_POLYTOMY_EPSILON = 1e-7;
+    // Tree builders write small positive stand-ins for branches whose optimized length is
+    // effectively zero: FastTree commonly emits values around 1e-8, while IQ-TREE 3 floors
+    // them at 1e-6. Use the same near-zero boundary as the tree-analysis metrics so either
+    // engine's arbitrary binary resolution is presented as one soft polytomy.
+    const ZERO_LENGTH_POLYTOMY_EPSILON = 1e-6;
+    // Alan 9/23/26 - Support labels are not drawn on a branch at or below this length. Such a
+    // branch cannot carry a single substitution on any alignment Dikarya builds (it would need
+    // 1e5 columns), so its support scores an arbitrary split of near-identical sequences and is
+    // uninformative -- a Quick Tree of one species printed "0" on 60% of its nodes. Looser than
+    // the polytomy epsilon on purpose: IQ-TREE also leaves such branches at 1-2.5e-6. A label that
+    // displays as zero is dropped too (see _addSupportLabels), since a blank already reads as
+    // unsupported.
+    const SUPPORT_LABEL_MIN_BRANCH_LENGTH = 1e-5;
 
     // Alan 8/24/26 - Say why a phylotree instance is not usable, or null when it is.
     // phylotree.js does not throw on a truncated or otherwise unparseable Newick: its
@@ -60,10 +69,29 @@
         return `internal:${hash.toString(16).padStart(8, '0')}`;
     }
 
+    // Older iNaturalist imports stripped the quotes from numbered provisional
+    // species codes. Restore those quotes for display so the species-name
+    // parser can distinguish Pisolithus sp. 'AZ01' from Pisolithus sp. 'PNW01'.
+    // Requiring a digit keeps ordinary unquoted "Genus sp. locality" labels
+    // from being reinterpreted as provisional names.
+    const UNQUOTED_PROVISIONAL_CODE_RE = /\b([A-Z][A-Za-z-]+\s+sp\.?)\s+([A-Za-z][A-Za-z0-9.-]*\d[A-Za-z0-9.-]*)\b/g;
+
+    // Danny Miller's provisional codes also travel with no "sp." at all ("OP028476 Hydnellum
+    // PNW10 iNat65285395"). Same species as Hydnellum sp. 'PNW10', so display it that way.
+    // Narrow on purpose (2-4 capitals + 2-3 digits, whole token) so accessions, iNat ids and
+    // vouchers such as REB-49 are never rewritten. Mirrors speciesUnquotedCode() in
+    // tree_viewer_controller.js.
+    const BARE_PROVISIONAL_CODE_RE = /(^|\s)([A-Z][a-z]{2,})\s+([A-Z]{2,4}\d{2,3})(?=\s|$)/g;
+
     // Alan 7/15/26 - Hide pipeline-only MAFFT and RiC annotations from tip labels while preserving stable tree IDs.
     function cleanTipDisplayName(name) {
         if (typeof name !== 'string') return name;
-        return name.replace(/^_R_/, '').replace(/\s+RiC(?:\s+\d+)?\s*$/i, '').trim();
+        return name
+            .replace(/^_R_/, '')
+            .replace(/\s+RiC(?:\s+\d+)?\s*$/i, '')
+            .replace(UNQUOTED_PROVISIONAL_CODE_RE, "$1 '$2'")
+            .replace(BARE_PROVISIONAL_CODE_RE, "$1$2 sp. '$3'")
+            .trim();
     }
 
     // Alan 8/15/26 - Curated font list for clade annotations, shared with the controller's
@@ -240,14 +268,23 @@
     const SUPPORT_METHOD_ALIASES = {
         'raxml-ng': 'raxml', 'raxmlng': 'raxml', 'raxml_ng': 'raxml', 'raxml8': 'raxml',
         'iq-tree': 'iqtree', 'iqtree2': 'iqtree', 'iq-tree2': 'iqtree',
+        'iqtree3': 'iqtree', 'iq-tree3': 'iqtree',
         'mr_bayes': 'mrbayes', 'mrbayes3': 'mrbayes',
         'fasttree2': 'fasttree',
-        'neighbor-joining': 'nj', 'neighbour-joining': 'nj'
+        'neighbor-joining': 'nj', 'neighbour-joining': 'nj',
+        // Spellings of the fast method. Whitespace is already removed before
+        // the lookup, so "IQ-TREE fast" arrives as "iq-treefast".
+        'iqtreefast': 'iqtree_fast', 'iq-treefast': 'iqtree_fast',
+        'iq-tree_fast': 'iqtree_fast', 'iqtree3fast': 'iqtree_fast'
     };
     const SUPPORT_METHOD_TYPES = {
         fasttree: 'SH',
         raxml: 'BS',
         iqtree: 'UFBOOT',
+        // Alan 9/17/26 - The IQ-TREE Quick Tree preset runs fixed SH-aLRT
+        // support without ultrafast bootstrap, so its node labels are always
+        // single SH-aLRT percentages.
+        iqtree_fast: 'ALRT',
         mrbayes: 'PP'
     };
 
@@ -816,7 +853,7 @@
                 throw new Error(parseFailure);
             }
 
-            // FastTree resolves zero-length polytomies into arbitrary binary ladders. Compact
+            // Tree builders resolve zero-length polytomies into arbitrary binary ladders. Compact
             // each complete zero-length tip component before recording "original" order, so
             // Sort -> Original and later reloads both retain the useful grouped presentation.
             this._groupZeroLengthPolytomies();
@@ -1225,6 +1262,66 @@
             return options.reduce((best, option) => better(option, best) ? option : best, null);
         }
 
+        _contractZeroLengthPolytomy(polytomy, originalPositions) {
+            const component = polytomy?.nodes;
+            const anchor = polytomy?.anchor;
+            if (!(component instanceof Set) || !anchor) return false;
+
+            const boundaryChildren = [];
+            component.forEach((node) => {
+                const children = node.children || node.data?.children || [];
+                if (!children.length) {
+                    if (node !== anchor) boundaryChildren.push(node);
+                    return;
+                }
+                children.forEach((child) => {
+                    if (!component.has(child)) boundaryChildren.push(child);
+                });
+            });
+            if (boundaryChildren.length < 2) return false;
+
+            const componentTips = new Set(polytomy.tips || []);
+            const positionCache = new WeakMap();
+            const firstOriginalPosition = (node) => {
+                if (positionCache.has(node)) return positionCache.get(node);
+                const children = node.children || node.data?.children || [];
+                if (!children.length) {
+                    const id = this._getNodeId(node);
+                    const position = originalPositions.get(id) ?? Number.MAX_SAFE_INTEGER;
+                    positionCache.set(node, position);
+                    return position;
+                }
+                const position = Math.min(...children.map(firstOriginalPosition));
+                positionCache.set(node, position);
+                return position;
+            };
+            boundaryChildren.sort((left, right) => {
+                // Once the near-zero edges are contracted, all unresolved tips are peers.
+                // Put those peers in one block and retain source order within each block.
+                const leftTip = componentTips.has(left) ? 0 : 1;
+                const rightTip = componentTips.has(right) ? 0 : 1;
+                return leftTip - rightTip
+                    || firstOriginalPosition(left) - firstOriginalPosition(right);
+            });
+            anchor.children = boundaryChildren;
+            boundaryChildren.forEach((child) => { child.parent = anchor; });
+            return true;
+        }
+
+        _refreshHierarchyMetrics(root) {
+            const visit = (node, depth) => {
+                node.depth = depth;
+                const children = node.children || [];
+                if (!children.length) {
+                    node.height = 0;
+                    return 0;
+                }
+                node.height = 1 + Math.max(...children.map((child) => visit(child, depth + 1)));
+                return node.height;
+            };
+            if (root) visit(root, 0);
+        }
+
         _groupZeroLengthPolytomies() {
             if (!this.tree) return 0;
             const nodes = [];
@@ -1232,6 +1329,9 @@
             const root = nodes.find((node) => !node.parent);
             if (!root) return 0;
 
+            const originalPositions = new Map(
+                this._tipOrderFromModel().map((id, index) => [id, index])
+            );
             const components = new Map();
             nodes.forEach((node) => {
                 const children = node.children || node.data?.children || [];
@@ -1239,16 +1339,26 @@
                 const polytomy = this._zeroLengthPolytomyForTip(node);
                 if (!polytomy) return;
                 const key = this._annotationMembershipKey(polytomy.memberIds);
-                if (key && !components.has(key)) components.set(key, new Set(polytomy.memberIds));
+                if (key && !components.has(key)) components.set(key, polytomy);
             });
-            const groups = Array.from(components.values()).sort((a, b) => b.size - a.size);
+            const polytomies = Array.from(components.values())
+                .sort((a, b) => b.memberIds.length - a.memberIds.length);
+            let grouped = 0;
+            polytomies.forEach((polytomy) => {
+                if (this._contractZeroLengthPolytomy(polytomy, originalPositions)) grouped += 1;
+            });
+            if (grouped) this._refreshHierarchyMetrics(root);
+
+            // A contraction makes the unresolved tips direct siblings and therefore
+            // contiguous. Retain the older rotation pass as a fallback for unusual tree
+            // objects that cannot safely be contracted.
+            const groups = polytomies.map((item) => new Set(item.memberIds));
             const totalRuns = () => {
                 const order = this._tipOrderFromModel();
                 return groups.reduce((sum, group) => sum + this._selectionRunCount(order, group), 0);
             };
 
             let score = totalRuns();
-            let grouped = 0;
             groups.forEach((group) => {
                 const order = this._tipOrderFromModel();
                 if (this._selectionRunCount(order, group) <= 1) return;
@@ -2733,6 +2843,14 @@
                         }
                     }
 
+                    if (d.parent) {
+                        const incoming = self._branchLength(d);
+                        if (incoming !== null && Math.abs(incoming) <= SUPPORT_LABEL_MIN_BRANCH_LENGTH) {
+                            group.select("text.node-support-value").remove();
+                            return;
+                        }
+                    }
+
                     const numVal = self._extractSupportValue(d);
                     if (numVal === null) {
                         group.select("text.node-support-value").remove();
@@ -2774,6 +2892,17 @@
                     } else {
                         if (numVal + EPS < bootThreshold) { group.select("text.node-support-value").remove(); return; }
                         rawLabel = Math.round(numVal).toString();
+                    }
+
+                    // Alan 9/23/26 - Omit a label that displays as zero. Checked on the formatted
+                    // label so a 0.004 printed as "0" is caught too. A dual label is dropped only
+                    // at "0/0": "0/95" says the two tests disagree, which is worth showing.
+                    const isZeroLabel = dualVal
+                        ? /^0(\.0+)?\/0(\.0+)?$/.test(rawLabel)
+                        : Number(rawLabel) === 0;
+                    if (isZeroLabel) {
+                        group.select("text.node-support-value").remove();
+                        return;
                     }
 
                     // Append Text
@@ -4066,6 +4195,19 @@
                 }
             });
             return names;
+        }
+
+        /**
+         * Alan 9/9/26 - The highlight colour behind each tip label, keyed by canonical tip id.
+         *
+         * Filled by the annotation renderer from the bands it actually painted, so hidden
+         * layers, annotations the current rooting cannot resolve, and nesting order are all
+         * already accounted for. The Alignment Viewer uses it to back the sequence names with
+         * the same colour as their clade.
+         */
+        getTipHighlightStyles() {
+            return this._tipHighlightStyles instanceof Map
+                ? new Map(this._tipHighlightStyles) : new Map();
         }
 
         // Alan 5/13/26 - Expose visible selected tip names so the Alignment Viewer can default to selection.
@@ -5644,6 +5786,10 @@
          * own container group, so they share the tree's coordinate space and zoom/pan transform.
          */
         _renderCladeAnnotations() {
+            // Alan 9/9/26 - Rebuilt on every redraw so the Alignment Viewer's name backgrounds
+            // can never outlive the bands they mirror (a deleted, hidden or no-longer-valid
+            // highlight leaves nothing behind).
+            this._tipHighlightStyles = new Map();
             const svg = window.d3v7.select(this.container).select('svg');
             if (svg.empty()) return;
             const svgNode = svg.node();
@@ -5894,6 +6040,25 @@
                 }
             }
 
+            // Alan 9/9/26 - Record the colour each highlighted tip is sitting under, in the
+            // same paint order as the bands above, so a nested clade wins exactly as it does
+            // on screen. The Alignment Viewer reads this to give the sequence names the same
+            // background; it is derived from what was actually drawn rather than recomputed,
+            // so the two views cannot disagree about a colour.
+            for (const item of highlightItems) {
+                const effective = this._effectiveHighlightStyle(item, highlightColors);
+                const members = item.annotation?.member_tip_ids || [];
+                for (const member of members) {
+                    if (!positions.has(member)) continue;
+                    this._tipHighlightStyles.set(member, {
+                        color: effective.color,
+                        opacity: effective.opacity,
+                        label: item.annotation?.label || '',
+                        annotationId: item.annotation?.id || null
+                    });
+                }
+            }
+
             // Alan 8/17/26 - Branch annotations are attached to the exact node resolved from the saved
             // descendant set. Layer order affects only stacking on that SAME branch.
             const layerOrder = new Map(orderedLayers.map((layer, index) => [layer.id, index]));
@@ -5960,13 +6125,12 @@
                 }
                 requiredRight = Math.max(requiredRight, annotationBox.x + annotationBox.width);
             } catch (_) { /* fall back to the layout cursor */ }
-            // The container group carries translate(...) alone before any zoom, and
-            // translate(...) scale(k) afterwards, so convert group units to SVG units.
-            let offsetX = 0;
-            const transform = enclosure.attr('transform') || '';
-            const match = /translate\(\s*(-?[\d.]+)/.exec(transform);
-            if (match) offsetX = parseFloat(match[1]) || 0;
-            const needed = Math.ceil(offsetX + requiredRight * (k || 1) + 24);
+            // Alan 9/23/26 - Size the canvas in the LAYOUT frame, never the camera's. D3's pan/zoom
+            // overwrites the container transform, so reading it here made every right-drag pan
+            // grow the viewBox by the pan distance and the browser shrank the whole tree to fit.
+            const layoutTranslate = this._annotationLayoutTranslate(enclosure);
+            const offsetX = layoutTranslate.x;
+            const needed = Math.ceil(offsetX + requiredRight + 24);
             if (Number.isFinite(baseWidth)) {
                 setWidth(Math.max(baseWidth, needed));
             } else if (needed > 0) {
@@ -5978,13 +6142,13 @@
                 const raw = (baseViewBox || `0 0 ${Number.isFinite(baseWidth) ? baseWidth : needed} ${parseFloat(svgNode.getAttribute('height')) || 800}`)
                     .trim().split(/[\s,]+/).map(Number);
                 if (raw.length === 4 && raw.every(Number.isFinite)) {
-                    const translate = /translate\(\s*(-?[\d.]+)(?:[ ,]+(-?[\d.]+))?/.exec(transform);
-                    const tx = translate ? (parseFloat(translate[1]) || 0) : 0;
-                    const ty = translate ? (parseFloat(translate[2]) || 0) : 0;
-                    const left = tx + annotationBox.x * (k || 1) - 12;
-                    const top = ty + annotationBox.y * (k || 1) - 12;
-                    const right = tx + (annotationBox.x + annotationBox.width) * (k || 1) + 12;
-                    const bottom = ty + (annotationBox.y + annotationBox.height) * (k || 1) + 12;
+                    // Alan 9/23/26 - Camera-independent offsets, so panning/zooming leaves the viewBox alone.
+                    const tx = layoutTranslate.x;
+                    const ty = layoutTranslate.y;
+                    const left = tx + annotationBox.x - 12;
+                    const top = ty + annotationBox.y - 12;
+                    const right = tx + (annotationBox.x + annotationBox.width) + 12;
+                    const bottom = ty + (annotationBox.y + annotationBox.height) + 12;
                     const minX = Math.min(raw[0], left);
                     const minY = Math.min(raw[1], top);
                     const maxX = Math.max(raw[0] + raw[2], right, needed);
@@ -5994,6 +6158,27 @@
                     svgNode.setAttribute('data-annotation-set-viewbox', nextViewBox);
                 }
             }
+        }
+
+        // Alan 9/23/26 - The translate phylotree gives its container at layout time (before any
+        // camera move). Prefer the renderer's own values; the attribute is only trusted while
+        // the D3 camera is still at identity, since any pan/zoom replaces it.
+        _annotationLayoutTranslate(enclosure) {
+            const display = this.tree?.display;
+            if (display && typeof display.pad_height === 'function' && Array.isArray(display.offsets)) {
+                const x = Number(display.offsets[1]) + Number(display.options?.['left-offset'] || 0);
+                const y = Number(display.pad_height());
+                if (Number.isFinite(x) && Number.isFinite(y)) return { x, y };
+            }
+            let camera = null;
+            try { camera = window.d3v7.zoomTransform(enclosure.node().ownerSVGElement); } catch (_) { }
+            if (camera && (camera.k !== 1 || camera.x !== 0 || camera.y !== 0)) return { x: 0, y: 0 };
+            // phylotree writes "translate (x,y)" with a space, so allow one before the paren.
+            const match = /translate\s*\(\s*(-?[\d.]+)(?:[ ,]+(-?[\d.]+))?/.exec(enclosure.attr('transform') || '');
+            return {
+                x: match ? (parseFloat(match[1]) || 0) : 0,
+                y: match ? (parseFloat(match[2]) || 0) : 0
+            };
         }
 
         /**

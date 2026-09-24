@@ -33,3 +33,25 @@ stay authoritative there; keep this file to settings the unit does not pass.
 # left keeps working.
 # Referrer is intentionally omitted: it can itself contain OAuth/query values.
 access_log_format = '%(h)s %(l)s %(u)s %(t)s "%(m)s %(U)s %(H)s" %(s)s %(b)s "-" "%(a)s" %(D)s req=%({x-request-id}o)s noise=%({x-dikarya-noise}o)s'
+
+
+# Alan 9/23/26 - Close SSE streams as soon as a worker is told to stop.
+#
+# On SIGTERM the master closes the listening socket first and then waits up to
+# graceful_timeout (30s) for workers to finish their requests. An open
+# /api/job/<id>/events stream never finishes, so every web restart meant 30s of
+# nginx 502s for the whole site (four of them on 2026-09-23). Gunicorn's own
+# handler only sets worker.alive, which the streams cannot see, so wrap it to
+# also raise the flag they poll. Ordinary requests still get the full
+# graceful_timeout to complete.
+def post_worker_init(worker):
+    import signal
+
+    from app.services import sse_registry
+
+    def handle_term(sig, frame):
+        sse_registry.begin_shutdown()
+        worker.handle_exit(sig, frame)
+
+    signal.signal(signal.SIGTERM, handle_term)
+    signal.siginterrupt(signal.SIGTERM, False)

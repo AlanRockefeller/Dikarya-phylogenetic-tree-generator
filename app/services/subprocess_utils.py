@@ -436,6 +436,7 @@ def run_command_streaming(
     timeout: Optional[int] = None,
     cpu_limit_seconds: Optional[int] = None,
     stderr_file_filter: Optional[callable] = None,
+    stdout_tee_path: Optional[Path] = None,
 ) -> Tuple[int, dict]:
     """
     Run an external command with streaming output.
@@ -447,7 +448,10 @@ def run_command_streaming(
     - Otherwise: stdout streams via on_stdout_line callback
     - If stderr_path provided: stderr goes to file AND on_stderr_line callback
     - If no stderr_path: stderr only via callback
-    
+    - If stdout_tee_path provided: stdout goes to file AND on_stdout_line
+      callback. Distinct from stdout_path, which redirects the pipe outright
+      and therefore leaves nothing for on_stdout_line to stream.
+
     Args:
         args: Command and arguments as list
         cwd: Working directory
@@ -460,6 +464,12 @@ def run_command_streaming(
             worth persisting to stderr_path. Live streaming (on_stderr_line) and
             the error tail are unaffected, so a tool's per-iteration progress
             chatter can still drive the UI without being kept on disk forever.
+        stdout_tee_path: Optional file to append stdout to while still streaming
+            it. For a tool that reports progress on stdout and keeps no log of
+            its own, this is the only durable record of what it said -- MrBayes
+            is the case this exists for. When it names the same file as
+            stderr_path the two share one handle, so the interleaving on disk
+            matches the order the lines actually arrived.
 
     Returns:
         (exit_code, stats_dict)
@@ -519,7 +529,22 @@ def run_command_streaming(
             stderr_file = open(stderr_path, 'a')
             stderr_file.write(f"CMD: {' '.join(args)}\n")
             stderr_file.write("-" * 40 + "\n")
-        
+
+        # Mirror for stdout. Sharing the handle when both point at the same file
+        # keeps the two streams in arrival order and avoids two buffers racing
+        # over one file; only a handle we opened ourselves gets closed below.
+        stdout_tee_file = None
+        stdout_tee_owned = False
+        if stdout_tee_path:
+            if stderr_file is not None and stdout_tee_path == stderr_path:
+                stdout_tee_file = stderr_file
+            else:
+                stdout_tee_path.parent.mkdir(parents=True, exist_ok=True)
+                stdout_tee_file = open(stdout_tee_path, 'a')
+                stdout_tee_owned = True
+                stdout_tee_file.write(f"CMD: {' '.join(args)}\n")
+                stdout_tee_file.write("-" * 40 + "\n")
+
         process = None
         try:
             # Start process
@@ -572,6 +597,11 @@ def run_command_streaming(
                         if stream_name == 'stdout':
                             stats["stdout_lines"] += 1
                             stdout_tail_buffer.append(line)
+
+                            if stdout_tee_file:
+                                stdout_tee_file.write(line + "\n")
+                                stdout_tee_file.flush()
+
                             if on_stdout_line:
                                 try:
                                     on_stdout_line(line)
@@ -624,6 +654,12 @@ def run_command_streaming(
         finally:
             if stdout_file:
                 stdout_file.close()
+            if stdout_tee_file and stdout_tee_owned:
+                stdout_tee_file.write("-" * 40 + "\n")
+                stdout_tee_file.write(
+                    f"Exit code: {process.returncode if process else 'N/A'}\n"
+                )
+                stdout_tee_file.close()
             if stderr_file:
                 stderr_file.write("-" * 40 + "\n")
                 # `process` is always bound here but is None when Popen itself

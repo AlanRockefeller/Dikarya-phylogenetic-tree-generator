@@ -74,7 +74,7 @@ def _schemas():
         "Job": {
             "type": "object",
             "properties": {
-                "id": {"type": "string", "format": "uuid"},
+                "id": {"type": "string", "example": "aq7c"},
                 "status": {"type": "string", "enum": ["queued", "running", "completed", "failed", "error"]},
                 "created_at": {"type": "string", "format": "date-time"},
                 "updated_at": {"type": "string", "format": "date-time"},
@@ -142,6 +142,299 @@ def _schemas():
                 "api_version": {"type": "string", "example": "v1"},
             },
         },
+        "InaturalistFinderMatch": {
+            "type": "object",
+            "required": ["id", "url", "is_original", "location", "user", "taxon"],
+            "properties": {
+                "id": {"type": "integer", "example": 360934883},
+                "url": {"type": "string", "format": "uri"},
+                "is_original": {
+                    "type": "boolean",
+                    "description": "True when the supplied ID itself matched the criterion.",
+                },
+                "observed_on": {"type": ["string", "null"], "format": "date"},
+                "location": {"type": "string"},
+                "place_guess": {"type": ["string", "null"]},
+                "photo_url": {"type": ["string", "null"], "format": "uri"},
+                "user": {
+                    "type": "object",
+                    "properties": {
+                        "id": {"type": ["integer", "null"]},
+                        "login": {"type": ["string", "null"]},
+                    },
+                },
+                "taxon": {
+                    "type": "object",
+                    "properties": {
+                        "id": {"type": ["integer", "null"]},
+                        "name": {"type": ["string", "null"]},
+                        "rank": {"type": ["string", "null"]},
+                        "preferred_common_name": {"type": ["string", "null"]},
+                        "iconic_taxon_name": {"type": ["string", "null"]},
+                    },
+                },
+            },
+        },
+        "InaturalistFinderResult": {
+            "type": "object",
+            "required": [
+                "query", "criteria", "matches", "match_count",
+                "checked_variations", "unchecked_variations", "total_variations",
+                "original_checked", "complete", "failed_batches",
+            ],
+            "properties": {
+                "query": {
+                    "type": "object",
+                    "properties": {
+                        "observation_id": {"type": "string", "example": "360934883"},
+                        "mode": {"type": "string", "enum": ["genus", "family", "taxon", "user", "project"]},
+                        "term": {"type": "string", "example": "Beauveria"},
+                        "digits_off": {"type": "integer", "minimum": 1, "maximum": 3},
+                    },
+                },
+                "criteria": {
+                    "type": "object",
+                    "description": "The canonical user, project, or taxon resolved by iNaturalist.",
+                },
+                "matches": {
+                    "type": "array",
+                    "items": {"$ref": "#/components/schemas/InaturalistFinderMatch"},
+                },
+                "match_count": {"type": "integer", "minimum": 0},
+                "checked_variations": {"type": "integer", "minimum": 0},
+                "unchecked_variations": {"type": "integer", "minimum": 0},
+                "total_variations": {"type": "integer", "minimum": 0, "maximum": 10000},
+                "original_checked": {"type": "boolean"},
+                "complete": {
+                    "type": "boolean",
+                    "description": "False when one or more iNaturalist batches could not be checked.",
+                },
+                "failed_batches": {"type": "integer", "minimum": 0},
+            },
+        },
+        "InaturalistFinderAnyResult": {
+            "oneOf": [
+                {"$ref": "#/components/schemas/InaturalistFinderAutoResult"},
+                {"$ref": "#/components/schemas/InaturalistFinderResult"},
+            ],
+            "description": (
+                "An automatic search returns InaturalistFinderAutoResult (`query.mode` "
+                "is `auto`); a single-criterion search returns InaturalistFinderResult."
+            ),
+        },
+        "InaturalistFinderScore": {
+            "type": "object",
+            "description": (
+                "How many of the supplied clues this observation satisfied. `unknown` "
+                "lists clues that could not be checked - today only project membership, "
+                "when its request failed. An unknown clue never counts toward the score "
+                "and can never make `is_full_match` true, so an unanswered question is "
+                "never mistaken for a negative answer."
+            ),
+            "required": ["matched", "unknown", "matched_count", "total", "is_full_match"],
+            "properties": {
+                "matched": {
+                    "type": "array", "items": {"type": "string"},
+                    "example": ["genus", "user"],
+                },
+                "unknown": {
+                    "type": "array", "items": {"type": "string"},
+                    "example": ["project"],
+                },
+                "matched_count": {"type": "integer", "minimum": 0, "example": 2},
+                "unknown_count": {"type": "integer", "minimum": 0, "example": 1},
+                "total": {"type": "integer", "minimum": 0, "example": 3},
+                "is_full_match": {"type": "boolean", "example": False},
+            },
+        },
+        "InaturalistFinderAutoMatch": {
+            "allOf": [
+                {"$ref": "#/components/schemas/InaturalistFinderMatch"},
+                {
+                    "type": "object",
+                    "properties": {
+                        "score": {"$ref": "#/components/schemas/InaturalistFinderScore"},
+                        "stage": {
+                            "type": "integer", "minimum": 0,
+                            "description": "Which rung found it. 0 is the number exactly as supplied.",
+                        },
+                    },
+                },
+            ],
+        },
+        "InaturalistFinderResume": {
+            "type": "object",
+            "description": (
+                "Where to continue. Send `token` back as the request's `resume` to pick "
+                "up exactly where this call stopped; no observation ID is requested "
+                "twice. Null when the search finished, or when part of it could not be "
+                "checked - a cursor over a gap would skip those IDs for good."
+            ),
+            "required": ["token", "stage", "offset"],
+            "properties": {
+                "token": {"type": "string", "example": "v1:3:0:1f4c9ab3"},
+                "stage": {"type": "integer", "minimum": 1},
+                "offset": {"type": "integer", "minimum": 0},
+            },
+        },
+        "InaturalistFinderAutoResult": {
+            "type": "object",
+            "required": [
+                "query", "status", "complete", "criteria", "unusable_clues",
+                "matches", "match_count", "checked_variations",
+                "unchecked_variations", "failed_batches", "stages",
+            ],
+            "properties": {
+                "query": {
+                    "type": "object",
+                    "properties": {
+                        "observation_id": {"type": "string", "example": "360934883"},
+                        "mode": {"type": "string", "enum": ["auto"]},
+                        "digits_off": {"type": "integer", "minimum": 1, "maximum": 3},
+                        "clues": {
+                            "type": "object", "additionalProperties": {"type": "string"},
+                            "description": "The non-empty clues as received.",
+                        },
+                        "resumed": {"type": "boolean"},
+                    },
+                },
+                "status": {
+                    "type": "string",
+                    "enum": ["match_found", "no_match", "needs_confirmation", "incomplete", "error"],
+                    "description": (
+                        "`match_found` at least one observation matched at least one clue; "
+                        "`no_match` nothing did; `needs_confirmation` more work is available "
+                        "and `resume` says where; `incomplete` part of the search could not "
+                        "be checked, so a negative result is not conclusive."
+                    ),
+                },
+                "stop_reason": {
+                    "type": "string",
+                    "enum": [
+                        "full_match", "exhausted", "no_clues",
+                        "large_stage", "budget_exhausted", "deadline_exhausted",
+                        "failures",
+                    ],
+                },
+                "message": {"type": ["string", "null"]},
+                "complete": {
+                    "type": "boolean",
+                    "description": (
+                        "True only when the ladder really finished. A paused stage and a "
+                        "failed request both make this false, for different reasons."
+                    ),
+                },
+                "criteria": {
+                    "type": "array",
+                    "description": "The clues that resolved and were scored, in scoring order.",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "kind": {"type": "string", "enum": ["genus", "family", "taxon", "user", "project"]},
+                            "value": {"type": "string"},
+                            "label": {"type": "string"},
+                            "taxon_id": {"type": "integer"},
+                        },
+                    },
+                },
+                "notices": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": (
+                        "Things worth telling the reader that are not errors. Today: that a "
+                        "single clue matched several neighbouring observations, so the one "
+                        "listed first is a best guess rather than an answer - iNaturalist "
+                        "numbers observations in upload order, so adjacent numbers often "
+                        "share an uploader and a taxon."
+                    ),
+                },
+                "unusable_clues": {
+                    "type": "array",
+                    "description": (
+                        "Clues iNaturalist could not resolve. Reported and left out of "
+                        "scoring rather than failing the request, because the mistaken "
+                        "element is as often a clue as the number. An ambiguous taxon name "
+                        "carries its `candidates`."
+                    ),
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "kind": {"type": "string"},
+                            "value": {"type": "string"},
+                            "reason": {"type": "string"},
+                            "candidates": {
+                                "type": ["array", "null"],
+                                "items": {"type": "object"},
+                            },
+                        },
+                    },
+                },
+                "original": {
+                    "type": ["object", "null"],
+                    "description": (
+                        "The observation the supplied number really points at, matching or "
+                        "not, so a caller can show it even when the clues disagree. Null "
+                        "when it does not exist, could not be checked, or the request "
+                        "resumed past stage 0."
+                    ),
+                },
+                "original_score": {
+                    "oneOf": [
+                        {"$ref": "#/components/schemas/InaturalistFinderScore"},
+                        {"type": "null"},
+                    ],
+                },
+                "original_checked": {"type": "boolean"},
+                "matches": {
+                    "type": "array",
+                    "description": "Best first: most clues matched, ties broken by observation ID.",
+                    "items": {"$ref": "#/components/schemas/InaturalistFinderAutoMatch"},
+                },
+                "match_count": {"type": "integer", "minimum": 0},
+                "full_match_count": {
+                    "type": "integer", "minimum": 0,
+                    "description": "How many matched every usable clue.",
+                },
+                "checked_variations": {"type": "integer", "minimum": 0},
+                "unchecked_variations": {
+                    "type": "integer", "minimum": 0,
+                    "description": "Candidates whose request failed permanently.",
+                },
+                "failed_batches": {"type": "integer", "minimum": 0},
+                "stages": {
+                    "type": "array",
+                    "description": "What each rung actually did, stage 0 being the number as supplied.",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "stage": {"type": "integer", "minimum": 0},
+                            "total": {"type": "integer", "minimum": 0},
+                            "attempted": {"type": "integer", "minimum": 0},
+                            "unchecked": {"type": "integer", "minimum": 0},
+                        },
+                    },
+                },
+                "resume": {
+                    "oneOf": [
+                        {"$ref": "#/components/schemas/InaturalistFinderResume"},
+                        {"type": "null"},
+                    ],
+                },
+                "next_stage": {
+                    "type": ["object", "null"],
+                    "description": "What continuing would cost, when the search paused.",
+                    "properties": {
+                        "stage": {"type": "integer", "minimum": 1},
+                        "label": {
+                            "type": "string",
+                            "example": "three substituted digits and extra digits",
+                        },
+                        "estimated_candidates": {"type": "integer", "minimum": 0, "example": 58968},
+                        "estimated_seconds": {"type": "integer", "minimum": 0, "example": 442},
+                    },
+                },
+            },
+        },
         "RecomputeRequest": {
             "type": "object",
             "description": (
@@ -153,7 +446,8 @@ def _schemas():
             "additionalProperties": False,
             "properties": {
                 "tree_method": {"type": "string",
-                                 "enum": ["nj", "raxml", "iqtree", "mrbayes", "fasttree"]},
+                                 "enum": ["nj", "raxml", "iqtree", "iqtree_fast",
+                                          "mrbayes", "fasttree"]},
                 "tree_model": {"type": "string", "maxLength": 64},
                 "alignment_method": {"type": "string",
                                       "enum": ["mafft", "muscle", "clustalo", "iqtree_builtin", "default"]},
@@ -184,12 +478,13 @@ def _schemas():
                     "type": "integer", "minimum": 0, "maximum": 10000,
                     "description": (
                         "Support replicates. For IQ-TREE UFBoot, use 0 to disable "
-                        "or at least 1000; values 1-999 are invalid."
+                        "or at least 1000; values 1-999 are invalid. Ignored by "
+                        "tree_method=iqtree_fast, fasttree, mrbayes and nj."
                     ),
                 },
                 "alrt_replicates": {
                     "type": "integer", "minimum": 0, "maximum": 10000,
-                    "description": "IQ-TREE SH-aLRT replicates. 0 reports UFBoot only.",
+                    "description": "IQ-TREE SH-aLRT replicates. 0 reports UFBoot only. Ignored by tree_method=iqtree_fast, which always runs 1000.",
                 },
                 "mcmc_generations": {
                     "type": "integer", "minimum": 1000, "maximum": 100000000,
@@ -233,7 +528,7 @@ def _schemas():
                     ">Sample_C\nATGCGTACGTAGCTAGCTAGCTAGCTAGCTAACGATCGATCGATCGATCGATCGATCGATCGATCGATCGATCGATCGATCGATCGTTTGATCG\n"
                     ">Sample_D\nATGCGTACGTAGCTAGCTAGCTAGCTAGCTAACGATCGATCGATCGATCGATCGATCGATCGATCGATCGTTTGATCGATCGATCGATCGATCG"
                 ),
-                "tree_method": "fasttree",
+                "tree_method": "iqtree_fast",
                 "alignment_method": "mafft",
                 "trimming_method": "trimal_gappy",
                 "trim_terminal_overhangs": True,
@@ -299,8 +594,20 @@ def _schemas():
                 },
                 "tree_method": {
                     "type": "string",
-                    "enum": ["nj", "raxml", "iqtree", "mrbayes", "fasttree"],
+                    "enum": ["nj", "raxml", "iqtree", "iqtree_fast", "mrbayes",
+                             "fasttree"],
                     "default": DEFAULT_TREE_METHOD,
+                    "description": (
+                        "`iqtree_fast` is the compatibility name for IQ-TREE 3 "
+                        "limited to five search iterations (`-n 5`), the quick "
+                        "exploratory engine under the full likelihood model, "
+                        "with SH-aLRT branch support "
+                        "(1000 replicates, percentages 0-100). It runs no "
+                        "ultrafast bootstrap, so `bootstrap` is ignored and reported as "
+                        "null. `iqtree` is the full search with ModelFinder and "
+                        "Ultrafast Bootstrap; `fasttree` is FastTree 2.2.0, "
+                        "whose SH-like support is on a 0-1 scale."
+                    ),
                 },
                 "tree_model": {
                     "type": "string",
@@ -320,13 +627,15 @@ def _schemas():
                     "default": DEFAULT_BOOTSTRAP,
                     "description": (
                         "Support replicates. For IQ-TREE UFBoot, use 0 to disable "
-                        "or at least 1000; values 1-999 are invalid."
+                        "or at least 1000; values 1-999 are invalid. Ignored by "
+                        "tree_method=iqtree_fast, fasttree, mrbayes and nj, which "
+                        "run no bootstrap."
                     ),
                 },
                 "alrt_replicates": {
                     "type": "integer", "minimum": 0, "maximum": 10000,
                     "default": DEFAULT_IQTREE_ALRT,
-                    "description": "IQ-TREE SH-aLRT replicates, run alongside Ultrafast Bootstrap. Nodes are labelled SH-aLRT/UFBoot. 0 reports UFBoot only.",
+                    "description": "IQ-TREE SH-aLRT replicates, run alongside Ultrafast Bootstrap. Nodes are labelled SH-aLRT/UFBoot. 0 reports UFBoot only. Ignored by tree_method=iqtree_fast, which always runs 1000 SH-aLRT replicates and no bootstrap.",
                 },
                 "mcmc_generations": {
                     "type": "integer", "minimum": 1000, "maximum": 100000000,
@@ -499,8 +808,12 @@ def build_spec():
                     "name": "job_id",
                     "in": "path",
                     "required": True,
-                    "description": "UUID of the job.",
-                    "schema": {"type": "string", "format": "uuid"},
+                    "description": (
+                        "Job id. Jobs created before 2026-09-09 are UUID4; "
+                        "newer ones are a short base36 string such as 'aq7c'. "
+                        "Treat it as an opaque token."
+                    ),
+                    "schema": {"type": "string", "example": "aq7c"},
                 },
                 "Page": {
                     "name": "page",
@@ -530,10 +843,25 @@ def build_spec():
             {"name": "Account", "description": "Identity and token management"},
             {"name": "Jobs", "description": "Phylogenetic job lifecycle"},
             {"name": "Tree", "description": "Post-hoc tree mutations"},
-            {"name": "Tools", "description": "Auxiliary lookups: BLAST, GenBank"},
+            {"name": "Tools", "description": "Auxiliary lookups: BLAST, GenBank, and iNaturalist"},
             {"name": "Health", "description": "Liveness ping"},
         ],
         "paths": {
+            # Honeytoken, not an endpoint: it is published here and nowhere
+            # else, so a request for it comes from somebody who read this spec
+            # and went looking for the one thing marked internal. It answers an
+            # ordinary 404 like any other missing path. See
+            # app/services/security_honeytokens.py before editing or removing.
+            "/internal/diagnostics-export": {
+                "get": {
+                    "tags": ["Health"],
+                    "summary": "Export request diagnostics bundle (deprecated)",
+                    "deprecated": True,
+                    "description": "Internal use only. Scheduled for removal.",
+                    "security": [{"bearerAuth": ["admin:read"]}],
+                    "responses": {"200": {"description": "OK"}},
+                }
+            },
             "/health": {
                 "get": {
                     "tags": ["Health"],
@@ -658,7 +986,9 @@ def build_spec():
                         "absolute lifetime cap (`reason: max_duration_reached`) "
                         "or when it has seen no activity on a still-running job "
                         "for the idle limit (`reason: idle`); both carry "
-                        "`max_seconds`. Clients should reconnect -- an "
+                        "`max_seconds`. A server restart closes it with "
+                        "`event: timeout` and `reason: server_restart`, "
+                        "preceded by a `retry:` delay. Clients should reconnect -- an "
                         "`EventSource` does so automatically and receives a "
                         "fresh snapshot. Connecting to a job that has already "
                         "finished or failed yields its snapshot, a short linger, "
@@ -829,6 +1159,215 @@ def build_spec():
                     "responses": {
                         "200": {"description": "BLAST results"},
                         **{k: v for k, v in COMMON_ERRORS.items() if k in ("400", "401", "403", "413", "422", "429", "500")},
+                    },
+                }
+            },
+            "/tools/inaturalist-finder": {
+                "post": {
+                    "tags": ["Tools"],
+                    "summary": "Find an iNaturalist observation with mistyped digits",
+                    "description": (
+                        "Two search modes share this endpoint.\n\n"
+                        "**Automatic search (recommended).** Omit `mode` and send any "
+                        "combination of the clue fields `genus`, `family`, `taxon`, `user` "
+                        "and `project` - or none at all. With at least one usable clue, the "
+                        "search checks the number exactly as supplied first, then widens "
+                        "through progressively broader typo searches. A request without "
+                        "clue fields stops after the exact supplied-number lookup. "
+                        "An observation matching every usable clue ends the search, but not "
+                        "necessarily on the spot: a stage small enough to finish is run to "
+                        "the end so equally good candidates are collected and ranked "
+                        "together, and only a stage too large to finish (over 5,000 "
+                        "candidates) stops as soon as one is found. "
+                        "Observations matching only some clues are returned too, ranked by "
+                        "how many matched and annotated with `score`, because a clue can be "
+                        "wrong as easily as a digit. A clue iNaturalist cannot resolve is "
+                        "reported in `unusable_clues` and dropped rather than failing the "
+                        "request; malformed input is still a 422, and an unreachable "
+                        "iNaturalist is still an upstream error.\n\n"
+                        "**Bounded work, with resume.** A single request checks at most "
+                        "10,000 observation numbers, uses a 150-second application deadline, "
+                        "and never "
+                        "starts a stage wider than 5,000 without being asked. The time "
+                        "limit is separate from the candidate limit because pacing, "
+                        "rate-limit retries and project-membership lookups make a candidate "
+                        "count a poor predictor of duration. What a limit produces depends "
+                        "on where the search was when it ran out:\n\n"
+                        "- stopped at an exact, resumable boundary - `status: "
+                        "\"needs_confirmation\"` with a `resume` cursor and a `next_stage` "
+                        "estimate. Repeat the request with that cursor (and `confirm: true` "
+                        "for a large stage) to continue from exactly where it stopped; "
+                        "nothing is ever re-requested, because the cursor replays candidate "
+                        "generation offline.\n"
+                        "- some candidates left unchecked, because a request failed or the "
+                        "deadline landed mid-flight - an incomplete result (`complete: "
+                        "false`) with **no** cursor, so those candidates can never be "
+                        "silently skipped by a later call reporting a clean \"no match\" "
+                        "over them.\n"
+                        "- the deadline elapsed before there was any resumable search "
+                        "position at all, for instance while the clues were still being "
+                        "resolved - HTTP 504.\n\n"
+                        "The widest stage of a "
+                        "nine-digit number is ~59,000 numbers, which is why it is never run "
+                        "unasked.\n\n"
+                        "**Single-criterion search (unchanged).** Send `mode` and `term` for "
+                        "the original behaviour: exactly one criterion, every result required "
+                        "to match it, every candidate checked. Sending both `mode` and clue "
+                        "fields is a 422.\n\n"
+                        "`complete: false` means the search did not establish that the "
+                        "unchecked candidates have no matches - because a request failed, or "
+                        "because it is waiting to be resumed. Call this endpoint from the "
+                        "integrating website's server; never expose its bearer token in "
+                        "browser JavaScript."
+                    ),
+                    "security": [{"bearerAuth": ["tools:read"]}],
+                    "parameters": [{"$ref": "#/components/parameters/IdempotencyKey"}],
+                    "requestBody": {
+                        "required": True,
+                        "content": {"application/json": {
+                            "schema": {
+                                "type": "object",
+                                "required": ["observation"],
+                                "properties": {
+                                    "observation": {
+                                        "oneOf": [
+                                            {"type": "string", "maxLength": 300},
+                                            {"type": "integer", "minimum": 1},
+                                        ],
+                                        "description": "Potentially mistyped observation ID or full iNaturalist observation URL.",
+                                        "example": "360934883",
+                                    },
+                                    "genus": {
+                                        "type": "string", "maxLength": 200,
+                                        "description": "Automatic search: expected genus name. Optional.",
+                                        "example": "Amanita",
+                                    },
+                                    "family": {
+                                        "type": "string", "maxLength": 200,
+                                        "description": "Automatic search: expected family name. Optional.",
+                                    },
+                                    "taxon": {
+                                        "type": "string", "maxLength": 200,
+                                        "description": (
+                                            "Automatic search: expected taxon ID or taxon URL, matching "
+                                            "that taxon and everything below it. Optional. A value that "
+                                            "is not a taxon ID is a 422 even in automatic search."
+                                        ),
+                                        "example": "48419",
+                                    },
+                                    "user": {
+                                        "type": "string", "maxLength": 200,
+                                        "description": "Automatic search: expected observer's iNaturalist username. Optional.",
+                                    },
+                                    "project": {
+                                        "type": "string", "maxLength": 200,
+                                        "description": (
+                                            "Automatic search: project ID, slug, URL, or exact title. "
+                                            "Optional. When combined with another clue, membership is "
+                                            "checked with a separate request so the other clues are not "
+                                            "hidden, and is reported as match, no match, or unknown."
+                                        ),
+                                    },
+                                    "resume": {
+                                        "type": "string",
+                                        "description": (
+                                            "Automatic search: the `resume.token` from a previous "
+                                            "`needs_confirmation` response. Continues from exactly where "
+                                            "that request stopped without re-requesting any ID. Bound to "
+                                            "the observation number, the clues and `digits_off`."
+                                        ),
+                                        "example": "v1:2:0:1f4c9ab3",
+                                    },
+                                    "confirm": {
+                                        "type": "boolean",
+                                        "default": False,
+                                        "description": (
+                                            "Automatic search: run a stage wider than 5,000 candidates. "
+                                            "Without it such a stage is never started, and the response "
+                                            "reports `needs_confirmation` with an estimate instead."
+                                        ),
+                                    },
+                                    "mode": {
+                                        "type": "string",
+                                        "enum": ["genus", "family", "taxon", "user", "project"],
+                                        "description": (
+                                            "Single-criterion search. Requires `term`, and may not be "
+                                            "combined with the clue fields above."
+                                        ),
+                                        "example": "genus",
+                                    },
+                                    "term": {
+                                        "type": "string",
+                                        "minLength": 1,
+                                        "maxLength": 200,
+                                        "description": (
+                                            "Single-criterion search: exact genus/family name, taxon ID "
+                                            "or URL, exact username, or project ID/slug/URL/exact title. "
+                                            "Ambiguous taxa are returned in the 422 error's "
+                                            "`details.candidates` list."
+                                        ),
+                                        "example": "Amanita",
+                                    },
+                                    "digits_off": {
+                                        "type": "integer",
+                                        "minimum": 1,
+                                        "maximum": 3,
+                                        "description": (
+                                            "How wide the search may go. Defaults to 3 for an automatic "
+                                            "search and 1 for a single-criterion search."
+                                        ),
+                                    },
+                                },
+                            },
+                            "examples": {
+                                "automatic": {
+                                    "summary": "Automatic search with several clues",
+                                    "value": {
+                                        "observation": "360934883",
+                                        "genus": "Beauveria",
+                                        "user": "alan_rockefeller",
+                                    },
+                                },
+                                "automaticNoClues": {
+                                    "summary": "Automatic search with no clues (checks only the number as supplied)",
+                                    "value": {"observation": "360934883"},
+                                },
+                                "automaticResume": {
+                                    "summary": "Continuing a paused deeper search",
+                                    "value": {
+                                        "observation": "360934883",
+                                        "genus": "Beauveria",
+                                        "resume": "v1:3:0:1f4c9ab3",
+                                        "confirm": True,
+                                    },
+                                },
+                                "singleCriterion": {
+                                    "summary": "Original single-criterion search",
+                                    "value": {
+                                        "observation": "360934883",
+                                        "mode": "genus",
+                                        "term": "Beauveria",
+                                        "digits_off": 1,
+                                    },
+                                },
+                            },
+                        }},
+                    },
+                    "responses": {
+                        "200": {
+                            "description": (
+                                "Search finished, paused, or finished partially; inspect "
+                                "`data.status` and `data.complete`. An automatic search returns "
+                                "`InaturalistFinderAutoResult`, a single-criterion search returns "
+                                "`InaturalistFinderResult`."
+                            ),
+                            "content": _data_response("InaturalistFinderAnyResult"),
+                        },
+                        **{k: v for k, v in COMMON_ERRORS.items() if k in ("400", "401", "403", "409", "413", "422", "429", "500")},
+                        "502": {"description": "iNaturalist was unavailable", "content": _error_response()},
+                        "503": {"description": "The shared iNaturalist request queue was busy", "content": _error_response()},
+                        "504": {"description": "The Finder request deadline elapsed before the search could complete",
+                                "content": _error_response()},
                     },
                 }
             },

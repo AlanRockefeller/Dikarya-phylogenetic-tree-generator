@@ -35,54 +35,25 @@ MIRROR_HEAD_RE = re.compile(
     r'\[[^\]]+\]\s*(?P<message>.*)$'
 )
 EXCEPTION_RE = re.compile(r'^([A-Za-z_][\w.]*(?:Error|Exception|Warning|Exit|Interrupt))(?::\s*(.*))?$')
-STATIC_SUFFIXES = (".css", ".js", ".map", ".ico", ".png", ".jpg", ".jpeg", ".gif", ".svg", ".webp", ".woff", ".woff2")
-SCANNER_MARKERS = (
-    "/.env", "/wp-", "/wordpress", "/phpmyadmin", "/xmlrpc", "/cgi-bin", "/.git",
-    "/vendor/php", "/actuator", "/.aws", "/.ssh", "/.svn", "/.hg", "/.docker",
-    "/.vscode", "/.idea", "/.well-known/security", "/config.json", "/credentials",
-    "/id_rsa", "/backup.sql", "/dump.sql", "/database.sql", "/server-status",
-    "/solr/", "/jenkins", "/hudson", "/manager/html", "/struts", "/login.action",
-    "/telescope", "/debug/default", "/geoserver", "/owa/", "/autodiscover",
-    "/boaform", "/hnap1", "/setup.cgi", "/shell", "/eval-stdin", "/wp/",
-    # Appliance / webmail credential probes seen daily against this host.
-    "/+cscoe+", "/remote/login", "/dana-na", "/global-protect", "/ecp/",
-    "/autodiscover", "/onvif", "/device_service", "/mcp",
+# Alan 9/12/26 - These lists used to live here AND in the application, so the
+# digest's idea of "scanner noise" could drift from the classifier that decides
+# which file a request is logged to. One definition now, in the app module,
+# which is deliberately free of Flask imports so this script can load it.
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from app.services.security_events import (  # noqa: E402
+    SCANNER_EXACT_PATHS, SCANNER_MARKERS, SCRIPT_EXT_RE, STATIC_SUFFIXES,
 )
-# Exact paths that only a scanner asks for. Kept as exact matches, not
-# substrings, so a genuine product 404 such as
-# /api/job/<id>/download/fasta/pruned is never swept into the noise bucket.
-SCANNER_EXACT_PATHS = frozenset({
-    "/login", "/logon", "/signin", "/ip", "/sse", "/graphql", "/api/graphql",
-    "/config", "/env", "/settings", "/api/config", "/api/env", "/api/settings",
-    "/api/v1/config", "/api/v1/env", "/api/v1/settings", "/server-info",
-    "/console", "/status", "/info",
-    # Auth/console routes this app has never had. One scanner probed each of
-    # these 88 times in a day, in the same sweep as the /login and /signin
-    # probes above, but they were landing in the product bucket and crowding
-    # out the real 4xx entries. Dikarya's own auth lives at /auth/login.
-    "/signup", "/register", "/dashboard", "/admin", "/account",
-    "/auth/callback", "/api/auth/signin", "/login.html", "/sftp-config.json",
-    # Generic fetch/proxy/config endpoints from a burst scanner that rotated
-    # dozens of fake crawler user agents. Dikarya has never exposed these exact
-    # routes; real downloads and previews live under scoped resource paths.
-    "/fetch", "/proxy", "/api/proxy", "/api/v1/fetch", "/api/download",
-    "/api/image", "/api/preview", "/api/v2/settings", "/api/v2/config",
-    # Historical credential/PHP probes predate the explicit limiter noise tag.
-    "/phpinfo", "/_profiler/phpinfo", "/_environment",
-    "/webroot/index.php/_environment", "/phpinfo.php.old", "/phpinfo.php~",
-    "/phpinfo.php.save", "/application_default_credentials.json", "/key.json",
-    "/service-account.json", "/sa.json", "/gcp-key.json", "/gcp-credentials.json",
-    "/gcp-sa.json", "/google-credentials.json", "/google-key.json",
-    "/.config/gcloud/application_default_credentials.json", "/keyfile.json",
-    "/firebase-adminsdk.json", "/firebase-key.json",
-})
-# Scanner probes hide the extension behind a version digit -- /randkeyword.PhP7,
-# /zup.php73, /baxa1.phP8 all arrived in one sweep and were filed as
-# product-relevant 404s because a plain endswith(".php") does not match them.
-# Case is already folded by the caller; the trailing digits are the whole point.
-SCRIPT_EXT_RE = re.compile(r'\.(?:php|asp|aspx|jsp|cgi|pl|cfm)[0-9]*$')
+# Imported rather than restated so the threshold printed in the report is the
+# one the app actually escalates at.
+from app.services.security_actors import ESCALATION_THRESHOLD  # noqa: E402
 # UUID form used for RQ job ids in worker logs.
 UUID_PATTERN = r'[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}'
+# Alan 9/23/26 - Jobs since 2026-09-09 have short base36 ids (job_id_service:
+# 4-12 of [a-z0-9]), which UUID_PATTERN never matched, so RQ's own "work horse
+# killed" line was invisible for every new job. Only used where RQ's wording
+# pins the id's position: in "Successfully completed <description> job in ..."
+# a bare [a-z0-9]{4,12} would match a word of the description.
+JOB_ID_PATTERN = rf'(?:{UUID_PATTERN}|[a-z0-9]{{4,12}})'
 
 
 def open_maybe_gz(path):
@@ -427,6 +398,30 @@ def record_identity(record):
     return (message.strip(), body, context)
 
 
+# The reason codes come from security_events.TARGETED_REASONS. They are
+# lowercase-with-underscores today, but `\w+` would silently truncate the first
+# one that used a dot or a dash (event slugs elsewhere in this file already do:
+# see the `event=degraded\.([\w.-]+)` pattern), reporting "job" for
+# "job_id.malformed" and splitting one reason across two rows. Match the same
+# character class the other slug parsers use, and assert against the real list
+# in tests/test_log_digest_security.py.
+SECURITY_RE = re.compile(
+    r'event=security\.suspicious\s+method=(?P<method>\S+)\s+path=(?P<path>\S+)\s+'
+    r'status=(?P<status>\d+)\s+reason=(?P<reason>[\w.-]+)\s+client=(?P<client>\S+)'
+)
+# One line per actor per hour, emitted when accumulated behaviour crosses the
+# threshold -- the counterpart to SECURITY_RE, which reports single requests.
+# An escalation carries signal COUNTS only: no path, no query, no agent string.
+ACTOR_RE = re.compile(
+    r'event=security\.actor_escalated\s+actor=(?P<actor>\S+)\s+'
+    r'score=(?P<score>\d+)\s+threshold=(?P<threshold>\d+)\s+'
+    r'signals=(?P<signals>\S+)\s+clients=(?P<clients>\d+)'
+)
+SSE_CLOSED_RE = re.compile(
+    r'event=sse\.closed.*?reason=(?P<reason>\w+)\s+duration_seconds=(?P<seconds>[\d.]+)'
+)
+
+
 def analyze_errors(cutoff, until=None):
     # Grouped by stem rather than flattened into one list, because the
     # occurrence counter below has to reset between the two mirrored streams
@@ -443,6 +438,15 @@ def analyze_errors(cutoff, until=None):
     files = [path for stream in streams for path in stream]
     exceptions = collections.Counter()
     degradations = collections.Counter()
+    # Alan 9/12/26 - Probes aimed at this application, and SSE stream lifetimes
+    # taken from the app's own close event rather than inferred from access-log
+    # durations. sse.closed carries the reason a stream ended, which an access
+    # log cannot show, and a stream that outlives its job is the failure mode
+    # that eats Gunicorn request slots.
+    security = collections.Counter()
+    security_clients = collections.defaultdict(set)
+    actors = {}
+    sse_closes = collections.defaultdict(list)
     affected = collections.defaultdict(set)
     affected_jobs = collections.defaultdict(set)
     seen = set()
@@ -462,11 +466,18 @@ def analyze_errors(cutoff, until=None):
                 if when is None:
                     unparsed += 1
                     continue
-                if (
-                    when < cutoff
-                    or (until is not None and when >= until)
-                    or not LEVEL_RE.search(record.splitlines()[0])
-                ):
+                if when < cutoff or (until is not None and when >= until):
+                    continue
+                # event=sse.closed is INFO, so it has to be collected before the
+                # WARNING+ filter below. It is written only by the app logger,
+                # which means it lands in error.log and NOT in the WARNING+
+                # mirror, so reading both streams cannot double-count it.
+                sse_close = SSE_CLOSED_RE.search(record.splitlines()[0])
+                if sse_close:
+                    sse_closes[sse_close.group("reason")].append(
+                        float(sse_close.group("seconds"))
+                    )
+                if not LEVEL_RE.search(record.splitlines()[0]):
                     continue
                 fields = context_fields(record.splitlines()[0])
                 oldest = when if oldest is None or when < oldest else oldest
@@ -500,6 +511,41 @@ def analyze_errors(cutoff, until=None):
                     contextual += 1
                 user = fields.get("user")
                 job = fields.get("job")
+                first_line = record.splitlines()[0]
+                escalated = ACTOR_RE.search(first_line)
+                if escalated:
+                    # Keep the highest-scoring escalation per actor rather than
+                    # one row per hour of a long sitting: the question is "who
+                    # got how far", not "how many times did we say so".
+                    actor = escalated.group("actor")
+                    score = int(escalated.group("score"))
+                    previous = actors.get(actor)
+                    if previous is None or score > previous["score"]:
+                        actors[actor] = {
+                            "score": score,
+                            "signals": escalated.group("signals"),
+                            "clients": int(escalated.group("clients")),
+                            "hits": (previous or {}).get("hits", 0) + 1,
+                        }
+                    else:
+                        previous["hits"] += 1
+                    continue
+                suspicious = SECURITY_RE.search(first_line)
+                if suspicious:
+                    reason = suspicious.group("reason")
+                    security[reason] += 1
+                    client = suspicious.group("client")
+                    if client and client != "-":
+                        security_clients[reason].add(client)
+                    # Alan 9/14/26 - and nowhere else. A security.suspicious
+                    # record used to fall through into the generic exception
+                    # tally as well, so one probe was reported twice: once in
+                    # "App-targeted probes" and again as a top warning, where
+                    # meaningful_error_key() rendered it as an unreadable
+                    # "event=security.suspicious method=<...>" row that crowded
+                    # out real failures. Every record belongs to exactly one of
+                    # the three sections.
+                    continue
                 if "DEGRADED" in record:
                     event = re.search(r'event=degraded\.([\w.-]+)', record)
                     slug = event.group(1) if event else record.split("DEGRADED", 1)[-1].strip().split(":", 1)[0]
@@ -516,7 +562,9 @@ def analyze_errors(cutoff, until=None):
                         affected_jobs[key].add(job)
     return {
         "exceptions": exceptions, "degradations": degradations, "affected": affected,
-        "affected_jobs": affected_jobs,
+        "affected_jobs": affected_jobs, "security": security,
+        "security_clients": security_clients, "sse_closes": sse_closes,
+        "actors": actors,
         "coverage": coverage_record(files, oldest, newest, lines, unparsed, 0, contextual, len(seen)),
     }
 
@@ -546,12 +594,33 @@ RQ_TERMINAL_RES = {
         re.compile(rf'Successfully completed (?:job )?(?P<id>{UUID_PATTERN})'),
     ),
     "failed": (
-        re.compile(rf'moving job (?P<id>{UUID_PATTERN}) to FailedJobRegistry'),
-        re.compile(rf'job (?P<id>{UUID_PATTERN}) stopped by user'),
-        re.compile(rf'Work horse killed for job (?P<id>{UUID_PATTERN})'),
-        re.compile(rf'job (?P<id>{UUID_PATTERN}) has exceeded maximum retry attempts'),
+        re.compile(rf'moving job (?P<id>{JOB_ID_PATTERN}) to FailedJobRegistry'),
+        re.compile(rf'job (?P<id>{JOB_ID_PATTERN}) stopped by user'),
+        re.compile(rf'Work horse killed for job (?P<id>{JOB_ID_PATTERN}):'),
+        re.compile(rf'job (?P<id>{JOB_ID_PATTERN}) has exceeded maximum retry attempts'),
     ),
 }
+# What each RQ failure line means, for the "Failed jobs" section. Keyed by the
+# index of the pattern in RQ_TERMINAL_RES["failed"].
+RQ_FAILURE_CAUSES = (
+    "RQ moved the job to FailedJobRegistry",
+    "stopped by user",
+    "work horse killed (process died mid-run)",
+    "RQ retry limit exceeded",
+)
+# The task's own failure line: event=job.failed Job failed at step=S
+# exception=E error="...". error= is JSON-quoted (log_context.failure_message_field).
+FAILED_DETAIL_RE = re.compile(
+    r'event=job\.failed\b.*?\bstep=(?P<step>\S+).*?\bexception=(?P<exc>\S+)'
+    r'(?:\s+error=(?P<error>"(?:[^"\\]|\\.)*"))?'
+)
+# Written by job_reconcile_service for a job it failed or requeued after the
+# job's process died without reporting. The worker main process has no job
+# context, so the id is in the message, not the context suffix.
+RECONCILED_RE = re.compile(
+    rf'event=job\.reconciled_(?P<action>failed|requeued)\s+job_id=(?P<id>{JOB_ID_PATTERN})\b'
+    r'.*?\breason=(?P<reason>"(?:[^"\\]|\\.)*")'
+)
 # A retry or a repeat is not an outcome: the job runs again and reports later.
 RQ_RETRY_RES = (
     re.compile(rf'handling retry of job (?P<id>{UUID_PATTERN})'),
@@ -627,7 +696,16 @@ def _timestamped_worker_lines(files, cutoff, until):
     return records, lines, unparsed
 
 
-def analyze_worker(cutoff, grace=timedelta(minutes=60), until=None):
+def _quoted(value):
+    if not value:
+        return ""
+    try:
+        return json.loads(value)
+    except ValueError:
+        return value.strip('"')
+
+
+def analyze_worker(cutoff, grace=timedelta(minutes=60), until=None, details=None):
     """Summarize worker job lifecycle from the worker logs (no Redis, no DB).
 
     Alan 9/7/26 - Both queues are read, not just phylo_high. This used to glob
@@ -640,6 +718,12 @@ def analyze_worker(cutoff, grace=timedelta(minutes=60), until=None):
     normally lives on one worker, so per-job order survives either way, but a
     requeue that lands on the other queue would otherwise be read out of order
     and counted as a fresh lifecycle.
+
+    When ``details`` is a dict it receives ``failures`` -- one entry per
+    failed job with its step, exception and message, never truncated -- and
+    ``waiting``, the stale jobs whose last word was job.deferred. Those are
+    planned waits (MycoMap), not stranded work, so they are left out of the
+    returned stale list and reported as a count.
     """
     streams = [log_files(stem, cutoff) for stem in WORKER_STEMS]
     files = [path for stream in streams for path in stream]
@@ -649,6 +733,8 @@ def analyze_worker(cutoff, grace=timedelta(minutes=60), until=None):
     last_start = {}
     retry_markers = collections.Counter()
     deferred_markers = collections.Counter()
+    last_event = {}
+    failures = {}
     oldest = newest = None
     lines = unparsed = contextual = window_lines = 0
     merged = []
@@ -672,6 +758,22 @@ def analyze_worker(cutoff, grace=timedelta(minutes=60), until=None):
             contextual += 1
         if "DEGRADED" in line:
             counts["degraded"] += 1
+
+        reconciled = RECONCILED_RE.search(line)
+        if reconciled:
+            job_id = reconciled.group("id")
+            if reconciled.group("action") == "failed":
+                if job_id not in terminal:
+                    counts["failed"] += 1
+                    terminal.add(job_id)
+                failures[job_id] = {
+                    "job": job_id, "when": when, "step": "-",
+                    "exception": "reconciled",
+                    "error": _quoted(reconciled.group("reason")),
+                }
+            else:
+                counts["requeued"] += 1
+            continue
 
         # 1. Dikarya's own stable events win: they carry the application
         #    job id, which is what an operator can act on.
@@ -720,6 +822,15 @@ def analyze_worker(cutoff, grace=timedelta(minutes=60), until=None):
                 if job_id not in terminal:
                     counts[state] += 1
                     terminal.add(job_id)
+                if state == "failed":
+                    detail = FAILED_DETAIL_RE.search(line)
+                    failures[job_id] = {
+                        "job": job_id, "when": when,
+                        "step": detail.group("step") if detail else "?",
+                        "exception": detail.group("exc") if detail else "?",
+                        "error": _quoted(detail.group("error")) if detail else "",
+                    }
+            last_event[fields["job"]] = state
             continue
 
         # 2. RQ terminal lines. Checked before starts because "Job OK
@@ -731,6 +842,19 @@ def analyze_worker(cutoff, grace=timedelta(minutes=60), until=None):
                 if job_id not in terminal:
                     counts[state] += 1
                     terminal.add(job_id)
+                if state == "failed" and job_id not in failures:
+                    # Only when the task never reported its own failure: a
+                    # killed work horse, a stop, or a failure outside the
+                    # task's except block.
+                    cause = next(
+                        (RQ_FAILURE_CAUSES[i] for i, pattern in enumerate(patterns)
+                         if pattern.search(line)),
+                        "RQ reported a failure",
+                    )
+                    failures[job_id] = {
+                        "job": job_id, "when": when, "step": "-",
+                        "exception": "rq", "error": cause,
+                    }
                 matched = True
                 break
         if matched:
@@ -783,7 +907,13 @@ def analyze_worker(cutoff, grace=timedelta(minutes=60), until=None):
     unmatched = [(job_id, when) for job_id, when in started.items() if job_id not in terminal]
     active = [item for item in unmatched if reference - item[1] < grace]
     stale = sorted((item for item in unmatched if reference - item[1] >= grace), key=lambda item: item[1])
+    waiting = [item for item in stale if last_event.get(item[0]) == "deferred"]
+    stale = [item for item in stale if last_event.get(item[0]) != "deferred"]
     counts["active"] = len(active)
+    counts["waiting"] = len(waiting)
+    if details is not None:
+        details["failures"] = sorted(failures.values(), key=lambda item: item["when"])
+        details["waiting"] = waiting
     return counts, stale, coverage_record(files, oldest, newest, lines, unparsed, 0, contextual, window_lines)
 
 
@@ -883,8 +1013,10 @@ def main():
 
     access = analyze_access(cutoff, until=until)
     errors = analyze_errors(cutoff, until=until)
+    worker_details = {}
     worker_counts, unterminated, worker_coverage = analyze_worker(
-        cutoff, grace=timedelta(minutes=args.unterminated_grace_minutes), until=until
+        cutoff, grace=timedelta(minutes=args.unterminated_grace_minutes), until=until,
+        details=worker_details,
     )
     print(
         f"Dikarya log digest -- {window_label} "
@@ -919,16 +1051,25 @@ def main():
     print("  " + "  ".join(
         f"{'recent_unterminated' if key == 'active' else key}={worker_counts.get(key, 0)}"
         for key in ("started", "completed", "failed", "retried", "deferred",
-                    "active", "degraded")
+                    "requeued", "waiting", "active", "degraded")
     ))
     print("  Log-only lifecycle: older unterminated jobs may still be running; check /health/jobs for live activity.")
     reference = until
     rows(
         [f"no terminal event observed: {job} (started {when:%Y-%m-%d %H:%M}, age {format_age(reference - when)})"
          for job, when in unterminated[:args.top]],
-        empty=f"  every started job reached a terminal event or is still within the "
-              f"{args.unterminated_grace_minutes:g}-minute grace period",
+        empty=f"  every started job reached a terminal event, is still within the "
+              f"{args.unterminated_grace_minutes:g}-minute grace period, or is waiting "
+              f"on an upstream result (waiting={worker_counts.get('waiting', 0)})",
     )
+    # Alan 9/23/26 - Every failure, never truncated: "failed=11" with the causes
+    # left to the top-N exception groups hid 4 of the 11 on 2026-09-22.
+    section("Failed jobs")
+    rows([
+        f"{item['when']:%Y-%m-%d %H:%M}  {item['job']}  step={item['step']}  "
+        f"{item['exception']}: {item['error'][:200] or '(no message logged)'}"
+        for item in worker_details.get("failures", [])
+    ])
     section(f"Slow requests (> {args.slow_threshold:g}s; streams excluded)")
     slow_rows = []
     for endpoint, values in access["durations"].items():
@@ -939,6 +1080,28 @@ def main():
     rows([text for _, text in sorted(slow_rows, reverse=True)[:args.top]], empty=f"  (nothing slower than {args.slow_threshold:g}s)")
     section("SSE stream lifetimes")
     rows([f"{len(values):>5}  {endpoint}  p50={percentile(values, .5):.1f}s p95={percentile(values, .95):.1f}s max={max(values):.1f}s" for endpoint, values in sorted(access["streams"].items())])
+    section(f"Escalated actors (behaviour score >= {ESCALATION_THRESHOLD})")
+    rows([
+        f"{data['score']:>5}  {actor:<20} {data['signals']}"
+        + (f"  [{data['clients']} client(s)]" if data["clients"] > 1 else "")
+        + (f"  x{data['hits']}" if data["hits"] > 1 else "")
+        for actor, data in sorted(
+            errors["actors"].items(), key=lambda kv: -kv[1]["score"]
+        )[:args.top]
+    ], empty="  (none -- no client's accumulated behaviour crossed the threshold)")
+    section("App-targeted probes (security.suspicious)")
+    rows([
+        f"{count:>5}  {reason:<20} from {len(errors['security_clients'].get(reason, ())) or '?'} client(s)"
+        for reason, count in errors["security"].most_common(args.top)
+    ], empty="  (none -- internet-wide scanner noise goes to var/logs/scanner.log)")
+    section("SSE stream close reasons (from the app, not the access log)")
+    rows([
+        f"{len(values):>5}  {reason:<22} p50={percentile(values, .5):.0f}s "
+        f"p95={percentile(values, .95):.0f}s max={max(values):.0f}s"
+        for reason, values in sorted(
+            errors["sse_closes"].items(), key=lambda kv: -len(kv[1])
+        )
+    ])
     section("Rate-limited clients (429)")
     rows([f"{count:>5}  {ip}" for ip, count in access["rate_limited"].most_common(args.top)])
     section("Heaviest clients / user agents")

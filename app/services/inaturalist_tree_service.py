@@ -27,11 +27,12 @@ from typing import Any, Dict, Iterator, List, Optional, Tuple
 from flask import current_app
 from app.config import Config
 from app.services.log_context import background_job_context
+from app.services.job_id_service import generate_job_id
 
 logger = logging.getLogger(__name__)
 
 INAT_API_BASE = "https://api.inaturalist.org/v1"
-USER_AGENT = "Dikarya Phylogenetic Tree Builder 1.0"
+USER_AGENT = "Dikarya Phylogenetic Tree Builder 1.0 - For questions contact Alan Rockefeller"
 REQUEST_TIMEOUT = 30
 MAX_RAW_INPUT_LEN = 300
 MAX_PER_PAGE = 200
@@ -64,6 +65,15 @@ _PACING_KEY = "dikarya:inat:next-request-slot-ms"
 # for an unreasonable time. Background workers have no cap and wait for the
 # slot they reserved.
 MAX_PACING_WAIT_SECONDS = 30.0
+# Alan 9/23/26 - A bulk run held the shared cursor at its one-per-second
+# ceiling for hours -- ~1,700 preparation passes an hour -- which is well past
+# iNaturalist's daily guidance and left nothing for interactive users, who got
+# the 429s. A request from a phylo_bulk job now reserves a slot on a second,
+# slower cursor first and only then an ordinary one, so bulk work can use at
+# most half of the shared budget and never delays a live request by more
+# than its own share.
+_BULK_PACING_KEY = "dikarya:inat:bulk-next-request-slot-ms"
+BULK_RATE_LIMIT_DELAY = 2.0
 _PACING_SCRIPT = """
 local slot = tonumber(redis.call('GET', KEYS[1]) or '0')
 local now = tonumber(ARGV[1])
@@ -126,7 +136,8 @@ def _reserve_slot_local(interval: float,
 
 
 def _reserve_inat_slot(interval: float = RATE_LIMIT_DELAY,
-                       max_wait: Optional[float] = None) -> float:
+                       max_wait: Optional[float] = None,
+                       key: Optional[str] = None) -> float:
     """Reserve the next iNaturalist request slot. Returns seconds to wait.
 
     Falls back to per-process pacing if Redis is unavailable. That is a
@@ -134,12 +145,13 @@ def _reserve_inat_slot(interval: float = RATE_LIMIT_DELAY,
     down to a still-polite rate, not make them impossible. iNat's own 429
     handling in _http_request remains the backstop.
     """
+    key = key or _PACING_KEY
     interval_ms = max(1, int(interval * 1000))
     try:
         now_ms = int(time.time() * 1000)
         max_wait_ms = -1 if max_wait is None else max(0, int(max_wait * 1000))
         result = _pacing_redis().eval(
-            _PACING_SCRIPT, 1, _PACING_KEY, now_ms, interval_ms, max_wait_ms,
+            _PACING_SCRIPT, 1, key, now_ms, interval_ms, max_wait_ms,
         )
         slot_ms = result[0]
         if int(slot_ms) < 0:
@@ -159,17 +171,81 @@ def _reserve_inat_slot(interval: float = RATE_LIMIT_DELAY,
             "iNaturalist request pacing fell back to per-process timing",
             exception=type(exc).__name__,
         )
-        wait = _reserve_slot_local(interval, max_wait)
+        # The local fallback models only the shared cursor. Without Redis a
+        # bulk slot cannot be coordinated across processes, so that layer is
+        # skipped and the ordinary per-process pacing still applies.
+        wait = _reserve_slot_local(interval, max_wait) if key == _PACING_KEY else 0.0
     return wait
 
 
-def _pace_inat_request() -> None:
-    """Block until this process may start its next iNaturalist request."""
+def _in_bulk_job() -> bool:
+    """True when running inside an RQ job taken from the bulk queue."""
+    try:
+        from rq import get_current_job
+        job = get_current_job()
+    except Exception:
+        return False
+    return bool(job and getattr(job, "origin", None) == "phylo_bulk")
+
+
+# Alan 9/23/26 - Once iNaturalist starts refusing us, pacing alone does not
+# get us out: after a heavy bulk run it kept refusing most requests even at
+# two passes a minute, and each refused request was retried four more times,
+# so the retries themselves were most of our traffic. A request still refused
+# after all its retries now starts a shared cooldown. Bulk jobs make no iNat
+# request at all until it ends, and outside one retry only once, leaving the
+# waiting to RQ. High-priority and interactive requests ignore the cooldown
+# and keep the full retry schedule: a person is waiting, and there are few.
+_COOLDOWN_KEY = "dikarya:inat:cooldown-until-ms"
+INAT_COOLDOWN_SECONDS = 10 * 60
+BULK_MAX_HTTP_ATTEMPTS = 1
+
+
+def inat_cooldown_remaining() -> float:
+    """Seconds left in the shared iNaturalist cooldown; 0 when none (or no Redis)."""
+    try:
+        raw = _pacing_redis().get(_COOLDOWN_KEY)
+    except Exception as exc:
+        logger.info("iNat cooldown read failed: %s", exc)
+        return 0.0
+    if raw is None:
+        return 0.0
+    return max(0.0, (int(raw) - time.time() * 1000) / 1000.0)
+
+
+def _start_inat_cooldown() -> None:
+    """Start (or extend) the shared cooldown after an exhausted 429."""
+    until_ms = int((time.time() + INAT_COOLDOWN_SECONDS) * 1000)
+    try:
+        _pacing_redis().set(_COOLDOWN_KEY, until_ms, px=INAT_COOLDOWN_SECONDS * 1000)
+    except Exception as exc:
+        logger.info("iNat cooldown write failed: %s", exc)
+        return
+    logger.warning(
+        "event=inat.cooldown_started iNaturalist kept refusing requests; bulk "
+        "jobs will not contact it for %ss", INAT_COOLDOWN_SECONDS,
+    )
+
+
+def _pace_inat_request(max_wait: Optional[float] = None) -> None:
+    """Block until this process may start its next iNaturalist request.
+
+    ``max_wait`` lowers the ceiling for one call. A deadline-bounded caller
+    passes its remaining time, so waiting for a slot can never by itself spend
+    more than the caller has left.
+    """
     from flask import has_request_context
 
-    wait = _reserve_inat_slot(
-        max_wait=MAX_PACING_WAIT_SECONDS if has_request_context() else None,
-    )
+    ceiling = MAX_PACING_WAIT_SECONDS if has_request_context() else None
+    if max_wait is not None:
+        ceiling = max_wait if ceiling is None else min(ceiling, max_wait)
+    if _in_bulk_job():
+        bulk_wait = _reserve_inat_slot(
+            BULK_RATE_LIMIT_DELAY, max_wait=ceiling, key=_BULK_PACING_KEY
+        )
+        if bulk_wait > 0:
+            time.sleep(bulk_wait)
+    wait = _reserve_inat_slot(max_wait=ceiling)
     if wait > 0:
         time.sleep(wait)
 
@@ -186,13 +262,45 @@ OBS_URL_RE = re.compile(
 )
 PLAIN_TOKEN_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_. -]{0,198}[A-Za-z0-9]$")
 
+# Segments that follow /observations/ but name a tool page rather than a user.
+# Anything else there is a login, which is how iNaturalist writes a user's
+# observation list.
+OBSERVATIONS_SUBPAGES = {"identify", "upload", "export", "new", "search"}
+
 
 class InatTreeError(Exception):
     """User-facing application error with an HTTP status and safe details."""
-    def __init__(self, message, status=400, details=None):
+    def __init__(self, message, status=400, details=None, failure_code=None):
         super().__init__(message)
         self.status = status
         self.details = details
+        # Stable, input-free diagnostics for expected rejections.  The request
+        # logger deliberately never copies user-entered URLs or response text.
+        self.failure_code = failure_code
+
+
+class InatDeadlineExceeded(InatTreeError):
+    """A caller's wall-clock deadline ran out before this request could finish.
+
+    Subclasses :class:`InatTreeError` on purpose: every existing handler already
+    treats it as "this call produced nothing", which is exactly right. A caller
+    that needs to tell "out of time" from "iNaturalist is down" -- the finder,
+    which must not issue a resume cursor over either -- can catch this first.
+    """
+
+    def __init__(self, message="The request ran out of time.", details=None):
+        super().__init__(message, status=504, details=details)
+
+
+def remaining_seconds(deadline: Optional[float]) -> Optional[float]:
+    """Seconds left before a monotonic ``deadline``; ``None`` when unbounded.
+
+    Monotonic on purpose: a wall-clock step (NTP, an administrator setting the
+    clock) must never be able to lengthen or cancel a request deadline.
+    """
+    if deadline is None:
+        return None
+    return deadline - time.monotonic()
 
 
 # ---------------------------------------------------------------------------
@@ -219,15 +327,27 @@ def parse_single_observation_input(raw: str) -> int:
 def parse_inaturalist_tree_input(raw_input: str) -> Dict[str, Any]:
     """Classify Tree Builder iNaturalist one-click input without API calls."""
     if raw_input is None:
-        raise InatTreeError("No iNaturalist input provided.")
+        raise InatTreeError(
+            "No iNaturalist input provided.",
+            failure_code="inat_tree_input_missing",
+        )
     raw = str(raw_input).strip()
     if not raw:
-        raise InatTreeError("No iNaturalist input provided.")
+        raise InatTreeError(
+            "No iNaturalist input provided.",
+            failure_code="inat_tree_input_missing",
+        )
     if len(raw) > MAX_RAW_INPUT_LEN:
-        raise InatTreeError("Input is too long.")
+        raise InatTreeError(
+            "Input is too long.",
+            failure_code="inat_tree_input_too_long",
+        )
     if raw.isdigit():
         if len(raw) > 12:
-            raise InatTreeError("iNaturalist observation ID is implausibly long.")
+            raise InatTreeError(
+                "iNaturalist observation ID is implausibly long.",
+                failure_code="inat_tree_observation_id_too_long",
+            )
         return {
             "type": "single_observation",
             "observation_id": int(raw),
@@ -242,7 +362,10 @@ def parse_inaturalist_tree_input(raw_input: str) -> Dict[str, Any]:
         parsed = urllib.parse.urlparse(urlish)
         host = (parsed.hostname or "").lower()
         if host not in {"inaturalist.org", "www.inaturalist.org"}:
-            raise InatTreeError("Only inaturalist.org URLs are accepted.")
+            raise InatTreeError(
+                "Only inaturalist.org URLs are accepted.",
+                failure_code="inat_tree_foreign_url",
+            )
         path_parts = [
             urllib.parse.unquote(part)
             for part in (parsed.path or "").split("/")
@@ -251,21 +374,36 @@ def parse_inaturalist_tree_input(raw_input: str) -> Dict[str, Any]:
         query_params = urllib.parse.parse_qs(parsed.query or "", keep_blank_values=True)
         if len(path_parts) >= 2 and path_parts[0].lower() == "observations":
             token = path_parts[1].strip()
-            if token.isdigit():
+            # A URL copied out of prose commonly carries the sentence's final
+            # period. Observation path components are numeric, so accepting one
+            # terminal period is unambiguous and does not loosen usernames or
+            # any other URL shape.
+            has_terminal_period = (
+                token.endswith(".")
+                and len(path_parts) == 2
+                and (parsed.path or "").endswith(".")
+            )
+            observation_token = token[:-1] if has_terminal_period else token
+            if observation_token.isdigit():
                 return {
                     "type": "single_observation",
-                    "observation_id": int(token),
+                    "observation_id": int(observation_token),
                     "raw": raw,
-                    "normalized": f"https://www.inaturalist.org/observations/{int(token)}",
+                    "normalized": f"https://www.inaturalist.org/observations/{int(observation_token)}",
                 }
-            return {
-                "type": "user_candidate",
-                "value": token,
-                "raw": raw,
-                "normalized": token,
-                "source": "observations_path",
-            }
-        if len(path_parts) == 1 and path_parts[0].lower() == "observations":
+            # /observations/<login> names a user, but /observations/identify and
+            # its siblings are tool pages -- the user there is in the query
+            # string. Reading the sub-page name as a login sent the whole URL
+            # off to look up a user called "identify".
+            if token.lower() not in OBSERVATIONS_SUBPAGES:
+                return {
+                    "type": "user_candidate",
+                    "value": token,
+                    "raw": raw,
+                    "normalized": token,
+                    "source": "observations_path",
+                }
+        if path_parts and path_parts[0].lower() == "observations":
             project_values = query_params.get("project_id") or []
             project_value = _clean_candidate(project_values[0]) if project_values else ""
             if project_value:
@@ -275,6 +413,22 @@ def parse_inaturalist_tree_input(raw_input: str) -> Dict[str, Any]:
                     "raw": raw,
                     "normalized": project_value,
                     "source": "observations_project_id",
+                }
+            # The shape iNaturalist's own filter UI produces, and the one the
+            # Analyze flow beside this has always accepted (see
+            # inaturalist_service.validate_inaturalist_url). Rejecting it here
+            # meant the same pasted URL worked in one half of the page and
+            # errored in the other.
+            user_values = query_params.get("user_id") or []
+            user_value = _clean_candidate(user_values[0]) if user_values else ""
+            if user_value:
+                return {
+                    "type": "user_candidate",
+                    "value": user_value,
+                    "raw": raw,
+                    "normalized": user_value,
+                    "source": "observations_user_id",
+                    "value_kind": "id" if user_value.isdigit() else "login",
                 }
         if len(path_parts) >= 2 and path_parts[0].lower() == "people":
             return {
@@ -293,10 +447,19 @@ def parse_inaturalist_tree_input(raw_input: str) -> Dict[str, Any]:
                 "normalized": path_parts[1].strip(),
                 "source": "projects_path",
             }
-        raise InatTreeError("That iNaturalist URL is not supported for one-click trees.")
+        raise InatTreeError(
+            "One-Click Tree needs a single observation, a person "
+            "(inaturalist.org/people/<username>) or a project "
+            "(inaturalist.org/projects/<name>). To import sequences from a "
+            "search or taxon page, click Submit instead.",
+            failure_code="inat_tree_url_unsupported",
+        )
 
     if not PLAIN_TOKEN_RE.match(raw):
-        raise InatTreeError("Enter an observation ID, iNaturalist username, project name, or iNaturalist URL.")
+        raise InatTreeError(
+            "Enter an observation ID, iNaturalist username, project name, or iNaturalist URL.",
+            failure_code="inat_tree_input_invalid",
+        )
     return {
         "type": "plain_candidate",
         "value": re.sub(r"\s+", " ", raw).strip(),
@@ -346,7 +509,8 @@ def _observation_failure(observation, observation_id, reason):
 def _http_request(url: str, *, method: str = "GET", body: Optional[Dict[str, Any]] = None,
                    bearer: Optional[str] = None,
                    max_attempts: Optional[int] = None,
-                   timeout: Optional[float] = None) -> Dict[str, Any]:
+                   timeout: Optional[float] = None,
+                   deadline: Optional[float] = None) -> Dict[str, Any]:
     data = None
     headers = {
         'Accept': 'application/json',
@@ -368,18 +532,57 @@ def _http_request(url: str, *, method: str = "GET", body: Optional[Dict[str, Any
     # failing the job. Inside a request it can outlast the request itself.
     # The value counts RETRIES, matching MAX_HTTP_ATTEMPTS, so 0 means "one
     # request, no backoff" and the default schedule is unchanged.
-    max_attempts = MAX_HTTP_ATTEMPTS if max_attempts is None else max(0, int(max_attempts))
+    in_bulk = _in_bulk_job()
+    if in_bulk:
+        cooldown = inat_cooldown_remaining()
+        if cooldown > 0:
+            raise InatTreeError(
+                "iNaturalist is rate-limiting Dikarya; batch jobs are pausing "
+                "their requests until it recovers.",
+                status=429,
+                details={"inat_cooldown_seconds": int(cooldown) + 1},
+            )
+    if max_attempts is None:
+        max_attempts = BULK_MAX_HTTP_ATTEMPTS if in_bulk else MAX_HTTP_ATTEMPTS
+    max_attempts = max(0, int(max_attempts))
     timeout = REQUEST_TIMEOUT if timeout is None else timeout
+
+    # An optional absolute monotonic deadline, enforced HERE rather than by the
+    # caller, because this is the only layer that knows about pacing waits,
+    # retry sleeps and per-attempt socket timeouts. A caller that computes a
+    # timeout once and hands it down cannot bound a call that paces, times out,
+    # sleeps and then tries again -- every one of those is re-checked below.
+    # `deadline=None` keeps the historical behaviour exactly.
+    def _left() -> Optional[float]:
+        return remaining_seconds(deadline)
+
+    def _out_of_time(where: str) -> InatDeadlineExceeded:
+        logger.warning("iNat %s %s abandoned at %s: deadline reached", method, url, where)
+        return InatDeadlineExceeded(
+            f"The iNaturalist request ran out of time ({where})."
+        )
 
     attempt = 0
     waited = 0.0
     while True:
         attempt += 1
+        left = _left()
+        if left is not None and left <= 0:
+            raise _out_of_time("before pacing")
         # Every attempt goes through the shared pacer, retries included: a
         # retry is another request to iNaturalist and must not jump the queue.
-        _pace_inat_request()
+        _pace_inat_request(max_wait=left)
+        # Pacing can have slept for most of what was left, so the budget is
+        # recomputed rather than reused: starting a socket read here on the
+        # pre-pacing figure is exactly how a "bounded" call overruns.
+        left = _left()
+        attempt_timeout = timeout
+        if left is not None:
+            if left <= 0:
+                raise _out_of_time("after pacing")
+            attempt_timeout = min(timeout, left)
         try:
-            with diagnostic_urlopen(req, timeout=timeout) as resp:
+            with diagnostic_urlopen(req, timeout=attempt_timeout) as resp:
                 wire = resp.read()
                 raw = wire.decode('utf-8') or '{}'
                 parsed = json.loads(raw) if raw.strip() else {}
@@ -392,15 +595,26 @@ def _http_request(url: str, *, method: str = "GET", body: Optional[Dict[str, Any
         except urllib.error.HTTPError as e:
             if e.code in RETRYABLE_HTTP_STATUSES and attempt <= max_attempts:
                 delay = _retry_delay(e, attempt)
-                logger.warning(
-                    "iNat %s %s: HTTP %s, retrying in %.1fs (attempt %d/%d)",
-                    method, url, e.code, delay, attempt, max_attempts,
-                )
-                time.sleep(delay)
-                waited += delay
-                continue
+                left = _left()
+                if left is not None and delay >= left:
+                    # Sleeping it out would consume the whole remaining budget
+                    # and leave nothing to make the retry with, so report the
+                    # failure now instead of burning the caller's time first.
+                    logger.warning(
+                        "iNat %s %s: HTTP %s, not retrying: %.1fs backoff "
+                        "exceeds the %.1fs left", method, url, e.code, delay, left,
+                    )
+                else:
+                    logger.warning(
+                        "iNat %s %s: HTTP %s, retrying in %.1fs (attempt %d/%d)",
+                        method, url, e.code, delay, attempt, max_attempts,
+                    )
+                    time.sleep(delay)
+                    waited += delay
+                    continue
             logger.warning("iNat %s %s failed: HTTP %s", method, url, e.code)
             if e.code == 429:
+                _start_inat_cooldown()
                 raise InatTreeError(
                     f"iNaturalist is rate-limiting requests right now (HTTP 429). "
                     f"Dikarya retried {max_attempts} times over about "
@@ -423,13 +637,21 @@ def _http_request(url: str, *, method: str = "GET", body: Optional[Dict[str, Any
         except urllib.error.URLError as e:
             if attempt <= max_attempts:
                 delay = _retry_delay(None, attempt)
-                logger.warning(
-                    "iNat %s %s network error (%s), retrying in %.1fs (attempt %d/%d)",
-                    method, url, e.reason, delay, attempt, max_attempts,
-                )
-                time.sleep(delay)
-                waited += delay
-                continue
+                left = _left()
+                if left is not None and delay >= left:
+                    logger.warning(
+                        "iNat %s %s network error (%s), not retrying: %.1fs "
+                        "backoff exceeds the %.1fs left",
+                        method, url, e.reason, delay, left,
+                    )
+                else:
+                    logger.warning(
+                        "iNat %s %s network error (%s), retrying in %.1fs (attempt %d/%d)",
+                        method, url, e.reason, delay, attempt, max_attempts,
+                    )
+                    time.sleep(delay)
+                    waited += delay
+                    continue
             raise InatTreeError(
                 f"Could not reach iNaturalist after {attempt} attempt(s) "
                 f"({e.reason}). Please try again shortly.",
@@ -453,6 +675,72 @@ def fetch_observation(observation_id: int, *, max_attempts: Optional[int] = None
     observation = _APIResponse(results[0])
     observation.response_payload = payload
     return observation
+
+
+# Alan 9/23/26 - A bulk job waiting on MycoMap re-runs prepare_inat_tree_job on
+# every poll, and each pass fetched the observation again although nothing
+# about it changes while the job waits. In one hour that was ~1,600 polls and
+# 160 HTTP 429s from iNaturalist, each adding 2-30s of backoff on the only bulk
+# worker. A job now reuses its own copy for this long. The copy belongs to one
+# job (a new job on the same observation always reads it fresh, so a user who
+# fixes a field and resubmits sees the fix), and any write this app makes to
+# the observation drops it.
+WAITING_OBSERVATION_REUSE_SECONDS = 30 * 60
+_OBSERVATION_REUSE_KEY = "dikarya:inat:observation_reuse:{}"
+
+
+def _observation_reuse_redis():
+    try:
+        from app.workers.queue import get_redis_connection
+        return get_redis_connection()
+    except Exception as exc:
+        logger.info("iNat observation reuse unavailable; Redis unavailable: %s", exc)
+        return None
+
+
+def fetch_observation_for_job(observation_id: int, owner: Optional[str]) -> Dict[str, Any]:
+    """fetch_observation(), reusing ``owner``'s copy from a recent poll.
+
+    Without an owner, or without Redis, this is exactly fetch_observation().
+    """
+    if not owner:
+        return fetch_observation(observation_id)
+    import zlib
+
+    key = _OBSERVATION_REUSE_KEY.format(int(observation_id))
+    conn = _observation_reuse_redis()
+    if conn is not None:
+        try:
+            raw = conn.get(key)
+            if raw:
+                entry = json.loads(zlib.decompress(raw))
+                if entry.get("owner") == owner and isinstance(entry.get("observation"), dict):
+                    return _APIResponse(entry["observation"])
+        except Exception as exc:
+            logger.info("iNat observation reuse read failed; fetching: %s", exc)
+    observation = fetch_observation(observation_id)
+    if conn is not None:
+        try:
+            conn.set(
+                key,
+                zlib.compress(json.dumps(
+                    {"owner": owner, "observation": dict(observation)}
+                ).encode("utf-8")),
+                ex=WAITING_OBSERVATION_REUSE_SECONDS,
+            )
+        except Exception as exc:
+            logger.info("iNat observation reuse write failed: %s", exc)
+    return observation
+
+
+def _forget_reused_observation(observation_id: int) -> None:
+    conn = _observation_reuse_redis()
+    if conn is None:
+        return
+    try:
+        conn.delete(_OBSERVATION_REUSE_KEY.format(int(observation_id)))
+    except Exception as exc:
+        logger.info("iNat observation reuse invalidation failed: %s", exc)
 
 
 def _clean_candidate(value: Any) -> str:
@@ -567,7 +855,7 @@ def resolve_inaturalist_user_or_project(parsed: Dict[str, Any],
     user_match = None
     project_match = None
     if kind in {"user_candidate", "plain_candidate"} and preferred_type in {None, "user"}:
-        if parsed.get("source") == "people_path" and parsed.get("value_kind") == "id":
+        if parsed.get("source") in {"people_path", "observations_user_id"} and parsed.get("value_kind") == "id":
             user_match = _lookup_inaturalist_user_by_id(value)
         else:
             user_match = _lookup_inaturalist_user_exact(value)
@@ -704,6 +992,29 @@ def _collect_tree_eligible_observations(scope: Dict[str, Any]) -> Dict[str, Any]
     }
 
 
+# Alan 9/22/26 - One anonymous request queued ~600 bulk jobs (every sequenced
+# observation of one iNaturalist user), which put an 11-hour backlog in front of
+# everyone else's bulk work. Anonymous batches are capped here; signed-in users
+# are not, so the answer to "more than this" is to log in, not to be refused.
+ANONYMOUS_BATCH_TREE_LIMIT = 100
+
+
+def anonymous_batch_limit_exceeded(user, eligible_count: int) -> bool:
+    """True when an anonymous caller asks for more batch jobs than allowed."""
+    signed_in = bool(user is not None and getattr(user, "is_authenticated", False))
+    return not signed_in and int(eligible_count or 0) > ANONYMOUS_BATCH_TREE_LIMIT
+
+
+def anonymous_batch_limit_message(eligible_count: int) -> str:
+    return (
+        f"This would queue {eligible_count} tree jobs, and batches of more than "
+        f"{ANONYMOUS_BATCH_TREE_LIMIT} need an account. Log in or register "
+        "(free, email and password only) and you will be brought back here "
+        "with this search filled in, ready to queue all "
+        f"{eligible_count}."
+    )
+
+
 def count_tree_eligible_observations(scope: Dict[str, Any]) -> Dict[str, Any]:
     counts = _collect_tree_eligible_observations(scope)
     counts.pop("observations", None)
@@ -756,7 +1067,8 @@ def _message_for_scope_counts(scope: Dict[str, Any], counts: Dict[str, Any]) -> 
 
 
 def preview_inaturalist_tree_input(raw_input: str,
-                                   resolved_type: Optional[str] = None
+                                   resolved_type: Optional[str] = None,
+                                   user=None,
                                    ) -> Dict[str, Any]:
     parsed = parse_inaturalist_tree_input(raw_input)
     if parsed.get("type") == "single_observation":
@@ -824,17 +1136,40 @@ def preview_inaturalist_tree_input(raw_input: str,
         }
 
     resolved = resolve_inaturalist_user_or_project(parsed, preferred_type=resolved_type)
-    if resolved.get("type") in {"ambiguous", "not_found"}:
+    if resolved.get("type") == "not_found":
+        # This is an HTTP-200 preview outcome, so the ordinary failed-request
+        # logger cannot see it. Record the bounded original input so an operator
+        # can distinguish an actual missing account from a parser/usability bug.
+        # %r escapes newlines and other controls instead of letting input forge
+        # additional log lines.
+        logged_input = str(raw_input)[:MAX_RAW_INPUT_LEN]
+        logger.warning(
+            "event=inat_tree.preview_not_found input_type=%s input_source=%s "
+            "preferred_type=%s input=%r",
+            parsed.get("type") or "unknown",
+            parsed.get("source") or "none",
+            (resolved_type or "none").strip().lower(),
+            logged_input,
+        )
+        return {"status": "success", **resolved}
+    if resolved.get("type") == "ambiguous":
         return {"status": "success", **resolved}
     scope = resolved["scope"]
     counts = count_tree_eligible_observations(scope)
+    message = _message_for_scope_counts(scope, counts)
+    eligible = int(counts.get("eligible_tree_count") or 0)
+    login_required = anonymous_batch_limit_exceeded(user, eligible)
+    if login_required:
+        message = f"{message} {anonymous_batch_limit_message(eligible)}"
     return {
         "status": "success",
         "type": scope["type"],
         "scope_value": scope.get("value"),
         "display_name": scope.get("display_name"),
         **counts,
-        "message": _message_for_scope_counts(scope, counts),
+        "login_required": login_required,
+        "anonymous_batch_limit": ANONYMOUS_BATCH_TREE_LIMIT,
+        "message": message,
     }
 
 
@@ -859,6 +1194,32 @@ def extract_observation_field_value(observation: Dict[str, Any], field_name: str
     return None if val is None else str(val)
 
 
+# Alan 9/23/26 - Answers that do not change between calls, cached in Redis so
+# they survive the fork of every RQ job. A field's id is permanent; a taxon's
+# ancestry changes only when iNaturalist's taxonomy does, so a day is plenty.
+# A waiting job used to repeat the taxon lookup on every one-minute poll.
+_LOOKUP_CACHE_KEY = "dikarya:inat:lookup:{}"
+FIELD_ID_CACHE_SECONDS = 30 * 24 * 60 * 60
+TAXON_GENUS_CACHE_SECONDS = 24 * 60 * 60
+
+
+def _cached_lookup(name: str) -> Optional[str]:
+    """Return a cached lookup answer, or None when absent or Redis is down."""
+    try:
+        raw = _pacing_redis().get(_LOOKUP_CACHE_KEY.format(name))
+    except Exception as exc:
+        logger.info("iNat lookup cache read failed for %s: %s", name, exc)
+        return None
+    return raw.decode("utf-8") if raw is not None else None
+
+
+def _store_lookup(name: str, value: str, ttl_seconds: int) -> None:
+    try:
+        _pacing_redis().set(_LOOKUP_CACHE_KEY.format(name), value, ex=ttl_seconds)
+    except Exception as exc:
+        logger.info("iNat lookup cache write failed for %s: %s", name, exc)
+
+
 def get_observation_field_id_by_name(field_name: str) -> int:
     """Look up an iNaturalist observation field's numeric ID by name.
 
@@ -866,14 +1227,21 @@ def get_observation_field_id_by_name(field_name: str) -> int:
     path returns 404). Prefers an exact case-insensitive match; if none,
     falls back to the first autocomplete result for that exact query.
     """
+    cache_name = f"field_id:{field_name.strip().lower()}"
+    cached = _cached_lookup(cache_name)
+    if cached and cached.isdigit():
+        return int(cached)
     q = urllib.parse.urlencode({'q': field_name})
     payload = _http_request(f"{INAT_API_BASE}/observation_fields/autocomplete?{q}")
     results = payload.get('results') or []
     target = field_name.strip().lower()
     for r in results:
         if (r.get('name') or '').strip().lower() == target:
+            _store_lookup(cache_name, str(int(r['id'])), FIELD_ID_CACHE_SECONDS)
             return int(r['id'])
     if results:
+        # A fuzzy fallback is not cached: it may be the wrong field, and
+        # caching it would keep it wrong after the right one is created.
         return int(results[0]['id'])
     raise InatTreeError(
         f"iNaturalist observation field '{field_name}' was not found. "
@@ -909,6 +1277,9 @@ def set_observation_field_value(observation_id: int, field_name: str, value: str
             "value": str(value),
         }
     }
+    # Dropped before the write, not after: a write that fails partway may
+    # still have landed, and a stale copy must never outlive a changed field.
+    _forget_reused_observation(observation_id)
     if existing and existing.get('uuid'):
         url = f"{INAT_API_BASE}/observation_field_values/{existing['uuid']}"
         return _http_request(url, method='PUT', body=body, bearer=jwt) or {}
@@ -931,7 +1302,7 @@ DEFAULT_TREE_PARAMS = {
     "alignment_method": "mafft",
     "trimming_method": "trimal_gappy",
     "trim_terminal_overhangs": True,
-    "tree_method": "fasttree",
+    "tree_method": "iqtree_fast",
     "tree_model": "GTR+G",
     "bootstrap": 1000,
     "mcmc_generations": Config.DEFAULT_MCMC_GENERATIONS,
@@ -1324,11 +1695,29 @@ def _resolve_inat_genus(observation: Dict[str, Any], observation_id: int,
     taxon = observation.get("taxon") or {}
     taxon_id = taxon.get("id") if isinstance(taxon, dict) else None
     if not genus and taxon_id:
+        cache_name = f"taxon_genus:{int(taxon_id)}"
+        cached = _cached_lookup(cache_name)
         try:
-            payload = _http_request(f"{INAT_API_BASE}/taxa/{int(taxon_id)}")
-            results = (payload or {}).get("results") or []
-            if results:
-                genus = _extract_inat_genus({"taxon": results[0]})
+            if cached is not None:
+                genus = cached
+            else:
+                payload = _http_request(f"{INAT_API_BASE}/taxa/{int(taxon_id)}")
+                results = (payload or {}).get("results") or []
+                if results:
+                    genus = _extract_inat_genus({"taxon": results[0]})
+                    # An empty answer is cached too: a taxon above genus
+                    # rank has no genus however often it is asked.
+                    _store_lookup(cache_name, genus or "", TAXON_GENUS_CACHE_SECONDS)
+        except InatTreeError as exc:
+            # A bulk job defers on a 429 and resolves the genus next pass;
+            # swallowing it would title the tree "Genus pending" for good.
+            if exc.status == 429 and _in_bulk_job():
+                raise
+            logger.warning(
+                "Could not resolve genus ancestry for iNaturalist observation %s: %s",
+                observation_id,
+                exc,
+            )
         except Exception as exc:
             logger.warning(
                 "Could not resolve genus ancestry for iNaturalist observation %s: %s",
@@ -1541,9 +1930,18 @@ def _create_mycomap_blast_from_observation(observation: Dict[str, Any],
                                            observation_id: int, *,
                                            mycomap_local_limit=None,
                                            mycomap_ncbi_limit=None,
-                                           pending_creation_details=None
+                                           pending_creation_details=None,
+                                           write_inat_field: bool = True,
+                                           throttle: bool = False,
                                            ) -> Dict[str, Any]:
-    """Create a MycoMap search from an observation's ITS and write its URL back."""
+    """Create a MycoMap search from an observation's ITS and write its URL back.
+
+    ``write_inat_field=False`` creates and uses the search exactly as normal but
+    leaves the observation's Mycomap BLAST Results field untouched. That is for
+    an observation whose saved value is a mycomap.org URL this app cannot
+    resolve yet: the .org value is correct and the user's, so we build the tree
+    from our own replacement .com search rather than overwriting theirs.
+    """
     from app.services.fasta_utils import clean_dna_sequence
     from app.services.mycomap_service import (
         advance_mycomap_creation_discovery,
@@ -1551,6 +1949,9 @@ def _create_mycomap_blast_from_observation(observation: Dict[str, Any],
         create_mycomap_blast,
         find_mycomap_blast_by_title,
         get_mycomap_creation_discovery_max_seconds,
+        release_bulk_mycomap_creation,
+        reserve_bulk_mycomap_creation,
+        unconfirmed_mycomap_creation_verdict,
         validate_mycomap_rerun_limit,
     )
 
@@ -1567,7 +1968,47 @@ def _create_mycomap_blast_from_observation(observation: Dict[str, Any],
     # Alan 8/5/26 - Collect why a lookup failed so a discovery timeout can say
     # what actually went wrong instead of always blaming MycoMap's queue.
     discovery_warnings: List[str] = []
-    created = find_mycomap_blast_by_title(job_title, warnings=discovery_warnings)
+    # MycoMap knows the record ID before it publishes the result page, and that
+    # ID is all the queue-position lookup needs -- which matters because the
+    # unpublished stretch is exactly when the search is sitting in the queue.
+    pending_creation: Dict[str, Any] = {}
+    # A job held back by the bulk throttle never created anything, and its
+    # first pass already checked history for this title, so skip the lookup
+    # while it waits for a slot (history is MycoMap's heaviest BLAST query).
+    was_throttled = bool((pending_creation_details or {}).get("creation_throttled"))
+    created = None if was_throttled else find_mycomap_blast_by_title(
+        job_title, warnings=discovery_warnings, pending_out=pending_creation
+    )
+    # A create POST that timed out is pending like any other, but is re-sent
+    # once MycoMap's history shows it never arrived.
+    recreate = False
+    carried_discovery: Dict[str, Any] = {}
+    if (not created and not was_throttled
+            and (pending_creation_details or {}).get("creation_pending")):
+        verdict = unconfirmed_mycomap_creation_verdict(
+            pending_creation_details,
+            lookup_warnings=discovery_warnings,
+            pending_creation=pending_creation,
+        )
+        if verdict == "give_up":
+            release_bulk_mycomap_creation(job_title)
+            raise InatTreeError(
+                "MycoMap did not respond when Dikarya tried to create this "
+                "BLAST search, and has no record of it after "
+                f"{pending_creation_details.get('creation_attempts')} attempts. "
+                "MycoMap may be down; try again later.",
+                status=502,
+            )
+        recreate = verdict == "retry"
+        if recreate:
+            # Keep the discovery clock running across the re-send, so the
+            # job's RQ retry budget and the discovery budget stay in step.
+            carried_discovery, _ = advance_mycomap_creation_discovery(
+                pending_creation_details
+            )
+    creation_attempts = int(
+        (pending_creation_details or {}).get("creation_attempts") or 0
+    )
     if created:
         local_limit, local_error = validate_mycomap_rerun_limit(
             mycomap_local_limit, "local"
@@ -1582,11 +2023,13 @@ def _create_mycomap_blast_from_observation(observation: Dict[str, Any],
             "ncbi_limit": ncbi_limit,
             "reused_existing": True,
         })
-    elif (pending_creation_details or {}).get("creation_pending"):
+    elif ((pending_creation_details or {}).get("creation_pending")
+          and not was_throttled and not recreate):
         details, expired = advance_mycomap_creation_discovery(
             pending_creation_details
         )
         if expired:
+            release_bulk_mycomap_creation(job_title)
             raise InatTreeError(
                 _mycomap_creation_discovery_message(
                     get_mycomap_creation_discovery_max_seconds(),
@@ -1596,8 +2039,41 @@ def _create_mycomap_blast_from_observation(observation: Dict[str, Any],
             )
         if discovery_warnings:
             details["creation_discovery_warnings"] = discovery_warnings
-        return details
+        return _record_creation_queue_position(details, pending_creation)
     else:
+        if throttle:
+            allowed, reason = reserve_bulk_mycomap_creation(job_title)
+            if not allowed:
+                logger.info(
+                    "event=mycomap.bulk_creation_throttled observation=%s reason=%s",
+                    observation_id, reason,
+                )
+                return {
+                    "local_limit": mycomap_local_limit,
+                    "ncbi_limit": mycomap_ncbi_limit,
+                    "local_status": "queued",
+                    "ncbi_status": "queued",
+                    "warnings": [],
+                    "auto_created": True,
+                    "creation_pending": True,
+                    "creation_throttled": True,
+                    "creation_throttle_reason": reason,
+                    "creation_attempts": creation_attempts,
+                    "creation_discovery_attempt": 0,
+                    "creation_discovery_elapsed_seconds": 0,
+                    "created_title": job_title,
+                    "created_blast_id": None,
+                    "created_mycomap_url": "",
+                    "inat_mycomap_field_status": "pending",
+                    "inat_mycomap_field_value_id": None,
+                    "ncbi_poll_attempt": 0,
+                }
+        if recreate:
+            logger.info(
+                "event=mycomap.creation_resent observation=%s attempt=%s",
+                observation_id, creation_attempts + 1,
+            )
+        creation_attempts += 1
         try:
             created = create_mycomap_blast(
                 cleaned_its,
@@ -1606,10 +2082,11 @@ def _create_mycomap_blast_from_observation(observation: Dict[str, Any],
                 ncbi_limit=mycomap_ncbi_limit,
             )
         except MycoMapCreateError as exc:
+            release_bulk_mycomap_creation(job_title)
             raise InatTreeError(str(exc), status=502)
 
     if created.get("record_pending"):
-        return {
+        return _record_creation_queue_position({
             "local_limit": created.get("local_limit"),
             "ncbi_limit": created.get("ncbi_limit"),
             "local": created,
@@ -1619,15 +2096,21 @@ def _create_mycomap_blast_from_observation(observation: Dict[str, Any],
             "warnings": [],
             "auto_created": True,
             "creation_pending": True,
-            "creation_discovery_attempt": 0,
-            "creation_discovery_elapsed_seconds": 0,
+            "creation_unconfirmed": bool(created.get("creation_unconfirmed")),
+            "creation_attempts": creation_attempts,
+            "creation_discovery_attempt": carried_discovery.get(
+                "creation_discovery_attempt", 0
+            ),
+            "creation_discovery_elapsed_seconds": carried_discovery.get(
+                "creation_discovery_elapsed_seconds", 0
+            ),
             "created_title": job_title,
             "created_blast_id": None,
             "created_mycomap_url": "",
             "inat_mycomap_field_status": "pending",
             "inat_mycomap_field_value_id": None,
             "ncbi_poll_attempt": 0,
-        }
+        }, pending_creation)
 
     mycomap_url = str(created.get("url") or "").strip()
     blast_id = str(created.get("blast_id") or "").strip()
@@ -1635,12 +2118,27 @@ def _create_mycomap_blast_from_observation(observation: Dict[str, Any],
         raise InatTreeError(
             "MycoMap did not return a usable BLAST Results URL.", status=502
         )
-    set_result = set_observation_field_value(
-        observation_id, MYCOMAP_BLAST_FIELD_NAME, mycomap_url
-    )
     field_value_id = None
-    if isinstance(set_result, dict):
-        field_value_id = set_result.get("id") or set_result.get("uuid")
+    field_status = "success" if write_inat_field else "preserved"
+    if write_inat_field:
+        # Alan 9/23/26 - Best-effort, as in _reuse_existing_mycomap_blast. The
+        # search already exists on MycoMap; if this write raised (a 429 during
+        # a bulk run), the worker deferred the job without these details, and
+        # a resume whose title lookup came back empty created a second BLAST.
+        # Returning them is what lets the next pass carry on with this one.
+        try:
+            set_result = set_observation_field_value(
+                observation_id, MYCOMAP_BLAST_FIELD_NAME, mycomap_url
+            )
+            if isinstance(set_result, dict):
+                field_value_id = set_result.get("id") or set_result.get("uuid")
+        except Exception as exc:
+            field_status = "failed"
+            logger.warning(
+                "Could not write the new MycoMap URL to observation %s; the tree "
+                "is still built from BLAST %s: %s",
+                observation_id, blast_id, exc,
+            )
     return {
         "local_limit": created.get("local_limit"),
         "ncbi_limit": created.get("ncbi_limit"),
@@ -1650,19 +2148,119 @@ def _create_mycomap_blast_from_observation(observation: Dict[str, Any],
         "ncbi_status": "queued",
         "warnings": [],
         "auto_created": True,
+        "created_title": job_title,
         "created_blast_id": blast_id,
         "created_mycomap_url": mycomap_url,
-        "inat_mycomap_field_status": "success",
+        "inat_mycomap_field_status": field_status,
         "inat_mycomap_field_value_id": field_value_id,
         "ncbi_poll_attempt": 0,
     }
 
 
+def _reuse_existing_mycomap_blast(observation: Dict[str, Any], observation_id: int,
+                                  pending_details: Optional[Dict[str, Any]], *,
+                                  write_inat_field: bool, progress=None,
+                                  ) -> Optional[Dict[str, str]]:
+    """Return an existing MycoMap BLAST of this observation's ITS, if any.
+
+    Alan 9/22/26 - Checked before every automatic creation, because half of
+    the observations MycoMap sampled already had a BLAST of the identical
+    sequence. Only on a job's first pass: once a search has been created (or is
+    being discovered) this must not switch it to a different one, and a job
+    waiting on the bulk throttle already looked.
+    """
+    details = pending_details or {}
+    if details.get("creation_pending") or details.get("created_blast_id"):
+        return None
+    from app.services.fasta_utils import clean_dna_sequence
+    from app.services.mycomap_service import find_existing_mycomap_blast_for_sequence
+
+    cleaned_its = clean_dna_sequence(
+        extract_observation_field_value(observation, DNA_BARCODE_ITS_FIELD_NAME) or ""
+    ) or ""
+    if not cleaned_its:
+        return None
+    try:
+        existing = find_existing_mycomap_blast_for_sequence(
+            f"inat:{int(observation_id)}", cleaned_its
+        )
+    except Exception:
+        logger.exception("MycoMap existing-BLAST lookup failed for %s", observation_id)
+        return None
+    if not existing:
+        return None
+    _report_progress(
+        progress,
+        f"MycoMap already has a BLAST search of this ITS sequence (r{existing['blast_id']}); "
+        "using it instead of starting a new one.",
+    )
+    if write_inat_field:
+        try:
+            set_observation_field_value(
+                observation_id, MYCOMAP_BLAST_FIELD_NAME, existing["url"]
+            )
+        except Exception as exc:
+            # The tree is still built from the existing search; only the link
+            # back on iNaturalist is missing.
+            logger.warning(
+                "Could not write the reused MycoMap URL to observation %s: %s",
+                observation_id, exc,
+            )
+    return existing
+
+
+def _record_creation_queue_position(details: dict, pending: dict) -> dict:
+    """
+    Attach the NCBI queue position to a still-being-discovered BLAST.
+
+    A search whose result page has not been published yet has no ``blast_id``
+    on its details, so the ordinary poll cannot ask where it sits. The history
+    lookup does know the ID, so carry it here and ask once per discovery pass.
+    """
+    from app.services.mycomap_service import (
+        get_mycomap_ncbi_queue_position,
+        record_mycomap_queue_position,
+    )
+
+    details = dict(details or {})
+    pending_id = str((pending or {}).get("blast_id") or "").strip()
+    if not pending_id:
+        return details
+    details["creation_pending_blast_id"] = pending_id
+    return record_mycomap_queue_position(
+        details, get_mycomap_ncbi_queue_position(blast_id=pending_id)
+    )
+
+
 def _check_auto_created_mycomap_ncbi_results(
         blast_id: str, details: Dict[str, Any],
         mycomap_url: Optional[str] = None) -> Tuple[bool, Dict[str, Any]]:
-    """Check one polling interval for NCBI hits on an auto-created BLAST."""
+    """Check one polling interval for NCBI hits on an auto-created BLAST.
+
+    Once the search is done with -- results in, local fallback, or given up --
+    it stops counting against the bulk creation throttle.
+    """
+    from app.services.mycomap_service import release_bulk_mycomap_creation
+
+    title = str((details or {}).get("created_title") or "")
+    try:
+        ready, details = _poll_auto_created_mycomap_ncbi_results(
+            blast_id, details, mycomap_url=mycomap_url
+        )
+    except Exception:
+        release_bulk_mycomap_creation(title)
+        raise
+    if ready:
+        release_bulk_mycomap_creation(title)
+    return ready, details
+
+
+def _poll_auto_created_mycomap_ncbi_results(
+        blast_id: str, details: Dict[str, Any],
+        mycomap_url: Optional[str] = None) -> Tuple[bool, Dict[str, Any]]:
     from app.services.mycomap_service import (
+        _looks_unfinished,
+        get_mycomap_ncbi_queue_status,
         get_mycomap_local_result_count,
         get_mycomap_ncbi_backlog_fallback_position,
         get_mycomap_ncbi_local_fallback_seconds,
@@ -1670,34 +2268,37 @@ def _check_auto_created_mycomap_ncbi_results(
         get_mycomap_ncbi_poll_max_attempts,
         get_mycomap_ncbi_queue_position,
         get_mycomap_ncbi_result_count,
+        record_mycomap_queue_position,
     )
 
     details = dict(details or {})
     attempt = int(details.get("ncbi_poll_attempt") or 0) + 1
-    # The result page is the authoritative cheap signal that MycoMap has not
+    # MycoMap's status endpoint is the authoritative cheap signal that it has not
     # reached this search yet. Do not hammer its NCBI FASTA export while it says
     # the search is queued; that endpoint returns 500 during a backlog.
-    queue_position = (
-        get_mycomap_ncbi_queue_position(mycomap_url) if mycomap_url else None
+    queue_status = get_mycomap_ncbi_queue_status(mycomap_url, blast_id=blast_id)
+    queue_position = queue_status["queue_position"]
+    # Alan 9/22/26 - Also hold off while the API says the search is still
+    # running with no queue position (MycoMap drops the position before the
+    # results exist). Fetching the export then only earns a 500.
+    still_running = queue_position is not None or (
+        queue_status["source"] == "api" and _looks_unfinished(queue_status["status"])
     )
-    if queue_position is None:
+    if not still_running:
         count, warnings = get_mycomap_ncbi_result_count(blast_id)
     else:
         count, warnings = 0, []
     details["ncbi_poll_attempt"] = attempt
     details["ncbi_result_count"] = count
     details["ncbi_status"] = (
-        "available" if count > 0 else "queued" if queue_position is not None else "waiting"
+        "available" if count > 0 else "queued" if still_running else "waiting"
     )
     if warnings:
         details["ncbi_poll_warnings"] = warnings
     if count > 0:
         details.pop("ncbi_queue_position", None)
         return True, details
-    if queue_position is not None:
-        details["ncbi_queue_position"] = queue_position
-    else:
-        details.pop("ncbi_queue_position", None)
+    details = record_mycomap_queue_position(details, queue_position)
 
     elapsed_seconds = attempt * get_mycomap_ncbi_poll_interval_seconds()
     fallback_seconds = get_mycomap_ncbi_local_fallback_seconds()
@@ -1764,12 +2365,21 @@ def _append_fasta_to_job_input(job_dir, fasta_text: str) -> int:
         _sequence_exact_key,
         _split_fasta_header,
     )
+    from app.services.mycomap_service import compact_mycomap_ncbi_header
 
     sequences_to_add = [
         s for s in _parse_fasta_sequences(fasta_text) if s.get("sequence", "").strip()
     ]
     if not sequences_to_add:
         return 0
+
+    # These headers arrive straight from MycoMap's NCBI export, which is the
+    # same source /api/mycomap compacts before it ever reaches the queue. Do
+    # the same here, or a tree that gained its NCBI hits on the recheck shows
+    # whole GenBank definition lines as tip labels while a tree that got them
+    # up front does not.
+    for seq in sequences_to_add:
+        seq["name"] = compact_mycomap_ncbi_header(seq.get("name", ""))
 
     input_path = job_dir / "input" / "input_raw.fasta"
     input_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1846,6 +2456,7 @@ def reconcile_delayed_ncbi_results(job_id: str) -> Dict[str, Any]:
         get_mycomap_ncbi_recheck_max_hours,
         get_mycomap_ncbi_queue_position,
         get_mycomap_ncbi_result_count,
+        record_mycomap_queue_position,
         validate_mycomap_url,
     )
 
@@ -1895,7 +2506,9 @@ def reconcile_delayed_ncbi_results(job_id: str) -> Dict[str, Any]:
         rerun_details["ncbi_recheck_count"] = recheck_count
         rerun_details["ncbi_last_rechecked_at"] = datetime.now(timezone.utc).isoformat()
 
-        queue_position = get_mycomap_ncbi_queue_position(mycomap_url)
+        queue_position = get_mycomap_ncbi_queue_position(
+            mycomap_url, blast_id=blast_id
+        )
         if queue_position is None:
             count, _warnings = get_mycomap_ncbi_result_count(blast_id)
             rerun_details.pop("ncbi_queue_position", None)
@@ -1903,7 +2516,9 @@ def reconcile_delayed_ncbi_results(job_id: str) -> Dict[str, Any]:
             # A queued search is healthy pending work, not a failed export.
             count, _warnings = 0, []
             rerun_details["ncbi_status"] = "queued"
-            rerun_details["ncbi_queue_position"] = queue_position
+            rerun_details = record_mycomap_queue_position(
+                rerun_details, queue_position
+            )
         if count <= 0:
             max_hours = get_mycomap_ncbi_recheck_max_hours()
             if recheck_count >= max_hours:
@@ -2020,7 +2635,9 @@ def prepare_inat_tree_job(observation_id: int, *, include_ncbi: bool = True,
                           defer_after_ncbi_rerun: bool = False,
                           skip_mycomap_refresh: bool = False,
                           mycomap_rerun_details: Optional[Dict[str, Any]] = None,
-                          progress=None
+                          progress=None,
+                          throttle_mycomap_creation: bool = False,
+                          observation_reuse_owner: Optional[str] = None,
                           ) -> Dict[str, Any]:
     """Fetch, refresh, and import an iNaturalist observation's MycoMap input.
 
@@ -2034,7 +2651,7 @@ def prepare_inat_tree_job(observation_id: int, *, include_ncbi: bool = True,
         validate_mycomap_url,
     )
 
-    observation = fetch_observation(observation_id)
+    observation = fetch_observation_for_job(observation_id, observation_reuse_owner)
     genus = _resolve_inat_genus(observation, observation_id)
     existing_tree_record = find_observation_field_value_record(
         observation, PHYLOGENETIC_TREE_FIELD_NAME
@@ -2058,12 +2675,20 @@ def prepare_inat_tree_job(observation_id: int, *, include_ncbi: bool = True,
         if skip_mycomap_refresh and saved_created_url:
             mycomap_url = saved_created_url
         else:
+            reused = _reuse_existing_mycomap_blast(
+                observation, observation_id, mycomap_rerun_details,
+                write_inat_field=True, progress=progress,
+            )
+            if reused:
+                mycomap_url = reused["url"]
+        if not mycomap_url:
             mycomap_rerun_details = _create_mycomap_blast_from_observation(
                 observation,
                 observation_id,
                 mycomap_local_limit=mycomap_local_limit,
                 mycomap_ncbi_limit=mycomap_ncbi_limit,
                 pending_creation_details=mycomap_rerun_details,
+                throttle=throttle_mycomap_creation,
             )
             return {
                 "status": "waiting_for_ncbi",
@@ -2076,28 +2701,84 @@ def prepare_inat_tree_job(observation_id: int, *, include_ncbi: bool = True,
     mycomap_url = mycomap_url.strip()
     blast_id = validate_mycomap_url(mycomap_url)
     if not blast_id:
+        # Alan 9/22/26 - A legacy do=results link names a Sequences/GenBank
+        # record, not a BLAST (see resolve_legacy_mycomap_results_url). Follow
+        # it to the BLASTs MycoMap already ran on that sequence. The saved
+        # value is left as it is: it still works on MycoMap.
+        from app.services.mycomap_service import resolve_legacy_mycomap_results_url
+        legacy = resolve_legacy_mycomap_results_url(mycomap_url)
+        if legacy:
+            _report_progress(
+                progress,
+                "The observation's MycoMap link is in MycoMap's older format; "
+                f"using the existing BLAST search it points to (r{legacy['blast_id']}).",
+            )
+            mycomap_url = legacy["url"]
+            blast_id = legacy["blast_id"]
+    if not blast_id:
         # Some older observations contain MycoMap's legacy query-string URL,
         # which cannot identify a result through the current API. If the
         # observation still has its ITS barcode, recover automatically by
         # creating a current search and replacing the field when it appears.
         from app.services.fasta_utils import clean_dna_sequence
+        from app.services.mycomap_service import is_mycomap_org_url
         raw_its = extract_observation_field_value(
             observation, DNA_BARCODE_ITS_FIELD_NAME,
         )
-        if clean_dna_sequence(raw_its or ""):
+        # Alan 9/16/26 - A mycomap.org URL is a CORRECT value that this app
+        # cannot resolve yet, not a broken one. Build the tree from our own
+        # replacement .com search as usual, but never write that .com URL over
+        # the user's .org value -- doing so destroyed the stored value on
+        # observation 333807166 on 2026-09-15. Drop the preserve_saved_url
+        # branch once .org URLs validate directly.
+        preserve_saved_url = is_mycomap_org_url(mycomap_url)
+        # A preserved .org value stays in the field, so this branch is
+        # re-entered on every deferred rerun. Reuse the replacement search the
+        # earlier pass already created instead of creating a second one.
+        saved_created_url = str(
+            (mycomap_rerun_details or {}).get("created_mycomap_url") or ""
+        ).strip()
+        reused_blast_id = (
+            validate_mycomap_url(saved_created_url, quiet=True)
+            if saved_created_url
+            else None
+        )
+        existing = None if reused_blast_id else _reuse_existing_mycomap_blast(
+            observation, observation_id, mycomap_rerun_details,
+            write_inat_field=False, progress=progress,
+        )
+        if reused_blast_id:
+            mycomap_url = saved_created_url
+            blast_id = reused_blast_id
+        elif existing:
+            mycomap_url = existing["url"]
+            blast_id = existing["blast_id"]
+        elif clean_dna_sequence(raw_its or ""):
             from app.services.log_context import log_degradation
-            log_degradation(
-                logger,
-                "invalid_mycomap_url_replaced",
-                "Saved MycoMap URL was unusable; creating a replacement search from ITS",
-                observation_id=observation_id,
-            )
+            if preserve_saved_url:
+                log_degradation(
+                    logger,
+                    "mycomap_org_url_not_supported",
+                    "Saved MycoMap URL is a mycomap.org link this app cannot "
+                    "resolve yet; building from a replacement search and "
+                    "leaving the saved value unchanged",
+                    observation_id=observation_id,
+                )
+            else:
+                log_degradation(
+                    logger,
+                    "invalid_mycomap_url_replaced",
+                    "Saved MycoMap URL was unusable; creating a replacement search from ITS",
+                    observation_id=observation_id,
+                )
             mycomap_rerun_details = _create_mycomap_blast_from_observation(
                 observation,
                 observation_id,
                 mycomap_local_limit=mycomap_local_limit,
                 mycomap_ncbi_limit=mycomap_ncbi_limit,
                 pending_creation_details=mycomap_rerun_details,
+                write_inat_field=not preserve_saved_url,
+                throttle=throttle_mycomap_creation,
             )
             return {
                 "status": "waiting_for_ncbi",
@@ -2106,13 +2787,14 @@ def prepare_inat_tree_job(observation_id: int, *, include_ncbi: bool = True,
                 "mycomap_blast_url": mycomap_rerun_details["created_mycomap_url"],
                 "mycomap_rerun_details": mycomap_rerun_details,
             }
-        raise InatTreeError(
-            "The observation's Mycomap BLAST Results field does not "
-            "contain a valid MycoMap BLAST URL. Edit that iNaturalist field "
-            "to contain the complete MycoMap result-page URL ending in an "
-            "r-number, then retry the tree job.",
-            status=422,
-        )
+        else:
+            raise InatTreeError(
+                "The observation's Mycomap BLAST Results field does not "
+                "contain a valid MycoMap BLAST URL. Edit that iNaturalist field "
+                "to contain the complete MycoMap result-page URL ending in an "
+                "r-number, then retry the tree job.",
+                status=422,
+            )
 
     if skip_mycomap_refresh:
         mycomap_rerun_details = dict(mycomap_rerun_details or {})
@@ -2168,7 +2850,10 @@ def prepare_inat_tree_job(observation_id: int, *, include_ncbi: bool = True,
     if "ncbi" in pending_sources:
         queue_position = (payload or {}).get("ncbi_queue_position")
         mycomap_rerun_details["ncbi_status"] = "queued"
-        mycomap_rerun_details["ncbi_queue_position"] = queue_position
+        from app.services.mycomap_service import record_mycomap_queue_position
+        mycomap_rerun_details = record_mycomap_queue_position(
+            mycomap_rerun_details, queue_position
+        )
         mycomap_rerun_details["ncbi_fallback_local_only"] = True
         queue_suffix = (
             f" at position {queue_position}" if queue_position is not None else ""
@@ -2316,7 +3001,7 @@ def create_job_from_inat_observation(raw_input: str, user=None,
     if extra_metrics:
         rq_meta.update(extra_metrics)
 
-    job_id = str(uuid.uuid4())
+    job_id = generate_job_id()
     job_params = {
         "input_type": "inat_tree_preparation",
         "notes": _build_inat_job_title(observation_id, initial_genus),
@@ -2437,6 +3122,17 @@ def create_jobs_from_inat_scope(raw_input: str, resolved_type: str, user=None,
     collected = _collect_tree_eligible_observations(scope)
     observations = collected.get("observations") or []
     eligible_count = len(observations)
+    if anonymous_batch_limit_exceeded(user, eligible_count):
+        raise InatTreeError(
+            anonymous_batch_limit_message(eligible_count),
+            status=401,
+            failure_code="inat_tree_batch_login_required",
+            details={
+                "login_required": True,
+                "eligible_count": eligible_count,
+                "anonymous_batch_limit": ANONYMOUS_BATCH_TREE_LIMIT,
+            },
+        )
     queue_class = "high" if eligible_count == 1 else "bulk"
     queue_name = "phylo_high" if queue_class == "high" else "phylo_bulk"
     batch_id = uuid.uuid4().hex

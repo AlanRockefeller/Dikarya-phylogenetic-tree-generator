@@ -17,7 +17,7 @@
 
         <!-- Card Body -->
         <div class="px-6 py-8">
-            <form method="POST" action="{{ url_for('auth.register') }}" class="space-y-6">
+            <form method="POST" action="{{ url_for('auth.register', next=request.args.get('next')) }}" class="space-y-6">
                 <input type="hidden" name="csrf_token" value="{{ csrf_token() }}" />
                 <!-- Email Field -->
                 <div>
@@ -56,7 +56,7 @@
         <div class="bg-gray-50 dark:bg-journal-dark px-6 py-4 border-t border-gray-200 dark:border-journal-green">
             <p class="text-sm text-gray-600 dark:text-gray-300 text-center">
                 Already have an account?
-                <a href="{{ url_for('auth.login') }}"
+                <a href="{{ url_for('auth.login', next=request.args.get('next')) }}"
                     class="text-journal-gold hover:text-journal-gold-light font-semibold transition-colors">
                     Login here
                 </a>

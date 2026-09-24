@@ -323,6 +323,8 @@ test('deleting a leaf below a bifurcating root promotes the surviving child', ()
     assert.strictEqual(tree.getNodes().depth, 0, 'promoted root kept a stale depth');
     assert.strictEqual(tree.getNodes().data.attribute, undefined,
         'the promoted root kept the branch length it no longer has');
+    assert.strictEqual(tree.getNodes().data.annotation, undefined);
+    assert.strictEqual(tree.getNodes().data.original_child_order, undefined);
     assertLinkInvariant(tree, 'after deleting below a bifurcating root');
     newickTips(tree.getNewick());
 });

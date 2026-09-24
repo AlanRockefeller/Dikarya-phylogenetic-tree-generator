@@ -289,6 +289,32 @@ def _fetch_annotation_xml(accessions: List[str],
         return None
 
 
+def fetch_annotation_records(accessions: List[str],
+                             deadline: Optional[float] = None):
+    """Yield ``(batch, records)`` for each efetch batch of ``accessions``.
+
+    ``records`` is the parsed ``by_acc`` mapping for that batch, or ``None``
+    when the fetch failed -- the caller has to tell "NCBI said nothing about
+    these" apart from "NCBI was never asked". Iteration stops once ``deadline``
+    (a ``time.monotonic()`` instant) passes, yielding ``(batch, None)`` for the
+    remaining ids so they are reported as unasked rather than answered-empty.
+
+    Shared by every annotation lookup over accessions (collection locations,
+    observation references) so they all use one fetch, retry and slicing path.
+    """
+    for start in range(0, len(accessions), EFETCH_BATCH_SIZE):
+        batch = accessions[start:start + EFETCH_BATCH_SIZE]
+        if deadline is not None and time.monotonic() >= deadline:
+            for remaining_start in range(start, len(accessions), EFETCH_BATCH_SIZE):
+                yield accessions[remaining_start:remaining_start + EFETCH_BATCH_SIZE], None
+            return
+        xml_text = _fetch_annotation_xml(batch, deadline=deadline)
+        if not xml_text:
+            yield batch, None
+            continue
+        yield batch, _parse_genbank_xml(xml_text).get("by_acc", {})
+
+
 def lookup_locations(accessions: List[str], deadline: Optional[float] = None
                      ) -> Tuple[Dict[str, str], List[str], List[str]]:
     """Look up collection locations for GenBank accessions.
@@ -330,20 +356,14 @@ def lookup_locations(accessions: List[str], deadline: Optional[float] = None
             locations[accession] = cached
 
     unavailable_set = set()
-    for start in range(0, len(to_fetch), EFETCH_BATCH_SIZE):
-        batch = to_fetch[start:start + EFETCH_BATCH_SIZE]
-        if deadline is not None and time.monotonic() >= deadline:
-            # Out of budget: every remaining id is unasked, not answered-empty.
-            unavailable_set.update(to_fetch[start:])
-            break
-        xml_text = _fetch_annotation_xml(batch, deadline=deadline)
-        if not xml_text:
-            # The request failed; nothing was learned about any id in it.
+    for batch, records in fetch_annotation_records(to_fetch, deadline=deadline):
+        if records is None:
+            # The request failed, or the budget ran out before it was sent;
+            # nothing was learned about any id in this batch.
             unavailable_set.update(batch)
             continue
 
-        parsed = _parse_genbank_xml(xml_text)
-        for record in parsed.get("by_acc", {}).values():
+        for record in records.values():
             location = _location_from_record(record)
             keys = [
                 str(record.get("accession") or "").upper(),

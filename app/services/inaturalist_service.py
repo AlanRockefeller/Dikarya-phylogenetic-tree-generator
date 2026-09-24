@@ -27,7 +27,7 @@ logger = logging.getLogger(__name__)
 INATURALIST_API_BASE = "https://api.inaturalist.org/v1"
 USER_AGENT = "Dikarya Phylogenetic Tree Builder 1.0 - For questions contact Alan Rockefeller"
 REQUEST_TIMEOUT = 30
-RATE_LIMIT_DELAY = 1.0  # seconds between requests
+RATE_LIMIT_DELAY = 1.0  # seconds between requests (paced by the shared Redis cursor)
 MAX_PER_PAGE = 200  # iNaturalist max per_page value
 MAX_OBSERVATIONS = 10000  # API pagination limit
 
@@ -125,6 +125,29 @@ def validate_inaturalist_url(url: str) -> Optional[Dict[str, Any]]:
     return None
 
 
+def canonical_inaturalist_source_url(value: Any) -> str:
+    """Return a safe, clickable URL for the iNaturalist input that made a job."""
+    raw = str(value or "").strip()
+    details = validate_inaturalist_url(raw)
+    if not details:
+        return ""
+    if details["type"] == "single_observation":
+        return (
+            "https://www.inaturalist.org/observations/"
+            f"{details['observation_id']}"
+        )
+
+    parsed = urlparse(raw)
+    if parsed.scheme.lower() not in {"http", "https"}:
+        return ""
+    # Rebuild on the trusted canonical host, retaining the exact search path
+    # and query the user supplied but never a fragment or credentials.
+    path = parsed.path if parsed.path.startswith("/observations") else "/observations"
+    return f"https://www.inaturalist.org{path}" + (
+        f"?{parsed.query}" if parsed.query else ""
+    )
+
+
 from app.services.fasta_utils import clean_dna_sequence
 
 
@@ -172,6 +195,16 @@ def _extract_location_label(observation_data: Dict) -> str:
     return location_label_from_place_guess(observation_data)
 
 
+class InatRateLimitedError(Exception):
+    """iNaturalist kept answering HTTP 429 after every retry.
+
+    Alan 9/23/26 - This used to be a bare Exception, which the routes report
+    as a 500. Being throttled is not a server fault, so the route answers 503
+    with Retry-After instead. Subclassing Exception keeps every existing
+    ``except Exception`` caller working unchanged.
+    """
+
+
 def _make_api_request(url: str, max_retries: int = 3) -> Dict:
     """
     Make a request to the iNaturalist API with proper headers and 429 retry logic.
@@ -194,8 +227,19 @@ def _make_api_request(url: str, max_retries: int = 3) -> Dict:
         ('Accept', 'application/json')
     ]
     
+    # Alan 9/23/26 - Every attempt, retries included, takes a slot from the
+    # same Redis-backed pacer the worker uses. This path used to pace only
+    # within its own process, so a Tree Builder import competed blindly with
+    # a bulk run for iNaturalist's limit -- and lost, as a 500.
+    from app.services.inaturalist_tree_service import InatTreeError, _pace_inat_request
+
     attempts = 0
     while attempts <= max_retries:
+        try:
+            _pace_inat_request()
+        except InatTreeError as exc:
+            # The shared queue is too deep to wait out inside a request.
+            raise InatRateLimitedError(str(exc)) from exc
         try:
             with diagnostic_urlopen(url, timeout=REQUEST_TIMEOUT, opener=opener.open) as resp:
                 content = resp.read()
@@ -211,6 +255,11 @@ def _make_api_request(url: str, max_retries: int = 3) -> Dict:
                 continue
                 
             error_msg = f"HTTP error {e.code}: {e.reason}"
+            if e.code == 429:
+                logger.warning(f"iNaturalist API error: {error_msg}")
+                from app.services.inaturalist_tree_service import _start_inat_cooldown
+                _start_inat_cooldown()
+                raise InatRateLimitedError(error_msg)
             logger.error(f"iNaturalist API error: {error_msg}")
             raise Exception(error_msg)
             
@@ -416,7 +465,6 @@ def fetch_observations_with_field_filter(base_params: Dict, field_name: str,
             break
             
         page += 1
-        time.sleep(RATE_LIMIT_DELAY)
         
     truncated = len(all_observations) < total_results and (
         timed_out or len(all_observations) >= MAX_OBSERVATIONS
@@ -566,8 +614,11 @@ def extract_sequences_from_observations(dna_observations: List[Dict],
             if taxon:
                 species_name = taxon.get('name', '')
         
-        # Sanitize species name
-        species_name = re.sub(r'[<>"\']', '', str(species_name or '')).strip()
+        # Strip HTML/attribute-hazard characters, but keep apostrophes. Single
+        # quotes are taxonomically meaningful in provisional fungal names such
+        # as ``Pisolithus sp. 'AZ01'``; deleting them makes otherwise distinct
+        # provisional species collapse to the same ``Genus sp.`` annotation.
+        species_name = _clean_display_text(species_name)
         # Prefer iNaturalist's standardized places over the observer's
         # free-text place_guess, which is often a road or a zip code.
         location_label = (place_labels.get(obs_id)
@@ -636,6 +687,7 @@ def fetch_inaturalist_data(url: str, mode: str = 'all',
         'timed_out': False,
         'total_available': 0
     }
+    final_result['inat_source_url'] = canonical_inaturalist_source_url(url)
 
     deadline = None if time_budget is None else time.monotonic() + time_budget
     # 'all' is the analyze pass behind the Fetch button: it reports counts and,

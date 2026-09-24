@@ -63,6 +63,11 @@ class DeadlineTestCase(unittest.TestCase):
         patcher = patch.object(places.time, "sleep", self.clock.sleep)
         patcher.start()
         self.addCleanup(patcher.stop)
+        # The shared iNaturalist pacer lives in Redis on a real clock; it is
+        # covered by test_inaturalist_pacing. Keep these tests off it.
+        patcher = patch.object(places, "_take_inat_slot", return_value=True)
+        patcher.start()
+        self.addCleanup(patcher.stop)
 
     def _urlopen(self, payload=None, *, cost=0.0, error=None):
         """A urlopen double that records its timeout and spends `cost` seconds."""

@@ -363,7 +363,7 @@ JOB_ID=$(
     -d '{
       "input_type": "pasted_sequence",
       "sequence": ">Sample_A\nATGCGTACGTAGCTAGCTAGCTAGCTAGCTAACGATCGATCGATCGATCGATCGATCGATCGATCGATCGATCGATCGATCGATCGATCGATCGATCG\n>Sample_B\nATGCGTACGTAGCTAGCTAGCTAGCTAGCTAACGATCGATCGATCGATCGATCGATCGATCGATCGATCGATCGATCGATCGTTTGATCGATCGATCG\n>Sample_C\nATGCGTACGTAGCTAGCTAGCTAGCTAGCTAACGATCGATCGATCGATCGATCGATCGATCGATCGATCGATCGATCGATCGATCGTTTGATCG\n>Sample_D\nATGCGTACGTAGCTAGCTAGCTAGCTAGCTAACGATCGATCGATCGATCGATCGATCGATCGATCGATCGATCGTTTGATCGATCGATCGATCGATCG",
-      "tree_method": "fasttree",
+      "tree_method": "iqtree_fast",
       "alignment_method": "mafft",
       "trimming_method": "none",
       "notes": "API test with valid pasted FASTA"
@@ -442,7 +442,7 @@ ATGCGTACGTAGCTAGCTAGCTAGCTAGCTAACGATCGATCGATCGATCGATCGATCGATCGATCGATCGATCGTTTGAT
 payload = {
     "input_type": "pasted_sequence",
     "sequence": sequence,
-    "tree_method": "fasttree",
+    "tree_method": "iqtree_fast",
     "alignment_method": "mafft",
     "trimming_method": "none",
     "notes": "Python API test with valid pasted FASTA",
@@ -487,6 +487,72 @@ print(tree_response.text)</code></pre>
             <p class="text-xs text-gray-500 dark:text-gray-400 italic">
                 Use the <code class="font-mono">Authorize</code> button below to plug in your token,
                 then any endpoint can be tried directly from this page.
+            </p>
+        </div>
+    </div>
+
+    <div class="bg-white dark:bg-journal-green rounded-xl shadow-lg overflow-hidden transition-colors">
+        <div class="bg-journal-dark px-5 py-3 border-b border-journal-green">
+            <h3 class="text-white font-semibold flex items-center">
+                <i class="fas fa-magnifying-glass text-journal-gold mr-2"></i>iNaturalist Finder integration
+            </h3>
+        </div>
+        <div class="p-5 space-y-3 text-sm text-gray-700 dark:text-gray-200">
+            <p>
+                Call <code class="font-mono">POST /api/v1/tools/inaturalist-finder</code> with a token carrying
+                <code class="font-mono">tools:read</code>. The response includes stable observation URLs, taxon and user fields,
+                location, photos, and search-completeness counts suitable for displaying on another website.
+            </p>
+            <p class="text-xs text-gray-500 dark:text-gray-400">
+                Make this request from the integrating website's server. Do not embed the bearer token in public browser JavaScript.
+            </p>
+            <p>
+                <strong>Automatic search</strong> is the recommended shape: send the observation number plus any
+                combination of the clue fields <code class="font-mono">genus</code>, <code class="font-mono">family</code>,
+                <code class="font-mono">taxon</code>, <code class="font-mono">user</code> and <code class="font-mono">project</code> —
+                or none at all. It checks the number exactly as supplied first, then widens through the common
+                transcription errors, and stops as soon as an observation matches every usable clue.
+            </p>
+            <pre class="bg-gray-100 dark:bg-journal-dark text-journal-dark dark:text-journal-cream text-xs p-3 rounded overflow-x-auto"><code>curl -sS -X POST https://dikarya.us/api/v1/tools/inaturalist-finder \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -H "Idempotency-Key: finder-360934883-beauveria-1" \
+  -d '{
+    "observation": "360934883",
+    "genus": "Beauveria",
+    "user": "alan_rockefeller"
+  }' | jq '.data'</code></pre>
+            <p>
+                Every match carries a <code class="font-mono">score</code> saying which clues it satisfied, and matches
+                are ranked by how many. An observation that matches only some clues is still returned — a clue can be
+                wrong as easily as a digit. A clue iNaturalist cannot resolve appears in
+                <code class="font-mono">unusable_clues</code> and is dropped rather than failing the request.
+            </p>
+            <p>
+                <strong>Continuing a deep search.</strong> One request checks at most 10,000 observation numbers and
+                never starts a stage wider than 5,000 unasked, so it always answers well inside the HTTP timeout.
+                When there is more to do the response is <code class="font-mono">"status": "needs_confirmation"</code>
+                with a <code class="font-mono">resume</code> cursor and a <code class="font-mono">next_stage</code>
+                estimate. Send the cursor back to continue from exactly where it stopped — no observation number is
+                ever requested twice.
+            </p>
+            <pre class="bg-gray-100 dark:bg-journal-dark text-journal-dark dark:text-journal-cream text-xs p-3 rounded overflow-x-auto"><code>-d '{
+    "observation": "360934883",
+    "genus": "Beauveria",
+    "resume": "v1:3:0:1f4c9ab3",
+    "confirm": true
+  }'</code></pre>
+            <p class="text-xs text-gray-500 dark:text-gray-400">
+                <code class="font-mono">complete: false</code> means the search did not establish that the unchecked
+                candidates have no matches — either a batch failed, or it is waiting to be resumed. Check
+                <code class="font-mono">status</code> to tell those apart.
+            </p>
+            <p class="text-xs text-gray-500 dark:text-gray-400">
+                <strong>Single-criterion search</strong> is unchanged for existing integrations: send
+                <code class="font-mono">mode</code> and <code class="font-mono">term</code> for exactly one criterion
+                that every result must match, with <code class="font-mono">digits_off</code> defaulting to 1 and a
+                10,000-variation ceiling enforced before searching. Sending both <code class="font-mono">mode</code>
+                and clue fields is an HTTP 422.
             </p>
         </div>
     </div>

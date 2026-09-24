@@ -60,7 +60,7 @@ def _install_logging(app, under_gunicorn=False):
     from app.services.log_context import (
         ContextFormatter, ensure_root_level, install_console_logging,
         install_error_mirror, install_record_factory, install_rq_logging,
-        new_request_id,
+        install_scanner_log, new_request_id,
     )
 
     # Stamp context onto every record created anywhere in this process.
@@ -94,6 +94,21 @@ def _install_logging(app, under_gunicorn=False):
             install_error_mirror(errors_path)
         except OSError as exc:
             app.logger.warning("Could not open errors log %s: %s", errors_path, exc)
+
+    # Alan 9/12/26 - Internet-wide scanner sweeps get their own file so they
+    # stop crowding errors.log. Defaults beside the other logs; a failure to
+    # open it must never stop the app starting, and the classifier falls back
+    # to dropping those records rather than routing them to the root logger.
+    scanner_path = app.config.get(
+        "SCANNER_LOG_PATH",
+        os.path.join(os.path.dirname(str(errors_path)), "scanner.log")
+        if errors_path else None,
+    )
+    if scanner_path:
+        try:
+            install_scanner_log(scanner_path)
+        except OSError as exc:
+            app.logger.warning("Could not open scanner log %s: %s", scanner_path, exc)
 
     # Gunicorn already owns stdout/stderr for the web process and app.logger
     # already points at its handlers, so a console handler there would duplicate

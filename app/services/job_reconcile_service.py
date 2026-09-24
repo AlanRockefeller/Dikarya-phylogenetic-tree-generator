@@ -6,6 +6,7 @@ job terminal.  Reconciliation is intentionally conservative: automatic retry
 requires RQ's positive, persisted evidence of an unexpected workhorse death.
 """
 
+import json
 import logging
 from dataclasses import dataclass
 from datetime import datetime, timedelta
@@ -353,6 +354,18 @@ def reconcile_job_statuses(
             )
             raise
         logger.info("Reconciled %d job(s) from RQ into the database.", len(changed))
+        # Alan 9/23/26 - A job killed mid-run never reaches the task's own
+        # except block, so this is the ONLY place its failure is recorded. The
+        # count above was all that reached the logs, at INFO, which kept these
+        # jobs out of errors.log and the digest entirely. One WARNING per job,
+        # after the commit, so a rolled-back pass never reports a change.
+        for entry in changed:
+            logger.warning(
+                "event=job.reconciled_%s job_id=%s from_status=%s rq_status=%s "
+                "reason=%s",
+                entry["action"], entry["job_id"], entry["from_status"],
+                entry["rq_status"], json.dumps(str(entry.get("reason") or "")),
+            )
     else:
         # Alan 8/15/26 - Close the read transaction the Job.query above opened.
         #

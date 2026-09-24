@@ -116,8 +116,15 @@ def can_edit_whats_new():
     return bool(getattr(current_user, "is_admin", False))
 
 
-def require_whats_new_editor():
+def require_whats_new_editor(post_only=False):
     if not can_edit_whats_new():
+        abort(404)
+    if post_only and request.method != "POST":
+        # Flask answers a GET to a POST-only route with 405, and a 405 confirms
+        # the route exists. /whats-new/edit already 404s for everyone who is not
+        # an editor, so the add/edit/delete endpoints beside it were the ones
+        # telling scanners where to look -- they are probed regularly. Answer a
+        # GET the same way whether or not the caller could have posted.
         abort(404)
 
 
@@ -729,9 +736,9 @@ def whats_new_edit():
     )
 
 
-@bp.route('/whats-new/add', methods=['POST'])
+@bp.route('/whats-new/add', methods=['GET', 'POST'])
 def whats_new_add():
-    require_whats_new_editor()
+    require_whats_new_editor(post_only=True)
 
     from app.models import WhatsNewEntry
 
@@ -753,9 +760,9 @@ def whats_new_add():
     return redirect(url_for("main.whats_new_edit"))
 
 
-@bp.route('/whats-new/<int:entry_id>/edit', methods=['POST'])
+@bp.route('/whats-new/<int:entry_id>/edit', methods=['GET', 'POST'])
 def whats_new_update(entry_id):
-    require_whats_new_editor()
+    require_whats_new_editor(post_only=True)
 
     from app.models import WhatsNewEntry
 
@@ -779,9 +786,9 @@ def whats_new_update(entry_id):
     return redirect(url_for("main.whats_new_edit"))
 
 
-@bp.route('/whats-new/<int:entry_id>/delete', methods=['POST'])
+@bp.route('/whats-new/<int:entry_id>/delete', methods=['GET', 'POST'])
 def whats_new_delete(entry_id):
-    require_whats_new_editor()
+    require_whats_new_editor(post_only=True)
 
     from app.models import WhatsNewEntry
 
@@ -896,11 +903,23 @@ def job_viewer(job_id):
                 job_details.pop("mycomap_blast_url", None)
         except Exception:
             job_details.pop("mycomap_blast_url", None)
+
+    inat_source_url = job_details.get("inat_source_url")
+    if not inat_source_url and db_job and isinstance(db_job.metrics, dict):
+        inat_source_url = db_job.metrics.get("inat_source_url")
+    if inat_source_url:
+        from app.services.inaturalist_service import canonical_inaturalist_source_url
+        inat_source_url = canonical_inaturalist_source_url(inat_source_url)
+        if inat_source_url:
+            job_details["inat_source_url"] = inat_source_url
+        else:
+            job_details.pop("inat_source_url", None)
             
     # Hide the Claude review control entirely when no API key is configured,
     # rather than offering a button that can only ever answer 503.
     from app.services.tree_analysis_service import (
         is_configured as claude_review_enabled,
+        resolve_tree_generation_context,
         resolve_tree_support_context,
     )
 
@@ -915,11 +934,17 @@ def job_viewer(job_id):
             "tree_method": job_details.get("tree_method", "") or "",
             "alrt_only": False,
         }
+    try:
+        generation_details = resolve_tree_generation_context(job_dir, job_details)
+    except Exception:
+        logger.exception("Could not resolve generation details for job %s", job_id)
+        generation_details = {}
 
     return render_template(
         'job_viewer.html', job_id=job_id, job_details=job_details, view_only=view_only,
         claude_review_enabled=claude_review_enabled(),
         tree_support_context=tree_support_context,
+        generation_details=generation_details,
     )
 
 # /health moved to the monitoring blueprint (app/monitoring/routes.py) where

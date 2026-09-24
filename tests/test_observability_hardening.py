@@ -608,17 +608,28 @@ def test_failed_request_logging_skips_scanner_and_static_noise(tmp_path, clean_l
     assert "event=http.request_failed" not in capture.text
 
 
-def test_telemetry_csrf_rejection_is_logged_and_token_can_be_refreshed(
+def test_telemetry_is_accepted_without_a_csrf_session(
     tmp_path, clean_logging, no_telemetry_dedup
 ):
+    """A page that is already unloading cannot obtain a token.
+
+    The browser sends this with keepalive on unload, and in-app browsers hand
+    that request to a background network layer that drops the session cookie.
+    The POST was rejected and the document was gone, so the refresh-and-retry
+    below could not run -- losing exactly the report from the user whose page
+    had just broken. The endpoint is a write-only, rate-limited, whitelisted
+    log sink, so it takes the report instead.
+    """
     app = _make_app(tmp_path)
     app.config['WTF_CSRF_ENABLED'] = True
     capture = _Capture()
     logging.getLogger().addHandler(capture)
     client = app.test_client()
     payload = {'event': 'window_error', 'message': 'test failure'}
-    assert client.post('/api/log/client', json=payload).status_code == 400
-    assert 'reason=csrf_token_missing' in capture.text
+    assert client.post('/api/log/client', json=payload).status_code == 200
+    assert 'reason=csrf_session_missing' not in capture.text
+    assert 'reason=csrf_token_missing' not in capture.text
+    # The refresh endpoint stays, and still serves a usable token.
     refreshed = client.get('/api/log/client/csrf')
     assert refreshed.status_code == 200
     assert refreshed.headers['Cache-Control'] == 'no-store'

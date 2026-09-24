@@ -137,7 +137,7 @@ async function main() {
         throw new Error('A null observation matched in user mode');
     }
 
-    const criteriaCode = section('    async function resolveCriteria', '    function observationMatches');
+    const criteriaCode = section('    function unresolvableClue', '    // ---- section:matching ----');
     const lookupCalls = [];
     const criteriaContext = contextWith(criteriaCode, {
         apiGet: async (requestPath, params) => {
@@ -324,7 +324,7 @@ async function main() {
     }
 
     const describe = contextWith(
-        section('    function describeTaxonSuggestion', '    function closeSuggestions'),
+        section('    function describeTaxonSuggestion', '    function createTaxonAutocomplete'),
         {exports: 'describeTaxonSuggestion'},
     ).result.describeTaxonSuggestion;
     const milkcaps = describe({id: 54597, name: 'Lactarius', rank: 'genus', iconic_taxon_name: 'Fungi', preferred_common_name: 'Common Milkcaps'});
@@ -335,11 +335,34 @@ async function main() {
     }
     if (describe({id: 7}) !== 'taxon ID 7') throw new Error('A bare taxon was not described by its ID');
 
-    const runSearch = section('    async function runSearch', "    form.addEventListener('submit'");
-    const capCheck = runSearch.indexOf('variationEstimate > MAX_VARIATIONS');
-    const criteriaLookup = runSearch.indexOf('await resolveCriteria');
+    const manualSearch = section('    async function runManualSearch', '    // ---- section:auto-ui ----');
+    const capCheck = manualSearch.indexOf('variationEstimate > MAX_VARIATIONS');
+    const criteriaLookup = manualSearch.indexOf('await resolveCriteria');
     if (capCheck < 0 || criteriaLookup < 0 || capCheck > criteriaLookup) {
         throw new Error('Search does not enforce the variation cap before its first API lookup');
+    }
+
+    // The single-criterion search must keep its own behaviour now that auto mode
+    // is the default: one criterion, every result required to match it, and the
+    // historical up-front confirmation for a large search.
+    if (!manualSearch.includes('const mode = currentMode();')) {
+        throw new Error('Manual mode no longer reads the single-criterion mode radios');
+    }
+    if (!manualSearch.includes('total > LARGE_SEARCH_THRESHOLD')) {
+        throw new Error('Manual mode lost its large-search confirmation');
+    }
+    if (!manualSearch.includes('checkBatch(batch, lookupMode, criteria, search)')) {
+        throw new Error('Manual mode no longer filters each batch by its single criterion');
+    }
+
+    // Auto mode is what the page does when nothing is chosen, in both the markup
+    // and the script. Nothing else in this file would notice the default moving.
+    const template = fs.readFileSync(path.join(repo, 'app/templates/inat_finder.html'), 'utf8');
+    if (!/id="search-mode-auto"[^>]*checked/.test(template)) {
+        throw new Error('Automatic search is not the checked default in the template');
+    }
+    if (!/name="search-mode"[^>]*value="manual"/.test(template)) {
+        throw new Error('The manual single-criterion mode is no longer offered');
     }
 
     console.log('PASS iNat Finder browser regressions');

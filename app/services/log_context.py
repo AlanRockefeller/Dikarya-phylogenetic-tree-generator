@@ -3,6 +3,7 @@
 import contextvars
 import functools
 import hashlib
+import json
 import logging
 import os
 import re
@@ -29,6 +30,8 @@ _RELEASE_LOCK = threading.Lock()
 # handler this module installs is tagged and looked up before anything is opened.
 CONSOLE_MARKER = "_dikarya_console"
 ERROR_MIRROR_MARKER = "_dikarya_error_mirror"
+SCANNER_LOG_MARKER = "_dikarya_scanner_log"
+SCANNER_LOGGER_NAME = "dikarya.scanner"
 
 
 def _read_git_head(git_dir: Path) -> str:
@@ -389,6 +392,126 @@ def install_error_mirror(path, level=logging.WARNING) -> bool:
     return True
 
 
+# Alan 9/12/26 - RQ logs one "cleaning registries for queue: <name>" line per
+# worker per maintenance pass. run_worker_with_heartbeat() caps that interval at
+# MAX_RQ_MAINTENANCE_INTERVAL (120s) so an abandoned job is recovered promptly,
+# which means two workers x two queues emit these around the clock: they were
+# 400 of the 834 lines in worker.log, 48% of the file, and they say only that
+# the worker is alive -- which event=job.started and the heartbeat file already
+# say. They also dragged the digest's worker context coverage down to 60%,
+# because RQ's own records carry no job id, making the number read like lost
+# provenance rather than filtered noise.
+#
+# Dropped rather than downgraded to DEBUG: RQ builds the message with %-args, so
+# a DEBUG record still pays the format cost on every pass for something nothing
+# reads. A genuine maintenance *failure* is logged by RQ at WARNING or above and
+# is unaffected.
+_RQ_REGISTRY_NOISE_RE = re.compile(r"cleaning registries for queue")
+
+
+def _drop_rq_registry_heartbeat(record) -> bool:
+    """Filter: False drops RQ's periodic registry-cleaning INFO line."""
+    if record.levelno > logging.INFO:
+        return True
+    return _RQ_REGISTRY_NOISE_RE.search(str(record.msg)) is None
+
+
+# Alan 9/23/26 - run_phylo_job and run_recompute_job log their own failure
+# (event=job.failed with the traceback) and then re-raise so RQ marks the job
+# failed -- and RQ logs the same traceback again. That doubled errors.log and
+# made the digest count every failure twice. RQ's copy is dropped only for a
+# job whose failure this process has already logged; anything that fails
+# before reaching our handler keeps RQ's line, its only record.
+_SELF_REPORTED_FAILURES: set = set()
+_RQ_EXCEPTION_MSG_PREFIX = "Worker %s: job %s: exception raised while executing"
+
+
+def note_job_failure_logged(rq_job_id) -> None:
+    """Mark that this process has already logged ``rq_job_id``'s failure."""
+    if rq_job_id:
+        _SELF_REPORTED_FAILURES.add(str(rq_job_id))
+
+
+def _drop_rq_duplicate_failure(record) -> bool:
+    """Filter: False drops RQ's traceback for a failure we already logged."""
+    if record.levelno < logging.ERROR:
+        return True
+    if not str(record.msg).startswith(_RQ_EXCEPTION_MSG_PREFIX):
+        return True
+    args = record.args if isinstance(record.args, tuple) else ()
+    job_id = str(args[1]) if len(args) > 1 else ""
+    if job_id in _SELF_REPORTED_FAILURES:
+        _SELF_REPORTED_FAILURES.discard(job_id)
+        return False
+    return True
+
+
+def failure_message_field(exc, max_length: int = 300) -> str:
+    """The exception message as a quoted, single-line, sanitized log value."""
+    return json.dumps(sanitize_telemetry_text(str(exc), max_length=max_length))
+
+
+def install_scanner_log(path, level=logging.INFO) -> bool:
+    """Attach var/logs/scanner.log to the dedicated scanner logger, once.
+
+    Alan 9/12/26 - Internet-wide vulnerability sweeps are the bulk of this
+    host's 4xx traffic and none of it can succeed, but discarding it would lose
+    the history that makes a later targeted probe from the same IP readable.
+    It goes to its own file instead.
+
+    The logger does not propagate: the whole point is to keep this volume out
+    of errors.log, error.log and the worker console, so a root handler must
+    never see it.
+
+    Alan 9/14/26 - The level and propagate=False are set BEFORE the filesystem
+    work, not after it. They used to be the last two statements, so a read-only
+    or full var/logs raised OSError out of mkdir()/WatchedFileHandler() with the
+    logger still propagating and still handler-less -- the exact opposite of the
+    intended fail-safe, and the failure mode where it matters most: sweeps are
+    heaviest when something is already wrong. Configured this way the worst case
+    is that scanner records are dropped (logging's "no handler" path, silenced
+    by the NullHandler), never that tens of thousands of them land in
+    errors.log.
+
+    Idempotent: a second call with a handler already attached still re-asserts
+    the level and propagate=False, so a caller that reconfigured the root
+    logger in between cannot leave this one leaking.
+    """
+    from logging.handlers import WatchedFileHandler
+
+    scanner_logger = logging.getLogger(SCANNER_LOGGER_NAME)
+    scanner_logger.setLevel(level)
+    scanner_logger.propagate = False
+    # Without a handler, logging falls back to lastResort (stderr at WARNING).
+    # These records are INFO so lastResort would not print them, but a
+    # NullHandler makes the intent explicit and survives a level change.
+    if not any(isinstance(h, logging.NullHandler) for h in scanner_logger.handlers):
+        scanner_logger.addHandler(logging.NullHandler())
+
+    target = os.path.abspath(str(path))
+    already = _has_marked_handler(scanner_logger, SCANNER_LOG_MARKER) or any(
+        getattr(handler, "baseFilename", None) == target
+        for handler in scanner_logger.handlers
+    )
+    if already:
+        return False
+    Path(target).parent.mkdir(parents=True, exist_ok=True)
+    # Rotation is external (ops/logrotate/dikarya), same as the error mirror.
+    handler = WatchedFileHandler(target)
+    handler.setLevel(level)
+    handler.setFormatter(ContextFormatter(
+        "[%(asctime)s] [%(process)d] [%(levelname)s] [%(name)s] %(message)s"
+    ))
+    setattr(handler, SCANNER_LOG_MARKER, True)
+    scanner_logger.addHandler(handler)
+    return True
+
+
+def scanner_logger():
+    """The logger backing var/logs/scanner.log."""
+    return logging.getLogger(SCANNER_LOGGER_NAME)
+
+
 def install_rq_logging(level=logging.INFO) -> None:
     """Make sure RQ's own loggers emit at INFO through the root console path.
 
@@ -399,6 +522,15 @@ def install_rq_logging(level=logging.INFO) -> None:
     """
     for name in ("rq", "rq.worker", "rq.scheduler"):
         logging.getLogger(name).setLevel(level)
+    worker_logger = logging.getLogger("rq.worker")
+    if not any(
+        getattr(existing, "_dikarya_rq_noise", False)
+        for existing in worker_logger.filters
+    ):
+        setattr(_drop_rq_registry_heartbeat, "_dikarya_rq_noise", True)
+        worker_logger.addFilter(_drop_rq_registry_heartbeat)
+    if _drop_rq_duplicate_failure not in worker_logger.filters:
+        worker_logger.addFilter(_drop_rq_duplicate_failure)
 
 
 # --------------------------------------------------------------------------

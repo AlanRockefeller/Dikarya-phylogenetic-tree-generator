@@ -30,3 +30,25 @@ def _isolate_api_diagnostic_archives(tmp_path_factory):
         yield api_diagnostics.ARCHIVE_DIR
     finally:
         api_diagnostics.ARCHIVE_DIR = original
+
+
+@pytest.fixture(autouse=True, scope="session")
+def _isolate_inat_redis_keys():
+    """Keep tests off the production iNaturalist pacing, cooldown and caches.
+
+    Alan 9/23/26 - Those live in the same Redis the site uses. A synthetic 429
+    in a test started a real ten-minute cooldown that would have paused every
+    production bulk job, and each paced test took a real slot from live
+    traffic. Everything is moved under a test prefix for the run instead.
+    """
+    from app.services import inaturalist_tree_service as svc
+
+    names = ("_PACING_KEY", "_BULK_PACING_KEY", "_COOLDOWN_KEY", "_LOOKUP_CACHE_KEY")
+    original = {name: getattr(svc, name) for name in names}
+    for name, value in original.items():
+        setattr(svc, name, value.replace("dikarya:inat:", "dikarya:test:inat:", 1))
+    try:
+        yield
+    finally:
+        for name, value in original.items():
+            setattr(svc, name, value)

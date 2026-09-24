@@ -348,9 +348,27 @@ The tree viewer's **Analyze with Claude** button posts to
   for an unrecognised method, both take the same `alrt_only` flag (IQ-TREE run
   with `-alrt` and no `-B` writes single SH-aLRT values, not UFBoot ones), and
   both are run over `tests/fixtures/support_classification_cases.json` by
-  `tests/test_tree_analysis_metrics.py` — add a case there. The builder itself
+  `tests/test_tree_analysis_metrics.py` — add a case there. `iqtree_fast` is
+  declared `ALRT` outright rather than relying on that flag, because it can
+  never produce a UFBoot value. The builder itself
   is resolved once, by `resolve_tree_support_context()`, which is what fills
   `window.TREE_METHOD`; do not resolve it separately in the template.
+- **The `pipeline` block reports what the builder DID, not what was asked.**
+  Four fields are deliberately not bare numbers, and each has a matching
+  paragraph under "WHAT THE RUN ACTUALLY DID" in `SYSTEM_PROMPT`:
+  `substitution_model` is the model that was *fit* (`model_selected`), with the
+  request published beside it as `substitution_model_requested` only when the
+  two differ — citing the request reported "MFP", which names no model, and
+  called a GTR+G job GTR+G when it ran as GTR+F+G4. `tree_search` plus
+  `tree_search_note` declare a deliberately limited search; the note is written
+  self-contained so it still steers a review when the installed prompt copy is
+  older than the field. `bootstrap_replicates` is a sentence whenever the
+  builder did not run the requested count. For RAxML-NG, it reports the exact
+  number of replicate trees written and whether AutoMRE declared convergence;
+  old jobs recover both from `raxml_run.raxml.bootstraps` and `.log`.
+  `bootstrap_metrics` names every metric computed, but only the
+  first one's values are in the context, so the transfer-bootstrap numbers must
+  never be quoted.
 - **Bump `REVIEW_SCHEMA_VERSION`** whenever the prompt or the metric set changes
   in a way that makes an already-stored review misleading. Cached reviews at a
   different version are ignored rather than shown.
@@ -395,6 +413,9 @@ When a new CLI version is published:
 
 1. Compare the released CLI source, changelog, and tests with the browser port.
    Port the behavior intentionally rather than copying Python request/UI code.
+   **The upstream default branch is `Main`, with a capital M** — a `raw.
+   githubusercontent.com` fetch from `main` or `master` 404s. The vendored
+   `inat_finder.py` is 1.8.1 and byte-identical to `Main`.
 2. Preserve the browser security boundary: requests go directly from the browser
    to `https://api.inaturalist.org/v1`; Flask must not proxy or store searches.
 3. Keep API-derived DOM content on `textContent`/`createElement` paths, and retain
@@ -403,16 +424,204 @@ When a new CLI version is published:
 4. Update the version credited in the page footer only after the matching browser
    behavior has been implemented and checked. Update the focused Node coverage in
    `tests/js/inat_finder_variation_limit.test.js` for changed parsing, matching,
-   variation, or request behavior.
-5. Run `.venv/bin/python -m pytest tests/test_inat_finder.py`, run
-   `node --check app/static/js/inat_finder.js`, and spot-check the affected modes
-   against live iNaturalist API responses before deploying.
+   variation, or request behavior, and `tests/js/inat_finder_auto_mode.test.js`
+   for anything in the auto-mode ladder.
+5. **The auto-mode candidate ladder is pinned to the CLI by fixture.**
+   `tests/fixtures/inat_finder_candidate_parity.json` carries each stage's totals,
+   label and a SHA-256 of its *ordered* candidate sequence, generated from the
+   vendored `inat_finder.py` by `scripts/dikarya_export_finder_parity.py`. Order is
+   load-bearing, not incidental: a paused deep search continues from where it
+   stopped, so a JS plan that yields the same set in a different order silently
+   skips or repeats candidates. After syncing `inat_finder.py`, re-run the export
+   and expect `app/static/js/inat_finder.js` to change in the same commit if the
+   hashes move — `tests/test_inat_finder.py` fails if the fixture and the vendored
+   CLI disagree.
+6. The browser sections the Node harnesses slice are delimited by
+   `// ---- section:<name> ----` banners in `inat_finder.js`. Renaming one breaks
+   the harness with "Finder section was not found", so move the banner with the
+   code rather than deleting it.
+7. Run `.venv/bin/python -m pytest tests/test_inat_finder.py`, run
+   `node --check app/static/js/inat_finder.js` and
+   `npx --no-install eslint app/static/js/inat_finder.js`, and spot-check the
+   affected modes against live iNaturalist API responses before deploying.
 
 - Flask app factory in `app/__init__.py`; extensions initialized in `app/extensions.py`.
 - All API responses use JSON; the frontend is a SPA-style UI talking to `/api/` endpoints.
 - FASTA sequence headers are sanitized on input and restored on download/display (see `fasta_utils.py`).
 - RAxML-NG jobs use named presets (`fast_good`, `standard`, `publication`, `maximum`) defined in `tree_builder_service.py`.
-- Job IDs are UUIDs; always validate with regex before using in file paths.
+- **`MAFFT_DIRECTION_MODE` chooses which direction check the normal alignment
+  runs**: `fast` (`--adjustdirection`, the default), `accurate`
+  (`--adjustdirectionaccurately`) or `off` (no flag). It is validated at import
+  time and an unrecognised value falls back to `fast` with a warning -- never
+  to `off`, which would silently disable direction correction. It does not
+  override the per-job `fix_orientation` setting: false there still means no
+  direction flag whatever the mode is. `accurate` exists so the change can be
+  rolled back in production by setting one environment variable, without a
+  deploy. Deliberately scoped to `_run_mafft()`; `fix_direction_with_mafft()`,
+  the direction-only pre-pass MUSCLE/Clustal Omega/IQ-TREE depend on, stays on
+  the accurate check because there MAFFT's answer is the only direction signal
+  there is. Every invocation logs `event=alignment.mafft_completed` with its own
+  elapsed time, `outcome` (`success`/`failed`) and `_R_` count. Emitted from a
+  `finally` around the subprocess only, so: a veto rerun is measured
+  separately; a run that times out having produced nothing -- the one whose
+  duration matters most -- is still recorded as `outcome=failed`; a MAFFT run
+  whose `_R_` markers then fail to parse is recorded as `outcome=success` with
+  `aligner_reversed_count=unknown` (never `0`, which would read as "reversed
+  nothing"); and a `publish_command` failure records nothing, because MAFFT
+  never started.
+- **ORIENT-vs-MAFFT disagreement is header-matched, not count-matched.** MAFFT
+  names the records it reversed through its `_R_` headers, so the disagreement
+  is `flipped - orient_uncertain - orient_never_saw` over sets, published as
+  `aligner_reversed_count` / `orient_uncertain_count` /
+  `aligner_orientation_disagreement_count`. Only a genuine contradiction is a
+  `DEGRADED`; a flip of a record ORIENT declined to call is an INFO line. When
+  the ORIENT headers were not persisted the answer is reported as unknown
+  (`disagreement=None`, `basis=counts`) rather than guessed from two totals.
+- **Quick Tree refuses individual sequences over
+  `QUICK_TREE_MAX_SEQUENCE_BP` (10,000 bp).** The constant and the
+  preset-detection live in `app/services/tree_parameter_validation.py`; the
+  browser mirrors it in `sequence_entry.html` and the two are asserted equal by
+  `tests/test_quick_tree_limits.py`. Which submissions are capped is decided by
+  the explicit `submission_mode` the Tree Builder posts -- both Quick Tree
+  buttons send `"quick_tree"`, the advanced form sends `"advanced"` -- with an
+  exact match of `QUICK_TREE_PRESET` as the fallback for a body that carries no
+  marker, or one nobody recognises (a cached page, a script, a typo -- falling
+  back rather than failing open is deliberate, since a mistyped marker would
+  otherwise switch the guardrail off silently). Only an explicit `"advanced"`
+  opts out. "Uses the preset's tree method" is **not** the test: a
+  deliberate limited IQ-TREE + MUSCLE + no-trimming request is an advanced
+  submission, and the advanced form can reproduce the preset's four values by
+  hand, which is why the marker exists.
+
+  **It is a guardrail, not an abuse boundary.** A caller who declares
+  `advanced` is not capped, deliberately: the advanced builder has always
+  accepted a 150 kb locus, so declaring advanced mode opens nothing that was
+  not already open. What the cap prevents is the accident -- a genome pasted
+  into the two-click preset meant for barcode reads. A real ceiling on pipeline
+  cost would have to be tied to the work itself (total bases x sequence count
+  against the aligner that will run), not to which button was pressed. The v1
+  API is untouched.
+- **Quick Tree runs `iqtree_fast`, not FastTree.** Since 2026-09-17 the preset
+  is IQ-TREE 3 `-n 5 --alrt 1000` under a fixed GTR+G, run by `_run_iqtree(…,
+  fast=True)` — on real job alignments it finds trees 10 to 200 log-likelihood
+  units better than FastTree at the same wall time (2-40 s). Node labels are
+  SH-aLRT **percentages (0-100)**, not FastTree's 0-1 SH-like values, so a
+  reader who assumes the old scale is off by two orders of magnitude.
+  `fasttree` remains a selectable advanced method and is unchanged.
+- **Quick Tree deliberately omits UFBoot.** `_run_iqtree` forces `bootstrap = 0`
+  in Quick Tree mode rather than trusting the caller, and the SH-aLRT count is the fixed
+  `IQTREE_FAST_ALRT_REPLICATES` rather than `params.alrt_replicates`, because
+  the preset has no support control to read one from.
+- **Quick Tree sends no `bootstrap`.** Neither engine can run one: FastTree
+  ignores it (`_run_fasttree` hardcodes `-boot FASTTREE_SH_RESAMPLES`, which is
+  SH-like local support, not bootstrap proportions) and the `iqtree_fast`
+  preset omits it. `tree_builder_service` records `bootstrap: None` for
+  both, with `support_type: "sh_like"` and `"alrt"` respectively. `create_job`
+  drops an unsent bootstrap for either method rather than persisting the
+  generic 1000 default; an explicitly submitted one is still stored.
+- **The IQ-TREE binary is `/usr/local/bin/iqtree3` (3.1.4).** `/usr/bin/iqtree2`
+  is 2.0.7 and must not be used. `_run_iqtree` uses the version 3 spellings
+  (`-T`, `--prefix`, `--seed`, `--redo`, `-B`, `--alrt`); 3.1.4 still accepts
+  the 2.x short forms but nothing here should. Every place that normalises
+  `iqtree2` to `iqtree` also normalises `iqtree3`: the method maps in
+  `tree_analysis_service.py` and `tree_viewer_phylotree_v2.js`, and the tool
+  regex in `security_events.py`. A non-fast run always pairs `-B` with
+  `--bnni`, recorded as `bnni: true`.
+- **RAxML-NG bootstrapping computes two support metrics, not one.**
+  `_get_raxml_cmd` passes `--bs-metric fbp,tbe`, so RAxML writes
+  `<prefix>.raxml.supportFBP` and `.supportTBE` and **no** bare
+  `.raxml.support`. The Felsenstein tree is the one served as
+  `tree_original.newick`, so the viewer's Bootstrap badge still means what it
+  always did; the transfer-bootstrap tree is copied beside it as
+  `tree_original_tbe.newick` (`tree_pruned_tbe.newick` after a recompute) and
+  nothing displays it by default. `tree_metadata.json` records
+  `bootstrap_metrics: ["fbp", "tbe"]` and `tbe_tree`. The bare `.raxml.support`
+  name is kept as a fallback for a binary that ignores the flag — do not delete
+  that branch. **The two files are on different scales**: RAxML writes FBP as a
+  percentage (`93`) and TBE as a proportion (`0.930000`), so anything that ever
+  displays the TBE tree must say which it is rather than reusing the bootstrap
+  badge's reading.
+- **GenBank accession policy lives in `fasta_utils.GENBANK_ACCESSION_RE`.** The
+  large-scale INSDC families (WGS contigs, TSA transcripts, TLS targeted-locus
+  records) share one accession structure and the string does not say which is
+  which, so Dikarya accepts the syntax rather than the family -- NCBI runs TLS
+  projects for ITS/ITS2, so an individual TLS record is often exactly what this
+  app is for. The real shapes are 4 letters + 8-10 digits and 6 letters + 9-11
+  digits (project code + 2-digit assembly version + contig digits); the
+  intermediate counts are valid and were previously rejected.
+  `_NON_INSDC_LARGE_SCALE_PREFIXES` excludes `INAT` by name, because "iNat" + 9
+  digits is shape-identical to a 4+9 accession and 318,227 records on disk are
+  exactly that against three real large-scale accessions ever submitted.
+  `is_insdc_master_accession()` recognises a project/master record
+  syntactically (every digit after the assembly version is zero); those carry no
+  sequence and are refused at the accession entry points with an explanation
+  rather than failing later as "NCBI could not resolve this". Per-sequence size
+  is bounded by the existing `MAX_CUSTOM_GENBANK_SEQUENCE_BP`, applied on both
+  user-facing accession paths -- no accession-family-specific limit.
+- **`MO123456` is ambiguous and dedup is destructive.** "MO" is a real INSDC
+  prefix, so the compact token is both a Mushroom Observer tip label and a
+  valid 2+6 accession. `extract_mycomap_observation_reference(...,
+  allow_compact_mo=False)` suppresses only that form; `mo:123456`, `MO #123456`,
+  a mushroomobserver.org URL and the spelled-out site name have no accession
+  shape and are always honoured, including inside a GenBank record's
+  qualifiers. `sequence_dedup_service.record_provenance()` decides which to use
+  from `source`/`hit_source` metadata, falling back to the version suffix
+  (`MO123456.1` is GenBank; a Mushroom Observer label never carries one).
+  `record_accession()` uses the same rule, so a MycoMap local hit's `MO######`
+  internal id is never sent to NCBI as an accession.
+- **`observation_reference_from_record()` refuses to guess.** It reads every
+  trusted field (DEFINITION plus the `OBSERVATION_QUALIFIERS`) and uses the
+  answer only when they agree on exactly one observation; two distinct
+  references log `event=dedup.genbank_reference_ambiguous` and yield nothing.
+  "Distinct" is counted *within* a field as well as across fields, via
+  `extract_mycomap_observation_references()` (plural) -- a single `/note`
+  reading "sequenced from iNat 280384724; compare iNat 999999999" is exactly
+  as undecidable as two fields disagreeing. The whole-record blob is a
+  fallback, never an override, and is held to the same rule. The singular
+  `extract_mycomap_observation_reference()` stays on the per-record hot path
+  and short-circuits; the two share one set of patterns and a test asserts
+  `plural[0] == singular`.
+- **The observation dedup's NCBI lookup runs in the worker, not in the
+  request.** `dedupe_by_observation` / `apply_observation_dedup` default to
+  `resolve_genbank_references=False`; `prepare_phylo_job_params` (which runs
+  inside `POST /api/job`) keeps the offline grouping and `run_phylo_job` does
+  the resolving pass before the INPUT step. `record_dedup_details` accumulates
+  across passes, so the second pass cannot erase the first pass's removed
+  records -- which the "rebuild including duplicates" action needs.
+
+  **Anything that removes records must then call `apply_input_warnings()`**
+  (`app/workers/queue.py`). The degenerate-input warnings depend on the record
+  count and quote it in their text, so a pass that collapses three records to
+  two both earns a warning and invalidates any existing one. The worker
+  refreshes `job_params` *and* the `Job.metrics` copy, because
+  `app/main/routes.py` renders the status page from the latter.
+- **Job IDs come in two shapes and both stay valid forever.** Jobs minted
+  before 2026-09-09 are UUID4; new ones are a short lowercase base36 string
+  (`/job/aq7c/view`), minted by `generate_job_id()` in
+  `app/services/job_id_service.py`. Nothing rewrites the ~11.6k UUID jobs on
+  disk. Always validate with `validate_job_id()` before using an id in a file
+  path — it accepts both and admits neither a dot nor a slash. The JS mirror is
+  `JOB_ID_RE` in `sequence_entry.html`; change the two together.
+  `generate_job_id()` starts at 4 characters and widens on its own once a
+  length gets crowded, so never assume a fixed length.
+- **Every path that creates a job must mint through `generate_job_id()`.**
+  There are five, not one: `create_job` and the duplicate-rebuild endpoint in
+  `app/api/routes.py`, `app/api_v1/routes.py`, and the iNat and Mushroom
+  Observer preparation flows in `inaturalist_tree_service.py` /
+  `mushroom_observer_service.py`. A path still calling `uuid.uuid4()` keeps
+  handing out long URLs and nothing fails, so the miss is invisible until
+  someone reads a URL -- which is how the iNat flow shipped long ids after the
+  other three were converted. `enqueue_mycomap_blast_refresh_job()` in
+  `workers/queue.py` deliberately keeps a UUID: that id is an internal RQ
+  handle, never a job directory or a URL.
+- **Job ids are not treated as secrets.** A short id is guessable (36**4 =
+  1.7M at 4 characters), and that is a deliberate, accepted trade for short
+  links: there is no guess-rate limit on the job surface, and `_job_ref()` in
+  `app/monitoring/services.py` publishes an 8-character prefix on the
+  unauthenticated monitoring views as it always has. Do not add hashing or
+  throttling back on the theory that an id is a capability token. The rest of
+  the monitoring rules still hold -- no sequence headers, notes, outgroup or
+  other submission-derived text on those views.
 - **Never call `Phylo.write()` for a file under `var/jobs/<id>/tree`.** Use
   `write_tree_file()` from `app/services/tree_io.py` (still re-exported from
   `tree_edit_service.py`). Biopython gets *two* things wrong here:
@@ -502,7 +711,179 @@ journal, including sshd auth records). Use these instead, in this order:
 | Per-job pipeline detail | `var/jobs/<id>/logs/{pipeline,alignment,tree_builder}.log` | yes |
 | Gunicorn access/errors | `var/logs/{access,error}.log` | yes |
 | Worker app output | `var/logs/worker.log` (phylo_high), `var/logs/worker-bulk.log` (phylo_bulk) | yes |
+| Internet-wide scanner sweeps | `var/logs/scanner.log` | yes |
 | Unit lifecycle, OOM kills, start failures | journal, via the wrapper below | wrapper only |
+
+**Nothing in `var/logs/` is deleted any more.** `ops/logrotate/dikarya` used to
+say `rotate 14` with `maxage 30`, and `rotate 14` was what actually bound: every
+stem kept 14 rotations plus the live file, which came to 13 days rather than the
+30 the `maxage` implied, because `maxsize 25M` makes a busy day rotate twice and
+burn two slots. Thirteen days of *all* of these logs was 3.2 MB compressed
+against a 5.3 GB `var/jobs`, so the retention bought nothing and cost history --
+`errors.log` alone is 2.8 KB/day, about 1 MB/year. `rotate` is now set past any
+reachable value and `maxage` is gone. `var/metrics/system_metrics.jsonl` still
+ages out at 30 days on purpose: it is machine telemetry nothing reads back, not
+a record of what happened.
+
+### Scanner noise vs probes aimed at this app
+
+About two thirds of this host's requests are 4xx, and nearly all of that is
+internet-wide vulnerability sweeps. `app/services/security_events.py` splits
+them, and `classify_request_failure()` is the single place that decides:
+
+- **scanner** -- a probe for software this host does not run (`/.env`,
+  `/.git/config`, `/wp-admin/...`) or a verb it does not serve. The HTTP method
+  reaches `classify_request_failure()` intact (bounded and stripped to A-Z by
+  `normalize_method()`, never renamed), so `PROPFIND`, `TRACE` and `CONNECT`
+  are reported as `reason=unsupported_method` rather than all collapsing into
+  one anonymous bucket -- the verb is the sweep signature. The verb is checked
+  before the status, because a PROPFIND sweep answers 405 on nearly every path
+  it tries. A scanner classification is filed to `var/logs/scanner.log`
+  whether or not a Flask route matched; a matched route still keeps its
+  ordinary `http.request_failed` line. Written to `var/logs/scanner.log`
+  as `event=security.scanner` on the `dikarya.scanner` logger, which has
+  `propagate = False` so this volume can never reach `errors.log` or the worker
+  console. Kept rather than dropped: a sweep is evidence when the same IP later
+  does something targeted.
+- **targeted** -- someone mapping *this* application: path traversal, a null
+  byte, an injection marker, a malformed job id, or an unmatched path under
+  `/api/` or `/admin/`. Logged at WARNING as `event=security.suspicious`, so it
+  lands in `errors.log`. Find them with
+  `grep security.suspicious var/logs/errors.log`, or read the digest's
+  "App-targeted probes" section.
+- **neither** -- an ordinary user 4xx keeps its existing
+  `event=http.request_failed` line, unchanged.
+
+`install_scanner_log()` sets the logger's level and `propagate = False`
+**before** it touches the filesystem, and re-asserts them on an already
+configured logger. They used to be the last two statements, so a read-only or
+full `var/logs` raised `OSError` out of `mkdir()` with the logger still
+propagating and handler-less -- every scanner record then fell through to the
+root logger, which is the WARNING+ `errors.log` mirror. That is the opposite of
+the intended fail-safe, and it fires exactly when it hurts most.
+
+The digest counts a `security.suspicious` record **once**, in the App-targeted
+probes section. It used to fall through into the generic exception tally as
+well, where `meaningful_error_key()` rendered it as an unreadable
+`event=security.suspicious method=<...>` row that crowded out real failures.
+
+### Behaviour scoring: catching someone who is good at this
+
+Everything above judges one request by its URL, which is why it catches sweeps
+and would never catch anyone competent. Somebody who reads `openapi.json`,
+notices job ids are four base36 characters and starts walking
+`/api/job/<id>/download/alignment` sends requests that are individually
+indistinguishable from a real user's. Three mechanisms cover that, and the
+first two share one Redis window (the same short-timeout client the
+missing-route gate uses, so a wedged Redis costs 100ms, never a request):
+
+**`app/services/security_actors.py` scores the actor, not the request.** Each
+signal is worth little once and a lot repeated -- that is what `free` encodes,
+the allowance that scores nothing because that many is ordinary use. One user
+hits one missing job; nobody hits nine. One `WARNING`
+(`event=security.actor_escalated`) fires when the total crosses
+`ESCALATION_THRESHOLD`, then that actor is silent for an hour.
+
+- Actors are scored per **network** (/24 or /64), not per address, because
+  rotation is free otherwise. The exact addresses ride along as the
+  zero-weight `client_ips` signal. A large NAT is therefore one actor: accepted,
+  since the line is a WARNING whose evidence names the addresses.
+- `api_surface_probe` and `admin_probe` **no longer WARN individually** -- they
+  fired 61 times in one ordinary day, essentially all `.env` hunting. They are
+  weight-1 with a hard cap, arranged so both saturated together stay *below*
+  the threshold: a dumb sweep can never escalate on volume alone.
+- An escalation line carries signal **counts only**. No path, no query, no
+  agent string -- same rule as the monitoring views.
+- **A new signal must define `free` deliberately.** `free=0` means "one
+  occurrence is an attack", which is true of a honeytoken and false of almost
+  everything else. Getting that wrong is how this becomes noise again.
+
+**`app/services/security_path_crowd.py` decides what is boring by counting who
+asks.** A path requested by ≥`DICTIONARY_CLIENTS` unrelated clients is sweep
+vocabulary by definition (`/api/.env` came from nine in a day) and scores
+nothing; a path requested by exactly one client, ever, that also looks like
+this app's surface, is a guess about *us* and scores. A scanner cannot produce
+a singleton, because its dictionary is shared with every other scanner on the
+internet. Paths are normalised (ids and digit runs collapsed) and stored only
+as a hash. Without Redis the verdict is `emerging` -- no opinion, never
+`singleton`, so the failure mode is quiet rather than accusatory.
+
+**`app/services/security_honeytokens.py` plants paths that exist only in our
+own output.** A scanner's dictionary was fixed before it ever contacted this
+host, so it cannot ask for something it learned here. Three today: a
+`Disallow:` line in `robots.txt`, a decoy job id in a `job_viewer.html`
+comment, and a deprecated stub in the OpenAPI document. Each is published in
+exactly one place, answers an ordinary 404 so a prober cannot tell it tripped
+one, and escalates on its own. `DECOY_JOB_ID` is in
+`job_id_service.RESERVED_JOB_IDS` and **must stay there** -- minting it for a
+real job would report that job's visitors as attackers.
+`tests/test_security_honeytokens.py` asserts both the reservation and that each
+token is still planted where it is published; a removed plant is a tripwire
+that silently stops working.
+
+### Attacks aimed at Dikarya specifically
+
+Four reason codes exist for attacks on *this* app rather than on whatever
+answers on port 443, and all four WARN immediately:
+
+- `path_traversal_app_surface` -- traversal that starts from a job artifact
+  route rather than the site root. A sweep asks every host for `/etc/passwd`
+  (still reported, as plain `path_traversal`); only someone who has looked at
+  Dikarya climbs out of `/job/<id>/download/`.
+- `artifact_path_probe` -- a request naming the on-disk layout
+  (`input_info.json`, `tree_state.json`, `var/jobs/...`). Those names are in
+  this repository and in no scanner dictionary anywhere.
+- `tool_exploit_probe` -- a request naming the binaries the pipeline executes
+  (MAFFT, RAxML-NG, IQ-TREE, trimAl, MrBayes, BLAST) or shaped like an attempt
+  to smuggle an argument into one. This is the part of Dikarya that actually
+  runs things.
+- `path_escape_refused` / `argument_injection_refused` -- reported by the code
+  that **refused** the attempt, not by reading a URL. The attacks that matter
+  most here are invisible in the request line: a path that only turns out to
+  escape `var/jobs` once resolved, a symlink planted in a job directory, a
+  model string that would have reached a RAxML `--model` argv as a flag.
+
+The last two are why `note_attack_attempt()` and
+`note_tool_argument_refusal()` exist in `request_diagnostics.py`. Anything that
+refuses a weaponized value calls one of them; inside a request it becomes an
+actor signal, and in the worker (where there is no actor) it is written
+straight out as a WARNING with the job and user from the log context. Two rules:
+
+- **The artifact and toolchain checks only run on an UNMATCHED path.** Real
+  routes legitimately carry these words -- `/job/<id>/download/mrbayes` is a
+  download, `/files/<path:filename>` serves arbitrary names -- so testing a
+  matched route would report the app's own traffic as an attack.
+- **Report the attempt, not the typo.** `looks_weaponized()` in
+  `security_events.py` is the line: a leading dash, a shell metacharacter, a
+  traversal sequence, a path separator outside a RAxML brace block. A
+  misspelled model name is a user mistake and must stay silent, or the signal
+  is worthless. Validators refuse plenty of ordinary errors.
+
+Three rules when editing this:
+
+- **A plain 401/403 on a real route is not a targeted signal.** It is almost
+  always an ordinary authorization outcome, and an earlier version that treated
+  it as one also *replaced* the normal `http.request_failed` record, so its
+  developer reason code (`scope_required`, `csrf_token_missing`) never reached
+  any log. The security record only ever adds; it must never short-circuit the
+  ordinary diagnostics for a matched route.
+- **A valid-shaped job id that 404s is not a probe.** Ids are short and
+  guessable by design (see the job-id conventions above); only an id
+  `validate_job_id()` refuses is worth reporting.
+- **The query string is classified but never logged.** It carries sequence text
+  and search terms. Only `request.path` is written, scrubbed of control
+  characters so an attacker-controlled path cannot inject a log line.
+
+The scanner path lists live in `security_events.py` and
+`scripts/dikarya_log_digest.py` imports them, so the digest's idea of noise and
+the app's cannot drift. The module is deliberately free of Flask imports to keep
+that import safe.
+
+**RQ's `cleaning registries for queue` heartbeat is filtered out** in
+`install_rq_logging()`. It was 400 of 834 lines in `worker.log` -- 48% of the
+file -- said only that the worker was alive, and dragged the digest's worker
+context coverage down to 60% because RQ's own records carry no job id. A real
+maintenance failure logs at WARNING and is unaffected.
 
 **Start with `errors.log`, not `error.log`.** Despite its name, `error.log` is
 Gunicorn's combined stream and runs ~98% INFO — real failures are buried in it.
@@ -647,6 +1028,10 @@ journal means a deliberate restart, not a crash.
 Note that a web or worker **restart produces a brief 502** while Gunicorn is
 down (~3-4 seconds). A 502 that succeeds on retry, with a matching
 `Stopping...`/`Started` pair in the journal, is a restart window and not a bug.
+That window stays short only because `post_worker_init` in `gunicorn.conf.py`
+makes SIGTERM raise `sse_registry.begin_shutdown()`, which closes open SSE
+streams at once. The master closes its listener *before* draining workers, so
+without it every restart was a full 30s (`graceful_timeout`) of site-wide 502s.
 
 **Worker and metrics processes get their stdout/stderr handlers from
 `app._install_logging()`, not from `logging.basicConfig()`.** The root logger
@@ -678,16 +1063,18 @@ rendered by one JavaScript renderer fed by `/health/jobs`, from an inline
 snapshot on first paint and from a 5-second poll after that, so the two views
 cannot drift apart.
 
-**The page and `/health/jobs` are unauthenticated, and a job UUID is a
-capability token** — `check_job_access(mode="view")` opens the tree for anyone
-holding it. So nothing here may emit a full job id (`_job_ref()` truncates to
-8 characters, which is a label, not a key), and nothing may emit anything
-derived from a submission: no sequence headers, no notes, no `outgroup`, no
-file contents. Options come from `PUBLIC_JOB_OPTION_KEYS`, a whitelist rather
-than a filter, because `input_info.json` holds the submitter's own text right
-beside them; progress lines are matched by regexes that capture numbers only,
-because the tool logs they come from also contain taxon labels. Keep new
-fields on that side of the line.
+**The page and `/health/jobs` are unauthenticated, so nothing here may emit
+anything derived from a submission**: no sequence headers, no notes, no
+`outgroup`, no file contents. Options come from `PUBLIC_JOB_OPTION_KEYS`, a
+whitelist rather than a filter, because `input_info.json` holds the submitter's
+own text right beside them; progress lines are matched by regexes that capture
+numbers only, because the tool logs they come from also contain taxon labels.
+Keep new fields on that side of the line.
+
+The job id itself is **not** on that list — ids are not treated as secrets here
+(see the job-id conventions above). `_job_ref()` still truncates to 8
+characters, but that is a display choice that keeps the table readable, not a
+security boundary, so emitting a full id would be untidy rather than a leak.
 
 A queued job has no job directory yet — the worker creates it — so its summary
 falls back to the description RQ already stored, which `safe_job_description()`

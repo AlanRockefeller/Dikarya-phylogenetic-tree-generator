@@ -112,6 +112,9 @@
         _resizeObs: null,
         // Alan 8/4/26 - Current width of the names column, in px; driven by the splitter.
         namesWidth: NAMES_DEFAULT_WIDTH,
+        // Alan 9/9/26 - Clade-highlight colour per alignment row name, mirrored from the tree
+        // viewer's painted bands. Empty when nothing is highlighted.
+        tipHighlights: new Map(),
     };
 
     // Alan 8/4/26 - Read the persisted names-column width; ignore anything absurd.
@@ -352,6 +355,70 @@
         const shorter = preferred.length <= rowName.length ? preferred : rowName;
         const longer = preferred.length <= rowName.length ? rowName : preferred;
         return longer.startsWith(shorter + ' ');
+    }
+
+    // Alan 9/9/26 - Read the clade-highlight colours the tree viewer just painted and key them
+    // by the names this alignment actually holds. Names usually match the tree's tip ids
+    // exactly; where an alignment row carries only an accession and the tree label is fuller
+    // (or the other way round) we bridge them at a token boundary, the same rule the focal-tip
+    // marker uses, so a shared leading genus cannot colour an unrelated row.
+    function loadTipHighlights() {
+        const map = new Map();
+        const viewer = window.dikaryaViewer;
+        let styles = null;
+        try {
+            styles = viewer && typeof viewer.getTipHighlightStyles === 'function'
+                ? viewer.getTipHighlightStyles() : null;
+        } catch (e) {
+            styles = null;
+        }
+        state.tipHighlights = map;
+        if (!styles || !styles.size) return;
+
+        const rowNames = state.sequences.map(r => normalizeTipName(r.name)).filter(Boolean);
+        for (const [tipId, style] of styles) {
+            const tip = normalizeTipName(tipId);
+            if (!tip || !style || !style.color) continue;
+            let matched = false;
+            for (const rowName of rowNames) {
+                if (rowName === tip) {
+                    map.set(rowName, style);
+                    matched = true;
+                    break;
+                }
+            }
+            if (matched) continue;
+            for (const rowName of rowNames) {
+                if (map.has(rowName)) continue;
+                const shorter = tip.length <= rowName.length ? tip : rowName;
+                const longer = tip.length <= rowName.length ? rowName : tip;
+                if (longer.startsWith(shorter + ' ')) {
+                    map.set(rowName, style);
+                    break;
+                }
+            }
+        }
+    }
+
+    // Alan 9/9/26 - Parse the tree's own hex colour into rgba at the band's opacity, so the
+    // name background is literally the same wash as the band rather than a lookalike.
+    function highlightBackground(style) {
+        const hex = String(style && style.color || '').trim();
+        const m = /^#?([0-9a-f]{6})$/i.exec(hex) || /^#?([0-9a-f]{3})$/i.exec(hex);
+        if (!m) return null;
+        let digits = m[1];
+        if (digits.length === 3) digits = digits.split('').map(c => c + c).join('');
+        const r = parseInt(digits.slice(0, 2), 16);
+        const g = parseInt(digits.slice(2, 4), 16);
+        const b = parseInt(digits.slice(4, 6), 16);
+        const opacity = typeof style.opacity === 'number' && style.opacity >= 0 && style.opacity <= 1
+            ? style.opacity : 0.18;
+        return `rgba(${r}, ${g}, ${b}, ${opacity})`;
+    }
+
+    function highlightForRow(row) {
+        if (!state.tipHighlights.size || !row) return null;
+        return state.tipHighlights.get(normalizeTipName(row.name)) || null;
     }
 
     function sortRows(rows) {
@@ -764,6 +831,18 @@
             nameText.title = isRef
                 ? `${row.name}\n(reference — click to compare to the consensus again)`
                 : `${row.name}\nClick to use as the reference sequence`;
+            // Alan 9/9/26 - Back the name with its clade's highlight colour. Written inline
+            // from the tree's own resolved colour and opacity, the same way the bands are, and
+            // full row height so consecutive members read as one band rather than as pills.
+            const highlight = highlightForRow(row);
+            const background = highlight ? highlightBackground(highlight) : null;
+            if (background) {
+                nameText.classList.add('av-name-highlighted');
+                nameText.style.backgroundColor = background;
+                if (highlight.label) {
+                    nameText.title += `\nClade annotation: ${highlight.label}`;
+                }
+            }
             div.appendChild(nameText);
             if (showScores && typeof row.__score === 'number') {
                 const score = document.createElement('span');
@@ -1032,6 +1111,9 @@
             // Alan 5/12/26 - Reset skeleton so dimensions match the new data.
             state._dom = null;
             renderWarnings();
+            // Alan 9/9/26 - Pick up the tree's clade-highlight colours for the freshly loaded
+            // row set, before anything paints the names column.
+            loadTipHighlights();
             pickInitialReference();
             populateReferenceSelector();
             renderAlignmentGrid();

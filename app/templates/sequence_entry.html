@@ -69,6 +69,75 @@
         line-height: 1.1;
     }
 
+    /* Alan 9/12/26 - Segmented source selector for the single Add Sequences
+       box. Six sources share one card; only the selected panel is shown. */
+    .source-segmented {
+        background: rgba(0, 0, 0, .18);
+        border: 1px solid var(--line);
+        border-radius: 6px;
+        display: flex;
+        flex-wrap: wrap;
+        gap: 2px;
+        margin-bottom: 20px;
+        padding: 3px;
+    }
+
+    .source-segment {
+        align-items: center;
+        background: none;
+        border: 0;
+        border-radius: 4px;
+        color: var(--text-mute);
+        cursor: pointer;
+        display: flex;
+        flex: 1 1 auto;
+        font-family: var(--sans);
+        font-size: 13px;
+        font-weight: 600;
+        gap: 7px;
+        justify-content: center;
+        padding: 9px 12px;
+        transition: background-color .15s ease, color .15s ease;
+        white-space: nowrap;
+    }
+
+    .source-segment > i {
+        font-size: 12px;
+        opacity: .85;
+    }
+
+    .source-segment:hover {
+        color: var(--text);
+    }
+
+    .source-segment:focus-visible {
+        outline: 2px solid var(--journal-gold);
+        outline-offset: -2px;
+    }
+
+    .source-segment[aria-selected="true"] {
+        background: linear-gradient(180deg, #2c4a36 0%, #243d2d 100%);
+        box-shadow: inset 0 1px 0 rgba(255, 239, 194, .08);
+        color: #f7faf8;
+    }
+
+    .source-panel[hidden] {
+        display: none;
+    }
+
+    /* Below the icon+label pair stops fitting on one row; drop the icons and
+       let the labels wrap to two rows rather than shrinking the hit targets. */
+    @media (max-width: 640px) {
+        .source-segment {
+            flex: 1 1 33%;
+            padding: 9px 8px;
+        }
+
+        .source-segment > i {
+            display: none;
+        }
+    }
+
     .eyebrow {
         color: var(--text-mute);
         font-family: var(--mono);
@@ -533,6 +602,16 @@
         color: #1a2f23;
     }
 
+    html:not(.dark) .tree-builder-page .source-segmented {
+        background: rgba(26, 47, 35, .05);
+    }
+
+    html:not(.dark) .tree-builder-page .source-segment[aria-selected="true"] {
+        background: #ffffff;
+        box-shadow: 0 1px 2px rgba(26, 47, 35, .14);
+        color: #1a2f23;
+    }
+
     html:not(.dark) .tree-builder-page input[type="url"],
     html:not(.dark) .tree-builder-page input[type="text"],
     html:not(.dark) .tree-builder-page input[type="number"],
@@ -590,12 +669,53 @@
     <!-- Left Section: 2 columns -->
     <div class="lg:col-span-2 space-y-6">
 
-        <!-- 1. iNaturalist URL Card -->
-        <div class="tree-card p-6 transition-colors">
+        <!-- Alan 9/12/26 - One "Add Sequences" box with a segmented source
+             selector, replacing six stacked cards. Each panel below holds its
+             original card contents verbatim, so every id and handler is
+             unchanged; only the selected panel is shown. The sources stay
+             additive -- switching a segment hides a fetch summary but never
+             touches the queue, which is the durable state. -->
+        <div class="tree-card p-6 transition-colors" id="add_sequences_card">
             <h3 class="text-xl font-semibold text-journal-dark dark:text-gray-100 mb-4 flex items-center">
-                <i class="fas fa-leaf text-journal-gold mr-2"></i>
-                Import from iNaturalist
+                <i class="fas fa-plus-circle text-journal-gold mr-2"></i>
+                Add Sequences
             </h3>
+
+            <div class="source-segmented" id="source_segmented" role="tablist" aria-label="Sequence source">
+                <button type="button" class="source-segment" role="tab" tabindex="0"
+                        id="source_tab_inaturalist" data-source-segment="inaturalist"
+                        aria-controls="source_panel_inaturalist" aria-selected="true">
+                    <i class="fas fa-leaf" aria-hidden="true"></i><span>iNaturalist</span>
+                </button>
+                <button type="button" class="source-segment" role="tab" tabindex="-1"
+                        id="source_tab_mycomap" data-source-segment="mycomap"
+                        aria-controls="source_panel_mycomap" aria-selected="false">
+                    <i class="fas fa-link" aria-hidden="true"></i><span>MycoMap</span>
+                </button>
+                <button type="button" class="source-segment" role="tab" tabindex="-1"
+                        id="source_tab_paste" data-source-segment="paste"
+                        aria-controls="source_panel_paste" aria-selected="false">
+                    <i class="fas fa-edit" aria-hidden="true"></i><span>Paste</span>
+                </button>
+                <button type="button" class="source-segment" role="tab" tabindex="-1"
+                        id="source_tab_upload" data-source-segment="upload"
+                        aria-controls="source_panel_upload" aria-selected="false">
+                    <i class="fas fa-file-upload" aria-hidden="true"></i><span>Upload</span>
+                </button>
+                <button type="button" class="source-segment" role="tab" tabindex="-1"
+                        id="source_tab_blast" data-source-segment="blast"
+                        aria-controls="source_panel_blast" aria-selected="false">
+                    <i class="fas fa-search" aria-hidden="true"></i><span>BLAST</span>
+                </button>
+                <button type="button" class="source-segment" role="tab" tabindex="-1"
+                        id="source_tab_mushroom_observer" data-source-segment="mushroom_observer"
+                        aria-controls="source_panel_mushroom_observer" aria-selected="false">
+                    <i class="fas fa-binoculars" aria-hidden="true"></i><span>Mushroom Observer</span>
+                </button>
+            </div>
+
+            <div class="source-panel" id="source_panel_inaturalist" role="tabpanel"
+                 aria-labelledby="source_tab_inaturalist" data-source-panel="inaturalist">
 
             <div class="space-y-4">
                 <div>
@@ -736,14 +856,220 @@
                     </div>
                 </div>
             </div>
-        </div>
+            </div>
 
-        <!-- 2. Mushroom Observer Card -->
-        <div class="tree-card p-6 transition-colors">
-            <h3 class="text-xl font-semibold text-journal-dark dark:text-gray-100 mb-4 flex items-center">
-                <i class="fas fa-binoculars text-journal-gold mr-2"></i>
-                Import from Mushroom Observer
-            </h3>
+            <div class="source-panel" id="source_panel_mycomap" role="tabpanel"
+                 aria-labelledby="source_tab_mycomap" data-source-panel="mycomap" hidden>
+
+            <div class="space-y-4">
+                <div>
+                    <label for="mycomap_url" class="block text-sm font-medium text-gray-700 dark:text-gray-200 mb-2">
+                        Mycomap BLAST Results URL
+                    </label>
+                    <input type="url" id="mycomap_url" class="w-full px-4 py-3 border border-gray-300 dark:border-journal-dark rounded-lg
+                                  bg-white dark:bg-journal-dark text-gray-900 dark:text-gray-100
+                                  focus:ring-2 focus:ring-journal-gold focus:border-transparent transition-all"
+                        placeholder="https://mycomap.com/...r12345...">
+                    <p class="text-xs text-gray-500 dark:text-gray-400 mt-1">
+                        Paste a Mycomap BLAST result URL to import sequences.
+                    </p>
+                </div>
+
+                <!-- Checkboxes -->
+                <div class="flex flex-wrap gap-4">
+                    <label class="flex items-center space-x-2 cursor-pointer">
+                        <input type="checkbox" id="mycomap_ncbi" checked class="w-4 h-4 text-journal-gold bg-gray-100 border-gray-300 rounded
+                                      focus:ring-journal-gold dark:bg-journal-dark dark:border-gray-600">
+                        <span class="text-sm text-gray-700 dark:text-gray-200">NCBI Results</span>
+                    </label>
+                    <label class="flex items-center space-x-2 cursor-pointer">
+                        <input type="checkbox" id="mycomap_local" checked class="w-4 h-4 text-journal-gold bg-gray-100 border-gray-300 rounded
+                                      focus:ring-journal-gold dark:bg-journal-dark dark:border-gray-600">
+                        <span class="text-sm text-gray-700 dark:text-gray-200">Local Results</span>
+                    </label>
+                    <label class="flex items-center space-x-2 cursor-pointer">
+                        <input type="checkbox" id="mycomap_dedup" checked class="w-4 h-4 text-journal-gold bg-gray-100 border-gray-300 rounded
+                                      focus:ring-journal-gold dark:bg-journal-dark dark:border-gray-600">
+                        <span class="text-sm text-gray-700 dark:text-gray-200">Remove Duplicates</span>
+                    </label>
+                    <label class="flex items-center space-x-2 cursor-pointer" title="Exclude local FASTA records that contradict the MycoMap BLAST table.">
+                        <input type="checkbox" id="mycomap_filter_conflicting_local" class="w-4 h-4 text-journal-gold bg-gray-100 border-gray-300 rounded
+                                      focus:ring-journal-gold dark:bg-journal-dark dark:border-gray-600">
+                        <span class="text-sm text-gray-700 dark:text-gray-200">Filter Conflicting Local FASTA</span>
+                    </label>
+                    <label id="mycomap_allow_identical_locations_option" class="flex items-center space-x-2 cursor-pointer opacity-50" title="Keep exact matching sequences when their known locations differ.">
+                        <input type="checkbox" id="mycomap_allow_identical_locations" checked disabled class="w-4 h-4 text-journal-gold bg-gray-100 border-gray-300 rounded
+                                      focus:ring-journal-gold dark:bg-journal-dark dark:border-gray-600">
+                        <span class="text-sm text-gray-700 dark:text-gray-200">Keep Exact Matches at Different Locations</span>
+                    </label>
+                </div>
+
+                <!-- Fetch / One-Click Tree Buttons -->
+                <div class="flex gap-3">
+                    <button id="fetch_mycomap_btn" data-active-style="outline" class="btn flex-1">
+                        <i class="fas fa-download mr-2"></i> Fetch sequences only
+                    </button>
+                    <button id="mycomap_quick_tree_btn" data-active-style="primary" class="btn flex-1">
+                        <i class="fas fa-magic mr-2"></i> One-Click Tree
+                    </button>
+                </div>
+            </div>
+            </div>
+
+            <div class="source-panel" id="source_panel_paste" role="tabpanel"
+                 aria-labelledby="source_tab_paste" data-source-panel="paste" hidden>
+
+            <div class="space-y-4">
+                <div>
+                    <label for="sequence_text" class="block text-sm font-medium text-gray-700 dark:text-gray-200 mb-2">
+                        Paste FASTA Sequences or GenBank Accessions
+                    </label>
+                    <div class="sequence-input-box" data-sequence-input-box="sequence_text">
+                        <div class="sequence-input-toolbar">
+                            <div class="input-chip-group">
+                                <button type="button" class="input-chip is-active" data-input-chip="sequence_text" data-chip-mode="fasta">FASTA</button>
+                                <button type="button" class="input-chip" data-input-chip="sequence_text" data-chip-mode="accessions">Accessions</button>
+                            </div>
+                            <span id="sequence_text_counter" class="detected-counter">0 sequences detected</span>
+                        </div>
+                        <textarea id="sequence_text" rows="8" class="sequence-textarea"
+                            placeholder="Paste a FASTA record or a list of accession numbers…"></textarea>
+                        <div class="sequence-input-footer">
+                            <span>UTF-8 · plain text</span>
+                            <button type="button" class="paste-example-link" data-paste-example="sequence_text">↳ Paste example</button>
+                        </div>
+                    </div>
+                    <!-- Alan 8/10/26 - Offer GenBank collection locations only once the input actually contains accessions. -->
+                    <div class="flex flex-wrap items-center justify-between gap-x-4 gap-y-2 mt-2">
+                        <p class="field-help text-xs">
+                            Enter FASTA sequences or one or more GenBank accessions.
+                            Works best with barcode markers (ITS, LSU, RPB2) up to about
+                            50,000&nbsp;bp each &mdash; for whole-genome or long-read
+                            contigs, use the &ldquo;ITS Region&rdquo; setting below to
+                            extract the barcode region first.
+                        </p>
+                        <div id="genbank_location_option" class="hidden">
+                            <label class="inline-flex items-center space-x-2 cursor-pointer"
+                                title="Look up each accession on GenBank and append its collection location to the FASTA header.">
+                                <input type="checkbox" id="genbank_add_locations" class="w-4 h-4 text-journal-gold bg-gray-100 border-gray-300 rounded
+                                              focus:ring-journal-gold dark:bg-journal-dark dark:border-gray-600">
+                                <span class="text-xs text-gray-700 dark:text-gray-200">Add locations to FASTA headers</span>
+                            </label>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Action Buttons for Input -->
+                <div class="flex flex-wrap gap-3">
+                    <button id="add_sequences_btn" data-active-style="outline"
+                        class="btn flex-1 min-w-[140px]" disabled>
+                        <i class="fas fa-plus mr-2"></i> Add / Remove Sequences
+                    </button>
+                    <!-- BLAST button removed from here -->
+                </div>
+            </div>
+            </div>
+
+            <div class="source-panel" id="source_panel_upload" role="tabpanel"
+                 aria-labelledby="source_tab_upload" data-source-panel="upload" hidden>
+
+            <div class="space-y-4">
+                <label for="sequence_file" class="upload-dropzone block w-full border-2 border-dashed border-gray-300 dark:border-gray-600
+                              rounded-lg p-8 text-center cursor-pointer
+                              hover:border-journal-gold dark:hover:border-journal-gold
+                              transition-colors bg-gray-50 dark:bg-journal-dark">
+                    <i class="fas fa-cloud-upload-alt text-4xl text-gray-400 dark:text-gray-500 mb-3"></i>
+                    <p class="text-sm text-gray-600 dark:text-gray-300">
+                        <span class="font-semibold text-journal-gold">Click to upload</span> or drag and drop
+                    </p>
+                    <p class="text-xs text-gray-500 dark:text-gray-400 mt-1">
+                        FASTA files (.fa, .fasta, .fna, .txt)
+                    </p>
+                    <input type="file" id="sequence_file" class="hidden" accept=".fa,.fasta,.fna,.txt">
+                </label>
+
+                <!-- Job Notes -->
+                <div>
+                    <label for="job_notes" class="block text-sm font-medium text-gray-700 dark:text-gray-200 mb-2">
+                        Job Name / Notes
+                    </label>
+                    <input type="text" id="job_notes" class="w-full px-4 py-3 border border-gray-300 dark:border-journal-dark rounded-lg
+                                  bg-white dark:bg-journal-dark text-gray-900 dark:text-gray-100
+                                  focus:ring-2 focus:ring-journal-gold focus:border-transparent transition-all"
+                        placeholder="e.g. Fungal ITS Analysis">
+                </div>
+
+                <!-- Hidden Add Button for File -->
+                <button id="add_file_btn" class="hidden btn btn-outline-gold w-full">
+                    <i class="fas fa-plus mr-2"></i> Add Sequences from File
+                </button>
+            </div>
+            </div>
+
+            <div class="source-panel" id="source_panel_blast" role="tabpanel"
+                 aria-labelledby="source_tab_blast" data-source-panel="blast" hidden>
+
+            <div class="space-y-4">
+                <div>
+                    <label for="blast_query" class="block text-sm font-medium text-gray-700 dark:text-gray-200 mb-2">
+                        Enter Single Sequence or Accession
+                    </label>
+                    <div class="sequence-input-box" data-sequence-input-box="blast_query">
+                        <div class="sequence-input-toolbar">
+                            <div class="input-chip-group">
+                                <button type="button" class="input-chip is-active" data-input-chip="blast_query" data-chip-mode="fasta">FASTA</button>
+                                <button type="button" class="input-chip" data-input-chip="blast_query" data-chip-mode="accessions">Accessions</button>
+                            </div>
+                            <span id="blast_query_counter" class="detected-counter">0 sequences detected</span>
+                        </div>
+                        <textarea id="blast_query" rows="4" class="sequence-textarea"
+                            placeholder="Paste a FASTA record or a list of accession numbers…"></textarea>
+                        <div class="sequence-input-footer">
+                            <span>UTF-8 · plain text</span>
+                            <button type="button" class="paste-example-link" data-paste-example="blast_query">↳ Paste example</button>
+                        </div>
+                    </div>
+                    <p class="field-help text-xs mt-2">
+                        Find related sequences on NCBI GenBank.
+                    </p>
+                </div>
+
+                <div class="grid grid-cols-2 gap-4">
+                    <div>
+                        <label for="blast_min_identity"
+                            class="block text-sm font-medium text-gray-700 dark:text-gray-200 mb-2">
+                            Min Identity (%)
+                        </label>
+                        <input type="number" id="blast_min_identity" value="90" min="50" max="100"
+                            class="w-full px-4 py-3 border border-gray-300 dark:border-journal-dark rounded-lg
+                                      bg-white dark:bg-journal-dark text-gray-900 dark:text-gray-100 focus:ring-2 focus:ring-journal-gold">
+                    </div>
+                    <div>
+                        <label for="blast_max_sequences"
+                            class="block text-sm font-medium text-gray-700 dark:text-gray-200 mb-2">
+                            Max Results
+                        </label>
+                        <select id="blast_max_sequences"
+                            class="w-full px-4 py-3 border border-gray-300 dark:border-journal-dark rounded-lg
+                                      bg-white dark:bg-journal-dark text-gray-900 dark:text-gray-100 focus:ring-2 focus:ring-journal-gold">
+                            <option value="10">10</option>
+                            <option value="50" selected>50</option>
+                            <option value="100">100</option>
+                            <option value="200">200</option>
+                        </select>
+                    </div>
+                </div>
+
+                <div class="flex flex-wrap gap-3">
+                    <button id="blast_btn" data-active-style="outline" class="btn w-full" disabled>
+                        <i class="fas fa-search mr-2"></i> BLAST Sequence
+                    </button>
+                </div>
+            </div>
+            </div>
+
+            <div class="source-panel" id="source_panel_mushroom_observer" role="tabpanel"
+                 aria-labelledby="source_tab_mushroom_observer" data-source-panel="mushroom_observer" hidden>
 
             <div class="space-y-4">
                 <div>
@@ -815,231 +1141,6 @@
                     </div>
                 </div>
             </div>
-        </div>
-
-        <!-- 3. Mycomap URL Card -->
-        <div class="tree-card p-6 transition-colors">
-            <h3 class="text-xl font-semibold text-journal-dark dark:text-gray-100 mb-4 flex items-center">
-                <i class="fas fa-link text-journal-gold mr-2"></i>
-                Import from Mycomap
-            </h3>
-
-            <div class="space-y-4">
-                <div>
-                    <label for="mycomap_url" class="block text-sm font-medium text-gray-700 dark:text-gray-200 mb-2">
-                        Mycomap BLAST Results URL
-                    </label>
-                    <input type="url" id="mycomap_url" class="w-full px-4 py-3 border border-gray-300 dark:border-journal-dark rounded-lg 
-                                  bg-white dark:bg-journal-dark text-gray-900 dark:text-gray-100
-                                  focus:ring-2 focus:ring-journal-gold focus:border-transparent transition-all"
-                        placeholder="https://mycomap.com/...r12345...">
-                    <p class="text-xs text-gray-500 dark:text-gray-400 mt-1">
-                        Paste a Mycomap BLAST result URL to import sequences.
-                    </p>
-                </div>
-
-                <!-- Checkboxes -->
-                <div class="flex flex-wrap gap-4">
-                    <label class="flex items-center space-x-2 cursor-pointer">
-                        <input type="checkbox" id="mycomap_ncbi" checked class="w-4 h-4 text-journal-gold bg-gray-100 border-gray-300 rounded 
-                                      focus:ring-journal-gold dark:bg-journal-dark dark:border-gray-600">
-                        <span class="text-sm text-gray-700 dark:text-gray-200">NCBI Results</span>
-                    </label>
-                    <label class="flex items-center space-x-2 cursor-pointer">
-                        <input type="checkbox" id="mycomap_local" checked class="w-4 h-4 text-journal-gold bg-gray-100 border-gray-300 rounded 
-                                      focus:ring-journal-gold dark:bg-journal-dark dark:border-gray-600">
-                        <span class="text-sm text-gray-700 dark:text-gray-200">Local Results</span>
-                    </label>
-                    <label class="flex items-center space-x-2 cursor-pointer">
-                        <input type="checkbox" id="mycomap_dedup" checked class="w-4 h-4 text-journal-gold bg-gray-100 border-gray-300 rounded 
-                                      focus:ring-journal-gold dark:bg-journal-dark dark:border-gray-600">
-                        <span class="text-sm text-gray-700 dark:text-gray-200">Remove Duplicates</span>
-                    </label>
-                    <label class="flex items-center space-x-2 cursor-pointer" title="Exclude local FASTA records that contradict the MycoMap BLAST table.">
-                        <input type="checkbox" id="mycomap_filter_conflicting_local" class="w-4 h-4 text-journal-gold bg-gray-100 border-gray-300 rounded
-                                      focus:ring-journal-gold dark:bg-journal-dark dark:border-gray-600">
-                        <span class="text-sm text-gray-700 dark:text-gray-200">Filter Conflicting Local FASTA</span>
-                    </label>
-                    <label id="mycomap_allow_identical_locations_option" class="flex items-center space-x-2 cursor-pointer opacity-50" title="Keep exact matching sequences when their known locations differ.">
-                        <input type="checkbox" id="mycomap_allow_identical_locations" checked disabled class="w-4 h-4 text-journal-gold bg-gray-100 border-gray-300 rounded
-                                      focus:ring-journal-gold dark:bg-journal-dark dark:border-gray-600">
-                        <span class="text-sm text-gray-700 dark:text-gray-200">Keep Exact Matches at Different Locations</span>
-                    </label>
-                </div>
-
-                <!-- Fetch / One-Click Tree Buttons -->
-                <div class="flex gap-3">
-                    <button id="fetch_mycomap_btn" data-active-style="outline" class="btn flex-1">
-                        <i class="fas fa-download mr-2"></i> Fetch sequences only
-                    </button>
-                    <button id="mycomap_quick_tree_btn" data-active-style="primary" class="btn flex-1">
-                        <i class="fas fa-magic mr-2"></i> One-Click Tree
-                    </button>
-                </div>
-            </div>
-        </div>
-
-        <!-- 3. BLAST Card -->
-        <div class="tree-card p-6 transition-colors">
-            <h3 class="text-xl font-semibold text-journal-dark dark:text-gray-100 mb-4 flex items-center">
-                <i class="fas fa-search text-journal-gold mr-2"></i>
-                BLAST for Related Sequences
-            </h3>
-
-            <div class="space-y-4">
-                <div>
-                    <label for="blast_query" class="block text-sm font-medium text-gray-700 dark:text-gray-200 mb-2">
-                        Enter Single Sequence or Accession
-                    </label>
-                    <div class="sequence-input-box" data-sequence-input-box="blast_query">
-                        <div class="sequence-input-toolbar">
-                            <div class="input-chip-group">
-                                <button type="button" class="input-chip is-active" data-input-chip="blast_query" data-chip-mode="fasta">FASTA</button>
-                                <button type="button" class="input-chip" data-input-chip="blast_query" data-chip-mode="accessions">Accessions</button>
-                            </div>
-                            <span id="blast_query_counter" class="detected-counter">0 sequences detected</span>
-                        </div>
-                        <textarea id="blast_query" rows="4" class="sequence-textarea"
-                            placeholder="Paste a FASTA record or a list of accession numbers…"></textarea>
-                        <div class="sequence-input-footer">
-                            <span>UTF-8 · plain text</span>
-                            <button type="button" class="paste-example-link" data-paste-example="blast_query">↳ Paste example</button>
-                        </div>
-                    </div>
-                    <p class="field-help text-xs mt-2">
-                        Find related sequences on NCBI GenBank.
-                    </p>
-                </div>
-
-                <div class="grid grid-cols-2 gap-4">
-                    <div>
-                        <label for="blast_min_identity"
-                            class="block text-sm font-medium text-gray-700 dark:text-gray-200 mb-2">
-                            Min Identity (%)
-                        </label>
-                        <input type="number" id="blast_min_identity" value="90" min="50" max="100"
-                            class="w-full px-4 py-3 border border-gray-300 dark:border-journal-dark rounded-lg 
-                                      bg-white dark:bg-journal-dark text-gray-900 dark:text-gray-100 focus:ring-2 focus:ring-journal-gold">
-                    </div>
-                    <div>
-                        <label for="blast_max_sequences"
-                            class="block text-sm font-medium text-gray-700 dark:text-gray-200 mb-2">
-                            Max Results
-                        </label>
-                        <select id="blast_max_sequences"
-                            class="w-full px-4 py-3 border border-gray-300 dark:border-journal-dark rounded-lg 
-                                      bg-white dark:bg-journal-dark text-gray-900 dark:text-gray-100 focus:ring-2 focus:ring-journal-gold">
-                            <option value="10">10</option>
-                            <option value="50" selected>50</option>
-                            <option value="100">100</option>
-                            <option value="200">200</option>
-                        </select>
-                    </div>
-                </div>
-
-                <div class="flex flex-wrap gap-3">
-                    <button id="blast_btn" data-active-style="outline" class="btn w-full" disabled>
-                        <i class="fas fa-search mr-2"></i> BLAST Sequence
-                    </button>
-                </div>
-            </div>
-        </div>
-
-        <!-- 4. File Upload Card -->
-        <div class="tree-card p-6 transition-colors">
-            <h3 class="text-xl font-semibold text-journal-dark dark:text-gray-100 mb-4 flex items-center">
-                <i class="fas fa-file-upload text-journal-gold mr-2"></i>
-                Or Upload a File
-            </h3>
-
-            <div class="space-y-4">
-                <label for="sequence_file" class="upload-dropzone block w-full border-2 border-dashed border-gray-300 dark:border-gray-600
-                              rounded-lg p-8 text-center cursor-pointer
-                              hover:border-journal-gold dark:hover:border-journal-gold
-                              transition-colors bg-gray-50 dark:bg-journal-dark">
-                    <i class="fas fa-cloud-upload-alt text-4xl text-gray-400 dark:text-gray-500 mb-3"></i>
-                    <p class="text-sm text-gray-600 dark:text-gray-300">
-                        <span class="font-semibold text-journal-gold">Click to upload</span> or drag and drop
-                    </p>
-                    <p class="text-xs text-gray-500 dark:text-gray-400 mt-1">
-                        FASTA files (.fa, .fasta, .fna, .txt)
-                    </p>
-                    <input type="file" id="sequence_file" class="hidden" accept=".fa,.fasta,.fna,.txt">
-                </label>
-
-                <!-- Job Notes -->
-                <div>
-                    <label for="job_notes" class="block text-sm font-medium text-gray-700 dark:text-gray-200 mb-2">
-                        Job Name / Notes
-                    </label>
-                    <input type="text" id="job_notes" class="w-full px-4 py-3 border border-gray-300 dark:border-journal-dark rounded-lg 
-                                  bg-white dark:bg-journal-dark text-gray-900 dark:text-gray-100
-                                  focus:ring-2 focus:ring-journal-gold focus:border-transparent transition-all"
-                        placeholder="e.g. Fungal ITS Analysis">
-                </div>
-
-                <!-- Hidden Add Button for File -->
-                <button id="add_file_btn" class="hidden btn btn-outline-gold w-full">
-                    <i class="fas fa-plus mr-2"></i> Add Sequences from File
-                </button>
-            </div>
-        </div>
-
-        <!-- 5. Paste Sequences Card -->
-        <div class="tree-card p-6 transition-colors">
-            <h3 class="text-xl font-semibold text-journal-dark dark:text-gray-100 mb-4 flex items-center">
-                <i class="fas fa-edit text-journal-gold mr-2"></i>
-                Add Custom Sequences
-            </h3>
-
-            <div class="space-y-4">
-                <div>
-                    <label for="sequence_text" class="block text-sm font-medium text-gray-700 dark:text-gray-200 mb-2">
-                        Paste FASTA Sequences or GenBank Accessions
-                    </label>
-                    <div class="sequence-input-box" data-sequence-input-box="sequence_text">
-                        <div class="sequence-input-toolbar">
-                            <div class="input-chip-group">
-                                <button type="button" class="input-chip is-active" data-input-chip="sequence_text" data-chip-mode="fasta">FASTA</button>
-                                <button type="button" class="input-chip" data-input-chip="sequence_text" data-chip-mode="accessions">Accessions</button>
-                            </div>
-                            <span id="sequence_text_counter" class="detected-counter">0 sequences detected</span>
-                        </div>
-                        <textarea id="sequence_text" rows="8" class="sequence-textarea"
-                            placeholder="Paste a FASTA record or a list of accession numbers…"></textarea>
-                        <div class="sequence-input-footer">
-                            <span>UTF-8 · plain text</span>
-                            <button type="button" class="paste-example-link" data-paste-example="sequence_text">↳ Paste example</button>
-                        </div>
-                    </div>
-                    <!-- Alan 8/10/26 - Offer GenBank collection locations only once the input actually contains accessions. -->
-                    <div class="flex flex-wrap items-center justify-between gap-x-4 gap-y-2 mt-2">
-                        <p class="field-help text-xs">
-                            Enter FASTA sequences or one or more GenBank accessions.
-                            Works best with barcode markers (ITS, LSU, RPB2) up to about
-                            50,000&nbsp;bp each &mdash; for whole-genome or long-read
-                            contigs, use the &ldquo;ITS Region&rdquo; setting below to
-                            extract the barcode region first.
-                        </p>
-                        <div id="genbank_location_option" class="hidden">
-                            <label class="inline-flex items-center space-x-2 cursor-pointer"
-                                title="Look up each accession on GenBank and append its collection location to the FASTA header.">
-                                <input type="checkbox" id="genbank_add_locations" class="w-4 h-4 text-journal-gold bg-gray-100 border-gray-300 rounded
-                                              focus:ring-journal-gold dark:bg-journal-dark dark:border-gray-600">
-                                <span class="text-xs text-gray-700 dark:text-gray-200">Add locations to FASTA headers</span>
-                            </label>
-                        </div>
-                    </div>
-                </div>
-
-                <!-- Action Buttons for Input -->
-                <div class="flex flex-wrap gap-3">
-                    <button id="add_sequences_btn" data-active-style="outline"
-                        class="btn flex-1 min-w-[140px]" disabled>
-                        <i class="fas fa-plus mr-2"></i> Add / Remove Sequences
-                    </button>
-                    <!-- BLAST button removed from here -->
-                </div>
             </div>
         </div>
 
@@ -1082,7 +1183,7 @@
                     </button>
                 </div>
                 <div class="pipeline-summary">
-                    Pipeline: <strong>MAFFT</strong> → <strong>FastTree</strong> · <strong>GTR+CAT</strong> · <strong>1000 BS</strong> · midpoint root
+                    Pipeline: <strong>MAFFT</strong> → <strong>IQ-TREE (5 iterations)</strong> · <strong>GTR+G</strong> · <strong>1000 SH-aLRT</strong> · midpoint root
                 </div>
                 <div class="queue-tools">
                     <button id="clear_queue_btn" class="btn btn-small" disabled>
@@ -1113,7 +1214,7 @@
         <p class="eyebrow">Advanced</p>
         <h3 class="mb-1">Pipeline Configuration</h3>
         <div class="advanced-summary">
-            <p id="advanced_current_summary" class="text-sm">Currently: MAFFT + FastTree 2.2.0, terminal overhang trim, midpoint-rooted, SH-like local support (not bootstrap).</p>
+            <p id="advanced_current_summary" class="text-sm">Currently: MAFFT + IQ-TREE five-iteration search, terminal overhang trim, midpoint-rooted, SH-aLRT branch support (1000 replicates, not bootstrap).</p>
         </div>
     </div>
 
@@ -1265,7 +1366,8 @@
                 <select id="tree_method" class="w-full px-4 py-3 border border-gray-300 dark:border-journal-dark rounded-lg 
                                bg-white dark:bg-journal-dark text-gray-900 dark:text-gray-100
                                focus:ring-2 focus:ring-journal-gold focus:border-transparent transition-all">
-                    <option value="fasttree" selected>FastTree 2.2.0 (Fast ML)</option>
+                    <option value="iqtree_fast" selected>IQ-TREE 5-iteration search (Quick ML)</option>
+                    <option value="fasttree">FastTree 2.2.0 (Fast ML)</option>
                     <option value="raxml">RAxML-NG (High Quality ML)</option>
                     <option value="iqtree">IQ-TREE (Maximum Likelihood)</option>
                     <option value="mrbayes">MrBayes (Bayesian)</option>
@@ -1652,6 +1754,355 @@
 
 {% block scripts %}
 <script>
+    // =========================================================================
+    // Add Sequences source selector
+    //
+    // Alan 9/12/26 - Six sources (iNaturalist, Mushroom Observer, MycoMap,
+    // BLAST, Paste, Upload) share one box behind a segmented control, so the
+    // queue and the tree options are not pushed a screen down and are not
+    // stacked below six cards on mobile.
+    //
+    // Switching a segment is display only. The queue is the durable state and
+    // lives in its own column, so a fetch summary hidden here is still one
+    // click from being visible again and nothing queued is ever discarded.
+    //
+    // Nothing below renames an id or rebinds a handler -- each panel holds its
+    // original card's markup verbatim. A hidden panel is [hidden], so the
+    // existing getElementById().value reads work exactly as they did.
+    // =========================================================================
+    (function setupSourceSelector() {
+        const STORAGE_KEY = 'dikarya.treeBuilder.sourceSegment';
+        const DEFAULT_SOURCE = 'inaturalist';
+        const tablist = document.getElementById('source_segmented');
+        if (!tablist) return;
+
+        const tabs = Array.from(tablist.querySelectorAll('.source-segment'));
+        const panels = Array.from(document.querySelectorAll('.source-panel'));
+        if (tabs.length === 0) return;
+
+        function panelFor(name) {
+            return panels.find(el => el.dataset.sourcePanel === name) || null;
+        }
+
+        function select(name, persist) {
+            const target = tabs.some(t => t.dataset.sourceSegment === name) ? name : DEFAULT_SOURCE;
+            tabs.forEach(tab => {
+                const active = tab.dataset.sourceSegment === target;
+                tab.setAttribute('aria-selected', active ? 'true' : 'false');
+                tab.tabIndex = active ? 0 : -1;
+            });
+            panels.forEach(panel => {
+                panel.hidden = panel.dataset.sourcePanel !== target;
+            });
+            if (persist !== false) {
+                // A private-mode or quota failure must never break the page.
+                try {
+                    window.localStorage.setItem(STORAGE_KEY, target);
+                } catch (err) { /* non-fatal */ }
+            }
+        }
+
+        // Kept from the accordion version so any later flow can reveal its own
+        // source without knowing how the selector is built.
+        window.openImportSection = function (name) {
+            select(name);
+        };
+
+        tabs.forEach(tab => {
+            tab.addEventListener('click', () => select(tab.dataset.sourceSegment));
+        });
+
+        // Roving-tabindex keyboard support, which role="tablist" implies.
+        tablist.addEventListener('keydown', event => {
+            const current = tabs.findIndex(t => t.getAttribute('aria-selected') === 'true');
+            if (current === -1) return;
+            let next = null;
+            if (event.key === 'ArrowRight' || event.key === 'ArrowDown') next = (current + 1) % tabs.length;
+            else if (event.key === 'ArrowLeft' || event.key === 'ArrowUp') next = (current - 1 + tabs.length) % tabs.length;
+            else if (event.key === 'Home') next = 0;
+            else if (event.key === 'End') next = tabs.length - 1;
+            if (next === null) return;
+            event.preventDefault();
+            select(tabs[next].dataset.sourceSegment);
+            tabs[next].focus();
+        });
+
+        let remembered = null;
+        try {
+            remembered = window.localStorage.getItem(STORAGE_KEY);
+        } catch (err) { /* non-fatal */ }
+        select(remembered || DEFAULT_SOURCE, false);
+
+        // A source holding typed input wins over the remembered segment. This
+        // covers back-navigation and Firefox's form restore, which repopulate
+        // fields without firing any event we listen for.
+        const filled = panels.find(panel => Array.from(panel.querySelectorAll('input, textarea'))
+            .some(el => (el.type === 'text' || el.type === 'url' || el.tagName === 'TEXTAREA')
+                && el.value.trim() !== ''));
+        if (filled) select(filled.dataset.sourcePanel, false);
+
+        // A result panel that reveals itself while its source is not showing
+        // means a fetch finished -- switch to it so the summary and its action
+        // buttons are reachable.
+        //
+        // Alan 9/14/26 - But only while the user is not busy somewhere else. An
+        // iNaturalist search can take tens of seconds; the user moves to Paste,
+        // starts typing a FASTA, and the result arriving used to hide the
+        // textarea mid-keystroke and throw away the selection. A completed
+        // background fetch is worth announcing, not worth seizing the screen
+        // for, so once another panel has been touched the finished source is
+        // marked on its tab and left for the user to open.
+        function markTabReady(name) {
+            const tab = tabs.find(t => t.dataset.sourceSegment === name);
+            if (!tab || tab.querySelector('.source-segment-badge')) return;
+            const badge = document.createElement('span');
+            badge.className = 'source-segment-badge ml-1 text-journal-gold';
+            badge.setAttribute('aria-label', 'results ready');
+            badge.title = 'Results ready';
+            badge.textContent = '\u25CF';
+            tab.appendChild(badge);
+        }
+
+        // Clear the badge when its own tab is opened, so it means "unseen
+        // results" rather than "this tab has ever been used".
+        tabs.forEach(tab => {
+            tab.addEventListener('click', () => {
+                const badge = tab.querySelector('.source-segment-badge');
+                if (badge) badge.remove();
+            });
+        });
+
+        // "Busy elsewhere" = the user has interacted with the panel they are
+        // looking at since the page settled. A first fetch on a page nobody has
+        // touched still auto-switches, which is the common case the behaviour
+        // was written for.
+        let userIsBusyElsewhere = false;
+        panels.forEach(panel => {
+            panel.addEventListener('input', () => {
+                if (!panel.hidden) userIsBusyElsewhere = true;
+            });
+        });
+        tabs.forEach(tab => {
+            // An explicit tab choice is the strongest statement of intent there
+            // is: from then on, nothing moves the user without asking.
+            tab.addEventListener('click', () => { userIsBusyElsewhere = true; });
+        });
+
+        panels.forEach(panel => {
+            const results = panel.querySelectorAll('[id$="_results"], [id$="_tree_preview"]');
+            if (results.length === 0) return;
+            const observer = new MutationObserver(records => {
+                records.forEach(record => {
+                    if (record.target.classList.contains('hidden')) return;
+                    if (!panel.hidden) return;
+                    if (userIsBusyElsewhere) {
+                        markTabReady(panel.dataset.sourcePanel);
+                        return;
+                    }
+                    select(panel.dataset.sourcePanel);
+                });
+            });
+            results.forEach(el => observer.observe(el, { attributes: true, attributeFilter: ['class'] }));
+        });
+    })();
+
+    // =========================================================================
+    // Work out which source the user means, and switch to it
+    //
+    // Alan 9/13/26 - The logs show people pasting whatever identifier they have
+    // into whichever box happens to be open: iNaturalist observation URLs went
+    // into the MycoMap box, which rejects them with a MycoMap error that
+    // explains nothing. With one Add Sequences box and a segment per source, we
+    // can read the input and move it to the field that wants it.
+    //
+    // The digit rule is measured, not guessed. Across 9,816 iNaturalist jobs on
+    // disk the smallest observation id is 1,706,015 -- 7 digits -- and 99.5% are
+    // 8 or 9. Not one is 6 digits or fewer. Mushroom Observer is still in the
+    // 6-digit range, so a bare 6-digit number is Mushroom Observer and 7+ is
+    // iNaturalist.
+    //
+    // NOTE: Mushroom Observer will eventually cross 1,000,000 and collide with
+    // the 7-digit rule. When it does, the tie has to break on something other
+    // than length -- at that point iNaturalist's smallest live id will be far
+    // above MO's, so the boundary becomes a threshold rather than a digit count.
+    //
+    // Nothing here is a guess about ambiguous input: 5 digits or fewer routes
+    // nowhere, and sequence data is never moved out of the two boxes that both
+    // legitimately accept it.
+    // =========================================================================
+    (function setupSourceAutoDetect() {
+        const URL_ROUTES = [
+            {
+                source: "inaturalist", label: "iNaturalist",
+                hosts: ["inaturalist.org", "www.inaturalist.org"],
+            },
+            {
+                source: "mushroom_observer", label: "Mushroom Observer",
+                hosts: ["mushroomobserver.org", "www.mushroomobserver.org"],
+            },
+            {
+                source: "mycomap", label: "MycoMap",
+                hosts: ["mycomap.com", "www.mycomap.com", "mycomap.org", "www.mycomap.org"],
+            },
+        ];
+        const TARGET_FIELD = {
+            inaturalist: "inaturalist_url",
+            mushroom_observer: "mushroom_observer_input",
+            mycomap: "mycomap_url",
+            paste: "sequence_text",
+            blast: "blast_query",
+        };
+        const LABEL = {
+            inaturalist: "iNaturalist", mushroom_observer: "Mushroom Observer",
+            mycomap: "MycoMap", paste: "Paste", blast: "BLAST",
+        };
+        // Each watched field and the source it already belongs to.
+        const WATCHED = [
+            ["inaturalist_url", "inaturalist"],
+            ["mushroom_observer_input", "mushroom_observer"],
+            ["mycomap_url", "mycomap"],
+            ["sequence_text", "paste"],
+            ["blast_query", "blast"],
+        ];
+        // The three identifier boxes. Sequence data pasted into one of these is
+        // certainly misplaced; the same data in sequence_text or blast_query is
+        // exactly where it belongs, so it is never moved out of those two.
+        const IDENTIFIER_FIELDS = new Set(["inaturalist", "mushroom_observer", "mycomap"]);
+        const IUPAC_RE = /^[ACGTURYSWKMBDHVN]+$/i;
+
+        function urlSource(token) {
+            let parsed = null;
+            try {
+                parsed = new URL(token);
+            } catch (err) {
+                try {
+                    parsed = new URL(`https://${token}`);
+                } catch (innerErr) {
+                    return null;
+                }
+            }
+            if (!/^https?:$/.test(parsed.protocol)) return null;
+            const host = parsed.hostname.toLowerCase();
+            const route = URL_ROUTES.find(entry => entry.hosts.includes(host));
+            return route ? route.source : null;
+        }
+
+        function looksLikeSequenceData(text) {
+            const trimmed = text.trim();
+            if (trimmed.startsWith(">")) return true;
+            const collapsed = trimmed.replace(/\s+/g, "");
+            return collapsed.length >= 20 && IUPAC_RE.test(collapsed);
+        }
+
+        // Returns the source this text belongs to, or null when it is ambiguous
+        // or already in the right place.
+        function detectSource(text, ownSource) {
+            const trimmed = String(text || "").trim();
+            if (!trimmed) return null;
+            const singleToken = !/\s/.test(trimmed);
+
+            // 1. A URL is unambiguous, wherever it was typed.
+            if (singleToken) {
+                const fromUrl = urlSource(trimmed);
+                if (fromUrl) return fromUrl;
+            }
+
+            // 2. A bare number. See the digit rule above.
+            if (singleToken && /^\d+$/.test(trimmed)) {
+                if (trimmed.length === 6) return "mushroom_observer";
+                if (trimmed.length >= 7) return "inaturalist";
+                return null;  // 5 or fewer: genuinely ambiguous, leave it alone.
+            }
+
+            // 3 & 4. An accession, a FASTA record or a bare sequence. Both the
+            // Paste and BLAST boxes accept all three, so this only rescues data
+            // stranded in one of the identifier boxes -- it never second-guesses
+            // a user who is already in Paste or BLAST.
+            if (!IDENTIFIER_FIELDS.has(ownSource)) return null;
+            if (singleToken && isGenBankAccession(trimmed)) return "paste";
+            if (looksLikeSequenceData(trimmed)) return "paste";
+            return null;
+        }
+
+        // Returns null when nothing needed moving, otherwise
+        // { source, moved } -- moved is false when the destination was occupied.
+        function handle(field, ownSource) {
+            const source = detectSource(field.value, ownSource);
+            if (!source || source === ownSource) return null;
+            const target = document.getElementById(TARGET_FIELD[source]);
+            if (!target || target === field) return null;
+
+            const value = field.value.trim();
+
+            // Alan 9/14/26 - Never overwrite something the user already typed.
+            // This used to assign target.value unconditionally, so pasting an
+            // iNaturalist URL into the MycoMap box silently destroyed whatever
+            // was already in the iNaturalist box -- a URL the user had queued up
+            // and had no way to get back. Moving one value is a convenience;
+            // losing the other is not a trade worth making, so when the
+            // destination is occupied the tab is revealed and BOTH values are
+            // left exactly as they are, for the user to resolve.
+            if (target.value.trim() !== "" && target.value.trim() !== value) {
+                if (typeof window.openImportSection === "function") {
+                    window.openImportSection(source);
+                }
+                if (typeof showStatus === "function") {
+                    showStatus(
+                        `That looks like ${LABEL[source]} input, but the `
+                        + `${LABEL[source]} box already has something in it. `
+                        + `Nothing was moved — both entries are still there. `
+                        + `Clear the ${LABEL[source]} box and paste it there to use it.`,
+                        "info"
+                    );
+                }
+                return { source, moved: false };
+            }
+
+            target.value = value;
+            field.value = "";
+            // Existing handlers (validation, button enable/disable, the detected
+            // counters) are wired to input events, so both fields have to
+            // announce the change or the UI keeps the old state.
+            field.dispatchEvent(new Event("input", { bubbles: true }));
+            target.dispatchEvent(new Event("input", { bubbles: true }));
+
+            if (typeof window.openImportSection === "function") {
+                window.openImportSection(source);
+            }
+            try {
+                target.focus();
+                target.setSelectionRange(value.length, value.length);
+            } catch (err) { /* not every control supports selection */ }
+            if (typeof showStatus === "function") {
+                showStatus(`That looks like ${LABEL[source]} input — switched to ${LABEL[source]}.`, "info");
+            }
+            return { source, moved: true };
+        }
+
+        // Alan 9/22/26 - The paste/change listeners below miss input that is
+        // typed and submitted with Enter or a button click before the field
+        // blurs, so an iNaturalist URL still reached the MycoMap fetch and got
+        // a MycoMap error (client_event=mycomap_url_rejected hostname=
+        // www.inaturalist.org). Import buttons call this first: it moves the
+        // value exactly as a paste would and returns what happened.
+        window.routeMisplacedImportInput = function (fieldId, ownSource) {
+            const field = document.getElementById(fieldId);
+            return field ? handle(field, ownSource) : null;
+        };
+
+        WATCHED.forEach(([id, ownSource]) => {
+            const field = document.getElementById(id);
+            if (!field) return;
+            // On paste, and on change/blur for a typed or autofilled value. Not
+            // on every keystroke: switching fields mid-type would move the caret
+            // out from under the user, and a half-typed id is not yet decidable.
+            field.addEventListener("paste", () => {
+                window.setTimeout(() => handle(field, ownSource), 0);
+            });
+            field.addEventListener("change", () => handle(field, ownSource));
+        });
+    })();
+
     // =========================================================================
     // Workflow failure telemetry
     //
@@ -2229,7 +2680,17 @@
     }
 
     function isGenBankAccession(text) {
-        return /^[A-Z]{1,6}_?\d{5,9}(\.\d+)?$/i.test(text.trim());
+        const cleaned = String(text || '').trim();
+        const accessionShape = /^(?:[A-Z]\d{5}|[A-Z]{2}\d{6}|[A-Z]{2}\d{8}|[A-Z]{2}_\d{6}|[A-Z]{2}_\d{8,9}|[A-Z]{4}\d{8,10}|[A-Z]{6}\d{9,11})(?:\.\d+)?$/i;
+        if (!accessionShape.test(cleaned)) return false;
+
+        // Four-letter large-scale accessions overlap exactly with the labels
+        // Dikarya uses for iNaturalist observations (iNat + 8-10 digits).
+        // INAT is not an assigned INSDC project prefix, so mirror the backend's
+        // explicit exclusion instead of sending an observation id to NCBI.
+        const largeScale = /^(?:([A-Z]{4})\d{8,10}|([A-Z]{6})\d{9,11})(?:\.\d+)?$/i.exec(cleaned);
+        const prefix = largeScale && (largeScale[1] || largeScale[2]);
+        return !prefix || prefix.toUpperCase() !== 'INAT';
     }
 
     function parseGenBankAccessions(text) {
@@ -2242,17 +2703,12 @@
     // =========================================================================
     // GenBank Collection Locations
     // =========================================================================
-    // Alan 8/10/26 - Only treat real INSDC accession shapes as accessions when scanning
-    // inside FASTA headers, so identifiers like iNat108887661 are not looked up. Case is
-    // significant here for the same reason; pasted accessions are uppercase by convention.
-    const GENBANK_HEADER_ACCESSION_RE = /^(?:[A-Z]\d{5}|[A-Z]{2}\d{6}|[A-Z]{2}\d{8}|[A-Z]{2}_\d{6,9})(?:\.\d+)?$/;
-
     function extractHeaderAccessions(seq) {
         const header = `${seq?.name || ''} ${seq?.organism || ''}`;
         const found = [];
         for (const token of header.split(/[\s,;|()\[\]]+/)) {
             const normalized = token.trim().replace(/^>+/, '');
-            if (normalized && GENBANK_HEADER_ACCESSION_RE.test(normalized) && !found.includes(normalized)) {
+            if (normalized && isGenBankAccession(normalized) && !found.includes(normalized)) {
                 found.push(normalized);
             }
         }
@@ -2726,6 +3182,13 @@
     function getMycomapBlastUrlForPayload() {
         return sequenceQueue.some(seq => seq && seq.source === 'mycomap') ? lastMycomapBlastUrl : '';
     }
+    function getInaturalistSourceUrlForPayload() {
+        const urls = [...new Set(sequenceQueue
+            .filter(seq => seq && seq.source === 'inaturalist')
+            .map(seq => String(seq.inat_source_url || '').trim())
+            .filter(Boolean))];
+        return urls.length === 1 ? urls[0] : '';
+    }
     // Alan 6/26/26 - Only submit filter diagnostics when the current queue still includes MycoMap records.
     function getImportFilterDetailsForPayload() {
         return sequenceQueue.some(seq => seq && seq.source === 'mycomap') ? importFilterDetails : {};
@@ -2809,6 +3272,13 @@
     function isValidMycomapUrl(url) {
         if (!url) return false;
         const trimmed = url.trim();
+        // Alan 9/22/26 - MycoMap's older results links (index.php?...controller=blast
+        // &do=results&db=..&id=..) are resolved server-side to the BLAST they list.
+        if (/^https?:\/\/(?:www\.)?mycomap\.com\/index\.php\?/i.test(trimmed)
+            && /[?&]controller=blast(?:&|$)/i.test(trimmed)
+            && /[?&]do=results(?:&|$)/i.test(trimmed)) {
+            return true;
+        }
         // Must start with the specific BLAST search path
         if (!trimmed.startsWith('https://mycomap.com/genetics/blast-search')) {
             return false;
@@ -2941,6 +3411,20 @@
             return await doFetchMycomapSequence(url);
         }
 
+        // An iNaturalist or Mushroom Observer link (or a bare observation id)
+        // belongs to that source's importer. Move it there and run that import,
+        // which is what the user was trying to do.
+        const routed = window.routeMisplacedImportInput?.('mycomap_url', 'mycomap');
+        if (routed) {
+            const submitBtnId = {
+                inaturalist: 'fetch_inaturalist_btn',
+                mushroom_observer: 'fetch_mushroom_observer_btn',
+            }[routed.source];
+            const submitBtn = submitBtnId && document.getElementById(submitBtnId);
+            if (routed.moved && submitBtn) submitBtn.click();
+            return false;
+        }
+
         if (!isValidMycomapUrl(url)) {
             logMycomapUrlRejection(url);
             if (url.includes('mycomap.com')) {
@@ -3051,6 +3535,13 @@
             return;
         }
 
+        if (!quickTreeLengthCheckPasses()) {
+            mycomapQuickTreeBtn.disabled = false;
+            fetchMycomapBtn.disabled = false;
+            mycomapQuickTreeBtn.innerHTML = '<i class="fas fa-magic mr-2"></i> One-Click Tree';
+            return;
+        }
+
         mycomapQuickTreeBtn.innerHTML = '<i class="fas fa-spinner fa-spin mr-2"></i> Submitting...';
         showStatus('Building tree from Mycomap sequences...', 'info');
 
@@ -3062,11 +3553,20 @@
             alignment_method: 'mafft',
             trimming_method: 'trimal_gappy',
             trim_terminal_overhangs: true,
-            tree_method: 'fasttree',
+            tree_method: 'iqtree_fast',
             tree_model: 'GTR+G',
-            bootstrap: 100,
+            // Says which button this came from, so the server does not have to
+            // infer it from the parameter set. The limited IQ-TREE search on its own is
+            // an ordinary advanced choice; only the preset carries the 10 kb
+            // per-sequence cap.
+            submission_mode: 'quick_tree',
+            // No bootstrap: the preset reports SH-aLRT branch support instead,
+            // 1000 replicates on a 0-100 scale,
+            // which is what the viewer reports (support_type "alrt"). Sending a
+            // replicate count would only persist one that never ran.
             import_filter_details: getImportFilterDetailsForPayload(),
-            mycomap_blast_url: getMycomapBlastUrlForPayload()
+            mycomap_blast_url: getMycomapBlastUrlForPayload(),
+            inat_source_url: getInaturalistSourceUrlForPayload()
         };
 
         try {
@@ -3141,6 +3641,10 @@
     }
 
     inaturalistUrlInput.addEventListener('input', checkInatState);
+    inaturalistUrlInput.addEventListener('paste', () => {
+        window.setTimeout(rewriteInaturalistTaxonInput, 0);
+    });
+    inaturalistUrlInput.addEventListener('change', rewriteInaturalistTaxonInput);
 
     // Store the current iNaturalist analysis result for use by action buttons
     let currentInaturalistResult = null;
@@ -3170,6 +3674,40 @@
         } catch (e) { return false; }
     }
 
+    // Alan 9/22/26 - People paste taxon pages (inaturalist.org/taxa/906595-Caesareae)
+    // expecting the sequenced observations of that taxon. That is exactly an
+    // observation search on taxon_id with the DNA Barcode ITS field present,
+    // which the direct sequence import already handles, so rewrite it to that
+    // instead of rejecting it as an unsupported one-click-tree URL.
+    function inaturalistTaxonSearchUrl(value) {
+        if (!value) return null;
+        try {
+            const urlValue = /^https?:\/\//i.test(value) ? value : `https://${value}`;
+            const parsed = new URL(urlValue);
+            if (!['inaturalist.org', 'www.inaturalist.org'].includes(parsed.hostname.toLowerCase())) {
+                return null;
+            }
+            const match = parsed.pathname.match(/^\/taxa\/(\d+)(?:[-/]|$)/i);
+            if (!match) return null;
+            return `https://www.inaturalist.org/observations?taxon_id=${match[1]}&field:DNA%20Barcode%20ITS=`;
+        } catch (e) {
+            return null;
+        }
+    }
+
+    function rewriteInaturalistTaxonInput() {
+        const search = inaturalistTaxonSearchUrl(inaturalistUrlInput.value.trim());
+        if (!search) return false;
+        inaturalistUrlInput.value = search;
+        checkInatState();
+        showStatus(
+            'That is a taxon page, so it has been turned into a search for observations '
+            + 'of that taxon with a DNA Barcode ITS sequence. Click Submit to import them.',
+            'info'
+        );
+        return true;
+    }
+
     function isLikelyInaturalistTreeInput(value) {
         if (!value) return false;
         if (/^\d+$/.test(value)) return true;
@@ -3188,8 +3726,27 @@
     function isSingleInaturalistObservationInput(value) {
         if (!value) return false;
         if (/^\d+$/.test(value)) return true;
-        return /^https?:\/\/(?:www\.)?inaturalist\.org\/observations\/\d+(?:[/?#].*)?$/i.test(value) ||
-            /^(?:www\.)?inaturalist\.org\/observations\/\d+(?:[/?#].*)?$/i.test(value);
+        // A final period is normally sentence punctuation copied with the URL;
+        // the server accepts it only after a numeric observation path too.
+        return /^https?:\/\/(?:www\.)?inaturalist\.org\/observations\/\d+(?:[/?#].*|\.(?:[?#].*)?)?$/i.test(value) ||
+            /^(?:www\.)?inaturalist\.org\/observations\/\d+(?:[/?#].*|\.(?:[?#].*)?)?$/i.test(value);
+    }
+
+    function isDirectInaturalistSequenceSearchInput(value) {
+        if (!isValidInaturalistInput(value) || isSingleInaturalistObservationInput(value)) {
+            return false;
+        }
+        try {
+            const urlValue = /^https?:\/\//i.test(value) ? value : `https://${value}`;
+            const parsed = new URL(urlValue);
+            // user_id/project_id searches are supported by the separate bulk
+            // MycoMap tree workflow. Other observation searches (taxon, place,
+            // field, dates, etc.) import their ITS records directly instead.
+            return !parsed.searchParams.has('user_id')
+                && !parsed.searchParams.has('project_id');
+        } catch (e) {
+            return false;
+        }
     }
 
     function getInaturalistBlastLimit(inputEl, fallback) {
@@ -3259,7 +3816,8 @@
     function updateInaturalistTreeButtonForInput() {
         if (!inaturalistTreeBtn) return;
         const value = inaturalistUrlInput.value.trim();
-        const show = isLikelyInaturalistTreeInput(value);
+        const show = isLikelyInaturalistTreeInput(value)
+            && !isDirectInaturalistSequenceSearchInput(value);
         inaturalistTreeBtn.classList.toggle('hidden', !show);
         const previewMatches = Boolean(
             currentInaturalistTreePreview && currentInaturalistTreePreviewInput === value
@@ -3322,6 +3880,11 @@
             const type = currentInaturalistTreePreview.type;
             const count = Number(currentInaturalistTreePreview.eligible_tree_count || 0);
             if ((type === 'user' || type === 'project') && count > 0) {
+                if (currentInaturalistTreePreview.login_required) {
+                    inaturalistTreeBtn.innerHTML =
+                        `<i class="fas fa-sign-in-alt mr-2"></i> Log in to create ${count} tree jobs`;
+                    return;
+                }
                 const label = count === 1 ? 'Create 1 tree job' : `Create ${count} bulk tree jobs`;
                 inaturalistTreeBtn.innerHTML = `<i class="fas fa-tree mr-2"></i> ${label}`;
                 return;
@@ -3350,6 +3913,43 @@
         inaturalistSpeciesItems.innerHTML = '';
         currentInaturalistResult = null;
         currentInaturalistUrl = null;
+    }
+
+    // Alan 9/22/26 - Anonymous batches are capped at ANONYMOUS_BATCH_TREE_LIMIT
+    // (inaturalist_tree_service.py). Over the cap, the visitor is sent to log in
+    // and the search is parked in sessionStorage, which survives the round trip
+    // in the same tab, so they come back to /tree with it filled in and
+    // previewed rather than having to find the username again.
+    const PENDING_INAT_BATCH_KEY = 'dikarya.pendingInatBatch';
+    const PENDING_INAT_BATCH_MAX_AGE_MS = 60 * 60 * 1000;
+    const USER_IS_AUTHENTICATED = {{ 'true' if current_user.is_authenticated else 'false' }};
+
+    function sendToLoginForInatBatch(input, resolvedType, loginUrl) {
+        try {
+            window.sessionStorage.setItem(PENDING_INAT_BATCH_KEY, JSON.stringify({
+                input, resolvedType: resolvedType || null, savedAt: Date.now()
+            }));
+        } catch (err) { /* storage blocked: they will just re-enter the search */ }
+        showStatus('Taking you to log in. You will come back here with this search ready to queue.', 'info');
+        window.location.href = loginUrl || {{ url_for('auth.login', next='/tree') | tojson }};
+    }
+
+    function takePendingInatBatch() {
+        let pending = null;
+        try {
+            const raw = window.sessionStorage.getItem(PENDING_INAT_BATCH_KEY);
+            if (!raw) return null;
+            // Only consume it once signed in; an anonymous visitor who backed
+            // out of the login page keeps it for when they do sign in.
+            if (!USER_IS_AUTHENTICATED) return null;
+            window.sessionStorage.removeItem(PENDING_INAT_BATCH_KEY);
+            pending = JSON.parse(raw);
+        } catch (err) {
+            return null;
+        }
+        if (!pending || typeof pending.input !== 'string' || !pending.input.trim()) return null;
+        if (!(Date.now() - Number(pending.savedAt || 0) < PENDING_INAT_BATCH_MAX_AGE_MS)) return null;
+        return pending;
     }
 
     async function previewInaturalistTreeInput(resolvedType = null) {
@@ -3418,8 +4018,14 @@
         )) {
             return;
         }
+        rewriteInaturalistTaxonInput();
         const input = inaturalistUrlInput.value.trim();
         if (!input || !isLikelyInaturalistTreeInput(input)) return;
+        // Search URLs belong to the direct-sequence flow below, not the
+        // observation/MycoMap one-click-tree preview. Previewing them on blur
+        // produced an alarming "not supported" error before Submit was even
+        // clicked, even though the URL is fully supported for sequence import.
+        if (isDirectInaturalistSequenceSearchInput(input)) return;
         previewInaturalistTreeInput();
     });
 
@@ -3440,7 +4046,20 @@
         inaturalistKeepTreeUrlRadio.addEventListener('change', updateInaturalistTreeButtonForInput);
     }
 
+    (async function resumePendingInatBatch() {
+        const pending = takePendingInatBatch();
+        if (!pending) return;
+        if (typeof window.openImportSection === 'function') window.openImportSection('inaturalist');
+        inaturalistUrlInput.value = pending.input.trim();
+        checkInatState();
+        const preview = await previewInaturalistTreeInput(pending.resolvedType);
+        if (preview && Number(preview.eligible_tree_count || 0) > 0) {
+            showStatus('You are logged in. Review the count below, then click Create to queue the tree jobs.', 'success');
+        }
+    })();
+
     fetchInaturalistBtn.addEventListener('click', async () => {
+        rewriteInaturalistTaxonInput();
         const url = inaturalistUrlInput.value.trim();
 
         // Client-side validation
@@ -3769,8 +4388,17 @@
                 throw httpError(resp, data.error || 'Failed to fetch sequences');
             }
 
-            const added = addSequences(data.sequences);
-            showStatus(`${data.message}. Added ${added} new sequences to queue.`, 'success');
+            const sourceUrl = data.inat_source_url || currentInaturalistUrl || '';
+            const sequences = data.sequences.map(sequence => ({
+                ...sequence,
+                inat_source_url: sourceUrl
+            }));
+            const added = addSequences(sequences);
+            showStatus(
+                `${data.message}. Added ${added} new sequences to the queue. `
+                + 'They are ready—click Run Quick Tree, or adjust Advanced settings first.',
+                'success'
+            );
 
             // Clear the URL input on success
             inaturalistUrlInput.value = '';
@@ -3790,6 +4418,9 @@
     // iNaturalist when the job completes. Backed by /api/inaturalist/tree.
     if (inaturalistTreeBtn) {
         inaturalistTreeBtn.addEventListener('click', async () => {
+            // A taxon page is a sequence search, not a one-click-tree scope;
+            // rewriting it hides this button, and the status says to use Submit.
+            if (rewriteInaturalistTaxonInput()) return;
             const input = inaturalistUrlInput.value.trim();
             if (!input || !isLikelyInaturalistTreeInput(input)) {
                 showStatus('Enter an iNaturalist observation, username, or project.', 'error');
@@ -3813,6 +4444,10 @@
                 const count = Number(preview.eligible_tree_count || 0);
                 if (count < 1) {
                     showStatus(preview.message || 'No observations are ready for tree building.', 'info');
+                    return;
+                }
+                if (preview.login_required) {
+                    sendToLoginForInatBatch(input, currentInaturalistTreeResolvedType || preview.type);
                     return;
                 }
             }
@@ -3895,6 +4530,14 @@
                     body: JSON.stringify(payload)
                 });
                 const data = await resp.json();
+                if (!resp.ok && data.login_required) {
+                    sendToLoginForInatBatch(
+                        input,
+                        currentInaturalistTreeResolvedType || preview?.type,
+                        data.login_url
+                    );
+                    return;
+                }
                 if (!resp.ok) {
                     throw new Error(data.error || data.message || 'Server error');
                 }
@@ -4277,6 +4920,8 @@
             return;
         }
 
+        if (!quickTreeLengthCheckPasses()) return;
+
         btn.disabled = true;
         btn.innerHTML = '<i class="fas fa-spinner fa-spin mr-2"></i> Submitting...';
         showStatus('Running Quick Tree analysis...', 'info');
@@ -4303,11 +4948,20 @@
             alignment_method: 'mafft',
             trimming_method: 'trimal_gappy',
             trim_terminal_overhangs: true,
-            tree_method: 'fasttree',
+            tree_method: 'iqtree_fast',
             tree_model: 'GTR+G',
-            bootstrap: 100,
+            // Says which button this came from, so the server does not have to
+            // infer it from the parameter set. The limited IQ-TREE search on its own is
+            // an ordinary advanced choice; only the preset carries the 10 kb
+            // per-sequence cap.
+            submission_mode: 'quick_tree',
+            // No bootstrap: the preset reports SH-aLRT branch support instead,
+            // 1000 replicates on a 0-100 scale,
+            // which is what the viewer reports (support_type "alrt"). Sending a
+            // replicate count would only persist one that never ran.
             import_filter_details: getImportFilterDetailsForPayload(),
-            mycomap_blast_url: getMycomapBlastUrlForPayload()
+            mycomap_blast_url: getMycomapBlastUrlForPayload(),
+            inat_source_url: getInaturalistSourceUrlForPayload()
         };
 
         try {
@@ -4453,6 +5107,9 @@
             const iqModel = iqtreeModelSelect?.value || 'MFP';
             const modelLabel = iqModel === 'MFP' ? 'ModelFinder' : iqModel;
             advancedCurrentSummary.textContent = `Currently: ${alignment} + ${treeMethod}, ${modelLabel}, ${terminalTrim}, ${rooting}, ${support}.`;
+        } else if (treeMethodSelect.value === 'iqtree_fast') {
+            // Fixed 1000 SH-aLRT replicates and no bootstrap in this preset.
+            advancedCurrentSummary.textContent = `Currently: ${alignment} + ${treeMethod}, ${terminalTrim}, ${rooting}, SH-aLRT branch support (1000 replicates, not bootstrap).`;
         } else if (treeMethodSelect.value === 'fasttree') {
             advancedCurrentSummary.textContent = `Currently: ${alignment} + ${treeMethod}, ${terminalTrim}, ${rooting}, SH-like local support (not bootstrap).`;
         } else if (treeMethodSelect.value === 'nj') {
@@ -4570,6 +5227,14 @@
 
             bootstrapInput.value = 1000;
             treeModelText.value = 'GTR+CAT';
+        } else if (method === 'iqtree_fast') {
+            // The IQ-TREE Quick Tree preset has no support control: it omits
+            // ultrafast bootstrap, and the SH-aLRT replicate count is fixed at
+            // 1000 in tree_builder_service. Only the model is editable, and
+            // GTR+CAT is a FastTree spelling IQ-TREE does not accept.
+            if (!treeModelText.value || treeModelText.value === 'GTR+CAT') {
+                treeModelText.value = 'GTR+G';
+            }
         } else if (method === 'mrbayes') {
             mbOptions.classList.remove('hidden');
             updateMrBayesStopEarlyState();
@@ -4922,6 +5587,12 @@
 
         const payload = {
             input_type: 'sequence',
+            // The advanced builder can reproduce the Quick Tree preset's four
+            // values exactly (mafft + trimAl-gappy + limited IQ-TREE + GTR+G is a
+            // reasonable thing to choose by hand), so it says which form it is
+            // rather than leaving the server to guess. Advanced submissions
+            // have always accepted long loci and still do.
+            submission_mode: 'advanced',
             sequence: buildFastaFromQueue(),
             sequence_metadata: buildSequenceMetadataFromQueue(),
             notes: notes,
@@ -4960,7 +5631,8 @@
             seed: document.getElementById('raxml_seed').value ? parseInt(document.getElementById('raxml_seed').value) : null,
             outgroup: document.getElementById('outgroup_select').value || null,
             import_filter_details: getImportFilterDetailsForPayload(),
-            mycomap_blast_url: getMycomapBlastUrlForPayload()
+            mycomap_blast_url: getMycomapBlastUrlForPayload(),
+            inat_source_url: getInaturalistSourceUrlForPayload()
         };
 
         try {
@@ -5034,6 +5706,48 @@
         return header;
     }
 
+    // =========================================================================
+    // Quick Tree per-sequence ceiling
+    //
+    // Quick Tree is the fixed MAFFT --auto / trimAl / IQ-TREE five-iteration preset, meant for
+    // barcode-length reads. MAFFT --auto's cost grows with sequence length as
+    // well as count, so one pathological record can turn a ten-second job into
+    // one that holds the single worker slot for hours. The advanced tree
+    // builder is untouched: a long locus is a perfectly reasonable RAxML run.
+    //
+    // The same ceiling is enforced in app/api/routes.py, from
+    // QUICK_TREE_MAX_SEQUENCE_BP in app/services/tree_parameter_validation.py.
+    // This check only saves the user a round trip; it is not the boundary. The
+    // two constants are asserted equal by tests/test_quick_tree_limits.py.
+    // =========================================================================
+    const QUICK_TREE_MAX_SEQUENCE_BP = 10000;
+
+    function quickTreeOversizedSequences() {
+        return sequenceQueue
+            .map(seq => ({
+                name: seq.name || '',
+                length: String(seq.sequence || '').replace(/\s+/g, '').length,
+            }))
+            .filter(entry => entry.length > QUICK_TREE_MAX_SEQUENCE_BP);
+    }
+
+    // Returns true when the submission may go ahead; shows the error and
+    // returns false when it may not.
+    function quickTreeLengthCheckPasses() {
+        const oversized = quickTreeOversizedSequences();
+        if (oversized.length === 0) return true;
+        const longest = Math.max(...oversized.map(entry => entry.length));
+        showStatus(
+            `Quick Tree is intended for barcode-length sequences and does not accept `
+            + `individual sequences over ${QUICK_TREE_MAX_SEQUENCE_BP.toLocaleString()} bp. `
+            + `Use the advanced tree builder for longer loci. `
+            + `${oversized.length} sequence(s) exceed the limit; the longest is `
+            + `${longest.toLocaleString()} bp.`,
+            'error'
+        );
+        return false;
+    }
+
     function buildFastaFromQueue() {
         return sequenceQueue.map(seq => {
             const header = buildFastaHeaderFromQueueItem(seq);
@@ -5087,16 +5801,18 @@
     // Initialize & "Add Sequences" Mode Logic
     // =========================================================================
     const urlParams = new URLSearchParams(window.location.search);
-    // Alan 5/10/26 - Strict UUIDv4 validation of edit_job_id/clone_job_id from the URL
+    // Alan 5/10/26 - Strict validation of edit_job_id/clone_job_id from the URL
     // before using them. These values flow into innerHTML and into fetch() URLs,
     // so an attacker-crafted link could otherwise inject markup or hit arbitrary
     // backend paths via the victim's session. Drop the value entirely if it
-    // doesn't match the UUID shape.
-    const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+    // doesn't match a job id shape.
+    // Mirrors validate_job_id() in app/services/security_utils.py: legacy UUID4
+    // jobs, or the short base36 id new jobs get. Change both together.
+    const JOB_ID_RE = /^(?:(?:[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-4[0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12})|[a-z0-9]{4,12})$/;
     const rawEditId = urlParams.get('edit_job_id');
     const rawCloneId = urlParams.get('clone_job_id');
-    const EDIT_JOB_ID = (rawEditId && UUID_RE.test(rawEditId)) ? rawEditId : null;
-    const CLONE_JOB_ID = (rawCloneId && UUID_RE.test(rawCloneId)) ? rawCloneId : null;
+    const EDIT_JOB_ID = (rawEditId && JOB_ID_RE.test(rawEditId)) ? rawEditId : null;
+    const CLONE_JOB_ID = (rawCloneId && JOB_ID_RE.test(rawCloneId)) ? rawCloneId : null;
     const submitBtn = document.getElementById('submit_btn');
 
     // --- HANDLE CLONE JOB (Load sequences from another job) ---
@@ -5305,7 +6021,7 @@
         // --- MODIFY UI FOR "ADD SEQ" MODE ---
         // Alan 5/10/26 - Build the heading via DOM APIs + textContent instead of
         // innerHTML so EDIT_JOB_ID (URL-supplied) can never be parsed as markup.
-        // Defense in depth on top of the UUID regex check above.
+        // Defense in depth on top of the job id regex check above.
         const headingEl = document.querySelector('.tree-page-title');
         if (headingEl) {
             headingEl.textContent = '';

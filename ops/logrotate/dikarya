@@ -1,8 +1,29 @@
-/var/www/dikarya/var/logs/access.log /var/www/dikarya/var/logs/error.log /var/www/dikarya/var/logs/errors.log /var/www/dikarya/var/logs/worker.log /var/www/dikarya/var/logs/worker-bulk.log {
+# Alan 9/12/26 - Retention is now indefinite. It used to be `rotate 14` with
+# `maxage 30`, and `rotate 14` was what actually bound: every stem kept exactly
+# 14 rotations plus the live file, which worked out to 13 days, not the 30 the
+# maxage implied (`maxsize 25M` makes a busy day rotate twice and burn two
+# slots). Thirteen days of ALL of these logs was 3.2 MB compressed against a
+# 5.3 GB var/jobs, so the retention was buying nothing and costing history --
+# errors.log alone is 2.8 KB/day, about 1 MB/year.
+#
+# Nothing is deleted now: `rotate -1` is logrotate's own "never remove old
+# logs" value (verified against the installed logrotate 3.21.0 with
+# `logrotate --debug`), and `maxage` is gone. It replaced `rotate 99999`, which
+# only approximated the same thing. Revisit only if var/logs stops being a
+# rounding error next to var/jobs.
+#
+# `dateext` matters more with unlimited retention than it did with 14 slots:
+# without it every rotation renames the whole chain (foo.log.1 -> foo.log.2 ->
+# ... ), so keeping years of files would mean thousands of renames per run.
+# With dateext each rotation is written once under its own timestamp and never
+# touched again. Nothing reads these by name -- the digest globs `<stem>.log*`
+# and orders by mtime (scripts/dikarya_log_digest.py:log_files), and
+# scripts/dikarya-nginx-log reads /var/log/nginx, which this file does not
+# manage -- so the naming is free to be the timestamped one.
+/var/www/dikarya/var/logs/access.log /var/www/dikarya/var/logs/error.log /var/www/dikarya/var/logs/errors.log /var/www/dikarya/var/logs/worker.log /var/www/dikarya/var/logs/worker-bulk.log /var/www/dikarya/var/logs/scanner.log {
     daily
     maxsize 25M
-    rotate 14
-    maxage 30
+    rotate -1
     missingok
     notifempty
     compress
@@ -15,7 +36,11 @@
 # file and nothing ever truncated it, so it had grown to 36 MB since December and
 # would keep going at roughly 50 MB a year. Nothing reads it back -- the
 # monitoring dashboard calls collect_system_metrics() live -- so it is a pure
-# write-only sink that only ever cost disk. Same policy as the logs above.
+# write-only sink that only ever cost disk.
+#
+# Alan 9/12/26 - This one keeps a bounded window deliberately, unlike the logs
+# above: it is machine telemetry nothing reads back, not a record of what
+# happened, so age-limiting it loses nothing an operator would want.
 /var/www/dikarya/var/metrics/system_metrics.jsonl {
     daily
     maxsize 25M

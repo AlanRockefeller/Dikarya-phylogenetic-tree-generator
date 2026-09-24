@@ -7,7 +7,7 @@ from rq import Queue, Retry
 from rq.exceptions import NoSuchJobError
 from rq.job import Job as RqJob
 from flask import current_app
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 QUEUE_HIGH = "phylo_high"
 QUEUE_BULK = "phylo_bulk"
@@ -61,6 +61,11 @@ _TRIMMING_STAGE_TOOL = {
 _TREE_STAGE_TOOL = {
     "raxml": "RAxML",
     "iqtree": "IQ-TREE",
+    # Quick Tree is the same executable under the same IQ-TREE budget. It is far
+    # quicker in practice, but the budget is a ceiling, not an estimate, and
+    # giving the Quick Tree engine its own smaller one would only turn a slow
+    # run into a killed one.
+    "iqtree_fast": "IQ-TREE",
     "mrbayes": "MrBayes",
     "fasttree": "FastTree",
     # Neighbour-joining is computed in-process, so it has no tool budget of its
@@ -185,6 +190,37 @@ def safe_job_description(kind: str, job_params: Optional[Dict[str, Any]] = None,
     return " ".join(str(part) for part in parts)[:200]
 
 
+def apply_input_warnings(job_params: Dict[str, Any]) -> List[str]:
+    """Recompute ``job_params['input_warnings']`` from the current sequences.
+
+    Flags input that cannot produce an informative tree (two sequences, or a
+    set that is all one sequence). Advisory only: it never blocks a job.
+
+    **Must be recomputed after anything that removes records.** The warning
+    text quotes the count ("All 3 submitted sequences are identical"), and the
+    two-sequence warning only exists at a count of exactly two, so a dedup pass
+    that collapses three records to two both adds a warning and invalidates any
+    existing one. The observation dedup now runs twice -- offline at submit
+    time, then again in the worker where the NCBI annotation lookup is
+    affordable -- so this is called from both places rather than only the first.
+
+    Returns the warnings, and clears the key when there are none, so a refresh
+    can retract a warning that no longer applies.
+    """
+    from app.services.fasta_utils import describe_degenerate_input
+
+    input_warnings = describe_degenerate_input(
+        job_params.get("sequence", ""),
+        accession_count=len(job_params.get("accessions") or []),
+        blast_mode=job_params.get("blast_mode"),
+    )
+    if input_warnings:
+        job_params["input_warnings"] = input_warnings
+    else:
+        job_params.pop("input_warnings", None)
+    return input_warnings
+
+
 def prepare_phylo_job_params(job_params: Dict[str, Any]) -> None:
     """Apply submission-wide normalization before persistence or enqueueing."""
     # Collapse near-identical records that share an observation number. This
@@ -194,19 +230,10 @@ def prepare_phylo_job_params(job_params: Dict[str, Any]) -> None:
     from app.services.sequence_dedup_service import apply_observation_dedup
     apply_observation_dedup(job_params)
 
-    # Flag input that cannot produce an informative tree (two sequences, or a set
-    # that is all one sequence). Runs after dedup so the count is the one the
-    # pipeline will actually align, and here rather than in create_job so every
-    # submission path gets it. Callers read it back off job_params to show the
-    # user; it is advisory only and never blocks the job.
-    from app.services.fasta_utils import describe_degenerate_input
-    input_warnings = describe_degenerate_input(
-        job_params.get("sequence", ""),
-        accession_count=len(job_params.get("accessions") or []),
-        blast_mode=job_params.get("blast_mode"),
-    )
-    if input_warnings:
-        job_params["input_warnings"] = input_warnings
+    # After dedup, so the count is the one the pipeline will actually align,
+    # and here rather than in create_job so every submission path gets it.
+    # Callers read it back off job_params to show the user.
+    apply_input_warnings(job_params)
 
 
 # Which submissions belong on the slow lane.
@@ -220,6 +247,9 @@ def prepare_phylo_job_params(job_params: Dict[str, Any]) -> None:
 # durations. Tree method dominates and size is secondary:
 #
 #     fasttree   n=181   p50=   25s   p90=  57s   max=  143s
+#                        (iqtree_fast, which replaced FastTree as the Quick
+#                        Tree engine, benchmarked in the same 2-40s band and
+#                        is routed the same way)
 #     none       n= 94   p50=   58s   p90=  81s   max=  190s
 #     iqtree     n= 14   p50=  124s   p90=1292s   max= 2554s
 #     raxml      n=  7   p50= 1279s   p90=9276s   max= 9276s
@@ -468,3 +498,60 @@ def get_job_status(job_id: str) -> Dict[str, Any]:
             job_id=job_id, exception=type(e).__name__,
         )
         return {"id": job_id, "status": "error", "error": "Job status unavailable"}
+
+
+def get_queue_position(job_id: str) -> Optional[Dict[str, Any]]:
+    """Where a queued job stands in its RQ queue, for the status page.
+
+    Alan 9/22/26 - A single iNaturalist batch put ~540 jobs on phylo_bulk, and
+    each of those status pages just said "waiting for a worker" for hours.
+
+    Returns None when the job is unknown or Redis is unavailable. Otherwise
+    ``state`` is one of:
+      waiting    -- in the queue; ``position`` is 1 for the next job to start
+      scheduled  -- deliberately parked (a MycoMap/NCBI wait); rejoins later
+      started    -- a worker has picked it up
+      other      -- finished, failed or otherwise not waiting
+    Each queue has its own worker, so only the job's own queue is counted.
+    Nothing here comes from the submission, so it is safe to publish.
+    """
+    try:
+        conn = get_redis_connection()
+        try:
+            job = RqJob.fetch(job_id, connection=conn)
+        except NoSuchJobError:
+            return None
+        status = job.get_status()
+        queue_name = job.origin if job.origin in VALID_QUEUE_NAMES else None
+        info: Dict[str, Any] = {
+            "state": "other",
+            "queue": queue_name,
+            "lane": "bulk" if queue_name == QUEUE_BULK else "high",
+            "position": None,
+            "queue_length": None,
+        }
+        if status == "started":
+            info["state"] = "started"
+            return info
+        if status in ("scheduled", "deferred"):
+            info["state"] = "scheduled"
+            return info
+        if status != "queued" or not queue_name:
+            return info
+        key = f"rq:queue:{queue_name}"
+        index = conn.lpos(key, job_id)
+        info["queue_length"] = int(conn.llen(key))
+        if index is None:
+            # Enqueued but not in the list yet, or just popped by the worker.
+            return info
+        info["state"] = "waiting"
+        info["position"] = int(index) + 1
+        return info
+    except Exception as exc:
+        from app.services.log_context import log_degradation_rate_limited
+        log_degradation_rate_limited(
+            logger, "rq_queue_position_failed",
+            "Queue position lookup failed; the status page shows no position",
+            exception=type(exc).__name__,
+        )
+        return None

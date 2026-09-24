@@ -20,6 +20,7 @@ inaturalist_service = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(inaturalist_service)
 
 validate_inaturalist_url = inaturalist_service.validate_inaturalist_url
+canonical_inaturalist_source_url = inaturalist_service.canonical_inaturalist_source_url
 clean_dna_sequence = inaturalist_service.clean_dna_sequence
 
 
@@ -94,6 +95,27 @@ class TestInaturalistUrlValidation(unittest.TestCase):
         url = "https://notinaturalist.org/observations/12345"
         result = validate_inaturalist_url(url)
         self.assertIsNone(result)
+
+    def test_canonical_source_url_preserves_search_filters(self):
+        source = (
+            "https://www.inaturalist.org/observations?subview=map&taxon_id=63839"
+            "&field:DNA%20Barcode%20ITS="
+        )
+        self.assertEqual(canonical_inaturalist_source_url(source), source)
+
+    def test_canonical_source_url_rejects_non_web_schemes(self):
+        self.assertEqual(
+            canonical_inaturalist_source_url(
+                "javascript://inaturalist.org/observations?taxon_id=63839"
+            ),
+            "",
+        )
+
+    def test_canonical_source_url_expands_observation_ids(self):
+        self.assertEqual(
+            canonical_inaturalist_source_url("12345678"),
+            "https://www.inaturalist.org/observations/12345678",
+        )
 
 
 class TestDnaSequenceCleanup(unittest.TestCase):
@@ -320,6 +342,22 @@ class TestQueryLogic(unittest.TestCase):
         self.assertEqual(sequences[0]['organism'], 'Override Name')
         self.assertEqual(sequences[1]['organism'], 'Prov Name')
         self.assertEqual(sequences[2]['organism'], 'Taxon Name')
+
+    def test_extract_sequences_preserves_provisional_species_quotes(self):
+        """Single quotes distinguish provisional fungal species codes."""
+        sequences = inaturalist_service.extract_sequences_from_observations([{
+            'observation': {
+                'id': 9402447,
+                'ofvs': [{
+                    'name': 'Provisional Species Name',
+                    'value': "<Pisolithus> sp. 'AZ01'\"",
+                }],
+                'taxon': {'name': "Pisolithus sp. 'AZ01'"},
+            },
+            'cleaned_dna': 'ATGC',
+        }], resolve_places=False)
+
+        self.assertEqual(sequences[0]['organism'], "Pisolithus sp. 'AZ01'")
 
 
     def test_fetch_observations_with_field_filter_strips_params(self):

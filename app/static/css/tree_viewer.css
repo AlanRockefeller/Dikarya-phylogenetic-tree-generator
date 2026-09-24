@@ -1,7 +1,6 @@
 #tree-container {
     overflow: auto;
     position: relative;
-    overscroll-behavior: contain;
 }
 
 .tree-mobile-only {

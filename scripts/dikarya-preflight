@@ -34,9 +34,21 @@ fi
 
 # Modules that must import cleanly for the app to serve or process a job. Add to
 # this list, do not replace it.
-if .venv/bin/python -c "import app.workers.tasks, app.workers.queue, app.api.routes, app.api_v1.routes, app.main.routes, app.services.api_diagnostics, app.services.scanner_burst, app.monitoring.services"; then
+if .venv/bin/python -c "import app.workers.tasks, app.workers.queue, app.api.routes, app.api_v1.routes, app.main.routes, app.services.api_diagnostics, app.services.inat_finder_service, app.services.scanner_burst, app.monitoring.services"; then
     echo "preflight: imports OK"
 else
     echo "preflight: FAILED -- do not restart; the traceback above is what users would get as a 500" >&2
+    exit 1
+fi
+
+# Module-level imports above cannot see a broken import inside a function body:
+# that line does not run until its code path does. On 2026-09-09 exactly that
+# shipped -- app/workers/tasks.py imported describe_mycomap_queue_wait from
+# mycomap_service, which never defined it, inside run_phylo_job's
+# waiting_for_ncbi branch. Everything imported, the restart looked healthy, and
+# a user's iNat tree died four minutes later with an ImportError. The check
+# below resolves those ~600 deferred names statically. It costs about a second.
+if ! .venv/bin/python scripts/dikarya_check_deferred_imports.py; then
+    echo "preflight: FAILED -- do not restart; each name above is a runtime ImportError" >&2
     exit 1
 fi
