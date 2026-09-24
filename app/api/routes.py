@@ -1750,6 +1750,7 @@ def gather_mycomap_sequences_for_queue(url, include_ncbi=True, include_local=Tru
         parse_mycomap_ncbi_fasta_header,
         prefer_local_mycomap_taxa,
         uniquify_mycomap_sequence_names,
+        parse_mycomap_result_reference,
         validate_mycomap_sequence_url,
         validate_mycomap_url,
     )
@@ -1781,7 +1782,7 @@ def gather_mycomap_sequences_for_queue(url, include_ncbi=True, include_local=Tru
     # Alan 8/14/26 - A sequence record URL also carries an r<digits> token, so
     # validate_mycomap_url() happily reads it as a BLAST ID and would fetch an
     # unrelated BLAST record. Route it to the endpoint that actually understands it.
-    if validate_mycomap_sequence_url(url):
+    if not url.lower().startswith(('https://mycomap.org/', 'https://www.mycomap.org/')) and validate_mycomap_sequence_url(url):
         return None, ({
             "status": "error",
             "error": (
@@ -1831,12 +1832,21 @@ def gather_mycomap_sequences_for_queue(url, include_ncbi=True, include_local=Tru
             }, 404)
         url = legacy["url"]
 
-    blast_id = validate_mycomap_url(url)
-    if not blast_id:
+    reference = parse_mycomap_result_reference(url)
+    if not reference:
         return None, ({
             "status": "error",
-            "error": "Invalid Mycomap URL. URL must be from mycomap.com and contain a result ID (e.g., r12345)",
+            "error": "Invalid MycoMap results URL. Use a mycomap.org result page or a legacy mycomap.com BLAST Search page.",
         }, 400)
+    provider = reference["provider"]
+    blast_id = reference.get("result_id")
+    if provider == "org" and not blast_id:
+        from app.services.mycomap_org_service import OrgResultError, resolve_result_id
+        try:
+            blast_id = resolve_result_id(reference)
+        except OrgResultError as exc:
+            return None, ({"status": "error", "error": str(exc),
+                           "retryable": exc.status in (409, 502)}, exc.status)
 
     # Alan 8/15/26 - Log the URL alongside the extracted ID. The raw URL was logged
     # only when validation *failed*, so a URL that parsed to the wrong ID and then
@@ -1849,7 +1859,7 @@ def gather_mycomap_sequences_for_queue(url, include_ncbi=True, include_local=Tru
     )
     ncbi_queue_position = (
         get_mycomap_ncbi_queue_position(url) if include_ncbi else None
-    )
+    ) if provider == "com" else None
     ncbi_queued = ncbi_queue_position is not None
     if ncbi_queued:
         logger.info(
@@ -1867,12 +1877,30 @@ def gather_mycomap_sequences_for_queue(url, include_ncbi=True, include_local=Tru
                 "ncbi_queue_position": ncbi_queue_position,
                 "retryable": True,
             }, 409)
-    result = fetch_mycomap_fasta(
-        blast_id, include_ncbi and not ncbi_queued, include_local,
-        time_budget=fetch_time_budget
-    )
+    if provider == "org":
+        from app.services.mycomap_org_service import OrgResultError, fetch_results
+        try:
+            result = fetch_results(
+                blast_id, include_ncbi=include_ncbi, include_local=include_local,
+                time_budget=fetch_time_budget,
+            )
+        except OrgResultError as exc:
+            return None, ({"status": "error", "error": str(exc),
+                           "retryable": exc.status == 502}, exc.status)
+        ncbi_queued = "ncbi" in result["pending_sources"]
+        ncbi_queue_position = result["ncbi_queue_position"]
+        if not result["sequences"] and result["pending_sources"]:
+            return None, ({"status": "pending", "error": "MycoMap.org BLAST results are still pending.",
+                           "pending_sources": result["pending_sources"],
+                           "ncbi_queue_position": ncbi_queue_position,
+                           "retryable": True}, 409)
+    else:
+        result = fetch_mycomap_fasta(
+            blast_id, include_ncbi and not ncbi_queued, include_local,
+            time_budget=fetch_time_budget
+        )
 
-    if result['errors'] and not result['fasta_content']:
+    if result['errors'] and not (result.get('fasta_content') or result.get('sequences')):
         # An upstream 404 means the record does not exist -- a real answer, not a
         # gateway fault. Say so in words the user can act on instead of returning
         # a 502 carrying raw urllib text ("Network error fetching fasta: HTTP
@@ -1888,13 +1916,25 @@ def gather_mycomap_sequences_for_queue(url, include_ncbi=True, include_local=Tru
             }, 404)
         return None, ({"status": "error", "error": "; ".join(result['errors'])}, 502)
 
-    sequences = _parse_fasta_sequences(result['fasta_content'])
+    sequences = (result['sequences'] if provider == "org"
+                 else _parse_fasta_sequences(result['fasta_content']))
     for seq in sequences:
         seq['_mycomap_original_name'] = seq.get('name', '')
+        if provider == "org":
+            seq['_org_metric'] = {
+                'identity': seq.get('identity'),
+                'query_cover': seq.get('query_cover'),
+                'subject_cover': seq.get('subject_cover'),
+                'species_name': seq.get('taxon'),
+                'mycomap_location': seq.get('location'),
+                'is_contaminant': seq.get('is_contaminant'),
+            }
 
     ncbi_count = result['ncbi_count']
     for i, seq in enumerate(sequences):
         seq['source'] = 'mycomap'
+        if provider == "org":
+            continue
         if include_ncbi and include_local:
             seq['hit_source'] = 'ncbi' if i < ncbi_count else 'local'
         elif include_ncbi:
@@ -1957,7 +1997,8 @@ def gather_mycomap_sequences_for_queue(url, include_ncbi=True, include_local=Tru
     sequences = cleaned_sequences
     dropped_count = original_count - len(sequences)
 
-    metrics_by_key = fetch_mycomap_blast_metrics(blast_id, source_url=url)
+    metrics_by_key = ({} if provider == "org"
+                      else fetch_mycomap_blast_metrics(blast_id, source_url=url))
     query_tokens = set()
     query_sequences = []
     if filter_conflicting_local_fasta:
@@ -1966,7 +2007,7 @@ def gather_mycomap_sequences_for_queue(url, include_ncbi=True, include_local=Tru
             sequences, metrics_by_key, query_tokens
         )
     sequence_metrics = [
-        _mycomap_metric_for_sequence(seq, metrics_by_key)
+        seq.get('_org_metric') or _mycomap_metric_for_sequence(seq, metrics_by_key)
         for seq in sequences
     ]
     metric_conflicts = {}
@@ -2132,6 +2173,7 @@ def gather_mycomap_sequences_for_queue(url, include_ncbi=True, include_local=Tru
     sequences = uniquify_mycomap_sequence_names(sequences)
     for seq in sequences:
         seq.pop('_mycomap_original_name', None)
+        seq.pop('_org_metric', None)
     metrics_attached_count = sum(
         1 for seq in sequences if seq.get('blast_metrics_available')
     )
@@ -2145,11 +2187,16 @@ def gather_mycomap_sequences_for_queue(url, include_ncbi=True, include_local=Tru
         parts.append(f"{result['local_count']} local")
     msg = f"Fetched {' + '.join(parts)} sequences from Mycomap"
     if ncbi_queued:
-        msg += (
-            f" -- MycoMap reports the NCBI search is still at queue position "
-            f"{ncbi_queue_position}; local results were imported now without "
-            "treating the pending NCBI export as a failure."
-        )
+        if ncbi_queue_position is not None:
+            msg += (
+                f" -- MycoMap reports the NCBI search is still at queue position "
+                f"{ncbi_queue_position}; local results were imported now without "
+                "treating the pending NCBI export as a failure."
+            )
+        else:
+            msg += " -- NCBI results are still pending on MycoMap; available local results were imported."
+    if "local" in result.get("pending_sources", []):
+        msg += " -- Local MycoBLAST results are still pending; available NCBI results were imported."
     if dropped_count > 0:
         msg += f" ({dropped_count} dropped due to invalid/short sequences)"
     if contaminant_dropped_count > 0:
@@ -2178,7 +2225,7 @@ def gather_mycomap_sequences_for_queue(url, include_ncbi=True, include_local=Tru
         "ncbi_count": result['ncbi_count'],
         "local_count": result['local_count'],
         "failed_sources": failed_sources,
-        "pending_sources": ["ncbi"] if ncbi_queued else [],
+        "pending_sources": result.get("pending_sources", ["ncbi"] if ncbi_queued else []),
         "ncbi_queue_position": ncbi_queue_position,
         "blast_metrics_count": metrics_attached_count,
         "conflicting_local_count": conflicting_local_dropped_count,
@@ -2358,11 +2405,11 @@ def start_mycomap_blast_refresh():
     if not url:
         return jsonify({"status": "error", "error": "No URL provided"}), 400
 
-    from app.services.mycomap_service import validate_mycomap_url
-    if not validate_mycomap_url(url):
+    from app.services.mycomap_service import parse_mycomap_result_reference
+    if not parse_mycomap_result_reference(url):
         return jsonify({
             "status": "error",
-            "error": "Invalid Mycomap URL. URL must be from mycomap.com and contain a result ID (e.g., r12345)",
+            "error": "Invalid MycoMap results URL.",
         }), 400
 
     rebuild_ncbi, rebuild_ncbi_valid = coerce_bool(data.get('rebuild_ncbi'), default=False)

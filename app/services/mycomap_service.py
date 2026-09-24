@@ -2244,14 +2244,65 @@ def refresh_mycomap_observation_records(references: list) -> dict:
     }
 
 
-# Alan 9/16/26 - mycomap.org is a real MycoMap host whose admin URLs
-# (https://mycomap.org/admin/blast-results/<observation_id>/<record_id>) this
-# app cannot resolve through the mycomap.com API yet. It is NOT accepted by
-# validate_mycomap_url(), so a saved .org value still falls back to creating a
-# replacement search -- but callers use this helper to recognise the case and
-# leave the user's stored .org value alone instead of overwriting it. Remove
-# this only when real .org support lands and .org URLs validate directly.
+# The legacy validator below remains specific to .com. The provider-aware
+# parser accepts these .org hosts on the three supported result paths.
 MYCOMAP_ORG_HOSTNAMES = ('mycomap.org', 'www.mycomap.org')
+
+
+def parse_mycomap_result_reference(url: str) -> Optional[dict]:
+    """Identify a supported result URL without making a network request.
+
+    A reference keeps the supplied URL for provenance. An observation link's
+    sequence ID is resolved to its BLAST job through MycoMap.org metadata later.
+    """
+    if not isinstance(url, str) or not url.strip():
+        return None
+    url = url.strip()
+    try:
+        parsed = urllib.parse.urlparse(url)
+        host = (parsed.hostname or '').lower()
+        if parsed.username or parsed.password or parsed.port:
+            return None
+    except (ValueError, TypeError):
+        return None
+    if host in MYCOMAP_ORG_HOSTNAMES:
+        if parsed.scheme != 'https' or parsed.query or parsed.fragment:
+            return None
+        path = parsed.path.rstrip('/')
+        direct = re.fullmatch(r'/mycoblast/(\d+)', path)
+        linked = re.fullmatch(
+            r'/(?:admin/)?blast-results/(\d{1,12})/(\d+)', path
+        )
+        if direct:
+            return {"provider": "org", "kind": "mycoblast",
+                    "result_id": direct.group(1), "url": url}
+        if linked:
+            return {"provider": "org", "kind": "sequence",
+                    "observation_id": linked.group(1),
+                    "sequence_id": linked.group(2), "url": url}
+        return None
+    if host in ('mycomap.com', 'www.mycomap.com'):
+        blast_id = validate_mycomap_url(url, quiet=True)
+        if blast_id:
+            return {"provider": "com", "kind": "mycoblast",
+                    "result_id": blast_id, "url": url}
+    return None
+
+
+def resolve_mycomap_result_reference(url: str) -> Optional[dict]:
+    """Return the provider and BLAST ID, resolving org sequence links if needed."""
+    reference = parse_mycomap_result_reference(url)
+    if reference and reference["provider"] == "org" and not reference.get("result_id"):
+        from app.services.mycomap_org_service import resolve_result_id
+        reference["result_id"] = resolve_result_id(reference)
+    return reference
+
+
+def rerun_mycomap_result(reference: dict, result_type: str, limit: int) -> dict:
+    if reference["provider"] == "org":
+        from app.services.mycomap_org_service import rerun
+        return rerun(reference["result_id"], result_type, limit)
+    return rerun_mycomap_blast(reference["result_id"], result_type=result_type, limit=limit)
 
 
 def is_mycomap_org_url(url: str) -> bool:
@@ -2653,6 +2704,22 @@ def get_mycomap_ncbi_queue_status(mycomap_url: Optional[str] = None, *,
     position could not be determined, which is why ``source`` is reported: only
     an answer from the API or the page is evidence about the queue at all.
     """
+    reference = parse_mycomap_result_reference(mycomap_url) if mycomap_url else None
+    if reference and reference["provider"] == "org":
+        from app.services.mycomap_org_service import OrgResultError, status
+        try:
+            resolved = blast_id or resolve_mycomap_result_reference(mycomap_url)["result_id"]
+            record = status(resolved)
+            ncbi = record.get("ncbi") or {}
+            return {
+                "queue_position": _coerce_queue_position(ncbi.get("queue_position")),
+                "status": ncbi.get("status"), "rid": ncbi.get("rid"),
+                "source": "api",
+            }
+        except OrgResultError:
+            logger.warning("MycoMap.org NCBI status unavailable", exc_info=True)
+            return {"queue_position": None, "status": None, "rid": None, "source": None}
+
     resolved_id = str(blast_id or "").strip()
     if not resolved_id.isdigit() and mycomap_url:
         resolved_id = validate_mycomap_url(mycomap_url) or ""

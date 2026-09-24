@@ -344,15 +344,15 @@ def _clean_text(value: Any, max_length: int = 500) -> str:
 def _mycomap_blast_url_from_notes(notes: Any) -> str:
     """Return the first validated MycoMap result URL in sequence notes."""
     text = str(notes or "")
-    from app.services.mycomap_service import validate_mycomap_url
+    from app.services.mycomap_service import parse_mycomap_result_reference
 
     for match in re.finditer(
-        r"https?://(?:www\.)?mycomap\.com/[^\s<>\"']+",
+        r"https?://(?:www\.)?mycomap\.(?:com|org)/[^\s<>\"']+",
         text,
         re.IGNORECASE,
     ):
         candidate = match.group(0).rstrip(".,;:!?)]}")
-        if validate_mycomap_url(candidate):
+        if parse_mycomap_result_reference(candidate):
             return candidate
     return ""
 
@@ -841,6 +841,7 @@ def prepare_tree_job(preparation: Dict[str, Any], *, defer_after_ncbi_rerun: boo
         get_mycomap_creation_discovery_max_seconds,
         recalled_blast_id_for_title,
         unconfirmed_mycomap_creation_verdict,
+        resolve_mycomap_result_reference,
         validate_mycomap_url,
         validate_mycomap_rerun_limit,
     )
@@ -862,7 +863,13 @@ def prepare_tree_job(preparation: Dict[str, Any], *, defer_after_ncbi_rerun: boo
     title = _mycomap_title(observation_id, sequence_id, sequence)
     details = dict(mycomap_rerun_details or {})
     notes_mycomap_url = str(preparation.get("mycomap_blast_url") or "").strip()
-    notes_blast_id = validate_mycomap_url(notes_mycomap_url)
+    from app.services.mycomap_org_service import OrgResultError
+    try:
+        notes_reference = (resolve_mycomap_result_reference(notes_mycomap_url)
+                           if notes_mycomap_url else None)
+    except OrgResultError as exc:
+        raise MushroomObserverError(str(exc), status=exc.status) from exc
+    notes_blast_id = notes_reference["result_id"] if notes_reference else None
     if not notes_blast_id:
         notes_mycomap_url = ""
     mycomap_url = str(
@@ -986,14 +993,16 @@ def prepare_tree_job(preparation: Dict[str, Any], *, defer_after_ncbi_rerun: boo
                     mycomap_local_limit=local_limit,
                     mycomap_ncbi_limit=ncbi_limit,
                     progress=progress,
+                    mycomap_url=mycomap_url,
                 )
-            except MycoMapRerunError as exc:
+            except (MycoMapRerunError, OrgResultError) as exc:
                 raise MushroomObserverError(str(exc), status=502)
             details["auto_created"] = False
             details["reused_from_sequence_notes"] = bool(notes_blast_id)
             details["created_blast_id"] = found["blast_id"]
             details["created_mycomap_url"] = found["url"]
-            if preparation.get("rebuild_ncbi_blast") and defer_after_ncbi_rerun:
+            if ((preparation.get("rebuild_ncbi_blast") and defer_after_ncbi_rerun)
+                    or details.get("org_wait_sources")):
                 return {
                     "status": "waiting_for_ncbi",
                     "notes": _job_title(observation_id, preparation.get("consensus_name")),
@@ -1022,6 +1031,18 @@ def prepare_tree_job(preparation: Dict[str, Any], *, defer_after_ncbi_rerun: boo
                     details, pending_creation
                 ),
             }
+
+    if notes_reference and notes_reference["provider"] == "org" and skip_mycomap_refresh and details.get("org_wait_sources"):
+        from app.services.mycomap_org_service import rerun_pending
+        try:
+            still_pending = rerun_pending(details)
+        except OrgResultError as exc:
+            raise MushroomObserverError(str(exc), status=exc.status) from exc
+        if still_pending:
+            return {"status": "waiting_for_ncbi",
+                    "notes": _job_title(observation_id, preparation.get("consensus_name")),
+                    "mycomap_blast_url": notes_mycomap_url,
+                    "mycomap_rerun_details": details}
 
     if details.get("auto_created"):
         blast_id = str(details.get("created_blast_id") or "")

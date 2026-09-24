@@ -463,6 +463,56 @@ class TestInaturalistTreeSourceLabel(unittest.TestCase):
         self.assertTrue(caught.exception.details.get("mycomap_unavailable"))
         self.assertIn("nothing was created", str(caught.exception))
 
+    def test_saved_org_link_is_used_without_creating_a_com_search(self):
+        org_url = "https://mycomap.org/admin/blast-results/332221330/761935"
+        with (
+            patch.object(inaturalist_tree_service, "fetch_observation_for_job",
+                         return_value={"id": 332221330}),
+            patch.object(inaturalist_tree_service, "_resolve_inat_genus",
+                         return_value="Mycena"),
+            patch.object(inaturalist_tree_service, "extract_observation_field_value",
+                         return_value=org_url),
+            patch("app.services.mycomap_service.resolve_mycomap_result_reference",
+                  return_value={"provider": "org", "result_id": "627080", "url": org_url}),
+            patch.object(inaturalist_tree_service, "_refresh_mycomap_blast_results",
+                         return_value={"provider": "org", "result_id": "627080"}) as refresh,
+            patch("app.api.routes.gather_mycomap_sequences_for_queue",
+                  return_value=(None, ({"error": "upstream unavailable"}, 502))) as gather,
+            patch.object(inaturalist_tree_service, "_create_mycomap_blast_from_observation",
+                         side_effect=AssertionError("must not create .com search")),
+            patch.object(inaturalist_tree_service, "_reuse_existing_mycomap_blast",
+                         side_effect=AssertionError("must not replace saved link")),
+        ):
+            with self.assertRaises(inaturalist_tree_service.InatTreeError) as caught:
+                inaturalist_tree_service.prepare_inat_tree_job(332221330)
+        self.assertEqual(caught.exception.status, 503)
+        self.assertTrue(caught.exception.details["mycomap_unavailable"])
+        self.assertEqual(refresh.call_args.kwargs["mycomap_url"], org_url)
+        self.assertEqual(gather.call_args.args[0], org_url)
+
+    def test_queued_legacy_replacement_keeps_its_com_search(self):
+        org_url = "https://mycomap.org/admin/blast-results/332221330/761935"
+        com_url = "https://mycomap.com/genetics/blast-search/r42/"
+        details = {"created_mycomap_url": com_url, "auto_created": False}
+        with (
+            patch.object(inaturalist_tree_service, "fetch_observation_for_job",
+                         return_value={"id": 332221330}),
+            patch.object(inaturalist_tree_service, "_resolve_inat_genus",
+                         return_value="Mycena"),
+            patch.object(inaturalist_tree_service, "extract_observation_field_value",
+                         return_value=org_url),
+            patch("app.api.routes.gather_mycomap_sequences_for_queue",
+                  return_value=(None, ({"error": "done"}, 404))) as gather,
+            patch("app.services.mycomap_org_service.resolve_result_id",
+                  side_effect=AssertionError("old job must use its com search")),
+        ):
+            with self.assertRaises(inaturalist_tree_service.InatTreeError):
+                inaturalist_tree_service.prepare_inat_tree_job(
+                    332221330, skip_mycomap_refresh=True,
+                    mycomap_rerun_details=details,
+                )
+        self.assertEqual(gather.call_args.args[0], com_url)
+
     def test_ncbi_rerun_returns_before_saved_results_are_fetched(self):
         mycomap_url = "https://mycomap.com/genetics/blast-search/c01-inat123456789-r42"
         rerun_details = {

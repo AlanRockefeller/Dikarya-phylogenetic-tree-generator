@@ -5,11 +5,16 @@ from unittest.mock import patch
 from app.services.mushroom_observer_service import (
     MushroomObserverError,
     _api_request,
+    _mycomap_blast_url_from_notes,
     prepare_tree_job,
 )
 
 
 class MushroomObserverMycoMapMessageTests(unittest.TestCase):
+    def test_org_result_in_notes_is_preserved(self):
+        url = "https://mycomap.org/blast-results/530840/136363"
+        self.assertEqual(_mycomap_blast_url_from_notes(f"Search: {url}"), url)
+
     def test_upstream_http_error_logs_table_method_and_status(self):
         upstream_error = urllib.error.HTTPError(
             "https://mushroomobserver.org/api2/observations", 503,

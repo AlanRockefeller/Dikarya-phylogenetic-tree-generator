@@ -434,7 +434,7 @@ def label_tree_with_type_status(tree, job_types: Dict[str, Any]) -> int:
     return changed
 
 
-def _job_sequence_metadata(job_dir: Path):
+def job_sequence_metadata(job_dir: Path):
     from app.services.artifact_storage import artifact_exists, open_artifact
 
     path = Path(job_dir) / "input_info.json"
@@ -464,7 +464,7 @@ def type_labeled_tree_text(job_dir: Path, newick_path: Path, fmt: str = "newick"
 
     from app.services.tree_io import relabel_newick_text, tree_to_nexus_text
 
-    job_types = type_specimens_for_job(job_dir, _job_sequence_metadata(job_dir))
+    job_types = type_specimens_for_job(job_dir, job_sequence_metadata(job_dir))
     if not job_types["records"]:
         return None
     try:
