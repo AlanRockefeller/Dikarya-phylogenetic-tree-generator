@@ -52,3 +52,21 @@ def _isolate_inat_redis_keys():
     finally:
         for name, value in original.items():
             setattr(svc, name, value)
+
+
+@pytest.fixture(autouse=True, scope="session")
+def _isolate_type_specimen_cache(tmp_path_factory):
+    """Keep GenBank /type_material answers from tests out of the real cache.
+
+    Alan 9/24/26 - _parse_genbank_xml() records every type-bearing record it
+    parses into type_specimen_service.DATA_DIR, which defaults to the shared
+    cache/type_specimens directory the live site reads.
+    """
+    from app.services import type_specimen_service
+
+    original = type_specimen_service.DATA_DIR
+    type_specimen_service.DATA_DIR = tmp_path_factory.mktemp("type-specimens")
+    try:
+        yield type_specimen_service.DATA_DIR
+    finally:
+        type_specimen_service.DATA_DIR = original

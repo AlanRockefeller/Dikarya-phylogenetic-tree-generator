@@ -46,6 +46,9 @@ from app.services.security_events import (  # noqa: E402
 # Imported rather than restated so the threshold printed in the report is the
 # one the app actually escalates at.
 from app.services.security_actors import ESCALATION_THRESHOLD  # noqa: E402
+# Where the weekly type-specimen refresh writes its report; one definition, in
+# the service, so the writer and this reader cannot disagree about the file.
+from app.services.type_specimen_service import REFRESH_LOG_PATH  # noqa: E402
 # UUID form used for RQ job ids in worker logs.
 UUID_PATTERN = r'[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}'
 # Alan 9/23/26 - Jobs since 2026-09-09 have short base36 ids (job_id_service:
@@ -917,6 +920,126 @@ def analyze_worker(cutoff, grace=timedelta(minutes=60), until=None, details=None
     return counts, stale, coverage_record(files, oldest, newest, lines, unparsed, 0, contextual, window_lines)
 
 
+TYPE_EVENT_RE = re.compile(r'\bevent=type_specimens\.(\w+)(.*)$')
+TYPE_FIELD_RE = re.compile(r'(\w+)=("(?:[^"\\]|\\.)*"|\S*)')
+# The refresh runs weekly from cron; later than this and it has stopped.
+TYPE_REFRESH_STALE_DAYS = 8
+
+
+def _type_event_fields(text):
+    fields = {}
+    for key, raw in TYPE_FIELD_RE.findall(text):
+        if raw.startswith('"'):
+            try:
+                raw = json.loads(raw)
+            except ValueError:
+                raw = raw.strip('"')
+        fields[key] = raw
+    return fields
+
+
+def analyze_type_specimens(cutoff, until, path=REFRESH_LOG_PATH):
+    """Refresh runs and type-accession changes recorded inside the window.
+
+    Also returns the last finished run anywhere in the file, so a digest can
+    say when a refresh last happened even on the six days a week it does not.
+    """
+    result = {"path": path, "exists": path.is_file(), "runs": [], "added": [],
+              "removed": [], "reclassified": [], "failures": [],
+              "last_run": None, "last_ok": None}
+    if not result["exists"]:
+        return result
+    run = None
+    with open(path, encoding="utf-8", errors="replace") as handle:
+        for line in handle:
+            match = TYPE_EVENT_RE.search(line)
+            when = parse_log_ts(line)
+            if not match or when is None:
+                continue
+            name, fields = match.group(1), _type_event_fields(match.group(2))
+            fields["when"] = when
+            if name == "refresh_finished":
+                result["last_run"] = fields
+                if fields.get("outcome") == "ok":
+                    result["last_ok"] = fields
+            if not (cutoff <= when < until):
+                continue
+            if name == "refresh_started":
+                run = {"started": when, "mycomap": None, "genbank": None, "finished": None}
+                result["runs"].append(run)
+            elif name in ("mycomap_summary", "genbank_summary") and run is not None:
+                run[name.split("_")[0]] = fields
+            elif name == "refresh_finished" and run is not None:
+                run["finished"] = fields
+            elif name == "pass_failed":
+                result["failures"].append(fields)
+            elif name in ("added", "removed", "reclassified"):
+                result[name].append(fields)
+    return result
+
+
+def _type_row(fields, sign):
+    text = (f"{sign} {fields.get('accession', '?'):<12} {fields.get('status') or '-':<12} "
+            f"{fields.get('organism') or '(organism not given)'}")
+    if fields.get("voucher"):
+        text += f"  voucher={fields['voucher']}"
+    text += f"  [{fields.get('source', '?')}]"
+    if fields.get("previously_marked") == "yes":
+        text += " (already marked from GenBank)"
+    if fields.get("still_marked") == "yes":
+        text += " (still marked from GenBank)"
+    if sign == "~":
+        text += f" was {fields.get('previous_status') or '-'}"
+    return text
+
+
+def print_type_specimens(data, until, limit=200):
+    section("Type specimens (weekly refresh)")
+    if not data["exists"]:
+        print(f"  WARNING: no refresh log at {data['path']} -- the weekly type-specimen "
+              "refresh has never run here (is ops/cron/dikarya-refresh-type-specimens installed?)")
+        return
+    for run in data["runs"]:
+        finished = run["finished"] or {}
+        mycomap, genbank = run["mycomap"] or {}, run["genbank"] or {}
+        parts = [f"{run['started']:%Y-%m-%d %H:%M}",
+                 finished.get("outcome", "UNFINISHED (killed or still running)")]
+        if finished:
+            parts.append(f"marked {finished.get('marked_before')} -> {finished.get('marked_after')}")
+        if mycomap:
+            parts.append(f"mycomap: +{mycomap.get('added')} -{mycomap.get('removed')} "
+                         f"~{mycomap.get('reclassified')} of {mycomap.get('accessions')}"
+                         + (" (first snapshot; not itemised)" if mycomap.get("initial") == "yes" else ""))
+        if genbank:
+            parts.append(f"genbank: +{genbank.get('added')} of {genbank.get('checked')} checked, "
+                         f"{genbank.get('missing')} missing, {genbank.get('unanswered')} unanswered, "
+                         f"{genbank.get('deferred')} left for next run")
+        print("  " + "  |  ".join(parts))
+    if not data["runs"]:
+        last = data["last_run"]
+        print("  (no refresh ran in this window"
+              + (f"; last run {last['when']:%Y-%m-%d %H:%M} UTC, {last.get('outcome')})" if last else ")"))
+    for failure in data["failures"]:
+        print(f"  FAILED pass={failure.get('pass')}: {failure.get('error')}")
+    last_ok = data["last_ok"]
+    if last_ok is None or until - last_ok["when"] > timedelta(days=TYPE_REFRESH_STALE_DAYS):
+        print("  WARNING: no successful refresh in the last "
+              f"{TYPE_REFRESH_STALE_DAYS} days"
+              + (f" (last {last_ok['when']:%Y-%m-%d})" if last_ok else ""))
+    # Every added type is listed: this is the part a reviewer reports.
+    for key, sign, title in (("added", "+", "New type sequences"),
+                             ("reclassified", "~", "Type status changed"),
+                             ("removed", "-", "No longer on MycoMap's list")):
+        items = data[key]
+        if not items:
+            continue
+        print(f"  {title} ({len(items)}):")
+        for fields in items[:limit]:
+            print("    " + _type_row(fields, sign))
+        if len(items) > limit:
+            print(f"    ... and {len(items) - limit} more in {data['path']}")
+
+
 def format_age(delta):
     minutes = max(0, int(delta.total_seconds() // 60))
     return f"{minutes // 60}h{minutes % 60:02d}m"
@@ -968,6 +1091,10 @@ def main():
     )
     parser.add_argument("--since-rotated", action="store_true", help="deprecated; rotations are always included")
     parser.add_argument("--top", type=int, default=10)
+    parser.add_argument(
+        "--type-specimen-log", type=Path, default=REFRESH_LOG_PATH,
+        help=f"weekly type-specimen refresh log (default: {REFRESH_LOG_PATH})",
+    )
     parser.add_argument("--slow-threshold", type=float, default=5.0)
     parser.add_argument(
         "--unterminated-grace-minutes", type=float, default=60,
@@ -1070,6 +1197,7 @@ def main():
         f"{item['exception']}: {item['error'][:200] or '(no message logged)'}"
         for item in worker_details.get("failures", [])
     ])
+    print_type_specimens(analyze_type_specimens(cutoff, until, args.type_specimen_log), until)
     section(f"Slow requests (> {args.slow_threshold:g}s; streams excluded)")
     slow_rows = []
     for endpoint, values in access["durations"].items():

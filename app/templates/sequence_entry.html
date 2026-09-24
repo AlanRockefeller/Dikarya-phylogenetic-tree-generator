@@ -869,7 +869,7 @@
                     <input type="url" id="mycomap_url" class="w-full px-4 py-3 border border-gray-300 dark:border-journal-dark rounded-lg
                                   bg-white dark:bg-journal-dark text-gray-900 dark:text-gray-100
                                   focus:ring-2 focus:ring-journal-gold focus:border-transparent transition-all"
-                        placeholder="https://mycomap.com/...r12345...">
+                        placeholder="https://mycomap.org/mycoblast/12345">
                     <p class="text-xs text-gray-500 dark:text-gray-400 mt-1">
                         Paste a Mycomap BLAST result URL to import sequences.
                     </p>
@@ -3272,6 +3272,18 @@
     function isValidMycomapUrl(url) {
         if (!url) return false;
         const trimmed = url.trim();
+        try {
+            const parsed = new URL(trimmed);
+            if (parsed.protocol === 'https:'
+                && ['mycomap.org', 'www.mycomap.org'].includes(parsed.hostname)
+                && !parsed.username && !parsed.password && !parsed.port
+                && !parsed.search && !parsed.hash) {
+                return /^\/mycoblast\/\d+\/?$/.test(parsed.pathname)
+                    || /^\/(?:admin\/)?blast-results\/\d{1,12}\/\d+\/?$/.test(parsed.pathname);
+            }
+        } catch (err) {
+            return false;
+        }
         // Alan 9/22/26 - MycoMap's older results links (index.php?...controller=blast
         // &do=results&db=..&id=..) are resolved server-side to the BLAST they list.
         if (/^https?:\/\/(?:www\.)?mycomap\.com\/index\.php\?/i.test(trimmed)
@@ -3342,7 +3354,7 @@
     // Alan 6/18/26 - Report sanitized client-side Mycomap URL rejections so support can diagnose inputs that never reach /api/mycomap.
     function getMycomapUrlDiagnostics(url) {
         const trimmed = (url || '').trim();
-        const startsWithRequiredPrefix = trimmed.startsWith('https://mycomap.com/genetics/blast-search');
+        const startsWithRequiredPrefix = isValidMycomapUrl(trimmed);
         const hasRId = /r\d+/.test(trimmed);
         let parsedUrl = null;
 
@@ -3361,7 +3373,7 @@
             reason = 'empty';
         } else if (!startsWithRequiredPrefix) {
             reason = 'bad_prefix';
-        } else if (!hasRId) {
+        } else if (!hasRId && parsedUrl?.hostname?.endsWith('mycomap.com')) {
             reason = 'missing_r_id';
         }
 
@@ -3430,12 +3442,9 @@
             if (url.includes('mycomap.com')) {
                 showStatus('Invalid Mycomap URL. Please use the URL from the BLAST Search page (starts with https://mycomap.com/genetics/blast-search), or a sequence record page from https://mycomap.com/genetics/sequences/.', 'error');
             } else if (url.includes('mycomap.org')) {
-                // Alan 8/24/26 - mycomap.org is a real site, so "must be from
-                // mycomap.com" reads like a typo rather than a real distinction.
-                // Only the .com BLAST API is wired up here.
-                showStatus('That is a mycomap.org URL. Sequence import works with mycomap.com only — open the BLAST Search page on https://mycomap.com/genetics/blast-search and paste that URL instead.', 'error');
+                showStatus('Invalid MycoMap.org results URL. Use /mycoblast/<id> or /blast-results/<observation-id>/<sequence-id>.', 'error');
             } else {
-                showStatus('Invalid Mycomap URL. URL must be from mycomap.com and contain a result ID.', 'error');
+                showStatus('Invalid MycoMap results URL. Use a mycomap.org result page or a legacy mycomap.com BLAST Search page.', 'error');
             }
             return false;
         }

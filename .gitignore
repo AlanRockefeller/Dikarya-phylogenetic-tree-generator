@@ -72,3 +72,5 @@ mycomap_api_documentation.md
 
 # Node dev tooling (ESLint for the browser-side viewer code). Not served.
 node_modules/
+docs/
+mycomap.org.type.specimen.api.txt

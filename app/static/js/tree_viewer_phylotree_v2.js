@@ -10,15 +10,20 @@
     // effectively zero: FastTree commonly emits values around 1e-8, while IQ-TREE 3 floors
     // them at 1e-6. Use the same near-zero boundary as the tree-analysis metrics so either
     // engine's arbitrary binary resolution is presented as one soft polytomy.
+    // Alan 9/23/26 - This is the ONE definition of "effectively zero-length" in the viewer:
+    // a branch at or below this numerical floor is treated as zero and contracted into a
+    // polytomy (tip components and internal edges alike), and its support label is not drawn.
+    // Anything longer is a real inferred split and is kept; weak ones are faded by support
+    // instead. Must stay equal to NEAR_ZERO_BRANCH_LENGTH in tree_analysis_service.py, with the
+    // same <= comparison, so the viewer and the review agree on what counts as zero.
     const ZERO_LENGTH_POLYTOMY_EPSILON = 1e-6;
-    // Alan 9/23/26 - Support labels are not drawn on a branch at or below this length. Such a
-    // branch cannot carry a single substitution on any alignment Dikarya builds (it would need
-    // 1e5 columns), so its support scores an arbitrary split of near-identical sequences and is
-    // uninformative -- a Quick Tree of one species printed "0" on 60% of its nodes. Looser than
-    // the polytomy epsilon on purpose: IQ-TREE also leaves such branches at 1-2.5e-6. A label that
-    // displays as zero is dropped too (see _addSupportLabels), since a blank already reads as
-    // unsupported.
-    const SUPPORT_LABEL_MIN_BRANCH_LENGTH = 1e-5;
+    // Alan 9/23/26 - Screen length of the short connector drawn in front of a tip that sits
+    // directly on a multifurcation with an effectively zero-length branch (see
+    // _needsPolytomyConnector). Without it such a label touches the vertical backbone. It is a
+    // layout marker, not evolutionary distance, so it is held at this many screen pixels at
+    // any zoom, exactly like the tip labels it leads into.
+    const POLYTOMY_CONNECTOR_PX = 8;
+    const SVG_NS = 'http://www.w3.org/2000/svg';
 
     // Alan 8/24/26 - Say why a phylotree instance is not usable, or null when it is.
     // phylotree.js does not throw on a truncated or otherwise unparseable Newick: its
@@ -92,6 +97,44 @@
             .replace(UNQUOTED_PROVISIONAL_CODE_RE, "$1 '$2'")
             .replace(BARE_PROVISIONAL_CODE_RE, "$1$2 sp. '$3'")
             .trim();
+    }
+
+    // Alan 9/24/26 - Type-specimen tips. The server resolves which of a job's sequences are
+    // types (type_specimen_service.type_specimens_for_job) and passes
+    // {records: {ACCESSION: info}, names: {input header: ACCESSION}} as window.TYPE_SPECIMENS.
+    const TYPE_SOURCE_LABELS = {
+        genbank: 'GenBank /type_material',
+        genbank_definition: 'NCBI definition ("from TYPE material")',
+        mycomap: 'MycoMap type specimen list'
+    };
+
+    // Alan 9/24/26 - Own-property read, so a label such as "constructor" can never resolve to
+    // something on Object.prototype.
+    function ownValue(obj, key) {
+        return obj && key && Object.prototype.hasOwnProperty.call(obj, key) ? obj[key] : undefined;
+    }
+
+    // Alan 9/24/26 - Mirror of type_specimen_service.append_type_status(): "(holotype)" is
+    // appended unless the label already names that status (BLAST headers often end in it).
+    function appendTypeStatusToLabel(label, info) {
+        const status = String((info && info.status) || '').trim();
+        if (!status || typeof label !== 'string') return label;
+        const base = status.startsWith('ex-') ? status.slice(3) : status;
+        const escaped = base.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+        if (new RegExp(`\\b${escaped}\\b`, 'i').test(label)) return label;
+        return `${label} (${status})`;
+    }
+    window.appendTypeStatusToLabel = appendTypeStatusToLabel;
+
+    // Alan 9/24/26 - Hover text for a type-specimen tip.
+    function describeTypeSpecimen(info) {
+        const lines = [`Type specimen: ${info.status || 'type'}`];
+        if (info.type_material) lines.push(info.type_material);
+        if (info.voucher) lines.push(`Voucher: ${info.voucher}`);
+        const sources = (Array.isArray(info.sources) ? info.sources : [])
+            .map(source => TYPE_SOURCE_LABELS[source] || source);
+        if (sources.length) lines.push(`Source: ${sources.join('; ')}`);
+        return lines.join('\n');
     }
 
     // Alan 8/15/26 - Curated font list for clade annotations, shared with the controller's
@@ -241,13 +284,15 @@
             label: 'SH-aLRT',
             tooltip: 'IQ-TREE SH-aLRT branch test (0-100), written when -alrt ran without ultrafast '
                 + 'bootstrap. A likelihood-ratio test of the branch, not a bootstrap proportion; the '
-                + 'conventional cutoff is 80.'
+                + 'conventional cutoff is 80. '
+                + 'SH-aLRT is a local branch-support test; high support indicates strong preference for this split over its local alternatives, not certainty that the overall topology is correct.'
         },
         ALRT_UFBOOT: {
             label: 'SH-aLRT / UFBoot',
             tooltip: 'IQ-TREE dual support, shown as SH-aLRT/UFBoot. Both are percentages (0-100). '
                 + 'A clade is normally called well supported when SH-aLRT is at least 80 AND UFBoot is at least 95. '
-                + 'The threshold filter applies to the UFBoot half.'
+                + 'The threshold filter applies to the UFBoot half. '
+                + 'SH-aLRT is a local branch-support test; high support indicates strong preference for this split over its local alternatives, not certainty that the overall topology is correct.'
         },
         mixed: {
             label: 'Mixed',
@@ -314,6 +359,77 @@
             return values.some(v => v > 0 && v < 1.0) ? 'mixed' : 'BS';
         }
         return 'PP';
+    };
+
+    // Alan 9/23/26 - "Fade by support": each internal branch is drawn in one of three display
+    // classes so a weakly supported split does not carry the same visual weight as a strongly
+    // supported one. Display only -- topology, lengths, support values and the Newick are
+    // untouched. The bins are per scale because the scales do not share conventions: a UFBoot
+    // of 80 is weak, a classical bootstrap of 80 is decent. Opacities live here only; the
+    // viewer applies them inline and the export legend draws its samples from the same table.
+    const SUPPORT_FADE_LEVELS = ['weak', 'intermediate', 'strong'];
+    const SUPPORT_FADE_OPACITY = { strong: 1, intermediate: 0.6, weak: 0.3 };
+    const SUPPORT_FADE_BINS = {
+        ALRT: { strong: 80, intermediate: 50, proportion: false },
+        UFBOOT: { strong: 95, intermediate: 70, proportion: false },
+        BS: { strong: 70, intermediate: 50, proportion: false },
+        PP: { strong: 0.95, intermediate: 0.80, proportion: true },
+        SH: { strong: 0.90, intermediate: 0.70, proportion: true }
+    };
+
+    function supportFadeLevel(value, bins) {
+        if (!Number.isFinite(value) || !bins) return null;
+        if (value >= bins.strong) return 'strong';
+        if (value >= bins.intermediate) return 'intermediate';
+        return 'weak';
+    }
+
+    function formatSupportFadeValue(value, bins) {
+        if (bins && bins.proportion) return value.toFixed(2);
+        return Number.isInteger(value) ? String(value) : value.toFixed(1);
+    }
+
+    // Alan 9/23/26 - Dual SH-aLRT/UFBoot is classified as an intersection of the two
+    // classes, never by comparing the numbers: a branch is strong only when BOTH halves meet
+    // their own strong cutoff, which is IQ-TREE's own reading (SH-aLRT >= 80 AND UFBoot >= 95).
+    // 91/82 therefore follows the UFBoot bin and 62/99 follows the SH-aLRT bin.
+    function dualSupportFadeLevel(alrt, ufboot) {
+        const a = supportFadeLevel(alrt, SUPPORT_FADE_BINS.ALRT);
+        const u = supportFadeLevel(ufboot, SUPPORT_FADE_BINS.UFBOOT);
+        if (!a || !u) return null;
+        return SUPPORT_FADE_LEVELS[Math.min(SUPPORT_FADE_LEVELS.indexOf(a), SUPPORT_FADE_LEVELS.indexOf(u))];
+    }
+
+    // Alan 9/23/26 - What the fading means for one support scale, for the checkbox tooltip and
+    // the export legend. Null for a tree whose scale cannot be binned (none, mixed), which is
+    // also how the viewer knows not to fade it.
+    window.describeSupportFade = function (supportType) {
+        const fmt = (value, bins) => formatSupportFadeValue(value, bins);
+        if (supportType === 'ALRT_UFBOOT') {
+            const a = SUPPORT_FADE_BINS.ALRT;
+            const u = SUPPORT_FADE_BINS.UFBOOT;
+            return {
+                statistic: 'SH-aLRT / UFBoot (a branch takes the weaker of its two classes)',
+                rows: [
+                    { level: 'strong', text: `SH-aLRT ≥ ${a.strong} and UFBoot ≥ ${u.strong}` },
+                    { level: 'intermediate', text: `SH-aLRT ≥ ${a.intermediate} and UFBoot ≥ ${u.intermediate}, not strong` },
+                    { level: 'weak', text: `SH-aLRT < ${a.intermediate} or UFBoot < ${u.intermediate}` }
+                ],
+                opacity: SUPPORT_FADE_OPACITY
+            };
+        }
+        const bins = SUPPORT_FADE_BINS[supportType];
+        if (!bins) return null;
+        const info = (window.SUPPORT_TYPE_INFO || {})[supportType] || { label: supportType };
+        return {
+            statistic: info.label,
+            rows: [
+                { level: 'strong', text: `≥ ${fmt(bins.strong, bins)}` },
+                { level: 'intermediate', text: `${fmt(bins.intermediate, bins)} to < ${fmt(bins.strong, bins)}` },
+                { level: 'weak', text: `< ${fmt(bins.intermediate, bins)}` }
+            ],
+            opacity: SUPPORT_FADE_OPACITY
+        };
     };
 
     // --- ZOOM PANIC STOP ---
@@ -583,6 +699,8 @@
             this.callbacks = callbacks || {};
             this.options = Object.assign({
                 showSupport: true,
+                // Alan 9/23/26 - Fade internal branches by their support class (on by default).
+                supportFade: true,
                 ppThreshold: 0.9,
                 bootstrapThreshold: 70,
                 minTips: 0,
@@ -594,6 +712,8 @@
                 identityMaximum: 100,
                 // Alan 5/9/26 - Store per-sequence BLAST metrics passed from the job metadata.
                 sequenceMetrics: [],
+                // Alan 9/24/26 - Type-specimen records for this job (window.TYPE_SPECIMENS).
+                typeSpecimens: {},
                 supportBasePx: 9,
                 tipBasePx: 12,
                 layout: 'linear',
@@ -603,6 +723,14 @@
             this.tipLabelGap = 2;
             // Alan 5/9/26 - Build a lookup once so tree tips can be matched to stored BLAST metrics quickly.
             this.sequenceMetricMap = this._buildSequenceMetricMap(this.options.sequenceMetrics);
+            // Alan 9/24/26 - Keep only object-shaped maps so a missing or malformed payload means
+            // "no type specimens" rather than a render error.
+            const typeSpecimens = this.options.typeSpecimens || {};
+            this.typeSpecimens = {
+                records: typeSpecimens.records && typeof typeSpecimens.records === 'object' ? typeSpecimens.records : {},
+                names: typeSpecimens.names && typeof typeSpecimens.names === 'object' ? typeSpecimens.names : {}
+            };
+            this.typeSpecimenCount = 0;
 
             this.tree = null;
             this.newick = null;
@@ -821,7 +949,9 @@
             if (this.tree && typeof this._updateNodeStylesOnly === 'function') this._updateNodeStylesOnly();
         }
 
-        async render(newick) {
+        // Alan 9/24/26 - renderOptions.sortMode applies a Sort mode before the first draw, so
+        // a reload that keeps the user's sort renders once instead of drawing and re-sorting.
+        async render(newick, renderOptions = {}) {
             this.newick = newick;
             if (!this.container) return;
 
@@ -1071,6 +1201,10 @@
             // Alan 5/9/26 - Apply any existing sequence metric filter state before the first draw.
             this._applySequenceFilters({ updateDisplay: false });
 
+            // Alan 9/24/26 - No display exists yet, so this only reorders the children.
+            const sortMode = renderOptions && renderOptions.sortMode;
+            if (sortMode && sortMode !== 'original') this._resortChildren(sortMode);
+
             // 4. DRAW
             this._draw();
         }
@@ -1119,6 +1253,8 @@
             }
             // Alan 5/9/26 - Attach stored BLAST metrics to leaf nodes after names are available.
             this._attachSequenceMetricsToLeaves();
+            // Alan 9/24/26 - Mark type-specimen tips from the same names.
+            this._attachTypeSpecimensToLeaves();
         }
 
         _branchLength(node) {
@@ -1322,6 +1458,49 @@
             if (root) visit(root, 0);
         }
 
+        /**
+         * Alan 9/23/26 - Contract every remaining internal branch at or below the zero-length
+         * floor (ZERO_LENGTH_POLYTOMY_EPSILON), including ones between two positive-length
+         * clades, which the tip-component pass above never reaches. Each such node's children
+         * are spliced into its parent at its own position, so tip order is unchanged. Display
+         * only: the tree files, the backend's stable clade ids and every edit endpoint still see
+         * the binary tree, and this reruns on every parse. Children of the root are left alone
+         * so a rooted tree keeps its two-way root split.
+         */
+        _contractZeroLengthInternalBranches(root) {
+            let contracted = 0;
+            // Walk the LIVE hierarchy from the root: the tip-component pass leaves its removed
+            // nodes still linked to one another, so a node list taken before it would splice
+            // children onto detached nodes. Preorder walked backwards contracts the deepest
+            // branches first, so a chain of short branches collapses completely into its
+            // topmost surviving ancestor.
+            const nodes = [];
+            const pending = [root];
+            while (pending.length) {
+                const node = pending.pop();
+                nodes.push(node);
+                (node.children || []).forEach((child) => pending.push(child));
+            }
+            for (let i = nodes.length - 1; i >= 0; i -= 1) {
+                const node = nodes[i];
+                const parent = node.parent;
+                if (!parent || !parent.parent) continue;
+                const children = node.children || [];
+                if (!children.length) continue;
+                // Alan 9/23/26 - Same zero-length test as the tip-component pass and the labels.
+                if (!this._hasZeroLengthIncomingBranch(node)) continue;
+                const siblings = parent.children || [];
+                const index = siblings.indexOf(node);
+                if (index < 0) continue;
+                siblings.splice(index, 1, ...children);
+                children.forEach((child) => { child.parent = parent; });
+                node.children = [];
+                node.parent = null;
+                contracted += 1;
+            }
+            return contracted;
+        }
+
         _groupZeroLengthPolytomies() {
             if (!this.tree) return 0;
             const nodes = [];
@@ -1347,6 +1526,7 @@
             polytomies.forEach((polytomy) => {
                 if (this._contractZeroLengthPolytomy(polytomy, originalPositions)) grouped += 1;
             });
+            if (this._contractZeroLengthInternalBranches(root)) grouped += 1;
             if (grouped) this._refreshHierarchyMetrics(root);
 
             // A contraction makes the unresolved tips direct siblings and therefore
@@ -1413,7 +1593,24 @@
                 'tip-label-gap': this.tipLabelGap,
                 'left-right-spacing': 'fixed-step',
                 'top-bottom-spacing': 'fixed-step',
-                'node-styler': (element, node) => this._styleNode(element, node)
+                // Alan 9/23/26 - No animated relayouts. phylotree animates trees under 300 nodes,
+                // so for ~250ms after every update the SVG's width/height and every node were
+                // still at their OLD values, and anything that measured the tree in that window
+                // got stale numbers: radial framing fitted the previous size, and the annotation
+                // canvas kept a viewBox from the old height, so the browser shrank the whole
+                // figure (tiny text after a sequence filter; the last tip clipped after Fit).
+                'transitions': false,
+                'node-styler': (element, node) => {
+                    this._styleNode(element, node);
+                    // Alan 9/24/26 - Re-add the type-specimen badge after phylotree rewrites the label.
+                    this._decorateTypeSpecimen(element, node);
+                    // Alan 9/23/26 - Runs after phylotree (re)draws each node, so a polytomy
+                    // connector follows every update() without a separate pass.
+                    this._drawPolytomyConnector(element, node);
+                },
+                // Alan 9/23/26 - Runs after phylotree (re)classes and redraws each branch, so the
+                // support fade survives every update() without a separate repaint pass.
+                'edge-styler': (element, edge) => this._styleBranchSupport(element, edge)
             };
 
             // D3 Version Lock
@@ -1467,6 +1664,9 @@
                         }
                     }, { capture: true, passive: true });
                 }
+
+                // Alan 9/23/26 - Radial only: start with the whole tree in view.
+                this._frameRadialTree();
 
             } catch (e) {
                 console.error("Render error:", e);
@@ -1641,14 +1841,98 @@
         }
 
         // Alan 8/17/26 - Convert the saved screen-space gap into an outward SVG offset.
+        // Alan 9/23/26 - A tip with a polytomy connector starts its gap where the connector ends.
         _tipLabelDx(node, zoomScale = 1) {
             const direction = node?.text_align === 'end' ? -1 : 1;
-            return direction * this.tipLabelGap / (zoomScale || 1);
+            // Read the decision _drawPolytomyConnector cached for this draw: the zoom pass calls
+            // this for every tip on every frame, and re-scanning siblings made a polytomy O(k^2).
+            const connector = node && node.__polytomyConnector ? POLYTOMY_CONNECTOR_PX : 0;
+            return direction * (this.tipLabelGap + connector) / (zoomScale || 1);
         }
 
-        sortNodes(mode) {
-            if (!this.tree) return;
+        /**
+         * Alan 9/23/26 - True for a displayed tip whose parent is a multifurcation (more than two
+         * displayed children) and whose own incoming branch is effectively zero-length, i.e. a
+         * tip that would otherwise be drawn sitting on the vertical backbone. A tip with a
+         * positive-length branch already has a visible horizontal segment, and a zero-length tip
+         * in a bifurcation is left as drawn. Aligned tips are skipped: their dotted tracer
+         * already runs from the backbone to the label column.
+         */
+        _needsPolytomyConnector(node) {
+            if (!node || !node.parent || this.options?.alignTips) return false;
+            if ((node.children || []).length) return false;
+            const siblings = (node.parent.children || []).filter((child) => !child.notshown && !child.hidden);
+            if (siblings.length <= 2) return false;
+            return this._hasZeroLengthIncomingBranch(node);
+        }
 
+        /**
+         * Alan 9/23/26 - Add, update or remove the polytomy connector inside one tip's node group.
+         *
+         * Display geometry only: a short path from the node outward toward its label, sized in
+         * screen pixels with the same zoom factor as the labels (see _applyTextSizingFromZoom).
+         * It lives in the node group so it moves with the node and is cloned into every export.
+         * Deliberately not a <line> (drawNode removes those as tracers) and not class "branch"
+         * (phylotree binds every path.branch to an edge); tree_viewer.css and phylotree.css give
+         * it the branch stroke by sharing the branch rules' selector lists.
+         */
+        _drawPolytomyConnector(element, node) {
+            const group = element && typeof element.node === 'function' ? element.node() : null;
+            if (!group || typeof group.querySelector !== 'function') return;
+            let peg = group.querySelector('path.polytomy-connector');
+            if (!this._needsPolytomyConnector(node)) {
+                if (peg) peg.remove();
+                if (node) node.__polytomyConnector = null;
+                return;
+            }
+            if (!peg) {
+                peg = document.createElementNS(SVG_NS, 'path');
+                peg.setAttribute('class', 'polytomy-connector');
+                peg.setAttribute('fill', 'none');
+                peg.setAttribute('pointer-events', 'none');
+                // Paint under the label so a long connector can never cover text.
+                group.insertBefore(peg, group.firstChild);
+            }
+            peg.setAttribute('d', this._polytomyConnectorD(node));
+            if (this.options.layout === 'radial' && Number.isFinite(node.text_angle)) {
+                peg.setAttribute('transform', `rotate(${node.text_angle})`);
+            } else {
+                peg.removeAttribute('transform');
+            }
+            node.__polytomyConnector = peg;
+            this._syncPolytomyConnectorState(node);
+            // drawNode has just reset the label's dx to phylotree's own offset; move it past
+            // the connector now rather than waiting for the next text-sizing pass.
+            const label = group.querySelector('text.phylotree-node-text');
+            if (label) label.setAttribute('dx', String(this._tipLabelDx(node, this._labelVisualK || 1)));
+        }
+
+        // Alan 9/24/26 - Path data for a connector at the current label zoom factor, shared by
+        // _drawPolytomyConnector and the zoom pass's in-place resize.
+        _polytomyConnectorD(node) {
+            const direction = node.text_align === 'end' ? -1 : 1;
+            const length = POLYTOMY_CONNECTOR_PX / (this._labelVisualK || 1);
+            return `M0,0H${direction * length}`;
+        }
+
+        // Alan 9/23/26 - A connector extends its tip's branch, so it shows that branch's
+        // selection, tag and any explicit stroke colour. It never copies the support fade:
+        // terminal branches are not faded, and the connector is a layout marker in any case.
+        _syncPolytomyConnectorState(node) {
+            const peg = node && node.__polytomyConnector;
+            if (!peg || !peg.classList) return;
+            const branch = node.__branchPath;
+            const classes = branch && branch.classList;
+            peg.classList.toggle('polytomy-connector-selected', Boolean(classes && classes.contains('branch-selected')));
+            peg.classList.toggle('polytomy-connector-tagged', Boolean(classes && classes.contains('branch-tagged')));
+            const stroke = branch && branch.style ? branch.style.stroke : '';
+            if (stroke) peg.style.setProperty('stroke', stroke);
+            else peg.style.removeProperty('stroke');
+        }
+
+        // Alan 9/24/26 - Reorder children for a Sort mode; shared by sortNodes and by render(),
+        // which calls it before any display exists. Returns false if phylotree cannot sort.
+        _resortChildren(mode) {
             // Metric: Total Descendants (clade size)
             const countDescendants = (node) => {
                 if (node.__total_descendants !== undefined) return node.__total_descendants;
@@ -1667,14 +1951,20 @@
                     ? this.tree.resort_children.bind(this.tree)
                     : null);
 
-            if (resortFn) {
-                resortFn((a, b) => {
-                    if (mode === 'original') return (a.__original_index || 0) - (b.__original_index || 0);
-                    const valA = countDescendants(a);
-                    const valB = countDescendants(b);
-                    return (mode === 'asc') ? valA - valB : valB - valA;
-                });
+            if (!resortFn) return false;
+            resortFn((a, b) => {
+                if (mode === 'original') return (a.__original_index || 0) - (b.__original_index || 0);
+                const valA = countDescendants(a);
+                const valB = countDescendants(b);
+                return (mode === 'asc') ? valA - valB : valB - valA;
+            });
+            return true;
+        }
 
+        sortNodes(mode) {
+            if (!this.tree) return;
+
+            if (this._resortChildren(mode)) {
                 // Incremental update if possible
                 if (this.tree.display && typeof this.tree.display.update === 'function') {
                     // Alan 5/9/26 - Reapply sequence metric filters after ladderizing so hidden tips stay hidden.
@@ -1693,6 +1983,53 @@
             // Ideally: manipulate zoom transform.
             // Phylotree v2 usually resets zoom on redraw.
             this._draw();
+        }
+
+        // Alan 9/23/26 - Radial trees open fitted to the visible pane. phylotree draws them
+        // at full size in the middle of a square padded by the LONGEST label on every side,
+        // so at 1:1 the visible corner of that square is empty and the tree reads as "off to
+        // the right and down". Fit the drawing's real extent (branches plus the labels as
+        // drawn) into the part of the tree pane that is on screen, never enlarging it, and
+        // make the canvas the size of that pane so the page does not scroll through the
+        // rest of the square. Needs a settled layout, hence 'transitions': false in _draw().
+        _frameRadialTree() {
+            if (this.options.layout !== 'radial') return;
+            const display = this.tree?.display;
+            const svgNode = this.container.querySelector('svg');
+            const group = svgNode?.querySelector('.phylotree-container');
+            if (!display || typeof display.set_camera !== 'function' || !group) return;
+            let box;
+            try { box = group.getBBox(); } catch (_) { return; }
+            if (!(box.width > 0 && box.height > 0)) return;
+            const layout = Array.isArray(display.layout_translate) ? display.layout_translate : [0, 0];
+            const style = window.getComputedStyle(this.container);
+            const padLeft = parseFloat(style.paddingLeft) || 0;
+            const padRight = parseFloat(style.paddingRight) || 0;
+            const padTop = parseFloat(style.paddingTop) || 0;
+            const padBottom = parseFloat(style.paddingBottom) || 0;
+            const paneWidth = this.container.clientWidth - padLeft - padRight;
+            // On desktop the container grows with the SVG, so its height says nothing about
+            // what is on screen: use the window below the pane's top edge. In full screen and
+            // on phones the container has a fixed height, which caps it.
+            const top = this.container.getBoundingClientRect().top + padTop;
+            const fixedHeight = this.container.clientHeight - padTop - padBottom;
+            const paneHeight = Math.max(320, Math.min(
+                (window.innerHeight || 800) - Math.max(0, top) - 12,
+                document.body.classList.contains('tree-expanded') ? fixedHeight : Infinity
+            ));
+            if (!(paneWidth > 0)) return;
+            const margin = 8;
+            // 0.1 is the zoom behaviour's lower limit; going below it would jump on the next zoom.
+            const k = Math.max(0.1, Math.min(1,
+                (paneWidth - 2 * margin) / box.width,
+                (paneHeight - 2 * margin) / box.height));
+            // The camera sits on top of the layout translate, so the box is shifted by it.
+            const x = (paneWidth - k * box.width) / 2 - k * (box.x + layout[0]);
+            const y = (paneHeight - k * box.height) / 2 - k * (box.y + layout[1]);
+            display.set_camera(k, x, y);
+            svgNode.setAttribute('width', String(Math.floor(paneWidth)));
+            svgNode.setAttribute('height', String(Math.floor(paneHeight)));
+            this._applyTextSizingFromZoom();
         }
 
         // Alan 5/11/26 - Apply persisted tip renames after loading Newick while preserving original IDs for edit actions.
@@ -1794,8 +2131,36 @@
          * Selected nodes receive a {Selected} tag comment.
          * @returns {string} Newick string representation of the current tree state.
          */
-        getNewickString() {
+        getNewickString(options = {}) {
             if (!this.tree) return "";
+            // Alan 9/24/26 - With options.typeLabels, type-specimen tips are written as
+            // "<label> (holotype)". Names are swapped only for the serialization and restored in
+            // `finally`. A tip with no __original_name is keyed by its name, so that is pinned too
+            // or its {Selected} tag would be lost.
+            const relabeled = [];
+            if (options.typeLabels) {
+                for (const node of this._getLeafNodes()) {
+                    const data = node.data || node;
+                    if (!node.__typeSpecimen || typeof data.name !== 'string') continue;
+                    const labelled = appendTypeStatusToLabel(data.name, node.__typeSpecimen);
+                    if (labelled === data.name) continue;
+                    relabeled.push({ data, name: data.name, pinned: !data.__original_name });
+                    if (!data.__original_name) data.__original_name = data.name;
+                    data.name = labelled;
+                }
+            }
+            try {
+                return this._serializeNewick();
+            } finally {
+                for (const entry of relabeled) {
+                    entry.data.name = entry.name;
+                    if (entry.pinned) delete entry.data.__original_name;
+                }
+            }
+        }
+
+        // Alan 9/24/26 - Split from getNewickString so the type-label swap can wrap it.
+        _serializeNewick() {
             return this.tree.getNewick((node) => {
                 // The callback determines what annotation gets appended to the node name
                 const id = this._getNodeId(node);
@@ -1870,7 +2235,9 @@
             const relevantPatterns = [
                 /\.node\b/, /\.branch\b/, /\.phylotree/, /\.internal-node/,
                 /\.tree-/, /circle/, /path/, /text/, /line/,
-                /\.node-support-value/, /\.selected/
+                /\.node-support-value/, /\.selected/,
+                // Alan 9/23/26 - Polytomy connectors carry the branch stroke into the figure.
+                /\.polytomy-connector/
             ];
             let cssText = '';
             try {
@@ -1942,6 +2309,23 @@
                 }
             }
 
+            // Alan 9/23/26 - 4b. Carry each branch's ON-SCREEN opacity into the figure. The
+            //    stylesheet rules are scoped to #tree-container and do not match inside the
+            //    standalone clone, so the computed value (support fade, minus any selection or
+            //    hover override) is written inline. With fading off every branch computes to 1
+            //    and nothing is written, so the export is unfaded too.
+            const origBranches = svg.querySelectorAll('path.branch');
+            const cloneBranches = clone.querySelectorAll('path.branch');
+            const bn = Math.min(origBranches.length, cloneBranches.length);
+            for (let i = 0; i < bn; i++) {
+                const opacity = parseFloat(window.getComputedStyle(origBranches[i]).strokeOpacity);
+                if (Number.isFinite(opacity) && opacity < 1) {
+                    cloneBranches[i].style.setProperty('stroke-opacity', String(opacity));
+                } else {
+                    cloneBranches[i].style.removeProperty('stroke-opacity');
+                }
+            }
+
             // 5. Resolve pixel dimensions.
             //    Prefer getBoundingClientRect because it is reliable even when SVG attrs use "%" or are unset.
             //    Only fall back to attribute value if it parses as a plain number (no % unit).
@@ -1967,7 +2351,91 @@
             if (vb) clone.setAttribute('viewBox', vb);
             else clone.setAttribute('viewBox', `0 0 ${width} ${height}`);
 
+            // Alan 9/23/26 - 7. A faded branch in a figure is ambiguous without a key, so a
+            //    faded export always carries one. Nothing is added when fading is off.
+            if (this._supportFadeActive()) {
+                ({ width, height } = this._appendSupportFadeLegend(clone, width, height));
+            }
+
             return { clone, width, height };
+        }
+
+        // Alan 9/23/26 - True when the fade is on AND this tree has at least one binnable branch.
+        _supportFadeActive() {
+            if (!this.options.supportFade) return false;
+            if (!window.describeSupportFade(this.lastStats?.supportType)) return false;
+            return (this.allNodes || []).some((node) => this._supportFadeInfo(node));
+        }
+
+        /**
+         * Alan 9/23/26 - Append the support-fade key below the tree in an export clone, growing
+         * the canvas to make room. Drawn in screen pixels and scaled into the clone's viewBox
+         * units. The sample strokes use class "branch" so they pick up exactly the stroke the
+         * exported branches get from the embedded stylesheet.
+         *
+         * @returns {{width: number, height: number}} the new pixel size of the clone
+         */
+        _appendSupportFadeLegend(clone, width, height) {
+            const legend = window.describeSupportFade(this.lastStats?.supportType);
+            if (!legend) return { width, height };
+            const NS = 'http://www.w3.org/2000/svg';
+            const vb = (clone.getAttribute('viewBox') || `0 0 ${width} ${height}`)
+                .split(/[\s,]+/).map(Number);
+            if (vb.length !== 4 || vb.some((v) => !Number.isFinite(v)) || !(vb[2] > 0)) {
+                return { width, height };
+            }
+            const unit = vb[2] / width;
+
+            const FONT = 11;
+            const LINE = 16;
+            const PAD = 12;
+            const SAMPLE = 28;
+            const lines = [
+                { text: `Branch opacity: ${legend.statistic} support`, bold: true },
+                ...legend.rows.map((row) => ({ text: `${row.level}: ${row.text}`, level: row.level })),
+                { text: 'Terminal branches and branches without a support value are drawn solid.', note: true }
+            ];
+            // No DOM to measure in (the clone is detached), so estimate generously.
+            const longest = Math.max(...lines.map((line) => line.text.length * FONT * 0.6
+                + (line.level ? SAMPLE + 8 : 0)));
+            const legendWidth = PAD * 2 + longest;
+            const legendHeight = PAD + lines.length * LINE + PAD / 2;
+
+            const g = document.createElementNS(NS, 'g');
+            g.setAttribute('class', 'support-fade-legend');
+            g.setAttribute('transform',
+                `translate(${vb[0] + PAD * unit},${vb[1] + vb[3] + (PAD / 2) * unit}) scale(${unit})`);
+            lines.forEach((line, index) => {
+                const y = index * LINE + LINE / 2;
+                let x = 0;
+                if (line.level) {
+                    const sample = document.createElementNS(NS, 'path');
+                    sample.setAttribute('class', 'branch');
+                    sample.setAttribute('d', `M0,${y} H${SAMPLE}`);
+                    sample.setAttribute('style', `fill:none;stroke-opacity:${legend.opacity[line.level]}`);
+                    g.appendChild(sample);
+                    x = SAMPLE + 8;
+                }
+                const text = document.createElementNS(NS, 'text');
+                text.setAttribute('x', String(x));
+                text.setAttribute('y', String(y));
+                text.setAttribute('dominant-baseline', 'central');
+                text.setAttribute('style', `font-family:Arial, Helvetica, sans-serif;font-size:${FONT}px;`
+                    + `fill:${line.note ? '#4b5563' : '#1f2937'};stroke:none;`
+                    + `font-weight:${line.bold ? 'bold' : 'normal'};`
+                    + `font-style:${line.note ? 'italic' : 'normal'}`);
+                text.textContent = line.text;
+                g.appendChild(text);
+            });
+            clone.appendChild(g);
+
+            const newWidth = Math.max(width, legendWidth);
+            const newHeight = height + legendHeight;
+            clone.setAttribute('viewBox',
+                `${vb[0]} ${vb[1]} ${vb[2] * (newWidth / width)} ${vb[3] + legendHeight * unit}`);
+            clone.setAttribute('width', newWidth);
+            clone.setAttribute('height', newHeight);
+            return { width: newWidth, height: newHeight };
         }
 
         /**
@@ -2197,6 +2665,94 @@
                     }
                 }
             }
+        }
+
+        // Alan 9/24/26 - Mirror of type_specimen_service.resolve_tip(): the exact input header
+        // first, then the label's first token as an accession under record_accession()'s rule.
+        // `records` only holds accessions the server resolved from this job's own headers, and a
+        // bare "MO123456" is a Mushroom Observer label, never an accession, so it cannot borrow
+        // the status of a GenBank "MO123456.1" in the same job.
+        _typeSpecimenForName(name) {
+            let label = String(name || '').trim();
+            if (label.startsWith('_R_')) label = label.slice(3);
+            if (!label) return null;
+            const records = this.typeSpecimens.records;
+            let acc = ownValue(this.typeSpecimens.names, label);
+            if (!acc) {
+                const first = label.split(/\s+/)[0] || '';
+                if (/^MO\d{5,12}$/i.test(first)) return null;
+                acc = first.split('.')[0].toUpperCase();
+            }
+            const info = ownValue(records, acc);
+            return info && typeof info === 'object' ? info : null;
+        }
+
+        // Alan 9/24/26 - Tag each tip with its type-specimen record (or null). A renamed tip is
+        // matched by its __original_name only: the new name is the user's text, and its first
+        // word may well be some other tip's accession.
+        _attachTypeSpecimensToLeaves() {
+            this.typeSpecimenCount = 0;
+            for (const node of this.allNodes) {
+                node.__typeSpecimen = null;
+                if (node.children && node.children.length) continue;
+                const name = node?.data?.__original_name || node?.__original_name
+                    || node?.data?.name || node?.name;
+                const info = this._typeSpecimenForName(name);
+                if (info) {
+                    node.__typeSpecimen = info;
+                    this.typeSpecimenCount += 1;
+                }
+            }
+        }
+
+        // Alan 9/24/26 - Type-specimen tips get a bold label, a gold superscript "T" badge (the
+        // usual taxonomic mark for type and ex-type material) and a hover title naming the type.
+        // Called from the node styler, i.e. after every phylotree redraw: phylotree resets the
+        // label with .text(), which drops the badge, so it is re-added here idempotently. Inline
+        // styles, not stylesheet rules, so SVG/PNG/JPG exports carry the marker too.
+        _decorateTypeSpecimen(element, node) {
+            const group = element && typeof element.node === 'function' ? element.node() : null;
+            if (!group || !group.querySelector) return;
+            const info = node && node.__typeSpecimen;
+            group.classList.toggle('type-specimen-tip', !!info);
+            const label = group.querySelector('text.phylotree-node-text');
+            if (!label) return;
+            let badge = label.querySelector('tspan.type-specimen-badge');
+            let title = label.querySelector('title.type-specimen-title');
+            if (!info || !label.textContent) {
+                if (badge) badge.remove();
+                if (title) title.remove();
+                // d3 can rebind a label drawn for a type tip to an ordinary one; drop its bold.
+                if (label.style.getPropertyValue('font-weight') === '700') {
+                    label.style.setProperty('font-weight', '400', 'important');
+                }
+                return;
+            }
+            label.style.setProperty('font-weight', '700', 'important');
+            if (!badge) {
+                badge = document.createElementNS(SVG_NS, 'tspan');
+                badge.setAttribute('class', 'type-specimen-badge');
+                badge.setAttribute('dx', '0.2em');
+                badge.setAttribute('dy', '-0.45em');
+                badge.style.setProperty('font-size', '72%');
+                badge.style.setProperty('font-weight', '700', 'important');
+                // The variable is defined in tree_viewer.css for light/dark; an exported figure
+                // has no stylesheet, so it falls back to the light-background gold.
+                badge.style.setProperty('fill', 'var(--type-specimen-badge, #8f6b1f)', 'important');
+                badge.textContent = 'T';
+                label.appendChild(badge);
+            }
+            if (!title) {
+                title = document.createElementNS(SVG_NS, 'title');
+                title.setAttribute('class', 'type-specimen-title');
+                label.appendChild(title);
+            }
+            title.textContent = describeTypeSpecimen(info);
+        }
+
+        // Alan 9/24/26 - Number of type-specimen tips in the loaded tree.
+        getTypeSpecimenCount() {
+            return this.typeSpecimenCount || 0;
         }
 
         // Alan 5/9/26 - Return leaf nodes so sequence metric filters only hide terminal tips.
@@ -2531,7 +3087,8 @@
                 self._styleNode(el, d);
                 if (id && self.hiddenSelectionIds.has(id)) el.classed("node-selected", false);
                 // Alan 5/11/26 - Restyle node shapes but clear label inline color so text follows the refreshed group state.
-                el.selectAll("circle,path,rect").each(function () {
+                // Alan 9/23/26 - A polytomy connector keeps the branch stroke, not the group colour.
+                el.selectAll("circle,path:not(.polytomy-connector),rect").each(function () {
                     self._styleNode(window.d3v7.select(this), d);
                 });
                 // Alan 5/12/26 - Track temporary action selection separately from persistent color groups.
@@ -2541,8 +3098,9 @@
                 // Alan 5/12/26 - Compute label color explicitly because base CSS no longer lets text inherit group fill.
                 const labelColor = self._getNodeDisplayColor(id, d) || (isCurrentSelection ? "#c9a962" : null);
                 // Alan 5/12/26 - Keep selected labels colored without adding weight or SVG stroke.
+                // Alan 9/24/26 - Type-specimen tips stay bold through selection restyles.
                 const labelText = el.selectAll("text.phylotree-node-text")
-                    .style("font-weight", "400", "important")
+                    .style("font-weight", n => (n && n.__typeSpecimen ? "700" : "400"), "important")
                     .style("stroke", "none", "important")
                     .style("stroke-width", "0", "important")
                     .style("paint-order", "normal", "important");
@@ -2552,6 +3110,105 @@
                 if (labelColor) labelText.style("fill", labelColor, "important");
                 // Alan 5/12/26 - Remove inline fill for ordinary labels so light/dark base CSS controls them.
                 else labelText.style("fill", null);
+            });
+            // Alan 9/23/26 - Selection changes arrive here, so re-evaluate which branches are
+            // highlighted (full opacity) and which return to their support fade.
+            this._applySupportFading();
+        }
+
+        /**
+         * Alan 9/23/26 - Display class of the branch leading to `node`, or null when that branch
+         * is not faded at all: a tip (terminal branches carry no support), the root, a node with
+         * no support value, or a tree whose scale cannot be binned (none, mixed).
+         */
+        _supportFadeInfo(node) {
+            if (!node || !node.parent) return null;
+            const children = node.children || [];
+            if (!children.length) return null;
+            const supportType = this.lastStats?.supportType;
+            if (supportType === 'ALRT_UFBOOT') {
+                const dual = this._extractDualSupport(node);
+                if (!dual) return null;
+                const level = dualSupportFadeLevel(dual.alrt, dual.ufboot);
+                if (!level) return null;
+                const a = formatSupportFadeValue(dual.alrt, SUPPORT_FADE_BINS.ALRT);
+                const u = formatSupportFadeValue(dual.ufboot, SUPPORT_FADE_BINS.UFBOOT);
+                return { level, text: `SH-aLRT/UFBoot: ${a}/${u} \u00b7 display class: ${level}` };
+            }
+            const bins = SUPPORT_FADE_BINS[supportType];
+            if (!bins) return null;
+            const value = this._extractSupportValue(node);
+            if (value === null) return null;
+            const level = supportFadeLevel(value, bins);
+            if (!level) return null;
+            const label = ((window.SUPPORT_TYPE_INFO || {})[supportType] || {}).label || supportType;
+            return {
+                level,
+                text: `${label}: ${formatSupportFadeValue(value, bins)} \u00b7 display class: ${level}`
+            };
+        }
+
+        /**
+         * Alan 9/23/26 - Apply (or clear) the support fade on one rendered branch.
+         *
+         * User styling always wins: a branch that is selected, tagged or hovered is restored by
+         * the !important rules in tree_viewer.css, and one leading to a selected clade, carrying
+         * a branch annotation, or given an explicit stroke colour is simply never faded here.
+         * Everything is recomputed on each call, so when a highlight goes away the fade returns.
+         */
+        _styleBranchSupport(element, edge) {
+            // phylotree's refresh() calls the edge styler with select(<display object>) rather
+            // than the path element, so anything without setAttribute is not a branch.
+            const el = element && typeof element.node === 'function' ? element.node() : null;
+            if (!el || typeof el.setAttribute !== 'function') return;
+            const target = edge?.target;
+            // Alan 9/23/26 - Remember the drawn branch so a polytomy connector can mirror its
+            // selection/tag state; this styler runs on every redraw and selection change.
+            if (target) {
+                target.__branchPath = el;
+                this._syncPolytomyConnectorState(target);
+            }
+            const info = this.options.supportFade ? this._supportFadeInfo(target) : null;
+
+            const title = el.querySelector('title');
+            if (title) {
+                // phylotree writes "Length = x" on every draw; keep only that line and re-append.
+                const lengthLine = String(title.textContent || '').split('\n')[0];
+                title.textContent = info ? `${lengthLine}\n${info.text}` : lengthLine;
+            }
+
+            const highlighted = Boolean(info) && (
+                this._supportFadeSelectedClades().has(target)
+                || Boolean(this._annotatedBranchNodes && this._annotatedBranchNodes.has(target))
+                || Boolean(el.style && el.style.stroke)
+            );
+            if (!info || highlighted || info.level === 'strong') {
+                el.removeAttribute('data-support-fade');
+                if (el.style) el.style.removeProperty('stroke-opacity');
+                return;
+            }
+            el.setAttribute('data-support-fade', info.level);
+            el.style.setProperty('stroke-opacity', String(SUPPORT_FADE_OPACITY[info.level]));
+        }
+
+        // Alan 9/23/26 - Selected clades as a Set of live nodes, rebuilt only when the cached
+        // selection array changes, since the edge styler consults it once per branch.
+        _supportFadeSelectedClades() {
+            const nodes = this.getSelectedCladeNodes();
+            if (this._supportFadeSelectionSource !== nodes) {
+                this._supportFadeSelectionSource = nodes;
+                this._supportFadeSelection = new Set(nodes);
+            }
+            return this._supportFadeSelection;
+        }
+
+        _applySupportFading() {
+            if (!this.tree || !this.container) return;
+            const svg = window.d3v7.select(this.container).select("svg");
+            if (svg.empty()) return;
+            const self = this;
+            svg.selectAll("path.branch").each(function (edge) {
+                self._styleBranchSupport(window.d3v7.select(this), edge);
             });
         }
 
@@ -2843,12 +3500,11 @@
                         }
                     }
 
-                    if (d.parent) {
-                        const incoming = self._branchLength(d);
-                        if (incoming !== null && Math.abs(incoming) <= SUPPORT_LABEL_MIN_BRANCH_LENGTH) {
-                            group.select("text.node-support-value").remove();
-                            return;
-                        }
+                    // Alan 9/23/26 - No label on an effectively zero-length branch (same floor as
+                    // the polytomy contraction); only the root's children can still have one.
+                    if (d.parent && self._hasZeroLengthIncomingBranch(d)) {
+                        group.select("text.node-support-value").remove();
+                        return;
                     }
 
                     const numVal = self._extractSupportValue(d);
@@ -2974,7 +3630,12 @@
             const { k } = this._getSvgAndZoomGroup();
             // Alan 8/28/26 - Coarse-pointer users expect the complete tree to zoom like one
             // image. Desktop retains its established counter-scaled labels and annotations.
-            const visualK = window.matchMedia?.('(pointer: coarse)')?.matches ? 1 : k;
+            // Alan 9/23/26 - A radial tree also zooms like one image: its labels circle the tree,
+            // so labels held at a constant screen size while zoomed out to fit it would pile
+            // into each other and spill past the pane. Rectangular desktop trees keep them.
+            const uniformZoom = window.matchMedia?.('(pointer: coarse)')?.matches
+                || this.options.layout === 'radial';
+            const visualK = uniformZoom ? 1 : k;
 
             // Base sizes
             let supportBase = this.options.supportBasePx;
@@ -2991,6 +3652,21 @@
             const haloSvgPx = Math.max(0.75, 3 / visualK);
 
             const svg = window.d3v7.select(this.container).select("svg");
+
+            // Alan 9/23/26 - Polytomy connectors are held at a fixed screen length by the same
+            // factor as the labels; _drawPolytomyConnector and _tipLabelDx both read it.
+            // Alan 9/24/26 - Whether a tip needs one is decided when its node is drawn (the
+            // node-styler), so a zoom frame only resizes the existing ones, and only when the
+            // factor moved -- re-deciding every node each frame was O(n^2) inside a large
+            // polytomy, and the label dx it wrote is rewritten by the tip-text pass below.
+            if (this._labelVisualK !== visualK) {
+                this._labelVisualK = visualK;
+                const self = this;
+                svg.selectAll("path.polytomy-connector").each(function () {
+                    const node = this.parentNode && this.parentNode.__data__;
+                    if (node) this.setAttribute('d', self._polytomyConnectorD(node));
+                });
+            }
 
             svg.selectAll("text.node-support-value").each(function (d) {
                 if (!d || !d.__supportVec) return;
@@ -4659,6 +5335,7 @@
             this.annotationLayers = Array.isArray(layers) ? layers : [];
             this.cladeAnnotations = Array.isArray(annotations) ? annotations : [];
             this._renderCladeAnnotations();
+            this._applySupportFading();
         }
 
         // Alan 8/15/26 - Give the controller the current configuration for saving.
@@ -4918,6 +5595,7 @@
             this.annotationRedrawTimer = setTimeout(() => {
                 this.annotationRedrawTimer = null;
                 this._renderCladeAnnotations();
+                this._applySupportFading();
             }, 60);
         }
 
@@ -5786,6 +6464,9 @@
          * own container group, so they share the tree's coordinate space and zoom/pan transform.
          */
         _renderCladeAnnotations() {
+            // Alan 9/23/26 - Branches carrying a branch annotation are user-styled, so they are
+            // exempt from the support fade; refilled below from the branch items actually drawn.
+            this._annotatedBranchNodes = new Set();
             // Alan 9/9/26 - Rebuilt on every redraw so the Alignment Viewer's name backgrounds
             // can never outlive the bands they mirror (a deleted, hidden or no-longer-valid
             // highlight leaves nothing behind).
@@ -6071,6 +6752,7 @@
             const branchCursors = new Map();
             for (const item of branchItems) {
                 const node = item.targetNode;
+                this._annotatedBranchNodes.add(node);
                 const point = this._annotationNodePoint(node);
                 const parentPoint = this._annotationNodePoint(node.parent);
                 if (!point || !parentPoint) continue;
@@ -6156,6 +6838,15 @@
                     const nextViewBox = `${minX} ${minY} ${maxX - minX} ${maxY - minY}`;
                     svgNode.setAttribute('viewBox', nextViewBox);
                     svgNode.setAttribute('data-annotation-set-viewbox', nextViewBox);
+                    // Alan 9/23/26 - Keep the figure at 1:1. A viewBox larger than the SVG's own
+                    // width/height makes the browser shrink everything to fit, which is how a
+                    // label or band past the last tip turned every tip label tiny.
+                    if (maxX - minX > (parseFloat(svgNode.getAttribute('width')) || 0)) {
+                        setWidth(Math.ceil(maxX - minX));
+                    }
+                    if (maxY - minY > (parseFloat(svgNode.getAttribute('height')) || 0)) {
+                        svgNode.setAttribute('height', String(Math.ceil(maxY - minY)));
+                    }
                 }
             }
         }

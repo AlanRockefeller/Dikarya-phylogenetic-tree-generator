@@ -541,6 +541,43 @@ When a new CLI version is published:
   percentage (`93`) and TBE as a proportion (`0.930000`), so anything that ever
   displays the TBE tree must say which it is rather than reusing the bootstrap
   badge's reading.
+- **Type-specimen tips are marked from two sources, by exact accession only.**
+  `app/services/type_specimen_service.py` merges MycoMap's type list
+  (`mycomap_type_specimens.json`, replaced weekly by
+  `scripts/dikarya_refresh_type_specimens.py` via
+  `ops/cron/dikarya-refresh-type-specimens`) with GenBank's own `/type_material`
+  qualifier or RefSeq's "from TYPE material" definition marker
+  (`genbank_type_material.jsonl`, appended by `_parse_genbank_xml()` on every
+  GenBank fetch and backfilled by the same script). Both live in
+  `Config.TYPE_SPECIMEN_DIR` (`cache/type_specimens`, tree:dikarya 2775 like
+  `cache/blast`). The app never reads the committed raw API dump
+  (`mycomap-type-specimens.json`), so a fresh deployment shows no MycoMap
+  markers until the refresh script has run once; run it by hand after
+  installing rather than waiting for Monday's cron. Neither
+  source contains the other: the MycoMap list holds no
+  RefSeq `NR_` records, and 93% of the `NR_` accessions in existing jobs are
+  types. Never match on organism name -- that marks every sequence of a species
+  as its type -- and resolve accessions through `record_accession()` so a
+  Mushroom Observer `MO123456` label is never read as a GenBank accession.
+  "reference material" is not type material and is deliberately not marked.
+  Resolution happens when the page is served (`type_specimens_for_job()` ->
+  `window.TYPE_SPECIMENS`), never written into a job, so old jobs pick up
+  markers as the data grows and tree state/undo are untouched.
+
+  Three pairs are mirrors and must change together: `resolve_tip()` /
+  `_typeSpecimenForName()`, `append_type_status()` /
+  `appendTypeStatusToLabel()`, and `classify_type_material()`, whose statuses
+  the viewer shows verbatim. The viewer draws a bold label plus a gold
+  superscript "T" `<tspan>` re-added by the node styler after every phylotree
+  redraw (which wipes the label's children), with inline styles so image
+  exports carry it. The "Type status in labels" Export option (on by default)
+  appends `(holotype)` etc. to Current Newick client-side and to Original
+  Newick/NEXUS via `?type_labels=1`. That parameter is opt-in on purpose: the
+  viewer itself loads `/download/tree/newick` and matches tips by name, so a
+  server-side default would break it. The labelled Original Newick is edited
+  as text by `tree_io.relabel_newick_text()`, touching only the type tips'
+  labels -- a Biopython round trip rounds every support value to two decimals,
+  and that download promises the builder's own file.
 - **GenBank accession policy lives in `fasta_utils.GENBANK_ACCESSION_RE`.** The
   large-scale INSDC families (WGS contigs, TSA transcripts, TLS targeted-locus
   records) share one accession structure and the string does not say which is
@@ -712,6 +749,7 @@ journal, including sshd auth records). Use these instead, in this order:
 | Gunicorn access/errors | `var/logs/{access,error}.log` | yes |
 | Worker app output | `var/logs/worker.log` (phylo_high), `var/logs/worker-bulk.log` (phylo_bulk) | yes |
 | Internet-wide scanner sweeps | `var/logs/scanner.log` | yes |
+| Weekly type-specimen refresh (stats, each type accession added/removed/reclassified) | `~/.dikarya/type-specimens/refresh.log` | yes |
 | Unit lifecycle, OOM kills, start failures | journal, via the wrapper below | wrapper only |
 
 **Nothing in `var/logs/` is deleted any more.** `ops/logrotate/dikarya` used to
@@ -976,6 +1014,16 @@ prints an exact half-open UTC window plus a line such as
 in that window. Capture the candidate exactly as printed; do not substitute the
 time when the investigation finishes, because events arriving during the
 review belong to the next review.
+
+**Always report the digest's "Type specimens (weekly refresh)" section to the
+user**, even when nothing else in the window is wrong: list every accession
+under "New type sequences" (accession, status, organism, source), give the
+run's statistics line, and pass on any removals, status changes, failed pass
+or stale-refresh WARNING. The section is read from the refresh's own log
+(`~/.dikarya/type-specimens/refresh.log`, written by
+`scripts/dikarya_refresh_type_specimens.py` as `event=type_specimens.*` lines),
+because the `tree` user that runs the refresh cannot write to `var/logs`. A
+first snapshot is summarised, not itemised.
 
 Only after the review has completed successfully, advance the checkpoint:
 
