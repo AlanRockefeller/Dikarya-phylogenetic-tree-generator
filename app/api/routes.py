@@ -4358,6 +4358,36 @@ def download_newick(job_id):
     response.headers["Expires"] = "0"
     return response
 
+def _type_labels_requested():
+    """Opt-in with ?type_labels=1, which the viewer's Export menu sends while its
+    "Type status in labels" box is ticked (the default). Never the default here:
+    the viewer itself loads /download/tree/newick and matches tips by name.
+    """
+    return request.args.get("type_labels") in ("1", "true")
+
+
+def _type_labeled_download(job_id, job_dir, newick_path, fmt, download_name):
+    """The tree with type status in its tip labels, or None to serve it as stored."""
+    if not _type_labels_requested():
+        return None
+    from io import BytesIO
+
+    from app.services.type_specimen_service import type_labeled_tree_text
+
+    text = type_labeled_tree_text(job_dir, newick_path, fmt)
+    if text is None:
+        return None
+    logger.info("Serving %s for job %s with type status in labels", fmt, job_id)
+    response = send_file(
+        BytesIO(text.encode("utf-8")),
+        as_attachment=True,
+        download_name=download_name,
+        mimetype="text/plain",
+    )
+    response.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
+    return response
+
+
 @bp.route('/job/<job_id>/download/tree/newick/original', methods=['GET'])
 def download_newick_original(job_id):
     _, error_msg, status_code = check_job_access(job_id)
@@ -4371,7 +4401,10 @@ def download_newick_original(job_id):
     if not validate_safe_file_path(path, job_dir):
         logger.error(f"File not found or unsafe: {path}")
         return jsonify({"status": "error", "error": "Tree file not found or invalid"}), 404
-        
+
+    labeled = _type_labeled_download(job_id, job_dir, path, "newick", "tree_original.newick")
+    if labeled is not None:
+        return labeled
     return send_file(path, as_attachment=True, download_name="tree_original.newick")
 
 @bp.route('/job/<job_id>/download/tree/newick/pruned', methods=['GET'])
@@ -4405,6 +4438,16 @@ def download_nexus(job_id):
         return jsonify({"status": "error", "error": "Invalid job id"}), 400
 
     job_dir = Config.JOB_DIR / job_id
+    if _type_labels_requested():
+        # Same Newick build_nexus_download() treats as the source of truth.
+        labeled_source = job_dir / "tree" / "tree_pruned.newick"
+        if not validate_safe_file_path(labeled_source, job_dir):
+            labeled_source = job_dir / "tree" / "tree_original.newick"
+        if validate_safe_file_path(labeled_source, job_dir):
+            labeled = _type_labeled_download(job_id, job_dir, labeled_source, "nexus", "tree.nexus")
+            if labeled is not None:
+                return labeled
+
     # Rebuilt from the Newick whenever the stored NEXUS is stale or was written
     # by Biopython's writer, which mangles any label containing a space or a
     # parenthesis -- see build_nexus_download().

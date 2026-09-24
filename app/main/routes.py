@@ -940,8 +940,18 @@ def job_viewer(job_id):
         logger.exception("Could not resolve generation details for job %s", job_id)
         generation_details = {}
 
+    # Which tips are type specimens (MycoMap's list plus GenBank /type_material).
+    # Display metadata only; a failure here must never stop the tree rendering.
+    try:
+        from app.services.type_specimen_service import type_specimens_for_job
+        type_specimens = type_specimens_for_job(job_dir, job_details.get("sequence_metadata"))
+    except Exception:
+        logger.exception("Could not resolve type specimens for job %s", job_id)
+        type_specimens = {"records": {}, "names": {}}
+
     return render_template(
         'job_viewer.html', job_id=job_id, job_details=job_details, view_only=view_only,
+        type_specimens=type_specimens,
         claude_review_enabled=claude_review_enabled(),
         tree_support_context=tree_support_context,
         generation_details=generation_details,

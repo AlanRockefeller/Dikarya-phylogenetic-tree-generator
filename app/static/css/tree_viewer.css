@@ -1513,3 +1513,15 @@ body.tree-expanded #btn-fullscreen i::before {
 .dark #tree-status-dock #status-message[data-status-type="danger"] {
     background-color: #450a0a;
 }
+
+/* Alan 9/24/26 - Type-specimen badge (the gold superscript "T" drawn by
+   _decorateTypeSpecimen in tree_viewer_phylotree_v2.js). A darker gold on the
+   light background for contrast; the badge's inline fallback is the light value,
+   which is what an exported figure (no stylesheet) gets. */
+:root {
+    --type-specimen-badge: #8f6b1f;
+}
+
+.dark {
+    --type-specimen-badge: #c9a962;
+}

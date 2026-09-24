@@ -99,6 +99,44 @@
             .trim();
     }
 
+    // Alan 9/24/26 - Type-specimen tips. The server resolves which of a job's sequences are
+    // types (type_specimen_service.type_specimens_for_job) and passes
+    // {records: {ACCESSION: info}, names: {input header: ACCESSION}} as window.TYPE_SPECIMENS.
+    const TYPE_SOURCE_LABELS = {
+        genbank: 'GenBank /type_material',
+        genbank_definition: 'NCBI definition ("from TYPE material")',
+        mycomap: 'MycoMap type specimen list'
+    };
+
+    // Alan 9/24/26 - Own-property read, so a label such as "constructor" can never resolve to
+    // something on Object.prototype.
+    function ownValue(obj, key) {
+        return obj && key && Object.prototype.hasOwnProperty.call(obj, key) ? obj[key] : undefined;
+    }
+
+    // Alan 9/24/26 - Mirror of type_specimen_service.append_type_status(): "(holotype)" is
+    // appended unless the label already names that status (BLAST headers often end in it).
+    function appendTypeStatusToLabel(label, info) {
+        const status = String((info && info.status) || '').trim();
+        if (!status || typeof label !== 'string') return label;
+        const base = status.startsWith('ex-') ? status.slice(3) : status;
+        const escaped = base.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+        if (new RegExp(`\\b${escaped}\\b`, 'i').test(label)) return label;
+        return `${label} (${status})`;
+    }
+    window.appendTypeStatusToLabel = appendTypeStatusToLabel;
+
+    // Alan 9/24/26 - Hover text for a type-specimen tip.
+    function describeTypeSpecimen(info) {
+        const lines = [`Type specimen: ${info.status || 'type'}`];
+        if (info.type_material) lines.push(info.type_material);
+        if (info.voucher) lines.push(`Voucher: ${info.voucher}`);
+        const sources = (Array.isArray(info.sources) ? info.sources : [])
+            .map(source => TYPE_SOURCE_LABELS[source] || source);
+        if (sources.length) lines.push(`Source: ${sources.join('; ')}`);
+        return lines.join('\n');
+    }
+
     // Alan 8/15/26 - Curated font list for clade annotations, shared with the controller's
     // editor UI and mirrored by ALLOWED_FONT_FAMILIES in tree_annotation_service.py. Using a
     // fixed list plus a fixed fallback stack means a font value can never carry a CSS fragment
@@ -674,6 +712,8 @@
                 identityMaximum: 100,
                 // Alan 5/9/26 - Store per-sequence BLAST metrics passed from the job metadata.
                 sequenceMetrics: [],
+                // Alan 9/24/26 - Type-specimen records for this job (window.TYPE_SPECIMENS).
+                typeSpecimens: {},
                 supportBasePx: 9,
                 tipBasePx: 12,
                 layout: 'linear',
@@ -683,6 +723,14 @@
             this.tipLabelGap = 2;
             // Alan 5/9/26 - Build a lookup once so tree tips can be matched to stored BLAST metrics quickly.
             this.sequenceMetricMap = this._buildSequenceMetricMap(this.options.sequenceMetrics);
+            // Alan 9/24/26 - Keep only object-shaped maps so a missing or malformed payload means
+            // "no type specimens" rather than a render error.
+            const typeSpecimens = this.options.typeSpecimens || {};
+            this.typeSpecimens = {
+                records: typeSpecimens.records && typeof typeSpecimens.records === 'object' ? typeSpecimens.records : {},
+                names: typeSpecimens.names && typeof typeSpecimens.names === 'object' ? typeSpecimens.names : {}
+            };
+            this.typeSpecimenCount = 0;
 
             this.tree = null;
             this.newick = null;
@@ -1205,6 +1253,8 @@
             }
             // Alan 5/9/26 - Attach stored BLAST metrics to leaf nodes after names are available.
             this._attachSequenceMetricsToLeaves();
+            // Alan 9/24/26 - Mark type-specimen tips from the same names.
+            this._attachTypeSpecimensToLeaves();
         }
 
         _branchLength(node) {
@@ -1552,6 +1602,8 @@
                 'transitions': false,
                 'node-styler': (element, node) => {
                     this._styleNode(element, node);
+                    // Alan 9/24/26 - Re-add the type-specimen badge after phylotree rewrites the label.
+                    this._decorateTypeSpecimen(element, node);
                     // Alan 9/23/26 - Runs after phylotree (re)draws each node, so a polytomy
                     // connector follows every update() without a separate pass.
                     this._drawPolytomyConnector(element, node);
@@ -2077,8 +2129,36 @@
          * Selected nodes receive a {Selected} tag comment.
          * @returns {string} Newick string representation of the current tree state.
          */
-        getNewickString() {
+        getNewickString(options = {}) {
             if (!this.tree) return "";
+            // Alan 9/24/26 - With options.typeLabels, type-specimen tips are written as
+            // "<label> (holotype)". Names are swapped only for the serialization and restored in
+            // `finally`. A tip with no __original_name is keyed by its name, so that is pinned too
+            // or its {Selected} tag would be lost.
+            const relabeled = [];
+            if (options.typeLabels) {
+                for (const node of this._getLeafNodes()) {
+                    const data = node.data || node;
+                    if (!node.__typeSpecimen || typeof data.name !== 'string') continue;
+                    const labelled = appendTypeStatusToLabel(data.name, node.__typeSpecimen);
+                    if (labelled === data.name) continue;
+                    relabeled.push({ data, name: data.name, pinned: !data.__original_name });
+                    if (!data.__original_name) data.__original_name = data.name;
+                    data.name = labelled;
+                }
+            }
+            try {
+                return this._serializeNewick();
+            } finally {
+                for (const entry of relabeled) {
+                    entry.data.name = entry.name;
+                    if (entry.pinned) delete entry.data.__original_name;
+                }
+            }
+        }
+
+        // Alan 9/24/26 - Split from getNewickString so the type-label swap can wrap it.
+        _serializeNewick() {
             return this.tree.getNewick((node) => {
                 // The callback determines what annotation gets appended to the node name
                 const id = this._getNodeId(node);
@@ -2585,6 +2665,94 @@
             }
         }
 
+        // Alan 9/24/26 - Mirror of type_specimen_service.resolve_tip(): the exact input header
+        // first, then the label's first token as an accession under record_accession()'s rule.
+        // `records` only holds accessions the server resolved from this job's own headers, and a
+        // bare "MO123456" is a Mushroom Observer label, never an accession, so it cannot borrow
+        // the status of a GenBank "MO123456.1" in the same job.
+        _typeSpecimenForName(name) {
+            let label = String(name || '').trim();
+            if (label.startsWith('_R_')) label = label.slice(3);
+            if (!label) return null;
+            const records = this.typeSpecimens.records;
+            let acc = ownValue(this.typeSpecimens.names, label);
+            if (!acc) {
+                const first = label.split(/\s+/)[0] || '';
+                if (/^MO\d{5,12}$/i.test(first)) return null;
+                acc = first.split('.')[0].toUpperCase();
+            }
+            const info = ownValue(records, acc);
+            return info && typeof info === 'object' ? info : null;
+        }
+
+        // Alan 9/24/26 - Tag each tip with its type-specimen record (or null). A renamed tip is
+        // matched by its __original_name only: the new name is the user's text, and its first
+        // word may well be some other tip's accession.
+        _attachTypeSpecimensToLeaves() {
+            this.typeSpecimenCount = 0;
+            for (const node of this.allNodes) {
+                node.__typeSpecimen = null;
+                if (node.children && node.children.length) continue;
+                const name = node?.data?.__original_name || node?.__original_name
+                    || node?.data?.name || node?.name;
+                const info = this._typeSpecimenForName(name);
+                if (info) {
+                    node.__typeSpecimen = info;
+                    this.typeSpecimenCount += 1;
+                }
+            }
+        }
+
+        // Alan 9/24/26 - Type-specimen tips get a bold label, a gold superscript "T" badge (the
+        // usual taxonomic mark for type and ex-type material) and a hover title naming the type.
+        // Called from the node styler, i.e. after every phylotree redraw: phylotree resets the
+        // label with .text(), which drops the badge, so it is re-added here idempotently. Inline
+        // styles, not stylesheet rules, so SVG/PNG/JPG exports carry the marker too.
+        _decorateTypeSpecimen(element, node) {
+            const group = element && typeof element.node === 'function' ? element.node() : null;
+            if (!group || !group.querySelector) return;
+            const info = node && node.__typeSpecimen;
+            group.classList.toggle('type-specimen-tip', !!info);
+            const label = group.querySelector('text.phylotree-node-text');
+            if (!label) return;
+            let badge = label.querySelector('tspan.type-specimen-badge');
+            let title = label.querySelector('title.type-specimen-title');
+            if (!info || !label.textContent) {
+                if (badge) badge.remove();
+                if (title) title.remove();
+                // d3 can rebind a label drawn for a type tip to an ordinary one; drop its bold.
+                if (label.style.getPropertyValue('font-weight') === '700') {
+                    label.style.setProperty('font-weight', '400', 'important');
+                }
+                return;
+            }
+            label.style.setProperty('font-weight', '700', 'important');
+            if (!badge) {
+                badge = document.createElementNS(SVG_NS, 'tspan');
+                badge.setAttribute('class', 'type-specimen-badge');
+                badge.setAttribute('dx', '0.2em');
+                badge.setAttribute('dy', '-0.45em');
+                badge.style.setProperty('font-size', '72%');
+                badge.style.setProperty('font-weight', '700', 'important');
+                // The variable is defined in tree_viewer.css for light/dark; an exported figure
+                // has no stylesheet, so it falls back to the light-background gold.
+                badge.style.setProperty('fill', 'var(--type-specimen-badge, #8f6b1f)', 'important');
+                badge.textContent = 'T';
+                label.appendChild(badge);
+            }
+            if (!title) {
+                title = document.createElementNS(SVG_NS, 'title');
+                title.setAttribute('class', 'type-specimen-title');
+                label.appendChild(title);
+            }
+            title.textContent = describeTypeSpecimen(info);
+        }
+
+        // Alan 9/24/26 - Number of type-specimen tips in the loaded tree.
+        getTypeSpecimenCount() {
+            return this.typeSpecimenCount || 0;
+        }
+
         // Alan 5/9/26 - Return leaf nodes so sequence metric filters only hide terminal tips.
         _getLeafNodes() {
             return (this.allNodes || []).filter(node => !node.children || !node.children.length);
@@ -2928,8 +3096,9 @@
                 // Alan 5/12/26 - Compute label color explicitly because base CSS no longer lets text inherit group fill.
                 const labelColor = self._getNodeDisplayColor(id, d) || (isCurrentSelection ? "#c9a962" : null);
                 // Alan 5/12/26 - Keep selected labels colored without adding weight or SVG stroke.
+                // Alan 9/24/26 - Type-specimen tips stay bold through selection restyles.
                 const labelText = el.selectAll("text.phylotree-node-text")
-                    .style("font-weight", "400", "important")
+                    .style("font-weight", n => (n && n.__typeSpecimen ? "700" : "400"), "important")
                     .style("stroke", "none", "important")
                     .style("stroke-width", "0", "important")
                     .style("paint-order", "normal", "important");

@@ -388,6 +388,11 @@ class Config:
     BASE_DIR = Path(__file__).resolve().parent.parent
     JOB_DIR = Path(os.environ.get('JOB_DIR') or BASE_DIR / 'var' / 'jobs')
     BLAST_CACHE_DIR = Path(os.environ.get('BLAST_CACHE_DIR') or BASE_DIR / 'cache' / 'blast')
+    # Type-specimen reference data (type_specimen_service.py): the MycoMap list
+    # snapshot and GenBank's /type_material answers. Under cache/ like the BLAST
+    # cache, because both the tree account (refresh script) and the service
+    # account (GenBank fetches) write here; the directory is group dikarya, 2775.
+    TYPE_SPECIMEN_DIR = Path(os.environ.get('TYPE_SPECIMEN_DIR') or BASE_DIR / 'cache' / 'type_specimens')
     # ITSx HMM profiles, used by pyitsx for optional ITS1/5.8S/ITS2 extraction.
     ITSX_HMM_DIR = Path(os.environ.get('ITSX_HMM_DIR') or BASE_DIR / 'cache' / 'itsx' / 'HMMs')
     BLAST_EMAIL = os.environ.get('BLAST_EMAIL', '')

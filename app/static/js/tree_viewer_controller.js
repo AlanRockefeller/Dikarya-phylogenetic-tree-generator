@@ -2707,6 +2707,8 @@ document.addEventListener('DOMContentLoaded', async () => {
                 ? parseInt(getEl('input-bs-threshold')?.value || 70) : 0,
             // Alan 5/9/26 - Pass stored per-sequence BLAST metrics into the viewer for tip filtering.
             sequenceMetrics: Array.isArray(window.SEQUENCE_METRICS) ? window.SEQUENCE_METRICS : [],
+            // Alan 9/24/26 - Type-specimen tips resolved server-side (type_specimen_service.py).
+            typeSpecimens: window.TYPE_SPECIMENS || {},
             treeMethod: window.TREE_METHOD || '',
             // Alan 8/22/26 - IQ-TREE run with -alrt but no ultrafast bootstrap writes single
             // SH-aLRT percentages, not UFBoot ones.
@@ -2851,10 +2853,40 @@ document.addEventListener('DOMContentLoaded', async () => {
 
     // --- 2. SETUP DOWNLOAD LINKS ---
     const setupLink = (id, url) => { const el = getEl(id); if (el) el.href = url; };
+
+    // Alan 9/24/26 - "Type status in labels" (Export menu, on by default). Applies to the three
+    // tree downloads: the server adds "(holotype)" etc. to tip labels when asked with
+    // ?type_labels=1, and Current Newick does the same client-side. Remembered per browser.
+    const TYPE_LABELS_STORAGE_KEY = 'dikarya.treeViewer.exportTypeLabels';
+    const typeLabelsCheckbox = getEl('cb-export-type-labels');
+    const jobHasTypeSpecimens = Object.keys((window.TYPE_SPECIMENS && window.TYPE_SPECIMENS.records) || {}).length > 0;
+    function exportTypeLabelsEnabled() {
+        return jobHasTypeSpecimens && (!typeLabelsCheckbox || typeLabelsCheckbox.checked);
+    }
+    function syncTreeDownloadLinks() {
+        if (JOB_ID === "unknown") return;
+        const query = exportTypeLabelsEnabled() ? '?type_labels=1' : '';
+        setupLink('newick-link-original', `/api/job/${JOB_ID}/download/tree/newick/original${query}`);
+        setupLink('nexus-link', `/api/job/${JOB_ID}/download/tree/nexus${query}`);
+    }
+    if (typeLabelsCheckbox) {
+        // Alan 9/24/26 - Nothing to label on a tree with no type specimens, so hide the option.
+        // Inline display, not the hidden attribute, which the row's `flex` class overrides.
+        const row = getEl('export-type-labels-row');
+        if (row) row.style.display = jobHasTypeSpecimens ? '' : 'none';
+        try {
+            if (localStorage.getItem(TYPE_LABELS_STORAGE_KEY) === '0') typeLabelsCheckbox.checked = false;
+        } catch (e) {}
+        typeLabelsCheckbox.addEventListener('change', () => {
+            try { localStorage.setItem(TYPE_LABELS_STORAGE_KEY, typeLabelsCheckbox.checked ? '1' : '0'); } catch (e) {}
+            syncTreeDownloadLinks();
+        });
+    }
+
     if (JOB_ID !== "unknown") {
-        setupLink('newick-link-original', `/api/job/${JOB_ID}/download/tree/newick/original`);
+        // Alan 9/24/26 - Original Newick and NEXUS links carry the type-label choice.
+        syncTreeDownloadLinks();
         // 'newick-link-pruned' is now a client-side export, wired below
-        setupLink('nexus-link', `/api/job/${JOB_ID}/download/tree/nexus`);
         setupLink('fasta-original', `/api/job/${JOB_ID}/download/fasta/original`);
     }
 
@@ -3018,7 +3050,8 @@ document.addEventListener('DOMContentLoaded', async () => {
             }
             let newickStr;
             try {
-                newickStr = viewer.getNewickString();
+                // Alan 9/24/26 - Follow the Export menu's "Type status in labels" choice.
+                newickStr = viewer.getNewickString({ typeLabels: exportTypeLabelsEnabled() });
             } catch (err) {
                 showStatus(err?.message || "Tree export failed.", "warning", 3000);
                 return;

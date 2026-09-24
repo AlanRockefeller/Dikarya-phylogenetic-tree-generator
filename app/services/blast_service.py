@@ -844,7 +844,13 @@ def _parse_genbank_xml(xml_text: str) -> Dict[str, Dict]:
         logger.error(f"XML Parse Error: {e}")
     except Exception as e:
         logger.error(f"Error parsing GenBank XML: {e}")
-        
+
+    # Every GenBank fetch the app makes teaches the tree viewer which accessions
+    # are types (type_specimen_service.py). Never raises.
+    if result["by_acc"]:
+        from app.services.type_specimen_service import remember_genbank_records
+        remember_genbank_records(result["by_acc"].values())
+
     return result
 
 def _build_header(record: Dict) -> str:

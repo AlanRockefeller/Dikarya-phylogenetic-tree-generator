@@ -7,7 +7,7 @@
 {% block main_width %}max-w-none{% endblock %}
 
 {% block head %}
-<link rel="stylesheet" href="{{ url_for('static', filename='css/tree_viewer.css') }}?v=20">
+<link rel="stylesheet" href="{{ url_for('static', filename='css/tree_viewer.css') }}?v=21">
 <link rel="stylesheet" href="{{ url_for('static', filename='css/phylotree.css') }}?v=3">
 <link rel="stylesheet" href="{{ url_for('static', filename='css/phylotree-menus.css') }}?v=3">
 <link rel="preconnect" href="https://fonts.googleapis.com">
@@ -129,6 +129,12 @@
                     <a id="nexus-link" href="#" target="_blank" class="tree-menu-item">
                         NEXUS tree
                     </a>
+                    <label id="export-type-labels-row" class="tree-menu-item cursor-pointer" style="justify-content: flex-start; align-items: center; gap: 0.5rem;"
+                        title="Append each type specimen's status to its label in the Newick and NEXUS downloads, e.g. &quot;NR_131851 Cortinarius rubrobrunneus (holotype)&quot;">
+                        <input type="checkbox" id="cb-export-type-labels" checked
+                            class="rounded border-gray-300 dark:border-gray-600 text-journal-gold focus:ring-journal-gold">
+                        Type status in labels
+                    </label>
                     {% if job_details.get('tree_method', '')|lower == 'mrbayes' %}
                     <a id="export-mrbayes" href="/api/job/{{ job_id }}/download/mrbayes" class="tree-menu-item"
                         title="NEXUS command file, raw .p parameter traces, .t tree traces, and MrBayes summaries">
@@ -1473,6 +1479,9 @@
     window.TREE_SUPPORT_CONTEXT = {{ tree_support_context|tojson }};
     window.VIEW_ONLY = {{ 'true' if view_only else 'false' }};
     window.SEQUENCE_METRICS = {{ job_details.get('sequence_metadata', [])|tojson }};
+    // Alan 9/24/26 - Type-specimen tips (type_specimen_service.type_specimens_for_job):
+    // {records: {ACCESSION: info}, names: {input header: ACCESSION}}.
+    window.TYPE_SPECIMENS = {{ type_specimens|default({}, true)|tojson }};
 </script>
 
 <script src="{{ url_for('static', filename='vendor/d3.v7.min.js') }}"></script>
@@ -1491,11 +1500,11 @@
 
 <script src="{{ url_for('static', filename='js/phylotree.js') }}?v=14"></script>
 
-<script src="{{ url_for('static', filename='js/tree_viewer_phylotree_v2.js') }}?v=101"></script>
+<script src="{{ url_for('static', filename='js/tree_viewer_phylotree_v2.js') }}?v=103"></script>
 
 <script src="{{ url_for('static', filename='js/tree_viewer_api.js') }}?v=8"></script>
 
-<script src="{{ url_for('static', filename='js/tree_viewer_controller.js') }}?v=93"></script>
+<script src="{{ url_for('static', filename='js/tree_viewer_controller.js') }}?v=94"></script>
 
 {% include 'partials/alignment_viewer_modal.html' %}
 
