@@ -1091,6 +1091,58 @@ test('the plain array selector still selects and deselects', () => {
     assert.strictEqual(c.selected, false);
 });
 
+// ------------------------------------------------------- camera over layout
+
+// Alan 9/23/26 - The tree container's transform is the D3 camera composed with the layout
+// translate. Replacing one with the other made the first pan after a draw jump by the
+// layout offset (a whole label width in radial layout) and made a relayout drop the pan.
+function cameraHarness(camera) {
+    const svgNode = { __zoom: camera };
+    return { svg: { node: () => svgNode } };
+}
+
+test('the camera is applied on top of the layout translate, not instead of it', () => {
+    const fake = cameraHarness(undefined);
+    const camera = { toString: () => 'translate(10,20) scale(2)' };
+    const out = TreeRender.prototype.cameraThenLayout.call(fake, [5, 7], camera);
+    assert.strictEqual(out.replace(/\s+/g, ' ').trim(), 'translate(10,20) scale(2) translate (5,7)');
+});
+
+test('with no camera yet, the layout translate is kept as drawn', () => {
+    const out = TreeRender.prototype.cameraThenLayout.call(cameraHarness(undefined), [30, 40]);
+    assert.strictEqual(out.replace(/\s+/g, ' ').trim(), 'translate(0,0) scale(1) translate (30,40)');
+});
+
+test('a relayout keeps the live camera instead of resetting it', () => {
+    const camera = { toString: () => 'translate(-120,15) scale(0.5)' };
+    const out = TreeRender.prototype.cameraThenLayout.call(cameraHarness(camera), [30, 40]);
+    assert.ok(out.startsWith('translate(-120,15) scale(0.5)'), out);
+});
+
+// ------------------------------------------------------------ wheel zoom step
+
+// Alan 9/23/26 - Ctrl+wheel went through D3's default, which multiplies by 10 when Ctrl is
+// held (the browser's trackpad-pinch convention), so one mouse notch zoomed 4x.
+const wheelDelta = TreeRender.prototype.boundedWheelDelta;
+const wheelFactor = (event) => Math.pow(2, wheelDelta(Object.assign({ deltaMode: 0 }, event)));
+
+test('one Ctrl+wheel mouse notch zooms one button step, not 4x', () => {
+    assert.ok(Math.abs(wheelFactor({ deltaY: -100, ctrlKey: true }) - 1.25) < 1e-9);
+    assert.ok(Math.abs(wheelFactor({ deltaY: 100, ctrlKey: true }) - 1 / 1.25) < 1e-9);
+    // Firefox line mode (3 lines per notch) is capped the same way.
+    assert.ok(Math.abs(wheelFactor({ deltaY: -3, deltaMode: 1, ctrlKey: true }) - 1.25) < 1e-9);
+});
+
+test('a trackpad pinch keeps the same fine-grained steps as before', () => {
+    // Pinch events are Ctrl+wheel with small deltas; below the cap they are D3's default.
+    assert.ok(Math.abs(wheelDelta({ deltaY: -4, deltaMode: 0, ctrlKey: true }) - 0.08) < 1e-12);
+    assert.ok(Math.abs(wheelDelta({ deltaY: 2, deltaMode: 0, ctrlKey: true }) + 0.04) < 1e-12);
+});
+
+test('a malformed wheel event does not move the camera', () => {
+    assert.strictEqual(wheelDelta({ deltaY: NaN, deltaMode: 0, ctrlKey: true }), 0);
+});
+
 // ---------------------------------------------------------------------------
 
 function report() {

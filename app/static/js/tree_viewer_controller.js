@@ -13,7 +13,18 @@ document.addEventListener('DOMContentLoaded', async () => {
     const btnPrune = getEl('btn-prune');
     const btnRename = getEl('btn-rename');
     const btnReroot = getEl('btn-reroot');
-    const btnMidpoint = getEl('btn-midpoint');
+    // Alan 9/23/26 - The Midpoint toggle is gone: "Midpoint root" and "Original root
+    // (midpoint off)" are both options of the Root menu. Desktop gains a full-screen button.
+    const btnFullscreen = getEl('btn-fullscreen');
+    // Alan 9/23/26 - Display settings panel beside the tree, and its toolbar toggle.
+    const settingsPanel = getEl('tree-settings-panel');
+    const btnDisplaySettings = getEl('btn-display-settings');
+    const SETTINGS_PANEL_PREFS_KEY = 'dikarya_tree_settings_panel';
+    // Alan 9/23/26 - Layout is no longer a tab: it is the toolbar's Layout popover below.
+    const SETTINGS_TABS = ['support', 'sequences', 'colors'];
+    // Alan 9/23/26 - Layout popover (fonts, tip label gap, spacing) in the toolbar.
+    const btnLayoutMenu = getEl('btn-layout-menu');
+    const layoutMenu = getEl('layout-menu');
     // Alan 5/11/26 - Track the viewer-only deselect control separately from persistent selection-set actions.
     const btnDeselect = getEl('btn-deselect');
     // Alan 8/24/26 - Single-level Undo control (toolbar button plus Ctrl/Cmd+Z).
@@ -82,10 +93,20 @@ document.addEventListener('DOMContentLoaded', async () => {
         if (currentStatusType && currentStatusType !== type) statusMsg.classList.remove(...colorMap[currentStatusType]);
         statusMsg.classList.add(...(colorMap[type] || colorMap['info']));
         currentStatusType = type;
+        // Alan 9/23/26 - Expose the type to tree_viewer.css, which makes the dark-mode colors
+        // opaque now that the message floats over the tree instead of sitting on a card.
+        statusMsg.dataset.statusType = colorMap[type] ? type : 'info';
         statusMsg.textContent = msg;
         statusMsg.classList.remove('hidden');
         if (timeout > 0) statusHideTimer = setTimeout(() => statusMsg.classList.add('hidden'), timeout);
     }
+
+    // Alan 9/23/26 - The status message now overlays the top of the tree, so a click
+    // dismisses it; otherwise a sticky message would cover those tips until the next one.
+    statusMsg?.addEventListener('click', () => {
+        if (statusHideTimer) { clearTimeout(statusHideTimer); statusHideTimer = null; }
+        statusMsg.classList.add('hidden');
+    });
 
     // --- STATE ---
     let viewer = null;
@@ -96,9 +117,16 @@ document.addEventListener('DOMContentLoaded', async () => {
     let isLoadingTree = false;
     // Alan 7/15/26 - Serialize tree loads so an edit-triggered redraw waits behind any load already in progress.
     let treeLoadQueue = Promise.resolve();
-    let isMidpointRooted = true; // Default: midpoint rooted on load
     // Alan 5/29/26 - Track rooting state so the SOI button can hide unless auto root needs help.
     let needsSequenceOfInterest = false;
+    // Alan 9/23/26 - The Sort button names its current mode rather than highlighting, because it
+    // cycles through three. Kept here, outside wireUI, so a reload can re-apply it.
+    const SORT_MODES = {
+        original: { next: 'asc', icon: 'fa-sort', text: 'Sort: original', title: 'Node order as saved' },
+        asc: { next: 'desc', icon: 'fa-sort-amount-up', text: 'Sort: ladderize ↑', title: 'Ladderized, smaller clades first' },
+        desc: { next: 'original', icon: 'fa-sort-amount-down', text: 'Sort: ladderize ↓', title: 'Ladderized, larger clades first' },
+    };
+    let treeSortMode = 'original';
     // Alan 5/29/26 - Keep the loaded tree state around so other viewers can reuse persisted metadata.
     let treeState = null;
     // Reroot Capture State (Moved top-level to fix reference errors)
@@ -205,6 +233,20 @@ document.addEventListener('DOMContentLoaded', async () => {
         if (!btnSelectionMore || !selectionMoreMenu) return;
         selectionMoreMenu.classList.toggle('hidden', !open);
         btnSelectionMore.setAttribute('aria-expanded', open ? 'true' : 'false');
+        // Alan 9/23/26 - Only one toolbar dropdown open at a time.
+        if (open) setLayoutMenuOpen(false);
+    }
+
+    // Alan 9/23/26 - Show or hide the toolbar's Layout popover.
+    function setLayoutMenuOpen(open) {
+        if (!btnLayoutMenu || !layoutMenu) return;
+        layoutMenu.classList.toggle('hidden', !open);
+        btnLayoutMenu.setAttribute('aria-expanded', open ? 'true' : 'false');
+        if (open) {
+            setSelectionMoreMenuOpen(false);
+            const exportWrap = getEl('export-menu-wrap');
+            if (exportWrap) exportWrap.open = false;
+        }
     }
 
     // Alan 7/20/26 - Open a compact reference for the tree viewer's supported keyboard shortcuts.
@@ -2267,6 +2309,16 @@ document.addEventListener('DOMContentLoaded', async () => {
         rerootCaptureHandler = null;
     }
 
+    // Alan 9/23/26 - Leave manual-reroot mode without rerooting (Esc or Cancel reroot), and
+    // point the Root menu back at the rooting the tree actually has instead of "Manual".
+    function cancelRerootMode() {
+        rerootMode = false;
+        removeRerootCapture();
+        syncRootingModeSelect(treeState);
+        showStatus("Reroot cancelled.", "info", 1000);
+        updateButtons();
+    }
+
     // Alan 5/11/26 - Open a modal for renaming the current visible clicked selections only.
     function openRenameModal(nodes) {
         if (!renameModal || !renameModalRows || !Array.isArray(nodes) || nodes.length === 0) return;
@@ -2391,17 +2443,100 @@ document.addEventListener('DOMContentLoaded', async () => {
         const wrap = getEl('tree-notices');
         const row = getEl('notice-rooting');
         const slot = getEl('notice-rooting-text');
-        if (!wrap || !row || !slot) return false;
+        // Alan 9/23/26 - The rooting line is now a chip under the page title rather than a
+        // row inside #tree-notices, so the notices wrapper is no longer required for it.
+        if (!row || !slot) return false;
         if (!text) {
             row.classList.add('hidden');
             row.classList.remove('flex');
             return false;
         }
         slot.textContent = text;
+        // Alan 9/23/26 - The chip truncates a long tip label; the tooltip carries all of it.
+        row.title = text;
         row.classList.remove('hidden');
         row.classList.add('flex');
-        wrap.classList.remove('hidden');
+        // Alan 9/23/26 - Only unhide the notices wrapper when the row still lives inside it.
+        if (wrap && wrap.contains(row)) wrap.classList.remove('hidden');
         return true;
+    }
+
+    // Alan 9/23/26 - One place that points the Root menu at the persisted rooting. Called on
+    // every load, after a rooting change that did not happen (the menu would otherwise keep
+    // showing the choice that failed) and when manual rerooting is cancelled.
+    function syncRootingModeSelect(state) {
+        if (!rootingModeSelect || !state) return;
+        const mode = (state.root_mode || '').toLowerCase();
+        // Alan 9/23/26 - "manual" is a state option (disabled, and hidden unless current), so the
+        // "pick" action beside it always fires a change, even on a tree already rooted by hand.
+        const manual = mode === 'manual' || mode === 'tip';
+        // "original" is the tree builder's own root, i.e. midpoint rooting switched off.
+        const allowed = ['auto', 'midpoint', 'original', 'most_divergent_hit', 'unrooted'];
+        // Alan 9/24/26 - Every state resolves to some option (outgroup and unnamed roots have
+        // state-only ones): a menu left on "pick" or on a choice that just failed made
+        // re-choosing it fire no change event.
+        let value = 'current';
+        if (allowed.includes(mode)) value = mode;
+        else if (manual) value = 'manual';
+        else if (mode === 'outgroup') value = 'outgroup';
+        ['manual', 'outgroup', 'current'].forEach(stateValue => {
+            const option = rootingModeSelect.querySelector(`option[value="${stateValue}"]`);
+            if (option) option.hidden = value !== stateValue;
+        });
+        rootingModeSelect.value = value;
+        syncMobileRootingSelect();
+    }
+
+    // Alan 9/23/26 - Remembered display settings panel state. A storage failure (private
+    // window, blocked site data) simply means "no preference".
+    function readSettingsPanelPrefs() {
+        try {
+            const prefs = JSON.parse(localStorage.getItem(SETTINGS_PANEL_PREFS_KEY) || '{}');
+            return prefs && typeof prefs === 'object' ? prefs : {};
+        } catch (e) {
+            return {};
+        }
+    }
+
+    function writeSettingsPanelPrefs(changes) {
+        try {
+            localStorage.setItem(SETTINGS_PANEL_PREFS_KEY,
+                JSON.stringify({ ...readSettingsPanelPrefs(), ...changes }));
+        } catch (e) {}
+    }
+
+    // Alan 9/23/26 - Show or hide the display settings panel and keep its toolbar toggle in step.
+    function setSettingsPanelOpen(open, { persist = true } = {}) {
+        if (!settingsPanel) return;
+        settingsPanel.hidden = !open;
+        btnDisplaySettings?.setAttribute('aria-expanded', open ? 'true' : 'false');
+        if (persist) writeSettingsPanelPrefs({ open: Boolean(open) });
+    }
+
+    // Alan 9/23/26 - Switch the display settings panel to one of its tabs.
+    function selectSettingsTab(name, { persist = true, focus = false } = {}) {
+        const tab = SETTINGS_TABS.includes(name) ? name : SETTINGS_TABS[0];
+        document.querySelectorAll('[data-settings-tab]').forEach((button) => {
+            const selected = button.dataset.settingsTab === tab;
+            button.setAttribute('aria-selected', selected ? 'true' : 'false');
+            button.tabIndex = selected ? 0 : -1;
+            if (selected && focus) button.focus();
+        });
+        document.querySelectorAll('[data-settings-panel]').forEach((section) => {
+            section.hidden = section.dataset.settingsPanel !== tab;
+        });
+        if (persist) writeSettingsPanelPrefs({ tab });
+    }
+
+    // Alan 9/23/26 - Record the sort mode and name it on the Sort button.
+    function setTreeSortMode(mode) {
+        treeSortMode = SORT_MODES[mode] ? mode : 'original';
+        const button = getEl('btn-ladderize');
+        if (!button) return;
+        const sort = SORT_MODES[treeSortMode];
+        button.innerHTML = `<i class="fa ${sort.icon}"></i> ${sort.text}`;
+        // Alan 7/20/26 - Keep the S shortcut discoverable after the sort button label changes.
+        button.title = `${sort.title}. Click to cycle node sorting (S)`;
     }
 
     function rootingFinalStatus(mode, result) {
@@ -2615,7 +2750,9 @@ document.addEventListener('DOMContentLoaded', async () => {
             if (!trimmed) throw new Error("Empty tree data received.");
             if (trimmed.startsWith("<")) throw new Error("Invalid tree format: Server returned HTML.");
 
-            await viewer.render(newick);
+            // Alan 9/24/26 - Pass the chosen sort into the render so a prune, rename or rooting
+            // change draws once, keeps the camera, and the Sort button's label stays true.
+            await viewer.render(newick, { sortMode: treeSortMode });
 
             // Fetch tree state to get midpoint rooting status and restore selection sets
             try {
@@ -2625,15 +2762,8 @@ document.addEventListener('DOMContentLoaded', async () => {
                 // Alan 8/15/26 - Reevaluate Edited FASTA from the authoritative persisted state
                 // on initial load and after every backend action that reloads the tree.
                 updateEditedFastaAvailability(loadedTreeState);
-                isMidpointRooted = loadedTreeState.is_midpoint_rooted ?? true;
-                updateMidpointButton();
                 // Alan 5/29/26 - Sync rooting-mode dropdown to persisted root_mode and warn when auto needs a focal tip.
-                if (rootingModeSelect) {
-                    const mode = (loadedTreeState.root_mode || '').toLowerCase();
-                    const allowed = ['auto', 'midpoint', 'most_divergent_hit', 'unrooted', 'manual'];
-                    if (allowed.includes(mode)) rootingModeSelect.value = mode;
-                    else if (mode === 'tip') rootingModeSelect.value = 'manual';
-                }
+                syncRootingModeSelect(loadedTreeState);
                 // Alan 5/29/26 - Only prompt for the focal tip when auto root is the chosen mode and we genuinely can't resolve one.
                 needsSequenceOfInterest = !!loadedTreeState.needs_sequence_of_interest;
                 const loadedMode = (loadedTreeState.root_mode || '').toLowerCase();
@@ -2655,6 +2785,13 @@ document.addEventListener('DOMContentLoaded', async () => {
                     // renders twice on screen.
                     if (!setRootingNotice(label)) showStatus(label, "info", 0);
                 }
+                // Alan 9/23/26 - The outgroup chip is permanent page chrome now, so drop it once the
+                // persisted rooting no longer names an auto-chosen outgroup (midpoint, manual, an
+                // auto fallback); the old banner kept describing a root the tree had since left.
+                const autoRootNamed = (loadedMode === 'auto' || loadedMode === 'most_divergent_hit')
+                    && (loadedInfo.chosen_by === 'auto' || loadedInfo.chosen_by === 'most_divergent_hit')
+                    && Boolean(loadedInfo.chosen_root_target);
+                if (!autoRootNamed) setRootingNotice('');
                 // Alan 5/11/26 - Reapply saved rename labels after loading the raw Newick tree.
                 if (loadedTreeState.renames && viewer && typeof viewer.applyRenames === 'function') {
                     viewer.applyRenames(loadedTreeState.renames);
@@ -2765,6 +2902,109 @@ document.addEventListener('DOMContentLoaded', async () => {
         }
     });
 
+    // Alan 9/23/26 - Export menu. The markup is a native <details>, so the downloads stay
+    // reachable even if the viewer bootstrap fails; this adds only what a menu needs on top:
+    // close after a choice, on a click elsewhere, and on Escape.
+    const exportMenuWrap = getEl('export-menu-wrap');
+    if (exportMenuWrap) {
+        const closeExportMenu = () => { exportMenuWrap.open = false; };
+        getEl('export-menu')?.addEventListener('click', (e) => {
+            if (e.target.closest('a, button')) closeExportMenu();
+        });
+        document.addEventListener('click', (e) => {
+            if (exportMenuWrap.open && !exportMenuWrap.contains(e.target)) closeExportMenu();
+        });
+        // Alan 9/23/26 - Capture phase, so this Escape closes only the menu and never also
+        // reaches the viewer's own Escape handling (reroot mode, expanded view).
+        document.addEventListener('keydown', (e) => {
+            if (e.key !== 'Escape' || !exportMenuWrap.open) return;
+            closeExportMenu();
+            getEl('btn-export-menu')?.focus();
+            e.stopPropagation();
+        }, true);
+        // Alan 9/23/26 - Only one dropdown open at a time.
+        exportMenuWrap.addEventListener('toggle', () => {
+            if (exportMenuWrap.open) setSelectionMoreMenuOpen(false);
+        });
+    }
+
+    // Alan 9/23/26 - Display settings panel (Support, Sequences, Layout, Colors). Open/closed
+    // and the last tab are remembered for this browser across jobs; with nothing stored it
+    // starts closed, so a first visit gives the tree the full width. Wired here rather than
+    // in wireUI() so it works before, and even without, a tree loading.
+    if (settingsPanel && btnDisplaySettings) {
+        const prefs = readSettingsPanelPrefs();
+        selectSettingsTab(prefs.tab, { persist: false });
+        setSettingsPanelOpen(prefs.open === true, { persist: false });
+        btnDisplaySettings.addEventListener('click', () => {
+            setSettingsPanelOpen(settingsPanel.hidden);
+        });
+        getEl('btn-settings-close')?.addEventListener('click', () => {
+            setSettingsPanelOpen(false);
+            btnDisplaySettings.focus();
+        });
+        document.querySelectorAll('[data-settings-tab]').forEach((tab) => {
+            tab.addEventListener('click', () => selectSettingsTab(tab.dataset.settingsTab));
+            // Alan 9/23/26 - Arrow keys, Home and End move between tabs, as for any tab list.
+            tab.addEventListener('keydown', (e) => {
+                const index = SETTINGS_TABS.indexOf(tab.dataset.settingsTab);
+                let next = null;
+                if (e.key === 'ArrowRight') next = SETTINGS_TABS[(index + 1) % SETTINGS_TABS.length];
+                else if (e.key === 'ArrowLeft') next = SETTINGS_TABS[(index + SETTINGS_TABS.length - 1) % SETTINGS_TABS.length];
+                else if (e.key === 'Home') next = SETTINGS_TABS[0];
+                else if (e.key === 'End') next = SETTINGS_TABS[SETTINGS_TABS.length - 1];
+                if (!next) return;
+                e.preventDefault();
+                selectSettingsTab(next, { focus: true });
+            });
+        });
+    }
+
+    // Alan 9/23/26 - Layout popover: fonts, tip label gap and spacing, one click from the
+    // toolbar. Unlike a menu it stays open while +/- are pressed repeatedly; a click outside
+    // it or Esc closes it. Wired here so it works before a tree has loaded.
+    if (btnLayoutMenu && layoutMenu) {
+        btnLayoutMenu.addEventListener('click', (e) => {
+            e.stopPropagation();
+            setLayoutMenuOpen(layoutMenu.classList.contains('hidden'));
+        });
+        document.addEventListener('click', (e) => {
+            if (layoutMenu.classList.contains('hidden')) return;
+            if (getEl('layout-menu-wrap')?.contains(e.target)) return;
+            setLayoutMenuOpen(false);
+        });
+        // Alan 9/23/26 - Capture phase, like the Export menu: this Escape closes only the popover
+        // (and returns focus to its button) instead of also leaving full screen or a reroot.
+        document.addEventListener('keydown', (e) => {
+            if (e.key !== 'Escape' || layoutMenu.classList.contains('hidden')) return;
+            setLayoutMenuOpen(false);
+            btnLayoutMenu.focus();
+            e.stopPropagation();
+        }, true);
+    }
+
+    // Alan 9/23/26 - The same-observation notice is a single dismissible line. The dismissal
+    // is remembered per job in this browser, so it does not come back on every reload.
+    const duplicatesNotice = getEl('notice-duplicates');
+    if (duplicatesNotice) {
+        const dismissKey = `dikarya_notice_dismissed_duplicates_${JOB_ID}`;
+        const hideDuplicatesNotice = () => {
+            duplicatesNotice.classList.add('hidden');
+            duplicatesNotice.classList.remove('flex');
+            const notices = getEl('tree-notices');
+            if (notices && !Array.from(notices.children).some(el => !el.classList.contains('hidden'))) {
+                notices.classList.add('hidden');
+            }
+        };
+        try {
+            if (localStorage.getItem(dismissKey) === '1') hideDuplicatesNotice();
+        } catch (e) {}
+        getEl('btn-dismiss-duplicates-notice')?.addEventListener('click', () => {
+            hideDuplicatesNotice();
+            try { localStorage.setItem(dismissKey, '1'); } catch (e) {}
+        });
+    }
+
     // Current Newick export (client-side with selection annotations)
     const newickCurrentLink = getEl('newick-link-pruned');
     if (newickCurrentLink) {
@@ -2829,6 +3069,33 @@ document.addEventListener('DOMContentLoaded', async () => {
         mobileMore.classList.toggle('hidden', !open);
         btnMobileMore.setAttribute('aria-expanded', open ? 'true' : 'false');
         document.body.classList.toggle('tree-mobile-sheet-open', open);
+        // Alan 9/23/26 - The sheet mirrors toolbar and settings state; refresh it on every open.
+        if (open) syncMobileSheetState();
+    }
+
+    // Alan 9/23/26 - Copy the state the sheet mirrors (Root menu, Show support values, font
+    // sizes) from the desktop controls, which remain the single source of truth.
+    function syncMobileSheetState() {
+        syncMobileRootingSelect();
+        const showSupport = getEl('cb-show-support');
+        const mobileShowSupport = getEl('mobile-show-support');
+        if (showSupport && mobileShowSupport) mobileShowSupport.checked = showSupport.checked;
+        document.querySelectorAll('[data-mobile-value-for]').forEach((output) => {
+            // A number input (font sizes) or a text readout (tip label gap).
+            const source = getEl(output.dataset.mobileValueFor);
+            if (source) output.textContent = 'value' in source ? source.value : source.textContent;
+        });
+    }
+
+    // Alan 9/23/26 - Copy the toolbar Root menu's options (once), value and disabled state into
+    // the mobile sheet's copy, so the two cannot disagree about what the tree is rooted on.
+    function syncMobileRootingSelect() {
+        const mobileSelect = getEl('mobile-rooting-mode-select');
+        if (!mobileSelect || !rootingModeSelect) return;
+        // Alan 9/23/26 - Recopied every time: the "manual" state option shows and hides.
+        mobileSelect.innerHTML = rootingModeSelect.innerHTML;
+        mobileSelect.value = rootingModeSelect.value;
+        mobileSelect.disabled = rootingModeSelect.disabled;
     }
 
     function setExpandedTree(open) {
@@ -2840,6 +3107,19 @@ document.addEventListener('DOMContentLoaded', async () => {
             if (expandLabel) expandLabel.textContent = open ? 'Exit' : 'Expand';
             btnMobileExpand.title = open ? 'Exit expanded tree view' : 'Expand tree';
         }
+        // Alan 9/23/26 - Desktop full screen is the same expanded mode, so keep its button in step.
+        if (btnFullscreen) {
+            btnFullscreen.setAttribute('aria-pressed', open ? 'true' : 'false');
+            btnFullscreen.title = open ? 'Leave full screen (F or Esc)' : 'Fill the window with the tree (F)';
+            btnFullscreen.setAttribute('aria-label', open ? 'Leave full screen' : 'Full screen');
+        }
+    }
+
+    // Alan 9/23/26 - Focus the full-screen control the user can actually see: the toolbar
+    // button on desktop, the Expand button on touch devices (the other one is display:none).
+    function focusVisibleExpandControl() {
+        const visible = [btnFullscreen, btnMobileExpand].find(el => el && el.getClientRects().length > 0);
+        visible?.focus();
     }
 
     function cleanupMobileViewerUI() {
@@ -2857,8 +3137,10 @@ document.addEventListener('DOMContentLoaded', async () => {
             proxy.addEventListener('click', () => {
                 const target = getEl(proxy.dataset.mobileTrigger);
                 if (!target || target.disabled) return;
-                setMobileMoreOpen(false);
+                // Alan 9/23/26 - +/- steppers keep the sheet open so they can be tapped repeatedly.
+                if (!('mobileKeepOpen' in proxy.dataset)) setMobileMoreOpen(false);
                 target.click();
+                if ('mobileKeepOpen' in proxy.dataset) syncMobileSheetState();
             });
         });
         btnMobileSelect?.addEventListener('click', () => {
@@ -2870,6 +3152,46 @@ document.addEventListener('DOMContentLoaded', async () => {
         getEl('btn-mobile-more-close')?.addEventListener('click', () => setMobileMoreOpen(false));
         getEl('tree-mobile-more-backdrop')?.addEventListener('click', () => setMobileMoreOpen(false));
         btnMobileExpand?.addEventListener('click', () => setExpandedTree(!document.body.classList.contains('tree-expanded')));
+        // Alan 9/23/26 - Desktop full screen reuses the mobile expanded mode: the tree panel,
+        // toolbar included, fills the window (see tree_viewer.css).
+        btnFullscreen?.addEventListener('click', () => setExpandedTree(!document.body.classList.contains('tree-expanded')));
+        // Alan 9/23/26 - Font size steppers in the sheet's Layout section step the desktop
+        // number inputs and fire the same change event their own edits do.
+        document.querySelectorAll('[data-mobile-step]').forEach((proxy) => {
+            proxy.addEventListener('click', () => {
+                const input = getEl(proxy.dataset.mobileStep);
+                if (!input || input.disabled) return;
+                const step = Number(proxy.dataset.step) || 1;
+                const min = Number(input.min);
+                const max = Number(input.max);
+                let next = (Number(input.value) || 0) + step;
+                if (Number.isFinite(min) && input.min !== '') next = Math.max(min, next);
+                if (Number.isFinite(max) && input.max !== '') next = Math.min(max, next);
+                input.value = String(next);
+                input.dispatchEvent(new Event('change'));
+                syncMobileSheetState();
+            });
+        });
+        // Alan 9/23/26 - The sheet's "Show support values" checkbox drives the desktop one.
+        getEl('mobile-show-support')?.addEventListener('change', (event) => {
+            const showSupport = getEl('cb-show-support');
+            if (!showSupport || showSupport.checked === event.target.checked) return;
+            showSupport.checked = event.target.checked;
+            showSupport.dispatchEvent(new Event('change'));
+        });
+        // Alan 9/23/26 - The sheet's Root menu replaces the old Midpoint button. It drives the
+        // toolbar select, so rooting keeps a single code path and a single view-only guard.
+        const mobileRootSelect = getEl('mobile-rooting-mode-select');
+        syncMobileRootingSelect();
+        mobileRootSelect?.addEventListener('change', () => {
+            if (!rootingModeSelect || rootingModeSelect.disabled) {
+                syncMobileRootingSelect();
+                return;
+            }
+            rootingModeSelect.value = mobileRootSelect.value;
+            setMobileMoreOpen(false);
+            rootingModeSelect.dispatchEvent(new Event('change'));
+        });
         btnMobileNodeActions?.addEventListener('click', () => {
             setMobileMoreOpen(false);
             if (!viewer?.openMobileNodeActions()) {
@@ -2885,8 +3207,14 @@ document.addEventListener('DOMContentLoaded', async () => {
             setMobileMoreOpen(false);
             if (show) setExpandedTree(false);
             const button = getEl('btn-mobile-all-controls');
-            if (button) button.textContent = show ? 'Hide all advanced controls' : 'Show all advanced controls';
-            if (show) getEl('tree-desktop-controls')?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+            // Alan 9/23/26 - Named for what it reveals now that the old controls card is gone.
+            if (button) button.textContent = show ? 'Hide display settings and full toolbar' : 'Show display settings and full toolbar';
+            // Alan 9/23/26 - The old controls card is gone: "all advanced controls" now means the
+            // toolbar plus the display settings panel, which is opened and scrolled to.
+            if (show) {
+                setSettingsPanelOpen(true);
+                getEl('tree-toolbar')?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+            }
         });
         window.addEventListener('pagehide', cleanupMobileViewerUI);
         setMobileInteractionMode('navigate');
@@ -2987,34 +3315,35 @@ document.addEventListener('DOMContentLoaded', async () => {
         });
 
         // Layout
-        getEl('btn-layout-linear')?.addEventListener('click', () => viewer?.updateLayout('linear'));
-        getEl('btn-layout-radial')?.addEventListener('click', () => viewer?.updateLayout('radial'));
+        // Alan 9/23/26 - Linear and Radial are a pair, so the current one shows as pressed.
+        const syncLayoutButtons = () => {
+            const layout = viewer?.options?.layout || 'linear';
+            getEl('btn-layout-linear')?.setAttribute('aria-pressed', layout === 'linear' ? 'true' : 'false');
+            getEl('btn-layout-radial')?.setAttribute('aria-pressed', layout === 'radial' ? 'true' : 'false');
+        };
+        getEl('btn-layout-linear')?.addEventListener('click', () => { viewer?.updateLayout('linear'); syncLayoutButtons(); });
+        getEl('btn-layout-radial')?.addEventListener('click', () => { viewer?.updateLayout('radial'); syncLayoutButtons(); });
+        syncLayoutButtons();
 
         // Align
         const btnAlign = getEl('btn-align-tips');
         btnAlign?.addEventListener('click', () => {
             if (!viewer) return;
-            const isAligned = btnAlign.classList.toggle('active');
+            // Alan 9/23/26 - A pressed on/off toggle with a fixed label, instead of relabelling
+            // itself "Unalign"; the state comes from the viewer rather than from a CSS class.
+            const isAligned = !viewer.options.alignTips;
             viewer.updateLayout(null, isAligned);
-            btnAlign.innerHTML = isAligned ? '<i class="fa fa-outdent"></i> Unalign' : '<i class="fa fa-indent"></i> Align';
+            btnAlign.setAttribute('aria-pressed', isAligned ? 'true' : 'false');
         });
 
         // Sort (Ladderize)
         const btnLadderize = getEl('btn-ladderize');
-        let sortMode = 'original';
         btnLadderize?.addEventListener('click', () => {
             if (!viewer) return;
-            if (sortMode === 'original') { sortMode = 'asc'; btnLadderize.classList.add('active'); }
-            else if (sortMode === 'asc') { sortMode = 'desc'; btnLadderize.classList.add('active'); }
-            else { sortMode = 'original'; btnLadderize.classList.remove('active'); }
-
-            viewer.sortNodes(sortMode);
-
-            if (sortMode === 'asc') btnLadderize.innerHTML = '<i class="fa fa-sort-amount-down"></i> Asc';
-            else if (sortMode === 'desc') btnLadderize.innerHTML = '<i class="fa fa-sort-amount-up"></i> Desc';
-            else btnLadderize.innerHTML = '<i class="fa fa-sort"></i> Sort';
-            // Alan 7/20/26 - Keep the S shortcut discoverable after the sort button label changes.
-            btnLadderize.title = 'Cycle node sorting (S)';
+            // Alan 9/23/26 - Cycle original -> ladderize up -> ladderize down, naming the mode on the button.
+            const next = (SORT_MODES[treeSortMode] || SORT_MODES.original).next;
+            viewer.sortNodes(next);
+            setTreeSortMode(next);
         });
 
         // Zoom & Fit
@@ -3772,17 +4101,15 @@ document.addEventListener('DOMContentLoaded', async () => {
         });
 
         // Support Toggle
-        const btnToggleSupport = getEl('btn-toggle-support');
-        if (btnToggleSupport) {
+        // Alan 9/23/26 - "Show support values" is a checkbox in Display settings > Support
+        // (checked by default) instead of a toolbar toggle button.
+        const cbShowSupport = getEl('cb-show-support');
+        if (cbShowSupport) {
             // Init state from viewer
-            btnToggleSupport.classList.toggle('active', viewer.options.showSupport);
-
-            btnToggleSupport.addEventListener('click', () => {
+            cbShowSupport.checked = Boolean(viewer.options.showSupport);
+            cbShowSupport.addEventListener('change', () => {
                 if (!viewer) return;
-                const nextState = !viewer.options.showSupport;
-                viewer.toggleSupport(nextState);
-                btnToggleSupport.classList.toggle('active', nextState);
-
+                viewer.toggleSupport(cbShowSupport.checked);
                 // Sync UI with correct support-type-specific enabling
                 updateSupportUI(viewer.getStats());
             });
@@ -3905,28 +4232,11 @@ document.addEventListener('DOMContentLoaded', async () => {
             openRenameModal(nodes);
         });
 
+        // Alan 9/23/26 - Rerooting now starts from the Root menu ("Manual: click a node…").
+        // This button is shown only while that mode waits for a click, and cancels it.
         if (btnReroot) btnReroot.addEventListener('click', () => {
-            if (isProcessing) return;
-            if (rerootMode) {
-                rerootMode = false;
-                removeRerootCapture();
-                showStatus("Reroot cancelled.", "info", 1000);
-            } else {
-                rerootMode = true;
-                if (viewer) viewer.clearSelection(); // Clear selection for reroot mode
-                installRerootCapture();
-                showStatus("Click a node to reroot.", "info");
-            }
-            updateButtons();
-        });
-
-        if (btnMidpoint) btnMidpoint.addEventListener('click', () => {
-            const actionName = isMidpointRooted ? "Disabling midpoint rooting" : "Enabling midpoint rooting";
-            runBackendAction(actionName, async () => {
-                const result = await TreeEditActions.midpointRootToggle(JOB_ID);
-                isMidpointRooted = result.is_midpoint_rooted ?? !isMidpointRooted;
-                updateMidpointButton();
-            });
+            if (isProcessing || !rerootMode) return;
+            cancelRerootMode();
         });
 
         // Alan 5/29/26 - Rooting-mode dropdown drives the unified rooting API; "manual" defers to existing Reroot-Here click flow.
@@ -3934,21 +4244,30 @@ document.addEventListener('DOMContentLoaded', async () => {
             // Alan 8/23/26 - Rooting is a persisted edit; view-only trees must not reach
             // it. The backend enforces this too (check_job_access mode="edit"), so this
             // only keeps the UI from offering an action that can only 403.
-            if (window.VIEW_ONLY || isProcessing) return;
+            if (window.VIEW_ONLY || isProcessing) {
+                syncRootingModeSelect(treeState);
+                return;
+            }
             const mode = rootingModeSelect.value;
-            if (mode === 'manual') {
+            // Alan 9/23/26 - "pick" starts a manual reroot; "manual" is only the state option,
+            // but is accepted here too in case a stale copy of the menu still offers it.
+            if (mode === 'pick' || mode === 'manual') {
                 rerootMode = true;
                 if (viewer) viewer.clearSelection();
                 installRerootCapture();
-                showStatus("Click a node to reroot.", "info");
+                showStatus("Click a node to reroot. Press Esc or Cancel reroot to stop.", "info");
                 updateButtons();
                 return;
             }
-            runBackendAction(`Applying ${mode} rooting`, async () => {
+            // Alan 9/23/26 - "original" is midpoint rooting switched off: the tree builder's own root.
+            const actionName = mode === 'original' ? 'Restoring the original root' : `Applying ${mode} rooting`;
+            runBackendAction(actionName, async () => {
                 const result = await TreeEditActions.setRootingMode(JOB_ID, mode);
                 // Alan 5/31/26 - Return the chosen-tip status so it survives the reload.
                 return { finalStatus: rootingFinalStatus(mode, result) };
-            });
+            // Alan 9/23/26 - A successful change has already re-synced the menu from the reload;
+            // a failed one must not leave it showing a rooting the tree does not have.
+            }).then(() => syncRootingModeSelect(treeState));
         });
 
         // Alan 5/29/26 - Persist focal/sequence-of-interest tip from the current viewer selection.
@@ -4174,14 +4493,17 @@ document.addEventListener('DOMContentLoaded', async () => {
             // Dialogs are above expanded mode, so Escape belongs to the visible dialog first.
             // Unknown dialogs (such as Alignment Viewer) own their own Escape listener.
             if (e.key === 'Escape' && anyModalOpen()) return;
-            if (e.key === 'Escape' && document.body.classList.contains('tree-expanded')) {
-                setExpandedTree(false);
-                btnMobileExpand?.focus();
+            // Alan 9/23/26 - Cancel a pending reroot before leaving full screen: the reroot is
+            // the mode the user entered most recently, and full screen is now reachable on desktop.
+            if (e.key === "Escape" && rerootMode) {
+                // Alan 9/23/26 - Shared with the Cancel reroot button, which also re-syncs the Root menu.
+                cancelRerootMode();
                 return;
             }
-            if (e.key === "Escape" && rerootMode) {
-                rerootMode = false; removeRerootCapture();
-                showStatus("Reroot cancelled.", "info", 1000); updateButtons();
+            if (e.key === 'Escape' && document.body.classList.contains('tree-expanded')) {
+                setExpandedTree(false);
+                // Alan 9/23/26 - Return focus to whichever full-screen control is actually visible.
+                focusVisibleExpandControl();
                 return;
             }
 
@@ -4220,6 +4542,10 @@ document.addEventListener('DOMContentLoaded', async () => {
             // Alan 7/20/26 - S cycles the existing original, ascending, and descending node sort modes.
             } else if (key === 's' && viewer) {
                 getEl('btn-ladderize')?.click();
+                handled = true;
+            // Alan 9/23/26 - F fills the window with the tree and its toolbar; F again or Esc leaves.
+            } else if (key === 'f') {
+                setExpandedTree(!document.body.classList.contains('tree-expanded'));
                 handled = true;
             // Alan 8/16/26 - The B hotkey and its Box Select mode are gone; left-drag always draws the box.
             // Alan 7/20/26 - Question mark opens the shortcut reference without requiring a loaded tree.
@@ -4316,7 +4642,6 @@ document.addEventListener('DOMContentLoaded', async () => {
             disableBtn(btnPrune);
             disableBtn(btnRename);
             disableBtn(btnReroot);
-            disableBtn(btnMidpoint);
             disableBtn(btnRecompute);
             // Alan 5/12/26 - Color clearing is a persisted edit, so disable it in view-only mode.
             disableBtn(btnUncolorSelection);
@@ -4343,7 +4668,6 @@ document.addEventListener('DOMContentLoaded', async () => {
             if (btnPrune) btnPrune.disabled = true;
             if (btnRename) btnRename.disabled = true;
             if (btnReroot) btnReroot.disabled = true;
-            if (btnMidpoint) btnMidpoint.disabled = true;
             // Alan 5/29/26 - Freeze rooting controls while a backend rooting action is in flight.
             if (btnSetSoi) btnSetSoi.disabled = true;
             // Alan 5/29/26 - SOI button only ever appears when auto root has no resolvable focal tip.
@@ -4374,17 +4698,12 @@ document.addEventListener('DOMContentLoaded', async () => {
             btnRename.innerHTML = selCount > 0 ? '<i class="fa fa-edit"></i> Rename (' + selCount + ')' : '<i class="fa fa-edit"></i> Rename';
         }
 
+        // Alan 9/23/26 - Reroot is started from the Root menu; this button only cancels a
+        // pending manual reroot, so it is shown only while one is pending.
         if (btnReroot) {
             btnReroot.disabled = false;
-            if (rerootMode) {
-                btnReroot.classList.add("active");
-                btnReroot.innerHTML = '<i class="fa fa-times"></i> Cancel Reroot';
-            } else {
-                btnReroot.classList.remove("active");
-                btnReroot.innerHTML = '<i class="fa fa-map-pin"></i> Reroot';
-            }
+            btnReroot.classList.toggle('hidden', !rerootMode);
         }
-        if (btnMidpoint) btnMidpoint.disabled = false;
         // Alan 5/29/26 - Show Set Sequence of Interest only when auto root needs help; require exactly one tip selected to enable it.
         if (btnSetSoi) {
             const showSoi = rootingModeSelect && rootingModeSelect.value === 'auto' && needsSequenceOfInterest;
@@ -4422,19 +4741,6 @@ document.addEventListener('DOMContentLoaded', async () => {
         btnAlignmentViewer.innerHTML = count > 0
             ? `<i class="fa fa-stream"></i> Alignment Viewer (${count})`
             : '<i class="fa fa-stream"></i> Alignment Viewer';
-    }
-
-    function updateMidpointButton() {
-        if (!btnMidpoint) return;
-        if (isMidpointRooted) {
-            btnMidpoint.classList.add('active');
-            btnMidpoint.innerHTML = '<i class="fa fa-balance-scale"></i> Midpoint (On)';
-            btnMidpoint.title = 'Click to disable midpoint rooting';
-        } else {
-            btnMidpoint.classList.remove('active');
-            btnMidpoint.innerHTML = '<i class="fa fa-balance-scale"></i> Midpoint';
-            btnMidpoint.title = 'Click to enable midpoint rooting';
-        }
     }
 
     // Alan 5/9/26 - Keep sequence metric sliders and labels synced to the loaded tree.

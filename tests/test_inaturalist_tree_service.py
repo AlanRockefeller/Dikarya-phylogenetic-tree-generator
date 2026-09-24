@@ -432,6 +432,37 @@ class TestInaturalistTreeSourceLabel(unittest.TestCase):
         self.assertEqual(details["local_error"], "temporary outage")
         self.assertIn("saved MycoMap results", details["warnings"][0])
 
+    def test_unreachable_mycomap_stops_before_replacing_a_legacy_link(self):
+        # A legacy do=results link that cannot be resolved because MycoMap did not
+        # answer must not fall through to creating a new search, which would also
+        # overwrite the observation's saved link on iNaturalist.
+        legacy_url = ("https://mycomap.com/index.php?app=genbank&module=genbank"
+                      "&controller=blast&do=results&db=42&id=123")
+
+        def unreachable(url, warnings=None, max_status_checks=None):
+            if warnings is not None:
+                warnings.append("MycoMap BLAST list for record 123 could not be read")
+            return None
+
+        with (
+            patch.object(inaturalist_tree_service, "fetch_observation", return_value={"id": 123456789}),
+            patch.object(inaturalist_tree_service, "extract_observation_field_value",
+                         return_value=legacy_url),
+            patch("app.services.mycomap_service.resolve_legacy_mycomap_results_url",
+                  side_effect=unreachable),
+            patch.object(inaturalist_tree_service, "_create_mycomap_blast_from_observation",
+                         side_effect=AssertionError("nothing may be created")),
+            patch.object(inaturalist_tree_service, "_reuse_existing_mycomap_blast",
+                         side_effect=AssertionError("nothing may be reused or written")),
+        ):
+            with self.assertRaises(inaturalist_tree_service.InatTreeError) as caught:
+                inaturalist_tree_service.prepare_inat_tree_job(123456789)
+        # 503 + mycomap_unavailable is what the worker defers on rather than
+        # failing the job.
+        self.assertEqual(caught.exception.status, 503)
+        self.assertTrue(caught.exception.details.get("mycomap_unavailable"))
+        self.assertIn("nothing was created", str(caught.exception))
+
     def test_ncbi_rerun_returns_before_saved_results_are_fetched(self):
         mycomap_url = "https://mycomap.com/genetics/blast-search/c01-inat123456789-r42"
         rerun_details = {

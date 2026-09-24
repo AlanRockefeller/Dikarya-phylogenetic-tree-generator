@@ -55,16 +55,16 @@ TIMEOUT_SECONDS=${DIKARYA_CLAUDE_TIMEOUT:-240}
 # cannot bill without limit even if everything above it misbehaves.
 MAX_BUDGET_USD=${DIKARYA_CLAUDE_MAX_BUDGET:-1.00}
 
-MODEL=${DIKARYA_CLAUDE_MODEL:-claude-opus-5}
+MODEL=${DIKARYA_CLAUDE_MODEL:-claude-opus-5-5}
 # Must match CLAUDE_REVIEW_EFFORT in app/config.py. If env_keep ever stops
-# propagating the variable through sudo, the fallback should be the fast path
-# that fits inside nginx timeout, not the slow one.
-EFFORT=${DIKARYA_CLAUDE_EFFORT:-low}
+# propagating the variable through sudo, the fallback must still be a setting
+# that fits inside the nginx timeout -- never high/xhigh/max.
+EFFORT=${DIKARYA_CLAUDE_EFFORT:-medium}
 
 # Allowlist rather than pass-through: these reach the CLI as flag values, and a
 # caller-supplied string must never be able to become another flag.
 case "$MODEL" in
-    claude-opus-5|claude-opus-4-8|claude-sonnet-5|claude-haiku-4-5) ;;
+    claude-opus-5-5|claude-opus-5|claude-opus-4-8|claude-sonnet-5|claude-haiku-4-5) ;;
     *) echo "dikarya-claude-review: unsupported model '$MODEL'" >&2; exit 64 ;;
 esac
 case "$EFFORT" in

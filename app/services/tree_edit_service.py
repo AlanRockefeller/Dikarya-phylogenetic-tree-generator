@@ -14,10 +14,12 @@ from typing import Dict, Any, List, Optional, Set, Tuple
 from app.config import Config
 from app.models import JobParams, AlignmentParams, TrimmingParams, TreeBuilderParams
 from app.services.artifact_storage import (
+    artifact_exists,
     default_file_mode,
     discard_artifact,
     discard_gzipped_form,
     gz_path,
+    open_artifact,
 )
 from app.services.security_utils import coerce_bool
 from app.services.subprocess_utils import run_command
@@ -564,6 +566,106 @@ def _editable_tree_input_path(job_dir: Path, what: str = "edit") -> Path:
     return input_path
 
 
+def _remove_clades(tree, clades) -> None:
+    """Physically remove clades from a Bio.Phylo tree, then tidy what is left.
+
+    A parent left with no children was an internal node, not a real tip, so it
+    is removed too; single-child pass-through nodes are then spliced out. The
+    root itself is never removed.
+    """
+    parents = {c: p for p in tree.find_clades() for c in p.clades}
+    queue = list(clades)
+    processed = set()
+
+    while queue:
+        current = queue.pop(0)
+        if current in processed:
+            continue
+        processed.add(current)
+
+        parent = parents.get(current)
+        if not parent:
+            # The root: never removed, even when every child has gone.
+            continue
+
+        if current in parent.clades:
+            parent.clades.remove(current)
+
+        # A parent with no children left has become an artifact tip.
+        if len(parent.clades) == 0 and parent != tree.root:
+            queue.append(parent)
+
+    # After pruning, internal nodes can end up with exactly one child,
+    # creating visually odd "pass-through" nodes. We splice them out.
+    _collapse_unifurcations(tree)
+
+
+def _drop_pruned_tips(tree, tree_json: Dict) -> int:
+    """Remove any tip listed in ``pruned_taxa`` that is still in ``tree``.
+
+    A tree file that still carries pruned tips shows the user sequences they
+    removed, and breaks every clade annotation that spanned them, because the
+    annotation's members no longer form a whole clade. Returns how many tips
+    were removed. Refuses to empty the tree.
+    """
+    pruned = set(tree_json.get("pruned_taxa") or [])
+    if not pruned:
+        return 0
+    terminals = tree.get_terminals()
+    stale = [t for t in terminals if t.name and t.name in pruned]
+    if not stale or len(stale) == len(terminals):
+        return 0
+    _remove_clades(tree, stale)
+    return len(stale)
+
+
+def _read_editable_tree(job_dir: Path, tree_json: Dict, what: str = "edit"):
+    """Read the current editable tree with every pruned tip guaranteed absent.
+
+    Rooting and rotation rewrite tree_pruned.newick from whatever they read, so
+    a pruned tip that is still present would be written straight back and the
+    prune silently lost. Before 2026-09-23 turning midpoint rooting off did
+    exactly that; this also repairs trees that were left in that state.
+    """
+    tree = Phylo.read(str(_editable_tree_input_path(job_dir, what)), "newick")
+    removed = _drop_pruned_tips(tree, tree_json)
+    if removed:
+        logger.warning(
+            "event=tree.pruned_tips_reapplied count=%d what=%s: the tree file still "
+            "held tips listed as pruned; removed them before the %s",
+            removed, what, what,
+        )
+    return tree
+
+
+def _builder_rooted_newick(job_dir: Path, tree_json: Dict) -> str:
+    """Newick of the current tree generation exactly as the tree builder rooted it.
+
+    That is tree_original.newick until a recompute, and the recompute's raw
+    output afterwards, which commit_recompute_tree_state() records in
+    ``pre_midpoint_newick`` with ``pre_midpoint_source == "recompute"``. A tree
+    recomputed before that was recorded has no copy of its builder root, and
+    the stored one belongs to the pre-recompute topology, so it is refused
+    rather than silently bringing back the old tree.
+    """
+    stored = tree_json.get("pre_midpoint_newick")
+    recomputed = artifact_exists(job_dir / "tree" / "tree_pruned_metadata.json")
+    if recomputed:
+        if stored and tree_json.get("pre_midpoint_source") == "recompute":
+            return stored
+        raise ValueError(
+            "The tree builder's own root was not kept for this recomputed tree. "
+            "Choose another rooting, or recompute again to record it."
+        )
+    if stored:
+        return stored
+    original = job_dir / "tree" / "tree_original.newick"
+    if artifact_exists(original):
+        with open_artifact(original, "rt") as handle:
+            return handle.read().strip()
+    raise ValueError("No tree builder output found for this job.")
+
+
 def rotate_node(job_dir: Path, tree_json: Dict, node_id: str) -> Dict:
     """
     Reverse the immediate child order for one internal node.
@@ -575,10 +677,8 @@ def rotate_node(job_dir: Path, tree_json: Dict, node_id: str) -> Dict:
     if not HAS_BIOPYTHON:
         raise RuntimeError("BioPython not installed; cannot rotate tree")
 
-    input_path = _editable_tree_input_path(job_dir, "rotate")
-
     try:
-        tree = Phylo.read(str(input_path), "newick")
+        tree = _read_editable_tree(job_dir, tree_json, "rotate")
 
         target_clade = None
         for clade in tree.find_clades(order="preorder"):
@@ -724,49 +824,7 @@ def prune_taxa(job_dir: Path, tree_json: Dict, taxa_names: List[str]) -> Dict:
             auto_modes = ("auto", "most_divergent_hit")
             tree_json["needs_sequence_of_interest"] = (tree_json.get("root_mode") or "").lower() in auto_modes
              
-        # Map parents for manual removal
-        parents = {c: p for p in tree.find_clades() for c in p.clades}
-        
-        
-        # Iterative Pruning with Cleanup
-        # 1. Start with explicit targets
-        queue = to_prune[:]
-        processed = set()
-        
-        while queue:
-            current = queue.pop(0)
-            if current in processed:
-                continue
-            processed.add(current)
-            
-            parent = parents.get(current)
-            if not parent:
-                # Root - cannot prune? Or if distinct root node, maybe?
-                # Usually we don't prune root unless tree is empty
-                continue
-                
-            # Remove from parent
-            if current in parent.clades:
-                parent.clades.remove(current)
-                
-            # Check status of parent
-            # If parent now has 0 children, it has become a tip.
-            # If parent was an original internal node (had children initially),
-            # it is now an "artifact" tip. We should remove it too.
-            # Exception: If parent is the Root, we might leave it or empty the tree.
-            if len(parent.clades) == 0:
-                 # It's empty. Is it the root?
-                 if parent == tree.root:
-                     # Attempt to leave empty root or handle gracefully
-                     pass
-                 else:
-                     # Recursively prune this parent
-                     queue.append(parent)
-            
-        # Post-pass: Collapse unifurcations (single-child internal nodes)
-        # After pruning, internal nodes can end up with exactly one child,
-        # creating visually odd "pass-through" nodes. We splice them out.
-        _collapse_unifurcations(tree)
+        _remove_clades(tree, to_prune)
 
         # Save
         valid_path = job_dir / "tree"
@@ -1021,12 +1079,9 @@ def reroot_tree(job_dir: Path, tree_json: Dict, root_target: str) -> Dict:
     if not HAS_BIOPYTHON:
         return tree_json # Return unchanged if no library
 
-    # Determine input path: prefer existing modified tree
-    input_path = _editable_tree_input_path(job_dir, "reroot")
-
     try:
-        # Load the tree
-        tree = Phylo.read(str(input_path), "newick")
+        # Load the current editable tree (pruned if present, else original)
+        tree = _read_editable_tree(job_dir, tree_json, "reroot")
         
         # Validate target
         if not root_target:
@@ -1155,8 +1210,7 @@ def reroot_tree_on_best_outgroup_clade(job_dir: Path, tree_json: Dict,
     if not HAS_BIOPYTHON:
         return tree_json, {"tip_count": 0, "rooted_on": "biopython_unavailable"}
 
-    input_path = _editable_tree_input_path(job_dir, "auto-root")
-    tree = Phylo.read(str(input_path), "newick")
+    tree = _read_editable_tree(job_dir, tree_json, "auto-root")
     target_clade, clade_info = _best_taxon_distinct_outgroup_clade(tree, focal_tip, target_tip)
     if target_clade is None:
         raise ValueError(f"Root target not found: {target_tip}")
@@ -1173,12 +1227,9 @@ def midpoint_root(job_dir: Path, tree_json: Dict) -> Dict:
     if not HAS_BIOPYTHON:
         raise RuntimeError("Biopython not installed; midpoint rooting unavailable")
 
-    # Determine input path
-    input_path = _editable_tree_input_path(job_dir, "reroot")
-
     try:
-        tree = Phylo.read(str(input_path), "newick")
-        
+        tree = _read_editable_tree(job_dir, tree_json, "midpoint root")
+
         # Check for branch lengths
         # Heuristic: Verify we have at least one positive branch length.
         has_lengths = any((c.branch_length or 0) > 0 for c in tree.find_clades())
@@ -1238,20 +1289,23 @@ def midpoint_root(job_dir: Path, tree_json: Dict) -> Dict:
 
 def undo_midpoint_root(job_dir: Path, tree_json: Dict) -> Dict:
     """
-    Restore tree to pre-midpoint rooted state.
-    Uses the stored pre_midpoint_newick from tree state.
+    Root the tree where the tree builder rooted it ("original" rooting mode).
+
+    Starts from the builder's own output for the current tree generation (see
+    _builder_rooted_newick) and removes every pruned tip from it. It used to
+    write the stored pre-midpoint tree back verbatim; that copy is taken before
+    any editing, so turning midpoint rooting off restored every pruned sequence
+    and broke each clade annotation that had spanned them.
     """
     if not HAS_BIOPYTHON:
         raise RuntimeError("Biopython not installed; cannot restore tree")
 
-    pre_midpoint_newick = tree_json.get("pre_midpoint_newick")
-    if not pre_midpoint_newick:
-        raise ValueError("No pre-midpoint tree backup found. Cannot undo midpoint rooting.")
+    builder_newick = _builder_rooted_newick(job_dir, tree_json)
 
     try:
-        # Parse the stored original newick
-        tree = Phylo.read(StringIO(pre_midpoint_newick), "newick")
-        
+        tree = Phylo.read(StringIO(builder_newick), "newick")
+        _drop_pruned_tips(tree, tree_json)
+
         # Ladderize for consistent display
         ladderize_tree(tree, focal_tip=tree_json.get("sequence_of_interest"))
 
@@ -1265,7 +1319,19 @@ def undo_midpoint_root(job_dir: Path, tree_json: Dict) -> Dict:
         tree_json["current_tree"] = "pruned"
         tree_json["tree_structure"] = new_structure
         tree_json["is_midpoint_rooted"] = False
-        
+        # Like every other non-auto mode, the builder's root needs no focal tip,
+        # and an auto root's rooting_info no longer describes this tree.
+        tree_json["needs_sequence_of_interest"] = False
+        tree_json["rooting_info"] = {
+            "query_tip": tree_json.get("sequence_of_interest"),
+            "chosen_root_target": None,
+            "chosen_by": "original",
+            "reason": "user_selected_builder_root",
+            "warnings": [],
+            "candidate_count": 0,
+            "rejected_count": 0,
+        }
+
         # Re-apply metadata
         renames = tree_json.get("renames", {})
         pruned_taxa = set(tree_json.get("pruned_taxa", []))
@@ -1513,7 +1579,8 @@ def _reapply_rooting_after_recompute(job_dir: Path, tree_json: Dict[str, Any],
 def commit_recompute_tree_state(job_dir: Path,
                                 new_structure: Dict[str, Any],
                                 initial_state: Optional[Dict[str, Any]] = None,
-                                task_logger=None) -> Dict[str, Any]:
+                                task_logger=None,
+                                builder_newick: Optional[str] = None) -> Dict[str, Any]:
     """Install a freshly recomputed topology into the LATEST tree state.
 
     Recompute runs for minutes without the tree-state lock, so the state it
@@ -1572,6 +1639,14 @@ def commit_recompute_tree_state(job_dir: Path,
         # longer forms a single clade under the new topology stays persisted and
         # is flagged by the viewer rather than deleted here.
         restrict_annotations_to_current_leaves(state)
+
+        # The "original" rooting mode restores the tree builder's own root, and
+        # after a recompute that root belongs to this run's output, not to
+        # tree_original.newick. Record it before the rooting below rewrites the
+        # live file; without it the stored copy would bring back the old tree.
+        if builder_newick:
+            state["pre_midpoint_newick"] = builder_newick
+            state["pre_midpoint_source"] = "recompute"
 
         state = _reapply_rooting_after_recompute(
             job_dir,
@@ -1960,6 +2035,9 @@ def _recompute_tree_staged(
     require_valid_pipeline_outputs(
         output_dir, job_params, logger, recompute=True
     )
+    # Read before installation moves the staged file: this is the only copy of
+    # the tree as the builder rooted it, which the "original" rooting mode needs.
+    builder_newick = Path(tree_pruned_newick).read_text().strip()
     _install_recompute_outputs(job_dir, output_dir)
 
     tree_json = commit_recompute_tree_state(
@@ -1967,6 +2045,7 @@ def _recompute_tree_staged(
         new_structure,
         initial_state=tree_json,
         task_logger=logger,
+        builder_newick=builder_newick,
     )
     # The commit above rewrites tree_state.json, which would otherwise read as
     # "the user edited the viewer since this run started" and make a duplicate
@@ -1988,7 +2067,7 @@ def apply_rooting_mode(job_dir: Path, tree_json: Dict, mode: str,
                         sequence_of_interest: Optional[str] = None) -> Dict:
     """Apply one of the user-facing rooting modes.
 
-    mode: "auto" | "midpoint" | "most_divergent_hit" | "unrooted" | "manual"
+    mode: "auto" | "midpoint" | "original" | "most_divergent_hit" | "unrooted" | "manual"
     """
     from app.services.tree_rooting_service import choose_auto_root_target
 
@@ -1996,6 +2075,10 @@ def apply_rooting_mode(job_dir: Path, tree_json: Dict, mode: str,
         tree_json = set_sequence_of_interest(tree_json, sequence_of_interest, source="user_selected")
 
     mode = (mode or "auto").lower()
+
+    # Midpoint rooting switched off: the root the tree builder itself chose.
+    if mode == "original":
+        return undo_midpoint_root(job_dir, tree_json)
 
     if mode == "midpoint":
         tree_json = midpoint_root(job_dir, tree_json)

@@ -17,6 +17,13 @@
     // instead. Must stay equal to NEAR_ZERO_BRANCH_LENGTH in tree_analysis_service.py, with the
     // same <= comparison, so the viewer and the review agree on what counts as zero.
     const ZERO_LENGTH_POLYTOMY_EPSILON = 1e-6;
+    // Alan 9/23/26 - Screen length of the short connector drawn in front of a tip that sits
+    // directly on a multifurcation with an effectively zero-length branch (see
+    // _needsPolytomyConnector). Without it such a label touches the vertical backbone. It is a
+    // layout marker, not evolutionary distance, so it is held at this many screen pixels at
+    // any zoom, exactly like the tip labels it leads into.
+    const POLYTOMY_CONNECTOR_PX = 8;
+    const SVG_NS = 'http://www.w3.org/2000/svg';
 
     // Alan 8/24/26 - Say why a phylotree instance is not usable, or null when it is.
     // phylotree.js does not throw on a truncated or otherwise unparseable Newick: its
@@ -894,7 +901,9 @@
             if (this.tree && typeof this._updateNodeStylesOnly === 'function') this._updateNodeStylesOnly();
         }
 
-        async render(newick) {
+        // Alan 9/24/26 - renderOptions.sortMode applies a Sort mode before the first draw, so
+        // a reload that keeps the user's sort renders once instead of drawing and re-sorting.
+        async render(newick, renderOptions = {}) {
             this.newick = newick;
             if (!this.container) return;
 
@@ -1143,6 +1152,10 @@
 
             // Alan 5/9/26 - Apply any existing sequence metric filter state before the first draw.
             this._applySequenceFilters({ updateDisplay: false });
+
+            // Alan 9/24/26 - No display exists yet, so this only reorders the children.
+            const sortMode = renderOptions && renderOptions.sortMode;
+            if (sortMode && sortMode !== 'original') this._resortChildren(sortMode);
 
             // 4. DRAW
             this._draw();
@@ -1530,7 +1543,19 @@
                 'tip-label-gap': this.tipLabelGap,
                 'left-right-spacing': 'fixed-step',
                 'top-bottom-spacing': 'fixed-step',
-                'node-styler': (element, node) => this._styleNode(element, node),
+                // Alan 9/23/26 - No animated relayouts. phylotree animates trees under 300 nodes,
+                // so for ~250ms after every update the SVG's width/height and every node were
+                // still at their OLD values, and anything that measured the tree in that window
+                // got stale numbers: radial framing fitted the previous size, and the annotation
+                // canvas kept a viewBox from the old height, so the browser shrank the whole
+                // figure (tiny text after a sequence filter; the last tip clipped after Fit).
+                'transitions': false,
+                'node-styler': (element, node) => {
+                    this._styleNode(element, node);
+                    // Alan 9/23/26 - Runs after phylotree (re)draws each node, so a polytomy
+                    // connector follows every update() without a separate pass.
+                    this._drawPolytomyConnector(element, node);
+                },
                 // Alan 9/23/26 - Runs after phylotree (re)classes and redraws each branch, so the
                 // support fade survives every update() without a separate repaint pass.
                 'edge-styler': (element, edge) => this._styleBranchSupport(element, edge)
@@ -1587,6 +1612,9 @@
                         }
                     }, { capture: true, passive: true });
                 }
+
+                // Alan 9/23/26 - Radial only: start with the whole tree in view.
+                this._frameRadialTree();
 
             } catch (e) {
                 console.error("Render error:", e);
@@ -1761,14 +1789,96 @@
         }
 
         // Alan 8/17/26 - Convert the saved screen-space gap into an outward SVG offset.
+        // Alan 9/23/26 - A tip with a polytomy connector starts its gap where the connector ends.
         _tipLabelDx(node, zoomScale = 1) {
             const direction = node?.text_align === 'end' ? -1 : 1;
-            return direction * this.tipLabelGap / (zoomScale || 1);
+            const connector = this._needsPolytomyConnector(node) ? POLYTOMY_CONNECTOR_PX : 0;
+            return direction * (this.tipLabelGap + connector) / (zoomScale || 1);
         }
 
-        sortNodes(mode) {
-            if (!this.tree) return;
+        /**
+         * Alan 9/23/26 - True for a displayed tip whose parent is a multifurcation (more than two
+         * displayed children) and whose own incoming branch is effectively zero-length, i.e. a
+         * tip that would otherwise be drawn sitting on the vertical backbone. A tip with a
+         * positive-length branch already has a visible horizontal segment, and a zero-length tip
+         * in a bifurcation is left as drawn. Aligned tips are skipped: their dotted tracer
+         * already runs from the backbone to the label column.
+         */
+        _needsPolytomyConnector(node) {
+            if (!node || !node.parent || this.options?.alignTips) return false;
+            if ((node.children || []).length) return false;
+            const siblings = (node.parent.children || []).filter((child) => !child.notshown && !child.hidden);
+            if (siblings.length <= 2) return false;
+            return this._hasZeroLengthIncomingBranch(node);
+        }
 
+        /**
+         * Alan 9/23/26 - Add, update or remove the polytomy connector inside one tip's node group.
+         *
+         * Display geometry only: a short path from the node outward toward its label, sized in
+         * screen pixels with the same zoom factor as the labels (see _applyTextSizingFromZoom).
+         * It lives in the node group so it moves with the node and is cloned into every export.
+         * Deliberately not a <line> (drawNode removes those as tracers) and not class "branch"
+         * (phylotree binds every path.branch to an edge); tree_viewer.css and phylotree.css give
+         * it the branch stroke by sharing the branch rules' selector lists.
+         */
+        _drawPolytomyConnector(element, node) {
+            const group = element && typeof element.node === 'function' ? element.node() : null;
+            if (!group || typeof group.querySelector !== 'function') return;
+            let peg = group.querySelector('path.polytomy-connector');
+            if (!this._needsPolytomyConnector(node)) {
+                if (peg) peg.remove();
+                if (node) node.__polytomyConnector = null;
+                return;
+            }
+            if (!peg) {
+                peg = document.createElementNS(SVG_NS, 'path');
+                peg.setAttribute('class', 'polytomy-connector');
+                peg.setAttribute('fill', 'none');
+                peg.setAttribute('pointer-events', 'none');
+                // Paint under the label so a long connector can never cover text.
+                group.insertBefore(peg, group.firstChild);
+            }
+            peg.setAttribute('d', this._polytomyConnectorD(node));
+            if (this.options.layout === 'radial' && Number.isFinite(node.text_angle)) {
+                peg.setAttribute('transform', `rotate(${node.text_angle})`);
+            } else {
+                peg.removeAttribute('transform');
+            }
+            node.__polytomyConnector = peg;
+            this._syncPolytomyConnectorState(node);
+            // drawNode has just reset the label's dx to phylotree's own offset; move it past
+            // the connector now rather than waiting for the next text-sizing pass.
+            const label = group.querySelector('text.phylotree-node-text');
+            if (label) label.setAttribute('dx', String(this._tipLabelDx(node, this._labelVisualK || 1)));
+        }
+
+        // Alan 9/24/26 - Path data for a connector at the current label zoom factor, shared by
+        // _drawPolytomyConnector and the zoom pass's in-place resize.
+        _polytomyConnectorD(node) {
+            const direction = node.text_align === 'end' ? -1 : 1;
+            const length = POLYTOMY_CONNECTOR_PX / (this._labelVisualK || 1);
+            return `M0,0H${direction * length}`;
+        }
+
+        // Alan 9/23/26 - A connector extends its tip's branch, so it shows that branch's
+        // selection, tag and any explicit stroke colour. It never copies the support fade:
+        // terminal branches are not faded, and the connector is a layout marker in any case.
+        _syncPolytomyConnectorState(node) {
+            const peg = node && node.__polytomyConnector;
+            if (!peg || !peg.classList) return;
+            const branch = node.__branchPath;
+            const classes = branch && branch.classList;
+            peg.classList.toggle('polytomy-connector-selected', Boolean(classes && classes.contains('branch-selected')));
+            peg.classList.toggle('polytomy-connector-tagged', Boolean(classes && classes.contains('branch-tagged')));
+            const stroke = branch && branch.style ? branch.style.stroke : '';
+            if (stroke) peg.style.setProperty('stroke', stroke);
+            else peg.style.removeProperty('stroke');
+        }
+
+        // Alan 9/24/26 - Reorder children for a Sort mode; shared by sortNodes and by render(),
+        // which calls it before any display exists. Returns false if phylotree cannot sort.
+        _resortChildren(mode) {
             // Metric: Total Descendants (clade size)
             const countDescendants = (node) => {
                 if (node.__total_descendants !== undefined) return node.__total_descendants;
@@ -1787,14 +1897,20 @@
                     ? this.tree.resort_children.bind(this.tree)
                     : null);
 
-            if (resortFn) {
-                resortFn((a, b) => {
-                    if (mode === 'original') return (a.__original_index || 0) - (b.__original_index || 0);
-                    const valA = countDescendants(a);
-                    const valB = countDescendants(b);
-                    return (mode === 'asc') ? valA - valB : valB - valA;
-                });
+            if (!resortFn) return false;
+            resortFn((a, b) => {
+                if (mode === 'original') return (a.__original_index || 0) - (b.__original_index || 0);
+                const valA = countDescendants(a);
+                const valB = countDescendants(b);
+                return (mode === 'asc') ? valA - valB : valB - valA;
+            });
+            return true;
+        }
 
+        sortNodes(mode) {
+            if (!this.tree) return;
+
+            if (this._resortChildren(mode)) {
                 // Incremental update if possible
                 if (this.tree.display && typeof this.tree.display.update === 'function') {
                     // Alan 5/9/26 - Reapply sequence metric filters after ladderizing so hidden tips stay hidden.
@@ -1813,6 +1929,53 @@
             // Ideally: manipulate zoom transform.
             // Phylotree v2 usually resets zoom on redraw.
             this._draw();
+        }
+
+        // Alan 9/23/26 - Radial trees open fitted to the visible pane. phylotree draws them
+        // at full size in the middle of a square padded by the LONGEST label on every side,
+        // so at 1:1 the visible corner of that square is empty and the tree reads as "off to
+        // the right and down". Fit the drawing's real extent (branches plus the labels as
+        // drawn) into the part of the tree pane that is on screen, never enlarging it, and
+        // make the canvas the size of that pane so the page does not scroll through the
+        // rest of the square. Needs a settled layout, hence 'transitions': false in _draw().
+        _frameRadialTree() {
+            if (this.options.layout !== 'radial') return;
+            const display = this.tree?.display;
+            const svgNode = this.container.querySelector('svg');
+            const group = svgNode?.querySelector('.phylotree-container');
+            if (!display || typeof display.set_camera !== 'function' || !group) return;
+            let box;
+            try { box = group.getBBox(); } catch (_) { return; }
+            if (!(box.width > 0 && box.height > 0)) return;
+            const layout = Array.isArray(display.layout_translate) ? display.layout_translate : [0, 0];
+            const style = window.getComputedStyle(this.container);
+            const padLeft = parseFloat(style.paddingLeft) || 0;
+            const padRight = parseFloat(style.paddingRight) || 0;
+            const padTop = parseFloat(style.paddingTop) || 0;
+            const padBottom = parseFloat(style.paddingBottom) || 0;
+            const paneWidth = this.container.clientWidth - padLeft - padRight;
+            // On desktop the container grows with the SVG, so its height says nothing about
+            // what is on screen: use the window below the pane's top edge. In full screen and
+            // on phones the container has a fixed height, which caps it.
+            const top = this.container.getBoundingClientRect().top + padTop;
+            const fixedHeight = this.container.clientHeight - padTop - padBottom;
+            const paneHeight = Math.max(320, Math.min(
+                (window.innerHeight || 800) - Math.max(0, top) - 12,
+                document.body.classList.contains('tree-expanded') ? fixedHeight : Infinity
+            ));
+            if (!(paneWidth > 0)) return;
+            const margin = 8;
+            // 0.1 is the zoom behaviour's lower limit; going below it would jump on the next zoom.
+            const k = Math.max(0.1, Math.min(1,
+                (paneWidth - 2 * margin) / box.width,
+                (paneHeight - 2 * margin) / box.height));
+            // The camera sits on top of the layout translate, so the box is shifted by it.
+            const x = (paneWidth - k * box.width) / 2 - k * (box.x + layout[0]);
+            const y = (paneHeight - k * box.height) / 2 - k * (box.y + layout[1]);
+            display.set_camera(k, x, y);
+            svgNode.setAttribute('width', String(Math.floor(paneWidth)));
+            svgNode.setAttribute('height', String(Math.floor(paneHeight)));
+            this._applyTextSizingFromZoom();
         }
 
         // Alan 5/11/26 - Apply persisted tip renames after loading Newick while preserving original IDs for edit actions.
@@ -1990,7 +2153,9 @@
             const relevantPatterns = [
                 /\.node\b/, /\.branch\b/, /\.phylotree/, /\.internal-node/,
                 /\.tree-/, /circle/, /path/, /text/, /line/,
-                /\.node-support-value/, /\.selected/
+                /\.node-support-value/, /\.selected/,
+                // Alan 9/23/26 - Polytomy connectors carry the branch stroke into the figure.
+                /\.polytomy-connector/
             ];
             let cssText = '';
             try {
@@ -2752,7 +2917,8 @@
                 self._styleNode(el, d);
                 if (id && self.hiddenSelectionIds.has(id)) el.classed("node-selected", false);
                 // Alan 5/11/26 - Restyle node shapes but clear label inline color so text follows the refreshed group state.
-                el.selectAll("circle,path,rect").each(function () {
+                // Alan 9/23/26 - A polytomy connector keeps the branch stroke, not the group colour.
+                el.selectAll("circle,path:not(.polytomy-connector),rect").each(function () {
                     self._styleNode(window.d3v7.select(this), d);
                 });
                 // Alan 5/12/26 - Track temporary action selection separately from persistent color groups.
@@ -2825,6 +2991,12 @@
             const el = element && typeof element.node === 'function' ? element.node() : null;
             if (!el || typeof el.setAttribute !== 'function') return;
             const target = edge?.target;
+            // Alan 9/23/26 - Remember the drawn branch so a polytomy connector can mirror its
+            // selection/tag state; this styler runs on every redraw and selection change.
+            if (target) {
+                target.__branchPath = el;
+                this._syncPolytomyConnectorState(target);
+            }
             const info = this.options.supportFade ? this._supportFadeInfo(target) : null;
 
             const title = el.querySelector('title');
@@ -3287,7 +3459,12 @@
             const { k } = this._getSvgAndZoomGroup();
             // Alan 8/28/26 - Coarse-pointer users expect the complete tree to zoom like one
             // image. Desktop retains its established counter-scaled labels and annotations.
-            const visualK = window.matchMedia?.('(pointer: coarse)')?.matches ? 1 : k;
+            // Alan 9/23/26 - A radial tree also zooms like one image: its labels circle the tree,
+            // so labels held at a constant screen size while zoomed out to fit it would pile
+            // into each other and spill past the pane. Rectangular desktop trees keep them.
+            const uniformZoom = window.matchMedia?.('(pointer: coarse)')?.matches
+                || this.options.layout === 'radial';
+            const visualK = uniformZoom ? 1 : k;
 
             // Base sizes
             let supportBase = this.options.supportBasePx;
@@ -3304,6 +3481,21 @@
             const haloSvgPx = Math.max(0.75, 3 / visualK);
 
             const svg = window.d3v7.select(this.container).select("svg");
+
+            // Alan 9/23/26 - Polytomy connectors are held at a fixed screen length by the same
+            // factor as the labels; _drawPolytomyConnector and _tipLabelDx both read it.
+            // Alan 9/24/26 - Whether a tip needs one is decided when its node is drawn (the
+            // node-styler), so a zoom frame only resizes the existing ones, and only when the
+            // factor moved -- re-deciding every node each frame was O(n^2) inside a large
+            // polytomy, and the label dx it wrote is rewritten by the tip-text pass below.
+            if (this._labelVisualK !== visualK) {
+                this._labelVisualK = visualK;
+                const self = this;
+                svg.selectAll("path.polytomy-connector").each(function () {
+                    const node = this.parentNode && this.parentNode.__data__;
+                    if (node) this.setAttribute('d', self._polytomyConnectorD(node));
+                });
+            }
 
             svg.selectAll("text.node-support-value").each(function (d) {
                 if (!d || !d.__supportVec) return;
@@ -6475,6 +6667,15 @@
                     const nextViewBox = `${minX} ${minY} ${maxX - minX} ${maxY - minY}`;
                     svgNode.setAttribute('viewBox', nextViewBox);
                     svgNode.setAttribute('data-annotation-set-viewbox', nextViewBox);
+                    // Alan 9/23/26 - Keep the figure at 1:1. A viewBox larger than the SVG's own
+                    // width/height makes the browser shrink everything to fit, which is how a
+                    // label or band past the last tip turned every tip label tiny.
+                    if (maxX - minX > (parseFloat(svgNode.getAttribute('width')) || 0)) {
+                        setWidth(Math.ceil(maxX - minX));
+                    }
+                    if (maxY - minY > (parseFloat(svgNode.getAttribute('height')) || 0)) {
+                        svgNode.setAttribute('height', String(Math.ceil(maxY - minY)));
+                    }
                 }
             }
         }

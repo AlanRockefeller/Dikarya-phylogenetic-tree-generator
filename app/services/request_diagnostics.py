@@ -393,8 +393,7 @@ def install_request_diagnostics(app):
     @app.after_request
     def log_failed_request(response):
         status = response.status_code
-        if status < 400:
-            return response
+        failed = status >= 400
 
         # Alan 9/12/26 - An unmatched 4xx used to return here unlogged, which
         # kept vulnerability sweeps out of errors.log but also meant a probe
@@ -411,6 +410,12 @@ def install_request_diagnostics(app):
         # a client that fetches a stylesheet is rendering a page, not reading
         # the URL map. Recorded for every status, then done -- a 404 on a
         # missing asset is nobody's attack.
+        #
+        # Alan 9/24/26 - This and the actor scoring below used to sit behind an
+        # early return for status < 400, so an asset was only "seen" when it
+        # FAILED to load and route_breadth / health_scrape -- which are 200s --
+        # could never fire. Only the failure classification and logging are
+        # limited to error responses now.
         state = _security_state(app)
         actor = _actor_key()
         if request.endpoint == "static":
@@ -419,7 +424,7 @@ def install_request_diagnostics(app):
 
         bucket = reason = None
         crowd_verdict = None
-        if status < 500:
+        if failed and status < 500:
             bucket, reason = _classify(app, status)
 
             # A honeytoken overrides whatever the path would otherwise look
@@ -486,6 +491,9 @@ def install_request_diagnostics(app):
             # signal is a missed attacker; a raised exception here is a broken
             # site, and this runs on every request.
             app.logger.exception("event=security.actor_scoring_failed")
+
+        if not failed:
+            return response
 
         if status < 500 and (
             request.url_rule is None

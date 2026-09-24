@@ -498,9 +498,18 @@ def _summarize_tree_quality(
         # degraded if more than a quarter of THAT tree's branches are zero.
         reduced = None
         if not duplicates_explain_zeros and redundant_duplicate_names:
-            reduced = _zero_branch_ratio_without_duplicates(
-                tree, redundant_duplicate_names
-            )
+            # Advisory: a deep tree can make deepcopy raise RecursionError, and
+            # that must read as "no reduction", never as an unparseable tree.
+            try:
+                reduced = _zero_branch_ratio_without_duplicates(
+                    tree, redundant_duplicate_names
+                )
+            except Exception:
+                logger_obj.warning(
+                    "Could not measure zero-length branches after duplicate "
+                    "reduction; judging the tree as built.", exc_info=True,
+                )
+                reduced = None
             if reduced is not None:
                 summary["zero_length_branches_after_dedup"] = reduced[0]
                 summary["branches_after_dedup"] = reduced[1]
@@ -1036,25 +1045,50 @@ INAT_RATE_LIMIT_MAX_DEFERRALS = 60
 # does not spend the allowance above; it gets its own, sized for a throttle
 # that lasts most of a day (144 ten-minute cooldowns).
 INAT_COOLDOWN_MAX_WAITS = 144
+# MycoMap not answering while a legacy do=results link is resolved is the same
+# kind of transient outage: nothing was created, so waiting costs nothing.
+MYCOMAP_UNAVAILABLE_DEFER_SECONDS = 120
+MYCOMAP_UNAVAILABLE_MAX_DEFERRALS = 30
 
 
 def _defer_for_inat_rate_limit(job, job_id: str, exc: Exception) -> Optional[Retry]:
-    """Return an rq.Retry for a preparation pass iNaturalist rate-limited.
+    """Return an rq.Retry for a preparation pass an upstream outage stopped.
 
-    None means "fail as before": not a 429, no RQ job, or the allowance spent.
-    The job's preparation meta is left untouched, so the next pass resumes
-    exactly where this one was refused.
+    Covers an iNaturalist 429 and MycoMap not answering (``mycomap_unavailable``
+    in the error's details). None means "fail as before": neither of those, no
+    RQ job, or the allowance spent.
+    This helper leaves the preparation state alone; run_phylo_job puts back a
+    saved NCBI wait before returning the deferral, so a pass that was resuming
+    one resumes it again rather than starting the MycoMap work over.
     """
-    if job is None or getattr(exc, "status", None) != 429:
+    if job is None:
         return None
-    cooldown = int((getattr(exc, "details", None) or {}).get("inat_cooldown_seconds") or 0)
-    if cooldown > 0:
+    details = getattr(exc, "details", None) or {}
+    mycomap_unavailable = bool(details.get("mycomap_unavailable"))
+    if not mycomap_unavailable and getattr(exc, "status", None) != 429:
+        return None
+    cooldown = int(details.get("inat_cooldown_seconds") or 0)
+    if mycomap_unavailable:
+        meta_key, limit = "mycomap_unavailable_deferrals", MYCOMAP_UNAVAILABLE_MAX_DEFERRALS
+        wait_seconds = MYCOMAP_UNAVAILABLE_DEFER_SECONDS + random.randint(0, 30)
+        service, detail, reason = (
+            "MycoMap", "MycoMap is not answering right now.", "mycomap_unavailable",
+        )
+    elif cooldown > 0:
         meta_key, limit = "inat_cooldown_waits", INAT_COOLDOWN_MAX_WAITS
         # Spread the resumptions so the queue does not all return at once.
         wait_seconds = cooldown + random.randint(0, 30)
+        service, detail, reason = (
+            "iNaturalist", "iNaturalist is rate-limiting requests right now.",
+            "inat_cooldown",
+        )
     else:
         meta_key, limit = "inat_rate_limit_deferrals", INAT_RATE_LIMIT_MAX_DEFERRALS
         wait_seconds = INAT_RATE_LIMIT_DEFER_SECONDS
+        service, detail, reason = (
+            "iNaturalist", "iNaturalist is rate-limiting requests right now.",
+            "inat_rate_limited",
+        )
     deferrals = int(job.meta.get(meta_key) or 0)
     if deferrals >= limit:
         return None
@@ -1064,8 +1098,8 @@ def _defer_for_inat_rate_limit(job, job_id: str, exc: Exception) -> Optional[Ret
     job.meta[meta_key] = deferrals + 1
     job.meta["steps"][STEP_INPUT].update({
         "state": STATE_QUEUED,
-        "label": "Waiting for iNaturalist",
-        "detail": "iNaturalist is rate-limiting requests right now.",
+        "label": f"Waiting for {service}",
+        "detail": detail,
     })
     job.meta["current_step"] = STEP_INPUT
     job.save_meta()
@@ -1075,7 +1109,7 @@ def _defer_for_inat_rate_limit(job, job_id: str, exc: Exception) -> Optional[Ret
         db.session.commit()
     publish_overview(
         job_id,
-        "iNaturalist is rate-limiting requests right now. Dikarya will try "
+        f"{detail} Dikarya will try "
         + ("again in a minute" if wait_seconds < 120
            else f"again in about {round(wait_seconds / 60)} minutes")
         + "; nothing about this job needs to change.",
@@ -1085,10 +1119,9 @@ def _defer_for_inat_rate_limit(job, job_id: str, exc: Exception) -> Optional[Ret
     # rather than borrowing from a MycoMap wait's budget.
     retries_done = getattr(job, "number_of_retries", None) or 0
     logger.info(
-        "event=job.deferred Waiting out the iNaturalist rate limit "
+        "event=job.deferred Waiting out an upstream outage "
         "reason=%s resume_in_seconds=%s attempt=%s/%s",
-        "inat_cooldown" if cooldown > 0 else "inat_rate_limited",
-        wait_seconds, deferrals + 1, limit,
+        reason, wait_seconds, deferrals + 1, limit,
     )
     return Retry(max=retries_done + 1, interval=wait_seconds)
 
@@ -1333,6 +1366,15 @@ def run_phylo_job(job_params: dict) -> dict:
                             deferral = _defer_for_inat_rate_limit(job, job_id, exc)
                             if deferral is None:
                                 raise
+                            # Alan 9/23/26 - This pass set the preparation state to
+                            # "running" when it started. If it was resuming an NCBI
+                            # wait, put that back: otherwise the retry would redo the
+                            # MycoMap refresh it already made. A first pass has no
+                            # wait to resume, and marking it waiting would skip the
+                            # refresh that never happened.
+                            if tree_resuming_after_ncbi:
+                                job.meta[tree_preparation_meta_key] = "waiting_for_ncbi"
+                                job.save_meta()
                             return deferral
                 if prepared.get("status") == "waiting_for_ncbi":
                     from app.services.mycomap_service import (
@@ -1362,15 +1404,20 @@ def run_phylo_job(job_params: dict) -> dict:
                             get_mycomap_ncbi_poll_interval_seconds()
                             if auto_created else get_mycomap_ncbi_rerun_wait_seconds()
                         )
-                    # A bulk job can also wait its turn for a MycoMap creation
-                    # slot before any of that starts; give that wait its own
-                    # allowance so a long batch cannot exhaust the budget.
-                    max_retry_attempts = (
-                        get_mycomap_creation_discovery_max_attempts()
-                        + get_mycomap_ncbi_poll_max_attempts()
-                        + get_mycomap_bulk_throttle_max_wait_attempts()
-                        if auto_created else 1
-                    )
+                    # A bulk job can wait for a creation slot before discovery
+                    # or NCBI polling starts. Count that phase separately, with
+                    # its own allowance, so neither phase can spend the other's.
+                    throttle_wait = bool(rerun_details.get("creation_throttled"))
+                    if throttle_wait:
+                        wait_counter_key = "mycomap_throttle_waits"
+                        max_retry_attempts = get_mycomap_bulk_throttle_max_wait_attempts()
+                    else:
+                        wait_counter_key = "mycomap_wait_attempts"
+                        max_retry_attempts = (
+                            get_mycomap_creation_discovery_max_attempts()
+                            + get_mycomap_ncbi_poll_max_attempts()
+                            if auto_created else 1
+                        )
                     # Alan 9/23/26 - RQ 2.6.1 only increments number_of_retries on
                     # the immediate-requeue path (Job._handle_retry_result); a
                     # Retry with an interval is rescheduled without counting, so
@@ -1379,9 +1426,14 @@ def run_phylo_job(job_params: dict) -> dict:
                     # attempt=1). Count the waits ourselves and fail through the
                     # normal error path, which marks the job row failed.
                     wait_attempts = (
-                        int(job.meta.get("mycomap_wait_attempts") or 0) if job else 0
+                        int(job.meta.get(wait_counter_key) or 0) if job else 0
                     ) + 1
                     if wait_attempts > max_retry_attempts:
+                        if throttle_wait:
+                            raise RuntimeError(
+                                "No MycoMap BLAST slot freed up in time; nothing "
+                                "was created. Rebuild the tree later."
+                            )
                         raise RuntimeError(
                             "MycoMap did not return this observation's BLAST "
                             f"results after {max_retry_attempts} checks. The "
@@ -1425,7 +1477,8 @@ def run_phylo_job(job_params: dict) -> dict:
                                 "frees up."
                             )
                         elif (rerun_details.get("creation_unconfirmed")
-                              and not rerun_details.get("creation_pending_blast_id")):
+                              and not rerun_details.get("creation_pending_blast_id")
+                              and not rerun_details.get("creation_pending_job_id")):
                             waiting_message = (
                                 "MycoMap did not answer the request to create the "
                                 "BLAST search in time. Dikarya is checking whether "
@@ -1490,7 +1543,7 @@ def run_phylo_job(job_params: dict) -> dict:
                         db.session.commit()
 
                     if job:
-                        job.meta["mycomap_wait_attempts"] = wait_attempts
+                        job.meta[wait_counter_key] = wait_attempts
                         job.meta[tree_preparation_meta_key] = "waiting_for_ncbi"
                         job.meta["mycomap_rerun_details"] = rerun_details
                         job.meta["mycomap_ncbi_resume_at"] = resume_at.isoformat()
@@ -1515,8 +1568,10 @@ def run_phylo_job(job_params: dict) -> dict:
                     # is our own wait_attempts counter (see above), not RQ's.
                     logger.info(
                         "event=job.deferred Waiting for MycoMap NCBI results "
-                        "reason=mycomap_ncbi_rerun resume_in_seconds=%s "
-                        "attempt=%s/%s attempts_remaining=%s",
+                        "reason=%s resume_in_seconds=%s attempt=%s/%s "
+                        "attempts_remaining=%s",
+                        ("mycomap_creation_throttled" if throttle_wait
+                         else "mycomap_ncbi_rerun"),
                         wait_seconds, wait_attempts, max_retry_attempts,
                         max(max_retry_attempts - wait_attempts, 0),
                     )
@@ -1637,15 +1692,18 @@ def run_phylo_job(job_params: dict) -> dict:
                 # entirely, and an "All 3 submitted sequences are identical"
                 # warning now names the wrong count. The status page reads them
                 # off Job.metrics, so both copies have to be refreshed.
-                from app.workers.queue import apply_input_warnings
-
-                refreshed_warnings = apply_input_warnings(job_params)
-                _save_job_params(input_info_path, job_params)
                 try:
+                    from app.workers.queue import apply_input_warnings
+
+                    refreshed_warnings = apply_input_warnings(job_params)
+                    _save_job_params(input_info_path, job_params)
                     warned_job = Job.query.get(job_id)
                     if warned_job:
                         metrics = dict(warned_job.metrics or {})
-                        metrics["input_warnings"] = refreshed_warnings
+                        if refreshed_warnings:
+                            metrics["input_warnings"] = refreshed_warnings
+                        else:
+                            metrics.pop("input_warnings", None)
                         warned_job.metrics = metrics
                         db.session.commit()
                 except Exception:

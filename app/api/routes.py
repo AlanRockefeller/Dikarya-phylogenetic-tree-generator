@@ -1798,8 +1798,29 @@ def gather_mycomap_sequences_for_queue(url, include_ncbi=True, include_local=Tru
         parse_legacy_mycomap_results_url, resolve_legacy_mycomap_results_url,
     )
     if parse_legacy_mycomap_results_url(url):
-        legacy = resolve_legacy_mycomap_results_url(url)
+        resolution_warnings = []
+        legacy = resolve_legacy_mycomap_results_url(
+            url,
+            warnings=resolution_warnings,
+            # An interactive request has a time budget. Bound the status checks
+            # by time rather than to one: one check could only ever find the
+            # oldest search, and would hand back an unchecked (possibly still
+            # running) one over an older finished search. A slow first check
+            # still stops the loop, so the worst case is unchanged.
+            status_check_deadline=(
+                time.monotonic() + 5 if fetch_time_budget is not None else None
+            ),
+        )
         if not legacy:
+            if resolution_warnings:
+                return None, ({
+                    "status": "error",
+                    "error": (
+                        "MycoMap could not be reached to resolve that older-style link; "
+                        "please try again shortly"
+                    ),
+                    "retryable": True,
+                }, 502)
             return None, ({
                 "status": "error",
                 "error": (
@@ -3585,7 +3606,7 @@ def midpoint_root_toggle_endpoint(job_id):
 
 @bp.route('/job/<job_id>/tree/rooting_mode', methods=['POST'])
 def set_rooting_mode_endpoint(job_id):
-    """Apply a rooting mode: auto | midpoint | most_divergent_hit | unrooted | manual."""
+    """Apply a rooting mode: auto | midpoint | original | most_divergent_hit | unrooted | manual."""
     if not validate_job_id(job_id):
         return jsonify({"status": "error", "error": "Invalid job ID format"}), 400
     _, error_msg, status_code = check_job_access(job_id, mode="edit")
@@ -3608,7 +3629,7 @@ def set_rooting_mode_endpoint(job_id):
     target = data.get("target")
     soi = data.get("sequence_of_interest")
 
-    if mode not in ("auto", "midpoint", "most_divergent_hit", "unrooted", "manual"):
+    if mode not in ("auto", "midpoint", "original", "most_divergent_hit", "unrooted", "manual"):
         return jsonify({"status": "error", "error": f"Unknown rooting mode: {mode}"}), 400
 
     try:

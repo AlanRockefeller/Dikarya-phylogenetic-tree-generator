@@ -825,6 +825,7 @@ def prepare_tree_job(preparation: Dict[str, Any], *, defer_after_ncbi_rerun: boo
         DEFAULT_TREE_PARAMS,
         _build_fasta_text,
         _build_sequence_metadata,
+        default_bootstrap_params,
         _check_auto_created_mycomap_ncbi_results,
         _mycomap_creation_discovery_message,
         _record_creation_queue_position,
@@ -835,8 +836,10 @@ def prepare_tree_job(preparation: Dict[str, Any], *, defer_after_ncbi_rerun: boo
         MycoMapCreateError,
         MycoMapRerunError,
         create_mycomap_blast,
+        find_mycomap_blast_by_known_id,
         find_mycomap_blast_by_title,
         get_mycomap_creation_discovery_max_seconds,
+        recalled_blast_id_for_title,
         unconfirmed_mycomap_creation_verdict,
         validate_mycomap_url,
         validate_mycomap_rerun_limit,
@@ -873,9 +876,29 @@ def prepare_tree_job(preparation: Dict[str, Any], *, defer_after_ncbi_rerun: boo
         # record ID before the result page exists, which is what lets the wait
         # message name a queue position during discovery.
         pending_creation = {}
-        found = find_mycomap_blast_by_title(
-            title, warnings=lookup_warnings, pending_out=pending_creation
-        )
+        known_id = str(
+            details.get("creation_pending_blast_id")
+            or recalled_blast_id_for_title(title)
+            or ""
+        ).strip()
+        if known_id:
+            found = find_mycomap_blast_by_known_id(
+                known_id, title, warnings=lookup_warnings
+            )
+            if not found:
+                # The stored id may be a MycoMap job id, which the known-id
+                # path cannot resolve (see _create_mycomap_blast_from_observation).
+                found = find_mycomap_blast_by_title(
+                    title, warnings=lookup_warnings, pending_out=pending_creation
+                )
+            # Preserve the ID for queue position reporting and for the
+            # unconfirmed-create check if the result page is not ready yet.
+            pending_creation.setdefault("blast_id", known_id)
+        else:
+            found = find_mycomap_blast_by_title(
+                title, warnings=lookup_warnings, pending_out=pending_creation,
+                fresh=bool(details.get("creation_unconfirmed")),
+            )
         discovery_warnings.extend(lookup_warnings)
         discovery_warnings = list(dict.fromkeys(discovery_warnings))
         verdict = "wait" if found else unconfirmed_mycomap_creation_verdict(
@@ -1067,7 +1090,7 @@ def prepare_tree_job(preparation: Dict[str, Any], *, defer_after_ncbi_rerun: boo
         "alignment_options": {},
         "tree_method": DEFAULT_TREE_PARAMS["tree_method"],
         "tree_model": DEFAULT_TREE_PARAMS["tree_model"],
-        "bootstrap": DEFAULT_TREE_PARAMS["bootstrap"],
+        **default_bootstrap_params(),
         "mcmc_generations": DEFAULT_TREE_PARAMS["mcmc_generations"],
         "mcmc_nruns": 2,
         "mcmc_nchains": 4,

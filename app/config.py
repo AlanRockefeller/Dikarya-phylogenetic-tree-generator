@@ -436,11 +436,12 @@ class Config:
         'CLAUDE_REVIEW_WRAPPER', '/usr/local/sbin/dikarya-claude-review'
     )
     ANTHROPIC_API_KEY = os.environ.get('ANTHROPIC_API_KEY', '')
-    CLAUDE_REVIEW_MODEL = os.environ.get('CLAUDE_REVIEW_MODEL', 'claude-opus-5')
+    CLAUDE_REVIEW_MODEL = os.environ.get('CLAUDE_REVIEW_MODEL', 'claude-opus-5-5')
     # Measured on a 147-sequence job: low = 61s/$0.25, medium = 156s/$0.35, for
     # the same verdict. The request is synchronous and nginx cuts it off at 300s,
-    # so low is the setting that fits; raise it if reviews read as too shallow.
-    CLAUDE_REVIEW_EFFORT = os.environ.get('CLAUDE_REVIEW_EFFORT', 'low')
+    # so medium leaves less headroom under the 240s timeout below than low did;
+    # drop back to low if large trees start timing out.
+    CLAUDE_REVIEW_EFFORT = os.environ.get('CLAUDE_REVIEW_EFFORT', 'medium')
     CLAUDE_REVIEW_MAX_TOKENS = int(os.environ.get('CLAUDE_REVIEW_MAX_TOKENS', '32000'))
     # Hard wall-clock cap. A review runs inside a Gunicorn request slot (4 workers
     # x 2 threads = 8 total) and behind nginx's proxy_read_timeout 300s, so it must

@@ -28,7 +28,11 @@ from app.services.tree_edit_service import (  # noqa: E402
     HAS_BIOPYTHON,
     _reapply_rooting_after_recompute,
     _stable_internal_node_id_from_names,
+    apply_rooting_mode,
+    commit_recompute_tree_state,
     ladderize_tree,
+    midpoint_root,
+    parse_newick_to_json,
     prune_taxa,
     reroot_tree,
     rotate_node,
@@ -321,6 +325,92 @@ class TestRotateIdentityAfterRename(unittest.TestCase):
             # Original Newick must be left intact; rotation writes only the pruned copy.
             self.assertTrue((job_dir / "tree" / "tree_pruned.newick").exists())
             self.assertEqual((job_dir / "tree" / "tree_original.newick").read_text(), self.NEWICK)
+
+
+@unittest.skipUnless(HAS_BIOPYTHON, "requires BioPython")
+class TestBuilderRootKeepsPrunes(unittest.TestCase):
+    """Midpoint off ("original" mode) must never bring pruned sequences back.
+
+    Reported 2026-09-23 on a real job: turning midpoint rooting off and on again
+    restored seven pruned tips, and the clade annotation that had spanned them
+    stopped being drawn because its members no longer formed a whole clade. The
+    cause was undo_midpoint_root() writing back a copy of the tree taken before
+    any editing.
+    """
+
+    NEWICK = "(((A:1,B:1):1,(C:1,D:2):1):1,(E:1,F:3):2);"
+    RECOMPUTED = "((C:1,E:1):1,(D:2,F:3):2);"
+
+    def _pruned_job(self, job_dir):
+        _write_job_tree(job_dir, self.NEWICK)
+        # What load_tree_state() stores when it first midpoint-roots a new job.
+        state = {"pre_midpoint_newick": self.NEWICK, "pruned_taxa": [], "renames": {}}
+        return prune_taxa(job_dir, state, ["A", "B"])
+
+    def _file_tips(self, job_dir):
+        tree = Phylo.read(str(job_dir / "tree" / "tree_pruned.newick"), "newick")
+        return {t.name for t in tree.get_terminals()}
+
+    def test_midpoint_off_then_on_keeps_pruned_tips_out(self):
+        with tempfile.TemporaryDirectory() as d:
+            job_dir = Path(d)
+            state = self._pruned_job(job_dir)
+            state = apply_rooting_mode(job_dir, state, "original")
+            self.assertEqual(state["root_mode"], "ORIGINAL")
+            self.assertFalse(state["is_midpoint_rooted"])
+            self.assertEqual(self._file_tips(job_dir), {"C", "D", "E", "F"})
+            self.assertEqual(set(_json_tip_names(state["tree_structure"])), {"C", "D", "E", "F"})
+
+            state = apply_rooting_mode(job_dir, state, "midpoint")
+            self.assertTrue(state["is_midpoint_rooted"])
+            self.assertEqual(self._file_tips(job_dir), {"C", "D", "E", "F"})
+
+    def test_rooting_repairs_a_tree_that_regained_pruned_tips(self):
+        # The state the bug left behind: tips listed as pruned are back in the file.
+        with tempfile.TemporaryDirectory() as d:
+            job_dir = Path(d)
+            state = self._pruned_job(job_dir)
+            _write_pruned_tree(job_dir, self.NEWICK)
+            state = midpoint_root(job_dir, state)
+            self.assertEqual(self._file_tips(job_dir), {"C", "D", "E", "F"})
+
+    def test_original_after_recompute_uses_the_recomputed_tree(self):
+        with tempfile.TemporaryDirectory() as d:
+            job_dir = Path(d)
+            state = self._pruned_job(job_dir)
+            (job_dir / "tree" / "tree_pruned_metadata.json").write_text("{}")
+            state["pre_midpoint_newick"] = self.RECOMPUTED
+            state["pre_midpoint_source"] = "recompute"
+            state = apply_rooting_mode(job_dir, state, "original")
+            tree = Phylo.read(str(job_dir / "tree" / "tree_pruned.newick"), "newick")
+            pairs = {frozenset(t.name for t in clade.get_terminals())
+                     for clade in tree.root.clades}
+            self.assertEqual(pairs, {frozenset({"C", "E"}), frozenset({"D", "F"})})
+
+    def test_original_is_refused_when_a_recompute_left_no_builder_copy(self):
+        # Recomputed before the builder tree was recorded: the stored copy is the
+        # pre-recompute topology, so using it would silently undo the recompute.
+        with tempfile.TemporaryDirectory() as d:
+            job_dir = Path(d)
+            state = self._pruned_job(job_dir)
+            (job_dir / "tree" / "tree_pruned_metadata.json").write_text("{}")
+            before = (job_dir / "tree" / "tree_pruned.newick").read_text()
+            with self.assertRaises(ValueError):
+                apply_rooting_mode(job_dir, state, "original")
+            self.assertEqual((job_dir / "tree" / "tree_pruned.newick").read_text(), before)
+
+    def test_recompute_commit_records_the_builder_tree(self):
+        with tempfile.TemporaryDirectory() as d:
+            job_dir = Path(d)
+            (job_dir / "tree").mkdir()
+            _write_pruned_tree(job_dir, self.RECOMPUTED)
+            structure = parse_newick_to_json(job_dir / "tree" / "tree_pruned.newick")
+            initial = {"root_mode": "ORIGINAL", "pre_midpoint_newick": self.NEWICK}
+            state = commit_recompute_tree_state(
+                job_dir, structure, initial_state=initial, builder_newick=self.RECOMPUTED,
+            )
+            self.assertEqual(state["pre_midpoint_newick"], self.RECOMPUTED)
+            self.assertEqual(state["pre_midpoint_source"], "recompute")
 
 
 if __name__ == "__main__":

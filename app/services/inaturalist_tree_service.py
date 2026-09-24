@@ -1310,6 +1310,20 @@ DEFAULT_TREE_PARAMS = {
 }
 
 
+def default_bootstrap_params() -> Dict[str, Any]:
+    """The ``bootstrap`` entry for one-click job params, or none at all.
+
+    Quick Tree (``iqtree_fast``) and FastTree run no bootstrap, so recording
+    the generic count would put replicates that never ran into input_info.json
+    and onto the job page. The key is omitted rather than set to None because
+    readers call ``int(job_params.get("bootstrap", <default>))`` -- the same
+    rule ``create_job`` applies to web submissions.
+    """
+    if DEFAULT_TREE_PARAMS["tree_method"] in ("fasttree", "iqtree_fast"):
+        return {}
+    return {"bootstrap": DEFAULT_TREE_PARAMS["bootstrap"]}
+
+
 def _report_progress(progress, message: str, icon: str = "running") -> None:
     """Send a human-readable step note to the caller's Activity Feed, if any.
 
@@ -1819,7 +1833,7 @@ def _build_inat_tree_job_params(observation_id: int, mycomap_url: str,
         "alignment_options": {},
         "tree_method": DEFAULT_TREE_PARAMS["tree_method"],
         "tree_model": DEFAULT_TREE_PARAMS["tree_model"],
-        "bootstrap": DEFAULT_TREE_PARAMS["bootstrap"],
+        **default_bootstrap_params(),
         "mcmc_generations": DEFAULT_TREE_PARAMS["mcmc_generations"],
         "mcmc_nruns": 2,
         "mcmc_nchains": 4,
@@ -1947,7 +1961,9 @@ def _create_mycomap_blast_from_observation(observation: Dict[str, Any],
         advance_mycomap_creation_discovery,
         MycoMapCreateError,
         create_mycomap_blast,
+        find_mycomap_blast_by_known_id,
         find_mycomap_blast_by_title,
+        recalled_blast_id_for_title,
         get_mycomap_creation_discovery_max_seconds,
         release_bulk_mycomap_creation,
         reserve_bulk_mycomap_creation,
@@ -1976,9 +1992,38 @@ def _create_mycomap_blast_from_observation(observation: Dict[str, Any],
     # first pass already checked history for this title, so skip the lookup
     # while it waits for a slot (history is MycoMap's heaviest BLAST query).
     was_throttled = bool((pending_creation_details or {}).get("creation_throttled"))
-    created = None if was_throttled else find_mycomap_blast_by_title(
-        job_title, warnings=discovery_warnings, pending_out=pending_creation
-    )
+    # Once history has told us the search's ID, resolve it by that ID: a large
+    # batch pushes older searches out of both the history page and the listing,
+    # so the title lookup stops finding them (see find_mycomap_blast_by_known_id).
+    known_id = str(
+        (pending_creation_details or {}).get("creation_pending_blast_id")
+        or (recalled_blast_id_for_title(job_title)
+            if (pending_creation_details or {}).get("creation_pending") else "")
+        or ""
+    ).strip()
+    created = None
+    if known_id and not was_throttled:
+        created = find_mycomap_blast_by_known_id(
+            known_id, job_title, warnings=discovery_warnings
+        )
+        if not created:
+            # A stored id may be a MycoMap job id rather than the result's
+            # r<id> (jobs saved before the two were told apart), and then the
+            # known-id path can never resolve it. The title lookup reads the
+            # shared history page, so asking it too is cheap.
+            created = find_mycomap_blast_by_title(
+                job_title, warnings=discovery_warnings, pending_out=pending_creation
+            )
+        # Carrying an ID keeps the queue-position report and the
+        # creation-confirmed check working.
+        pending_creation.setdefault("blast_id", known_id)
+    elif not was_throttled:
+        # A timed-out create is judged by what this lookup does NOT find, so it
+        # must read MycoMap's history directly rather than a shared cached page.
+        created = find_mycomap_blast_by_title(
+            job_title, warnings=discovery_warnings, pending_out=pending_creation,
+            fresh=bool((pending_creation_details or {}).get("creation_unconfirmed")),
+        )
     # A create POST that timed out is pending like any other, but is re-sent
     # once MycoMap's history shows it never arrived.
     recreate = False
@@ -2226,7 +2271,15 @@ def _record_creation_queue_position(details: dict, pending: dict) -> dict:
     pending_id = str((pending or {}).get("blast_id") or "").strip()
     if not pending_id:
         return details
-    details["creation_pending_blast_id"] = pending_id
+    # Only a result id may drive find_mycomap_blast_by_known_id, which resolves
+    # it as r<id>. A bare MycoMap job id is kept for the queue position and the
+    # unconfirmed-create check, and the title lookup keeps running.
+    if (pending or {}).get("id_kind") == "job":
+        details["creation_pending_job_id"] = pending_id
+        if details.get("creation_pending_blast_id") == pending_id:
+            del details["creation_pending_blast_id"]
+    else:
+        details["creation_pending_blast_id"] = pending_id
     return record_mycomap_queue_position(
         details, get_mycomap_ncbi_queue_position(blast_id=pending_id)
     )
@@ -2706,7 +2759,10 @@ def prepare_inat_tree_job(observation_id: int, *, include_ncbi: bool = True,
         # it to the BLASTs MycoMap already ran on that sequence. The saved
         # value is left as it is: it still works on MycoMap.
         from app.services.mycomap_service import resolve_legacy_mycomap_results_url
-        legacy = resolve_legacy_mycomap_results_url(mycomap_url)
+        resolution_warnings = []
+        legacy = resolve_legacy_mycomap_results_url(
+            mycomap_url, warnings=resolution_warnings,
+        )
         if legacy:
             _report_progress(
                 progress,
@@ -2715,6 +2771,19 @@ def prepare_inat_tree_job(observation_id: int, *, include_ncbi: bool = True,
             )
             mycomap_url = legacy["url"]
             blast_id = legacy["blast_id"]
+        elif resolution_warnings:
+            # Alan 9/23/26 - MycoMap could not be asked, which is not the same as
+            # "no search exists". Falling through would create a new search and
+            # overwrite the observation's saved link on iNaturalist because of a
+            # transient outage, so stop before anything is created or written.
+            # The worker defers on mycomap_unavailable rather than failing, so
+            # a blip during a long NCBI wait does not lose the whole job.
+            raise InatTreeError(
+                "MycoMap could not be reached to resolve the observation's "
+                "older-style link; nothing was created. Rebuild the tree later.",
+                status=503,
+                details={"mycomap_unavailable": True},
+            )
     if not blast_id:
         # Some older observations contain MycoMap's legacy query-string URL,
         # which cannot identify a result through the current API. If the
@@ -2745,7 +2814,10 @@ def prepare_inat_tree_job(observation_id: int, *, include_ncbi: bool = True,
         )
         existing = None if reused_blast_id else _reuse_existing_mycomap_blast(
             observation, observation_id, mycomap_rerun_details,
-            write_inat_field=False, progress=progress,
+            # Same rule as the creation path below: replace an unusable saved
+            # value, never a .org one. Leaving a broken value in place made
+            # every later job on this observation repeat the lookup.
+            write_inat_field=not preserve_saved_url, progress=progress,
         )
         if reused_blast_id:
             mycomap_url = saved_created_url

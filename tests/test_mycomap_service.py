@@ -590,5 +590,118 @@ class TestMycomapBlastCreation(unittest.TestCase):
         self.assertEqual(created["title"], "iNat365269897 DNA Barcode ITS")
         self.assertNotIn("blast_id", created)
 
+
+class TestExistingBlastResolution(unittest.TestCase):
+    """Resolving a legacy do=results link, and finding a search by known ID."""
+
+    CANDIDATES = [
+        {"blast_id": "101", "url": "https://mycomap.com/genetics/blast-search/a-r101/"},
+        {"blast_id": "102", "url": "https://mycomap.com/genetics/blast-search/a-r102/"},
+        {"blast_id": "103", "url": "https://mycomap.com/genetics/blast-search/a-r103/"},
+    ]
+
+    def _choose(self, statuses, **kwargs):
+        records = {bid: ({"status": st} if st is not None else None)
+                   for bid, st in statuses.items()}
+        with patch.object(mycomap_service, "fetch_mycomap_blast_record",
+                          side_effect=lambda bid: records.get(bid)) as fetch:
+            chosen = mycomap_service._choose_existing_blast(self.CANDIDATES, **kwargs)
+        return chosen, fetch.call_count
+
+    def test_the_oldest_finished_search_wins(self):
+        chosen, _ = self._choose({"101": "running", "102": "complete", "103": "complete"})
+        self.assertEqual((chosen["blast_id"], chosen["status"]), ("102", "complete"))
+
+    def test_an_unreadable_status_counts_as_unknown(self):
+        chosen, _ = self._choose({"101": "running", "102": None, "103": "running"})
+        self.assertEqual((chosen["blast_id"], chosen["status"]), ("102", "unknown"))
+
+    def test_a_status_budget_limits_the_checks_and_falls_back_to_the_next(self):
+        # An interactive request asks once; if that search is still running, the
+        # next one is offered as unknown instead of "no search exists".
+        chosen, calls = self._choose({"101": "running", "102": "complete"},
+                                     max_status_checks=1)
+        self.assertEqual(calls, 1)
+        self.assertEqual((chosen["blast_id"], chosen["status"]), ("102", "unknown"))
+
+    def test_a_time_budget_keeps_checking_while_time_remains(self):
+        # Bounding by time rather than to one check finds an older finished
+        # search instead of offering an unchecked one as unknown.
+        chosen, calls = self._choose(
+            {"101": "running", "102": "running", "103": "complete"},
+            status_check_deadline=float("inf"),
+        )
+        self.assertEqual(calls, 3)
+        self.assertEqual((chosen["blast_id"], chosen["status"]), ("103", "complete"))
+
+    def test_a_spent_time_budget_still_makes_one_check(self):
+        chosen, calls = self._choose(
+            {"101": "running", "102": "complete"}, status_check_deadline=0.0,
+        )
+        self.assertEqual(calls, 1)
+        self.assertEqual((chosen["blast_id"], chosen["status"]), ("102", "unknown"))
+
+    def test_a_pending_history_job_id_is_not_taken_for_a_blast_id(self):
+        # MycoMap's job id is not necessarily the result's r<id>; only the latter
+        # may drive the known-id lookup.
+        row = {"title": "iNat1 DNA Barcode ITS", "status": "queued", "job_id": "77"}
+        pending = {}
+        with patch.object(mycomap_service, "_history_backoff_active", return_value=False), \
+                patch.object(mycomap_service, "_fetch_mycomap_history", return_value=[row]):
+            found = mycomap_service.find_mycomap_blast_via_history(
+                "iNat1 DNA Barcode ITS", pending_out=pending)
+        self.assertIsNone(found)
+        self.assertEqual(pending, {"blast_id": "77", "id_kind": "job"})
+
+    def test_a_fresh_history_lookup_skips_the_shared_cache(self):
+        class Conn:
+            def __init__(self):
+                self.writes = []
+            def get(self, key):
+                raise AssertionError("a fresh lookup must not read the cache")
+            def set(self, key, value, **kwargs):
+                self.writes.append(key)
+                return True
+        conn = Conn()
+        with patch.object(mycomap_service, "_shared_redis", return_value=conn), \
+                patch.object(mycomap_service, "_mycomap_refresh_request",
+                             return_value=[{"title": "x"}]) as request:
+            payload = mycomap_service._fetch_mycomap_history(1, fresh=True)
+        request.assert_called_once()
+        self.assertEqual(payload, [{"title": "x"}])
+        self.assertEqual(len(conn.writes), 1, "the fresh page still refills the cache")
+
+    def test_every_search_still_running_is_none(self):
+        chosen, calls = self._choose({"101": "running", "102": "running", "103": "running"})
+        self.assertIsNone(chosen)
+        self.assertEqual(calls, 3)
+
+    def test_an_unreachable_blast_list_is_reported_as_a_warning(self):
+        url = ("https://mycomap.com/index.php?app=genbank&module=genbank"
+               "&controller=blast&do=results&db=42&id=123")
+        warnings = []
+        with patch.object(mycomap_service, "diagnostic_urlopen",
+                          side_effect=OSError("connection refused")):
+            chosen = mycomap_service.resolve_legacy_mycomap_results_url(url, warnings=warnings)
+        self.assertIsNone(chosen)
+        self.assertEqual(len(warnings), 1)
+
+    def test_a_known_id_is_still_found_when_the_status_record_is_unavailable(self):
+        found_url = "https://mycomap.com/genetics/blast-search/inat1-dna-barcode-its-r555/"
+        with patch.object(mycomap_service, "fetch_mycomap_blast_record", return_value=None), \
+                patch.object(mycomap_service, "find_mycomap_record_url_by_id",
+                             return_value=found_url) as by_id:
+            result = mycomap_service.find_mycomap_blast_by_known_id("555", "iNat1 DNA Barcode ITS")
+        by_id.assert_called_once()
+        self.assertIsNotNone(result)
+
+    def test_an_unfinished_known_id_costs_no_page_lookup(self):
+        with patch.object(mycomap_service, "fetch_mycomap_blast_record",
+                          return_value={"status": "running"}), \
+                patch.object(mycomap_service, "find_mycomap_record_url_by_id") as by_id:
+            result = mycomap_service.find_mycomap_blast_by_known_id("555", "iNat1 DNA Barcode ITS")
+        self.assertIsNone(result)
+        by_id.assert_not_called()
+
 if __name__ == '__main__':
     unittest.main()

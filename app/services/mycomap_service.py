@@ -60,6 +60,14 @@ MYCOMAP_RERUN_REQUEST_TIMEOUT = 60
 # for a full minute each, mostly during one MycoMap outage. A missed lookup is
 # harmless -- the job simply looks again on its next poll -- so fail fast.
 MYCOMAP_HISTORY_REQUEST_TIMEOUT = 15
+# The member history is the same for every job that Dikarya created under the
+# configured member. Share one first page for a minute so concurrent workers
+# do not each scan it while checking their own pending BLAST.
+MYCOMAP_HISTORY_SHARED_CACHE_SECONDS = 60
+# A waiter must outlast the fetch it is waiting for, or concurrent lookups
+# never actually share one; it stops early once that fetch gives up.
+MYCOMAP_HISTORY_SHARED_CACHE_WAIT_SECONDS = MYCOMAP_HISTORY_REQUEST_TIMEOUT + 2
+_MYCOMAP_HISTORY_CACHE_KEY = "dikarya:mycomap:blast_history:member:{}:limit:100"
 # After one history lookup times out, every other waiting job would time out
 # too; a batch of 300 jobs then costs 300 x timeout per pass. Skip the lookup
 # for everyone for this long instead. Redis-backed; without Redis it fails open.
@@ -863,9 +871,284 @@ def _start_history_backoff() -> None:
         logger.info("MycoMap history backoff could not be set: %s", exc)
 
 
+def _read_cached_mycomap_history(conn, cache_key: str):
+    """Read a decoded history payload from Redis, or return None on a miss."""
+    try:
+        cached = conn.get(cache_key)
+    except Exception as exc:
+        logger.info("MycoMap history cache read failed: %s", exc)
+        return None
+    if not cached:
+        return None
+    if isinstance(cached, bytes):
+        cached = cached.decode("utf-8", errors="replace")
+    try:
+        payload = json.loads(cached)
+    except (TypeError, json.JSONDecodeError):
+        logger.info("MycoMap history cache contained invalid JSON")
+        return None
+    return payload if isinstance(payload, (list, dict)) else None
+
+
+def _fetch_mycomap_history(member_id: int, fresh: bool = False):
+    """Fetch one shared member-history page, coalescing concurrent workers.
+
+    ``fresh`` skips the shared cache and asks MycoMap directly (still refilling
+    the cache). Use it when an absent row is taken as evidence of absence: a
+    page cached before a timed-out create POST landed would otherwise read as
+    "never created" and send a duplicate.
+    """
+    conn = _shared_redis()
+    if conn is None:
+        return _mycomap_refresh_request(
+            "blast/history",
+            data={"member": str(member_id), "limit": "100"},
+            timeout=MYCOMAP_HISTORY_REQUEST_TIMEOUT,
+        )
+
+    cache_key = _MYCOMAP_HISTORY_CACHE_KEY.format(member_id)
+    if fresh:
+        payload = _mycomap_refresh_request(
+            "blast/history",
+            data={"member": str(member_id), "limit": "100"},
+            timeout=MYCOMAP_HISTORY_REQUEST_TIMEOUT,
+        )
+        if isinstance(payload, (list, dict)):
+            try:
+                conn.set(
+                    cache_key,
+                    json.dumps(payload, separators=(",", ":")),
+                    ex=MYCOMAP_HISTORY_SHARED_CACHE_SECONDS,
+                )
+            except Exception as exc:
+                logger.info("MycoMap history cache write failed: %s", exc)
+        return payload
+
+    cached = _read_cached_mycomap_history(conn, cache_key)
+    if cached is not None:
+        return cached
+
+    lock_key = f"{cache_key}:fetching"
+    owner_token = os.urandom(16).hex()
+    try:
+        owns_lock = bool(conn.set(
+            lock_key,
+            owner_token,
+            nx=True,
+            ex=MYCOMAP_HISTORY_REQUEST_TIMEOUT + 5,
+        ))
+    except Exception as exc:
+        logger.info("MycoMap history request lock failed: %s", exc)
+        owns_lock = None
+
+    if owns_lock is True:
+        try:
+            # A concurrent fetch may have filled the cache between our first
+            # read and lock acquisition.
+            cached = _read_cached_mycomap_history(conn, cache_key)
+            if cached is not None:
+                return cached
+            payload = _mycomap_refresh_request(
+                "blast/history",
+                data={"member": str(member_id), "limit": "100"},
+                timeout=MYCOMAP_HISTORY_REQUEST_TIMEOUT,
+            )
+            if isinstance(payload, (list, dict)):
+                try:
+                    conn.set(
+                        cache_key,
+                        json.dumps(payload, separators=(",", ":")),
+                        ex=MYCOMAP_HISTORY_SHARED_CACHE_SECONDS,
+                    )
+                except Exception as exc:
+                    logger.info("MycoMap history cache write failed: %s", exc)
+            return payload
+        finally:
+            # Compare-and-delete so an expired lock acquired by another worker
+            # is never removed by this request's cleanup.
+            try:
+                conn.eval(
+                    "if redis.call('get', KEYS[1]) == ARGV[1] then "
+                    "return redis.call('del', KEYS[1]) else return 0 end",
+                    1,
+                    lock_key,
+                    owner_token,
+                )
+            except Exception as exc:
+                logger.info("MycoMap history request lock release failed: %s", exc)
+
+    if owns_lock is False:
+        deadline = time.monotonic() + MYCOMAP_HISTORY_SHARED_CACHE_WAIT_SECONDS
+        while time.monotonic() < deadline:
+            time.sleep(0.2)
+            cached = _read_cached_mycomap_history(conn, cache_key)
+            if cached is not None:
+                return cached
+            try:
+                fetch_running = bool(conn.exists(lock_key))
+            except Exception:
+                fetch_running = True
+            if not fetch_running:
+                # The fetch ended without caching anything, so it failed;
+                # its owner has already reported (and backed off) why.
+                cached = _read_cached_mycomap_history(conn, cache_key)
+                if cached is not None:
+                    return cached
+                raise MycoMapRefreshError(
+                    "MycoMap BLAST history lookup by another worker failed; "
+                    "retrying on the next scheduled check."
+                )
+        raise MycoMapRefreshError(
+            "MycoMap BLAST history is being checked by another worker; "
+            "retrying on the next scheduled check."
+        )
+
+    # Redis is unavailable. Preserve the old fail-open behavior and make the
+    # request directly; the cache is only a coordination optimization.
+    return _mycomap_refresh_request(
+        "blast/history",
+        data={"member": str(member_id), "limit": "100"},
+        timeout=MYCOMAP_HISTORY_REQUEST_TIMEOUT,
+    )
+
+
+# Alan 9/23/26 - Jobs created before creation_pending_blast_id was persisted
+# only ever had their search ID in the logs, and the title lookup cannot find
+# them again once a batch outgrows history's 100 rows. Every ID the history
+# lookup sees is remembered here by title, so the known-ID path can recover it.
+# Oldest wins, matching MycoMap's rule for duplicate searches of one sequence.
+MYCOMAP_TITLE_ID_TTL_SECONDS = 14 * 24 * 60 * 60
+_TITLE_ID_KEY = "dikarya:mycomap:blast_id_by_title:{}"
+
+
+def _title_id_key(title: str) -> str:
+    return _TITLE_ID_KEY.format(" ".join(str(title or "").split()).strip().lower())
+
+
+def remember_blast_id_for_title(title: str, blast_id) -> None:
+    blast_id = str(blast_id or "").strip()
+    if not blast_id.isdigit() or not str(title or "").strip():
+        return
+    conn = _shared_redis()
+    if conn is None:
+        return
+    try:
+        key = _title_id_key(title)
+        existing = conn.get(key)
+        existing = existing.decode() if isinstance(existing, bytes) else existing
+        if existing and existing.isdigit() and int(existing) <= int(blast_id):
+            conn.expire(key, MYCOMAP_TITLE_ID_TTL_SECONDS)
+            return
+        conn.set(key, blast_id, ex=MYCOMAP_TITLE_ID_TTL_SECONDS)
+    except Exception as exc:
+        logger.info("Could not remember MycoMap BLAST %s for %s: %s", blast_id, title, exc)
+
+
+def recalled_blast_id_for_title(title: str) -> Optional[str]:
+    conn = _shared_redis()
+    if conn is None or not str(title or "").strip():
+        return None
+    try:
+        value = conn.get(_title_id_key(title))
+    except Exception as exc:
+        logger.info("Could not recall a MycoMap BLAST for %s: %s", title, exc)
+        return None
+    value = value.decode() if isinstance(value, bytes) else value
+    return value if value and value.isdigit() else None
+
+
+def _mycomap_title_slug(title: str) -> str:
+    """MycoMap's result-page slug for a search title.
+
+    "iNat61372441 DNA Barcode ITS" -> "inat61372441-dna-barcode-its", as in
+    blast-search/inat61372441-dna-barcode-its-r660784/.
+    """
+    return re.sub(r"[^a-z0-9]+", "-", str(title or "").lower()).strip("-")
+
+
+def find_mycomap_blast_by_known_id(blast_id: str, title: str,
+                                   warnings: Optional[list] = None
+                                   ) -> Optional[dict]:
+    """
+    Find a created BLAST whose ID we already hold, without the title lookup.
+
+    Alan 9/23/26 - The history API returns only our newest 100 searches and the
+    listing only the site's newest 50, so a bulk batch outgrows both: its
+    searches finished on MycoMap but could never be found again, and 324 jobs
+    polled for hours (r660784, created 2026-09-22 16:27, was published and
+    complete while its job kept waiting). A job that saw its ID once keeps it
+    as creation_pending_blast_id; this resolves it directly.
+
+    Asks the status record first so an unfinished search costs no page fetch,
+    then tries the listing, then builds <title-slug>-r<id>/ and accepts it only
+    when that page answers 200 with our own title -- the slug rule is inferred
+    from MycoMap's URLs, so it is verified rather than trusted. An unreadable
+    status record only skips that shortcut: the listing and page checks still
+    decide, so a status outage cannot hide a finished search for the whole
+    polling budget.
+    """
+    blast_id = str(blast_id or "").strip()
+    wanted = " ".join(str(title or "").split()).strip()
+    if not blast_id.isdigit() or not wanted:
+        return None
+    record = fetch_mycomap_blast_record(blast_id)
+    if record is not None and _looks_unfinished(_api_text_value(record.get("status"))):
+        return None
+
+    url = find_mycomap_record_url_by_id(blast_id, warnings)
+    if not url:
+        candidate = (
+            "https://mycomap.com/genetics/blast-search/"
+            f"{_mycomap_title_slug(wanted)}-r{blast_id}/"
+        )
+        request = urllib.request.Request(
+            candidate,
+            headers={"User-Agent": "Dikarya-TreeBuilder/1.0",
+                     "Accept": "text/html,*/*"},
+            method="GET",
+        )
+        try:
+            with diagnostic_urlopen(request, timeout=REQUEST_TIMEOUT) as resp:
+                # The <title> is in the first few KB of a ~500 KB page.
+                head = resp.read(65536).decode("utf-8", errors="replace")
+        except Exception as exc:
+            logger.info("MycoMap result page %s could not be confirmed: %s",
+                        candidate, exc)
+            # Only a status record that said so makes the search "finished".
+            # Without one, a 404 is the ordinary not-published-yet answer.
+            if warnings is not None and record is not None:
+                warnings.append(
+                    f"MycoMap BLAST {blast_id} is finished but its results page "
+                    f"could not be confirmed: {exc}"
+                )
+            elif warnings is not None and getattr(exc, "code", None) != 404:
+                warnings.append(
+                    f"MycoMap BLAST {blast_id}'s status could not be read and "
+                    f"its results page could not be checked: {exc}"
+                )
+            return None
+        match = re.search(r"<title>(.*?)</title>", head, re.IGNORECASE | re.DOTALL)
+        page_title = html.unescape(match.group(1)) if match else ""
+        page_label = page_title.split(" - BLAST Search", 1)[0]
+        if (not _title_matches_blast_label(page_label, wanted)
+                or validate_mycomap_url(candidate, quiet=True) != blast_id):
+            logger.warning(
+                "event=mycomap.known_id_page_mismatch blast_id=%s MycoMap page "
+                "for our search did not carry the expected title", blast_id,
+            )
+            return None
+        url = candidate
+    logger.info(
+        "event=mycomap.found_by_known_id blast_id=%s Found MycoMap BLAST for "
+        "title %s by its recorded ID", blast_id, wanted,
+    )
+    return {"blast_id": blast_id, "url": url, "title": wanted}
+
+
 def find_mycomap_blast_via_history(title: str,
                                    warnings: Optional[list] = None,
-                                   pending_out: Optional[dict] = None
+                                   pending_out: Optional[dict] = None,
+                                   fresh: bool = False,
                                    ) -> Optional[dict]:
     """
     Find a BLAST record by title through the authenticated history API.
@@ -884,7 +1167,12 @@ def find_mycomap_blast_via_history(title: str,
     MycoMap knows the record's ID before it publishes its result page, and that
     ID is enough to read the search's queue position. When ``pending_out`` is
     supplied it receives that ID under ``blast_id`` so a caller still waiting
-    for the page can tell the user where the search sits in the queue.
+    for the page can tell the user where the search sits in the queue, and
+    ``id_kind``: ``"blast"`` when it is the result's r<id>, ``"job"`` when it
+    is only MycoMap's job id, which is not necessarily the same number and so
+    must not be resolved as a result page.
+
+    ``fresh`` bypasses the shared history cache (see _fetch_mycomap_history).
     """
     wanted = " ".join(str(title or "").split()).strip()
     if not wanted:
@@ -897,11 +1185,7 @@ def find_mycomap_blast_via_history(title: str,
                             "timed out recently")
         return None
     try:
-        payload = _mycomap_refresh_request(
-            "blast/history",
-            data={"userID": str(get_mycomap_user_id()), "perPage": "100"},
-            timeout=MYCOMAP_HISTORY_REQUEST_TIMEOUT,
-        )
+        payload = _fetch_mycomap_history(get_mycomap_user_id(), fresh=fresh)
     except MycoMapRefreshTimeout as exc:
         _start_history_backoff()
         logger.warning("MycoMap BLAST history lookup failed for %s: %s", wanted, exc)
@@ -930,6 +1214,32 @@ def find_mycomap_blast_via_history(title: str,
         if not _title_matches_blast_label(label, wanted):
             continue
 
+        # Alan 9/23/26 - The history endpoint exposes job_id/status directly.
+        # Once we have a pending job ID, carry it to the next discovery pass;
+        # that pass checks /blast/<job_id> instead of rescanning all history.
+        row_status = _find_api_field(row, ("status",))
+        row_job_id = _find_api_field(row, ("job_id", "jobid")).strip()
+        if _looks_unfinished(row_status) and row_job_id.isdigit():
+            row_blast_id = re.fullmatch(
+                r"(?:r)?(\d+)",
+                _find_api_field(
+                    row, ("blastid", "blast_id", "resultid", "result_id")
+                ).strip(),
+                re.IGNORECASE,
+            )
+            if pending_out is not None:
+                if row_blast_id:
+                    pending_out["blast_id"] = row_blast_id.group(1)
+                    pending_out["id_kind"] = "blast"
+                else:
+                    pending_out["blast_id"] = row_job_id
+                    pending_out["id_kind"] = "job"
+            logger.info(
+                "MycoMap history found pending BLAST job %s for title %s",
+                row_job_id, wanted,
+            )
+            continue
+
         url_text = _find_api_field(
             row,
             ("url", "resulturl", "result_url", "blasturl", "blast_url",
@@ -948,6 +1258,7 @@ def find_mycomap_blast_via_history(title: str,
             else None
         )
         if blast_id:
+            remember_blast_id_for_title(wanted, blast_id)
             logger.info(
                 "Found MycoMap BLAST %s for title %s via history API",
                 blast_id, wanted,
@@ -956,7 +1267,7 @@ def find_mycomap_blast_via_history(title: str,
 
         # No usable URL on the row: fall back to its numeric ID and resolve the
         # real result page. The row already matched our exact title under our
-        # own userID, so the ID is trustworthy -- what is missing is its URL.
+        # configured member, so the ID is trustworthy -- what is missing is its URL.
         for id_names in (
             ("blastid", "blast_id", "resultid", "result_id",
              "recordid", "record_id"),
@@ -969,6 +1280,10 @@ def find_mycomap_blast_via_history(title: str,
             if not match:
                 continue
             candidate_id = match.group(1)
+            if id_names != ("jobid", "job_id"):
+                # A job id is not necessarily the BLAST id; "oldest wins"
+                # would pin a wrong one, so only BLAST-id fields are kept.
+                remember_blast_id_for_title(wanted, candidate_id)
             # Alan 8/5/26 - This used to synthesize blast-search/r<id>/ and check
             # that page for the title. That URL form does not exist on MycoMap
             # (records are <slug>-r<id>/), so the check 404'd every time and the
@@ -994,6 +1309,9 @@ def find_mycomap_blast_via_history(title: str,
             )
             if pending_out is not None:
                 pending_out["blast_id"] = candidate_id
+                pending_out["id_kind"] = (
+                    "job" if id_names == ("jobid", "job_id") else "blast"
+                )
             if warnings is not None:
                 warnings.append(
                     f"MycoMap reported BLAST record {candidate_id} for this "
@@ -1004,23 +1322,29 @@ def find_mycomap_blast_via_history(title: str,
 
 def find_mycomap_blast_by_title(title: str,
                                 warnings: Optional[list] = None,
-                                pending_out: Optional[dict] = None
+                                pending_out: Optional[dict] = None,
+                                fresh: bool = False,
                                 ) -> Optional[dict]:
     """
     Find the newest MycoMap BLAST record matching an exact job title.
 
     When ``warnings`` is supplied, any reason the lookup could not complete is
     appended to it -- see ``find_mycomap_blast_via_history``, which also
-    documents ``pending_out``.
+    documents ``pending_out`` and ``fresh``.
     """
     wanted = " ".join(str(title or "").split()).strip()
     if not wanted:
         return None
     found = find_mycomap_blast_via_history(
-        wanted, warnings=warnings, pending_out=pending_out
+        wanted, warnings=warnings, pending_out=pending_out, fresh=fresh
     )
     if found:
         return found
+    # The history row already gave us the job ID. It is both cheaper and more
+    # reliable to check that one record on the next pass than to fetch another
+    # site-wide listing while its result page is still being published.
+    if (pending_out or {}).get("blast_id"):
+        return None
     page = _fetch_mycomap_blast_listing(warnings)
     if not page:
         return None
@@ -1135,11 +1459,31 @@ def find_mycomap_blasts_for_sequence_record(db: str, record_id: str,
     ]
 
 
-def _choose_existing_blast(candidates: List[Dict[str, str]]) -> Optional[Dict[str, str]]:
-    """The oldest candidate MycoMap reports as finished; failing that, the oldest
-    one not known to be unfinished (status unreadable counts as unknown)."""
+def _choose_existing_blast(
+        candidates: List[Dict[str, str]],
+        max_status_checks: Optional[int] = None,
+        status_check_deadline: Optional[float] = None,
+        ) -> Optional[Dict[str, str]]:
+    """Choose the oldest finished candidate, or failing that an unknown one.
+
+    Status-unavailable candidates count as unknown. Only the first
+    ``max_status_checks`` (default _MAX_EXISTING_BLAST_STATUS_CHECKS) are asked,
+    and no new check starts once ``status_check_deadline`` (time.monotonic())
+    has passed -- an interactive caller bounds time, not count, so a normal
+    fast MycoMap still gets every candidate asked. If every one asked is still
+    unfinished, the first candidate not asked is returned as unknown rather
+    than reporting that no search exists.
+    """
+    candidates = list(candidates or [])
+    limit = (_MAX_EXISTING_BLAST_STATUS_CHECKS if max_status_checks is None
+             else max(0, int(max_status_checks)))
+    checked = []
     fallback = None
-    for candidate in candidates[:_MAX_EXISTING_BLAST_STATUS_CHECKS]:
+    for candidate in candidates[:limit]:
+        if (checked and status_check_deadline is not None
+                and time.monotonic() >= status_check_deadline):
+            break
+        checked.append(candidate)
         record = fetch_mycomap_blast_record(candidate["blast_id"])
         if isinstance(record, dict):
             ncbi = record.get("ncbi") if isinstance(record.get("ncbi"), dict) else {}
@@ -1151,18 +1495,30 @@ def _choose_existing_blast(candidates: List[Dict[str, str]]) -> Optional[Dict[st
                 continue
         if fallback is None:
             fallback = dict(candidate, status="unknown")
+    if fallback is None and len(candidates) > len(checked):
+        fallback = dict(candidates[len(checked)], status="unknown")
     return fallback
 
 
-def resolve_legacy_mycomap_results_url(url: str,
-                                       warnings: Optional[list] = None
-                                       ) -> Optional[Dict[str, str]]:
-    """Map a legacy do=results link to a current BLAST {"blast_id", "url"}."""
+def resolve_legacy_mycomap_results_url(
+        url: str,
+        warnings: Optional[list] = None,
+        max_status_checks: Optional[int] = None,
+        status_check_deadline: Optional[float] = None,
+        ) -> Optional[Dict[str, str]]:
+    """Map a legacy do=results link to a current BLAST {"blast_id", "url"}.
+
+    ``warnings`` receives a message when MycoMap's BLAST list could not be read,
+    which callers use to tell "unreachable" apart from "no search yet".
+    """
     parsed = parse_legacy_mycomap_results_url(url)
     if not parsed:
         return None
     candidates = find_mycomap_blasts_for_sequence_record(*parsed, warnings=warnings)
-    chosen = _choose_existing_blast(candidates)
+    chosen = _choose_existing_blast(
+        candidates, max_status_checks=max_status_checks,
+        status_check_deadline=status_check_deadline,
+    )
     logger.info(
         "event=mycomap.legacy_url_resolved db=%s record=%s candidates=%s "
         "chosen=%s status=%s",
@@ -1473,7 +1829,8 @@ def unconfirmed_mycomap_creation_verdict(details: Optional[dict], *,
     if not details.get("creation_unconfirmed"):
         return "wait"
     if (lookup_warnings or (pending_creation or {}).get("blast_id")
-            or details.get("creation_pending_blast_id")):
+            or details.get("creation_pending_blast_id")
+            or details.get("creation_pending_job_id")):
         return "wait"
     attempts = int(details.get("creation_attempts") or 1)
     if attempts >= MYCOMAP_UNCONFIRMED_CREATE_MAX_ATTEMPTS:

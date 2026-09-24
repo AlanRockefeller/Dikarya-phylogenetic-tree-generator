@@ -3,9 +3,12 @@
 {% block title %}Dikarya - Tree Viewer{% endblock %}
 {% block subtitle %}Tree Viewer{% endblock %}
 
+{# The tree, its toolbar and the settings panel use the whole window width. #}
+{% block main_width %}max-w-none{% endblock %}
+
 {% block head %}
-<link rel="stylesheet" href="{{ url_for('static', filename='css/tree_viewer.css') }}?v=13">
-<link rel="stylesheet" href="{{ url_for('static', filename='css/phylotree.css') }}?v=2">
+<link rel="stylesheet" href="{{ url_for('static', filename='css/tree_viewer.css') }}?v=20">
+<link rel="stylesheet" href="{{ url_for('static', filename='css/phylotree.css') }}?v=3">
 <link rel="stylesheet" href="{{ url_for('static', filename='css/phylotree-menus.css') }}?v=3">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
@@ -16,10 +19,10 @@
 {% block content %}
 <!-- Cached viewer state for this job. Superseded by /api/job/q0x9/state in the
      next viewer release; the legacy path is retained for older bookmarks. -->
-<!-- Page Header -->
-<div class="mb-6">
-    <div class="flex flex-col md:flex-row justify-between items-center gap-4">
-        <div>
+<!-- Page Header: title, method chips and the page-level actions -->
+<div class="mb-4">
+    <div class="flex flex-col lg:flex-row lg:items-end gap-3">
+        <div class="min-w-0">
             <h2 class="text-2xl font-bold text-journal-dark dark:text-gray-100 flex items-center">
                 <i class="fas fa-tree text-journal-gold mr-3"></i>
                 {% if view_only %}
@@ -57,616 +60,131 @@
             {% set trim_display = 'Trimming: ' + trim_name %}
             {% endif %}
 
-            <p class="text-gray-600 dark:text-gray-300 mt-1 font-mono text-sm" title="{{ job_id }}">
-                {% if view_only %}
-                <span class="text-gray-500 mr-2"><i class="fas fa-lock text-xs"></i> You can explore and download this
-                    tree, but editing is disabled. Make an editable copy to modify it.</span>
-                <span class="mx-2 opacity-50">|</span>
-                {% endif %}
-                <a href="/tree?clone_job_id={{ job_id }}"
-                    class="hover:text-journal-gold underline decoration-dotted transition-colors"
-                    title="Click to clone sequences to a new job">Job: {{ job_id[:16] }}...</a> <span
-                    class="mx-2 opacity-50">|</span>
-                {{ align }} <i class="fas fa-arrow-right mx-1 text-xs opacity-50"></i> {{ tree }}
-                {% if trim_display %}
-                <span class="mx-2 opacity-50">|</span> {{ trim_display }}
-                {% endif %}
-            </p>
-        </div>
-    </div>
-</div>
-
-<!-- Controls Panel -->
-<div id="tree-desktop-controls" class="bg-white dark:bg-journal-green rounded-xl shadow-lg p-4 mb-6 transition-colors">
-    <!-- Main Toolbar -->
-    <div class="space-y-4">
-        <!-- Row 1: Primary Controls (Layout, Zoom, Display) -->
-        <div
-            class="flex flex-wrap gap-3 items-center justify-between border-b border-gray-100 dark:border-gray-800 pb-4">
-            <div class="flex items-center gap-3">
-                <!-- Layout Buttons -->
-                <div
-                    class="flex gap-1 border border-gray-300 dark:border-journal-dark rounded-lg overflow-hidden shrink-0">
-                    <button type="button"
-                        class="px-3 py-2 text-sm font-medium text-gray-700 dark:text-gray-200 bg-white dark:bg-journal-dark hover:bg-journal-gold hover:text-journal-dark transition-colors flex items-center gap-1.5"
-                        id="btn-layout-linear" title="Linear Layout">
-                        <i class="fa fa-align-left"></i>
-                    </button>
-                    <button type="button"
-                        class="px-3 py-2 text-sm font-medium text-gray-700 dark:text-gray-200 bg-white dark:bg-journal-dark hover:bg-journal-gold hover:text-journal-dark transition-colors flex items-center gap-1.5 border-l border-gray-300 dark:border-journal-dark"
-                        id="btn-layout-radial" title="Radial Layout">
-                        <i class="fa fa-circle-notch"></i>
-                    </button>
-                </div>
-
-                <!-- Zoom Controls -->
-                <div
-                    class="flex gap-1 border border-gray-300 dark:border-journal-dark rounded-lg overflow-hidden shrink-0">
-                    <button type="button"
-                        class="px-3 py-2 text-sm font-medium text-gray-700 dark:text-gray-200 bg-white dark:bg-journal-dark hover:bg-journal-gold hover:text-journal-dark transition-colors"
-                        id="btn-zoom-in" title="Zoom In">
-                        <i class="fa fa-plus"></i>
-                    </button>
-                    <button type="button"
-                        class="px-3 py-2 text-sm font-medium text-gray-700 dark:text-gray-200 bg-white dark:bg-journal-dark hover:bg-journal-gold hover:text-journal-dark transition-colors border-l border-gray-300 dark:border-journal-dark"
-                        id="btn-zoom-out" title="Zoom Out">
-                        <i class="fa fa-minus"></i>
-                    </button>
-                    <button type="button"
-                        class="px-3 py-2 text-sm font-medium text-gray-700 dark:text-gray-200 bg-white dark:bg-journal-dark hover:bg-journal-gold hover:text-journal-dark transition-colors border-l border-gray-300 dark:border-journal-dark"
-                        id="btn-fit" title="Fit to Screen">
-                        <i class="fa fa-compress-arrows-alt"></i> Fit
-                    </button>
-                </div>
-
-                <!-- Display Options -->
-                <div
-                    class="flex gap-1 border border-gray-300 dark:border-journal-dark rounded-lg overflow-hidden shrink-0">
-                    <button type="button"
-                        class="px-3 py-2 text-sm font-medium text-gray-700 dark:text-gray-200 bg-white dark:bg-journal-dark hover:bg-journal-gold hover:text-journal-dark transition-colors flex items-center gap-1.5"
-                        id="btn-align-tips" title="Align Tips">
-                        <i class="fa fa-indent"></i> Align
-                    </button>
-                    <button type="button"
-                        class="px-3 py-2 text-sm font-medium text-gray-700 dark:text-gray-200 bg-white dark:bg-journal-dark hover:bg-journal-gold hover:text-journal-dark transition-colors flex items-center gap-1.5 border-l border-gray-300 dark:border-journal-dark"
-                        id="btn-ladderize" title="Cycle Node Sorting (S)">
-                        <i class="fa fa-sort-amount-down"></i> Sort
-                    </button>
-                    <button type="button"
-                        class="px-3 py-2 text-sm font-medium text-gray-700 dark:text-gray-200 bg-white dark:bg-journal-dark hover:bg-journal-gold hover:text-journal-dark transition-colors border-l border-gray-300 dark:border-journal-dark"
-                        id="btn-toggle-support" title="Toggle Support Values">Hide Node Support</button>
-                    <button type="button"
-                        class="px-3 py-2 text-sm font-medium text-gray-700 dark:text-gray-200 bg-white dark:bg-journal-dark hover:bg-journal-gold hover:text-journal-dark transition-colors flex items-center gap-1.5 border-l border-gray-300 dark:border-journal-dark"
-                        id="btn-tree-shortcuts-help" title="Shortcuts, and how Collapse, Prune, Recompute and Undo differ (?)">
-                        <i class="fas fa-keyboard"></i> Keyboard Shortcuts
-                    </button>
-                </div>
-
-                {% if claude_review_enabled %}
-                <!-- Claude review of the alignment and tree -->
-                <button type="button"
-                    class="px-3 py-2 text-sm font-semibold rounded-lg border border-journal-gold/60 text-journal-dark dark:text-journal-gold bg-journal-gold/10 hover:bg-journal-gold hover:text-journal-dark dark:hover:text-journal-dark transition-colors flex items-center gap-1.5 shrink-0 disabled:opacity-60 disabled:cursor-not-allowed"
-                    id="btn-claude-review" title="Ask Claude to assess this alignment and tree">
-                    <i class="fas fa-wand-magic-sparkles"></i> Analyze
-                </button>
-                {% endif %}
-            </div>
-        </div>
-
-        <!-- Row 2: Advanced Controls (Filters, Typography, Selection) -->
-        <div class="flex flex-wrap gap-4 items-center">
-
-            <!-- Support Thresholds (Filters) -->
-            <div class="flex flex-col gap-1">
-                <span class="text-xs font-bold uppercase tracking-wide text-gray-600 dark:text-gray-400">Filters</span>
-                <div
-                    class="flex items-center gap-2 border border-gray-300 dark:border-journal-dark rounded-lg overflow-hidden bg-white dark:bg-journal-dark px-2 py-1">
-                    <span id="support-type-badge"
-                        class="px-2 py-0.5 text-xs font-semibold rounded bg-journal-gold/20 text-journal-dark dark:text-journal-gold shrink-0">Support:
-                        --</span>
-
-                    <div class="h-4 w-px bg-gray-300 dark:bg-gray-700 mx-1"></div>
-
-                    <div class="flex items-center gap-1">
-                        <span class="text-xs font-bold text-gray-600 dark:text-gray-300">PP &gt;</span>
-                        <input type="number" id="input-pp-threshold"
-                            class="w-14 px-1 py-1 text-xs bg-transparent text-gray-900 dark:text-gray-100 ring-1 ring-gray-300/50 dark:ring-gray-600/50 rounded hover:bg-gray-50 dark:hover:bg-journal-dark/80 focus:ring-2 focus:ring-journal-gold transition-colors"
-                            value="0.80" step="0.05" min="0" max="1">
-                    </div>
-
-                    <div class="flex items-center gap-1 ml-2">
-                        <span class="text-xs font-bold text-gray-600 dark:text-gray-300">BS &gt;</span>
-                        <input type="number" id="input-bs-threshold"
-                            class="w-14 px-1 py-1 text-xs bg-transparent text-gray-900 dark:text-gray-100 ring-1 ring-gray-300/50 dark:ring-gray-600/50 rounded hover:bg-gray-50 dark:hover:bg-journal-dark/80 focus:ring-2 focus:ring-journal-gold transition-colors"
-                            value="70" step="5" min="0" max="100">
-                    </div>
-
-                    <div class="h-4 w-px bg-gray-300 dark:bg-gray-700 mx-1"></div>
-
-                    <div class="flex items-center gap-1">
-                        <span class="text-xs font-bold text-gray-600 dark:text-gray-300">Tips &ge;</span>
-                        <input type="number" id="input-min-tips"
-                            class="w-12 px-1 py-1 text-xs bg-transparent text-gray-900 dark:text-gray-100 ring-1 ring-gray-300/50 dark:ring-gray-600/50 rounded hover:bg-gray-50 dark:hover:bg-journal-dark/80 focus:ring-2 focus:ring-journal-gold transition-colors"
-                            value="0" step="1" min="0">
-                    </div>
-                </div>
-
-                <div class="flex items-center gap-2 mt-1">
-                    <label
-                        class="flex items-center gap-1.5 text-xs font-medium text-gray-600 dark:text-gray-300 cursor-pointer select-none">
-                        <input class="rounded border-gray-300 text-journal-gold focus:ring-journal-gold w-3.5 h-3.5"
-                            type="checkbox" id="cb-hide-low-support">
-                        Apply thresholds (Filter Low)
-                    </label>
-                    <!-- Alan 9/23/26 - Fade internal branches by support class; on by default. Title is set from the support type by updateSupportUI(). -->
-                    <label id="label-fade-by-support"
-                        class="flex items-center gap-1.5 text-xs font-medium text-gray-600 dark:text-gray-300 cursor-pointer select-none"
-                        title="Draw weakly supported branches lighter. Display only; the tree is unchanged.">
-                        <input class="rounded border-gray-300 text-journal-gold focus:ring-journal-gold w-3.5 h-3.5"
-                            type="checkbox" id="cb-fade-by-support" checked>
-                        Fade by support
-                    </label>
-                </div>
-            </div>
-
-            <!-- Font Sizes (Typography) -->
-            <div class="flex flex-col gap-1">
-                <span
-                    class="text-xs font-bold uppercase tracking-wide text-gray-600 dark:text-gray-400">Typography</span>
-                <div
-                    class="flex items-center gap-2 border border-gray-300 dark:border-journal-dark rounded-lg overflow-hidden bg-white dark:bg-journal-dark px-2 py-1 h-[34px]">
-                    <div class="flex items-center gap-1">
-                        <span class="text-xs font-bold text-gray-600 dark:text-gray-300">Support</span>
-                        <input type="number" id="input-support-font"
-                            class="w-12 px-1 py-1 text-xs bg-transparent text-gray-900 dark:text-gray-100 ring-1 ring-gray-300/50 dark:ring-gray-600/50 rounded hover:bg-gray-50 dark:hover:bg-journal-dark/80 focus:ring-2 focus:ring-journal-gold transition-colors"
-                            value="9" step="1" min="6" max="24">
-                    </div>
-                    <div class="flex items-center gap-1 ml-1">
-                        <span class="text-xs font-bold text-gray-600 dark:text-gray-300">Tip</span>
-                        <input type="number" id="input-tip-font"
-                            class="w-12 px-1 py-1 text-xs bg-transparent text-gray-900 dark:text-gray-100 ring-1 ring-gray-300/50 dark:ring-gray-600/50 rounded hover:bg-gray-50 dark:hover:bg-journal-dark/80 focus:ring-2 focus:ring-journal-gold transition-colors"
-                            value="12" step="1" min="8" max="24">
-                    </div>
-                </div>
-            </div>
-
-            <!-- Row 3: Advanced Visuals (Spacing & Filter) -->
-            <div class="flex flex-col gap-1">
-                <span class="text-xs font-bold uppercase tracking-wide text-gray-600 dark:text-gray-400">Spacing</span>
-                <div
-                    class="flex items-center gap-2 border border-gray-300 dark:border-journal-dark rounded-lg overflow-hidden bg-white dark:bg-journal-dark px-2 py-1 h-[34px]">
-                    <div class="flex items-center gap-1" title="Horizontal Spacing">
-                        <i class="fas fa-arrows-alt-h text-gray-400 text-xs"></i>
-                        <button type="button" id="btn-spacing-x-dec"
-                            class="px-1.5 hover:text-journal-gold transition-colors"><i
-                                class="fas fa-minus text-[10px]"></i></button>
-                        <button type="button" id="btn-spacing-x-inc"
-                            class="px-1.5 hover:text-journal-gold transition-colors"><i
-                                class="fas fa-plus text-[10px]"></i></button>
-                    </div>
-                    <div class="h-4 w-px bg-gray-300 dark:bg-gray-700 mx-0.5"></div>
-                    <div class="flex items-center gap-1" title="Vertical Spacing">
-                        <i class="fas fa-arrows-alt-v text-gray-400 text-xs"></i>
-                        <button type="button" id="btn-spacing-y-dec"
-                            class="px-1.5 hover:text-journal-gold transition-colors"><i
-                                class="fas fa-minus text-[10px]"></i></button>
-                        <button type="button" id="btn-spacing-y-inc"
-                            class="px-1.5 hover:text-journal-gold transition-colors"><i
-                                class="fas fa-plus text-[10px]"></i></button>
-                    </div>
-                    <div class="h-4 w-px bg-gray-300 dark:bg-gray-700 mx-0.5"></div>
-                    <div class="flex items-center gap-1" title="Horizontal space between branch tips and their labels.">
-                        <span class="text-[10px] font-bold text-gray-500 dark:text-gray-400">Tip label gap: <span id="tip-label-gap-value">2</span> px</span>
-                        <button type="button" id="btn-tip-label-gap-dec" aria-label="Decrease tip label gap"
-                            class="px-1.5 hover:text-journal-gold transition-colors"><i
-                                class="fas fa-minus text-[10px]"></i></button>
-                        <button type="button" id="btn-tip-label-gap-inc" aria-label="Increase tip label gap"
-                            class="px-1.5 hover:text-journal-gold transition-colors"><i
-                                class="fas fa-plus text-[10px]"></i></button>
-                    </div>
-                </div>
-            </div>
-
-            <!-- Sequence Filters -->
-            <div class="flex flex-col gap-1">
-                <span class="text-xs font-bold uppercase tracking-wide text-gray-600 dark:text-gray-400">Sequence
-                    Filters</span>
-                <div
-                    class="flex flex-wrap items-center gap-3 border border-gray-300 dark:border-journal-dark rounded-lg overflow-hidden bg-white dark:bg-journal-dark px-2 py-1 min-h-[34px]">
-                    <span id="sequence-filter-count"
-                        class="px-2 py-0.5 text-xs font-semibold rounded bg-gray-100 text-gray-700 dark:bg-gray-700/40 dark:text-gray-200 shrink-0">Metrics:
-                        --</span>
-
-                    <div class="flex items-center gap-2" title="Minimum query coverage">
-                        <span class="text-xs font-bold text-blue-700 dark:text-blue-300">Query Coverage</span>
-                        <input type="range" id="slider-query-cover" min="0" max="100" value="100" step="1"
-                            class="w-24 h-2 rounded-lg appearance-none cursor-pointer accent-blue-500" disabled>
-                        <span id="query-cover-value"
-                            class="w-12 text-right text-xs font-mono text-gray-600 dark:text-gray-300">--</span>
-                    </div>
-
-                    <div class="h-4 w-px bg-gray-300 dark:bg-gray-700 mx-0.5"></div>
-
-                    <div class="flex items-center gap-2" title="Minimum subject coverage">
-                        <span class="text-xs font-bold text-green-700 dark:text-green-300">Subject Coverage</span>
-                        <input type="range" id="slider-subject-cover" min="0" max="100" value="100" step="1"
-                            class="w-24 h-2 rounded-lg appearance-none cursor-pointer accent-green-500" disabled>
-                        <span id="subject-cover-value"
-                            class="w-12 text-right text-xs font-mono text-gray-600 dark:text-gray-300">--</span>
-                    </div>
-
-                    <div class="h-4 w-px bg-gray-300 dark:bg-gray-700 mx-0.5"></div>
-
-                    <div class="flex items-center gap-2" title="Maximum identity; lower this value to hide more similar sequences first">
-                        <span class="text-xs font-bold text-purple-700 dark:text-purple-300">Identity %</span>
-                        <input type="range" id="slider-identity" min="0" max="100" value="100" step="1"
-                            class="w-24 h-2 rounded-lg appearance-none cursor-pointer accent-purple-500" disabled>
-                        <span id="identity-value"
-                            class="w-12 text-right text-xs font-mono text-gray-600 dark:text-gray-300">--</span>
-                    </div>
-
-                    <button type="button" id="btn-sequence-filter-reset"
-                        class="px-1.5 py-1 text-xs hover:bg-gray-100 dark:hover:bg-gray-800 rounded text-gray-500 dark:text-gray-300"
-                        title="Reset sequence filters">
-                        <i class="fas fa-undo"></i>
-                    </button>
-                </div>
-            </div>
-
-            <!-- Force new row for Color Groups & Search Branches -->
-            <div style="width: 100%; height: 0; flex-basis: 100%;"></div>
-
-            <!-- Selection Controls (Enhanced) -->
-            <div class="relative flex flex-col gap-1">
-                <span class="text-xs font-bold uppercase tracking-wide text-gray-600 dark:text-gray-400">Color
-                    Groups</span>
-                <div
-                    class="flex gap-1 border border-gray-300 dark:border-journal-dark rounded-lg overflow-visible min-h-[34px] items-center bg-white dark:bg-journal-dark px-1">
-                    <div id="color-group-chips" class="flex items-center gap-1 max-w-[360px] overflow-x-auto py-0.5">
-                    </div>
-
-                    <div id="color-preset-swatches"
-                        class="flex items-center gap-1 border-l border-gray-200 dark:border-gray-700 pl-1 ml-0.5"
-                        aria-label="Preset colors">
-                        <button type="button"
-                            class="btn-color-preset h-6 w-6 rounded border border-black/20 ring-offset-1 hover:ring-2 hover:ring-journal-gold disabled:opacity-30 disabled:cursor-not-allowed"
-                            data-preset-name="Red" data-preset-color="#dc2626" title="Mark selected sequences red"
-                            aria-label="Red" style="background-color: #dc2626;"></button>
-                        <button type="button"
-                            class="btn-color-preset h-6 w-6 rounded border border-black/20 ring-offset-1 hover:ring-2 hover:ring-journal-gold disabled:opacity-30 disabled:cursor-not-allowed"
-                            data-preset-name="Orange" data-preset-color="#ea580c" title="Mark selected sequences orange"
-                            aria-label="Orange" style="background-color: #ea580c;"></button>
-                        <button type="button"
-                            class="btn-color-preset h-6 w-6 rounded border border-black/20 ring-offset-1 hover:ring-2 hover:ring-journal-gold disabled:opacity-30 disabled:cursor-not-allowed"
-                            data-preset-name="Gold" data-preset-color="#ca8a04" title="Mark selected sequences gold"
-                            aria-label="Gold" style="background-color: #ca8a04;"></button>
-                        <button type="button"
-                            class="btn-color-preset h-6 w-6 rounded border border-black/20 ring-offset-1 hover:ring-2 hover:ring-journal-gold disabled:opacity-30 disabled:cursor-not-allowed"
-                            data-preset-name="Green" data-preset-color="#16a34a" title="Mark selected sequences green"
-                            aria-label="Green" style="background-color: #16a34a;"></button>
-                        <button type="button"
-                            class="btn-color-preset h-6 w-6 rounded border border-black/20 ring-offset-1 hover:ring-2 hover:ring-journal-gold disabled:opacity-30 disabled:cursor-not-allowed"
-                            data-preset-name="Teal" data-preset-color="#0d9488" title="Mark selected sequences teal"
-                            aria-label="Teal" style="background-color: #0d9488;"></button>
-                        <button type="button"
-                            class="btn-color-preset h-6 w-6 rounded border border-black/20 ring-offset-1 hover:ring-2 hover:ring-journal-gold disabled:opacity-30 disabled:cursor-not-allowed"
-                            data-preset-name="Blue" data-preset-color="#2563eb" title="Mark selected sequences blue"
-                            aria-label="Blue" style="background-color: #2563eb;"></button>
-                        <button type="button"
-                            class="btn-color-preset h-6 w-6 rounded border border-black/20 ring-offset-1 hover:ring-2 hover:ring-journal-gold disabled:opacity-30 disabled:cursor-not-allowed"
-                            data-preset-name="Purple" data-preset-color="#9333ea" title="Mark selected sequences purple"
-                            aria-label="Purple" style="background-color: #9333ea;"></button>
-                        <button type="button"
-                            class="btn-color-preset h-6 w-6 rounded border border-black/20 ring-offset-1 hover:ring-2 hover:ring-journal-gold disabled:opacity-30 disabled:cursor-not-allowed"
-                            data-preset-name="Pink" data-preset-color="#db2777" title="Mark selected sequences pink"
-                            aria-label="Pink" style="background-color: #db2777;"></button>
-                    </div>
-
-                    <!-- New Set button -->
-                    <button type="button" id="btn-new-selection-set"
-                        class="px-1.5 py-1 text-xs hover:bg-green-100 dark:hover:bg-green-900/30 rounded text-green-600 dark:text-green-400"
-                        title="Create New Color Group">
-                        <i class="fas fa-plus"></i>
-                    </button>
-
-                    <button type="button" id="btn-edit-selection-set-color"
-                        class="px-1.5 py-1 text-xs hover:bg-gray-100 dark:hover:bg-gray-800 rounded text-gray-600 dark:text-gray-300 disabled:opacity-30 disabled:cursor-not-allowed"
-                        title="Change Active Color Group Color">
-                        <i class="fas fa-palette"></i>
-                    </button>
-                    <input type="color" id="input-selection-set-color" class="sr-only" value="#1f77b4">
-
-                    <!-- Delete Set button -->
-                    <button type="button" id="btn-delete-selection-set"
-                        class="px-1.5 py-1 text-xs hover:bg-red-100 dark:hover:bg-red-900/30 rounded text-red-500 dark:text-red-400 disabled:opacity-30 disabled:cursor-not-allowed"
-                        title="Delete Current Color Group" disabled>
-                        <i class="fas fa-trash"></i>
-                    </button>
-
-                    <button type="button" id="btn-uncolor-selection"
-                        class="px-2 py-1 text-xs hover:bg-gray-100 dark:hover:bg-gray-800 rounded text-gray-600 dark:text-gray-300 disabled:opacity-30 disabled:cursor-not-allowed"
-                        title="Clear Color from Current Selection" disabled>Clear Color</button>
-
-                    <div class="h-4 w-px bg-gray-300 dark:bg-gray-700 mx-0.5"></div>
-
-                    <button type="button"
-                        class="btn-selection-action px-2 py-1 text-xs hover:bg-gray-100 dark:hover:bg-gray-800 rounded text-gray-600 dark:text-gray-300"
-                        data-action="all" title="Select All">All</button>
-                    <button type="button"
-                        class="btn-selection-action px-2 py-1 text-xs hover:bg-gray-100 dark:hover:bg-gray-800 rounded text-gray-600 dark:text-gray-300"
-                        data-action="none" title="Select None">None</button>
-                    <div class="relative">
-                        <button type="button" id="btn-selection-more"
-                            class="px-2 py-1 text-xs hover:bg-gray-100 dark:hover:bg-gray-800 rounded text-gray-600 dark:text-gray-300"
-                            title="More selection actions" aria-label="More selection actions" aria-haspopup="true"
-                            aria-expanded="false" aria-controls="selection-more-menu">
-                            <i class="fas fa-ellipsis-v"></i>
-                        </button>
-                        <!-- Dropdown Menu -->
-                        <div id="selection-more-menu"
-                            class="absolute right-0 top-full mt-1 hidden w-40 bg-white dark:bg-gray-900 border border-gray-200 dark:border-gray-700 rounded shadow-lg z-50 py-1">
-                            <button type="button"
-                                class="btn-selection-action block w-full text-left px-3 py-1.5 text-xs hover:bg-gray-100 dark:hover:bg-gray-800"
-                                data-action="all-internal">All Internal Nodes</button>
-                            <button type="button"
-                                class="btn-selection-action block w-full text-left px-3 py-1.5 text-xs hover:bg-gray-100 dark:hover:bg-gray-800"
-                                data-action="all-leaves">All Leaves</button>
-                            <div class="border-t border-gray-200 dark:border-gray-700 my-1"></div>
-                            <button type="button"
-                                class="btn-selection-action block w-full text-left px-3 py-1.5 text-xs hover:bg-gray-100 dark:hover:bg-gray-800"
-                                data-action="select-filtered">Select Filtered</button>
-                            <button type="button"
-                                class="btn-selection-action block w-full text-left px-3 py-1.5 text-xs hover:bg-gray-100 dark:hover:bg-gray-800"
-                                data-action="inverse">Invert Selection</button>
-                            <div class="border-t border-gray-200 dark:border-gray-700 my-1"></div>
-                            <button type="button"
-                                class="btn-selection-action block w-full text-left px-3 py-1.5 text-xs hover:bg-gray-100 dark:hover:bg-gray-800"
-                                data-action="select-ancestors">Select Ancestors (Max Parsimony)</button>
-                            <button type="button"
-                                class="btn-selection-action block w-full text-left px-3 py-1.5 text-xs hover:bg-gray-100 dark:hover:bg-gray-800"
-                                data-action="select-descendants">Select All Descendants</button>
-                        </div>
-                    </div>
-                </div>
-                <div id="color-group-popover"
-                    class="hidden absolute left-0 top-full mt-1 z-50 w-64 rounded-lg border border-gray-200 bg-white p-3 shadow-lg dark:border-gray-700 dark:bg-gray-900">
-                    <label class="block text-[10px] font-bold uppercase tracking-wide text-gray-500 dark:text-gray-400"
-                        for="input-color-group-name">Name</label>
-                    <input type="text" id="input-color-group-name"
-                        class="mt-1 w-full rounded border border-gray-300 bg-white px-2 py-1 text-sm text-gray-900 focus:border-journal-gold focus:ring-journal-gold dark:border-gray-700 dark:bg-journal-dark dark:text-gray-100"
-                        placeholder="Color group name">
-                    <label class="mt-2 block text-[10px] font-bold uppercase tracking-wide text-gray-500 dark:text-gray-400"
-                        for="input-color-group-new-color">Color</label>
-                    <div class="mt-1 grid grid-cols-8 gap-1" aria-label="Preset colors for new group">
-                        <button type="button"
-                            class="btn-color-preset-create h-6 rounded border border-black/20 ring-offset-1 hover:ring-2 hover:ring-journal-gold"
-                            data-preset-name="Red" data-preset-color="#dc2626" title="Use red" aria-label="Red"
-                            style="background-color: #dc2626;"></button>
-                        <button type="button"
-                            class="btn-color-preset-create h-6 rounded border border-black/20 ring-offset-1 hover:ring-2 hover:ring-journal-gold"
-                            data-preset-name="Orange" data-preset-color="#ea580c" title="Use orange" aria-label="Orange"
-                            style="background-color: #ea580c;"></button>
-                        <button type="button"
-                            class="btn-color-preset-create h-6 rounded border border-black/20 ring-offset-1 hover:ring-2 hover:ring-journal-gold"
-                            data-preset-name="Gold" data-preset-color="#ca8a04" title="Use gold" aria-label="Gold"
-                            style="background-color: #ca8a04;"></button>
-                        <button type="button"
-                            class="btn-color-preset-create h-6 rounded border border-black/20 ring-offset-1 hover:ring-2 hover:ring-journal-gold"
-                            data-preset-name="Green" data-preset-color="#16a34a" title="Use green" aria-label="Green"
-                            style="background-color: #16a34a;"></button>
-                        <button type="button"
-                            class="btn-color-preset-create h-6 rounded border border-black/20 ring-offset-1 hover:ring-2 hover:ring-journal-gold"
-                            data-preset-name="Teal" data-preset-color="#0d9488" title="Use teal" aria-label="Teal"
-                            style="background-color: #0d9488;"></button>
-                        <button type="button"
-                            class="btn-color-preset-create h-6 rounded border border-black/20 ring-offset-1 hover:ring-2 hover:ring-journal-gold"
-                            data-preset-name="Blue" data-preset-color="#2563eb" title="Use blue" aria-label="Blue"
-                            style="background-color: #2563eb;"></button>
-                        <button type="button"
-                            class="btn-color-preset-create h-6 rounded border border-black/20 ring-offset-1 hover:ring-2 hover:ring-journal-gold"
-                            data-preset-name="Purple" data-preset-color="#9333ea" title="Use purple" aria-label="Purple"
-                            style="background-color: #9333ea;"></button>
-                        <button type="button"
-                            class="btn-color-preset-create h-6 rounded border border-black/20 ring-offset-1 hover:ring-2 hover:ring-journal-gold"
-                            data-preset-name="Pink" data-preset-color="#db2777" title="Use pink" aria-label="Pink"
-                            style="background-color: #db2777;"></button>
-                    </div>
-                    <div class="mt-1 flex items-center gap-2">
-                        <input type="color" id="input-color-group-new-color"
-                            class="h-8 w-12 rounded border border-gray-300 bg-transparent p-0 dark:border-gray-700"
-                            value="#1f77b4">
-                        <button type="button" id="btn-create-color-group"
-                            class="rounded bg-journal-gold px-3 py-1.5 text-xs font-semibold text-journal-dark hover:bg-journal-gold-light">Create</button>
-                        <button type="button" id="btn-cancel-color-group"
-                            class="rounded px-3 py-1.5 text-xs text-gray-600 hover:bg-gray-100 dark:text-gray-300 dark:hover:bg-gray-800">Cancel</button>
-                    </div>
-                </div>
-            </div>
-
-            <!-- Search Branches (near Color Groups) -->
-            <div class="flex flex-col gap-1">
-                <span class="text-xs font-bold uppercase tracking-wide text-gray-600 dark:text-gray-400">Search
-                    Branches</span>
-                <div
-                    class="flex items-center gap-2 border border-gray-300 dark:border-journal-dark rounded-lg overflow-hidden bg-white dark:bg-journal-dark px-2 py-1 h-[34px]">
-                    <input type="text" id="input-branch-filter" placeholder="Filter branches..."
-                        class="w-32 px-1 py-0.5 text-xs bg-transparent border-none focus:ring-0 text-gray-900 dark:text-gray-100 placeholder-gray-400">
-                    <button id="btn-filter-clear" class="text-gray-400 hover:text-red-500 hidden"><i
-                            class="fas fa-times"></i></button>
-                </div>
-            </div>
-        </div>
-
-        <!-- Right Side: Action Buttons -->
-        <div class="flex flex-wrap gap-2 items-center">
             {% if view_only %}
-            <a href="{{ url_for('main.sequence_entry', clone_job_id=job_id) }}"
-                class="px-4 py-2 text-sm font-semibold rounded-lg bg-teal-600 hover:bg-teal-700 text-white transition-colors shadow-sm flex items-center gap-2 ring-2 ring-teal-500/50"
+            <p class="text-gray-500 dark:text-gray-400 mt-1 text-sm">
+                <i class="fas fa-lock text-xs"></i> You can explore and download this tree, but editing is
+                disabled. Make an editable copy to modify it.
+            </p>
+            {% endif %}
+            {# The pipeline in order (align, trim, tree), then the auto-root outgroup, which
+               replaces the full-width rooting banner that used to sit above the tree. #}
+            <div id="tree-title-chips" class="mt-2 flex flex-wrap items-center gap-1.5 font-mono text-xs text-gray-600 dark:text-gray-300">
+                <a href="/tree?clone_job_id={{ job_id }}"
+                    class="px-2 py-0.5 rounded border border-gray-300 dark:border-gray-600 underline decoration-dotted hover:text-journal-gold hover:border-journal-gold transition-colors"
+                    title="Job {{ job_id }}. Click to clone sequences to a new job">Job {{ job_id[:16] }}{% if job_id|length > 16 %}&hellip;{% endif %}</a>
+                <span class="px-2 py-0.5 rounded border border-gray-300 dark:border-gray-600">{{ align }}</span>
+                {% if trim_display %}
+                <span class="px-2 py-0.5 rounded border border-gray-300 dark:border-gray-600">{{ trim_display }}</span>
+                {% endif %}
+                <span class="px-2 py-0.5 rounded border border-gray-300 dark:border-gray-600">{{ tree }}</span>
+                <span id="notice-rooting"
+                    class="hidden min-w-0 max-w-full sm:max-w-[32rem] items-center gap-1.5 px-2 py-0.5 rounded border border-journal-gold/60 bg-journal-gold/10 text-journal-dark dark:text-gray-100">
+                    <i class="fas fa-anchor text-journal-gold shrink-0"></i>
+                    <span id="notice-rooting-text" class="truncate"></span>
+                </span>
+            </div>
+        </div>
+
+        {# Page-level actions. Hidden on touch devices with the rest of the desktop
+           controls (see tree_viewer.css); the mobile sheet reaches them by id. #}
+        <div id="tree-title-actions" class="flex flex-wrap items-center gap-2 lg:ml-auto shrink-0">
+            {% if view_only %}
+            <a id="btn-make-copy" href="{{ url_for('main.sequence_entry', clone_job_id=job_id) }}"
+                class="px-3 py-2 text-sm font-medium rounded-lg border border-gray-300 dark:border-gray-600 bg-white dark:bg-journal-green text-gray-700 dark:text-gray-100 hover:border-journal-gold transition-colors flex items-center gap-2"
                 title="Create a new submission with these sequences.">
                 <i class="fa fa-clone"></i> Make Editable Copy
             </a>
             {% endif %}
             <button type="button"
-                class="px-4 py-2 text-sm font-semibold rounded-lg bg-gray-500 hover:bg-gray-600 text-white transition-colors shadow-sm flex items-center gap-2"
-                id="btn-recompute"
-                title="Recompute rebuilds the tree from scratch using your remaining (unpruned) sequences.  It's a full re-analysis, not just a redraw. It re-runs alignment, trimming, and tree inference with the job's original settings, then reloads the viewer. Your pruned-taxa list and renames are kept; the current selection is cleared.&#10;Use it after pruning low-quality, contaminant, redundant, or long-branch sequences. Pruning only removes tips, while Recompute recalculates alignment, topology, branch lengths, and support values for what's left.&#10;You usually don't need it after renaming, recoloring, rotating, or rerooting (display-only changes), or if you haven't changed the sequence set.">
-                <i class="fa fa-sync"></i> Recompute
-            </button>
-            {% if not view_only %}
-            <a href="/tree?edit_job_id={{ job_id }}"
-                class="px-4 py-2 text-sm font-semibold rounded-lg bg-green-500 hover:bg-green-600 text-white transition-colors shadow-sm flex items-center gap-2"
-                id="btn-add-sequences-link">
-                <i class="fa fa-plus-circle"></i> Add Seq
-            </a>
-            {% endif %}
-            <button type="button"
-                class="px-4 py-2 text-sm font-semibold rounded-lg bg-yellow-500 hover:bg-yellow-600 text-white transition-colors shadow-sm flex items-center gap-2"
-                id="btn-prune">
-                <i class="fa fa-cut"></i> Prune
+                class="px-3 py-2 text-sm font-medium rounded-lg border border-gray-300 dark:border-gray-600 bg-white dark:bg-journal-green text-gray-700 dark:text-gray-100 hover:border-journal-gold transition-colors flex items-center gap-2 disabled:opacity-50 disabled:cursor-not-allowed"
+                id="btn-alignment-viewer" title="Open the Alignment Viewer for visible/selected tree sequences (A)">
+                <i class="fa fa-stream"></i> Alignment Viewer
             </button>
             <button type="button"
-                class="px-4 py-2 text-sm font-semibold rounded-lg bg-blue-500 hover:bg-blue-600 text-white transition-colors shadow-sm flex items-center gap-2"
-                id="btn-rename">
-                <i class="fa fa-edit"></i> Rename
-            </button>
-            <button type="button"
-                class="px-4 py-2 text-sm font-semibold rounded-lg bg-journal-gold hover:bg-journal-gold-light text-journal-dark transition-colors shadow-sm flex items-center gap-2"
-                id="btn-reroot">
-                <i class="fa fa-map-pin"></i> Reroot
-            </button>
-            <button type="button"
-                class="px-4 py-2 text-sm font-semibold rounded-lg bg-indigo-500 hover:bg-indigo-600 text-white transition-colors shadow-sm flex items-center gap-2"
-                id="btn-midpoint">
-                <i class="fa fa-balance-scale"></i> Midpoint
-            </button>
-            <!-- Alan 8/24/26 - Single-level undo. Rendered in view-only mode too, because
-                 collapsing a clade is a viewer-only display change that read-only visitors
-                 may make and therefore may also take back; the button stays disabled unless
-                 something is actually undoable. -->
-            <button type="button"
-                class="px-4 py-2 text-sm font-semibold rounded-lg bg-slate-600 hover:bg-slate-700 text-white transition-colors shadow-sm flex items-center gap-2 disabled:opacity-50 disabled:cursor-not-allowed"
-                id="btn-undo"
-                title="Nothing to undo yet (Ctrl/Cmd+Z)"
-                disabled>
-                <i class="fa fa-rotate-left"></i> Undo
-            </button>
-            <div class="flex items-center gap-1 px-2 py-1 rounded-lg bg-gray-100 dark:bg-journal-dark border border-gray-300 dark:border-gray-600"
-                 title="Auto root chooses a useful display root for BLAST-result trees; it is not necessarily the true evolutionary root.">
-                <label for="rooting-mode-select" class="text-sm font-semibold text-gray-700 dark:text-gray-200">Root:</label>
-                <select id="rooting-mode-select"
-                        class="text-sm bg-white dark:bg-journal-dark text-gray-900 dark:text-gray-100 border border-gray-300 dark:border-gray-600 rounded px-2 py-1 focus:ring-2 focus:ring-blue-500">
-                    <option value="auto">Auto root</option>
-                    <option value="midpoint">Midpoint root</option>
-                    <option value="most_divergent_hit">Most divergent hit</option>
-                    <option value="unrooted" disabled>Unrooted (coming soon)</option>
-                    <option value="manual">Manual root here</option>
-                </select>
-            </div>
-            <button type="button"
-                class="hidden px-4 py-2 text-sm font-semibold rounded-lg bg-blue-600 hover:bg-blue-700 text-white transition-colors shadow-sm flex items-center gap-2 disabled:opacity-50 disabled:cursor-not-allowed"
-                id="btn-set-soi"
-                title="Set the selected tip as the sequence of interest (focal/query) for Auto root."
-                disabled>
-                <i class="fa fa-crosshairs"></i> Set Sequence of Interest
-            </button>
-            <button type="button"
-                class="px-4 py-2 text-sm font-semibold rounded-lg bg-gray-600 hover:bg-gray-700 text-white transition-colors shadow-sm flex items-center gap-2"
-                id="btn-deselect" title="Deselect current selection (D)">
-                <i class="fa fa-mouse-pointer"></i> Deselect
-            </button>
-            <button type="button"
-                class="px-4 py-2 text-sm font-semibold rounded-lg bg-teal-700 hover:bg-teal-800 text-white transition-colors shadow-sm flex items-center gap-2"
+                class="px-3 py-2 text-sm font-medium rounded-lg border border-gray-300 dark:border-gray-600 bg-white dark:bg-journal-green text-gray-700 dark:text-gray-100 hover:border-journal-gold transition-colors flex items-center gap-2"
                 id="btn-annotations"
                 title="Label clades beside the tree — subgenera, sections, subsections or any custom grouping — on independently styled layers.">
                 <i class="fa fa-tags"></i> Annotations
             </button>
+
+            {# A native <details> so every download stays reachable even if the viewer's
+               JavaScript fails to start; the controller only adds click-away and Escape. #}
+            <details id="export-menu-wrap" class="relative">
+                <summary id="btn-export-menu"
+                    class="px-3 py-2 text-sm font-medium rounded-lg border border-gray-300 dark:border-gray-600 bg-white dark:bg-journal-green text-gray-700 dark:text-gray-100 hover:border-journal-gold transition-colors flex items-center gap-2 cursor-pointer select-none"
+                    title="Download the tree, a figure, or the sequences">
+                    <i class="fas fa-download"></i> Export <i class="fas fa-chevron-down text-[10px] opacity-70"></i>
+                </summary>
+                <div id="export-menu"
+                    class="absolute right-0 top-full mt-1 z-40 w-72 max-w-[calc(100vw-2rem)] rounded-lg border border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-900 shadow-lg py-1 text-sm">
+                    <p class="tree-menu-heading">Tree</p>
+                    <button type="button" id="newick-link-pruned" class="tree-menu-item"
+                        title="The tree as currently displayed, with pruning, renames and rooting applied">
+                        Current Newick
+                    </button>
+                    <a id="newick-link-original" href="#" target="_blank" class="tree-menu-item"
+                        title="The tree exactly as the tree builder produced it">
+                        Original Newick
+                    </a>
+                    <a id="nexus-link" href="#" target="_blank" class="tree-menu-item">
+                        NEXUS tree
+                    </a>
+                    {% if job_details.get('tree_method', '')|lower == 'mrbayes' %}
+                    <a id="export-mrbayes" href="/api/job/{{ job_id }}/download/mrbayes" class="tree-menu-item"
+                        title="NEXUS command file, raw .p parameter traces, .t tree traces, and MrBayes summaries">
+                        MrBayes analysis files
+                    </a>
+                    {% endif %}
+
+                    <p class="tree-menu-heading">Image</p>
+                    <button type="button" id="btn-save-svg" class="tree-menu-item">SVG</button>
+                    <button type="button" id="btn-save-png" class="tree-menu-item">PNG</button>
+                    <button type="button" id="btn-save-jpg" class="tree-menu-item">JPG</button>
+
+                    <p class="tree-menu-heading">Sequences</p>
+                    <a id="fasta-edited" download class="tree-menu-item edited-fasta-link is-unavailable" aria-disabled="true"
+                        tabindex="-1" title="Available after pruning or renaming sequences.">
+                        Edited FASTA
+                        <span class="tree-menu-hint edited-fasta-hint-unavailable">after prune or rename</span>
+                        <span class="tree-menu-hint edited-fasta-hint-available">edits applied</span>
+                    </a>
+                    <a id="fasta-original" href="#" target="_blank" class="tree-menu-item"
+                        title="Unaligned processed sequence set used to build this tree">
+                        Processed input FASTA
+                    </a>
+                    <a id="export-aligned-fasta" href="/api/job/{{ job_id }}/download/fasta/aligned" download class="tree-menu-item"
+                        title="Aligned FASTA before trimming; this is also the tree input when trimming is disabled">
+                        Aligned FASTA <span class="tree-menu-hint">before trimming</span>
+                    </a>
+                    {% set export_trimming_details = job_details.get('trimming_details') or {} %}
+                    {% set export_terminal_trim = export_trimming_details.get('terminal_overhang_trim') or {} %}
+                    {% set export_trim_method = job_details.get('trimming_method', 'none')|lower %}
+                    {% set export_has_trimming = export_trim_method not in ['none', ''] or export_terminal_trim.get('enabled') %}
+                    {% if export_has_trimming %}
+                    <a id="export-trimmed-fasta" href="/api/job/{{ job_id }}/download/fasta/trimmed" download class="tree-menu-item"
+                        title="Final trimmed alignment supplied to the tree builder">
+                        Trimmed FASTA <span class="tree-menu-hint">tree input</span>
+                    </a>
+                    {% endif %}
+                    {% if export_trimming_details.get('report_file') %}
+                    <a id="export-trimming-inspection" href="/api/job/{{ job_id }}/download/alignment/inspection" download class="tree-menu-item"
+                        title="Before/after FASTA files and a colored HTML report marking retained and removed columns">
+                        Trimming inspection <span class="tree-menu-hint">.zip</span>
+                    </a>
+                    {% endif %}
+                </div>
+            </details>
+
+            {% if claude_review_enabled %}
+            <!-- Claude review of the alignment and tree: the page's primary action -->
             <button type="button"
-                class="px-4 py-2 text-sm font-semibold rounded-lg bg-purple-600 hover:bg-purple-700 text-white transition-colors shadow-sm flex items-center gap-2 disabled:opacity-50 disabled:cursor-not-allowed"
-                id="btn-alignment-viewer" title="Open the Alignment Viewer for visible/selected tree sequences (A)">
-                <i class="fa fa-stream"></i> Alignment Viewer
+                class="px-4 py-2 text-sm font-semibold rounded-lg bg-journal-gold hover:bg-journal-gold-light text-journal-dark transition-colors flex items-center gap-2 disabled:opacity-60 disabled:cursor-not-allowed"
+                id="btn-claude-review" title="Ask Claude to assess this alignment and tree">
+                <i class="fas fa-wand-magic-sparkles"></i> Analyze
             </button>
+            {% endif %}
         </div>
     </div>
-
-    <!-- Export Links Row -->
-    <div class="mt-4 pt-4 border-t border-gray-200 dark:border-journal-dark">
-        <div class="flex flex-wrap items-center gap-x-6 gap-y-2 text-sm">
-            <a id="fasta-edited" download class="edited-fasta-link is-unavailable" aria-disabled="true"
-                tabindex="-1" title="Available after pruning or renaming sequences.">
-                <i class="fas fa-download text-xs"></i> Edited FASTA
-            </a>
-            <a id="newick-link-original" href="#" target="_blank"
-                class="text-journal-gold hover:text-journal-gold-light transition-colors flex items-center gap-1">
-                <i class="fas fa-download text-xs"></i> Original Newick
-            </a>
-            <a id="newick-link-pruned" href="#" target="_blank"
-                class="text-journal-gold hover:text-journal-gold-light transition-colors flex items-center gap-1">
-                <i class="fas fa-download text-xs"></i> Current Newick
-            </a>
-            <a id="nexus-link" href="#" target="_blank"
-                class="text-journal-gold hover:text-journal-gold-light transition-colors flex items-center gap-1">
-                <i class="fas fa-download text-xs"></i> NEXUS Tree
-            </a>
-            {% if job_details.get('tree_method', '')|lower == 'mrbayes' %}
-            <a href="/api/job/{{ job_id }}/download/mrbayes"
-                class="text-journal-gold hover:text-journal-gold-light transition-colors flex items-center gap-1"
-                title="NEXUS command file, raw .p parameter traces, .t tree traces, and MrBayes summaries">
-                <i class="fas fa-download text-xs"></i> MrBayes Analysis Files
-            </a>
-            {% endif %}
-            <a id="fasta-original" href="#" target="_blank"
-                class="text-journal-gold hover:text-journal-gold-light transition-colors flex items-center gap-1"
-                title="Unaligned processed sequence set used to build this tree">
-                <i class="fas fa-download text-xs"></i> Processed Input FASTA
-            </a>
-            <a href="/api/job/{{ job_id }}/download/fasta/aligned" download
-                class="text-journal-gold hover:text-journal-gold-light transition-colors flex items-center gap-1"
-                title="Aligned FASTA before trimming; this is also the tree input when trimming is disabled">
-                <i class="fas fa-download text-xs"></i> Aligned FASTA (Before Trimming)
-            </a>
-            {% set export_trimming_details = job_details.get('trimming_details') or {} %}
-            {% set export_terminal_trim = export_trimming_details.get('terminal_overhang_trim') or {} %}
-            {% set export_trim_method = job_details.get('trimming_method', 'none')|lower %}
-            {% set export_has_trimming = export_trim_method not in ['none', ''] or export_terminal_trim.get('enabled') %}
-            {% if export_has_trimming %}
-            <a href="/api/job/{{ job_id }}/download/fasta/trimmed" download
-                class="text-journal-gold hover:text-journal-gold-light transition-colors flex items-center gap-1"
-                title="Final trimmed alignment supplied to the tree builder">
-                <i class="fas fa-download text-xs"></i> Trimmed FASTA (Tree Input)
-            </a>
-            {% endif %}
-            {% if export_trimming_details.get('report_file') %}
-            <a href="/api/job/{{ job_id }}/download/alignment/inspection" download
-                class="text-journal-gold hover:text-journal-gold-light transition-colors flex items-center gap-1"
-                title="Before/after FASTA files and a colored HTML report marking retained and removed columns">
-                <i class="fas fa-search text-xs"></i> Trimming Inspection ZIP
-            </a>
-            {% endif %}
-            <a id="btn-save-svg" href="#"
-                class="text-journal-gold hover:text-journal-gold-light transition-colors flex items-center gap-1">
-                <i class="fas fa-download text-xs"></i> Download SVG
-            </a>
-            <a id="btn-save-jpg" href="#"
-                class="text-journal-gold hover:text-journal-gold-light transition-colors flex items-center gap-1">
-                <i class="fas fa-image text-xs"></i> Download JPG
-            </a>
-            <a id="btn-save-png" href="#"
-                class="text-journal-gold hover:text-journal-gold-light transition-colors flex items-center gap-1">
-                <i class="fas fa-image text-xs"></i> Download PNG
-            </a>
-        </div>
-    </div>
-
-    <!-- Status Message -->
-    <div class="mt-3">
-        <div id="status-message" class="hidden px-4 py-2 rounded-lg text-sm" role="alert"></div>
-    </div>
-
-    <!-- Hidden viewer select (kept for compatibility) -->
-    <select id="viewer-select" class="hidden">
-        <option value="phylotree" selected>Phylotree v2</option>
-        <option value="d3">D3 Standard</option>
-    </select>
 </div>
 
 <!-- Keyboard Shortcuts Modal -->
@@ -694,6 +212,8 @@
                     <dd>Open the Alignment Viewer (<kbd class="rounded border border-gray-300 bg-gray-100 px-2 py-0.5 font-mono dark:border-gray-600 dark:bg-journal-dark">V</kbd> also works)</dd>
                     <dt><kbd class="rounded border border-gray-300 bg-gray-100 px-2 py-0.5 font-mono dark:border-gray-600 dark:bg-journal-dark">S</kbd></dt>
                     <dd>Cycle node sorting</dd>
+                    <dt><kbd class="rounded border border-gray-300 bg-gray-100 px-2 py-0.5 font-mono dark:border-gray-600 dark:bg-journal-dark">F</kbd></dt>
+                    <dd>Fill the window with the tree and its toolbar; press <kbd class="rounded border border-gray-300 bg-gray-100 px-2 py-0.5 font-mono dark:border-gray-600 dark:bg-journal-dark">F</kbd> again or <kbd class="rounded border border-gray-300 bg-gray-100 px-2 py-0.5 font-mono dark:border-gray-600 dark:bg-journal-dark">Esc</kbd> to leave</dd>
                     <dt><kbd class="rounded border border-gray-300 bg-gray-100 px-2 py-0.5 font-mono dark:border-gray-600 dark:bg-journal-dark">Left-drag</kbd></dt>
                     <dd>Select sequences within a selection box</dd>
                     <dt><kbd class="rounded border border-gray-300 bg-gray-100 px-2 py-0.5 font-mono dark:border-gray-600 dark:bg-journal-dark">Ctrl/Cmd + left-drag</kbd></dt>
@@ -1051,62 +571,481 @@
 
 <!-- Tree Container -->
 <div id="tree-viewer-panel" class="bg-white dark:bg-journal-green rounded-xl shadow-lg p-6 transition-colors">
-    {# Persistent notices. The rooting line was previously only a sticky toast, which
-       vanished on the next action; the duplicate line points at the table further down. #}
-    {% set dup_filters = (job_details.get('import_filter_details') or {}).get('duplicates') %}
-    <div id="tree-notices" class="flex flex-col gap-2 mb-4 {% if not dup_filters %}hidden{% endif %}">
-        <div id="notice-rooting"
-            class="hidden items-start gap-2 text-sm rounded-lg px-3 py-2 bg-journal-gold/10 text-journal-dark dark:text-gray-100 ring-1 ring-journal-gold/40">
-            <i class="fas fa-anchor mt-0.5 text-journal-gold shrink-0"></i>
-            <span id="notice-rooting-text" class="min-w-0 break-words"></span>
+    {# The tree toolbar. It lives inside the tree panel so that full screen, which
+       expands this panel to fill the window, takes the controls along. Hidden on
+       touch devices, which have #tree-mobile-toolbar instead (see tree_viewer.css). #}
+    <div id="tree-toolbar" class="tree-toolbar" role="toolbar" aria-label="Tree controls">
+        {# Row 1: how the tree is shown. #}
+        <div class="tree-toolbar-row" id="tree-toolbar-view">
+            <div class="tree-tool-group" role="group" aria-label="Layout">
+                <button type="button" class="tree-tool" id="btn-layout-linear" title="Linear layout" aria-pressed="true">
+                    <i class="fa fa-align-left"></i> Linear
+                </button>
+                <button type="button" class="tree-tool" id="btn-layout-radial" title="Radial layout" aria-pressed="false">
+                    <i class="fa fa-circle-notch"></i> Radial
+                </button>
+            </div>
+            <div class="tree-tool-group" role="group" aria-label="Zoom">
+                <button type="button" class="tree-tool tree-tool-icon" id="btn-zoom-out" title="Zoom out: magnify the whole view (spacing is under Layout)" aria-label="Zoom out">
+                    <i class="fas fa-search-minus"></i>
+                </button>
+                <button type="button" class="tree-tool tree-tool-icon" id="btn-zoom-in" title="Zoom in: magnify the whole view (spacing is under Layout)" aria-label="Zoom in">
+                    <i class="fas fa-search-plus"></i>
+                </button>
+                <button type="button" class="tree-tool" id="btn-fit" title="Fit to screen">
+                    <i class="fa fa-compress-arrows-alt"></i> Fit
+                </button>
+            </div>
+            <span class="tree-tool-divider" aria-hidden="true"></span>
+            <button type="button" class="tree-tool" id="btn-align-tips" title="Align tip labels in one column" aria-pressed="false">
+                <i class="fa fa-indent"></i> Align tips
+            </button>
+            <button type="button" class="tree-tool" id="btn-ladderize" title="Cycle node sorting (S)">
+                <i class="fa fa-sort"></i> Sort: original
+            </button>
+            {# Fonts, tip label gap and spacing: one click away, floating over the tree so it is
+               not narrowed, and left open while +/- are pressed; click elsewhere or Esc closes it. #}
+            <div class="relative" id="layout-menu-wrap">
+                <button type="button" class="tree-tool" id="btn-layout-menu" aria-haspopup="true"
+                    aria-expanded="false" aria-controls="layout-menu" title="Font sizes, tip label gap and spacing">
+                    <i class="fas fa-text-height"></i> Layout <i class="fas fa-chevron-down text-[10px] opacity-70"></i>
+                </button>
+                <div id="layout-menu" class="tree-popover hidden" role="group" aria-label="Layout settings">
+                    <div class="settings-field">
+                        <label for="input-support-font">Support font</label>
+                        <input type="number" id="input-support-font" class="settings-input"
+                            value="9" step="1" min="6" max="24">
+                    </div>
+                    <div class="settings-field">
+                        <label for="input-tip-font">Tip font</label>
+                        <input type="number" id="input-tip-font" class="settings-input"
+                            value="12" step="1" min="8" max="24">
+                    </div>
+                    <div class="settings-field" title="Horizontal space between branch tips and their labels.">
+                        <span>Tip label gap</span>
+                        <span class="settings-stepper">
+                            <button type="button" id="btn-tip-label-gap-dec" aria-label="Decrease tip label gap"><i class="fas fa-minus"></i></button>
+                            <span class="settings-value"><span id="tip-label-gap-value">2</span> px</span>
+                            <button type="button" id="btn-tip-label-gap-inc" aria-label="Increase tip label gap"><i class="fas fa-plus"></i></button>
+                        </span>
+                    </div>
+                    <div class="settings-field" title="Vertical spacing between tips">
+                        <span>Vertical spacing</span>
+                        <span class="settings-stepper">
+                            <button type="button" id="btn-spacing-y-dec" aria-label="Decrease vertical spacing"><i class="fas fa-minus"></i></button>
+                            <button type="button" id="btn-spacing-y-inc" aria-label="Increase vertical spacing"><i class="fas fa-plus"></i></button>
+                        </span>
+                    </div>
+                    <div class="settings-field" title="Horizontal spacing (branch length scale)">
+                        <span>Horizontal spacing</span>
+                        <span class="settings-stepper">
+                            <button type="button" id="btn-spacing-x-dec" aria-label="Decrease horizontal spacing"><i class="fas fa-minus"></i></button>
+                            <button type="button" id="btn-spacing-x-inc" aria-label="Increase horizontal spacing"><i class="fas fa-plus"></i></button>
+                        </span>
+                    </div>
+                </div>
+            </div>
+            <span class="tree-tool-divider" aria-hidden="true"></span>
+            <div class="tree-tool-root"
+                title="Auto root chooses a useful display root for BLAST-result trees; it is not necessarily the true evolutionary root.">
+                <label for="rooting-mode-select">Root</label>
+                <select id="rooting-mode-select" class="tree-tool-select">
+                    <option value="auto">Auto root</option>
+                    <option value="midpoint">Midpoint root</option>
+                    <option value="original">Original root (midpoint off)</option>
+                    <option value="most_divergent_hit">Most divergent hit</option>
+                    {# "manual" only reports the current state (a node the user rooted on) and is
+                       shown only then; "pick" is the action. Keeping them apart means choosing
+                       "Manual: click a node…" always fires, even on a tree already rooted by hand. #}
+                    <option value="manual" disabled hidden>Manual root</option>
+                    {# State-only too: an outgroup root, or one the viewer cannot name (e.g. a
+                       recompute that could not reapply the rooting). Without them the menu
+                       kept showing the last choice, so re-choosing it fired no change. #}
+                    <option value="outgroup" disabled hidden>Outgroup root</option>
+                    <option value="current" disabled hidden>Current root</option>
+                    <option value="pick">Manual: click a node&hellip;</option>
+                    <option value="unrooted" disabled>Unrooted (coming soon)</option>
+                </select>
+                {# Shown only while manual rerooting waits for a node to be clicked. #}
+                <button type="button" class="tree-tool hidden" id="btn-reroot" title="Cancel rerooting (Esc)">
+                    <i class="fa fa-times"></i> Cancel reroot
+                </button>
+            </div>
+            <div class="tree-toolbar-end">
+                <button type="button" class="tree-tool" id="btn-display-settings"
+                    title="Show or hide display settings: support, sequence filters and colors"
+                    aria-expanded="false" aria-controls="tree-settings-panel">
+                    <i class="fas fa-sliders-h"></i> Display settings
+                </button>
+                <button type="button" class="tree-tool tree-tool-icon" id="btn-fullscreen"
+                    title="Fill the window with the tree (F)" aria-label="Full screen" aria-pressed="false">
+                    <i class="fa fa-expand"></i>
+                </button>
+                <button type="button" class="tree-tool tree-tool-icon" id="btn-tree-shortcuts-help"
+                    title="Shortcuts, and how Collapse, Prune, Recompute and Undo differ (?)" aria-label="Keyboard shortcuts">
+                    ?
+                </button>
+            </div>
         </div>
-        {% if dup_filters %}
-        <div
-            class="flex items-start gap-2 text-sm rounded-lg px-3 py-2 bg-amber-50 dark:bg-amber-900/20 text-amber-900 dark:text-amber-100 ring-1 ring-amber-400/50">
-            <i class="fas fa-clone mt-0.5 shrink-0"></i>
-            <span class="min-w-0">
-                <strong>{{ dup_filters.get('removed_count', 0) }}</strong>
-                same-observation record{{ '' if dup_filters.get('removed_count') == 1 else 's' }}
-                excluded after all input sources were merged.
-                <a href="#duplicate-records"
-                    class="underline decoration-dotted hover:text-journal-gold font-medium">Scroll
-                    down to see them</a>{% if view_only %}; make an editable copy first if you want to rebuild with them{% else %}, or rebuild the tree with them included{% endif %}.
-            </span>
+        {# Row 2: editing the tree and working with the selection. #}
+        <div class="tree-toolbar-row" id="tree-toolbar-edit">
+            {% if not view_only %}
+            <a href="/tree?edit_job_id={{ job_id }}" class="tree-tool" id="btn-add-sequences-link"
+                title="Add sequences to this tree in the Tree Builder">
+                <i class="fa fa-plus-circle"></i> Add seq
+            </a>
+            {% endif %}
+            <button type="button" class="tree-tool" id="btn-recompute"
+                title="Recompute rebuilds the tree from scratch using your remaining (unpruned) sequences.  It's a full re-analysis, not just a redraw. It re-runs alignment, trimming, and tree inference with the job's original settings, then reloads the viewer. Your pruned-taxa list and renames are kept; the current selection is cleared.&#10;Use it after pruning low-quality, contaminant, redundant, or long-branch sequences. Pruning only removes tips, while Recompute recalculates alignment, topology, branch lengths, and support values for what's left.&#10;You usually don't need it after renaming, recoloring, rotating, or rerooting (display-only changes), or if you haven't changed the sequence set.">
+                <i class="fa fa-sync"></i> Recompute
+            </button>
+            <!-- Alan 8/24/26 - Single-level undo. Rendered in view-only mode too, because
+                 collapsing a clade is a viewer-only display change that read-only visitors
+                 may make and therefore may also take back; the button stays disabled unless
+                 something is actually undoable. -->
+            <button type="button" class="tree-tool" id="btn-undo" title="Nothing to undo yet (Ctrl/Cmd+Z)" disabled>
+                <i class="fa fa-rotate-left"></i> Undo
+            </button>
+            <span class="tree-tool-divider" aria-hidden="true"></span>
+            {# Selection actions. The controller relabels them with the selection count. #}
+            <button type="button" class="tree-tool tree-tool-danger" id="btn-prune" title="Select nodes to prune" disabled>
+                <i class="fa fa-cut"></i> Prune
+            </button>
+            <button type="button" class="tree-tool" id="btn-rename" title="Select sequences to rename" disabled>
+                <i class="fa fa-edit"></i> Rename
+            </button>
+            <button type="button" class="tree-tool" id="btn-deselect" title="No current selection (D)" disabled>
+                <i class="fa fa-mouse-pointer"></i> Deselect
+            </button>
+            {# Shown only while Auto root needs a focal tip and exactly one tip is selected. #}
+            <button type="button" class="tree-tool hidden" id="btn-set-soi"
+                title="Set the selected tip as the sequence of interest (focal/query) for Auto root."
+                disabled>
+                <i class="fa fa-crosshairs"></i> Set Sequence of Interest
+            </button>
+            <div class="tree-toolbar-end">
+                <div class="relative">
+                    <button type="button" class="tree-tool" id="btn-selection-more"
+                        title="Selection actions" aria-haspopup="true" aria-expanded="false"
+                        aria-controls="selection-more-menu">
+                        Select <i class="fas fa-chevron-down text-[10px] opacity-70"></i>
+                    </button>
+                    <div id="selection-more-menu"
+                        class="absolute right-0 top-full mt-1 hidden w-60 bg-white dark:bg-gray-900 border border-gray-200 dark:border-gray-700 rounded-lg shadow-lg z-50 py-1 text-sm">
+                        <button type="button" class="btn-selection-action tree-menu-item" data-action="all">All</button>
+                        <button type="button" class="btn-selection-action tree-menu-item" data-action="none">None</button>
+                        <div class="border-t border-gray-200 dark:border-gray-700 my-1"></div>
+                        <button type="button" class="btn-selection-action tree-menu-item" data-action="all-internal">All internal nodes</button>
+                        <button type="button" class="btn-selection-action tree-menu-item" data-action="all-leaves">All leaves</button>
+                        <div class="border-t border-gray-200 dark:border-gray-700 my-1"></div>
+                        <button type="button" class="btn-selection-action tree-menu-item" data-action="select-filtered">Select filtered</button>
+                        <button type="button" class="btn-selection-action tree-menu-item" data-action="inverse">Invert selection</button>
+                        <div class="border-t border-gray-200 dark:border-gray-700 my-1"></div>
+                        <button type="button" class="btn-selection-action tree-menu-item" data-action="select-ancestors">Select ancestors (max parsimony)</button>
+                        <button type="button" class="btn-selection-action tree-menu-item" data-action="select-descendants">Select all descendants</button>
+                    </div>
+                </div>
+                <div class="tree-tool-search">
+                    <i class="fas fa-search" aria-hidden="true"></i>
+                    <input type="text" id="input-branch-filter" placeholder="Filter branches&hellip;"
+                        aria-label="Filter branches">
+                    <button type="button" id="btn-filter-clear" class="hidden" title="Clear filter" aria-label="Clear filter">
+                        <i class="fas fa-times"></i>
+                    </button>
+                </div>
+            </div>
         </div>
-        {% endif %}
     </div>
-    <div id="tree-mobile-toolbar" class="tree-mobile-only" aria-label="Tree navigation controls">
-        <button type="button" class="tree-mobile-tool" data-mobile-trigger="btn-fit" aria-label="Fit tree">
-            <i class="fa fa-compress-arrows-alt"></i><span>Fit</span>
-        </button>
-        <button type="button" class="tree-mobile-tool" data-mobile-trigger="btn-zoom-out" aria-label="Zoom out">
-            <i class="fa fa-minus"></i><span>Out</span>
-        </button>
-        <button type="button" class="tree-mobile-tool" data-mobile-trigger="btn-zoom-in" aria-label="Zoom in">
-            <i class="fa fa-plus"></i><span>In</span>
-        </button>
-        <button type="button" id="btn-mobile-select" class="tree-mobile-tool tree-mobile-mode" aria-pressed="false">
-            <i class="fa fa-hand-pointer"></i><span>Select</span>
-        </button>
-        <button type="button" id="btn-mobile-more" class="tree-mobile-tool" aria-expanded="false" aria-controls="tree-mobile-more">
-            <i class="fa fa-ellipsis-h"></i><span>More</span>
-        </button>
-        <button type="button" id="btn-mobile-expand" class="tree-mobile-tool" aria-pressed="false">
-            <i class="fa fa-expand"></i><span>Expand</span>
-        </button>
-        <button type="button" id="btn-mobile-undo" class="tree-mobile-tool tree-mobile-undo" data-mobile-trigger="btn-undo" disabled>
-            <i class="fa fa-rotate-left"></i><span>Undo</span>
-        </button>
-    </div>
-    <div id="tree-mobile-mode-status" class="tree-mobile-only tree-mobile-mode-status" role="status">
-        Navigate mode: drag to pan, pinch to zoom
-    </div>
-    <div id="tree-container" class="bg-white dark:bg-black rounded-lg p-4" style="min-height: 600px;">
-        <div class="text-center text-gray-400 dark:text-gray-500 mt-20">
-            <i class="fas fa-spinner fa-spin text-3xl mb-3"></i>
-            <p>Loading tree...</p>
+    {# The tree and, beside it, the display settings panel. #}
+    <div id="tree-workspace" class="tree-workspace">
+        <div id="tree-stage" class="tree-stage">
+        {# Persistent notices. The rooting line now lives as a chip under the page title;
+           the duplicate line is a single dismissible row pointing at the table further down. #}
+        {% set dup_filters = (job_details.get('import_filter_details') or {}).get('duplicates') %}
+        <div id="tree-notices" class="flex flex-col gap-2 mb-4 {% if not dup_filters %}hidden{% endif %}">
+            {% if dup_filters %}
+            <div id="notice-duplicates"
+                class="flex items-center gap-2 text-sm rounded-lg px-3 py-1.5 bg-amber-50 dark:bg-amber-900/20 text-amber-900 dark:text-amber-100 ring-1 ring-amber-400/50">
+                <i class="fas fa-clone shrink-0"></i>
+                <span class="min-w-0 flex-1">
+                    <strong>{{ dup_filters.get('removed_count', 0) }}</strong>
+                    same-observation record{{ '' if dup_filters.get('removed_count') == 1 else 's' }}
+                    excluded after all input sources were merged.
+                    <a href="#duplicate-records"
+                        class="underline decoration-dotted hover:text-journal-gold font-medium">See them</a>{% if view_only %}; make an editable copy to rebuild with them{% else %} or
+                    <a href="#btn-rebuild-with-duplicates"
+                        class="underline decoration-dotted hover:text-journal-gold font-medium">rebuild with them included</a>{% endif %}.
+                </span>
+                <button type="button" id="btn-dismiss-duplicates-notice"
+                    class="shrink-0 p-1 rounded text-amber-800/70 hover:text-amber-900 hover:bg-amber-100 dark:text-amber-100/70 dark:hover:text-amber-50 dark:hover:bg-amber-900/40"
+                    title="Dismiss this notice for this job" aria-label="Dismiss this notice">
+                    <i class="fas fa-times"></i>
+                </button>
+            </div>
+            {% endif %}
         </div>
+        <div id="tree-mobile-toolbar" class="tree-mobile-only" aria-label="Tree navigation controls">
+            <button type="button" class="tree-mobile-tool" data-mobile-trigger="btn-fit" aria-label="Fit tree">
+                <i class="fa fa-compress-arrows-alt"></i><span>Fit</span>
+            </button>
+            <button type="button" class="tree-mobile-tool" data-mobile-trigger="btn-zoom-out" aria-label="Zoom out">
+                <i class="fa fa-minus"></i><span>Out</span>
+            </button>
+            <button type="button" class="tree-mobile-tool" data-mobile-trigger="btn-zoom-in" aria-label="Zoom in">
+                <i class="fa fa-plus"></i><span>In</span>
+            </button>
+            <button type="button" id="btn-mobile-select" class="tree-mobile-tool tree-mobile-mode" aria-pressed="false">
+                <i class="fa fa-hand-pointer"></i><span>Select</span>
+            </button>
+            <button type="button" id="btn-mobile-more" class="tree-mobile-tool" aria-expanded="false" aria-controls="tree-mobile-more">
+                <i class="fa fa-ellipsis-h"></i><span>More</span>
+            </button>
+            <button type="button" id="btn-mobile-expand" class="tree-mobile-tool" aria-pressed="false">
+                <i class="fa fa-expand"></i><span>Expand</span>
+            </button>
+            <button type="button" id="btn-mobile-undo" class="tree-mobile-tool tree-mobile-undo" data-mobile-trigger="btn-undo" disabled>
+                <i class="fa fa-rotate-left"></i><span>Undo</span>
+            </button>
+        </div>
+        <div id="tree-mobile-mode-status" class="tree-mobile-only tree-mobile-mode-status" role="status">
+            Navigate mode: drag to pan, pinch to zoom
+        </div>
+        {# Zero-height sticky anchor: the status message floats over the top of the tree
+           instead of pushing it down. It sits with the tree rather than with the desktop
+           controls, so it is also visible on touch devices, where those are hidden. #}
+        <div id="tree-status-dock">
+            <div id="status-message" class="hidden px-4 py-2 rounded-lg text-sm" role="alert"
+                title="Click to dismiss"></div>
+        </div>
+        <div id="tree-container" class="bg-white dark:bg-black rounded-lg p-4" style="min-height: 600px;">
+            <div class="text-center text-gray-400 dark:text-gray-500 mt-20">
+                <i class="fas fa-spinner fa-spin text-3xl mb-3"></i>
+                <p>Loading tree...</p>
+            </div>
+        </div>
+        </div>
+
+        {# Display settings, beside the tree. Opened from the toolbar; open/closed and the
+           last tab are remembered in this browser (tree_viewer_controller.js). Every control
+           keeps the id and element structure the controller already reads: in particular
+           the first <span> beside each threshold input is its label, which updateSupportUI()
+           rewrites to name the support scale. #}
+        <aside id="tree-settings-panel" class="tree-settings-panel" aria-label="Display settings" hidden>
+            <div class="tree-settings-inner">
+                <div class="tree-settings-head">
+                    <div class="tree-settings-tabs" role="tablist" aria-label="Display settings">
+                        <button type="button" role="tab" id="tab-settings-support" data-settings-tab="support"
+                            aria-controls="settings-panel-support" aria-selected="true">Support</button>
+                        <button type="button" role="tab" id="tab-settings-sequences" data-settings-tab="sequences"
+                            aria-controls="settings-panel-sequences" aria-selected="false" tabindex="-1">Sequence filters</button>
+                        <button type="button" role="tab" id="tab-settings-colors" data-settings-tab="colors"
+                            aria-controls="settings-panel-colors" aria-selected="false" tabindex="-1">Colors</button>
+                    </div>
+                    <button type="button" id="btn-settings-close" class="tree-settings-close"
+                        title="Close display settings" aria-label="Close display settings">
+                        <i class="fas fa-times"></i>
+                    </button>
+                </div>
+
+                <section id="settings-panel-support" class="tree-settings-body" role="tabpanel"
+                    data-settings-panel="support" aria-labelledby="tab-settings-support">
+                    {# Replaces the toolbar's "Support values" toggle; checked by default. #}
+                    <label class="settings-check">
+                        <input class="rounded border-gray-300 text-journal-gold focus:ring-journal-gold w-3.5 h-3.5"
+                            type="checkbox" id="cb-show-support" checked>
+                        Show support values
+                    </label>
+                    <div class="settings-row">
+                        <span class="settings-label">Support in this tree</span>
+                        <span id="support-type-badge"
+                            class="px-2 py-0.5 text-xs font-semibold rounded bg-journal-gold/20 text-journal-dark dark:text-journal-gold shrink-0">Support: --</span>
+                    </div>
+                    <div class="settings-field">
+                        <span>PP &gt;</span>
+                        <input type="number" id="input-pp-threshold" class="settings-input"
+                            value="0.80" step="0.05" min="0" max="1">
+                    </div>
+                    <div class="settings-field">
+                        <span>BS &gt;</span>
+                        <input type="number" id="input-bs-threshold" class="settings-input"
+                            value="70" step="5" min="0" max="100">
+                    </div>
+                    <div class="settings-field">
+                        <span>Tips &ge;</span>
+                        <input type="number" id="input-min-tips" class="settings-input"
+                            value="0" step="1" min="0">
+                    </div>
+                    <label class="settings-check">
+                        <input class="rounded border-gray-300 text-journal-gold focus:ring-journal-gold w-3.5 h-3.5"
+                            type="checkbox" id="cb-hide-low-support">
+                        Apply thresholds (filter low)
+                    </label>
+                    <!-- Alan 9/23/26 - Fade internal branches by support class; on by default. Title is set from the support type by updateSupportUI(). -->
+                    <label id="label-fade-by-support" class="settings-check"
+                        title="Draw weakly supported branches lighter. Display only; the tree is unchanged.">
+                        <input class="rounded border-gray-300 text-journal-gold focus:ring-journal-gold w-3.5 h-3.5"
+                            type="checkbox" id="cb-fade-by-support" checked>
+                        Fade by support
+                    </label>
+                </section>
+
+                <section id="settings-panel-sequences" class="tree-settings-body" role="tabpanel"
+                    data-settings-panel="sequences" aria-labelledby="tab-settings-sequences" hidden>
+                    <p><span id="sequence-filter-count"
+                        class="px-2 py-0.5 text-xs font-semibold rounded bg-gray-100 text-gray-700 dark:bg-gray-700/40 dark:text-gray-200">Metrics: --</span></p>
+                    <div class="settings-slider" title="Minimum query coverage">
+                        <div class="settings-slider-head">
+                            <span>Query coverage</span>
+                            <span class="settings-value">&ge; <span id="query-cover-value">--</span></span>
+                        </div>
+                        <input type="range" id="slider-query-cover" min="0" max="100" value="100" step="1"
+                            class="w-full cursor-pointer accent-blue-500" disabled>
+                    </div>
+                    <div class="settings-slider" title="Minimum subject coverage">
+                        <div class="settings-slider-head">
+                            <span>Subject coverage</span>
+                            <span class="settings-value">&ge; <span id="subject-cover-value">--</span></span>
+                        </div>
+                        <input type="range" id="slider-subject-cover" min="0" max="100" value="100" step="1"
+                            class="w-full cursor-pointer accent-green-500" disabled>
+                    </div>
+                    <div class="settings-slider"
+                        title="Maximum identity; lower this value to hide more similar sequences first">
+                        <div class="settings-slider-head">
+                            <span>Identity (maximum)</span>
+                            <span class="settings-value">&le; <span id="identity-value">--</span></span>
+                        </div>
+                        <input type="range" id="slider-identity" min="0" max="100" value="100" step="1"
+                            class="w-full cursor-pointer accent-purple-500" disabled>
+                        <p class="settings-help">Hides sequences more similar to the query than this.
+                            Lower it to hide the most similar hits first.</p>
+                    </div>
+                    <button type="button" id="btn-sequence-filter-reset" class="tree-tool"
+                        title="Reset sequence filters">
+                        <i class="fas fa-undo"></i> Reset
+                    </button>
+                </section>
+
+                <section id="settings-panel-colors" class="tree-settings-body" role="tabpanel"
+                    data-settings-panel="colors" aria-labelledby="tab-settings-colors" hidden>
+                    <p class="settings-help">Select tips on the tree, then click a color or a group to mark them.
+                        With nothing selected, clicking a group makes it the active group.</p>
+                    <div class="settings-subhead">Mark the selection</div>
+                    <div id="color-preset-swatches" class="flex flex-wrap items-center gap-1" aria-label="Preset colors">
+                        <button type="button"
+                            class="btn-color-preset h-6 w-6 rounded border border-black/20 ring-offset-1 hover:ring-2 hover:ring-journal-gold disabled:opacity-30 disabled:cursor-not-allowed"
+                            data-preset-name="Red" data-preset-color="#dc2626" title="Mark selected sequences red"
+                            aria-label="Red" style="background-color: #dc2626;"></button>
+                        <button type="button"
+                            class="btn-color-preset h-6 w-6 rounded border border-black/20 ring-offset-1 hover:ring-2 hover:ring-journal-gold disabled:opacity-30 disabled:cursor-not-allowed"
+                            data-preset-name="Orange" data-preset-color="#ea580c" title="Mark selected sequences orange"
+                            aria-label="Orange" style="background-color: #ea580c;"></button>
+                        <button type="button"
+                            class="btn-color-preset h-6 w-6 rounded border border-black/20 ring-offset-1 hover:ring-2 hover:ring-journal-gold disabled:opacity-30 disabled:cursor-not-allowed"
+                            data-preset-name="Gold" data-preset-color="#ca8a04" title="Mark selected sequences gold"
+                            aria-label="Gold" style="background-color: #ca8a04;"></button>
+                        <button type="button"
+                            class="btn-color-preset h-6 w-6 rounded border border-black/20 ring-offset-1 hover:ring-2 hover:ring-journal-gold disabled:opacity-30 disabled:cursor-not-allowed"
+                            data-preset-name="Green" data-preset-color="#16a34a" title="Mark selected sequences green"
+                            aria-label="Green" style="background-color: #16a34a;"></button>
+                        <button type="button"
+                            class="btn-color-preset h-6 w-6 rounded border border-black/20 ring-offset-1 hover:ring-2 hover:ring-journal-gold disabled:opacity-30 disabled:cursor-not-allowed"
+                            data-preset-name="Teal" data-preset-color="#0d9488" title="Mark selected sequences teal"
+                            aria-label="Teal" style="background-color: #0d9488;"></button>
+                        <button type="button"
+                            class="btn-color-preset h-6 w-6 rounded border border-black/20 ring-offset-1 hover:ring-2 hover:ring-journal-gold disabled:opacity-30 disabled:cursor-not-allowed"
+                            data-preset-name="Blue" data-preset-color="#2563eb" title="Mark selected sequences blue"
+                            aria-label="Blue" style="background-color: #2563eb;"></button>
+                        <button type="button"
+                            class="btn-color-preset h-6 w-6 rounded border border-black/20 ring-offset-1 hover:ring-2 hover:ring-journal-gold disabled:opacity-30 disabled:cursor-not-allowed"
+                            data-preset-name="Purple" data-preset-color="#9333ea" title="Mark selected sequences purple"
+                            aria-label="Purple" style="background-color: #9333ea;"></button>
+                        <button type="button"
+                            class="btn-color-preset h-6 w-6 rounded border border-black/20 ring-offset-1 hover:ring-2 hover:ring-journal-gold disabled:opacity-30 disabled:cursor-not-allowed"
+                            data-preset-name="Pink" data-preset-color="#db2777" title="Mark selected sequences pink"
+                            aria-label="Pink" style="background-color: #db2777;"></button>
+                    </div>
+                    <div class="settings-subhead">Groups</div>
+                    <div id="color-group-chips" class="flex flex-wrap items-center gap-1"></div>
+                    <div class="flex flex-wrap gap-2">
+                        <button type="button" id="btn-new-selection-set" class="tree-tool" title="Create New Color Group">
+                            <i class="fas fa-plus"></i> New group
+                        </button>
+                        <button type="button" id="btn-edit-selection-set-color" class="tree-tool"
+                            title="Change Active Color Group Color">
+                            <i class="fas fa-palette"></i> Color&hellip;
+                        </button>
+                        <input type="color" id="input-selection-set-color" class="sr-only" value="#1f77b4">
+                        <button type="button" id="btn-delete-selection-set" class="tree-tool tree-tool-danger"
+                            title="Delete Current Color Group" disabled>
+                            <i class="fas fa-trash"></i> Delete group
+                        </button>
+                        <button type="button" id="btn-uncolor-selection" class="tree-tool"
+                            title="Clear Color from Current Selection" disabled>Clear color</button>
+                    </div>
+                    <div id="color-group-popover"
+                        class="hidden rounded-lg border border-gray-200 bg-white p-3 shadow-sm dark:border-gray-700 dark:bg-gray-900">
+                        <label class="block text-[10px] font-bold uppercase tracking-wide text-gray-500 dark:text-gray-400"
+                            for="input-color-group-name">Name</label>
+                        <input type="text" id="input-color-group-name"
+                            class="mt-1 w-full rounded border border-gray-300 bg-white px-2 py-1 text-sm text-gray-900 focus:border-journal-gold focus:ring-journal-gold dark:border-gray-700 dark:bg-journal-dark dark:text-gray-100"
+                            placeholder="Color group name">
+                        <label class="mt-2 block text-[10px] font-bold uppercase tracking-wide text-gray-500 dark:text-gray-400"
+                            for="input-color-group-new-color">Color</label>
+                        <div class="mt-1 grid grid-cols-8 gap-1" aria-label="Preset colors for new group">
+                            <button type="button"
+                                class="btn-color-preset-create h-6 rounded border border-black/20 ring-offset-1 hover:ring-2 hover:ring-journal-gold"
+                                data-preset-name="Red" data-preset-color="#dc2626" title="Use red" aria-label="Red"
+                                style="background-color: #dc2626;"></button>
+                            <button type="button"
+                                class="btn-color-preset-create h-6 rounded border border-black/20 ring-offset-1 hover:ring-2 hover:ring-journal-gold"
+                                data-preset-name="Orange" data-preset-color="#ea580c" title="Use orange" aria-label="Orange"
+                                style="background-color: #ea580c;"></button>
+                            <button type="button"
+                                class="btn-color-preset-create h-6 rounded border border-black/20 ring-offset-1 hover:ring-2 hover:ring-journal-gold"
+                                data-preset-name="Gold" data-preset-color="#ca8a04" title="Use gold" aria-label="Gold"
+                                style="background-color: #ca8a04;"></button>
+                            <button type="button"
+                                class="btn-color-preset-create h-6 rounded border border-black/20 ring-offset-1 hover:ring-2 hover:ring-journal-gold"
+                                data-preset-name="Green" data-preset-color="#16a34a" title="Use green" aria-label="Green"
+                                style="background-color: #16a34a;"></button>
+                            <button type="button"
+                                class="btn-color-preset-create h-6 rounded border border-black/20 ring-offset-1 hover:ring-2 hover:ring-journal-gold"
+                                data-preset-name="Teal" data-preset-color="#0d9488" title="Use teal" aria-label="Teal"
+                                style="background-color: #0d9488;"></button>
+                            <button type="button"
+                                class="btn-color-preset-create h-6 rounded border border-black/20 ring-offset-1 hover:ring-2 hover:ring-journal-gold"
+                                data-preset-name="Blue" data-preset-color="#2563eb" title="Use blue" aria-label="Blue"
+                                style="background-color: #2563eb;"></button>
+                            <button type="button"
+                                class="btn-color-preset-create h-6 rounded border border-black/20 ring-offset-1 hover:ring-2 hover:ring-journal-gold"
+                                data-preset-name="Purple" data-preset-color="#9333ea" title="Use purple" aria-label="Purple"
+                                style="background-color: #9333ea;"></button>
+                            <button type="button"
+                                class="btn-color-preset-create h-6 rounded border border-black/20 ring-offset-1 hover:ring-2 hover:ring-journal-gold"
+                                data-preset-name="Pink" data-preset-color="#db2777" title="Use pink" aria-label="Pink"
+                                style="background-color: #db2777;"></button>
+                        </div>
+                        <div class="mt-1 flex items-center gap-2">
+                            <input type="color" id="input-color-group-new-color"
+                                class="h-8 w-12 rounded border border-gray-300 bg-transparent p-0 dark:border-gray-700"
+                                value="#1f77b4">
+                            <button type="button" id="btn-create-color-group"
+                                class="rounded bg-journal-gold px-3 py-1.5 text-xs font-semibold text-journal-dark hover:bg-journal-gold-light">Create</button>
+                            <button type="button" id="btn-cancel-color-group"
+                                class="rounded px-3 py-1.5 text-xs text-gray-600 hover:bg-gray-100 dark:text-gray-300 dark:hover:bg-gray-800">Cancel</button>
+                        </div>
+                    </div>
+                </section>
+            </div>
+        </aside>
     </div>
+
+    <!-- Hidden viewer select (kept for compatibility) -->
+    <select id="viewer-select" class="hidden">
+        <option value="phylotree" selected>Phylotree v2</option>
+        <option value="d3">D3 Standard</option>
+    </select>
 </div>
 
 <div id="tree-mobile-more" class="tree-mobile-only tree-mobile-sheet hidden" aria-hidden="true">
@@ -1117,29 +1056,79 @@
             <button type="button" id="btn-mobile-more-close" class="tree-mobile-sheet-close" aria-label="Close tree controls"><i class="fa fa-times"></i></button>
         </div>
         <div class="tree-mobile-sheet-content">
+            {# Grouped like the desktop controls: Edit (toolbar row 2), View (toolbar row 1),
+               Layout (the Layout popover) and the page actions and downloads (title row).
+               Each button triggers the desktop control by id, so behaviour stays in one place. #}
             <section>
-                <h4>Selection actions</h4>
+                <h4>Edit</h4>
                 <div class="tree-mobile-action-grid">
                     <button type="button" id="btn-mobile-node-actions" disabled><i class="fa fa-ellipsis-v"></i> Node actions</button>
-                    <button type="button" data-mobile-trigger="btn-rename"><i class="fa fa-edit"></i> Rename</button>
                     <button type="button" data-mobile-trigger="btn-prune"><i class="fa fa-cut"></i> Prune</button>
+                    <button type="button" data-mobile-trigger="btn-rename"><i class="fa fa-edit"></i> Rename</button>
                     <button type="button" data-mobile-trigger="btn-deselect"><i class="fa fa-mouse-pointer"></i> Deselect</button>
-                    <button type="button" data-mobile-trigger="btn-annotations"><i class="fa fa-tags"></i> Annotations</button>
-                    <button type="button" data-mobile-trigger="btn-alignment-viewer"><i class="fa fa-stream"></i> Alignment</button>
+                    {% if not view_only %}
+                    <button type="button" data-mobile-trigger="btn-add-sequences-link"><i class="fa fa-plus-circle"></i> Add seq</button>
+                    {% endif %}
+                    <button type="button" data-mobile-trigger="btn-recompute"><i class="fa fa-sync"></i> Recompute</button>
                 </div>
             </section>
             <section>
-                <h4>Tree layout</h4>
-                <div class="tree-mobile-setting-row"><span>Horizontal spacing</span><span><button type="button" data-mobile-trigger="btn-spacing-x-dec" aria-label="Decrease horizontal spacing"><i class="fa fa-minus"></i></button><button type="button" data-mobile-trigger="btn-spacing-x-inc" aria-label="Increase horizontal spacing"><i class="fa fa-plus"></i></button></span></div>
-                <div class="tree-mobile-setting-row"><span>Vertical spacing</span><span><button type="button" data-mobile-trigger="btn-spacing-y-dec" aria-label="Decrease vertical spacing"><i class="fa fa-minus"></i></button><button type="button" data-mobile-trigger="btn-spacing-y-inc" aria-label="Increase vertical spacing"><i class="fa fa-plus"></i></button></span></div>
-                <div class="tree-mobile-setting-row"><span>Tip label gap</span><span><button type="button" data-mobile-trigger="btn-tip-label-gap-dec" aria-label="Decrease tip label gap"><i class="fa fa-minus"></i></button><button type="button" data-mobile-trigger="btn-tip-label-gap-inc" aria-label="Increase tip label gap"><i class="fa fa-plus"></i></button></span></div>
-                <div class="tree-mobile-action-grid mt-3">
+                <h4>View</h4>
+                <div class="tree-mobile-action-grid">
                     <button type="button" data-mobile-trigger="btn-layout-linear">Linear</button>
                     <button type="button" data-mobile-trigger="btn-layout-radial">Radial</button>
                     <button type="button" data-mobile-trigger="btn-align-tips">Align tips</button>
                     <button type="button" data-mobile-trigger="btn-ladderize">Sort</button>
-                    <button type="button" data-mobile-trigger="btn-toggle-support">Node support</button>
-                    <button type="button" data-mobile-trigger="btn-midpoint">Midpoint root</button>
+                </div>
+                {# Mirrors #rooting-mode-select, whose options the controller copies in. #}
+                <div class="tree-mobile-setting-row mt-3">
+                    <label for="mobile-rooting-mode-select">Root</label>
+                    <select id="mobile-rooting-mode-select"></select>
+                </div>
+                <label class="tree-mobile-setting-row">
+                    <span>Show support values</span>
+                    <input type="checkbox" id="mobile-show-support" checked>
+                </label>
+            </section>
+            <section>
+                <h4>Layout</h4>
+                <div class="tree-mobile-setting-row"><span>Tip font</span><span><button type="button" data-mobile-step="input-tip-font" data-step="-1" aria-label="Smaller tip font"><i class="fa fa-minus"></i></button><span class="tree-mobile-value" data-mobile-value-for="input-tip-font">12</span><button type="button" data-mobile-step="input-tip-font" data-step="1" aria-label="Larger tip font"><i class="fa fa-plus"></i></button></span></div>
+                <div class="tree-mobile-setting-row"><span>Support font</span><span><button type="button" data-mobile-step="input-support-font" data-step="-1" aria-label="Smaller support font"><i class="fa fa-minus"></i></button><span class="tree-mobile-value" data-mobile-value-for="input-support-font">9</span><button type="button" data-mobile-step="input-support-font" data-step="1" aria-label="Larger support font"><i class="fa fa-plus"></i></button></span></div>
+                <div class="tree-mobile-setting-row"><span>Tip label gap</span><span><button type="button" data-mobile-trigger="btn-tip-label-gap-dec" data-mobile-keep-open aria-label="Decrease tip label gap"><i class="fa fa-minus"></i></button><span class="tree-mobile-value" data-mobile-value-for="tip-label-gap-value">2</span><button type="button" data-mobile-trigger="btn-tip-label-gap-inc" data-mobile-keep-open aria-label="Increase tip label gap"><i class="fa fa-plus"></i></button></span></div>
+                <div class="tree-mobile-setting-row"><span>Vertical spacing</span><span><button type="button" data-mobile-trigger="btn-spacing-y-dec" data-mobile-keep-open aria-label="Decrease vertical spacing"><i class="fa fa-minus"></i></button><button type="button" data-mobile-trigger="btn-spacing-y-inc" data-mobile-keep-open aria-label="Increase vertical spacing"><i class="fa fa-plus"></i></button></span></div>
+                <div class="tree-mobile-setting-row"><span>Horizontal spacing</span><span><button type="button" data-mobile-trigger="btn-spacing-x-dec" data-mobile-keep-open aria-label="Decrease horizontal spacing"><i class="fa fa-minus"></i></button><button type="button" data-mobile-trigger="btn-spacing-x-inc" data-mobile-keep-open aria-label="Increase horizontal spacing"><i class="fa fa-plus"></i></button></span></div>
+            </section>
+            <section>
+                <h4>Page and downloads</h4>
+                <div class="tree-mobile-action-grid">
+                    {% if view_only %}
+                    <button type="button" data-mobile-trigger="btn-make-copy"><i class="fa fa-clone"></i> Editable copy</button>
+                    {% endif %}
+                    <button type="button" data-mobile-trigger="btn-alignment-viewer"><i class="fa fa-stream"></i> Alignment</button>
+                    <button type="button" data-mobile-trigger="btn-annotations"><i class="fa fa-tags"></i> Annotations</button>
+                    {% if claude_review_enabled %}
+                    <button type="button" data-mobile-trigger="btn-claude-review"><i class="fas fa-wand-magic-sparkles"></i> Analyze</button>
+                    {% endif %}
+                </div>
+                <div class="tree-mobile-action-grid mt-3" aria-label="Downloads">
+                    <button type="button" data-mobile-trigger="newick-link-pruned">Newick (current)</button>
+                    <button type="button" data-mobile-trigger="newick-link-original">Newick (original)</button>
+                    <button type="button" data-mobile-trigger="nexus-link">NEXUS</button>
+                    {% if job_details.get('tree_method', '')|lower == 'mrbayes' %}
+                    <button type="button" data-mobile-trigger="export-mrbayes">MrBayes files</button>
+                    {% endif %}
+                    <button type="button" data-mobile-trigger="btn-save-svg">SVG</button>
+                    <button type="button" data-mobile-trigger="btn-save-png">PNG</button>
+                    <button type="button" data-mobile-trigger="btn-save-jpg">JPG</button>
+                    <button type="button" data-mobile-trigger="fasta-edited">Edited FASTA</button>
+                    <button type="button" data-mobile-trigger="fasta-original">Processed input</button>
+                    <button type="button" data-mobile-trigger="export-aligned-fasta">Aligned FASTA</button>
+                    {% if export_has_trimming %}
+                    <button type="button" data-mobile-trigger="export-trimmed-fasta">Trimmed FASTA</button>
+                    {% endif %}
+                    {% if export_trimming_details.get('report_file') %}
+                    <button type="button" data-mobile-trigger="export-trimming-inspection">Trimming ZIP</button>
+                    {% endif %}
                 </div>
             </section>
             <section>
@@ -1147,7 +1136,8 @@
                 <p><strong>Navigate:</strong> drag to pan; pinch to zoom. Camera gestures never change tree spacing.</p>
                 <p><strong>Select:</strong> tap a tip to toggle it; drag empty tree background to box-select. Tap Node actions for the existing Rename, Prune, Copy, Collapse/Expand, Rotate, annotation, and related actions available for that target.</p>
             </section>
-            <button type="button" id="btn-mobile-all-controls" class="tree-mobile-all-controls">Show all advanced controls</button>
+            {# Support thresholds, sequence filters and colors live in the display settings panel. #}
+            <button type="button" id="btn-mobile-all-controls" class="tree-mobile-all-controls">Show display settings and full toolbar</button>
         </div>
     </div>
 </div>
@@ -1499,13 +1489,13 @@
 
 <script src="{{ url_for('static', filename='vendor/underscore-1.13.6-min.js') }}"></script>
 
-<script src="{{ url_for('static', filename='js/phylotree.js') }}?v=12"></script>
+<script src="{{ url_for('static', filename='js/phylotree.js') }}?v=14"></script>
 
-<script src="{{ url_for('static', filename='js/tree_viewer_phylotree_v2.js') }}?v=97"></script>
+<script src="{{ url_for('static', filename='js/tree_viewer_phylotree_v2.js') }}?v=101"></script>
 
 <script src="{{ url_for('static', filename='js/tree_viewer_api.js') }}?v=8"></script>
 
-<script src="{{ url_for('static', filename='js/tree_viewer_controller.js') }}?v=86"></script>
+<script src="{{ url_for('static', filename='js/tree_viewer_controller.js') }}?v=93"></script>
 
 {% include 'partials/alignment_viewer_modal.html' %}
 
