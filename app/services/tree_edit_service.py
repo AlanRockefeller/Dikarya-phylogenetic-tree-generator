@@ -1511,10 +1511,119 @@ def _count_fasta_columns(path: Path) -> int:
         return 0
 
 
+def _structure_split_for_stable_id(structure: Any, stable_id: str
+                                   ) -> Optional[Tuple[Set[str], Set[str]]]:
+    """Return (tips under the node, all tips) for ``stable_id`` in a stored structure.
+
+    Leaves are read by ``original_name``, the label the tree file carries and
+    the stable ID hashes, not the user's rename.
+    """
+    def leaves(node) -> Set[str]:
+        names: Set[str] = set()
+        stack = [node]
+        while stack:
+            current = stack.pop()
+            if not isinstance(current, dict):
+                continue
+            children = current.get("children") or []
+            if children:
+                stack.extend(children)
+            else:
+                name = current.get("original_name") or current.get("name")
+                if name:
+                    names.add(name)
+        return names
+
+    if not isinstance(structure, dict):
+        return None
+    stack = [structure]
+    while stack:
+        node = stack.pop()
+        if not isinstance(node, dict):
+            continue
+        if node.get("stable_id") == stable_id:
+            inside = leaves(node)
+            return (inside, leaves(structure)) if inside else None
+        stack.extend(node.get("children") or [])
+    return None
+
+
+def _translate_internal_root_target(job_dir: Path, tree_json: Dict[str, Any],
+                                    previous_target: str,
+                                    old_split: Optional[Tuple[Set[str], Set[str]]]
+                                    ) -> str:
+    """Map a pre-recompute internal-node root onto the recomputed tree.
+
+    Alan 9/28/26 - An internal node's stable ID hashes the tips below it, so it
+    cannot survive a recompute that added a sequence to that clade (job fu81:
+    78 -> 79 tips, "Root target not found: internal:eccfe892"), and the
+    recompute's own root can put the same branch on the other side of the hash.
+    Resolve the branch from the old tip sets instead: root on the branch whose
+    one side holds every surviving tip of the old clade and none of the tips
+    that were outside it. Newly added tips may fall on either side. Returns the
+    ID/tip name of that branch in the tree reroot_tree() will read, or the
+    original target unchanged when there is nothing sound to translate to --
+    reroot_tree() then fails exactly as before and the caller degrades.
+    """
+    if not previous_target.startswith("internal:") or not old_split:
+        return previous_target
+    tree = _read_editable_tree(job_dir, tree_json, "reroot")
+    for clade in tree.find_clades(order="preorder"):
+        if (len(getattr(clade, "clades", None) or []) >= 2
+                and _stable_internal_node_id(clade) == previous_target):
+            return previous_target
+
+    old_inside, old_all = old_split
+    new_all = {t.name for t in tree.get_terminals() if t.name}
+    inside = old_inside & new_all
+    outside = (old_all - old_inside) & new_all
+    if not inside or not outside:
+        return previous_target
+
+    # Bottom-up tip sets, then look for the branch on either side of each node.
+    tips_below: Dict[int, frozenset] = {}
+    for clade in tree.find_clades(order="postorder"):
+        if clade.clades:
+            tips_below[id(clade)] = frozenset().union(
+                *(tips_below[id(child)] for child in clade.clades)
+            )
+        else:
+            tips_below[id(clade)] = frozenset([clade.name] if clade.name else [])
+    # Several branches qualify when new tips sit beside the old clade; take the
+    # one that pulls the fewest of them onto the old clade's side.
+    best = None
+    for clade in tree.find_clades(order="preorder"):
+        if clade is tree.root:
+            continue
+        if clade.clades and len(clade.clades) < 2:
+            continue
+        below = tips_below[id(clade)]
+        for side in (below, new_all - below):
+            if inside <= side and not (outside & side):
+                extra = len(side) - len(inside)
+                if best is None or extra < best[0]:
+                    best = (extra, clade)
+    if best is None:
+        return previous_target
+    clade = best[1]
+    translated = clade.name if not clade.clades else _stable_internal_node_id(clade)
+    if not translated:
+        return previous_target
+    logger.info(
+        "event=tree.root_target_translated old=%s new=%s old_clade_tips=%d "
+        "surviving=%d new_tips_joined=%d",
+        previous_target, translated, len(old_inside), len(inside), best[0],
+    )
+    return translated
+
+
 def _reapply_rooting_after_recompute(job_dir: Path, tree_json: Dict[str, Any],
                                      previous_mode: Optional[str],
                                      previous_target: Optional[str],
-                                     task_logger=None) -> Dict[str, Any]:
+                                     task_logger=None,
+                                     previous_split: Optional[
+                                         Tuple[Set[str], Set[str]]] = None,
+                                     ) -> Dict[str, Any]:
     """Reapply the viewer's rooting intent after recompute writes a fresh tree."""
     mode = (previous_mode or "").lower()
     if not mode:
@@ -1531,7 +1640,10 @@ def _reapply_rooting_after_recompute(job_dir: Path, tree_json: Dict[str, Any],
         if mode in ("auto", "most_divergent_hit", "midpoint", "unrooted"):
             return apply_rooting_mode(job_dir, tree_json, mode)
         if mode in ("manual", "tip", "outgroup") and previous_target:
-            return apply_rooting_mode(job_dir, tree_json, "manual", target=previous_target)
+            target = _translate_internal_root_target(
+                job_dir, tree_json, previous_target, previous_split
+            )
+            return apply_rooting_mode(job_dir, tree_json, "manual", target=target)
 
         # Reached when a manual/tip/outgroup mode has no usable target (e.g. the
         # target tip was pruned in this recompute) or the stored mode is
@@ -1642,6 +1754,18 @@ def commit_recompute_tree_state(job_dir: Path,
                 initial_state.get("root_target") or initial_state.get("root")
             )
 
+        # Capture the old clade's tips before the new structure replaces the old
+        # one: the internal-node ID alone cannot be found again in a recomputed
+        # tree whose tip set changed (see _translate_internal_root_target).
+        previous_split = None
+        if isinstance(previous_target, str) and previous_target.startswith("internal:"):
+            previous_split = (
+                _structure_split_for_stable_id(state.get("tree_structure"), previous_target)
+                or _structure_split_for_stable_id(
+                    initial_state.get("tree_structure"), previous_target
+                )
+            )
+
         state["current_tree"] = "pruned"
         structure = copy.deepcopy(new_structure)
         apply_state_to_structure(
@@ -1672,6 +1796,7 @@ def commit_recompute_tree_state(job_dir: Path,
             previous_mode,
             previous_target,
             task_logger=task_logger or logger,
+            previous_split=previous_split,
         )
         save_tree_state(job_dir, state)
         # A new inferred topology invalidates any single-level undo checkpoint
