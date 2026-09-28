@@ -130,7 +130,8 @@ def _ncbi_request(method: str, url: str, max_retries: int = 5, **kwargs) -> requ
 
 
 def blast_from_sequence(seq: str, config: Config, min_identity: float = 90.0,
-                        max_sequences: int = DEFAULT_MAX_SEQUENCES, logger=logger) -> Dict:
+                        max_sequences: int = DEFAULT_MAX_SEQUENCES, logger=logger,
+                        max_wait: Optional[float] = None) -> Dict:
     """
     Perform remote BLAST using the given nucleotide sequence.
     Use caching if available.
@@ -147,7 +148,8 @@ def blast_from_sequence(seq: str, config: Config, min_identity: float = 90.0,
         rid, rtoe = _submit_blast_request(seq, config, min_identity, max_sequences)
         logger.info(f"BLAST submitted. RID: {rid}, RTOE: {rtoe}")
         
-        _poll_blast(rid, rtoe, config, logger)
+        _poll_blast(rid, rtoe, config, logger,
+                    max_wait=BLAST_MAX_WAIT_SECONDS if max_wait is None else max_wait)
         
         blast_result = _fetch_blast_results(rid, max_sequences)
         hit_accessions = blast_result.get("accessions", [])
@@ -165,7 +167,8 @@ def blast_from_sequence(seq: str, config: Config, min_identity: float = 90.0,
         raise
 
 def blast_from_accessions(accessions: List[str], config: Config, min_identity: float = 90.0,
-                          max_sequences: int = DEFAULT_MAX_SEQUENCES, logger=logger) -> Dict:
+                          max_sequences: int = DEFAULT_MAX_SEQUENCES, logger=logger,
+                          max_wait: Optional[float] = None) -> Dict:
     """
     Retrieve sequences for the provided accessions.
     Then run remote BLAST using the combined sequence.
@@ -191,7 +194,8 @@ def blast_from_accessions(accessions: List[str], config: Config, min_identity: f
         rid, rtoe = _submit_blast_request(query_fasta, config, min_identity, max_sequences)
         logger.info(f"BLAST submitted. RID: {rid}, RTOE: {rtoe}")
         
-        _poll_blast(rid, rtoe, config, logger)
+        _poll_blast(rid, rtoe, config, logger,
+                    max_wait=BLAST_MAX_WAIT_SECONDS if max_wait is None else max_wait)
         
         blast_result = _fetch_blast_results(rid, max_sequences)
         hit_accessions = blast_result.get("accessions", [])
@@ -336,6 +340,15 @@ def _submit_blast_request(seq: str, config: Config = None, min_identity: float =
 
 # Total time _poll_blast will wait for one RID, counting the initial RTOE wait.
 BLAST_MAX_WAIT_SECONDS = 600
+
+# Alan 9/28/26 - The same budget for a BLAST run inside a web request, which
+# nginx abandons at proxy_read_timeout 300. With the worker's 600s the browser
+# got nginx's HTML 504 at 300s while the handler held its Gunicorn slot for
+# another five minutes and then logged a 500 nobody received. Submission and
+# the result/FASTA fetch around the poll take well under 10s on real requests,
+# so 240s leaves headroom. The pipeline's BLAST step runs in the worker and
+# keeps the full budget.
+BLAST_REQUEST_MAX_WAIT_SECONDS = 240
 
 
 def _poll_blast(rid: str, rtoe: int, config: Config, logger,

@@ -1787,7 +1787,9 @@ def midpoint_root_v1(job_id):
 @require_api_token(scope='tools:read')
 @limiter.limit("10 per minute; 200 per hour", key_func=api_token_key_func)
 def tools_blast():
-    from app.services.blast_service import blast_from_sequence, blast_from_accessions
+    from app.services.blast_service import (
+        BLAST_REQUEST_MAX_WAIT_SECONDS, blast_from_accessions, blast_from_sequence,
+    )
     body, body_error = _json_object_body()
     if body_error:
         return body_error
@@ -1833,12 +1835,25 @@ def tools_blast():
         if _is_genbank_accession(query):
             result = blast_from_accessions([query], Config,
                                            min_identity=min_identity,
-                                           max_sequences=max_sequences)
+                                           max_sequences=max_sequences,
+                                           max_wait=BLAST_REQUEST_MAX_WAIT_SECONDS)
         else:
             result = blast_from_sequence(query, Config,
                                          min_identity=min_identity,
-                                         max_sequences=max_sequences)
+                                         max_sequences=max_sequences,
+                                         max_wait=BLAST_REQUEST_MAX_WAIT_SECONDS)
         return ok(result)
+    except TimeoutError as e:
+        # Same budget and reason as the web route: answer before nginx's 300s.
+        logger.warning("v1 BLAST request timed out: %s", e)
+        return error_response(
+            code="upstream_error",
+            message=(
+                "NCBI BLAST did not finish in time. NCBI is busy right now; "
+                "please try again in a few minutes."
+            ),
+            status=504,
+        )
     except Exception as e:
         return server_error(e, where="tools_blast")
 
