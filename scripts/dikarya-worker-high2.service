@@ -1,0 +1,108 @@
+# Dikarya second interactive worker -- a second slot on phylo_high.
+#
+# Alan 9/24/26 - One phylo_high worker means one slot, and RQ cannot preempt.
+# That day job 6vre (a 119-sequence Quick Tree, seconds of work) waited 14
+# minutes behind 7r0z, a 137-record IQ-TREE run with ModelFinder, -B 5000 and
+# --alrt 1000 that classify_queue_for_params() correctly kept on phylo_high
+# (IQ-TREE only goes to bulk above 150 records). A second process on the same
+# queue lets short jobs keep flowing while one long interactive job runs.
+#
+# RQ supports any number of workers on one queue natively: each job is popped
+# by exactly one worker, and startup/maintenance reconciliation reads RQ's own
+# job status, so a starting worker never fails a job its sibling is running.
+#
+# Derived from dikarya-worker-bulk.service. The differences are the queue,
+# normal scheduling priority, its own log file, and PartOf= below.
+#
+# --- Restarting ------------------------------------------------------------
+# PartOf=dikarya-worker.service means every stop or restart of the original
+# worker is propagated here, so the existing wrapper restarts BOTH phylo_high
+# workers and neither can be left running stale code after a deploy:
+#   sudo /usr/local/sbin/restart-dikarya-worker
+# The pre-restart check is unchanged, because it is per queue and both
+# workers' running jobs are in the same registry:
+#   redis-cli LLEN rq:queue:phylo_high ; redis-cli ZCARD rq:wip:phylo_high
+# (ZCARD can now be 2.) Restarting this unit alone does not touch the other.
+#
+# --- Install as root -------------------------------------------------------
+#   cp scripts/dikarya-worker-high2.service \
+#      /etc/systemd/system/dikarya-worker-high2.service
+#
+#   # Drop-ins are NOT inherited by a new unit; give it the same ones.
+#   mkdir -p /etc/systemd/system/dikarya-worker-high2.service.d
+#   cp scripts/dikarya-umask.conf \
+#      /etc/systemd/system/dikarya-worker-high2.service.d/umask.conf
+#   cp /etc/systemd/system/dikarya-worker.service.d/hardening.conf \
+#      /etc/systemd/system/dikarya-worker-high2.service.d/hardening.conf
+#   # Must sort after hardening.conf, which sets the single-worker 8G/10G.
+#   cp scripts/dikarya-worker-high2-memory.conf \
+#      /etc/systemd/system/dikarya-worker-high2.service.d/zz-memory.conf
+#   # Lets a running job drain on stop instead of being SIGKILLed after the
+#   # default 90s. The guarded restart wrapper (scripts/WORKER_RESTART.md)
+#   # refuses, exit 78, while a running phylo_high unit lacks it.
+#   cp scripts/dikarya-worker-graceful.conf \
+#      /etc/systemd/system/dikarya-worker-high2.service.d/zz-graceful.conf
+#
+#   install -o dikarya -g dikarya -m 0664 /dev/null \
+#      /var/www/dikarya/var/logs/worker-high2.log
+#
+#   systemctl daemon-reload
+#   systemctl enable --now dikarya-worker-high2
+#
+# Installing and starting this unit does not restart or interrupt the
+# existing workers.
+#
+# Verify:
+#   grep "Worker serving queue" /var/www/dikarya/var/logs/worker-high2.log
+#   systemctl show dikarya-worker-high2 -p MemoryHigh -p MemoryMax -p UMask \
+#       -p KillMode -p TimeoutStopUSec      # mixed, infinity
+#   redis-cli SMEMBERS rq:workers     # three workers, two on phylo_high
+#
+# To back out: systemctl disable --now dikarya-worker-high2 (after checking
+# rq:wip:phylo_high), then remove the unit and its .d directory.
+
+[Unit]
+Description=Dikarya interactive phylogenetics worker (second phylo_high slot)
+After=network.target redis-server.service
+Wants=redis-server.service
+PartOf=dikarya-worker.service
+
+[Service]
+Type=simple
+User=dikarya
+Group=dikarya
+WorkingDirectory=/var/www/dikarya
+EnvironmentFile=/etc/dikarya/dikarya.environment.live
+ExecStart=/var/www/dikarya/.venv/bin/flask run-worker --queues phylo_high
+Restart=always
+RestartSec=5
+KillSignal=SIGTERM
+
+StandardOutput=append:/var/www/dikarya/var/logs/worker-high2.log
+StandardError=append:/var/www/dikarya/var/logs/worker-high2.log
+
+# --- Threads -----------------------------------------------------------
+# The host has 2 cores. dikarya-worker asks for 2 threads and the bulk worker
+# for 1 (at CPUWeight=20), so one thread here keeps the worst case at 4
+# threads on 2 cores rather than 5. IQ-TREE's OpenMP threads spin while they
+# wait, which makes oversubscription cost more than the thread count suggests.
+# The price is that a job landing here on an otherwise idle box runs on one
+# core; most phylo_high jobs are 25-60s, so the wait this unit removes is far
+# larger than that. Read by worker_thread_budget() in alignment_service.py.
+Environment=DIKARYA_WORKER_THREADS=1
+
+# Same reason as dikarya-worker's queue.conf: stop LLVM OpenMP's libarcher
+# probe writing a bogus "cannot open shared object file" into tree_builder.log.
+Environment=OMP_TOOL=disabled
+
+# Scheduling priority is deliberately left at the defaults (Nice=0,
+# CPUWeight=100): these are jobs a person is watching, the same class as
+# dikarya-worker's.
+
+# Memory ceiling lives in scripts/dikarya-worker-high2-memory.conf, installed as
+# zz-memory.conf, because hardening.conf is a drop-in and would override any
+# value set here. TasksMax matches the bulk unit.
+TasksMax=256
+
+[Install]
+WantedBy=multi-user.target

@@ -512,7 +512,7 @@ def get_queue_position(job_id: str) -> Optional[Dict[str, Any]]:
       scheduled  -- deliberately parked (a MycoMap/NCBI wait); rejoins later
       started    -- a worker has picked it up
       other      -- finished, failed or otherwise not waiting
-    Each queue has its own worker, so only the job's own queue is counted.
+    Each queue has its own worker(s), so only the job's own queue is counted.
     Nothing here comes from the submission, so it is safe to publish.
     """
     try:

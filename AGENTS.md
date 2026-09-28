@@ -166,12 +166,18 @@ stayed group-unwritable in a job directory where everything else was 0664.
 
 ## Restarting Dikarya services
 
-### Guarded worker wrapper (installation required)
+### Guarded worker wrapper (installed 2026-09-28)
 
-`scripts/WORKER_RESTART.md` documents the new root-owned replacement wrapper
-and graceful-shutdown drop-in. Until those are installed, the legacy safety
-checks below still apply. After installation, use the same high-worker wrapper;
-the separately granted `restart-dikarya-worker-bulk` handles bulk jobs.
+`scripts/WORKER_RESTART.md` documents the root-owned guarded wrapper and the
+graceful-shutdown drop-in. Both are installed for all three workers
+(`dikarya-worker`, `dikarya-worker-high2`, `dikarya-worker-bulk`), so
+`restart-dikarya-worker` no longer SIGKILLs blindly: an idle queue restarts at
+once and a busy one gets the report below. The Redis pre-check further down is
+still a cheap first look. The separately granted `restart-dikarya-worker-bulk`
+handles bulk jobs. The installed wrapper is a copy: after editing
+`scripts/restart-dikarya-worker`, a human must re-install it (both
+`/usr/local/sbin/restart-dikarya-worker` and
+`/usr/local/libexec/dikarya-worker-restart`) before the change takes effect.
 
 The guarded wrapper prints JSON with owners, job details, elapsed time and a
 timeout budget (not an ETA). Exit 75 means **show the report to the user and ask
@@ -286,7 +292,14 @@ redis-cli LLEN rq:queue:phylo_bulk  ; redis-cli ZCARD rq:wip:phylo_bulk
 
 `rq:queue:<name>` is the pending queue and `rq:wip:<name>` is RQ's
 StartedJobRegistry, so a non-zero `wip` means a job is executing *right now* and
-restarting will kill it. Re-run the check immediately before the restart, not
+restarting will kill it.
+
+**phylo_high has two workers**: `dikarya-worker` and `dikarya-worker-high2`
+(`scripts/dikarya-worker-high2.service`, 1 thread, its own
+`var/logs/worker-high2.log`). The second is `PartOf=dikarya-worker.service`, so
+`restart-dikarya-worker` restarts both and neither can keep running stale code
+after a deploy. The check above is per queue, so it already covers both, and
+`rq:wip:phylo_high` can now read 2. Re-run the check immediately before the restart, not
 once at the start of a long task — a job can arrive in between.
 
 If anything is in flight, wait for it to finish unless the user has accepted
@@ -747,7 +760,7 @@ journal, including sshd auth records). Use these instead, in this order:
 | Daily summary of failures/degradations | `~/.dikarya/log-digests/<date>.txt` | yes |
 | Per-job pipeline detail | `var/jobs/<id>/logs/{pipeline,alignment,tree_builder}.log` | yes |
 | Gunicorn access/errors | `var/logs/{access,error}.log` | yes |
-| Worker app output | `var/logs/worker.log` (phylo_high), `var/logs/worker-bulk.log` (phylo_bulk) | yes |
+| Worker app output | `var/logs/worker.log` and `var/logs/worker-high2.log` (phylo_high), `var/logs/worker-bulk.log` (phylo_bulk) | yes |
 | Internet-wide scanner sweeps | `var/logs/scanner.log` | yes |
 | Weekly type-specimen refresh (stats, each type accession added/removed/reclassified) | `cache/type_specimens/refresh.log` | yes |
 | Unit lifecycle, OOM kills, start failures | journal, via the wrapper below | wrapper only |

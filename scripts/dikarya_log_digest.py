@@ -661,7 +661,7 @@ def _is_record_continuation(line):
 
 # The worker streams, in the order their files are read. Each RQ worker writes
 # its own file via StandardOutput=append: in its systemd drop-in.
-WORKER_STEMS = ("worker", "worker-bulk")
+WORKER_STEMS = ("worker", "worker-bulk", "worker-high2")
 
 
 def _timestamped_worker_lines(files, cutoff, until):

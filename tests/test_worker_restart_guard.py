@@ -18,14 +18,14 @@ def load_guard():
 
 def test_busy_agent_gets_report_without_restart():
     guard = load_guard()
-    with patch.object(guard.sys, "argv", ["restart-dikarya-worker"]), patch.object(guard.os, "geteuid", return_value=0), patch.object(guard, "run", side_effect=["mixed", "infinity"]), patch("builtins.open", mock_open(read_data="DATABASE_URL=postgresql://example\n")), patch.object(guard.subprocess, "check_output", return_value=json.dumps({"jobs": [{"id": "job-a"}]})), patch.object(guard.subprocess, "run") as mutate, patch.object(guard.sys, "stdin", io.StringIO("")), patch("select.select", return_value=([], [], [])):
+    with patch.object(guard.sys, "argv", ["restart-dikarya-worker"]), patch.object(guard.os, "geteuid", return_value=0), patch.object(guard, "run", side_effect=["inactive", "mixed", "infinity"]), patch("builtins.open", mock_open(read_data="DATABASE_URL=postgresql://example\n")), patch.object(guard.subprocess, "check_output", return_value=json.dumps({"jobs": [{"id": "job-a"}]})), patch.object(guard.subprocess, "run") as mutate, patch.object(guard.sys, "stdin", io.StringIO("")), patch("select.select", return_value=([], [], [])):
         assert guard.main() == 75
         mutate.assert_not_called()
 
 
 def test_unsafe_shutdown_config_refuses_even_idle_restart():
     guard = load_guard()
-    with patch.object(guard.sys, "argv", ["restart-dikarya-worker"]), patch.object(guard.os, "geteuid", return_value=0), patch.object(guard, "run", side_effect=["control-group", "90s"]), patch.object(guard.subprocess, "run") as mutate:
+    with patch.object(guard.sys, "argv", ["restart-dikarya-worker"]), patch.object(guard.os, "geteuid", return_value=0), patch.object(guard, "run", side_effect=["inactive", "control-group", "90s"]), patch.object(guard.subprocess, "run") as mutate:
         assert guard.main() == 78
         mutate.assert_not_called()
 
@@ -43,9 +43,36 @@ def test_changed_job_set_cancels_approved_interrupt_and_thaws():
     guard = load_guard()
     reports = [json.dumps({"jobs": [{"id": name}]}) for name in ("job-a", "job-b")]
     stream = io.StringIO("INTERRUPT job-a\n")
-    with patch.object(guard.sys, "argv", ["restart-dikarya-worker"]), patch.object(guard.os, "geteuid", return_value=0), patch.object(guard, "run", side_effect=["mixed", "infinity"]), patch("builtins.open", mock_open(read_data="DATABASE_URL=postgresql://example\n")), patch.object(guard.subprocess, "check_output", side_effect=reports), patch.object(guard.subprocess, "run") as mutate, patch.object(guard.sys, "stdin", stream), patch("select.select", return_value=([stream], [], [])):
+    with patch.object(guard.sys, "argv", ["restart-dikarya-worker"]), patch.object(guard.os, "geteuid", return_value=0), patch.object(guard, "run", side_effect=["inactive", "mixed", "infinity"]), patch("builtins.open", mock_open(read_data="DATABASE_URL=postgresql://example\n")), patch.object(guard.subprocess, "check_output", side_effect=reports), patch.object(guard.subprocess, "run") as mutate, patch.object(guard.sys, "stdin", stream), patch("select.select", return_value=([stream], [], [])):
         assert guard.main() == 75
         assert [call.args[0][1] for call in mutate.call_args_list] == ["freeze", "thaw"]
+
+
+def test_high_queue_covers_second_worker_when_installed():
+    guard = load_guard()
+    reports = [json.dumps({"jobs": [{"id": "job-a"}, {"id": "job-b"}]})] * 2
+    stream = io.StringIO("INTERRUPT job-a,job-b\n")
+    # ActiveState of dikarya-worker-high2, then KillMode/TimeoutStopUSec per unit.
+    inspect = ["active", "mixed", "infinity", "mixed", "infinity"]
+    with patch.object(guard.sys, "argv", ["restart-dikarya-worker"]), patch.object(guard.os, "geteuid", return_value=0), patch.object(guard, "run", side_effect=inspect), patch("builtins.open", mock_open(read_data="DATABASE_URL=postgresql://example\n")), patch.object(guard.subprocess, "check_output", side_effect=reports) as report, patch.object(guard.subprocess, "run") as mutate, patch.object(guard.sys, "stdin", stream), patch("select.select", return_value=([stream], [], [])):
+        assert guard.main() == 0
+        assert report.call_args.args[0][-1] == "phylo_high"
+        units = ["dikarya-worker.service", "dikarya-worker-high2.service"]
+        assert [call.args[0][1:] for call in mutate.call_args_list] == [
+            ["freeze", units[0]], ["freeze", units[1]],
+            ["kill", "--kill-whom=all", "--signal=SIGKILL", units[0]],
+            ["kill", "--kill-whom=all", "--signal=SIGKILL", units[1]],
+            ["thaw", units[0]], ["thaw", units[1]],
+            ["restart", "--no-block", *units],
+        ]
+
+
+def test_second_worker_without_graceful_config_refuses_restart():
+    guard = load_guard()
+    inspect = ["active", "mixed", "infinity", "control-group", "90s"]
+    with patch.object(guard.sys, "argv", ["restart-dikarya-worker"]), patch.object(guard.os, "geteuid", return_value=0), patch.object(guard, "run", side_effect=inspect), patch.object(guard.subprocess, "run") as mutate:
+        assert guard.main() == 78
+        mutate.assert_not_called()
 
 
 @pytest.fixture

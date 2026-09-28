@@ -89,6 +89,24 @@ def _restart_bulk_after_current():
         return 0
 
 
+# dikarya-worker-high2 is a second phylo_high worker, PartOf dikarya-worker.
+# It is optional so this guard keeps working on a host that has not installed it.
+HIGH_QUEUE_UNITS = ("dikarya-worker.service", "dikarya-worker-high2.service")
+
+
+def _queue_units(bulk):
+    if bulk:
+        return ["dikarya-worker-bulk.service"]
+    units = [HIGH_QUEUE_UNITS[0]]
+    for unit in HIGH_QUEUE_UNITS[1:]:
+        # Only a running unit can hold a job. A stopped or failed one stays
+        # loaded, but systemd refuses to freeze it, and restarting it by name
+        # would start a worker someone deliberately stopped.
+        if run("/usr/bin/systemctl", "show", unit, "-p", "ActiveState", "--value") in ("active", "reloading"):
+            units.append(unit)
+    return units
+
+
 def main(*, bulk=None, after_current=False):
     if len(sys.argv) != 1 or os.geteuid() != 0:
         return 64
@@ -98,14 +116,15 @@ def main(*, bulk=None, after_current=False):
         if not bulk:
             return 64
         return _restart_bulk_after_current()
-    unit = "dikarya-worker-bulk.service" if bulk else "dikarya-worker.service"
     queue = "phylo_bulk" if bulk else "phylo_high"
+    units = _queue_units(bulk)
     # Safe default even if a job arrives between the check and systemctl restart.
-    mode = run("/usr/bin/systemctl", "show", unit, "-p", "KillMode", "--value")
-    timeout = run("/usr/bin/systemctl", "show", unit, "-p", "TimeoutStopUSec", "--value")
-    if mode != "mixed" or timeout != "infinity":
-        print("Install dikarya-worker-graceful.conf and daemon-reload first; refusing unsafe restart.")
-        return 78
+    for unit in units:
+        mode = run("/usr/bin/systemctl", "show", unit, "-p", "KillMode", "--value")
+        timeout = run("/usr/bin/systemctl", "show", unit, "-p", "TimeoutStopUSec", "--value")
+        if mode != "mixed" or timeout != "infinity":
+            print("Install dikarya-worker-graceful.conf on " + unit + " and daemon-reload first; refusing unsafe restart.")
+            return 78
     # Read only the two required settings; never execute environment-file text.
     env = {"PATH": "/usr/bin:/bin", "LANG": "C.UTF-8"}
     with open("/etc/dikarya/dikarya.environment.live") as stream:
@@ -145,18 +164,25 @@ def main(*, bulk=None, after_current=False):
             return 75
         # Stop assignment before acting on consent so a different job cannot
         # replace the approved one between the final census and the kill.
-        subprocess.run(["/usr/bin/systemctl", "freeze", unit], check=True)
+        # The report covers the whole queue, so every unit serving it is frozen
+        # and killed together; approval never names a job this does not stop.
+        frozen = []
         try:
+            for unit in units:
+                subprocess.run(["/usr/bin/systemctl", "freeze", unit], check=True)
+                frozen.append(unit)
             current = report()
             if sorted(job["id"] for job in current["jobs"]) != ids:
                 print("Job set changed; obtain a fresh report and approval.")
                 return 75
-            subprocess.run(["/usr/bin/systemctl", "kill", "--kill-whom=all", "--signal=SIGKILL", unit], check=True)
+            for unit in units:
+                subprocess.run(["/usr/bin/systemctl", "kill", "--kill-whom=all", "--signal=SIGKILL", unit], check=True)
         finally:
-            subprocess.run(["/usr/bin/systemctl", "thaw", unit], check=False)
+            for unit in frozen:
+                subprocess.run(["/usr/bin/systemctl", "thaw", unit], check=False)
     # --no-block: an idle-check race drains safely in the background; do not
     # hold an agent tool call open for the duration of a newly started job.
-    subprocess.run(["/usr/bin/systemctl", "restart", "--no-block", unit], check=True)
+    subprocess.run(["/usr/bin/systemctl", "restart", "--no-block", *units], check=True)
     print("Restart requested. Check ActiveState/MainPID and worker logs for completion.")
     return 0
 

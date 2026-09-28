@@ -103,6 +103,15 @@ class DegenerateTreeError(ValueError):
     """
 
 
+class PruneRequestError(ValueError):
+    """A prune the user asked for that cannot be carried out as requested.
+
+    Removing every remaining tip, or naming only tips the tree does not hold,
+    is the user's choice rather than a server fault, so the route answers 400
+    with this message instead of a 500 filed in errors.log.
+    """
+
+
 @contextmanager
 def tree_state_lock(job_dir: Path):
     """Serialize one job's tree-state read/modify/write operations.
@@ -765,7 +774,7 @@ def prune_taxa(job_dir: Path, tree_json: Dict, taxa_names: List[str]) -> Dict:
             for terminal in clade.get_terminals()
         }
         if terminals and not (terminals - terminals_to_remove):
-            raise ValueError("Cannot prune every remaining taxon from the tree.")
+            raise PruneRequestError("Cannot prune every remaining taxon from the tree.")
 
         tree_json.pop("prune_unresolved", None)
         if unresolved_targets:
@@ -780,7 +789,7 @@ def prune_taxa(job_dir: Path, tree_json: Dict, taxa_names: List[str]) -> Dict:
                 sorted(unresolved_targets)[:5], available_tips, available_internal,
             )
             if not to_prune and not previously_pruned:
-                raise ValueError(
+                raise PruneRequestError(
                     "None of the selected tips were found in the tree: "
                     + ", ".join(sorted(unresolved_targets)[:5])
                 )
@@ -842,6 +851,8 @@ def prune_taxa(job_dir: Path, tree_json: Dict, taxa_names: List[str]) -> Dict:
         
         return tree_json
         
+    except PruneRequestError:
+        raise
     except Exception as e:
         logger.error(f"Prune failed: {e}")
         raise

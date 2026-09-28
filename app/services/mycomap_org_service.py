@@ -245,18 +245,43 @@ def _local_metadata(ids, *, deadline=None):
     return output
 
 
+def _is_transient_ncbi_failure(exc):
+    """True when NCBI did not answer, so the same request may work later.
+
+    A 4xx refusal, an oversized batch or undecodable text fails the same way on
+    every retry; counting those as transient would keep the delayed recheck
+    retrying until it gave up and discarded every sequence that did arrive.
+    """
+    import requests
+
+    if isinstance(exc, (requests.ConnectionError, requests.Timeout,
+                        requests.exceptions.RetryError,
+                        requests.exceptions.ChunkedEncodingError)):
+        return True
+    status = getattr(getattr(exc, "response", None), "status_code", None)
+    return isinstance(status, int) and (status == 429 or status >= 500)
+
+
 def _ncbi_sequences(accessions, *, deadline=None):
-    """Fetch complete NCBI records in batches, keyed by the requested accession."""
+    """Fetch complete NCBI records in batches, keyed by the requested accession.
+
+    Returns ``(sequences, unchecked)``. ``unchecked`` holds the accessions never
+    answered because their batch failed transiently or the deadline passed.
+    Those are worth retrying, unlike an accession NCBI answered without a
+    usable record or a batch it refused outright.
+    """
     from app.services.blast_service import NCBI_EFETCH_URL, _ncbi_request
 
     requested = list(dict.fromkeys(
         accession.upper() for accession in accessions if is_genbank_accession(accession)
     ))
     sequences = {}
+    unchecked = set()
     for offset in range(0, len(requested), NCBI_BATCH_SIZE):
         batch = requested[offset:offset + NCBI_BATCH_SIZE]
         remaining = deadline - time.monotonic() if deadline is not None else 30
         if remaining <= 0:
+            unchecked.update(requested[offset:])
             break
         try:
             response = _ncbi_request(
@@ -277,9 +302,11 @@ def _ncbi_sequences(accessions, *, deadline=None):
                 fasta = b"".join(chunks).decode("utf-8")
             finally:
                 response.close()
-        except Exception:
+        except Exception as exc:
             logger.warning("NCBI full sequence fetch failed for %s accessions",
                            len(batch), exc_info=True)
+            if _is_transient_ncbi_failure(exc):
+                unchecked.update(batch)
             continue
 
         returned = {}
@@ -299,12 +326,15 @@ def _ncbi_sequences(accessions, *, deadline=None):
                                  if key.split(".")[0] == accession), None)
             if sequence:
                 sequences[accession] = sequence
-    return sequences
+    return sequences, unchecked
 
 
 def fetch_results(result_id, *, include_ncbi=True, include_local=True,
                   time_budget=None):
     """Return normalized hits and source state for the shared import pipeline."""
+    # Imported here: mycomap_service imports this module lazily as well.
+    from app.services.mycomap_service import describe_ncbi_hit
+
     deadline = time.monotonic() + time_budget if time_budget is not None else None
     record = _json(result_id, deadline=deadline)
     result = {"sequences": [], "ncbi_count": 0, "local_count": 0,
@@ -337,8 +367,8 @@ def fetch_results(result_id, *, include_ncbi=True, include_local=True,
                                        deadline=deadline)
         else:
             metadata = {}
-            ncbi_sequences = _ncbi_sequences([h["accession"] for h in hits],
-                                             deadline=deadline)
+            ncbi_sequences, unchecked = _ncbi_sequences(
+                [h["accession"] for h in hits], deadline=deadline)
             # Hit_len identifies the sequence whose BLAST metrics we received.
             # A changed or incomplete NCBI record must not inherit those metrics.
             for hit in hits:
@@ -366,8 +396,19 @@ def fetch_results(result_id, *, include_ncbi=True, include_local=True,
                 else f"MO #{item['moObservationId']}" if item.get("moObservationId")
                 else ""
             )
-            name = (f"{accession} {hit['description']}" if accession else
-                    f"{hit['id']} {observation_token} {taxon or hit['description']}").strip()
+            raw_description = ""
+            if accession:
+                # The label the mycomap.com path gives the same accession, or
+                # the tip label is the whole GenBank definition line. BLAST XML
+                # joins the deflines of identical subjects with " >"; only the
+                # first names this hit.
+                raw_description = hit["description"].split(" >", 1)[0].strip()
+                described = describe_ncbi_hit(accession, raw_description)
+                taxon = taxon or described["taxon"]
+                name = described["display_name"]
+            else:
+                name = f"{hit['id']} {observation_token} {taxon or hit['description']}"
+            name = name.strip()
             if source == "ncbi":
                 sequence = hit["full_sequence"]
             else:
@@ -377,6 +418,7 @@ def fetch_results(result_id, *, include_ncbi=True, include_local=True,
             result["sequences"].append({
                 "name": name, "sequence": sequence, "source": "mycomap",
                 "hit_source": source, "accession": accession, "taxon": taxon,
+                "raw_ncbi_description": raw_description,
                 "location": _location(item), "identity": hit["identity"],
                 "query_cover": hit["query_cover"], "subject_cover": hit["subject_cover"],
                 "is_contaminant": any("contaminant" in str(flag).lower()

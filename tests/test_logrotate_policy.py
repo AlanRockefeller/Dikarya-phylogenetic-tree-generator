@@ -93,7 +93,7 @@ class RetentionPolicyTests(unittest.TestCase):
         paths, _directives = self.logs
         covered = {Path(path).name for path in paths}
         for name in ("access.log", "error.log", "errors.log", "worker.log",
-                     "worker-bulk.log", "scanner.log"):
+                     "worker-bulk.log", "worker-high2.log", "scanner.log"):
             self.assertIn(name, covered)
 
 

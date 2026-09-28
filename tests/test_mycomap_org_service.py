@@ -126,13 +126,84 @@ def test_ncbi_import_omits_hits_without_matching_full_records(full_sequences):
     status = {"ncbi": {"status": "complete", "has_results": True}}
     with patch.object(org, "_json", return_value=status), \
          patch.object(org, "_read", return_value=xml), \
-         patch.object(org, "_ncbi_sequences", return_value=full_sequences):
+         patch.object(org, "_ncbi_sequences", return_value=(full_sequences, set())):
         result = org.fetch_results("123", include_local=False)
 
     assert result["sequences"] == []
     assert result["ncbi_count"] == 0
     assert result["failed_sources"] == ["ncbi"]
     assert "full NCBI sequences" in result["errors"][0]
+
+
+_HIT = (XML.split(b"<Iteration_hits>")[1].split(b"</Iteration_hits>")[0]
+        .replace(b"551798", b"{accession}"))
+TWO_HIT_XML = XML.replace(
+    _HIT.replace(b"{accession}", b"551798"),
+    _HIT.replace(b"{accession}", b"PX215422") + _HIT.replace(b"{accession}", b"PX215423"),
+)
+
+
+@pytest.mark.parametrize("unchecked_second, failed", [(True, ["ncbi"]), (False, [])])
+def test_partial_ncbi_miss_fails_source_only_when_transient(unchecked_second, failed):
+    status = {"ncbi": {"status": "complete", "has_results": True}}
+
+    def fake_fetch(accessions, *, deadline=None):
+        assert sorted(accessions) == ["PX215422", "PX215423"]
+        # PX215423 either sat in a batch that errored or timed out, or NCBI
+        # answered without a record for it.
+        unchecked = {"PX215423"} if unchecked_second else set()
+        return {"PX215422": "ACGT" * 25}, unchecked
+
+    with patch.object(org, "_json", return_value=status), \
+         patch.object(org, "_read", return_value=TWO_HIT_XML), \
+         patch.object(org, "_ncbi_sequences", side_effect=fake_fetch):
+        result = org.fetch_results("123", include_local=False)
+
+    assert result["ncbi_count"] == 1
+    assert result["failed_sources"] == failed
+    assert "full NCBI sequences for 1" in result["errors"][0]
+
+
+class _FakeResponse:
+    def __init__(self, status=200, body=b""):
+        self.status_code = status
+        self.body = body
+
+    def raise_for_status(self):
+        if self.status_code >= 400:
+            import requests
+            raise requests.HTTPError(response=self)
+
+    def iter_content(self, chunk_size):
+        yield self.body
+
+    def close(self):
+        pass
+
+
+def _retry_exhausted(*args, **kwargs):
+    import requests
+    raise requests.exceptions.RetryError("NCBI did not answer")
+
+
+@pytest.mark.parametrize("outcome, transient", [
+    (_retry_exhausted, True),
+    (lambda *a, **k: _FakeResponse(503), True),
+    (lambda *a, **k: _FakeResponse(400), False),
+    (lambda *a, **k: _FakeResponse(body=b"\xff\xfe"), False),
+])
+def test_only_unanswered_ncbi_batches_count_as_unchecked(outcome, transient):
+    with patch("app.services.blast_service._ncbi_request", side_effect=outcome):
+        sequences, unchecked = org._ncbi_sequences(["PX215422"])
+    assert sequences == {}
+    assert unchecked == ({"PX215422"} if transient else set())
+
+
+def test_oversized_ncbi_batch_is_not_unchecked(monkeypatch):
+    monkeypatch.setattr(org, "MAX_XML_BYTES", 4)
+    with patch("app.services.blast_service._ncbi_request",
+               return_value=_FakeResponse(body=b">PX215422\nACGTACGT\n")):
+        assert org._ncbi_sequences(["PX215422"]) == ({}, set())
 
 
 def test_local_metadata_preserves_observation_reference():

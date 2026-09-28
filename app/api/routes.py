@@ -3270,7 +3270,8 @@ def prune_tree(job_id):
     
     try:
         from app.services.tree_edit_service import (
-            _tree_tip_set, load_tree_state, prune_taxa, save_tree_state, tree_state_lock,
+            PruneRequestError, _tree_tip_set, load_tree_state, prune_taxa, save_tree_state,
+            tree_state_lock,
         )
         with tree_state_lock(job_dir):
             state = load_tree_state(job_dir)
@@ -3290,6 +3291,8 @@ def prune_tree(job_id):
                         f"prune of {removed} sequence{'' if removed == 1 else 's'}"
                     )
         return jsonify(_with_undo_state(state, job_dir))
+    except PruneRequestError as e:
+        return jsonify({"status": "error", "error": str(e)}), 400
     except Exception as e:
         return _server_error(e)
 

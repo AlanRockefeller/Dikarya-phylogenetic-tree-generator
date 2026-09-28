@@ -20,7 +20,7 @@
 # and orders by mtime (scripts/dikarya_log_digest.py:log_files), and
 # scripts/dikarya-nginx-log reads /var/log/nginx, which this file does not
 # manage -- so the naming is free to be the timestamped one.
-/var/www/dikarya/var/logs/access.log /var/www/dikarya/var/logs/error.log /var/www/dikarya/var/logs/errors.log /var/www/dikarya/var/logs/worker.log /var/www/dikarya/var/logs/worker-bulk.log /var/www/dikarya/var/logs/scanner.log {
+/var/www/dikarya/var/logs/access.log /var/www/dikarya/var/logs/error.log /var/www/dikarya/var/logs/errors.log /var/www/dikarya/var/logs/worker.log /var/www/dikarya/var/logs/worker-bulk.log /var/www/dikarya/var/logs/worker-high2.log /var/www/dikarya/var/logs/scanner.log {
     daily
     maxsize 25M
     rotate -1
