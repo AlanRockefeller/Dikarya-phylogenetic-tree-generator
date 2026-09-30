@@ -45,7 +45,12 @@ fill: black !important;
 fill: #00f; 
 }
 
-.branch {
+/* Alan 9/23/26 - A polytomy connector (tree_viewer_phylotree_v2.js) is a layout marker drawn
+   with the branch stroke. It is not class "branch", because phylotree binds every path.branch
+   to an edge, so it shares these rules' selector lists instead. This is also the stroke an
+   exported figure gets, since the #tree-container rules do not match inside the export. */
+.branch,
+.polytomy-connector {
 fill: none;
 stroke: #999;
 stroke-width: 2px;
@@ -58,12 +63,14 @@ stroke-width: 2px;
 opacity: 0.5;
 }
 
-.branch-selected {
+.branch-selected,
+.polytomy-connector.polytomy-connector-selected {
 stroke: #f00 !important; 
 stroke-width: 3px;
 }
 
-.branch-tagged {
+.branch-tagged,
+.polytomy-connector.polytomy-connector-tagged {
 stroke: #00f;
 stroke-dasharray: 10,5;
 stroke-width: 2px;

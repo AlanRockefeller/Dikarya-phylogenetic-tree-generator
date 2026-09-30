@@ -218,6 +218,102 @@ def tree_to_newick_string(tree) -> str:
     return _render_newick(tree)
 
 
+def _newick_tip_label_spans(text: str) -> list:
+    """``(start, end)`` of every tip label in a Newick string, in order.
+
+    An unlabelled tip gets an empty span at the point its label would go, so
+    the list lines up one-to-one with ``tree.get_terminals()``. Quoted labels
+    and bracketed comments are skipped whole, so a parenthesis or comma inside
+    either is never read as structure.
+    """
+    spans = []
+    expect_tip = False
+    i, n = 0, len(text)
+
+    def skip_quoted(pos: int) -> int:
+        pos += 1
+        while pos < n:
+            if text[pos] == "'":
+                if pos + 1 < n and text[pos + 1] == "'":
+                    pos += 2
+                    continue
+                return pos + 1
+            pos += 1
+        return pos
+
+    while i < n:
+        ch = text[i]
+        if ch == "[":
+            depth = 0
+            while i < n:
+                depth += {"[": 1, "]": -1}.get(text[i], 0)
+                i += 1
+                if depth == 0:
+                    break
+            continue
+        if ch.isspace():
+            i += 1
+            continue
+        if ch == "(" or (ch == "," and not expect_tip):
+            expect_tip = True
+            i += 1
+            continue
+        if expect_tip:
+            expect_tip = False
+            if ch in ",:);":
+                spans.append((i, i))
+                continue
+            start = i
+            if ch == "'":
+                i = skip_quoted(i)
+            else:
+                while i < n and text[i] not in "(),:;[]'" and not text[i].isspace():
+                    i += 1
+            spans.append((start, i))
+            continue
+        i = skip_quoted(i) if ch == "'" else i + 1
+    return spans
+
+
+def _unquote_newick_label(token: str) -> str:
+    if len(token) >= 2 and token[0] == token[-1] == "'":
+        return token[1:-1].replace("''", "'")
+    return token
+
+
+def relabel_newick_text(text: str, relabel) -> Optional[str]:
+    """Rename tips in a Newick string without re-serializing anything else.
+
+    ``relabel(name)`` returns the new tip name, or None to leave it. Only the
+    renamed labels are rewritten, so branch lengths, support values and
+    comments stay byte-for-byte as the tree builder wrote them -- a Biopython
+    round trip would round every support value to two decimals. Returns None if
+    the text cannot be matched tip-for-tip against Biopython's own parse, which
+    decides what each label means, so the caller can serve the file unchanged.
+    """
+    if not HAS_BIOPYTHON:
+        return None
+    try:
+        tree = Phylo.read(StringIO(text), "newick")
+    except Exception as exc:
+        logger.warning("Cannot parse Newick for relabelling: %s", exc)
+        return None
+    terminals = tree.get_terminals()
+    spans = _newick_tip_label_spans(text)
+    if len(spans) != len(terminals):
+        return None
+    edits = []
+    for (start, end), tip in zip(spans, terminals):
+        if _unquote_newick_label(text[start:end]) != (tip.name or ""):
+            return None
+        renamed = relabel(tip.name) if tip.name else None
+        if renamed is not None and renamed != tip.name:
+            edits.append((start, end, quote_tree_label(renamed)))
+    for start, end, label in reversed(edits):
+        text = text[:start] + label + text[end:]
+    return text
+
+
 def _terminal_labels(tree) -> list:
     """Return one existing, unique label per terminal or fail loudly."""
     labels = []
@@ -239,7 +335,13 @@ def _terminal_labels(tree) -> list:
 
 def write_nexus_tree(tree, path, tree_name: str = "tree1",
                      comment: Optional[str] = None) -> None:
-    """Write a valid NEXUS file for a single tree.
+    """Write a valid NEXUS file for a single tree (see `tree_to_nexus_text`)."""
+    Path(path).write_text(tree_to_nexus_text(tree, tree_name, comment), encoding="utf-8")
+
+
+def tree_to_nexus_text(tree, tree_name: str = "tree1",
+                       comment: Optional[str] = None) -> str:
+    """Render a single tree as valid NEXUS text.
 
     Biopython's own NEXUS writer cannot be used here (see the module
     docstring). Two things make this one safe:
@@ -298,7 +400,7 @@ def write_nexus_tree(tree, path, tree_name: str = "tree1",
     lines.append("END;")
     lines.append("")
 
-    Path(path).write_text("\n".join(lines), encoding="utf-8")
+    return "\n".join(lines)
 
 
 def write_tree_file(tree, path, fmt: str = "newick") -> None:
@@ -457,16 +559,9 @@ def newick_file_to_nexus_text(newick_path, comment: Optional[str] = None) -> Opt
     """
     if not HAS_BIOPYTHON:
         return None
-    import tempfile
-
     try:
         tree = Phylo.read(str(newick_path), "newick")
-        # write_nexus_tree writes a path; there is no string form of it, and
-        # duplicating its body to make one would be two writers to keep in step.
-        with tempfile.TemporaryDirectory() as scratch:
-            staged = Path(scratch) / "tree.nexus"
-            write_nexus_tree(tree, staged, comment=comment)
-            return staged.read_text(encoding="utf-8")
+        return tree_to_nexus_text(tree, comment=comment)
     except Exception as exc:
         logger.error("Failed to convert %s to NEXUS: %s", newick_path, exc)
         return None

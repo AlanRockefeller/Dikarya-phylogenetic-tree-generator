@@ -90,9 +90,26 @@ def _note_model_refusal(model: str) -> None:
     try:
         from app.services.request_diagnostics import note_tool_argument_refusal
 
-        note_tool_argument_refusal("raxml_model", model)
+        # A valid partition assignment ("p1=1-300/3") carries a codon-stride
+        # slash. When some OTHER component was what got the model rejected,
+        # that slash must not read as a path, so classify only the rest.
+        suspect = ",".join(
+            part for part in _split_model_string(model, ",")
+            if not _is_valid_partition_assignment(part)
+        )
+        note_tool_argument_refusal("raxml_model", suspect)
     except Exception:
         pass
+
+
+def _is_valid_partition_assignment(part: str) -> bool:
+    """Same syntax the validator accepts for ``name=range`` below."""
+    name, sep, spec = _normalize_raxml_model(part).partition("=")
+    return bool(
+        sep
+        and re.match(r"^[A-Za-z0-9_]+$", name)
+        and re.match(r"^[0-9\-\,\/]+$", spec)
+    )
 
 
 def _is_safe_model_param(value: str) -> bool:

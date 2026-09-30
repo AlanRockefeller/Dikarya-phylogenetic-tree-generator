@@ -76,6 +76,9 @@ NOTEWORTHY_INTERNAL_GAP_PERCENT = 1.0
 # branch is in practice anything below the resolution the substitution model
 # could distinguish. Metrics computed with this tolerance are named near_zero_*
 # so an exact-zero tally is never confused with a tolerance-based one.
+# The tree viewer uses the same floor, with the same <= comparison, as
+# ZERO_LENGTH_POLYTOMY_EPSILON in tree_viewer_phylotree_v2.js: at or below it a
+# branch is contracted into a polytomy and gets no support label. Change both.
 NEAR_ZERO_BRANCH_LENGTH = 1e-6
 # How many worst-offender rows to name. Long enough to see a pattern, short
 # enough that the prompt stays compact on a 2000-tip tree.
@@ -148,6 +151,13 @@ class TreeAnalysisUpstreamError(TreeAnalysisError):
     answered with something we cannot show", which is about the service behind
     us. The old code reported both as 400 and blamed the browser for an upstream
     failure.
+    """
+
+
+class TreeAnalysisTimeout(TreeAnalysisUpstreamError):
+    """Claude ran out of wall clock (still a 502). Split out so review_job() can
+    log `event=claude_review.timed_out` with the effort and tree size -- the
+    numbers needed to decide whether CLAUDE_REVIEW_EFFORT must come back down.
     """
 
 
@@ -3716,7 +3726,7 @@ def _call_claude_cli(
             "Claude review is not installed correctly on this server."
         ) from exc
     except subprocess.TimeoutExpired as exc:
-        raise TreeAnalysisUpstreamError(
+        raise TreeAnalysisTimeout(
             "Claude did not finish the review in time. Try again in a moment."
         ) from exc
 
@@ -3798,7 +3808,7 @@ def _call_claude_cli(
             completed.returncode, detail or "(no stderr)",
         )
         if completed.returncode in (124, 137):  # timeout / SIGKILL from `timeout`
-            raise TreeAnalysisUpstreamError(
+            raise TreeAnalysisTimeout(
                 "Claude did not finish the review in time. Try again in a moment."
             )
         if "sudo" in detail.lower():
@@ -3885,7 +3895,7 @@ def _call_claude(
         ) as stream:
             message = stream.get_final_message()
     except anthropic.APITimeoutError as exc:
-        raise TreeAnalysisUpstreamError(
+        raise TreeAnalysisTimeout(
             "Claude did not respond in time. Try again in a moment."
         ) from exc
     except anthropic.RateLimitError as exc:
@@ -4125,6 +4135,19 @@ def _append_usage_log(job_dir: Path, payload: Dict[str, Any]) -> None:
         logger.warning("Could not append Claude review usage log: %s", exc)
 
 
+def _log_review_timeout(context: Dict[str, Any], elapsed: float) -> None:
+    """One WARNING per timed-out review, whichever layer's clock fired."""
+    alignment = context.get("alignment") or {}
+    tree = context.get("tree") or {}
+    logger.warning(
+        "event=claude_review.timed_out backend=%s model=%s effort=%s "
+        "timeout_seconds=%s elapsed_seconds=%.1f sequences=%s columns=%s tips=%s",
+        _backend(), Config.CLAUDE_REVIEW_MODEL, Config.CLAUDE_REVIEW_EFFORT,
+        Config.CLAUDE_REVIEW_TIMEOUT_SECONDS, elapsed,
+        alignment.get("sequences"), alignment.get("columns"), tree.get("tips"),
+    )
+
+
 def review_job(job_dir: Path, *, force_refresh: bool = False) -> Dict[str, Any]:
     """Produce (or reuse) a Claude review of this job's alignment and tree."""
     if not is_configured():
@@ -4148,6 +4171,9 @@ def review_job(job_dir: Path, *, force_refresh: bool = False) -> Dict[str, Any]:
         slot = _acquire_slot()
         _reserve_daily_review()
         result = _call_claude(context, displayed_names)
+    except TreeAnalysisTimeout:
+        _log_review_timeout(context, time.monotonic() - started)
+        raise
     finally:
         if slot is not None:
             slot.release()

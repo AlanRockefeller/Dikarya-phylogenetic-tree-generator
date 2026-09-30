@@ -498,9 +498,18 @@ def _summarize_tree_quality(
         # degraded if more than a quarter of THAT tree's branches are zero.
         reduced = None
         if not duplicates_explain_zeros and redundant_duplicate_names:
-            reduced = _zero_branch_ratio_without_duplicates(
-                tree, redundant_duplicate_names
-            )
+            # Advisory: a deep tree can make deepcopy raise RecursionError, and
+            # that must read as "no reduction", never as an unparseable tree.
+            try:
+                reduced = _zero_branch_ratio_without_duplicates(
+                    tree, redundant_duplicate_names
+                )
+            except Exception:
+                logger_obj.warning(
+                    "Could not measure zero-length branches after duplicate "
+                    "reduction; judging the tree as built.", exc_info=True,
+                )
+                reduced = None
             if reduced is not None:
                 summary["zero_length_branches_after_dedup"] = reduced[0]
                 summary["branches_after_dedup"] = reduced[1]
@@ -958,27 +967,90 @@ def run_mycomap_blast_refresh_job(params: dict) -> dict:
     from app.services.mycomap_service import (
         MycoMapRerunError,
         get_mycomap_ncbi_rerun_wait_seconds,
-        rerun_mycomap_blast,
+        rerun_mycomap_result,
+        resolve_mycomap_result_reference,
         validate_mycomap_rerun_limit,
-        validate_mycomap_url,
+    )
+    from app.services.mycomap_org_service import (
+        OrgResultError, rerun_pending, status as org_status,
     )
 
     job = get_current_job()
     url = params.get("url", "")
-    blast_id = validate_mycomap_url(url)
-    if not blast_id:
+    try:
+        reference = resolve_mycomap_result_reference(url)
+    except OrgResultError as exc:
+        return {"status": "error", "error": str(exc)}
+    if not reference:
         return {"status": "error", "error": "Invalid Mycomap URL."}
+    blast_id = reference["result_id"]
+    org_provider = reference["provider"] == "org"
 
-    resuming = bool(job and job.meta.get("mycomap_refresh_stage") == "waiting_for_ncbi")
+    resuming = bool(job and job.meta.get("mycomap_refresh_stage") in
+                    {"waiting_for_ncbi", "waiting_for_org"})
     warnings = list((job.meta.get("mycomap_refresh_warnings") or [])) if (job and resuming) else []
 
-    if not resuming:
+    if org_provider:
+        if not resuming:
+            try:
+                before = org_status(blast_id)
+            except OrgResultError as exc:
+                return {"status": "error", "error": str(exc)}
+            wait_details = {
+                "result_id": blast_id,
+                "org_before_dates": {
+                    source: (before.get(source) or {}).get("xml_date")
+                    for source in ("local", "ncbi")
+                },
+                "org_wait_sources": [],
+                "warnings": warnings,
+            }
+            local_limit, local_error = validate_mycomap_rerun_limit(params.get("local_limit"), "local")
+            if local_error:
+                return {"status": "error", "error": local_error}
+            try:
+                rerun_mycomap_result(reference, "local", local_limit)
+                wait_details["org_wait_sources"].append("local")
+            except OrgResultError as exc:
+                warnings.append(f"MycoMap.org local rerun failed; using saved results. {exc}")
+            if params.get("rebuild_ncbi"):
+                ncbi_limit, ncbi_error = validate_mycomap_rerun_limit(params.get("ncbi_limit"), "ncbi")
+                if ncbi_error:
+                    return {"status": "error", "error": ncbi_error}
+                try:
+                    rerun_mycomap_result(reference, "ncbi", ncbi_limit)
+                    wait_details["org_wait_sources"].append("ncbi")
+                except OrgResultError as exc:
+                    warnings.append(f"MycoMap.org NCBI rerun failed; using saved results. {exc}")
+            if wait_details["org_wait_sources"]:
+                if job:
+                    job.meta["mycomap_refresh_stage"] = "waiting_for_org"
+                    job.meta["mycomap_org_refresh_details"] = wait_details
+                    job.meta["mycomap_refresh_warnings"] = warnings
+                    job.save_meta()
+                return Retry(max=120, interval=60)
+        else:
+            wait_details = dict(job.meta.get("mycomap_org_refresh_details") or {})
+            try:
+                pending = rerun_pending(wait_details)
+            except OrgResultError as exc:
+                return {"status": "error", "error": str(exc)}
+            if pending:
+                waits = int(job.meta.get("mycomap_org_refresh_waits") or 0) + 1
+                if waits > 120:
+                    return {"status": "error", "error": "MycoMap.org rerun did not finish after 120 checks."}
+                job.meta["mycomap_org_refresh_waits"] = waits
+                job.save_meta()
+                return Retry(max=120, interval=60)
+            warnings = list(wait_details.get("warnings") or [])
+
+    if not resuming and not org_provider:
         local_limit, local_error = validate_mycomap_rerun_limit(params.get("local_limit"), "local")
         if local_error:
             return {"status": "error", "error": local_error}
         try:
-            rerun_mycomap_blast(blast_id, result_type="local", limit=local_limit)
-        except MycoMapRerunError as exc:
+            rerun_mycomap_result(reference, "local", local_limit)
+        except (MycoMapRerunError, OrgResultError) as exc:
             warning = f"MycoMap local BLAST could not be refreshed; using saved results instead. {exc}"
             logger.warning("%s blast_id=%s", warning, blast_id)
             warnings.append(warning)
@@ -988,7 +1060,7 @@ def run_mycomap_blast_refresh_job(params: dict) -> dict:
             if ncbi_error:
                 return {"status": "error", "error": ncbi_error}
             try:
-                rerun_mycomap_blast(blast_id, result_type="ncbi", limit=ncbi_limit)
+                rerun_mycomap_result(reference, "ncbi", ncbi_limit)
                 wait_seconds = get_mycomap_ncbi_rerun_wait_seconds()
                 if job:
                     job.meta["mycomap_refresh_stage"] = "waiting_for_ncbi"
@@ -1004,7 +1076,7 @@ def run_mycomap_blast_refresh_job(params: dict) -> dict:
                     wait_seconds,
                 )
                 return Retry(max=1, interval=wait_seconds)
-            except MycoMapRerunError as exc:
+            except (MycoMapRerunError, OrgResultError) as exc:
                 warning = f"MycoMap NCBI BLAST could not be rebuilt; using saved results instead. {exc}"
                 logger.warning("%s blast_id=%s", warning, blast_id)
                 warnings.append(warning)
@@ -1036,25 +1108,72 @@ INAT_RATE_LIMIT_MAX_DEFERRALS = 60
 # does not spend the allowance above; it gets its own, sized for a throttle
 # that lasts most of a day (144 ten-minute cooldowns).
 INAT_COOLDOWN_MAX_WAITS = 144
+# MycoMap not answering while a legacy do=results link is resolved is the same
+# kind of transient outage: nothing was created, so waiting costs nothing.
+MYCOMAP_UNAVAILABLE_DEFER_SECONDS = 120
+MYCOMAP_UNAVAILABLE_MAX_DEFERRALS = 30
 
 
 def _defer_for_inat_rate_limit(job, job_id: str, exc: Exception) -> Optional[Retry]:
-    """Return an rq.Retry for a preparation pass iNaturalist rate-limited.
+    """Return an rq.Retry for a preparation pass an upstream outage stopped.
 
-    None means "fail as before": not a 429, no RQ job, or the allowance spent.
-    The job's preparation meta is left untouched, so the next pass resumes
-    exactly where this one was refused.
+    Covers an iNaturalist 429, MycoMap not answering (``mycomap_unavailable``
+    in the error's details) and MycoMap answering that the BLAST results are
+    not published yet (``mycomap_results_pending``). None means "fail as
+    before": none of those, no RQ job, or the allowance spent.
+    This helper leaves the preparation state alone; run_phylo_job puts back a
+    saved NCBI wait before returning the deferral, so a pass that was resuming
+    one resumes it again rather than starting the MycoMap work over.
     """
-    if job is None or getattr(exc, "status", None) != 429:
+    if job is None:
         return None
-    cooldown = int((getattr(exc, "details", None) or {}).get("inat_cooldown_seconds") or 0)
-    if cooldown > 0:
+    details = getattr(exc, "details", None) or {}
+    mycomap_unavailable = bool(details.get("mycomap_unavailable"))
+    results_pending = bool(details.get("mycomap_results_pending"))
+    if (not mycomap_unavailable and not results_pending
+            and getattr(exc, "status", None) != 429):
+        return None
+    cooldown = int(details.get("inat_cooldown_seconds") or 0)
+    if results_pending:
+        # Not an outage: MycoMap answered, it just has no BLAST results for
+        # this sequence yet. Poll on the same rolling backoff and budget as a
+        # just-created search (1 min, then 5, 15, 60 as the wait grows).
+        from app.services.mycomap_service import (
+            get_mycomap_creation_discovery_max_attempts,
+            get_mycomap_creation_discovery_poll_interval_seconds,
+        )
+        meta_key = "mycomap_results_pending_waits"
+        limit = get_mycomap_creation_discovery_max_attempts()
+        since = float(job.meta.get("mycomap_results_pending_since") or time.time())
+        job.meta["mycomap_results_pending_since"] = since
+        wait_seconds = get_mycomap_creation_discovery_poll_interval_seconds(
+            int(time.time() - since)
+        )
+        service, detail, reason = (
+            "MycoMap", "MycoMap has not published the BLAST results for this sequence yet.",
+            "mycomap_results_pending",
+        )
+    elif mycomap_unavailable:
+        meta_key, limit = "mycomap_unavailable_deferrals", MYCOMAP_UNAVAILABLE_MAX_DEFERRALS
+        wait_seconds = MYCOMAP_UNAVAILABLE_DEFER_SECONDS + random.randint(0, 30)
+        service, detail, reason = (
+            "MycoMap", "MycoMap is not answering right now.", "mycomap_unavailable",
+        )
+    elif cooldown > 0:
         meta_key, limit = "inat_cooldown_waits", INAT_COOLDOWN_MAX_WAITS
         # Spread the resumptions so the queue does not all return at once.
         wait_seconds = cooldown + random.randint(0, 30)
+        service, detail, reason = (
+            "iNaturalist", "iNaturalist is rate-limiting requests right now.",
+            "inat_cooldown",
+        )
     else:
         meta_key, limit = "inat_rate_limit_deferrals", INAT_RATE_LIMIT_MAX_DEFERRALS
         wait_seconds = INAT_RATE_LIMIT_DEFER_SECONDS
+        service, detail, reason = (
+            "iNaturalist", "iNaturalist is rate-limiting requests right now.",
+            "inat_rate_limited",
+        )
     deferrals = int(job.meta.get(meta_key) or 0)
     if deferrals >= limit:
         return None
@@ -1064,8 +1183,8 @@ def _defer_for_inat_rate_limit(job, job_id: str, exc: Exception) -> Optional[Ret
     job.meta[meta_key] = deferrals + 1
     job.meta["steps"][STEP_INPUT].update({
         "state": STATE_QUEUED,
-        "label": "Waiting for iNaturalist",
-        "detail": "iNaturalist is rate-limiting requests right now.",
+        "label": f"Waiting for {service}",
+        "detail": detail,
     })
     job.meta["current_step"] = STEP_INPUT
     job.save_meta()
@@ -1075,7 +1194,7 @@ def _defer_for_inat_rate_limit(job, job_id: str, exc: Exception) -> Optional[Ret
         db.session.commit()
     publish_overview(
         job_id,
-        "iNaturalist is rate-limiting requests right now. Dikarya will try "
+        f"{detail} Dikarya will try "
         + ("again in a minute" if wait_seconds < 120
            else f"again in about {round(wait_seconds / 60)} minutes")
         + "; nothing about this job needs to change.",
@@ -1085,10 +1204,9 @@ def _defer_for_inat_rate_limit(job, job_id: str, exc: Exception) -> Optional[Ret
     # rather than borrowing from a MycoMap wait's budget.
     retries_done = getattr(job, "number_of_retries", None) or 0
     logger.info(
-        "event=job.deferred Waiting out the iNaturalist rate limit "
+        "event=job.deferred Waiting out an upstream outage "
         "reason=%s resume_in_seconds=%s attempt=%s/%s",
-        "inat_cooldown" if cooldown > 0 else "inat_rate_limited",
-        wait_seconds, deferrals + 1, limit,
+        reason, wait_seconds, deferrals + 1, limit,
     )
     return Retry(max=retries_done + 1, interval=wait_seconds)
 
@@ -1283,24 +1401,30 @@ def run_phylo_job(job_params: dict) -> dict:
 
                 with step_heartbeat(job_id, STEP_INPUT, current_step_label):
                     if tree_preparation_kind == "mo":
-                        from app.services.mushroom_observer_service import prepare_tree_job
-
-                        prepared = prepare_tree_job(
-                            tree_preparation,
-                            defer_after_ncbi_rerun=not tree_resuming_after_ncbi,
-                            skip_mycomap_refresh=tree_resuming_after_ncbi,
-                            mycomap_rerun_details=(
-                                job.meta.get("mycomap_rerun_details") if job else None
-                            ),
-                            progress=_mycomap_progress,
+                        from app.services.mushroom_observer_service import (
+                            MushroomObserverError as PreparationError,
+                            prepare_tree_job,
                         )
                     else:
                         from app.services.inaturalist_tree_service import (
-                            InatTreeError,
+                            InatTreeError as PreparationError,
                             prepare_inat_tree_job,
                         )
 
-                        try:
+                    # MO and iNat preparation defer the same way on a MycoMap
+                    # outage; MO used to fail outright on a MycoMap.org 502.
+                    try:
+                        if tree_preparation_kind == "mo":
+                            prepared = prepare_tree_job(
+                                tree_preparation,
+                                defer_after_ncbi_rerun=not tree_resuming_after_ncbi,
+                                skip_mycomap_refresh=tree_resuming_after_ncbi,
+                                mycomap_rerun_details=(
+                                    job.meta.get("mycomap_rerun_details") if job else None
+                                ),
+                                progress=_mycomap_progress,
+                            )
+                        else:
                             prepared = prepare_inat_tree_job(
                                 int(tree_preparation["observation_id"]),
                                 include_ncbi=bool(tree_preparation.get("include_ncbi", True)),
@@ -1329,11 +1453,20 @@ def run_phylo_job(job_params: dict) -> dict:
                                 # job's own copy of the observation between polls.
                                 observation_reuse_owner=job_id,
                             )
-                        except InatTreeError as exc:
-                            deferral = _defer_for_inat_rate_limit(job, job_id, exc)
-                            if deferral is None:
-                                raise
-                            return deferral
+                    except PreparationError as exc:
+                        deferral = _defer_for_inat_rate_limit(job, job_id, exc)
+                        if deferral is None:
+                            raise
+                        # Alan 9/23/26 - This pass set the preparation state to
+                        # "running" when it started. If it was resuming an NCBI
+                        # wait, put that back: otherwise the retry would redo the
+                        # MycoMap refresh it already made. A first pass has no
+                        # wait to resume, and marking it waiting would skip the
+                        # refresh that never happened.
+                        if tree_resuming_after_ncbi:
+                            job.meta[tree_preparation_meta_key] = "waiting_for_ncbi"
+                            job.save_meta()
+                        return deferral
                 if prepared.get("status") == "waiting_for_ncbi":
                     from app.services.mycomap_service import (
                         get_mycomap_bulk_throttle_max_wait_attempts,
@@ -1349,6 +1482,7 @@ def run_phylo_job(job_params: dict) -> dict:
 
                     rerun_details = prepared.get("mycomap_rerun_details") or {}
                     auto_created = bool(rerun_details.get("auto_created"))
+                    org_rerun = rerun_details.get("provider") == "org"
                     creation_pending = bool(rerun_details.get("creation_pending"))
                     if auto_created and creation_pending:
                         discovery_elapsed = int(
@@ -1360,17 +1494,23 @@ def run_phylo_job(job_params: dict) -> dict:
                     else:
                         wait_seconds = (
                             get_mycomap_ncbi_poll_interval_seconds()
-                            if auto_created else get_mycomap_ncbi_rerun_wait_seconds()
+                            if auto_created or org_rerun else get_mycomap_ncbi_rerun_wait_seconds()
                         )
-                    # A bulk job can also wait its turn for a MycoMap creation
-                    # slot before any of that starts; give that wait its own
-                    # allowance so a long batch cannot exhaust the budget.
-                    max_retry_attempts = (
-                        get_mycomap_creation_discovery_max_attempts()
-                        + get_mycomap_ncbi_poll_max_attempts()
-                        + get_mycomap_bulk_throttle_max_wait_attempts()
-                        if auto_created else 1
-                    )
+                    # A bulk job can wait for a creation slot before discovery
+                    # or NCBI polling starts. Count that phase separately, with
+                    # its own allowance, so neither phase can spend the other's.
+                    throttle_wait = bool(rerun_details.get("creation_throttled"))
+                    if throttle_wait:
+                        wait_counter_key = "mycomap_throttle_waits"
+                        max_retry_attempts = get_mycomap_bulk_throttle_max_wait_attempts()
+                    else:
+                        wait_counter_key = "mycomap_wait_attempts"
+                        max_retry_attempts = (
+                            get_mycomap_creation_discovery_max_attempts()
+                            + get_mycomap_ncbi_poll_max_attempts()
+                            if auto_created else
+                            get_mycomap_ncbi_poll_max_attempts() if org_rerun else 1
+                        )
                     # Alan 9/23/26 - RQ 2.6.1 only increments number_of_retries on
                     # the immediate-requeue path (Job._handle_retry_result); a
                     # Retry with an interval is rescheduled without counting, so
@@ -1379,9 +1519,14 @@ def run_phylo_job(job_params: dict) -> dict:
                     # attempt=1). Count the waits ourselves and fail through the
                     # normal error path, which marks the job row failed.
                     wait_attempts = (
-                        int(job.meta.get("mycomap_wait_attempts") or 0) if job else 0
+                        int(job.meta.get(wait_counter_key) or 0) if job else 0
                     ) + 1
                     if wait_attempts > max_retry_attempts:
+                        if throttle_wait:
+                            raise RuntimeError(
+                                "No MycoMap BLAST slot freed up in time; nothing "
+                                "was created. Rebuild the tree later."
+                            )
                         raise RuntimeError(
                             "MycoMap did not return this observation's BLAST "
                             f"results after {max_retry_attempts} checks. The "
@@ -1393,7 +1538,9 @@ def run_phylo_job(job_params: dict) -> dict:
                     # A rerun deferral never polls, so it has no queue position of
                     # its own -- ask once here, since this message is the only thing
                     # telling the user how long the MycoMap wait is likely to be.
-                    if not auto_created and not creation_pending:
+                    if not auto_created and not creation_pending and (
+                        not org_rerun or "ncbi" in (rerun_details.get("org_wait_sources") or [])
+                    ):
                         rerun_details = record_mycomap_queue_position(
                             rerun_details,
                             get_mycomap_ncbi_queue_position(
@@ -1425,7 +1572,8 @@ def run_phylo_job(job_params: dict) -> dict:
                                 "frees up."
                             )
                         elif (rerun_details.get("creation_unconfirmed")
-                              and not rerun_details.get("creation_pending_blast_id")):
+                              and not rerun_details.get("creation_pending_blast_id")
+                              and not rerun_details.get("creation_pending_job_id")):
                             waiting_message = (
                                 "MycoMap did not answer the request to create the "
                                 "BLAST search in time. Dikarya is checking whether "
@@ -1458,6 +1606,11 @@ def run_phylo_job(job_params: dict) -> dict:
                                     f"NCBI results are not ready yet; check {poll_attempt + 1} "
                                     "will run in one minute."
                                 )
+                    elif org_rerun:
+                        waiting_message = (
+                            "MycoMap.org BLAST results are updating. This tree will "
+                            "check again in about one minute; other tree jobs can run meanwhile."
+                        )
                     else:
                         waiting_message = (
                             "MycoMap NCBI BLAST was queued. This tree will resume "
@@ -1490,7 +1643,7 @@ def run_phylo_job(job_params: dict) -> dict:
                         db.session.commit()
 
                     if job:
-                        job.meta["mycomap_wait_attempts"] = wait_attempts
+                        job.meta[wait_counter_key] = wait_attempts
                         job.meta[tree_preparation_meta_key] = "waiting_for_ncbi"
                         job.meta["mycomap_rerun_details"] = rerun_details
                         job.meta["mycomap_ncbi_resume_at"] = resume_at.isoformat()
@@ -1498,7 +1651,8 @@ def run_phylo_job(job_params: dict) -> dict:
                             job.meta["mycomap_refresh_warnings"] = refresh_warnings
                         job.meta["steps"][STEP_INPUT].update({
                             "state": STATE_QUEUED,
-                            "label": "Waiting for MycoMap NCBI Results",
+                            "label": ("Waiting for MycoMap Results" if org_rerun
+                                      else "Waiting for MycoMap NCBI Results"),
                             "detail": waiting_message,
                         })
                         job.meta["current_step"] = STEP_INPUT
@@ -1515,8 +1669,10 @@ def run_phylo_job(job_params: dict) -> dict:
                     # is our own wait_attempts counter (see above), not RQ's.
                     logger.info(
                         "event=job.deferred Waiting for MycoMap NCBI results "
-                        "reason=mycomap_ncbi_rerun resume_in_seconds=%s "
-                        "attempt=%s/%s attempts_remaining=%s",
+                        "reason=%s resume_in_seconds=%s attempt=%s/%s "
+                        "attempts_remaining=%s",
+                        ("mycomap_creation_throttled" if throttle_wait
+                         else "mycomap_ncbi_rerun"),
                         wait_seconds, wait_attempts, max_retry_attempts,
                         max(max_retry_attempts - wait_attempts, 0),
                     )
@@ -1637,15 +1793,18 @@ def run_phylo_job(job_params: dict) -> dict:
                 # entirely, and an "All 3 submitted sequences are identical"
                 # warning now names the wrong count. The status page reads them
                 # off Job.metrics, so both copies have to be refreshed.
-                from app.workers.queue import apply_input_warnings
-
-                refreshed_warnings = apply_input_warnings(job_params)
-                _save_job_params(input_info_path, job_params)
                 try:
+                    from app.workers.queue import apply_input_warnings
+
+                    refreshed_warnings = apply_input_warnings(job_params)
+                    _save_job_params(input_info_path, job_params)
                     warned_job = Job.query.get(job_id)
                     if warned_job:
                         metrics = dict(warned_job.metrics or {})
-                        metrics["input_warnings"] = refreshed_warnings
+                        if refreshed_warnings:
+                            metrics["input_warnings"] = refreshed_warnings
+                        else:
+                            metrics.pop("input_warnings", None)
                         warned_job.metrics = metrics
                         db.session.commit()
                 except Exception:

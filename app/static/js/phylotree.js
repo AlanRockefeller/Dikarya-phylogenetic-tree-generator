@@ -10787,16 +10787,11 @@
       ];
 
       if (svg) {
+        // Alan 9/23/26 - Record the radial layout translate and keep any camera on top of it.
+        this.layout_translate = [pad_radius, pad_radius + vertical_offset];
         svg
           .selectAll("." + css_classes["tree-container"])
-          .attr(
-            "transform",
-            "translate (" +
-              pad_radius +
-              "," +
-              (pad_radius + vertical_offset) +
-              ")"
-          );
+          .attr("transform", this.cameraThenLayout(this.layout_translate));
       }
     } else {
 
@@ -10901,6 +10896,32 @@
     return "";
   }
 
+  // Alan 9/23/26 - The tree container's transform is the D3 camera (pan/zoom) applied ON TOP
+  // of the layout translate. Layout passes (update, resizeSvg) and the zoom handler all write
+  // it through here. Each used to replace the other: the first pan or zoom after a draw threw
+  // the layout translate away, so the tree jumped -- by a whole label width in radial layout,
+  // where it read as "the tree is off to the side until I nudge it" -- and a spacing change
+  // after a pan threw the pan away. `camera` defaults to the SVG's live D3 state.
+  function cameraThenLayout(layout, camera) {
+    const svgNode = this.svg && this.svg.node && this.svg.node();
+    const cam = camera || (svgNode && svgNode.__zoom) || identity;
+    return cam.toString() + " " + d3PhylotreeSvgTranslate(layout);
+  }
+
+  // Alan 9/23/26 - Wheel zoom step for the tree camera. D3's default multiplies the step by 10
+  // whenever Ctrl is held, because browsers report a trackpad pinch as a Ctrl+wheel with tiny
+  // deltas. A real mouse notch (deltaY ~100) then zoomed 2^(100 * 0.002 * 10) = 4x per click.
+  // Keep D3's scaling, so a pinch feels exactly as before, but never move more than one
+  // zoom-button step (1.25x, triggerZoom in tree_viewer_controller.js) per wheel event.
+  const MAX_WHEEL_ZOOM_STEP = Math.log2(1.25);
+  function boundedWheelDelta(event) {
+    const delta = -event.deltaY
+      * (event.deltaMode === 1 ? 0.05 : event.deltaMode ? 1 : 0.002)
+      * (event.ctrlKey ? 10 : 1);
+    if (!Number.isFinite(delta)) return 0;
+    return Math.max(-MAX_WHEEL_ZOOM_STEP, Math.min(MAX_WHEEL_ZOOM_STEP, delta));
+  }
+
   function d3PhylotreeSvgRotate(a) {
     if (a !== null) {
       return "rotate (" + a + ") ";
@@ -10919,6 +10940,10 @@
     d3PhylotreeEventListener: d3PhylotreeEventListener,
     d3PhylotreeAddEventListener: d3PhylotreeAddEventListener,
     d3PhylotreeSvgTranslate: d3PhylotreeSvgTranslate,
+    // Alan 9/23/26 - Shared by every writer of the tree container's transform.
+    cameraThenLayout: cameraThenLayout,
+    // Alan 9/23/26 - The camera's wheel step, exposed so the invariant harness can pin it.
+    boundedWheelDelta: boundedWheelDelta,
     d3PhylotreeSvgRotate: d3PhylotreeSvgRotate
   });
 
@@ -12418,10 +12443,12 @@
         .attr("class", css_classes["tree-container"])
         .merge(enclosure)
         .attr("transform", d => {
-          return this.d3PhylotreeSvgTranslate([
+          // Alan 9/23/26 - Record the layout translate and keep any camera on top of it.
+          this.layout_translate = [
             this.offsets[1] + this.options["left-offset"],
             this.pad_height()
-          ]);
+          ];
+          return this.cameraThenLayout(this.layout_translate);
         });
 
       if (this.draw_scale_bar) {
@@ -12436,10 +12463,12 @@
           .style("font-size", this.ensure_size_is_in_px(this.scale_bar_font_size))
           .merge(scale_bar)
           .attr("transform", d => {
-            return this.d3PhylotreeSvgTranslate([
+            // Alan 9/23/26 - Same camera-on-layout composition as the tree container.
+            this.scale_bar_translate = [
               this.offsets[1] + this.options["left-offset"],
               this.pad_height() - 10
-            ]);
+            ];
+            return this.cameraThenLayout(this.scale_bar_translate);
           })
           .call(this.draw_scale_bar);
 
@@ -12574,6 +12603,8 @@
       if (this.options["zoom"]) {
         let zoom$1 = zoom()
           .scaleExtent([0.1, 10])
+          // Alan 9/23/26 - At most one zoom-button step per Ctrl+wheel click (was 4x).
+          .wheelDelta(boundedWheelDelta)
           // Alan 8/16/26 - Dikarya change: pan with the RIGHT mouse button so the left
           // button is free for box select. Node right-drags are excluded so the tip and
           // internal-node context menus still open. Non-mouse gestures (wheel, touch)
@@ -12592,14 +12623,18 @@
           })
           .on("zoom", (event) => {
 
-            select("." + css_classes["tree-container"]).attr("transform", event.transform);
+            // Alan 9/23/26 - Apply the camera on top of the layout translate instead of in
+            // place of it (see cameraThenLayout); replacing it made the first pan jump.
+            select("." + css_classes["tree-container"]).attr(
+              "transform", this.cameraThenLayout(this.layout_translate, event.transform));
 
             // Alan 8/28/26 - The D3 transform above is authoritative camera state. The old
             // scale-bar callback aliased event.transform and subtracted from y in place, so
             // every pan/pinch/button event accumulated a phantom offset in D3 itself.
-            const scaleBarTransform = `translate(${event.transform.x},${event.transform.y - 10}) scale(${event.transform.k})`;
+            // Alan 9/23/26 - It is still only read: the bar's 10px lift lives in its layout translate.
+            const scaleBarTransform = this.cameraThenLayout(this.scale_bar_translate, event.transform);
             select("." + css_classes["tree-scale-bar"]).attr("transform", scaleBarTransform);
-            
+
           });
 
         // Alan 8/28/26 - Expose this exact behavior to supported programmatic camera controls;
@@ -13443,6 +13478,15 @@
         viewportRect.top + viewportRect.height / 2 - svgRect.top
       ];
       this.svg.call(this.zoom_behavior.scaleBy, factor, point);
+      return true;
+    }
+
+    // Alan 9/23/26 - Set the camera outright (scale k, then offset x,y in screen pixels) through
+    // the same D3 behavior that pan and pinch use, so the next gesture continues from it.
+    set_camera(k, x, y) {
+      if (!this.svg || !this.zoom_behavior) return false;
+      if (![k, x, y].every(Number.isFinite) || k <= 0) return false;
+      this.svg.call(this.zoom_behavior.transform, new Transform(k, x, y));
       return true;
     }
 

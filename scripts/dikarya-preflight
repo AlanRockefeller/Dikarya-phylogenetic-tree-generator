@@ -34,7 +34,7 @@ fi
 
 # Modules that must import cleanly for the app to serve or process a job. Add to
 # this list, do not replace it.
-if .venv/bin/python -c "import app.workers.tasks, app.workers.queue, app.api.routes, app.api_v1.routes, app.main.routes, app.services.api_diagnostics, app.services.inat_finder_service, app.services.scanner_burst, app.monitoring.services"; then
+if .venv/bin/python -c "import app.workers.tasks, app.workers.queue, app.api.routes, app.api_v1.routes, app.main.routes, app.services.api_diagnostics, app.services.mycomap_org_service, app.services.inat_finder_service, app.services.scanner_burst, app.services.type_specimen_service, app.monitoring.services"; then
     echo "preflight: imports OK"
 else
     echo "preflight: FAILED -- do not restart; the traceback above is what users would get as a 500" >&2

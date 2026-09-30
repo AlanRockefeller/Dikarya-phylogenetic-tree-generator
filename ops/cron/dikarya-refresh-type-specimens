@@ -1,0 +1,23 @@
+# Weekly refresh of the type-specimen reference data the tree viewer marks
+# tips from (app/services/type_specimen_service.py).
+#
+# Install for the `tree` user. `crontab <file>` REPLACES the whole crontab, and
+# tree already runs the log digest from one, so append rather than install:
+#     (crontab -l; cat /var/www/dikarya/ops/cron/dikarya-refresh-type-specimens) | crontab -
+# Inspect:  crontab -l
+#
+# Runs as tree because cache/type_specimens is tree-owned (group dikarya, 2775,
+# like cache/blast): tree replaces the MycoMap snapshot, and the web and worker
+# processes append GenBank answers to the same directory.
+#
+# Runs 04:40 UTC every Monday:
+#   - mycomap  re-downloads the MycoMap type list (~170 requests, ~1 minute);
+#              refuses a snapshot >10% smaller than the last one
+#   - genbank  asks NCBI about RefSeq NR_ and type-labelled accessions in jobs
+#              from the last 8 days that neither source knows yet
+# Exits 1 if a pass failed; the previous data stays in place.
+
+SHELL=/bin/bash
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+40 4 * * 1 mkdir -p $HOME/.dikarya/type-specimens && cd /var/www/dikarya && /var/www/dikarya/.venv/bin/python /var/www/dikarya/scripts/dikarya_refresh_type_specimens.py --since-days 8 > $HOME/.dikarya/type-specimens/$(date -u +\%Y-\%m-\%d).txt 2>&1; find $HOME/.dikarya/type-specimens -name '*.txt' -mtime +90 -delete

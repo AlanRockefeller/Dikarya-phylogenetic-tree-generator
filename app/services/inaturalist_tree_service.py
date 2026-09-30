@@ -13,7 +13,9 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
+import tempfile
 import threading
 import time
 import urllib.parse
@@ -1310,6 +1312,20 @@ DEFAULT_TREE_PARAMS = {
 }
 
 
+def default_bootstrap_params() -> Dict[str, Any]:
+    """The ``bootstrap`` entry for one-click job params, or none at all.
+
+    Quick Tree (``iqtree_fast``) and FastTree run no bootstrap, so recording
+    the generic count would put replicates that never ran into input_info.json
+    and onto the job page. The key is omitted rather than set to None because
+    readers call ``int(job_params.get("bootstrap", <default>))`` -- the same
+    rule ``create_job`` applies to web submissions.
+    """
+    if DEFAULT_TREE_PARAMS["tree_method"] in ("fasttree", "iqtree_fast"):
+        return {}
+    return {"bootstrap": DEFAULT_TREE_PARAMS["bootstrap"]}
+
+
 def _report_progress(progress, message: str, icon: str = "running") -> None:
     """Send a human-readable step note to the caller's Activity Feed, if any.
 
@@ -1329,7 +1345,8 @@ def _refresh_mycomap_blast_results(blast_id: str, *, rebuild_ncbi_blast: bool = 
                                    rebuild_local_blast: bool = True,
                                    mycomap_local_limit=None,
                                    mycomap_ncbi_limit=None,
-                                   progress=None) -> Dict[str, Any]:
+                                   progress=None,
+                                   mycomap_url: Optional[str] = None) -> Dict[str, Any]:
     """Refresh MycoMap BLAST results before importing FASTA for a tree job.
 
     The automatic local refresh is best-effort so a missing API key or a
@@ -1338,9 +1355,23 @@ def _refresh_mycomap_blast_results(blast_id: str, *, rebuild_ncbi_blast: bool = 
     """
     from app.services.mycomap_service import (
         MycoMapRerunError,
-        rerun_mycomap_blast,
+        rerun_mycomap_result,
+        resolve_mycomap_result_reference,
         validate_mycomap_rerun_limit,
     )
+    from app.services.mycomap_org_service import OrgResultError, status as org_status
+
+    reference = (resolve_mycomap_result_reference(mycomap_url)
+                 if mycomap_url else None)
+    if reference is None:
+        reference = {"provider": "com", "result_id": blast_id}
+    org_before_dates = {}
+    if reference["provider"] == "org":
+        before = org_status(reference["result_id"])
+        org_before_dates = {
+            source: (before.get(source) or {}).get("xml_date")
+            for source in ("local", "ncbi")
+        }
 
     local_limit, local_error = validate_mycomap_rerun_limit(mycomap_local_limit, "local")
     if local_error:
@@ -1364,14 +1395,12 @@ def _refresh_mycomap_blast_results(blast_id: str, *, rebuild_ncbi_blast: bool = 
             f"Refreshing MycoMap local BLAST results (top {local_limit})...",
         )
         try:
-            result["local"] = rerun_mycomap_blast(
-                blast_id, result_type="local", limit=local_limit
-            )
-            result["local_status"] = "completed"
+            result["local"] = rerun_mycomap_result(reference, "local", local_limit)
+            result["local_status"] = "queued" if reference["provider"] == "org" else "completed"
             _report_progress(
                 progress, "MycoMap local BLAST results refreshed.", icon="done"
             )
-        except MycoMapRerunError as exc:
+        except (MycoMapRerunError, OrgResultError) as exc:
             warning = (
                 "MycoMap local BLAST could not be refreshed; Dikarya will use "
                 f"the saved MycoMap results instead. {exc}"
@@ -1385,8 +1414,17 @@ def _refresh_mycomap_blast_results(blast_id: str, *, rebuild_ncbi_blast: bool = 
             progress,
             f"Requesting a MycoMap NCBI BLAST rebuild (top {ncbi_limit})...",
         )
-        result["ncbi"] = rerun_mycomap_blast(blast_id, result_type="ncbi", limit=ncbi_limit)
+        result["ncbi"] = rerun_mycomap_result(reference, "ncbi", ncbi_limit)
         result["ncbi_status"] = "queued"
+    result["provider"] = reference["provider"]
+    result["result_id"] = reference["result_id"]
+    if reference["provider"] == "org":
+        result["org_before_dates"] = org_before_dates
+        result["org_wait_sources"] = [
+            source for source, requested in (("local", rebuild_local_blast),
+                                             ("ncbi", rebuild_ncbi_blast))
+            if requested and (source != "local" or result["local_status"] == "queued")
+        ]
     return result
 
 
@@ -1819,7 +1857,7 @@ def _build_inat_tree_job_params(observation_id: int, mycomap_url: str,
         "alignment_options": {},
         "tree_method": DEFAULT_TREE_PARAMS["tree_method"],
         "tree_model": DEFAULT_TREE_PARAMS["tree_model"],
-        "bootstrap": DEFAULT_TREE_PARAMS["bootstrap"],
+        **default_bootstrap_params(),
         "mcmc_generations": DEFAULT_TREE_PARAMS["mcmc_generations"],
         "mcmc_nruns": 2,
         "mcmc_nchains": 4,
@@ -1936,18 +1974,16 @@ def _create_mycomap_blast_from_observation(observation: Dict[str, Any],
                                            ) -> Dict[str, Any]:
     """Create a MycoMap search from an observation's ITS and write its URL back.
 
-    ``write_inat_field=False`` creates and uses the search exactly as normal but
-    leaves the observation's Mycomap BLAST Results field untouched. That is for
-    an observation whose saved value is a mycomap.org URL this app cannot
-    resolve yet: the .org value is correct and the user's, so we build the tree
-    from our own replacement .com search rather than overwriting theirs.
+    ``write_inat_field=False`` leaves the observation's saved field untouched.
     """
     from app.services.fasta_utils import clean_dna_sequence
     from app.services.mycomap_service import (
         advance_mycomap_creation_discovery,
         MycoMapCreateError,
         create_mycomap_blast,
+        find_mycomap_blast_by_known_id,
         find_mycomap_blast_by_title,
+        recalled_blast_id_for_title,
         get_mycomap_creation_discovery_max_seconds,
         release_bulk_mycomap_creation,
         reserve_bulk_mycomap_creation,
@@ -1976,9 +2012,38 @@ def _create_mycomap_blast_from_observation(observation: Dict[str, Any],
     # first pass already checked history for this title, so skip the lookup
     # while it waits for a slot (history is MycoMap's heaviest BLAST query).
     was_throttled = bool((pending_creation_details or {}).get("creation_throttled"))
-    created = None if was_throttled else find_mycomap_blast_by_title(
-        job_title, warnings=discovery_warnings, pending_out=pending_creation
-    )
+    # Once history has told us the search's ID, resolve it by that ID: a large
+    # batch pushes older searches out of both the history page and the listing,
+    # so the title lookup stops finding them (see find_mycomap_blast_by_known_id).
+    known_id = str(
+        (pending_creation_details or {}).get("creation_pending_blast_id")
+        or (recalled_blast_id_for_title(job_title)
+            if (pending_creation_details or {}).get("creation_pending") else "")
+        or ""
+    ).strip()
+    created = None
+    if known_id and not was_throttled:
+        created = find_mycomap_blast_by_known_id(
+            known_id, job_title, warnings=discovery_warnings
+        )
+        if not created:
+            # A stored id may be a MycoMap job id rather than the result's
+            # r<id> (jobs saved before the two were told apart), and then the
+            # known-id path can never resolve it. The title lookup reads the
+            # shared history page, so asking it too is cheap.
+            created = find_mycomap_blast_by_title(
+                job_title, warnings=discovery_warnings, pending_out=pending_creation
+            )
+        # Carrying an ID keeps the queue-position report and the
+        # creation-confirmed check working.
+        pending_creation.setdefault("blast_id", known_id)
+    elif not was_throttled:
+        # A timed-out create is judged by what this lookup does NOT find, so it
+        # must read MycoMap's history directly rather than a shared cached page.
+        created = find_mycomap_blast_by_title(
+            job_title, warnings=discovery_warnings, pending_out=pending_creation,
+            fresh=bool((pending_creation_details or {}).get("creation_unconfirmed")),
+        )
     # A create POST that timed out is pending like any other, but is re-sent
     # once MycoMap's history shows it never arrived.
     recreate = False
@@ -2226,7 +2291,15 @@ def _record_creation_queue_position(details: dict, pending: dict) -> dict:
     pending_id = str((pending or {}).get("blast_id") or "").strip()
     if not pending_id:
         return details
-    details["creation_pending_blast_id"] = pending_id
+    # Only a result id may drive find_mycomap_blast_by_known_id, which resolves
+    # it as r<id>. A bare MycoMap job id is kept for the queue position and the
+    # unconfirmed-create check, and the title lookup keeps running.
+    if (pending or {}).get("id_kind") == "job":
+        details["creation_pending_job_id"] = pending_id
+        if details.get("creation_pending_blast_id") == pending_id:
+            del details["creation_pending_blast_id"]
+    else:
+        details["creation_pending_blast_id"] = pending_id
     return record_mycomap_queue_position(
         details, get_mycomap_ncbi_queue_position(blast_id=pending_id)
     )
@@ -2352,7 +2425,8 @@ def _poll_auto_created_mycomap_ncbi_results(
     return False, details
 
 
-def _append_fasta_to_job_input(job_dir, fasta_text: str) -> int:
+def _append_fasta_to_job_input(job_dir, fasta_text: str, *,
+                               sequence_records=None, added_records=None) -> int:
     """
     Append newly-available sequences to a job's original input FASTA,
     de-duplicating against what's already there. Reuses the same
@@ -2368,7 +2442,9 @@ def _append_fasta_to_job_input(job_dir, fasta_text: str) -> int:
     from app.services.mycomap_service import compact_mycomap_ncbi_header
 
     sequences_to_add = [
-        s for s in _parse_fasta_sequences(fasta_text) if s.get("sequence", "").strip()
+        dict(s) for s in (sequence_records if sequence_records is not None
+                          else _parse_fasta_sequences(fasta_text))
+        if s.get("sequence", "").strip()
     ]
     if not sequences_to_add:
         return 0
@@ -2378,33 +2454,95 @@ def _append_fasta_to_job_input(job_dir, fasta_text: str) -> int:
     # the same here, or a tree that gained its NCBI hits on the recheck shows
     # whole GenBank definition lines as tip labels while a tree that got them
     # up front does not.
-    for seq in sequences_to_add:
-        seq["name"] = compact_mycomap_ncbi_header(seq.get("name", ""))
+    if sequence_records is None:
+        for seq in sequences_to_add:
+            seq["name"] = compact_mycomap_ncbi_header(seq.get("name", ""))
+
+    from app.services.artifact_storage import default_file_mode
 
     input_path = job_dir / "input" / "input_raw.fasta"
     input_path.parent.mkdir(parents=True, exist_ok=True)
 
     existing_ids = set()
-    existing_records = set()
+    existing_records = {}
+    existing_text = ""
     if input_path.exists():
-        for s in _parse_fasta_sequences(input_path.read_text()):
+        existing_text = input_path.read_text()
+        for s in _parse_fasta_sequences(existing_text):
             seq_id, _ = _split_fasta_header(s["name"])
             if seq_id:
                 existing_ids.add(seq_id)
-            existing_records.add(_sequence_exact_key(s))
+            existing_records[_sequence_exact_key(s)] = s["name"]
 
-    added_count = 0
-    with open(input_path, "a") as f:
-        if input_path.stat().st_size > 0:
-            f.write("\n")
-        for seq in sequences_to_add:
-            exact_key = _sequence_exact_key(seq)
-            if exact_key in existing_records:
-                continue
-            f.write(_format_fasta_record_for_job(seq, existing_ids, added_count + 1))
-            existing_records.add(exact_key)
-            added_count += 1
-    return added_count
+    formatted_records = []
+    for seq in sequences_to_add:
+        exact_key = _sequence_exact_key(seq)
+        existing_name = existing_records.get(exact_key)
+        if existing_name is None:
+            # A previous attempt may have appended this record under a
+            # unique _added ID, then failed before writing its metadata.
+            incoming_id, incoming_rest = _split_fasta_header(seq.get("name"))
+            for stored_name, stored_sequence in existing_records:
+                stored_id, stored_rest = _split_fasta_header(stored_name)
+                if (stored_sequence == exact_key[1] and stored_rest == incoming_rest
+                        and stored_id.startswith(incoming_id + "_added")):
+                    existing_name = stored_name
+                    break
+        if existing_name is not None:
+            if added_records is not None:
+                added_records.append({**seq, "name": existing_name})
+            continue
+        formatted = _format_fasta_record_for_job(seq, existing_ids,
+                                                 len(formatted_records) + 1)
+        formatted_records.append(formatted)
+        formatted_name = formatted.splitlines()[0][1:]
+        if added_records is not None:
+            added_records.append({**seq, "name": formatted_name})
+        existing_records[_sequence_exact_key({"name": formatted_name,
+                                              "sequence": seq["sequence"]})] = formatted_name
+
+    if formatted_records:
+        mode = (input_path.stat().st_mode & 0o777) if input_path.exists() else default_file_mode()
+        fd, temp_path = tempfile.mkstemp(dir=input_path.parent, prefix="input_raw.")
+        try:
+            with os.fdopen(fd, "w") as handle:
+                if existing_text:
+                    handle.write(existing_text.rstrip("\n") + "\n")
+                handle.write("".join(formatted_records))
+            os.chmod(temp_path, mode)
+            os.replace(temp_path, input_path)
+        finally:
+            if os.path.exists(temp_path):
+                os.unlink(temp_path)
+    return len(formatted_records)
+
+
+def _remember_reconciled_sequence_metadata(job_dir, records) -> int:
+    """Add missing provenance after an append, including on a retry."""
+    from app.services.artifact_storage import default_file_mode
+
+    if not records:
+        return 0
+    info_path = job_dir / "input_info.json"
+    stored = json.loads(info_path.read_text())
+    metadata = list(stored.get("sequence_metadata") or [])
+    known = {item.get("fasta_header") for item in metadata if isinstance(item, dict)}
+    additions = [item for item in _build_sequence_metadata(records)
+                 if item["fasta_header"] not in known]
+    if not additions:
+        return 0
+    stored["sequence_metadata"] = metadata + additions
+    mode = (info_path.stat().st_mode & 0o777) if info_path.exists() else default_file_mode()
+    fd, temp_path = tempfile.mkstemp(dir=info_path.parent, prefix="input_info.")
+    try:
+        with os.fdopen(fd, "w") as handle:
+            json.dump(stored, handle, separators=(",", ":"))
+        os.chmod(temp_path, mode)
+        os.replace(temp_path, info_path)
+    finally:
+        if os.path.exists(temp_path):
+            os.unlink(temp_path)
+    return len(additions)
 
 
 def _schedule_ncbi_recheck(job_id: str, *, hours: int = 1) -> None:
@@ -2456,6 +2594,7 @@ def reconcile_delayed_ncbi_results(job_id: str) -> Dict[str, Any]:
         get_mycomap_ncbi_recheck_max_hours,
         get_mycomap_ncbi_queue_position,
         get_mycomap_ncbi_result_count,
+        resolve_mycomap_result_reference,
         record_mycomap_queue_position,
         validate_mycomap_url,
     )
@@ -2498,9 +2637,16 @@ def reconcile_delayed_ncbi_results(job_id: str) -> Dict[str, Any]:
             return {"status": "rebuilt", "added_count": rerun_details.get("ncbi_appended_count", 0)}
 
         mycomap_url = str(metrics.get("mycomap_blast_url") or "").strip()
-        blast_id = validate_mycomap_url(mycomap_url)
-        if not blast_id:
+        from app.services.mycomap_org_service import OrgResultError, status as org_status
+        try:
+            reference = resolve_mycomap_result_reference(mycomap_url)
+        except OrgResultError:
+            logger.warning("MycoMap.org reconciliation could not resolve its URL", exc_info=True)
+            _schedule_ncbi_recheck(job_id, hours=1)
+            return {"status": "lookup_failed"}
+        if not reference:
             return {"status": "invalid_url"}
+        blast_id = reference["result_id"]
 
         recheck_count = int(rerun_details.get("ncbi_recheck_count") or 0) + 1
         rerun_details["ncbi_recheck_count"] = recheck_count
@@ -2509,7 +2655,14 @@ def reconcile_delayed_ncbi_results(job_id: str) -> Dict[str, Any]:
         queue_position = get_mycomap_ncbi_queue_position(
             mycomap_url, blast_id=blast_id
         )
-        if queue_position is None:
+        if reference["provider"] == "org":
+            try:
+                ncbi_record = org_status(blast_id).get("ncbi") or {}
+                count = 1 if ncbi_record.get("has_results") and ncbi_record.get("status") == "complete" else 0
+            except OrgResultError:
+                count = 0
+            _warnings = []
+        elif queue_position is None:
             count, _warnings = get_mycomap_ncbi_result_count(blast_id)
             rerun_details.pop("ncbi_queue_position", None)
         else:
@@ -2542,65 +2695,117 @@ def reconcile_delayed_ncbi_results(job_id: str) -> Dict[str, Any]:
             return {"status": "still_waiting", "recheck_count": recheck_count}
 
         # NCBI results are in -- fetch and append them, then rebuild.
-        fetch_result = fetch_mycomap_fasta(blast_id, include_ncbi=True, include_local=False)
-        fasta_text = fetch_result.get("fasta_content") or ""
+        if reference["provider"] == "org":
+            from app.api.routes import gather_mycomap_sequences_for_queue
+            payload, org_error = gather_mycomap_sequences_for_queue(
+                mycomap_url, include_ncbi=True, include_local=False
+            )
+            if org_error:
+                fetch_result = {"failed_sources": ["ncbi"],
+                                "errors": [org_error[0].get("error", "MycoMap.org fetch failed")]}
+                fasta_text = ""
+            else:
+                fetch_result = {"failed_sources": payload.get("failed_sources") or [],
+                                "errors": [payload.get("message") or "incomplete NCBI results"]
+                                if payload.get("failed_sources") else []}
+                fasta_text = _build_fasta_text(payload.get("sequences") or [])
+        else:
+            fetch_result = fetch_mycomap_fasta(blast_id, include_ncbi=True, include_local=False)
+            fasta_text = fetch_result.get("fasta_content") or ""
 
         # Alan 8/14/26 - A failed fetch is not an answer. This used to record
         # ncbi_status="available" unconditionally, so one transient MycoMap 500 marked
         # the job as having NCBI results it never received and cancelled all further
         # rechecks -- the sequences were then never picked up. Leave the status alone
         # and reschedule so the next pass can try again.
+        partial_download = False
         if fetch_result.get("failed_sources"):
             errors = "; ".join(fetch_result.get("errors") or []) or "unknown error"
             # Bounded by the same budget as the "still waiting" path, so a persistently
             # broken endpoint gives up instead of rescheduling forever.
             max_hours = get_mycomap_ncbi_recheck_max_hours()
             if recheck_count >= max_hours:
-                rerun_details["ncbi_status"] = "gave_up"
-                rerun_details["ncbi_fallback_local_only"] = False
+                partial_download = reference["provider"] == "org" and bool(fasta_text.strip())
+                if not partial_download:
+                    rerun_details["ncbi_status"] = "gave_up"
+                    rerun_details["ncbi_fallback_local_only"] = False
+                    metrics["mycomap_blast_rerun"] = rerun_details
+                    metrics["mycomap_refresh_warnings"] = list(
+                        metrics.get("mycomap_refresh_warnings") or []
+                    ) + [
+                        "MycoMap NCBI results were ready but could not be downloaded after "
+                        f"{max_hours} attempts ({errors}); tree remains local-only."
+                    ]
+                    db_job.metrics = metrics
+                    db.session.commit()
+                    logger.warning(
+                        "Giving up on MycoMap NCBI fetch for job %s (blast %s) after %s "
+                        "attempts: %s", job_id, blast_id, recheck_count, errors,
+                    )
+                    return {"status": "gave_up", "error": errors}
+            else:
+                from app.services.log_context import log_degradation
+                log_degradation(
+                    logger,
+                    "mycomap_ncbi_recheck_failed",
+                    f"NCBI results are ready but could not be downloaded ({errors}); "
+                    "leaving the job local-only and rescheduling the recheck",
+                    job=job_id, blast_id=blast_id, attempt=recheck_count,
+                )
                 metrics["mycomap_blast_rerun"] = rerun_details
-                metrics["mycomap_refresh_warnings"] = list(
-                    metrics.get("mycomap_refresh_warnings") or []
-                ) + [
-                    "MycoMap NCBI results were ready but could not be downloaded after "
-                    f"{max_hours} attempts ({errors}); tree remains local-only."
-                ]
                 db_job.metrics = metrics
                 db.session.commit()
-                logger.warning(
-                    "Giving up on MycoMap NCBI fetch for job %s (blast %s) after %s "
-                    "attempts: %s", job_id, blast_id, recheck_count, errors,
-                )
-                return {"status": "gave_up", "error": errors}
-
-            from app.services.log_context import log_degradation
-            log_degradation(
-                logger,
-                "mycomap_ncbi_recheck_failed",
-                f"NCBI results are ready but could not be downloaded ({errors}); "
-                "leaving the job local-only and rescheduling the recheck",
-                job=job_id, blast_id=blast_id, attempt=recheck_count,
-            )
-            metrics["mycomap_blast_rerun"] = rerun_details
-            db_job.metrics = metrics
-            db.session.commit()
-            _schedule_ncbi_recheck(job_id, hours=1)
-            return {"status": "fetch_failed", "error": errors}
+                _schedule_ncbi_recheck(job_id, hours=1)
+                return {"status": "fetch_failed", "error": errors}
 
         added_count = 0
+        matched_count = 0
         if fasta_text.strip():
-            added_count = _append_fasta_to_job_input(Config.JOB_DIR / job_id, fasta_text)
+            added_records = []
+            # This check is a recovery backstop if the worker stops between
+            # replacing the FASTA and replacing input_info.json. A successful
+            # reconciliation makes the extra check a cheap no-op.
+            recovery_scheduled = False
+            try:
+                if reference["provider"] == "org":
+                    _schedule_ncbi_recheck(job_id, hours=1)
+                    recovery_scheduled = True
+                added_count = _append_fasta_to_job_input(
+                    Config.JOB_DIR / job_id, fasta_text,
+                    sequence_records=(payload.get("sequences") or [])
+                    if reference["provider"] == "org" else None,
+                    added_records=added_records if reference["provider"] == "org" else None,
+                )
+                matched_count = len(added_records)
+                if added_records:
+                    _remember_reconciled_sequence_metadata(Config.JOB_DIR / job_id,
+                                                           added_records)
+            except Exception:
+                # The FASTA may have been written already. On the next check,
+                # matched records repair missing metadata and still recompute.
+                logger.exception("NCBI input reconciliation failed for job %s", job_id)
+                if not recovery_scheduled:
+                    _schedule_ncbi_recheck(job_id, hours=1)
+                return {"status": "input_update_failed"}
 
-        rerun_details["ncbi_status"] = "available"
+        rerun_details["ncbi_status"] = "partial" if partial_download else "available"
         rerun_details["ncbi_fallback_local_only"] = False
         rerun_details["ncbi_appended_at"] = datetime.now(timezone.utc).isoformat()
         rerun_details["ncbi_appended_count"] = added_count
-        rerun_details["ncbi_recompute_pending"] = added_count > 0
+        rerun_details["ncbi_recompute_pending"] = added_count > 0 or matched_count > 0
+        if partial_download:
+            metrics["mycomap_refresh_warnings"] = list(
+                metrics.get("mycomap_refresh_warnings") or []
+            ) + [
+                "MycoMap NCBI results remained incomplete after "
+                f"{max_hours} attempts ({errors}); the available NCBI sequences "
+                "were added, but some BLAST hits are missing."
+            ]
         metrics["mycomap_blast_rerun"] = rerun_details
         db_job.metrics = metrics
         db.session.commit()
 
-        if added_count <= 0:
+        if not rerun_details["ncbi_recompute_pending"]:
             return {"status": "no_new_sequences"}
 
         input_info_path = (Config.JOB_DIR / job_id) / "input_info.json"
@@ -2648,8 +2853,11 @@ def prepare_inat_tree_job(observation_id: int, *, include_ncbi: bool = True,
     from app.api.routes import gather_mycomap_sequences_for_queue
     from app.services.mycomap_service import (
         MycoMapRerunError,
+        parse_mycomap_result_reference,
+        resolve_mycomap_result_reference,
         validate_mycomap_url,
     )
+    from app.services.mycomap_org_service import OrgResultError
 
     observation = fetch_observation_for_job(observation_id, observation_reuse_owner)
     genus = _resolve_inat_genus(observation, observation_id)
@@ -2668,6 +2876,16 @@ def prepare_inat_tree_job(observation_id: int, *, include_ncbi: bool = True,
         # submission explicitly requested replacement.
         _report_progress(progress, "An existing tree URL will be preserved while this new tree is built.")
     mycomap_url = extract_observation_field_value(observation, MYCOMAP_BLAST_FIELD_NAME)
+    # Jobs queued before org support may already have created a replacement com
+    # search while leaving the observation's org field alone. Finish those jobs
+    # against the search they actually started; new jobs use the saved org URL.
+    if skip_mycomap_refresh and mycomap_url and mycomap_rerun_details:
+        from app.services.mycomap_service import is_mycomap_org_url
+        legacy_created_url = str(mycomap_rerun_details.get("created_mycomap_url") or "")
+        if (is_mycomap_org_url(mycomap_url)
+                and mycomap_rerun_details.get("provider") != "org"
+                and validate_mycomap_url(legacy_created_url, quiet=True)):
+            mycomap_url = legacy_created_url
     if not mycomap_url:
         saved_created_url = str(
             (mycomap_rerun_details or {}).get("created_mycomap_url") or ""
@@ -2699,14 +2917,35 @@ def prepare_inat_tree_job(observation_id: int, *, include_ncbi: bool = True,
             }
 
     mycomap_url = mycomap_url.strip()
-    blast_id = validate_mycomap_url(mycomap_url)
-    if not blast_id:
+    parsed_reference = parse_mycomap_result_reference(mycomap_url)
+    org_reference = parsed_reference if parsed_reference and parsed_reference["provider"] == "org" else None
+    if org_reference:
+        try:
+            org_reference = resolve_mycomap_result_reference(mycomap_url)
+        except OrgResultError as exc:
+            # Unavailable (502) or not published yet (409) waits in the worker.
+            from app.services.mycomap_org_service import deferral_details
+            details = deferral_details(exc)
+            unavailable = bool(details and details.get("mycomap_unavailable"))
+            raise InatTreeError(
+                str(exc), status=503 if unavailable else exc.status, details=details,
+            ) from exc
+        blast_id = org_reference["result_id"]
+    else:
+        from app.services.mycomap_service import is_mycomap_org_url
+        if is_mycomap_org_url(mycomap_url):
+            raise InatTreeError("The observation has an unsupported MycoMap.org results URL. Nothing was created or changed.", status=422)
+        blast_id = validate_mycomap_url(mycomap_url)
+    if not blast_id and not org_reference:
         # Alan 9/22/26 - A legacy do=results link names a Sequences/GenBank
         # record, not a BLAST (see resolve_legacy_mycomap_results_url). Follow
         # it to the BLASTs MycoMap already ran on that sequence. The saved
         # value is left as it is: it still works on MycoMap.
         from app.services.mycomap_service import resolve_legacy_mycomap_results_url
-        legacy = resolve_legacy_mycomap_results_url(mycomap_url)
+        resolution_warnings = []
+        legacy = resolve_legacy_mycomap_results_url(
+            mycomap_url, warnings=resolution_warnings,
+        )
         if legacy:
             _report_progress(
                 progress,
@@ -2715,26 +2954,30 @@ def prepare_inat_tree_job(observation_id: int, *, include_ncbi: bool = True,
             )
             mycomap_url = legacy["url"]
             blast_id = legacy["blast_id"]
-    if not blast_id:
+        elif resolution_warnings:
+            # Alan 9/23/26 - MycoMap could not be asked, which is not the same as
+            # "no search exists". Falling through would create a new search and
+            # overwrite the observation's saved link on iNaturalist because of a
+            # transient outage, so stop before anything is created or written.
+            # The worker defers on mycomap_unavailable rather than failing, so
+            # a blip during a long NCBI wait does not lose the whole job.
+            raise InatTreeError(
+                "MycoMap could not be reached to resolve the observation's "
+                "older-style link; nothing was created. Rebuild the tree later.",
+                status=503,
+                details={"mycomap_unavailable": True},
+            )
+    if not blast_id and not org_reference:
         # Some older observations contain MycoMap's legacy query-string URL,
         # which cannot identify a result through the current API. If the
         # observation still has its ITS barcode, recover automatically by
         # creating a current search and replacing the field when it appears.
         from app.services.fasta_utils import clean_dna_sequence
-        from app.services.mycomap_service import is_mycomap_org_url
         raw_its = extract_observation_field_value(
             observation, DNA_BARCODE_ITS_FIELD_NAME,
         )
-        # Alan 9/16/26 - A mycomap.org URL is a CORRECT value that this app
-        # cannot resolve yet, not a broken one. Build the tree from our own
-        # replacement .com search as usual, but never write that .com URL over
-        # the user's .org value -- doing so destroyed the stored value on
-        # observation 333807166 on 2026-09-15. Drop the preserve_saved_url
-        # branch once .org URLs validate directly.
-        preserve_saved_url = is_mycomap_org_url(mycomap_url)
-        # A preserved .org value stays in the field, so this branch is
-        # re-entered on every deferred rerun. Reuse the replacement search the
-        # earlier pass already created instead of creating a second one.
+        # A prior pass may already have created a replacement search. Reuse it
+        # when resuming instead of starting the same work twice.
         saved_created_url = str(
             (mycomap_rerun_details or {}).get("created_mycomap_url") or ""
         ).strip()
@@ -2745,7 +2988,7 @@ def prepare_inat_tree_job(observation_id: int, *, include_ncbi: bool = True,
         )
         existing = None if reused_blast_id else _reuse_existing_mycomap_blast(
             observation, observation_id, mycomap_rerun_details,
-            write_inat_field=False, progress=progress,
+            write_inat_field=True, progress=progress,
         )
         if reused_blast_id:
             mycomap_url = saved_created_url
@@ -2755,29 +2998,19 @@ def prepare_inat_tree_job(observation_id: int, *, include_ncbi: bool = True,
             blast_id = existing["blast_id"]
         elif clean_dna_sequence(raw_its or ""):
             from app.services.log_context import log_degradation
-            if preserve_saved_url:
-                log_degradation(
-                    logger,
-                    "mycomap_org_url_not_supported",
-                    "Saved MycoMap URL is a mycomap.org link this app cannot "
-                    "resolve yet; building from a replacement search and "
-                    "leaving the saved value unchanged",
-                    observation_id=observation_id,
-                )
-            else:
-                log_degradation(
-                    logger,
-                    "invalid_mycomap_url_replaced",
-                    "Saved MycoMap URL was unusable; creating a replacement search from ITS",
-                    observation_id=observation_id,
-                )
+            log_degradation(
+                logger,
+                "invalid_mycomap_url_replaced",
+                "Saved MycoMap URL was unusable; creating a replacement search from ITS",
+                observation_id=observation_id,
+            )
             mycomap_rerun_details = _create_mycomap_blast_from_observation(
                 observation,
                 observation_id,
                 mycomap_local_limit=mycomap_local_limit,
                 mycomap_ncbi_limit=mycomap_ncbi_limit,
                 pending_creation_details=mycomap_rerun_details,
-                write_inat_field=not preserve_saved_url,
+                write_inat_field=True,
                 throttle=throttle_mycomap_creation,
             )
             return {
@@ -2807,11 +3040,16 @@ def prepare_inat_tree_job(observation_id: int, *, include_ncbi: bool = True,
                 mycomap_local_limit=mycomap_local_limit,
                 mycomap_ncbi_limit=mycomap_ncbi_limit,
                 progress=progress,
+                mycomap_url=mycomap_url,
             )
-        except MycoMapRerunError as e:
-            raise InatTreeError(str(e), status=502)
+        except (MycoMapRerunError, OrgResultError) as e:
+            if isinstance(e, OrgResultError) and e.status == 502 and e.retryable:
+                raise InatTreeError(str(e), status=503,
+                                    details={"mycomap_unavailable": True}) from e
+            raise InatTreeError(str(e), status=502) from e
 
-    if rebuild_ncbi_blast and defer_after_ncbi_rerun and not skip_mycomap_refresh:
+    if ((rebuild_ncbi_blast and defer_after_ncbi_rerun)
+            or (org_reference and mycomap_rerun_details.get("org_wait_sources"))) and not skip_mycomap_refresh:
         return {
             "status": "waiting_for_ncbi",
             "notes": _build_inat_job_title(observation_id, genus),
@@ -2819,6 +3057,22 @@ def prepare_inat_tree_job(observation_id: int, *, include_ncbi: bool = True,
             "mycomap_blast_url": mycomap_url,
             "mycomap_rerun_details": mycomap_rerun_details,
         }
+
+    if org_reference and skip_mycomap_refresh and mycomap_rerun_details.get("org_wait_sources"):
+        from app.services.mycomap_org_service import rerun_pending
+        try:
+            still_pending = rerun_pending(mycomap_rerun_details)
+        except OrgResultError as exc:
+            raise InatTreeError(
+                str(exc), status=503 if exc.retryable and exc.status == 502 else exc.status,
+                details={"mycomap_unavailable": True} if exc.retryable and exc.status == 502 else None,
+            ) from exc
+        if still_pending:
+            return {
+                "status": "waiting_for_ncbi", "notes": _build_inat_job_title(observation_id, genus),
+                "inat_genus": genus, "mycomap_blast_url": mycomap_url,
+                "mycomap_rerun_details": mycomap_rerun_details,
+            }
 
     if mycomap_rerun_details.get("auto_created"):
         ncbi_ready, mycomap_rerun_details = _check_auto_created_mycomap_ncbi_results(
@@ -2840,6 +3094,15 @@ def prepare_inat_tree_job(observation_id: int, *, include_ncbi: bool = True,
     )
     if err is not None:
         body, status = err
+        if org_reference and status == 502:
+            raise InatTreeError(body.get('error', 'MycoMap.org is unavailable.'),
+                                status=503, details={"mycomap_unavailable": True})
+        if status == 409 and body.get('retryable'):
+            # MycoMap has not published this BLAST's results yet: wait for them.
+            raise InatTreeError(
+                body.get('error', 'MycoMap BLAST results are not published yet.'),
+                status=409, details={"mycomap_results_pending": True},
+            )
         raise InatTreeError(
             body.get('error', 'Failed to fetch MycoMap sequences.'),
             # 404 = MycoMap has no such BLAST result. Passing it through keeps the

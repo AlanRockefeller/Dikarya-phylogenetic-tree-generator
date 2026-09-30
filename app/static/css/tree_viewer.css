@@ -7,15 +7,679 @@
     display: none;
 }
 
+/* Tree toolbar (top of #tree-viewer-panel). Plain CSS rather than Tailwind utilities
+   because the pressed states are set from JS, and the vendored Tailwind runtime does
+   not reliably generate classes that were never present in the served HTML. */
+.tree-toolbar {
+    display: flex;
+    flex-direction: column;
+    gap: 0.5rem;
+    margin-bottom: 0.75rem;
+    padding-bottom: 0.75rem;
+    border-bottom: 1px solid #e5e7eb;
+}
+
+/* Row 1 shows the tree (layout, zoom, sorting, rooting); row 2 edits it (add, recompute,
+   undo, prune, rename, deselect). Each wraps on its own if the window is narrow. */
+.tree-toolbar-row {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 0.4rem 0.5rem;
+}
+
+.dark .tree-toolbar {
+    border-bottom-color: #3a5a4c;
+}
+
+.tree-toolbar-end {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 0.5rem;
+    margin-left: auto;
+}
+
+.tree-tool {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.375rem;
+    height: 2rem;
+    padding: 0 0.625rem;
+    border: 1px solid #d1d5db;
+    border-radius: 0.5rem;
+    background-color: #fff;
+    color: #374151;
+    font-size: 0.875rem;
+    font-weight: 500;
+    line-height: 1;
+    white-space: nowrap;
+    text-decoration: none;
+    cursor: pointer;
+    transition: background-color .15s ease, border-color .15s ease, color .15s ease;
+}
+
+.tree-tool:hover {
+    background-color: #f9fafb;
+    border-color: #c9a962;
+    color: #111827;
+}
+
+.tree-tool:focus-visible {
+    outline: 2px solid #c9a962;
+    outline-offset: 1px;
+}
+
+.tree-tool:disabled,
+.tree-tool:disabled:hover {
+    background-color: #fff;
+    border-color: #d1d5db;
+    color: #374151;
+    opacity: 0.45;
+    cursor: not-allowed;
+}
+
+.tree-tool.hidden {
+    display: none;
+}
+
+.tree-tool-icon {
+    justify-content: center;
+    width: 2rem;
+    padding: 0;
+}
+
+/* On/off controls (Align tips, Support values, the current layout, full screen). */
+.tree-tool[aria-pressed="true"] {
+    background-color: #f3ead3;
+    border-color: #c9a962;
+    color: #1a2f23;
+    box-shadow: inset 0 1px 3px rgba(0, 0, 0, 0.18);
+}
+
+.dark .tree-tool {
+    background-color: #1a2f23;
+    border-color: #4b5563;
+    color: #e5e7eb;
+}
+
+.dark .tree-tool:hover {
+    background-color: #22392c;
+    border-color: #c9a962;
+    color: #fff;
+}
+
+.dark .tree-tool:disabled,
+.dark .tree-tool:disabled:hover {
+    background-color: #1a2f23;
+    border-color: #4b5563;
+    color: #e5e7eb;
+}
+
+.dark .tree-tool[aria-pressed="true"] {
+    background-color: rgba(201, 169, 98, 0.28);
+    border-color: #c9a962;
+    color: #fff;
+    box-shadow: inset 0 1px 3px rgba(0, 0, 0, 0.45);
+}
+
+/* Destructive action (Prune): a muted red rather than a bright fill. */
+.tree-tool-danger,
+.tree-tool-danger:disabled,
+.tree-tool-danger:disabled:hover {
+    border-color: #fca5a5;
+    color: #b91c1c;
+}
+
+.tree-tool-danger:hover {
+    background-color: #fef2f2;
+    border-color: #f87171;
+    color: #991b1b;
+}
+
+.dark .tree-tool-danger,
+.dark .tree-tool-danger:disabled,
+.dark .tree-tool-danger:disabled:hover {
+    border-color: #7f1d1d;
+    color: #fca5a5;
+}
+
+.dark .tree-tool-danger:hover {
+    background-color: rgba(127, 29, 29, 0.35);
+    border-color: #b91c1c;
+    color: #fecaca;
+}
+
+/* Segmented groups (layout, zoom) share one outline. */
+.tree-tool-group {
+    display: inline-flex;
+}
+
+.tree-tool-group .tree-tool {
+    border-radius: 0;
+}
+
+.tree-tool-group .tree-tool + .tree-tool {
+    margin-left: -1px;
+}
+
+.tree-tool-group .tree-tool:first-child {
+    border-radius: 0.5rem 0 0 0.5rem;
+}
+
+.tree-tool-group .tree-tool:last-child {
+    border-radius: 0 0.5rem 0.5rem 0;
+}
+
+.tree-tool-group .tree-tool:hover,
+.tree-tool-group .tree-tool[aria-pressed="true"] {
+    position: relative;
+    z-index: 1;
+}
+
+/* Sort names its mode; a fixed width keeps the toolbar from shifting as it cycles. */
+#btn-ladderize {
+    min-width: 10.5rem;
+}
+
+.tree-tool-divider {
+    width: 1px;
+    height: 1.25rem;
+    margin: 0 0.125rem;
+    background-color: #d1d5db;
+}
+
+.dark .tree-tool-divider {
+    background-color: #4b5563;
+}
+
+.tree-tool-root {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.375rem;
+    color: #4b5563;
+    font-size: 0.875rem;
+}
+
+.dark .tree-tool-root {
+    color: #d1d5db;
+}
+
+.tree-tool-select {
+    height: 2rem;
+    padding: 0 0.5rem;
+    border: 1px solid #d1d5db;
+    border-radius: 0.5rem;
+    background-color: #fff;
+    color: #111827;
+    font-size: 0.875rem;
+}
+
+.tree-tool-select:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
+}
+
+.dark .tree-tool-select {
+    border-color: #4b5563;
+    background-color: #1a2f23;
+    color: #f3f4f6;
+}
+
+.tree-tool-search {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.375rem;
+    height: 2rem;
+    padding: 0 0.5rem;
+    border: 1px solid #d1d5db;
+    border-radius: 0.5rem;
+    background-color: #fff;
+    color: #9ca3af;
+    font-size: 0.8rem;
+}
+
+.tree-tool-search:focus-within {
+    border-color: #c9a962;
+}
+
+.tree-tool-search input,
+.tree-tool-search input:focus {
+    width: 11rem;
+    padding: 0;
+    border: 0;
+    outline: none;
+    box-shadow: none;
+    background: transparent;
+    color: #111827;
+    font-size: 0.875rem;
+}
+
+.tree-tool-search button:hover {
+    color: #dc2626;
+}
+
+.tree-tool-search button.hidden {
+    display: none;
+}
+
+.dark .tree-tool-search {
+    border-color: #4b5563;
+    background-color: #1a2f23;
+}
+
+.dark .tree-tool-search input {
+    color: #f3f4f6;
+}
+
+/* Menus and the settings panel toggle look pressed while open. */
+.tree-tool[aria-expanded="true"] {
+    background-color: #f3ead3;
+    border-color: #c9a962;
+    color: #1a2f23;
+}
+
+.dark .tree-tool[aria-expanded="true"] {
+    background-color: rgba(201, 169, 98, 0.28);
+    border-color: #c9a962;
+    color: #fff;
+}
+
+/* Toolbar popover (Layout): floats over the tree rather than narrowing it. */
+.tree-popover {
+    position: absolute;
+    top: calc(100% + 0.25rem);
+    left: 0;
+    z-index: 50;
+    display: flex;
+    flex-direction: column;
+    gap: 0.6rem;
+    width: 17.5rem;
+    padding: 0.75rem;
+    border: 1px solid #e5e7eb;
+    border-radius: 0.5rem;
+    background-color: #fff;
+    color: #374151;
+    font-size: 0.875rem;
+    box-shadow: 0 10px 25px rgba(0, 0, 0, 0.15);
+}
+
+.tree-popover.hidden {
+    display: none;
+}
+
+.dark .tree-popover {
+    border-color: #374151;
+    background-color: #111827;
+    color: #e5e7eb;
+}
+
+/* The tree and, beside it, the display settings panel. */
+.tree-workspace {
+    display: flex;
+    align-items: stretch;
+}
+
+.tree-stage {
+    flex: 1 1 auto;
+    min-width: 0;
+}
+
+.tree-settings-panel {
+    flex: 0 0 20rem;
+    width: 20rem;
+    margin-left: 0.75rem;
+    padding-left: 0.75rem;
+    border-left: 1px solid #e5e7eb;
+    color: #374151;
+    font-size: 0.875rem;
+}
+
+.tree-settings-panel[hidden] {
+    display: none;
+}
+
+.dark .tree-settings-panel {
+    border-left-color: #3a5a4c;
+    color: #e5e7eb;
+}
+
+/* Stays in view below the sticky site nav while a tall tree scrolls past. */
+.tree-settings-inner {
+    position: sticky;
+    top: 4.5rem;
+    max-height: calc(100vh - 5.5rem);
+    overflow-y: auto;
+}
+
+.tree-settings-head {
+    display: flex;
+    align-items: center;
+    gap: 0.25rem;
+    border-bottom: 1px solid #e5e7eb;
+}
+
+.dark .tree-settings-head {
+    border-bottom-color: #3a5a4c;
+}
+
+.tree-settings-tabs {
+    display: flex;
+    flex: 1 1 auto;
+}
+
+.tree-settings-tabs [role="tab"] {
+    flex: 1 1 auto;
+    padding: 0.5rem 0.25rem;
+    border-bottom: 2px solid transparent;
+    margin-bottom: -1px;
+    color: #6b7280;
+    font-size: 0.8rem;
+    font-weight: 600;
+    cursor: pointer;
+}
+
+.tree-settings-tabs [role="tab"]:hover {
+    color: #111827;
+}
+
+.tree-settings-tabs [role="tab"][aria-selected="true"] {
+    border-bottom-color: #c9a962;
+    color: #111827;
+}
+
+.tree-settings-tabs [role="tab"]:focus-visible {
+    outline: 2px solid #c9a962;
+    outline-offset: -2px;
+}
+
+.dark .tree-settings-tabs [role="tab"] {
+    color: #9ca3af;
+}
+
+.dark .tree-settings-tabs [role="tab"]:hover,
+.dark .tree-settings-tabs [role="tab"][aria-selected="true"] {
+    color: #f3f4f6;
+}
+
+.tree-settings-close {
+    padding: 0.35rem 0.5rem;
+    border-radius: 0.375rem;
+    color: #6b7280;
+}
+
+.tree-settings-close:hover {
+    background-color: #f3f4f6;
+    color: #111827;
+}
+
+.dark .tree-settings-close:hover {
+    background-color: #22392c;
+    color: #fff;
+}
+
+.tree-settings-body {
+    display: flex;
+    flex-direction: column;
+    gap: 0.75rem;
+    padding: 0.85rem 0.1rem 0.5rem;
+}
+
+.tree-settings-body[hidden] {
+    display: none;
+}
+
+.settings-row,
+.settings-field {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 0.75rem;
+}
+
+.settings-label,
+.settings-help {
+    color: #6b7280;
+}
+
+.dark .settings-label,
+.dark .settings-help {
+    color: #9ca3af;
+}
+
+.settings-help {
+    font-size: 0.75rem;
+    line-height: 1.35;
+}
+
+.settings-subhead {
+    margin-top: 0.25rem;
+    font-size: 0.6875rem;
+    font-weight: 700;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    color: #6b7280;
+}
+
+.dark .settings-subhead {
+    color: #9ca3af;
+}
+
+.settings-input {
+    width: 5rem;
+    height: 1.9rem;
+    padding: 0 0.5rem;
+    border: 1px solid #d1d5db;
+    border-radius: 0.375rem;
+    background-color: #fff;
+    color: #111827;
+    font-family: "IBM Plex Mono", ui-monospace, monospace;
+    font-size: 0.8rem;
+}
+
+.settings-input:focus {
+    outline: none;
+    border-color: #c9a962;
+    box-shadow: 0 0 0 1px #c9a962;
+}
+
+.settings-input:disabled {
+    opacity: 0.45;
+    cursor: not-allowed;
+}
+
+.dark .settings-input {
+    border-color: #4b5563;
+    background-color: #1a2f23;
+    color: #f3f4f6;
+}
+
+.settings-check {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    cursor: pointer;
+    user-select: none;
+}
+
+.settings-slider {
+    display: flex;
+    flex-direction: column;
+    gap: 0.3rem;
+}
+
+.settings-slider-head {
+    display: flex;
+    justify-content: space-between;
+}
+
+.settings-value {
+    color: #4b5563;
+    font-family: "IBM Plex Mono", ui-monospace, monospace;
+    font-size: 0.8rem;
+}
+
+.dark .settings-value {
+    color: #d1d5db;
+}
+
+.settings-stepper {
+    display: inline-flex;
+    align-items: center;
+    border: 1px solid #d1d5db;
+    border-radius: 0.375rem;
+}
+
+.settings-stepper button {
+    width: 1.9rem;
+    height: 1.9rem;
+    color: #4b5563;
+    font-size: 0.7rem;
+}
+
+.settings-stepper button:hover {
+    color: #111827;
+    background-color: #f3f4f6;
+}
+
+.settings-stepper .settings-value {
+    min-width: 3.25rem;
+    text-align: center;
+}
+
+.dark .settings-stepper {
+    border-color: #4b5563;
+}
+
+.dark .settings-stepper button {
+    color: #d1d5db;
+}
+
+.dark .settings-stepper button:hover {
+    color: #fff;
+    background-color: #22392c;
+}
+
+#color-group-chips:empty::before {
+    content: "No color groups yet.";
+    color: #9ca3af;
+    font-size: 0.75rem;
+}
+
+/* Full screen: the tree panel, toolbar included, fills the browser window. Used by
+   the desktop button, the F key and the mobile Expand button alike. Deliberately not
+   the browser Fullscreen API, which shows only the full-screen element and so would
+   hide every dialog and menu that lives outside the tree panel. The touch-device
+   block below refines this for phones. */
+body.tree-expanded {
+    overflow: hidden;
+    overscroll-behavior: none;
+}
+
+body.tree-expanded #tree-viewer-panel {
+    position: fixed;
+    inset: 0;
+    z-index: 990;
+    width: 100vw;
+    height: 100dvh;
+    max-width: none;
+    margin: 0;
+    padding: 0.75rem;
+    border-radius: 0;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+}
+
+body.tree-expanded #tree-viewer-panel #tree-notices {
+    display: none;
+}
+
+body.tree-expanded #tree-status-dock {
+    flex: none;
+    top: 0;
+}
+
+/* In full screen the tree and settings panel share the height below the toolbar. */
+body.tree-expanded #tree-workspace {
+    flex: 1 1 auto;
+    min-height: 0;
+}
+
+body.tree-expanded #tree-stage {
+    display: flex;
+    flex-direction: column;
+    min-height: 0;
+}
+
+body.tree-expanded .tree-settings-panel {
+    overflow-y: auto;
+}
+
+body.tree-expanded .tree-settings-inner {
+    position: static;
+    max-height: none;
+}
+
+body.tree-expanded #tree-container {
+    flex: 1 1 auto;
+    height: auto;
+    min-height: 0 !important;
+}
+
+/* Dialogs opened from full screen must still cover it. */
+body.tree-expanded main > [role="dialog"][aria-modal="true"],
+body.tree-expanded #modal-alignment-viewer {
+    z-index: 1000;
+}
+
+body.tree-expanded #btn-fullscreen i::before {
+    content: "\f066";
+}
+
 /* The mobile viewer is keyed to an actual coarse pointer, not viewport width.
    A narrow desktop window therefore keeps the established mouse toolbar and gestures. */
 @media (pointer: coarse) {
-    #tree-desktop-controls {
+    /* The display settings panel stacks above the tree on a phone, and only appears with
+       "Show all advanced controls" (the toolbar button that opens it is hidden too). */
+    #tree-workspace {
+        flex-direction: column;
+    }
+
+    #tree-settings-panel {
         display: none;
     }
 
-    body.mobile-show-desktop-controls #tree-desktop-controls {
+    body.mobile-show-desktop-controls #tree-settings-panel:not([hidden]) {
         display: block;
+        order: -1;
+        /* In the stacked column the desktop 20rem basis would become a fixed height. */
+        flex: none;
+        width: auto;
+        margin: 0 0 0.75rem;
+        padding: 0;
+        border-left: 0;
+    }
+
+    /* The page-level actions (Alignment Viewer, Annotations, Export, Analyze) follow the
+       desktop controls: the mobile sheet reaches them by id, and "Show all advanced
+       controls" brings them back. An id selector so Tailwind's .flex cannot win. */
+    #tree-title-actions {
+        display: none;
+    }
+
+    body.mobile-show-desktop-controls #tree-title-actions {
+        display: flex;
+    }
+
+    /* Touch devices navigate with #tree-mobile-toolbar; the desktop toolbar only
+       returns with "Show all advanced controls". */
+    #tree-toolbar {
+        display: none;
+    }
+
+    body.mobile-show-desktop-controls #tree-toolbar {
+        display: flex;
     }
 
     #tree-viewer-panel {
@@ -165,6 +829,10 @@
         display: none;
     }
 
+    body.tree-expanded #tree-status-dock {
+        flex: none;
+    }
+
     body.tree-expanded #tree-container {
         flex: 1 1 auto;
         height: auto;
@@ -312,6 +980,35 @@
         border-color: #4b5563;
     }
 
+    .tree-mobile-setting-row select {
+        min-height: 44px;
+        max-width: 65%;
+        padding: 0 0.5rem;
+        border: 1px solid #d1d5db;
+        border-radius: 0.5rem;
+        background-color: #fff;
+        color: #111827;
+        font-size: 0.88rem;
+    }
+
+    .tree-mobile-setting-row input[type="checkbox"] {
+        width: 1.35rem;
+        height: 1.35rem;
+    }
+
+    .tree-mobile-value {
+        display: inline-block;
+        min-width: 2.25rem;
+        text-align: center;
+        font-variant-numeric: tabular-nums;
+    }
+
+    .dark .tree-mobile-setting-row select {
+        border-color: #4b5563;
+        background-color: #111827;
+        color: #f3f4f6;
+    }
+
     .tree-mobile-sheet-content p {
         margin-top: 0.45rem;
         color: #4b5563;
@@ -416,7 +1113,9 @@
     /* Black halo for dark mode */
 }
 
-#tree-container .branch {
+/* Alan 9/23/26 - Polytomy connectors share every branch stroke rule (see phylotree.css). */
+#tree-container .branch,
+#tree-container .polytomy-connector {
     stroke: #000000;
     fill: none;
 }
@@ -452,9 +1151,27 @@
     stroke: #ffffff !important;
 }
 
-.dark #tree-container .branch {
+.dark #tree-container .branch,
+.dark #tree-container .polytomy-connector {
     stroke: #ccc !important;
     /* Brighter than #999 for better visibility in dark mode */
+}
+
+/* Fade by support. The viewer sets stroke-opacity inline on weak/intermediate branches
+   (values in SUPPORT_FADE_OPACITY, tree_viewer_phylotree_v2.js). A selected, tagged or
+   hovered branch is user styling and wins; removing the class restores the fade. The
+   export copies each branch's computed opacity, so these overrides export as shown. */
+#tree-container path.branch.branch-selected,
+#tree-container path.branch.branch-tagged,
+#tree-container path.branch:hover {
+    stroke-opacity: 1 !important;
+}
+
+/* A polytomy connector is a layout marker, not an inferred branch: never faded, never a
+   click or hover target (clicks fall through to the tip's node group as before). */
+#tree-container .polytomy-connector {
+    stroke-opacity: 1 !important;
+    pointer-events: none;
 }
 
 
@@ -650,62 +1367,163 @@
     padding: 1rem 0;
 }
 
-/* Active state for toggle buttons (e.g., midpoint rooting) */
-#btn-midpoint.active {
-    background-color: #6366f1 !important;
-    /* indigo-500 */
-    box-shadow: inset 0 2px 4px rgba(0, 0, 0, 0.2);
+/* Dropdown menus: Export (the <details> in the page title row) and the toolbar Select menu. */
+#btn-export-menu {
+    list-style: none;
 }
 
-#btn-midpoint.active:hover {
-    background-color: #4f46e5 !important;
-    /* indigo-600 */
+#btn-export-menu::-webkit-details-marker {
+    display: none;
 }
 
-/* Edited FASTA export control.
+#export-menu-wrap[open] > #btn-export-menu {
+    border-color: #c9a962;
+}
+
+.tree-menu-heading {
+    padding: 0.55rem 0.75rem 0.2rem;
+    font-size: 0.6875rem;
+    font-weight: 700;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    color: #6b7280;
+}
+
+.dark .tree-menu-heading {
+    color: #9ca3af;
+}
+
+.tree-menu-item {
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    gap: 0.75rem;
+    width: 100%;
+    padding: 0.4rem 0.75rem;
+    border: 0;
+    background: transparent;
+    color: #1f2937;
+    text-align: left;
+    text-decoration: none;
+    cursor: pointer;
+}
+
+.tree-menu-item:hover,
+.tree-menu-item:focus-visible {
+    outline: none;
+    background-color: #f3f4f6;
+    color: #111827;
+    box-shadow: inset 2px 0 0 #c9a962;
+}
+
+.dark .tree-menu-item {
+    color: #e5e7eb;
+}
+
+.dark .tree-menu-item:hover,
+.dark .tree-menu-item:focus-visible {
+    background-color: #1f2937;
+    color: #fff;
+}
+
+.tree-menu-hint {
+    font-size: 0.75rem;
+    color: #6b7280;
+}
+
+.dark .tree-menu-hint {
+    color: #9ca3af;
+}
+
+/* Edited FASTA export item.
    Styled here rather than with Tailwind utilities because the enabled/disabled
    swap happens from JS, and the vendored Tailwind runtime does not reliably
-   generate classes that were never present in the served HTML. */
-.edited-fasta-link {
-    display: inline-flex;
-    align-items: center;
-    gap: 0.4rem;
-    padding: 0.3rem 0.75rem;
-    border-radius: 0.5rem;
-    border: 1px solid transparent;
-    font-weight: 600;
-    line-height: 1.35;
-    text-decoration: none;
-    transition: background-color .15s ease, border-color .15s ease, color .15s ease;
+   generate classes that were never present in the served HTML. Each state shows
+   its own hint, so the item says why it is unavailable without a tooltip. */
+.edited-fasta-link.is-available .edited-fasta-hint-unavailable,
+.edited-fasta-link.is-unavailable .edited-fasta-hint-available {
+    display: none;
 }
 
-/* Available: the app's gold accent, so the file you now want is the easiest
-   thing to find in the export row. */
 .edited-fasta-link.is-available {
-    background-color: #c9a962;
-    border-color: #c9a962;
-    color: #1a2f23;
-    cursor: pointer;
-    box-shadow: 0 1px 2px rgba(0, 0, 0, .12);
+    font-weight: 600;
 }
 
-.edited-fasta-link.is-available:hover,
-.edited-fasta-link.is-available:focus-visible {
-    background-color: #e5d4a1;
-    border-color: #e5d4a1;
-    color: #1a2f23;
+.edited-fasta-link.is-available .edited-fasta-hint-available {
+    color: #9a7b35;
+}
+
+.dark .edited-fasta-link.is-available .edited-fasta-hint-available {
+    color: #c9a962;
 }
 
 /* Unavailable: visible so the feature is discoverable, but plainly inert. */
-.edited-fasta-link.is-unavailable {
+.edited-fasta-link.is-unavailable,
+.edited-fasta-link.is-unavailable:hover {
     background-color: transparent;
-    border-color: #d1d5db;
+    box-shadow: none;
     color: #9ca3af;
     cursor: not-allowed;
-    opacity: .75;
 }
 
-.dark .edited-fasta-link.is-unavailable {
-    border-color: #355245;
+.dark .edited-fasta-link.is-unavailable,
+.dark .edited-fasta-link.is-unavailable:hover {
+    background-color: transparent;
     color: #7b8a80;
+}
+
+/* Status message. A zero-height sticky anchor sits directly above the tree, so the
+   message floats over the top of the tree rather than pushing it down, and stays in
+   view below the sticky site nav while the page scrolls. */
+#tree-status-dock {
+    position: sticky;
+    top: 4.5rem;
+    height: 0;
+    z-index: 40;
+}
+
+#tree-status-dock #status-message {
+    position: absolute;
+    top: 0.5rem;
+    left: 50%;
+    transform: translateX(-50%);
+    width: max-content;
+    max-width: calc(100% - 2rem);
+    border: 1px solid rgba(0, 0, 0, 0.08);
+    box-shadow: 0 4px 14px rgba(0, 0, 0, 0.15);
+    cursor: pointer;
+}
+
+/* The dark-mode status colors are translucent, which is fine on a card but lets tree
+   branches show through an overlay; these are the same hues made opaque. */
+.dark #tree-status-dock #status-message {
+    border-color: rgba(255, 255, 255, 0.1);
+}
+
+.dark #tree-status-dock #status-message[data-status-type="info"] {
+    background-color: #172554;
+}
+
+.dark #tree-status-dock #status-message[data-status-type="success"] {
+    background-color: #052e16;
+}
+
+.dark #tree-status-dock #status-message[data-status-type="warning"] {
+    background-color: #422006;
+}
+
+.dark #tree-status-dock #status-message[data-status-type="danger"] {
+    background-color: #450a0a;
+}
+
+/* Alan 9/24/26 - Type-specimen badge (the gold superscript "T" drawn by
+   _decorateTypeSpecimen in tree_viewer_phylotree_v2.js). A darker gold on the
+   light background for contrast; the badge's inline fallback is the light value,
+   which is what an exported figure (no stylesheet) gets. */
+:root {
+    --type-specimen-badge: #8f6b1f;
+}
+
+.dark {
+    --type-specimen-badge: #c9a962;
 }

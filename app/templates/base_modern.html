@@ -368,8 +368,9 @@
     {% endif %}
     {% endwith %}
 
-    <!-- Main Content -->
-    <main class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-8">
+    <!-- Main Content. A page may widen it through main_width (the tree viewer does);
+         every other page keeps the default max-w-7xl. -->
+    <main class="{% block main_width %}max-w-7xl{% endblock %} mx-auto px-4 sm:px-6 lg:px-8 py-8">
         {% block content %}{% endblock %}
     </main>
 

@@ -101,7 +101,12 @@ class MobileTreeViewerTests(unittest.TestCase):
         )[0]
         self.assertNotIn("toTransform = event.transform", zoom_handler)
         self.assertNotRegex(zoom_handler, r"event\.transform\.(?:x|y|k)\s*[-+*/]?=")
-        self.assertIn("event.transform.y - 10", zoom_handler)
+        # The camera is composed with the layout translate, never substituted for it:
+        # substituting made the first pan after every draw jump (by a whole label width
+        # in radial layout). The scale bar's 10px lift lives in its layout translate.
+        self.assertIn("cameraThenLayout(this.layout_translate, event.transform)", zoom_handler)
+        self.assertIn("cameraThenLayout(this.scale_bar_translate, event.transform)", zoom_handler)
+        self.assertIn("this.pad_height() - 10", phylotree)
         self.assertIn("this.zoom_behavior.scaleBy", phylotree)
 
     def test_button_zoom_uses_shared_camera_api(self):

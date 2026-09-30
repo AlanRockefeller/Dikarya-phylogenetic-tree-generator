@@ -388,6 +388,11 @@ class Config:
     BASE_DIR = Path(__file__).resolve().parent.parent
     JOB_DIR = Path(os.environ.get('JOB_DIR') or BASE_DIR / 'var' / 'jobs')
     BLAST_CACHE_DIR = Path(os.environ.get('BLAST_CACHE_DIR') or BASE_DIR / 'cache' / 'blast')
+    # Type-specimen reference data (type_specimen_service.py): the MycoMap list
+    # snapshot and GenBank's /type_material answers. Under cache/ like the BLAST
+    # cache, because both the tree account (refresh script) and the service
+    # account (GenBank fetches) write here; the directory is group dikarya, 2775.
+    TYPE_SPECIMEN_DIR = Path(os.environ.get('TYPE_SPECIMEN_DIR') or BASE_DIR / 'cache' / 'type_specimens')
     # ITSx HMM profiles, used by pyitsx for optional ITS1/5.8S/ITS2 extraction.
     ITSX_HMM_DIR = Path(os.environ.get('ITSX_HMM_DIR') or BASE_DIR / 'cache' / 'itsx' / 'HMMs')
     BLAST_EMAIL = os.environ.get('BLAST_EMAIL', '')
@@ -436,11 +441,12 @@ class Config:
         'CLAUDE_REVIEW_WRAPPER', '/usr/local/sbin/dikarya-claude-review'
     )
     ANTHROPIC_API_KEY = os.environ.get('ANTHROPIC_API_KEY', '')
-    CLAUDE_REVIEW_MODEL = os.environ.get('CLAUDE_REVIEW_MODEL', 'claude-opus-5')
+    CLAUDE_REVIEW_MODEL = os.environ.get('CLAUDE_REVIEW_MODEL', 'claude-opus-5-5')
     # Measured on a 147-sequence job: low = 61s/$0.25, medium = 156s/$0.35, for
     # the same verdict. The request is synchronous and nginx cuts it off at 300s,
-    # so low is the setting that fits; raise it if reviews read as too shallow.
-    CLAUDE_REVIEW_EFFORT = os.environ.get('CLAUDE_REVIEW_EFFORT', 'low')
+    # so medium leaves less headroom under the 240s timeout below than low did;
+    # drop back to low if large trees start timing out.
+    CLAUDE_REVIEW_EFFORT = os.environ.get('CLAUDE_REVIEW_EFFORT', 'medium')
     CLAUDE_REVIEW_MAX_TOKENS = int(os.environ.get('CLAUDE_REVIEW_MAX_TOKENS', '32000'))
     # Hard wall-clock cap. A review runs inside a Gunicorn request slot (4 workers
     # x 2 threads = 8 total) and behind nginx's proxy_read_timeout 300s, so it must

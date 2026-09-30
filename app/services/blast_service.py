@@ -584,7 +584,8 @@ def _fetch_blast_results(rid: str, max_sequences: int = DEFAULT_MAX_SEQUENCES) -
         )
         raise ValueError(f"Failed to parse BLAST JSON response: {e}")
 
-def _fetch_genbank_xml_batch(accessions: List[str]) -> List[str]:
+def _fetch_genbank_xml_batch(accessions: List[str],
+                             unchecked: Optional[List[str]] = None) -> List[str]:
     """
     Fetch GenBank XML for a single batch of accessions.
 
@@ -592,6 +593,11 @@ def _fetch_genbank_xml_batch(accessions: List[str]) -> List[str]:
     one per accession when the batch had to be retried individually. Empty when
     nothing could be fetched. Each document is parsed separately by the caller,
     since efetch replies cannot simply be concatenated into one XML tree.
+
+    ``unchecked``, when given, collects the accessions NCBI never answered for
+    (a timeout, a 5xx, the isolation budget running out), as opposed to ones it
+    answered and refused. Only the latter say anything about whether a record
+    exists, so a caller recording absences must leave these out.
     """
     if not accessions:
         return []
@@ -627,7 +633,9 @@ def _fetch_genbank_xml_batch(accessions: List[str]) -> List[str]:
         # with their own exponential backoff turns one slow call into an hour
         # of them, well past nginx's proxy_read_timeout.
         if len(accessions) > 1 and _is_rejected_batch(e):
-            return _fetch_genbank_xml_individually(accessions)
+            return _fetch_genbank_xml_individually(accessions, unchecked=unchecked)
+        if unchecked is not None and not _is_rejected_batch(e):
+            unchecked.extend(accessions)
         _report_unresolved_accessions(accessions, 0)
         return []
 
@@ -645,7 +653,8 @@ def _is_rejected_batch(error: Exception) -> bool:
     return isinstance(status, int) and 400 <= status < 500 and status != 429
 
 
-def _fetch_genbank_xml_individually(accessions: List[str]) -> List[str]:
+def _fetch_genbank_xml_individually(accessions: List[str],
+                                    unchecked: Optional[List[str]] = None) -> List[str]:
     """Re-fetch a rejected batch one accession at a time, keeping what works.
 
     Only reached after NCBI refused a whole batch, so the extra requests are
@@ -668,6 +677,8 @@ def _fetch_genbank_xml_individually(accessions: List[str]) -> List[str]:
                 _ISOLATION_BUDGET_SECONDS, len(accessions) - index, len(accessions),
             )
             failed.extend(accessions[index:])
+            if unchecked is not None:
+                unchecked.extend(accessions[index:])
             break
         params = {
             "db": "nuccore",
@@ -681,8 +692,10 @@ def _fetch_genbank_xml_individually(accessions: List[str]) -> List[str]:
             )
             response.raise_for_status()
             documents.append(response.text)
-        except Exception:
+        except Exception as exc:
             failed.append(accession)
+            if unchecked is not None and not _is_rejected_batch(exc):
+                unchecked.append(accession)
 
     if failed:
         _report_unresolved_accessions(failed, len(documents))
@@ -844,7 +857,13 @@ def _parse_genbank_xml(xml_text: str) -> Dict[str, Dict]:
         logger.error(f"XML Parse Error: {e}")
     except Exception as e:
         logger.error(f"Error parsing GenBank XML: {e}")
-        
+
+    # Every GenBank fetch the app makes teaches the tree viewer which accessions
+    # are types (type_specimen_service.py). Never raises.
+    if result["by_acc"]:
+        from app.services.type_specimen_service import remember_genbank_records
+        remember_genbank_records(result["by_acc"].values())
+
     return result
 
 def _build_header(record: Dict) -> str:

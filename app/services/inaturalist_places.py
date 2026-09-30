@@ -196,7 +196,17 @@ def _take_inat_slot(deadline: Optional[float]) -> bool:
     Returns False when the shared queue is too deep to wait out in time, which
     callers treat like any other failed lookup: the label falls back.
     """
-    from app.services.inaturalist_tree_service import InatTreeError, _pace_inat_request
+    from app.services.inaturalist_tree_service import (
+        InatTreeError, _in_bulk_job, _pace_inat_request, inat_cooldown_remaining,
+    )
+
+    # Alan 9/24/26 - A bulk job sends nothing to iNaturalist during the shared
+    # cooldown; _http_request enforces that, but these lookups bypass it. The
+    # per-process cache misses in every forked job, so without this each bulk
+    # preparation kept sending places requests exactly while being refused.
+    if _in_bulk_job() and inat_cooldown_remaining() > 0:
+        logger.info("iNaturalist place lookup skipped: shared cooldown active")
+        return False
 
     try:
         _pace_inat_request(max_wait=_remaining(deadline))

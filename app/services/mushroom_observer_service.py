@@ -33,6 +33,21 @@ class MushroomObserverError(Exception):
         self.details = details
 
 
+def _mycomap_org_error(exc, status: Optional[int] = None) -> "MushroomObserverError":
+    """Map a MycoMap.org failure the way prepare_inat_tree_job does.
+
+    MycoMap.org not answering (503) and BLAST results not published yet (409)
+    carry the marker that makes the worker wait instead of failing the job.
+    """
+    from app.services.mycomap_org_service import deferral_details
+    details = deferral_details(exc)
+    if details and details.get("mycomap_unavailable"):
+        return MushroomObserverError(str(exc), status=503, details=details)
+    if details:
+        return MushroomObserverError(str(exc), status=409, details=details)
+    return MushroomObserverError(str(exc), status=status or exc.status)
+
+
 def parse_mushroom_observer_input(raw_input: str) -> int:
     """Return an observation ID from a bare ID or an official MO URL shape."""
     raw = str(raw_input or "").strip()
@@ -344,15 +359,15 @@ def _clean_text(value: Any, max_length: int = 500) -> str:
 def _mycomap_blast_url_from_notes(notes: Any) -> str:
     """Return the first validated MycoMap result URL in sequence notes."""
     text = str(notes or "")
-    from app.services.mycomap_service import validate_mycomap_url
+    from app.services.mycomap_service import parse_mycomap_result_reference
 
     for match in re.finditer(
-        r"https?://(?:www\.)?mycomap\.com/[^\s<>\"']+",
+        r"https?://(?:www\.)?mycomap\.(?:com|org)/[^\s<>\"']+",
         text,
         re.IGNORECASE,
     ):
         candidate = match.group(0).rstrip(".,;:!?)]}")
-        if validate_mycomap_url(candidate):
+        if parse_mycomap_result_reference(candidate):
             return candidate
     return ""
 
@@ -825,6 +840,7 @@ def prepare_tree_job(preparation: Dict[str, Any], *, defer_after_ncbi_rerun: boo
         DEFAULT_TREE_PARAMS,
         _build_fasta_text,
         _build_sequence_metadata,
+        default_bootstrap_params,
         _check_auto_created_mycomap_ncbi_results,
         _mycomap_creation_discovery_message,
         _record_creation_queue_position,
@@ -835,9 +851,12 @@ def prepare_tree_job(preparation: Dict[str, Any], *, defer_after_ncbi_rerun: boo
         MycoMapCreateError,
         MycoMapRerunError,
         create_mycomap_blast,
+        find_mycomap_blast_by_known_id,
         find_mycomap_blast_by_title,
         get_mycomap_creation_discovery_max_seconds,
+        recalled_blast_id_for_title,
         unconfirmed_mycomap_creation_verdict,
+        resolve_mycomap_result_reference,
         validate_mycomap_url,
         validate_mycomap_rerun_limit,
     )
@@ -859,7 +878,13 @@ def prepare_tree_job(preparation: Dict[str, Any], *, defer_after_ncbi_rerun: boo
     title = _mycomap_title(observation_id, sequence_id, sequence)
     details = dict(mycomap_rerun_details or {})
     notes_mycomap_url = str(preparation.get("mycomap_blast_url") or "").strip()
-    notes_blast_id = validate_mycomap_url(notes_mycomap_url)
+    from app.services.mycomap_org_service import OrgResultError
+    try:
+        notes_reference = (resolve_mycomap_result_reference(notes_mycomap_url)
+                           if notes_mycomap_url else None)
+    except OrgResultError as exc:
+        raise _mycomap_org_error(exc) from exc
+    notes_blast_id = notes_reference["result_id"] if notes_reference else None
     if not notes_blast_id:
         notes_mycomap_url = ""
     mycomap_url = str(
@@ -873,9 +898,29 @@ def prepare_tree_job(preparation: Dict[str, Any], *, defer_after_ncbi_rerun: boo
         # record ID before the result page exists, which is what lets the wait
         # message name a queue position during discovery.
         pending_creation = {}
-        found = find_mycomap_blast_by_title(
-            title, warnings=lookup_warnings, pending_out=pending_creation
-        )
+        known_id = str(
+            details.get("creation_pending_blast_id")
+            or recalled_blast_id_for_title(title)
+            or ""
+        ).strip()
+        if known_id:
+            found = find_mycomap_blast_by_known_id(
+                known_id, title, warnings=lookup_warnings
+            )
+            if not found:
+                # The stored id may be a MycoMap job id, which the known-id
+                # path cannot resolve (see _create_mycomap_blast_from_observation).
+                found = find_mycomap_blast_by_title(
+                    title, warnings=lookup_warnings, pending_out=pending_creation
+                )
+            # Preserve the ID for queue position reporting and for the
+            # unconfirmed-create check if the result page is not ready yet.
+            pending_creation.setdefault("blast_id", known_id)
+        else:
+            found = find_mycomap_blast_by_title(
+                title, warnings=lookup_warnings, pending_out=pending_creation,
+                fresh=bool(details.get("creation_unconfirmed")),
+            )
         discovery_warnings.extend(lookup_warnings)
         discovery_warnings = list(dict.fromkeys(discovery_warnings))
         verdict = "wait" if found else unconfirmed_mycomap_creation_verdict(
@@ -963,14 +1008,18 @@ def prepare_tree_job(preparation: Dict[str, Any], *, defer_after_ncbi_rerun: boo
                     mycomap_local_limit=local_limit,
                     mycomap_ncbi_limit=ncbi_limit,
                     progress=progress,
+                    mycomap_url=mycomap_url,
                 )
+            except OrgResultError as exc:
+                raise _mycomap_org_error(exc, status=502) from exc
             except MycoMapRerunError as exc:
                 raise MushroomObserverError(str(exc), status=502)
             details["auto_created"] = False
             details["reused_from_sequence_notes"] = bool(notes_blast_id)
             details["created_blast_id"] = found["blast_id"]
             details["created_mycomap_url"] = found["url"]
-            if preparation.get("rebuild_ncbi_blast") and defer_after_ncbi_rerun:
+            if ((preparation.get("rebuild_ncbi_blast") and defer_after_ncbi_rerun)
+                    or details.get("org_wait_sources")):
                 return {
                     "status": "waiting_for_ncbi",
                     "notes": _job_title(observation_id, preparation.get("consensus_name")),
@@ -1000,6 +1049,18 @@ def prepare_tree_job(preparation: Dict[str, Any], *, defer_after_ncbi_rerun: boo
                 ),
             }
 
+    if notes_reference and notes_reference["provider"] == "org" and skip_mycomap_refresh and details.get("org_wait_sources"):
+        from app.services.mycomap_org_service import rerun_pending
+        try:
+            still_pending = rerun_pending(details)
+        except OrgResultError as exc:
+            raise _mycomap_org_error(exc) from exc
+        if still_pending:
+            return {"status": "waiting_for_ncbi",
+                    "notes": _job_title(observation_id, preparation.get("consensus_name")),
+                    "mycomap_blast_url": notes_mycomap_url,
+                    "mycomap_rerun_details": details}
+
     if details.get("auto_created"):
         blast_id = str(details.get("created_blast_id") or "")
         if not blast_id:
@@ -1027,6 +1088,12 @@ def prepare_tree_job(preparation: Dict[str, Any], *, defer_after_ncbi_rerun: boo
     )
     if error is not None:
         body, status = error
+        if status == 409 and body.get("retryable"):
+            # MycoMap has not published this BLAST's results yet: wait for them.
+            raise MushroomObserverError(
+                body.get("error", "MycoMap BLAST results are not published yet."),
+                status=409, details={"mycomap_results_pending": True},
+            )
         raise MushroomObserverError(
             body.get("error", "Failed to fetch MycoMap sequences."),
             # 404 = MycoMap has no such BLAST result. Passing it through keeps the
@@ -1067,7 +1134,7 @@ def prepare_tree_job(preparation: Dict[str, Any], *, defer_after_ncbi_rerun: boo
         "alignment_options": {},
         "tree_method": DEFAULT_TREE_PARAMS["tree_method"],
         "tree_model": DEFAULT_TREE_PARAMS["tree_model"],
-        "bootstrap": DEFAULT_TREE_PARAMS["bootstrap"],
+        **default_bootstrap_params(),
         "mcmc_generations": DEFAULT_TREE_PARAMS["mcmc_generations"],
         "mcmc_nruns": 2,
         "mcmc_nchains": 4,
