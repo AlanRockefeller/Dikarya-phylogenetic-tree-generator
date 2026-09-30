@@ -67,6 +67,18 @@ def test_high_queue_covers_second_worker_when_installed():
         ]
 
 
+@pytest.mark.parametrize("state", ["deactivating", "activating"])
+def test_draining_second_worker_refuses_even_approved_interrupt(state):
+    # A draining high2 job appears in both reports, so an exact approval would
+    # match; the guard must refuse rather than kill only the primary worker.
+    guard = load_guard()
+    reports = [json.dumps({"jobs": [{"id": "job-a"}, {"id": "job-b"}]})] * 2
+    stream = io.StringIO("INTERRUPT job-a,job-b\n")
+    with patch.object(guard.sys, "argv", ["restart-dikarya-worker"]), patch.object(guard.os, "geteuid", return_value=0), patch.object(guard, "run", side_effect=[state, "mixed", "infinity"]), patch("builtins.open", mock_open(read_data="DATABASE_URL=postgresql://example\n")), patch.object(guard.subprocess, "check_output", side_effect=reports), patch.object(guard.subprocess, "run") as mutate, patch.object(guard.sys, "stdin", stream), patch("select.select", return_value=([stream], [], [])):
+        assert guard.main() == 78
+        mutate.assert_not_called()
+
+
 def test_second_worker_without_graceful_config_refuses_restart():
     guard = load_guard()
     inspect = ["active", "mixed", "infinity", "control-group", "90s"]

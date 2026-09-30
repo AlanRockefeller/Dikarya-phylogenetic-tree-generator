@@ -95,6 +95,7 @@ HIGH_QUEUE_UNITS = ("dikarya-worker.service", "dikarya-worker-high2.service")
 
 
 def _queue_units(bulk):
+    """Units serving the queue, or None when one is between states."""
     if bulk:
         return ["dikarya-worker-bulk.service"]
     units = [HIGH_QUEUE_UNITS[0]]
@@ -102,8 +103,15 @@ def _queue_units(bulk):
         # Only a running unit can hold a job. A stopped or failed one stays
         # loaded, but systemd refuses to freeze it, and restarting it by name
         # would start a worker someone deliberately stopped.
-        if run("/usr/bin/systemctl", "show", unit, "-p", "ActiveState", "--value") in ("active", "reloading"):
+        state = run("/usr/bin/systemctl", "show", unit, "-p", "ActiveState", "--value")
+        if state in ("active", "reloading"):
             units.append(unit)
+        elif state not in ("inactive", "failed"):
+            # Alan 9/30/26 - A draining (deactivating) worker can still be
+            # running a job the queue report lists. Leaving it out would let an
+            # exact INTERRUPT approval pass while that job kept running.
+            print(unit + " is " + state + "; refusing to restart until it settles.")
+            return None
     return units
 
 
@@ -118,6 +126,8 @@ def main(*, bulk=None, after_current=False):
         return _restart_bulk_after_current()
     queue = "phylo_bulk" if bulk else "phylo_high"
     units = _queue_units(bulk)
+    if units is None:
+        return 78
     # Safe default even if a job arrives between the check and systemctl restart.
     for unit in units:
         mode = run("/usr/bin/systemctl", "show", unit, "-p", "KillMode", "--value")

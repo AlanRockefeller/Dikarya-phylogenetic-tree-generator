@@ -1,3 +1,4 @@
+import contextvars
 import hashlib
 import json
 import logging
@@ -23,6 +24,48 @@ _MIN_REQUEST_GAP = 1.0 / 3.0  # At least 0.34s between requests (~3 req/s)
 # 50 ids at the rate limit cost ~17s when NCBI is healthy; this only bites when
 # it is not, and it is what keeps the pass inside nginx's 300s read timeout.
 _ISOLATION_BUDGET_SECONDS = 60.0
+
+# Alan 9/30/26 - Absolute deadline shared by every NCBI call of one web-request
+# BLAST. Budgeting the poll alone let submission, the result fetch and the
+# FASTA fetch -- each with its own retries -- run on past nginx's 300s. Unset
+# in the worker, whose BLAST step keeps its own per-poll budget.
+_request_deadline: contextvars.ContextVar = contextvars.ContextVar(
+    "ncbi_request_deadline", default=None
+)
+
+
+def _remaining_budget() -> Optional[float]:
+    """Seconds left in the current request's budget, or None when unbounded.
+
+    Raises TimeoutError once the budget is spent, so no further NCBI call starts.
+    """
+    deadline = _request_deadline.get()
+    if deadline is None:
+        return None
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise TimeoutError("BLAST request budget exhausted")
+    return remaining
+
+
+def _sleep_before_retry(seconds: float) -> None:
+    """Back off, but refuse a wait the request budget cannot absorb."""
+    remaining = _remaining_budget()
+    if remaining is not None and seconds >= remaining:
+        raise TimeoutError(
+            f"BLAST request budget exhausted (retry wait {seconds:.0f}s, "
+            f"{remaining:.0f}s left)"
+        )
+    time.sleep(seconds)
+
+
+def _clamp_timeout(timeout, remaining: float):
+    """Shrink a requests timeout (scalar or (connect, read)) to the budget."""
+    if isinstance(timeout, tuple):
+        return tuple(min(part, remaining) for part in timeout)
+    if timeout is None:
+        return remaining
+    return min(timeout, remaining)
 
 # How many hits a BLAST search returns when the caller names no limit. Both
 # public entry points already defaulted to this; it is named here so the
@@ -78,6 +121,9 @@ def _ncbi_request(method: str, url: str, max_retries: int = 5, **kwargs) -> requ
         # here only delayed the RetryError below by the full backoff (4s on the
         # default three attempts) while holding the caller's request slot.
         last_attempt = attempt == max_retries - 1
+        remaining = _remaining_budget()
+        if remaining is not None:
+            kwargs["timeout"] = _clamp_timeout(kwargs.get("timeout"), remaining)
         try:
             response = requests.request(method, url, **kwargs)
             if response.status_code >= 400:
@@ -98,7 +144,7 @@ def _ncbi_request(method: str, url: str, max_retries: int = 5, **kwargs) -> requ
                     logger.warning(f"NCBI 429 (Too Many Requests) on final attempt {attempt + 1}/{max_retries}. Giving up.")
                     break
                 logger.warning(f"NCBI 429 (Too Many Requests). Waiting {wait_time}s before retry {attempt + 2}/{max_retries}")
-                time.sleep(wait_time)
+                _sleep_before_retry(wait_time)
                 backoff *= 2 # Exponential backoff for next time if needed
                 continue
                 
@@ -108,7 +154,7 @@ def _ncbi_request(method: str, url: str, max_retries: int = 5, **kwargs) -> requ
                     logger.warning(f"NCBI {response.status_code} Error on final attempt {attempt + 1}/{max_retries}. Giving up.")
                     break
                 logger.warning(f"NCBI {response.status_code} Error. Waiting {backoff}s before retry {attempt + 2}/{max_retries}")
-                time.sleep(backoff)
+                _sleep_before_retry(backoff)
                 backoff *= 2
                 continue
             
@@ -122,11 +168,29 @@ def _ncbi_request(method: str, url: str, max_retries: int = 5, **kwargs) -> requ
                 logger.warning(f"NCBI Connection/Timeout error on final attempt {attempt + 1}/{max_retries}: {e}. Giving up.")
                 break
             logger.warning(f"NCBI Connection/Timeout error: {e}. Waiting {backoff}s before retry {attempt + 2}/{max_retries}")
-            time.sleep(backoff)
+            _sleep_before_retry(backoff)
             backoff *= 2
             
     # Every attempt is spent.
     raise requests.exceptions.RetryError(f"Max retries ({max_retries}) exceeded for NCBI request to {url}")
+
+
+def _start_request_budget(max_wait: Optional[float]):
+    """Open an absolute deadline for this call when the caller set a budget."""
+    if max_wait is None:
+        return None
+    return _request_deadline.set(time.monotonic() + max_wait)
+
+
+def _end_request_budget(token) -> None:
+    if token is not None:
+        _request_deadline.reset(token)
+
+
+def _poll_budget() -> float:
+    """The poll's share: what is left of the request budget, else the worker's."""
+    remaining = _remaining_budget()
+    return BLAST_MAX_WAIT_SECONDS if remaining is None else remaining
 
 
 def blast_from_sequence(seq: str, config: Config, min_identity: float = 90.0,
@@ -144,12 +208,12 @@ def blast_from_sequence(seq: str, config: Config, min_identity: float = 90.0,
 
     logger.info(f"BLAST cache miss for hash {query_hash}. Submitting to NCBI.")
     
+    budget_token = _start_request_budget(max_wait)
     try:
         rid, rtoe = _submit_blast_request(seq, config, min_identity, max_sequences)
         logger.info(f"BLAST submitted. RID: {rid}, RTOE: {rtoe}")
         
-        _poll_blast(rid, rtoe, config, logger,
-                    max_wait=BLAST_MAX_WAIT_SECONDS if max_wait is None else max_wait)
+        _poll_blast(rid, rtoe, config, logger, max_wait=_poll_budget())
         
         blast_result = _fetch_blast_results(rid, max_sequences)
         hit_accessions = blast_result.get("accessions", [])
@@ -158,6 +222,9 @@ def blast_from_sequence(seq: str, config: Config, min_identity: float = 90.0,
         
         fasta_content = fetch_fasta_for_accessions(hit_accessions)
         logger.info(f"Downloaded FASTA for {len(hit_accessions)} accessions.")
+        # The FASTA fetch degrades rather than raising, so a budget that ran
+        # out inside it would otherwise cache a partial reference set.
+        _remaining_budget()
         
         return _save_cache(query_hash, hit_accessions, hit_details, fasta_content, config)
         
@@ -165,6 +232,8 @@ def blast_from_sequence(seq: str, config: Config, min_identity: float = 90.0,
         logger.error(f"BLAST failed: {e}")
         # Re-raise to let caller handle failure (e.g. show user error)
         raise
+    finally:
+        _end_request_budget(budget_token)
 
 def blast_from_accessions(accessions: List[str], config: Config, min_identity: float = 90.0,
                           max_sequences: int = DEFAULT_MAX_SEQUENCES, logger=logger,
@@ -186,16 +255,17 @@ def blast_from_accessions(accessions: List[str], config: Config, min_identity: f
 
     logger.info(f"BLAST cache miss for accessions {query_hash}. Fetching sequences first.")
     
+    budget_token = _start_request_budget(max_wait)
     try:
         # 1. Fetch initial sequences to use as query
         query_fasta = fetch_fasta_for_accessions(sorted_accessions)
+        _remaining_budget()
         
         # 2. Run BLAST with these sequences
         rid, rtoe = _submit_blast_request(query_fasta, config, min_identity, max_sequences)
         logger.info(f"BLAST submitted. RID: {rid}, RTOE: {rtoe}")
         
-        _poll_blast(rid, rtoe, config, logger,
-                    max_wait=BLAST_MAX_WAIT_SECONDS if max_wait is None else max_wait)
+        _poll_blast(rid, rtoe, config, logger, max_wait=_poll_budget())
         
         blast_result = _fetch_blast_results(rid, max_sequences)
         hit_accessions = blast_result.get("accessions", [])
@@ -213,12 +283,15 @@ def blast_from_accessions(accessions: List[str], config: Config, min_identity: f
         
         fasta_content = fetch_fasta_for_accessions(all_accessions)
         logger.info(f"Downloaded FASTA for {len(all_accessions)} accessions.")
+        _remaining_budget()
         
         return _save_cache(query_hash, all_accessions, hit_details, fasta_content, config)
 
     except Exception as e:
         logger.error(f"BLAST from accessions failed: {e}")
         raise
+    finally:
+        _end_request_budget(budget_token)
 
 def _hash_query(query_str: str, min_identity: float = 90.0, max_sequences: int = 50) -> str:
     raw = f"{query_str}|{min_identity}|{max_sequences}"
@@ -344,10 +417,10 @@ BLAST_MAX_WAIT_SECONDS = 600
 # Alan 9/28/26 - The same budget for a BLAST run inside a web request, which
 # nginx abandons at proxy_read_timeout 300. With the worker's 600s the browser
 # got nginx's HTML 504 at 300s while the handler held its Gunicorn slot for
-# another five minutes and then logged a 500 nobody received. Submission and
-# the result/FASTA fetch around the poll take well under 10s on real requests,
-# so 240s leaves headroom. The pipeline's BLAST step runs in the worker and
-# keeps the full budget.
+# another five minutes and then logged a 500 nobody received. Alan 9/30/26 -
+# This is one absolute deadline for the whole call -- submission, poll, result
+# and FASTA fetches, and every retry wait -- so 240s leaves 60s of headroom.
+# The pipeline's BLAST step runs in the worker and keeps the full budget.
 BLAST_REQUEST_MAX_WAIT_SECONDS = 240
 
 

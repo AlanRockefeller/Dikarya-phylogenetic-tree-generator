@@ -2288,11 +2288,19 @@ document.addEventListener('DOMContentLoaded', async () => {
     // root type check and highlight slots behave exactly as a normal Add. Both run synchronously
     // up to the save's await, so the dialog is never painted; if validation refuses, it stays
     // open with the error so the user can fix it by hand.
+    // Alan 9/30/26 - Selections whose quick annotation is still saving. The selection is only
+    // cleared after the save returns, so a second N press in that window would add it again.
+    const quickAnnotationsInFlight = [];
+
     function quickAnnotateCurrentSelection() {
         if (!annotationsEditable() || !viewer?.getSelectedAnnotationLeafIds) return;
         const memberIds = viewer.getSelectedAnnotationLeafIds();
         if (!memberIds.length) {
             showStatus('Select the sequences you want to annotate.', 'warning', 6000);
+            return;
+        }
+        if (quickAnnotationsInFlight.some(pending => sameTipIdSet(pending, memberIds))) {
+            showStatus('Still saving the annotation for this selection.', 'info', 3000);
             return;
         }
         if (!suggestedAnnotationLabel(memberIds)) {
@@ -2301,7 +2309,13 @@ document.addEventListener('DOMContentLoaded', async () => {
             return;
         }
         openAnnotationEditor('add', { memberIds });
-        if (annotationEditorState) submitAnnotationEditor({ quick: true });
+        if (!annotationEditorState) return;
+        const pending = memberIds.slice();
+        quickAnnotationsInFlight.push(pending);
+        Promise.resolve(submitAnnotationEditor({ quick: true })).finally(() => {
+            const index = quickAnnotationsInFlight.indexOf(pending);
+            if (index >= 0) quickAnnotationsInFlight.splice(index, 1);
+        });
     }
 
     function saveDisplayPrefs() {
