@@ -86,6 +86,28 @@ class VoucherFormatTests(unittest.TestCase):
         self.assertIsNone(vs.extract_voucher(None, rx))
 
 
+class PatternTimeoutTests(unittest.TestCase):
+    def test_catastrophic_custom_pattern_times_out_instead_of_hanging(self):
+        # (a|aa)+$ passes the short probe but backtracks for seconds at ~32 chars.
+        rx = vs.compile_voucher_pattern(r"(a|aa)+$")
+        with self.assertRaises(TimeoutError):
+            vs.extract_voucher("a" * 60 + "!", rx)
+
+    def test_timed_out_observation_becomes_a_flag_row(self):
+        obs_list = [{"id": 7}]
+        with patch.object(vs, "build_row", side_effect=TimeoutError("regex timed out")):
+            rows, cancelled = vs.scan_observations(
+                _StubClient(), obs_list, field_id=1907,
+                voucher_re=vs.compile_voucher_pattern("x"),
+                allow_overwrite=False, use_ocr=False, workers=1)
+        self.assertFalse(cancelled)
+        self.assertEqual((rows[0]["action"], rows[0]["reason"]), (vs.FLAG, "pattern_timeout"))
+
+    def test_presets_still_match_through_regex(self):
+        rx = vs.compile_voucher_pattern(vs.DEFAULT_VOUCHER_RE)
+        self.assertEqual(vs.extract_voucher("label bt-001 here", rx), "BT-001")
+
+
 class PhotoAndObservationHelperTests(unittest.TestCase):
     def test_last_photo_url_orders_by_position_and_swaps_size(self):
         self.assertEqual(vs.last_photo_url(_obs()), "https://cdn/1/original.jpg")
@@ -255,19 +277,34 @@ class OrchestrationTests(unittest.TestCase):
 
 
 class RedosGuardTests(unittest.TestCase):
-    """A custom pattern runs on the shared RQ worker, so it is probed first."""
+    """A custom pattern is probed first, and every match is time-limited."""
 
-    def test_pathological_patterns_are_rejected(self):
+    def test_pathological_patterns_are_rejected_or_bounded(self):
         # Several alphabets on purpose: a probe built only from "a" never enters
-        # the repeated group of (\d+)+ or ([A-Z]+)+, so those patterns looked
-        # safe to the guard and would have reached the worker.
+        # the repeated group of (\d+)+ or ([A-Z]+)+. Alan 9/30/26 - The `regex`
+        # engine optimises several of these into linear matches, so the probe
+        # now accepts them; what must hold is that none can hang the worker:
+        # each is either refused up front or finishes/times out on a long
+        # adversarial input.
+        import time
         for pattern in ("(a+)+$", r"(\d+)+$", "([A-Z]+)+!", "([a-z0-9]+)+$",
-                        r"(\s+)+$", "(a|a)*$"):
+                        r"(\s+)+$", "(a|a)*$", "(a|aa)+$"):
             with self.subTest(pattern=pattern):
                 params, err = vs.validate_scan_params(
                     {"date_start": "2026-08-01", "format": "Custom", "regex": pattern})
-                self.assertIsNone(params, pattern)
-                self.assertIn("too slow", err)
+                if params is None:
+                    self.assertIn("too slow", err)
+                    continue
+                rx = vs.compile_voucher_pattern(params["regex"])
+                for unit, suffix in vs._REDOS_ALPHABETS:
+                    text = (unit * vs.MAX_MATCH_TEXT)[:vs.MAX_MATCH_TEXT - 1] + suffix
+                    start = time.perf_counter()
+                    try:
+                        vs.extract_voucher(text, rx)
+                    except TimeoutError:
+                        pass
+                    self.assertLess(time.perf_counter() - start,
+                                    vs.VOUCHER_MATCH_TIMEOUT_SECONDS + 0.5)
 
     def test_ordinary_custom_patterns_are_accepted(self):
         # The guard must not reject the patterns collectors actually write.

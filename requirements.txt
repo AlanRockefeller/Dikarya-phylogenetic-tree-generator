@@ -152,6 +152,8 @@ pyyaml==6.0.3
     # via rapidocr-onnxruntime
 rapidocr-onnxruntime==1.4.4
     # via -r requirements.in
+regex==2026.9.29
+    # via -r requirements.in
 redis==7.1.0
     # via
     #   -r requirements.in

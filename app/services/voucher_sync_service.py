@@ -24,6 +24,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date
 from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 
+import regex
 import requests
 
 logger = logging.getLogger(__name__)
@@ -325,11 +326,33 @@ def decode_qr(img, cache: Dict[str, Any]) -> Tuple[Optional[str], Optional[str]]
     return None, "no_qr_detected"
 
 
+# Alan 9/30/26 - Custom patterns are user-supplied and matched against photo
+# text an uploader controls, and no probe can prove an arbitrary pattern is
+# fast: (a|aa)+$ passes one and then takes seconds on 32 characters. So every
+# voucher pattern is compiled with the `regex` module and each match carries a
+# hard timeout. A timeout raises TimeoutError, which scan_observations turns
+# into a FLAG row (reason "pattern_timeout").
+VOUCHER_MATCH_TIMEOUT_SECONDS = 0.25
+_TIMEOUT_PATTERN_TYPE = type(regex.compile(""))
+
+
+def compile_voucher_pattern(pattern: str):
+    """Compile a voucher pattern so its matches can be time-limited."""
+    return regex.compile(pattern, regex.IGNORECASE)
+
+
 def extract_voucher(text: Optional[str], voucher_re) -> Optional[str]:
-    """First substring of `text` matching the voucher pattern, upper-cased."""
+    """First substring of `text` matching the voucher pattern, upper-cased.
+
+    Raises TimeoutError when a `compile_voucher_pattern` pattern runs too long.
+    """
     if text is None:
         return None
-    m = voucher_re.search(text[:MAX_MATCH_TEXT])
+    text = text[:MAX_MATCH_TEXT]
+    if isinstance(voucher_re, _TIMEOUT_PATTERN_TYPE):
+        m = voucher_re.search(text, timeout=VOUCHER_MATCH_TIMEOUT_SECONDS)
+    else:
+        m = voucher_re.search(text)
     return m.group(0).upper() if m else None
 
 
@@ -655,6 +678,11 @@ def scan_observations(client: INatClient, obs_list: List[Dict[str, Any]], *,
             obs = obs_list[idx]
             try:
                 row = fut.result()
+            except TimeoutError:
+                row = _base_row(obs)
+                row["action"] = FLAG
+                row["reason"] = "pattern_timeout"
+                logger.warning("voucher sync pattern_timeout obs=%s", obs.get("id"))
             except Exception as exc:
                 row = _base_row(obs)
                 row["action"] = FLAG
@@ -759,8 +787,12 @@ def _pattern_is_slow(compiled) -> bool:
             probe = (unit * n)[:n] + suffix
             start = _time.perf_counter()
             try:
-                compiled.search(probe)
-            except (RecursionError, MemoryError, OverflowError):
+                if isinstance(compiled, _TIMEOUT_PATTERN_TYPE):
+                    # Bounded, so the probe itself cannot hang the request.
+                    compiled.search(probe, timeout=_REDOS_BUDGET_SECONDS)
+                else:
+                    compiled.search(probe)
+            except (RecursionError, MemoryError, OverflowError, TimeoutError):
                 return True
             if (_time.perf_counter() - start) > _REDOS_BUDGET_SECONDS:
                 return True
@@ -783,8 +815,8 @@ def validate_scan_params(data: Dict[str, Any]) -> Tuple[Optional[Dict[str, Any]]
     else:
         pattern = presets[fmt]
     try:
-        compiled = re.compile(pattern, re.IGNORECASE)
-    except re.error as exc:
+        compiled = compile_voucher_pattern(pattern)
+    except (regex.error, re.error) as exc:
         return None, f"Voucher pattern error: {exc}"
     if fmt == "Custom":
         slow = _pattern_is_slow(compiled)

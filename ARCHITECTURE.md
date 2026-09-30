@@ -171,7 +171,9 @@ same four outcomes under its own names -- `ocr_fallback`, `already_correct`
 (shared with the QR path), `ocr_fallback_overwrite`, `ocr_value_conflict` --
 so the `ocr_` prefix is neither uniform nor present on all of them. Otherwise:
 `no_photos`, `unexpected_qr_data`, `no_qr_detected`, `ocr_no_match`,
-`photo_download_failed`, `scan_error`. The page
+`photo_download_failed`, `scan_error`, `pattern_timeout` (a voucher pattern
+match exceeded `VOUCHER_MATCH_TIMEOUT_SECONDS`; patterns are compiled with the
+`regex` module so every match is time-limited). The page
 colours rows green (update), grey (skip), amber (flag); OCR updates are
 labelled "Update (OCR)" rather than coloured differently.
 

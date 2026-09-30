@@ -25,6 +25,8 @@ pyitsx==0.1.0
 python-dotenv==1.2.2
 # Voucher Sync: OCR fallback when no QR code decodes (worker only; lazy-imported).
 rapidocr-onnxruntime==1.4.4
+# Voucher Sync: time-limited matching of user-supplied Custom voucher patterns.
+regex==2026.9.29
 redis==7.1.0
 requests==2.33.0
 rq==2.6.1

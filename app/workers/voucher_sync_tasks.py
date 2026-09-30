@@ -18,7 +18,6 @@ from __future__ import annotations
 
 import json
 import logging
-import re
 import time
 from datetime import datetime
 from typing import Any, Dict, List, Optional
@@ -206,7 +205,7 @@ def run_voucher_scan_job(run_id: str) -> Dict[str, Any]:
         ctx.log(f"Found {total} observation(s). Scanning photos...")
         ctx.progress(0, total, force=True)
 
-        voucher_re = re.compile(params["regex"], re.IGNORECASE)
+        voucher_re = vs.compile_voucher_pattern(params["regex"])
 
         def on_row(done: int, total_: int, row: Dict[str, Any]) -> None:
             ctx.push_row(row)
