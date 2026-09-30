@@ -65,8 +65,11 @@ def _isolate_type_specimen_cache(tmp_path_factory):
     from app.services import type_specimen_service
 
     original = type_specimen_service.DATA_DIR
+    bundled_original = type_specimen_service.BUNDLED_MYCOMAP_PATH
     type_specimen_service.DATA_DIR = tmp_path_factory.mktemp("type-specimens")
+    type_specimen_service.BUNDLED_MYCOMAP_PATH = type_specimen_service.DATA_DIR / "bundled.json"
     try:
         yield type_specimen_service.DATA_DIR
     finally:
         type_specimen_service.DATA_DIR = original
+        type_specimen_service.BUNDLED_MYCOMAP_PATH = bundled_original

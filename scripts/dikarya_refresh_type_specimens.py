@@ -19,7 +19,7 @@ Two independent passes (see app/services/type_specimen_service.py):
 Output lives in Config.TYPE_SPECIMEN_DIR (cache/type_specimens, group dikarya,
 2775), which the web process reads and the worker appends to.
 
-Every run except --dry-run also appends its log to ~/.dikarya/type-specimens/
+Every run except --dry-run also appends its log to cache/type_specimens/
 refresh.log (type_specimen_service.REFRESH_LOG_PATH): per-pass statistics plus
 one event=type_specimens.added / removed / reclassified line per accession.
 scripts/dikarya_log_digest.py turns those into its "Type specimens" section.
@@ -50,7 +50,6 @@ from app.config import Config  # noqa: E402
 from app.services import type_specimen_service as tss  # noqa: E402
 from app.services.api_diagnostics import diagnostic_urlopen  # noqa: E402
 from app.services.artifact_storage import default_file_mode  # noqa: E402
-from app.services.fasta_utils import is_genbank_accession  # noqa: E402
 
 MYCOMAP_URL = "https://mycomap.org/api/type-specimens"
 # Cloudflare answers Python's default "Python-urllib/3.x" agent with a 403.
@@ -141,46 +140,8 @@ def download_mycomap():
     return list(unique.values())
 
 
-def _specificity(record, row_id):
-    """Rank two rows for the same accession: a named category beats the generic
-    "type", then a row with a description and a voucher. The row id breaks a
-    tie so the answer never depends on the API's row order."""
-    return (record["status"] != "type", bool(record["type_material"]),
-            bool(record["voucher"]), -row_id if isinstance(row_id, int) else 0)
-
-
 def build_snapshot(rows):
-    records = {}
-    ranks = {}
-    skipped = {"not_an_accession": 0, "not_type_material": 0}
-    for row in rows:
-        acc = tss.accession_root(row.get("accessionNumber"))
-        # Drops the core list's 7-digit lab sequence ids and the two
-        # spreadsheet header rows that were imported as data.
-        if not acc or not is_genbank_accession(acc):
-            skipped["not_an_accession"] += 1
-            continue
-        type_material = " ".join(str(row.get("typeMaterial") or "").split())
-        status = tss.classify_type_material(type_material)
-        if status is None:
-            if type_material:
-                skipped["not_type_material"] += 1  # e.g. "reference material"
-                continue
-            status = "type"  # listed as a type, but no category given
-        record = {
-            "status": status,
-            "type_material": type_material,
-            "organism": " ".join(str(row.get("organism") or "").split()),
-            "voucher": " ".join(str(row.get("specimenVoucher") or row.get("isolate") or "").split()),
-            "source": row.get("source") or "",
-        }
-        # The list can carry one accession more than once, and a later bare row
-        # must not overwrite "holotype" with the generic "type".
-        rank = _specificity(record, row.get("id"))
-        if acc not in records or rank > ranks[acc]:
-            records[acc] = record
-            ranks[acc] = rank
-    return records, skipped
+    return tss.build_mycomap_snapshot(rows)
 
 
 def write_atomically(path, text):

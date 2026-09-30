@@ -43,15 +43,16 @@ logger = logging.getLogger(__name__)
 # fixture records next to real ones.
 DATA_DIR = Path(Config.TYPE_SPECIMEN_DIR)
 MYCOMAP_SNAPSHOT_NAME = "mycomap_type_specimens.json"
+BUNDLED_MYCOMAP_PATH = Config.BASE_DIR / "mycomap-type-specimens.json"
 GENBANK_CACHE_NAME = "genbank_type_material.jsonl"
 # scripts/dikarya_refresh_type_specimens.py appends its statistics and one
 # event=type_specimens.* line per type accession it adds, drops or reclassifies
-# here, and scripts/dikarya_log_digest.py reports them. Under the tree user's
-# home, beside the cron's per-run transcripts, because tree cannot write to
-# var/logs.
+# here, and scripts/dikarya_log_digest.py reports them. Keep the default in
+# the shared type-specimen directory so scheduled and manual runs by different
+# accounts read the same file.
 REFRESH_LOG_PATH = Path(
     os.environ.get("DIKARYA_TYPE_SPECIMEN_REFRESH_LOG")
-    or Path.home() / ".dikarya" / "type-specimens" / "refresh.log"
+    or DATA_DIR / "refresh.log"
 )
 
 # Type categories as NCBI's /type_material vocabulary spells them (MycoMap's
@@ -129,8 +130,8 @@ def _file_signature(path: Path):
     return (stat.st_mtime_ns, stat.st_size)
 
 
-def _cached_load(name: str, loader):
-    path = DATA_DIR / name
+def _cached_load(name: str, loader, *, path: Optional[Path] = None):
+    path = path or DATA_DIR / name
     signature = _file_signature(path)
     key = (str(path), name)
     with _lock:
@@ -154,6 +155,53 @@ def _load_mycomap(path: Path) -> Dict[str, Dict[str, Any]]:
     return records if isinstance(records, dict) else {}
 
 
+def build_mycomap_snapshot(rows):
+    """Normalize raw MycoMap rows for both the bundled fallback and refresh."""
+    from app.services.fasta_utils import is_genbank_accession
+
+    records, ranks = {}, {}
+    skipped = {"not_an_accession": 0, "not_type_material": 0}
+    for row in rows:
+        acc = accession_root(row.get("accessionNumber"))
+        if not acc or not is_genbank_accession(acc):
+            skipped["not_an_accession"] += 1
+            continue
+        type_material = " ".join(str(row.get("typeMaterial") or "").split())
+        status = classify_type_material(type_material)
+        if status is None:
+            if type_material:
+                skipped["not_type_material"] += 1
+                continue
+            status = "type"
+        record = {
+            "status": status,
+            "type_material": type_material,
+            "organism": " ".join(str(row.get("organism") or "").split()),
+            "voucher": " ".join(str(row.get("specimenVoucher") or row.get("isolate") or "").split()),
+            "source": row.get("source") or "",
+        }
+        row_id = row.get("id")
+        rank = (status != "type", bool(type_material), bool(record["voucher"]),
+                -row_id if isinstance(row_id, int) else 0)
+        if acc not in records or rank > ranks[acc]:
+            records[acc], ranks[acc] = record, rank
+    return records, skipped
+
+
+def _load_bundled_mycomap(path: Path) -> Dict[str, Dict[str, Any]]:
+    try:
+        with open(path, encoding="utf-8") as handle:
+            payload = json.load(handle)
+        rows = payload.get("specimens") if isinstance(payload, dict) else None
+        if not isinstance(rows, list):
+            raise ValueError("missing specimens list")
+        records, _ = build_mycomap_snapshot(rows)
+        return records
+    except (OSError, ValueError) as exc:
+        logger.warning("event=type_specimens.bundled_snapshot_unreadable path=%s error=%s", path, exc)
+        return {}
+
+
 def _load_genbank(path: Path) -> Dict[str, Dict[str, Any]]:
     entries: Dict[str, Dict[str, Any]] = {}
     try:
@@ -172,7 +220,11 @@ def _load_genbank(path: Path) -> Dict[str, Dict[str, Any]]:
 
 
 def mycomap_index() -> Dict[str, Dict[str, Any]]:
-    return _cached_load(MYCOMAP_SNAPSHOT_NAME, _load_mycomap)
+    live_path = DATA_DIR / MYCOMAP_SNAPSHOT_NAME
+    if live_path.is_file():
+        return _cached_load(MYCOMAP_SNAPSHOT_NAME, _load_mycomap)
+    return _cached_load("bundled_mycomap", _load_bundled_mycomap,
+                        path=BUNDLED_MYCOMAP_PATH)
 
 
 def genbank_index() -> Dict[str, Dict[str, Any]]:

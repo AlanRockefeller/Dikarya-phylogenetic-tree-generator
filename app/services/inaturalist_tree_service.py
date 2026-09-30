@@ -2458,33 +2458,91 @@ def _append_fasta_to_job_input(job_dir, fasta_text: str, *,
         for seq in sequences_to_add:
             seq["name"] = compact_mycomap_ncbi_header(seq.get("name", ""))
 
+    from app.services.artifact_storage import default_file_mode
+
     input_path = job_dir / "input" / "input_raw.fasta"
     input_path.parent.mkdir(parents=True, exist_ok=True)
 
     existing_ids = set()
-    existing_records = set()
+    existing_records = {}
+    existing_text = ""
     if input_path.exists():
-        for s in _parse_fasta_sequences(input_path.read_text()):
+        existing_text = input_path.read_text()
+        for s in _parse_fasta_sequences(existing_text):
             seq_id, _ = _split_fasta_header(s["name"])
             if seq_id:
                 existing_ids.add(seq_id)
-            existing_records.add(_sequence_exact_key(s))
+            existing_records[_sequence_exact_key(s)] = s["name"]
 
-    added_count = 0
-    with open(input_path, "a") as f:
-        if input_path.stat().st_size > 0:
-            f.write("\n")
-        for seq in sequences_to_add:
-            exact_key = _sequence_exact_key(seq)
-            if exact_key in existing_records:
-                continue
-            formatted = _format_fasta_record_for_job(seq, existing_ids, added_count + 1)
-            f.write(formatted)
+    formatted_records = []
+    for seq in sequences_to_add:
+        exact_key = _sequence_exact_key(seq)
+        existing_name = existing_records.get(exact_key)
+        if existing_name is None:
+            # A previous attempt may have appended this record under a
+            # unique _added ID, then failed before writing its metadata.
+            incoming_id, incoming_rest = _split_fasta_header(seq.get("name"))
+            for stored_name, stored_sequence in existing_records:
+                stored_id, stored_rest = _split_fasta_header(stored_name)
+                if (stored_sequence == exact_key[1] and stored_rest == incoming_rest
+                        and stored_id.startswith(incoming_id + "_added")):
+                    existing_name = stored_name
+                    break
+        if existing_name is not None:
             if added_records is not None:
-                added_records.append({**seq, "name": formatted.splitlines()[0][1:]})
-            existing_records.add(exact_key)
-            added_count += 1
-    return added_count
+                added_records.append({**seq, "name": existing_name})
+            continue
+        formatted = _format_fasta_record_for_job(seq, existing_ids,
+                                                 len(formatted_records) + 1)
+        formatted_records.append(formatted)
+        formatted_name = formatted.splitlines()[0][1:]
+        if added_records is not None:
+            added_records.append({**seq, "name": formatted_name})
+        existing_records[_sequence_exact_key({"name": formatted_name,
+                                              "sequence": seq["sequence"]})] = formatted_name
+
+    if formatted_records:
+        mode = (input_path.stat().st_mode & 0o777) if input_path.exists() else default_file_mode()
+        fd, temp_path = tempfile.mkstemp(dir=input_path.parent, prefix="input_raw.")
+        try:
+            with os.fdopen(fd, "w") as handle:
+                if existing_text:
+                    handle.write(existing_text.rstrip("\n") + "\n")
+                handle.write("".join(formatted_records))
+            os.chmod(temp_path, mode)
+            os.replace(temp_path, input_path)
+        finally:
+            if os.path.exists(temp_path):
+                os.unlink(temp_path)
+    return len(formatted_records)
+
+
+def _remember_reconciled_sequence_metadata(job_dir, records) -> int:
+    """Add missing provenance after an append, including on a retry."""
+    from app.services.artifact_storage import default_file_mode
+
+    if not records:
+        return 0
+    info_path = job_dir / "input_info.json"
+    stored = json.loads(info_path.read_text())
+    metadata = list(stored.get("sequence_metadata") or [])
+    known = {item.get("fasta_header") for item in metadata if isinstance(item, dict)}
+    additions = [item for item in _build_sequence_metadata(records)
+                 if item["fasta_header"] not in known]
+    if not additions:
+        return 0
+    stored["sequence_metadata"] = metadata + additions
+    mode = (info_path.stat().st_mode & 0o777) if info_path.exists() else default_file_mode()
+    fd, temp_path = tempfile.mkstemp(dir=info_path.parent, prefix="input_info.")
+    try:
+        with os.fdopen(fd, "w") as handle:
+            json.dump(stored, handle, separators=(",", ":"))
+        os.chmod(temp_path, mode)
+        os.replace(temp_path, info_path)
+    finally:
+        if os.path.exists(temp_path):
+            os.unlink(temp_path)
+    return len(additions)
 
 
 def _schedule_ncbi_recheck(job_id: str, *, hours: int = 1) -> None:
@@ -2648,7 +2706,8 @@ def reconcile_delayed_ncbi_results(job_id: str) -> Dict[str, Any]:
                 fasta_text = ""
             else:
                 fetch_result = {"failed_sources": payload.get("failed_sources") or [],
-                                "errors": []}
+                                "errors": [payload.get("message") or "incomplete NCBI results"]
+                                if payload.get("failed_sources") else []}
                 fasta_text = _build_fasta_text(payload.get("sequences") or [])
         else:
             fetch_result = fetch_mycomap_fasta(blast_id, include_ncbi=True, include_local=False)
@@ -2659,81 +2718,94 @@ def reconcile_delayed_ncbi_results(job_id: str) -> Dict[str, Any]:
         # the job as having NCBI results it never received and cancelled all further
         # rechecks -- the sequences were then never picked up. Leave the status alone
         # and reschedule so the next pass can try again.
+        partial_download = False
         if fetch_result.get("failed_sources"):
             errors = "; ".join(fetch_result.get("errors") or []) or "unknown error"
             # Bounded by the same budget as the "still waiting" path, so a persistently
             # broken endpoint gives up instead of rescheduling forever.
             max_hours = get_mycomap_ncbi_recheck_max_hours()
             if recheck_count >= max_hours:
-                rerun_details["ncbi_status"] = "gave_up"
-                rerun_details["ncbi_fallback_local_only"] = False
+                partial_download = reference["provider"] == "org" and bool(fasta_text.strip())
+                if not partial_download:
+                    rerun_details["ncbi_status"] = "gave_up"
+                    rerun_details["ncbi_fallback_local_only"] = False
+                    metrics["mycomap_blast_rerun"] = rerun_details
+                    metrics["mycomap_refresh_warnings"] = list(
+                        metrics.get("mycomap_refresh_warnings") or []
+                    ) + [
+                        "MycoMap NCBI results were ready but could not be downloaded after "
+                        f"{max_hours} attempts ({errors}); tree remains local-only."
+                    ]
+                    db_job.metrics = metrics
+                    db.session.commit()
+                    logger.warning(
+                        "Giving up on MycoMap NCBI fetch for job %s (blast %s) after %s "
+                        "attempts: %s", job_id, blast_id, recheck_count, errors,
+                    )
+                    return {"status": "gave_up", "error": errors}
+            else:
+                from app.services.log_context import log_degradation
+                log_degradation(
+                    logger,
+                    "mycomap_ncbi_recheck_failed",
+                    f"NCBI results are ready but could not be downloaded ({errors}); "
+                    "leaving the job local-only and rescheduling the recheck",
+                    job=job_id, blast_id=blast_id, attempt=recheck_count,
+                )
                 metrics["mycomap_blast_rerun"] = rerun_details
-                metrics["mycomap_refresh_warnings"] = list(
-                    metrics.get("mycomap_refresh_warnings") or []
-                ) + [
-                    "MycoMap NCBI results were ready but could not be downloaded after "
-                    f"{max_hours} attempts ({errors}); tree remains local-only."
-                ]
                 db_job.metrics = metrics
                 db.session.commit()
-                logger.warning(
-                    "Giving up on MycoMap NCBI fetch for job %s (blast %s) after %s "
-                    "attempts: %s", job_id, blast_id, recheck_count, errors,
-                )
-                return {"status": "gave_up", "error": errors}
-
-            from app.services.log_context import log_degradation
-            log_degradation(
-                logger,
-                "mycomap_ncbi_recheck_failed",
-                f"NCBI results are ready but could not be downloaded ({errors}); "
-                "leaving the job local-only and rescheduling the recheck",
-                job=job_id, blast_id=blast_id, attempt=recheck_count,
-            )
-            metrics["mycomap_blast_rerun"] = rerun_details
-            db_job.metrics = metrics
-            db.session.commit()
-            _schedule_ncbi_recheck(job_id, hours=1)
-            return {"status": "fetch_failed", "error": errors}
+                _schedule_ncbi_recheck(job_id, hours=1)
+                return {"status": "fetch_failed", "error": errors}
 
         added_count = 0
+        matched_count = 0
         if fasta_text.strip():
             added_records = []
-            added_count = _append_fasta_to_job_input(
-                Config.JOB_DIR / job_id, fasta_text,
-                sequence_records=(payload.get("sequences") or [])
-                if reference["provider"] == "org" else None,
-                added_records=added_records if reference["provider"] == "org" else None,
-            )
-            if added_records:
-                from app.services.artifact_storage import default_file_mode
-                info_path = (Config.JOB_DIR / job_id) / "input_info.json"
-                stored = json.loads(info_path.read_text())
-                stored["sequence_metadata"] = (
-                    list(stored.get("sequence_metadata") or [])
-                    + _build_sequence_metadata(added_records)
+            # This check is a recovery backstop if the worker stops between
+            # replacing the FASTA and replacing input_info.json. A successful
+            # reconciliation makes the extra check a cheap no-op.
+            recovery_scheduled = False
+            try:
+                if reference["provider"] == "org":
+                    _schedule_ncbi_recheck(job_id, hours=1)
+                    recovery_scheduled = True
+                added_count = _append_fasta_to_job_input(
+                    Config.JOB_DIR / job_id, fasta_text,
+                    sequence_records=(payload.get("sequences") or [])
+                    if reference["provider"] == "org" else None,
+                    added_records=added_records if reference["provider"] == "org" else None,
                 )
-                mode = (info_path.stat().st_mode & 0o777) if info_path.exists() else default_file_mode()
-                fd, temp_path = tempfile.mkstemp(dir=info_path.parent, prefix="input_info.")
-                try:
-                    with os.fdopen(fd, "w") as handle:
-                        json.dump(stored, handle, separators=(",", ":"))
-                    os.chmod(temp_path, mode)
-                    os.replace(temp_path, info_path)
-                finally:
-                    if os.path.exists(temp_path):
-                        os.unlink(temp_path)
+                matched_count = len(added_records)
+                if added_records:
+                    _remember_reconciled_sequence_metadata(Config.JOB_DIR / job_id,
+                                                           added_records)
+            except Exception:
+                # The FASTA may have been written already. On the next check,
+                # matched records repair missing metadata and still recompute.
+                logger.exception("NCBI input reconciliation failed for job %s", job_id)
+                if not recovery_scheduled:
+                    _schedule_ncbi_recheck(job_id, hours=1)
+                return {"status": "input_update_failed"}
 
-        rerun_details["ncbi_status"] = "available"
+        rerun_details["ncbi_status"] = "partial" if partial_download else "available"
         rerun_details["ncbi_fallback_local_only"] = False
         rerun_details["ncbi_appended_at"] = datetime.now(timezone.utc).isoformat()
         rerun_details["ncbi_appended_count"] = added_count
-        rerun_details["ncbi_recompute_pending"] = added_count > 0
+        rerun_details["ncbi_recompute_pending"] = added_count > 0 or matched_count > 0
+        if partial_download:
+            metrics["mycomap_refresh_warnings"] = list(
+                metrics.get("mycomap_refresh_warnings") or []
+            ) + [
+                "MycoMap NCBI results remained incomplete after "
+                f"{max_hours} attempts ({errors}); the available NCBI sequences "
+                "were added, but some BLAST hits are missing."
+            ]
         metrics["mycomap_blast_rerun"] = rerun_details
         db_job.metrics = metrics
         db.session.commit()
 
-        if added_count <= 0:
+        if not rerun_details["ncbi_recompute_pending"]:
             return {"status": "no_new_sequences"}
 
         input_info_path = (Config.JOB_DIR / job_id) / "input_info.json"

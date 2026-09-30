@@ -351,8 +351,10 @@ def fetch_results(result_id, *, include_ncbi=True, include_local=True,
                 result["errors"].append(
                     f"Could not fetch full NCBI sequences for {missing} BLAST hits"
                 )
-                if missing == len(hits):
-                    result["failed_sources"].append(source)
+                # Even one missing full record leaves an incomplete result.
+                # The delayed reconciler retains available hits after its
+                # bounded retries rather than declaring NCBI complete.
+                result["failed_sources"].append(source)
         for hit in hits:
             item = metadata.get(hit["id"], {})
             accession = hit["accession"] if source == "ncbi" else ""
