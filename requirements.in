@@ -17,7 +17,7 @@ MarkupSafe==3.0.3
 # Voucher Sync: QR decoding of observation photos (worker only; lazy-imported).
 # rapidocr-onnxruntime requires the full opencv-python (not -headless), which
 # needs libgl1 + libglib2.0-0 on the host. Pinned here so it does not float.
-opencv-python==4.12.0.88
+opencv-python==4.14.0.94
 psutil==7.2.0
 psycopg2-binary==2.9.11
 # ITS1/5.8S/ITS2 region extraction (optional pipeline step); pulls in pyhmmer.
