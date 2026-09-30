@@ -14,6 +14,7 @@ import os
 import re
 import shutil
 import logging
+import time
 import math
 from collections import Counter
 from pathlib import Path
@@ -1397,6 +1398,30 @@ MRBAYES_MAX_ASDSF = Config.DEFAULT_MCMC_STOPVAL
 MRBAYES_MAX_PSRF = 1.02
 MRBAYES_MIN_ESS = 200.0
 
+# What MrBayes prints just before aborting when a proposal leaves the
+# likelihood undefined: "DEBUG ERROR: Log likelihood nan after move
+# 'Dirichlet(Revmat)'". On real jobs it has only ever come from GTR+G runs over
+# nearly identical sequences (tree length ~0.2 across 126 tips): with no +I to
+# absorb the invariant columns, the gamma shape collapses to MrBayes's 1e-4
+# floor and the rate categories underflow. +I+G gives those columns their own
+# parameter, so a gamma-only run that hits it is retried once with invgamma.
+MRBAYES_NAN_MARKER = "Log likelihood nan"
+
+
+def _mrbayes_nan_failure_message(fallback_tried: bool) -> str:
+    """User-facing text for a run MrBayes abandoned on a NaN likelihood."""
+    retried = (
+        " It failed the same way after switching from +G to +I+G rates."
+        if fallback_tried else ""
+    )
+    return (
+        "MrBayes stopped because its likelihood calculation broke down (it "
+        "produced 'not a number'). This happens when the sequences are nearly "
+        "identical, so almost every alignment column is invariant." + retried +
+        " IQ-TREE or RAxML-NG will usually build this tree; removing "
+        "near-identical sequences can also help."
+    )
+
 
 def _mrbayes_lset_from_model(model_str: str, task_logger) -> Tuple[int, str, bool, str]:
     """Map a requested model string onto MrBayes ``lset``/``prset`` settings.
@@ -1657,85 +1682,151 @@ def _run_mrbayes(
 
     # MrBayes requires Nexus input with a block
     nexus_input = output_newick.parent / "mrbayes_input.nex"
-    _convert_fasta_to_nexus(sanitized_fasta, nexus_input)
 
-    # Append MrBayes block
-    with open(nexus_input, "a") as f:
-        f.write("\nbegin mrbayes;\n")
-        f.write("   set autoclose=yes nowarn=yes;\n")
-        # Seeds are set explicitly so a Bayesian run is reproducible; MrBayes
-        # otherwise seeds from the clock and records nothing.
-        f.write(f"   set seed={seed} swapseed={seed};\n")
-        f.write(f"   lset nst={nst} rates={rates};\n")
-        if equal_freqs:
-            # JC, K2P and SYM are their nst siblings with base frequencies held
-            # equal instead of estimated. Without this prior MrBayes runs F81,
-            # HKY and GTR respectively, which is what it silently did before.
-            f.write("   prset statefreqpr=fixed(equal);\n")
-        mcmc_opts = (
-            f"ngen={ngen} nchains={nchains} nruns={nruns} "
-            f"samplefreq={samplefreq} printfreq={printfreq} "
-            f"relburnin=yes burninfrac={burnin_value}"
-        )
-        if stop_early:
-            # ngen becomes an upper bound: MrBayes stops as soon as the average
-            # standard deviation of split frequencies between the independent
-            # runs drops below stopval, which saves computation without
-            # claiming anything about ESS or PSRF -- those are still checked
-            # after the run by _read_mrbayes_convergence().
-            # mcmcdiagn is stated explicitly rather than relied on: the
-            # diagnostics it writes are what the stop rule is evaluated from.
-            mcmc_opts += (
-                f" mcmcdiagn=yes stoprule=yes stopval={stopval}"
+    def _write_mrbayes_input(run_rates: str) -> None:
+        _convert_fasta_to_nexus(sanitized_fasta, nexus_input)
+
+        # Append MrBayes block
+        with open(nexus_input, "a") as f:
+            f.write("\nbegin mrbayes;\n")
+            f.write("   set autoclose=yes nowarn=yes;\n")
+            # Seeds are set explicitly so a Bayesian run is reproducible; MrBayes
+            # otherwise seeds from the clock and records nothing.
+            f.write(f"   set seed={seed} swapseed={seed};\n")
+            f.write(f"   lset nst={nst} rates={run_rates};\n")
+            if equal_freqs:
+                # JC, K2P and SYM are their nst siblings with base frequencies held
+                # equal instead of estimated. Without this prior MrBayes runs F81,
+                # HKY and GTR respectively, which is what it silently did before.
+                f.write("   prset statefreqpr=fixed(equal);\n")
+            mcmc_opts = (
+                f"ngen={ngen} nchains={nchains} nruns={nruns} "
+                f"samplefreq={samplefreq} printfreq={printfreq} "
+                f"relburnin=yes burninfrac={burnin_value}"
             )
-        f.write(f"   mcmc {mcmc_opts};\n")
-        f.write(f"   sump relburnin=yes burninfrac={burnin_value};\n")
-        f.write(f"   sumt relburnin=yes burninfrac={burnin_value};\n")
-        # Without an explicit quit MrBayes drops to its interactive prompt and
-        # reads stdin, which the worker does not own.
-        f.write("   quit;\n")
-        f.write("end;\n")
+            if stop_early:
+                # ngen becomes an upper bound: MrBayes stops as soon as the average
+                # standard deviation of split frequencies between the independent
+                # runs drops below stopval, which saves computation without
+                # claiming anything about ESS or PSRF -- those are still checked
+                # after the run by _read_mrbayes_convergence().
+                # mcmcdiagn is stated explicitly rather than relied on: the
+                # diagnostics it writes are what the stop rule is evaluated from.
+                mcmc_opts += (
+                    f" mcmcdiagn=yes stoprule=yes stopval={stopval}"
+                )
+            f.write(f"   mcmc {mcmc_opts};\n")
+            f.write(f"   sump relburnin=yes burninfrac={burnin_value};\n")
+            f.write(f"   sumt relburnin=yes burninfrac={burnin_value};\n")
+            # Without an explicit quit MrBayes drops to its interactive prompt and
+            # reads stdin, which the worker does not own.
+            f.write("   quit;\n")
+            f.write("end;\n")
 
     cmd = [config.MRBAYES_BINARY, str(nexus_input)]
 
     log_file = output_newick.parent.parent / "logs" / "tree_builder.log"
 
-    if job_id:
-        # Publish command line (displayed in green)
-        from app.workers.events import publish_command
-        publish_command(job_id, "tree", cmd)
+    rate_fallback: Optional[Dict[str, Any]] = None
+    # One budget covers both attempts: the RQ job timeout is sized for one
+    # MrBayes run, so a +I+G retry gets what the first run left, not a fresh one.
+    budget = _tool_timeout_seconds(config, "MrBayes")
+    started = time.monotonic()
+    while True:
+        _write_mrbayes_input(rates)
+        nan_seen = False
+        stats: Optional[Dict[str, Any]] = None
+        remaining = max(1, int(budget - (time.monotonic() - started)))
 
-        # MrBayes prints progress to stdout, and unlike IQ-TREE (<prefix>.log)
-        # and RAxML-NG (.raxml.log) it writes no log of its own, so without the
-        # tee the run leaves nothing behind: this branch used to produce a
-        # 4-line tree_builder.log holding only the CMD header, which is also
-        # what the status page's Tree tab and the tree-log download served.
-        exit_code, stats = run_command_streaming(
-            cmd,
-            stderr_path=log_file,
-            stdout_tee_path=log_file,
-            on_stdout_line=_make_log_callback(job_id, "tree", "stdout"),  # MrBayes uses stdout
-            on_stderr_line=_make_log_callback(job_id, "tree", "stderr"),
-            **_tool_limits(config, "MrBayes", _get_thread_count(params)),
-        )
+        if job_id:
+            # Publish command line (displayed in green)
+            from app.workers.events import publish_command
+            publish_command(job_id, "tree", cmd)
 
-        if exit_code != 0:
-            raise ToolExecutionError(
-                "MrBayes", exit_code, stats, tool_failure_message(
-                    "MrBayes", exit_code, _tool_time_limit_hours(config, "MrBayes")
-                ))
-    else:
-        returncode, stdout, stderr = run_command(
-            cmd, log_file=log_file, timeout=_tool_timeout_seconds(config, "MrBayes")
-        )
+            forward_stdout = _make_log_callback(job_id, "tree", "stdout")
 
-        if returncode != 0:
-            task_logger.error(f"MrBayes failed. RC={returncode}")
-            task_logger.error(f"STDOUT: {stdout}")
-            task_logger.error(f"STDERR: {stderr}")
-            raise RuntimeError(tool_failure_message(
-                "MrBayes", returncode, _tool_time_limit_hours(config, "MrBayes")
-            ))
+            def _on_stdout(line, _forward=forward_stdout):
+                nonlocal nan_seen
+                if MRBAYES_NAN_MARKER in line:
+                    nan_seen = True
+                if _forward:
+                    _forward(line)
+
+            # MrBayes prints progress to stdout, and unlike IQ-TREE (<prefix>.log)
+            # and RAxML-NG (.raxml.log) it writes no log of its own, so without the
+            # tee the run leaves nothing behind: this branch used to produce a
+            # 4-line tree_builder.log holding only the CMD header, which is also
+            # what the status page's Tree tab and the tree-log download served.
+            limits = _tool_limits(config, "MrBayes", _get_thread_count(params))
+            if remaining < limits["timeout"]:
+                limits["cpu_limit_seconds"] = int(
+                    limits["cpu_limit_seconds"] * remaining / limits["timeout"]
+                )
+                limits["timeout"] = remaining
+            exit_code, stats = run_command_streaming(
+                cmd,
+                stderr_path=log_file,
+                stdout_tee_path=log_file,
+                on_stdout_line=_on_stdout,  # MrBayes uses stdout
+                on_stderr_line=_make_log_callback(job_id, "tree", "stderr"),
+                **limits,
+            )
+            stdout = ""
+        else:
+            exit_code, stdout, stderr = run_command(
+                cmd, log_file=log_file, timeout=min(budget, remaining)
+            )
+            nan_seen = MRBAYES_NAN_MARKER in (stdout or "")
+
+        if exit_code == 0:
+            break
+
+        # Retry only a gamma-only run, only once, and only when the failed
+        # attempt left at least half the MrBayes budget. Measured here rather
+        # than read from stats, which the non-streaming path does not return.
+        elapsed = time.monotonic() - started
+        if nan_seen and rates == "gamma" and rate_fallback is None and elapsed < budget / 2:
+            from app.services.log_context import log_degradation
+
+            fallback_model = effective_model[: -len("+G")] + "+I+G"
+            log_degradation(
+                task_logger, "mrbayes_invgamma_fallback",
+                "MrBayes aborted on a NaN likelihood under +G rates; rerunning "
+                "once with +I+G, which models the invariant columns separately",
+                requested=params.model, ran=fallback_model,
+            )
+            rate_fallback = {
+                "requested_model": effective_model,
+                "ran_model": fallback_model,
+                "reason": "MrBayes aborted with a NaN log likelihood under +G rates",
+            }
+            rates, effective_model = "invgamma", fallback_model
+            if job_id:
+                notice = _make_log_callback(job_id, "tree", "stdout")
+                if notice:
+                    notice(
+                        "MrBayes stopped on a NaN likelihood under "
+                        f"{rate_fallback['requested_model']}; restarting once as "
+                        f"{fallback_model}."
+                    )
+            # The failed run's sample files would otherwise sit beside the
+            # retry's until MrBayes overwrote them.
+            for stale in nexus_input.parent.glob(f"{nexus_input.name}.*"):
+                stale.unlink(missing_ok=True)
+            continue
+
+        if nan_seen:
+            message = _mrbayes_nan_failure_message(rate_fallback is not None)
+        else:
+            message = tool_failure_message(
+                "MrBayes", exit_code, _tool_time_limit_hours(config, "MrBayes")
+            )
+        if job_id:
+            raise ToolExecutionError("MrBayes", exit_code, stats, message)
+        task_logger.error(f"MrBayes failed. RC={exit_code}")
+        task_logger.error(f"STDOUT: {stdout}")
+        task_logger.error(f"STDERR: {stderr}")
+        raise RuntimeError(message)
 
     # Output: <input>.con.tre (Consensus tree)
     con_tree = Path(f"{nexus_input}.con.tre")
@@ -1767,6 +1858,8 @@ def _run_mrbayes(
         "mcmc_stoprule": stop_early,
         "seed": seed,
     }
+    if rate_fallback:
+        metadata["mrbayes_rate_fallback"] = rate_fallback
     if stop_early:
         metadata["mcmc_stopval"] = stopval
     metadata.update(_read_mrbayes_convergence(nexus_input, task_logger))

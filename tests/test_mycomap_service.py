@@ -703,5 +703,25 @@ class TestExistingBlastResolution(unittest.TestCase):
         self.assertIsNone(result)
         by_id.assert_not_called()
 
+class DropRedundantInatBioMaterialTests(unittest.TestCase):
+    drop = staticmethod(mycomap_service._drop_redundant_inat_bio_material)
+
+    def test_drops_bio_material_repeating_an_existing_reference(self):
+        self.assertEqual(
+            self.drop("Amanita sp. isolate OMDL iNat # 217417974 bio-material iNAT:217417974"),
+            "Amanita sp. isolate OMDL iNat # 217417974",
+        )
+
+    def test_keeps_the_only_reference(self):
+        text = "Amanita sp. bio-material iNAT:217417974"
+        self.assertEqual(self.drop(text), text)
+
+    def test_keeps_one_copy_of_a_repeated_only_reference(self):
+        self.assertEqual(
+            self.drop("Amanita sp. bio-material iNAT:217417974 ITS bio-material iNAT:217417974"),
+            "Amanita sp. bio-material iNAT:217417974 ITS",
+        )
+
+
 if __name__ == '__main__':
     unittest.main()

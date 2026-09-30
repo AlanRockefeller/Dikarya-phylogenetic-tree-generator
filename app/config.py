@@ -609,6 +609,28 @@ class Config:
     INAT_PUBLIC_BASE_URL = os.environ.get('INAT_PUBLIC_BASE_URL', '')
     INAT_OAUTH_ADMIN_EMAILS = _csv_env('INAT_OAUTH_ADMIN_EMAILS')
 
+    # Voucher Sync (/voucher-sync): each user connects their *own* iNaturalist
+    # account. Same OAuth app as above, but a second redirect URI must be
+    # registered on it for this callback.
+    # Unset (the normal case) reuses INAT_OAUTH_REDIRECT_URI: iNaturalist allows
+    # one redirect URI per app, and /tree/oauth/callback hands a Voucher Sync
+    # sign-in on by its state value.
+    INAT_VOUCHER_OAUTH_REDIRECT_URI = os.environ.get('INAT_VOUCHER_OAUTH_REDIRECT_URI', '')
+    # Fernet key for per-user tokens at rest. Generate one with:
+    #   python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
+    # Required in production: unset, connecting an account fails closed. Only
+    # debug/testing derive one from SECRET_KEY (rotating it forces reconnects).
+    INAT_TOKEN_ENCRYPTION_KEY = os.environ.get('INAT_TOKEN_ENCRYPTION_KEY', '')
+    # Concurrent photo download+decode threads inside one scan job. Photos come
+    # from iNat's CDN (not the rate-limited API). The desktop tool used 6; the
+    # worker host also runs Gunicorn, so default lower.
+    VOUCHER_SYNC_SCAN_WORKERS = count_env('VOUCHER_SYNC_SCAN_WORKERS', 4)
+    VOUCHER_SYNC_MAX_OBSERVATIONS = count_env('VOUCHER_SYNC_MAX_OBSERVATIONS', 2000)
+    # Pause between observation-field writes (the rate-limited API).
+    VOUCHER_SYNC_WRITE_PAUSE_SECONDS = timeout_env('VOUCHER_SYNC_WRITE_PAUSE_SECONDS', 1.0)
+    # How long a run's live rows/log stay in Redis after the last write.
+    VOUCHER_SYNC_RUN_TTL_SECONDS = count_env('VOUCHER_SYNC_RUN_TTL_SECONDS', 86400)
+
     # Site-wide Mushroom Observer account used to post completed tree links.
     MUSHROOM_OBSERVER_API_KEY = os.environ.get('MUSHROOM_OBSERVER_API_KEY', '')
 

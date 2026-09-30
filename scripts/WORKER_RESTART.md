@@ -95,6 +95,10 @@ sudo install -o root -g root -m 0755 /var/www/dikarya/scripts/restart-dikarya-wo
 sudo install -o root -g root -m 0755 /var/www/dikarya/scripts/restart-dikarya-worker /usr/local/sbin/restart-dikarya-worker-bulk
 sudo install -o root -g root -m 0644 /var/www/dikarya/scripts/dikarya-worker-graceful.conf /etc/systemd/system/dikarya-worker.service.d/zz-graceful.conf
 sudo install -o root -g root -m 0644 /var/www/dikarya/scripts/dikarya-worker-graceful.conf /etc/systemd/system/dikarya-worker-bulk.service.d/zz-graceful.conf
+# Only if dikarya-worker-high2 is installed. The high-worker guard freezes,
+# kills and restarts every unit serving phylo_high together, and refuses (exit
+# 78) while any of them lacks the graceful settings.
+sudo install -o root -g root -m 0644 /var/www/dikarya/scripts/dikarya-worker-graceful.conf /etc/systemd/system/dikarya-worker-high2.service.d/zz-graceful.conf
 sudo systemctl daemon-reload
 ```
 

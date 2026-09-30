@@ -11,7 +11,11 @@ from typing import Any, Dict, List, Optional
 
 QUEUE_HIGH = "phylo_high"
 QUEUE_BULK = "phylo_bulk"
-VALID_QUEUE_NAMES = {QUEUE_HIGH, QUEUE_BULK}
+# Voucher Sync scan/apply runs. Served only by dikarya-worker-voucher
+# (scripts/dikarya-worker-voucher.service): a scan can hold its work horse for
+# up to its 3h timeout, so sharing a phylo worker would stall tree jobs.
+QUEUE_VOUCHER = "voucher_sync"
+VALID_QUEUE_NAMES = {QUEUE_HIGH, QUEUE_BULK, QUEUE_VOUCHER}
 logger = logging.getLogger(__name__)
 
 # Bound the TCP connect only. Without this, a Redis host that accepts no
@@ -346,6 +350,52 @@ def enqueue_mycomap_blast_refresh_job(params: Dict[str, Any], job_timeout: Any =
     return job.id
 
 
+def voucher_apply_timeout(row_count: Optional[int]) -> int:
+    """Seconds an apply may run: one write plus the pause per row, never under 1h.
+
+    Alan 9/30/26 - A fixed hour could not cover MAX_APPLY_IDS writes at the
+    default one-second pause, and RQ killing the horse skips the code that
+    records which rows were applied.
+    """
+    from app.config import Config
+    pause = float(getattr(Config, "VOUCHER_SYNC_WRITE_PAUSE_SECONDS", 1.0))
+    return max(3600, int((row_count or 0) * (pause + 3)))
+
+
+def enqueue_voucher_sync_run(run_id: str, kind: str, row_count: Optional[int] = None) -> str:
+    """Enqueue a Voucher Sync scan or apply run. Only the run id travels
+    through Redis; the worker loads params and the user's token from the DB."""
+    from app.workers.voucher_sync_tasks import run_voucher_apply_job, run_voucher_scan_job
+
+    fn = run_voucher_apply_job if kind == "apply" else run_voucher_scan_job
+    job = get_queue(QUEUE_VOUCHER).enqueue(
+        fn,
+        run_id,
+        job_timeout=voucher_apply_timeout(row_count) if kind == "apply" else "3h",
+        meta={},
+        job_id=run_id,
+        description=safe_job_description(f"voucher sync {kind}", job_id=run_id),
+    )
+    return job.id
+
+
+def get_voucher_run_rq_status(run_id: str) -> Optional[str]:
+    """RQ's view of a Voucher Sync run: queued/started/finished/failed/..., or
+    None when Redis no longer has it. Uses Job.fetch rather than
+    Queue.fetch_job because the latter only returns jobs from its own queue."""
+    from rq.job import Job as RQJob
+    from rq.exceptions import NoSuchJobError
+
+    try:
+        job = RQJob.fetch(run_id, connection=get_redis_connection())
+    except NoSuchJobError:
+        return None
+    except Exception as exc:
+        logger.warning("event=voucher_sync.rq_lookup_failed run=%s error=%s", run_id, exc)
+        return "error"
+    return job.get_status(refresh=True)
+
+
 def enqueue_recompute_job(job_id: str, params_dict: Dict[str, Any], *,
                           return_created: bool = False):
     """Enqueue at most one active recompute for a job.
@@ -512,7 +562,7 @@ def get_queue_position(job_id: str) -> Optional[Dict[str, Any]]:
       scheduled  -- deliberately parked (a MycoMap/NCBI wait); rejoins later
       started    -- a worker has picked it up
       other      -- finished, failed or otherwise not waiting
-    Each queue has its own worker, so only the job's own queue is counted.
+    Each queue has its own worker(s), so only the job's own queue is counted.
     Nothing here comes from the submission, so it is safe to publish.
     """
     try:

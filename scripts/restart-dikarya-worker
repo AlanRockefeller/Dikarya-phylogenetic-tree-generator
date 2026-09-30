@@ -2,7 +2,9 @@
 """Root-owned entry point. No arguments; JSON report and exact-job consent on stdin.
 
 Install the same file as restart-dikarya-worker-bulk for the bulk queue.
-Exit 75 means active jobs need a human decision; 78 means unsafe configuration.
+Exit 75 means active jobs need a human decision; 78 means unsafe configuration;
+70 means an approved interrupt killed only some units, or a unit could not be
+thawed (the report names them).
 Noninteractive callers must not synthesize consent without asking the user.
 """
 import json
@@ -89,6 +91,32 @@ def _restart_bulk_after_current():
         return 0
 
 
+# dikarya-worker-high2 is a second phylo_high worker, PartOf dikarya-worker.
+# It is optional so this guard keeps working on a host that has not installed it.
+HIGH_QUEUE_UNITS = ("dikarya-worker.service", "dikarya-worker-high2.service")
+
+
+def _queue_units(bulk):
+    """Units serving the queue, or None when one is between states."""
+    if bulk:
+        return ["dikarya-worker-bulk.service"]
+    units = [HIGH_QUEUE_UNITS[0]]
+    for unit in HIGH_QUEUE_UNITS[1:]:
+        # Only a running unit can hold a job. A stopped or failed one stays
+        # loaded, but systemd refuses to freeze it, and restarting it by name
+        # would start a worker someone deliberately stopped.
+        state = run("/usr/bin/systemctl", "show", unit, "-p", "ActiveState", "--value")
+        if state in ("active", "reloading"):
+            units.append(unit)
+        elif state not in ("inactive", "failed"):
+            # Alan 9/30/26 - A draining (deactivating) worker can still be
+            # running a job the queue report lists. Leaving it out would let an
+            # exact INTERRUPT approval pass while that job kept running.
+            print(unit + " is " + state + "; refusing to restart until it settles.")
+            return None
+    return units
+
+
 def main(*, bulk=None, after_current=False):
     if len(sys.argv) != 1 or os.geteuid() != 0:
         return 64
@@ -98,14 +126,17 @@ def main(*, bulk=None, after_current=False):
         if not bulk:
             return 64
         return _restart_bulk_after_current()
-    unit = "dikarya-worker-bulk.service" if bulk else "dikarya-worker.service"
     queue = "phylo_bulk" if bulk else "phylo_high"
-    # Safe default even if a job arrives between the check and systemctl restart.
-    mode = run("/usr/bin/systemctl", "show", unit, "-p", "KillMode", "--value")
-    timeout = run("/usr/bin/systemctl", "show", unit, "-p", "TimeoutStopUSec", "--value")
-    if mode != "mixed" or timeout != "infinity":
-        print("Install dikarya-worker-graceful.conf and daemon-reload first; refusing unsafe restart.")
+    units = _queue_units(bulk)
+    if units is None:
         return 78
+    # Safe default even if a job arrives between the check and systemctl restart.
+    for unit in units:
+        mode = run("/usr/bin/systemctl", "show", unit, "-p", "KillMode", "--value")
+        timeout = run("/usr/bin/systemctl", "show", unit, "-p", "TimeoutStopUSec", "--value")
+        if mode != "mixed" or timeout != "infinity":
+            print("Install dikarya-worker-graceful.conf on " + unit + " and daemon-reload first; refusing unsafe restart.")
+            return 78
     # Read only the two required settings; never execute environment-file text.
     env = {"PATH": "/usr/bin:/bin", "LANG": "C.UTF-8"}
     with open("/etc/dikarya/dikarya.environment.live") as stream:
@@ -145,18 +176,46 @@ def main(*, bulk=None, after_current=False):
             return 75
         # Stop assignment before acting on consent so a different job cannot
         # replace the approved one between the final census and the kill.
-        subprocess.run(["/usr/bin/systemctl", "freeze", unit], check=True)
+        # The report covers the whole queue, so every unit serving it is frozen
+        # and killed together; approval never names a job this does not stop.
+        frozen = []
         try:
+            for unit in units:
+                subprocess.run(["/usr/bin/systemctl", "freeze", unit], check=True)
+                frozen.append(unit)
             current = report()
             if sorted(job["id"] for job in current["jobs"]) != ids:
                 print("Job set changed; obtain a fresh report and approval.")
                 return 75
-            subprocess.run(["/usr/bin/systemctl", "kill", "--kill-whom=all", "--signal=SIGKILL", unit], check=True)
+            # Alan 9/30/26 - Try every unit even if one kill fails, then name
+            # both lists: an earlier kill cannot be undone, so the operator must
+            # know which workers already lost their jobs and which still run.
+            killed, failed = [], []
+            for unit in units:
+                result = subprocess.run(["/usr/bin/systemctl", "kill", "--kill-whom=all", "--signal=SIGKILL", unit], check=False)
+                (failed if result.returncode else killed).append(unit)
+            if failed:
+                print(json.dumps({"interrupted": killed, "kill_failed": failed}), flush=True)
+                print("Partial interrupt: jobs on the interrupted units were killed; "
+                      "the kill_failed units were not restarted and may still be running their jobs.")
+                print("Check: systemctl status " + " ".join(units))
+                return 70
         finally:
-            subprocess.run(["/usr/bin/systemctl", "thaw", unit], check=False)
+            # Alan 9/30/26 - A unit left frozen stalls its job silently, so a
+            # failed thaw is reported and blocks the restart below.
+            thaw_failed = [
+                unit for unit in frozen
+                if subprocess.run(["/usr/bin/systemctl", "thaw", unit], check=False).returncode
+            ]
+            if thaw_failed:
+                print(json.dumps({"thaw_failed": thaw_failed}), flush=True)
+                print("These units may still be frozen; nothing was restarted. "
+                      "Run: systemctl thaw " + " ".join(thaw_failed), flush=True)
+        if thaw_failed:
+            return 70
     # --no-block: an idle-check race drains safely in the background; do not
     # hold an agent tool call open for the duration of a newly started job.
-    subprocess.run(["/usr/bin/systemctl", "restart", "--no-block", unit], check=True)
+    subprocess.run(["/usr/bin/systemctl", "restart", "--no-block", *units], check=True)
     print("Restart requested. Check ActiveState/MainPID and worker logs for completion.")
     return 0
 

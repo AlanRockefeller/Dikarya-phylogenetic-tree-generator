@@ -480,9 +480,9 @@ class PruneUndoTests(_RouteHarness):
             job_dir = _make_job(root)
             self._prune(root, ["A"])
 
-            # Pruning everything that is left is refused atomically.
+            # Pruning everything that is left is refused atomically, as a user error.
             status, _ = self._prune(root, ["B", "C", "D"])
-            self.assertEqual(status, 500)
+            self.assertEqual(status, 400)
             self.assertEqual(
                 self._undo_state(root)[1]["label"], "prune of 1 sequence"
             )

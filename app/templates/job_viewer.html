@@ -7,13 +7,13 @@
 {% block main_width %}max-w-none{% endblock %}
 
 {% block head %}
-<link rel="stylesheet" href="{{ url_for('static', filename='css/tree_viewer.css') }}?v=22">
+<link rel="stylesheet" href="{{ url_for('static', filename='css/tree_viewer.css') }}?v=23">
 <link rel="stylesheet" href="{{ url_for('static', filename='css/phylotree.css') }}?v=3">
 <link rel="stylesheet" href="{{ url_for('static', filename='css/phylotree-menus.css') }}?v=3">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;700&display=swap">
-<link rel="stylesheet" href="{{ url_for('static', filename='css/alignment_viewer.css') }}?v=18">
+<link rel="stylesheet" href="{{ url_for('static', filename='css/alignment_viewer.css') }}?v=19">
 {% endblock %}
 
 {% block content %}
@@ -83,6 +83,10 @@
                     <span id="notice-rooting-text" class="truncate"></span>
                 </span>
             </div>
+            <a id="btn-new-tree" href="{{ url_for('main.sequence_entry') }}" class="tree-new-button mt-3"
+                title="Start a new tree with fresh inputs">
+                <i class="fas fa-plus-circle" aria-hidden="true"></i> New Tree
+            </a>
         </div>
 
         {# Page-level actions. Hidden on touch devices with the rest of the desktop
@@ -214,6 +218,8 @@
                 <dl class="grid grid-cols-[auto,1fr] gap-x-4 gap-y-3 px-5 py-4 text-sm text-gray-700 dark:text-gray-200">
                     <dt><kbd class="rounded border border-gray-300 bg-gray-100 px-2 py-0.5 font-mono dark:border-gray-600 dark:bg-journal-dark">D</kbd></dt>
                     <dd>Deselect all sequences</dd>
+                    <dt><kbd class="rounded border border-gray-300 bg-gray-100 px-2 py-0.5 font-mono dark:border-gray-600 dark:bg-journal-dark">N</kbd></dt>
+                    <dd>Annotate the selected sequences with their most common species (or genus) name, without opening the editor. Opens the editor instead if no name can be found.</dd>
                     <dt><kbd class="rounded border border-gray-300 bg-gray-100 px-2 py-0.5 font-mono dark:border-gray-600 dark:bg-journal-dark">A</kbd></dt>
                     <dd>Open the Alignment Viewer (<kbd class="rounded border border-gray-300 bg-gray-100 px-2 py-0.5 font-mono dark:border-gray-600 dark:bg-journal-dark">V</kbd> also works)</dd>
                     <dt><kbd class="rounded border border-gray-300 bg-gray-100 px-2 py-0.5 font-mono dark:border-gray-600 dark:bg-journal-dark">S</kbd></dt>
@@ -1504,11 +1510,11 @@
 
 <script src="{{ url_for('static', filename='js/tree_viewer_api.js') }}?v=8"></script>
 
-<script src="{{ url_for('static', filename='js/tree_viewer_controller.js') }}?v=95"></script>
+<script src="{{ url_for('static', filename='js/tree_viewer_controller.js') }}?v=98"></script>
 
 {% include 'partials/alignment_viewer_modal.html' %}
 
-<script src="{{ url_for('static', filename='js/alignment_viewer.js') }}?v=16"></script>
+<script src="{{ url_for('static', filename='js/alignment_viewer.js') }}?v=17"></script>
 
 
 

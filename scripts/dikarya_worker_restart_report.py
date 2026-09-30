@@ -10,6 +10,7 @@ from sqlalchemy import create_engine, text
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from app.services.artifact_storage import open_artifact
+from app.services.security_utils import validate_job_id
 
 
 def report(queue):
@@ -36,9 +37,10 @@ def report(queue):
                 elapsed = max(0, int((datetime.now(timezone.utc) - started.replace(tzinfo=timezone.utc)).total_seconds()))
             metrics = (row["metrics"] or {}) if row else {}
             details = {}
-            # Never use unvalidated Redis IDs as paths.
-            import uuid
-            if str(uuid.UUID(job_id)) == job_id:
+            # Never use unvalidated Redis IDs as paths. validate_job_id accepts
+            # both the UUID and the short base36 form; uuid.UUID() raised on a
+            # short id and failed the whole report.
+            if validate_job_id(job_id):
                 try:
                     with open_artifact(Path("/var/www/dikarya/var/jobs") / job_id / "input_info.json", "rt") as stream:
                         params = json.load(stream)

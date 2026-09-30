@@ -97,5 +97,39 @@ class WorkerQueueStatusTests(unittest.TestCase):
         self.assertNotIn("password", str(status))
 
 
+
+
+class VoucherSyncQueueTests(unittest.TestCase):
+    def test_voucher_sync_queue_is_valid(self):
+        from app.workers.queue import QUEUE_VOUCHER, VALID_QUEUE_NAMES, get_queue
+
+        self.assertIn(QUEUE_VOUCHER, VALID_QUEUE_NAMES)
+        self.assertEqual(QUEUE_VOUCHER, "voucher_sync")
+        with patch("app.workers.queue.get_redis_connection", return_value=Mock()):
+            self.assertEqual(get_queue(QUEUE_VOUCHER).name, "voucher_sync")
+
+    def test_voucher_apply_timeout_scales_with_rows(self):
+        from app.workers.queue import voucher_apply_timeout
+        self.assertEqual(voucher_apply_timeout(None), 3600)
+        self.assertEqual(voucher_apply_timeout(100), 3600)
+        # 5000 rows at the default 1s pause plus ~3s per write.
+        self.assertEqual(voucher_apply_timeout(5000), 20000)
+
+    def test_enqueue_voucher_sync_run_carries_only_the_run_id(self):
+        from app.workers.queue import enqueue_voucher_sync_run
+
+        queue = Mock()
+        queue.enqueue.return_value = Mock(id="run-1")
+        with patch("app.workers.queue.get_queue", return_value=queue), \
+             patch("app.workers.voucher_sync_tasks.run_voucher_scan_job") as scan:
+            self.assertEqual(enqueue_voucher_sync_run("run-1", "scan"), "run-1")
+        args, kwargs = queue.enqueue.call_args
+        self.assertIs(args[0], scan)
+        self.assertEqual(args[1:], ("run-1",))
+        self.assertEqual(kwargs["job_id"], "run-1")
+        self.assertEqual(kwargs["job_timeout"], "3h")
+        self.assertNotIn("token", kwargs["description"].lower())
+
+
 if __name__ == "__main__":
     unittest.main()

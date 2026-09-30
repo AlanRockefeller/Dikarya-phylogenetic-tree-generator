@@ -1455,7 +1455,9 @@ def run_blast():
         return jsonify({"status": "error", "error": "No query provided"}), 400
 
     try:
-        from app.services.blast_service import blast_from_sequence, blast_from_accessions
+        from app.services.blast_service import (
+            BLAST_REQUEST_MAX_WAIT_SECONDS, blast_from_accessions, blast_from_sequence,
+        )
         from pathlib import Path
 
         # Extract + clamp parameters. Bad/missing values fall back to the
@@ -1475,11 +1477,13 @@ def run_blast():
         # Determine if query is an accession or a sequence
         if _is_genbank_accession(query):
             logger.info(f"BLAST API: Detected accession: {query}")
-            result = blast_from_accessions([query], Config, min_identity=min_identity, max_sequences=max_sequences)
+            result = blast_from_accessions([query], Config, min_identity=min_identity, max_sequences=max_sequences,
+                                           max_wait=BLAST_REQUEST_MAX_WAIT_SECONDS)
         else:
             # Assume it's a raw sequence
             logger.info(f"BLAST API: Using sequence query ({len(query)} chars)")
-            result = blast_from_sequence(query, Config, min_identity=min_identity, max_sequences=max_sequences)
+            result = blast_from_sequence(query, Config, min_identity=min_identity, max_sequences=max_sequences,
+                                         max_wait=BLAST_REQUEST_MAX_WAIT_SECONDS)
         
         # Read FASTA content from the file path returned by blast service
         fasta_path = result.get('fasta_path', '')
@@ -1515,6 +1519,18 @@ def run_blast():
         # explanation to the Tree Builder.
         logger.warning("BLAST request rejected: %s", e)
         return jsonify({"status": "error", "error": str(e)}), 400
+    except TimeoutError as e:
+        # NCBI is slow, not broken: answer in JSON before nginx gives up at
+        # 300s, so the Tree Builder shows this instead of failing to parse
+        # nginx's HTML 504 page.
+        logger.warning("BLAST request timed out: %s", e)
+        return jsonify({
+            "status": "error",
+            "error": (
+                "NCBI BLAST did not finish in time. NCBI is busy right now; "
+                "please try again in a few minutes."
+            ),
+        }), 504
     except Exception as e:
         return _server_error(e, where="blast")
 
@@ -3270,7 +3286,8 @@ def prune_tree(job_id):
     
     try:
         from app.services.tree_edit_service import (
-            _tree_tip_set, load_tree_state, prune_taxa, save_tree_state, tree_state_lock,
+            PruneRequestError, _tree_tip_set, load_tree_state, prune_taxa, save_tree_state,
+            tree_state_lock,
         )
         with tree_state_lock(job_dir):
             state = load_tree_state(job_dir)
@@ -3290,6 +3307,8 @@ def prune_tree(job_id):
                         f"prune of {removed} sequence{'' if removed == 1 else 's'}"
                     )
         return jsonify(_with_undo_state(state, job_dir))
+    except PruneRequestError as e:
+        return jsonify({"status": "error", "error": str(e)}), 400
     except Exception as e:
         return _server_error(e)
 
@@ -5005,7 +5024,8 @@ def alignment_view(job_id):
     def as_response_row(row):
         display = display_names.get(id(row))
         if display and display != row["name"]:
-            return {"name": display, "sequence": row["sequence"]}
+            # Keep the source header for display metadata when a tip is renamed.
+            return {"name": display, "original_name": row["name"], "sequence": row["sequence"]}
         return row
 
     warnings = []

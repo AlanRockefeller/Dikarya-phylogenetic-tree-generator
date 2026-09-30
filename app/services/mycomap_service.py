@@ -3378,6 +3378,38 @@ def _contains_species_name(label: str, species_name: str) -> bool:
     return True
 
 
+_INAT_BIO_MATERIAL_RE = re.compile(r'\s*\bbio-material\s+iNAT:?\s*(\d{5,12})\b', re.IGNORECASE)
+
+
+def _drop_redundant_inat_bio_material(text: str) -> str:
+    """Drop "bio-material iNAT:<n>" when <n> is already elsewhere in the label.
+
+    Runs before _FILLER_QUALIFIER_RE strips the word "bio-material" itself,
+    which is what anchors this match.
+
+    OMDL records carry the observation twice ("isolate OMDL iNat # 217417974
+    bio-material iNAT:217417974"). A bio-material number that appears nowhere
+    else is the only observation reference, so it is kept -- once, even when
+    the qualifier itself is repeated. "Elsewhere" therefore excludes the other
+    bio-material tokens, or two copies would each justify dropping the other.
+    """
+    outside = _INAT_BIO_MATERIAL_RE.sub(' ', text)
+    kept = set()
+
+    def replace(match):
+        number = match.group(1)
+        if number in kept or re.search(rf'(?<!\d){number}(?!\d)', outside):
+            return ''
+        kept.add(number)
+        return match.group(0)
+
+    return _INAT_BIO_MATERIAL_RE.sub(replace, text)
+
+
+# Qualifier names that only introduce the value after them; the value stays.
+_FILLER_QUALIFIER_RE = re.compile(r'\b(?:isolate|bio-material)\b', re.IGNORECASE)
+
+
 def _compact_ncbi_description(description: str) -> str:
     """Return the organism/voucher part of an NCBI BLAST description."""
     text = _clean_label_fragment(description)
@@ -3400,7 +3432,8 @@ def _compact_ncbi_description(description: str) -> str:
     match = re.search(marker_pattern, text, flags=re.IGNORECASE)
     if match:
         text = text[:match.start()]
-    text = _clean_label_fragment(text)
+    text = _drop_redundant_inat_bio_material(text)
+    text = _clean_label_fragment(_FILLER_QUALIFIER_RE.sub(' ', text))
     if type_marker and type_marker.casefold() not in text.casefold():
         text = _clean_label_fragment(f"{text} {type_marker}")
     return text
@@ -3413,6 +3446,23 @@ def _infer_species_name(description: str) -> str:
     if not match:
         return ''
     return _clean_label_fragment(' '.join(match.groups()))
+
+
+def describe_ncbi_hit(accession: str, raw_description: str) -> dict:
+    """Taxon and tip label for an NCBI hit known only by accession + defline.
+
+    Shared by the mycomap.com FASTA headers and the mycomap.org BLAST XML, so
+    the two providers label the same accession the same way.
+    """
+    compact_description = _compact_ncbi_description(raw_description)
+    return {
+        'taxon': _infer_species_name(raw_description),
+        'raw_ncbi_description': raw_description,
+        'mycomap_header_format': 'ncbi_description',
+        'display_name': _clean_label_fragment(
+            ' '.join(part for part in (accession, compact_description) if part)
+        ),
+    }
 
 
 def parse_mycomap_ncbi_fasta_header(header: str) -> dict:
@@ -3473,16 +3523,7 @@ def parse_mycomap_ncbi_fasta_header(header: str) -> dict:
             })
             return result
 
-        raw_description = fields[1]
-        compact_description = _compact_ncbi_description(raw_description)
-        result.update({
-            'taxon': _infer_species_name(raw_description),
-            'raw_ncbi_description': raw_description,
-            'mycomap_header_format': 'ncbi_description',
-            'display_name': _clean_label_fragment(
-                ' '.join(part for part in (accession, compact_description) if part)
-            ),
-        })
+        result.update(describe_ncbi_hit(accession, fields[1]))
         return result
 
     parts = raw_header.split(None, 1)

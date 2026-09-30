@@ -1,5 +1,85 @@
 # Dikarya
 
+**Build a phylogenetic tree in your browser, no installation needed.**
+
+> ## Most people should just use the website: **<https://dikarya.us>**
+>
+> Dikarya is a hosted service. If you want to build and explore trees, you do
+> not need to download, install, or configure anything. Open the site, paste 
+> your sequences or iNaturalist observation # or username, and go.
+>
+> Everything below the [divider](#for-developers-and-self-hosters) is only for
+> people who want to work on the code or run their own Dikarya-style
+> phylogenetic tree website.
+
+## What is Dikarya?
+
+Dikarya takes DNA sequences (pasted FASTA or GenBank accessions) and turns them
+into a phylogenetic tree you can explore, edit, and download. It handles the
+whole pipeline for you (finding related sequences, aligning, trimming, and
+building the tree) and shows live progress while it runs. It was built for
+mycologists and fungal researchers, and it works well for ITS and other genes, 
+and would work equally well for any organism (plants, bacteria, animals, etc).
+
+## Core strengths
+
+- **No setup.** Everything runs on the server; you only need a web browser.
+- **Fast path and full control.** One-click *Quick Tree* presets get a tree in
+  about a minute. The advanced builder lets you change the aligner, trimming,
+  tree method (IQ-TREE, RAxML-NG, MrBayes, FastTree), substitution model,
+  bootstrap settings, and outgroup.
+- **Optimized for fungi.** Sequences can be augmented with related sequences found
+  by NCBI BLAST, and type specimens (holotypes and other type material) are
+  automatically marked right on the tree.   Not just for fungi - anything with
+  DNA will work equally well.
+- **Interactive tree viewer and editor.** Prune, reroot, rename, collapse clades,
+  and undo edits after the tree is built, and add nice looking clade annotations.  
+  You can export Newick, NEXUS, images, and alignments.
+- **Live progress.** Watch each pipeline step as it runs, and share a short
+  link to your finished tree.
+- **Optional AI review.** *Analyze* reads a summary of your alignment and tree 
+  and points out problems worth a second look, such as weak support, badly aligned 
+  sequences, or unexpected groupings.
+- **Scriptable.** A token-authenticated JSON API is available for automation.
+- **Free and open source.**
+
+## Common workflows
+
+1. **Trees from observations.** Start from iNaturalist or Mushroom Observer
+   observation numbers and build a tree.  Super fast and easy.
+2. **Tree from GenBank accessions.** Enter accession numbers and let Dikarya
+   fetch the sequences from Genbank.
+3. **Put an unknown sequence in context.** Add a BLAST step to pull in its
+   closest relatives from NCBI, then build the tree around them.
+4. **Quick tree from your own sequences.** paste FASTA, choose Quick Tree, 
+   and explore it in the interactive viewer.
+5. **Publication-quality analysis.** Use advanced mode with RAxML-NG,
+   IQ-TREE, or MrBayes.   Adjust trimming, and bootstrap settings, then 
+   clean up, annotate and export the tree from the viewer.
+6. **Edit and re-run.** Add or remove sequences on a finished tree and
+   recompute; your renames and rooting are kept where possible.
+
+## Contributing
+
+Suggestions can be submitted here:  https://dikarya.us/todo
+
+**Pull requests are welcome.** Bug fixes, new features, documentation
+improvements, and support for more tools or data sources are all appreciated.
+For anything sizable, please open an issue first to talk it over. Fork the
+repository, make your change on a branch, and open a PR against `main`. The
+developer sections below explain how to set up a working copy and run the
+tests. Bug reports and feature ideas are welcome as issues too.
+
+---
+
+## For developers and self-hosters
+
+**Everything from here down is for people who want to work on the Dikarya code
+or run their own Dikarya-style phylogenetic tree website. If you just want to
+make trees, use <https://dikarya.us> instead.**
+
+---
+
 Dikarya is a Flask web application for fungal phylogenetic analysis. It accepts
 FASTA sequences and GenBank accessions, runs configurable alignment, trimming,
 and tree-building pipelines in Redis Queue (RQ) workers, streams job progress
@@ -226,6 +306,14 @@ review the lockfile diff before committing it.
 Please report vulnerabilities privately as described in [SECURITY.md](SECURITY.md).
 Do not publish suspected vulnerabilities or proof-of-concept exploits in a
 public issue before a fix is available.
+
+## Credits
+
+Voucher Sync (`/voucher-sync`) was contributed by Bryce Thorson, ported from the
+standalone desktop application
+[inat-voucher-sync](https://github.com/bthorson1029/inat-voucher-sync) (MIT,
+[doi:10.5281/zenodo.22064695](https://doi.org/10.5281/zenodo.22064695)), which
+is still maintained separately.
 
 ## License
 

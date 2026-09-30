@@ -1709,7 +1709,8 @@ document.addEventListener('DOMContentLoaded', async () => {
         if (labelInput && suggestedLabel) labelInput.select();
     }
 
-    async function submitAnnotationEditor() {
+    // Alan 9/30/26 - `options.quick` marks a save from the N hotkey, which never showed the dialog.
+    async function submitAnnotationEditor(options = {}) {
         if (!annotationEditorState) return;
         // Alan 8/17/26 - Normalize textarea newlines and tabs before client validation and saving.
         const label = String(getEl('input-annotation-label')?.value || '')
@@ -1806,7 +1807,12 @@ document.addEventListener('DOMContentLoaded', async () => {
                     updateButtons();
                 }
             }
-            showStatus(`Annotation "${label}" saved.`, 'success', 2000);
+            // Alan 9/30/26 - A quick annotation's label was guessed, so say what it was and how to fix it.
+            if (options.quick === true) {
+                showStatus(`Annotated as "${label}". Wrong name? Edit it from Annotations.`, 'success', 5000);
+            } else {
+                showStatus(`Annotation "${label}" saved.`, 'success', 2000);
+            }
         }
     }
 
@@ -2277,6 +2283,41 @@ document.addEventListener('DOMContentLoaded', async () => {
         openAnnotationForMembership(memberIds, { defaultType: 'clade_line', forceAdd: true });
     }
 
+    // Alan 9/30/26 - N hotkey: annotate the selection with its suggested name without asking.
+    // Goes through the editor's own open/submit path so layers, multi-clade membership, the
+    // root type check and highlight slots behave exactly as a normal Add. Both run synchronously
+    // up to the save's await, so the dialog is never painted; if validation refuses, it stays
+    // open with the error so the user can fix it by hand.
+    // Alan 9/30/26 - Selections whose quick annotation is still saving. The selection is only
+    // cleared after the save returns, so a second N press in that window would add it again.
+    const quickAnnotationsInFlight = [];
+
+    function quickAnnotateCurrentSelection() {
+        if (!annotationsEditable() || !viewer?.getSelectedAnnotationLeafIds) return;
+        const memberIds = viewer.getSelectedAnnotationLeafIds();
+        if (!memberIds.length) {
+            showStatus('Select the sequences you want to annotate.', 'warning', 6000);
+            return;
+        }
+        if (quickAnnotationsInFlight.some(pending => sameTipIdSet(pending, memberIds))) {
+            showStatus('Still saving the annotation for this selection.', 'info', 3000);
+            return;
+        }
+        if (!suggestedAnnotationLabel(memberIds)) {
+            annotateCurrentSelection();
+            showStatus('No species or genus name found in the selected labels — type one.', 'info', 5000);
+            return;
+        }
+        openAnnotationEditor('add', { memberIds });
+        if (!annotationEditorState) return;
+        const pending = memberIds.slice();
+        quickAnnotationsInFlight.push(pending);
+        Promise.resolve(submitAnnotationEditor({ quick: true })).finally(() => {
+            const index = quickAnnotationsInFlight.indexOf(pending);
+            if (index >= 0) quickAnnotationsInFlight.splice(index, 1);
+        });
+    }
+
     function saveDisplayPrefs() {
         if (JOB_ID === 'unknown') return;
         try {
@@ -2492,8 +2533,8 @@ document.addEventListener('DOMContentLoaded', async () => {
         syncMobileRootingSelect();
     }
 
-    // Alan 9/23/26 - Remembered display settings panel state. A storage failure (private
-    // window, blocked site data) simply means "no preference".
+    // Alan 9/28/26 - Remember only the display settings tab; the pane starts closed
+    // whenever a tree viewer opens. A storage failure means "no preference".
     function readSettingsPanelPrefs() {
         try {
             const prefs = JSON.parse(localStorage.getItem(SETTINGS_PANEL_PREFS_KEY) || '{}');
@@ -2510,12 +2551,11 @@ document.addEventListener('DOMContentLoaded', async () => {
         } catch (e) {}
     }
 
-    // Alan 9/23/26 - Show or hide the display settings panel and keep its toolbar toggle in step.
-    function setSettingsPanelOpen(open, { persist = true } = {}) {
+    // Alan 9/28/26 - Show or hide the pane for this visit and keep its toggle in step.
+    function setSettingsPanelOpen(open) {
         if (!settingsPanel) return;
         settingsPanel.hidden = !open;
         btnDisplaySettings?.setAttribute('aria-expanded', open ? 'true' : 'false');
-        if (persist) writeSettingsPanelPrefs({ open: Boolean(open) });
     }
 
     // Alan 9/23/26 - Switch the display settings panel to one of its tabs.
@@ -2965,14 +3005,13 @@ document.addEventListener('DOMContentLoaded', async () => {
         });
     }
 
-    // Alan 9/23/26 - Display settings panel (Support, Sequences, Layout, Colors). Open/closed
-    // and the last tab are remembered for this browser across jobs; with nothing stored it
-    // starts closed, so a first visit gives the tree the full width. Wired here rather than
-    // in wireUI() so it works before, and even without, a tree loading.
+    // Alan 9/28/26 - Always start with the pane closed, including when older browser
+    // storage says it was open. Remember only the last tab across jobs. Wire this
+    // before tree loading so the pane and its toggle agree from the start.
     if (settingsPanel && btnDisplaySettings) {
         const prefs = readSettingsPanelPrefs();
         selectSettingsTab(prefs.tab, { persist: false });
-        setSettingsPanelOpen(prefs.open === true, { persist: false });
+        setSettingsPanelOpen(false);
         btnDisplaySettings.addEventListener('click', () => {
             setSettingsPanelOpen(settingsPanel.hidden);
         });
@@ -4572,6 +4611,10 @@ document.addEventListener('DOMContentLoaded', async () => {
             // Alan 7/20/26 - D clears the visible current selection directly, independent of button disabled-state timing.
             if (key === 'd' && viewer && !isProcessing) {
                 deselectCurrentTreeSelection();
+                handled = true;
+            // Alan 9/30/26 - N annotates the selection with its suggested name, skipping the dialog.
+            } else if (key === 'n' && viewer && !isProcessing) {
+                quickAnnotateCurrentSelection();
                 handled = true;
             // Alan 8/24/26 - A opens the Alignment Viewer; V stays as the original alias.
             } else if ((key === 'a' || key === 'v') && viewer && btnAlignmentViewer && !btnAlignmentViewer.disabled) {
