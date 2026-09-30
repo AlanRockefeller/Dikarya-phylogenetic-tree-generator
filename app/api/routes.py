@@ -5024,7 +5024,8 @@ def alignment_view(job_id):
     def as_response_row(row):
         display = display_names.get(id(row))
         if display and display != row["name"]:
-            return {"name": display, "sequence": row["sequence"]}
+            # Keep the source header for display metadata when a tip is renamed.
+            return {"name": display, "original_name": row["name"], "sequence": row["sequence"]}
         return row
 
     warnings = []

@@ -380,10 +380,34 @@ body.av-col-resizing {
 }
 
 .alignment-viewer .av-name-text {
+    display: inline-flex;
+    align-items: center;
+    min-width: 0;
+    white-space: nowrap;
+    flex: 1;
+}
+
+.alignment-viewer .av-name-label {
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
-    flex: 1;
+    min-width: 0;
+}
+
+/* The red T stays visible even when a long sequence name is clipped. */
+.alignment-viewer .av-type-badge {
+    flex: none;
+    margin-left: 0.25em;
+    color: #dc2626;
+    font-size: 0.85em;
+    font-weight: 700;
+    line-height: 1;
+    align-self: flex-start;
+}
+
+.dark .alignment-viewer .av-type-badge,
+.dark .alignment-viewer[data-color-scheme] .av-type-badge {
+    color: #f87171;
 }
 
 .alignment-viewer .av-name-score {

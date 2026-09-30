@@ -3,6 +3,48 @@
     position: relative;
 }
 
+/* Keep the fresh Tree Builder action visible above the tree on desktop and touch screens. */
+.tree-new-button {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.5rem;
+    padding: 0.65rem 1rem;
+    border-radius: 0.65rem;
+    background: #b45309;
+    color: #fff;
+    font-size: 0.9rem;
+    font-weight: 700;
+    line-height: 1;
+    text-decoration: none;
+    box-shadow: 0 2px 6px rgba(120, 53, 15, 0.22);
+    transition: background-color 0.15s ease, box-shadow 0.15s ease;
+}
+
+.tree-new-button:hover {
+    background: #92400e;
+    color: #fff;
+    box-shadow: 0 3px 9px rgba(120, 53, 15, 0.3);
+}
+
+.tree-new-button:focus-visible {
+    outline: 3px solid #78350f;
+    outline-offset: 3px;
+}
+
+.dark .tree-new-button {
+    background: #d4a94e;
+    color: #17251c;
+}
+
+.dark .tree-new-button:hover {
+    background: #f3c969;
+    color: #17251c;
+}
+
+.dark .tree-new-button:focus-visible {
+    outline-color: #f3c969;
+}
+
 .tree-mobile-only {
     display: none;
 }

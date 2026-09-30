@@ -393,9 +393,11 @@ class TreeViewerLayoutTests(unittest.TestCase):
         viewer = (TEMPLATES / "job_viewer.html").read_text(encoding="utf-8")
         self.assertIn("{% block main_width %}max-w-none{% endblock %}", viewer)
 
-    def test_settings_panel_is_remembered_and_hidden_on_touch(self):
+    def test_settings_panel_starts_closed_and_is_hidden_on_touch(self):
         controller = CONTROLLER.read_text(encoding="utf-8")
-        self.assertIn("setSettingsPanelOpen(prefs.open === true", controller)
+        self.assertIn("setSettingsPanelOpen(false);", controller)
+        self.assertNotIn("prefs.open", controller)
+        self.assertIn("selectSettingsTab(prefs.tab, { persist: false })", controller)
         self.assertIn("SETTINGS_PANEL_PREFS_KEY", controller)
         coarse = CSS.read_text(encoding="utf-8").split("@media (pointer: coarse) {", 1)[1]
         self.assertRegex(coarse, r"#tree-settings-panel\s*\{\s*display:\s*none;")

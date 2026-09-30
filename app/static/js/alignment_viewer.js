@@ -166,7 +166,9 @@
         ctx.font = "12px 'IBM Plex Mono', ui-monospace, SFMono-Regular, Menlo, Consolas, monospace";
         let max = 0;
         for (let i = 0; i < rows.length; i++) {
-            const label = (state.referenceName === rows[i].name ? '◆ ' : '') + rows[i].name;
+            // Alan 9/28/26 - Reserve width for the display-only type marker when fitting names.
+            const label = (state.referenceName === rows[i].name ? '◆ ' : '') + rows[i].name
+                + (typeSpecimenForRow(rows[i]) ? ' T' : '');
             const w = ctx.measureText(label).width;
             if (w > max) max = w;
         }
@@ -340,6 +342,24 @@
     // Alan 5/29/26 - Normalize tip names so we can match the persisted focal tip against FASTA headers.
     function normalizeTipName(name) {
         return String(name || '').trim();
+    }
+
+    // Alan 9/28/26 - Resolve the tree page's type annotations using the original
+    // header when an alignment row displays a renamed tip.
+    function typeSpecimenForRow(row) {
+        const types = window.TYPE_SPECIMENS || {};
+        const name = normalizeTipName(row && (row.original_name || row.name)).replace(/^_R_/, '');
+        if (!name) return null;
+        const names = types.names || {};
+        const records = types.records || {};
+        let accession = Object.prototype.hasOwnProperty.call(names, name) ? names[name] : null;
+        if (!accession) {
+            const first = name.split(/\s+/)[0] || '';
+            if (/^MO\d{5,12}$/i.test(first)) return null;
+            accession = first.split('.')[0].toUpperCase();
+        }
+        const info = Object.prototype.hasOwnProperty.call(records, accession) ? records[accession] : null;
+        return info && typeof info === 'object' ? info : null;
     }
 
     // Alan 5/29/26 - Reuse the persisted focal tip as a visual marker without changing row order.
@@ -827,10 +847,24 @@
             div.dataset.name = row.name;
             const nameText = document.createElement('span');
             nameText.className = 'av-name-text';
-            nameText.textContent = isRef ? '◆ ' + row.name : row.name;
+            // Alan 9/28/26 - Attach the red T separately so the sequence name and FASTA stay intact.
+            const nameLabel = document.createElement('span');
+            nameLabel.className = 'av-name-label';
+            nameLabel.textContent = isRef ? '◆ ' + row.name : row.name;
+            nameText.appendChild(nameLabel);
+            const typeInfo = typeSpecimenForRow(row);
+            if (typeInfo) {
+                const typeBadge = document.createElement('span');
+                typeBadge.className = 'av-type-badge';
+                typeBadge.textContent = 'T';
+                typeBadge.setAttribute('aria-label', 'Type specimen');
+                nameText.appendChild(typeBadge);
+            }
             nameText.title = isRef
                 ? `${row.name}\n(reference — click to compare to the consensus again)`
                 : `${row.name}\nClick to use as the reference sequence`;
+            // Alan 9/28/26 - Show the tree annotation's status on hover.
+            if (typeInfo) nameText.title += `\nType specimen: ${typeInfo.status || 'type'}`;
             // Alan 9/9/26 - Back the name with its clade's highlight colour. Written inline
             // from the tree's own resolved colour and opacity, the same way the bands are, and
             // full row height so consecutive members read as one band rather than as pills.

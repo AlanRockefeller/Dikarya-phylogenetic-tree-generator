@@ -143,8 +143,8 @@ TWO_HIT_XML = XML.replace(
 )
 
 
-@pytest.mark.parametrize("unchecked_second, failed", [(True, ["ncbi"]), (False, [])])
-def test_partial_ncbi_miss_fails_source_only_when_transient(unchecked_second, failed):
+@pytest.mark.parametrize("unchecked_second", [True, False])
+def test_partial_ncbi_miss_always_flags_incomplete_source(unchecked_second):
     status = {"ncbi": {"status": "complete", "has_results": True}}
 
     def fake_fetch(accessions, *, deadline=None):
@@ -160,7 +160,7 @@ def test_partial_ncbi_miss_fails_source_only_when_transient(unchecked_second, fa
         result = org.fetch_results("123", include_local=False)
 
     assert result["ncbi_count"] == 1
-    assert result["failed_sources"] == failed
+    assert result["failed_sources"] == ["ncbi"]
     assert "full NCBI sequences for 1" in result["errors"][0]
 
 

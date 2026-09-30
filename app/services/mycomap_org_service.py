@@ -367,7 +367,7 @@ def fetch_results(result_id, *, include_ncbi=True, include_local=True,
                                        deadline=deadline)
         else:
             metadata = {}
-            ncbi_sequences, unchecked = _ncbi_sequences(
+            ncbi_sequences, _unchecked = _ncbi_sequences(
                 [h["accession"] for h in hits], deadline=deadline)
             # Hit_len identifies the sequence whose BLAST metrics we received.
             # A changed or incomplete NCBI record must not inherit those metrics.
