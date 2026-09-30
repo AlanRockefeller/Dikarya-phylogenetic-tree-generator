@@ -1,0 +1,70 @@
+# Dedicated worker for the voucher_sync queue (Voucher Sync scan/apply runs).
+#
+# Every other worker names its queues explicitly with --queues, so without this
+# unit nothing serves voucher_sync and every scan sits at "queued". It is kept
+# off the phylo workers because a scan can run for up to its 3h RQ timeout
+# (photo download + QR/OCR decode) and would hold a tree worker that long.
+#
+# PartOf=dikarya-worker.service, so restart-dikarya-worker restarts it too and
+# it never keeps running stale code after a deploy. That restart does NOT check
+# this queue, so check it by hand first:
+#   redis-cli LLEN rq:queue:voucher_sync ; redis-cli ZCARD rq:wip:voucher_sync
+# A killed scan only loses its preview (nothing is written to iNaturalist until
+# an apply run); an apply re-validates every target before writing, so
+# re-running an interrupted one is safe.
+#
+# Install (root):
+#   cp scripts/dikarya-worker-voucher.service /etc/systemd/system/
+#   mkdir -p /etc/systemd/system/dikarya-worker-voucher.service.d
+#   cp scripts/dikarya-worker-hardening.conf /etc/systemd/system/dikarya-worker-voucher.service.d/hardening.conf
+#   cp scripts/dikarya-umask.conf            /etc/systemd/system/dikarya-worker-voucher.service.d/umask.conf
+#   cp scripts/dikarya-worker-voucher-memory.conf /etc/systemd/system/dikarya-worker-voucher.service.d/zz-memory.conf
+#   systemctl daemon-reload && systemctl enable --now dikarya-worker-voucher
+#   grep "Worker serving queue" /var/www/dikarya/var/logs/worker-voucher.log
+#
+# The graceful-shutdown drop-in is deliberately NOT installed here: it sets
+# TimeoutStopSec=infinity, which would make every restart-dikarya-worker wait
+# up to 3h for a scan to finish.
+#
+# To back out: systemctl disable --now dikarya-worker-voucher, then remove the
+# unit and its .d directory. Queued runs stay in Redis until a worker returns.
+
+[Unit]
+Description=Dikarya Voucher Sync worker (photo QR/OCR scans and iNat field writes)
+After=network.target redis-server.service
+Wants=redis-server.service
+PartOf=dikarya-worker.service
+
+[Service]
+Type=simple
+User=dikarya
+Group=dikarya
+WorkingDirectory=/var/www/dikarya
+EnvironmentFile=/etc/dikarya/dikarya.environment.live
+ExecStart=/var/www/dikarya/.venv/bin/flask run-worker --queues voucher_sync
+Restart=always
+RestartSec=5
+KillSignal=SIGTERM
+
+StandardOutput=append:/var/www/dikarya/var/logs/worker-voucher.log
+StandardError=append:/var/www/dikarya/var/logs/worker-voucher.log
+
+# Background work nobody is watching tick by tick: same low priority as the
+# bulk worker, so interactive tree jobs keep the 2 cores.
+Nice=10
+CPUWeight=20
+IOWeight=50
+
+# Photo decode threads inside one scan. The config default is 4, which is
+# double the host's cores. EnvironmentFile wins if it sets this too.
+Environment=VOUCHER_SYNC_SCAN_WORKERS=2
+Environment=OMP_NUM_THREADS=1
+Environment=OMP_TOOL=disabled
+
+# Memory ceiling lives in scripts/dikarya-worker-voucher-memory.conf, installed
+# as zz-memory.conf, because hardening.conf is a drop-in and would override any
+# value set here.
+TasksMax=256
+
+[Install]
+WantedBy=multi-user.target

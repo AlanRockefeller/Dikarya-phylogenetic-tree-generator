@@ -123,6 +123,60 @@ Handles asynchronous task processing using Redis Queue (RQ):
     - `tree_edit_actions.js`: Bridges UI actions to API calls (prune, reroot).
     - `phylotree.js` / `tree_viewer_phylotree_v2.js`: D3-based tree rendering logic.
 
+## Voucher Sync
+
+A standalone tool at `/voucher-sync` (login required) ported from the desktop
+app `inat-voucher-sync`. It reads a printed voucher label from the **last
+photo** of each of the user's iNaturalist observations and reconciles the
+decoded ID with an observation field (default "Personal voucher number", id
+1907).
+
+**Flow**
+
+1. `GET /voucher-sync/oauth/connect` -> iNaturalist consent ->
+   `/voucher-sync/oauth/callback` exchanges the code (confidential client,
+   `INAT_CLIENT_ID/SECRET`, redirect `INAT_VOUCHER_OAUTH_REDIRECT_URI`), mints
+   a JWT, reads `/v1/users/me`, and stores the grant in `inat_user_credential`
+   (Fernet-encrypted access token + cached JWT, one row per user).
+2. `POST /api/voucher-sync/scan` validates the form
+   (`voucher_sync_service.validate_scan_params`), creates a `voucher_sync_run`
+   (`kind=scan`) and enqueues `run_voucher_scan_job(run_id)` on the
+   `voucher_sync` queue. Only the run id crosses Redis.
+3. The worker (`app/workers/voucher_sync_tasks.py`) loads the user's JWT,
+   verifies the token belongs to the connected login, pages
+   `/v1/observations` (capped at `VOUCHER_SYNC_MAX_OBSERVATIONS`), then scans
+   photos with a `ThreadPoolExecutor(VOUCHER_SYNC_SCAN_WORKERS)`:
+   OpenCV `QRCodeDetector` over image variants and deskewed label crops, then
+   RapidOCR over the same crops when no QR decodes. Each row is `RPUSH`ed to
+   `voucher_sync:run:<id>:rows` (+ a log line) and progress is committed to
+   the DB; the page polls with a cursor. On completion rows and a summary are
+   persisted on the run.
+4. `POST /api/voucher-sync/runs/<id>/apply` re-reads the server-held rows,
+   filters to `action=update` (and the selected ids), requires
+   `confirm_overwrite` when any target field is populated, creates a child
+   run (`kind=apply`) and enqueues `run_voucher_apply_job`. The worker
+   re-reads *every* selected target first (batched by id, see
+   `_revalidate_targets`), not only the ones the preview saw as populated: a
+   field filled in between preview and apply would otherwise be overwritten
+   from stale data without the confirmation the overwrite gate requires. Rows
+   that changed, or that cannot be re-read, are skipped and logged. It then
+   writes serially with a pause and writes the results back into the parent
+   preview.
+
+**Decision matrix** (`build_row`): `field_empty` / `already_correct` /
+`overwrite_existing` / `value_conflict` for QR. The OCR fallback reaches the
+same four outcomes under its own names -- `ocr_fallback`, `already_correct`
+(shared with the QR path), `ocr_fallback_overwrite`, `ocr_value_conflict` --
+so the `ocr_` prefix is neither uniform nor present on all of them. Otherwise:
+`no_photos`, `unexpected_qr_data`, `no_qr_detected`, `ocr_no_match`,
+`photo_download_failed`, `scan_error`. The page
+colours rows green (update), blue (update via OCR), grey (skip), amber (flag).
+
+**Models**: `InatUserCredential`, `VoucherSyncRun` (see `app/models.py`);
+migration `b7d4e2f1a9c3`. **Config**: `INAT_VOUCHER_OAUTH_REDIRECT_URI`,
+`INAT_TOKEN_ENCRYPTION_KEY`, `VOUCHER_SYNC_*`. **Why not `Job`/SSE**: see the
+Voucher Sync section of `AGENTS.md`.
+
 ## Tree state concurrency (`tree_state.json`)
 
 Every viewer edit — prune, rename, reroot, selection sets, clade annotations —
