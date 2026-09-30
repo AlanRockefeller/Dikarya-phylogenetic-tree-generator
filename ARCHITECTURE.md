@@ -134,8 +134,10 @@ decoded ID with an observation field (default "Personal voucher number", id
 **Flow**
 
 1. `GET /voucher-sync/oauth/connect` -> iNaturalist consent ->
-   `/voucher-sync/oauth/callback` exchanges the code (confidential client,
-   `INAT_CLIENT_ID/SECRET`, redirect `INAT_VOUCHER_OAUTH_REDIRECT_URI`), mints
+   `/tree/oauth/callback`, the app's one registered redirect URI (iNaturalist
+   allows only one), which sees the `inat_vs_oauth_state` session key and hands
+   off to `voucher_sync_oauth_callback()`. That exchanges the code (confidential
+   client, `INAT_CLIENT_ID/SECRET`, same redirect URI), mints
    a JWT, reads `/v1/users/me`, and stores the grant in `inat_user_credential`
    (Fernet-encrypted access token + cached JWT, one row per user).
 2. `POST /api/voucher-sync/scan` validates the form

@@ -1012,6 +1012,13 @@ def inat_oauth_callback():
     from app.services.inaturalist_oauth_service import (
         InatAuthError, exchange_code_for_token,
     )
+    # The single registered redirect URI is shared with Voucher Sync. Its state
+    # lives under its own session key, so a match there is a Voucher Sync
+    # sign-in, which any logged-in user may complete -- dispatch it before the
+    # admin check, and leave the admin flow's state untouched.
+    vs_state = session.get("inat_vs_oauth_state")
+    if vs_state and request.args.get("state") == vs_state:
+        return voucher_sync_oauth_callback()
     _require_inat_oauth_admin()
     expected_state = session.pop("inat_oauth_state", None)
     state = request.args.get("state")
@@ -1151,9 +1158,12 @@ def _voucher_sync_redirect_uri():
     uri = (current_app.config.get("INAT_VOUCHER_OAUTH_REDIRECT_URI") or "").strip()
     if uri:
         return uri
-    # Fall back to this deployment's own callback URL. iNaturalist still has to
-    # have it registered on the OAuth app for the consent step to succeed.
-    return url_for("main.voucher_sync_oauth_callback", _external=True)
+    # iNaturalist allows one redirect URI per OAuth app, and it is the Tree
+    # Builder's /tree/oauth/callback, so reuse it: inat_oauth_callback() hands a
+    # request carrying the Voucher Sync state on to voucher_sync_oauth_callback().
+    # The token exchange must send the same URI the consent step did.
+    uri = (current_app.config.get("INAT_OAUTH_REDIRECT_URI") or "").strip()
+    return uri or url_for("main.inat_oauth_callback", _external=True)
 
 
 @bp.route("/voucher-sync")

@@ -612,11 +612,10 @@ class Config:
     # Voucher Sync (/voucher-sync): each user connects their *own* iNaturalist
     # account. Same OAuth app as above, but a second redirect URI must be
     # registered on it for this callback.
-    INAT_VOUCHER_OAUTH_REDIRECT_URI = os.environ.get(
-        'INAT_VOUCHER_OAUTH_REDIRECT_URI',
-        (os.environ.get('INAT_PUBLIC_BASE_URL', '').rstrip('/') + '/voucher-sync/oauth/callback')
-        if os.environ.get('INAT_PUBLIC_BASE_URL') else '',
-    )
+    # Unset (the normal case) reuses INAT_OAUTH_REDIRECT_URI: iNaturalist allows
+    # one redirect URI per app, and /tree/oauth/callback hands a Voucher Sync
+    # sign-in on by its state value.
+    INAT_VOUCHER_OAUTH_REDIRECT_URI = os.environ.get('INAT_VOUCHER_OAUTH_REDIRECT_URI', '')
     # Fernet key for per-user tokens at rest. Generate one with:
     #   python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
     # When unset, a key is derived from SECRET_KEY (rotating it forces reconnects).
