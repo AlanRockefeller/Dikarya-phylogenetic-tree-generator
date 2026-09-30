@@ -64,9 +64,13 @@ def decrypt_secret(value: Optional[str]) -> Optional[str]:
     if not value:
         return None
     from cryptography.fernet import InvalidToken
+    # Alan 9/30/26 - Built outside the try: a malformed key raises ValueError,
+    # which used to read as an unreadable token and made get_user_jwt delete
+    # every user's grant. A bad key is a configuration error and must surface.
+    cipher = _fernet()
     try:
-        return _fernet().decrypt(value.encode("ascii")).decode("utf-8")
-    except (InvalidToken, ValueError):
+        return cipher.decrypt(value.encode("ascii")).decode("utf-8")
+    except (InvalidToken, UnicodeError):
         return None
 
 

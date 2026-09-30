@@ -350,7 +350,19 @@ def enqueue_mycomap_blast_refresh_job(params: Dict[str, Any], job_timeout: Any =
     return job.id
 
 
-def enqueue_voucher_sync_run(run_id: str, kind: str) -> str:
+def voucher_apply_timeout(row_count: Optional[int]) -> int:
+    """Seconds an apply may run: one write plus the pause per row, never under 1h.
+
+    Alan 9/30/26 - A fixed hour could not cover MAX_APPLY_IDS writes at the
+    default one-second pause, and RQ killing the horse skips the code that
+    records which rows were applied.
+    """
+    from app.config import Config
+    pause = float(getattr(Config, "VOUCHER_SYNC_WRITE_PAUSE_SECONDS", 1.0))
+    return max(3600, int((row_count or 0) * (pause + 3)))
+
+
+def enqueue_voucher_sync_run(run_id: str, kind: str, row_count: Optional[int] = None) -> str:
     """Enqueue a Voucher Sync scan or apply run. Only the run id travels
     through Redis; the worker loads params and the user's token from the DB."""
     from app.workers.voucher_sync_tasks import run_voucher_apply_job, run_voucher_scan_job
@@ -359,7 +371,7 @@ def enqueue_voucher_sync_run(run_id: str, kind: str) -> str:
     job = get_queue(QUEUE_VOUCHER).enqueue(
         fn,
         run_id,
-        job_timeout="1h" if kind == "apply" else "3h",
+        job_timeout=voucher_apply_timeout(row_count) if kind == "apply" else "3h",
         meta={},
         job_id=run_id,
         description=safe_job_description(f"voucher sync {kind}", job_id=run_id),

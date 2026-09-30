@@ -108,6 +108,13 @@ class VoucherSyncQueueTests(unittest.TestCase):
         with patch("app.workers.queue.get_redis_connection", return_value=Mock()):
             self.assertEqual(get_queue(QUEUE_VOUCHER).name, "voucher_sync")
 
+    def test_voucher_apply_timeout_scales_with_rows(self):
+        from app.workers.queue import voucher_apply_timeout
+        self.assertEqual(voucher_apply_timeout(None), 3600)
+        self.assertEqual(voucher_apply_timeout(100), 3600)
+        # 5000 rows at the default 1s pause plus ~3s per write.
+        self.assertEqual(voucher_apply_timeout(5000), 20000)
+
     def test_enqueue_voucher_sync_run_carries_only_the_run_id(self):
         from app.workers.queue import enqueue_voucher_sync_run
 

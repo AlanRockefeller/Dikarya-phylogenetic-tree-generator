@@ -274,11 +274,18 @@ def _revalidate_targets(ctx, client, rows, field_id, allow_overwrite):
         if fresh is None:
             ctx.log(f"  SKIP  #{obs_id}  could not be re-read; not applying from stale data")
             continue
+        # Alan 9/30/26 - The confirmation covered the value the user saw in the
+        # preview, not whatever the field holds now. One confirmed row used to
+        # authorise overwriting every selected row, including ones that were
+        # empty at preview time or changed since.
+        preview_value = str(r.get("current_value") or "").strip().upper()
         value, ofv_id = vs.existing_ofv(fresh, field_id)
         r["ofv_id"] = ofv_id
         r["current_value"] = value
         r["field_state"] = "populated" if value else "empty"
-        if value and not allow_overwrite:
+        confirmed = (allow_overwrite and bool(preview_value)
+                     and str(value).strip().upper() == preview_value)
+        if value and not confirmed:
             if str(value).strip().upper() == str(r.get("detected_voucher") or "").strip().upper():
                 ctx.log(f"  SKIP  #{obs_id}  already holds {value}")
             else:
@@ -330,7 +337,10 @@ def run_voucher_apply_job(run_id: str) -> Dict[str, Any]:
         selected = params.get("observation_ids")
         selected_set = {int(x) for x in selected} if selected else None
 
-        parent_rows: List[Dict[str, Any]] = list(parent.rows or [])
+        # Copies, not the loaded dicts: the rows are edited below, and edits to
+        # the committed JSON objects compare equal to it, so the "applied"
+        # state was never flushed and a reload offered those rows again.
+        parent_rows: List[Dict[str, Any]] = [dict(r) for r in (parent.rows or [])]
         to_apply = [r for r in parent_rows
                     if r.get("action") == vs.UPDATE and r.get("detected_voucher")
                     and (selected_set is None or int(r.get("observation_id") or 0) in selected_set)]

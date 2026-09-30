@@ -70,3 +70,28 @@ def test_worker_call_has_no_request_deadline():
          patch.object(bs, "_save_cache", return_value={}):
         bs.blast_from_sequence("ACGT", MagicMock())
     assert poll.call_args.kwargs["max_wait"] == bs.BLAST_MAX_WAIT_SECONDS
+
+
+def test_rate_limit_near_deadline_in_fasta_fetch_is_not_cached():
+    # 5s left when NCBI answers the GenBank fetch with 429 Retry-After: 120.
+    # The fetch helpers degrade on ordinary failures; this one must propagate.
+    now = [0.0]
+
+    def fetch_results(_rid, _limit):
+        now[0] = 235.0
+        return {"accessions": ["AB123456"], "hit_details": []}
+
+    with patch.object(bs, "_check_cache", return_value=None), \
+         patch.object(bs, "_submit_blast_request", return_value=("RID", 0)), \
+         patch.object(bs, "_poll_blast"), \
+         patch.object(bs, "_fetch_blast_results", side_effect=fetch_results), \
+         patch.object(bs.requests, "request",
+                      return_value=_response(429, {"Retry-After": "120"})), \
+         patch.object(bs, "record_requests_failure"), \
+         patch.object(bs, "_report_unresolved_accessions"), \
+         patch.object(bs, "_save_cache") as save, \
+         patch.object(bs.time, "sleep"), \
+         patch.object(bs.time, "monotonic", side_effect=lambda: now[0]):
+        with pytest.raises(TimeoutError):
+            bs.blast_from_sequence("ACGT", MagicMock(), max_wait=240)
+    save.assert_not_called()

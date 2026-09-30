@@ -98,6 +98,20 @@ def test_partial_kill_names_units_and_skips_restart(capsys):
     assert json.dumps({"interrupted": [units[0]], "kill_failed": [units[1]]}) in out
 
 
+def test_failed_thaw_is_reported_and_blocks_restart(capsys):
+    guard = load_guard()
+    reports = [json.dumps({"jobs": [{"id": "job-a"}]})] * 2
+    stream = io.StringIO("INTERRUPT job-a\n")
+
+    def systemctl(args, check):
+        return guard.subprocess.CompletedProcess(args, 1 if args[1] == "thaw" else 0)
+
+    with patch.object(guard.sys, "argv", ["restart-dikarya-worker"]), patch.object(guard.os, "geteuid", return_value=0), patch.object(guard, "run", side_effect=["inactive", "mixed", "infinity"]), patch("builtins.open", mock_open(read_data="DATABASE_URL=postgresql://example\n")), patch.object(guard.subprocess, "check_output", side_effect=reports), patch.object(guard.subprocess, "run", side_effect=systemctl) as mutate, patch.object(guard.sys, "stdin", stream), patch("select.select", return_value=([stream], [], [])):
+        assert guard.main() == 70
+    assert [call.args[0][1] for call in mutate.call_args_list] == ["freeze", "kill", "thaw"]
+    assert json.dumps({"thaw_failed": ["dikarya-worker.service"]}) in capsys.readouterr().out
+
+
 def test_second_worker_without_graceful_config_refuses_restart():
     guard = load_guard()
     inspect = ["active", "mixed", "infinity", "control-group", "90s"]

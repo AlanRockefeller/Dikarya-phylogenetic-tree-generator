@@ -188,7 +188,9 @@ Exit 78 means a failed safety/configuration check (including a high2 worker
 that is still `deactivating`/`activating`); do not bypass it. Exit 70 after an
 approved interrupt means some kills failed: the printed `interrupted` units
 lost their jobs, the `kill_failed` ones may still be running theirs, and
-nothing was restarted -- report both lists to the user. Exit 0
+nothing was restarted -- report both lists to the user. Exit 70 with
+`thaw_failed` means those units may still be frozen (their jobs stalled);
+report it and have a human run the printed `systemctl thaw`. Exit 0
 means restart requested, not necessarily finished: verify worker state/logs.
 An idle-check race drains the newly started job safely in the background.
 
@@ -437,8 +439,8 @@ Rules that matter when editing it:
   the single admin account that posts tree links. Voucher Sync writes to *each
   user's own* observations, so every user connects their own account
   (`/voucher-sync/oauth/connect`). Grants live in `inat_user_credential`,
-  Fernet-encrypted (`INAT_TOKEN_ENCRYPTION_KEY`, else derived from
-  `SECRET_KEY`) via `app/services/inat_user_credential_service.py`. Never read
+  Fernet-encrypted (`INAT_TOKEN_ENCRYPTION_KEY`, required in production; only
+  debug/testing derive one from `SECRET_KEY`) via `app/services/inat_user_credential_service.py`. Never read
   the `*_enc` columns directly and never put a token in a job argument, RQ
   description, JSON response or log line -- the worker loads it from the DB by
   `run_id`.
@@ -449,17 +451,19 @@ Rules that matter when editing it:
   which holds a Gunicorn slot per stream. Finished rows/summary are persisted
   on the row so Apply re-reads the *server-held* preview; the browser only
   sends observation ids and `confirm_overwrite`.
-- **Scans run on the shared RQ worker** (`voucher_sync` queue, listened to
-  last). OpenCV/RapidOCR are lazy-imported inside
+- **Scans run on the dedicated `dikarya-worker-voucher`** (`voucher_sync`
+  queue only; the phylo worker checks do not cover it). OpenCV/RapidOCR are lazy-imported inside
   `app/services/voucher_sync_service.py`, so the web process never loads them;
   `scripts/dikarya-preflight` checks they import. `rapidocr-onnxruntime`
   requires the *full* `opencv-python`, which needs `libgl1` and `libglib2.0-0`
   on the host.
 - **Writes are gated.** Scans are locked to the connected iNat login; one
-  active run per user; Apply requires a finished preview, re-fetches any
-  overwrite target before the PUT, paces writes at
-  `VOUCHER_SYNC_WRITE_PAUSE_SECONDS`, and refuses overwrites unless
-  `confirm_overwrite` is set.
+  active run per user (checked under a row lock on the user); Apply requires a
+  finished preview, re-reads every selected target before writing, paces
+  writes at `VOUCHER_SYNC_WRITE_PAUSE_SECONDS`, and refuses overwrites unless
+  `confirm_overwrite` is set. The confirmation covers only the value the
+  preview showed: a target that was empty then, or holds a different value
+  now, is skipped rather than overwritten.
 
 ## Key Conventions & UI Patterns
 

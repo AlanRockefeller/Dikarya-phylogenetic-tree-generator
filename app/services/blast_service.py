@@ -34,6 +34,15 @@ _request_deadline: contextvars.ContextVar = contextvars.ContextVar(
 )
 
 
+class BudgetExhausted(TimeoutError):
+    """The request budget cannot absorb the next NCBI call or retry wait.
+
+    Its own type so the fetch helpers, which degrade on any other failure,
+    re-raise it: swallowed, a 429 near the deadline returned a partial FASTA
+    while budget technically remained, and that partial set was cached.
+    """
+
+
 def _remaining_budget() -> Optional[float]:
     """Seconds left in the current request's budget, or None when unbounded.
 
@@ -44,7 +53,7 @@ def _remaining_budget() -> Optional[float]:
         return None
     remaining = deadline - time.monotonic()
     if remaining <= 0:
-        raise TimeoutError("BLAST request budget exhausted")
+        raise BudgetExhausted("BLAST request budget exhausted")
     return remaining
 
 
@@ -52,7 +61,7 @@ def _sleep_before_retry(seconds: float) -> None:
     """Back off, but refuse a wait the request budget cannot absorb."""
     remaining = _remaining_budget()
     if remaining is not None and seconds >= remaining:
-        raise TimeoutError(
+        raise BudgetExhausted(
             f"BLAST request budget exhausted (retry wait {seconds:.0f}s, "
             f"{remaining:.0f}s left)"
         )
@@ -506,6 +515,8 @@ def _poll_blast(rid: str, rtoe: int, config: Config, logger,
                     logger.warning("BLAST Status: READY but ThereAreHits=no (will still attempt to fetch results).")
                 return
                 
+        except BudgetExhausted:
+            raise
         except Exception as e:
              logger.warning(f"Poll exception: {e}. Retrying next cycle.")
              _sleep_within_budget(poll_interval)
@@ -701,6 +712,8 @@ def _fetch_genbank_xml_batch(accessions: List[str],
         response = _ncbi_request("POST", NCBI_EFETCH_URL, data=params, timeout=(15, 90))
         response.raise_for_status()
         return [response.text]
+    except BudgetExhausted:
+        raise
     except Exception as e:
         # Log the whole batch, not accessions[:3]. The truncation hid how many
         # records a single failure was taking down, and the "..." read as if
@@ -778,6 +791,8 @@ def _fetch_genbank_xml_individually(accessions: List[str],
             )
             response.raise_for_status()
             documents.append(response.text)
+        except BudgetExhausted:
+            raise
         except Exception as exc:
             failed.append(accession)
             if unchecked is not None and not _is_rejected_batch(exc):
@@ -1243,6 +1258,8 @@ def fetch_fasta_for_accessions(accessions: List[str]) -> str:
                         "status=%s count=%s",
                         response.status_code, len(chunk),
                     )
+            except BudgetExhausted:
+                raise
             except Exception as e:
                 logger.error(f"Fallback FASTA fetch exception: {e}")
 

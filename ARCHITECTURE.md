@@ -172,7 +172,8 @@ same four outcomes under its own names -- `ocr_fallback`, `already_correct`
 so the `ocr_` prefix is neither uniform nor present on all of them. Otherwise:
 `no_photos`, `unexpected_qr_data`, `no_qr_detected`, `ocr_no_match`,
 `photo_download_failed`, `scan_error`. The page
-colours rows green (update), blue (update via OCR), grey (skip), amber (flag).
+colours rows green (update), grey (skip), amber (flag); OCR updates are
+labelled "Update (OCR)" rather than coloured differently.
 
 **Models**: `InatUserCredential`, `VoucherSyncRun` (see `app/models.py`);
 migration `b7d4e2f1a9c3`. **Config**: `INAT_VOUCHER_OAUTH_REDIRECT_URI`,

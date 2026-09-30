@@ -214,7 +214,11 @@ class VoucherSyncRun(db.Model):
     started_at = db.Column(db.DateTime, nullable=True)
     finished_at = db.Column(db.DateTime, nullable=True)
 
-    user = db.relationship('User', backref=db.backref('voucher_sync_runs', lazy=True))
+    # The FK is ON DELETE CASCADE and user_id is NOT NULL: without passive_deletes
+    # an ORM delete of a User would first try to null user_id and fail.
+    user = db.relationship('User', backref=db.backref('voucher_sync_runs', lazy=True,
+                                                      cascade='all, delete-orphan',
+                                                      passive_deletes=True))
 
     ACTIVE_STATUSES = ('queued', 'running')
 

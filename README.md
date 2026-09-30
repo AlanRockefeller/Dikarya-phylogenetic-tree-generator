@@ -2,7 +2,7 @@
 
 **Build a phylogenetic tree in your browser, no installation needed.**
 
-> ### Most people should just use the website: **<https://dikarya.us>**
+> ## Most people should just use the website: **<https://dikarya.us>**
 >
 > Dikarya is a hosted service. If you want to build and explore trees, you do
 > not need to download, install, or configure anything. Open the site, paste 

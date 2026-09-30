@@ -18,7 +18,7 @@ from flask_login import current_user, login_required
 from app.api import bp
 from app.config import Config
 from app.extensions import db, limiter
-from app.models import VoucherSyncRun
+from app.models import User, VoucherSyncRun
 from app.services.security_utils import validate_job_id
 
 logger = logging.getLogger(__name__)
@@ -70,6 +70,27 @@ def _active_run() -> Optional[VoucherSyncRun]:
                     VoucherSyncRun.status.in_(VoucherSyncRun.ACTIVE_STATUSES))
             .order_by(VoucherSyncRun.created_at.desc())
             .first())
+
+
+def _claim_run_slot() -> Optional[VoucherSyncRun]:
+    """The caller's genuinely active run, checked under a lock on their user row.
+
+    Alan 9/30/26 - A bare check-then-insert let a double-clicked Start queue two
+    scans. The row lock (Postgres ``FOR UPDATE``; a no-op on SQLite) is held
+    until the caller commits its new run, so a concurrent request waits and then
+    sees it. ``_reconcile_stale`` may commit and release the lock, so the check
+    is repeated under a fresh lock after it.
+    """
+    def lock() -> None:
+        db.session.query(User.id).filter(User.id == current_user.id).with_for_update().first()
+
+    lock()
+    active = _active_run()
+    if active is not None:
+        _reconcile_stale(active)
+        lock()
+        active = _active_run()
+    return active
 
 
 def _reconcile_stale(run: VoucherSyncRun) -> None:
@@ -186,12 +207,10 @@ def voucher_sync_scan():
     if get_credential(current_user.id) is None:
         return jsonify({"error": "Connect your iNaturalist account first."}), 409
 
-    active = _active_run()
+    active = _claim_run_slot()
     if active is not None:
-        _reconcile_stale(active)
-        if active.status in VoucherSyncRun.ACTIVE_STATUSES:
-            return jsonify({"error": "A run is already in progress.",
-                            "active_run_id": active.id}), 409
+        return jsonify({"error": "A run is already in progress.",
+                        "active_run_id": active.id}), 409
 
     body = request.get_json(silent=True)
     if body is None:
@@ -295,12 +314,10 @@ def voucher_sync_run_apply(run_id):
         return jsonify({"error": "Only a finished preview can be applied."}), 409
     if get_credential(current_user.id) is None:
         return jsonify({"error": "Connect your iNaturalist account first."}), 409
-    active = _active_run()
+    active = _claim_run_slot()
     if active is not None:
-        _reconcile_stale(active)
-        if active.status in VoucherSyncRun.ACTIVE_STATUSES:
-            return jsonify({"error": "A run is already in progress.",
-                            "active_run_id": active.id}), 409
+        return jsonify({"error": "A run is already in progress.",
+                        "active_run_id": active.id}), 409
 
     data = request.get_json(silent=True)
     if data is None:
@@ -349,7 +366,7 @@ def voucher_sync_run_apply(run_id):
     db.session.commit()
     try:
         from app.workers.queue import enqueue_voucher_sync_run
-        enqueue_voucher_sync_run(run.id, "apply")
+        enqueue_voucher_sync_run(run.id, "apply", row_count=len(rows))
     except Exception:
         logger.exception("event=voucher_sync.enqueue_failed run=%s", run.id)
         run.status = "failed"

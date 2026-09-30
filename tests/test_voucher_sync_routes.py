@@ -87,6 +87,17 @@ def _update_row(obs_id, current=None, reason="field_empty"):
 
 
 class TestCredentialEncryption:
+    def test_malformed_key_raises_instead_of_deleting_grants(self, app):
+        import pytest
+        from app.services.inat_user_credential_service import decrypt_secret
+        original = app.config.get("INAT_TOKEN_ENCRYPTION_KEY")
+        app.config["INAT_TOKEN_ENCRYPTION_KEY"] = "not-a-fernet-key"
+        try:
+            with pytest.raises(ValueError):
+                decrypt_secret("gAAAAA-anything")
+        finally:
+            app.config["INAT_TOKEN_ENCRYPTION_KEY"] = original
+
     def test_round_trip_and_status(self, app):
         from app.services.inat_user_credential_service import (
             credential_status, decrypt_secret, encrypt_secret, get_credential,
@@ -282,7 +293,7 @@ class TestRunScopingAndApply:
                                json={"confirm_overwrite": True})
         assert resp.status_code == 202, resp.get_json()
         child_id = resp.get_json()["run_id"]
-        enq.assert_called_once_with(child_id, "apply")
+        enq.assert_called_once_with(child_id, "apply", row_count=1)
         child = db.session.get(VoucherSyncRun, child_id)
         assert child.kind == "apply" and child.parent_run_id == run.id
         assert child.params["allow_overwrite"] is True
@@ -375,9 +386,24 @@ class TestApplyRevalidation:
                 return {1: {"id": 1, "ofvs": [{"field_id": 1907, "value": "OLD", "id": 77}]},
                         2: {"id": 2, "ofvs": []}}
 
-        kept = _revalidate_targets(self._ctx(), FakeClient(), self._rows(), 1907, allow_overwrite=True)
+        rows = [_update_row(1, current="OLD"), _update_row(2)]
+        kept = _revalidate_targets(self._ctx(), FakeClient(), rows, 1907, allow_overwrite=True)
         assert [r["observation_id"] for r in kept] == [1, 2]
         assert kept[0]["ofv_id"] == 77 and kept[0]["current_value"] == "OLD"
+
+    def test_confirmation_does_not_cover_values_the_user_never_saw(self, app):
+        from app.workers.voucher_sync_tasks import _revalidate_targets
+
+        class FakeClient:
+            def fetch_observations_by_id(self, ids):
+                return {1: {"id": 1, "ofvs": [{"field_id": 1907, "value": "NEW", "id": 77}]},
+                        2: {"id": 2, "ofvs": [{"field_id": 1907, "value": "LATE", "id": 78}]},
+                        3: {"id": 3, "ofvs": [{"field_id": 1907, "value": "SEEN", "id": 79}]}}
+
+        # 1 changed since the preview, 2 was empty then, 3 is what was confirmed.
+        rows = [_update_row(1, current="OLD"), _update_row(2), _update_row(3, current="seen")]
+        kept = _revalidate_targets(self._ctx(), FakeClient(), rows, 1907, allow_overwrite=True)
+        assert [r["observation_id"] for r in kept] == [3]
 
     def test_unreadable_observation_is_dropped_not_written_from_stale_data(self, app):
         from app.workers.voucher_sync_tasks import _revalidate_targets

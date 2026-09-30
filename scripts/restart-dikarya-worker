@@ -3,7 +3,8 @@
 
 Install the same file as restart-dikarya-worker-bulk for the bulk queue.
 Exit 75 means active jobs need a human decision; 78 means unsafe configuration;
-70 means an approved interrupt killed only some units (the report names them).
+70 means an approved interrupt killed only some units, or a unit could not be
+thawed (the report names them).
 Noninteractive callers must not synthesize consent without asking the user.
 """
 import json
@@ -200,8 +201,18 @@ def main(*, bulk=None, after_current=False):
                 print("Check: systemctl status " + " ".join(units))
                 return 70
         finally:
-            for unit in frozen:
-                subprocess.run(["/usr/bin/systemctl", "thaw", unit], check=False)
+            # Alan 9/30/26 - A unit left frozen stalls its job silently, so a
+            # failed thaw is reported and blocks the restart below.
+            thaw_failed = [
+                unit for unit in frozen
+                if subprocess.run(["/usr/bin/systemctl", "thaw", unit], check=False).returncode
+            ]
+            if thaw_failed:
+                print(json.dumps({"thaw_failed": thaw_failed}), flush=True)
+                print("These units may still be frozen; nothing was restarted. "
+                      "Run: systemctl thaw " + " ".join(thaw_failed), flush=True)
+        if thaw_failed:
+            return 70
     # --no-block: an idle-check race drains safely in the background; do not
     # hold an agent tool call open for the duration of a newly started job.
     subprocess.run(["/usr/bin/systemctl", "restart", "--no-block", *units], check=True)
