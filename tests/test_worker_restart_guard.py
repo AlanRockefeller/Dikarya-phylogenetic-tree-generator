@@ -54,7 +54,7 @@ def test_high_queue_covers_second_worker_when_installed():
     stream = io.StringIO("INTERRUPT job-a,job-b\n")
     # ActiveState of dikarya-worker-high2, then KillMode/TimeoutStopUSec per unit.
     inspect = ["active", "mixed", "infinity", "mixed", "infinity"]
-    with patch.object(guard.sys, "argv", ["restart-dikarya-worker"]), patch.object(guard.os, "geteuid", return_value=0), patch.object(guard, "run", side_effect=inspect), patch("builtins.open", mock_open(read_data="DATABASE_URL=postgresql://example\n")), patch.object(guard.subprocess, "check_output", side_effect=reports) as report, patch.object(guard.subprocess, "run") as mutate, patch.object(guard.sys, "stdin", stream), patch("select.select", return_value=([stream], [], [])):
+    with patch.object(guard.sys, "argv", ["restart-dikarya-worker"]), patch.object(guard.os, "geteuid", return_value=0), patch.object(guard, "run", side_effect=inspect), patch("builtins.open", mock_open(read_data="DATABASE_URL=postgresql://example\n")), patch.object(guard.subprocess, "check_output", side_effect=reports) as report, patch.object(guard.subprocess, "run", return_value=guard.subprocess.CompletedProcess([], 0)) as mutate, patch.object(guard.sys, "stdin", stream), patch("select.select", return_value=([stream], [], [])):
         assert guard.main() == 0
         assert report.call_args.args[0][-1] == "phylo_high"
         units = ["dikarya-worker.service", "dikarya-worker-high2.service"]
@@ -77,6 +77,25 @@ def test_draining_second_worker_refuses_even_approved_interrupt(state):
     with patch.object(guard.sys, "argv", ["restart-dikarya-worker"]), patch.object(guard.os, "geteuid", return_value=0), patch.object(guard, "run", side_effect=[state, "mixed", "infinity"]), patch("builtins.open", mock_open(read_data="DATABASE_URL=postgresql://example\n")), patch.object(guard.subprocess, "check_output", side_effect=reports), patch.object(guard.subprocess, "run") as mutate, patch.object(guard.sys, "stdin", stream), patch("select.select", return_value=([stream], [], [])):
         assert guard.main() == 78
         mutate.assert_not_called()
+
+
+def test_partial_kill_names_units_and_skips_restart(capsys):
+    guard = load_guard()
+    reports = [json.dumps({"jobs": [{"id": "job-a"}, {"id": "job-b"}]})] * 2
+    stream = io.StringIO("INTERRUPT job-a,job-b\n")
+    units = ["dikarya-worker.service", "dikarya-worker-high2.service"]
+
+    def systemctl(args, check):
+        failed = args[1] == "kill" and args[-1] == units[1]
+        return guard.subprocess.CompletedProcess(args, 1 if failed else 0)
+
+    inspect = ["active", "mixed", "infinity", "mixed", "infinity"]
+    with patch.object(guard.sys, "argv", ["restart-dikarya-worker"]), patch.object(guard.os, "geteuid", return_value=0), patch.object(guard, "run", side_effect=inspect), patch("builtins.open", mock_open(read_data="DATABASE_URL=postgresql://example\n")), patch.object(guard.subprocess, "check_output", side_effect=reports), patch.object(guard.subprocess, "run", side_effect=systemctl) as mutate, patch.object(guard.sys, "stdin", stream), patch("select.select", return_value=([stream], [], [])):
+        assert guard.main() == 70
+    verbs = [call.args[0][1] for call in mutate.call_args_list]
+    assert verbs == ["freeze", "freeze", "kill", "kill", "thaw", "thaw"]
+    out = capsys.readouterr().out
+    assert json.dumps({"interrupted": [units[0]], "kill_failed": [units[1]]}) in out
 
 
 def test_second_worker_without_graceful_config_refuses_restart():

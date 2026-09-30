@@ -2,7 +2,8 @@
 """Root-owned entry point. No arguments; JSON report and exact-job consent on stdin.
 
 Install the same file as restart-dikarya-worker-bulk for the bulk queue.
-Exit 75 means active jobs need a human decision; 78 means unsafe configuration.
+Exit 75 means active jobs need a human decision; 78 means unsafe configuration;
+70 means an approved interrupt killed only some units (the report names them).
 Noninteractive callers must not synthesize consent without asking the user.
 """
 import json
@@ -185,8 +186,19 @@ def main(*, bulk=None, after_current=False):
             if sorted(job["id"] for job in current["jobs"]) != ids:
                 print("Job set changed; obtain a fresh report and approval.")
                 return 75
+            # Alan 9/30/26 - Try every unit even if one kill fails, then name
+            # both lists: an earlier kill cannot be undone, so the operator must
+            # know which workers already lost their jobs and which still run.
+            killed, failed = [], []
             for unit in units:
-                subprocess.run(["/usr/bin/systemctl", "kill", "--kill-whom=all", "--signal=SIGKILL", unit], check=True)
+                result = subprocess.run(["/usr/bin/systemctl", "kill", "--kill-whom=all", "--signal=SIGKILL", unit], check=False)
+                (failed if result.returncode else killed).append(unit)
+            if failed:
+                print(json.dumps({"interrupted": killed, "kill_failed": failed}), flush=True)
+                print("Partial interrupt: jobs on the interrupted units were killed; "
+                      "the kill_failed units were not restarted and may still be running their jobs.")
+                print("Check: systemctl status " + " ".join(units))
+                return 70
         finally:
             for unit in frozen:
                 subprocess.run(["/usr/bin/systemctl", "thaw", unit], check=False)
