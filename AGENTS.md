@@ -184,7 +184,11 @@ timeout budget (not an ETA). Exit 75 means **show the report to the user and ask
 whether to interrupt or wait**. Do not automatically confirm. Only after the
 user explicitly approves losing those jobs' current work, send the exact
 printed `INTERRUPT <job-ids>` line on stdin. Changed IDs require a fresh choice.
-Exit 78 means a failed safety/configuration check; do not bypass it. Exit 0
+Exit 78 means a failed safety/configuration check (including a high2 worker
+that is still `deactivating`/`activating`); do not bypass it. Exit 70 after an
+approved interrupt means some kills failed: the printed `interrupted` units
+lost their jobs, the `kill_failed` ones may still be running theirs, and
+nothing was restarted -- report both lists to the user. Exit 0
 means restart requested, not necessarily finished: verify worker state/logs.
 An idle-check race drains the newly started job safely in the background.
 
