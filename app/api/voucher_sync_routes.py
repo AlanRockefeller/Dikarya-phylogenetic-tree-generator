@@ -313,12 +313,14 @@ def voucher_sync_run_resume(run_id):
         return jsonify({"error": "Only a paused preview can be resumed."}), 409
     if get_credential(current_user.id) is None:
         return jsonify({"error": "Connect your iNaturalist account first."}), 409
-    active = _active_run()
+    # Claim the slot under the user-row lock, as scan and apply do. The lock is
+    # held until the status commit below, so a second Resume click waits and then
+    # sees the queued run rather than enqueueing the same job twice -- RQ does
+    # not reject a duplicate job_id.
+    active = _claim_run_slot()
     if active is not None:
-        _reconcile_stale(active)
-        if active.status in VoucherSyncRun.ACTIVE_STATUSES:
-            return jsonify({"error": "A run is already in progress.",
-                            "active_run_id": active.id}), 409
+        return jsonify({"error": "A run is already in progress.",
+                        "active_run_id": active.id}), 409
 
     # The pause flag has to go, or the worker stops again on its first row.
     from app.workers.voucher_sync_tasks import run_keys
