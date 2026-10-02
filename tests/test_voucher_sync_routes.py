@@ -494,3 +494,192 @@ class TestWorkerTask:
         stored = db.session.get(VoucherSyncRun, run_id)
         assert stored.status == "failed"
         assert "Connect your iNaturalist account" in stored.error
+
+class TestPauseAndResume:
+    """A paused scan keeps its rows and continues instead of rescanning."""
+
+    def _paused(self, user, scanned, total):
+        from app.extensions import db
+        from app.models import VoucherSyncRun
+        rows = [_update_row(i) for i in range(scanned)]
+        run = VoucherSyncRun(
+            id=str(uuid.uuid4()), user_id=user.id, kind="scan", status="paused",
+            params={"field_id": 1907, "regex": r"\bBT-\d{3,5}\b",
+                    "date_start": "2026-10-01", "date_end": "2026-10-01"},
+            rows=rows, summary={"update": scanned}, progress_done=scanned,
+            progress_total=total)
+        db.session.add(run)
+        db.session.commit()
+        return run
+
+    def test_paused_run_is_partial_and_not_active(self, app):
+        from app.models import VoucherSyncRun
+        user = _make_user("pause1@example.org")
+        run = self._paused(user, 106, 157)
+        assert run.is_partial is True
+        assert run.status not in VoucherSyncRun.ACTIVE_STATUSES
+        assert run.status in VoucherSyncRun.RESUMABLE_STATUSES
+
+    def test_resume_requeues_the_same_run(self, app):
+        from app.extensions import db
+        from app.models import VoucherSyncRun
+        client = app.test_client()
+        user = _make_user("pause2@example.org")
+        _connect(user)
+        _login(client, user)
+        run = self._paused(user, 106, 157)
+
+        class FakeRedis:
+            def __init__(self):
+                self.deleted = []
+
+            def delete(self, key):
+                self.deleted.append(key)
+
+        fake = FakeRedis()
+        with patch("app.api.voucher_sync_routes._redis", return_value=fake), \
+             patch("app.workers.queue.enqueue_voucher_sync_run", return_value=run.id) as enq:
+            resp = client.post(f"/api/voucher-sync/runs/{run.id}/resume", json={})
+        assert resp.status_code == 202, resp.get_json()
+        body = resp.get_json()
+        assert body["run_id"] == run.id
+        assert body["resumed_from"] == 106 and body["total"] == 157
+        enq.assert_called_once_with(run.id, "scan")
+        # The pause flag must be cleared, or the worker stops again on row one.
+        assert any(k.endswith(":cancel") for k in fake.deleted)
+        assert db.session.get(VoucherSyncRun, run.id).status == "queued"
+
+    def test_only_a_paused_scan_can_be_resumed(self, app):
+        client = app.test_client()
+        user = _make_user("pause3@example.org")
+        _connect(user)
+        _login(client, user)
+        done = _scan_run(user, [_update_row(1)], status="completed")
+        resp = client.post(f"/api/voucher-sync/runs/{done.id}/resume", json={})
+        assert resp.status_code == 409
+        assert "paused" in resp.get_json()["error"].lower()
+
+    def test_another_user_cannot_resume_my_run(self, app):
+        owner = _make_user("pause4@example.org")
+        other = _make_user("pause5@example.org")
+        run = self._paused(owner, 10, 20)
+        client = app.test_client()
+        _login(client, other)
+        resp = client.post(f"/api/voucher-sync/runs/{run.id}/resume", json={})
+        assert resp.status_code == 404
+
+    def test_a_paused_preview_can_still_be_applied(self, app):
+        client = app.test_client()
+        user = _make_user("pause6@example.org")
+        _connect(user)
+        _login(client, user)
+        run = self._paused(user, 3, 157)
+        with patch("app.workers.queue.enqueue_voucher_sync_run", return_value="x"):
+            resp = client.post(f"/api/voucher-sync/runs/{run.id}/apply", json={})
+        assert resp.status_code == 202, resp.get_json()
+
+
+class _ScanRedis:
+    """Minimal stand-in for the Redis the worker publishes progress to."""
+
+    def __init__(self):
+        self.lists = {}
+
+    def rpush(self, key, value):
+        self.lists.setdefault(key, []).append(value)
+
+    def expire(self, *a):
+        pass
+
+    def exists(self, *a):
+        return 0
+
+    def delete(self, *a):
+        pass
+
+
+def _fake_obs(n):
+    return [{"id": i, "taxon": {"name": "Amanita"},
+             "created_at_details": {"date": "2026-10-01"},
+             "observation_photos": [{"position": 0, "photo": {"url": "https://cdn/square.jpg"}}]}
+            for i in range(n)]
+
+
+class TestResumeWorker:
+    def test_resume_scans_only_what_is_left(self, app):
+        """The worker skips observations already present in run.rows."""
+        from app.extensions import db
+        from app.models import VoucherSyncRun
+        from app.workers import voucher_sync_tasks as tasks
+        user = _make_user("pause7@example.org")
+        _connect(user, login="scanner")
+        rows = [_update_row(i) for i in range(2)]
+        run = VoucherSyncRun(
+            id=str(uuid.uuid4()), user_id=user.id, kind="scan", status="queued",
+            params={"field_id": 1907, "regex": r"\bBT-\d{3,5}\b",
+                    "date_start": "2026-10-01", "date_end": "2026-10-01"},
+            rows=rows, summary={"update": 2}, progress_done=2, progress_total=3)
+        db.session.add(run)
+        db.session.commit()
+        run_id = run.id
+
+        class FakeClient:
+            def __init__(self, jwt):
+                pass
+
+            def verify_token(self):
+                return {"login": "scanner", "id": 42}
+
+            def fetch_observations(self, login, d1, d2, max_observations=None):
+                yield from _fake_obs(3)
+
+        seen = {}
+
+        def fake_scan(client, obs_list, **kw):
+            seen["ids"] = [o["id"] for o in obs_list]
+            row = dict(_update_row(2), observation_id=2)
+            kw["on_row"](1, len(obs_list), row)
+            return [row], False
+
+        with patch.object(tasks, "get_redis_connection", return_value=_ScanRedis()), \
+             patch("app.services.voucher_sync_service.INatClient", FakeClient), \
+             patch("app.services.voucher_sync_service.scan_observations", side_effect=fake_scan), \
+             patch("app.services.voucher_sync_service.ocr_engine_available", return_value=False):
+            result = tasks.run_voucher_scan_job(run_id)
+
+        assert result["status"] == "completed"
+        # Observations 0 and 1 were already scanned; only 2 was handed over.
+        assert seen["ids"] == [2]
+        stored = db.session.get(VoucherSyncRun, run_id)
+        assert stored.progress_done == 3 and stored.progress_total == 3
+        assert len(stored.rows) == 3
+
+    def test_pausing_mid_scan_stores_paused_not_cancelled(self, app):
+        from app.extensions import db
+        from app.models import VoucherSyncRun
+        from app.workers import voucher_sync_tasks as tasks
+        user = _make_user("pause8@example.org")
+        _connect(user, login="scanner")
+        run_id = _scan_run(user, None, status="queued").id
+
+        class FakeClient:
+            def __init__(self, jwt):
+                pass
+
+            def verify_token(self):
+                return {"login": "scanner", "id": 42}
+
+            def fetch_observations(self, login, d1, d2, max_observations=None):
+                yield from _fake_obs(1)
+
+        def fake_scan(client, obs_list, **kw):
+            return [], True          # the user paused before it finished
+
+        with patch.object(tasks, "get_redis_connection", return_value=_ScanRedis()), \
+             patch("app.services.voucher_sync_service.INatClient", FakeClient), \
+             patch("app.services.voucher_sync_service.scan_observations", side_effect=fake_scan), \
+             patch("app.services.voucher_sync_service.ocr_engine_available", return_value=False):
+            result = tasks.run_voucher_scan_job(run_id)
+
+        assert result["status"] == "paused"
+        assert db.session.get(VoucherSyncRun, run_id).status == "paused"
