@@ -135,11 +135,13 @@
     .dark .vs-input { background: #1a2f23; border-color: rgb(255 255 255 / 0.12); color: #eef2ef; }
     .vs-date { flex: 1; min-width: 0; padding: 8px 9px; font-family: 'JetBrains Mono', ui-monospace, monospace; font-size: 12.5px; }
     .dark .vs-date { color-scheme: dark; }
-    .vs-pill { font-family: 'JetBrains Mono', ui-monospace, monospace; font-size: 10.5px; font-weight: 500; line-height: 1;
-               padding: 4px 7px; border-radius: 5px; background: #f3f4f6; border: 1px solid rgb(0 0 0 / 0.10); color: #6b7280; cursor: pointer; }
-    .vs-pill:hover { border-color: #c9a962; color: #1a2f23; }
+    .vs-pill { display: inline-block; max-width: 60%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+               font-family: 'JetBrains Mono', ui-monospace, monospace; font-size: 10.5px; font-weight: 500; line-height: 1;
+               padding: 4px 7px; border-radius: 5px; background: #f3f4f6; border: 1px solid rgb(0 0 0 / 0.10); color: #6b7280; }
     .dark .vs-pill { background: #1a2f23; border-color: rgb(255 255 255 / 0.10); color: #8fa298; }
-    .dark .vs-pill:hover { color: #eef2ef; }
+    .vs-pill-button { cursor: pointer; }
+    .vs-pill-button:hover { border-color: #c9a962; color: #1a2f23; }
+    .dark .vs-pill-button:hover { color: #eef2ef; }
     .vs-pill-input { width: 5.5rem; cursor: text; color: #1a2f23; -moz-appearance: textfield; }
     .vs-pill-input::-webkit-outer-spin-button, .vs-pill-input::-webkit-inner-spin-button { -webkit-appearance: none; margin: 0; }
     .dark .vs-pill-input { color: #eef2ef; }
@@ -255,8 +257,8 @@
                 <div class="relative">
                     <div class="flex items-center justify-between mb-1.5">
                         <label for="vs_field_name" class="text-[12.5px] font-bold">Observation field</label>
-                        <button type="button" id="vs_field_id_pill" class="vs-pill" title="Click to edit the numeric field ID">ID <span id="vs_field_id_text">{{ default_field_id }}</span></button>
-                        <input id="vs_field_id" type="number" min="1" value="{{ default_field_id }}" class="vs-pill vs-pill-input hidden" aria-label="Observation field ID">
+                        <button type="button" id="vs_field_id_pill" class="vs-pill vs-pill-button" title="Click to edit the numeric field ID">ID <span id="vs_field_id_text">{{ default_field_id }}</span></button>
+                        <input id="vs_field_id" type="number" min="1" value="{{ default_field_id }}" class="vs-pill vs-pill-button vs-pill-input hidden" aria-label="Observation field ID">
                     </div>
                     <input id="vs_field_name" type="text" value="{{ default_field_name }}" autocomplete="off" class="vs-input"
                         role="combobox" aria-expanded="false" aria-controls="vs_field_suggest" aria-autocomplete="list">
@@ -269,7 +271,7 @@
                 <div>
                     <div class="flex items-baseline justify-between mb-[7px]">
                         <span class="text-[12.5px] font-bold">Code format</span>
-                        <span id="vs_format_hint" class="font-mono text-[10.5px] text-gray-500 dark:text-[#8fa298] truncate max-w-[55%]"></span>
+                        <span id="vs_format_hint" class="vs-pill"></span>
                     </div>
                     <div class="grid grid-cols-2 gap-[5px]">
                         {% for f in voucher_formats %}
