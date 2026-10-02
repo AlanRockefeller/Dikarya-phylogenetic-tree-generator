@@ -371,6 +371,9 @@
                 </div>
             </section>
 
+            <p id="vs_coverage" class="hidden rounded-md border border-amber-300 bg-amber-50 px-4 py-3 text-sm text-amber-900
+                dark:border-[#6e5629] dark:bg-[#2a3a26] dark:text-[#f0d69a]" role="status"></p>
+
             <section class="bg-white dark:bg-[#15201a] border border-gray-200 dark:border-[#2a3a2f] rounded-md shadow-sm overflow-hidden">
                 <div class="overflow-x-auto">
                     <table id="vs_table" class="min-w-full text-journal-dark dark:text-[#ece9df]">
@@ -455,6 +458,8 @@
         polling: null,
         busy: false,          // a run is queued/running (set before polling starts)
         selected: new Set(),
+        cancelRequested: false,   // Stop clicked; the worker has not stopped yet
+        coverage: null,           // {done, total, partial} for the shown preview
         filters: new Set(), // active chip filters; empty = show everything
     };
 
@@ -629,7 +634,8 @@
         btnClear.disabled = busy || !hasRows;
         // A finished run reruns the same settings, so the verb changes.
         // One button, two roles: it starts a run, and stops the one in flight.
-        btnPreview.textContent = busy ? 'Stop' : (hasRows ? 'Preview again' : 'Preview');
+        btnPreview.textContent = state.cancelRequested ? 'Stopping...'
+                               : (busy ? 'Stop' : (hasRows ? 'Preview again' : 'Preview'));
         btnPreview.classList.toggle('vs-bar-stop', busy);
         btnPreview.title = busy ? 'Stop the run in progress' : '';
         if (state.runId && hasRows) {
@@ -645,11 +651,16 @@
 
     function setBusy(busy) {
         state.busy = busy;
+        if (!busy) state.cancelRequested = false;
         // Stays enabled while running - it is the Stop control then.
         btnPreview.disabled = !CONNECTED;
         updateChips();
     }
     function clearResults() {
+        const banner = el('vs_coverage');
+        banner.classList.add('hidden');
+        banner.textContent = '';
+        state.coverage = null;
         state.rows.clear(); state.order = []; state.selected.clear();
         state.cursor = 0; state.logCursor = 0;
         rowsBody.innerHTML = ''; logBox.innerHTML = '';
@@ -824,6 +835,7 @@
             state.cursor = data.next_cursor;
         }
         setProgress(data.progress_done || 0, data.progress_total || 0);
+        if (data.kind === 'scan' && !active) markCoverage(data);
         updateChips();
 
         const active = data.status === 'queued' || data.status === 'running';
@@ -875,13 +887,21 @@
     async function cancelRun() {
         const id = state.kind === 'apply' ? state.applyRunId : state.runId;
         if (!id) return;
-        btnPreview.disabled = true;          // re-enabled by setBusy on the terminal poll
+        // Acknowledge the click immediately. The worker only notices the flag
+        // between rows, so there is a wait here -- saying nothing during it is
+        // what made Stop look broken.
+        state.cancelRequested = true;
+        btnPreview.textContent = 'Stopping...';
+        btnPreview.disabled = true;
+        setStatus('Stopping - waiting for the rows already in progress to finish...', 'busy');
         const { ok, data } = await api(`/api/voucher-sync/runs/${id}/cancel`, { method: 'POST', body: '{}' });
         if (!ok) {
+            state.cancelRequested = false;
             showStatus(data.error || 'Could not stop the run.', 'error');
+            setStatus('Could not stop the run.', 'error');
             btnPreview.disabled = !CONNECTED;
         } else {
-            setStatus('Stopping...', 'busy');
+            showStatus('Stopping after the rows already in progress.', 'info');
         }
     }
 
@@ -943,12 +963,14 @@
     btnApply.addEventListener('click', () => {
         const c = applyCounts();
         if (!c.total) { showStatus('Select at least one Update row.', 'error'); return; }
+        const cov = state.coverage;
         const body = el('vs_apply_modal_body');
         body.innerHTML = `
             <p>This will write <strong>${c.total}</strong> voucher number(s) to iNaturalist field
                <strong>${esc(fieldInput.value || ('#' + el('vs_field_id').value))}</strong>.</p>
             ${c.ocr ? `<p class="text-blue-700 dark:text-blue-300"><i class="fas fa-eye mr-1"></i>${c.ocr} value(s) came from OCR - please double-check them in the table.</p>` : ''}
             ${c.overwrite ? `<p class="text-amber-700 dark:text-amber-300"><i class="fas fa-triangle-exclamation mr-1"></i>${c.overwrite} observation(s) already have a different value that will be <strong>overwritten</strong>.</p>` : ''}
+            ${cov && cov.partial ? `<p class="text-amber-700 dark:text-amber-300"><i class="fas fa-circle-exclamation mr-1"></i>This preview only covered <strong>${cov.done} of ${cov.total}</strong> observations, so this is not the whole window.</p>` : ''}
             <p class="text-xs text-gray-500 dark:text-gray-400">Writes are paced at about one per second.</p>`;
         openApplyModal();
     });
@@ -1003,6 +1025,24 @@
         el('vs_log_caret').className = hidden ? 'fas fa-chevron-down text-gray-400' : 'fas fa-chevron-up text-gray-400';
     });
 
+    // Partial coverage has to be impossible to miss: it changes what Apply means.
+    function markCoverage(run) {
+        const done = run.progress_done || 0;
+        const total = run.progress_total || 0;
+        const banner = el('vs_coverage');
+        state.coverage = { done, total, partial: !!(total && done < total) };
+        if (!state.coverage.partial) {
+            banner.classList.add('hidden');
+            banner.textContent = '';
+            return;
+        }
+        const missed = total - done;
+        banner.innerHTML = `<strong>This preview covers ${done} of ${total} observations.</strong> ` +
+            `${missed} ${missed === 1 ? 'was' : 'were'} never scanned, so anything needing a voucher ` +
+            `among them is not shown here. Run the preview again to cover them.`;
+        banner.classList.remove('hidden');
+    }
+
     // ---------- resume on reload ----------
     (async function resume() {
         if (!CONNECTED) { setStatus('Connect your iNaturalist account to begin.'); return; }
@@ -1023,10 +1063,17 @@
             if (scan) {
                 state.runId = scan.id;
                 await reloadPreview(scan.id);
-                const s = scan.summary || {};
-                setStatus('Preview complete', 'ok',
-                          `${relativeTime(scan.created_at)} \u00b7 ${scan.created_at.slice(11, 16)} UTC`);
+                const when = `${relativeTime(scan.created_at)} \u00b7 ${scan.created_at.slice(11, 16)} UTC`;
+                // Report what the run actually was. A cancelled run is a
+                // partial scan, and saying "complete" invites applying it as
+                // though it covered everything.
+                if (scan.status === 'cancelled') {
+                    setStatus('Preview stopped', 'error', when);
+                } else {
+                    setStatus('Preview complete', 'ok', when);
+                }
                 setProgress(scan.progress_done || 0, scan.progress_total || 0);
+                markCoverage(scan);
             }
         }
     })();
