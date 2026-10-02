@@ -301,6 +301,57 @@ def voucher_sync_run_cancel(run_id):
     return jsonify({"status": run.status, "cancelled": True})
 
 
+@bp.route('/voucher-sync/runs/<run_id>/resume', methods=['POST'])
+@login_required
+@limiter.limit(_scan_rate_limit, key_func=_rate_key)
+def voucher_sync_run_resume(run_id):
+    """Continue a paused scan, keeping the rows it already produced."""
+    from app.services.inat_user_credential_service import get_credential
+
+    run = _own_run(run_id)
+    if run.kind != 'scan' or run.status not in VoucherSyncRun.RESUMABLE_STATUSES:
+        return jsonify({"error": "Only a paused preview can be resumed."}), 409
+    if get_credential(current_user.id) is None:
+        return jsonify({"error": "Connect your iNaturalist account first."}), 409
+    # Claim the slot under the user-row lock, as scan and apply do. The lock is
+    # held until the status commit below, so a second Resume click waits and then
+    # sees the queued run rather than enqueueing the same job twice -- RQ does
+    # not reject a duplicate job_id.
+    active = _claim_run_slot()
+    if active is not None:
+        return jsonify({"error": "A run is already in progress.",
+                        "active_run_id": active.id}), 409
+
+    # The pause flag has to go, or the worker stops again on its first row.
+    from app.workers.voucher_sync_tasks import run_keys
+    try:
+        _redis().delete(run_keys(run.id)["cancel"])
+    except Exception as exc:
+        logger.warning("event=voucher_sync.resume_flag_clear_failed run=%s error=%s", run.id, exc)
+        return jsonify({"error": "Could not reach the worker to resume."}), 503
+
+    run.status = 'queued'
+    run.error = None
+    run.finished_at = None
+    db.session.commit()
+
+    try:
+        from app.workers.queue import enqueue_voucher_sync_run
+        enqueue_voucher_sync_run(run.id, "scan")
+    except Exception:
+        logger.exception("event=voucher_sync.resume_enqueue_failed run=%s", run.id)
+        run.status = 'paused'
+        run.error = "Could not queue the resume (background worker unavailable)."
+        db.session.commit()
+        return jsonify({"error": run.error}), 503
+
+    logger.info("event=voucher_sync.resume_queued run=%s done=%s total=%s",
+                run.id, run.progress_done, run.progress_total)
+    return jsonify({"run_id": run.id, "status": run.status,
+                    "resumed_from": run.progress_done or 0,
+                    "total": run.progress_total or 0}), 202
+
+
 @bp.route('/voucher-sync/runs/<run_id>/apply', methods=['POST'])
 @login_required
 @limiter.limit(_apply_rate_limit, key_func=_rate_key)
@@ -310,7 +361,7 @@ def voucher_sync_run_apply(run_id):
     from app.services.voucher_sync_service import UPDATE
 
     parent = _own_run(run_id)
-    if parent.kind != "scan" or parent.status not in ("completed", "cancelled"):
+    if parent.kind != "scan" or parent.status not in ("completed", "cancelled", "paused"):
         return jsonify({"error": "Only a finished preview can be applied."}), 409
     if get_credential(current_user.id) is None:
         return jsonify({"error": "Connect your iNaturalist account first."}), 409
