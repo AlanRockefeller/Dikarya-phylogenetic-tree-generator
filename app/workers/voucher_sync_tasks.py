@@ -196,9 +196,15 @@ def run_voucher_scan_job(run_id: str) -> Dict[str, Any]:
         done_rows: List[Dict[str, Any]] = list(run.rows or [])
         done_ids = {int(r["observation_id"]) for r in done_rows
                     if r.get("observation_id") is not None}
+        # A saved row is kept even when its observation has since been deleted
+        # from iNaturalist, but progress is measured against the window as it is
+        # now -- so count only the saved rows still in that window. Counting all
+        # of done_rows would let progress run past the total.
+        window_ids = {int(o.get("id") or 0) for o in obs_list}
+        done_count = len(done_ids & window_ids)
         if done_ids:
             pending = [o for o in obs_list if int(o.get("id") or 0) not in done_ids]
-            ctx.log(f"Resuming: {len(done_rows)} already scanned, "
+            ctx.log(f"Resuming: {done_count} already scanned, "
                     f"{len(pending)} to go.")
         else:
             pending = obs_list
@@ -207,7 +213,7 @@ def run_voucher_scan_job(run_id: str) -> Dict[str, Any]:
 
         if ctx.cancelled():
             ctx.log("Paused before scanning started.")
-            ctx.progress(len(done_rows), total, force=True)
+            ctx.progress(done_count, total, force=True)
             ctx.finish("paused", rows=done_rows, summary=vs.summarize_rows(done_rows))
             return {"status": "paused"}
         if not total:
@@ -230,7 +236,7 @@ def run_voucher_scan_job(run_id: str) -> Dict[str, Any]:
             # Everything in the window is already scanned; nothing left to do.
             done_rows.sort(key=lambda r: (r.get("upload_date") or "", r.get("observation_id") or 0))
             ctx.log("Every observation in this window has already been scanned.")
-            ctx.progress(len(done_rows), total, force=True)
+            ctx.progress(done_count, total, force=True)
             ctx.finish("completed", rows=done_rows, summary=vs.summarize_rows(done_rows))
             return {"status": "completed", "total": total}
 
@@ -240,11 +246,11 @@ def run_voucher_scan_job(run_id: str) -> Dict[str, Any]:
             ctx.push_row(row)
 
         ctx.log(f"Found {total} observation(s). Scanning photos...")
-        ctx.progress(len(done_rows), total, force=True)
+        ctx.progress(done_count, total, force=True)
 
         voucher_re = vs.compile_voucher_pattern(params["regex"])
 
-        offset = len(done_rows)
+        offset = done_count
 
         def on_row(done: int, total_: int, row: Dict[str, Any]) -> None:
             # `done` counts this pass; the user cares about the whole window.
@@ -263,16 +269,17 @@ def run_voucher_scan_job(run_id: str) -> Dict[str, Any]:
             on_row=on_row,
             should_cancel=ctx.cancelled,
         )
+        scanned = done_count + len(rows)
         rows = done_rows + rows
         rows.sort(key=lambda r: (r.get("upload_date") or "", r.get("observation_id") or 0))
         summary = vs.summarize_rows(rows)
         if cancelled:
-            ctx.log(f"Paused -- {len(rows)} of {total} observation(s) scanned. "
+            ctx.log(f"Paused -- {scanned} of {total} observation(s) scanned. "
                     f"Resume to continue from here.")
         else:
             ctx.log(f"Scan complete: {summary['update']} to update, "
                     f"{summary['skip']} to skip, {summary['flag']} flagged.")
-        ctx.progress(len(rows), total, force=True)
+        ctx.progress(scanned, total, force=True)
         ctx.finish("paused" if cancelled else "completed", rows=rows, summary=summary)
         return {"status": run.status, "total": total, "summary": summary}
     except Exception as exc:

@@ -683,3 +683,62 @@ class TestResumeWorker:
 
         assert result["status"] == "paused"
         assert db.session.get(VoucherSyncRun, run_id).status == "paused"
+
+    def test_progress_counts_only_observations_still_in_the_window(self, app):
+        """A saved row whose observation was deleted must not inflate progress."""
+        from app.extensions import db
+        from app.models import VoucherSyncRun
+        from app.workers import voucher_sync_tasks as tasks
+        user = _make_user("pause9@example.org")
+        _connect(user, login="scanner")
+        # Three rows were saved, then observation 0 was deleted on iNaturalist
+        # and a new observation 3 appeared, so the window is now 1, 2, 3.
+        rows = [_update_row(i) for i in range(3)]
+        run = VoucherSyncRun(
+            id=str(uuid.uuid4()), user_id=user.id, kind="scan", status="queued",
+            params={"field_id": 1907, "regex": r"\bBT-\d{3,5}\b",
+                    "date_start": "2026-10-01", "date_end": "2026-10-01"},
+            rows=rows, summary={"update": 3}, progress_done=3, progress_total=3)
+        db.session.add(run)
+        db.session.commit()
+        run_id = run.id
+
+        window = [{"id": i, "taxon": {"name": "Amanita"},
+                   "created_at_details": {"date": "2026-10-01"},
+                   "observation_photos": [{"position": 0,
+                                           "photo": {"url": "https://cdn/square.jpg"}}]}
+                  for i in (1, 2, 3)]
+        seen = {}
+
+        class FakeClient:
+            def __init__(self, jwt):
+                pass
+
+            def verify_token(self):
+                return {"login": "scanner", "id": 42}
+
+            def fetch_observations(self, login, d1, d2, max_observations=None):
+                yield from window
+
+        def fake_scan(client, obs_list, **kw):
+            seen["ids"] = [o["id"] for o in obs_list]
+            row = _update_row(3)
+            kw["on_row"](1, len(obs_list), row)
+            return [row], False
+
+        with patch.object(tasks, "get_redis_connection", return_value=_ScanRedis()), \
+             patch("app.services.voucher_sync_service.INatClient", FakeClient), \
+             patch("app.services.voucher_sync_service.scan_observations", side_effect=fake_scan), \
+             patch("app.services.voucher_sync_service.ocr_engine_available", return_value=False):
+            result = tasks.run_voucher_scan_job(run_id)
+
+        assert result["status"] == "completed"
+        assert seen["ids"] == [3]
+        stored = db.session.get(VoucherSyncRun, run_id)
+        # Rows 1 and 2 carried over and 3 was scanned now: 3 of 3. Counting the
+        # retained row for the deleted observation 0 would report 4 of 3.
+        assert stored.progress_total == 3
+        assert stored.progress_done == 3, "progress must not exceed the window size"
+        assert stored.is_partial is False
+        # The row for the deleted observation is still kept, deliberately.
+        assert {r["observation_id"] for r in stored.rows} == {0, 1, 2, 3}
