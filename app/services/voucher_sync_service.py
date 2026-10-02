@@ -43,7 +43,7 @@ DEFAULT_FIELD_NAME = "Personal voucher number"
 DEFAULT_FIELD_ID = 1907
 
 # A 2-4 character alphanumeric prefix that must contain at least one letter,
-# a hyphen, and a 3-5 digit suffix, e.g. "BT-001", "AB12-34567". The lookahead
+# a hyphen, and a 3-5 digit suffix, e.g. "RS-001", "AB12-34567". The lookahead
 # rejects a purely numeric prefix like "12-3456" (OCR noise or a date).
 DEFAULT_VOUCHER_RE = r"\b(?=[A-Za-z0-9]*[A-Za-z])[A-Za-z0-9]{2,4}-\d{3,5}\b"
 
@@ -59,7 +59,7 @@ MAX_MATCH_TEXT = 500
 MAX_CUSTOM_REGEX_LEN = 200
 
 VOUCHER_FORMATS: List[Tuple[str, Optional[str]]] = [
-    ("Prefix-Number", DEFAULT_VOUCHER_RE),                    # BT-001, AB12-34567
+    ("Prefix-Number", DEFAULT_VOUCHER_RE),                    # RS-001, AB12-34567
     ("Numbers only", r"\b\d{3,6}\b"),                         # 00421, 123456
     # 4-10 chars containing at least one letter and one digit.
     ("Alphanumeric",
@@ -68,7 +68,7 @@ VOUCHER_FORMATS: List[Tuple[str, Optional[str]]] = [
 ]
 DEFAULT_VOUCHER_FORMAT = VOUCHER_FORMATS[0][0]
 VOUCHER_FORMAT_EXAMPLES = {
-    "Prefix-Number": "BT-001, AB12-34567",
+    "Prefix-Number": "RS-001, AB12-34567",
     "Numbers only": "00421, 123456",
     "Alphanumeric": "AB12, 4F9X, X7Y9Z2",
     "Custom": "your own regular expression",
