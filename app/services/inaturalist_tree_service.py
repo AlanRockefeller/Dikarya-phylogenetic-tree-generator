@@ -2012,19 +2012,25 @@ def _create_mycomap_blast_from_observation(observation: Dict[str, Any],
     # first pass already checked history for this title, so skip the lookup
     # while it waits for a slot (history is MycoMap's heaviest BLAST query).
     was_throttled = bool((pending_creation_details or {}).get("creation_throttled"))
-    # Once history has told us the search's ID, resolve it by that ID: a large
-    # batch pushes older searches out of both the history page and the listing,
-    # so the title lookup stops finding them (see find_mycomap_blast_by_known_id).
-    known_id = str(
+    # Once history has told us an ID, check its result page directly: a large
+    # batch pushes older searches out of both the history page and the listing.
+    # A job ID may differ from the BLAST ID, but the known-ID lookup accepts a
+    # page only after verifying its title. Keep the ID kind until that succeeds.
+    known_blast_id = str(
         (pending_creation_details or {}).get("creation_pending_blast_id")
         or (recalled_blast_id_for_title(job_title)
             if (pending_creation_details or {}).get("creation_pending") else "")
         or ""
     ).strip()
+    known_job_id = str(
+        (pending_creation_details or {}).get("creation_pending_job_id") or ""
+    ).strip()
+    known_id = known_blast_id or known_job_id
     created = None
     if known_id and not was_throttled:
         created = find_mycomap_blast_by_known_id(
-            known_id, job_title, warnings=discovery_warnings
+            known_id, job_title, warnings=discovery_warnings,
+            verify_title=not bool(known_blast_id),
         )
         if not created:
             # A stored id may be a MycoMap job id rather than the result's
@@ -2037,6 +2043,7 @@ def _create_mycomap_blast_from_observation(observation: Dict[str, Any],
         # Carrying an ID keeps the queue-position report and the
         # creation-confirmed check working.
         pending_creation.setdefault("blast_id", known_id)
+        pending_creation.setdefault("id_kind", "blast" if known_blast_id else "job")
     elif not was_throttled:
         # A timed-out create is judged by what this lookup does NOT find, so it
         # must read MycoMap's history directly rather than a shared cached page.

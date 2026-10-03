@@ -7,7 +7,7 @@
 {% block main_width %}max-w-none{% endblock %}
 
 {% block head %}
-<link rel="stylesheet" href="{{ url_for('static', filename='css/tree_viewer.css') }}?v=23">
+<link rel="stylesheet" href="{{ url_for('static', filename='css/tree_viewer.css') }}?v=24">
 <link rel="stylesheet" href="{{ url_for('static', filename='css/phylotree.css') }}?v=3">
 <link rel="stylesheet" href="{{ url_for('static', filename='css/phylotree-menus.css') }}?v=3">
 <link rel="preconnect" href="https://fonts.googleapis.com">
@@ -899,6 +899,26 @@
                             type="checkbox" id="cb-fade-by-support" checked>
                         Fade by support
                     </label>
+                    {# Alan 10/3/26 - Collapse branches below a support cutoff into polytomies.
+                       Off by default; display only. The slider's range, default and label are set
+                       from the support type by updateSupportCollapseUI(). #}
+                    <label id="label-collapse-weak-support" class="settings-check"
+                        title="Contract branches whose support is below the cutoff, so unsupported splits are not drawn as resolved. Display only; the tree and downloads are unchanged.">
+                        <input class="rounded border-gray-300 text-journal-gold focus:ring-journal-gold w-3.5 h-3.5"
+                            type="checkbox" id="cb-collapse-weak-support">
+                        Collapse weak branches
+                    </label>
+                    <div id="support-collapse-controls" class="settings-slider" hidden>
+                        <div class="settings-slider-head">
+                            <span id="support-collapse-label">Support</span>
+                            <span class="settings-value">&lt; <span id="support-collapse-value">--</span></span>
+                        </div>
+                        <input type="range" id="slider-support-collapse" min="0" max="100" value="95" step="1"
+                            list="support-collapse-ticks" class="w-full cursor-pointer accent-yellow-600">
+                        <datalist id="support-collapse-ticks"></datalist>
+                        <p id="support-collapse-summary" class="settings-help"></p>
+                        <button type="button" id="btn-support-collapse-reset" class="tree-tool">Reset to standard</button>
+                    </div>
                 </section>
 
                 <section id="settings-panel-sequences" class="tree-settings-body" role="tabpanel"
@@ -1504,13 +1524,13 @@
 
 <script src="{{ url_for('static', filename='vendor/underscore-1.13.6-min.js') }}"></script>
 
-<script src="{{ url_for('static', filename='js/phylotree.js') }}?v=14"></script>
+<script src="{{ url_for('static', filename='js/phylotree.js') }}?v=15"></script>
 
-<script src="{{ url_for('static', filename='js/tree_viewer_phylotree_v2.js') }}?v=104"></script>
+<script src="{{ url_for('static', filename='js/tree_viewer_phylotree_v2.js') }}?v=105"></script>
 
 <script src="{{ url_for('static', filename='js/tree_viewer_api.js') }}?v=8"></script>
 
-<script src="{{ url_for('static', filename='js/tree_viewer_controller.js') }}?v=98"></script>
+<script src="{{ url_for('static', filename='js/tree_viewer_controller.js') }}?v=100"></script>
 
 {% include 'partials/alignment_viewer_modal.html' %}
 

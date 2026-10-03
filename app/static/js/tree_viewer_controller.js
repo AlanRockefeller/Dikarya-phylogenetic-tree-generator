@@ -2584,6 +2584,16 @@ document.addEventListener('DOMContentLoaded', async () => {
         button.title = `${sort.title}. Click to cycle node sorting (S)`;
     }
 
+    // Alan 10/3/26 - Auto root now usually roots on a clade around the chosen hit
+    // (rooting_info.root_clade), so the notice must not present one tip as the whole outgroup.
+    function autoRootNoticeLabel(info, target) {
+        if (info.chosen_by === 'most_divergent_hit') return `Auto root used the most divergent hit: ${target}`;
+        const cladeTips = Number((info.root_clade || {}).tip_count) || 1;
+        return cladeTips > 1
+            ? `Auto root chose an outgroup clade of ${cladeTips} sequences, including ${target}`
+            : `Auto root chose outgroup: ${target}`;
+    }
+
     function rootingFinalStatus(mode, result) {
         needsSequenceOfInterest = !!(result && result.needs_sequence_of_interest);
         const info = (result && result.rooting_info) || {};
@@ -2599,9 +2609,8 @@ document.addEventListener('DOMContentLoaded', async () => {
         }
         if (info.chosen_by === 'auto' || info.chosen_by === 'most_divergent_hit') {
             const target = info.chosen_root_target || (result && result.root_target) || 'selected tip';
-            const label = info.chosen_by === 'most_divergent_hit'
-                ? `Auto root used the most divergent hit: ${target}`
-                : `Auto root chose outgroup: ${target}`;
+            // Alan 10/3/26 - Shared wording; names the outgroup clade when there is one.
+            const label = autoRootNoticeLabel(info, target);
             // Alan 5/31/26 - Keep the chosen-outgroup message up (sticky) so it can actually be read.
             // Alan 8/4/26 - The persistent banner now carries this, so suppress the duplicate
             // toast whenever the banner accepted it; a short confirmation is enough.
@@ -2737,6 +2746,9 @@ document.addEventListener('DOMContentLoaded', async () => {
             showSupport: true,
             // Alan 9/23/26 - Fade by support ships checked; honour the box if a cached page differs.
             supportFade: getEl('cb-fade-by-support') ? getEl('cb-fade-by-support').checked : true,
+            // Alan 10/3/26 - Collapse weak branches ships unchecked; null threshold = scale default.
+            supportCollapse: !!getEl('cb-collapse-weak-support')?.checked,
+            supportCollapseThreshold: null,
             layout: 'linear',
             alignTips: false,
             // grab initial DOM values
@@ -2824,9 +2836,8 @@ document.addEventListener('DOMContentLoaded', async () => {
                 // Alan 5/31/26 - On initial page load (not post-action reloads), tell the user
                 // which sequence auto root chose as the outgroup when the tree opens already auto-rooted.
                 } else if (!opts.fromAction && loadedMode === 'auto' && (loadedInfo.chosen_by === 'auto' || loadedInfo.chosen_by === 'most_divergent_hit') && loadedInfo.chosen_root_target) {
-                    const label = loadedInfo.chosen_by === 'most_divergent_hit'
-                        ? `Auto root used the most divergent hit: ${loadedInfo.chosen_root_target}`
-                        : `Auto root chose outgroup: ${loadedInfo.chosen_root_target}`;
+                    // Alan 10/3/26 - Shared wording; names the outgroup clade when there is one.
+                    const label = autoRootNoticeLabel(loadedInfo, loadedInfo.chosen_root_target);
                     // Alan 8/4/26 - Prefer the persistent banner; only fall back to the sticky
                     // toast when the banner is missing, otherwise the same rooting sentence
                     // renders twice on screen.
@@ -4205,6 +4216,38 @@ document.addEventListener('DOMContentLoaded', async () => {
             viewer.setOptions({ supportFade: !!event.target.checked });
         });
 
+        // Alan 10/3/26 - Collapse weak branches. The collapse happens when the Newick is parsed,
+        // so a change re-renders through the normal load path (which restores renames, colours
+        // and annotations). The slider only re-renders on release; dragging updates the number.
+        const collapseBox = getEl('cb-collapse-weak-support');
+        const collapseSlider = getEl('slider-support-collapse');
+        const rerenderForCollapse = () => {
+            if (!viewer) return;
+            loadTree({ fromAction: true });
+        };
+        collapseBox?.addEventListener('change', () => {
+            if (!viewer) return;
+            viewer.options.supportCollapse = collapseBox.checked;
+            updateSupportCollapseUI(viewer.getStats());
+            rerenderForCollapse();
+        });
+        collapseSlider?.addEventListener('input', () => {
+            const spec = window.describeSupportCollapse?.(viewer?.getStats()?.supportType);
+            const valueEl = getEl('support-collapse-value');
+            if (spec && valueEl) valueEl.textContent = spec.format(Number(collapseSlider.value));
+        });
+        collapseSlider?.addEventListener('change', () => {
+            if (!viewer) return;
+            viewer.options.supportCollapseThreshold = Number(collapseSlider.value);
+            rerenderForCollapse();
+        });
+        getEl('btn-support-collapse-reset')?.addEventListener('click', () => {
+            if (!viewer) return;
+            viewer.options.supportCollapseThreshold = null;
+            updateSupportCollapseUI(viewer.getStats());
+            rerenderForCollapse();
+        });
+
         // SVG Save
         getEl('btn-save-svg')?.addEventListener('click', (e) => {
             e.preventDefault();
@@ -4895,8 +4938,58 @@ document.addEventListener('DOMContentLoaded', async () => {
         });
     }
 
+    // Alan 10/3/26 - Fit the collapse slider to this tree's support scale and report how many
+    // branches the current cutoff collapses. Disabled for trees with no single scale.
+    function updateSupportCollapseUI(stats) {
+        const box = getEl('cb-collapse-weak-support');
+        const label = getEl('label-collapse-weak-support');
+        const controls = getEl('support-collapse-controls');
+        const slider = getEl('slider-support-collapse');
+        if (!box) return;
+        const spec = stats ? window.describeSupportCollapse?.(stats.supportType) : null;
+        box.disabled = !spec;
+        if (label) {
+            label.classList.toggle('opacity-40', !spec);
+            label.classList.toggle('cursor-not-allowed', !spec);
+        }
+        if (controls) controls.hidden = !(spec && box.checked);
+        if (!spec || !slider) return;
+
+        const wanted = viewer?.options?.supportCollapseThreshold;
+        const value = (wanted === null || wanted === undefined) ? spec.defaultValue : wanted;
+        slider.min = String(spec.min);
+        slider.max = String(spec.max);
+        slider.step = String(spec.step);
+        slider.value = String(value);
+        const ticks = getEl('support-collapse-ticks');
+        if (ticks) {
+            ticks.textContent = '';
+            const tick = document.createElement('option');
+            tick.value = String(spec.defaultValue);
+            ticks.appendChild(tick);
+        }
+        const nameEl = getEl('support-collapse-label');
+        if (nameEl) {
+            nameEl.textContent = spec.fixedAlrt !== null
+                ? `UFBoot (SH-aLRT fixed at ${spec.fixedAlrt})` : spec.label;
+        }
+        const valueEl = getEl('support-collapse-value');
+        if (valueEl) valueEl.textContent = spec.format(Number(value));
+        slider.title = `Standard cutoff: ${spec.format(spec.defaultValue)}`;
+        const summaryEl = getEl('support-collapse-summary');
+        if (summaryEl) {
+            const summary = viewer?.getSupportCollapseSummary?.();
+            summaryEl.textContent = summary
+                ? `${summary.collapsed} of ${summary.internal} internal branches collapsed. `
+                    + `Standard cutoff: ${spec.format(spec.defaultValue)}.`
+                : `Standard cutoff: ${spec.format(spec.defaultValue)}.`;
+        }
+    }
+
     function updateSupportUI(stats) {
         if (!stats) return;
+        // Alan 10/3/26 - Keep the collapse controls in step with every support refresh.
+        updateSupportCollapseUI(stats);
         const badge = getEl('support-type-badge');
         const ppInput = getEl('input-pp-threshold');
         const bsInput = getEl('input-bs-threshold');

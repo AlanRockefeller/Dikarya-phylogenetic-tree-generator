@@ -745,6 +745,64 @@ class TestInaturalistTreeSourceLabel(unittest.TestCase):
         self.assertTrue(details["creation_pending"])
         self.assertEqual(details["creation_discovery_attempt"], 2)
 
+    def test_pending_job_id_resolves_verified_result_page(self):
+        observation = {
+            "id": 346029217,
+            "ofvs": [{"name": "DNA Barcode ITS", "value": "ACGT" * 40}],
+        }
+        pending = {
+            "auto_created": True,
+            "creation_pending": True,
+            "creation_pending_job_id": "668497",
+        }
+        result_url = (
+            "https://mycomap.com/genetics/blast-search/"
+            "inat346029217-dna-barcode-its-r668497/"
+        )
+        with (
+            patch("app.services.mycomap_service.find_mycomap_blast_by_known_id",
+                  return_value={"blast_id": "668497", "url": result_url}) as by_id,
+            patch("app.services.mycomap_service.create_mycomap_blast",
+                  side_effect=AssertionError("the search must not be duplicated")),
+            patch.object(inaturalist_tree_service, "set_observation_field_value",
+                         return_value={"id": 1}),
+        ):
+            details = inaturalist_tree_service._create_mycomap_blast_from_observation(
+                observation, 346029217, pending_creation_details=pending
+            )
+
+        self.assertEqual(details["created_blast_id"], "668497")
+        self.assertEqual(details["created_mycomap_url"], result_url)
+        self.assertFalse(details.get("creation_pending"))
+        self.assertTrue(by_id.call_args.kwargs["verify_title"])
+
+    def test_unresolved_job_id_stays_a_job_id(self):
+        observation = {
+            "id": 346029217,
+            "ofvs": [{"name": "DNA Barcode ITS", "value": "ACGT" * 40}],
+        }
+        pending = {
+            "auto_created": True,
+            "creation_pending": True,
+            "creation_pending_job_id": "668497",
+        }
+        with (
+            patch("app.services.mycomap_service.find_mycomap_blast_by_known_id",
+                  return_value=None),
+            patch("app.services.mycomap_service.find_mycomap_blast_by_title",
+                  return_value=None),
+            patch("app.services.mycomap_service.get_mycomap_ncbi_queue_position",
+                  return_value=None),
+            patch("app.services.mycomap_service.create_mycomap_blast",
+                  side_effect=AssertionError("the search must not be duplicated")),
+        ):
+            details = inaturalist_tree_service._create_mycomap_blast_from_observation(
+                observation, 346029217, pending_creation_details=pending
+            )
+
+        self.assertEqual(details["creation_pending_job_id"], "668497")
+        self.assertNotIn("creation_pending_blast_id", details)
+
     def test_auto_created_blast_waits_until_ncbi_results_exist(self):
         mycomap_url = "https://mycomap.com/genetics/blast-search/r42/"
         details = {

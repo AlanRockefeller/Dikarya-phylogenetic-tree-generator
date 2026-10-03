@@ -265,6 +265,38 @@ class TestAutoRootTaxonPreference(unittest.TestCase):
         self.assertEqual(set().union(*distinct_taxon_root_children), {other_1, other_2, other_3})
 
 
+    def test_auto_roots_on_smallest_supported_clade_holding_target_species(self):
+        # The o9w4/u1vq shape: an unnamed focal ("sp."), a weakly supported ingroup,
+        # and a strongly supported outgroup clade with the most distant hit deep inside
+        # it. Rooting on that hit alone split the outgroup species across the root.
+        focal = "iNat1 Amanita sp. 'bisporigera-MX01' Chihuahua MX"
+        ingroup = [f"MW{i} Amanita bisporigera sample" for i in range(1, 5)]
+        p1, p2, p3 = (f"KF{i} Amanita pallidorosea sample" for i in range(1, 4))
+        target = "KY9 Amanita pallidorosea divergent"
+        q = _quote_newick_label
+        newick = (
+            f"((((({q(focal)}:0.1,{q(ingroup[0])}:0.01)10:0.01,{q(ingroup[1])}:0.01)10:0.01,"
+            f"{q(ingroup[2])}:0.01)10:0.01,{q(ingroup[3])}:0.01)10:0.05,"
+            f"(({q(p1)}:0.01,{q(p2)}:0.01)100:0.01,({q(p3)}:0.01,{q(target)}:0.3)20:0.01)100:0.05)R:0.0;"
+        )
+        names = [focal, *ingroup, p1, p2, p3, target]
+
+        with tempfile.TemporaryDirectory() as d:
+            job_dir = Path(d)
+            _write_pruned_tree(job_dir, newick)
+            _write_pruned_alignment(job_dir, [(name, "A" * 100) for name in names])
+            state = _tree_json_with_tips(names)
+            state["sequence_of_interest"] = focal
+
+            out = _reapply_rooting_after_recompute(job_dir, state, "auto", None)
+
+        self.assertEqual(out["root_target"], target)
+        self.assertEqual(out["rooting_info"]["root_clade"]["rooted_on"], "supported_clade")
+        self.assertEqual(out["rooting_info"]["root_clade"]["tip_count"], 4)
+        root_child_sets = [set(_json_tip_names(child)) for child in out["tree_structure"]["children"]]
+        self.assertIn({p1, p2, p3, target}, root_child_sets)
+
+
 @unittest.skipUnless(HAS_BIOPYTHON, "requires BioPython")
 class TestRerootClearsMidpointState(unittest.TestCase):
     NEWICK = "((A:1,B:1)I1:1,(C:1,D:1)I2:1)R:0.0;"

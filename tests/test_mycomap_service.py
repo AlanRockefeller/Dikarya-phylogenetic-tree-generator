@@ -4,6 +4,7 @@ Unit tests for mycomap_service.py
 Tests URL validation logic without requiring network access.
 """
 
+import io
 import unittest
 from unittest.mock import patch
 
@@ -702,6 +703,33 @@ class TestExistingBlastResolution(unittest.TestCase):
             result = mycomap_service.find_mycomap_blast_by_known_id("555", "iNat1 DNA Barcode ITS")
         self.assertIsNone(result)
         by_id.assert_not_called()
+
+    def test_job_id_requires_matching_result_page_title_even_on_listing_hit(self):
+        wrong_url = "https://mycomap.com/genetics/blast-search/inat2-dna-barcode-its-r555/"
+        page = b"<title>iNat2 DNA Barcode ITS - BLAST Search - MycoMap Beta</title>"
+        with patch.object(mycomap_service, "fetch_mycomap_blast_record",
+                          return_value={"status": "complete"}), \
+                patch.object(mycomap_service, "find_mycomap_record_url_by_id",
+                             return_value=wrong_url), \
+                patch.object(mycomap_service, "diagnostic_urlopen",
+                             return_value=io.BytesIO(page)):
+            result = mycomap_service.find_mycomap_blast_by_known_id(
+                "555", "iNat1 DNA Barcode ITS", verify_title=True
+            )
+        self.assertIsNone(result)
+
+    def test_job_id_accepts_matching_result_page_title(self):
+        page = b"<title>iNat1 DNA Barcode ITS - ABC123 - BLAST Search - MycoMap Beta</title>"
+        with patch.object(mycomap_service, "fetch_mycomap_blast_record",
+                          return_value={"status": "complete"}), \
+                patch.object(mycomap_service, "find_mycomap_record_url_by_id",
+                             return_value=None), \
+                patch.object(mycomap_service, "diagnostic_urlopen",
+                             return_value=io.BytesIO(page)):
+            result = mycomap_service.find_mycomap_blast_by_known_id(
+                "555", "iNat1 DNA Barcode ITS", verify_title=True
+            )
+        self.assertEqual(result["blast_id"], "555")
 
 class DropRedundantInatBioMaterialTests(unittest.TestCase):
     drop = staticmethod(mycomap_service._drop_redundant_inat_bio_material)

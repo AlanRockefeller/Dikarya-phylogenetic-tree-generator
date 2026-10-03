@@ -1175,8 +1175,11 @@ def _terminal_names(clade) -> List[str]:
     return [terminal.name for terminal in clade.get_terminals() if terminal.name]
 
 
-def _best_taxon_distinct_outgroup_clade(tree, focal_tip: str,
-                                        target_tip: str) -> Tuple[Any, Dict[str, Any]]:
+def _largest_taxon_distinct_clade(tree, focal_tip: str,
+                                  target_tip: str) -> Tuple[Any, Dict[str, Any]]:
+    """The previous Auto-root clade rule, kept as the fallback for trees with no
+    strongly supported branch to root on: the largest clade around the target, in
+    the tree's current orientation, holding no tip of the focal tip's species."""
     from app.services.tree_rooting_service import _extract_binomial
 
     focal_taxon = _extract_binomial(focal_tip)
@@ -1214,6 +1217,131 @@ def _best_taxon_distinct_outgroup_clade(tree, focal_tip: str,
     }
 
 
+def _strong_support_test(tree, job_dir: Path):
+    """Return a predicate: is this clade's stem strongly supported on the tree's own scale?
+
+    Uses the Claude review's support rules (tree_analysis_service) so auto-root and
+    the review agree on what "strongly supported" means for every builder.
+    """
+    from app.services.tree_analysis_service import (
+        SUPPORT_THRESHOLDS, _classify_support, _clade_support, _is_strongly_supported,
+        resolve_tree_support_context,
+    )
+
+    context = resolve_tree_support_context(job_dir)
+    values: List[float] = []
+    has_dual = False
+    for clade in tree.get_nonterminals():
+        value, dual = _clade_support(clade)
+        if value is not None:
+            values.append(value)
+        has_dual = has_dual or dual is not None
+    support_type = _classify_support(
+        values, has_dual, context.get("tree_method") or "", bool(context.get("alrt_only"))
+    )
+    strong_threshold = SUPPORT_THRESHOLDS.get(support_type, (None, None))[0]
+
+    def is_strong(clade) -> bool:
+        value, dual = _clade_support(clade)
+        return _is_strongly_supported(value, dual, strong_threshold)
+
+    return is_strong, support_type
+
+
+def _best_taxon_distinct_outgroup_clade(tree, focal_tip: str, target_tip: str,
+                                        job_dir: Path) -> Tuple[Any, Dict[str, Any]]:
+    """Pick the clade Auto root should root on, around the chosen target tip.
+
+    Rooting on the target tip alone puts the root inside the target's own group
+    whenever that group has more than one member, so its relatives end up on
+    both sides of the root (half at the top of the drawing, half at the bottom).
+    Instead, walk the branches between the focal tip and the target and take the
+    SMALLEST strongly supported clade on the target's side that
+
+      * holds every tip of the target's species (when the target has one), and
+      * holds no tip of the focal tip's species,
+
+    and, when the focal tip has no species name, staying LOCAL_NEIGHBORHOOD_EDGES
+    clear of it. "Most inclusive"
+    was measured across every job and is wrong: on the long path to the most
+    distant hit there is nearly always a strongly supported ingroup clade, which
+    it then roots inside. No qualifying branch -> the previous unsupported taxon
+    rule (_largest_taxon_distinct_clade), and failing that the target tip.
+    """
+    from app.services.tree_rooting_service import LOCAL_NEIGHBORHOOD_EDGES, _extract_binomial
+
+    tips = {t.name: t for t in tree.get_terminals() if t.name}
+    focal = tips.get(focal_tip)
+    target = tips.get(target_tip)
+    if target is None:
+        return None, {"tip_count": 0, "rooted_on": "target_missing"}
+    fallback = {"tip_count": 1, "rooted_on": "target_tip"}
+    if focal is None or focal is target:
+        return target, fallback
+
+    focal_taxon = _extract_binomial(focal_tip)
+    target_taxon = _extract_binomial(target_tip)
+    if focal_taxon and focal_taxon == target_taxon:
+        return target, fallback
+    is_strong, support_type = _strong_support_test(tree, job_dir)
+
+    # The branches between focal and target, in order from the focal tip. Each
+    # non-root clade is one branch; a bifurcating root's two children share one,
+    # so its support may sit on either child.
+    path_focal = tree.get_path(focal)
+    path_target = tree.get_path(target)
+    common = 0
+    while (common < min(len(path_focal), len(path_target))
+           and path_focal[common] is path_target[common]):
+        common += 1
+    path = list(reversed(path_focal[common:])) + path_target[common:]
+    root_children = list(tree.root.clades)
+
+    all_names = set(tips)
+    taxa = {name: _extract_binomial(name) for name in all_names}
+    candidates = []
+    for hops, clade in enumerate(path, start=1):
+        if clade is focal or clade is target:
+            continue
+        # Without a species name for the focal tip, nothing else stops the root
+        # landing inside the focal's own group, so keep clear of its neighbourhood.
+        if not focal_taxon and hops <= LOCAL_NEIGHBORHOOD_EDGES:
+            continue
+        strong = is_strong(clade)
+        if not strong and clade in root_children and len(root_children) == 2:
+            other = root_children[1] if clade is root_children[0] else root_children[0]
+            strong = is_strong(other)
+        if not strong:
+            continue
+        under = set(_terminal_names(clade))
+        side = under if target_tip in under else all_names - under
+        if focal_taxon and any(taxa[name] == focal_taxon for name in side):
+            continue
+        if target_taxon and any(
+            taxa[name] == target_taxon for name in all_names - side
+        ):
+            continue
+        candidates.append((len(side), clade, side))
+
+    if not candidates:
+        # Measured over every job: where no supported branch qualifies, the old
+        # unsupported taxon rule still splits the target's species less often than
+        # the bare tip does, so it stays as the next fallback.
+        clade, info = _largest_taxon_distinct_clade(tree, focal_tip, target_tip)
+        return clade, dict(info, support_type=support_type)
+
+    size, clade, _side = min(candidates, key=lambda item: item[0])
+    # Rooting on a branch is symmetric, so the clade object of that branch serves
+    # whichever side of it the target is on.
+    return clade, {
+        "tip_count": size,
+        "rooted_on": "supported_clade",
+        "support_type": support_type,
+        "focal_taxon": " ".join(focal_taxon) if focal_taxon else None,
+        "target_taxon": " ".join(target_taxon) if target_taxon else None,
+    }
+
+
 def reroot_tree_on_best_outgroup_clade(job_dir: Path, tree_json: Dict,
                                        focal_tip: str,
                                        target_tip: str) -> Tuple[Dict, Dict[str, Any]]:
@@ -1222,7 +1350,9 @@ def reroot_tree_on_best_outgroup_clade(job_dir: Path, tree_json: Dict,
         return tree_json, {"tip_count": 0, "rooted_on": "biopython_unavailable"}
 
     tree = _read_editable_tree(job_dir, tree_json, "auto-root")
-    target_clade, clade_info = _best_taxon_distinct_outgroup_clade(tree, focal_tip, target_tip)
+    target_clade, clade_info = _best_taxon_distinct_outgroup_clade(
+        tree, focal_tip, target_tip, job_dir
+    )
     if target_clade is None:
         raise ValueError(f"Root target not found: {target_tip}")
 

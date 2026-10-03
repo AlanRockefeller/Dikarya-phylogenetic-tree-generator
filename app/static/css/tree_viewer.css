@@ -550,6 +550,11 @@
     gap: 0.3rem;
 }
 
+/* Alan 10/3/26 - The flex rule above would otherwise override [hidden] (support-collapse slider). */
+.settings-slider[hidden] {
+    display: none;
+}
+
 .settings-slider-head {
     display: flex;
     justify-content: space-between;
