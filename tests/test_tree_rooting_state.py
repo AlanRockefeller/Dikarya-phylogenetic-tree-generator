@@ -295,6 +295,38 @@ class TestAutoRootTaxonPreference(unittest.TestCase):
         self.assertEqual(out["rooting_info"]["root_clade"]["tip_count"], 4)
         root_child_sets = [set(_json_tip_names(child)) for child in out["tree_structure"]["children"]]
         self.assertIn({p1, p2, p3, target}, root_child_sets)
+        # wida: the outgroup must be ONE root child, never spread over a multifurcating root.
+        self.assertEqual(len(root_child_sets), 2)
+
+    def test_outgroup_on_far_side_of_current_root_stays_one_root_child(self):
+        # wida: the chosen branch was the current root's own branch, with the outgroup's
+        # two sub-branches already hanging off the root. Rooting on the ingroup clade
+        # left a three-way root that drew the outgroup on both sides of the ingroup.
+        focal = "iNat1 Inocybe sp. 'flocculosa-CA01' Oregon US"
+        ingroup = [f"MW{i} Inocybe flocculosa sample" for i in range(1, 6)]
+        out_a, out_b, out_c = (f"OR{i} Inocybe semifulva sample" for i in range(1, 4))
+        target = "MW9 Inocybe semifulva divergent"
+        q = _quote_newick_label
+        newick = (
+            f"((((({q(focal)}:0.1,{q(ingroup[0])}:0.01)10:0.01,{q(ingroup[1])}:0.01)10:0.01,"
+            f"{q(ingroup[2])}:0.01)10:0.01,({q(ingroup[3])}:0.01,{q(ingroup[4])}:0.01)10:0.01)100:0.05,"
+            f"({q(out_a)}:0.01,{q(out_b)}:0.01,{q(target)}:0.3)0:0.0,{q(out_c)}:0.01)R:0.0;"
+        )
+        names = [focal, *ingroup, out_a, out_b, out_c, target]
+
+        with tempfile.TemporaryDirectory() as d:
+            job_dir = Path(d)
+            _write_pruned_tree(job_dir, newick)
+            _write_pruned_alignment(job_dir, [(name, "A" * 100) for name in names])
+            state = _tree_json_with_tips(names)
+            state["sequence_of_interest"] = focal
+
+            out = _reapply_rooting_after_recompute(job_dir, state, "auto", None)
+
+        self.assertEqual(out["rooting_info"]["root_clade"]["rooted_on"], "supported_clade")
+        root_child_sets = [set(_json_tip_names(child)) for child in out["tree_structure"]["children"]]
+        self.assertEqual(len(root_child_sets), 2)
+        self.assertIn({out_a, out_b, out_c, target}, root_child_sets)
 
 
 @unittest.skipUnless(HAS_BIOPYTHON, "requires BioPython")

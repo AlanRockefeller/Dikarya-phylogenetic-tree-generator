@@ -1356,8 +1356,67 @@ def reroot_tree_on_best_outgroup_clade(job_dir: Path, tree_json: Dict,
     if target_clade is None:
         raise ValueError(f"Root target not found: {target_tip}")
 
+    # The chosen branch's clade object may be the INGROUP side (the outgroup is its
+    # complement in the tree's current orientation). Rooting on that leaves a
+    # multifurcating root with the outgroup scattered over several root children,
+    # which the viewer can draw on both sides of the ingroup (wida). Root on the
+    # outgroup side itself: orient away from the focal tip first, where the outgroup
+    # is a real clade, then root on that clade.
+    outgroup_names = set(_terminal_names(target_clade))
+    if target_tip not in outgroup_names:
+        outgroup_names = set(_terminal_names(tree.root)) - outgroup_names
+        focal = next((t for t in tree.get_terminals() if t.name == focal_tip), None)
+        if focal is None:
+            raise ValueError(f"Focal tip not found: {focal_tip}")
+        reroot_preserving_support(tree, lambda: tree.root_with_outgroup(focal))
+        members = [t for t in tree.get_terminals() if t.name in outgroup_names]
+        target_clade = tree.common_ancestor(members)
+        if set(_terminal_names(target_clade)) != outgroup_names:
+            raise ValueError("Outgroup is not a clade after orienting on the focal tip")
+
     reroot_preserving_support(tree, lambda: tree.root_with_outgroup(target_clade))
+    _group_outgroup_at_root(tree, outgroup_names)
+    _split_root_branch(tree)
     return _write_rerooted_tree(job_dir, tree_json, tree, target_tip), clade_info
+
+
+def _split_root_branch(tree) -> None:
+    """Place the root halfway along the branch it sits on.
+
+    root_with_outgroup puts the whole branch on one side and 0 on the other; a
+    zero-length outgroup stem then reads as "no divergence at all" and the viewer's
+    zero-length grouping treats it as part of a polytomy. Splitting the length
+    keeps every tip-to-tip distance unchanged.
+    """
+    children = list(tree.root.clades)
+    if len(children) != 2:
+        return
+    total = sum(float(c.branch_length or 0.0) for c in children)
+    if total <= 0:
+        return
+    for child in children:
+        child.branch_length = total / 2
+
+
+def _group_outgroup_at_root(tree, outgroup_names: set) -> None:
+    """Make the outgroup ONE child of the root.
+
+    Biopython roots AT the outgroup node when its stem has zero length (which it
+    does after any earlier reroot on that branch), leaving the outgroup's own
+    children as separate root children beside the ingroup -- drawn on both sides
+    of it. Regroup them under one zero-length clade so the root is a clean split.
+    """
+    from Bio.Phylo.BaseTree import Clade
+
+    children = list(tree.root.clades)
+    if len(children) <= 2:
+        return
+    members = [c for c in children if set(_terminal_names(c)) <= outgroup_names]
+    covered = set().union(*(set(_terminal_names(c)) for c in members)) if members else set()
+    if len(members) < 2 or covered != outgroup_names or len(members) == len(children):
+        return
+    group = Clade(branch_length=0.0, clades=members)
+    tree.root.clades = [c for c in children if c not in members] + [group]
 
 
 def midpoint_root(job_dir: Path, tree_json: Dict) -> Dict:

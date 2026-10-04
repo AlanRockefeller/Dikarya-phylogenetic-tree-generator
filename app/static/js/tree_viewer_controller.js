@@ -835,6 +835,7 @@ document.addEventListener('DOMContentLoaded', async () => {
     let annotationRevision = 0;
     // Alan 8/15/26 - Editor session: what is being added/edited and for which tips.
     let annotationEditorState = null;
+    let annotationMembershipPicker = null;
     const ANNOTATION_STYLE_FIELDS = [
         { field: 'font_family', label: 'Font' },
         { field: 'font_size', label: 'Size' },
@@ -1828,6 +1829,104 @@ document.addEventListener('DOMContentLoaded', async () => {
         return true;
     }
 
+    function updateAnnotationMembershipPicker() {
+        if (!annotationMembershipPicker || !viewer) return;
+        const selected = viewer.getSelectedAnnotationLeafIds?.() || [];
+        const count = selected.length;
+        const status = getEl('annotation-membership-status');
+        const save = getEl('btn-annotation-membership-save');
+        const clade = count && viewer.getSelectedCladeLeafIds?.();
+        const type = canonicalAnnotationType(annotationMembershipPicker.annotationType);
+        const branchType = !CLADE_ANNOTATION_TYPES.includes(type);
+        const missingBranch = clade && branchType
+            && !viewer.hasIncomingBranchForMemberIds?.(clade);
+        const invalidBranch = branchType && (!clade || missingBranch);
+        if (save) {
+            save.disabled = !count || invalidBranch || annotationMembershipPicker.saving;
+            save.textContent = annotationMembershipPicker.saving ? 'Saving…'
+                : annotationMembershipPicker.confirmSelectedGroup && !clade
+                    ? 'Save selected group anyway' : 'Save members';
+        }
+        const cancel = getEl('btn-annotation-membership-cancel');
+        if (cancel) cancel.disabled = annotationMembershipPicker.saving;
+        if (!status) return;
+        if (!count) status.textContent = 'Select at least one tip. Click tips or drag a box; Cancel restores your previous selection.';
+        else if (missingBranch) status.textContent = 'This annotation type needs a clade with an incoming branch.';
+        else if (invalidBranch) status.textContent = 'This annotation type needs one complete clade.';
+        else if (!clade) status.textContent = annotationMembershipPicker.confirmSelectedGroup
+            ? `${count} tips across multiple clades. Save this explicitly selected group?`
+            : `${count} tips across multiple clades. Saving will label them as a selected group; review before confirming.`;
+        else status.textContent = `${count} selected tip${count === 1 ? '' : 's'}. Click tips or drag a box to add or remove members.`;
+    }
+
+    function startAnnotationMembershipPicker(annotationId) {
+        if (!annotationsEditable() || !viewer?.selectLeafIds) return;
+        const annotation = cladeAnnotations.find(item => item.id === annotationId);
+        if (!annotation) return;
+        annotationMembershipPicker = {
+            annotationId,
+            annotationType: annotation.annotation_type,
+            previousSelection: viewer.getSelectedAnnotationLeafIds?.() || [],
+            confirmSelectedGroup: false,
+            saving: false
+        };
+        closeAnnotationManager();
+        viewer.selectLeafIds(annotation.member_tip_ids || []);
+        getEl('annotation-membership-label').textContent = annotation.label;
+        getEl('annotation-membership-picker')?.classList.remove('hidden');
+        updateButtons();
+    }
+
+    function closeAnnotationMembershipPicker(restoreSelection, force = false) {
+        if (annotationMembershipPicker?.saving && !force) return;
+        const previous = annotationMembershipPicker?.previousSelection;
+        annotationMembershipPicker = null;
+        getEl('annotation-membership-picker')?.classList.add('hidden');
+        if (restoreSelection && previous && viewer?.selectLeafIds) {
+            viewer.selectLeafIds(previous);
+            updateButtons();
+        }
+    }
+
+    async function saveAnnotationMembershipPicker() {
+        if (!annotationMembershipPicker || annotationMembershipPicker.saving || !viewer) return;
+        const selected = viewer.getSelectedAnnotationLeafIds?.() || [];
+        if (!selected.length) return;
+        const clade = viewer.getSelectedCladeLeafIds?.();
+        const type = canonicalAnnotationType(annotationMembershipPicker.annotationType);
+        if (!CLADE_ANNOTATION_TYPES.includes(type)
+            && (!clade || !viewer.hasIncomingBranchForMemberIds?.(clade))) return;
+        if (!clade && !annotationMembershipPicker.confirmSelectedGroup) {
+            annotationMembershipPicker.confirmSelectedGroup = true;
+            updateAnnotationMembershipPicker();
+            return;
+        }
+        const index = cladeAnnotations.findIndex(item => item.id === annotationMembershipPicker.annotationId);
+        if (index < 0) return;
+        const original = cladeAnnotations[index];
+        const changed = !sameTipIdSet(original.member_tip_ids, selected)
+            || Boolean(original.membership_mode) !== !clade;
+        if (!changed) {
+            closeAnnotationMembershipPicker(false);
+            showStatus('Annotation members are unchanged.', 'info', 2000);
+            return;
+        }
+        const updated = { ...original, member_tip_ids: selected.slice() };
+        if (clade) delete updated.membership_mode;
+        else updated.membership_mode = 'selection';
+        annotationMembershipPicker.saving = true;
+        updateAnnotationMembershipPicker();
+        cladeAnnotations[index] = updated;
+        const saved = await saveAnnotationsNow();
+        if (saved) {
+            closeAnnotationMembershipPicker(false, true);
+            showStatus(`Updated members of "${updated.label}".`, 'success', 2500);
+        } else if (annotationMembershipPicker) {
+            annotationMembershipPicker.saving = false;
+            updateAnnotationMembershipPicker();
+        }
+    }
+
     async function deleteCurrentAnnotation() {
         if (!annotationEditorState || annotationEditorState.mode !== 'edit') return;
         const id = annotationEditorState.annotationId;
@@ -1955,6 +2054,9 @@ document.addEventListener('DOMContentLoaded', async () => {
             // Mutating controls simply are not rendered for read-only viewers; the server
             // rejects the requests regardless, so this is presentation only.
             if (annotationsEditable()) {
+                row.appendChild(annotationIconButton('fas fa-users', 'Edit members', () => {
+                    startAnnotationMembershipPicker(annotation.id);
+                }));
                 row.appendChild(annotationIconButton('fas fa-pen', 'Edit annotation', () => {
                     openAnnotationEditor('edit', { annotationId: annotation.id });
                 }));
@@ -3330,6 +3432,8 @@ document.addEventListener('DOMContentLoaded', async () => {
             button.addEventListener('click', () => setAnnotationManagerTab(button.getAttribute('data-annotation-tab')));
         });
         getEl('btn-annotation-add-selected')?.addEventListener('click', annotateCurrentSelection);
+        getEl('btn-annotation-membership-cancel')?.addEventListener('click', () => closeAnnotationMembershipPicker(true));
+        getEl('btn-annotation-membership-save')?.addEventListener('click', saveAnnotationMembershipPicker);
         getEl('btn-annotation-add-layer')?.addEventListener('click', async () => {
             if (!annotationsEditable()) return;
             createAnnotationLayer(`Layer ${annotationLayers.length + 1}`);
@@ -4594,6 +4698,10 @@ document.addEventListener('DOMContentLoaded', async () => {
             // Alan 8/15/26 - Escape closes the annotation editor first, then the manager behind it,
             // matching how the Rename modal already behaves.
             if (e.key === 'Escape') {
+                if (annotationMembershipPicker) {
+                    closeAnnotationMembershipPicker(true);
+                    return;
+                }
                 const editorModal = getEl('modal-annotation-editor');
                 if (editorModal && !editorModal.classList.contains('hidden')) {
                     closeAnnotationEditor();
@@ -4732,6 +4840,10 @@ document.addEventListener('DOMContentLoaded', async () => {
         // action is in flight, and before a tree has finished loading.
         updateUndoButton();
         if (!viewer) return;
+        if (annotationMembershipPicker) {
+            annotationMembershipPicker.confirmSelectedGroup = false;
+            updateAnnotationMembershipPicker();
+        }
 
         // Multi-select check
         let selCount = 0;

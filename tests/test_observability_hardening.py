@@ -525,6 +525,31 @@ def test_telemetry_links_failed_request_and_client_environment(tmp_path, clean_l
     assert record.req != "abcdef123456"  # Collector request and failed request are distinct.
 
 
+def test_hidden_or_preview_asset_failures_stay_out_of_error_mirror(
+    tmp_path, clean_logging, no_telemetry_dedup,
+):
+    app = _make_app(tmp_path)
+    capture = _Capture()
+    logging.getLogger().addHandler(capture)
+    cases = [
+        ("hidden", "Mozilla/5.0", logging.INFO),
+        ("visible", "Mozilla/5.0 meta-externalagent/1.1", logging.INFO),
+        ("visible", "Mozilla/5.0", logging.ERROR),
+    ]
+    for visibility, agent, expected in cases:
+        capture.records.clear()
+        response = app.test_client().post(
+            "/api/log/client",
+            json={"event": "resource_load_failed", "pathname": "/tree",
+                  "action": "link", "message": "/static/vendor/fontawesome.min.css",
+                  "visibility": visibility},
+            headers={"User-Agent": agent},
+        )
+        assert response.status_code == 200
+        record = next(r for r in capture.records if "event=client.resource_load_failed" in r.getMessage())
+        assert record.levelno == expected
+
+
 def test_telemetry_rejects_malformed_metadata_and_non_object_payload(tmp_path, clean_logging, no_telemetry_dedup):
     app = _make_app(tmp_path)
     capture = _Capture()

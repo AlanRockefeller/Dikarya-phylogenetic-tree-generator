@@ -5985,7 +5985,16 @@ def log_client_error():
     except Exception:
         pass
 
-    current_app.logger.error(
+    browser_agent = sanitize_telemetry_text(request.headers.get("User-Agent"), 200)
+    # Link-load events from preview crawlers and hidden tabs are common and
+    # rarely signal a broken page for an active visitor. Retain them in the
+    # web log, but keep the WARNING+ mirror focused on actionable failures.
+    log_event = current_app.logger.info if (
+        event == "resource_load_failed" and (
+            visibility != "visible" or "meta-externalagent/" in browser_agent.lower()
+        )
+    ) else current_app.logger.error
+    log_event(
         "event=client.%s Browser failure pathname=%s job_id=%s action=%s "
         "message=%s fingerprint=%s release=%s client_release=%s "
         "server_request_id=%s method=%s http_status=%s duration_ms=%s "
@@ -5994,7 +6003,7 @@ def log_client_error():
         current_app.config.get("RELEASE_VERSION", "unknown"),
         client_release, server_request_id, method, http_status,
         bounded_integer("duration_ms", 3_600_000), online, visibility,
-        sanitize_telemetry_text(request.headers.get("User-Agent"), 200), stack or "-",
+        browser_agent, stack or "-",
     )
     return jsonify({"status": "logged"}), 200
 

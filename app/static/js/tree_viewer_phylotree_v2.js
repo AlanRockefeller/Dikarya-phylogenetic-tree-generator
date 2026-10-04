@@ -1310,7 +1310,10 @@
             const pending = [tip];
             while (pending.length) {
                 const node = pending.pop();
-                if (node.parent && this._hasZeroLengthIncomingBranch(node)
+                // Alan 10/4/26 - Never climb into the root: a zero-length branch hanging off the
+                // root (an outgroup rooted on a zero-length stem) would otherwise splice that
+                // whole side into the root and scatter it beside the ingroup (job wida).
+                if (node.parent && node.parent.parent && this._hasZeroLengthIncomingBranch(node)
                     && !component.has(node.parent)) {
                     component.add(node.parent);
                     pending.push(node.parent);

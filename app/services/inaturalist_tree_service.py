@@ -2659,10 +2659,14 @@ def reconcile_delayed_ncbi_results(job_id: str) -> Dict[str, Any]:
         rerun_details["ncbi_recheck_count"] = recheck_count
         rerun_details["ncbi_last_rechecked_at"] = datetime.now(timezone.utc).isoformat()
 
-        queue_position = get_mycomap_ncbi_queue_position(
+        retry_failed_download = bool(rerun_details.get("ncbi_download_failed"))
+        queue_position = None if retry_failed_download else get_mycomap_ncbi_queue_position(
             mycomap_url, blast_id=blast_id
         )
-        if reference["provider"] == "org":
+        if retry_failed_download:
+            # The search was already complete; the export itself failed.
+            count, _warnings = 1, []
+        elif reference["provider"] == "org":
             try:
                 ncbi_record = org_status(blast_id).get("ncbi") or {}
                 count = 1 if ncbi_record.get("has_results") and ncbi_record.get("status") == "complete" else 0
@@ -2726,8 +2730,8 @@ def reconcile_delayed_ncbi_results(job_id: str) -> Dict[str, Any]:
         # rechecks -- the sequences were then never picked up. Leave the status alone
         # and reschedule so the next pass can try again.
         partial_download = False
-        if fetch_result.get("failed_sources"):
-            errors = "; ".join(fetch_result.get("errors") or []) or "unknown error"
+        if fetch_result.get("failed_sources") or not fasta_text.strip():
+            errors = "; ".join(fetch_result.get("errors") or []) or "NCBI export was empty"
             # Bounded by the same budget as the "still waiting" path, so a persistently
             # broken endpoint gives up instead of rescheduling forever.
             max_hours = get_mycomap_ncbi_recheck_max_hours()
@@ -2797,6 +2801,7 @@ def reconcile_delayed_ncbi_results(job_id: str) -> Dict[str, Any]:
 
         rerun_details["ncbi_status"] = "partial" if partial_download else "available"
         rerun_details["ncbi_fallback_local_only"] = False
+        rerun_details.pop("ncbi_download_failed", None)
         rerun_details["ncbi_appended_at"] = datetime.now(timezone.utc).isoformat()
         rerun_details["ncbi_appended_count"] = added_count
         rerun_details["ncbi_recompute_pending"] = added_count > 0 or matched_count > 0
@@ -2809,6 +2814,12 @@ def reconcile_delayed_ncbi_results(job_id: str) -> Dict[str, Any]:
                 "were added, but some BLAST hits are missing."
             ]
         metrics["mycomap_blast_rerun"] = rerun_details
+        if not partial_download:
+            metrics["mycomap_refresh_warnings"] = [
+                warning for warning in metrics.get("mycomap_refresh_warnings") or []
+                if "NCBI export failed" not in warning
+                and "NCBI download is being retried" not in warning
+            ]
         db_job.metrics = metrics
         db.session.commit()
 
@@ -3117,6 +3128,7 @@ def prepare_inat_tree_job(observation_id: int, *, include_ncbi: bool = True,
             status=status if status in (400, 404, 409, 422, 502) else 502,
         )
     pending_sources = set((payload or {}).get("pending_sources") or [])
+    failed_sources = set((payload or {}).get("failed_sources") or [])
     if "ncbi" in pending_sources:
         queue_position = (payload or {}).get("ncbi_queue_position")
         mycomap_rerun_details["ncbi_status"] = "queued"
@@ -3135,6 +3147,19 @@ def prepare_inat_tree_job(observation_id: int, *, include_ncbi: bool = True,
         )
         mycomap_rerun_details["warnings"] = list(dict.fromkeys(
             list(mycomap_rerun_details.get("warnings") or []) + [backlog_warning]
+        ))
+    elif include_ncbi and "ncbi" in failed_sources and (payload or {}).get("sequences"):
+        # The NCBI export can fail after MycoMap has already marked the search
+        # complete. Use the same delayed append/rebuild path as a queued search,
+        # but have the recheck try the download directly rather than waiting for
+        # a result-count endpoint that may also be unavailable.
+        mycomap_rerun_details["ncbi_fallback_local_only"] = True
+        mycomap_rerun_details["ncbi_download_failed"] = True
+        mycomap_rerun_details["warnings"] = list(dict.fromkeys(
+            list(mycomap_rerun_details.get("warnings") or []) + [
+                "MycoMap's NCBI export failed; this tree uses local results only. "
+                "Dikarya will retry hourly and rebuild when NCBI sequences can be downloaded."
+            ]
         ))
     sequences = (payload or {}).get('sequences') or []
     if len(sequences) < 2:

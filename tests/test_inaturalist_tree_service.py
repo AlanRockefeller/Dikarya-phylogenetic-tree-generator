@@ -906,6 +906,31 @@ class TestInaturalistTreeSourceLabel(unittest.TestCase):
         self.assertTrue(prepared["metrics"]["mycomap_ncbi_blast_rebuilt"])
         self.assertIn(">AB123456 Example one", prepared["job_params"]["sequence"])
 
+    def test_failed_ncbi_export_marks_local_tree_for_recheck(self):
+        mycomap_url = "https://mycomap.com/genetics/blast-search/r42/"
+        payload = {
+            "sequences": [
+                {"name": "Local one", "sequence": "ACGT" * 40},
+                {"name": "Local two", "sequence": "TGCA" * 40},
+            ],
+            "failed_sources": ["ncbi"], "pending_sources": [],
+        }
+        with (
+            patch.object(inaturalist_tree_service, "fetch_observation",
+                         return_value={"id": 123456789}),
+            patch.object(inaturalist_tree_service, "extract_observation_field_value",
+                         return_value=mycomap_url),
+            patch("app.api.routes.gather_mycomap_sequences_for_queue",
+                  return_value=(payload, None)),
+        ):
+            prepared = inaturalist_tree_service.prepare_inat_tree_job(
+                123456789, skip_mycomap_refresh=True,
+            )
+        rerun = prepared["metrics"]["mycomap_blast_rerun"]
+        self.assertTrue(rerun["ncbi_fallback_local_only"])
+        self.assertTrue(rerun["ncbi_download_failed"])
+        self.assertIn("retry hourly", prepared["metrics"]["mycomap_refresh_warnings"][0])
+
     def test_auto_created_blast_uses_queue_position_without_probing_fasta(self):
         details = {
             "auto_created": True,
