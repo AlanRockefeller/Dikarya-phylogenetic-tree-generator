@@ -360,6 +360,8 @@
                     <div class="flex items-center gap-2">
                         <button id="vs_btn_preview" type="button" class="vs-bar-primary disabled:opacity-50"
                             {% if not credential.connected %}disabled{% endif %}>Preview</button>
+                        <button id="vs_btn_resume" type="button" class="vs-bar-secondary hidden"
+                            title="Carry on from where this preview was paused">Resume</button>
                     </div>
                     <div class="flex items-center gap-2">
                         <button id="vs_btn_clear" type="button" class="vs-bar-danger disabled:opacity-50" disabled>Clear results</button>
@@ -370,6 +372,9 @@
                     </div>
                 </div>
             </section>
+
+            <p id="vs_coverage" class="hidden rounded-md border border-amber-300 bg-amber-50 px-4 py-3 text-sm text-amber-900
+                dark:border-[#6e5629] dark:bg-[#2a3a26] dark:text-[#f0d69a]" role="status"></p>
 
             <section class="bg-white dark:bg-[#15201a] border border-gray-200 dark:border-[#2a3a2f] rounded-md shadow-sm overflow-hidden">
                 <div class="overflow-x-auto">
@@ -455,6 +460,9 @@
         polling: null,
         busy: false,          // a run is queued/running (set before polling starts)
         selected: new Set(),
+        cancelRequested: false,   // Pause clicked; the worker has not stopped yet
+        pausedRun: null,          // the paused run the Resume button would continue
+        coverage: null,           // {done, total, partial} for the shown preview
         filters: new Set(), // active chip filters; empty = show everything
     };
 
@@ -629,9 +637,10 @@
         btnClear.disabled = busy || !hasRows;
         // A finished run reruns the same settings, so the verb changes.
         // One button, two roles: it starts a run, and stops the one in flight.
-        btnPreview.textContent = busy ? 'Stop' : (hasRows ? 'Preview again' : 'Preview');
+        btnPreview.textContent = state.cancelRequested ? 'Pausing...'
+                               : (busy ? 'Pause' : (hasRows ? 'Preview again' : 'Preview'));
         btnPreview.classList.toggle('vs-bar-stop', busy);
-        btnPreview.title = busy ? 'Stop the run in progress' : '';
+        btnPreview.title = busy ? 'Pause this run; resuming keeps the rows already scanned' : '';
         if (state.runId && hasRows) {
             btnExport.href = `/api/voucher-sync/runs/${state.runId}/export.csv`;
             btnExport.classList.remove('opacity-50', 'pointer-events-none');
@@ -645,11 +654,18 @@
 
     function setBusy(busy) {
         state.busy = busy;
+        if (!busy) state.cancelRequested = false;
         // Stays enabled while running - it is the Stop control then.
         btnPreview.disabled = !CONNECTED;
         updateChips();
     }
     function clearResults() {
+        const banner = el('vs_coverage');
+        banner.classList.add('hidden');
+        banner.textContent = '';
+        state.coverage = null;
+        state.pausedRun = null;
+        el('vs_btn_resume').classList.add('hidden');
         state.rows.clear(); state.order = []; state.selected.clear();
         state.cursor = 0; state.logCursor = 0;
         rowsBody.innerHTML = ''; logBox.innerHTML = '';
@@ -672,6 +688,10 @@
         if (custom) el('vs_custom_regex').focus();
     }
     document.querySelectorAll('input[name="vs_format"]').forEach(r => r.addEventListener('change', refreshFormatUI));
+    ['vs_field_id', 'vs_date_start', 'vs_date_end', 'vs_custom_regex'].forEach(id =>
+        el(id).addEventListener('change', () => { if (state.pausedRun) showResume(state.pausedRun); }));
+    document.querySelectorAll('input[name="vs_format"], input[name="vs_date_mode"]').forEach(r =>
+        r.addEventListener('change', () => { if (state.pausedRun) showResume(state.pausedRun); }));
     refreshFormatUI();
 
     function refreshDateUI() {
@@ -827,6 +847,8 @@
         updateChips();
 
         const active = data.status === 'queued' || data.status === 'running';
+        // Coverage can only be judged once the run has stopped moving.
+        if (data.kind === 'scan' && !active) markCoverage(data);
         if (active) {
             setStatus(data.status === 'queued' ? 'Waiting for a worker...' : (data.kind === 'apply' ? 'Applying updates...' : 'Scanning photos...'), 'busy');
             state.polling = setTimeout(() => pollOnce(runId), POLL_MS);
@@ -846,6 +868,11 @@
             state.applyRunId = null;
             // Re-read the preview so applied rows show their final state.
             await reloadPreview(state.runId);
+        } else if (data.status === 'paused') {
+            setStatus('Paused', 'error',
+                      `${state.rows.size} of ${data.progress_total || state.rows.size} scanned`);
+            markCoverage(data);
+            showResume(data);
         } else {
             const s = data.summary || {};
             setStatus(data.status === 'cancelled' ? 'Preview stopped' : 'Preview complete', 'ok',
@@ -867,6 +894,8 @@
         if (kind === 'scan') { state.runId = runId; state.cursor = 0; }
         else { state.applyRunId = runId; state.cursor = 0; }
         state.kind = kind;
+        el('vs_btn_resume').classList.add('hidden');
+        state.pausedRun = null;
         setBusy(true);
         pollOnce(runId);
     }
@@ -875,13 +904,21 @@
     async function cancelRun() {
         const id = state.kind === 'apply' ? state.applyRunId : state.runId;
         if (!id) return;
-        btnPreview.disabled = true;          // re-enabled by setBusy on the terminal poll
+        // Acknowledge the click immediately. The worker only notices the flag
+        // between rows, so there is a wait here -- saying nothing during it is
+        // what made Stop look broken.
+        state.cancelRequested = true;
+        btnPreview.textContent = 'Pausing...';
+        btnPreview.disabled = true;
+        setStatus('Pausing - waiting for the rows already in progress to finish...', 'busy');
         const { ok, data } = await api(`/api/voucher-sync/runs/${id}/cancel`, { method: 'POST', body: '{}' });
         if (!ok) {
-            showStatus(data.error || 'Could not stop the run.', 'error');
+            state.cancelRequested = false;
+            showStatus(data.error || 'Could not pause the run.', 'error');
+            setStatus('Could not pause the run.', 'error');
             btnPreview.disabled = !CONNECTED;
         } else {
-            setStatus('Stopping...', 'busy');
+            showStatus('Pausing after the rows already in progress.', 'info');
         }
     }
 
@@ -943,12 +980,14 @@
     btnApply.addEventListener('click', () => {
         const c = applyCounts();
         if (!c.total) { showStatus('Select at least one Update row.', 'error'); return; }
+        const cov = state.coverage;
         const body = el('vs_apply_modal_body');
         body.innerHTML = `
             <p>This will write <strong>${c.total}</strong> voucher number(s) to iNaturalist field
                <strong>${esc(fieldInput.value || ('#' + el('vs_field_id').value))}</strong>.</p>
             ${c.ocr ? `<p class="text-blue-700 dark:text-blue-300"><i class="fas fa-eye mr-1"></i>${c.ocr} value(s) came from OCR - please double-check them in the table.</p>` : ''}
             ${c.overwrite ? `<p class="text-amber-700 dark:text-amber-300"><i class="fas fa-triangle-exclamation mr-1"></i>${c.overwrite} observation(s) already have a different value that will be <strong>overwritten</strong>.</p>` : ''}
+            ${cov && cov.partial ? `<p class="text-amber-700 dark:text-amber-300"><i class="fas fa-circle-exclamation mr-1"></i>This preview only covered <strong>${cov.done} of ${cov.total}</strong> observations, so this is not the whole window.</p>` : ''}
             <p class="text-xs text-gray-500 dark:text-gray-400">Writes are paced at about one per second.</p>`;
         openApplyModal();
     });
@@ -1003,6 +1042,81 @@
         el('vs_log_caret').className = hidden ? 'fas fa-chevron-down text-gray-400' : 'fas fa-chevron-up text-gray-400';
     });
 
+    // Resume is offered only for a paused run, and only while its settings still
+    // match the form -- resuming with a different pattern would mix rows judged
+    // by different rules into one preview.
+    function formMatchesRun(run) {
+        const p = run.params || {};
+        const f = selectedFormat();
+        const range = document.querySelector('input[name="vs_date_mode"]:checked').value === 'range';
+        return String(p.field_id) === String(el('vs_field_id').value)
+            && String(p.date_start || '') === el('vs_date_start').value
+            && String(p.date_end || '') === (range ? el('vs_date_end').value : el('vs_date_start').value)
+            && String(p.regex || '') === String(f.value === 'Custom' ? el('vs_custom_regex').value : (f.dataset.regex || ''));
+    }
+
+    function showResume(run) {
+        const btn = el('vs_btn_resume');
+        state.pausedRun = (run && run.status === 'paused') ? run : null;
+        if (!state.pausedRun) { btn.classList.add('hidden'); return; }
+        btn.classList.remove('hidden');
+        btn.disabled = false;
+        const drifted = !formMatchesRun(run);
+        btn.title = drifted
+            ? 'The settings above no longer match this paused preview; resuming uses the original settings'
+            : 'Carry on from where this preview was paused';
+        btn.textContent = drifted ? 'Resume (original settings)' : 'Resume';
+    }
+
+    el('vs_btn_resume').addEventListener('click', async () => {
+        const run = state.pausedRun;
+        if (!run) return;
+        if (!formMatchesRun(run)) {
+            const p = run.params || {};
+            const ok = confirm(
+                `This paused preview used field #${p.field_id}, ${p.date_start}` +
+                (p.date_end && p.date_end !== p.date_start ? ` to ${p.date_end}` : '') +
+                `, which no longer matches the settings above.\n\n` +
+                `Resume continues with the ORIGINAL settings so every row was judged the same way. ` +
+                `To use the settings above instead, press Preview for a fresh run.`);
+            if (!ok) return;
+        }
+        el('vs_btn_resume').disabled = true;
+        setStatus('Resuming...', 'busy');
+        const { ok, status, data } = await api(`/api/voucher-sync/runs/${run.id}/resume`, { method: 'POST', body: '{}' });
+        if (!ok) {
+            el('vs_btn_resume').disabled = false;
+            showStatus(data.error || `Could not resume (HTTP ${status}).`, 'error');
+            setStatus('Paused', 'error');
+            return;
+        }
+        log(`Resuming from ${data.resumed_from} of ${data.total}.`);
+        el('vs_btn_resume').classList.add('hidden');
+        startPolling(data.run_id, 'scan');
+    });
+
+    // Partial coverage has to be impossible to miss: it changes what Apply means.
+    function markCoverage(run) {
+        const done = run.progress_done || 0;
+        const total = run.progress_total || 0;
+        const banner = el('vs_coverage');
+        state.coverage = { done, total, partial: !!(total && done < total) };
+        if (!state.coverage.partial) {
+            banner.classList.add('hidden');
+            banner.textContent = '';
+            return;
+        }
+        const missed = total - done;
+        const resumable = run.status === 'paused';
+        banner.innerHTML = `<strong>${resumable ? 'Paused at' : 'This preview covers'} ` +
+            `${done} of ${total} observations.</strong> ` +
+            `${missed} ${missed === 1 ? 'was' : 'were'} never scanned, so anything needing a voucher ` +
+            `among them is not shown here. ` +
+            (resumable ? `<strong>Resume</strong> carries on from here without rescanning the ${done} already done.`
+                       : `Run the preview again to cover them.`);
+        banner.classList.remove('hidden');
+    }
+
     // ---------- resume on reload ----------
     (async function resume() {
         if (!CONNECTED) { setStatus('Connect your iNaturalist account to begin.'); return; }
@@ -1019,14 +1133,25 @@
         }
         const last = await api('/api/voucher-sync/runs');
         if (last.ok) {
-            const scan = (last.data.runs || []).find(r => r.kind === 'scan' && r.status !== 'failed' && r.summary);
+            const scan = (last.data.runs || []).find(r => r.kind === 'scan' && r.status !== 'failed'
+                                                        && (r.summary || r.status === 'paused'));
             if (scan) {
                 state.runId = scan.id;
                 await reloadPreview(scan.id);
-                const s = scan.summary || {};
-                setStatus('Preview complete', 'ok',
-                          `${relativeTime(scan.created_at)} \u00b7 ${scan.created_at.slice(11, 16)} UTC`);
+                const when = `${relativeTime(scan.created_at)} \u00b7 ${scan.created_at.slice(11, 16)} UTC`;
+                // Report what the run actually was. A cancelled run is a
+                // partial scan, and saying "complete" invites applying it as
+                // though it covered everything.
+                if (scan.status === 'paused') {
+                    setStatus('Paused', 'error', when);
+                } else if (scan.status === 'cancelled') {
+                    setStatus('Preview stopped', 'error', when);
+                } else {
+                    setStatus('Preview complete', 'ok', when);
+                }
                 setProgress(scan.progress_done || 0, scan.progress_total || 0);
+                markCoverage(scan);
+                showResume(scan);
             }
         }
     })();

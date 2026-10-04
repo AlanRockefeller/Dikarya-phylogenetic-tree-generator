@@ -189,7 +189,7 @@ class VoucherSyncRun(db.Model):
     __table_args__ = (
         db.CheckConstraint("kind in ('scan', 'apply')", name='ck_voucher_sync_run_kind'),
         db.CheckConstraint(
-            "status in ('queued', 'running', 'completed', 'cancelled', 'failed')",
+            "status in ('queued', 'running', 'completed', 'cancelled', 'paused', 'failed')",
             name='ck_voucher_sync_run_status'),
         db.Index('ix_voucher_sync_run_user_created', 'user_id', 'created_at'),
     )
@@ -221,6 +221,14 @@ class VoucherSyncRun(db.Model):
                                                       passive_deletes=True))
 
     ACTIVE_STATUSES = ('queued', 'running')
+    # A paused scan is not active -- the page stops polling it -- but its rows
+    # and params are intact, so it can be continued rather than rescanned.
+    RESUMABLE_STATUSES = ('paused',)
+
+    @property
+    def is_partial(self) -> bool:
+        """True when the run covered fewer observations than it found."""
+        return bool(self.progress_total and (self.progress_done or 0) < self.progress_total)
 
     def to_dict(self) -> Dict[str, Any]:
         return {
