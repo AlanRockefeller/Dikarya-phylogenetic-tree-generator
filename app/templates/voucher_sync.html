@@ -688,7 +688,7 @@
         if (custom) el('vs_custom_regex').focus();
     }
     document.querySelectorAll('input[name="vs_format"]').forEach(r => r.addEventListener('change', refreshFormatUI));
-    ['vs_field_id', 'vs_date_start', 'vs_date_end', 'vs_custom_regex'].forEach(id =>
+    ['vs_field_id', 'vs_date_start', 'vs_date_end', 'vs_custom_regex', 'vs_use_ocr', 'vs_overwrite'].forEach(id =>
         el(id).addEventListener('change', () => { if (state.pausedRun) showResume(state.pausedRun); }));
     document.querySelectorAll('input[name="vs_format"], input[name="vs_date_mode"]').forEach(r =>
         r.addEventListener('change', () => { if (state.pausedRun) showResume(state.pausedRun); }));
@@ -736,6 +736,7 @@
         el('vs_date_start').value = today; el('vs_date_end').value = '';
         el('vs_overwrite').checked = false; el('vs_use_ocr').checked = true;
         refreshFormatUI(); refreshDateUI();
+        if (state.pausedRun) showResume(state.pausedRun);
     });
 
     // Observation field typeahead
@@ -800,6 +801,7 @@
         el('vs_field_id').value = f.id;
         syncFieldIdPill();
         closeSuggest();
+        if (state.pausedRun) showResume(state.pausedRun);
     }
     fieldInput.addEventListener('keydown', (e) => {
         if (suggest.classList.contains('hidden')) return;
@@ -1042,9 +1044,8 @@
         el('vs_log_caret').className = hidden ? 'fas fa-chevron-down text-gray-400' : 'fas fa-chevron-up text-gray-400';
     });
 
-    // Resume is offered only for a paused run, and only while its settings still
-    // match the form -- resuming with a different pattern would mix rows judged
-    // by different rules into one preview.
+    // Resume uses the original scan settings. Flag every visible setting that
+    // could change how an unscanned observation is judged.
     function formMatchesRun(run) {
         const p = run.params || {};
         const f = selectedFormat();
@@ -1052,7 +1053,9 @@
         return String(p.field_id) === String(el('vs_field_id').value)
             && String(p.date_start || '') === el('vs_date_start').value
             && String(p.date_end || '') === (range ? el('vs_date_end').value : el('vs_date_start').value)
-            && String(p.regex || '') === String(f.value === 'Custom' ? el('vs_custom_regex').value : (f.dataset.regex || ''));
+            && String(p.regex || '') === String(f.value === 'Custom' ? el('vs_custom_regex').value : (f.dataset.regex || ''))
+            && Boolean(p.use_ocr) === el('vs_use_ocr').checked
+            && Boolean(p.allow_overwrite) === el('vs_overwrite').checked;
     }
 
     function showResume(run) {
@@ -1074,9 +1077,10 @@
         if (!formMatchesRun(run)) {
             const p = run.params || {};
             const ok = confirm(
-                `This paused preview used field #${p.field_id}, ${p.date_start}` +
+                `The settings above differ from this paused preview. It used field #${p.field_id}, ${p.date_start}` +
                 (p.date_end && p.date_end !== p.date_start ? ` to ${p.date_end}` : '') +
-                `, which no longer matches the settings above.\n\n` +
+                `, OCR fallback ${p.use_ocr ? 'on' : 'off'}, and overwrite existing values ` +
+                `${p.allow_overwrite ? 'on' : 'off'}.\n\n` +
                 `Resume continues with the ORIGINAL settings so every row was judged the same way. ` +
                 `To use the settings above instead, press Preview for a fresh run.`);
             if (!ok) return;
