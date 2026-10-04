@@ -836,6 +836,7 @@ def job_status(job_id):
 
 
 @bp.post('/job/<job_id>/retry-mycomap-ncbi')
+@limiter.limit("6 per minute; 60 per hour")
 def retry_mycomap_ncbi(job_id):
     """Retry a missing NCBI export on a completed local-only MycoMap tree."""
     db_job, error_msg, status_code = check_job_access(job_id, mode="edit")
@@ -907,9 +908,17 @@ def retry_mycomap_ncbi(job_id):
         )
     except Exception:
         logger.exception("Could not schedule MycoMap NCBI retry for job %s", job_id)
-        db_job.metrics = previous_metrics
-        db.session.commit()
-        redis.delete(lock_key)
+        try:
+            db.session.rollback()
+            db_job.metrics = previous_metrics
+            db.session.commit()
+        except Exception:
+            db.session.rollback()
+            logger.exception("Could not restore metrics for job %s", job_id)
+        try:
+            redis.delete(lock_key)
+        except Exception:
+            logger.exception("Could not release NCBI retry lock for job %s", job_id)
         abort(503)
     flash("MycoMap NCBI retry queued. The tree will rebuild if new sequences arrive.", "success")
     return redirect(url_for("main.job_viewer", job_id=job_id))

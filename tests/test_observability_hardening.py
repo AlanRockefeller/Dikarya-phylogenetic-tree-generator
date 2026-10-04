@@ -533,8 +533,11 @@ def test_hidden_or_preview_asset_failures_stay_out_of_error_mirror(
     logging.getLogger().addHandler(capture)
     cases = [
         ("hidden", "Mozilla/5.0", logging.INFO),
+        ("prerender", "Mozilla/5.0", logging.INFO),
         ("visible", "Mozilla/5.0 meta-externalagent/1.1", logging.INFO),
         ("visible", "Mozilla/5.0", logging.ERROR),
+        ("unknown", "Mozilla/5.0", logging.ERROR),
+        ("invalid", "Mozilla/5.0", logging.ERROR),
     ]
     for visibility, agent, expected in cases:
         capture.records.clear()

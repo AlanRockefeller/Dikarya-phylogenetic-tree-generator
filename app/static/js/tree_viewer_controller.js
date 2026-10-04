@@ -1016,8 +1016,10 @@ document.addEventListener('DOMContentLoaded', async () => {
         try {
             const state = await TreeEditActions.getTreeState(JOB_ID);
             applyAnnotationState(state.annotation_layers, state.clade_annotations);
+            return true;
         } catch (e) {
             console.warn('Could not reload annotations:', e);
+            return false;
         }
     }
 
@@ -1040,6 +1042,7 @@ document.addEventListener('DOMContentLoaded', async () => {
     // POST was in flight is coalesced into a single follow-up send of the current state.
     async function runAnnotationSaveCycle() {
         let ok = true;
+        let reloaded = false;
         try {
             do {
                 annotationSaveQueued = false;
@@ -1067,12 +1070,12 @@ document.addEventListener('DOMContentLoaded', async () => {
                         clearTimeout(annotationSaveDebounce);
                         annotationSaveDebounce = null;
                     }
-                    await reloadAnnotationsFromServer();
+                    reloaded = await reloadAnnotationsFromServer();
                     ok = false;
                     break;
                 }
             } while (annotationSaveQueued);
-            return ok;
+            return ok ? true : (reloaded ? null : false);
         } finally {
             // Cleared synchronously as the loop exits, so a caller can never join a cycle
             // that has already decided it has nothing left to send.
@@ -1922,6 +1925,14 @@ document.addEventListener('DOMContentLoaded', async () => {
             closeAnnotationMembershipPicker(false, true);
             showStatus(`Updated members of "${updated.label}".`, 'success', 2500);
         } else if (annotationMembershipPicker) {
+            if (saved === false) {
+                // The server could not be reloaded after the failed save. Restore
+                // the local copy so Cancel or another edit cannot later save it.
+                const currentIndex = cladeAnnotations.findIndex(item => item.id === updated.id);
+                if (currentIndex >= 0) cladeAnnotations[currentIndex] = original;
+                viewer.setCladeAnnotations?.(annotationLayers, cladeAnnotations);
+                renderAnnotationManager();
+            }
             annotationMembershipPicker.saving = false;
             updateAnnotationMembershipPicker();
         }

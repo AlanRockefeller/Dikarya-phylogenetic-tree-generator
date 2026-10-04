@@ -2578,6 +2578,18 @@ def schedule_initial_ncbi_recheck(job_id: str) -> None:
     _schedule_ncbi_recheck(job_id, hours=1)
 
 
+def _without_transient_ncbi_warnings(warnings):
+    """Drop retry and queue notices once delayed NCBI recovery has ended."""
+    return [
+        warning for warning in warnings or []
+        if not any(phrase in warning for phrase in (
+            "NCBI export failed",
+            "NCBI download is being retried",
+            "NCBI results are still queued",
+        ))
+    ]
+
+
 @background_job_context(0, pipeline_log=True)
 def reconcile_delayed_ncbi_results(job_id: str) -> Dict[str, Any]:
     """
@@ -2599,7 +2611,8 @@ def reconcile_delayed_ncbi_results(job_id: str) -> Dict[str, Any]:
     from app.services.mycomap_service import (
         fetch_mycomap_fasta,
         get_mycomap_ncbi_recheck_max_hours,
-        get_mycomap_ncbi_queue_position,
+        _looks_unfinished,
+        get_mycomap_ncbi_queue_status,
         get_mycomap_ncbi_result_count,
         resolve_mycomap_result_reference,
         record_mycomap_queue_position,
@@ -2660,37 +2673,44 @@ def reconcile_delayed_ncbi_results(job_id: str) -> Dict[str, Any]:
         rerun_details["ncbi_last_rechecked_at"] = datetime.now(timezone.utc).isoformat()
 
         retry_failed_download = bool(rerun_details.get("ncbi_download_failed"))
-        queue_position = None if retry_failed_download else get_mycomap_ncbi_queue_position(
-            mycomap_url, blast_id=blast_id
-        )
-        if retry_failed_download:
-            # The search was already complete; the export itself failed.
-            count, _warnings = 1, []
-        elif reference["provider"] == "org":
+        if reference["provider"] == "org":
             try:
                 ncbi_record = org_status(blast_id).get("ncbi") or {}
                 count = 1 if ncbi_record.get("has_results") and ncbi_record.get("status") == "complete" else 0
             except OrgResultError:
                 count = 0
             _warnings = []
-        elif queue_position is None:
-            count, _warnings = get_mycomap_ncbi_result_count(blast_id)
-            rerun_details.pop("ncbi_queue_position", None)
         else:
-            # A queued search is healthy pending work, not a failed export.
-            count, _warnings = 0, []
-            rerun_details["ncbi_status"] = "queued"
-            rerun_details = record_mycomap_queue_position(
-                rerun_details, queue_position
+            queue_status = get_mycomap_ncbi_queue_status(
+                mycomap_url, blast_id=blast_id
             )
+            queue_position = queue_status["queue_position"]
+            search_pending = queue_position is not None or (
+                queue_status["source"] == "api"
+                and _looks_unfinished(queue_status["status"])
+            )
+            if search_pending:
+                # An unfinished search can lack a queue position. Do not spend
+                # the failed-export retry budget trying to download it yet.
+                count, _warnings = 0, []
+                rerun_details["ncbi_status"] = "queued"
+                rerun_details = record_mycomap_queue_position(
+                    rerun_details, queue_position
+                )
+            elif retry_failed_download:
+                count, _warnings = 1, []
+                rerun_details.pop("ncbi_queue_position", None)
+            else:
+                count, _warnings = get_mycomap_ncbi_result_count(blast_id)
+                rerun_details.pop("ncbi_queue_position", None)
         if count <= 0:
             max_hours = get_mycomap_ncbi_recheck_max_hours()
             if recheck_count >= max_hours:
                 rerun_details["ncbi_status"] = "gave_up"
                 rerun_details["ncbi_fallback_local_only"] = False
                 metrics["mycomap_blast_rerun"] = rerun_details
-                metrics["mycomap_refresh_warnings"] = list(
-                    metrics.get("mycomap_refresh_warnings") or []
+                metrics["mycomap_refresh_warnings"] = _without_transient_ncbi_warnings(
+                    metrics.get("mycomap_refresh_warnings")
                 ) + [
                     "Gave up waiting for MycoMap NCBI BLAST results after "
                     f"{max_hours} hourly re-checks; tree remains local-only."
@@ -2741,8 +2761,8 @@ def reconcile_delayed_ncbi_results(job_id: str) -> Dict[str, Any]:
                     rerun_details["ncbi_status"] = "gave_up"
                     rerun_details["ncbi_fallback_local_only"] = False
                     metrics["mycomap_blast_rerun"] = rerun_details
-                    metrics["mycomap_refresh_warnings"] = list(
-                        metrics.get("mycomap_refresh_warnings") or []
+                    metrics["mycomap_refresh_warnings"] = _without_transient_ncbi_warnings(
+                        metrics.get("mycomap_refresh_warnings")
                     ) + [
                         "MycoMap NCBI results were ready but could not be downloaded after "
                         f"{max_hours} attempts ({errors}); tree remains local-only."
@@ -2806,8 +2826,8 @@ def reconcile_delayed_ncbi_results(job_id: str) -> Dict[str, Any]:
         rerun_details["ncbi_appended_count"] = added_count
         rerun_details["ncbi_recompute_pending"] = added_count > 0 or matched_count > 0
         if partial_download:
-            metrics["mycomap_refresh_warnings"] = list(
-                metrics.get("mycomap_refresh_warnings") or []
+            metrics["mycomap_refresh_warnings"] = _without_transient_ncbi_warnings(
+                metrics.get("mycomap_refresh_warnings")
             ) + [
                 "MycoMap NCBI results remained incomplete after "
                 f"{max_hours} attempts ({errors}); the available NCBI sequences "
@@ -2815,11 +2835,9 @@ def reconcile_delayed_ncbi_results(job_id: str) -> Dict[str, Any]:
             ]
         metrics["mycomap_blast_rerun"] = rerun_details
         if not partial_download:
-            metrics["mycomap_refresh_warnings"] = [
-                warning for warning in metrics.get("mycomap_refresh_warnings") or []
-                if "NCBI export failed" not in warning
-                and "NCBI download is being retried" not in warning
-            ]
+            metrics["mycomap_refresh_warnings"] = _without_transient_ncbi_warnings(
+                metrics.get("mycomap_refresh_warnings")
+            )
         db_job.metrics = metrics
         db.session.commit()
 

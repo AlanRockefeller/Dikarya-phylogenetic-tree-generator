@@ -2181,6 +2181,8 @@ def resolve_tree_generation_context(
     convergence_warning = None
     if method == "mrbayes":
         problems = metadata.get("convergence_warnings") or []
+        if not isinstance(problems, list):
+            problems = [problems]
         if problems:
             convergence_warning = (
                 "MrBayes did not meet its convergence thresholds ("

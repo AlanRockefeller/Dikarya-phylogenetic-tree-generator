@@ -13,7 +13,10 @@ from pathlib import Path
 import shutil
 import subprocess
 import unittest
-from unittest.mock import patch
+from types import SimpleNamespace
+from unittest.mock import MagicMock, patch
+
+from flask import Flask
 
 
 SERVICE_PATH = os.path.join(os.path.dirname(__file__), "../app/services/inaturalist_tree_service.py")
@@ -30,6 +33,51 @@ find_observation_source_tip_name = inaturalist_tree_service._find_observation_so
 maybe_add_inat_its_sequence = inaturalist_tree_service._maybe_add_inat_its_sequence
 source_display_label_for_tip = inaturalist_tree_service._source_display_label_for_tip
 from app.services.tree_edit_service import rename_tip
+
+
+def test_reconcile_defers_failed_export_while_mycomap_search_is_running(tmp_path):
+    """An absent queue position does not mean an API-reported search is ready."""
+    job = SimpleNamespace(metrics={
+        "mycomap_blast_url": "https://mycomap.com/genetics/blast-search/r42/",
+        "mycomap_blast_rerun": {
+            "ncbi_fallback_local_only": True, "ncbi_download_failed": True,
+        },
+    })
+    database = MagicMock()
+    query = MagicMock()
+    query.get.return_value = job
+    status = {"queue_position": None, "status": "running", "source": "api"}
+    with (
+        patch("app.create_app", return_value=Flask(__name__)),
+        patch("app.extensions.db", database),
+        patch("app.models.Job", SimpleNamespace(query=query)),
+        patch("app.services.log_context.bind_background_context"),
+        patch("app.services.log_context.background_user_identity", return_value="test"),
+        patch("app.services.mycomap_service.resolve_mycomap_result_reference",
+              return_value={"provider": "com", "result_id": "42"}),
+        patch("app.services.mycomap_service.get_mycomap_ncbi_queue_status",
+              return_value=status),
+        patch("app.services.mycomap_service.fetch_mycomap_fasta") as fetch,
+        patch.object(inaturalist_tree_service, "_schedule_ncbi_recheck") as schedule,
+    ):
+        result = inaturalist_tree_service.reconcile_delayed_ncbi_results.__wrapped__("test-job")
+
+    assert result["status"] == "still_waiting"
+    assert job.metrics["mycomap_blast_rerun"]["ncbi_status"] == "queued"
+    fetch.assert_not_called()
+    schedule.assert_called_once()
+
+
+def test_terminal_ncbi_warnings_drop_retry_notices():
+    warnings = [
+        "MycoMap NCBI download is being retried.",
+        "MycoMap's NCBI export failed; Dikarya will retry hourly.",
+        "MycoMap NCBI results are still queued; Dikarya will check hourly.",
+        "Another useful warning.",
+    ]
+    assert inaturalist_tree_service._without_transient_ncbi_warnings(warnings) == [
+        "Another useful warning."
+    ]
 
 
 class TestInaturalistTreeInputParsing(unittest.TestCase):

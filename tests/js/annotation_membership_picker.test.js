@@ -41,9 +41,11 @@ async function scenario({ type = 'clade_line', initial = ['A', 'B'], selected = 
         member_tip_ids: initial, font_size: 14 };
     const ctx = vm.createContext({
         annotationMembershipPicker: null,
+        annotationLayers: [],
         cladeAnnotations: [original],
         viewer: {
             selectLeafIds(ids) { selection = ids.slice(); return selection.length; },
+            setCladeAnnotations() {},
             getSelectedAnnotationLeafIds() { return selection.slice(); },
             getSelectedCladeLeafIds() { return clade ? selection.slice() : null; },
             hasIncomingBranchForMemberIds() { return true; }
@@ -51,6 +53,7 @@ async function scenario({ type = 'clade_line', initial = ['A', 'B'], selected = 
         annotationsEditable: () => true,
         getEl: id => elements[id],
         closeAnnotationManager: () => { calls.managerClosed += 1; },
+        renderAnnotationManager: () => {},
         updateButtons: () => {},
         showStatus: message => calls.statuses.push(message),
         canonicalAnnotationType: value => value,
@@ -97,6 +100,17 @@ async function scenario({ type = 'clade_line', initial = ['A', 'B'], selected = 
     await failed.ctx.saveAnnotationMembershipPicker();
     assert.notEqual(failed.ctx.annotationMembershipPicker, null);
     assert.equal(failed.ctx.annotationMembershipPicker.saving, false);
+    assert.deepEqual(Array.from(failed.ctx.cladeAnnotations[0].member_tip_ids), ['A', 'B']);
+    failed.ctx.closeAnnotationMembershipPicker(true);
+    assert.deepEqual(Array.from(failed.ctx.cladeAnnotations[0].member_tip_ids), ['A', 'B']);
+
+    const reloaded = await scenario({ saveResult: null });
+    reloaded.ctx.saveAnnotationsNow = async () => {
+        reloaded.ctx.cladeAnnotations[0] = { ...reloaded.original, member_tip_ids: ['C'] };
+        return null;
+    };
+    await reloaded.ctx.saveAnnotationMembershipPicker();
+    assert.deepEqual(Array.from(reloaded.ctx.cladeAnnotations[0].member_tip_ids), ['C']);
 
     let finishSave;
     const pending = await scenario({ saveResult: new Promise(resolve => { finishSave = resolve; }) });

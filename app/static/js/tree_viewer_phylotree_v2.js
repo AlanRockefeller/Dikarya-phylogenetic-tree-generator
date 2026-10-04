@@ -758,6 +758,7 @@
             this.typeSpecimenCount = 0;
 
             this.tree = null;
+            this.exportTree = null;
             this.newick = null;
             this.allNodes = []; // Node Cache
 
@@ -978,6 +979,7 @@
         // a reload that keeps the user's sort renders once instead of drawing and re-sorting.
         async render(newick, renderOptions = {}) {
             this.newick = newick;
+            this.exportTree = null;
             if (!this.container) return;
 
             // 1. CLEAR & SETUP
@@ -1012,6 +1014,11 @@
             // each complete zero-length tip component before recording "original" order, so
             // Sort -> Original and later reloads both retain the useful grouped presentation.
             this._groupZeroLengthPolytomies();
+            // Keep the full topology for Newick export. Support collapse changes
+            // only the live display hierarchy and must not discard weak splits.
+            if (this.options.supportCollapse) {
+                this.exportTree = new phylotreeLib.phylotree(this.tree.getNewick());
+            }
             // Alan 10/3/26 - Then, when enabled, contract branches below the support cutoff.
             this._collapseWeakSupportBranches();
 
@@ -2296,7 +2303,20 @@
 
         // Alan 9/24/26 - Split from getNewickString so the type-label swap can wrap it.
         _serializeNewick() {
-            return this.tree.getNewick((node) => {
+            const tree = this.exportTree || this.tree;
+            if (this.exportTree) {
+                const displayTips = new Map(this._getLeafNodes().map(node => [this._getNodeId(node), node]));
+                tree.traverse_and_compute(node => {
+                    if (node.children?.length) return;
+                    const id = this._getNodeId(node);
+                    const display = displayTips.get(id);
+                    if (!display) return;
+                    node.data.__original_name = id;
+                    node.data.name = (display.data || display).name;
+                    node.notshown = Boolean(display.notshown);
+                });
+            }
+            return tree.getNewick((node) => {
                 // The callback determines what annotation gets appended to the node name
                 const id = this._getNodeId(node);
                 // Alan 5/11/26 - Export only visible active selections after local Deselect has been used.

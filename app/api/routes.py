@@ -5991,7 +5991,7 @@ def log_client_error():
     # web log, but keep the WARNING+ mirror focused on actionable failures.
     log_event = current_app.logger.info if (
         event == "resource_load_failed" and (
-            visibility != "visible" or "meta-externalagent/" in browser_agent.lower()
+            visibility in {"hidden", "prerender"} or "meta-externalagent/" in browser_agent.lower()
         )
     ) else current_app.logger.error
     log_event(
