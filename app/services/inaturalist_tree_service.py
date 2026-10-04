@@ -2012,19 +2012,25 @@ def _create_mycomap_blast_from_observation(observation: Dict[str, Any],
     # first pass already checked history for this title, so skip the lookup
     # while it waits for a slot (history is MycoMap's heaviest BLAST query).
     was_throttled = bool((pending_creation_details or {}).get("creation_throttled"))
-    # Once history has told us the search's ID, resolve it by that ID: a large
-    # batch pushes older searches out of both the history page and the listing,
-    # so the title lookup stops finding them (see find_mycomap_blast_by_known_id).
-    known_id = str(
+    # Once history has told us an ID, check its result page directly: a large
+    # batch pushes older searches out of both the history page and the listing.
+    # A job ID may differ from the BLAST ID, but the known-ID lookup accepts a
+    # page only after verifying its title. Keep the ID kind until that succeeds.
+    known_blast_id = str(
         (pending_creation_details or {}).get("creation_pending_blast_id")
         or (recalled_blast_id_for_title(job_title)
             if (pending_creation_details or {}).get("creation_pending") else "")
         or ""
     ).strip()
+    known_job_id = str(
+        (pending_creation_details or {}).get("creation_pending_job_id") or ""
+    ).strip()
+    known_id = known_blast_id or known_job_id
     created = None
     if known_id and not was_throttled:
         created = find_mycomap_blast_by_known_id(
-            known_id, job_title, warnings=discovery_warnings
+            known_id, job_title, warnings=discovery_warnings,
+            verify_title=not bool(known_blast_id),
         )
         if not created:
             # A stored id may be a MycoMap job id rather than the result's
@@ -2037,6 +2043,7 @@ def _create_mycomap_blast_from_observation(observation: Dict[str, Any],
         # Carrying an ID keeps the queue-position report and the
         # creation-confirmed check working.
         pending_creation.setdefault("blast_id", known_id)
+        pending_creation.setdefault("id_kind", "blast" if known_blast_id else "job")
     elif not was_throttled:
         # A timed-out create is judged by what this lookup does NOT find, so it
         # must read MycoMap's history directly rather than a shared cached page.
@@ -2571,6 +2578,18 @@ def schedule_initial_ncbi_recheck(job_id: str) -> None:
     _schedule_ncbi_recheck(job_id, hours=1)
 
 
+def _without_transient_ncbi_warnings(warnings):
+    """Drop retry and queue notices once delayed NCBI recovery has ended."""
+    return [
+        warning for warning in warnings or []
+        if not any(phrase in warning for phrase in (
+            "NCBI export failed",
+            "NCBI download is being retried",
+            "NCBI results are still queued",
+        ))
+    ]
+
+
 @background_job_context(0, pipeline_log=True)
 def reconcile_delayed_ncbi_results(job_id: str) -> Dict[str, Any]:
     """
@@ -2592,7 +2611,8 @@ def reconcile_delayed_ncbi_results(job_id: str) -> Dict[str, Any]:
     from app.services.mycomap_service import (
         fetch_mycomap_fasta,
         get_mycomap_ncbi_recheck_max_hours,
-        get_mycomap_ncbi_queue_position,
+        _looks_unfinished,
+        get_mycomap_ncbi_queue_status,
         get_mycomap_ncbi_result_count,
         resolve_mycomap_result_reference,
         record_mycomap_queue_position,
@@ -2652,9 +2672,7 @@ def reconcile_delayed_ncbi_results(job_id: str) -> Dict[str, Any]:
         rerun_details["ncbi_recheck_count"] = recheck_count
         rerun_details["ncbi_last_rechecked_at"] = datetime.now(timezone.utc).isoformat()
 
-        queue_position = get_mycomap_ncbi_queue_position(
-            mycomap_url, blast_id=blast_id
-        )
+        retry_failed_download = bool(rerun_details.get("ncbi_download_failed"))
         if reference["provider"] == "org":
             try:
                 ncbi_record = org_status(blast_id).get("ncbi") or {}
@@ -2662,24 +2680,37 @@ def reconcile_delayed_ncbi_results(job_id: str) -> Dict[str, Any]:
             except OrgResultError:
                 count = 0
             _warnings = []
-        elif queue_position is None:
-            count, _warnings = get_mycomap_ncbi_result_count(blast_id)
-            rerun_details.pop("ncbi_queue_position", None)
         else:
-            # A queued search is healthy pending work, not a failed export.
-            count, _warnings = 0, []
-            rerun_details["ncbi_status"] = "queued"
-            rerun_details = record_mycomap_queue_position(
-                rerun_details, queue_position
+            queue_status = get_mycomap_ncbi_queue_status(
+                mycomap_url, blast_id=blast_id
             )
+            queue_position = queue_status["queue_position"]
+            search_pending = queue_position is not None or (
+                queue_status["source"] == "api"
+                and _looks_unfinished(queue_status["status"])
+            )
+            if search_pending:
+                # An unfinished search can lack a queue position. Do not spend
+                # the failed-export retry budget trying to download it yet.
+                count, _warnings = 0, []
+                rerun_details["ncbi_status"] = "queued"
+                rerun_details = record_mycomap_queue_position(
+                    rerun_details, queue_position
+                )
+            elif retry_failed_download:
+                count, _warnings = 1, []
+                rerun_details.pop("ncbi_queue_position", None)
+            else:
+                count, _warnings = get_mycomap_ncbi_result_count(blast_id)
+                rerun_details.pop("ncbi_queue_position", None)
         if count <= 0:
             max_hours = get_mycomap_ncbi_recheck_max_hours()
             if recheck_count >= max_hours:
                 rerun_details["ncbi_status"] = "gave_up"
                 rerun_details["ncbi_fallback_local_only"] = False
                 metrics["mycomap_blast_rerun"] = rerun_details
-                metrics["mycomap_refresh_warnings"] = list(
-                    metrics.get("mycomap_refresh_warnings") or []
+                metrics["mycomap_refresh_warnings"] = _without_transient_ncbi_warnings(
+                    metrics.get("mycomap_refresh_warnings")
                 ) + [
                     "Gave up waiting for MycoMap NCBI BLAST results after "
                     f"{max_hours} hourly re-checks; tree remains local-only."
@@ -2719,8 +2750,8 @@ def reconcile_delayed_ncbi_results(job_id: str) -> Dict[str, Any]:
         # rechecks -- the sequences were then never picked up. Leave the status alone
         # and reschedule so the next pass can try again.
         partial_download = False
-        if fetch_result.get("failed_sources"):
-            errors = "; ".join(fetch_result.get("errors") or []) or "unknown error"
+        if fetch_result.get("failed_sources") or not fasta_text.strip():
+            errors = "; ".join(fetch_result.get("errors") or []) or "NCBI export was empty"
             # Bounded by the same budget as the "still waiting" path, so a persistently
             # broken endpoint gives up instead of rescheduling forever.
             max_hours = get_mycomap_ncbi_recheck_max_hours()
@@ -2730,8 +2761,8 @@ def reconcile_delayed_ncbi_results(job_id: str) -> Dict[str, Any]:
                     rerun_details["ncbi_status"] = "gave_up"
                     rerun_details["ncbi_fallback_local_only"] = False
                     metrics["mycomap_blast_rerun"] = rerun_details
-                    metrics["mycomap_refresh_warnings"] = list(
-                        metrics.get("mycomap_refresh_warnings") or []
+                    metrics["mycomap_refresh_warnings"] = _without_transient_ncbi_warnings(
+                        metrics.get("mycomap_refresh_warnings")
                     ) + [
                         "MycoMap NCBI results were ready but could not be downloaded after "
                         f"{max_hours} attempts ({errors}); tree remains local-only."
@@ -2790,18 +2821,23 @@ def reconcile_delayed_ncbi_results(job_id: str) -> Dict[str, Any]:
 
         rerun_details["ncbi_status"] = "partial" if partial_download else "available"
         rerun_details["ncbi_fallback_local_only"] = False
+        rerun_details.pop("ncbi_download_failed", None)
         rerun_details["ncbi_appended_at"] = datetime.now(timezone.utc).isoformat()
         rerun_details["ncbi_appended_count"] = added_count
         rerun_details["ncbi_recompute_pending"] = added_count > 0 or matched_count > 0
         if partial_download:
-            metrics["mycomap_refresh_warnings"] = list(
-                metrics.get("mycomap_refresh_warnings") or []
+            metrics["mycomap_refresh_warnings"] = _without_transient_ncbi_warnings(
+                metrics.get("mycomap_refresh_warnings")
             ) + [
                 "MycoMap NCBI results remained incomplete after "
                 f"{max_hours} attempts ({errors}); the available NCBI sequences "
                 "were added, but some BLAST hits are missing."
             ]
         metrics["mycomap_blast_rerun"] = rerun_details
+        if not partial_download:
+            metrics["mycomap_refresh_warnings"] = _without_transient_ncbi_warnings(
+                metrics.get("mycomap_refresh_warnings")
+            )
         db_job.metrics = metrics
         db.session.commit()
 
@@ -3110,6 +3146,7 @@ def prepare_inat_tree_job(observation_id: int, *, include_ncbi: bool = True,
             status=status if status in (400, 404, 409, 422, 502) else 502,
         )
     pending_sources = set((payload or {}).get("pending_sources") or [])
+    failed_sources = set((payload or {}).get("failed_sources") or [])
     if "ncbi" in pending_sources:
         queue_position = (payload or {}).get("ncbi_queue_position")
         mycomap_rerun_details["ncbi_status"] = "queued"
@@ -3128,6 +3165,19 @@ def prepare_inat_tree_job(observation_id: int, *, include_ncbi: bool = True,
         )
         mycomap_rerun_details["warnings"] = list(dict.fromkeys(
             list(mycomap_rerun_details.get("warnings") or []) + [backlog_warning]
+        ))
+    elif include_ncbi and "ncbi" in failed_sources and (payload or {}).get("sequences"):
+        # The NCBI export can fail after MycoMap has already marked the search
+        # complete. Use the same delayed append/rebuild path as a queued search,
+        # but have the recheck try the download directly rather than waiting for
+        # a result-count endpoint that may also be unavailable.
+        mycomap_rerun_details["ncbi_fallback_local_only"] = True
+        mycomap_rerun_details["ncbi_download_failed"] = True
+        mycomap_rerun_details["warnings"] = list(dict.fromkeys(
+            list(mycomap_rerun_details.get("warnings") or []) + [
+                "MycoMap's NCBI export failed; this tree uses local results only. "
+                "Dikarya will retry hourly and rebuild when NCBI sequences can be downloaded."
+            ]
         ))
     sequences = (payload or {}).get('sequences') or []
     if len(sequences) < 2:

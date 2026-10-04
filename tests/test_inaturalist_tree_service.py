@@ -13,7 +13,10 @@ from pathlib import Path
 import shutil
 import subprocess
 import unittest
-from unittest.mock import patch
+from types import SimpleNamespace
+from unittest.mock import MagicMock, patch
+
+from flask import Flask
 
 
 SERVICE_PATH = os.path.join(os.path.dirname(__file__), "../app/services/inaturalist_tree_service.py")
@@ -30,6 +33,51 @@ find_observation_source_tip_name = inaturalist_tree_service._find_observation_so
 maybe_add_inat_its_sequence = inaturalist_tree_service._maybe_add_inat_its_sequence
 source_display_label_for_tip = inaturalist_tree_service._source_display_label_for_tip
 from app.services.tree_edit_service import rename_tip
+
+
+def test_reconcile_defers_failed_export_while_mycomap_search_is_running(tmp_path):
+    """An absent queue position does not mean an API-reported search is ready."""
+    job = SimpleNamespace(metrics={
+        "mycomap_blast_url": "https://mycomap.com/genetics/blast-search/r42/",
+        "mycomap_blast_rerun": {
+            "ncbi_fallback_local_only": True, "ncbi_download_failed": True,
+        },
+    })
+    database = MagicMock()
+    query = MagicMock()
+    query.get.return_value = job
+    status = {"queue_position": None, "status": "running", "source": "api"}
+    with (
+        patch("app.create_app", return_value=Flask(__name__)),
+        patch("app.extensions.db", database),
+        patch("app.models.Job", SimpleNamespace(query=query)),
+        patch("app.services.log_context.bind_background_context"),
+        patch("app.services.log_context.background_user_identity", return_value="test"),
+        patch("app.services.mycomap_service.resolve_mycomap_result_reference",
+              return_value={"provider": "com", "result_id": "42"}),
+        patch("app.services.mycomap_service.get_mycomap_ncbi_queue_status",
+              return_value=status),
+        patch("app.services.mycomap_service.fetch_mycomap_fasta") as fetch,
+        patch.object(inaturalist_tree_service, "_schedule_ncbi_recheck") as schedule,
+    ):
+        result = inaturalist_tree_service.reconcile_delayed_ncbi_results.__wrapped__("test-job")
+
+    assert result["status"] == "still_waiting"
+    assert job.metrics["mycomap_blast_rerun"]["ncbi_status"] == "queued"
+    fetch.assert_not_called()
+    schedule.assert_called_once()
+
+
+def test_terminal_ncbi_warnings_drop_retry_notices():
+    warnings = [
+        "MycoMap NCBI download is being retried.",
+        "MycoMap's NCBI export failed; Dikarya will retry hourly.",
+        "MycoMap NCBI results are still queued; Dikarya will check hourly.",
+        "Another useful warning.",
+    ]
+    assert inaturalist_tree_service._without_transient_ncbi_warnings(warnings) == [
+        "Another useful warning."
+    ]
 
 
 class TestInaturalistTreeInputParsing(unittest.TestCase):
@@ -745,6 +793,64 @@ class TestInaturalistTreeSourceLabel(unittest.TestCase):
         self.assertTrue(details["creation_pending"])
         self.assertEqual(details["creation_discovery_attempt"], 2)
 
+    def test_pending_job_id_resolves_verified_result_page(self):
+        observation = {
+            "id": 346029217,
+            "ofvs": [{"name": "DNA Barcode ITS", "value": "ACGT" * 40}],
+        }
+        pending = {
+            "auto_created": True,
+            "creation_pending": True,
+            "creation_pending_job_id": "668497",
+        }
+        result_url = (
+            "https://mycomap.com/genetics/blast-search/"
+            "inat346029217-dna-barcode-its-r668497/"
+        )
+        with (
+            patch("app.services.mycomap_service.find_mycomap_blast_by_known_id",
+                  return_value={"blast_id": "668497", "url": result_url}) as by_id,
+            patch("app.services.mycomap_service.create_mycomap_blast",
+                  side_effect=AssertionError("the search must not be duplicated")),
+            patch.object(inaturalist_tree_service, "set_observation_field_value",
+                         return_value={"id": 1}),
+        ):
+            details = inaturalist_tree_service._create_mycomap_blast_from_observation(
+                observation, 346029217, pending_creation_details=pending
+            )
+
+        self.assertEqual(details["created_blast_id"], "668497")
+        self.assertEqual(details["created_mycomap_url"], result_url)
+        self.assertFalse(details.get("creation_pending"))
+        self.assertTrue(by_id.call_args.kwargs["verify_title"])
+
+    def test_unresolved_job_id_stays_a_job_id(self):
+        observation = {
+            "id": 346029217,
+            "ofvs": [{"name": "DNA Barcode ITS", "value": "ACGT" * 40}],
+        }
+        pending = {
+            "auto_created": True,
+            "creation_pending": True,
+            "creation_pending_job_id": "668497",
+        }
+        with (
+            patch("app.services.mycomap_service.find_mycomap_blast_by_known_id",
+                  return_value=None),
+            patch("app.services.mycomap_service.find_mycomap_blast_by_title",
+                  return_value=None),
+            patch("app.services.mycomap_service.get_mycomap_ncbi_queue_position",
+                  return_value=None),
+            patch("app.services.mycomap_service.create_mycomap_blast",
+                  side_effect=AssertionError("the search must not be duplicated")),
+        ):
+            details = inaturalist_tree_service._create_mycomap_blast_from_observation(
+                observation, 346029217, pending_creation_details=pending
+            )
+
+        self.assertEqual(details["creation_pending_job_id"], "668497")
+        self.assertNotIn("creation_pending_blast_id", details)
+
     def test_auto_created_blast_waits_until_ncbi_results_exist(self):
         mycomap_url = "https://mycomap.com/genetics/blast-search/r42/"
         details = {
@@ -847,6 +953,31 @@ class TestInaturalistTreeSourceLabel(unittest.TestCase):
         self.assertTrue(prepared["metrics"]["mycomap_blast_auto_created"])
         self.assertTrue(prepared["metrics"]["mycomap_ncbi_blast_rebuilt"])
         self.assertIn(">AB123456 Example one", prepared["job_params"]["sequence"])
+
+    def test_failed_ncbi_export_marks_local_tree_for_recheck(self):
+        mycomap_url = "https://mycomap.com/genetics/blast-search/r42/"
+        payload = {
+            "sequences": [
+                {"name": "Local one", "sequence": "ACGT" * 40},
+                {"name": "Local two", "sequence": "TGCA" * 40},
+            ],
+            "failed_sources": ["ncbi"], "pending_sources": [],
+        }
+        with (
+            patch.object(inaturalist_tree_service, "fetch_observation",
+                         return_value={"id": 123456789}),
+            patch.object(inaturalist_tree_service, "extract_observation_field_value",
+                         return_value=mycomap_url),
+            patch("app.api.routes.gather_mycomap_sequences_for_queue",
+                  return_value=(payload, None)),
+        ):
+            prepared = inaturalist_tree_service.prepare_inat_tree_job(
+                123456789, skip_mycomap_refresh=True,
+            )
+        rerun = prepared["metrics"]["mycomap_blast_rerun"]
+        self.assertTrue(rerun["ncbi_fallback_local_only"])
+        self.assertTrue(rerun["ncbi_download_failed"])
+        self.assertIn("retry hourly", prepared["metrics"]["mycomap_refresh_warnings"][0])
 
     def test_auto_created_blast_uses_queue_position_without_probing_fasta(self):
         details = {

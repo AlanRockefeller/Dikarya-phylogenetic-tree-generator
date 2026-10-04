@@ -664,6 +664,24 @@ test('the viewer refuses export when its metric filters hide every tip', () => {
     );
 });
 
+test('Newick export keeps weak splits removed from the display hierarchy', () => {
+    const { ctx } = loadViewer();
+    const viewer = new ctx.DikaryaTreeViewer('tree-container', {}, {});
+    const original = '((A:0.1,B:0.2)40:0.05,C:0.3);';
+    viewer.tree = new Phylotree(original);
+    viewer.exportTree = new Phylotree(original);
+    const weak = viewer.tree.getNodeByName('40');
+    const parent = weak.parent;
+    parent.children.splice(parent.children.indexOf(weak), 1, ...weak.children);
+    weak.children.forEach(child => { child.parent = parent; });
+    viewer.allNodes = viewer.tree.getNodes().descendants().filter(node => node !== weak);
+    viewer.tree.getNodeByName('B').notshown = true;
+
+    const out = viewer.getNewickString();
+    assert.ok(out.includes('40'), 'the weak internal split was omitted: ' + out);
+    assertSameList(newickTips(out), ['A', 'C']);
+});
+
 // ===========================================================================
 // Finding 4 - cached links must follow a topology change
 // ===========================================================================

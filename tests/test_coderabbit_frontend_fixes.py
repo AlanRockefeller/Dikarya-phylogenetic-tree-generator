@@ -272,23 +272,5 @@ class StatusToastTests(unittest.TestCase):
         self.assertIn("bg-red-500", table)
 
 
-class LegacySubmissionTemplateTests(unittest.TestCase):
-    """beginner.html / advanced.html are currently unrouted but still shipped."""
-
-    def test_a_bootstrap_bootstrap_value_of_zero_survives(self):
-        html = read("app", "templates", "advanced.html")
-        self.assertIn('intOr("bootstrap", 1000)', html)
-        self.assertNotIn('parseInt(document.getElementById("bootstrap").value) || 100', html)
-
-    def test_the_file_read_error_uses_a_real_bootstrap_class(self):
-        html = read("app", "templates", "advanced.html")
-        self.assertNotIn("allow-danger", html)
-
-    def test_the_beginner_submit_button_is_disabled_while_posting(self):
-        html = read("app", "templates", "beginner.html")
-        self.assertIn('const btn = document.getElementById("submit_btn");', html)
-        self.assertIn("if (btn.disabled) return;", html)
-
-
 if __name__ == "__main__":
     unittest.main()

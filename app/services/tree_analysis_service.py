@@ -2178,6 +2178,24 @@ def resolve_tree_generation_context(
         if metadata.get("converged"):
             run_details.append("Convergence criterion reached")
 
+    convergence_warning = None
+    if method == "mrbayes":
+        problems = metadata.get("convergence_warnings") or []
+        if not isinstance(problems, list):
+            problems = [problems]
+        if problems:
+            convergence_warning = (
+                "MrBayes did not meet its convergence thresholds ("
+                + "; ".join(str(problem) for problem in problems)
+                + "). Posterior probabilities on this tree should not be trusted. "
+                "Run more MCMC generations and check convergence again."
+            )
+        elif metadata.get("convergence_unavailable"):
+            convergence_warning = (
+                "MrBayes convergence could not be assessed. Posterior probabilities "
+                "on this tree are unverified; inspect the run diagnostics."
+            )
+
     tree_method_label = _TREE_METHOD_LABELS.get(method, str(raw_method).upper())
     if method == "iqtree_fast":
         tree_method_label = (
@@ -2210,6 +2228,7 @@ def resolve_tree_generation_context(
             for row in mycomap_records
         ),
         "run_details": run_details,
+        "convergence_warning": convergence_warning,
         "requested_model": requested_model,
         "metadata": metadata,
     }

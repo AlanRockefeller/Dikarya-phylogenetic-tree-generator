@@ -97,7 +97,6 @@
         gap: 7px;
         justify-content: center;
         padding: 9px 12px;
-        transition: background-color .15s ease, color .15s ease;
         white-space: nowrap;
     }
 
@@ -187,7 +186,6 @@
         border: 1px solid var(--line);
         border-radius: 4px;
         overflow: hidden;
-        transition: border-color .2s ease, box-shadow .2s ease;
     }
 
     .sequence-input-box:focus-within {
@@ -293,7 +291,6 @@
         justify-content: center;
         min-height: 42px;
         padding: 10px 14px;
-        transition: border-color .2s ease, color .2s ease, background-color .2s ease, opacity .2s ease;
     }
 
     .btn:hover:not(:disabled) {
@@ -309,7 +306,7 @@
     }
 
     .btn-primary:hover:not(:disabled) {
-        background: var(--journal-gold-light);
+        background: #b8934a;
         color: #1a2f23;
     }
 
@@ -390,7 +387,6 @@
         gap: 12px;
         grid-template-columns: 26px 22px minmax(0, 1fr) auto 22px;
         padding: 7px 28px;
-        transition: background-color .2s ease;
     }
 
     .queue-row:hover {
@@ -488,7 +484,6 @@
         color: var(--text-mute);
         font-size: 16px;
         line-height: 1;
-        transition: color .2s ease;
     }
 
     .queue-remove:hover {
@@ -675,7 +670,7 @@
              unchanged; only the selected panel is shown. The sources stay
              additive -- switching a segment hides a fetch summary but never
              touches the queue, which is the durable state. -->
-        <div class="tree-card p-6 transition-colors" id="add_sequences_card">
+        <div class="tree-card p-6" id="add_sequences_card">
             <h3 class="text-xl font-semibold text-journal-dark dark:text-gray-100 mb-4 flex items-center">
                 <i class="fas fa-plus-circle text-journal-gold mr-2"></i>
                 Add Sequences
@@ -725,7 +720,7 @@
                     </label>
                     <input type="text" id="inaturalist_url" class="w-full px-4 py-3 border border-gray-300 dark:border-journal-dark rounded-lg 
                                   bg-white dark:bg-journal-dark text-gray-900 dark:text-gray-100
-                                  focus:ring-2 focus:ring-journal-gold focus:border-transparent transition-all"
+                                  focus:ring-2 focus:ring-journal-gold focus:border-transparent"
                         placeholder="1234567, alan_rockefeller, or inaturalist.org/projects/project-slug">
                     <p class="text-xs text-gray-500 dark:text-gray-400 mt-1">
                         Enter an observation ID, observation URL, username, user URL, project name, or project URL.
@@ -868,7 +863,7 @@
                     </label>
                     <input type="url" id="mycomap_url" class="w-full px-4 py-3 border border-gray-300 dark:border-journal-dark rounded-lg
                                   bg-white dark:bg-journal-dark text-gray-900 dark:text-gray-100
-                                  focus:ring-2 focus:ring-journal-gold focus:border-transparent transition-all"
+                                  focus:ring-2 focus:ring-journal-gold focus:border-transparent"
                         placeholder="https://mycomap.org/mycoblast/12345">
                     <p class="text-xs text-gray-500 dark:text-gray-400 mt-1">
                         Paste a Mycomap BLAST result URL to import sequences.
@@ -977,7 +972,7 @@
                 <label for="sequence_file" class="upload-dropzone block w-full border-2 border-dashed border-gray-300 dark:border-gray-600
                               rounded-lg p-8 text-center cursor-pointer
                               hover:border-journal-gold dark:hover:border-journal-gold
-                              transition-colors bg-gray-50 dark:bg-journal-dark">
+                              bg-gray-50 dark:bg-journal-dark">
                     <i class="fas fa-cloud-upload-alt text-4xl text-gray-400 dark:text-gray-500 mb-3"></i>
                     <p class="text-sm text-gray-600 dark:text-gray-300">
                         <span class="font-semibold text-journal-gold">Click to upload</span> or drag and drop
@@ -995,7 +990,7 @@
                     </label>
                     <input type="text" id="job_notes" class="w-full px-4 py-3 border border-gray-300 dark:border-journal-dark rounded-lg
                                   bg-white dark:bg-journal-dark text-gray-900 dark:text-gray-100
-                                  focus:ring-2 focus:ring-journal-gold focus:border-transparent transition-all"
+                                  focus:ring-2 focus:ring-journal-gold focus:border-transparent"
                         placeholder="e.g. Fungal ITS Analysis">
                 </div>
 
@@ -1078,7 +1073,7 @@
                         Mushroom Observer Observation URL or Number
                     </label>
                     <input type="text" id="mushroom_observer_input"
-                           class="w-full px-4 py-3 border border-gray-300 dark:border-journal-dark rounded-lg bg-white dark:bg-journal-dark text-gray-900 dark:text-gray-100 focus:ring-2 focus:ring-journal-gold focus:border-transparent transition-all"
+                           class="w-full px-4 py-3 border border-gray-300 dark:border-journal-dark rounded-lg bg-white dark:bg-journal-dark text-gray-900 dark:text-gray-100 focus:ring-2 focus:ring-journal-gold focus:border-transparent"
                            placeholder="575883 or mushroomobserver.org/obs/575883">
                     <p class="text-xs text-gray-500 dark:text-gray-400 mt-1">
                         Current, short, and legacy Mushroom Observer observation links are supported.
@@ -1148,7 +1143,7 @@
 
     <!-- Right Section: 1 column - Sequence Queue -->
     <div class="lg:col-span-1">
-        <div class="queue-card transition-colors sticky top-24">
+        <div class="queue-card sticky top-24">
 
             <!-- Queue Header -->
             <div class="p-4 border-b border-[var(--line-gold)] flex justify-between items-start gap-4">
@@ -1176,7 +1171,7 @@
             <div class="queue-footer">
                 <div class="queue-run-row">
                     <button id="quick_tree_btn" class="btn btn-primary">
-                        ▶ Run Quick Tree
+                        ▶ Build Quick Tree
                     </button>
                     <button id="toggle_advanced_btn" class="btn btn-outline-gold">
                         Advanced…
@@ -1209,7 +1204,7 @@
 </div>
 
 <!-- Advanced Configuration Panel (Hidden by default) -->
-<div id="advanced_panel" class="mt-6 tree-card p-6 transition-colors hidden">
+<div id="advanced_panel" class="mt-6 tree-card p-6 hidden">
     <div class="flex flex-col gap-2">
         <p class="eyebrow">Advanced</p>
         <h3 class="mb-1">Pipeline Configuration</h3>
@@ -1227,7 +1222,7 @@
             </label>
             <select id="alignment_method" class="w-full px-4 py-3 border border-gray-300 dark:border-journal-dark rounded-lg 
                            bg-white dark:bg-journal-dark text-gray-900 dark:text-gray-100
-                           focus:ring-2 focus:ring-journal-gold focus:border-transparent transition-all">
+                           focus:ring-2 focus:ring-journal-gold focus:border-transparent">
                 <option value="mafft" selected>MAFFT (Default)</option>
                 <option value="muscle">MUSCLE</option>
                 <option value="clustalo">Clustal Omega</option>
@@ -1258,7 +1253,7 @@
             </label>
             <select id="trimming_method" class="w-full px-4 py-3 border border-gray-300 dark:border-journal-dark rounded-lg 
                            bg-white dark:bg-journal-dark text-gray-900 dark:text-gray-100
-                           focus:ring-2 focus:ring-journal-gold focus:border-transparent transition-all">
+                           focus:ring-2 focus:ring-journal-gold focus:border-transparent">
                 <option value="trimal_gappy" selected>trimAl gap-threshold (recommended)</option>
                 <option value="none">None</option>
                 <option value="trimal">trimAl -automated1</option>
@@ -1313,7 +1308,7 @@
             </label>
             <select id="its_region" class="w-full px-4 py-3 border border-gray-300 dark:border-journal-dark rounded-lg
                            bg-white dark:bg-journal-dark text-gray-900 dark:text-gray-100
-                           focus:ring-2 focus:ring-journal-gold focus:border-transparent transition-all">
+                           focus:ring-2 focus:ring-journal-gold focus:border-transparent">
                 <option value="none" selected>Whole sequence (Default)</option>
                 <option value="its1">ITS1 only</option>
                 <option value="s58">5.8S only</option>
@@ -1333,7 +1328,7 @@
                 <input type="number" id="its_min_length" min="1" max="5000" step="10" value="100"
                     class="w-full px-4 py-3 border border-gray-300 dark:border-journal-dark rounded-lg
                            bg-white dark:bg-journal-dark text-gray-900 dark:text-gray-100
-                           focus:ring-2 focus:ring-journal-gold focus:border-transparent transition-all">
+                           focus:ring-2 focus:ring-journal-gold focus:border-transparent">
                 <p class="text-xs text-gray-500 dark:text-gray-400 mt-1">
                     Sequences with less than this much of the region are dropped. Typical extracted
                     lengths are ~200&nbsp;bp for ITS1, ~160&nbsp;bp for 5.8S, ~185&nbsp;bp for ITS2,
@@ -1365,7 +1360,7 @@
                 </label>
                 <select id="tree_method" class="w-full px-4 py-3 border border-gray-300 dark:border-journal-dark rounded-lg 
                                bg-white dark:bg-journal-dark text-gray-900 dark:text-gray-100
-                               focus:ring-2 focus:ring-journal-gold focus:border-transparent transition-all">
+                               focus:ring-2 focus:ring-journal-gold focus:border-transparent">
                     <option value="iqtree_fast" selected>IQ-TREE 5-iteration search (Quick ML)</option>
                     <option value="fasttree">FastTree 2.2.0 (Fast ML)</option>
                     <option value="raxml">RAxML-NG (High Quality ML)</option>
@@ -1382,7 +1377,7 @@
                 </label>
                 <select id="run_preset" class="w-full px-4 py-3 border border-gray-300 dark:border-journal-dark rounded-lg 
                                bg-white dark:bg-journal-dark text-gray-900 dark:text-gray-100
-                               focus:ring-2 focus:ring-journal-gold focus:border-transparent transition-all">
+                               focus:ring-2 focus:ring-journal-gold focus:border-transparent">
                     <option value="fast_good" selected>Fast but Good (2 Start Trees, Early Stopping OK)</option>
                     <option value="standard">Standard (5 Start Trees, Early Stopping OK)</option>
                     <option value="publication">Publication (10 Start Trees, No Early Stop)</option>
@@ -1402,12 +1397,12 @@
                 <!-- Standard Text Input -->
                 <input type="text" id="tree_model" value="GTR+G" class="w-full px-4 py-3 border border-gray-300 dark:border-journal-dark rounded-lg 
                               bg-white dark:bg-journal-dark text-gray-900 dark:text-gray-100
-                              focus:ring-2 focus:ring-journal-gold focus:border-transparent transition-all">
+                              focus:ring-2 focus:ring-journal-gold focus:border-transparent">
 
                 <!-- RAxML Dropdown (Hidden initially) -->
                 <select id="raxml_model_select" class="w-full px-4 py-3 border border-gray-300 dark:border-journal-dark rounded-lg 
                                bg-white dark:bg-journal-dark text-gray-900 dark:text-gray-100
-                               focus:ring-2 focus:ring-journal-gold focus:border-transparent transition-all hidden">
+                               focus:ring-2 focus:ring-journal-gold focus:border-transparent hidden">
                     <option value="GTR+G">GTR+G (DNA Default)</option>
                     <option value="LG+G">LG+G (Protein Default)</option>
                     <option value="HKY+G">HKY+G</option>
@@ -1422,7 +1417,7 @@
                 <!-- IQ-TREE Dropdown (Hidden initially) -->
                 <select id="iqtree_model_select" class="w-full px-4 py-3 border border-gray-300 dark:border-journal-dark rounded-lg
                                bg-white dark:bg-journal-dark text-gray-900 dark:text-gray-100
-                               focus:ring-2 focus:ring-journal-gold focus:border-transparent transition-all hidden">
+                               focus:ring-2 focus:ring-journal-gold focus:border-transparent hidden">
                     <option value="MFP">ModelFinder — pick best model automatically (recommended)</option>
                     <option value="GTR+G">GTR+G</option>
                     <option value="GTR+I+G">GTR+I+G</option>
@@ -1455,7 +1450,7 @@
             </label>
             <select id="outgroup_select" class="w-full px-4 py-3 border border-gray-300 dark:border-journal-dark rounded-lg 
                            bg-white dark:bg-journal-dark text-gray-900 dark:text-gray-100
-                           focus:ring-2 focus:ring-journal-gold focus:border-transparent transition-all">
+                           focus:ring-2 focus:ring-journal-gold focus:border-transparent">
                 <option value="">None (Auto / Midpoint)</option>
                 <!-- Populated by JS -->
             </select>
@@ -1471,11 +1466,11 @@
                        placeholder="Or add a GenBank accession, e.g. MH937541"
                        class="flex-1 px-4 py-2 border border-gray-300 dark:border-journal-dark rounded-lg
                               bg-white dark:bg-journal-dark text-gray-900 dark:text-gray-100
-                              focus:ring-2 focus:ring-journal-gold focus:border-transparent transition-all">
+                              focus:ring-2 focus:ring-journal-gold focus:border-transparent">
                 <button type="button" id="outgroup_accession_btn"
                         class="px-4 py-2 rounded-lg border border-gray-300 dark:border-journal-dark
                                bg-gray-50 dark:bg-journal-dark text-gray-700 dark:text-gray-200
-                               hover:bg-gray-100 dark:hover:bg-gray-700 transition-all whitespace-nowrap">
+                               hover:bg-gray-100 dark:hover:bg-gray-700 whitespace-nowrap">
                     <i class="fas fa-plus mr-2"></i>Add as Outgroup
                 </button>
             </div>
@@ -1494,7 +1489,7 @@
                 </label>
                 <input type="number" id="bootstrap" value="1000" min="0" max="10000" class="w-full md:w-1/2 px-4 py-3 border border-gray-300 dark:border-journal-dark rounded-lg 
                               bg-white dark:bg-journal-dark text-gray-900 dark:text-gray-100
-                              focus:ring-2 focus:ring-journal-gold focus:border-transparent transition-all">
+                              focus:ring-2 focus:ring-journal-gold focus:border-transparent">
                 <p id="iqtree_bootstrap_note" class="text-xs text-gray-500 dark:text-gray-400 mt-1 hidden">
                     IQ-TREE requires >= 1000 for Ultrafast Bootstrap.
                 </p>
@@ -1508,7 +1503,7 @@
                 </label>
                 <input type="number" id="alrt_replicates" value="1000" min="0" max="10000" class="w-full md:w-1/2 px-4 py-3 border border-gray-300 dark:border-journal-dark rounded-lg
                               bg-white dark:bg-journal-dark text-gray-900 dark:text-gray-100
-                              focus:ring-2 focus:ring-journal-gold focus:border-transparent transition-all">
+                              focus:ring-2 focus:ring-journal-gold focus:border-transparent">
                 <p class="text-xs text-gray-500 dark:text-gray-400 mt-1">
                     Runs the SH-aLRT branch test alongside Ultrafast Bootstrap. Nodes are then labelled
                     <span class="font-mono">SH-aLRT/UFBoot</span> (both 0&ndash;100); a clade is conventionally
@@ -1534,7 +1529,7 @@
                     <div class="flex gap-4">
                         <select id="bootstrap_preset" class="w-full md:w-2/3 px-4 py-3 border border-gray-300 dark:border-journal-dark rounded-lg 
                                        bg-white dark:bg-journal-dark text-gray-900 dark:text-gray-100
-                                       focus:ring-2 focus:ring-journal-gold focus:border-transparent transition-all">
+                                       focus:ring-2 focus:ring-journal-gold focus:border-transparent">
                             <option value="standard" selected>Standard (Max 500)</option>
                             <option value="publication">Publication (Max 1000)</option>
                             <option value="maximum">Maximum (Max 2000)</option>
@@ -1556,7 +1551,7 @@
                     </label>
                     <input type="number" id="mb_gen" value="1000000" step="1000" class="w-full px-4 py-3 border border-gray-300 dark:border-journal-dark rounded-lg
                                   bg-white dark:bg-journal-dark text-gray-900 dark:text-gray-100
-                                  focus:ring-2 focus:ring-journal-gold focus:border-transparent transition-all">
+                                  focus:ring-2 focus:ring-journal-gold focus:border-transparent">
                 </div>
                 <div>
                     <label for="mb_runs" class="block text-sm font-medium text-gray-700 dark:text-gray-200 mb-2">
@@ -1564,7 +1559,7 @@
                     </label>
                     <input type="number" id="mb_runs" value="2" class="w-full px-4 py-3 border border-gray-300 dark:border-journal-dark rounded-lg 
                                   bg-white dark:bg-journal-dark text-gray-900 dark:text-gray-100
-                                  focus:ring-2 focus:ring-journal-gold focus:border-transparent transition-all">
+                                  focus:ring-2 focus:ring-journal-gold focus:border-transparent">
                 </div>
                 <div>
                     <label for="mb_chains" class="block text-sm font-medium text-gray-700 dark:text-gray-200 mb-2">
@@ -1572,7 +1567,7 @@
                     </label>
                     <input type="number" id="mb_chains" value="4" class="w-full px-4 py-3 border border-gray-300 dark:border-journal-dark rounded-lg 
                                   bg-white dark:bg-journal-dark text-gray-900 dark:text-gray-100
-                                  focus:ring-2 focus:ring-journal-gold focus:border-transparent transition-all">
+                                  focus:ring-2 focus:ring-journal-gold focus:border-transparent">
                 </div>
                 <div>
                     <label for="mb_burnin" class="block text-sm font-medium text-gray-700 dark:text-gray-200 mb-2">
@@ -1580,7 +1575,7 @@
                     </label>
                     <input type="number" id="mb_burnin" value="25" min="0" max="99" step="0.1" class="w-full px-4 py-3 border border-gray-300 dark:border-journal-dark rounded-lg
                                   bg-white dark:bg-journal-dark text-gray-900 dark:text-gray-100
-                                  focus:ring-2 focus:ring-journal-gold focus:border-transparent transition-all">
+                                  focus:ring-2 focus:ring-journal-gold focus:border-transparent">
                 </div>
             </div>
             <div class="mt-4">
@@ -1653,7 +1648,7 @@
                 <i class="fas fa-filter text-journal-gold mr-2"></i>
                 Filter by BLAST Metrics
             </h3>
-            <button id="filter-modal-close-x" class="text-gray-400 hover:text-gray-600 dark:text-gray-500 dark:hover:text-gray-300 transition-colors p-1">
+            <button id="filter-modal-close-x" class="text-gray-400 hover:text-gray-600 dark:text-gray-500 dark:hover:text-gray-300 p-1">
                 <i class="fas fa-times text-lg"></i>
             </button>
         </div>
@@ -4405,7 +4400,7 @@
             const added = addSequences(sequences);
             showStatus(
                 `${data.message}. Added ${added} new sequences to the queue. `
-                + 'They are ready—click Run Quick Tree, or adjust Advanced settings first.',
+                + 'They are ready—click Build Quick Tree, or adjust Advanced settings first.',
                 'success'
             );
 
@@ -4719,7 +4714,7 @@
             // Alan 7/17/26 - Omit empty Archive and Accession rows from Mushroom Observer sequence details.
             return `
                 <label for="${inputId}"
-                       class="block cursor-pointer rounded-lg border border-gray-200 dark:border-gray-700 bg-white dark:bg-journal-dark p-4 hover:border-journal-gold transition-colors">
+                       class="block cursor-pointer rounded-lg border border-gray-200 dark:border-gray-700 bg-white dark:bg-journal-dark p-4 hover:border-journal-gold">
                     <div class="flex items-start gap-3">
                         <input type="radio" id="${inputId}" name="mushroom_observer_sequence"
                                value="${Number(sequence.id)}" ${autoSelected ? 'checked' : ''}
@@ -4997,7 +4992,7 @@
             reportWorkflowFailure('tree_builder.submit_quick_tree', e);
             showStatus('Submission Failed: ' + e.message, 'error');
             btn.disabled = false;
-            btn.innerHTML = '▶ Run Quick Tree';
+            btn.innerHTML = '▶ Build Quick Tree';
         }
     });
 
@@ -6048,7 +6043,7 @@
         const actionRow = document.querySelector('.mt-8.flex.flex-wrap.gap-4');
         if (actionRow) actionRow.style.display = 'none';
 
-        // "Run Quick Tree" would submit a brand-new job, which is not what this
+        // "Build Quick Tree" would submit a brand-new job, which is not what this
         // page does in edit mode. The Advanced panel stays, so the recompute can
         // be run with different settings than the original job -- but only once
         // it has been pre-filled from that job (see loadJobParamsIntoAdvanced).

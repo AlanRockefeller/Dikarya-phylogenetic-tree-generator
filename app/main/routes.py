@@ -834,6 +834,95 @@ def job_status(job_id):
                            status=status_info.get('status', 'unknown'),
                            input_warnings=input_warnings)
 
+
+@bp.post('/job/<job_id>/retry-mycomap-ncbi')
+@limiter.limit("6 per minute; 60 per hour")
+def retry_mycomap_ncbi(job_id):
+    """Retry a missing NCBI export on a completed local-only MycoMap tree."""
+    db_job, error_msg, status_code = check_job_access(job_id, mode="edit")
+    if error_msg:
+        abort(status_code)
+    if not db_job or db_job.status != "completed":
+        abort(409)
+
+    from app.config import Config
+    from app.services.artifact_storage import open_artifact
+    from app.services.mycomap_service import parse_mycomap_result_reference
+    from app.workers.queue import get_queue, get_redis_connection, safe_job_description
+    from app.services.inaturalist_tree_service import reconcile_delayed_ncbi_results
+
+    info_path = Config.JOB_DIR / job_id / "input_info.json"
+    try:
+        with open_artifact(info_path, "rt") as handle:
+            details = json.load(handle)
+    except (OSError, ValueError):
+        abort(409)
+    url = str(details.get("mycomap_blast_url") or
+              (db_job.metrics or {}).get("mycomap_blast_url") or "").strip()
+    records = details.get("sequence_metadata") or []
+    if (not parse_mycomap_result_reference(url)
+            or not any(row.get("source") == "mycomap" and row.get("hit_source") == "local"
+                       for row in records if isinstance(row, dict))
+            or any(row.get("source") == "mycomap" and row.get("hit_source") == "ncbi"
+                   for row in records if isinstance(row, dict))):
+        abort(409)
+
+    metrics = dict(db_job.metrics or {})
+    rerun = dict(metrics.get("mycomap_blast_rerun") or {})
+    if rerun.get("ncbi_fallback_local_only") or rerun.get("ncbi_recompute_pending"):
+        flash("An NCBI follow-up is already scheduled for this tree.", "info")
+        return redirect(url_for("main.job_viewer", job_id=job_id))
+
+    # A deterministic short lock prevents repeated clicks from queuing parallel
+    # appends and recomputes. The existing recheck is still idempotent if a
+    # worker restart redelivers one of these jobs.
+    try:
+        redis = get_redis_connection()
+        lock_key = f"mycomap-ncbi-manual-retry:{job_id}"
+        acquired = redis.set(lock_key, "1", nx=True, ex=600)
+    except Exception:
+        logger.exception("Could not reserve MycoMap NCBI retry for job %s", job_id)
+        abort(503)
+    if not acquired:
+        flash("An NCBI retry has already been requested.", "info")
+        return redirect(url_for("main.job_viewer", job_id=job_id))
+    previous_metrics = dict(metrics)
+    try:
+        rerun["ncbi_fallback_local_only"] = True
+        rerun["ncbi_download_failed"] = True
+        rerun["ncbi_recheck_count"] = 0
+        metrics["mycomap_blast_rerun"] = rerun
+        metrics["mycomap_blast_url"] = url
+        warning = (
+            "MycoMap NCBI download is being retried. This tree remains local-only "
+            "until any recovered NCBI sequences are added and the tree is rebuilt."
+        )
+        metrics["mycomap_refresh_warnings"] = list(dict.fromkeys(
+            list(metrics.get("mycomap_refresh_warnings") or []) + [warning]
+        ))
+        db_job.metrics = metrics
+        db.session.commit()
+        get_queue("phylo_bulk").enqueue(
+            reconcile_delayed_ncbi_results, job_id, job_timeout="10m",
+            description=safe_job_description("manual ncbi reconcile", job_id=job_id),
+        )
+    except Exception:
+        logger.exception("Could not schedule MycoMap NCBI retry for job %s", job_id)
+        try:
+            db.session.rollback()
+            db_job.metrics = previous_metrics
+            db.session.commit()
+        except Exception:
+            db.session.rollback()
+            logger.exception("Could not restore metrics for job %s", job_id)
+        try:
+            redis.delete(lock_key)
+        except Exception:
+            logger.exception("Could not release NCBI retry lock for job %s", job_id)
+        abort(503)
+    flash("MycoMap NCBI retry queued. The tree will rebuild if new sequences arrive.", "success")
+    return redirect(url_for("main.job_viewer", job_id=job_id))
+
 from app.config import Config
 import json
 
@@ -950,12 +1039,28 @@ def job_viewer(job_id):
         logger.exception("Could not resolve type specimens for job %s", job_id)
         type_specimens = {"records": {}, "names": {}}
 
+    mycomap_records = [row for row in job_details.get("sequence_metadata", [])
+                       if isinstance(row, dict) and row.get("source") == "mycomap"]
+    rerun_state = ((db_job.metrics or {}).get("mycomap_blast_rerun") or {}) \
+        if db_job and isinstance(db_job.metrics, dict) else {}
+    mycomap_ncbi_retry_available = bool(
+        not view_only and db_job and db_job.status == "completed"
+        and job_details.get("mycomap_blast_url")
+        and any(row.get("hit_source") == "local" for row in mycomap_records)
+        and not any(row.get("hit_source") == "ncbi" for row in mycomap_records)
+        and not rerun_state.get("ncbi_fallback_local_only")
+        and not rerun_state.get("ncbi_recompute_pending")
+    )
+
     return render_template(
         'job_viewer.html', job_id=job_id, job_details=job_details, view_only=view_only,
         type_specimens=type_specimens,
         claude_review_enabled=claude_review_enabled(),
         tree_support_context=tree_support_context,
         generation_details=generation_details,
+        mycomap_refresh_warnings=(db_job.metrics or {}).get("mycomap_refresh_warnings", [])
+        if db_job and isinstance(db_job.metrics, dict) else [],
+        mycomap_ncbi_retry_available=mycomap_ncbi_retry_available,
     )
 
 # /health moved to the monitoring blueprint (app/monitoring/routes.py) where

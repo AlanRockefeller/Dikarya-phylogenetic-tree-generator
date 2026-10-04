@@ -1067,7 +1067,8 @@ def _mycomap_title_slug(title: str) -> str:
 
 
 def find_mycomap_blast_by_known_id(blast_id: str, title: str,
-                                   warnings: Optional[list] = None
+                                   warnings: Optional[list] = None, *,
+                                   verify_title: bool = False,
                                    ) -> Optional[dict]:
     """
     Find a created BLAST whose ID we already hold, without the title lookup.
@@ -1096,8 +1097,8 @@ def find_mycomap_blast_by_known_id(blast_id: str, title: str,
         return None
 
     url = find_mycomap_record_url_by_id(blast_id, warnings)
-    if not url:
-        candidate = (
+    if not url or verify_title:
+        candidate = url or (
             "https://mycomap.com/genetics/blast-search/"
             f"{_mycomap_title_slug(wanted)}-r{blast_id}/"
         )

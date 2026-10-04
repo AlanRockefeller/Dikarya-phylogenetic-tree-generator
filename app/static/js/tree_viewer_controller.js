@@ -835,6 +835,7 @@ document.addEventListener('DOMContentLoaded', async () => {
     let annotationRevision = 0;
     // Alan 8/15/26 - Editor session: what is being added/edited and for which tips.
     let annotationEditorState = null;
+    let annotationMembershipPicker = null;
     const ANNOTATION_STYLE_FIELDS = [
         { field: 'font_family', label: 'Font' },
         { field: 'font_size', label: 'Size' },
@@ -1015,8 +1016,10 @@ document.addEventListener('DOMContentLoaded', async () => {
         try {
             const state = await TreeEditActions.getTreeState(JOB_ID);
             applyAnnotationState(state.annotation_layers, state.clade_annotations);
+            return true;
         } catch (e) {
             console.warn('Could not reload annotations:', e);
+            return false;
         }
     }
 
@@ -1039,6 +1042,7 @@ document.addEventListener('DOMContentLoaded', async () => {
     // POST was in flight is coalesced into a single follow-up send of the current state.
     async function runAnnotationSaveCycle() {
         let ok = true;
+        let reloaded = false;
         try {
             do {
                 annotationSaveQueued = false;
@@ -1066,12 +1070,12 @@ document.addEventListener('DOMContentLoaded', async () => {
                         clearTimeout(annotationSaveDebounce);
                         annotationSaveDebounce = null;
                     }
-                    await reloadAnnotationsFromServer();
+                    reloaded = await reloadAnnotationsFromServer();
                     ok = false;
                     break;
                 }
             } while (annotationSaveQueued);
-            return ok;
+            return ok ? true : (reloaded ? null : false);
         } finally {
             // Cleared synchronously as the loop exits, so a caller can never join a cycle
             // that has already decided it has nothing left to send.
@@ -1828,6 +1832,112 @@ document.addEventListener('DOMContentLoaded', async () => {
         return true;
     }
 
+    function updateAnnotationMembershipPicker() {
+        if (!annotationMembershipPicker || !viewer) return;
+        const selected = viewer.getSelectedAnnotationLeafIds?.() || [];
+        const count = selected.length;
+        const status = getEl('annotation-membership-status');
+        const save = getEl('btn-annotation-membership-save');
+        const clade = count && viewer.getSelectedCladeLeafIds?.();
+        const type = canonicalAnnotationType(annotationMembershipPicker.annotationType);
+        const branchType = !CLADE_ANNOTATION_TYPES.includes(type);
+        const missingBranch = clade && branchType
+            && !viewer.hasIncomingBranchForMemberIds?.(clade);
+        const invalidBranch = branchType && (!clade || missingBranch);
+        if (save) {
+            save.disabled = !count || invalidBranch || annotationMembershipPicker.saving;
+            save.textContent = annotationMembershipPicker.saving ? 'Saving…'
+                : annotationMembershipPicker.confirmSelectedGroup && !clade
+                    ? 'Save selected group anyway' : 'Save members';
+        }
+        const cancel = getEl('btn-annotation-membership-cancel');
+        if (cancel) cancel.disabled = annotationMembershipPicker.saving;
+        if (!status) return;
+        if (!count) status.textContent = 'Select at least one tip. Click tips or drag a box; Cancel restores your previous selection.';
+        else if (missingBranch) status.textContent = 'This annotation type needs a clade with an incoming branch.';
+        else if (invalidBranch) status.textContent = 'This annotation type needs one complete clade.';
+        else if (!clade) status.textContent = annotationMembershipPicker.confirmSelectedGroup
+            ? `${count} tips across multiple clades. Save this explicitly selected group?`
+            : `${count} tips across multiple clades. Saving will label them as a selected group; review before confirming.`;
+        else status.textContent = `${count} selected tip${count === 1 ? '' : 's'}. Click tips or drag a box to add or remove members.`;
+    }
+
+    function startAnnotationMembershipPicker(annotationId) {
+        if (!annotationsEditable() || !viewer?.selectLeafIds) return;
+        const annotation = cladeAnnotations.find(item => item.id === annotationId);
+        if (!annotation) return;
+        annotationMembershipPicker = {
+            annotationId,
+            annotationType: annotation.annotation_type,
+            previousSelection: viewer.getSelectedAnnotationLeafIds?.() || [],
+            confirmSelectedGroup: false,
+            saving: false
+        };
+        closeAnnotationManager();
+        viewer.selectLeafIds(annotation.member_tip_ids || []);
+        getEl('annotation-membership-label').textContent = annotation.label;
+        getEl('annotation-membership-picker')?.classList.remove('hidden');
+        updateButtons();
+    }
+
+    function closeAnnotationMembershipPicker(restoreSelection, force = false) {
+        if (annotationMembershipPicker?.saving && !force) return;
+        const previous = annotationMembershipPicker?.previousSelection;
+        annotationMembershipPicker = null;
+        getEl('annotation-membership-picker')?.classList.add('hidden');
+        if (restoreSelection && previous && viewer?.selectLeafIds) {
+            viewer.selectLeafIds(previous);
+            updateButtons();
+        }
+    }
+
+    async function saveAnnotationMembershipPicker() {
+        if (!annotationMembershipPicker || annotationMembershipPicker.saving || !viewer) return;
+        const selected = viewer.getSelectedAnnotationLeafIds?.() || [];
+        if (!selected.length) return;
+        const clade = viewer.getSelectedCladeLeafIds?.();
+        const type = canonicalAnnotationType(annotationMembershipPicker.annotationType);
+        if (!CLADE_ANNOTATION_TYPES.includes(type)
+            && (!clade || !viewer.hasIncomingBranchForMemberIds?.(clade))) return;
+        if (!clade && !annotationMembershipPicker.confirmSelectedGroup) {
+            annotationMembershipPicker.confirmSelectedGroup = true;
+            updateAnnotationMembershipPicker();
+            return;
+        }
+        const index = cladeAnnotations.findIndex(item => item.id === annotationMembershipPicker.annotationId);
+        if (index < 0) return;
+        const original = cladeAnnotations[index];
+        const changed = !sameTipIdSet(original.member_tip_ids, selected)
+            || Boolean(original.membership_mode) !== !clade;
+        if (!changed) {
+            closeAnnotationMembershipPicker(false);
+            showStatus('Annotation members are unchanged.', 'info', 2000);
+            return;
+        }
+        const updated = { ...original, member_tip_ids: selected.slice() };
+        if (clade) delete updated.membership_mode;
+        else updated.membership_mode = 'selection';
+        annotationMembershipPicker.saving = true;
+        updateAnnotationMembershipPicker();
+        cladeAnnotations[index] = updated;
+        const saved = await saveAnnotationsNow();
+        if (saved) {
+            closeAnnotationMembershipPicker(false, true);
+            showStatus(`Updated members of "${updated.label}".`, 'success', 2500);
+        } else if (annotationMembershipPicker) {
+            if (saved === false) {
+                // The server could not be reloaded after the failed save. Restore
+                // the local copy so Cancel or another edit cannot later save it.
+                const currentIndex = cladeAnnotations.findIndex(item => item.id === updated.id);
+                if (currentIndex >= 0) cladeAnnotations[currentIndex] = original;
+                viewer.setCladeAnnotations?.(annotationLayers, cladeAnnotations);
+                renderAnnotationManager();
+            }
+            annotationMembershipPicker.saving = false;
+            updateAnnotationMembershipPicker();
+        }
+    }
+
     async function deleteCurrentAnnotation() {
         if (!annotationEditorState || annotationEditorState.mode !== 'edit') return;
         const id = annotationEditorState.annotationId;
@@ -1955,6 +2065,9 @@ document.addEventListener('DOMContentLoaded', async () => {
             // Mutating controls simply are not rendered for read-only viewers; the server
             // rejects the requests regardless, so this is presentation only.
             if (annotationsEditable()) {
+                row.appendChild(annotationIconButton('fas fa-users', 'Edit members', () => {
+                    startAnnotationMembershipPicker(annotation.id);
+                }));
                 row.appendChild(annotationIconButton('fas fa-pen', 'Edit annotation', () => {
                     openAnnotationEditor('edit', { annotationId: annotation.id });
                 }));
@@ -2584,6 +2697,16 @@ document.addEventListener('DOMContentLoaded', async () => {
         button.title = `${sort.title}. Click to cycle node sorting (S)`;
     }
 
+    // Alan 10/3/26 - Auto root now usually roots on a clade around the chosen hit
+    // (rooting_info.root_clade), so the notice must not present one tip as the whole outgroup.
+    function autoRootNoticeLabel(info, target) {
+        if (info.chosen_by === 'most_divergent_hit') return `Auto root used the most divergent hit: ${target}`;
+        const cladeTips = Number((info.root_clade || {}).tip_count) || 1;
+        return cladeTips > 1
+            ? `Auto root chose an outgroup clade of ${cladeTips} sequences, including ${target}`
+            : `Auto root chose outgroup: ${target}`;
+    }
+
     function rootingFinalStatus(mode, result) {
         needsSequenceOfInterest = !!(result && result.needs_sequence_of_interest);
         const info = (result && result.rooting_info) || {};
@@ -2599,9 +2722,8 @@ document.addEventListener('DOMContentLoaded', async () => {
         }
         if (info.chosen_by === 'auto' || info.chosen_by === 'most_divergent_hit') {
             const target = info.chosen_root_target || (result && result.root_target) || 'selected tip';
-            const label = info.chosen_by === 'most_divergent_hit'
-                ? `Auto root used the most divergent hit: ${target}`
-                : `Auto root chose outgroup: ${target}`;
+            // Alan 10/3/26 - Shared wording; names the outgroup clade when there is one.
+            const label = autoRootNoticeLabel(info, target);
             // Alan 5/31/26 - Keep the chosen-outgroup message up (sticky) so it can actually be read.
             // Alan 8/4/26 - The persistent banner now carries this, so suppress the duplicate
             // toast whenever the banner accepted it; a short confirmation is enough.
@@ -2737,6 +2859,9 @@ document.addEventListener('DOMContentLoaded', async () => {
             showSupport: true,
             // Alan 9/23/26 - Fade by support ships checked; honour the box if a cached page differs.
             supportFade: getEl('cb-fade-by-support') ? getEl('cb-fade-by-support').checked : true,
+            // Alan 10/3/26 - Collapse weak branches ships unchecked; null threshold = scale default.
+            supportCollapse: !!getEl('cb-collapse-weak-support')?.checked,
+            supportCollapseThreshold: null,
             layout: 'linear',
             alignTips: false,
             // grab initial DOM values
@@ -2824,9 +2949,8 @@ document.addEventListener('DOMContentLoaded', async () => {
                 // Alan 5/31/26 - On initial page load (not post-action reloads), tell the user
                 // which sequence auto root chose as the outgroup when the tree opens already auto-rooted.
                 } else if (!opts.fromAction && loadedMode === 'auto' && (loadedInfo.chosen_by === 'auto' || loadedInfo.chosen_by === 'most_divergent_hit') && loadedInfo.chosen_root_target) {
-                    const label = loadedInfo.chosen_by === 'most_divergent_hit'
-                        ? `Auto root used the most divergent hit: ${loadedInfo.chosen_root_target}`
-                        : `Auto root chose outgroup: ${loadedInfo.chosen_root_target}`;
+                    // Alan 10/3/26 - Shared wording; names the outgroup clade when there is one.
+                    const label = autoRootNoticeLabel(loadedInfo, loadedInfo.chosen_root_target);
                     // Alan 8/4/26 - Prefer the persistent banner; only fall back to the sticky
                     // toast when the banner is missing, otherwise the same rooting sentence
                     // renders twice on screen.
@@ -3319,6 +3443,8 @@ document.addEventListener('DOMContentLoaded', async () => {
             button.addEventListener('click', () => setAnnotationManagerTab(button.getAttribute('data-annotation-tab')));
         });
         getEl('btn-annotation-add-selected')?.addEventListener('click', annotateCurrentSelection);
+        getEl('btn-annotation-membership-cancel')?.addEventListener('click', () => closeAnnotationMembershipPicker(true));
+        getEl('btn-annotation-membership-save')?.addEventListener('click', saveAnnotationMembershipPicker);
         getEl('btn-annotation-add-layer')?.addEventListener('click', async () => {
             if (!annotationsEditable()) return;
             createAnnotationLayer(`Layer ${annotationLayers.length + 1}`);
@@ -4205,6 +4331,38 @@ document.addEventListener('DOMContentLoaded', async () => {
             viewer.setOptions({ supportFade: !!event.target.checked });
         });
 
+        // Alan 10/3/26 - Collapse weak branches. The collapse happens when the Newick is parsed,
+        // so a change re-renders through the normal load path (which restores renames, colours
+        // and annotations). The slider only re-renders on release; dragging updates the number.
+        const collapseBox = getEl('cb-collapse-weak-support');
+        const collapseSlider = getEl('slider-support-collapse');
+        const rerenderForCollapse = () => {
+            if (!viewer) return;
+            loadTree({ fromAction: true });
+        };
+        collapseBox?.addEventListener('change', () => {
+            if (!viewer) return;
+            viewer.options.supportCollapse = collapseBox.checked;
+            updateSupportCollapseUI(viewer.getStats());
+            rerenderForCollapse();
+        });
+        collapseSlider?.addEventListener('input', () => {
+            const spec = window.describeSupportCollapse?.(viewer?.getStats()?.supportType);
+            const valueEl = getEl('support-collapse-value');
+            if (spec && valueEl) valueEl.textContent = spec.format(Number(collapseSlider.value));
+        });
+        collapseSlider?.addEventListener('change', () => {
+            if (!viewer) return;
+            viewer.options.supportCollapseThreshold = Number(collapseSlider.value);
+            rerenderForCollapse();
+        });
+        getEl('btn-support-collapse-reset')?.addEventListener('click', () => {
+            if (!viewer) return;
+            viewer.options.supportCollapseThreshold = null;
+            updateSupportCollapseUI(viewer.getStats());
+            rerenderForCollapse();
+        });
+
         // SVG Save
         getEl('btn-save-svg')?.addEventListener('click', (e) => {
             e.preventDefault();
@@ -4551,6 +4709,10 @@ document.addEventListener('DOMContentLoaded', async () => {
             // Alan 8/15/26 - Escape closes the annotation editor first, then the manager behind it,
             // matching how the Rename modal already behaves.
             if (e.key === 'Escape') {
+                if (annotationMembershipPicker) {
+                    closeAnnotationMembershipPicker(true);
+                    return;
+                }
                 const editorModal = getEl('modal-annotation-editor');
                 if (editorModal && !editorModal.classList.contains('hidden')) {
                     closeAnnotationEditor();
@@ -4689,6 +4851,10 @@ document.addEventListener('DOMContentLoaded', async () => {
         // action is in flight, and before a tree has finished loading.
         updateUndoButton();
         if (!viewer) return;
+        if (annotationMembershipPicker) {
+            annotationMembershipPicker.confirmSelectedGroup = false;
+            updateAnnotationMembershipPicker();
+        }
 
         // Multi-select check
         let selCount = 0;
@@ -4895,8 +5061,58 @@ document.addEventListener('DOMContentLoaded', async () => {
         });
     }
 
+    // Alan 10/3/26 - Fit the collapse slider to this tree's support scale and report how many
+    // branches the current cutoff collapses. Disabled for trees with no single scale.
+    function updateSupportCollapseUI(stats) {
+        const box = getEl('cb-collapse-weak-support');
+        const label = getEl('label-collapse-weak-support');
+        const controls = getEl('support-collapse-controls');
+        const slider = getEl('slider-support-collapse');
+        if (!box) return;
+        const spec = stats ? window.describeSupportCollapse?.(stats.supportType) : null;
+        box.disabled = !spec;
+        if (label) {
+            label.classList.toggle('opacity-40', !spec);
+            label.classList.toggle('cursor-not-allowed', !spec);
+        }
+        if (controls) controls.hidden = !(spec && box.checked);
+        if (!spec || !slider) return;
+
+        const wanted = viewer?.options?.supportCollapseThreshold;
+        const value = (wanted === null || wanted === undefined) ? spec.defaultValue : wanted;
+        slider.min = String(spec.min);
+        slider.max = String(spec.max);
+        slider.step = String(spec.step);
+        slider.value = String(value);
+        const ticks = getEl('support-collapse-ticks');
+        if (ticks) {
+            ticks.textContent = '';
+            const tick = document.createElement('option');
+            tick.value = String(spec.defaultValue);
+            ticks.appendChild(tick);
+        }
+        const nameEl = getEl('support-collapse-label');
+        if (nameEl) {
+            nameEl.textContent = spec.fixedAlrt !== null
+                ? `UFBoot (SH-aLRT fixed at ${spec.fixedAlrt})` : spec.label;
+        }
+        const valueEl = getEl('support-collapse-value');
+        if (valueEl) valueEl.textContent = spec.format(Number(value));
+        slider.title = `Standard cutoff: ${spec.format(spec.defaultValue)}`;
+        const summaryEl = getEl('support-collapse-summary');
+        if (summaryEl) {
+            const summary = viewer?.getSupportCollapseSummary?.();
+            summaryEl.textContent = summary
+                ? `${summary.collapsed} of ${summary.internal} internal branches collapsed. `
+                    + `Standard cutoff: ${spec.format(spec.defaultValue)}.`
+                : `Standard cutoff: ${spec.format(spec.defaultValue)}.`;
+        }
+    }
+
     function updateSupportUI(stats) {
         if (!stats) return;
+        // Alan 10/3/26 - Keep the collapse controls in step with every support refresh.
+        updateSupportCollapseUI(stats);
         const badge = getEl('support-type-badge');
         const ppInput = getEl('input-pp-threshold');
         const bsInput = getEl('input-bs-threshold');

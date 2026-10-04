@@ -12606,13 +12606,13 @@
           // Alan 9/23/26 - At most one zoom-button step per Ctrl+wheel click (was 4x).
           .wheelDelta(boundedWheelDelta)
           // Alan 8/16/26 - Dikarya change: pan with the RIGHT mouse button so the left
-          // button is free for box select. Node right-drags are excluded so the tip and
-          // internal-node context menus still open. Non-mouse gestures (wheel, touch)
+          // button is free for box select. Node and annotation right-drags are excluded
+          // so their context menus still open. Non-mouse gestures (wheel, touch)
           // keep d3's default filter.
           .filter((event) => {
             if (event.type === "mousedown") {
               if (event.button !== 2) return false;
-              return !(event.target && event.target.closest && event.target.closest(".node, .internal-node"));
+              return !(event.target && event.target.closest && event.target.closest(".node, .internal-node, .clade-annotation"));
             }
             // Alan 8/28/26 - Dikarya mobile Select mode owns touch taps and background box
             // selection; Navigate mode must continue through D3 for camera pan and pinch zoom.

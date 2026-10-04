@@ -7,7 +7,7 @@
 {% block main_width %}max-w-none{% endblock %}
 
 {% block head %}
-<link rel="stylesheet" href="{{ url_for('static', filename='css/tree_viewer.css') }}?v=23">
+<link rel="stylesheet" href="{{ url_for('static', filename='css/tree_viewer.css') }}?v=24">
 <link rel="stylesheet" href="{{ url_for('static', filename='css/phylotree.css') }}?v=3">
 <link rel="stylesheet" href="{{ url_for('static', filename='css/phylotree-menus.css') }}?v=3">
 <link rel="preconnect" href="https://fonts.googleapis.com">
@@ -17,6 +17,31 @@
 {% endblock %}
 
 {% block content %}
+{% for warning in mycomap_refresh_warnings %}
+<div role="alert" class="mb-4 rounded-xl border border-amber-500 bg-amber-50 dark:bg-amber-950/40 px-5 py-4 text-amber-950 dark:text-amber-100 shadow-sm">
+    <p class="font-bold"><i class="fas fa-triangle-exclamation mr-2" aria-hidden="true"></i>MycoMap import warning</p>
+    <p class="mt-1 text-sm">{{ warning }}</p>
+</div>
+{% endfor %}
+{% if mycomap_ncbi_retry_available %}
+<div class="mb-4 rounded-xl border border-journal-gold/60 bg-journal-gold/10 px-5 py-4 text-journal-dark dark:text-gray-100">
+    <p class="font-semibold">This MycoMap tree contains local hits but no NCBI hits.</p>
+    <p class="mt-1 text-sm">If NCBI results are now available on MycoMap, check again and add them to this tree.</p>
+    <form class="mt-3" method="post" action="{{ url_for('main.retry_mycomap_ncbi', job_id=job_id) }}">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+        <button type="submit" class="rounded-lg bg-journal-gold px-3 py-2 text-sm font-semibold text-journal-dark">Retry NCBI import</button>
+    </form>
+</div>
+{% endif %}
+{% if (generation_details or {}).get('convergence_warning') %}
+<div role="alert" class="mb-4 rounded-xl border border-amber-500 bg-amber-50 dark:bg-amber-950/40 px-5 py-4 text-amber-950 dark:text-amber-100 shadow-sm">
+    <p class="font-bold"><i class="fas fa-triangle-exclamation mr-2" aria-hidden="true"></i>MrBayes convergence warning</p>
+    <p class="mt-1 text-sm">{{ generation_details.convergence_warning }}</p>
+    {% if not view_only %}
+    <a class="mt-2 inline-block text-sm font-semibold underline" href="{{ url_for('main.sequence_entry', edit_job_id=job_id) }}">Recompute this tree with more generations</a>
+    {% endif %}
+</div>
+{% endif %}
 <!-- Cached viewer state for this job. Superseded by /api/job/q0x9/state in the
      next viewer release; the legacy path is retained for older bookmarks. -->
 <!-- Page Header: title, method chips and the page-level actions -->
@@ -338,6 +363,24 @@
                     </button>
                 </div>
             </div>
+        </div>
+    </div>
+</div>
+
+<!-- Edit annotation members while the tree stays interactive -->
+<div id="annotation-membership-picker"
+    class="fixed bottom-4 left-1/2 z-40 hidden w-[min(42rem,calc(100%-2rem))] -translate-x-1/2 rounded-xl border border-journal-gold bg-white p-4 shadow-2xl dark:bg-journal-green"
+    role="region" aria-label="Edit annotation members">
+    <div class="flex flex-wrap items-center justify-between gap-3">
+        <div>
+            <p class="text-sm font-semibold text-journal-dark dark:text-gray-100">Edit members: <span id="annotation-membership-label"></span></p>
+            <p id="annotation-membership-status" class="mt-1 text-xs text-gray-600 dark:text-gray-300" aria-live="polite"></p>
+        </div>
+        <div class="flex gap-2">
+            <button type="button" id="btn-annotation-membership-cancel"
+                class="rounded border border-gray-300 px-3 py-1.5 text-sm dark:border-gray-600 dark:text-gray-100">Cancel</button>
+            <button type="button" id="btn-annotation-membership-save"
+                class="rounded bg-journal-gold px-3 py-1.5 text-sm font-semibold text-journal-dark disabled:opacity-50">Save members</button>
         </div>
     </div>
 </div>
@@ -899,6 +942,26 @@
                             type="checkbox" id="cb-fade-by-support" checked>
                         Fade by support
                     </label>
+                    {# Alan 10/3/26 - Collapse branches below a support cutoff into polytomies.
+                       Off by default; display only. The slider's range, default and label are set
+                       from the support type by updateSupportCollapseUI(). #}
+                    <label id="label-collapse-weak-support" class="settings-check"
+                        title="Contract branches whose support is below the cutoff, so unsupported splits are not drawn as resolved. Display only; the tree and downloads are unchanged.">
+                        <input class="rounded border-gray-300 text-journal-gold focus:ring-journal-gold w-3.5 h-3.5"
+                            type="checkbox" id="cb-collapse-weak-support">
+                        Collapse weak branches
+                    </label>
+                    <div id="support-collapse-controls" class="settings-slider" hidden>
+                        <div class="settings-slider-head">
+                            <span id="support-collapse-label">Support</span>
+                            <span class="settings-value">&lt; <span id="support-collapse-value">--</span></span>
+                        </div>
+                        <input type="range" id="slider-support-collapse" min="0" max="100" value="95" step="1"
+                            list="support-collapse-ticks" class="w-full cursor-pointer accent-yellow-600">
+                        <datalist id="support-collapse-ticks"></datalist>
+                        <p id="support-collapse-summary" class="settings-help"></p>
+                        <button type="button" id="btn-support-collapse-reset" class="tree-tool">Reset to standard</button>
+                    </div>
                 </section>
 
                 <section id="settings-panel-sequences" class="tree-settings-body" role="tabpanel"
@@ -1504,13 +1567,13 @@
 
 <script src="{{ url_for('static', filename='vendor/underscore-1.13.6-min.js') }}"></script>
 
-<script src="{{ url_for('static', filename='js/phylotree.js') }}?v=14"></script>
+<script src="{{ url_for('static', filename='js/phylotree.js') }}?v=15"></script>
 
-<script src="{{ url_for('static', filename='js/tree_viewer_phylotree_v2.js') }}?v=104"></script>
+<script src="{{ url_for('static', filename='js/tree_viewer_phylotree_v2.js') }}?v=106"></script>
 
 <script src="{{ url_for('static', filename='js/tree_viewer_api.js') }}?v=8"></script>
 
-<script src="{{ url_for('static', filename='js/tree_viewer_controller.js') }}?v=98"></script>
+<script src="{{ url_for('static', filename='js/tree_viewer_controller.js') }}?v=101"></script>
 
 {% include 'partials/alignment_viewer_modal.html' %}
 

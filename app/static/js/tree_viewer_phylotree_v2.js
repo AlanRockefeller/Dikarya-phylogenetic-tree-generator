@@ -432,6 +432,31 @@
         };
     };
 
+    // Alan 10/3/26 - "Collapse weak branches": internal branches whose support is below a
+    // user-chosen cutoff are contracted into polytomies, so a split the data do not support
+    // is not drawn as resolved. Display only, like the zero-length contraction: the Newick,
+    // tree_state.json and every edit endpoint still see the builder's binary tree. The
+    // default cutoff for each scale is the fade's "strong" bin, so the two features agree on
+    // what a well-supported branch is. For dual SH-aLRT/UFBoot the slider moves the UFBoot
+    // cutoff and SH-aLRT stays at its conventional 80 (IQ-TREE's "SH-aLRT >= 80 and UFBoot
+    // >= 95" reading). Null for a tree whose scale cannot be thresholded (none, mixed).
+    window.describeSupportCollapse = function (supportType) {
+        const dual = supportType === 'ALRT_UFBOOT';
+        const bins = dual ? SUPPORT_FADE_BINS.UFBOOT : SUPPORT_FADE_BINS[supportType];
+        if (!bins) return null;
+        const info = (window.SUPPORT_TYPE_INFO || {})[supportType] || { label: supportType };
+        return {
+            label: dual ? 'UFBoot' : info.label,
+            proportion: bins.proportion,
+            min: 0,
+            max: bins.proportion ? 1 : 100,
+            step: bins.proportion ? 0.01 : 1,
+            defaultValue: bins.strong,
+            fixedAlrt: dual ? SUPPORT_FADE_BINS.ALRT.strong : null,
+            format: (value) => formatSupportFadeValue(value, bins)
+        };
+    };
+
     // --- ZOOM PANIC STOP ---
     if (!window.__dikarya_zoom_panic_stop_attached) {
         window.__dikarya_zoom_panic_stop_attached = true;
@@ -733,6 +758,7 @@
             this.typeSpecimenCount = 0;
 
             this.tree = null;
+            this.exportTree = null;
             this.newick = null;
             this.allNodes = []; // Node Cache
 
@@ -953,6 +979,7 @@
         // a reload that keeps the user's sort renders once instead of drawing and re-sorting.
         async render(newick, renderOptions = {}) {
             this.newick = newick;
+            this.exportTree = null;
             if (!this.container) return;
 
             // 1. CLEAR & SETUP
@@ -987,6 +1014,13 @@
             // each complete zero-length tip component before recording "original" order, so
             // Sort -> Original and later reloads both retain the useful grouped presentation.
             this._groupZeroLengthPolytomies();
+            // Keep the full topology for Newick export. Support collapse changes
+            // only the live display hierarchy and must not discard weak splits.
+            if (this.options.supportCollapse) {
+                this.exportTree = new phylotreeLib.phylotree(this.tree.getNewick());
+            }
+            // Alan 10/3/26 - Then, when enabled, contract branches below the support cutoff.
+            this._collapseWeakSupportBranches();
 
             // Tag original order per-parent for correct restoration
             this.tree.traverse_and_compute(n => {
@@ -1196,6 +1230,9 @@
 
             // 3. COMPUTE STATS
             this.lastStats = this._computeSupportStats();
+            // Alan 10/3/26 - Collapsing can remove every supported node; the tree's support
+            // scale is still the one it was built with, so the badge and controls keep it.
+            if (this.supportCollapseState) this.lastStats.supportType = this.supportCollapseState.supportType;
             if (this.container) this.container.__treeStats = this.lastStats;
 
             // Alan 5/9/26 - Apply any existing sequence metric filter state before the first draw.
@@ -1280,7 +1317,10 @@
             const pending = [tip];
             while (pending.length) {
                 const node = pending.pop();
-                if (node.parent && this._hasZeroLengthIncomingBranch(node)
+                // Alan 10/4/26 - Never climb into the root: a zero-length branch hanging off the
+                // root (an outgroup rooted on a zero-length stem) would otherwise splice that
+                // whole side into the root and scatter it beside the ingroup (job wida).
+                if (node.parent && node.parent.parent && this._hasZeroLengthIncomingBranch(node)
                     && !component.has(node.parent)) {
                     component.add(node.parent);
                     pending.push(node.parent);
@@ -1499,6 +1539,108 @@
                 contracted += 1;
             }
             return contracted;
+        }
+
+        /**
+         * Alan 10/3/26 - The support cutoff in force, or null when collapsing is off or the
+         * tree's scale cannot be thresholded.
+         */
+        _supportCollapseCutoff(supportType) {
+            if (!this.options.supportCollapse) return null;
+            const spec = window.describeSupportCollapse(supportType);
+            if (!spec) return null;
+            const raw = this.options.supportCollapseThreshold;
+            // Alan 10/3/26 - null/'' means "use the default"; Number(null) would read as 0.
+            const wanted = (raw === null || raw === undefined || raw === '') ? NaN : Number(raw);
+            const value = Number.isFinite(wanted)
+                ? Math.max(spec.min, Math.min(spec.max, wanted)) : spec.defaultValue;
+            return { spec, value };
+        }
+
+        /**
+         * Alan 10/3/26 - Contract every internal branch whose support is below the cutoff
+         * (see describeSupportCollapse). Runs at parse time, after the zero-length pass, so a
+         * change of cutoff is a re-render. Unlike the zero-length pass, a root child may be
+         * contracted: a weak branch at the root is just as unsupported, and the root then
+         * becomes a multifurcation. A contracted branch's length is added to each of its
+         * children so every tip keeps its distance from the root. A node with no support value
+         * is never contracted.
+         */
+        _collapseWeakSupportBranches() {
+            this.supportCollapseState = null;
+            if (!this.tree || !this.options.supportCollapse) return 0;
+            const nodes = [];
+            this.tree.traverse_and_compute((node) => nodes.push(node));
+            const root = nodes.find((node) => !node.parent);
+            if (!root) return 0;
+            const supportType = this._computeSupportStats(nodes).supportType;
+            const cutoff = this._supportCollapseCutoff(supportType);
+            const internalCount = nodes.filter((node) => node.parent && (node.children || []).length).length;
+            this.supportCollapseState = { supportType, cutoff, collapsed: 0, internal: internalCount };
+            if (!cutoff) return 0;
+
+            const isWeak = (node) => {
+                if (supportType === 'ALRT_UFBOOT') {
+                    const dual = this._extractDualSupport(node);
+                    return Boolean(dual)
+                        && (dual.alrt < cutoff.spec.fixedAlrt || dual.ufboot < cutoff.value);
+                }
+                const value = this._extractSupportValue(node);
+                return value !== null && value < cutoff.value;
+            };
+
+            // Same live-hierarchy walk as _contractZeroLengthInternalBranches: deepest first,
+            // so lengths accumulate correctly down a chain of weak branches.
+            const order = [];
+            const pending = [root];
+            while (pending.length) {
+                const node = pending.pop();
+                order.push(node);
+                (node.children || []).forEach((child) => pending.push(child));
+            }
+            let collapsed = 0;
+            for (let i = order.length - 1; i >= 0; i -= 1) {
+                const node = order[i];
+                const parent = node.parent;
+                const children = node.children || [];
+                if (!parent || !children.length || !isWeak(node)) continue;
+                const siblings = parent.children || [];
+                const index = siblings.indexOf(node);
+                if (index < 0) continue;
+                const length = this._branchLength(node);
+                if (length !== null && length > 0) {
+                    children.forEach((child) => {
+                        if (!child.data) return;
+                        child.data.attribute = String((this._branchLength(child) || 0) + length);
+                    });
+                }
+                siblings.splice(index, 1, ...children);
+                children.forEach((child) => { child.parent = parent; });
+                node.children = [];
+                node.parent = null;
+                collapsed += 1;
+            }
+            this.supportCollapseState.collapsed = collapsed;
+            if (collapsed) this._refreshHierarchyMetrics(root);
+            return collapsed;
+        }
+
+        /**
+         * Alan 10/3/26 - One line describing the collapse for the settings panel and the
+         * export key, or null when nothing is collapsed by support.
+         */
+        getSupportCollapseSummary() {
+            const state = this.supportCollapseState;
+            if (!state || !state.cutoff) return null;
+            const { spec, value } = state.cutoff;
+            const rule = spec.fixedAlrt !== null
+                ? `SH-aLRT < ${spec.fixedAlrt} or UFBoot < ${spec.format(value)}`
+                : `${spec.label} < ${spec.format(value)}`;
+            return {
+                collapsed: state.collapsed,
+                internal: state.internal,
+                text: `Branches with ${rule} collapsed (${state.collapsed} of ${state.internal} internal branches).`
+            };
         }
 
         _groupZeroLengthPolytomies() {
@@ -2161,7 +2303,20 @@
 
         // Alan 9/24/26 - Split from getNewickString so the type-label swap can wrap it.
         _serializeNewick() {
-            return this.tree.getNewick((node) => {
+            const tree = this.exportTree || this.tree;
+            if (this.exportTree) {
+                const displayTips = new Map(this._getLeafNodes().map(node => [this._getNodeId(node), node]));
+                tree.traverse_and_compute(node => {
+                    if (node.children?.length) return;
+                    const id = this._getNodeId(node);
+                    const display = displayTips.get(id);
+                    if (!display) return;
+                    node.data.__original_name = id;
+                    node.data.name = (display.data || display).name;
+                    node.notshown = Boolean(display.notshown);
+                });
+            }
+            return tree.getNewick((node) => {
                 // The callback determines what annotation gets appended to the node name
                 const id = this._getNodeId(node);
                 // Alan 5/11/26 - Export only visible active selections after local Deselect has been used.
@@ -2353,7 +2508,9 @@
 
             // Alan 9/23/26 - 7. A faded branch in a figure is ambiguous without a key, so a
             //    faded export always carries one. Nothing is added when fading is off.
-            if (this._supportFadeActive()) {
+            // Alan 10/3/26 - A support-collapsed export says so, so a screenshot of a collapsed
+            // tree cannot pass for the builder's own resolution.
+            if (this._supportFadeActive() || this.getSupportCollapseSummary()) {
                 ({ width, height } = this._appendSupportFadeLegend(clone, width, height));
             }
 
@@ -2376,8 +2533,11 @@
          * @returns {{width: number, height: number}} the new pixel size of the clone
          */
         _appendSupportFadeLegend(clone, width, height) {
-            const legend = window.describeSupportFade(this.lastStats?.supportType);
-            if (!legend) return { width, height };
+            // Alan 10/3/26 - The key now carries the collapse note, the fade rows, or both.
+            const legend = this._supportFadeActive()
+                ? window.describeSupportFade(this.lastStats?.supportType) : null;
+            const collapse = this.getSupportCollapseSummary();
+            if (!legend && !collapse) return { width, height };
             const NS = 'http://www.w3.org/2000/svg';
             const vb = (clone.getAttribute('viewBox') || `0 0 ${width} ${height}`)
                 .split(/[\s,]+/).map(Number);
@@ -2390,11 +2550,16 @@
             const LINE = 16;
             const PAD = 12;
             const SAMPLE = 28;
-            const lines = [
-                { text: `Branch opacity: ${legend.statistic} support`, bold: true },
-                ...legend.rows.map((row) => ({ text: `${row.level}: ${row.text}`, level: row.level })),
-                { text: 'Terminal branches and branches without a support value are drawn solid.', note: true }
-            ];
+            // Alan 10/3/26 - Collapse note first, then the fade key when fading is on.
+            const lines = [];
+            if (collapse) lines.push({ text: collapse.text, bold: true });
+            if (legend) {
+                lines.push(
+                    { text: `Branch opacity: ${legend.statistic} support`, bold: true },
+                    ...legend.rows.map((row) => ({ text: `${row.level}: ${row.text}`, level: row.level })),
+                    { text: 'Terminal branches and branches without a support value are drawn solid.', note: true }
+                );
+            }
             // No DOM to measure in (the clone is detached), so estimate generously.
             const longest = Math.max(...lines.map((line) => line.text.length * FONT * 0.6
                 + (line.level ? SAMPLE + 8 : 0)));
@@ -3411,8 +3576,10 @@
             return null;
         }
 
-        _computeSupportStats() {
-            if (!this.allNodes || !this.allNodes.length) return { maxSupport: 0, supportType: 'none' };
+        // Alan 10/3/26 - `nodes` lets the support-collapse pass classify the tree before the
+        // node cache exists; every other caller uses the cache.
+        _computeSupportStats(nodes = this.allNodes) {
+            if (!nodes || !nodes.length) return { maxSupport: 0, supportType: 'none' };
 
             let maxSupport = 0;
             let supportValues = [];
@@ -3421,7 +3588,7 @@
             // Leaf counts are already pre-computed in _cacheNodes()
 
             // Support value extraction
-            for (const node of this.allNodes) {
+            for (const node of nodes) {
                 if (!node.children || node.children.length === 0) continue; // Skip tips for support
 
                 const val = this._extractSupportValue(node);
@@ -3433,7 +3600,7 @@
 
             // Alan 8/4/26 - Dual SH-aLRT/UFBoot labels take priority: they are their own
             // scale (two 0-100 percentages) and must not be reported as plain bootstrap.
-            const hasDual = this.allNodes.some(
+            const hasDual = nodes.some(
                 n => n.children && n.children.length > 0 && this._extractDualSupport(n)
             );
 

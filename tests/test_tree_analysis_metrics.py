@@ -1435,6 +1435,31 @@ def test_generation_details_never_call_an_nj_request_a_substitution_model(tmp_pa
     assert details["requested_model"] is None
 
 
+def test_generation_details_expose_mrbayes_convergence_failure(tmp_path):
+    job_dir = tmp_path / "job"
+    _write(job_dir / "tree" / "tree_metadata.json", json.dumps({
+        "method": "mrbayes", "converged": False,
+        "convergence_warnings": ["ASDSF=0.0161 > 0.01"],
+    }))
+    details = service.resolve_tree_generation_context(
+        job_dir, {"tree_method": "mrbayes", "trimming_method": "none"}
+    )
+    assert "ASDSF=0.0161 > 0.01" in details["convergence_warning"]
+    assert "should not be trusted" in details["convergence_warning"]
+
+
+def test_generation_details_accept_single_mrbayes_convergence_warning(tmp_path):
+    job_dir = tmp_path / "job"
+    _write(job_dir / "tree" / "tree_metadata.json", json.dumps({
+        "method": "mrbayes", "converged": False,
+        "convergence_warnings": 42,
+    }))
+    details = service.resolve_tree_generation_context(
+        job_dir, {"tree_method": "mrbayes", "trimming_method": "none"}
+    )
+    assert "42" in details["convergence_warning"]
+
+
 # ---------------------------------------------------------------------------
 # Response validation: a malformed reply is an upstream failure
 # ---------------------------------------------------------------------------
