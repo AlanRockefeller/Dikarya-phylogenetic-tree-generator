@@ -6449,6 +6449,12 @@
             try { width = probe.getComputedTextLength(); } catch (_) { width = text.length * style.font_size * 0.55; }
             svgNode.removeChild(probe);
 
+            // Alan 10/5/26 - A hidden SVG (the editor preview before its dialog is shown, which
+            // is always the case for the N hotkey) measures every string as 0. Caching that
+            // gave the saved annotation a zero-width label and a right-click target covering
+            // only its bracket, until a reload cleared the cache.
+            if (width === 0 && text.trim()) return width;
+
             // Bound the cache so a user typing in the editor cannot grow it without limit.
             if (this.annotationTextWidthCache.size > 2000) this.annotationTextWidthCache.clear();
             this.annotationTextWidthCache.set(key, width);

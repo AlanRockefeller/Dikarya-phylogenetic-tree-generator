@@ -1565,8 +1565,7 @@ document.addEventListener('DOMContentLoaded', async () => {
 
     /**
      * Alan 8/26/26 - The default label for a NEW annotation: the species name held by the most
-     * tips in the clade. Ties go to a determinate binomial over "Genus sp." or a provisional
-     * name, then to whichever appeared first, so a mixed clade never suggests the vaguer name.
+     * tips in the clade. A tie between different names suggests the genus instead (Alan 10/5/26).
      * A clade whose tips carry no species name at all falls back to the dominant genus, and
      * failing that the field is left empty exactly as before.
      */
@@ -1587,11 +1586,24 @@ document.addEventListener('DOMContentLoaded', async () => {
             }
             entry.count += 1;
         });
-        const best = Array.from(counts.values()).sort((a, b) =>
+        const ranked = Array.from(counts.values()).sort((a, b) =>
             (b.count - a.count)
             || (Number(b.determinate) - Number(a.determinate))
-            || (a.order - b.order))[0];
-        return best ? best.name : '';
+            || (a.order - b.order));
+        const best = ranked[0];
+        if (!best) return '';
+        // Alan 10/5/26 - A tie between different species names is no majority: suggest the
+        // genus ("Galerina sp.") when the tied names share one, else the most common genus.
+        const tied = ranked.filter((entry) => entry.count === best.count);
+        if (tied.length > 1 && extract === extractSpeciesName) {
+            const genera = new Set(tied.map((entry) => entry.name.split(' ')[0]));
+            if (genera.size === 1) return `${best.name.split(' ')[0]} sp.`;
+            return mostCommonName(labels, (label) => {
+                const name = extractSpeciesName(label);
+                return name ? name.split(' ')[0] : null;
+            });
+        }
+        return best.name;
     }
 
     /**
@@ -1600,13 +1612,39 @@ document.addEventListener('DOMContentLoaded', async () => {
      * Several distinct type species in one genus: "Genus sp.". Types from different genera,
      * or none whose name can be read, give no opinion and the usual majority vote applies.
      */
+    // Alan 10/5/26 - Infraspecific ranks a type name keeps: a type is the type of the variety,
+    // so "Galerina decipiens var. separans" must not be cut back to "Galerina decipiens".
+    const INFRASPECIFIC_RANKS = {
+        var: 'var.', subsp: 'subsp.', ssp: 'subsp.', f: 'f.', forma: 'f.'
+    };
+
+    // Alan 10/5/26 - extractSpeciesName() plus a following "var./subsp./f. epithet", if present.
+    function extractTypeName(text) {
+        const species = extractSpeciesName(text);
+        if (!species || /\s(sp|cf|aff|nr)\.(\s|$)/.test(species)) return species;
+        const tokens = speciesTokens(text);
+        const [genus, epithet] = species.split(' ');
+        for (let i = 0; i < tokens.length - 3; i++) {
+            if (speciesGenusCandidate(tokens[i]) !== genus) continue;
+            if (speciesEpithetCandidate(tokens[i + 1]) !== epithet) continue;
+            const rankWord = tokens[i + 2].replace(/[^A-Za-z]/g, '').toLowerCase();
+            const rank = Object.prototype.hasOwnProperty.call(INFRASPECIFIC_RANKS, rankWord)
+                ? INFRASPECIFIC_RANKS[rankWord]
+                : null;
+            const infra = rank ? speciesEpithetCandidate(tokens[i + 3]) : null;
+            if (infra) return `${species} ${rank} ${infra}`;
+        }
+        return species;
+    }
+
     function typeSpecimenAnnotationLabel(memberIds) {
         const types = viewer?.getTypeSpecimensForLeafIds
             ? viewer.getTypeSpecimensForLeafIds(memberIds)
             : [];
         const names = new Set();
         types.forEach(({ label, info }) => {
-            const name = extractSpeciesName(info?.organism) || extractSpeciesName(label);
+            // Alan 10/5/26 - Keep the variety/subspecies/form of the type's name.
+            const name = extractTypeName(info?.organism) || extractTypeName(label);
             if (name) names.add(name);
         });
         if (!names.size) return '';
