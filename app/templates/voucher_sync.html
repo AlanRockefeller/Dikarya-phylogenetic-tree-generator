@@ -1046,6 +1046,11 @@
 
     // Resume uses the original scan settings. Flag every visible setting that
     // could change how an unscanned observation is judged.
+    function runUsesOcr(params) {
+        // Match the worker's default for a run saved without this setting.
+        return params.use_ocr === undefined ? true : Boolean(params.use_ocr);
+    }
+
     function formMatchesRun(run) {
         const p = run.params || {};
         const f = selectedFormat();
@@ -1054,7 +1059,7 @@
             && String(p.date_start || '') === el('vs_date_start').value
             && String(p.date_end || '') === (range ? el('vs_date_end').value : el('vs_date_start').value)
             && String(p.regex || '') === String(f.value === 'Custom' ? el('vs_custom_regex').value : (f.dataset.regex || ''))
-            && Boolean(p.use_ocr) === el('vs_use_ocr').checked
+            && runUsesOcr(p) === el('vs_use_ocr').checked
             && Boolean(p.allow_overwrite) === el('vs_overwrite').checked;
     }
 
@@ -1079,7 +1084,7 @@
             const ok = confirm(
                 `The settings above differ from this paused preview. It used field #${p.field_id}, ${p.date_start}` +
                 (p.date_end && p.date_end !== p.date_start ? ` to ${p.date_end}` : '') +
-                `, OCR fallback ${p.use_ocr ? 'on' : 'off'}, and overwrite existing values ` +
+                `, OCR fallback ${runUsesOcr(p) ? 'on' : 'off'}, and overwrite existing values ` +
                 `${p.allow_overwrite ? 'on' : 'off'}.\n\n` +
                 `Resume continues with the ORIGINAL settings so every row was judged the same way. ` +
                 `To use the settings above instead, press Preview for a fresh run.`);
