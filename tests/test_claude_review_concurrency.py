@@ -71,11 +71,10 @@ class _FakeRedis:
         # confusing AssertionError instead of a redis-behaviour mismatch.
         assert numkeys == 1
         assert re.fullmatch(
-            r"\s*if\s+redis\.call\(['\"]get['\"],\s*KEYS\[1\]\)\s*==\s*ARGV\[1\]"
-            r"\s+then\s+return\s+redis\.call\(['\"]del['\"],\s*KEYS\[1\]\)"
+            r"\s*if\s+redis\.call\((?P<get_quote>['\"])(?i:get)(?P=get_quote),\s*KEYS\[1\]\)\s*==\s*ARGV\[1\]"
+            r"\s+then\s+return\s+redis\.call\((?P<del_quote>['\"])(?i:del)(?P=del_quote),\s*KEYS\[1\]\)"
             r"\s+else\s+return\s+0\s+end\s*",
             script,
-            flags=re.IGNORECASE,
         ), script
         if self.values.get(key) == arg:
             return self.delete(key)
@@ -420,3 +419,14 @@ def test_time_is_not_frozen_by_the_fake_clock():
         slot = service._acquire_slot()
     assert slot is not None
     assert redis.zsets[SLOT_KEY][slot.token] == pytest.approx(time.time(), abs=5)
+
+
+@pytest.mark.parametrize("bad_call", ["Redis.call('get'", "redis.call('get\"", "redis.call('del\""])
+def test_lock_fake_rejects_invalid_lua_calls(bad_call):
+    script = "if redis.call('get', KEYS[1]) == ARGV[1] then return redis.call('del', KEYS[1]) else return 0 end"
+    good_call = "redis.call('del'" if 'del' in bad_call else "redis.call('get'"
+    redis = _FakeRedis()
+    redis.set('lock', 'owner')
+    with pytest.raises(AssertionError):
+        redis.eval(script.replace(good_call, bad_call), 1, 'lock', 'owner')
+    assert redis.get('lock') == 'owner'

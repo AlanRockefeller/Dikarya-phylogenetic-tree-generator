@@ -518,6 +518,9 @@ def purge_deleted_jobs_command(dry_run):
     if dry_run or not expired:
         return
     result = purge_jobs(expired)
+    if result.get("recovery_required"):
+        click.echo("Job files need administrator recovery; do not retry. See errors.log.")
+        raise SystemExit(1)
     if result["failed"]:
         click.echo("Commit failed; nothing was purged. See errors.log.")
         raise SystemExit(1)

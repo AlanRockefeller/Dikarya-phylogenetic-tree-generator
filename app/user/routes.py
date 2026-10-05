@@ -47,7 +47,8 @@ def user_jobs():
 def _owned_job_or_404(job_id):
     if not validate_job_id(job_id):
         abort(404)
-    job = db.session.get(Job, job_id)
+    job = (Job.query.filter_by(id=job_id).populate_existing()
+           .with_for_update().first())
     if job is None or job.user_id != current_user.id:
         abort(404)
     return job
@@ -129,14 +130,19 @@ def purge_job(job_id):
         flash('Only a job in Recently deleted can be deleted permanently.', 'error')
         return redirect(url_for('user.user_jobs'))
     result = purge_jobs([job])
-    if result['failed']:
+    if result.get('recovery_required'):
+        flash('The job files need administrator recovery. This has been logged. '
+              'Please do not retry until it is fixed.', 'error')
+    elif result['failed']:
         flash('The job could not be deleted because of a database error. '
               'Nothing was deleted. Please try again.', 'error')
     elif result['files_left']:
         flash('The job was deleted, but its files could not be removed from the '
               'server. This has been logged for the administrator.', 'warning')
-    else:
+    elif result['removed']:
         flash('Job deleted permanently.', 'success')
+    else:
+        flash('The job was kept because it is active, protected, or restored.', 'warning')
     return redirect(url_for('user.user_jobs'))
 
 

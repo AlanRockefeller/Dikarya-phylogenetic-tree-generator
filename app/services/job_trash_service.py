@@ -74,10 +74,29 @@ def purge_jobs(jobs) -> dict:
     trash_root = Config.JOB_DIR / ".trash"
     staged_entries = []  # (job_id, source, staged)
     removed = 0
-    for job in jobs:
+    recovery_required = 0
+    for selected_job in jobs:
+        # Refresh under a row lock: an owner may have restored/protected the
+        # job since the expired-job query. Hold the lock through staging/commit.
+        job = (Job.query.filter_by(id=selected_job.id).populate_existing()
+               .with_for_update().first())
+        if job is None:
+            continue
         if job.deleted_at is None or job.protected:
             continue
+        # Soft deletion does not cancel work. Automatic page-load/CLI purges
+        # must wait for it to finish, rather than interrupting a user's job.
+        if job.status not in ("completed", "failed"):
+            logger.warning("event=jobs.purge_active_skipped job=%s status=%s",
+                           job.id, job.status)
+            continue
         candidate = _canonical_job_dir(job)
+        if candidate is not None and any(trash_root.glob(f"{job.id}.*")):
+            # A prior rollback may have left the only artifacts staged. Never
+            # delete their surviving row on a retry, even if source is missing.
+            recovery_required += 1
+            logger.error("event=jobs.purge_recovery_required job=%s", job.id)
+            continue
         if candidate is None:
             logger.warning(
                 "event=jobs.purge_invalid_job_path job=%s dir=%s "
@@ -109,13 +128,15 @@ def purge_jobs(jobs) -> dict:
             try:
                 staged.rename(source)
             except OSError:
+                recovery_required += 1
                 logger.exception(
                     "event=jobs.purge_restore_failed job=%s staged=%s source=%s "
                     "Move staged back to source to complete the rollback.",
                     job_id, staged, source,
                 )
         logger.exception("event=jobs.purge_commit_failed error=%s", type(e).__name__)
-        return {"removed": 0, "files_left": 0, "failed": True}
+        return {"removed": 0, "files_left": recovery_required, "failed": True,
+                "recovery_required": recovery_required}
 
     files_left = 0
     for job_id, _source, staged in staged_entries:
@@ -135,7 +156,10 @@ def purge_jobs(jobs) -> dict:
                 job_id=job_id, staged=str(staged),
                 error=failure or "still_present",
             )
-    return {"removed": removed, "files_left": files_left, "failed": False}
+    result = {"removed": removed, "files_left": files_left, "failed": False}
+    if recovery_required:
+        result["recovery_required"] = recovery_required
+    return result
 
 
 def expired_deleted_jobs(user_id: int | None = None, limit: int | None = None):

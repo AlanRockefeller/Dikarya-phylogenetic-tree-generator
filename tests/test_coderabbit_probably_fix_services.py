@@ -596,7 +596,8 @@ class PurgeDeletedJobsTests(unittest.TestCase):
 
     def _run(self, *, rmtree_error=None, commit_error=None, rename_error=None,
              outside_job_dir=False, restore_error=None, restore_fails_for=None,
-             corrupt_rows=None):
+             corrupt_rows=None, job_status="completed", stale_protected=False,
+             retry_after_failure=False):
         import shutil
         import tempfile
         from datetime import datetime
@@ -630,12 +631,24 @@ class PurgeDeletedJobsTests(unittest.TestCase):
                 jobs.append(SimpleNamespace(id=name, job_dir=str(directory),
                                             deleted_at=deleted, protected=False))
 
+        for job in jobs:
+            job.status = job_status
+        model = MagicMock()
+        def locked_query(**kwargs):
+            selected = next((job for job in jobs if job.id == kwargs['id']), None)
+            if selected and stale_protected:
+                selected.protected = True
+            query = MagicMock()
+            query.populate_existing.return_value.with_for_update.return_value.first.return_value = selected
+            return query
+        model.query.filter_by.side_effect = locked_query
         db = MagicMock()
         if commit_error is not None:
             db.session.commit.side_effect = commit_error
 
         patches = [
             patch.object(svc, "db", db),
+            patch.object(svc, "Job", model),
             patch.object(Config, "JOB_DIR", job_root),
         ]
         if rmtree_error is not None:
@@ -659,8 +672,13 @@ class PurgeDeletedJobsTests(unittest.TestCase):
             with patch.object(svc.logger, "warning") as warn:
                 with patch.object(svc.logger, "exception") as exception:
                     outcome = svc.purge_jobs(jobs)
+                    retry_outcome = None
+                    if retry_after_failure:
+                        db.session.commit.side_effect = None
+                        db.session.delete.reset_mock()
+                        retry_outcome = svc.purge_jobs([jobs[0]])
         return SimpleNamespace(
-            outcome=outcome, db=db, warn=warn, exception=exception,
+            outcome=outcome, retry_outcome=retry_outcome, db=db, warn=warn, exception=exception,
             jobs=jobs, job_root=job_root,
         )
 
@@ -680,9 +698,25 @@ class PurgeDeletedJobsTests(unittest.TestCase):
         from app.services import job_trash_service as svc
         live = SimpleNamespace(id="a", job_dir="/x", deleted_at=None, protected=False)
         locked = SimpleNamespace(id="b", job_dir="/x", deleted_at=1, protected=True)
-        with patch.object(svc, "db", MagicMock()) as db:
+        with patch.object(svc, "db", MagicMock()) as db, patch.object(svc, "Job") as model:
+            model.query.filter_by.return_value.populate_existing.return_value.with_for_update.return_value.first.side_effect = [live, locked]
             self.assertEqual(svc.purge_jobs([live, locked])["removed"], 0)
             db.session.delete.assert_not_called()
+
+    def test_active_jobs_keep_their_rows_and_files(self):
+        for status in ("queued", "running", "deleting"):
+            result = self._run(job_status=status)
+            self.assertEqual(result.outcome['removed'], 0)
+            result.db.session.delete.assert_not_called()
+            for job in result.jobs:
+                self.assertTrue(Path(job.job_dir).is_dir())
+
+    def test_protection_committed_after_selection_is_respected(self):
+        result = self._run(stale_protected=True)
+        self.assertEqual(result.outcome['removed'], 0)
+        result.db.session.delete.assert_not_called()
+        for job in result.jobs:
+            self.assertTrue(Path(job.job_dir).is_dir())
 
     def test_a_failed_directory_removal_is_reported(self):
         result = self._run(rmtree_error=PermissionError("nope"))
@@ -738,6 +772,8 @@ class PurgeDeletedJobsTests(unittest.TestCase):
             restore_error=OSError("cross-device link"),
             restore_fails_for="11111111-1111-4111-8111-111111111111",
         )
+        self.assertEqual(result.outcome["recovery_required"], 1)
+        self.assertEqual(result.outcome["files_left"], 1)
         job_a, job_b = result.jobs
         self.assertTrue(Path(job_b.job_dir).is_dir())
         self.assertFalse(Path(job_a.job_dir).exists())
@@ -751,6 +787,17 @@ class PurgeDeletedJobsTests(unittest.TestCase):
         self.assertEqual(job_id, job_a.id)
         self.assertEqual(Path(staged_path), staged[0])
         self.assertEqual(Path(source_path), Path(job_a.job_dir))
+
+    def test_retry_after_failed_restore_keeps_the_surviving_row(self):
+        result = self._run(
+            commit_error=RuntimeError("db is down"),
+            restore_error=OSError("no restore"),
+            restore_fails_for="11111111-1111-4111-8111-111111111111",
+            retry_after_failure=True,
+        )
+        self.assertEqual(result.retry_outcome['removed'], 0)
+        self.assertEqual(result.retry_outcome['recovery_required'], 1)
+        result.db.session.delete.assert_not_called()
 
     def test_a_staging_failure_deletes_nothing_and_keeps_the_row(self):
         result = self._run(rename_error=OSError("cross-device"))

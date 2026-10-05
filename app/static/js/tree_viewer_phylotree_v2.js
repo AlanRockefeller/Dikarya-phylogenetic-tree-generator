@@ -2992,7 +2992,6 @@
             const typeTitle = label.querySelector('title.type-specimen-title');
             if (typeTitle) {
                 if (title) title.remove();
-                if (!typeTitle.textContent.includes('Suspected dirty read end')) typeTitle.textContent += '\n\n' + text;
             } else {
                 if (!title) {
                     title = document.createElementNS(SVG_NS, 'title');

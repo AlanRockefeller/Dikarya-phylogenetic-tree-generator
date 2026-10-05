@@ -1344,7 +1344,7 @@
                     <tr>
                         <td class="py-2 pr-4 font-mono break-all max-w-md">{{ record.get('name', 'Unknown') }}</td>
                         <td class="py-2 pr-4 font-mono break-all max-w-md">{{ record.get('duplicate_of', '-') }}</td>
-                        <td class="py-2 pr-4 font-mono whitespace-nowrap">{{ record.get('observation_reference', '-') }}
+                        <td class="py-2 pr-4 font-mono whitespace-nowrap">{{ record.get('observation_reference') or '-' }}
                         </td>
                         <td class="py-2 pr-4 whitespace-nowrap">{{ record.get('difference_count', 0) }} bp</td>
                     </tr>

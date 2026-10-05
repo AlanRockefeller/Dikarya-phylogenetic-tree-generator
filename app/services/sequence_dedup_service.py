@@ -559,16 +559,16 @@ def dedupe_by_observation(
             entry = dropped[index]
             kept_name = records[entry["kept_index"]].get("name", "")
             difference = entry["difference"]
-            same_what = (
-                "GenBank record"
-                if entry["reference"].startswith(ACCESSION_GROUP_PREFIX)
-                else "observation"
-            )
+            group_key = (entry["reference"]
+                         if entry["reference"].startswith(ACCESSION_GROUP_PREFIX)
+                         else "")
+            same_what = "GenBank record" if group_key else "observation"
             removed_record = {
                 "name": records[index].get("name", ""),
                 "sequence": records[index].get("sequence", ""),
                 "duplicate_of": kept_name,
-                "observation_reference": entry["reference"],
+                "group_key": group_key,
+                "observation_reference": "" if group_key else entry["reference"],
                 "difference_count": difference,
                 "reason": "duplicate_observation_record",
                 "reason_label": (
@@ -655,7 +655,7 @@ def record_dedup_details(job_params: Dict[str, Any], removed: List[Dict[str, Any
         return (
             str(record.get("name") or ""),
             str(record.get("sequence") or ""),
-            str(record.get("observation_reference") or ""),
+            str(record.get("group_key") or record.get("observation_reference") or ""),
             record.get("metadata"),
         )
 
