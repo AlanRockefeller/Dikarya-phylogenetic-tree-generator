@@ -500,9 +500,37 @@ def jobs_in_flight_command():
     raise SystemExit(1)
 
 
+@click.command("purge-deleted-jobs")
+@click.option("--dry-run", is_flag=True, help="Report what would be purged, then exit.")
+@with_appcontext
+def purge_deleted_jobs_command(dry_run):
+    """Permanently delete jobs cleared more than JOB_DELETE_GRACE_DAYS ago.
+
+    /user/jobs already purges its owner's expired jobs when they open it; this
+    covers owners who never come back.
+    """
+    from app.services.job_trash_service import (
+        JOB_DELETE_GRACE_DAYS, expired_deleted_jobs, purge_jobs,
+    )
+
+    expired = expired_deleted_jobs()
+    click.echo(f"{len(expired)} job(s) deleted more than {JOB_DELETE_GRACE_DAYS} days ago.")
+    if dry_run or not expired:
+        return
+    result = purge_jobs(expired)
+    if result.get("recovery_required"):
+        click.echo("Job files need administrator recovery; do not retry. See errors.log.")
+        raise SystemExit(1)
+    if result["failed"]:
+        click.echo("Commit failed; nothing was purged. See errors.log.")
+        raise SystemExit(1)
+    click.echo(f"Purged {result['removed']} job(s); files left behind: {result['files_left']}.")
+
+
 def register(app):
     app.cli.add_command(jobs_in_flight_command)
     app.cli.add_command(reap_stuck_jobs_command)
+    app.cli.add_command(purge_deleted_jobs_command)
     app.cli.add_command(run_worker_command)
     app.cli.add_command(run_metrics_command)
     app.cli.add_command(whats_new_add_command)

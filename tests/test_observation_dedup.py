@@ -458,3 +458,16 @@ class InputWarningRefreshTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class AccessionGroupDisplayTests(unittest.TestCase):
+    def test_accession_duplicates_do_not_claim_an_observation(self):
+        fasta = _fasta(("NR_173927", SEQUENCE), ("NR_173927.1", SEQUENCE))
+        _, _, removed = dedup.dedupe_by_observation(fasta, [])
+        self.assertEqual(len(removed), 1)
+        self.assertEqual(removed[0]["observation_reference"], "")
+        self.assertEqual(removed[0]["group_key"], dedup.ACCESSION_GROUP_PREFIX + "NR_173927")
+        params = {}
+        dedup.record_dedup_details(params, removed)
+        dedup.record_dedup_details(params, removed)
+        self.assertEqual(params['import_filter_details']['duplicates']['removed_count'], 1)

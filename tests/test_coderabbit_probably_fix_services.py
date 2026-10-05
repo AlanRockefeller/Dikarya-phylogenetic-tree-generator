@@ -583,27 +583,28 @@ class MushroomObserverMalformedSequenceTests(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
-# #76 -- "Clear jobs" reports what actually happened
+# #76 -- purging deleted jobs cannot lose artifacts
 # ---------------------------------------------------------------------------
 
-class ClearJobsReportingTests(unittest.TestCase):
-    """Clear-all reports what actually happened, and cannot lose artifacts.
-
-    The directories are moved into var/jobs/.trash before the rows are deleted,
-    so a failed commit can put them back. Committing first and destroying the
-    files afterwards left every surviving history row pointing at artifacts that
-    were already gone.
+class PurgeDeletedJobsTests(unittest.TestCase):
+    """Permanent deletion moves each directory into var/jobs/.trash before the
+    rows are deleted, so a failed commit can put them back. Committing first
+    and destroying the files afterwards left surviving rows pointing at
+    artifacts that were already gone. (This was Clear All's logic; Clear All is
+    now a recoverable soft delete and only the purge destroys anything.)
     """
 
     def _run(self, *, rmtree_error=None, commit_error=None, rename_error=None,
              outside_job_dir=False, restore_error=None, restore_fails_for=None,
-             corrupt_rows=None):
+             corrupt_rows=None, job_status="completed", stale_protected=False,
+             retry_after_failure=False):
         import shutil
         import tempfile
+        from datetime import datetime
         from pathlib import Path as _Path
 
         from app.config import Config
-        from app.user import routes
+        from app.services import job_trash_service as svc
 
         tmp = tempfile.mkdtemp()
         self.addCleanup(shutil.rmtree, tmp, True)
@@ -611,9 +612,12 @@ class ClearJobsReportingTests(unittest.TestCase):
         job_root.mkdir()
         outside = _Path(tmp) / "elsewhere"
         outside.mkdir()
+        deleted = datetime(2026, 1, 1)
 
         if corrupt_rows is not None:
             jobs = corrupt_rows(job_root, outside)
+            for job in jobs:
+                job.deleted_at, job.protected = deleted, False
         else:
             jobs = []
             for name in (
@@ -624,21 +628,27 @@ class ClearJobsReportingTests(unittest.TestCase):
                 directory = parent / name
                 directory.mkdir()
                 (directory / "tree_state.json").write_text("{}")
-                jobs.append(SimpleNamespace(id=name, job_dir=str(directory)))
+                jobs.append(SimpleNamespace(id=name, job_dir=str(directory),
+                                            deleted_at=deleted, protected=False))
 
-        flashes = []
+        for job in jobs:
+            job.status = job_status
+        model = MagicMock()
+        def locked_query(**kwargs):
+            selected = next((job for job in jobs if job.id == kwargs['id']), None)
+            if selected and stale_protected:
+                selected.protected = True
+            query = MagicMock()
+            query.populate_existing.return_value.with_for_update.return_value.first.return_value = selected
+            return query
+        model.query.filter_by.side_effect = locked_query
         db = MagicMock()
         if commit_error is not None:
             db.session.commit.side_effect = commit_error
 
         patches = [
-            patch.object(routes, "Job"),
-            patch.object(routes, "db", db),
-            patch.object(routes, "current_user", SimpleNamespace(id=1)),
-            patch.object(routes, "flash",
-                         side_effect=lambda msg, cat="message": flashes.append((msg, cat))),
-            patch.object(routes, "redirect", side_effect=lambda target: target),
-            patch.object(routes, "url_for", side_effect=lambda endpoint: endpoint),
+            patch.object(svc, "db", db),
+            patch.object(svc, "Job", model),
             patch.object(Config, "JOB_DIR", job_root),
         ]
         if rmtree_error is not None:
@@ -646,10 +656,6 @@ class ClearJobsReportingTests(unittest.TestCase):
         if rename_error is not None:
             patches.append(patch.object(_Path, "rename", side_effect=rename_error))
         elif restore_error is not None:
-            # Stage everything normally, then fail the move *back* for one job.
-            # That is the recovery path: the rows survive the rollback, but one
-            # job's artifacts are left sitting in .trash rather than at the
-            # path its surviving row points to.
             real_rename = _Path.rename
 
             def _rename(self, target):
@@ -660,52 +666,70 @@ class ClearJobsReportingTests(unittest.TestCase):
 
             patches.append(patch.object(_Path, "rename", _rename))
 
-        app = Flask(__name__)
-        with app.test_request_context():
-            with contextlib.ExitStack() as stack:
-                entered = [stack.enter_context(item) for item in patches]
-                entered[0].query.filter_by.return_value.all.return_value = jobs
-                with patch.object(routes.logger, "warning") as warn:
-                    with patch.object(routes.logger, "exception") as exception:
-                        routes.clear_jobs.__wrapped__()
+        with contextlib.ExitStack() as stack:
+            for item in patches:
+                stack.enter_context(item)
+            with patch.object(svc.logger, "warning") as warn:
+                with patch.object(svc.logger, "exception") as exception:
+                    outcome = svc.purge_jobs(jobs)
+                    retry_outcome = None
+                    if retry_after_failure:
+                        db.session.commit.side_effect = None
+                        db.session.delete.reset_mock()
+                        retry_outcome = svc.purge_jobs([jobs[0]])
         return SimpleNamespace(
-            flashes=flashes, db=db, warn=warn, exception=exception,
+            outcome=outcome, retry_outcome=retry_outcome, db=db, warn=warn, exception=exception,
             jobs=jobs, job_root=job_root,
         )
 
-    def test_a_clean_run_reports_success(self):
+    def test_a_clean_run_removes_rows_and_files(self):
         result = self._run()
-        message, category = result.flashes[0]
-        self.assertEqual(category, "success")
-        self.assertIn("2 job(s) cleared", message)
+        self.assertEqual(result.outcome, {"removed": 2, "files_left": 0, "failed": False})
         self.assertEqual(result.db.session.delete.call_count, 2)
         result.warn.assert_not_called()
-        # Both the job directories and the staging area are gone.
         for job in result.jobs:
             self.assertFalse(Path(job.job_dir).exists())
         trash = result.job_root / ".trash"
         self.assertEqual(list(trash.iterdir()) if trash.exists() else [], [])
 
-    def test_a_failed_directory_removal_is_not_reported_as_success(self):
+    def test_protected_or_live_jobs_are_never_purged(self):
+        result = self._run(corrupt_rows=lambda root, _o: [])
+        self.assertEqual(result.outcome["removed"], 0)
+        from app.services import job_trash_service as svc
+        live = SimpleNamespace(id="a", job_dir="/x", deleted_at=None, protected=False)
+        locked = SimpleNamespace(id="b", job_dir="/x", deleted_at=1, protected=True)
+        with patch.object(svc, "db", MagicMock()) as db, patch.object(svc, "Job") as model:
+            model.query.filter_by.return_value.populate_existing.return_value.with_for_update.return_value.first.side_effect = [live, locked]
+            self.assertEqual(svc.purge_jobs([live, locked])["removed"], 0)
+            db.session.delete.assert_not_called()
+
+    def test_active_jobs_keep_their_rows_and_files(self):
+        for status in ("queued", "running", "deleting"):
+            result = self._run(job_status=status)
+            self.assertEqual(result.outcome['removed'], 0)
+            result.db.session.delete.assert_not_called()
+            for job in result.jobs:
+                self.assertTrue(Path(job.job_dir).is_dir())
+
+    def test_protection_committed_after_selection_is_respected(self):
+        result = self._run(stale_protected=True)
+        self.assertEqual(result.outcome['removed'], 0)
+        result.db.session.delete.assert_not_called()
+        for job in result.jobs:
+            self.assertTrue(Path(job.job_dir).is_dir())
+
+    def test_a_failed_directory_removal_is_reported(self):
         result = self._run(rmtree_error=PermissionError("nope"))
-        message, category = result.flashes[0]
-        self.assertEqual(category, "warning")
-        self.assertIn("still", message)
-        self.assertIn("could not be deleted", message)
-        # The history rows are still removed; that half did succeed.
+        self.assertEqual(result.outcome["files_left"], 2)
         self.assertEqual(result.db.session.delete.call_count, 2)
-        # And the failure goes to the application logger, not to print().
         self.assertEqual(result.warn.call_count, 2)
-        # log_degradation formats lazily, so the event name is an argument.
         self.assertIn("job_trash_cleanup_failed", result.warn.call_args[0])
 
     def test_a_path_outside_the_job_directory_is_never_touched(self):
         result = self._run(outside_job_dir=True)
-        message, category = result.flashes[0]
-        self.assertEqual(category, "warning")
         for job in result.jobs:
             self.assertTrue(Path(job.job_dir).is_dir())
-        self.assertIn("jobs.clear_invalid_job_path", result.warn.call_args[0][0])
+        self.assertIn("jobs.purge_invalid_job_path", result.warn.call_args[0][0])
 
     def test_a_traversal_job_id_cannot_shape_a_staging_or_deletion_path(self):
         def corrupt_rows(job_root, outside):
@@ -715,104 +739,73 @@ class ClearJobsReportingTests(unittest.TestCase):
             return [SimpleNamespace(id="../victim", job_dir=str(victim))]
 
         result = self._run(corrupt_rows=corrupt_rows)
-
         victim = Path(result.jobs[0].job_dir)
         self.assertEqual((victim / "keep.txt").read_text(), "keep")
         trash = result.job_root / ".trash"
         self.assertEqual(list(trash.iterdir()) if trash.exists() else [], [])
         self.assertEqual(result.db.session.delete.call_count, 1)
-        self.assertIn("jobs.clear_invalid_job_path", result.warn.call_args[0][0])
+        self.assertIn("jobs.purge_invalid_job_path", result.warn.call_args[0][0])
 
     def test_a_row_pointing_at_another_jobs_directory_cannot_delete_it(self):
         def corrupt_rows(job_root, _outside):
-            row_id = "11111111-1111-4111-8111-111111111111"
-            other_id = "22222222-2222-4222-8222-222222222222"
-            other = job_root / other_id
+            other = job_root / "22222222-2222-4222-8222-222222222222"
             other.mkdir()
             (other / "keep.txt").write_text("keep")
-            return [SimpleNamespace(id=row_id, job_dir=str(other))]
+            return [SimpleNamespace(id="11111111-1111-4111-8111-111111111111",
+                                    job_dir=str(other))]
 
         result = self._run(corrupt_rows=corrupt_rows)
-
         other = Path(result.jobs[0].job_dir)
         self.assertEqual((other / "keep.txt").read_text(), "keep")
-        trash = result.job_root / ".trash"
-        self.assertEqual(list(trash.iterdir()) if trash.exists() else [], [])
-        self.assertIn("jobs.clear_invalid_job_path", result.warn.call_args[0][0])
+        self.assertIn("jobs.purge_invalid_job_path", result.warn.call_args[0][0])
 
     def test_a_commit_failure_puts_every_artifact_back(self):
         result = self._run(commit_error=RuntimeError("db is down"))
-        message, category = result.flashes[0]
-        self.assertEqual(category, "error")
-        self.assertIn("Nothing was deleted", message)
+        self.assertTrue(result.outcome["failed"])
         result.db.session.rollback.assert_called_once()
-        # This is the whole point: the rows survive, so the files must too.
         for job in result.jobs:
-            self.assertTrue(Path(job.job_dir).is_dir())
             self.assertTrue((Path(job.job_dir) / "tree_state.json").is_file())
 
-    def test_an_unrestorable_artifact_is_never_reported_as_nothing_deleted(self):
-        """The remaining defect: rollback succeeded, restore did not.
-
-        The row was kept, but its directory is still in .trash rather than at
-        the path the row names -- so the user has a job that cannot open its
-        own files. Telling them "Nothing was deleted" sends them away with no
-        reason to report it.
-        """
+    def test_an_unrestorable_artifact_is_left_staged_and_logged(self):
         result = self._run(
             commit_error=RuntimeError("db is down"),
             restore_error=OSError("cross-device link"),
             restore_fails_for="11111111-1111-4111-8111-111111111111",
         )
-
-        message, category = result.flashes[0]
-        self.assertEqual(category, "error")
-        self.assertNotIn("Nothing was deleted", message)
-        self.assertIn("kept", message)
-        self.assertIn("could not be put back", message)
-        # No var/jobs internals in what the user is shown.
-        self.assertNotIn(".trash", message)
-        self.assertNotIn(str(result.job_root), message)
-
-        result.db.session.rollback.assert_called_once()
-
-        # The second job restored cleanly; the first did not and its bytes are still staged.
+        self.assertEqual(result.outcome["recovery_required"], 1)
+        self.assertEqual(result.outcome["files_left"], 1)
         job_a, job_b = result.jobs
         self.assertTrue(Path(job_b.job_dir).is_dir())
         self.assertFalse(Path(job_a.job_dir).exists())
         staged = list((result.job_root / ".trash").iterdir())
         self.assertTrue(staged[0].name.startswith(job_a.id + "."))
-        # Left intact for manual recovery, not cleaned up.
         self.assertTrue((staged[0] / "tree_state.json").is_file())
-
-        # And the log carries both ends of the move plus the job id.
         recovery = [call for call in result.exception.call_args_list
-                    if "jobs.clear_restore_failed" in call[0][0]]
+                    if "jobs.purge_restore_failed" in call[0][0]]
         self.assertEqual(len(recovery), 1)
-        template, job_id, staged_path, source_path = recovery[0][0]
+        _template, job_id, staged_path, source_path = recovery[0][0]
         self.assertEqual(job_id, job_a.id)
         self.assertEqual(Path(staged_path), staged[0])
         self.assertEqual(Path(source_path), Path(job_a.job_dir))
-        # The degradation line is countable by `grep DEGRADED`.
-        self.assertIn("job_clear_rollback_incomplete", result.warn.call_args[0])
 
-    def test_a_staging_failure_deletes_nothing_from_disk(self):
+    def test_retry_after_failed_restore_keeps_the_surviving_row(self):
+        result = self._run(
+            commit_error=RuntimeError("db is down"),
+            restore_error=OSError("no restore"),
+            restore_fails_for="11111111-1111-4111-8111-111111111111",
+            retry_after_failure=True,
+        )
+        self.assertEqual(result.retry_outcome['removed'], 0)
+        self.assertEqual(result.retry_outcome['recovery_required'], 1)
+        result.db.session.delete.assert_not_called()
+
+    def test_a_staging_failure_deletes_nothing_and_keeps_the_row(self):
         result = self._run(rename_error=OSError("cross-device"))
-        message, category = result.flashes[0]
-        self.assertEqual(category, "warning")
-        self.assertIn("could not be deleted", message)
+        self.assertEqual(result.outcome["removed"], 0)
+        result.db.session.delete.assert_not_called()
         for job in result.jobs:
             self.assertTrue(Path(job.job_dir).is_dir())
-        self.assertIn("jobs.clear_dir_failed", result.warn.call_args[0][0])
-
-    def test_failures_go_to_the_logger_not_to_stdout(self):
-        import inspect
-        from app.user import routes
-        # Strip the docstring, which describes the old print() on purpose.
-        source = inspect.getsource(routes.clear_jobs)
-        body = source.split('"""')[-1]
-        self.assertNotIn("print(", body)
-        self.assertIn("logger.warning(", body)
+        self.assertIn("jobs.purge_stage_failed", result.warn.call_args[0][0])
 
 
 if __name__ == "__main__":

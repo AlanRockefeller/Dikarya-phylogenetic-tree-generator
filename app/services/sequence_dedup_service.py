@@ -41,6 +41,10 @@ OBSERVATION_NEAR_DUPLICATE_MAX_DIFFERENCES = 3
 # rather than burning CPU on an O(n^2) scan at submit time.
 MAX_GROUP_SIZE = 25
 
+# Group key prefix for records collapsed because they are the same GenBank
+# accession (version suffix ignored) rather than the same observation.
+ACCESSION_GROUP_PREFIX = "accession:"
+
 
 def _parse_fasta(text: str) -> List[Dict[str, str]]:
     """Parse FASTA text into [{name, sequence}], preserving full headers."""
@@ -308,7 +312,7 @@ def _resolve_genbank_references(
 def _identifier_label(reference: str) -> str:
     """Render 'inat:280384724' as the 'iNat280384724' form tip labels use."""
     source, _, number = str(reference or "").partition(":")
-    if not number:
+    if not number or source == ACCESSION_GROUP_PREFIX.rstrip(":"):
         return ""
     return f"iNat{number}" if source == "inat" else f"MO{number}"
 
@@ -453,6 +457,14 @@ def dedupe_by_observation(
         for index, reference in enumerate(references):
             if reference:
                 groups.setdefault(reference, []).append(index)
+            elif accessions[index]:
+                # No observation number, but the same GenBank record can still
+                # arrive twice -- e.g. a MycoMap BLAST hit sourced from NCBI
+                # ("NR_173927") beside MycoMap's local copy ("NR_173927.1").
+                # Group on the unversioned accession; the near-identical check
+                # below still guards against collapsing different sequences.
+                base = accessions[index].split(".", 1)[0]
+                groups.setdefault(f"{ACCESSION_GROUP_PREFIX}{base}", []).append(index)
 
         # index of a removed record -> {kept_index, difference, reference}
         dropped: Dict[int, Dict[str, Any]] = {}
@@ -547,19 +559,24 @@ def dedupe_by_observation(
             entry = dropped[index]
             kept_name = records[entry["kept_index"]].get("name", "")
             difference = entry["difference"]
+            group_key = (entry["reference"]
+                         if entry["reference"].startswith(ACCESSION_GROUP_PREFIX)
+                         else "")
+            same_what = "GenBank record" if group_key else "observation"
             removed_record = {
                 "name": records[index].get("name", ""),
                 "sequence": records[index].get("sequence", ""),
                 "duplicate_of": kept_name,
-                "observation_reference": entry["reference"],
+                "group_key": group_key,
+                "observation_reference": "" if group_key else entry["reference"],
                 "difference_count": difference,
                 "reason": "duplicate_observation_record",
                 "reason_label": (
-                    f"Same observation as \'{kept_name}\'; identical where the "
+                    f"Same {same_what} as \'{kept_name}\'; identical where the "
                     f"reads overlap"
                     if difference == 0
                     else (
-                        f"Same observation as \'{kept_name}\' ({difference} base "
+                        f"Same {same_what} as \'{kept_name}\' ({difference} base "
                         f"difference{'' if difference == 1 else 's'} where the "
                         f"reads overlap)"
                     )
@@ -638,7 +655,7 @@ def record_dedup_details(job_params: Dict[str, Any], removed: List[Dict[str, Any
         return (
             str(record.get("name") or ""),
             str(record.get("sequence") or ""),
-            str(record.get("observation_reference") or ""),
+            str(record.get("group_key") or record.get("observation_reference") or ""),
             record.get("metadata"),
         )
 

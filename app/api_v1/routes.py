@@ -754,7 +754,7 @@ def list_jobs():
 
     `since`/`until` accept offset-aware or naive ISO-8601; see
     `parse_utc_query_timestamp` for how each is interpreted."""
-    q = Job.query.filter_by(user_id=g.api_user.id)
+    q = Job.query.filter_by(user_id=g.api_user.id).filter(Job.deleted_at.is_(None))
 
     status = request.args.get("status")
     if status:
@@ -876,6 +876,16 @@ def delete_job(job_id):
     job = get_owned_job_or_404(job_id)
     if not job:
         return error_response(code="not_found", message="Job not found.", status=404)
+    if getattr(job, "protected", False):
+        return error_response(
+            code="conflict",
+            message=(
+                "This job is protected. Unprotect it on the My Jobs page "
+                "before deleting it."
+            ),
+            status=409,
+            details={"job_id": job_id, "protected": True},
+        )
     if job.status == "deleting":
         return error_response(
             code="conflict",

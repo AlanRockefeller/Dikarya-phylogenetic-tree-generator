@@ -137,6 +137,18 @@
         return lines.join('\n');
     }
 
+    // Alan 10/5/26 - Hover text for a suspected dirty read end (dirty_read_service.py). Same wording as
+    // the Alignment Viewer's, where the suspect bases are drawn hatched.
+    function describeDirtyRead(info) {
+        const parts = [];
+        const seg = (where, s) => `${where} ${s.bases} bp (${s.mismatches} of ${s.compared} compared positions disagree with its closest relatives)`;
+        if (info.start) parts.push(seg('first', info.start));
+        if (info.end) parts.push(seg('last', info.end));
+        return 'Suspected dirty read end: ' + parts.join('; ') + '.\n'
+            + 'The rest of the read matches its closest relatives, so this is most often a low-quality trace end; '
+            + 'a chimera or a genuinely divergent region looks the same. Open the Alignment Viewer to see the bases.';
+    }
+
     // Alan 8/15/26 - Curated font list for clade annotations, shared with the controller's
     // editor UI and mirrored by ALLOWED_FONT_FAMILIES in tree_annotation_service.py. Using a
     // fixed list plus a fixed fallback stack means a font value can never carry a CSS fragment
@@ -756,6 +768,10 @@
                 names: typeSpecimens.names && typeof typeSpecimens.names === 'object' ? typeSpecimens.names : {}
             };
             this.typeSpecimenCount = 0;
+            // Alan 10/5/26 - Suspected dirty read ends, keyed by alignment header (window.DIRTY_READS).
+            const dirtyReads = this.options.dirtyReads || {};
+            this.dirtyReadNames = dirtyReads.names && typeof dirtyReads.names === 'object' ? dirtyReads.names : {};
+            this.dirtyReadCount = 0;
 
             this.tree = null;
             this.exportTree = null;
@@ -1292,6 +1308,7 @@
             this._attachSequenceMetricsToLeaves();
             // Alan 9/24/26 - Mark type-specimen tips from the same names.
             this._attachTypeSpecimensToLeaves();
+            this._attachDirtyReadsToLeaves();
         }
 
         _branchLength(node) {
@@ -1746,6 +1763,7 @@
                     this._styleNode(element, node);
                     // Alan 9/24/26 - Re-add the type-specimen badge after phylotree rewrites the label.
                     this._decorateTypeSpecimen(element, node);
+                    this._decorateDirtyRead(element, node);
                     // Alan 9/23/26 - Runs after phylotree (re)draws each node, so a polytomy
                     // connector follows every update() without a separate pass.
                     this._drawPolytomyConnector(element, node);
@@ -2382,6 +2400,8 @@
             // Alan 8/21/26 - The invisible right-click targets behind each annotation are UI
             // only; keep them out of exported SVG/JPG figures.
             clone.querySelectorAll('.clade-annotation-hit').forEach(hit => hit.remove());
+            // Alan 10/5/26 - The dirty-read marker is a heuristic for the viewer, not a fact for a figure.
+            clone.querySelectorAll('.dirty-read-badge, .dirty-read-title').forEach(el => el.remove());
             clone.querySelectorAll('style').forEach(s => {
                 if ((s.textContent || '').toLowerCase().includes('darkreader')) s.remove();
             });
@@ -2913,6 +2933,78 @@
                 label.appendChild(title);
             }
             title.textContent = describeTypeSpecimen(info);
+        }
+
+        // Alan 10/5/26 - Tag each tip with its suspected dirty read end (or null), matched by the
+        // original alignment header like the type markers, so a renamed tip keeps its flag.
+        _attachDirtyReadsToLeaves() {
+            this.dirtyReadCount = 0;
+            const names = this.dirtyReadNames || {};
+            const keys = Object.keys(names);
+            const stripped = new Map(keys.map(k => [k.replace(/^_R_/, '').trim(), k]));
+            for (const node of this.allNodes) {
+                node.__dirtyRead = null;
+                if (node.children && node.children.length) continue;
+                const name = String(node?.data?.__original_name || node?.__original_name
+                    || node?.data?.name || node?.name || '').trim();
+                if (!name || !keys.length) continue;
+                const key = ownValue(names, name) ? name : stripped.get(name.replace(/^_R_/, ''));
+                const info = key ? ownValue(names, key) : null;
+                if (info && typeof info === 'object' && (info.start || info.end)) {
+                    node.__dirtyRead = info;
+                    this.dirtyReadCount += 1;
+                }
+            }
+        }
+
+        // Alan 10/5/26 - Amber ⚠ after the label of a suspected dirty read, with a hover title. Re-added
+        // after every redraw like the type badge (phylotree resets the label text). Left out of image
+        // exports by _buildExportClone.
+        _decorateDirtyRead(element, node) {
+            const group = element && typeof element.node === 'function' ? element.node() : null;
+            if (!group || !group.querySelector) return;
+            const info = node && node.__dirtyRead;
+            const label = group.querySelector('text.phylotree-node-text');
+            if (!label) return;
+            let badge = label.querySelector('tspan.dirty-read-badge');
+            let title = label.querySelector('title.dirty-read-title');
+            if (!info || !label.textContent) {
+                if (badge) badge.remove();
+                if (title) title.remove();
+                return;
+            }
+            const text = describeDirtyRead(info);
+            if (!badge) {
+                badge = document.createElementNS(SVG_NS, 'tspan');
+                badge.setAttribute('class', 'dirty-read-badge');
+                badge.setAttribute('dx', '0.3em');
+                badge.style.setProperty('font-size', '85%');
+                badge.style.setProperty('font-weight', '400', 'important');
+                badge.style.setProperty('fill', 'var(--dirty-read-badge, #b45309)', 'important');
+                badge.textContent = '⚠';
+                const badgeTitle = document.createElementNS(SVG_NS, 'title');
+                badge.appendChild(badgeTitle);
+            }
+            // Keep it last, after a type badge that may have been (re)added this pass.
+            if (label.lastElementChild !== badge) label.appendChild(badge);
+            badge.firstChild.textContent = text;
+            // A type tip already has a label-level title; the badge's own title covers that case.
+            const typeTitle = label.querySelector('title.type-specimen-title');
+            if (typeTitle) {
+                if (title) title.remove();
+            } else {
+                if (!title) {
+                    title = document.createElementNS(SVG_NS, 'title');
+                    title.setAttribute('class', 'dirty-read-title');
+                    label.appendChild(title);
+                }
+                title.textContent = text;
+            }
+        }
+
+        // Alan 10/5/26 - Number of suspected dirty-read tips in the loaded tree.
+        getDirtyReadCount() {
+            return this.dirtyReadCount || 0;
         }
 
         // Alan 9/24/26 - Number of type-specimen tips in the loaded tree.

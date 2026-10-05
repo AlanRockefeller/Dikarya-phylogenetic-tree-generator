@@ -2879,6 +2879,8 @@ document.addEventListener('DOMContentLoaded', async () => {
             sequenceMetrics: Array.isArray(window.SEQUENCE_METRICS) ? window.SEQUENCE_METRICS : [],
             // Alan 9/24/26 - Type-specimen tips resolved server-side (type_specimen_service.py).
             typeSpecimens: window.TYPE_SPECIMENS || {},
+            // Alan 10/5/26 - Suspected dirty read ends resolved server-side (dirty_read_service.py).
+            dirtyReads: window.DIRTY_READS || {},
             treeMethod: window.TREE_METHOD || '',
             // Alan 8/22/26 - IQ-TREE run with -alrt but no ultrafast bootstrap writes single
             // SH-aLRT percentages, not UFBoot ones.

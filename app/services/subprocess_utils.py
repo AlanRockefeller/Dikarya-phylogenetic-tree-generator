@@ -361,7 +361,8 @@ def run_command(args: List[str], cwd: Optional[Path] = None, log_file: Optional[
       the CLI, neither of which had any limit at all.
 
     Returns (returncode, stdout, stderr).
-    Raises no exceptions; caller decides what to do.
+    Returns command failures; RQ job timeouts propagate after subprocess.run
+    kills and waits for its child so callers cannot continue past the deadline.
     """
     try:
         import os
@@ -417,6 +418,9 @@ def run_command(args: List[str], cwd: Optional[Path] = None, log_file: Optional[
             f"[TIMEOUT] {Path(args[0]).name} exceeded its {timeout}s time limit "
             f"and was stopped."
         )
+
+    except _JOB_TIMEOUT_EXCEPTIONS:
+        raise
 
     except FileNotFoundError as e:
         return EXIT_CODE_TOOL_NOT_FOUND, "", _log_missing_executable(args, e)

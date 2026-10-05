@@ -1574,3 +1574,12 @@ body.tree-expanded #btn-fullscreen i::before {
 .dark {
     --type-specimen-badge: #c9a962;
 }
+
+/* Alan 10/5/26 - Suspected dirty read marker (amber ⚠ from _decorateDirtyRead). */
+:root {
+    --dirty-read-badge: #b45309;
+}
+
+.dark {
+    --dirty-read-badge: #fbbf24;
+}

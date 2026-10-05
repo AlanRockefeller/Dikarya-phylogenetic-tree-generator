@@ -7,13 +7,13 @@
 {% block main_width %}max-w-none{% endblock %}
 
 {% block head %}
-<link rel="stylesheet" href="{{ url_for('static', filename='css/tree_viewer.css') }}?v=24">
+<link rel="stylesheet" href="{{ url_for('static', filename='css/tree_viewer.css') }}?v=25">
 <link rel="stylesheet" href="{{ url_for('static', filename='css/phylotree.css') }}?v=3">
 <link rel="stylesheet" href="{{ url_for('static', filename='css/phylotree-menus.css') }}?v=3">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;700&display=swap">
-<link rel="stylesheet" href="{{ url_for('static', filename='css/alignment_viewer.css') }}?v=19">
+<link rel="stylesheet" href="{{ url_for('static', filename='css/alignment_viewer.css') }}?v=20">
 {% endblock %}
 
 {% block content %}
@@ -1344,7 +1344,7 @@
                     <tr>
                         <td class="py-2 pr-4 font-mono break-all max-w-md">{{ record.get('name', 'Unknown') }}</td>
                         <td class="py-2 pr-4 font-mono break-all max-w-md">{{ record.get('duplicate_of', '-') }}</td>
-                        <td class="py-2 pr-4 font-mono whitespace-nowrap">{{ record.get('observation_reference', '-') }}
+                        <td class="py-2 pr-4 font-mono whitespace-nowrap">{{ record.get('observation_reference') or '-' }}
                         </td>
                         <td class="py-2 pr-4 whitespace-nowrap">{{ record.get('difference_count', 0) }} bp</td>
                     </tr>
@@ -1551,6 +1551,9 @@
     // Alan 9/24/26 - Type-specimen tips (type_specimen_service.type_specimens_for_job):
     // {records: {ACCESSION: info}, names: {input header: ACCESSION}}.
     window.TYPE_SPECIMENS = {{ type_specimens|default({}, true)|tojson }};
+    // Alan 10/5/26 - Suspected dirty read ends (dirty_read_service.dirty_read_ends_for_job):
+    // {names: {alignment header: {start, end}}}, column ranges in the Alignment Viewer's alignment.
+    window.DIRTY_READS = {{ dirty_reads|default({}, true)|tojson }};
 </script>
 
 <script src="{{ url_for('static', filename='vendor/d3.v7.min.js') }}"></script>
@@ -1569,15 +1572,15 @@
 
 <script src="{{ url_for('static', filename='js/phylotree.js') }}?v=15"></script>
 
-<script src="{{ url_for('static', filename='js/tree_viewer_phylotree_v2.js') }}?v=106"></script>
+<script src="{{ url_for('static', filename='js/tree_viewer_phylotree_v2.js') }}?v=107"></script>
 
 <script src="{{ url_for('static', filename='js/tree_viewer_api.js') }}?v=8"></script>
 
-<script src="{{ url_for('static', filename='js/tree_viewer_controller.js') }}?v=101"></script>
+<script src="{{ url_for('static', filename='js/tree_viewer_controller.js') }}?v=102"></script>
 
 {% include 'partials/alignment_viewer_modal.html' %}
 
-<script src="{{ url_for('static', filename='js/alignment_viewer.js') }}?v=17"></script>
+<script src="{{ url_for('static', filename='js/alignment_viewer.js') }}?v=20"></script>
 
 
 

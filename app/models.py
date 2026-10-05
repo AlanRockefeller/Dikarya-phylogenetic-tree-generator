@@ -77,7 +77,16 @@ class Job(db.Model):
     # metrics were silently lost. Tracking mutation fixes it without touching
     # the PostgreSQL column, which stays plain JSON.
     metrics = db.Column(MutableDict.as_mutable(db.JSON), default=dict)
-    
+    # Owner-set lock: Clear All skips a protected job and the v1 API refuses
+    # to delete it until it is unprotected.
+    protected = db.Column(db.Boolean, nullable=False, default=False,
+                          server_default=db.false())
+    # Set by Clear All. The row and files are kept for
+    # JOB_DELETE_GRACE_DAYS so the owner can restore them; check_job_access
+    # treats a deleted job as missing, and `flask purge-deleted-jobs` removes
+    # it for good once the grace period is over.
+    deleted_at = db.Column(db.DateTime, nullable=True, index=True)
+
     user = db.relationship("User", backref=db.backref("jobs", lazy=True))
 
 class ApiToken(db.Model):
