@@ -5555,6 +5555,8 @@
     // =========================================================================
     document.getElementById('submit_btn').addEventListener('click', async () => {
         const btn = document.getElementById('submit_btn');
+        // Edit mode saves and recomputes through the queue footer's handler.
+        if (EDIT_JOB_ID || btn.disabled) return;
 
         if (sequenceQueue.length < 2) {
             showStatus('Please add at least 2 sequences to the queue.', 'error');
@@ -6093,8 +6095,10 @@
             }
         })();
 
-        // Change Submit Button
-        submitBtn.innerHTML = '<i class="fas fa-plus-circle mr-2"></i> Add & Recompute';
+        // This control creates a new job; edit mode uses the recompute control
+        // below, which also reads changes from the Advanced panel.
+        submitBtn.style.display = 'none';
+        submitBtn.disabled = true;
 
         // Let's create a dedicated "Add & Recompute" button container below the queue
         const queueContainer = document.querySelector('.lg\\:col-span-1 > div'); // The queue card
