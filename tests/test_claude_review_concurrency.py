@@ -8,6 +8,7 @@ visible as the feature refusing to work.
 """
 
 import inspect
+import re
 import time
 from unittest.mock import patch
 
@@ -68,8 +69,14 @@ class _FakeRedis:
         # `"del" in script` matched any Lua text containing those three letters
         # and broke on the equally valid redis.call("DEL", ...), reporting a
         # confusing AssertionError instead of a redis-behaviour mismatch.
-        lowered = script.lower()
-        assert "del" in lowered and "get" in lowered, script
+        assert numkeys == 1
+        assert re.fullmatch(
+            r"\s*if\s+redis\.call\(['\"]get['\"],\s*KEYS\[1\]\)\s*==\s*ARGV\[1\]"
+            r"\s+then\s+return\s+redis\.call\(['\"]del['\"],\s*KEYS\[1\]\)"
+            r"\s+else\s+return\s+0\s+end\s*",
+            script,
+            flags=re.IGNORECASE,
+        ), script
         if self.values.get(key) == arg:
             return self.delete(key)
         return 0
