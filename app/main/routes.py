@@ -826,6 +826,8 @@ def job_status(job_id):
     # be gone before it was read.
     from app.models import Job
     job_record = db.session.get(Job, job_id)
+    if job_record is not None and getattr(job_record, "deleted_at", None) is not None:
+        abort(404)
     input_warnings = []
     if job_record and isinstance(job_record.metrics, dict):
         input_warnings = job_record.metrics.get("input_warnings") or []

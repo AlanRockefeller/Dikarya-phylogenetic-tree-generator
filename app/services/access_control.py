@@ -39,6 +39,11 @@ def check_job_access(job_id: str, mode: str = "view") -> Tuple[Optional[Job], Op
 
     db_job = Job.query.get(job_id)
     job_dir = Config.JOB_DIR / job_id
+
+    # A job in the owner's "Recently deleted" list is gone as far as every job
+    # URL is concerned, shared links included, until it is restored.
+    if db_job is not None and getattr(db_job, "deleted_at", None) is not None:
+        return None, "Job not found", 404
     
     # Check if job exists (either in DB or on disk)
     if not db_job and not job_dir.exists():

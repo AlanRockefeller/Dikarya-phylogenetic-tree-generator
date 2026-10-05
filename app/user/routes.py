@@ -20,183 +20,123 @@ logger = logging.getLogger(__name__)
 @bp.route('/jobs')
 @login_required
 def user_jobs():
-    jobs = Job.query.filter_by(user_id=current_user.id).order_by(Job.created_at.desc()).all()
-    return render_template('user_jobs.html', jobs=jobs)
+    from app.services.job_trash_service import (
+        JOB_DELETE_GRACE_DAYS, PURGE_BATCH_LIMIT, expired_deleted_jobs,
+        purge_cutoff, purge_jobs,
+    )
+
+    # Jobs past their grace period are purged lazily, when their owner next
+    # opens this page. Best effort: a failure is logged and retried next time.
+    expired = expired_deleted_jobs(current_user.id, limit=PURGE_BATCH_LIMIT)
+    if expired:
+        purge_jobs(expired)
+
+    jobs = (Job.query.filter_by(user_id=current_user.id)
+            .filter(Job.deleted_at.is_(None))
+            .order_by(Job.created_at.desc()).all())
+    deleted_jobs = (Job.query.filter_by(user_id=current_user.id)
+                    .filter(Job.deleted_at.isnot(None))
+                    .order_by(Job.deleted_at.desc()).all())
+    cutoff = purge_cutoff()
+    for job in deleted_jobs:
+        job.days_left = max(0, (job.deleted_at - cutoff).days)
+    return render_template('user_jobs.html', jobs=jobs, deleted_jobs=deleted_jobs,
+                           grace_days=JOB_DELETE_GRACE_DAYS)
+
+
+def _owned_job_or_404(job_id):
+    if not validate_job_id(job_id):
+        abort(404)
+    job = db.session.get(Job, job_id)
+    if job is None or job.user_id != current_user.id:
+        abort(404)
+    return job
 
 
 @bp.route('/jobs/clear', methods=['POST'])
 @login_required
 def clear_jobs():
-    """Remove the user's job history, and their files where that is possible.
+    """Move the user's unprotected jobs to "Recently deleted".
 
-    Two things happen here and they can succeed independently: the history row
-    is deleted from the database, and the job's directory under var/jobs is
-    deleted from disk. The old version reported "N jobs cleared successfully"
-    for every run regardless, wrote directory failures to stdout with print()
-    (so they went nowhere anybody reads), and left the user believing files had
-    been removed that were still on disk. Now the flash says exactly what
-    happened, and a failure is logged with the job id attached.
-
-    Ordering matters too, for the same reason it does in the v1 API's
-    single-job delete. Destroying the directories first and committing the row
-    deletions afterwards meant a failed commit left every history row live with
-    its artifacts already gone for good. So each directory is *moved aside*
-    into ``var/jobs/.trash`` first -- cheap, atomic and reversible -- the rows
-    are deleted and committed, and only then are the moved copies reclaimed. A
-    commit failure puts every staged directory back -- and when one of those
-    restores itself fails, the user is told so rather than told that nothing
-    was deleted, because the surviving row now points at a path whose contents
-    are still in the staging area.
+    Nothing is destroyed here: the rows and files are kept for the grace
+    period and can be restored. See app/services/job_trash_service.py.
     """
-    import shutil
-    import time
-    from pathlib import Path
-
-    from app.config import Config
-
-    def _canonical_job_dir(job) -> Path | None:
-        """Return a trusted canonical path, or None for a corrupt row."""
-        if not validate_job_id(job.id):
-            return None
-        candidate = Config.JOB_DIR / job.id
-        try:
-            if Path(job.job_dir).resolve() != candidate.resolve():
-                return None
-            if not candidate.resolve().is_relative_to(Config.JOB_DIR.resolve()):
-                return None
-        except (OSError, TypeError, ValueError):
-            return None
-        return candidate
-
-    jobs = Job.query.filter_by(user_id=current_user.id).all()
-    removed_rows = 0
-    failed_dirs = []
-    staged_entries = []  # (job_id, source, staged)
-    trash_root = Config.JOB_DIR / ".trash"
-
-    for job in jobs:
-        candidate = _canonical_job_dir(job)
-        if candidate is None:
-            failed_dirs.append(job.id)
-            logger.warning(
-                "event=jobs.clear_invalid_job_path job=%s dir=%s "
-                "The history row was still removed; its invalid or "
-                "non-canonical path was left untouched.",
-                job.id, job.job_dir,
-            )
-        elif candidate.exists():
-            try:
-                trash_root.mkdir(parents=True, exist_ok=True)
-                staged = trash_root / f"{job.id}.{int(time.time() * 1000)}"
-                candidate.rename(staged)
-                staged_entries.append((job.id, candidate, staged))
-            except OSError as e:
-                # Staging failed, so nothing was destroyed: the row goes
-                # anyway (as it always has) and the files are reported as
-                # still present rather than silently leaked.
-                failed_dirs.append(job.id)
-                logger.warning(
-                    "event=jobs.clear_dir_failed job=%s dir=%s error=%s "
-                    "The history row was still removed; the files remain on disk.",
-                    job.id, job.job_dir, type(e).__name__,
-                )
-        db.session.delete(job)
-        removed_rows += 1
+    from app.services.job_trash_service import (
+        JOB_DELETE_GRACE_DAYS, soft_delete_user_jobs,
+    )
 
     try:
+        deleted, skipped = soft_delete_user_jobs(current_user.id)
         db.session.commit()
     except Exception as e:
         db.session.rollback()
-        # The rows survive, so their artifacts must too: put them all back.
-        restore_failures = []
-        for job_id, source, staged in staged_entries:
-            try:
-                staged.rename(source)
-            except OSError:
-                restore_failures.append(job_id)
-                # Both ends of the move, because recovering this by hand means
-                # moving `staged` back to `source` and nothing else identifies
-                # the pair once the request is over. The staged copy is
-                # deliberately left where it is -- it is the only copy.
-                logger.exception(
-                    "event=jobs.clear_restore_failed job=%s staged=%s source=%s "
-                    "The staged copy was left in place for manual recovery; "
-                    "move it back to source to complete the rollback.",
-                    job_id, staged, source,
-                )
-        logger.exception(
-            "event=jobs.clear_commit_failed user=%s jobs=%s restore_failed=%s "
-            "error=%s",
-            current_user.id, len(jobs), len(restore_failures), type(e).__name__,
-        )
-        if restore_failures:
-            # "Nothing was deleted" is false here. The rows were kept, but some
-            # of their artifacts are sitting in the staging area rather than at
-            # the path the surviving row points to, so those jobs are broken
-            # until an administrator moves them back. Saying nothing happened
-            # would send the user to a job that cannot open its own files with
-            # no reason to report it. The staging path itself stays in the log:
-            # var/jobs internals are not shown to ordinary users anywhere else.
-            from app.services.log_context import log_degradation
-            log_degradation(
-                logger, "job_clear_rollback_incomplete",
-                "Clear-jobs rolled the database back but could not restore "
-                "every staged job directory",
-                user_id=current_user.id, jobs=len(restore_failures),
-            )
-            flash(
-                'Your jobs could not be cleared because of a database error. '
-                'Your job history was kept, but the files for '
-                f'{len(restore_failures)} of them could not be put back '
-                'automatically and need an administrator to recover them. '
-                'This has been logged. Please do not retry until it is fixed.',
-                'error',
-            )
-        else:
-            flash(
-                'Your jobs could not be cleared because of a database error. '
-                'Nothing was deleted. Please try again.',
-                'error',
-            )
+        logger.exception("event=jobs.clear_failed user=%s error=%s",
+                         current_user.id, type(e).__name__)
+        flash('Your jobs could not be cleared because of a database error. '
+              'Nothing was changed. Please try again.', 'error')
         return redirect(url_for('user.user_jobs'))
 
-    # Logical deletion is committed. Reclaiming the bytes is now best effort; a
-    # leftover under var/jobs/.trash is visible evidence, not lost data.
-    for job_id, _source, staged in staged_entries:
-        failure = None
-        try:
-            if staged.is_dir():
-                shutil.rmtree(staged)
-            else:
-                staged.unlink(missing_ok=True)
-        except OSError as exc:
-            failure = type(exc).__name__
-        if failure or staged.exists():
-            from app.services.log_context import log_degradation
-            log_degradation(
-                logger, "job_trash_cleanup_failed",
-                "Cleared job files could not be removed from var/jobs/.trash",
-                job_id=job_id, staged=str(staged),
-                error=failure or "still_present",
-            )
-            # The row is gone but the bytes are still on the server, which is
-            # exactly what the warning below tells the user. Reporting success
-            # here would be the old lie in a new place.
-            failed_dirs.append(job_id)
-
-    if not removed_rows:
-        flash('There were no jobs to clear.', 'info')
-    elif failed_dirs:
-        # Deliberately not "success": some of what the user asked to delete is
-        # still there, and only an administrator can finish the job.
-        flash(
-            f'{removed_rows} job(s) removed from your history, but the files '
-            f'for {len(failed_dirs)} of them could not be deleted and are still '
-            f'on the server. This has been logged for the administrator.',
-            'warning',
-        )
+    kept = f' {skipped} protected job(s) were kept.' if skipped else ''
+    if not deleted:
+        flash('There were no unprotected jobs to clear.' + kept, 'info')
     else:
-        flash(f'{removed_rows} job(s) cleared, including their files.', 'success')
+        flash(f'{deleted} job(s) moved to Recently deleted. You can restore them '
+              f'for {JOB_DELETE_GRACE_DAYS} days.' + kept, 'success')
+    return redirect(url_for('user.user_jobs'))
+
+
+@bp.route('/jobs/<job_id>/protect', methods=['POST'])
+@login_required
+def toggle_job_protection(job_id):
+    job = _owned_job_or_404(job_id)
+    job.protected = not job.protected
+    db.session.commit()
+    flash('Job protected: it will be kept when you clear your jobs.'
+          if job.protected else 'Job unprotected.', 'success')
+    return redirect(url_for('user.user_jobs'))
+
+
+@bp.route('/jobs/<job_id>/restore', methods=['POST'])
+@login_required
+def restore_job(job_id):
+    job = _owned_job_or_404(job_id)
+    if job.deleted_at is not None:
+        job.deleted_at = None
+        db.session.commit()
+    flash('Job restored.', 'success')
+    return redirect(url_for('user.user_jobs'))
+
+
+@bp.route('/jobs/restore-all', methods=['POST'])
+@login_required
+def restore_all_jobs():
+    restored = (Job.query.filter_by(user_id=current_user.id)
+                .filter(Job.deleted_at.isnot(None))
+                .update({Job.deleted_at: None}, synchronize_session=False))
+    db.session.commit()
+    flash(f'{restored} job(s) restored.', 'success')
+    return redirect(url_for('user.user_jobs'))
+
+
+@bp.route('/jobs/<job_id>/purge', methods=['POST'])
+@login_required
+def purge_job(job_id):
+    """Delete one already-deleted job permanently, before its grace period ends."""
+    from app.services.job_trash_service import purge_jobs
+
+    job = _owned_job_or_404(job_id)
+    if job.deleted_at is None:
+        flash('Only a job in Recently deleted can be deleted permanently.', 'error')
+        return redirect(url_for('user.user_jobs'))
+    result = purge_jobs([job])
+    if result['failed']:
+        flash('The job could not be deleted because of a database error. '
+              'Nothing was deleted. Please try again.', 'error')
+    elif result['files_left']:
+        flash('The job was deleted, but its files could not be removed from the '
+              'server. This has been logged for the administrator.', 'warning')
+    else:
+        flash('Job deleted permanently.', 'success')
     return redirect(url_for('user.user_jobs'))
 
 

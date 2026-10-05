@@ -28,7 +28,7 @@ def get_owned_job_or_404(job_id):
     if not validate_job_id(job_id):
         return None
     job = Job.query.get(job_id)
-    if job is None:
+    if job is None or getattr(job, "deleted_at", None) is not None:
         return None
     user = getattr(g, "api_user", None)
     if user is None or job.user_id != user.id:
@@ -89,6 +89,7 @@ def serialize_job(job):
     return {
         "id": job.id,
         "status": job.status,
+        "protected": bool(getattr(job, "protected", False)),
         "created_at": job.created_at.isoformat() if job.created_at else None,
         "updated_at": job.updated_at.isoformat() if job.updated_at else None,
         "input_type": job.input_type,
