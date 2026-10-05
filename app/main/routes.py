@@ -1041,6 +1041,15 @@ def job_viewer(job_id):
         logger.exception("Could not resolve type specimens for job %s", job_id)
         type_specimens = {"records": {}, "names": {}}
 
+    # Suspected dirty read ends (dirty_read_service.py), shared by the tree and alignment viewers.
+    # Display metadata only, like the type markers; a failure must never stop the tree rendering.
+    try:
+        from app.services.dirty_read_service import dirty_read_ends_for_job
+        dirty_reads = dirty_read_ends_for_job(job_dir)
+    except Exception:
+        logger.exception("Could not detect dirty read ends for job %s", job_id)
+        dirty_reads = {"names": {}}
+
     mycomap_records = [row for row in job_details.get("sequence_metadata", [])
                        if isinstance(row, dict) and row.get("source") == "mycomap"]
     rerun_state = ((db_job.metrics or {}).get("mycomap_blast_rerun") or {}) \
@@ -1057,6 +1066,7 @@ def job_viewer(job_id):
     return render_template(
         'job_viewer.html', job_id=job_id, job_details=job_details, view_only=view_only,
         type_specimens=type_specimens,
+        dirty_reads=dirty_reads,
         claude_review_enabled=claude_review_enabled(),
         tree_support_context=tree_support_context,
         generation_details=generation_details,

@@ -115,6 +115,9 @@
         // Alan 9/9/26 - Clade-highlight colour per alignment row name, mirrored from the tree
         // viewer's painted bands. Empty when nothing is highlighted.
         tipHighlights: new Map(),
+        // Alan 10/5/26 - Suspected dirty read ends, keyed by row name: { start: [lo, hi) | null, end: ... }
+        // in alignment columns, plus the bases/mismatches each covers. Detection only; nothing is trimmed.
+        dirtyEnds: new Map(),
     };
 
     // Alan 8/4/26 - Read the persisted names-column width; ignore anything absurd.
@@ -168,7 +171,7 @@
         for (let i = 0; i < rows.length; i++) {
             // Alan 9/28/26 - Reserve width for the display-only type marker when fitting names.
             const label = (state.referenceName === rows[i].name ? '◆ ' : '') + rows[i].name
-                + (typeSpecimenForRow(rows[i]) ? ' T' : '');
+                + (typeSpecimenForRow(rows[i]) ? ' T' : '') + (state.dirtyEnds.has(rows[i].name) ? ' ⚠' : '');
             const w = ctx.measureText(label).width;
             if (w > max) max = w;
         }
@@ -221,7 +224,56 @@
         warningsEl.textContent = state.warnings.join(' • ');
     }
 
+    // Alan 10/5/26 - Server warnings plus the client-side dirty-end summary, in one banner.
+    function renderAllWarnings() {
+        const base = state._serverWarnings || [];
+        const n = state.dirtyEnds.size;
+        state.warnings = n
+            ? base.concat([`${n} sequence${n === 1 ? ' has' : 's have'} a suspected dirty read end (hatched; hover the ⚠ for details). Not trimmed.`])
+            : base.slice();
+        renderWarnings();
+    }
+
+    // Alan 10/5/26 - Suspected dirty read ends come from the server (dirty_read_service.py, served as
+    // window.DIRTY_READS) so this viewer and the tree viewer's marker can never disagree. Keyed by the
+    // alignment header; a renamed row carries it as original_name. Ranges are columns of this alignment.
+    function dirtyEndsForRows(rows) {
+        const out = new Map();
+        const names = (window.DIRTY_READS && window.DIRTY_READS.names) || {};
+        for (const row of rows) {
+            const key = row.original_name || row.name;
+            const info = Object.prototype.hasOwnProperty.call(names, key) ? names[key] : null;
+            if (info && (info.start || info.end)) out.set(row.name, info);
+        }
+        return out;
+    }
+
+    function dirtyEndsTitle(info) {
+        const parts = [];
+        if (info.start) parts.push(`first ${info.start.bases} bp (${info.start.mismatches} of ${info.start.compared} compared positions disagree with its closest relatives)`);
+        if (info.end) parts.push(`last ${info.end.bases} bp (${info.end.mismatches} of ${info.end.compared} compared positions disagree with its closest relatives)`);
+        return 'Suspected dirty read end: ' + parts.join('; ')
+            + '.\nThe rest of the read matches its closest relatives, so this is most often a low-quality trace end;'
+            + ' a chimera or a genuinely divergent region looks the same. Check before trimming or dropping it.';
+    }
+
+    function inDirtyEnd(info, i) {
+        return !!info && ((info.start && i >= info.start.range[0] && i < info.start.range[1])
+            || (info.end && i >= info.end.range[0] && i < info.end.range[1]));
+    }
+
     function isGap(ch) { return ch === '-' || ch === '.'; }
+
+    // Alan 10/5/26 - [first, last+1) columns where a sequence has data. Outside this span a reference's gaps
+    // are missing data (a shorter read), not indels, so they must not mark other rows' bases as differences.
+    function dataSpan(seq) {
+        if (!seq) return null;
+        let lo = 0;
+        while (lo < seq.length && isGap(seq[lo])) lo++;
+        let hi = seq.length;
+        while (hi > lo && isGap(seq[hi - 1])) hi--;
+        return [lo, hi];
+    }
 
     // Alan 5/13/26 - Build the corner label shown above the names column: sort mode + variable/conserved column counts.
     const SORT_MODE_LABELS = {
@@ -256,20 +308,26 @@
         const len = state.alignmentLength;
         const indexes = [];
         let gapOnly = 0;
+        const span = dataSpan(refSeq);
         for (let i = 0; i < len; i++) {
             let hasNonGap = false;
             let firstBase = null;
             let varied = false;
             const refCh = refSeq ? (refSeq[i] || '-').toUpperCase() : null;
             const useRef = !!refCh && !isGap(refCh) && refCh !== 'N';
+            // Alan 10/5/26 - Against a reference: outside its data span nothing is comparable; an internal
+            // reference gap is an indel, so any base in another row there is a difference.
+            const outsideRef = !!refSeq && (i < span[0] || i >= span[1]);
+            const refIndel = !!refCh && isGap(refCh) && !outsideRef;
             if (useRef) firstBase = refCh;
             for (let r = 0; r < rows.length; r++) {
                 const ch = rows[r].sequence[i] || '-';
                 const gap = isGap(ch);
                 if (!hasNonGap && !gap) hasNonGap = true;
-                if (state.variableOnly && !varied && !gap) {
+                if (state.variableOnly && !varied && !gap && !outsideRef) {
                     const up = ch.toUpperCase();
                     if (up === 'N') continue;
+                    if (refIndel) { varied = true; continue; }
                     if (firstBase === null) firstBase = up;
                     else if (up !== firstBase) varied = true;
                 }
@@ -287,6 +345,7 @@
         const out = new Array(state.alignmentLength).fill('-');
         // Alan 5/13/26 - Count variable columns (>1 distinct non-gap/non-N base) while computing consensus for the corner label.
         let variable = 0;
+        const span = dataSpan(refSeq);
         for (let k = 0; k < visibleIdx.length; k++) {
             const i = visibleIdx[k];
             const counts = {};
@@ -303,13 +362,15 @@
                 else counts[c]++;
                 if (useRef && c !== refCh) differsFromRef = true;
             }
+            const outsideRef = !!refSeq && (i < span[0] || i >= span[1]);
+            const refIndel = !!refCh && (refCh === '-' || refCh === '.') && !outsideRef && distinct > 0;
             let best = '-';
             let bestN = 0;
             for (const k2 in counts) {
                 if (counts[k2] > bestN) { best = k2; bestN = counts[k2]; }
             }
             out[i] = best;
-            if (useRef ? differsFromRef : distinct > 1) variable++;
+            if (refSeq ? (useRef ? differsFromRef : refIndel) : distinct > 1) variable++;
         }
         state.variableColumnCount = variable;
         return out.join('');
@@ -860,11 +921,20 @@
                 typeBadge.setAttribute('aria-label', 'Type specimen');
                 nameText.appendChild(typeBadge);
             }
+            const dirtyInfo = state.dirtyEnds.get(row.name);
+            if (dirtyInfo) {
+                const dirtyBadge = document.createElement('span');
+                dirtyBadge.className = 'av-dirty-badge';
+                dirtyBadge.textContent = '⚠';
+                dirtyBadge.setAttribute('aria-label', 'Suspected dirty read end');
+                nameText.appendChild(dirtyBadge);
+            }
             nameText.title = isRef
                 ? `${row.name}\n(reference — click to compare to the consensus again)`
                 : `${row.name}\nClick to use as the reference sequence`;
             // Alan 9/28/26 - Show the tree annotation's status on hover.
             if (typeInfo) nameText.title += `\nType specimen: ${typeInfo.status || 'type'}`;
+            if (dirtyInfo) nameText.title += '\n' + dirtyEndsTitle(dirtyInfo);
             // Alan 9/9/26 - Back the name with its clade's highlight colour. Written inline
             // from the tree's own resolved colour and opacity, the same way the bands are, and
             // full row height so consecutive members read as one band rather than as pills.
@@ -895,6 +965,7 @@
         // Alan 8/4/26 - Compare against the active baseline (reference sequence or consensus).
         const consensus = state.baselineSeq || state.consensus;
         const refName = state.referenceName;
+        const refSpan = refName && state.baselineSeq !== state.consensus ? dataSpan(state.baselineSeq) : null;
         const sizer = state._dom.cellsSizer;
         const frag = document.createDocumentFragment();
         // Alan 5/13/26 - In diff mode, av-match cells render as a middle dot; new cells from scroll inherit this.
@@ -909,12 +980,14 @@
                 + (isPreferredRow(rows[r]) ? ' av-focus-row' : '') + (isRef ? ' av-ref-row' : '');
             rowDiv.style.cssText = `position:absolute;top:${r * ROW_HEIGHT}px;left:${cs * CELL_WIDTH}px;height:${ROW_HEIGHT}px;`;
             const seq = rows[r].sequence;
+            const dirtyInfo = state.dirtyEnds.get(rows[r].name);
             for (let k = cs; k < ce; k++) {
                 const i = idx[k];
                 const ch = seq[i] || '-';
                 const span = document.createElement('span');
-                const cls = cellClass(ch, consensus[i]);
-                span.className = cls;
+                // Alan 10/5/26 - Past the reference's ends there is no baseline: compare against N (= unknown).
+                const cls = cellClass(ch, refSpan && (i < refSpan[0] || i >= refSpan[1]) ? 'N' : consensus[i]);
+                span.className = dirtyInfo && inDirtyEnd(dirtyInfo, i) ? cls + ' av-dirty' : cls;
                 // Alan 5/13/26 - Replace matches with · only when highlight-differences is on; gaps are unaffected.
                 if (diffMode && !isRef && cls.indexOf('av-match') !== -1) {
                     span.dataset.orig = ch;
@@ -966,6 +1039,8 @@
             state.visibleColumnIndexes = buildVisibleColumnIndexes(rows, refSeq);
             state.consensus = computeConsensus(rows, state.visibleColumnIndexes, refSeq);
             state._diffComputedFor = fp;
+            state.dirtyEnds = dirtyEndsForRows(rows);
+            renderAllWarnings();
         }
         state.baselineSeq = refSeq || state.consensus;
         const visibleIdx = state.visibleColumnIndexes;
@@ -1139,7 +1214,8 @@
             state.availablePruned = data.available_pruned_count || 0;
             state.includedPruned = data.included_pruned_count || 0;
             state.alignmentLength = data.alignment_length || (state.sequences[0]?.sequence.length || 0);
-            state.warnings = data.warnings || [];
+            state._serverWarnings = data.warnings || [];
+            state.warnings = state._serverWarnings.slice();
             // Alan 5/12/26 - Row set changed; force consensus/visible-column recompute.
             state._diffComputedFor = '';
             // Alan 5/12/26 - Reset skeleton so dimensions match the new data.
