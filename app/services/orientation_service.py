@@ -45,8 +45,8 @@ CORE_MAX_MM = 2       # Require a reasonably good 5.8S hit to reverse
 
 # IUPAC complement table
 IUPAC_COMP = str.maketrans(
-    "ACGTRYMKWSVHDBNacgtrymkwsvhdbn-",
-    "TGCAYRKMWSBDHVNtgcayrkmwsbdhvn-"
+    "ACGTRYMKWSVHDBNUacgtrymkwsvhdbnu-",
+    "TGCAYRKMWSBDHVNAtgcayrkmwsbdhvna-"
 )
 
 # Precomputed bitmask lookup for IUPAC codes
@@ -54,7 +54,7 @@ I2M: Dict[str, int] = {
     **{b: 1 << i for i, b in enumerate("ACGT")},
     "R": 5, "Y": 10, "S": 6, "W": 9,
     "K": 12, "M": 3, "B": 14, "D": 13,
-    "H": 11, "V": 7, "N": 15, "-": 0
+    "H": 11, "V": 7, "N": 15, "U": 8, "-": 0
 }
 I2M.update({k.lower(): v for k, v in I2M.items()})
 

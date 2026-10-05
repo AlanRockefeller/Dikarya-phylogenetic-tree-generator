@@ -65,7 +65,7 @@ def validate_job_id(job_id: str) -> bool:
     """
     if not job_id or not isinstance(job_id, str):
         return False
-    return bool(JOB_ID_PATTERN.match(job_id) or SHORT_JOB_ID_PATTERN.match(job_id))
+    return bool(JOB_ID_PATTERN.fullmatch(job_id) or SHORT_JOB_ID_PATTERN.fullmatch(job_id))
 
 def cap_fasta_header(header: str) -> str:
     """Strip control characters from a FASTA header and cap it to a sane length.

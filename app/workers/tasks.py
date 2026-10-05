@@ -29,6 +29,7 @@ from app.services.log_context import (
     stable_fingerprint, utc_formatter,
 )
 from app.services.tree_parameter_validation import validate_iqtree_ufboot_count
+from app.services.security_utils import validate_job_id
 from app.services.subprocess_utils import ToolExecutionError, log_tool_failure
 from app.workers.events import (
     STEP_INPUT, STEP_ORIENT, STEP_BLAST, STEP_ITS, STEP_ALIGN, STEP_TRIM, STEP_TREE, STEP_POST,
@@ -815,6 +816,8 @@ def _check_and_maybe_fix_orientation(input_path, fix_orientation: bool) -> dict:
 @background_job_context(0)
 def run_recompute_job(job_id: str, params_dict: dict) -> dict:
     """Background task for recomputing an existing tree while streaming status events."""
+    if not validate_job_id(job_id):
+        raise ValueError("Invalid job ID format")
     job = get_current_job()
     job_dir = Config.JOB_DIR / job_id
     job_dir.mkdir(parents=True, exist_ok=True)
@@ -1221,6 +1224,9 @@ def run_phylo_job(job_params: dict) -> dict:
     """
     job = get_current_job()
     job_id = job.id if job else "local_debug"
+    # The local debug directory is a fixed internal name, never caller input.
+    if job is not None and not validate_job_id(job_id):
+        raise ValueError("Invalid job ID format")
 
     # RQ cancellation and worker dequeue are not one atomic operation. DELETE
     # commits a DB-visible guard first, and every real RQ execution checks it
