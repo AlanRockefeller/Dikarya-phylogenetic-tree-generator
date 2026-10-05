@@ -1594,8 +1594,31 @@ document.addEventListener('DOMContentLoaded', async () => {
         return best ? best.name : '';
     }
 
+    /**
+     * Alan 10/5/26 - A clade holding type material is named after it. The name comes from
+     * the type record's organism, falling back to the tip label. One type species: that name.
+     * Several distinct type species in one genus: "Genus sp.". Types from different genera,
+     * or none whose name can be read, give no opinion and the usual majority vote applies.
+     */
+    function typeSpecimenAnnotationLabel(memberIds) {
+        const types = viewer?.getTypeSpecimensForLeafIds
+            ? viewer.getTypeSpecimensForLeafIds(memberIds)
+            : [];
+        const names = new Set();
+        types.forEach(({ label, info }) => {
+            const name = extractSpeciesName(info?.organism) || extractSpeciesName(label);
+            if (name) names.add(name);
+        });
+        if (!names.size) return '';
+        if (names.size === 1) return names.values().next().value;
+        const genera = new Set(Array.from(names, (name) => name.split(' ')[0]));
+        return genera.size === 1 ? `${genera.values().next().value} sp.` : '';
+    }
+
     function suggestedAnnotationLabel(memberIds) {
         if (!Array.isArray(memberIds) || !memberIds.length) return '';
+        const typeLabel = typeSpecimenAnnotationLabel(memberIds);
+        if (typeLabel) return typeLabel;
         const labels = viewer?.getDisplayLabelsForLeafIds
             ? viewer.getDisplayLabelsForLeafIds(memberIds)
             : [];

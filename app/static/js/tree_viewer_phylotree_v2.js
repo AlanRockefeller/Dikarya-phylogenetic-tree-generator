@@ -5651,6 +5651,27 @@
             return labels;
         }
 
+        /**
+         * Alan 10/5/26 - The type-specimen tips among canonical leaf IDs, as
+         * {label, info} pairs (label is the on-screen name, info the type record).
+         * The annotation editor prefers a type's name when suggesting a clade label.
+         */
+        getTypeSpecimensForLeafIds(ids) {
+            const wanted = new Set(Array.isArray(ids) ? ids.filter(Boolean) : []);
+            if (!wanted.size || !Array.isArray(this.allNodes)) return [];
+            const types = [];
+            this.allNodes.forEach((node) => {
+                const children = node.children || node.data?.children || [];
+                if (children && children.length) return;
+                const info = node.__typeSpecimen;
+                if (!info) return;
+                const id = this._getNodeId(node);
+                if (!id || !wanted.has(id)) return;
+                types.push({ label: String(node.data?.name || node.name || id), info });
+            });
+            return types;
+        }
+
         // Alan 8/17/26 - Compare annotations by canonical descendant membership rather than
         // display order, so rotation and renaming cannot turn Edit into an accidental Add.
         _annotationMembershipKey(ids) {
