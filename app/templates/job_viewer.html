@@ -1,12 +1,35 @@
 {% extends "base_modern.html" %}
 
-{% block title %}Dikarya - Tree Viewer{% endblock %}
+{# Title, description and the link-preview tags are server-rendered from
+   social_preview_service: Facebook, X, Discord etc. never run this page's JS.
+   Guarded so a render without `social` keeps the old title and no card. #}
+{% block title %}{{ social.title if social is defined else 'Dikarya - Tree Viewer' }}{% endblock %}
+{% block description %}{{ social.description if social is defined else 'Dikarya - Mycological Research Tools' }}{% endblock %}
 {% block subtitle %}Tree Viewer{% endblock %}
 
 {# The tree, its toolbar and the settings panel use the whole window width. #}
 {% block main_width %}max-w-none{% endblock %}
 
 {% block head %}
+{% if social is defined %}
+<link rel="canonical" href="{{ social.url }}">
+<meta property="og:type" content="website">
+<meta property="og:site_name" content="Dikarya">
+<meta property="og:title" content="{{ social.title }}">
+<meta property="og:description" content="{{ social.description }}">
+<meta property="og:url" content="{{ social.url }}">
+<meta property="og:image" content="{{ social.image_url }}">
+<meta property="og:image:secure_url" content="{{ social.image_url }}">
+<meta property="og:image:type" content="image/png">
+<meta property="og:image:width" content="{{ social.image_width }}">
+<meta property="og:image:height" content="{{ social.image_height }}">
+<meta property="og:image:alt" content="{{ social.image_alt }}">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:title" content="{{ social.title }}">
+<meta name="twitter:description" content="{{ social.description }}">
+<meta name="twitter:image" content="{{ social.image_url }}">
+<meta name="twitter:image:alt" content="{{ social.image_alt }}">
+{% endif %}
 <link rel="stylesheet" href="{{ url_for('static', filename='css/tree_viewer.css') }}?v=25">
 <link rel="stylesheet" href="{{ url_for('static', filename='css/phylotree.css') }}?v=3">
 <link rel="stylesheet" href="{{ url_for('static', filename='css/phylotree-menus.css') }}?v=3">

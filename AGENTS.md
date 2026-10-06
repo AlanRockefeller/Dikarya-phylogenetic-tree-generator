@@ -95,6 +95,7 @@ var/jobs/{job_id}/
        tree_pruned.{newick,nexus}
        tree_metadata.json
   logs/{pipeline,alignment,tree_builder}.log
+  social/preview.json, preview-<key>.png   link-preview cache (safe to delete)
 ```
 
 **`input_info.json["sequence"]` is not a duplicate of `input/input_raw.fasta`.**
@@ -604,6 +605,26 @@ When a new CLI version is published:
   percentage (`93`) and TBE as a proportion (`0.930000`), so anything that ever
   displays the TBE tree must say which it is rather than reusing the bootstrap
   badge's reading.
+- **Link previews (Open Graph) for `/job/<id>/view` are server-rendered.**
+  `app/services/social_preview_service.py` supplies the page `<title>`
+  ("<Genus> phylogenetic tree — Dikarya", else "Phylogenetic tree — Dikarya"),
+  the fixed description and the og/twitter tags in `job_viewer.html`; crawlers
+  run no JavaScript, so never move these client-side. The og:image is
+  `/job/<id>/social-preview.png?v=<key>`: a 1200x630 Pillow drawing of the
+  actual tree around `sequence_of_interest` (resolved with
+  `resolve_sequence_of_interest()`, as the viewer does), at most ~22 tips --
+  whole sister groups while they fit, then nearest tips by patristic distance
+  (edge count without branch lengths), then one tip per deeper level as
+  context. It reads `tree_pruned.newick`/`tree_original.newick` and
+  `tree_state.json` read-only (it never creates state) and caches under
+  `var/jobs/<id>/social/`, keyed on those files' mtime/size plus
+  `RENDER_VERSION` -- bump that when the drawing or the selection changes. A
+  job it cannot draw gets the committed `static/img/social-preview-default.png`
+  (regenerate it with `render_generic_png()` if the look changes; a test pins
+  them equal). `robots.txt` has a link-preview-bot group that opens only the
+  view page and this image: Twitterbot honours robots.txt, so without it no
+  tree link showed a card on X. Inspect or redraw one job's card with
+  `scripts/dikarya_social_preview.py <job_id> [--out f.png | --force]`.
 - **Type-specimen tips are marked from two sources, by exact accession only.**
   `app/services/type_specimen_service.py` merges MycoMap's type list
   (`mycomap_type_specimens.json`, replaced weekly by
