@@ -11,6 +11,7 @@
 {% block main_width %}max-w-none{% endblock %}
 
 {% block head %}
+<link rel="stylesheet" href="{{ url_for('static', filename='vendor/viewer-fonts.css') }}">
 {% if social is defined %}
 <link rel="canonical" href="{{ social.url }}">
 <meta property="og:type" content="website">
@@ -33,9 +34,6 @@
 <link rel="stylesheet" href="{{ url_for('static', filename='css/tree_viewer.css') }}?v=25">
 <link rel="stylesheet" href="{{ url_for('static', filename='css/phylotree.css') }}?v=3">
 <link rel="stylesheet" href="{{ url_for('static', filename='css/phylotree-menus.css') }}?v=3">
-<link rel="preconnect" href="https://fonts.googleapis.com">
-<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;700&display=swap">
 <link rel="stylesheet" href="{{ url_for('static', filename='css/alignment_viewer.css') }}?v=20">
 {% endblock %}
 
