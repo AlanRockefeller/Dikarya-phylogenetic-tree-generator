@@ -2462,7 +2462,8 @@ def start_mycomap_blast_refresh():
         "local_limit": 50,
         "ncbi_limit": 100,
         "include_ncbi": true,
-        "include_local": true
+        "include_local": true,
+        "refresh_only": false     # true: refresh at MycoMap, gather nothing
     }
     Response: { "status": "success", "job_id": "<job id>" }
     """
@@ -2485,6 +2486,9 @@ def start_mycomap_blast_refresh():
     include_local, include_local_valid = coerce_bool(data.get('include_local'), default=True)
     if not include_ncbi_valid or not include_local_valid:
         return jsonify({"status": "error", "error": "include_ncbi/include_local must be booleans."}), 422
+    refresh_only, refresh_only_valid = coerce_bool(data.get('refresh_only'), default=False)
+    if not refresh_only_valid:
+        return jsonify({"status": "error", "error": "refresh_only must be a boolean."}), 422
 
     try:
         from app.workers.queue import enqueue_mycomap_blast_refresh_job
@@ -2495,6 +2499,7 @@ def start_mycomap_blast_refresh():
             "ncbi_limit": data.get('ncbi_limit'),
             "include_ncbi": include_ncbi,
             "include_local": include_local,
+            "refresh_only": refresh_only,
         })
         return jsonify({"status": "success", "job_id": job_id})
     except Exception as e:

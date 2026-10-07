@@ -1084,6 +1084,12 @@ def run_mycomap_blast_refresh_job(params: dict) -> dict:
                 logger.warning("%s blast_id=%s", warning, blast_id)
                 warnings.append(warning)
 
+    # Alan 10/7/26 - The MycoMap panel refreshes first and then runs its normal
+    # /api/mycomap import (filters, dedup, BLAST metrics), so gathering the
+    # sequences here as well would only fetch them twice.
+    if params.get("refresh_only"):
+        return {"status": "success", "refreshed": True, "warnings": warnings}
+
     from app.api.routes import gather_mycomap_sequences_for_queue
 
     payload, err = gather_mycomap_sequences_for_queue(
