@@ -2402,6 +2402,10 @@
             clone.querySelectorAll('.clade-annotation-hit').forEach(hit => hit.remove());
             // Alan 10/5/26 - The dirty-read marker is a heuristic for the viewer, not a fact for a figure.
             clone.querySelectorAll('.dirty-read-badge, .dirty-read-title').forEach(el => el.remove());
+            clone.querySelectorAll('title.type-specimen-title[data-type-text]').forEach(t => {
+                t.textContent = t.getAttribute('data-type-text');
+                t.removeAttribute('data-type-text');
+            });
             clone.querySelectorAll('style').forEach(s => {
                 if ((s.textContent || '').toLowerCase().includes('darkreader')) s.remove();
             });
@@ -2933,6 +2937,8 @@
                 label.appendChild(title);
             }
             title.textContent = describeTypeSpecimen(info);
+            // _decorateDirtyRead re-appends its explanation after this, from a clean slate.
+            title.removeAttribute('data-type-text');
         }
 
         // Alan 10/5/26 - Tag each tip with its suspected dirty read end (or null), matched by the
@@ -2960,6 +2966,11 @@
         // Alan 10/5/26 - Amber ⚠ after the label of a suspected dirty read, with a hover title. Re-added
         // after every redraw like the type badge (phylotree resets the label text). Left out of image
         // exports by _buildExportClone.
+        // Alan 10/7/26 - The hover text lives in a <title> on the label itself, never inside the ⚠
+        // <tspan>: Firefox lays out a <title> nested in a <tspan> as ordinary text, so the whole
+        // explanation was printed after the tip name instead of appearing on hover. A label has
+        // one tooltip, so on a type tip the explanation is appended to the type title and the
+        // original wording is kept in data-type-text for the export clone to restore.
         _decorateDirtyRead(element, node) {
             const group = element && typeof element.node === 'function' ? element.node() : null;
             if (!group || !group.querySelector) return;
@@ -2968,9 +2979,14 @@
             if (!label) return;
             let badge = label.querySelector('tspan.dirty-read-badge');
             let title = label.querySelector('title.dirty-read-title');
+            const typeTitle = label.querySelector('title.type-specimen-title');
             if (!info || !label.textContent) {
                 if (badge) badge.remove();
                 if (title) title.remove();
+                if (typeTitle && typeTitle.hasAttribute('data-type-text')) {
+                    typeTitle.textContent = typeTitle.getAttribute('data-type-text');
+                    typeTitle.removeAttribute('data-type-text');
+                }
                 return;
             }
             const text = describeDirtyRead(info);
@@ -2981,22 +2997,23 @@
                 badge.style.setProperty('font-size', '85%');
                 badge.style.setProperty('font-weight', '400', 'important');
                 badge.style.setProperty('fill', 'var(--dirty-read-badge, #b45309)', 'important');
+                badge.style.setProperty('cursor', 'help');
                 badge.textContent = '⚠';
-                const badgeTitle = document.createElementNS(SVG_NS, 'title');
-                badge.appendChild(badgeTitle);
             }
             // Keep it last, after a type badge that may have been (re)added this pass.
             if (label.lastElementChild !== badge) label.appendChild(badge);
-            badge.firstChild.textContent = text;
-            // A type tip already has a label-level title; the badge's own title covers that case.
-            const typeTitle = label.querySelector('title.type-specimen-title');
             if (typeTitle) {
                 if (title) title.remove();
+                // _decorateTypeSpecimen has just rewritten the type title (and cleared
+                // data-type-text), so its text is the plain type wording.
+                const typeText = typeTitle.textContent;
+                typeTitle.setAttribute('data-type-text', typeText);
+                typeTitle.textContent = `${typeText}\n\n${text}`;
             } else {
                 if (!title) {
                     title = document.createElementNS(SVG_NS, 'title');
                     title.setAttribute('class', 'dirty-read-title');
-                    label.appendChild(title);
+                    label.insertBefore(title, label.firstChild);
                 }
                 title.textContent = text;
             }
