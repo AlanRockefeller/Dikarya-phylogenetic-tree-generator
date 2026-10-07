@@ -405,6 +405,22 @@ class Config:
     MAFFT_LINSI_MAX_SEQUENCES = count_env('MAFFT_LINSI_MAX_SEQUENCES', 200)
     MAFFT_LINSI_MAX_LENGTH = count_env('MAFFT_LINSI_MAX_LENGTH', 3000)
 
+    # Tree methods whose jobs get full L-INS-i (within the two limits above)
+    # whatever MAFFT_DEFAULT_STRATEGY says: the full ML and Bayesian runs, where
+    # the alignment is a few seconds against minutes to hours of tree search.
+    # Set to an empty string to turn it off.
+    #
+    # Measured 2026-10-07 on 20 real jobs (--auto vs full L-INS-i, same trimming,
+    # IQ-TREE GTR+F+G4 with SH-aLRT): below 1,000 bp the two alignments were
+    # identical or differed less than two tree-search seeds do. Where one sequence
+    # of >= 1,000 bp had pushed --auto to FFT-NS-i (27% of MAFFT jobs), 4 of 8
+    # topologies moved by more than seed noise and 2 of 8 flipped 3-5 clades with
+    # SH-aLRT >= 80. L-INS-i costs ~10 s more on such a job with the opt5-dikarya1
+    # MAFFT build.
+    MAFFT_LINSI_TREE_METHODS = frozenset(
+        _csv_env('MAFFT_LINSI_TREE_METHODS', 'iqtree,raxml,mrbayes')
+    )
+
 
     # Paths
     BASE_DIR = Path(__file__).resolve().parent.parent

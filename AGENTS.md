@@ -542,6 +542,11 @@ When a new CLI version is published:
   to FFT-NS-i. Only enable `linsi` together with the opt5 MAFFT build at
   `MAFFT_BINARY`; on stock MAFFT it roughly doubles alignment time. Every
   `event=alignment.mafft_completed` line carries `strategy=`.
+  Separately, `MAFFT_LINSI_TREE_METHODS` (default `iqtree,raxml,mrbayes`) gives
+  full L-INS-i, within the same limits, to jobs with those tree methods
+  regardless of `MAFFT_DEFAULT_STRATEGY`; Quick Tree (`iqtree_fast`), FastTree
+  and NJ keep `--auto`. The measurement behind it is in the comment in
+  `app/config.py`. Empty string turns it off.
 - **ORIENT-vs-MAFFT disagreement is header-matched, not count-matched.** MAFFT
   names the records it reversed through its `_R_` headers, so the disagreement
   is `flipped - orient_uncertain - orient_never_saw` over sets, published as

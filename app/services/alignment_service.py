@@ -68,13 +68,21 @@ def mafft_direction_flag(config: Config, logger=None) -> Optional[str]:
     return MAFFT_DIRECTION_FLAGS[resolve_mafft_direction_mode(config, logger)]
 
 
-def _mafft_default_strategy_args(input_fasta: Path, config: Config, logger) -> list:
+def _mafft_default_strategy_args(input_fasta: Path, config: Config, logger,
+                                 tree_method: str = "") -> list:
     """MAFFT strategy flags for a job that did not choose one.
 
-    See MAFFT_DEFAULT_STRATEGY in app/config.py. Fails open to ``--auto``: an
-    unreadable input or an unexpected setting never changes the strategy.
+    Full L-INS-i when MAFFT_DEFAULT_STRATEGY is ``linsi`` or the job's tree
+    method is in MAFFT_LINSI_TREE_METHODS (see app/config.py), and the input is
+    within the L-INS-i size limits; ``--auto`` otherwise. Fails open to
+    ``--auto``: an unreadable input or an unexpected setting never changes the
+    strategy.
     """
-    if getattr(config, "MAFFT_DEFAULT_STRATEGY", "auto") != "linsi":
+    linsi_methods = getattr(config, "MAFFT_LINSI_TREE_METHODS", frozenset())
+    if not isinstance(linsi_methods, (set, frozenset, list, tuple)):
+        linsi_methods = ()
+    if (getattr(config, "MAFFT_DEFAULT_STRATEGY", "auto") != "linsi"
+            and (tree_method or "").lower() not in linsi_methods):
         return ["--auto"]
 
     max_sequences = getattr(config, "MAFFT_LINSI_MAX_SEQUENCES", 200)
@@ -803,7 +811,7 @@ def _run_mafft(
          cmd.extend(["--retree", "2", "--maxiterate", "2"])
     else:
          # Default reasonable option for ML/Bayesian trees
-         cmd.extend(_mafft_default_strategy_args(input_fasta, config, logger))
+         cmd.extend(_mafft_default_strategy_args(input_fasta, config, logger, tree_method))
 
     # Recorded on the mafft_completed line so --auto and L-INS-i timings can
     # be told apart in the logs.
