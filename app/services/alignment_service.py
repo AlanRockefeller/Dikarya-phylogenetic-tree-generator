@@ -68,6 +68,43 @@ def mafft_direction_flag(config: Config, logger=None) -> Optional[str]:
     return MAFFT_DIRECTION_FLAGS[resolve_mafft_direction_mode(config, logger)]
 
 
+def _mafft_default_strategy_args(input_fasta: Path, config: Config, logger) -> list:
+    """MAFFT strategy flags for a job that did not choose one.
+
+    See MAFFT_DEFAULT_STRATEGY in app/config.py. Fails open to ``--auto``: an
+    unreadable input or an unexpected setting never changes the strategy.
+    """
+    if getattr(config, "MAFFT_DEFAULT_STRATEGY", "auto") != "linsi":
+        return ["--auto"]
+
+    max_sequences = getattr(config, "MAFFT_LINSI_MAX_SEQUENCES", 200)
+    max_length = getattr(config, "MAFFT_LINSI_MAX_LENGTH", 3000)
+    count = 0
+    current = 0
+    longest = 0
+    try:
+        with open_artifact(input_fasta, "rt") as handle:
+            for line in handle:
+                if line.startswith(">"):
+                    count += 1
+                    longest = max(longest, current)
+                    current = 0
+                    if count >= max_sequences:
+                        return ["--auto"]
+                else:
+                    current += len(line.strip())
+    except OSError:
+        return ["--auto"]
+    longest = max(longest, current)
+
+    if count == 0 or longest >= max_length:
+        return ["--auto"]
+    logger.info(
+        "Using MAFFT L-INS-i: %s sequences, longest %s bp", count, longest
+    )
+    return ["--localpair", "--maxiterate", "1000"]
+
+
 def _orientation_input_too_large(input_fasta: Path, config: Config, logger) -> bool:
     """True when the input is too big for MAFFT's direction check to be worth it.
 
@@ -766,8 +803,15 @@ def _run_mafft(
          cmd.extend(["--retree", "2", "--maxiterate", "2"])
     else:
          # Default reasonable option for ML/Bayesian trees
-         cmd.append("--auto")
+         cmd.extend(_mafft_default_strategy_args(input_fasta, config, logger))
 
+    # Recorded on the mafft_completed line so --auto and L-INS-i timings can
+    # be told apart in the logs.
+    strategy = next(
+        (flag.lstrip("-") for flag in ("--localpair", "--globalpair", "--auto", "--retree")
+         if flag in cmd),
+        "other",
+    )
     cmd.append(str(input_fasta))
     
     log_file = output_fasta.parent.parent / "logs" / "alignment.log"
@@ -873,11 +917,12 @@ def _run_mafft(
         logger.info(
             "event=alignment.mafft_completed direction_mode=%s direction_flag=%s "
             "fix_orientation=%s outcome=%s elapsed_seconds=%.3f elapsed_ms=%d "
-            "aligner_reversed_count=%s",
+            "aligner_reversed_count=%s strategy=%s",
             direction_mode, direction_flag or "none",
             "true" if fix_orientation else "false", outcome,
             elapsed_seconds, int(elapsed_seconds * 1000),
             "unknown" if reversed_headers is None else len(reversed_headers),
+            strategy,
         )
 
     if reversed_headers and fix_orientation:

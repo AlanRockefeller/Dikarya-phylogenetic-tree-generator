@@ -383,6 +383,28 @@ class Config:
         'MAFFT_DIRECTION_MODE', 'fast', MAFFT_DIRECTION_MODES
     )
 
+    # Which strategy a job that did not ask for one gets.
+    #
+    #   auto   --auto                                   (default)
+    #   linsi  --localpair --maxiterate 1000 when the input has fewer than
+    #          MAFFT_LINSI_MAX_SEQUENCES sequences and none reaches
+    #          MAFFT_LINSI_MAX_LENGTH bp; --auto otherwise
+    #
+    # --auto gives full L-INS-i only below 100 sequences. Measured over 11,960
+    # jobs on disk, 65% have 100-199 sequences and a longest sequence under
+    # 1,000 bp, where --auto runs local-pair with just 2 refinement rounds, and
+    # another 27% are under 200 sequences but switched to FFT-NS-i because ONE
+    # sequence reached 1,000 bp. With the opt5 MAFFT build, full L-INS-i on a
+    # 176-sequence job took 25 s against 53.5 s for --auto on stock 7.505.
+    # Keep `auto` unless MAFFT_BINARY points at that build: on stock MAFFT
+    # this roughly doubles alignment time on the typical job.
+    MAFFT_DEFAULT_STRATEGIES = ("auto", "linsi")
+    MAFFT_DEFAULT_STRATEGY = choice_env(
+        'MAFFT_DEFAULT_STRATEGY', 'auto', MAFFT_DEFAULT_STRATEGIES
+    )
+    MAFFT_LINSI_MAX_SEQUENCES = count_env('MAFFT_LINSI_MAX_SEQUENCES', 200)
+    MAFFT_LINSI_MAX_LENGTH = count_env('MAFFT_LINSI_MAX_LENGTH', 3000)
+
 
     # Paths
     BASE_DIR = Path(__file__).resolve().parent.parent

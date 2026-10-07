@@ -533,6 +533,15 @@ When a new CLI version is published:
   `aligner_reversed_count=unknown` (never `0`, which would read as "reversed
   nothing"); and a `publish_command` failure records nothing, because MAFFT
   never started.
+- **`MAFFT_DEFAULT_STRATEGY` chooses the strategy for jobs that set none**:
+  `auto` (`--auto`, the default) or `linsi` (`--localpair --maxiterate 1000`
+  below `MAFFT_LINSI_MAX_SEQUENCES`=200 sequences with every sequence under
+  `MAFFT_LINSI_MAX_LENGTH`=3000 bp, `--auto` otherwise). `--auto` gives full
+  L-INS-i only below 100 sequences; at 100-199 it runs local-pair with 2
+  refinement rounds, and one sequence of 1,000 bp or more drops the whole job
+  to FFT-NS-i. Only enable `linsi` together with the opt5 MAFFT build at
+  `MAFFT_BINARY`; on stock MAFFT it roughly doubles alignment time. Every
+  `event=alignment.mafft_completed` line carries `strategy=`.
 - **ORIENT-vs-MAFFT disagreement is header-matched, not count-matched.** MAFFT
   names the records it reversed through its `_R_` headers, so the disagreement
   is `flipped - orient_uncertain - orient_never_saw` over sets, published as
