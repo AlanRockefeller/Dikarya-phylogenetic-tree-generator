@@ -20,6 +20,8 @@ MAX_JSON_BYTES = 2 * 1024 * 1024
 NCBI_BATCH_SIZE = 50
 _JOB_LINK = re.compile(r"(?:/|%2F)(\d+)(?:/?$|[?&#])", re.I)
 _LOCAL_XML_ID = re.compile(r"/local_(\d+)_xml\.", re.I)
+# The rerun endpoint accepts only these hit counts (MycoMap.org PR #9).
+RERUN_MAX_HITS = (50, 100, 250, 500)
 
 
 class OrgResultError(Exception):
@@ -61,7 +63,13 @@ def _read(path, *, limit=MAX_JSON_BYTES, method="GET", body=None,
         if not key:
             raise OrgResultError("MycoMap.org rerun key is not configured.", 502,
                                  retryable=False)
-        headers["Authorization"] = f"Bearer {key}"
+        # Alan 10/7/26 - MycoMap.org reads an API key only from X-API-Key, raw,
+        # with no "Bearer " prefix. Authorization: Bearer there carries mobile-app
+        # tokens, so a key sent that way is treated as anonymous -- which is why
+        # every rerun since the integration was written answered 401. (The
+        # rerun route itself also took session cookies only until MycoMap.org
+        # PR #9 moved it to requireAuthOrApiKey.)
+        headers["X-API-Key"] = key
     base = "https://mycomap.org/api" if path.startswith("mycomap/sequences/batch?") else ORG_API
     request = urllib.request.Request(
         f"{base}/{path}",
@@ -81,6 +89,17 @@ def _read(path, *, limit=MAX_JSON_BYTES, method="GET", body=None,
         # "could not complete the BLAST request" and an NCBI rebuild would sit
         # in the mycomap_unavailable wait loop on a credential that will never
         # start working. Name it, and do not retry it.
+        if exc.code == 429:
+            # 10 reruns per 10 minutes per key owner, and every Dikarya user shares
+            # this one key. A wait clears it, so make it the retryable 502 the
+            # worker already waits out (deferral_details) rather than a refusal.
+            retry_after = (exc.headers.get("Retry-After") if exc.headers else None) or ""
+            logger.warning("event=mycomap_org.rate_limited path=%s retry_after=%s",
+                           path.split("?", 1)[0], retry_after.strip()[:10] or "-")
+            raise OrgResultError(
+                "MycoMap.org's rerun limit was reached; Dikarya will try again shortly.",
+                502,
+            ) from exc
         if exc.code in (401, 403):
             if authenticated:
                 logger.error(
@@ -172,13 +191,27 @@ def rerun_pending(details):
     return False
 
 
+def rerun_max_hits(limit):
+    """The smallest hit count MycoMap.org accepts that covers ``limit``.
+
+    Dikarya lets a user ask for 1-500 hits; the rerun endpoint takes only
+    RERUN_MAX_HITS, so round up rather than return fewer than were asked for.
+    """
+    try:
+        wanted = int(limit)
+    except (TypeError, ValueError):
+        wanted = RERUN_MAX_HITS[0]
+    return next((n for n in RERUN_MAX_HITS if n >= wanted), RERUN_MAX_HITS[-1])
+
+
 def rerun(result_id, result_type, limit):
     if not str(result_id).isdigit() or result_type not in {"local", "ncbi"}:
         raise OrgResultError("Invalid MycoMap rerun request.", 400)
     try:
         result = json.loads(_read(
             "rerun", method="POST",
-            body={"id": int(result_id), "type": result_type, "limit": int(limit)},
+            body={"sequenceId": int(result_id), "rerunType": result_type,
+                  "maxHits": rerun_max_hits(limit)},
             authenticated=True,
         ))
     except (ValueError, UnicodeDecodeError) as exc:
