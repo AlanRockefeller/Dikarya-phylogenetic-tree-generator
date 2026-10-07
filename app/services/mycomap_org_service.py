@@ -1,5 +1,6 @@
 """Read public MycoMap.org BLAST results without following user supplied URLs."""
 
+import hashlib
 import json
 import logging
 import os
@@ -75,6 +76,25 @@ def _read(path, *, limit=MAX_JSON_BYTES, method="GET", body=None,
         with diagnostic_urlopen(request, timeout=timeout) as response:
             data = response.read(limit + 1)
     except urllib.error.HTTPError as exc:
+        # Alan 10/7/26 - A 401/403 is a refusal, not an outage. It used to fall
+        # into the generic retryable 502 below, so the user was told MycoMap
+        # "could not complete the BLAST request" and an NCBI rebuild would sit
+        # in the mycomap_unavailable wait loop on a credential that will never
+        # start working. Name it, and do not retry it.
+        if exc.code in (401, 403):
+            if authenticated:
+                logger.error(
+                    "event=mycomap_org.auth_refused status=%s path=%s "
+                    "key_env=MYCOMAP_ORG_API_KEY key_len=%s key_sha256=%s",
+                    exc.code, path.split("?", 1)[0], len(key),
+                    hashlib.sha256(key.encode()).hexdigest()[:12],
+                )
+                message = (f"MycoMap.org did not accept Dikarya's access key "
+                           f"(HTTP {exc.code}).")
+            else:
+                message = (f"MycoMap.org refused access to this BLAST result "
+                           f"(HTTP {exc.code}).")
+            raise OrgResultError(message, 502, retryable=False) from exc
         raise OrgResultError(
             "MycoMap.org has no matching BLAST result." if exc.code == 404
             else "MycoMap.org could not complete the BLAST request.",
