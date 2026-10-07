@@ -1,4 +1,4 @@
-from flask import g, jsonify, request, send_file, url_for
+from flask import current_app, g, jsonify, request, send_file, url_for
 from flask_login import current_user
 from app.api import bp
 from app.workers.queue import (
@@ -1447,8 +1447,58 @@ def run_blast():
     
     Request: { "query": "<sequence or accession>" }
     Response: { "status": "success", "sequences": [...], "message": "..." }
+
+    With ``X-Dikarya-Background: 1`` the search runs off the request thread and
+    this answers 202 {"task_id"}; see app/services/background_requests.py.
     """
     data = request.get_json() or {}
+    return _run_in_background_if_asked("blast", _run_blast_request, data)
+
+
+def _run_in_background_if_asked(kind, handler, data):
+    """Start ``handler(data)`` in the background when the page asked for it.
+
+    Falls through to running it inline -- the original behaviour -- for a
+    caller that did not ask, or when background_requests cannot take it.
+    """
+    from app.services import background_requests
+    if background_requests.wants_background(request):
+        task_id = background_requests.start(kind, handler, data)
+        if task_id:
+            return jsonify({"status": "running", "task_id": task_id}), 202
+    return handler(data)
+
+
+@bp.get('/background/<task_id>')
+@limiter.limit("120 per minute")
+def background_request_status(task_id):
+    """Poll a request started with X-Dikarya-Background.
+
+    202 while it runs; once done, the handler's own response, byte for byte,
+    with its own status code.
+    """
+    from app.services import background_requests
+    try:
+        record = background_requests.fetch(task_id)
+    except Exception as exc:
+        logger.warning("event=background_request.poll_failed error=%s", type(exc).__name__)
+        return jsonify({"status": "running", "poll_error": True}), 202
+    if record is None:
+        return jsonify({
+            "status": "error",
+            "background_missing": True,
+            "error": ("This request is no longer running on the server "
+                      "(the site may have restarted). Please try again."),
+        }), 410
+    if record.get("state") != "done":
+        return jsonify({"status": "running"}), 202
+    return current_app.response_class(
+        record.get("body") or "", status=int(record.get("status") or 500),
+        mimetype="application/json",
+    )
+
+
+def _run_blast_request(data):
     query = data.get('query', '').strip()
     
     if not query:
@@ -2635,10 +2685,14 @@ def inaturalist_tree():
 @limiter.limit(_inat_tree_preview_rate_limit, key_func=_inat_tree_rate_key)
 def inaturalist_tree_preview():
     """Preview iNaturalist one-click tree scope and eligibility."""
+    data = request.get_json(silent=True) or {}
+    return _run_in_background_if_asked("inat_tree_preview", _inat_tree_preview_request, data)
+
+
+def _inat_tree_preview_request(data):
     from app.services.inaturalist_tree_service import (
         InatTreeError, preview_inaturalist_tree_input,
     )
-    data = request.get_json(silent=True) or {}
     raw = data.get('input') or data.get('observation') or data.get('url') or ''
     resolved_type = data.get('resolved_type')
     try:

@@ -2123,6 +2123,59 @@
         return error;
     }
 
+    // Alan 10/7/26 - BLAST takes 35-95 s and the iNat tree preview can take a
+    // minute. Held open as one request, a phone that switched apps while it
+    // waited lost the answer ("Load failed", nginx 499) though the server
+    // finished the work. Asked with X-Dikarya-Background the server answers 202
+    // at once and runs the lookup on its own (app/services/background_requests.py);
+    // this polls for the result, and a poll lost to a suspended tab is simply
+    // retried. Resolves to a Response exactly like fetch(), so call sites only
+    // swap the function name. A server that ran it inline answers as before.
+    const BACKGROUND_POLL_MS = 2000;
+    const BACKGROUND_MAX_WAIT_MS = 6 * 60 * 1000;
+
+    function waitForBackgroundPoll(ms) {
+        return new Promise(resolve => {
+            const done = () => {
+                clearTimeout(timer);
+                document.removeEventListener('visibilitychange', onVisible);
+                resolve();
+            };
+            // Coming back to the tab polls immediately instead of waiting out
+            // a timer the browser throttled while it was hidden.
+            const onVisible = () => { if (!document.hidden) done(); };
+            const timer = setTimeout(done, ms);
+            document.addEventListener('visibilitychange', onVisible);
+        });
+    }
+
+    async function fetchInBackground(url, options = {}) {
+        const headers = Object.assign({}, options.headers, {'X-Dikarya-Background': '1'});
+        const first = await fetch(url, Object.assign({}, options, {headers}));
+        if (first.status !== 202) return first;
+        let started = null;
+        try { started = await first.clone().json(); } catch (_) { return first; }
+        if (!started || !started.task_id) return first;
+
+        const pollUrl = `/api/background/${encodeURIComponent(started.task_id)}`;
+        const deadline = Date.now() + BACKGROUND_MAX_WAIT_MS;
+        for (;;) {
+            await waitForBackgroundPoll(BACKGROUND_POLL_MS);
+            let resp = null;
+            try {
+                resp = await fetch(pollUrl, {credentials: 'same-origin', cache: 'no-store'});
+            } catch (_) {
+                // Suspended tab or a network blip; the server is still working.
+            }
+            if (resp && resp.status !== 202 && resp.status !== 429) return resp;
+            // Checked after the poll, so a tab that slept past the deadline
+            // still collects a result that finished while it was away.
+            if (Date.now() > deadline) {
+                throw new Error('The server is taking unusually long to answer. Please try again.');
+            }
+        }
+    }
+
     function reportWorkflowFailure(action, error) {
         if (!error || error.expected || error.name === 'AbortError') return;
         const status = Number(error.httpStatus) || 0;
@@ -2925,7 +2978,7 @@
             }
 
             const csrfToken = document.querySelector('meta[name="csrf-token"]').getAttribute('content');
-            const resp = await fetch('/api/blast', {
+            const resp = await fetchInBackground('/api/blast', {
                 method: 'POST',
                 headers: {
                     'Content-Type': 'application/json',
@@ -3971,7 +4024,7 @@
             const csrfToken = document.querySelector('meta[name="csrf-token"]').getAttribute('content');
             const body = { input };
             if (resolvedType) body.resolved_type = resolvedType;
-            const resp = await fetch('/api/inaturalist/tree/preview', {
+            const resp = await fetchInBackground('/api/inaturalist/tree/preview', {
                 method: 'POST',
                 headers: {
                     'Content-Type': 'application/json',
@@ -4232,7 +4285,7 @@
 
         try {
             const csrfToken = document.querySelector('meta[name="csrf-token"]').getAttribute('content');
-            const resp = await fetch('/api/blast', {
+            const resp = await fetchInBackground('/api/blast', {
                 method: 'POST',
                 headers: {
                     'Content-Type': 'application/json',
@@ -4813,7 +4866,7 @@
         showStatus('Running BLAST for the selected Mushroom Observer ITS sequence...', 'info');
         try {
             const csrfToken = document.querySelector('meta[name="csrf-token"]').getAttribute('content');
-            const response = await fetch('/api/blast', {
+            const response = await fetchInBackground('/api/blast', {
                 method: 'POST',
                 headers: {'Content-Type': 'application/json', 'X-CSRFToken': csrfToken},
                 body: JSON.stringify({query: selected.sequence})

@@ -166,8 +166,12 @@
                 } catch (_) { path = ''; }
                 const method = String(args[1]?.method || args[0]?.method || 'GET').toUpperCase();
                 const started = performance.now();
+                // Background-request polls fail by design while a phone has the
+                // tab suspended and are retried by fetchInBackground(); their
+                // path also carries a task id, which would split the digest.
                 const isAppRequest = sameOrigin && path.startsWith('/api/')
-                    && path !== endpoint && path !== endpoint + '/csrf';
+                    && path !== endpoint && path !== endpoint + '/csrf'
+                    && !path.startsWith('/api/background/');
                 let response;
                 try {
                     response = await originalFetch(...args);
