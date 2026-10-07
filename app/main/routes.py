@@ -200,9 +200,34 @@ def _import_legacy_todos_if_needed():
     _LEGACY_TODOS_IMPORTED = True
 
 
+# Alan 10/7/26 - MycoMap links to /tree?mycomap_url=<blast url>&one_click=1 so
+# one click there starts the tree here. The page only fills in the URL and
+# waits for a click unless the visitor arrived from MycoMap itself: otherwise
+# any website could link visitors into running jobs. The Referer is set by the
+# visitor's browser, so another site cannot claim to be MycoMap; a missing
+# Referer (privacy settings, rel="noreferrer") just means one more click.
+MYCOMAP_REFERRER_HOSTS = frozenset({
+    "mycomap.org", "www.mycomap.org", "mycomap.com", "www.mycomap.com",
+})
+
+
+def _referred_by_mycomap():
+    from urllib.parse import urlsplit
+    try:
+        parts = urlsplit(request.referrer or "")
+    except ValueError:
+        return False
+    return parts.scheme == "https" and (parts.hostname or "") in MYCOMAP_REFERRER_HOSTS
+
+
 @bp.route('/tree')
 def sequence_entry():
-    return render_template('sequence_entry.html')
+    return render_template(
+        'sequence_entry.html',
+        mycomap_one_click_allowed=(
+            request.args.get("one_click") == "1" and _referred_by_mycomap()
+        ),
+    )
 
 
 @bp.route('/inat.finder.py')

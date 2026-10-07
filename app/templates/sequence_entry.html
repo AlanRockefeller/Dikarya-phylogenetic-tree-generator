@@ -5905,6 +5905,34 @@
         })();
     }
 
+    // --- LINK FROM MYCOMAP (?mycomap_url=...&one_click=1) ---
+    // Alan 10/7/26 - The link always fills in the MycoMap URL. It starts the
+    // One-Click Tree by itself only when the server saw the visitor arrive from
+    // MycoMap (mycomap_one_click_allowed in app/main/routes.py); a link from
+    // anywhere else waits for the visitor to press the button.
+    const MYCOMAP_ONE_CLICK_ALLOWED = {{ 'true' if mycomap_one_click_allowed else 'false' }};
+    const linkedMycomapUrl = (urlParams.get('mycomap_url') || '').trim();
+    if (linkedMycomapUrl && !EDIT_JOB_ID && !CLONE_JOB_ID
+        && (isValidMycomapUrl(linkedMycomapUrl) || isMycomapSequenceUrl(linkedMycomapUrl))) {
+        window.openImportSection?.('mycomap');
+        mycomapUrlInput.value = linkedMycomapUrl;
+        checkMycomapState();
+        // Drop one_click from the address so a reload or Back cannot submit a
+        // second job.
+        if (urlParams.has('one_click')) {
+            const cleaned = new URL(window.location.href);
+            cleaned.searchParams.delete('one_click');
+            history.replaceState(history.state, '', cleaned.pathname + cleaned.search + cleaned.hash);
+        }
+        if (MYCOMAP_ONE_CLICK_ALLOWED) {
+            mycomapQuickTreeBtn.click();
+        } else {
+            mycomapQuickTreeBtn.scrollIntoView({block: 'center'});
+            mycomapQuickTreeBtn.focus({preventScroll: true});
+            showStatus('MycoMap BLAST link loaded. Press One-Click Tree to build the tree.', 'info');
+        }
+    }
+
     // =========================================================================
     // Advanced settings for "Add & Recompute"
     // =========================================================================
