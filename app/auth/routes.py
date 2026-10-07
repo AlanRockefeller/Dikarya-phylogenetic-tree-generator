@@ -1,4 +1,5 @@
 import logging
+import re
 
 from flask import render_template, redirect, url_for, flash, request
 from flask_login import login_user, logout_user, current_user
@@ -33,6 +34,25 @@ def normalize_email(raw):
     own jobs. New accounts are therefore stored in this form.
     """
     return (raw or '').strip().lower()
+
+
+# Alan 10/7/26 - Auth log lines now name the email. They used to carry only an
+# account id, and identifying a user locked out of their account took a
+# production database query. Only an email-shaped value is ever written: a
+# password typed into the email box has no "@", and a control character could
+# forge a log line, so anything else is recorded as "-".
+_LOGGABLE_EMAIL_RE = re.compile(r"^[^\s@]{1,64}@[^\s@]{1,190}\.[^\s@]{1,63}$")
+
+
+def loggable_email(user=None, typed=None):
+    """The account's stored email, else the typed one if email-shaped, else "-"."""
+    stored = getattr(user, "email", None) if user is not None else None
+    if isinstance(stored, str) and stored:
+        return stored
+    candidate = normalize_email(typed)
+    if _LOGGABLE_EMAIL_RE.match(candidate) and candidate.isprintable():
+        return candidate
+    return "-"
 
 
 def find_user_by_email(raw):
@@ -76,14 +96,16 @@ def register():
         password = request.form.get('password')
 
         if not email or not password:
-            logger.warning("event=auth.registration_failed reason=missing_credentials")
+            logger.warning("event=auth.registration_failed reason=missing_credentials email=%s",
+                           loggable_email(typed=email))
             flash('Email and password are required.', 'danger')
             return redirect(url_for('auth.register', next=next_page))
 
         # Case-insensitive, so `Alan@x.com` cannot become a second account
         # alongside `alan@x.com`.
         if User.query.filter(func.lower(User.email) == email).first():
-            logger.warning("event=auth.registration_failed reason=already_registered")
+            logger.warning("event=auth.registration_failed reason=already_registered email=%s",
+                           loggable_email(typed=email))
             flash('Email already registered. Please log in.', 'warning')
             return redirect(url_for('auth.login', next=next_page))
 
@@ -98,12 +120,14 @@ def register():
             # what actually guarantees uniqueness, so the loser is told to log
             # in rather than being handed a 500.
             db.session.rollback()
-            logger.warning("event=auth.registration_failed reason=registration_conflict")
+            logger.warning("event=auth.registration_failed reason=registration_conflict email=%s",
+                           loggable_email(typed=email))
             flash('Email already registered. Please log in.', 'warning')
             return redirect(url_for('auth.login', next=next_page))
 
         login_user(user, remember=True)
-        logger.info("event=auth.registered account_id=%s", user.id)
+        logger.info("event=auth.registered account_id=%s email=%s",
+                    user.id, loggable_email(user))
         flash('Registration successful!', 'success')
         return redirect(next_page or url_for('user.user_jobs'))
 
@@ -122,17 +146,21 @@ def login():
         user = find_user_by_email(email)
         if user and password and user.check_password(password):
             login_user(user, remember=True)
-            logger.info("event=auth.login_succeeded account_id=%s", user.id)
+            logger.info("event=auth.login_succeeded account_id=%s email=%s",
+                        user.id, loggable_email(user))
             flash('Logged in successfully.', 'success')
             next_page = _safe_next(request.args.get('next'))
             return redirect(next_page or url_for('user.user_jobs'))
         else:
             # Login failures return HTTP 200, so access/error-status logging
-            # cannot see them. A known account id permits follow-up without
-            # recording either credential or an unverified email address.
+            # cannot see them. The password is never logged; the email is
+            # (see loggable_email), including the typed one when it matched no
+            # account, since a mistyped address is a common reason for a lockout.
             logger.warning(
-                "event=auth.login_failed reason=invalid_credentials account_id=%s",
+                "event=auth.login_failed reason=%s account_id=%s email=%s",
+                "invalid_credentials" if user else "unknown_account",
                 user.id if user else "-",
+                loggable_email(user, email),
             )
             flash('Invalid email or password.', 'danger')
 
