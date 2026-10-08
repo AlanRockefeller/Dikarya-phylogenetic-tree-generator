@@ -472,6 +472,11 @@ def install_request_diagnostics(app):
                 # its ordinary http.request_failed line below, carrying the
                 # developer reason code.
                 _log_scanner(status, reason)
+                # Alan 10/8/26 - The same verdict for the access log's noise=
+                # field, which is what the digest reads (see gunicorn.conf.py).
+                # Targeted api/admin probes are deliberately not marked, so a
+                # real frontend call to a missing /api/ route stays visible.
+                request.environ["dikarya.noise"] = "scanner"
 
         # Score the actor whatever the status was: enumeration shows up as
         # 404s, denied edits as 403s, and route breadth mostly as 200s.

@@ -1030,7 +1030,15 @@ Three rules when editing this:
 The scanner path lists live in `security_events.py` and
 `scripts/dikarya_log_digest.py` imports them, so the digest's idea of noise and
 the app's cannot drift. The module is deliberately free of Flask imports to keep
-that import safe.
+that import safe. The lists alone cannot say which paths the app serves, so the
+app also writes its verdict into the access log: every request it files to
+`scanner.log` as scanner (and every missing-route limiter 429) is logged with
+`noise=scanner`, via the WSGI environ key `dikarya.noise` that
+`gunicorn.conf.py` reads, and the digest counts those as noise. Targeted
+`/api/` and `/admin/` probes are deliberately not marked, so a frontend call to
+a missing API route still shows as a product error. A real route must never be
+listed in `SCANNER_EXACT_PATHS`, or its users' 4xx are filed as noise (`/todo`
+and `/metrics` were, until 2026-10-08).
 
 **RQ's `cleaning registries for queue` heartbeat is filtered out** in
 `install_rq_logging()`. It was 400 of 834 lines in `worker.log` -- 48% of the
