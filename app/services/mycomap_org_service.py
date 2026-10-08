@@ -399,6 +399,80 @@ def _ncbi_sequences(accessions, *, deadline=None):
     return sequences, unchecked
 
 
+CURATION_BATCH_SIZE = 100
+# The GenBank qualifiers that end the organism at the start of a defline, as in
+# "Geoglossum sp. SA-2022a voucher AMI-SPL642 small subunit ...".
+_DEFLINE_QUALIFIER = re.compile(
+    r"\s(?:voucher|isolate|strain|culture|clone|specimen|haplotype|"
+    r"culture-collection|cultivar|genotype|from)\s", re.I)
+
+
+def _curated_genbank_names(accessions, *, deadline=None):
+    """MycoMap's curated name for each GenBank accession, keyed by accession.
+
+    POST mycoblast/genbank-curation is public and is what MycoMap.org's own
+    BLAST page labels NCBI hits with: curators rename GenBank records there
+    (OM691497 "Geoglossum sp. SA-2022a" -> "Geoglossum laurisilvae") without
+    GenBank changing. Best effort -- on failure the GenBank names stand.
+    """
+    names = {}
+    unique = list(dict.fromkeys(a for a in accessions if a))
+    for offset in range(0, len(unique), CURATION_BATCH_SIZE):
+        batch = unique[offset:offset + CURATION_BATCH_SIZE]
+        try:
+            payload = json.loads(_read("genbank-curation", method="POST",
+                                       body={"accessions": batch}, deadline=deadline))
+        except (OrgResultError, ValueError, UnicodeDecodeError):
+            logger.warning("event=mycomap_org.genbank_curation_unavailable count=%s",
+                           len(batch), exc_info=True)
+            break
+        results = payload.get("results") if isinstance(payload, dict) else None
+        for key, row in (results or {}).items():
+            name = str((row or {}).get("scientificName") or "").strip() if isinstance(row, dict) else ""
+            if name:
+                names[str(key).upper().split(".")[0]] = name
+    return names
+
+
+# The organism at the start of a GenBank label: a genus (or "uncultured X"),
+# optionally sp./cf./aff./nr. and one epithet or quoted provisional name, and an
+# optional infraspecific rank. Deliberately stops there, so a voucher written
+# straight after the name ("Geoglossum squamulosum SAV F-11677") is not taken
+# for part of it and dropped.
+_LABEL_ORGANISM = re.compile(r"""
+    ^(?:[Uu]ncultured\s+)?[A-Z][A-Za-z]+(?:-[a-z]+)?
+    (?:
+        \s+(?:sp|cf|aff|nr)\.(?:\s+(?:'[^']*'|"[^"]*"|\S+))?
+      | \s+(?:'[^']*'|"[^"]*"|[a-z][a-z-]*)
+    )?
+    (?:\s+(?:var|subsp|f)\.\s+[a-z][a-z-]*)?
+""", re.X)
+
+
+def apply_curated_genbank_name(display_name, accession, curated_name):
+    """Swap the GenBank organism in an NCBI hit label for MycoMap's curated name.
+
+    A curated name is trusted even when it moves the record to another genus:
+    someone who went to the trouble of curating it is probably right. Returns
+    the new label, or None when the label already carries that name or does not
+    visibly begin with an organism (the GenBank label is then kept).
+    """
+    curated = " ".join(str(curated_name or "").split())
+    prefix = f"{accession} "
+    if not curated or not display_name.startswith(prefix):
+        return None
+    body = display_name[len(prefix):]
+    qualifier = _DEFLINE_QUALIFIER.search(f" {body} ")
+    head = body[:max(qualifier.start() - 1, 0)] if qualifier else body
+    match = _LABEL_ORGANISM.match(head)
+    if not match:
+        return None
+    organism = match.group(0)
+    if organism.casefold() == curated.casefold():
+        return None
+    return f"{accession} {curated}{body[len(organism):]}".strip()
+
+
 def fetch_results(result_id, *, include_ncbi=True, include_local=True,
                   time_budget=None):
     """Return normalized hits and source state for the shared import pipeline."""
@@ -435,6 +509,7 @@ def fetch_results(result_id, *, include_ncbi=True, include_local=True,
         if source == "local":
             metadata = _local_metadata([h["id"] for h in hits if h["id"].isdigit()],
                                        deadline=deadline)
+            curated_names = {}
         else:
             metadata = {}
             ncbi_sequences, _unchecked = _ncbi_sequences(
@@ -455,6 +530,9 @@ def fetch_results(result_id, *, include_ncbi=True, include_local=True,
                 # The delayed reconciler retains available hits after its
                 # bounded retries rather than declaring NCBI complete.
                 result["failed_sources"].append(source)
+            curated_names = _curated_genbank_names(
+                [hit["accession"] for hit in hits if "full_sequence" in hit],
+                deadline=deadline)
         for hit in hits:
             item = metadata.get(hit["id"], {})
             accession = hit["accession"] if source == "ncbi" else ""
@@ -476,6 +554,10 @@ def fetch_results(result_id, *, include_ncbi=True, include_local=True,
                 described = describe_ncbi_hit(accession, raw_description)
                 taxon = taxon or described["taxon"]
                 name = described["display_name"]
+                curated = curated_names.get(accession.upper().split(".")[0])
+                curated_label = apply_curated_genbank_name(name, accession, curated)
+                if curated_label:
+                    name, taxon = curated_label, curated
             else:
                 name = f"{hit['id']} {observation_token} {taxon or hit['description']}"
             name = name.strip()
