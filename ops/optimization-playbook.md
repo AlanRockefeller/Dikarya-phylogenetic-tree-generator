@@ -103,6 +103,13 @@ AVX-512-only and which had plainly inefficient hot loops. Check, in this order:
 - The user's root shell may be on a different machine (`xps17`); production is `mycolab`.
   Root command blocks should start with `hostname`.
 - Redis and `perf` need the sandbox disabled; scratch builds do not.
+- Never run a tool with an unpacked LLVM toolchain's `lib/` on `LD_LIBRARY_PATH`.
+  IQ-TREE's static binary (official one included) has LLVM's OpenMP runtime linked in;
+  at startup it looks for OpenMP tool plugins (`libompd.so`, `libarcher.so`), loads the
+  toolchain's newer ones and spins at 100% CPU forever, printing nothing. Give the
+  toolchain's libraries to the compiler only.
+- Each sandboxed Bash call has its own PID namespace: `ps` cannot see a process started
+  by a background task, so watch its output files instead.
 
 ## 6. What worked on MAFFT (for ideas, not as a recipe)
 
@@ -117,6 +124,36 @@ AVX-512-only and which had plainly inefficient hot loops. Check, in this order:
 - **Dead ends:** wider vectors when the loop is uop-bound; "lazy" branches that are taken
   too often on related sequences (gaps win across large areas of ITS alignments);
   restructuring for latency when the problem is throughput.
+
+## 6b. What worked on IQ-TREE (2026-10-08, `ops/iqtree/`)
+
+- **Match the release's toolchain before anything else.** The official 3.1.4 binary is
+  clang 22 + glibc 2.35 static (the "GNU CC 11.4" string in it is glibc's banner), with
+  IQ-TREE's bundled libomp/zlib and Ubuntu 22.04's Eigen/Boost headers. A clang-22
+  stock rebuild reproduced the release byte for byte, which made the release itself the
+  identity reference. gcc would not: it contracts FMAs differently in the FMA kernel.
+- **Replaying a job proves the inputs.** `alignment/alignment_trimmed.fasta` renamed with
+  `sanitize_fasta_headers()` plus the job's `--seed` and `-T 1` reproduces the job's own
+  `iqtree_run.treefile`; do that before trusting a benchmark set.
+- **Most of the win was work the program did not need to do**, not faster arithmetic:
+  SH-aLRT re-drew identical bootstrap replicates for every branch (~20% of Quick Tree);
+  UFBoot printed every candidate tree through iostreams before checking whether any
+  replicate wanted it (~27% of a UFBoot run) and re-serialized all 1000 trees into the
+  checkpoint after each refined tree (~10%), though the file is written once a minute.
+- **Store-forwarding stalls hide in "data movement".** The tip-state loaders built each
+  256-bit vector from four scalar stores; a 4x4 in-register transpose was 7-11%.
+- **The kernels themselves are near their limit** for exact output: the FP and load
+  ports are both busy, so sharing coefficient broadcasts or wider vectors buys little.
+- **Things that do not help or are not allowed:** PGO (3% on Quick Tree, 0% on UFBoot,
+  not worth a 7.7 MB profile); `-march=native` on the generic files (Eigen and
+  vectorclass switch packet width and FMA on `__AVX2__`/`__FMA__`, which changes
+  results); LTO (could inline a non-FMA `a*b+c` into an FMA function and fuse it).
+- `-T 2` runs are not reproducible run to run even in stock (dynamic scheduling,
+  per-thread RNG streams), so multi-threaded logic was checked with a debug build that
+  recomputes and compares (`-DIQTREE_ALRT_CACHE_CHECK`) instead of by output bytes.
+- An OpenMP region with one thread still costs a runtime call (~5% of a UFBoot run in
+  `__kmp_fork_call`/serialized-parallel); a direct loop for `num_threads == 1` is exact
+  when the reduction copies start at +0.0.
 
 ## 7. Delivery
 

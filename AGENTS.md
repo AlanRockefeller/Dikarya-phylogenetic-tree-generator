@@ -605,6 +605,16 @@ When a new CLI version is published:
   `tree_analysis_service.py` and `tree_viewer_phylotree_v2.js`, and the tool
   regex in `security_events.py`. A non-fast run always pairs `-B` with
   `--bnni`, recorded as `bnni: true`.
+
+  `ops/iqtree/` holds an exact-speedup build, **3.1.4-dikarya1** (installed
+  into `/opt/iqtree-3.1.4-dikarya1` by `ops/iqtree/install-iqtree-dikarya.sh`,
+  selected by `IQTREE_BINARY`, which production points at since 2026-10-08):
+  the official 3.1.4 plus patches that skip
+  redundant work, with byte-identical results at `-T 1`. A job's
+  `logs/tree_builder.log` banner says which binary ran. Rebuild it only with
+  that script -- the release is clang 22 + static glibc, and a gcc build fuses
+  FMAs differently and does not reproduce it. `-T 2` runs are not reproducible
+  run to run in any build, stock included.
 - **RAxML-NG bootstrapping computes two support metrics, not one.**
   `_get_raxml_cmd` passes `--bs-metric fbp,tbe`, so RAxML writes
   `<prefix>.raxml.supportFBP` and `.supportTBE` and **no** bare
