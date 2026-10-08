@@ -3539,7 +3539,7 @@ def refresh_tree_mycomap_records(job_id):
             "refreshed_count": len(references),
             "updated_tip_count": len(changes),
             "changes": changes,
-            "warnings": label_result["warnings"],
+            "warnings": list(refresh_result.get("warnings") or []) + label_result["warnings"],
             "message": refresh_result.get("message") or "",
         })
     except MycoMapRefreshError as exc:

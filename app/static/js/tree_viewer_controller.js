@@ -4174,8 +4174,10 @@ document.addEventListener('DOMContentLoaded', async () => {
                     const updatedText = updatedCount
                         ? ` ${updatedCount} tree label${updatedCount === 1 ? '' : 's'} updated.`
                         : ' Tree labels already match the refreshed records.';
+                    // Alan 10/8/26 - Show the first warning itself; a bare count hid
+                    // a refused MycoMap key behind "1 label update warning".
                     const warningText = warningCount
-                        ? ` ${warningCount} label update warning${warningCount === 1 ? '' : 's'}.`
+                        ? ` ${String(result.warnings[0])}${warningCount > 1 ? ` (+${warningCount - 1} more warning${warningCount === 2 ? '' : 's'})` : ''}`
                         : '';
                     return {
                         finalStatus: {

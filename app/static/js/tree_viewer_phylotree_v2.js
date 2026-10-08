@@ -1160,9 +1160,7 @@
                             const nodes = this._getContextMycomapRecordNodes(node);
                             if (typeof this._onRefreshMycomapRecords === 'function') this._onRefreshMycomapRecords(node, nodes);
                         },
-                        (node) => !window.VIEW_ONLY && this._getContextMycomapRecordReferences(node).length > 0,
-                        // Alan 8/13/26 - Keep the currently broken refresh action visible but unavailable.
-                        true
+                        (node) => !window.VIEW_ONLY && this._getContextMycomapRecordReferences(node).length > 0
                     ]);
                 }
                 // Alan 8/17/26 - Annotation actions are registered for every parented node above;

@@ -15,6 +15,7 @@ from app.services.fasta_utils import is_genbank_accession, parse_fasta_records
 
 logger = logging.getLogger(__name__)
 ORG_API = "https://mycomap.org/api/mycoblast"
+ORG_API_ROOT = "https://mycomap.org/api"
 MAX_XML_BYTES = 16 * 1024 * 1024
 MAX_JSON_BYTES = 2 * 1024 * 1024
 NCBI_BATCH_SIZE = 50
@@ -48,9 +49,10 @@ def deferral_details(exc):
 
 
 def _read(path, *, limit=MAX_JSON_BYTES, method="GET", body=None,
-          authenticated=False, deadline=None):
+          authenticated=False, deadline=None, timeout=15):
     """Only fixed API paths are accepted; no URL from a result is fetched."""
-    if not re.fullmatch(r"[a-z0-9/?=&,_-]+", path, re.I) or ".." in path:
+    # ":" is for observation references (inat:123) in a query string.
+    if not re.fullmatch(r"[a-z0-9/?=&,:_-]+", path, re.I) or ".." in path:
         raise OrgResultError("Invalid MycoMap API path.", 400)
     headers = {
         "Accept": "application/json" if limit == MAX_JSON_BYTES else "application/xml",
@@ -70,14 +72,15 @@ def _read(path, *, limit=MAX_JSON_BYTES, method="GET", body=None,
         # rerun route itself also took session cookies only until MycoMap.org
         # PR #9 moved it to requireAuthOrApiKey.)
         headers["X-API-Key"] = key
-    base = "https://mycomap.org/api" if path.startswith("mycomap/sequences/batch?") else ORG_API
+    base = ORG_API_ROOT if path.startswith(("mycomap/", "admin/")) else ORG_API
     request = urllib.request.Request(
         f"{base}/{path}",
         data=json.dumps(body).encode() if body is not None else None,
         headers=headers,
         method=method,
     )
-    timeout = 15 if deadline is None else min(15, deadline - time.monotonic())
+    if deadline is not None:
+        timeout = min(timeout, deadline - time.monotonic())
     if timeout <= 0:
         raise OrgResultError("MycoMap.org request timed out.")
     try:
@@ -471,6 +474,104 @@ def apply_curated_genbank_name(display_name, accession, curated_name):
     if organism.casefold() == curated.casefold():
         return None
     return f"{accession} {curated}{body[len(organism):]}".strip()
+
+
+REFRESH_REQUEST_TIMEOUT = 45
+REFRESH_BUDGET_SECONDS = 150
+REFRESH_WORKERS = 3
+OBSERVATION_BATCH_SIZE = 50
+
+
+def observation_records(references, *, deadline=None):
+    """The name and location MycoMap.org holds for each inat:/mo: reference.
+
+    sequences/batch?observations= is public and returns one row per sequence,
+    so an observation with several sequences comes back several times; the
+    lowest sequence id wins, so a before/after pair always compares one row.
+    """
+    rows = []
+    for offset in range(0, len(references), OBSERVATION_BATCH_SIZE):
+        query = ",".join(references[offset:offset + OBSERVATION_BATCH_SIZE])
+        payload = _json(f"mycomap/sequences/batch?observations={query}", deadline=deadline)
+        rows.extend(row for row in payload.get("sequences") or [] if isinstance(row, dict))
+    rows.sort(key=lambda row: _number(row.get("id")))
+    by_reference = {}
+    for row in rows:
+        for prefix, key in (("inat", "inatObservationId"), ("mo", "moObservationId")):
+            value = str(row.get(key) or "").strip()
+            if value.isdigit():
+                by_reference.setdefault(f"{prefix}:{value}", row)
+    summaries = {}
+    for reference in references:
+        row = by_reference.get(reference)
+        summaries[reference] = {
+            "found": row is not None,
+            "scientific_name": str((row or {}).get("scientificName") or "").strip(),
+            "location": _location(row) if row else "",
+        }
+    return summaries
+
+
+def _refresh_observation(reference, deadline):
+    return _read("admin/mycomap/refresh", method="POST", body={"observation": reference},
+                 authenticated=True, deadline=deadline, timeout=REFRESH_REQUEST_TIMEOUT)
+
+
+def refresh_observations(references):
+    """Refresh observations from their source, then sync them onto their sequences.
+
+    Mirrors MycoMap.org's own Refresh button: admin/mycomap/refresh pulls each
+    observation from iNaturalist or Mushroom Observer, and sync-batch copies the
+    refreshed name onto the observation's sequences -- which is where
+    sequences/batch, and so every Dikarya label, reads it from. Returns a list
+    of warnings; raises OrgResultError only when nothing could be refreshed.
+    """
+    from concurrent.futures import ThreadPoolExecutor
+
+    warnings = []
+    deadline = time.monotonic() + REFRESH_BUDGET_SECONDS
+    refused = None
+    failed = []
+    # The first call alone, so a refused key is reported once rather than by
+    # every worker thread at the same moment.
+    try:
+        _refresh_observation(references[0], deadline)
+    except OrgResultError as exc:
+        if exc.retryable:
+            failed.append(references[0])
+        else:
+            refused = exc
+    if refused is None and len(references) > 1:
+        def attempt(reference):
+            try:
+                _refresh_observation(reference, deadline)
+            except OrgResultError:
+                logger.warning("event=mycomap_org.refresh_failed reference=%s",
+                               reference, exc_info=True)
+                return reference
+            return None
+        with ThreadPoolExecutor(max_workers=REFRESH_WORKERS) as pool:
+            failed.extend(ref for ref in pool.map(attempt, references[1:]) if ref)
+    if refused is not None:
+        warnings.append(f"{refused} Names were synced from MycoMap's stored "
+                        "observations without re-reading iNaturalist or Mushroom Observer.")
+    elif failed:
+        warnings.append("MycoMap.org could not refresh " + ", ".join(failed[:10])
+                        + (" and others" if len(failed) > 10 else "")
+                        + " from the source site.")
+
+    try:
+        _read("sync-batch", method="POST",
+              body={"action": "sync", "observations": list(references)},
+              authenticated=True, deadline=time.monotonic() + REFRESH_REQUEST_TIMEOUT,
+              timeout=REFRESH_REQUEST_TIMEOUT)
+    except OrgResultError:
+        if refused is not None or len(failed) == len(references):
+            raise
+        logger.warning("event=mycomap_org.sync_failed count=%s", len(references), exc_info=True)
+        warnings.append("MycoMap.org refreshed the observations but could not update "
+                        "their sequence records, so some names may still be the old ones.")
+    return warnings
 
 
 def fetch_results(result_id, *, include_ncbi=True, include_local=True,
