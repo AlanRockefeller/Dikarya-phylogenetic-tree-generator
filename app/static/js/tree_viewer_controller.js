@@ -835,6 +835,12 @@ document.addEventListener('DOMContentLoaded', async () => {
     let annotationRevision = 0;
     // Alan 8/15/26 - Editor session: what is being added/edited and for which tips.
     let annotationEditorState = null;
+    // Remember the quick-annotation hint per tree, including after a page reload.
+    const quickAnnotationHintKey = `dikarya_quick_annotation_hint_${JOB_ID}`;
+    let quickAnnotationHintShown = false;
+    try {
+        quickAnnotationHintShown = localStorage.getItem(quickAnnotationHintKey) === '1';
+    } catch (e) {}
     let annotationMembershipPicker = null;
     const ANNOTATION_STYLE_FIELDS = [
         { field: 'font_family', label: 'Font' },
@@ -1874,7 +1880,11 @@ document.addEventListener('DOMContentLoaded', async () => {
             }
             // Alan 9/30/26 - A quick annotation's label was guessed, so say what it was and how to fix it.
             if (options.quick === true) {
-                showStatus(`Annotated as "${label}". Wrong name? Edit it from Annotations.`, 'success', 5000);
+                const showHint = !quickAnnotationHintShown;
+                quickAnnotationHintShown = true;
+                try { localStorage.setItem(quickAnnotationHintKey, '1'); } catch (e) {}
+                const hint = showHint ? ' Wrong name? Edit it from Annotations.' : '';
+                showStatus(`Annotated as "${label}".${hint}`, 'success', showHint ? 5000 : 2000);
             } else {
                 showStatus(`Annotation "${label}" saved.`, 'success', 2000);
             }
