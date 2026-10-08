@@ -14,13 +14,16 @@ import logging
 logger = logging.getLogger(__name__)
 _HEALTH_STATES = {}
 _HEALTH_LAST_EMIT = {}
-# Last observed value per metric, for reporting movement between emissions.
+# Value per metric at its last logged line, for reporting movement between lines.
 _HEALTH_LAST_VALUE = {}
 HEALTH_COOLDOWN_SECONDS = 6 * 3600
 
 
 def _transition(name, unhealthy, detail, now=None):
-    """Log state changes immediately and persistent faults at most every 6h."""
+    """Log state changes immediately and persistent faults at most every 6h.
+
+    Returns True when a line was logged.
+    """
     # `now or time.monotonic()` treated a caller-supplied 0 as "unset", which made
     # the cooldown arithmetic compare a passed-in clock against the real monotonic
     # clock and silently suppress every reminder.
@@ -31,12 +34,15 @@ def _transition(name, unhealthy, detail, now=None):
     due = unhealthy and now - last >= HEALTH_COOLDOWN_SECONDS
     _HEALTH_STATES[name] = unhealthy
     if not changed and not due:
-        return
+        return False
     _HEALTH_LAST_EMIT[name] = now
     if unhealthy:
         logger.warning("event=health.%s.unhealthy Health threshold crossed %s", name, detail)
-    elif previous:
+        return True
+    if previous:
         logger.warning("event=health.%s.recovered Health recovered %s", name, detail)
+        return True
+    return False
 
 
 def emit_health_transitions(metrics):
@@ -50,13 +56,20 @@ def emit_health_transitions(metrics):
     # every six hours told nobody whether to act.
     previous_free = _HEALTH_LAST_VALUE.get("disk_free_bytes")
     delta = "" if previous_free is None else f" delta_bytes={disk_free - previous_free:+d}"
-    _transition(
+    logged = _transition(
         "disk", disk_bad,
         f"percent={disk_percent:.1f} free_bytes={disk_free}"
         f" mount={metrics.get('disk_mountpoint') or '?'}{delta}",
     )
-    if disk_bad:
-        _HEALTH_LAST_VALUE["disk_free_bytes"] = disk_free
+    # Alan 10/8/26 - Record the value only when a line was logged. It used to be
+    # overwritten on every one-minute tick while the disk was unhealthy, so each
+    # reminder's delta covered one minute: the 10/8 08:29 reminder said -102400
+    # when 2.4 GB had gone since the 02:28 one, and a filling disk read as flat.
+    if logged:
+        if disk_bad:
+            _HEALTH_LAST_VALUE["disk_free_bytes"] = disk_free
+        else:
+            _HEALTH_LAST_VALUE.pop("disk_free_bytes", None)
     memory_percent = float(metrics.get("memory_percent") or 0)
     memory_was_bad = _HEALTH_STATES.get("memory", False)
     _transition(
