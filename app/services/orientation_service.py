@@ -32,7 +32,13 @@ logger = logging.getLogger(__name__)
 FWD_MOTIFS = [
     "TCCGTAGGTGAACCTGCGG",    # ITS1-F  (18S end)
     "GCATCGATGAAGAACGCAGC",   # 5.8S core
-    "TCCTCCGCTTATTGATATGC"    # ITS4    (28S start)
+    # Alan 10/8/26 - ITS4 is a reverse primer, so a forward read carries its
+    # reverse complement. This entry used to be the primer as written,
+    # TCCTCCGCTTATTGATATGC, which only matches reversed reads (job crao's
+    # final alignment: 15 of 186 rows, every one on the "reverse" strand). A
+    # reversed read's ITS4 site was counted as forward evidence and called
+    # forward, and the reversal rule could never use ITS4 as its flank.
+    "GCATATCAATAAGCGGAGGA"    # ITS4 site (28S start), forward strand
 ]
 
 DEFAULT_MAX_MM = 4   # Per-motif mismatch ceiling
@@ -235,8 +241,13 @@ def decide_orientation(seq: str, max_mm: int = DEFAULT_MAX_MM) -> Tuple[str, Ori
 
     # Enforce conservative reversal rule
     if winner == "reverse" and not reverse_allowed():
-        # If forward has at least one real hit, keep forward; otherwise uncertain
-        return ("forward" if fwd.hits else "uncertain"), fwd, rev
+        # Alan 10/8/26 - The evidence favoured reverse, just not enough to act
+        # on, so decline the call. This used to answer "forward" whenever any
+        # forward motif matched: crao's iNat2718307 was called forward on a
+        # 4-mismatch ITS1-F hit at bp 633 of 652 against an exact reverse 5.8S
+        # core, and MAFFT's correct flip was then logged as a disagreement.
+        # The sequence is left as it is either way.
+        return "uncertain", fwd, rev
 
     return winner, fwd, rev
 
