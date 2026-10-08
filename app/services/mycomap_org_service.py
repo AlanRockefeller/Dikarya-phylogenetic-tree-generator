@@ -163,30 +163,47 @@ def status(result_id):
 
 
 def rerun_pending(details):
-    """Check requested rerun sources against the saved pre-rerun XML dates."""
+    """Check requested rerun sources against the saved pre-rerun XML dates.
+
+    Every source is checked on each call, and its state is recorded in
+    ``details["org_source_states"]`` ("running", "done" or "failed") so a
+    caller can report a local rerun that finished while NCBI is still running.
+    """
     sources = list(details.get("org_wait_sources") or [])
     if not sources:
         return False
     record = status(str(details["result_id"]))
     before = details.get("org_before_dates") or {}
+    states = details.setdefault("org_source_states", {})
+    pending = False
     for source in sources:
         current = record.get(source) or {}
         state = current.get("status")
         if state in {"queued", "pending", "running", "processing"}:
-            return True
+            states[source] = "running"
+            pending = True
+            continue
         if state in {"failed", "error"} or not current.get("has_results"):
             if source == "ncbi":
+                states[source] = "failed"
                 raise OrgResultError("MycoMap.org NCBI rerun finished without results.",
                                      retryable=False)
-            details.setdefault("warnings", []).append(
-                "MycoMap.org local rerun did not finish; using any saved local results."
-            )
-            details["local_status"] = "failed"
+            if details.get("local_status") != "failed":
+                details.setdefault("warnings", []).append(
+                    "MycoMap.org local rerun did not finish; using any saved local results."
+                )
+                details["local_status"] = "failed"
+            states[source] = "failed"
             continue
         old_date = before.get(source)
         if old_date and current.get("xml_date") == old_date:
-            return True
+            states[source] = "running"
+            pending = True
+            continue
         details[f"{source}_status"] = "available" if source == "ncbi" else "completed"
+        states[source] = "done"
+    if pending:
+        return True
     details["org_wait_sources"] = []
     return False
 
