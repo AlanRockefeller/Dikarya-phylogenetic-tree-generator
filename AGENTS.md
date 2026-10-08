@@ -943,6 +943,13 @@ hits one missing job; nobody hits nine. One `WARNING`
 - **A new signal must define `free` deliberately.** `free=0` means "one
   occurrence is an attack", which is true of a honeytoken and false of almost
   everything else. Getting that wrong is how this becomes noise again.
+- **`route_breadth` and `health_scrape` count only for clients with no
+  browser evidence** (`BrowserWitness`). The evidence that reaches Flask in
+  production is `Sec-Fetch-Site: same-origin` on a request one of our pages
+  made: nginx serves `/static/` itself, so the static-asset check alone never
+  fired, and until 2026-10-08 those two signals escalated ordinary users,
+  the site owner included. Being logged in is deliberately *not* evidence --
+  accounts are free, and a script with one must still be scored.
 
 **`app/services/security_path_crowd.py` decides what is boring by counting who
 asks.** A path requested by ≥`DICTIONARY_CLIENTS` unrelated clients is sweep
