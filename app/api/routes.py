@@ -1810,8 +1810,9 @@ def gather_mycomap_sequences_for_queue(url, include_ncbi=True, include_local=Tru
 
     from app.services.mycomap_service import (
         fetch_mycomap_blast_metrics,
+        _looks_unfinished,
         fetch_mycomap_fasta,
-        get_mycomap_ncbi_queue_position,
+        get_mycomap_ncbi_queue_status,
         improve_mycomap_sequence_name,
         parse_mycomap_ncbi_fasta_header,
         prefer_local_mycomap_taxa,
@@ -1923,22 +1924,35 @@ def gather_mycomap_sequences_for_queue(url, include_ncbi=True, include_local=Tru
     logger.info(
         f"Mycomap helper: blast_id={blast_id} (ncbi={include_ncbi}, local={include_local}) url={url}"
     )
-    ncbi_queue_position = (
-        get_mycomap_ncbi_queue_position(url) if include_ncbi else None
-    ) if provider == "com" else None
-    ncbi_queued = ncbi_queue_position is not None
+    ncbi_queue_status = (
+        get_mycomap_ncbi_queue_status(url) if include_ncbi and provider == "com" else None
+    )
+    ncbi_queue_position = ncbi_queue_status["queue_position"] if ncbi_queue_status else None
+    # Alan 10/8/26 - Also hold off while MycoMap's API says the NCBI search is
+    # still running with no queue position (MycoMap drops the position before
+    # the results exist), as _poll_auto_created_mycomap_ncbi_results() already
+    # does. Job 8ucm fetched the export in that state: three HTTP 500s, then a
+    # local-only tree reported as a failed NCBI download.
+    ncbi_queued = ncbi_queue_position is not None or bool(
+        ncbi_queue_status
+        and ncbi_queue_status["source"] == "api"
+        and _looks_unfinished(ncbi_queue_status["status"])
+    )
     if ncbi_queued:
         logger.info(
-            "event=mycomap.ncbi_queued blast_id=%s position=%s",
-            blast_id, ncbi_queue_position,
+            "event=mycomap.ncbi_queued blast_id=%s position=%s status=%s",
+            blast_id, ncbi_queue_position, ncbi_queue_status.get("status") or "-",
         )
         if not include_local:
+            where = (
+                f"still waiting in its BLAST queue at position {ncbi_queue_position}"
+                if ncbi_queue_position is not None else "still running"
+            )
             return None, ({
                 "status": "pending",
                 "error": (
-                    "MycoMap's NCBI results are still waiting in its BLAST queue "
-                    f"at position {ncbi_queue_position}. Try this import again "
-                    "after the queue advances, or include local MycoBLAST results now."
+                    f"MycoMap's NCBI BLAST search is {where}. Try this import again "
+                    "in a few minutes, or include local MycoBLAST results now."
                 ),
                 "ncbi_queue_position": ncbi_queue_position,
                 "retryable": True,
