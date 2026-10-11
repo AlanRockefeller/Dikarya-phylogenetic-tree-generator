@@ -69,8 +69,11 @@ phylogenetics, and the discovery of new species.{% endblock %}
     <h2>🧬 Phylogenetic Tree Builder</h2>
     <p>Build publication-quality phylogenetic trees directly from your sequences. Supports MAFFT, RAxML, IQ-TREE,
         MrBayes, and more.</p>
-    <a href="{{ url_for('main.sequence_entry') }}" class="journal-btn journal-btn-primary journal-btn-large">
-        Launch Tree Builder →
+    {#- The Workbench section link from app/navigation.py: Tree Builder until
+        the Workbench overview page exists, then the overview. -#}
+    {%- set workbench = site_nav().sections|selectattr('key', 'equalto', 'workbench')|first %}
+    <a href="{{ workbench.url }}" class="journal-btn journal-btn-primary journal-btn-large">
+        Open in Workbench →
     </a>
 </section>
 

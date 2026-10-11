@@ -226,8 +226,12 @@ class VoucherCustomLayoutTests(unittest.TestCase):
 
 class JournalTemplateTests(unittest.TestCase):
     def test_the_footer_ethics_link_has_a_target(self):
-        footer = read("app", "templates", "journal", "base_journal.html")
-        self.assertIn("journal.about') }}#ethics", footer)
+        # The footer is the shared site footer; its links live in
+        # app/navigation.py rather than in the layout.
+        self.assertIn('{% include "partials/site_footer.html" %}',
+                      read("app", "templates", "journal", "base_journal.html"))
+        self.assertIn("'endpoint': 'journal.about', 'anchor': 'ethics'",
+                      read("app", "navigation.py"))
         self.assertIn('id="ethics"', read("app", "templates", "journal", "about.html"))
 
     def test_the_display_only_contact_form_cannot_submit(self):

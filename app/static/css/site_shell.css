@@ -111,6 +111,13 @@
     border-radius: 4px;
 }
 
+/* Land #fragment links (footer's #ethics, the skip link) below the sticky
+   bar. :target only, so scrollIntoView() elsewhere is unaffected, and
+   :where() so a page's own scroll-margin still wins. */
+:where(:target) {
+    scroll-margin-top: 76px;
+}
+
 .dk-skip {
     position: absolute;
     left: 8px;
