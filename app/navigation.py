@@ -10,7 +10,7 @@ pages that land in a later release (``main.workbench``, ``journal.authors``)
 without breaking the pages that render it today.
 """
 
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 from flask import current_app, g, request, url_for
 
@@ -136,7 +136,8 @@ def active_job_count(user):
         return 0
     try:
         from app.models import Job
-        cutoff = datetime.utcnow() - ACTIVE_JOB_MAX_AGE
+        # Job.created_at is naive UTC.
+        cutoff = datetime.now(timezone.utc).replace(tzinfo=None) - ACTIVE_JOB_MAX_AGE
         return (Job.query.filter(Job.user_id == user.id,
                                  Job.status.in_(ACTIVE_JOB_STATUSES),
                                  Job.deleted_at.is_(None),
