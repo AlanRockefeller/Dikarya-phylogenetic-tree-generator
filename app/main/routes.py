@@ -616,6 +616,7 @@ def _build_voucher_rtf(labels, layout):
 
 @bp.route('/voucher')
 @bp.route('/vouchers')
+@bp.route('/labels')
 def voucherredirect():
     return redirect(url_for('main.voucher_labels'), code=301)
 
