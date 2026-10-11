@@ -36,14 +36,26 @@ JOURNAL_NAV = (
      'also': ('journal.contact', 'journal.support')},
 )
 
+# ``description`` and ``icon`` feed the cards on the Workbench overview page
+# (workbench_tools()), so adding a tool here adds both its tab and its card.
 WORKBENCH_NAV = (
     {'label': 'Overview', 'endpoint': 'main.workbench'},
     {'label': 'Tree Builder', 'endpoint': 'main.sequence_entry',
-     'also': ('main.job_status', 'main.job_viewer')},
-    {'label': 'iNat Finder', 'endpoint': 'main.inat_finder'},
-    {'label': 'Voucher Sync', 'endpoint': 'main.voucher_sync'},
-    {'label': 'Voucher Labels', 'endpoint': 'main.voucher_labels'},
-    {'label': 'Docs', 'endpoint': 'main.help_page'},
+     'also': ('main.job_status', 'main.job_viewer'), 'icon': 'fa-tree',
+     'description': 'Build phylogenetic trees from DNA sequences using MAFFT, '
+                    'RAxML-NG, IQ-TREE and MrBayes.'},
+    {'label': 'iNat Finder', 'endpoint': 'main.inat_finder', 'icon': 'fa-magnifying-glass',
+     'description': 'Find an iNaturalist observation when its observation number '
+                    'contains a typo.'},
+    {'label': 'Voucher Sync', 'endpoint': 'main.voucher_sync', 'icon': 'fa-qrcode',
+     'login_required': True,
+     'description': 'Read specimen voucher numbers from your iNaturalist photos and '
+                    'sync them to an observation field.'},
+    {'label': 'Voucher Labels', 'endpoint': 'main.voucher_labels', 'icon': 'fa-tag',
+     'description': 'Generate numbered specimen voucher label sheets for printing.'},
+    {'label': 'Docs', 'endpoint': 'main.help_page', 'icon': 'fa-circle-question',
+     'description': 'Practical guides for building trees, inspecting alignments, '
+                    'editing results and using the API.'},
 )
 
 LOCAL_NAV = {'journal': JOURNAL_NAV, 'workbench': WORKBENCH_NAV}
@@ -128,6 +140,23 @@ def _links(items, endpoint=None):
         links.append({'label': item['label'], 'url': url,
                       'current': _current(item, resolved, endpoint)})
     return links
+
+
+def workbench_tools():
+    """The Workbench tools as overview-page cards: every WORKBENCH_NAV item
+    except the overview itself, in nav order, skipping unregistered ones."""
+    tools = []
+    for item in WORKBENCH_NAV:
+        if item['endpoint'] == 'main.workbench':
+            continue
+        _, url = _resolve(item)
+        if url is None:
+            continue
+        tools.append({'label': item['label'], 'url': url,
+                      'icon': item.get('icon', 'fa-toolbox'),
+                      'description': item.get('description', ''),
+                      'login_required': item.get('login_required', False)})
+    return tools
 
 
 def active_job_count(user):

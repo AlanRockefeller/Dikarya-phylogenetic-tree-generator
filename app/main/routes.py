@@ -218,6 +218,22 @@ def help_page():
     return render_template('help.html')
 
 
+@bp.route('/workbench')
+def workbench():
+    # Landing page for the Workbench section: one card per tool (from
+    # app/navigation.py) plus the signed-in user's latest jobs.
+    from app.models import Job
+    from app.navigation import workbench_tools
+    recent_jobs = []
+    if current_user.is_authenticated:
+        recent_jobs = (Job.query.filter_by(user_id=current_user.id)
+                       .filter(Job.deleted_at.is_(None))
+                       .order_by(Job.created_at.desc())
+                       .limit(5).all())
+    return render_template('workbench.html', tools=workbench_tools(),
+                           recent_jobs=recent_jobs)
+
+
 # Alan 8/14/26 - The site had no robots.txt at all, so crawlers had nothing telling
 # them which paths are worth fetching. nginx serves this file directly when the
 # config in ops/nginx/ is installed; this route is the fallback so it works either
@@ -241,9 +257,11 @@ SITEMAP_ENDPOINTS = (
     ('journal.ai_policy', 'monthly', '0.6'),
     ('journal.taxonomy', 'monthly', '0.6'),
     ('journal.reviewers', 'monthly', '0.5'),
+    ('journal.authors', 'monthly', '0.6'),
     ('journal.resources', 'monthly', '0.5'),
     ('journal.contact', 'monthly', '0.5'),
     ('journal.support', 'monthly', '0.5'),
+    ('main.workbench', 'weekly', '0.8'),
     ('main.sequence_entry', 'weekly', '0.9'),
     ('main.inat_finder', 'monthly', '0.7'),
     ('main.help_page', 'monthly', '0.7'),

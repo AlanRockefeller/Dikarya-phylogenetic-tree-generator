@@ -1,0 +1,37 @@
+{% extends "journal/base_journal.html" %}
+
+{% block title %}For Authors - Dikarya{% endblock %}
+{% block meta_description %}Author guidelines, AI policy and writing resources for submitting to Dikarya.{% endblock %}
+
+{% block content %}
+<div class="journal-page-header">
+    <h1>For Authors</h1>
+</div>
+
+<section class="journal-section">
+    <p>Everything you need to prepare a manuscript for Dikarya, from formatting and data deposition to how AI tools
+        may be used.</p>
+    <div class="journal-card-grid">
+        <div class="journal-card">
+            <h3>Author Guidelines</h3>
+            <p>Manuscript format and structure, special requirements for taxonomic works, and data availability.</p>
+            <a href="{{ url_for('journal.submit_manuscript') }}#guidelines">Read the guidelines →</a>
+        </div>
+        <div class="journal-card">
+            <h3>AI Policy</h3>
+            <p>How AI tools may and may not be used when preparing a manuscript, and what to disclose.</p>
+            <a href="{{ url_for('journal.ai_policy') }}">Read the policy →</a>
+        </div>
+        <div class="journal-card">
+            <h3>Writing Resources</h3>
+            <p>Guides for describing new species, reading phylogenies and depositing data, plus databases and tools.</p>
+            <a href="{{ url_for('journal.resources') }}">Browse resources →</a>
+        </div>
+        <div class="journal-card">
+            <h3>Submit a Manuscript</h3>
+            <p>How to prepare your manuscript and submit it by email, and what happens in peer review.</p>
+            <a href="{{ url_for('journal.submit_manuscript') }}">Go to Submit →</a>
+        </div>
+    </div>
+</section>
+{% endblock %}
