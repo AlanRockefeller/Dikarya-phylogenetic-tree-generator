@@ -1,0 +1,26 @@
+{#- Local nav: the tabs of the active section (Journal or Workbench).
+    Items and active state come from app/navigation.py via site_nav(). -#}
+{%- set nav = site_nav() -%}
+<nav class="dk-shell dk-local" aria-label="{{ nav.section_label }}">
+    <div class="dk-local-scroll" data-dk-local-scroll>
+        <ul class="dk-local-list">
+            {%- for item in nav.local %}
+            <li>
+                <a href="{{ item.url }}" class="dk-local-item"
+                    {%- if item.current %} aria-current="{{ item.current }}"{% endif %}>{{ item.label }}</a>
+            </li>
+            {%- endfor %}
+        </ul>
+    </div>
+</nav>
+<script>
+    (function () {
+        // On narrow screens the tabs scroll sideways; bring the active one
+        // into view. scrollLeft rather than scrollIntoView, which would also
+        // scroll the page vertically.
+        var strip = document.querySelector('[data-dk-local-scroll]');
+        var active = strip && strip.querySelector('[aria-current]');
+        if (!strip || !active || strip.scrollWidth <= strip.clientWidth) return;
+        strip.scrollLeft = Math.max(0, active.offsetLeft - (strip.clientWidth - active.offsetWidth) / 2);
+    })();
+</script>

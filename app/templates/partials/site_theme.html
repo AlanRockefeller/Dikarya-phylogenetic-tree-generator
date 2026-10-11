@@ -1,0 +1,70 @@
+{#- Shared theme bootstrap. Include as early in <head> as possible so the page
+    never paints in the wrong theme.
+
+    It sets BOTH forms the two layouts read: the `.dark` class (Tailwind's
+    darkMode: 'class', base_modern.html) and data-theme="dark" (journal.css).
+
+    localStorage['theme'] holds "light" or "dark"; System is stored as no key
+    at all rather than as "system", because the older per-layout toggles read
+    any non-"dark" value as light. Removing the key keeps them agreeing with
+    this script while both are still in use. -#}
+<script>
+    (function () {
+        var html = document.documentElement;
+        var query = window.matchMedia ? window.matchMedia('(prefers-color-scheme: dark)') : null;
+
+        function stored() {
+            try {
+                var value = localStorage.getItem('theme');
+                return value === 'light' || value === 'dark' ? value : 'system';
+            } catch (_) {
+                // Blocked storage can make even a read throw.
+                return 'system';
+            }
+        }
+
+        function apply(preference) {
+            var dark = preference === 'dark' || (preference === 'system' && !!(query && query.matches));
+            html.classList.toggle('dark', dark);
+            if (dark) {
+                html.setAttribute('data-theme', 'dark');
+            } else {
+                html.removeAttribute('data-theme');
+            }
+            return dark;
+        }
+
+        window.dikaryaTheme = {
+            get: stored,
+            set: function (preference) {
+                if (preference !== 'light' && preference !== 'dark') preference = 'system';
+                try {
+                    if (preference === 'system') {
+                        localStorage.removeItem('theme');
+                    } else {
+                        localStorage.setItem('theme', preference);
+                    }
+                } catch (_) {
+                    // Still switch this page when the browser declines to persist it.
+                }
+                var dark = apply(preference);
+                document.dispatchEvent(new CustomEvent('dikarya:themechange', {
+                    detail: { preference: preference, dark: dark }
+                }));
+            }
+        };
+
+        apply(stored());
+
+        if (query) {
+            var follow = function () {
+                if (stored() === 'system') apply('system');
+            };
+            if (query.addEventListener) {
+                query.addEventListener('change', follow);
+            } else if (query.addListener) {
+                query.addListener(follow);
+            }
+        }
+    })();
+</script>

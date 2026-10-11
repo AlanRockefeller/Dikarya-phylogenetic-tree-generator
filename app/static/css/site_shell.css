@@ -1,0 +1,732 @@
+/* Dikarya site shell: global bar, local nav and footer.
+ *
+ * Shared by the Journal (journal.css, no Tailwind) and the Workbench
+ * (base_modern.html, Tailwind), so this is plain CSS with every class
+ * prefixed `dk-` to stay clear of both. Dark mode is keyed on BOTH forms the
+ * layouts use: `.dark` (Tailwind) and `[data-theme="dark"]` (journal.css);
+ * partials/site_theme.html sets both.
+ *
+ * Gold is reserved for the active switcher segment, the active tab underline
+ * and badges. Nothing in the navigation is styled as a gold button.
+ *
+ * Breakpoints (spec section 7): >=1100px full; 768-1099px icon-only What's
+ * New and My Jobs; <768px compact bar, scrolling tabs, accordion footer.
+ */
+
+@import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600;700&display=swap');
+
+:root {
+    --dk-font: 'IBM Plex Sans', system-ui, -apple-system, sans-serif;
+    --dk-gold: #c9a962;
+    --dk-gold-ink: #1a2f23;
+
+    --dk-bar-bg: #1a2f23;
+    --dk-bar-border: #2d4a3e;
+    --dk-bar-text: #f3eee2;
+    --dk-bar-muted: #c3cbbf;
+    --dk-bar-hover: rgba(255, 255, 255, 0.08);
+
+    --dk-local-bg: #fdfcf8;
+    --dk-local-border: #e2ddcf;
+    --dk-local-text: #3b4a41;
+    --dk-local-active: #1a2f23;
+    --dk-local-underline: #9a7b2c;
+
+    --dk-panel-bg: #ffffff;
+    --dk-panel-border: #ddd8ca;
+    --dk-panel-text: #1f2a24;
+    --dk-panel-muted: #5d6a62;
+    --dk-panel-hover: #f1eee5;
+    --dk-panel-shadow: 0 10px 30px rgba(26, 47, 35, 0.18);
+
+    --dk-footer-bg: #1a2f23;
+    --dk-footer-text: #c3cbbf;
+    --dk-footer-heading: #f3eee2;
+    --dk-footer-rule: #2d4a3e;
+
+    --dk-focus: #e5d4a1;
+    --dk-focus-on-light: #1a2f23;
+}
+
+.dark,
+[data-theme="dark"] {
+    --dk-bar-bg: #12221a;
+    --dk-bar-border: #24392e;
+
+    --dk-local-bg: #16271e;
+    --dk-local-border: #2a4034;
+    --dk-local-text: #c3cbbf;
+    --dk-local-active: #f3eee2;
+    --dk-local-underline: #c9a962;
+
+    --dk-panel-bg: #1c3025;
+    --dk-panel-border: #355245;
+    --dk-panel-text: #ece4cf;
+    --dk-panel-muted: #b9b29a;
+    --dk-panel-hover: #24392e;
+    --dk-panel-shadow: 0 10px 30px rgba(0, 0, 0, 0.45);
+
+    --dk-footer-bg: #0f1b14;
+    --dk-footer-rule: #24392e;
+
+    --dk-focus-on-light: #e5d4a1;
+}
+
+/* ---- Shared ---- */
+
+.dk-shell,
+.dk-shell *,
+.dk-shell *::before,
+.dk-shell *::after {
+    box-sizing: border-box;
+}
+
+.dk-shell {
+    font-family: var(--dk-font);
+    font-size: 15px;
+    line-height: 1.4;
+}
+
+:where(.dk-shell) ul {
+    list-style: none;
+    margin: 0;
+    padding: 0;
+}
+
+:where(.dk-shell) a {
+    text-decoration: none;
+}
+
+:where(.dk-shell) button {
+    font: inherit;
+    margin: 0;
+    background: none;
+    border: 0;
+    cursor: pointer;
+}
+
+:where(.dk-shell) :focus-visible {
+    outline: 2px solid var(--dk-focus);
+    outline-offset: 2px;
+    border-radius: 4px;
+}
+
+.dk-skip {
+    position: absolute;
+    left: 8px;
+    top: -100px;
+    z-index: 1100;
+    padding: 10px 16px;
+    background: var(--dk-gold);
+    color: var(--dk-gold-ink);
+    font-family: var(--dk-font);
+    font-weight: 600;
+    border-radius: 6px;
+    text-decoration: none;
+}
+
+.dk-skip:focus {
+    top: 8px;
+}
+
+/* ---- Global bar ---- */
+
+.dk-header {
+    position: sticky;
+    top: 0;
+    z-index: 1000;
+    background: var(--dk-bar-bg);
+    border-bottom: 1px solid var(--dk-bar-border);
+    color: var(--dk-bar-text);
+}
+
+.dk-bar {
+    display: flex;
+    align-items: center;
+    gap: 24px;
+    max-width: 1400px;
+    height: 60px;
+    margin: 0 auto;
+    padding: 0 24px;
+}
+
+.dk-logo {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    flex-shrink: 0;
+    color: var(--dk-bar-text);
+}
+
+.dk-logo-mark {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 36px;
+    height: 36px;
+    border-radius: 50%;
+    background: var(--dk-gold);
+    font-size: 19px;
+    line-height: 1;
+}
+
+.dk-wordmark {
+    font-size: 20px;
+    font-weight: 700;
+    letter-spacing: 0.01em;
+    white-space: nowrap;
+}
+
+.dk-switcher {
+    display: flex;
+    align-items: stretch;
+    gap: 4px;
+    height: 100%;
+}
+
+.dk-switcher-item {
+    display: flex;
+    align-items: center;
+    height: 100%;
+    padding: 0 12px;
+    color: var(--dk-bar-muted);
+    font-weight: 500;
+    white-space: nowrap;
+    border-bottom: 3px solid transparent;
+    border-top: 3px solid transparent;
+}
+
+.dk-switcher-item:hover {
+    color: var(--dk-bar-text);
+}
+
+.dk-switcher-item[aria-current] {
+    color: var(--dk-bar-text);
+    font-weight: 600;
+    border-bottom-color: var(--dk-gold);
+}
+
+.dk-actions {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    margin-left: auto;
+}
+
+.dk-action {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    min-height: 44px;
+    min-width: 44px;
+    padding: 0 12px;
+    border-radius: 8px;
+    color: var(--dk-bar-muted);
+    font-weight: 500;
+    white-space: nowrap;
+}
+
+.dk-action:hover,
+.dk-action[aria-expanded="true"] {
+    color: var(--dk-bar-text);
+    background: var(--dk-bar-hover);
+}
+
+.dk-icon-wrap {
+    position: relative;
+    display: inline-flex;
+    font-size: 16px;
+}
+
+.dk-dot {
+    position: absolute;
+    top: -2px;
+    right: -3px;
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    background: var(--dk-gold);
+    box-shadow: 0 0 0 2px var(--dk-bar-bg);
+}
+
+.dk-badge {
+    position: absolute;
+    top: -8px;
+    right: -12px;
+    min-width: 18px;
+    height: 18px;
+    padding: 0 5px;
+    border-radius: 9px;
+    background: var(--dk-gold);
+    color: var(--dk-gold-ink);
+    font-size: 11px;
+    font-weight: 700;
+    line-height: 18px;
+    text-align: center;
+    box-shadow: 0 0 0 2px var(--dk-bar-bg);
+}
+
+/* Room for the count so it does not run into the label; icon-only mode
+   drops the label, and the margin with it. */
+.dk-has-badge {
+    margin-right: 10px;
+}
+
+.dk-avatar {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 44px;
+    height: 44px;
+    margin-left: 4px;
+}
+
+.dk-avatar span {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 34px;
+    height: 34px;
+    border-radius: 50%;
+    background: var(--dk-bar-border);
+    border: 1px solid var(--dk-bar-muted);
+    color: var(--dk-bar-text);
+    font-weight: 600;
+}
+
+.dk-avatar:hover span,
+.dk-avatar[aria-expanded="true"] span {
+    border-color: var(--dk-bar-text);
+}
+
+.dk-auth-link {
+    display: inline-flex;
+    align-items: center;
+    min-height: 40px;
+    padding: 0 14px;
+    border-radius: 8px;
+    border: 1px solid transparent;
+    color: var(--dk-bar-text);
+    font-weight: 500;
+    white-space: nowrap;
+}
+
+.dk-auth-link:hover {
+    background: var(--dk-bar-hover);
+}
+
+.dk-auth-link-outline {
+    border-color: var(--dk-bar-muted);
+}
+
+/* ---- Menus (What's New panel, account menu) ---- */
+
+.dk-menu {
+    position: relative;
+}
+
+.dk-menu-panel {
+    position: absolute;
+    top: calc(100% + 8px);
+    left: 0;
+    z-index: 1010;
+    min-width: 240px;
+    padding: 6px;
+    background: var(--dk-panel-bg);
+    border: 1px solid var(--dk-panel-border);
+    border-radius: 10px;
+    box-shadow: var(--dk-panel-shadow);
+    color: var(--dk-panel-text);
+}
+
+.dk-menu-panel[hidden] {
+    display: none;
+}
+
+.dk-menu-panel-right {
+    left: auto;
+    right: 0;
+}
+
+.dk-shell .dk-menu-panel :focus-visible {
+    outline-color: var(--dk-focus-on-light);
+}
+
+.dk-menu-item {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    width: 100%;
+    min-height: 40px;
+    padding: 8px 10px;
+    border-radius: 6px;
+    color: var(--dk-panel-text);
+    text-align: left;
+    white-space: nowrap;
+}
+
+.dk-menu-item i {
+    width: 16px;
+    text-align: center;
+    color: var(--dk-panel-muted);
+}
+
+.dk-menu-item:hover,
+.dk-menu-item:focus-visible {
+    background: var(--dk-panel-hover);
+}
+
+.dk-pill {
+    margin-left: auto;
+    padding: 1px 8px;
+    border-radius: 9px;
+    background: var(--dk-gold);
+    color: var(--dk-gold-ink);
+    font-size: 11px;
+    font-weight: 700;
+}
+
+.dk-menu-email {
+    margin: 0;
+    padding: 8px 10px;
+}
+
+.dk-menu-caption {
+    display: block;
+    color: var(--dk-panel-muted);
+    font-size: 12px;
+    font-weight: 500;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+}
+
+.dk-menu-email-value {
+    display: block;
+    max-width: 260px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    font-weight: 500;
+}
+
+.dk-menu-divider {
+    height: 1px;
+    margin: 6px 4px;
+    background: var(--dk-panel-border);
+}
+
+.dk-theme {
+    padding: 6px 10px 8px;
+}
+
+.dk-theme-options {
+    display: flex;
+    gap: 4px;
+    margin-top: 6px;
+    padding: 3px;
+    border: 1px solid var(--dk-panel-border);
+    border-radius: 8px;
+}
+
+.dk-theme-option {
+    flex: 1;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: 6px;
+    min-height: 34px;
+    padding: 0 8px;
+    border-radius: 6px;
+    color: var(--dk-panel-muted);
+    font-size: 13px;
+    white-space: nowrap;
+}
+
+.dk-theme-option:hover {
+    color: var(--dk-panel-text);
+    background: var(--dk-panel-hover);
+}
+
+.dk-theme-option[aria-pressed="true"] {
+    background: var(--dk-panel-hover);
+    color: var(--dk-panel-text);
+    font-weight: 600;
+    box-shadow: inset 0 0 0 1px var(--dk-panel-border);
+}
+
+/* ---- Local nav ---- */
+
+.dk-local {
+    background: var(--dk-local-bg);
+    border-bottom: 1px solid var(--dk-local-border);
+}
+
+.dk-local-scroll {
+    position: relative;
+    max-width: 1400px;
+    margin: 0 auto;
+    overflow-x: auto;
+    scrollbar-width: none;
+}
+
+.dk-local-scroll::-webkit-scrollbar {
+    display: none;
+}
+
+.dk-local-list {
+    display: flex;
+    gap: 4px;
+    width: max-content;
+    padding: 0 16px;
+}
+
+.dk-local-item {
+    display: flex;
+    align-items: center;
+    min-height: 46px;
+    padding: 0 12px;
+    color: var(--dk-local-text);
+    font-weight: 500;
+    white-space: nowrap;
+    border-top: 3px solid transparent;
+    border-bottom: 3px solid transparent;
+}
+
+.dk-local-item:hover {
+    color: var(--dk-local-active);
+}
+
+.dk-local-item[aria-current] {
+    color: var(--dk-local-active);
+    font-weight: 600;
+    border-bottom-color: var(--dk-local-underline);
+}
+
+.dk-shell.dk-local :focus-visible {
+    outline-color: var(--dk-focus-on-light);
+    outline-offset: -3px;
+}
+
+/* ---- Footer ---- */
+
+.dk-footer {
+    background: var(--dk-footer-bg);
+    color: var(--dk-footer-text);
+    margin-top: 48px;
+}
+
+.dk-footer-inner {
+    display: grid;
+    grid-template-columns: repeat(5, minmax(0, 1fr));
+    gap: 32px;
+    max-width: 1400px;
+    margin: 0 auto;
+    padding: 40px 24px 24px;
+}
+
+.dk-footer-heading {
+    display: block;
+    margin-bottom: 12px;
+    color: var(--dk-footer-heading);
+    font-size: 14px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    list-style: none;
+    cursor: default;
+}
+
+.dk-footer-heading::-webkit-details-marker {
+    display: none;
+}
+
+.dk-footer-links li + li {
+    margin-top: 8px;
+}
+
+.dk-footer-links a {
+    color: var(--dk-footer-text);
+}
+
+.dk-footer-links a:hover,
+.dk-footer-bottom a:hover {
+    color: var(--dk-gold);
+    text-decoration: underline;
+}
+
+.dk-footer-bottom {
+    max-width: 1400px;
+    margin: 0 auto;
+    padding: 16px 24px 24px;
+    border-top: 1px solid var(--dk-footer-rule);
+    font-size: 13px;
+}
+
+.dk-footer-bottom p {
+    margin: 0;
+}
+
+.dk-footer-bottom a {
+    color: var(--dk-footer-text);
+    text-decoration: underline;
+}
+
+/* ---- Visibility helpers ---- */
+
+.dk-only-mobile {
+    display: none;
+}
+
+/* ---- 768-1099px: icon-only What's New and My Jobs ---- */
+
+@media (max-width: 1099px) {
+    .dk-bar {
+        gap: 16px;
+        padding: 0 16px;
+    }
+
+    .dk-action {
+        padding: 0;
+        justify-content: center;
+    }
+
+    .dk-has-badge {
+        margin-right: 0;
+    }
+
+    .dk-action-label {
+        position: absolute;
+        width: 1px;
+        height: 1px;
+        overflow: hidden;
+        clip: rect(0 0 0 0);
+        white-space: nowrap;
+    }
+
+    .dk-footer-inner {
+        grid-template-columns: repeat(3, minmax(0, 1fr));
+    }
+}
+
+/* ---- <768px: compact bar, segmented switcher, accordion footer ---- */
+
+@media (max-width: 767px) {
+    .dk-bar {
+        gap: 10px;
+        height: 56px;
+        padding: 0 12px;
+    }
+
+    .dk-hide-mobile {
+        display: none;
+    }
+
+    .dk-only-mobile {
+        display: list-item;
+    }
+
+    .dk-switcher {
+        height: auto;
+        padding: 3px;
+        gap: 2px;
+        border: 1px solid var(--dk-bar-border);
+        border-radius: 9px;
+    }
+
+    .dk-switcher-item {
+        height: 34px;
+        padding: 0 10px;
+        border: 0;
+        border-radius: 6px;
+        font-size: 14px;
+    }
+
+    .dk-switcher-item[aria-current] {
+        background: var(--dk-gold);
+        color: var(--dk-gold-ink);
+    }
+
+    .dk-auth-link {
+        padding: 0 10px;
+        font-size: 14px;
+    }
+
+    .dk-local-scroll {
+        -webkit-mask-image: linear-gradient(to right, transparent 0, #000 16px, #000 calc(100% - 16px), transparent 100%);
+        mask-image: linear-gradient(to right, transparent 0, #000 16px, #000 calc(100% - 16px), transparent 100%);
+    }
+
+    .dk-footer-inner {
+        grid-template-columns: 1fr;
+        gap: 0;
+        padding: 16px 16px 8px;
+    }
+
+    .dk-footer-col {
+        border-bottom: 1px solid var(--dk-footer-rule);
+    }
+
+    .dk-footer-heading {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        min-height: 48px;
+        margin: 0;
+        cursor: pointer;
+    }
+
+    .dk-footer-heading::after {
+        content: "";
+        width: 8px;
+        height: 8px;
+        margin-right: 4px;
+        border-right: 2px solid currentColor;
+        border-bottom: 2px solid currentColor;
+        transform: rotate(45deg);
+        transition: transform 0.15s ease;
+    }
+
+    .dk-footer-col[open] .dk-footer-heading::after {
+        transform: rotate(-135deg);
+    }
+
+    .dk-footer-links {
+        padding-bottom: 14px;
+    }
+
+    .dk-footer-links a {
+        display: inline-block;
+        padding: 6px 0;
+    }
+
+    .dk-footer-links li + li {
+        margin-top: 0;
+    }
+
+    .dk-footer-bottom {
+        padding: 16px;
+        border-top: 0;
+    }
+}
+
+@media (max-width: 479px) {
+    .dk-wordmark {
+        display: none;
+    }
+
+    .dk-switcher-item {
+        padding: 0 8px;
+    }
+
+    /* The bar cannot fit both auth links beside the switcher on a phone;
+       the login page links to Sign up. */
+    .dk-auth-link-outline {
+        display: none;
+    }
+}
+
+@media (prefers-reduced-motion: reduce) {
+    .dk-footer-heading::after {
+        transition: none;
+    }
+}
