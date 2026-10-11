@@ -473,6 +473,22 @@
     display: none;
 }
 
+/* Mouse drag-to-scroll (partials/site_local_nav.html); touch scrolls natively. */
+@media (pointer: fine) {
+    .dk-local-overflowing {
+        cursor: grab;
+    }
+}
+
+.dk-local-dragging {
+    cursor: grabbing;
+    user-select: none;
+}
+
+.dk-local-dragging .dk-local-item {
+    cursor: grabbing;
+}
+
 .dk-local-list {
     display: flex;
     gap: 4px;

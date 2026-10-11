@@ -15,12 +15,88 @@
 </nav>
 <script>
     (function () {
+        var strip = document.querySelector('[data-dk-local-scroll]');
+        if (!strip) return;
+
+        function overflowing() {
+            return strip.scrollWidth > strip.clientWidth + 1;
+        }
+
         // On narrow screens the tabs scroll sideways; bring the active one
         // into view. scrollLeft rather than scrollIntoView, which would also
         // scroll the page vertically.
-        var strip = document.querySelector('[data-dk-local-scroll]');
-        var active = strip && strip.querySelector('[aria-current]');
-        if (!strip || !active || strip.scrollWidth <= strip.clientWidth) return;
-        strip.scrollLeft = Math.max(0, active.offsetLeft - (strip.clientWidth - active.offsetWidth) / 2);
+        var active = strip.querySelector('[aria-current]');
+        if (active && overflowing()) {
+            strip.scrollLeft = Math.max(0, active.offsetLeft - (strip.clientWidth - active.offsetWidth) / 2);
+        }
+
+        // Touch swipes scroll the strip natively. A mouse cannot -- there is
+        // no visible scrollbar and a vertical wheel does nothing -- so give
+        // mouse users drag-to-scroll and wheel-to-scroll as well.
+        function markOverflow() {
+            strip.classList.toggle('dk-local-overflowing', overflowing());
+        }
+        markOverflow();
+        window.addEventListener('resize', markOverflow);
+
+        var drag = null;
+        var suppressClick = false;
+
+        strip.addEventListener('pointerdown', function (event) {
+            suppressClick = false;
+            if (event.pointerType !== 'mouse' || event.button !== 0 || !overflowing()) return;
+            drag = { x: event.clientX, left: strip.scrollLeft, moved: false, id: event.pointerId };
+        });
+
+        strip.addEventListener('pointermove', function (event) {
+            if (!drag || event.pointerId !== drag.id) return;
+            var dx = event.clientX - drag.x;
+            // A few pixels of wobble is still a click, not a drag.
+            if (!drag.moved && Math.abs(dx) < 5) return;
+            if (!drag.moved) {
+                drag.moved = true;
+                strip.classList.add('dk-local-dragging');
+                if (strip.setPointerCapture) strip.setPointerCapture(drag.id);
+            }
+            strip.scrollLeft = drag.left - dx;
+        });
+
+        function endDrag() {
+            if (!drag) return;
+            if (drag.moved) {
+                // The pointerup that ends a drag is followed by a click on
+                // whichever tab it was released over; swallow that one.
+                suppressClick = true;
+                strip.classList.remove('dk-local-dragging');
+            }
+            drag = null;
+        }
+        strip.addEventListener('pointerup', endDrag);
+        strip.addEventListener('pointercancel', endDrag);
+        strip.addEventListener('lostpointercapture', endDrag);
+
+        strip.addEventListener('click', function (event) {
+            if (!suppressClick) return;
+            suppressClick = false;
+            event.preventDefault();
+            event.stopPropagation();
+        }, true);
+
+        // Links are natively draggable; that would hijack the gesture.
+        strip.addEventListener('dragstart', function (event) {
+            event.preventDefault();
+        });
+
+        // A vertical wheel moves the strip sideways, then hands back to the
+        // page once the strip reaches either end, so it never traps the page
+        // scroll. Horizontal wheels and trackpads already work natively.
+        strip.addEventListener('wheel', function (event) {
+            if (!overflowing() || Math.abs(event.deltaY) <= Math.abs(event.deltaX)) return;
+            var delta = event.deltaMode === 1 ? event.deltaY * 16 : event.deltaY;
+            var max = strip.scrollWidth - strip.clientWidth;
+            if ((delta < 0 && strip.scrollLeft <= 0) || (delta > 0 && strip.scrollLeft >= max - 1)) return;
+            event.preventDefault();
+            strip.scrollLeft += delta;
+        }, { passive: false });
     })();
 </script>
