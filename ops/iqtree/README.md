@@ -26,8 +26,10 @@ reproducible run to run in any build, stock included, because IQ-TREE schedules
 parsimony trees dynamically and seeds each thread's SH-aLRT stream separately.
 
 Since 2026-10-11 Dikarya runs IQ-TREE with `-T 1` on every worker (`IQTREE_THREADS` in
-`app/services/tree_builder_service.py`), so every production tree is reproducible from
-its recorded seed. Replaying 34 production jobs at both thread counts on dikarya1, a
+`app/services/tree_builder_service.py`), so a tree built at that default is reproducible
+from its recorded seed. The default applies only when a job's parameters name no thread
+count (`TreeBuilderParams.threads`); no submission path sets one today, and a job that
+did would run at `-T N` and not be reproducible. Replaying 34 production jobs at both thread counts on dikarya1, a
 second thread gained 1.02x on Quick Tree overall (0.89x-1.18x, gaining only past ~700
 patterns) and made the three MFP+UFBoot+bnni jobs (58-80 taxa) 16-22% slower.
 
@@ -106,7 +108,7 @@ refuses to install unless the new binary reproduces `/usr/local/bin/iqtree3` byt
 byte on a synthetic alignment for the Quick Tree, MFP+UFBoot+bnni and plain UFBoot
 commands. Then point Dikarya at it -- comment out any existing `IQTREE_BINARY` line
 rather than adding a second one -- and have an agent restart the workers with the
-guarded wrapper (see "Restarting Dikarya services" in `CLAUDE.md`):
+guarded wrapper (see "Restarting Dikarya services" in `AGENTS.md`):
 
 ```zsh
 grep -n IQTREE_BINARY /etc/dikarya/dikarya.environment.live

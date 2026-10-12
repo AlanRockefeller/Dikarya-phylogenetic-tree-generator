@@ -154,7 +154,7 @@ that the installed binary loads its own library. It needs `git`, `cmake`,
 `gcc`/`g++` and network access to GitHub. Then point Dikarya at it -- comment out
 any existing `MRBAYES_BINARY` line rather than adding a second one -- and have an
 agent restart the workers with the guarded wrapper (see "Restarting Dikarya
-services" in `CLAUDE.md`):
+services" in `AGENTS.md`):
 
 ```zsh
 grep -n MRBAYES_BINARY /etc/dikarya/dikarya.environment.live

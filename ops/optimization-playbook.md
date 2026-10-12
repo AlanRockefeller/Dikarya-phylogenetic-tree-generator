@@ -52,10 +52,15 @@ AVX-512-only and which had plainly inefficient hot loops. Check, in this order:
   compare tree files and logs' likelihoods byte for byte at 1 thread. If a change cannot
   be exact (reordered floating-point sums), it is a different result -- stop and ask the
   user before going down that road.
-- **Rounding.** gcc with `-std=c99` (ISO mode) never contracts `a*b+c` into an FMA; gcc in
-  GNU mode (`-std=gnu11`, the default) contracts freely with `-march=native` (FMA
-  available). Match the stock build's mode; in vector code use a separate multiply and
-  add unless the stock build fuses. Check each tool's Makefile/CMake flags.
+- **Rounding.** Whether gcc fuses `a*b+c` into an FMA (with FMA available, e.g.
+  `-march=native`) is decided by the effective `-ffp-contract`, not by `-std=` alone.
+  Measured with gcc 13.3 at `-O2 -march=native`: C in ISO mode (`-std=c99`) does not fuse,
+  C in GNU mode (`-std=gnu11`, the default) does, an explicit `-ffp-contract=fast` or
+  `=off` overrides either, and g++ fuses even under `-std=c++11`. `gcc -Q --help=optimizers`
+  reports `fast` for `-std=c99` regardless, so do not trust it: compile a one-line
+  `a*b+c` with the build's real flags and grep the assembly for `vfmadd`. Record the
+  effective setting with the measurements, match the stock build's, and in vector code
+  use a separate multiply and add unless the stock build fuses.
 - **Reference builds.** Build stock and patched side by side from the same commit with the
   same compiler and flags, in the scratchpad. Also keep the currently installed binary as
   a third reference.
@@ -276,7 +281,7 @@ AVX-512-only and which had plainly inefficient hot loops. Check, in this order:
 3. The user installs as root; switch with the `*_BINARY` env var in
    `/etc/dikarya/dikarya.environment.live` (comment out the old line, do not add a
    duplicate); restart workers with the guarded wrapper after checking the queues
-   (`CLAUDE.md`, "Restarting Dikarya services"); confirm the new version string in a real
+   (`AGENTS.md`, "Restarting Dikarya services"); confirm the new version string in a real
    job's log. Rollback is swapping the line back.
 4. If the user wants it upstream: fork on their GitHub, README section with hardware,
    results, verification, credits (original authors; the session's model as co-author).
