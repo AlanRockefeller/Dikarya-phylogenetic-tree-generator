@@ -5,13 +5,35 @@
     <div class="dk-local-scroll" data-dk-local-scroll>
         <ul class="dk-local-list">
             {%- for item in nav.local %}
+            {%- if item.children %}
+            {#- A menu tab. Its panel sits outside the strip below, because the
+                strip scrolls sideways and would clip it. -#}
+            <li class="dk-menu" data-dk-menu data-dk-local-menu>
+                <button type="button" class="dk-local-item" data-dk-menu-trigger
+                    aria-haspopup="true" aria-expanded="false" aria-controls="dk-local-{{ item.key }}-panel"
+                    {%- if item.current %} aria-current="{{ item.current }}"{% endif %}>
+                    {{ item.label }}<i class="fas fa-chevron-down dk-local-caret" aria-hidden="true"></i>
+                </button>
+            </li>
+            {%- else %}
             <li>
                 <a href="{{ item.url }}" class="dk-local-item"
                     {%- if item.current %} aria-current="{{ item.current }}"{% endif %}>{{ item.label }}</a>
             </li>
+            {%- endif %}
             {%- endfor %}
         </ul>
     </div>
+    {%- for item in nav.local if item.children %}
+    <div class="dk-menu-panel dk-local-panel" id="dk-local-{{ item.key }}-panel" data-dk-menu-panel hidden>
+        <ul class="dk-menu-list">
+            {%- for child in item.children %}
+            <li><a class="dk-menu-item" href="{{ child.url }}"
+                {%- if child.current %} aria-current="{{ child.current }}"{% endif %}>{{ child.label }}</a></li>
+            {%- endfor %}
+        </ul>
+    </div>
+    {%- endfor %}
 </nav>
 <script>
     (function () {
@@ -81,6 +103,27 @@
             event.preventDefault();
             event.stopPropagation();
         }, true);
+
+        // A menu tab's panel lives outside the strip, so place it under its
+        // tab when it opens (partials/site_global_bar.html fires dk-menu-open)
+        // and keep it there while the strip scrolls or the window resizes.
+        var nav = strip.parentElement;
+        var openMenu = null;
+        function place() {
+            if (!openMenu) return;
+            var trigger = openMenu.querySelector('[data-dk-menu-trigger]');
+            var panel = document.getElementById(trigger.getAttribute('aria-controls'));
+            if (panel.hidden) { openMenu = null; return; }
+            var box = nav.getBoundingClientRect();
+            var left = trigger.getBoundingClientRect().left - box.left;
+            var max = nav.clientWidth - panel.offsetWidth - 8;
+            panel.style.left = Math.max(8, Math.min(left, max)) + 'px';
+        }
+        Array.prototype.forEach.call(strip.querySelectorAll('[data-dk-local-menu]'), function (menu) {
+            menu.addEventListener('dk-menu-open', function () { openMenu = menu; place(); });
+        });
+        strip.addEventListener('scroll', place);
+        window.addEventListener('resize', place);
 
         // Links are natively draggable; that would hijack the gesture.
         strip.addEventListener('dragstart', function (event) {
