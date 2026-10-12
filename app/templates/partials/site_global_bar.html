@@ -3,6 +3,39 @@
     The layout must give its <main> the id in `skip_target` (default
     "main-content") for the skip link to land. -#}
 {%- set nav = site_nav() -%}
+
+{#- Shared by the account menu and the signed-out menu. -#}
+{%- macro theme_group() %}
+                    <div class="dk-theme" role="group" aria-labelledby="dk-theme-label">
+                        <span class="dk-menu-caption" id="dk-theme-label">Theme</span>
+                        <div class="dk-theme-options">
+                            <button type="button" class="dk-theme-option" data-dk-theme="light" aria-pressed="false">
+                                <i class="fas fa-sun" aria-hidden="true"></i> Light</button>
+                            <button type="button" class="dk-theme-option" data-dk-theme="dark" aria-pressed="false">
+                                <i class="fas fa-moon" aria-hidden="true"></i> Dark</button>
+                            <button type="button" class="dk-theme-option" data-dk-theme="system" aria-pressed="false">
+                                <i class="fas fa-desktop" aria-hidden="true"></i> System</button>
+                        </div>
+                    </div>
+{%- endmacro %}
+
+{#- Help & Docs, plus What's New and Feedback & Roadmap on phones, where
+    the What's New button is hidden (spec section 7). -#}
+{%- macro help_and_updates(nav) %}
+                        {%- if nav.help_url %}
+                        <li><a class="dk-menu-item" href="{{ nav.help_url }}">
+                            <i class="fas fa-circle-question" aria-hidden="true"></i> Help &amp; Docs</a></li>
+                        {%- endif %}
+                        {%- if nav.changelog_url %}
+                        <li class="dk-only-mobile"><a class="dk-menu-item" href="{{ nav.changelog_url }}">
+                            <i class="fas fa-bell" aria-hidden="true"></i> What's New
+                            {%- if whats_new_has_new %}<span class="dk-pill">New</span>{% endif %}</a></li>
+                        {%- endif %}
+                        {%- if nav.roadmap_url %}
+                        <li class="dk-only-mobile"><a class="dk-menu-item" href="{{ nav.roadmap_url }}">
+                            <i class="fas fa-route" aria-hidden="true"></i> Feedback &amp; Roadmap</a></li>
+                        {%- endif %}
+{%- endmacro %}
 <a class="dk-skip" href="#{{ skip_target|default('main-content') }}">Skip to content</a>
 <header class="dk-shell dk-header">
     <nav class="dk-bar" aria-label="Global">
@@ -21,10 +54,9 @@
         </ul>
 
         <div class="dk-actions">
-            {#- What's New. For signed-in users on a phone it moves into the
-                account menu (spec section 7); signed-out users have no
-                account menu, so for them it stays here. -#}
-            <div class="dk-menu{% if current_user.is_authenticated %} dk-hide-mobile{% endif %}" data-dk-menu>
+            {#- What's New. On a phone it moves into the account menu, or the
+                signed-out menu (spec section 7). -#}
+            <div class="dk-menu dk-hide-mobile" data-dk-menu>
                 <button type="button" class="dk-action" data-dk-menu-trigger
                     aria-haspopup="true" aria-expanded="false" aria-controls="dk-whats-new-panel"
                     aria-label="What's New{% if whats_new_has_new %}, new updates{% endif %}"
@@ -73,32 +105,10 @@
                         <span class="dk-menu-email-value">{{ current_user.email }}</span>
                     </p>
                     <div class="dk-menu-divider" role="separator"></div>
-                    <div class="dk-theme" role="group" aria-labelledby="dk-theme-label">
-                        <span class="dk-menu-caption" id="dk-theme-label">Theme</span>
-                        <div class="dk-theme-options">
-                            <button type="button" class="dk-theme-option" data-dk-theme="light" aria-pressed="false">
-                                <i class="fas fa-sun" aria-hidden="true"></i> Light</button>
-                            <button type="button" class="dk-theme-option" data-dk-theme="dark" aria-pressed="false">
-                                <i class="fas fa-moon" aria-hidden="true"></i> Dark</button>
-                            <button type="button" class="dk-theme-option" data-dk-theme="system" aria-pressed="false">
-                                <i class="fas fa-desktop" aria-hidden="true"></i> System</button>
-                        </div>
-                    </div>
+{{- theme_group() }}
                     <div class="dk-menu-divider" role="separator"></div>
                     <ul class="dk-menu-list">
-                        {%- if nav.help_url %}
-                        <li><a class="dk-menu-item" href="{{ nav.help_url }}">
-                            <i class="fas fa-circle-question" aria-hidden="true"></i> Help &amp; Docs</a></li>
-                        {%- endif %}
-                        {%- if nav.changelog_url %}
-                        <li class="dk-only-mobile"><a class="dk-menu-item" href="{{ nav.changelog_url }}">
-                            <i class="fas fa-bell" aria-hidden="true"></i> What's New
-                            {%- if whats_new_has_new %}<span class="dk-pill">New</span>{% endif %}</a></li>
-                        {%- endif %}
-                        {%- if nav.roadmap_url %}
-                        <li class="dk-only-mobile"><a class="dk-menu-item" href="{{ nav.roadmap_url }}">
-                            <i class="fas fa-route" aria-hidden="true"></i> Feedback &amp; Roadmap</a></li>
-                        {%- endif %}
+                        {{- help_and_updates(nav) }}
                     </ul>
                     <div class="dk-menu-divider" role="separator"></div>
                     <form action="{{ nav.logout_url }}" method="post">
@@ -114,13 +124,40 @@
             {%- if nav.register_url %}
             <a class="dk-auth-link dk-auth-link-outline" href="{{ nav.register_url }}">Sign up</a>
             {%- endif %}
+
+            {#- Signed-out visitors get the same menu shape as the account menu,
+                so Theme (and on phones What's New) still has a home. -#}
+            <div class="dk-menu" data-dk-menu>
+                <button type="button" class="dk-avatar dk-avatar-guest" data-dk-menu-trigger
+                    aria-haspopup="true" aria-expanded="false" aria-controls="dk-guest-panel"
+                    aria-label="Menu: theme and help" title="Theme and help">
+                    <span aria-hidden="true"><i class="fas fa-user"></i></span>
+                </button>
+                <div class="dk-menu-panel dk-menu-panel-right" id="dk-guest-panel" data-dk-menu-panel hidden>
+                    <p class="dk-menu-email">
+                        <span class="dk-menu-caption">Not signed in</span>
+                        <span class="dk-menu-note">Anyone with a job link can edit that job. Log in for exclusive edit access.</span>
+                    </p>
+                    <div class="dk-menu-divider" role="separator"></div>
+                    {{- theme_group() }}
+                    <div class="dk-menu-divider" role="separator"></div>
+                    <ul class="dk-menu-list">
+                        {{- help_and_updates(nav) }}
+                        {%- if nav.register_url %}
+                        <li class="dk-only-narrow"><a class="dk-menu-item" href="{{ nav.register_url }}">
+                            <i class="fas fa-user-plus" aria-hidden="true"></i> Sign up</a></li>
+                        {%- endif %}
+                    </ul>
+                </div>
+            </div>
             {%- endif %}
         </div>
     </nav>
 </header>
 <script>
     (function () {
-        // Menu-button behaviour for the What's New panel and the account menu:
+        // Menu-button behaviour for the What's New panel and the account and
+        // signed-out menus:
         // Esc and click-outside close, focus returns to the trigger, and Tab
         // cycles inside an open panel until it is closed.
         var menus = Array.prototype.slice.call(document.querySelectorAll('[data-dk-menu]'));
