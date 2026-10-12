@@ -301,6 +301,10 @@
     font-weight: 600;
 }
 
+.dk-avatar-guest span {
+    font-size: 14px;
+}
+
 .dk-avatar:hover span,
 .dk-avatar[aria-expanded="true"] span {
     border-color: var(--dk-bar-text);
@@ -414,6 +418,17 @@
     text-overflow: ellipsis;
     white-space: nowrap;
     font-weight: 500;
+}
+
+/* The signed-out menu's anonymous-editing note. */
+.dk-menu-note {
+    display: block;
+    max-width: 240px;
+    margin-top: 4px;
+    color: var(--dk-panel-muted);
+    font-size: 13px;
+    line-height: 1.4;
+    white-space: normal;
 }
 
 .dk-menu-divider {
@@ -596,7 +611,8 @@
 
 /* ---- Visibility helpers ---- */
 
-.dk-only-mobile {
+.dk-only-mobile,
+.dk-only-narrow {
     display: none;
 }
 
@@ -742,9 +758,13 @@
     }
 
     /* The bar cannot fit both auth links beside the switcher on a phone;
-       the login page links to Sign up. */
+       Sign up moves into the signed-out menu instead. */
     .dk-auth-link-outline {
         display: none;
+    }
+
+    .dk-only-narrow {
+        display: list-item;
     }
 }
 
