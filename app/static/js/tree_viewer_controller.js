@@ -1768,6 +1768,7 @@ document.addEventListener('DOMContentLoaded', async () => {
         if (typeSelect.selectedOptions[0]?.disabled) typeSelect.value = 'clade_line';
         getEl('btn-annotation-save-text').textContent = mode === 'edit' ? 'Save changes' : 'Save';
         getEl('btn-annotation-delete').classList.toggle('hidden', mode !== 'edit');
+        getEl('btn-annotation-edit-members')?.classList.toggle('hidden', mode !== 'edit');
         getEl('annotation-style-details').open = false;
 
         populateAnnotationLayerSelect(existing ? existing.layer_id : annotationLayers[0]?.id);
@@ -1888,6 +1889,7 @@ document.addEventListener('DOMContentLoaded', async () => {
             } else {
                 showStatus(`Annotation "${label}" saved.`, 'success', 2000);
             }
+            if (options.editMembers === true) startAnnotationMembershipPicker(payload.id);
         }
     }
 
@@ -3528,6 +3530,11 @@ document.addEventListener('DOMContentLoaded', async () => {
         getEl('btn-annotation-cancel')?.addEventListener('click', closeAnnotationEditor);
         getEl('annotation-editor-backdrop')?.addEventListener('click', closeAnnotationEditor);
         getEl('btn-annotation-save')?.addEventListener('click', submitAnnotationEditor);
+        getEl('btn-annotation-edit-members')?.addEventListener('click', () => {
+            if (window.VIEW_ONLY || isProcessing || annotationEditorState?.mode !== 'edit') return;
+            // Save the current label and styling before switching to member selection.
+            submitAnnotationEditor({ editMembers: true });
+        });
         getEl('btn-annotation-delete')?.addEventListener('click', deleteCurrentAnnotation);
         // Alan 8/15/26 - Switching layer changes what the override rows inherit, so re-render them.
         getEl('select-annotation-layer')?.addEventListener('change', renderAnnotationStyleOverrides);
@@ -4089,8 +4096,7 @@ document.addEventListener('DOMContentLoaded', async () => {
             });
         }
 
-        // Alan 8/21/26 - Right-clicking a drawn annotation edits that exact annotation, which is
-        // the only unambiguous path when several are stacked on one clade or branch.
+        // Right-click opens the editor for the exact annotation clicked.
         if (viewer && typeof viewer.setEditCladeAnnotationHandler === 'function') {
             viewer.setEditCladeAnnotationHandler((annotationId) => {
                 if (window.VIEW_ONLY || isProcessing || !annotationId) return;
