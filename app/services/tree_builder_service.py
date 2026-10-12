@@ -312,6 +312,15 @@ def _discard_scratch_inputs(tree_dir: Path, task_logger) -> None:
         )
 
 
+# IQ-TREE runs on one thread whatever the worker's budget. Replaying 34
+# production jobs on 3.1.4-dikarya1 (2026-10-10), a second thread gained 1.02x
+# on Quick Tree overall (up to 1.18x on the few alignments past ~700 patterns)
+# and made MFP+UFBoot+bnni runs ~20% slower, while holding a second core the
+# other phylo_high worker could use. One thread also makes every run
+# reproducible from its recorded seed, which -T 2 is not in any build.
+IQTREE_THREADS = 1
+
+
 def _get_thread_count(params: TreeBuilderParams) -> int:
     if params.threads:
         return params.threads
@@ -1231,8 +1240,8 @@ def _run_iqtree(
     """
     bootstrap = 0 if fast else validate_iqtree_ufboot_count("iqtree", params.bootstrap)
     prefix = str(output_newick.parent / "iqtree_run")
-    threads = _get_thread_count(params)
-    
+    threads = params.threads or IQTREE_THREADS
+
     # Sanitize FASTA to create safe IDs
     sanitized_fasta = output_newick.parent / "iqtree_input_sanitized.fasta"
     name_mapping = sanitize_fasta_headers(alignment_fasta, sanitized_fasta)

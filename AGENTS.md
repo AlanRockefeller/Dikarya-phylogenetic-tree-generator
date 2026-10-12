@@ -615,6 +615,13 @@ When a new CLI version is published:
   that script -- the release is clang 22 + static glibc, and a gcc build fuses
   FMAs differently and does not reproduce it. `-T 2` runs are not reproducible
   run to run in any build, stock included.
+
+  **IQ-TREE always runs with `-T 1`** (`IQTREE_THREADS` in
+  `tree_builder_service.py`), not the worker's `DIKARYA_WORKER_THREADS`
+  budget, which MAFFT, RAxML and MrBayes still use. On real production jobs a
+  second thread gained 1.02x on Quick Tree and cost ~20% on UFBoot (see
+  `ops/iqtree/README.md`), and one thread makes every tree reproducible from
+  its seed. Measure before raising it.
 - **RAxML-NG bootstrapping computes two support metrics, not one.**
   `_get_raxml_cmd` passes `--bs-metric fbp,tbe`, so RAxML writes
   `<prefix>.raxml.supportFBP` and `.supportTBE` and **no** bare

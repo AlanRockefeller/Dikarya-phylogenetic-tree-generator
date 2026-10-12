@@ -21,10 +21,15 @@ harness in `test_scripts/exact-speedups/`.
 **dikarya1 gives the same results, faster.** For the same input, options and seed, at
 `-T 1`, every output -- tree, UFBoot consensus and split supports, SH-aLRT values,
 model parameters, distances, the `.iqtree` report and the log apart from timings and
-the version line -- is byte-identical to the official 3.1.4 binary. `-T 2` (the main
-worker's Quick Tree) is not reproducible run to run in any build, stock included,
-because IQ-TREE schedules parsimony trees dynamically and seeds each thread's SH-aLRT
-stream separately.
+the version line -- is byte-identical to the official 3.1.4 binary. `-T 2` is not
+reproducible run to run in any build, stock included, because IQ-TREE schedules
+parsimony trees dynamically and seeds each thread's SH-aLRT stream separately.
+
+Since 2026-10-11 Dikarya runs IQ-TREE with `-T 1` on every worker (`IQTREE_THREADS` in
+`app/services/tree_builder_service.py`), so every production tree is reproducible from
+its recorded seed. Replaying 34 production jobs at both thread counts on dikarya1, a
+second thread gained 1.02x on Quick Tree overall (0.89x-1.18x, gaining only past ~700
+patterns) and made the three MFP+UFBoot+bnni jobs (58-80 taxa) 16-22% slower.
 
 ## Measured on this host (Xeon E5-2690 v4, 2 vCPUs, -T 1)
 
