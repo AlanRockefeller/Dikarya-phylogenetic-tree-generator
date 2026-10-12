@@ -24,6 +24,14 @@ PATCH=$HERE/0001-mafft-dikarya1-avx2.patch
 if [ "$(id -u)" -ne 0 ]; then echo "run as root" >&2; exit 77; fi
 grep -qw avx2 /proc/cpuinfo || { echo "this CPU has no AVX2; the patch would compile to the opt5 code paths only" >&2; exit 1; }
 [ -f "$PATCH" ] || { echo "missing $PATCH" >&2; exit 1; }
+# The identity self-test below is what makes this build safe to switch to, so a
+# missing reference stops the install rather than skipping the check.
+# SKIP_SELFTEST=1 installs an unchecked build, on purpose only.
+SKIP_SELFTEST=${SKIP_SELFTEST:-0}
+if [ ! -x "$REFERENCE" ] && [ "$SKIP_SELFTEST" != 1 ]; then
+    echo "no reference build at $REFERENCE (set REFERENCE=..., or SKIP_SELFTEST=1 to install unchecked)" >&2
+    exit 1
+fi
 
 rm -rf "$SRC"
 git clone --quiet "$UPSTREAM" "$SRC"
@@ -77,7 +85,9 @@ if [ -x "$REFERENCE" ]; then
     done
     [ "$status" -eq 0 ] || { echo "do not switch MAFFT_BINARY to this build" >&2; exit 1; }
 else
-    echo "no reference build at $REFERENCE; skipped the identity self-test" >&2
+    echo "SKIP_SELFTEST=1: this build was NOT checked against $REFERENCE;" \
+         "do not switch MAFFT_BINARY to it until it has been" >&2
+    exit 0
 fi
 
 echo "next: set MAFFT_BINARY=$PREFIX/bin/mafft in /etc/dikarya/dikarya.environment.live"
