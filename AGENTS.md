@@ -555,6 +555,18 @@ When a new CLI version is published:
   `DEGRADED`; a flip of a record ORIENT declined to call is an INFO line. When
   the ORIENT headers were not persisted the answer is reported as unknown
   (`disagreement=None`, `basis=counts`) rather than guessed from two totals.
+- **MAFFT's direction check is anchored on a confidently forward record.**
+  MAFFT keeps the first record's direction and turns the rest to match it.
+  When a job's first record was a reversed barcode ORIENT could not call, the
+  whole alignment came out reverse-complemented (14 jobs, e.g. y4y8, i7yl).
+  `_write_direction_anchored_input()` therefore hands MAFFT a scratch copy
+  (`input_raw.direction_anchor.fasta`, deleted afterwards) with the first
+  record ORIENT calls forward moved to the front. `_run_mafft` moves that row
+  back afterwards, so the output order is unchanged, and the line is logged as
+  `event=alignment.direction_anchor`. A job whose first record is already
+  forward, or that has no ITS landmark anywhere, runs exactly as before. ORIENT
+  itself also calls a record reverse on a strong reverse-strand 5.8S core when
+  the forward strand has no motif at all, without needing a primer-site flank.
 - **Quick Tree refuses individual sequences over
   `QUICK_TREE_MAX_SEQUENCE_BP` (10,000 bp).** The constant and the
   preset-detection live in `app/services/tree_parameter_validation.py`; the
