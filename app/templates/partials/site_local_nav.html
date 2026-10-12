@@ -132,7 +132,50 @@
         }
         Array.prototype.forEach.call(strip.querySelectorAll('[data-dk-local-menu]'), function (menu) {
             menu.addEventListener('dk-menu-open', function () { openMenu = menu; place(); });
+            hoverToOpen(menu);
         });
+        // A mouse opens a menu tab by hovering; click, touch and the keyboard
+        // still work as for any menu. Leaving the tab and its panel closes it
+        // after a short delay, so the pointer can cross the gap between them.
+        // A mouse click on the tab opens it the same way, or leaves it open if
+        // hovering already has, rather than toggling it shut.
+        function hoverToOpen(menu) {
+            var trigger = menu.querySelector('[data-dk-menu-trigger]');
+            var panel = document.getElementById(trigger.getAttribute('aria-controls'));
+            var hoverOpen = false;
+            var timer = null;
+            function enter(event) {
+                if (event.pointerType !== 'mouse' || drag) return;
+                clearTimeout(timer);
+                if (panel.hidden) {
+                    menu.dispatchEvent(new CustomEvent('dk-menu-show'));
+                    hoverOpen = !panel.hidden;
+                }
+            }
+            function leave(event) {
+                if (event.pointerType !== 'mouse' || !hoverOpen) return;
+                clearTimeout(timer);
+                timer = setTimeout(function () {
+                    hoverOpen = false;
+                    menu.dispatchEvent(new CustomEvent('dk-menu-hide'));
+                }, 200);
+            }
+            menu.addEventListener('pointerenter', enter);
+            menu.addEventListener('pointerleave', leave);
+            panel.addEventListener('pointerenter', enter);
+            panel.addEventListener('pointerleave', leave);
+            menu.addEventListener('click', function (event) {
+                if (event.pointerType !== 'mouse' || !trigger.contains(event.target)) return;
+                event.stopPropagation();
+                clearTimeout(timer);
+                if (panel.hidden) menu.dispatchEvent(new CustomEvent('dk-menu-show'));
+                hoverOpen = !panel.hidden;
+            }, true);
+            // Closed some other way (Esc, a click elsewhere): not hover-open any more.
+            new MutationObserver(function () {
+                if (panel.hidden) { hoverOpen = false; clearTimeout(timer); }
+            }).observe(panel, { attributes: true, attributeFilter: ['hidden'] });
+        }
         strip.addEventListener('scroll', place);
         window.addEventListener('resize', place);
 
