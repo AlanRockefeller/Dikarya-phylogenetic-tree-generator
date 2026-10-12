@@ -32,8 +32,8 @@
                 <a href="{{ url_for('main.sequence_entry') }}" class="journal-btn journal-btn-primary">
                     🧬 Tree Builder App
                 </a>
-                <a href="{{ url_for('main.voucher_labels') }}" class="journal-btn journal-btn-primary">
-                    🏷️ Voucher Labels
+                <a href="/labels" class="journal-btn journal-btn-primary">
+                    🏷️ Herbarium Label Generator
                 </a>
                 {% if current_user.is_authenticated %}
                 <a href="{{ url_for('user.user_jobs') }}" class="journal-btn journal-btn-outline">My Jobs</a>
