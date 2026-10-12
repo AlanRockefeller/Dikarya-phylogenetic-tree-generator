@@ -20,6 +20,12 @@ behaviour rather than breaking BLAST.
 A web restart kills a running thread. Its task then disappears when the
 "running" record ages out, and the page reports that rather than polling
 forever; a BLAST rerun is cheap because blast_service caches finished searches.
+
+A task belongs to the browser session that started it: the record carries a
+random owner token kept in that session, and a poll from any other session is
+answered as if the task did not exist. The task id alone is not enough, because
+it appears in the access log and a stored response can depend on the user
+(the iNat preview runs as current_user).
 """
 
 import json
@@ -28,7 +34,7 @@ import re
 import secrets
 import threading
 
-from flask import copy_current_request_context, current_app, g, jsonify
+from flask import copy_current_request_context, current_app, g, jsonify, session
 
 logger = logging.getLogger(__name__)
 
@@ -46,11 +52,21 @@ RUNNING_TTL_SECONDS = 330
 # inline as they always did.
 MAX_CONCURRENT_PER_PROCESS = 8
 _TASK_ID_RE = re.compile(r"^[A-Za-z0-9_-]{20,40}$")
+_OWNER_SESSION_KEY = "bgreq_owner"
 _slots = threading.BoundedSemaphore(MAX_CONCURRENT_PER_PROCESS)
 
 
 def wants_background(req) -> bool:
     return req.headers.get(BACKGROUND_HEADER) == "1"
+
+
+def _session_owner(create=False):
+    """This browser session's owner token for background tasks, or None."""
+    token = session.get(_OWNER_SESSION_KEY)
+    if not token and create:
+        token = secrets.token_urlsafe(16)
+        session[_OWNER_SESSION_KEY] = token
+    return token
 
 
 def _redis():
@@ -70,9 +86,10 @@ def start(kind, handler, *args):
         return None
     task_id = secrets.token_urlsafe(18)
     key = _KEY.format(task_id)
+    owner = _session_owner(create=True)
     try:
         conn = _redis()
-        conn.set(key, json.dumps({"state": "running", "kind": kind}),
+        conn.set(key, json.dumps({"state": "running", "kind": kind, "owner": owner}),
                  ex=RUNNING_TTL_SECONDS)
     except Exception as exc:
         _slots.release()
@@ -98,6 +115,7 @@ def start(kind, handler, *args):
             record = {
                 "state": "done",
                 "kind": kind,
+                "owner": owner,
                 "status": response.status_code,
                 "body": response.get_data(as_text=True),
             }
@@ -112,7 +130,8 @@ def start(kind, handler, *args):
 
 
 def fetch(task_id):
-    """The stored record for ``task_id``, or None when unknown or expired."""
+    """The stored record for ``task_id``, or None when unknown, expired or
+    started by another session."""
     if not _TASK_ID_RE.match(task_id or ""):
         return None
     raw = _redis().get(_KEY.format(task_id))
@@ -122,4 +141,9 @@ def fetch(task_id):
         record = json.loads(raw)
     except (ValueError, TypeError):
         return None
-    return record if isinstance(record, dict) else None
+    if not isinstance(record, dict):
+        return None
+    owner, mine = record.get("owner"), _session_owner()
+    if not (isinstance(owner, str) and mine and secrets.compare_digest(owner, mine)):
+        return None
+    return record
