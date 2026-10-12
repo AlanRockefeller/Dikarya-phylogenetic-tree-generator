@@ -1677,6 +1677,8 @@ def _run_mrbayes(
     printfreq = max(100, ngen // 100)
     seed = _resolve_seed(params)
 
+    mrbayes_threads = _get_thread_count(params)
+
     # Sanitize FASTA to create safe IDs before converting to NEXUS
     sanitized_fasta = output_newick.parent / "mrbayes_input_sanitized.fasta"
     name_mapping = sanitize_fasta_headers(alignment_fasta, sanitized_fasta)
@@ -1699,6 +1701,15 @@ def _run_mrbayes(
         with open(nexus_input, "a") as f:
             f.write("\nbegin mrbayes;\n")
             f.write("   set autoclose=yes nowarn=yes;\n")
+            # The worker's thread budget. The Dikarya build
+            # (ops/mrbayes/README.md) computes the chains' likelihoods on that
+            # many threads, or splits a single chain's by site pattern; the
+            # result is the same either way, and Ubuntu's mb ignores it here.
+            # It must come before the seed: every `set beagle...` command
+            # reruns MrBayes's analysis setup, which draws from the seeded
+            # random stream, so after `set seed` it would change the run.
+            if mrbayes_threads > 1:
+                f.write(f"   set beaglethreadcount={mrbayes_threads};\n")
             # Seeds are set explicitly so a Bayesian run is reproducible; MrBayes
             # otherwise seeds from the clock and records nothing.
             f.write(f"   set seed={seed} swapseed={seed};\n")
