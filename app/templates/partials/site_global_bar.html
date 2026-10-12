@@ -159,8 +159,17 @@
         // Menu-button behaviour for the What's New panel and the account and
         // signed-out menus:
         // Esc and click-outside close, focus returns to the trigger, and Tab
-        // cycles inside an open panel until it is closed.
-        var menus = Array.prototype.slice.call(document.querySelectorAll('[data-dk-menu]'));
+        // cycles inside an open panel until it is closed. The local nav's
+        // menu tabs (partials/site_local_nav.html) come after this script, so
+        // menus are collected once the page is parsed. A panel is found through
+        // its trigger's aria-controls, because a menu tab's panel sits outside
+        // the tab strip rather than inside the menu.
+        var menus = [];
+
+        function panelOf(menu) {
+            var trigger = menu.querySelector('[data-dk-menu-trigger]');
+            return document.getElementById(trigger.getAttribute('aria-controls'));
+        }
 
         function focusables(panel) {
             return Array.prototype.slice.call(panel.querySelectorAll('a[href], button:not([disabled])'))
@@ -169,7 +178,7 @@
 
         function close(menu, restoreFocus) {
             var trigger = menu.querySelector('[data-dk-menu-trigger]');
-            var panel = menu.querySelector('[data-dk-menu-panel]');
+            var panel = panelOf(menu);
             if (panel.hidden) return;
             panel.hidden = true;
             trigger.setAttribute('aria-expanded', 'false');
@@ -179,20 +188,21 @@
         function open(menu) {
             menus.forEach(function (other) { if (other !== menu) close(other, false); });
             var trigger = menu.querySelector('[data-dk-menu-trigger]');
-            var panel = menu.querySelector('[data-dk-menu-panel]');
+            var panel = panelOf(menu);
             panel.hidden = false;
             trigger.setAttribute('aria-expanded', 'true');
+            menu.dispatchEvent(new CustomEvent('dk-menu-open'));
             var items = focusables(panel);
             if (items.length) items[0].focus();
         }
 
-        menus.forEach(function (menu) {
+        function setUp(menu) {
             var trigger = menu.querySelector('[data-dk-menu-trigger]');
-            var panel = menu.querySelector('[data-dk-menu-panel]');
+            var panel = panelOf(menu);
             trigger.addEventListener('click', function () {
                 if (panel.hidden) { open(menu); } else { close(menu, true); }
             });
-            menu.addEventListener('keydown', function (event) {
+            function onKeydown(event) {
                 if (panel.hidden) return;
                 if (event.key === 'Escape') {
                     event.preventDefault();
@@ -215,12 +225,24 @@
                         items[0].focus();
                     }
                 }
-            });
-        });
+            }
+            menu.addEventListener('keydown', onKeydown);
+            if (!menu.contains(panel)) panel.addEventListener('keydown', onKeydown);
+        }
+
+        function collectMenus() {
+            menus = Array.prototype.slice.call(document.querySelectorAll('[data-dk-menu]'));
+            menus.forEach(setUp);
+        }
+        if (document.readyState === 'loading') {
+            document.addEventListener('DOMContentLoaded', collectMenus);
+        } else {
+            collectMenus();
+        }
 
         document.addEventListener('click', function (event) {
             menus.forEach(function (menu) {
-                if (!menu.contains(event.target)) close(menu, false);
+                if (!menu.contains(event.target) && !panelOf(menu).contains(event.target)) close(menu, false);
             });
         });
 
