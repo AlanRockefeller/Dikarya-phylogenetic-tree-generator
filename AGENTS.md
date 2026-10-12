@@ -328,13 +328,41 @@ Do not attempt to use sudo for anything else. The tree user is intentionally res
 
 ## What's New / Changelog System
 
-The "What's New" page at `/whats-new` shows changelog entries stored in PostgreSQL, linked in the header nav between "Journal Home" and "Tree Builder".
+The "What's New" page at `/whats-new` shows changelog entries stored in PostgreSQL, linked from the global bar's What's New menu and the footer (both defined in `app/navigation.py`; see "Site navigation" below).
 
 **When you (an agent) make a major user-visible change, draft a What's New entry but do not add it yet.** Do not add an entry for minor changes. Draft the title, body, and category, then ask the user exactly: **"Add this to What's New?"** Only after explicit approval, add it — see the `whats-new` skill for the exact command, categories, and troubleshooting.
 
 If the user directly asks to "add," "update," "publish," or "announce" something in What's New, that request itself is explicit approval. Do not ask for a second confirmation; choose the appropriate title, body, and category, then publish the entry.
 
 The add and list commands connect to the production PostgreSQL database and require escalated/outside-sandbox permissions on the first attempt — see the `whats-new` skill for the exact invocation and verification steps.
+
+## Site navigation
+
+Both layouts render one shared shell: a global bar (Journal | Workbench switcher, What's New, My Jobs, account menu), a tab row for the active section, and a footer. `journal/base_journal.html` is plain CSS and `base_modern.html` is Tailwind, but the shell is the same in both:
+
+- `app/navigation.py` defines the structure.
+- `templates/partials/site_{global_bar,local_nav,footer,theme}.html` holds the markup.
+- `static/css/site_shell.css` holds the styles.
+
+- **Add a tool or page in `app/navigation.py`, not in a template.**
+  - `JOURNAL_NAV` and `WORKBENCH_NAV` drive the tabs.
+  - `FOOTER_COLUMNS` drives the footer.
+  - A Workbench item also needs a `description` and an `icon`, because `workbench_tools()` turns the same list into the cards on `/workbench`.
+- **Items name endpoints, not URLs.** An item whose endpoint is not registered falls back to its `fallback` or is left out, so the config can name a page before it exists.
+- **Active state is computed on the server.**
+  - The section comes from the blueprint: `journal`, otherwise Workbench.
+  - The tab comes from the endpoint plus the item's `also` list.
+  - `aria-current` is `"page"` on the item's own page and `"true"` on a page it owns through `also`.
+  - Do not reintroduce per-template `nav_*` or `subtitle` blocks. The layouts do not declare them, so Jinja would silently ignore them.
+- **`site_nav` is a callable cached on `g`**, so pages that do not render the shell never run the My Jobs count query. The badge counts queued or running jobs from the last 7 days, so a stranded job cannot pin it, and it fails open like the What's New badge.
+- **`site_shell.css` is plain CSS because Journal pages do not load Tailwind.**
+  - Every class is `dk-` prefixed.
+  - Resets are wrapped in `:where()` so component rules win.
+  - Dark mode is keyed on both `.dark` (Tailwind) and `[data-theme="dark"]` (journal.css).
+  - Bump its `?v=` in both layouts whenever it changes. Static files are cached, and the same goes for `journal.css`.
+- **`partials/site_theme.html` must come first in `<head>`.** It sets both `.dark` and `data-theme` before first paint, and exposes `window.dikaryaTheme`. `localStorage['theme']` only ever holds `"light"` or `"dark"`; System means the key is absent. Never store `"system"`, because a page cached from before the shell reads any non-`"dark"` value as light.
+- **The account menu (signed in) and the signed-out menu share** the `theme_group()` and `help_and_updates()` macros in `site_global_bar.html`. Change them there so the two menus cannot drift apart. On phones both menus also carry What's New, whose bar button is hidden below 768px.
+- **Gold is reserved** for the active switcher segment, the active-tab underline and badges. Nothing in the navigation is a gold button.
 
 ## Claude Review ("Analyze with Claude")
 
