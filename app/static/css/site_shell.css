@@ -575,6 +575,10 @@
     min-width: 200px;
 }
 
+.dk-local-panel .dk-menu-item[aria-current] {
+    font-weight: 600;
+}
+
 .dk-shell.dk-local :focus-visible {
     outline-color: var(--dk-focus-on-light);
     outline-offset: -3px;
