@@ -81,22 +81,27 @@ status=0
 n=0
 # the shapes _run_raxml() and _run_moose() produce: tree + autoMRE bootstrap
 # with both support metrics, the KH stopping rule, FreeRate/+I models, ML search
-# only, a fixed bootstrap count, and MOOSE model selection
+# only, a fixed bootstrap count, and MOOSE model selection -- each at --threads 1
+# and at --threads 2, the main worker's budget, where the bootstopping test runs
+# at the coarse-grained workers' barrier
 while IFS= read -r opts; do
-    n=$((n+1))
-    for side in ref new; do
-        bin=$REF; [ "$side" = new ] && bin=$NEW
-        mkdir -p "$tmp/$side$n"
-        # shellcheck disable=SC2086
-        nice -n 10 "$bin" --msa "$tmp/aln.fasta" $opts --threads 1 --seed 20261009 --redo \
-            --prefix "$tmp/$side$n/run" >/dev/null 2>&1 || { echo "$side build failed: $opts" >&2; status=1; }
+    for threads in 1 2; do
+        n=$((n+1))
+        for side in ref new; do
+            bin=$REF; [ "$side" = new ] && bin=$NEW
+            mkdir -p "$tmp/$side$n"
+            # shellcheck disable=SC2086
+            nice -n 10 "$bin" --msa "$tmp/aln.fasta" $opts --threads "$threads" --seed 20261009 --redo \
+                --prefix "$tmp/$side$n/run" >/dev/null 2>&1 \
+                || { echo "$side build failed: --threads $threads $opts" >&2; status=1; }
+        done
+        if python3 -I "$HERE/compare-raxml-runs.py" "$tmp/ref$n/run" "$tmp/new$n/run"; then
+            echo "self-test ok:   --threads $threads $opts"
+        else
+            echo "self-test FAIL: --threads $threads $opts" >&2
+            status=1
+        fi
     done
-    if python3 -I "$HERE/compare-raxml-runs.py" "$tmp/ref$n/run" "$tmp/new$n/run"; then
-        echo "self-test ok:   $opts"
-    else
-        echo "self-test FAIL: $opts" >&2
-        status=1
-    fi
 done <<'EOF'
 --all --model GTR+G --tree pars{3},rand{2} --bs-trees autoMRE{100} --bs-metric fbp,tbe
 --all --model HKY+I+G --tree pars{2} --bs-trees autoMRE{60} --bs-metric fbp,tbe --stop-rule kh-mult

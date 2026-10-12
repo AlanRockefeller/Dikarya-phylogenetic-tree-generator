@@ -50,17 +50,36 @@ def same_content(pa: Path, pb: Path) -> bool:
     return json.dumps(ja, sort_keys=True) == json.dumps(jb, sort_keys=True)
 
 
+WORKER = re.compile(r"\[worker #(\d+)\]")
+MOOSE_MODEL = re.compile(r"Evaluated model \(\s*\d+/\d+\)")
+
+
 def log_lines(prefix: Path) -> list:
     path = Path(str(prefix) + ".raxml.log")
     if not path.is_file():
         return None
-    out = []
+    out, workers, moose_models = [], {}, []
     for line in path.read_text(errors="replace").splitlines():
         # "[hh:mm:ss] text" and "[hh:mm:ss logLH] text": drop the clock, keep the logLH
         line = re.sub(r"^\[\d\d:\d\d:\d\d(?: ([^\]]*))?\] ", lambda m: (m.group(1) or "") + " ", line)
-        if not VOLATILE.search(line):
+        if VOLATILE.search(line):
+            continue
+        if MOOSE_MODEL.search(line):
+            # MOOSE evaluates models concurrently at --threads 2 and numbers
+            # them in completion order; compare the set of results.
+            moose_models.append(MOOSE_MODEL.sub("Evaluated model", line))
+            continue
+        worker = WORKER.search(line)
+        if worker:
+            # At --threads 2 the coarse-grained workers log concurrently, so
+            # their lines interleave differently from run to run even in stock;
+            # compare each worker's lines in its own order.
+            workers.setdefault(int(worker.group(1)), []).append(line)
+        else:
             out.append(line)
-    return out
+    for worker_id in sorted(workers):
+        out.extend(workers[worker_id])
+    return out + sorted(moose_models)
 
 
 def main() -> int:

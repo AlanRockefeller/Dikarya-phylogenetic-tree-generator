@@ -1174,7 +1174,7 @@ index 4f3adb8..403bc99 100644
 2.43.0
 
 
-From a93d95eb87e9f12eb7ff3e517aab3be835eece03 Mon Sep 17 00:00:00 2001
+From f0d37e2eba843653b881f4f39dfefda1398dea5d Mon Sep 17 00:00:00 2001
 From: Alan Rockefeller <alanrockefeller@gmail.com>
 Date: Fri, 9 Oct 2026 06:02:56 +0000
 Subject: [PATCH 6/7] AVX2 edge log-likelihood (site repeats): 4-state path
@@ -1201,7 +1201,7 @@ Co-authored-by: Claude Opus 5.5 <noreply@anthropic.com>
  1 file changed, 254 insertions(+)
 
 diff --git a/src/corax/kernel/avx2/core_likelihood_avx2.c b/src/corax/kernel/avx2/core_likelihood_avx2.c
-index a77c98a..fb6d78c 100644
+index a77c98a..6ab25c9 100644
 --- a/src/corax/kernel/avx2/core_likelihood_avx2.c
 +++ b/src/corax/kernel/avx2/core_likelihood_avx2.c
 @@ -20,6 +20,7 @@
@@ -1212,10 +1212,10 @@ index a77c98a..fb6d78c 100644
  #include <limits.h>
  
  CORAX_EXPORT double
-@@ -690,6 +691,238 @@ corax_core_edge_loglikelihood_ii_avx2(unsigned int         states,
+@@ -689,6 +690,238 @@ corax_core_edge_loglikelihood_ii_avx2(unsigned int         states,
+   return logl;
  }
  
- CORAX_EXPORT
 +/* 4-state specialization of corax_core_edge_loglikelihood_repeats_generic_avx2():
 + * the same arithmetic, operation for operation, with the p-matrix product
 + * computed from the matrix columns (see matvec_4x4_cols.h) instead of a
@@ -1448,9 +1448,9 @@ index a77c98a..fb6d78c 100644
 +  return logl;
 +}
 +
+ CORAX_EXPORT
  double corax_core_edge_loglikelihood_repeats_generic_avx2(
      unsigned int         states,
-     unsigned int         sites,
 @@ -715,6 +948,27 @@ double corax_core_edge_loglikelihood_repeats_generic_avx2(
  {
    CORAX_UNUSED(child_sites);
@@ -1483,7 +1483,7 @@ index a77c98a..fb6d78c 100644
 2.43.0
 
 
-From 44ed7bff86067e65a4bfdf6f7d143d821aa0155a Mon Sep 17 00:00:00 2001
+From 236046f7ab195e1d037f8f1da059781539b23327 Mon Sep 17 00:00:00 2001
 From: Alan Rockefeller <alanrockefeller@gmail.com>
 Date: Fri, 9 Oct 2026 06:02:56 +0000
 Subject: [PATCH 7/7] AVX2 branch-length derivatives: 4-state fast path
@@ -1517,13 +1517,13 @@ Co-authored-by: Claude Opus 5.5 <noreply@anthropic.com>
  1 file changed, 171 insertions(+), 42 deletions(-)
 
 diff --git a/src/corax/kernel/avx2/core_derivatives_avx2.c b/src/corax/kernel/avx2/core_derivatives_avx2.c
-index ebba3ce..9390cb8 100644
+index ebba3ce..c297a62 100644
 --- a/src/corax/kernel/avx2/core_derivatives_avx2.c
 +++ b/src/corax/kernel/avx2/core_derivatives_avx2.c
-@@ -1537,6 +1537,52 @@ corax_core_update_sumtable_ti_avx2(unsigned int         states,
+@@ -1536,6 +1536,52 @@ corax_core_update_sumtable_ti_avx2(unsigned int         states,
+   return CORAX_SUCCESS;
  }
  
- CORAX_EXPORT
 +/* Derivative step for 4 adjacent sites whose (LH, 1st, 2nd derivative)
 + * terms are stored at site_lk[0..15], 4 per site; pw points at the pattern
 + * weight of the first of the 4 sites. */
@@ -1570,9 +1570,9 @@ index ebba3ce..9390cb8 100644
 +  }
 +}
 +
+ CORAX_EXPORT
  int corax_core_likelihood_derivatives_avx2(unsigned int        states,
                                             unsigned int        states_padded,
-                                            unsigned int        rate_cats,
 @@ -1570,17 +1616,12 @@ int corax_core_likelihood_derivatives_avx2(unsigned int        states,
      eq_weights &= (rate_weights[i] == rate_weights[0]);
    }

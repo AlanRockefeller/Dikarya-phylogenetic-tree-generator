@@ -35,7 +35,8 @@ starting trees and support options (inputs rebuilt exactly as `_run_raxml` does:
 replaying a job's command reproduces its stored trees byte for byte), stock and
 dikarya1 interleaved (ABBA), CPU time:
 
-TIMINGS
+*Pending: the timing table has not been written up yet, so this build has no
+published speedup. Do not switch `RAXML_BINARY` on the strength of this section.*
 
 The gain is the same at `--threads 2` (two coarse-grained workers, how the main
 worker runs RAxML), since each worker runs the same single-threaded searches.
@@ -84,7 +85,9 @@ LTO, a vectorized `log()`), the search algorithm, or thread scheduling.
   bit. The repeat-class loop was checked separately (renumbering would not show in
   the output). A build that fills every reused buffer with NaN/junk
   (`-DCORAX_REPEATS_POISON_TEST`) gives identical output.
-- End to end, dikarya1 vs stock 2.0.3: SUITE
+- End to end, dikarya1 vs stock 2.0.3 on real job alignments: *pending*. The
+  install script's synthetic self-test (five command shapes, each at `--threads 1`
+  and `--threads 2`) matched stock 2.0.3 on 2026-10-12.
 
 ## Installing / switching / rolling back
 
@@ -104,7 +107,7 @@ stopping rule, `+I+G`, `+I+R3`, ML search only, MOOSE). It needs `git`, `cmake`,
 `g++` and network access to GitHub. Then point Dikarya at it -- comment out any
 existing `RAXML_BINARY` line rather than adding a second one -- and have an agent
 restart the workers with the guarded wrapper (see "Restarting Dikarya services" in
-`CLAUDE.md`):
+`AGENTS.md`):
 
 ```zsh
 grep -n RAXML_BINARY /etc/dikarya/dikarya.environment.live
