@@ -349,6 +349,8 @@ Both layouts render one shared shell: a global bar (Journal | Workbench switcher
   - `FOOTER_COLUMNS` drives the footer.
   - A Workbench item also needs a `description` and an `icon`, because `workbench_tools()` turns the same list into the cards on `/workbench`.
 - **Items name endpoints, not URLs.** An item whose endpoint is not registered falls back to its `fallback` or is left out, so the config can name a page before it exists.
+- **A page Flask does not serve gets a `url` instead of an `endpoint`.** The iNaturalist Label Generator at `/labels` is a separate app, not another name for Voucher Labels; it appears as Herbarium Labels. A `url` item is never marked active. Do not add a Flask route at `/labels`.
+- **An item with `children` is a menu tab**, such as Labels (Herbarium Labels and Voucher Labels). It is a button, not a link. It is marked `aria-current="true"` when one of its children is the current page, and each child still gets its own Workbench card. Its panel sits in the nav row outside the scrolling tab strip, which would clip it. `site_local_nav.html` places the panel under its tab, and the global bar's menu script handles opening and closing.
 - **Active state is computed on the server.**
   - The section comes from the blueprint: `journal`, otherwise Workbench.
   - The tab comes from the endpoint plus the item's `also` list.
