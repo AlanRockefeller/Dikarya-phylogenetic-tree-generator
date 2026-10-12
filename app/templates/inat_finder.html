@@ -51,7 +51,7 @@
 <div class="max-w-6xl mx-auto">
     <header class="mb-8 grid gap-6 lg:grid-cols-[minmax(0,1fr)_320px] lg:items-end">
         <div>
-            <h1 class="font-serif text-4xl sm:text-5xl font-semibold leading-tight text-journal-dark dark:text-white">
+            <h1 class="dk-h1 text-journal-dark dark:text-white">
                 Find the correct iNaturalist observation
             </h1>
             <p class="mt-3 max-w-3xl text-base sm:text-lg leading-relaxed text-gray-600 dark:text-gray-300">
@@ -69,7 +69,7 @@
     </header>
 
     <div class="grid gap-6 lg:grid-cols-[minmax(0,1fr)_340px]">
-        <section class="rounded-2xl border border-gray-200 dark:border-gray-700 bg-white dark:bg-journal-green shadow-sm overflow-hidden">
+        <section class="rounded-2xl border border-gray-200 dark:border-gray-700 bg-white dark:bg-journal-panel shadow-sm overflow-hidden">
             <form id="finder-form" class="p-5 sm:p-7" novalidate>
                 {# The observation number is the one thing every search needs, in
                    either mode, so it sits above the mode-specific panels. #}
@@ -79,7 +79,7 @@
                         <i class="fas fa-hashtag absolute left-4 top-1/2 -translate-y-1/2 text-gray-400"></i>
                         <input id="observation-input" type="text" inputmode="url" maxlength="200" autocomplete="off"
                             placeholder="187067126 or an iNaturalist observation URL" required
-                            class="w-full rounded-xl border border-gray-300 dark:border-gray-600 bg-white dark:bg-journal-dark py-3 pl-11 pr-4 font-mono text-lg text-journal-dark dark:text-white placeholder:font-sans placeholder:text-base placeholder:text-gray-400 focus:border-journal-gold focus:ring-journal-gold">
+                            class="w-full rounded-xl border border-gray-300 dark:border-gray-600 bg-white dark:bg-journal-dark py-3 pl-11 pr-4 font-mono text-lg text-journal-dark dark:text-white placeholder:font-sans placeholder:text-base focus:border-journal-gold focus:ring-journal-gold">
                     </div>
                     <p id="short-id-note" class="hidden mt-2 rounded-lg bg-amber-50 dark:bg-amber-950/40 px-3 py-2 text-sm text-amber-800 dark:text-amber-200">
                         <i class="fas fa-circle-info mr-1"></i> Five digits or fewer may be a Mushroom Observer number.
@@ -106,7 +106,7 @@
                                     <i class="fas fa-leaf absolute left-4 top-1/2 -translate-y-1/2 text-gray-400"></i>
                                     <input id="clue-genus" type="text" maxlength="160" autocomplete="off" placeholder="e.g. Amanita"
                                         role="combobox" aria-expanded="false" aria-autocomplete="list" aria-controls="clue-genus-suggestions"
-                                        class="w-full rounded-xl border border-gray-300 dark:border-gray-600 bg-white dark:bg-journal-dark py-3 pl-11 pr-4 text-journal-dark dark:text-white placeholder:text-gray-400 focus:border-journal-gold focus:ring-journal-gold">
+                                        class="w-full rounded-xl border border-gray-300 dark:border-gray-600 bg-white dark:bg-journal-dark py-3 pl-11 pr-4 text-journal-dark dark:text-white focus:border-journal-gold focus:ring-journal-gold">
                                     <ul id="clue-genus-suggestions" role="listbox" aria-label="Matching genera"
                                         class="hidden absolute left-0 right-0 top-full z-20 mt-1 max-h-72 overflow-auto rounded-xl border border-gray-200 dark:border-gray-600 bg-white dark:bg-journal-dark py-1 shadow-lg"></ul>
                                 </div>
@@ -127,7 +127,7 @@
                                     <i class="fas fa-sitemap absolute left-4 top-1/2 -translate-y-1/2 text-gray-400"></i>
                                     <input id="clue-family" type="text" maxlength="160" autocomplete="off" placeholder="e.g. Amanitaceae"
                                         role="combobox" aria-expanded="false" aria-autocomplete="list" aria-controls="clue-family-suggestions"
-                                        class="w-full rounded-xl border border-gray-300 dark:border-gray-600 bg-white dark:bg-journal-dark py-3 pl-11 pr-4 text-journal-dark dark:text-white placeholder:text-gray-400 focus:border-journal-gold focus:ring-journal-gold">
+                                        class="w-full rounded-xl border border-gray-300 dark:border-gray-600 bg-white dark:bg-journal-dark py-3 pl-11 pr-4 text-journal-dark dark:text-white focus:border-journal-gold focus:ring-journal-gold">
                                     <ul id="clue-family-suggestions" role="listbox" aria-label="Matching families"
                                         class="hidden absolute left-0 right-0 top-full z-20 mt-1 max-h-72 overflow-auto rounded-xl border border-gray-200 dark:border-gray-600 bg-white dark:bg-journal-dark py-1 shadow-lg"></ul>
                                 </div>
@@ -147,7 +147,7 @@
                                 <div class="mt-2 relative">
                                     <i class="fas fa-fingerprint absolute left-4 top-1/2 -translate-y-1/2 text-gray-400"></i>
                                     <input id="clue-taxon" type="text" maxlength="160" autocomplete="off" placeholder="e.g. 48419"
-                                        class="w-full rounded-xl border border-gray-300 dark:border-gray-600 bg-white dark:bg-journal-dark py-3 pl-11 pr-4 text-journal-dark dark:text-white placeholder:text-gray-400 focus:border-journal-gold focus:ring-journal-gold">
+                                        class="w-full rounded-xl border border-gray-300 dark:border-gray-600 bg-white dark:bg-journal-dark py-3 pl-11 pr-4 text-journal-dark dark:text-white focus:border-journal-gold focus:ring-journal-gold">
                                 </div>
                                 <p class="mt-1 text-xs text-gray-500 dark:text-gray-400">Matches that taxon and everything below it, at any rank.</p>
                             </div>
@@ -157,7 +157,7 @@
                                 <div class="mt-2 relative">
                                     <i class="fas fa-user absolute left-4 top-1/2 -translate-y-1/2 text-gray-400"></i>
                                     <input id="clue-user" type="text" maxlength="160" autocomplete="off" placeholder="iNaturalist username"
-                                        class="w-full rounded-xl border border-gray-300 dark:border-gray-600 bg-white dark:bg-journal-dark py-3 pl-11 pr-4 text-journal-dark dark:text-white placeholder:text-gray-400 focus:border-journal-gold focus:ring-journal-gold">
+                                        class="w-full rounded-xl border border-gray-300 dark:border-gray-600 bg-white dark:bg-journal-dark py-3 pl-11 pr-4 text-journal-dark dark:text-white focus:border-journal-gold focus:ring-journal-gold">
                                 </div>
                             </div>
 
@@ -166,7 +166,7 @@
                                 <div class="mt-2 relative">
                                     <i class="fas fa-people-group absolute left-4 top-1/2 -translate-y-1/2 text-gray-400"></i>
                                     <input id="clue-project" type="text" maxlength="200" autocomplete="off" placeholder="Project ID, slug, URL, or exact title"
-                                        class="w-full rounded-xl border border-gray-300 dark:border-gray-600 bg-white dark:bg-journal-dark py-3 pl-11 pr-4 text-journal-dark dark:text-white placeholder:text-gray-400 focus:border-journal-gold focus:ring-journal-gold">
+                                        class="w-full rounded-xl border border-gray-300 dark:border-gray-600 bg-white dark:bg-journal-dark py-3 pl-11 pr-4 text-journal-dark dark:text-white focus:border-journal-gold focus:ring-journal-gold">
                                 </div>
                             </div>
                         </div>
@@ -217,7 +217,7 @@
                             <i id="search-term-icon" class="fas fa-leaf absolute left-4 top-1/2 -translate-y-1/2 text-gray-400"></i>
                             <input id="search-term" type="text" maxlength="160" autocomplete="off" placeholder="e.g. Amanita"
                                 role="combobox" aria-expanded="false" aria-autocomplete="list" aria-controls="taxon-suggestions"
-                                class="w-full rounded-xl border border-gray-300 dark:border-gray-600 bg-white dark:bg-journal-dark py-3 pl-11 pr-4 text-journal-dark dark:text-white placeholder:text-gray-400 focus:border-journal-gold focus:ring-journal-gold">
+                                class="w-full rounded-xl border border-gray-300 dark:border-gray-600 bg-white dark:bg-journal-dark py-3 pl-11 pr-4 text-journal-dark dark:text-white focus:border-journal-gold focus:ring-journal-gold">
                             <ul id="taxon-suggestions" role="listbox" aria-label="Matching taxa"
                                 class="hidden absolute left-0 right-0 top-full z-20 mt-1 max-h-80 overflow-auto rounded-xl border border-gray-200 dark:border-gray-600 bg-white dark:bg-journal-dark py-1 shadow-lg"></ul>
                         </div>
@@ -248,7 +248,7 @@
                                 <label for="search-mode-auto" class="cursor-pointer rounded-xl border border-gray-200 dark:border-gray-600 p-4 transition-colors hover:border-journal-gold">
                                     <i class="fas fa-wand-magic-sparkles text-journal-gold" aria-hidden="true"></i>
                                     <span class="ml-2 font-semibold text-journal-dark dark:text-white">Automatic search</span>
-                                    <span class="mt-1 block text-xs text-gray-500 dark:text-gray-400">Recommended. Any combination of clues, widening until it finds a match.</span>
+                                    <span class="mt-1 block text-xs text-gray-600 dark:text-gray-300">Recommended. Any combination of clues, widening until it finds a match.</span>
                                 </label>
                                 <input class="finder-search-mode sr-only" type="radio" name="search-mode" value="manual" id="search-mode-manual">
                                 <label for="search-mode-manual" class="cursor-pointer rounded-xl border border-gray-200 dark:border-gray-600 p-4 transition-colors hover:border-journal-gold">
@@ -304,10 +304,10 @@
         </section>
 
         <aside class="space-y-6">
-            <section id="progress-panel" class="rounded-2xl border border-gray-200 dark:border-gray-700 bg-white dark:bg-journal-green p-5 shadow-sm">
+            <section id="progress-panel" class="rounded-2xl border border-gray-200 dark:border-gray-700 bg-white dark:bg-journal-panel p-5 shadow-sm">
                 <div class="flex items-center justify-between gap-3">
                     <h2 class="font-semibold text-journal-dark dark:text-white">Search progress</h2>
-                    <span id="progress-percent" class="font-mono text-sm font-semibold text-journal-gold">0%</span>
+                    <span id="progress-percent" class="font-mono text-sm font-semibold text-journal-gold-ink dark:text-journal-gold">0%</span>
                 </div>
                 <div class="mt-4 h-3 overflow-hidden rounded-full bg-gray-200 dark:bg-journal-dark" role="progressbar" aria-label="Search progress" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0" id="progress-track">
                     <div id="progress-fill" class="finder-progress-fill h-full w-0 rounded-full bg-gradient-to-r from-journal-green to-journal-gold"></div>
@@ -330,7 +330,7 @@
                 </div>
             </section>
 
-            <section class="rounded-2xl border border-gray-200 dark:border-gray-700 bg-white dark:bg-journal-green p-5 text-sm shadow-sm">
+            <section class="rounded-2xl border border-gray-200 dark:border-gray-700 bg-white dark:bg-journal-panel p-5 text-sm shadow-sm">
                 <h2 class="font-semibold text-journal-dark dark:text-white"><i class="fas fa-palette mr-2 text-journal-gold"></i>Result colours</h2>
                 <p class="mt-2 text-xs text-gray-500 dark:text-gray-400">Each match is marked with its iNaturalist iconic-taxon colour.</p>
                 <ul class="mt-3 grid grid-cols-2 gap-2 text-xs text-gray-700 dark:text-gray-200">
@@ -366,8 +366,8 @@
     <section id="results-section" class="hidden mt-8" aria-live="polite">
         <div class="flex flex-wrap items-end justify-between gap-3">
             <div>
-                <p class="text-sm font-semibold uppercase tracking-wider text-journal-gold">Results</p>
-                <h2 id="results-heading" class="mt-1 font-serif text-3xl font-semibold text-journal-dark dark:text-white"></h2>
+                <p class="text-sm font-semibold uppercase tracking-wider text-journal-gold-ink dark:text-journal-gold">Results</p>
+                <h2 id="results-heading" class="mt-1 dk-h2 text-journal-dark dark:text-white"></h2>
             </div>
             <p id="results-summary" class="text-sm text-gray-500 dark:text-gray-400"></p>
         </div>
@@ -378,7 +378,7 @@
            deliberately the first thing under the heading. #}
         <div id="keep-looking" role="group" aria-labelledby="keep-looking-heading"
             class="hidden mt-5 rounded-2xl border-2 border-journal-gold bg-journal-gold/10 p-5">
-            <h3 id="keep-looking-heading" class="font-serif text-xl font-semibold text-journal-dark dark:text-white">
+            <h3 id="keep-looking-heading" class="dk-h3 text-journal-dark dark:text-white">
                 <i class="fas fa-circle-question mr-2 text-journal-gold" aria-hidden="true"></i>Not the observation you were looking for?
             </h3>
             <p id="keep-looking-message" class="mt-2 text-sm text-gray-700 dark:text-gray-200"></p>
@@ -403,12 +403,12 @@
         <pre id="search-log" class="max-h-80 overflow-auto whitespace-pre-wrap p-5 font-mono text-xs leading-6 text-gray-300"></pre>
     </section>
 
-    <footer class="mt-8 text-center text-xs text-gray-500 dark:text-gray-400">
+    <footer class="mt-8 text-center text-xs text-gray-600 dark:text-gray-400">
         Web interface based on <a href="https://github.com/AlanRockefeller/inat.finder.py" target="_blank" rel="noopener" class="font-semibold text-journal-green dark:text-journal-gold hover:underline">inat.finder.py v1.8.1</a> by Alan Rockefeller. iNaturalist data is provided by the iNaturalist API.
     </footer>
 </div>
 {% endblock %}
 
 {% block scripts %}
-<script src="{{ url_for('static', filename='js/inat_finder.js') }}?v=7" defer></script>
+<script src="{{ url_for('static', filename='js/inat_finder.js') }}?v=8" defer></script>
 {% endblock %}

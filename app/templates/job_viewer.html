@@ -47,7 +47,7 @@
 <div class="mb-4">
     <div class="flex flex-col lg:flex-row lg:items-end gap-3">
         <div class="min-w-0">
-            <h2 class="text-2xl font-bold text-journal-dark dark:text-gray-100 flex items-center">
+            <h1 class="dk-h1 text-journal-dark dark:text-gray-100 flex items-center">
                 <i class="fas fa-tree text-journal-gold mr-3"></i>
                 {% if view_only %}
                 Tree Viewer <span class="ml-3 text-lg font-normal text-gray-400 dark:text-gray-500">(Viewing
@@ -55,7 +55,7 @@
                 {% else %}
                 Tree Viewer
                 {% endif %}
-            </h2>
+            </h1>
             {% set align_raw = job_details.get('alignment_method', 'mafft') %}
             {% set tree_raw = job_details.get('tree_method', 'nj') %}
             {% set trim_raw = job_details.get('trimming_method', 'none') %}
@@ -118,18 +118,18 @@
         <div id="tree-title-actions" class="flex flex-wrap items-center gap-2 lg:ml-auto shrink-0">
             {% if view_only %}
             <a id="btn-make-copy" href="{{ url_for('main.sequence_entry', clone_job_id=job_id) }}"
-                class="px-3 py-2 text-sm font-medium rounded-lg border border-gray-300 dark:border-gray-600 bg-white dark:bg-journal-green text-gray-700 dark:text-gray-100 hover:border-journal-gold transition-colors flex items-center gap-2"
+                class="px-3 py-2 text-sm font-medium rounded-lg border border-gray-300 dark:border-gray-600 bg-white dark:bg-journal-panel text-gray-700 dark:text-gray-100 hover:border-journal-gold transition-colors flex items-center gap-2"
                 title="Create a new submission with these sequences.">
                 <i class="fa fa-clone"></i> Make Editable Copy
             </a>
             {% endif %}
             <button type="button"
-                class="px-3 py-2 text-sm font-medium rounded-lg border border-gray-300 dark:border-gray-600 bg-white dark:bg-journal-green text-gray-700 dark:text-gray-100 hover:border-journal-gold transition-colors flex items-center gap-2 disabled:opacity-50 disabled:cursor-not-allowed"
+                class="px-3 py-2 text-sm font-medium rounded-lg border border-gray-300 dark:border-gray-600 bg-white dark:bg-journal-panel text-gray-700 dark:text-gray-100 hover:border-journal-gold transition-colors flex items-center gap-2 disabled:opacity-50 disabled:cursor-not-allowed"
                 id="btn-alignment-viewer" title="Open the Alignment Viewer for visible/selected tree sequences (A)">
                 <i class="fa fa-stream"></i> Alignment Viewer
             </button>
             <button type="button"
-                class="px-3 py-2 text-sm font-medium rounded-lg border border-gray-300 dark:border-gray-600 bg-white dark:bg-journal-green text-gray-700 dark:text-gray-100 hover:border-journal-gold transition-colors flex items-center gap-2"
+                class="px-3 py-2 text-sm font-medium rounded-lg border border-gray-300 dark:border-gray-600 bg-white dark:bg-journal-panel text-gray-700 dark:text-gray-100 hover:border-journal-gold transition-colors flex items-center gap-2"
                 id="btn-annotations"
                 title="Label clades beside the tree — subgenera, sections, subsections or any custom grouping — on independently styled layers.">
                 <i class="fa fa-tags"></i> Annotations
@@ -139,7 +139,7 @@
                JavaScript fails to start; the controller only adds click-away and Escape. #}
             <details id="export-menu-wrap" class="relative">
                 <summary id="btn-export-menu"
-                    class="px-3 py-2 text-sm font-medium rounded-lg border border-gray-300 dark:border-gray-600 bg-white dark:bg-journal-green text-gray-700 dark:text-gray-100 hover:border-journal-gold transition-colors flex items-center gap-2 cursor-pointer select-none"
+                    class="px-3 py-2 text-sm font-medium rounded-lg border border-gray-300 dark:border-gray-600 bg-white dark:bg-journal-panel text-gray-700 dark:text-gray-100 hover:border-journal-gold transition-colors flex items-center gap-2 cursor-pointer select-none"
                     title="Download the tree, a figure, or the sequences">
                     <i class="fas fa-download"></i> Export <i class="fas fa-chevron-down text-[10px] opacity-70"></i>
                 </summary>
@@ -228,7 +228,7 @@
     <div class="fixed inset-0 z-10 overflow-y-auto">
         <div class="flex min-h-full items-center justify-center p-4">
             <div
-                class="relative w-full max-w-2xl max-h-[85vh] overflow-y-auto rounded-xl bg-white dark:bg-journal-green shadow-2xl border border-gray-200 dark:border-journal-dark">
+                class="relative w-full max-w-2xl max-h-[85vh] overflow-y-auto rounded-xl bg-white dark:bg-journal-panel shadow-2xl border border-gray-200 dark:border-journal-dark">
                 <div class="px-5 py-4 border-b border-gray-200 dark:border-journal-dark flex items-center justify-between">
                     <h3 id="tree-shortcuts-title" class="text-lg font-bold text-journal-dark dark:text-gray-100">
                         Tree Viewer Shortcuts &amp; Editing Guide
@@ -331,7 +331,7 @@
     <div class="fixed inset-0 z-10 overflow-y-auto">
         <div class="flex min-h-full items-center justify-center p-4">
             <div
-                class="relative w-full max-w-3xl rounded-xl bg-white dark:bg-journal-green shadow-2xl border border-gray-200 dark:border-journal-dark overflow-hidden">
+                class="relative w-full max-w-3xl rounded-xl bg-white dark:bg-journal-panel shadow-2xl border border-gray-200 dark:border-journal-dark overflow-hidden">
                 <div class="px-5 py-4 border-b border-gray-200 dark:border-journal-dark flex items-center justify-between">
                     <div>
                         <h3 id="rename-modal-title" class="text-lg font-bold text-journal-dark dark:text-gray-100">
@@ -368,7 +368,7 @@
 
 <!-- Edit annotation members while the tree stays interactive -->
 <div id="annotation-membership-picker"
-    class="fixed bottom-4 left-1/2 z-40 hidden w-[min(42rem,calc(100%-2rem))] -translate-x-1/2 rounded-xl border border-journal-gold bg-white p-4 shadow-2xl dark:bg-journal-green"
+    class="fixed bottom-4 left-1/2 z-40 hidden w-[min(42rem,calc(100%-2rem))] -translate-x-1/2 rounded-xl border border-journal-gold bg-white p-4 shadow-2xl dark:bg-journal-panel"
     role="region" aria-label="Edit annotation members">
     <div class="flex flex-wrap items-center justify-between gap-3">
         <div>
@@ -391,7 +391,7 @@
     <div class="fixed inset-0 z-10 overflow-y-auto">
         <div class="flex min-h-full items-center justify-center p-4">
             <div
-                class="relative w-full max-w-3xl rounded-xl bg-white dark:bg-journal-green shadow-2xl border border-gray-200 dark:border-journal-dark overflow-hidden">
+                class="relative w-full max-w-3xl rounded-xl bg-white dark:bg-journal-panel shadow-2xl border border-gray-200 dark:border-journal-dark overflow-hidden">
                 <div
                     class="px-5 py-4 border-b border-gray-200 dark:border-journal-dark flex items-center justify-between">
                     <div>
@@ -469,7 +469,7 @@
     <div class="fixed inset-0 z-10 overflow-y-auto">
         <div class="flex min-h-full items-center justify-center p-4">
             <div
-                class="relative w-full max-w-lg rounded-xl bg-white dark:bg-journal-green shadow-2xl border border-gray-200 dark:border-journal-dark overflow-hidden">
+                class="relative w-full max-w-lg rounded-xl bg-white dark:bg-journal-panel shadow-2xl border border-gray-200 dark:border-journal-dark overflow-hidden">
                 <div
                     class="px-5 py-4 border-b border-gray-200 dark:border-journal-dark flex items-center justify-between">
                     <div>
@@ -576,7 +576,7 @@
     <div class="fixed inset-0 z-10 overflow-y-auto">
         <div class="flex min-h-full items-center justify-center p-4">
             <div
-                class="relative w-full max-w-3xl rounded-xl bg-white dark:bg-journal-green shadow-2xl border border-gray-200 dark:border-journal-dark overflow-hidden">
+                class="relative w-full max-w-3xl rounded-xl bg-white dark:bg-journal-panel shadow-2xl border border-gray-200 dark:border-journal-dark overflow-hidden">
                 <div class="px-5 py-4 border-b border-gray-200 dark:border-journal-dark flex items-start justify-between gap-4">
                     <div class="min-w-0">
                         <h3 id="claude-review-title" class="text-lg font-bold text-journal-dark dark:text-gray-100">
@@ -624,7 +624,7 @@
 {% endif %}
 
 <!-- Tree Container -->
-<div id="tree-viewer-panel" class="bg-white dark:bg-journal-green rounded-xl shadow-lg p-6 transition-colors">
+<div id="tree-viewer-panel" class="bg-white dark:bg-journal-panel rounded-xl shadow-lg p-6 transition-colors">
     {# The tree toolbar. It lives inside the tree panel so that full screen, which
        expands this panel to fill the window, takes the controls along. Hidden on
        touch devices, which have #tree-mobile-toolbar instead (see tree_viewer.css). #}
@@ -871,7 +871,7 @@
             <div id="status-message" class="hidden px-4 py-2 rounded-lg text-sm" role="alert"
                 title="Click to dismiss"></div>
         </div>
-        <div id="tree-container" class="bg-white dark:bg-black rounded-lg p-4" style="min-height: 600px;">
+        <div id="tree-container" class="bg-white dark:bg-black text-gray-900 dark:text-gray-100 rounded-lg p-4" style="min-height: 600px;">
             <div class="text-center text-gray-400 dark:text-gray-500 mt-20">
                 <i class="fas fa-spinner fa-spin text-3xl mb-3"></i>
                 <p>Loading tree...</p>
@@ -1217,10 +1217,10 @@
 </div>
 
 <!-- Job Details Section -->
-<div class="bg-white dark:bg-journal-green rounded-xl shadow-lg p-6 mt-6 mb-6 transition-colors">
-    <h3 class="text-lg font-bold text-journal-dark dark:text-gray-100 mb-4 flex items-center gap-2">
+<div class="bg-white dark:bg-journal-panel rounded-xl shadow-lg p-6 mt-6 mb-6 transition-colors">
+    <h2 class="dk-h3 text-journal-dark dark:text-gray-100 mb-4 flex items-center gap-2">
         <i class="fas fa-info-circle text-journal-gold"></i> Generation Details
-    </h3>
+    </h2>
     {% set details = generation_details or {} %}
     {% set terminal_trim = details.get('terminal_trim') or {} %}
     {% set raw_shape = details.get('raw_shape') or {} %}
@@ -1229,20 +1229,20 @@
     <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6 text-sm text-gray-700 dark:text-gray-300">
         <!-- Column 1: Core Methods -->
         <div>
-            <h4 class="font-semibold text-journal-gold mb-2 uppercase text-xs tracking-wider">Methods</h4>
+            <h4 class="font-semibold text-journal-gold-ink dark:text-journal-gold mb-2 uppercase text-xs tracking-wider">Methods</h4>
             <div class="space-y-1">
-                <p><span class="opacity-70 w-24 inline-block">Alignment:</span>
+                <p><span class="text-gray-600 dark:text-gray-400 w-24 inline-block">Alignment:</span>
                     <span class="font-medium">{{ details.get('alignment_method_label', 'Unknown') }}</span></p>
-                <p><span class="opacity-70 w-24 inline-block">Trimming:</span>
+                <p><span class="text-gray-600 dark:text-gray-400 w-24 inline-block">Trimming:</span>
                     <span class="font-medium">{{ details.get('trimming_method_label', 'None') }}</span></p>
-                <p><span class="opacity-70 w-24 inline-block">Tree Builder:</span>
+                <p><span class="text-gray-600 dark:text-gray-400 w-24 inline-block">Tree Builder:</span>
                     <span class="font-medium">{{ details.get('tree_method_label', 'Unknown') }}</span></p>
             </div>
         </div>
 
         <!-- Column 2: the alignment actually consumed by the tree builder -->
         <div>
-            <h4 class="font-semibold text-journal-gold mb-2 uppercase text-xs tracking-wider">Alignment Used</h4>
+            <h4 class="font-semibold text-journal-gold-ink dark:text-journal-gold mb-2 uppercase text-xs tracking-wider">Alignment Used</h4>
             <div class="space-y-1">
                 {% if raw_shape.get('sequences') is not none %}
                 <p><span class="opacity-70 w-28 inline-block">Sequences:</span>
@@ -1275,7 +1275,7 @@
 
         <!-- Column 3: what the tree builder actually applied -->
         <div>
-            <h4 class="font-semibold text-journal-gold mb-2 uppercase text-xs tracking-wider">Tree Inference</h4>
+            <h4 class="font-semibold text-journal-gold-ink dark:text-journal-gold mb-2 uppercase text-xs tracking-wider">Tree Inference</h4>
             <div class="space-y-1">
                 {% if details.get('model_value') %}
                 <p><span class="opacity-70">{{ details.get('model_label') }}:</span>
@@ -1309,7 +1309,7 @@
     {% if duplicate_filters and duplicate_filters.get('removed_records') %}
     <div id="duplicate-records" class="mt-6 pt-4 border-t border-gray-200 dark:border-gray-700 scroll-mt-6">
         <div class="flex flex-wrap items-center justify-between gap-3 mb-2">
-            <h4 class="font-semibold text-journal-gold uppercase text-xs tracking-wider">
+            <h4 class="font-semibold text-journal-gold-ink dark:text-journal-gold uppercase text-xs tracking-wider">
                 Removed After All Input Sources Were Merged ({{ duplicate_filters.get('removed_count', 0) }})
             </h4>
             {% if not view_only %}
@@ -1356,7 +1356,7 @@
     {% set its_details = job_details.get('its_extraction_details') %}
     {% if its_details %}
     <div class="mt-6 pt-4 border-t border-gray-200 dark:border-gray-700">
-        <h4 class="font-semibold text-journal-gold mb-2 uppercase text-xs tracking-wider">ITS Region Extraction</h4>
+        <h4 class="font-semibold text-journal-gold-ink dark:text-journal-gold mb-2 uppercase text-xs tracking-wider">ITS Region Extraction</h4>
         <p class="text-sm text-gray-700 dark:text-gray-300">
             Aligned <span class="font-medium">{{ its_details.get('region_label', 'ITS') }}</span> only:
             kept {{ its_details.get('kept_count', 0) }} of {{ its_details.get('input_count', 0) }} sequences
@@ -1403,7 +1403,7 @@
     {% set queue_duplicates = import_filters.get('queue_duplicates') if import_filters else None %}
     {% if queue_duplicates and queue_duplicates.get('removed_records') %}
     <div id="queue-duplicates" class="mt-6 pt-4 border-t border-gray-200 dark:border-gray-700 scroll-mt-6">
-        <h4 class="font-semibold text-journal-gold mb-2 uppercase text-xs tracking-wider">
+        <h4 class="font-semibold text-journal-gold-ink dark:text-journal-gold mb-2 uppercase text-xs tracking-wider">
             Duplicates Not Added ({{ queue_duplicates.get('removed_count', 0) }})
         </h4>
         <p class="text-sm text-gray-700 dark:text-gray-300">
@@ -1454,7 +1454,7 @@
     <div class="mt-6 pt-4 border-t border-gray-200 dark:border-gray-700">
         {% set restorable_filtered = mycomap_filters.get('filtered_records', [])|selectattr('sequence')|list %}
         <div class="flex flex-wrap items-center justify-between gap-3 mb-2">
-            <h4 class="font-semibold text-journal-gold uppercase text-xs tracking-wider">Removed by MycoMap Before Import</h4>
+            <h4 class="font-semibold text-journal-gold-ink dark:text-journal-gold uppercase text-xs tracking-wider">Removed by MycoMap Before Import</h4>
             {% if not view_only %}
             <button type="button" id="btn-rebuild-with-import-filtered"
                 class="px-3 py-2 text-sm font-semibold rounded-lg bg-journal-gold hover:bg-journal-gold-light text-journal-dark transition-colors shadow-sm flex items-center gap-2 disabled:opacity-50 disabled:cursor-not-allowed"
@@ -1514,14 +1514,14 @@
             <span class="font-mono block">Job ID: {{ job_id }}</span>
             {% if job_details.get('inat_source_url') %}
             <a href="{{ job_details.get('inat_source_url') }}" target="_blank" rel="noopener noreferrer"
-                class="font-mono block mt-2 text-journal-gold hover:text-journal-gold-light underline underline-offset-2 break-all">
+                class="font-mono block mt-2 text-journal-gold-ink dark:text-journal-gold hover:underline dark:hover:text-journal-gold-light underline underline-offset-2 break-all">
                 iNaturalist source: {{ job_details.get('inat_source_url') }}
                 <i class="fas fa-external-link-alt ml-1 text-xs"></i>
             </a>
             {% endif %}
             {% if job_details.get('mycomap_blast_url') %}
             <a href="{{ job_details.get('mycomap_blast_url') }}" target="_blank" rel="noopener noreferrer"
-                class="font-mono block mt-2 text-journal-gold hover:text-journal-gold-light underline underline-offset-2 break-all">
+                class="font-mono block mt-2 text-journal-gold-ink dark:text-journal-gold hover:underline dark:hover:text-journal-gold-light underline underline-offset-2 break-all">
                 MycoMap BLAST results: {{ job_details.get('mycomap_blast_url') }}
                 <i class="fas fa-external-link-alt ml-1 text-xs"></i>
             </a>

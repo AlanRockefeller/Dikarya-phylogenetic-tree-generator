@@ -28,7 +28,7 @@
 {% block content %}
 <div class="max-w-6xl mx-auto px-4 sm:px-6 lg:px-8 py-8">
     <div class="mb-6">
-        <h2 class="text-3xl font-bold text-journal-dark dark:text-white">Voucher Labels</h2>
+        <h1 class="dk-h1 text-journal-dark dark:text-white">Voucher Labels</h1>
         <p class="mt-2 text-sm text-gray-600 dark:text-gray-300">
             Generate numbered specimen voucher label sheets for printing.
         </p>
@@ -38,7 +38,7 @@
         class="grid gap-6 lg:grid-cols-[minmax(0,1fr)_360px]">
         <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
 
-        <section class="bg-white dark:bg-journal-green border border-gray-200 dark:border-gray-700 rounded-lg p-5 shadow-sm">
+        <section class="bg-white dark:bg-journal-panel border border-gray-200 dark:border-gray-700 rounded-lg p-5 shadow-sm">
             <div class="grid gap-5 sm:grid-cols-2">
                 <label class="block">
                     <span class="block text-sm font-semibold text-journal-dark dark:text-gray-100 mb-2">Prefix</span>
@@ -183,7 +183,7 @@
             </div>
         </section>
 
-        <aside class="bg-white dark:bg-journal-green border border-gray-200 dark:border-gray-700 rounded-lg p-5 shadow-sm">
+        <aside class="bg-white dark:bg-journal-panel border border-gray-200 dark:border-gray-700 rounded-lg p-5 shadow-sm">
             <div class="mb-4 flex items-center justify-between gap-3">
                 <h3 class="text-sm font-bold uppercase tracking-wide text-gray-500 dark:text-gray-300">Preview</h3>
                 <span id="voucher_labels_per_page"

@@ -7,9 +7,9 @@
     <!-- Header -->
     <div class="flex flex-col md:flex-row justify-between items-center mb-8 gap-4">
         <div>
-            <h2 class="text-2xl font-bold text-journal-dark dark:text-gray-100 flex items-center">
+            <h1 class="dk-h1 text-journal-dark dark:text-gray-100 flex items-center">
                 <i class="fas fa-tasks text-journal-gold mr-3"></i>My Jobs
-            </h2>
+            </h1>
             <p class="text-gray-600 dark:text-gray-300 mt-1">Manage and view your phylogenetic analysis jobs.</p>
         </div>
 
@@ -26,7 +26,7 @@
             <form action="{{ url_for('user.clear_jobs') }}" method="POST"
                 onsubmit="return confirm('Clear all your unprotected jobs? Protected jobs are kept. Cleared jobs can be restored from Recently deleted for {{ grace_days }} days.');">
                 <input type="hidden" name="csrf_token" value="{{ csrf_token() }}" />
-                <button type="submit" class="bg-red-500 hover:bg-red-600 text-white px-5 py-2.5 rounded-lg font-medium
+                <button type="submit" class="bg-red-600 hover:bg-red-700 text-white px-5 py-2.5 rounded-lg font-medium
                            shadow-md hover:shadow-lg transition-all flex items-center text-sm">
                     <i class="fas fa-trash-alt mr-2"></i> Clear All Jobs
                 </button>
@@ -36,7 +36,7 @@
     </div>
 
     <!-- Jobs Table Card -->
-    <div class="bg-white dark:bg-journal-green rounded-xl shadow-lg overflow-hidden transition-colors">
+    <div class="bg-white dark:bg-journal-panel rounded-xl shadow-lg overflow-hidden transition-colors">
         {% if jobs %}
         <div class="overflow-x-auto">
             <table class="w-full text-left border-collapse">
@@ -154,7 +154,7 @@
             <div class="inline-flex items-center justify-center w-16 h-16 rounded-full bg-journal-gold/20 mb-4">
                 <i class="fas fa-tasks text-3xl text-journal-gold"></i>
             </div>
-            <h3 class="text-lg font-medium text-journal-dark dark:text-gray-100 mb-2">No Jobs Found</h3>
+            <h2 class="dk-h3 text-journal-dark dark:text-gray-100 mb-2">No Jobs Found</h2>
             <p class="text-gray-500 dark:text-gray-400 max-w-sm mx-auto mb-6">
                 You haven't run any phylogenetic analyses yet. Start a new job to see it here.
             </p>
@@ -169,12 +169,12 @@
 
     {% if deleted_jobs %}
     <!-- Recently deleted -->
-    <div class="mt-10 bg-white dark:bg-journal-green rounded-xl shadow-lg overflow-hidden transition-colors">
+    <div class="mt-10 bg-white dark:bg-journal-panel rounded-xl shadow-lg overflow-hidden transition-colors">
         <div class="flex flex-col md:flex-row justify-between items-start md:items-center gap-3 px-6 py-4 border-b border-gray-200 dark:border-journal-dark">
             <div>
-                <h3 class="text-lg font-semibold text-journal-dark dark:text-gray-100 flex items-center">
+                <h2 class="dk-h2 text-journal-dark dark:text-gray-100 flex items-center">
                     <i class="fas fa-trash-restore text-journal-gold mr-2"></i>Recently deleted
-                </h3>
+                </h2>
                 <p class="text-sm text-gray-500 dark:text-gray-400">Cleared jobs are kept for {{ grace_days }} days, then deleted permanently. Their links don't work until you restore them.</p>
             </div>
             <form action="{{ url_for('user.restore_all_jobs') }}" method="POST">

@@ -15,13 +15,9 @@
         padding-bottom: 3rem;
     }
 
+    /* Size, weight and family come from .dk-h1 (site_shell.css). */
     .tree-page-title {
         color: var(--text);
-        font-family: var(--serif);
-        font-size: 34px;
-        font-weight: 500;
-        line-height: 1.05;
-        letter-spacing: 0;
     }
 
     .tree-page-subtitle,
@@ -45,8 +41,10 @@
         border-color: var(--journal-gold);
     }
 
-    .tree-builder-page h2,
-    .tree-builder-page h3:not(.queue-title),
+    /* Small headings inside cards and modals read as labels; the two panel
+       titles are on the site type scale (.dk-h2) instead. */
+    .tree-builder-page h2:not(.dk-h2),
+    .tree-builder-page h3,
     .tree-builder-page h4 {
         color: var(--text);
         font-family: var(--sans);
@@ -55,15 +53,13 @@
         letter-spacing: 0;
     }
 
-    .tree-card > h3 > i,
+    .tree-card > h2 > i,
     .tree-modal h3 > i {
         display: none;
     }
 
-    .tree-card > h3 {
+    .tree-card > h2 {
         color: #f7faf8;
-        font-size: 28px;
-        line-height: 1.1;
     }
 
     /* Alan 9/12/26 - Segmented source selector for the single Add Sequences
@@ -170,12 +166,6 @@
 
     .tree-builder-page input[type="checkbox"] {
         accent-color: var(--journal-gold);
-    }
-
-    .tree-builder-page input::placeholder,
-    .tree-builder-page textarea::placeholder {
-        color: #5d6b62;
-        font-style: italic;
     }
 
     .sequence-input-box {
@@ -313,6 +303,19 @@
         color: var(--journal-gold);
     }
 
+    /* Gold text is 1.9:1 on the light cards; gold-ink text and a darker
+       outline pass (4.7+ and 3.4+). */
+    html:not(.dark) .tree-builder-page .btn-outline-gold {
+        border-color: #9a7b2c;
+        color: #7a5f1a;
+    }
+
+    /* Colour comes from the site-wide placeholder rule (site_shell.css). */
+    .tree-builder-page input::placeholder,
+    .tree-builder-page textarea::placeholder {
+        font-style: italic;
+    }
+
     .btn-small {
         font-size: 12px;
         min-height: 34px;
@@ -338,11 +341,6 @@
 
     .queue-title {
         color: var(--text);
-        font-family: var(--serif);
-        font-size: 24px;
-        font-style: normal;
-        font-weight: 500;
-        line-height: 1;
     }
 
     .queue-count-number {
@@ -575,8 +573,8 @@
         --line-gold: #c9a962;
         --text: #1a2f23;
         --text-dim: #4a5a52;
-        --text-mute: #7a8a82;
-        --gold-soft: #8a6f2e;
+        --text-mute: #56625b;
+        --gold-soft: #7a5f1a;
     }
 
     html:not(.dark) .tree-builder-page .tree-card,
@@ -590,7 +588,7 @@
             0 1px 2px rgba(26, 47, 35, .04);
     }
 
-    html:not(.dark) .tree-builder-page .tree-card > h3 {
+    html:not(.dark) .tree-builder-page .tree-card > h2 {
         color: #1a2f23;
     }
 
@@ -610,11 +608,6 @@
     html:not(.dark) .tree-builder-page select,
     html:not(.dark) .tree-builder-page .sequence-input-box {
         background: #ffffff;
-    }
-
-    html:not(.dark) .tree-builder-page input::placeholder,
-    html:not(.dark) .tree-builder-page textarea::placeholder {
-        color: #9aa19a;
     }
 
     html:not(.dark) .tree-builder-page .sequence-input-toolbar {
@@ -650,7 +643,7 @@
 <div class="mb-8">
     <div class="flex flex-col md:flex-row justify-between items-start gap-4">
         <div>
-            <h1 class="tree-page-title">Phylogenetic Tree Builder</h1>
+            <h1 class="tree-page-title dk-h1">Phylogenetic Tree Builder</h1>
         </div>
     </div>
 </div>
@@ -668,10 +661,10 @@
              additive -- switching a segment hides a fetch summary but never
              touches the queue, which is the durable state. -->
         <div class="tree-card p-6" id="add_sequences_card">
-            <h3 class="text-xl font-semibold text-journal-dark dark:text-gray-100 mb-4 flex items-center">
+            <h2 class="dk-h2 mb-4 flex items-center">
                 <i class="fas fa-plus-circle text-journal-gold mr-2"></i>
                 Add Sequences
-            </h3>
+            </h2>
 
             <div class="source-segmented" id="source_segmented" role="tablist" aria-label="Sequence source">
                 <button type="button" class="source-segment" role="tab" tabindex="0"
@@ -1144,7 +1137,7 @@
 
             <!-- Queue Header -->
             <div class="p-4 border-b border-[var(--line-gold)] flex justify-between items-start gap-4">
-                <h3 class="queue-title">Sequence queue</h3>
+                <h2 class="queue-title dk-h2">Sequence queue</h2>
                 <div id="sequence_count_block" class="hidden" aria-live="polite">
                     <span id="sequence_count" class="queue-count-number">0</span>
                     <span class="queue-count-label">SEQUENCES</span>

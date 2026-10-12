@@ -11,12 +11,24 @@
  *
  * Breakpoints (spec section 7): >=1100px full; 768-1099px icon-only What's
  * New and My Jobs; <768px compact bar, scrolling tabs, accordion footer.
+ *
+ * This file also owns the site-wide type scale (below the shell rules):
+ * Libre Baskerville for page titles and section headings, IBM Plex Sans for
+ * everything else. journal.css reads the same --dk-h* variables, and
+ * Workbench templates use the .dk-h1/.dk-h2/.dk-h3 classes.
  */
 
-@import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600;700&display=swap');
+@import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600;700&family=Libre+Baskerville:ital,wght@0,400;0,700;1,400&display=swap');
 
 :root {
     --dk-font: 'IBM Plex Sans', system-ui, -apple-system, sans-serif;
+    --dk-font-serif: 'Libre Baskerville', Georgia, serif;
+
+    /* Type scale. Display is the Journal home hero only. */
+    --dk-display: 3rem;
+    --dk-h1: 2.25rem;
+    --dk-h2: 1.5rem;
+    --dk-h3: 1.125rem;
     --dk-gold: #c9a962;
     --dk-gold-ink: #1a2f23;
 
@@ -765,6 +777,59 @@
 
     .dk-only-narrow {
         display: list-item;
+    }
+}
+
+/* ---- Form placeholders (page content, both layouts) ----
+ * Tailwind's preflight greys placeholders to #9ca3af, 2.5:1 on white. These
+ * pass on every input background the site uses (4.6+ light, 5.3+ dark).
+ * :root makes them outrank preflight's input::placeholder. */
+
+:root ::placeholder {
+    color: #6b7280;
+    opacity: 1;
+}
+
+:root.dark ::placeholder,
+:root[data-theme="dark"] ::placeholder {
+    color: #9ca3af;
+}
+
+/* ---- Type scale (page content, both layouts) ----
+ * Page title = one <h1 class="dk-h1"> per page; section and card headings use
+ * .dk-h2/.dk-h3 at whatever tag the outline needs. Small uppercase panel
+ * labels are UI, not headings, and stay in Plex.
+ * `html .dk-h1` (0,1,1) outranks Tailwind's single-class utilities on the same
+ * element, so a stray text-2xl cannot resize a title. Colour is left to the
+ * page. */
+
+html .dk-h1,
+html .dk-h2,
+html .dk-h3 {
+    font-family: var(--dk-font-serif);
+    font-weight: 700;
+    letter-spacing: -0.005em;
+}
+
+html .dk-h1 {
+    font-size: var(--dk-h1);
+    line-height: 1.2;
+}
+
+html .dk-h2 {
+    font-size: var(--dk-h2);
+    line-height: 1.3;
+}
+
+html .dk-h3 {
+    font-size: var(--dk-h3);
+    line-height: 1.4;
+}
+
+@media (max-width: 767px) {
+    :root {
+        --dk-display: 2.25rem;
+        --dk-h1: 1.875rem;
     }
 }
 

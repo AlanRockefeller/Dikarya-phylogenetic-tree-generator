@@ -135,7 +135,7 @@
     .dark .vs-date { color-scheme: dark; }
     .vs-pill { display: inline-block; max-width: 60%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
                font-family: 'JetBrains Mono', ui-monospace, monospace; font-size: 10.5px; font-weight: 500; line-height: 1;
-               padding: 4px 7px; border-radius: 5px; background: #f3f4f6; border: 1px solid rgb(0 0 0 / 0.10); color: #6b7280; }
+               padding: 4px 7px; border-radius: 5px; background: #f3f4f6; border: 1px solid rgb(0 0 0 / 0.10); color: #4b5563; }
     .dark .vs-pill { background: #1a2f23; border-color: rgb(255 255 255 / 0.10); color: #8fa298; }
     .vs-pill-button { cursor: pointer; }
     .vs-pill-button:hover { border-color: #c9a962; color: #1a2f23; }
@@ -155,7 +155,7 @@
     .vs-seg { display: inline-flex; padding: 2px; border-radius: 6px; background: #f3f4f6; border: 1px solid rgb(0 0 0 / 0.10); }
     .dark .vs-seg { background: #1a2f23; border-color: rgb(255 255 255 / 0.10); }
     .vs-seg-wrap { cursor: pointer; }
-    .vs-seg-opt { display: block; padding: 3px 9px; border-radius: 4px; font-size: 11px; font-weight: 600; color: #6b7280; }
+    .vs-seg-opt { display: block; padding: 3px 9px; border-radius: 4px; font-size: 11px; font-weight: 600; color: #4b5563; }
     .vs-seg-wrap input:checked + .vs-seg-opt { background: rgb(201 169 98 / 0.2); color: #7a5d1d; font-weight: 700; }
     .vs-seg-wrap input:focus-visible + .vs-seg-opt { box-shadow: 0 0 0 2px rgb(201 169 98 / 0.45); }
     .dark .vs-seg-opt { color: #8fa298; }
@@ -177,7 +177,7 @@
 {% block content %}
 <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-8">
     <div class="mb-6">
-        <h2 class="text-3xl font-bold text-journal-dark dark:text-white">Voucher Sync</h2>
+        <h1 class="dk-h1 text-journal-dark dark:text-white">Voucher Sync</h1>
         <p class="mt-2 text-sm text-gray-600 dark:text-gray-300 max-w-3xl">
             Photograph a printed voucher label (QR code + printed ID) as the <strong>last photo</strong> of each
             observation. Voucher Sync reads the code from that photo and writes it into an observation field, so
@@ -202,7 +202,7 @@
         <!-- Left column: connection + settings -->
         <div class="space-y-6">
             <!-- Connection card -->
-            <section class="bg-white dark:bg-journal-green border border-gray-200 dark:border-gray-700 rounded-lg p-5 shadow-sm">
+            <section class="bg-white dark:bg-journal-panel border border-gray-200 dark:border-gray-700 rounded-lg p-5 shadow-sm">
                 <h3 class="text-sm font-semibold uppercase tracking-wide text-gray-500 dark:text-gray-300 mb-3">
                     <i class="fas fa-link mr-1"></i> iNaturalist account
                 </h3>
@@ -244,7 +244,7 @@
 
             <!-- Settings card -->
             <!-- Compact stack (Claude Design "Matching Card Variations" 1a) -->
-            <section id="vs_matching" class="vs-card bg-white dark:bg-journal-green border border-gray-200 dark:border-white/5 rounded-[10px] p-4 shadow-sm text-journal-dark dark:text-[#eef2ef]">
+            <section id="vs_matching" class="vs-card bg-white dark:bg-journal-panel border border-gray-200 dark:border-white/5 rounded-[10px] p-4 shadow-sm text-journal-dark dark:text-[#eef2ef]">
                 <div class="flex items-center justify-between mb-3.5">
                     <h3 class="flex items-center gap-2 text-[11.5px] font-extrabold uppercase tracking-[.14em] text-journal-dark dark:text-[#eef2ef]">
                         <i class="fas fa-sliders text-journal-gold"></i> Matching
@@ -324,7 +324,7 @@
         <!-- Right column: actions + results -->
         <div class="space-y-4">
             <!-- Summary-first bar (Claude Design "Action Bar" 1b) -->
-            <section class="bg-white dark:bg-journal-green border border-gray-200 dark:border-[#2f4a37] rounded-lg shadow-sm overflow-hidden">
+            <section class="bg-white dark:bg-journal-panel border border-gray-200 dark:border-[#2f4a37] rounded-lg shadow-sm overflow-hidden">
                 <div class="vs-head">
                     <div class="flex items-center gap-2.5 min-w-0">
                         <span id="vs_status_dot" class="block w-2 h-2 rounded-full bg-gray-400 flex-none"></span>
@@ -402,7 +402,7 @@
                 </div>
             </section>
 
-            <section class="bg-white dark:bg-journal-green border border-gray-200 dark:border-gray-700 rounded-lg shadow-sm">
+            <section class="bg-white dark:bg-journal-panel border border-gray-200 dark:border-gray-700 rounded-lg shadow-sm">
                 <button id="vs_log_toggle" type="button" class="w-full flex items-center justify-between px-4 py-3 text-sm font-semibold text-journal-dark dark:text-gray-100">
                     <span><i class="fas fa-terminal mr-2 text-gray-400"></i>Run log</span>
                     <i id="vs_log_caret" class="fas fa-chevron-down text-gray-400"></i>
@@ -414,7 +414,7 @@
 
     <!-- Attribution: this tool was contributed to Dikarya, and the desktop original
          is still maintained separately, so the link is useful as well as due credit. -->
-    <p class="mt-8 pt-4 border-t border-gray-200 dark:border-gray-700 text-xs text-gray-500 dark:text-gray-400">
+    <p class="mt-8 pt-4 border-t border-gray-200 dark:border-gray-700 text-xs text-gray-600 dark:text-gray-400">
         Voucher Sync by <span class="font-semibold text-gray-600 dark:text-gray-300">Bryce Thorson</span> &mdash;
         ported from <a href="https://github.com/bthorson1029/inat-voucher-sync" target="_blank" rel="noopener"
             class="underline hover:text-journal-gold transition-colors">inat-voucher-sync</a>,
@@ -427,7 +427,7 @@
 <!-- Apply confirmation modal -->
 <div id="vs_apply_modal" class="hidden fixed inset-0 z-50 flex items-center justify-center bg-black/50 px-4"
     role="dialog" aria-modal="true" aria-labelledby="vs_apply_modal_title">
-    <div class="bg-white dark:bg-journal-green rounded-xl shadow-2xl max-w-md w-full p-6">
+    <div class="bg-white dark:bg-journal-panel rounded-xl shadow-2xl max-w-md w-full p-6">
         <h3 id="vs_apply_modal_title" class="text-lg font-bold text-journal-dark dark:text-white mb-3"><i class="fas fa-cloud-arrow-up mr-2 text-green-600"></i>Apply updates?</h3>
         <div id="vs_apply_modal_body" class="text-sm text-gray-700 dark:text-gray-200 space-y-2"></div>
         <div class="mt-6 flex justify-end gap-2">

@@ -1972,7 +1972,7 @@
 
     function buildResultCard(observation) {
         const card = document.createElement('article');
-        card.className = 'flex gap-4 rounded-2xl border border-gray-200 dark:border-gray-700 bg-white dark:bg-journal-green p-4 shadow-sm';
+        card.className = 'flex gap-4 rounded-2xl border border-gray-200 dark:border-gray-700 bg-white dark:bg-journal-panel p-4 shadow-sm';
         const accent = iconicColor(observation.taxon);
         card.style.borderLeft = `5px solid ${accent}`;
         const photo = document.createElement('div');
@@ -2006,7 +2006,10 @@
         }
         body.appendChild(badges);
         const title = document.createElement('h3');
-        title.className = 'mt-1 truncate font-serif text-xl font-semibold italic text-journal-dark dark:text-white';
+        title.className = 'mt-1 truncate dk-h3 italic text-journal-dark dark:text-white';
+        // A taxon name: regular-weight italic, the convention for scientific
+        // names (and the only italic Libre Baskerville ships).
+        title.style.fontWeight = '400';
         title.textContent = observation.taxon?.name || observation.species_guess || 'Unknown taxon';
         body.appendChild(title);
         const details = document.createElement('p');
