@@ -110,6 +110,10 @@ AVX-512-only and which had plainly inefficient hot loops. Check, in this order:
   toolchain's libraries to the compiler only.
 - Each sandboxed Bash call has its own PID namespace: `ps` cannot see a process started
   by a background task, so watch its output files instead.
+- Bash reads a script as it runs it: editing a running benchmark script breaks that run.
+  Copy it, or wait.
+- `pid=$(cmd & echo $!)` never returns if `cmd` keeps the pipe open: redirect its output.
+- `git clone` from GitHub inside the sandbox needs `github.com` declared for the command.
 
 ## 6. What worked on MAFFT (for ideas, not as a recipe)
 
@@ -154,6 +158,113 @@ AVX-512-only and which had plainly inefficient hot loops. Check, in this order:
 - An OpenMP region with one thread still costs a runtime call (~5% of a UFBoot run in
   `__kmp_fork_call`/serialized-parallel); a direct loop for `num_threads == 1` is exact
   when the reduction copies start at +0.0.
+
+## 6c. What worked on RAxML-NG (2026-10-09, `ops/raxml/`)
+
+- **Toolchain:** the official static binaries are Ubuntu 24.04 gcc 13.3.0, i.e. this
+  host's system compiler; `-DSTATIC_BUILD=ON -DPORTABLE_BUILD=ON` reproduced the
+  installed 2.0.2 byte for byte. The identity reference was stock 2.0.3 (newer than
+  production, and 2.0.3 changes results by itself), built with the same flags.
+- **Replaying a job:** a job's `raxml_run.raxml.rba` is kept but carries a model, so
+  a replay from it is close, not exact. Rebuild `raxml_input_sanitized.fasta` from
+  `alignment/alignment_trimmed.fasta` (renamed `SEQ%06d` in order, as
+  `sanitize_fasta_headers()` does) and rerun the logged command: exact. Some jobs'
+  alignments were later grown by "add sequences" -- check the taxon count.
+- **Where the time goes:** bootstrap replicates (~95%), i.e. thorough SPR rounds:
+  local 3-branch Newton optimization (derivatives + sumtables) and CLV updates with
+  site repeats. Coarse-grained `--threads 2` = 2 workers x 1 thread.
+- **Work not needed:** a likelihood evaluated after every regraft and overwritten by
+  the branch optimizer's own first evaluation (~11%); an autoMRE test counting bits
+  one tree at a time in `vector<bool>`; per-update free/malloc of site-repeat
+  buffers; small per-call heap tables.
+- **Exact kernel rewrites that paid:** 4x4 `P*v` from matrix columns (same products,
+  same addition pairing as the row-product + transpose-add, without five port-5
+  shuffles); two sites per iteration sharing loads -- with `__asm__("" : "+x"(v))`
+  to stop gcc folding the shared load into each FMA as a memory operand; and
+  **chunked two-phase loops** where a per-site chain ends in something slow (`log()`,
+  a 4-wide division): compute 64 sites' terms first, then the slow step back to back.
+  Those latency-bound loops gained 1.5-1.7x without changing an operation.
+- **Traps:** gcc turns `c ? a : b` back into an unpredictable branch -- write a mask
+  select and check the disassembly. GCC's `_mm256_mul_pd`/`_add_pd` are plain vector
+  arithmetic, so in an `-mfma` file they can be contracted like scalar code.
+  `fma(a,b,0)` is not `0 + a*b` (an underflowed product stays -0), while
+  `canon(a)+canon(b) == canon(a+b)` for `canon(x) = x+0` holds for all doubles.
+  End-to-end output cannot detect a renumbering of site-repeat classes (the
+  likelihood does not depend on it): test such bookkeeping with a unit check.
+  Random harness data with subnormals ran 3x slower than real data; time kernels on
+  realistic values. Search-mode logs prefix lines with `[hh:mm:ss logLH]` and MOOSE
+  JSON carries timing metadata -- the comparer must strip those and nothing else.
+- **Kernel harness:** compile the stock and patched kernel file with coraxlib's own
+  flags, rename the stock object's globals (`nm --defined-only -g` +
+  `objcopy --redefine-syms`, prefix `ref_`), link both against stock `libcorax.a`,
+  and compare outputs bit for bit on thousands of random cases (every repeat layout,
+  scaling mode, rate count, zero/-0/subnormal/negative inputs).
+- **Another user's jobs** shared the 2 vCPUs for hours: profiles taken at different
+  times were not comparable at all; only ABBA runs and same-run ratios were.
+
+## 6d. What worked on MrBayes (2026-10-09, `ops/mrbayes/`)
+
+- **Find the likelihood engine first.** Ubuntu's `mb` is built with BEAGLE and uses
+  it by default (`Using BEAGLE ... CPU-4State-Single` in every job log), so ~75% of a
+  run is in `libhmsbeagle-cpu`, not MrBayes. The deliverable is MrBayes plus its own
+  BEAGLE build, installed together. BEAGLE 4.0.1 built *without* `-march=native`
+  gives the same bits as Ubuntu's 3.1.2; upstream's CMake forces `-march=native`,
+  and **g++ contracts `a*b+c` into an FMA even with `-std=c++11`** (gcc only stops
+  for ISO C), so that build differs.
+- **Keep the distribution's build mode.** Ubuntu builds MrBayes `--enable-debug`
+  (no `-DNDEBUG`). The checks that compiles in include the `Log likelihood nan`
+  abort that `_run_mrbayes` turns into its +I+G retry; a release build silently
+  rejects the NaN move instead. Short identity runs never hit it: test the real
+  failing jobs at full length (jagz, 1nek abort near generation 200,000).
+- **`set beagle...` after `set seed` changes the run** (each one reruns the analysis
+  setup, which draws from the seeded stream). Put such settings before the seed.
+- **Subnormal assists were half the kernel time on large trees.** On Broadwell a
+  float multiply with a subnormal input or result costs ~120 cycles (a divide with a
+  subnormal numerator ~150); adds, max and compares cost nothing. Exact fix: run a
+  block with flush-to-zero on and the underflow flag cleared; a clear flag proves
+  the result is IEEE. Otherwise redo the block doing the risky multiplies in double,
+  `(float)((double)a*b)`, which is one correctly rounded multiply (division: double
+  rounding is innocuous since 53 >= 2*24+2). Measure the ceiling first by setting
+  FTZ/DAZ in a throwaway build.
+- **Guard logic must only decide speed.** With the underflow-flag check and exact
+  fallbacks, a wrong guard can only cost time; the harness then needs a mutation test
+  (break the exact path by one ulp) to prove the slow path is actually exercised.
+- **Memory latency, not arithmetic, after vectorizing.** An update ran ~4x slower
+  inside MrBayes than in the harness; prefetching and hugepages did not help, and
+  splitting each call between two threads gained only on alignments of 768+ patterns
+  (+35% at 1191, ~0 at 400). Two *independent* MrBayes processes, by contrast, both
+  ran at full speed, so the second core went to whole chains instead.
+- **Chains in parallel, one random stream, same run.** Keep every random draw on
+  the main thread in the original order: a chain's move and its acceptance draw
+  happen together (nothing in between draws or aborts in a BEAGLE run), and a swap
+  draws exactly one number whatever its outcome, so its place can be reserved and
+  the swap done when its run is ready. Only the likelihood runs elsewhere. Working
+  run by run (run 1's acceptances, swaps and next moves while run 2's likelihoods
+  compute) took two threads from 1.4x to 1.6x of one.
+- **Look for stale reads before splitting shared scratch.** Per-chain scratch slots
+  passed a 20-case smoke test and failed a quarter of the 88-case suite in the last
+  digit: `ResetScalersPartition` leaves some scaler-node flags as it finds them, so
+  which chain flipped the shared array last matters. That array stays shared and
+  only the main thread flips it, in chain order (rare: numerical rescaling).
+- **Copying a struct for a worker copies its inline arrays too.** A result written
+  to `m->lnLike[...]` in a private ModelInfo copy never reached the real one.
+- **ThreadSanitizer works here only with ASLR off** (`setarch x86_64 -R`, also around
+  `configure`); otherwise "unexpected memory mapping". It found the one real race.
+- **A second thread can lose.** With one busy process beside it, two coupled threads
+  were ~15% slower than one (each generation waits for its slowest chain). Run-queue
+  wait time did not separate the cases (14% quiet, 45% busy, depends on neighbours'
+  priority); measuring generations per second each way and using the faster did.
+  Per-chain scratch also costs ~4% in cache footprint, so the one-thread mode passes
+  a single scratch set from chain to chain as MrBayes does.
+- **Exact parsimony sums:** the parsimony-biased moves add float site weights into a
+  double; when all weights are whole numbers below 2^24 any summation order is exact,
+  so integer SIMD sums are fine -- checked at run time, original loop otherwise.
+- MrBayes comparer: strip `[ID: n]`, `MCMC stamp`, the clock seed for default start
+  values, progress-line times and the version banners, nothing else.
+- **Benchmark only on a quiet host, and check.** Production jobs arrive mid-run; a
+  timing wrapper that takes the lock, waits until `/proc/stat` shows the rest of the
+  host idle, and repeats any run during which others used more than a quarter CPU
+  (`scratchpad tools/qbench.sh` in that session) kept the numbers clean.
 
 ## 7. Delivery
 
