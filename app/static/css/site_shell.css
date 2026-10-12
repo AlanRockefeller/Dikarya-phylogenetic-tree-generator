@@ -554,6 +554,27 @@
     border-bottom-color: var(--dk-local-underline);
 }
 
+/* A menu tab (Labels). Its panel is a child of .dk-local, not of the strip,
+   which would clip it; site_local_nav.html sets its left edge. */
+.dk-local {
+    position: relative;
+}
+
+.dk-local-caret {
+    margin-left: 6px;
+    font-size: 10px;
+    transition: transform 0.15s ease;
+}
+
+.dk-local-item[aria-expanded="true"] .dk-local-caret {
+    transform: rotate(180deg);
+}
+
+.dk-local-panel {
+    top: calc(100% - 2px);
+    min-width: 200px;
+}
+
 .dk-shell.dk-local :focus-visible {
     outline-color: var(--dk-focus-on-light);
     outline-offset: -3px;
