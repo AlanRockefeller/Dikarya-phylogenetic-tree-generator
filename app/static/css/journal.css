@@ -73,6 +73,12 @@
     border-left-color: var(--gold);
 }
 
+/* --primary-dark turns near-black in dark mode, which left announcement
+   titles invisible on the dark card. */
+[data-theme="dark"] .journal-announcement h4 {
+    color: var(--accent-light);
+}
+
 [data-theme="dark"] .journal-page-header {
     background: var(--primary-dark);
 }
@@ -364,6 +370,33 @@ body.journal-page {
     color: var(--text-muted);
     margin: 0 0 var(--space-md);
     font-size: 0.95rem;
+}
+
+/* Plain links inside cards (the home page Quick Links) had no rule and fell
+   back to browser blue and visited purple. */
+.journal-card > a:not(.journal-btn) {
+    color: var(--primary);
+    font-weight: 600;
+    text-decoration: underline;
+    text-underline-offset: 3px;
+}
+
+.journal-card > a:not(.journal-btn):hover {
+    color: var(--primary-light);
+}
+
+.journal-card > a:not(.journal-btn):focus-visible {
+    outline: 2px solid var(--gold);
+    outline-offset: 3px;
+    border-radius: 2px;
+}
+
+[data-theme="dark"] .journal-card > a:not(.journal-btn) {
+    color: var(--accent-light);
+}
+
+[data-theme="dark"] .journal-card > a:not(.journal-btn):hover {
+    color: var(--gold);
 }
 
 .journal-card-meta {
