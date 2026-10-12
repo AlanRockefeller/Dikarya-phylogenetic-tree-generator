@@ -15,6 +15,7 @@ Nothing else is normalized: sampled parameters, trees, likelihoods, split
 frequencies, convergence diagnostics, checkpoints and summaries must match
 byte for byte.
 """
+import argparse
 import os
 import re
 import sys
@@ -44,9 +45,15 @@ def normalized(path):
     return out
 
 
-def main():
-    a, b = sys.argv[1], sys.argv[2]
-    quiet = '-q' in sys.argv[3:]
+def main(argv=None):
+    parser = argparse.ArgumentParser(
+        description='Compare two MrBayes run directories (see the module docstring).')
+    parser.add_argument('dir_a')
+    parser.add_argument('dir_b')
+    parser.add_argument('-q', '--quiet', action='store_true',
+                        help='print only the differences')
+    args = parser.parse_args(argv)
+    a, b, quiet = args.dir_a, args.dir_b, args.quiet
     names_a = sorted(f for f in os.listdir(a) if not f.startswith('.'))
     names_b = sorted(f for f in os.listdir(b) if not f.startswith('.'))
     bad = 0
@@ -70,7 +77,8 @@ def main():
             print('DIFF %s: %d vs %d lines' % (name, len(la), len(lb)))
     if bad and not quiet:
         print('MISMATCH (%d files)' % bad)
-    sys.exit(1 if bad else 0)
+    return 1 if bad else 0
 
 
-main()
+if __name__ == '__main__':
+    sys.exit(main())
