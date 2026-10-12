@@ -79,13 +79,7 @@
         {% for entry in entries %}
         {% set is_new = (not edit_mode) and (last_viewed is none or entry.published_at > last_viewed) %}
 
-        <div class="rounded-2xl shadow-sm border transition-all duration-200
-            {% if is_new %}
-                bg-white dark:bg-journal-green/30 border-journal-gold/50 shadow-journal-gold/10 shadow-md
-            {% else %}
-                bg-gray-50 dark:bg-journal-dark/60 border-gray-200 dark:border-journal-green/20
-            {% endif %}
-            p-6">
+        <div class="dk-card p-6{% if is_new %} border-journal-gold/60 dark:border-journal-gold/60{% endif %}">
 
             <!-- Category badge + New indicator + date -->
             <div class="flex items-center justify-between mb-3 flex-wrap gap-2">

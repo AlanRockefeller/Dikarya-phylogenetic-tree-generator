@@ -196,10 +196,6 @@ body.journal-page {
 }
 
 /* Main Content Area */
-.journal-main {
-    min-height: 70vh;
-}
-
 /* Hero Section */
 .journal-hero {
     background: linear-gradient(135deg, var(--primary) 0%, var(--primary-dark) 100%);

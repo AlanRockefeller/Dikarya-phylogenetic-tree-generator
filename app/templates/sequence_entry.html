@@ -25,8 +25,13 @@
         color: var(--text-dim);
     }
 
+    /* The two page panels use the shared .dk-card surface (site_shell.css);
+       only the dialogs keep this gradient. */
     .tree-card,
-    .queue-card,
+    .queue-card {
+        color: var(--text);
+    }
+
     .tree-modal {
         background: linear-gradient(180deg, #213829 0%, #1c3025 100%);
         border: 1px solid var(--line);
@@ -37,9 +42,6 @@
         color: var(--text);
     }
 
-    .queue-card {
-        border-color: var(--journal-gold);
-    }
 
     /* Small headings inside cards and modals read as labels; the two panel
        titles are on the site type scale (.dk-h2) instead. */
@@ -577,8 +579,6 @@
         --gold-soft: #7a5f1a;
     }
 
-    html:not(.dark) .tree-builder-page .tree-card,
-    html:not(.dark) .tree-builder-page .queue-card,
     html:not(.dark) .tree-builder-page .tree-modal,
     html:not(.dark) .tree-modal {
         background: linear-gradient(180deg, #ffffff 0%, #f3eedf 100%);
@@ -660,7 +660,7 @@
              unchanged; only the selected panel is shown. The sources stay
              additive -- switching a segment hides a fetch summary but never
              touches the queue, which is the durable state. -->
-        <div class="tree-card p-6" id="add_sequences_card">
+        <div class="tree-card dk-card p-6" id="add_sequences_card">
             <h2 class="dk-h2 mb-4 flex items-center">
                 <i class="fas fa-plus-circle text-journal-gold mr-2"></i>
                 Add Sequences
@@ -1133,7 +1133,7 @@
 
     <!-- Right Section: 1 column - Sequence Queue -->
     <div class="lg:col-span-1">
-        <div class="queue-card sticky top-24">
+        <div class="queue-card dk-card sticky top-24">
 
             <!-- Queue Header -->
             <div class="p-4 border-b border-[var(--line-gold)] flex justify-between items-start gap-4">

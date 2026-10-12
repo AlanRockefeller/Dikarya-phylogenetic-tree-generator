@@ -59,7 +59,7 @@
     {% endif %}
 
     {# Create new token #}
-    <div class="bg-white dark:bg-journal-panel rounded-xl shadow-lg overflow-hidden transition-colors">
+    <div class="dk-card overflow-hidden">
         <div class="bg-journal-dark px-5 py-3 border-b border-journal-green">
             <h2 class="dk-h3 text-white flex items-center">
                 <i class="fas fa-plus-circle text-journal-gold mr-2"></i>Create New Token
@@ -108,7 +108,7 @@
     </div>
 
     {# Existing tokens #}
-    <div class="bg-white dark:bg-journal-panel rounded-xl shadow-lg overflow-hidden transition-colors">
+    <div class="dk-card overflow-hidden">
         <div class="bg-journal-dark px-5 py-3 border-b border-journal-green">
             <h2 class="dk-h3 text-white flex items-center">
                 <i class="fas fa-list text-journal-gold mr-2"></i>Your Tokens
@@ -181,7 +181,7 @@
     </div>
 
     {# Docs #}
-    <div id="docs" class="bg-white dark:bg-journal-panel rounded-xl shadow p-5 text-sm text-gray-700 dark:text-gray-200">
+    <div id="docs" class="dk-card p-5 text-sm text-gray-700 dark:text-gray-200">
         <h2 class="dk-h3 text-journal-dark dark:text-gray-100 mb-2">Using your token</h2>
         <p class="mb-2">Send the token in the <code class="font-mono text-xs bg-gray-100 dark:bg-journal-dark px-1 py-0.5 rounded">Authorization</code> header:</p>
         <pre class="bg-gray-100 dark:bg-journal-dark text-xs p-3 rounded overflow-x-auto"><code>curl https://dikarya.us/api/v1/me \

@@ -374,7 +374,7 @@
 
         <!-- Header Section -->
         <div
-            class="flex flex-col md:flex-row justify-between items-start md:items-center gap-4 bg-white dark:bg-journal-panel p-6 rounded-xl shadow-lg transition-colors">
+            class="flex flex-col md:flex-row justify-between items-start md:items-center gap-4">
             <div>
                 <h1 class="dk-h1 text-journal-dark dark:text-white flex items-center gap-3">
                     Job Status
@@ -383,7 +383,7 @@
                         Loading...
                     </span>
                 </h1>
-                <div class="flex items-center gap-6 mt-2 text-sm text-gray-500 dark:text-gray-300">
+                <div class="flex items-center gap-6 mt-2 text-sm text-gray-600 dark:text-gray-300">
                     <span class="font-mono bg-gray-100 dark:bg-journal-dark text-gray-700 dark:text-gray-300 px-2 py-1 rounded">ID: {{ job_id }}</span>
                     <span>Elapsed: <span id="elapsed-time" class="font-mono font-bold">--</span></span>
                 </div>
@@ -391,7 +391,7 @@
             </div>
 
             <div class="flex flex-col items-end gap-2">
-                <div id="connection-indicator" class="flex items-center gap-2 text-sm text-gray-500 dark:text-gray-400">
+                <div id="connection-indicator" class="flex items-center gap-2 text-sm text-gray-600 dark:text-gray-400">
                     <div class="w-2 h-2 rounded-full bg-gray-400 connection-dot"></div>
                     <span id="connection-text">Connecting...</span>
                 </div>
@@ -425,7 +425,7 @@
         {% endif %}
 
         <!-- Pipeline Visualizer -->
-        <div class="bg-white dark:bg-journal-panel p-6 rounded-xl shadow-lg overflow-hidden transition-colors relative">
+        <div class="dk-card p-6 overflow-hidden relative">
             <h2 class="text-sm font-semibold text-gray-500 dark:text-gray-400 uppercase tracking-wider mb-6">Pipeline
                 Progress</h2>
 
@@ -561,7 +561,7 @@
 
             <!-- Left Column: Overview Feed -->
             <div class="lg:col-span-1">
-                <div class="bg-white dark:bg-journal-panel rounded-xl shadow-lg p-4 transition-colors sticky top-24">
+                <div class="dk-card p-4 sticky top-24">
                     <h3
                         class="text-sm font-semibold text-gray-500 dark:text-gray-400 uppercase tracking-wider mb-4 border-b border-gray-100 dark:border-journal-dark pb-2">
                         Activity Feed

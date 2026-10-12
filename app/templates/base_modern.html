@@ -26,6 +26,9 @@
                         'journal-cream': '#f8f6f0',
                         // Dark-mode card surface. journal-green is too light under
                         // gray-400/gold text (3.8:1 and 4.3:1); this gives 5.5+ and 6.2.
+                        // Dark-mode page background, the same as Tree Builder's --bg.
+                        // journal-panel cards sit on it.
+                        'journal-ground': '#14241b',
                         'journal-panel': '#1c3025',
                         // Gold for TEXT on light surfaces: journal-gold is 2.1:1
                         // on white. Pair with dark:text-journal-gold.
@@ -73,11 +76,11 @@
         }
     </style>
 
-    <link rel="stylesheet" href="{{ url_for('static', filename='css/site_shell.css') }}?v=2">
+    <link rel="stylesheet" href="{{ url_for('static', filename='css/site_shell.css') }}?v=6">
     {% block head %}{% endblock %}
 </head>
 
-<body class="bg-journal-cream dark:bg-journal-dark min-h-screen">
+<body class="dk-page bg-journal-cream dark:bg-journal-ground min-h-screen">
     <script>
         (() => {
             const endpoint = '/api/log/client';
@@ -215,7 +218,7 @@
     <!-- Flash Messages -->
     {% with messages = get_flashed_messages(with_categories=true) %}
     {% if messages %}
-    <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 pt-4">
+    <div class="w-full max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 pt-4">
         {% for category, message in messages %}
         <div
             class="mb-2 px-4 py-3 rounded-lg {% if category == 'error' %}bg-red-100 text-red-800 dark:bg-red-900 dark:text-red-200{% elif category == 'success' %}bg-green-100 text-green-800 dark:bg-green-900 dark:text-green-200{% else %}bg-blue-100 text-blue-800 dark:bg-blue-900 dark:text-blue-200{% endif %}">

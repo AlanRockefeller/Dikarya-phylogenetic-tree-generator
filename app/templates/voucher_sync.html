@@ -175,7 +175,7 @@
 {% endblock %}
 
 {% block content %}
-<div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-8">
+<div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 pb-8">
     <div class="mb-6">
         <h1 class="dk-h1 text-journal-dark dark:text-white">Voucher Sync</h1>
         <p class="mt-2 text-sm text-gray-600 dark:text-gray-300 max-w-3xl">
@@ -202,7 +202,7 @@
         <!-- Left column: connection + settings -->
         <div class="space-y-6">
             <!-- Connection card -->
-            <section class="bg-white dark:bg-journal-panel border border-gray-200 dark:border-gray-700 rounded-lg p-5 shadow-sm">
+            <section class="dk-card p-5">
                 <h3 class="text-sm font-semibold uppercase tracking-wide text-gray-500 dark:text-gray-300 mb-3">
                     <i class="fas fa-link mr-1"></i> iNaturalist account
                 </h3>
@@ -244,7 +244,7 @@
 
             <!-- Settings card -->
             <!-- Compact stack (Claude Design "Matching Card Variations" 1a) -->
-            <section id="vs_matching" class="vs-card bg-white dark:bg-journal-panel border border-gray-200 dark:border-white/5 rounded-[10px] p-4 shadow-sm text-journal-dark dark:text-[#eef2ef]">
+            <section id="vs_matching" class="dk-card vs-card p-4 text-journal-dark dark:text-[#eef2ef]">
                 <div class="flex items-center justify-between mb-3.5">
                     <h3 class="flex items-center gap-2 text-[11.5px] font-extrabold uppercase tracking-[.14em] text-journal-dark dark:text-[#eef2ef]">
                         <i class="fas fa-sliders text-journal-gold"></i> Matching
@@ -324,7 +324,7 @@
         <!-- Right column: actions + results -->
         <div class="space-y-4">
             <!-- Summary-first bar (Claude Design "Action Bar" 1b) -->
-            <section class="bg-white dark:bg-journal-panel border border-gray-200 dark:border-[#2f4a37] rounded-lg shadow-sm overflow-hidden">
+            <section class="dk-card overflow-hidden">
                 <div class="vs-head">
                     <div class="flex items-center gap-2.5 min-w-0">
                         <span id="vs_status_dot" class="block w-2 h-2 rounded-full bg-gray-400 flex-none"></span>
@@ -376,7 +376,7 @@
             <p id="vs_coverage" class="hidden rounded-md border border-amber-300 bg-amber-50 px-4 py-3 text-sm text-amber-900
                 dark:border-[#6e5629] dark:bg-[#2a3a26] dark:text-[#f0d69a]" role="status"></p>
 
-            <section class="bg-white dark:bg-[#15201a] border border-gray-200 dark:border-[#2a3a2f] rounded-md shadow-sm overflow-hidden">
+            <section class="dk-card overflow-hidden">
                 <div class="overflow-x-auto">
                     <table id="vs_table" class="min-w-full text-journal-dark dark:text-[#ece9df]">
                         <colgroup>
@@ -402,7 +402,7 @@
                 </div>
             </section>
 
-            <section class="bg-white dark:bg-journal-panel border border-gray-200 dark:border-gray-700 rounded-lg shadow-sm">
+            <section class="dk-card">
                 <button id="vs_log_toggle" type="button" class="w-full flex items-center justify-between px-4 py-3 text-sm font-semibold text-journal-dark dark:text-gray-100">
                     <span><i class="fas fa-terminal mr-2 text-gray-400"></i>Run log</span>
                     <i id="vs_log_caret" class="fas fa-chevron-down text-gray-400"></i>

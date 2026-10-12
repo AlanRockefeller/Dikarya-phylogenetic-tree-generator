@@ -33,7 +33,7 @@
             <div class="space-y-3">
                 {% for todo in todos %}
                 <div
-                    class="{{ 'bg-gray-100 dark:bg-journal-dark/80 border-gray-300 dark:border-journal-green/40 border-l-4 border-l-journal-gold' if todo.status == 'done' else 'bg-white dark:bg-journal-green/20 border-gray-200 dark:border-journal-green/30' }} border p-4 rounded-xl shadow-sm hover:shadow-md transition-shadow">
+                    class="dk-card p-4 hover:shadow-md transition-shadow{{ ' border-l-4 border-l-journal-gold dark:border-l-journal-gold' if todo.status == 'done' else '' }}">
                     <div class="flex items-start justify-between gap-4">
                         <div class="mb-1">
                             <span class="text-journal-gold-ink dark:text-journal-gold font-bold text-sm uppercase tracking-wider">{{ todo.name }}</span>
@@ -106,7 +106,7 @@
         <!-- Add Suggestion Form -->
         <div class="lg:col-span-1">
             <div
-                class="bg-white dark:bg-journal-dark border border-gray-200 dark:border-journal-green/50 p-6 rounded-2xl shadow-xl sticky top-24">
+                class="dk-card p-6 sticky top-24">
                 <h2 class="dk-h2 text-journal-dark dark:text-journal-gold mb-6 flex items-center">
                     <i class="fas fa-plus-circle mr-2"></i>
                     Add Suggestion
