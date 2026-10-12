@@ -47,9 +47,14 @@
         // On narrow screens the tabs scroll sideways; bring the active one
         // into view. scrollLeft rather than scrollIntoView, which would also
         // scroll the page vertically.
+        // Measured from the strip, not offsetLeft: a menu tab's offsetParent
+        // is its own wrapper.
+        function offsetInStrip(el) {
+            return el.getBoundingClientRect().left - strip.getBoundingClientRect().left + strip.scrollLeft;
+        }
         var active = strip.querySelector('[aria-current]');
         if (active && overflowing()) {
-            strip.scrollLeft = Math.max(0, active.offsetLeft - (strip.clientWidth - active.offsetWidth) / 2);
+            strip.scrollLeft = Math.max(0, offsetInStrip(active) - (strip.clientWidth - active.offsetWidth) / 2);
         }
 
         // Touch swipes scroll the strip natively. A mouse cannot -- there is
@@ -114,6 +119,12 @@
             var trigger = openMenu.querySelector('[data-dk-menu-trigger]');
             var panel = document.getElementById(trigger.getAttribute('aria-controls'));
             if (panel.hidden) { openMenu = null; return; }
+            // A tab opened from the keyboard can be scrolled out of sight.
+            var start = offsetInStrip(trigger);
+            var end = start + trigger.offsetWidth;
+            if (start < strip.scrollLeft || end > strip.scrollLeft + strip.clientWidth) {
+                strip.scrollLeft = Math.max(0, start - (strip.clientWidth - trigger.offsetWidth) / 2);
+            }
             var box = nav.getBoundingClientRect();
             var left = trigger.getBoundingClientRect().left - box.left;
             var max = nav.clientWidth - panel.offsetWidth - 8;
