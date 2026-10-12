@@ -45,11 +45,15 @@ _LOGGABLE_EMAIL_RE = re.compile(r"^[^\s@]{1,64}@[^\s@]{1,190}\.[^\s@]{1,63}$")
 
 
 def loggable_email(user=None, typed=None):
-    """The account's stored email, else the typed one if email-shaped, else "-"."""
+    """The account's stored email, else the typed one, if email-shaped, else "-"."""
     stored = getattr(user, "email", None) if user is not None else None
+    # The stored address gets the same check: registration only requires it to
+    # be non-empty, so an account created with a control character in its
+    # email would otherwise forge a log line on every later login.
     if isinstance(stored, str) and stored:
-        return stored
-    candidate = normalize_email(typed)
+        candidate = stored
+    else:
+        candidate = normalize_email(typed)
     if _LOGGABLE_EMAIL_RE.match(candidate) and candidate.isprintable():
         return candidate
     return "-"
