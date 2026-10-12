@@ -8,6 +8,11 @@ Items name Flask endpoints, not URLs. An item whose endpoint is not registered
 falls back to its ``fallback`` endpoint, or is left out, so the config can name
 pages that land in a later release (``main.workbench``, ``journal.authors``)
 without breaking the pages that render it today.
+
+A page Flask does not serve (the iNaturalist Label Generator at /labels) is an
+item with a ``url`` instead of an ``endpoint``; it is never marked active. An
+item with ``children`` is a tab that opens a menu of its children rather than
+linking anywhere itself.
 """
 
 from datetime import datetime, timedelta, timezone
@@ -51,8 +56,13 @@ WORKBENCH_NAV = (
      'login_required': True,
      'description': 'Read specimen voucher numbers from your iNaturalist photos and '
                     'sync them to an observation field.'},
-    {'label': 'Voucher Labels', 'endpoint': 'main.voucher_labels', 'icon': 'fa-tag',
-     'description': 'Generate numbered specimen voucher label sheets for printing.'},
+    {'label': 'Labels', 'key': 'labels', 'children': (
+        {'label': 'Herbarium Labels', 'url': '/labels', 'icon': 'fa-leaf',
+         'description': 'Print herbarium labels, as PDF or RTF, for your iNaturalist '
+                        'observations.'},
+        {'label': 'Voucher Labels', 'endpoint': 'main.voucher_labels', 'icon': 'fa-tag',
+         'description': 'Generate numbered specimen voucher label sheets for printing.'},
+    )},
     {'label': 'Docs', 'endpoint': 'main.help_page', 'icon': 'fa-circle-question',
      'description': 'Practical guides for building trees, inspecting alignments, '
                     'editing results and using the API.'},
@@ -80,6 +90,7 @@ FOOTER_COLUMNS = (
         {'label': 'Tree Builder', 'endpoint': 'main.sequence_entry'},
         {'label': 'iNat Finder', 'endpoint': 'main.inat_finder'},
         {'label': 'Voucher Sync', 'endpoint': 'main.voucher_sync'},
+        {'label': 'Herbarium Labels', 'url': '/labels'},
         {'label': 'Voucher Labels', 'endpoint': 'main.voucher_labels'},
         {'label': 'Docs', 'endpoint': 'main.help_page'},
     )},
@@ -105,7 +116,9 @@ ACTIVE_JOB_MAX_AGE = timedelta(days=7)
 
 def _resolve(item):
     """Return (endpoint, url) for an item, or (None, None) when neither its
-    endpoint nor its fallback is registered."""
+    endpoint nor its fallback is registered. A ``url`` item has no endpoint."""
+    if 'url' in item:
+        return None, item['url']
     for endpoint in (item['endpoint'], item.get('fallback')):
         if endpoint and endpoint in current_app.view_functions:
             url = url_for(endpoint)
@@ -118,7 +131,7 @@ def _resolve(item):
 def _current(item, resolved_endpoint, endpoint):
     """aria-current value: "page" on the item's own page, "true" on a page it
     owns through ``also`` (or a fallback), None otherwise."""
-    if endpoint is None:
+    if endpoint is None or 'url' in item:
         return None
     if endpoint == item['endpoint'] or endpoint == resolved_endpoint:
         return 'page'
@@ -134,6 +147,16 @@ def active_section():
 def _links(items, endpoint=None):
     links = []
     for item in items:
+        if 'children' in item:
+            # A menu tab: shown when any child resolves. The tab is a button,
+            # so it is never the page itself; a child page marks it "true".
+            children = _links(item['children'], endpoint)
+            if children:
+                links.append({'label': item['label'], 'key': item['key'],
+                              'children': children,
+                              'current': 'true' if any(c['current'] for c in children)
+                                         else None})
+            continue
         resolved, url = _resolve(item)
         if url is None:
             continue
@@ -144,10 +167,14 @@ def _links(items, endpoint=None):
 
 def workbench_tools():
     """The Workbench tools as overview-page cards: every WORKBENCH_NAV item
-    except the overview itself, in nav order, skipping unregistered ones."""
+    except the overview itself, in nav order, skipping unregistered ones. A
+    menu tab contributes one card per child."""
     tools = []
+    items = []
     for item in WORKBENCH_NAV:
-        if item['endpoint'] == 'main.workbench':
+        items.extend(item.get('children', (item,)))
+    for item in items:
+        if item.get('endpoint') == 'main.workbench':
             continue
         _, url = _resolve(item)
         if url is None:
