@@ -69,6 +69,16 @@ def _session_owner(create=False):
     return token
 
 
+def ensure_session_owner():
+    """Give this session its owner token now, while serving the page.
+
+    Left to ``start()``, two background requests sent before either answered
+    would each mint a token and the cookie would keep only the last, so the
+    other task's polls would read as "no longer running".
+    """
+    _session_owner(create=True)
+
+
 def _redis():
     from app.workers.queue import get_redis_connection
     return get_redis_connection()

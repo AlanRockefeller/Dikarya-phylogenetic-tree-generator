@@ -222,6 +222,8 @@ def _referred_by_mycomap():
 
 @bp.route('/tree')
 def sequence_entry():
+    from app.services import background_requests
+    background_requests.ensure_session_owner()
     return render_template(
         'sequence_entry.html',
         mycomap_one_click_allowed=(
