@@ -383,6 +383,52 @@ class Config:
         'MAFFT_DIRECTION_MODE', 'fast', MAFFT_DIRECTION_MODES
     )
 
+    # Which strategy a job that did not ask for one gets.
+    #
+    #   auto   --auto                                   (default)
+    #   linsi  --localpair --maxiterate 1000 when the input has fewer than
+    #          MAFFT_LINSI_MAX_SEQUENCES sequences and none reaches
+    #          MAFFT_LINSI_MAX_LENGTH bp; --auto otherwise
+    #
+    # --auto gives full L-INS-i only below 100 sequences. Measured over 11,960
+    # jobs on disk, 65% have 100-199 sequences and a longest sequence under
+    # 1,000 bp, where --auto runs local-pair with just 2 refinement rounds, and
+    # another 27% are under 200 sequences but switched to FFT-NS-i because ONE
+    # sequence reached 1,000 bp. With the opt5 MAFFT build, full L-INS-i on a
+    # 176-sequence job took 25 s against 53.5 s for --auto on stock 7.505.
+    # Keep `auto` unless MAFFT_BINARY points at that build: on stock MAFFT
+    # this roughly doubles alignment time on the typical job.
+    MAFFT_DEFAULT_STRATEGIES = ("auto", "linsi")
+    MAFFT_DEFAULT_STRATEGY = choice_env(
+        'MAFFT_DEFAULT_STRATEGY', 'auto', MAFFT_DEFAULT_STRATEGIES
+    )
+    MAFFT_LINSI_MAX_SEQUENCES = count_env('MAFFT_LINSI_MAX_SEQUENCES', 200)
+    MAFFT_LINSI_MAX_LENGTH = count_env('MAFFT_LINSI_MAX_LENGTH', 3000)
+
+    # Tree methods whose jobs get full L-INS-i (within the two limits above)
+    # whatever MAFFT_DEFAULT_STRATEGY says: the full ML and Bayesian runs, where
+    # the alignment is a few seconds against minutes to hours of tree search,
+    # and Quick Tree (iqtree_fast). FastTree and NJ keep --auto. Set to an empty
+    # string to turn it off.
+    #
+    # Measured 2026-10-07 on 20 real jobs (--auto vs full L-INS-i, same trimming,
+    # IQ-TREE GTR+F+G4 with SH-aLRT): below 1,000 bp the two alignments were
+    # identical or differed less than two tree-search seeds do. Where one sequence
+    # of >= 1,000 bp had pushed --auto to FFT-NS-i (27% of MAFFT jobs), 4 of 8
+    # topologies moved by more than seed noise and 2 of 8 flipped 3-5 clades with
+    # SH-aLRT >= 80. L-INS-i costs ~10 s more on such a job with the opt5-dikarya1
+    # MAFFT build.
+    #
+    # Quick Tree measured the same way 2026-10-08 (16 jobs, its own IQ-TREE
+    # preset): where --auto used local pairs, 6 of 8 trees were identical to
+    # L-INS-i and none contradicted a clade with SH-aLRT >= 80; where it had
+    # fallen to FFT-NS-i (~31% of Quick Trees), 6 of 8 contradicted 1-3 such
+    # clades, while two seeds on one alignment never did. That costs ~5-25 s
+    # more on those jobs at 2 threads and almost nothing on the rest.
+    MAFFT_LINSI_TREE_METHODS = frozenset(
+        _csv_env('MAFFT_LINSI_TREE_METHODS', 'iqtree,raxml,mrbayes,iqtree_fast')
+    )
+
 
     # Paths
     BASE_DIR = Path(__file__).resolve().parent.parent

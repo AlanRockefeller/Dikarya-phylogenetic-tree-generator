@@ -907,6 +907,39 @@
                     </label>
                 </div>
 
+                <!-- Alan 10/7/26 - Optional refresh at MycoMap before importing, as the iNaturalist panel offers. -->
+                <div class="rounded-lg border border-gray-200 dark:border-gray-700 p-3 space-y-2 text-sm text-gray-700 dark:text-gray-200">
+                    <div class="flex flex-wrap items-center gap-x-4 gap-y-2">
+                        <label class="flex items-center space-x-2 cursor-pointer"
+                               title="Rerun this search's local MycoMap BLAST before importing, so new MycoMap sequences are included.">
+                            <input type="checkbox" id="mycomap_refresh_blast" checked class="w-4 h-4 text-journal-gold bg-gray-100 border-gray-300 rounded
+                                          focus:ring-journal-gold dark:bg-journal-dark dark:border-gray-600">
+                            <span class="font-medium">Refresh MycoMap BLAST first</span>
+                        </label>
+                        <label class="flex items-center gap-2">
+                            <span>Local hits</span>
+                            <input type="number" id="mycomap_refresh_local_limit" min="1" max="500" step="1" value="50"
+                                   class="w-20 px-2 py-1 border border-gray-300 dark:border-journal-dark rounded-lg bg-white dark:bg-journal-dark text-gray-900 dark:text-gray-100 focus:ring-2 focus:ring-journal-gold focus:border-transparent">
+                        </label>
+                    </div>
+                    <div class="flex flex-wrap items-center gap-x-4 gap-y-2">
+                        <label class="flex items-center space-x-2 cursor-pointer"
+                               title="Also rebuild the NCBI BLAST at MycoMap. MycoMap needs about 10 minutes before the new NCBI results can be imported.">
+                            <input type="checkbox" id="mycomap_rebuild_ncbi" class="w-4 h-4 text-journal-gold bg-gray-100 border-gray-300 rounded
+                                          focus:ring-journal-gold dark:bg-journal-dark dark:border-gray-600">
+                            <span class="font-medium">Also rebuild NCBI BLAST</span>
+                        </label>
+                        <label class="flex items-center gap-2">
+                            <span>NCBI hits</span>
+                            <input type="number" id="mycomap_refresh_ncbi_limit" min="1" max="500" step="1" value="100"
+                                   class="w-20 px-2 py-1 border border-gray-300 dark:border-journal-dark rounded-lg bg-white dark:bg-journal-dark text-gray-900 dark:text-gray-100 focus:ring-2 focus:ring-journal-gold focus:border-transparent">
+                        </label>
+                    </div>
+                    <p class="text-xs text-gray-500 dark:text-gray-400">
+                        Local refresh takes a few seconds; an NCBI rebuild takes about 10 minutes, then the import runs.
+                    </p>
+                </div>
+
                 <!-- Fetch / One-Click Tree Buttons -->
                 <div class="flex gap-3">
                     <button id="fetch_mycomap_btn" data-active-style="outline" class="btn flex-1">
@@ -2131,6 +2164,59 @@
         return error;
     }
 
+    // Alan 10/7/26 - BLAST takes 35-95 s and the iNat tree preview can take a
+    // minute. Held open as one request, a phone that switched apps while it
+    // waited lost the answer ("Load failed", nginx 499) though the server
+    // finished the work. Asked with X-Dikarya-Background the server answers 202
+    // at once and runs the lookup on its own (app/services/background_requests.py);
+    // this polls for the result, and a poll lost to a suspended tab is simply
+    // retried. Resolves to a Response exactly like fetch(), so call sites only
+    // swap the function name. A server that ran it inline answers as before.
+    const BACKGROUND_POLL_MS = 2000;
+    const BACKGROUND_MAX_WAIT_MS = 6 * 60 * 1000;
+
+    function waitForBackgroundPoll(ms) {
+        return new Promise(resolve => {
+            const done = () => {
+                clearTimeout(timer);
+                document.removeEventListener('visibilitychange', onVisible);
+                resolve();
+            };
+            // Coming back to the tab polls immediately instead of waiting out
+            // a timer the browser throttled while it was hidden.
+            const onVisible = () => { if (!document.hidden) done(); };
+            const timer = setTimeout(done, ms);
+            document.addEventListener('visibilitychange', onVisible);
+        });
+    }
+
+    async function fetchInBackground(url, options = {}) {
+        const headers = Object.assign({}, options.headers, {'X-Dikarya-Background': '1'});
+        const first = await fetch(url, Object.assign({}, options, {headers}));
+        if (first.status !== 202) return first;
+        let started = null;
+        try { started = await first.clone().json(); } catch (_) { return first; }
+        if (!started || !started.task_id) return first;
+
+        const pollUrl = `/api/background/${encodeURIComponent(started.task_id)}`;
+        const deadline = Date.now() + BACKGROUND_MAX_WAIT_MS;
+        for (;;) {
+            await waitForBackgroundPoll(BACKGROUND_POLL_MS);
+            let resp = null;
+            try {
+                resp = await fetch(pollUrl, {credentials: 'same-origin', cache: 'no-store'});
+            } catch (_) {
+                // Suspended tab or a network blip; the server is still working.
+            }
+            if (resp && resp.status !== 202 && resp.status !== 429) return resp;
+            // Checked after the poll, so a tab that slept past the deadline
+            // still collects a result that finished while it was away.
+            if (Date.now() > deadline) {
+                throw new Error('The server is taking unusually long to answer. Please try again.');
+            }
+        }
+    }
+
     function reportWorkflowFailure(action, error) {
         if (!error || error.expected || error.name === 'AbortError') return;
         const status = Number(error.httpStatus) || 0;
@@ -2933,7 +3019,7 @@
             }
 
             const csrfToken = document.querySelector('meta[name="csrf-token"]').getAttribute('content');
-            const resp = await fetch('/api/blast', {
+            const resp = await fetchInBackground('/api/blast', {
                 method: 'POST',
                 headers: {
                     'Content-Type': 'application/json',
@@ -3179,6 +3265,10 @@
     const mycomapAllowIdenticalLocationsOption = document.getElementById('mycomap_allow_identical_locations_option');
     const fetchMycomapBtn = document.getElementById('fetch_mycomap_btn');
     const mycomapQuickTreeBtn = document.getElementById('mycomap_quick_tree_btn');
+    const mycomapRefreshBlastCheckbox = document.getElementById('mycomap_refresh_blast');
+    const mycomapRebuildNcbiCheckbox = document.getElementById('mycomap_rebuild_ncbi');
+    const mycomapRefreshLocalLimitInput = document.getElementById('mycomap_refresh_local_limit');
+    const mycomapRefreshNcbiLimitInput = document.getElementById('mycomap_refresh_ncbi_limit');
     let lastMycomapBlastUrl = '';
     // Alan 6/26/26 - Preserve MycoMap import filter diagnostics so tree Generation Details can explain excluded records.
     let importFilterDetails = {};
@@ -3409,6 +3499,106 @@
         }
     }
 
+    // Alan 10/7/26 - Optional "Refresh MycoMap BLAST first": rerun the search's local BLAST
+    // (and, if asked, rebuild its NCBI BLAST) at MycoMap through the same background job the
+    // iNaturalist panel's MycoMap BLAST button uses, then let the normal /api/mycomap import
+    // run, so filters, dedup and BLAST metrics behave exactly as without a refresh.
+    // refresh_only keeps the job from gathering sequences the import fetches anyway.
+    // Throws on failure; a rerun MycoMap declined comes back as a warning and the import
+    // proceeds on the saved results.
+    async function refreshMycomapBlastBeforeImport(url) {
+        const rebuildNcbi = Boolean(mycomapRebuildNcbiCheckbox?.checked);
+        showStatus(
+            rebuildNcbi
+                ? 'Refreshing the MycoMap BLAST. Local results refresh right away; the NCBI rebuild takes about 10 minutes before the import runs.'
+                : 'Refreshing the MycoMap local BLAST before importing...',
+            'info'
+        );
+        const csrfToken = document.querySelector('meta[name="csrf-token"]').getAttribute('content');
+        const startResp = await fetch('/api/mycomap/refresh', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json', 'X-CSRFToken': csrfToken},
+            body: JSON.stringify({
+                url: url,
+                rebuild_ncbi: rebuildNcbi,
+                local_limit: mycomapRefreshLocalLimitInput?.value,
+                ncbi_limit: mycomapRefreshNcbiLimitInput?.value,
+                refresh_only: true
+            })
+        });
+        const startData = await startResp.json();
+        if (!startResp.ok) {
+            throw httpError(startResp, startData.error || 'Failed to start the MycoMap BLAST refresh');
+        }
+        // Alan 10/8/26 - A local rerun usually finishes in 3-4 s and the worker checks
+        // it every second early on, so poll every second for the first 15 s, then every
+        // 3 s (5 s while an NCBI rebuild runs); a slow one falls back to the worker's
+        // once-a-minute check.
+        const pollDelayMs = (attempt) => attempt < 15 ? 1000 : (rebuildNcbi ? 5000 : 3000);
+        const startedAt = Date.now();
+        const deadline = startedAt + (rebuildNcbi ? 25 : 6) * 60 * 1000;
+        setMycomapBusyLabel(rebuildNcbi ? 'Rebuilding local + NCBI BLAST...' : 'Rebuilding local BLAST...');
+        let announcedLocalDone = false;
+        for (let attempt = 0; Date.now() < deadline; attempt++) {
+            await new Promise(resolve => setTimeout(resolve, pollDelayMs(attempt)));
+            let statusData = null;
+            try {
+                const statusResp = await fetch(`/api/mycomap/refresh/${encodeURIComponent(startData.job_id)}`);
+                statusData = await statusResp.json();
+            } catch (_) {
+                continue;  // a suspended tab or a network blip; the job keeps running
+            }
+            if (statusData.status === 'finished') {
+                const result = statusData.result || {};
+                if (result.status === 'error') {
+                    throw expectedError(result.error || 'MycoMap BLAST refresh failed');
+                }
+                return {
+                    warnings: result.warnings || [],
+                    refreshedSources: Array.isArray(result.refreshed_sources) ? result.refreshed_sources : null
+                };
+            }
+            if (statusData.status === 'failed' || statusData.status === 'error') {
+                throw expectedError(statusData.error || 'MycoMap BLAST refresh failed');
+            }
+            // Alan 10/8/26 - Say which rebuild is still running. Both run at MycoMap in
+            // parallel; the local one is usually done in seconds, NCBI in about 10 minutes.
+            const progress = statusData.progress || {};
+            if (rebuildNcbi && progress.ncbi === 'running' && progress.local && progress.local !== 'running') {
+                const minutes = Math.floor((Date.now() - startedAt) / 60000);
+                setMycomapBusyLabel(`Local done; rebuilding NCBI BLAST${minutes ? ` (${minutes} min)` : ''}...`);
+                if (!announcedLocalDone) {
+                    announcedLocalDone = true;
+                    showStatus(
+                        progress.local === 'done'
+                            ? 'MycoMap local BLAST rebuilt. Waiting for the NCBI rebuild (usually about 10 minutes); the import starts as soon as it finishes.'
+                            : 'MycoMap could not rebuild the local BLAST; saved local results will be used. Waiting for the NCBI rebuild (usually about 10 minutes)...',
+                        'info', 30000
+                    );
+                }
+            }
+        }
+        throw expectedError('The MycoMap BLAST refresh is taking longer than expected. Try again in a few minutes.');
+    }
+
+    // Alan 10/8/26 - One sentence naming the BLAST sources MycoMap actually reran.
+    // null means the backend did not report them (legacy mycomap.com results).
+    function describeMycomapRefresh(sources) {
+        if (sources === null || sources === undefined) return 'MycoMap BLAST refresh finished.';
+        const names = sources.map(source => source === 'ncbi' ? 'NCBI' : 'local');
+        if (!names.length) return 'MycoMap BLAST was not refreshed; using saved results.';
+        return `MycoMap ${names.join(' and ')} BLAST refreshed.`;
+    }
+
+    // Alan 10/8/26 - The button that started the current MycoMap import, so a long
+    // BLAST rebuild can say what it is doing instead of an unexplained "Fetching...".
+    let mycomapBusyButton = null;
+    function setMycomapBusyLabel(text) {
+        if (!mycomapBusyButton) return;
+        mycomapBusyButton.innerHTML = '<i class="fas fa-spinner fa-spin mr-2"></i> ';
+        mycomapBusyButton.appendChild(document.createTextNode(text));
+    }
+
     // Shared fetch logic returns true on success and false on error.
     async function doFetchMycomap() {
         const url = mycomapUrlInput.value.trim();
@@ -3457,6 +3647,21 @@
             return false;
         }
 
+        let refreshWarnings = [];
+        let refreshSummary = '';
+        if (mycomapRefreshBlastCheckbox?.checked || mycomapRebuildNcbiCheckbox?.checked) {
+            try {
+                const refreshResult = await refreshMycomapBlastBeforeImport(url);
+                refreshWarnings = refreshResult.warnings;
+                refreshSummary = describeMycomapRefresh(refreshResult.refreshedSources);
+            } catch (e) {
+                reportWorkflowFailure('tree_builder.mycomap_refresh', e);
+                showStatus('MycoMap BLAST refresh error: ' + e.message, 'error');
+                return false;
+            }
+        }
+
+        setMycomapBusyLabel('Fetching...');
         showStatus('Fetching sequences from Mycomap...', 'info');
 
         try {
@@ -3502,7 +3707,16 @@
             if (data.blast_metrics_count > 0) {
                 statusMsg += ` ${data.blast_metrics_count} sequence${data.blast_metrics_count !== 1 ? 's' : ''} include BLAST metrics and can be filtered from the queue.`;
             }
-            showStatus(statusMsg, 'success');
+            // Alan 10/8/26 - Say whether the BLAST was refreshed in the same message;
+            // a second showStatus replaced the first, so the outcome was never seen.
+            if (refreshSummary) {
+                statusMsg = `${refreshSummary} ${statusMsg}`;
+            }
+            // A local or NCBI rerun MycoMap declined: the import above used its saved results.
+            if (refreshWarnings.length) {
+                statusMsg += ` ${refreshWarnings.join(' ')}`;
+            }
+            showStatus(statusMsg, refreshWarnings.length ? 'warning' : 'success', refreshSummary || refreshWarnings.length ? 10000 : 5000);
 
             lastMycomapBlastUrl = url;
             mergeImportFilterDetails(data.import_filter_details);
@@ -3520,7 +3734,9 @@
     fetchMycomapBtn.addEventListener('click', async () => {
         fetchMycomapBtn.disabled = true;
         fetchMycomapBtn.innerHTML = '<i class="fas fa-spinner fa-spin mr-2"></i> Fetching...';
+        mycomapBusyButton = fetchMycomapBtn;
         await doFetchMycomap();
+        mycomapBusyButton = null;
         fetchMycomapBtn.disabled = false;
         fetchMycomapBtn.innerHTML = '<i class="fas fa-download mr-2"></i> Fetch sequences only';
     });
@@ -3530,7 +3746,9 @@
         fetchMycomapBtn.disabled = true;
         mycomapQuickTreeBtn.innerHTML = '<i class="fas fa-spinner fa-spin mr-2"></i> Fetching...';
 
+        mycomapBusyButton = mycomapQuickTreeBtn;
         const ok = await doFetchMycomap();
+        mycomapBusyButton = null;
 
         if (!ok) {
             mycomapQuickTreeBtn.disabled = false;
@@ -3979,7 +4197,7 @@
             const csrfToken = document.querySelector('meta[name="csrf-token"]').getAttribute('content');
             const body = { input };
             if (resolvedType) body.resolved_type = resolvedType;
-            const resp = await fetch('/api/inaturalist/tree/preview', {
+            const resp = await fetchInBackground('/api/inaturalist/tree/preview', {
                 method: 'POST',
                 headers: {
                     'Content-Type': 'application/json',
@@ -4240,7 +4458,7 @@
 
         try {
             const csrfToken = document.querySelector('meta[name="csrf-token"]').getAttribute('content');
-            const resp = await fetch('/api/blast', {
+            const resp = await fetchInBackground('/api/blast', {
                 method: 'POST',
                 headers: {
                     'Content-Type': 'application/json',
@@ -4821,7 +5039,7 @@
         showStatus('Running BLAST for the selected Mushroom Observer ITS sequence...', 'info');
         try {
             const csrfToken = document.querySelector('meta[name="csrf-token"]').getAttribute('content');
-            const response = await fetch('/api/blast', {
+            const response = await fetchInBackground('/api/blast', {
                 method: 'POST',
                 headers: {'Content-Type': 'application/json', 'X-CSRFToken': csrfToken},
                 body: JSON.stringify({query: selected.sequence})
@@ -5858,6 +6076,34 @@
                 showStatus(`Failed to clone job: ${e.message}`, 'error', 5000);
             }
         })();
+    }
+
+    // --- LINK FROM MYCOMAP (?mycomap_url=...&one_click=1) ---
+    // Alan 10/7/26 - The link always fills in the MycoMap URL. It starts the
+    // One-Click Tree by itself only when the server saw the visitor arrive from
+    // MycoMap (mycomap_one_click_allowed in app/main/routes.py); a link from
+    // anywhere else waits for the visitor to press the button.
+    const MYCOMAP_ONE_CLICK_ALLOWED = {{ 'true' if mycomap_one_click_allowed else 'false' }};
+    const linkedMycomapUrl = (urlParams.get('mycomap_url') || '').trim();
+    if (linkedMycomapUrl && !EDIT_JOB_ID && !CLONE_JOB_ID
+        && (isValidMycomapUrl(linkedMycomapUrl) || isMycomapSequenceUrl(linkedMycomapUrl))) {
+        window.openImportSection?.('mycomap');
+        mycomapUrlInput.value = linkedMycomapUrl;
+        checkMycomapState();
+        // Drop one_click from the address so a reload or Back cannot submit a
+        // second job.
+        if (urlParams.has('one_click')) {
+            const cleaned = new URL(window.location.href);
+            cleaned.searchParams.delete('one_click');
+            history.replaceState(history.state, '', cleaned.pathname + cleaned.search + cleaned.hash);
+        }
+        if (MYCOMAP_ONE_CLICK_ALLOWED) {
+            mycomapQuickTreeBtn.click();
+        } else {
+            mycomapQuickTreeBtn.scrollIntoView({block: 'center'});
+            mycomapQuickTreeBtn.focus({preventScroll: true});
+            showStatus('MycoMap BLAST link loaded. Press One-Click Tree to build the tree.', 'info');
+        }
     }
 
     // =========================================================================

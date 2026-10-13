@@ -537,6 +537,16 @@ def get_job_status(job_id: str) -> Dict[str, Any]:
         # scheduled again. It is internal state and cannot be JSON encoded.
         if status != "failed" and result and not isinstance(result, Retry):
             response["result"] = result
+
+        # Per-source state of a MycoMap.org BLAST rerun, so the browser can say
+        # "local done, NCBI still rebuilding". Whitelisted: only these names
+        # and states ever leave the job meta.
+        progress = (job.meta or {}).get("mycomap_refresh_progress")
+        if isinstance(progress, dict):
+            response["progress"] = {
+                source: state for source, state in progress.items()
+                if source in ("local", "ncbi") and state in ("running", "done", "failed")
+            }
             
         return response
         

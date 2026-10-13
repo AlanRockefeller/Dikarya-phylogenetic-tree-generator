@@ -1,17 +1,38 @@
 {% extends "base_modern.html" %}
 
-{% block title %}Dikarya - Tree Viewer{% endblock %}
+{# Title, description and the link-preview tags are server-rendered from
+   social_preview_service: Facebook, X, Discord etc. never run this page's JS.
+   Guarded so a render without `social` keeps the old title and no card. #}
+{% block title %}{{ social.title if social is defined else 'Dikarya - Tree Viewer' }}{% endblock %}
+{% block description %}{{ social.description if social is defined else 'Dikarya - Mycological Research Tools' }}{% endblock %}
 
 {# The tree, its toolbar and the settings panel use the whole window width. #}
 {% block main_width %}max-w-none{% endblock %}
 
 {% block head %}
+<link rel="stylesheet" href="{{ url_for('static', filename='vendor/viewer-fonts.css') }}">
+{% if social is defined %}
+<link rel="canonical" href="{{ social.url }}">
+<meta property="og:type" content="website">
+<meta property="og:site_name" content="Dikarya">
+<meta property="og:title" content="{{ social.title }}">
+<meta property="og:description" content="{{ social.description }}">
+<meta property="og:url" content="{{ social.url }}">
+<meta property="og:image" content="{{ social.image_url }}">
+<meta property="og:image:secure_url" content="{{ social.image_url }}">
+<meta property="og:image:type" content="image/png">
+<meta property="og:image:width" content="{{ social.image_width }}">
+<meta property="og:image:height" content="{{ social.image_height }}">
+<meta property="og:image:alt" content="{{ social.image_alt }}">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:title" content="{{ social.title }}">
+<meta name="twitter:description" content="{{ social.description }}">
+<meta name="twitter:image" content="{{ social.image_url }}">
+<meta name="twitter:image:alt" content="{{ social.image_alt }}">
+{% endif %}
 <link rel="stylesheet" href="{{ url_for('static', filename='css/tree_viewer.css') }}?v=25">
 <link rel="stylesheet" href="{{ url_for('static', filename='css/phylotree.css') }}?v=3">
 <link rel="stylesheet" href="{{ url_for('static', filename='css/phylotree-menus.css') }}?v=3">
-<link rel="preconnect" href="https://fonts.googleapis.com">
-<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;700&display=swap">
 <link rel="stylesheet" href="{{ url_for('static', filename='css/alignment_viewer.css') }}?v=20">
 {% endblock %}
 
@@ -553,6 +574,11 @@
                     <button type="button" id="btn-annotation-delete"
                         class="hidden mr-auto px-4 py-2 text-sm font-semibold rounded-lg border border-red-300 dark:border-red-700 text-red-600 dark:text-red-300 hover:bg-red-50 dark:hover:bg-red-900/30 transition-colors">
                         <i class="fas fa-trash"></i> Delete annotation
+                    </button>
+                    <button type="button" id="btn-annotation-edit-members"
+                        title="Save changes and select the sequences belonging to this annotation"
+                        class="hidden px-4 py-2 text-sm font-semibold rounded-lg border border-gray-300 dark:border-gray-600 text-gray-700 dark:text-gray-200 hover:bg-gray-100 dark:hover:bg-journal-dark transition-colors">
+                        <i class="fas fa-users"></i> Edit members
                     </button>
                     <button type="button" id="btn-annotation-cancel"
                         class="px-4 py-2 text-sm font-semibold rounded-lg border border-gray-300 dark:border-gray-600 text-gray-700 dark:text-gray-200 hover:bg-gray-100 dark:hover:bg-journal-dark transition-colors">
@@ -1571,11 +1597,11 @@
 
 <script src="{{ url_for('static', filename='js/phylotree.js') }}?v=15"></script>
 
-<script src="{{ url_for('static', filename='js/tree_viewer_phylotree_v2.js') }}?v=107"></script>
+<script src="{{ url_for('static', filename='js/tree_viewer_phylotree_v2.js') }}?v=111"></script>
 
 <script src="{{ url_for('static', filename='js/tree_viewer_api.js') }}?v=8"></script>
 
-<script src="{{ url_for('static', filename='js/tree_viewer_controller.js') }}?v=102"></script>
+<script src="{{ url_for('static', filename='js/tree_viewer_controller.js') }}?v=106"></script>
 
 {% include 'partials/alignment_viewer_modal.html' %}
 

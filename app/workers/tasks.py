@@ -25,7 +25,7 @@ from app.services.artifact_storage import (
 )
 from app.services.log_context import (
     JobContextFilter, background_job_context, bind_background_context,
-    background_user_identity, failure_message_field, note_job_failure_logged,
+    background_user_identity, failure_message_field, log_degradation, note_job_failure_logged,
     stable_fingerprint, utc_formatter,
 )
 from app.services.tree_parameter_validation import validate_iqtree_ufboot_count
@@ -52,6 +52,35 @@ from app.workers.events import (
 # everything the per-job pipeline.log handler exists to capture -- was dropped.
 # Levels and handlers are now set explicitly in app._install_logging().
 logger = logging.getLogger(__name__)
+# How long a MycoMap.org local-only BLAST refresh is polled in the worker before
+# falling back to the once-a-minute deferred wait.
+ORG_LOCAL_RERUN_INLINE_WAIT_SECONDS = 30
+
+
+def _org_local_rerun_poll_delay(elapsed):
+    """Seconds until the next check of a MycoMap.org local rerun.
+
+    Most local reruns publish in 3-4 s, so the first check waits 3 s, then
+    every second until 10 s, then every 3 s. Tune against the elapsed_seconds
+    that event=mycomap_org.local_rerun_wait records.
+    """
+    if elapsed < 3:
+        return 3 - elapsed
+    return 1 if elapsed < 10 else 3
+
+
+def _publish_org_refresh_progress(job, wait_details):
+    """Share each MycoMap.org rerun's state with the browser that polls this job.
+
+    Only fixed source names and states are stored -- nothing from the result --
+    because get_job_status() returns this to the browser as ``progress``.
+    """
+    if not job:
+        return
+    progress = dict(job.meta.get("mycomap_refresh_progress") or {})
+    progress.update(wait_details.get("org_source_states") or {})
+    job.meta["mycomap_refresh_progress"] = progress
+    job.save_meta()
 
 # Relocated to app/services/fasta_utils.py so the API can reject a malformed
 # FASTA at submit time instead of accepting the job and failing it in the
@@ -992,6 +1021,9 @@ def run_mycomap_blast_refresh_job(params: dict) -> dict:
     resuming = bool(job and job.meta.get("mycomap_refresh_stage") in
                     {"waiting_for_ncbi", "waiting_for_org"})
     warnings = list((job.meta.get("mycomap_refresh_warnings") or [])) if (job and resuming) else []
+    # Which BLAST sources MycoMap actually reran, for the browser to report.
+    # Filled in by the MycoMap.org path; None means "not reported" (.com).
+    refreshed_sources = None
 
     if org_provider:
         if not resuming:
@@ -1011,11 +1043,17 @@ def run_mycomap_blast_refresh_job(params: dict) -> dict:
             local_limit, local_error = validate_mycomap_rerun_limit(params.get("local_limit"), "local")
             if local_error:
                 return {"status": "error", "error": local_error}
+            states = wait_details.setdefault("org_source_states", {})
             try:
                 rerun_mycomap_result(reference, "local", local_limit)
                 wait_details["org_wait_sources"].append("local")
+                states["local"] = "running"
             except OrgResultError as exc:
+                states["local"] = "failed"
                 warnings.append(f"MycoMap.org local rerun failed; using saved results. {exc}")
+                log_degradation(logger, "mycomap_org_rerun",
+                                f"local rerun refused; imported saved results. {exc}",
+                                result_id=blast_id, status=getattr(exc, "status", ""))
             if params.get("rebuild_ncbi"):
                 ncbi_limit, ncbi_error = validate_mycomap_rerun_limit(params.get("ncbi_limit"), "ncbi")
                 if ncbi_error:
@@ -1023,29 +1061,91 @@ def run_mycomap_blast_refresh_job(params: dict) -> dict:
                 try:
                     rerun_mycomap_result(reference, "ncbi", ncbi_limit)
                     wait_details["org_wait_sources"].append("ncbi")
+                    states["ncbi"] = "running"
                 except OrgResultError as exc:
+                    states["ncbi"] = "failed"
                     warnings.append(f"MycoMap.org NCBI rerun failed; using saved results. {exc}")
+                    log_degradation(logger, "mycomap_org_rerun",
+                                    f"NCBI rerun refused; imported saved results. {exc}",
+                                    result_id=blast_id, status=getattr(exc, "status", ""))
+            requested_sources = list(wait_details["org_wait_sources"])
+            _publish_org_refresh_progress(job, wait_details)
+            # Alan 10/8/26 - A local rerun is usually published within seconds
+            # (672622: 4 s), so check briefly before the once-a-minute wait,
+            # which made every local refresh take at least a minute. With an
+            # NCBI rebuild alongside (both run at MycoMap in parallel) this
+            # still runs, so the browser can say the local half is done; the
+            # NCBI half, which takes minutes, is left to the deferred wait.
+            if "local" in requested_sources:
+                started = time.monotonic()
+                checks = 0
+                outcome = "deferred"
+                while True:
+                    elapsed = time.monotonic() - started
+                    delay = _org_local_rerun_poll_delay(elapsed)
+                    if elapsed + delay > ORG_LOCAL_RERUN_INLINE_WAIT_SECONDS:
+                        break
+                    time.sleep(delay)
+                    checks += 1
+                    try:
+                        still_pending = rerun_pending(wait_details)
+                    except OrgResultError:
+                        outcome = "error"
+                        break  # the deferred path below reports it
+                    _publish_org_refresh_progress(job, wait_details)
+                    if wait_details.get("org_source_states", {}).get("local") != "running":
+                        outcome = "ready" if wait_details.get("local_status") != "failed" else "failed"
+                        break
+                    if not still_pending:
+                        outcome = "ready"
+                        break
+                logger.info(
+                    "event=mycomap_org.local_rerun_wait outcome=%s elapsed_seconds=%.1f "
+                    "checks=%s result_id=%s",
+                    outcome, time.monotonic() - started, checks, blast_id,
+                )
             if wait_details["org_wait_sources"]:
                 if job:
                     job.meta["mycomap_refresh_stage"] = "waiting_for_org"
                     job.meta["mycomap_org_refresh_details"] = wait_details
+                    job.meta["mycomap_org_requested_sources"] = requested_sources
                     job.meta["mycomap_refresh_warnings"] = warnings
                     job.save_meta()
+                logger.info(
+                    "event=job.deferred Waiting for MycoMap.org BLAST rerun "
+                    "reason=mycomap_org_rerun sources=%s resume_in_seconds=60",
+                    ",".join(wait_details["org_wait_sources"]),
+                )
                 return Retry(max=120, interval=60)
+            warnings = list(wait_details.get("warnings") or [])
+            refreshed_sources = [source for source in requested_sources
+                                 if wait_details.get(f"{source}_status") != "failed"]
         else:
             wait_details = dict(job.meta.get("mycomap_org_refresh_details") or {})
             try:
                 pending = rerun_pending(wait_details)
             except OrgResultError as exc:
+                _publish_org_refresh_progress(job, wait_details)
                 return {"status": "error", "error": str(exc)}
+            _publish_org_refresh_progress(job, wait_details)
             if pending:
+                job.meta["mycomap_org_refresh_details"] = wait_details
                 waits = int(job.meta.get("mycomap_org_refresh_waits") or 0) + 1
                 if waits > 120:
                     return {"status": "error", "error": "MycoMap.org rerun did not finish after 120 checks."}
                 job.meta["mycomap_org_refresh_waits"] = waits
                 job.save_meta()
+                logger.info(
+                    "event=job.deferred Waiting for MycoMap.org BLAST rerun "
+                    "reason=mycomap_org_rerun sources=%s resume_in_seconds=60",
+                    ",".join(wait_details.get("org_wait_sources") or []),
+                )
                 return Retry(max=120, interval=60)
             warnings = list(wait_details.get("warnings") or [])
+            refreshed_sources = [
+                source for source in (job.meta.get("mycomap_org_requested_sources") or [])
+                if wait_details.get(f"{source}_status") != "failed"
+            ]
 
     if not resuming and not org_provider:
         local_limit, local_error = validate_mycomap_rerun_limit(params.get("local_limit"), "local")
@@ -1083,6 +1183,13 @@ def run_mycomap_blast_refresh_job(params: dict) -> dict:
                 warning = f"MycoMap NCBI BLAST could not be rebuilt; using saved results instead. {exc}"
                 logger.warning("%s blast_id=%s", warning, blast_id)
                 warnings.append(warning)
+
+    # Alan 10/7/26 - The MycoMap panel refreshes first and then runs its normal
+    # /api/mycomap import (filters, dedup, BLAST metrics), so gathering the
+    # sequences here as well would only fetch them twice.
+    if params.get("refresh_only"):
+        return {"status": "success", "refreshed": True, "warnings": warnings,
+                "refreshed_sources": refreshed_sources}
 
     from app.api.routes import gather_mycomap_sequences_for_queue
 

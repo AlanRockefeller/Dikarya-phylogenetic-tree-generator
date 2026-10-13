@@ -1,0 +1,2553 @@
+From fab7bd92c13ee2ce0599b5ceece009c7264cb56c Mon Sep 17 00:00:00 2001
+From: Alan Rockefeller <alanrockefeller@gmail.com>
+Date: Fri, 9 Oct 2026 11:16:42 +0000
+Subject: [PATCH 1/5] Build without -march=native
+
+With -march=native gcc may fuse a*b+c into an FMA in the scalar kernels
+(g++ contracts even in -std=c++11), which changes single-precision
+results relative to a baseline x86-64 build such as the Debian/Ubuntu
+packages. The dikarya kernels are checked bit for bit against the
+baseline build, so build the library that way.
+---
+ CMakeLists.txt | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index b8e37830..92c1bf2e 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -14,7 +14,7 @@ set(BEAGLE_PLUGIN_VERSION "${BEAGLE_VERSION_MAJOR}${BEAGLE_VERSION_MINOR}")
+ message(STATUS "BEAGLE_VERSION = ${BEAGLE_VERSION}")
+ message(STATUS "BEAGLE_PLUGIN_VERSION = ${BEAGLE_PLUGIN_VERSION}")
+ 
+-set(BEAGLE_OPTIMIZE_FOR_NATIVE_ARCH true)
++set(BEAGLE_OPTIMIZE_FOR_NATIVE_ARCH false)
+ 
+ option(BUILD_OPENCL "Build beagle with OpenCL library" ON)
+ option(BUILD_CUDA "Build beagle with CUDA library" ON)
+-- 
+2.43.0
+
+
+From 3e75f0727e1ab8bb077cdf2704f1e7291ed61329 Mon Sep 17 00:00:00 2001
+From: Alan Rockefeller <alanrockefeller@gmail.com>
+Date: Fri, 9 Oct 2026 11:16:42 +0000
+Subject: [PATCH 2/5] CPU 4-state single precision: exact AVX2 kernels
+
+AVX2 versions of the kernels MrBayes spends its time in when it runs
+BEAGLE's CPU-4State-Single implementation: calcStatesStates,
+calcStatesPartials, calcPartialsPartials and their FixedScaling variants,
+the edge log-likelihood accumulation and state integration, and the
+per-pattern maxima of rescalePartials.
+
+Two patterns per 256-bit vector, one per 128-bit half, so all lane
+movement is in-lane. Each value is the same IEEE single-precision
+operation on the same operands, in the same order, as the scalar
+expression it replaces:
+  - sum_i = ((m_i0*p0 + m_i1*p1) + m_i2*p2) + m_i3*p3 is formed from
+    matrix columns times in-lane broadcasts of p_j, added in that order;
+  - no FMA: the functions are compiled for target("avx2") only;
+  - sums that start from a zeroed buffer start from +0.0f;
+  - the rescale maximum uses maxps(x, m), which is exactly
+    "if (x > m) m = x" (NaN and equal zeros return m), and the maximum
+    of that loop does not depend on visiting order.
+The log() calls, scale-factor and double-precision site sums are the
+original scalar code.
+
+A tip state outside 0..4 (only a negative one, since setTipStates clamps
+the top) is looked up exactly as the scalar code would. The kernels run
+only when the CPU has AVX2; BEAGLE_DIKARYA_SCALAR=1 forces the original
+code for A/B comparisons.
+
+Verification: a harness that compiles the stock and patched function
+bodies side by side (extracted from both source trees) compares every
+output bit for bit on 90,000 random cases: 1-8 categories, odd and even
+pattern counts, start/end sub-ranges, extra padding patterns, zero, -0,
+subnormal, huge, negative, inf and (x86 default) NaN inputs, negative
+tip states. MrBayes 3.2.9 runs with this build are byte-identical to
+runs with the stock 4.0.1 library and with Ubuntu's libhmsbeagle 3.1.2.
+
+Per call, 846 patterns x 4 categories, in cache: partials-partials
+1.8x, states-partials 3.5x, states-states 2.1x, edge 1.5-2.2x.
+---
+ libhmsbeagle/CPU/BeagleCPU4StateImpl.hpp | 119 ++++++++
+ libhmsbeagle/CPU/DikaryaAVX.h            | 370 +++++++++++++++++++++++
+ 2 files changed, 489 insertions(+)
+ create mode 100644 libhmsbeagle/CPU/DikaryaAVX.h
+
+diff --git a/libhmsbeagle/CPU/BeagleCPU4StateImpl.hpp b/libhmsbeagle/CPU/BeagleCPU4StateImpl.hpp
+index e6988194..231c18e2 100644
+--- a/libhmsbeagle/CPU/BeagleCPU4StateImpl.hpp
++++ b/libhmsbeagle/CPU/BeagleCPU4StateImpl.hpp
+@@ -36,6 +36,13 @@
+ #include "libhmsbeagle/beagle.h"
+ #include "libhmsbeagle/CPU/BeagleCPUImpl.h"
+ #include "libhmsbeagle/CPU/BeagleCPU4StateImpl.h"
++#include "libhmsbeagle/CPU/DikaryaAVX.h"
++
++#ifdef BEAGLE_DIKARYA_AVX
++/* The AVX2 kernels cover the single-precision 4-state layout (T_PAD == 1,
++   so OFFSET == 5) and give the same bits as the scalar code. */
++#define DK_FLOAT4 (sizeof(REALTYPE) == sizeof(float) && T_PAD == 1 && dk::enabled())
++#endif
+ 
+ #define EXPERIMENTAL_OPENMP
+ 
+@@ -190,6 +197,14 @@ void BeagleCPU4StateImpl<BEAGLE_CPU_GENERIC>::calcStatesStates(REALTYPE* destP,
+                                                                const REALTYPE* matrices2,
+                                                                int startPattern,
+                                                                int endPattern) {
++#ifdef BEAGLE_DIKARYA_AVX
++    if (DK_FLOAT4) {
++        dk::statesStates<false>((float*) destP, states1, (const float*) matrices1, states2,
++            (const float*) matrices2, NULL, kCategoryCount, kPaddedPatternCount,
++            startPattern, endPattern);
++        return;
++    }
++#endif
+ 
+ #pragma omp parallel for num_threads(kCategoryCount)
+     for (int l = 0; l < kCategoryCount; l++) {
+@@ -227,6 +242,14 @@ void BeagleCPU4StateImpl<BEAGLE_CPU_GENERIC>::calcStatesStatesFixedScaling(REALT
+                                                                            const REALTYPE* scaleFactors,
+                                                                            int startPattern,
+                                                                            int endPattern) {
++#ifdef BEAGLE_DIKARYA_AVX
++    if (DK_FLOAT4) {
++        dk::statesStates<true>((float*) destP, states1, (const float*) matrices1, states2,
++            (const float*) matrices2, (const float*) scaleFactors, kCategoryCount,
++            kPaddedPatternCount, startPattern, endPattern);
++        return;
++    }
++#endif
+ 
+ #pragma omp parallel for num_threads(kCategoryCount)
+     for (int l = 0; l < kCategoryCount; l++) {
+@@ -267,6 +290,14 @@ void BeagleCPU4StateImpl<BEAGLE_CPU_GENERIC>::calcStatesPartials(REALTYPE* destP
+                                                                  const REALTYPE* matrices2,
+                                                                  int startPattern,
+                                                                  int endPattern) {
++#ifdef BEAGLE_DIKARYA_AVX
++    if (DK_FLOAT4) {
++        dk::statesPartials<false>((float*) destP, states1, (const float*) matrices1,
++            (const float*) partials2, (const float*) matrices2, NULL, kCategoryCount,
++            kPaddedPatternCount, startPattern, endPattern);
++        return;
++    }
++#endif
+ 
+ #pragma omp parallel for num_threads(kCategoryCount)
+     for (int l = 0; l < kCategoryCount; l++) {
+@@ -306,6 +337,14 @@ void BeagleCPU4StateImpl<BEAGLE_CPU_GENERIC>::calcStatesPartialsFixedScaling(REA
+                                                                              const REALTYPE* scaleFactors,
+                                                                              int startPattern,
+                                                                              int endPattern) {
++#ifdef BEAGLE_DIKARYA_AVX
++    if (DK_FLOAT4) {
++        dk::statesPartials<true>((float*) destP, states1, (const float*) matrices1,
++            (const float*) partials2, (const float*) matrices2, (const float*) scaleFactors,
++            kCategoryCount, kPaddedPatternCount, startPattern, endPattern);
++        return;
++    }
++#endif
+ 
+ #pragma omp parallel for num_threads(kCategoryCount)
+     for (int l = 0; l < kCategoryCount; l++) {
+@@ -345,6 +384,14 @@ void BeagleCPU4StateImpl<BEAGLE_CPU_GENERIC>::calcPartialsPartials(REALTYPE* des
+                                                                    const REALTYPE* matrices2,
+                                                                    int startPattern,
+                                                                    int endPattern) {
++#ifdef BEAGLE_DIKARYA_AVX
++    if (DK_FLOAT4) {
++        dk::partialsPartials<false>((float*) destP, (const float*) partials1,
++            (const float*) matrices1, (const float*) partials2, (const float*) matrices2,
++            NULL, kCategoryCount, kPaddedPatternCount, startPattern, endPattern);
++        return;
++    }
++#endif
+ 
+ 
+ #pragma omp parallel for num_threads(kCategoryCount)
+@@ -524,6 +571,15 @@ void BeagleCPU4StateImpl<BEAGLE_CPU_GENERIC>::calcPartialsPartialsFixedScaling(R
+                                                                                const REALTYPE* scaleFactors,
+                                                                                int startPattern,
+                                                                                int endPattern) {
++#ifdef BEAGLE_DIKARYA_AVX
++    if (DK_FLOAT4) {
++        dk::partialsPartials<true>((float*) destP, (const float*) partials1,
++            (const float*) matrices1, (const float*) partials2, (const float*) matrices2,
++            (const float*) scaleFactors, kCategoryCount, kPaddedPatternCount,
++            startPattern, endPattern);
++        return;
++    }
++#endif
+ 
+ #pragma omp parallel for num_threads(kCategoryCount)
+     for (int l = 0; l < kCategoryCount; l++) {
+@@ -573,6 +629,18 @@ int inline BeagleCPU4StateImpl<BEAGLE_CPU_GENERIC>::integrateOutStatesAndScale(c
+     freq2 = gStateFrequencies[stateFrequenciesIndex][2];
+     freq3 = gStateFrequencies[stateFrequenciesIndex][3];
+ 
++#ifdef BEAGLE_DIKARYA_AVX
++    if (DK_FLOAT4) {
++        /* sumOverI for every pattern first, then the same log() calls */
++        dk::integrateStates((float*) outLogLikelihoodsTmp, (const float*) integrationTmp,
++                            (const float*) gStateFrequencies[stateFrequenciesIndex], kPatternCount);
++        for(int k = 0; k < kPatternCount; k++) {
++            const REALTYPE sumOverI = outLogLikelihoodsTmp[k];
++            outLogLikelihoodsTmp[k] = log(sumOverI);
++        }
++    } else
++#endif
++    {
+     int u = 0;
+     for(int k = 0; k < kPatternCount; k++) {
+         REALTYPE sumOverI =
+@@ -585,6 +653,7 @@ int inline BeagleCPU4StateImpl<BEAGLE_CPU_GENERIC>::integrateOutStatesAndScale(c
+ 
+         outLogLikelihoodsTmp[k] = log(sumOverI);
+     }
++    }
+ 
+     if (scalingFactorsIndex != BEAGLE_OP_NONE) {
+         const REALTYPE* scalingFactors = gScaleBuffers[scalingFactorsIndex];
+@@ -669,6 +738,42 @@ void BeagleCPU4StateImpl<BEAGLE_CPU_GENERIC>::rescalePartials(REALTYPE* destP,
+ 
+ 	bool useLogScalars = kFlags & BEAGLE_FLAG_SCALERS_LOG;
+ 
++#ifdef BEAGLE_DIKARYA_AVX
++    if (DK_FLOAT4) {
++        /* Same per-pattern values as the loop below: the maxima and the
++           1/max multiply are vectorized, the rest is that loop's scalar code. */
++        const int chunk = 256;
++        float maxima[chunk], oneOverMaxima[chunk];
++        for (int k0 = 0; k0 < kPatternCount; k0 += chunk) {
++            const int n = (kPatternCount - k0 < chunk ? kPatternCount - k0 : chunk);
++            dk::patternMaxima(maxima, (const float*) destP + 4 * k0, kCategoryCount,
++                              kPaddedPatternCount, n);
++            for (int i = 0; i < n; i++) {
++                if (maxima[i] == 0)
++                    maxima[i] = 1.0f;
++                oneOverMaxima[i] = 1.0f / maxima[i];
++            }
++            dk::scalePatterns((float*) destP + 4 * k0, oneOverMaxima, kCategoryCount,
++                              kPaddedPatternCount, n);
++            for (int i = 0; i < n; i++) {
++                const int k = k0 + i;
++                const REALTYPE max = maxima[i];
++                if (useLogScalars) {
++                    REALTYPE logMax = log(max);
++                    scaleFactors[k] = logMax;
++                    if( cumulativeScaleFactors != NULL )
++                        cumulativeScaleFactors[k] += logMax;
++                } else {
++                    scaleFactors[k] = max;
++                    if( cumulativeScaleFactors != NULL )
++                        cumulativeScaleFactors[k] += log(max);
++                }
++            }
++        }
++        return;
++    }
++#endif
++
+     for (int k = 0; k < kPatternCount; k++) {
+     	REALTYPE max = 0;
+         const int patternOffset = k * 4;
+@@ -792,6 +897,20 @@ int BeagleCPU4StateImpl<BEAGLE_CPU_GENERIC>::calcEdgeLogLikelihoods(const int pa
+ 
+     memset(integrationTmp, 0, (kPatternCount * kStateCount)*sizeof(REALTYPE));
+ 
++#ifdef BEAGLE_DIKARYA_AVX
++    if (DK_FLOAT4) {
++        if (childIndex < kTipCount && gTipStates[childIndex])
++            dk::edgeAccumulate<true>((float*) integrationTmp, (const float*) partialsParent,
++                gTipStates[childIndex], NULL, (const float*) transMatrix, (const float*) wt,
++                kCategoryCount, kPaddedPatternCount, kPatternCount);
++        else
++            dk::edgeAccumulate<false>((float*) integrationTmp, (const float*) partialsParent,
++                NULL, (const float*) gPartials[childIndex], (const float*) transMatrix,
++                (const float*) wt, kCategoryCount, kPaddedPatternCount, kPatternCount);
++        return integrateOutStatesAndScale(integrationTmp, stateFrequenciesIndex, scalingFactorsIndex, outSumLogLikelihood);
++    }
++#endif
++
+     if (childIndex < kTipCount && gTipStates[childIndex]) { // Integrate against a state at the child
+ 
+         const int* statesChild = gTipStates[childIndex];
+diff --git a/libhmsbeagle/CPU/DikaryaAVX.h b/libhmsbeagle/CPU/DikaryaAVX.h
+new file mode 100644
+index 00000000..8a611a73
+--- /dev/null
++++ b/libhmsbeagle/CPU/DikaryaAVX.h
+@@ -0,0 +1,370 @@
++/*
++ *  DikaryaAVX.h
++ *
++ *  AVX2 versions of the single-precision 4-state CPU kernels
++ *  (BeagleCPU4StateImpl<float, 1, 0>) that give bit-for-bit the same results as
++ *  the scalar code they replace.
++ *
++ *  Exactness rules followed throughout:
++ *   - every value is produced by the same IEEE single-precision operations, on
++ *     the same operands, in the same order as the scalar expression it replaces
++ *     (only commuted, which is exact: a*b == b*a and a+b == b+a, NaN payloads
++ *     aside);
++ *   - no fused multiply-add: the functions are compiled for "avx2" only, never
++ *     "fma", so a separate multiply and add cannot be contracted;
++ *   - a sum that starts from a zeroed buffer starts from +0.0f here too, since
++ *     0 + x is not x when x is -0.
++ *
++ *  Layout (as in the scalar code): partials are [category][pattern][state],
++ *  category stride 4 * paddedPatternCount; a transition matrix is 4 rows of
++ *  OFFSET = 5 floats per category (row i = from-state i, column 4 = 1.0 for a
++ *  missing state). Two patterns are processed per 256-bit vector, one per
++ *  128-bit half, so every lane-crossing step is an in-lane permute.
++ */
++
++#ifndef __BeagleDikaryaAVX__
++#define __BeagleDikaryaAVX__
++
++#if defined(__x86_64__) && defined(__GNUC__)
++#define BEAGLE_DIKARYA_AVX 1
++#endif
++
++#ifdef BEAGLE_DIKARYA_AVX
++
++#include <immintrin.h>
++#include <cmath>
++#include <cstdlib>
++
++#define DK_TARGET __attribute__((target("avx2")))
++#define DK_INLINE inline __attribute__((always_inline))
++
++namespace beagle {
++namespace cpu {
++namespace dk {
++
++/* Kernels run only when the CPU has AVX2 and BEAGLE_DIKARYA_SCALAR is unset
++   (the latter forces the original scalar code, for A/B checks). */
++inline bool enabled() {
++    static const bool on = __builtin_cpu_supports("avx2") && getenv("BEAGLE_DIKARYA_SCALAR") == NULL;
++    return on;
++}
++
++/* c[j] = column j of a 4x5 row-major matrix, duplicated into both halves:
++   (m0j, m1j, m2j, m3j, m0j, m1j, m2j, m3j). */
++DK_TARGET DK_INLINE void loadColumns(const float* m, __m256 c[4]) {
++    for (int j = 0; j < 4; j++) {
++        const __m128 col = _mm_setr_ps(m[j], m[5 + j], m[10 + j], m[15 + j]);
++        c[j] = _mm256_insertf128_ps(_mm256_castps128_ps256(col), col, 1);
++    }
++}
++
++/* t[s] = column s of a 4x5 row-major matrix, s = 0..4 (4 = missing state). */
++DK_TARGET DK_INLINE void loadStateColumns(const float* m, __m128 t[5]) {
++    for (int s = 0; s < 5; s++)
++        t[s] = _mm_setr_ps(m[s], m[5 + s], m[10 + s], m[15 + s]);
++}
++
++/* For two patterns: sum_i = ((m_i0*p0 + m_i1*p1) + m_i2*p2) + m_i3*p3, the
++   DO_INTEGRATION macro's evaluation order. */
++DK_TARGET DK_INLINE __m256 integrate2(const __m256 c[4], const __m256 p) {
++    __m256 s = _mm256_mul_ps(c[0], _mm256_permute_ps(p, 0x00));
++    s = _mm256_add_ps(s, _mm256_mul_ps(c[1], _mm256_permute_ps(p, 0x55)));
++    s = _mm256_add_ps(s, _mm256_mul_ps(c[2], _mm256_permute_ps(p, 0xAA)));
++    s = _mm256_add_ps(s, _mm256_mul_ps(c[3], _mm256_permute_ps(p, 0xFF)));
++    return s;
++}
++
++/* The same for one pattern (low halves of the column vectors). */
++DK_TARGET DK_INLINE __m128 integrate1(const __m256 c[4], const __m128 p) {
++    __m128 s = _mm_mul_ps(_mm256_castps256_ps128(c[0]), _mm_permute_ps(p, 0x00));
++    s = _mm_add_ps(s, _mm_mul_ps(_mm256_castps256_ps128(c[1]), _mm_permute_ps(p, 0x55)));
++    s = _mm_add_ps(s, _mm_mul_ps(_mm256_castps256_ps128(c[2]), _mm_permute_ps(p, 0xAA)));
++    s = _mm_add_ps(s, _mm_mul_ps(_mm256_castps256_ps128(c[3]), _mm_permute_ps(p, 0xFF)));
++    return s;
++}
++
++DK_TARGET DK_INLINE __m256 pair128(const __m128 lo, const __m128 hi) {
++    return _mm256_insertf128_ps(_mm256_castps128_ps256(lo), hi, 1);
++}
++
++/* (x[k] x4, x[k+1] x4) */
++DK_TARGET DK_INLINE __m256 broadcastPair(const float* x) {
++    return pair128(_mm_broadcast_ss(x), _mm_broadcast_ss(x + 1));
++}
++
++/* A tip state outside 0..4 (only a negative one can get here: setTipStates
++   clamps the top) indexes the matrix exactly as the scalar code does. */
++DK_INLINE bool stateInTable(int s) { return (unsigned) s <= 4u; }
++
++DK_INLINE float matrixEntry(const float* m, int row, int state) {
++    return m[5 * row + state];
++}
++
++/* ------------------------------------------------------------------------ */
++/* Partials updates                                                          */
++/* ------------------------------------------------------------------------ */
++
++/* destP = sum1 * sum2                (calcPartialsPartials)
++   destP = sum1 * sum2 / scale[k]     (calcPartialsPartialsFixedScaling) */
++template <bool FIXED_SCALING>
++DK_TARGET void partialsPartials(float* destP,
++                                const float* partials1, const float* matrices1,
++                                const float* partials2, const float* matrices2,
++                                const float* scaleFactors,
++                                int categoryCount, int paddedPatternCount,
++                                int startPattern, int endPattern) {
++    for (int l = 0; l < categoryCount; l++) {
++        const int u0 = l * 4 * paddedPatternCount;
++        const int w = l * 4 * 5;
++        __m256 c1[4], c2[4];
++        loadColumns(matrices1 + w, c1);
++        loadColumns(matrices2 + w, c2);
++        int k = startPattern;
++        for (; k + 1 < endPattern; k += 2) {
++            const int u = u0 + 4 * k;
++            const __m256 s1 = integrate2(c1, _mm256_loadu_ps(partials1 + u));
++            const __m256 s2 = integrate2(c2, _mm256_loadu_ps(partials2 + u));
++            __m256 r = _mm256_mul_ps(s1, s2);
++            if (FIXED_SCALING)
++                r = _mm256_div_ps(r, broadcastPair(scaleFactors + k));
++            _mm256_storeu_ps(destP + u, r);
++        }
++        if (k < endPattern) {
++            const int u = u0 + 4 * k;
++            const __m128 s1 = integrate1(c1, _mm_loadu_ps(partials1 + u));
++            const __m128 s2 = integrate1(c2, _mm_loadu_ps(partials2 + u));
++            __m128 r = _mm_mul_ps(s1, s2);
++            if (FIXED_SCALING)
++                r = _mm_div_ps(r, _mm_broadcast_ss(scaleFactors + k));
++            _mm_storeu_ps(destP + u, r);
++        }
++    }
++}
++
++/* destP[i] = matrices1[5i + state1] * sum2_i            (calcStatesPartials)
++   destP[i] = matrices1[5i + state1] * sum2_i / scale[k] (...FixedScaling) */
++template <bool FIXED_SCALING>
++DK_TARGET void statesPartials(float* destP,
++                              const int* states1, const float* matrices1,
++                              const float* partials2, const float* matrices2,
++                              const float* scaleFactors,
++                              int categoryCount, int paddedPatternCount,
++                              int startPattern, int endPattern) {
++    for (int l = 0; l < categoryCount; l++) {
++        const int u0 = l * 4 * paddedPatternCount;
++        const int w = l * 4 * 5;
++        const float* m1 = matrices1 + w;
++        __m128 t1[5];
++        __m256 c2[4];
++        loadStateColumns(m1, t1);
++        loadColumns(matrices2 + w, c2);
++        int k = startPattern;
++        for (; k + 1 < endPattern; k += 2) {
++            const int u = u0 + 4 * k;
++            const int sa = states1[k], sb = states1[k + 1];
++            const __m256 s2 = integrate2(c2, _mm256_loadu_ps(partials2 + u));
++            __m256 a;
++            if (stateInTable(sa) && stateInTable(sb)) {
++                a = pair128(t1[sa], t1[sb]);
++            } else {
++                a = _mm256_setr_ps(matrixEntry(m1, 0, sa), matrixEntry(m1, 1, sa),
++                                   matrixEntry(m1, 2, sa), matrixEntry(m1, 3, sa),
++                                   matrixEntry(m1, 0, sb), matrixEntry(m1, 1, sb),
++                                   matrixEntry(m1, 2, sb), matrixEntry(m1, 3, sb));
++            }
++            __m256 r = _mm256_mul_ps(a, s2);
++            if (FIXED_SCALING)
++                r = _mm256_div_ps(r, broadcastPair(scaleFactors + k));
++            _mm256_storeu_ps(destP + u, r);
++        }
++        if (k < endPattern) {
++            const int u = u0 + 4 * k;
++            const int sa = states1[k];
++            const __m128 s2 = integrate1(c2, _mm_loadu_ps(partials2 + u));
++            const __m128 a = stateInTable(sa) ? t1[sa] :
++                _mm_setr_ps(matrixEntry(m1, 0, sa), matrixEntry(m1, 1, sa),
++                            matrixEntry(m1, 2, sa), matrixEntry(m1, 3, sa));
++            __m128 r = _mm_mul_ps(a, s2);
++            if (FIXED_SCALING)
++                r = _mm_div_ps(r, _mm_broadcast_ss(scaleFactors + k));
++            _mm_storeu_ps(destP + u, r);
++        }
++    }
++}
++
++/* destP[i] = matrices1[5i + state1] * matrices2[5i + state2]  (/ scale[k]) */
++template <bool FIXED_SCALING>
++DK_TARGET void statesStates(float* destP,
++                            const int* states1, const float* matrices1,
++                            const int* states2, const float* matrices2,
++                            const float* scaleFactors,
++                            int categoryCount, int paddedPatternCount,
++                            int startPattern, int endPattern) {
++    for (int l = 0; l < categoryCount; l++) {
++        const int u0 = l * 4 * paddedPatternCount;
++        const int w = l * 4 * 5;
++        const float* m1 = matrices1 + w;
++        const float* m2 = matrices2 + w;
++        __m128 t1[5], t2[5];
++        loadStateColumns(m1, t1);
++        loadStateColumns(m2, t2);
++        for (int k = startPattern; k < endPattern; k++) {
++            const int u = u0 + 4 * k;
++            const int sa = states1[k], sb = states2[k];
++            const __m128 a = stateInTable(sa) ? t1[sa] :
++                _mm_setr_ps(matrixEntry(m1, 0, sa), matrixEntry(m1, 1, sa),
++                            matrixEntry(m1, 2, sa), matrixEntry(m1, 3, sa));
++            const __m128 b = stateInTable(sb) ? t2[sb] :
++                _mm_setr_ps(matrixEntry(m2, 0, sb), matrixEntry(m2, 1, sb),
++                            matrixEntry(m2, 2, sb), matrixEntry(m2, 3, sb));
++            __m128 r = _mm_mul_ps(a, b);
++            if (FIXED_SCALING)
++                r = _mm_div_ps(r, _mm_broadcast_ss(scaleFactors + k));
++            _mm_storeu_ps(destP + u, r);
++        }
++    }
++}
++
++/* ------------------------------------------------------------------------ */
++/* Edge likelihood                                                           */
++/* ------------------------------------------------------------------------ */
++
++/* integrationTmp (zeroed by the caller, as the scalar code does) +=
++     (P_l[i][stateChild] * parent_l[k][i]) * weight_l     (child is a tip)
++     (sum_li            * parent_l[k][i]) * weight_l      (child has partials)
++   category by category, exactly the scalar loop. */
++template <bool CHILD_STATES>
++DK_TARGET void edgeAccumulate(float* integrationTmp,
++                              const float* partialsParent,
++                              const int* statesChild, const float* partialsChild,
++                              const float* transMatrix, const float* weights,
++                              int categoryCount, int paddedPatternCount,
++                              int patternCount) {
++    for (int l = 0; l < categoryCount; l++) {
++        const float* m = transMatrix + l * 4 * 5;
++        const int v0 = l * 4 * paddedPatternCount;
++        const __m256 wt = _mm256_broadcast_ss(weights + l);
++        __m128 t[5];
++        __m256 c[4];
++        if (CHILD_STATES)
++            loadStateColumns(m, t);
++        else
++            loadColumns(m, c);
++        int k = 0;
++        for (; k + 1 < patternCount; k += 2) {
++            const int v = v0 + 4 * k;
++            __m256 a;
++            if (CHILD_STATES) {
++                const int sa = statesChild[k], sb = statesChild[k + 1];
++                if (stateInTable(sa) && stateInTable(sb))
++                    a = pair128(t[sa], t[sb]);
++                else
++                    a = _mm256_setr_ps(matrixEntry(m, 0, sa), matrixEntry(m, 1, sa),
++                                       matrixEntry(m, 2, sa), matrixEntry(m, 3, sa),
++                                       matrixEntry(m, 0, sb), matrixEntry(m, 1, sb),
++                                       matrixEntry(m, 2, sb), matrixEntry(m, 3, sb));
++            } else {
++                a = integrate2(c, _mm256_loadu_ps(partialsChild + v));
++            }
++            const __m256 x = _mm256_mul_ps(_mm256_mul_ps(a, _mm256_loadu_ps(partialsParent + v)), wt);
++            float* tmp = integrationTmp + 4 * k;
++            _mm256_storeu_ps(tmp, _mm256_add_ps(_mm256_loadu_ps(tmp), x));
++        }
++        if (k < patternCount) {
++            const int v = v0 + 4 * k;
++            __m128 a;
++            if (CHILD_STATES) {
++                const int sa = statesChild[k];
++                a = stateInTable(sa) ? t[sa] :
++                    _mm_setr_ps(matrixEntry(m, 0, sa), matrixEntry(m, 1, sa),
++                                matrixEntry(m, 2, sa), matrixEntry(m, 3, sa));
++            } else {
++                a = integrate1(c, _mm_loadu_ps(partialsChild + v));
++            }
++            const __m128 x = _mm_mul_ps(_mm_mul_ps(a, _mm_loadu_ps(partialsParent + v)),
++                                        _mm256_castps256_ps128(wt));
++            float* tmp = integrationTmp + 4 * k;
++            _mm_storeu_ps(tmp, _mm_add_ps(_mm_loadu_ps(tmp), x));
++        }
++    }
++}
++
++/* sumOverI[k] = ((f0*t0 + f1*t1) + f2*t2) + f3*t3 over integrationTmp, the
++   integrateOutStatesAndScale expression. */
++DK_TARGET inline void integrateStates(float* sumOverI, const float* integrationTmp,
++                                      const float* freqs, int patternCount) {
++    const __m128 f128 = _mm_setr_ps(freqs[0], freqs[1], freqs[2], freqs[3]);
++    const __m256 f = pair128(f128, f128);
++    int k = 0;
++    for (; k + 1 < patternCount; k += 2) {
++        const __m256 q = _mm256_mul_ps(f, _mm256_loadu_ps(integrationTmp + 4 * k));
++        __m256 s = _mm256_add_ps(_mm256_permute_ps(q, 0x00), _mm256_permute_ps(q, 0x55));
++        s = _mm256_add_ps(s, _mm256_permute_ps(q, 0xAA));
++        s = _mm256_add_ps(s, _mm256_permute_ps(q, 0xFF));
++        sumOverI[k]     = _mm256_cvtss_f32(s);
++        sumOverI[k + 1] = _mm_cvtss_f32(_mm256_extractf128_ps(s, 1));
++    }
++    if (k < patternCount) {
++        const __m128 q = _mm_mul_ps(f128, _mm_loadu_ps(integrationTmp + 4 * k));
++        __m128 s = _mm_add_ps(_mm_permute_ps(q, 0x00), _mm_permute_ps(q, 0x55));
++        s = _mm_add_ps(s, _mm_permute_ps(q, 0xAA));
++        s = _mm_add_ps(s, _mm_permute_ps(q, 0xFF));
++        sumOverI[k] = _mm_cvtss_f32(s);
++    }
++}
++
++/* ------------------------------------------------------------------------ */
++/* Rescaling                                                                 */
++/* ------------------------------------------------------------------------ */
++
++/* The scalar loop keeps max = 0 and replaces it by each entry with
++   entry > max. That ends at the largest entry (or +0 when none is positive)
++   whatever the visiting order: a NaN never compares greater, a negative or -0
++   entry never beats +0, and equal positive floats are the same bits.
++   maxps(x, m) returns m unless x > m (it returns the second operand for NaN
++   and for equal zeros), so it is that step exactly. */
++DK_TARGET inline void patternMaxima(float* maxima, const float* destP,
++                                    int categoryCount, int paddedPatternCount,
++                                    int patternCount) {
++    int k = 0;
++    for (; k + 1 < patternCount; k += 2) {
++        __m256 m = _mm256_setzero_ps();
++        for (int l = 0; l < categoryCount; l++)
++            m = _mm256_max_ps(_mm256_loadu_ps(destP + l * 4 * paddedPatternCount + 4 * k), m);
++        m = _mm256_max_ps(_mm256_permute_ps(m, 0x4E), m);   /* (2,3,0,1) */
++        m = _mm256_max_ps(_mm256_permute_ps(m, 0xB1), m);   /* (1,0,3,2) */
++        maxima[k]     = _mm256_cvtss_f32(m);
++        maxima[k + 1] = _mm_cvtss_f32(_mm256_extractf128_ps(m, 1));
++    }
++    if (k < patternCount) {
++        __m128 m = _mm_setzero_ps();
++        for (int l = 0; l < categoryCount; l++)
++            m = _mm_max_ps(_mm_loadu_ps(destP + l * 4 * paddedPatternCount + 4 * k), m);
++        m = _mm_max_ps(_mm_permute_ps(m, 0x4E), m);
++        m = _mm_max_ps(_mm_permute_ps(m, 0xB1), m);
++        maxima[k] = _mm_cvtss_f32(m);
++    }
++}
++
++/* destP[l][k][i] *= oneOverMax[k] */
++DK_TARGET inline void scalePatterns(float* destP, const float* oneOverMax,
++                                    int categoryCount, int paddedPatternCount,
++                                    int patternCount) {
++    for (int l = 0; l < categoryCount; l++) {
++        float* d = destP + l * 4 * paddedPatternCount;
++        int k = 0;
++        for (; k + 1 < patternCount; k += 2)
++            _mm256_storeu_ps(d + 4 * k, _mm256_mul_ps(_mm256_loadu_ps(d + 4 * k),
++                                                      broadcastPair(oneOverMax + k)));
++        if (k < patternCount)
++            _mm_storeu_ps(d + 4 * k, _mm_mul_ps(_mm_loadu_ps(d + 4 * k),
++                                                _mm_broadcast_ss(oneOverMax + k)));
++    }
++}
++
++}   // namespace dk
++}   // namespace cpu
++}   // namespace beagle
++
++#endif  // BEAGLE_DIKARYA_AVX
++#endif  // __BeagleDikaryaAVX__
+-- 
+2.43.0
+
+
+From ce198194e49e511edf9d6e837d4ed5dc0fc2642c Mon Sep 17 00:00:00 2001
+From: Alan Rockefeller <alanrockefeller@gmail.com>
+Date: Fri, 9 Oct 2026 21:29:26 +0000
+Subject: [PATCH 3/5] CPU 4-state single precision: no subnormal assists; exact
+ threading
+
+Two changes to the same code paths.
+
+1. Subnormal partials without microcode assists.
+
+On x86 a single-precision multiply whose input or result is subnormal,
+and a divide with a subnormal numerator, take a microcode assist (about
+120 and 150 cycles on Broadwell); adds, max and compares never do. With
+MrBayes's sparse scaler nodes, partials on larger trees reach the
+subnormal range routinely: on a 129-taxon ITS job half of all partials
+updates wrote subnormals, and the assists were about half of the kernel
+time (measured by switching flush-to-zero on, which is not used: it
+changes results).
+
+Each category of each kernel is now first computed with flush-to-zero on
+(denormals-are-zero off) and the underflow flag cleared. Flush-to-zero
+alters a result only when that result is tiny, and every tiny result sets
+the underflow flag, so a clear flag means the output is the IEEE result.
+Otherwise the category is recomputed by a guarded kernel, under the
+caller's MXCSR, that does every multiply or divide that could touch a
+subnormal in double, (float)((double)a * b): a product of two floats is
+exact in double and is rounded once, as the float multiply rounds it,
+gradual underflow included; for division the double rounding is
+innocuous since 53 >= 2*24 + 2. Conversions never assist; adds stay in
+single precision in the original order. The tests that pick a path
+(per-column limits from the transition matrix, an exponent-sum test for
+products, tameness of scale factors and weights) only decide speed.
+
+Each partials buffer records, per pattern chunk and rate category,
+whether it may hold a subnormal, so a consumer whose inputs do skips the
+fast attempt (it would assist on its inputs). The flags are a hint: a
+wrong one costs time, never bits. With a non-default MXCSR (FTZ, DAZ or
+directed rounding) the plain kernels run, as before.
+
+2. beagleSetCPUThreadCount: split calls by pattern.
+
+BEAGLE's own CPU threading sums site log likelihoods per partition, so its
+result depends on the thread count, and it never engages on two cores.
+For this implementation setCPUThreadCount now starts a small fork-join
+pool (DikaryaThreads.h) when the instance has at least 768 patterns:
+updatePartials runs every operation on contiguous pattern ranges, one per
+thread (the caller always takes the first; a late worker's range is taken
+over, never waited for), and the edge log likelihood computes per-pattern
+values in parallel and then sums them in pattern order, as before. Each
+pattern is computed by the same kernel code on any range, so the result is
+the same for any thread count. Workers spin briefly between calls, then
+sleep (BEAGLE_DIKARYA_SPIN_US).
+
+Verification: the side-by-side kernel harness (stock vs patched bodies,
+bit for bit) with values spread from 1e-45 to 1, adversarial inputs and
+random subnormal hints, 120,000+ cases; a mutation test (one ulp added to
+the exact multiply) is caught. Complete MrBayes runs are byte-identical to
+the stock library at 1 and 2 threads, including a NaN abort at generation
+~240,000 of a real job.
+
+On a quiet host, MrBayes 3.2.9, one thread: a 129-taxon ITS job 27.8 s ->
+23.3 s; a 36-taxon job unchanged (no subnormals, ~1% for the attempt).
+Two threads: +35% on a 1191-pattern alignment, not enabled below 768.
+---
+ libhmsbeagle/CPU/BeagleCPU4StateImpl.h   |   8 +
+ libhmsbeagle/CPU/BeagleCPU4StateImpl.hpp | 185 ++++--
+ libhmsbeagle/CPU/BeagleCPUImpl.h         |  31 +
+ libhmsbeagle/CPU/BeagleCPUImpl.hpp       | 160 ++++++
+ libhmsbeagle/CPU/DikaryaAVX.h            | 694 +++++++++++++++++++----
+ libhmsbeagle/CPU/DikaryaThreads.h        | 175 ++++++
+ 6 files changed, 1090 insertions(+), 163 deletions(-)
+ create mode 100644 libhmsbeagle/CPU/DikaryaThreads.h
+
+diff --git a/libhmsbeagle/CPU/BeagleCPU4StateImpl.h b/libhmsbeagle/CPU/BeagleCPU4StateImpl.h
+index 56c4ce8e..b189e2b1 100644
+--- a/libhmsbeagle/CPU/BeagleCPU4StateImpl.h
++++ b/libhmsbeagle/CPU/BeagleCPU4StateImpl.h
+@@ -65,6 +65,14 @@ protected:
+   using BeagleCPUImpl<BEAGLE_CPU_GENERIC>::accumulateDerivatives;
+   using BeagleCPUImpl<BEAGLE_CPU_GENERIC>::calcEdgeLogDerivatives;
+ 
++    virtual bool dkCanThread();
++    virtual void dkRescalePartialsRange(REALTYPE* destP, REALTYPE* scaleFactors,
++                                        REALTYPE* cumulativeScaleFactors,
++                                        int startPattern, int endPattern);
++    virtual void dkPartialsChanged(int buffer);
++    using BeagleCPUImpl<BEAGLE_CPU_GENERIC>::dkPool;
++    using BeagleCPUImpl<BEAGLE_CPU_GENERIC>::dkChunkCount;
++
+ public:
+     virtual ~BeagleCPU4StateImpl();
+     virtual const char* getName();
+diff --git a/libhmsbeagle/CPU/BeagleCPU4StateImpl.hpp b/libhmsbeagle/CPU/BeagleCPU4StateImpl.hpp
+index 231c18e2..78a2e138 100644
+--- a/libhmsbeagle/CPU/BeagleCPU4StateImpl.hpp
++++ b/libhmsbeagle/CPU/BeagleCPU4StateImpl.hpp
+@@ -199,7 +199,7 @@ void BeagleCPU4StateImpl<BEAGLE_CPU_GENERIC>::calcStatesStates(REALTYPE* destP,
+                                                                int endPattern) {
+ #ifdef BEAGLE_DIKARYA_AVX
+     if (DK_FLOAT4) {
+-        dk::statesStates<false>((float*) destP, states1, (const float*) matrices1, states2,
++        dk::opState().outMaySub = dk::statesStates<false>((float*) destP, states1, (const float*) matrices1, states2,
+             (const float*) matrices2, NULL, kCategoryCount, kPaddedPatternCount,
+             startPattern, endPattern);
+         return;
+@@ -244,7 +244,7 @@ void BeagleCPU4StateImpl<BEAGLE_CPU_GENERIC>::calcStatesStatesFixedScaling(REALT
+                                                                            int endPattern) {
+ #ifdef BEAGLE_DIKARYA_AVX
+     if (DK_FLOAT4) {
+-        dk::statesStates<true>((float*) destP, states1, (const float*) matrices1, states2,
++        dk::opState().outMaySub = dk::statesStates<true>((float*) destP, states1, (const float*) matrices1, states2,
+             (const float*) matrices2, (const float*) scaleFactors, kCategoryCount,
+             kPaddedPatternCount, startPattern, endPattern);
+         return;
+@@ -292,9 +292,10 @@ void BeagleCPU4StateImpl<BEAGLE_CPU_GENERIC>::calcStatesPartials(REALTYPE* destP
+                                                                  int endPattern) {
+ #ifdef BEAGLE_DIKARYA_AVX
+     if (DK_FLOAT4) {
+-        dk::statesPartials<false>((float*) destP, states1, (const float*) matrices1,
++        dk::OpState& dkState = dk::opState();
++        dkState.outMaySub = dk::statesPartials<false>((float*) destP, states1, (const float*) matrices1,
+             (const float*) partials2, (const float*) matrices2, NULL, kCategoryCount,
+-            kPaddedPatternCount, startPattern, endPattern);
++            kPaddedPatternCount, startPattern, endPattern, dkState.inMaySub);
+         return;
+     }
+ #endif
+@@ -339,9 +340,10 @@ void BeagleCPU4StateImpl<BEAGLE_CPU_GENERIC>::calcStatesPartialsFixedScaling(REA
+                                                                              int endPattern) {
+ #ifdef BEAGLE_DIKARYA_AVX
+     if (DK_FLOAT4) {
+-        dk::statesPartials<true>((float*) destP, states1, (const float*) matrices1,
++        dk::OpState& dkState = dk::opState();
++        dkState.outMaySub = dk::statesPartials<true>((float*) destP, states1, (const float*) matrices1,
+             (const float*) partials2, (const float*) matrices2, (const float*) scaleFactors,
+-            kCategoryCount, kPaddedPatternCount, startPattern, endPattern);
++            kCategoryCount, kPaddedPatternCount, startPattern, endPattern, dkState.inMaySub);
+         return;
+     }
+ #endif
+@@ -386,9 +388,10 @@ void BeagleCPU4StateImpl<BEAGLE_CPU_GENERIC>::calcPartialsPartials(REALTYPE* des
+                                                                    int endPattern) {
+ #ifdef BEAGLE_DIKARYA_AVX
+     if (DK_FLOAT4) {
+-        dk::partialsPartials<false>((float*) destP, (const float*) partials1,
++        dk::OpState& dkState = dk::opState();
++        dkState.outMaySub = dk::partialsPartials<false>((float*) destP, (const float*) partials1,
+             (const float*) matrices1, (const float*) partials2, (const float*) matrices2,
+-            NULL, kCategoryCount, kPaddedPatternCount, startPattern, endPattern);
++            NULL, kCategoryCount, kPaddedPatternCount, startPattern, endPattern, dkState.inMaySub);
+         return;
+     }
+ #endif
+@@ -573,10 +576,11 @@ void BeagleCPU4StateImpl<BEAGLE_CPU_GENERIC>::calcPartialsPartialsFixedScaling(R
+                                                                                int endPattern) {
+ #ifdef BEAGLE_DIKARYA_AVX
+     if (DK_FLOAT4) {
+-        dk::partialsPartials<true>((float*) destP, (const float*) partials1,
++        dk::OpState& dkState = dk::opState();
++        dkState.outMaySub = dk::partialsPartials<true>((float*) destP, (const float*) partials1,
+             (const float*) matrices1, (const float*) partials2, (const float*) matrices2,
+             (const float*) scaleFactors, kCategoryCount, kPaddedPatternCount,
+-            startPattern, endPattern);
++            startPattern, endPattern, dkState.inMaySub);
+         return;
+     }
+ #endif
+@@ -725,6 +729,73 @@ void inline BeagleCPU4StateImpl<BEAGLE_CPU_GENERIC>::integrateOutStatesAndScaleB
+ 
+ }
+ 
++BEAGLE_CPU_TEMPLATE
++bool BeagleCPU4StateImpl<BEAGLE_CPU_GENERIC>::dkCanThread() {
++#ifdef BEAGLE_DIKARYA_AVX
++    return DK_FLOAT4 && !(kFlags & (BEAGLE_FLAG_SCALING_AUTO | BEAGLE_FLAG_SCALING_ALWAYS |
++                                    BEAGLE_FLAG_SCALING_DYNAMIC));
++#else
++    return false;
++#endif
++}
++
++/* rescalePartials for patterns [startPattern, endPattern): the maxima and
++   the 1/max multiply are vectorized, the rest is the scalar loop's code. */
++BEAGLE_CPU_TEMPLATE
++void BeagleCPU4StateImpl<BEAGLE_CPU_GENERIC>::dkRescalePartialsRange(REALTYPE* destP,
++                                                                     REALTYPE* scaleFactors,
++                                                                     REALTYPE* cumulativeScaleFactors,
++                                                                     int startPattern,
++                                                                     int endPattern) {
++#ifdef BEAGLE_DIKARYA_AVX
++    bool useLogScalars = kFlags & BEAGLE_FLAG_SCALERS_LOG;
++    const int chunk = 256;
++    float maxima[chunk], oneOverMaxima[chunk];
++    for (int k0 = startPattern; k0 < endPattern; k0 += chunk) {
++        const int n = (endPattern - k0 < chunk ? endPattern - k0 : chunk);
++        dk::patternMaxima(maxima, (const float*) destP + 4 * k0, kCategoryCount,
++                          kPaddedPatternCount, n);
++        for (int i = 0; i < n; i++) {
++            if (maxima[i] == 0)
++                maxima[i] = 1.0f;
++            oneOverMaxima[i] = 1.0f / maxima[i];
++        }
++        dk::scalePatterns((float*) destP + 4 * k0, oneOverMaxima, kCategoryCount,
++                          kPaddedPatternCount, n);
++        for (int i = 0; i < n; i++) {
++            const int k = k0 + i;
++            const REALTYPE max = maxima[i];
++            if (useLogScalars) {
++                REALTYPE logMax = log(max);
++                scaleFactors[k] = logMax;
++                if( cumulativeScaleFactors != NULL )
++                    cumulativeScaleFactors[k] += logMax;
++            } else {
++                scaleFactors[k] = max;
++                if( cumulativeScaleFactors != NULL )
++                    cumulativeScaleFactors[k] += log(max);
++            }
++        }
++    }
++    dk::opState().outMaySub = dk::subnormalMask((const float*) destP, kCategoryCount,
++                                                kPaddedPatternCount, startPattern, endPattern);
++#endif
++}
++
++BEAGLE_CPU_TEMPLATE
++void BeagleCPU4StateImpl<BEAGLE_CPU_GENERIC>::dkPartialsChanged(int buffer) {
++#ifdef BEAGLE_DIKARYA_AVX
++    if (DK_FLOAT4 && buffer >= 0 && gPartials[buffer] != NULL) {
++        const unsigned sub = dk::subnormalMask((const float*) gPartials[buffer], kCategoryCount,
++                                               kPaddedPatternCount, 0, kPatternCount);
++        for (int c = 0; c < BeagleCPUImpl<BEAGLE_CPU_GENERIC>::kDkFlagChunks; c++)
++            this->dkSetMaySub(buffer, c, sub);
++        return;
++    }
++#endif
++    BeagleCPUImpl<BEAGLE_CPU_GENERIC>::dkPartialsChanged(buffer);
++}
++
+ #define FAST_MAX(x,y)	(x > y ? x : y)
+ //#define BEAGLE_TEST_OPTIMIZATION
+ /*
+@@ -740,36 +811,7 @@ void BeagleCPU4StateImpl<BEAGLE_CPU_GENERIC>::rescalePartials(REALTYPE* destP,
+ 
+ #ifdef BEAGLE_DIKARYA_AVX
+     if (DK_FLOAT4) {
+-        /* Same per-pattern values as the loop below: the maxima and the
+-           1/max multiply are vectorized, the rest is that loop's scalar code. */
+-        const int chunk = 256;
+-        float maxima[chunk], oneOverMaxima[chunk];
+-        for (int k0 = 0; k0 < kPatternCount; k0 += chunk) {
+-            const int n = (kPatternCount - k0 < chunk ? kPatternCount - k0 : chunk);
+-            dk::patternMaxima(maxima, (const float*) destP + 4 * k0, kCategoryCount,
+-                              kPaddedPatternCount, n);
+-            for (int i = 0; i < n; i++) {
+-                if (maxima[i] == 0)
+-                    maxima[i] = 1.0f;
+-                oneOverMaxima[i] = 1.0f / maxima[i];
+-            }
+-            dk::scalePatterns((float*) destP + 4 * k0, oneOverMaxima, kCategoryCount,
+-                              kPaddedPatternCount, n);
+-            for (int i = 0; i < n; i++) {
+-                const int k = k0 + i;
+-                const REALTYPE max = maxima[i];
+-                if (useLogScalars) {
+-                    REALTYPE logMax = log(max);
+-                    scaleFactors[k] = logMax;
+-                    if( cumulativeScaleFactors != NULL )
+-                        cumulativeScaleFactors[k] += logMax;
+-                } else {
+-                    scaleFactors[k] = max;
+-                    if( cumulativeScaleFactors != NULL )
+-                        cumulativeScaleFactors[k] += log(max);
+-                }
+-            }
+-        }
++        dkRescalePartialsRange(destP, scaleFactors, cumulativeScaleFactors, 0, kPatternCount);
+         return;
+     }
+ #endif
+@@ -898,15 +940,72 @@ int BeagleCPU4StateImpl<BEAGLE_CPU_GENERIC>::calcEdgeLogLikelihoods(const int pa
+     memset(integrationTmp, 0, (kPatternCount * kStateCount)*sizeof(REALTYPE));
+ 
+ #ifdef BEAGLE_DIKARYA_AVX
++    if (DK_FLOAT4 && dkPool) {
++        /* Per-pattern work split by pattern range; the double-precision sum
++           over patterns is then done here, in pattern order, exactly as
++           integrateOutStatesAndScale does it. */
++        struct Job {
++            BeagleCPU4StateImpl* self; const REALTYPE *parent, *tm, *w, *freqs, *scale;
++            const int* childStates; const REALTYPE* childPartials; int chunks, parIndex, childIndex;
++            static void run(void* p, int c) {
++                Job* j = (Job*) p;
++                BeagleCPU4StateImpl* s = j->self;
++                int lo, hi;
++                dk::evenRange(s->kPatternCount, j->chunks, c, &lo, &hi);
++                float* tmp = (float*) s->integrationTmp;
++                REALTYPE* outLog = s->outLogLikelihoodsTmp;
++                for (int k = 4 * lo; k < 4 * hi; k++)
++                    tmp[k] = 0.0f;
++                const unsigned maySub = s->dkMaySub(j->parIndex, c) |
++                                        (j->childStates ? 0u : s->dkMaySub(j->childIndex, c));
++                if (j->childStates)
++                    dk::edgeAccumulate<true>(tmp, (const float*) j->parent, j->childStates, NULL,
++                        (const float*) j->tm, (const float*) j->w, s->kCategoryCount,
++                        s->kPaddedPatternCount, lo, hi, maySub);
++                else
++                    dk::edgeAccumulate<false>(tmp, (const float*) j->parent, NULL,
++                        (const float*) j->childPartials, (const float*) j->tm, (const float*) j->w,
++                        s->kCategoryCount, s->kPaddedPatternCount, lo, hi, maySub);
++                dk::integrateStates((float*) outLog + lo, tmp + 4 * lo, (const float*) j->freqs, hi - lo);
++                for (int k = lo; k < hi; k++) {
++                    const REALTYPE sumOverI = outLog[k];
++                    outLog[k] = log(sumOverI);
++                }
++                if (j->scale)
++                    for (int k = lo; k < hi; k++)
++                        outLog[k] += j->scale[k];
++            }
++        } job;
++        job.self = this; job.parent = partialsParent; job.tm = transMatrix; job.w = wt;
++        job.freqs = gStateFrequencies[stateFrequenciesIndex];
++        job.scale = (scalingFactorsIndex != BEAGLE_OP_NONE) ? gScaleBuffers[scalingFactorsIndex] : NULL;
++        const bool tip = (childIndex < kTipCount && gTipStates[childIndex]);
++        job.childStates = tip ? gTipStates[childIndex] : NULL;
++        job.childPartials = tip ? NULL : gPartials[childIndex];
++        job.chunks = dkChunkCount(kPatternCount);
++        job.parIndex = parIndex;
++        job.childIndex = childIndex;
++        dkPool->run(job.chunks, &Job::run, &job);
++
++        *outSumLogLikelihood = 0.0;
++        for(int k=0; k < kPatternCount; k++) {
++            *outSumLogLikelihood += outLogLikelihoodsTmp[k] * gPatternWeights[k];
++        }
++        if (*outSumLogLikelihood != *outSumLogLikelihood)
++            return BEAGLE_ERROR_FLOATING_POINT;
++        return BEAGLE_SUCCESS;
++    }
+     if (DK_FLOAT4) {
+-        if (childIndex < kTipCount && gTipStates[childIndex])
++        const bool tipChild = (childIndex < kTipCount && gTipStates[childIndex]);
++        const unsigned maySub = this->dkMaySub(parIndex, 0) | (tipChild ? 0u : this->dkMaySub(childIndex, 0));
++        if (tipChild)
+             dk::edgeAccumulate<true>((float*) integrationTmp, (const float*) partialsParent,
+                 gTipStates[childIndex], NULL, (const float*) transMatrix, (const float*) wt,
+-                kCategoryCount, kPaddedPatternCount, kPatternCount);
++                kCategoryCount, kPaddedPatternCount, 0, kPatternCount, maySub);
+         else
+             dk::edgeAccumulate<false>((float*) integrationTmp, (const float*) partialsParent,
+                 NULL, (const float*) gPartials[childIndex], (const float*) transMatrix,
+-                (const float*) wt, kCategoryCount, kPaddedPatternCount, kPatternCount);
++                (const float*) wt, kCategoryCount, kPaddedPatternCount, 0, kPatternCount, maySub);
+         return integrateOutStatesAndScale(integrationTmp, stateFrequenciesIndex, scalingFactorsIndex, outSumLogLikelihood);
+     }
+ #endif
+diff --git a/libhmsbeagle/CPU/BeagleCPUImpl.h b/libhmsbeagle/CPU/BeagleCPUImpl.h
+index 8efb86b1..196f386a 100644
+--- a/libhmsbeagle/CPU/BeagleCPUImpl.h
++++ b/libhmsbeagle/CPU/BeagleCPUImpl.h
+@@ -33,6 +33,7 @@
+ #include <condition_variable>
+ #include <mutex>
+ #include <functional>
++#include "libhmsbeagle/CPU/DikaryaThreads.h"
+ 
+ #define BEAGLE_CPU_GENERIC	REALTYPE, T_PAD, P_PAD
+ #define BEAGLE_CPU_TEMPLATE	template <typename REALTYPE, int T_PAD, int P_PAD>
+@@ -155,6 +156,36 @@ protected:
+     double* gAutoPartitionOutSumLogLikelihoods;
+     std::shared_future<void>* gFutures;
+ 
++    /* Dikarya: exact pattern-split threading (see DikaryaThreads.h) */
++    dk::Pool* dkPool = nullptr;
++    /* below this many patterns a split call costs more than it saves on a
++       two-core machine (BEAGLE's own threshold for few cores is the same) */
++    int dkMinPatterns = 768;
++    virtual bool dkCanThread() { return false; }
++    virtual void dkRescalePartialsRange(REALTYPE* destP, REALTYPE* scaleFactors,
++                                        REALTYPE* cumulativeScaleFactors,
++                                        int startPattern, int endPattern) {}
++    int dkUpPartialsRange(const int* operations, int count, int cumulativeScaleIndex,
++                          int startPattern, int endPattern, int chunk);
++    /* [buffer * kDkFlagChunks + chunk]: bit per rate category (dk::catBit)
++       set when those partials may hold a subnormal; a speed hint only */
++    static const int kDkFlagChunks = 64;
++    unsigned char* dkSubFlags = nullptr;
++    unsigned dkMaySub(int buffer, int chunk) const {
++        if (buffer < 0 || dkSubFlags == nullptr) return 0xFFu;
++        if (gTipStates[buffer] != NULL) return 0u;
++        return __atomic_load_n(&dkSubFlags[buffer * kDkFlagChunks + chunk], __ATOMIC_RELAXED);
++    }
++    void dkSetMaySub(int buffer, int chunk, unsigned v) {
++        if (buffer >= 0 && dkSubFlags != nullptr)
++            __atomic_store_n(&dkSubFlags[buffer * kDkFlagChunks + chunk], (unsigned char) v, __ATOMIC_RELAXED);
++    }
++    virtual void dkPartialsChanged(int buffer) {
++        if (buffer >= 0 && dkSubFlags != nullptr)
++            for (int c = 0; c < kDkFlagChunks; c++) dkSetMaySub(buffer, c, 0xFFu);
++    }
++    int dkChunkCount(int patterns) const;
++
+ public:
+     virtual ~BeagleCPUImpl();
+ 
+diff --git a/libhmsbeagle/CPU/BeagleCPUImpl.hpp b/libhmsbeagle/CPU/BeagleCPUImpl.hpp
+index 8ff9d0a5..a5e465b3 100644
+--- a/libhmsbeagle/CPU/BeagleCPUImpl.hpp
++++ b/libhmsbeagle/CPU/BeagleCPUImpl.hpp
+@@ -116,6 +116,10 @@ inline const long getBeagleCPUFlags<float>(){ return BEAGLE_FLAG_COMPUTATION_SYN
+ 
+ BEAGLE_CPU_TEMPLATE
+ BeagleCPUImpl<BEAGLE_CPU_GENERIC>::~BeagleCPUImpl() {
++    delete dkPool;
++    dkPool = nullptr;
++    free(dkSubFlags);
++    dkSubFlags = nullptr;
+     // free all that stuff...
+     // If you delete partials, make sure not to delete the last element
+     // which is TEMP_SCRATCH_PARTIAL twice.
+@@ -372,6 +376,11 @@ int BeagleCPUImpl<BEAGLE_CPU_GENERIC>::createInstance(int tipCount,
+             throw std::bad_alloc();
+     }
+ 
++    dkSubFlags = (unsigned char*) malloc((size_t) kBufferCount * kDkFlagChunks);
++    if (dkSubFlags == NULL)
++        throw std::bad_alloc();
++    memset(dkSubFlags, 1, (size_t) kBufferCount * kDkFlagChunks);
++
+     gScaleBuffers = NULL;
+ 
+     gAutoScaleBuffers = NULL;
+@@ -518,6 +527,25 @@ int BeagleCPUImpl<BEAGLE_CPU_GENERIC>::setCPUThreadCount(int threadCount) {
+     if (threadCount < 1)
+         return BEAGLE_ERROR_OUT_OF_RANGE;
+ 
++    if (dkCanThread()) {
++        /* Dikarya: split each call by pattern instead of BEAGLE's partition
++           threading, which sums the site log likelihoods per partition and so
++           changes the result with the thread count. Never more threads than
++           the caller asked for or the machine has. */
++        delete dkPool;
++        dkPool = nullptr;
++        int n = threadCount;
++        const int hw = (int) std::thread::hardware_concurrency();
++        if (hw > 0 && n > hw)
++            n = hw;
++        const char* mp = getenv("BEAGLE_DIKARYA_MIN_PATTERNS");
++        if (mp)
++            dkMinPatterns = atoi(mp);
++        if (n >= 2 && kPatternCount >= dkMinPatterns)
++            dkPool = new dk::Pool(n);
++        return BEAGLE_SUCCESS;
++    }
++
+     kThreadingEnabled = false;
+     kAutoPartitioningEnabled = false;
+     if (kFlags & BEAGLE_FLAG_THREADING_CPP) {
+@@ -614,6 +642,7 @@ int BeagleCPUImpl<BEAGLE_CPU_GENERIC>::setTipPartials(int tipIndex,
+         }
+     }
+ 
++    dkPartialsChanged(tipIndex);
+     return BEAGLE_SUCCESS;
+ }
+ 
+@@ -705,6 +734,7 @@ int BeagleCPUImpl<BEAGLE_CPU_GENERIC>::setPartials(int bufferIndex,
+         }
+     }
+ 
++    dkPartialsChanged(bufferIndex);
+     return BEAGLE_SUCCESS;
+ }
+ 
+@@ -1296,6 +1326,25 @@ int BeagleCPUImpl<BEAGLE_CPU_GENERIC>::updatePartials(const int* operations,
+ 
+     int returnCode = BEAGLE_ERROR_GENERAL;
+ 
++    if (dkPool) {
++        struct Job {
++            BeagleCPUImpl* self; const int* ops; int count, cumIndex, chunks, rc[64];
++            static void run(void* p, int c) {
++                Job* j = (Job*) p;
++                int lo, hi;
++                dk::evenRange(j->self->kPatternCount, j->chunks, c, &lo, &hi);
++                j->rc[c] = j->self->dkUpPartialsRange(j->ops, j->count, j->cumIndex, lo, hi, c);
++            }
++        } job;
++        job.self = this; job.ops = operations; job.count = count;
++        job.cumIndex = cumulativeScaleIndex; job.chunks = dkChunkCount(kPatternCount);
++        dkPool->run(job.chunks, &Job::run, &job);
++        for (int c = 0; c < job.chunks; c++)
++            if (job.rc[c] != BEAGLE_SUCCESS)
++                return job.rc[c];
++        return BEAGLE_SUCCESS;
++    }
++
+     if (kAutoPartitioningEnabled) {
+         autoPartitionPartialsOperations(operations,
+                                         gAutoPartitionOperations,
+@@ -1493,6 +1542,108 @@ int BeagleCPUImpl<BEAGLE_CPU_GENERIC>::upPartialsByPartitionAsync(const int* ope
+     return BEAGLE_SUCCESS;
+ }
+ 
++BEAGLE_CPU_TEMPLATE
++int BeagleCPUImpl<BEAGLE_CPU_GENERIC>::dkChunkCount(int patterns) const {
++    static const int forced = getenv("BEAGLE_DIKARYA_CHUNKS") ? atoi(getenv("BEAGLE_DIKARYA_CHUNKS")) : 0;
++    int chunks = forced > 0 ? forced : (dkPool ? dkPool->threads() : 1);
++    if (chunks > 64)
++        chunks = 64;
++    if (chunks > (patterns + 1) / 2)
++        chunks = (patterns + 1) / 2;
++    return chunks < 1 ? 1 : chunks;
++}
++
++/* upPartials restricted to patterns [startPattern, endPattern), for instances
++   with manual scaling (dkCanThread). The same kernels on a sub-range compute
++   each pattern exactly as the full-range call does; every per-pattern array
++   written here (partials, scale factors, cumulative scale factors) is
++   written only for the patterns in range. */
++BEAGLE_CPU_TEMPLATE
++int BeagleCPUImpl<BEAGLE_CPU_GENERIC>::dkUpPartialsRange(const int* operations,
++                                                         int count,
++                                                         int cumulativeScaleIndex,
++                                                         int startPattern,
++                                                         int endPattern,
++                                                         int chunk) {
++    dk::OpState& dkState = dk::opState();
++
++    REALTYPE* cumulativeScaleBuffer = NULL;
++    if (cumulativeScaleIndex != BEAGLE_OP_NONE)
++        cumulativeScaleBuffer = gScaleBuffers[cumulativeScaleIndex];
++
++    for (int op = 0; op < count; op++) {
++        const int numOps = BEAGLE_OP_COUNT;
++        const int parIndex = operations[op * numOps];
++        const int writeScalingIndex = operations[op * numOps + 1];
++        const int readScalingIndex = operations[op * numOps + 2];
++        const int child1Index = operations[op * numOps + 3];
++        const int child1TransMatIndex = operations[op * numOps + 4];
++        const int child2Index = operations[op * numOps + 5];
++        const int child2TransMatIndex = operations[op * numOps + 6];
++
++        const REALTYPE* partials1 = gPartials[child1Index];
++        const REALTYPE* partials2 = gPartials[child2Index];
++        const int* tipStates1 = gTipStates[child1Index];
++        const int* tipStates2 = gTipStates[child2Index];
++        const REALTYPE* matrices1 = gTransitionMatrices[child1TransMatIndex];
++        const REALTYPE* matrices2 = gTransitionMatrices[child2TransMatIndex];
++        REALTYPE* destPartials = gPartials[parIndex];
++
++        dkState.inMaySub = dkMaySub(child1Index, chunk) | dkMaySub(child2Index, chunk);
++        dkState.outMaySub = 0xFFu;
++
++        int rescale = BEAGLE_OP_NONE;
++        REALTYPE* scalingFactors = NULL;
++        if (writeScalingIndex >= 0) {
++            rescale = 1;
++            scalingFactors = gScaleBuffers[writeScalingIndex];
++        } else if (readScalingIndex >= 0) {
++            rescale = 0;
++            scalingFactors = gScaleBuffers[readScalingIndex];
++        }
++
++        if (tipStates1 != NULL) {
++            if (tipStates2 != NULL ) {
++                if (rescale == 0)
++                    calcStatesStatesFixedScaling(destPartials, tipStates1, matrices1, tipStates2,
++                                                 matrices2, scalingFactors, startPattern, endPattern);
++                else
++                    calcStatesStates(destPartials, tipStates1, matrices1, tipStates2, matrices2,
++                                     startPattern, endPattern);
++            } else {
++                if (rescale == 0)
++                    calcStatesPartialsFixedScaling(destPartials, tipStates1, matrices1, partials2,
++                                                   matrices2, scalingFactors, startPattern, endPattern);
++                else
++                    calcStatesPartials(destPartials, tipStates1, matrices1, partials2, matrices2,
++                                       startPattern, endPattern);
++            }
++        } else {
++            if (tipStates2 != NULL) {
++                if (rescale == 0)
++                    calcStatesPartialsFixedScaling(destPartials, tipStates2, matrices2, partials1,
++                                                   matrices1, scalingFactors, startPattern, endPattern);
++                else
++                    calcStatesPartials(destPartials, tipStates2, matrices2, partials1, matrices1,
++                                       startPattern, endPattern);
++            } else {
++                if (rescale == 0)
++                    calcPartialsPartialsFixedScaling(destPartials, partials1, matrices1, partials2,
++                                                     matrices2, scalingFactors, startPattern, endPattern);
++                else
++                    calcPartialsPartials(destPartials, partials1, matrices1, partials2, matrices2,
++                                         startPattern, endPattern);
++            }
++        }
++        if (rescale == 1)
++            dkRescalePartialsRange(destPartials, scalingFactors, cumulativeScaleBuffer,
++                                   startPattern, endPattern);
++        dkSetMaySub(parIndex, chunk, dkState.outMaySub);
++    }
++
++    return BEAGLE_SUCCESS;
++}
++
+ BEAGLE_CPU_TEMPLATE
+ int BeagleCPUImpl<BEAGLE_CPU_GENERIC>::upPartials(bool byPartition,
+                                                   const int* operations,
+@@ -1552,6 +1703,10 @@ int BeagleCPUImpl<BEAGLE_CPU_GENERIC>::upPartials(bool byPartition,
+             endPattern = gPatternPartitionsStartPatterns[currentPartition + 1];
+         }
+ 
++        dk::OpState& dkState = dk::opState();
++        dkState.inMaySub = dkMaySub(child1Index, 0) | dkMaySub(child2Index, 0);
++        dkState.outMaySub = 0xFFu;
++
+         int rescale = BEAGLE_OP_NONE;
+         REALTYPE* scalingFactors = NULL;
+ 
+@@ -1655,6 +1810,11 @@ int BeagleCPUImpl<BEAGLE_CPU_GENERIC>::upPartials(bool byPartition,
+             }
+         }
+ 
++        if (byPartition)
++            dkSetMaySub(parIndex, 0, 0xFFu);
++        else
++            dkSetMaySub(parIndex, 0, dkState.outMaySub);
++
+         if (kFlags & BEAGLE_FLAG_SCALING_ALWAYS) {
+             int parScalingIndex = parIndex - kTipCount;
+             int child1ScalingIndex = child1Index - kTipCount;
+diff --git a/libhmsbeagle/CPU/DikaryaAVX.h b/libhmsbeagle/CPU/DikaryaAVX.h
+index 8a611a73..b8ca1819 100644
+--- a/libhmsbeagle/CPU/DikaryaAVX.h
++++ b/libhmsbeagle/CPU/DikaryaAVX.h
+@@ -100,56 +100,425 @@ DK_INLINE float matrixEntry(const float* m, int row, int state) {
+     return m[5 * row + state];
+ }
+ 
++/* ------------------------------------------------------------------------ */
++/* Subnormals                                                                */
++/* ------------------------------------------------------------------------ */
++/*
++ * On x86, a float multiply whose input or result is subnormal, and a divide
++ * with a subnormal numerator, take a microcode assist (~120 and ~150 cycles
++ * on Broadwell); adds, max and compares never do. Single-precision partials
++ * reach the subnormal range routinely on larger trees between MrBayes's
++ * scaler nodes, and the assists were then about half of the kernel time.
++ *
++ * Two exact ways around them are used:
++ *
++ *  - the fast attempt: a category is computed with flush-to-zero on (DAZ
++ *    off) and the underflow flag cleared. Flush-to-zero changes a result
++ *    only when that result is tiny, and every tiny result sets the underflow
++ *    flag, so if the flag is still clear the output is exactly the IEEE
++ *    result. Otherwise the category is computed again by
++ *  - the guarded kernels: any multiply or divide that could involve a
++ *    subnormal is done in double, (float)((double)a * b). A product of two
++ *    floats is exact in double and is rounded once, as the float multiply
++ *    rounds it (gradual underflow included); for division double rounding is
++ *    innocuous because 53 >= 2*24 + 2 (Figueroa 1995). Conversions do not
++ *    assist. Adds stay in single precision, in the original order.
++ *
++ * The checks that pick a path only decide speed, never the result: both paths
++ * compute the same IEEE single-precision values.
++ */
++
++/* MXCSR: flags in bits 0-5 (UE = 0x10), DAZ 0x40, rounding 0x6000, FTZ 0x8000 */
++DK_INLINE bool ftzUsable(unsigned csr) { return (csr & 0xE040u) == 0; }   /* nearest, no FTZ/DAZ */
++DK_INLINE void ftzBegin(unsigned csr) { _mm_setcsr((csr & ~0x3Fu) | 0x8000u); }
++DK_INLINE bool ftzUnderflowed() { return (_mm_getcsr() & 0x10u) != 0; }
++
++DK_INLINE float xmul(float a, float b) { return (float) ((double) a * (double) b); }
++DK_INLINE float xdiv(float a, float b) { return (float) ((double) a / (double) b); }
++
++DK_TARGET DK_INLINE __m128 xmul4(const __m128 a, const __m128 b) {
++    return _mm256_cvtpd_ps(_mm256_mul_pd(_mm256_cvtps_pd(a), _mm256_cvtps_pd(b)));
++}
++DK_TARGET DK_INLINE __m128 xdiv4(const __m128 a, const __m128 b) {
++    return _mm256_cvtpd_ps(_mm256_div_pd(_mm256_cvtps_pd(a), _mm256_cvtps_pd(b)));
++}
++DK_TARGET DK_INLINE __m256 xmul8(const __m256 a, const __m256 b) {
++    return pair128(xmul4(_mm256_castps256_ps128(a), _mm256_castps256_ps128(b)),
++                   xmul4(_mm256_extractf128_ps(a, 1), _mm256_extractf128_ps(b, 1)));
++}
++DK_TARGET DK_INLINE __m256 xdiv8(const __m256 a, const __m256 b) {
++    return pair128(xdiv4(_mm256_castps256_ps128(a), _mm256_castps256_ps128(b)),
++                   xdiv4(_mm256_extractf128_ps(a, 1), _mm256_extractf128_ps(b, 1)));
++}
++
++/* integrate2/integrate1 with exact (double) products. cd[j] is column j in
++   double (one pattern's four states); each product is rounded to float once,
++   then the sum is formed in single precision in the original order. */
++DK_TARGET DK_INLINE void loadColumnsDouble(const __m256 c[4], __m256d cd[4]) {
++    for (int j = 0; j < 4; j++)
++        cd[j] = _mm256_cvtps_pd(_mm256_castps256_ps128(c[j]));
++}
++DK_TARGET DK_INLINE __m128 integrate1xd(const __m256d cd[4], const __m128 p) {
++    const __m256d q = _mm256_cvtps_pd(p);
++    __m128 s = _mm256_cvtpd_ps(_mm256_mul_pd(cd[0], _mm256_permute4x64_pd(q, 0x00)));
++    s = _mm_add_ps(s, _mm256_cvtpd_ps(_mm256_mul_pd(cd[1], _mm256_permute4x64_pd(q, 0x55))));
++    s = _mm_add_ps(s, _mm256_cvtpd_ps(_mm256_mul_pd(cd[2], _mm256_permute4x64_pd(q, 0xAA))));
++    s = _mm_add_ps(s, _mm256_cvtpd_ps(_mm256_mul_pd(cd[3], _mm256_permute4x64_pd(q, 0xFF))));
++    return s;
++}
++DK_TARGET DK_INLINE __m256 integrate2xd(const __m256d cd[4], const __m256 p) {
++    return pair128(integrate1xd(cd, _mm256_castps256_ps128(p)),
++                   integrate1xd(cd, _mm256_extractf128_ps(p, 1)));
++}
++DK_TARGET DK_INLINE __m256 integrate2x(const __m256 c[4], const __m256 p) {
++    __m256d cd[4];
++    loadColumnsDouble(c, cd);
++    return integrate2xd(cd, p);
++}
++DK_TARGET DK_INLINE __m128 integrate1x(const __m256 c[4], const __m128 p) {
++    __m256d cd[4];
++    loadColumnsDouble(c, cd);
++    return integrate1xd(cd, p);
++}
++
++/* Tiny-value tests. limit is passed as bits(limit) - 1 (0: nothing is tiny).
++   x is tiny when 0 < |x| < limit; |x| comes from the bit pattern, so NaN and
++   infinity are never tiny and -0 is zero. */
++DK_INLINE unsigned limitBits(float limit) {
++    union { float f; unsigned u; } v;
++    v.f = limit;
++    return v.u == 0 ? 0u : v.u - 1u;
++}
++DK_TARGET DK_INLINE __m256i tinyKey8(const __m256 x) {
++    return _mm256_sub_epi32(_mm256_and_si256(_mm256_castps_si256(x), _mm256_set1_epi32(0x7FFFFFFF)),
++                            _mm256_set1_epi32(1));
++}
++DK_TARGET DK_INLINE __m128i tinyKey4(const __m128 x) {
++    return _mm_sub_epi32(_mm_and_si128(_mm_castps_si128(x), _mm_set1_epi32(0x7FFFFFFF)),
++                         _mm_set1_epi32(1));
++}
++/* any lane of a below la, or of b below lb */
++DK_TARGET DK_INLINE bool anyTiny8(const __m256 a, const __m256i la, const __m256 b, const __m256i lb) {
++    const __m256i ea = _mm256_cmpeq_epi32(_mm256_min_epu32(tinyKey8(a), la), la);
++    const __m256i eb = _mm256_cmpeq_epi32(_mm256_min_epu32(tinyKey8(b), lb), lb);
++    return _mm256_movemask_epi8(_mm256_and_si256(ea, eb)) != -1;
++}
++DK_TARGET DK_INLINE bool anyTiny8(const __m256 a, const __m256i la) {
++    return _mm256_movemask_epi8(_mm256_cmpeq_epi32(_mm256_min_epu32(tinyKey8(a), la), la)) != -1;
++}
++DK_TARGET DK_INLINE bool anyTiny4(const __m128 a, const __m128i la, const __m128 b, const __m128i lb) {
++    const __m128i ea = _mm_cmpeq_epi32(_mm_min_epu32(tinyKey4(a), la), la);
++    const __m128i eb = _mm_cmpeq_epi32(_mm_min_epu32(tinyKey4(b), lb), lb);
++    return _mm_movemask_epi8(_mm_and_si128(ea, eb)) != 0xFFFF;
++}
++DK_TARGET DK_INLINE bool anyTiny4(const __m128 a, const __m128i la) {
++    return _mm_movemask_epi8(_mm_cmpeq_epi32(_mm_min_epu32(tinyKey4(a), la), la)) != 0xFFFF;
++}
++
++/* true if some lane's product |a|*|b| might be below 2^-126: biased
++   exponents ea + eb >= 130 guarantee |a*b| >= 2^(ea+eb-254) >= 2^-124 */
++DK_TARGET DK_INLINE bool anyTinyProduct8(const __m256 a, const __m256 b) {
++    const __m256i m = _mm256_set1_epi32(0x7FFFFFFF);
++    const __m256i ea = _mm256_srli_epi32(_mm256_and_si256(_mm256_castps_si256(a), m), 23);
++    const __m256i eb = _mm256_srli_epi32(_mm256_and_si256(_mm256_castps_si256(b), m), 23);
++    const __m256i lo = _mm256_cmpgt_epi32(_mm256_set1_epi32(130), _mm256_add_epi32(ea, eb));
++    return !_mm256_testz_si256(lo, lo);
++}
++DK_TARGET DK_INLINE bool anyTinyProduct4(const __m128 a, const __m128 b) {
++    const __m128i m = _mm_set1_epi32(0x7FFFFFFF);
++    const __m128i ea = _mm_srli_epi32(_mm_and_si128(_mm_castps_si128(a), m), 23);
++    const __m128i eb = _mm_srli_epi32(_mm_and_si128(_mm_castps_si128(b), m), 23);
++    const __m128i lo = _mm_cmpgt_epi32(_mm_set1_epi32(130), _mm_add_epi32(ea, eb));
++    return !_mm_testz_si128(lo, lo);
++}
++
++const float kTwoM60 = 8.673617379884035e-19f;        /* 2^-60 */
++const float kTwoM126 = 1.1754943508222875e-38f;      /* FLT_MIN */
++
++/* For each child state j, the smallest |p_j| such that m_ij * p_j is normal
++   for every nonzero m_ij in column j (with a factor 4 to spare), as limit
++   bits laid out like a pair of patterns: (j = 0..3, j = 0..3). */
++inline unsigned columnLimit(const float* m, int j) {
++    float mmin = 0.0f;
++    for (int i = 0; i < 4; i++) {
++        const float a = std::fabs(m[5 * i + j]);
++        if (a > 0.0f && (mmin == 0.0f || a < mmin))
++            mmin = a;
++    }
++    if (mmin == 0.0f)
++        return 0u;
++    double t = std::ldexp(1.0, -124) / (double) mmin;
++    if (t < std::ldexp(1.0, -125))
++        t = std::ldexp(1.0, -125);
++    if (t > 3.0e38)
++        return 0x7F7FFFFFu;
++    return limitBits((float) t);
++}
++DK_TARGET DK_INLINE __m256i columnLimits(const float* m) {
++    const int a = (int) columnLimit(m, 0), b = (int) columnLimit(m, 1),
++              c = (int) columnLimit(m, 2), d = (int) columnLimit(m, 3);
++    return _mm256_setr_epi32(a, b, c, d, a, b, c, d);
++}
++
++/* Smallest |p| such that m*p is normal for every nonzero entry m of one
++   category's 4x4 matrix (with a factor 4 to spare). */
++inline unsigned innerLimit(const float* m) {
++    float mmin = 0.0f;
++    for (int i = 0; i < 4; i++)
++        for (int j = 0; j < 4; j++) {
++            const float a = std::fabs(m[5 * i + j]);
++            if (a > 0.0f && (mmin == 0.0f || a < mmin))
++                mmin = a;
++        }
++    if (mmin == 0.0f)
++        return 0u;
++    double t = std::ldexp(1.0, -124) / (double) mmin;
++    if (t < std::ldexp(1.0, -125))
++        t = std::ldexp(1.0, -125);
++    if (t > 3.0e38)
++        return 0x7F7FFFFFu;                       /* every nonzero finite value */
++    return limitBits((float) t);
++}
++
++/* true when every v[k] in [start, end) is zero or in [2^-60, 1]: dividing a
++   product of at least 2^-126 by it then stays normal */
++inline bool scaleFactorsTame(const float* v, int start, int end) {
++    for (int k = start; k < end; k++) {
++        const float x = v[k];
++        if (!(x == 0.0f || (x >= kTwoM60 && x <= 1.0f)))
++            return false;
++    }
++    return true;
++}
++
++/* bit for category l in a per-buffer subnormal mask (categories from 7 on
++   share the top bit) */
++DK_INLINE unsigned catBit(int l) { return 1u << (l < 7 ? l : 7); }
++
++/* mask of categories holding a subnormal value in partials[.][start..end) */
++DK_TARGET inline unsigned subnormalMask(const float* p, int categoryCount, int paddedPatternCount,
++                                   int start, int end) {
++    const __m256i l8 = _mm256_set1_epi32((int) limitBits(kTwoM126));
++    const __m128i l4 = _mm_set1_epi32((int) limitBits(kTwoM126));
++    unsigned mask = 0;
++    for (int l = 0; l < categoryCount; l++) {
++        const float* q = p + l * 4 * paddedPatternCount;
++        bool any = false;
++        int k = start;
++        for (; k + 1 < end && !any; k += 2)
++            any = anyTiny8(_mm256_loadu_ps(q + 4 * k), l8);
++        if (!any && k < end)
++            any = anyTiny4(_mm_loadu_ps(q + 4 * k), l4);
++        if (any)
++            mask |= catBit(l);
++    }
++    return mask;
++}
++
+ /* ------------------------------------------------------------------------ */
+ /* Partials updates                                                          */
+ /* ------------------------------------------------------------------------ */
++/*
++ * Each kernel returns whether its output may contain a subnormal (true only
++ * from the guarded path, or when MXCSR is not the default); callers keep that
++ * per buffer and pass inputsMaySub = true when a child buffer may hold one, so
++ * that category goes straight to the guarded kernel instead of making a fast
++ * attempt that would assist on its inputs.
++ */
+ 
+ /* destP = sum1 * sum2                (calcPartialsPartials)
+-   destP = sum1 * sum2 / scale[k]     (calcPartialsPartialsFixedScaling) */
++   destP = sum1 * sum2 / scale[k]     (calcPartialsPartialsFixedScaling)   */
++template <bool FIXED_SCALING>
++DK_TARGET DK_INLINE void ppFast(float* d, const float* p1, const float* p2,
++                      const __m256 c1[4], const __m256 c2[4],
++                      const float* scaleFactors, int start, int end) {
++    int k = start;
++    for (; k + 1 < end; k += 2) {
++        const int u = 4 * k;
++        const __m256 s1 = integrate2(c1, _mm256_loadu_ps(p1 + u));
++        const __m256 s2 = integrate2(c2, _mm256_loadu_ps(p2 + u));
++        __m256 r = _mm256_mul_ps(s1, s2);
++        if (FIXED_SCALING)
++            r = _mm256_div_ps(r, broadcastPair(scaleFactors + k));
++        _mm256_storeu_ps(d + u, r);
++    }
++    if (k < end) {
++        const int u = 4 * k;
++        const __m128 s1 = integrate1(c1, _mm_loadu_ps(p1 + u));
++        const __m128 s2 = integrate1(c2, _mm_loadu_ps(p2 + u));
++        __m128 r = _mm_mul_ps(s1, s2);
++        if (FIXED_SCALING)
++            r = _mm_div_ps(r, _mm_broadcast_ss(scaleFactors + k));
++        _mm_storeu_ps(d + u, r);
++    }
++}
++
++template <bool FIXED_SCALING>
++DK_TARGET bool ppGuarded(float* d, const float* p1, const float* p2,
++                         const __m256 c1[4], const __m256 c2[4],
++                         const __m256i l1, const __m256i l2, bool tameScale,
++                         const float* scaleFactors, int start, int end) {
++    const __m256i ls = _mm256_set1_epi32((int) limitBits(kTwoM126));
++    __m256d cd1[4], cd2[4];
++    loadColumnsDouble(c1, cd1);
++    loadColumnsDouble(c2, cd2);
++    bool sub = false;
++    int k = start;
++    for (; k + 1 < end; k += 2) {
++        const int u = 4 * k;
++        const __m256 a = _mm256_loadu_ps(p1 + u), b = _mm256_loadu_ps(p2 + u);
++        const __m256 s1 = anyTiny8(a, l1) ? integrate2xd(cd1, a) : integrate2(c1, a);
++        const __m256 s2 = anyTiny8(b, l2) ? integrate2xd(cd2, b) : integrate2(c2, b);
++        const bool exact = anyTinyProduct8(s1, s2);
++        __m256 r = exact ? xmul8(s1, s2) : _mm256_mul_ps(s1, s2);
++        if (FIXED_SCALING) {
++            const __m256 f = broadcastPair(scaleFactors + k);
++            r = (exact || !tameScale) ? xdiv8(r, f) : _mm256_div_ps(r, f);
++        }
++        if ((exact || (FIXED_SCALING && !tameScale)) && anyTiny8(r, ls))
++            sub = true;
++        _mm256_storeu_ps(d + u, r);
++    }
++    if (k < end) {
++        const int u = 4 * k;
++        const __m128 s1 = integrate1x(c1, _mm_loadu_ps(p1 + u));
++        const __m128 s2 = integrate1x(c2, _mm_loadu_ps(p2 + u));
++        __m128 r = xmul4(s1, s2);
++        if (FIXED_SCALING)
++            r = xdiv4(r, _mm_broadcast_ss(scaleFactors + k));
++        if (anyTiny4(r, _mm_set1_epi32((int) limitBits(kTwoM126))))
++            sub = true;
++        _mm_storeu_ps(d + u, r);
++    }
++    return sub;
++}
++
+ template <bool FIXED_SCALING>
+-DK_TARGET void partialsPartials(float* destP,
++DK_TARGET unsigned partialsPartials(float* destP,
+                                 const float* partials1, const float* matrices1,
+                                 const float* partials2, const float* matrices2,
+                                 const float* scaleFactors,
+                                 int categoryCount, int paddedPatternCount,
+-                                int startPattern, int endPattern) {
++                                int startPattern, int endPattern, unsigned inputsMaySub) {
++    const unsigned csr = _mm_getcsr();
++    const bool ftz = ftzUsable(csr);
++    const bool tame = !FIXED_SCALING || scaleFactorsTame(scaleFactors, startPattern, endPattern);
++    unsigned sub = ftz ? 0u : 0xFFu;
+     for (int l = 0; l < categoryCount; l++) {
+         const int u0 = l * 4 * paddedPatternCount;
+         const int w = l * 4 * 5;
+         __m256 c1[4], c2[4];
+         loadColumns(matrices1 + w, c1);
+         loadColumns(matrices2 + w, c2);
+-        int k = startPattern;
+-        for (; k + 1 < endPattern; k += 2) {
+-            const int u = u0 + 4 * k;
+-            const __m256 s1 = integrate2(c1, _mm256_loadu_ps(partials1 + u));
+-            const __m256 s2 = integrate2(c2, _mm256_loadu_ps(partials2 + u));
+-            __m256 r = _mm256_mul_ps(s1, s2);
+-            if (FIXED_SCALING)
+-                r = _mm256_div_ps(r, broadcastPair(scaleFactors + k));
+-            _mm256_storeu_ps(destP + u, r);
++        if (!ftz) {
++            ppFast<FIXED_SCALING>(destP + u0, partials1 + u0, partials2 + u0, c1, c2,
++                                  scaleFactors, startPattern, endPattern);
++            continue;
+         }
+-        if (k < endPattern) {
+-            const int u = u0 + 4 * k;
+-            const __m128 s1 = integrate1(c1, _mm_loadu_ps(partials1 + u));
+-            const __m128 s2 = integrate1(c2, _mm_loadu_ps(partials2 + u));
+-            __m128 r = _mm_mul_ps(s1, s2);
+-            if (FIXED_SCALING)
+-                r = _mm_div_ps(r, _mm_broadcast_ss(scaleFactors + k));
+-            _mm_storeu_ps(destP + u, r);
++        if (!(inputsMaySub & catBit(l))) {
++            ftzBegin(csr);
++            ppFast<FIXED_SCALING>(destP + u0, partials1 + u0, partials2 + u0, c1, c2,
++                                  scaleFactors, startPattern, endPattern);
++            const bool tiny = ftzUnderflowed();
++            _mm_setcsr(csr);
++            if (!tiny)
++                continue;
+         }
++        if (ppGuarded<FIXED_SCALING>(destP + u0, partials1 + u0, partials2 + u0, c1, c2,
++                                        columnLimits(matrices1 + w), columnLimits(matrices2 + w),
++                                        tame, scaleFactors, startPattern, endPattern))
++            sub |= catBit(l);
+     }
++    return sub;
+ }
+ 
+ /* destP[i] = matrices1[5i + state1] * sum2_i            (calcStatesPartials)
+    destP[i] = matrices1[5i + state1] * sum2_i / scale[k] (...FixedScaling) */
++DK_TARGET DK_INLINE __m256 stateColumnPair(const __m128 t[5], const float* m1, int sa, int sb) {
++    if (stateInTable(sa) && stateInTable(sb))
++        return pair128(t[sa], t[sb]);
++    return _mm256_setr_ps(matrixEntry(m1, 0, sa), matrixEntry(m1, 1, sa),
++                          matrixEntry(m1, 2, sa), matrixEntry(m1, 3, sa),
++                          matrixEntry(m1, 0, sb), matrixEntry(m1, 1, sb),
++                          matrixEntry(m1, 2, sb), matrixEntry(m1, 3, sb));
++}
++DK_TARGET DK_INLINE __m128 stateColumn(const __m128 t[5], const float* m1, int sa) {
++    return stateInTable(sa) ? t[sa] :
++        _mm_setr_ps(matrixEntry(m1, 0, sa), matrixEntry(m1, 1, sa),
++                    matrixEntry(m1, 2, sa), matrixEntry(m1, 3, sa));
++}
++
++template <bool FIXED_SCALING>
++DK_TARGET DK_INLINE void spFast(float* d, const int* states1, const float* m1, const __m128 t1[5],
++                      const float* p2, const __m256 c2[4],
++                      const float* scaleFactors, int start, int end) {
++    int k = start;
++    for (; k + 1 < end; k += 2) {
++        const int u = 4 * k;
++        const __m256 s2 = integrate2(c2, _mm256_loadu_ps(p2 + u));
++        __m256 r = _mm256_mul_ps(stateColumnPair(t1, m1, states1[k], states1[k + 1]), s2);
++        if (FIXED_SCALING)
++            r = _mm256_div_ps(r, broadcastPair(scaleFactors + k));
++        _mm256_storeu_ps(d + u, r);
++    }
++    if (k < end) {
++        const int u = 4 * k;
++        const __m128 s2 = integrate1(c2, _mm_loadu_ps(p2 + u));
++        __m128 r = _mm_mul_ps(stateColumn(t1, m1, states1[k]), s2);
++        if (FIXED_SCALING)
++            r = _mm_div_ps(r, _mm_broadcast_ss(scaleFactors + k));
++        _mm_storeu_ps(d + u, r);
++    }
++}
++
++template <bool FIXED_SCALING>
++DK_TARGET bool spGuarded(float* d, const int* states1, const float* m1, const __m128 t1[5],
++                         const float* p2, const __m256 c2[4], const __m256i l2, bool tameScale,
++                         const float* scaleFactors, int start, int end) {
++    __m256d cd2[4];
++    loadColumnsDouble(c2, cd2);
++    const __m256i ls = _mm256_set1_epi32((int) limitBits(kTwoM126));
++    bool sub = false;
++    int k = start;
++    for (; k + 1 < end; k += 2) {
++        const int u = 4 * k;
++        const __m256 b = _mm256_loadu_ps(p2 + u);
++        const __m256 s2 = anyTiny8(b, l2) ? integrate2xd(cd2, b) : integrate2(c2, b);
++        const __m256 a = stateColumnPair(t1, m1, states1[k], states1[k + 1]);
++        const bool exact = anyTinyProduct8(a, s2);
++        __m256 r = exact ? xmul8(a, s2) : _mm256_mul_ps(a, s2);
++        if (FIXED_SCALING) {
++            const __m256 f = broadcastPair(scaleFactors + k);
++            r = (exact || !tameScale) ? xdiv8(r, f) : _mm256_div_ps(r, f);
++        }
++        if ((exact || (FIXED_SCALING && !tameScale)) && anyTiny8(r, ls))
++            sub = true;
++        _mm256_storeu_ps(d + u, r);
++    }
++    if (k < end) {
++        const int u = 4 * k;
++        const __m128 s2 = integrate1x(c2, _mm_loadu_ps(p2 + u));
++        __m128 r = xmul4(stateColumn(t1, m1, states1[k]), s2);
++        if (FIXED_SCALING)
++            r = xdiv4(r, _mm_broadcast_ss(scaleFactors + k));
++        if (anyTiny4(r, _mm_set1_epi32((int) limitBits(kTwoM126))))
++            sub = true;
++        _mm_storeu_ps(d + u, r);
++    }
++    return sub;
++}
++
+ template <bool FIXED_SCALING>
+-DK_TARGET void statesPartials(float* destP,
++DK_TARGET unsigned statesPartials(float* destP,
+                               const int* states1, const float* matrices1,
+                               const float* partials2, const float* matrices2,
+                               const float* scaleFactors,
+                               int categoryCount, int paddedPatternCount,
+-                              int startPattern, int endPattern) {
++                              int startPattern, int endPattern, unsigned inputsMaySub) {
++    const unsigned csr = _mm_getcsr();
++    const bool ftz = ftzUsable(csr);
++    const bool tame = !FIXED_SCALING || scaleFactorsTame(scaleFactors, startPattern, endPattern);
++    unsigned sub = ftz ? 0u : 0xFFu;
+     for (int l = 0; l < categoryCount; l++) {
+         const int u0 = l * 4 * paddedPatternCount;
+         const int w = l * 4 * 5;
+@@ -158,48 +527,62 @@ DK_TARGET void statesPartials(float* destP,
+         __m256 c2[4];
+         loadStateColumns(m1, t1);
+         loadColumns(matrices2 + w, c2);
+-        int k = startPattern;
+-        for (; k + 1 < endPattern; k += 2) {
+-            const int u = u0 + 4 * k;
+-            const int sa = states1[k], sb = states1[k + 1];
+-            const __m256 s2 = integrate2(c2, _mm256_loadu_ps(partials2 + u));
+-            __m256 a;
+-            if (stateInTable(sa) && stateInTable(sb)) {
+-                a = pair128(t1[sa], t1[sb]);
+-            } else {
+-                a = _mm256_setr_ps(matrixEntry(m1, 0, sa), matrixEntry(m1, 1, sa),
+-                                   matrixEntry(m1, 2, sa), matrixEntry(m1, 3, sa),
+-                                   matrixEntry(m1, 0, sb), matrixEntry(m1, 1, sb),
+-                                   matrixEntry(m1, 2, sb), matrixEntry(m1, 3, sb));
+-            }
+-            __m256 r = _mm256_mul_ps(a, s2);
+-            if (FIXED_SCALING)
+-                r = _mm256_div_ps(r, broadcastPair(scaleFactors + k));
+-            _mm256_storeu_ps(destP + u, r);
++        if (!ftz) {
++            spFast<FIXED_SCALING>(destP + u0, states1, m1, t1, partials2 + u0, c2,
++                                  scaleFactors, startPattern, endPattern);
++            continue;
+         }
+-        if (k < endPattern) {
+-            const int u = u0 + 4 * k;
+-            const int sa = states1[k];
+-            const __m128 s2 = integrate1(c2, _mm_loadu_ps(partials2 + u));
+-            const __m128 a = stateInTable(sa) ? t1[sa] :
+-                _mm_setr_ps(matrixEntry(m1, 0, sa), matrixEntry(m1, 1, sa),
+-                            matrixEntry(m1, 2, sa), matrixEntry(m1, 3, sa));
+-            __m128 r = _mm_mul_ps(a, s2);
+-            if (FIXED_SCALING)
+-                r = _mm_div_ps(r, _mm_broadcast_ss(scaleFactors + k));
+-            _mm_storeu_ps(destP + u, r);
++        if (!(inputsMaySub & catBit(l))) {
++            ftzBegin(csr);
++            spFast<FIXED_SCALING>(destP + u0, states1, m1, t1, partials2 + u0, c2,
++                                  scaleFactors, startPattern, endPattern);
++            const bool tiny = ftzUnderflowed();
++            _mm_setcsr(csr);
++            if (!tiny)
++                continue;
+         }
++        if (spGuarded<FIXED_SCALING>(destP + u0, states1, m1, t1, partials2 + u0, c2,
++                                        columnLimits(matrices2 + w), tame, scaleFactors,
++                                        startPattern, endPattern))
++            sub |= catBit(l);
+     }
++    return sub;
+ }
+ 
+ /* destP[i] = matrices1[5i + state1] * matrices2[5i + state2]  (/ scale[k]) */
++template <bool FIXED_SCALING, bool GUARDED>
++DK_TARGET DK_INLINE bool ssPass(float* d, const int* states1, const float* m1, const __m128 t1[5],
++                      const int* states2, const float* m2, const __m128 t2[5], bool tameScale,
++                      const float* scaleFactors, int start, int end) {
++    const __m128i ls = _mm_set1_epi32((int) limitBits(kTwoM126));
++    bool sub = false;
++    for (int k = start; k < end; k++) {
++        const __m128 a = stateColumn(t1, m1, states1[k]);
++        const __m128 b = stateColumn(t2, m2, states2[k]);
++        const bool exact = GUARDED && anyTinyProduct4(a, b);
++        __m128 r = exact ? xmul4(a, b) : _mm_mul_ps(a, b);
++        if (FIXED_SCALING) {
++            const __m128 f = _mm_broadcast_ss(scaleFactors + k);
++            r = (GUARDED && (exact || !tameScale)) ? xdiv4(r, f) : _mm_div_ps(r, f);
++        }
++        if (GUARDED && (exact || (FIXED_SCALING && !tameScale)) && anyTiny4(r, ls))
++            sub = true;
++        _mm_storeu_ps(d + 4 * k, r);
++    }
++    return sub;
++}
++
+ template <bool FIXED_SCALING>
+-DK_TARGET void statesStates(float* destP,
+-                            const int* states1, const float* matrices1,
+-                            const int* states2, const float* matrices2,
+-                            const float* scaleFactors,
+-                            int categoryCount, int paddedPatternCount,
+-                            int startPattern, int endPattern) {
++DK_TARGET unsigned statesStates(float* destP,
++                                const int* states1, const float* matrices1,
++                                const int* states2, const float* matrices2,
++                                const float* scaleFactors,
++                                int categoryCount, int paddedPatternCount,
++                                int startPattern, int endPattern) {
++    const unsigned csr = _mm_getcsr();
++    const bool ftz = ftzUsable(csr);
++    const bool tame = !FIXED_SCALING || scaleFactorsTame(scaleFactors, startPattern, endPattern);
++    unsigned sub = ftz ? 0u : 0xFFu;
+     for (int l = 0; l < categoryCount; l++) {
+         const int u0 = l * 4 * paddedPatternCount;
+         const int w = l * 4 * 5;
+@@ -208,21 +591,19 @@ DK_TARGET void statesStates(float* destP,
+         __m128 t1[5], t2[5];
+         loadStateColumns(m1, t1);
+         loadStateColumns(m2, t2);
+-        for (int k = startPattern; k < endPattern; k++) {
+-            const int u = u0 + 4 * k;
+-            const int sa = states1[k], sb = states2[k];
+-            const __m128 a = stateInTable(sa) ? t1[sa] :
+-                _mm_setr_ps(matrixEntry(m1, 0, sa), matrixEntry(m1, 1, sa),
+-                            matrixEntry(m1, 2, sa), matrixEntry(m1, 3, sa));
+-            const __m128 b = stateInTable(sb) ? t2[sb] :
+-                _mm_setr_ps(matrixEntry(m2, 0, sb), matrixEntry(m2, 1, sb),
+-                            matrixEntry(m2, 2, sb), matrixEntry(m2, 3, sb));
+-            __m128 r = _mm_mul_ps(a, b);
+-            if (FIXED_SCALING)
+-                r = _mm_div_ps(r, _mm_broadcast_ss(scaleFactors + k));
+-            _mm_storeu_ps(destP + u, r);
+-        }
++        if (ftz)
++            ftzBegin(csr);
++        ssPass<FIXED_SCALING, false>(destP + u0, states1, m1, t1, states2, m2, t2, tame,
++                                     scaleFactors, startPattern, endPattern);
++        if (!ftz)
++            continue;
++        const bool tiny = ftzUnderflowed();
++        _mm_setcsr(csr);
++        if (tiny && ssPass<FIXED_SCALING, true>(destP + u0, states1, m1, t1, states2, m2, t2, tame,
++                                                scaleFactors, startPattern, endPattern))
++            sub |= catBit(l);
+     }
++    return sub;
+ }
+ 
+ /* ------------------------------------------------------------------------ */
+@@ -233,71 +614,128 @@ DK_TARGET void statesStates(float* destP,
+      (P_l[i][stateChild] * parent_l[k][i]) * weight_l     (child is a tip)
+      (sum_li            * parent_l[k][i]) * weight_l      (child has partials)
+    category by category, exactly the scalar loop. */
++template <bool CHILD_STATES>
++DK_TARGET DK_INLINE void edgeCatFast(float* tmp, const float* parent, const int* statesChild,
++                           const float* child, const float* m, const __m256 wt,
++                           int start, int end) {
++    __m128 t[5];
++    __m256 c[4];
++    if (CHILD_STATES)
++        loadStateColumns(m, t);
++    else
++        loadColumns(m, c);
++    int k = start;
++    for (; k + 1 < end; k += 2) {
++        const int v = 4 * k;
++        const __m256 a = CHILD_STATES ? stateColumnPair(t, m, statesChild[k], statesChild[k + 1])
++                                      : integrate2(c, _mm256_loadu_ps(child + v));
++        const __m256 x = _mm256_mul_ps(_mm256_mul_ps(a, _mm256_loadu_ps(parent + v)), wt);
++        _mm256_storeu_ps(tmp + v, _mm256_add_ps(_mm256_loadu_ps(tmp + v), x));
++    }
++    if (k < end) {
++        const int v = 4 * k;
++        const __m128 a = CHILD_STATES ? stateColumn(t, m, statesChild[k])
++                                      : integrate1(c, _mm_loadu_ps(child + v));
++        const __m128 x = _mm_mul_ps(_mm_mul_ps(a, _mm_loadu_ps(parent + v)), _mm256_castps256_ps128(wt));
++        _mm_storeu_ps(tmp + v, _mm_add_ps(_mm_loadu_ps(tmp + v), x));
++    }
++}
++
++/* a*parent >= 2^-120 when both are at least 2^-60, and times a weight in
++   [2^-6, 1] (or zero) that stays normal */
++template <bool CHILD_STATES>
++DK_TARGET void edgeCatGuarded(float* tmp, const float* parent, const int* statesChild,
++                              const float* child, const float* m, const __m256 wt, bool tameWeight,
++                              int start, int end) {
++    __m128 t[5];
++    __m256 c[4];
++    if (CHILD_STATES)
++        loadStateColumns(m, t);
++    else
++        loadColumns(m, c);
++    const __m256i lc = _mm256_set1_epi32((int) innerLimit(m));
++    const __m256i l60 = _mm256_set1_epi32((int) limitBits(kTwoM60));
++    int k = start;
++    for (; k + 1 < end; k += 2) {
++        const int v = 4 * k;
++        __m256 a;
++        if (CHILD_STATES) {
++            a = stateColumnPair(t, m, statesChild[k], statesChild[k + 1]);
++        } else {
++            const __m256 q = _mm256_loadu_ps(child + v);
++            a = anyTiny8(q, lc) ? integrate2x(c, q) : integrate2(c, q);
++        }
++        const __m256 p = _mm256_loadu_ps(parent + v);
++        const __m256 x = (!tameWeight || anyTiny8(a, l60, p, l60))
++            ? xmul8(xmul8(a, p), wt) : _mm256_mul_ps(_mm256_mul_ps(a, p), wt);
++        _mm256_storeu_ps(tmp + v, _mm256_add_ps(_mm256_loadu_ps(tmp + v), x));
++    }
++    if (k < end) {
++        const int v = 4 * k;
++        const __m128 a = CHILD_STATES ? stateColumn(t, m, statesChild[k])
++                                      : integrate1x(c, _mm_loadu_ps(child + v));
++        const __m128 x = xmul4(xmul4(a, _mm_loadu_ps(parent + v)), _mm256_castps256_ps128(wt));
++        _mm_storeu_ps(tmp + v, _mm_add_ps(_mm_loadu_ps(tmp + v), x));
++    }
++}
++
+ template <bool CHILD_STATES>
+ DK_TARGET void edgeAccumulate(float* integrationTmp,
+                               const float* partialsParent,
+                               const int* statesChild, const float* partialsChild,
+                               const float* transMatrix, const float* weights,
+                               int categoryCount, int paddedPatternCount,
+-                              int patternCount) {
++                              int startPattern, int endPattern, unsigned inputsMaySub) {
++    const unsigned csr = _mm_getcsr();
++    const bool ftz = ftzUsable(csr);
++    if (ftz && !inputsMaySub)
++        ftzBegin(csr);
++    if (!ftz || !inputsMaySub) {   /* any flagged category: all of them guarded */
++        for (int l = 0; l < categoryCount; l++) {
++            const int v0 = l * 4 * paddedPatternCount;
++            edgeCatFast<CHILD_STATES>(integrationTmp, partialsParent + v0, statesChild,
++                                      CHILD_STATES ? NULL : partialsChild + v0,
++                                      transMatrix + l * 4 * 5, _mm256_broadcast_ss(weights + l),
++                                      startPattern, endPattern);
++        }
++        if (!ftz)
++            return;
++        const bool tiny = ftzUnderflowed();
++        _mm_setcsr(csr);
++        if (!tiny)
++            return;
++        for (int k = 4 * startPattern; k < 4 * endPattern; k++)
++            integrationTmp[k] = 0.0f;                /* start the sums again */
++    }
++    bool tameWeight = true;
++    for (int l = 0; l < categoryCount; l++) {
++        const float x = weights[l];
++        if (!(x == 0.0f || (x >= 0.015625f && x <= 1.0f)))
++            tameWeight = false;
++    }
+     for (int l = 0; l < categoryCount; l++) {
+-        const float* m = transMatrix + l * 4 * 5;
+         const int v0 = l * 4 * paddedPatternCount;
+-        const __m256 wt = _mm256_broadcast_ss(weights + l);
+-        __m128 t[5];
+-        __m256 c[4];
+-        if (CHILD_STATES)
+-            loadStateColumns(m, t);
+-        else
+-            loadColumns(m, c);
+-        int k = 0;
+-        for (; k + 1 < patternCount; k += 2) {
+-            const int v = v0 + 4 * k;
+-            __m256 a;
+-            if (CHILD_STATES) {
+-                const int sa = statesChild[k], sb = statesChild[k + 1];
+-                if (stateInTable(sa) && stateInTable(sb))
+-                    a = pair128(t[sa], t[sb]);
+-                else
+-                    a = _mm256_setr_ps(matrixEntry(m, 0, sa), matrixEntry(m, 1, sa),
+-                                       matrixEntry(m, 2, sa), matrixEntry(m, 3, sa),
+-                                       matrixEntry(m, 0, sb), matrixEntry(m, 1, sb),
+-                                       matrixEntry(m, 2, sb), matrixEntry(m, 3, sb));
+-            } else {
+-                a = integrate2(c, _mm256_loadu_ps(partialsChild + v));
+-            }
+-            const __m256 x = _mm256_mul_ps(_mm256_mul_ps(a, _mm256_loadu_ps(partialsParent + v)), wt);
+-            float* tmp = integrationTmp + 4 * k;
+-            _mm256_storeu_ps(tmp, _mm256_add_ps(_mm256_loadu_ps(tmp), x));
+-        }
+-        if (k < patternCount) {
+-            const int v = v0 + 4 * k;
+-            __m128 a;
+-            if (CHILD_STATES) {
+-                const int sa = statesChild[k];
+-                a = stateInTable(sa) ? t[sa] :
+-                    _mm_setr_ps(matrixEntry(m, 0, sa), matrixEntry(m, 1, sa),
+-                                matrixEntry(m, 2, sa), matrixEntry(m, 3, sa));
+-            } else {
+-                a = integrate1(c, _mm_loadu_ps(partialsChild + v));
+-            }
+-            const __m128 x = _mm_mul_ps(_mm_mul_ps(a, _mm_loadu_ps(partialsParent + v)),
+-                                        _mm256_castps256_ps128(wt));
+-            float* tmp = integrationTmp + 4 * k;
+-            _mm_storeu_ps(tmp, _mm_add_ps(_mm_loadu_ps(tmp), x));
+-        }
++        edgeCatGuarded<CHILD_STATES>(integrationTmp, partialsParent + v0, statesChild,
++                                     CHILD_STATES ? NULL : partialsChild + v0,
++                                     transMatrix + l * 4 * 5, _mm256_broadcast_ss(weights + l),
++                                     tameWeight, startPattern, endPattern);
+     }
+ }
+ 
+ /* sumOverI[k] = ((f0*t0 + f1*t1) + f2*t2) + f3*t3 over integrationTmp, the
+    integrateOutStatesAndScale expression. */
+-DK_TARGET inline void integrateStates(float* sumOverI, const float* integrationTmp,
+-                                      const float* freqs, int patternCount) {
++template <bool GUARDED>
++DK_TARGET void integrateStatesPass(float* sumOverI, const float* integrationTmp,
++                                   const float* freqs, int patternCount) {
+     const __m128 f128 = _mm_setr_ps(freqs[0], freqs[1], freqs[2], freqs[3]);
+     const __m256 f = pair128(f128, f128);
++    float fm[20] = {0};
++    for (int i = 0; i < 4; i++) fm[5 * i] = freqs[i];   /* limit from the smallest frequency */
++    const __m256i lt = _mm256_set1_epi32((int) (GUARDED ? innerLimit(fm) : 0u));
+     int k = 0;
+     for (; k + 1 < patternCount; k += 2) {
+-        const __m256 q = _mm256_mul_ps(f, _mm256_loadu_ps(integrationTmp + 4 * k));
++        const __m256 t = _mm256_loadu_ps(integrationTmp + 4 * k);
++        const __m256 q = (GUARDED && anyTiny8(t, lt)) ? xmul8(f, t) : _mm256_mul_ps(f, t);
+         __m256 s = _mm256_add_ps(_mm256_permute_ps(q, 0x00), _mm256_permute_ps(q, 0x55));
+         s = _mm256_add_ps(s, _mm256_permute_ps(q, 0xAA));
+         s = _mm256_add_ps(s, _mm256_permute_ps(q, 0xFF));
+@@ -305,7 +743,8 @@ DK_TARGET inline void integrateStates(float* sumOverI, const float* integrationT
+         sumOverI[k + 1] = _mm_cvtss_f32(_mm256_extractf128_ps(s, 1));
+     }
+     if (k < patternCount) {
+-        const __m128 q = _mm_mul_ps(f128, _mm_loadu_ps(integrationTmp + 4 * k));
++        const __m128 t = _mm_loadu_ps(integrationTmp + 4 * k);
++        const __m128 q = GUARDED ? xmul4(f128, t) : _mm_mul_ps(f128, t);
+         __m128 s = _mm_add_ps(_mm_permute_ps(q, 0x00), _mm_permute_ps(q, 0x55));
+         s = _mm_add_ps(s, _mm_permute_ps(q, 0xAA));
+         s = _mm_add_ps(s, _mm_permute_ps(q, 0xFF));
+@@ -313,6 +752,21 @@ DK_TARGET inline void integrateStates(float* sumOverI, const float* integrationT
+     }
+ }
+ 
++DK_TARGET inline void integrateStates(float* sumOverI, const float* integrationTmp,
++                                      const float* freqs, int patternCount) {
++    const unsigned csr = _mm_getcsr();
++    if (!ftzUsable(csr)) {
++        integrateStatesPass<false>(sumOverI, integrationTmp, freqs, patternCount);
++        return;
++    }
++    ftzBegin(csr);
++    integrateStatesPass<false>(sumOverI, integrationTmp, freqs, patternCount);
++    const bool tiny = ftzUnderflowed();
++    _mm_setcsr(csr);
++    if (tiny)
++        integrateStatesPass<true>(sumOverI, integrationTmp, freqs, patternCount);
++}
++
+ /* ------------------------------------------------------------------------ */
+ /* Rescaling                                                                 */
+ /* ------------------------------------------------------------------------ */
+diff --git a/libhmsbeagle/CPU/DikaryaThreads.h b/libhmsbeagle/CPU/DikaryaThreads.h
+new file mode 100644
+index 00000000..1417689a
+--- /dev/null
++++ b/libhmsbeagle/CPU/DikaryaThreads.h
+@@ -0,0 +1,175 @@
++/*
++ *  DikaryaThreads.h
++ *
++ *  A small fork-join pool for splitting one likelihood call across threads
++ *  by site pattern. Every pattern is computed by the same kernel code
++ *  whichever thread runs it, and anything summed over patterns is summed
++ *  afterwards by the caller in the original order, so results do not depend
++ *  on the number of threads or on which thread ran which range.
++ *
++ *  The caller always takes part and always runs chunk 0. Chunks are claimed with a compare-and-swap
++ *  on a ticket that carries the job number, so a worker that wakes late
++ *  never claims a chunk of a later job, and a worker that is descheduled
++ *  before claiming anything costs nothing: the caller runs the remaining
++ *  chunks itself. Workers spin briefly between jobs (MrBayes calls the
++ *  library every few tens of microseconds) and then sleep on a condition
++ *  variable; BEAGLE_DIKARYA_SPIN_US sets the spin time.
++ */
++
++#ifndef __BeagleDikaryaThreads__
++#define __BeagleDikaryaThreads__
++
++#include <atomic>
++#include <condition_variable>
++#include <cstdint>
++#include <cstdlib>
++#include <mutex>
++#include <thread>
++#include <vector>
++#include <x86intrin.h>
++
++namespace beagle {
++namespace cpu {
++namespace dk {
++
++class Pool {
++public:
++    typedef void (*ChunkFn)(void* ctx, int chunk);
++
++    explicit Pool(int nThreads) : kThreads(nThreads < 1 ? 1 : nThreads) {
++        const char* s = getenv("BEAGLE_DIKARYA_SPIN_US");
++        long us = s ? atol(s) : 300;
++        spinCycles = (uint64_t) (us < 0 ? 0 : us) * 2600u;   /* TSC ticks, ~2.6 GHz */
++        for (int i = 1; i < kThreads; i++)
++            workers.push_back(std::thread(&Pool::workerLoop, this));
++    }
++
++    ~Pool() {
++        {
++            std::lock_guard<std::mutex> lk(m);
++            stop.store(true, std::memory_order_seq_cst);
++        }
++        cv.notify_all();
++        for (size_t i = 0; i < workers.size(); i++)
++            workers[i].join();
++    }
++
++    int threads() const { return kThreads; }
++
++    /* fn(ctx, c) for every c in [0, nChunks); returns when all have finished */
++    void run(int nChunks, ChunkFn f, void* c) {
++        if (kThreads == 1 || nChunks <= 1) {
++            for (int i = 0; i < nChunks; i++)
++                f(c, i);
++            return;
++        }
++        jobChunks.store(nChunks, std::memory_order_relaxed);
++        jobFn = f;
++        jobCtx = c;
++        done.store(0, std::memory_order_relaxed);
++        const uint32_t s = ++seq;
++        /* chunk 0 belongs to the caller, so with one chunk per thread each
++           thread keeps working on the same patterns call after call (their
++           partials stay in its own cache); workers claim from chunk 1 on,
++           and the caller takes over any chunk no worker has claimed yet */
++        ticket.store(((uint64_t) s << 32) | 1u, std::memory_order_seq_cst);
++        if (sleeping.load(std::memory_order_seq_cst) > 0) {
++            std::lock_guard<std::mutex> lk(m);
++            cv.notify_all();
++        }
++        f(c, 0);
++        done.fetch_add(1, std::memory_order_release);
++        claimAndRun(s);
++        while (done.load(std::memory_order_acquire) < nChunks)
++            _mm_pause();
++    }
++
++private:
++    /* claim chunks of job s until none are left; true if any were run */
++    bool claimAndRun(uint32_t s) {
++        bool ran = false;
++        uint64_t t = ticket.load(std::memory_order_acquire);
++        for (;;) {
++            if ((uint32_t) (t >> 32) != s)
++                return ran;
++            const int c = (int) (uint32_t) t;
++            if (c >= jobChunks.load(std::memory_order_relaxed))
++                return ran;
++            if (ticket.compare_exchange_weak(t, t + 1, std::memory_order_acq_rel, std::memory_order_acquire)) {
++                jobFn(jobCtx, c);
++                done.fetch_add(1, std::memory_order_release);
++                ran = true;
++                t = ticket.load(std::memory_order_acquire);
++            }
++        }
++    }
++
++    void workerLoop() {
++        uint32_t seen = 0;
++        for (;;) {
++            uint32_t s = (uint32_t) (ticket.load(std::memory_order_acquire) >> 32);
++            if (s == seen) {
++                const uint64_t t0 = __rdtsc();
++                while (s == seen && !stop.load(std::memory_order_relaxed) && __rdtsc() - t0 < spinCycles) {
++                    _mm_pause();
++                    s = (uint32_t) (ticket.load(std::memory_order_acquire) >> 32);
++                }
++                if (s == seen) {
++                    std::unique_lock<std::mutex> lk(m);
++                    sleeping.fetch_add(1, std::memory_order_seq_cst);
++                    while ((s = (uint32_t) (ticket.load(std::memory_order_seq_cst) >> 32)) == seen
++                           && !stop.load(std::memory_order_seq_cst))
++                        cv.wait(lk);
++                    sleeping.fetch_sub(1, std::memory_order_seq_cst);
++                }
++            }
++            if (stop.load(std::memory_order_acquire))
++                return;
++            seen = s;
++            claimAndRun(s);
++        }
++    }
++
++    const int kThreads;
++    uint64_t spinCycles;
++    std::vector<std::thread> workers;
++    std::atomic<uint64_t> ticket{0};   /* job number << 32 | next chunk */
++    std::atomic<int> done{0};
++    std::atomic<int> sleeping{0};
++    std::atomic<bool> stop{false};
++    uint32_t seq = 0;                  /* written by the caller only */
++    std::atomic<int> jobChunks{0};
++    ChunkFn jobFn = nullptr;
++    void* jobCtx = nullptr;
++    std::mutex m;
++    std::condition_variable cv;
++};
++
++/* Per-thread hand-off between the operation loop, which knows buffer
++   indices, and the kernels, which only see pointers: which rate categories
++   of the children may hold subnormal partials, and which of the result may. Only speed
++   depends on these; the defaults are the cautious answers. */
++struct OpState {
++    unsigned inMaySub = 0xFFu;    /* bit per category (see catBit) */
++    unsigned outMaySub = 0xFFu;
++};
++inline OpState& opState() {
++    static thread_local OpState s;
++    return s;
++}
++
++/* Split [0, n) into `parts` ranges with even boundaries (two patterns per
++   vector in the kernels), returning range i as [*lo, *hi). */
++inline void evenRange(int n, int parts, int i, int* lo, int* hi) {
++    const int pairs = (n + 1) / 2;
++    *lo = 2 * (int) ((int64_t) pairs * i / parts);
++    *hi = 2 * (int) ((int64_t) pairs * (i + 1) / parts);
++    if (*lo > n) *lo = n;
++    if (*hi > n) *hi = n;
++}
++
++}   // namespace dk
++}   // namespace cpu
++}   // namespace beagle
++
++#endif  // __BeagleDikaryaThreads__
+-- 
+2.43.0
+
+
+From d4593a30136928882f57e343b8737f602a81888b Mon Sep 17 00:00:00 2001
+From: Alan Rockefeller <alanrockefeller@gmail.com>
+Date: Fri, 9 Oct 2026 22:01:22 +0000
+Subject: [PATCH 4/5] CPU 4-state single precision: calls for different buffers
+ may run concurrently
+
+MrBayes (3.2.9-dikarya2) can compute the likelihoods of different MCMC chains
+on different threads, one BEAGLE instance shared between them, each chain
+using its own partials, matrices, scale buffers and eigen/weight/frequency
+slots. Everything BEAGLE keeps per slot is then already private to a chain;
+four things were not:
+
+- the edge likelihood's per-pattern work arrays (integrationTmp,
+  outLogLikelihoodsTmp), which getSiteLogLikelihoods then reads;
+- the category rates, which beagleSetCategoryRates stores in one shared slot
+  and updateTransitionMatrices reads;
+- EigenDecompositionCube's matrixTmp.
+
+These are now per thread (per instance): the edge likelihood writes into the
+calling thread's arrays, getSiteLogLikelihoods returns the calling thread's
+last result, and updateTransitionMatrices uses the rates the calling thread
+last set (in a single-threaded caller, the same values as the shared slot,
+which is still written, under a lock). The unthreaded 4-state edge likelihood now goes
+through the same per-pattern job as the pattern-split one, with one chunk
+covering every pattern; that is the code path already shown identical to the
+original summation (exact threading, previous commit).
+
+Nothing here changes a value: the same operations on the same operands in the
+same order, only stored in a different place.
+---
+ libhmsbeagle/CPU/BeagleCPU4StateImpl.hpp    | 46 ++++++++++-----------
+ libhmsbeagle/CPU/BeagleCPUImpl.h            | 22 ++++++++++
+ libhmsbeagle/CPU/BeagleCPUImpl.hpp          | 35 ++++++++++++----
+ libhmsbeagle/CPU/EigenDecompositionCube.hpp |  7 ++++
+ 4 files changed, 79 insertions(+), 31 deletions(-)
+
+diff --git a/libhmsbeagle/CPU/BeagleCPU4StateImpl.hpp b/libhmsbeagle/CPU/BeagleCPU4StateImpl.hpp
+index 78a2e138..653a6d97 100644
+--- a/libhmsbeagle/CPU/BeagleCPU4StateImpl.hpp
++++ b/libhmsbeagle/CPU/BeagleCPU4StateImpl.hpp
+@@ -937,23 +937,24 @@ int BeagleCPU4StateImpl<BEAGLE_CPU_GENERIC>::calcEdgeLogLikelihoods(const int pa
+     const REALTYPE* wt = gCategoryWeights[categoryWeightsIndex];
+ 
+ 
+-    memset(integrationTmp, 0, (kPatternCount * kStateCount)*sizeof(REALTYPE));
+-
+ #ifdef BEAGLE_DIKARYA_AVX
+-    if (DK_FLOAT4 && dkPool) {
+-        /* Per-pattern work split by pattern range; the double-precision sum
+-           over patterns is then done here, in pattern order, exactly as
+-           integrateOutStatesAndScale does it. */
++    if (DK_FLOAT4) {
++        /* Per-pattern work, split by pattern range when threaded, into this
++           thread's scratch (so calls for different chains may run at once);
++           then the double-precision sum over patterns in pattern order,
++           exactly as integrateOutStatesAndScale does it. */
++        typename BeagleCPUImpl<BEAGLE_CPU_GENERIC>::DkScratch& scratch = this->dkScratch();
+         struct Job {
+             BeagleCPU4StateImpl* self; const REALTYPE *parent, *tm, *w, *freqs, *scale;
+             const int* childStates; const REALTYPE* childPartials; int chunks, parIndex, childIndex;
++            float* tmp; REALTYPE* outLog;
+             static void run(void* p, int c) {
+                 Job* j = (Job*) p;
+                 BeagleCPU4StateImpl* s = j->self;
+                 int lo, hi;
+                 dk::evenRange(s->kPatternCount, j->chunks, c, &lo, &hi);
+-                float* tmp = (float*) s->integrationTmp;
+-                REALTYPE* outLog = s->outLogLikelihoodsTmp;
++                float* tmp = j->tmp;
++                REALTYPE* outLog = j->outLog;
+                 for (int k = 4 * lo; k < 4 * hi; k++)
+                     tmp[k] = 0.0f;
+                 const unsigned maySub = s->dkMaySub(j->parIndex, c) |
+@@ -982,34 +983,31 @@ int BeagleCPU4StateImpl<BEAGLE_CPU_GENERIC>::calcEdgeLogLikelihoods(const int pa
+         const bool tip = (childIndex < kTipCount && gTipStates[childIndex]);
+         job.childStates = tip ? gTipStates[childIndex] : NULL;
+         job.childPartials = tip ? NULL : gPartials[childIndex];
+-        job.chunks = dkChunkCount(kPatternCount);
++        job.chunks = dkPool ? dkChunkCount(kPatternCount) : 1;
+         job.parIndex = parIndex;
+         job.childIndex = childIndex;
+-        dkPool->run(job.chunks, &Job::run, &job);
++        job.tmp = (float*) scratch.integration.data();
++        job.outLog = scratch.outLog.data();
++        if (dkPool)
++            dkPool->run(job.chunks, &Job::run, &job);
++        else
++            Job::run(&job, 0);
+ 
++        scratch.outLogHere = true;
++        const REALTYPE* outLog = scratch.outLog.data();
+         *outSumLogLikelihood = 0.0;
+         for(int k=0; k < kPatternCount; k++) {
+-            *outSumLogLikelihood += outLogLikelihoodsTmp[k] * gPatternWeights[k];
++            *outSumLogLikelihood += outLog[k] * gPatternWeights[k];
+         }
+         if (*outSumLogLikelihood != *outSumLogLikelihood)
+             return BEAGLE_ERROR_FLOATING_POINT;
+         return BEAGLE_SUCCESS;
+     }
+-    if (DK_FLOAT4) {
+-        const bool tipChild = (childIndex < kTipCount && gTipStates[childIndex]);
+-        const unsigned maySub = this->dkMaySub(parIndex, 0) | (tipChild ? 0u : this->dkMaySub(childIndex, 0));
+-        if (tipChild)
+-            dk::edgeAccumulate<true>((float*) integrationTmp, (const float*) partialsParent,
+-                gTipStates[childIndex], NULL, (const float*) transMatrix, (const float*) wt,
+-                kCategoryCount, kPaddedPatternCount, 0, kPatternCount, maySub);
+-        else
+-            dk::edgeAccumulate<false>((float*) integrationTmp, (const float*) partialsParent,
+-                NULL, (const float*) gPartials[childIndex], (const float*) transMatrix,
+-                (const float*) wt, kCategoryCount, kPaddedPatternCount, 0, kPatternCount, maySub);
+-        return integrateOutStatesAndScale(integrationTmp, stateFrequenciesIndex, scalingFactorsIndex, outSumLogLikelihood);
+-    }
+ #endif
+ 
++    this->dkScratch().outLogHere = false;
++    memset(integrationTmp, 0, (kPatternCount * kStateCount)*sizeof(REALTYPE));
++
+     if (childIndex < kTipCount && gTipStates[childIndex]) { // Integrate against a state at the child
+ 
+         const int* statesChild = gTipStates[childIndex];
+diff --git a/libhmsbeagle/CPU/BeagleCPUImpl.h b/libhmsbeagle/CPU/BeagleCPUImpl.h
+index 196f386a..162333d7 100644
+--- a/libhmsbeagle/CPU/BeagleCPUImpl.h
++++ b/libhmsbeagle/CPU/BeagleCPUImpl.h
+@@ -34,6 +34,7 @@
+ #include <mutex>
+ #include <functional>
+ #include "libhmsbeagle/CPU/DikaryaThreads.h"
++#include <unordered_map>
+ 
+ #define BEAGLE_CPU_GENERIC	REALTYPE, T_PAD, P_PAD
+ #define BEAGLE_CPU_TEMPLATE	template <typename REALTYPE, int T_PAD, int P_PAD>
+@@ -180,6 +181,27 @@ protected:
+         if (buffer >= 0 && dkSubFlags != nullptr)
+             __atomic_store_n(&dkSubFlags[buffer * kDkFlagChunks + chunk], (unsigned char) v, __ATOMIC_RELAXED);
+     }
++    /* Per-thread scratch for the calls MrBayes makes, so that calls on
++       different buffers (different MCMC chains) can run at the same time on
++       one instance: category rates as last set by this thread, and the edge
++       likelihood's per-pattern work arrays. Keyed by a per-instance id. */
++    struct DkScratch {
++        std::vector<REALTYPE> integration, outLog;
++        std::vector<double> rates;
++        bool ratesSet = false;
++        bool outLogHere = false;   /* last edge likelihood on this thread used outLog */
++    };
++    unsigned long dkInstanceId = 0;
++    std::mutex dkRatesLock;
++    DkScratch& dkScratch() {
++        static thread_local std::unordered_map<unsigned long, DkScratch> perThread;
++        DkScratch& s = perThread[dkInstanceId];
++        if (s.integration.size() < (size_t) kPatternCount * kStateCount) {
++            s.integration.resize((size_t) kPatternCount * kStateCount);
++            s.outLog.resize((size_t) kPatternCount * kStateCount);
++        }
++        return s;
++    }
+     virtual void dkPartialsChanged(int buffer) {
+         if (buffer >= 0 && dkSubFlags != nullptr)
+             for (int c = 0; c < kDkFlagChunks; c++) dkSetMaySub(buffer, c, 0xFFu);
+diff --git a/libhmsbeagle/CPU/BeagleCPUImpl.hpp b/libhmsbeagle/CPU/BeagleCPUImpl.hpp
+index a5e465b3..dfef629a 100644
+--- a/libhmsbeagle/CPU/BeagleCPUImpl.hpp
++++ b/libhmsbeagle/CPU/BeagleCPUImpl.hpp
+@@ -376,6 +376,10 @@ int BeagleCPUImpl<BEAGLE_CPU_GENERIC>::createInstance(int tipCount,
+             throw std::bad_alloc();
+     }
+ 
++    {
++        static std::atomic<unsigned long> dkNextInstanceId(1);
++        dkInstanceId = dkNextInstanceId.fetch_add(1);
++    }
+     dkSubFlags = (unsigned char*) malloc((size_t) kBufferCount * kDkFlagChunks);
+     if (dkSubFlags == NULL)
+         throw std::bad_alloc();
+@@ -799,12 +803,20 @@ int BeagleCPUImpl<BEAGLE_CPU_GENERIC>::setEigenDecomposition(int eigenIndex,
+ BEAGLE_CPU_TEMPLATE
+ int BeagleCPUImpl<BEAGLE_CPU_GENERIC>::setCategoryRates(const double* inCategoryRates) {
+     int categoryRatesIndex=0;
+-    if (gCategoryRates[categoryRatesIndex] == NULL) {
+-        gCategoryRates[categoryRatesIndex] = (double*) malloc(sizeof(double) * kCategoryCount);
+-        if (gCategoryRates[categoryRatesIndex] == 0L)
+-            return BEAGLE_ERROR_OUT_OF_MEMORY;
+-    }
+-    memcpy(gCategoryRates[categoryRatesIndex], inCategoryRates, sizeof(double) * kCategoryCount);
++    {
++        /* the shared copy, for anything that reads it; concurrent callers
++           each use their own (below) */
++        std::lock_guard<std::mutex> lock(dkRatesLock);
++        if (gCategoryRates[categoryRatesIndex] == NULL) {
++            gCategoryRates[categoryRatesIndex] = (double*) malloc(sizeof(double) * kCategoryCount);
++            if (gCategoryRates[categoryRatesIndex] == 0L)
++                return BEAGLE_ERROR_OUT_OF_MEMORY;
++        }
++        memcpy(gCategoryRates[categoryRatesIndex], inCategoryRates, sizeof(double) * kCategoryCount);
++    }
++    DkScratch& dk = dkScratch();
++    dk.rates.assign(inCategoryRates, inCategoryRates + kCategoryCount);
++    dk.ratesSet = true;
+     return BEAGLE_SUCCESS;
+ }
+ 
+@@ -1037,6 +1049,11 @@ int BeagleCPUImpl<BEAGLE_CPU_GENERIC>::getDerivatives(double* outSumFirstDerivat
+ 
+ BEAGLE_CPU_TEMPLATE
+ int BeagleCPUImpl<BEAGLE_CPU_GENERIC>::getSiteLogLikelihoods(double* outLogLikelihoods) {
++    DkScratch& dk = dkScratch();
++    if (dk.outLogHere && !kPatternsReordered) {
++        beagleMemCpy(outLogLikelihoods, dk.outLog.data(), kPatternCount);
++        return BEAGLE_SUCCESS;
++    }
+     if (kPatternsReordered) {
+         REALTYPE* outLogLikelihoodsOriginalOrder = (REALTYPE*) malloc(sizeof(REALTYPE) * kPatternCount);
+         for (int i=0; i < kPatternCount; i++) {
+@@ -1262,8 +1279,12 @@ int BeagleCPUImpl<BEAGLE_CPU_GENERIC>::updateTransitionMatrices(int eigenIndex,
+     //     printf("uTM %d %d %f %d\n", eigenIndex, probabilityIndices[i], edgeLengths[i], 0);
+     // }
+ 
++    /* the rates this thread set (the same values in a single-threaded
++       caller); another thread may be setting its own meanwhile */
++    DkScratch& dk = dkScratch();
++    const double* rates = dk.ratesSet ? dk.rates.data() : gCategoryRates[0];
+     gEigenDecomposition->updateTransitionMatrices(eigenIndex,probabilityIndices,firstDerivativeIndices,secondDerivativeIndices,
+-                                                  edgeLengths,gCategoryRates[0],gTransitionMatrices,count);
++                                                  edgeLengths,rates,gTransitionMatrices,count);
+     return BEAGLE_SUCCESS;
+ }
+ 
+diff --git a/libhmsbeagle/CPU/EigenDecompositionCube.hpp b/libhmsbeagle/CPU/EigenDecompositionCube.hpp
+index 50819503..b2720b03 100644
+--- a/libhmsbeagle/CPU/EigenDecompositionCube.hpp
++++ b/libhmsbeagle/CPU/EigenDecompositionCube.hpp
+@@ -8,6 +8,7 @@
+ #define _EigenDecompositionCube_hpp_
+ 
+ #include "libhmsbeagle/CPU/EigenDecompositionCube.h"
++#include <vector>
+ 
+ 
+ namespace beagle {
+@@ -110,6 +111,12 @@ void EigenDecompositionCube<BEAGLE_CPU_EIGEN_GENERIC>::updateTransitionMatrices(
+                                                       const double* categoryRates,
+                                                       REALTYPE** transitionMatrices,
+                                                       int count) {
++    /* Dikarya: a per-thread temporary, so concurrent calls for different
++       matrices do not share one */
++    static thread_local std::vector<REALTYPE> dkMatrixTmp;
++    if (dkMatrixTmp.size() < (size_t) kStateCount)
++        dkMatrixTmp.resize(kStateCount);
++    REALTYPE* matrixTmp = dkMatrixTmp.data();
+ #ifdef UNROLL
+ 	int stateCountModFour = (kStateCount / 4) * 4;
+ #endif
+-- 
+2.43.0
+
+
+From a27349d54b7f873d5b5cacc3aae6fd7b7c48f90d Mon Sep 17 00:00:00 2001
+From: Alan Rockefeller <alanrockefeller@gmail.com>
+Date: Sat, 10 Oct 2026 03:06:13 +0000
+Subject: [PATCH 5/5] Version 4.0.1-dikarya2
+
+The release tag still printed 4.0.1 (PRE-RELEASE); name the patched build so
+that a MrBayes log shows which library ran. MrBayes 3.2.9-dikarya2 computes
+chains concurrently only on a BEAGLE whose version says dikarya2 or later,
+since an earlier one keeps shared scratch.
+---
+ libhmsbeagle/beagle.cpp | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/libhmsbeagle/beagle.cpp b/libhmsbeagle/beagle.cpp
+index 4e91d709..fc1e19a3 100644
+--- a/libhmsbeagle/beagle.cpp
++++ b/libhmsbeagle/beagle.cpp
+@@ -41,7 +41,7 @@
+ #include "libhmsbeagle/plugin/Plugin.h"
+ #include "beagle.h"
+ 
+-#define BEAGLE_VERSION  PACKAGE_VERSION  " (PRE-RELEASE)"
++#define BEAGLE_VERSION  PACKAGE_VERSION  "-dikarya2"
+ #define BEAGLE_CITATION "Using BEAGLE library v" BEAGLE_VERSION " for accelerated, parallel likelihood evaluation\n\
+ 2009-, BEAGLE Working Group - https://beagle-dev.github.io/\n\
+ Citation: Ayres et al (2019) Systematic Biology 68: 1052-1061 | doi:10.1093/sysbio/syz020\n"
+-- 
+2.43.0
+

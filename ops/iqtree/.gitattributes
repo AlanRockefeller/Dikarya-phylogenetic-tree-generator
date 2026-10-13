@@ -1,0 +1,2 @@
+# the patch series touches CRLF files; keep its bytes exactly (applied with git am --keep-cr)
+*.patch -text
