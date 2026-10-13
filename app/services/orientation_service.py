@@ -6,7 +6,8 @@ Based on fixfasta.py by Alan Rockefeller, adapted for pipeline integration.
 
 Key features:
 - Uses IUPAC-aware fuzzy matching (≤4 mismatches over 20bp)
-- Conservative reversal: requires 5.8S core + at least one flanking motif
+- Conservative reversal: requires a 5.8S core hit (<= 2 mismatches) plus at least
+  one flanking motif, or no forward-strand motif hit at all
 - Safe for non-ITS sequences: without strong motif evidence, sequences pass unchanged
 """
 
@@ -32,7 +33,13 @@ logger = logging.getLogger(__name__)
 FWD_MOTIFS = [
     "TCCGTAGGTGAACCTGCGG",    # ITS1-F  (18S end)
     "GCATCGATGAAGAACGCAGC",   # 5.8S core
-    "TCCTCCGCTTATTGATATGC"    # ITS4    (28S start)
+    # Alan 10/8/26 - ITS4 is a reverse primer, so a forward read carries its
+    # reverse complement. This entry used to be the primer as written,
+    # TCCTCCGCTTATTGATATGC, which only matches reversed reads (job crao's
+    # final alignment: 15 of 186 rows, every one on the "reverse" strand). A
+    # reversed read's ITS4 site was counted as forward evidence and called
+    # forward, and the reversal rule could never use ITS4 as its flank.
+    "GCATATCAATAAGCGGAGGA"    # ITS4 site (28S start), forward strand
 ]
 
 DEFAULT_MAX_MM = 4   # Per-motif mismatch ceiling
@@ -198,8 +205,17 @@ def decide_orientation(seq: str, max_mm: int = DEFAULT_MAX_MM) -> Tuple[str, Ori
 
     def reverse_allowed() -> bool:
         """Check if reversing is allowed based on conservative criteria."""
-        # Check 1: Must have core + at least one flank
-        if not has_core_and_flank(rev):
+        # Check 1: Must have core + at least one flank -- unless the forward
+        # strand has no motif hit at all, in which case a good 5.8S core
+        # (check 2) is enough. Reads trimmed inside ITS1 and ITS2 carry
+        # neither primer site, so the flank rule left every reversed one
+        # uncertain. Job y4y8 had 86 of them, its first record among them;
+        # MAFFT --adjustdirection keeps the first record's direction, so it
+        # turned the 90 correctly forward records around to match and the
+        # whole alignment came out reverse-complemented (14 jobs did this).
+        # Replayed over 333 past jobs, this rule calls 1,501 such records
+        # reverse, and MAFFT's own alignment agrees on every one.
+        if not has_core_and_flank(rev) and fwd.hits:
             return False
 
         # Check 2: Require a decent 5.8S-core hit in the reverse orientation
@@ -235,8 +251,13 @@ def decide_orientation(seq: str, max_mm: int = DEFAULT_MAX_MM) -> Tuple[str, Ori
 
     # Enforce conservative reversal rule
     if winner == "reverse" and not reverse_allowed():
-        # If forward has at least one real hit, keep forward; otherwise uncertain
-        return ("forward" if fwd.hits else "uncertain"), fwd, rev
+        # Alan 10/8/26 - The evidence favoured reverse, just not enough to act
+        # on, so decline the call. This used to answer "forward" whenever any
+        # forward motif matched: crao's iNat2718307 was called forward on a
+        # 4-mismatch ITS1-F hit at bp 633 of 652 against an exact reverse 5.8S
+        # core, and MAFFT's correct flip was then logged as a disagreement.
+        # The sequence is left as it is either way.
+        return "uncertain", fwd, rev
 
     return winner, fwd, rev
 

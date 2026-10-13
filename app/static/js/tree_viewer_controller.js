@@ -835,6 +835,12 @@ document.addEventListener('DOMContentLoaded', async () => {
     let annotationRevision = 0;
     // Alan 8/15/26 - Editor session: what is being added/edited and for which tips.
     let annotationEditorState = null;
+    // Remember the quick-annotation hint per tree, including after a page reload.
+    const quickAnnotationHintKey = `dikarya_quick_annotation_hint_${JOB_ID}`;
+    let quickAnnotationHintShown = false;
+    try {
+        quickAnnotationHintShown = localStorage.getItem(quickAnnotationHintKey) === '1';
+    } catch (e) {}
     let annotationMembershipPicker = null;
     const ANNOTATION_STYLE_FIELDS = [
         { field: 'font_family', label: 'Font' },
@@ -1565,8 +1571,7 @@ document.addEventListener('DOMContentLoaded', async () => {
 
     /**
      * Alan 8/26/26 - The default label for a NEW annotation: the species name held by the most
-     * tips in the clade. Ties go to a determinate binomial over "Genus sp." or a provisional
-     * name, then to whichever appeared first, so a mixed clade never suggests the vaguer name.
+     * tips in the clade. A tie between different names suggests the genus instead (Alan 10/5/26).
      * A clade whose tips carry no species name at all falls back to the dominant genus, and
      * failing that the field is left empty exactly as before.
      */
@@ -1587,15 +1592,77 @@ document.addEventListener('DOMContentLoaded', async () => {
             }
             entry.count += 1;
         });
-        const best = Array.from(counts.values()).sort((a, b) =>
+        const ranked = Array.from(counts.values()).sort((a, b) =>
             (b.count - a.count)
             || (Number(b.determinate) - Number(a.determinate))
-            || (a.order - b.order))[0];
-        return best ? best.name : '';
+            || (a.order - b.order));
+        const best = ranked[0];
+        if (!best) return '';
+        // Alan 10/5/26 - A tie between different species names is no majority: suggest the
+        // genus ("Galerina sp.") when the tied names share one, else the most common genus.
+        const tied = ranked.filter((entry) => entry.count === best.count);
+        if (tied.length > 1 && extract === extractSpeciesName) {
+            const genera = new Set(tied.map((entry) => entry.name.split(' ')[0]));
+            if (genera.size === 1) return `${best.name.split(' ')[0]} sp.`;
+            return mostCommonName(labels, (label) => {
+                const name = extractSpeciesName(label);
+                return name ? name.split(' ')[0] : null;
+            });
+        }
+        return best.name;
+    }
+
+    /**
+     * Alan 10/5/26 - A clade holding type material is named after it. The name comes from
+     * the type record's organism, falling back to the tip label. One type species: that name.
+     * Several distinct type species in one genus: "Genus sp.". Types from different genera,
+     * or none whose name can be read, give no opinion and the usual majority vote applies.
+     */
+    // Alan 10/5/26 - Infraspecific ranks a type name keeps: a type is the type of the variety,
+    // so "Galerina decipiens var. separans" must not be cut back to "Galerina decipiens".
+    const INFRASPECIFIC_RANKS = {
+        var: 'var.', subsp: 'subsp.', ssp: 'subsp.', f: 'f.', forma: 'f.'
+    };
+
+    // Alan 10/5/26 - extractSpeciesName() plus a following "var./subsp./f. epithet", if present.
+    function extractTypeName(text) {
+        const species = extractSpeciesName(text);
+        if (!species || /\s(sp|cf|aff|nr)\.(\s|$)/.test(species)) return species;
+        const tokens = speciesTokens(text);
+        const [genus, epithet] = species.split(' ');
+        for (let i = 0; i < tokens.length - 3; i++) {
+            if (speciesGenusCandidate(tokens[i]) !== genus) continue;
+            if (speciesEpithetCandidate(tokens[i + 1]) !== epithet) continue;
+            const rankWord = tokens[i + 2].replace(/[^A-Za-z]/g, '').toLowerCase();
+            const rank = Object.prototype.hasOwnProperty.call(INFRASPECIFIC_RANKS, rankWord)
+                ? INFRASPECIFIC_RANKS[rankWord]
+                : null;
+            const infra = rank ? speciesEpithetCandidate(tokens[i + 3]) : null;
+            if (infra) return `${species} ${rank} ${infra}`;
+        }
+        return species;
+    }
+
+    function typeSpecimenAnnotationLabel(memberIds) {
+        const types = viewer?.getTypeSpecimensForLeafIds
+            ? viewer.getTypeSpecimensForLeafIds(memberIds)
+            : [];
+        const names = new Set();
+        types.forEach(({ label, info }) => {
+            // Alan 10/5/26 - Keep the variety/subspecies/form of the type's name.
+            const name = extractTypeName(info?.organism) || extractTypeName(label);
+            if (name) names.add(name);
+        });
+        if (!names.size) return '';
+        if (names.size === 1) return names.values().next().value;
+        const genera = new Set(Array.from(names, (name) => name.split(' ')[0]));
+        return genera.size === 1 ? `${genera.values().next().value} sp.` : '';
     }
 
     function suggestedAnnotationLabel(memberIds) {
         if (!Array.isArray(memberIds) || !memberIds.length) return '';
+        const typeLabel = typeSpecimenAnnotationLabel(memberIds);
+        if (typeLabel) return typeLabel;
         const labels = viewer?.getDisplayLabelsForLeafIds
             ? viewer.getDisplayLabelsForLeafIds(memberIds)
             : [];
@@ -1701,6 +1768,7 @@ document.addEventListener('DOMContentLoaded', async () => {
         if (typeSelect.selectedOptions[0]?.disabled) typeSelect.value = 'clade_line';
         getEl('btn-annotation-save-text').textContent = mode === 'edit' ? 'Save changes' : 'Save';
         getEl('btn-annotation-delete').classList.toggle('hidden', mode !== 'edit');
+        getEl('btn-annotation-edit-members')?.classList.toggle('hidden', mode !== 'edit');
         getEl('annotation-style-details').open = false;
 
         populateAnnotationLayerSelect(existing ? existing.layer_id : annotationLayers[0]?.id);
@@ -1813,10 +1881,15 @@ document.addEventListener('DOMContentLoaded', async () => {
             }
             // Alan 9/30/26 - A quick annotation's label was guessed, so say what it was and how to fix it.
             if (options.quick === true) {
-                showStatus(`Annotated as "${label}". Wrong name? Edit it from Annotations.`, 'success', 5000);
+                const showHint = !quickAnnotationHintShown;
+                quickAnnotationHintShown = true;
+                try { localStorage.setItem(quickAnnotationHintKey, '1'); } catch (e) {}
+                const hint = showHint ? ' Wrong name? Edit it from Annotations.' : '';
+                showStatus(`Annotated as "${label}".${hint}`, 'success', showHint ? 5000 : 2000);
             } else {
                 showStatus(`Annotation "${label}" saved.`, 'success', 2000);
             }
+            if (options.editMembers === true) startAnnotationMembershipPicker(payload.id);
         }
     }
 
@@ -3457,6 +3530,11 @@ document.addEventListener('DOMContentLoaded', async () => {
         getEl('btn-annotation-cancel')?.addEventListener('click', closeAnnotationEditor);
         getEl('annotation-editor-backdrop')?.addEventListener('click', closeAnnotationEditor);
         getEl('btn-annotation-save')?.addEventListener('click', submitAnnotationEditor);
+        getEl('btn-annotation-edit-members')?.addEventListener('click', () => {
+            if (window.VIEW_ONLY || isProcessing || annotationEditorState?.mode !== 'edit') return;
+            // Save the current label and styling before switching to member selection.
+            submitAnnotationEditor({ editMembers: true });
+        });
         getEl('btn-annotation-delete')?.addEventListener('click', deleteCurrentAnnotation);
         // Alan 8/15/26 - Switching layer changes what the override rows inherit, so re-render them.
         getEl('select-annotation-layer')?.addEventListener('change', renderAnnotationStyleOverrides);
@@ -4018,8 +4096,7 @@ document.addEventListener('DOMContentLoaded', async () => {
             });
         }
 
-        // Alan 8/21/26 - Right-clicking a drawn annotation edits that exact annotation, which is
-        // the only unambiguous path when several are stacked on one clade or branch.
+        // Right-click opens the editor for the exact annotation clicked.
         if (viewer && typeof viewer.setEditCladeAnnotationHandler === 'function') {
             viewer.setEditCladeAnnotationHandler((annotationId) => {
                 if (window.VIEW_ONLY || isProcessing || !annotationId) return;
@@ -4103,8 +4180,10 @@ document.addEventListener('DOMContentLoaded', async () => {
                     const updatedText = updatedCount
                         ? ` ${updatedCount} tree label${updatedCount === 1 ? '' : 's'} updated.`
                         : ' Tree labels already match the refreshed records.';
+                    // Alan 10/8/26 - Show the first warning itself; a bare count hid
+                    // a refused MycoMap key behind "1 label update warning".
                     const warningText = warningCount
-                        ? ` ${warningCount} label update warning${warningCount === 1 ? '' : 's'}.`
+                        ? ` ${String(result.warnings[0])}${warningCount > 1 ? ` (+${warningCount - 1} more warning${warningCount === 2 ? '' : 's'})` : ''}`
                         : '';
                     return {
                         finalStatus: {
