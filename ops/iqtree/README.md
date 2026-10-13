@@ -29,7 +29,7 @@ Since 2026-10-11 Dikarya runs IQ-TREE with `-T 1` on every worker (`IQTREE_THREA
 `app/services/tree_builder_service.py`), so a tree built at that default is reproducible
 from its recorded seed. The default applies only when a job's parameters name no thread
 count (`TreeBuilderParams.threads`); no submission path sets one today, and a job that
-did would run at `-T N` and not be reproducible. Replaying 34 production jobs at both thread counts on dikarya1, a
+set more than one would run at `-T N` (N > 1) and not be reproducible. Replaying 34 production jobs at both thread counts on dikarya1, a
 second thread gained 1.02x on Quick Tree overall (0.89x-1.18x, gaining only past ~700
 patterns) and made the three MFP+UFBoot+bnni jobs (58-80 taxa) 16-22% slower.
 
