@@ -37,6 +37,39 @@ Allow: /
 
 Sitemap: https://dikarya.us/sitemap.xml
 
+# Link-preview fetchers. These are not indexers: each fetches one page because
+# a person just pasted that link into a post or chat, and the card it builds
+# (title + /job/<id>/social-preview.png, see social_preview_service.py) is the
+# reason tree links are shared at all. Twitterbot honours robots.txt, so the
+# blanket "/job" above left every shared tree without a card on X. A crawler
+# obeys only its most specific group, so this one repeats the "*" rules and
+# opens just the viewer page and its image; the longer Allow wins over
+# "Disallow: /job".
+User-agent: Twitterbot
+User-agent: facebookexternalhit
+User-agent: Facebot
+User-agent: Discordbot
+User-agent: Slackbot-LinkExpanding
+User-agent: LinkedInBot
+User-agent: TelegramBot
+User-agent: WhatsApp
+Allow: /job/*/view
+Allow: /job/*/social-preview.png
+Disallow: /api/
+Disallow: /api_v1/
+Disallow: /job
+Disallow: /auth/
+Disallow: /labels/
+Disallow: /tree/oauth/
+Disallow: /voucher-labels/export
+Disallow: /whats-new/edit
+Disallow: /whats-new/add
+Disallow: /todo
+Disallow: /test
+Disallow: /thumb/
+Disallow: /admin/db-export
+Allow: /
+
 # Image scrapers. These crawl a /thumb/<n>.jpg namespace that does not exist on
 # this site and never has: in a two-day sample ImageBot alone made 43,466
 # requests, all 404, ~88% of all traffic. nginx blocks these outright; the

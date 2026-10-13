@@ -433,10 +433,17 @@ def _bool_param(params_dict: Dict[str, Any], key: str, default: bool) -> bool:
 
 def build_recompute_job_params(params_dict: Dict[str, Any]) -> JobParams:
     """Build the dataclass params used by tree recomputation from stored job JSON."""
+    tree_method = params_dict.get("tree_method", "nj")
+    # MAFFT picks its strategy by tree method (MAFFT_LINSI_TREE_METHODS, faster
+    # settings for NJ), and the worker adds it to a new job's options at run
+    # time. The stored options lack it on older jobs and name the original
+    # method when this recompute changes it, so set it the same way here.
+    align_options = dict(params_dict.get("alignment_options") or {})
+    align_options["tree_method"] = tree_method
     align_params = AlignmentParams(
         method=params_dict.get("alignment_method", "default"),
         fix_orientation=_bool_param(params_dict, "fix_orientation", True),
-        advanced_options=params_dict.get("alignment_options", {}) or {}
+        advanced_options=align_options
     )
 
     # Through the shared resolver, so an absent key and the literal "default"
@@ -450,7 +457,6 @@ def build_recompute_job_params(params_dict: Dict[str, Any]) -> JobParams:
         trim_terminal_overhangs=_bool_param(params_dict, "trim_terminal_overhangs", True),
     )
 
-    tree_method = params_dict.get("tree_method", "nj")
     # Mirror the worker's per-method model default so a recompute of an IQ-TREE
     # job that never stored a model runs ModelFinder rather than a fixed GTR+G.
     default_model = (

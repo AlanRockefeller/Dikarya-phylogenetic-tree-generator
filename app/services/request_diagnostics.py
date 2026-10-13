@@ -328,7 +328,7 @@ def _collect_signals(app, status, bucket, reason, matched, browser_seen, crowd_v
             signals.append(("odd_verb_real_route", f"{method}:{matched}"))
 
     # Both of the following are things a real user's browser does too, so they
-    # only count for a client that has never fetched a static asset.
+    # only count for a client with no browser evidence (see BrowserWitness).
     if not browser_seen:
         if path.rstrip("/").lower() == "/health/jobs":
             signals.append(("health_scrape", "1"))
@@ -421,6 +421,17 @@ def install_request_diagnostics(app):
         if request.endpoint == "static":
             state["browser"].mark(actor)
             return response
+        # Alan 10/8/26 - In production nginx serves /static/ itself, so the
+        # branch above never runs: Flask logged no static request at all, Redis
+        # held no browser marks, and route_breadth escalated ordinary users
+        # (the site owner four times since 10/3). A browser stamps each request
+        # one of our pages makes with Sec-Fetch-Site: same-origin, which page
+        # script cannot set; a script walking the URL map sends none unless it
+        # forges it, which is no harder than fetching a stylesheet was. Being
+        # logged in is deliberately not evidence: accounts are free, and the
+        # breadth signal should still see a script that has one.
+        if request.headers.get("Sec-Fetch-Site") == "same-origin":
+            state["browser"].mark(actor)
 
         bucket = reason = None
         crowd_verdict = None
@@ -461,6 +472,11 @@ def install_request_diagnostics(app):
                 # its ordinary http.request_failed line below, carrying the
                 # developer reason code.
                 _log_scanner(status, reason)
+                # Alan 10/8/26 - The same verdict for the access log's noise=
+                # field, which is what the digest reads (see gunicorn.conf.py).
+                # Targeted api/admin probes are deliberately not marked, so a
+                # real frontend call to a missing /api/ route stays visible.
+                request.environ["dikarya.noise"] = "scanner"
 
         # Score the actor whatever the status was: enumeration shows up as
         # 404s, denied edits as 403s, and route breadth mostly as 200s.

@@ -1,4 +1,4 @@
-from flask import g, jsonify, request, send_file, url_for
+from flask import current_app, g, jsonify, request, send_file, url_for
 from flask_login import current_user
 from app.api import bp
 from app.workers.queue import (
@@ -1447,8 +1447,58 @@ def run_blast():
     
     Request: { "query": "<sequence or accession>" }
     Response: { "status": "success", "sequences": [...], "message": "..." }
+
+    With ``X-Dikarya-Background: 1`` the search runs off the request thread and
+    this answers 202 {"task_id"}; see app/services/background_requests.py.
     """
     data = request.get_json() or {}
+    return _run_in_background_if_asked("blast", _run_blast_request, data)
+
+
+def _run_in_background_if_asked(kind, handler, data):
+    """Start ``handler(data)`` in the background when the page asked for it.
+
+    Falls through to running it inline -- the original behaviour -- for a
+    caller that did not ask, or when background_requests cannot take it.
+    """
+    from app.services import background_requests
+    if background_requests.wants_background(request):
+        task_id = background_requests.start(kind, handler, data)
+        if task_id:
+            return jsonify({"status": "running", "task_id": task_id}), 202
+    return handler(data)
+
+
+@bp.get('/background/<task_id>')
+@limiter.limit("120 per minute")
+def background_request_status(task_id):
+    """Poll a request started with X-Dikarya-Background.
+
+    202 while it runs; once done, the handler's own response, byte for byte,
+    with its own status code.
+    """
+    from app.services import background_requests
+    try:
+        record = background_requests.fetch(task_id)
+    except Exception as exc:
+        logger.warning("event=background_request.poll_failed error=%s", type(exc).__name__)
+        return jsonify({"status": "running", "poll_error": True}), 202
+    if record is None:
+        return jsonify({
+            "status": "error",
+            "background_missing": True,
+            "error": ("This request is no longer running on the server "
+                      "(the site may have restarted). Please try again."),
+        }), 410
+    if record.get("state") != "done":
+        return jsonify({"status": "running"}), 202
+    return current_app.response_class(
+        record.get("body") or "", status=int(record.get("status") or 500),
+        mimetype="application/json",
+    )
+
+
+def _run_blast_request(data):
     query = data.get('query', '').strip()
     
     if not query:
@@ -1760,8 +1810,9 @@ def gather_mycomap_sequences_for_queue(url, include_ncbi=True, include_local=Tru
 
     from app.services.mycomap_service import (
         fetch_mycomap_blast_metrics,
+        _looks_unfinished,
         fetch_mycomap_fasta,
-        get_mycomap_ncbi_queue_position,
+        get_mycomap_ncbi_queue_status,
         improve_mycomap_sequence_name,
         parse_mycomap_ncbi_fasta_header,
         prefer_local_mycomap_taxa,
@@ -1873,22 +1924,35 @@ def gather_mycomap_sequences_for_queue(url, include_ncbi=True, include_local=Tru
     logger.info(
         f"Mycomap helper: blast_id={blast_id} (ncbi={include_ncbi}, local={include_local}) url={url}"
     )
-    ncbi_queue_position = (
-        get_mycomap_ncbi_queue_position(url) if include_ncbi else None
-    ) if provider == "com" else None
-    ncbi_queued = ncbi_queue_position is not None
+    ncbi_queue_status = (
+        get_mycomap_ncbi_queue_status(url) if include_ncbi and provider == "com" else None
+    )
+    ncbi_queue_position = ncbi_queue_status["queue_position"] if ncbi_queue_status else None
+    # Alan 10/8/26 - Also hold off while MycoMap's API says the NCBI search is
+    # still running with no queue position (MycoMap drops the position before
+    # the results exist), as _poll_auto_created_mycomap_ncbi_results() already
+    # does. Job 8ucm fetched the export in that state: three HTTP 500s, then a
+    # local-only tree reported as a failed NCBI download.
+    ncbi_queued = ncbi_queue_position is not None or bool(
+        ncbi_queue_status
+        and ncbi_queue_status["source"] == "api"
+        and _looks_unfinished(ncbi_queue_status["status"])
+    )
     if ncbi_queued:
         logger.info(
-            "event=mycomap.ncbi_queued blast_id=%s position=%s",
-            blast_id, ncbi_queue_position,
+            "event=mycomap.ncbi_queued blast_id=%s position=%s status=%s",
+            blast_id, ncbi_queue_position, ncbi_queue_status.get("status") or "-",
         )
         if not include_local:
+            where = (
+                f"still waiting in its BLAST queue at position {ncbi_queue_position}"
+                if ncbi_queue_position is not None else "still running"
+            )
             return None, ({
                 "status": "pending",
                 "error": (
-                    "MycoMap's NCBI results are still waiting in its BLAST queue "
-                    f"at position {ncbi_queue_position}. Try this import again "
-                    "after the queue advances, or include local MycoBLAST results now."
+                    f"MycoMap's NCBI BLAST search is {where}. Try this import again "
+                    "in a few minutes, or include local MycoBLAST results now."
                 ),
                 "ncbi_queue_position": ncbi_queue_position,
                 "retryable": True,
@@ -2412,7 +2476,8 @@ def start_mycomap_blast_refresh():
         "local_limit": 50,
         "ncbi_limit": 100,
         "include_ncbi": true,
-        "include_local": true
+        "include_local": true,
+        "refresh_only": false     # true: refresh at MycoMap, gather nothing
     }
     Response: { "status": "success", "job_id": "<job id>" }
     """
@@ -2435,6 +2500,9 @@ def start_mycomap_blast_refresh():
     include_local, include_local_valid = coerce_bool(data.get('include_local'), default=True)
     if not include_ncbi_valid or not include_local_valid:
         return jsonify({"status": "error", "error": "include_ncbi/include_local must be booleans."}), 422
+    refresh_only, refresh_only_valid = coerce_bool(data.get('refresh_only'), default=False)
+    if not refresh_only_valid:
+        return jsonify({"status": "error", "error": "refresh_only must be a boolean."}), 422
 
     try:
         from app.workers.queue import enqueue_mycomap_blast_refresh_job
@@ -2445,6 +2513,7 @@ def start_mycomap_blast_refresh():
             "ncbi_limit": data.get('ncbi_limit'),
             "include_ncbi": include_ncbi,
             "include_local": include_local,
+            "refresh_only": refresh_only,
         })
         return jsonify({"status": "success", "job_id": job_id})
     except Exception as e:
@@ -2635,10 +2704,14 @@ def inaturalist_tree():
 @limiter.limit(_inat_tree_preview_rate_limit, key_func=_inat_tree_rate_key)
 def inaturalist_tree_preview():
     """Preview iNaturalist one-click tree scope and eligibility."""
+    data = request.get_json(silent=True) or {}
+    return _run_in_background_if_asked("inat_tree_preview", _inat_tree_preview_request, data)
+
+
+def _inat_tree_preview_request(data):
     from app.services.inaturalist_tree_service import (
         InatTreeError, preview_inaturalist_tree_input,
     )
-    data = request.get_json(silent=True) or {}
     raw = data.get('input') or data.get('observation') or data.get('url') or ''
     resolved_type = data.get('resolved_type')
     try:
@@ -3480,7 +3553,7 @@ def refresh_tree_mycomap_records(job_id):
             "refreshed_count": len(references),
             "updated_tip_count": len(changes),
             "changes": changes,
-            "warnings": label_result["warnings"],
+            "warnings": list(refresh_result.get("warnings") or []) + label_result["warnings"],
             "message": refresh_result.get("message") or "",
         })
     except MycoMapRefreshError as exc:

@@ -162,8 +162,9 @@ class TestMycomapLocalFastaConflictFilter(unittest.TestCase):
         with (
             patch("app.services.mycomap_service.validate_mycomap_url", return_value="42"),
             patch(
-                "app.services.mycomap_service.get_mycomap_ncbi_queue_position",
-                return_value=2741,
+                "app.services.mycomap_service.get_mycomap_ncbi_queue_status",
+                return_value={"queue_position": 2741, "status": "queued",
+                              "rid": None, "source": "api"},
             ),
             patch(
                 "app.services.mycomap_service.fetch_mycomap_fasta",
@@ -192,8 +193,9 @@ class TestMycomapLocalFastaConflictFilter(unittest.TestCase):
         with (
             patch("app.services.mycomap_service.validate_mycomap_url", return_value="42"),
             patch(
-                "app.services.mycomap_service.get_mycomap_ncbi_queue_position",
-                return_value=2741,
+                "app.services.mycomap_service.get_mycomap_ncbi_queue_status",
+                return_value={"queue_position": 2741, "status": "queued",
+                              "rid": None, "source": "api"},
             ),
             patch("app.services.mycomap_service.fetch_mycomap_fasta") as fetch_fasta,
         ):

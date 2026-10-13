@@ -2,7 +2,8 @@
 
 /* Typography. @import must come before every style rule or the browser drops
    it and the journal silently falls back to system fonts. */
-@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Libre+Baskerville:ital,wght@0,400;0,700;1,400&display=swap');
+@import url('../vendor/inter.css');
+@import url('../vendor/journal-fonts.css');
 
 :root {
     /* Color Palette - Forest/Mycology inspired */
