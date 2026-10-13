@@ -540,7 +540,7 @@
     border-bottom-color: var(--dk-local-underline);
 }
 
-/* A menu tab (Labels). Its panel is a child of .dk-local, not of the strip,
+/* A menu tab (Label Tools). Its panel is a child of .dk-local, not of the strip,
    which would clip it; site_local_nav.html sets its left edge. */
 .dk-local {
     position: relative;
