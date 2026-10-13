@@ -46,10 +46,10 @@ WORKBENCH_NAV = (
     {'label': 'Tree Builder', 'endpoint': 'main.sequence_entry',
      'also': ('main.job_status', 'main.job_viewer')},
     {'label': 'iNat Finder', 'endpoint': 'main.inat_finder'},
-    {'label': 'Voucher Sync', 'endpoint': 'main.voucher_sync'},
-    {'label': 'Labels', 'key': 'labels', 'children': (
+    {'label': 'Label Tools', 'key': 'label-tools', 'children': (
         {'label': 'Herbarium Labels', 'url': '/labels'},
         {'label': 'Voucher Labels', 'endpoint': 'main.voucher_labels'},
+        {'label': 'Voucher Sync', 'endpoint': 'main.voucher_sync'},
     )},
     {'label': 'Docs', 'endpoint': 'main.help_page'},
 )
