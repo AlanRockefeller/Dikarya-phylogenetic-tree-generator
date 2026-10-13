@@ -730,8 +730,14 @@ def test_failed_login_and_registration_are_visible_despite_200_and_302(tmp_path,
         assert response.status_code == 200
         assert "event=auth.login_failed reason=invalid_credentials account_id=17" in capture.text
         assert client.post("/auth/register", data={"email": "private@example.test"}).status_code == 302
-        assert "event=auth.registration_failed reason=missing_credentials" in capture.text
-    assert "private@example.test" not in capture.text
+        assert "event=auth.registration_failed reason=missing_credentials email=private@example.test" in capture.text
+        # Emails are logged on purpose (identifying a locked-out user); a
+        # value that is not email-shaped -- e.g. a password typed into the
+        # email box -- and the password itself never are.
+        assert "email=private@example.test" in capture.text
+        client.post("/auth/login", data={"email": "hunter2-not-an-email", "password": "x"})
+        assert "hunter2-not-an-email" not in capture.text
+        assert "event=auth.login_failed reason=invalid_credentials account_id=17 email=-" in capture.text
     assert "private-password" not in capture.text
 
 

@@ -32,10 +32,8 @@
     <!-- Font Awesome (vendored from cdnjs 6.4.0; SHA-256 in static/vendor/VENDORED_HASHES.txt) -->
     <link rel="stylesheet" href="{{ url_for('static', filename='vendor/fontawesome.min.css') }}">
 
-    <!-- Display fonts for the journal and analysis tools -->
-    <link rel="preconnect" href="https://fonts.googleapis.com">
-    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-    <link href="https://fonts.googleapis.com/css2?family=Cormorant+Garamond:ital,wght@0,400;0,500;0,600;1,400;1,500&family=IBM+Plex+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+    <!-- Locally hosted display fonts for the journal and analysis tools -->
+    <link rel="stylesheet" href="{{ url_for('static', filename='vendor/display-fonts.css') }}">
 
     <style>
         :root {
@@ -168,8 +166,12 @@
                 } catch (_) { path = ''; }
                 const method = String(args[1]?.method || args[0]?.method || 'GET').toUpperCase();
                 const started = performance.now();
+                // Background-request polls fail by design while a phone has the
+                // tab suspended and are retried by fetchInBackground(); their
+                // path also carries a task id, which would split the digest.
                 const isAppRequest = sameOrigin && path.startsWith('/api/')
-                    && path !== endpoint && path !== endpoint + '/csrf';
+                    && path !== endpoint && path !== endpoint + '/csrf'
+                    && !path.startsWith('/api/background/');
                 let response;
                 try {
                     response = await originalFetch(...args);

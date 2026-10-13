@@ -1160,9 +1160,7 @@
                             const nodes = this._getContextMycomapRecordNodes(node);
                             if (typeof this._onRefreshMycomapRecords === 'function') this._onRefreshMycomapRecords(node, nodes);
                         },
-                        (node) => !window.VIEW_ONLY && this._getContextMycomapRecordReferences(node).length > 0,
-                        // Alan 8/13/26 - Keep the currently broken refresh action visible but unavailable.
-                        true
+                        (node) => !window.VIEW_ONLY && this._getContextMycomapRecordReferences(node).length > 0
                     ]);
                 }
                 // Alan 8/17/26 - Annotation actions are registered for every parented node above;
@@ -2402,6 +2400,10 @@
             clone.querySelectorAll('.clade-annotation-hit').forEach(hit => hit.remove());
             // Alan 10/5/26 - The dirty-read marker is a heuristic for the viewer, not a fact for a figure.
             clone.querySelectorAll('.dirty-read-badge, .dirty-read-title').forEach(el => el.remove());
+            clone.querySelectorAll('title.type-specimen-title[data-type-text]').forEach(t => {
+                t.textContent = t.getAttribute('data-type-text');
+                t.removeAttribute('data-type-text');
+            });
             clone.querySelectorAll('style').forEach(s => {
                 if ((s.textContent || '').toLowerCase().includes('darkreader')) s.remove();
             });
@@ -2933,6 +2935,8 @@
                 label.appendChild(title);
             }
             title.textContent = describeTypeSpecimen(info);
+            // _decorateDirtyRead re-appends its explanation after this, from a clean slate.
+            title.removeAttribute('data-type-text');
         }
 
         // Alan 10/5/26 - Tag each tip with its suspected dirty read end (or null), matched by the
@@ -2960,6 +2964,11 @@
         // Alan 10/5/26 - Amber ⚠ after the label of a suspected dirty read, with a hover title. Re-added
         // after every redraw like the type badge (phylotree resets the label text). Left out of image
         // exports by _buildExportClone.
+        // Alan 10/7/26 - The hover text lives in a <title> on the label itself, never inside the ⚠
+        // <tspan>: Firefox lays out a <title> nested in a <tspan> as ordinary text, so the whole
+        // explanation was printed after the tip name instead of appearing on hover. A label has
+        // one tooltip, so on a type tip the explanation is appended to the type title and the
+        // original wording is kept in data-type-text for the export clone to restore.
         _decorateDirtyRead(element, node) {
             const group = element && typeof element.node === 'function' ? element.node() : null;
             if (!group || !group.querySelector) return;
@@ -2968,9 +2977,14 @@
             if (!label) return;
             let badge = label.querySelector('tspan.dirty-read-badge');
             let title = label.querySelector('title.dirty-read-title');
+            const typeTitle = label.querySelector('title.type-specimen-title');
             if (!info || !label.textContent) {
                 if (badge) badge.remove();
                 if (title) title.remove();
+                if (typeTitle && typeTitle.hasAttribute('data-type-text')) {
+                    typeTitle.textContent = typeTitle.getAttribute('data-type-text');
+                    typeTitle.removeAttribute('data-type-text');
+                }
                 return;
             }
             const text = describeDirtyRead(info);
@@ -2981,22 +2995,23 @@
                 badge.style.setProperty('font-size', '85%');
                 badge.style.setProperty('font-weight', '400', 'important');
                 badge.style.setProperty('fill', 'var(--dirty-read-badge, #b45309)', 'important');
+                badge.style.setProperty('cursor', 'help');
                 badge.textContent = '⚠';
-                const badgeTitle = document.createElementNS(SVG_NS, 'title');
-                badge.appendChild(badgeTitle);
             }
             // Keep it last, after a type badge that may have been (re)added this pass.
             if (label.lastElementChild !== badge) label.appendChild(badge);
-            badge.firstChild.textContent = text;
-            // A type tip already has a label-level title; the badge's own title covers that case.
-            const typeTitle = label.querySelector('title.type-specimen-title');
             if (typeTitle) {
                 if (title) title.remove();
+                // _decorateTypeSpecimen has just rewritten the type title (and cleared
+                // data-type-text), so its text is the plain type wording.
+                const typeText = typeTitle.textContent;
+                typeTitle.setAttribute('data-type-text', typeText);
+                typeTitle.textContent = `${typeText}\n\n${text}`;
             } else {
                 if (!title) {
                     title = document.createElementNS(SVG_NS, 'title');
                     title.setAttribute('class', 'dirty-read-title');
-                    label.appendChild(title);
+                    label.insertBefore(title, label.firstChild);
                 }
                 title.textContent = text;
             }
@@ -5651,6 +5666,27 @@
             return labels;
         }
 
+        /**
+         * Alan 10/5/26 - The type-specimen tips among canonical leaf IDs, as
+         * {label, info} pairs (label is the on-screen name, info the type record).
+         * The annotation editor prefers a type's name when suggesting a clade label.
+         */
+        getTypeSpecimensForLeafIds(ids) {
+            const wanted = new Set(Array.isArray(ids) ? ids.filter(Boolean) : []);
+            if (!wanted.size || !Array.isArray(this.allNodes)) return [];
+            const types = [];
+            this.allNodes.forEach((node) => {
+                const children = node.children || node.data?.children || [];
+                if (children && children.length) return;
+                const info = node.__typeSpecimen;
+                if (!info) return;
+                const id = this._getNodeId(node);
+                if (!id || !wanted.has(id)) return;
+                types.push({ label: String(node.data?.name || node.name || id), info });
+            });
+            return types;
+        }
+
         // Alan 8/17/26 - Compare annotations by canonical descendant membership rather than
         // display order, so rotation and renaming cannot turn Edit into an accidental Add.
         _annotationMembershipKey(ids) {
@@ -6427,6 +6463,12 @@
             let width = 0;
             try { width = probe.getComputedTextLength(); } catch (_) { width = text.length * style.font_size * 0.55; }
             svgNode.removeChild(probe);
+
+            // Alan 10/5/26 - A hidden SVG (the editor preview before its dialog is shown, which
+            // is always the case for the N hotkey) measures every string as 0. Caching that
+            // gave the saved annotation a zero-width label and a right-click target covering
+            // only its bracket, until a reload cleared the cache.
+            if (width === 0 && text.trim()) return width;
 
             // Bound the cache so a user typing in the editor cannot grow it without limit.
             if (this.annotationTextWidthCache.size > 2000) this.annotationTextWidthCache.clear();

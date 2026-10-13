@@ -122,13 +122,14 @@ SIGNALS = {
     # definition requested by many unrelated clients; a guess about *our*
     # routes is requested by one.
     "unique_app_shaped_path": Signal(weight=20, free=1, cap=32, kind="distinct"),
-    # Distinct app routes touched by a client that has never fetched a static
-    # asset. Browsers fetch CSS. Scripts reading the URL map do not.
+    # Distinct app routes touched by a client with no browser evidence (see
+    # BrowserWitness). A page's own requests carry it; a script reading the URL
+    # map does not.
     "route_breadth": Signal(weight=6, free=6, cap=64, kind="distinct"),
     # /health/jobs is unauthenticated and publishes live job-id prefixes, which
     # makes it an oracle for which ids exist. The monitoring page polls it
-    # every 5s legitimately -- and fetches static assets, so it is exempt by
-    # the same browser test route_breadth uses.
+    # every 5s legitimately -- from the page itself, so it is exempt by the
+    # same browser test route_breadth uses.
     "health_scrape": Signal(weight=3, free=20, cap=None, kind="count"),
     # Distinct user-agent families from one network. 34.27.83.69 rotated
     # YouBot/Amazonbot/ChatGLM-Spider within a single second on 2026-09-15;
@@ -446,14 +447,16 @@ class ActorScorer:
 
 
 class BrowserWitness:
-    """Has this actor ever fetched a static asset in this window?
+    """Has this actor shown any sign of being a browser in this window?
 
     The cheapest discriminator there is. A browser rendering the tree viewer
-    pulls stylesheets, phylotree.js and a font; a script walking the URL map
-    pulls none of them, because nothing tells it to. So ``route_breadth`` and
+    pulls stylesheets, phylotree.js and a font, and every request the page then
+    makes carries ``Sec-Fetch-Site: same-origin``; a script walking the URL map
+    does neither, because nothing tells it to. So ``route_breadth`` and
     ``health_scrape`` -- both of which a real user would otherwise trip, the
-    monitoring page especially -- only count for clients that have never
-    fetched one.
+    monitoring page especially -- only count for clients with no such sign.
+    In production nginx serves ``/static/`` without Flask seeing it, so the
+    header is the evidence that actually arrives (see request_diagnostics).
 
     Both directions are cached in-process for ``cache_seconds``, because
     otherwise this would add a Redis round trip to every single request rather
@@ -494,7 +497,7 @@ class BrowserWitness:
                 pass
 
     def mark(self, actor):
-        """Record that this actor fetched a static asset."""
+        """Record browser evidence for this actor (a static asset or a same-origin request)."""
         if self._cached(actor) is True:
             return
         self._remember(actor, True)

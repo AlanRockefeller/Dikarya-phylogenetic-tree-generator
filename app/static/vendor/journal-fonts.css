@@ -1,0 +1,23 @@
+/* Self-hosted Google Fonts, downloaded 2026-10-05.
+   SIL OFL 1.1; see licenses and THIRD_PARTY_NOTICES.md. */
+@font-face {
+  font-family: 'Libre Baskerville';
+  font-style: italic;
+  font-weight: 400;
+  font-display: swap;
+  src: url(../webfonts/libre-baskerville/libre-baskerville-400-italic.ttf) format('truetype');
+}
+@font-face {
+  font-family: 'Libre Baskerville';
+  font-style: normal;
+  font-weight: 400;
+  font-display: swap;
+  src: url(../webfonts/libre-baskerville/libre-baskerville-400-normal.ttf) format('truetype');
+}
+@font-face {
+  font-family: 'Libre Baskerville';
+  font-style: normal;
+  font-weight: 700;
+  font-display: swap;
+  src: url(../webfonts/libre-baskerville/libre-baskerville-700-normal.ttf) format('truetype');
+}

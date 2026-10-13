@@ -312,6 +312,15 @@ def _discard_scratch_inputs(tree_dir: Path, task_logger) -> None:
         )
 
 
+# IQ-TREE runs on one thread whatever the worker's budget. Replaying 34
+# production jobs on 3.1.4-dikarya1 (2026-10-10), a second thread gained 1.02x
+# on Quick Tree overall (up to 1.18x on the few alignments past ~700 patterns)
+# and made MFP+UFBoot+bnni runs ~20% slower, while holding a second core the
+# other phylo_high worker could use. One thread also makes every run
+# reproducible from its recorded seed, which -T 2 is not in any build.
+IQTREE_THREADS = 1
+
+
 def _get_thread_count(params: TreeBuilderParams) -> int:
     if params.threads:
         return params.threads
@@ -1231,8 +1240,8 @@ def _run_iqtree(
     """
     bootstrap = 0 if fast else validate_iqtree_ufboot_count("iqtree", params.bootstrap)
     prefix = str(output_newick.parent / "iqtree_run")
-    threads = _get_thread_count(params)
-    
+    threads = params.threads or IQTREE_THREADS
+
     # Sanitize FASTA to create safe IDs
     sanitized_fasta = output_newick.parent / "iqtree_input_sanitized.fasta"
     name_mapping = sanitize_fasta_headers(alignment_fasta, sanitized_fasta)
@@ -1668,6 +1677,8 @@ def _run_mrbayes(
     printfreq = max(100, ngen // 100)
     seed = _resolve_seed(params)
 
+    mrbayes_threads = _get_thread_count(params)
+
     # Sanitize FASTA to create safe IDs before converting to NEXUS
     sanitized_fasta = output_newick.parent / "mrbayes_input_sanitized.fasta"
     name_mapping = sanitize_fasta_headers(alignment_fasta, sanitized_fasta)
@@ -1690,6 +1701,15 @@ def _run_mrbayes(
         with open(nexus_input, "a") as f:
             f.write("\nbegin mrbayes;\n")
             f.write("   set autoclose=yes nowarn=yes;\n")
+            # The worker's thread budget. The Dikarya build
+            # (ops/mrbayes/README.md) computes the chains' likelihoods on that
+            # many threads, or splits a single chain's by site pattern; the
+            # result is the same either way, and Ubuntu's mb ignores it here.
+            # It must come before the seed: every `set beagle...` command
+            # reruns MrBayes's analysis setup, which draws from the seeded
+            # random stream, so after `set seed` it would change the run.
+            if mrbayes_threads > 1:
+                f.write(f"   set beaglethreadcount={mrbayes_threads};\n")
             # Seeds are set explicitly so a Bayesian run is reproducible; MrBayes
             # otherwise seeds from the clock and records nothing.
             f.write(f"   set seed={seed} swapseed={seed};\n")
