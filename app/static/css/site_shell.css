@@ -18,7 +18,9 @@
  * Workbench templates use the .dk-h1/.dk-h2/.dk-h3 classes.
  */
 
-@import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600;700&family=Libre+Baskerville:ital,wght@0,400;0,700;1,400&display=swap');
+/* Locally hosted (public-main 29be477): IBM Plex Sans and Libre Baskerville. */
+@import url('../vendor/display-fonts.css');
+@import url('../vendor/journal-fonts.css');
 
 :root {
     --dk-font: 'IBM Plex Sans', system-ui, -apple-system, sans-serif;
