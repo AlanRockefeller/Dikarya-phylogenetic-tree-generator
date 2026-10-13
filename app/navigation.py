@@ -52,16 +52,16 @@ WORKBENCH_NAV = (
     {'label': 'iNat Finder', 'endpoint': 'main.inat_finder', 'icon': 'fa-magnifying-glass',
      'description': 'Find an iNaturalist observation when its observation number '
                     'contains a typo.'},
-    {'label': 'Voucher Sync', 'endpoint': 'main.voucher_sync', 'icon': 'fa-qrcode',
-     'login_required': True,
-     'description': 'Read specimen voucher numbers from your iNaturalist photos and '
-                    'sync them to an observation field.'},
-    {'label': 'Labels', 'key': 'labels', 'children': (
+    {'label': 'Label Tools', 'key': 'label-tools', 'children': (
         {'label': 'Herbarium Labels', 'url': '/labels', 'icon': 'fa-leaf',
          'description': 'Print herbarium labels, as PDF or RTF, for your iNaturalist '
                         'observations.'},
         {'label': 'Voucher Labels', 'endpoint': 'main.voucher_labels', 'icon': 'fa-tag',
          'description': 'Generate numbered specimen voucher label sheets for printing.'},
+        {'label': 'Voucher Sync', 'endpoint': 'main.voucher_sync', 'icon': 'fa-qrcode',
+         'login_required': True,
+         'description': 'Read specimen voucher numbers from your iNaturalist photos and '
+                        'sync them to an observation field.'},
     )},
     {'label': 'Docs', 'endpoint': 'main.help_page', 'icon': 'fa-circle-question',
      'description': 'Practical guides for building trees, inspecting alignments, '
