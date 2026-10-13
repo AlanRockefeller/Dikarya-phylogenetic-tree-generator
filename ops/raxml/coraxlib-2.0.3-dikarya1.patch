@@ -1,0 +1,1775 @@
+From a85e52749827dc6fbced0c48417ce88171efde5a Mon Sep 17 00:00:00 2001
+From: Alan Rockefeller <alanrockefeller@gmail.com>
+Date: Fri, 9 Oct 2026 01:55:22 +0000
+Subject: [PATCH 1/7] SPR: do not evaluate the likelihood that thorough mode
+ throws away
+
+In thorough SPR rounds best_reinsert_edge() called
+corax_treeinfo_compute_loglh_flex() after every regraft and then
+overwrote the result with the score returned by algo_optimize_bl_triplet(),
+whose first step evaluates the likelihood on the same edge again. Only the
+CLV updates of that call are needed.
+
+corax_treeinfo_update_partials() does the same traversal, operations and
+CLV updates without the edge evaluation. It is used only when thorough mode
+is on, the improving-moves counter (the one consumer of the discarded score)
+is NULL, and fast CLV updates are on, so the restore at the end of
+best_reinsert_edge() still refreshes partition_loglh[] exactly as before.
+
+Exactness: the skipped call reads CLVs, scalers and the p-matrix and writes
+only partition_loglh[] (and per-site buffers, NULL here); no later
+computation reads its result. Output is byte-identical.
+
+Measured: the edge evaluation plus its log() calls were ~11% of a
+bootstrap-dominated run (fzc7, 101 taxa, GTR+G).
+
+Co-authored-by: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/corax/optimize/spr_round.c | 11 +++++++++--
+ src/corax/tree/treeinfo.c      | 32 ++++++++++++++++++++++++++------
+ src/corax/tree/treeinfo.h      |  3 +++
+ 3 files changed, 38 insertions(+), 8 deletions(-)
+
+diff --git a/src/corax/optimize/spr_round.c b/src/corax/optimize/spr_round.c
+index 2c28c82..850de60 100644
+--- a/src/corax/optimize/spr_round.c
++++ b/src/corax/optimize/spr_round.c
+@@ -797,8 +797,15 @@ static int best_reinsert_edge(corax_treeinfo_t            *treeinfo,
+     algo_update_pmatrix(treeinfo, p_edge->next);
+     algo_update_pmatrix(treeinfo, p_edge->next->next);
+ 
+-    /* re-compute invalid CLVs, and get tree logLH */
+-    loglh = corax_treeinfo_compute_loglh_flex(treeinfo, 1, 0);
++    /* re-compute invalid CLVs, and get tree logLH.
++     * In thorough mode the triplet optimization below starts by evaluating
++     * the same edge and its result replaces this score, so unless the
++     * improving-moves counter needs it, only the CLVs are brought up to date */
++    if (params->thorough && !params->improving_moves_counter
++        && params->fast_clv_updates)
++      corax_treeinfo_update_partials(treeinfo, 1, 0);
++    else
++      loglh = corax_treeinfo_compute_loglh_flex(treeinfo, 1, 0);
+ 
+     if(params->improving_moves_counter && (loglh > init_loglh)) (*params->improving_moves_counter)++;
+ 
+diff --git a/src/corax/tree/treeinfo.c b/src/corax/tree/treeinfo.c
+index 83c4a8b..a2f9a08 100644
+--- a/src/corax/tree/treeinfo.c
++++ b/src/corax/tree/treeinfo.c
+@@ -976,7 +976,8 @@ static double treeinfo_compute_loglh(corax_treeinfo_t *treeinfo,
+                                      int               incremental,
+                                      int               update_pmatrices,
+                                      double **persite_lnl,
+-                                     double **sitecat_lh) {
++                                     double **sitecat_lh,
++                                     int               compute_lh) {
+   /* tree root must be an inner node! */
+   assert(!CORAX_UTREE_IS_TIP(treeinfo->root));
+ 
+@@ -1055,7 +1056,7 @@ static double treeinfo_compute_loglh(corax_treeinfo_t *treeinfo,
+     if (!treeinfo->partitions[p])
+     {
+       /* this partition will be computed by another thread(s) */
+-      treeinfo->partition_loglh[p] = 0.0;
++      if (compute_lh) treeinfo->partition_loglh[p] = 0.0;
+       continue;
+     }
+ 
+@@ -1070,6 +1071,8 @@ static double treeinfo_compute_loglh(corax_treeinfo_t *treeinfo,
+     corax_treeinfo_validate_clvs(
+         treeinfo, treeinfo->travbuffer, traversal_size);
+ 
++    if (!compute_lh) continue;
++
+     /* compute the likelihood on an edge of the unrooted tree by specifying
+        the CLV indices at the two end-point of the branch, the probability
+        matrix index for the concrete branch length, and the index of the model
+@@ -1086,6 +1089,13 @@ static double treeinfo_compute_loglh(corax_treeinfo_t *treeinfo,
+                                                  sitecat_lh ? sitecat_lh[p] : NULL);
+   }
+ 
++  if (!compute_lh)
++  {
++    /* CLVs only: partition_loglh[] is left as it was */
++    corax_treeinfo_set_active_partition(treeinfo, old_active_partition);
++    return 0.0;
++  }
++
+   /* sum up likelihood from all threads */
+   if (treeinfo->parallel_reduce_cb)
+   {
+@@ -1110,25 +1120,35 @@ static double treeinfo_compute_loglh(corax_treeinfo_t *treeinfo,
+ CORAX_EXPORT double corax_treeinfo_compute_loglh(corax_treeinfo_t *treeinfo,
+                                                  int               incremental)
+ {
+-  return treeinfo_compute_loglh(treeinfo, incremental, 1, NULL,NULL);
++  return treeinfo_compute_loglh(treeinfo, incremental, 1, NULL, NULL, 1);
+ }
+ 
+ CORAX_EXPORT double corax_treeinfo_compute_loglh_flex(
+     corax_treeinfo_t *treeinfo, int incremental, int update_pmatrices)
+ {
+-  return treeinfo_compute_loglh(treeinfo, incremental, update_pmatrices, NULL,NULL);
++  return treeinfo_compute_loglh(treeinfo, incremental, update_pmatrices, NULL, NULL, 1);
+ }
+ 
+ CORAX_EXPORT double corax_treeinfo_compute_loglh_persite(
+     corax_treeinfo_t *treeinfo, int incremental, int update_matrices, double **persite_lnl)
+ {
+-  return treeinfo_compute_loglh(treeinfo, incremental, update_matrices, persite_lnl,NULL);
++  return treeinfo_compute_loglh(treeinfo, incremental, update_matrices, persite_lnl, NULL, 1);
+ }
+ 
+ // TODO: implement for all kernels
+ CORAX_EXPORT double corax_treeinfo_compute_loglh_sitecat(
+   corax_treeinfo_t *treeinfo, int incremental, int update_matrices, double **sitecat_lh) {
+-  return treeinfo_compute_loglh(treeinfo, incremental, update_matrices, NULL, sitecat_lh);
++  return treeinfo_compute_loglh(treeinfo, incremental, update_matrices, NULL, sitecat_lh, 1);
++}
++
++/* Same traversal and CLV updates as corax_treeinfo_compute_loglh_flex(), but
++   without evaluating the likelihood at the root edge. For callers that need
++   the CLVs up to date and will compute the score themselves. */
++CORAX_EXPORT void corax_treeinfo_update_partials(corax_treeinfo_t *treeinfo,
++                                                 int               incremental,
++                                                 int               update_pmatrices)
++{
++  treeinfo_compute_loglh(treeinfo, incremental, update_pmatrices, NULL, NULL, 0);
+ }
+ 
+ CORAX_EXPORT
+diff --git a/src/corax/tree/treeinfo.h b/src/corax/tree/treeinfo.h
+index e1c6c13..ad1113c 100644
+--- a/src/corax/tree/treeinfo.h
++++ b/src/corax/tree/treeinfo.h
+@@ -265,6 +265,9 @@ extern "C"
+   CORAX_EXPORT double corax_treeinfo_compute_loglh_flex(
+       corax_treeinfo_t *treeinfo, int incremental, int update_pmatrices);
+ 
++  CORAX_EXPORT void corax_treeinfo_update_partials(
++      corax_treeinfo_t *treeinfo, int incremental, int update_pmatrices);
++
+   CORAX_EXPORT double corax_treeinfo_compute_loglh_persite(
+       corax_treeinfo_t *treeinfo, int incremental, int update_matrices, double **persite_lnl);
+ 
+-- 
+2.43.0
+
+
+From 548d67cb8f1cd5da599b6d71a4d0381823c4a93f Mon Sep 17 00:00:00 2001
+From: Alan Rockefeller <alanrockefeller@gmail.com>
+Date: Fri, 9 Oct 2026 01:55:22 +0000
+Subject: [PATCH 2/7] Site repeats: grow-only CLV, scaler and id-to-site
+ buffers
+
+corax_default_reallocate_repeats() freed and reallocated a node's CLV,
+scaler and id-to-site buffers whenever the node's number of repeat classes
+changed, which during SPR is on nearly every CLV update (~4% of a run in
+malloc/free/memalign and the reallocation itself).
+
+The default callback now keeps a buffer that is already large enough; the
+capacities are tracked in two new arrays in corax_repeats_t. A tip CLV
+replaced by corax_update_repeats_tips() and buffers replaced by the binary
+loader are marked unknown, which falls back to the old reallocation.
+
+Exactness: every user writes the first sites_to_alloc entries of these
+buffers before reading them (the CLV kernels write the whole parent CLV and
+fill the parent scaler, corax_update_repeats() the id-to-site table), so a
+reused buffer yields the same values. A -DCORAX_REPEATS_POISON_TEST build
+fills every reused buffer with NaN/junk; it produces byte-identical output.
+
+Co-authored-by: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/corax/core/partition.c |  2 +
+ src/corax/core/repeats.c   | 79 +++++++++++++++++++++++++++++---------
+ src/corax/core/repeats.h   |  8 ++++
+ src/corax/io/binary.c      |  4 ++
+ 4 files changed, 74 insertions(+), 19 deletions(-)
+
+diff --git a/src/corax/core/partition.c b/src/corax/core/partition.c
+index 60d22d6..edda6f8 100644
+--- a/src/corax/core/partition.c
++++ b/src/corax/core/partition.c
+@@ -111,6 +111,8 @@ static void dealloc_partition_data(corax_partition_t *partition)
+     free(repeats->pernode_ids);
+     free(repeats->perscale_ids);
+     free(repeats->pernode_allocated_clvs);
++    free(repeats->pernode_clv_capacity);
++    free(repeats->perscale_capacity);
+     free(repeats->lookup_buffer);
+     free(repeats->toclean_buffer);
+     free(repeats->id_site_buffer);
+diff --git a/src/corax/core/repeats.c b/src/corax/core/repeats.c
+index 20bc536..aa59bd8 100644
+--- a/src/corax/core/repeats.c
++++ b/src/corax/core/repeats.c
+@@ -153,6 +153,9 @@ CORAX_EXPORT int corax_repeats_initialize(corax_partition_t *partition)
+       calloc(partition->scale_buffers, sizeof(unsigned int));
+   repeats->pernode_allocated_clvs =
+       calloc(partition->nodes, sizeof(unsigned int));
++  repeats->pernode_clv_capacity = calloc(partition->nodes, sizeof(unsigned int));
++  repeats->perscale_capacity =
++      calloc(partition->scale_buffers, sizeof(unsigned int));
+   repeats->lookup_buffer      = 0;
+   repeats->lookup_buffer_size = 0;
+   repeats->toclean_buffer     = malloc(sites_alloc * sizeof(unsigned int));
+@@ -163,6 +166,7 @@ CORAX_EXPORT int corax_repeats_initialize(corax_partition_t *partition)
+                           partition->alignment);
+   repeats->charmap = calloc(CORAX_ASCII_SIZE, sizeof(char));
+   if (!(repeats->pernode_ids && repeats->pernode_allocated_clvs
++        && repeats->pernode_clv_capacity && repeats->perscale_capacity
+         && repeats->bclv_buffer && repeats->toclean_buffer
+         && repeats->id_site_buffer && repeats->charmap))
+   {
+@@ -234,6 +238,7 @@ CORAX_EXPORT int corax_update_repeats_tips(corax_partition_t *  partition,
+   /* zero-out CLV vectors to avoid valgrind warnings when using odd number of
+        states with vectorized code */
+   repeats->pernode_allocated_clvs[tip_index] = ids;
++  if (repeats->pernode_clv_capacity) repeats->pernode_clv_capacity[tip_index] = 0;
+   memset(partition->clv[tip_index], 0, sizealloc);
+   return CORAX_SUCCESS;
+ }
+@@ -247,35 +252,71 @@ CORAX_EXPORT void corax_default_reallocate_repeats(corax_partition_t *partition,
+   if (sites_to_alloc == repeats->pernode_allocated_clvs[parent]) return;
+   repeats->pernode_allocated_clvs[parent] = sites_to_alloc;
+   unsigned int **id_site                  = repeats->pernode_id_site;
+-  // reallocate clvs
+-  corax_aligned_free(partition->clv[parent]);
+-  partition->clv[parent] =
+-      corax_aligned_alloc(sites_to_alloc * partition->states_padded
+-                              * partition->rate_cats * sizeof(double),
+-                          partition->alignment);
+ 
+-  if (!partition->clv[parent])
++  /* Grow-only: the CLV, scaler and id-to-site buffers are kept when they are
++   * already large enough. Every user writes the first sites_to_alloc entries
++   * (the CLV kernels write the whole parent CLV and parent scaler, and
++   * corax_update_repeats() the whole id-to-site table) before anything reads
++   * them, so a reused buffer gives the same results as a fresh one. */
++  if (!repeats->pernode_clv_capacity
++      || sites_to_alloc > repeats->pernode_clv_capacity[parent])
+   {
+-    corax_errno = CORAX_ERROR_MEM_ALLOC;
+-    corax_set_error(CORAX_ERROR_MEM_ALLOC,
+-                    "Unable to allocate enough memory for repeats structure.");
+-    return;
++    // reallocate clvs
++    corax_aligned_free(partition->clv[parent]);
++    partition->clv[parent] =
++        corax_aligned_alloc(sites_to_alloc * partition->states_padded
++                                * partition->rate_cats * sizeof(double),
++                            partition->alignment);
++
++    if (!partition->clv[parent])
++    {
++      if (repeats->pernode_clv_capacity)
++        repeats->pernode_clv_capacity[parent] = 0;
++      corax_errno = CORAX_ERROR_MEM_ALLOC;
++      corax_set_error(CORAX_ERROR_MEM_ALLOC,
++                      "Unable to allocate enough memory for repeats structure.");
++      return;
++    }
++    // reallocate id to site lookup
++    free(id_site[parent]);
++    id_site[parent] = malloc(sites_to_alloc * sizeof(unsigned int));
++    // avoid valgrind errors
++    memset(partition->clv[parent], 0, sites_to_alloc);
++    if (repeats->pernode_clv_capacity)
++      repeats->pernode_clv_capacity[parent] = sites_to_alloc;
+   }
++#ifdef CORAX_REPEATS_POISON_TEST
++  else
++  {
++    /* reused buffer: fill with junk to prove nothing reads it before writing */
++    size_t n = (size_t)sites_to_alloc * partition->states_padded
++               * partition->rate_cats;
++    for (size_t k = 0; k < n; ++k) partition->clv[parent][k] = NAN;
++    memset(id_site[parent], 0xA5, sites_to_alloc * sizeof(unsigned int));
++  }
++#endif
+   // reallocate scales
+   if (CORAX_SCALE_BUFFER_NONE != scaler_index)
+   {
+     unsigned int scaler_size = sites_to_alloc;
+     if (partition->attributes & CORAX_ATTRIB_RATE_SCALERS)
+       scaler_size *= partition->rate_cats;
+-    free(partition->scale_buffer[scaler_index]);
+-    partition->scale_buffer[scaler_index] =
+-        calloc(scaler_size, sizeof(unsigned int));
++    if (!repeats->perscale_capacity
++        || scaler_size > repeats->perscale_capacity[scaler_index])
++    {
++      free(partition->scale_buffer[scaler_index]);
++      partition->scale_buffer[scaler_index] =
++          calloc(scaler_size, sizeof(unsigned int));
++      if (repeats->perscale_capacity)
++        repeats->perscale_capacity[scaler_index] =
++            partition->scale_buffer[scaler_index] ? scaler_size : 0;
++    }
++#ifdef CORAX_REPEATS_POISON_TEST
++    else
++      memset(partition->scale_buffer[scaler_index], 0x5A,
++             scaler_size * sizeof(unsigned int));
++#endif
+   }
+-  // reallocate id to site lookup
+-  free(id_site[parent]);
+-  id_site[parent] = malloc(sites_to_alloc * sizeof(unsigned int));
+-  // avoid valgrind errors
+-  memset(partition->clv[parent], 0, sites_to_alloc);
+ }
+ 
+ /* Fill the repeat structure in partition for the parent node of op */
+diff --git a/src/corax/core/repeats.h b/src/corax/core/repeats.h
+index d3d3151..7426cdc 100644
+--- a/src/corax/core/repeats.h
++++ b/src/corax/core/repeats.h
+@@ -68,6 +68,14 @@ typedef struct corax_repeats
+    */
+   unsigned int *pernode_allocated_clvs;
+ 
++  /** Capacity, in sites, of `partition->clv[u]` and `pernode_id_site[u]`,
++   * and of `partition->scale_buffer[s]` (in entries). The default reallocation
++   * callback only grows these buffers, so that a node whose number of repeat
++   * classes changes does not free and reallocate its CLV every time. NULL (or
++   * 0 for one node) means unknown: the buffer is reallocated as before. */
++  unsigned int *pernode_clv_capacity;
++  unsigned int *perscale_capacity;
++
+   /**
+    * Returns `true` if site repeats compression should be applied on the parent
+    * node of `left_clv` and `right_clv`. In particular, applying site repeats on
+diff --git a/src/corax/io/binary.c b/src/corax/io/binary.c
+index 03ad47f..2cd334c 100644
+--- a/src/corax/io/binary.c
++++ b/src/corax/io/binary.c
+@@ -397,6 +397,10 @@ CORAX_EXPORT corax_partition_t *
+                    sizeof(unsigned int));
+         local_partition->repeats->perscale_ids =
+             calloc(local_partition->scale_buffers, sizeof(unsigned int));
++        free(local_partition->repeats->pernode_clv_capacity);
++        free(local_partition->repeats->perscale_capacity);
++        local_partition->repeats->pernode_clv_capacity = NULL;
++        local_partition->repeats->perscale_capacity    = NULL;
+         local_partition->repeats->pernode_site_id =
+             calloc(local_partition->clv_buffers + local_partition->tips,
+                    sizeof(unsigned int *));
+-- 
+2.43.0
+
+
+From 9194319c0acbce89fa67552221fad6f6318005a6 Mon Sep 17 00:00:00 2001
+From: Alan Rockefeller <alanrockefeller@gmail.com>
+Date: Fri, 9 Oct 2026 06:02:56 +0000
+Subject: [PATCH 3/7] Site repeats: branch-free class identification
+
+corax_update_repeats() runs on every CLV update and decides per site
+whether its (left class, right class) pair is new. On real alignments that
+is close to a coin flip -- a parent averages about half as many classes as
+there are sites -- so the branch mispredicted constantly (6-10% of a run,
+the larger share with FreeRate models, whose kernels do less work per
+site).
+
+The loop now writes the slot curr_id of toclean_buffer/id_site_buffer for
+every site, advances curr_id only for a new pair, selects the id with a
+mask (written as ?: gcc turns it back into the branch) and rewrites an
+existing lookup entry with its own value.
+
+Exactness: integer bookkeeping only; the ids, the first ids entries of both
+buffers and the lookup table end up exactly as before (checked on 20000
+random class layouts against the original loop). End-to-end output cannot
+catch a renumbering -- the likelihood does not depend on the class
+numbering -- hence the unit check.
+
+Co-authored-by: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/corax/core/repeats.c | 24 ++++++++++++++++--------
+ 1 file changed, 16 insertions(+), 8 deletions(-)
+
+diff --git a/src/corax/core/repeats.c b/src/corax/core/repeats.c
+index aa59bd8..cecb826 100644
+--- a/src/corax/core/repeats.c
++++ b/src/corax/core/repeats.c
+@@ -355,17 +355,25 @@ CORAX_EXPORT void corax_update_repeats(corax_partition_t *      partition,
+   else
+   {
+     // fill the parent repeats identifiers
++    // Branch-free: whether a (left, right) pair is new is close to a coin
++    // flip, so the branch mispredicted constantly. The slot curr_id of the
++    // two buffers is written for every site but only kept (curr_id advanced)
++    // for a new pair, and an existing entry of the lookup table is rewritten
++    // with its own value, so the results are the same as before.
++    unsigned int *lookup = repeats->lookup_buffer;
+     for (s = 0; s < partition->sites; ++s)
+     {
+       unsigned int index_lookup = site_id_left[s] + site_id_right[s] * ids_left;
+-      unsigned int id           = repeats->lookup_buffer[index_lookup];
+-      if (EMPTY_ELEMENT == id)
+-      {
+-        toclean_buffer[curr_id]              = index_lookup;
+-        id_site_buffer[curr_id]              = s;
+-        id                                   = curr_id;
+-        repeats->lookup_buffer[index_lookup] = curr_id++;
+-      }
++      unsigned int id           = lookup[index_lookup];
++      unsigned int is_new       = (EMPTY_ELEMENT == id);
++      /* select with a mask: written as ?: the compiler turns it back into
++       * the unpredictable branch */
++      unsigned int new_mask     = 0u - is_new;
++      toclean_buffer[curr_id]   = index_lookup;
++      id_site_buffer[curr_id]   = s;
++      id                        = (curr_id & new_mask) | (id & ~new_mask);
++      lookup[index_lookup]      = id;
++      curr_id += is_new;
+       site_id_parent[s] = id;
+     }
+     ids = curr_id;
+-- 
+2.43.0
+
+
+From 2292f9022a64bb80f035b042668ad18e0323963a Mon Sep 17 00:00:00 2001
+From: Alan Rockefeller <alanrockefeller@gmail.com>
+Date: Fri, 9 Oct 2026 06:02:56 +0000
+Subject: [PATCH 4/7] AVX 4x4 CLV update (site repeats): matrix-vector products
+ from columns
+
+The 4-state kernels compute P*v as four row products followed by a 4x4
+transpose-add (unpacklo/unpackhi, add, permute2f128/blend, add): six
+shuffles per product vector, five of them on port 5, the only shuffle port
+on Haswell/Broadwell. matvec_4x4_cols.h computes the same vector from the
+columns of P with broadcast elements of v.
+
+Exactness: element i of the row-wise result is
+(p_i0*v0 + p_i1*v1) + (p_i2*v2 + p_i3*v3); the column form computes the same
+four products and pairs the additions the same way. IEEE addition is
+commutative, so the results are bitwise identical (signed zeros included).
+The header also has the variants the other kernels need: products added to
+a zeroed accumulator (canon(a)+canon(b) == canon(a+b) with canon(x)=x+0, so
+one +0 on the finished sum suffices) and FMAs into a zeroed accumulator
+(formed per product, since fma(a,b,0) keeps an underflowed -0).
+
+corax_core_update_clv_repeatsbclv_4x4_avx(), the CLV update used for DNA
+with site repeats (~22% of a run), uses it, processes two parent sites per
+iteration sharing the column loads (each site still goes through the same
+operations), and ANDs the per-site scaling compare masks in vector
+registers instead of moving each one to an integer register.
+
+A harness running the old and new kernel on 4000 random cases (1-8 rate
+categories, all repeat layouts, no/per-site/per-rate scaling, zero, -0,
+subnormal and negative matrix entries, one-hot and tiny CLVs) compares the
+parent CLV and scalers bit for bit: all identical. 1.51x faster on a
+realistic call (208 parent classes, 13 left classes, 4 categories).
+
+Co-authored-by: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/corax/kernel/avx/core_clv_avx.c | 230 +++++++++++++++++-----------
+ src/corax/kernel/matvec_4x4_cols.h  |  70 +++++++++
+ 2 files changed, 208 insertions(+), 92 deletions(-)
+ create mode 100644 src/corax/kernel/matvec_4x4_cols.h
+
+diff --git a/src/corax/kernel/avx/core_clv_avx.c b/src/corax/kernel/avx/core_clv_avx.c
+index 5557644..948ef0a 100644
+--- a/src/corax/kernel/avx/core_clv_avx.c
++++ b/src/corax/kernel/avx/core_clv_avx.c
+@@ -21,6 +21,8 @@
+ 
+ #include "corax/corax.h"
+ 
++#include "corax/kernel/matvec_4x4_cols.h"
++
+ CORAX_EXPORT void corax_core_create_lookup_avx(unsigned int  states,
+                                                unsigned int  rate_cats,
+                                                double *      ttlookup,
+@@ -579,31 +581,22 @@ corax_core_update_clv_repeatsbclv_4x4_avx(unsigned int        states,
+   CORAX_UNUSED(left_sites);
+   unsigned int n, k, i;
+ 
+-  const double *lmat;
+-  const double *rmat;
+-
+-  __m256d ymm0, ymm1, ymm2, ymm3, ymm4, ymm5, ymm6, ymm7;
+-  __m256d xmm0, xmm1, xmm2, xmm3, xmm4, xmm5, xmm6, xmm7;
+-
+   unsigned int span = 4 * rate_cats;
+ 
+   /* scaling-related stuff */
+   unsigned int scale_mode; /* 0 = none, 1 = per-site, 2 = per-rate */
+-  unsigned int scale_mask;
+-  unsigned int init_mask;
+   __m256d      v_scale_threshold = _mm256_set1_pd(CORAX_SCALE_THRESHOLD);
+   __m256d      v_scale_factor    = _mm256_set1_pd(CORAX_SCALE_FACTOR);
+ 
+   if (!parent_scaler)
+   {
+     /* scaling disabled / not required */
+-    scale_mode = init_mask = 0;
++    scale_mode = 0;
+   }
+   else
+   {
+     /* determine the scaling mode and init the vars accordingly */
+     scale_mode = (attrib & CORAX_ATTRIB_RATE_SCALERS) ? 2 : 1;
+-    init_mask  = (scale_mode == 1) ? 0xF : 0;
+     /* add up the scale vector of the two children if available */
+     if (scale_mode == 2)
+       corax_fill_parent_scaler_repeats_per_rate(parent_sites,
+@@ -624,41 +617,22 @@ corax_core_update_clv_repeatsbclv_4x4_avx(unsigned int        states,
+                                        right_site_id);
+   }
+ 
++  /* columns of the left and right p-matrices of every rate category */
++  __m256d lcol[4 * rate_cats];
++  __m256d rcol[4 * rate_cats];
++  for (k = 0; k < rate_cats; ++k)
++  {
++    corax_transpose_4x4_avx(left_matrix + 16 * k, lcol + 4 * k);
++    corax_transpose_4x4_avx(right_matrix + 16 * k, rcol + 4 * k);
++  }
++
+   double *      left_res = bclv_buffer;
+   const double *lclv     = left_clv;
+   for (n = 0; n < left_sites; ++n)
+   {
+-    lmat = left_matrix;
+     for (k = 0; k < rate_cats; ++k)
+     {
+-      xmm4 = _mm256_load_pd(lmat);
+-      xmm5 = _mm256_load_pd(lclv);
+-      xmm0 = _mm256_mul_pd(xmm4, xmm5);
+-      lmat += states;
+-      xmm4 = _mm256_load_pd(lmat);
+-      xmm1 = _mm256_mul_pd(xmm4, xmm5);
+-      lmat += states;
+-      xmm4 = _mm256_load_pd(lmat);
+-      xmm2 = _mm256_mul_pd(xmm4, xmm5);
+-      lmat += states;
+-      xmm4 = _mm256_load_pd(lmat);
+-      xmm3 = _mm256_mul_pd(xmm4, xmm5);
+-      lmat += states;
+-      /* compute x */
+-      xmm4 = _mm256_unpackhi_pd(xmm0, xmm1);
+-      xmm5 = _mm256_unpacklo_pd(xmm0, xmm1);
+-
+-      xmm6 = _mm256_unpackhi_pd(xmm2, xmm3);
+-      xmm7 = _mm256_unpacklo_pd(xmm2, xmm3);
+-
+-      xmm0 = _mm256_add_pd(xmm4, xmm5);
+-      xmm1 = _mm256_add_pd(xmm6, xmm7);
+-
+-      xmm2 = _mm256_permute2f128_pd(xmm0, xmm1, _MM_SHUFFLE(0, 2, 0, 1));
+-      xmm3 = _mm256_blend_pd(xmm0, xmm1, 12);
+-      xmm4 = _mm256_add_pd(xmm2, xmm3);
+-
+-      _mm256_store_pd(left_res, xmm4);
++      _mm256_store_pd(left_res, corax_matvec_cols_4x4_avx(lcol + 4 * k, lclv));
+       lclv += states;
+       left_res += states;
+     }
+@@ -666,83 +640,155 @@ corax_core_update_clv_repeatsbclv_4x4_avx(unsigned int        states,
+ 
+   const double *lres = bclv_buffer;
+   const double *rclv = right_clv;
+-  for (n = 0; n < parent_sites; ++n)
+-  {
+-    unsigned int site = CORAX_GET_SITE(parent_id_site, n);
+-    lres              = &bclv_buffer[left_site_id[site] * span];
+-    if (right_site_id) { rclv = &right_clv[right_site_id[site] * span]; }
+-    rmat       = right_matrix;
+-    scale_mask = init_mask;
+ 
+-    for (k = 0; k < rate_cats; ++k)
++  if (scale_mode == 2)
++  {
++    for (n = 0; n < parent_sites; ++n)
+     {
+-      /* compute vector of x */
+-      ymm4 = _mm256_load_pd(rmat);
+-      ymm5 = _mm256_load_pd(rclv);
+-      ymm0 = _mm256_mul_pd(ymm4, ymm5);
+-
+-      rmat += states;
++      unsigned int site = CORAX_GET_SITE(parent_id_site, n);
++      lres              = &bclv_buffer[left_site_id[site] * span];
++      if (right_site_id) { rclv = &right_clv[right_site_id[site] * span]; }
++      const __m256d *rc = rcol;
+ 
+-      ymm4 = _mm256_load_pd(rmat);
+-      ymm1 = _mm256_mul_pd(ymm4, ymm5);
++      for (k = 0; k < rate_cats; ++k)
++      {
++        /* compute x*y */
++        __m256d v_prod =
++            _mm256_mul_pd(_mm256_load_pd(lres), corax_matvec_cols_4x4_avx(rc, rclv));
+ 
+-      rmat += states;
++        /* PER-RATE SCALING: if *all* entries of the *rate* CLV were below
++         * the threshold then scale (all) entries by CORAX_SCALE_FACTOR */
++        __m256d v_cmp = _mm256_cmp_pd(v_prod, v_scale_threshold, _CMP_LT_OS);
++        if (_mm256_movemask_pd(v_cmp) == 0xF)
++        {
++          v_prod = _mm256_mul_pd(v_prod, v_scale_factor);
++          parent_scaler[n * rate_cats + k] += 1;
++        }
+ 
+-      ymm4 = _mm256_load_pd(rmat);
+-      ymm2 = _mm256_mul_pd(ymm4, ymm5);
++        _mm256_store_pd(parent_clv, v_prod);
+ 
+-      rmat += states;
++        parent_clv += states;
++        lres += states;
++        rclv += states;
++        rc += 4;
++      }
++    }
++    return;
++  }
+ 
+-      ymm4 = _mm256_load_pd(rmat);
+-      ymm3 = _mm256_mul_pd(ymm4, ymm5);
++  /* no scaling, or per-site scaling: the site is scaled if every entry of
++   * every rate category is below the threshold (the AND of the compare masks,
++   * as the AND of the movemask bits was before) */
++  const __m256d v_all_ones = _mm256_castsi256_pd(_mm256_set1_epi64x(-1));
++  n                         = 0;
+ 
+-      rmat += states;
++  /* two parent sites per iteration, sharing the column loads; each site
++   * goes through the same operations as in the one-site loop below */
++  for (; n + 2 <= parent_sites; n += 2)
++  {
++    unsigned int  site_a = CORAX_GET_SITE(parent_id_site, n);
++    unsigned int  site_b = CORAX_GET_SITE(parent_id_site, n + 1);
++    const double *lres_a = &bclv_buffer[left_site_id[site_a] * span];
++    const double *lres_b = &bclv_buffer[left_site_id[site_b] * span];
++    const double *rclv_a = rclv;
++    const double *rclv_b = rclv + span;
++    if (right_site_id)
++    {
++      rclv_a = &right_clv[right_site_id[site_a] * span];
++      rclv_b = &right_clv[right_site_id[site_b] * span];
++    }
++    double *       pclv_a    = parent_clv;
++    double *       pclv_b    = parent_clv + span;
++    const __m256d *rc        = rcol;
++    __m256d        v_below_a = v_all_ones;
++    __m256d        v_below_b = v_all_ones;
+ 
+-      /* compute y */
+-      ymm4 = _mm256_unpackhi_pd(ymm0, ymm1);
+-      ymm5 = _mm256_unpacklo_pd(ymm0, ymm1);
++    for (k = 0; k < rate_cats; ++k)
++    {
++      __m256d c0 = rc[0], c1 = rc[1], c2 = rc[2], c3 = rc[3];
++      __asm__("" : "+x"(c0), "+x"(c1), "+x"(c2), "+x"(c3));
++
++      __m256d ya = _mm256_add_pd(
++          _mm256_add_pd(_mm256_mul_pd(c0, _mm256_broadcast_sd(rclv_a)),
++                        _mm256_mul_pd(c1, _mm256_broadcast_sd(rclv_a + 1))),
++          _mm256_add_pd(_mm256_mul_pd(c2, _mm256_broadcast_sd(rclv_a + 2)),
++                        _mm256_mul_pd(c3, _mm256_broadcast_sd(rclv_a + 3))));
++      __m256d yb = _mm256_add_pd(
++          _mm256_add_pd(_mm256_mul_pd(c0, _mm256_broadcast_sd(rclv_b)),
++                        _mm256_mul_pd(c1, _mm256_broadcast_sd(rclv_b + 1))),
++          _mm256_add_pd(_mm256_mul_pd(c2, _mm256_broadcast_sd(rclv_b + 2)),
++                        _mm256_mul_pd(c3, _mm256_broadcast_sd(rclv_b + 3))));
++
++      __m256d v_prod_a = _mm256_mul_pd(_mm256_load_pd(lres_a), ya);
++      __m256d v_prod_b = _mm256_mul_pd(_mm256_load_pd(lres_b), yb);
++      if (scale_mode)
++      {
++        v_below_a = _mm256_and_pd(
++            v_below_a, _mm256_cmp_pd(v_prod_a, v_scale_threshold, _CMP_LT_OS));
++        v_below_b = _mm256_and_pd(
++            v_below_b, _mm256_cmp_pd(v_prod_b, v_scale_threshold, _CMP_LT_OS));
++      }
+ 
+-      ymm6 = _mm256_unpackhi_pd(ymm2, ymm3);
+-      ymm7 = _mm256_unpacklo_pd(ymm2, ymm3);
++      _mm256_store_pd(pclv_a, v_prod_a);
++      _mm256_store_pd(pclv_b, v_prod_b);
+ 
+-      ymm0 = _mm256_add_pd(ymm4, ymm5);
+-      ymm1 = _mm256_add_pd(ymm6, ymm7);
++      pclv_a += states;
++      pclv_b += states;
++      lres_a += states;
++      lres_b += states;
++      rclv_a += states;
++      rclv_b += states;
++      rc += 4;
++    }
+ 
+-      ymm2 = _mm256_permute2f128_pd(ymm0, ymm1, _MM_SHUFFLE(0, 2, 0, 1));
+-      ymm3 = _mm256_blend_pd(ymm0, ymm1, 12);
+-      ymm4 = _mm256_add_pd(ymm2, ymm3);
++    if (scale_mode && _mm256_movemask_pd(v_below_a) == 0xF)
++    {
++      for (i = 0; i < span; i += 4)
++        _mm256_store_pd(parent_clv + i,
++                        _mm256_mul_pd(_mm256_load_pd(parent_clv + i), v_scale_factor));
++      parent_scaler[n] += 1;
++    }
++    if (scale_mode && _mm256_movemask_pd(v_below_b) == 0xF)
++    {
++      for (i = 0; i < span; i += 4)
++        _mm256_store_pd(parent_clv + span + i,
++                        _mm256_mul_pd(_mm256_load_pd(parent_clv + span + i),
++                                      v_scale_factor));
++      parent_scaler[n + 1] += 1;
++    }
+ 
+-      /* compute x*y */
+-      xmm4 = _mm256_load_pd(lres);
+-      xmm0 = _mm256_mul_pd(xmm4, ymm4);
++    parent_clv += 2 * span;
++    rclv += 2 * span;
++  }
+ 
+-      /* check if scaling is needed for the current rate category */
+-      __m256d v_cmp = _mm256_cmp_pd(xmm0, v_scale_threshold, _CMP_LT_OS);
+-      const unsigned int rate_mask = _mm256_movemask_pd(v_cmp);
++  for (; n < parent_sites; ++n)
++  {
++    unsigned int site = CORAX_GET_SITE(parent_id_site, n);
++    lres              = &bclv_buffer[left_site_id[site] * span];
++    if (right_site_id) { rclv = &right_clv[right_site_id[site] * span]; }
++    const __m256d *rc      = rcol;
++    __m256d        v_below = v_all_ones;
+ 
+-      if (scale_mode == 2)
+-      {
+-        /* PER-RATE SCALING: if *all* entries of the *rate* CLV were below
+-         * the threshold then scale (all) entries by CORAX_SCALE_FACTOR */
+-        if (rate_mask == 0xF)
+-        {
+-          xmm0 = _mm256_mul_pd(xmm0, v_scale_factor);
+-          parent_scaler[n * rate_cats + k] += 1;
+-        }
+-      }
+-      else
+-        scale_mask = scale_mask & rate_mask;
++    for (k = 0; k < rate_cats; ++k)
++    {
++      /* compute x*y */
++      __m256d v_prod =
++          _mm256_mul_pd(_mm256_load_pd(lres), corax_matvec_cols_4x4_avx(rc, rclv));
++      if (scale_mode)
++        v_below = _mm256_and_pd(
++            v_below, _mm256_cmp_pd(v_prod, v_scale_threshold, _CMP_LT_OS));
+ 
+-      _mm256_store_pd(parent_clv, xmm0);
++      _mm256_store_pd(parent_clv, v_prod);
+ 
+       parent_clv += states;
+       lres += states;
+       rclv += states;
++      rc += 4;
+     }
+ 
+     /* PER-SITE SCALING: if *all* entries of the *site* CLV were below
+      * the threshold then scale (all) entries by CORAX_SCALE_FACTOR */
+-    if (scale_mask == 0xF)
++    if (scale_mode && _mm256_movemask_pd(v_below) == 0xF)
+     {
+       parent_clv -= span;
+       for (i = 0; i < span; i += 4)
+diff --git a/src/corax/kernel/matvec_4x4_cols.h b/src/corax/kernel/matvec_4x4_cols.h
+new file mode 100644
+index 0000000..2744a41
+--- /dev/null
++++ b/src/corax/kernel/matvec_4x4_cols.h
+@@ -0,0 +1,70 @@
++/*
++    4x4 matrix-vector products from matrix columns, for the 4-state kernels.
++
++    The row-wise kernels compute M*v as four elementwise products row_i * v
++    and reduce each with unpacklo/unpackhi + add (pairing elements 0,1 and
++    2,3) followed by permute2f128/blend + add. Element i of the result is
++    therefore (m_i0*v0 + m_i1*v1) + (m_i2*v2 + m_i3*v3). Computing it from the
++    columns of M as (c0*v0 + c1*v1) + (c2*v2 + c3*v3) gives the same products
++    and pairs the additions the same way; IEEE addition is commutative, so the
++    result is bitwise identical, without four port-5 shuffles per product.
++
++    Include from a file compiled with AVX enabled.
++*/
++#ifndef CORAX_KERNEL_MATVEC_4X4_COLS_H_
++#define CORAX_KERNEL_MATVEC_4X4_COLS_H_
++
++#include <immintrin.h>
++
++/* Columns of a row-major 4x4 matrix: c[j] = (m[0][j], m[1][j], m[2][j], m[3][j]). */
++static inline void corax_transpose_4x4_avx(const double *m, __m256d *c)
++{
++  __m256d r0 = _mm256_loadu_pd(m);
++  __m256d r1 = _mm256_loadu_pd(m + 4);
++  __m256d r2 = _mm256_loadu_pd(m + 8);
++  __m256d r3 = _mm256_loadu_pd(m + 12);
++  __m256d t0 = _mm256_unpacklo_pd(r0, r1);
++  __m256d t1 = _mm256_unpackhi_pd(r0, r1);
++  __m256d t2 = _mm256_unpacklo_pd(r2, r3);
++  __m256d t3 = _mm256_unpackhi_pd(r2, r3);
++  c[0]       = _mm256_permute2f128_pd(t0, t2, 0x20);
++  c[1]       = _mm256_permute2f128_pd(t1, t3, 0x20);
++  c[2]       = _mm256_permute2f128_pd(t0, t2, 0x31);
++  c[3]       = _mm256_permute2f128_pd(t1, t3, 0x31);
++}
++
++/* M*v, products by multiplication (as in the kernels that use _mm256_mul_pd). */
++static inline __m256d corax_matvec_cols_4x4_avx(const __m256d *c, const double *v)
++{
++  __m256d p0 = _mm256_mul_pd(c[0], _mm256_broadcast_sd(v));
++  __m256d p1 = _mm256_mul_pd(c[1], _mm256_broadcast_sd(v + 1));
++  __m256d p2 = _mm256_mul_pd(c[2], _mm256_broadcast_sd(v + 2));
++  __m256d p3 = _mm256_mul_pd(c[3], _mm256_broadcast_sd(v + 3));
++  return _mm256_add_pd(_mm256_add_pd(p0, p1), _mm256_add_pd(p2, p3));
++}
++
++/* M*v for kernels that form each product as 0 + m*v (an add to a zeroed
++ * accumulator), which turns a -0 product into +0. With canon(x) = x + 0,
++ * canon(a) + canon(b) == canon(a + b) for all doubles under round-to-nearest,
++ * so adding +0 once to the finished sum gives the same bits. */
++static inline __m256d corax_matvec_cols_4x4_zadd_avx(const __m256d *c, const double *v)
++{
++  return _mm256_add_pd(corax_matvec_cols_4x4_avx(c, v), _mm256_setzero_pd());
++}
++
++#ifdef __FMA__
++/* M*v for kernels that form each product as fma(m, v, 0) (an FMA into a
++ * zeroed accumulator). That is not always canon(m*v) -- an exact product
++ * that underflows to -0 stays -0 -- so each product is formed the same way. */
++static inline __m256d corax_matvec_cols_4x4_fma0_avx(const __m256d *c, const double *v)
++{
++  const __m256d z = _mm256_setzero_pd();
++  __m256d p0 = _mm256_fmadd_pd(c[0], _mm256_broadcast_sd(v), z);
++  __m256d p1 = _mm256_fmadd_pd(c[1], _mm256_broadcast_sd(v + 1), z);
++  __m256d p2 = _mm256_fmadd_pd(c[2], _mm256_broadcast_sd(v + 2), z);
++  __m256d p3 = _mm256_fmadd_pd(c[3], _mm256_broadcast_sd(v + 3), z);
++  return _mm256_add_pd(_mm256_add_pd(p0, p1), _mm256_add_pd(p2, p3));
++}
++#endif
++
++#endif
+-- 
+2.43.0
+
+
+From e8ea020f9733e78bb307c59bb42521637a92266f Mon Sep 17 00:00:00 2001
+From: Alan Rockefeller <alanrockefeller@gmail.com>
+Date: Fri, 9 Oct 2026 06:02:56 +0000
+Subject: [PATCH 5/7] AVX 4x4 sumtable (site repeats): matrix-vector products
+ from columns
+
+corax_core_update_sumtable_repeatsbclv_4x4_avx() (~11% of a run) built both
+terms of every sumtable entry as row products plus a 4x4 transpose-add. It
+now uses the column form with the zero-accumulator variant -- the original
+adds every product to a zeroed vector, which turns a -0 product into +0, and
+adding +0 once to the finished sum gives the same bits
+(canon(a)+canon(b) == canon(a+b) for all doubles) -- and two sites per
+iteration share the column loads. The small per-call tables (transposed
+inverse eigenvectors here, the per-rate pointer arrays in
+sumtable_repeats()) are on the stack instead of five heap allocations per
+call.
+
+Harness: 4000 random cases (eigenvectors with negative and zero entries,
+inv on/off, per-rate and per-site scalers, child with and without repeats):
+all identical. 1.69x faster per call (218 sites, 4 categories).
+
+Co-authored-by: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/corax/kernel/avx/core_derivatives_avx.c | 184 ++++++++------------
+ src/corax/kernel/derivatives.c              |  21 +--
+ 2 files changed, 79 insertions(+), 126 deletions(-)
+
+diff --git a/src/corax/kernel/avx/core_derivatives_avx.c b/src/corax/kernel/avx/core_derivatives_avx.c
+index 7c96160..14ced6e 100644
+--- a/src/corax/kernel/avx/core_derivatives_avx.c
++++ b/src/corax/kernel/avx/core_derivatives_avx.c
+@@ -20,6 +20,7 @@
+ */
+ 
+ #include "corax/corax.h"
++#include "corax/kernel/matvec_4x4_cols.h"
+ #include <limits.h>
+ 
+ static int core_update_sumtable_ii_4x4_avx(unsigned int        sites,
+@@ -426,15 +427,11 @@ CORAX_EXPORT int corax_core_update_sumtable_repeatsbclv_4x4_avx(
+ 
+   /* build sumtable */
+   double *sum = sumtable;
+-  double *t_eigenvecs;
+-
+   double *t_freqs;
+ 
+   unsigned int span_padded = rate_cats * states;
+   double *     lbclv       = bclv_buffer;
+ 
+-  double * tt_inv_eigenvecs_buff = NULL;
+-  double **tt_inv_eigenvecs_ptr  = NULL;
+ 
+   /* scaling stuff*/
+   unsigned int  min_scaler       = 0;
+@@ -462,20 +459,11 @@ CORAX_EXPORT int corax_core_update_sumtable_repeatsbclv_4x4_avx(
+     }
+   }
+ 
+-  /* transposed inv_eigenvecs */
+-  tt_inv_eigenvecs_buff = (double *)corax_aligned_alloc(
+-      (states * states * rate_cats) * sizeof(double), CORAX_ALIGNMENT_AVX);
+-  tt_inv_eigenvecs_ptr = (double **)malloc(rate_cats * sizeof(double *));
+-  if (!tt_inv_eigenvecs_buff || !tt_inv_eigenvecs_ptr)
+-  {
+-    if (rate_scalings) free(rate_scalings);
+-    if (tt_inv_eigenvecs_buff) corax_aligned_free(tt_inv_eigenvecs_buff);
+-    if (tt_inv_eigenvecs_ptr) free(tt_inv_eigenvecs_ptr);
+-
+-    corax_set_error(CORAX_ERROR_MEM_ALLOC,
+-                    "Cannot allocate memory for tt_inv_eigenvecs");
+-    return CORAX_FAILURE;
+-  }
++  /* transposed inv_eigenvecs (on the stack: this runs once per branch
++   * length optimization and is small, 16 doubles per rate category) */
++  double  tt_inv_eigenvecs_buff[states * states * rate_cats]
++      __attribute__((aligned(CORAX_ALIGNMENT_AVX)));
++  double *tt_inv_eigenvecs_ptr[rate_cats];
+ 
+   for (i = 0; i < rate_cats; ++i)
+   {
+@@ -497,61 +485,84 @@ CORAX_EXPORT int corax_core_update_sumtable_repeatsbclv_4x4_avx(
+     eigenvecs        = tt_inv_eigenvecs_ptr;
+   }
+ 
++  /* columns of the left and right matrices of every rate category */
++  __m256d lcol[4 * rate_cats];
++  __m256d rcol[4 * rate_cats];
++  for (i = 0; i < rate_cats; ++i)
++  {
++    corax_transpose_4x4_avx(tt_inv_eigenvecs[i], lcol + 4 * i);
++    corax_transpose_4x4_avx(eigenvecs[i], rcol + 4 * i);
++  }
++
+   const double *t_clvp = clvp;
+   /* bclv computation */
+   for (n = 0; n < parent_sites; n++)
+   {
+     for (i = 0; i < rate_cats; ++i)
+     {
+-      const double *ct_inv_eigenvecs = tt_inv_eigenvecs[i];
+-      __m256d       v_lefterm[4];
+-      v_lefterm[0] = v_lefterm[1] = v_lefterm[2] = v_lefterm[3] =
+-          _mm256_setzero_pd();
+-      __m256d v_eigen;
+-      __m256d v_clvp;
+-
+-      v_clvp = _mm256_load_pd(t_clvp);
+-
+-      v_eigen = _mm256_load_pd(ct_inv_eigenvecs);
+-      v_lefterm[0] =
+-          _mm256_add_pd(v_lefterm[0], _mm256_mul_pd(v_eigen, v_clvp));
+-      ct_inv_eigenvecs += 4;
+-
+-      v_eigen = _mm256_load_pd(ct_inv_eigenvecs);
+-      v_lefterm[1] =
+-          _mm256_add_pd(v_lefterm[1], _mm256_mul_pd(v_eigen, v_clvp));
+-
+-      ct_inv_eigenvecs += 4;
+-      v_eigen = _mm256_load_pd(ct_inv_eigenvecs);
+-      v_lefterm[2] =
+-          _mm256_add_pd(v_lefterm[2], _mm256_mul_pd(v_eigen, v_clvp));
+-
+-      ct_inv_eigenvecs += 4;
+-
+-      v_eigen = _mm256_load_pd(ct_inv_eigenvecs);
+-      v_lefterm[3] =
+-          _mm256_add_pd(v_lefterm[3], _mm256_mul_pd(v_eigen, v_clvp));
+-
+-      ct_inv_eigenvecs += 4;
+-
+-      /* compute lefterm */
+-      __m256d xmm0 = _mm256_unpackhi_pd(v_lefterm[0], v_lefterm[1]);
+-      __m256d xmm1 = _mm256_unpacklo_pd(v_lefterm[0], v_lefterm[1]);
+-      __m256d xmm2 = _mm256_unpackhi_pd(v_lefterm[2], v_lefterm[3]);
+-      __m256d xmm3 = _mm256_unpacklo_pd(v_lefterm[2], v_lefterm[3]);
+-      xmm0         = _mm256_add_pd(xmm0, xmm1);
+-      xmm1         = _mm256_add_pd(xmm2, xmm3);
+-      xmm2 = _mm256_permute2f128_pd(xmm0, xmm1, _MM_SHUFFLE(0, 2, 0, 1));
+-      xmm3 = _mm256_blend_pd(xmm0, xmm1, 12);
+-      __m256d v_lefterm_sum = _mm256_add_pd(xmm2, xmm3);
+-      _mm256_store_pd(lbclv, v_lefterm_sum);
++      /* lefterm: each product was added to a zeroed accumulator */
++      _mm256_store_pd(lbclv, corax_matvec_cols_4x4_zadd_avx(lcol + 4 * i, t_clvp));
+       t_clvp += states;
+       lbclv += states;
+     }
+   }
+ 
+   /* vectorized loop from update_sumtable() */
+-  for (n = 0; n < sites; n++)
++  n = 0;
++  if (!per_rate_scaling)
++  {
++    /* two sites per iteration, sharing the column loads; each site goes
++     * through the same operations as in the one-site loop below */
++    const __m256d z = _mm256_setzero_pd();
++    for (; n + 2 <= sites; n += 2)
++    {
++      const double *lb_a   = &bclv_buffer[parent_site_id[n] * span_padded];
++      const double *lb_b   = &bclv_buffer[parent_site_id[n + 1] * span_padded];
++      const double *clvc_a = &clvc[CORAX_GET_ID(child_site_id, n) * span_padded];
++      const double *clvc_b =
++          &clvc[CORAX_GET_ID(child_site_id, n + 1) * span_padded];
++      double *       sum_a = sum;
++      double *       sum_b = sum + span_padded;
++      const __m256d *rc    = rcol;
++
++      for (i = 0; i < rate_cats; ++i)
++      {
++        __m256d c0 = rc[0], c1 = rc[1], c2 = rc[2], c3 = rc[3];
++        __asm__("" : "+x"(c0), "+x"(c1), "+x"(c2), "+x"(c3));
++
++        /* righterm: each product was added to a zeroed accumulator */
++        __m256d ra = _mm256_add_pd(
++            _mm256_add_pd(
++                _mm256_add_pd(_mm256_mul_pd(c0, _mm256_broadcast_sd(clvc_a)),
++                              _mm256_mul_pd(c1, _mm256_broadcast_sd(clvc_a + 1))),
++                _mm256_add_pd(_mm256_mul_pd(c2, _mm256_broadcast_sd(clvc_a + 2)),
++                              _mm256_mul_pd(c3, _mm256_broadcast_sd(clvc_a + 3)))),
++            z);
++        __m256d rb = _mm256_add_pd(
++            _mm256_add_pd(
++                _mm256_add_pd(_mm256_mul_pd(c0, _mm256_broadcast_sd(clvc_b)),
++                              _mm256_mul_pd(c1, _mm256_broadcast_sd(clvc_b + 1))),
++                _mm256_add_pd(_mm256_mul_pd(c2, _mm256_broadcast_sd(clvc_b + 2)),
++                              _mm256_mul_pd(c3, _mm256_broadcast_sd(clvc_b + 3)))),
++            z);
++
++        /* update sum */
++        _mm256_store_pd(sum_a, _mm256_mul_pd(_mm256_load_pd(lb_a), ra));
++        _mm256_store_pd(sum_b, _mm256_mul_pd(_mm256_load_pd(lb_b), rb));
++
++        clvc_a += states;
++        clvc_b += states;
++        lb_a += states;
++        lb_b += states;
++        sum_a += states;
++        sum_b += states;
++        rc += 4;
++      }
++      sum += 2 * span_padded;
++    }
++  }
++
++  for (; n < sites; n++)
+   {
+     unsigned int cid     = CORAX_GET_ID(child_site_id, n);
+     unsigned int pid     = parent_site_id[n];
+@@ -580,53 +591,11 @@ CORAX_EXPORT int corax_core_update_sumtable_repeatsbclv_4x4_avx(
+ 
+     for (i = 0; i < rate_cats; ++i)
+     {
+-      t_eigenvecs = eigenvecs[i];
+-
+-      const double *c_eigenvecs = t_eigenvecs;
+-
+-      __m256d v_righterm[4];
+-      v_righterm[0] = v_righterm[1] = v_righterm[2] = v_righterm[3] =
+-          _mm256_setzero_pd();
+-
+-      __m256d v_eigen;
+-      __m256d v_clvc;
+-
+-      v_clvc = _mm256_load_pd(t_clvc);
+-
+-      v_eigen = _mm256_load_pd(c_eigenvecs);
+-      v_righterm[0] =
+-          _mm256_add_pd(v_righterm[0], _mm256_mul_pd(v_eigen, v_clvc));
+-      c_eigenvecs += 4;
+-
+-      v_eigen = _mm256_load_pd(c_eigenvecs);
+-      v_righterm[1] =
+-          _mm256_add_pd(v_righterm[1], _mm256_mul_pd(v_eigen, v_clvc));
+-      c_eigenvecs += 4;
+-
+-      v_eigen = _mm256_load_pd(c_eigenvecs);
+-      v_righterm[2] =
+-          _mm256_add_pd(v_righterm[2], _mm256_mul_pd(v_eigen, v_clvc));
+-      c_eigenvecs += 4;
+-
+-      v_eigen = _mm256_load_pd(c_eigenvecs);
+-      v_righterm[3] =
+-          _mm256_add_pd(v_righterm[3], _mm256_mul_pd(v_eigen, v_clvc));
+-      c_eigenvecs += 4;
+-
+-      /* compute righterm */
++      /* righterm: each product was added to a zeroed accumulator */
++      __m256d v_righterm_sum =
++          corax_matvec_cols_4x4_zadd_avx(rcol + 4 * i, t_clvc);
+       __m256d v_lefterm_sum = _mm256_load_pd(lbclv);
+ 
+-      /* compute righterm */
+-      __m256d xmm0 = _mm256_unpackhi_pd(v_righterm[0], v_righterm[1]);
+-      __m256d xmm1 = _mm256_unpacklo_pd(v_righterm[0], v_righterm[1]);
+-      __m256d xmm2 = _mm256_unpackhi_pd(v_righterm[2], v_righterm[3]);
+-      __m256d xmm3 = _mm256_unpacklo_pd(v_righterm[2], v_righterm[3]);
+-      xmm0         = _mm256_add_pd(xmm0, xmm1);
+-      xmm1         = _mm256_add_pd(xmm2, xmm3);
+-      xmm2 = _mm256_permute2f128_pd(xmm0, xmm1, _MM_SHUFFLE(0, 2, 0, 1));
+-      xmm3 = _mm256_blend_pd(xmm0, xmm1, 12);
+-      __m256d v_righterm_sum = _mm256_add_pd(xmm2, xmm3);
+-
+       /* update sum */
+       __m256d v_prod = _mm256_mul_pd(v_lefterm_sum, v_righterm_sum);
+       /* apply per-rate scalers */
+@@ -641,9 +610,6 @@ CORAX_EXPORT int corax_core_update_sumtable_repeatsbclv_4x4_avx(
+     }
+   }
+ 
+-  corax_aligned_free(tt_inv_eigenvecs_buff);
+-  free(tt_inv_eigenvecs_ptr);
+-
+   if (rate_scalings) free(rate_scalings);
+ 
+   return CORAX_SUCCESS;
+diff --git a/src/corax/kernel/derivatives.c b/src/corax/kernel/derivatives.c
+index 4f3adb8..403bc99 100644
+--- a/src/corax/kernel/derivatives.c
++++ b/src/corax/kernel/derivatives.c
+@@ -166,20 +166,10 @@ static int sumtable_repeats(corax_partition_t * partition,
+   unsigned int i;
+   unsigned int sites = partition->sites;
+ 
+-  double **eigenvecs =
+-      (double **)malloc(partition->rate_cats * sizeof(double *));
+-  double **inv_eigenvecs =
+-      (double **)malloc(partition->rate_cats * sizeof(double *));
+-  double **freqs = (double **)malloc(partition->rate_cats * sizeof(double *));
+-  if (!eigenvecs || !inv_eigenvecs || !freqs)
+-  {
+-    if (eigenvecs) free(eigenvecs);
+-    if (inv_eigenvecs) free(inv_eigenvecs);
+-    if (freqs) free(freqs);
+-
+-    corax_set_error(CORAX_ERROR_MEM_ALLOC, "Unable to allocate enough memory.");
+-    return CORAX_FAILURE;
+-  }
++  /* per-rate pointer tables, on the stack (one call per branch) */
++  double *eigenvecs[partition->rate_cats];
++  double *inv_eigenvecs[partition->rate_cats];
++  double *freqs[partition->rate_cats];
+ 
+   /* ascertaiment bias correction */
+   if (partition->asc_bias_alloc)
+@@ -219,9 +209,6 @@ static int sumtable_repeats(corax_partition_t * partition,
+       inv,
+       partition->attributes);
+ 
+-  free(freqs);
+-  free(eigenvecs);
+-  free(inv_eigenvecs);
+ 
+   return retval;
+ }
+-- 
+2.43.0
+
+
+From f0d37e2eba843653b881f4f39dfefda1398dea5d Mon Sep 17 00:00:00 2001
+From: Alan Rockefeller <alanrockefeller@gmail.com>
+Date: Fri, 9 Oct 2026 06:02:56 +0000
+Subject: [PATCH 6/7] AVX2 edge log-likelihood (site repeats): 4-state path
+
+DNA with site repeats evaluated the edge log-likelihood with the generic
+AVX2 kernel (~16% of a run plus 7% in log()). A 4-state path does the same
+arithmetic with the p-matrix product from columns (FMA into a zeroed
+accumulator, per product, as before), takes the per-category frequency
+vector and invariant proportion out of the site loop, and processes sites
+in chunks of 64: first each site's likelihood terms, then the logs and the
+sum in site order. The old loop issued ~200 uops and a log() call per site,
+too much for the out-of-order window to overlap consecutive sites.
+
+Exactness: every per-site value comes from the same operations in the same
+order (the scalar code is unchanged, so gcc contracts the same expressions
+into FMAs), and the log-likelihood is summed in the same site order.
+Harness: 4000 random cases (invariant sites, per-rate and per-site scaling,
+per-site and per-category outputs, pattern weights): return value and
+outputs all identical. ~1.6x faster per call.
+
+Co-authored-by: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/corax/kernel/avx2/core_likelihood_avx2.c | 254 +++++++++++++++++++
+ 1 file changed, 254 insertions(+)
+
+diff --git a/src/corax/kernel/avx2/core_likelihood_avx2.c b/src/corax/kernel/avx2/core_likelihood_avx2.c
+index a77c98a..6ab25c9 100644
+--- a/src/corax/kernel/avx2/core_likelihood_avx2.c
++++ b/src/corax/kernel/avx2/core_likelihood_avx2.c
+@@ -20,6 +20,7 @@
+ */
+ 
+ #include "corax/corax.h"
++#include "corax/kernel/matvec_4x4_cols.h"
+ #include <limits.h>
+ 
+ CORAX_EXPORT double
+@@ -689,6 +690,238 @@ corax_core_edge_loglikelihood_ii_avx2(unsigned int         states,
+   return logl;
+ }
+ 
++/* 4-state specialization of corax_core_edge_loglikelihood_repeats_generic_avx2():
++ * the same arithmetic, operation for operation, with the p-matrix product
++ * computed from the matrix columns (see matvec_4x4_cols.h) instead of a
++ * row-wise product followed by a 4x4 transpose-add. */
++static double edge_loglikelihood_repeats_4x4_avx2(
++    unsigned int         sites,
++    unsigned int         rate_cats,
++    const double *       parent_clv,
++    const unsigned int * parent_scaler,
++    const double *       child_clv,
++    const unsigned int * child_scaler,
++    const double *       pmatrix,
++    const double *const *frequencies,
++    const double *       rate_weights,
++    const unsigned int * pattern_weights,
++    const double *       invar_proportion,
++    const int *          invar_indices,
++    const unsigned int * freqs_indices,
++    double *             persite_lnl,
++    double *             sitecat_lh,
++    const unsigned int * parent_site_id,
++    const unsigned int * child_site_id,
++    unsigned int         attrib)
++{
++  unsigned int n, i;
++  double       logl       = 0;
++  double       prop_invar = 0;
++
++  const double *freqs = NULL;
++
++  double terma, terma_r, terminv;
++  double site_lk, inv_site_lk;
++
++  const unsigned int states_padded = 4;
++  unsigned int       span          = states_padded * rate_cats;
++
++  __m256d xmm0, xmm1, xmm2;
++
++  /* scaling stuff */
++  unsigned int  site_scalings;
++  unsigned int *rate_scalings    = NULL;
++  int           per_rate_scaling = (attrib & CORAX_ATTRIB_RATE_SCALERS) ? 1 : 0;
++
++  /* powers of scale threshold for undoing the scaling */
++  double scale_minlh[CORAX_SCALE_RATE_MAXDIFF];
++  if (per_rate_scaling || invar_proportion)
++  {
++    double scale_factor = 1.0;
++    for (i = 0; i < CORAX_SCALE_RATE_MAXDIFF; ++i)
++    {
++      scale_factor *= CORAX_SCALE_THRESHOLD;
++      scale_minlh[i] = scale_factor;
++    }
++  }
++  if (per_rate_scaling)
++  {
++    rate_scalings = (unsigned int *)calloc(rate_cats, sizeof(unsigned int));
++
++    if (!rate_scalings)
++    {
++      corax_set_error(CORAX_ERROR_MEM_ALLOC,
++                      "Cannot allocate space for rate scalers.");
++      return -INFINITY;
++    }
++  }
++
++  /* columns of the p-matrix of every rate category, and the per-category
++   * frequency vector and proportion of invariant sites (the same for every
++   * site) */
++  __m256d       pcol[4 * rate_cats];
++  const double *rate_freqs[rate_cats];
++  double        rate_pinv[rate_cats];
++  for (i = 0; i < rate_cats; ++i)
++  {
++    corax_transpose_4x4_avx(pmatrix + 16 * i, pcol + 4 * i);
++    rate_freqs[i] = frequencies[freqs_indices[i]];
++    rate_pinv[i]  = invar_proportion ? invar_proportion[freqs_indices[i]] : 0;
++  }
++
++  /* Sites are processed in chunks: first every site's likelihood terms (no
++   * calls, so consecutive sites overlap in the pipeline), then the logs and
++   * the sum, in site order. Each site's values come from exactly the same
++   * operations as before. */
++#define EDGE_4X4_CHUNK 64
++  double       chunk_terma[EDGE_4X4_CHUNK];
++  double       chunk_terminv[EDGE_4X4_CHUNK];
++  unsigned int chunk_scalings[EDGE_4X4_CHUNK];
++
++  unsigned int chunk_start;
++  for (chunk_start = 0; chunk_start < sites; chunk_start += EDGE_4X4_CHUNK)
++  {
++    unsigned int chunk_end = CORAX_MIN(sites, chunk_start + EDGE_4X4_CHUNK);
++
++    for (n = chunk_start; n < chunk_end; ++n)
++    {
++      unsigned int  pid  = CORAX_GET_ID(parent_site_id, n);
++      unsigned int  cid  = CORAX_GET_ID(child_site_id, n);
++      const double *clvp = &parent_clv[pid * span];
++      const double *clvc = &child_clv[cid * span];
++      terma              = 0;
++      terminv            = 0;
++
++      if (per_rate_scaling)
++      {
++        /* compute minimum per-rate scaler -> common per-site scaler */
++        site_scalings = UINT_MAX;
++        for (i = 0; i < rate_cats; ++i)
++        {
++          rate_scalings[i] =
++              (parent_scaler) ? parent_scaler[pid * rate_cats + i] : 0;
++          rate_scalings[i] +=
++              (child_scaler) ? child_scaler[cid * rate_cats + i] : 0;
++          if (rate_scalings[i] < site_scalings)
++            site_scalings = rate_scalings[i];
++        }
++
++        /* compute relative capped per-rate scalers */
++        for (i = 0; i < rate_cats; ++i)
++        {
++          rate_scalings[i] = CORAX_MIN(rate_scalings[i] - site_scalings,
++                                       CORAX_SCALE_RATE_MAXDIFF);
++        }
++      }
++      else
++      {
++        /* count number of scaling factors to account for */
++        site_scalings = (parent_scaler) ? parent_scaler[pid] : 0;
++        site_scalings += (child_scaler) ? child_scaler[cid] : 0;
++      }
++
++      for (i = 0; i < rate_cats; ++i)
++      {
++        freqs   = rate_freqs[i];
++        terma_r = 0;
++
++        /* P * clvc: each product is an FMA into a zeroed accumulator */
++        xmm0 = corax_matvec_cols_4x4_fma0_avx(pcol + 4 * i, clvc);
++
++        /* multiply with frequencies */
++        xmm1 = _mm256_load_pd(freqs);
++        xmm2 = _mm256_mul_pd(xmm0, xmm1);
++
++        /* multiply with clvp */
++        xmm0 = _mm256_load_pd(clvp);
++        xmm1 = _mm256_mul_pd(xmm2, xmm0);
++
++        /* add up the elements of xmm1 */
++        xmm0 = _mm256_hadd_pd(xmm1, xmm1);
++        terma_r += ((double *)&xmm0)[0] + ((double *)&xmm0)[2];
++
++        clvp += states_padded;
++
++        if (sitecat_lh != NULL) {
++          *sitecat_lh = terma_r;
++          ++sitecat_lh;
++        }
++
++        /* apply per-rate scalers, if necessary */
++        if (rate_scalings && rate_scalings[i] > 0)
++        {
++          terma_r *= scale_minlh[rate_scalings[i] - 1];
++        }
++
++        /* account for invariant sites */
++        prop_invar = rate_pinv[i];
++        if (prop_invar > 0)
++        {
++          terma += rate_weights[i] * terma_r * (1. - prop_invar);
++          if (invar_indices[n] != -1)
++          {
++            freqs       = rate_freqs[i];
++            inv_site_lk = freqs[invar_indices[n]];
++            terminv += rate_weights[i] * inv_site_lk * prop_invar;
++          }
++        }
++        else
++        {
++          terma += terma_r * rate_weights[i];
++        }
++
++        clvc += states_padded;
++      }
++
++      chunk_terma[n - chunk_start]    = terma;
++      chunk_terminv[n - chunk_start]  = terminv;
++      chunk_scalings[n - chunk_start] = site_scalings;
++    }
++
++    for (n = chunk_start; n < chunk_end; ++n)
++    {
++      terma         = chunk_terma[n - chunk_start];
++      terminv       = chunk_terminv[n - chunk_start];
++      site_scalings = chunk_scalings[n - chunk_start];
++
++      /* compute site log-likelihood and scale if necessary */
++      if (site_scalings)
++      {
++        if (terminv > 0.)
++        {
++          /* IMPORTANT: undoing the scaling for non-variant likelihood term
++           * only! */
++          unsigned int capped_scalings =
++              CORAX_MIN(site_scalings, CORAX_SCALE_RATE_MAXDIFF);
++          double scale_factor = scale_minlh[capped_scalings - 1];
++          site_lk             = log(terma * scale_factor + terminv);
++        }
++        else
++        {
++          site_lk = log(terma);
++          site_lk += site_scalings * log(CORAX_SCALE_THRESHOLD);
++        }
++      }
++      else
++      {
++        site_lk = log(terma + terminv);
++      }
++
++      site_lk *= pattern_weights[n];
++
++      /* store per-site log-likelihood */
++      if (persite_lnl) persite_lnl[n] = site_lk;
++
++      logl += site_lk;
++    }
++  }
++#undef EDGE_4X4_CHUNK
++
++  if (rate_scalings) free(rate_scalings);
++
++  return logl;
++}
++
+ CORAX_EXPORT
+ double corax_core_edge_loglikelihood_repeats_generic_avx2(
+     unsigned int         states,
+@@ -715,6 +948,27 @@ double corax_core_edge_loglikelihood_repeats_generic_avx2(
+ {
+   CORAX_UNUSED(child_sites);
+   CORAX_UNUSED(bclv);
++
++  if (states == 4)
++    return edge_loglikelihood_repeats_4x4_avx2(sites,
++                                               rate_cats,
++                                               parent_clv,
++                                               parent_scaler,
++                                               child_clv,
++                                               child_scaler,
++                                               pmatrix,
++                                               frequencies,
++                                               rate_weights,
++                                               pattern_weights,
++                                               invar_proportion,
++                                               invar_indices,
++                                               freqs_indices,
++                                               persite_lnl,
++                                               sitecat_lh,
++                                               parent_site_id,
++                                               child_site_id,
++                                               attrib);
++
+   unsigned int n, i, j, k;
+   double       logl       = 0;
+   double       prop_invar = 0;
+-- 
+2.43.0
+
+
+From 236046f7ab195e1d037f8f1da059781539b23327 Mon Sep 17 00:00:00 2001
+From: Alan Rockefeller <alanrockefeller@gmail.com>
+Date: Fri, 9 Oct 2026 06:02:56 +0000
+Subject: [PATCH 7/7] AVX2 branch-length derivatives: 4-state fast path
+
+corax_core_likelihood_derivatives_avx2() (~20% of a run) had two problems
+for DNA. It was load-bound -- per site and rate category four broadcasts of
+the sumtable and four loads of the diagptable, which is the same for every
+site -- and every fourth site waited on a dependent chain: scalar loads of
+the four just-stored site vectors (a store-forwarding stall), a 4-wide
+division and the accumulation.
+
+The 4-state path now works in chunks of 64 sites: first every site's
+(LH, 1st, 2nd derivative) terms, two adjacent sites at a time sharing the
+diagptable vectors (pinned in registers: otherwise gcc folds each load into
+both sites' FMAs), then the derivative steps of the chunk back to back,
+with the four site vectors read whole and transposed in registers. The
+invariant-site table is on the stack instead of an aligned allocation on
+every Newton iteration (+I models).
+
+Exactness: each site goes through exactly the operations of the one-site
+loop in the same order; chunks are multiples of 4, so the groups for the
+derivative step are the same, and they are accumulated in the same order;
+the remainder loop is unchanged. Harness: 6000 random cases (4 and 20
+states, odd and even site counts, invariant sites, unequal rate weights,
+pattern weights): first and second derivative identical bit for bit.
+~1.5x faster per call.
+
+Co-authored-by: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/corax/kernel/avx2/core_derivatives_avx2.c | 213 ++++++++++++++----
+ 1 file changed, 171 insertions(+), 42 deletions(-)
+
+diff --git a/src/corax/kernel/avx2/core_derivatives_avx2.c b/src/corax/kernel/avx2/core_derivatives_avx2.c
+index ebba3ce..c297a62 100644
+--- a/src/corax/kernel/avx2/core_derivatives_avx2.c
++++ b/src/corax/kernel/avx2/core_derivatives_avx2.c
+@@ -1536,6 +1536,52 @@ corax_core_update_sumtable_ti_avx2(unsigned int         states,
+   return CORAX_SUCCESS;
+ }
+ 
++/* Derivative step for 4 adjacent sites whose (LH, 1st, 2nd derivative)
++ * terms are stored at site_lk[0..15], 4 per site; pw points at the pattern
++ * weight of the first of the 4 sites. */
++static inline void derivatives_4sites_avx2(const double *      site_lk,
++                                           const unsigned int *pw,
++                                           __m256d             v_all1,
++                                           __m256d *           v_df,
++                                           __m256d *           v_ddf)
++{
++  /* v_termK = (site_lk[K], site_lk[4+K], site_lk[8+K], site_lk[12+K]):
++   * a 4x4 transpose of the four stored site vectors, read back whole
++   * (assembling them from scalar loads of just-stored vectors stalls on
++   * store forwarding) */
++  __m256d s0      = _mm256_load_pd(site_lk);
++  __m256d s1      = _mm256_load_pd(site_lk + 4);
++  __m256d s2      = _mm256_load_pd(site_lk + 8);
++  __m256d s3      = _mm256_load_pd(site_lk + 12);
++  __m256d t0      = _mm256_unpacklo_pd(s0, s1);
++  __m256d t1      = _mm256_unpackhi_pd(s0, s1);
++  __m256d t2      = _mm256_unpacklo_pd(s2, s3);
++  __m256d t3      = _mm256_unpackhi_pd(s2, s3);
++  __m256d v_term0 = _mm256_permute2f128_pd(t0, t2, 0x20);
++  __m256d v_term1 = _mm256_permute2f128_pd(t1, t3, 0x20);
++  __m256d v_term2 = _mm256_permute2f128_pd(t0, t2, 0x31);
++
++  __m256d v_recip0 = _mm256_div_pd(v_all1, v_term0);
++  __m256d v_deriv1 = _mm256_mul_pd(v_term1, v_recip0);
++  __m256d v_deriv2 = _mm256_sub_pd(_mm256_mul_pd(v_deriv1, v_deriv1),
++                                   _mm256_mul_pd(v_term2, v_recip0));
++
++  /* assumption: no zero weights */
++  if ((pw[0] | pw[1] | pw[2] | pw[3]) == 1)
++  {
++    /* all 4 weights are 1 -> no multiplication needed */
++    *v_df  = _mm256_sub_pd(*v_df, v_deriv1);
++    *v_ddf = _mm256_add_pd(*v_ddf, v_deriv2);
++  }
++  else
++  {
++    __m256d v_patw = _mm256_setr_pd(pw[0], pw[1], pw[2], pw[3]);
++
++    *v_df  = _mm256_fnmadd_pd(v_deriv1, v_patw, *v_df);
++    *v_ddf = _mm256_fmadd_pd(v_deriv2, v_patw, *v_ddf);
++  }
++}
++
+ CORAX_EXPORT
+ int corax_core_likelihood_derivatives_avx2(unsigned int        states,
+                                            unsigned int        states_padded,
+@@ -1570,17 +1616,12 @@ int corax_core_likelihood_derivatives_avx2(unsigned int        states,
+     eq_weights &= (rate_weights[i] == rate_weights[0]);
+   }
+ 
++  /* invariant site likelihoods: small, on the stack (this runs once per
++   * Newton iteration) */
++  double invar_lk_buf[use_pinv ? rate_cats * states : 1];
+   if (use_pinv)
+   {
+-    invar_lk = (double *)corax_aligned_alloc(
+-        rate_cats * states * sizeof(double), CORAX_ALIGNMENT_AVX);
+-
+-    if (!invar_lk)
+-    {
+-      corax_set_error(CORAX_ERROR_MEM_ALLOC,
+-                      "Unable to allocate enough memory.");
+-      return CORAX_FAILURE;
+-    }
++    invar_lk = invar_lk_buf;
+ 
+     /* pre-compute invariant site likelihoods*/
+     for (i = 0; i < states; ++i)
+@@ -1634,7 +1675,125 @@ int corax_core_likelihood_derivatives_avx2(unsigned int        states,
+   const double *sum           = sumtable;
+   const int *   invariant_ptr = invariant;
+   unsigned int  offset        = 0;
+-  for (n = 0; n < ef_sites; ++n)
++  n                           = 0;
++
++  if (states == 4)
++  {
++    /* Sites are processed in chunks of DERIV_4X4_CHUNK (a multiple of 4, so
++     * the groups of 4 sites for the derivative step are the same as in the
++     * one-site loop below). First every site's (LH, 1st, 2nd derivative)
++     * terms, two adjacent sites at a time sharing the diagptable loads; then
++     * the derivative steps of the chunk, in site order, back to back. Each
++     * site and each group goes through exactly the operations of the
++     * one-site loop. */
++#define DERIV_4X4_CHUNK 64
++    double chunk_lk[4 * DERIV_4X4_CHUNK]
++        __attribute__((aligned(CORAX_ALIGNMENT_AVX)));
++    const unsigned int span4 = 4 * rate_cats;
++
++    while (n < ef_sites)
++    {
++      const unsigned int chunk_n = CORAX_MIN(DERIV_4X4_CHUNK, ef_sites - n);
++      unsigned int       c;
++
++      for (c = 0; c < chunk_n; c += 2)
++      {
++        /* the second site of the last pair may not exist (odd count) */
++        const int     pair  = (c + 1 < chunk_n);
++        const double *diagp = diagp_start;
++        const double *sum_a = sum;
++        const double *sum_b = pair ? sum + span4 : sum;
++        const int     inv_a = invariant ? invariant_ptr[0] : -1;
++        const int     inv_b = (invariant && pair) ? invariant_ptr[1] : -1;
++
++        __m256d v_sitelk_a = _mm256_setzero_pd();
++        __m256d v_sitelk_b = _mm256_setzero_pd();
++        for (i = 0; i < rate_cats; ++i)
++        {
++          __m256d v_diagp0 = _mm256_load_pd(diagp);
++          __m256d v_diagp1 = _mm256_load_pd(diagp + 4);
++          __m256d v_diagp2 = _mm256_load_pd(diagp + 8);
++          __m256d v_diagp3 = _mm256_load_pd(diagp + 12);
++          /* keep them in registers: otherwise the compiler folds each load
++           * into both sites' FMAs and nothing is shared */
++          __asm__("" : "+x"(v_diagp0), "+x"(v_diagp1), "+x"(v_diagp2), "+x"(v_diagp3));
++
++          __m256d v_cat_a = _mm256_setzero_pd();
++          __m256d v_cat_b = _mm256_setzero_pd();
++          v_cat_a = _mm256_fmadd_pd(_mm256_set1_pd(sum_a[0]), v_diagp0, v_cat_a);
++          v_cat_b = _mm256_fmadd_pd(_mm256_set1_pd(sum_b[0]), v_diagp0, v_cat_b);
++          v_cat_a = _mm256_fmadd_pd(_mm256_set1_pd(sum_a[1]), v_diagp1, v_cat_a);
++          v_cat_b = _mm256_fmadd_pd(_mm256_set1_pd(sum_b[1]), v_diagp1, v_cat_b);
++          v_cat_a = _mm256_fmadd_pd(_mm256_set1_pd(sum_a[2]), v_diagp2, v_cat_a);
++          v_cat_b = _mm256_fmadd_pd(_mm256_set1_pd(sum_b[2]), v_diagp2, v_cat_b);
++          v_cat_a = _mm256_fmadd_pd(_mm256_set1_pd(sum_a[3]), v_diagp3, v_cat_a);
++          v_cat_b = _mm256_fmadd_pd(_mm256_set1_pd(sum_b[3]), v_diagp3, v_cat_b);
++
++          diagp += 16;
++          sum_a += 4;
++          sum_b += 4;
++
++          /* account for invariant sites */
++          if (use_pinv && prop_invar[i] > 0)
++          {
++            __m256d v_inv_prop = _mm256_set1_pd(1. - prop_invar[i]);
++            v_cat_a            = _mm256_mul_pd(v_cat_a, v_inv_prop);
++            v_cat_b            = _mm256_mul_pd(v_cat_b, v_inv_prop);
++
++            if (inv_a != -1)
++            {
++              double site_invar_lk = invar_lk[inv_a * rate_cats + i];
++              v_cat_a              = _mm256_add_pd(
++                  v_cat_a, _mm256_setr_pd(site_invar_lk, 0., 0., 0.));
++            }
++            if (inv_b != -1)
++            {
++              double site_invar_lk = invar_lk[inv_b * rate_cats + i];
++              v_cat_b              = _mm256_add_pd(
++                  v_cat_b, _mm256_setr_pd(site_invar_lk, 0., 0., 0.));
++            }
++          }
++
++          /* apply rate category weights */
++          if (eq_weights)
++          {
++            v_sitelk_a = _mm256_add_pd(v_sitelk_a, v_cat_a);
++            v_sitelk_b = _mm256_add_pd(v_sitelk_b, v_cat_b);
++          }
++          else
++          {
++            __m256d v_weight = _mm256_set1_pd(rate_weights[i]);
++            v_sitelk_a       = _mm256_fmadd_pd(v_cat_a, v_weight, v_sitelk_a);
++            v_sitelk_b       = _mm256_fmadd_pd(v_cat_b, v_weight, v_sitelk_b);
++          }
++        }
++
++        _mm256_store_pd(&chunk_lk[4 * c], v_sitelk_a);
++        if (pair) _mm256_store_pd(&chunk_lk[4 * (c + 1)], v_sitelk_b);
++
++        sum += pair ? 2 * span4 : span4;
++        invariant_ptr += pair ? 2 : 1;
++      }
++
++      /* derivative steps for the complete groups of 4 sites */
++      const unsigned int groups = chunk_n / 4;
++      unsigned int       g;
++      for (g = 0; g < groups; ++g)
++        derivatives_4sites_avx2(
++            chunk_lk + 16 * g, pattern_weights + n + 4 * g, v_all1, &v_df, &v_ddf);
++
++      /* the last 1-3 sites (only in the last chunk) are left for the
++       * remainder loop, exactly as the one-site loop leaves them */
++      offset = 4 * (chunk_n - 4 * groups);
++      memcpy(site_lk, chunk_lk + 16 * groups, offset * sizeof(double));
++
++      n += chunk_n;
++    }
++#undef DERIV_4X4_CHUNK
++  }
++
++  /* one site per iteration: states != 4, and the last site of an odd count */
++  for (; n < ef_sites; ++n)
+   {
+     const double *diagp = diagp_start;
+ 
+@@ -1748,37 +1907,8 @@ int corax_core_likelihood_derivatives_avx2(unsigned int        states,
+     /* build derivatives for 4 adjacent sites at once */
+     if (offset == 16)
+     {
+-      __m256d v_term0 =
+-          _mm256_setr_pd(site_lk[0], site_lk[4], site_lk[8], site_lk[12]);
+-      __m256d v_term1 =
+-          _mm256_setr_pd(site_lk[1], site_lk[5], site_lk[9], site_lk[13]);
+-      __m256d v_term2 =
+-          _mm256_setr_pd(site_lk[2], site_lk[6], site_lk[10], site_lk[14]);
+-
+-      __m256d v_recip0 = _mm256_div_pd(v_all1, v_term0);
+-      __m256d v_deriv1 = _mm256_mul_pd(v_term1, v_recip0);
+-      __m256d v_deriv2 = _mm256_sub_pd(_mm256_mul_pd(v_deriv1, v_deriv1),
+-                                       _mm256_mul_pd(v_term2, v_recip0));
+-
+-      /* assumption: no zero weights */
+-      if ((pattern_weights[n - 3] | pattern_weights[n - 2]
+-           | pattern_weights[n - 1] | pattern_weights[n])
+-          == 1)
+-      {
+-        /* all 4 weights are 1 -> no multiplication needed */
+-        v_df  = _mm256_sub_pd(v_df, v_deriv1);
+-        v_ddf = _mm256_add_pd(v_ddf, v_deriv2);
+-      }
+-      else
+-      {
+-        __m256d v_patw = _mm256_setr_pd(pattern_weights[n - 3],
+-                                        pattern_weights[n - 2],
+-                                        pattern_weights[n - 1],
+-                                        pattern_weights[n]);
+-
+-        v_df  = _mm256_fnmadd_pd(v_deriv1, v_patw, v_df);
+-        v_ddf = _mm256_fmadd_pd(v_deriv2, v_patw, v_ddf);
+-      }
++      derivatives_4sites_avx2(site_lk, pattern_weights + n - 3, v_all1, &v_df,
++                              &v_ddf);
+       offset = 0;
+     }
+   }
+@@ -1807,7 +1937,6 @@ int corax_core_likelihood_derivatives_avx2(unsigned int        states,
+   *dd_f += site_lk[0] + site_lk[1] + site_lk[2] + site_lk[3];
+ 
+   if (t_diagp) corax_aligned_free(t_diagp);
+-  if (invar_lk) corax_aligned_free(invar_lk);
+ 
+   return CORAX_SUCCESS;
+ }
+-- 
+2.43.0
+

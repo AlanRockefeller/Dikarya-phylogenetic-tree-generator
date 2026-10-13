@@ -35,3 +35,15 @@ repeat-string, and DOMPurify. Their copyright/license notices and the exact
 Swagger dependency manifest are linked from
 `swagger-ui-bundle.js.LICENSE.txt`; the standalone-preset companion does the
 same for its bundle. No upstream JavaScript was changed.
+
+## Additional self-hosted fonts (2026-10-05)
+
+The following font files were downloaded from Google Fonts CSS and `fonts.gstatic.com`, preserving the previously requested styles and weights. The local wrappers use `font-display: swap`.
+
+| Family | Local files | License and upstream |
+|---|---|---|
+| Cormorant Garamond | `webfonts/cormorant-garamond/*.ttf` | SIL OFL 1.1; see `licenses/cormorantgaramond-OFL.txt`, including copyright and reserved-name notices. [Google Fonts source](https://github.com/google/fonts/tree/main/ofl/cormorantgaramond). |
+| IBM Plex Sans | `webfonts/ibm-plex-sans/*.ttf` | SIL OFL 1.1; see `licenses/ibmplexsans-OFL.txt`, including copyright and reserved-name notices. [Google Fonts source](https://github.com/google/fonts/tree/main/ofl/ibmplexsans). |
+| IBM Plex Mono | `webfonts/ibm-plex-mono/*.ttf` | SIL OFL 1.1; see `licenses/ibmplexmono-OFL.txt`, including copyright and reserved-name notices. [Google Fonts source](https://github.com/google/fonts/tree/main/ofl/ibmplexmono). |
+| JetBrains Mono | `webfonts/jetbrains-mono/*.ttf` | SIL OFL 1.1; see `licenses/jetbrainsmono-OFL.txt`, including copyright and reserved-name notices. [Google Fonts source](https://github.com/google/fonts/tree/main/ofl/jetbrainsmono). |
+| Libre Baskerville | `webfonts/libre-baskerville/*.ttf` | SIL OFL 1.1; see `licenses/librebaskerville-OFL.txt`, including copyright and reserved-name notices. [Google Fonts source](https://github.com/google/fonts/tree/main/ofl/librebaskerville). |

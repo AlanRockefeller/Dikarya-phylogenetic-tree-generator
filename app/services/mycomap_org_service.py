@@ -1,5 +1,6 @@
 """Read public MycoMap.org BLAST results without following user supplied URLs."""
 
+import hashlib
 import json
 import logging
 import os
@@ -14,11 +15,14 @@ from app.services.fasta_utils import is_genbank_accession, parse_fasta_records
 
 logger = logging.getLogger(__name__)
 ORG_API = "https://mycomap.org/api/mycoblast"
+ORG_API_ROOT = "https://mycomap.org/api"
 MAX_XML_BYTES = 16 * 1024 * 1024
 MAX_JSON_BYTES = 2 * 1024 * 1024
 NCBI_BATCH_SIZE = 50
 _JOB_LINK = re.compile(r"(?:/|%2F)(\d+)(?:/?$|[?&#])", re.I)
 _LOCAL_XML_ID = re.compile(r"/local_(\d+)_xml\.", re.I)
+# The rerun endpoint accepts only these hit counts (MycoMap.org PR #9).
+RERUN_MAX_HITS = (50, 100, 250, 500)
 
 
 class OrgResultError(Exception):
@@ -45,9 +49,10 @@ def deferral_details(exc):
 
 
 def _read(path, *, limit=MAX_JSON_BYTES, method="GET", body=None,
-          authenticated=False, deadline=None):
+          authenticated=False, deadline=None, timeout=15):
     """Only fixed API paths are accepted; no URL from a result is fetched."""
-    if not re.fullmatch(r"[a-z0-9/?=&,_-]+", path, re.I) or ".." in path:
+    # ":" is for observation references (inat:123) in a query string.
+    if not re.fullmatch(r"[a-z0-9/?=&,:_-]+", path, re.I) or ".." in path:
         raise OrgResultError("Invalid MycoMap API path.", 400)
     headers = {
         "Accept": "application/json" if limit == MAX_JSON_BYTES else "application/xml",
@@ -60,21 +65,58 @@ def _read(path, *, limit=MAX_JSON_BYTES, method="GET", body=None,
         if not key:
             raise OrgResultError("MycoMap.org rerun key is not configured.", 502,
                                  retryable=False)
-        headers["Authorization"] = f"Bearer {key}"
-    base = "https://mycomap.org/api" if path.startswith("mycomap/sequences/batch?") else ORG_API
+        # Alan 10/7/26 - MycoMap.org reads an API key only from X-API-Key, raw,
+        # with no "Bearer " prefix. Authorization: Bearer there carries mobile-app
+        # tokens, so a key sent that way is treated as anonymous -- which is why
+        # every rerun since the integration was written answered 401. (The
+        # rerun route itself also took session cookies only until MycoMap.org
+        # PR #9 moved it to requireAuthOrApiKey.)
+        headers["X-API-Key"] = key
+    base = ORG_API_ROOT if path.startswith(("mycomap/", "admin/")) else ORG_API
     request = urllib.request.Request(
         f"{base}/{path}",
         data=json.dumps(body).encode() if body is not None else None,
         headers=headers,
         method=method,
     )
-    timeout = 15 if deadline is None else min(15, deadline - time.monotonic())
+    if deadline is not None:
+        timeout = min(timeout, deadline - time.monotonic())
     if timeout <= 0:
         raise OrgResultError("MycoMap.org request timed out.")
     try:
         with diagnostic_urlopen(request, timeout=timeout) as response:
             data = response.read(limit + 1)
     except urllib.error.HTTPError as exc:
+        # Alan 10/7/26 - A 401/403 is a refusal, not an outage. It used to fall
+        # into the generic retryable 502 below, so the user was told MycoMap
+        # "could not complete the BLAST request" and an NCBI rebuild would sit
+        # in the mycomap_unavailable wait loop on a credential that will never
+        # start working. Name it, and do not retry it.
+        if exc.code == 429:
+            # 10 reruns per 10 minutes per key owner, and every Dikarya user shares
+            # this one key. A wait clears it, so make it the retryable 502 the
+            # worker already waits out (deferral_details) rather than a refusal.
+            retry_after = (exc.headers.get("Retry-After") if exc.headers else None) or ""
+            logger.warning("event=mycomap_org.rate_limited path=%s retry_after=%s",
+                           path.split("?", 1)[0], retry_after.strip()[:10] or "-")
+            raise OrgResultError(
+                "MycoMap.org's rerun limit was reached; Dikarya will try again shortly.",
+                502,
+            ) from exc
+        if exc.code in (401, 403):
+            if authenticated:
+                logger.error(
+                    "event=mycomap_org.auth_refused status=%s path=%s "
+                    "key_env=MYCOMAP_ORG_API_KEY key_len=%s key_sha256=%s",
+                    exc.code, path.split("?", 1)[0], len(key),
+                    hashlib.sha256(key.encode()).hexdigest()[:12],
+                )
+                message = (f"MycoMap.org did not accept Dikarya's access key "
+                           f"(HTTP {exc.code}).")
+            else:
+                message = (f"MycoMap.org refused access to this BLAST result "
+                           f"(HTTP {exc.code}).")
+            raise OrgResultError(message, 502, retryable=False) from exc
         raise OrgResultError(
             "MycoMap.org has no matching BLAST result." if exc.code == 404
             else "MycoMap.org could not complete the BLAST request.",
@@ -124,32 +166,62 @@ def status(result_id):
 
 
 def rerun_pending(details):
-    """Check requested rerun sources against the saved pre-rerun XML dates."""
+    """Check requested rerun sources against the saved pre-rerun XML dates.
+
+    Every source is checked on each call, and its state is recorded in
+    ``details["org_source_states"]`` ("running", "done" or "failed") so a
+    caller can report a local rerun that finished while NCBI is still running.
+    """
     sources = list(details.get("org_wait_sources") or [])
     if not sources:
         return False
     record = status(str(details["result_id"]))
     before = details.get("org_before_dates") or {}
+    states = details.setdefault("org_source_states", {})
+    pending = False
     for source in sources:
         current = record.get(source) or {}
         state = current.get("status")
         if state in {"queued", "pending", "running", "processing"}:
-            return True
+            states[source] = "running"
+            pending = True
+            continue
         if state in {"failed", "error"} or not current.get("has_results"):
             if source == "ncbi":
+                states[source] = "failed"
                 raise OrgResultError("MycoMap.org NCBI rerun finished without results.",
                                      retryable=False)
-            details.setdefault("warnings", []).append(
-                "MycoMap.org local rerun did not finish; using any saved local results."
-            )
-            details["local_status"] = "failed"
+            if details.get("local_status") != "failed":
+                details.setdefault("warnings", []).append(
+                    "MycoMap.org local rerun did not finish; using any saved local results."
+                )
+                details["local_status"] = "failed"
+            states[source] = "failed"
             continue
         old_date = before.get(source)
         if old_date and current.get("xml_date") == old_date:
-            return True
+            states[source] = "running"
+            pending = True
+            continue
         details[f"{source}_status"] = "available" if source == "ncbi" else "completed"
+        states[source] = "done"
+    if pending:
+        return True
     details["org_wait_sources"] = []
     return False
+
+
+def rerun_max_hits(limit):
+    """The smallest hit count MycoMap.org accepts that covers ``limit``.
+
+    Dikarya lets a user ask for 1-500 hits; the rerun endpoint takes only
+    RERUN_MAX_HITS, so round up rather than return fewer than were asked for.
+    """
+    try:
+        wanted = int(limit)
+    except (TypeError, ValueError):
+        wanted = RERUN_MAX_HITS[0]
+    return next((n for n in RERUN_MAX_HITS if n >= wanted), RERUN_MAX_HITS[-1])
 
 
 def rerun(result_id, result_type, limit):
@@ -158,7 +230,8 @@ def rerun(result_id, result_type, limit):
     try:
         result = json.loads(_read(
             "rerun", method="POST",
-            body={"id": int(result_id), "type": result_type, "limit": int(limit)},
+            body={"sequenceId": int(result_id), "rerunType": result_type,
+                  "maxHits": rerun_max_hits(limit)},
             authenticated=True,
         ))
     except (ValueError, UnicodeDecodeError) as exc:
@@ -329,6 +402,178 @@ def _ncbi_sequences(accessions, *, deadline=None):
     return sequences, unchecked
 
 
+CURATION_BATCH_SIZE = 100
+# The GenBank qualifiers that end the organism at the start of a defline, as in
+# "Geoglossum sp. SA-2022a voucher AMI-SPL642 small subunit ...".
+_DEFLINE_QUALIFIER = re.compile(
+    r"\s(?:voucher|isolate|strain|culture|clone|specimen|haplotype|"
+    r"culture-collection|cultivar|genotype|from)\s", re.I)
+
+
+def _curated_genbank_names(accessions, *, deadline=None):
+    """MycoMap's curated name for each GenBank accession, keyed by accession.
+
+    POST mycoblast/genbank-curation is public and is what MycoMap.org's own
+    BLAST page labels NCBI hits with: curators rename GenBank records there
+    (OM691497 "Geoglossum sp. SA-2022a" -> "Geoglossum laurisilvae") without
+    GenBank changing. Best effort -- on failure the GenBank names stand.
+    """
+    names = {}
+    unique = list(dict.fromkeys(a for a in accessions if a))
+    for offset in range(0, len(unique), CURATION_BATCH_SIZE):
+        batch = unique[offset:offset + CURATION_BATCH_SIZE]
+        try:
+            payload = json.loads(_read("genbank-curation", method="POST",
+                                       body={"accessions": batch}, deadline=deadline))
+        except (OrgResultError, ValueError, UnicodeDecodeError):
+            logger.warning("event=mycomap_org.genbank_curation_unavailable count=%s",
+                           len(batch), exc_info=True)
+            break
+        results = payload.get("results") if isinstance(payload, dict) else None
+        for key, row in (results or {}).items():
+            name = str((row or {}).get("scientificName") or "").strip() if isinstance(row, dict) else ""
+            if name:
+                names[str(key).upper().split(".")[0]] = name
+    return names
+
+
+# The organism at the start of a GenBank label: a genus (or "uncultured X"),
+# optionally sp./cf./aff./nr. and one epithet or quoted provisional name, and an
+# optional infraspecific rank. Deliberately stops there, so a voucher written
+# straight after the name ("Geoglossum squamulosum SAV F-11677") is not taken
+# for part of it and dropped.
+_LABEL_ORGANISM = re.compile(r"""
+    ^(?:[Uu]ncultured\s+)?[A-Z][A-Za-z]+(?:-[a-z]+)?
+    (?:
+        \s+(?:sp|cf|aff|nr)\.(?:\s+(?:'[^']*'|"[^"]*"|\S+))?
+      | \s+(?:'[^']*'|"[^"]*"|[a-z][a-z-]*)
+    )?
+    (?:\s+(?:var|subsp|f)\.\s+[a-z][a-z-]*)?
+""", re.X)
+
+
+def apply_curated_genbank_name(display_name, accession, curated_name):
+    """Swap the GenBank organism in an NCBI hit label for MycoMap's curated name.
+
+    A curated name is trusted even when it moves the record to another genus:
+    someone who went to the trouble of curating it is probably right. Returns
+    the new label, or None when the label already carries that name or does not
+    visibly begin with an organism (the GenBank label is then kept).
+    """
+    curated = " ".join(str(curated_name or "").split())
+    prefix = f"{accession} "
+    if not curated or not display_name.startswith(prefix):
+        return None
+    body = display_name[len(prefix):]
+    qualifier = _DEFLINE_QUALIFIER.search(f" {body} ")
+    head = body[:max(qualifier.start() - 1, 0)] if qualifier else body
+    match = _LABEL_ORGANISM.match(head)
+    if not match:
+        return None
+    organism = match.group(0)
+    if organism.casefold() == curated.casefold():
+        return None
+    return f"{accession} {curated}{body[len(organism):]}".strip()
+
+
+REFRESH_REQUEST_TIMEOUT = 45
+REFRESH_BUDGET_SECONDS = 150
+REFRESH_WORKERS = 3
+OBSERVATION_BATCH_SIZE = 50
+
+
+def observation_records(references, *, deadline=None):
+    """The name and location MycoMap.org holds for each inat:/mo: reference.
+
+    sequences/batch?observations= is public and returns one row per sequence,
+    so an observation with several sequences comes back several times; the
+    lowest sequence id wins, so a before/after pair always compares one row.
+    """
+    rows = []
+    for offset in range(0, len(references), OBSERVATION_BATCH_SIZE):
+        query = ",".join(references[offset:offset + OBSERVATION_BATCH_SIZE])
+        payload = _json(f"mycomap/sequences/batch?observations={query}", deadline=deadline)
+        rows.extend(row for row in payload.get("sequences") or [] if isinstance(row, dict))
+    rows.sort(key=lambda row: _number(row.get("id")))
+    by_reference = {}
+    for row in rows:
+        for prefix, key in (("inat", "inatObservationId"), ("mo", "moObservationId")):
+            value = str(row.get(key) or "").strip()
+            if value.isdigit():
+                by_reference.setdefault(f"{prefix}:{value}", row)
+    summaries = {}
+    for reference in references:
+        row = by_reference.get(reference)
+        summaries[reference] = {
+            "found": row is not None,
+            "scientific_name": str((row or {}).get("scientificName") or "").strip(),
+            "location": _location(row) if row else "",
+        }
+    return summaries
+
+
+def _refresh_observation(reference, deadline):
+    return _read("admin/mycomap/refresh", method="POST", body={"observation": reference},
+                 authenticated=True, deadline=deadline, timeout=REFRESH_REQUEST_TIMEOUT)
+
+
+def refresh_observations(references):
+    """Refresh observations from their source, then sync them onto their sequences.
+
+    Mirrors MycoMap.org's own Refresh button: admin/mycomap/refresh pulls each
+    observation from iNaturalist or Mushroom Observer, and sync-batch copies the
+    refreshed name onto the observation's sequences -- which is where
+    sequences/batch, and so every Dikarya label, reads it from. Returns a list
+    of warnings; raises OrgResultError only when nothing could be refreshed.
+    """
+    from concurrent.futures import ThreadPoolExecutor
+
+    warnings = []
+    deadline = time.monotonic() + REFRESH_BUDGET_SECONDS
+    refused = None
+    failed = []
+    # The first call alone, so a refused key is reported once rather than by
+    # every worker thread at the same moment.
+    try:
+        _refresh_observation(references[0], deadline)
+    except OrgResultError as exc:
+        if exc.retryable:
+            failed.append(references[0])
+        else:
+            refused = exc
+    if refused is None and len(references) > 1:
+        def attempt(reference):
+            try:
+                _refresh_observation(reference, deadline)
+            except OrgResultError:
+                logger.warning("event=mycomap_org.refresh_failed reference=%s",
+                               reference, exc_info=True)
+                return reference
+            return None
+        with ThreadPoolExecutor(max_workers=REFRESH_WORKERS) as pool:
+            failed.extend(ref for ref in pool.map(attempt, references[1:]) if ref)
+    if refused is not None:
+        warnings.append(f"{refused} Names were synced from MycoMap's stored "
+                        "observations without re-reading iNaturalist or Mushroom Observer.")
+    elif failed:
+        warnings.append("MycoMap.org could not refresh " + ", ".join(failed[:10])
+                        + (" and others" if len(failed) > 10 else "")
+                        + " from the source site.")
+
+    try:
+        _read("sync-batch", method="POST",
+              body={"action": "sync", "observations": list(references)},
+              authenticated=True, deadline=time.monotonic() + REFRESH_REQUEST_TIMEOUT,
+              timeout=REFRESH_REQUEST_TIMEOUT)
+    except OrgResultError:
+        if refused is not None or len(failed) == len(references):
+            raise
+        logger.warning("event=mycomap_org.sync_failed count=%s", len(references), exc_info=True)
+        warnings.append("MycoMap.org refreshed the observations but could not update "
+                        "their sequence records, so some names may still be the old ones.")
+    return warnings
+
+
 def fetch_results(result_id, *, include_ncbi=True, include_local=True,
                   time_budget=None):
     """Return normalized hits and source state for the shared import pipeline."""
@@ -365,6 +610,7 @@ def fetch_results(result_id, *, include_ncbi=True, include_local=True,
         if source == "local":
             metadata = _local_metadata([h["id"] for h in hits if h["id"].isdigit()],
                                        deadline=deadline)
+            curated_names = {}
         else:
             metadata = {}
             ncbi_sequences, _unchecked = _ncbi_sequences(
@@ -385,6 +631,9 @@ def fetch_results(result_id, *, include_ncbi=True, include_local=True,
                 # The delayed reconciler retains available hits after its
                 # bounded retries rather than declaring NCBI complete.
                 result["failed_sources"].append(source)
+            curated_names = _curated_genbank_names(
+                [hit["accession"] for hit in hits if "full_sequence" in hit],
+                deadline=deadline)
         for hit in hits:
             item = metadata.get(hit["id"], {})
             accession = hit["accession"] if source == "ncbi" else ""
@@ -406,6 +655,10 @@ def fetch_results(result_id, *, include_ncbi=True, include_local=True,
                 described = describe_ncbi_hit(accession, raw_description)
                 taxon = taxon or described["taxon"]
                 name = described["display_name"]
+                curated = curated_names.get(accession.upper().split(".")[0])
+                curated_label = apply_curated_genbank_name(name, accession, curated)
+                if curated_label:
+                    name, taxon = curated_label, curated
             else:
                 name = f"{hit['id']} {observation_token} {taxon or hit['description']}"
             name = name.strip()

@@ -95,6 +95,7 @@ var/jobs/{job_id}/
        tree_pruned.{newick,nexus}
        tree_metadata.json
   logs/{pipeline,alignment,tree_builder}.log
+  social/preview.json, preview-<key>.png   link-preview cache (safe to delete)
 ```
 
 **`input_info.json["sequence"]` is not a duplicate of `input/input_raw.fasta`.**
@@ -532,6 +533,20 @@ When a new CLI version is published:
   `aligner_reversed_count=unknown` (never `0`, which would read as "reversed
   nothing"); and a `publish_command` failure records nothing, because MAFFT
   never started.
+- **`MAFFT_DEFAULT_STRATEGY` chooses the strategy for jobs that set none**:
+  `auto` (`--auto`, the default) or `linsi` (`--localpair --maxiterate 1000`
+  below `MAFFT_LINSI_MAX_SEQUENCES`=200 sequences with every sequence under
+  `MAFFT_LINSI_MAX_LENGTH`=3000 bp, `--auto` otherwise). `--auto` gives full
+  L-INS-i only below 100 sequences; at 100-199 it runs local-pair with 2
+  refinement rounds, and one sequence of 1,000 bp or more drops the whole job
+  to FFT-NS-i. Only enable `linsi` together with the opt5 MAFFT build at
+  `MAFFT_BINARY`; on stock MAFFT it roughly doubles alignment time. Every
+  `event=alignment.mafft_completed` line carries `strategy=`.
+  Separately, `MAFFT_LINSI_TREE_METHODS` (default
+  `iqtree,raxml,mrbayes,iqtree_fast`) gives full L-INS-i, within the same
+  limits, to jobs with those tree methods regardless of
+  `MAFFT_DEFAULT_STRATEGY`; FastTree and NJ keep `--auto`. The measurement behind it is in the comment in
+  `app/config.py`. Empty string turns it off.
 - **ORIENT-vs-MAFFT disagreement is header-matched, not count-matched.** MAFFT
   names the records it reversed through its `_R_` headers, so the disagreement
   is `flipped - orient_uncertain - orient_never_saw` over sets, published as
@@ -540,6 +555,18 @@ When a new CLI version is published:
   `DEGRADED`; a flip of a record ORIENT declined to call is an INFO line. When
   the ORIENT headers were not persisted the answer is reported as unknown
   (`disagreement=None`, `basis=counts`) rather than guessed from two totals.
+- **MAFFT's direction check is anchored on a confidently forward record.**
+  MAFFT keeps the first record's direction and turns the rest to match it.
+  When a job's first record was a reversed barcode ORIENT could not call, the
+  whole alignment came out reverse-complemented (14 jobs, e.g. y4y8, i7yl).
+  `_write_direction_anchored_input()` therefore hands MAFFT a scratch copy
+  (`input_raw.direction_anchor.fasta`, deleted afterwards) with the first
+  record ORIENT calls forward moved to the front. `_run_mafft` moves that row
+  back afterwards, so the output order is unchanged, and the line is logged as
+  `event=alignment.direction_anchor`. A job whose first record is already
+  forward, or that has no ITS landmark anywhere, runs exactly as before. ORIENT
+  itself also calls a record reverse on a strong reverse-strand 5.8S core when
+  the forward strand has no motif at all, without needing a primer-site flank.
 - **Quick Tree refuses individual sequences over
   `QUICK_TREE_MAX_SEQUENCE_BP` (10,000 bp).** The constant and the
   preset-detection live in `app/services/tree_parameter_validation.py`; the
@@ -590,6 +617,23 @@ When a new CLI version is published:
   `tree_analysis_service.py` and `tree_viewer_phylotree_v2.js`, and the tool
   regex in `security_events.py`. A non-fast run always pairs `-B` with
   `--bnni`, recorded as `bnni: true`.
+
+  `ops/iqtree/` holds an exact-speedup build, **3.1.4-dikarya1** (installed
+  into `/opt/iqtree-3.1.4-dikarya1` by `ops/iqtree/install-iqtree-dikarya.sh`,
+  selected by `IQTREE_BINARY`, which production points at since 2026-10-08):
+  the official 3.1.4 plus patches that skip
+  redundant work, with byte-identical results at `-T 1`. A job's
+  `logs/tree_builder.log` banner says which binary ran. Rebuild it only with
+  that script -- the release is clang 22 + static glibc, and a gcc build fuses
+  FMAs differently and does not reproduce it. `-T 2` runs are not reproducible
+  run to run in any build, stock included.
+
+  **IQ-TREE always runs with `-T 1`** (`IQTREE_THREADS` in
+  `tree_builder_service.py`), not the worker's `DIKARYA_WORKER_THREADS`
+  budget, which MAFFT, RAxML and MrBayes still use. On real production jobs a
+  second thread gained 1.02x on Quick Tree and cost ~20% on UFBoot (see
+  `ops/iqtree/README.md`), and one thread makes every tree reproducible from
+  its seed. Measure before raising it.
 - **RAxML-NG bootstrapping computes two support metrics, not one.**
   `_get_raxml_cmd` passes `--bs-metric fbp,tbe`, so RAxML writes
   `<prefix>.raxml.supportFBP` and `.supportTBE` and **no** bare
@@ -604,6 +648,26 @@ When a new CLI version is published:
   percentage (`93`) and TBE as a proportion (`0.930000`), so anything that ever
   displays the TBE tree must say which it is rather than reusing the bootstrap
   badge's reading.
+- **Link previews (Open Graph) for `/job/<id>/view` are server-rendered.**
+  `app/services/social_preview_service.py` supplies the page `<title>`
+  ("<Genus> phylogenetic tree — Dikarya", else "Phylogenetic tree — Dikarya"),
+  the fixed description and the og/twitter tags in `job_viewer.html`; crawlers
+  run no JavaScript, so never move these client-side. The og:image is
+  `/job/<id>/social-preview.png?v=<key>`: a 1200x630 Pillow drawing of the
+  actual tree around `sequence_of_interest` (resolved with
+  `resolve_sequence_of_interest()`, as the viewer does), at most ~22 tips --
+  whole sister groups while they fit, then nearest tips by patristic distance
+  (edge count without branch lengths), then one tip per deeper level as
+  context. It reads `tree_pruned.newick`/`tree_original.newick` and
+  `tree_state.json` read-only (it never creates state) and caches under
+  `var/jobs/<id>/social/`, keyed on those files' mtime/size plus
+  `RENDER_VERSION` -- bump that when the drawing or the selection changes. A
+  job it cannot draw gets the committed `static/img/social-preview-default.png`
+  (regenerate it with `render_generic_png()` if the look changes; a test pins
+  them equal). `robots.txt` has a link-preview-bot group that opens only the
+  view page and this image: Twitterbot honours robots.txt, so without it no
+  tree link showed a card on X. Inspect or redraw one job's card with
+  `scripts/dikarya_social_preview.py <job_id> [--out f.png | --force]`.
 - **Type-specimen tips are marked from two sources, by exact accession only.**
   `app/services/type_specimen_service.py` merges MycoMap's type list
   (`mycomap_type_specimens.json`, replaced weekly by
@@ -898,6 +962,13 @@ hits one missing job; nobody hits nine. One `WARNING`
 - **A new signal must define `free` deliberately.** `free=0` means "one
   occurrence is an attack", which is true of a honeytoken and false of almost
   everything else. Getting that wrong is how this becomes noise again.
+- **`route_breadth` and `health_scrape` count only for clients with no
+  browser evidence** (`BrowserWitness`). The evidence that reaches Flask in
+  production is `Sec-Fetch-Site: same-origin` on a request one of our pages
+  made: nginx serves `/static/` itself, so the static-asset check alone never
+  fired, and until 2026-10-08 those two signals escalated ordinary users,
+  the site owner included. Being logged in is deliberately *not* evidence --
+  accounts are free, and a script with one must still be scored.
 
 **`app/services/security_path_crowd.py` decides what is boring by counting who
 asks.** A path requested by ≥`DICTIONARY_CLIENTS` unrelated clients is sweep
@@ -978,7 +1049,15 @@ Three rules when editing this:
 The scanner path lists live in `security_events.py` and
 `scripts/dikarya_log_digest.py` imports them, so the digest's idea of noise and
 the app's cannot drift. The module is deliberately free of Flask imports to keep
-that import safe.
+that import safe. The lists alone cannot say which paths the app serves, so the
+app also writes its verdict into the access log: every request it files to
+`scanner.log` as scanner (and every missing-route limiter 429) is logged with
+`noise=scanner`, via the WSGI environ key `dikarya.noise` that
+`gunicorn.conf.py` reads, and the digest counts those as noise. Targeted
+`/api/` and `/admin/` probes are deliberately not marked, so a frontend call to
+a missing API route still shows as a product error. A real route must never be
+listed in `SCANNER_EXACT_PATHS`, or its users' 4xx are filed as noise (`/todo`
+and `/metrics` were, until 2026-10-08).
 
 **RQ's `cleaning registries for queue` heartbeat is filtered out** in
 `install_rq_logging()`. It was 400 of 834 lines in `worker.log` -- 48% of the
