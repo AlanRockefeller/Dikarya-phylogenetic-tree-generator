@@ -1,6 +1,6 @@
 from flask import (
     render_template, redirect, url_for, abort, request, current_app, flash,
-    jsonify, session, send_from_directory, Response,
+    jsonify, session, send_from_directory, send_file, Response,
 )
 from flask_login import current_user, login_required
 from jinja2 import TemplateNotFound
@@ -200,9 +200,36 @@ def _import_legacy_todos_if_needed():
     _LEGACY_TODOS_IMPORTED = True
 
 
+# Alan 10/7/26 - MycoMap links to /tree?mycomap_url=<blast url>&one_click=1 so
+# one click there starts the tree here. The page only fills in the URL and
+# waits for a click unless the visitor arrived from MycoMap itself: otherwise
+# any website could link visitors into running jobs. The Referer is set by the
+# visitor's browser, so another site cannot claim to be MycoMap; a missing
+# Referer (privacy settings, rel="noreferrer") just means one more click.
+MYCOMAP_REFERRER_HOSTS = frozenset({
+    "mycomap.org", "www.mycomap.org", "mycomap.com", "www.mycomap.com",
+})
+
+
+def _referred_by_mycomap():
+    from urllib.parse import urlsplit
+    try:
+        parts = urlsplit(request.referrer or "")
+    except ValueError:
+        return False
+    return parts.scheme == "https" and (parts.hostname or "") in MYCOMAP_REFERRER_HOSTS
+
+
 @bp.route('/tree')
 def sequence_entry():
-    return render_template('sequence_entry.html')
+    from app.services import background_requests
+    background_requests.ensure_session_owner()
+    return render_template(
+        'sequence_entry.html',
+        mycomap_one_click_allowed=(
+            request.args.get("one_click") == "1" and _referred_by_mycomap()
+        ),
+    )
 
 
 @bp.route('/inat.finder.py')
@@ -1065,6 +1092,7 @@ def job_viewer(job_id):
 
     return render_template(
         'job_viewer.html', job_id=job_id, job_details=job_details, view_only=view_only,
+        social=_job_social_meta(job_id, job_dir),
         type_specimens=type_specimens,
         dirty_reads=dirty_reads,
         claude_review_enabled=claude_review_enabled(),
@@ -1074,6 +1102,71 @@ def job_viewer(job_id):
         if db_job and isinstance(db_job.metrics, dict) else [],
         mycomap_ncbi_retry_available=mycomap_ncbi_retry_available,
     )
+
+
+def _job_social_meta(job_id, job_dir):
+    """Open Graph / Twitter card values for the viewer's <head>.
+
+    Server-rendered because link-preview crawlers do not run JavaScript. The
+    image URL carries the preview's cache key as ?v= so a crawler that caches
+    by URL refetches after the tree changes. Never raises: a job whose card
+    cannot be drawn gets the generic title and the site-wide image.
+    """
+    from app.services.social_preview_service import (
+        DEFAULT_IMAGE_STATIC_PATH, FALLBACK_TITLE, OVERVIEW_IMAGE_ALT,
+        PREVIEW_DESCRIPTION, PREVIEW_HEIGHT, PREVIEW_WIDTH, social_metadata,
+    )
+    try:
+        meta = social_metadata(job_dir)
+    except Exception:
+        logger.exception("Could not build social metadata for job %s", job_id)
+        meta = {"title": FALLBACK_TITLE, "description": PREVIEW_DESCRIPTION,
+                "has_preview": False, "version": None, "image_alt": OVERVIEW_IMAGE_ALT}
+    if meta.get("has_preview"):
+        image_url = url_for("main.job_social_preview", job_id=job_id, v=meta.get("version"),
+                            _external=True, _scheme="https")
+    else:
+        image_url = url_for("static", filename=DEFAULT_IMAGE_STATIC_PATH,
+                            _external=True, _scheme="https")
+    return {
+        **meta,
+        "url": url_for("main.job_viewer", job_id=job_id, _external=True, _scheme="https"),
+        "image_url": image_url,
+        "image_width": PREVIEW_WIDTH,
+        "image_height": PREVIEW_HEIGHT,
+    }
+
+
+@bp.route('/job/<job_id>/social-preview.png')
+@limiter.limit("120 per minute")
+def job_social_preview(job_id):
+    """The 1200x630 link-preview card for a job: public, cookie-free, no JS.
+
+    Drawn on first request and cached in the job directory until the tree or
+    its state changes (social_preview_service). A job whose card cannot be
+    drawn answers 200 with the site-wide image rather than a broken og:image.
+    """
+    _, error_msg, status_code = check_job_access(job_id, mode="view")
+    if error_msg:
+        abort(404 if status_code in (401, 403) else status_code)
+
+    from app.services.social_preview_service import generic_png, preview_png
+
+    try:
+        data, signature = preview_png(Config.JOB_DIR / job_id)
+    except Exception:
+        logger.exception("Could not render social preview for job %s", job_id)
+        data, signature = None, None
+    if data is None:
+        response = send_file(BytesIO(generic_png(current_app.static_folder)),
+                             mimetype="image/png", max_age=300)
+        response.headers["Cache-Control"] = "public, max-age=300"
+        return response
+    response = send_file(BytesIO(data), mimetype="image/png", etag=signature,
+                         max_age=3600, conditional=True)
+    response.headers["Cache-Control"] = "public, max-age=3600"
+    return response
+
 
 # /health moved to the monitoring blueprint (app/monitoring/routes.py) where
 # it does an actual DB + filesystem check. Keeping just one /health avoids

@@ -2149,64 +2149,6 @@ def _reference_from_api_record(record: dict) -> Optional[str]:
     return None
 
 
-def _summarize_mycomap_records(payload, references: list) -> dict:
-    """Map MycoMap sequence detail rows to the requested external references."""
-    rows = _mycomap_result_rows(payload)
-    mapped = {}
-    unresolved = []
-    wanted = set(references)
-    for row in rows:
-        reference = _reference_from_api_record(row)
-        if reference in wanted:
-            mapped.setdefault(reference, row)
-        else:
-            unresolved.append(row)
-
-    missing = [reference for reference in references if reference not in mapped]
-    # sequences/batch is queried with an explicit observation list, so a row we
-    # could not parse a reference out of is only safe to attribute when a single
-    # observation was requested and exactly one candidate row came back. Never
-    # guess by position across a multi-observation batch, and never override a
-    # reference that already matched: either would write another observation's
-    # taxon onto the tip label.
-    if len(references) == 1 and len(missing) == 1 and len(unresolved) == 1:
-        mapped[missing[0]] = unresolved[0]
-
-    summaries = {}
-    for reference in references:
-        record = mapped.get(reference)
-        if not record:
-            summaries[reference] = {
-                "found": False,
-                "scientific_name": "",
-                "location": "",
-            }
-            continue
-        summaries[reference] = {
-            "found": True,
-            "scientific_name": _find_api_field(
-                record,
-                (
-                    "scientific_name", "scientificName", "species_name", "speciesName",
-                    "taxon_name", "species", "taxon",
-                ),
-            ),
-            "location": _find_api_field(
-                record,
-                ("location", "location_name", "locationName", "locality", "place_name", "formatted_location"),
-            ),
-        }
-    return summaries
-
-
-def _fetch_mycomap_observation_records(references: list) -> dict:
-    payload = _mycomap_refresh_request(
-        "sequences/batch",
-        data={"observations": ",".join(references)},
-    )
-    return _summarize_mycomap_records(payload, references)
-
-
 def refresh_mycomap_observation_records(references: list) -> dict:
     """Refresh observation records and return their before/after name and location."""
     normalized = []
@@ -2223,25 +2165,25 @@ def refresh_mycomap_observation_records(references: list) -> dict:
     if len(normalized) > 100:
         raise MycoMapRefreshError("No more than 100 MycoMap records can be refreshed at once.")
 
-    before = _fetch_mycomap_observation_records(normalized)
-    if len(normalized) == 1:
-        refresh_payload = _mycomap_refresh_request(
-            "refresh",
-            method="POST",
-            data={"observation": normalized[0]},
-        )
-    else:
-        refresh_payload = _mycomap_refresh_request(
-            "refresh/batch",
-            method="POST",
-            data={"observations": ",".join(normalized)},
-        )
-    after = _fetch_mycomap_observation_records(normalized)
+    # Alan 10/8/26 - Moved from mycomap.com's refresh/refresh-batch and
+    # sequences/batch to the documented mycomap.org API, the same calls
+    # MycoMap.org's own Refresh button makes (see mycomap_org_service).
+    from app.services import mycomap_org_service as org
+
+    try:
+        before = org.observation_records(normalized)
+        warnings = org.refresh_observations(normalized)
+        # MycoMap.org's own button waits briefly before re-reading too.
+        time.sleep(1)
+        after = org.observation_records(normalized)
+    except org.OrgResultError as exc:
+        raise MycoMapRefreshError(str(exc)) from exc
     return {
         "references": normalized,
         "before": before,
         "after": after,
-        "message": _summarize_api_response(refresh_payload, ""),
+        "warnings": warnings,
+        "message": "",
     }
 
 

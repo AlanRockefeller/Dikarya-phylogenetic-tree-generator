@@ -32,7 +32,15 @@ stay authoritative there; keep this file to settings the unit does not pass.
 # %(D)s is appended last so existing log parsing that counts fields from the
 # left keeps working.
 # Referrer is intentionally omitted: it can itself contain OAuth/query values.
-access_log_format = '%(h)s %(l)s %(u)s %(t)s "%(m)s %(U)s %(H)s" %(s)s %(b)s "-" "%(a)s" %(D)s req=%({x-request-id}o)s noise=%({x-dikarya-noise}o)s'
+#
+# Alan 10/8/26 - noise= is the app's own verdict, read from the WSGI environ key
+# dikarya.noise: "scanner" for everything request_diagnostics files to
+# scanner.log and for the missing-route limiter's 429s. It used to come from the
+# X-Dikarya-Noise response header, which only the limiter set, so a 404 sweep
+# the app had already classified reached the digest as "-" and filled its
+# product-relevant section. The environ never reaches the client, so the verdict
+# cannot be used to map which paths the app serves.
+access_log_format = '%(h)s %(l)s %(u)s %(t)s "%(m)s %(U)s %(H)s" %(s)s %(b)s "-" "%(a)s" %(D)s req=%({x-request-id}o)s noise=%({dikarya.noise}e)s'
 
 
 # Alan 9/23/26 - Close SSE streams as soon as a worker is told to stop.

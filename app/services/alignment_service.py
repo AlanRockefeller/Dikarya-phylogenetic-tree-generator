@@ -68,6 +68,51 @@ def mafft_direction_flag(config: Config, logger=None) -> Optional[str]:
     return MAFFT_DIRECTION_FLAGS[resolve_mafft_direction_mode(config, logger)]
 
 
+def _mafft_default_strategy_args(input_fasta: Path, config: Config, logger,
+                                 tree_method: str = "") -> list:
+    """MAFFT strategy flags for a job that did not choose one.
+
+    Full L-INS-i when MAFFT_DEFAULT_STRATEGY is ``linsi`` or the job's tree
+    method is in MAFFT_LINSI_TREE_METHODS (see app/config.py), and the input is
+    within the L-INS-i size limits; ``--auto`` otherwise. Fails open to
+    ``--auto``: an unreadable input or an unexpected setting never changes the
+    strategy.
+    """
+    linsi_methods = getattr(config, "MAFFT_LINSI_TREE_METHODS", frozenset())
+    if not isinstance(linsi_methods, (set, frozenset, list, tuple)):
+        linsi_methods = ()
+    if (getattr(config, "MAFFT_DEFAULT_STRATEGY", "auto") != "linsi"
+            and (tree_method or "").lower() not in linsi_methods):
+        return ["--auto"]
+
+    max_sequences = getattr(config, "MAFFT_LINSI_MAX_SEQUENCES", 200)
+    max_length = getattr(config, "MAFFT_LINSI_MAX_LENGTH", 3000)
+    count = 0
+    current = 0
+    longest = 0
+    try:
+        with open_artifact(input_fasta, "rt") as handle:
+            for line in handle:
+                if line.startswith(">"):
+                    count += 1
+                    longest = max(longest, current)
+                    current = 0
+                    if count >= max_sequences:
+                        return ["--auto"]
+                else:
+                    current += len(line.strip())
+    except OSError:
+        return ["--auto"]
+    longest = max(longest, current)
+
+    if count == 0 or longest >= max_length:
+        return ["--auto"]
+    logger.info(
+        "Using MAFFT L-INS-i: %s sequences, longest %s bp", count, longest
+    )
+    return ["--localpair", "--maxiterate", "1000"]
+
+
 def _orientation_input_too_large(input_fasta: Path, config: Config, logger) -> bool:
     """True when the input is too big for MAFFT's direction check to be worth it.
 
@@ -428,6 +473,70 @@ def _flipped_headers_from_mafft(aligned_text: str, input_headers: set) -> set:
     return flipped
 
 
+def _fasta_blocks(text: str) -> list:
+    """Split FASTA text into per-record blocks, bytes untouched, each ending in a newline."""
+    blocks = [block for block in re.split(r"(?m)^(?=>)", text) if block.strip()]
+    return [block if block.endswith("\n") else block + "\n" for block in blocks]
+
+
+def _direction_anchor_index(blocks: list) -> int:
+    """Index of the first record ORIENT confidently calls forward, or 0.
+
+    MAFFT's direction check keeps the FIRST record's direction and turns every
+    other record to match it. A job whose first record is reversed and that
+    ORIENT could not call -- a query barcode stored reverse-complemented and
+    trimmed inside ITS1 and ITS2 -- therefore had every correctly forward
+    record turned around, and the whole alignment came out reverse-complemented
+    (jobs i7yl, 6g93, eh2x, fjyh: their NCBI hits were short fragments with no
+    ITS landmark at all, so ORIENT could not fix them either). The anchor is a
+    record with a 5.8S core within CORE_MAX_MM on the forward strand that
+    ORIENT calls forward; the cheap core search runs first so a non-ITS marker,
+    which has no anchor, costs one motif search per record.
+    """
+    from app.services.orientation_service import (
+        CORE_IDX, CORE_MAX_MM, FWD_MOTIFS, best_hit, decide_orientation,
+    )
+
+    for index, block in enumerate(blocks):
+        seq = "".join(block.splitlines()[1:])
+        if best_hit(seq, FWD_MOTIFS[CORE_IDX], CORE_MAX_MM) is None:
+            continue
+        if decide_orientation(seq)[0] == "forward":
+            return index
+    return 0
+
+
+def _write_direction_anchored_input(input_fasta: Path, logger):
+    """Copy ``input_fasta`` with a confidently forward record moved to the front.
+
+    Returns ``(path, index)``: the scratch copy and the original position of
+    the moved record, or ``(input_fasta, 0)`` when the first record already is
+    one or no record qualifies, so nothing changes for the ordinary job. The
+    caller runs MAFFT on the copy, deletes it, and -- where row order matters
+    -- moves output record 0 back with _restore_direction_anchor_order.
+    """
+    blocks = _fasta_blocks(input_fasta.read_text(encoding="utf-8", errors="replace"))
+    index = _direction_anchor_index(blocks) if len(blocks) > 1 else 0
+    if index == 0:
+        return input_fasta, 0
+    anchored = input_fasta.parent / f"{input_fasta.stem}.direction_anchor.fasta"
+    anchored.write_text(
+        "".join([blocks[index]] + blocks[:index] + blocks[index + 1:]), encoding="utf-8"
+    )
+    logger.info(
+        "event=alignment.direction_anchor record=%s of %s moved first for MAFFT's direction check",
+        index + 1, len(blocks),
+    )
+    return anchored, index
+
+
+def _restore_direction_anchor_order(output_fasta: Path, index: int) -> None:
+    """Undo _write_direction_anchored_input in MAFFT's output (MAFFT keeps input order)."""
+    blocks = _fasta_blocks(output_fasta.read_text(encoding="utf-8", errors="replace"))
+    blocks.insert(index, blocks.pop(0))
+    output_fasta.write_text("".join(blocks), encoding="utf-8")
+
+
 KMER_VETO_K = 12
 KMER_VETO_MAX_REFERENCES = 100
 KMER_VETO_MAX_REFERENCE_BASES = 1_000_000
@@ -569,13 +678,16 @@ def fix_direction_with_mafft(
         return 0
 
     threads = _get_thread_count()
+    # Only the _R_ markers are read back, by header, so the anchored copy's
+    # row order never needs restoring here.
+    mafft_input, _ = _write_direction_anchored_input(input_fasta, logger)
     cmd = [
         config.MAFFT_BINARY, "--thread", str(threads),
         "--adjustdirectionaccurately",
         # Direction only: skip the iterative refinement that makes a MAFFT run
         # expensive. The _R_ markers are decided before any of it.
         "--retree", "1", "--maxiterate", "0",
-        "--quiet", str(input_fasta),
+        "--quiet", str(mafft_input),
     ]
     if job_id:
         # Show it in the live log like every other tool invocation, so the extra
@@ -598,11 +710,17 @@ def fix_direction_with_mafft(
             stdout = scratch.read_text(encoding="utf-8", errors="replace") if scratch.exists() else ""
         finally:
             scratch.unlink(missing_ok=True)
+            if mafft_input != input_fasta:
+                mafft_input.unlink(missing_ok=True)
         stderr = ""
     else:
-        returncode, stdout, stderr = run_command(
-            cmd, timeout=configured_tool_timeout_seconds(config, "MAFFT")
-        )
+        try:
+            returncode, stdout, stderr = run_command(
+                cmd, timeout=configured_tool_timeout_seconds(config, "MAFFT")
+            )
+        finally:
+            if mafft_input != input_fasta:
+                mafft_input.unlink(missing_ok=True)
 
     if returncode != 0:
         # Fail open. The chosen aligner can still produce a tree; it just will
@@ -766,10 +884,24 @@ def _run_mafft(
          cmd.extend(["--retree", "2", "--maxiterate", "2"])
     else:
          # Default reasonable option for ML/Bayesian trees
-         cmd.append("--auto")
+         cmd.extend(_mafft_default_strategy_args(input_fasta, config, logger, tree_method))
 
-    cmd.append(str(input_fasta))
-    
+    # Recorded on the mafft_completed line so --auto and L-INS-i timings can
+    # be told apart in the logs.
+    strategy = next(
+        (flag.lstrip("-") for flag in ("--localpair", "--globalpair", "--auto", "--retree")
+         if flag in cmd),
+        "other",
+    )
+    # MAFFT turns every record to match the first one, so give its direction
+    # check a confidently forward record to start from (see
+    # _direction_anchor_index). The output's row order is put back below.
+    mafft_input, anchor_index = (
+        _write_direction_anchored_input(input_fasta, logger)
+        if direction_flag else (input_fasta, 0)
+    )
+    cmd.append(str(mafft_input))
+
     log_file = output_fasta.parent.parent / "logs" / "alignment.log"
     
     if job_id:
@@ -859,10 +991,14 @@ def _run_mafft(
             with open(output_fasta, "w") as f:
                 f.write(stdout)
 
+        if anchor_index:
+            _restore_direction_anchor_order(output_fasta, anchor_index)
         reversed_headers = _restore_mafft_direction_headers(
             input_fasta, output_fasta, logger
         )
     finally:
+        if mafft_input != input_fasta:
+            mafft_input.unlink(missing_ok=True)
         if elapsed_seconds is None:
             # MAFFT itself failed; time-to-failure is the measurement.
             elapsed_seconds = time.monotonic() - started_at
@@ -873,11 +1009,12 @@ def _run_mafft(
         logger.info(
             "event=alignment.mafft_completed direction_mode=%s direction_flag=%s "
             "fix_orientation=%s outcome=%s elapsed_seconds=%.3f elapsed_ms=%d "
-            "aligner_reversed_count=%s",
+            "aligner_reversed_count=%s strategy=%s",
             direction_mode, direction_flag or "none",
             "true" if fix_orientation else "false", outcome,
             elapsed_seconds, int(elapsed_seconds * 1000),
             "unknown" if reversed_headers is None else len(reversed_headers),
+            strategy,
         )
 
     if reversed_headers and fix_orientation:

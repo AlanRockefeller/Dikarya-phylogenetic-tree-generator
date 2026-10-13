@@ -82,8 +82,13 @@ SCANNER_EXACT_PATHS = frozenset({
     "/.config/gcloud/application_default_credentials.json", "/keyfile.json",
     "/firebase-adminsdk.json", "/firebase-key.json",
     # Alan 9/12/26 - Seen in the current week's sweeps.
-    "/todo", "/blog", "/containers/json", "/hello.world", "/test.hello",
-    "/v2/_catalog", "/debug", "/metrics",
+    # Alan 10/8/26 - "/todo" and "/metrics" removed: both are real routes (the
+    # suggestions page and the monitoring JSON), so a user's 4xx there -- an
+    # expired-CSRF 400 on a suggestion, a 429 -- was filed as scanner noise.
+    # A probe that sends them a verb they do not serve is still caught by the
+    # 405 rule in _scanner_reason().
+    "/blog", "/containers/json", "/hello.world", "/test.hello",
+    "/v2/_catalog", "/debug",
 })
 
 SCRIPT_EXT_RE = re.compile(r"\.(?:php|asp|aspx|jsp|cgi|pl|cfm)[0-9]*$")

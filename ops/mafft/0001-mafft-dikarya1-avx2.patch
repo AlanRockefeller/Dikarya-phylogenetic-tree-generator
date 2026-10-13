@@ -1,0 +1,1103 @@
+From fb94e614565c02c1f267d4c376f661c335041d22 Mon Sep 17 00:00:00 2001
+From: Alan Rockefeller <alanrockefeller@gmail.com>
+Date: Wed, 7 Oct 2026 09:33:35 +0000
+Subject: [PATCH] Exact AVX2 speedups for x86 without AVX-512 (Broadwell),
+ 7.526-opt5-dikarya1
+
+Same constraint as the opt series: output byte-identical to the stock gcc
+build at --thread 1.  All paths are guarded by __AVX2__ && !MAFFT_STOCK_FMA
+(and !__AVX512F__ where an AVX-512 path exists), so other builds are
+unchanged.
+
+- Lfill_int (L-INS-i all-pairs local alignment): AVX2 fill, 8 cells per
+  step.  Cells whose best move is a gap store a marker instead of the gap
+  offset, all DP rows are kept, and Ltracking replays the original scalar
+  rule over the stored rows for the few marked cells on its path (integer
+  arithmetic, so the offsets are exact).  This drops the first-index scan
+  and the vmp[] state from the inner loop: 1.68 -> 0.82 ns/cell.
+- scarr_fill(): the 26x26 profile-score loop of every match_calc, skipping
+  the zero terms (exact: the sum starts at +0 and is never -0) and adding
+  4 letters at a time with separate multiply and add.  Also mc_match.
+- A_row / partA_row: AVX2 ports of the AVX-512 row fills.
+- Falign: per-call result/tmpres/tmpseq/rndseq rows are malloc'd, not
+  calloc'd (AllocateCharMtxNoZero); they are only used as strings written
+  before they are read.  MAFFT_POISON_TEST fills them with junk to check.
+
+Verified byte-identical to stock MAFFT 7.505 (Ubuntu) / 7.526 at --thread 1
+on 52 real Dikarya inputs (L-INS-i and FFT-NS-i), with and without
+MAFFT_POISON_TEST.
+
+Hardware: Intel Xeon E5-2690 v4 (Broadwell-EP, AVX2 + FMA, no AVX-512),
+gcc 13.3, -O3 -march=native, Ubuntu 24.04.
+
+Builds on the opt1-opt5 series by Josh Walker and Claude Code.
+
+Co-authored-by: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01DB1sfN8zWs4Fi4QfWU5CP8
+---
+ core/Dalignmm.c     |  16 ++
+ core/Falign.c       |  18 ++-
+ core/Lalign11.c     | 378 +++++++++++++++++++++++++++++++++++++++++++-
+ core/SAalignmm.c    |   4 +
+ core/Salignmm.c     |  78 +++++++++
+ core/mafft.tmpl     |   2 +-
+ core/mltaln.h       |   8 +-
+ core/mltaln9.c      |  40 +++++
+ core/mtxutl.c       |  35 ++++
+ core/mtxutl.h       |   1 +
+ core/partSalignmm.c |  97 +++++++++++-
+ 11 files changed, 659 insertions(+), 18 deletions(-)
+
+diff --git a/core/Dalignmm.c b/core/Dalignmm.c
+index d9b9e65..b21064f 100644
+--- a/core/Dalignmm.c
++++ b/core/Dalignmm.c
+@@ -274,6 +274,9 @@ static void match_calc_add( double **scoreingmtx, double *match, double **cpmx1,
+ 	}
+ 
+ 	{
++#ifdef HAVE_SCARR_FILL
++		scarr_fill( scarr, scoreingmtx, cpmx1, i1 );
++#else
+ 		for( l=0; l<nalphabets; l++ )
+ 		{
+ 			scarr[l] = 0.0;
+@@ -282,6 +285,7 @@ static void match_calc_add( double **scoreingmtx, double *match, double **cpmx1,
+ //				scarr[l] += n_dis_consweight_multi[j][l] * cpmx1[j][i1];
+ 				scarr[l] += scoreingmtx[j][l] * cpmx1[j][i1];
+ 		}
++#endif
+ 		matchpt = match;
+ 		cpmxpdnptpt = cpmxpdn;
+ 		cpmxpdptpt = cpmxpd;
+@@ -323,6 +327,9 @@ static void match_calc_add( double **scoreingmtx, double *match, double **cpmx1,
+ 			cpmxpdn[count][j] = -1;
+ 		}
+ 	}
++#ifdef HAVE_SCARR_FILL
++	scarr_fill( scarr, scoreingmtx, cpmx1, i1 );
++#else
+ 	for( l=0; l<nalphabets; l++ )
+ 	{
+ 		scarr[l] = 0.0;
+@@ -331,6 +338,7 @@ static void match_calc_add( double **scoreingmtx, double *match, double **cpmx1,
+ //			scarr[l] += n_dis_consweight_multi[k][l] * cpmx1[k][i1];
+ 			scarr[l] += scoreingmtx[k][l] * cpmx1[k][i1];
+ 	}
++#endif
+ 	for( j=0; j<lgth2; j++ )
+ 	{
+ 		match[j] = 0.0;
+@@ -373,6 +381,9 @@ static void match_calc( double **n_dynamicmtx, double *match, double **cpmx1, do
+ 	}
+ 
+ 	{
++#ifdef HAVE_SCARR_FILL
++		scarr_fill( scarr, n_dynamicmtx, cpmx1, i1 );
++#else
+ 		for( l=0; l<nalphabets; l++ )
+ 		{
+ 			scarr[l] = 0.0;
+@@ -381,6 +392,7 @@ static void match_calc( double **n_dynamicmtx, double *match, double **cpmx1, do
+ //				scarr[l] += n_dis_consweight_multi[j][l] * cpmx1[j][i1];
+ 				scarr[l] += n_dynamicmtx[j][l] * cpmx1[j][i1];
+ 		}
++#endif
+ 		matchpt = match;
+ 		cpmxpdnptpt = cpmxpdn;
+ 		cpmxpdptpt = cpmxpd;
+@@ -422,6 +434,9 @@ static void match_calc( double **n_dynamicmtx, double *match, double **cpmx1, do
+ 			cpmxpdn[count][j] = -1;
+ 		}
+ 	}
++#ifdef HAVE_SCARR_FILL
++	scarr_fill( scarr, n_dynamicmtx, cpmx1, i1 );
++#else
+ 	for( l=0; l<nalphabets; l++ )
+ 	{
+ 		scarr[l] = 0.0;
+@@ -430,6 +445,7 @@ static void match_calc( double **n_dynamicmtx, double *match, double **cpmx1, do
+ //			scarr[l] += n_dis_consweight_multi[k][l] * cpmx1[k][i1];
+ 			scarr[l] += n_dynamicmtx[k][l] * cpmx1[k][i1];
+ 	}
++#endif
+ 	for( j=0; j<lgth2; j++ )
+ 	{
+ 		match[j] = 0.0;
+diff --git a/core/Falign.c b/core/Falign.c
+index f6b7cd2..de2b12d 100644
+--- a/core/Falign.c
++++ b/core/Falign.c
+@@ -884,21 +884,23 @@ double Falign( int **whichmtx, double ***scoringmatrices, double **n_dynamicmtx,
+ #endif
+ 
+ 
+-	result1 = AllocateCharMtx( clus1, alloclen );
+-	result2 = AllocateCharMtx( clus2, alloclen );
+-	tmpres1 = AllocateCharMtx( clus1, alloclen );
+-	tmpres2 = AllocateCharMtx( clus2, alloclen );
++	/* Only ever used as strings written before they are read (rndseq is filled whole), so the
++	   rows need no clearing -- see AllocateCharMtxNoZero. */
++	result1 = AllocateCharMtxNoZero( clus1, alloclen );
++	result2 = AllocateCharMtxNoZero( clus2, alloclen );
++	tmpres1 = AllocateCharMtxNoZero( clus1, alloclen );
++	tmpres2 = AllocateCharMtxNoZero( clus2, alloclen );
+ 	sgap1 = AllocateCharVec( clus1 );
+ 	egap1 = AllocateCharVec( clus1 );
+ 	sgap2 = AllocateCharVec( clus2 );
+ 	egap2 = AllocateCharVec( clus2 );
+ 	tmpptr1 = calloc( clus1, sizeof( char * ) );
+ 	tmpptr2 = calloc( clus2, sizeof( char * ) );
+-	tmpseq1 = AllocateCharMtx( clus1, nlen );
+-	tmpseq2 = AllocateCharMtx( clus2, nlen );
++	tmpseq1 = AllocateCharMtxNoZero( clus1, nlen );
++	tmpseq2 = AllocateCharMtxNoZero( clus2, nlen );
+ #if RND
+-	rndseq1 = AllocateCharMtx( clus1, nlen );
+-	rndseq2 = AllocateCharMtx( clus2, nlen );
++	rndseq1 = AllocateCharMtxNoZero( clus1, nlen );
++	rndseq2 = AllocateCharMtxNoZero( clus2, nlen );
+ 	for( i=0; i<clus1; i++ )
+ 		generateRndSeq( rndseq1[i], nlen );
+ 	for( i=0; i<clus2; i++ )
+diff --git a/core/Lalign11.c b/core/Lalign11.c
+index c896717..f2c392d 100644
+--- a/core/Lalign11.c
++++ b/core/Lalign11.c
+@@ -1,6 +1,7 @@
+ #include "mltaln.h"
+ #include "dp.h"
+ #include <limits.h>
++#include <stdint.h>
+ #if defined(__ARM_NEON)
+ #include <arm_neon.h>
+ #elif defined(__AVX512F__) || defined(__SSE4_1__)
+@@ -61,12 +62,16 @@ static void match_calc_bk( double *match, double **cpmx1, double **cpmx2, int i1
+ 		}
+ 	}
+ 
++#ifdef HAVE_SCARR_FILL
++	scarr_fill( scarr, n_dis, cpmx1, i1 );
++#else
+ 	for( l=0; l<nalphabets; l++ )
+ 	{
+ 		scarr[l] = 0.0;
+ 		for( k=0; k<nalphabets; k++ )
+ 			scarr[l] += n_dis[k][l] * cpmx1[k][i1];
+ 	}
++#endif
+ #if 0 /* �����Ȥ��Ȥ���doublework�Υ��������Ȥ�դˤ��� */
+ 	{
+ 		double *fpt, **fptpt, *fpt2;
+@@ -94,6 +99,50 @@ static void match_calc_bk( double *match, double **cpmx1, double **cpmx2, int i1
+ }
+ #endif
+ 
++#if defined(__AVX2__) && !defined(__AVX512F__) && !defined(__ARM_NEON)
++/*
++ * The AVX2 integer fill (Lfill_int below) does not compute the traceback offsets themselves.  A
++ * cell whose best move is a horizontal gap stores LMARK_H, a vertical gap LMARK_V, and every DP
++ * row is kept (lr_*) instead of two alternating ones.  Ltracking only reads ijp along the one
++ * path it follows, and for a marked cell asks lres_hk()/lres_vmp() for the offset, which replay
++ * the original scalar rules over the stored rows -- integer arithmetic, so the offset is exactly
++ * the one the full fill would have stored.  The markers lie below every real value (offsets are
++ * at least -lgth2, localstop and warpbase are positive).
++ */
++#define LFILL_MARKS 1
++#define LMARK_H INT_MIN
++#define LMARK_V ( INT_MIN + 1 )
++static TLS int *lr_raw = NULL;
++static TLS size_t lr_cap = 0;
++static TLS int *lr_base, lr_stride, lr_ext, lr_v0;
++#define LROW( r ) ( lr_base + (size_t)( r ) * lr_stride )
++
++/* hk[j] of row i: first k in [0, j-2] maximising prev[k] - k*ext (the first k of a tie), k = 0 for j < 2 */
++static int lres_hk( int i, int j )
++{
++	int *prev = LROW( i-1 ), jj, tbest = prev[0], tbestk = 0;
++	for( jj=2; jj<=j; jj++ )
++	{
++		int q = prev[jj-2] - ( jj-2 ) * lr_ext;
++		if( q > tbest ) { tbest = q; tbestk = jj-2; }
++	}
++	return( tbestk );
++}
++
++/* vmp[j] as row i reads it: the vertical state started from row 0 and updated by rows 1 .. i-1 */
++static int lres_vmp( int i, int j )
++{
++	int r, vm = ( j == 1 ) ? lr_v0 : LROW( 0 )[j-1], vmp = 0;
++	for( r=1; r<i; r++ )
++	{
++		int p = LROW( r-1 )[j-1];
++		if( p > vm ) { vm = p; vmp = r-1; }
++		vm += lr_ext;
++	}
++	return( vmp );
++}
++#endif
++
+ static double Ltracking( double *lasthorizontalw, double *lastverticalw, 
+ 						char **seq1, char **seq2, 
+                         char **mseq1, char **mseq2, 
+@@ -132,19 +181,24 @@ static double Ltracking( double *lasthorizontalw, double *lastverticalw,
+ 	limk = lgth1+lgth2;
+ 	for( k=0; k<=limk; k++ ) 
+ 	{
+-		if( ijp[iin][jin] >= warpbase )
++		int ijv = ijp[iin][jin];
++#ifdef LFILL_MARKS
++		if( ijv == LMARK_H ) ijv = -( jin - lres_hk( iin, jin ) );
++		else if( ijv == LMARK_V ) ijv = iin - lres_vmp( iin, jin );
++#endif
++		if( ijv >= warpbase )
+ 		{
+ //			fprintf( stderr, "WARP!\n" );
+-			ifi = warpis[ijp[iin][jin]-warpbase];
+-			jfi = warpjs[ijp[iin][jin]-warpbase];
++			ifi = warpis[ijv-warpbase];
++			jfi = warpjs[ijv-warpbase];
+ 		}
+-		else if( ijp[iin][jin] < 0 ) 
++		else if( ijv < 0 ) 
+ 		{
+-			ifi = iin-1; jfi = jin+ijp[iin][jin];
++			ifi = iin-1; jfi = jin+ijv;
+ 		}
+-		else if( ijp[iin][jin] > 0 )
++		else if( ijv > 0 )
+ 		{
+-			ifi = iin-ijp[iin][jin]; jfi = jin-1;
++			ifi = iin-ijv; jfi = jin-1;
+ 		}
+ 		else
+ 		{
+@@ -223,6 +277,224 @@ static double Ltracking( double *lasthorizontalw, double *lastverticalw,
+  *
+  * Returns 0 (and does nothing) when the integral/range preconditions do not hold.
+  */
++#ifdef LFILL_MARKS
++/*
++ * Lfill_int for AVX2 (see LFILL_MARKS above): the same integer fill, 8 cells at a time, storing
++ * LMARK_H / LMARK_V instead of gap offsets, so neither the first-index scan for the horizontal
++ * state nor the vmp[] rows are needed.  Values, wm, the threshold clamp, ijp's 0 / lstop cells,
++ * maxwm and the end point are computed exactly as in the original.
++ */
++static int Lfill_int( double **amino_dynamicmtx, double **n_dynamicmtx, double scoreoffset,
++                      char *s1, char *s2, int lgth1, int lgth2, int **ijp, int lstop,
++                      double *maxwmpt, int *endalipt, int *endaljpt )
++{
++	int i, j, c, k, maxabs = 0;
++	int pen = penalty, ext = penalty_ex;
++	double thr = -offset + scoreoffset * 600;
++	int ithr, *prof[0x100], *profbuf, nprof = 0;
++	int *prev, *cur, *vm, *hq, *wmrow, *vmraw;
++	int tbest, jj;
++	int maxwm, endali = 0, endalj = 0, rowmax;
++	unsigned char *u1 = (unsigned char *)s1, *u2 = (unsigned char *)s2;
++	unsigned char used[0x100];
++	size_t need;
++
++	if( lgth1 < 1 || lgth2 < 1 ) return( 0 );
++	if( thr != (double)(int)thr ) return( 0 );
++	ithr = (int)thr;
++	for( i=0; i<nalphabets; i++ ) for( j=0; j<nalphabets; j++ )
++	{
++		double v = n_dynamicmtx[i][j];
++		if( v != (double)(int)v ) return( 0 );
++		if( abs( (int)v ) > maxabs ) maxabs = abs( (int)v );
++	}
++	/* Characters outside the alphabet read entries that were never set from n_dynamicmtx. */
++	memset( used, 0, sizeof( used ) );
++	for( i=0; i<lgth1; i++ ) used[u1[i]] = 1;
++	for( j=0; j<lgth2; j++ ) used[u2[j]] = 1;
++	for( c=0; c<0x100; c++ ) if( used[c] )
++	{
++		for( k=0; k<0x100; k++ ) if( used[k] )
++		{
++			double v = amino_dynamicmtx[c][k];
++			if( v != (double)(int)v || fabs( v ) > 1e6 ) return( 0 );
++			if( abs( (int)v ) > maxabs ) maxabs = abs( (int)v );
++		}
++	}
++	/* Keep every intermediate (including prev[k] - k*ext) far from int32 overflow. */
++	{
++		double bound = (double)( maxabs + abs( pen ) + abs( ext ) + abs( ithr ) + 1 ) * ( lgth1 + lgth2 + 4 ) * 2.0;
++		if( bound > 5.0e8 ) return( 0 );
++	}
++
++	for( c=0; c<0x100; c++ ) prof[c] = NULL;
++	for( c=0; c<0x100; c++ ) if( used[c] ) nprof++;
++	profbuf = malloc( sizeof( int ) * nprof * ( lgth2 + 4 ) );
++	k = 0;
++	for( c=0; c<0x100; c++ ) if( used[c] )
++	{
++		double *row = amino_dynamicmtx[c];
++		prof[c] = profbuf + k * ( lgth2 + 4 );
++		for( j=0; j<lgth2; j++ ) prof[c][j] = (int)row[u2[j]];
++		prof[c][lgth2] = 0;
++		k++;
++	}
++
++	/* All rows, each with one slot in front (prev[-1] seeds the vector scan); rows start so that
++	   cell 1 of every row is 32-byte aligned.  Kept between calls: a fresh 3 MB mapping per pair
++	   costs more in page faults than the fill. */
++	lr_stride = ( ( lgth2 + 9 ) + 7 ) & ~7;
++	need = (size_t)( lgth1 + 1 ) * lr_stride + 16;
++	/* The rows double the memory of ijp[][]; past 256 MB leave it to the double-precision fill. */
++	if( need > ( (size_t)1 << 26 ) ) { free( profbuf ); return( 0 ); }
++	if( need > lr_cap )
++	{
++		free( lr_raw );
++		lr_raw = malloc( sizeof( int ) * need );
++		if( lr_raw == NULL ) ErrorExit( "Cannot allocate the local alignment rows." );
++		lr_cap = need;
++	}
++#ifdef MAFFT_POISON_TEST
++	memset( lr_raw, 0xa5, sizeof( int ) * need );
++#endif
++	lr_base = (int *)( ( (uintptr_t)( lr_raw + 8 ) & ~(uintptr_t)31 ) ) + 7; /* lr_base + 1 is 32-byte aligned */
++	lr_ext = ext;
++	vmraw = malloc( sizeof( int ) * ( lgth2 + 16 ) );
++	vm    = (int *)( ( (uintptr_t)( vmraw + 8 ) & ~(uintptr_t)31 ) ) + 7;
++	hq    = malloc( sizeof( int ) * ( lgth2 + 4 ) );
++	wmrow = malloc( sizeof( int ) * ( lgth2 + 4 ) );
++#ifdef MAFFT_POISON_TEST
++	memset( vmraw, 0xa5, sizeof( int ) * ( lgth2 + 16 ) ); memset( hq, 0xa5, sizeof( int ) * ( lgth2 + 4 ) ); memset( wmrow, 0xa5, sizeof( int ) * ( lgth2 + 4 ) );
++#endif
++
++	/* row 0: currentw[j] = mtx[s1[0]][s2[j]];  m[j] = currentw[j-1] */
++	cur = LROW( 0 );
++	for( j=0; j<lgth2; j++ ) cur[j] = prof[u1[0]][j];
++	cur[lgth2] = 0;
++	for( j=1; j<=lgth2; j++ ) vm[j] = cur[j-1];
++	lr_v0 = cur[0]; /* m[1] before row 1 overwrites cur[0] */
++
++	maxwm = INT_MIN;
++	for( i=1; i<=lgth1; i++ )
++	{
++		int *profrow = ( i < lgth1 ) ? prof[u1[i]] : NULL;
++		int *ijrow = ijp[i];
++		prev = LROW( i-1 ); cur = LROW( i );
++		/* previousw[0] = initverticalw[i-1] = mtx[s2[0]][s1[i-1]] */
++		prev[0] = (int)amino_dynamicmtx[u2[0]][u1[i-1]];
++		/* H_j = (j-1)*ext + max_{k<=max(j-2,0)} (prev[k] - k*ext); prev[-1] stands for the k=0 term of H_1 */
++		prev[-1] = prev[0] - ext;
++		tbest = prev[0];
++
++		rowmax = INT_MIN;
++		if( !profrow ) profrow = prof[u1[0]]; /* last row: cur[] is never read again */
++		j = 1;
++		{
++			/* prefix max with in-lane byte shifts (vpslldq) and the fill OR-ed in, one vpermd for the
++			   half carry; blends are and/xor (vpblendvb is two port-5 uops on Haswell/Broadwell). */
++#define AVX2_BLEND( a, b, m ) _mm256_xor_si256( (a), _mm256_and_si256( _mm256_xor_si256( (a), (b) ), (m) ) )
++			const __m256i vpen = _mm256_set1_epi32( pen ), vext = _mm256_set1_epi32( ext ), vthr = _mm256_set1_epi32( ithr );
++			const __m256i vstop = _mm256_set1_epi32( lstop ), vmarkh = _mm256_set1_epi32( LMARK_H ), vmarkv = _mm256_set1_epi32( LMARK_V );
++			const __m256i ninf = _mm256_set1_epi32( INT_MIN );
++			const __m256i fill1 = _mm256_setr_epi32( INT_MIN, 0, 0, 0, INT_MIN, 0, 0, 0 );
++			const __m256i fill2 = _mm256_setr_epi32( INT_MIN, INT_MIN, 0, 0, INT_MIN, INT_MIN, 0, 0 );
++			const __m256i idx3 = _mm256_set1_epi32( 3 ), last = _mm256_set1_epi32( 7 );
++			const __m256i ext8 = _mm256_set1_epi32( 8 * ext );
++			__m256i vmax = ninf, cv = ninf;
++			/* lane l of the block at j stands for k = j-2+l */
++			__m256i kext = _mm256_mullo_epi32( _mm256_setr_epi32( -1, 0, 1, 2, 3, 4, 5, 6 ), vext );
++			__m256i kext1pen = _mm256_add_epi32( kext, _mm256_set1_epi32( ext + pen ) );
++			for( ; j+7<=lgth2; j+=8 )
++			{
++				__m256i p = _mm256_loadu_si256( (__m256i *)( prev + j - 1 ) );
++				__m256i v = _mm256_sub_epi32( _mm256_loadu_si256( (__m256i *)( prev + j - 2 ) ), kext );
++				__m256i x, g, wm, ch, cvt, clamp, ij, vmj;
++				x = _mm256_max_epi32( v, _mm256_or_si256( _mm256_bslli_epi128( v, 4 ), fill1 ) );
++				x = _mm256_max_epi32( x, _mm256_or_si256( _mm256_bslli_epi128( x, 8 ), fill2 ) );
++				x = _mm256_max_epi32( x, _mm256_blend_epi32( ninf, _mm256_permutevar8x32_epi32( x, idx3 ), 0xf0 ) );
++				x = _mm256_max_epi32( x, cv );
++				cv = _mm256_permutevar8x32_epi32( x, last );
++
++				wm = p;
++				g = _mm256_add_epi32( x, kext1pen );   /* hq + pen */
++				ch = _mm256_cmpgt_epi32( g, wm );
++				wm = _mm256_max_epi32( wm, g );
++				vmj = _mm256_load_si256( (__m256i *)( vm + j ) );
++				g = _mm256_add_epi32( vmj, vpen );
++				cvt = _mm256_cmpgt_epi32( g, wm );
++				wm = _mm256_max_epi32( wm, g );
++				_mm256_store_si256( (__m256i *)( vm + j ), _mm256_add_epi32( _mm256_max_epi32( p, vmj ), vext ) );
++				_mm256_storeu_si256( (__m256i *)( wmrow + j ), wm );
++				vmax = _mm256_max_epi32( vmax, wm );
++				clamp = _mm256_cmpgt_epi32( vthr, wm );
++				ij = _mm256_and_si256( ch, vmarkh );
++				ij = AVX2_BLEND( ij, vmarkv, cvt );
++				ij = AVX2_BLEND( ij, vstop, clamp );
++				wm = _mm256_max_epi32( wm, vthr );
++				_mm256_storeu_si256( (__m256i *)( ijrow + j ), ij );
++				_mm256_store_si256( (__m256i *)( cur + j ), _mm256_add_epi32( wm, _mm256_loadu_si256( (__m256i *)( profrow + j ) ) ) );
++				kext = _mm256_add_epi32( kext, ext8 );
++				kext1pen = _mm256_add_epi32( kext1pen, ext8 );
++			}
++#undef AVX2_BLEND
++			{
++				__m128i h = _mm_max_epi32( _mm256_castsi256_si128( vmax ), _mm256_extracti128_si256( vmax, 1 ) );
++				h = _mm_max_epi32( h, _mm_shuffle_epi32( h, 0x4e ) );
++				h = _mm_max_epi32( h, _mm_shuffle_epi32( h, 0xb1 ) );
++				rowmax = _mm_cvtsi128_si32( h );
++			}
++			if( j > 1 ) tbest = _mm256_cvtsi256_si32( cv );
++		}
++		/* the remaining cells */
++		for( jj=j; jj<=lgth2; jj++ )
++		{
++			if( jj >= 2 )
++			{
++				int q = prev[jj-2] - ( jj-2 ) * ext;
++				if( q > tbest ) tbest = q;
++			}
++			hq[jj] = tbest + ( jj-1 ) * ext;
++		}
++		for( ; j<=lgth2; j++ )
++		{
++			int p = prev[j-1];
++			int wm = p, ij = 0, g;
++			g = hq[j] + pen;
++			if( g > wm ) { wm = g; ij = LMARK_H; }
++			g = vm[j] + pen;
++			if( g > wm ) { wm = g; ij = LMARK_V; }
++			if( p > vm[j] ) vm[j] = p;
++			vm[j] += ext;
++			wmrow[j] = wm;
++			rowmax = ( wm > rowmax ) ? wm : rowmax;
++			if( wm < ithr ) { ij = lstop; wm = ithr; }
++			ijrow[j] = ij;
++			cur[j] = wm + profrow[j];
++		}
++		if( rowmax > maxwm )
++		{
++			/* first cell holding rowmax, 8 at a time (it is always present) */
++			__m256i vr = _mm256_set1_epi32( rowmax );
++			j = 1;
++			for( ; j+7<=lgth2; j+=8 )
++			{
++				int km = _mm256_movemask_ps( _mm256_castsi256_ps( _mm256_cmpeq_epi32( _mm256_loadu_si256( (__m256i *)( wmrow + j ) ), vr ) ) );
++				if( km ) { j += __builtin_ctz( (unsigned)km ); break; }
++			}
++			for( ; wmrow[j] != rowmax; j++ )
++				;
++			maxwm = rowmax; endali = i; endalj = j;
++		}
++		if( i < lgth1 ) cur[0] = (int)amino_dynamicmtx[u2[0]][u1[i]]; /* currentw[0] = initverticalw[i] */
++	}
++
++	free( profbuf ); free( vmraw ); free( hq ); free( wmrow );
++	*maxwmpt = (double)maxwm;
++	*endalipt = endali;
++	*endaljpt = endalj;
++	return( 1 );
++}
++#else
+ static int Lfill_int( double **amino_dynamicmtx, double **n_dynamicmtx, double scoreoffset,
+                       char *s1, char *s2, int lgth1, int lgth2, int **ijp, int lstop,
+                       double *maxwmpt, int *endalipt, int *endaljpt )
+@@ -446,6 +718,87 @@ static int Lfill_int( double **amino_dynamicmtx, double **n_dynamicmtx, double s
+ 			rowmax = _mm512_reduce_max_epi32( vmax );
+ 			if( j > 1 ) { tbest = _mm_cvtsi128_si32( _mm512_castsi512_si128( cv ) ); tbestk = _mm_cvtsi128_si32( _mm512_castsi512_si128( ck ) ); }
+ 		}
++#elif defined(__AVX2__)
++		/* The NEON block above, 8 cells at a time.  On Haswell/Broadwell every cross-lane shuffle
++		   and every vpblendvb issues on port 5 only, so the prefix maxima use in-lane byte shifts
++		   (vpslldq) with the fill OR-ed into the vacated lanes, one vpermd to carry the low half
++		   into the high half, and blends are and/xor.  Same comparisons, cell for cell. */
++#define AVX2_BLEND( a, b, m ) _mm256_xor_si256( (a), _mm256_and_si256( _mm256_xor_si256( (a), (b) ), (m) ) )
++		{
++			const __m256i vpen = _mm256_set1_epi32( pen ), vext = _mm256_set1_epi32( ext ), vthr = _mm256_set1_epi32( ithr );
++			const __m256i vstop = _mm256_set1_epi32( lstop ), vi = _mm256_set1_epi32( i ), vi1 = _mm256_set1_epi32( negi1 );
++			const __m256i veight = _mm256_set1_epi32( 8 ), ninf = _mm256_set1_epi32( INT_MIN ), none = _mm256_set1_epi32( -1 );
++			const __m256i fill1 = _mm256_setr_epi32( INT_MIN, 0, 0, 0, INT_MIN, 0, 0, 0 );
++			const __m256i fill2 = _mm256_setr_epi32( INT_MIN, INT_MIN, 0, 0, INT_MIN, INT_MIN, 0, 0 );
++			const __m256i none1 = _mm256_setr_epi32( -1, 0, 0, 0, -1, 0, 0, 0 );
++			const __m256i none2 = _mm256_setr_epi32( -1, -1, 0, 0, -1, -1, 0, 0 );
++			const __m256i idx3 = _mm256_set1_epi32( 3 ), last = _mm256_set1_epi32( 7 );
++			const __m256i idxe = _mm256_setr_epi32( 0, 0, 1, 2, 3, 4, 5, 6 );
++			const __m256i ext8 = _mm256_mullo_epi32( veight, vext );
++			__m256i vmax = ninf, vj = _mm256_setr_epi32( 1, 2, 3, 4, 5, 6, 7, 8 );
++			__m256i cv = ninf, ck = _mm256_setzero_si256();
++			__m256i kv = _mm256_setr_epi32( -1, 0, 1, 2, 3, 4, 5, 6 );
++			__m256i kext = _mm256_mullo_epi32( kv, vext ), kext1 = _mm256_add_epi32( kext, vext );
++			for( ; j+7<=lgth2; j+=8 )
++			{
++				__m256i p = _mm256_loadu_si256( (__m256i *)( prev + j - 1 ) );
++				__m256i hqv, hkv;
++				{
++					__m256i v = _mm256_sub_epi32( _mm256_loadu_si256( (__m256i *)( prev + j - 2 ) ), kext );
++					__m256i x, e, r, t;
++					x = _mm256_max_epi32( v, _mm256_or_si256( _mm256_bslli_epi128( v, 4 ), fill1 ) );
++					x = _mm256_max_epi32( x, _mm256_or_si256( _mm256_bslli_epi128( x, 8 ), fill2 ) );
++					x = _mm256_max_epi32( x, _mm256_blend_epi32( ninf, _mm256_permutevar8x32_epi32( x, idx3 ), 0xf0 ) );
++					x = _mm256_max_epi32( x, cv );
++					e = _mm256_blend_epi32( _mm256_permutevar8x32_epi32( x, idxe ), cv, 0x01 );
++					/* kv where v > e, else -1 */
++					r = _mm256_or_si256( kv, _mm256_andnot_si256( _mm256_cmpgt_epi32( v, e ), none ) );
++					t = _mm256_max_epi32( r, _mm256_or_si256( _mm256_bslli_epi128( r, 4 ), none1 ) );
++					t = _mm256_max_epi32( t, _mm256_or_si256( _mm256_bslli_epi128( t, 8 ), none2 ) );
++					t = _mm256_max_epi32( t, _mm256_blend_epi32( none, _mm256_permutevar8x32_epi32( t, idx3 ), 0xf0 ) );
++					t = _mm256_max_epi32( t, ck );
++					hqv = _mm256_add_epi32( x, kext1 );
++					hkv = t;
++					cv = _mm256_permutevar8x32_epi32( x, last );
++					ck = _mm256_permutevar8x32_epi32( t, last );
++					kv = _mm256_add_epi32( kv, veight );
++					kext = _mm256_add_epi32( kext, ext8 );
++					kext1 = _mm256_add_epi32( kext1, ext8 );
++				}
++				__m256i g, wm, ij, m, vmj, vmpj, c;
++				wm = p;
++				g = _mm256_add_epi32( hqv, vpen );
++				c = _mm256_cmpgt_epi32( g, wm );
++				wm = _mm256_max_epi32( wm, g );
++				ij = _mm256_and_si256( c, _mm256_sub_epi32( hkv, vj ) );
++				vmj = _mm256_loadu_si256( (__m256i *)( vm + j ) );
++				vmpj = _mm256_loadu_si256( (__m256i *)( vmp + j ) );
++				g = _mm256_add_epi32( vmj, vpen );
++				c = _mm256_cmpgt_epi32( g, wm );
++				wm = _mm256_max_epi32( wm, g );
++				ij = AVX2_BLEND( ij, _mm256_sub_epi32( vi, vmpj ), c );
++				c = _mm256_cmpgt_epi32( p, vmj );
++				m = _mm256_max_epi32( p, vmj );
++				_mm256_storeu_si256( (__m256i *)( vm + j ), _mm256_add_epi32( m, vext ) );
++				_mm256_storeu_si256( (__m256i *)( vmp + j ), AVX2_BLEND( vmpj, vi1, c ) );
++				_mm256_storeu_si256( (__m256i *)( wmrow + j ), wm );
++				vmax = _mm256_max_epi32( vmax, wm );
++				c = _mm256_cmpgt_epi32( vthr, wm );
++				ij = AVX2_BLEND( ij, vstop, c );
++				wm = _mm256_max_epi32( wm, vthr );
++				_mm256_storeu_si256( (__m256i *)( ijrow + j ), ij );
++				_mm256_storeu_si256( (__m256i *)( cur + j ), _mm256_add_epi32( wm, _mm256_loadu_si256( (__m256i *)( profrow + j ) ) ) );
++				vj = _mm256_add_epi32( vj, veight );
++			}
++			{
++				__m128i h = _mm_max_epi32( _mm256_castsi256_si128( vmax ), _mm256_extracti128_si256( vmax, 1 ) );
++				h = _mm_max_epi32( h, _mm_shuffle_epi32( h, 0x4e ) );
++				h = _mm_max_epi32( h, _mm_shuffle_epi32( h, 0xb1 ) );
++				rowmax = _mm_cvtsi128_si32( h );
++			}
++			if( j > 1 ) { tbest = _mm256_cvtsi256_si32( cv ); tbestk = _mm256_cvtsi256_si32( ck ); }
++		}
++#undef AVX2_BLEND
+ #elif defined(__SSE4_1__)
+ 		/* The NEON block above, lane for lane: palignr for vextq, pblendvb for vbslq. */
+ 		{
+@@ -552,6 +905,16 @@ static int Lfill_int( double **amino_dynamicmtx, double **n_dynamicmtx, double s
+ 					if( k ) { j += __builtin_ctz( (unsigned)k ); break; }
+ 				}
+ 			}
++#elif defined(__AVX2__) && !defined(__ARM_NEON)
++			/* first cell holding rowmax, 8 at a time (it is always present) */
++			{
++				__m256i vr = _mm256_set1_epi32( rowmax );
++				for( ; j+7<=lgth2; j+=8 )
++				{
++					int k = _mm256_movemask_ps( _mm256_castsi256_ps( _mm256_cmpeq_epi32( _mm256_loadu_si256( (__m256i *)( wmrow + j ) ), vr ) ) );
++					if( k ) { j += __builtin_ctz( (unsigned)k ); break; }
++				}
++			}
+ #elif defined(__SSE4_1__) && !defined(__ARM_NEON)
+ 			{
+ 				__m128i vr = _mm_set1_epi32( rowmax );
+@@ -575,6 +938,7 @@ static int Lfill_int( double **amino_dynamicmtx, double **n_dynamicmtx, double s
+ 	*endaljpt = endalj;
+ 	return( 1 );
+ }
++#endif
+ 
+ double L__align11( double **n_dynamicmtx, double scoreoffset, char **seq1, char **seq2, int alloclen, int *off1pt, int *off2pt )
+ /* score no keisan no sai motokaraaru gap no atukai ni mondai ga aru */
+diff --git a/core/SAalignmm.c b/core/SAalignmm.c
+index c7c5c47..44992cc 100644
+--- a/core/SAalignmm.c
++++ b/core/SAalignmm.c
+@@ -31,12 +31,16 @@ static void match_calc( double *match, double **cpmx1, double **cpmx2, int i1, i
+ 		}
+ 	}
+ 
++#ifdef HAVE_SCARR_FILL
++	scarr_fill( scarr, n_dis, cpmx1, i1 );
++#else
+ 	for( l=0; l<nalphabets; l++ )
+ 	{
+ 		scarr[l] = 0.0;
+ 		for( k=0; k<nalphabets; k++ )
+ 			scarr[l] += n_dis[k][l] * cpmx1[k][i1];
+ 	}
++#endif
+ 	for( j=0; j<lgth2; j++ )
+ 	{
+ 		match[j] = 0;
+diff --git a/core/Salignmm.c b/core/Salignmm.c
+index 592424f..bfcbb14 100644
+--- a/core/Salignmm.c
++++ b/core/Salignmm.c
+@@ -233,6 +233,9 @@ static void match_calc_add( double **scoreingmtx, double *match, double **cpmx1,
+ 	}
+ 
+ 	{
++#ifdef HAVE_SCARR_FILL
++		scarr_fill( scarr, scoreingmtx, cpmx1, i1 );
++#else
+ 		for( l=0; l<nalphabets; l++ )
+ 		{
+ 			scarr[l] = 0.0;
+@@ -241,6 +244,7 @@ static void match_calc_add( double **scoreingmtx, double *match, double **cpmx1,
+ //				scarr[l] += n_dis_consweight_multi[j][l] * cpmx1[j][i1];
+ 				scarr[l] += scoreingmtx[j][l] * cpmx1[j][i1];
+ 		}
++#endif
+ 		matchpt = match;
+ 		cpmxpdnptpt = cpmxpdn;
+ 		cpmxpdptpt = cpmxpd;
+@@ -282,6 +286,9 @@ static void match_calc_add( double **scoreingmtx, double *match, double **cpmx1,
+ 			cpmxpdn[count][j] = -1;
+ 		}
+ 	}
++#ifdef HAVE_SCARR_FILL
++	scarr_fill( scarr, scoreingmtx, cpmx1, i1 );
++#else
+ 	for( l=0; l<nalphabets; l++ )
+ 	{
+ 		scarr[l] = 0.0;
+@@ -290,6 +297,7 @@ static void match_calc_add( double **scoreingmtx, double *match, double **cpmx1,
+ //			scarr[l] += n_dis_consweight_multi[k][l] * cpmx1[k][i1];
+ 			scarr[l] += scoreingmtx[k][l] * cpmx1[k][i1];
+ 	}
++#endif
+ 	for( j=0; j<lgth2; j++ )
+ 	{
+ 		match[j] = 0.0;
+@@ -331,6 +339,9 @@ static void match_calc( double **n_dynamicmtx, double *match, double **cpmx1, do
+ 	}
+ 
+ 	{
++#ifdef HAVE_SCARR_FILL
++		scarr_fill( scarr, n_dynamicmtx, cpmx1, i1 );
++#else
+ 		for( l=0; l<nalphabets; l++ )
+ 		{
+ 			scarr[l] = 0.0;
+@@ -339,6 +350,7 @@ static void match_calc( double **n_dynamicmtx, double *match, double **cpmx1, do
+ //				scarr[l] += n_dis_consweight_multi[j][l] * cpmx1[j][i1];
+ 				scarr[l] += n_dynamicmtx[j][l] * cpmx1[j][i1];
+ 		}
++#endif
+ 		matchpt = match;
+ 		cpmxpdnptpt = cpmxpdn;
+ 		cpmxpdptpt = cpmxpd;
+@@ -380,6 +392,9 @@ static void match_calc( double **n_dynamicmtx, double *match, double **cpmx1, do
+ 			cpmxpdn[count][j] = -1;
+ 		}
+ 	}
++#ifdef HAVE_SCARR_FILL
++	scarr_fill( scarr, n_dynamicmtx, cpmx1, i1 );
++#else
+ 	for( l=0; l<nalphabets; l++ )
+ 	{
+ 		scarr[l] = 0.0;
+@@ -388,6 +403,7 @@ static void match_calc( double **n_dynamicmtx, double *match, double **cpmx1, do
+ //			scarr[l] += n_dis_consweight_multi[k][l] * cpmx1[k][i1];
+ 			scarr[l] += n_dynamicmtx[k][l] * cpmx1[k][i1];
+ 	}
++#endif
+ 	for( j=0; j<lgth2; j++ )
+ 	{
+ 		match[j] = 0.0;
+@@ -1093,6 +1109,12 @@ static double Atracking( double *lasthorizontalw, double *lastverticalw,
+ #else
+ #define VMULADD(a,b,c) _mm512_add_pd( _mm512_mul_pd( (a), (b) ), (c) )
+ #endif
++#elif defined(__AVX2__) && !MAFFT_STOCK_FMA
++#include <immintrin.h>
++/* a*b+c rounded like MULADD in a build that does not contract */
++#define VMULADD4(a,b,c) _mm256_add_pd( _mm256_mul_pd( (a), (b) ), (c) )
++/* 4 x 64-bit compare mask -> 4 x 32-bit mask */
++#define PACKMASK4(c) _mm256_castsi256_si128( _mm256_permutevar8x32_epi32( _mm256_castpd_si256( c ), _mm256_setr_epi32( 0, 2, 4, 6, 0, 2, 4, 6 ) ) )
+ #endif
+ /*
+  * One row of the A__align fill for trywarp == 0 and fpenalty_ex == 0.0 (the default), equivalent
+@@ -1141,6 +1163,28 @@ static void A_row( int i, int lgth2, double *prev, double *cur, double *m, int *
+ 		}
+ 		best = _mm512_cvtsd_f64( cv ); bi = _mm256_cvtsi256_si32( ck );
+ 	}
++#elif defined(__AVX2__) && !MAFFT_STOCK_FMA
++	/* The AVX-512 scan above, 4 at a time. */
++	{
++		__m256d cv = _mm256_set1_pd( best ), vpre = _mm256_set1_pd( gf1vapre ), vext = _mm256_set1_pd( ext );
++		__m128i ck = _mm_set1_epi32( bi ), vk = _mm_setr_epi32( 0, 1, 2, 3 ), vfour = _mm_set1_epi32( 4 );
++		for( ; j+4<=lgth2; j+=4 )
++		{
++			__m256d x = VMULADD4( _mm256_loadu_pd( ogcp2 + j ), vpre, _mm256_loadu_pd( prev + j - 1 ) ), e, c;
++			__m128i t = vk, f, c32;
++			e = _mm256_blend_pd( _mm256_permute4x64_pd( x, 0x90 ), cv, 0x1 ); f = _mm_alignr_epi8( t, ck, 12 );
++			c = _mm256_cmp_pd( x, e, _CMP_GE_OQ ); c32 = PACKMASK4( c ); x = _mm256_blendv_pd( e, x, c ); t = _mm_blendv_epi8( f, t, c32 );
++			e = _mm256_permute2f128_pd( cv, x, 0x21 ); f = _mm_alignr_epi8( t, ck, 8 );
++			c = _mm256_cmp_pd( x, e, _CMP_GE_OQ ); c32 = PACKMASK4( c ); x = _mm256_blendv_pd( e, x, c ); t = _mm_blendv_epi8( f, t, c32 );
++			c = _mm256_cmp_pd( x, cv, _CMP_GE_OQ ); c32 = PACKMASK4( c ); x = _mm256_blendv_pd( cv, x, c ); t = _mm_blendv_epi8( ck, t, c32 );
++			_mm256_storeu_pd( MI + j + 1, _mm256_add_pd( x, vext ) );
++			_mm_storeu_si128( (__m128i *)( MPI + j + 1 ), t );
++			cv = _mm256_permute4x64_pd( x, 0xff );
++			ck = _mm_shuffle_epi32( t, 0xff );
++			vk = _mm_add_epi32( vk, vfour );
++		}
++		best = _mm256_cvtsd_f64( cv ); bi = _mm_cvtsi128_si32( ck );
++	}
+ #endif
+ 	for( ; j<lgth2; j++ )
+ 	{
+@@ -1219,6 +1263,40 @@ static void A_row( int i, int lgth2, double *prev, double *cur, double *m, int *
+ 			vj = _mm256_add_epi32( vj, veight );
+ 		}
+ 	}
++#elif defined(__AVX2__) && !MAFFT_STOCK_FMA
++	/* The AVX-512 block above, 4 cells at a time. */
++	{
++		__m256d vgf1va = _mm256_set1_pd( gf1va ), vfgcp1va = _mm256_set1_pd( fgcp1va ), vogcp1va = _mm256_set1_pd( ogcp1va ), vext = _mm256_set1_pd( ext );
++		__m128i vi = _mm_set1_epi32( i ), vi1 = _mm_set1_epi32( i-1 ), vfour = _mm_set1_epi32( 4 );
++		__m128i vj = _mm_setr_epi32( 1, 2, 3, 4 );
++		for( ; j+3<=lgth2; j+=4 )
++		{
++			__m256d p = _mm256_loadu_pd( prev + j - 1 );
++			__m256d wm, g1, g3, g4, mv, c;
++			__m128i ij, mpv;
++
++			g1 = VMULADD4( _mm256_loadu_pd( fgcp2 + j - 1 ), vgf1va, _mm256_loadu_pd( MI + j ) );
++			c = _mm256_cmp_pd( g1, p, _CMP_GT_OQ );
++			wm = _mm256_blendv_pd( p, g1, c );
++			ij = _mm_and_si128( PACKMASK4( c ), _mm_sub_epi32( _mm_loadu_si128( (__m128i *)( MPI + j ) ), vj ) );
++
++			mv = _mm256_loadu_pd( m + j );
++			mpv = _mm_loadu_si128( (__m128i *)( mp + j ) );
++			g3 = VMULADD4( vfgcp1va, _mm256_loadu_pd( gf2 + j ), mv );
++			c = _mm256_cmp_pd( g3, wm, _CMP_GT_OQ );
++			wm = _mm256_blendv_pd( wm, g3, c );
++			ij = _mm_blendv_epi8( ij, _mm_sub_epi32( vi, mpv ), PACKMASK4( c ) );
++
++			g4 = VMULADD4( vogcp1va, _mm256_loadu_pd( gf2 + j - 1 ), p );
++			c = _mm256_cmp_pd( g4, mv, _CMP_GE_OQ );
++			_mm256_storeu_pd( m + j, _mm256_add_pd( _mm256_blendv_pd( mv, g4, c ), vext ) );
++			_mm_storeu_si128( (__m128i *)( mp + j ), _mm_blendv_epi8( mpv, vi1, PACKMASK4( c ) ) );
++
++			_mm256_storeu_pd( cur + j, _mm256_add_pd( _mm256_loadu_pd( cur + j ), wm ) );
++			_mm_storeu_si128( (__m128i *)( ijrow + j ), ij );
++			vj = _mm_add_epi32( vj, vfour );
++		}
++	}
+ #endif
+ 	for( ; j<=lgth2; j++ )
+ 	{
+diff --git a/core/mafft.tmpl b/core/mafft.tmpl
+index dd16fd8..b895cb2 100644
+--- a/core/mafft.tmpl
++++ b/core/mafft.tmpl
+@@ -1,7 +1,7 @@
+ #! /bin/bash 
+ er=0;
+ myself=`dirname "$0"`/`basename "$0"`; export myself
+-version="v7.526-opt5 (2024/Apr/26)"; export version
++version="v7.526-opt5-dikarya1 (2024/Apr/26)"; export version
+ LANG=C; export LANG
+ os=`uname`
+ progname=`basename "$0"`
+diff --git a/core/mltaln.h b/core/mltaln.h
+index b6c929e..53f7f57 100644
+--- a/core/mltaln.h
++++ b/core/mltaln.h
+@@ -36,7 +36,7 @@
+ 
+ 
+ 
+-#define VERSION "7.526-opt5"
++#define VERSION "7.526-opt5-dikarya1"
+ #define SHOWVERSION reporterr( "%s (%s) Version " VERSION "\nalg=%c, model=%s, amax=%3.1f\n%d thread(s)\n\n", progName( argv[0] ), (dorp=='d')?"nuc":((nblosum==-2)?"text":"aa"), alg, modelname, specificityconsideration, nthread )
+ 
+ /* a*b+c rounded the way the stock build rounds it, for rewritten code that must stay
+@@ -56,6 +56,12 @@
+ #define MULADD(a,b,c) ( (a)*(b) + (c) )
+ #endif
+ 
++/* scarr[l] = sum over j of mtx[j][l] * cpmx1[j][i1], added in ascending j from +0 (see mltaln9.c) */
++#if defined(__AVX2__) && !defined(__ARM_NEON) && !MAFFT_STOCK_FMA
++#define HAVE_SCARR_FILL 1
++extern void scarr_fill( double *scarr, double **mtx, double **cpmx1, int i1 );
++#endif
++
+ #define FFT_THRESHOLD  80
+ #define FFT_WINSIZE_P   20
+ #define FFT_WINSIZE_D   100
+diff --git a/core/mltaln9.c b/core/mltaln9.c
+index a86fa12..7f7f210 100644
+--- a/core/mltaln9.c
++++ b/core/mltaln9.c
+@@ -16818,3 +16818,43 @@ void fillimp_file( double **impmtx, double *imp, int clus1, int clus2, int lgth1
+ 	}
+ #endif
+ }
++
++
++#if defined(HAVE_SCARR_FILL)
++#include <immintrin.h>
++/*
++ * The profile-score vector every match_calc builds:  for each l, scarr[l] = 0.0 and then
++ * scarr[l] += mtx[j][l] * cpmx1[j][i1] for j = 0 .. nalphabets-1, in a build that does not
++ * contract a*b+c.  Only the letters present in column i1 contribute: s + (+-0) == s for every
++ * value the sum can hold (it starts at +0 and a sum is never -0 under round-to-nearest), so the
++ * zero terms are skipped exactly.  The rest are added in the same ascending j, 4 letters at a
++ * time, each lane with its own multiply then add -- bit-identical to the scalar loop.
++ */
++void scarr_fill( double *scarr, double **mtx, double **cpmx1, int i1 )
++{
++	static TLS int *nzj = NULL, nzalloc = 0;
++	static TLS double *nzc = NULL;
++	int j, k, l, nz = 0;
++	if( nzalloc < nalphabets )
++	{
++		free( nzj ); free( nzc );
++		nzalloc = nalphabets;
++		nzj = malloc( sizeof( int ) * nzalloc );
++		nzc = malloc( sizeof( double ) * nzalloc );
++	}
++	for( j=0; j<nalphabets; j++ ) if( cpmx1[j][i1] != 0.0 ) { nzj[nz] = j; nzc[nz] = cpmx1[j][i1]; nz++; }
++	for( l=0; l+4<=nalphabets; l+=4 )
++	{
++		__m256d s = _mm256_setzero_pd();
++		for( k=0; k<nz; k++ )
++			s = _mm256_add_pd( s, _mm256_mul_pd( _mm256_loadu_pd( mtx[nzj[k]] + l ), _mm256_set1_pd( nzc[k] ) ) );
++		_mm256_storeu_pd( scarr + l, s );
++	}
++	for( ; l<nalphabets; l++ )
++	{
++		double s = 0.0;
++		for( k=0; k<nz; k++ ) s += mtx[nzj[k]][l] * nzc[k];
++		scarr[l] = s;
++	}
++}
++#endif
+diff --git a/core/mtxutl.c b/core/mtxutl.c
+index 5236527..b4462a9 100644
+--- a/core/mtxutl.c
++++ b/core/mtxutl.c
+@@ -91,6 +91,41 @@ void ReallocateCharMtx( char **mtx, int l1, int l2 )
+ } 
+ #endif
+ 
++/* AllocateCharMtx without zero-filling the rows (the row-pointer array is still cleared).  For
++   buffers that are only ever used as C strings written before they are read: Falign allocates
++   several njob x alloclen of these per call, and clearing them was a quarter of an FFT-NS-i run.
++   Freed with FreeCharMtx as usual.  -DMAFFT_POISON_TEST fills the rows with junk instead, to show
++   that nothing reads a byte it did not write. */
++char **AllocateCharMtxNoZero( int l1, int l2 )
++{
++	int i;
++	char **cmtx;
++
++	cmtx = (char **)calloc( l1+1, sizeof( char * ) );
++	if( cmtx == NULL )
++	{
++		fprintf( stderr, "Cannot allocate %d x %d character matrix.\n", l1, l2 );
++		exit( 1 );
++	}
++	if( l2 )
++	{
++		for( i=0; i<l1; i++ )
++		{
++			cmtx[i] = (char *)malloc( l2 );
++			if( cmtx[i] == NULL )
++			{
++				fprintf( stderr, "Cannot allocate %d character vector.\n", l2 );
++				exit( 1 );
++			}
++#ifdef MAFFT_POISON_TEST
++			memset( cmtx[i], 0xa5, l2 );
++#endif
++		}
++	}
++	cmtx[l1] = NULL;
++	return( cmtx );
++}
++
+ char **AllocateCharMtx( int l1, int l2 )
+ {
+ 	int i;
+diff --git a/core/mtxutl.h b/core/mtxutl.h
+index b8a5e6f..846578e 100644
+--- a/core/mtxutl.h
++++ b/core/mtxutl.h
+@@ -5,6 +5,7 @@ char *AllocateCharVec( int );
+ void FreeCharVec( char * );
+ 
+ char **AllocateCharMtx( int, int);
++char **AllocateCharMtxNoZero( int, int);
+ void ReallocateCharMtx( char **, int, int);
+ void FreeCharMtx( char ** );
+ 
+diff --git a/core/partSalignmm.c b/core/partSalignmm.c
+index 30115a5..38f0f24 100644
+--- a/core/partSalignmm.c
++++ b/core/partSalignmm.c
+@@ -1,6 +1,6 @@
+ #include "mltaln.h"
+ #include "dp.h"
+-#if defined(__AVX512F__) && !defined(__ARM_NEON)
++#if ( defined(__AVX512F__) || defined(__AVX2__) ) && !defined(__ARM_NEON)
+ #include <immintrin.h>
+ /* vector a*b+c rounded like MULADD */
+ #if MAFFT_STOCK_FMA
+@@ -8,6 +8,11 @@
+ #else
+ #define VMULADD(a,b,c) _mm512_add_pd( _mm512_mul_pd( (a), (b) ), (c) )
+ #endif
++#if defined(__AVX2__) && !MAFFT_STOCK_FMA
++#define VMULADD4(a,b,c) _mm256_add_pd( _mm256_mul_pd( (a), (b) ), (c) )
++/* 4 x 64-bit compare mask -> 4 x 32-bit mask */
++#define PACKMASK4(c) _mm256_castsi256_si128( _mm256_permutevar8x32_epi32( _mm256_castpd_si256( c ), _mm256_setr_epi32( 0, 2, 4, 6, 0, 2, 4, 6 ) ) )
++#endif
+ #endif
+ 
+ #define MACHIGAI 0
+@@ -311,6 +316,32 @@ static void mc_match( double *match, double **cpmx1, int i1, int lgth2 )
+ 			s = VMULADD( _mm512_loadu_pd( n_dis_consweight_multi[j] + l ), _mm512_set1_pd( cpmx1[j][i1] ), s );
+ 		_mm512_storeu_pd( scarr + l, s );
+ 	}
++#elif defined(__AVX2__) && !defined(__ARM_NEON) && !MAFFT_STOCK_FMA
++	/* Only the letters present in column i1 contribute: s + (+-0) == s for every s the sum can
++	   hold (it starts at +0 and a sum is never -0 under round-to-nearest), so skipping the zero
++	   terms is exact.  The remaining terms are added in ascending j, 4 letters at a time, with a
++	   separate multiply and add -- the rounding of MULADD in a build that does not contract. */
++	{
++		static TLS int *nzj = NULL, nzalloc = 0;
++		static TLS double *nzc = NULL;
++		int nz = 0;
++		if( nzalloc < nalphabets ) { free( nzj ); free( nzc ); nzalloc = nalphabets; nzj = malloc( sizeof( int ) * nzalloc ); nzc = malloc( sizeof( double ) * nzalloc ); }
++		for( j=0; j<nalphabets; j++ ) if( cpmx1[j][i1] != 0.0 ) { nzj[nz] = j; nzc[nz] = cpmx1[j][i1]; nz++; }
++		for( ; l+4<=nalphabets; l+=4 )
++		{
++			__m256d s = _mm256_setzero_pd();
++			for( k=0; k<nz; k++ )
++				s = _mm256_add_pd( _mm256_mul_pd( _mm256_loadu_pd( n_dis_consweight_multi[nzj[k]] + l ), _mm256_set1_pd( nzc[k] ) ), s );
++			_mm256_storeu_pd( scarr + l, s );
++		}
++		for( ; l<nalphabets; l++ )
++		{
++			double s = 0.0;
++			for( k=0; k<nz; k++ )
++				s = MULADD( n_dis_consweight_multi[nzj[k]][l], nzc[k], s );
++			scarr[l] = s;
++		}
++	}
+ #endif
+ 	for( ; l<nalphabets; l++ )
+ 	{
+@@ -542,6 +573,9 @@ static void match_calc_add( double **scoreingmtx, double *match, double **cpmx1,
+ 	}
+ 
+ 	{
++#ifdef HAVE_SCARR_FILL
++		scarr_fill( scarr, scoreingmtx, cpmx1, i1 );
++#else
+ 		for( l=0; l<nalphabets; l++ )
+ 		{
+ 			scarr[l] = 0.0;
+@@ -550,6 +584,7 @@ static void match_calc_add( double **scoreingmtx, double *match, double **cpmx1,
+ //				scarr[l] += n_dis_consweight_multi[j][l] * cpmx1[j][i1];
+ 				scarr[l] += scoreingmtx[j][l] * cpmx1[j][i1];
+ 		}
++#endif
+ 		matchpt = match;
+ 		cpmxpdnptpt = cpmxpdn;
+ 		cpmxpdptpt = cpmxpd;
+@@ -591,6 +626,9 @@ static void match_calc_add( double **scoreingmtx, double *match, double **cpmx1,
+ 			cpmxpdn[count][j] = -1;
+ 		}
+ 	}
++#ifdef HAVE_SCARR_FILL
++	scarr_fill( scarr, scoreingmtx, cpmx1, i1 );
++#else
+ 	for( l=0; l<nalphabets; l++ )
+ 	{
+ 		scarr[l] = 0.0;
+@@ -599,6 +637,7 @@ static void match_calc_add( double **scoreingmtx, double *match, double **cpmx1,
+ //			scarr[l] += n_dis_consweight_multi[k][l] * cpmx1[k][i1];
+ 			scarr[l] += scoreingmtx[k][l] * cpmx1[k][i1];
+ 	}
++#endif
+ 	for( j=0; j<lgth2; j++ )
+ 	{
+ 		match[j] = 0.0;
+@@ -952,6 +991,28 @@ static void partA_row( int i, int lgth2, double *prev, double *cur, double *m, i
+ 		}
+ 		best = _mm512_cvtsd_f64( cv ); bi = _mm256_cvtsi256_si32( ck );
+ 	}
++#elif defined(__AVX2__) && !defined(__ARM_NEON) && !MAFFT_STOCK_FMA
++	/* The AVX-512 scan above, 4 at a time. */
++	{
++		__m256d cv = _mm256_set1_pd( best ), vpre = _mm256_set1_pd( gf1vapre );
++		__m128i ck = _mm_set1_epi32( bi ), vk = _mm_setr_epi32( 0, 1, 2, 3 ), vfour = _mm_set1_epi32( 4 );
++		for( ; j+4<=lgth2; j+=4 )
++		{
++			__m256d x = VMULADD4( _mm256_loadu_pd( ogcp2 + j ), vpre, _mm256_loadu_pd( prev + j - 1 ) ), e, c;
++			__m128i t = vk, f, c32;
++			e = _mm256_blend_pd( _mm256_permute4x64_pd( x, 0x90 ), cv, 0x1 ); f = _mm_alignr_epi8( t, ck, 12 );
++			c = _mm256_cmp_pd( x, e, _CMP_GT_OQ ); c32 = PACKMASK4( c ); x = _mm256_blendv_pd( e, x, c ); t = _mm_blendv_epi8( f, t, c32 );
++			e = _mm256_permute2f128_pd( cv, x, 0x21 ); f = _mm_alignr_epi8( t, ck, 8 );
++			c = _mm256_cmp_pd( x, e, _CMP_GT_OQ ); c32 = PACKMASK4( c ); x = _mm256_blendv_pd( e, x, c ); t = _mm_blendv_epi8( f, t, c32 );
++			c = _mm256_cmp_pd( x, cv, _CMP_GT_OQ ); c32 = PACKMASK4( c ); x = _mm256_blendv_pd( cv, x, c ); t = _mm_blendv_epi8( ck, t, c32 );
++			_mm256_storeu_pd( MI + j + 1, x );
++			_mm_storeu_si128( (__m128i *)( MPI + j + 1 ), t );
++			cv = _mm256_permute4x64_pd( x, 0xff );
++			ck = _mm_shuffle_epi32( t, 0xff );
++			vk = _mm_add_epi32( vk, vfour );
++		}
++		best = _mm256_cvtsd_f64( cv ); bi = _mm_cvtsi128_si32( ck );
++	}
+ #endif
+ 	for( ; j<lgth2; j++ )
+ 	{
+@@ -1030,6 +1091,40 @@ static void partA_row( int i, int lgth2, double *prev, double *cur, double *m, i
+ 			vj = _mm256_add_epi32( vj, veight );
+ 		}
+ 	}
++#elif defined(__AVX2__) && !MAFFT_STOCK_FMA
++	/* The AVX-512 block above, 4 cells at a time. */
++	{
++		__m256d vgf1va = _mm256_set1_pd( gf1va ), vfgcp1va = _mm256_set1_pd( fgcp1va ), vogcp1va = _mm256_set1_pd( ogcp1va );
++		__m128i vi = _mm_set1_epi32( i ), vi1 = _mm_set1_epi32( i-1 ), vfour = _mm_set1_epi32( 4 );
++		__m128i vj = _mm_setr_epi32( 1, 2, 3, 4 );
++		for( ; j+3<=lgth2; j+=4 )
++		{
++			__m256d p = _mm256_loadu_pd( prev + j - 1 );
++			__m256d wm, g1, g3, g4, mv, c;
++			__m128i ij, mpv;
++
++			g1 = VMULADD4( _mm256_loadu_pd( fgcp2 + j - 1 ), vgf1va, _mm256_loadu_pd( MI + j ) );
++			c = _mm256_cmp_pd( g1, p, _CMP_GT_OQ );
++			wm = _mm256_blendv_pd( p, g1, c );
++			ij = _mm_and_si128( PACKMASK4( c ), _mm_sub_epi32( _mm_loadu_si128( (__m128i *)( MPI + j ) ), vj ) );
++
++			mv = _mm256_loadu_pd( m + j );
++			mpv = _mm_loadu_si128( (__m128i *)( mp + j ) );
++			g3 = VMULADD4( vfgcp1va, _mm256_loadu_pd( gapfreq2 + j ), mv );
++			c = _mm256_cmp_pd( g3, wm, _CMP_GT_OQ );
++			wm = _mm256_blendv_pd( wm, g3, c );
++			ij = _mm_blendv_epi8( ij, _mm_sub_epi32( vi, mpv ), PACKMASK4( c ) );
++
++			g4 = VMULADD4( vogcp1va, _mm256_loadu_pd( gapfreq2 + j - 1 ), p );
++			c = _mm256_cmp_pd( g4, mv, _CMP_GT_OQ );
++			_mm256_storeu_pd( m + j, _mm256_blendv_pd( mv, g4, c ) );
++			_mm_storeu_si128( (__m128i *)( mp + j ), _mm_blendv_epi8( mpv, vi1, PACKMASK4( c ) ) );
++
++			_mm256_storeu_pd( cur + j, _mm256_add_pd( _mm256_loadu_pd( cur + j ), wm ) );
++			_mm_storeu_si128( (__m128i *)( ijrow + j ), ij );
++			vj = _mm_add_epi32( vj, vfour );
++		}
++	}
+ #endif
+ 	for( ; j<=lgth2; j++ )
+ 	{
+-- 
+2.43.0
+

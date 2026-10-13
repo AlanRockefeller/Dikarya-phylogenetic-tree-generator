@@ -243,7 +243,7 @@ def test_direct_org_import_uses_shared_queue_rules():
     assert payload["sequences"][0]["identity"] == 98.5
 
 
-def test_rerun_uses_bearer_key_and_fixed_endpoint(monkeypatch):
+def test_rerun_uses_api_key_header_and_fixed_endpoint(monkeypatch):
     monkeypatch.setenv("MYCOMAP_ORG_API_KEY", "example-key")
     seen = {}
 
@@ -260,16 +260,49 @@ def test_rerun_uses_bearer_key_and_fixed_endpoint(monkeypatch):
     def urlopen(request, timeout):
         seen["url"] = request.full_url
         seen["auth"] = request.get_header("Authorization")
+        seen["key"] = request.get_header("X-api-key")
         seen["body"] = json.loads(request.data)
         return Response()
 
     with patch.object(org, "diagnostic_urlopen", side_effect=urlopen):
-        assert org.rerun("648539", "ncbi", 100)["status"] == "queued"
+        assert org.rerun("648539", "ncbi", 120)["status"] == "queued"
+    # MycoMap.org reads a raw key from X-API-Key; a Bearer header there is a
+    # mobile-app token and would make the request anonymous.
     assert seen == {
         "url": "https://mycomap.org/api/mycoblast/rerun",
-        "auth": "Bearer example-key",
-        "body": {"id": 648539, "type": "ncbi", "limit": 100},
+        "auth": None,
+        "key": "example-key",
+        "body": {"sequenceId": 648539, "rerunType": "ncbi", "maxHits": 250},
     }
+
+
+def test_rerun_max_hits_rounds_up_to_an_accepted_value():
+    assert [org.rerun_max_hits(n) for n in (1, 50, 51, 100, 101, 250, 251, 500, 9999, None)] == [
+        50, 50, 100, 100, 250, 250, 500, 500, 500, 50,
+    ]
+
+
+def test_rerun_rate_limit_is_retryable_but_a_refusal_is_not(monkeypatch):
+    import io
+    import urllib.error
+
+    monkeypatch.setenv("MYCOMAP_ORG_API_KEY", "example-key")
+
+    def answer(code):
+        def urlopen(request, timeout):
+            raise urllib.error.HTTPError(request.full_url, code, "x", {"Retry-After": "300"},
+                                         io.BytesIO(b"{}"))
+        return urlopen
+
+    for code, retryable in ((429, True), (401, False), (403, False)):
+        with patch.object(org, "diagnostic_urlopen", side_effect=answer(code)):
+            try:
+                org.rerun("648539", "local", 50)
+            except org.OrgResultError as exc:
+                assert exc.retryable is retryable, code
+                assert (org.deferral_details(exc) is not None) is retryable, code
+            else:
+                raise AssertionError(f"HTTP {code} did not raise")
 
 
 def test_rerun_waits_for_new_xml_date():
