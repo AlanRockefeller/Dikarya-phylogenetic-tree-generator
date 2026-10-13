@@ -123,6 +123,23 @@ def test_stop_rule_emitted_with_two_runs(tmp_path):
     assert metadata["mcmc_max_generations"] == 1_000_000
 
 
+def test_thread_budget_is_set_before_the_seed(tmp_path):
+    # After `set seed`, a `set beagle...` command would rerun MrBayes's setup
+    # with the seeded random stream and change the run.
+    nexus, _, _ = _run_mrbayes(tmp_path, threads=2)
+    lines = [line.strip() for line in nexus.splitlines()]
+
+    assert "set beaglethreadcount=2;" in lines
+    seed_line = next(i for i, line in enumerate(lines) if line.startswith("set seed="))
+    assert lines.index("set beaglethreadcount=2;") < seed_line
+
+
+def test_single_thread_budget_writes_no_thread_setting(tmp_path):
+    nexus, _, _ = _run_mrbayes(tmp_path, threads=1)
+
+    assert "beaglethreadcount" not in nexus
+
+
 def test_stop_rule_absent_when_disabled(tmp_path):
     nexus, metadata, _ = _run_mrbayes(tmp_path, mcmc_stop_early=False)
     mcmc = _mcmc_line(nexus)

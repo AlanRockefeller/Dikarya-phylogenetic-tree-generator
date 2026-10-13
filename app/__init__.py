@@ -298,6 +298,8 @@ def create_app(config_name='default'):
                 exception=type(exc).__name__,
             )
         if misses >= SCANNER_404_LIMIT:
+            # The access log's noise= field (see gunicorn.conf.py).
+            request.environ["dikarya.noise"] = "scanner"
             return (
                 "Too many missing routes", 429,
                 {"Retry-After": str(SCANNER_404_WINDOW_SECONDS),

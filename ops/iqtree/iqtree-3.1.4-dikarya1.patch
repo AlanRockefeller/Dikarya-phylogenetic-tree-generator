@@ -1,0 +1,1395 @@
+From 6799aa46c25023cda6e923dd4b6663f1542efc26 Mon Sep 17 00:00:00 2001
+From: Alan Rockefeller <alanrockefeller@gmail.com>
+Date: Wed, 7 Oct 2026 20:11:36 +0000
+Subject: [PATCH 01/12] SH-aLRT: draw the replicate pattern frequencies once
+ per traversal
+
+testOneBranch() re-seeds every OpenMP thread's random stream with
+ran_seed + thread number on every call, and the replicate loop is
+statically scheduled, so each of the n-3 internal branches draws exactly
+the same `times` bootstrap pattern-frequency vectors -- nsite random
+numbers per replicate, regenerated for every branch. On a 130-taxon ITS
+alignment that regeneration (createBootstrapAlignment, random_resampling,
+get_rn_dbl) was ~20% of a whole `-n 5 --alrt 1000` run.
+
+Draw the vectors once per testAllBranches() traversal, while scoring the
+first branch, and replay them for the others. The cache is keyed on the
+replicate count, pattern count, alignment and OpenMP team size (a
+different team size changes which stream draws which replicate, so it is
+re-recorded), is reset at the start of each traversal and freed at its
+end, and is skipped above 128 MB. The RELL sums are factored into one
+helper used by both paths, so each replicate's frequencies enter the
+same sums in the same order: supports are bit-identical. The serial
+(non-OpenMP) build keeps advancing the global stream between branches
+and is unchanged.
+
+SPRNG streams depend only on (stream number, seed, parameter); skipping
+init_sprng on replayed calls only leaves its global stream counter
+lower, which nothing reads for values.
+
+Co-authored-by: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01QBkV69MxCAg5qwKtaWSJ2d
+---
+ tree/phylotree.cpp | 67 ++++++++++++++++++++++++++++++++++++++--------
+ tree/phylotree.h   | 13 +++++++++
+ 2 files changed, 69 insertions(+), 11 deletions(-)
+
+diff --git a/tree/phylotree.cpp b/tree/phylotree.cpp
+index 47f422b1..82a5fa9d 100644
+--- a/tree/phylotree.cpp
++++ b/tree/phylotree.cpp
+@@ -5162,19 +5162,23 @@ void PhyloTree::computeNNIPatternLh(double cur_lh, double &lh2, double *pattern_
+         cout << "Alternative NNI shows better log-likelihood " << max(lh2,lh3) << " > " << cur_lh << endl;
+ }
+ 
+-void PhyloTree::resampleLh(double **pat_lh, double *lh_new, int *rstream) {
+-    //int nsite = getAlnNSite();
+-    int nptn = getAlnNPattern();
++/** RELL log-likelihoods of the three NNI topologies for one replicate's pattern frequencies */
++static inline void sumRellLh(double **pat_lh, double *lh_new, const int *boot_freq, int nptn) {
+     memset(lh_new, 0, sizeof(double) * 3);
+-    int i;
+-    int *boot_freq = aligned_alloc<int>(getAlnNPattern());
+-    aln->createBootstrapAlignment(boot_freq, params->bootstrap_spec, rstream);
+-    for (i = 0; i < nptn; i++) {
++    for (int i = 0; i < nptn; i++) {
+ 
+         lh_new[0] += boot_freq[i] * pat_lh[0][i];
+         lh_new[1] += boot_freq[i] * pat_lh[1][i];
+         lh_new[2] += boot_freq[i] * pat_lh[2][i];
+     }
++}
++
++void PhyloTree::resampleLh(double **pat_lh, double *lh_new, int *rstream) {
++    //int nsite = getAlnNSite();
++    int nptn = getAlnNPattern();
++    int *boot_freq = aligned_alloc<int>(getAlnNPattern());
++    aln->createBootstrapAlignment(boot_freq, params->bootstrap_spec, rstream);
++    sumRellLh(pat_lh, lh_new, boot_freq, nptn);
+     aligned_free(boot_freq);
+ }
+ 
+@@ -5390,17 +5394,43 @@ double PhyloTree::testOneBranch(double best_score, double *pattern_lh, int reps,
+         outWarning("Branch where both NNIs violate constraint tree will show 100% SH-aLRT support");
+     } else
+ #ifdef _OPENMP
++    {
++    // Every call re-seeds each thread's stream with ran_seed + thread number, and the
++    // replicate loop is statically scheduled, so every branch draws exactly the same
++    // `times` pattern-frequency vectors, at a cost of nsite random numbers each. Draw
++    // them once per testAllBranches() traversal and replay them for the other branches:
++    // the same frequencies enter the same sums, so the supports are unchanged.
++    size_t cache_ints = (size_t)times * nptn;
++    bool cacheable = cache_ints > 0 && cache_ints <= ALRT_BOOT_FREQ_MAX_INTS;
++    if (cacheable && !(alrt_boot_freq_threads > 0 && alrt_boot_freq_times == times &&
++                       alrt_boot_freq_nptn == nptn && alrt_boot_freq_aln == aln)) {
++        alrt_boot_freq_threads = 0;
++        if (alrt_boot_freq.size() < cache_ints)
++            alrt_boot_freq.resize(cache_ints);
++    }
++    int team_size = 0;
+ #pragma omp parallel
+     {
+-        int *rstream;
+-        init_random(params->ran_seed + omp_get_thread_num(), false, &rstream);
++        // a different team size means a different replicate-to-stream assignment
++        bool replay = cacheable && alrt_boot_freq_threads == omp_get_num_threads();
++        int *rstream = nullptr;
++        if (!replay)
++            init_random(params->ran_seed + omp_get_thread_num(), false, &rstream);
++        if (omp_get_thread_num() == 0)
++            team_size = omp_get_num_threads();
+ #pragma omp for reduction(+: lbp_support_int, SH_aLRT_support)
+ #endif
+     for (int i = 0; i < times; i++) {
+         double lh_new[NUM_NNI];
+         // resampling estimated log-likelihood (RELL)
+ #ifdef _OPENMP
+-        resampleLh(pat_lh, lh_new, rstream);
++        if (cacheable) {
++            int *boot_freq = alrt_boot_freq.data() + (size_t)i * nptn;
++            if (!replay)
++                aln->createBootstrapAlignment(boot_freq, params->bootstrap_spec, rstream);
++            sumRellLh(pat_lh, lh_new, boot_freq, nptn);
++        } else
++            resampleLh(pat_lh, lh_new, rstream);
+ #else
+         resampleLh(pat_lh, lh_new, randstream);
+ #endif
+@@ -5433,7 +5463,15 @@ double PhyloTree::testOneBranch(double best_score, double *pattern_lh, int reps,
+             SH_aLRT_support++;
+     }
+ #ifdef _OPENMP
+-    finish_random(rstream);
++    if (rstream)
++        finish_random(rstream);
++    }
++    if (cacheable) {
++        alrt_boot_freq_threads = team_size;
++        alrt_boot_freq_times = times;
++        alrt_boot_freq_nptn = nptn;
++        alrt_boot_freq_aln = aln;
++    }
+     }
+ #endif
+     delete[] pat_lh[2];
+@@ -5452,7 +5490,10 @@ double PhyloTree::testOneBranch(double best_score, double *pattern_lh, int reps,
+ int PhyloTree::testAllBranches(int threshold, double best_score, double *pattern_lh, int reps, int lbp_reps, bool aLRT_test, bool aBayes_test,
+         PhyloNode *node, PhyloNode *dad) {
+     int num_low_support = 0;
++    bool top_level = !node;
+     if (!node) {
++        // replicate frequencies are only reused within this traversal (see testOneBranch)
++        alrt_boot_freq_threads = 0;
+         node = (PhyloNode*) root;
+         root->neighbors[0]->node->name = "";
+         if (isSuperTree()) {
+@@ -5493,6 +5534,10 @@ int PhyloTree::testAllBranches(int threshold, double best_score, double *pattern
+     FOR_NEIGHBOR_IT(node, dad, it)
+         num_low_support += testAllBranches(threshold, best_score, pattern_lh, reps, lbp_reps, aLRT_test, aBayes_test, (PhyloNode*) (*it)->node, node);
+ 
++    if (top_level) {
++        alrt_boot_freq_threads = 0;
++        IntVector().swap(alrt_boot_freq);
++    }
+     return num_low_support;
+ }
+ 
+diff --git a/tree/phylotree.h b/tree/phylotree.h
+index e096445a..c03f5f10 100644
+--- a/tree/phylotree.h
++++ b/tree/phylotree.h
+@@ -1941,6 +1941,19 @@ public:
+             int reps, int lbp_reps, bool aLRT_test, bool aBayes_test,
+             PhyloNode *node = nullptr, PhyloNode *dad = nullptr);
+ 
++    /**
++            Pattern frequencies of the SH-aLRT/LBP replicates, drawn once per testAllBranches()
++            traversal by a team of alrt_boot_freq_threads threads (0: not drawn) and replayed
++            for every branch (see testOneBranch)
++     */
++    IntVector alrt_boot_freq;
++    int alrt_boot_freq_threads = 0;
++    int alrt_boot_freq_times = 0;
++    int alrt_boot_freq_nptn = 0;
++    Alignment *alrt_boot_freq_aln = nullptr;
++    /** do not cache more replicate frequencies than this (128 MB) */
++    static const size_t ALRT_BOOT_FREQ_MAX_INTS = 32 * 1024 * 1024;
++
+     /****************************************************************************
+             Quartet functions
+      ****************************************************************************/
+-- 
+2.43.0
+
+
+From 85048a533460b28c3395a39663cf32da9b105c46 Mon Sep 17 00:00:00 2001
+From: Alan Rockefeller <alanrockefeller@gmail.com>
+Date: Wed, 7 Oct 2026 20:11:36 +0000
+Subject: [PATCH 02/12] UFBoot: print a candidate tree only if some replicate
+ takes it
+
+saveCurrentTree() runs for every tree the search scores, including both
+alternatives of every NNI evaluated, and printed the tree before looking
+at the replicates. With -bnni (print_ufboot_trees = 2) that print sorts
+every subtree through a fresh ostringstream and formats every branch
+length through iostreams; it was ~27% of an -m MFP -B 1000 -bnni run,
+while most candidate trees win no replicate at all.
+
+Run the replicate loop first, marking the samples that take the tree,
+then print it once and store it for those samples. The loop only reads
+the tree and the same RNG draws happen in the same order, so the stored
+strings, counts and log-likelihoods are unchanged.
+
+Co-authored-by: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01QBkV69MxCAg5qwKtaWSJ2d
+---
+ tree/iqtree.cpp | 26 +++++++++++++++++---------
+ 1 file changed, 17 insertions(+), 9 deletions(-)
+
+diff --git a/tree/iqtree.cpp b/tree/iqtree.cpp
+index 93817eeb..b5053580 100644
+--- a/tree/iqtree.cpp
++++ b/tree/iqtree.cpp
+@@ -3879,15 +3879,11 @@ void IQTree::saveCurrentTree(double cur_logl) {
+ //        int ptn;
+ //        int updated = 0;
+ //        int nsamples = boot_samples.size();
+-        ostringstream ostr;
+-        string tree_str;
+         setRootNode(params->root);
+-        if (params->print_ufboot_trees == 2) {
+-            printTree(ostr, WT_TAXON_ID + WT_SORT_TAXA + WT_BR_LEN + WT_BR_LEN_SHORT);
+-        } else {
+-            printTree(ostr, WT_TAXON_ID + WT_SORT_TAXA);
+-        }
+-        tree_str = ostr.str();
++        // Printing the tree is costly (every subtree is sorted, and with -bnni every branch
++        // length is formatted) and most candidate trees win no replicate, so it is printed
++        // after the loop, only if some replicate took it. The loop does not change the tree.
++        vector<char> took_tree(sample_end - sample_start, 0);
+ 
+     #ifdef _OPENMP
+         int rand_seed = random_int(1000);
+@@ -3923,13 +3919,25 @@ void IQTree::saveCurrentTree(double cur_logl) {
+                 }
+                 boot_logl[sample] = max(boot_logl[sample], rell);
+                 boot_orig_logl[sample] = cur_logl;
+-                boot_trees[sample] = tree_str;
++                took_tree[sample - sample_start] = 1;
+             }
+         }
+     #ifdef _OPENMP
+         finish_random(rstream);
+         }
+     #endif
++        if (find(took_tree.begin(), took_tree.end(), 1) != took_tree.end()) {
++            ostringstream ostr;
++            if (params->print_ufboot_trees == 2) {
++                printTree(ostr, WT_TAXON_ID + WT_SORT_TAXA + WT_BR_LEN + WT_BR_LEN_SHORT);
++            } else {
++                printTree(ostr, WT_TAXON_ID + WT_SORT_TAXA);
++            }
++            string tree_str = ostr.str();
++            for (int sample = sample_start; sample < sample_end; sample++)
++                if (took_tree[sample - sample_start])
++                    boot_trees[sample] = tree_str;
++        }
+     }
+     if (Params::getInstance().print_tree_lh) {
+         out_treelh << cur_logl;
+-- 
+2.43.0
+
+
+From 473a820f5bde1e72f2a6dc6463aa1af91f77384b Mon Sep 17 00:00:00 2001
+From: Alan Rockefeller <alanrockefeller@gmail.com>
+Date: Wed, 7 Oct 2026 20:11:36 +0000
+Subject: [PATCH 03/12] PLL parsimony: compile fastDNAparsimony.c with -mpopcnt
+ on x86-64
+
+The parsimony kernels that build IQ-TREE's starting trees are
+integer-only and sum __builtin_popcount over every vector they touch;
+in the generic -msse3 build that is a bit-twiddling sequence per
+64-bit word. With POPCNT it is one instruction. Scores, and so the
+starting trees, cannot change.
+
+Co-authored-by: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01QBkV69MxCAg5qwKtaWSJ2d
+---
+ pll/CMakeLists.txt | 6 ++++++
+ 1 file changed, 6 insertions(+)
+
+diff --git a/pll/CMakeLists.txt b/pll/CMakeLists.txt
+index a04837b0..51f81dad 100644
+--- a/pll/CMakeLists.txt
++++ b/pll/CMakeLists.txt
+@@ -65,3 +65,9 @@ add_library(pll
+   treeIO.c
+   utils.c)
+ endif()
++
++# The parsimony kernels are integer-only and spend much of their time in
++# __builtin_popcount, which without POPCNT compiles to a bit-twiddling sequence.
++if (CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64" AND NOT IQTREE_FLAGS MATCHES "novx")
++    set_source_files_properties(fastDNAparsimony.c PROPERTIES COMPILE_FLAGS "-mpopcnt")
++endif()
+-- 
+2.43.0
+
+
+From 4560fbda838d9e514b9aba3ee28a2c82a03d6f2d Mon Sep 17 00:00:00 2001
+From: Alan Rockefeller <alanrockefeller@gmail.com>
+Date: Wed, 7 Oct 2026 20:35:00 +0000
+Subject: [PATCH 04/12] UFBoot: refresh the checkpoint only when it is about to
+ be dumped
+
+refineBootTrees() called saveCheckpoint() after every one of the 1000
+refined trees, and doTreeSearch() after every iteration. With UFBoot
+that serializes all boot_trees, their log-likelihoods (via iostream
+double formatting) and the split graphs, so the cost grows with
+replicates x trees; it was ~10% of an -m MFP -B 1000 -bnni run and most
+of a small one. Checkpoint::dump() then writes the file at most once per
+dump interval (60 s), so almost all of that work was discarded.
+
+Add Checkpoint::isDumpDue() and only save (and dump) when the dump will
+write. Nothing reads these keys of the in-memory checkpoint mid-run:
+the boot trees restore only the model, which neither IQTree::save-
+Checkpoint() nor a refining boot tree (on_refine_btree) writes, and the
+MPI readers use their own Checkpoint objects. Whenever a file is
+written it is written right after a full save, as before;
+refined_samples is still recorded every iteration; and
+refineBootTrees() and runTreeReconstruction() save the full state after
+the loops, so the final checkpoint is unchanged.
+
+Co-authored-by: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01QBkV69MxCAg5qwKtaWSJ2d
+---
+ tree/iqtree.cpp      | 18 ++++++++++++++----
+ utils/checkpoint.cpp |  4 ++++
+ utils/checkpoint.h   |  5 +++++
+ 3 files changed, 23 insertions(+), 4 deletions(-)
+
+diff --git a/tree/iqtree.cpp b/tree/iqtree.cpp
+index b5053580..f6347eae 100644
+--- a/tree/iqtree.cpp
++++ b/tree/iqtree.cpp
+@@ -2648,8 +2648,12 @@ double IQTree::doTreeSearch() {
+ 
+         // print UFBoot trees every 10 iterations
+ 
+-        saveCheckpoint();
+-        checkpoint->dump();
++        // as in refineBootTrees(): only serialize the state when the dump will write it;
++        // runTreeReconstruction() saves the final state after the search
++        if (checkpoint->isDumpDue()) {
++            saveCheckpoint();
++            checkpoint->dump();
++        }
+ 
+         if (bestcandidate_changed) {
+             printBestCandidateTree();
+@@ -3067,13 +3071,19 @@ void IQTree::refineBootTrees() {
+             cout << sample+1 << " samples done" << endl;
+         }
+ 
+-        saveCheckpoint();
++        // Saving serializes every UFBoot tree, which costs about as much as refining one,
++        // and nothing reads the in-memory checkpoint before it is dumped (the full state is
++        // saved again after this loop), so only refresh it when the dump will write it.
++        bool dump_due = checkpoint->isDumpDue();
++        if (dump_due)
++            saveCheckpoint();
+         checkpoint->startStruct("UFBoot");
+         refined_samples = sample;
+         CKP_SAVE(refined_samples);
+         checkpoint->endStruct();
+ 
+-        checkpoint->dump();
++        if (dump_due)
++            checkpoint->dump();
+ 
+ 	}
+     
+diff --git a/utils/checkpoint.cpp b/utils/checkpoint.cpp
+index 504ca5ac..4951e25e 100644
+--- a/utils/checkpoint.cpp
++++ b/utils/checkpoint.cpp
+@@ -143,6 +143,10 @@ void Checkpoint::dump(ostream &out) {
+     }
+ }
+ 
++bool Checkpoint::isDumpDue() {
++    return filename != "" && !(getRealTime() < prev_dump_time + dump_interval);
++}
++
+ void Checkpoint::dump(bool force) {
+     if (filename == "")
+         return;
+diff --git a/utils/checkpoint.h b/utils/checkpoint.h
+index 1372fc4d..75b0e038 100644
+--- a/utils/checkpoint.h
++++ b/utils/checkpoint.h
+@@ -118,6 +118,11 @@ public:
+ 	 */
+ 	void dump(bool force = false);
+ 
++	/**
++	 * @return TRUE if dump() without force would write the file now
++	 */
++	bool isDumpDue();
++
+     /**
+         set dumping interval in seconds
+         @param interval dumping interval
+-- 
+2.43.0
+
+
+From d5cef74e84f50d535f5a2d8e09536ab77734aaee Mon Sep 17 00:00:00 2001
+From: Alan Rockefeller <alanrockefeller@gmail.com>
+Date: Wed, 7 Oct 2026 20:35:00 +0000
+Subject: [PATCH 05/12] UFBoot: print sorted topology strings without
+ per-subtree streams
+
+With WT_SORT_TAXA, MTree::printTree() prints every subtree into its own
+ostringstream, collects them in a heap-allocated set and, with -bnni,
+formats each branch length through iostreams (glibc printf with
+multiprecision digits). The UFBoot candidate and refined boot trees are
+printed this way thousands of times; after the previous changes it was
+still ~8% of an -m MFP -B 1000 -bnni run.
+
+Add MTree::printSortedTreeString(), which appends the same text to a
+std::string: subtrees are built as strings and ordered by smallest taxon
+ID (keeping the first of equal IDs, as the set does), taxon IDs use
+std::to_string, and branch lengths use std::to_chars with the
+precision and notation the stream would have used -- fixed for a leaf,
+whose stream printTree() switches to fixed, the default notation for an
+internal node. std::to_chars with a precision is specified to match
+printf's %.*f / %.*g, which is what the stream produces; non-finite
+values and anything to_chars cannot fit fall back to a stream. Checked
+against ostream on 10.6M values (random bit patterns, branch-length
+magnitudes, decimal rounding ties, signed zero) at precisions 1-17 in
+both notations: no differences.
+
+It only handles WT_SORT_TAXA with WT_TAXON_ID, WT_BR_LEN, WT_BR_LEN_SHORT
+and WT_NEWLINE, and returns false otherwise; IQTreeMix,
+PhyloSuperTreeUnlinked and PhyloTreeMixlen, which print their own way,
+always return false, and the callers then use printTree() as before.
+
+Co-authored-by: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01QBkV69MxCAg5qwKtaWSJ2d
+---
+ tree/iqtree.cpp               |  26 +++++---
+ tree/iqtreemix.h              |   3 +
+ tree/mtree.cpp                | 114 ++++++++++++++++++++++++++++++++++
+ tree/mtree.h                  |  12 ++++
+ tree/phylosupertreeunlinked.h |   3 +
+ tree/phylotreemixlen.h        |   3 +
+ 6 files changed, 151 insertions(+), 10 deletions(-)
+
+diff --git a/tree/iqtree.cpp b/tree/iqtree.cpp
+index f6347eae..9bb509a8 100644
+--- a/tree/iqtree.cpp
++++ b/tree/iqtree.cpp
+@@ -3047,13 +3047,16 @@ void IQTree::refineBootTrees() {
+             cout << "UFBoot tree " << sample+1 << ": " << boot_logl[sample] << " -> " << boot_tree->getCurScore() << endl;
+         }
+ 
+-        stringstream ostr;
++        int brtype = WT_TAXON_ID | WT_SORT_TAXA;
+         if (params->print_ufboot_trees == 2) {
+-            boot_tree->printTree(ostr, WT_TAXON_ID | WT_SORT_TAXA | WT_BR_LEN | WT_BR_LEN_SHORT);
+-        } else {
+-            boot_tree->printTree(ostr, WT_TAXON_ID | WT_SORT_TAXA);
++            brtype |= WT_BR_LEN | WT_BR_LEN_SHORT;
++        }
++        boot_trees[sample].clear();
++        if (!boot_tree->printSortedTreeString(boot_trees[sample], brtype)) {
++            stringstream ostr;
++            boot_tree->printTree(ostr, brtype);
++            boot_trees[sample] = ostr.str();
+         }
+-        boot_trees[sample] = ostr.str();
+         boot_logl[sample] = boot_tree->curScore;
+ 
+ 
+@@ -3937,13 +3940,16 @@ void IQTree::saveCurrentTree(double cur_logl) {
+         }
+     #endif
+         if (find(took_tree.begin(), took_tree.end(), 1) != took_tree.end()) {
+-            ostringstream ostr;
++            int brtype = WT_TAXON_ID + WT_SORT_TAXA;
+             if (params->print_ufboot_trees == 2) {
+-                printTree(ostr, WT_TAXON_ID + WT_SORT_TAXA + WT_BR_LEN + WT_BR_LEN_SHORT);
+-            } else {
+-                printTree(ostr, WT_TAXON_ID + WT_SORT_TAXA);
++                brtype += WT_BR_LEN + WT_BR_LEN_SHORT;
++            }
++            string tree_str;
++            if (!printSortedTreeString(tree_str, brtype)) {
++                ostringstream ostr;
++                printTree(ostr, brtype);
++                tree_str = ostr.str();
+             }
+-            string tree_str = ostr.str();
+             for (int sample = sample_start; sample < sample_end; sample++)
+                 if (took_tree[sample - sample_start])
+                     boot_trees[sample] = tree_str;
+diff --git a/tree/iqtreemix.h b/tree/iqtreemix.h
+index 0350fe4b..05d06aa6 100644
+--- a/tree/iqtreemix.h
++++ b/tree/iqtreemix.h
+@@ -250,6 +250,9 @@ public:
+      */
+     virtual void printTree(ostream & out, int brtype = WT_BR_LEN) override;
+ 
++    /** this class prints trees its own way: use printTree() */
++    virtual bool printSortedTreeString(string &out, int brtype) override { return false; }
++
+     /**
+      *  Return best tree string from the candidate set
+      *
+diff --git a/tree/mtree.cpp b/tree/mtree.cpp
+index 082b94b5..df8f00aa 100644
+--- a/tree/mtree.cpp
++++ b/tree/mtree.cpp
+@@ -21,6 +21,8 @@
+ #include <iostream>
+ //#include <fstream>
+ #include <iterator>
++#include <charconv>
++#include <cmath>
+ //#include <mtree.h>
+ #include "pda/splitgraph.h"
+ #include "utils/tools.h"
+@@ -499,6 +501,118 @@ void MTree::printBranchLength(ostream &out, int brtype, bool print_slash, Neighb
+     }
+ }
+ 
++/**
++    append value as `out << value` would on a stream with this precision, in fixed notation
++    if `fixed` and in the default notation otherwise; that is printf's %.*f or %.*g, which
++    std::to_chars reproduces exactly
++*/
++static void appendStreamDouble(string &out, double value, int prec, bool fixed) {
++    char buf[128];
++    if (std::isfinite(value)) {
++        auto res = std::to_chars(buf, buf + sizeof(buf), value,
++            fixed ? std::chars_format::fixed : std::chars_format::general, prec);
++        if (res.ec == std::errc()) {
++            out.append(buf, res.ptr);
++            return;
++        }
++    }
++    ostringstream ss;
++    if (fixed)
++        ss.setf(std::ios::fixed, std::ios::floatfield);
++    ss.precision(prec);
++    ss << value;
++    out += ss.str();
++}
++
++/** printBranchLength() for the brtypes printSortedTreeString() accepts */
++static void appendSortedBranchLength(string &out, int brtype, Neighbor *length_nei, bool fixed) {
++    if (length_nei->length == -1.0)
++        return; // NA branch length
++    if (!(brtype & WT_BR_LEN))
++        return;
++    int prec = 10;
++    if (Params::getInstance().numeric_precision > 0)
++        prec = Params::getInstance().numeric_precision;
++    if (brtype & WT_BR_LEN_SHORT) prec = 6;
++    out += ':';
++    appendStreamDouble(out, length_nei->length, prec, fixed);
++}
++
++bool MTree::printSortedTreeString(string &out, int brtype) {
++    const int supported = WT_SORT_TAXA | WT_TAXON_ID | WT_BR_LEN | WT_BR_LEN_SHORT | WT_NEWLINE;
++    if (!(brtype & WT_SORT_TAXA) || (brtype & ~supported))
++        return false;
++    if (root->isLeaf()) {
++        if (root->neighbors[0]->node->isLeaf()) {
++            // tree has only 2 taxa!
++            out += '(';
++            printSortedTreeString(out, brtype, root, nullptr);
++            out += ',';
++            if (brtype & WT_TAXON_ID)
++                out += std::to_string(root->neighbors[0]->node->id);
++            else
++                out += root->neighbors[0]->node->name;
++            if (brtype & WT_BR_LEN)
++                out += ":0";
++            out += ')';
++        } else
++            // tree has more than 2 taxa
++            printSortedTreeString(out, brtype, root->neighbors[0]->node, nullptr);
++    } else
++        printSortedTreeString(out, brtype, root, nullptr);
++    out += ';';
++    if (brtype & WT_NEWLINE)
++        out += '\n';
++    return true;
++}
++
++int MTree::printSortedTreeString(string &out, int brtype, Node *node, Node *dad) {
++    int smallest_taxid = leafNum;
++    if (node->isLeaf()) {
++        smallest_taxid = node->id;
++        if (brtype & WT_TAXON_ID)
++            out += std::to_string(node->id);
++        else
++            out += node->name;
++        // printTree() switches this leaf's stream to fixed notation
++        appendSortedBranchLength(out, brtype, node->neighbors[0], true);
++        return smallest_taxid;
++    }
++    out += '(';
++    Neighbor *length_nei = nullptr;
++    vector<pair<int, string> > subtrees;
++    FOR_NEIGHBOR_IT(node, dad, it) {
++        if ((*it)->node->name != ROOT_NAME) {
++            string str;
++            int id = printSortedTreeString(str, brtype, (*it)->node, node);
++            subtrees.emplace_back(id, std::move(str));
++        } else
++            length_nei = (*it);
++    } else {
++        length_nei = (*it);
++    }
++    // printTree() collects the subtrees in a set ordered by smallest taxon ID, which keeps
++    // the first of equal IDs
++    stable_sort(subtrees.begin(), subtrees.end(),
++        [](const pair<int, string> &a, const pair<int, string> &b) { return a.first < b.first; });
++    subtrees.erase(unique(subtrees.begin(), subtrees.end(),
++        [](const pair<int, string> &a, const pair<int, string> &b) { return a.first == b.first; }),
++        subtrees.end());
++    smallest_taxid = subtrees.begin()->first;
++    for (size_t i = 0; i < subtrees.size(); i++) {
++        if (i > 0) out += ',';
++        out += subtrees[i].second;
++    }
++    out += ')';
++    if (!node->name.empty())
++        out += node->name;
++    if (dad != nullptr || length_nei) {
++        // an internal node's stream is never switched to fixed notation
++        appendSortedBranchLength(out, brtype, length_nei, false);
++    }
++    return smallest_taxid;
++}
++
+ int MTree::printTree(ostream &out, int brtype, Node *node, Node *dad)
+ {
+     int smallest_taxid = leafNum;
+diff --git a/tree/mtree.h b/tree/mtree.h
+index dab6a155..1167d0ff 100644
+--- a/tree/mtree.h
++++ b/tree/mtree.h
+@@ -223,6 +223,18 @@ public:
+      */
+     virtual int printTree(ostream &out, int brtype, Node *node, Node *dad = nullptr);
+ 
++    /**
++            append to out exactly what printTree(out, brtype) writes into a new ostringstream,
++            without the per-subtree streams and iostream number formatting
++            @param brtype WT_SORT_TAXA plus any of WT_TAXON_ID, WT_BR_LEN, WT_BR_LEN_SHORT, WT_NEWLINE
++            @return false, appending nothing, for any other brtype or for a tree class that
++                prints differently; the caller then uses printTree()
++     */
++    virtual bool printSortedTreeString(string &out, int brtype);
++
++    /** recursive part of printSortedTreeString(), mirroring printTree(out, brtype, node, dad) */
++    int printSortedTreeString(string &out, int brtype, Node *node, Node *dad);
++
+ 
+     /**
+             print the sub-tree to the output file in newick format
+diff --git a/tree/phylosupertreeunlinked.h b/tree/phylosupertreeunlinked.h
+index 07e1e1b6..72d4222a 100644
+--- a/tree/phylosupertreeunlinked.h
++++ b/tree/phylosupertreeunlinked.h
+@@ -113,6 +113,9 @@ public:
+      */
+     virtual void printTree(ostream & out, int brtype = WT_BR_LEN) override;
+ 
++    /** this class prints trees its own way: use printTree() */
++    virtual bool printSortedTreeString(string &out, int brtype) override { return false; }
++
+     /**
+      print tree to .treefile
+      @param suffix suffix of the output file
+diff --git a/tree/phylotreemixlen.h b/tree/phylotreemixlen.h
+index 81b037e1..891654d1 100644
+--- a/tree/phylotreemixlen.h
++++ b/tree/phylotreemixlen.h
+@@ -82,6 +82,9 @@ public:
+      */
+     virtual void printBranchLength(ostream &out, int brtype, bool print_slash, Neighbor *length_nei) override;
+ 
++    /** this class prints trees its own way: use printTree() */
++    virtual bool printSortedTreeString(string &out, int brtype) override { return false; }
++
+     /**
+             print tree to .treefile
+             @param suffix suffix of the output file
+-- 
+2.43.0
+
+
+From ec4c93467642aa941f5b8abc4b9a1e2d67c1b7e0 Mon Sep 17 00:00:00 2001
+From: Alan Rockefeller <alanrockefeller@gmail.com>
+Date: Wed, 7 Oct 2026 20:46:09 +0000
+Subject: [PATCH 06/12] SH-aLRT: IQTREE_ALRT_CACHE_CHECK debug build for the
+ replicate cache
+
+Compiled with -DIQTREE_ALRT_CACHE_CHECK, testOneBranch() also draws
+every replayed replicate the original way, aborts if it differs from
+the cached frequencies, and testAllBranches() reports how many it
+compared. Multi-threaded runs are not reproducible run to run, so this
+is how the cache is checked at -T 2: 413,000 replayed replicates on
+five real alignments (three at both -T 1 and -T 2, two UFBoot runs at
+-T 2), covering both resampling paths (per-site and multinomial) and
+SH-aLRT after UFBoot, all identical.
+
+Co-authored-by: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01QBkV69MxCAg5qwKtaWSJ2d
+---
+ tree/phylotree.cpp | 24 ++++++++++++++++++++++++
+ 1 file changed, 24 insertions(+)
+
+diff --git a/tree/phylotree.cpp b/tree/phylotree.cpp
+index 82a5fa9d..797f183c 100644
+--- a/tree/phylotree.cpp
++++ b/tree/phylotree.cpp
+@@ -5163,6 +5163,10 @@ void PhyloTree::computeNNIPatternLh(double cur_lh, double &lh2, double *pattern_
+ }
+ 
+ /** RELL log-likelihoods of the three NNI topologies for one replicate's pattern frequencies */
++#ifdef IQTREE_ALRT_CACHE_CHECK
++static long alrt_cache_checked = 0;
++#endif
++
+ static inline void sumRellLh(double **pat_lh, double *lh_new, const int *boot_freq, int nptn) {
+     memset(lh_new, 0, sizeof(double) * 3);
+     for (int i = 0; i < nptn; i++) {
+@@ -5414,8 +5418,14 @@ double PhyloTree::testOneBranch(double best_score, double *pattern_lh, int reps,
+         // a different team size means a different replicate-to-stream assignment
+         bool replay = cacheable && alrt_boot_freq_threads == omp_get_num_threads();
+         int *rstream = nullptr;
++#ifdef IQTREE_ALRT_CACHE_CHECK
++        // debug build: also draw every replicate as before and compare it with the replay
++        IntVector check_freq(nptn);
++        init_random(params->ran_seed + omp_get_thread_num(), false, &rstream);
++#else
+         if (!replay)
+             init_random(params->ran_seed + omp_get_thread_num(), false, &rstream);
++#endif
+         if (omp_get_thread_num() == 0)
+             team_size = omp_get_num_threads();
+ #pragma omp for reduction(+: lbp_support_int, SH_aLRT_support)
+@@ -5428,6 +5438,17 @@ double PhyloTree::testOneBranch(double best_score, double *pattern_lh, int reps,
+             int *boot_freq = alrt_boot_freq.data() + (size_t)i * nptn;
+             if (!replay)
+                 aln->createBootstrapAlignment(boot_freq, params->bootstrap_spec, rstream);
++#ifdef IQTREE_ALRT_CACHE_CHECK
++            else {
++                aln->createBootstrapAlignment(check_freq.data(), params->bootstrap_spec, rstream);
++                if (memcmp(check_freq.data(), boot_freq, sizeof(int) * nptn) != 0) {
++                    cerr << "ALRT_CACHE_CHECK: replicate " << i << " differs" << endl;
++                    abort();
++                }
++#pragma omp atomic
++                alrt_cache_checked++;
++            }
++#endif
+             sumRellLh(pat_lh, lh_new, boot_freq, nptn);
+         } else
+             resampleLh(pat_lh, lh_new, rstream);
+@@ -5537,6 +5558,9 @@ int PhyloTree::testAllBranches(int threshold, double best_score, double *pattern
+     if (top_level) {
+         alrt_boot_freq_threads = 0;
+         IntVector().swap(alrt_boot_freq);
++#ifdef IQTREE_ALRT_CACHE_CHECK
++        cout << "ALRT_CACHE_CHECK: " << alrt_cache_checked << " replayed replicates matched" << endl;
++#endif
+     }
+     return num_low_support;
+ }
+-- 
+2.43.0
+
+
+From 08f2316ae9ea5e711a44d96b50a506e9d9e9e9be Mon Sep 17 00:00:00 2001
+From: Alan Rockefeller <alanrockefeller@gmail.com>
+Date: Wed, 7 Oct 2026 21:10:09 +0000
+Subject: [PATCH 07/12] Node: define isLeaf(), degree() and findNeighbor() in
+ the header
+
+These one-line accessors live in node.cpp, so every call from the tree
+search and the likelihood kernels -- millions per run -- was an
+out-of-line call (findNeighbor alone was ~4% of a UFBoot run). Define
+them in the class; findNeighbor keeps its search order and moves only
+its error report out of line. No arithmetic is involved.
+
+Co-authored-by: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01QBkV69MxCAg5qwKtaWSJ2d
+---
+ tree/node.cpp | 17 +----------------
+ tree/node.h   | 18 +++++++++++++++---
+ 2 files changed, 16 insertions(+), 19 deletions(-)
+
+diff --git a/tree/node.cpp b/tree/node.cpp
+index 9d430ced..8eabb551 100644
+--- a/tree/node.cpp
++++ b/tree/node.cpp
+@@ -55,10 +55,6 @@ Node::Node(int aid, const char *aname) {
+     sequence = nullptr;
+ }
+ 
+-bool Node::isLeaf() {
+-    return neighbors.size() <= 1;
+-}
+-
+ bool Node::isInCherry() {
+ 	if (this->isLeaf()) {
+ 		if (neighbors[0]->node->isCherry()) {
+@@ -78,10 +74,6 @@ bool Node::isCherry() {
+     return (num_leaves > 1);
+ }
+ 
+-int Node::degree() {
+-    return neighbors.size();
+-}
+-
+ /** calculate the height of the subtree rooted at this node,
+         given the dad. Also return the lowestLeaf.
+         @param dad the dad of this node
+@@ -169,14 +161,7 @@ double Node::longestPath2(Node* &node1, Node* &node2) {
+     return node1->height;
+ }
+ 
+-Neighbor *Node::findNeighbor(Node *node) {
+-	int size = neighbors.size();
+-    for (int i = 0; i < size; i++)
+-        if (neighbors[i]->node == node) return neighbors[i];
+-    /*
+-    for (NeighborVec::iterator it = neighbors.begin(); it != neighbors.end(); it ++)
+-            if ((*it)->node == node)
+-                    return (*it);*/
++Neighbor *Node::neighborNotFound(Node *node) {
+     cout << "ERROR : Could not find neighbors of node " << node->id << endl;
+     ASSERT(0);
+     return nullptr;
+diff --git a/tree/node.h b/tree/node.h
+index 13164b81..54f8f42a 100644
+--- a/tree/node.h
++++ b/tree/node.h
+@@ -339,7 +339,9 @@ public:
+     /**
+         @return true of this is a leaf
+      */
+-    bool isLeaf();
++    bool isLeaf() {
++        return neighbors.size() <= 1;
++    }
+ 
+     /**
+      *  @return TRUE if this node is a leaf in a cherry
+@@ -354,7 +356,9 @@ public:
+     /**
+         @return the number of adjacent nodes
+      */
+-    int degree();
++    int degree() {
++        return neighbors.size();
++    }
+ 
+     /** calculate the height of the subtree rooted at this node,
+         given the dad. Also return the lowestLeaf.
+@@ -382,7 +386,15 @@ public:
+         @param node the target node
+         @return the iterator to the neighbor that has the node. If not found, return nullptr
+      */
+-    Neighbor *findNeighbor(Node *node);
++    Neighbor *findNeighbor(Node *node) {
++        int size = neighbors.size();
++        for (int i = 0; i < size; i++)
++            if (neighbors[i]->node == node) return neighbors[i];
++        return neighborNotFound(node);
++    }
++
++    /** reports the error for findNeighbor() */
++    Neighbor *neighborNotFound(Node *node);
+ 
+     /**
+      * @brief check whether the two nodes are neighbors
+-- 
+2.43.0
+
+
+From 74ee05f45bd13ddfa11394a2f732266b2b489019 Mon Sep 17 00:00:00 2001
+From: Alan Rockefeller <alanrockefeller@gmail.com>
+Date: Wed, 7 Oct 2026 21:15:37 +0000
+Subject: [PATCH 08/12] Kernels: skip the OpenMP runtime when the tree has one
+ thread
+
+computeLikelihoodDervSIMD() enters a parallel region on every Newton
+step of every branch, and computeTraversalInfo() on every traversal.
+With -T 1 each of those is a serialized region (__kmp_fork_call,
+__kmp_serialized_parallel, a dynamic-schedule dispatch per packet):
+~5% of an -m MFP -B 1000 -bnni run.
+
+When num_threads is 1, run the same loops directly. The Derv packet
+body becomes a lambda taking the reduction variables as parameters, so
+inside the OpenMP loop they still bind to the threads' reduction
+copies. A one-thread team runs the packets in order into copies that
+start at +0.0 -- a sum started at +0.0 can never end at -0.0 under
+round-to-nearest -- and then adds them to variables that are still
++0.0, which leaves them unchanged; summing directly gives the same
+values. The serialized team's thread number is 0, so the traversal's
+scratch buffer is the same too. Multi-threaded runs are unchanged.
+
+Co-authored-by: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01QBkV69MxCAg5qwKtaWSJ2d
+---
+ tree/phylokernelnew.h | 50 ++++++++++++++++++++++++++++++++++---------
+ 1 file changed, 40 insertions(+), 10 deletions(-)
+
+diff --git a/tree/phylokernelnew.h b/tree/phylokernelnew.h
+index 8969beb2..2ecf5f10 100644
+--- a/tree/phylokernelnew.h
++++ b/tree/phylokernelnew.h
+@@ -1242,13 +1242,11 @@ void PhyloTree::computeTraversalInfo(PhyloNode *node, PhyloNode *dad, bool compu
+         
+         if (!Params::getInstance().buffer_mem_save) {
+ #ifdef _OPENMP
+-#pragma omp parallel if (num_info >= 3) num_threads(num_threads)
++        if (num_info >= 3 && num_threads > 1) {
++#pragma omp parallel num_threads(num_threads)
+         {
+             VectorClass *buffer_tmp = (VectorClass*)buffer + aln->num_states*omp_get_thread_num();
+ #pragma omp for schedule(static)
+-#else
+-            VectorClass *buffer_tmp = (VectorClass*)buffer;
+-#endif
+             for (int i = 0; i < num_info; i++) {
+             #ifdef KERNEL_FIX_STATES
+                 computePartialInfo<VectorClass, nstates>(traversal_info[i], buffer_tmp);
+@@ -1256,9 +1254,20 @@ void PhyloTree::computeTraversalInfo(PhyloNode *node, PhyloNode *dad, bool compu
+                 computePartialInfo<VectorClass>(traversal_info[i], buffer_tmp);
+             #endif
+             }
+-#ifdef _OPENMP
+         }
++        } else
+ #endif
++        {
++            // one thread (the team of a serialized region is thread 0): no OpenMP runtime
++            VectorClass *buffer_tmp = (VectorClass*)buffer;
++            for (int i = 0; i < num_info; i++) {
++            #ifdef KERNEL_FIX_STATES
++                computePartialInfo<VectorClass, nstates>(traversal_info[i], buffer_tmp);
++            #else
++                computePartialInfo<VectorClass>(traversal_info[i], buffer_tmp);
++            #endif
++            }
++        }
+         }
+     }
+ 
+@@ -1269,8 +1278,16 @@ void PhyloTree::computeTraversalInfo(PhyloNode *node, PhyloNode *dad, bool compu
+         computeBounds<VectorClass>(num_threads, num_packets, nptn, limits);
+ 
+         #ifdef _OPENMP
++        if (num_threads > 1) {
+         #pragma omp parallel for schedule(dynamic,1) num_threads(num_threads)
++        for (int packet_id = 0; packet_id < num_packets; ++packet_id) {
++            for (auto it = traversal_info.begin(); it != traversal_info.end(); it++) {
++                computePartialLikelihood(*it, limits[packet_id], limits[packet_id+1], packet_id);
++            }
++        }
++        } else
+         #endif
++        // one thread: the same packets in the same order, without the OpenMP runtime
+         for (int packet_id = 0; packet_id < num_packets; ++packet_id) {
+             for (auto it = traversal_info.begin(); it != traversal_info.end(); it++) {
+                 computePartialLikelihood(*it, limits[packet_id], limits[packet_id+1], packet_id);
+@@ -2378,10 +2395,10 @@ void PhyloTree::computeLikelihoodDervGenericSIMD(PhyloNeighbor *dad_branch, Phyl
+     }
+ 
+     double all_lh(0.0), all_df(0.0), all_ddf(0.0), all_prob_const(0.0), all_df_const(0.0), all_ddf_const(0.0);
+-#ifdef _OPENMP
+-#pragma omp parallel for schedule(dynamic,1) num_threads(num_threads) reduction(+:all_lh,all_df,all_ddf,all_prob_const,all_df_const,all_ddf_const)
+-#endif
+-    for (int packet_id = 0; packet_id < num_packets; packet_id++) {
++    // One packet. The sums are parameters so that inside the OpenMP loop they bind to the
++    // thread's reduction copies.
++    auto derv_packet = [&](int packet_id, double &all_lh, double &all_df, double &all_ddf,
++                           double &all_prob_const, double &all_df_const, double &all_ddf_const) {
+         size_t ptn_lower = limits[packet_id];
+         size_t ptn_upper = limits[packet_id+1];
+ 
+@@ -2577,7 +2594,20 @@ void PhyloTree::computeLikelihoodDervGenericSIMD(PhyloNeighbor *dad_branch, Phyl
+             }
+ 
+         } // else isMixlen()
+-    } // FOR packet
++    }; // packet
++#ifdef _OPENMP
++    if (num_threads > 1) {
++#pragma omp parallel for schedule(dynamic,1) num_threads(num_threads) reduction(+:all_lh,all_df,all_ddf,all_prob_const,all_df_const,all_ddf_const)
++        for (int packet_id = 0; packet_id < num_packets; packet_id++)
++            derv_packet(packet_id, all_lh, all_df, all_ddf, all_prob_const, all_df_const, all_ddf_const);
++    } else
++#endif
++    // This runs for every Newton step of every branch. A one-thread team would run the
++    // packets in order into reduction copies that start at +0.0 (so never end at -0.0) and
++    // then add them to these +0.0 variables: the same values as summing here directly,
++    // without entering the OpenMP runtime.
++    for (int packet_id = 0; packet_id < num_packets; packet_id++)
++        derv_packet(packet_id, all_lh, all_df, all_ddf, all_prob_const, all_df_const, all_ddf_const);
+     gradient_vector[branch_id] = all_df;
+     hessian_diagonal[branch_id] = all_ddf;
+ 
+-- 
+2.43.0
+
+
+From dbb9538c6c00da3f29eac8ea3726c32fcaeccf70 Mon Sep 17 00:00:00 2001
+From: Alan Rockefeller <alanrockefeller@gmail.com>
+Date: Wed, 7 Oct 2026 21:32:06 +0000
+Subject: [PATCH 09/12] Kernels: interleave tip partial likelihoods with vector
+ transposes
+
+Where a child is a leaf, the kernels look up the precomputed partial
+likelihood of each of the 4 patterns' tip states and interleave them
+pattern by pattern into a buffer, which is then read as vectors. The
+interleave was one double at a time (clang emits scalar vmovq
+load/store pairs), so each 256-bit vector read back had been written by
+four separate 8-byte stores, which cannot be forwarded to the load.
+
+Do the interleave in interleaveTipLh(): with 4 patterns per vector and
+an AVX target, four vector loads, a 4x4 transpose (unpacklo/hi,
+permute2f128) and four vector stores; the old loop otherwise. The same
+doubles land at the same places; no arithmetic changes. Used for the
+tip-tip and tip-internal partial likelihoods,
+computeLikelihoodBufferSIMD and computeLikelihoodBranchSIMD (the rare
+multifurcating case is left alone). The helper is file-local because
+this header is compiled once per instruction set.
+
+-T 1, 8 real Quick Tree inputs: 19.6 s -> 18.3 s; 2 -m MFP -B 1000
+-bnni runs: 47.2 s -> 41.9 s. All outputs identical.
+
+Co-authored-by: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01QBkV69MxCAg5qwKtaWSJ2d
+---
+ tree/phylokernelnew.h | 102 ++++++++++++++++++++++++++++++------------
+ 1 file changed, 74 insertions(+), 28 deletions(-)
+
+diff --git a/tree/phylokernelnew.h b/tree/phylokernelnew.h
+index 2ecf5f10..00adb914 100644
+--- a/tree/phylokernelnew.h
++++ b/tree/phylokernelnew.h
+@@ -37,6 +37,66 @@
+     @param[out] X sum of elements of A
+ */
+ #ifndef KERNEL_FIX_STATES
++namespace {
++
++/**
++    Interleave the tip partial likelihoods of W patterns, one vector lane each:
++    vec[i*W + x] = tips[x][i] for i < len. Only copies values. The kernels used to do
++    this one double at a time, so every vector they then loaded from vec had been
++    written by W separate stores, which the CPU cannot forward to a vector load.
++    Kept file-local: this header is compiled once per instruction set.
++*/
++template <size_t W>
++struct TipLhInterleave {
++    static inline void run(double *vec, const double *const *tips, size_t len) {
++        for (size_t x = 0; x < W; x++) {
++            double *v = vec + x;
++            const double *t = tips[x];
++            for (size_t i = 0; i < len; i++, v += W)
++                *v = t[i];
++        }
++    }
++};
++
++#if defined(__AVX__) && !defined(__ARM_NEON)
++/** four patterns: a 4x4 transpose per four values */
++template <>
++struct TipLhInterleave<4> {
++    static inline void run(double *vec, const double *const *tips, size_t len) {
++        if (len % 4 != 0) {
++            for (size_t x = 0; x < 4; x++) {
++                double *v = vec + x;
++                const double *t = tips[x];
++                for (size_t i = 0; i < len; i++, v += 4)
++                    *v = t[i];
++            }
++            return;
++        }
++        for (size_t i = 0; i < len; i += 4) {
++            __m256d r0 = _mm256_loadu_pd(tips[0] + i); // a0 a1 a2 a3
++            __m256d r1 = _mm256_loadu_pd(tips[1] + i); // b0 b1 b2 b3
++            __m256d r2 = _mm256_loadu_pd(tips[2] + i); // c0 c1 c2 c3
++            __m256d r3 = _mm256_loadu_pd(tips[3] + i); // d0 d1 d2 d3
++            __m256d u0 = _mm256_unpacklo_pd(r0, r1);   // a0 b0 a2 b2
++            __m256d u1 = _mm256_unpackhi_pd(r0, r1);   // a1 b1 a3 b3
++            __m256d u2 = _mm256_unpacklo_pd(r2, r3);   // c0 d0 c2 d2
++            __m256d u3 = _mm256_unpackhi_pd(r2, r3);   // c1 d1 c3 d3
++            _mm256_storeu_pd(vec + 4*i,      _mm256_permute2f128_pd(u0, u2, 0x20)); // a0 b0 c0 d0
++            _mm256_storeu_pd(vec + 4*i + 4,  _mm256_permute2f128_pd(u1, u3, 0x20)); // a1 b1 c1 d1
++            _mm256_storeu_pd(vec + 4*i + 8,  _mm256_permute2f128_pd(u0, u2, 0x31)); // a2 b2 c2 d2
++            _mm256_storeu_pd(vec + 4*i + 12, _mm256_permute2f128_pd(u1, u3, 0x31)); // a3 b3 c3 d3
++        }
++    }
++};
++#endif
++
++template <class VectorClass>
++inline void interleaveTipLh(double *vec, const double *const *tips, size_t len) {
++    TipLhInterleave<sizeof(VectorClass) / sizeof(double)>::run(vec, tips, len);
++}
++
++} // namespace
++
+ template <class VectorClass, const bool append>
+ inline void sumVec(VectorClass *A, VectorClass &X, size_t N)
+ {
+@@ -1702,6 +1762,7 @@ void PhyloTree::computePartialLikelihoodGenericSIMD(TraversalInfo &info
+             } else {
+                 VectorClass *vleft  = (VectorClass*)vec_left;
+                 VectorClass *vright = (VectorClass*)vec_right;
++                const double *tips_left[VectorClass::size()], *tips_right[VectorClass::size()];
+                 // load data for tip
+                 for (size_t x = 0; x < VectorClass::size(); x++) {
+                     int leftState;
+@@ -1727,17 +1788,11 @@ void PhyloTree::computePartialLikelihoodGenericSIMD(TraversalInfo &info
+                         leftState  = unknown;
+                         rightState = unknown;
+                     }
+-                    const double* tip_left  = partial_lh_left  + block*leftState;
+-                    const double* tip_right = partial_lh_right + block*rightState;
+-                    double* this_vec_left = vec_left+x;
+-                    double* this_vec_right = vec_right+x;
+-                    for (size_t i = 0; i < block; i++) {
+-                        *this_vec_left = tip_left[i];
+-                        *this_vec_right = tip_right[i];
+-                        this_vec_left += VectorClass::size();
+-                        this_vec_right += VectorClass::size();
+-                    }
++                    tips_left[x]  = partial_lh_left  + block*leftState;
++                    tips_right[x] = partial_lh_right + block*rightState;
+                 }
++                interleaveTipLh<VectorClass>(vec_left, tips_left, block);
++                interleaveTipLh<VectorClass>(vec_right, tips_right, block);
+ 
+ 
+                 for (size_t c = 0; c < ncat_mix; c++) {
+@@ -1835,6 +1890,7 @@ void PhyloTree::computePartialLikelihoodGenericSIMD(TraversalInfo &info
+ 
+             } else {
+                 VectorClass *vleft = (VectorClass*)vec_left;
++                const double *tips[VectorClass::size()];
+                 // load data for tip
+                 for (size_t x = 0; x < VectorClass::size(); x++) {
+                     int state;
+@@ -1851,13 +1907,9 @@ void PhyloTree::computePartialLikelihoodGenericSIMD(TraversalInfo &info
+                     } else {
+                         state = unknown;
+                     }
+-                    const double *tip = partial_lh_left + block*state;
+-                    double *this_vec_left = vec_left+x;
+-                    for (size_t i = 0; i < block; i++) {
+-                        *this_vec_left = tip[i];
+-                        this_vec_left += VectorClass::size();
+-                    }
++                    tips[x] = partial_lh_left + block*state;
+                 }
++                interleaveTipLh<VectorClass>(vec_left, tips, block);
+ 
+                 double *eright_ptr = eright;
+                 for (size_t c = 0; c < ncat_mix; c++) {
+@@ -2122,6 +2174,7 @@ void PhyloTree::computeLikelihoodBufferGenericSIMD(PhyloNeighbor *dad_branch, Ph
+             VectorClass *theta = (VectorClass*)(theta_all + offset);
+             //load tip vector
+             if (!SITE_MODEL) {
++                const double *tips[VectorClass::size()];
+                 for (size_t i = 0; i < VectorClass::size(); i++) {
+                     int state;
+                     if (ptn+i < orig_nptn) {
+@@ -2137,13 +2190,9 @@ void PhyloTree::computeLikelihoodBufferGenericSIMD(PhyloNeighbor *dad_branch, Ph
+                     } else {
+                         state = unknown;
+                     }
+-                    const double *this_tip_partial_lh = tip_partial_lh + tip_block*state;
+-                    double *this_vec_tip = vec_tip+i;
+-                    for (size_t c = 0; c < tip_block; c++) {
+-                        *this_vec_tip = this_tip_partial_lh[c];
+-                        this_vec_tip += VectorClass::size();
+-                    }
++                    tips[i] = tip_partial_lh + tip_block*state;
+                 }
++                interleaveTipLh<VectorClass>(vec_tip, tips, tip_block);
+             }
+             VectorClass *lh_tip;
+             if (SITE_MODEL) {
+@@ -2920,6 +2969,7 @@ double PhyloTree::computeLikelihoodBranchGenericSIMD(PhyloNeighbor *dad_branch,
+                     }
+                 } else { // normal model
+                     //load tip vector
++                    const double *tips[VectorClass::size()];
+                     for (size_t i = 0; i < VectorClass::size(); i++) {
+                         int state;
+                         if (ptn+i < orig_nptn) {
+@@ -2935,13 +2985,9 @@ double PhyloTree::computeLikelihoodBranchGenericSIMD(PhyloNeighbor *dad_branch,
+                         } else {
+                             state = aln->STATE_UNKNOWN;
+                         }
+-                        const double *lh_tip = partial_lh_node + block*state;
+-                        double *this_vec_tip = vec_tip+i;
+-                        for (size_t c = 0; c < block; c++) {
+-                            *this_vec_tip = lh_tip[c];
+-                            this_vec_tip += VectorClass::size();
+-                        }
++                        tips[i] = partial_lh_node + block*state;
+                     }
++                    interleaveTipLh<VectorClass>(vec_tip, tips, block);
+                     // compute likelihood per category
+                     for (size_t c = 0; c < ncat_mix; c++) {
+     #ifdef KERNEL_FIX_STATES
+-- 
+2.43.0
+
+
+From 7a43616e5cd1283764401c912717f76e49a7ff65 Mon Sep 17 00:00:00 2001
+From: Alan Rockefeller <alanrockefeller@gmail.com>
+Date: Wed, 7 Oct 2026 21:40:12 +0000
+Subject: [PATCH 10/12] Kernels: capture the Derv packet's inputs by value
+
+The packet lambda only writes its sums (parameters) and arrays reached
+through pointers; capture the other locals by value so the pattern loop
+does not reload them through the closure. A non-mutable lambda cannot
+assign a by-value capture, so the compiler confirms none is written.
+The variable-length arrays stay by reference.
+
+Co-authored-by: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01QBkV69MxCAg5qwKtaWSJ2d
+---
+ tree/phylokernelnew.h | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/tree/phylokernelnew.h b/tree/phylokernelnew.h
+index 00adb914..0e4b59ba 100644
+--- a/tree/phylokernelnew.h
++++ b/tree/phylokernelnew.h
+@@ -2446,7 +2446,7 @@ void PhyloTree::computeLikelihoodDervGenericSIMD(PhyloNeighbor *dad_branch, Phyl
+     double all_lh(0.0), all_df(0.0), all_ddf(0.0), all_prob_const(0.0), all_df_const(0.0), all_ddf_const(0.0);
+     // One packet. The sums are parameters so that inside the OpenMP loop they bind to the
+     // thread's reduction copies.
+-    auto derv_packet = [&](int packet_id, double &all_lh, double &all_df, double &all_ddf,
++    auto derv_packet = [=, &cat_rate, &cat_prop, &mix_addr_nstates_malign, &mix_addr_malign, &cat_id](int packet_id, double &all_lh, double &all_df, double &all_ddf,
+                            double &all_prob_const, double &all_df_const, double &all_ddf_const) {
+         size_t ptn_lower = limits[packet_id];
+         size_t ptn_upper = limits[packet_id+1];
+-- 
+2.43.0
+
+
+From 97c9800378addd0e9ad03ba84545cf50528b150a Mon Sep 17 00:00:00 2001
+From: Alan Rockefeller <alanrockefeller@gmail.com>
+Date: Thu, 8 Oct 2026 03:03:52 +0000
+Subject: [PATCH 11/12] Kernels: two pattern blocks per pass for
+ internal-internal partials
+
+For every 4-pattern block and rate category the internal-internal case
+broadcasts the same 48 coefficients (both children's eigenvector x exp
+rows and the inverse eigenvectors) from memory. Process two blocks per
+pass in the fixed-4-state, non-safe, non-site-model instantiation:
+each block makes exactly the dotProductDualVec / productVecMat calls of
+the single-block loop on the same operands, with its temporaries in
+registers, and then runs the same scaling check; only the coefficient
+loads are shared. The blocks write disjoint patterns, so interleaving
+them changes no value. A trailing odd block uses the original loop.
+
+GTR+F+R6 on a 489-taxon alignment (-n 3): 223.8 s -> 210.9 s;
+identical outputs.
+
+Co-authored-by: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01QBkV69MxCAg5qwKtaWSJ2d
+---
+ tree/phylokernelnew.h | 64 ++++++++++++++++++++++++++++++++++++++++++-
+ 1 file changed, 63 insertions(+), 1 deletion(-)
+
+diff --git a/tree/phylokernelnew.h b/tree/phylokernelnew.h
+index 0e4b59ba..aaf18b73 100644
+--- a/tree/phylokernelnew.h
++++ b/tree/phylokernelnew.h
+@@ -1980,7 +1980,69 @@ void PhyloTree::computePartialLikelihoodGenericSIMD(TraversalInfo &info
+ 
+         VectorClass *partial_lh_tmp
+             = (VectorClass*)(buffer_partial_lh_ptr + thread_buf_size * packet_id);
+-		for (size_t ptn = ptn_lower; ptn < ptn_upper; ptn+=VectorClass::size()) {
++        size_t ptn = ptn_lower;
++#ifdef KERNEL_FIX_STATES
++        if (!SAFE_NUMERIC && !SITE_MODEL && nstates == 4) {
++            // Two pattern blocks per pass: each block makes exactly the calls of the
++            // single-block loop below, on the same operands, but the per-category
++            // eigenvector coefficients are loaded once for both. The blocks write
++            // disjoint patterns, so the order between them does not matter.
++            for (; ptn + 2*VectorClass::size() <= ptn_upper; ptn += 2*VectorClass::size()) {
++                const size_t ptn_b = ptn + VectorClass::size();
++                VectorClass *partial_lh_a = (VectorClass*)(dad_branch->partial_lh + (ptn*block));
++                VectorClass *partial_lh_b = (VectorClass*)(dad_branch->partial_lh + (ptn_b*block));
++                VectorClass *left_a = (VectorClass*)(left->partial_lh + (ptn*block));
++                VectorClass *left_b = (VectorClass*)(left->partial_lh + (ptn_b*block));
++                VectorClass *right_a = (VectorClass*)(right->partial_lh + (ptn*block));
++                VectorClass *right_b = (VectorClass*)(right->partial_lh + (ptn_b*block));
++                VectorClass lh_max_a = 0.0, lh_max_b = 0.0;
++                for (size_t i = 0; i < 2*VectorClass::size(); i++)
++                    dad_branch->scale_num[ptn+i] = left->scale_num[ptn+i] + right->scale_num[ptn+i];
++                double *eleft_ptr = eleft;
++                double *eright_ptr = eright;
++                for (size_t c = 0; c < ncat_mix; c++) {
++                    double *inv_evec_ptr = inv_evec + mix_addr_malign[c];
++                    VectorClass tmp_a[nstates], tmp_b[nstates], out_a[nstates], out_b[nstates];
++                    for (size_t x = 0; x < nstates; x++) {
++                        dotProductDualVec<VectorClass, double, nstates, FMA>(eleft_ptr, left_a, eright_ptr, right_a, tmp_a[x]);
++                        dotProductDualVec<VectorClass, double, nstates, FMA>(eleft_ptr, left_b, eright_ptr, right_b, tmp_b[x]);
++                        eleft_ptr += nstates;
++                        eright_ptr += nstates;
++                    }
++                    productVecMat<VectorClass, double, nstates, FMA>(tmp_a, inv_evec_ptr, out_a, lh_max_a);
++                    productVecMat<VectorClass, double, nstates, FMA>(tmp_b, inv_evec_ptr, out_b, lh_max_b);
++                    for (size_t x = 0; x < nstates; x++) {
++                        partial_lh_a[x] = out_a[x];
++                        partial_lh_b[x] = out_b[x];
++                    }
++                    left_a += nstates;
++                    left_b += nstates;
++                    right_a += nstates;
++                    right_b += nstates;
++                    partial_lh_a += nstates;
++                    partial_lh_b += nstates;
++                }
++                // the single-block loop's scaling check, for each block
++                for (size_t b = 0; b < 2; b++) {
++                    const size_t ptn_x = b ? ptn_b : ptn;
++                    VectorClass lh_max = b ? lh_max_b : lh_max_a;
++                    auto underflown = (lh_max < SCALING_THRESHOLD) & (VectorClass().load_a(&ptn_invar[ptn_x]) == 0.0);
++                    if (horizontal_or(underflown)) { // at least one site has numerical underflown
++                        for (size_t x = 0; x < VectorClass::size(); x++)
++                        if (underflown[x]) {
++                            double *partial_lh = dad_branch->partial_lh + (ptn_x*block + x);
++                            // now do the likelihood scaling
++                            for (size_t i = 0; i < block; i++) {
++                                partial_lh[i*VectorClass::size()] = ldexp(partial_lh[i*VectorClass::size()], SCALING_THRESHOLD_EXP);
++                            }
++                            dad_branch->scale_num[ptn_x+x] += 1;
++                        }
++                    }
++                }
++            }
++        }
++#endif
++		for (; ptn < ptn_upper; ptn+=VectorClass::size()) {
+ 			VectorClass *partial_lh = (VectorClass*)(dad_branch->partial_lh + (ptn*block));
+ 			VectorClass *partial_lh_left = (VectorClass*)(left->partial_lh + (ptn*block));
+ 			VectorClass *partial_lh_right = (VectorClass*)(right->partial_lh + (ptn*block));
+-- 
+2.43.0
+
+
+From 92e88b6297105bf12e5c70c849466c4e3b015c50 Mon Sep 17 00:00:00 2001
+From: Alan Rockefeller <alanrockefeller@gmail.com>
+Date: Wed, 7 Oct 2026 21:52:53 +0000
+Subject: [PATCH 12/12] Version 3.1.4-dikarya1
+
+Name the build in the banner, the .iqtree report and the checkpoint, so a
+run's log says which binary produced it. The version string is only
+printed and stored; nothing parses it.
+
+Co-authored-by: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01QBkV69MxCAg5qwKtaWSJ2d
+---
+ CMakeLists.txt | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index a8cade34..d7adc928 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -121,7 +121,7 @@ find_package(Backtrace)
+ # The version number.
+ set (iqtree_VERSION_MAJOR 3)
+ set (iqtree_VERSION_MINOR 1)
+-set (iqtree_VERSION_PATCH ".4")
++set (iqtree_VERSION_PATCH ".4-dikarya1")
+ 
+ option(BUILD_SHARED_LIBS "Build Shared Libraries" OFF)
+ 
+-- 
+2.43.0
+
