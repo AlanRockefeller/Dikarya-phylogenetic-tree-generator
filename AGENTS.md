@@ -366,6 +366,7 @@ Both layouts render one shared shell: a global bar (Journal | Workbench switcher
 - **`partials/site_theme.html` must come first in `<head>`.** It sets both `.dark` and `data-theme` before first paint, and exposes `window.dikaryaTheme`. `localStorage['theme']` only ever holds `"light"` or `"dark"`; System means the key is absent. Never store `"system"`, because a page cached from before the shell reads any non-`"dark"` value as light.
 - **The account menu (signed in) and the signed-out menu share** the `theme_group()` and `help_and_updates()` macros in `site_global_bar.html`. Change them there so the two menus cannot drift apart. On phones both menus also carry What's New, whose bar button is hidden below 768px.
 - **Gold is reserved** for the active switcher segment, the active-tab underline and badges. Nothing in the navigation is a gold button.
+- **The shell stays below modals.** `.dk-header` is `z-index: 45`: above the tree viewer's sticky status dock (40), below the `z-50`/`z-[60]` modals and the expanded tree view (990). The Label Tools panel is page-level at 46. Do not raise either above 49, or the bar covers the top of every modal and stays clickable behind it.
 
 ## Claude Review ("Analyze with Claude")
 
