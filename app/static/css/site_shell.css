@@ -132,10 +132,14 @@
 
 /* ---- Global bar ---- */
 
+/* Above the tree viewer's sticky status dock (40), below the modals (z-50 and
+   z-[60]) and the expanded tree view (990), as the old z-50 nav was. Its menu
+   panels and the skip link sit inside this stacking context, so their own
+   z-indexes only order them within the header. */
 .dk-header {
     position: sticky;
     top: 0;
-    z-index: 1000;
+    z-index: 45;
     background: var(--dk-bar-bg);
     border-bottom: 1px solid var(--dk-bar-border);
     color: var(--dk-bar-text);
@@ -552,6 +556,9 @@
 
 .dk-local-panel {
     top: calc(100% - 2px);
+    /* The tab row is not in the header's stacking context, so this is a
+       page-level z-index: above page content, below the modals (z-50). */
+    z-index: 46;
     min-width: 200px;
 }
 
