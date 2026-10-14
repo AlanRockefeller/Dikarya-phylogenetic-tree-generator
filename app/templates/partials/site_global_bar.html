@@ -1,0 +1,271 @@
+{#- Global bar: identical on every Journal and Workbench page.
+    Config and active state come from app/navigation.py via site_nav().
+    The layout must give its <main> the id in `skip_target` (default
+    "main-content") for the skip link to land. -#}
+{%- set nav = site_nav() -%}
+
+{#- Shared by the account menu and the signed-out menu. -#}
+{%- macro theme_group() %}
+                    <div class="dk-theme" role="group" aria-labelledby="dk-theme-label">
+                        <span class="dk-menu-caption" id="dk-theme-label">Theme</span>
+                        <div class="dk-theme-options">
+                            <button type="button" class="dk-theme-option" data-dk-theme="light" aria-pressed="false">
+                                <i class="fas fa-sun" aria-hidden="true"></i> Light</button>
+                            <button type="button" class="dk-theme-option" data-dk-theme="dark" aria-pressed="false">
+                                <i class="fas fa-moon" aria-hidden="true"></i> Dark</button>
+                            <button type="button" class="dk-theme-option" data-dk-theme="system" aria-pressed="false">
+                                <i class="fas fa-desktop" aria-hidden="true"></i> System</button>
+                        </div>
+                    </div>
+{%- endmacro %}
+
+{#- Help & Docs, plus What's New and Feedback & Roadmap on phones, where
+    the What's New button is hidden (spec section 7). -#}
+{%- macro help_and_updates(nav) %}
+                        {%- if nav.help_url %}
+                        <li><a class="dk-menu-item" href="{{ nav.help_url }}">
+                            <i class="fas fa-circle-question" aria-hidden="true"></i> Help &amp; Docs</a></li>
+                        {%- endif %}
+                        {%- if nav.changelog_url %}
+                        <li class="dk-only-mobile"><a class="dk-menu-item" href="{{ nav.changelog_url }}">
+                            <i class="fas fa-bell" aria-hidden="true"></i> What's New
+                            {%- if whats_new_has_new %}<span class="dk-pill">New</span>{% endif %}</a></li>
+                        {%- endif %}
+                        {%- if nav.roadmap_url %}
+                        <li class="dk-only-mobile"><a class="dk-menu-item" href="{{ nav.roadmap_url }}">
+                            <i class="fas fa-route" aria-hidden="true"></i> Feedback &amp; Roadmap</a></li>
+                        {%- endif %}
+{%- endmacro %}
+<a class="dk-skip" href="#{{ skip_target|default('main-content') }}">Skip to content</a>
+<header class="dk-shell dk-header">
+    <nav class="dk-bar" aria-label="Global">
+        <a class="dk-logo" href="{{ nav.home_url }}" aria-label="Dikarya home">
+            <span class="dk-logo-mark" aria-hidden="true">🍄</span>
+            <span class="dk-wordmark">Dikarya</span>
+        </a>
+
+        <ul class="dk-switcher">
+            {%- for section in nav.sections if section.url %}
+            <li>
+                <a href="{{ section.url }}" class="dk-switcher-item"
+                    {%- if section.current %} aria-current="{{ section.current }}"{% endif %}>{{ section.label }}</a>
+            </li>
+            {%- endfor %}
+        </ul>
+
+        <div class="dk-actions">
+            {#- What's New. On a phone it moves into the account menu, or the
+                signed-out menu (spec section 7). -#}
+            <div class="dk-menu dk-hide-mobile" data-dk-menu>
+                <button type="button" class="dk-action" data-dk-menu-trigger
+                    aria-haspopup="true" aria-expanded="false" aria-controls="dk-whats-new-panel"
+                    aria-label="What's New{% if whats_new_has_new %}, new updates{% endif %}"
+                    title="What's New">
+                    <span class="dk-icon-wrap">
+                        <i class="fas fa-bell" aria-hidden="true"></i>
+                        {%- if whats_new_has_new %}<span class="dk-dot" aria-hidden="true"></span>{% endif %}
+                    </span>
+                    <span class="dk-action-label">What's New</span>
+                </button>
+                <div class="dk-menu-panel" id="dk-whats-new-panel" data-dk-menu-panel hidden>
+                    <ul class="dk-menu-list">
+                        {%- if nav.changelog_url %}
+                        <li><a class="dk-menu-item" href="{{ nav.changelog_url }}">
+                            <i class="fas fa-list-ul" aria-hidden="true"></i> Changelog
+                            {%- if whats_new_has_new %}<span class="dk-pill">New</span>{% endif %}</a></li>
+                        {%- endif %}
+                        {%- if nav.roadmap_url %}
+                        <li><a class="dk-menu-item" href="{{ nav.roadmap_url }}">
+                            <i class="fas fa-route" aria-hidden="true"></i> Feedback &amp; Roadmap</a></li>
+                        {%- endif %}
+                    </ul>
+                </div>
+            </div>
+
+            {%- if current_user.is_authenticated %}
+            {%- set jobs = nav.active_job_count %}
+            <a class="dk-action" href="{{ nav.jobs_url }}" title="My Jobs"
+                aria-label="My Jobs{% if jobs %}, {{ jobs }} active{% endif %}">
+                <span class="dk-icon-wrap{% if jobs %} dk-has-badge{% endif %}">
+                    <i class="fas fa-hourglass-half" aria-hidden="true"></i>
+                    {%- if jobs %}<span class="dk-badge" aria-hidden="true">{{ jobs if jobs < 100 else '99+' }}</span>{% endif %}
+                </span>
+                <span class="dk-action-label">My Jobs</span>
+            </a>
+
+            <div class="dk-menu" data-dk-menu>
+                <button type="button" class="dk-avatar" data-dk-menu-trigger
+                    aria-haspopup="true" aria-expanded="false" aria-controls="dk-account-panel"
+                    aria-label="Account menu" title="{{ current_user.email }}">
+                    <span aria-hidden="true">{{ (current_user.email or '?')[:1]|upper }}</span>
+                </button>
+                <div class="dk-menu-panel dk-menu-panel-right" id="dk-account-panel" data-dk-menu-panel hidden>
+                    <p class="dk-menu-email">
+                        <span class="dk-menu-caption">Signed in as</span>
+                        <span class="dk-menu-email-value">{{ current_user.email }}</span>
+                    </p>
+                    <div class="dk-menu-divider" role="separator"></div>
+{{- theme_group() }}
+                    <div class="dk-menu-divider" role="separator"></div>
+                    <ul class="dk-menu-list">
+                        {{- help_and_updates(nav) }}
+                    </ul>
+                    <div class="dk-menu-divider" role="separator"></div>
+                    <form action="{{ nav.logout_url }}" method="post">
+                        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+                        <button type="submit" class="dk-menu-item">
+                            <i class="fas fa-sign-out-alt" aria-hidden="true"></i> Log out</button>
+                    </form>
+                </div>
+            </div>
+            {%- else %}
+            <a class="dk-auth-link" href="{{ nav.login_url }}"
+                title="Not signed in: anyone with a job link can edit that job. Log in for exclusive edit access.">Log in</a>
+            {%- if nav.register_url %}
+            <a class="dk-auth-link dk-auth-link-outline" href="{{ nav.register_url }}">Sign up</a>
+            {%- endif %}
+
+            {#- Signed-out visitors get the same menu shape as the account menu,
+                so Theme (and on phones What's New) still has a home. -#}
+            <div class="dk-menu" data-dk-menu>
+                <button type="button" class="dk-avatar dk-avatar-guest" data-dk-menu-trigger
+                    aria-haspopup="true" aria-expanded="false" aria-controls="dk-guest-panel"
+                    aria-label="Menu: theme and help" title="Theme and help">
+                    <span aria-hidden="true"><i class="fas fa-user"></i></span>
+                </button>
+                <div class="dk-menu-panel dk-menu-panel-right" id="dk-guest-panel" data-dk-menu-panel hidden>
+                    <p class="dk-menu-email">
+                        <span class="dk-menu-caption">Not signed in</span>
+                        <span class="dk-menu-note">Anyone with a job link can edit that job. Log in for exclusive edit access.</span>
+                    </p>
+                    <div class="dk-menu-divider" role="separator"></div>
+                    {{- theme_group() }}
+                    <div class="dk-menu-divider" role="separator"></div>
+                    <ul class="dk-menu-list">
+                        {{- help_and_updates(nav) }}
+                        {%- if nav.register_url %}
+                        <li class="dk-only-narrow"><a class="dk-menu-item" href="{{ nav.register_url }}">
+                            <i class="fas fa-user-plus" aria-hidden="true"></i> Sign up</a></li>
+                        {%- endif %}
+                    </ul>
+                </div>
+            </div>
+            {%- endif %}
+        </div>
+    </nav>
+</header>
+<script>
+    (function () {
+        // Menu-button behaviour for the What's New panel and the account and
+        // signed-out menus:
+        // Esc and click-outside close, focus returns to the trigger, and Tab
+        // cycles inside an open panel until it is closed. The local nav's
+        // menu tabs (partials/site_local_nav.html) come after this script, so
+        // menus are collected once the page is parsed. A panel is found through
+        // its trigger's aria-controls, because a menu tab's panel sits outside
+        // the tab strip rather than inside the menu.
+        var menus = [];
+
+        function panelOf(menu) {
+            var trigger = menu.querySelector('[data-dk-menu-trigger]');
+            return document.getElementById(trigger.getAttribute('aria-controls'));
+        }
+
+        function focusables(panel) {
+            return Array.prototype.slice.call(panel.querySelectorAll('a[href], button:not([disabled])'))
+                .filter(function (el) { return el.offsetParent !== null; });
+        }
+
+        function close(menu, restoreFocus) {
+            var trigger = menu.querySelector('[data-dk-menu-trigger]');
+            var panel = panelOf(menu);
+            if (panel.hidden) return;
+            panel.hidden = true;
+            trigger.setAttribute('aria-expanded', 'false');
+            if (restoreFocus) trigger.focus();
+        }
+
+        function open(menu, keepFocus) {
+            menus.forEach(function (other) { if (other !== menu) close(other, false); });
+            var trigger = menu.querySelector('[data-dk-menu-trigger]');
+            var panel = panelOf(menu);
+            panel.hidden = false;
+            trigger.setAttribute('aria-expanded', 'true');
+            menu.dispatchEvent(new CustomEvent('dk-menu-open'));
+            if (keepFocus) return;
+            var items = focusables(panel);
+            if (items.length) items[0].focus();
+        }
+
+        function setUp(menu) {
+            var trigger = menu.querySelector('[data-dk-menu-trigger]');
+            var panel = panelOf(menu);
+            trigger.addEventListener('click', function () {
+                if (panel.hidden) { open(menu); } else { close(menu, true); }
+            });
+            // Hover-to-open (the local nav's menu tabs) opens and closes a menu
+            // through these, without moving focus.
+            menu.addEventListener('dk-menu-show', function () { if (panel.hidden) open(menu, true); });
+            menu.addEventListener('dk-menu-hide', function () { close(menu, false); });
+            function onKeydown(event) {
+                if (panel.hidden) return;
+                if (event.key === 'Escape') {
+                    event.preventDefault();
+                    close(menu, true);
+                    return;
+                }
+                var items = focusables(panel);
+                if (!items.length) return;
+                var index = items.indexOf(document.activeElement);
+                if (event.key === 'ArrowDown' || event.key === 'ArrowUp') {
+                    event.preventDefault();
+                    var step = event.key === 'ArrowDown' ? 1 : -1;
+                    items[(index + step + items.length) % items.length].focus();
+                } else if (event.key === 'Tab' && index !== -1) {
+                    if (event.shiftKey && index === 0) {
+                        event.preventDefault();
+                        items[items.length - 1].focus();
+                    } else if (!event.shiftKey && index === items.length - 1) {
+                        event.preventDefault();
+                        items[0].focus();
+                    }
+                }
+            }
+            menu.addEventListener('keydown', onKeydown);
+            if (!menu.contains(panel)) panel.addEventListener('keydown', onKeydown);
+        }
+
+        function collectMenus() {
+            menus = Array.prototype.slice.call(document.querySelectorAll('[data-dk-menu]'));
+            menus.forEach(setUp);
+        }
+        if (document.readyState === 'loading') {
+            document.addEventListener('DOMContentLoaded', collectMenus);
+        } else {
+            collectMenus();
+        }
+
+        document.addEventListener('click', function (event) {
+            menus.forEach(function (menu) {
+                if (!menu.contains(event.target) && !panelOf(menu).contains(event.target)) close(menu, false);
+            });
+        });
+
+        // Theme choice in the account menu. window.dikaryaTheme comes from
+        // partials/site_theme.html, which must be included in <head>.
+        var options = Array.prototype.slice.call(document.querySelectorAll('[data-dk-theme]'));
+        function markTheme() {
+            var current = window.dikaryaTheme ? window.dikaryaTheme.get() : 'system';
+            options.forEach(function (button) {
+                button.setAttribute('aria-pressed', String(button.getAttribute('data-dk-theme') === current));
+            });
+        }
+        options.forEach(function (button) {
+            button.addEventListener('click', function () {
+                if (window.dikaryaTheme) window.dikaryaTheme.set(button.getAttribute('data-dk-theme'));
+            });
+        });
+        document.addEventListener('dikarya:themechange', markTheme);
+        markTheme();
+    })();
+</script>

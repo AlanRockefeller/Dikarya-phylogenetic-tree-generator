@@ -1,0 +1,199 @@
+{#- Local nav: the tabs of the active section (Journal or Workbench).
+    Items and active state come from app/navigation.py via site_nav(). -#}
+{%- set nav = site_nav() -%}
+<nav class="dk-shell dk-local" aria-label="{{ nav.section_label }}">
+    <div class="dk-local-scroll" data-dk-local-scroll>
+        <ul class="dk-local-list">
+            {%- for item in nav.local %}
+            {%- if item.children %}
+            {#- A menu tab. Its panel sits outside the strip below, because the
+                strip scrolls sideways and would clip it. -#}
+            <li class="dk-menu" data-dk-menu data-dk-local-menu>
+                <button type="button" class="dk-local-item" data-dk-menu-trigger
+                    aria-haspopup="true" aria-expanded="false" aria-controls="dk-local-{{ item.key }}-panel"
+                    {%- if item.current %} aria-current="{{ item.current }}"{% endif %}>
+                    {{ item.label }}<i class="fas fa-chevron-down dk-local-caret" aria-hidden="true"></i>
+                </button>
+            </li>
+            {%- else %}
+            <li>
+                <a href="{{ item.url }}" class="dk-local-item"
+                    {%- if item.current %} aria-current="{{ item.current }}"{% endif %}>{{ item.label }}</a>
+            </li>
+            {%- endif %}
+            {%- endfor %}
+        </ul>
+    </div>
+    {%- for item in nav.local if item.children %}
+    <div class="dk-menu-panel dk-local-panel" id="dk-local-{{ item.key }}-panel" data-dk-menu-panel hidden>
+        <ul class="dk-menu-list">
+            {%- for child in item.children %}
+            <li><a class="dk-menu-item" href="{{ child.url }}"
+                {%- if child.current %} aria-current="{{ child.current }}"{% endif %}>{{ child.label }}</a></li>
+            {%- endfor %}
+        </ul>
+    </div>
+    {%- endfor %}
+</nav>
+<script>
+    (function () {
+        var strip = document.querySelector('[data-dk-local-scroll]');
+        if (!strip) return;
+
+        function overflowing() {
+            return strip.scrollWidth > strip.clientWidth + 1;
+        }
+
+        // On narrow screens the tabs scroll sideways; bring the active one
+        // into view. scrollLeft rather than scrollIntoView, which would also
+        // scroll the page vertically.
+        // Measured from the strip, not offsetLeft: a menu tab's offsetParent
+        // is its own wrapper.
+        function offsetInStrip(el) {
+            return el.getBoundingClientRect().left - strip.getBoundingClientRect().left + strip.scrollLeft;
+        }
+        var active = strip.querySelector('[aria-current]');
+        if (active && overflowing()) {
+            strip.scrollLeft = Math.max(0, offsetInStrip(active) - (strip.clientWidth - active.offsetWidth) / 2);
+        }
+
+        // Touch swipes scroll the strip natively. A mouse cannot -- there is
+        // no visible scrollbar and a vertical wheel does nothing -- so give
+        // mouse users drag-to-scroll and wheel-to-scroll as well.
+        function markOverflow() {
+            strip.classList.toggle('dk-local-overflowing', overflowing());
+        }
+        markOverflow();
+        window.addEventListener('resize', markOverflow);
+
+        var drag = null;
+        var suppressClick = false;
+
+        strip.addEventListener('pointerdown', function (event) {
+            suppressClick = false;
+            if (event.pointerType !== 'mouse' || event.button !== 0 || !overflowing()) return;
+            drag = { x: event.clientX, left: strip.scrollLeft, moved: false, id: event.pointerId };
+        });
+
+        strip.addEventListener('pointermove', function (event) {
+            if (!drag || event.pointerId !== drag.id) return;
+            var dx = event.clientX - drag.x;
+            // A few pixels of wobble is still a click, not a drag.
+            if (!drag.moved && Math.abs(dx) < 5) return;
+            if (!drag.moved) {
+                drag.moved = true;
+                strip.classList.add('dk-local-dragging');
+                if (strip.setPointerCapture) strip.setPointerCapture(drag.id);
+            }
+            strip.scrollLeft = drag.left - dx;
+        });
+
+        function endDrag() {
+            if (!drag) return;
+            if (drag.moved) {
+                // The pointerup that ends a drag is followed by a click on
+                // whichever tab it was released over; swallow that one.
+                suppressClick = true;
+                strip.classList.remove('dk-local-dragging');
+            }
+            drag = null;
+        }
+        strip.addEventListener('pointerup', endDrag);
+        strip.addEventListener('pointercancel', endDrag);
+        strip.addEventListener('lostpointercapture', endDrag);
+
+        strip.addEventListener('click', function (event) {
+            if (!suppressClick) return;
+            suppressClick = false;
+            event.preventDefault();
+            event.stopPropagation();
+        }, true);
+
+        // A menu tab's panel lives outside the strip, so place it under its
+        // tab when it opens (partials/site_global_bar.html fires dk-menu-open)
+        // and keep it there while the strip scrolls or the window resizes.
+        var nav = strip.parentElement;
+        var openMenu = null;
+        function place() {
+            if (!openMenu) return;
+            var trigger = openMenu.querySelector('[data-dk-menu-trigger]');
+            var panel = document.getElementById(trigger.getAttribute('aria-controls'));
+            if (panel.hidden) { openMenu = null; return; }
+            // A tab opened from the keyboard can be scrolled out of sight.
+            var start = offsetInStrip(trigger);
+            var end = start + trigger.offsetWidth;
+            if (start < strip.scrollLeft || end > strip.scrollLeft + strip.clientWidth) {
+                strip.scrollLeft = Math.max(0, start - (strip.clientWidth - trigger.offsetWidth) / 2);
+            }
+            var box = nav.getBoundingClientRect();
+            var left = trigger.getBoundingClientRect().left - box.left;
+            var max = nav.clientWidth - panel.offsetWidth - 8;
+            panel.style.left = Math.max(8, Math.min(left, max)) + 'px';
+        }
+        Array.prototype.forEach.call(strip.querySelectorAll('[data-dk-local-menu]'), function (menu) {
+            menu.addEventListener('dk-menu-open', function () { openMenu = menu; place(); });
+            hoverToOpen(menu);
+        });
+        // A mouse opens a menu tab by hovering; click, touch and the keyboard
+        // still work as for any menu. Leaving the tab and its panel closes it
+        // after a short delay, so the pointer can cross the gap between them.
+        // A mouse click on the tab opens it the same way, or leaves it open if
+        // hovering already has, rather than toggling it shut.
+        function hoverToOpen(menu) {
+            var trigger = menu.querySelector('[data-dk-menu-trigger]');
+            var panel = document.getElementById(trigger.getAttribute('aria-controls'));
+            var hoverOpen = false;
+            var timer = null;
+            function enter(event) {
+                if (event.pointerType !== 'mouse' || drag) return;
+                clearTimeout(timer);
+                if (panel.hidden) {
+                    menu.dispatchEvent(new CustomEvent('dk-menu-show'));
+                    hoverOpen = !panel.hidden;
+                }
+            }
+            function leave(event) {
+                if (event.pointerType !== 'mouse' || !hoverOpen) return;
+                clearTimeout(timer);
+                timer = setTimeout(function () {
+                    hoverOpen = false;
+                    menu.dispatchEvent(new CustomEvent('dk-menu-hide'));
+                }, 200);
+            }
+            menu.addEventListener('pointerenter', enter);
+            menu.addEventListener('pointerleave', leave);
+            panel.addEventListener('pointerenter', enter);
+            panel.addEventListener('pointerleave', leave);
+            menu.addEventListener('click', function (event) {
+                if (event.pointerType !== 'mouse' || !trigger.contains(event.target)) return;
+                event.stopPropagation();
+                clearTimeout(timer);
+                if (panel.hidden) menu.dispatchEvent(new CustomEvent('dk-menu-show'));
+                hoverOpen = !panel.hidden;
+            }, true);
+            // Closed some other way (Esc, a click elsewhere): not hover-open any more.
+            new MutationObserver(function () {
+                if (panel.hidden) { hoverOpen = false; clearTimeout(timer); }
+            }).observe(panel, { attributes: true, attributeFilter: ['hidden'] });
+        }
+        strip.addEventListener('scroll', place);
+        window.addEventListener('resize', place);
+
+        // Links are natively draggable; that would hijack the gesture.
+        strip.addEventListener('dragstart', function (event) {
+            event.preventDefault();
+        });
+
+        // A vertical wheel moves the strip sideways, then hands back to the
+        // page once the strip reaches either end, so it never traps the page
+        // scroll. Horizontal wheels and trackpads already work natively.
+        strip.addEventListener('wheel', function (event) {
+            if (!overflowing() || Math.abs(event.deltaY) <= Math.abs(event.deltaX)) return;
+            var delta = event.deltaMode === 1 ? event.deltaY * 16 : event.deltaY;
+            var max = strip.scrollWidth - strip.clientWidth;
+            if ((delta < 0 && strip.scrollLeft <= 0) || (delta > 0 && strip.scrollLeft >= max - 1)) return;
+            event.preventDefault();
+            strip.scrollLeft += delta;
+        }, { passive: false });
+    })();
+</script>

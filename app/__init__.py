@@ -447,6 +447,13 @@ def create_app(config_name='default'):
             )
             return {'whats_new_has_new': False}
 
+    @app.context_processor
+    def inject_site_nav():
+        # A callable, not a value: only the shell partials call it, so pages
+        # that do not render the shell skip the My Jobs count query.
+        from app.navigation import site_nav
+        return {'site_nav': site_nav}
+
     # Register CLI commands
     from app import cli
     cli.register(app)

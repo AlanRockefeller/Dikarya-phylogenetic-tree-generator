@@ -1,0 +1,55 @@
+{#- Shared footer, identical on every page. Columns come from
+    app/navigation.py (FOOTER_COLUMNS).
+
+    Each column is a <details> so it can be an accordion below 768px. It is
+    rendered open, so without JavaScript every link is visible; the script
+    below collapses the columns on phones and keeps them open (and not
+    toggleable) on wider screens. -#}
+{%- set nav = site_nav() -%}
+<footer class="dk-shell dk-footer">
+    <div class="dk-footer-inner">
+        {%- for column in nav.footer if column.links %}
+        <details class="dk-footer-col" open data-dk-footer-col>
+            <summary class="dk-footer-heading">{{ column.heading }}</summary>
+            <ul class="dk-footer-links">
+                {%- for link in column.links %}
+                <li><a href="{{ link.url }}">{{ link.label }}</a></li>
+                {%- endfor %}
+            </ul>
+        </details>
+        {%- endfor %}
+    </div>
+    <div class="dk-footer-bottom">
+        <p>{{ nav.copyright }} <a href="{{ nav.license.url }}" target="_blank" rel="noopener">{{ nav.license.label }}</a></p>
+    </div>
+</footer>
+<script>
+    (function () {
+        var columns = Array.prototype.slice.call(document.querySelectorAll('[data-dk-footer-col]'));
+        if (!columns.length || !window.matchMedia) return;
+        var phone = window.matchMedia('(max-width: 767px)');
+        function layout() {
+            columns.forEach(function (column) {
+                var summary = column.querySelector('summary');
+                column.open = !phone.matches;
+                // On wider screens the heading is just a heading.
+                if (phone.matches) {
+                    summary.removeAttribute('tabindex');
+                } else {
+                    summary.setAttribute('tabindex', '-1');
+                }
+            });
+        }
+        columns.forEach(function (column) {
+            column.querySelector('summary').addEventListener('click', function (event) {
+                if (!phone.matches) event.preventDefault();
+            });
+        });
+        layout();
+        if (phone.addEventListener) {
+            phone.addEventListener('change', layout);
+        } else if (phone.addListener) {
+            phone.addListener(layout);
+        }
+    })();
+</script>
