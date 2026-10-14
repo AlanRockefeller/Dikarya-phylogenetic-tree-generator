@@ -9,10 +9,13 @@
 
 {% block head %}
 <style>
+    /* The page colour runs edge to edge through an outset border-image, which
+       paints past the box without clipping anything inside it. The previous
+       box-shadow + clip-path did the same, but clip-path also cropped the
+       fixed-position modals to this box and gave them their own stacking
+       context, so the header and tabs always showed above an open modal. */
     .tree-builder-page {
-        background: var(--bg);
-        box-shadow: 0 0 0 100vmax var(--bg);
-        clip-path: inset(0 -100vmax);
+        border-image: linear-gradient(var(--bg), var(--bg)) fill 0 / 0 / 0 100vmax;
         color: var(--text);
         margin-bottom: -2rem;
         padding-bottom: 3rem;
