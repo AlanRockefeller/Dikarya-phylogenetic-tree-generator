@@ -5,7 +5,6 @@
    Guarded so a render without `social` keeps the old title and no card. #}
 {% block title %}{{ social.title if social is defined else 'Dikarya - Tree Viewer' }}{% endblock %}
 {% block description %}{{ social.description if social is defined else 'Dikarya - Mycological Research Tools' }}{% endblock %}
-{% block subtitle %}Tree Viewer{% endblock %}
 
 {# The tree, its toolbar and the settings panel use the whole window width. #}
 {% block main_width %}max-w-none{% endblock %}
