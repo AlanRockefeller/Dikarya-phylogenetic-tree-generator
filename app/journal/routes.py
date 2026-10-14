@@ -42,6 +42,12 @@ def reviewers():
     return render_template('journal/reviewers.html')
 
 
+@bp.route('/authors')
+def authors():
+    # Hub for the "For Authors" tab: guidelines, AI policy, writing resources.
+    return render_template('journal/authors.html')
+
+
 @bp.route('/resources')
 def resources():
     return render_template('journal/resources.html')
