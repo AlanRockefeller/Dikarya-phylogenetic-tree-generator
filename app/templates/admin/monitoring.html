@@ -20,7 +20,7 @@
     <div class="grid grid-cols-1 md:grid-cols-3 gap-6">
 
         <!-- System Health -->
-        <div class="bg-white dark:bg-journal-green rounded-xl shadow-lg overflow-hidden transition-colors">
+        <div class="bg-white dark:bg-journal-panel rounded-xl shadow-lg overflow-hidden transition-colors">
             <div class="bg-journal-dark px-5 py-3 border-b border-journal-green">
                 <h3 class="text-white font-semibold flex items-center">
                     <i class="fas fa-heart-pulse text-journal-gold mr-2"></i>System Health
@@ -56,7 +56,7 @@
         </div>
 
         <!-- Resources -->
-        <div class="bg-white dark:bg-journal-green rounded-xl shadow-lg overflow-hidden transition-colors">
+        <div class="bg-white dark:bg-journal-panel rounded-xl shadow-lg overflow-hidden transition-colors">
             <div class="bg-journal-dark px-5 py-3 border-b border-journal-green">
                 <h3 class="text-white font-semibold flex items-center">
                     <i class="fas fa-microchip text-journal-gold mr-2"></i>Resources
@@ -83,7 +83,7 @@
         </div>
 
         <!-- Job Stats -->
-        <div class="bg-white dark:bg-journal-green rounded-xl shadow-lg overflow-hidden transition-colors">
+        <div class="bg-white dark:bg-journal-panel rounded-xl shadow-lg overflow-hidden transition-colors">
             <div class="bg-journal-dark px-5 py-3 border-b border-journal-green">
                 <h3 class="text-white font-semibold flex items-center">
                     <i class="fas fa-chart-bar text-journal-gold mr-2"></i>Job Stats
@@ -147,7 +147,7 @@
     <div id="live-error" class="hidden bg-red-50 dark:bg-red-900/30 border border-red-200 dark:border-red-800 text-red-800 dark:text-red-200 rounded-xl px-4 py-3 text-sm"></div>
 
     <!-- Queues -->
-    <div class="bg-white dark:bg-journal-green rounded-xl shadow-lg overflow-hidden transition-colors">
+    <div class="bg-white dark:bg-journal-panel rounded-xl shadow-lg overflow-hidden transition-colors">
         <div class="bg-journal-dark px-5 py-3 border-b border-journal-green">
             <h3 class="text-white font-semibold flex items-center">
                 <i class="fas fa-list-ol text-journal-gold mr-2"></i>Queues
@@ -157,7 +157,7 @@
     </div>
 
     <!-- Running jobs -->
-    <div class="bg-white dark:bg-journal-green rounded-xl shadow-lg overflow-hidden transition-colors">
+    <div class="bg-white dark:bg-journal-panel rounded-xl shadow-lg overflow-hidden transition-colors">
         <div class="bg-journal-dark px-5 py-3 border-b border-journal-green">
             <h3 class="text-white font-semibold flex items-center">
                 <i class="fas fa-gears text-journal-gold mr-2"></i>Running Jobs
@@ -168,7 +168,7 @@
     </div>
 
     <!-- Waiting jobs -->
-    <div class="bg-white dark:bg-journal-green rounded-xl shadow-lg overflow-hidden transition-colors">
+    <div class="bg-white dark:bg-journal-panel rounded-xl shadow-lg overflow-hidden transition-colors">
         <div class="bg-journal-dark px-5 py-3 border-b border-journal-green">
             <h3 class="text-white font-semibold flex items-center">
                 <i class="fas fa-hourglass-half text-journal-gold mr-2"></i>Waiting in Queue
@@ -179,7 +179,7 @@
     </div>
 
     <!-- Workers -->
-    <div class="bg-white dark:bg-journal-green rounded-xl shadow-lg overflow-hidden transition-colors">
+    <div class="bg-white dark:bg-journal-panel rounded-xl shadow-lg overflow-hidden transition-colors">
         <div class="bg-journal-dark px-5 py-3 border-b border-journal-green">
             <h3 class="text-white font-semibold flex items-center">
                 <i class="fas fa-users-gear text-journal-gold mr-2"></i>Worker Nodes
@@ -190,7 +190,7 @@
     </div>
 
     <!-- Recently finished -->
-    <div class="bg-white dark:bg-journal-green rounded-xl shadow-lg overflow-hidden transition-colors">
+    <div class="bg-white dark:bg-journal-panel rounded-xl shadow-lg overflow-hidden transition-colors">
         <div class="bg-journal-dark px-5 py-3 border-b border-journal-green">
             <h3 class="text-white font-semibold flex items-center">
                 <i class="fas fa-clock-rotate-left text-journal-gold mr-2"></i>Recently Finished
@@ -240,7 +240,7 @@
     <script id="live-data" type="application/json">{{ live|tojson }}</script>
 
     <!-- Claude Review (AI) usage -->
-    <div class="bg-white dark:bg-journal-green rounded-xl shadow-lg overflow-hidden transition-colors">
+    <div class="bg-white dark:bg-journal-panel rounded-xl shadow-lg overflow-hidden transition-colors">
         <div class="bg-journal-dark px-5 py-3 border-b border-journal-green flex items-center justify-between">
             <h3 class="text-white font-semibold flex items-center">
                 <i class="fas fa-wand-magic-sparkles text-journal-gold mr-2"></i>AI Review Usage
@@ -360,7 +360,7 @@
     </div>
 
     <!-- JSON endpoint links -->
-    <div class="bg-white dark:bg-journal-green rounded-xl shadow p-4 text-xs text-gray-500 dark:text-gray-400">
+    <div class="bg-white dark:bg-journal-panel rounded-xl shadow p-4 text-xs text-gray-500 dark:text-gray-400">
         JSON endpoints:
         <a href="{{ url_for('monitoring.health_check') }}" class="font-mono hover:text-journal-gold mx-2">/health</a> |
         <a href="{{ url_for('monitoring.worker_health') }}" class="font-mono hover:text-journal-gold mx-2">/health/workers</a> |

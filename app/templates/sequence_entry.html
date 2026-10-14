@@ -18,13 +18,9 @@
         padding-bottom: 3rem;
     }
 
+    /* Size, weight and family come from .dk-h1 (site_shell.css). */
     .tree-page-title {
         color: var(--text);
-        font-family: var(--serif);
-        font-size: 34px;
-        font-weight: 500;
-        line-height: 1.05;
-        letter-spacing: 0;
     }
 
     .tree-page-subtitle,
@@ -32,8 +28,13 @@
         color: var(--text-dim);
     }
 
+    /* The two page panels use the shared .dk-card surface (site_shell.css);
+       only the dialogs keep this gradient. */
     .tree-card,
-    .queue-card,
+    .queue-card {
+        color: var(--text);
+    }
+
     .tree-modal {
         background: linear-gradient(180deg, #213829 0%, #1c3025 100%);
         border: 1px solid var(--line);
@@ -44,12 +45,11 @@
         color: var(--text);
     }
 
-    .queue-card {
-        border-color: var(--journal-gold);
-    }
 
-    .tree-builder-page h2,
-    .tree-builder-page h3:not(.queue-title),
+    /* Small headings inside cards and modals read as labels; the two panel
+       titles are on the site type scale (.dk-h2) instead. */
+    .tree-builder-page h2:not(.dk-h2),
+    .tree-builder-page h3,
     .tree-builder-page h4 {
         color: var(--text);
         font-family: var(--sans);
@@ -58,23 +58,24 @@
         letter-spacing: 0;
     }
 
-    .tree-card > h3 > i,
+    .tree-card > h2 > i,
     .tree-modal h3 > i {
         display: none;
     }
 
-    .tree-card > h3 {
+    .tree-card > h2 {
         color: #f7faf8;
-        font-size: 28px;
-        line-height: 1.1;
     }
 
     /* Alan 9/12/26 - Segmented source selector for the single Add Sequences
        box. Six sources share one card; only the selected panel is shown. */
+    /* Same segmented-switch look as the header's Journal | Workbench control:
+       outlined track, active segment filled (gold in dark mode, forest green
+       with gold text in light mode), no hover fill. */
     .source-segmented {
-        background: rgba(0, 0, 0, .18);
-        border: 1px solid var(--line);
-        border-radius: 6px;
+        background: none;
+        border: 1px solid var(--journal-green);
+        border-radius: 9px;
         display: flex;
         flex-wrap: wrap;
         gap: 2px;
@@ -86,7 +87,7 @@
         align-items: center;
         background: none;
         border: 0;
-        border-radius: 4px;
+        border-radius: 6px;
         color: var(--text-mute);
         cursor: pointer;
         display: flex;
@@ -105,8 +106,10 @@
         opacity: .85;
     }
 
-    .source-segment:hover {
-        color: var(--text);
+    /* Hover highlights the label in gold; no fill, so the track still reads
+       as a switch. */
+    .source-segment:not([aria-selected="true"]):hover {
+        color: var(--journal-gold);
     }
 
     .source-segment:focus-visible {
@@ -115,9 +118,13 @@
     }
 
     .source-segment[aria-selected="true"] {
-        background: linear-gradient(180deg, #2c4a36 0%, #243d2d 100%);
-        box-shadow: inset 0 1px 0 rgba(255, 239, 194, .08);
-        color: #f7faf8;
+        background: var(--journal-gold);
+        color: var(--journal-dark);
+    }
+
+    /* The gold focus ring would vanish on the gold segment. */
+    .source-segment[aria-selected="true"]:focus-visible {
+        outline-color: var(--journal-dark);
     }
 
     .source-panel[hidden] {
@@ -173,12 +180,6 @@
 
     .tree-builder-page input[type="checkbox"] {
         accent-color: var(--journal-gold);
-    }
-
-    .tree-builder-page input::placeholder,
-    .tree-builder-page textarea::placeholder {
-        color: #5d6b62;
-        font-style: italic;
     }
 
     .sequence-input-box {
@@ -316,6 +317,19 @@
         color: var(--journal-gold);
     }
 
+    /* Gold text is 1.9:1 on the light cards; gold-ink text and a darker
+       outline pass (4.7+ and 3.4+). */
+    html:not(.dark) .tree-builder-page .btn-outline-gold {
+        border-color: #9a7b2c;
+        color: #7a5f1a;
+    }
+
+    /* Colour comes from the site-wide placeholder rule (site_shell.css). */
+    .tree-builder-page input::placeholder,
+    .tree-builder-page textarea::placeholder {
+        font-style: italic;
+    }
+
     .btn-small {
         font-size: 12px;
         min-height: 34px;
@@ -341,11 +355,6 @@
 
     .queue-title {
         color: var(--text);
-        font-family: var(--serif);
-        font-size: 24px;
-        font-style: normal;
-        font-weight: 500;
-        line-height: 1;
     }
 
     .queue-count-number {
@@ -578,12 +587,10 @@
         --line-gold: #c9a962;
         --text: #1a2f23;
         --text-dim: #4a5a52;
-        --text-mute: #7a8a82;
-        --gold-soft: #8a6f2e;
+        --text-mute: #56625b;
+        --gold-soft: #7a5f1a;
     }
 
-    html:not(.dark) .tree-builder-page .tree-card,
-    html:not(.dark) .tree-builder-page .queue-card,
     html:not(.dark) .tree-builder-page .tree-modal,
     html:not(.dark) .tree-modal {
         background: linear-gradient(180deg, #ffffff 0%, #f3eedf 100%);
@@ -593,18 +600,27 @@
             0 1px 2px rgba(26, 47, 35, .04);
     }
 
-    html:not(.dark) .tree-builder-page .tree-card > h3 {
+    html:not(.dark) .tree-builder-page .tree-card > h2 {
         color: #1a2f23;
     }
 
     html:not(.dark) .tree-builder-page .source-segmented {
-        background: rgba(26, 47, 35, .05);
+        border-color: #d8cfb6;
     }
 
+    /* Light mode: a pale sage fill with dark gold text (4.8:1) rather than a
+       solid block. */
     html:not(.dark) .tree-builder-page .source-segment[aria-selected="true"] {
-        background: #ffffff;
-        box-shadow: 0 1px 2px rgba(26, 47, 35, .14);
-        color: #1a2f23;
+        background: #dfe9dc;
+        color: #7a5f1a;
+    }
+
+    html:not(.dark) .tree-builder-page .source-segment:not([aria-selected="true"]):hover {
+        color: #7a5f1a;
+    }
+
+    html:not(.dark) .tree-builder-page .source-segment[aria-selected="true"]:focus-visible {
+        outline-color: #7a5f1a;
     }
 
     html:not(.dark) .tree-builder-page input[type="url"],
@@ -613,11 +629,6 @@
     html:not(.dark) .tree-builder-page select,
     html:not(.dark) .tree-builder-page .sequence-input-box {
         background: #ffffff;
-    }
-
-    html:not(.dark) .tree-builder-page input::placeholder,
-    html:not(.dark) .tree-builder-page textarea::placeholder {
-        color: #9aa19a;
     }
 
     html:not(.dark) .tree-builder-page .sequence-input-toolbar {
@@ -653,7 +664,7 @@
 <div class="mb-8">
     <div class="flex flex-col md:flex-row justify-between items-start gap-4">
         <div>
-            <h1 class="tree-page-title">Phylogenetic Tree Builder</h1>
+            <h1 class="tree-page-title dk-h1">Phylogenetic Tree Builder</h1>
         </div>
     </div>
 </div>
@@ -670,11 +681,11 @@
              unchanged; only the selected panel is shown. The sources stay
              additive -- switching a segment hides a fetch summary but never
              touches the queue, which is the durable state. -->
-        <div class="tree-card p-6" id="add_sequences_card">
-            <h3 class="text-xl font-semibold text-journal-dark dark:text-gray-100 mb-4 flex items-center">
+        <div class="tree-card dk-card p-6" id="add_sequences_card">
+            <h2 class="dk-h2 mb-4 flex items-center">
                 <i class="fas fa-plus-circle text-journal-gold mr-2"></i>
                 Add Sequences
-            </h3>
+            </h2>
 
             <div class="source-segmented" id="source_segmented" role="tablist" aria-label="Sequence source">
                 <button type="button" class="source-segment" role="tab" tabindex="0"
@@ -1176,11 +1187,11 @@
 
     <!-- Right Section: 1 column - Sequence Queue -->
     <div class="lg:col-span-1">
-        <div class="queue-card sticky top-24">
+        <div class="queue-card dk-card sticky top-24">
 
             <!-- Queue Header -->
             <div class="p-4 border-b border-[var(--line-gold)] flex justify-between items-start gap-4">
-                <h3 class="queue-title">Sequence queue</h3>
+                <h2 class="queue-title dk-h2">Sequence queue</h2>
                 <div id="sequence_count_block" class="hidden" aria-live="polite">
                     <span id="sequence_count" class="queue-count-number">0</span>
                     <span class="queue-count-label">SEQUENCES</span>

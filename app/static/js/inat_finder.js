@@ -1972,7 +1972,7 @@
 
     function buildResultCard(observation) {
         const card = document.createElement('article');
-        card.className = 'flex gap-4 rounded-2xl border border-gray-200 dark:border-gray-700 bg-white dark:bg-journal-green p-4 shadow-sm';
+        card.className = 'flex gap-4 dk-card p-4';
         const accent = iconicColor(observation.taxon);
         card.style.borderLeft = `5px solid ${accent}`;
         const photo = document.createElement('div');
@@ -2006,7 +2006,10 @@
         }
         body.appendChild(badges);
         const title = document.createElement('h3');
-        title.className = 'mt-1 truncate font-serif text-xl font-semibold italic text-journal-dark dark:text-white';
+        title.className = 'mt-1 truncate dk-h3 italic text-journal-dark dark:text-white';
+        // A taxon name: regular-weight italic, the convention for scientific
+        // names (and the only italic Libre Baskerville ships).
+        title.style.fontWeight = '400';
         title.textContent = observation.taxon?.name || observation.species_guess || 'Unknown taxon';
         body.appendChild(title);
         const details = document.createElement('p');
@@ -2189,7 +2192,7 @@
         document.getElementById('results-summary').textContent = parts.join(' · ');
         if (matchCount) return;
         const empty = document.createElement('div');
-        empty.className = 'md:col-span-2 rounded-2xl border border-dashed border-gray-300 dark:border-gray-600 bg-white/60 dark:bg-journal-green/40 p-8 text-center text-gray-600 dark:text-gray-300';
+        empty.className = 'md:col-span-2 rounded-xl border border-dashed border-gray-300 dark:border-journal-green p-8 text-center text-gray-600 dark:text-gray-300';
         empty.textContent = incomplete
             ? 'The search was incomplete because iNaturalist could not be reached for part of it. Try again before concluding that nothing matches.'
             : 'Try checking more digits, confirming the taxon or username spelling, or using a project ID. The observation may also have been removed.';
@@ -2655,7 +2658,7 @@
         }
         if (!ranked.length) {
             const empty = document.createElement('div');
-            empty.className = 'md:col-span-2 rounded-2xl border border-dashed border-gray-300 dark:border-gray-600 bg-white/60 dark:bg-journal-green/40 p-8 text-center text-gray-600 dark:text-gray-300';
+            empty.className = 'md:col-span-2 rounded-xl border border-dashed border-gray-300 dark:border-journal-green p-8 text-center text-gray-600 dark:text-gray-300';
             empty.textContent = outcome.stopReason === 'no_clues'
                 ? 'Nothing was searched beyond the number itself. Add a genus, family, taxon ID, observer or project so the search has something to recognise, and it will widen to nearby numbers.'
                 : (outcome.complete

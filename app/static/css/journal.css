@@ -2,7 +2,8 @@
 
 /* Typography. @import must come before every style rule or the browser drops
    it and the journal silently falls back to system fonts. */
-@import url('../vendor/inter.css');
+/* Locally hosted: IBM Plex Sans (body) and Libre Baskerville (headings). */
+@import url('../vendor/display-fonts.css');
 @import url('../vendor/journal-fonts.css');
 
 :root {
@@ -23,7 +24,7 @@
 
     /* Typography */
     --font-serif: 'Libre Baskerville', 'Georgia', serif;
-    --font-sans: 'Inter', system-ui, -apple-system, sans-serif;
+    --font-sans: 'IBM Plex Sans', system-ui, -apple-system, sans-serif;
 
     /* Spacing */
     --space-xs: 0.25rem;
@@ -65,7 +66,9 @@
 }
 
 [data-theme="dark"] .journal-card h3,
-[data-theme="dark"] .journal-content h2 {
+[data-theme="dark"] .journal-content h2,
+[data-theme="dark"] .journal-content h3,
+[data-theme="dark"] .journal-section > h3 {
     color: var(--accent);
 }
 
@@ -101,6 +104,23 @@
 *::before,
 *::after {
     box-sizing: border-box;
+}
+
+:where(.journal-main) a:not(.journal-btn) {
+    color: var(--primary);
+    text-underline-offset: 2px;
+}
+
+:where(.journal-main) a:not(.journal-btn):hover {
+    color: var(--primary-light);
+}
+
+:where([data-theme="dark"] .journal-main) a:not(.journal-btn) {
+    color: var(--accent-light);
+}
+
+:where([data-theme="dark"] .journal-main) a:not(.journal-btn):hover {
+    color: var(--gold);
 }
 
 body.journal-page {
@@ -167,10 +187,6 @@ body.journal-page {
 }
 
 /* Main Content Area */
-.journal-main {
-    min-height: 70vh;
-}
-
 /* Hero Section */
 .journal-hero {
     background: linear-gradient(135deg, var(--primary) 0%, var(--primary-dark) 100%);
@@ -181,7 +197,7 @@ body.journal-page {
 
 .journal-hero h1 {
     font-family: var(--font-serif);
-    font-size: 3rem;
+    font-size: var(--dk-display, 3rem);
     font-weight: 700;
     margin: 0 0 var(--space-md);
     letter-spacing: -0.02em;
@@ -203,7 +219,8 @@ body.journal-page {
 
 .journal-section h2 {
     font-family: var(--font-serif);
-    font-size: 1.75rem;
+    font-size: var(--dk-h2, 1.5rem);
+    line-height: 1.3;
     color: var(--primary-dark);
     margin: 0 0 var(--space-lg);
     border-bottom: 2px solid var(--accent);
@@ -233,7 +250,8 @@ body.journal-page {
 
 .journal-card h3 {
     font-family: var(--font-serif);
-    font-size: 1.25rem;
+    font-size: var(--dk-h3, 1.125rem);
+    line-height: 1.4;
     color: var(--primary-dark);
     margin: 0 0 var(--space-sm);
 }
@@ -263,6 +281,10 @@ body.journal-page {
     border-radius: 2px;
 }
 
+[data-theme="dark"] .journal-card-meta {
+    color: var(--accent);
+}
+
 [data-theme="dark"] .journal-card > a:not(.journal-btn) {
     color: var(--accent-light);
 }
@@ -273,14 +295,14 @@ body.journal-page {
 
 .journal-card-meta {
     font-size: 0.8rem;
-    color: var(--accent);
+    color: #5c6b40;
     text-transform: uppercase;
     letter-spacing: 0.05em;
 }
 
 /* App Promo Section */
 .journal-app-promo {
-    background: linear-gradient(135deg, var(--accent) 0%, var(--primary-light) 100%);
+    background: linear-gradient(135deg, #2d4a3e 0%, #3d6b56 100%);
     color: var(--text-white);
     padding: var(--space-3xl) var(--space-xl);
     text-align: center;
@@ -289,7 +311,7 @@ body.journal-page {
 
 .journal-app-promo h2 {
     font-family: var(--font-serif);
-    font-size: 2rem;
+    font-size: var(--dk-h2, 1.5rem);
     color: var(--text-white);
     border: none;
     margin-bottom: var(--space-md);
@@ -337,7 +359,8 @@ body.journal-page {
 
 .journal-page-header h1 {
     font-family: var(--font-serif);
-    font-size: 2.5rem;
+    font-size: var(--dk-h1, 2.25rem);
+    line-height: 1.2;
     margin: 0;
 }
 
@@ -352,7 +375,8 @@ body.journal-page {
 
 .journal-content h2 {
     font-family: var(--font-serif);
-    font-size: 1.5rem;
+    font-size: var(--dk-h2, 1.5rem);
+    line-height: 1.3;
     color: var(--primary-dark);
     margin: var(--space-xl) 0 var(--space-md);
     border-bottom: 1px solid var(--border);
@@ -361,6 +385,15 @@ body.journal-page {
 
 .journal-content h2:first-child {
     margin-top: 0;
+}
+
+.journal-content h3,
+.journal-section > h3 {
+    font-family: var(--font-serif);
+    font-size: var(--dk-h3, 1.125rem);
+    line-height: 1.4;
+    color: var(--primary-dark);
+    margin: var(--space-lg) 0 var(--space-sm);
 }
 
 .journal-content p {
@@ -379,16 +412,8 @@ body.journal-page {
 
 /* Responsive */
 @media (max-width: 768px) {
-    .journal-hero h1 {
-        font-size: 2rem;
-    }
-
     .journal-section {
         padding: var(--space-xl) var(--space-md);
-    }
-
-    .ai-policy-page-header h1 {
-        font-size: 2rem;
     }
 
     .ai-policy-content {

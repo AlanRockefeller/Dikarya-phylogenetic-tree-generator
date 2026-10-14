@@ -6,10 +6,10 @@
 <div class="max-w-3xl mx-auto">
     <!-- Header -->
     <div class="mb-10 text-center">
-        <h2 class="text-3xl font-bold text-journal-dark dark:text-journal-gold mb-2 flex items-center justify-center gap-3">
+        <h1 class="dk-h1 text-journal-dark dark:text-journal-gold mb-2 flex items-center justify-center gap-3">
             <i class="fas {% if edit_mode %}fa-pen-to-square{% else %}fa-star{% endif %} text-journal-gold"></i>
             {% if edit_mode %}Edit What's New{% else %}What's New{% endif %}
-        </h2>
+        </h1>
         <p class="text-gray-600 dark:text-gray-400">Recent updates, improvements, and new features in Dikarya tree builder.</p>
     </div>
 
@@ -79,13 +79,7 @@
         {% for entry in entries %}
         {% set is_new = (not edit_mode) and (last_viewed is none or entry.published_at > last_viewed) %}
 
-        <div class="rounded-2xl shadow-sm border transition-all duration-200
-            {% if is_new %}
-                bg-white dark:bg-journal-green/30 border-journal-gold/50 shadow-journal-gold/10 shadow-md
-            {% else %}
-                bg-gray-50 dark:bg-journal-dark/60 border-gray-200 dark:border-journal-green/20 opacity-75
-            {% endif %}
-            p-6">
+        <div class="dk-card p-6{% if is_new %} border-journal-gold/60 dark:border-journal-gold/60{% endif %}">
 
             <!-- Category badge + New indicator + date -->
             <div class="flex items-center justify-between mb-3 flex-wrap gap-2">
@@ -113,7 +107,7 @@
                     </span>
                     {% endif %}
                 </div>
-                <time class="text-xs text-gray-400 dark:text-gray-500 tabular-nums">
+                <time class="text-xs text-gray-500 dark:text-gray-400 tabular-nums">
                     {{ entry.published_at.strftime('%B %-d, %Y') }}
                 </time>
             </div>
@@ -161,21 +155,16 @@
             </form>
             {% else %}
             <!-- Title -->
-            <h3 class="text-lg font-semibold mb-2
-                {% if is_new %}
-                    text-journal-dark dark:text-white
-                {% else %}
-                    text-gray-600 dark:text-gray-400
-                {% endif %}">
+            <h2 class="dk-h3 mb-2 {% if is_new %} text-journal-dark dark:text-white {% else %} text-gray-700 dark:text-gray-300 {% endif %}">
                 {{ entry.title }}
-            </h3>
+            </h2>
 
             <!-- Body -->
             <div class="text-sm leading-relaxed
                 {% if is_new %}
                     text-gray-700 dark:text-gray-300
                 {% else %}
-                    text-gray-500 dark:text-gray-500
+                    text-gray-600 dark:text-gray-400
                 {% endif %}">
                 {{ entry.body | safe }}
             </div>
@@ -197,7 +186,7 @@
     </div>
 
     {% if last_viewed %}
-    <p class="text-center text-xs text-gray-400 dark:text-gray-600 mt-8">
+    <p class="text-center text-xs text-gray-600 dark:text-gray-400 mt-8">
         <i class="fas fa-clock mr-1"></i>
         Items above the marker are new since your last visit on {{ last_viewed.strftime('%B %-d, %Y at %-I:%M %p') }} UTC.
     </p>

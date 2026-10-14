@@ -11,13 +11,26 @@
  *
  * Breakpoints (spec section 7): >=1100px full; 768-1099px icon-only What's
  * New and My Jobs; <768px compact bar, scrolling tabs, accordion footer.
+ *
+ * This file also owns the site-wide type scale (below the shell rules):
+ * Libre Baskerville for page titles and section headings, IBM Plex Sans for
+ * everything else. journal.css reads the same --dk-h* variables, and
+ * Workbench templates use the .dk-h1/.dk-h2/.dk-h3 classes.
  */
 
-/* Locally hosted IBM Plex Sans (public-main 29be477). */
+/* Locally hosted (public-main 29be477): IBM Plex Sans and Libre Baskerville. */
 @import url('../vendor/display-fonts.css');
+@import url('../vendor/journal-fonts.css');
 
 :root {
     --dk-font: 'IBM Plex Sans', system-ui, -apple-system, sans-serif;
+    --dk-font-serif: 'Libre Baskerville', Georgia, serif;
+
+    /* Type scale. Display is the Journal home hero only. */
+    --dk-display: 3rem;
+    --dk-h1: 2.25rem;
+    --dk-h2: 1.5rem;
+    --dk-h3: 1.125rem;
     --dk-gold: #c9a962;
     --dk-gold-ink: #1a2f23;
 
@@ -28,7 +41,6 @@
     --dk-bar-hover: rgba(255, 255, 255, 0.08);
 
     --dk-local-bg: #fdfcf8;
-    --dk-local-border: #e2ddcf;
     --dk-local-text: #3b4a41;
     --dk-local-active: #1a2f23;
     --dk-local-underline: #9a7b2c;
@@ -54,8 +66,8 @@
     --dk-bar-bg: #12221a;
     --dk-bar-border: #24392e;
 
-    --dk-local-bg: #16271e;
-    --dk-local-border: #2a4034;
+    /* Same green as the footer (--dk-footer-bg below). */
+    --dk-local-bg: #0f1b14;
     --dk-local-text: #c3cbbf;
     --dk-local-active: #f3eee2;
     --dk-local-underline: #c9a962;
@@ -189,23 +201,27 @@
     white-space: nowrap;
 }
 
+/* Journal | Workbench: a segmented control at every width, with the active
+   section filled gold. */
 .dk-switcher {
     display: flex;
-    align-items: stretch;
-    gap: 4px;
-    height: 100%;
+    align-items: center;
+    gap: 2px;
+    padding: 3px;
+    border: 1px solid var(--dk-bar-border);
+    border-radius: 9px;
 }
 
 .dk-switcher-item {
     display: flex;
     align-items: center;
-    height: 100%;
+    height: 34px;
     padding: 0 12px;
+    border-radius: 6px;
     color: var(--dk-bar-muted);
+    font-size: 14px;
     font-weight: 500;
     white-space: nowrap;
-    border-bottom: 3px solid transparent;
-    border-top: 3px solid transparent;
 }
 
 .dk-switcher-item:hover {
@@ -213,9 +229,9 @@
 }
 
 .dk-switcher-item[aria-current] {
-    color: var(--dk-bar-text);
+    background: var(--dk-gold);
+    color: var(--dk-gold-ink);
     font-weight: 600;
-    border-bottom-color: var(--dk-gold);
 }
 
 .dk-actions {
@@ -485,7 +501,6 @@
 
 .dk-local {
     background: var(--dk-local-bg);
-    border-bottom: 1px solid var(--dk-local-border);
 }
 
 .dk-local-scroll {
@@ -697,25 +712,8 @@
         display: list-item;
     }
 
-    .dk-switcher {
-        height: auto;
-        padding: 3px;
-        gap: 2px;
-        border: 1px solid var(--dk-bar-border);
-        border-radius: 9px;
-    }
-
     .dk-switcher-item {
-        height: 34px;
         padding: 0 10px;
-        border: 0;
-        border-radius: 6px;
-        font-size: 14px;
-    }
-
-    .dk-switcher-item[aria-current] {
-        background: var(--dk-gold);
-        color: var(--dk-gold-ink);
     }
 
     .dk-auth-link {
@@ -798,6 +796,105 @@
 
     .dk-only-narrow {
         display: list-item;
+    }
+}
+
+/* ---- Page frame (both layouts) ----
+ * Body is a full-height column and <main> takes the spare height, so on a
+ * short page the footer sits at the bottom of the window instead of
+ * floating halfway up it. Long pages scroll exactly as before. Children are
+ * given width:100% because a flex item with mx-auto would otherwise shrink
+ * to its content. */
+
+.dk-page {
+    display: flex;
+    flex-direction: column;
+}
+
+.dk-page > main {
+    flex: 1 0 auto;
+    width: 100%;
+}
+
+/* ---- Card (Workbench pages) ----
+ * The one surface for panels and cards on base_modern.html pages. Templates
+ * add .dk-card instead of their own bg/border/rounded/shadow utilities, so
+ * every Workbench card has the same colour, edge and corner in both themes.
+ * Plain class specificity on purpose: hover:/focus: utilities on the same
+ * element still win. Callouts (gold tips), the job terminal, dialogs and
+ * dropdowns are deliberately different surfaces and do not use it. */
+
+.dk-card {
+    background-color: #ffffff;
+    border: 1px solid #e5e7eb;
+    border-radius: 0.75rem;
+    box-shadow: 0 1px 2px 0 rgb(0 0 0 / 0.05);
+}
+
+.dark .dk-card,
+[data-theme="dark"] .dk-card {
+    background-color: #1c3025;
+    border-color: #2d4a3e;
+}
+
+/* ---- Form placeholders (page content, both layouts) ----
+ * Tailwind's preflight greys placeholders to #9ca3af, 2.5:1 on white. These
+ * pass on every input background the site uses (4.6+ light, 5.3+ dark).
+ * :root makes them outrank preflight's input::placeholder. */
+
+:root ::placeholder {
+    color: #6b7280;
+    opacity: 1;
+}
+
+:root.dark ::placeholder,
+:root[data-theme="dark"] ::placeholder {
+    color: #9ca3af;
+}
+
+/* ---- Type scale (page content, both layouts) ----
+ * Page title = one <h1 class="dk-h1"> per page; section and card headings use
+ * .dk-h2/.dk-h3 at whatever tag the outline needs. Small uppercase panel
+ * labels are UI, not headings, and stay in Plex.
+ * `html .dk-h1` (0,1,1) outranks Tailwind's single-class utilities on the same
+ * element, so a stray text-2xl cannot resize a title. Colour is left to the
+ * page. */
+
+html .dk-h1,
+html .dk-h2,
+html .dk-h3 {
+    font-family: var(--dk-font-serif);
+    font-weight: 700;
+    letter-spacing: -0.005em;
+}
+
+html .dk-h1 {
+    font-size: var(--dk-h1);
+    line-height: 1.2;
+    color: #1a2f23;
+}
+
+/* Every Workbench page title is the same colour in each theme, whatever
+   text-* utilities the template carries (this outranks dark:text-*). */
+html.dark .dk-h1,
+html[data-theme="dark"] .dk-h1 {
+    color: #f3eee2;
+}
+
+html .dk-h2 {
+    font-size: var(--dk-h2);
+    line-height: 1.3;
+}
+
+html .dk-h3 {
+    font-size: var(--dk-h3);
+    line-height: 1.4;
+}
+
+@media (max-width: 767px) {
+    :root {
+        --dk-display: 2.25rem;
+        --dk-h1: 1.875rem;
     }
 }
 
