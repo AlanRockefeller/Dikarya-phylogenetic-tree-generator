@@ -1004,7 +1004,12 @@
                         class="btn flex-1 min-w-[140px]" disabled>
                         <i class="fas fa-plus mr-2"></i> Add / Remove Sequences
                     </button>
-                    <!-- BLAST button removed from here -->
+                    <!-- Alan 10/12/26 - Shown only while the box holds one accession or one sequence. -->
+                    <button id="paste_blast_btn" type="button" data-active-style="outline"
+                        class="btn flex-1 min-w-[140px] hidden"
+                        title="Search GenBank for sequences related to this one, using the BLAST tab's settings">
+                        <i class="fas fa-search mr-2"></i> BLAST This Sequence
+                    </button>
                 </div>
             </div>
             </div>
@@ -2058,7 +2063,7 @@
             // stranded in one of the identifier boxes -- it never second-guesses
             // a user who is already in Paste or BLAST.
             if (!IDENTIFIER_FIELDS.has(ownSource)) return null;
-            if (singleToken && isGenBankAccession(trimmed)) return "paste";
+            if (singleToken && isGenBankAccession(normalizeAccessionToken(trimmed))) return "paste";
             if (looksLikeSequenceData(trimmed)) return "paste";
             return null;
         }
@@ -2178,7 +2183,7 @@
     const BACKGROUND_POLL_MS = 2000;
     const BACKGROUND_MAX_WAIT_MS = 6 * 60 * 1000;
 
-    function waitForBackgroundPoll(ms) {
+    function waitForBackgroundPoll(ms, wakeOnVisible = true) {
         return new Promise(resolve => {
             const done = () => {
                 clearTimeout(timer);
@@ -2187,7 +2192,7 @@
             };
             // Coming back to the tab polls immediately instead of waiting out
             // a timer the browser throttled while it was hidden.
-            const onVisible = () => { if (!document.hidden) done(); };
+            const onVisible = () => { if (wakeOnVisible && !document.hidden) done(); };
             const timer = setTimeout(done, ms);
             document.addEventListener('visibilitychange', onVisible);
         });
@@ -2203,8 +2208,10 @@
 
         const pollUrl = `/api/background/${encodeURIComponent(started.task_id)}`;
         const deadline = Date.now() + BACKGROUND_MAX_WAIT_MS;
+        let pollDelay = BACKGROUND_POLL_MS;
+        let throttled = false;
         for (;;) {
-            await waitForBackgroundPoll(BACKGROUND_POLL_MS);
+            await waitForBackgroundPoll(pollDelay, !throttled);
             let resp = null;
             try {
                 resp = await fetch(pollUrl, {credentials: 'same-origin', cache: 'no-store'});
@@ -2212,6 +2219,18 @@
                 // Suspended tab or a network blip; the server is still working.
             }
             if (resp && resp.status !== 202 && resp.status !== 429) return resp;
+            throttled = resp?.status === 429;
+            if (throttled) {
+                const retryAfter = resp.headers.get('Retry-After');
+                const seconds = retryAfter ? Number(retryAfter) : NaN;
+                const retryMs = Number.isFinite(seconds)
+                    ? seconds * 1000 : Date.parse(retryAfter || '') - Date.now();
+                pollDelay = Number.isFinite(retryMs) && retryMs > 0
+                    ? Math.max(BACKGROUND_POLL_MS, retryMs)
+                    : Math.min(30000, pollDelay * 2);
+            } else {
+                pollDelay = BACKGROUND_POLL_MS;
+            }
             // Checked after the poll, so a tab that slept past the deadline
             // still collects a result that finished while it was away.
             if (Date.now() > deadline) {
@@ -2785,9 +2804,34 @@
         return !prefix || prefix.toUpperCase() !== 'INAT';
     }
 
+    // Alan 10/12/26 - People copy the GenBank record page URL as often as the bare
+    // accession (https://www.ncbi.nlm.nih.gov/nuccore/OM021889.1), so read the
+    // accession out of it. Only /nuccore/ and its /nucleotide/ alias, and only when
+    // the path holds an accession -- a GI number (/nuccore/2178497362) is not one.
+    function accessionFromNcbiUrl(text) {
+        const cleaned = String(text || '').trim();
+        if (!/ncbi\.nlm\.nih\.gov/i.test(cleaned)) return null;
+        let parsed = null;
+        try {
+            parsed = new URL(/^[a-z]+:\/\//i.test(cleaned) ? cleaned : `https://${cleaned}`);
+        } catch (err) {
+            return null;
+        }
+        if (!/^https?:$/.test(parsed.protocol)) return null;
+        const host = parsed.hostname.toLowerCase();
+        if (host !== 'ncbi.nlm.nih.gov' && host !== 'www.ncbi.nlm.nih.gov') return null;
+        const match = /^\/(?:nuccore|nucleotide)\/([^/]+)\/?$/i.exec(parsed.pathname);
+        return match && isGenBankAccession(match[1]) ? match[1] : null;
+    }
+
+    // An NCBI record URL becomes its accession; anything else is returned unchanged.
+    function normalizeAccessionToken(token) {
+        return accessionFromNcbiUrl(token) || token;
+    }
+
     function parseGenBankAccessions(text) {
         if (!text || text.trim().startsWith('>')) return [];
-        const tokens = text.split(/[\s,;]+/).map(token => token.trim()).filter(Boolean);
+        const tokens = text.split(/[\s,;]+/).map(token => normalizeAccessionToken(token.trim())).filter(Boolean);
         if (tokens.length === 0 || !tokens.every(isGenBankAccession)) return [];
         return [...new Set(tokens.map(token => token.toUpperCase()))];
     }
@@ -2971,7 +3015,7 @@
         let isValid = false;
         updateSequenceInputMeta('blast_query');
 
-        if (isGenBankAccession(text)) {
+        if (isGenBankAccession(normalizeAccessionToken(text))) {
             isValid = true;
         } else if (text.length >= 20) {
             // Basic DNA char check (allow some noise/formatting)
@@ -2997,17 +3041,21 @@
     blastQueryInput.addEventListener('input', updateBlastButtonState);
     updateBlastButtonState();
 
+    // Read by the Paste panel's BLAST button, which must not start a second search.
+    let blastRunning = false;
+
     blastBtn.addEventListener('click', async () => {
         const text = blastQueryInput.value.trim();
         const minIdentity = document.getElementById('blast_min_identity').value;
         const maxSequences = document.getElementById('blast_max_sequences').value;
 
+        blastRunning = true;
         blastBtn.disabled = true;
         blastBtn.innerHTML = '<i class="fas fa-spinner fa-spin mr-2"></i> BLASTing...';
         showStatus('Running BLAST search... This may take a minute.', 'info');
 
         try {
-            let query = text;
+            let query = normalizeAccessionToken(text);
 
             if (text.startsWith('>')) {
                 const seqs = parseFasta(text);
@@ -3058,6 +3106,7 @@
             showStatus('BLAST error: ' + e.message, 'error');
         }
 
+        blastRunning = false;
         blastBtn.innerHTML = '<i class="fas fa-search mr-2"></i> BLAST Sequence';
         updateBlastButtonState();
     });
@@ -3070,6 +3119,23 @@
     // Alan 8/10/26 - The location option only makes sense once GenBank accessions are present.
     const genbankLocationOption = document.getElementById('genbank_location_option');
     const genbankAddLocationsCheckbox = document.getElementById('genbank_add_locations');
+    const pasteBlastBtn = document.getElementById('paste_blast_btn');
+
+    // Alan 10/12/26 - A single accession, NCBI record URL or sequence pasted here is
+    // as often meant for BLAST as for the queue, so offer both. Returns the query to
+    // hand the BLAST box, or null when the input is not exactly one query.
+    function pasteBlastQuery(text) {
+        const trimmed = String(text || '').trim();
+        if (!trimmed) return null;
+        const accessions = parseGenBankAccessions(trimmed);
+        if (accessions.length > 0) return accessions.length === 1 ? accessions[0] : null;
+        if (trimmed.startsWith('>')) {
+            const records = parseFasta(trimmed);
+            return records.length === 1 && records[0].sequence.length >= 20 ? trimmed : null;
+        }
+        const collapsed = trimmed.replace(/\s+/g, '');
+        return collapsed.length >= 20 && /^[ACGTURYSWKMBDHVN]+$/i.test(collapsed) ? trimmed : null;
+    }
 
     function shouldAddGenBankLocations() {
         return !!genbankAddLocationsCheckbox &&
@@ -3094,9 +3160,37 @@
 
         addSequencesBtn.disabled = !isValid;
         updateButtonVisuals(addSequencesBtn, isValid);
+
+        if (pasteBlastBtn) {
+            const canBlast = pasteBlastQuery(text) !== null;
+            pasteBlastBtn.classList.toggle('hidden', !canBlast);
+            updateButtonVisuals(pasteBlastBtn, canBlast);
+        }
     }
 
     sequenceTextInput.addEventListener('input', updateAddSequencesButtonState);
+
+    // Moves the query to the BLAST tab, so its settings and progress are in view,
+    // and starts the search there.
+    pasteBlastBtn?.addEventListener('click', () => {
+        const query = pasteBlastQuery(sequenceTextInput.value);
+        if (!query) return;
+        window.openImportSection?.('blast');
+        if (blastRunning) {
+            showStatus('A BLAST search is already running. When it finishes, come back to Paste to BLAST this one.', 'info');
+            return;
+        }
+        const existing = blastQueryInput.value.trim();
+        if (existing && existing !== query) {
+            showStatus('The BLAST box already has a query in it. Nothing was moved — clear the BLAST box, then try again.', 'info');
+            return;
+        }
+        blastQueryInput.value = query;
+        sequenceTextInput.value = '';
+        blastQueryInput.dispatchEvent(new Event('input', { bubbles: true }));
+        sequenceTextInput.dispatchEvent(new Event('input', { bubbles: true }));
+        blastBtn.click();
+    });
 
     // Initial check
     updateAddSequencesButtonState();

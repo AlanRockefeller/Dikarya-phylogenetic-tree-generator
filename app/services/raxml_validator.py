@@ -259,6 +259,18 @@ class ResolvedRaxmlParams:
     enable_early_stopping: bool = False
 
 
+def resolve_outgroup_id(outgroup: str, name_mapping: Dict[str, str]) -> str:
+    """Resolve an exact header or record ID; never guess by substring."""
+    matches = [safe_id for safe_id, header in name_mapping.items() if header == outgroup]
+    if not matches:
+        matches = [safe_id for safe_id, header in name_mapping.items()
+                   if header.split(None, 1)[0] == outgroup]
+    if len(matches) != 1:
+        reason = "matches more than one sequence" if matches else "was not found among the sequences"
+        raise ValueError(f"The requested outgroup {outgroup!r} {reason}. Choose its full sequence name or clear the outgroup selection.")
+    return matches[0]
+
+
 def validate_and_resolve_raxml_params(params: Dict[str, Any], data_type: str = 'DNA') -> ResolvedRaxmlParams:
     """
     Validate raw input parameters and resolve them to safe, executable values.
@@ -506,22 +518,16 @@ def validate_and_resolve_raxml_params(params: Dict[str, Any], data_type: str = '
              warnings.append("Invalid seed provided; using random seed.")
              seed = random.randint(1, 2147483647)
 
-    # 5. Outgroup Logic
+    # 5. Outgroups name original FASTA records, not command-line arguments.
+    # The builder resolves them to SEQ###### before rooting. In particular,
+    # NCBI region identifiers contain colons, and descriptions contain spaces.
     outgroup = params.get('outgroup')
     if outgroup:
+        if not isinstance(outgroup, str) or not outgroup.isprintable() or len(outgroup) > 2000:
+            raise ValueError("Outgroup must be a sequence name without control characters (maximum 2000 characters).")
         outgroup = str(outgroup).strip()
-        # Reject whitespace/quotes
-        if any(ch.isspace() for ch in outgroup) or '"' in outgroup or "'" in outgroup:
-             warnings.append("Outgroup contained whitespace or quotes; ignored.")
-             outgroup = None
-        # Strict char check. Narrowed from a previous regex that allowed
-        # `|`, `:`, and `@` -- none of those appear in real FASTA tip IDs
-        # for our pipeline, and removing them reduces the surface for any
-        # taxa-name confusion attempts. Argv passing already prevents shell
-        # injection; this is hygiene.
-        elif not re.match(r"^[A-Za-z0-9_.\-]+$", outgroup):
-             warnings.append(f"Outgroup '{outgroup}' contains invalid characters; ignored.")
-             outgroup = None
+        if not outgroup:
+            raise ValueError("Choose a sequence name for the outgroup, or clear the outgroup selection.")
 
     # 6. Early Stopping
     # NOTE: Does NOT check if supported by binary here. That check happens in service.

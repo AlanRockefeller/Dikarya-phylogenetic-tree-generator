@@ -156,6 +156,9 @@ document.addEventListener('DOMContentLoaded', async () => {
     // walks back the way a user expects. There is no redo.
     // ======================================================================
     let serverUndoState = null;
+    let undoStateRequest = 0;
+    let undoStateRetryTimer = null;
+    let undoStateNeedsRefresh = false;
 
     // What Undo would do right now, or null when there is nothing to undo.
     function currentUndoTarget() {
@@ -187,20 +190,41 @@ document.addEventListener('DOMContentLoaded', async () => {
 
     // Ask the server whether a persisted checkpoint is available. Cheap, and
     // called after every edit so the button never claims more than is true.
-    async function refreshServerUndoState() {
+    async function refreshServerUndoState(retryAttempt = 0) {
+        const requestNumber = ++undoStateRequest;
+        clearTimeout(undoStateRetryTimer);
+        undoStateNeedsRefresh = false;
         if (JOB_ID === 'unknown') { serverUndoState = null; updateUndoButton(); return; }
         try {
-            serverUndoState = await TreeEditActions.getUndoState(JOB_ID);
+            const state = await TreeEditActions.getUndoState(JOB_ID);
+            if (requestNumber !== undoStateRequest) return;
+            serverUndoState = state;
         } catch (err) {
-            // An unreadable undo state is not an error worth interrupting for;
-            // it just means Undo is not offered.
+            if (requestNumber !== undoStateRequest) return;
             serverUndoState = null;
+            // Retry only reads, and only transient failures. A fresh edit or a
+            // reconnect supersedes any older request and its pending retry.
+            const status = Number(err.status) || 0;
+            undoStateNeedsRefresh = !status || status === 429 || status >= 500;
+            if (undoStateNeedsRefresh && retryAttempt < 3 && !document.hidden && navigator.onLine !== false) {
+                undoStateRetryTimer = setTimeout(
+                    () => refreshServerUndoState(retryAttempt + 1), 1000 * (2 ** retryAttempt)
+                );
+            }
         }
         updateUndoButton();
     }
 
+    const retryUndoStateWhenVisible = () => {
+        if (undoStateNeedsRefresh && !document.hidden && navigator.onLine !== false) refreshServerUndoState();
+    };
+    window.addEventListener('online', retryUndoStateWhenVisible);
+    document.addEventListener('visibilitychange', retryUndoStateWhenVisible);
+    window.addEventListener('pagehide', () => clearTimeout(undoStateRetryTimer));
+
     // Apply whatever the single Undo slot currently holds.
     async function performUndo() {
+        if (undoStateNeedsRefresh && !isProcessing) await refreshServerUndoState();
         const target = currentUndoTarget();
         if (!target || isProcessing) return;
 
@@ -2478,7 +2502,19 @@ document.addEventListener('DOMContentLoaded', async () => {
     // cleared after the save returns, so a second N press in that window would add it again.
     const quickAnnotationsInFlight = [];
 
-    function quickAnnotateCurrentSelection() {
+    // Alan 10/14/26 - Shift+N's "cf." form: "Inocybe geophylla" -> "Inocybe cf. geophylla".
+    // Only a genus followed by a plain epithet qualifies; "Genus sp.", a bare genus, a quoted
+    // provisional name or one already carrying cf./aff./nr. is returned unchanged (null).
+    function cfAnnotationLabel(label) {
+        const tokens = String(label || '').trim().split(/\s+/);
+        if (tokens.length < 2) return null;
+        const epithet = tokens[1];
+        if (speciesRankMarker(epithet) || !/^[a-z][a-z-]*$/.test(epithet)) return null;
+        return [tokens[0], 'cf.', ...tokens.slice(1)].join(' ');
+    }
+
+    // Alan 10/14/26 - `cf` (Shift+N) inserts "cf." after the genus of the suggested name.
+    function quickAnnotateCurrentSelection(options = {}) {
         if (!annotationsEditable() || !viewer?.getSelectedAnnotationLeafIds) return;
         const memberIds = viewer.getSelectedAnnotationLeafIds();
         if (!memberIds.length) {
@@ -2496,6 +2532,16 @@ document.addEventListener('DOMContentLoaded', async () => {
         }
         openAnnotationEditor('add', { memberIds });
         if (!annotationEditorState) return;
+        // Alan 10/14/26 - Rewrite the pre-filled suggestion to its "cf." form before saving.
+        if (options.cf) {
+            const labelInput = getEl('input-annotation-label');
+            const cfLabel = labelInput ? cfAnnotationLabel(labelInput.value) : null;
+            if (cfLabel) {
+                labelInput.value = cfLabel;
+            } else {
+                showStatus('No species epithet to qualify with cf. — annotated with the plain name.', 'info', 5000);
+            }
+        }
         const pending = memberIds.slice();
         quickAnnotationsInFlight.push(pending);
         Promise.resolve(submitAnnotationEditor({ quick: true })).finally(() => {
@@ -4856,8 +4902,9 @@ document.addEventListener('DOMContentLoaded', async () => {
                 deselectCurrentTreeSelection();
                 handled = true;
             // Alan 9/30/26 - N annotates the selection with its suggested name, skipping the dialog.
+            // Alan 10/14/26 - Capital N does the same with "cf." added ("Inocybe cf. geophylla").
             } else if (key === 'n' && viewer && !isProcessing) {
-                quickAnnotateCurrentSelection();
+                quickAnnotateCurrentSelection({ cf: e.key === 'N' });
                 handled = true;
             // Alan 8/24/26 - A opens the Alignment Viewer; V stays as the original alias.
             } else if ((key === 'a' || key === 'v') && viewer && btnAlignmentViewer && !btnAlignmentViewer.disabled) {

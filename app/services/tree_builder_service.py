@@ -77,8 +77,7 @@ FASTTREE_SH_RESAMPLES = 1000
 # and a small set of punctuation for modifiers/partitions/params. This is a
 # character-allowlist (not a semantic check like raxml_validator.py) --
 # IQ-TREE itself rejects unrecognized model names. Argv passing already
-# prevents shell injection; this is hygiene, matching the outgroup check in
-# raxml_validator.py.
+# prevents shell injection; this bounds model syntax before IQ-TREE sees it.
 _IQTREE_MODEL_ALLOWED_RE = re.compile(r"^[A-Za-z0-9+\-_.,:{}*/]+$")
 _IQTREE_MODEL_MAX_LEN = 256
 _IQTREE_DEFAULT_MODEL = "GTR+G"
@@ -1042,6 +1041,13 @@ def _run_raxml(
     else:
         sanitized_fasta = output_newick.parent / "raxml_input_sanitized.fasta"
         name_mapping = sanitize_fasta_headers(alignment_fasta, sanitized_fasta)
+
+    outgroup_tip = None
+    if resolved.outgroup:
+        from app.services.raxml_validator import resolve_outgroup_id
+        outgroup_tip = resolve_outgroup_id(resolved.outgroup, name_mapping)
+        if not HAS_BIOPYTHON:
+            raise RuntimeError("The requested outgroup rooting requires Biopython.")
     
     cmd = _get_raxml_cmd(resolved, config, sanitized_fasta, prefix, threads)
     
@@ -1114,36 +1120,16 @@ def _run_raxml(
 
             # RAxML output uses sanitized IDs while the UI supplies an original
             # record ID. Resolve the requested ID before rerooting.
-            target_name = resolved.outgroup
-
-            for safe_id, original_header in name_mapping.items():
-                original_id = original_header.split(None, 1)[0]
-                if resolved.outgroup in (original_id, original_header):
-                    target_name = safe_id
-                    break
-
-            if target_name == resolved.outgroup:
-                for safe_id, original_header in name_mapping.items():
-                    if resolved.outgroup in original_header:
-                        target_name = safe_id
-                        break
+            target_name = outgroup_tip
 
             if _reroot_tree_file_on_tip(output_newick, target_name):
                 applied_outgroup = resolved.outgroup
                 if tbe_tree_path is not None:
                     _reroot_tree_file_on_tip(tbe_tree_path, target_name)
             else:
-                task_logger.warning(f"Outgroup {target_name} not found in tree. Skipping reroot.")
-                resolved.warnings.append(
-                    f"Requested outgroup {resolved.outgroup!r} was not found in the "
-                    "inferred tree; the tree was not outgroup-rooted."
-                )
+                raise ValueError(f"The requested outgroup {resolved.outgroup!r} could not be found in the inferred tree.")
         except Exception as e:
-            task_logger.error(f"Outgroup rerooting failed: {e}")
-            resolved.warnings.append(
-                f"Requested outgroup rooting failed ({type(e).__name__}); the tree "
-                "was retained without that rooting operation."
-            )
+            raise ValueError(f"Could not apply the requested outgroup rooting: {e}") from e
     elif resolved.outgroup:
         resolved.warnings.append(
             "Requested outgroup rooting could not be applied because Biopython "

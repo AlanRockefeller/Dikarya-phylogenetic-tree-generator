@@ -1470,7 +1470,7 @@ def _run_in_background_if_asked(kind, handler, data):
 
 
 @bp.get('/background/<task_id>')
-@limiter.limit("120 per minute")
+@limiter.limit("600 per minute")
 def background_request_status(task_id):
     """Poll a request started with X-Dikarya-Background.
 
@@ -3142,6 +3142,9 @@ def create_job():
             if resolved.warnings:
                 job_params['validation_warnings'] = resolved.warnings
                 
+        except ValueError as e:
+            note_request_failure("invalid_outgroup")
+            return jsonify({"status": "error", "error": str(e)}), 400
         except Exception as e:
             logger.error(f"Validation error: {e}")
             # Continue but verify in worker
@@ -3233,6 +3236,18 @@ def create_job():
         except ValueError as e:
             note_request_failure("invalid_dna_fasta")
             return jsonify({"status": "error", "error": str(e)}), 400
+        if tree_method == 'raxml' and job_params.get('outgroup'):
+            try:
+                from app.services.fasta_utils import parse_fasta_records
+                from app.services.raxml_validator import resolve_outgroup_id
+                resolve_outgroup_id(job_params['outgroup'], {
+                    str(i): header for i, (header, _seq) in enumerate(
+                        parse_fasta_records(job_params['sequence'])
+                    )
+                })
+            except ValueError as e:
+                note_request_failure("invalid_outgroup")
+                return jsonify({"status": "error", "error": str(e)}), 400
 
     # Quick Tree's per-sequence ceiling, enforced here as well as in the
     # browser so a request built by hand cannot put a 150 kb genome through

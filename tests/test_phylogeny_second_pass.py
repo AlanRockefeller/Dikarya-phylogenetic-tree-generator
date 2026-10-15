@@ -652,7 +652,7 @@ def test_raxml_adjustments_are_retained_in_metadata_and_degraded(
         bootstrap_cap=1,
         start_tree_override="not-valid",
         seed="bad",
-        outgroup="bad outgroup",
+        outgroup=None,
         early_stopping=True,
         moose_enabled=moose_enabled,
     )
@@ -673,7 +673,7 @@ def test_raxml_adjustments_are_retained_in_metadata_and_degraded(
 
 @pytest.mark.parametrize(
     ("requested_outgroup", "applied_outgroup"),
-    [("A", "A"), ("MISSING", None)],
+    [("A", "A"), ("NR_185817.1:125-562", "NR_185817.1:125-562")],
 )
 def test_raxml_applied_outgroup_records_actual_rooting_outcome(
     tmp_path, monkeypatch, requested_outgroup, applied_outgroup
@@ -682,6 +682,8 @@ def test_raxml_applied_outgroup_records_actual_rooting_outcome(
     output = tmp_path / "tree" / "tree_original.newick"
     nexus = tmp_path / "tree" / "tree_original.nexus"
     _write_alignment(alignment)
+    if requested_outgroup.startswith('NR_'):
+        alignment.write_text(alignment.read_text().replace('>A\n', '>NR_185817.1:125-562 Agrocybe striatipes\n'))
     with alignment.open("a") as handle:
         handle.write(">C\nACGTACGG\n")
     output.parent.mkdir()
@@ -713,8 +715,8 @@ def test_raxml_applied_outgroup_records_actual_rooting_outcome(
 
     assert metadata["parameters_requested"]["outgroup"] == requested_outgroup
     assert metadata["parameters_applied"]["outgroup"] == applied_outgroup
-    if applied_outgroup is None:
-        assert any("not outgroup-rooted" in warning for warning in metadata["parameter_warnings"])
+    tree = Phylo.read(output, "newick")
+    assert any(clade.name and clade.name.split(None, 1)[0] == requested_outgroup for clade in tree.root.clades)
 
 
 @pytest.mark.parametrize(
