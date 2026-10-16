@@ -1,3 +1,4 @@
+import math
 import re
 import random
 from pathlib import Path
@@ -24,6 +25,40 @@ BOOTSTRAP_PRESETS = {
     'publication': 1000,
     'maximum': 2000,
 }
+
+# AutoMRE convergence cutoff (--bs-cutoff): bootstrapping stops once a check
+# every 50 replicates finds the support values stable to within this
+# threshold, so a larger cutoff stops sooner. RAxML-NG's own default is 0.03,
+# which every Dikarya job used until 2026-10-16. The stopping test was replayed
+# on the stored bootstrap trees of 67 production jobs (ops/raxml/README.md).
+# Against 0.03, 0.07 saved 80% of bootstrap time and moved a branch's support
+# by 1.9 points on average (16 at most). Two independent full runs at 0.03
+# already differ by 1.4-1.8 on average. The form offers these values with a
+# speed word. The API accepts anything in the range below.
+BOOTSTRAP_CUTOFF_CHOICES = {
+    0.03: 'Slowest',
+    0.04: 'Slow',
+    0.07: 'Medium',
+    0.10: 'Fast',
+}
+DEFAULT_BOOTSTRAP_CUTOFF = 0.07
+# What a job stored without the setting ran with: RAxML-NG's default. A
+# recompute of such a job reproduces that rather than switching cutoffs.
+LEGACY_BOOTSTRAP_CUTOFF = 0.03
+MIN_BOOTSTRAP_CUTOFF = 0.01
+MAX_BOOTSTRAP_CUTOFF = 0.10
+
+
+def bootstrap_cutoff_label(cutoff) -> str:
+    """'0.07 (Medium)' for a form value, '0.05' for any other cutoff."""
+    try:
+        value = round(float(cutoff), 4)
+    except (TypeError, ValueError):
+        return str(cutoff)
+    word = BOOTSTRAP_CUTOFF_CHOICES.get(value)
+    # Two decimals, as the form writes them ("0.10", not "0.1").
+    text = f"{value:.2f}" if round(value, 2) == value else f"{value:g}"
+    return f"{text} ({word})" if word else text
 
 # Supported Models (Base matrices)
 # Uppercased on the way in, like VALID_AA_MODELS below, because the parser
@@ -257,6 +292,19 @@ class ResolvedRaxmlParams:
     outgroup: Optional[str] = None
     enable_moose: bool = False
     enable_early_stopping: bool = False
+    bootstrap_cutoff: float = DEFAULT_BOOTSTRAP_CUTOFF
+
+
+def resolve_outgroup_id(outgroup: str, name_mapping: Dict[str, str]) -> str:
+    """Resolve an exact header or record ID; never guess by substring."""
+    matches = [safe_id for safe_id, header in name_mapping.items() if header == outgroup]
+    if not matches:
+        matches = [safe_id for safe_id, header in name_mapping.items()
+                   if header.split(None, 1)[0] == outgroup]
+    if len(matches) != 1:
+        reason = "matches more than one sequence" if matches else "was not found among the sequences"
+        raise ValueError(f"The requested outgroup {outgroup!r} {reason}. Choose its full sequence name or clear the outgroup selection.")
+    return matches[0]
 
 
 def validate_and_resolve_raxml_params(params: Dict[str, Any], data_type: str = 'DNA') -> ResolvedRaxmlParams:
@@ -304,6 +352,26 @@ def validate_and_resolve_raxml_params(params: Dict[str, Any], data_type: str = '
             bootstrap_cap = req_cap
     else:
         bootstrap_cap = 0  # Irrelevant but safe value
+
+    bootstrap_cutoff = DEFAULT_BOOTSTRAP_CUTOFF
+    raw_cutoff = params.get('bootstrap_cutoff')
+    if raw_cutoff is not None and raw_cutoff != '':
+        try:
+            requested_cutoff = float(raw_cutoff)
+        except (TypeError, ValueError):
+            requested_cutoff = None
+        if isinstance(raw_cutoff, bool) or requested_cutoff is None or not math.isfinite(requested_cutoff):
+            warnings.append(
+                f"Invalid bootstrap convergence cutoff; using {DEFAULT_BOOTSTRAP_CUTOFF:g}."
+            )
+        elif not MIN_BOOTSTRAP_CUTOFF <= requested_cutoff <= MAX_BOOTSTRAP_CUTOFF:
+            bootstrap_cutoff = min(max(requested_cutoff, MIN_BOOTSTRAP_CUTOFF), MAX_BOOTSTRAP_CUTOFF)
+            warnings.append(
+                f"Bootstrap convergence cutoff {requested_cutoff:g} is outside "
+                f"{MIN_BOOTSTRAP_CUTOFF:g}-{MAX_BOOTSTRAP_CUTOFF:g}; clamped to {bootstrap_cutoff:g}."
+            )
+        else:
+            bootstrap_cutoff = round(requested_cutoff, 4)
 
     # 2. Starting Trees Logic
     run_preset = params.get('run_preset', 'fast_good')
@@ -506,22 +574,16 @@ def validate_and_resolve_raxml_params(params: Dict[str, Any], data_type: str = '
              warnings.append("Invalid seed provided; using random seed.")
              seed = random.randint(1, 2147483647)
 
-    # 5. Outgroup Logic
+    # 5. Outgroups name original FASTA records, not command-line arguments.
+    # The builder resolves them to SEQ###### before rooting. In particular,
+    # NCBI region identifiers contain colons, and descriptions contain spaces.
     outgroup = params.get('outgroup')
     if outgroup:
+        if not isinstance(outgroup, str) or not outgroup.isprintable() or len(outgroup) > 2000:
+            raise ValueError("Outgroup must be a sequence name without control characters (maximum 2000 characters).")
         outgroup = str(outgroup).strip()
-        # Reject whitespace/quotes
-        if any(ch.isspace() for ch in outgroup) or '"' in outgroup or "'" in outgroup:
-             warnings.append("Outgroup contained whitespace or quotes; ignored.")
-             outgroup = None
-        # Strict char check. Narrowed from a previous regex that allowed
-        # `|`, `:`, and `@` -- none of those appear in real FASTA tip IDs
-        # for our pipeline, and removing them reduces the surface for any
-        # taxa-name confusion attempts. Argv passing already prevents shell
-        # injection; this is hygiene.
-        elif not re.match(r"^[A-Za-z0-9_.\-]+$", outgroup):
-             warnings.append(f"Outgroup '{outgroup}' contains invalid characters; ignored.")
-             outgroup = None
+        if not outgroup:
+            raise ValueError("Choose a sequence name for the outgroup, or clear the outgroup selection.")
 
     # 6. Early Stopping
     # NOTE: Does NOT check if supported by binary here. That check happens in service.
@@ -542,5 +604,6 @@ def validate_and_resolve_raxml_params(params: Dict[str, Any], data_type: str = '
         warnings=warnings,
         outgroup=outgroup,
         enable_moose=enable_moose,
-        enable_early_stopping=enable_early_stopping
+        enable_early_stopping=enable_early_stopping,
+        bootstrap_cutoff=bootstrap_cutoff,
     )

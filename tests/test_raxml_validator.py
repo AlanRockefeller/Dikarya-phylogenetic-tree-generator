@@ -4,7 +4,29 @@ from app.services.raxml_validator import (
     _is_safe_mapping_param,
     _is_safe_model_param,
     validate_and_resolve_raxml_params,
+    resolve_outgroup_id,
 )
+
+
+@pytest.mark.parametrize("name", ["NR_185817.1:125-562", "A species 'TYPE'", "gb|AB123456.1|", "A#1*", "José — type"])
+def test_outgroups_preserve_original_fasta_names(name):
+    assert validate_and_resolve_raxml_params({"outgroup": name}).outgroup == name
+    assert resolve_outgroup_id(name, {"SEQ000001": name}) == "SEQ000001"
+
+
+@pytest.mark.parametrize("name", ["A\nB", "A\tB", "A\x00", "A" * 2001, "   ", ["A"]])
+def test_invalid_outgroups_raise_instead_of_silently_changing_rooting(name):
+    with pytest.raises(ValueError, match="[Oo]utgroup"):
+        validate_and_resolve_raxml_params({"outgroup": name})
+
+
+def test_outgroup_matching_requires_a_unique_exact_header_or_id():
+    mapping = {"SEQ000001": "AB123.1:10-20 first", "SEQ000002": "AB123.1:10-20 second"}
+    assert resolve_outgroup_id("AB123.1:10-20 first", mapping) == "SEQ000001"
+    with pytest.raises(ValueError, match="more than one"):
+        resolve_outgroup_id("AB123.1:10-20", mapping)
+    with pytest.raises(ValueError, match="not found"):
+        resolve_outgroup_id("AB123.1", mapping)
 
 
 @pytest.mark.parametrize(

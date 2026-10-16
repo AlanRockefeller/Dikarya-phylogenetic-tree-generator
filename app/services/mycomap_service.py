@@ -34,6 +34,14 @@ REQUEST_TIMEOUT = 10
 FASTA_FETCH_ATTEMPTS = 3
 FASTA_FETCH_RETRY_BASE_SECONDS = 2
 
+# The metrics page is read after the FASTA exports. One retry on the same URL
+# recovers truncated responses (notably http.client.IncompleteRead) without
+# immediately falling through to the obsolete canonical URL. Keep this much
+# smaller than the worker-only FASTA budget because this fetch also runs in a
+# request handler.
+BLAST_METRICS_FETCH_ATTEMPTS = 2
+BLAST_METRICS_RETRY_SECONDS = 0.25
+
 # Alan 8/15/26 - That full retry budget is only affordable in a worker. A request
 # handler fetches both endpoints, so the unbounded worst case is
 # 2 x (3 x REQUEST_TIMEOUT + 6s backoff) = 72s spent holding one of only 8
@@ -3879,12 +3887,41 @@ def fetch_mycomap_blast_metrics(blast_id: str, source_url: Optional[str] = None)
 
     content = ''
     for url in _metrics_page_urls(blast_id, source_url):
-        try:
-            with diagnostic_urlopen(url, timeout=REQUEST_TIMEOUT, opener=opener.open) as resp:
-                content = resp.read().decode('utf-8', errors='replace')
+        fetched = False
+        for attempt in range(BLAST_METRICS_FETCH_ATTEMPTS):
+            try:
+                with diagnostic_urlopen(
+                    url, timeout=REQUEST_TIMEOUT, opener=opener.open
+                ) as resp:
+                    content = resp.read().decode('utf-8', errors='replace')
+                fetched = True
+                if attempt:
+                    logger.info(
+                        "fetch_mycomap_blast_metrics: fetched page %s on "
+                        "attempt %s/%s",
+                        url, attempt + 1, BLAST_METRICS_FETCH_ATTEMPTS,
+                    )
+                break
+            except Exception as e:
+                # A 4xx is a real response for this URL, so move to the fallback
+                # immediately. Network/read failures and upstream 5xx responses
+                # are transient and get one retry on the URL that just failed.
+                retryable = not isinstance(e, urllib.error.HTTPError) or e.code >= 500
+                if retryable and attempt + 1 < BLAST_METRICS_FETCH_ATTEMPTS:
+                    logger.warning(
+                        "fetch_mycomap_blast_metrics: could not fetch page %s "
+                        "(attempt %s/%s): %s; retrying",
+                        url, attempt + 1, BLAST_METRICS_FETCH_ATTEMPTS, e,
+                    )
+                    time.sleep(BLAST_METRICS_RETRY_SECONDS)
+                    continue
+                logger.warning(
+                    "fetch_mycomap_blast_metrics: could not fetch page %s: %s",
+                    url, e,
+                )
+                break
+        if fetched:
             break
-        except Exception as e:
-            logger.warning(f"fetch_mycomap_blast_metrics: could not fetch page {url}: {e}")
 
     if not content:
         return {}

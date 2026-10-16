@@ -42,7 +42,7 @@ class RecordingDb:
 
 
 def _submit(*, fail_commits=(), enqueue_error=None, prepare_warning=False,
-            tree_method="nj", bootstrap=1000):
+            tree_method="nj", bootstrap=1000, sequence=FASTA, outgroup=None):
     events = []
     database = RecordingDb(events, fail_commits=fail_commits)
     queued = {}
@@ -67,9 +67,10 @@ def _submit(*, fail_commits=(), enqueue_error=None, prepare_warning=False,
     with (
         app.test_request_context(method="POST", json={
             "input_type": "sequence",
-            "sequence": FASTA,
+            "sequence": sequence,
             "tree_method": tree_method,
             "bootstrap": bootstrap,
+            "outgroup": outgroup,
         }),
         patch.object(routes, "db", database),
         patch.object(routes, "Job", side_effect=make_job),
@@ -82,6 +83,23 @@ def _submit(*, fail_commits=(), enqueue_error=None, prepare_warning=False,
         g.request_id = "test-request"
         response = app.make_response(_undecorated(routes.create_job)())
     return response, events, database, queued
+
+
+def test_raxml_region_outgroup_survives_submission():
+    sequence = FASTA.replace('>A\n', '>NR_185817.1:125-562 Agrocybe striatipes\n')
+    response, _events, _database, queued = _submit(
+        tree_method='raxml', sequence=sequence, outgroup='NR_185817.1:125-562'
+    )
+    assert response.status_code == 202
+    assert queued['params']['outgroup'] == 'NR_185817.1:125-562'
+
+
+@pytest.mark.parametrize('outgroup', ['MISSING', 'A\nB'])
+def test_invalid_outgroup_is_reported_without_queuing_a_different_rooting(outgroup):
+    response, events, _database, queued = _submit(tree_method='raxml', outgroup=outgroup)
+    assert response.status_code == 400
+    assert 'outgroup' in response.get_json()['error'].lower()
+    assert 'enqueue' not in events
 
 
 def test_web_commit_precedes_enqueue_and_uses_the_same_uuid():

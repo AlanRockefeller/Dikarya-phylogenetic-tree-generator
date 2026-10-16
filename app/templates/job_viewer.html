@@ -265,6 +265,8 @@
                     <dd>Deselect all sequences</dd>
                     <dt><kbd class="rounded border border-gray-300 bg-gray-100 px-2 py-0.5 font-mono dark:border-gray-600 dark:bg-journal-dark">N</kbd></dt>
                     <dd>Annotate the selected sequences with their most common species (or genus) name, without opening the editor. Opens the editor instead if no name can be found.</dd>
+                    <dt><kbd class="rounded border border-gray-300 bg-gray-100 px-2 py-0.5 font-mono dark:border-gray-600 dark:bg-journal-dark">Shift</kbd>&nbsp;+&nbsp;<kbd class="rounded border border-gray-300 bg-gray-100 px-2 py-0.5 font-mono dark:border-gray-600 dark:bg-journal-dark">N</kbd></dt>
+                    <dd>Same as <kbd class="rounded border border-gray-300 bg-gray-100 px-2 py-0.5 font-mono dark:border-gray-600 dark:bg-journal-dark">N</kbd>, but adds <em>cf.</em> after the genus (<em>Inocybe geophylla</em> becomes <em>Inocybe cf. geophylla</em>)</dd>
                     <dt><kbd class="rounded border border-gray-300 bg-gray-100 px-2 py-0.5 font-mono dark:border-gray-600 dark:bg-journal-dark">A</kbd></dt>
                     <dd>Open the Alignment Viewer (<kbd class="rounded border border-gray-300 bg-gray-100 px-2 py-0.5 font-mono dark:border-gray-600 dark:bg-journal-dark">V</kbd> also works)</dd>
                     <dt><kbd class="rounded border border-gray-300 bg-gray-100 px-2 py-0.5 font-mono dark:border-gray-600 dark:bg-journal-dark">S</kbd></dt>
@@ -1595,17 +1597,17 @@
 
 <script src="{{ url_for('static', filename='vendor/underscore-1.13.6-min.js') }}"></script>
 
-<script src="{{ url_for('static', filename='js/phylotree.js') }}?v=15"></script>
+<script src="{{ url_for('static', filename='js/phylotree.js') }}?v=16"></script>
 
 <script src="{{ url_for('static', filename='js/tree_viewer_phylotree_v2.js') }}?v=111"></script>
 
 <script src="{{ url_for('static', filename='js/tree_viewer_api.js') }}?v=8"></script>
 
-<script src="{{ url_for('static', filename='js/tree_viewer_controller.js') }}?v=106"></script>
+<script src="{{ url_for('static', filename='js/tree_viewer_controller.js') }}?v=109"></script>
 
 {% include 'partials/alignment_viewer_modal.html' %}
 
-<script src="{{ url_for('static', filename='js/alignment_viewer.js') }}?v=20"></script>
+<script src="{{ url_for('static', filename='js/alignment_viewer.js') }}?v=22"></script>
 
 
 

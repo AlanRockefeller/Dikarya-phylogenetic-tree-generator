@@ -26,20 +26,98 @@ built the same way.
 `--threads 1` and `--threads 2`, every output file -- best tree, ML trees, bootstrap
 trees, both support trees, the model, MOOSE's JSON apart from its run metadata -- and
 the log apart from timings, paths and the version line are byte-identical to stock
-2.0.3.
+2.0.3. One qualification at `--threads 2`, where stock differs from itself run to
+run: the two workers' log lines interleave in a different order, and MOOSE lists its
+models in the order they finish. So `compare-raxml-runs.py` compares each worker's
+lines in its own order and MOOSE's model lines as a set. The values must still match
+exactly.
 
-## Measured on this host (Xeon E5-2690 v4, 2 vCPUs, --threads 1)
+## Measured on this host (Xeon E5-2690 v4, 2 vCPUs)
 
 Real Dikarya alignments from `var/jobs`, each run with the job's own model, seed,
 starting trees and support options (inputs rebuilt exactly as `_run_raxml` does:
-replaying a job's command reproduces its stored trees byte for byte), stock and
-dikarya1 interleaved (ABBA), CPU time:
+replaying a job's command reproduces its stored trees byte for byte). Only the
+bootstrap count was cut where a full run would take hours; dd7c1be7 is the complete
+job. Stock 2.0.3 against a build made from the patches in this directory,
+interleaved (ABBA, two runs each), one input per hold of the benchmark lock, on
+2026-10-16. Every run's output was identical to stock.
 
-*Pending: the timing table has not been written up yet, so this build has no
-published speedup. Do not switch `RAXML_BINARY` on the strength of this section.*
+| job | taxa x patterns | model | run | stock 2.0.3 | dikarya1 | speedup |
+|---|---|---|---|---|---|---|
+| n0k5 | 127 x 153 | HKY+FE+R2 | 20 starting trees, 20 bootstraps | 59.2 s | 46.0 s | 1.29x |
+| fzc7 | 101 x 218 | GTR+G | 20 starting trees, 20 bootstraps | 99.0 s | 69.8 s | 1.42x |
+| b930451f | 75 x 449 | TIM1+FO+I+R3 | 20 starting trees, 10 bootstraps | 124.1 s | 89.6 s | 1.39x |
+| c91f0a5a | 240 x 588 | HKY+FO+R3 | 20 starting trees, 4 bootstraps | 653.8 s | 481.2 s | 1.36x |
+| dd7c1be7 | 40 x 189 | GTR+G | the whole job: 5 starting trees, autoMRE{500} | 154.3 s | 108.8 s | 1.42x |
+| b4a1f45e | 430 x 495 | TVM+FO+I+R4 | 1 starting tree, 10 bootstraps, KH rule | 334.1 s | 241.8 s | 1.38x |
+| 0be9b363 | 136 x 229 | MOOSE's choice | 2 starting trees, autoMRE{100}, KH rule | 277.4 s | 185.8 s | 1.49x |
+| all seven, `--threads 1` (CPU time) | | | | 1702 s | 1223 s | **1.39x** |
+| fzc7, `--threads 2` (wall time) | | | | 53.5 s | 37.7 s | 1.42x |
+| dd7c1be7, `--threads 2` (wall time) | | | | 99.1 s | 66.6 s | 1.49x |
 
-The gain is the same at `--threads 2` (two coarse-grained workers, how the main
-worker runs RAxML), since each worker runs the same single-threaded searches.
+`--threads 2` is how the main worker runs RAxML: two coarse-grained workers, each
+running the same single-threaded searches, so the gain carries over. On the 88 hours
+of RAxML in the job history, 1.39x would have saved about 25 hours, before the
+bootstrapping changes below.
+
+## Bootstrapping settings (2026-10-16)
+
+Two changes to how Dikarya runs RAxML-NG alter results slightly, so unlike the
+patches they were measured on what they change, not only on speed. Both apply to
+any `RAXML_BINARY`.
+
+**Identical sequences are left out of the tree search.** `_run_raxml` gets an
+alignment with one sequence per group of identical sequences. After the run, each
+group goes back onto the delivered trees (FBP and TBE) as a zero-length polytomy
+where its kept sequence sits, with no support value on the clade that joins them
+(`app/services/identical_sequences.py`). The same applies to the advanced IQ-TREE
+method and to MrBayes. Six production jobs with duplicates, each replayed with its
+own model, seed and starting trees (bootstrap count reduced so a pair of runs takes
+minutes), CPU time on the full alignment and on the collapsed one:
+
+| job | taxa | identical | full | collapsed | saved | log-likelihood change | RF distance |
+|---|---|---|---|---|---|---|---|
+| fzc7 | 101 | 12 (12%) | 74.2 s | 64.0 s | 13.7% | -0.002 | 0.30 |
+| b930451f | 75 | 10 (13%) | 104.7 s | 89.5 s | 14.6% | +0.048 | 0.02 |
+| 602ab439 | 179 | 49 (27%) | 140.2 s | 93.0 s | 33.6% | -0.711 | 0.59 |
+| n0k5 | 127 | 35 (28%) | 54.9 s | 38.8 s | 29.4% | +0.474 | 0.45 |
+| 3235d144 | 341 | 102 (30%) | 115.1 s | 70.0 s | 39.2% | -0.062 | 0.50 |
+| 1vpz | 140 | 47 (34%) | 65.0 s | 39.7 s | 39.0% | +0.002 | 0.51 |
+
+The log-likelihood change is that of the re-added tree, scored with
+`raxml-ng --evaluate` on the full alignment, against the tree from the full
+alignment. The RF distance (normalized) compares the two topologies with one tip
+per identical group. Rerunning the full alignment with a different seed moves these
+jobs just as far: RF 0.33-0.74 and up to 0.5 log-likelihood units. These ITS
+datasets have many near-equal trees. Applied to the 92 finished RAxML jobs on disk,
+the collapse would have saved about 8-9% of all RAxML wall time (7-8 of 88 hours),
+almost all of it in jobs with many duplicates.
+
+**The AutoMRE cutoff defaults to 0.07** (`--bs-cutoff`; RAxML-NG's own default is
+0.03), with a dropdown in the advanced options (0.03 Slowest, 0.04 Slow,
+0.07 Medium, 0.10 Fast). The convergence test was replayed on the stored bootstrap
+trees of 67 production jobs (81.7 hours of bootstrapping, 9,051 branches),
+using a build of RAxML-NG's own `--bsconverge` test that draws its permutations
+from the run's seed as the in-run test does. At 0.03 the replay reproduces each
+job's actual stopping point in 64 of 67 jobs (the other three are within one
+50-replicate check). Support values at each cutoff, against the job's full run at
+0.03:
+
+| cutoff | bootstrap time saved | mean support change | largest | branches >=70 that drop below | <70 that rise above | >=95 that drop below |
+|---|---|---|---|---|---|---|
+| 0.04 | 40% | 0.71 | 7 | 33 of 3,209 | 34 | 31 of 1,684 |
+| 0.05 | 63% | 1.22 | 11 | 60 | 79 | 48 |
+| 0.07 | 80% | 1.89 | 16 | 100 | 109 | 76 |
+| 0.10 | 90% | 2.84 | 21 | 113 | 183 | 120 |
+
+For scale: two complete independent runs of the same job at 0.03 (different seeds)
+differ by 1.4-1.8 support points on average and by up to 6.
+
+Evaluated and not adopted: educated bootstrap guessing (`--ebg`, a predictor trained
+on parsimony features). Against the real Felsenstein supports of 56 jobs (7,947
+branches) it was off by 9.5 points on average (biased 3.6 low, worst 83), and it
+put 19% of branches with FBP >= 70 below 70, in a median 4 seconds. Users who want
+fast support have Quick Tree's SH-aLRT.
 
 ## What the patches change
 
@@ -85,9 +163,16 @@ LTO, a vectorized `log()`), the search algorithm, or thread scheduling.
   bit. The repeat-class loop was checked separately (renumbering would not show in
   the output). A build that fills every reused buffer with NaN/junk
   (`-DCORAX_REPEATS_POISON_TEST`) gives identical output.
-- End to end, dikarya1 vs stock 2.0.3 on real job alignments: *pending*. The
-  install script's synthetic self-test (five command shapes, each at `--threads 1`
-  and `--threads 2`) matched stock 2.0.3 on 2026-10-12.
+- End to end, dikarya1 vs stock 2.0.3 on real job alignments, each with the job's own
+  model, seed, starting trees and stopping rule: all identical. That covers 18 jobs at
+  `--threads 1` (6-430 taxa; GTR, HKY, TIM, TPM and TVM models with `+G`, `+I` and
+  `+R2..R5`, three of them chosen by MOOSE; fzc7 complete with its 1000-replicate
+  cap, the larger jobs with fewer replicates or starting trees), 3 at `--threads 2`
+  with coarse-grained workers, 2 with one worker on two threads (fine-grained), and
+  MOOSE on 2 jobs. The timing runs above were compared the same way, each against
+  stock.
+  The install script's synthetic self-test (five command shapes, each at
+  `--threads 1` and `--threads 2`) also passes.
 
 ## Installing / switching / rolling back
 

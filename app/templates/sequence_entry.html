@@ -1004,7 +1004,12 @@
                         class="btn flex-1 min-w-[140px]" disabled>
                         <i class="fas fa-plus mr-2"></i> Add / Remove Sequences
                     </button>
-                    <!-- BLAST button removed from here -->
+                    <!-- Alan 10/12/26 - Shown only while the box holds one accession or one sequence. -->
+                    <button id="paste_blast_btn" type="button" data-active-style="outline"
+                        class="btn flex-1 min-w-[140px] hidden"
+                        title="Search GenBank for sequences related to this one, using the BLAST tab's settings">
+                        <i class="fas fa-search mr-2"></i> BLAST This Sequence
+                    </button>
                 </div>
             </div>
             </div>
@@ -1579,9 +1584,27 @@
                             <option value="maximum">Maximum (Max 2000)</option>
                             <option value="custom">Custom Cap...</option>
                         </select>
-                        <input type="number" id="bootstrap_cap_custom" placeholder="Cap" min="50" max="2000" class="w-1/3 px-4 py-3 border border-gray-300 dark:border-journal-dark rounded-lg 
+                        <input type="number" id="bootstrap_cap_custom" placeholder="Cap" min="50" max="2000" class="w-1/3 px-4 py-3 border border-gray-300 dark:border-journal-dark rounded-lg
                                        bg-white dark:bg-journal-dark text-gray-900 dark:text-gray-100 hidden">
                     </div>
+
+                    <label for="bootstrap_cutoff" class="block text-sm font-medium text-gray-700 dark:text-gray-200 mt-4 mb-2">
+                        Convergence Cutoff
+                    </label>
+                    <select id="bootstrap_cutoff" class="w-full md:w-2/3 px-4 py-3 border border-gray-300 dark:border-journal-dark rounded-lg
+                                   bg-white dark:bg-journal-dark text-gray-900 dark:text-gray-100
+                                   focus:ring-2 focus:ring-journal-gold focus:border-transparent">
+                        <option value="0.03">0.03 &ndash; Slowest (RAxML-NG default)</option>
+                        <option value="0.04">0.04 &ndash; Slow</option>
+                        <option value="0.07" selected>0.07 &ndash; Medium</option>
+                        <option value="0.10">0.10 &ndash; Fast</option>
+                    </select>
+                    <p class="text-xs text-gray-500 dark:text-gray-400 mt-1">
+                        Bootstrapping stops early once the support values stop changing by more than this
+                        (checked every 50 replicates). A larger cutoff stops sooner. On past Dikarya jobs,
+                        0.07 needed about 80% less bootstrap time than 0.03 and moved support values by about
+                        2 points on average, about as much as two runs at 0.03 differ from each other.
+                    </p>
                 </div>
             </div>
         </div>
@@ -2058,7 +2081,7 @@
             // stranded in one of the identifier boxes -- it never second-guesses
             // a user who is already in Paste or BLAST.
             if (!IDENTIFIER_FIELDS.has(ownSource)) return null;
-            if (singleToken && isGenBankAccession(trimmed)) return "paste";
+            if (singleToken && isGenBankAccession(normalizeAccessionToken(trimmed))) return "paste";
             if (looksLikeSequenceData(trimmed)) return "paste";
             return null;
         }
@@ -2178,7 +2201,7 @@
     const BACKGROUND_POLL_MS = 2000;
     const BACKGROUND_MAX_WAIT_MS = 6 * 60 * 1000;
 
-    function waitForBackgroundPoll(ms) {
+    function waitForBackgroundPoll(ms, wakeOnVisible = true) {
         return new Promise(resolve => {
             const done = () => {
                 clearTimeout(timer);
@@ -2187,7 +2210,7 @@
             };
             // Coming back to the tab polls immediately instead of waiting out
             // a timer the browser throttled while it was hidden.
-            const onVisible = () => { if (!document.hidden) done(); };
+            const onVisible = () => { if (wakeOnVisible && !document.hidden) done(); };
             const timer = setTimeout(done, ms);
             document.addEventListener('visibilitychange', onVisible);
         });
@@ -2203,8 +2226,10 @@
 
         const pollUrl = `/api/background/${encodeURIComponent(started.task_id)}`;
         const deadline = Date.now() + BACKGROUND_MAX_WAIT_MS;
+        let pollDelay = BACKGROUND_POLL_MS;
+        let throttled = false;
         for (;;) {
-            await waitForBackgroundPoll(BACKGROUND_POLL_MS);
+            await waitForBackgroundPoll(pollDelay, !throttled);
             let resp = null;
             try {
                 resp = await fetch(pollUrl, {credentials: 'same-origin', cache: 'no-store'});
@@ -2212,6 +2237,18 @@
                 // Suspended tab or a network blip; the server is still working.
             }
             if (resp && resp.status !== 202 && resp.status !== 429) return resp;
+            throttled = resp?.status === 429;
+            if (throttled) {
+                const retryAfter = resp.headers.get('Retry-After');
+                const seconds = retryAfter ? Number(retryAfter) : NaN;
+                const retryMs = Number.isFinite(seconds)
+                    ? seconds * 1000 : Date.parse(retryAfter || '') - Date.now();
+                pollDelay = Number.isFinite(retryMs) && retryMs > 0
+                    ? Math.max(BACKGROUND_POLL_MS, retryMs)
+                    : Math.min(30000, pollDelay * 2);
+            } else {
+                pollDelay = BACKGROUND_POLL_MS;
+            }
             // Checked after the poll, so a tab that slept past the deadline
             // still collects a result that finished while it was away.
             if (Date.now() > deadline) {
@@ -2785,9 +2822,34 @@
         return !prefix || prefix.toUpperCase() !== 'INAT';
     }
 
+    // Alan 10/12/26 - People copy the GenBank record page URL as often as the bare
+    // accession (https://www.ncbi.nlm.nih.gov/nuccore/OM021889.1), so read the
+    // accession out of it. Only /nuccore/ and its /nucleotide/ alias, and only when
+    // the path holds an accession -- a GI number (/nuccore/2178497362) is not one.
+    function accessionFromNcbiUrl(text) {
+        const cleaned = String(text || '').trim();
+        if (!/ncbi\.nlm\.nih\.gov/i.test(cleaned)) return null;
+        let parsed = null;
+        try {
+            parsed = new URL(/^[a-z]+:\/\//i.test(cleaned) ? cleaned : `https://${cleaned}`);
+        } catch (err) {
+            return null;
+        }
+        if (!/^https?:$/.test(parsed.protocol)) return null;
+        const host = parsed.hostname.toLowerCase();
+        if (host !== 'ncbi.nlm.nih.gov' && host !== 'www.ncbi.nlm.nih.gov') return null;
+        const match = /^\/(?:nuccore|nucleotide)\/([^/]+)\/?$/i.exec(parsed.pathname);
+        return match && isGenBankAccession(match[1]) ? match[1] : null;
+    }
+
+    // An NCBI record URL becomes its accession; anything else is returned unchanged.
+    function normalizeAccessionToken(token) {
+        return accessionFromNcbiUrl(token) || token;
+    }
+
     function parseGenBankAccessions(text) {
         if (!text || text.trim().startsWith('>')) return [];
-        const tokens = text.split(/[\s,;]+/).map(token => token.trim()).filter(Boolean);
+        const tokens = text.split(/[\s,;]+/).map(token => normalizeAccessionToken(token.trim())).filter(Boolean);
         if (tokens.length === 0 || !tokens.every(isGenBankAccession)) return [];
         return [...new Set(tokens.map(token => token.toUpperCase()))];
     }
@@ -2971,7 +3033,7 @@
         let isValid = false;
         updateSequenceInputMeta('blast_query');
 
-        if (isGenBankAccession(text)) {
+        if (isGenBankAccession(normalizeAccessionToken(text))) {
             isValid = true;
         } else if (text.length >= 20) {
             // Basic DNA char check (allow some noise/formatting)
@@ -2997,17 +3059,21 @@
     blastQueryInput.addEventListener('input', updateBlastButtonState);
     updateBlastButtonState();
 
+    // Read by the Paste panel's BLAST button, which must not start a second search.
+    let blastRunning = false;
+
     blastBtn.addEventListener('click', async () => {
         const text = blastQueryInput.value.trim();
         const minIdentity = document.getElementById('blast_min_identity').value;
         const maxSequences = document.getElementById('blast_max_sequences').value;
 
+        blastRunning = true;
         blastBtn.disabled = true;
         blastBtn.innerHTML = '<i class="fas fa-spinner fa-spin mr-2"></i> BLASTing...';
         showStatus('Running BLAST search... This may take a minute.', 'info');
 
         try {
-            let query = text;
+            let query = normalizeAccessionToken(text);
 
             if (text.startsWith('>')) {
                 const seqs = parseFasta(text);
@@ -3058,6 +3124,7 @@
             showStatus('BLAST error: ' + e.message, 'error');
         }
 
+        blastRunning = false;
         blastBtn.innerHTML = '<i class="fas fa-search mr-2"></i> BLAST Sequence';
         updateBlastButtonState();
     });
@@ -3070,6 +3137,23 @@
     // Alan 8/10/26 - The location option only makes sense once GenBank accessions are present.
     const genbankLocationOption = document.getElementById('genbank_location_option');
     const genbankAddLocationsCheckbox = document.getElementById('genbank_add_locations');
+    const pasteBlastBtn = document.getElementById('paste_blast_btn');
+
+    // Alan 10/12/26 - A single accession, NCBI record URL or sequence pasted here is
+    // as often meant for BLAST as for the queue, so offer both. Returns the query to
+    // hand the BLAST box, or null when the input is not exactly one query.
+    function pasteBlastQuery(text) {
+        const trimmed = String(text || '').trim();
+        if (!trimmed) return null;
+        const accessions = parseGenBankAccessions(trimmed);
+        if (accessions.length > 0) return accessions.length === 1 ? accessions[0] : null;
+        if (trimmed.startsWith('>')) {
+            const records = parseFasta(trimmed);
+            return records.length === 1 && records[0].sequence.length >= 20 ? trimmed : null;
+        }
+        const collapsed = trimmed.replace(/\s+/g, '');
+        return collapsed.length >= 20 && /^[ACGTURYSWKMBDHVN]+$/i.test(collapsed) ? trimmed : null;
+    }
 
     function shouldAddGenBankLocations() {
         return !!genbankAddLocationsCheckbox &&
@@ -3094,9 +3178,37 @@
 
         addSequencesBtn.disabled = !isValid;
         updateButtonVisuals(addSequencesBtn, isValid);
+
+        if (pasteBlastBtn) {
+            const canBlast = pasteBlastQuery(text) !== null;
+            pasteBlastBtn.classList.toggle('hidden', !canBlast);
+            updateButtonVisuals(pasteBlastBtn, canBlast);
+        }
     }
 
     sequenceTextInput.addEventListener('input', updateAddSequencesButtonState);
+
+    // Moves the query to the BLAST tab, so its settings and progress are in view,
+    // and starts the search there.
+    pasteBlastBtn?.addEventListener('click', () => {
+        const query = pasteBlastQuery(sequenceTextInput.value);
+        if (!query) return;
+        window.openImportSection?.('blast');
+        if (blastRunning) {
+            showStatus('A BLAST search is already running. When it finishes, come back to Paste to BLAST this one.', 'info');
+            return;
+        }
+        const existing = blastQueryInput.value.trim();
+        if (existing && existing !== query) {
+            showStatus('The BLAST box already has a query in it. Nothing was moved — clear the BLAST box, then try again.', 'info');
+            return;
+        }
+        blastQueryInput.value = query;
+        sequenceTextInput.value = '';
+        blastQueryInput.dispatchEvent(new Event('input', { bubbles: true }));
+        sequenceTextInput.dispatchEvent(new Event('input', { bubbles: true }));
+        blastBtn.click();
+    });
 
     // Initial check
     updateAddSequencesButtonState();
@@ -5347,6 +5459,16 @@
             advancedCurrentSummary.textContent = `Currently: ${alignment} + ${treeMethod}, ${terminalTrim}, ${rooting}, SH-like local support (not bootstrap).`;
         } else if (treeMethodSelect.value === 'nj') {
             advancedCurrentSummary.textContent = `Currently: ${alignment} + ${treeMethod}, ${terminalTrim}, ${rooting}, no node support.`;
+        } else if (treeMethodSelect.value === 'raxml') {
+            // RAxML-NG runs AutoMRE bootstrapping up to a cap, not the
+            // 'bootstrap' replicate count the other methods read.
+            const cap = document.getElementById('bootstrap_preset')?.value === 'custom'
+                ? `cap ${document.getElementById('bootstrap_cap_custom')?.value || 'not set'}`
+                : `${selectedText('bootstrap_preset')} cap`;
+            const support = document.getElementById('enable_bootstrap')?.checked
+                ? `AutoMRE bootstrap (${cap}, cutoff ${selectedText('bootstrap_cutoff')})`
+                : 'no bootstrap';
+            advancedCurrentSummary.textContent = `Currently: ${alignment} + ${treeMethod}, ${terminalTrim}, ${rooting}, ${support}.`;
         } else {
             advancedCurrentSummary.textContent = `Currently: ${alignment} + ${treeMethod}, ${terminalTrim}, ${rooting}, ${bootstrap} bootstrap.`;
         }
@@ -5492,6 +5614,7 @@
     });
     ['alignment_method', 'trimming_method', 'trim_terminal_overhangs', 'fix_orientation', 'its_region', 'its_min_length',
         'tree_model', 'bootstrap', 'outgroup_select',
+        'enable_bootstrap', 'bootstrap_preset', 'bootstrap_cap_custom', 'bootstrap_cutoff',
         'mb_gen', 'mb_runs', 'mb_chains', 'mb_burnin', 'mb_stop_early'].forEach(id => {
         document.getElementById(id)?.addEventListener('input', refreshAdvancedSummary);
         document.getElementById(id)?.addEventListener('change', refreshAdvancedSummary);
@@ -5859,6 +5982,7 @@
             run_preset: document.getElementById('run_preset').value,
             bootstrap_preset: document.getElementById('bootstrap_preset').value,
             bootstrap_cap: document.getElementById('bootstrap_cap_custom').value ? parseInt(document.getElementById('bootstrap_cap_custom').value) : null,
+            bootstrap_cutoff: isRaxml ? (parseFloat(document.getElementById('bootstrap_cutoff').value) || null) : null,
             enable_bootstrap: document.getElementById('enable_bootstrap').checked,
             start_tree_override: document.getElementById('start_tree_override').value,
             moose_enabled: isRaxml && model === 'AUTO',
@@ -6019,6 +6143,7 @@
                 occurrence: seq.occurrence || null,
                 observation_id: seq.observation_id || '',
                 mushroom_observer_sequence_id: seq.mushroom_observer_sequence_id || null,
+                mycomap_sequence_id: seq.mycomap_sequence_id || null,
                 locus: seq.locus || '',
                 query_cover: seq.query_cover ?? null,
                 subject_cover: seq.subject_cover ?? null,
@@ -6191,6 +6316,22 @@
         setFieldValue('early_stopping', p.early_stopping);
         setFieldValue('start_tree_override', p.start_tree_override);
         if (p.bootstrap_cap) setFieldValue('bootstrap_cap_custom', p.bootstrap_cap);
+        // A RAxML job stored before the cutoff setting existed ran RAxML-NG's
+        // own 0.03, so the panel shows that rather than this form's default.
+        const storedCutoff = p.bootstrap_cutoff ?? (method === 'raxml' ? 0.03 : null);
+        const cutoffSelect = document.getElementById('bootstrap_cutoff');
+        if (cutoffSelect && storedCutoff !== null && Number.isFinite(parseFloat(storedCutoff))) {
+            const wanted = parseFloat(storedCutoff);
+            let match = Array.from(cutoffSelect.options).find(o => parseFloat(o.value) === wanted);
+            if (!match) {
+                // A value set through the API rather than this form.
+                match = document.createElement('option');
+                match.value = String(wanted);
+                match.text = `${wanted} (Custom)`;
+                cutoffSelect.add(match);
+            }
+            cutoffSelect.value = match.value;
+        }
         if (p.seed) setFieldValue('raxml_seed', p.seed);
 
         if (p.outgroup) {
@@ -6241,6 +6382,8 @@
             bootstrap_preset: document.getElementById('bootstrap_preset').value,
             bootstrap_cap: document.getElementById('bootstrap_cap_custom').value
                 ? parseInt(document.getElementById('bootstrap_cap_custom').value, 10) : null,
+            bootstrap_cutoff: isRaxml
+                ? (parseFloat(document.getElementById('bootstrap_cutoff').value) || null) : null,
             enable_bootstrap: document.getElementById('enable_bootstrap').checked,
             start_tree_override: document.getElementById('start_tree_override').value,
             moose_enabled: isRaxml && model === 'AUTO',

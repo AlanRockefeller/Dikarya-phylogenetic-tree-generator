@@ -436,7 +436,7 @@ def get_ai_usage(days=30):
 PUBLIC_JOB_OPTION_KEYS = (
     "input_type", "alignment_method", "trimming_method",
     "trim_terminal_overhangs", "fix_orientation", "its_region",
-    "tree_method", "tree_model", "bootstrap", "bootstrap_cap",
+    "tree_method", "tree_model", "bootstrap", "bootstrap_cap", "bootstrap_cutoff",
     "enable_bootstrap", "alrt_replicates", "run_preset", "bootstrap_preset",
     "mcmc_generations", "mcmc_nruns", "mcmc_nchains", "mcmc_stop_early",
     "moose_enabled", "early_stopping", "blast_mode", "include_ncbi",
