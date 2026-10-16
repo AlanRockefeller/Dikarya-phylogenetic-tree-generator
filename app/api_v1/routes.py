@@ -17,7 +17,9 @@ from flask import (
 from sqlalchemy import desc
 
 from app.api_v1 import bp
-from app.api_v1.auth import require_api_token, api_token_key_func
+from app.api_v1.auth import (
+    require_api_token, api_token_key_func, api_user_is_rate_limit_exempt,
+)
 from app.api_v1.envelope import error_response, ok, paginate_query, server_error
 from app.api_v1.idempotency import idempotent
 from app.api_v1.job_defaults import (
@@ -75,7 +77,7 @@ def api_docs():
 
 @bp.route('/me', methods=['GET'])
 @require_api_token(scope='account:read')
-@limiter.limit("600 per minute", key_func=api_token_key_func)
+@limiter.limit("600 per minute", key_func=api_token_key_func, exempt_when=api_user_is_rate_limit_exempt)
 def whoami():
     user = g.api_user
     return ok({
@@ -87,7 +89,7 @@ def whoami():
 
 @bp.route('/tokens', methods=['GET'])
 @require_api_token(scope='account:read')
-@limiter.limit("600 per minute", key_func=api_token_key_func)
+@limiter.limit("600 per minute", key_func=api_token_key_func, exempt_when=api_user_is_rate_limit_exempt)
 def list_tokens():
     user = g.api_user
     tokens = sorted(user.api_tokens, key=lambda t: t.created_at, reverse=True)
@@ -412,7 +414,7 @@ def _validate_accessions(value):
 
 @bp.route('/jobs', methods=['POST'])
 @require_api_token(scope='jobs:write')
-@limiter.limit("30 per hour; 200 per day", key_func=api_token_key_func)
+@limiter.limit("30 per hour; 200 per day", key_func=api_token_key_func, exempt_when=api_user_is_rate_limit_exempt)
 @idempotent
 def create_job():
     """Create a new phylo job. Body: {input_type, sequence, accessions,
@@ -747,7 +749,7 @@ def parse_utc_query_timestamp(raw):
 
 @bp.route('/jobs', methods=['GET'])
 @require_api_token(scope='jobs:read')
-@limiter.limit("600 per minute", key_func=api_token_key_func)
+@limiter.limit("600 per minute", key_func=api_token_key_func, exempt_when=api_user_is_rate_limit_exempt)
 def list_jobs():
     """List the caller's jobs. Filters: ?status=, ?since=, ?until=.
     Pagination: ?page=, ?per_page= (max 100).
@@ -786,7 +788,7 @@ def list_jobs():
 
 @bp.route('/jobs/<job_id>', methods=['GET'])
 @require_api_token(scope='jobs:read')
-@limiter.limit("600 per minute", key_func=api_token_key_func)
+@limiter.limit("600 per minute", key_func=api_token_key_func, exempt_when=api_user_is_rate_limit_exempt)
 def get_job(job_id):
     job = get_owned_job_or_404(job_id)
     if not job:
@@ -857,7 +859,7 @@ def _release_rq_job(job_id):
 
 @bp.route('/jobs/<job_id>', methods=['DELETE'])
 @require_api_token(scope='jobs:write')
-@limiter.limit("60 per hour", key_func=api_token_key_func)
+@limiter.limit("60 per hour", key_func=api_token_key_func, exempt_when=api_user_is_rate_limit_exempt)
 def delete_job(job_id):
     """Delete a job's DB record and its on-disk directory.
 
@@ -1021,7 +1023,7 @@ def delete_job(job_id):
 
 @bp.route('/jobs/<job_id>/recompute', methods=['POST'])
 @require_api_token(scope='jobs:write')
-@limiter.limit("5 per hour", key_func=api_token_key_func)
+@limiter.limit("5 per hour", key_func=api_token_key_func, exempt_when=api_user_is_rate_limit_exempt)
 @idempotent
 def recompute_job(job_id):
     job = get_owned_job_or_404(job_id)
@@ -1214,7 +1216,7 @@ def recompute_job(job_id):
 
 @bp.route('/jobs/<job_id>/files', methods=['GET'])
 @require_api_token(scope='jobs:read')
-@limiter.limit("600 per minute", key_func=api_token_key_func)
+@limiter.limit("600 per minute", key_func=api_token_key_func, exempt_when=api_user_is_rate_limit_exempt)
 def list_job_files(job_id):
     job = get_owned_job_or_404(job_id)
     if not job:
@@ -1230,7 +1232,7 @@ _FILE_NAME_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
 
 @bp.route('/jobs/<job_id>/files/<name>', methods=['GET'])
 @require_api_token(scope='jobs:read')
-@limiter.limit("600 per minute", key_func=api_token_key_func)
+@limiter.limit("600 per minute", key_func=api_token_key_func, exempt_when=api_user_is_rate_limit_exempt)
 def download_job_file(job_id, name):
     job = get_owned_job_or_404(job_id)
     if not job:
@@ -1283,7 +1285,7 @@ def download_job_file(job_id, name):
 
 @bp.route('/jobs/<job_id>/logs/<log_name>', methods=['GET'])
 @require_api_token(scope='jobs:read')
-@limiter.limit("600 per minute", key_func=api_token_key_func)
+@limiter.limit("600 per minute", key_func=api_token_key_func, exempt_when=api_user_is_rate_limit_exempt)
 def get_job_log(job_id, log_name):
     job = get_owned_job_or_404(job_id)
     if not job:
@@ -1331,7 +1333,7 @@ def _sse_limits():
 
 @bp.route('/jobs/<job_id>/events', methods=['GET'])
 @require_api_token(scope='jobs:read')
-@limiter.limit("30 per minute", key_func=api_token_key_func)
+@limiter.limit("30 per minute", key_func=api_token_key_func, exempt_when=api_user_is_rate_limit_exempt)
 def job_events(job_id):
     """SSE stream of pipeline progress events. Mirrors the internal /api/job/<id>/events
     stream but enforces strict ownership, a per-token concurrent-connection cap,
@@ -1351,21 +1353,25 @@ def job_events(job_id):
     max_stream_seconds, max_idle_seconds, terminal_linger_seconds = _sse_limits()
     token_id = g.api_token.id
     conn_key = f"sse:conn:{token_id}"
-    try:
-        r_gate = _redis.from_url(Config.REDIS_URL)
-        current = r_gate.incr(conn_key)
-        r_gate.expire(conn_key, max_stream_seconds + 60)
-    except Exception as exc:
-        # If Redis is unreachable we fall back to enforcing only the per-token
-        # rate limit -- which is itself sufficient to bound abuse.
+    if api_user_is_rate_limit_exempt():
         current = 1
         r_gate = None
-        from app.services.log_context import log_degradation_rate_limited
-        log_degradation_rate_limited(
-            logger, "sse_connection_gate_failed",
-            "API SSE stream continued without the Redis connection gate",
-            exception=type(exc).__name__,
-        )
+    else:
+        try:
+            r_gate = _redis.from_url(Config.REDIS_URL)
+            current = r_gate.incr(conn_key)
+            r_gate.expire(conn_key, max_stream_seconds + 60)
+        except Exception as exc:
+            # If Redis is unreachable we fall back to enforcing only the per-token
+            # rate limit -- which is itself sufficient to bound abuse.
+            current = 1
+            r_gate = None
+            from app.services.log_context import log_degradation_rate_limited
+            log_degradation_rate_limited(
+                logger, "sse_connection_gate_failed",
+                "API SSE stream continued without the Redis connection gate",
+                exception=type(exc).__name__,
+            )
 
     if current > SSE_MAX_CONCURRENT_PER_TOKEN:
         if r_gate is not None:
@@ -1689,7 +1695,7 @@ def _mutation(handler, job_id, *, where, scope="jobs:write"):
 
 @bp.route('/jobs/<job_id>/tree/prune', methods=['POST'])
 @require_api_token(scope='jobs:write')
-@limiter.limit("60 per hour", key_func=api_token_key_func)
+@limiter.limit("60 per hour", key_func=api_token_key_func, exempt_when=api_user_is_rate_limit_exempt)
 def prune_tree_v1(job_id):
     def handler(job_dir, body):
         from app.services.tree_edit_service import load_tree_state, prune_taxa, save_tree_state
@@ -1730,7 +1736,7 @@ def prune_tree_v1(job_id):
 
 @bp.route('/jobs/<job_id>/tree/rename', methods=['POST'])
 @require_api_token(scope='jobs:write')
-@limiter.limit("60 per hour", key_func=api_token_key_func)
+@limiter.limit("60 per hour", key_func=api_token_key_func, exempt_when=api_user_is_rate_limit_exempt)
 def rename_tip_v1(job_id):
     def handler(job_dir, body):
         from app.services.tree_edit_service import (
@@ -1753,7 +1759,7 @@ def rename_tip_v1(job_id):
 
 @bp.route('/jobs/<job_id>/tree/reroot', methods=['POST'])
 @require_api_token(scope='jobs:write')
-@limiter.limit("60 per hour", key_func=api_token_key_func)
+@limiter.limit("60 per hour", key_func=api_token_key_func, exempt_when=api_user_is_rate_limit_exempt)
 def reroot_v1(job_id):
     def handler(job_dir, body):
         from app.services.tree_edit_service import load_tree_state, reroot_tree, save_tree_state
@@ -1778,7 +1784,7 @@ def reroot_v1(job_id):
 
 @bp.route('/jobs/<job_id>/tree/midpoint_root', methods=['POST'])
 @require_api_token(scope='jobs:write')
-@limiter.limit("60 per hour", key_func=api_token_key_func)
+@limiter.limit("60 per hour", key_func=api_token_key_func, exempt_when=api_user_is_rate_limit_exempt)
 def midpoint_root_v1(job_id):
     def handler(job_dir, body):
         from app.services.tree_edit_service import load_tree_state, midpoint_root, save_tree_state
@@ -1795,7 +1801,7 @@ def midpoint_root_v1(job_id):
 
 @bp.route('/tools/blast', methods=['POST'])
 @require_api_token(scope='tools:read')
-@limiter.limit("10 per minute; 200 per hour", key_func=api_token_key_func)
+@limiter.limit("10 per minute; 200 per hour", key_func=api_token_key_func, exempt_when=api_user_is_rate_limit_exempt)
 def tools_blast():
     from app.services.blast_service import (
         BLAST_REQUEST_MAX_WAIT_SECONDS, blast_from_accessions, blast_from_sequence,
@@ -1870,7 +1876,7 @@ def tools_blast():
 
 @bp.route('/tools/genbank', methods=['POST'])
 @require_api_token(scope='tools:read')
-@limiter.limit("10 per minute; 200 per hour", key_func=api_token_key_func)
+@limiter.limit("10 per minute; 200 per hour", key_func=api_token_key_func, exempt_when=api_user_is_rate_limit_exempt)
 def tools_genbank():
     from app.api.routes import (
         MAX_CUSTOM_GENBANK_ACCESSIONS,
@@ -1909,7 +1915,7 @@ def tools_genbank():
 
 @bp.route('/tools/inaturalist-finder', methods=['POST'])
 @require_api_token(scope='tools:read')
-@limiter.limit("10 per hour; 50 per day", key_func=api_token_key_func)
+@limiter.limit("10 per hour; 50 per day", key_func=api_token_key_func, exempt_when=api_user_is_rate_limit_exempt)
 @idempotent
 def tools_inaturalist_finder():
     """Find likely iNaturalist observations for a mistyped observation ID."""
@@ -2002,7 +2008,8 @@ def _inat_tree_v1_rate_limit():
 
 @bp.route('/tools/inaturalist-tree', methods=['POST'])
 @require_api_token(scope='jobs:write')
-@limiter.limit(_inat_tree_v1_rate_limit, key_func=_inat_tree_v1_rate_key)
+@limiter.limit(_inat_tree_v1_rate_limit, key_func=_inat_tree_v1_rate_key,
+               exempt_when=api_user_is_rate_limit_exempt)
 @idempotent
 def tools_inaturalist_tree():
     """Build Dikarya tree jobs from iNaturalist one-click tree input.

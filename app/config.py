@@ -523,6 +523,14 @@ class Config:
     ALLOW_SQLITE_FALLBACK = bool_env('ALLOW_SQLITE_FALLBACK', False)
     SQLALCHEMY_DATABASE_URI = os.environ.get('DATABASE_URL') or 'sqlite:///' + str(BASE_DIR / 'app.db')
     SQLALCHEMY_TRACK_MODIFICATIONS = False
+    # Trusted API clients that are exempt from Dikarya's own request-rate and
+    # concurrent-SSE ceilings. Upstream provider limits and ordinary input/
+    # runtime safety bounds still apply. Harte Singer uses the shared Dikarya
+    # mycology account; deployments may replace or extend this comma-separated
+    # list through the environment.
+    API_RATE_LIMIT_EXEMPT_EMAILS = _csv_env(
+        'API_RATE_LIMIT_EXEMPT_EMAILS', 'mycology@dikarya.llc'
+    )
     # Validate pooled connections on checkout (cheap SELECT 1) and recycle
     # them every 30 minutes. Eliminates the "SSL connection has been closed
     # unexpectedly" tracebacks we saw when Postgres or the network dropped

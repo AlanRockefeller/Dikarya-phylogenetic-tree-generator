@@ -204,6 +204,19 @@ def _pre_auth_lookup_allowed():
         return True
 
 
+def api_user_is_rate_limit_exempt(user=None):
+    """Whether an authenticated API user bypasses Dikarya API throttles."""
+    from flask import current_app
+
+    if user is None:
+        user = getattr(g, "api_user", None)
+    if user is None:
+        return False
+    email = (getattr(user, "email", None) or "").strip().lower()
+    configured = current_app.config.get("API_RATE_LIMIT_EXEMPT_EMAILS") or ()
+    return email in {str(value).strip().lower() for value in configured}
+
+
 def require_api_token(scope=None):
     """Decorator: require a valid, unrevoked API token with the given scope.
 
