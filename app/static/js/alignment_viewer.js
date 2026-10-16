@@ -1348,9 +1348,22 @@
     applyColorScheme(loadColorScheme());
     // Alan 8/4/26 - Seed the names-column width from storage; the skeleton re-applies it once it exists.
     state.namesWidth = loadNamesWidth();
+    // Alan 10/16/26 - A toggles the Alignment Viewer closed, matching the tree-level
+    // shortcut that opens it. Capture and claim the event so that tree handler cannot
+    // immediately reopen the viewer after this handler hides it. Form controls keep
+    // their normal letter-key behavior, including typing in the sequence filter.
     document.addEventListener('keydown', (e) => {
-        if (e.key === 'Escape' && !modal.classList.contains('hidden')) closeModal();
-    });
+        if (modal.classList.contains('hidden')) return;
+        const key = e.key.length === 1 ? e.key.toLowerCase() : e.key;
+        const target = e.target;
+        const isFormControl = target
+            && (target.isContentEditable || ['INPUT', 'TEXTAREA', 'SELECT'].includes(target.tagName));
+        const isPlainA = key === 'a' && !e.ctrlKey && !e.metaKey && !e.altKey && !isFormControl;
+        if (key !== 'Escape' && !isPlainA) return;
+        e.preventDefault();
+        e.stopImmediatePropagation();
+        closeModal();
+    }, true);
 
     includeChk.addEventListener('change', () => {
         state.includePruned = includeChk.checked;
