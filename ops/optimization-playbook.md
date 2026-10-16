@@ -206,6 +206,17 @@ AVX-512-only and which had plainly inefficient hot loops. Check, in this order:
   scaling mode, rate count, zero/-0/subnormal/negative inputs).
 - **Another user's jobs** shared the 2 vCPUs for hours: profiles taken at different
   times were not comparable at all; only ABBA runs and same-run ratios were.
+- **Bigger wins came from settings, measured on what they change** (2026-10-16):
+  leaving identical sequences out of the search (14-39% on jobs with duplicates)
+  and an AutoMRE cutoff of 0.07 (80% of bootstrap time). These change results, so
+  each was judged against the run-to-run noise of full runs with different
+  seeds, never against zero. The cutoff needed no new runs: the jobs' stored
+  `.raxml.bootstraps` files replay the stopping test at any cutoff, but only with a
+  build whose `--bsconverge` draws its permutations from `--seed`. Stock uses
+  `rand()` there, unlike the in-run test, and so does not reproduce the job's own
+  stopping point. Score a tree with re-added duplicates on the full alignment with
+  `--evaluate` (re-add them on 1e-6 branches there, since `--evaluate` reoptimizes
+  lengths anyway).
 
 ## 6d. What worked on MrBayes (2026-10-09, `ops/mrbayes/`)
 

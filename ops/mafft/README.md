@@ -90,6 +90,22 @@ against ~5 s for the whole `--auto` alignment of the same input.
 Verification: byte-identical to dikarya1 on all 101 `--thread 1` runs above (all six
 modes), and so to stock MAFFT, which dikarya1 was checked against.
 
+### Stock vs opt8, measured directly (2026-10-16)
+
+The numbers above compare each build with the one before it. This is the end-to-end
+figure: Ubuntu's MAFFT 7.505 (`/usr/bin/mafft`, what Dikarya ran before 2026-10-07)
+against opt8, on the same 43 job inputs (6-827 sequences) in the two modes
+production runs. `--thread 1`, one pair per hold of the benchmark lock, order
+alternating between inputs, CPU time:
+
+| mode | inputs | Ubuntu 7.505 | opt8 | speedup | per input |
+|---|---|---|---|---|---|
+| `--adjustdirection --auto` | 43 | 825.6 s | 187.1 s | **4.41x** | median 4.41x (1.14x-7.63x) |
+| L-INS-i (`--adjustdirection --localpair --maxiterate 1000`) | 35 | 1224.7 s | 214.7 s | **5.70x** | median 5.71x (1.14x-7.46x) |
+
+All 78 alignments were byte-identical to stock. The longest input (gz5k, L-INS-i)
+went from 108.9 s to 23.0 s.
+
 ### Installing opt8 / switching / rolling back
 
 As root on the production host (the build is `-march=native`, so build where it runs):

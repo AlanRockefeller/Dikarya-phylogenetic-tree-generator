@@ -130,6 +130,36 @@ MAFFT and IQ-TREE's five-iteration search by default, so those two programs are 
 minimum for that workflow. NCBI BLAST is accessed remotely and does not require a local
 BLAST+ installation.
 
+### Faster builds of MAFFT, IQ-TREE, MrBayes and RAxML-NG
+
+`ops/` holds exact-speedup builds of the four slowest programs: the official source
+(for MAFFT, Josh Walker's optimized fork of it) plus patches that remove redundant
+work or do the same arithmetic faster. For the same input, options and seed they
+produce byte-identical output to the stock program, in less time. Each directory has
+the patches, an install script that refuses to install unless the patched build
+reproduces the stock one, and the full measurements. Switching or rolling back is one
+environment variable. Measured on real Dikarya job inputs on the production host (Xeon
+E5-2690 v4, 2 vCPUs):
+
+| Program | Stock | Dikarya build | Stock time | Dikarya time | Speedup | Details |
+| --- | --- | --- | --- | --- | --- | --- |
+| MAFFT, `--auto` (43 inputs) | 7.505 (Ubuntu) | 7.526-opt8 | 825.6 s | 187.1 s | 4.41x | [ops/mafft](ops/mafft/README.md) |
+| MAFFT, L-INS-i (35 inputs) | 7.505 (Ubuntu) | 7.526-opt8 | 1224.7 s | 214.7 s | 5.70x | [ops/mafft](ops/mafft/README.md) |
+| IQ-TREE, Quick Tree (48 inputs) | 3.1.4 | 3.1.4-dikarya1 | 285.0 s | 191.9 s | 1.48x | [ops/iqtree](ops/iqtree/README.md) |
+| IQ-TREE, ModelFinder + UFBoot (19 inputs) | 3.1.4 | 3.1.4-dikarya1 | 4288 s | 2783 s | 1.54x | [ops/iqtree](ops/iqtree/README.md) |
+| MrBayes, 1 thread (6 inputs) | 3.2.9 | 3.2.9-dikarya2 | 358.3 s | 202.4 s | 1.77x | [ops/mrbayes](ops/mrbayes/README.md) |
+| MrBayes, 2 threads (6 inputs) | 3.2.9 | 3.2.9-dikarya2 | 358.3 s | 132.0 s | 2.71x | [ops/mrbayes](ops/mrbayes/README.md) |
+| RAxML-NG, 1 thread (7 inputs) | 2.0.3 | 2.0.3-dikarya1 (not installed yet) | 1702 s | 1223 s | 1.39x | [ops/raxml](ops/raxml/README.md) |
+| RAxML-NG, 2 threads (2 inputs) | 2.0.3 | 2.0.3-dikarya1 (not installed yet) | 152.6 s | 104.3 s | 1.46x | [ops/raxml](ops/raxml/README.md) |
+
+Times are CPU time, except MrBayes and the two-thread rows, which are wall time. MAFFT
+and IQ-TREE are identical at one thread; at two threads their output varies from run to
+run in every build, stock included. MrBayes and RAxML-NG are identical at one and two
+threads. Two of the stock versions change results compared with older
+releases: MrBayes 3.2.9 fixes a proposal ratio in 3.2.7a, and RAxML-NG 2.0.3 rounds
+branch lengths in parsimony starting trees, which 2.0.2 did not. So those builds
+match the newer stock release, not the older one.
+
 ## Installation
 
 Clone the repository, create a Python 3.12 virtual environment, and install the

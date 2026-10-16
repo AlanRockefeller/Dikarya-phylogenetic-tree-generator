@@ -679,6 +679,31 @@ When a new CLI version is published:
   percentage (`93`) and TBE as a proportion (`0.930000`), so anything that ever
   displays the TBE tree must say which it is rather than reusing the bootstrap
   badge's reading.
+- **RAxML-NG's AutoMRE cutoff defaults to 0.07, not RAxML-NG's own 0.03.**
+  `_get_raxml_cmd` always passes `--bs-cutoff`. The value is the job's
+  `bootstrap_cutoff` (the Advanced panel offers 0.03/0.04/0.07/0.10 as
+  Slowest/Slow/Medium/Fast; `raxml_validator` accepts 0.01-0.10 and defaults
+  to `DEFAULT_BOOTSTRAP_CUTOFF`). A job stored without the key ran 0.03, so a
+  recompute of it passes `LEGACY_BOOTSTRAP_CUTOFF` (the same rule as
+  `mcmc_stop_early`), and the Advanced panel prefills 0.03 for it.
+  `tree_metadata.json` records `bootstrap_cutoff`. The replay behind the
+  default is in `ops/raxml/README.md`.
+- **Long tree runs leave identical sequences out and add them back.**
+  `run_tree_builder` hands RAxML-NG, the advanced IQ-TREE method and MrBayes
+  (`COLLAPSE_METHODS` in `app/services/identical_sequences.py`) an alignment
+  with one record per group of identical sequences (exact match after
+  upper-casing, as RAxML-NG and `validate_pipeline_outputs` test). The
+  builders never see the full set. Afterwards, each group goes back onto
+  `tree_original.newick` and the TBE tree as a zero-length polytomy with no
+  support label, edited as text by `tree_io.expand_newick_tips`, and the stored
+  NEXUS is regenerated from that Newick. Quick Tree, FastTree and NJ run on
+  the full alignment. The outgroup is always the record kept, because RAxML-NG
+  roots on it before the others are re-added. The collapse is skipped (the job
+  runs exactly as before) when two records share a name, when fewer than 4
+  distinct sequences would remain, or when the outgroup does not name exactly
+  one record. The raw builder files (`raxml_run.*`, `iqtree_run.*`, the
+  MrBayes `.nex.*` files and `sequence_names.tsv`) cover only the kept
+  records. `tree_metadata.json["identical_sequences"]` lists each group.
 - **Link previews (Open Graph) for `/job/<id>/view` are server-rendered.**
   `app/services/social_preview_service.py` supplies the page `<title>`
   ("<Genus> phylogenetic tree — Dikarya", else "Phylogenetic tree — Dikarya"),

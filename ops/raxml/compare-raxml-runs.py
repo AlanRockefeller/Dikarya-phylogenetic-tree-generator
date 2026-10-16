@@ -51,7 +51,9 @@ def same_content(pa: Path, pb: Path) -> bool:
 
 
 WORKER = re.compile(r"\[worker #(\d+)\]")
-MOOSE_MODEL = re.compile(r"Evaluated model \(\s*\d+/\d+\)")
+# The counter pads both numbers ("(  7/214)", "( 69/ 69)"), and the "[  2T]" tag
+# names whichever thread finished the model.
+MOOSE_MODEL = re.compile(r"(\[\s*\d+T\] )?Evaluated model \(\s*\d+/\s*\d+\)")
 
 
 def log_lines(prefix: Path) -> list:
