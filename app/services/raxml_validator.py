@@ -56,7 +56,9 @@ def bootstrap_cutoff_label(cutoff) -> str:
     except (TypeError, ValueError):
         return str(cutoff)
     word = BOOTSTRAP_CUTOFF_CHOICES.get(value)
-    return f"{value:g} ({word})" if word else f"{value:g}"
+    # Two decimals, as the form writes them ("0.10", not "0.1").
+    text = f"{value:.2f}" if round(value, 2) == value else f"{value:g}"
+    return f"{text} ({word})" if word else text
 
 # Supported Models (Base matrices)
 # Uppercased on the way in, like VALID_AA_MODELS below, because the parser
