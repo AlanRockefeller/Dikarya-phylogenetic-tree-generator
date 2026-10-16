@@ -26,6 +26,7 @@ HARNESS = Path(__file__).resolve().parent / "js" / "phylotree_invariants.test.js
 
 # One group per reported finding, so a regression names the finding it broke.
 GROUPS = {
+    "mycomap-sequence-target": "MycoMap local-sequence source-link gating",
     "delete-below-root": "deleting a direct child of a bifurcating root",
     "add-child-parent": "addChild() maintaining the parent/child invariant",
     "newick-hidden-children": "Newick separators for hidden children",
@@ -97,6 +98,9 @@ class PhylotreeInvariantTests(unittest.TestCase):
 
     def test_deleting_below_a_bifurcating_root(self):
         self.assert_group("delete-below-root")
+
+    def test_mycomap_sequence_links_require_local_source_provenance(self):
+        self.assert_group("mycomap-sequence-target")
 
     def test_add_child_sets_the_parent(self):
         self.assert_group("add-child-parent")

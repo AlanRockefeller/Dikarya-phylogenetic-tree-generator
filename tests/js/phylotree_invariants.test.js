@@ -306,6 +306,50 @@ function newickTips(s) {
 }
 
 // ===========================================================================
+// MycoMap local-sequence source links
+// ===========================================================================
+
+section('mycomap-sequence-target');
+
+test('a MycoMap-local tip gets an exact-sequence resolver link', () => {
+    const label = 'iNat393666515 Lepiota Greenville Ohio US RiC 44';
+    const target = P.extractMycomapSequenceTarget(
+        { data: { __original_name: label } },
+        [{ fasta_header: label, source: 'mycomap', hit_source: 'local' }],
+        'zszo'
+    );
+    assert.strictEqual(target.kind, 'mycomap-sequence');
+    assert.strictEqual(target.label, 'Open sequence in MycoMap');
+    assert.strictEqual(
+        target.urls.primary,
+        '/api/job/zszo/tree/mycomap-sequence?tip_name=' + encodeURIComponent(label)
+    );
+});
+
+test('nonlocal and non-MycoMap tips do not get a MycoMap sequence link', () => {
+    const node = { data: { name: 'iNat393666515 Lepiota' } };
+    assert.strictEqual(P.extractMycomapSequenceTarget(
+        node,
+        [{ name: 'iNat393666515 Lepiota', source: 'mycomap', hit_source: 'ncbi' }],
+        'zszo'
+    ), null);
+    assert.strictEqual(P.extractMycomapSequenceTarget(
+        node,
+        [{ name: 'iNat393666515 Lepiota', source: 'manual', hit_source: 'local' }],
+        'zszo'
+    ), null);
+});
+
+test('a directly imported MycoMap sequence record gets the same link', () => {
+    const label = 'iNat393666515 Lepiota';
+    assert.ok(P.extractMycomapSequenceTarget(
+        { data: { name: label } },
+        [{ name: label, source: 'mycomap', hit_source: 'sequence_record' }],
+        'zszo'
+    ));
+});
+
+// ===========================================================================
 // Finding 1 - deleting a direct child of a bifurcating root
 // ===========================================================================
 

@@ -512,6 +512,27 @@ def observation_records(references, *, deadline=None):
     return summaries
 
 
+def observation_sequences(reference, *, deadline=None):
+    """Return the public MycoMap sequence rows attached to one observation.
+
+    The public batch endpoint is also used by :func:`observation_records`, but
+    callers resolving a tree tip need the sequence ID and bases so they can
+    distinguish several reads attached to the same observation.  Keep the
+    fixed-path validation in ``_read`` and accept only the two observation
+    reference forms Dikarya itself emits.
+    """
+    reference = str(reference or "").strip().lower()
+    if not re.fullmatch(r"(?:inat|mo):\d{1,12}", reference):
+        raise OrgResultError("Invalid MycoMap observation reference.", 400,
+                             retryable=False)
+    payload = _json(f"mycomap/sequences/batch?observations={reference}",
+                    deadline=deadline)
+    return [
+        row for row in (payload.get("sequences") or [])
+        if isinstance(row, dict)
+    ]
+
+
 def _refresh_observation(reference, deadline):
     return _read("admin/mycomap/refresh", method="POST", body={"observation": reference},
                  authenticated=True, deadline=deadline, timeout=REFRESH_REQUEST_TIMEOUT)
@@ -671,6 +692,7 @@ def fetch_results(result_id, *, include_ncbi=True, include_local=True,
             result["sequences"].append({
                 "name": name, "sequence": sequence, "source": "mycomap",
                 "hit_source": source, "accession": accession, "taxon": taxon,
+                "mycomap_sequence_id": hit["id"] if source == "local" else "",
                 "raw_ncbi_description": raw_description,
                 "location": _location(item), "identity": hit["identity"],
                 "query_cover": hit["query_cover"], "subject_cover": hit["subject_cover"],

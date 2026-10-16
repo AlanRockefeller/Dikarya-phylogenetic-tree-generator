@@ -1,4 +1,4 @@
-from flask import current_app, g, jsonify, request, send_file, url_for
+from flask import current_app, g, jsonify, redirect, request, send_file, url_for
 from flask_login import current_user
 from app.api import bp
 from app.workers.queue import (
@@ -278,6 +278,12 @@ def _normalize_sequence_metadata(raw_items):
             mo_sequence_id = 0
         if mo_sequence_id > 0:
             row["mushroom_observer_sequence_id"] = mo_sequence_id
+        try:
+            mycomap_sequence_id = int(raw.get("mycomap_sequence_id") or 0)
+        except (TypeError, ValueError):
+            mycomap_sequence_id = 0
+        if mycomap_sequence_id > 0:
+            row["mycomap_sequence_id"] = mycomap_sequence_id
         row["blast_metrics_available"] = bool(raw.get("blast_metrics_available")) or any(
             row[field] is not None
             for field in ("identity", "query_cover", "subject_cover")
@@ -3576,6 +3582,31 @@ def refresh_tree_mycomap_records(job_id):
         return jsonify({"status": "error", "error": str(exc)}), 502
     except Exception as exc:
         return _server_error(exc, where="refresh_tree_mycomap_records")
+
+
+@bp.route('/job/<job_id>/tree/mycomap-sequence', methods=['GET'])
+@limiter.limit("20 per minute; 200 per hour")
+def open_tree_mycomap_sequence(job_id):
+    """Redirect one saved MycoMap-local tree tip to its exact public record."""
+    _, error_msg, status_code = check_job_access(job_id)
+    if error_msg:
+        return jsonify({"status": "error", "error": error_msg}), status_code
+
+    tip_name = str(request.args.get("tip_name") or "").strip()
+    if (not tip_name or len(tip_name) > 1000
+            or any(ord(char) < 32 or ord(char) == 127 for char in tip_name)):
+        return jsonify({"status": "error", "error": "Invalid tree tip name."}), 422
+
+    from app.services.mycomap_sequence_link_service import (
+        MycoMapSequenceLinkError,
+        resolve_job_tip_url,
+    )
+    try:
+        return redirect(resolve_job_tip_url(Config.JOB_DIR / job_id, tip_name), code=302)
+    except MycoMapSequenceLinkError as exc:
+        return jsonify({"status": "error", "error": str(exc)}), exc.status
+    except Exception as exc:
+        return _server_error(exc, where="open_tree_mycomap_sequence")
 
 @bp.route('/job/<job_id>/tree/undo', methods=['GET'])
 def get_tree_undo_state(job_id):
