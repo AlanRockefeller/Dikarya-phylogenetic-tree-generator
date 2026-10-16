@@ -154,6 +154,7 @@ ADVANCED_SUBMISSION_MODE = "advanced"
 ADVANCED_TREE_BUILDER_FIELDS = frozenset({
     "alrt_replicates",
     "bootstrap_cap",
+    "bootstrap_cutoff",
     "bootstrap_preset",
     "early_stopping",
     "enable_bootstrap",

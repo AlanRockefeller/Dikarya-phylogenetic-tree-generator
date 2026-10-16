@@ -1584,9 +1584,27 @@
                             <option value="maximum">Maximum (Max 2000)</option>
                             <option value="custom">Custom Cap...</option>
                         </select>
-                        <input type="number" id="bootstrap_cap_custom" placeholder="Cap" min="50" max="2000" class="w-1/3 px-4 py-3 border border-gray-300 dark:border-journal-dark rounded-lg 
+                        <input type="number" id="bootstrap_cap_custom" placeholder="Cap" min="50" max="2000" class="w-1/3 px-4 py-3 border border-gray-300 dark:border-journal-dark rounded-lg
                                        bg-white dark:bg-journal-dark text-gray-900 dark:text-gray-100 hidden">
                     </div>
+
+                    <label for="bootstrap_cutoff" class="block text-sm font-medium text-gray-700 dark:text-gray-200 mt-4 mb-2">
+                        Convergence Cutoff
+                    </label>
+                    <select id="bootstrap_cutoff" class="w-full md:w-2/3 px-4 py-3 border border-gray-300 dark:border-journal-dark rounded-lg
+                                   bg-white dark:bg-journal-dark text-gray-900 dark:text-gray-100
+                                   focus:ring-2 focus:ring-journal-gold focus:border-transparent">
+                        <option value="0.03">0.03 &ndash; Slowest (RAxML-NG default)</option>
+                        <option value="0.04">0.04 &ndash; Slow</option>
+                        <option value="0.07" selected>0.07 &ndash; Medium</option>
+                        <option value="0.10">0.10 &ndash; Fast</option>
+                    </select>
+                    <p class="text-xs text-gray-500 dark:text-gray-400 mt-1">
+                        Bootstrapping stops early once the support values stop changing by more than this
+                        (checked every 50 replicates). A larger cutoff stops sooner. On past Dikarya jobs,
+                        0.07 needed about 80% less bootstrap time than 0.03 and moved support values by about
+                        2 points on average, about as much as two runs at 0.03 differ from each other.
+                    </p>
                 </div>
             </div>
         </div>
@@ -5441,6 +5459,16 @@
             advancedCurrentSummary.textContent = `Currently: ${alignment} + ${treeMethod}, ${terminalTrim}, ${rooting}, SH-like local support (not bootstrap).`;
         } else if (treeMethodSelect.value === 'nj') {
             advancedCurrentSummary.textContent = `Currently: ${alignment} + ${treeMethod}, ${terminalTrim}, ${rooting}, no node support.`;
+        } else if (treeMethodSelect.value === 'raxml') {
+            // RAxML-NG runs AutoMRE bootstrapping up to a cap, not the
+            // 'bootstrap' replicate count the other methods read.
+            const cap = document.getElementById('bootstrap_preset')?.value === 'custom'
+                ? `cap ${document.getElementById('bootstrap_cap_custom')?.value || 'not set'}`
+                : `${selectedText('bootstrap_preset')} cap`;
+            const support = document.getElementById('enable_bootstrap')?.checked
+                ? `AutoMRE bootstrap (${cap}, cutoff ${selectedText('bootstrap_cutoff')})`
+                : 'no bootstrap';
+            advancedCurrentSummary.textContent = `Currently: ${alignment} + ${treeMethod}, ${terminalTrim}, ${rooting}, ${support}.`;
         } else {
             advancedCurrentSummary.textContent = `Currently: ${alignment} + ${treeMethod}, ${terminalTrim}, ${rooting}, ${bootstrap} bootstrap.`;
         }
@@ -5586,6 +5614,7 @@
     });
     ['alignment_method', 'trimming_method', 'trim_terminal_overhangs', 'fix_orientation', 'its_region', 'its_min_length',
         'tree_model', 'bootstrap', 'outgroup_select',
+        'enable_bootstrap', 'bootstrap_preset', 'bootstrap_cap_custom', 'bootstrap_cutoff',
         'mb_gen', 'mb_runs', 'mb_chains', 'mb_burnin', 'mb_stop_early'].forEach(id => {
         document.getElementById(id)?.addEventListener('input', refreshAdvancedSummary);
         document.getElementById(id)?.addEventListener('change', refreshAdvancedSummary);
@@ -5953,6 +5982,7 @@
             run_preset: document.getElementById('run_preset').value,
             bootstrap_preset: document.getElementById('bootstrap_preset').value,
             bootstrap_cap: document.getElementById('bootstrap_cap_custom').value ? parseInt(document.getElementById('bootstrap_cap_custom').value) : null,
+            bootstrap_cutoff: isRaxml ? (parseFloat(document.getElementById('bootstrap_cutoff').value) || null) : null,
             enable_bootstrap: document.getElementById('enable_bootstrap').checked,
             start_tree_override: document.getElementById('start_tree_override').value,
             moose_enabled: isRaxml && model === 'AUTO',
@@ -6286,6 +6316,22 @@
         setFieldValue('early_stopping', p.early_stopping);
         setFieldValue('start_tree_override', p.start_tree_override);
         if (p.bootstrap_cap) setFieldValue('bootstrap_cap_custom', p.bootstrap_cap);
+        // A RAxML job stored before the cutoff setting existed ran RAxML-NG's
+        // own 0.03, so the panel shows that rather than this form's default.
+        const storedCutoff = p.bootstrap_cutoff ?? (method === 'raxml' ? 0.03 : null);
+        const cutoffSelect = document.getElementById('bootstrap_cutoff');
+        if (cutoffSelect && storedCutoff !== null && Number.isFinite(parseFloat(storedCutoff))) {
+            const wanted = parseFloat(storedCutoff);
+            let match = Array.from(cutoffSelect.options).find(o => parseFloat(o.value) === wanted);
+            if (!match) {
+                // A value set through the API rather than this form.
+                match = document.createElement('option');
+                match.value = String(wanted);
+                match.text = `${wanted} (Custom)`;
+                cutoffSelect.add(match);
+            }
+            cutoffSelect.value = match.value;
+        }
         if (p.seed) setFieldValue('raxml_seed', p.seed);
 
         if (p.outgroup) {
@@ -6336,6 +6382,8 @@
             bootstrap_preset: document.getElementById('bootstrap_preset').value,
             bootstrap_cap: document.getElementById('bootstrap_cap_custom').value
                 ? parseInt(document.getElementById('bootstrap_cap_custom').value, 10) : null,
+            bootstrap_cutoff: isRaxml
+                ? (parseFloat(document.getElementById('bootstrap_cutoff').value) || null) : null,
             enable_bootstrap: document.getElementById('enable_bootstrap').checked,
             start_tree_override: document.getElementById('start_tree_override').value,
             moose_enabled: isRaxml && model === 'AUTO',

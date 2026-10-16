@@ -1,3 +1,4 @@
+import math
 import re
 import random
 from pathlib import Path
@@ -24,6 +25,38 @@ BOOTSTRAP_PRESETS = {
     'publication': 1000,
     'maximum': 2000,
 }
+
+# AutoMRE convergence cutoff (--bs-cutoff): bootstrapping stops once a check
+# every 50 replicates finds the support values stable to within this
+# threshold, so a larger cutoff stops sooner. RAxML-NG's own default is 0.03,
+# which every Dikarya job used until 2026-10-16. The stopping test was replayed
+# on the stored bootstrap trees of 67 production jobs (ops/raxml/README.md).
+# Against 0.03, 0.07 saved 80% of bootstrap time and moved a branch's support
+# by 1.9 points on average (16 at most). Two independent full runs at 0.03
+# already differ by 1.4-1.8 on average. The form offers these values with a
+# speed word. The API accepts anything in the range below.
+BOOTSTRAP_CUTOFF_CHOICES = {
+    0.03: 'Slowest',
+    0.04: 'Slow',
+    0.07: 'Medium',
+    0.10: 'Fast',
+}
+DEFAULT_BOOTSTRAP_CUTOFF = 0.07
+# What a job stored without the setting ran with: RAxML-NG's default. A
+# recompute of such a job reproduces that rather than switching cutoffs.
+LEGACY_BOOTSTRAP_CUTOFF = 0.03
+MIN_BOOTSTRAP_CUTOFF = 0.01
+MAX_BOOTSTRAP_CUTOFF = 0.10
+
+
+def bootstrap_cutoff_label(cutoff) -> str:
+    """'0.07 (Medium)' for a form value, '0.05' for any other cutoff."""
+    try:
+        value = round(float(cutoff), 4)
+    except (TypeError, ValueError):
+        return str(cutoff)
+    word = BOOTSTRAP_CUTOFF_CHOICES.get(value)
+    return f"{value:g} ({word})" if word else f"{value:g}"
 
 # Supported Models (Base matrices)
 # Uppercased on the way in, like VALID_AA_MODELS below, because the parser
@@ -257,6 +290,7 @@ class ResolvedRaxmlParams:
     outgroup: Optional[str] = None
     enable_moose: bool = False
     enable_early_stopping: bool = False
+    bootstrap_cutoff: float = DEFAULT_BOOTSTRAP_CUTOFF
 
 
 def resolve_outgroup_id(outgroup: str, name_mapping: Dict[str, str]) -> str:
@@ -316,6 +350,26 @@ def validate_and_resolve_raxml_params(params: Dict[str, Any], data_type: str = '
             bootstrap_cap = req_cap
     else:
         bootstrap_cap = 0  # Irrelevant but safe value
+
+    bootstrap_cutoff = DEFAULT_BOOTSTRAP_CUTOFF
+    raw_cutoff = params.get('bootstrap_cutoff')
+    if raw_cutoff is not None and raw_cutoff != '':
+        try:
+            requested_cutoff = float(raw_cutoff)
+        except (TypeError, ValueError):
+            requested_cutoff = None
+        if isinstance(raw_cutoff, bool) or requested_cutoff is None or not math.isfinite(requested_cutoff):
+            warnings.append(
+                f"Invalid bootstrap convergence cutoff; using {DEFAULT_BOOTSTRAP_CUTOFF:g}."
+            )
+        elif not MIN_BOOTSTRAP_CUTOFF <= requested_cutoff <= MAX_BOOTSTRAP_CUTOFF:
+            bootstrap_cutoff = min(max(requested_cutoff, MIN_BOOTSTRAP_CUTOFF), MAX_BOOTSTRAP_CUTOFF)
+            warnings.append(
+                f"Bootstrap convergence cutoff {requested_cutoff:g} is outside "
+                f"{MIN_BOOTSTRAP_CUTOFF:g}-{MAX_BOOTSTRAP_CUTOFF:g}; clamped to {bootstrap_cutoff:g}."
+            )
+        else:
+            bootstrap_cutoff = round(requested_cutoff, 4)
 
     # 2. Starting Trees Logic
     run_preset = params.get('run_preset', 'fast_good')
@@ -548,5 +602,6 @@ def validate_and_resolve_raxml_params(params: Dict[str, Any], data_type: str = '
         warnings=warnings,
         outgroup=outgroup,
         enable_moose=enable_moose,
-        enable_early_stopping=enable_early_stopping
+        enable_early_stopping=enable_early_stopping,
+        bootstrap_cutoff=bootstrap_cutoff,
     )

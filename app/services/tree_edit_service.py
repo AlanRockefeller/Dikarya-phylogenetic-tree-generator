@@ -21,6 +21,7 @@ from app.services.artifact_storage import (
     gz_path,
     open_artifact,
 )
+from app.services.raxml_validator import LEGACY_BOOTSTRAP_CUTOFF
 from app.services.security_utils import coerce_bool
 from app.services.subprocess_utils import run_command
 
@@ -501,6 +502,10 @@ def build_recompute_job_params(params_dict: Dict[str, Any]) -> JobParams:
         run_preset=params_dict.get("run_preset", "fast_good"),
         bootstrap_preset=params_dict.get("bootstrap_preset", "standard"),
         bootstrap_cap=params_dict.get("bootstrap_cap"),
+        # Same rule as mcmc_stop_early above: a job stored before the setting
+        # existed ran RAxML-NG's 0.03, so its recompute does too unless the
+        # Advanced panel chose a cutoff.
+        bootstrap_cutoff=params_dict.get("bootstrap_cutoff", LEGACY_BOOTSTRAP_CUTOFF),
         enable_bootstrap=_bool_param(params_dict, "enable_bootstrap", True),
         start_tree_override=params_dict.get("start_tree_override"),
         moose_enabled=_bool_param(params_dict, "moose_enabled", False),

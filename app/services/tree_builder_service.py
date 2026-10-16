@@ -39,6 +39,11 @@ from app.services.fasta_utils import (
     sanitize_fasta_headers,
     write_name_map,
 )
+from app.services.identical_sequences import (
+    COLLAPSE_METHODS,
+    plan_identical_collapse,
+    restore_identical_tips,
+)
 from app.services.tree_parameter_validation import validate_iqtree_ufboot_count
 from app.services.tree_io import (
     newick_file_to_nexus,
@@ -228,6 +233,16 @@ def run_tree_builder(
             "mcmc_stop_early_requested": bool(params.mcmc_stop_early),
         })
 
+    # Long runs search a tree of one sequence per identical group, and the
+    # left-out sequences are added back once the builder has finished. The
+    # builders below see only `builder_input`.
+    collapse = None
+    if method in COLLAPSE_METHODS:
+        collapse = _collapse_identical_sequences(
+            alignment_fasta, output_newick.parent, params, task_logger, job_id
+        )
+    builder_input = collapse.reduced_fasta if collapse else alignment_fasta
+
     try:
         if method == "nj":
             metadata.update(_run_neighbor_joining(
@@ -239,7 +254,7 @@ def run_tree_builder(
             # model was ever recorded, so the viewer cited a model the tree was
             # not built under. Same model_selected contract as IQ-TREE below.
             effective_model, selected_by, raxml_meta = _run_raxml(
-                alignment_fasta, output_newick, output_nexus, params, config, task_logger, job_id
+                builder_input, output_newick, output_nexus, params, config, task_logger, job_id
             )
             metadata.update(raxml_meta)
             if effective_model and effective_model != params.model:
@@ -248,7 +263,7 @@ def run_tree_builder(
                     metadata["model_selector"] = selected_by
         elif method in ("iqtree", "iqtree_fast"):
             selected_model, iqtree_seed = _run_iqtree(
-                alignment_fasta, output_newick, output_nexus, params, config, task_logger, job_id,
+                builder_input, output_newick, output_nexus, params, config, task_logger, job_id,
                 fast=(method == "iqtree_fast"),
             )
             metadata["seed"] = iqtree_seed
@@ -263,7 +278,7 @@ def run_tree_builder(
                     task_logger.info(f"ModelFinder selected substitution model: {selected_model}")
         elif method == "mrbayes":
             metadata.update(_run_mrbayes(
-                alignment_fasta, output_newick, output_nexus, params, config, task_logger, job_id
+                builder_input, output_newick, output_nexus, params, config, task_logger, job_id
             ))
         elif method == "fasttree":
             metadata.update(_run_fasttree(
@@ -275,6 +290,11 @@ def run_tree_builder(
         if not output_newick.exists() or output_newick.stat().st_size == 0:
              raise RuntimeError(f"Tree building failed: Output file {output_newick} is missing or empty.")
 
+        if collapse is not None:
+            _restore_identical_sequences(
+                collapse, output_newick, output_nexus, metadata, task_logger, job_id
+            )
+
         task_logger.info(f"Tree building completed successfully. Output: {output_newick}")
         return metadata
 
@@ -284,6 +304,73 @@ def run_tree_builder(
 
     finally:
         _discard_scratch_inputs(output_newick.parent, task_logger)
+        if collapse is not None:
+            collapse.reduced_fasta.unlink(missing_ok=True)
+
+
+def _collapse_identical_sequences(
+    alignment_fasta: Path, tree_dir: Path, params: TreeBuilderParams, task_logger, job_id
+):
+    """Plan the one-per-group alignment for a long run, or return None.
+
+    Any failure here leaves the job on the alignment as given: skipping the
+    collapse costs time, not results.
+    """
+    try:
+        collapse = plan_identical_collapse(
+            alignment_fasta, tree_dir, prefer=params.outgroup, task_logger=task_logger
+        )
+    except Exception:
+        task_logger.warning(
+            "Could not check for identical sequences; building the tree from "
+            "every sequence.", exc_info=True,
+        )
+        return None
+    if collapse is None:
+        return None
+    message = (
+        f"{collapse.removed_count} of {collapse.total_records} sequences are identical "
+        f"to another sequence in the alignment. Building the tree from the "
+        f"{collapse.total_records - collapse.removed_count} distinct sequences; the "
+        "identical ones are added back beside their twin at the end."
+    )
+    task_logger.info(
+        "event=tree.identical_collapsed removed=%d groups=%d records=%d %s",
+        collapse.removed_count, len(collapse.groups), collapse.total_records, message,
+    )
+    notice = _make_log_callback(job_id, "tree", "stdout")
+    if notice:
+        notice(message)
+    return collapse
+
+
+def _restore_identical_sequences(
+    collapse, output_newick: Path, output_nexus: Path, metadata: Dict[str, Any],
+    task_logger, job_id,
+) -> None:
+    """Add the left-out sequences back to every tree the builder delivered.
+
+    The primary tree, and the RAxML-NG TBE companion when there is one, get each
+    identical group as a zero-length polytomy where its kept sequence was (see
+    `expand_newick_tips`). The stored NEXUS is regenerated from the finished
+    Newick. MrBayes's posterior annotations survive only in its own .con.tre,
+    which the MrBayes download carries.
+    """
+    restore_identical_tips(output_newick, collapse)
+    tbe_name = metadata.get("tbe_tree")
+    if tbe_name:
+        restore_identical_tips(output_newick.parent / tbe_name, collapse)
+    _convert_newick_to_nexus(output_newick, output_nexus)
+    metadata["identical_sequences"] = collapse.metadata()
+    message = (
+        f"Added the {collapse.removed_count} identical sequences back to the tree "
+        "on zero-length branches beside their twin. The clades joining them carry "
+        "no support value."
+    )
+    task_logger.info(message)
+    notice = _make_log_callback(job_id, "tree", "stdout")
+    if notice:
+        notice(message)
 
 
 def _discard_scratch_inputs(tree_dir: Path, task_logger) -> None:
@@ -749,6 +836,11 @@ def _get_raxml_cmd(
         cmd.append("--all")
         # --bs-trees autoMRE{cap}
         cmd.extend(["--bs-trees", f"autoMRE{{{params.bootstrap_cap}}}"])
+        # Always explicit, the 0.03 default included, so the logged command
+        # says which convergence threshold this run stopped on. None only when
+        # the binary does not know the flag (see _run_raxml).
+        if params.bootstrap_cutoff is not None:
+            cmd.extend(["--bs-cutoff", f"{params.bootstrap_cutoff:g}"])
         # Both support metrics from the same replicates: Felsenstein (the
         # classical proportion the viewer shows) and the transfer bootstrap
         # (Lemoine et al. 2018), which is far less punishing of one rogue taxon
@@ -952,6 +1044,7 @@ def _run_raxml(
         "run_preset": params.run_preset,
         "bootstrap_preset": params.bootstrap_preset,
         "bootstrap_cap": params.bootstrap_cap,
+        "bootstrap_cutoff": params.bootstrap_cutoff,
         "enable_bootstrap": params.enable_bootstrap,
         "start_tree_override": params.start_tree_override,
         "moose_enabled": params.moose_enabled,
@@ -966,6 +1059,7 @@ def _run_raxml(
         "model": params.model,
         "enable_bootstrap": params.enable_bootstrap,
         "bootstrap_cap": params.bootstrap_cap,
+        "bootstrap_cutoff": params.bootstrap_cutoff,
         "bootstrap_preset": params.bootstrap_preset,
         "start_tree_override": params.start_tree_override,
         "run_preset": params.run_preset,
@@ -978,6 +1072,17 @@ def _run_raxml(
     # Check Support for Features
     has_moose_support = _check_raxml_feature(config, "--moose")
     has_early_stop_support = _check_raxml_feature(config, "--stop-rule")
+    if resolved.enable_bootstrap and not _check_raxml_feature(config, "--bs-cutoff"):
+        task_logger.warning(
+            "The installed RAxML-NG does not accept --bs-cutoff; AutoMRE uses its "
+            "built-in cutoff."
+        )
+        resolved.warnings.append(
+            f"The bootstrap convergence cutoff {resolved.bootstrap_cutoff:g} could not "
+            "be applied: the installed RAxML-NG does not accept --bs-cutoff, so its "
+            "built-in default (0.03 in every release) was used."
+        )
+        resolved.bootstrap_cutoff = None
 
     # 3. Handle MOOSE
     moose_mapping = None
@@ -1146,6 +1251,7 @@ def _run_raxml(
         "model": resolved.model,
         "enable_bootstrap": resolved.enable_bootstrap,
         "bootstrap_cap": resolved.bootstrap_cap if resolved.enable_bootstrap else None,
+        "bootstrap_cutoff": resolved.bootstrap_cutoff if resolved.enable_bootstrap else None,
         "start_tree_spec": resolved.start_tree_spec,
         "seed": resolved.seed,
         "outgroup": applied_outgroup,
@@ -1182,6 +1288,10 @@ def _run_raxml(
         "bootstrap": None,
         "bootstrap_spec": (
             f"autoMRE{{{resolved.bootstrap_cap}}}" if resolved.enable_bootstrap else None
+        ),
+        # --bs-cutoff: the AutoMRE convergence threshold the run stopped on.
+        "bootstrap_cutoff": (
+            resolved.bootstrap_cutoff if resolved.enable_bootstrap else None
         ),
         "support_type": "bootstrap" if resolved.enable_bootstrap else None,
         # Unlike the submitted generic `bootstrap` field, this is the number

@@ -166,9 +166,9 @@ RECOMPUTE_OVERRIDABLE_FIELDS = frozenset({
     "bootstrap", "alrt_replicates",
     "mcmc_generations", "mcmc_nruns", "mcmc_nchains", "mcmc_burnin_fraction",
     "mcmc_stop_early",
-    "run_preset", "bootstrap_preset", "bootstrap_cap", "enable_bootstrap",
-    "start_tree_override", "moose_enabled", "early_stopping", "seed",
-    "outgroup", "notes",
+    "run_preset", "bootstrap_preset", "bootstrap_cap", "bootstrap_cutoff",
+    "enable_bootstrap", "start_tree_override", "moose_enabled",
+    "early_stopping", "seed", "outgroup", "notes",
 })
 
 # The overridable settings that are booleans. JSON clients send these as
@@ -3109,6 +3109,7 @@ def create_job():
         "run_preset": data.get("run_preset", "fast_good"),
         "bootstrap_preset": data.get("bootstrap_preset", "standard"),
         "bootstrap_cap": data.get("bootstrap_cap"),
+        "bootstrap_cutoff": data.get("bootstrap_cutoff"),
         "enable_bootstrap": data.get("enable_bootstrap", True),
         "start_tree_override": data.get("start_tree_override"),
         "moose_enabled": data.get("moose_enabled", False),
@@ -3137,6 +3138,7 @@ def create_job():
             # overwrite with safe values to ensure what is stored/shown matches execution
             job_params.update({
                 "bootstrap_cap": resolved.bootstrap_cap,
+                "bootstrap_cutoff": resolved.bootstrap_cutoff,
                 "enable_bootstrap": resolved.enable_bootstrap,
                 "seed": resolved.seed,
                 "outgroup": resolved.outgroup,
