@@ -1,0 +1,710 @@
+--- a/app.py
++++ b/app.py
+@@ -23,7 +23,7 @@
+ import traceback
+ import sys
+ import importlib.util
+-from collections import defaultdict, OrderedDict
++from collections import defaultdict, OrderedDict, deque
+ from datetime import date
+ from uuid import uuid4
+ from functools import partial, cmp_to_key
+@@ -172,9 +172,9 @@
+ RATE_LIMIT_WRITE_ONLY_ENDPOINTS = {"todo"}
+ # Sort field names are forwarded to inat.label.py as a command argument.  An
+ # allowlist keeps that boundary allowlist-shaped instead of blacklist-shaped.
+-SORT_FIELD_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9 ()/&.,'#_-]{0,63}$")
++SORT_FIELD_RE = re.compile(r"^[^\W_][\w ()/&.,'#–—-]{0,63}\Z")
+ # Custom label field names travel to the generator the same way.
+-CUSTOM_FIELD_RE = re.compile(r"^[+-]?[A-Za-z0-9][A-Za-z0-9 ()/&.'#_-]{0,63}$")
++CUSTOM_FIELD_RE = re.compile(r"^[+-]?[^\W_][\w ()/&.'#–—-]{0,63}\Z")
+ MAX_CUSTOM_FIELDS = int(os.environ.get("MAX_CUSTOM_FIELDS", "40"))
+ # Labels print the iNaturalist link as a bare URL with no field name in front
+ # of it, so a user who wants that line gone has nothing to type into the
+@@ -345,6 +345,7 @@
+ # In-memory job store for streaming print jobs
+ _jobs = {}
+ _jobs_lock = threading.Lock()
++_jobs_changed = threading.Condition(_jobs_lock)
+ 
+ # Count of SSE log streams currently held open (one worker thread each).
+ _open_streams = [0]
+@@ -2352,7 +2353,13 @@
+             "proc": proc,
+             "output_path": output_path,
+             "filename": filename,
++            "started_time": time.time(),
++            "observation_count": len(inat_ids),
++            "logs": deque(maxlen=1000),
++            "log_cursor": 0,
+         }
++        job = _jobs[job_id]
++    _start_print_collector(job_id, job)
+ 
+     return jsonify(
+         {
+@@ -2366,156 +2373,137 @@
+     )
+ 
+ 
++def _print_result(job):
++    """A result is published only after the generator has closed its file."""
++    if "result" in job:
++        return job["result"]
++    return {"status": "running", "elapsed_seconds": max(
++        0, int(time.time() - job.get("started_time", time.time()))
++    ), "observation_count": job.get("observation_count", 0)}
++
++
++def _collect_print_output(job_id, job):
++    # Drain stdout even without an SSE reader: a full pipe must never stall
++    # generation. Keep bounded logs for reconnecting streams.
++    proc = job["proc"]
++    try:
++        for line in iter(proc.stdout.readline, ""):
++            with _jobs_changed:
++                job["log_cursor"] += 1
++                job["logs"].append((job["log_cursor"], line.rstrip("\n")[:4000]))
++                _jobs_changed.notify_all()
++        exit_code = proc.wait()
++        # A nonempty file with the process finished is safe to download.
++        if os.path.isfile(job["output_path"]) and os.path.getsize(job["output_path"]) > 0:
++            result = {"status": "completed", "success": True,
++                      "download_url": f"/labels/static/jobs/{job_id}/{job['filename']}",
++                      "exit_code": exit_code}
++            if exit_code:
++                log_user_problem("label_generator_nonzero_exit", job_id=job_id, exit_code=exit_code)
++        else:
++            if exit_code == 0:
++                error = ("No labels were generated from these observations. Check that the "
++                         "observation IDs exist and are accessible, then try again.")
++            else:
++                error = ("Label generation stopped before creating a file. Check the "
++                         "generation output below for the observations that could not be processed, then try again.")
++            result = {"status": "failed", "success": False, "error": error,
++                      "exit_code": exit_code}
++            log_user_problem("label_generator_output_missing", job_id=job_id,
++                             exit_code=exit_code, output_path=job["output_path"])
++    except Exception:
++        app.logger.exception("Label generation output collection failed for %s", job_id)
++        result = {"status": "failed", "success": False,
++                  "error": "Label generation was interrupted. Please try again."}
++        try:
++            if proc.poll() is None:
++                proc.terminate()
++                try:
++                    proc.wait(timeout=5)
++                except subprocess.TimeoutExpired:
++                    proc.kill()
++                    proc.wait(timeout=5)
++        except Exception:
++            app.logger.exception("Could not stop interrupted label job %s", job_id)
++    finally:
++        if proc.stdout:
++            try:
++                proc.stdout.close()
++            except Exception:
++                app.logger.exception("Could not close output of label job %s", job_id)
++    with _jobs_changed:
++        job["result"] = result
++        job["finished_time"] = time.time()
++        _jobs_changed.notify_all()
++
++
++def _start_print_collector(job_id, job):
++    threading.Thread(target=_collect_print_output, args=(job_id, job), daemon=True,
++                     name=f"labels-{job_id}").start()
++
++
++@app.route("/labels/print_status")
++def print_status():
++    job_id = request.args.get("job_id", "")
++    with _jobs_lock:
++        job = _jobs.get(job_id)
++        if job is None:
++            response = jsonify({"status": "failed", "success": False,
++                "error": "This label job is no longer available. The server may have restarted; please generate the labels again."})
++            response.status_code = 410
++        else:
++            response = jsonify(_print_result(job))
++    response.headers["Cache-Control"] = "no-store"
++    return response
++
++
+ @app.route("/labels/print_stream")
+ def print_stream():
+     job_id = request.args.get("job_id")
+-
+-    if job_id and not re.fullmatch(
+-        r"[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}",
+-        job_id,
+-        re.IGNORECASE,
+-    ):
++    with _jobs_lock:
++        job = _jobs.get(job_id)
++    if job is None:
+         if not getattr(g, "security_event_logged", False):
+-            log_user_problem("malformed_print_job_id", submitted_value=job_id)
+-
+-    with _jobs_lock:
+-        if not job_id or job_id not in _jobs:
+-            if (
+-                not getattr(g, "security_event_logged", False)
+-                and not getattr(g, "user_problem_event_logged", False)
+-            ):
+-                log_user_problem("print_job_not_found", submitted_value=job_id)
+-            # Job is already gone, possibly reaped.
+-            # Return an immediate SSE 'done' event with an error.
+-            def generate_reaped_error():
+-                error_payload = json.dumps(
+-                    {
+-                        "success": False,
+-                        "error": "Job not found. It may have been completed and cleaned up.",
+-                        "exit_code": -1,
+-                    }
+-                )
+-                yield f"event: done\ndata: {error_payload}\n\n"
+-
+-            return app.response_class(
+-                generate_reaped_error(),
+-                mimetype="text/event-stream",
+-                headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+-            )
+-        job = _jobs[job_id]
+-        proc = job["proc"]
+-        output_path = job["output_path"]
+-
+-    # Each open stream pins a worker thread until its job ends, so refuse new
+-    # ones past the cap instead of letting them exhaust the thread pool.  The
+-    # client falls back to polling for the finished file.
++            log_user_problem("print_job_not_found", submitted_value=job_id)
++        payload = json.dumps({"success": False,
++            "error": "This label job is no longer available. Please generate the labels again."})
++        return app.response_class(f"event: done\ndata: {payload}\n\n",
++            mimetype="text/event-stream", headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
++
+     with _stream_count_lock:
+         if _open_streams[0] >= MAX_CONCURRENT_STREAMS:
+-            app.logger.warning(
+-                "print_stream: refusing stream, %s already open (max %s)",
+-                _open_streams[0],
+-                MAX_CONCURRENT_STREAMS,
+-            )
+-            return (
+-                jsonify(
+-                    {
+-                        "error": (
+-                            f"Too many log streams open ({_open_streams[0]}, max "
+-                            f"{MAX_CONCURRENT_STREAMS}). The label job is still running; "
+-                            f"the download will appear when it finishes."
+-                        )
+-                    }
+-                ),
+-                429,
+-            )
++            return jsonify({"error": "Log streaming is busy. Generation is still running; progress and downloads remain available."}), 429
+         _open_streams[0] += 1
+-
+-    rel_path = os.path.relpath(
+-        output_path, os.path.join(app.root_path, "static")
+-    ).replace("\\", "/")
+-    download_url = url_for("static", filename=rel_path)
++    try:
++        cursor = max(0, int(request.headers.get("Last-Event-ID", 0)))
++    except ValueError:
++        cursor = 0
+ 
+     def generate():
++        nonlocal cursor
+         try:
+-            # Stream already-written and future output
+-            for line in iter(proc.stdout.readline, ""):
+-                line = line.rstrip("\n")
+-                # Small debug hook if you want:
+-                # app.logger.debug(f"SSE log line: {line!r}")
+-
+-                yield f"event: log\ndata: {json.dumps(line)}\n\n"
+-
+-            # When the loop ends, the process has finished
+-            exit_code = proc.wait()
+-
+-            if os.path.exists(output_path):
+-                if exit_code != 0:
+-                    log_user_problem(
+-                        "label_generator_nonzero_exit",
+-                        job_id=job_id,
+-                        exit_code=exit_code,
+-                        output_path=output_path,
+-                    )
+-                done_payload = json.dumps(
+-                    {
+-                        "success": True,
+-                        "download_url": download_url,
+-                        "exit_code": exit_code,
+-                    }
+-                )
+-            else:
+-                error_message = (
+-                    f"Output file was not created. "
+-                    f"Process exited with code {exit_code}."
+-                )
+-                done_payload = json.dumps(
+-                    {
+-                        "success": False,
+-                        "error": error_message,
+-                        "exit_code": exit_code,
+-                    }
+-                )
+-                log_user_problem(
+-                    "label_generator_output_missing",
+-                    job_id=job_id,
+-                    exit_code=exit_code,
+-                    output_path=output_path,
+-                )
+-
+-            yield f"event: done\ndata: {done_payload}\n\n"
+-
++            while True:
++                with _jobs_changed:
++                    lines = [(n, line) for n, line in job["logs"] if n > cursor]
++                    result = job.get("result")
++                    if not lines and result is None:
++                        _jobs_changed.wait(timeout=10)
++                        lines = [(n, line) for n, line in job["logs"] if n > cursor]
++                        result = job.get("result")
++                for n, line in lines:
++                    cursor = n
++                    yield f"id: {n}\nevent: log\ndata: {json.dumps(line)}\n\n"
++                if result is not None:
++                    yield f"event: done\ndata: {json.dumps(result)}\n\n"
++                    return
++                yield ": waiting for generation\n\n"
+         finally:
+-            try:
+-                if proc.poll() is None:
+-                    proc.terminate()
+-                    try:
+-                        proc.wait(timeout=5)
+-                    except Exception as e:
+-                        app.logger.debug(f"Error waiting for process termination: {e}")
+-                        pass
+-            except Exception as e:
+-                app.logger.debug(f"Error terminating process: {e}")
+-            try:
+-                if proc.stdout:
+-                    proc.stdout.close()
+-            except Exception as e:
+-                app.logger.debug(f"Error closing stdout: {e}")
+-
+-            with _jobs_lock:
+-                if job_id in _jobs:
+-                    _jobs[job_id]["finished_time"] = time.time()
+-
++            # Closing a tab or losing SSE must not terminate its generator.
+             with _stream_count_lock:
+-                _open_streams[0] = max(0, _open_streams[0] - 1)
+-
+-    return app.response_class(
+-        generate(),
+-        mimetype="text/event-stream",
+-        headers={
+-            "Cache-Control": "no-cache",
+-            "X-Accel-Buffering": "no",  # nginx hint; harmless even if not used
+-        },
+-    )
++                _open_streams[0] -= 1
++
++    return app.response_class(generate(), mimetype="text/event-stream",
++        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+ 
+ 
+ def _clean_locality_text(value):
+--- a/templates/index.html
++++ b/templates/index.html
+@@ -2449,6 +2449,7 @@
+                 <button id="logModalCloseX" class="btn btn-outline btn-icon" aria-label="Close">&times;</button>
+             </div>
+             <div class="modal-body">
++                <p id="printProgress" role="status" aria-live="polite"></p>
+                 <div id="logContent" class="ansi-log"></div>
+             </div>
+             <div class="modal-footer">
+@@ -3565,6 +3566,7 @@
+         }
+ 
+         function showErrorModal(messageHtml, title = "Error") {
++            $("#printProgress").text("");
+             $("#logModalTitle").text(title);
+ 
+             $("#logContent").html(`<div class="modal-error">${messageHtml}</div>`);
+@@ -4057,6 +4059,7 @@
+                 .prop("disabled", true);
+             // Open the modal immediately
+             $("#logModalTitle").text("Starting Label Generation...");
++            $("#printProgress").text("Preparing observations…");
+             $("#logContent").html("");
+             $("#logModal").css("display", "flex");
+             let firstLogMessageReceived = false;
+@@ -4087,39 +4090,70 @@
+                     `/labels/print_stream?job_id=${encodeURIComponent(job_id)}`,
+                 );
+ 
+-                // Fallback polling in case SSE 'done' is blocked by proxies
+-                const expectedUrl = `/labels/static/jobs/${job_id}/labels.${format}`;
+-                let downloaded = false;
+-
+-                const poller = setInterval(async () => {
++                // Poll job state, not a file that is expected not to exist yet.
++                // Completion is shared by SSE and polling to prevent double downloads.
++                let settled = false;
++                let pollTimer = null;
++                let pollDelay = 2000;
++                const finishPrint = (payload) => {
++                    if (settled) return;
++                    settled = true;
++                    clearTimeout(pollTimer);
++                    es.close();
++                    btn.html(originalText).removeClass("is-busy").prop("disabled", false);
++                    if (payload.success && payload.download_url) {
++                        recordSuccessfulPrint();
++                        $("#printProgress").text("Labels are ready.");
++                        const a = document.createElement("a");
++                        a.href = payload.download_url;
++                        a.download = downloadName;
++                        a.className = "download-link";
++                        a.textContent = `Download ${downloadName}`;
++                        $("#logContent").append(document.createElement("br"), a);
++                        a.click();
++                        showToast(successMsg);
++                    } else {
++                        $("#logModalTitle").text("Label Generation Failed");
++                        $("#printProgress").text(payload.error || "The label file could not be generated. Please try again.");
++                        $("#logModal").css("display", "flex");
++                    }
++                };
++                const pollStatus = async () => {
++                    const controller = new AbortController();
++                    const timeout = setTimeout(() => controller.abort(), 15000);
+                     try {
+-                        const resp = await fetch(expectedUrl, {
+-                            method: "HEAD",
+-                            cache: "no-store",
++                        const resp = await fetch(`/labels/print_status?job_id=${encodeURIComponent(job_id)}`, {
++                            cache: "no-store", signal: controller.signal,
+                         });
+-
+-                        if (resp.ok && !downloaded) {
+-                            downloaded = true;
+-                            recordSuccessfulPrint();
+-                            btn.html(originalText).removeClass("is-busy").prop("disabled", false);
+-                            const a = document.createElement("a");
+-                            a.href = expectedUrl;
+-                            a.download = downloadName;
+-                            document.body.appendChild(a);
+-                            a.click();
+-                            document.body.removeChild(a);
+-                            const cont = $("#logContent");
+-
+-                            cont.append(
+-                                `\n<div style="margin-top:8px;"><a class="download-link" href="${expectedUrl}" download="${downloadName}">Download ${downloadName}</a></div>`,
+-                            );
+-                            showToast(successMsg);
+-                            clearInterval(poller);
++                        if (settled) return;
++                        if (resp.status === 429) {
++                            const retryAfter = resp.headers.get('Retry-After');
++                            const seconds = retryAfter ? Number(retryAfter) : NaN;
++                            const retryMs = Number.isFinite(seconds) ? seconds * 1000 : Date.parse(retryAfter || '') - Date.now();
++                            pollDelay = Number.isFinite(retryMs) && retryMs > 0 ? Math.max(2000, retryMs) : Math.min(30000, pollDelay * 2);
++                        } else if (resp.ok || resp.status === 410) {
++                            const payload = await resp.json();
++                            if (settled) return;
++                            pollDelay = 2000;
++                            if (payload.status === 'completed' || payload.status === 'failed') {
++                                finishPrint(payload);
++                                return;
++                            }
++                            const elapsed = Math.max(0, Number(payload.elapsed_seconds) || 0);
++                            const time = elapsed < 60 ? `${elapsed}s` : `${Math.floor(elapsed / 60)}m ${elapsed % 60}s`;
++                            $("#printProgress").text(`Generating ${payload.observation_count || ''} labels · ${time} elapsed. Large batches can take several minutes.`);
++                        } else {
++                            pollDelay = Math.min(30000, pollDelay * 2);
+                         }
+-                    } catch (e) {
+-                        console.debug("Fallback poll error:", e);
++                    } catch (_) {
++                        if (!settled) $("#printProgress").text("Reconnecting to check progress. Label generation continues on the server.");
++                        pollDelay = Math.min(30000, pollDelay * 2);
++                    } finally {
++                        clearTimeout(timeout);
++                        if (!settled) pollTimer = setTimeout(pollStatus, pollDelay);
+                     }
+-                }, 2000);
++                };
++                pollTimer = setTimeout(pollStatus, pollDelay);
+ 
+                 es.addEventListener("log", (ev) => {
+                     try {
+@@ -4158,79 +4192,16 @@
+                     }
+                 });
+ 
+-                // Some servers deliver unnamed events as 'message'
++                // Both event forms use the same completion/error path.
+                 es.onmessage = (ev) => {
+-                    // Try to detect done payload
+                     try {
+                         const payload = JSON.parse(ev.data);
+-
+-                        if (
+-                            payload &&
+-                            typeof payload === "object" &&
+-                            "success" in payload
+-                        ) {
+-                            btn.html(originalText).removeClass("is-busy").prop("disabled", false);
+-
+-                            if (payload.success && payload.download_url) {
+-                                downloaded = true;
+-                                recordSuccessfulPrint();
+-                                const a = document.createElement("a");
+-                                a.href = payload.download_url;
+-                                a.download = downloadName;
+-                                document.body.appendChild(a);
+-                                a.click();
+-                                document.body.removeChild(a);
+-                                const cont = $("#logContent");
+-
+-                                cont.append(
+-                                    `\n<div style="margin-top:8px;"><a class="download-link" href="${payload.download_url}" download="${downloadName}">Download ${downloadName}</a></div>`,
+-                                );
+-                                showToast(successMsg);
+-                            }
+-
+-                            clearInterval(poller);
+-                            es.close();
+-                        }
+-                    } catch (_) {
+-                        /* ignore non-JSON message */
+-                    }
++                        if (payload && typeof payload === 'object' && 'success' in payload) finishPrint(payload);
++                    } catch (_) { /* A log message need not be JSON. */ }
+                 };
+-
+                 es.addEventListener("done", (ev) => {
+-                    btn.html(originalText).removeClass("is-busy").prop("disabled", false);
+-
+-                    try {
+-                        const payload = JSON.parse(ev.data);
+-
+-                        if (payload.success && payload.download_url) {
+-                            downloaded = true;
+-                            recordSuccessfulPrint();
+-                            // Auto-download
+-                            const a = document.createElement("a");
+-                            a.href = payload.download_url;
+-                            a.download = downloadName;
+-                            document.body.appendChild(a);
+-                            a.click();
+-                            document.body.removeChild(a);
+-                            // Also show a clickable link in case the browser blocks auto-download
+-                            // Also show a clickable link in case the browser blocks auto-download
+-                            const cont = $("#logContent");
+-
+-                            cont.append(
+-                                `\n<div style="margin-top:8px;"><a class="download-link" href="${payload.download_url}" download="${downloadName}">Download ${downloadName}</a></div>`,
+-                            );
+-                            showToast(successMsg);
+-                        } else {
+-                            showErrorModal(
+-                                "The label file could not be generated. Please try again.",
+-                            );
+-                        }
+-                    } catch (e) {
+-                        showErrorModal("Unexpected response from server.");
+-                    }
+-
+-                    clearInterval(poller);
+-                    es.close();
++                    try { finishPrint(JSON.parse(ev.data)); }
++                    catch (_) { finishPrint({success: false, error: "Unexpected response from server. Please try again."}); }
+                 });
+ 
+                 es.onerror = function () {
+--- a/tests/test_diagnostic_logging.py
++++ b/tests/test_diagnostic_logging.py
+@@ -1,6 +1,7 @@
+ """Tests for user-problem, commodity-scanner, and targeted-attack logging."""
+ 
+ import json
++from collections import deque
+ import unittest
+ from unittest.mock import MagicMock, patch
+ 
+@@ -167,10 +168,12 @@
+             "proc": proc,
+             "output_path": "/tmp/labels-test-output-that-does-not-exist.rtf",
+             "filename": "labels.rtf",
++            "logs": deque(maxlen=1000), "log_cursor": 0,
+         }
+         self.addCleanup(labels_app._jobs.pop, job_id, None)
+ 
+         with patch.object(labels_app.user_problem_logger, "warning") as problem:
++            labels_app._collect_print_output(job_id, labels_app._jobs[job_id])
+             response = self.client.get(f"/labels/print_stream?job_id={job_id}")
+             response.get_data()
+ 
+--- a/tests/test_queue_persistence.py
++++ b/tests/test_queue_persistence.py
+@@ -224,7 +224,9 @@
+         print_job = self.template.split("async function startPrintJob", 1)[1].split(
+             '$("#printRtfButton")', 1
+         )[0]
+-        self.assertGreaterEqual(print_job.count("recordSuccessfulPrint();"), 3)
++        # SSE and status polling share one idempotent completion handler.
++        self.assertEqual(print_job.count("recordSuccessfulPrint();"), 1)
++        self.assertIn("if (settled) return;", print_job)
+ 
+     def test_changed_queue_is_not_discarded_when_an_older_print_finishes(self):
+         remember = self.template.split(
+--- /dev/null
++++ b/tests/conftest.py
+@@ -0,0 +1,8 @@
++"""Print tests must not launch daemon collectors against mocked subprocesses."""
++import pytest
++
++
++@pytest.fixture(autouse=True)
++def isolate_print_collectors(monkeypatch):
++    import app
++    monkeypatch.setattr(app, '_start_print_collector', lambda *_args: None)
+--- /dev/null
++++ b/tests/test_print_status.py
+@@ -0,0 +1,100 @@
++import io
++import json
++from collections import deque
++from pathlib import Path
++from unittest.mock import MagicMock, patch
++
++import app as labels_app
++
++JOB_ID = '12345678-1234-4123-8123-123456789abc'
++
++
++def make_job(tmp_path, code=0, output=None):
++    path = tmp_path / 'labels.pdf'
++    if output is not None:
++        path.write_bytes(output)
++    proc = MagicMock()
++    proc.stdout = io.StringIO('Generating 2 labels\nNo valid observations found.\n')
++    proc.wait.return_value = code
++    proc.poll.return_value = code
++    return {'proc': proc, 'output_path': str(path), 'filename': 'labels.pdf',
++            'started_time': 0, 'observation_count': 2,
++            'logs': deque(maxlen=1000), 'log_cursor': 0}
++
++
++def test_running_status_does_not_probe_or_offer_partial_file(tmp_path):
++    job = make_job(tmp_path, output=b'partial')
++    with patch.dict(labels_app._jobs, {JOB_ID: job}, clear=True):
++        response = labels_app.app.test_client().get('/labels/print_status', query_string={'job_id': JOB_ID})
++    assert response.status_code == 200
++    assert response.headers['Cache-Control'] == 'no-store'
++    assert response.get_json()['status'] == 'running'
++    assert 'download_url' not in response.get_json()
++
++
++def test_collector_publishes_a_finished_nonempty_file_without_a_stream(tmp_path):
++    job = make_job(tmp_path, output=b'%PDF finished')
++    with patch.dict(labels_app._jobs, {JOB_ID: job}, clear=True):
++        labels_app._collect_print_output(JOB_ID, job)
++        response = labels_app.app.test_client().get('/labels/print_status', query_string={'job_id': JOB_ID})
++    assert response.get_json()['status'] == 'completed'
++    assert response.get_json()['download_url'] == f'/labels/static/jobs/{JOB_ID}/labels.pdf'
++    assert len(job['logs']) == 2
++
++
++def test_exit_zero_without_output_explains_unusable_observations(tmp_path):
++    job = make_job(tmp_path)
++    with patch.object(labels_app, 'log_user_problem') as logged:
++        labels_app._collect_print_output(JOB_ID, job)
++    assert job['result']['status'] == 'failed'
++    assert 'observation IDs' in job['result']['error']
++    assert 'Process exited' not in job['result']['error']
++    assert logged.call_args.args[0] == 'label_generator_output_missing'
++
++
++def test_empty_output_is_a_failure(tmp_path):
++    job = make_job(tmp_path, output=b'')
++    with patch.object(labels_app, 'log_user_problem'):
++        labels_app._collect_print_output(JOB_ID, job)
++    assert not job['result']['success']
++
++
++def test_reconnecting_stream_replays_only_new_lines_and_retains_job(tmp_path):
++    job = make_job(tmp_path, output=b'%PDF')
++    labels_app._collect_print_output(JOB_ID, job)
++    with patch.dict(labels_app._jobs, {JOB_ID: job}, clear=True):
++        response = labels_app.app.test_client().get('/labels/print_stream', query_string={'job_id': JOB_ID}, headers={'Last-Event-ID': '1'})
++        body = response.get_data(as_text=True)
++    assert 'Generating 2 labels' not in body
++    assert 'No valid observations' in body
++    assert 'event: done' in body
++    job['proc'].terminate.assert_not_called()
++
++
++def test_disconnect_does_not_kill_generation(tmp_path):
++    job = make_job(tmp_path)
++    job['logs'].append((1, 'working'))
++    with patch.dict(labels_app._jobs, {JOB_ID: job}, clear=True):
++        response = labels_app.app.test_client().get('/labels/print_stream', query_string={'job_id': JOB_ID}, buffered=False)
++        next(iter(response.response))
++        response.close()
++    job['proc'].terminate.assert_not_called()
++    assert labels_app._open_streams[0] == 0
++
++
++def test_unknown_status_reports_a_terminal_error():
++    with patch.dict(labels_app._jobs, {}, clear=True):
++        response = labels_app.app.test_client().get('/labels/print_status', query_string={'job_id': JOB_ID})
++    assert response.status_code == 410
++    assert response.get_json()['status'] == 'failed'
++
++
++def test_real_unicode_field_names_survive_command_construction(tmp_path):
++    fields = ['+Odor — Macrofungi', '+Substrate — Fungi', '+Hábitat – hongos']
++    with patch.object(labels_app.subprocess, 'Popen', return_value=MagicMock()) as popen, patch.dict(labels_app._jobs, {}, clear=True):
++        response = labels_app.app.test_client().post('/labels/print_start', data={
++            'format': 'pdf', 'observations[]': ['123'], 'use_custom': 'on', 'custom_args[]': fields,
++        })
++    assert response.status_code == 200
++    cmd = popen.call_args.args[0]
++    assert cmd[cmd.index('--custom') + 1] == ', '.join(fields)
+--- /dev/null
++++ b/tests/test_print_browser.py
+@@ -0,0 +1,25 @@
++import json
++import subprocess
++from pathlib import Path
++
++
++def test_sse_and_polling_can_only_download_and_archive_once():
++    html = (Path(__file__).resolve().parents[1] / 'templates/index.html').read_text()
++    start = html.index('                let settled = false;')
++    end = html.index('                const pollStatus = async', start)
++    script = html[start:end]
++    harness = '''
++const vm = require('node:vm'), assert = require('node:assert/strict');
++let downloads = 0, archived = 0, closed = 0;
++const node = {html() {return this;}, removeClass() {return this;}, prop() {return this;}, text() {return this;}, append() {return this;}};
++const ctx = vm.createContext({
++ btn: node, originalText: 'Print', downloadName: 'labels.pdf', successMsg: 'ready',
++ $: () => node, clearTimeout() {}, es: {close() {closed++;}},
++ recordSuccessfulPrint() {archived++;}, showToast() {}, showErrorModal() {}, escapeHtml: x => x,
++ document: {createElement: () => ({click() {downloads++;}})},
++});
++vm.runInContext(SCRIPT, ctx);
++vm.runInContext("finishPrint({success: true, download_url: '/file.pdf'}); finishPrint({success: true, download_url: '/file.pdf'});", ctx);
++assert.equal(downloads, 1); assert.equal(archived, 1); assert.equal(closed, 1);
++'''.replace('SCRIPT', json.dumps(script))
++    subprocess.run(['node', '-e', harness], check=True, capture_output=True, text=True)
