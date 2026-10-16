@@ -2510,13 +2510,26 @@ def _append_fasta_to_job_input(job_dir, fasta_text: str, *,
                                               "sequence": seq["sequence"]})] = formatted_name
 
     if formatted_records:
+        # This path appends to a completed job after MycoMap's delayed NCBI
+        # results arrive, bypassing create-job validation. Validate the exact
+        # post-dedup file before the atomic replace so a late whole genome (or
+        # repeated additions that cross the cumulative ceiling) cannot enter a
+        # recompute.
+        from app.services.fasta_utils import (
+            check_fasta_size_limits,
+            parse_fasta_records,
+        )
+
+        combined_text = (
+            (existing_text.rstrip("\n") + "\n") if existing_text else ""
+        ) + "".join(formatted_records)
+        check_fasta_size_limits(parse_fasta_records(combined_text))
+
         mode = (input_path.stat().st_mode & 0o777) if input_path.exists() else default_file_mode()
         fd, temp_path = tempfile.mkstemp(dir=input_path.parent, prefix="input_raw.")
         try:
             with os.fdopen(fd, "w") as handle:
-                if existing_text:
-                    handle.write(existing_text.rstrip("\n") + "\n")
-                handle.write("".join(formatted_records))
+                handle.write(combined_text)
             os.chmod(temp_path, mode)
             os.replace(temp_path, input_path)
         finally:
@@ -2812,6 +2825,27 @@ def reconcile_delayed_ncbi_results(job_id: str) -> Dict[str, Any]:
                 if added_records:
                     _remember_reconciled_sequence_metadata(Config.JOB_DIR / job_id,
                                                            added_records)
+            except ValueError as exc:
+                # Size validation is a permanent refusal, not a transient write
+                # failure. A MycoMap.org recovery job may already have been
+                # scheduled above; clearing the fallback flag makes that job a
+                # harmless no-op instead of retrying the same genome hourly.
+                rerun_details["ncbi_status"] = "rejected"
+                rerun_details["ncbi_fallback_local_only"] = False
+                rerun_details["ncbi_recompute_pending"] = False
+                metrics["mycomap_blast_rerun"] = rerun_details
+                metrics["mycomap_refresh_warnings"] = _without_transient_ncbi_warnings(
+                    metrics.get("mycomap_refresh_warnings")
+                ) + [
+                    "MycoMap's NCBI results were not added: " + str(exc)
+                ]
+                db_job.metrics = metrics
+                db.session.commit()
+                logger.warning(
+                    "event=mycomap.ncbi_input_rejected job=%s blast_id=%s reason=%s",
+                    job_id, blast_id, exc,
+                )
+                return {"status": "input_rejected", "error": str(exc)}
             except Exception:
                 # The FASTA may have been written already. On the next check,
                 # matched records repair missing metadata and still recompute.

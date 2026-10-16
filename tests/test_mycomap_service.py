@@ -5,6 +5,7 @@ Tests URL validation logic without requiring network access.
 """
 
 import io
+import http.client
 import unittest
 from unittest.mock import patch
 
@@ -127,6 +128,72 @@ class TestMycomapCreationDiscoveryBackoff(unittest.TestCase):
 
 class TestMycomapBlastMetrics(unittest.TestCase):
     """Test local/MycoBLAST metric key parsing without network access."""
+
+    def test_metrics_page_retries_a_truncated_response_before_fallback(self):
+        html_page = b"""
+            <table>
+              <tr><th>Description</th><th>Query Cover</th><th>Per. Ident</th><th>Accession</th></tr>
+              <tr><td>Example fungus</td><td>99%</td><td>98.5%</td><td>OR807397</td></tr>
+            </table>
+        """
+        source_url = (
+            "https://mycomap.com/genetics/blast-search/"
+            "example-search-r12345/"
+        )
+
+        with (
+            patch(
+                "app.services.mycomap_service.diagnostic_urlopen",
+                side_effect=[
+                    http.client.IncompleteRead(b"<table>"),
+                    io.BytesIO(html_page),
+                ],
+            ) as urlopen,
+            patch("app.services.mycomap_service.time.sleep") as sleep,
+        ):
+            metrics = mycomap_service.fetch_mycomap_blast_metrics(
+                "12345", source_url=source_url,
+            )
+
+        self.assertEqual(metrics["OR807397"]["identity"], 98.5)
+        self.assertEqual(urlopen.call_count, 2)
+        self.assertEqual(
+            [call.args[0] for call in urlopen.call_args_list],
+            [source_url, source_url],
+        )
+        sleep.assert_called_once_with(
+            mycomap_service.BLAST_METRICS_RETRY_SECONDS
+        )
+
+    def test_metrics_page_does_not_retry_a_404_before_fallback(self):
+        html_page = b"""
+            <table>
+              <tr><th>Description</th><th>Query Cover</th><th>Per. Ident</th><th>Accession</th></tr>
+              <tr><td>Example fungus</td><td>99%</td><td>98.5%</td><td>OR807397</td></tr>
+            </table>
+        """
+        source_url = (
+            "https://mycomap.com/genetics/blast-search/"
+            "example-search-r12345/"
+        )
+        missing = mycomap_service.urllib.error.HTTPError(
+            source_url, 404, "not found", {}, None,
+        )
+
+        with (
+            patch(
+                "app.services.mycomap_service.diagnostic_urlopen",
+                side_effect=[missing, io.BytesIO(html_page)],
+            ) as urlopen,
+            patch("app.services.mycomap_service.time.sleep") as sleep,
+        ):
+            metrics = mycomap_service.fetch_mycomap_blast_metrics(
+                "12345", source_url=source_url,
+            )
+
+        self.assertIn("OR807397", metrics)
+        self.assertEqual(urlopen.call_count, 2)
+        sleep.assert_not_called()
 
     def test_metric_keys_include_local_observation_variants(self):
         """Local MycoMap labels should match FASTA headers and table labels."""

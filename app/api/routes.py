@@ -23,6 +23,7 @@ from app.services.security_utils import validate_job_id, validate_safe_file_path
 from app.services.job_id_service import generate_job_id
 from app.services.fasta_utils import (
     GENBANK_ACCESSION_RE,
+    check_fasta_size_limits,
     is_genbank_accession,
     is_insdc_master_accession,
 )
@@ -1183,6 +1184,17 @@ def _parse_fasta_sequences(text):
         })
     
     return sequences
+
+
+def _check_sequence_dict_size_limits(sequences) -> None:
+    """Apply the pipeline's shared size ceilings to route-shaped records."""
+    check_fasta_size_limits([
+        (
+            str(sequence.get("name") or "").strip(),
+            "".join(str(sequence.get("sequence") or "").split()),
+        )
+        for sequence in sequences or []
+    ])
 
 
 def _sequence_exact_key(seq):
@@ -6214,6 +6226,16 @@ def add_sequences_to_job(job_id):
                 }), 400
             return jsonify({"status": "error", "error": "No valid sequences found in input"}), 400
 
+        # The create-job path already applies these shared per-record, total-base
+        # and record-count ceilings. Adding to an existing tree writes straight
+        # to input_raw.fasta, so it must enforce the same boundary here rather
+        # than relying only on the looser per-request character/count checks.
+        try:
+            _check_sequence_dict_size_limits(sequences_to_add)
+        except ValueError as exc:
+            note_request_failure("added_sequences_too_large")
+            return jsonify({"status": "error", "error": str(exc)}), 400
+
         # 2. Sequence Count Limit
         MAX_SEQUENCES_TO_ADD = 500
         if len(sequences_to_add) > MAX_SEQUENCES_TO_ADD:
@@ -6297,6 +6319,7 @@ def add_sequences_to_job(job_id):
         existing_by_id = {}
         exact_headers = {}
         duplicate_records = []
+        existing_seqs = []
         if input_path.exists():
             try:
                 existing_seqs = _parse_fasta_sequences(input_path.read_text())
@@ -6325,37 +6348,53 @@ def add_sequences_to_job(job_id):
         added_count = 0
         duplicate_count = 0
         added_headers = []
-        with open(input_path, "a") as f:
-            # Ensure newline at end of file before appending
-            if input_path.stat().st_size > 0:
-                f.write("\n")
+        records_to_append = []
+        for seq in sequences_to_add:
+            exact_key = _sequence_exact_key(seq)
+            if exact_key in existing_records:
+                duplicate_count += 1
+                duplicate_records.append(_describe_skipped_duplicate(
+                    seq, exact_headers.get(exact_key), 'exact_duplicate'))
+                continue
+            record_id, record_sequence = _record_identity(seq)
+            matched = _find_duplicate_record(record_id, record_sequence, existing_by_id)
+            if matched:
+                duplicate_count += 1
+                duplicate_records.append(_describe_skipped_duplicate(
+                    seq, matched, 'same_record_refetched'))
+                continue
+            record_text = _format_fasta_record_for_job(
+                seq, existing_ids, added_count + 1
+            )
+            record_header = _fasta_record_header(record_text)
+            records_to_append.append(record_text)
+            added_headers.append(record_header)
+            existing_records.add(exact_key)
+            entry = {
+                "header": str(seq.get('name') or ''),
+                "identifier": record_id,
+                "sequence": record_sequence,
+            }
+            existing_by_id.setdefault(record_id, []).append(entry)
+            exact_headers[exact_key] = entry
+            added_count += 1
 
-            for seq in sequences_to_add:
-                exact_key = _sequence_exact_key(seq)
-                if exact_key in existing_records:
-                    duplicate_count += 1
-                    duplicate_records.append(_describe_skipped_duplicate(
-                        seq, exact_headers.get(exact_key), 'exact_duplicate'))
-                    continue
-                record_id, record_sequence = _record_identity(seq)
-                matched = _find_duplicate_record(record_id, record_sequence, existing_by_id)
-                if matched:
-                    duplicate_count += 1
-                    duplicate_records.append(_describe_skipped_duplicate(
-                        seq, matched, 'same_record_refetched'))
-                    continue
-                record_text = _format_fasta_record_for_job(seq, existing_ids, added_count + 1)
-                f.write(record_text)
-                added_headers.append(_fasta_record_header(record_text))
-                existing_records.add(exact_key)
-                entry = {
-                    "header": str(seq.get('name') or ''),
-                    "identifier": record_id,
-                    "sequence": record_sequence,
-                }
-                existing_by_id.setdefault(record_id, []).append(entry)
-                exact_headers[exact_key] = entry
-                added_count += 1
+        if records_to_append:
+            # Check the actual post-dedup sequence set before writing. This closes
+            # the cumulative bypass where several individually-small requests
+            # could grow one job beyond the normal submission-wide ceiling.
+            appended = _parse_fasta_sequences("".join(records_to_append))
+            try:
+                _check_sequence_dict_size_limits(existing_seqs + appended)
+            except ValueError as exc:
+                note_request_failure("added_sequences_too_large")
+                return jsonify({"status": "error", "error": str(exc)}), 400
+
+            with open(input_path, "a") as f:
+                # Ensure newline at end of file before appending.
+                if input_path.stat().st_size > 0:
+                    f.write("\n")
+                f.write("".join(records_to_append))
 
         _record_headers_added_after_orient(job_dir, added_headers)
         _merge_queue_duplicate_details(job_dir, duplicate_records)

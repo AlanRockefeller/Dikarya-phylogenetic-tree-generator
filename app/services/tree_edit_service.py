@@ -1748,6 +1748,77 @@ def _structure_split_for_stable_id(structure: Any, stable_id: str
     return None
 
 
+_LEGACY_INTERNAL_ROOT_RE = re.compile(
+    r"^Node_\d+_\d+(?:\.\d+)?(?:/\d+(?:\.\d+)?)?$"
+)
+
+
+def _is_legacy_internal_root_target(target: Any) -> bool:
+    """Whether ``target`` is an internal-node label made by the old viewer."""
+    return bool(
+        isinstance(target, str) and _LEGACY_INTERNAL_ROOT_RE.fullmatch(target)
+    )
+
+
+def _structure_split_for_legacy_root(
+    structure: Any, legacy_target: str
+) -> Optional[Tuple[Set[str], Set[str]]]:
+    """Recover the branch selected by a pre-stable-ID viewer root target.
+
+    The old phylotree client addressed internal nodes with transient labels such
+    as ``Node_395_1.0``.  Those labels never entered the Newick, so BioPython
+    cannot find them after a recompute.  The saved tree structure does still
+    contain either the labelled node or (for older state shapes) the already
+    rerooted two-way root split.  Either representation is enough to preserve
+    the branch by its descendant tips.
+    """
+    if not isinstance(structure, dict) or not _is_legacy_internal_root_target(
+        legacy_target
+    ):
+        return None
+
+    def leaves(node: Any) -> Set[str]:
+        names: Set[str] = set()
+        stack = [node]
+        while stack:
+            current = stack.pop()
+            if not isinstance(current, dict):
+                continue
+            children = current.get("children") or []
+            if children:
+                stack.extend(children)
+            else:
+                name = current.get("original_name") or current.get("name")
+                if name:
+                    names.add(name)
+        return names
+
+    all_tips = leaves(structure)
+    stack = [structure]
+    while stack:
+        node = stack.pop()
+        if not isinstance(node, dict):
+            continue
+        children = node.get("children") or []
+        if children and (
+            node.get("name") == legacy_target
+            or node.get("original_name") == legacy_target
+        ):
+            inside = leaves(node)
+            return (inside, all_tips) if inside and inside != all_tips else None
+        stack.extend(children)
+
+    # Some old state snapshots discarded generated internal labels. A manual
+    # internal reroot still leaves its selected branch as one side of a binary
+    # root, so either child recovers the same unrooted split.
+    root_children = structure.get("children") or []
+    if len(root_children) == 2:
+        inside = leaves(root_children[0])
+        if inside and inside != all_tips:
+            return inside, all_tips
+    return None
+
+
 def _translate_internal_root_target(job_dir: Path, tree_json: Dict[str, Any],
                                     previous_target: str,
                                     old_split: Optional[Tuple[Set[str], Set[str]]]
@@ -1765,12 +1836,20 @@ def _translate_internal_root_target(job_dir: Path, tree_json: Dict[str, Any],
     original target unchanged when there is nothing sound to translate to --
     reroot_tree() then fails exactly as before and the caller degrades.
     """
-    if not previous_target.startswith("internal:") or not old_split:
+    stable_target = previous_target.startswith("internal:")
+    legacy_target = _is_legacy_internal_root_target(previous_target)
+    if not (stable_target or legacy_target) or not old_split:
         return previous_target
     tree = _read_editable_tree(job_dir, tree_json, "reroot")
-    for clade in tree.find_clades(order="preorder"):
-        if (len(getattr(clade, "clades", None) or []) >= 2
-                and _stable_internal_node_id(clade) == previous_target):
+    if stable_target:
+        for clade in tree.find_clades(order="preorder"):
+            if (len(getattr(clade, "clades", None) or []) >= 2
+                    and _stable_internal_node_id(clade) == previous_target):
+                return previous_target
+    else:
+        # A legacy label can survive in hand-authored Newick. Prefer the exact
+        # match (including a real tip with that unusual name) over translation.
+        if any(clade.name == previous_target for clade in tree.find_clades()):
             return previous_target
 
     old_inside, old_all = old_split
@@ -1958,13 +2037,25 @@ def commit_recompute_tree_state(job_dir: Path,
         # one: the internal-node ID alone cannot be found again in a recomputed
         # tree whose tip set changed (see _translate_internal_root_target).
         previous_split = None
-        if isinstance(previous_target, str) and previous_target.startswith("internal:"):
-            previous_split = (
-                _structure_split_for_stable_id(state.get("tree_structure"), previous_target)
-                or _structure_split_for_stable_id(
-                    initial_state.get("tree_structure"), previous_target
+        if isinstance(previous_target, str):
+            if previous_target.startswith("internal:"):
+                previous_split = (
+                    _structure_split_for_stable_id(
+                        state.get("tree_structure"), previous_target
+                    )
+                    or _structure_split_for_stable_id(
+                        initial_state.get("tree_structure"), previous_target
+                    )
                 )
-            )
+            elif _is_legacy_internal_root_target(previous_target):
+                previous_split = (
+                    _structure_split_for_legacy_root(
+                        state.get("tree_structure"), previous_target
+                    )
+                    or _structure_split_for_legacy_root(
+                        initial_state.get("tree_structure"), previous_target
+                    )
+                )
 
         state["current_tree"] = "pruned"
         structure = copy.deepcopy(new_structure)
