@@ -176,9 +176,17 @@ document.addEventListener('DOMContentLoaded', async () => {
 
     function updateUndoButton() {
         const target = currentUndoTarget();
-        const disabled = !target || isProcessing;
+        // A transient state read can leave the server checkpoint unknown after
+        // its bounded automatic retries. Keep Undo as an explicit retry affordance,
+        // but do not turn that unknown state into an undoable target.
+        const canRetryState = !target && undoStateNeedsRefresh;
+        const disabled = (!target && !canRetryState) || isProcessing;
         // Alan 8/28/26 - Mirror the established Undo state onto the coarse-pointer toolbar button.
-        const title = target ? `Undo ${target.label} (Ctrl/Cmd+Z)` : "Nothing to undo yet (Ctrl/Cmd+Z)";
+        const title = target
+            ? `Undo ${target.label} (Ctrl/Cmd+Z)`
+            : canRetryState
+                ? "Could not check Undo availability. Click to retry (Ctrl/Cmd+Z)"
+                : "Nothing to undo yet (Ctrl/Cmd+Z)";
         [btnUndo, btnMobileUndo].forEach((button) => {
             if (!button) return;
             button.disabled = disabled;
@@ -194,6 +202,7 @@ document.addEventListener('DOMContentLoaded', async () => {
         const requestNumber = ++undoStateRequest;
         clearTimeout(undoStateRetryTimer);
         undoStateNeedsRefresh = false;
+        updateUndoButton();
         if (JOB_ID === 'unknown') { serverUndoState = null; updateUndoButton(); return; }
         try {
             const state = await TreeEditActions.getUndoState(JOB_ID);
@@ -4883,7 +4892,7 @@ document.addEventListener('DOMContentLoaded', async () => {
                 // Mid-edit the tree is about to be replaced; taking an undo now would
                 // race the mutation that is still running.
                 if (isProcessing) return;
-                if (!currentUndoTarget()) return;
+                if (!currentUndoTarget() && !undoStateNeedsRefresh) return;
                 e.preventDefault();
                 performUndo();
                 return;

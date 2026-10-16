@@ -1358,7 +1358,8 @@
         const target = e.target;
         const isFormControl = target
             && (target.isContentEditable || ['INPUT', 'TEXTAREA', 'SELECT'].includes(target.tagName));
-        const isPlainA = key === 'a' && !e.ctrlKey && !e.metaKey && !e.altKey && !isFormControl;
+        const isPlainA = key === 'a' && !e.repeat
+            && !e.ctrlKey && !e.metaKey && !e.altKey && !isFormControl;
         if (key !== 'Escape' && !isPlainA) return;
         e.preventDefault();
         e.stopImmediatePropagation();

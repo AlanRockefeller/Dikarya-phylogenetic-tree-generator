@@ -23,7 +23,8 @@ async function undoTests() {
     let calls = 0;
     const u = undoContext(async () => {if (++calls === 1) throw new TypeError('offline'); return {can_undo: true};});
     await u.refresh();
-    assert.equal(u.button.disabled, true);
+    assert.equal(u.button.disabled, false);
+    assert.equal(vm.runInContext('currentUndoTarget()', u.context), null);
     const [id, timer] = [...u.timers][0]; u.timers.delete(id);
     await timer.fn();
     assert.equal(u.button.disabled, false);
@@ -40,10 +41,20 @@ async function undoTests() {
     await reconnect.refresh(); assert.equal(reconnect.timers.size, 0);
     offline = false; reconnect.context.document.hidden = false;
     reconnect.events.visibilitychange(); await flush(); assert.equal(reconnect.button.disabled, false);
-    const bounded = undoContext(async () => {throw new TypeError('offline');});
+    let boundedCalls = 0;
+    const bounded = undoContext(async () => {
+        if (++boundedCalls <= 4) throw new TypeError('offline');
+        return {can_undo: true};
+    });
     await bounded.refresh();
     for (let n = 0; n < 3; n++) {const [id, timer] = [...bounded.timers][0]; bounded.timers.delete(id); await timer.fn();}
     assert.equal(bounded.timers.size, 0);
+    assert.equal(bounded.button.disabled, false);
+    assert.match(bounded.button.title, /retry/i);
+    assert.equal(vm.runInContext('currentUndoTarget()', bounded.context), null);
+    await bounded.refresh();
+    assert.equal(bounded.button.disabled, false);
+    assert.equal(vm.runInContext('currentUndoTarget().kind', bounded.context), 'server');
 }
 async function pollTests() {
     const html = fs.readFileSync('app/templates/sequence_entry.html', 'utf8');
