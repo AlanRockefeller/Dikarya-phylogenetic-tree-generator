@@ -2168,6 +2168,29 @@ def resolve_tree_generation_context(
         run_details.append("Limited IQ-TREE --fast search (NNI search over two initial trees)")
     if metadata.get("seed") is not None:
         run_details.append(f"Random seed: {metadata.get('seed')}")
+    if method == "raxml" and support_type == "bootstrap":
+        from app.services.raxml_validator import (
+            LEGACY_BOOTSTRAP_CUTOFF,
+            bootstrap_cutoff_label,
+        )
+
+        if "bootstrap_cutoff" not in metadata:
+            # Every RAxML job before the setting existed ran RAxML-NG's default.
+            run_details.append(
+                f"AutoMRE convergence cutoff: {LEGACY_BOOTSTRAP_CUTOFF:g} (RAxML-NG default)"
+            )
+        elif metadata.get("bootstrap_cutoff") is not None:
+            run_details.append(
+                "AutoMRE convergence cutoff: "
+                + bootstrap_cutoff_label(metadata["bootstrap_cutoff"])
+            )
+    identical = metadata.get("identical_sequences")
+    if isinstance(identical, dict) and identical.get("removed"):
+        run_details.append(
+            f"{int(identical['removed']):,} sequences identical to another were left out "
+            "of the tree search and added back beside their twin (zero-length "
+            "branches, no support value)"
+        )
     if method == "mrbayes":
         completed = metadata.get("mcmc_generations_completed")
         maximum = metadata.get("mcmc_max_generations") or metadata.get("mcmc_generations")

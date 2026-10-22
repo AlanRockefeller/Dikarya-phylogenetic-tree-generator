@@ -1,4 +1,4 @@
-from flask import current_app, g, jsonify, request, send_file, url_for
+from flask import current_app, g, jsonify, redirect, request, send_file, url_for
 from flask_login import current_user
 from app.api import bp
 from app.workers.queue import (
@@ -23,6 +23,7 @@ from app.services.security_utils import validate_job_id, validate_safe_file_path
 from app.services.job_id_service import generate_job_id
 from app.services.fasta_utils import (
     GENBANK_ACCESSION_RE,
+    check_fasta_size_limits,
     is_genbank_accession,
     is_insdc_master_accession,
 )
@@ -166,9 +167,9 @@ RECOMPUTE_OVERRIDABLE_FIELDS = frozenset({
     "bootstrap", "alrt_replicates",
     "mcmc_generations", "mcmc_nruns", "mcmc_nchains", "mcmc_burnin_fraction",
     "mcmc_stop_early",
-    "run_preset", "bootstrap_preset", "bootstrap_cap", "enable_bootstrap",
-    "start_tree_override", "moose_enabled", "early_stopping", "seed",
-    "outgroup", "notes",
+    "run_preset", "bootstrap_preset", "bootstrap_cap", "bootstrap_cutoff",
+    "enable_bootstrap", "start_tree_override", "moose_enabled",
+    "early_stopping", "seed", "outgroup", "notes",
 })
 
 # The overridable settings that are booleans. JSON clients send these as
@@ -278,6 +279,12 @@ def _normalize_sequence_metadata(raw_items):
             mo_sequence_id = 0
         if mo_sequence_id > 0:
             row["mushroom_observer_sequence_id"] = mo_sequence_id
+        try:
+            mycomap_sequence_id = int(raw.get("mycomap_sequence_id") or 0)
+        except (TypeError, ValueError):
+            mycomap_sequence_id = 0
+        if mycomap_sequence_id > 0:
+            row["mycomap_sequence_id"] = mycomap_sequence_id
         row["blast_metrics_available"] = bool(raw.get("blast_metrics_available")) or any(
             row[field] is not None
             for field in ("identity", "query_cover", "subject_cover")
@@ -1179,6 +1186,17 @@ def _parse_fasta_sequences(text):
     return sequences
 
 
+def _check_sequence_dict_size_limits(sequences) -> None:
+    """Apply the pipeline's shared size ceilings to route-shaped records."""
+    check_fasta_size_limits([
+        (
+            str(sequence.get("name") or "").strip(),
+            "".join(str(sequence.get("sequence") or "").split()),
+        )
+        for sequence in sequences or []
+    ])
+
+
 def _sequence_exact_key(seq):
     header = (seq.get('name') or '').strip()
     sequence = ''.join(str(seq.get('sequence') or '').split())
@@ -1470,7 +1488,7 @@ def _run_in_background_if_asked(kind, handler, data):
 
 
 @bp.get('/background/<task_id>')
-@limiter.limit("120 per minute")
+@limiter.limit("600 per minute")
 def background_request_status(task_id):
     """Poll a request started with X-Dikarya-Background.
 
@@ -3103,6 +3121,7 @@ def create_job():
         "run_preset": data.get("run_preset", "fast_good"),
         "bootstrap_preset": data.get("bootstrap_preset", "standard"),
         "bootstrap_cap": data.get("bootstrap_cap"),
+        "bootstrap_cutoff": data.get("bootstrap_cutoff"),
         "enable_bootstrap": data.get("enable_bootstrap", True),
         "start_tree_override": data.get("start_tree_override"),
         "moose_enabled": data.get("moose_enabled", False),
@@ -3131,6 +3150,7 @@ def create_job():
             # overwrite with safe values to ensure what is stored/shown matches execution
             job_params.update({
                 "bootstrap_cap": resolved.bootstrap_cap,
+                "bootstrap_cutoff": resolved.bootstrap_cutoff,
                 "enable_bootstrap": resolved.enable_bootstrap,
                 "seed": resolved.seed,
                 "outgroup": resolved.outgroup,
@@ -3142,6 +3162,9 @@ def create_job():
             if resolved.warnings:
                 job_params['validation_warnings'] = resolved.warnings
                 
+        except ValueError as e:
+            note_request_failure("invalid_outgroup")
+            return jsonify({"status": "error", "error": str(e)}), 400
         except Exception as e:
             logger.error(f"Validation error: {e}")
             # Continue but verify in worker
@@ -3233,6 +3256,18 @@ def create_job():
         except ValueError as e:
             note_request_failure("invalid_dna_fasta")
             return jsonify({"status": "error", "error": str(e)}), 400
+        if tree_method == 'raxml' and job_params.get('outgroup'):
+            try:
+                from app.services.fasta_utils import parse_fasta_records
+                from app.services.raxml_validator import resolve_outgroup_id
+                resolve_outgroup_id(job_params['outgroup'], {
+                    str(i): header for i, (header, _seq) in enumerate(
+                        parse_fasta_records(job_params['sequence'])
+                    )
+                })
+            except ValueError as e:
+                note_request_failure("invalid_outgroup")
+                return jsonify({"status": "error", "error": str(e)}), 400
 
     # Quick Tree's per-sequence ceiling, enforced here as well as in the
     # browser so a request built by hand cannot put a 150 kb genome through
@@ -3561,6 +3596,31 @@ def refresh_tree_mycomap_records(job_id):
         return jsonify({"status": "error", "error": str(exc)}), 502
     except Exception as exc:
         return _server_error(exc, where="refresh_tree_mycomap_records")
+
+
+@bp.route('/job/<job_id>/tree/mycomap-sequence', methods=['GET'])
+@limiter.limit("20 per minute; 200 per hour")
+def open_tree_mycomap_sequence(job_id):
+    """Redirect one saved MycoMap-local tree tip to its exact public record."""
+    _, error_msg, status_code = check_job_access(job_id)
+    if error_msg:
+        return jsonify({"status": "error", "error": error_msg}), status_code
+
+    tip_name = str(request.args.get("tip_name") or "").strip()
+    if (not tip_name or len(tip_name) > 1000
+            or any(ord(char) < 32 or ord(char) == 127 for char in tip_name)):
+        return jsonify({"status": "error", "error": "Invalid tree tip name."}), 422
+
+    from app.services.mycomap_sequence_link_service import (
+        MycoMapSequenceLinkError,
+        resolve_job_tip_url,
+    )
+    try:
+        return redirect(resolve_job_tip_url(Config.JOB_DIR / job_id, tip_name), code=302)
+    except MycoMapSequenceLinkError as exc:
+        return jsonify({"status": "error", "error": str(exc)}), exc.status
+    except Exception as exc:
+        return _server_error(exc, where="open_tree_mycomap_sequence")
 
 @bp.route('/job/<job_id>/tree/undo', methods=['GET'])
 def get_tree_undo_state(job_id):
@@ -6166,6 +6226,16 @@ def add_sequences_to_job(job_id):
                 }), 400
             return jsonify({"status": "error", "error": "No valid sequences found in input"}), 400
 
+        # The create-job path already applies these shared per-record, total-base
+        # and record-count ceilings. Adding to an existing tree writes straight
+        # to input_raw.fasta, so it must enforce the same boundary here rather
+        # than relying only on the looser per-request character/count checks.
+        try:
+            _check_sequence_dict_size_limits(sequences_to_add)
+        except ValueError as exc:
+            note_request_failure("added_sequences_too_large")
+            return jsonify({"status": "error", "error": str(exc)}), 400
+
         # 2. Sequence Count Limit
         MAX_SEQUENCES_TO_ADD = 500
         if len(sequences_to_add) > MAX_SEQUENCES_TO_ADD:
@@ -6249,6 +6319,7 @@ def add_sequences_to_job(job_id):
         existing_by_id = {}
         exact_headers = {}
         duplicate_records = []
+        existing_seqs = []
         if input_path.exists():
             try:
                 existing_seqs = _parse_fasta_sequences(input_path.read_text())
@@ -6277,37 +6348,53 @@ def add_sequences_to_job(job_id):
         added_count = 0
         duplicate_count = 0
         added_headers = []
-        with open(input_path, "a") as f:
-            # Ensure newline at end of file before appending
-            if input_path.stat().st_size > 0:
-                f.write("\n")
+        records_to_append = []
+        for seq in sequences_to_add:
+            exact_key = _sequence_exact_key(seq)
+            if exact_key in existing_records:
+                duplicate_count += 1
+                duplicate_records.append(_describe_skipped_duplicate(
+                    seq, exact_headers.get(exact_key), 'exact_duplicate'))
+                continue
+            record_id, record_sequence = _record_identity(seq)
+            matched = _find_duplicate_record(record_id, record_sequence, existing_by_id)
+            if matched:
+                duplicate_count += 1
+                duplicate_records.append(_describe_skipped_duplicate(
+                    seq, matched, 'same_record_refetched'))
+                continue
+            record_text = _format_fasta_record_for_job(
+                seq, existing_ids, added_count + 1
+            )
+            record_header = _fasta_record_header(record_text)
+            records_to_append.append(record_text)
+            added_headers.append(record_header)
+            existing_records.add(exact_key)
+            entry = {
+                "header": str(seq.get('name') or ''),
+                "identifier": record_id,
+                "sequence": record_sequence,
+            }
+            existing_by_id.setdefault(record_id, []).append(entry)
+            exact_headers[exact_key] = entry
+            added_count += 1
 
-            for seq in sequences_to_add:
-                exact_key = _sequence_exact_key(seq)
-                if exact_key in existing_records:
-                    duplicate_count += 1
-                    duplicate_records.append(_describe_skipped_duplicate(
-                        seq, exact_headers.get(exact_key), 'exact_duplicate'))
-                    continue
-                record_id, record_sequence = _record_identity(seq)
-                matched = _find_duplicate_record(record_id, record_sequence, existing_by_id)
-                if matched:
-                    duplicate_count += 1
-                    duplicate_records.append(_describe_skipped_duplicate(
-                        seq, matched, 'same_record_refetched'))
-                    continue
-                record_text = _format_fasta_record_for_job(seq, existing_ids, added_count + 1)
-                f.write(record_text)
-                added_headers.append(_fasta_record_header(record_text))
-                existing_records.add(exact_key)
-                entry = {
-                    "header": str(seq.get('name') or ''),
-                    "identifier": record_id,
-                    "sequence": record_sequence,
-                }
-                existing_by_id.setdefault(record_id, []).append(entry)
-                exact_headers[exact_key] = entry
-                added_count += 1
+        if records_to_append:
+            # Check the actual post-dedup sequence set before writing. This closes
+            # the cumulative bypass where several individually-small requests
+            # could grow one job beyond the normal submission-wide ceiling.
+            appended = _parse_fasta_sequences("".join(records_to_append))
+            try:
+                _check_sequence_dict_size_limits(existing_seqs + appended)
+            except ValueError as exc:
+                note_request_failure("added_sequences_too_large")
+                return jsonify({"status": "error", "error": str(exc)}), 400
+
+            with open(input_path, "a") as f:
+                # Ensure newline at end of file before appending.
+                if input_path.stat().st_size > 0:
+                    f.write("\n")
+                f.write("".join(records_to_append))
 
         _record_headers_added_after_orient(job_dir, added_headers)
         _merge_queue_duplicate_details(job_dir, duplicate_records)

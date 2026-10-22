@@ -498,5 +498,68 @@ class TestBuilderRootKeepsPrunes(unittest.TestCase):
             self.assertEqual(set(_json_tip_names(state["tree_structure"])), {"C", "D", "F"})
 
 
+@unittest.skipUnless(HAS_BIOPYTHON, "requires BioPython")
+class TestLegacyInternalRootTranslation(unittest.TestCase):
+    def test_recompute_translates_old_node_label_by_its_saved_tip_split(self):
+        """A pre-stable-ID ``Node_*`` root survives a changed tip set."""
+        old_structure = {
+            "name": None,
+            "original_name": None,
+            "children": [
+                {
+                    "name": "Node_395_1.0",
+                    "original_name": "Node_395_1.0",
+                    "children": [
+                        {"name": "A", "original_name": "A"},
+                        {"name": "B", "original_name": "B"},
+                    ],
+                },
+                {
+                    "name": None,
+                    "original_name": None,
+                    "children": [
+                        {"name": "C", "original_name": "C"},
+                        {"name": "D", "original_name": "D"},
+                    ],
+                },
+            ],
+        }
+        old_state = {
+            "root": "Node_395_1.0",
+            "root_mode": "tip",
+            "root_target": "Node_395_1.0",
+            "tree_structure": old_structure,
+            "pruned_taxa": [],
+            "renames": {},
+        }
+
+        with tempfile.TemporaryDirectory() as d:
+            job_dir = Path(d)
+            # E joined the old A/B side, so its former descendant hash cannot
+            # identify the branch even if this had already used stable IDs.
+            _write_pruned_tree(
+                job_dir, "(((A:1,B:1,E:1):1,C:1):1,D:1);\n"
+            )
+            new_structure = parse_newick_to_json(
+                job_dir / "tree" / "tree_pruned.newick"
+            )
+            (job_dir / "tree_state.json").write_text(json.dumps(old_state))
+
+            state = commit_recompute_tree_state(
+                job_dir, new_structure, initial_state=old_state,
+            )
+
+        self.assertEqual(state["root_mode"], "manual")
+        self.assertEqual(
+            state["root_target"],
+            _stable_internal_node_id_from_names(["A", "B", "E"]),
+        )
+        self.assertNotEqual(state["root_target"], "Node_395_1.0")
+        self.assertEqual(
+            set(_json_tip_names(state["tree_structure"])),
+            {"A", "B", "C", "D", "E"},
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

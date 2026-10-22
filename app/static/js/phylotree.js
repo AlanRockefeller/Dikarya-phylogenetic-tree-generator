@@ -11033,6 +11033,38 @@
     return null;
   }
 
+  // Alan 10/16/26 - A local MycoMap hit may have only an observation number in
+  // its label. Offer its exact sequence page only when the saved provenance says
+  // this tip came from MycoMap's local database; the server resolves old jobs by
+  // matching their DNA and redirects new jobs by their saved sequence ID.
+  function extractMycomapSequenceTarget(node, sequenceMetadata, jobId) {
+    const normalized = getRecordLabelText(node);
+    if (!normalized) return null;
+    const normalize = value => String(value || "")
+      .replace(/^_R_/, "")
+      .replace(/\s+/g, " ")
+      .trim();
+    const records = Array.isArray(sequenceMetadata)
+      ? sequenceMetadata
+      : (Array.isArray(window.SEQUENCE_METRICS) ? window.SEQUENCE_METRICS : []);
+    const record = records.find(item => {
+      const hitSource = String(item?.hit_source || "").toLowerCase();
+      return item &&
+        String(item.source || "").toLowerCase() === "mycomap" &&
+        ["local", "sequence_record"].includes(hitSource) &&
+        [item.fasta_header, item.name].some(name => normalize(name) === normalized);
+    });
+    const resolvedJobId = jobId === undefined ? window.JOB_ID : jobId;
+    if (!record || !resolvedJobId) return null;
+    return {
+      kind: "mycomap-sequence",
+      label: "Open sequence in MycoMap",
+      urls: {
+        primary: `/api/job/${encodeURIComponent(String(resolvedJobId))}/tree/mycomap-sequence?tip_name=${encodeURIComponent(normalized)}`
+      }
+    };
+  }
+
   // Alan 5/12/26 - Resolve record targets from node labels so the menu can jump to the source record.
   function extractRecordTarget(node) {
     // Alan 6/25/26 - Reuse normalized labels so iNaturalist links and clipboard copies recognize the same formats.
@@ -11101,7 +11133,8 @@
   // Alan 7/16/26 - Keep a tip's GenBank/MycoMap actions when its label also contains an observation record.
   function extractRecordTargets(node) {
     const primaryTarget = extractRecordTarget(node);
-    if (!primaryTarget) return [];
+    const mycomapTarget = extractMycomapSequenceTarget(node);
+    if (!primaryTarget) return mycomapTarget ? [mycomapTarget] : [];
     if (primaryTarget.kind === "genbank") return [primaryTarget];
 
     const genbankTarget = extractGenBankRecordTarget(node);
@@ -11114,9 +11147,9 @@
       genbankTarget &&
       genbankTarget.id.toUpperCase() === `MO${primaryTarget.id}`.toUpperCase()
     ) {
-      return [primaryTarget];
+      return mycomapTarget ? [primaryTarget, mycomapTarget] : [primaryTarget];
     }
-    return genbankTarget ? [primaryTarget, genbankTarget] : [primaryTarget];
+    return [primaryTarget, mycomapTarget, genbankTarget].filter(Boolean);
   }
 
   // Alan 7/16/26 - Preserve clicked-tip sequence links while retaining bulk actions for selected observations.
@@ -15107,6 +15140,8 @@
   exports.extractINaturalistObservationNumber = extractINaturalistObservationNumber;
   // Alan 7/16/26 - Export cross-platform observation parsing for Mycomap record refresh actions.
   exports.extractObservationRecordReference = extractObservationRecordReference;
+  // Alan 10/16/26 - Exported for the invariant harness that pins local-source gating.
+  exports.extractMycomapSequenceTarget = extractMycomapSequenceTarget;
   exports.fitRootToTip = fitRootToTip;
   exports.getDistanceMatrix = getDistanceMatrix;
   exports.getNewick = getNewick;

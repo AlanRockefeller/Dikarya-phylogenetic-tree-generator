@@ -1623,20 +1623,29 @@ class AnnotationRenderDecisionTests(_RenderHarnessMixin, unittest.TestCase):
         self.assertIsNone(out["selectedClade"])
 
     def test_zero_length_polytomy_tips_are_grouped_automatically(self):
+        # Long tree searches now omit identical sequences and re-add them as a
+        # zero-length polytomy below the kept tip's original branch. Model that
+        # positive outer stem explicitly: the viewer deliberately does not
+        # contract through the tree's root, because doing so can mix a
+        # zero-stem outgroup into the ingroup.
         tree = {
             "children": [
                 {"children": [
-                    {"id": "A", "length": 6e-9},
-                    {"id": "X", "length": 0.01},
-                ], "length": 6e-9},
-                {"children": [
-                    {"id": "B", "length": 6e-9},
-                    {"id": "C", "length": 6e-9},
-                ], "length": 6e-9},
+                    {"children": [
+                        {"id": "A", "length": 6e-9},
+                        {"id": "X", "length": 0.01},
+                    ], "length": 6e-9},
+                    {"children": [
+                        {"id": "B", "length": 6e-9},
+                        {"id": "C", "length": 6e-9},
+                    ], "length": 6e-9},
+                ], "length": 0.02},
+                {"id": "outgroup", "length": 0.03},
             ]
         }
         out = self._resolve(
-            [], tree=tree, tip_order=["A", "X", "B", "C"], auto_group=True,
+            [], tree=tree,
+            tip_order=["A", "X", "B", "C", "outgroup"], auto_group=True,
         )
         order = out["groupedTipOrder"]
         selected_indices = sorted(order.index(name) for name in ("A", "B", "C"))
@@ -1646,27 +1655,34 @@ class AnnotationRenderDecisionTests(_RenderHarnessMixin, unittest.TestCase):
         # IQ-TREE 3 writes an optimized zero as 0.000001. Keep those unresolved tips
         # together even when multiple positive-length side branches split their Newick
         # order. Rotations alone cannot make A/B/C contiguous in this topology; the
-        # near-zero internal edges have to be contracted for display.
+        # near-zero internal edges have to be contracted for display. As in a
+        # duplicate-collapse expansion, this component sits below a real outer
+        # branch rather than spanning the root split.
         tree = {
             "children": [
                 {"children": [
-                    {"id": "A", "length": 1e-6},
-                    {"id": "X", "length": 0.003},
-                ], "length": 1e-6},
-                {"children": [
                     {"children": [
-                        {"id": "B", "length": 1e-6},
-                        {"id": "Y", "length": 0.004},
+                        {"id": "A", "length": 1e-6},
+                        {"id": "X", "length": 0.003},
                     ], "length": 1e-6},
                     {"children": [
-                        {"id": "C", "length": 1e-6},
-                        {"id": "Z", "length": 0.005},
+                        {"children": [
+                            {"id": "B", "length": 1e-6},
+                            {"id": "Y", "length": 0.004},
+                        ], "length": 1e-6},
+                        {"children": [
+                            {"id": "C", "length": 1e-6},
+                            {"id": "Z", "length": 0.005},
+                        ], "length": 1e-6},
                     ], "length": 1e-6},
-                ], "length": 1e-6},
+                ], "length": 0.02},
+                {"id": "outgroup", "length": 0.03},
             ]
         }
         out = self._resolve(
-            [], tree=tree, tip_order=["A", "X", "B", "Y", "C", "Z"], auto_group=True,
+            [], tree=tree,
+            tip_order=["A", "X", "B", "Y", "C", "Z", "outgroup"],
+            auto_group=True,
         )
         order = out["groupedTipOrder"]
         unresolved_indices = sorted(order.index(name) for name in ("A", "B", "C"))

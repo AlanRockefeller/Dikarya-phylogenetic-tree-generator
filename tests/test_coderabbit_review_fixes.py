@@ -267,6 +267,17 @@ class AlignmentSplitterAriaTests(unittest.TestCase):
         self.assertIn("String(width)", helper)
 
 
+class AlignmentViewerKeyboardTests(unittest.TestCase):
+    """Holding A opens the viewer once; a repeat must not close it again."""
+
+    def test_the_close_shortcut_ignores_key_repeat(self):
+        js = read("app", "static", "js", "alignment_viewer.js")
+        handler = js.split("// Alan 10/16/26 - A toggles", 1)[1].split(
+            "includeChk.addEventListener", 1
+        )[0]
+        self.assertRegex(handler, r"const isPlainA\s*=\s*key === 'a' && !e\.repeat")
+
+
 class DeadStylesheetTests(unittest.TestCase):
     """job_status.css was served to nobody; loading it would have collided."""
 

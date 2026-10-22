@@ -305,6 +305,10 @@ class TreeBuilderParams:
     run_preset: str = "fast_good"          # fast_good, standard, publication, maximum
     bootstrap_preset: str = "standard"     # standard, publication, maximum
     bootstrap_cap: Optional[int] = None    # User override for caps
+    # AutoMRE convergence cutoff (--bs-cutoff). None means
+    # raxml_validator.DEFAULT_BOOTSTRAP_CUTOFF; a recompute of a job stored
+    # without one passes LEGACY_BOOTSTRAP_CUTOFF, the 0.03 it actually ran with.
+    bootstrap_cutoff: Optional[float] = None
     enable_bootstrap: bool = True          # New explicit toggle
     start_tree_override: Optional[str] = None
     moose_enabled: bool = False

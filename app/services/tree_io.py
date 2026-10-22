@@ -314,6 +314,49 @@ def relabel_newick_text(text: str, relabel) -> Optional[str]:
     return text
 
 
+def expand_newick_tips(text: str, expansions: dict) -> Optional[str]:
+    """Give tips zero-length siblings without re-serializing anything else.
+
+    ``expansions`` maps a tip name to the names of the sequences identical to
+    it. Each such tip becomes ``(tip:0,added:0,...)``, and the branch length
+    and anything else the builder wrote after the tip now belong to that new
+    clade. The new clade has no support label, because no replicate ever saw
+    the added tips. Everything outside the edited tips stays byte for byte as
+    the builder wrote it, as in `relabel_newick_text`. Returns None if the text
+    cannot be matched tip for tip, or if a named tip does not occur exactly
+    once.
+    """
+    if not HAS_BIOPYTHON:
+        return None
+    try:
+        tree = Phylo.read(StringIO(text), "newick")
+    except Exception as exc:
+        logger.warning("Cannot parse Newick to add identical tips: %s", exc)
+        return None
+    terminals = tree.get_terminals()
+    spans = _newick_tip_label_spans(text)
+    if len(spans) != len(terminals):
+        return None
+    zero = NEWICK_BRANCH_LENGTH_FORMAT % 0.0
+    seen = {}
+    edits = []
+    for (start, end), tip in zip(spans, terminals):
+        token = text[start:end]
+        if _unquote_newick_label(token) != (tip.name or ""):
+            return None
+        added = expansions.get(tip.name) if tip.name else None
+        if not added:
+            continue
+        seen[tip.name] = seen.get(tip.name, 0) + 1
+        members = [token] + [quote_tree_label(name) for name in added]
+        edits.append((start, end, "(" + ",".join(f"{m}:{zero}" for m in members) + ")"))
+    if any(seen.get(name) != 1 for name, added in expansions.items() if added):
+        return None
+    for start, end, replacement in reversed(edits):
+        text = text[:start] + replacement + text[end:]
+    return text
+
+
 def _terminal_labels(tree) -> list:
     """Return one existing, unique label per terminal or fail loudly."""
     labels = []

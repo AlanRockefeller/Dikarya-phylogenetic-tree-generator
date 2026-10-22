@@ -2550,6 +2550,7 @@ def run_phylo_job(job_params: dict) -> dict:
                 run_preset=job_params.get("run_preset", "fast_good"),
                 bootstrap_preset=job_params.get("bootstrap_preset", "standard"),
                 bootstrap_cap=job_params.get("bootstrap_cap"),
+                bootstrap_cutoff=job_params.get("bootstrap_cutoff"),
                 enable_bootstrap=job_params.get("enable_bootstrap", True),
                 start_tree_override=job_params.get("start_tree_override"),
                 moose_enabled=job_params.get("moose_enabled", False),

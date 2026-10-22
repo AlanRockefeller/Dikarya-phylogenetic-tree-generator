@@ -216,6 +216,7 @@ def test_local_metadata_preserves_observation_reference():
          patch.object(org, "_local_metadata", return_value=metadata):
         result = org.fetch_results("123", include_ncbi=False)
     assert "iNat314834254" in result["sequences"][0]["name"]
+    assert result["sequences"][0]["mycomap_sequence_id"] == "551798"
     assert len(result["sequences"][0]["sequence"]) == 100
 
 
