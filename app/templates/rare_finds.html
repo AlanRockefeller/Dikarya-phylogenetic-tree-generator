@@ -1,0 +1,159 @@
+{% extends "base_modern.html" %}
+
+{% block title %}Rare Finds - Dikarya{% endblock %}
+{% block description %}Paste an iNaturalist search and see which of its taxa are the rarest worldwide, then download them as a slide deck.{% endblock %}
+
+{% block head %}
+<style>
+    .rare-progress-fill { transition: width 300ms ease; }
+    @media (prefers-reduced-motion: reduce) { .rare-progress-fill { transition: none; } }
+    #rare-table th { position: sticky; top: 0; z-index: 1; }
+</style>
+{% endblock %}
+
+{% block content %}
+<div class="max-w-6xl mx-auto">
+    <header class="mb-8 grid gap-6 lg:grid-cols-[minmax(0,1fr)_320px] lg:items-end">
+        <div>
+            <h1 class="dk-h1 text-journal-dark dark:text-white">Rare Finds</h1>
+            <p class="mt-3 max-w-3xl text-base sm:text-lg leading-relaxed text-gray-600 dark:text-gray-300">
+                Paste any iNaturalist observation search. Rare Finds lists every taxon it returns, ranked by
+                how few times that taxon has been observed anywhere in the world, and builds a slide deck of
+                the ones you pick.
+            </p>
+        </div>
+        <div class="rounded-2xl border border-journal-gold/40 bg-journal-gold/10 p-4 text-sm text-gray-700 dark:text-gray-200">
+            <div class="flex items-start gap-3">
+                <i class="fas fa-shield-halved mt-0.5 text-journal-gold" aria-hidden="true"></i>
+                <p>The search runs in your browser and talks directly to iNaturalist. Dikarya does not store your query or the slides.</p>
+            </div>
+        </div>
+    </header>
+
+    <section class="dk-card p-5 sm:p-7">
+        <form id="rare-form" novalidate>
+            <label for="rare-url" class="block text-sm font-semibold uppercase tracking-wider text-gray-500 dark:text-gray-400">iNaturalist search URL</label>
+            <div class="mt-2 flex flex-col gap-3 sm:flex-row">
+                <div class="relative flex-1 min-w-0">
+                    <i class="fas fa-link absolute left-4 top-1/2 -translate-y-1/2 text-gray-400" aria-hidden="true"></i>
+                    <input id="rare-url" type="url" inputmode="url" maxlength="4000" autocomplete="off" required
+                        placeholder="https://www.inaturalist.org/observations?place_id=…&taxon_id=…"
+                        class="w-full rounded-xl border border-gray-300 dark:border-gray-600 bg-white dark:bg-journal-dark py-3 pl-11 pr-4 text-journal-dark dark:text-white focus:border-journal-gold focus:ring-journal-gold">
+                </div>
+                <button id="rare-run" type="submit"
+                    class="inline-flex items-center justify-center gap-2 rounded-xl bg-journal-gold px-6 py-3 font-bold text-journal-dark shadow-sm transition hover:bg-journal-gold-light focus:outline-none focus:ring-2 focus:ring-journal-gold focus:ring-offset-2">
+                    <i class="fas fa-gem" aria-hidden="true"></i><span>Find rare taxa</span>
+                </button>
+                <button id="rare-cancel" type="button"
+                    class="hidden inline-flex items-center justify-center gap-2 rounded-xl border border-gray-300 dark:border-gray-600 px-5 py-3 font-semibold text-gray-700 dark:text-gray-200 hover:bg-gray-50 dark:hover:bg-gray-800">
+                    <i class="fas fa-xmark" aria-hidden="true"></i><span>Cancel</span>
+                </button>
+            </div>
+            <p class="mt-2 text-sm text-gray-600 dark:text-gray-300">
+                Set up the search on iNaturalist's Explore page with whatever filters you like (place, taxon,
+                project, observer, dates, observation fields), then copy the address bar. Project and observer
+                pages work too.
+            </p>
+            <p id="rare-form-error" class="hidden mt-3 rounded-lg bg-red-50 dark:bg-red-950/40 px-3 py-2 text-sm text-red-700 dark:text-red-200" role="alert"></p>
+        </form>
+
+        <div id="rare-progress" class="hidden mt-6" aria-live="polite">
+            <div class="flex items-center justify-between text-sm text-gray-700 dark:text-gray-200">
+                <span id="rare-progress-label">Starting…</span>
+                <span id="rare-progress-count" class="font-mono text-xs text-gray-500 dark:text-gray-400"></span>
+            </div>
+            <div class="mt-2 h-2 overflow-hidden rounded-full bg-gray-200 dark:bg-gray-700">
+                <div id="rare-progress-fill" class="rare-progress-fill h-full w-0 rounded-full bg-journal-gold"></div>
+            </div>
+        </div>
+    </section>
+
+    <section id="rare-results" class="hidden mt-8">
+        <div class="flex flex-col gap-4 lg:flex-row lg:items-end lg:justify-between">
+            <div class="min-w-0">
+                <h2 class="dk-h2 text-journal-dark dark:text-white">Rarest taxa in this search</h2>
+                <p id="rare-summary" class="mt-1 text-sm text-gray-600 dark:text-gray-300"></p>
+            </div>
+            <div class="flex flex-wrap items-center gap-2">
+                <button id="rare-csv" type="button"
+                    class="inline-flex items-center gap-2 rounded-xl border border-gray-300 dark:border-gray-600 px-4 py-2 text-sm font-semibold text-gray-700 dark:text-gray-200 hover:bg-gray-50 dark:hover:bg-gray-800">
+                    <i class="fas fa-file-csv" aria-hidden="true"></i>Download CSV
+                </button>
+            </div>
+        </div>
+
+        <div class="mt-5 dk-card p-5">
+            <h3 class="dk-h3 text-journal-dark dark:text-white"><i class="fas fa-person-chalkboard mr-2 text-journal-gold" aria-hidden="true"></i>Slide deck</h3>
+            <div class="mt-3 grid gap-4 sm:grid-cols-2">
+                <div>
+                    <label for="rare-deck-title" class="block text-sm font-semibold text-gray-700 dark:text-gray-200">Title</label>
+                    <input id="rare-deck-title" type="text" maxlength="160"
+                        class="mt-1 w-full rounded-xl border border-gray-300 dark:border-gray-600 bg-white dark:bg-journal-dark px-3 py-2 text-journal-dark dark:text-white focus:border-journal-gold focus:ring-journal-gold">
+                </div>
+                <div>
+                    <label for="rare-deck-subtitle" class="block text-sm font-semibold text-gray-700 dark:text-gray-200">Subtitle</label>
+                    <input id="rare-deck-subtitle" type="text" maxlength="300"
+                        class="mt-1 w-full rounded-xl border border-gray-300 dark:border-gray-600 bg-white dark:bg-journal-dark px-3 py-2 text-journal-dark dark:text-white focus:border-journal-gold focus:ring-journal-gold">
+                </div>
+            </div>
+            <label class="mt-4 flex items-start gap-3 text-sm text-gray-700 dark:text-gray-200">
+                <input id="rare-commercial" type="checkbox"
+                    class="mt-0.5 h-4 w-4 rounded border-gray-300 text-journal-green focus:ring-journal-gold">
+                <span>
+                    <span class="font-semibold">Only use photos licensed for commercial use</span>
+                    <span class="block text-gray-600 dark:text-gray-400">CC0, CC BY, CC BY-SA or CC BY-ND. When a taxon's chosen observation has no such photo, another observation of it from this search is used; if none qualifies, its slide has no photo.</span>
+                </span>
+            </label>
+            <div class="mt-4 flex flex-col gap-3 sm:flex-row sm:items-center">
+                <button id="rare-pptx" type="button"
+                    class="inline-flex items-center justify-center gap-2 rounded-xl bg-journal-gold px-6 py-3 font-bold text-journal-dark shadow-sm transition hover:bg-journal-gold-light focus:outline-none focus:ring-2 focus:ring-journal-gold focus:ring-offset-2 disabled:opacity-50">
+                    <i class="fas fa-download" aria-hidden="true"></i><span id="rare-pptx-label">Download presentation (.pptx)</span>
+                </button>
+                <p class="text-xs text-gray-600 dark:text-gray-400">Opens in PowerPoint, Keynote and Google Slides. Tick the taxa below to choose the slides.</p>
+            </div>
+            <p id="rare-pptx-status" class="hidden mt-3 text-sm text-gray-700 dark:text-gray-200" aria-live="polite"></p>
+        </div>
+
+        <div class="mt-5 flex flex-wrap items-center gap-3 text-sm text-gray-700 dark:text-gray-200">
+            <button id="rare-select-top" type="button" class="rounded-lg border border-gray-300 dark:border-gray-600 px-3 py-1.5 font-semibold hover:bg-gray-50 dark:hover:bg-gray-800">Select top 15</button>
+            <button id="rare-select-none" type="button" class="rounded-lg border border-gray-300 dark:border-gray-600 px-3 py-1.5 font-semibold hover:bg-gray-50 dark:hover:bg-gray-800">Clear selection</button>
+            <label class="inline-flex items-center gap-2">
+                <input id="rare-described-only" type="checkbox" class="h-4 w-4 rounded border-gray-300 text-journal-green focus:ring-journal-gold">
+                Hide provisional names
+            </label>
+            <span id="rare-selected-count" class="text-gray-500 dark:text-gray-400"></span>
+        </div>
+
+        <div class="mt-3 overflow-x-auto rounded-2xl border border-gray-200 dark:border-gray-700">
+            <table id="rare-table" class="min-w-full text-sm">
+                <thead class="bg-gray-50 dark:bg-journal-dark text-left text-xs uppercase tracking-wider text-gray-500 dark:text-gray-400">
+                    <tr>
+                        <th class="px-3 py-2 w-10"><span class="sr-only">Include in slides</span></th>
+                        <th class="px-3 py-2">#</th>
+                        <th class="px-3 py-2">Photo</th>
+                        <th class="px-3 py-2">Taxon</th>
+                        <th class="px-3 py-2 text-right">Worldwide</th>
+                        <th class="px-3 py-2 text-right">In search</th>
+                        <th class="px-3 py-2">Observation</th>
+                    </tr>
+                </thead>
+                <tbody id="rare-tbody" class="divide-y divide-gray-100 dark:divide-gray-800 bg-white dark:bg-journal-panel"></tbody>
+            </table>
+        </div>
+
+        <div class="mt-5 rounded-2xl border border-gray-200 dark:border-gray-700 p-4 text-sm text-gray-600 dark:text-gray-300">
+            <p><strong>How to read this.</strong> "Worldwide" is every iNaturalist observation of the taxon, any quality grade, at the time of the search. Taxa above species (a genus nobody took further, for example) are left out, because a count for a whole genus says nothing about rarity.</p>
+            <p class="mt-2">Provisional names such as <em>Inocybe</em> sp. 'PNW77' exist only because someone sequenced a collection, so a low count there partly reflects how few collections get sequenced. "Known from only N observations anywhere" is accurate; "rare species" is a stronger claim.</p>
+        </div>
+    </section>
+
+    <footer class="mt-8 text-center text-xs text-gray-600 dark:text-gray-400">
+        iNaturalist data is provided by the iNaturalist API. Photos remain the property of their photographers and are credited on every slide.
+    </footer>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script src="{{ url_for('static', filename='vendor/pptxgen-3.12.0.bundle.js') }}" defer></script>
+<script src="{{ url_for('static', filename='js/rare_finds.js') }}?v=1" defer></script>
+{% endblock %}

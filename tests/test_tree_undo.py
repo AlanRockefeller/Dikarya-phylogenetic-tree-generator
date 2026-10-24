@@ -635,25 +635,87 @@ class CheckpointInvalidationTests(_RouteHarness):
             self.assertEqual(status, 409)
             self.assertEqual(payload["status"], "error")
 
-    def test_saving_annotations_clears_the_checkpoint(self):
+    def _save_annotations(self, root, annotations, undo_kind=None):
         from app.api import routes
+        body = {
+            "layers": [{"id": "layer-1", "name": "Sections", "order": 1}],
+            "annotations": annotations,
+        }
+        if undo_kind:
+            body["undo_kind"] = undo_kind
+        return self._call(root, routes.save_clade_annotations, body=body)
+
+    _GROUP = {"id": "ann-1", "layer_id": "layer-1", "label": "Group",
+              "member_tip_ids": ["C", "D"]}
+
+    def test_an_annotation_save_is_undoable(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             job_dir = _make_job(root)
             self._prune(root, ["A"])
-            self.assertTrue(describe_undo_checkpoint(job_dir)["available"])
 
-            # An annotation is deliberate authoring work that undo would revert
-            # along with the prune, so the checkpoint goes instead.
-            status, _ = self._call(root, routes.save_clade_annotations, body={
-                "layers": [{"id": "layer-1", "name": "Sections", "order": 1}],
-                "annotations": [{
-                    "id": "ann-1", "layer_id": "layer-1", "label": "Group",
-                    "member_tip_ids": ["C", "D"],
-                }],
-            })
+            status, payload = self._save_annotations(root, [self._GROUP], "add")
             self.assertEqual(status, 200)
-            self.assertEqual(describe_undo_checkpoint(job_dir), {"available": False})
+            self.assertTrue(payload["undo_recorded"])
+            self.assertEqual(payload["undo"]["label"], "new annotation")
+
+            status, payload = self._undo(root)
+            self.assertEqual(status, 200)
+            self.assertEqual(payload["undone"]["operation"], "annotation")
+            restored = load_tree_state(job_dir)
+            self.assertFalse(restored.get("clade_annotations"))
+            # The prune is still in place: one level only.
+            self.assertNotIn("A", json.dumps(restored.get("tree") or {}))
+
+    def test_an_unknown_undo_kind_gets_the_generic_label(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            _make_job(root)
+            _, payload = self._save_annotations(root, [self._GROUP], "<script>")
+            self.assertEqual(payload["undo"]["label"], "annotation change")
+
+    def test_a_no_op_annotation_save_keeps_the_earlier_checkpoint(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            job_dir = _make_job(root)
+            self._save_annotations(root, [self._GROUP], "add")
+            _, payload = self._save_annotations(root, [self._GROUP], "edit")
+            self.assertFalse(payload["undo_recorded"])
+            self.assertEqual(describe_undo_checkpoint(job_dir)["label"], "new annotation")
+
+    def test_a_burst_of_layer_style_saves_undoes_as_one_step(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            job_dir = _make_job(root)
+            self._save_annotations(root, [self._GROUP], "add")
+            for color in ("#111111", "#222222", "#333333"):
+                body_layers = [{"id": "layer-1", "name": "Sections", "order": 1,
+                                "default_highlight_color": color}]
+                from app.api import routes
+                status, _ = self._call(root, routes.save_clade_annotations, body={
+                    "layers": body_layers, "annotations": [self._GROUP],
+                    "undo_kind": "layer_style",
+                })
+                self.assertEqual(status, 200)
+
+            status, payload = self._undo(root)
+            self.assertEqual(status, 200)
+            self.assertEqual(payload["undone"]["label"], "annotation layer style change")
+            layer = load_tree_state(job_dir)["annotation_layers"][0]
+            self.assertNotIn(layer.get("default_highlight_color"),
+                             {"#111111", "#222222", "#333333"})
+            self.assertEqual(len(load_tree_state(job_dir)["clade_annotations"]), 1)
+
+    def test_discrete_annotation_saves_do_not_coalesce(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            job_dir = _make_job(root)
+            self._save_annotations(root, [self._GROUP], "add")
+            self._save_annotations(root, [], "delete")
+
+            status, _ = self._undo(root)
+            self.assertEqual(status, 200)
+            self.assertEqual(len(load_tree_state(job_dir)["clade_annotations"]), 1)
 
     def test_setting_the_sequence_of_interest_clears_the_checkpoint(self):
         from app.api import routes

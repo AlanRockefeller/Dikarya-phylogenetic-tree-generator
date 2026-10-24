@@ -9,7 +9,9 @@ Evidence, strongest first (the `confidence` column):
   medium  NCBI's DEFINITION line says "from TYPE material" (RefSeq's marker),
           or the NCBI description stored with a MycoMap BLAST hit says so.
   low     Only the tip label names a type; the NCBI record carries no type
-          annotation. Worth checking against the literature, not proven.
+          annotation, or its organism and voucher exactly match a different
+          accession already marked as type. Worth checking against the
+          literature, not proven.
 
 Every suspect is re-fetched from NCBI so the evidence is current. RefSeq
 records (NR_...) are NCBI copies of an ordinary GenBank record; the source
@@ -46,7 +48,12 @@ DEFAULT_OUTPUT = REPO_ROOT / "type_specimens_not_in_mycomap.csv"
 NCBI_BATCH = 100
 TYPE_WORD_RE = re.compile(
     r"\b(holotype|isotype|epitype|lectotype|neotype|paratype|syntype|ex-type|"
-    r"TYPE material|type strain)\b",
+    r"TYPE material|type strain|type)\b",
+    re.IGNORECASE,
+)
+NEGATED_TYPE_RE = re.compile(r"\b(?:non|not|no)[\s-]*(?:an?\s+)?\w*type\b", re.IGNORECASE)
+VOUCHER_TYPE_MARKER_RE = re.compile(
+    r"\b(?:holotype|isotype|epitype|lectotype|neotype|paratype|syntype|ex[- ]?type|type)\b",
     re.IGNORECASE,
 )
 # "The reference sequence is identical to JQ003648." / "...was derived from ..."
@@ -60,12 +67,48 @@ FIELDS = [
 ]
 
 
-def scan_jobs(mycomap):
+def _normalized_organism(value):
+    return re.sub(r"[^A-Z0-9]", "", str(value or "").upper())
+
+
+def _normalized_voucher(value):
+    text = VOUCHER_TYPE_MARKER_RE.sub("", " ".join(str(value or "").split()))
+    normalized = re.sub(r"[^A-Z0-9]", "", text.upper())
+    # Short, numberless values ("CBS", "s.n.") are not specimen identifiers
+    # specific enough to relate two accessions safely.
+    return normalized if len(normalized) >= 5 and any(c.isdigit() for c in normalized) else ""
+
+
+def type_voucher_index(mycomap, genbank):
+    """Marked type records keyed by exact normalized organism and voucher."""
+    result = collections.defaultdict(list)
+    sources = (
+        ("MycoMap", mycomap),
+        ("GenBank", {acc: entry for acc, entry in genbank.items() if entry.get("status")}),
+    )
+    for source, records in sources:
+        for acc, entry in records.items():
+            organism = _normalized_organism(entry.get("organism"))
+            voucher = _normalized_voucher(entry.get("voucher"))
+            if organism and voucher:
+                result[(organism, voucher)].append({
+                    "accession": acc,
+                    "status": entry.get("status") or "type",
+                    "source": source,
+                    "voucher": " ".join(str(entry.get("voucher") or "").split()),
+                })
+    return result
+
+
+def scan_jobs(mycomap, genbank):
     """Which unlisted accessions occur in which jobs, and what the jobs say about them."""
     jobs_for = collections.defaultdict(set)
     example = {}
-    label_claims = set()
+    label_claims = {}
     description_claims = {}
+    voucher_claims = {}
+    marked = set(mycomap) | {acc for acc, entry in genbank.items() if entry.get("status")}
+    known_vouchers = type_voucher_index(mycomap, genbank)
     for input_info in Config.JOB_DIR.glob("*/input_info.json"):
         job_dir = input_info.parent
         by_name = {}
@@ -85,12 +128,32 @@ def scan_jobs(mycomap):
                 continue
             jobs_for[acc].add(job_dir.name)
             example.setdefault(acc, header)
-            if TYPE_WORD_RE.search(header):
-                label_claims.add(acc)
+            if TYPE_WORD_RE.search(header) and not NEGATED_TYPE_RE.search(header):
+                label_claims.setdefault(acc, header)
             description = str(metadata.get("raw_ncbi_description") or "")
             if tss.FROM_TYPE_MATERIAL_RE.search(description):
                 description_claims[acc] = description
-    return jobs_for, example, label_claims, description_claims
+            if acc not in marked:
+                voucher = " ".join(str(metadata.get("voucher") or "").split())
+                organism = " ".join(str(
+                    metadata.get("taxon") or metadata.get("organism") or "").split())
+                key = (
+                    _normalized_organism(organism),
+                    _normalized_voucher(voucher),
+                )
+                matches = [entry for entry in known_vouchers.get(key, ())
+                           if entry["accession"] != acc]
+                if matches and acc not in voucher_claims:
+                    joined = "; ".join(
+                        f'{entry["accession"]} ({entry["status"]}, {entry["source"]}, '
+                        f'voucher {entry["voucher"]})'
+                        for entry in matches
+                    )
+                    voucher_claims[acc] = (
+                        "Exact organism and voucher match to marked type accession(s)",
+                        f"Analyzed organism {organism}; target voucher {voucher}; matches {joined}",
+                    )
+    return jobs_for, example, label_claims, description_claims, voucher_claims
 
 
 def fetch_ncbi(accessions):
@@ -124,7 +187,7 @@ def fetch_ncbi(accessions):
     return records
 
 
-def classify(acc, record, label_claims, description_claims, example):
+def classify(acc, record, label_claims, description_claims, voucher_claims, example):
     """(status, confidence, evidence_source, evidence_text), or None if not a suspect."""
     if record and tss.classify_type_material(record["type_material"]):
         return (tss.classify_type_material(record["type_material"]), "high",
@@ -137,12 +200,16 @@ def classify(acc, record, label_claims, description_claims, example):
                 "NCBI description stored with the MycoMap BLAST hit says 'from TYPE material' "
                 "(record could not be re-fetched)", description_claims[acc])
     if acc in label_claims:
-        match = TYPE_WORD_RE.search(example.get(acc, ""))
+        claim = label_claims[acc]
+        match = TYPE_WORD_RE.search(claim)
         word = match.group(1).lower() if match else "type"
-        status = "type" if word in ("type material", "type strain") else word
+        status = "type" if word in ("type", "type material", "type strain") else word
         source = ("Tip label mentions a type word, but the NCBI record has no type annotation"
                   if record else "Tip label mentions a type word; NCBI record could not be fetched")
-        return status, "low", source, example.get(acc, "")
+        return status, "low", source, claim
+    if acc in voucher_claims:
+        source, evidence = voucher_claims[acc]
+        return "type", "low", source, evidence
     return None  # e.g. the cache said type but NCBI no longer does
 
 
@@ -156,19 +223,22 @@ def main():
     if not mycomap:
         parser.error("no MycoMap snapshot; run scripts/dikarya_refresh_type_specimens.py first")
 
-    jobs_for, example, label_claims, description_claims = scan_jobs(mycomap)
-    cached = {acc for acc, entry in tss.genbank_index().items()
+    genbank = tss.genbank_index()
+    jobs_for, example, label_claims, description_claims, voucher_claims = scan_jobs(mycomap, genbank)
+    cached = {acc for acc, entry in genbank.items()
               if entry.get("status") and acc not in mycomap}
-    suspects = sorted(cached | set(description_claims) | label_claims)
+    suspects = sorted(cached | set(description_claims) | set(label_claims) | set(voucher_claims))
     print(f"{len(suspects)} suspects: {len(cached)} from the GenBank cache, "
-          f"{len(description_claims)} from stored NCBI descriptions, {len(label_claims)} from labels",
+          f"{len(description_claims)} from stored NCBI descriptions, {len(label_claims)} from labels, "
+          f"{len(voucher_claims)} from exact type-voucher matches",
           file=sys.stderr)
 
     ncbi = fetch_ncbi(suspects)
     rows = []
     for acc in suspects:
         record = ncbi.get(acc)
-        verdict = classify(acc, record, label_claims, description_claims, example)
+        verdict = classify(
+            acc, record, label_claims, description_claims, voucher_claims, example)
         if verdict is None:
             continue
         status, confidence, evidence_source, evidence_text = verdict

@@ -149,8 +149,8 @@ E5-2690 v4, 2 vCPUs):
 | IQ-TREE, ModelFinder + UFBoot (19 inputs) | 3.1.4 | 3.1.4-dikarya1 | 4288 s | 2783 s | 1.54x | [ops/iqtree](ops/iqtree/README.md) |
 | MrBayes, 1 thread (6 inputs) | 3.2.9 | 3.2.9-dikarya2 | 358.3 s | 202.4 s | 1.77x | [ops/mrbayes](ops/mrbayes/README.md) |
 | MrBayes, 2 threads (6 inputs) | 3.2.9 | 3.2.9-dikarya2 | 358.3 s | 132.0 s | 2.71x | [ops/mrbayes](ops/mrbayes/README.md) |
-| RAxML-NG, 1 thread (7 inputs) | 2.0.3 | 2.0.3-dikarya1 (not installed yet) | 1702 s | 1223 s | 1.39x | [ops/raxml](ops/raxml/README.md) |
-| RAxML-NG, 2 threads (2 inputs) | 2.0.3 | 2.0.3-dikarya1 (not installed yet) | 152.6 s | 104.3 s | 1.46x | [ops/raxml](ops/raxml/README.md) |
+| RAxML-NG, 1 thread (7 inputs) | 2.0.3 | 2.0.3-dikarya1 | 1702 s | 1223 s | 1.39x | [ops/raxml](ops/raxml/README.md) |
+| RAxML-NG, 2 threads (2 inputs) | 2.0.3 | 2.0.3-dikarya1 | 152.6 s | 104.3 s | 1.46x | [ops/raxml](ops/raxml/README.md) |
 
 Times are CPU time, except MrBayes and the two-thread rows, which are wall time. MAFFT
 and IQ-TREE are identical at one thread; at two threads their output varies from run to
@@ -274,9 +274,14 @@ deployment step rather than from every Gunicorn worker.
 ### MycoMap
 
 Importing sequences from an existing public MycoMap BLAST-result URL does not
-require an API credential. Creating a MycoMap BLAST from an iNaturalist ITS
-sequence, or rerunning local/NCBI MycoMap searches, requires
-`MYCOMAP_COM_API_KEY`. `MYCOMAP_COM_USER_ID` selects the MycoMap account that
+require an API credential. The Tree Builder's **MycoMap BLAST** searches the
+MycoMap.org local database using `MYCOMAP_ORG_API_KEY`; the same key enables
+rerunning MycoMap.org searches. **NCBI BLAST** searches GenBank separately.
+MycoMap queries accept one GenBank accession or one DNA/FASTA sequence of
+50–20,000 bases, and matching hits retain identity and coverage metrics.
+
+Creating or rerunning legacy MycoMap.com searches requires
+`MYCOMAP_COM_API_KEY`. `MYCOMAP_COM_USER_ID` selects the legacy account that
 owns API-created searches. Hit limits, the legacy NCBI grace period, and the
 polling interval/attempt limit are configurable in `.env.example`.
 

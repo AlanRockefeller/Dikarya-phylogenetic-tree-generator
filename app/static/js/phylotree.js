@@ -12792,6 +12792,14 @@
             undef_BL = true;
             return 0;
           }
+          // Alan 10/20/26 - Optional display-only length (long-branch breaks). It moves where
+          // the node is drawn and nothing else: the accessor, and so Newick export, rerooting
+          // and the branch tooltip, still read the tree's own length.
+          const display_length = this.options["display-branch-length"];
+          if (typeof display_length === "function") {
+            const shown = display_length(a_node, a_node.y);
+            if (Number.isFinite(shown)) a_node.y = shown;
+          }
           a_node.y += a_node.parent.y;
         } else {
           a_node.y = is_leaf ? this.max_depth : a_node.depth;
@@ -12929,7 +12937,16 @@
       }
 
       if (this.options["left-right-spacing"] == "fixed-step") {
-        this.size[1] = this.max_depth * this.fixed_width[1];
+        // Alan 10/20/26 - "branch-width" gives a rectangular tree an exact root-to-deepest-tip
+        // width in pixels, so the viewer can size it to the screen. Without it the width is
+        // max_depth x per-level step, i.e. set by how many nodes the longest path happens to
+        // have rather than by anything the reader can see. Radial keeps the per-level step.
+        const branch_width = Number(this.options["branch-width"]);
+        if (!this.radial() && Number.isFinite(branch_width) && branch_width > 0) {
+          this.size[1] = branch_width + this.offsets[1] + this.options["left-offset"];
+        } else {
+          this.size[1] = this.max_depth * this.fixed_width[1];
+        }
 
         this.scales[1] = 
           (this.size[1] - this.offsets[1] - this.options["left-offset"]) /
@@ -13295,21 +13312,24 @@
             return n ? Math.round(x * (n = Math.pow(10, n))) / n : Math.round(x);
           };
 
-          let my_ticks = scale.ticks();
-          my_ticks = my_ticks.length > 1 ? my_ticks[1] : my_ticks[0];
-
-          this.draw_scale_bar.ticks(
-            Math.min(
-              10,
-              round(
-                range_limit /
-                  (this.shown_font_size *
-                    scaleTickFormatter(my_ticks).length *
-                    2),
-                0
-              )
-            )
+          // Alan 10/20/26 - A tree can now be drawn many screens wide (Width above 100%, or a
+          // clade stretched to the screen), so the scale keeps roughly one tick per 150px
+          // instead of stopping at 10, and labels carry the precision the tick step needs:
+          // the fixed ".2f" printed every tick of a 0.005-step scale as 0.00 or 0.01.
+          const guess_format = scale.tickFormat(10);
+          const label_chars = Math.max(
+            4,
+            ...scale.ticks(10).map(t => guess_format(t).length)
           );
+          const tick_count = Math.max(1, Math.min(
+            Math.max(10, Math.floor(range_limit / 150)),
+            round(range_limit / (this.shown_font_size * label_chars * 2), 0)
+          ));
+          const tick_format = scale.tickFormat(tick_count);
+
+          this.draw_scale_bar
+            .ticks(tick_count)
+            .tickFormat(d => (d === 0 ? "" : tick_format(d)));
         }
       } else {
         this.draw_scale_bar = null;

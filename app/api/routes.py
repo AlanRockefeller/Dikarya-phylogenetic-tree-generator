@@ -12,6 +12,7 @@ from app.config import Config
 from app.extensions import db
 from app.models import Job
 import logging
+import math
 import re
 import hashlib
 import time
@@ -1473,6 +1474,67 @@ def run_blast():
     return _run_in_background_if_asked("blast", _run_blast_request, data)
 
 
+@bp.post('/mycomap/blast')
+@limiter.limit("10 per minute; 200 per hour")
+def run_mycomap_blast():
+    """Search MycoMap.org's local database with one sequence or accession."""
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict):
+        return jsonify({"status": "error", "error": "Provide a JSON object."}), 400
+    return _run_in_background_if_asked("mycomap_blast", _run_mycomap_blast_request, data)
+
+
+def _run_mycomap_blast_request(data):
+    from app.services.mycomap_org_service import OrgResultError, search_from_query
+
+    query = data.get('query')
+    if not isinstance(query, str) or not query.strip():
+        return jsonify({"status": "error", "error": "Enter one sequence or GenBank accession."}), 400
+    try:
+        min_identity = float(data.get('min_identity', 90))
+        if not math.isfinite(min_identity):
+            raise ValueError
+        min_identity = max(50.0, min(100.0, min_identity))
+        max_sequences = max(1, min(500, int(data.get('max_sequences', 50))))
+    except (TypeError, ValueError, OverflowError):
+        return jsonify({"status": "error", "error": "Enter valid identity and result limits."}), 400
+
+    try:
+        result = search_from_query(
+            query, min_identity=min_identity, max_sequences=max_sequences,
+            time_budget=200,
+        )
+        payload, err = gather_mycomap_sequences_for_queue(
+            result['result_url'], include_ncbi=False, include_local=True,
+            fetch_time_budget=20,
+            prefetched_org_result=result,
+        )
+        if err is not None:
+            body, status = err
+            return jsonify(body), status
+        payload['mycomap_blast_url'] = result['result_url']
+        payload['warnings'] = result.get('warnings', [])
+        payload['message'] = (
+            f"MycoMap BLAST complete. Found {len(payload['sequences'])} related sequences."
+        )
+        return jsonify(payload)
+    except ValueError as exc:
+        note_request_failure("invalid_mycomap_blast_query")
+        return jsonify({"status": "error", "error": str(exc)}), 400
+    except TimeoutError:
+        return jsonify({
+            "status": "error",
+            "error": "MycoMap BLAST is taking longer than expected. Please try again in a few minutes.",
+        }), 504
+    except OrgResultError as exc:
+        logger.warning("event=mycomap_org.search_failed status=%s retryable=%s",
+                       exc.status, exc.retryable)
+        return jsonify({"status": "error", "error": str(exc),
+                        "retryable": exc.retryable}), exc.status
+    except Exception as exc:
+        return _server_error(exc, where="mycomap_blast")
+
+
 def _run_in_background_if_asked(kind, handler, data):
     """Start ``handler(data)`` in the background when the page asked for it.
 
@@ -1802,7 +1864,8 @@ def _fill_missing_genbank_locations(sequences, deadline=None):
 def gather_mycomap_sequences_for_queue(url, include_ncbi=True, include_local=True,
                                        filter_conflicting_local_fasta=False,
                                        allow_identical_sequences_different_locations=True,
-                                       fetch_time_budget=None):
+                                       fetch_time_budget=None,
+                                       prefetched_org_result=None):
     """Reusable helper for fetching MycoMap BLAST result sequences.
 
     Returns a tuple ``(payload, error_response)`` where ``payload`` is the
@@ -1817,6 +1880,9 @@ def gather_mycomap_sequences_for_queue(url, include_ncbi=True, include_local=Tru
     running inside a request must pass one (see
     ``INTERACTIVE_FETCH_BUDGET_SECONDS``) so a MycoMap outage cannot hold a
     Gunicorn slot for the full retry budget; worker callers leave it None.
+
+    ``prefetched_org_result`` lets a newly completed MycoMap.org search use
+    the same import filters and metadata enrichment without fetching it twice.
     """
     if not url:
         return None, ({"status": "error", "error": "No URL provided"}, 400)
@@ -1978,7 +2044,7 @@ def gather_mycomap_sequences_for_queue(url, include_ncbi=True, include_local=Tru
     if provider == "org":
         from app.services.mycomap_org_service import OrgResultError, fetch_results
         try:
-            result = fetch_results(
+            result = prefetched_org_result if prefetched_org_result is not None else fetch_results(
                 blast_id, include_ncbi=include_ncbi, include_local=include_local,
                 time_budget=fetch_time_budget,
             )
@@ -3959,6 +4025,12 @@ def save_clade_annotations(job_id):
             apply_annotation_config,
             normalize_annotation_config,
         )
+        from app.services.tree_undo_service import (
+            ANNOTATION_COALESCING_KINDS,
+            ANNOTATION_UNDO_DEFAULT_LABEL,
+            ANNOTATION_UNDO_LABELS,
+            extend_undo_checkpoint,
+        )
 
         with tree_state_lock(job_dir):
             # Load and commit under the same per-job lock. This preserves a
@@ -3972,16 +4044,45 @@ def save_clade_annotations(job_id):
                 # configuration is still intact on disk.
                 return jsonify({"status": "error", "error": str(exc)}), 400
 
-            apply_annotation_config(state, config)
-            save_tree_state(job_dir, state)
-            # Annotations are deliberate authoring work and are not undoable.
-            # An undo checkpoint older than this save would roll them back with
-            # the edit it does undo, so drop it rather than offer that.
-            clear_undo_checkpoint(job_dir)
+            before = (
+                state.get(ANNOTATION_LAYERS_KEY) or [],
+                state.get(CLADE_ANNOTATIONS_KEY) or [],
+            )
+            changed = before != (
+                config[ANNOTATION_LAYERS_KEY], config[CLADE_ANNOTATIONS_KEY],
+            )
+            # The client names only a kind; the label always comes from the
+            # server's own table, so annotation text never becomes a label.
+            undo_kind = data.get("undo_kind")
+            if not isinstance(undo_kind, str) or undo_kind not in ANNOTATION_UNDO_LABELS:
+                undo_kind = None
+            undo_label = ANNOTATION_UNDO_LABELS.get(undo_kind, ANNOTATION_UNDO_DEFAULT_LABEL)
+            coalesce_key = undo_kind if undo_kind in ANNOTATION_COALESCING_KINDS else None
+
+            if not changed:
+                # A no-op save must not replace a real checkpoint with an
+                # empty one.
+                apply_annotation_config(state, config)
+                save_tree_state(job_dir, state)
+            elif coalesce_key and extend_undo_checkpoint(
+                job_dir, "annotation", coalesce_key, undo_label
+            ):
+                # Continues a debounced burst (one colour drag): keep the
+                # snapshot from before the burst began.
+                apply_annotation_config(state, config)
+                save_tree_state(job_dir, state)
+            else:
+                with undo_checkpoint(job_dir, "annotation", undo_label) as checkpoint:
+                    apply_annotation_config(state, config)
+                    save_tree_state(job_dir, state)
+                    checkpoint.commit(coalesce_key=coalesce_key)
+            undo_state = describe_undo_checkpoint(job_dir)
         return jsonify({
             "status": "ok",
             "layers": config[ANNOTATION_LAYERS_KEY],
             "annotations": config[CLADE_ANNOTATIONS_KEY],
+            "undo": undo_state,
+            "undo_recorded": changed,
         })
     except Exception as e:
         return _server_error(e, where="save_clade_annotations")

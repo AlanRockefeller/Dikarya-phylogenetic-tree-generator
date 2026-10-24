@@ -68,7 +68,7 @@
     }
 
     /* Alan 9/12/26 - Segmented source selector for the single Add Sequences
-       box. Six sources share one card; only the selected panel is shown. */
+       box. Sources share one card; only the selected panel is shown. */
     /* Same segmented-switch look as the header's Journal | Workbench control:
        outlined track, active segment filled (gold in dark mode, forest green
        with gold text in light mode), no hover fill. */
@@ -711,7 +711,12 @@
                 <button type="button" class="source-segment" role="tab" tabindex="-1"
                         id="source_tab_blast" data-source-segment="blast"
                         aria-controls="source_panel_blast" aria-selected="false">
-                    <i class="fas fa-search" aria-hidden="true"></i><span>BLAST</span>
+                    <i class="fas fa-search" aria-hidden="true"></i><span>NCBI BLAST</span>
+                </button>
+                <button type="button" class="source-segment" role="tab" tabindex="-1"
+                        id="source_tab_mycomap_blast" data-source-segment="mycomap_blast"
+                        aria-controls="source_panel_mycomap_blast" aria-selected="false">
+                    <i class="fas fa-dna" aria-hidden="true"></i><span>MycoMap BLAST</span>
                 </button>
                 <button type="button" class="source-segment" role="tab" tabindex="-1"
                         id="source_tab_mushroom_observer" data-source-segment="mushroom_observer"
@@ -750,6 +755,10 @@
                        class="hidden btn btn-small btn-outline-gold mt-3">
                         <i class="fas fa-external-link-alt mr-2"></i> View existing tree
                     </a>
+                    <button type="button" id="inaturalist_use_taxon_search_btn"
+                            class="hidden btn btn-small btn-outline-gold mt-3">
+                        <i class="fas fa-search mr-2" aria-hidden="true"></i> Use this search
+                    </button>
                     <div id="inaturalist_tree_choices" class="hidden flex flex-wrap gap-2 mt-3">
                         <button type="button" id="inaturalist_use_user_btn" class="btn btn-small btn-outline-gold">
                             Use user
@@ -932,13 +941,14 @@
                                           focus:ring-journal-gold dark:bg-journal-dark dark:border-gray-600">
                             <span class="font-medium">Also rebuild NCBI BLAST</span>
                         </label>
-                        <label class="flex items-center gap-2">
+                        <label id="mycomap_refresh_ncbi_limit_option" class="flex items-center gap-2 opacity-50">
                             <span>NCBI hits</span>
-                            <input type="number" id="mycomap_refresh_ncbi_limit" min="1" max="500" step="1" value="100"
+                            <input type="number" id="mycomap_refresh_ncbi_limit" min="1" max="500" step="1" value="100" disabled
                                    class="w-20 px-2 py-1 border border-gray-300 dark:border-journal-dark rounded-lg bg-white dark:bg-journal-dark text-gray-900 dark:text-gray-100 focus:ring-2 focus:ring-journal-gold focus:border-transparent">
                         </label>
                     </div>
                     <p class="text-xs text-gray-500 dark:text-gray-400">
+                        Local and NCBI hit counts are separate. With NCBI rebuild off, only the Local hits value is used.
                         Local refresh takes a few seconds; an NCBI rebuild takes about 10 minutes, then the import runs.
                     </p>
                 </div>
@@ -1007,8 +1017,13 @@
                     <!-- Alan 10/12/26 - Shown only while the box holds one accession or one sequence. -->
                     <button id="paste_blast_btn" type="button" data-active-style="outline"
                         class="btn flex-1 min-w-[140px] hidden"
-                        title="Search GenBank for sequences related to this one, using the BLAST tab's settings">
-                        <i class="fas fa-search mr-2"></i> BLAST This Sequence
+                        title="Search GenBank for related sequences using the NCBI BLAST settings">
+                        <i class="fas fa-search mr-2"></i> NCBI BLAST
+                    </button>
+                    <button id="paste_mycomap_blast_btn" type="button" data-active-style="outline"
+                        class="btn flex-1 min-w-[140px] hidden"
+                        title="Search MycoMap.org for related sequences using the MycoMap BLAST settings">
+                        <i class="fas fa-dna mr-2"></i> MycoMap BLAST
                     </button>
                 </div>
             </div>
@@ -1067,7 +1082,7 @@
                             <span id="blast_query_counter" class="detected-counter">0 sequences detected</span>
                         </div>
                         <textarea id="blast_query" rows="4" class="sequence-textarea"
-                            placeholder="Paste a FASTA record or a list of accession numbers…"></textarea>
+                            placeholder="Paste one DNA sequence, FASTA record, or GenBank accession…"></textarea>
                         <div class="sequence-input-footer">
                             <span>UTF-8 · plain text</span>
                             <button type="button" class="paste-example-link" data-paste-example="blast_query">↳ Paste example</button>
@@ -1105,10 +1120,71 @@
                 </div>
 
                 <div class="flex flex-wrap gap-3">
-                    <button id="blast_btn" data-active-style="outline" class="btn w-full" disabled>
-                        <i class="fas fa-search mr-2"></i> BLAST Sequence
+                    <button id="blast_btn" type="button" data-active-style="outline" class="btn w-full" disabled>
+                        <i class="fas fa-search mr-2"></i> NCBI BLAST
                     </button>
                 </div>
+            </div>
+            </div>
+
+            <div class="source-panel" id="source_panel_mycomap_blast" role="tabpanel"
+                 aria-labelledby="source_tab_mycomap_blast" data-source-panel="mycomap_blast" hidden>
+
+            <div class="space-y-4">
+                <div>
+                    <label for="mycomap_blast_query" class="block text-sm font-medium text-gray-700 dark:text-gray-200 mb-2">
+                        Enter Single Sequence or Accession
+                    </label>
+                    <div class="sequence-input-box" data-sequence-input-box="mycomap_blast_query">
+                        <div class="sequence-input-toolbar">
+                            <div class="input-chip-group">
+                                <button type="button" class="input-chip is-active" data-input-chip="mycomap_blast_query" data-chip-mode="fasta">FASTA</button>
+                                <button type="button" class="input-chip" data-input-chip="mycomap_blast_query" data-chip-mode="accessions">Accessions</button>
+                            </div>
+                            <span id="mycomap_blast_query_counter" class="detected-counter">0 sequences detected</span>
+                        </div>
+                        <textarea id="mycomap_blast_query" rows="4" class="sequence-textarea"
+                            placeholder="Paste one DNA sequence, FASTA record, or GenBank accession…"></textarea>
+                        <div class="sequence-input-footer">
+                            <span>UTF-8 · plain text</span>
+                            <button type="button" class="paste-example-link" data-paste-example="mycomap_blast_query">↳ Paste example</button>
+                        </div>
+                    </div>
+                    <p class="field-help text-xs mt-2">
+                        Find related sequences in the local fungal sequence database at MycoMap.org.
+                        Use one GenBank accession or a DNA sequence of 50–20,000 bp.
+                    </p>
+                </div>
+
+                <div class="grid grid-cols-2 gap-4">
+                    <div>
+                        <label for="mycomap_blast_min_identity"
+                            class="block text-sm font-medium text-gray-700 dark:text-gray-200 mb-2">
+                            Min Identity (%)
+                        </label>
+                        <input type="number" id="mycomap_blast_min_identity" value="90" min="50" max="100"
+                            class="w-full px-4 py-3 border border-gray-300 dark:border-journal-dark rounded-lg
+                                      bg-white dark:bg-journal-dark text-gray-900 dark:text-gray-100 focus:ring-2 focus:ring-journal-gold">
+                    </div>
+                    <div>
+                        <label for="mycomap_blast_max_sequences"
+                            class="block text-sm font-medium text-gray-700 dark:text-gray-200 mb-2">
+                            Max Results
+                        </label>
+                        <select id="mycomap_blast_max_sequences"
+                            class="w-full px-4 py-3 border border-gray-300 dark:border-journal-dark rounded-lg
+                                      bg-white dark:bg-journal-dark text-gray-900 dark:text-gray-100 focus:ring-2 focus:ring-journal-gold">
+                            <option value="10">10</option>
+                            <option value="50" selected>50</option>
+                            <option value="100">100</option>
+                            <option value="200">200</option>
+                        </select>
+                    </div>
+                </div>
+
+                <button id="mycomap_blast_btn" type="button" data-active-style="outline" class="btn w-full" disabled>
+                    <i class="fas fa-dna mr-2"></i> MycoMap BLAST
+                </button>
             </div>
             </div>
 
@@ -1819,10 +1895,9 @@
     // =========================================================================
     // Add Sequences source selector
     //
-    // Alan 9/12/26 - Six sources (iNaturalist, Mushroom Observer, MycoMap,
-    // BLAST, Paste, Upload) share one box behind a segmented control, so the
+    // Alan 9/12/26 - Sequence imports and BLAST searches share one box behind a segmented control, so the
     // queue and the tree options are not pushed a screen down and are not
-    // stacked below six cards on mobile.
+    // stacked below separate cards on mobile.
     //
     // Switching a segment is display only. The queue is the durable state and
     // lives in its own column, so a fetch summary hidden here is still one
@@ -1989,7 +2064,7 @@
     // above MO's, so the boundary becomes a threshold rather than a digit count.
     //
     // Nothing here is a guess about ambiguous input: 5 digits or fewer routes
-    // nowhere, and sequence data is never moved out of the two boxes that both
+    // nowhere, and sequence data is never moved out of the boxes that
     // legitimately accept it.
     // =========================================================================
     (function setupSourceAutoDetect() {
@@ -2013,10 +2088,11 @@
             mycomap: "mycomap_url",
             paste: "sequence_text",
             blast: "blast_query",
+            mycomap_blast: "mycomap_blast_query",
         };
         const LABEL = {
             inaturalist: "iNaturalist", mushroom_observer: "Mushroom Observer",
-            mycomap: "MycoMap", paste: "Paste", blast: "BLAST",
+            mycomap: "MycoMap", paste: "Paste", blast: "NCBI BLAST", mycomap_blast: "MycoMap BLAST",
         };
         // Each watched field and the source it already belongs to.
         const WATCHED = [
@@ -2025,10 +2101,10 @@
             ["mycomap_url", "mycomap"],
             ["sequence_text", "paste"],
             ["blast_query", "blast"],
+            ["mycomap_blast_query", "mycomap_blast"],
         ];
         // The three identifier boxes. Sequence data pasted into one of these is
-        // certainly misplaced; the same data in sequence_text or blast_query is
-        // exactly where it belongs, so it is never moved out of those two.
+        // certainly misplaced; Paste and the two BLAST query boxes accept it.
         const IDENTIFIER_FIELDS = new Set(["inaturalist", "mushroom_observer", "mycomap"]);
         const IUPAC_RE = /^[ACGTURYSWKMBDHVN]+$/i;
 
@@ -2077,7 +2153,7 @@
             }
 
             // 3 & 4. An accession, a FASTA record or a bare sequence. Both the
-            // Paste and BLAST boxes accept all three, so this only rescues data
+            // Paste and both BLAST boxes accept all three, so this only rescues data
             // stranded in one of the identifier boxes -- it never second-guesses
             // a user who is already in Paste or BLAST.
             if (!IDENTIFIER_FIELDS.has(ownSource)) return null;
@@ -2300,6 +2376,7 @@
     // =========================================================================
     let sequenceQueue = [];
     let lastBlastQuery = null; // Track the query used for the last successful BLAST
+    let lastMycomapBlastUrl = '';
     let selectedQueueOutgroup = '';
 
     function updateQueueDisplay() {
@@ -2999,8 +3076,8 @@
         if (!input) return;
         const activeMode = document.querySelector(`[data-input-chip="${inputId}"].is-active`)?.dataset.chipMode || 'fasta';
         input.value = activeMode === 'accessions'
-            ? (inputId === 'blast_query' ? 'OR807397' : 'OR807397\nOR807398')
-            : '>OP973765 Amanita muscaria ITS\nATGCGTACGTAGCTAGCTAGCTAGCTAGCTAGCTAGCTA';
+            ? (inputId.endsWith('blast_query') ? 'OR807397' : 'OR807397\nOR807398')
+            : '>OP973765 Amanita muscaria ITS\nATGCGTACGTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTA';
         input.dispatchEvent(new Event('input', { bubbles: true }));
         input.focus();
     }
@@ -3020,139 +3097,138 @@
     });
 
     // =========================================================================
-    // BLAST Button Logic
-    // =========================================================================
-    // =========================================================================
-    // BLAST Button Logic
+    // NCBI and MycoMap BLAST searches
     // =========================================================================
     const blastBtn = document.getElementById('blast_btn');
     const blastQueryInput = document.getElementById('blast_query');
-
-    function updateBlastButtonState() {
-        const text = blastQueryInput.value.trim();
-        let isValid = false;
-        updateSequenceInputMeta('blast_query');
-
-        if (isGenBankAccession(normalizeAccessionToken(text))) {
-            isValid = true;
-        } else if (text.length >= 20) {
-            // Basic DNA char check (allow some noise/formatting)
-            const dnaChars = (text.match(/[ACGTURYSWKMBDHVN]/gi) || []).length;
-            if (dnaChars >= 20) isValid = true;
-        } else {
-            const sequences = parseFasta(text);
-            if (sequences.length === 1 && sequences[0].sequence.length >= 20) {
-                isValid = true;
-            }
-        }
-
-        blastBtn.disabled = !isValid;
-        updateButtonVisuals(blastBtn, isValid);
-
-        if (isValid) {
-            blastBtn.title = "BLAST this sequence/accession to find related sequences";
-        } else {
-            blastBtn.title = "Enter a GenBank accession or sequence (>20bp) to BLAST";
-        }
-    }
-
-    blastQueryInput.addEventListener('input', updateBlastButtonState);
-    updateBlastButtonState();
-
-    // Read by the Paste panel's BLAST button, which must not start a second search.
+    const mycomapBlastBtn = document.getElementById('mycomap_blast_btn');
+    const mycomapBlastQueryInput = document.getElementById('mycomap_blast_query');
+    const sequenceTextInput = document.getElementById('sequence_text');
+    const blastSources = {
+        blast: {
+            input: blastQueryInput, button: blastBtn, label: 'NCBI BLAST', icon: 'fa-search',
+            endpoint: '/api/blast', telemetry: 'tree_builder.blast',
+        },
+        mycomap_blast: {
+            input: mycomapBlastQueryInput, button: mycomapBlastBtn, label: 'MycoMap BLAST', icon: 'fa-dna',
+            endpoint: '/api/mycomap/blast', telemetry: 'tree_builder.mycomap_blast',
+        },
+    };
+    // Both panels and Paste shortcuts share the guard, including input events
+    // that arrive while a request is still running.
     let blastRunning = false;
 
-    blastBtn.addEventListener('click', async () => {
-        const text = blastQueryInput.value.trim();
-        const minIdentity = document.getElementById('blast_min_identity').value;
-        const maxSequences = document.getElementById('blast_max_sequences').value;
+    function updateBlastButtonState() {
+        Object.entries(blastSources).forEach(([source, config]) => {
+            const isValid = pasteBlastQuery(config.input.value, source) !== null;
+            updateSequenceInputMeta(config.input.id);
+            config.button.disabled = blastRunning || !isValid;
+            updateButtonVisuals(config.button, isValid && !blastRunning);
+            config.button.title = source === 'mycomap_blast'
+                ? 'Search MycoMap.org using one GenBank accession or a sequence of 50–20,000 bp'
+                : 'Search NCBI using one GenBank accession or a sequence of at least 20 bp';
+        });
+    }
+
+    async function runBlastSearch(source, pasteText = null) {
+        const config = blastSources[source];
+        if (blastRunning) {
+            showStatus('A BLAST search is already running. Please wait for it to finish.', 'info');
+            return;
+        }
+        const text = config.input.value.trim();
+        let query = pasteBlastQuery(text, source);
+        if (!query) {
+            showStatus(config.button.title, 'error');
+            return;
+        }
+        if (query.startsWith('>')) query = parseFasta(query)[0].sequence;
+        query = query.replace(/\s+/g, '');
+        const minIdentity = document.getElementById(`${source}_min_identity`).value;
+        const maxSequences = document.getElementById(`${source}_max_sequences`).value;
 
         blastRunning = true;
-        blastBtn.disabled = true;
-        blastBtn.innerHTML = '<i class="fas fa-spinner fa-spin mr-2"></i> BLASTing...';
-        showStatus('Running BLAST search... This may take a minute.', 'info');
+        updateBlastButtonState();
+        updateAddSequencesButtonState();
+        config.button.innerHTML = '<i class="fas fa-spinner fa-spin mr-2"></i> Searching...';
+        showStatus(`Running ${config.label} search... This may take a minute.`, 'info');
 
         try {
-            let query = normalizeAccessionToken(text);
-
-            if (text.startsWith('>')) {
-                const seqs = parseFasta(text);
-                if (seqs.length === 1) {
-                    query = seqs[0].sequence;
-                } else if (seqs.length > 1) {
-                    throw expectedError(
-                        `BLAST accepts one query sequence at a time; this input contains ${seqs.length}. ` +
-                        'Use Add Sequences to put them in the queue, then build the tree.'
-                    );
-                }
-            }
-
             const csrfToken = document.querySelector('meta[name="csrf-token"]').getAttribute('content');
-            const resp = await fetchInBackground('/api/blast', {
+            const resp = await fetchInBackground(config.endpoint, {
                 method: 'POST',
                 headers: {
                     'Content-Type': 'application/json',
                     'X-CSRFToken': csrfToken
                 },
-                body: JSON.stringify({
-                    query: query,
-                    min_identity: minIdentity,
-                    max_sequences: maxSequences
-                })
+                body: JSON.stringify({ query, min_identity: minIdentity, max_sequences: maxSequences })
             });
-
             const data = await resp.json();
-
-            if (!resp.ok) {
-                throw httpError(resp, data.error || 'BLAST failed');
-            }
+            if (!resp.ok) throw httpError(resp, data.error || `${config.label} failed`);
 
             const added = addSequences(data.sequences);
-            showStatus(`BLAST complete! Added ${added} new sequences to queue.`, 'success');
-
-            // Save the query for later use in notes
+            const warnings = Array.isArray(data.warnings)
+                ? data.warnings.filter(warning => typeof warning === 'string') : [];
+            showStatus(`${config.label} complete! Added ${added} new sequences to queue.` +
+                (warnings.length ? ` ${warnings.join(' ')}` : ''), warnings.length ? 'warning' : 'success');
             lastBlastQuery = query;
+            if (source === 'mycomap_blast') {
+                if (data.mycomap_blast_url) lastMycomapBlastUrl = data.mycomap_blast_url;
+                mergeImportFilterDetails(data.import_filter_details);
+            }
 
-            // Optional: Clear input or keep it? 
-            // Often nice to keep it to see what was run, but maybe clear to indicate success.
-            // Let's clear it as per original behavior.
-            blastQueryInput.value = '';
-            updateBlastButtonState();
-
+            // Preserve anything typed during the search, and keep both inputs
+            // available for a retry when the search fails.
+            if (config.input.value.trim() === text) config.input.value = '';
+            if (pasteText !== null && sequenceTextInput.value === pasteText) {
+                sequenceTextInput.value = '';
+            }
         } catch (e) {
-            reportWorkflowFailure('tree_builder.blast', e);
-            showStatus('BLAST error: ' + e.message, 'error');
+            reportWorkflowFailure(config.telemetry, e);
+            showStatus(`${config.label} error: ${e.message}`, 'error');
+        } finally {
+            blastRunning = false;
+            config.button.innerHTML = `<i class="fas ${config.icon} mr-2"></i> ${config.label}`;
+            updateBlastButtonState();
+            updateAddSequencesButtonState();
         }
+    }
 
-        blastRunning = false;
-        blastBtn.innerHTML = '<i class="fas fa-search mr-2"></i> BLAST Sequence';
-        updateBlastButtonState();
+    Object.entries(blastSources).forEach(([source, config]) => {
+        config.input.addEventListener('input', updateBlastButtonState);
+        config.button.addEventListener('click', () => runBlastSearch(source));
     });
+    updateBlastButtonState();
 
     // =========================================================================
     // Add Sequences Button Logic (Visuals & Validation)
     // =========================================================================
     const addSequencesBtn = document.getElementById('add_sequences_btn');
-    const sequenceTextInput = document.getElementById('sequence_text');
     // Alan 8/10/26 - The location option only makes sense once GenBank accessions are present.
     const genbankLocationOption = document.getElementById('genbank_location_option');
     const genbankAddLocationsCheckbox = document.getElementById('genbank_add_locations');
     const pasteBlastBtn = document.getElementById('paste_blast_btn');
+    const pasteMycomapBlastBtn = document.getElementById('paste_mycomap_blast_btn');
 
     // Alan 10/12/26 - A single accession, NCBI record URL or sequence pasted here is
     // as often meant for BLAST as for the queue, so offer both. Returns the query to
     // hand the BLAST box, or null when the input is not exactly one query.
-    function pasteBlastQuery(text) {
+    function pasteBlastQuery(text, source = 'blast') {
         const trimmed = String(text || '').trim();
         if (!trimmed) return null;
         const accessions = parseGenBankAccessions(trimmed);
         if (accessions.length > 0) return accessions.length === 1 ? accessions[0] : null;
+        let sequence = trimmed;
         if (trimmed.startsWith('>')) {
             const records = parseFasta(trimmed);
-            return records.length === 1 && records[0].sequence.length >= 20 ? trimmed : null;
+            if (records.length !== 1) return null;
+            sequence = records[0].sequence;
         }
-        const collapsed = trimmed.replace(/\s+/g, '');
-        return collapsed.length >= 20 && /^[ACGTURYSWKMBDHVN]+$/i.test(collapsed) ? trimmed : null;
+        const collapsed = sequence.replace(/\s+/g, '');
+        const minLength = source === 'mycomap_blast' ? 50 : 20;
+        const maxLength = source === 'mycomap_blast' ? 20000 : Infinity;
+        return collapsed.length >= minLength && collapsed.length <= maxLength &&
+            /^[ACGTURYSWKMBDHVN]+$/i.test(collapsed) ? trimmed : null;
     }
 
     function shouldAddGenBankLocations() {
@@ -3179,36 +3255,40 @@
         addSequencesBtn.disabled = !isValid;
         updateButtonVisuals(addSequencesBtn, isValid);
 
-        if (pasteBlastBtn) {
-            const canBlast = pasteBlastQuery(text) !== null;
-            pasteBlastBtn.classList.toggle('hidden', !canBlast);
-            updateButtonVisuals(pasteBlastBtn, canBlast);
-        }
+        [[pasteBlastBtn, 'blast'], [pasteMycomapBlastBtn, 'mycomap_blast']].forEach(([button, source]) => {
+            if (!button) return;
+            const canBlast = pasteBlastQuery(text, source) !== null;
+            button.classList.toggle('hidden', !canBlast);
+            button.disabled = blastRunning || !canBlast;
+            updateButtonVisuals(button, canBlast && !blastRunning);
+        });
     }
 
     sequenceTextInput.addEventListener('input', updateAddSequencesButtonState);
 
-    // Moves the query to the BLAST tab, so its settings and progress are in view,
-    // and starts the search there.
-    pasteBlastBtn?.addEventListener('click', () => {
-        const query = pasteBlastQuery(sequenceTextInput.value);
+    // Reveal the chosen provider and copy the query without discarding the
+    // Paste input until the search has succeeded.
+    function startPasteBlast(source) {
+        const pasteText = sequenceTextInput.value;
+        const query = pasteBlastQuery(pasteText, source);
         if (!query) return;
-        window.openImportSection?.('blast');
+        const config = blastSources[source];
+        window.openImportSection?.(source);
         if (blastRunning) {
-            showStatus('A BLAST search is already running. When it finishes, come back to Paste to BLAST this one.', 'info');
+            showStatus('A BLAST search is already running. Please wait for it to finish.', 'info');
             return;
         }
-        const existing = blastQueryInput.value.trim();
+        const existing = config.input.value.trim();
         if (existing && existing !== query) {
-            showStatus('The BLAST box already has a query in it. Nothing was moved — clear the BLAST box, then try again.', 'info');
+            showStatus(`The ${config.label} box already has a query. Clear it before using the Paste shortcut.`, 'info');
             return;
         }
-        blastQueryInput.value = query;
-        sequenceTextInput.value = '';
-        blastQueryInput.dispatchEvent(new Event('input', { bubbles: true }));
-        sequenceTextInput.dispatchEvent(new Event('input', { bubbles: true }));
-        blastBtn.click();
-    });
+        config.input.value = query;
+        config.input.dispatchEvent(new Event('input', { bubbles: true }));
+        return runBlastSearch(source, pasteText);
+    }
+    pasteBlastBtn?.addEventListener('click', () => startPasteBlast('blast'));
+    pasteMycomapBlastBtn?.addEventListener('click', () => startPasteBlast('mycomap_blast'));
 
     // Initial check
     updateAddSequencesButtonState();
@@ -3384,7 +3464,7 @@
     const mycomapRebuildNcbiCheckbox = document.getElementById('mycomap_rebuild_ncbi');
     const mycomapRefreshLocalLimitInput = document.getElementById('mycomap_refresh_local_limit');
     const mycomapRefreshNcbiLimitInput = document.getElementById('mycomap_refresh_ncbi_limit');
-    let lastMycomapBlastUrl = '';
+    const mycomapRefreshNcbiLimitOption = document.getElementById('mycomap_refresh_ncbi_limit_option');
     // Alan 6/26/26 - Preserve MycoMap import filter diagnostics so tree Generation Details can explain excluded records.
     let importFilterDetails = {};
     function getMycomapBlastUrlForPayload() {
@@ -3475,6 +3555,19 @@
     mycomapFilterConflictingLocalCheckbox?.addEventListener('change', updateMycomapConflictFilterOptions);
     // Alan 7/10/26 - Initialize the dependent location option in its disabled default state.
     updateMycomapConflictFilterOptions();
+
+    // The two hit limits belong to separate reruns. Keep the NCBI value visibly
+    // inactive until its rebuild is selected so the default "100" cannot be
+    // mistaken for the local rerun's requested count.
+    function updateMycomapRefreshOptions() {
+        const rebuildNcbi = Boolean(mycomapRebuildNcbiCheckbox?.checked);
+        if (mycomapRefreshNcbiLimitInput) {
+            mycomapRefreshNcbiLimitInput.disabled = !rebuildNcbi;
+        }
+        mycomapRefreshNcbiLimitOption?.classList.toggle('opacity-50', !rebuildNcbi);
+    }
+    mycomapRebuildNcbiCheckbox?.addEventListener('change', updateMycomapRefreshOptions);
+    updateMycomapRefreshOptions();
     checkMycomapState();
 
     function isValidMycomapUrl(url) {
@@ -3623,10 +3716,24 @@
     // proceeds on the saved results.
     async function refreshMycomapBlastBeforeImport(url) {
         const rebuildNcbi = Boolean(mycomapRebuildNcbiCheckbox?.checked);
+        const requestedLocalHits = Math.max(
+            1,
+            Math.min(500, parseInt(mycomapRefreshLocalLimitInput?.value, 10) || 50)
+        );
+        const requestedNcbiHits = Math.max(
+            1,
+            Math.min(500, parseInt(mycomapRefreshNcbiLimitInput?.value, 10) || 100)
+        );
+        if (mycomapRefreshLocalLimitInput) {
+            mycomapRefreshLocalLimitInput.value = String(requestedLocalHits);
+        }
+        if (mycomapRefreshNcbiLimitInput) {
+            mycomapRefreshNcbiLimitInput.value = String(requestedNcbiHits);
+        }
         showStatus(
             rebuildNcbi
-                ? 'Refreshing the MycoMap BLAST. Local results refresh right away; the NCBI rebuild takes about 10 minutes before the import runs.'
-                : 'Refreshing the MycoMap local BLAST before importing...',
+                ? `Refreshing MycoMap with up to ${requestedLocalHits} local hits and ${requestedNcbiHits} NCBI hits. The NCBI rebuild takes about 10 minutes before the import runs.`
+                : `Refreshing the MycoMap local BLAST for up to ${requestedLocalHits} hits before importing...`,
             'info'
         );
         const csrfToken = document.querySelector('meta[name="csrf-token"]').getAttribute('content');
@@ -3636,8 +3743,8 @@
             body: JSON.stringify({
                 url: url,
                 rebuild_ncbi: rebuildNcbi,
-                local_limit: mycomapRefreshLocalLimitInput?.value,
-                ncbi_limit: mycomapRefreshNcbiLimitInput?.value,
+                local_limit: requestedLocalHits,
+                ncbi_limit: requestedNcbiHits,
                 refresh_only: true
             })
         });
@@ -3652,7 +3759,11 @@
         const pollDelayMs = (attempt) => attempt < 15 ? 1000 : (rebuildNcbi ? 5000 : 3000);
         const startedAt = Date.now();
         const deadline = startedAt + (rebuildNcbi ? 25 : 6) * 60 * 1000;
-        setMycomapBusyLabel(rebuildNcbi ? 'Rebuilding local + NCBI BLAST...' : 'Rebuilding local BLAST...');
+        setMycomapBusyLabel(
+            rebuildNcbi
+                ? `Rebuilding local (${requestedLocalHits}) + NCBI (${requestedNcbiHits}) BLAST...`
+                : `Rebuilding local BLAST (${requestedLocalHits} hits)...`
+        );
         let announcedLocalDone = false;
         for (let attempt = 0; Date.now() < deadline; attempt++) {
             await new Promise(resolve => setTimeout(resolve, pollDelayMs(attempt)));
@@ -3971,6 +4082,7 @@
     const inaturalistTreeChoices = document.getElementById('inaturalist_tree_choices');
     const inaturalistUseUserBtn = document.getElementById('inaturalist_use_user_btn');
     const inaturalistUseProjectBtn = document.getElementById('inaturalist_use_project_btn');
+    const inaturalistUseTaxonSearchBtn = document.getElementById('inaturalist_use_taxon_search_btn');
     // Alan 7/15/26 - Require explicit confirmation before replacing an existing iNaturalist tree URL.
     const inaturalistRecreateTreeOption = document.getElementById('inaturalist_recreate_tree_option');
     const inaturalistRecreateTreeCheckbox = document.getElementById('inaturalist_recreate_tree');
@@ -4145,12 +4257,25 @@
         inaturalistExistingTreeLink.classList.toggle('hidden', !safeUrl);
     }
 
+    // A species name typed into the observation box comes back as not_found
+    // with a taxon_hint. Offer the search Submit can import, built here from the
+    // numeric id exactly as a pasted taxon page is, never from a server string.
+    function setInaturalistTaxonSearch(hint) {
+        if (!inaturalistUseTaxonSearchBtn) return;
+        const usable = hint && hint.offer_search === true
+            && /^\d+$/.test(String(hint.id || ''));
+        inaturalistUseTaxonSearchBtn.dataset.taxonId = usable ? String(hint.id) : '';
+        inaturalistUseTaxonSearchBtn.dataset.taxonName = usable ? String(hint.name || '') : '';
+        inaturalistUseTaxonSearchBtn.classList.toggle('hidden', !usable);
+    }
+
     function clearInaturalistTreePreview() {
         currentInaturalistTreePreview = null;
         currentInaturalistTreePreviewInput = '';
         currentInaturalistTreeResolvedType = null;
         setInaturalistTreePreviewMessage('');
         setInaturalistExistingTreeLink('');
+        setInaturalistTaxonSearch(null);
         if (inaturalistTreeChoices) inaturalistTreeChoices.classList.add('hidden');
         // Alan 7/15/26 - Clear re-creation consent whenever the observation input or preview changes.
         if (inaturalistRecreateTreeOption) inaturalistRecreateTreeOption.classList.add('hidden');
@@ -4332,6 +4457,7 @@
             setInaturalistExistingTreeLink(
                 data.type === 'single_observation' ? data.phylogenetic_tree_url : ''
             );
+            setInaturalistTaxonSearch(data.type === 'not_found' ? data.taxon_hint : null);
             if (data.type === 'ambiguous' && inaturalistTreeChoices) {
                 inaturalistTreeChoices.classList.remove('hidden');
             }
@@ -4346,6 +4472,7 @@
             reportWorkflowFailure('tree_builder.inaturalist_preview', e);
             setInaturalistTreePreviewMessage(e.message, 'error');
             setInaturalistExistingTreeLink('');
+            setInaturalistTaxonSearch(null);
             return null;
         } finally {
             updateInaturalistTreeButtonForInput();
@@ -4358,6 +4485,7 @@
             nextTarget === inaturalistTreeBtn ||
             nextTarget === inaturalistUseUserBtn ||
             nextTarget === inaturalistUseProjectBtn ||
+            nextTarget === inaturalistUseTaxonSearchBtn ||
             nextTarget === inaturalistRecreateTreeCheckbox ||
             nextTarget === inaturalistKeepTreeUrlRadio
         )) {
@@ -4379,6 +4507,25 @@
     }
     if (inaturalistUseProjectBtn) {
         inaturalistUseProjectBtn.addEventListener('click', () => previewInaturalistTreeInput('project'));
+    }
+    if (inaturalistUseTaxonSearchBtn) {
+        inaturalistUseTaxonSearchBtn.addEventListener('click', () => {
+            const taxonId = inaturalistUseTaxonSearchBtn.dataset.taxonId || '';
+            const name = inaturalistUseTaxonSearchBtn.dataset.taxonName || 'that species';
+            const search = inaturalistTaxonSearchUrl(`https://www.inaturalist.org/taxa/${taxonId}`);
+            if (!search) return;
+            // Drop any preview still in flight for the typed name.
+            inaturalistTreePreviewRequestId += 1;
+            inaturalistUrlInput.value = search;
+            clearInaturalistTreePreview();
+            checkInatState();
+            showStatus(
+                `Search filled in for ${name} observations with a DNA Barcode ITS sequence. `
+                + 'Click Submit to import them.',
+                'info'
+            );
+            fetchInaturalistBtn.focus();
+        });
     }
     if (inaturalistRebuildNcbiCheckbox) {
         inaturalistRebuildNcbiCheckbox.addEventListener('change', updateInaturalistNcbiWaitHint);
@@ -4415,8 +4562,12 @@
 
         if (!isValidInaturalistInput(url)) {
             if (isLikelyInaturalistTreeInput(url)) {
-                await previewInaturalistTreeInput();
-                showStatus('iNaturalist tree preview ready. Review the count, then click One-Click Tree to queue jobs.', 'info');
+                const preview = await previewInaturalistTreeInput();
+                // A not-found preview explains itself in the panel; announcing
+                // "preview ready" over it read as though something had been found.
+                if (preview && preview.type !== 'not_found') {
+                    showStatus('iNaturalist tree preview ready. Review the count, then click One-Click Tree to queue jobs.', 'info');
+                }
                 return;
             }
             showStatus('Enter an iNaturalist observation ID, observation URL, username, or project.', 'error');

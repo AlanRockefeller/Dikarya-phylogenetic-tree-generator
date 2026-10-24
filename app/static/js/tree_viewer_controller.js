@@ -146,7 +146,7 @@ document.addEventListener('DOMContentLoaded', async () => {
     //   viewer  collapse/expand of clades. Pure display state living on the
     //           phylotree nodes, so undoing it is local and instant.
     //   server  the last persisted edit (prune / rename / rotate / reroot /
-    //           rooting change). The checkpoint is a file snapshot held by
+    //           rooting change / annotation save). The checkpoint is a file snapshot held by
     //           app/services/tree_undo_service.py; `serverUndoState` is only
     //           this tab's view of whether one exists.
     //
@@ -233,6 +233,13 @@ document.addEventListener('DOMContentLoaded', async () => {
 
     // Apply whatever the single Undo slot currently holds.
     async function performUndo() {
+        // Alan 10/20/26 - An annotation edit still waiting on its debounce, or in flight, is
+        // the newest action. Let it land first so Undo takes it back, rather than restoring
+        // the checkpoint and then having that late save re-apply the edit over the restore.
+        if (annotationSaveDebounce || annotationSaveChain) {
+            const pending = annotationSaveDebounce ? saveAnnotationsNow() : annotationSaveChain;
+            try { await pending; } catch (_) { /* reported by the save cycle */ }
+        }
         if (undoStateNeedsRefresh && !isProcessing) await refreshServerUndoState();
         const target = currentUndoTarget();
         if (!target || isProcessing) return;
@@ -866,6 +873,9 @@ document.addEventListener('DOMContentLoaded', async () => {
     let annotationSaveChain = null;
     let annotationSaveQueued = false;
     let annotationRevision = 0;
+    // Alan 10/20/26 - What the edits waiting to be sent were, for the Undo label. Edits of
+    // different kinds coalesced into one POST are reported as 'mixed' (a generic label).
+    let pendingAnnotationUndoKind = null;
     // Alan 8/15/26 - Editor session: what is being added/edited and for which tips.
     let annotationEditorState = null;
     // Remember the quick-annotation hint per tree, including after a page reload.
@@ -1069,6 +1079,28 @@ document.addEventListener('DOMContentLoaded', async () => {
         annotationRevision += 1;
     }
 
+    // Alan 10/20/26 - Record what kind of annotation edit is about to be saved.
+    function noteAnnotationUndoKind(kind) {
+        if (!kind) return;
+        pendingAnnotationUndoKind = (pendingAnnotationUndoKind && pendingAnnotationUndoKind !== kind)
+            ? 'mixed' : kind;
+    }
+
+    // Alan 10/20/26 - Annotation saves are undoable. The reply carries the job's undo state,
+    // so adopt it directly; a save that changed something is now the newest action, so it
+    // also supersedes any collapse/expand undo still held by the viewer.
+    function adoptAnnotationUndoState(data) {
+        if (!data || !data.undo) return;
+        undoStateRequest += 1; // an older in-flight GET must not overwrite this
+        clearTimeout(undoStateRetryTimer);
+        undoStateNeedsRefresh = false;
+        serverUndoState = { ...data.undo, can_undo: Boolean(data.undo.available) };
+        if (data.undo_recorded && viewer && typeof viewer.clearCollapseUndo === 'function') {
+            viewer.clearCollapseUndo();
+        }
+        updateUndoButton();
+    }
+
     // Alan 8/15/26 - Layers still owned by an open annotation editor are held back from every
     // save until that editor commits, so an unrelated save (a colour tweak, a visibility
     // toggle) can never persist a layer the user is about to cancel out of.
@@ -1086,12 +1118,15 @@ document.addEventListener('DOMContentLoaded', async () => {
             do {
                 annotationSaveQueued = false;
                 const sentRevision = annotationRevision;
+                const undoKind = pendingAnnotationUndoKind;
+                pendingAnnotationUndoKind = null;
                 try {
                     // Serialized at call time, so this is a snapshot of the state as it is now.
                     const data = await TreeEditActions.saveCladeAnnotations(
-                        JOB_ID, annotationLayersForSave(), cladeAnnotations
+                        JOB_ID, annotationLayersForSave(), cladeAnnotations, undoKind
                     );
                     ok = true;
+                    adoptAnnotationUndoState(data);
                     // Adopt the server's normalization only while it is still the newest
                     // thing anyone has said. If the user edited during the round trip, their
                     // state wins and the next pass (or the pending debounce) sends it.
@@ -1105,6 +1140,7 @@ document.addEventListener('DOMContentLoaded', async () => {
                     // and fall back to the authoritative persisted configuration so nothing
                     // local-only keeps being displayed as if it had been saved.
                     annotationSaveQueued = false;
+                    pendingAnnotationUndoKind = null;
                     if (annotationSaveDebounce) {
                         clearTimeout(annotationSaveDebounce);
                         annotationSaveDebounce = null;
@@ -1125,13 +1161,14 @@ document.addEventListener('DOMContentLoaded', async () => {
     // Alan 8/15/26 - One atomic save of the complete configuration. Last-write-wins across
     // tabs by design; the endpoint replaces only the annotation keys of tree_state.json.
     // Callers await the outcome of the coalesced cycle rather than starting a second POST.
-    function saveAnnotationsNow() {
+    function saveAnnotationsNow(undoKind = null) {
         if (annotationSaveDebounce) {
             clearTimeout(annotationSaveDebounce);
             annotationSaveDebounce = null;
         }
         if (!annotationsEditable() || JOB_ID === 'unknown') return Promise.resolve(false);
         touchAnnotations();
+        noteAnnotationUndoKind(undoKind);
         if (annotationSaveChain) {
             annotationSaveQueued = true;
             return annotationSaveChain;
@@ -1143,8 +1180,9 @@ document.addEventListener('DOMContentLoaded', async () => {
     // Alan 8/15/26 - Debounce rapid edits, especially the colour inputs, into one request.
     // The revision is bumped now, not when the timer fires, so an in-flight reply that lands
     // in between cannot repaint the UI with the colour the user has already moved past.
-    function debouncedSaveAnnotations() {
+    function debouncedSaveAnnotations(undoKind = null) {
         touchAnnotations();
+        noteAnnotationUndoKind(undoKind);
         if (annotationSaveDebounce) clearTimeout(annotationSaveDebounce);
         annotationSaveDebounce = setTimeout(() => {
             annotationSaveDebounce = null;
@@ -1894,7 +1932,7 @@ document.addEventListener('DOMContentLoaded', async () => {
         // drops the local-only layer rather than leaving it behind as a fake.
         const wasAdd = annotationEditorState.mode !== 'edit';
         closeAnnotationEditor(true);
-        const saved = await saveAnnotationsNow();
+        const saved = await saveAnnotationsNow(wasAdd ? 'add' : 'edit');
         if (saved) {
             // Alan 9/9/26 - Drop the tip selection once a NEW annotation is saved, so the group
             // that was just annotated is not silently carried into the next Add. Only the
@@ -2026,7 +2064,7 @@ document.addEventListener('DOMContentLoaded', async () => {
         annotationMembershipPicker.saving = true;
         updateAnnotationMembershipPicker();
         cladeAnnotations[index] = updated;
-        const saved = await saveAnnotationsNow();
+        const saved = await saveAnnotationsNow('members');
         if (saved) {
             closeAnnotationMembershipPicker(false, true);
             showStatus(`Updated members of "${updated.label}".`, 'success', 2500);
@@ -2049,8 +2087,8 @@ document.addEventListener('DOMContentLoaded', async () => {
         const id = annotationEditorState.annotationId;
         cladeAnnotations = cladeAnnotations.filter(a => a.id !== id);
         closeAnnotationEditor();
-        const saved = await saveAnnotationsNow();
-        if (saved) showStatus('Annotation deleted.', 'success', 2000);
+        const saved = await saveAnnotationsNow('delete');
+        if (saved) showStatus('Annotation deleted. Undo is available.', 'success', 3000);
     }
 
     // Alan 8/17/26 - New section: the Annotation Manager list, layer cards and validity warnings.
@@ -2179,8 +2217,8 @@ document.addEventListener('DOMContentLoaded', async () => {
                 }));
                 row.appendChild(annotationIconButton('fas fa-trash', 'Delete annotation', async () => {
                     cladeAnnotations = cladeAnnotations.filter(a => a.id !== annotation.id);
-                    const saved = await saveAnnotationsNow();
-                    if (saved) showStatus('Annotation deleted.', 'success', 2000);
+                    const saved = await saveAnnotationsNow('delete');
+                    if (saved) showStatus('Annotation deleted. Undo is available.', 'success', 3000);
                 }, 'text-red-600 dark:text-red-300'));
             }
 
@@ -2234,7 +2272,7 @@ document.addEventListener('DOMContentLoaded', async () => {
             layer.default_highlight_color = picker.value;
             sync();
             if (viewer?.setCladeAnnotations) viewer.setCladeAnnotations(annotationLayers, cladeAnnotations);
-            debouncedSaveAnnotations();
+            debouncedSaveAnnotations('layer_style');
         };
         mode.addEventListener('change', commit);
         picker.addEventListener('change', commit);
@@ -2295,7 +2333,7 @@ document.addEventListener('DOMContentLoaded', async () => {
             // Repaint immediately so inheriting annotations restyle without waiting for the
             // debounced save round-trip.
             if (viewer?.setCladeAnnotations) viewer.setCladeAnnotations(annotationLayers, cladeAnnotations);
-            debouncedSaveAnnotations();
+            debouncedSaveAnnotations('layer_style');
         };
         control.addEventListener('change', commit);
         if (control.type === 'color') control.addEventListener('input', commit);
@@ -2341,7 +2379,7 @@ document.addEventListener('DOMContentLoaded', async () => {
                     const next = name.value.trim();
                     if (!next) { name.value = layer.name; return; }
                     layer.name = next;
-                    debouncedSaveAnnotations();
+                    debouncedSaveAnnotations('layer_rename');
                 });
                 top.appendChild(name);
             } else {
@@ -2360,7 +2398,7 @@ document.addEventListener('DOMContentLoaded', async () => {
                     if (index === 0) return;
                     const previous = ordered[index - 1];
                     const swap = layer.order; layer.order = previous.order; previous.order = swap;
-                    await saveAnnotationsNow();
+                    await saveAnnotationsNow('layer_order');
                 });
                 up.disabled = index === 0;
                 top.appendChild(up);
@@ -2369,7 +2407,7 @@ document.addEventListener('DOMContentLoaded', async () => {
                     if (index === ordered.length - 1) return;
                     const next = ordered[index + 1];
                     const swap = layer.order; layer.order = next.order; next.order = swap;
-                    await saveAnnotationsNow();
+                    await saveAnnotationsNow('layer_order');
                 });
                 down.disabled = index === ordered.length - 1;
                 top.appendChild(down);
@@ -2377,7 +2415,7 @@ document.addEventListener('DOMContentLoaded', async () => {
                 top.appendChild(annotationIconButton(visible ? 'fas fa-eye' : 'fas fa-eye-slash',
                     visible ? 'Hide this layer (its annotations are kept)' : 'Show this layer', async () => {
                         layer.visible = !visible;
-                        await saveAnnotationsNow();
+                        await saveAnnotationsNow('layer_visibility');
                     }));
 
                 // Deleting a layer never silently discards the annotations inside it.
@@ -2391,7 +2429,7 @@ document.addEventListener('DOMContentLoaded', async () => {
                         return;
                     }
                     annotationLayers = annotationLayers.filter(l => l.id !== layer.id);
-                    const saved = await saveAnnotationsNow();
+                    const saved = await saveAnnotationsNow('layer_delete');
                     if (saved) showStatus('Layer deleted.', 'success', 2000);
                 }, 'text-red-600 dark:text-red-300'));
             } else if (!visible) {
@@ -2565,7 +2603,10 @@ document.addEventListener('DOMContentLoaded', async () => {
             localStorage.setItem(`dikarya_tree_${JOB_ID}`, JSON.stringify({
                 supportFont: Number(getEl('input-support-font')?.value) || 9,
                 tipFont: Number(getEl('input-tip-font')?.value) || 12,
-                spacingX: viewer?.spacingState?.x || 0,
+                // Alan 10/20/26 - Width as a percentage of the fitted width. Replaces spacingX,
+                // a per-level pixel offset that no longer means anything; a clade stretch is a
+                // momentary view and is never saved (savedHorizontalPercent excludes it).
+                widthPercent: viewer?.savedHorizontalPercent ?? 100,
                 spacingY: viewer?.spacingState?.y || 0,
                 tipLabelGap: viewer?.tipLabelGap ?? 2,
             }));
@@ -2584,8 +2625,14 @@ document.addEventListener('DOMContentLoaded', async () => {
             if (tIn && prefs.tipFont) tIn.value = prefs.tipFont;
             viewer.applyTextSizing();
             // Alan 7/17/26 - Replace spacing with the saved values so repeated tree redraws cannot compound them.
-            viewer.setSpacingState(prefs.spacingX || 0, prefs.spacingY || 0);
+            viewer.setSpacingState(0, prefs.spacingY || 0);
             viewer.setTipLabelGap(prefs.tipLabelGap ?? 2);
+            // Alan 10/20/26 - A saved spacingX from before the fitted width is ignored: the
+            // tree opens fitted to the screen, and only a widthPercent saved since applies.
+            const widthPercent = Number(prefs.widthPercent);
+            if (Number.isFinite(widthPercent) && widthPercent !== viewer.getHorizontalPercent()) {
+                viewer.setHorizontalPercent(widthPercent, { reason: 'restore' });
+            }
         } catch (e) {}
     }
 
@@ -2990,6 +3037,8 @@ document.addEventListener('DOMContentLoaded', async () => {
             // Alan 10/3/26 - Collapse weak branches ships unchecked; null threshold = scale default.
             supportCollapse: !!getEl('cb-collapse-weak-support')?.checked,
             supportCollapseThreshold: null,
+            // Alan 10/20/26 - Long-branch breaks ship checked; honour the box if a cached page differs.
+            breakLongBranches: getEl('cb-break-long-branches') ? getEl('cb-break-long-branches').checked : true,
             layout: 'linear',
             alignTips: false,
             // grab initial DOM values
@@ -3578,7 +3627,7 @@ document.addEventListener('DOMContentLoaded', async () => {
         getEl('btn-annotation-add-layer')?.addEventListener('click', async () => {
             if (!annotationsEditable()) return;
             createAnnotationLayer(`Layer ${annotationLayers.length + 1}`);
-            await saveAnnotationsNow();
+            await saveAnnotationsNow('layer_add');
             setAnnotationManagerTab('layers');
         });
         getEl('btn-annotation-editor-close')?.addEventListener('click', closeAnnotationEditor);
@@ -3685,28 +3734,65 @@ document.addEventListener('DOMContentLoaded', async () => {
         });
 
         // Zoom & Fit
-        getEl('btn-fit')?.addEventListener('click', () => viewer?.fitToView());
+        // Alan 10/20/26 - Fit also resets Width to 100%, which is worth remembering.
+        getEl('btn-fit')?.addEventListener('click', () => {
+            if (!viewer) return;
+            viewer.fitToView();
+            saveDisplayPrefs();
+        });
         getEl('btn-zoom-in')?.addEventListener('click', () => triggerZoom(-300));
         getEl('btn-zoom-out')?.addEventListener('click', () => triggerZoom(300));
 
         // Spacing - Use larger increments for visible effect
         const showSpacingFeedback = () => {
             if (!viewer) return;
-            const { x, y } = viewer.spacingState;
-            showStatus(`Spacing: H${x > 0 ? '+' : ''}${x}, V${y > 0 ? '+' : ''}${y}`, "info", 1500);
+            const { y } = viewer.spacingState;
+            // Alan 10/20/26 - Horizontal is reported as Width, a percentage of the fitted width.
+            showStatus(`Width ${Math.round(viewer.getHorizontalPercent())}%, vertical spacing ${y > 0 ? '+' : ''}${y}`, "info", 1500);
         };
 
+        // Alan 10/20/26 - Width steps through HORIZONTAL_PERCENT_STEPS (100% fits the pane)
+        // instead of adding 5px to a per-level step whose meaning depended on tree depth.
         getEl('btn-spacing-x-inc')?.addEventListener('click', () => {
-            if (DEBUG_MODE) console.log('X-Inc clicked: adding 5 to X');
-            viewer?.updateSpacing(5, 0);
+            if (!viewer) return;
+            viewer.stepHorizontalPercent(1);
             showSpacingFeedback();
             saveDisplayPrefs();
         });
         getEl('btn-spacing-x-dec')?.addEventListener('click', () => {
-            if (DEBUG_MODE) console.log('X-Dec clicked: subtracting 5 from X');
-            viewer?.updateSpacing(-5, 0);
+            if (!viewer) return;
+            viewer.stepHorizontalPercent(-1);
             showSpacingFeedback();
             saveDisplayPrefs();
+        });
+
+        // Alan 10/20/26 - Keep the Width readout in step with every change (buttons, Fit, a
+        // restored preference, a clade stretch), and say what a clade stretch did.
+        container?.addEventListener('dikarya:horizontal-width', (event) => {
+            const detail = event.detail || {};
+            const readout = getEl('horizontal-width-value');
+            if (readout) readout.textContent = String(Math.round(detail.percent || 100));
+            if (detail.reason !== 'clade') return;
+            if (detail.alreadyWide) {
+                showStatus('This clade already fills the screen width; scrolled to it.', 'info', 3500);
+                return;
+            }
+            const times = detail.magnification >= 10
+                ? Math.round(detail.magnification)
+                : Math.round(detail.magnification * 10) / 10;
+            showStatus(`Stretched ${times}x so this clade fills the screen`
+                + (detail.capped ? ' (as far as the tree can widen)' : '')
+                + '. Fit returns to the whole tree.', 'success', 5000);
+        });
+        // Alan 10/20/26 - Show how many branches the long-branch option shortened.
+        container?.addEventListener('dikarya:long-branch-breaks', (event) => {
+            const count = Number(event.detail?.count) || 0;
+            const note = getEl('long-branch-break-count');
+            if (note) note.textContent = count ? `(${count} on this tree)` : '';
+        });
+        getEl('cb-break-long-branches')?.addEventListener('change', (event) => {
+            if (!viewer) return;
+            viewer.setOptions({ breakLongBranches: !!event.target.checked });
         });
         getEl('btn-spacing-y-inc')?.addEventListener('click', () => {
             if (DEBUG_MODE) console.log('Y-Inc clicked: adding 5 to Y');

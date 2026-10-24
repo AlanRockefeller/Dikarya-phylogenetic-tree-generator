@@ -1,8 +1,9 @@
-"""Read public MycoMap.org BLAST results without following user supplied URLs."""
+"""Submit MycoMap.org BLAST searches and read results through fixed API paths."""
 
 import hashlib
 import json
 import logging
+import math
 import os
 import re
 import time
@@ -23,6 +24,11 @@ _JOB_LINK = re.compile(r"(?:/|%2F)(\d+)(?:/?$|[?&#])", re.I)
 _LOCAL_XML_ID = re.compile(r"/local_(\d+)_xml\.", re.I)
 # The rerun endpoint accepts only these hit counts (MycoMap.org PR #9).
 RERUN_MAX_HITS = (50, 100, 250, 500)
+# MycoMap.org's public MycoBLAST form accepts one 50-20,000 bp query.
+SEARCH_MIN_QUERY_LENGTH = 50
+SEARCH_MAX_QUERY_LENGTH = 20_000
+SEARCH_POLL_INTERVAL_SECONDS = 2
+SEARCH_REQUEST_BUDGET_SECONDS = 200
 
 
 class OrgResultError(Exception):
@@ -63,7 +69,7 @@ def _read(path, *, limit=MAX_JSON_BYTES, method="GET", body=None,
     if authenticated:
         key = (os.environ.get("MYCOMAP_ORG_API_KEY") or "").strip()
         if not key:
-            raise OrgResultError("MycoMap.org rerun key is not configured.", 502,
+            raise OrgResultError("MycoMap.org access key is not configured.", 502,
                                  retryable=False)
         # Alan 10/7/26 - MycoMap.org reads an API key only from X-API-Key, raw,
         # with no "Bearer " prefix. Authorization: Bearer there carries mobile-app
@@ -100,7 +106,9 @@ def _read(path, *, limit=MAX_JSON_BYTES, method="GET", body=None,
             logger.warning("event=mycomap_org.rate_limited path=%s retry_after=%s",
                            path.split("?", 1)[0], retry_after.strip()[:10] or "-")
             raise OrgResultError(
-                "MycoMap.org's rerun limit was reached; Dikarya will try again shortly.",
+                ("MycoMap.org's search limit was reached; please try again shortly."
+                 if path == "submit" else
+                 "MycoMap.org's rerun limit was reached; Dikarya will try again shortly."),
                 502,
             ) from exc
         if exc.code in (401, 403):
@@ -111,8 +119,12 @@ def _read(path, *, limit=MAX_JSON_BYTES, method="GET", body=None,
                     exc.code, path.split("?", 1)[0], len(key),
                     hashlib.sha256(key.encode()).hexdigest()[:12],
                 )
-                message = (f"MycoMap.org did not accept Dikarya's access key "
-                           f"(HTTP {exc.code}).")
+                message = (
+                    "MycoMap.org is not accepting new BLAST searches from Dikarya. "
+                    "You can use NCBI BLAST meanwhile."
+                    if path == "submit" else
+                    f"MycoMap.org did not accept Dikarya's access key (HTTP {exc.code})."
+                )
             else:
                 message = (f"MycoMap.org refused access to this BLAST result "
                            f"(HTTP {exc.code}).")
@@ -163,6 +175,129 @@ def resolve_result_id(reference):
 
 def status(result_id):
     return _json(result_id)
+
+
+def _search_query(query):
+    """Normalize one raw/FASTA query or an individual GenBank accession.
+
+    Match the public MycoBLAST form's bounds before creating an upstream job.
+    Headers and comments are discarded locally rather than sent to MycoMap.
+    """
+    from app.services.fasta_utils import is_insdc_master_accession
+
+    if not isinstance(query, str) or not query.strip():
+        raise ValueError("Enter a DNA sequence or GenBank accession to search.")
+    query = query.strip()
+    if is_genbank_accession(query):
+        if is_insdc_master_accession(query):
+            raise ValueError(
+                "That accession is a project record with no sequence; enter an "
+                "individual sequence accession instead."
+            )
+        return "genbank", query.upper()
+    lines = [line.strip() for line in query.splitlines() if line.strip()]
+    if sum(line.startswith(">") for line in lines) > 1:
+        raise ValueError("MycoMap BLAST searches one sequence at a time; paste a single FASTA record.")
+    sequence = re.sub(r"[\s\d]", "", "".join(
+        line for line in lines if not line.startswith((">", ";"))
+    )).upper()
+    if not sequence or not re.fullmatch(r"[ACGTURYKMSWBDHVN]+", sequence):
+        raise ValueError("Enter a DNA sequence containing only nucleotide codes, or a GenBank accession.")
+    sequence = sequence.replace("U", "T")
+    if not any(base in sequence for base in "ACGT"):
+        raise ValueError("The sequence needs at least one A, C, G or T base.")
+    if len(sequence) < SEARCH_MIN_QUERY_LENGTH:
+        raise ValueError(f"MycoMap BLAST needs at least {SEARCH_MIN_QUERY_LENGTH} sequence bases.")
+    if len(sequence) > SEARCH_MAX_QUERY_LENGTH:
+        raise ValueError(f"MycoMap BLAST accepts up to {SEARCH_MAX_QUERY_LENGTH:,} sequence bases.")
+    return "sequence", sequence
+
+
+def search_from_query(query, *, min_identity=90.0, max_sequences=50,
+                      time_budget=SEARCH_REQUEST_BUDGET_SECONDS):
+    """Search MycoMap.org's local database and return import-ready full hits.
+
+    ``submit`` creates a BLAST search, not a persistent sequence record. The
+    contract is the one used by MycoMap.org's public MycoBLAST page: type/input,
+    limit and localOnly. The installed server key stays on this server. A
+    single deadline covers submission, polling, XML and full-sequence fetches.
+    """
+    query_type, normalized_query = _search_query(query)
+    try:
+        identity = float(min_identity)
+    except (TypeError, ValueError):
+        identity = 90.0
+    if not math.isfinite(identity):
+        identity = 90.0
+    identity = max(50.0, min(100.0, identity))
+    try:
+        limit = int(max_sequences)
+    except (TypeError, ValueError, OverflowError):
+        limit = 50
+    limit = max(1, min(500, limit))
+    try:
+        budget = float(time_budget)
+    except (TypeError, ValueError):
+        budget = 0
+    if not math.isfinite(budget) or budget <= 0:
+        raise ValueError("MycoMap BLAST needs a positive request time budget.")
+    deadline = time.monotonic() + budget
+
+    def remaining():
+        seconds = deadline - time.monotonic()
+        if seconds <= 0:
+            raise TimeoutError("MycoMap.org BLAST did not finish in time.")
+        return seconds
+
+    try:
+        submitted = json.loads(_read(
+            "submit", method="POST", authenticated=True, deadline=deadline,
+            body={"type": query_type, "input": normalized_query,
+                  "limit": rerun_max_hits(limit), "localOnly": True},
+        ))
+    except (ValueError, UnicodeDecodeError) as exc:
+        raise OrgResultError("MycoMap.org returned an invalid search response.") from exc
+    result_id = str(submitted.get("job_id") or "") if isinstance(submitted, dict) else ""
+    if not re.fullmatch(r"[1-9]\d{0,11}", result_id):
+        raise OrgResultError("MycoMap.org did not return a valid BLAST search ID.")
+    logger.info("event=mycomap_org.search_submitted result_id=%s query_type=%s "
+                "max_hits=%s min_identity=%s", result_id, query_type, limit, identity)
+
+    while True:
+        remaining()
+        record = _json(result_id, deadline=deadline)
+        local = record.get("local") or {}
+        if not isinstance(local, dict):
+            raise OrgResultError("MycoMap.org returned invalid local BLAST status.")
+        local_state = str(local.get("status") or "").lower()
+        overall_state = str(record.get("status") or "").lower()
+        if local_state in {"failed", "failure", "error"} or overall_state in {
+            "failed", "failure", "error"
+        }:
+            raise OrgResultError("MycoMap.org could not complete the local BLAST search.",
+                                 retryable=False)
+        if local_state not in {"queued", "pending", "running", "processing"}:
+            if local.get("has_results"):
+                break
+            if local_state in {"done", "complete", "completed"} or overall_state in {
+                "done", "complete", "completed"
+            }:
+                raise OrgResultError("MycoMap.org finished the search without publishing BLAST results.")
+        time.sleep(min(SEARCH_POLL_INTERVAL_SECONDS, remaining()))
+
+    result = fetch_results(result_id, include_ncbi=False, include_local=True,
+                           time_budget=remaining())
+    remaining()
+    if result.get("failed_sources") or result.get("pending_sources") or result.get("errors"):
+        raise OrgResultError("MycoMap.org could not load the completed local BLAST results.")
+    result["sequences"] = [
+        hit for hit in result.get("sequences", [])
+        if hit.get("identity") is not None and hit["identity"] >= identity
+    ][:limit]
+    result["local_count"] = len(result["sequences"])
+    result["result_id"] = result_id
+    result["result_url"] = f"https://mycomap.org/mycoblast/{result_id}"
+    return result
 
 
 def rerun_pending(details):
@@ -681,7 +816,16 @@ def fetch_results(result_id, *, include_ncbi=True, include_local=True,
                 if curated_label:
                     name, taxon = curated_label, curated
             else:
-                name = f"{hit['id']} {observation_token} {taxon or hit['description']}"
+                # MycoMap.org identifies local hits with its own sequence ID.
+                # A bare numeric ID such as ``833182`` looks exactly like a
+                # GenBank accession with its letter prefix stripped, which led
+                # users to conclude both that local hits were absent and that
+                # GenBank labels had been damaged. Keep the upstream ID, but
+                # make its namespace explicit in every exported tree label.
+                name = (
+                    f"MycoMap#{hit['id']} {observation_token} "
+                    f"{taxon or hit['description']}"
+                )
             name = name.strip()
             if source == "ncbi":
                 sequence = hit["full_sequence"]

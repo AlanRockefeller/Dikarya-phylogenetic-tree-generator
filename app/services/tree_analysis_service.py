@@ -1919,16 +1919,39 @@ def _tree_metadata(job_dir: Path, recomputed: bool) -> Dict[str, Any]:
     A recomputed tree was built by its own run, which writes
     tree_pruned_metadata.json; the original tree_metadata.json describes a tree
     the viewer is no longer showing. Its keys are kept as a fallback for
-    anything the recompute did not record.
+    anything the recompute did not record -- except the run-outcome keys,
+    which a builder writes only when they apply. Their absence from the
+    recompute is itself the answer: a converged recompute has no
+    ``convergence_warnings``, and inheriting the original run's showed a
+    non-convergence banner over a converged tree (job eawn).
     """
     metadata = _load_json(job_dir / "tree" / "tree_metadata.json")
     if recomputed:
         pruned = _load_json(job_dir / "tree" / "tree_pruned_metadata.json")
         if pruned:
-            merged = dict(metadata)
+            merged = {
+                key: value for key, value in metadata.items()
+                if key not in _RUN_OUTCOME_KEYS
+            }
             merged.update(pruned)
             return merged
     return metadata
+
+
+# Written by the builder only when they apply to that run, so never inherited
+# from the original run's metadata by a recompute.
+_RUN_OUTCOME_KEYS = frozenset({
+    "asdsf",
+    "min_ess",
+    "max_psrf",
+    "converged",
+    "convergence_checked",
+    "convergence_unavailable",
+    "convergence_warnings",
+    "mcmc_generations_completed",
+    "mcmc_stopped_at_stopval",
+    "identical_sequences",
+})
 
 
 def _first_positive_int(*values: Any) -> int:
@@ -3773,6 +3796,32 @@ def _call_claude_cli(
         ) from exc
 
     try:
+        return _parse_cli_reply(completed, displayed_names)
+    except TreeAnalysisUpstreamError as exc:
+        # The reason alone ("malformed review") does not say what Claude sent,
+        # and the review cannot be re-asked to find out. Keep the raw reply in
+        # the restricted api-responses archive; review_job() logs its id.
+        if not isinstance(exc, TreeAnalysisTimeout):
+            from app.services.api_diagnostics import record_api_failure
+            exc.diagnostic_id = record_api_failure(
+                "cli://dikarya-claude-review",
+                reason=str(exc),
+                status=completed.returncode,
+                method="CLI",
+                body={
+                    "returncode": completed.returncode,
+                    "stdout": completed.stdout,
+                    "stderr_tail": (completed.stderr or "")[-4000:],
+                },
+            )
+        raise
+
+
+def _parse_cli_reply(
+    completed, displayed_names: Optional[Set[str]] = None
+) -> Dict[str, Any]:
+    """Turn the wrapper's finished run into a validated review, or raise."""
+    try:
         envelope = json.loads(completed.stdout)
     except (TypeError, ValueError):
         envelope = None
@@ -4190,6 +4239,23 @@ def _log_review_timeout(context: Dict[str, Any], elapsed: float) -> None:
     )
 
 
+def _log_review_failure(context: Dict[str, Any], elapsed: float,
+                        exc: TreeAnalysisUpstreamError) -> None:
+    """One WARNING per failed review saying which check failed and where the
+    raw reply was archived. The endpoint's own line names only the exception
+    class, which about twenty different failures share."""
+    alignment = context.get("alignment") or {}
+    tree = context.get("tree") or {}
+    logger.warning(
+        "event=claude_review.failed backend=%s model=%s effort=%s "
+        "elapsed_seconds=%.1f sequences=%s columns=%s tips=%s diagnostic=%s reason=%s",
+        _backend(), Config.CLAUDE_REVIEW_MODEL, Config.CLAUDE_REVIEW_EFFORT, elapsed,
+        alignment.get("sequences"), alignment.get("columns"), tree.get("tips"),
+        getattr(exc, "diagnostic_id", None) or "-",
+        json.dumps(str(exc)[:300], ensure_ascii=False),
+    )
+
+
 def review_job(job_dir: Path, *, force_refresh: bool = False) -> Dict[str, Any]:
     """Produce (or reuse) a Claude review of this job's alignment and tree."""
     if not is_configured():
@@ -4215,6 +4281,9 @@ def review_job(job_dir: Path, *, force_refresh: bool = False) -> Dict[str, Any]:
         result = _call_claude(context, displayed_names)
     except TreeAnalysisTimeout:
         _log_review_timeout(context, time.monotonic() - started)
+        raise
+    except TreeAnalysisUpstreamError as exc:
+        _log_review_failure(context, time.monotonic() - started, exc)
         raise
     finally:
         if slot is not None:

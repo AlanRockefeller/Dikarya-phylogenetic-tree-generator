@@ -52,6 +52,9 @@ WORKBENCH_NAV = (
     {'label': 'iNat Finder', 'endpoint': 'main.inat_finder', 'icon': 'fa-magnifying-glass',
      'description': 'Find an iNaturalist observation when its observation number '
                     'contains a typo.'},
+    {'label': 'Rare Finds', 'endpoint': 'main.rare_finds', 'icon': 'fa-gem',
+     'description': 'See which taxa in an iNaturalist search are the rarest worldwide, '
+                    'and download them as a slide deck.'},
     {'label': 'Label Tools', 'key': 'label-tools', 'children': (
         {'label': 'Herbarium Labels', 'url': '/labels', 'icon': 'fa-leaf',
          'description': 'Print herbarium labels, as PDF or RTF, for your iNaturalist '
@@ -89,6 +92,7 @@ FOOTER_COLUMNS = (
     {'heading': 'Workbench', 'links': (
         {'label': 'Tree Builder', 'endpoint': 'main.sequence_entry'},
         {'label': 'iNat Finder', 'endpoint': 'main.inat_finder'},
+        {'label': 'Rare Finds', 'endpoint': 'main.rare_finds'},
         {'label': 'Voucher Sync', 'endpoint': 'main.voucher_sync'},
         {'label': 'Herbarium Labels', 'url': '/labels'},
         {'label': 'Voucher Labels', 'endpoint': 'main.voucher_labels'},

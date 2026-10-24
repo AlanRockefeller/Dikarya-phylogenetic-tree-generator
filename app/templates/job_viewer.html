@@ -30,8 +30,8 @@
 <meta name="twitter:image" content="{{ social.image_url }}">
 <meta name="twitter:image:alt" content="{{ social.image_alt }}">
 {% endif %}
-<link rel="stylesheet" href="{{ url_for('static', filename='css/tree_viewer.css') }}?v=25">
-<link rel="stylesheet" href="{{ url_for('static', filename='css/phylotree.css') }}?v=3">
+<link rel="stylesheet" href="{{ url_for('static', filename='css/tree_viewer.css') }}?v=26">
+<link rel="stylesheet" href="{{ url_for('static', filename='css/phylotree.css') }}?v=4">
 <link rel="stylesheet" href="{{ url_for('static', filename='css/phylotree-menus.css') }}?v=3">
 <link rel="stylesheet" href="{{ url_for('static', filename='css/alignment_viewer.css') }}?v=20">
 {% endblock %}
@@ -674,7 +674,7 @@
                 <button type="button" class="tree-tool tree-tool-icon" id="btn-zoom-in" title="Zoom in: magnify the whole view (spacing is under Layout)" aria-label="Zoom in">
                     <i class="fas fa-search-plus"></i>
                 </button>
-                <button type="button" class="tree-tool" id="btn-fit" title="Fit to screen">
+                <button type="button" class="tree-tool" id="btn-fit" title="Fit to screen: the whole tree, at a width that fits the pane (Width 100%)">
                     <i class="fa fa-compress-arrows-alt"></i> Fit
                 </button>
             </div>
@@ -718,13 +718,24 @@
                             <button type="button" id="btn-spacing-y-inc" aria-label="Increase vertical spacing"><i class="fas fa-plus"></i></button>
                         </span>
                     </div>
-                    <div class="settings-field" title="Horizontal spacing (branch length scale)">
-                        <span>Horizontal spacing</span>
+                    {# Alan 10/20/26 - Width is a percentage of the width that fits the pane, so
+                       100% always fits the screen whatever the tree's depth; Fit returns to it. #}
+                    <div class="settings-field" title="Branch width as a percentage of the width that fits the screen. Above 100% the tree scrolls sideways and small differences between sequences get more room; Fit returns to 100%. To widen just one clade, right-click it and choose Stretch clade to screen width.">
+                        <span>Width</span>
                         <span class="settings-stepper">
-                            <button type="button" id="btn-spacing-x-dec" aria-label="Decrease horizontal spacing"><i class="fas fa-minus"></i></button>
-                            <button type="button" id="btn-spacing-x-inc" aria-label="Increase horizontal spacing"><i class="fas fa-plus"></i></button>
+                            <button type="button" id="btn-spacing-x-dec" aria-label="Decrease width"><i class="fas fa-minus"></i></button>
+                            <span class="settings-value"><span id="horizontal-width-value">100</span>%</span>
+                            <button type="button" id="btn-spacing-x-inc" aria-label="Increase width"><i class="fas fa-plus"></i></button>
                         </span>
                     </div>
+                    {# Alan 10/20/26 - Long-branch breaks. On by default; display only. #}
+                    <label class="settings-check"
+                        title="Draw an extremely long branch (often an outgroup or a contaminant) shortened, marked // with its true length, so the rest of the tree gets the width. Every other branch stays to scale; downloads keep the true lengths.">
+                        <input class="rounded border-gray-300 text-journal-gold focus:ring-journal-gold w-3.5 h-3.5"
+                            type="checkbox" id="cb-break-long-branches" checked>
+                        Shorten very long branches (//)
+                        <span id="long-branch-break-count" class="text-xs opacity-70"></span>
+                    </label>
                 </div>
             </div>
             <span class="tree-tool-divider" aria-hidden="true"></span>
@@ -1198,7 +1209,7 @@
                 <div class="tree-mobile-setting-row"><span>Support font</span><span><button type="button" data-mobile-step="input-support-font" data-step="-1" aria-label="Smaller support font"><i class="fa fa-minus"></i></button><span class="tree-mobile-value" data-mobile-value-for="input-support-font">9</span><button type="button" data-mobile-step="input-support-font" data-step="1" aria-label="Larger support font"><i class="fa fa-plus"></i></button></span></div>
                 <div class="tree-mobile-setting-row"><span>Tip label gap</span><span><button type="button" data-mobile-trigger="btn-tip-label-gap-dec" data-mobile-keep-open aria-label="Decrease tip label gap"><i class="fa fa-minus"></i></button><span class="tree-mobile-value" data-mobile-value-for="tip-label-gap-value">2</span><button type="button" data-mobile-trigger="btn-tip-label-gap-inc" data-mobile-keep-open aria-label="Increase tip label gap"><i class="fa fa-plus"></i></button></span></div>
                 <div class="tree-mobile-setting-row"><span>Vertical spacing</span><span><button type="button" data-mobile-trigger="btn-spacing-y-dec" data-mobile-keep-open aria-label="Decrease vertical spacing"><i class="fa fa-minus"></i></button><button type="button" data-mobile-trigger="btn-spacing-y-inc" data-mobile-keep-open aria-label="Increase vertical spacing"><i class="fa fa-plus"></i></button></span></div>
-                <div class="tree-mobile-setting-row"><span>Horizontal spacing</span><span><button type="button" data-mobile-trigger="btn-spacing-x-dec" data-mobile-keep-open aria-label="Decrease horizontal spacing"><i class="fa fa-minus"></i></button><button type="button" data-mobile-trigger="btn-spacing-x-inc" data-mobile-keep-open aria-label="Increase horizontal spacing"><i class="fa fa-plus"></i></button></span></div>
+                <div class="tree-mobile-setting-row"><span>Width</span><span><button type="button" data-mobile-trigger="btn-spacing-x-dec" data-mobile-keep-open aria-label="Decrease width"><i class="fa fa-minus"></i></button><button type="button" data-mobile-trigger="btn-spacing-x-inc" data-mobile-keep-open aria-label="Increase width"><i class="fa fa-plus"></i></button></span></div>
             </section>
             <section>
                 <h4>Page and downloads</h4>
@@ -1583,27 +1594,27 @@
     window.DIRTY_READS = {{ dirty_reads|default({}, true)|tojson }};
 </script>
 
-<script src="{{ url_for('static', filename='vendor/d3.v7.min.js') }}"></script>
+<script data-viewer-critical="true" src="{{ url_for('static', filename='vendor/d3.v7.min.js') }}"></script>
 <script>
     window.d3v7 = window.d3; // Critical for your v2 renderer
 </script>
 
-<script src="{{ url_for('static', filename='vendor/lodash-4.min.js') }}?v=1"></script>
+<script data-viewer-critical="true" src="{{ url_for('static', filename='vendor/lodash-4.min.js') }}?v=1"></script>
 <script>
     // phylotree 2.2.1's browser bundle expects Lodash as `_$1` and
     // Underscore as `_`. Preserve Lodash before Underscore claims `_` below.
     window._$1 = window._;
 </script>
 
-<script src="{{ url_for('static', filename='vendor/underscore-1.13.6-min.js') }}"></script>
+<script data-viewer-critical="true" src="{{ url_for('static', filename='vendor/underscore-1.13.6-min.js') }}"></script>
 
-<script src="{{ url_for('static', filename='js/phylotree.js') }}?v=16"></script>
+<script data-viewer-critical="true" src="{{ url_for('static', filename='js/phylotree.js') }}?v=17"></script>
 
-<script src="{{ url_for('static', filename='js/tree_viewer_phylotree_v2.js') }}?v=111"></script>
+<script data-viewer-critical="true" src="{{ url_for('static', filename='js/tree_viewer_phylotree_v2.js') }}?v=112"></script>
 
-<script src="{{ url_for('static', filename='js/tree_viewer_api.js') }}?v=8"></script>
+<script data-viewer-critical="true" src="{{ url_for('static', filename='js/tree_viewer_api.js') }}?v=9"></script>
 
-<script src="{{ url_for('static', filename='js/tree_viewer_controller.js') }}?v=109"></script>
+<script data-viewer-critical="true" src="{{ url_for('static', filename='js/tree_viewer_controller.js') }}?v=111"></script>
 
 {% include 'partials/alignment_viewer_modal.html' %}
 

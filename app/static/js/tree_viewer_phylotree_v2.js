@@ -24,6 +24,31 @@
     // any zoom, exactly like the tip labels it leads into.
     const POLYTOMY_CONNECTOR_PX = 8;
     const SVG_NS = 'http://www.w3.org/2000/svg';
+    // Alan 10/20/26 - Horizontal width of a rectangular tree. Its branches are sized to the
+    // part of the tree pane its labels leave free (_fittedBranchWidth); the Width control
+    // scales that by these steps, so 100 always means "fits the screen". Before this the
+    // width was max_depth x 20px: set by how many nodes the longest path happened to have,
+    // which gave 60px to one tree and 1,700px to the next.
+    const HORIZONTAL_PERCENT_STEPS = [25, 33, 50, 67, 80, 100, 125, 150, 200, 300, 400, 600, 800];
+    const HORIZONTAL_PERCENT_MIN = 25;
+    // The saved Width preference stays inside the button range; a clade stretch can go further
+    // but is a view of the moment, not a preference.
+    const HORIZONTAL_PERCENT_SAVED_MAX = 800;
+    // On a pane narrower than the labels (a phone) the reader pans anyway, so branches keep
+    // this much room rather than being squeezed toward nothing.
+    const FIT_MIN_BRANCH_PX = 320;
+    const FIT_MARGIN_PX = 12;
+    // Hard ceiling on drawn branch width: a stretched clade on a deep tree could otherwise
+    // ask for an SVG wider than browsers will rasterise when it is exported.
+    const MAX_BRANCH_WIDTH_PX = 20000;
+    // Alan 10/20/26 - Long-branch breaks (_computeLongBranchBreaks). Calibrated on 1,026 job
+    // trees: about 7% qualify, almost all with one or two breaks, and those draw a median
+    // 1.6x wider (up to 16x when an outgroup or contaminant sits on a very long branch).
+    const LONG_BRANCH_DEPTH_SHARE = 0.25;  // the branch alone spans a quarter of the tree...
+    const LONG_BRANCH_OUTLIER_RATIO = 6;   // ...and is 6x the 90th-percentile branch length
+    const LONG_BRANCH_DRAWN_RATIO = 2;     // it is then drawn 2x that percentile long
+    const LONG_BRANCH_MAX_BREAKS = 3;
+    const LONG_BRANCH_MIN_GAIN = 1.25;     // and nothing is broken for less than this gain
 
     // Alan 8/24/26 - Say why a phylotree instance is not usable, or null when it is.
     // phylotree.js does not throw on a truncated or otherwise unparseable Newick: its
@@ -640,6 +665,13 @@
         // Alan 7/17/26 - Let saved display preferences replace spacing instead of accumulating it across tree redraws.
         setSpacingState(x, y) { }
 
+        // Alan 10/20/26 - Horizontal width as a percentage of the width that fits the pane.
+        getHorizontalPercent() { return 100; }
+        setHorizontalPercent(percent, options) { return 100; }
+        stepHorizontalPercent(direction) { return 100; }
+        /** Widen the tree until one clade fills the pane, and scroll to it. */
+        stretchCladeToWidth(node) { return null; }
+
         // Alan 8/28/26 - Expose the mobile mode and node-menu bridge through the common viewer contract.
         /** Switch touch interaction between camera navigation and deliberate selection. */
         setMobileInteractionMode(mode) { }
@@ -738,6 +770,8 @@
                 showSupport: true,
                 // Alan 9/23/26 - Fade internal branches by their support class (on by default).
                 supportFade: true,
+                // Alan 10/20/26 - Draw extreme branches shortened with a // mark (on by default).
+                breakLongBranches: true,
                 ppThreshold: 0.9,
                 bootstrapThreshold: 70,
                 minTips: 0,
@@ -822,10 +856,27 @@
             });
 
             // Spacing State (relative to default)
+            // Alan 10/20/26 - Only y is still read. Horizontal width is horizontalPercent below;
+            // x stays so a saved preference or caller that still passes it is harmless.
             this.spacingState = { x: 0, y: 0 };
             // Alan 7/17/26 - Apply automatic large-tree spacing only once so backend redraws retain the current viewer spacing.
             this.automaticSpacingInitialized = false;
             this.spacingTimeout = null;
+            // Alan 10/20/26 - Horizontal width (see HORIZONTAL_PERCENT_STEPS). horizontalPercent
+            // is what is drawn; savedHorizontalPercent is the reader's own choice, which a clade
+            // stretch leaves alone so a momentary view is never written into saved preferences.
+            this.horizontalPercent = 100;
+            this.savedHorizontalPercent = 100;
+            // Width of everything right and left of the branches (offset, tip labels, clade
+            // annotations) as last measured; null until the first draw has been measured.
+            this._nonBranchWidthPx = null;
+            this._lastPaneWidth = 0;
+            this._fitCheckTimer = null;
+            this._paneResizeTimer = null;
+            this._paneResizeObserver = null;
+            // Alan 10/20/26 - Branches drawn shortened, from _computeLongBranchBreaks().
+            this.longBranchBreaks = [];
+            this._branchBreakDrawPending = false;
 
             // Zoom/UI state
             this.cachedZoomNode = null;
@@ -1175,6 +1226,15 @@
                             () => 'Rotate node',
                             (node) => { if (typeof this._onRotateNode === 'function') this._onRotateNode(node); },
                             (node) => Boolean(node.children && node.children.length >= 2)
+                        ]);
+                        // Alan 10/20/26 - Widen the tree until this clade fills the screen (a view
+                        // only; Fit returns). Named "Stretch", not "Expand": phylotree's Expand
+                        // Clade already means un-collapse.
+                        n.menu_items.push([
+                            () => 'Stretch clade to screen width',
+                            (node) => this.stretchCladeToWidth(node),
+                            (node) => this.options.layout !== 'radial' && !node.collapsed
+                                && this._visibleDescendantTips(node).length >= 2
                         ]);
                         // Alan 8/24/26 - Bulk collapse/expand of the SELECTED clades. These act on
                         // the selection, not on the clicked node, so they are registered on every
@@ -1736,6 +1796,12 @@
 
             this.container.innerHTML = '';
 
+            // Alan 10/20/26 - Decide the long-branch breaks before layout, which reads them, and
+            // start following the pane width so the fitted width tracks window changes.
+            this._fitCorrections = 0;
+            this._computeLongBranchBreaks();
+            this._observePaneWidth();
+
             // Phylotree uses 'fixed-step' mode where spacing_x/spacing_y set the per-node/per-level pixel values
             // The render options should use 'fixed-step' and we apply spacing post-render
             const renderOpts = {
@@ -1750,6 +1816,11 @@
                 'tip-label-gap': this.tipLabelGap,
                 'left-right-spacing': 'fixed-step',
                 'top-bottom-spacing': 'fixed-step',
+                // Alan 10/20/26 - Size the branches to the pane from the first layout (the
+                // measured correction in _applySpacingViaAPI then settles it), and let layout
+                // draw a broken branch at its shortened length.
+                'branch-width': this._targetBranchWidth(),
+                'display-branch-length': (node, length) => this._displayBranchLength(node, length),
                 // Alan 9/23/26 - No animated relayouts. phylotree animates trees under 300 nodes,
                 // so for ~250ms after every update the SVG's width/height and every node were
                 // still at their OLD values, and anything that measured the tree in that window
@@ -1765,6 +1836,9 @@
                     // Alan 9/23/26 - Runs after phylotree (re)draws each node, so a polytomy
                     // connector follows every update() without a separate pass.
                     this._drawPolytomyConnector(element, node);
+                    // Alan 10/20/26 - Every relayout passes through here, whoever triggered it,
+                    // so the break marks are redrawn once after it rather than per caller.
+                    this._scheduleBranchBreakDraw();
                 },
                 // Alan 9/23/26 - Runs after phylotree (re)classes and redraws each branch, so the
                 // support fade survives every update() without a separate repaint pass.
@@ -1838,24 +1912,24 @@
 
             try {
                 // Calculate absolute spacing values (base + accumulated state)
-                // Phylotree constraints: X: 2-100, Y: 10-100
-                const targetX = Math.max(2, Math.min(100, (this.baseSpacing?.x || 20) + (this.spacingState?.x || 0)));
+                // Phylotree constraints: Y: 10-100
                 const targetY = Math.max(10, Math.min(100, (this.baseSpacing?.y || 20) + (this.spacingState?.y || 0)));
 
-                if (DEBUG_MODE) console.log('Applying spacing via API:', { targetX, targetY, stateX: this.spacingState.x, stateY: this.spacingState.y });
+                if (DEBUG_MODE) console.log('Applying spacing via API:', { targetY, stateY: this.spacingState.y, horizontalPercent: this.horizontalPercent });
 
                 // Set absolute values (not relative/delta)
                 // Note: phylotree uses inverted conventions - spacing_x affects vertical, spacing_y affects horizontal
                 if (typeof display.spacing_x === 'function') {
                     display.spacing_x(targetY, true); // Y state -> spacing_x (vertical)
                 }
-                if (typeof display.spacing_y === 'function') {
-                    display.spacing_y(targetX, true); // X state -> spacing_y (horizontal)
-                }
+                // Alan 10/20/26 - Horizontal is the fitted width x horizontalPercent.
+                this._applyHorizontalWidth(display);
 
                 // Now trigger layout recalculation
                 if (typeof display.update === 'function') {
                     display.update();
+                    // Alan 10/20/26 - The labels are drawn now: measure them and settle the fit.
+                    this._settleFittedWidth(display);
                 }
             } catch (e) {
                 console.error('Error applying spacing via API:', e);
@@ -1878,14 +1952,376 @@
             this.automaticSpacingInitialized = true;
         }
 
+        // --- Alan 10/20/26 - HORIZONTAL WIDTH ---
+        // A rectangular tree's root-to-deepest-tip width is phylotree's "branch-width" option,
+        // set to (pane width - everything that is not branch) x horizontalPercent. "Not branch"
+        // is measured from the drawn SVG -- left offset, tip labels at their real font, type
+        // badges, clade annotations -- rather than estimated, so 100% really ends at the
+        // pane's right edge. Radial trees are framed by the camera instead (_frameRadialTree)
+        // and keep a per-level step, which Width scales.
 
+        _paneWidth() {
+            const el = this.container;
+            if (!el) return 0;
+            let padding = 0;
+            try {
+                const style = window.getComputedStyle(el);
+                padding = (parseFloat(style.paddingLeft) || 0) + (parseFloat(style.paddingRight) || 0);
+            } catch (_) { /* no layout yet */ }
+            return Math.max(0, (Number(el.clientWidth) || 0) - padding);
+        }
 
+        // Before anything is drawn there is nothing to measure: guess from the longest tip
+        // name at the tip font. The first draw replaces it with the measured value.
+        _estimateNonBranchWidth() {
+            let longest = 0;
+            (this.allNodes || []).forEach(node => {
+                if (node.children && node.children.length) return;
+                const name = String(node.data?.name || '');
+                if (name.length > longest) longest = name.length;
+            });
+            const tipFont = Number(document.getElementById('input-tip-font')?.value)
+                || this.options.tipBasePx || 12;
+            return longest * tipFont * 0.6 + (this.tipLabelGap || 0) + 40;
+        }
 
+        _fittedBranchWidth() {
+            const pane = this._paneWidth();
+            if (!(pane > 0)) return FIT_MIN_BRANCH_PX;
+            const nonBranch = Number.isFinite(this._nonBranchWidthPx)
+                ? this._nonBranchWidthPx
+                : this._estimateNonBranchWidth();
+            return Math.max(FIT_MIN_BRANCH_PX, pane - nonBranch - FIT_MARGIN_PX);
+        }
+
+        _targetBranchWidth() {
+            const width = this._fittedBranchWidth() * this.horizontalPercent / 100;
+            return Math.max(1, Math.min(MAX_BRANCH_WIDTH_PX, width));
+        }
+
+        _maxHorizontalPercent() {
+            return Math.max(100, (MAX_BRANCH_WIDTH_PX / this._fittedBranchWidth()) * 100);
+        }
+
+        _applyHorizontalWidth(display) {
+            if (!display || !display.options) return;
+            if (this.options.layout === 'radial') {
+                display.options['branch-width'] = 0;
+                // phylotree ignores a per-level step outside 10-100.
+                const perLevel = Math.max(10, Math.min(100,
+                    (this.baseSpacing?.x || 20) * this.horizontalPercent / 100));
+                if (typeof display.spacing_y === 'function') display.spacing_y(perLevel, true);
+                return;
+            }
+            display.options['branch-width'] = this._targetBranchWidth();
+        }
+
+        // Width of the drawing that is not branch, in layout pixels: its right edge minus the
+        // branch width it was laid out with. The labels do not change size when the branches
+        // do, so this is what the next fit subtracts from the pane.
+        _measureNonBranchWidth(display) {
+            const group = this.container?.querySelector?.('svg g.phylotree-container');
+            if (!display || !group || typeof group.getBBox !== 'function') return NaN;
+            // Zoomed on desktop, labels are counter-scaled to a constant screen size, so their
+            // layout width is not the width they have at 100%: keep the last good measurement.
+            if (Math.abs((this._labelVisualK || 1) - 1) > 0.01) return NaN;
+            let box;
+            try { box = group.getBBox(); } catch (_) { return NaN; }
+            if (!box || !(box.width > 0)) return NaN;
+            const layout = Array.isArray(display.layout_translate) ? display.layout_translate : [0, 0];
+            const branchWidth = Number(display.options?.['branch-width']) || 0;
+            if (!(branchWidth > 0)) return NaN;
+            return (layout[0] || 0) + box.x + box.width - branchWidth;
+        }
+
+        // Measure what was just drawn and, if the fit is off, lay it out once more.
+        _settleFittedWidth(display) {
+            if (this.options.layout === 'radial') return;
+            const measured = this._measureNonBranchWidth(display);
+            if (!Number.isFinite(measured)) return;
+            this._nonBranchWidthPx = measured;
+            const target = this._targetBranchWidth();
+            if (Math.abs(target - (Number(display.options['branch-width']) || 0)) <= 2) return;
+            display.options['branch-width'] = target;
+            display.update();
+        }
+
+        // Labels reach their final font and annotations their final place only after a
+        // delay, so the fit is re-checked then. Bounded, so a measurement that never settles
+        // cannot keep relaying out the tree.
+        _scheduleFitCheck() {
+            if (!this.tree?.display || this.options?.layout === 'radial') return;
+            if (this._fitCheckTimer) clearTimeout(this._fitCheckTimer);
+            this._fitCheckTimer = setTimeout(() => {
+                this._fitCheckTimer = null;
+                const display = this.tree?.display;
+                if (!display || this.options.layout === 'radial') return;
+                const measured = this._measureNonBranchWidth(display);
+                if (!Number.isFinite(measured)) return;
+                this._nonBranchWidthPx = measured;
+                const current = Number(display.options['branch-width']) || 0;
+                if (Math.abs(this._targetBranchWidth() - current) <= 4) {
+                    this._fitCorrections = 0;
+                    return;
+                }
+                this._fitCorrections = (this._fitCorrections || 0) + 1;
+                if (this._fitCorrections > 3) return;
+                this._relayoutHorizontal();
+            }, 80);
+        }
+
+        // Apply horizontalPercent to the drawn tree without a full redraw.
+        _relayoutHorizontal() {
+            const display = this.tree?.display;
+            if (!display || typeof display.update !== 'function') return false;
+            try {
+                this._applyHorizontalWidth(display);
+                display.update();
+                this._settleFittedWidth(display);
+            } catch (e) {
+                console.error('Error applying horizontal width:', e);
+                return false;
+            }
+            // Re-add support labels after layout change, as updateSpacing does.
+            if (this.spacingTimeout) clearTimeout(this.spacingTimeout);
+            this.spacingTimeout = setTimeout(() => {
+                this._addSupportLabels();
+                this._applyTextSizingFromZoom();
+            }, 100);
+            return true;
+        }
+
+        // Refit when the pane changes width (window resize, full screen, the settings panel).
+        // Only the width matters: on desktop the pane grows in height with the tree.
+        _observePaneWidth() {
+            if (this._paneResizeObserver || !this.container || typeof ResizeObserver === 'undefined') return;
+            this._lastPaneWidth = this._paneWidth();
+            this._paneResizeObserver = new ResizeObserver(() => {
+                const width = this._paneWidth();
+                if (Math.abs(width - this._lastPaneWidth) <= 4) return;
+                this._lastPaneWidth = width;
+                if (this._paneResizeTimer) clearTimeout(this._paneResizeTimer);
+                this._paneResizeTimer = setTimeout(() => {
+                    this._paneResizeTimer = null;
+                    if (this.options.layout !== 'radial') this._relayoutHorizontal();
+                }, 150);
+            });
+            this._paneResizeObserver.observe(this.container);
+        }
+
+        _announceHorizontalPercent(reason, extra = {}) {
+            if (!this.container || typeof this.container.dispatchEvent !== 'function'
+                || typeof CustomEvent !== 'function') return;
+            this.container.dispatchEvent(new CustomEvent('dikarya:horizontal-width', {
+                detail: Object.assign({
+                    percent: this.horizontalPercent,
+                    saved: this.savedHorizontalPercent,
+                    reason
+                }, extra)
+            }));
+        }
+
+        // The visible tips of a clade; a collapsed clade inside it counts as one tip.
+        _visibleDescendantTips(node) {
+            const tips = [];
+            const stack = (node && !node.collapsed) ? (node.children || []).slice() : [];
+            while (stack.length) {
+                const current = stack.pop();
+                if (current.hidden || current.notshown) continue;
+                const kids = current.children || [];
+                if (!kids.length || current.collapsed) {
+                    if (Number.isFinite(current.screen_x)) tips.push(current);
+                } else {
+                    stack.push(...kids);
+                }
+            }
+            return tips;
+        }
+
+        // Put the clade's root a short stem in from the pane's left edge and its middle tip
+        // in the middle of the view. The stretch was laid out at camera scale 1, so any
+        // camera zoom or pan is cleared first or the scroll would land somewhere else.
+        _scrollCladeIntoView(node, tips) {
+            const display = this.tree?.display;
+            const container = this.container;
+            if (!display || !container) return;
+            if (typeof display.set_camera === 'function') display.set_camera(1, 0, 0);
+            const ys = tips.map(tip => tip.screen_y).filter(Number.isFinite);
+            if (ys.length) {
+                const midY = (Math.min(...ys) + Math.max(...ys)) / 2;
+                const middle = tips.reduce((best, tip) =>
+                    Math.abs(tip.screen_y - midY) < Math.abs(best.screen_y - midY) ? tip : best);
+                const element = Array.from(container.querySelectorAll('svg g.node'))
+                    .find(el => el.__data__ === middle);
+                if (element && typeof element.scrollIntoView === 'function') {
+                    element.scrollIntoView({ block: 'center', inline: 'nearest' });
+                }
+            }
+            let padLeft = 0;
+            try { padLeft = parseFloat(window.getComputedStyle(container).paddingLeft) || 0; } catch (_) { /* default */ }
+            const layout = Array.isArray(display.layout_translate) ? display.layout_translate : [0, 0];
+            const stem = this._fittedBranchWidth() * 0.1;
+            container.scrollLeft = Math.max(0, padLeft + (layout[0] || 0) + node.screen_x - stem);
+        }
+
+        // --- Alan 10/20/26 - LONG-BRANCH BREAKS ---
+        // A branch is drawn shortened only when it is an outlier twice over: on its own it
+        // spans LONG_BRANCH_DEPTH_SHARE of the tree's drawn depth, and it is
+        // LONG_BRANCH_OUTLIER_RATIO x the 90th-percentile branch length. Longest first, at
+        // most LONG_BRANCH_MAX_BREAKS, each drawn LONG_BRANCH_DRAWN_RATIO x that percentile,
+        // and none at all unless the tree gains LONG_BRANCH_MIN_GAIN in width. The true length
+        // stays the tree's length: layout alone reads __breakLength, through phylotree's
+        // "display-branch-length" hook, so downloads, rerooting and tooltips are unchanged.
+        // Each break is marked // on the branch with its true length (_drawBranchBreaks).
+        _computeLongBranchBreaks() {
+            this._findLongBranchBreaks();
+            // Tell the controller, which shows the count beside the Layout checkbox.
+            if (this.container && typeof this.container.dispatchEvent === 'function'
+                && typeof CustomEvent === 'function') {
+                this.container.dispatchEvent(new CustomEvent('dikarya:long-branch-breaks', {
+                    detail: { count: this.longBranchBreaks.length }
+                }));
+            }
+        }
+
+        _findLongBranchBreaks() {
+            const nodes = this.tree?.nodes && typeof this.tree.nodes.descendants === 'function'
+                ? this.tree.nodes.descendants() : [];
+            nodes.forEach(node => { node.__breakLength = undefined; });
+            this.longBranchBreaks = [];
+            if (!this.options.breakLongBranches || this.options.layout === 'radial') return;
+            const root = nodes.find(node => !node.parent);
+            if (!root) return;
+            const lengthOf = (node) => {
+                const value = this._branchLength(node);
+                return Number.isFinite(value) && value > 0 ? value : 0;
+            };
+            const branches = nodes.filter(node => node.parent);
+            const positive = branches.map(lengthOf)
+                .filter(value => value > ZERO_LENGTH_POLYTOMY_EPSILON)
+                .sort((a, b) => a - b);
+            if (positive.length < 5) return;
+            const q90 = positive[Math.floor(0.9 * (positive.length - 1))];
+            const drawn = q90 * LONG_BRANCH_DRAWN_RATIO;
+            const drawnDepth = () => {
+                let deepest = 0;
+                const stack = [[root, 0]];
+                while (stack.length) {
+                    const [node, depth] = stack.pop();
+                    const kids = node.children || [];
+                    if (!kids.length) deepest = Math.max(deepest, depth);
+                    kids.forEach(kid => stack.push([kid,
+                        depth + (Number.isFinite(kid.__breakLength) ? kid.__breakLength : lengthOf(kid))]));
+                }
+                return deepest;
+            };
+            const fullDepth = drawnDepth();
+            if (!(fullDepth > 0)) return;
+            const broken = [];
+            const candidates = branches.filter(node => lengthOf(node) > drawn)
+                .sort((a, b) => lengthOf(b) - lengthOf(a));
+            for (const node of candidates) {
+                if (broken.length >= LONG_BRANCH_MAX_BREAKS) break;
+                const length = lengthOf(node);
+                if (length <= LONG_BRANCH_OUTLIER_RATIO * q90
+                    || length <= LONG_BRANCH_DEPTH_SHARE * drawnDepth()) break;
+                node.__breakLength = drawn;
+                broken.push(node);
+            }
+            if (!broken.length) return;
+            if (fullDepth / drawnDepth() < LONG_BRANCH_MIN_GAIN) {
+                broken.forEach(node => { node.__breakLength = undefined; });
+                return;
+            }
+            this.longBranchBreaks = broken.map(node => ({ node, length: lengthOf(node) }));
+        }
+
+        _displayBranchLength(node, length) {
+            if (this.options.layout === 'radial') return length;
+            return Number.isFinite(node?.__breakLength) ? node.__breakLength : length;
+        }
+
+        _scheduleBranchBreakDraw() {
+            if (this._branchBreakDrawPending) return;
+            this._branchBreakDrawPending = true;
+            Promise.resolve().then(() => {
+                this._branchBreakDrawPending = false;
+                this._drawBranchBreaks();
+            });
+        }
+
+        // Shown with 3 significant figures, which is what the scale bar can resolve anyway.
+        _formatBreakLength(length) {
+            return Number(length.toPrecision(3)).toString();
+        }
+
+        // Two slashes across each broken branch, with its true length above them. They live
+        // in their own group inside phylotree's container (same coordinates and camera as the
+        // nodes) rather than in a node group: phylotree rebinds every <text> in a tip's group
+        // to the tip label. No background patch, so they read on a transparent PNG as well.
+        _drawBranchBreaks() {
+            const enclosure = this.container?.querySelector?.('svg g.phylotree-container');
+            if (!enclosure) return;
+            let layer = enclosure.querySelector('g.branch-breaks');
+            const breaks = this.options?.layout === 'radial' ? [] : (this.longBranchBreaks || []).filter(({ node }) =>
+                !node.hidden && !node.notshown && node.parent
+                && Number.isFinite(node.screen_x) && Number.isFinite(node.parent.screen_x)
+                && Number.isFinite(node.screen_y));
+            if (!breaks.length) {
+                if (layer) layer.remove();
+                return;
+            }
+            if (!layer) {
+                layer = document.createElementNS(SVG_NS, 'g');
+                layer.setAttribute('class', 'branch-breaks');
+                layer.setAttribute('pointer-events', 'none');
+                enclosure.appendChild(layer);
+            }
+            while (layer.firstChild) layer.removeChild(layer.firstChild);
+            // Same size as the support values, held at that screen size like them on desktop
+            // (_applyTextSizingFromZoom resizes these on every zoom).
+            const supportFont = (Number(document.getElementById('input-support-font')?.value)
+                || this.options.supportBasePx || 9) / (this._labelVisualK || 1);
+            breaks.forEach(({ node, length }) => {
+                const start = node.parent.screen_x;
+                const end = node.screen_x;
+                const y = node.screen_y;
+                if (end - start < 12) return;
+                const mid = (start + end) / 2;
+                const mark = document.createElementNS(SVG_NS, 'path');
+                mark.setAttribute('class', 'branch-break-mark');
+                mark.setAttribute('d', `M${mid - 5},${y + 5}L${mid - 1},${y - 5}M${mid + 1},${y + 5}L${mid + 5},${y - 5}`);
+                const label = document.createElementNS(SVG_NS, 'text');
+                label.setAttribute('class', 'branch-break-label');
+                label.setAttribute('x', String(mid));
+                label.setAttribute('y', String(y - 7));
+                label.setAttribute('text-anchor', 'middle');
+                label.setAttribute('style', `font-size:${supportFont}px`);
+                label.textContent = this._formatBreakLength(length);
+                const title = document.createElementNS(SVG_NS, 'title');
+                title.textContent = `Branch drawn shortened to give the rest of the tree room. True length ${length}`
+                    + ' (scale bar units). Every other branch is drawn to scale.';
+                const group = document.createElementNS(SVG_NS, 'g');
+                group.setAttribute('class', 'branch-break');
+                group.appendChild(mark);
+                group.appendChild(label);
+                group.appendChild(title);
+                layer.appendChild(group);
+            });
+        }
 
         // --- PUBLIC API FOR CONTROLLER ---
 
         setOptions(newOpts) {
+            // Alan 10/20/26 - Breaks change where nodes are drawn, so a change relays the tree.
+            const breaksChanged = Boolean(newOpts) && 'breakLongBranches' in newOpts
+                && Boolean(newOpts.breakLongBranches) !== Boolean(this.options.breakLongBranches);
             Object.assign(this.options, newOpts);
+            if (breaksChanged) {
+                this._computeLongBranchBreaks();
+                this._relayoutHorizontal();
+                this._scheduleBranchBreakDraw();
+            }
             // Decide if we need full redraw or implemented partial update
             // For thresholds, we can just re-run support labels
             this._addSupportLabels();
@@ -1912,25 +2348,27 @@
         }
 
         updateSpacing(xDelta, yDelta) {
+            // Alan 10/20/26 - Horizontal is a Width step now (stepHorizontalPercent); a caller
+            // that still sends an x delta gets one step in that direction.
+            if (xDelta) this.stepHorizontalPercent(Math.sign(xDelta));
+            if (!yDelta) return;
+
             // Update accumulated state
-            this.spacingState.x += xDelta;
             this.spacingState.y += yDelta;
 
-            if (DEBUG_MODE) console.log('Spacing update:', { x: this.spacingState.x, y: this.spacingState.y, xDelta, yDelta });
+            if (DEBUG_MODE) console.log('Spacing update:', { y: this.spacingState.y, yDelta });
 
             // Try incremental update via phylotree's native API (faster than full redraw)
             const display = this.tree?.display;
-            if (display && typeof display.spacing_x === 'function' && typeof display.spacing_y === 'function') {
+            if (display && typeof display.spacing_x === 'function') {
                 try {
                     // Calculate new absolute values
-                    const targetX = Math.max(2, Math.min(100, (this.baseSpacing?.x || 20) + this.spacingState.x));
                     const targetY = Math.max(10, Math.min(100, (this.baseSpacing?.y || 20) + this.spacingState.y));
 
-                    if (DEBUG_MODE) console.log('Incremental spacing update:', { targetX, targetY });
+                    if (DEBUG_MODE) console.log('Incremental spacing update:', { targetY });
 
-                    // Note: phylotree uses inverted conventions - spacing_x affects vertical, spacing_y affects horizontal
+                    // Note: phylotree uses inverted conventions - spacing_x affects vertical
                     display.spacing_x(targetY, true); // Y state -> spacing_x (vertical)
-                    display.spacing_y(targetX, true); // X state -> spacing_y (horizontal)
 
                     if (typeof display.update === 'function') {
                         display.update();
@@ -1960,16 +2398,87 @@
 
         // Alan 7/17/26 - Replace the relative spacing state so persisted preferences do not compound after redraws.
         setSpacingState(x, y) {
-            // Alan 7/17/26 - Normalize malformed stored horizontal values to the established zero offset.
-            const nextX = Number.isFinite(Number(x)) ? Number(x) : 0;
+            // Alan 10/20/26 - x is ignored: it was a per-level pixel offset from the retired
+            // max_depth x 20px width, and means nothing against a fitted width. Saved
+            // preferences carry widthPercent instead (setHorizontalPercent).
             // Alan 7/17/26 - Normalize malformed stored vertical values to the established zero offset.
             const nextY = Number.isFinite(Number(y)) ? Number(y) : 0;
             // Alan 7/17/26 - Reuse incremental rendering with only the difference from the current state.
-            this.updateSpacing(nextX - this.spacingState.x, nextY - this.spacingState.y);
+            this.updateSpacing(0, nextY - this.spacingState.y);
+        }
+
+        // Alan 10/20/26 - The width currently drawn, as a percentage of the fitted width.
+        getHorizontalPercent() {
+            return this.horizontalPercent;
+        }
+
+        // Alan 10/20/26 - Draw the tree at this percentage of the width that fits the pane.
+        // options.transient (a clade stretch) changes what is drawn but not the reader's saved
+        // choice; options.announce false leaves the change event to the caller.
+        setHorizontalPercent(percent, options = {}) {
+            const value = Number(percent);
+            const next = Number.isFinite(value)
+                ? Math.max(HORIZONTAL_PERCENT_MIN, Math.min(this._maxHorizontalPercent(), value))
+                : 100;
+            this.horizontalPercent = next;
+            if (!options.transient) {
+                this.savedHorizontalPercent = Math.min(HORIZONTAL_PERCENT_SAVED_MAX, next);
+            }
+            this._fitCorrections = 0;
+            this._relayoutHorizontal();
+            if (options.announce !== false) this._announceHorizontalPercent(options.reason || 'set');
+            return next;
+        }
+
+        // Alan 10/20/26 - One Width button press: the next step in HORIZONTAL_PERCENT_STEPS, or
+        // 1.25x beyond either end of it (a stretched clade can sit well past 800%).
+        stepHorizontalPercent(direction) {
+            const current = this.horizontalPercent;
+            let next;
+            if (direction > 0) {
+                next = HORIZONTAL_PERCENT_STEPS.find(step => step > current + 0.5);
+                if (next === undefined) next = current * 1.25;
+            } else {
+                next = HORIZONTAL_PERCENT_STEPS.slice().reverse().find(step => step < current - 0.5);
+                if (next === undefined) next = current / 1.25;
+            }
+            return this.setHorizontalPercent(next, { reason: 'step' });
+        }
+
+        // Alan 10/20/26 - Stretch the whole tree until one clade, from its root to its deepest
+        // tip, spans the fitted branch area -- which leaves exactly room for its labels -- and
+        // scroll so it is the clade on screen. The rest of the tree is still drawn, at the same
+        // scale, so the scale bar stays true and scrolling shows the clade's neighbours. It is
+        // a view: nothing is pruned or saved, and Fit returns to the whole tree.
+        stretchCladeToWidth(node) {
+            const display = this.tree?.display;
+            if (!display || !node || this.options.layout === 'radial') return null;
+            const tips = this._visibleDescendantTips(node);
+            if (tips.length < 2 || !Number.isFinite(node.screen_x)) return null;
+            const span = Math.max(...tips.map(tip => tip.screen_x)) - node.screen_x;
+            if (!(span > 0)) return null;
+            const before = this.horizontalPercent;
+            // 0.9 keeps a short run of the clade's own stem visible on the left.
+            const wanted = before * (this._fittedBranchWidth() * 0.9) / span;
+            const applied = wanted > before * 1.05
+                ? this.setHorizontalPercent(wanted, { transient: true, announce: false })
+                : before;
+            this._scrollCladeIntoView(node, tips);
+            const result = {
+                percent: applied,
+                magnification: applied / before,
+                capped: applied < wanted - 0.5,
+                alreadyWide: applied === before,
+                tipCount: tips.length
+            };
+            this._announceHorizontalPercent('clade', result);
+            return result;
         }
 
         applyTextSizing() {
             this._applyTextSizingFromZoom();
+            // Alan 10/20/26 - A new tip font changes the labels' width, so re-check the fit.
+            this._scheduleFitCheck();
         }
 
         // Alan 8/17/26 - Keep the independent tip-label offset in the requested 0-80 px,
@@ -1995,6 +2504,8 @@
                 }
             }
             this._applyTextSizingFromZoom();
+            // Alan 10/20/26 - The gap is part of the labels' width, so re-check the fit.
+            this._scheduleFitCheck();
             return clamped;
         }
 
@@ -2140,6 +2651,12 @@
         fitToView() {
             // Ideally: manipulate zoom transform.
             // Phylotree v2 usually resets zoom on redraw.
+            // Alan 10/20/26 - Fit also returns the width to 100% of the pane (undoing a Width
+            // change or a clade stretch) and scrolls back to the root.
+            this.horizontalPercent = 100;
+            this.savedHorizontalPercent = 100;
+            if (this.container) this.container.scrollLeft = 0;
+            this._announceHorizontalPercent('fit');
             this._draw();
         }
 
@@ -2688,7 +3205,15 @@
                 img.onload = () => {
                     URL.revokeObjectURL(svgUrl);
                     try {
-                        const scale = window.devicePixelRatio || 1;
+                        // Alan 10/20/26 - A widened or clade-stretched tree can be wider than
+                        // a canvas may be (32,767px a side, ~268M px in all in Chrome), and an
+                        // oversized canvas exports silently blank. Lower the resolution to fit.
+                        const scale = Math.min(
+                            window.devicePixelRatio || 1,
+                            32767 / Math.max(1, width),
+                            32767 / Math.max(1, height),
+                            Math.sqrt(268000000 / Math.max(1, width * height))
+                        );
                         const canvas = document.createElement('canvas');
                         canvas.width = Math.round(width * scale);
                         canvas.height = Math.round(height * scale);
@@ -3897,6 +4422,8 @@
             // Alan 8/15/26 - Recompute annotation geometry after the tip labels have their
             // final size, since the bracket is placed just right of the drawn tip labels.
             this._scheduleAnnotationRedraw();
+            // Alan 10/20/26 - Tip labels are at their final font only now; re-check the fit.
+            this._scheduleFitCheck();
         }
 
         _applyTextSizingFromZoom() {
@@ -3926,6 +4453,9 @@
             const haloSvgPx = Math.max(0.75, 3 / visualK);
 
             const svg = window.d3v7.select(this.container).select("svg");
+
+            // Alan 10/20/26 - A long-branch break's length reads at the support-value size.
+            svg.selectAll("text.branch-break-label").style("font-size", `${supportFontSvgPx}px`);
 
             // Alan 9/23/26 - Polytomy connectors are held at a fixed screen length by the same
             // factor as the labels; _drawPolytomyConnector and _tipLabelDx both read it.
@@ -5891,6 +6421,8 @@
                 this.annotationRedrawTimer = null;
                 this._renderCladeAnnotations();
                 this._applySupportFading();
+                // Alan 10/20/26 - Annotations sit right of the labels, so they count in the fit.
+                this._scheduleFitCheck();
             }, 60);
         }
 

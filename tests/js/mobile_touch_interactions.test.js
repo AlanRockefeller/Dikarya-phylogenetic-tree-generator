@@ -171,9 +171,13 @@ viewer._handleTouchPointerEnd(pointer({ pointerId: 21, target: { node } }), fals
 assert.strictEqual(JSON.stringify(viewer.spacingState), spacingBefore,
     'multi-touch navigation wrapper handling does not change spacingState');
 
+// Alan 10/20/26 - Horizontal spacing is a Width percentage of the fitted width now;
+// vertical spacing is still the spacingState offset.
 viewer.tree = null;
-viewer.updateSpacing(5, 0);
-assert.strictEqual(viewer.spacingState.x, 5, 'explicit spacing API still changes spacing');
+viewer.updateSpacing(0, 5);
+assert.strictEqual(viewer.spacingState.y, 5, 'explicit spacing API still changes vertical spacing');
+assert.strictEqual(viewer.stepHorizontalPercent(1), 125, 'a Width step moves to the next percentage');
+assert.strictEqual(viewer.stepHorizontalPercent(-1), 100, 'and back again');
 
 // Alan 8/28/26 - Programmatic buttons must use the same camera callback as pinch without
 // changing figure spacing; reciprocal button factors restore the original scale.

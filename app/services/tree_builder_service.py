@@ -92,6 +92,39 @@ _IQTREE_DEFAULT_MODEL = "GTR+G"
 # are the jModelTest-compatible aliases.
 _MODEL_FINDER_REQUESTS = frozenset({"MF", "MFP", "TEST", "TESTNEW", "TESTONLY", "TESTNEWONLY"})
 
+# Fewest sequences each builder will accept, measured against the installed
+# binaries: IQ-TREE exits 2 ("Alignment must have at least 3 sequences"),
+# RAxML-NG and MrBayes refuse fewer than four taxa. FastTree and NJ build a
+# tree from two. Below these the tool's own failure reached the job page as a
+# generic "contact Alan" error (job ocpr, a two-sequence Quick Tree).
+_MIN_SEQUENCES = {"iqtree": 3, "iqtree_fast": 3, "raxml": 4, "mrbayes": 4}
+_MIN_SEQUENCES_LABEL = {
+    "iqtree": "IQ-TREE", "iqtree_fast": "Quick Tree (IQ-TREE)",
+    "raxml": "RAxML-NG", "mrbayes": "MrBayes",
+}
+
+
+def _require_enough_sequences(method: str, alignment_fasta: Path) -> None:
+    """Refuse an alignment the selected builder cannot run, in plain words."""
+    minimum = _MIN_SEQUENCES.get(method)
+    if not minimum:
+        return
+    from app.services.artifact_storage import artifact_exists, open_artifact
+    if not artifact_exists(alignment_fasta):
+        return  # the builder reports a missing alignment as it always has
+    with open_artifact(alignment_fasta, "rt") as handle:
+        count = sum(1 for line in handle if line.startswith(">"))
+    if count >= minimum:
+        return
+    found = "only one sequence" if count == 1 else f"only {count} sequences"
+    raise ValueError(
+        f"The alignment has {found}, and {_MIN_SEQUENCES_LABEL[method]} needs at "
+        f"least {minimum} to build a tree. Add more sequences (a close relative "
+        "or an outgroup works well) and submit again. If you submitted more than "
+        f"{count}, the others were removed by an earlier step, for example as "
+        "duplicates."
+    )
+
 
 def _is_model_finder_request(model_str: str) -> bool:
     """True when the model string delegates model choice to ModelFinder."""
@@ -155,7 +188,8 @@ def run_tree_builder(
     method = params.method.lower()
     params.bootstrap = validate_iqtree_ufboot_count(method, params.bootstrap)
     task_logger.info(f"Starting tree building with method: {method}")
-    
+    _require_enough_sequences(method, alignment_fasta)
+
     # `model` and `bootstrap` describe what the user asked for. Anything a
     # method does not actually honour is nulled out below rather than echoed
     # back: this file is what the viewer and the downstream analysis cite, and

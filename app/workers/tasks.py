@@ -1720,9 +1720,14 @@ def run_phylo_job(job_params: dict) -> dict:
                                     "will run in one minute."
                                 )
                     elif org_rerun:
+                        org_sources = " and ".join(
+                            "NCBI" if source == "ncbi" else source
+                            for source in (rerun_details.get("org_wait_sources") or [])
+                        )
                         waiting_message = (
-                            "MycoMap.org BLAST results are updating. This tree will "
-                            "check again in about one minute; other tree jobs can run meanwhile."
+                            f"Waiting for MycoMap.org to finish the {org_sources or 'BLAST'} "
+                            "rerun. This tree will check again in about one minute; "
+                            "other tree jobs can run meanwhile."
                         )
                     else:
                         waiting_message = (

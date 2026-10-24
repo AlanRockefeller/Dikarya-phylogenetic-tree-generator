@@ -709,8 +709,15 @@ def fetch_inaturalist_data(url: str, mode: str = 'all',
         # Analyze PSN independently (regardless of whether ITS exists)
         psn_histogram = analyze_provisional_species([observation])
 
-        from app.services.inaturalist_tree_service import MYCOMAP_BLAST_FIELD_NAME
-        mycomap_blast_url = get_field_value(observation, MYCOMAP_BLAST_FIELD_NAME)
+        from app.services.inaturalist_tree_service import (
+            MYCOMAP_BLAST_FIELD_NAME,
+            _select_mycomap_its_result_url,
+        )
+        from app.services.mycomap_service import fetch_mycomap_result_title
+        mycomap_blast_url = _select_mycomap_its_result_url(
+            get_field_value(observation, MYCOMAP_BLAST_FIELD_NAME),
+            title_fetcher=fetch_mycomap_result_title,
+        )
 
         final_result.update({
             'total_observations': 1,

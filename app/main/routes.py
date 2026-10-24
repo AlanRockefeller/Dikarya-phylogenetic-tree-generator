@@ -240,6 +240,51 @@ def inat_finder():
     return render_template('inat_finder.html')
 
 
+@bp.route('/rare-finds')
+def rare_finds():
+    """Rank the taxa in an iNaturalist search by how rarely they are observed worldwide."""
+    return render_template('rare_finds.html')
+
+
+# All-rights-reserved photos live on static.inaturalist.org, which sends no CORS
+# header, so the browser cannot put their bytes into a downloaded slide deck.
+# This relays exactly one shape of URL, rebuilt from validated parts, so it can
+# never be pointed anywhere else. CC-licensed photos (open-data S3, which does
+# send CORS) are fetched by the browser directly and never come through here.
+RARE_FINDS_PHOTO_SIZES = ('medium', 'large')
+RARE_FINDS_PHOTO_EXTENSIONS = {'jpg': 'image/jpeg', 'jpeg': 'image/jpeg', 'png': 'image/png', 'gif': 'image/gif'}
+RARE_FINDS_PHOTO_MAX_BYTES = 8 * 1024 * 1024
+
+
+@bp.route('/rare-finds/photo/<int:photo_id>/<size>.<ext>')
+@limiter.limit("60 per minute; 600 per hour")
+def rare_finds_photo(photo_id, size, ext):
+    from urllib.request import Request
+    from app.services.api_diagnostics import diagnostic_urlopen
+
+    ext = ext.lower()
+    if size not in RARE_FINDS_PHOTO_SIZES or ext not in RARE_FINDS_PHOTO_EXTENSIONS or photo_id <= 0:
+        abort(404)
+    url = f'https://static.inaturalist.org/photos/{photo_id}/{size}.{ext}'
+    req = Request(url, headers={'User-Agent': 'Dikarya Rare Finds (+https://dikarya.us/rare-finds)'})
+    try:
+        with diagnostic_urlopen(req, timeout=15) as response:
+            if response.status != 200:
+                abort(502)
+            data = response.read(RARE_FINDS_PHOTO_MAX_BYTES + 1)
+    except Exception as exc:
+        if getattr(exc, 'code', None) == 404:
+            abort(404)
+        logger.warning("event=rare_finds.photo_failed photo_id=%s error_type=%s", photo_id, type(exc).__name__)
+        abort(502)
+    if len(data) > RARE_FINDS_PHOTO_MAX_BYTES:
+        abort(413)
+    out = Response(data, mimetype=RARE_FINDS_PHOTO_EXTENSIONS[ext])
+    out.headers['Cache-Control'] = 'public, max-age=86400'
+    out.headers['X-Content-Type-Options'] = 'nosniff'
+    return out
+
+
 @bp.route('/help')
 def help_page():
     return render_template('help.html')
@@ -291,6 +336,7 @@ SITEMAP_ENDPOINTS = (
     ('main.workbench', 'weekly', '0.8'),
     ('main.sequence_entry', 'weekly', '0.9'),
     ('main.inat_finder', 'monthly', '0.7'),
+    ('main.rare_finds', 'monthly', '0.6'),
     ('main.help_page', 'monthly', '0.7'),
     ('main.whats_new', 'weekly', '0.7'),
     ('main.voucher_labels', 'monthly', '0.5'),

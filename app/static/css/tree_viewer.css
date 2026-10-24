@@ -1204,6 +1204,24 @@ body.tree-expanded #btn-fullscreen i::before {
     /* Brighter than #999 for better visibility in dark mode */
 }
 
+/* Alan 10/20/26 - Long-branch breaks: the // takes the branch colour, the length the muted
+   label colour. Never a click target, so clicks reach the branch and nodes beneath. */
+#tree-container .branch-break-mark {
+    stroke: #000000;
+}
+
+#tree-container .branch-break-label {
+    fill: #4b5563;
+}
+
+.dark #tree-container .branch-break-mark {
+    stroke: #ccc !important;
+}
+
+.dark #tree-container .branch-break-label {
+    fill: #d1d5db !important;
+}
+
 /* Fade by support. The viewer sets stroke-opacity inline on weak/intermediate branches
    (values in SUPPORT_FADE_OPACITY, tree_viewer_phylotree_v2.js). A selected, tagged or
    hovered branch is user styling and wins; removing the class restores the fade. The

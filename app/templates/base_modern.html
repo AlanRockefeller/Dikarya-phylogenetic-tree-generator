@@ -147,6 +147,30 @@
                     action, message: error?.message || error, stack: error?.stack
                 });
             };
+            function showViewerLoadFailure() {
+                const container = document.getElementById('tree-container');
+                if (!container || container.dataset.viewerLoadFailed === 'true') return;
+                container.dataset.viewerLoadFailed = 'true';
+
+                const notice = document.createElement('div');
+                notice.className = 'mx-auto mt-16 max-w-lg rounded-lg border border-red-300 bg-red-50 p-6 text-center text-red-900 dark:border-red-800 dark:bg-red-950/40 dark:text-red-100';
+                notice.setAttribute('role', 'alert');
+
+                const title = document.createElement('p');
+                title.className = 'text-lg font-semibold';
+                title.textContent = 'Viewer failed to load';
+                const explanation = document.createElement('p');
+                explanation.className = 'mt-2 text-sm';
+                explanation.textContent = 'Check your connection, then retry. Your tree and saved edits are unchanged.';
+                const retry = document.createElement('button');
+                retry.type = 'button';
+                retry.className = 'mt-4 rounded-lg bg-red-700 px-4 py-2 font-semibold text-white hover:bg-red-800';
+                retry.textContent = 'Retry viewer';
+                retry.addEventListener('click', () => window.location.reload());
+
+                notice.append(title, explanation, retry);
+                container.replaceChildren(notice);
+            }
             window.addEventListener('error', event => {
                 if (event.target && event.target !== window) {
                     const tag = event.target.tagName?.toLowerCase();
@@ -157,6 +181,9 @@
                     if (['script', 'link'].includes(tag)) report('resource_load_failed', {
                         action: tag, message: new URL(event.target.src || event.target.href || '', location.href).pathname
                     });
+                    if (tag === 'script' && event.target.dataset?.viewerCritical === 'true') {
+                        showViewerLoadFailure();
+                    }
                     return;
                 }
                 report('window_error', {message: event.message, stack: event.error?.stack});

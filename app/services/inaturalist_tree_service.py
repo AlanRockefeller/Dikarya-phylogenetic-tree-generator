@@ -269,6 +269,95 @@ PLAIN_TOKEN_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_. -]{0,198}[A-Za-z0-9]$")
 # observation list.
 OBSERVATIONS_SUBPAGES = {"identify", "upload", "export", "new", "search"}
 
+# iNaturalist observation fields occasionally contain several MycoMap searches
+# for different barcode loci. URL slugs and MycoMap page titles usually name
+# LSU/SSU explicitly, while older ITS searches often have only a specimen name.
+# Treat an unlabelled result as the ordinary ITS default; this keeps the common
+# one-link path untouched and avoids turning every tree build into extra MycoMap
+# page requests.
+_MYCOMAP_RESULT_URL_RE = re.compile(
+    r"https?://.*?(?=(?:https?://)|[\s<>\"']|$)", re.IGNORECASE
+)
+_MYCOMAP_ITS_LOCUS_RE = re.compile(
+    r"(?<![a-z0-9])(?:nr[-_ ]?)?its(?:1|2)?(?:f|r)?(?![a-z0-9])"
+    r"|internal[-_ ]+transcribed[-_ ]+spacer",
+    re.IGNORECASE,
+)
+_MYCOMAP_NON_ITS_LOCUS_RE = re.compile(
+    r"(?<![a-z0-9])(?:lsu|ssu|nr[-_ ]?lsu|nr[-_ ]?ssu|28s|18s"
+    r"|tef[-_ ]?1(?:[-_ ]?alpha)?|rpb[-_ ]?[12]|tub[-_ ]?2|cox[-_ ]?1|coi)"
+    r"(?![a-z0-9])|beta[-_ ]+tubulin|translation[-_ ]+elongation[-_ ]+factor",
+    re.IGNORECASE,
+)
+
+
+def _extract_mycomap_result_urls(value: Any) -> List[str]:
+    """Extract distinct MycoMap links from an observation-field value."""
+    urls: List[str] = []
+    seen = set()
+    for match in _MYCOMAP_RESULT_URL_RE.finditer(str(value or "")):
+        candidate = match.group(0).rstrip(".,;:!?)]}")
+        try:
+            parsed = urllib.parse.urlparse(candidate)
+            host = (parsed.hostname or "").lower()
+            if parsed.username or parsed.password or parsed.port:
+                continue
+        except (TypeError, ValueError):
+            continue
+        if host not in {
+            "mycomap.com", "www.mycomap.com", "mycomap.org", "www.mycomap.org",
+        }:
+            continue
+        if candidate not in seen:
+            urls.append(candidate)
+            seen.add(candidate)
+    return urls
+
+
+def _mycomap_locus_hint(*values: str) -> str:
+    """Classify explicit result-link/title locus text; unknown defaults later."""
+    text = " ".join(urllib.parse.unquote(str(value or "")) for value in values)
+    if _MYCOMAP_ITS_LOCUS_RE.search(text):
+        return "its"
+    if _MYCOMAP_NON_ITS_LOCUS_RE.search(text):
+        return "non_its"
+    return "unknown"
+
+
+def _select_mycomap_its_result_url(
+    value: Any, *, title_fetcher=None,
+) -> str:
+    """Choose the ITS result from a multi-link iNaturalist field.
+
+    One link is returned exactly as before. With several links, the first is
+    still the default. Only when that first result explicitly identifies a
+    non-ITS locus do we inspect later links for an explicit ITS result, falling
+    back to the first unlabelled result because most historical searches are
+    ITS and did not put the locus in their title.
+    """
+    raw = str(value or "").strip()
+    urls = _extract_mycomap_result_urls(raw)
+    if len(urls) <= 1:
+        return raw
+
+    first = urls[0]
+    first_hint = _mycomap_locus_hint(first)
+    if first_hint == "unknown" and title_fetcher is not None:
+        first_hint = _mycomap_locus_hint(first, title_fetcher(first))
+    if first_hint != "non_its":
+        return first
+
+    first_unknown = None
+    for candidate in urls[1:]:
+        hint = _mycomap_locus_hint(candidate)
+        if hint == "unknown" and title_fetcher is not None:
+            hint = _mycomap_locus_hint(candidate, title_fetcher(candidate))
+        if hint == "its":
+            return candidate
+        if hint == "unknown" and first_unknown is None:
+            first_unknown = candidate
+    return first_unknown or first
+
 
 class InatTreeError(Exception):
     """User-facing application error with an HTTP status and safe details."""
@@ -812,6 +901,115 @@ def _lookup_inaturalist_project_exact(value: str) -> Optional[Dict[str, Any]]:
     return None
 
 
+# Something a person types when they mean a species: one to three words of
+# letters, optionally hyphenated ("Psilocybe cubensis", "fly agaric"). Usernames
+# with digits, dots or underscores never get here, so a mistyped login is not
+# answered with a mushroom.
+TAXON_NAME_RE = re.compile(r"^[A-Za-z][A-Za-z-]+(?: [A-Za-z][A-Za-z-]*){0,2}$")
+# How far a misspelled last word is cut back looking for a match: "cubenesis"
+# needs four letters off to reach "cuben", which iNaturalist completes to
+# cubensis. Each step is one more request, so this stays small.
+TAXON_TYPO_MAX_TRIM = 6
+TAXON_HINT_BUDGET_SECONDS = 10.0
+SEQUENCED_TAXON_FIELD = "DNA Barcode ITS"
+# Above this many sequenced observations the search is not offered as a
+# one-click start: a genus such as Amanita has ~7,900, and Submit would page
+# through all of them into one queue.
+TAXON_HINT_MAX_OFFERED = 500
+
+
+def _autocomplete_taxon(query: str, deadline: float) -> Optional[Dict[str, Any]]:
+    params = urllib.parse.urlencode({"q": query, "per_page": 5, "is_active": "true"})
+    payload = _http_request(f"{INAT_API_BASE}/taxa/autocomplete?{params}",
+                            max_attempts=1, deadline=deadline)
+    results = [r for r in payload.get("results") or [] if isinstance(r, dict) and r.get("id")]
+    if not results:
+        return None
+    wanted = query.casefold()
+    for item in results:
+        if str(item.get("name") or "").casefold() == wanted:
+            return item
+    return results[0]
+
+
+def lookup_taxon_hint(value: str) -> Optional[Dict[str, Any]]:
+    """Read a name typed into the observation box as the taxon it most likely is.
+
+    Returns the taxon and how many of its iNaturalist observations carry an ITS
+    sequence, so the Tree Builder can offer that search instead of a bare "not
+    found". Best effort: any failure is no hint, never an error.
+    """
+    text = re.sub(r"\s+", " ", str(value or "")).strip()
+    if not TAXON_NAME_RE.match(text):
+        return None
+    deadline = time.monotonic() + TAXON_HINT_BUDGET_SECONDS
+    try:
+        taxon = _autocomplete_taxon(text, deadline)
+        corrected = False
+        words = text.split(" ")
+        if taxon is None and len(words) >= 2 and len(words[-1]) > 3:
+            head, last = " ".join(words[:-1]), words[-1]
+            for cut in range(1, TAXON_TYPO_MAX_TRIM + 1):
+                if len(last) - cut < 3:
+                    break
+                candidate = _autocomplete_taxon(f"{head} {last[:-cut]}", deadline)
+                # Only a match in the genus the person typed counts as a
+                # correction; anything else is a guess about a different name.
+                if candidate and str(candidate.get("name") or "").casefold().startswith(
+                        head.casefold() + " "):
+                    taxon, corrected = candidate, True
+                    break
+        if taxon is None:
+            return None
+        taxon_id = int(taxon["id"])
+        counts = _http_request(
+            f"{INAT_API_BASE}/observations?"
+            + urllib.parse.urlencode({"taxon_id": taxon_id, "per_page": 0,
+                                      f"field:{SEQUENCED_TAXON_FIELD}": ""}),
+            max_attempts=1, deadline=deadline,
+        )
+        sequenced = counts.get("total_results")
+    except Exception as exc:  # a hint must never turn "not found" into a failure
+        logger.info("event=inat_tree.taxon_hint_failed error=%s", type(exc).__name__)
+        return None
+    return {
+        "id": taxon_id,
+        "name": str(taxon.get("name") or ""),
+        "rank": str(taxon.get("rank") or ""),
+        "common_name": str(taxon.get("preferred_common_name") or ""),
+        # A common name ("fly agaric") is a match, not a misspelling.
+        "corrected": corrected or str(
+            taxon.get("matched_term") or taxon.get("name") or ""
+        ).casefold() != text.casefold(),
+        "sequenced_observations": sequenced if isinstance(sequenced, int) else None,
+        "offer_search": isinstance(sequenced, int) and 0 < sequenced <= TAXON_HINT_MAX_OFFERED,
+    }
+
+
+def _taxon_hint_message(raw: str, hint: Dict[str, Any]) -> str:
+    rank = hint["rank"] or "taxon"
+    name = hint["name"]
+    lead = (f"Did you mean the {rank} {name}? " if hint["corrected"]
+            else f"'{raw}' looks like the {rank} {name}. ")
+    lead += ("This box takes an iNaturalist observation, person or project rather "
+             "than a species name. ")
+    count = hint["sequenced_observations"]
+    if count and not hint["offer_search"]:
+        return (lead + f"{count:,} iNaturalist observations have an ITS sequence for "
+                f"{name}, which is too many for one tree. Pick a species, or narrow "
+                "the search on iNaturalist (by place, for example) and paste that "
+                "search's URL here.")
+    if count:
+        noun, them = ("observation has", "it") if count == 1 else ("observations have", "them")
+        return (lead + f"{count:,} iNaturalist {noun} an ITS sequence for {name}. "
+                f"Click \"Use this search\" and then Submit to import {them} as the "
+                "starting set for your tree.")
+    return (lead + f"No iNaturalist observation of {name} has an ITS sequence yet. "
+            "To start a tree for it, paste an ITS sequence under Paste (Dikarya "
+            "adds related sequences with BLAST), or enter one sequenced "
+            "observation here.")
+
+
 def _scope_from_user(user_info: Dict[str, Any]) -> Dict[str, Any]:
     login = _clean_candidate(user_info.get("login"))
     return {
@@ -897,6 +1095,24 @@ def resolve_inaturalist_user_or_project(parsed: Dict[str, Any],
         return {"type": "user", "scope": _scope_from_user(user_match)}
     if project_match:
         return {"type": "project", "scope": _scope_from_project(project_match)}
+    if kind == "plain_candidate":
+        hint = lookup_taxon_hint(value)
+        if hint:
+            return {
+                "type": "not_found",
+                "message": _taxon_hint_message(parsed.get("raw") or value, hint),
+                "taxon_hint": hint,
+            }
+        if TAXON_NAME_RE.match(value):
+            return {
+                "type": "not_found",
+                "message": (
+                    f"No iNaturalist user, project or species was found for "
+                    f"'{parsed.get('raw') or value}'. This box takes an observation ID "
+                    "or URL, a username or a project. To start from a species, open "
+                    "its page on iNaturalist and paste that page's URL here."
+                ),
+            }
     return {
         "type": "not_found",
         "message": f"No iNaturalist user or project was found for '{parsed.get('raw') or value}'.",
@@ -1147,10 +1363,11 @@ def preview_inaturalist_tree_input(raw_input: str,
         logged_input = str(raw_input)[:MAX_RAW_INPUT_LEN]
         logger.warning(
             "event=inat_tree.preview_not_found input_type=%s input_source=%s "
-            "preferred_type=%s input=%r",
+            "preferred_type=%s taxon_hint=%s input=%r",
             parsed.get("type") or "unknown",
             parsed.get("source") or "none",
             (resolved_type or "none").strip().lower(),
+            (resolved.get("taxon_hint") or {}).get("id") or "none",
             logged_input,
         )
         return {"status": "success", **resolved}
@@ -1397,9 +1614,16 @@ def _refresh_mycomap_blast_results(blast_id: str, *, rebuild_ncbi_blast: bool = 
         try:
             result["local"] = rerun_mycomap_result(reference, "local", local_limit)
             result["local_status"] = "queued" if reference["provider"] == "org" else "completed"
-            _report_progress(
-                progress, "MycoMap local BLAST results refreshed.", icon="done"
-            )
+            # MycoMap.org only accepts the rerun here and runs it later, so
+            # saying "refreshed" read as done right before the tree waited on it.
+            if reference["provider"] == "org":
+                _report_progress(
+                    progress, "MycoMap.org accepted the local BLAST refresh.", icon="done"
+                )
+            else:
+                _report_progress(
+                    progress, "MycoMap local BLAST results refreshed.", icon="done"
+                )
         except (MycoMapRerunError, OrgResultError) as exc:
             warning = (
                 "MycoMap local BLAST could not be refreshed; Dikarya will use "
@@ -2924,6 +3148,7 @@ def prepare_inat_tree_job(observation_id: int, *, include_ncbi: bool = True,
     from app.api.routes import gather_mycomap_sequences_for_queue
     from app.services.mycomap_service import (
         MycoMapRerunError,
+        fetch_mycomap_result_title,
         parse_mycomap_result_reference,
         resolve_mycomap_result_reference,
         validate_mycomap_url,
@@ -2946,7 +3171,29 @@ def prepare_inat_tree_job(observation_id: int, *, include_ncbi: bool = True,
         # the completion hook rechecks the field and preserves it unless the
         # submission explicitly requested replacement.
         _report_progress(progress, "An existing tree URL will be preserved while this new tree is built.")
-    mycomap_url = extract_observation_field_value(observation, MYCOMAP_BLAST_FIELD_NAME)
+    raw_mycomap_url = extract_observation_field_value(
+        observation, MYCOMAP_BLAST_FIELD_NAME
+    )
+    mycomap_url = _select_mycomap_its_result_url(
+        raw_mycomap_url, title_fetcher=fetch_mycomap_result_title,
+    )
+    saved_mycomap_urls = _extract_mycomap_result_urls(raw_mycomap_url)
+    if len(saved_mycomap_urls) > 1:
+        selected_index = (
+            saved_mycomap_urls.index(mycomap_url) + 1
+            if mycomap_url in saved_mycomap_urls else 1
+        )
+        logger.info(
+            "event=inat_tree.mycomap_result_selected observation_id=%s "
+            "link_count=%s selected_index=%s",
+            observation_id, len(saved_mycomap_urls), selected_index,
+        )
+        if selected_index > 1:
+            _report_progress(
+                progress,
+                "Multiple MycoMap BLAST links were found; using the later "
+                "ITS result instead of the first non-ITS result.",
+            )
     # Jobs queued before org support may already have created a replacement com
     # search while leaving the observation's org field alone. Finish those jobs
     # against the search they actually started; new jobs use the saved org URL.

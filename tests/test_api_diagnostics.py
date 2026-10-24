@@ -1,6 +1,8 @@
 import gzip
 import io
 import json
+import os
+import stat
 from urllib.error import HTTPError, URLError
 from urllib.request import Request
 from unittest.mock import patch
@@ -75,6 +77,26 @@ def test_success_does_not_write_archive(archive):
         with diagnostics.diagnostic_urlopen("https://api.example/test") as response:
             assert json.loads(response.read()) == {"ok": True}
     assert records(archive) == []
+
+
+def test_cli_date_folder_inherits_archive_group_and_allows_worker_writes(archive):
+    shared_gid = next((gid for gid in os.getgroups() if gid != os.getgid()), os.getgid())
+    os.chown(archive, -1, shared_gid)
+    # Reproduce a date folder made by an earlier CLI capture, with its primary
+    # group and a restrictive umask. A later capture must repair its own folder.
+    directory = archive / diagnostics.datetime.now(diagnostics.timezone.utc).strftime("%Y-%m-%d")
+    directory.mkdir(mode=0o750)
+    diagnostic_id = diagnostics.record_api_failure(
+        "https://api.example/test", reason="http_error", status=404,
+    )
+    assert diagnostic_id
+    info = directory.stat()
+    assert info.st_gid == shared_gid
+    assert info.st_mode & stat.S_ISGID
+    assert info.st_mode & 0o070 == 0o070
+    assert info.st_mode & 0o007 == 0
+    assert next(directory.glob("*.gz")).stat().st_gid == shared_gid
+    assert records(archive)[0]["status"] == 404
 
 
 def test_semantic_observation_failure_retains_full_envelope(archive):

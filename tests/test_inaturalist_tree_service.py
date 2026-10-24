@@ -31,6 +31,7 @@ extract_inat_genus = inaturalist_tree_service._extract_inat_genus
 extract_genus_from_inat_tip = inaturalist_tree_service._extract_genus_from_inat_tip
 find_observation_source_tip_name = inaturalist_tree_service._find_observation_source_tip_name
 maybe_add_inat_its_sequence = inaturalist_tree_service._maybe_add_inat_its_sequence
+select_mycomap_its_result_url = inaturalist_tree_service._select_mycomap_its_result_url
 source_display_label_for_tip = inaturalist_tree_service._source_display_label_for_tip
 from app.services.tree_edit_service import rename_tip
 
@@ -192,6 +193,99 @@ class TestInaturalistTreeInputParsing(unittest.TestCase):
             ),
             3,
         )
+
+
+class TestMycoMapResultSelection(unittest.TestCase):
+    ITS_URL = (
+        "https://mycomap.com/genetics/blast-search/"
+        "153574698-psilocybe-r70829/"
+    )
+    LSU_URL = (
+        "https://mycomap.com/genetics/blast-search/"
+        "amaj12-psilocybe-lsu-r70831/"
+    )
+
+    def test_single_link_keeps_existing_behavior_without_title_lookup(self):
+        fetch_title = MagicMock(side_effect=AssertionError("must not fetch"))
+
+        selected = select_mycomap_its_result_url(
+            self.LSU_URL, title_fetcher=fetch_title,
+        )
+
+        self.assertEqual(selected, self.LSU_URL)
+        fetch_title.assert_not_called()
+
+    def test_first_unlabelled_result_remains_the_default(self):
+        fetch_title = MagicMock(
+            return_value="153574698 psilocybe - BLAST Search - MycoMap Beta"
+        )
+
+        selected = select_mycomap_its_result_url(
+            f"{self.ITS_URL} {self.LSU_URL}", title_fetcher=fetch_title,
+        )
+
+        self.assertEqual(selected, self.ITS_URL)
+        fetch_title.assert_called_once_with(self.ITS_URL)
+
+    def test_later_its_result_replaces_an_explicit_first_lsu_result(self):
+        fetch_title = MagicMock(
+            return_value="153574698 psilocybe - BLAST Search - MycoMap Beta"
+        )
+
+        selected = select_mycomap_its_result_url(
+            f"{self.LSU_URL}\n{self.ITS_URL}", title_fetcher=fetch_title,
+        )
+
+        self.assertEqual(selected, self.ITS_URL)
+        # LSU was explicit in the first URL. Only the unlabelled later result
+        # needed a title lookup.
+        fetch_title.assert_called_once_with(self.ITS_URL)
+
+    def test_explicit_later_its_wins_over_an_earlier_unlabelled_fallback(self):
+        unknown_url = "https://mycomap.com/genetics/blast-search/specimen-r70000/"
+        explicit_its_url = (
+            "https://mycomap.com/genetics/blast-search/"
+            "specimen-dna-barcode-its-r70001/"
+        )
+        fetch_title = MagicMock(return_value="Specimen - BLAST Search")
+
+        selected = select_mycomap_its_result_url(
+            f"{self.LSU_URL}, {unknown_url}; {explicit_its_url}",
+            title_fetcher=fetch_title,
+        )
+
+        self.assertEqual(selected, explicit_its_url)
+        fetch_title.assert_called_once_with(unknown_url)
+
+    def test_first_explicit_its_does_not_inspect_additional_links(self):
+        explicit_its_url = (
+            "https://mycomap.com/genetics/blast-search/"
+            "specimen-dna-barcode-its-r70001/"
+        )
+        fetch_title = MagicMock(side_effect=AssertionError("must not fetch"))
+
+        selected = select_mycomap_its_result_url(
+            f"{explicit_its_url} {self.LSU_URL}", title_fetcher=fetch_title,
+        )
+
+        self.assertEqual(selected, explicit_its_url)
+        fetch_title.assert_not_called()
+
+    def test_other_explicit_fungal_locus_also_triggers_the_search(self):
+        tef_url = (
+            "https://mycomap.com/genetics/blast-search/"
+            "specimen-tef1-alpha-r70002/"
+        )
+        explicit_its_url = (
+            "https://mycomap.com/genetics/blast-search/"
+            "specimen-its-r70003/"
+        )
+
+        selected = select_mycomap_its_result_url(
+            f"{tef_url} {explicit_its_url}",
+        )
+
+        self.assertEqual(selected, explicit_its_url)
 
 
 class TestInaturalistTreeSourceLabel(unittest.TestCase):

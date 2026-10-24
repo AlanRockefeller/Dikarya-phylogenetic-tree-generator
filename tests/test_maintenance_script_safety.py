@@ -238,7 +238,7 @@ def test_reclaim_dry_run_does_not_mutate_artifacts(reclaim, tmp_path):
 def test_main_exits_non_zero_when_a_pass_failed(reclaim, tmp_path, monkeypatch, capsys):
     """Cron cannot see a partial run that exits 0."""
     jobs_root = tmp_path / "jobs"
-    job_dir = jobs_root / "0123abcd-0123-0123-0123-0123456789ab"
+    job_dir = jobs_root / "0123abcd-0123-4123-8123-0123456789ab"
     (job_dir / "logs").mkdir(parents=True)
     # Backdate everything so --min-age-hours does not skip the job.
     old = 0
@@ -266,6 +266,31 @@ def test_main_exits_zero_on_a_clean_run(reclaim, tmp_path, monkeypatch):
     )
 
     assert reclaim.main() == 0
+
+
+def test_reclaim_includes_short_ids_and_preserves_recent_jobs(reclaim, tmp_path, monkeypatch):
+    jobs_root = tmp_path / "jobs"
+    legacy = "0123abcd-0123-4123-8123-0123456789ab"
+    for name in (legacy, "abcd", "recent", "not-a-job"):
+        alignment = jobs_root / name / "alignment" / "alignment_raw.fasta"
+        alignment.parent.mkdir(parents=True)
+        alignment.write_bytes(b">sample\n" + b"ACGT" * 5000 + b"\n")
+        if name != "recent":
+            for path in (alignment, alignment.parent, alignment.parent.parent):
+                os.utime(path, (0, 0))
+    # A valid-looking symlink must not take maintenance outside the jobs root.
+    (jobs_root / "link").symlink_to(jobs_root / "not-a-job", target_is_directory=True)
+    monkeypatch.setattr(sys, "argv", [
+        "dikarya_reclaim_job_space.py", "--jobs-dir", str(jobs_root),
+        "--passes", "alignments", "--apply",
+    ])
+    assert reclaim.main() == 0
+    for name in (legacy, "abcd"):
+        alignment = jobs_root / name / "alignment" / "alignment_raw.fasta"
+        assert not alignment.exists()
+        assert gzip.decompress(alignment.with_suffix(".fasta.gz").read_bytes()).startswith(b">sample\n")
+    for name in ("recent", "not-a-job"):
+        assert (jobs_root / name / "alignment" / "alignment_raw.fasta").exists()
 
 
 # --------------------------------------------------------------------------

@@ -95,6 +95,38 @@ class TestMycomapUrlValidation(unittest.TestCase):
         self.assertIsNone(result)
 
 
+class TestMycomapResultTitle(unittest.TestCase):
+    def test_reads_only_the_page_title(self):
+        page = (
+            b"<html><head><title> AMAJ12 Psilocybe LSU - BLAST Search "
+            b"- MycoMap Beta </title></head><body>ignored</body></html>"
+        )
+        with patch.object(
+            mycomap_service,
+            "diagnostic_urlopen",
+            return_value=io.BytesIO(page),
+        ) as urlopen:
+            title = mycomap_service.fetch_mycomap_result_title(
+                "https://mycomap.com/genetics/blast-search/"
+                "amaj12-psilocybe-lsu-r70831/"
+            )
+
+        self.assertEqual(
+            title,
+            "AMAJ12 Psilocybe LSU - BLAST Search - MycoMap Beta",
+        )
+        self.assertEqual(urlopen.call_args.kwargs["timeout"], 10)
+
+    def test_rejects_an_untrusted_host_without_fetching(self):
+        with patch.object(mycomap_service, "diagnostic_urlopen") as urlopen:
+            title = mycomap_service.fetch_mycomap_result_title(
+                "https://example.com/genetics/blast-search/r70831/"
+            )
+
+        self.assertEqual(title, "")
+        urlopen.assert_not_called()
+
+
 class TestMycomapCreationDiscoveryBackoff(unittest.TestCase):
     def test_polling_backs_off_after_one_hour_six_hours_and_one_day(self):
         interval = mycomap_service.get_mycomap_creation_discovery_poll_interval_seconds
@@ -514,6 +546,19 @@ class TestMycomapBlastMetrics(unittest.TestCase):
             improved,
             "iNat135398232 Lasiobolus sp. 'UT01' Nederland Colorado US",
         )
+
+    def test_improve_local_name_uses_accession_when_header_leads_with_genus(self):
+        """A curator header ending in an accession should not label the tip by genus."""
+        metric = {
+            "display_name": "Hygrocybe minutula",
+            "species_name": "Hygrocybe minutula",
+            "mycomap_location": "",
+        }
+        current = "Hygrocybe cf minutula QC (type NY) KM248898"
+
+        improved = improve_mycomap_sequence_name(current, metric, "local")
+
+        self.assertEqual(improved, "KM248898 Hygrocybe minutula")
 
 
 class TestMycomapBlastCreation(unittest.TestCase):

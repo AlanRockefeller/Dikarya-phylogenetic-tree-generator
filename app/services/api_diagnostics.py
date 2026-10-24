@@ -10,6 +10,7 @@ import json
 import logging
 import os
 import re
+import stat
 import uuid
 from contextlib import contextmanager
 from datetime import datetime, timezone
@@ -23,6 +24,29 @@ ARCHIVE_DIR = Path(__file__).resolve().parents[2] / "var" / "logs" / "api-respon
 _SENSITIVE = re.compile(r"password|secret|token|authorization|cookie|api.?key|client.?secret|session|^code$|^key$", re.I)
 _HEADERS = {"content-type", "content-length", "date", "retry-after", "x-request-id",
             "x-correlation-id", "age", "etag", "last-modified", "cache-control"}
+
+
+def _archive_directory(now):
+    """Share date folders between CLI captures and the web/worker account."""
+    ARCHIVE_DIR.mkdir(parents=True, exist_ok=True)
+    directory = ARCHIVE_DIR / now.strftime("%Y-%m-%d")
+    directory.mkdir(mode=0o770, exist_ok=True)
+    info = directory.stat()
+    if info.st_uid == os.geteuid():
+        # CLI processes may have a different primary group. Inherit the
+        # archive's shared group explicitly even when its parent lacks setgid.
+        # Best effort: the workers run with RestrictSUIDSGID=yes, which refuses
+        # the setgid chmod with EPERM, and that must not cost the archive itself.
+        try:
+            shared_gid = ARCHIVE_DIR.stat().st_gid
+            if info.st_gid != shared_gid:
+                os.chown(directory, -1, shared_gid)
+            mode = stat.S_IMODE(info.st_mode) | stat.S_ISGID | stat.S_IRWXG
+            if mode != stat.S_IMODE(info.st_mode):
+                directory.chmod(mode)
+        except OSError:
+            pass
+    return directory
 
 
 def safe_url(url):
@@ -84,8 +108,7 @@ def record_api_failure(url, *, reason, body=None, status=None, headers=None, met
                 pass
         now = datetime.now(timezone.utc)
         diagnostic_id = uuid.uuid4().hex
-        directory = ARCHIVE_DIR / now.strftime("%Y-%m-%d")
-        directory.mkdir(parents=True, exist_ok=True)
+        directory = _archive_directory(now)
         path = directory / f"{diagnostic_id}.json.gz"
         context = _current_context()
         # Stable user IDs are preferable, but existing request correlation may

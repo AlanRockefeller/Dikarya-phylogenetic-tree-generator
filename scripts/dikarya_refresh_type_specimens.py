@@ -62,9 +62,10 @@ GENBANK_BATCH = 100
 MISSING_RETRY_DAYS = 30
 TYPE_WORD_RE = re.compile(
     r"\b(holotype|isotype|epitype|lectotype|neotype|paratype|syntype|ex-type|"
-    r"TYPE material|type strain)\b",
+    r"TYPE material|type strain|type)\b",
     re.IGNORECASE,
 )
+NEGATED_TYPE_RE = re.compile(r"\b(?:non|not|no)[\s-]*(?:an?\s+)?\w*type\b", re.IGNORECASE)
 
 
 # Opened by main() unless --dry-run: every log line is also appended to
@@ -244,7 +245,8 @@ def candidate_accessions(since_days):
         jobs += 1
         for header in headers:
             acc = tss.accession_root(record_accession(header, {}))
-            if acc and (acc.startswith("NR_") or TYPE_WORD_RE.search(header)):
+            if acc and (acc.startswith("NR_") or (
+                    TYPE_WORD_RE.search(header) and not NEGATED_TYPE_RE.search(header))):
                 candidates.add(acc)
     return candidates, jobs
 

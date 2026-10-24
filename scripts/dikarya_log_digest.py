@@ -24,6 +24,7 @@ UUID_RE = re.compile(r'(?i)[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a
 NUMERIC_SEG_RE = re.compile(r'/\d+(?=/|$|\.)')
 TS_RE = re.compile(r'^\[?(\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2})')
 LEVEL_RE = re.compile(r'\[(ERROR|CRITICAL|WARNING)\]')
+LEVEL_PRIORITY = {"WARNING": 1, "ERROR": 2, "CRITICAL": 3}
 CONTEXT_RE = re.compile(r'\[(?=[^\]]*\b(?:req|job|rq|user)=)(?P<body>[^\]]+)\]')
 # The WARNING+ mirror's timestamp has milliseconds and is followed by a logger
 # name. Gunicorn's copy instead has a numeric UTC offset and no logger field.
@@ -368,6 +369,14 @@ def meaningful_error_key(record):
     first = lines[0] if lines else record
     message = formatted_log_message(first)
     message = UUID_RE.sub("<id>", message)
+    if "event=client." in message:
+        # Fingerprints identify individual reports, not distinct bugs. Keeping
+        # them (and short job IDs) split one fetch failure across dozens of
+        # rows, burying the other warnings in a supposedly grouped digest.
+        message = message.split(" fingerprint=", 1)[0]
+        message = re.sub(r'\bjob_id=\S+\s*', '', message)
+        message = re.sub(r'(/(?:api/)?job/)[a-z0-9]{4,12}(?=/|\s|$)',
+                         r'\1<id>', message)
     message = re.sub(r'\bdiagnostic=[0-9a-f]{32}\b', 'diagnostic=<id>', message)
     message = re.sub(r'\b\d+\b', '<n>', message)
     return message.strip()[:180]
@@ -440,6 +449,7 @@ def analyze_errors(cutoff, until=None):
     streams = [log_files("error", cutoff), log_files("errors", cutoff)]
     files = [path for stream in streams for path in stream]
     exceptions = collections.Counter()
+    exception_levels = {}
     degradations = collections.Counter()
     # Alan 9/12/26 - Probes aimed at this application, and SSE stream lifetimes
     # taken from the app's own close event rather than inferred from access-log
@@ -559,12 +569,18 @@ def analyze_errors(cutoff, until=None):
                         affected_jobs[slug[:100]].add(job)
                 else:
                     exceptions[key] += 1
+                    level_match = LEVEL_RE.search(first_line)
+                    level = level_match.group(1) if level_match else "WARNING"
+                    previous_level = exception_levels.get(key, "WARNING")
+                    if LEVEL_PRIORITY[level] >= LEVEL_PRIORITY[previous_level]:
+                        exception_levels[key] = level
                     if user:
                         affected[key].add(user)
                     if job:
                         affected_jobs[key].add(job)
     return {
-        "exceptions": exceptions, "degradations": degradations, "affected": affected,
+        "exceptions": exceptions, "exception_levels": exception_levels,
+        "degradations": degradations, "affected": affected,
         "affected_jobs": affected_jobs, "security": security,
         "security_clients": security_clients, "sse_closes": sse_closes,
         "actors": actors,
@@ -1057,6 +1073,37 @@ def rows(items, empty="  (none)"):
             print(f"  {item}")
 
 
+def format_exception_rows(errors):
+    """Render every grouped WARNING+ finding, with serious levels first.
+
+    These groups are already compacted by ``meaningful_error_key``. Truncating
+    them to ``--top`` silently hid low-frequency ERRORs and tied warnings behind
+    whichever message happened to be inserted first, so this safety-critical
+    section deliberately does not use the general top-N display limit.
+    """
+    levels = errors.get("exception_levels", {})
+    ranked = sorted(
+        errors["exceptions"].items(),
+        key=lambda item: (
+            -LEVEL_PRIORITY.get(levels.get(item[0], "WARNING"), 1),
+            -item[1],
+            item[0],
+        ),
+    )
+    return [
+        f"{count:>5}  [{levels.get(key, 'WARNING')}] {key}"
+        + (
+            f" [jobs: {len(errors['affected_jobs'][key])}]"
+            if errors["affected_jobs"].get(key) else ""
+        )
+        + (
+            f" [users: {', '.join(sorted(errors['affected'][key])[:3])}]"
+            if errors["affected"].get(key) else ""
+        )
+        for key, count in ranked
+    ]
+
+
 def format_coverage(label, data):
     oldest = data["oldest"].strftime("%Y-%m-%d %H:%M:%S") if data["oldest"] else "-"
     newest = data["newest"].strftime("%Y-%m-%d %H:%M:%S") if data["newest"] else "-"
@@ -1160,18 +1207,7 @@ def main():
     section("Crawler/scanner/static noise (4xx)")
     rows([f"{count:>5}  {status}  {endpoint}" for (status, endpoint), count in access["noise_4xx"].most_common(args.top)])
     section("Exceptions and errors")
-    rows([
-        f"{count:>5}  {key}"
-        + (
-            f" [jobs: {len(errors['affected_jobs'][key])}]"
-            if errors["affected_jobs"].get(key) else ""
-        )
-        + (
-            f" [users: {', '.join(sorted(errors['affected'][key])[:3])}]"
-            if errors['affected'].get(key) else ""
-        )
-        for key, count in errors["exceptions"].most_common(args.top)
-    ])
+    rows(format_exception_rows(errors))
     section("Degraded work")
     rows([f"{count:>5}  {key}" for key, count in errors["degradations"].most_common(args.top)])
     section("Worker lifecycle")

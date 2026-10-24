@@ -2240,6 +2240,42 @@ def parse_mycomap_result_reference(url: str) -> Optional[dict]:
     return None
 
 
+def fetch_mycomap_result_title(url: str) -> str:
+    """Return a public MycoMap result page's HTML title, best effort.
+
+    This is intentionally a small head read. The iNaturalist tree importer
+    uses it only when an observation field contains more than one MycoMap
+    result link and the URL itself does not say which locus was searched.
+    Unsupported hosts are rejected before any request is made.
+    """
+    if not parse_mycomap_result_reference(url):
+        return ""
+
+    request = urllib.request.Request(
+        url,
+        headers={
+            "User-Agent": "Dikarya-TreeBuilder/1.0",
+            "Accept": "text/html,*/*",
+        },
+        method="GET",
+    )
+    try:
+        with diagnostic_urlopen(request, timeout=REQUEST_TIMEOUT) as response:
+            # MycoMap puts <title> in the first few KB; leave ample room for
+            # harmless head markup without downloading the much larger result
+            # tables.
+            head = response.read(65536).decode("utf-8", errors="replace")
+    except Exception as exc:
+        logger.info("Could not read MycoMap result title from %s: %s", url, exc)
+        return ""
+
+    match = re.search(r"<title[^>]*>(.*?)</title>", head,
+                      re.IGNORECASE | re.DOTALL)
+    if not match:
+        return ""
+    return " ".join(html.unescape(match.group(1)).split())
+
+
 def resolve_mycomap_result_reference(url: str) -> Optional[dict]:
     """Return the provider and BLAST ID, resolving org sequence links if needed."""
     reference = parse_mycomap_result_reference(url)
@@ -3631,6 +3667,17 @@ def _build_result_display_info(description: str, identifier: str = '',
     return result
 
 
+def _header_accession_token(tokens: list) -> str:
+    """Return the first GenBank-accession-shaped token in a local hit header."""
+    from app.services.fasta_utils import is_genbank_accession
+
+    for token in tokens:
+        candidate = token.strip('>,;()[]{}')
+        if re.search(r'\d', candidate) and is_genbank_accession(candidate):
+            return candidate
+    return ''
+
+
 def improve_mycomap_sequence_name(current_name: str, metric: Optional[dict],
                                    hit_source: str = '', *, accession: str = '',
                                    voucher: str = '', location: str = '') -> str:
@@ -3662,6 +3709,13 @@ def improve_mycomap_sequence_name(current_name: str, metric: Optional[dict],
                 label_identifier = inat_token
             elif label_identifier.casefold() != inat_token.casefold():
                 label_identifier = f"{label_identifier} {inat_token}"
+        elif not re.search(r'\d', label_identifier):
+            # A curator-written header such as "Hygrocybe cf minutula QC (type
+            # NY) KM248898" leads with the genus and puts the accession last;
+            # taking the first word produced "Hygrocybe Hygrocybe minutula".
+            accession_token = _header_accession_token(identifier[1:])
+            if accession_token:
+                label_identifier = accession_token
         location = metric.get('mycomap_location') or ''
         return _clean_label_fragment(
             ' '.join(part for part in (label_identifier, species_name, location) if part)

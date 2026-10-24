@@ -5,6 +5,7 @@ user-visible symptom when it breaks: the worker kept running perfectly while its
 log went silent, and the digest kept printing while its numbers were wrong.
 """
 
+import collections
 import gzip
 import importlib.util
 import json
@@ -1177,6 +1178,28 @@ def test_digest_reads_rotations_deduplicates_mirrors_and_groups_final_cause(tmp_
     key = next(iter(result["exceptions"]))
     assert key == "ValueError: final meaningful cause <n>"
     assert sorted(result["coverage"]["files"]) == ["error.log-20260814.gz", "errors.log"]
+
+
+def test_digest_renders_every_error_group_and_orders_by_severity():
+    digest = _digest_module()
+    warning_keys = [f"warning {index}" for index in range(12)]
+    errors = {
+        "exceptions": collections.Counter(
+            {**{key: 1 for key in warning_keys}, "rare serious failure": 1}
+        ),
+        "exception_levels": {
+            **{key: "WARNING" for key in warning_keys},
+            "rare serious failure": "ERROR",
+        },
+        "affected": {},
+        "affected_jobs": {},
+    }
+
+    rendered = digest.format_exception_rows(errors)
+
+    assert len(rendered) == 13
+    assert "[ERROR] rare serious failure" in rendered[0]
+    assert all(any(key in row for row in rendered) for key in warning_keys)
 
 
 def test_digest_separates_5xx_noise_and_streams_and_normalizes_thumb(tmp_path):

@@ -540,6 +540,17 @@ When a new CLI version is published:
    `npx --no-install eslint app/static/js/inat_finder.js`, and spot-check the
    affected modes against live iNaturalist API responses before deploying.
 
+- **Rare Finds (`/rare-finds`) runs in the browser, like iNat Finder.**
+  `app/static/js/rare_finds.js` reads an iNaturalist search URL, ranks its
+  species-level taxa by live worldwide observation count (the taxon objects'
+  cached `observations_count` is stale for renamed taxa, so the shown list is
+  always re-counted) and builds the .pptx client-side with the vendored
+  `vendor/pptxgen-3.12.0.bundle.js`. The one server piece is
+  `/rare-finds/photo/<id>/<size>.<ext>`, which relays all-rights-reserved photos
+  because `static.inaturalist.org` sends no CORS header. It rebuilds the
+  upstream URL from validated parts and must stay that narrow -- never accept
+  a URL or host from the client. `?url=<search>` runs a search on load, so a
+  result can be shared as a link.
 - Flask app factory in `app/__init__.py`; extensions initialized in `app/extensions.py`.
 - All API responses use JSON; the frontend is a SPA-style UI talking to `/api/` endpoints.
 - FASTA sequence headers are sanitized on input and restored on download/display (see `fasta_utils.py`).
@@ -898,6 +909,20 @@ When a new CLI version is published:
   "Single-level undo of a tree edit" section of `ARCHITECTURE.md`.
 - Collapsing a clade in the viewer is display state only (phylotree's transient
   `node.collapsed`). It must never prune, persist, or trigger a recompute.
+- **A rectangular tree's width is fitted to the pane, not derived from its depth.**
+  The viewer sets phylotree's `branch-width` option (added in our `phylotree.js`
+  `do_lr`) to (pane width − measured label/annotation width) × `horizontalPercent`;
+  Layout → Width steps that percentage and Fit resets it to 100. Before 2026-10-20
+  the width was `max_depth × 20px`, which ranged from 60 to 1,700 px across real
+  trees. A saved `widthPercent` replaces the old `spacingX` preference, which is
+  ignored. "Stretch clade to screen width" (node menu) is a transient
+  `horizontalPercent` that is never saved. Radial layout keeps the per-level step.
+- **Long-branch breaks are layout-only.** `_computeLongBranchBreaks()` marks at
+  most 3 outlier branches (≥25% of the drawn depth and ≥6× the 90th-percentile
+  branch), and phylotree's `display-branch-length` hook draws them shortened with
+  a `//` and their true length. Never shorten a branch through
+  `branch_length_accessor` or `data.attribute`: those feed Newick export,
+  rerooting and the branch tooltip, which must keep the true length.
 - Use existing Tailwind utility style patterns from `templates/sequence_entry.html` and `templates/partials/*.html`.
 - Reuse modal structure from `templates/partials/add_sequences_modal.html`.
 - Support dark mode (`dark:*` classes) for all new UI.
