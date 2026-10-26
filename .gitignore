@@ -82,3 +82,6 @@ type_specimens_not_in_mycomap.csv
 
 # Ad-hoc dated type-sequence reports from scripts/dikarya_type_specimen_gap_report.py.
 type_sequence*_2026-10-17.csv
+
+# Local convenience symlink to cache/type_specimens/mycomap_type_specimens.json.
+/current-type-sequences.json
