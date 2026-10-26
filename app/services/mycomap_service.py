@@ -85,6 +85,11 @@ MYCOMAP_NCBI_RERUN_WAIT_SECONDS = 600
 MYCOMAP_NCBI_POLL_INTERVAL_SECONDS = 60
 MYCOMAP_NCBI_POLL_MAX_ATTEMPTS = 120
 MYCOMAP_NCBI_LOCAL_FALLBACK_SECONDS = 600
+# Alan 10/24/26 - MycoMap.org now answers a local BLAST from its own database
+# in seconds instead of going to NCBI, so a deferred MycoMap.org rerun is
+# checked every 15 s rather than every minute. The total wait stays two hours.
+MYCOMAP_ORG_RERUN_POLL_INTERVAL_SECONDS = 15
+MYCOMAP_ORG_RERUN_WAIT_MAX_SECONDS = 2 * 60 * 60
 MYCOMAP_NCBI_BACKLOG_FALLBACK_POSITION = 100
 MYCOMAP_NCBI_RECHECK_MAX_HOURS = 48
 # How long to keep looking for a newly created BLAST's result page before
@@ -525,6 +530,22 @@ def get_mycomap_ncbi_poll_max_attempts() -> int:
         min_value=1,
         max_value=720,
     )
+
+
+def get_mycomap_org_rerun_poll_interval_seconds() -> int:
+    """Return the deferred-check interval for a MycoMap.org BLAST rerun."""
+    return _env_int(
+        "MYCOMAP_ORG_RERUN_POLL_INTERVAL_SECONDS",
+        MYCOMAP_ORG_RERUN_POLL_INTERVAL_SECONDS,
+        min_value=5,
+        max_value=300,
+    )
+
+
+def get_mycomap_org_rerun_poll_max_attempts() -> int:
+    """Return how many deferred checks fit in the MycoMap.org rerun budget."""
+    interval = get_mycomap_org_rerun_poll_interval_seconds()
+    return max(1, -(-MYCOMAP_ORG_RERUN_WAIT_MAX_SECONDS // interval))
 
 
 def get_mycomap_ncbi_local_fallback_seconds() -> int:

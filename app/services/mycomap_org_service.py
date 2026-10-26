@@ -346,6 +346,58 @@ def rerun_pending(details):
     return False
 
 
+# How long a local rerun is polled in place before the caller falls back to a
+# deferred wait. Every logged local rerun has published at the first check,
+# 3.3-4.2 s after the request (event=mycomap_org.local_rerun_wait).
+LOCAL_RERUN_INLINE_WAIT_SECONDS = 30
+
+
+def local_rerun_poll_delay(elapsed):
+    """Seconds until the next check of a MycoMap.org local rerun.
+
+    Most local reruns publish in 3-4 s, so the first check waits 3 s, then
+    every second until 10 s, then every 3 s. Tune against the elapsed_seconds
+    that event=mycomap_org.local_rerun_wait records.
+    """
+    if elapsed < 3:
+        return 3 - elapsed
+    return 1 if elapsed < 10 else 3
+
+
+def wait_for_local_rerun(details, on_check=None):
+    """Poll a requested local rerun for up to LOCAL_RERUN_INLINE_WAIT_SECONDS.
+
+    Updates ``details`` exactly as rerun_pending() does and returns
+    ``(outcome, elapsed_seconds, checks)``; outcome is "ready", "failed",
+    "error" (a check raised; the deferred path reports it) or "deferred".
+    An NCBI rerun alongside is left pending: it takes minutes, not seconds.
+    """
+    started = time.monotonic()
+    checks = 0
+    outcome = "deferred"
+    while True:
+        elapsed = time.monotonic() - started
+        delay = local_rerun_poll_delay(elapsed)
+        if elapsed + delay > LOCAL_RERUN_INLINE_WAIT_SECONDS:
+            break
+        time.sleep(delay)
+        checks += 1
+        try:
+            still_pending = rerun_pending(details)
+        except OrgResultError:
+            outcome = "error"
+            break
+        if on_check:
+            on_check(details)
+        if details.get("org_source_states", {}).get("local") != "running":
+            outcome = "ready" if details.get("local_status") != "failed" else "failed"
+            break
+        if not still_pending:
+            outcome = "ready"
+            break
+    return outcome, time.monotonic() - started, checks
+
+
 def rerun_max_hits(limit):
     """The smallest hit count MycoMap.org accepts that covers ``limit``.
 

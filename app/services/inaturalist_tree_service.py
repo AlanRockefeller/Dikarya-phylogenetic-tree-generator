@@ -1614,13 +1614,9 @@ def _refresh_mycomap_blast_results(blast_id: str, *, rebuild_ncbi_blast: bool = 
         try:
             result["local"] = rerun_mycomap_result(reference, "local", local_limit)
             result["local_status"] = "queued" if reference["provider"] == "org" else "completed"
-            # MycoMap.org only accepts the rerun here and runs it later, so
-            # saying "refreshed" read as done right before the tree waited on it.
-            if reference["provider"] == "org":
-                _report_progress(
-                    progress, "MycoMap.org accepted the local BLAST refresh.", icon="done"
-                )
-            else:
+            # MycoMap.org only accepts the rerun here and runs it later; its
+            # line is reported once the wait below knows the outcome.
+            if reference["provider"] != "org":
                 _report_progress(
                     progress, "MycoMap local BLAST results refreshed.", icon="done"
                 )
@@ -1649,6 +1645,27 @@ def _refresh_mycomap_blast_results(blast_id: str, *, rebuild_ncbi_blast: bool = 
                                              ("ncbi", rebuild_ncbi_blast))
             if requested and (source != "local" or result["local_status"] == "queued")
         ]
+        # Alan 10/24/26 - A MycoMap.org local rerun publishes in ~3.4 s, but
+        # this path deferred straight to the worker's next check, so every
+        # iNat/MO tree that refreshed MycoMap.org waited a full minute (awgr).
+        # Check in place first, as the browser's refresh task already does.
+        if "local" in result["org_wait_sources"]:
+            from app.services.mycomap_org_service import wait_for_local_rerun
+            outcome, elapsed, checks = wait_for_local_rerun(result)
+            logger.info(
+                "event=mycomap_org.local_rerun_wait outcome=%s elapsed_seconds=%.1f "
+                "checks=%s result_id=%s",
+                outcome, elapsed, checks, reference["result_id"],
+            )
+            if outcome == "ready":
+                _report_progress(
+                    progress, "MycoMap local BLAST results refreshed.", icon="done"
+                )
+            elif outcome == "deferred":
+                _report_progress(
+                    progress,
+                    "MycoMap.org accepted the local BLAST refresh; it is still running.",
+                )
     return result
 
 
