@@ -29,6 +29,35 @@ SEARCH_MIN_QUERY_LENGTH = 50
 SEARCH_MAX_QUERY_LENGTH = 20_000
 SEARCH_POLL_INTERVAL_SECONDS = 2
 SEARCH_REQUEST_BUDGET_SECONDS = 200
+SEARCH_AUTH_KEY_PREFIX = "dikarya:mycomap-org:submit-auth:"
+
+
+def _search_auth_key():
+    key = (os.environ.get("MYCOMAP_ORG_API_KEY") or "").strip()
+    return SEARCH_AUTH_KEY_PREFIX + hashlib.sha256(key.encode()).hexdigest()
+
+
+def search_availability():
+    """Report a known refusal without probing upstream or exposing credentials."""
+    message = "MycoMap BLAST is temporarily unavailable. Use NCBI BLAST while access is restored."
+    if not (os.environ.get("MYCOMAP_ORG_API_KEY") or "").strip():
+        return {"available": False, "message": message, "retry_after": 600}
+    try:
+        from app.services.ncbi_pacing import connection
+        remaining = connection().ttl(_search_auth_key())
+        if remaining > 0:
+            return {"available": False, "message": message, "retry_after": remaining}
+    except Exception:
+        pass
+    return {"available": True, "message": "", "retry_after": 0}
+
+
+def _remember_search_refusal():
+    try:
+        from app.services.ncbi_pacing import connection
+        connection().set(_search_auth_key(), "refused", ex=600)
+    except Exception:
+        logger.warning("event=mycomap_org.availability_store_failed")
 
 
 class OrgResultError(Exception):
@@ -78,6 +107,10 @@ def _read(path, *, limit=MAX_JSON_BYTES, method="GET", body=None,
         # rerun route itself also took session cookies only until MycoMap.org
         # PR #9 moved it to requireAuthOrApiKey.)
         headers["X-API-Key"] = key
+        if path == "submit":
+            availability = search_availability()
+            if not availability["available"]:
+                raise OrgResultError(availability["message"], 502, retryable=False)
     base = ORG_API_ROOT if path.startswith(("mycomap/", "admin/")) else ORG_API
     request = urllib.request.Request(
         f"{base}/{path}",
@@ -113,6 +146,8 @@ def _read(path, *, limit=MAX_JSON_BYTES, method="GET", body=None,
             ) from exc
         if exc.code in (401, 403):
             if authenticated:
+                if path == "submit":
+                    _remember_search_refusal()
                 logger.error(
                     "event=mycomap_org.auth_refused status=%s path=%s "
                     "key_env=MYCOMAP_ORG_API_KEY key_len=%s key_sha256=%s",
@@ -545,7 +580,7 @@ def _ncbi_sequences(accessions, *, deadline=None):
             break
         try:
             response = _ncbi_request(
-                "POST", NCBI_EFETCH_URL, max_retries=1,
+                "POST", NCBI_EFETCH_URL, max_retries=2, deadline=deadline,
                 data={"db": "nuccore", "id": ",".join(batch),
                       "rettype": "fasta", "retmode": "text"},
                 timeout=(min(5, remaining), min(20, remaining)), stream=True,
@@ -586,6 +621,8 @@ def _ncbi_sequences(accessions, *, deadline=None):
                                  if key.split(".")[0] == accession), None)
             if sequence:
                 sequences[accession] = sequence
+    logger.info("event=import.source_summary operation=mycomap_full_sequences source=ncbi expected=%s fetched=%s omitted=%s unchecked=%s",
+                len(requested), len(sequences), len(requested) - len(sequences), len(unchecked))
     return sequences, unchecked
 
 
@@ -899,4 +936,7 @@ def fetch_results(result_id, *, include_ncbi=True, include_local=True,
         result[f"{source}_count"] = sum(
             sequence["hit_source"] == source for sequence in result["sequences"]
         )
+        logger.info("event=import.source_summary operation=mycomap_org source=%s expected=%s fetched=%s omitted=%s",
+                    source, len(hits), result[f"{source}_count"],
+                    max(0, len(hits) - result[f"{source}_count"]))
     return result

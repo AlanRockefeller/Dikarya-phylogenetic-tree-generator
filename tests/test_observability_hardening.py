@@ -1216,7 +1216,7 @@ def test_digest_separates_5xx_noise_and_streams_and_normalizes_thumb(tmp_path):
 
     result = digest.analyze_access(datetime.now() - timedelta(hours=1))
 
-    assert result["server_errors"][(500, "GET /api/job/abc")] == 1
+    assert result["server_errors"][(500, "GET /api/job/<id>")] == 1
     assert result["product_4xx"][(422, "POST /api/job")] == 1
     assert result["noise_4xx"][(404, "GET /thumb/<id>.jpg")] == 1
     assert "GET /api/job/<id>/events" in result["streams"]

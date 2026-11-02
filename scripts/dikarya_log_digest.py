@@ -7,6 +7,7 @@ import gzip
 import json
 import math
 import re
+import subprocess
 import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -17,8 +18,8 @@ DEFAULT_CHECKPOINT = REPO_ROOT / ".log-review-checkpoint.json"
 ACCESS_RE = re.compile(
     r'^(?P<ip>\S+) \S+ \S+ \[(?P<ts>[^\]]+)\] '
     r'"(?P<method>[A-Z]+) (?P<path>\S+) (?P<proto>[^"]+)" '
-    r'(?P<status>\d{3}) (?P<size>\S+) "(?P<ref>[^"]*)" "(?P<ua>[^"]*)"'
-    r'(?: (?P<micros>\d+))?(?: req=(?P<req>\S+))?(?: noise=(?P<noise>\S+))?'
+    r'(?P<status>\d{3}) (?P<size>\S+) "(?P<ref>(?:\\.|[^"\\])*)" "(?P<ua>(?:\\.|[^"\\])*)"'
+    r'(?: (?P<micros>\d+))?(?: req=(?P<req>\S+))?(?: noise=(?P<noise>\S+))?\s*$'
 )
 UUID_RE = re.compile(r'(?i)[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}')
 NUMERIC_SEG_RE = re.compile(r'/\d+(?=/|$|\.)')
@@ -94,6 +95,10 @@ def log_files(stem, cutoff=None):
 
 def normalize_path(path):
     path = path.split("?", 1)[0]
+    # Only replace ids in known positions; ordinary words and arbitrary scanner
+    # paths must not accidentally become job identifiers.
+    path = re.sub(r'(/(?:api/(?:v1/jobs|job)|job)/)[^/]+', r'\1<id>', path)
+    path = re.sub(r'(/api/background/)[^/]+', r'\1<task_id>', path)
     path = UUID_RE.sub("<id>", path)
     path = NUMERIC_SEG_RE.sub("/<id>", path)
     return path
@@ -1116,6 +1121,127 @@ def format_coverage(label, data):
             f"timing={timing:.1f}% context={context:.1f}%")
 
 
+def analyze_operations(cutoff, until):
+    """INFO outcomes that HTTP status and the warning mirror cannot describe."""
+    assets = collections.defaultdict(lambda: {"count": 0, "clients": set(), "visibility": collections.Counter()})
+    background = collections.defaultdict(list)
+    imports = collections.defaultdict(collections.Counter)
+    third_party = collections.Counter()
+    seen = set()
+    for stem in ("error", *WORKER_STEMS):
+        for path in log_files(stem, cutoff):
+            for record in iter_log_records(path):
+                when = parse_log_ts(record)
+                if when is None or not cutoff <= when < until:
+                    continue
+                line = record.splitlines()[0]
+                fields = context_fields(line)
+                identity = (when, fields.get("req"), fields.get("job"), record_identity(record))
+                if identity in seen:
+                    continue
+                seen.add(identity)
+                if "event=client.resource_load_failed " in line:
+                    match = re.search(r'message=(.*?) fingerprint=', line)
+                    asset = normalize_path(match[1]) if match else "unknown"
+                    row = assets[asset]
+                    row["count"] += 1
+                    client = re.search(r'\bclient=(\S+)', line)
+                    user = fields.get("user")
+                    if user and user != "anon":
+                        row["clients"].add("user:" + user)
+                    elif client:
+                        row["clients"].add("client:" + client[1])
+                    visibility = re.search(r'\bvisibility=(\w+)', line)
+                    row["visibility"][visibility[1] if visibility else "unknown"] += 1
+                if "origin=facebook_injected " in line or ("iabjs://" in line and "postMessage" in line and "FB_IAB/" in line):
+                    third_party["facebook_injected"] += 1
+                if "event=background_request.completed " in line:
+                    kind = re.search(r'\bkind=(\w+)', line)
+                    status = re.search(r'\bstatus=(\d+)', line)
+                    duration = re.search(r'\bduration_ms=(\d+)', line)
+                    if kind and status and duration:
+                        background[(kind[1], int(status[1]))].append(int(duration[1]) / 1000)
+                if "event=import.source_summary " in line:
+                    operation = re.search(r'\boperation=(\w+)', line)
+                    source = re.search(r'\bsource=(\w+)', line)
+                    if operation and source:
+                        row = imports[(operation[1], source[1])]
+                        row["calls"] += 1
+                        values = dict(re.findall(r'\b(expected|fetched|omitted|unchecked|recovered)=(\d+)', line))
+                        for key, value in values.items():
+                            row[key] += int(value)
+                        row["partial"] += int(int(values.get("omitted", 0)) > 0)
+    return {"assets": assets, "background": background, "imports": imports, "third_party": third_party}
+
+
+def analyze_nginx(cutoff, until):
+    """Use only the fixed read-only wrapper; never turn this into sudo cat."""
+    counts = collections.Counter()
+    coverage = []
+    for kind in ("access", "error"):
+        scoped = True
+        try:
+            command = ["sudo", "-n", "/usr/local/sbin/dikarya-nginx-log", f"app-{kind}-all", "200000"]
+            result = subprocess.run(command, capture_output=True, text=True, errors="replace", timeout=45)
+            if result.returncode == 2:
+                scoped = False
+                command[-2] = f"{kind}-all"
+                result = subprocess.run(command, capture_output=True, text=True, errors="replace", timeout=45)
+            if result.returncode:
+                coverage.append(f"{kind}: unavailable (wrapper exit {result.returncode}); proxy/static failures are not covered")
+                continue
+        except (OSError, subprocess.TimeoutExpired):
+            coverage.append(f"{kind}: unavailable; proxy/static failures are not covered")
+            continue
+        oldest = newest = None
+        observed = 0
+        for line in result.stdout.splitlines():
+            if kind == "access":
+                timestamp = re.search(r'\[([^\]]+)\]', line)
+                when = parse_access_ts(timestamp[1]) if timestamp else None
+            else:
+                try:
+                    when = datetime.strptime(line[:19], "%Y/%m/%d %H:%M:%S")
+                except ValueError:
+                    when = None
+            if when is None:
+                continue
+            oldest = min(oldest, when) if oldest else when
+            newest = max(newest, when) if newest else when
+            if not cutoff <= when < until:
+                continue
+            if kind == "access":
+                if not re.search(r' host="(?:www\.)?dikarya\.us" server="dikarya\.us"\s*$', line):
+                    continue
+                match = ACCESS_RE.match(re.sub(r' host="[^"]*" server="[^"]*"\s*$', '', line))
+                if not match:
+                    continue
+                observed += 1
+                status = int(match["status"])
+                if status >= 400:
+                    counts[(kind, str(status), match["method"] + " " + normalize_path(match["path"]))] += 1
+            else:
+                if "server: dikarya.us," not in line:
+                    continue
+                observed += 1
+                if "buffered to a temporary file" in line:
+                    continue
+                request_match = re.search(r'request: "([A-Z]+) (\S+) HTTP', line)
+                endpoint = request_match[1] + " " + normalize_path(request_match[2]) if request_match else "unknown"
+                reason = ("directory_forbidden" if "directory index" in line else
+                          "missing_static" if "No such file or directory" in line else
+                          "upstream_timeout" if "timed out" in line else "upstream_or_other")
+                counts[(kind, reason, endpoint)] += 1
+        boundary = f"{oldest}..{newest}" if oldest else "empty"
+        detail = f"{kind}: range={boundary} in-window-app={observed} scoped={'yes' if scoped else 'no'}"
+        if oldest is None or oldest > cutoff:
+            detail += " WARNING partial historical coverage"
+        if not scoped:
+            detail += " (install updated wrapper for filtering before the line limit)"
+        coverage.append(detail)
+    return counts, coverage
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     window = parser.add_mutually_exclusive_group()
@@ -1138,6 +1264,7 @@ def main():
     )
     parser.add_argument("--since-rotated", action="store_true", help="deprecated; rotations are always included")
     parser.add_argument("--top", type=int, default=10)
+    parser.add_argument("--skip-nginx", action="store_true", help="omit privileged read-only nginx log collection")
     parser.add_argument(
         "--type-specimen-log", type=Path, default=REFRESH_LOG_PATH,
         help=f"weekly type-specimen refresh log (default: {REFRESH_LOG_PATH})",
@@ -1234,6 +1361,30 @@ def main():
         for item in worker_details.get("failures", [])
     ])
     print_type_specimens(analyze_type_specimens(cutoff, until, args.type_specimen_log), until)
+    operations = analyze_operations(cutoff, until)
+    section("Background searches (whole operation, not poll latency)")
+    rows([f"{len(values):>5}  {kind} status={status} p50={percentile(values, .5):.1f}s max={max(values):.1f}s"
+          for (kind, status), values in sorted(operations["background"].items())])
+    section("Source imports (per lookup, including repeated attempts)")
+    rows([f"{operation}/{source} " + " ".join(f"{key}={row[key]}" for key in ("calls", "partial", "expected", "fetched", "omitted", "unchecked", "recovered"))
+          for (operation, source), row in sorted(operations["imports"].items())])
+    section("Browser asset failures and third-party scripts")
+    rows([f"{row['count']:>5} {asset} known_clients={len(row['clients'])} " +
+          " ".join(f"{key}={value}" for key, value in sorted(row["visibility"].items()))
+          for asset, row in sorted(operations["assets"].items(), key=lambda item: -item[1]["count"])][:args.top])
+    rows([f"{count:>5} {origin}" for origin, count in operations["third_party"].items()])
+    if not args.skip_nginx:
+        nginx, nginx_coverage = analyze_nginx(cutoff, until)
+        section("Nginx failures (separate observations; may overlap app errors)")
+        important = [(key, count) for key, count in nginx.items()
+                     if (key[0] == "access" and key[1].isdigit() and int(key[1]) >= 500)
+                     or (key[0] == "error" and key[1] in {"upstream_timeout", "upstream_or_other"})]
+        # A large scanner sweep must never push a proxy failure past --top.
+        rows([f"{count:>5} {kind} {status} {endpoint}" for (kind, status, endpoint), count in sorted(important, key=lambda item: -item[1])],
+             empty="  (no upstream/server failures observed in the covered records)")
+        rest = [(key, count) for key, count in nginx.most_common() if (key, count) not in important]
+        rows([f"{count:>5} {kind} {status} {endpoint}" for (kind, status, endpoint), count in rest[:args.top]])
+        rows(nginx_coverage)
     section(f"Slow requests (> {args.slow_threshold:g}s; streams excluded)")
     slow_rows = []
     for endpoint, values in access["durations"].items():

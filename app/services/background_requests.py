@@ -33,6 +33,7 @@ import logging
 import re
 import secrets
 import threading
+import time
 
 from flask import copy_current_request_context, current_app, g, jsonify, session
 
@@ -108,12 +109,16 @@ def start(kind, handler, *args):
         return None
 
     request_id = g.get("request_id")
+    started = time.monotonic()
 
     @copy_current_request_context
     def run():
         # The copied request context gets a fresh app context, so g is empty;
         # the request id is what ties this thread's log lines to the request.
         g.request_id = request_id
+        g.background_task_id = task_id
+        logger.info("event=background_request.started task_id=%s origin_request_id=%s kind=%s",
+                    task_id, request_id or "-", kind)
         try:
             try:
                 rv = handler(*args)
@@ -122,20 +127,42 @@ def start(kind, handler, *args):
                 rv = (jsonify({"status": "error", "error": "Internal server error",
                                "request_id": request_id}), 500)
             response = current_app.make_response(rv)
+            elapsed = round((time.monotonic() - started) * 1000)
+            diagnostic_id = getattr(g, "upstream_diagnostic_id", None)
             record = {
                 "state": "done",
                 "kind": kind,
                 "owner": owner,
                 "status": response.status_code,
                 "body": response.get_data(as_text=True),
+                "request_id": request_id,
+                "duration_ms": elapsed,
+                "diagnostic_id": diagnostic_id,
             }
             conn.set(key, json.dumps(record), ex=RESULT_TTL_SECONDS)
+            logger.info(
+                "event=background_request.completed task_id=%s origin_request_id=%s "
+                "kind=%s status=%s duration_ms=%s diagnostic=%s rid=%s",
+                task_id, request_id or "-", kind, response.status_code, elapsed,
+                diagnostic_id or "-", getattr(g, "blast_rid", "-"),
+            )
         except Exception:
-            logger.exception("event=background_request.store_failed kind=%s", kind)
+            logger.exception("event=background_request.store_failed kind=%s task_id=%s origin_request_id=%s",
+                             kind, task_id, request_id or "-")
         finally:
             _slots.release()
 
-    threading.Thread(target=run, name=f"bgreq-{kind}", daemon=True).start()
+    try:
+        threading.Thread(target=run, name=f"bgreq-{kind}", daemon=True).start()
+    except Exception:
+        _slots.release()
+        try:
+            conn.delete(key)
+        except Exception:
+            pass
+        logger.exception("event=background_request.start_failed kind=%s task_id=%s origin_request_id=%s",
+                         kind, task_id, request_id or "-")
+        return None
     return task_id
 
 

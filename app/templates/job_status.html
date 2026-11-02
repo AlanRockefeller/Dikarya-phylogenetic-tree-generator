@@ -546,6 +546,8 @@
                     </div>
 
                     <div class="pt-4 border-t border-gray-100 dark:border-gray-700 flex flex-wrap gap-3">
+                        <a href="{{ url_for('main.sequence_entry', source='blast') }}"
+                            class="btn-secondary px-4 py-2 bg-gray-100 dark:bg-gray-700 rounded text-sm font-medium hover:bg-gray-200 dark:hover:bg-gray-600 transition-colors">Start a new BLAST search</a>
                         <a href="/api/job/{{ job_id }}/logs/pipeline" download
                             class="btn-secondary px-4 py-2 bg-gray-100 dark:bg-gray-700 rounded text-sm font-medium hover:bg-gray-200 dark:hover:bg-gray-600 transition-colors">
                             <i class="fas fa-download mr-1"></i> Download Logs

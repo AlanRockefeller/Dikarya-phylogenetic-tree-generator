@@ -3,6 +3,7 @@ import io
 import json
 import os
 import stat
+from pathlib import Path
 from urllib.error import HTTPError, URLError
 from urllib.request import Request
 from unittest.mock import patch
@@ -80,7 +81,18 @@ def test_success_does_not_write_archive(archive):
 
 
 def test_cli_date_folder_inherits_archive_group_and_allows_worker_writes(archive):
-    shared_gid = next((gid for gid in os.getgroups() if gid != os.getgid()), os.getgid())
+    # In a user-namespace sandbox the supplementary groups show up as the
+    # unmapped overflow gid (65534), which chown rejects with EINVAL. Fall back
+    # to the primary group there; the assertions below still apply to it.
+    overflow_gid = 65534
+    try:
+        overflow_gid = int(Path("/proc/sys/kernel/overflowgid").read_text())
+    except (OSError, ValueError):
+        pass
+    shared_gid = next(
+        (gid for gid in os.getgroups() if gid not in (os.getgid(), overflow_gid)),
+        os.getgid(),
+    )
     os.chown(archive, -1, shared_gid)
     # Reproduce a date folder made by an earlier CLI capture, with its primary
     # group and a restrictive umask. A later capture must repair its own folder.

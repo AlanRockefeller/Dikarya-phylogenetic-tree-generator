@@ -572,6 +572,9 @@
         // Alan 6/4/26 - Let implementations expose a controller-owned context-menu prune action.
         setPruneNodeHandler(fn) { }
 
+        // Alan 11/2/26 - Let implementations expose a controller-owned, persisted context-menu reroot.
+        setRerootNodeHandler(fn) { }
+
         // Alan 8/13/26 - Let implementations expose a controller-owned context-menu rename action.
         setRenameNodeHandler(fn) { }
 
@@ -901,6 +904,8 @@
             };
             // Alan 6/2/26 - Controller-supplied handler invoked by the native menu's "Rotate node" item.
             this._onRotateNode = null;
+            // Alan 11/2/26 - Controller-supplied handler for the menu's saved "Reroot on this node" item.
+            this._onRerootNode = null;
             // Alan 7/17/26 - Controller-supplied handler receives the clicked node and the exact context-menu prune targets.
             this._onPruneNode = null;
             // Alan 8/13/26 - Controller-supplied handler opens Rename for a single selected tip.
@@ -946,6 +951,12 @@
         // Alan 6/2/26 - Let the controller own the rotate action while the item lives in phylotree's native node menu.
         setRotateNodeHandler(fn) {
             this._onRotateNode = typeof fn === 'function' ? fn : null;
+        }
+
+        // Alan 11/2/26 - Let the controller own rerooting from the node menu, so it goes through
+        // the backend like the toolbar's reroot mode instead of phylotree's browser-only reroot.
+        setRerootNodeHandler(fn) {
+            this._onRerootNode = typeof fn === 'function' ? fn : null;
         }
 
         // Alan 6/4/26 - Let the controller own pruning while the item lives in phylotree's native node menu.
@@ -1171,6 +1182,15 @@
                             if (typeof this._onPruneNode === 'function') this._onPruneNode(node, nodes);
                         },
                         () => !window.VIEW_ONLY
+                    ]);
+                    // Alan 11/2/26 - Replaces phylotree's built-in "Reroot on this node" (disabled via
+                    // 'reroot': false below), which rerooted only the browser's copy: nothing was
+                    // saved, and every clade on the new root path then hashed to an ID the server's
+                    // tree lacks, so Rotate failed with "Unknown internal node" (job 342b8d1f).
+                    n.menu_items.push([
+                        () => 'Reroot on this node',
+                        (node) => { if (typeof this._onRerootNode === 'function') this._onRerootNode(node); },
+                        () => !window.VIEW_ONLY && typeof this._onRerootNode === 'function'
                     ]);
                     // Alan 8/13/26 - Put Rename below Prune for an unselected tip or the sole selected tip.
                     if (!n.children || n.children.length === 0) {
@@ -1809,6 +1829,10 @@
                 'is-radial': (this.options.layout === 'radial'),
                 'align-tips': this.options.alignTips,
                 'draw-size-bubbles': false,
+                // Alan 11/2/26 - phylotree defaults 'reroot' to true, adding a menu item that reroots
+                // only the browser's tree. Rerooting must go through the backend (see the saved
+                // "Reroot on this node" item registered with the other node-menu actions).
+                'reroot': false,
                 'zoom': true,
                 // Alan 8/16/26 - Keep phylotree's built-in brush off; our own left-drag box select replaces it.
                 'brush': false,
@@ -4533,6 +4557,9 @@
 
                 // Alan 5/11/26 - Toggle visible selection state without treating hidden Deselect state as set deletion.
                 const selected = self._toggleVisibleSelection(id);
+                // Alan 11/1/26 - Register the clicked clade like the capture-phase handler does;
+                // getSelectedNodes() now reports an internal node only from this registry.
+                self._syncCladeSelection(d, selected);
 
                 self._updateNodeStylesOnly();
                 // Fire callback with full node details, but state is now in Viewer
@@ -5533,12 +5560,14 @@
             }
 
             // Step 1: For each selected node, collect all ancestors (path to root)
+            // Alan 11/1/26 - Collect the ancestor NODES, not their IDs. An internal node's ID is
+            // its support label, so two unrelated "100" clades intersected as a common ancestor
+            // and the deepest of them was picked as the MRCA.
             const getAncestorsSet = (node) => {
                 const ancestors = new Set();
                 let current = node;
                 while (current) {
-                    const id = this._getNodeId(current);
-                    if (id) ancestors.add(id);
+                    ancestors.add(current);
                     current = current.parent;
                 }
                 return ancestors;
@@ -5552,33 +5581,19 @@
                     commonAncestors = ancestors;
                 } else {
                     // Intersection
-                    commonAncestors = new Set([...commonAncestors].filter(id => ancestors.has(id)));
+                    commonAncestors = new Set([...commonAncestors].filter(n => ancestors.has(n)));
                 }
             }
 
             if (!commonAncestors || commonAncestors.size === 0) return;
 
             // Step 3: Find the MRCA (deepest common ancestor = closest to tips)
-            // The MRCA is the common ancestor with the greatest depth
-            let mrca = null;
-            let maxDepth = -1;
-
-            this.tree.traverse_and_compute(n => {
-                const id = this._getNodeId(n);
-                if (id && commonAncestors.has(id)) {
-                    // Calculate depth (distance from root)
-                    let depth = 0;
-                    let current = n;
-                    while (current.parent) {
-                        depth++;
-                        current = current.parent;
-                    }
-                    if (depth > maxDepth) {
-                        maxDepth = depth;
-                        mrca = n;
-                    }
-                }
-            });
+            // Alan 11/1/26 - The common ancestors form one chain to the root, so the first of them
+            // met walking up from any selected node is the deepest one. Continuing up to the first
+            // node with an ID keeps the old rule that only a labelled node can be selected.
+            let mrca = selectedNodes[0];
+            while (mrca && !commonAncestors.has(mrca)) mrca = mrca.parent;
+            while (mrca && !this._getNodeId(mrca)) mrca = mrca.parent;
 
             if (!mrca) return;
 
@@ -5587,6 +5602,8 @@
             // Alan 5/11/26 - Nodes explicitly added by derived selection should be visible after Deselect.
             this.hiddenSelectionIds.delete(mrcaId);
             this.selectedIds.add(mrcaId);
+            // Alan 11/1/26 - Register the MRCA as an exact clade so actions use it, not its label.
+            this._syncCladeSelection(mrca, true);
 
             // For each selected node, walk up to MRCA and select the path
             for (const node of selectedNodes) {
@@ -5597,8 +5614,11 @@
                         // Alan 5/11/26 - Reveal path nodes that this action explicitly selects.
                         this.hiddenSelectionIds.delete(id);
                         this.selectedIds.add(id);
-                        if (id === mrcaId) break; // Stop at MRCA
+                        // Alan 11/1/26 - Path clades join the exact registry too, and the walk stops
+                        // at the MRCA node itself rather than at the first node sharing its label.
+                        this._syncCladeSelection(current, true);
                     }
+                    if (current === mrca) break; // Stop at MRCA
                     current = current.parent;
                 }
             }
@@ -5647,10 +5667,19 @@
         getSelectedNodes() {
             if (!this.tree) return [];
             const selected = [];
+            // Alan 11/1/26 - An internal node's ID is its support label, so a label match alone
+            // returned every clade sharing that value, and Prune / Select descendants acted on
+            // all of them (job 5pzo has 45 clades labelled "0" and 16 labelled "100"; its four
+            // refused prunes were dozens of internal IDs whose union was the whole tree).
+            // Internal nodes now count only when that exact clade is in the stable clade
+            // registry; tips still match by name exactly as before.
+            const pickedClades = new Set(this.getSelectedCladeNodes());
             this.tree.traverse_and_compute(n => {
                 const id = this._getNodeId(n);
                 // Alan 5/11/26 - Backend actions should only use visible active selections after Deselect.
-                if (id && this._isVisibleSelection(id)) selected.push(n);
+                if (!id || !this._isVisibleSelection(id)) return;
+                if (n.children && n.children.length && !pickedClades.has(n)) return;
+                selected.push(n);
             });
             return selected;
         }

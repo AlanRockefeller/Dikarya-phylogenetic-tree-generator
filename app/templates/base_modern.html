@@ -144,7 +144,9 @@
                 const status = Number(error?.httpStatus) || 0;
                 if (error?.name === 'AbortError' || error?.expected || (status >= 400 && status < 500)) return;
                 report('ui_action_failed', {
-                    action, message: error?.message || error, stack: error?.stack
+                    action, message: error?.message || error, stack: error?.stack,
+                    server_request_id: error?.serverRequestId,
+                    http_status: status || undefined, duration_ms: error?.durationMs
                 });
             };
             function showViewerLoadFailure() {

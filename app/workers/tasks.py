@@ -1943,25 +1943,16 @@ def run_phylo_job(job_params: dict) -> dict:
                 sequence = (job_params.get("sequence") or "").strip()
                 logger.info("Processing pasted sequence")
 
-                if not sequence:
-                    raise ValueError(
-                        "No DNA sequence was provided. Paste FASTA text such as "
-                        "'>sample_1' followed by the DNA sequence on the next line."
-                    )
-                if not sequence.lstrip().startswith(">"):
-                    raise ValueError(
-                        "Pasted input is not FASTA. Start each record with a header "
-                        "line beginning with '>', for example '>sample_1', followed "
-                        "by its DNA sequence on the next line."
-                    )
+                from app.services.fasta_input_service import validate_submitted_fasta
+                n_records = validate_submitted_fasta(
+                    job_params.get("sequence") or "", source="worker_paste",
+                )
 
                 # Bound header lengths before anything downstream reads them:
                 # MAFFT and trimAl parse these names directly.
                 sequence, capped = cap_fasta_headers(sequence)
                 if capped:
                     logger.warning(f"Capped {capped} over-long FASTA header(s) in pasted input")
-
-                n_records = validate_dna_fasta(sequence)
 
                 # Always write what the user gave us
                 input_raw_path.write_text(sequence + "\n", encoding="utf-8")
@@ -1986,6 +1977,8 @@ def run_phylo_job(job_params: dict) -> dict:
                     )
 
                 uploaded = input_raw_path.read_text(encoding="utf-8", errors="replace")
+                from app.services.fasta_input_service import validate_submitted_fasta
+                n_records = validate_submitted_fasta(uploaded, source="worker_upload")
 
                 # Same header cap as the pasted path. The upload landed on disk
                 # unfiltered, so rewrite the file before the pipeline reads it.
@@ -1994,7 +1987,6 @@ def run_phylo_job(job_params: dict) -> dict:
                     logger.warning(f"Capped {capped} over-long FASTA header(s) in uploaded file")
                     input_raw_path.write_text(uploaded, encoding="utf-8")
 
-                n_records = validate_dna_fasta(uploaded)
                 logger.info(f"Uploaded FASTA records: {n_records}")
 
                 if blast_mode == "on" and n_records != 1:

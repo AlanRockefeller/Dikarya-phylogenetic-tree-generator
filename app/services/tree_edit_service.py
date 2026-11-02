@@ -544,6 +544,49 @@ def _selection_sets_without_names(tree_json: Dict, removed_names: Set[str]) -> N
         ]
 
 
+def copy_json_tree(value: Any) -> Any:
+    """Deep-copy JSON-shaped data (dicts/lists) without recursion.
+
+    ``copy.deepcopy`` spends about four Python frames per nesting level, and a
+    ``tree_structure`` nests two levels (dict + children list) per tree level,
+    so a caterpillar-shaped tree a few hundred levels deep (job 6qhe: 365)
+    raises RecursionError. This walks the structure with an explicit stack;
+    anything that is not a dict, list or tuple is handed to copy.deepcopy,
+    which for the scalars tree state holds returns them as they are.
+    """
+    def shell(item):
+        if isinstance(item, dict):
+            return {}
+        if isinstance(item, (list, tuple)):
+            return []
+        return None
+
+    root = shell(value)
+    if root is None:
+        return copy.deepcopy(value)
+    tuples = []
+    stack = [(value, root)]
+    while stack:
+        source, target = stack.pop()
+        items = source.items() if isinstance(source, dict) else enumerate(source)
+        for key, item in items:
+            child = shell(item)
+            if child is None:
+                child = copy.deepcopy(item)
+            else:
+                stack.append((item, child))
+                if isinstance(item, tuple):
+                    tuples.append((target, key))
+            if isinstance(target, dict):
+                target[key] = child
+            else:
+                target.append(child)
+    # Tuples are filled as lists and converted afterwards, innermost first.
+    for target, key in reversed(tuples):
+        target[key] = tuple(target[key])
+    return tuple(root) if isinstance(value, tuple) else root
+
+
 def _stable_internal_node_id_from_names(tip_names: List[str]) -> str:
     """Build the same stable internal-node ID used by the browser viewer."""
     key = "\x1f".join(sorted(str(name) for name in tip_names if name))
@@ -1063,6 +1106,8 @@ def _write_rerooted_tree(job_dir: Path, tree_json: Dict, tree, root_target: str)
 
     new_structure = _clade_to_json(tree.root)
 
+    # Only an internal-node reroot records a split (reroot_tree sets it again).
+    tree_json.pop("root_split", None)
     tree_json["root"] = root_target
     tree_json["root_mode"] = "TIP"
     tree_json["root_target"] = root_target
@@ -1159,9 +1204,32 @@ def reroot_tree(job_dir: Path, tree_json: Dict, root_target: str) -> Dict:
                 f"Example internal names: {internal}. Example tip names: {tips}"
              )
         
+        # Record the chosen branch by its tips, not just its hash. The stable ID
+        # hashes the tips below the node, so after a recompute that adds or
+        # removes a tip it no longer names anything, and recovering the split
+        # from a stored structure fails whenever that structure no longer holds
+        # the hashed node (job c28x). The tip names survive either way.
+        root_split = None
+        if target_clade.clades:
+            inside = sorted(_terminal_names(target_clade))
+            inside_set = set(inside)
+            outside = sorted(
+                name for name in _terminal_names(tree.root)
+                if name not in inside_set
+            )
+            if inside and outside:
+                root_split = {
+                    "target": root_target,
+                    "inside": inside,
+                    "outside": outside,
+                }
+
         # Reroot
         reroot_preserving_support(tree, lambda: tree.root_with_outgroup(target_clade))
-        return _write_rerooted_tree(job_dir, tree_json, tree, root_target)
+        tree_json = _write_rerooted_tree(job_dir, tree_json, tree, root_target)
+        if root_split:
+            tree_json["root_split"] = root_split
+        return tree_json
         
     except Exception as e:
         logger.error(f"Reroot failed: {e}")
@@ -1748,6 +1816,21 @@ def _structure_split_for_stable_id(structure: Any, stable_id: str
     return None
 
 
+def _recorded_root_split(state: Any, target: str
+                         ) -> Optional[Tuple[Set[str], Set[str]]]:
+    """(tips inside, all tips) saved by reroot_tree() for this exact target."""
+    if not isinstance(state, dict):
+        return None
+    recorded = state.get("root_split")
+    if not isinstance(recorded, dict) or recorded.get("target") != target:
+        return None
+    inside = {n for n in recorded.get("inside") or [] if isinstance(n, str) and n}
+    outside = {n for n in recorded.get("outside") or [] if isinstance(n, str) and n}
+    if not inside or not outside:
+        return None
+    return inside, inside | outside
+
+
 _LEGACY_INTERNAL_ROOT_RE = re.compile(
     r"^Node_\d+_\d+(?:\.\d+)?(?:/\d+(?:\.\d+)?)?$"
 )
@@ -2019,7 +2102,7 @@ def commit_recompute_tree_state(job_dir: Path,
             # No usable current state (a brand-new job dir, or a state that
             # could not be rebuilt). Fall back to the snapshot we started from
             # rather than dropping the user's metadata entirely.
-            state = copy.deepcopy(initial_state)
+            state = copy_json_tree(initial_state)
 
         # The rooting INTENT is user-authored, so the newest one wins. Only when
         # the latest state carries no mode at all do we fall back to the mode
@@ -2038,7 +2121,13 @@ def commit_recompute_tree_state(job_dir: Path,
         # tree whose tip set changed (see _translate_internal_root_target).
         previous_split = None
         if isinstance(previous_target, str):
-            if previous_target.startswith("internal:"):
+            previous_split = (
+                _recorded_root_split(state, previous_target)
+                or _recorded_root_split(initial_state, previous_target)
+            )
+            if previous_split is not None:
+                pass
+            elif previous_target.startswith("internal:"):
                 previous_split = (
                     _structure_split_for_stable_id(
                         state.get("tree_structure"), previous_target
@@ -2058,7 +2147,7 @@ def commit_recompute_tree_state(job_dir: Path,
                 )
 
         state["current_tree"] = "pruned"
-        structure = copy.deepcopy(new_structure)
+        structure = copy_json_tree(new_structure)
         apply_state_to_structure(
             structure,
             state.get("renames") or {},
@@ -2641,7 +2730,7 @@ def apply_auto_root_default(job_dir: Path, tree_json: Dict, focal_tip: str,
         return tree_json
     if (tree_json.get("root_mode") or "") not in ("", "MIDPOINT"):
         return tree_json
-    trial = copy.deepcopy(tree_json)
+    trial = copy_json_tree(tree_json)
     trial["sequence_of_interest"] = focal_tip
     trial["sequence_of_interest_source"] = source
     try:

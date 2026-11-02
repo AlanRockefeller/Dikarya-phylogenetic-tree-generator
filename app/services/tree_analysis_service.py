@@ -3619,9 +3619,6 @@ def _require_object(value: Any, fields: Sequence[str], where: str) -> None:
             )
 
 
-HEADLINE_MAX_CHARACTERS = 140
-
-
 def _validate_review(
     review: Any, displayed_names: Optional[Set[str]] = None
 ) -> Dict[str, Any]:
@@ -3662,14 +3659,10 @@ def _validate_review(
         if not isinstance(review.get(field), str) or not review[field].strip():
             raise TreeAnalysisUpstreamError(f"Claude's review had an empty {field}.")
 
-    # The schema asks for one sentence under 140 characters and nothing enforced
-    # it, so a paragraph could arrive in the field the viewer renders as a
-    # single headline line beside the rating chip.
-    if len(review["headline"]) > HEADLINE_MAX_CHARACTERS:
-        raise TreeAnalysisUpstreamError(
-            f"Claude's headline was {len(review['headline'])} characters; the "
-            f"limit is {HEADLINE_MAX_CHARACTERS}."
-        )
+    # Keep the schema's short-headline instruction as generation guidance.
+    # The viewer wraps this text, so exceeding 140 characters must not discard
+    # a paid-for review. Preserve the complete verdict, including any caveat
+    # near the end, rather than truncating it to fit a presentation preference.
 
     for field in ("strengths", "recommendations"):
         value = review.get(field)

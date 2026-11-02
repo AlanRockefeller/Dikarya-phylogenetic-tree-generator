@@ -772,6 +772,18 @@ When a new CLI version is published:
   as text by `tree_io.relabel_newick_text()`, touching only the type tips'
   labels -- a Biopython round trip rounds every support value to two decimals,
   and that download promises the builder's own file.
+- **The "closest type specimen" callout compares only type tips already in the
+  tree.** `app/services/closest_type_service.py` (served by
+  `/api/job/<id>/closest-type`, shown in `#notice-closest-type`) computes
+  identity on the job's own *untrimmed* alignment, over positions where both
+  rows hold an unambiguous base. It is not the BLAST `identity` in
+  `sequence_metadata`, and it reads tree state without ever creating or saving
+  it.
+- **phylotree's built-in "Reroot on this node" stays off (`'reroot': false`).**
+  It rerooted only the browser's copy, so every clade on the new root path
+  hashed to a stable ID the server's tree lacks and Rotate failed with "Unknown
+  internal node" (job 342b8d1f). The node menu's own "Reroot on this node"
+  goes through `/tree/reroot`. Any topology change must go through the backend.
 - **GenBank accession policy lives in `fasta_utils.GENBANK_ACCESSION_RE`.** The
   large-scale INSDC families (WGS contigs, TSA transcripts, TLS targeted-locus
   records) share one accession structure and the string does not say which is
@@ -1163,6 +1175,26 @@ Credentials are redacted; request bodies and authorization/cookie headers are
 never archived. Archives are compressed, not truncated or automatically expired.
 They are outside the static/download trees. Do not paste an entire archive into
 a public issue; it can contain observation data and account context.
+
+**Rejected FASTA inputs are retained in full.** Find `event=fasta.rejected
+diagnostic=<id>` in `errors.log`, then read
+`var/logs/fasta-rejections/<UTC-date>/<id>.json.gz` with `gzip -dc`. The archive
+contains the original submitted text, source (paste/upload/API/worker), upload
+filename when available, request/user/job context, and structured validation
+issues with original line, column, record name, sequence position and offending
+Unicode code point. The user explicitly authorized retention of sequence data.
+Only the displayed issue list is capped at 100; the original text is never
+truncated. No credentials or authorization/cookie headers are captured.
+`event=fasta.diagnostic_write_failed` reports archive failures without hiding
+the validation error. Tests isolate these archives in `tests/conftest.py`.
+
+The Tree Builder calls `/api/fasta/check` before adding pasted/uploaded FASTA.
+Its formatting repair is a preview requiring an explicit Apply action. Never
+silently drop empty records, replace unknown bases, or remove punctuation to
+make an invalid sequence pass. Both submission APIs validate before dedup can
+discard a malformed record. Keep these checks on `analyze_dna_fasta()` in
+`fasta_utils.py`, shared with workers; `parse_fasta_records()` remains the
+permissive parser for existing pipeline artifacts.
 
 New upstream calls should use `diagnostic_urlopen` from
 `app/services/api_diagnostics.py`, or `record_requests_failure` for requests/httpx

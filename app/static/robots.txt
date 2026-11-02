@@ -14,6 +14,12 @@
 # slash covers both the bare route and everything beneath it. Do not "tidy" the
 # slashes back on. /tree/oauth/ keeps its slash on purpose: /tree itself is a
 # public page that must stay crawlable.
+#
+# Alan 11/1/26 - "/tree?" is the query-string form only, so bare /tree is still
+# crawlable. Every /tree?... URL is per-job (the viewer's Clone and Add-sequences
+# links, /tree?clone_job_id=<id> and /tree?edit_job_id=<id>), and rendering one
+# runs the Tree Builder, which downloads that job's sequences. A rendering
+# crawler pulled the sequences of ~800 jobs that way from 2026-10-28 to 10-31.
 
 User-agent: *
 Disallow: /api/
@@ -22,6 +28,7 @@ Disallow: /job
 Disallow: /auth/
 Disallow: /labels/
 Disallow: /tree/oauth/
+Disallow: /tree?
 Disallow: /voucher-labels/export
 Disallow: /whats-new/edit
 Disallow: /whats-new/add
@@ -61,6 +68,7 @@ Disallow: /job
 Disallow: /auth/
 Disallow: /labels/
 Disallow: /tree/oauth/
+Disallow: /tree?
 Disallow: /voucher-labels/export
 Disallow: /whats-new/edit
 Disallow: /whats-new/add

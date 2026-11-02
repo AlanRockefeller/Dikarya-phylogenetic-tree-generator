@@ -554,15 +554,17 @@ def create_job():
     # app/api/routes.py; this keeps the two APIs telling the user the same
     # story instead of the API accepting what the website refuses.
     if sequence_text:
-        from app.services.fasta_utils import validate_dna_fasta
+        from app.services.fasta_utils import FastaValidationError
+        from app.services.fasta_input_service import validate_submitted_fasta
         try:
-            validate_dna_fasta(sequence_text)
-        except ValueError as exc:
+            validate_submitted_fasta(sequence_text, source="api_v1_submission")
+        except FastaValidationError as exc:
             return error_response(
                 code="validation_failed",
                 message=str(exc),
                 status=422,
-                details={"field": "sequence"},
+                details={"field": "sequence", "fasta_validation": exc.analysis,
+                         "diagnostic_id": exc.diagnostic_id},
             )
 
     # `alignment_options` is a free-form dict consumed by the worker; we cap

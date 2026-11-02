@@ -2795,6 +2795,44 @@ document.addEventListener('DOMContentLoaded', async () => {
         return true;
     }
 
+    // Alan 11/2/26 - "Closest type specimen" callout. The server compares the sequence of
+    // interest with every type-specimen tip already in this tree on the job's own alignment
+    // (closest_type_service.py); this only shows the answer. A sequence counter drops a reply
+    // that arrives after a newer load, so a slow request cannot overwrite a fresher one.
+    let closestTypeRequest = 0;
+    async function refreshClosestTypeNotice() {
+        const row = getEl('notice-closest-type');
+        const text = getEl('notice-closest-type-text');
+        const detail = getEl('notice-closest-type-detail');
+        if (!row || !text || !detail) return;
+        const requestId = ++closestTypeRequest;
+        let closest = null;
+        try {
+            const resp = await fetch(`/api/job/${JOB_ID}/closest-type`, { cache: 'no-store' });
+            if (resp.ok) closest = (await resp.json()).closest || null;
+        } catch (err) {
+            closest = null;
+        }
+        if (requestId !== closestTypeRequest) return;
+        if (!closest) {
+            row.classList.add('hidden');
+            row.classList.remove('flex');
+            return;
+        }
+        text.textContent = `${closest.summary}.`;
+        const parts = [`${closest.compared_bp} aligned bp compared`,
+            `${closest.differences} difference${closest.differences === 1 ? '' : 's'}`];
+        if (closest.accession) parts.push(closest.accession);
+        if (closest.type_tips_compared > 1) parts.push(`closest of ${closest.type_tips_compared} type sequences in this tree`);
+        detail.textContent = ` (${parts.join('; ')})`;
+        row.title = `Compared with ${closest.type_tip}. Identity counts only positions where both `
+            + 'sequences have an unambiguous base; gaps and ambiguity codes are skipped.';
+        row.classList.remove('hidden');
+        row.classList.add('flex');
+        const wrap = getEl('tree-notices');
+        if (wrap && wrap.contains(row)) wrap.classList.remove('hidden');
+    }
+
     // Alan 9/23/26 - One place that points the Root menu at the persisted rooting. Called on
     // every load, after a rooting change that did not happen (the menu would otherwise keep
     // showing the choice that failed) and when manual rerooting is cancelled.
@@ -3142,6 +3180,9 @@ document.addEventListener('DOMContentLoaded', async () => {
                     && (loadedInfo.chosen_by === 'auto' || loadedInfo.chosen_by === 'most_divergent_hit')
                     && Boolean(loadedInfo.chosen_root_target);
                 if (!autoRootNamed) setRootingNotice('');
+                // Alan 11/2/26 - Refresh the closest-type callout; a prune, recompute or new
+                // sequence of interest can change the answer. Not awaited: it is advisory.
+                refreshClosestTypeNotice();
                 // Alan 5/11/26 - Reapply saved rename labels after loading the raw Newick tree.
                 if (loadedTreeState.renames && viewer && typeof viewer.applyRenames === 'function') {
                     viewer.applyRenames(loadedTreeState.renames);
@@ -4182,6 +4223,22 @@ document.addEventListener('DOMContentLoaded', async () => {
                 runBackendAction("Rotating node", async () => {
                     await TreeEditActions.rotateNode(JOB_ID, nodeId);
                 }, { clearSelections: false });
+            });
+        }
+
+        // Alan 11/2/26 - The node menu's "Reroot on this node" saves the reroot through the
+        // backend, the same request the toolbar's reroot mode sends for a clicked node.
+        if (viewer && typeof viewer.setRerootNodeHandler === 'function') {
+            viewer.setRerootNodeHandler((node) => {
+                if (window.VIEW_ONLY || isProcessing) return;
+                const target = getRerootTargetForNode(node);
+                if (!target) {
+                    showStatus("Can't reroot: no stable ID.", "warning", 2500);
+                    return;
+                }
+                runBackendAction("Rerooting", async () => {
+                    await TreeEditActions.reroot(JOB_ID, target);
+                });
             });
         }
 

@@ -3,6 +3,8 @@ import os
 import re
 import time
 import psutil
+import subprocess
+from collections import deque
 from datetime import datetime, timedelta
 from pathlib import Path
 from sqlalchemy import text, func
@@ -17,6 +19,40 @@ _HEALTH_LAST_EMIT = {}
 # Value per metric at its last logged line, for reporting movement between lines.
 _HEALTH_LAST_VALUE = {}
 HEALTH_COOLDOWN_SECONDS = 6 * 3600
+_DISK_SAMPLES = deque(maxlen=61)
+_DISK_DIRECTORY_SIZES = {}
+
+
+def _disk_growth_detail(free_bytes, now):
+    _DISK_SAMPLES.append((now, free_bytes))
+    first_time, first_free = _DISK_SAMPLES[0]
+    elapsed = now - first_time
+    growth = max(0, (first_free - free_bytes) / elapsed) if elapsed >= 300 else 0
+    exhaustion = round(free_bytes / growth) if growth > 0 else None
+    return growth, exhaustion
+
+
+def _log_disk_directories():
+    """Bounded, infrequent attribution; never walk job contents in a request."""
+    root = Path(__file__).resolve().parents[2]
+    paths = {"jobs": root / "var/jobs", "cache": root / "cache",
+             "app_logs": root / "var/logs", "system_logs": Path("/var/log"),
+             "shared_data": Path("/data")}
+    for label, path in paths.items():
+        try:
+            result = subprocess.run(["du", "-sx", "-B1", "--", str(path)],
+                                    capture_output=True, text=True, timeout=2)
+            if result.returncode:
+                raise ValueError("incomplete directory measurement")
+            size = int(result.stdout.split()[0])
+        except (OSError, ValueError, IndexError, subprocess.TimeoutExpired):
+            logger.warning("event=health.disk.directory directory=%s measurement=unavailable", label)
+            continue
+        previous = _DISK_DIRECTORY_SIZES.get(label)
+        delta = size - previous if previous is not None else 0
+        _DISK_DIRECTORY_SIZES[label] = size
+        logger.warning("event=health.disk.directory directory=%s bytes=%s delta_bytes=%s baseline=%s",
+                    label, size, delta, str(previous is None).lower())
 
 
 def _transition(name, unhealthy, detail, now=None):
@@ -50,6 +86,7 @@ def emit_health_transitions(metrics):
     disk_percent = float(metrics.get("disk_usage") or 0)
     disk_free = int(metrics.get("disk_free_bytes") or 0)
     disk_was_bad = _HEALTH_STATES.get("disk", False)
+    growth, exhaustion = _disk_growth_detail(disk_free, time.monotonic())
     disk_bad = disk_percent >= (85 if disk_was_bad else 90)
     # Free space at the previous emission, so a repeat warning says whether the
     # situation is getting worse or merely still true. A flat number repeated
@@ -59,7 +96,8 @@ def emit_health_transitions(metrics):
     logged = _transition(
         "disk", disk_bad,
         f"percent={disk_percent:.1f} free_bytes={disk_free}"
-        f" mount={metrics.get('disk_mountpoint') or '?'}{delta}",
+        f" mount={metrics.get('disk_mountpoint') or '?'}{delta}"
+        f" growth_bytes_per_second={growth:.0f} time_to_full_seconds={exhaustion if exhaustion is not None else 'unknown'}",
     )
     # Alan 10/8/26 - Record the value only when a line was logged. It used to be
     # overwritten on every one-minute tick while the disk was unhealthy, so each
@@ -68,8 +106,14 @@ def emit_health_transitions(metrics):
     if logged:
         if disk_bad:
             _HEALTH_LAST_VALUE["disk_free_bytes"] = disk_free
+            if "disk_free_bytes" in metrics:
+                _log_disk_directories()
         else:
             _HEALTH_LAST_VALUE.pop("disk_free_bytes", None)
+    _transition("disk_critical", disk_percent >= (93 if _HEALTH_STATES.get("disk_critical") else 95),
+                f"percent={disk_percent:.1f} free_bytes={disk_free}")
+    _transition("disk_growth", exhaustion is not None and exhaustion < 6 * 3600,
+                f"growth_bytes_per_second={growth:.0f} time_to_full_seconds={exhaustion if exhaustion is not None else 'unknown'}")
     memory_percent = float(metrics.get("memory_percent") or 0)
     memory_was_bad = _HEALTH_STATES.get("memory", False)
     _transition(

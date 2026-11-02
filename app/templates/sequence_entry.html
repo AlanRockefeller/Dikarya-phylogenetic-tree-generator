@@ -45,6 +45,9 @@
         color: var(--text);
     }
 
+    #fasta-repair-dialog { width: min(60rem, calc(100% - 2rem)); max-height: 90vh; margin: auto; padding: 1.5rem; overflow: auto; }
+    #fasta-repair-dialog::backdrop { background: rgb(0 0 0 / 60%); }
+
 
     /* Small headings inside cards and modals read as labels; the two panel
        titles are on the site type scale (.dk-h2) instead. */
@@ -1014,6 +1017,9 @@
                         class="btn flex-1 min-w-[140px]" disabled>
                         <i class="fas fa-plus mr-2"></i> Add / Remove Sequences
                     </button>
+                    <button id="check_fasta_btn" type="button" class="btn">
+                        Check / fix FASTA
+                    </button>
                     <!-- Alan 10/12/26 - Shown only while the box holds one accession or one sequence. -->
                     <button id="paste_blast_btn" type="button" data-active-style="outline"
                         class="btn flex-1 min-w-[140px] hidden"
@@ -1046,6 +1052,7 @@
                     </p>
                     <input type="file" id="sequence_file" class="hidden" accept=".fa,.fasta,.fna,.txt">
                 </label>
+                <button id="check_file_fasta_btn" type="button" class="btn">Check / fix selected FASTA</button>
 
                 <!-- Job Notes -->
                 <div>
@@ -1185,6 +1192,8 @@
                 <button id="mycomap_blast_btn" type="button" data-active-style="outline" class="btn w-full" disabled>
                     <i class="fas fa-dna mr-2"></i> MycoMap BLAST
                 </button>
+                <p id="mycomap-blast-availability" class="hidden text-sm text-amber-800 dark:text-amber-200" role="status"></p>
+                <button type="button" class="btn" onclick="useNcbiBlastAlternative()">Use NCBI BLAST</button>
             </div>
             </div>
 
@@ -1888,6 +1897,26 @@
     </div>
 </div>
 </div>
+<dialog id="fasta-repair-dialog" class="tree-modal" aria-labelledby="fasta-repair-title">
+    <h3 id="fasta-repair-title">Check FASTA</h3>
+    <p id="fasta-repair-summary" class="text-sm mt-3" role="status"></p>
+    <ul id="fasta-repair-issues" class="text-sm list-disc pl-5 mt-3 space-y-2"></ul>
+    <ul id="fasta-repair-changes" class="text-sm list-disc pl-5 mt-3 space-y-2"></ul>
+    <div class="grid grid-cols-1 md:grid-cols-2 gap-4 mt-4">
+        <label class="text-sm">Original input
+            <textarea id="fasta-repair-original" rows="9" readonly class="sequence-textarea mt-2" spellcheck="false"></textarea>
+        </label>
+        <label class="text-sm">Proposed formatting repair
+            <textarea id="fasta-repair-preview" rows="9" readonly class="sequence-textarea mt-2" spellcheck="false"></textarea>
+        </label>
+    </div>
+    <p class="text-sm mt-3">Review the changes before applying. Unknown DNA symbols and empty sequences must be corrected; they are never silently removed.</p>
+    <div class="flex flex-wrap justify-end gap-3 mt-5">
+        <button id="fasta-repair-close" type="button" class="btn">Close</button>
+        <button id="fasta-use-accessions" type="button" class="btn hidden">Fetch GenBank accessions</button>
+        <button id="fasta-repair-apply" type="button" class="btn" disabled>Apply formatting repair</button>
+    </div>
+</dialog>
 {% endblock %}
 
 {% block scripts %}
@@ -1968,7 +1997,9 @@
         try {
             remembered = window.localStorage.getItem(STORAGE_KEY);
         } catch (err) { /* non-fatal */ }
-        select(remembered || DEFAULT_SOURCE, false);
+        const requested = typeof URLSearchParams === 'function'
+            ? new URLSearchParams(window.location?.search || '').get('source') : null;
+        select(requested || remembered || DEFAULT_SOURCE, false);
 
         // A source holding typed input wins over the remembered segment. This
         // covers back-navigation and Firefox's form restore, which repopulate
@@ -2257,6 +2288,8 @@
     function httpError(response, message) {
         const error = new Error(message);
         error.httpStatus = Number(response?.status) || 0;
+        error.serverRequestId = response?.headers?.get('X-Origin-Request-Id') || response?.headers?.get('X-Request-Id') || '';
+        error.durationMs = Number(response?.headers?.get('X-Background-Duration-Ms')) || undefined;
         return error;
     }
 
@@ -2845,7 +2878,7 @@
         let currentOrganism = "";
         let currentSeq = [];
 
-        for (const line of text.split('\n')) {
+        for (const line of text.split(/\r\n?|[\n\v\f\x1c-\x1e\x85\u2028\u2029]/)) {
             const trimmed = line.trim();
             if (trimmed.startsWith('>')) {
                 if (currentName !== null) {
@@ -2870,7 +2903,7 @@
 
                 currentSeq = [];
             } else if (trimmed && currentName !== null) {
-                currentSeq.push(trimmed);
+                currentSeq.push(trimmed.replace(/[\s\x1c-\x1f\x85]+/g, ''));
             }
         }
 
@@ -3052,7 +3085,7 @@
     }
 
     function countDetectedInputItems(text) {
-        const fastaCount = parseFasta(text).filter(seq => seq.sequence.length > 0).length;
+        const fastaCount = parseFasta(text).length;
         if (fastaCount > 0) {
             return { count: fastaCount, mode: 'fasta' };
         }
@@ -3117,13 +3150,57 @@
     // Both panels and Paste shortcuts share the guard, including input events
     // that arrive while a request is still running.
     let blastRunning = false;
+    let mycomapSearchAvailable = true;
+    let mycomapAvailabilityTimer = null;
+
+    function useNcbiBlastAlternative() {
+        if (blastQueryInput.value.trim() && blastQueryInput.value !== mycomapBlastQueryInput.value) {
+            showStatus('The NCBI panel already contains a query. Review it before replacing it.', 'info');
+        } else {
+            blastQueryInput.value = mycomapBlastQueryInput.value;
+        }
+        window.openImportSection?.('blast');
+        blastQueryInput.focus();
+        updateBlastButtonState();
+    }
+
+    function blastInputKey(source) {
+        const config = blastSources[source];
+        return JSON.stringify([pasteBlastQuery(config.input.value, source),
+            document.getElementById(`${source}_min_identity`).value,
+            document.getElementById(`${source}_max_sequences`).value]);
+    }
+
+    async function refreshMycomapAvailability() {
+        try {
+            const response = await fetch('/api/mycomap/blast/status', {cache: 'no-store'});
+            if (!response.ok) return;
+            const status = await response.json();
+            clearTimeout(mycomapAvailabilityTimer);
+            mycomapSearchAvailable = status.available !== false;
+            if (!mycomapSearchAvailable) {
+                const delay = Math.max(10, Math.min(900, Number(status.retry_after) || 60));
+                mycomapAvailabilityTimer = setTimeout(refreshMycomapAvailability, delay * 1000);
+            }
+            const notice = document.getElementById('mycomap-blast-availability');
+            if (notice) {
+                notice.textContent = status.message || '';
+                notice.classList.toggle('hidden', mycomapSearchAvailable);
+            }
+            updateBlastButtonState();
+            updateAddSequencesButtonState();
+        } catch (_) { /* The existing search error remains available if status cannot be read. */ }
+    }
 
     function updateBlastButtonState() {
         Object.entries(blastSources).forEach(([source, config]) => {
             const isValid = pasteBlastQuery(config.input.value, source) !== null;
             updateSequenceInputMeta(config.input.id);
-            config.button.disabled = blastRunning || !isValid;
-            updateButtonVisuals(config.button, isValid && !blastRunning);
+            const available = source !== 'mycomap_blast' || mycomapSearchAvailable;
+            config.button.disabled = blastRunning || !isValid || !available;
+            updateButtonVisuals(config.button, isValid && !blastRunning && available);
+            if (!blastRunning) config.button.innerHTML = `<i class="fas ${config.icon} mr-2"></i> ` +
+                (config.pendingKey && config.pendingKey === blastInputKey(source) ? 'Continue NCBI BLAST' : config.label);
             config.button.title = source === 'mycomap_blast'
                 ? 'Search MycoMap.org using one GenBank accession or a sequence of 50–20,000 bp'
                 : 'Search NCBI using one GenBank accession or a sequence of at least 20 bp';
@@ -3136,6 +3213,10 @@
             showStatus('A BLAST search is already running. Please wait for it to finish.', 'info');
             return;
         }
+        if (source === 'mycomap_blast' && !mycomapSearchAvailable) {
+            showStatus('MycoMap BLAST is temporarily unavailable. Use NCBI BLAST while access is restored.', 'warning');
+            return;
+        }
         const text = config.input.value.trim();
         let query = pasteBlastQuery(text, source);
         if (!query) {
@@ -3146,6 +3227,7 @@
         query = query.replace(/\s+/g, '');
         const minIdentity = document.getElementById(`${source}_min_identity`).value;
         const maxSequences = document.getElementById(`${source}_max_sequences`).value;
+        const inputKey = blastInputKey(source);
 
         blastRunning = true;
         updateBlastButtonState();
@@ -3164,7 +3246,13 @@
                 body: JSON.stringify({ query, min_identity: minIdentity, max_sequences: maxSequences })
             });
             const data = await resp.json();
-            if (!resp.ok) throw httpError(resp, data.error || `${config.label} failed`);
+            if (!resp.ok) {
+                if (data.can_resume) config.pendingKey = inputKey;
+                else if (data.can_resume === false || resp.status === 400) config.pendingKey = null;
+                if (source === 'mycomap_blast' && data.retryable === false) refreshMycomapAvailability();
+                throw httpError(resp, data.error || `${config.label} failed`);
+            }
+            config.pendingKey = null;
 
             const added = addSequences(data.sequences);
             const warnings = Array.isArray(data.warnings)
@@ -3204,6 +3292,7 @@
     // Add Sequences Button Logic (Visuals & Validation)
     // =========================================================================
     const addSequencesBtn = document.getElementById('add_sequences_btn');
+    let fastaAddRunning = false;
     // Alan 8/10/26 - The location option only makes sense once GenBank accessions are present.
     const genbankLocationOption = document.getElementById('genbank_location_option');
     const genbankAddLocationsCheckbox = document.getElementById('genbank_add_locations');
@@ -3252,15 +3341,16 @@
             );
         }
 
-        addSequencesBtn.disabled = !isValid;
-        updateButtonVisuals(addSequencesBtn, isValid);
+        addSequencesBtn.disabled = fastaAddRunning || !isValid;
+        updateButtonVisuals(addSequencesBtn, isValid && !fastaAddRunning);
 
         [[pasteBlastBtn, 'blast'], [pasteMycomapBlastBtn, 'mycomap_blast']].forEach(([button, source]) => {
             if (!button) return;
             const canBlast = pasteBlastQuery(text, source) !== null;
             button.classList.toggle('hidden', !canBlast);
-            button.disabled = blastRunning || !canBlast;
-            updateButtonVisuals(button, canBlast && !blastRunning);
+            const available = source !== 'mycomap_blast' || mycomapSearchAvailable;
+            button.disabled = blastRunning || !canBlast || !available;
+            updateButtonVisuals(button, canBlast && !blastRunning && available);
         });
     }
 
@@ -3294,36 +3384,55 @@
     updateAddSequencesButtonState();
 
     document.getElementById('add_sequences_btn').addEventListener('click', async () => {
-        const text = sequenceTextInput.value.trim();
+        if (fastaAddRunning) return;
+        const text = sequenceTextInput.value;
 
-        if (!text) {
+        if (!text.trim()) {
             showStatus('Please paste FASTA sequences or GenBank accessions first.', 'error');
             return;
         }
 
-        const sequences = parseFasta(text).filter(seq => seq.sequence.length > 0);
+        const sequences = parseFasta(text);
+        const accessions = sequences.length ? [] : parseGenBankAccessions(text);
 
-        if (sequences.length > 0) {
-            let locationNote = '';
-            // Alan 8/10/26 - Pasted FASTA is added client-side, so the only server round trip
-            // is the optional GenBank location lookup for accessions found in the headers.
-            if (shouldAddGenBankLocations()) {
-                addSequencesBtn.disabled = true;
-                addSequencesBtn.innerHTML = '<i class="fas fa-spinner fa-spin mr-2"></i> Looking up locations...';
-                showStatus('Looking up GenBank collection locations...', 'info');
-                locationNote = await applyGenBankLocationsToSequences(sequences);
+        if (sequences.length > 0 || accessions.length === 0) {
+            fastaAddRunning = true;
+            addSequencesBtn.disabled = true;
+            addSequencesBtn.innerHTML = '<i class="fas fa-spinner fa-spin mr-2"></i> Checking FASTA...';
+            try {
+                const checked = await checkFastaText(text, 'paste');
+                if (sequenceTextInput.value !== text) {
+                    showStatus('The pasted text changed while checking. Click Add again to check the new text.', 'info');
+                    return;
+                }
+                if (!checked.valid) {
+                    showStatus(checked.issues[0].message, 'error');
+                    showFastaRepair(checked, text, 'paste');
+                    return;
+                }
+                let locationNote = '';
+                if (shouldAddGenBankLocations()) {
+                    addSequencesBtn.innerHTML = '<i class="fas fa-spinner fa-spin mr-2"></i> Looking up locations...';
+                    showStatus('Looking up GenBank collection locations...', 'info');
+                    locationNote = await applyGenBankLocationsToSequences(sequences);
+                }
+                if (sequenceTextInput.value !== text) {
+                    showStatus('The pasted text changed. Click Add again to check the new text.', 'info');
+                    return;
+                }
+                const added = addSequences(sequences);
+                showStatus(`Added ${added} sequence${added !== 1 ? 's' : ''} to queue.${locationNote}`, 'success');
+                sequenceTextInput.value = '';
+            } catch (error) {
+                showStatus('FASTA check failed: ' + error.message, 'error');
+            } finally {
+                fastaAddRunning = false;
                 addSequencesBtn.innerHTML = '<i class="fas fa-plus mr-2"></i> Add / Remove Sequences';
+                updateAddSequencesButtonState();
             }
-
-            const added = addSequences(sequences);
-            showStatus(`Added ${added} sequence${added !== 1 ? 's' : ''} to queue.${locationNote}`, 'success');
-
-            sequenceTextInput.value = '';
-            updateAddSequencesButtonState();
             return;
         }
 
-        const accessions = parseGenBankAccessions(text);
         if (accessions.length === 0) {
             showStatus('No valid FASTA sequences or GenBank accessions found.', 'error');
             return;
@@ -3380,10 +3489,18 @@
     // File Upload Handler
     // =========================================================================
     let fileSequences = [];
+    let uploadFastaText = '';
+    let uploadFastaName = '';
+    let uploadFastaGeneration = 0;
 
     document.getElementById('sequence_file').addEventListener('change', async (e) => {
         const file = e.target.files[0];
         const addBtn = document.getElementById('add_file_btn');
+        const generation = ++uploadFastaGeneration;
+        fileSequences = [];
+        uploadFastaText = '';
+        uploadFastaName = file?.name || '';
+        addBtn.classList.add('hidden');
 
         if (!file) {
             addBtn.classList.add('hidden');
@@ -3392,19 +3509,24 @@
 
         try {
             const text = await file.text();
-            fileSequences = parseFasta(text);
-
-            if (fileSequences.length === 0) {
-                showStatus('No valid FASTA sequences found in file.', 'error');
-                addBtn.classList.add('hidden');
+            if (generation !== uploadFastaGeneration) return;
+            uploadFastaText = text;
+            showStatus('Checking FASTA file...', 'info');
+            const checked = await checkFastaText(text, 'upload', file.name);
+            if (generation !== uploadFastaGeneration) return;
+            if (!checked.valid) {
+                showStatus(checked.issues[0].message, 'error');
+                showFastaRepair(checked, text, 'upload', generation);
                 return;
             }
+            fileSequences = parseFasta(text);
 
             showStatus(`File ready: ${fileSequences.length} sequence${fileSequences.length !== 1 ? 's' : ''} found. Click Add to queue.`, 'info');
 
             // Show the file add action once a valid FASTA file has been parsed.
             addBtn.classList.remove('hidden');
         } catch (err) {
+            if (generation !== uploadFastaGeneration) return;
             showStatus('Error reading file: ' + err.message, 'error');
             addBtn.classList.add('hidden');
         }
@@ -3419,7 +3541,120 @@
             document.getElementById('sequence_file').value = '';
             document.getElementById('add_file_btn').classList.add('hidden');
             fileSequences = [];
+            uploadFastaText = '';
+            uploadFastaName = '';
+            ++uploadFastaGeneration;
         }
+    });
+
+    // FASTA validation and reviewable formatting repair. The server checker is
+    // shared with submission validation so browser and worker symbols agree.
+    let fastaRepairProposal = null;
+
+    async function checkFastaText(text, source, filename = '') {
+        const controller = new AbortController();
+        const timeout = setTimeout(() => controller.abort(), 30000);
+        try {
+            const response = await fetch('/api/fasta/check', {
+                method: 'POST', signal: controller.signal,
+                headers: { 'Content-Type': 'application/json',
+                    'X-CSRFToken': document.querySelector('meta[name="csrf-token"]').getAttribute('content') },
+                body: JSON.stringify({ sequence: text, source, filename }),
+            });
+            const data = await response.json();
+            if (!response.ok) throw httpError(response, data.error || 'Unable to check FASTA');
+            return data;
+        } finally { clearTimeout(timeout); }
+    }
+
+    function showFastaRepair(checked, original, source, generation = null) {
+        const dialog = document.getElementById('fasta-repair-dialog');
+        fastaRepairProposal = { checked, original, source, generation };
+        const summary = checked.valid
+            ? `Valid FASTA: ${checked.record_count} record(s), ${checked.total_bases.toLocaleString()} bases.`
+            : `${checked.issue_count} problem(s) found. ` + (checked.diagnostic_id ? `Diagnostic reference: ${checked.diagnostic_id}` : '');
+        document.getElementById('fasta-repair-summary').textContent = summary;
+        const accessionButton = document.getElementById('fasta-use-accessions');
+        accessionButton.classList.toggle('hidden', checked.input_kind !== 'accessions');
+        if (checked.input_kind === 'accessions') {
+            document.getElementById('fasta-repair-summary').textContent =
+                `This is a list of ${checked.accession_count} GenBank accession(s). Use Fetch GenBank accessions to retrieve their sequences.`;
+        }
+        for (const [id, messages] of [
+            ['fasta-repair-issues', (checked.issues || []).map(issue => issue.message)],
+            ['fasta-repair-changes', checked.repair?.changes || ['No formatting repair is available.']],
+        ]) {
+            const list = document.getElementById(id);
+            list.replaceChildren();
+            messages.forEach(message => {
+                const item = document.createElement('li'); item.textContent = message; list.appendChild(item);
+            });
+        }
+        if (checked.repair && !checked.repair.valid) {
+            for (const issue of checked.repair.issues) {
+                const item = document.createElement('li');
+                item.textContent = 'Still needs correction: ' + issue.message;
+                document.getElementById('fasta-repair-issues').appendChild(item);
+            }
+        }
+        document.getElementById('fasta-repair-original').value = original;
+        document.getElementById('fasta-repair-preview').value = checked.repair?.sequence || original;
+        document.getElementById('fasta-repair-apply').disabled = !checked.repair?.valid;
+        if (!dialog.open) dialog.showModal();
+    }
+
+    async function reviewFastaInput(source) {
+        const original = source === 'upload' ? uploadFastaText : sequenceTextInput.value;
+        const generation = uploadFastaGeneration;
+        if (!original.trim()) { showStatus('Paste FASTA text or select a FASTA file first.', 'error'); return; }
+        const button = document.getElementById(source === 'upload' ? 'check_file_fasta_btn' : 'check_fasta_btn');
+        button.disabled = true;
+        try {
+            const checked = await checkFastaText(original, source, source === 'upload' ? uploadFastaName : '');
+            if (source === 'upload' ? generation !== uploadFastaGeneration : original !== sequenceTextInput.value) return;
+            showFastaRepair(checked, original, source, generation);
+        } catch (error) { showStatus('FASTA check failed: ' + error.message, 'error'); }
+        finally { button.disabled = false; }
+    }
+
+    document.getElementById('check_fasta_btn').addEventListener('click', () => reviewFastaInput('paste'));
+    document.getElementById('check_file_fasta_btn').addEventListener('click', () => reviewFastaInput('upload'));
+    document.getElementById('fasta-repair-close').addEventListener('click', () => document.getElementById('fasta-repair-dialog').close());
+    document.getElementById('fasta-use-accessions').addEventListener('click', () => {
+        const proposal = fastaRepairProposal;
+        if (!proposal || proposal.checked.input_kind !== 'accessions') return;
+        if (proposal.source === 'upload' && proposal.generation !== uploadFastaGeneration) return;
+        if (proposal.source !== 'upload' && sequenceTextInput.value !== proposal.original) return;
+        if (sequenceTextInput.value.trim() && sequenceTextInput.value !== proposal.original) {
+            showStatus('The Paste panel already has different input. Save or clear it before importing this list.', 'warning');
+            return;
+        }
+        sequenceTextInput.value = proposal.original;
+        sequenceTextInput.dispatchEvent(new Event('input', {bubbles: true}));
+        document.getElementById('fasta-repair-dialog').close();
+        window.openImportSection?.('paste');
+        return addSequencesBtn.click();
+    });
+    document.getElementById('fasta-repair-apply').addEventListener('click', () => {
+        const proposal = fastaRepairProposal;
+        if (!proposal?.checked.repair?.valid) return;
+        if (proposal.source === 'upload') {
+            if (proposal.generation !== uploadFastaGeneration) {
+                showStatus('The selected file changed. Check it again before applying a repair.', 'error'); return;
+            }
+            uploadFastaText = proposal.checked.repair.sequence;
+            fileSequences = parseFasta(uploadFastaText);
+            document.getElementById('add_file_btn').classList.remove('hidden');
+        } else {
+            if (sequenceTextInput.value !== proposal.original) {
+                showStatus('The pasted text changed. Check it again before applying a repair.', 'error'); return;
+            }
+            sequenceTextInput.value = proposal.checked.repair.sequence;
+            sequenceTextInput.dispatchEvent(new Event('input', { bubbles: true }));
+        }
+        document.getElementById('fasta-repair-dialog').close();
+        showStatus('Formatting repair applied. Click Add to put the checked records in the queue.', 'success');
+        fastaRepairProposal = null;
     });
 
     // =========================================================================
@@ -6895,5 +7130,9 @@
 
     // Open button
     document.getElementById('btn-filter-results').addEventListener('click', openFilterModal);
+    refreshMycomapAvailability();
+    document.addEventListener('visibilitychange', () => {
+        if (!document.hidden) refreshMycomapAvailability();
+    });
 </script>
 {% endblock %}

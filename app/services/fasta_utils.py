@@ -78,11 +78,25 @@ def clean_dna_sequence(raw_sequence: str, min_length: int = 100) -> str:
                 if len(parts) == 2:
                     candidate = ''.join(parts[1].split())
                     recovery_min_length = max(min_length, 20)
+                    words = parts[1].split()
                     if (
                         len(candidate) >= recovery_min_length
                         and all(char in valid_chars for char in candidate)
                     ):
                         processed_lines.append(parts[1])
+                    elif (
+                        # iNaturalist fields are single-line, so a pasted FASTA
+                        # arrives as ">MT160320 Cortinarius sp. voucher JLF7611
+                        # AGTAAAAG..." -- a description, then the sequence. Take
+                        # the final word only when it is long pure IUPAC and the
+                        # word before it is plainly not sequence, so a wrapped
+                        # sequence or a DNA-looking word is never split or glued.
+                        len(words) >= 2
+                        and len(words[-1]) >= recovery_min_length
+                        and all(char in valid_chars for char in words[-1])
+                        and not all(char in valid_chars for char in words[-2])
+                    ):
+                        processed_lines.append(words[-1])
             continue
         processed_lines.append(line)
     
@@ -417,49 +431,143 @@ def check_fasta_size_limits(records: list[tuple[str, str]]) -> None:
         )
 
 
+class FastaValidationError(ValueError):
+    """A readable validation failure with stable, inspectable diagnostics."""
+
+    def __init__(self, analysis):
+        self.analysis = analysis
+        super().__init__(analysis["issues"][0]["message"])
+
+
+def _header_text_in_sequence_row(row: str, column: int) -> str:
+    """The name-like text in a sequence row, or "" when it reads as a typo.
+
+    ``column`` is the one-based column of the row's first invalid symbol. The
+    text from there to the end of the row is header-like when several of its
+    symbols are not DNA (a label, an accession, a sample code), as opposed to
+    one stray character inside a sequence.
+    """
+    tail = row[column - 1:].strip()
+    # A row that is name-like from its start (a header missing '>') is shown
+    # whole: its first letters are often DNA symbols too (H, S, ...).
+    if len("".join(row[:column - 1].split())) < 20:
+        tail = row.strip()
+    bare = "".join(tail.split())
+    invalid = sum(1 for c in bare if c.upper() not in VALID_DNA_SYMBOLS)
+    if invalid < 3 or invalid < 0.15 * len(bare):
+        return ""
+    return tail if len(tail) <= 80 else tail[:79] + "\u2026"
+
+
+def analyze_dna_fasta(fasta_text: str) -> dict:
+    """Inspect original text without dropping records, preambles or symbols.
+
+    Positions are one-based in the submitted text, before whitespace cleanup.
+    Keep at most 100 issue descriptions; the diagnostic archive retains the
+    complete original input even when a very broken file exceeds that display.
+    """
+    issues = []
+    issue_count = 0
+
+    def issue(code, message, **details):
+        nonlocal issue_count
+        issue_count += 1
+        if len(issues) < 100:
+            issues.append({"code": code, "message": message, **details})
+
+    lines = fasta_text.splitlines()
+    records = []
+    current = None
+    for line_number, raw_line in enumerate(lines, 1):
+        line = raw_line.strip()
+        if not line:
+            continue
+        if line.startswith(">"):
+            current = {"header": line[1:].strip(), "line": line_number, "rows": []}
+            records.append(current)
+        elif current is not None:
+            current["rows"].append((line_number, raw_line))
+        else:
+            issue("text_before_header",
+                  f"Line {line_number} contains text before the first FASTA header. "
+                  "Start each record with '>' and a name, then its DNA sequence.",
+                  line=line_number, column=len(raw_line) - len(raw_line.lstrip()) + 1)
+
+    if not records:
+        issues.clear()
+        issue_count = 0
+        issue("no_records", "No FASTA records were found. Start each record with a "
+              "header line beginning with '>', followed by its DNA sequence on the next line.",
+              line=1, column=1)
+
+    parsed = [(record["header"], "".join("".join(row.split()) for _, row in record["rows"]))
+              for record in records]
+    total_bases = sum(len(sequence) for _, sequence in parsed)
+    # Keep oversized input off the per-character scan, as at submission before.
+    try:
+        check_fasta_size_limits(parsed)
+    except ValueError as exc:
+        code = ("too_many_records" if len(parsed) > MAX_RECORD_COUNT else
+                "sequence_too_long" if any(len(s) > MAX_SEQUENCE_LENGTH for _, s in parsed)
+                else "too_many_bases")
+        issue(code, str(exc))
+        return {"valid": False, "record_count": len(records), "total_bases": total_bases,
+                "issues": issues, "issue_count": issue_count}
+
+    for index, (record, (header, sequence)) in enumerate(zip(records, parsed), 1):
+        details = {"record_number": index, "record_name": header, "line": record["line"]}
+        if not header:
+            issue("empty_header", f"FASTA record {index} on line {record['line']} has an "
+                  "empty header. Add a name after '>', for example '>sample_1'.", **details)
+        if not sequence:
+            issue("empty_sequence", f"FASTA record '{header[:100] or index}' on line "
+                  f"{record['line']} has no DNA sequence. Add its nucleotide sequence "
+                  "after the header; the record has not been removed.", **details)
+        position = 0
+        first = None
+        invalid = set()
+        invalid_count = 0
+        for line_number, row in record["rows"]:
+            for column, character in enumerate(row, 1):
+                if character.isspace():
+                    continue
+                position += 1
+                if character.upper() not in VALID_DNA_SYMBOLS:
+                    invalid.add(character)
+                    invalid_count += 1
+                    if first is None:
+                        first_row = row
+                        first = {"line": line_number, "column": column,
+                                 "sequence_position": position, "character": character,
+                                 "character_code": f"U+{ord(character):04X}"}
+        if first:
+            shown = ", ".join(repr(symbol) for symbol in sorted(invalid)[:10])
+            header_text = _header_text_in_sequence_row(first_row, first["column"])
+            if header_text:
+                hint = (f"Line {first['line']} looks like part of a FASTA header, not "
+                        f"DNA: '{header_text}'. A header must start with '>' on its own "
+                        "line; if this text was pasted by accident, delete it.")
+            else:
+                hint = "Check for copied labels, line numbers or punctuation."
+            issue("invalid_symbols", f"FASTA record '{header[:100] or index}' contains "
+                  f"invalid DNA symbol(s): {shown}. First at line {first['line']}, "
+                  f"column {first['column']} (sequence position {first['sequence_position']}). "
+                  "Valid symbols are A, C, G, T/U, IUPAC ambiguity codes, '-' and '?'. "
+                  + hint,
+                  **{**details, **first}, invalid_symbols=sorted(invalid)[:20],
+                  invalid_count=invalid_count,
+                  **({"looks_like_header": True} if header_text else {}))
+
+    return {"valid": not issue_count, "record_count": len(records),
+            "total_bases": total_bases, "issues": issues, "issue_count": issue_count}
+
+
 def validate_dna_fasta(fasta_text: str) -> int:
     """Validate FASTA structure, DNA symbols and size, returning the record count."""
-    records = parse_fasta_records(fasta_text)
-    if not records:
-        raise ValueError(
-            "No FASTA records were found. Start each record with a header line "
-            "beginning with '>', followed by its DNA sequence on the next line."
-        )
-
-    # Checked before the per-symbol scan so an oversized set is rejected
-    # without walking every base of it.
-    check_fasta_size_limits(records)
-
-    for index, (header, sequence) in enumerate(records, start=1):
-        record_name = header or f"record {index}"
-        if not header:
-            raise ValueError(
-                f"FASTA record {index} has an empty header. Add a name after '>', "
-                "for example '>sample_1', then retry."
-            )
-        if not sequence:
-            raise ValueError(
-                f"FASTA record '{record_name[:100]}' has no DNA sequence. Add the "
-                "nucleotide sequence on the line after its header, then retry."
-            )
-
-        invalid_symbols = sorted({
-            symbol
-            for symbol in sequence.upper()
-            if symbol not in VALID_DNA_SYMBOLS
-        })
-        if invalid_symbols:
-            shown_symbols = ", ".join(repr(symbol) for symbol in invalid_symbols[:10])
-            if len(invalid_symbols) > 10:
-                shown_symbols += ", ..."
-            raise ValueError(
-                f"FASTA record '{record_name[:100]}' contains invalid DNA "
-                f"symbol(s): {shown_symbols}. Remove labels, punctuation, and "
-                "other non-sequence text from sequence lines. Valid symbols are "
-                "A, C, G, T/U, IUPAC ambiguity codes, '-' and '?'."
-            )
-
-    return len(records)
+    analysis = analyze_dna_fasta(fasta_text)
+    if not analysis["valid"]:
+        raise FastaValidationError(analysis)
+    return analysis["record_count"]
 
 
 # --- Sanitized-ID name maps -------------------------------------------------

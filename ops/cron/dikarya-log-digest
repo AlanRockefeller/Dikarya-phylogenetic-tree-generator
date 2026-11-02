@@ -14,8 +14,9 @@
 # would fail silently every night -- exactly the kind of quiet failure this whole
 # change set is meant to eliminate.
 #
-# The digest reads only files -- no database, no network, no privileges -- so it
-# is safe to run unattended and cannot affect the running site.
+# The digest also invokes the fixed read-only nginx log wrapper with sudo -n.
+# Missing permissions are reported as a coverage gap, never an interactive
+# prompt. --skip-nginx leaves the digest entirely unprivileged.
 
 SHELL=/bin/bash
 PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin

@@ -876,6 +876,16 @@
                 </button>
             </div>
             {% endif %}
+            {# Filled by refreshClosestTypeNotice() in tree_viewer_controller.js from
+               /api/job/<id>/closest-type (closest_type_service), via textContent only. #}
+            <div id="notice-closest-type" role="status"
+                class="hidden items-center gap-2 text-sm rounded-lg px-3 py-1.5 bg-journal-gold/10 text-journal-dark dark:text-gray-100 ring-1 ring-journal-gold/50">
+                <span class="shrink-0 font-bold text-journal-gold" aria-hidden="true">T</span>
+                <span class="min-w-0 flex-1">
+                    <span id="notice-closest-type-text" class="font-medium"></span>
+                    <span id="notice-closest-type-detail" class="text-xs text-gray-600 dark:text-gray-300"></span>
+                </span>
+            </div>
         </div>
         <div id="tree-mobile-toolbar" class="tree-mobile-only" aria-label="Tree navigation controls">
             <button type="button" class="tree-mobile-tool" data-mobile-trigger="btn-fit" aria-label="Fit tree">
@@ -1610,11 +1620,11 @@
 
 <script data-viewer-critical="true" src="{{ url_for('static', filename='js/phylotree.js') }}?v=17"></script>
 
-<script data-viewer-critical="true" src="{{ url_for('static', filename='js/tree_viewer_phylotree_v2.js') }}?v=112"></script>
+<script data-viewer-critical="true" src="{{ url_for('static', filename='js/tree_viewer_phylotree_v2.js') }}?v=114"></script>
 
 <script data-viewer-critical="true" src="{{ url_for('static', filename='js/tree_viewer_api.js') }}?v=9"></script>
 
-<script data-viewer-critical="true" src="{{ url_for('static', filename='js/tree_viewer_controller.js') }}?v=111"></script>
+<script data-viewer-critical="true" src="{{ url_for('static', filename='js/tree_viewer_controller.js') }}?v=112"></script>
 
 {% include 'partials/alignment_viewer_modal.html' %}
 

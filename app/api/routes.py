@@ -60,6 +60,29 @@ logger = logging.getLogger(__name__)
 CLIENT_LOG_MAX_STR = 120
 
 
+@bp.route('/fasta/check', methods=['POST'])
+@limiter.limit("60 per minute; 1000 per day")
+def check_fasta_input():
+    """Validate before queueing and offer an explicit formatting preview."""
+    from app.services.fasta_utils import analyze_dna_fasta
+    from app.services.fasta_input_service import record_fasta_rejection, propose_fasta_repair
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict) or not isinstance(data.get("sequence"), str):
+        return jsonify({"error": "Provide FASTA text in the sequence field."}), 400
+    text = data["sequence"]
+    source = "browser_upload" if data.get("source") == "upload" else "browser_paste"
+    filename = data.get("filename") if isinstance(data.get("filename"), str) else None
+    analysis = analyze_dna_fasta(text)
+    diagnostic = None
+    if not analysis["valid"]:
+        diagnostic = record_fasta_rejection(text, analysis, source=source, filename=filename)
+    accessions, invalid = _parse_genbank_accession_tokens(text)
+    return jsonify({**analysis, "diagnostic_id": diagnostic,
+                    "input_kind": "accessions" if accessions and not invalid else "fasta",
+                    "accession_count": len(accessions) if not invalid else 0,
+                    "repair": propose_fasta_repair(text)})
+
+
 def _server_error(exc, *, where=""):
     """Return a generic 500 JSON response without leaking internals.
 
@@ -1484,6 +1507,15 @@ def run_mycomap_blast():
     return _run_in_background_if_asked("mycomap_blast", _run_mycomap_blast_request, data)
 
 
+@bp.get('/mycomap/blast/status')
+@limiter.limit("60 per minute")
+def mycomap_search_availability():
+    from app.services.mycomap_org_service import search_availability
+    response = jsonify(search_availability())
+    response.headers["Cache-Control"] = "no-store"
+    return response
+
+
 def _run_mycomap_blast_request(data):
     from app.services.mycomap_org_service import OrgResultError, search_from_query
 
@@ -1572,10 +1604,18 @@ def background_request_status(task_id):
         }), 410
     if record.get("state") != "done":
         return jsonify({"status": "running"}), 202
-    return current_app.response_class(
+    response = current_app.response_class(
         record.get("body") or "", status=int(record.get("status") or 500),
         mimetype="application/json",
     )
+    origin = record.get("request_id")
+    if isinstance(origin, str) and re.fullmatch(r"[0-9a-f]{12}", origin):
+        response.headers["X-Origin-Request-Id"] = origin
+    response.headers["X-Background-Task-Id"] = task_id
+    elapsed = record.get("duration_ms")
+    if type(elapsed) is int and elapsed >= 0:
+        response.headers["X-Background-Duration-Ms"] = str(elapsed)
+    return response
 
 
 def _run_blast_request(data):
@@ -1654,11 +1694,14 @@ def _run_blast_request(data):
         # 300s, so the Tree Builder shows this instead of failing to parse
         # nginx's HTML 504 page.
         logger.warning("BLAST request timed out: %s", e)
+        can_resume = bool(getattr(g, "blast_can_resume", False))
         return jsonify({
             "status": "error",
+            "can_resume": can_resume,
             "error": (
-                "NCBI BLAST did not finish in time. NCBI is busy right now; "
-                "please try again in a few minutes."
+                "NCBI is still working on this search. Click Continue NCBI BLAST to check the same search again."
+                if can_resume else
+                "NCBI BLAST did not finish in time. NCBI is busy right now; please try again in a few minutes."
             ),
         }), 504
     except Exception as e:
@@ -3301,27 +3344,28 @@ def create_job():
         job_params.get("mcmc_burnin_fraction"),
         Config.DEFAULT_MCMC_BURNIN_FRACTION, 0.0, 0.99
     )
+    # Validate and archive the ORIGINAL submission before deduplication can
+    # discard an empty record or move an error away from its submitted line.
+    if job_params.get("sequence"):
+        from app.services.fasta_utils import FastaValidationError
+        from app.services.fasta_input_service import validate_submitted_fasta
+        if not isinstance(job_params["sequence"], str):
+            return jsonify({"status": "error", "error": "sequence must be FASTA text."}), 400
+        try:
+            validate_submitted_fasta(job_params["sequence"], source="job_submission")
+        except FastaValidationError as exc:
+            note_request_failure("invalid_dna_fasta")
+            return jsonify({"status": "error", "error": str(exc),
+                            "fasta_validation": exc.analysis,
+                            "diagnostic_id": exc.diagnostic_id}), 400
+
     job_params["sequence"], job_params["sequence_metadata"] = _dedupe_sequence_payload(
         job_params.get("sequence", ""),
         job_params.get("sequence_metadata", []),
     )
 
-    # Reject a malformed FASTA here rather than in the worker. This validation
-    # used to live only in run_phylo_job, so a stray character on a sequence
-    # line was accepted with 202, queued, and only reported as a failed job
-    # once a worker picked it up -- the user waited for a run that could never
-    # have started. validate_dna_fasta is pure, so it is safe in-request.
-    #
-    # Only the pasted path is checked: a fasta_upload lands on disk separately
-    # and an accession/MycoMap import has no sequence text yet, both of which
-    # the worker still validates once it has the records in hand.
+    # Resolve the outgroup against the same deduplicated records the worker sees.
     if job_params.get("sequence"):
-        from app.services.fasta_utils import validate_dna_fasta
-        try:
-            validate_dna_fasta(job_params["sequence"])
-        except ValueError as e:
-            note_request_failure("invalid_dna_fasta")
-            return jsonify({"status": "error", "error": str(e)}), 400
         if tree_method == 'raxml' and job_params.get('outgroup'):
             try:
                 from app.services.fasta_utils import parse_fasta_records
@@ -3746,6 +3790,24 @@ def undo_tree_edit(job_id):
         return jsonify({"status": "error", "error": str(exc)}), 409
     except Exception as e:
         return _server_error(e)
+
+
+@bp.route('/job/<job_id>/closest-type', methods=['GET'])
+def closest_type_specimen(job_id):
+    """The type tip in this tree closest to the sequence of interest (viewer callout)."""
+    if not validate_job_id(job_id):
+        return jsonify({"status": "error", "error": "Invalid job ID format"}), 400
+    _, error_msg, status_code = check_job_access(job_id)
+    if error_msg:
+        return jsonify({"status": "error", "error": error_msg}), status_code
+    try:
+        from app.services.closest_type_service import closest_type_for_job
+        result = closest_type_for_job(Config.JOB_DIR / job_id)
+        response = jsonify({"status": "ok", **result})
+        response.headers["Cache-Control"] = "no-store"
+        return response
+    except Exception as e:
+        return _server_error(e, where="closest_type")
 
 
 @bp.route('/job/<job_id>/tree/rotate', methods=['POST'])
@@ -6223,7 +6285,10 @@ def log_client_error():
     # Link-load events from preview crawlers and hidden tabs are common and
     # rarely signal a broken page for an active visitor. Retain them in the
     # web log, but keep the WARNING+ mirror focused on actionable failures.
-    log_event = current_app.logger.info if (
+    third_party = (event in {"window_error", "unhandled_rejection"}
+                   and "iabjs://" in stack and "postMessage" in message
+                   and "FB_IAB/" in browser_agent)
+    log_event = current_app.logger.info if third_party or (
         event == "resource_load_failed" and (
             visibility in {"hidden", "prerender"} or "meta-externalagent/" in browser_agent.lower()
         )
@@ -6232,11 +6297,12 @@ def log_client_error():
         "event=client.%s Browser failure pathname=%s job_id=%s action=%s "
         "message=%s fingerprint=%s release=%s client_release=%s "
         "server_request_id=%s method=%s http_status=%s duration_ms=%s "
-        "online=%s visibility=%s browser=%s stack=%s",
+        "online=%s visibility=%s origin=%s client=%s browser=%s stack=%s",
         event, pathname, job_id or "-", action or "-", message, fingerprint,
         current_app.config.get("RELEASE_VERSION", "unknown"),
         client_release, server_request_id, method, http_status,
         bounded_integer("duration_ms", 3_600_000), online, visibility,
+        "facebook_injected" if third_party else "browser", _client_log_value(request.remote_addr, 64) or "-",
         browser_agent, stack or "-",
     )
     return jsonify({"status": "logged"}), 200
@@ -6259,7 +6325,8 @@ def add_sequences_to_job(job_id):
         return jsonify({"status": "error", "error": "Job not found"}), 404
         
     data = request.get_json(silent=True) or {}
-    input_text = data.get("input", "").strip()
+    raw_input_text = data.get("input", "")
+    input_text = raw_input_text.strip()
     replace_existing = bool(data.get("replace"))
     
     if not input_text:
@@ -6278,7 +6345,8 @@ def add_sequences_to_job(job_id):
         
         # Heuristic: Check if input looks like a list of accessions (no > at start, short lines)
         first_line = input_text.splitlines()[0].strip()
-        if not first_line.startswith(">"):
+        if not (first_line.startswith((">", "\ufeff>")) or
+                any(line.lstrip().startswith(">") for line in input_text.splitlines())):
             # Assume accessions
             is_accession_input = True
             
@@ -6306,6 +6374,15 @@ def add_sequences_to_job(job_id):
                 )
         else:
             # Assume FASTA
+            from app.services.fasta_utils import FastaValidationError
+            from app.services.fasta_input_service import validate_submitted_fasta
+            try:
+                validate_submitted_fasta(raw_input_text, source="existing_job_addition")
+            except FastaValidationError as exc:
+                note_request_failure("invalid_dna_fasta")
+                return jsonify({"status": "error", "error": str(exc),
+                                "fasta_validation": exc.analysis,
+                                "diagnostic_id": exc.diagnostic_id}), 400
             sequences_to_add = _parse_fasta_sequences(input_text)
             # Pasted MycoMap/NCBI headers carry the whole GenBank definition
             # line. /api/mycomap compacts those before they reach the queue;
@@ -6338,14 +6415,20 @@ def add_sequences_to_job(job_id):
             return jsonify({"status": "error", "error": str(exc)}), 400
 
         # 2. Sequence Count Limit
+        # Alan 11/1/26 - These two caps bound one APPEND. A replace is the Tree
+        # Builder's "Add & Recompute", which posts the whole queue as the job's
+        # new input, so capping it at 500 made every job over 500 sequences
+        # uneditable (gx1e and e0nz, 830 and 526 records, refused four times on
+        # 2026-10-30). A replace is the same size question as creating the job,
+        # and the shared creation ceilings were already applied just above.
         MAX_SEQUENCES_TO_ADD = 500
-        if len(sequences_to_add) > MAX_SEQUENCES_TO_ADD:
+        if not replace_existing and len(sequences_to_add) > MAX_SEQUENCES_TO_ADD:
             return jsonify({"status": "error", "error": f"Too many sequences (max {MAX_SEQUENCES_TO_ADD})"}), 400
-            
+
         # 3. Total Base Pair Limit
         MAX_TOTAL_BP_TO_ADD = 2_000_000
         total_bp = sum(len(s['sequence']) for s in sequences_to_add)
-        if total_bp > MAX_TOTAL_BP_TO_ADD:
+        if not replace_existing and total_bp > MAX_TOTAL_BP_TO_ADD:
              return jsonify({"status": "error", "error": f"Total sequence length too large (max {MAX_TOTAL_BP_TO_ADD} bp)"}), 400
              
         # Append to input_raw.fasta, or replace it when the queue is the desired final set.

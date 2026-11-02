@@ -45,6 +45,7 @@ set -eu
 
 LOG="${1:-error}"
 LINES="${2:-200}"
+FILTER=all
 
 # The keyword selects a fixed glob, never a caller-supplied path. The globs
 # cover logrotate's own naming (error.log, error.log.1, error.log.2.gz).
@@ -53,8 +54,10 @@ case "$LOG" in
     access)     GLOB='/var/log/nginx/access.log' ;;
     error-all)  GLOB='/var/log/nginx/error.log*' ;;
     access-all) GLOB='/var/log/nginx/access.log*' ;;
+    app-error-all) GLOB='/var/log/nginx/error.log*'; FILTER=app_error ;;
+    app-access-all) GLOB='/var/log/nginx/access.log*'; FILTER=app_access ;;
     *)
-        echo "usage: dikarya-nginx-log {error|access|error-all|access-all} [lines]" >&2
+        echo "usage: dikarya-nginx-log {error|access|error-all|access-all|app-error-all|app-access-all} [lines]" >&2
         exit 2
         ;;
 esac
@@ -97,4 +100,10 @@ fi
 
 # zcat -f passes plain files through uncompressed, so one pipeline handles the
 # live file and the gzipped rotations together.
-/usr/bin/zcat -f $FILES | /usr/bin/tail -n "$LINES"
+# Filter before tail: traffic from image hosting can otherwise consume the
+# entire 200,000-line budget before even one day of Dikarya is covered.
+case "$FILTER" in
+    app_access) /usr/bin/zcat -f $FILES | /usr/bin/awk '/ host="(www\.)?dikarya\.us" server="dikarya\.us"$/' | /usr/bin/tail -n "$LINES" ;;
+    app_error) /usr/bin/zcat -f $FILES | /usr/bin/awk '/server: dikarya\.us,/' | /usr/bin/tail -n "$LINES" ;;
+    all) /usr/bin/zcat -f $FILES | /usr/bin/tail -n "$LINES" ;;
+esac

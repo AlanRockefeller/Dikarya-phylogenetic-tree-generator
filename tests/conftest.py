@@ -15,6 +15,34 @@ import pytest
 
 
 @pytest.fixture(autouse=True, scope="session")
+def _isolate_ncbi_pacing():
+    from app.services import ncbi_pacing, mycomap_org_service
+    import uuid
+    run_id = uuid.uuid4().hex
+    original = ncbi_pacing.KEY_PREFIX
+    auth_prefix = mycomap_org_service.SEARCH_AUTH_KEY_PREFIX
+    ncbi_pacing.KEY_PREFIX = f"dikarya:test:ncbi:{run_id}:"
+    mycomap_org_service.SEARCH_AUTH_KEY_PREFIX = f"dikarya:test:mycomap-org:submit-auth:{run_id}:"
+    try:
+        yield
+    finally:
+        ncbi_pacing.KEY_PREFIX = original
+        mycomap_org_service.SEARCH_AUTH_KEY_PREFIX = auth_prefix
+
+
+@pytest.fixture(autouse=True, scope="session")
+def _isolate_fasta_diagnostic_archives(tmp_path_factory):
+    from app.services import fasta_input_service
+
+    original = fasta_input_service.ARCHIVE_DIR
+    fasta_input_service.ARCHIVE_DIR = tmp_path_factory.mktemp("fasta-rejections")
+    try:
+        yield
+    finally:
+        fasta_input_service.ARCHIVE_DIR = original
+
+
+@pytest.fixture(autouse=True, scope="session")
 def _isolate_api_diagnostic_archives(tmp_path_factory):
     """Point failed-API-response archives at a temporary directory for the run.
 

@@ -127,6 +127,9 @@ def record_api_failure(url, *, reason, body=None, status=None, headers=None, met
                 archive.write(json.dumps(payload, ensure_ascii=True).encode("utf-8"))
         logger.warning("event=api.response_failed diagnostic=%s status=%s endpoint=%s reason=%s",
                        diagnostic_id, status, safe_url(url), _redact(reason, secrets))
+        from flask import g, has_request_context
+        if has_request_context():
+            g.upstream_diagnostic_id = diagnostic_id
         return diagnostic_id
     except Exception as exc:
         logger.warning("event=api.diagnostic_write_failed error_type=%s", type(exc).__name__)
@@ -152,9 +155,18 @@ def diagnostic_urlopen(req, *args, opener=None, **kwargs):
     """Preserve retry behavior and HTTPError bodies for existing callers."""
     url = req.full_url if isinstance(req, request.Request) else str(req)
     method = req.get_method() if isinstance(req, request.Request) else "GET"
+    from app.services import ncbi_pacing
+    import time
+    timeout = kwargs.get("timeout")
+    deadline = time.monotonic() + timeout if isinstance(timeout, (int, float)) else None
+    ncbi_pacing.wait_for_slot(url, deadline=deadline)
+    if deadline is not None and ncbi_pacing.is_eutils(url):
+        kwargs["timeout"] = max(0.001, deadline - time.monotonic())
     try:
         response = (opener or request.urlopen)(req, *args, **kwargs)
     except error.HTTPError as exc:
+        if exc.code == 429:
+            ncbi_pacing.note_cooldown(url, exc.headers.get("Retry-After") if exc.headers else None)
         raw = None
         try:
             raw = exc.read()

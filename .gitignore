@@ -64,7 +64,10 @@ dosage-calculator/
 /app/templates/test.html
 /tests/test_dosage_calculator.py
 /app/static/files/
-/amanitaceae
+/amanitaceae/*
+!/amanitaceae/pages/
+/amanitaceae/pages/*
+!/amanitaceae/pages/index.html
 mycomap.com.api.md
 mycomap.org.api.md
 chatgpt_project_context*

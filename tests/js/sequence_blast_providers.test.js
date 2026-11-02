@@ -199,3 +199,30 @@ test('a completed request preserves replacement input typed while the search run
     assert.equal(h.nodes.sequence_text.value, 'OR807397');
     assert.equal(h.nodes.blast_query.value, 'OR807398');
 });
+
+test('a timed-out NCBI search offers Continue and preserves the same query and settings', async () => {
+    const h = harness(attempt => attempt === 1
+        ? response({error: 'NCBI is still working.', can_resume: true}, 504)
+        : response({sequences: [{name: 'continued result', sequence: DNA}]}));
+    await h.input('blast_query', DNA);
+    await h.nodes.blast_btn.click();
+    assert.match(h.nodes.blast_btn.innerHTML, /Continue NCBI BLAST/);
+    assert.equal(h.nodes.blast_query.value, DNA);
+    await h.nodes.blast_btn.click();
+    assert.deepEqual(h.calls[0].body, h.calls[1].body);
+    assert.equal(h.queue[0].name, 'continued result');
+});
+
+test('known MycoMap refusal disables both entry points and keeps NCBI available', async () => {
+    const h = harness();
+    await h.input('mycomap_blast_query', DNA);
+    await h.input('blast_query', DNA);
+    await h.input('sequence_text', DNA);
+    h.run('mycomapSearchAvailable = false; updateBlastButtonState(); updateAddSequencesButtonState();');
+    assert.equal(h.nodes.mycomap_blast_btn.disabled, true);
+    assert.equal(h.nodes.paste_mycomap_blast_btn.disabled, true);
+    assert.equal(h.nodes.blast_btn.disabled, false);
+    assert.equal(h.nodes.paste_blast_btn.disabled, false);
+    await h.run("runBlastSearch('mycomap_blast')");
+    assert.equal(h.calls.length, 0);
+});
