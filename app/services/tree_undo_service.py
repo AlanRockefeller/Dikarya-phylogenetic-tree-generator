@@ -71,6 +71,7 @@ import json
 import logging
 import math
 import os
+import secrets
 import shutil
 import tempfile
 import time
@@ -133,6 +134,27 @@ STALE_PENDING_AGE_SECONDS = 3600
 
 def _undo_dir(job_dir: Path) -> Path:
     return Path(job_dir) / UNDO_DIR_NAME
+
+
+def _make_staging_dir(job_dir: Path, prefix: str) -> Path:
+    """``tempfile.mkdtemp()``, but with the mode the rest of a job gets.
+
+    mkdtemp() creates 0700 by design, and the capture's staging directory is
+    renamed into place as the live checkpoint, so every ``.tree_undo`` came out
+    owner-only in a job directory the ``dikarya`` group otherwise maintains
+    (AGENTS.md: "Writing to var/jobs"). ``mkdir(0o777)`` applies the process
+    umask instead -- 0775 under the services' ``UMask=0002``, 0755 under the
+    usual 0022 -- and the kernel carries the job directory's setgid down, with
+    no chmod for the workers' ``RestrictSUIDSGID`` to refuse.
+    """
+    for _ in range(100):
+        candidate = Path(job_dir) / f"{prefix}{secrets.token_hex(4)}"
+        try:
+            candidate.mkdir(mode=0o777)
+        except FileExistsError:
+            continue
+        return candidate
+    raise FileExistsError(f"no unused staging name under {job_dir}")
 
 
 def _flat_name(relative: str) -> str:
@@ -277,7 +299,7 @@ def undo_checkpoint(job_dir: Path, operation: str, label: str):
     staging: Optional[Path] = None
     handle: Optional[_PendingCheckpoint] = None
     try:
-        staging = Path(tempfile.mkdtemp(dir=str(job_dir), prefix=PENDING_PREFIX))
+        staging = _make_staging_dir(job_dir, PENDING_PREFIX)
         present: List[str] = []
         absent: List[str] = []
         for relative in SNAPSHOT_PATHS:
@@ -438,7 +460,7 @@ def _restore_file(source: Path, destination: Path) -> None:
 def _restore_snapshot(job_dir: Path, checkpoint: Path,
                       present: List[str], absent: List[str]) -> None:
     """Restore all snapshot paths, rolling every changed path back on failure."""
-    rollback = Path(tempfile.mkdtemp(dir=str(job_dir), prefix=PENDING_PREFIX + "restore."))
+    rollback = _make_staging_dir(job_dir, PENDING_PREFIX + "restore.")
     paths = list(dict.fromkeys(present + absent))
     previously_present = set()
     changed: List[str] = []

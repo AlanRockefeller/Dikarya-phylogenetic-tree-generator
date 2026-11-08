@@ -117,6 +117,20 @@ class CheckpointLifecycleTests(unittest.TestCase):
                 [UNDO_DIR_NAME],
             )
 
+    def test_the_checkpoint_folder_follows_the_umask(self):
+        # mkdtemp's 0700 left every .tree_undo owner-only; the services run
+        # with UMask=0002, so the folder should come out 0775 like the job's.
+        previous = os.umask(0o002)
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                job_dir = _make_job(Path(tmp))
+                with undo_checkpoint(job_dir, "prune", "the last prune") as checkpoint:
+                    checkpoint.commit()
+                undo_dir = job_dir / UNDO_DIR_NAME
+                self.assertEqual(undo_dir.stat().st_mode & 0o777, 0o775)
+        finally:
+            os.umask(previous)
+
     def test_a_second_edit_replaces_the_single_checkpoint(self):
         with tempfile.TemporaryDirectory() as tmp:
             job_dir = _make_job(Path(tmp))
