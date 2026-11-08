@@ -1010,8 +1010,12 @@ def get_worker_queue_health():
 
         for worker in Worker.all(connection=get_redis_connection()):
             queues_by_name[worker.name] = [q.name for q in getattr(worker, "queues", [])]
-    except Exception:
+    except Exception as exc:
+        # DEBUG, not WARNING: an outage would repeat this every minute. It still
+        # leaves a trail when the cause is something other than Redis.
         available = False
+        logger.debug("event=health.worker_queues_unreadable exception=%s",
+                     type(exc).__name__, exc_info=True)
     for entry in workers:
         entry["queues"] = queues_by_name.get(entry.get("id"), [])
     return {"available": available, "workers": workers}

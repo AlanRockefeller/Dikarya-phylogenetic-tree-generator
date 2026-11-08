@@ -135,9 +135,8 @@ found no attack aimed at Dikarya. Its fixes:
 - The digest drops the http.request_failed row of a 4xx the access log marked
   noise=scanner, so scanner requests on real routes are not listed twice, and
   has a New accounts section that flags dotted Gmail addresses. Registrations
-  were INFO-only; a Tor-based signup bot's account (#88, created November 3)
-  went unnoticed until this review. It has been locked: its password hash was
-  replaced, which also revokes its session cookies.
+  were INFO-only, so an automated signup went unnoticed for several days until
+  this review; that account has been disabled.
 - A recompute whose root clade no longer exists (pruned away, or no longer
   grouped together) falls back to midpoint rooting with a notice, like a lost
   root tip, instead of keeping the builder's arbitrary root (job jtk5). The

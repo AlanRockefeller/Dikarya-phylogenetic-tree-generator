@@ -714,9 +714,19 @@ def fetch_inaturalist_data(url: str, mode: str = 'all',
             _select_mycomap_its_result_url,
         )
         from app.services.mycomap_service import fetch_mycomap_result_title
+        title_fetcher = fetch_mycomap_result_title
+        if deadline is not None:
+            # Inside a request: each title lookup gets only what is left of the
+            # budget, and none once it is spent (the selector then keeps the
+            # first link, its default), instead of 10 s per unlabelled link.
+            def title_fetcher(result_url):
+                remaining = deadline - time.monotonic()
+                if remaining < 1:
+                    return ""
+                return fetch_mycomap_result_title(result_url, timeout=min(10.0, remaining))
         mycomap_blast_url = _select_mycomap_its_result_url(
             get_field_value(observation, MYCOMAP_BLAST_FIELD_NAME),
-            title_fetcher=fetch_mycomap_result_title,
+            title_fetcher=title_fetcher,
         )
 
         final_result.update({

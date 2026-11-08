@@ -41,6 +41,11 @@
     // Hard ceiling on drawn branch width: a stretched clade on a deep tree could otherwise
     // ask for an SVG wider than browsers will rasterise when it is exported.
     const MAX_BRANCH_WIDTH_PX = 20000;
+    // Alan 11/8/26 - phylotree draws a rectangular tree's deepest tip at 0.8 x its
+    // 'branch-width' (placenodes: d.y *= scales[1] * .8). Every width here is a DRAWN width;
+    // divide by this when writing the option and multiply when reading it back. Mixing the
+    // two made the fit feed on itself: 200% drew 2.67x, and 400%+ ran to the cap.
+    const PHYLOTREE_RECT_DEPTH_SCALE = 0.8;
     // Alan 10/20/26 - Long-branch breaks (_computeLongBranchBreaks). Calibrated on 1,026 job
     // trees: about 7% qualify, almost all with one or two breaks, and those draw a median
     // 1.6x wider (up to 16x when an outgroup or contaminant sits on a very long branch).
@@ -1878,7 +1883,8 @@
                 // Alan 10/20/26 - Size the branches to the pane from the first layout (the
                 // measured correction in _applySpacingViaAPI then settles it), and let layout
                 // draw a broken branch at its shortened length.
-                'branch-width': this._targetBranchWidth(),
+                // Alan 11/8/26 - phylotree's input, not the drawn width (PHYLOTREE_RECT_DEPTH_SCALE).
+                'branch-width': this._targetBranchWidth() / PHYLOTREE_RECT_DEPTH_SCALE,
                 'display-branch-length': (node, length) => this._displayBranchLength(node, length),
                 // Alan 9/23/26 - No animated relayouts. phylotree animates trees under 300 nodes,
                 // so for ~250ms after every update the SVG's width/height and every node were
@@ -2072,7 +2078,8 @@
                 if (typeof display.spacing_y === 'function') display.spacing_y(perLevel, true);
                 return;
             }
-            display.options['branch-width'] = this._targetBranchWidth();
+            // Alan 11/8/26 - Drawn target converted to phylotree's input.
+            display.options['branch-width'] = this._targetBranchWidth() / PHYLOTREE_RECT_DEPTH_SCALE;
         }
 
         // Width of the drawing that is not branch, in layout pixels: its right edge minus the
@@ -2090,7 +2097,8 @@
             const layout = Array.isArray(display.layout_translate) ? display.layout_translate : [0, 0];
             const branchWidth = Number(display.options?.['branch-width']) || 0;
             if (!(branchWidth > 0)) return NaN;
-            return (layout[0] || 0) + box.x + box.width - branchWidth;
+            // Alan 11/8/26 - Subtract the branch extent actually drawn, not the option value.
+            return (layout[0] || 0) + box.x + box.width - branchWidth * PHYLOTREE_RECT_DEPTH_SCALE;
         }
 
         // Measure what was just drawn and, if the fit is off, lay it out once more.
@@ -2100,8 +2108,10 @@
             if (!Number.isFinite(measured)) return;
             this._nonBranchWidthPx = measured;
             const target = this._targetBranchWidth();
-            if (Math.abs(target - (Number(display.options['branch-width']) || 0)) <= 2) return;
-            display.options['branch-width'] = target;
+            // Alan 11/8/26 - Compare and write in drawn pixels (PHYLOTREE_RECT_DEPTH_SCALE).
+            const drawn = (Number(display.options['branch-width']) || 0) * PHYLOTREE_RECT_DEPTH_SCALE;
+            if (Math.abs(target - drawn) <= 2) return;
+            display.options['branch-width'] = target / PHYLOTREE_RECT_DEPTH_SCALE;
             display.update();
         }
 
@@ -2118,7 +2128,8 @@
                 const measured = this._measureNonBranchWidth(display);
                 if (!Number.isFinite(measured)) return;
                 this._nonBranchWidthPx = measured;
-                const current = Number(display.options['branch-width']) || 0;
+                // Alan 11/8/26 - Drawn pixels, like _targetBranchWidth().
+                const current = (Number(display.options['branch-width']) || 0) * PHYLOTREE_RECT_DEPTH_SCALE;
                 if (Math.abs(this._targetBranchWidth() - current) <= 4) {
                     this._fitCorrections = 0;
                     return;
@@ -5537,14 +5548,22 @@
                         firstNode = false;
                     }
                     if (id) this.selectedIds.add(id);
+                    // Alan 11/8/26 - getSelectedNodes() counts an internal node only through the
+                    // clade registry; without this, Prune acted on fewer nodes than it showed.
+                    if (id && n.children && n.children.length) this._syncCladeSelection(n, true);
                 });
             } else if (action === 'none') {
                 this.selectedIds.clear();
+                // Alan 11/8/26 - Clear the clade registry with the ids it mirrors.
+                this.selectedCladeIds.clear();
+                this._invalidateCladeSelection();
             } else if (action === 'all-internal') {
                 this.tree.traverse_and_compute(n => {
                     if (n.children && n.children.length) {
                         const id = this._getNodeId(n);
                         if (id) this.selectedIds.add(id);
+                        // Alan 11/8/26 - Register the clade too (see 'all').
+                        if (id) this._syncCladeSelection(n, true);
                     }
                 });
             } else if (action === 'all-leaves') {
@@ -5555,11 +5574,28 @@
                     }
                 });
             } else if (action === 'inverse') {
+                // Alan 11/8/26 - Invert internal nodes by clade, not by id: an internal id is its
+                // support label, shared by many clades ("100"), so toggling the id once per node
+                // flipped it back and forth. A label stays selected while any clade carrying it
+                // is selected; tips still toggle by name.
+                const wasClade = new Set(this.selectedCladeIds);
+                const internalIds = new Map();
                 this.tree.traverse_and_compute(n => {
                     const id = this._getNodeId(n);
                     if (!id) return;
+                    if (n.children && n.children.length) {
+                        const cladeId = this._getCladeId(n);
+                        const nowSelected = !(cladeId && wasClade.has(cladeId));
+                        this._syncCladeSelection(n, nowSelected);
+                        internalIds.set(id, internalIds.get(id) || nowSelected);
+                        return;
+                    }
                     if (this.selectedIds.has(id)) this.selectedIds.delete(id);
                     else this.selectedIds.add(id);
+                });
+                internalIds.forEach((selected, id) => {
+                    if (selected) this.selectedIds.add(id);
+                    else this.selectedIds.delete(id);
                 });
             } else if (action === 'select-filtered') {
                 const predicate = filteredNodesPredicate || ((n) => n.__search_match);
@@ -5567,6 +5603,8 @@
                     if (predicate(n)) {
                         const id = this._getNodeId(n);
                         if (id) this.selectedIds.add(id);
+                        // Alan 11/8/26 - Register a matched clade (see 'all').
+                        if (id && n.children && n.children.length) this._syncCladeSelection(n, true);
                     }
                 });
             }

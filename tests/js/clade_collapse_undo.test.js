@@ -536,6 +536,54 @@ function main() {
         assert.strictEqual(viewer.undoLastCollapseChange(), 'collapse of 2 clades');
     });
 
+    // --- bulk selection keeps the clade registry in step -------------------
+    // Alan 11/8/26 - getSelectedNodes() returns an internal node only through the
+    // clade registry, so a bulk action that set ids alone left Prune with fewer
+    // nodes than its count (none at all after "all internal").
+    function bulkViewer(newick) {
+        const made = makeViewer(ctx, newick);
+        Object.defineProperty(made.viewer, 'selectedIds', { get: () => made.viewer.currentSelectionIds });
+        made.viewer.selectionSets = {};
+        made.viewer._updateStats = () => {};
+        return made;
+    }
+    // Spread into this realm's Array: deepStrictEqual compares prototypes.
+    const internalNames = (nodes) => [...nodes]
+        .filter((n) => n.children && n.children.length)
+        .map((n) => viewer_tips(n)).sort();
+    function viewer_tips(node) {
+        const tips = [];
+        const walk = (n) => (n.children && n.children.length ? n.children.forEach(walk) : tips.push(n.data.name));
+        walk(node);
+        return tips.sort().join('');
+    }
+
+    test('selection-bulk', '"all internal" selects every clade for Prune and friends', () => {
+        const { viewer } = bulkViewer();
+        viewer.selectionAction('all-internal');
+        assert.deepStrictEqual(internalNames(viewer.getSelectedNodes()),
+            ['AB', 'ABCD', 'CD', 'EF', 'EFGH', 'GH']);
+    });
+
+    test('selection-bulk', '"none" clears the clade registry too', () => {
+        const { viewer } = bulkViewer();
+        viewer.selectionAction('all');
+        viewer.selectionAction('none');
+        assert.strictEqual(viewer.selectedCladeIds.size, 0);
+        assert.strictEqual(viewer.getSelectedNodes().length, 0);
+    });
+
+    test('selection-bulk', '"inverse" inverts clades that share a support label', () => {
+        const { viewer, tree } = bulkViewer('(((A,B)100,(C,D)100)left,((E,F)ef,(G,H)gh)right)root;');
+        let ab = null;
+        tree.traverse_and_compute((n) => { if (viewer_tips(n) === 'AB') ab = n; });
+        viewer.selectedIds.add('100');
+        viewer._syncCladeSelection(ab, true);
+        viewer.selectionAction('inverse');
+        assert.deepStrictEqual(internalNames(viewer.getSelectedNodes()),
+            ['ABCD', 'CD', 'EF', 'EFGH', 'GH']);
+    });
+
     return keyboardTests();
 }
 

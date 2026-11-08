@@ -34,6 +34,7 @@ GROUPS = {
     "collapse-undo": "undoing a collapse",
     "collapse-nondestructive": "collapse leaving persisted state alone",
     "keyboard": "Ctrl/Cmd+Z",
+    "selection-bulk": "bulk selection actions keeping the clade registry in step",
 }
 
 
@@ -97,6 +98,9 @@ class CollapseBehaviourTests(unittest.TestCase):
 
     def test_the_undo_hotkey(self):
         self.assert_group("keyboard")
+
+    def test_bulk_selection_registers_clades(self):
+        self.assert_group("selection-bulk")
 
     def test_every_group_is_covered(self):
         """A group that stops running would otherwise pass silently."""

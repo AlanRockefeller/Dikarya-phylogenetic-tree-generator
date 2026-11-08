@@ -237,11 +237,17 @@ def report_mycomap_changes(old_records, records, rows, genbank_types):
 # genbank pass
 # --------------------------------------------------------------------------
 
-def candidate_accessions(since_days):
+def _scan_job_accessions(since_days, keep):
+    """Accessions in job inputs (changed within since_days, 0 = all) that keep() accepts.
+
+    ``keep(header, accession)`` decides per header. One scan for every pass, so
+    the cutoff, the mtime check and the handling of unreadable jobs cannot drift
+    apart between them.
+    """
     from app.services.sequence_dedup_service import record_accession
 
     cutoff = time.time() - since_days * 86400 if since_days else None
-    candidates = set()
+    accessions = set()
     jobs = 0
     for input_dir in Config.JOB_DIR.glob("*/input"):
         try:
@@ -253,10 +259,14 @@ def candidate_accessions(since_days):
         jobs += 1
         for header in headers:
             acc = tss.accession_root(record_accession(header, {}))
-            if acc and (acc.startswith("NR_") or (
-                    TYPE_WORD_RE.search(header) and not NEGATED_TYPE_RE.search(header))):
-                candidates.add(acc)
-    return candidates, jobs
+            if acc and keep(header, acc):
+                accessions.add(acc)
+    return accessions, jobs
+
+
+def candidate_accessions(since_days):
+    return _scan_job_accessions(since_days, lambda header, acc: acc.startswith("NR_") or (
+        TYPE_WORD_RE.search(header) and not NEGATED_TYPE_RE.search(header)))
 
 
 def run_genbank(args):
@@ -339,24 +349,7 @@ def run_genbank(args):
 
 def job_accessions(since_days):
     """Every GenBank accession in job inputs (changed within since_days, 0 = all)."""
-    from app.services.sequence_dedup_service import record_accession
-
-    cutoff = time.time() - since_days * 86400 if since_days else None
-    accessions = set()
-    jobs = 0
-    for input_dir in Config.JOB_DIR.glob("*/input"):
-        try:
-            if cutoff and (input_dir / "input_raw.fasta").stat().st_mtime < cutoff:
-                continue
-            headers = list(tss.job_headers(input_dir.parent))
-        except OSError:
-            continue
-        jobs += 1
-        for header in headers:
-            acc = tss.accession_root(record_accession(header, {}))
-            if acc:
-                accessions.add(acc)
-    return accessions, jobs
+    return _scan_job_accessions(since_days, lambda header, acc: True)
 
 
 def run_curation(args):

@@ -189,6 +189,14 @@ def _normalize_max_sequences(value) -> int:
         return DEFAULT_MAX_SEQUENCES
     return limit if limit > 0 else DEFAULT_MAX_SEQUENCES
 
+def _in_web_request() -> bool:
+    try:
+        from flask import has_request_context
+        return has_request_context()
+    except Exception:
+        return False
+
+
 def _ncbi_request(method: str, url: str, max_retries: int = 5, deadline=None, **kwargs) -> requests.Response:
     """
     Helper to perform NCBI requests with:
@@ -229,6 +237,13 @@ def _ncbi_request(method: str, url: str, max_retries: int = 5, deadline=None, **
         try:
             effective = _request_deadline.get()
             effective = min(effective, deadline) if effective is not None and deadline is not None else (effective or deadline)
+            if effective is None and not _in_web_request():
+                # A worker call has no budget. Before pacing was shared it slept
+                # through its own Retry-After; give it room to wait out the
+                # longest shared cooldown rather than wait_for_slot's 60 s
+                # default, which failed the BLAST step on a longer one. A web
+                # request without a budget keeps that default.
+                effective = time.monotonic() + ncbi_pacing.MAX_COOLDOWN_SECONDS + 60
             ncbi_pacing.wait_for_slot(url, deadline=effective)
         except TimeoutError as exc:
             raise BudgetExhausted(str(exc)) from exc

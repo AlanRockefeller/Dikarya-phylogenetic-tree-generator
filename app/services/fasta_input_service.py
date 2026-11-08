@@ -125,11 +125,21 @@ def _repair_header_text_on_sequence_lines(text):
     out = []
     changes = []
 
+    # Index of the next non-empty line after each line, from one backward pass;
+    # slicing the rest of the input per call was quadratic on long pastes.
+    next_nonempty = [None] * len(lines)
+    following = None
+    for position in range(len(lines) - 1, -1, -1):
+        next_nonempty[position] = following
+        if lines[position].strip():
+            following = position
+
     def next_is_dna(index):
-        for later in lines[index + 1:]:
-            if later.strip():
-                return not later.strip().startswith(">") and _is_dna(later)
-        return False
+        later_index = next_nonempty[index]
+        if later_index is None:
+            return False
+        later = lines[later_index]
+        return not later.strip().startswith(">") and _is_dna(later)
 
     # Include headers with stray text before their '>' (fixed below).
     headers = [(i + 1, l.split(">", 1)[1].strip()) for i, l in enumerate(lines)

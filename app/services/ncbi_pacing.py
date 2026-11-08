@@ -48,6 +48,10 @@ def connection():
     return _client
 
 
+# The longest shared cooldown a Retry-After can set (retry_after_seconds caps it).
+MAX_COOLDOWN_SECONDS = 3600.0
+
+
 def retry_after_seconds(value, default=1.0):
     try:
         seconds = float(value)
@@ -56,7 +60,7 @@ def retry_after_seconds(value, default=1.0):
             seconds = parsedate_to_datetime(str(value)).timestamp() - time.time()
         except (TypeError, ValueError, OverflowError):
             seconds = default
-    return max(0.0, min(3600.0, seconds)) if math.isfinite(seconds) else default
+    return max(0.0, min(MAX_COOLDOWN_SECONDS, seconds)) if math.isfinite(seconds) else default
 
 
 def _warn(exc):

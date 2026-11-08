@@ -386,7 +386,13 @@ def extend_undo_checkpoint(job_dir: Path, operation: str, coalesce_key: str,
         fd, temp_name = tempfile.mkstemp(
             dir=str(manifest_path.parent), prefix=".manifest.", suffix=".tmp"
         )
+        # mkstemp creates 0600; keep the manifest's existing mode (AGENTS.md).
+        try:
+            mode = manifest_path.stat().st_mode & 0o7777
+        except OSError:
+            mode = default_file_mode()
         with os.fdopen(fd, "w") as handle:
+            os.fchmod(handle.fileno(), mode)
             json.dump(manifest, handle)
         os.replace(temp_name, manifest_path)
     except OSError as exc:

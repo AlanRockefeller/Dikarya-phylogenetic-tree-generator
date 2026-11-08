@@ -560,6 +560,21 @@ class TestMycomapBlastMetrics(unittest.TestCase):
 
         self.assertEqual(improved, "KM248898 Hygrocybe minutula")
 
+        # A herbarium barcode is accession-shaped too (NY + 8 digits); the
+        # accession the curator put last must still win.
+        with_barcode = "Hygrocybe cf minutula NY00123456 KM248898"
+        self.assertEqual(
+            improve_mycomap_sequence_name(with_barcode, metric, "local"),
+            "KM248898 Hygrocybe minutula",
+        )
+        # A known voucher is never taken for the accession, wherever it sits.
+        voucher_last = "Hygrocybe cf minutula KM248898 NY00123456"
+        self.assertEqual(
+            improve_mycomap_sequence_name(voucher_last, metric, "local",
+                                          voucher="NY00123456"),
+            "KM248898 Hygrocybe minutula",
+        )
+
 
 class TestMycomapBlastCreation(unittest.TestCase):
     def test_find_blast_by_exact_title(self):

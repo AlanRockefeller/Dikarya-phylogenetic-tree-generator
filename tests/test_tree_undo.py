@@ -664,8 +664,12 @@ class CheckpointInvalidationTests(_RouteHarness):
             self.assertEqual(payload["undone"]["operation"], "annotation")
             restored = load_tree_state(job_dir)
             self.assertFalse(restored.get("clade_annotations"))
-            # The prune is still in place: one level only.
-            self.assertNotIn("A", json.dumps(restored.get("tree") or {}))
+            # The prune is still in place: one level only. (The topology is under
+            # tree_structure; the old check read a "tree" key that never exists.)
+            from app.services.tree_edit_service import _tree_tip_set
+            self.assertIn("A", restored.get("pruned_taxa") or [])
+            self.assertNotIn("A", _tree_tip_set(restored))
+            self.assertIn("B", _tree_tip_set(restored))
 
     def test_an_unknown_undo_kind_gets_the_generic_label(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -705,6 +709,31 @@ class CheckpointInvalidationTests(_RouteHarness):
             self.assertNotIn(layer.get("default_highlight_color"),
                              {"#111111", "#222222", "#333333"})
             self.assertEqual(len(load_tree_state(job_dir)["clade_annotations"]), 1)
+
+    def test_extending_a_checkpoint_keeps_the_manifest_mode(self):
+        # mkstemp creates 0600; a coalesced save must not narrow a group-shared
+        # manifest (AGENTS.md: "Writing to var/jobs").
+        from app.services.tree_undo_service import MANIFEST_NAME
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            job_dir = _make_job(root)
+            layers = [{"id": "layer-1", "name": "Sections", "order": 1,
+                       "default_highlight_color": "#111111"}]
+            from app.api import routes
+            body = {"layers": layers, "annotations": [self._GROUP], "undo_kind": "layer_style"}
+            self._call(root, routes.save_clade_annotations, body=body)
+            manifest = job_dir / UNDO_DIR_NAME / MANIFEST_NAME
+            os.chmod(manifest, 0o664)
+
+            layers[0]["default_highlight_color"] = "#222222"
+            first = json.loads(manifest.read_text())
+            status, _ = self._call(root, routes.save_clade_annotations, body=body)
+            self.assertEqual(status, 200)
+            extended = json.loads(manifest.read_text())
+            # Coalesced: same checkpoint, later timestamp.
+            self.assertEqual(extended["created_at"], first["created_at"])
+            self.assertGreater(extended["updated_at"], first["updated_at"])
+            self.assertEqual(manifest.stat().st_mode & 0o777, 0o664)
 
     def test_discrete_annotation_saves_do_not_coalesce(self):
         with tempfile.TemporaryDirectory() as tmp:

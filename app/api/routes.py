@@ -74,14 +74,25 @@ def check_fasta_input():
     source = "browser_upload" if data.get("source") == "upload" else "browser_paste"
     filename = data.get("filename") if isinstance(data.get("filename"), str) else None
     analysis = analyze_dna_fasta(text)
-    diagnostic = None
-    if not analysis["valid"]:
-        diagnostic = record_fasta_rejection(text, analysis, source=source, filename=filename)
     accessions, invalid = _parse_genbank_accession_tokens(text)
+    is_accession_list = bool(accessions) and not invalid
+    diagnostic = None
+    # An accession list is valid input here (the dialog offers to fetch it),
+    # not a rejected FASTA, so it gets no WARNING and no archive.
+    if not analysis["valid"] and not is_accession_list:
+        diagnostic = record_fasta_rejection(text, analysis, source=source, filename=filename)
+    # analyze_dna_fasta stops before its per-character scan on oversized input;
+    # the repair proposal's line scans would not, so skip it there too.
+    oversized = any(issue.get("code") in _FASTA_SIZE_ISSUE_CODES
+                    for issue in analysis["issues"])
     return jsonify({**analysis, "diagnostic_id": diagnostic,
-                    "input_kind": "accessions" if accessions and not invalid else "fasta",
+                    "input_kind": "accessions" if is_accession_list else "fasta",
                     "accession_count": len(accessions) if not invalid else 0,
-                    "repair": propose_fasta_repair(text)})
+                    "repair": None if oversized else propose_fasta_repair(text)})
+
+
+# The issue codes analyze_dna_fasta() reports for check_fasta_size_limits().
+_FASTA_SIZE_ISSUE_CODES = frozenset({"too_many_records", "sequence_too_long", "too_many_bases"})
 
 
 def _server_error(exc, *, where=""):

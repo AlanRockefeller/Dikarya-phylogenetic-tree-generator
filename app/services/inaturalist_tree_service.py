@@ -1666,6 +1666,19 @@ def _refresh_mycomap_blast_results(blast_id: str, *, rebuild_ncbi_blast: bool = 
                     progress,
                     "MycoMap.org accepted the local BLAST refresh; it is still running.",
                 )
+            elif outcome == "failed":
+                _report_progress(
+                    progress,
+                    "MycoMap local BLAST could not be refreshed; Dikarya will use "
+                    "the saved MycoMap results instead.",
+                    icon="failed",
+                )
+            else:  # "error": the check itself failed; the deferred wait retries it.
+                _report_progress(
+                    progress,
+                    "MycoMap.org could not be checked yet; Dikarya will check the "
+                    "local BLAST refresh again shortly.",
+                )
     return result
 
 

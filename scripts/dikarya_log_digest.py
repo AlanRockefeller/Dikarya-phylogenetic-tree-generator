@@ -441,7 +441,7 @@ SSE_CLOSED_RE = re.compile(
     r'event=sse\.closed.*?reason=(?P<reason>\w+)\s+duration_seconds=(?P<seconds>[\d.]+)'
 )
 # Alan 11/8/26 - Registrations are INFO, so no section ever showed them, and a
-# signup bot's account (#88, a "dotted" Gmail address) went unnoticed for days.
+# signup bot's account (a "dotted" Gmail address) went unnoticed for days.
 # Collected before the WARNING+ filter, like sse.closed.
 REGISTERED_RE = re.compile(
     r'event=auth\.registered\s+account_id=(?P<account>\d+)\s+email=(?P<email>\S+)'
@@ -456,7 +456,7 @@ HTTP_FAILED_RE = re.compile(r'event=http\.request_failed\b.*?\bstatus=(?P<status
 def signup_hint(email):
     """A note for a registration whose address looks machine-made, or ''."""
     local, _, domain = str(email or "").lower().rpartition("@")
-    # Gmail ignores dots, so "y.e.mireri.d.e.0.1" lands in one inbox under any
+    # Gmail ignores dots, so "j.o.h.n.d.o.e.4.2" lands in one inbox under any
     # number of spellings; three or more dots is rare for a person.
     if domain in ("gmail.com", "googlemail.com") and local.count(".") >= 3:
         return "dotted Gmail address, a common signup-bot pattern"

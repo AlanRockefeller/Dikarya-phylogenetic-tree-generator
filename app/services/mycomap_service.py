@@ -2261,13 +2261,15 @@ def parse_mycomap_result_reference(url: str) -> Optional[dict]:
     return None
 
 
-def fetch_mycomap_result_title(url: str) -> str:
+def fetch_mycomap_result_title(url: str, timeout: Optional[float] = None) -> str:
     """Return a public MycoMap result page's HTML title, best effort.
 
     This is intentionally a small head read. The iNaturalist tree importer
     uses it only when an observation field contains more than one MycoMap
     result link and the URL itself does not say which locus was searched.
-    Unsupported hosts are rejected before any request is made.
+    Unsupported hosts are rejected before any request is made. ``timeout``
+    (default REQUEST_TIMEOUT) lets a caller inside a request budget pass what
+    is left of it.
     """
     if not parse_mycomap_result_reference(url):
         return ""
@@ -2281,7 +2283,9 @@ def fetch_mycomap_result_title(url: str) -> str:
         method="GET",
     )
     try:
-        with diagnostic_urlopen(request, timeout=REQUEST_TIMEOUT) as response:
+        with diagnostic_urlopen(
+            request, timeout=REQUEST_TIMEOUT if timeout is None else timeout,
+        ) as response:
             # MycoMap puts <title> in the first few KB; leave ample room for
             # harmless head markup without downloading the much larger result
             # tables.
@@ -3688,15 +3692,27 @@ def _build_result_display_info(description: str, identifier: str = '',
     return result
 
 
-def _header_accession_token(tokens: list) -> str:
-    """Return the first GenBank-accession-shaped token in a local hit header."""
+def _header_accession_token(tokens: list, voucher: str = '') -> str:
+    """Return the accession-shaped token a local hit header names, or ''.
+
+    Shape alone cannot tell an accession from a herbarium barcode: NYBG's
+    "NY00123456" is a valid 2+8 accession shape. Curator headers put the
+    accession last ("Hygrocybe cf minutula QC (type NY) KM248898"), so the
+    LAST matching token wins, and any token of a known voucher is skipped.
+    """
     from app.services.fasta_utils import is_genbank_accession
 
+    voucher_tokens = {
+        part.strip('>,;()[]{}').casefold() for part in str(voucher or '').split()
+    }
+    found = ''
     for token in tokens:
         candidate = token.strip('>,;()[]{}')
+        if candidate.casefold() in voucher_tokens:
+            continue
         if re.search(r'\d', candidate) and is_genbank_accession(candidate):
-            return candidate
-    return ''
+            found = candidate
+    return found
 
 
 def improve_mycomap_sequence_name(current_name: str, metric: Optional[dict],
@@ -3734,7 +3750,7 @@ def improve_mycomap_sequence_name(current_name: str, metric: Optional[dict],
             # A curator-written header such as "Hygrocybe cf minutula QC (type
             # NY) KM248898" leads with the genus and puts the accession last;
             # taking the first word produced "Hygrocybe Hygrocybe minutula".
-            accession_token = _header_accession_token(identifier[1:])
+            accession_token = _header_accession_token(identifier[1:], voucher)
             if accession_token:
                 label_identifier = accession_token
         location = metric.get('mycomap_location') or ''
