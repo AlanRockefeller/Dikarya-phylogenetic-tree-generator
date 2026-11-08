@@ -21,13 +21,17 @@ def _isolate_ncbi_pacing():
     run_id = uuid.uuid4().hex
     original = ncbi_pacing.KEY_PREFIX
     auth_prefix = mycomap_org_service.SEARCH_AUTH_KEY_PREFIX
+    curation_pause_key = mycomap_org_service.CURATION_PAUSE_KEY
     ncbi_pacing.KEY_PREFIX = f"dikarya:test:ncbi:{run_id}:"
     mycomap_org_service.SEARCH_AUTH_KEY_PREFIX = f"dikarya:test:mycomap-org:submit-auth:{run_id}:"
+    # A mocked 429 must never pause the live site's curation lookups.
+    mycomap_org_service.CURATION_PAUSE_KEY = f"dikarya:test:mycomap-org:curation-paused:{run_id}"
     try:
         yield
     finally:
         ncbi_pacing.KEY_PREFIX = original
         mycomap_org_service.SEARCH_AUTH_KEY_PREFIX = auth_prefix
+        mycomap_org_service.CURATION_PAUSE_KEY = curation_pause_key
 
 
 @pytest.fixture(autouse=True, scope="session")
@@ -101,3 +105,21 @@ def _isolate_type_specimen_cache(tmp_path_factory):
     finally:
         type_specimen_service.DATA_DIR = original
         type_specimen_service.BUNDLED_MYCOMAP_PATH = bundled_original
+
+
+@pytest.fixture(autouse=True, scope="session")
+def _no_mycomap_curation_from_genbank_fetches():
+    """Keep every GenBank fetch in the suite off mycomap.org.
+
+    fetch_fasta_for_accessions() asks MycoMap.org for curated names; tests mock
+    NCBI and would otherwise make that call for real. A test of the override
+    monkeypatches blast_service._mycomap_curated_names itself.
+    """
+    from app.services import blast_service
+
+    original = blast_service._mycomap_curated_names
+    blast_service._mycomap_curated_names = lambda accessions: {}
+    try:
+        yield
+    finally:
+        blast_service._mycomap_curated_names = original

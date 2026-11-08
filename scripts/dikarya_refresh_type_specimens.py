@@ -2,7 +2,7 @@
 """
 Refresh the type-specimen reference data the tree viewer marks tips from.
 
-Two independent passes (see app/services/type_specimen_service.py):
+Three independent passes (see app/services/type_specimen_service.py):
 
   mycomap   Download MycoMap's full type-specimen list
             (https://mycomap.org/api/type-specimens, public, no key needed) and
@@ -15,6 +15,13 @@ Two independent passes (see app/services/type_specimen_service.py):
             New fetches record themselves as they happen, so this only matters
             for jobs that predate the feature (or with --since-days, for the
             last week's jobs whose BLAST headers came from MycoMap).
+  curation  Ask MycoMap.org's genbank-curation endpoint about every GenBank
+            accession in job inputs and record its isType flag. Curators
+            designate types there (typeBasis "manual") that never reach the
+            type-specimen list; only tss.TRUSTED_CURATION_BASES are recorded
+            ("source" is a keyword match). The flag can change at any time, so
+            accessions are re-asked every run rather than skipped once known.
+            Bounded by --max-curation-accessions (100 per request).
 
 Output lives in Config.TYPE_SPECIMEN_DIR (cache/type_specimens, group dikarya,
 2775), which the web process reads and the worker appends to.
@@ -94,9 +101,10 @@ def event(name, **fields):
 
 
 def marked_accessions():
-    """Accessions the viewer currently marks as types, from either source."""
+    """Accessions the viewer currently marks as types, from any source."""
     genbank = {acc for acc, entry in tss.genbank_index().items() if entry.get("status")}
-    return genbank | set(tss.mycomap_index())
+    curation = {acc for acc, entry in tss.curation_index().items() if tss.curation_marks(entry)}
+    return genbank | set(tss.mycomap_index()) | curation
 
 
 # --------------------------------------------------------------------------
@@ -325,20 +333,129 @@ def run_genbank(args):
               previously_marked="no")
 
 
+# --------------------------------------------------------------------------
+# curation pass
+# --------------------------------------------------------------------------
+
+def job_accessions(since_days):
+    """Every GenBank accession in job inputs (changed within since_days, 0 = all)."""
+    from app.services.sequence_dedup_service import record_accession
+
+    cutoff = time.time() - since_days * 86400 if since_days else None
+    accessions = set()
+    jobs = 0
+    for input_dir in Config.JOB_DIR.glob("*/input"):
+        try:
+            if cutoff and (input_dir / "input_raw.fasta").stat().st_mtime < cutoff:
+                continue
+            headers = list(tss.job_headers(input_dir.parent))
+        except OSError:
+            continue
+        jobs += 1
+        for header in headers:
+            acc = tss.accession_root(record_accession(header, {}))
+            if acc:
+                accessions.add(acc)
+    return accessions, jobs
+
+
+def run_curation(args):
+    from app.services.mycomap_org_service import CURATION_BATCH_SIZE, curated_genbank_rows
+
+    candidates, jobs = job_accessions(args.since_days)
+    todo = sorted(candidates)
+    deferred = 0
+    log(f"curation: {jobs} jobs scanned, {len(todo)} accessions to ask MycoMap.org about")
+    if args.max_curation_accessions and len(todo) > args.max_curation_accessions:
+        log(f"curation: limiting this run to {args.max_curation_accessions}; "
+            "the rest are picked up next time")
+        deferred = len(todo) - args.max_curation_accessions
+        todo = todo[:args.max_curation_accessions]
+    if args.dry_run or not todo:
+        event("curation_summary", jobs=jobs, candidates=len(candidates), checked=0,
+              added=0, removed=0, unanswered=0, deferred=deferred)
+        return
+
+    before = {acc: entry for acc, entry in tss.curation_index().items() if tss.curation_marks(entry)}
+    other_marked = ({acc for acc, entry in tss.genbank_index().items() if entry.get("status")}
+                    | set(tss.mycomap_index()))
+    # MycoMap.org rate-limits genbank-curation per client, and the live site's
+    # name lookups share that allowance, so this pass is paced well below it
+    # and waits out a 429's Retry-After rather than writing the batch off.
+    budget_ends = time.monotonic() + args.curation_max_minutes * 60
+    answered = unanswered = 0
+    starts = list(range(0, len(todo), CURATION_BATCH_SIZE))
+    for number, start in enumerate(starts):
+        batch = todo[start:start + CURATION_BATCH_SIZE]
+        while True:
+            try:
+                # Records every answer into the curation cache as a side effect.
+                answered += len(curated_genbank_rows(batch, strict=True))
+                break
+            except Exception as exc:
+                wait = (getattr(exc, "retry_after", None) or 0) + 5
+                if wait > 5 and time.monotonic() + wait < budget_ends:
+                    log(f"curation: MycoMap.org asked for a {wait - 5}s wait; waiting")
+                    time.sleep(wait)
+                    continue
+                unanswered += len(batch)
+                log(f"curation: batch starting {batch[0]} was not answered ({exc}); retried next run")
+                break
+        done = min(start + CURATION_BATCH_SIZE, len(todo))
+        if done % 2000 < CURATION_BATCH_SIZE or done == len(todo):
+            log(f"curation: {done}/{len(todo)} asked")
+        if number + 1 < len(starts):
+            if time.monotonic() + args.curation_interval >= budget_ends:
+                left = len(todo) - done
+                unanswered += left
+                log(f"curation: --curation-max-minutes reached; {left} accessions left for next run")
+                break
+            time.sleep(args.curation_interval)
+    after = {acc: entry for acc, entry in tss.curation_index().items() if tss.curation_marks(entry)}
+    added = sorted(set(after) - set(before))
+    removed = sorted(set(before) - set(after))
+    log(f"curation: done, {answered} answered, {len(added)} designations added, "
+        f"{len(removed)} cleared, {unanswered} unanswered")
+    event("curation_summary", jobs=jobs, candidates=len(candidates), checked=len(todo),
+          added=len(added), removed=len(removed), unanswered=unanswered, deferred=deferred)
+    for acc in added:
+        entry = after[acc]
+        event("added", source="mycomap_curation", accession=acc, status=entry.get("status"),
+              organism=entry.get("organism"), basis=entry.get("type_basis"),
+              previously_marked="yes" if acc in other_marked else "no")
+    for acc in removed:
+        entry = before[acc]
+        event("removed", source="mycomap_curation", accession=acc, status=entry.get("status"),
+              organism=entry.get("organism"),
+              still_marked="yes" if acc in other_marked else "no")
+
+
+PASSES = {"mycomap": run_mycomap, "genbank": run_genbank, "curation": run_curation}
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--passes", default="mycomap,genbank",
-                        help="comma-separated passes to run (default: mycomap,genbank)")
+    parser.add_argument("--passes", default="mycomap,genbank,curation",
+                        help="comma-separated passes to run (default: mycomap,genbank,curation)")
     parser.add_argument("--dry-run", action="store_true", help="report what would change; write nothing")
     parser.add_argument("--force", action="store_true", help="accept a MycoMap snapshot that shrank by >10%%")
     parser.add_argument("--since-days", type=float, default=0,
-                        help="genbank pass: only scan jobs whose input changed in this many days (0 = all)")
+                        help="genbank and curation passes: only scan jobs whose input changed "
+                             "in this many days (0 = all)")
     parser.add_argument("--max-accessions", type=int, default=5000,
                         help="genbank pass: most accessions to fetch from NCBI in one run (0 = no limit)")
+    parser.add_argument("--max-curation-accessions", type=int, default=25000,
+                        help="curation pass: most accessions to ask MycoMap.org about in one run "
+                             "(0 = no limit; all jobs hold ~212,000)")
+    parser.add_argument("--curation-interval", type=float, default=30,
+                        help="curation pass: seconds between requests (default 30, leaving "
+                             "MycoMap.org's per-client allowance for the live site's lookups)")
+    parser.add_argument("--curation-max-minutes", type=float, default=150,
+                        help="curation pass: stop after this long; the rest are asked next run")
     args = parser.parse_args()
 
     passes = [name.strip() for name in args.passes.split(",") if name.strip()]
-    unknown = set(passes) - {"mycomap", "genbank"}
+    unknown = set(passes) - set(PASSES)
     if unknown:
         parser.error(f"unknown pass(es): {', '.join(sorted(unknown))}")
 
@@ -357,7 +474,7 @@ def main():
     failed = False
     for name in passes:
         try:
-            (run_mycomap if name == "mycomap" else run_genbank)(args)
+            PASSES[name](args)
         except Exception as exc:
             failed = True
             log(f"{name}: FAILED: {exc}")

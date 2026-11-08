@@ -11056,11 +11056,16 @@
     });
     const resolvedJobId = jobId === undefined ? window.JOB_ID : jobId;
     if (!record || !resolvedJobId) return null;
+    // Alan 11/8/26 - Send the saved tip name, not the normalized one. Normalization
+    // is for matching provenance; the resolver identifies the actual saved tip, so
+    // preserve its direction marker and internal spaces.
+    const tipName = String(node?.data?.__original_name || node?.data?.original_name ||
+      node?.data?.name || node?.name || "").trim();
     return {
       kind: "mycomap-sequence",
       label: "Open sequence in MycoMap",
       urls: {
-        primary: `/api/job/${encodeURIComponent(String(resolvedJobId))}/tree/mycomap-sequence?tip_name=${encodeURIComponent(normalized)}`
+        primary: `/api/job/${encodeURIComponent(String(resolvedJobId))}/tree/mycomap-sequence?tip_name=${encodeURIComponent(tipName)}`
       }
     };
   }

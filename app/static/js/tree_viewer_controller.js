@@ -3172,6 +3172,26 @@ document.addEventListener('DOMContentLoaded', async () => {
                     // toast when the banner is missing, otherwise the same rooting sentence
                     // renders twice on screen.
                     if (!setRootingNotice(label)) showStatus(label, "info", 0);
+                // Alan 11/4/26 - A recompute after pruning the root tip falls back to midpoint
+                // rooting on the server; say so instead of silently changing the root.
+                } else if (!opts.fromAction && loadedMode === 'midpoint' && loadedInfo.chosen_by === 'recompute_root_tip_pruned') {
+                    // Alan 11/8/26 - Show it once per recompute in this browser, not on every visit
+                    // (shared links included) for as long as the midpoint root stands, and use the
+                    // server's wording, which does not assume the viewer is the one who pruned.
+                    const noticeKey = `dikarya_root_tip_notice_${JOB_ID}`;
+                    const occurrence = String(loadedInfo.applied_at || loadedInfo.previous_root_target || '1');
+                    let alreadyShown = false;
+                    try { alreadyShown = localStorage.getItem(noticeKey) === occurrence; } catch (e) {}
+                    if (!alreadyShown) {
+                        try { localStorage.setItem(noticeKey, occurrence); } catch (e) {}
+                        const removedRoot = loadedInfo.previous_root_target || 'the root sequence';
+                        const serverMessage = Array.isArray(loadedInfo.warnings) ? loadedInfo.warnings[0] : '';
+                        showStatus(
+                            `${serverMessage || `This tree was rooted on ${removedRoot}, which was removed, so the recomputed tree is midpoint rooted.`} Pick another root from the Root menu if you need one.`,
+                            "warning",
+                            12000
+                        );
+                    }
                 }
                 // Alan 9/23/26 - The outgroup chip is permanent page chrome now, so drop it once the
                 // persisted rooting no longer names an auto-chosen outgroup (midpoint, manual, an

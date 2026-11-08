@@ -561,5 +561,53 @@ class TestLegacyInternalRootTranslation(unittest.TestCase):
         )
 
 
+@unittest.skipUnless(HAS_BIOPYTHON, "requires BioPython")
+class TestRecomputeRootTargets(unittest.TestCase):
+    def test_numeric_internal_root_survives_recompute(self):
+        for support, target in (("95", "95"), ("95", "95.000"), ("1.000", "1.000")):
+            with self.subTest(target=target), tempfile.TemporaryDirectory() as d:
+                job_dir = Path(d)
+                _write_pruned_tree(
+                    job_dir, f"(((A:1,B:2){support}:1,C:1):1,(D:1,E:1):1);"
+                )
+                state = _reapply_rooting_after_recompute(job_dir, {}, "tip", target)
+                tree = Phylo.read(str(job_dir / "tree/tree_pruned.newick"), "newick")
+
+                self.assertEqual(state["root_mode"], "manual")
+                self.assertEqual(state["root_target"], target)
+                self.assertFalse(state["is_midpoint_rooted"])
+                self.assertEqual(set(state["root_split"]["inside"]), {"A", "B"})
+                sides = {frozenset(t.name for t in clade.get_terminals())
+                         for clade in tree.root.clades}
+                self.assertEqual(sides, {frozenset({"A"}), frozenset({"B"}),
+                                         frozenset({"C", "D", "E"})})
+                self.assertNotIn("previous_root_target", state["rooting_info"])
+
+    def test_existing_numeric_tip_remains_a_tip_root(self):
+        with tempfile.TemporaryDirectory() as d:
+            job_dir = Path(d)
+            _write_pruned_tree(job_dir, "((95:1,B:2):1,(C:1,D:1):1);")
+            state = _reapply_rooting_after_recompute(job_dir, {}, "manual", "95")
+            tree = Phylo.read(str(job_dir / "tree/tree_pruned.newick"), "newick")
+
+            self.assertEqual(state["root_mode"], "manual")
+            self.assertEqual(state["root_target"], "95")
+            self.assertTrue(any(clade.is_terminal() and clade.name == "95"
+                                for clade in tree.root.clades))
+
+    def test_removed_tip_still_falls_back_to_midpoint(self):
+        for target in ("removed_tip", "95"):
+            with self.subTest(target=target), tempfile.TemporaryDirectory() as d:
+                job_dir = Path(d)
+                _write_pruned_tree(job_dir, "((A:1,B:2):1,(C:1,D:1):1);")
+                state = _reapply_rooting_after_recompute(
+                    job_dir, {"pruned_taxa": [target]}, "tip", target)
+
+                self.assertTrue(state["is_midpoint_rooted"])
+                self.assertIsNone(state["root_target"])
+                self.assertEqual(state["rooting_info"]["reason"], "root_tip_pruned")
+                self.assertEqual(state["rooting_info"]["previous_root_target"], target)
+
+
 if __name__ == "__main__":
     unittest.main()

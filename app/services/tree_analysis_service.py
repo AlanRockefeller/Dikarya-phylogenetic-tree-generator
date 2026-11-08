@@ -1950,6 +1950,7 @@ _RUN_OUTCOME_KEYS = frozenset({
     "convergence_warnings",
     "mcmc_generations_completed",
     "mcmc_stopped_at_stopval",
+    "mrbayes_early_stop_continuation",
     "identical_sequences",
 })
 

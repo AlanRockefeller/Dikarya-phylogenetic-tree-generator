@@ -61,10 +61,38 @@ def _remember_search_refusal():
 
 
 class OrgResultError(Exception):
-    def __init__(self, message, status=502, retryable=True):
+    def __init__(self, message, status=502, retryable=True, retry_after=None):
         super().__init__(message)
         self.status = status
         self.retryable = retryable
+        # Seconds from a 429's Retry-After, when MycoMap.org sent one.
+        self.retry_after = retry_after
+
+
+# MycoMap.org limits genbank-curation per client ("Too many GenBank lookups in
+# a short time", 429 with Retry-After; ~30 requests per 10 minutes from this
+# host on 2026-11-08). Every GenBank fetch asks it for curated names, so once
+# refused, all processes stop asking until the wait is over instead of each
+# one collecting its own 429.
+CURATION_PAUSE_KEY = "dikarya:mycomap-org:genbank-curation-paused"
+
+
+def curation_paused_for():
+    """Seconds left before genbank-curation may be asked again, or 0."""
+    try:
+        from app.services.ncbi_pacing import connection
+        remaining = connection().ttl(CURATION_PAUSE_KEY)
+        return remaining if remaining and remaining > 0 else 0
+    except Exception:
+        return 0
+
+
+def _pause_curation(seconds):
+    try:
+        from app.services.ncbi_pacing import connection
+        connection().set(CURATION_PAUSE_KEY, "rate_limited", ex=max(1, min(int(seconds), 3600)))
+    except Exception:
+        logger.warning("event=mycomap_org.curation_pause_store_failed")
 
 
 def deferral_details(exc):
@@ -141,8 +169,11 @@ def _read(path, *, limit=MAX_JSON_BYTES, method="GET", body=None,
             raise OrgResultError(
                 ("MycoMap.org's search limit was reached; please try again shortly."
                  if path == "submit" else
+                 "MycoMap.org's GenBank lookup limit was reached."
+                 if path == "genbank-curation" else
                  "MycoMap.org's rerun limit was reached; Dikarya will try again shortly."),
                 502,
+                retry_after=int(retry_after.strip()) if retry_after.strip().isdigit() else None,
             ) from exc
         if exc.code in (401, 403):
             if authenticated:
@@ -634,30 +665,64 @@ _DEFLINE_QUALIFIER = re.compile(
     r"culture-collection|cultivar|genotype|from)\s", re.I)
 
 
-def _curated_genbank_names(accessions, *, deadline=None):
-    """MycoMap's curated name for each GenBank accession, keyed by accession.
+def curated_genbank_rows(accessions, *, deadline=None, strict=False):
+    """MycoMap.org's curation row for each GenBank accession, keyed by bare accession.
 
     POST mycoblast/genbank-curation is public and is what MycoMap.org's own
     BLAST page labels NCBI hits with: curators rename GenBank records there
-    (OM691497 "Geoglossum sp. SA-2022a" -> "Geoglossum laurisilvae") without
-    GenBank changing. Best effort -- on failure the GenBank names stand.
+    (OM691497 "Geoglossum sp. SA-2022a" -> "Geoglossum laurisilvae";
+    OP739129 "Podaxis pistillaris" -> "Podaxis inyoensis") without GenBank
+    changing. Each row is ``{scientificName, location, isType, typeBasis}``;
+    every answer is also handed to the type-specimen cache, so a type a curator
+    designated on MycoMap.org is marked in the viewer.
+
+    Best effort: on failure the remaining batches are skipped and the caller
+    keeps the GenBank names, unless ``strict`` (the refresh backfill), which
+    raises the batch's error instead. While MycoMap.org's rate-limit wait is
+    running (``curation_paused_for()``) nothing is asked at all.
     """
-    names = {}
-    unique = list(dict.fromkeys(a for a in accessions if a))
+    rows = {}
+    unique = list(dict.fromkeys(str(a).strip() for a in accessions if a and str(a).strip()))
+    paused = curation_paused_for() if unique else 0
+    if paused:
+        if strict:
+            raise OrgResultError("MycoMap.org's GenBank lookup limit was reached.",
+                                 502, retry_after=paused)
+        logger.info("event=mycomap_org.genbank_curation_paused retry_after=%s count=%s",
+                    paused, len(unique))
+        return rows
     for offset in range(0, len(unique), CURATION_BATCH_SIZE):
         batch = unique[offset:offset + CURATION_BATCH_SIZE]
         try:
             payload = json.loads(_read("genbank-curation", method="POST",
                                        body={"accessions": batch}, deadline=deadline))
-        except (OrgResultError, ValueError, UnicodeDecodeError):
+        except (OrgResultError, ValueError, UnicodeDecodeError) as exc:
+            retry_after = getattr(exc, "retry_after", None)
+            if retry_after:
+                _pause_curation(retry_after)
+            if strict:
+                raise
+            # _read already logged a rate limit; a trace adds nothing to it.
             logger.warning("event=mycomap_org.genbank_curation_unavailable count=%s",
-                           len(batch), exc_info=True)
+                           len(batch), exc_info=not retry_after)
             break
         results = payload.get("results") if isinstance(payload, dict) else None
-        for key, row in (results or {}).items():
-            name = str((row or {}).get("scientificName") or "").strip() if isinstance(row, dict) else ""
-            if name:
-                names[str(key).upper().split(".")[0]] = name
+        for key, row in (results or {}).items() if isinstance(results, dict) else ():
+            if isinstance(row, dict):
+                rows[str(key).upper().split(".")[0]] = row
+    if rows:
+        from app.services.type_specimen_service import remember_mycomap_curation
+        remember_mycomap_curation(rows)
+    return rows
+
+
+def _curated_genbank_names(accessions, *, deadline=None):
+    """MycoMap's curated name for each GenBank accession, keyed by bare accession."""
+    names = {}
+    for accession, row in curated_genbank_rows(accessions, deadline=deadline).items():
+        name = " ".join(str(row.get("scientificName") or "").split())
+        if name:
+            names[accession] = name
     return names
 
 

@@ -31,6 +31,7 @@ from app.services.fasta_utils import (
 from app.services.tree_parameter_validation import (
     normalize_inherited_iqtree_ufboot_count,
     quick_tree_length_error,
+    submitted_tree_count_error,
     validate_iqtree_ufboot_count,
 )
 from app.services.artifact_storage import (
@@ -1693,8 +1694,16 @@ def _run_blast_request(data):
         # NCBI is slow, not broken: answer in JSON before nginx gives up at
         # 300s, so the Tree Builder shows this instead of failing to parse
         # nginx's HTML 504 page.
-        logger.warning("BLAST request timed out: %s", e)
         can_resume = bool(getattr(g, "blast_can_resume", False))
+        if can_resume and request.headers.get("X-Dikarya-BLAST-Pending") == "1":
+            message = (
+                "NCBI is still working on this search. Your search is saved; "
+                "click Continue NCBI BLAST to check for results."
+            )
+            logger.info("event=blast.pending rid=%s", getattr(g, "blast_rid", "-"))
+            return jsonify({"status": "pending", "can_resume": True,
+                            "message": message, "retry_after": 15}), 202
+        logger.warning("BLAST request timed out: %s", e)
         return jsonify({
             "status": "error",
             "can_resume": can_resume,
@@ -3346,13 +3355,14 @@ def create_job():
     )
     # Validate and archive the ORIGINAL submission before deduplication can
     # discard an empty record or move an error away from its submitted line.
+    submitted_count = None
     if job_params.get("sequence"):
         from app.services.fasta_utils import FastaValidationError
         from app.services.fasta_input_service import validate_submitted_fasta
         if not isinstance(job_params["sequence"], str):
             return jsonify({"status": "error", "error": "sequence must be FASTA text."}), 400
         try:
-            validate_submitted_fasta(job_params["sequence"], source="job_submission")
+            submitted_count = validate_submitted_fasta(job_params["sequence"], source="job_submission")
         except FastaValidationError as exc:
             note_request_failure("invalid_dna_fasta")
             return jsonify({"status": "error", "error": str(exc),
@@ -3393,6 +3403,10 @@ def create_job():
     # owns before persisting, then enqueue with that preparation disabled. This
     # preserves the observable params while ensuring RQ cannot run first.
     prepare_phylo_job_params(job_params)
+    count_error = submitted_tree_count_error(job_params, submitted_count)
+    if count_error:
+        note_request_failure("too_few_sequences")
+        return jsonify({"status": "error", "error": count_error}), 400
     job_id = generate_job_id()
     g.job_id = job_id
     job_record = Job(
@@ -4520,6 +4534,13 @@ def get_job_pipeline_params(job_id):
             and "mcmc_stop_early" not in stored):
         params["mcmc_stop_early"] = False
 
+    if str(stored.get("tree_method", "")).lower() == "raxml":
+        from app.services.raxml_validator import stored_bootstrap_cutoff
+
+        params["bootstrap_cutoff"] = stored_bootstrap_cutoff(
+            stored, Config.JOB_DIR / job_id
+        )
+
     # The requested model is often not the one that was fit -- IQ-TREE's "MFP"
     # defers to ModelFinder, and RAxML with MOOSE enabled substitutes its own
     # pick. Report the fitted model, and who chose it, rather than leaving the
@@ -4891,17 +4912,36 @@ def _mrbayes_name_map_text(job_dir):
                 "taxa but the run declares %d", job_dir.name, len(rows), declared,
             )
 
-    return format_name_map(reconstructed) if reconstructed else None
+    if not reconstructed:
+        return None
+    text = format_name_map(reconstructed)
+    if declared is not None and len(reconstructed) != declared:
+        # Still the best key there is, and the labels must not leave without
+        # one -- but say plainly that it does not match the run.
+        logger.warning(
+            "Serving an unverified MrBayes name map for %s: %d records against "
+            "%d declared taxa", job_dir.name, len(reconstructed), declared,
+        )
+        text = (
+            "# WARNING: this key could not be verified. The MrBayes run declares "
+            f"{declared} taxa, but the alignment it was rebuilt from has "
+            f"{len(reconstructed)} records, so ids after the first difference "
+            "may name the wrong sequence.\n" + text
+        )
+    return text
 
 
 def _reconstructed_mrbayes_name_map(job_dir, declared):
     """Rebuild the key from the alignment this generation of the run consumed.
 
     Returns ``(mapping, confirmed)``. `confirmed` means the alignment holds
-    exactly the number of taxa the run declares, which is what licenses using
-    it to overrule a stored map.
+    exactly the number of taxa the run declares after excluding the identical
+    sequences that its metadata says were left out of the search. Only this
+    generation's alignments can overrule a stored map.
     """
-    from app.services.artifact_storage import artifact_exists
+    import json
+
+    from app.services.artifact_storage import artifact_exists, open_artifact
     from app.services.fasta_utils import reconstruct_name_map
 
     # A recompute rebuilds the tree from its own realigned, pruned alignment,
@@ -4920,17 +4960,37 @@ def _reconstructed_mrbayes_name_map(job_dir, declared):
             job_dir / "alignment" / "alignment_pruned_trimmed.fasta",
             job_dir / "alignment" / "alignment_pruned_aligned.fasta",
         ]
-    candidates += [
-        job_dir / "alignment" / "alignment_trimmed.fasta",
-        job_dir / "alignment" / "alignment_raw.fasta",
-    ]
+    else:
+        candidates += [
+            job_dir / "alignment" / "alignment_trimmed.fasta",
+            job_dir / "alignment" / "alignment_raw.fasta",
+        ]
+
+    metadata_path = tree_dir / (
+        "tree_pruned_metadata.json" if recomputed else "tree_metadata.json"
+    )
+    excluded_headers = set()
+    if artifact_exists(metadata_path):
+        try:
+            with open_artifact(metadata_path, "rt") as handle:
+                metadata = json.load(handle)
+            collapse = metadata.get("identical_sequences") if isinstance(metadata, dict) else None
+            if isinstance(collapse, dict):
+                excluded_headers = {
+                    name for group in collapse.get("groups") or []
+                    if isinstance(group, dict)
+                    for name in group.get("removed") or []
+                    if isinstance(name, str)
+                }
+        except (OSError, ValueError):
+            logger.warning("Could not read MrBayes collapse metadata from %s", metadata_path)
 
     fallback = None
     for path in candidates:
         if not artifact_exists(path):
             continue
         try:
-            mapping = reconstruct_name_map(path)
+            mapping = reconstruct_name_map(path, excluded_headers=excluded_headers)
         except Exception:
             logger.warning("Could not reconstruct a MrBayes name map from %s", path)
             continue
@@ -4941,6 +5001,9 @@ def _reconstructed_mrbayes_name_map(job_dir, declared):
         if fallback is None:
             fallback = mapping
 
+    # Unconfirmed: either the run declares no count, or no alignment of this
+    # generation matches it. The caller labels the latter as unverified rather
+    # than dropping the key (a stored map that does match is preferred).
     return fallback, False
 
 
@@ -5000,6 +5063,16 @@ def download_mrbayes_files(job_id):
         name_map = _mrbayes_name_map_text(job_dir)
         if name_map:
             zip_file.writestr(NAME_MAP_FILENAME, name_map)
+        else:
+            # Never drop the labels silently: say why the key is missing.
+            zip_file.writestr(
+                "sequence_names_unavailable.txt",
+                "The taxa in these MrBayes files are SEQnnnnnn ids. The key that "
+                "maps them back to sequence names could not be rebuilt for this "
+                "job, because neither a stored key nor the alignment this run was "
+                "built from is available. The Newick and NEXUS tree downloads "
+                "carry the real names.\n",
+            )
     archive.seek(0)
 
     response = send_file(

@@ -21,6 +21,7 @@ _HEALTH_LAST_VALUE = {}
 HEALTH_COOLDOWN_SECONDS = 6 * 3600
 _DISK_SAMPLES = deque(maxlen=61)
 _DISK_DIRECTORY_SIZES = {}
+_WORKER_HEALTH_STARTED_AT = None
 
 
 def _disk_growth_detail(free_bytes, now):
@@ -81,6 +82,36 @@ def _transition(name, unhealthy, detail, now=None):
     return False
 
 
+def _emit_worker_health(now):
+    """Detect loss of any queue's staffing, with a collector startup grace."""
+    global _WORKER_HEALTH_STARTED_AT
+    if _WORKER_HEALTH_STARTED_AT is None:
+        _WORKER_HEALTH_STARTED_AT = now
+    grace = current_app.config.get("WORKER_HEALTH_STARTUP_GRACE_SECONDS", 120)
+    starting = now - _WORKER_HEALTH_STARTED_AT < grace
+    details = get_worker_queue_health()
+    workers = details.get("workers", [])
+    healthy = [worker for worker in workers if worker.get("status") == "healthy"]
+    if healthy or not starting:
+        _transition(
+            "worker_heartbeat", not healthy,
+            f"healthy={len(healthy)} total={len(workers)} states={','.join(sorted({w.get('status', 'unknown') for w in workers})) or 'missing'}",
+            now=now,
+        )
+    if not details.get("available", True):
+        return  # Unreadable RQ membership is not evidence that queues are unstaffed.
+    expected = current_app.config.get("WORKER_EXPECTED_COUNTS", {
+        "phylo_high": 2, "phylo_bulk": 1, "voucher_sync": 1,
+    })
+    for name, minimum in expected.items():
+        count = sum(name in worker.get("queues", []) for worker in healthy)
+        if count >= minimum or not starting:
+            _transition(
+                f"worker_queue.{name}", count < minimum,
+                f"queue={name} healthy={count} expected={minimum}", now=now,
+            )
+
+
 def emit_health_transitions(metrics):
     """Perform cheap health checks and emit only transitions/cooldown reminders."""
     disk_percent = float(metrics.get("disk_usage") or 0)
@@ -121,23 +152,21 @@ def emit_health_transitions(metrics):
         f"percent={memory_percent:.1f} available_bytes={int(metrics.get('memory_available_bytes') or 0)}",
     )
 
-    workers = get_worker_status().get("workers", [])
-    healthy = [worker for worker in workers if worker.get("status") == "healthy"]
-    _transition(
-        "worker_heartbeat", not healthy,
-        f"healthy={len(healthy)} total={len(workers)} states={','.join(sorted({w.get('status', 'unknown') for w in workers})) or 'missing'}",
-    )
+    _emit_worker_health(time.monotonic())
 
     try:
-        from app.workers.queue import get_redis_connection, QUEUE_HIGH, QUEUE_BULK
+        from app.workers.queue import get_redis_connection, QUEUE_HIGH, QUEUE_BULK, QUEUE_VOUCHER
         from rq.registry import StartedJobRegistry
         redis_conn = get_redis_connection()
         redis_conn.ping()
-        queue_depth = sum(int(redis_conn.llen(f"rq:queue:{name}")) for name in (QUEUE_HIGH, QUEUE_BULK))
-        wip = sum(StartedJobRegistry(name=name, connection=redis_conn).count for name in (QUEUE_HIGH, QUEUE_BULK))
+        queue_names = (QUEUE_HIGH, QUEUE_BULK, QUEUE_VOUCHER)
+        depths = {name: int(redis_conn.llen(f"rq:queue:{name}")) for name in queue_names}
+        queue_depth = sum(depths.values())
+        wip = sum(StartedJobRegistry(name=name, connection=redis_conn).count for name in queue_names)
         _transition("redis", False, "ping=ok")
         queue_was_bad = _HEALTH_STATES.get("queue_depth", False)
-        _transition("queue_depth", queue_depth >= (10 if queue_was_bad else 25), f"queued={queue_depth} wip={wip}")
+        detail = " ".join(f"{name}={depth}" for name, depth in depths.items())
+        _transition("queue_depth", queue_depth >= (10 if queue_was_bad else 25), f"queued={queue_depth} wip={wip} {detail}")
     except Exception as exc:
         _transition("redis", True, f"exception={type(exc).__name__}")
 
@@ -962,11 +991,38 @@ def get_active_jobs(max_queued=25):
     return payload
 
 
+def get_worker_queue_health():
+    """Heartbeat status plus the queues each worker serves, and nothing else.
+
+    What the minutely health collector needs. get_worker_details() also reads
+    every worker's state, current job and working time, which this loop would
+    throw away, and it logs a WARNING whenever RQ is unreadable -- once a
+    minute for the length of a Redis outage, which the cooldown-limited
+    ``health.redis`` transition already reports.
+    """
+    status = get_worker_status()
+    workers = [dict(entry) for entry in status.get("workers", [])]
+    available = True
+    queues_by_name = {}
+    try:
+        from app.workers.queue import get_redis_connection
+        from rq import Worker
+
+        for worker in Worker.all(connection=get_redis_connection()):
+            queues_by_name[worker.name] = [q.name for q in getattr(worker, "queues", [])]
+    except Exception:
+        available = False
+    for entry in workers:
+        entry["queues"] = queues_by_name.get(entry.get("id"), [])
+    return {"available": available, "workers": workers}
+
+
 def get_worker_details():
     """Heartbeat files joined with what RQ knows about each worker process."""
     status = get_worker_status()
     workers = {entry["id"]: dict(entry) for entry in status.get("workers", [])}
 
+    available = True
     try:
         from app.workers.queue import get_redis_connection
         from rq import Worker
@@ -998,6 +1054,7 @@ def get_worker_details():
                 "rq_version": str(getattr(worker, "version", "") or "")[:20],
             })
     except Exception as exc:
+        available = False
         logger.warning("worker details: RQ registry unreadable: %s", exc)
 
     for entry in workers.values():
@@ -1005,7 +1062,7 @@ def get_worker_details():
         entry.setdefault("queues", [])
 
     rank = {"healthy": 0, "stale": 1, "dead": 2}
-    result = {"workers": sorted(
+    result = {"available": available, "workers": sorted(
         workers.values(),
         key=lambda w: (rank.get(w.get("status"), 9), w.get("age_seconds") or 0),
     )}

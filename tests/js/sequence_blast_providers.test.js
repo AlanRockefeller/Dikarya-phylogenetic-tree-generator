@@ -213,6 +213,22 @@ test('a timed-out NCBI search offers Continue and preserves the same query and s
     assert.equal(h.queue[0].name, 'continued result');
 });
 
+test('a pending NCBI response returns control without queueing or reporting an error', async () => {
+    const h = harness(attempt => attempt === 1
+        ? response({status: 'pending', message: 'Your search is saved.', can_resume: true}, 202)
+        : response({sequences: [{name: 'continued result', sequence: DNA}]}));
+    await h.input('blast_query', DNA);
+    await h.nodes.blast_btn.click();
+    assert.equal(h.queue.length, 0);
+    assert.equal(h.nodes.blast_btn.disabled, false);
+    assert.match(h.nodes.blast_btn.innerHTML, /Continue NCBI BLAST/);
+    assert.equal(h.statuses.at(-1).level, 'info');
+    assert.equal(h.failures.at(-1).error.expected, true);
+    await h.nodes.blast_btn.click();
+    assert.deepEqual(h.calls[0].body, h.calls[1].body);
+    assert.equal(h.queue[0].name, 'continued result');
+});
+
 test('known MycoMap refusal disables both entry points and keeps NCBI available', async () => {
     const h = harness();
     await h.input('mycomap_blast_query', DNA);

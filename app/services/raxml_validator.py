@@ -1,3 +1,4 @@
+import json
 import math
 import re
 import random
@@ -47,6 +48,44 @@ DEFAULT_BOOTSTRAP_CUTOFF = 0.07
 LEGACY_BOOTSTRAP_CUTOFF = 0.03
 MIN_BOOTSTRAP_CUTOFF = 0.01
 MAX_BOOTSTRAP_CUTOFF = 0.10
+
+
+def stored_bootstrap_cutoff(params: Dict[str, Any], job_dir: Optional[Path] = None):
+    """Recover an omitted cutoff from this job's run before using the legacy default.
+
+    Early public-API jobs ran the new default without saving it in input_info.
+    Their tree metadata records the actual cutoff. Explicit saved values and
+    recompute overrides take precedence; jobs with no recorded cutoff used 0.03.
+    """
+    if "bootstrap_cutoff" in params:
+        return params["bootstrap_cutoff"]
+    recorded_by_current_code = False
+    if job_dir is not None:
+        from app.services.artifact_storage import open_artifact
+
+        for filename in ("tree_pruned_metadata.json", "tree_metadata.json"):
+            try:
+                with open_artifact(Path(job_dir) / "tree" / filename, "rt") as handle:
+                    metadata = json.load(handle)
+            except (OSError, ValueError):
+                continue
+            if (isinstance(metadata, dict)
+                    and str(metadata.get("method", "")).lower() == "raxml"
+                    and "bootstrap_cutoff" in metadata):
+                cutoff = metadata["bootstrap_cutoff"]
+                if cutoff:
+                    return cutoff
+                applied = metadata.get("parameters_applied")
+                if isinstance(applied, dict) and applied.get("enable_bootstrap") is False:
+                    # None because no bootstrap ran, so no cutoff did either.
+                    # The key's presence still dates the job to after the
+                    # setting existed; look further, then use today's default.
+                    recorded_by_current_code = True
+                    continue
+                # None with bootstrapping on records a binary without
+                # --bs-cutoff support, whose built-in 0.03 was used instead.
+                return LEGACY_BOOTSTRAP_CUTOFF
+    return DEFAULT_BOOTSTRAP_CUTOFF if recorded_by_current_code else LEGACY_BOOTSTRAP_CUTOFF
 
 
 def bootstrap_cutoff_label(cutoff) -> str:

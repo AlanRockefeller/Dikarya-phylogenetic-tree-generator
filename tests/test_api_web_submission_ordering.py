@@ -9,7 +9,8 @@ from flask import Flask, g
 from app.api import routes
 
 
-FASTA = ">A\nACGTACGTACGTACGTACGT\n>B\nACGTACGTACGTACGTACGA\n"
+FASTA = (">A\nACGTACGTACGTACGTACGT\n>B\nACGTACGTACGTACGTACGA\n"
+         ">C\nACGTACGTACGTACGTACGC\n>D\nACGTACGTACGTACGTACGG\n")
 
 
 def _undecorated(fn):
@@ -144,6 +145,17 @@ def test_web_submission_keeps_the_default_high_priority_queue():
 
     # No queue override means enqueue_job's established phylo_high default.
     assert "queue_name" not in queued
+
+
+@pytest.mark.parametrize("method", ["nj", "fasttree", "iqtree_fast", "iqtree", "raxml", "mrbayes"])
+def test_single_query_is_queued_for_default_auto_blast(method):
+    sequence = ">query\nACGTACGTACGTACGTACGT\n"
+    response, events, _database, queued = _submit(tree_method=method, sequence=sequence)
+
+    assert response.status_code == 202
+    assert "enqueue" in events
+    assert queued["params"]["sequence"] == sequence
+    assert queued["params"].get("blast_mode", "auto") == "auto"
 
 
 @pytest.mark.parametrize(

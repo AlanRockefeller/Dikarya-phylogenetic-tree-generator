@@ -735,14 +735,45 @@ When a new CLI version is published:
   view page and this image: Twitterbot honours robots.txt, so without it no
   tree link showed a card on X. Inspect or redraw one job's card with
   `scripts/dikarya_social_preview.py <job_id> [--out f.png | --force]`.
-- **Type-specimen tips are marked from two sources, by exact accession only.**
+- **MycoMap's names always override GenBank's.** MycoMap.org is curated on
+  top of GenBank, and a misidentified GenBank record can only be corrected
+  there (OP739129 is filed as *Podaxis pistillaris* and is the *P. inyoensis*
+  holotype). `fetch_fasta_for_accessions()` in `blast_service.py` -- the one
+  path every GenBank-fetched label goes through: the Tree Builder's accession
+  box, the viewer's Add Sequences, v1 `tools/genbank`, Dikarya's own NCBI BLAST
+  hits -- swaps the organism for the `scientificName` from MycoMap.org's public
+  `POST /api/mycoblast/genbank-curation`, as the mycomap.org BLAST import
+  already did. Best effort, capped at `MYCOMAP_CURATION_BUDGET_SECONDS`; GenBank's
+  name stands if MycoMap.org cannot answer. `tests/conftest.py` stubs the
+  lookup out, so the suite never reaches mycomap.org.
+  **`genbank-curation` is rate-limited per client** (~30 requests per 10
+  minutes from this host; a 429 says "Too many GenBank lookups" with a
+  `Retry-After` of several minutes). A 429 sets the Redis key
+  `CURATION_PAUSE_KEY` for that long and every process skips the lookup until
+  it expires, so live labels fall back to GenBank's names during the wait.
+  Anything that calls it in bulk must pace itself -- the refresh's `curation`
+  pass waits `--curation-interval` (30 s) between requests to leave room for
+  the live site, and waits out a `Retry-After` instead of writing the batch off.
+- **Type-specimen tips are marked from three sources, by exact accession only.**
   `app/services/type_specimen_service.py` merges MycoMap's type list
   (`mycomap_type_specimens.json`, replaced weekly by
   `scripts/dikarya_refresh_type_specimens.py` via
   `ops/cron/dikarya-refresh-type-specimens`) with GenBank's own `/type_material`
   qualifier or RefSeq's "from TYPE material" definition marker
   (`genbank_type_material.jsonl`, appended by `_parse_genbank_xml()` on every
-  GenBank fetch and backfilled by the same script). Both live in
+  GenBank fetch and backfilled by the same script) and MycoMap.org's curation
+  flag (`isType` from `genbank-curation`, `mycomap_curation_types.jsonl`,
+  appended by `curated_genbank_rows()` on every curation lookup and re-asked
+  for the last 8 days' jobs by the script's `curation` pass). The third source
+  exists because a type a curator designates on MycoMap.org (`typeBasis:
+  "manual"`) never reaches the type list -- job cewq held seven of them, none
+  marked. Only a positive flag with a basis in `TRUSTED_CURATION_BASES`
+  (`manual`, `mycomap`, `refseq`) marks: `isType: false` means "not designated
+  on MycoMap" (GenBank holotypes answer false), never "not a type", and
+  `typeBasis: "source"` is a bare match on the word "type" in GenBank's source
+  qualifiers -- "RFLP type 52", "its type b", "type: OTU" -- that was wrong
+  every time it was checked. The check runs on read (`curation_marks()`), so
+  narrowing the list also disarms entries already recorded. All live in
   `Config.TYPE_SPECIMEN_DIR` (`cache/type_specimens`, tree:dikarya 2775 like
   `cache/blast`). If the processed snapshot is absent on a fresh deployment,
   the app reads and normalizes the committed raw API dump

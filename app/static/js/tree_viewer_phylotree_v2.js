@@ -130,7 +130,9 @@
     const TYPE_SOURCE_LABELS = {
         genbank: 'GenBank /type_material',
         genbank_definition: 'NCBI definition ("from TYPE material")',
-        mycomap: 'MycoMap type specimen list'
+        mycomap: 'MycoMap type specimen list',
+        // Alan 11/8/26 - Types a curator flagged on MycoMap.org (genbank-curation isType), e.g. OP739129.
+        mycomap_curation: 'MycoMap.org curation'
     };
 
     // Alan 9/24/26 - Own-property read, so a label such as "constructor" can never resolve to

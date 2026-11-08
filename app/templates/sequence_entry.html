@@ -2326,7 +2326,9 @@
     }
 
     async function fetchInBackground(url, options = {}) {
-        const headers = Object.assign({}, options.headers, {'X-Dikarya-Background': '1'});
+        const headers = Object.assign({}, options.headers, {
+            'X-Dikarya-Background': '1', 'X-Dikarya-BLAST-Pending': '1'
+        });
         const first = await fetch(url, Object.assign({}, options, {headers}));
         if (first.status !== 202) return first;
         let started = null;
@@ -2346,6 +2348,13 @@
                 // Suspended tab or a network blip; the server is still working.
             }
             if (resp && resp.status !== 202 && resp.status !== 429) return resp;
+            if (resp?.status === 202) {
+                // This task finished its bounded check; NCBI still owns the
+                // saved search. Return control so the user can continue it.
+                let data = null;
+                try { data = await resp.clone().json(); } catch (_) { /* Poll again. */ }
+                if (data?.status === 'pending' && data.can_resume) return resp;
+            }
             throttled = resp?.status === 429;
             if (throttled) {
                 const retryAfter = resp.headers.get('Retry-After');
@@ -3149,6 +3158,12 @@
     };
     // Both panels and Paste shortcuts share the guard, including input events
     // that arrive while a request is still running.
+    function pendingBlastError(data) {
+        if (data?.status !== 'pending' || !data.can_resume) return null;
+        return Object.assign(new Error(data.message || 'NCBI is still working. Click Continue NCBI BLAST to check for results.'),
+            {expected: true, blastPending: true});
+    }
+
     let blastRunning = false;
     let mycomapSearchAvailable = true;
     let mycomapAvailabilityTimer = null;
@@ -3246,6 +3261,11 @@
                 body: JSON.stringify({ query, min_identity: minIdentity, max_sequences: maxSequences })
             });
             const data = await resp.json();
+            const pending = pendingBlastError(data);
+            if (pending) {
+                config.pendingKey = inputKey;
+                throw pending;
+            }
             if (!resp.ok) {
                 if (data.can_resume) config.pendingKey = inputKey;
                 else if (data.can_resume === false || resp.status === 400) config.pendingKey = null;
@@ -3273,7 +3293,8 @@
             }
         } catch (e) {
             reportWorkflowFailure(config.telemetry, e);
-            showStatus(`${config.label} error: ${e.message}`, 'error');
+            showStatus(e.blastPending ? e.message : `${config.label} error: ${e.message}`,
+                e.blastPending ? 'info' : 'error');
         } finally {
             blastRunning = false;
             config.button.innerHTML = `<i class="fas ${config.icon} mr-2"></i> ${config.label}`;
@@ -4218,8 +4239,7 @@
             return;
         }
 
-        if (sequenceQueue.length < 2) {
-            showStatus('Need at least 2 sequences to build a tree.', 'error');
+        if (!treeSequenceCountCheckPasses('iqtree_fast')) {
             mycomapQuickTreeBtn.disabled = false;
             fetchMycomapBtn.disabled = false;
             mycomapQuickTreeBtn.innerHTML = '<i class="fas fa-magic mr-2"></i> One-Click Tree';
@@ -4599,6 +4619,7 @@
     }
 
     function resetInaturalistUI() {
+        inaturalistBlastBtn.innerHTML = '<i class="fas fa-search mr-2"></i> NCBI BLAST';
         inaturalistResults.classList.add('hidden');
         inaturalistSpeciesList.classList.add('hidden');
         inaturalistBlastBtn.classList.add('hidden');
@@ -4953,6 +4974,7 @@
             return;
         }
 
+        let pending = false;
         inaturalistBlastBtn.disabled = true;
         inaturalistBlastBtn.innerHTML = '<i class="fas fa-spinner fa-spin mr-2"></i> BLASTing...';
         showStatus('Running NCBI BLAST search... This may take a minute.', 'info');
@@ -4969,7 +4991,8 @@
             });
 
             const data = await resp.json();
-
+            const waiting = pendingBlastError(data);
+            if (waiting) throw waiting;
             if (!resp.ok) {
                 throw httpError(resp, data.error || 'BLAST failed');
             }
@@ -4985,12 +5008,14 @@
             resetInaturalistUI();
 
         } catch (e) {
+            pending = Boolean(e.blastPending);
             reportWorkflowFailure('tree_builder.inaturalist_blast', e);
-            showStatus('NCBI BLAST error: ' + e.message, 'error');
+            showStatus(pending ? e.message : 'NCBI BLAST error: ' + e.message, pending ? 'info' : 'error');
         }
 
         inaturalistBlastBtn.disabled = false;
-        inaturalistBlastBtn.innerHTML = '<i class="fas fa-search mr-2"></i> NCBI BLAST';
+        inaturalistBlastBtn.innerHTML = '<i class="fas fa-search mr-2"></i> '
+            + (pending ? 'Continue NCBI BLAST' : 'NCBI BLAST');
     });
 
     // Mycomap BLAST button for single observation: refreshes the observation's
@@ -5310,6 +5335,20 @@
     const mushroomObserverItems = document.getElementById('mushroom_observer_sequence_items');
     const mushroomObserverActions = document.getElementById('mushroom_observer_actions');
     const mushroomObserverBlastBtn = document.getElementById('mushroom_observer_blast_btn');
+    // The button's own label ("BLAST Sequence"), restored after every search.
+    const MUSHROOM_OBSERVER_BLAST_HTML = mushroomObserverBlastBtn.innerHTML;
+    // The ITS sequence whose NCBI search is still pending; "Continue" only
+    // applies to that query, not to whichever sequence is picked next.
+    let mushroomObserverPendingBlastId = null;
+
+    function renderMushroomObserverBlastLabel() {
+        if (mushroomObserverBlastBtn.querySelector('.fa-spinner')) return;  // search running
+        const continuing = mushroomObserverPendingBlastId !== null
+            && Number(selectedMushroomObserverSequenceId) === mushroomObserverPendingBlastId;
+        mushroomObserverBlastBtn.innerHTML = continuing
+            ? '<i class="fas fa-search mr-2"></i> Continue NCBI BLAST'
+            : MUSHROOM_OBSERVER_BLAST_HTML;
+    }
     const mushroomObserverAddBtn = document.getElementById('mushroom_observer_add_btn');
     const mushroomObserverTreeBtn = document.getElementById('mushroom_observer_tree_btn');
     const mushroomObserverTreeOptions = document.getElementById('mushroom_observer_tree_options');
@@ -5358,6 +5397,8 @@
     }
 
     function resetMushroomObserverUI() {
+        mushroomObserverPendingBlastId = null;
+        mushroomObserverBlastBtn.innerHTML = MUSHROOM_OBSERVER_BLAST_HTML;
         mushroomObserverResults.classList.add('hidden');
         mushroomObserverChoices.classList.add('hidden');
         mushroomObserverActions.classList.add('hidden');
@@ -5491,6 +5532,7 @@
             selectedMushroomObserverSequenceId = Number(event.target.value);
             applyMushroomObserverNcbiDefault(selectedMushroomObserverSequence());
             updateMushroomObserverActions();
+            renderMushroomObserverBlastLabel();
         }
     });
 
@@ -5534,7 +5576,7 @@
             showStatus('Choose an ITS sequence first.', 'error');
             return;
         }
-        const originalHtml = mushroomObserverBlastBtn.innerHTML;
+        let pending = false;
         mushroomObserverBlastBtn.disabled = true;
         mushroomObserverBlastBtn.innerHTML = '<i class="fas fa-spinner fa-spin mr-2"></i> BLASTing...';
         showStatus('Running BLAST for the selected Mushroom Observer ITS sequence...', 'info');
@@ -5546,16 +5588,21 @@
                 body: JSON.stringify({query: selected.sequence})
             });
             const data = await response.json();
+            const waiting = pendingBlastError(data);
+            if (waiting) throw waiting;
             if (!response.ok) throw httpError(response, data.error || 'BLAST failed');
             const added = addSequences(data.sequences || []);
             lastBlastQuery = 'Mushroom Observer';
             showStatus(`BLAST complete! Added ${added} new sequences to queue.`, 'success');
         } catch (error) {
+            pending = Boolean(error.blastPending);
             reportWorkflowFailure('tree_builder.mushroom_observer_blast', error);
-            showStatus('BLAST error: ' + error.message, 'error');
+            showStatus(pending ? error.message : 'BLAST error: ' + error.message, pending ? 'info' : 'error');
         } finally {
             mushroomObserverBlastBtn.disabled = false;
-            mushroomObserverBlastBtn.innerHTML = originalHtml;
+            mushroomObserverPendingBlastId = pending ? Number(selected.id) : null;
+            mushroomObserverBlastBtn.innerHTML = '';  // clear the spinner first
+            renderMushroomObserverBlastLabel();
         }
     });
 
@@ -5646,8 +5693,7 @@
     document.getElementById('quick_tree_btn').addEventListener('click', async () => {
         const btn = document.getElementById('quick_tree_btn');
 
-        if (sequenceQueue.length < 2) {
-            showStatus('Please add at least 2 sequences to the queue.', 'error');
+        if (!treeSequenceCountCheckPasses('iqtree_fast')) {
             return;
         }
 
@@ -6296,8 +6342,7 @@
         // Edit mode saves and recomputes through the queue footer's handler.
         if (EDIT_JOB_ID || btn.disabled) return;
 
-        if (sequenceQueue.length < 2) {
-            showStatus('Please add at least 2 sequences to the queue.', 'error');
+        if (!treeSequenceCountCheckPasses(document.getElementById('tree_method').value)) {
             return;
         }
 
@@ -6465,6 +6510,18 @@
     // This check only saves the user a round trip; it is not the boundary. The
     // two constants are asserted equal by tests/test_quick_tree_limits.py.
     // =========================================================================
+    const TREE_MIN_SEQUENCES = {iqtree: 3, iqtree_fast: 3, raxml: 4, mrbayes: 4, fasttree: 2, nj: 2};
+    const TREE_METHOD_LABELS = {iqtree: 'IQ-TREE', iqtree_fast: 'Quick Tree (IQ-TREE)',
+        raxml: 'RAxML-NG', mrbayes: 'MrBayes', fasttree: 'FastTree', nj: 'Neighbor Joining'};
+
+    function treeSequenceCountCheckPasses(method) {
+        const minimum = TREE_MIN_SEQUENCES[method] || 2;
+        if (sequenceQueue.length >= minimum) return true;
+        showStatus(`${TREE_METHOD_LABELS[method] || 'This method'} needs at least ${minimum} sequences; `
+            + `the queue contains ${sequenceQueue.length}. Add more sequences or choose a method that supports this count.`, 'error');
+        return false;
+    }
+
     const QUICK_TREE_MAX_SEQUENCE_BP = 10000;
 
     function quickTreeOversizedSequences() {
@@ -6905,8 +6962,14 @@
             document.getElementById('btn_add_recompute_job').addEventListener('click', async () => {
                 const btn = document.getElementById('btn_add_recompute_job');
 
-                if (sequenceQueue.length < 2) {
-                    showStatus('Please keep at least 2 sequences in the queue.', 'error');
+                // The select names the recompute's method only once it holds the
+                // job's own settings; before that (or after a failed prefill) it
+                // shows this page's default, and the recompute reuses the stored
+                // method, so only the universal minimum is checked here and the
+                // worker's guard reports the method-specific one.
+                const recomputeMethod = advancedPrefilled
+                    ? document.getElementById('tree_method').value : null;
+                if (!treeSequenceCountCheckPasses(recomputeMethod)) {
                     return;
                 }
 

@@ -77,5 +77,13 @@ async function pollTests() {
     replies.push(started, limited, limited, ready); delays.length = 0;
     await vm.runInContext("fetchInBackground('/preview')", ctx);
     assert.deepEqual(delays, [2000, 4000, 8000]);
+    // A completed check whose upstream search is still pending must not keep
+    // polling the same finished task forever.
+    const pending = {status: 202, clone: () => ({json: async () => ({
+        status: 'pending', can_resume: true, message: 'Search saved',
+    })})};
+    replies.push(started, pending); delays.length = 0;
+    assert.equal(await vm.runInContext("fetchInBackground('/api/blast')", ctx), pending);
+    assert.deepEqual(delays, [2000]);
 }
 (async () => {await undoTests(); await pollTests(); console.log('Undo recovery and background polling checks passed');})().catch(e => {console.error(e); process.exitCode = 1;});

@@ -986,9 +986,10 @@ def analyze_type_specimens(cutoff, until, path=REFRESH_LOG_PATH):
             if not (cutoff <= when < until):
                 continue
             if name == "refresh_started":
-                run = {"started": when, "mycomap": None, "genbank": None, "finished": None}
+                run = {"started": when, "mycomap": None, "genbank": None, "curation": None,
+                       "finished": None}
                 result["runs"].append(run)
-            elif name in ("mycomap_summary", "genbank_summary") and run is not None:
+            elif name in ("mycomap_summary", "genbank_summary", "curation_summary") and run is not None:
                 run[name.split("_")[0]] = fields
             elif name == "refresh_finished" and run is not None:
                 run["finished"] = fields
@@ -1004,11 +1005,15 @@ def _type_row(fields, sign):
             f"{fields.get('organism') or '(organism not given)'}")
     if fields.get("voucher"):
         text += f"  voucher={fields['voucher']}"
-    text += f"  [{fields.get('source', '?')}]"
+    text += f"  [{fields.get('source', '?')}"
+    text += f" basis={fields['basis']}]" if fields.get("basis") else "]"
+    # A curation flag can overlap either other source; the list's own events
+    # are only ever compared with GenBank.
+    other = "another source" if fields.get("source") == "mycomap_curation" else "GenBank"
     if fields.get("previously_marked") == "yes":
-        text += " (already marked from GenBank)"
+        text += f" (already marked from {other})"
     if fields.get("still_marked") == "yes":
-        text += " (still marked from GenBank)"
+        text += f" (still marked from {other})"
     if sign == "~":
         text += f" was {fields.get('previous_status') or '-'}"
     return text
@@ -1023,6 +1028,7 @@ def print_type_specimens(data, until, limit=200):
     for run in data["runs"]:
         finished = run["finished"] or {}
         mycomap, genbank = run["mycomap"] or {}, run["genbank"] or {}
+        curation = run.get("curation") or {}
         parts = [f"{run['started']:%Y-%m-%d %H:%M}",
                  finished.get("outcome", "UNFINISHED (killed or still running)")]
         if finished:
@@ -1035,6 +1041,11 @@ def print_type_specimens(data, until, limit=200):
             parts.append(f"genbank: +{genbank.get('added')} of {genbank.get('checked')} checked, "
                          f"{genbank.get('missing')} missing, {genbank.get('unanswered')} unanswered, "
                          f"{genbank.get('deferred')} left for next run")
+        if curation:
+            parts.append(f"curation: +{curation.get('added')} -{curation.get('removed')} "
+                         f"of {curation.get('checked')} checked, "
+                         f"{curation.get('unanswered')} unanswered, "
+                         f"{curation.get('deferred')} left for next run")
         print("  " + "  |  ".join(parts))
     if not data["runs"]:
         last = data["last_run"]
@@ -1050,7 +1061,7 @@ def print_type_specimens(data, until, limit=200):
     # Every added type is listed: this is the part a reviewer reports.
     for key, sign, title in (("added", "+", "New type sequences"),
                              ("reclassified", "~", "Type status changed"),
-                             ("removed", "-", "No longer on MycoMap's list")):
+                             ("removed", "-", "No longer a MycoMap type")):
         items = data[key]
         if not items:
             continue
@@ -1174,31 +1185,99 @@ def analyze_operations(cutoff, until):
     return {"assets": assets, "background": background, "imports": imports, "third_party": third_party}
 
 
+NGINX_APP_ACCESS_RE = re.compile(
+    r' host="(?:www\.)?dikarya\.us" server="dikarya\.us"(?=\s|$)'
+)
+NGINX_ACCESS_TAIL_RE = re.compile(
+    r' host="(?:www\.)?dikarya\.us" server="dikarya\.us"'
+    r'(?:\s+[A-Za-z_][A-Za-z0-9_]*="(?:\\.|[^"\\])*")*\s*$'
+)
+NGINX_ACCESS_STALE_AFTER = timedelta(minutes=15)
+
+
+# The same layout with any quoted request field. A line that fits this but not
+# ACCESS_RE carries a request that is not an HTTP request line -- "-", TLS
+# bytes on the wrong port, a lowercase method -- which is client junk, not the
+# log_format drift the unparsed WARNING exists to catch.
+ACCESS_ANY_REQUEST_RE = re.compile(
+    r'^\S+ \S+ \S+ \[[^\]]+\] "(?:\\.|[^"\\])*" \d{3} \S+ '
+    r'"(?:\\.|[^"\\])*" "(?:\\.|[^"\\])*"(?: \d+)?(?: req=\S+)?(?: noise=\S+)?\s*$'
+)
+
+
+def parse_nginx_access(line):
+    """Accept old combined logs and the current timing/correlation suffix."""
+    tail = NGINX_ACCESS_TAIL_RE.search(line)
+    return ACCESS_RE.fullmatch(line[:tail.start()]) if tail else None
+
+
+def is_malformed_nginx_request(line):
+    """True for a well-formed log line whose client sent no valid request line."""
+    tail = NGINX_ACCESS_TAIL_RE.search(line)
+    return bool(tail and ACCESS_ANY_REQUEST_RE.fullmatch(line[:tail.start()]))
+
+
+def parse_nginx_access_ts(line):
+    stamp = re.search(r'\[([^\]]+)\]', line)
+    return parse_access_ts(stamp[1]) if stamp else None
+
+
 def analyze_nginx(cutoff, until):
     """Use only the fixed read-only wrapper; never turn this into sudo cat."""
     counts = collections.Counter()
     coverage = []
     for kind in ("access", "error"):
         scoped = True
+        partial_fallback = False
         try:
             command = ["sudo", "-n", "/usr/local/sbin/dikarya-nginx-log", f"app-{kind}-all", "200000"]
             result = subprocess.run(command, capture_output=True, text=True, errors="replace", timeout=45)
             if result.returncode == 2:
                 scoped = False
-                command[-2] = f"{kind}-all"
+                command = [*command[:-2], f"{kind}-all", command[-1]]
                 result = subprocess.run(command, capture_output=True, text=True, errors="replace", timeout=45)
             if result.returncode:
                 coverage.append(f"{kind}: unavailable (wrapper exit {result.returncode}); proxy/static failures are not covered")
                 continue
+            lines = result.stdout.splitlines()
+            if kind == "access":
+                lines = [line for line in lines if NGINX_APP_ACCESS_RE.search(line)]
+            if kind == "access" and scoped:
+                # An installed reader with the old end-of-line host filter
+                # returns only old rotations, successfully. An idle app looks
+                # the same, so preserve its scoped history and merge a bounded
+                # fallback only when it recovers newer Dikarya records.
+                timestamps = [parse_nginx_access_ts(line) for line in lines]
+                latest = max((when for when in timestamps if when is not None), default=None)
+                if latest is None or latest < until - NGINX_ACCESS_STALE_AFTER:
+                    fallback_command = [*command[:-2], "access-all", command[-1]]
+                    try:
+                        fallback = subprocess.run(fallback_command, capture_output=True, text=True, errors="replace", timeout=45)
+                    except (OSError, subprocess.TimeoutExpired):
+                        fallback = None
+                    if fallback is not None and fallback.returncode == 0:
+                        fallback_lines = [line for line in fallback.stdout.splitlines()
+                                          if NGINX_APP_ACCESS_RE.search(line)]
+                        fallback_times = [when for line in fallback_lines
+                                          if (when := parse_nginx_access_ts(line)) is not None]
+                        if fallback_times and (latest is None or max(fallback_times) > latest):
+                            scoped = False
+                            # An unfiltered tail can leave a gap after the
+                            # scoped history, even though their union is older
+                            # than the requested start boundary.
+                            partial_fallback = min(fallback_times) > max(cutoff, latest or cutoff)
+                            # Keep repeated requests within each source while
+                            # counting overlapping history only once.
+                            lines.extend((collections.Counter(fallback_lines)
+                                          - collections.Counter(lines)).elements())
         except (OSError, subprocess.TimeoutExpired):
             coverage.append(f"{kind}: unavailable; proxy/static failures are not covered")
             continue
         oldest = newest = None
-        observed = 0
-        for line in result.stdout.splitlines():
+        observed = unparsed_app = malformed_requests = 0
+        for line in lines:
             if kind == "access":
-                timestamp = re.search(r'\[([^\]]+)\]', line)
-                when = parse_access_ts(timestamp[1]) if timestamp else None
+                when = parse_nginx_access_ts(line)
             else:
                 try:
                     when = datetime.strptime(line[:19], "%Y/%m/%d %H:%M:%S")
@@ -1211,10 +1290,12 @@ def analyze_nginx(cutoff, until):
             if not cutoff <= when < until:
                 continue
             if kind == "access":
-                if not re.search(r' host="(?:www\.)?dikarya\.us" server="dikarya\.us"\s*$', line):
-                    continue
-                match = ACCESS_RE.match(re.sub(r' host="[^"]*" server="[^"]*"\s*$', '', line))
+                match = parse_nginx_access(line)
                 if not match:
+                    if is_malformed_nginx_request(line):
+                        malformed_requests += 1
+                    else:
+                        unparsed_app += 1
                     continue
                 observed += 1
                 status = int(match["status"])
@@ -1234,8 +1315,14 @@ def analyze_nginx(cutoff, until):
                 counts[(kind, reason, endpoint)] += 1
         boundary = f"{oldest}..{newest}" if oldest else "empty"
         detail = f"{kind}: range={boundary} in-window-app={observed} scoped={'yes' if scoped else 'no'}"
-        if oldest is None or oldest > cutoff:
+        if oldest is None or oldest > cutoff or partial_fallback:
             detail += " WARNING partial historical coverage"
+        if kind == "access" and newest is not None and newest < until - NGINX_ACCESS_STALE_AFTER:
+            detail += " WARNING stale access history; recent proxy failures may be missing"
+        if malformed_requests:
+            detail += f" malformed_requests={malformed_requests}"
+        if unparsed_app:
+            detail += f" WARNING unparsed app access records={unparsed_app}"
         if not scoped:
             detail += " (install updated wrapper for filtering before the line limit)"
         coverage.append(detail)

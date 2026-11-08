@@ -1083,9 +1083,9 @@ class HealthTransitionTests(unittest.TestCase):
         assert sum("recovered" in message for message in messages) == 1
 
     def test_disk_uses_hysteresis_so_a_flapping_value_does_not_spam(self):
-        with patch.object(self.services, "get_worker_status", return_value={"workers": [
-            {"status": "healthy"}
-        ]}), patch.object(self.services, "db", Mock()), patch.object(self.services, "Job", Mock()):
+        with patch.object(self.services, "_emit_worker_health"), \
+                patch.object(self.services, "db", Mock()), \
+                patch.object(self.services, "Job", Mock()):
             self.services.emit_health_transitions({"disk_usage": 91, "memory_percent": 10})
             # 87 is below the 90 entry threshold but above the 85 exit threshold:
             # still unhealthy, and therefore not a new transition.

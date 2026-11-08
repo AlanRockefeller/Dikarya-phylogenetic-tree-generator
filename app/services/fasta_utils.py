@@ -609,19 +609,23 @@ def write_name_map(mapping: Dict[str, str], path: Path) -> None:
     Path(path).write_text(format_name_map(mapping), encoding="utf-8")
 
 
-def reconstruct_name_map(alignment_path) -> Dict[str, str]:
+def reconstruct_name_map(alignment_path, *, excluded_headers=()) -> Dict[str, str]:
     """Rebuild the ``SEQnnnnnn -> original header`` map from an alignment file.
 
     ``sanitize_fasta_headers`` numbers records by position and nothing else, so
     reading the same FASTA back in order reproduces the map exactly. This is
     what recovers the labels for the ~10,000 MrBayes jobs that ran before the
-    map was written to disk.
+    map was written to disk. For a collapsed tree search, exclude the removed
+    headers before numbering so the IDs describe the reduced builder input.
     """
+    excluded = set(excluded_headers)
+    headers = (
+        header for header, _sequence in read_fasta_records(alignment_path)
+        if header not in excluded
+    )
     return {
         f"SEQ{index:06d}": header
-        for index, (header, _sequence) in enumerate(
-            read_fasta_records(alignment_path), start=1
-        )
+        for index, header in enumerate(headers, start=1)
     }
 
 

@@ -345,6 +345,14 @@ def blast_from_sequence(seq: str, config: Config, min_identity: float = 90.0,
         
         return _save_cache(query_hash, hit_accessions, hit_details, fasta_content, config)
         
+    except TimeoutError as e:
+        if max_wait is None:
+            # No request budget means no resumable wait (the worker): the
+            # BLAST step has failed and must say so where failures are read.
+            logger.error(f"BLAST failed: {e}")
+        else:
+            logger.info("event=blast.waiting %s", e)
+        raise
     except Exception as e:
         logger.error(f"BLAST failed: {e}")
         # Re-raise to let caller handle failure (e.g. show user error)
@@ -405,6 +413,12 @@ def blast_from_accessions(accessions: List[str], config: Config, min_identity: f
         
         return _save_cache(query_hash, all_accessions, hit_details, fasta_content, config)
 
+    except TimeoutError as e:
+        if max_wait is None:
+            logger.error(f"BLAST from accessions failed: {e}")
+        else:
+            logger.info("event=blast.waiting %s", e)
+        raise
     except Exception as e:
         logger.error(f"BLAST from accessions failed: {e}")
         raise
@@ -1083,17 +1097,23 @@ def _parse_genbank_xml(xml_text: str) -> Dict[str, Dict]:
 
     return result
 
-def _build_header(record: Dict) -> str:
+def _build_header(record: Dict, display_organism: Optional[str] = None) -> str:
     """
     Construct FASTA header from parsed record.
     Format: >{acc_ver} {organism} {sample_id} {extras} {type_status}
+
+    ``display_organism`` (MycoMap.org's curated name) replaces GenBank's
+    organism in the label. GenBank's own name still drives the clean-up below,
+    because that is the name GenBank repeats inside its voucher, isolate and
+    location qualifiers.
     """
     # 1. Base
     # Use version if available, else accession
     acc_ver = record.get("version") or record.get("accession")
     organism = record.get("organism") or "(unknown organism)"
-    
-    parts = [acc_ver, organism]
+    shown_organism = " ".join(str(display_organism or "").split()) or organism
+
+    parts = [acc_ver, shown_organism]
     
     # Helper to clean redundant organism name from values
     def _strip_organism(val: str, org_name: str) -> str:
@@ -1249,6 +1269,33 @@ def _build_header(record: Dict) -> str:
         
     return ">" + " ".join(parts)
 
+# Upper bound on the MycoMap.org curation lookup inside one GenBank fetch. It
+# answers 100 accessions in well under a second; this only caps an outage.
+MYCOMAP_CURATION_BUDGET_SECONDS = 10.0
+
+
+def _mycomap_curated_names(accessions: List[str]) -> Dict[str, str]:
+    """MycoMap.org's curated name per bare accession; {} when unavailable.
+
+    Best effort, inside the current request budget: GenBank's names stand
+    whenever MycoMap.org cannot answer in time. tests/conftest.py stubs this
+    out so the suite never reaches mycomap.org.
+    """
+    if not accessions:
+        return {}
+    try:
+        budget = MYCOMAP_CURATION_BUDGET_SECONDS
+        remaining = _remaining_budget()
+        if remaining is not None:
+            budget = min(budget, remaining)
+        from app.services.mycomap_org_service import _curated_genbank_names
+        return _curated_genbank_names(accessions, deadline=time.monotonic() + budget)
+    except Exception as exc:  # a label lookup must never fail the fetch
+        logger.warning("event=genbank.mycomap_curation_skipped count=%s error=%s",
+                       len(accessions), exc)
+        return {}
+
+
 def fetch_fasta_for_accessions(accessions: List[str]) -> str:
     """
     Fetch FASTA sequences from NCBI for the given accessions using GenBank XML
@@ -1311,15 +1358,24 @@ def fetch_fasta_for_accessions(accessions: List[str]) -> str:
     # 2. Reassemble deterministically
     final_lines = []
     missing_for_fallback = []
-    
+    # MycoMap's names always override GenBank's: MycoMap.org is curated on top
+    # of GenBank, so a misidentified record (OP739129, filed as Podaxis
+    # pistillaris, is the P. inyoensis holotype) is corrected there and only
+    # there. Every GenBank label this app builds comes through here.
+    curated_names = _mycomap_curated_names([
+        acc for acc in validated
+        if (records_by_ver.get(acc) or records_by_acc.get(acc) or {}).get("sequence")
+    ])
+
     for acc in validated:
         # Try finding record
         record = records_by_ver.get(acc) or records_by_acc.get(acc)
-        
+
         if record and record.get("sequence"):
             counters["xml_ok"] += 1
-            
-            header = _build_header(record)
+
+            header = _build_header(
+                record, display_organism=curated_names.get(acc.upper().split(".")[0]))
             seq = record["sequence"]
             
             # Wrap sequence at 60 chars

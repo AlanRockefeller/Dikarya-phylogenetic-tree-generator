@@ -340,6 +340,20 @@ test('nonlocal and non-MycoMap tips do not get a MycoMap sequence link', () => {
     ), null);
 });
 
+test('MycoMap resolver links preserve the original tip while provenance matching is normalized', () => {
+    const label = 'iNat393666515 Lepiota Greenville Ohio US RiC 44';
+    for (const original of ['_R_' + label, label.replaceAll(' ', '  ')]) {
+        const target = P.extractMycomapSequenceTarget(
+            { data: { __original_name: original, name: 'Renamed tip' } },
+            [{ fasta_header: label, source: 'mycomap', hit_source: 'local' }],
+            'zszo'
+        );
+        assert.ok(target);
+        assert.strictEqual(target.urls.primary,
+            '/api/job/zszo/tree/mycomap-sequence?tip_name=' + encodeURIComponent(original));
+    }
+});
+
 test('a directly imported MycoMap sequence record gets the same link', () => {
     const label = 'iNat393666515 Lepiota';
     assert.ok(P.extractMycomapSequenceTarget(

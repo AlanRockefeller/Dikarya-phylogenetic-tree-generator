@@ -22,8 +22,13 @@ from app.services.log_context import _current_context
 logger = logging.getLogger(__name__)
 ARCHIVE_DIR = Path(__file__).resolve().parents[2] / "var" / "logs" / "api-responses"
 _SENSITIVE = re.compile(r"password|secret|token|authorization|cookie|api.?key|client.?secret|session|^code$|^key$", re.I)
+# Alan 11/4/26 - cf-ray is Cloudflare's per-request id, which Cloudflare and
+# the upstream's own logs both carry. MycoMap.org's 401s send no x-request-id,
+# so without it a refused call could only be matched to their logs by time and
+# user agent. It identifies the request, not the caller, so it is safe to keep.
 _HEADERS = {"content-type", "content-length", "date", "retry-after", "x-request-id",
-            "x-correlation-id", "age", "etag", "last-modified", "cache-control"}
+            "x-correlation-id", "age", "etag", "last-modified", "cache-control",
+            "cf-ray", "server"}
 
 
 def _archive_directory(now):

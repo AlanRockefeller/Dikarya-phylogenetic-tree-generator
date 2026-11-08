@@ -9,6 +9,7 @@ import tempfile
 import threading
 import time
 from contextlib import contextmanager
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, Any, List, Optional, Set, Tuple
 from app.config import Config
@@ -21,7 +22,7 @@ from app.services.artifact_storage import (
     gz_path,
     open_artifact,
 )
-from app.services.raxml_validator import LEGACY_BOOTSTRAP_CUTOFF
+from app.services.raxml_validator import stored_bootstrap_cutoff
 from app.services.security_utils import coerce_bool
 from app.services.subprocess_utils import run_command
 
@@ -432,7 +433,9 @@ def _bool_param(params_dict: Dict[str, Any], key: str, default: bool) -> bool:
     return coerce_bool(params_dict.get(key), default)[0]
 
 
-def build_recompute_job_params(params_dict: Dict[str, Any]) -> JobParams:
+def build_recompute_job_params(
+    params_dict: Dict[str, Any], *, job_dir: Optional[Path] = None
+) -> JobParams:
     """Build the dataclass params used by tree recomputation from stored job JSON."""
     tree_method = params_dict.get("tree_method", "nj")
     # MAFFT picks its strategy by tree method (MAFFT_LINSI_TREE_METHODS, faster
@@ -502,10 +505,9 @@ def build_recompute_job_params(params_dict: Dict[str, Any]) -> JobParams:
         run_preset=params_dict.get("run_preset", "fast_good"),
         bootstrap_preset=params_dict.get("bootstrap_preset", "standard"),
         bootstrap_cap=params_dict.get("bootstrap_cap"),
-        # Same rule as mcmc_stop_early above: a job stored before the setting
-        # existed ran RAxML-NG's 0.03, so its recompute does too unless the
-        # Advanced panel chose a cutoff.
-        bootstrap_cutoff=params_dict.get("bootstrap_cutoff", LEGACY_BOOTSTRAP_CUTOFF),
+        # Recover the actual run when an early API job omitted the key, while
+        # retaining 0.03 for jobs from before the setting existed.
+        bootstrap_cutoff=stored_bootstrap_cutoff(params_dict, job_dir),
         enable_bootstrap=_bool_param(params_dict, "enable_bootstrap", True),
         start_tree_override=params_dict.get("start_tree_override"),
         moose_enabled=_bool_param(params_dict, "moose_enabled", False),
@@ -1138,6 +1140,49 @@ def _write_rerooted_tree(job_dir: Path, tree_json: Dict, tree, root_target: str)
     return tree_json
 
 
+def _find_root_target_clade(tree, root_target: str):
+    """The clade a reroot target names, or None.
+
+    Shared by reroot_tree() and the recompute's root-tip check, so the two can
+    never disagree about whether a target is still in the tree.
+    """
+    # Alan 8/14/26 - Internal nodes are addressed by stable ID, the same scheme
+    # rotate/prune already use. The viewer renders from raw Newick parsed in the
+    # browser, so an internal node's client-side "name" is its support label
+    # ("1.000"); BioPython moves that same label into .confidence as a float, so
+    # matching on the label could never work and every internal-node reroot failed
+    # with "Root target not found: 1.000".
+    if root_target.startswith("internal:"):
+        for clade in tree.find_clades(order="preorder"):
+            # Mirror rotate_node: unary pass-through nodes share their only
+            # child's descendant-leaf set, so skipping them avoids resolving a
+            # stable ID to the wrong node.
+            if not getattr(clade, "clades", None) or len(clade.clades) < 2:
+                continue
+            if _stable_internal_node_id(clade) == root_target:
+                return clade
+
+    # Find the target clade (search ANY clade, not just terminals)
+    for clade in tree.find_clades():
+        if clade.name == root_target:
+            return clade
+
+    # Fallback: match a numeric support label. Newick I/O turns a numeric
+    # internal name into a float confidence, so compare numerically --
+    # str(1.0) never equals the "1.000" the tree file actually carried.
+    # Ambiguous by nature (many nodes share a support value), so this is
+    # only a last resort behind the stable-ID lookup above.
+    target_value = _as_float(root_target)
+    if target_value is not None:
+        for clade in tree.find_clades():
+            if clade.confidence is None:
+                continue
+            clade_value = _as_float(clade.confidence)
+            if clade_value is not None and clade_value == target_value:
+                return clade
+    return None
+
+
 def reroot_tree(job_dir: Path, tree_json: Dict, root_target: str) -> Dict:
     """
     Reroot using any valid node (tip or internal). 
@@ -1153,47 +1198,8 @@ def reroot_tree(job_dir: Path, tree_json: Dict, root_target: str) -> Dict:
         # Validate target
         if not root_target:
              raise ValueError("Reroot target cannot be empty")
-             
-        # Alan 8/14/26 - Internal nodes are addressed by stable ID, the same scheme
-        # rotate/prune already use. The viewer renders from raw Newick parsed in the
-        # browser, so an internal node's client-side "name" is its support label
-        # ("1.000"); BioPython moves that same label into .confidence as a float, so
-        # matching on the label could never work and every internal-node reroot failed
-        # with "Root target not found: 1.000".
-        target_clade = None
-        if root_target.startswith("internal:"):
-            for clade in tree.find_clades(order="preorder"):
-                # Mirror rotate_node: unary pass-through nodes share their only
-                # child's descendant-leaf set, so skipping them avoids resolving a
-                # stable ID to the wrong node.
-                if not getattr(clade, "clades", None) or len(clade.clades) < 2:
-                    continue
-                if _stable_internal_node_id(clade) == root_target:
-                    target_clade = clade
-                    break
 
-        # Find the target clade (search ANY clade, not just terminals)
-        if target_clade is None:
-            for clade in tree.find_clades():
-                if clade.name == root_target:
-                    target_clade = clade
-                    break
-
-        if target_clade is None:
-             # Fallback: match a numeric support label. Newick I/O turns a numeric
-             # internal name into a float confidence, so compare numerically --
-             # str(1.0) never equals the "1.000" the tree file actually carried.
-             # Ambiguous by nature (many nodes share a support value), so this is
-             # only a last resort behind the stable-ID lookup above.
-             target_value = _as_float(root_target)
-             if target_value is not None:
-                 for clade in tree.find_clades():
-                     if clade.confidence is None:
-                         continue
-                     clade_value = _as_float(clade.confidence)
-                     if clade_value is not None and clade_value == target_value:
-                         target_clade = clade
-                         break
+        target_clade = _find_root_target_clade(tree, root_target)
 
         if target_clade is None:
              # Useful debug info in the error
@@ -1979,6 +1985,79 @@ def _translate_internal_root_target(job_dir: Path, tree_json: Dict[str, Any],
     return translated
 
 
+ROOT_TIP_PRUNED_CHOSEN_BY = "recompute_root_tip_pruned"
+
+
+def _resolve_outgroup_root_target(tree, target: str) -> str:
+    """The tip an OUTGROUP root names, matched as the submission matched it.
+
+    An OUTGROUP state stores the user's outgroup string, which
+    resolve_outgroup_id() accepted as either the full header or its first
+    token ("AY123456" for "AY123456 Russula ..."); no clade carries the short
+    form as its name. Unresolvable strings are returned unchanged.
+    """
+    from app.services.raxml_validator import resolve_outgroup_id
+
+    tips = {clade.name: clade.name for clade in tree.get_terminals() if clade.name}
+    try:
+        return resolve_outgroup_id(target, tips)
+    except ValueError:
+        return target
+
+
+def _root_target_absence(tree_json: Dict[str, Any], tree, target: str) -> Optional[str]:
+    """Why a tip-name root target cannot be rerooted on, or None if it can.
+
+    ``"pruned"`` -- the user pruned exactly that tip (checked first: a tip
+    pruned while the recompute ran is still in the builder's output, and a
+    pruned tip named "95" must not resolve to some node with support 95).
+    ``"missing"`` -- no clade of the recomputed tree answers to it.
+    Internal-node IDs are left to reroot_tree().
+    """
+    if not target or target.startswith("internal:") or _is_legacy_internal_root_target(target):
+        return None
+    if target in set(tree_json.get("pruned_taxa") or []):
+        return "pruned"
+    if _find_root_target_clade(tree, target) is None:
+        return "missing"
+    return None
+
+
+def _midpoint_root_after_pruned_target(job_dir: Path, tree_json: Dict[str, Any],
+                                       previous_target: str, absence: str,
+                                       task_logger=None) -> Dict[str, Any]:
+    """Midpoint-root a recomputed tree whose root tip is gone."""
+    tree_json = apply_rooting_mode(job_dir, tree_json, "midpoint")
+    if absence == "pruned":
+        message = (
+            f"The tree was rooted on {previous_target}, which was removed from "
+            "the tree, so the recomputed tree is midpoint rooted."
+        )
+    else:
+        message = (
+            f"The tree was rooted on {previous_target}, which is not in the "
+            "recomputed tree, so it is midpoint rooted."
+        )
+    tree_json["rooting_info"] = {
+        "query_tip": tree_json.get("sequence_of_interest"),
+        "chosen_root_target": None,
+        "previous_root_target": previous_target,
+        "chosen_by": ROOT_TIP_PRUNED_CHOSEN_BY,
+        "reason": f"root_tip_{absence}",
+        "warnings": [message],
+        # Lets the viewer show the notice once per occurrence rather than on
+        # every visit for as long as this rooting stands.
+        "applied_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "candidate_count": 0,
+        "rejected_count": 0,
+    }
+    (task_logger or logger).info(
+        "event=tree.root_tip_pruned_midpoint reason=%s Root tip is not in the "
+        "recomputed tree; applied midpoint rooting", absence,
+    )
+    return tree_json
+
+
 def _reapply_rooting_after_recompute(job_dir: Path, tree_json: Dict[str, Any],
                                      previous_mode: Optional[str],
                                      previous_target: Optional[str],
@@ -2005,6 +2084,19 @@ def _reapply_rooting_after_recompute(job_dir: Path, tree_json: Dict[str, Any],
             target = _translate_internal_root_target(
                 job_dir, tree_json, previous_target, previous_split
             )
+            # Alan 11/4/26 - The user pruned the very tip the tree was rooted on
+            # and then recomputed (job 1436fec1). There is nothing to reroot on,
+            # and the builder's root is arbitrary, so use the default midpoint
+            # root and record why so the viewer can tell the user.
+            if HAS_BIOPYTHON:
+                tree = _read_editable_tree(job_dir, tree_json, "reroot")
+                if mode == "outgroup":
+                    target = _resolve_outgroup_root_target(tree, target)
+                absence = _root_target_absence(tree_json, tree, target)
+                if absence:
+                    return _midpoint_root_after_pruned_target(
+                        job_dir, tree_json, previous_target, absence, task_logger
+                    )
             return apply_rooting_mode(job_dir, tree_json, "manual", target=target)
 
         # Reached when a manual/tip/outgroup mode has no usable target (e.g. the

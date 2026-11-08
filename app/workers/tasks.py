@@ -869,7 +869,7 @@ def run_recompute_job(job_id: str, params_dict: dict) -> dict:
         publish_job_running(job_id)
         publish_overview(job_id, "Starting tree recompute...")
 
-        job_params = build_recompute_job_params(params_dict)
+        job_params = build_recompute_job_params(params_dict, job_dir=job_dir)
         result = recompute_tree(
             job_dir,
             job_params,
@@ -2022,11 +2022,11 @@ def run_phylo_job(job_params: dict) -> dict:
                     if input_type == "accession_list":
                         accessions = job_params.get("accessions", [])
                         from app.services.blast_service import blast_from_accessions
-                        blast_result = blast_from_accessions(accessions, Config, logger)
+                        blast_result = blast_from_accessions(accessions, Config, logger=logger)
                     else:
                         sequence = input_raw_path.read_text(encoding="utf-8")
                         from app.services.blast_service import blast_from_sequence
-                        blast_result = blast_from_sequence(sequence, Config, logger)
+                        blast_result = blast_from_sequence(sequence, Config, logger=logger)
                 
                 if blast_result:
                     with open(job_dir / "blast" / "blast_results.json", "w") as f:

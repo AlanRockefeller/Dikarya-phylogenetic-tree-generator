@@ -38,15 +38,17 @@ from app.models import ApiToken, Job
 from app.services.artifact_storage import read_artifact_bytes
 from app.services.security_utils import validate_safe_file_path, coerce_bool
 from app.services.job_id_service import generate_job_id
+from app.services.raxml_validator import DEFAULT_BOOTSTRAP_CUTOFF
 from app.services.tree_parameter_validation import (
     normalize_inherited_iqtree_ufboot_count,
+    submitted_tree_count_error,
     validate_iqtree_ufboot_count,
 )
 from app.services.tree_edit_service import (
     MAX_TREE_TIP_NAME_LENGTH,
     NEWICK_UNSAFE_TIP_CHARS,
 )
-from app.workers.queue import enqueue_job, enqueue_recompute_job
+from app.workers.queue import enqueue_job, enqueue_recompute_job, prepare_phylo_job_params
 
 logger = logging.getLogger(__name__)
 
@@ -553,11 +555,12 @@ def create_job():
     # MAFFT cannot align. The browser path applies the same check in
     # app/api/routes.py; this keeps the two APIs telling the user the same
     # story instead of the API accepting what the website refuses.
+    submitted_count = None
     if sequence_text:
         from app.services.fasta_utils import FastaValidationError
         from app.services.fasta_input_service import validate_submitted_fasta
         try:
-            validate_submitted_fasta(sequence_text, source="api_v1_submission")
+            submitted_count = validate_submitted_fasta(sequence_text, source="api_v1_submission")
         except FastaValidationError as exc:
             return error_response(
                 code="validation_failed",
@@ -663,6 +666,19 @@ def create_job():
         "mcmc_stop_early":   mcmc_stop_early,
     }
 
+    if tree_method == "raxml":
+        # An absent saved key means a legacy 0.03 run during recompute, so
+        # persist the default this new API job will actually use.
+        job_params["bootstrap_cutoff"] = DEFAULT_BOOTSTRAP_CUTOFF
+
+    prepare_phylo_job_params(job_params)
+    count_error = submitted_tree_count_error(job_params, submitted_count)
+    if count_error:
+        return error_response(
+            code="validation_failed", message=count_error, status=422,
+            details={"field": "sequence"},
+        )
+
     # Mint the id ourselves and commit the Job row *before* the work becomes
     # runnable. Enqueueing first meant a free worker could pick the job up in
     # the gap before the row existed; the pipeline tolerates a missing row, so
@@ -695,7 +711,7 @@ def create_job():
         return server_error(e, where="create_job")
 
     try:
-        enqueue_job(job_params, job_id=job_id)
+        enqueue_job(job_params, job_id=job_id, prepare=False)
     except Exception as e:
         # The row is committed and is the only record that this submission was
         # ever accepted, so it is marked failed rather than deleted: erasing it

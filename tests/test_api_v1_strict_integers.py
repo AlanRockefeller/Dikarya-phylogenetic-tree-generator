@@ -23,7 +23,9 @@ from app.api_v1 import routes as v1
 from app.config import Config
 
 JOB_ID = "6f7f0f8f-1d3a-4a26-9f2f-2f1c4b8d7a55"
-FASTA = ">Sample_A\nACGTACGTACGTACGTACGT\n>Sample_B\nACGTACGTACGTACGTACGA\n"
+# Keep input counts valid while exercising numeric parameter validation.
+FASTA = (">Sample_A\nACGTACGTACGTACGTACGT\n>Sample_B\nACGTACGTACGTACGTACGA\n"
+         ">Sample_C\nACGTACGTACGTACGTACGC\n>Sample_D\nACGTACGTACGTACGTACGG\n")
 
 # Every field that reaches `_validate_clamped_int`, with an in-range integer
 # and a value one step outside the documented bounds.

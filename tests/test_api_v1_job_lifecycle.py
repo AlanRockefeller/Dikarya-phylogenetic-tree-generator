@@ -25,7 +25,9 @@ from flask import Flask, g
 from app.api_v1 import routes as v1
 from app.config import Config
 
-FASTA = ">Sample_A\nACGTACGTACGTACGTACGT\n>Sample_B\nACGTACGTACGTACGTACGA\n"
+# Valid for every builder; these tests exercise lifecycle and input-type rules.
+FASTA = (">Sample_A\nACGTACGTACGTACGTACGT\n>Sample_B\nACGTACGTACGTACGTACGA\n"
+         ">Sample_C\nACGTACGTACGTACGTACGC\n>Sample_D\nACGTACGTACGTACGTACGG\n")
 
 
 def _undecorated(fn):
@@ -97,6 +99,44 @@ def _call_create(payload, *, enqueue=None, db=None, events=None):
 # ---------------------------------------------------------------------------
 
 class CreateOrderingTests(unittest.TestCase):
+    def test_single_query_is_queued_for_default_auto_blast(self):
+        sequence = ">query\nACGTACGTACGTACGTACGT\n"
+        for method in ("nj", "fasttree", "iqtree_fast", "iqtree", "raxml", "mrbayes"):
+            with self.subTest(method=method):
+                queued = {}
+                def enqueue(params, **kwargs):
+                    queued.update(params)
+                    return kwargs["job_id"]
+                response, _events, _created, _db = _call_create(
+                    {"input_type": "pasted_sequence", "sequence": sequence,
+                     "tree_method": method}, enqueue=enqueue)
+
+                self.assertEqual(response.status_code, 202)
+                self.assertEqual(queued["sequence"], sequence)
+                self.assertEqual(queued.get("blast_mode", "auto"), "auto")
+
+    def test_raxml_cutoff_is_saved_and_replayed_without_changing_the_default(self):
+        from app.services.raxml_validator import (
+            DEFAULT_BOOTSTRAP_CUTOFF, validate_and_resolve_raxml_params,
+        )
+        from app.services.tree_edit_service import build_recompute_job_params
+
+        queued = {}
+
+        def capture(params, *args, **kwargs):
+            queued.update(params)
+            return kwargs["job_id"]
+
+        response, *_ = _call_create(
+            {"input_type": "pasted_sequence", "sequence": FASTA, "tree_method": "raxml"},
+            enqueue=capture,
+        )
+        self.assertEqual(response.status_code, 202)
+        self.assertEqual(queued["bootstrap_cutoff"], DEFAULT_BOOTSTRAP_CUTOFF)
+        initial = validate_and_resolve_raxml_params(queued).bootstrap_cutoff
+        replayed = build_recompute_job_params(queued).tree_builder_params.bootstrap_cutoff
+        self.assertEqual(replayed, initial)
+
     def test_the_row_is_committed_before_the_job_becomes_runnable(self):
         response, events, created, _db = _call_create(
             {"input_type": "pasted_sequence", "sequence": FASTA})

@@ -38,6 +38,11 @@ def _ric(value):
     return match.group(1) if match else ""
 
 
+def _normalize_tip_label(value):
+    """Match the viewer's record-label normalization for legacy source links."""
+    return " ".join(re.sub(r"^_R_", "", str(value or "")).split())
+
+
 def _iter_leaves(node):
     if not isinstance(node, dict):
         return
@@ -52,13 +57,20 @@ def _iter_leaves(node):
 def _original_tip_name(state, requested):
     renames = state.get("renames") if isinstance(state, dict) else {}
     renames = renames if isinstance(renames, dict) else {}
-    matches = []
+    exact = []
+    normalized_matches = []
+    normalized = _normalize_tip_label(requested)
     for leaf in _iter_leaves((state or {}).get("tree_structure") or {}):
         original = str(leaf.get("original_name") or leaf.get("name") or "").strip()
         displayed = str(renames.get(original) or leaf.get("display_name")
                         or leaf.get("name") or original).strip()
-        if requested in {original, displayed} and original not in matches:
-            matches.append(original)
+        if requested in {original, displayed} and original not in exact:
+            exact.append(original)
+        if (normalized in {_normalize_tip_label(original), _normalize_tip_label(displayed)}
+                and original not in normalized_matches):
+            normalized_matches.append(original)
+    # Preserve exact identity when two saved labels normalize to the same text.
+    matches = exact or normalized_matches
     if len(matches) != 1:
         raise MycoMapSequenceLinkError(
             "That tree sequence is no longer available." if not matches
@@ -70,8 +82,10 @@ def _original_tip_name(state, requested):
 
 def _metadata_for_tip(job_info, original_name):
     exact = []
+    normalized_matches = []
     token_matches = []
-    wanted_token = original_name.split(None, 1)[0] if original_name else ""
+    normalized = _normalize_tip_label(original_name)
+    wanted_token = normalized.split(None, 1)[0] if normalized else ""
     for row in job_info.get("sequence_metadata") or []:
         if not isinstance(row, dict):
             continue
@@ -81,11 +95,14 @@ def _metadata_for_tip(job_info, original_name):
         }
         if original_name in names:
             exact.append(row)
+        elif normalized in {_normalize_tip_label(name) for name in names}:
+            normalized_matches.append(row)
         elif wanted_token and any(
-            name.split(None, 1)[0] == wanted_token for name in names if name
+            _normalize_tip_label(name).split(None, 1)[0] == wanted_token
+            for name in names if _normalize_tip_label(name)
         ):
             token_matches.append(row)
-    matches = exact or token_matches
+    matches = exact or normalized_matches or token_matches
     if len(matches) != 1:
         raise MycoMapSequenceLinkError("No unique MycoMap source record was saved for this tip.")
     row = matches[0]
@@ -100,10 +117,17 @@ def _matching_fasta_sequences(fasta_text, original_name):
     exact = [sequence for header, sequence in records if header == original_name]
     if exact:
         return exact
-    token = original_name.split(None, 1)[0] if original_name else ""
+    normalized = _normalize_tip_label(original_name)
+    normalized_matches = [
+        sequence for header, sequence in records
+        if normalized and _normalize_tip_label(header) == normalized
+    ]
+    if normalized_matches:
+        return normalized_matches if len(normalized_matches) == 1 else []
+    token = normalized.split(None, 1)[0] if normalized else ""
     token_matches = [
         sequence for header, sequence in records
-        if token and header.split(None, 1)[0] == token
+        if token and (_normalize_tip_label(header).split(None, 1) or [""])[0] == token
     ]
     return token_matches if len(token_matches) == 1 else []
 
@@ -173,9 +197,9 @@ def resolve_job_tip_url(job_dir, tip_name):
 
     displayed_name = str((state.get("renames") or {}).get(original_name) or original_name)
     reference = (
-        extract_mycomap_observation_reference(original_name)
-        or extract_mycomap_observation_reference(displayed_name)
-        or extract_mycomap_observation_reference(metadata.get("display_label"))
+        extract_mycomap_observation_reference(_normalize_tip_label(original_name))
+        or extract_mycomap_observation_reference(_normalize_tip_label(displayed_name))
+        or extract_mycomap_observation_reference(_normalize_tip_label(metadata.get("display_label")))
     )
     if not reference:
         raise MycoMapSequenceLinkError(

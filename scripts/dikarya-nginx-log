@@ -103,7 +103,8 @@ fi
 # Filter before tail: traffic from image hosting can otherwise consume the
 # entire 200,000-line budget before even one day of Dikarya is covered.
 case "$FILTER" in
-    app_access) /usr/bin/zcat -f $FILES | /usr/bin/awk '/ host="(www\.)?dikarya\.us" server="dikarya\.us"$/' | /usr/bin/tail -n "$LINES" ;;
+    # Timing and correlation fields follow server= in the current format.
+    app_access) /usr/bin/zcat -f $FILES | /usr/bin/awk '/ host="(www\.)?dikarya\.us" server="dikarya\.us"([[:space:]]|$)/' | /usr/bin/tail -n "$LINES" ;;
     app_error) /usr/bin/zcat -f $FILES | /usr/bin/awk '/server: dikarya\.us,/' | /usr/bin/tail -n "$LINES" ;;
     all) /usr/bin/zcat -f $FILES | /usr/bin/tail -n "$LINES" ;;
 esac
