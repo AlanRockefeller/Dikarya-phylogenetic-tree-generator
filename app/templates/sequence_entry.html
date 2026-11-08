@@ -3596,14 +3596,18 @@
             : `${checked.issue_count} problem(s) found. ` + (checked.diagnostic_id ? `Diagnostic reference: ${checked.diagnostic_id}` : '');
         document.getElementById('fasta-repair-summary').textContent = summary;
         const accessionButton = document.getElementById('fasta-use-accessions');
-        accessionButton.classList.toggle('hidden', checked.input_kind !== 'accessions');
-        if (checked.input_kind === 'accessions') {
+        // Alan 11/8/26 - An accession list is not broken FASTA: it gets the fetch
+        // prompt only, without the "no records" issue or repair guidance under it.
+        const isAccessionList = checked.input_kind === 'accessions';
+        accessionButton.classList.toggle('hidden', !isAccessionList);
+        document.getElementById('fasta-repair-apply').classList.toggle('hidden', isAccessionList);
+        if (isAccessionList) {
             document.getElementById('fasta-repair-summary').textContent =
                 `This is a list of ${checked.accession_count} GenBank accession(s). Use Fetch GenBank accessions to retrieve their sequences.`;
         }
         for (const [id, messages] of [
-            ['fasta-repair-issues', (checked.issues || []).map(issue => issue.message)],
-            ['fasta-repair-changes', checked.repair?.changes || ['No formatting repair is available.']],
+            ['fasta-repair-issues', isAccessionList ? [] : (checked.issues || []).map(issue => issue.message)],
+            ['fasta-repair-changes', isAccessionList ? [] : (checked.repair?.changes || ['No formatting repair is available.'])],
         ]) {
             const list = document.getElementById(id);
             list.replaceChildren();
@@ -3611,7 +3615,7 @@
                 const item = document.createElement('li'); item.textContent = message; list.appendChild(item);
             });
         }
-        if (checked.repair && !checked.repair.valid) {
+        if (!isAccessionList && checked.repair && !checked.repair.valid) {
             for (const issue of checked.repair.issues) {
                 const item = document.createElement('li');
                 item.textContent = 'Still needs correction: ' + issue.message;
@@ -3620,7 +3624,7 @@
         }
         document.getElementById('fasta-repair-original').value = original;
         document.getElementById('fasta-repair-preview').value = checked.repair?.sequence || original;
-        document.getElementById('fasta-repair-apply').disabled = !checked.repair?.valid;
+        document.getElementById('fasta-repair-apply').disabled = isAccessionList || !checked.repair?.valid;
         if (!dialog.open) dialog.showModal();
     }
 

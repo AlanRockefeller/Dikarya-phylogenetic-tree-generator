@@ -98,6 +98,20 @@ test('formatting preview changes input only after Apply, and Add remains a separ
     assert.equal(h.queue[0].sequence, 'ACGT');
 });
 
+test('an accession list gets the fetch prompt without FASTA issues or repair guidance', async () => {
+    const h = harness(() => ({ ...invalid, diagnostic_id: null, input_kind: 'accessions', accession_count: 1,
+        issues: [{ message: 'No FASTA records were found.' }],
+        repair: { valid: false, issues: [{ message: 'No FASTA records were found.' }], sequence: 'AB123456\n', changes: ['Normalize.'] } }));
+    h.nodes.sequence_text.value = 'AB123456';
+    await h.nodes.check_fasta_btn.click();
+    assert.match(h.nodes['fasta-repair-summary'].textContent, /list of 1 GenBank accession/);
+    assert.equal(h.nodes['fasta-repair-issues'].children.length, 0);
+    assert.equal(h.nodes['fasta-repair-changes'].children.length, 0);
+    assert.equal(h.nodes['fasta-use-accessions'].classList.contains('hidden'), false);
+    assert.equal(h.nodes['fasta-repair-apply'].classList.contains('hidden'), true);
+    assert.equal(h.nodes['fasta-repair-apply'].disabled, true);
+});
+
 test('replacement text and a duplicate Add cannot be consumed by an in-flight check', async () => {
     let resolve;
     const h = harness(() => new Promise(done => { resolve = done; }));

@@ -21,7 +21,10 @@ Three independent passes (see app/services/type_specimen_service.py):
             type-specimen list; only tss.TRUSTED_CURATION_BASES are recorded
             ("source" is a keyword match). The flag can change at any time, so
             accessions are re-asked every run rather than skipped once known.
-            Bounded by --max-curation-accessions (100 per request).
+            Bounded by --max-curation-accessions (100 per request) and
+            --curation-max-minutes. A run stopped by either one records where
+            it got to in curation_cursor.json (per --since-days), and the
+            next run continues from there, wrapping round.
 
 Output lives in Config.TYPE_SPECIMEN_DIR (cache/type_specimens, group dikarya,
 2775), which the web process reads and the worker appends to.
@@ -46,6 +49,7 @@ import sys
 import tempfile
 import time
 import urllib.request
+from bisect import bisect_right
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from urllib.parse import urlencode
@@ -352,6 +356,48 @@ def job_accessions(since_days):
     return _scan_job_accessions(since_days, lambda header, acc: True)
 
 
+# Where the last curation run that stopped short got to, per --since-days.
+# Alan 11/8/26 - Negative answers are not cached, so without this every capped
+# or time-limited run asked the same sorted prefix again and an all-jobs
+# backfill (~212,000 accessions against the 25,000 cap) never got past it.
+CURATION_CURSOR_NAME = "curation_cursor.json"
+
+
+def _curation_cursor_scope(since_days):
+    return f"since_days={since_days:g}"
+
+
+def _read_curation_cursor(scope):
+    try:
+        data = json.loads((tss.DATA_DIR / CURATION_CURSOR_NAME).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return ""
+    value = data.get(scope) if isinstance(data, dict) else None
+    return value if isinstance(value, str) else ""
+
+
+def _write_curation_cursor(scope, accession):
+    """Record (or, with accession None, clear) where the next run starts."""
+    path = tss.DATA_DIR / CURATION_CURSOR_NAME
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(data, dict):
+            data = {}
+    except (OSError, ValueError):
+        data = {}
+    if accession:
+        data[scope] = accession
+    elif scope in data:
+        del data[scope]
+    else:
+        return
+    try:
+        write_atomically(path, json.dumps(data, sort_keys=True) + "\n")
+    except OSError as exc:
+        log(f"curation: could not save where this run stopped ({exc}); "
+            "the next run starts from the beginning")
+
+
 def run_curation(args):
     from app.services.mycomap_org_service import CURATION_BATCH_SIZE, curated_genbank_rows
 
@@ -359,9 +405,19 @@ def run_curation(args):
     todo = sorted(candidates)
     deferred = 0
     log(f"curation: {jobs} jobs scanned, {len(todo)} accessions to ask MycoMap.org about")
-    if args.max_curation_accessions and len(todo) > args.max_curation_accessions:
+    # Continue after the accession the last short run stopped at, wrapping
+    # round, so every candidate is asked in turn and then re-asked on the next
+    # lap; a run that asks everything clears the cursor and starts at the top.
+    scope = _curation_cursor_scope(args.since_days)
+    cursor = _read_curation_cursor(scope)
+    if cursor:
+        start = bisect_right(todo, cursor)
+        todo = todo[start:] + todo[:start]
+        log(f"curation: continuing after {cursor}, where the last run stopped")
+    capped = bool(args.max_curation_accessions and len(todo) > args.max_curation_accessions)
+    if capped:
         log(f"curation: limiting this run to {args.max_curation_accessions}; "
-            "the rest are picked up next time")
+            "the next run continues from where this one stops")
         deferred = len(todo) - args.max_curation_accessions
         todo = todo[:args.max_curation_accessions]
     if args.dry_run or not todo:
@@ -377,6 +433,9 @@ def run_curation(args):
     # and waits out a 429's Retry-After rather than writing the batch off.
     budget_ends = time.monotonic() + args.curation_max_minutes * 60
     answered = unanswered = 0
+    # How many of todo, from its start, were asked without a gap: the next run
+    # starts after the last of them, so an unanswered batch is asked again.
+    asked_through = 0
     starts = list(range(0, len(todo), CURATION_BATCH_SIZE))
     for number, start in enumerate(starts):
         batch = todo[start:start + CURATION_BATCH_SIZE]
@@ -384,6 +443,8 @@ def run_curation(args):
             try:
                 # Records every answer into the curation cache as a side effect.
                 answered += len(curated_genbank_rows(batch, strict=True))
+                if asked_through == start:
+                    asked_through = start + len(batch)
                 break
             except Exception as exc:
                 wait = (getattr(exc, "retry_after", None) or 0) + 5
@@ -404,6 +465,10 @@ def run_curation(args):
                 log(f"curation: --curation-max-minutes reached; {left} accessions left for next run")
                 break
             time.sleep(args.curation_interval)
+    if not capped and asked_through == len(todo):
+        _write_curation_cursor(scope, None)
+    elif asked_through:
+        _write_curation_cursor(scope, todo[asked_through - 1])
     after = {acc: entry for acc, entry in tss.curation_index().items() if tss.curation_marks(entry)}
     added = sorted(set(after) - set(before))
     removed = sorted(set(before) - set(after))

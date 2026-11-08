@@ -560,20 +560,59 @@ class TestMycomapBlastMetrics(unittest.TestCase):
 
         self.assertEqual(improved, "KM248898 Hygrocybe minutula")
 
-        # A herbarium barcode is accession-shaped too (NY + 8 digits); the
-        # accession the curator put last must still win.
+        # A herbarium barcode is accession-shaped too (NY + 8 digits). With no
+        # voucher to say which is which, both are kept in header order, in
+        # either position, rather than one being guessed.
         with_barcode = "Hygrocybe cf minutula NY00123456 KM248898"
         self.assertEqual(
             improve_mycomap_sequence_name(with_barcode, metric, "local"),
-            "KM248898 Hygrocybe minutula",
+            "NY00123456 KM248898 Hygrocybe minutula",
+        )
+        barcode_last = "Hygrocybe cf minutula KM248898 NY00123456"
+        self.assertEqual(
+            improve_mycomap_sequence_name(barcode_last, metric, "local"),
+            "KM248898 NY00123456 Hygrocybe minutula",
         )
         # A known voucher is never taken for the accession, wherever it sits.
-        voucher_last = "Hygrocybe cf minutula KM248898 NY00123456"
         self.assertEqual(
-            improve_mycomap_sequence_name(voucher_last, metric, "local",
+            improve_mycomap_sequence_name(barcode_last, metric, "local",
                                           voucher="NY00123456"),
             "KM248898 Hygrocybe minutula",
         )
+        # A versioned and an unversioned spelling are one record.
+        self.assertEqual(
+            improve_mycomap_sequence_name(
+                "Hygrocybe cf minutula KM248898 KM248898.1", metric, "local"),
+            "KM248898 Hygrocybe minutula",
+        )
+
+    def test_improve_local_name_ignores_accessions_in_curator_notes(self):
+        """A parenthetical note names another record, never this one."""
+        # Real curator headers from local hits: the note holds the type
+        # it was matched to, or a second specimen's herbarium number.
+        metric = {"display_name": "Russula mendocinensis",
+                  "species_name": "Russula mendocinensis", "mycomap_location": ""}
+        self.assertEqual(
+            improve_mycomap_sequence_name(
+                "Russula mendocinensis CA (1/0 ITS1 matchto TYPE CA KX812826) DQ367913",
+                metric, "local"),
+            "DQ367913 Russula mendocinensis",
+        )
+        metric = {"display_name": "Russula crenulata",
+                  "species_name": "Russula crenulata", "mycomap_location": ""}
+        self.assertEqual(
+            improve_mycomap_sequence_name(
+                "Russula crenulata 24a (crenulata UNITE #2) (+CAx3) HQ604846 F19990 "
+                "MO67832 Vict Garry Oak (F18833 unseq'd)", metric, "local"),
+            "HQ604846 F19990 Russula crenulata",
+        )
+        # A holotype named only in a note must not label (and so type-mark) the tip.
+        metric = {"display_name": "Entoloma undulatosporum",
+                  "species_name": "Entoloma undulatosporum", "mycomap_location": ""}
+        improved = improve_mycomap_sequence_name(
+            "Entoloma undulatosporum (match to dirty holotype PX412020) EU UDB0799647",
+            metric, "local")
+        self.assertNotIn("PX412020", improved)
 
 
 class TestMycomapBlastCreation(unittest.TestCase):

@@ -3692,27 +3692,53 @@ def _build_result_display_info(description: str, identifier: str = '',
     return result
 
 
-def _header_accession_token(tokens: list, voucher: str = '') -> str:
-    """Return the accession-shaped token a local hit header names, or ''.
+def _strip_header_notes(text: str) -> str:
+    """Remove parenthetical and bracketed notes, innermost first."""
+    previous = None
+    while previous != text:
+        previous = text
+        text = re.sub(r'\([^()]*\)|\[[^\[\]]*\]', ' ', text)
+    return text
 
-    Shape alone cannot tell an accession from a herbarium barcode: NYBG's
-    "NY00123456" is a valid 2+8 accession shape. Curator headers put the
-    accession last ("Hygrocybe cf minutula QC (type NY) KM248898"), so the
-    LAST matching token wins, and any token of a known voucher is skipped.
+
+def _header_accession_identifier(tokens: list, voucher: str = '') -> str:
+    """Return the accession(s) a local hit header names, or ''.
+
+    Shape alone cannot tell an accession from a herbarium number: NYBG's
+    "NY00123456" is a valid 2+8 accession shape and UBC's "F19990" a valid 1+5
+    one, and a local hit has no structured accession or voucher to check
+    against. Alan 11/8/26 - Two signals in the header are reliable, and the
+    "last token wins" rule this replaces picked a herbarium number in two of
+    the three real curator headers with more than one candidate:
+
+    - a note in parentheses or brackets is about some other record ("(match to
+      dirty holotype PX412020)", "(F17170 OC98)"), so nothing inside one is
+      this record's accession -- taking PX412020 would mark the tip a type;
+    - a token of a known voucher is never the accession.
+
+    If more than one candidate is still left, which one is this record's own
+    cannot be known, so all are kept in header order rather than one guessed:
+    "... HQ604846 F19990 MO67832 Vict" -> "HQ604846 F19990".
     """
     from app.services.fasta_utils import is_genbank_accession
 
     voucher_tokens = {
         part.strip('>,;()[]{}').casefold() for part in str(voucher or '').split()
     }
-    found = ''
-    for token in tokens:
+    found = []
+    seen = set()
+    for token in _strip_header_notes(' '.join(tokens)).split():
         candidate = token.strip('>,;()[]{}')
         if candidate.casefold() in voucher_tokens:
             continue
-        if re.search(r'\d', candidate) and is_genbank_accession(candidate):
-            found = candidate
-    return found
+        if not (re.search(r'\d', candidate) and is_genbank_accession(candidate)):
+            continue
+        # "KM248898 KM248898.1" names one record, not two.
+        key = candidate.split('.', 1)[0].casefold()
+        if key not in seen:
+            seen.add(key)
+            found.append(candidate)
+    return ' '.join(found)
 
 
 def improve_mycomap_sequence_name(current_name: str, metric: Optional[dict],
@@ -3750,7 +3776,7 @@ def improve_mycomap_sequence_name(current_name: str, metric: Optional[dict],
             # A curator-written header such as "Hygrocybe cf minutula QC (type
             # NY) KM248898" leads with the genus and puts the accession last;
             # taking the first word produced "Hygrocybe Hygrocybe minutula".
-            accession_token = _header_accession_token(identifier[1:], voucher)
+            accession_token = _header_accession_identifier(identifier[1:], voucher)
             if accession_token:
                 label_identifier = accession_token
         location = metric.get('mycomap_location') or ''
