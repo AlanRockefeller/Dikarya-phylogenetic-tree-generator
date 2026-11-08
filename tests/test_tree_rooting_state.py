@@ -608,6 +608,49 @@ class TestRecomputeRootTargets(unittest.TestCase):
                 self.assertEqual(state["rooting_info"]["reason"], "root_tip_pruned")
                 self.assertEqual(state["rooting_info"]["previous_root_target"], target)
 
+    def test_lost_root_clade_falls_back_to_midpoint(self):
+        # Alan 11/8/26 - Job jtk5: the clade the tree was rooted on is not in the
+        # recomputed tree. The reroot used to raise and keep the builder's
+        # arbitrary root; it is now midpoint rooted like a lost root tip, with
+        # a reason that says how the clade was lost.
+        target = _stable_internal_node_id_from_names(["A", "B"])
+        split = ({"A", "B"}, {"A", "B", "C", "D"})
+        cases = (
+            ("((A:1,C:1):1,(B:1,D:1):1);", split, "root_clade_split"),
+            ("((C:1,D:1):1,(E:1,F:1):1);", split, "root_clade_removed"),
+            ("((A:1,E:1):1,(B:1,F:1):1);", split, "root_clade_rest_removed"),
+            ("((A:1,C:1):1,(B:1,D:1):1);", None, "root_clade_unrecorded"),
+        )
+        for newick, previous_split, reason in cases:
+            with self.subTest(reason=reason), tempfile.TemporaryDirectory() as d:
+                job_dir = Path(d)
+                _write_pruned_tree(job_dir, newick)
+                state = _reapply_rooting_after_recompute(
+                    job_dir, {}, "tip", target, previous_split=previous_split)
+
+                self.assertTrue(state["is_midpoint_rooted"])
+                self.assertIsNone(state["root_target"])
+                info = state["rooting_info"]
+                self.assertEqual(info["reason"], reason)
+                self.assertEqual(info["chosen_by"], "recompute_root_tip_pruned")
+                self.assertEqual(info["previous_root_target"], target)
+                # The stable ID means nothing to a reader; the notice must not
+                # quote it.
+                self.assertNotIn("internal:", info["warnings"][0])
+
+    def test_surviving_root_clade_is_still_rerooted_on(self):
+        target = _stable_internal_node_id_from_names(["A", "B"])
+        with tempfile.TemporaryDirectory() as d:
+            job_dir = Path(d)
+            _write_pruned_tree(job_dir, "(((A:1,B:1):1,C:1):1,D:1);")
+            state = _reapply_rooting_after_recompute(
+                job_dir, {}, "tip", target,
+                previous_split=({"A", "B"}, {"A", "B", "C", "D"}))
+
+            self.assertEqual(state["root_mode"], "manual")
+            self.assertEqual(state["root_target"], target)
+            self.assertFalse(state["is_midpoint_rooted"])
+
 
 if __name__ == "__main__":
     unittest.main()

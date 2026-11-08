@@ -1304,14 +1304,22 @@ def _run_raxml(
             "bootstrap_stopped_early": False,
         }
     )
-    if resolved.warnings:
+    # Alan 11/8/26 - Only adjustments that cut back what was requested are
+    # DEGRADED; resolved.notices (e.g. early stopping turned off for a
+    # publication run, which searches MORE thoroughly) are still listed in
+    # parameter_warnings below but did not degrade anything.
+    # getattr: a worker that imported raxml_validator before `notices` existed
+    # can still load this module fresh in a forked job.
+    notices = set(getattr(resolved, "notices", ()) or ())
+    degrading = [w for w in resolved.warnings if w not in notices]
+    if degrading:
         from app.services.log_context import log_degradation
 
         log_degradation(
             task_logger, "raxml_parameters_adjusted",
             "RAxML-NG ran with scientifically meaningful parameter adjustments; "
             "see tree_metadata.json for requested, applied, and warning details",
-            warning_count=len(resolved.warnings),
+            warning_count=len(degrading),
         )
 
     return resolved.model, model_selected_by, {

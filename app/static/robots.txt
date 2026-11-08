@@ -82,6 +82,11 @@ Allow: /
 # this site and never has: in a two-day sample ImageBot alone made 43,466
 # requests, all 404, ~88% of all traffic. nginx blocks these outright; the
 # entries are kept here so a well-behaved client can opt out before being blocked.
+#
+# Alan 11/8/26 - Everything nginx blocks (ops/nginx/00-bot-blocklist) must have a
+# "Disallow: /" group here, and the blocklist now lets those bots read this one
+# file: until then they got a 403 for robots.txt too, never saw these groups, and
+# kept retrying.
 User-agent: ImageBot
 Disallow: /
 
@@ -105,6 +110,15 @@ User-agent: PetalBot
 Disallow: /
 
 User-agent: DataForSeoBot
+Disallow: /
+
+User-agent: BLEXBot
+Disallow: /
+
+User-agent: ZoominfoBot
+Disallow: /
+
+User-agent: serpstatbot
 Disallow: /
 
 User-agent: Bytespider

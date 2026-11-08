@@ -14,8 +14,9 @@ all ask for the same things -- ``/api/.env`` came from nine distinct clients in
 a single day. Nobody else in the world is asking for
 ``/api/job/aq7c/download/alignment_raw``, because that shape exists only here.
 
-So this module tracks distinct clients per normalised path over a rolling week
-and returns one of three verdicts:
+So this module tracks distinct clients per normalised path, forgetting a path
+only after a week in which nobody asked for it, and returns one of three
+verdicts:
 
 * ``dictionary``  -- seen from enough unrelated clients to be sweep vocabulary.
   Demote it: no WARNING, and no score against the actor either.
@@ -106,16 +107,22 @@ def verdict_for(distinct_clients):
 
 
 # Add this client and report how many distinct ones have asked, atomically and
-# without letting the set grow past the cap or lose its TTL.
+# without letting the set grow past the cap.
+#
+# Alan 11/8/26 - The expiry slides: every observation pushes it a full window
+# out, so a path is forgotten only after a week in which nobody asked for it.
+# It used to be set once, when the key was created, which wiped each path's
+# history seven days after it was FIRST seen however busy it was. /core/app/.env
+# had been requested by 8 clients since 9/1, yet after its key lapsed on 11/7
+# the next sweep scored it as a never-seen "singleton" and escalated a plain
+# .env scanner (35.189.61.0/24). The set itself stays capped at CLIENT_CAP.
 _OBSERVE_SCRIPT = """
 local cap = tonumber(ARGV[1])
 local window = tonumber(ARGV[2])
 if redis.call('SCARD', KEYS[1]) < cap then
     redis.call('SADD', KEYS[1], ARGV[3])
 end
-if redis.call('TTL', KEYS[1]) < 0 then
-    redis.call('EXPIRE', KEYS[1], window)
-end
+redis.call('EXPIRE', KEYS[1], window)
 return redis.call('SCARD', KEYS[1])
 """
 

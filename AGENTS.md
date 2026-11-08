@@ -751,6 +751,15 @@ When a new CLI version is published:
   `Retry-After` of several minutes). A 429 sets the Redis key
   `CURATION_PAUSE_KEY` for that long and every process skips the lookup until
   it expires, so live labels fall back to GenBank's names during the wait.
+  MycoMap.org PR #17 exempts a key an admin has marked at `/admin/api-keys`:
+  `curated_genbank_rows()` sends `MYCOMAP_ORG_API_KEY` in `X-API-Key` whenever
+  the process has it (web and worker units do; the `tree` user's cron does
+  not, so the weekly pass stays anonymous and paced), and an exempt answer
+  carries `X-MycoMap-Rate-Limit: exempt`. A 401 (invalid key) or 403
+  (pending/disabled) logs `event=mycomap_org.auth_refused`, sets
+  `CURATION_KEY_REFUSED_KEY` for 10 minutes and re-asks anonymously -- the key
+  is an optimisation, never a reason to lose curated names. MycoMap.org drops
+  accessions past 500 per request without an error; Dikarya sends 100.
   Anything that calls it in bulk must pace itself -- the refresh's `curation`
   pass waits `--curation-interval` (30 s) between requests to leave room for
   the live site, and waits out a `Retry-After` instead of writing the batch off.
@@ -768,12 +777,15 @@ When a new CLI version is published:
   exists because a type a curator designates on MycoMap.org (`typeBasis:
   "manual"`) never reaches the type list -- job cewq held seven of them, none
   marked. Only a positive flag with a basis in `TRUSTED_CURATION_BASES`
-  (`manual`, `mycomap`, `refseq`) marks: `isType: false` means "not designated
-  on MycoMap" (GenBank holotypes answer false), never "not a type", and
-  `typeBasis: "source"` is a bare match on the word "type" in GenBank's source
-  qualifiers -- "RFLP type 52", "its type b", "type: OTU" -- that was wrong
-  every time it was checked. The check runs on read (`curation_marks()`), so
-  narrowing the list also disarms entries already recorded. All live in
+  (`manual`, `refseq`, `type_material`, `mycomap`) marks: `isType: false` means
+  "not designated on MycoMap" (and a `manual` false is a curator's "Not type"),
+  never "not a type" on its own. `typeBasis: "source"` was a bare match on the
+  word "type" in GenBank's source qualifiers -- "RFLP type 52", "its type b",
+  "type: OTU" -- wrong every time it was checked. MycoMap.org PR #18 rewrites
+  `title` and `source` with type-word rules; trust them only once it is
+  deployed and its recheck script has been applied to .org's
+  `genbank_curation` table. The check runs on read (`curation_marks()`), so
+  changing the list also changes entries already recorded. All live in
   `Config.TYPE_SPECIMEN_DIR` (`cache/type_specimens`, tree:dikarya 2775 like
   `cache/blast`). If the processed snapshot is absent on a fresh deployment,
   the app reads and normalizes the committed raw API dump
@@ -1104,6 +1116,18 @@ internet. Paths are normalised (ids and digit runs collapsed) and stored only
 as a hash. Without Redis the verdict is `emerging` -- no opinion, never
 `singleton`, so the failure mode is quiet rather than accusatory.
 
+The expiry **slides**: each observation pushes it a full week out, so a path is
+forgotten only after a week in which nobody asked for it. It used to be set
+once, at key creation, which wiped every path's history seven days after it was
+first seen however busy it was -- a sweep landing just after that reset scored
+every app-shaped path as a singleton and escalated (35.189.61.0/24, a plain
+`.env` scanner, 2026-11-07). Do not "simplify" the script back to setting the
+TTL only when it is missing.
+
+A scanner word in the job-id slot (`/job/.env`) is filed as scanner, not as
+`job_id_malformed`: it is a sweep appending its dictionary to a directory it
+found on our pages, not a test of the id parser.
+
 **`app/services/security_honeytokens.py` plants paths that exist only in our
 own output.** A scanner's dictionary was fixed before it ever contacted this
 host, so it cannot ask for something it learned here. Three today: a
@@ -1125,7 +1149,10 @@ answers on port 443, and all four WARN immediately:
 - `path_traversal_app_surface` -- traversal that starts from a job artifact
   route rather than the site root. A sweep asks every host for `/etc/passwd`
   (still reported, as plain `path_traversal`); only someone who has looked at
-  Dikarya climbs out of `/job/<id>/download/`.
+  Dikarya climbs out of `/job/<id>/download/`. The traversal has to start
+  *inside* the route (`/static/../`): `/static../` is the stock nginx
+  "off-by-slash" alias probe, sent to the same ten directory names on every
+  host, and is plain `path_traversal`.
 - `artifact_path_probe` -- a request naming the on-disk layout
   (`input_info.json`, `tree_state.json`, `var/jobs/...`). Those names are in
   this repository and in no scanner dictionary anywhere.
@@ -1417,6 +1444,23 @@ built from counts and option names for this same reason.
 ## Ops / Debugging Notes
 
 - Production runs under systemd (Gunicorn web + worker services).
+- **nginx's crawler blocklist lives in `ops/nginx/00-bot-blocklist`** (the
+  installed `/etc/nginx/sites-available/00-bot-blocklist` is a root-owned copy;
+  the install command is in the file's header). Blocked crawlers get a 403 for
+  everything except `/robots.txt`, and every bot it blocks must also have a
+  `Disallow: /` group in `app/static/robots.txt`, so a compliant one can read
+  that and stop instead of retrying against the 403.
+- **`/amanitaceae/` is untrusted third-party content on our origin.** It is a
+  static mirror (not in git) of Tulloss's amanitaceae.org, built 2026-05-30 from
+  archived copies of a CMS that was compromised in 2023-24 (the "Boolka"
+  campaign injected a script dropper into its content snippets). nginx serves
+  it with a `Content-Security-Policy: sandbox ...` header (in
+  `ops/nginx/dikarya`), so its legacy jQuery/xajax/CKEditor code runs in an
+  opaque origin and cannot reach dikarya.us cookies, storage or same-origin
+  APIs, and cannot load from or send to other hosts. Keep that header, and do
+  not add third-party scripts to the mirror; the 2026-11-08 cleanup removed its
+  Google Analytics loaders and the inert BeEF clean-up snippets. Backups from
+  that cleanup are in `~/.dikarya/backups/`.
 - If route changes do not appear in production, Gunicorn reload/restart may be required.
 - `127.0.0.1` is not reachable for website tests in this environment; use `https://dikarya.us` for local website testing instead.
 - Check app logs for 500 errors before changing code (see "Reading logs" above).

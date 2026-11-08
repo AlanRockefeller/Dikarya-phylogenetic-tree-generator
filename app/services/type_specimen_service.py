@@ -58,15 +58,20 @@ MYCOMAP_SNAPSHOT_NAME = "mycomap_type_specimens.json"
 BUNDLED_MYCOMAP_PATH = Config.BASE_DIR / "mycomap-type-specimens.json"
 GENBANK_CACHE_NAME = "genbank_type_material.jsonl"
 CURATION_CACHE_NAME = "mycomap_curation_types.jsonl"
-# genbank-curation's typeBasis says why MycoMap.org calls a record a type, and
-# only these are trusted. "manual" is a curator's designation (OP739129),
-# "mycomap" a type word in the record's own annotation ("holotype Leccinum
-# snellii", "isotype"), "refseq" RefSeq's "from TYPE material". "source" is a
-# bare match on the word "type" anywhere in GenBank's source qualifiers and
-# was wrong for every one checked on 2026-11-08: "RFLP type 52", "its type b",
-# "type: OTU: KGP46", "study type" -- three of them on uncultured fungi. An
-# unknown basis is not trusted until someone has looked at what it matches.
-TRUSTED_CURATION_BASES = frozenset({"manual", "mycomap", "refseq"})
+# genbank-curation's typeBasis says why MycoMap.org calls a record a type
+# (first match wins), and only these are trusted. "manual" is a curator's
+# designation (OP739129), "refseq" an NR_ record not "from reference/verified
+# material", "type_material" NCBI's own /type_material qualifier (added by
+# MycoMap.org PR #18; 0/30 false in its audit), "mycomap" MycoMap's stored
+# flag. Not yet: "title" (a type named in the DEFINITION line) and "source" (a
+# note, voucher or strain). "source" was a bare match on the word "type" and
+# was wrong for every one checked on 2026-11-08 -- "RFLP type 52", "its type
+# b", "type: OTU: KGP46", "study type", three on uncultured fungi. PR #18
+# rewrites both with type-word rules (0/30 false in its audit); add them here
+# once that is deployed AND its recheck has been applied to .org's
+# genbank_curation table, because until then .org still serves the old flags.
+# An unknown basis is not trusted until someone has looked at what it matches.
+TRUSTED_CURATION_BASES = frozenset({"manual", "refseq", "type_material", "mycomap"})
 # scripts/dikarya_refresh_type_specimens.py appends its statistics and one
 # event=type_specimens.* line per type accession it adds, drops or reclassifies
 # here, and scripts/dikarya_log_digest.py reports them. Keep the default in

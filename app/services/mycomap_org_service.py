@@ -61,12 +61,15 @@ def _remember_search_refusal():
 
 
 class OrgResultError(Exception):
-    def __init__(self, message, status=502, retryable=True, retry_after=None):
+    def __init__(self, message, status=502, retryable=True, retry_after=None,
+                 key_refused=False):
         super().__init__(message)
         self.status = status
         self.retryable = retryable
         # Seconds from a 429's Retry-After, when MycoMap.org sent one.
         self.retry_after = retry_after
+        # A 401/403 answering a request that carried Dikarya's X-API-Key.
+        self.key_refused = key_refused
 
 
 # MycoMap.org limits genbank-curation per client ("Too many GenBank lookups in
@@ -75,6 +78,12 @@ class OrgResultError(Exception):
 # refused, all processes stop asking until the wait is over instead of each
 # one collecting its own 429.
 CURATION_PAUSE_KEY = "dikarya:mycomap-org:genbank-curation-paused"
+# Dikarya's key is exempt from that limit once a MycoMap.org admin marks it
+# (MycoMap.org PR #17; an exempt answer carries X-MycoMap-Rate-Limit: exempt).
+# The key is an optimisation there, never a requirement: a 401 (invalid) or
+# 403 (pending/disabled) is remembered here for 10 minutes, during which the
+# lookups go out anonymously, under the ordinary limit, as they did before.
+CURATION_KEY_REFUSED_KEY = "dikarya:mycomap-org:genbank-curation-key-refused"
 
 
 def curation_paused_for():
@@ -85,6 +94,22 @@ def curation_paused_for():
         return remaining if remaining and remaining > 0 else 0
     except Exception:
         return 0
+
+
+def _curation_key_refused():
+    try:
+        from app.services.ncbi_pacing import connection
+        return bool(connection().exists(CURATION_KEY_REFUSED_KEY))
+    except Exception:
+        return False
+
+
+def _remember_curation_key_refusal():
+    try:
+        from app.services.ncbi_pacing import connection
+        connection().set(CURATION_KEY_REFUSED_KEY, "refused", ex=600)
+    except Exception:
+        logger.warning("event=mycomap_org.curation_key_store_failed")
 
 
 def _pause_curation(seconds):
@@ -112,8 +137,13 @@ def deferral_details(exc):
 
 
 def _read(path, *, limit=MAX_JSON_BYTES, method="GET", body=None,
-          authenticated=False, deadline=None, timeout=15):
-    """Only fixed API paths are accepted; no URL from a result is fetched."""
+          authenticated=False, send_key=False, deadline=None, timeout=15):
+    """Only fixed API paths are accepted; no URL from a result is fetched.
+
+    ``authenticated`` requires MYCOMAP_ORG_API_KEY; ``send_key`` sends it when
+    it is configured (the web and worker units have it, the tree user's cron
+    does not) and goes anonymous otherwise.
+    """
     # ":" is for observation references (inat:123) in a query string.
     if not re.fullmatch(r"[a-z0-9/?=&,:_-]+", path, re.I) or ".." in path:
         raise OrgResultError("Invalid MycoMap API path.", 400)
@@ -123,6 +153,11 @@ def _read(path, *, limit=MAX_JSON_BYTES, method="GET", body=None,
     }
     if body is not None:
         headers["Content-Type"] = "application/json"
+    key = ""
+    if send_key and not authenticated:
+        key = (os.environ.get("MYCOMAP_ORG_API_KEY") or "").strip()
+        if key:
+            headers["X-API-Key"] = key
     if authenticated:
         key = (os.environ.get("MYCOMAP_ORG_API_KEY") or "").strip()
         if not key:
@@ -176,7 +211,7 @@ def _read(path, *, limit=MAX_JSON_BYTES, method="GET", body=None,
                 retry_after=int(retry_after.strip()) if retry_after.strip().isdigit() else None,
             ) from exc
         if exc.code in (401, 403):
-            if authenticated:
+            if key:
                 if path == "submit":
                     _remember_search_refusal()
                 logger.error(
@@ -194,7 +229,8 @@ def _read(path, *, limit=MAX_JSON_BYTES, method="GET", body=None,
             else:
                 message = (f"MycoMap.org refused access to this BLAST result "
                            f"(HTTP {exc.code}).")
-            raise OrgResultError(message, 502, retryable=False) from exc
+            raise OrgResultError(message, 502, retryable=False,
+                                 key_refused=bool(key)) from exc
         raise OrgResultError(
             "MycoMap.org has no matching BLAST result." if exc.code == 404
             else "MycoMap.org could not complete the BLAST request.",
@@ -691,11 +727,22 @@ def curated_genbank_rows(accessions, *, deadline=None, strict=False):
         logger.info("event=mycomap_org.genbank_curation_paused retry_after=%s count=%s",
                     paused, len(unique))
         return rows
+    send_key = not _curation_key_refused()
     for offset in range(0, len(unique), CURATION_BATCH_SIZE):
         batch = unique[offset:offset + CURATION_BATCH_SIZE]
         try:
-            payload = json.loads(_read("genbank-curation", method="POST",
-                                       body={"accessions": batch}, deadline=deadline))
+            try:
+                payload = json.loads(_read("genbank-curation", method="POST", send_key=send_key,
+                                           body={"accessions": batch}, deadline=deadline))
+            except OrgResultError as exc:
+                if not exc.key_refused:
+                    raise
+                # _read logged auth_refused with the key's fingerprint. Ask
+                # again anonymously; the names matter more than the exemption.
+                _remember_curation_key_refusal()
+                send_key = False
+                payload = json.loads(_read("genbank-curation", method="POST",
+                                           body={"accessions": batch}, deadline=deadline))
         except (OrgResultError, ValueError, UnicodeDecodeError) as exc:
             retry_after = getattr(exc, "retry_after", None)
             if retry_after:

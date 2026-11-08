@@ -112,12 +112,83 @@ To finish deployment from an administrator's host session:
    startup and the metrics journal/metrics-file timestamp. After the collector
    startup grace, each of the three queue staffing checks should be healthy.
 
-What's New draft (not published):
 
-Title: More reliable tree submissions and searches
-Category: improvement
-Body: Tree Builder checks sequence counts before queueing and shows pending
-NCBI BLAST searches with a Continue action. MrBayes can continue an early-stopped
-run from its checkpoint when sampling is insufficient, within the original
-limits. Worker and proxy-log monitoring now detects missing queue workers and
-log coverage gaps.
+Deployment status, checked November 8: the nginx reader was installed on
+November 6 (16:59 UTC) and matches the repository copy; the bulk worker restarted
+at 18:13 that day; the metrics collector was still the boot-time process from
+09:10, before the staffing checks, and was restarted on November 8 at 07:01 UTC.
+Inside the agent sandbox the digest still reports the nginx reader as
+"unavailable (wrapper exit 1)": that is sudo refusing under no-new-privileges,
+not a broken reader. Run the digest outside the sandbox for nginx coverage.
+
+The November 8 review (window 2026-11-04T05:22:54Z to 2026-11-08T06:33:51Z)
+found no attack aimed at Dikarya. Its fixes:
+
+- The path crowd's expiry slides with each observation instead of being set
+  once at key creation. The old rule wiped each path's history seven days after
+  it was first seen, so a .env sweep landing after a reset scored its app-shaped
+  paths as never-seen singletons and escalated (35.189.61.0/24). A replay of all
+  70 requests for /core/app/.env since September 1 reproduced the reset exactly.
+- A scanner word used as a job id (/job/.env) is scanner noise, not
+  job_id_malformed, and traversal counts as app-surface only when it starts
+  inside one of our routes (/static/../, not the stock /static../ nginx probe).
+- The digest drops the http.request_failed row of a 4xx the access log marked
+  noise=scanner, so scanner requests on real routes are not listed twice, and
+  has a New accounts section that flags dotted Gmail addresses. Registrations
+  were INFO-only; a Tor-based signup bot's account (#88, created November 3)
+  went unnoticed until this review. It has been locked: its password hash was
+  replaced, which also revokes its session cookies.
+- A recompute whose root clade no longer exists (pruned away, or no longer
+  grouped together) falls back to midpoint rooting with a notice, like a lost
+  root tip, instead of keeping the builder's arbitrary root (job jtk5). The
+  log line names which way the clade was lost.
+- Prune, rotate and reroot refusals carry reason codes (prune_would_empty_tree,
+  prune_targets_not_found, reroot_target_not_found, ...) instead of bad_request.
+- raxml_parameters_adjusted is no longer DEGRADED for the publication-preset
+  early-stopping override, which makes the search more thorough; it was the
+  only thing that had ever triggered it.
+- /job/<id>/ redirects to /job/<id>; the decoy id keeps answering 404.
+- nginx: ops/nginx/00-bot-blocklist (new repository copy) lets blocked crawlers
+  read /robots.txt, which already told most of them "Disallow: /"; robots.txt
+  gains groups for BLEXBot, ZoominfoBot and serpstatbot. Installed 2026-11-08
+  09:14 UTC; verified that SemrushBot gets robots.txt (200) and a 403 elsewhere.
+- The /amanitaceae/ mirror (not in git; backup of every HTML and CSS file at
+  ~/.dikarya/backups/amanitaceae-html-css-2026-11-08.tar.gz): its jQuery UI
+  imports, theme images (restored from jQuery UI 1.8.24, byte-identical to the
+  copies the mirror already had) and font are fixed; 1,466 page backgrounds and
+  3,316 magnifier images point at their archived copies; 2,091 links to pages
+  that were never archived point at unavailable.html. An inert snippet in 1,465
+  pages that only removed a BeEF hook <script> (left by the original site's
+  admins after a compromise; no such tag exists in the mirror) was deleted.
+
+Follow-up the same day -- what happened to the mirror's original site, and how
+the mirror is now secured:
+
+- The compromise was on the old host, not here. Every mirror file still had its
+  2026-05-30 build time when the cleanup started (the one later file is git
+  tracked and clean), and Wayback captures of amanitaceae.org show the
+  injection there: clean through 2023-07; two live
+  <script src="https://beef.beonlineboo.com/hook.js"> tags in CMS content
+  snippets in 2024-02 and 2024-05; tags gone by 2024-08, leaving the site's own
+  removal snippet; by 2024-12 that snippet targeted beef.softbyms.com; the site
+  stopped answering by 2025-02 and still does not.
+- The script (archived copies read statically, never run) reported every page
+  view to the attacker's server and, for visitors the server chose, covered the
+  page with a fake "install the browser extension to continue" prompt (styled
+  after 1C:Enterprise's extension prompt) whose Download button fetched a file
+  chosen by the server. Group-IB tracks the operator as "Boolka": opportunistic
+  SQL injection into websites since 2022, and a BeEF-based delivery platform
+  for BMANAGER, a Windows downloader with keylogger and file/wallet-stealer
+  modules that installs to C:\Program Files\Full Browser Manager\.
+- The mirror never carried a live hook, and no mirrored JavaScript was altered
+  (jQuery 1.7.2 is byte-identical to the official build; no library carries
+  appended code). The last inert snippet (beonlineboo, one page) is removed,
+  and so is Google Analytics: every page loaded ga.js from Google into this
+  origin and reported visits to the original site's UA-18752463-1.
+- ops/nginx/dikarya (repository copy of the site config) adds a CSP sandbox,
+  nosniff, no-referrer and HSTS to /amanitaceae/; tested in a throwaway nginx,
+  installed 2026-11-08 09:14 UTC (pre-install copies of both files are beside
+  them as *.bak-20261108) and verified live: mirror responses carry the
+  sandbox policy and the main app's do not. A second HTML backup
+  taken before the analytics removal is
+  ~/.dikarya/backups/amanitaceae-html-2026-11-08-before-ga-removal.tar.gz.

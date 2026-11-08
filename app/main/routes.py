@@ -928,6 +928,19 @@ def job_status(job_id):
                            input_warnings=input_warnings)
 
 
+# Alan 11/8/26 - /job/<id>/ (trailing slash) answered 404 even for jobs that
+# exist; send it to the canonical page. A malformed id keeps its 400, and the
+# decoy id keeps answering 404 so the honeytoken still trips on this spelling.
+@bp.route('/job/<job_id>/')
+def job_status_trailing_slash(job_id):
+    if not validate_job_id(job_id):
+        abort(400)
+    from app.services.security_honeytokens import honeytoken_hit
+    if honeytoken_hit(request.path):
+        abort(404)
+    return redirect(url_for('main.job_status', job_id=job_id), code=308)
+
+
 @bp.post('/job/<job_id>/retry-mycomap-ncbi')
 @limiter.limit("6 per minute; 60 per hour")
 def retry_mycomap_ncbi(job_id):

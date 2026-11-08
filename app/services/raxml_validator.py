@@ -4,7 +4,7 @@ import re
 import random
 from pathlib import Path
 from typing import Dict, Any, Tuple, Optional
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 # Constants
 MIN_BOOTSTRAP_CAP = 100
@@ -332,6 +332,12 @@ class ResolvedRaxmlParams:
     enable_moose: bool = False
     enable_early_stopping: bool = False
     bootstrap_cutoff: float = DEFAULT_BOOTSTRAP_CUTOFF
+    # Alan 11/8/26 - The entries of ``warnings`` that never reduce the work done
+    # (a policy that makes the search MORE thorough than asked). They stay in
+    # ``warnings`` so users still see them, but they are not DEGRADED: the
+    # publication-preset early-stopping note was the only thing that had ever
+    # triggered raxml_parameters_adjusted.
+    notices: list[str] = field(default_factory=list)
 
 
 def resolve_outgroup_id(outgroup: str, name_mapping: Dict[str, str]) -> str:
@@ -629,8 +635,11 @@ def validate_and_resolve_raxml_params(params: Dict[str, Any], data_type: str = '
     enable_early_stopping = bool(params.get('enable_early_stopping', params.get('early_stopping', False)))
     
     # Force default OFF for high-quality presets
+    notices = []
     if run_preset in ('publication', 'maximum') and enable_early_stopping:
-        warnings.append(f"Early stopping disabled for '{run_preset}' quality to ensure thorough search.")
+        note = f"Early stopping disabled for '{run_preset}' quality to ensure thorough search."
+        warnings.append(note)
+        notices.append(note)
         enable_early_stopping = False
 
     return ResolvedRaxmlParams(
@@ -645,4 +654,5 @@ def validate_and_resolve_raxml_params(params: Dict[str, Any], data_type: str = '
         enable_moose=enable_moose,
         enable_early_stopping=enable_early_stopping,
         bootstrap_cutoff=bootstrap_cutoff,
+        notices=notices,
     )

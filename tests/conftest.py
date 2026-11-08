@@ -26,12 +26,15 @@ def _isolate_ncbi_pacing():
     mycomap_org_service.SEARCH_AUTH_KEY_PREFIX = f"dikarya:test:mycomap-org:submit-auth:{run_id}:"
     # A mocked 429 must never pause the live site's curation lookups.
     mycomap_org_service.CURATION_PAUSE_KEY = f"dikarya:test:mycomap-org:curation-paused:{run_id}"
+    curation_key_refused = mycomap_org_service.CURATION_KEY_REFUSED_KEY
+    mycomap_org_service.CURATION_KEY_REFUSED_KEY = f"dikarya:test:mycomap-org:curation-key-refused:{run_id}"
     try:
         yield
     finally:
         ncbi_pacing.KEY_PREFIX = original
         mycomap_org_service.SEARCH_AUTH_KEY_PREFIX = auth_prefix
         mycomap_org_service.CURATION_PAUSE_KEY = curation_pause_key
+        mycomap_org_service.CURATION_KEY_REFUSED_KEY = curation_key_refused
 
 
 @pytest.fixture(autouse=True, scope="session")

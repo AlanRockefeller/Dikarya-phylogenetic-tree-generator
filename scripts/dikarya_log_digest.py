@@ -289,6 +289,7 @@ def analyze_access(cutoff, until=None):
     streams = collections.defaultdict(list)
     clients = collections.Counter()
     agents = collections.Counter()
+    noise_requests = set()
     oldest = newest = None
     lines = unparsed = timed = contextual = total = 0
     for path in files:
@@ -321,6 +322,8 @@ def analyze_access(cutoff, until=None):
                         normalized, match.group("ua"), status, match.group("method")
                     ) else product_4xx
                     target[(status, endpoint)] += 1
+                    if match.group('noise') == 'scanner' and match.group("req") not in (None, "-", ""):
+                        noise_requests.add(match.group("req"))
                 if status == 429:
                     rate_limited[match.group("ip")] += 1
                 micros = match.group("micros")
@@ -334,7 +337,7 @@ def analyze_access(cutoff, until=None):
         "total": total, "statuses": statuses, "server_errors": server_errors,
         "product_4xx": product_4xx, "noise_4xx": noise_4xx,
         "rate_limited": rate_limited, "durations": durations, "streams": streams,
-        "clients": clients, "agents": agents,
+        "clients": clients, "agents": agents, "noise_requests": noise_requests,
         "coverage": coverage_record(files, oldest, newest, lines, unparsed, timed, contextual, total),
     }
 
@@ -437,9 +440,30 @@ ACTOR_RE = re.compile(
 SSE_CLOSED_RE = re.compile(
     r'event=sse\.closed.*?reason=(?P<reason>\w+)\s+duration_seconds=(?P<seconds>[\d.]+)'
 )
+# Alan 11/8/26 - Registrations are INFO, so no section ever showed them, and a
+# signup bot's account (#88, a "dotted" Gmail address) went unnoticed for days.
+# Collected before the WARNING+ filter, like sse.closed.
+REGISTERED_RE = re.compile(
+    r'event=auth\.registered\s+account_id=(?P<account>\d+)\s+email=(?P<email>\S+)'
+)
+# A request the access log marked noise=scanner keeps its ordinary
+# http.request_failed line (security records only ever add to the diagnostics),
+# so for a 4xx the exceptions section drops that row instead of listing the
+# same scanner request a second time.
+HTTP_FAILED_RE = re.compile(r'event=http\.request_failed\b.*?\bstatus=(?P<status>\d+)')
 
 
-def analyze_errors(cutoff, until=None):
+def signup_hint(email):
+    """A note for a registration whose address looks machine-made, or ''."""
+    local, _, domain = str(email or "").lower().rpartition("@")
+    # Gmail ignores dots, so "y.e.mireri.d.e.0.1" lands in one inbox under any
+    # number of spellings; three or more dots is rare for a person.
+    if domain in ("gmail.com", "googlemail.com") and local.count(".") >= 3:
+        return "dotted Gmail address, a common signup-bot pattern"
+    return ""
+
+
+def analyze_errors(cutoff, until=None, noise_requests=None):
     # Grouped by stem rather than flattened into one list, because the
     # occurrence counter below has to reset between the two mirrored streams
     # while still counting across each stream's own rotations.
@@ -465,6 +489,8 @@ def analyze_errors(cutoff, until=None):
     security_clients = collections.defaultdict(set)
     actors = {}
     sse_closes = collections.defaultdict(list)
+    registrations = []
+    noise_failures = 0
     affected = collections.defaultdict(set)
     affected_jobs = collections.defaultdict(set)
     seen = set()
@@ -494,6 +520,13 @@ def analyze_errors(cutoff, until=None):
                 if sse_close:
                     sse_closes[sse_close.group("reason")].append(
                         float(sse_close.group("seconds"))
+                    )
+                # INFO and app-logger only, so like sse.closed it appears in
+                # error.log alone and cannot be double-counted by the mirror.
+                registered = REGISTERED_RE.search(record.splitlines()[0])
+                if registered:
+                    registrations.append(
+                        (when, int(registered.group("account")), registered.group("email"))
                     )
                 if not LEVEL_RE.search(record.splitlines()[0]):
                     continue
@@ -525,6 +558,11 @@ def analyze_errors(cutoff, until=None):
                 if incident in seen:
                     continue
                 seen.add(incident)
+                if noise_requests and request in noise_requests:
+                    failed_request = HTTP_FAILED_RE.search(record.splitlines()[0])
+                    if failed_request and int(failed_request.group("status")) < 500:
+                        noise_failures += 1
+                        continue
                 if fields:
                     contextual += 1
                 user = fields.get("user")
@@ -588,7 +626,8 @@ def analyze_errors(cutoff, until=None):
         "degradations": degradations, "affected": affected,
         "affected_jobs": affected_jobs, "security": security,
         "security_clients": security_clients, "sse_closes": sse_closes,
-        "actors": actors,
+        "actors": actors, "registrations": registrations,
+        "noise_failures": noise_failures,
         "coverage": coverage_record(files, oldest, newest, lines, unparsed, 0, contextual, len(seen)),
     }
 
@@ -1400,7 +1439,7 @@ def main():
         parser.error("The review start must be earlier than --until")
 
     access = analyze_access(cutoff, until=until)
-    errors = analyze_errors(cutoff, until=until)
+    errors = analyze_errors(cutoff, until=until, noise_requests=access["noise_requests"])
     worker_details = {}
     worker_counts, unterminated, worker_coverage = analyze_worker(
         cutoff, grace=timedelta(minutes=args.unterminated_grace_minutes), until=until,
@@ -1422,6 +1461,9 @@ def main():
     rows([f"{count:>5}  {status}  {endpoint}" for (status, endpoint), count in access["noise_4xx"].most_common(args.top)])
     section("Exceptions and errors")
     rows(format_exception_rows(errors))
+    if errors["noise_failures"]:
+        print(f"  ({errors['noise_failures']} 4xx request failure(s) on requests the app "
+              "classified as scanner traffic are counted in the noise section instead)")
     section("Degraded work")
     rows([f"{count:>5}  {key}" for key, count in errors["degradations"].most_common(args.top)])
     section("Worker lifecycle")
@@ -1496,6 +1538,12 @@ def main():
         f"{count:>5}  {reason:<20} from {len(errors['security_clients'].get(reason, ())) or '?'} client(s)"
         for reason, count in errors["security"].most_common(args.top)
     ], empty="  (none -- internet-wide scanner noise goes to var/logs/scanner.log)")
+    section("New accounts")
+    rows([
+        f"{when:%Y-%m-%d %H:%M}  #{account:<5} {email}"
+        + (f"  <- {signup_hint(email)}" if signup_hint(email) else "")
+        for when, account, email in sorted(errors["registrations"])
+    ], empty="  (none registered in this window)")
     section("SSE stream close reasons (from the app, not the access log)")
     rows([
         f"{len(values):>5}  {reason:<22} p50={percentile(values, .5):.0f}s "

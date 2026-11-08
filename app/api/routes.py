@@ -3514,8 +3514,9 @@ def prune_tree(job_id):
         tip_names = [data.get("tip_name")]
         
     if not tip_names:
+        note_request_failure("prune_no_targets")
         return jsonify({"status": "error", "error": "No tips specified"}), 400
-    
+
     try:
         from app.services.tree_edit_service import (
             PruneRequestError, _tree_tip_set, load_tree_state, prune_taxa, save_tree_state,
@@ -3540,6 +3541,9 @@ def prune_tree(job_id):
                     )
         return jsonify(_with_undo_state(state, job_dir))
     except PruneRequestError as e:
+        # Alan 11/8/26 - Say WHY in the request log (would empty the tree, none
+        # of the tips found); the message itself can carry tip names.
+        note_request_failure(e.failure_code)
         return jsonify({"status": "error", "error": str(e)}), 400
     except Exception as e:
         return _server_error(e)
@@ -3837,9 +3841,11 @@ def rotate_tree_node(job_id):
     data = request.get_json(silent=True) or {}
     node_id = data.get("node_id")
     if not isinstance(node_id, str) or not node_id.strip():
+        note_request_failure("rotate_node_id_missing")
         return jsonify({"status": "error", "error": "Missing node_id"}), 400
     node_id = node_id.strip()
     if len(node_id) > 256 or any(ord(char) < 32 for char in node_id):
+        note_request_failure("rotate_node_id_invalid")
         return jsonify({"status": "error", "error": "Invalid node_id"}), 400
 
     try:
@@ -3852,6 +3858,7 @@ def rotate_tree_node(job_id):
                 checkpoint.commit()
         return jsonify(_with_undo_state(state, job_dir))
     except ValueError as e:
+        note_request_failure(getattr(e, "failure_code", None) or "rotate_refused")
         return jsonify({"status": "error", "error": str(e)}), 400
     except Exception as e:
         return _server_error(e)
@@ -3868,8 +3875,9 @@ def reroot_tree_endpoint(job_id):
     target = data.get("root_target") or data.get("target") or data.get("node_name")
 
     if not target:
+        note_request_failure("reroot_target_missing")
         return jsonify({"status": "error", "error": "Missing root_target"}), 400
-    
+
     try:
         from app.services.tree_edit_service import load_tree_state, reroot_tree, save_tree_state, tree_state_lock
         with tree_state_lock(job_dir):
@@ -3880,6 +3888,7 @@ def reroot_tree_endpoint(job_id):
                 checkpoint.commit()
         return jsonify(_with_undo_state(state, job_dir))
     except ValueError as e:
+        note_request_failure(getattr(e, "failure_code", None) or "reroot_refused")
         return jsonify({"status": "error", "error": str(e)}), 400
     except Exception as e:
         return _server_error(e)

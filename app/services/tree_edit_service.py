@@ -105,13 +105,30 @@ class DegenerateTreeError(ValueError):
     """
 
 
-class PruneRequestError(ValueError):
+class TreeEditRefused(ValueError):
+    """A tree edit refused for a reason worth naming in the request log.
+
+    Alan 11/8/26 - Every tree-edit 400 used to log as reason=bad_request, so a
+    refused prune could only be explained from the response's byte count.
+    ``failure_code`` is developer-defined, never user text; the routes pass it
+    to note_request_failure(). Still a ValueError, so existing handlers apply.
+    """
+
+    def __init__(self, message, failure_code="tree_edit_refused"):
+        super().__init__(message)
+        self.failure_code = failure_code
+
+
+class PruneRequestError(TreeEditRefused):
     """A prune the user asked for that cannot be carried out as requested.
 
     Removing every remaining tip, or naming only tips the tree does not hold,
     is the user's choice rather than a server fault, so the route answers 400
     with this message instead of a 500 filed in errors.log.
     """
+
+    def __init__(self, message, failure_code="prune_refused"):
+        super().__init__(message, failure_code)
 
 
 @contextmanager
@@ -759,7 +776,7 @@ def rotate_node(job_dir: Path, tree_json: Dict, node_id: str) -> Dict:
                 break
 
         if target_clade is None:
-            raise ValueError("Unknown internal node")
+            raise TreeEditRefused("Unknown internal node", "rotate_node_not_found")
 
         target_clade.clades.reverse()
 
@@ -830,7 +847,8 @@ def prune_taxa(job_dir: Path, tree_json: Dict, taxa_names: List[str]) -> Dict:
             for terminal in clade.get_terminals()
         }
         if terminals and not (terminals - terminals_to_remove):
-            raise PruneRequestError("Cannot prune every remaining taxon from the tree.")
+            raise PruneRequestError("Cannot prune every remaining taxon from the tree.",
+                                    failure_code="prune_would_empty_tree")
 
         tree_json.pop("prune_unresolved", None)
         if unresolved_targets:
@@ -847,7 +865,8 @@ def prune_taxa(job_dir: Path, tree_json: Dict, taxa_names: List[str]) -> Dict:
             if not to_prune and not previously_pruned:
                 raise PruneRequestError(
                     "None of the selected tips were found in the tree: "
-                    + ", ".join(sorted(unresolved_targets)[:5])
+                    + ", ".join(sorted(unresolved_targets)[:5]),
+                    failure_code="prune_targets_not_found",
                 )
             # Transient; stripped by save_tree_state so it never persists.
             tree_json["prune_unresolved"] = sorted(unresolved_targets)
@@ -1197,7 +1216,7 @@ def reroot_tree(job_dir: Path, tree_json: Dict, root_target: str) -> Dict:
         
         # Validate target
         if not root_target:
-             raise ValueError("Reroot target cannot be empty")
+             raise TreeEditRefused("Reroot target cannot be empty", "reroot_target_missing")
 
         target_clade = _find_root_target_clade(tree, root_target)
 
@@ -1205,9 +1224,10 @@ def reroot_tree(job_dir: Path, tree_json: Dict, root_target: str) -> Dict:
              # Useful debug info in the error
              internal = [c.name for c in tree.get_nonterminals() if c.name][:15]
              tips = [c.name for c in tree.get_terminals() if c.name][:15]
-             raise ValueError(
+             raise TreeEditRefused(
                 f"Root target not found: {root_target}. "
-                f"Example internal names: {internal}. Example tip names: {tips}"
+                f"Example internal names: {internal}. Example tip names: {tips}",
+                "reroot_target_not_found",
              )
         
         # Record the chosen branch by its tips, not just its hash. The stable ID
@@ -2005,17 +2025,27 @@ def _resolve_outgroup_root_target(tree, target: str) -> str:
         return target
 
 
-def _root_target_absence(tree_json: Dict[str, Any], tree, target: str) -> Optional[str]:
-    """Why a tip-name root target cannot be rerooted on, or None if it can.
+def _root_target_absence(tree_json: Dict[str, Any], tree, target: str,
+                         previous_split: Optional[Tuple[Set[str], Set[str]]] = None
+                         ) -> Optional[str]:
+    """Why a root target cannot be rerooted on, or None if it can.
 
+    For a tip name:
     ``"pruned"`` -- the user pruned exactly that tip (checked first: a tip
     pruned while the recompute ran is still in the builder's output, and a
     pruned tip named "95" must not resolve to some node with support 95).
     ``"missing"`` -- no clade of the recomputed tree answers to it.
-    Internal-node IDs are left to reroot_tree().
+
+    For an internal node that _translate_internal_root_target() could not map
+    onto the recomputed tree, one of the ``"clade_*"`` reasons from
+    _root_clade_absence().
     """
-    if not target or target.startswith("internal:") or _is_legacy_internal_root_target(target):
+    if not target:
         return None
+    if target.startswith("internal:") or _is_legacy_internal_root_target(target):
+        if _find_root_target_clade(tree, target) is not None:
+            return None
+        return _root_clade_absence(tree_json, tree, previous_split)
     if target in set(tree_json.get("pruned_taxa") or []):
         return "pruned"
     if _find_root_target_clade(tree, target) is None:
@@ -2023,27 +2053,87 @@ def _root_target_absence(tree_json: Dict[str, Any], tree, target: str) -> Option
     return None
 
 
+def _root_clade_absence(tree_json: Dict[str, Any], tree,
+                        previous_split: Optional[Tuple[Set[str], Set[str]]]) -> str:
+    """Why the clade an internal-node root named is not in the recomputed tree.
+
+    Alan 11/8/26 - Job jtk5 was rooted on a clade, and after a recompute
+    _translate_internal_root_target() correctly found no branch to translate it
+    to. The reroot then raised and the tree kept the builder's arbitrary root,
+    and nothing in the logs said which of these it was:
+
+    ``"clade_removed"`` -- every tip of the old clade is gone.
+    ``"clade_rest_removed"`` -- every tip outside it is gone, so there is no
+    "rest of the tree" left to root against.
+    ``"clade_split"`` -- tips survive on both sides, but the new topology no
+    longer groups the clade's tips together.
+    ``"clade_unrecorded"`` -- no tip split was saved for the old root, so it
+    cannot be looked for at all.
+    """
+    if not previous_split:
+        return "clade_unrecorded"
+    old_inside, old_all = previous_split
+    pruned = set(tree_json.get("pruned_taxa") or [])
+    current = {t.name for t in tree.get_terminals() if t.name} - pruned
+    if not old_inside & current:
+        return "clade_removed"
+    if not (old_all - old_inside) & current:
+        return "clade_rest_removed"
+    return "clade_split"
+
+
 def _midpoint_root_after_pruned_target(job_dir: Path, tree_json: Dict[str, Any],
                                        previous_target: str, absence: str,
-                                       task_logger=None) -> Dict[str, Any]:
-    """Midpoint-root a recomputed tree whose root tip is gone."""
+                                       task_logger=None,
+                                       previous_split: Optional[
+                                           Tuple[Set[str], Set[str]]] = None,
+                                       ) -> Dict[str, Any]:
+    """Midpoint-root a recomputed tree whose root tip or root clade is gone."""
     tree_json = apply_rooting_mode(job_dir, tree_json, "midpoint")
+    clade_tips = len(previous_split[0]) if previous_split else 0
+    # Alan 11/8/26 - A clade root is named by its stable ID ("internal:190d8406"),
+    # which means nothing to a reader, so the clade messages describe it instead.
     if absence == "pruned":
         message = (
             f"The tree was rooted on {previous_target}, which was removed from "
             "the tree, so the recomputed tree is midpoint rooted."
+        )
+    elif absence == "clade_removed":
+        message = (
+            f"The tree was rooted on a clade of {clade_tips} sequences, all of "
+            "which were removed, so the recomputed tree is midpoint rooted."
+        )
+    elif absence == "clade_rest_removed":
+        message = (
+            "The tree was rooted between a clade and the rest of the tree, and "
+            "every sequence outside that clade was removed, so the recomputed "
+            "tree is midpoint rooted."
+        )
+    elif absence == "clade_split":
+        message = (
+            f"The tree was rooted on a clade of {clade_tips} sequences that the "
+            "recomputed tree no longer groups together, so it is midpoint rooted."
+        )
+    elif absence == "clade_unrecorded":
+        message = (
+            "The clade this tree was rooted on could not be found in the "
+            "recomputed tree, so it is midpoint rooted."
         )
     else:
         message = (
             f"The tree was rooted on {previous_target}, which is not in the "
             "recomputed tree, so it is midpoint rooted."
         )
+    is_clade = absence.startswith("clade_")
     tree_json["rooting_info"] = {
         "query_tip": tree_json.get("sequence_of_interest"),
         "chosen_root_target": None,
         "previous_root_target": previous_target,
+        # The viewer keys its one-time notice on this value, so a lost root
+        # clade reuses it rather than introducing a second name for "the root
+        # you chose is gone".
         "chosen_by": ROOT_TIP_PRUNED_CHOSEN_BY,
-        "reason": f"root_tip_{absence}",
+        "reason": f"root_{absence}" if is_clade else f"root_tip_{absence}",
         "warnings": [message],
         # Lets the viewer show the notice once per occurrence rather than on
         # every visit for as long as this rooting stands.
@@ -2051,10 +2141,17 @@ def _midpoint_root_after_pruned_target(job_dir: Path, tree_json: Dict[str, Any],
         "candidate_count": 0,
         "rejected_count": 0,
     }
-    (task_logger or logger).info(
-        "event=tree.root_tip_pruned_midpoint reason=%s Root tip is not in the "
-        "recomputed tree; applied midpoint rooting", absence,
-    )
+    if is_clade:
+        (task_logger or logger).info(
+            "event=tree.root_clade_lost_midpoint reason=%s clade_tips=%d Root "
+            "clade is not in the recomputed tree; applied midpoint rooting",
+            absence, clade_tips,
+        )
+    else:
+        (task_logger or logger).info(
+            "event=tree.root_tip_pruned_midpoint reason=%s Root tip is not in the "
+            "recomputed tree; applied midpoint rooting", absence,
+        )
     return tree_json
 
 
@@ -2088,14 +2185,18 @@ def _reapply_rooting_after_recompute(job_dir: Path, tree_json: Dict[str, Any],
             # and then recomputed (job 1436fec1). There is nothing to reroot on,
             # and the builder's root is arbitrary, so use the default midpoint
             # root and record why so the viewer can tell the user.
+            # Alan 11/8/26 - The same holds for a root CLADE the recomputed tree
+            # no longer contains (job jtk5): it used to fall through to a failed
+            # reroot and keep the builder's root as a DEGRADED.
             if HAS_BIOPYTHON:
                 tree = _read_editable_tree(job_dir, tree_json, "reroot")
                 if mode == "outgroup":
                     target = _resolve_outgroup_root_target(tree, target)
-                absence = _root_target_absence(tree_json, tree, target)
+                absence = _root_target_absence(tree_json, tree, target, previous_split)
                 if absence:
                     return _midpoint_root_after_pruned_target(
-                        job_dir, tree_json, previous_target, absence, task_logger
+                        job_dir, tree_json, previous_target, absence, task_logger,
+                        previous_split=previous_split,
                     )
             return apply_rooting_mode(job_dir, tree_json, "manual", target=target)
 

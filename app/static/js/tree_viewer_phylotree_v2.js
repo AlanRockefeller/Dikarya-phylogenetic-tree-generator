@@ -1576,9 +1576,42 @@
                 return leftTip - rightTip
                     || firstOriginalPosition(left) - firstOriginalPosition(right);
             });
+            // Alan 11/8/26 - Draw the unresolved tips beside their nearest side clade, not above all of them.
+            this._placeTipBlockBesideNearestClade(boundaryChildren, componentTips);
             anchor.children = boundaryChildren;
             boundaryChildren.forEach((child) => { child.parent = anchor; });
             return true;
+        }
+
+        /**
+         * Alan 11/8/26 - The unresolved tips of a soft polytomy used to lead it, above every
+         * side clade. When the polytomy also holds a large clade, that put the tips far from the
+         * clade they differ from by a base or two (job cewq: two P. inyoensis drawn above 108
+         * pistillaris, away from the 18-tip inyoensis clade). Move the tip block to sit directly
+         * before the side clade whose nearest tip is closest by branch length; ties keep the
+         * earlier clade, so a block already beside its nearest clade does not move. Display
+         * order only -- topology, files and clade ids are untouched. In-place on `children`.
+         */
+        _placeTipBlockBesideNearestClade(children, componentTips) {
+            const tips = children.filter((child) => componentTips.has(child));
+            const clades = children.filter((child) => !componentTips.has(child));
+            if (!tips.length || clades.length < 2) return;
+            const nearestTipDistance = (node) => {
+                const own = this._branchLength(node);
+                if (own === null) return Infinity;
+                const kids = node.children || node.data?.children || [];
+                if (!kids.length) return Math.max(0, own);
+                return Math.max(0, own) + Math.min(...kids.map(nearestTipDistance));
+            };
+            const distances = clades.map(nearestTipDistance);
+            const nearest = Math.min(...distances);
+            if (!Number.isFinite(nearest)) return;
+            // Alan 11/8/26 - Move only for a clear winner: the target is the earliest clade
+            // within 2x of the closest, so near-ties (1.56e-3 vs 1.56e-3) keep today's order.
+            const nearestIndex = distances.findIndex((distance) => distance <= nearest * 2);
+            if (nearestIndex <= 0) return;
+            const ordered = clades.slice(0, nearestIndex).concat(tips, clades.slice(nearestIndex));
+            children.splice(0, children.length, ...ordered);
         }
 
         _refreshHierarchyMetrics(root) {

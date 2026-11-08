@@ -1,0 +1,215 @@
+# nginx site for dikarya.us -- repository copy of
+# /etc/nginx/sites-available/dikarya (root-owned; the installed file is a copy).
+# Certbot manages the "listen 443 ssl"/certificate lines; if it rewrites the
+# installed file, copy the result back here rather than overwriting it.
+#
+#   sudo install -o root -g root -m 0644 \
+#       /var/www/dikarya/ops/nginx/dikarya /etc/nginx/sites-available/dikarya
+#   sudo nginx -t && sudo systemctl reload nginx
+#
+# Taken on 2026-11-08 from the installed file whose sha256 was
+# bf064bb9408142d04719b5b7433b32416d409e70e5c5659aff845392a5fd1815; the only
+# change then was the /amanitaceae/ headers block.
+
+server {
+    server_name dikarya.us www.dikarya.us;
+
+    client_max_body_size 200M;
+
+    # Bot blocklist. $blocked_bot is defined by the map in
+    # sites-enabled/00-bot-blocklist. Dropping these here means they never reach
+    # Gunicorn, which only has 8 request slots (4 workers x 2 threads).
+    # ImageBot alone was 88% of all requests in the 12-14 Aug 2026 sample.
+    if ($blocked_bot) {
+        return 403;
+    }
+
+    # Served straight off disk so crawlers fetching it cost no Python at all.
+    # Same file the Flask /robots.txt route falls back to, so the two cannot drift.
+    location = /robots.txt {
+        alias /var/www/dikarya/app/static/robots.txt;
+        default_type "text/plain";
+        expires 1h;
+        # Inherit the global access log, including request IDs and timing.
+    }
+
+    # /thumb/ does not exist in this app. Answer the scrapers that probe it
+    # without waking Gunicorn; a 404 from nginx costs essentially nothing.
+    location ^~ /thumb/ {
+        return 404;
+        access_log off;
+    }
+
+    location ^~ /.well-known/acme-challenge/ {
+	root /var/www/letsencrypt;
+	default_type "text/plain";
+	try_files $uri =404;
+    }
+
+    location = /amanitaceae {
+        return 301 /amanitaceae/;
+   }
+
+    location = /labels {
+        limit_req zone=labels_req burst=20 nodelay;
+        client_max_body_size 4m;
+        proxy_pass http://127.0.0.1:5000;
+        proxy_set_header X-Request-ID $request_id;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_read_timeout 120s;
+    }
+
+    location = /labels/print_stream {
+        # One thread per open stream; cap concurrent streams per client.
+        limit_conn labels_conn 3;
+        proxy_pass http://127.0.0.1:5000;
+        proxy_set_header X-Request-ID $request_id;
+        proxy_http_version 1.1;
+        proxy_set_header Connection "";
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_buffering off;
+        proxy_cache off;
+        proxy_read_timeout 3600s;
+    }
+
+    location /labels/static/ {
+        alias /home/labels/labels/static/;
+    }
+
+    location /labels/ {
+        # Sheds bursts before they reach the single Gunicorn worker.  The app
+        # applies its own per-IP limits behind this.
+        limit_req zone=labels_req burst=20 nodelay;
+        # The app rejects bodies over 2 MB; this stops nginx buffering 200 MB
+        # first.  The 200M vhost default still applies to the other apps.
+        client_max_body_size 4m;
+        proxy_pass http://127.0.0.1:5000;
+        proxy_set_header X-Request-ID $request_id;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_read_timeout 120s;
+    }
+
+    location /amanitaceae/ {
+        alias /var/www/dikarya/amanitaceae/;
+        index index.html;
+        try_files $uri $uri/ =404;
+
+        # Alan 11/8/26 - The mirror is a third party's legacy CMS output (jQuery
+        # 1.7, jQuery UI 1.8, xajax, CKEditor), and the original site was
+        # compromised in 2023-24: a script injected through its CMS snippets
+        # phoned home on every page view and pushed a fake "browser extension"
+        # download to chosen visitors. Served from this origin, any script in
+        # the mirror runs as dikarya.us.
+        #
+        # `sandbox` (without allow-same-origin) gives every mirror page an
+        # opaque origin: its scripts still run, but cannot read dikarya.us
+        # cookies or storage, or make same-origin requests as the visitor. The
+        # fetch directives stop it loading anything from, or sending anything
+        # to, another host. The pages use no frames, media or plugins.
+        # allow-modals keeps the pages' Print buttons working.
+        #
+        # add_header here replaces the server-level headers rather than adding
+        # to them, so HSTS is repeated.
+        add_header Content-Security-Policy "sandbox allow-scripts allow-popups allow-popups-to-escape-sandbox allow-modals; default-src 'none'; script-src 'self' https://dikarya.us https://www.dikarya.us 'unsafe-inline' 'unsafe-eval'; style-src 'self' https://dikarya.us https://www.dikarya.us 'unsafe-inline'; img-src 'self' https://dikarya.us https://www.dikarya.us data:; font-src 'self' https://dikarya.us https://www.dikarya.us; connect-src 'none'; media-src 'none'; object-src 'none'; frame-src 'none'; worker-src 'none'; manifest-src 'none'; form-action 'none'; base-uri 'none'; frame-ancestors 'none'" always;
+        add_header X-Content-Type-Options "nosniff" always;
+        add_header Referrer-Policy "no-referrer" always;
+        add_header Strict-Transport-Security "max-age=31536000" always;
+    }
+
+    # Job status streams. One thread per open stream, so cap how many a single
+    # client can hold; the app allows a long-running job to stream for hours now,
+    # and this is what stops one client from taking the whole pool.
+    location ~ ^/api/job/[^/]+/events$ {
+        limit_conn dikarya_sse_conn 6;
+        proxy_pass http://127.0.0.1:8000;
+        proxy_http_version 1.1;
+        proxy_set_header Connection "";
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_buffering off;
+        proxy_cache off;
+        # Must outlast SSE_MAX_STREAM_SECONDS (6h) so nginx is not the thing that
+        # cuts a long job's stream.
+        proxy_read_timeout 21900s;
+    }
+
+    location / {
+        proxy_pass http://127.0.0.1:8000;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_read_timeout 300;
+    }
+
+    location /static/ {
+        alias /var/www/dikarya/app/static/;
+        expires 30d;
+    }
+
+    # Every http:// entry point here already 301s to https://.
+    add_header Strict-Transport-Security "max-age=31536000" always;
+
+    listen 443 ssl; # managed by Certbot
+    ssl_certificate /etc/letsencrypt/live/dikarya.us/fullchain.pem; # managed by Certbot
+    ssl_certificate_key /etc/letsencrypt/live/dikarya.us/privkey.pem; # managed by Certbot
+    include /etc/letsencrypt/options-ssl-nginx.conf; # managed by Certbot
+    ssl_dhparam /etc/letsencrypt/ssl-dhparams.pem; # managed by Certbot
+
+
+}
+server {
+    listen 443 ssl;
+    server_name labels.dikarya.us;
+
+    ssl_certificate /etc/letsencrypt/live/labels.dikarya.us/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/labels.dikarya.us/privkey.pem;
+    include /etc/letsencrypt/options-ssl-nginx.conf;
+    ssl_dhparam /etc/letsencrypt/ssl-dhparams.pem;
+
+    return 301 https://dikarya.us/labels$is_args$args;
+}
+server {
+    listen 80;
+    server_name labels.dikarya.us;
+
+    location ^~ /.well-known/acme-challenge/ {
+        root /var/www/letsencrypt;
+        default_type "text/plain";
+        try_files $uri =404;
+    }
+
+    location / {
+        return 301 https://dikarya.us/labels$is_args$args;
+    }
+}
+server {
+    if ($host = www.dikarya.us) {
+        return 301 https://$host$request_uri;
+    } # managed by Certbot
+
+
+    if ($host = dikarya.us) {
+        return 301 https://$host$request_uri;
+    } # managed by Certbot
+
+
+    listen 80;
+    server_name dikarya.us www.dikarya.us;
+    return 404; # managed by Certbot
+
+
+
+
+}
