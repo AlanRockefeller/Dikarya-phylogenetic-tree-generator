@@ -4623,7 +4623,8 @@
 
         _updateStats() {
             // Alan 5/11/26 - Report only visible active selections so Deselect disables edit actions.
-            const selCount = this._getVisibleSelectionIds().length;
+            // Alan 11/8/26 - Same count as getSelectionCount(), so the toolbar matches Prune.
+            const selCount = this.getSelectionCount();
             if (this.callbacks.onSelectionChange) this.callbacks.onSelectionChange(selCount);
         }
 
@@ -5759,7 +5760,11 @@
 
         getSelectionCount() {
             // Alan 5/11/26 - Count only visible active selections that still exist in the rendered tree.
-            return this._getVisibleSelectionIds().length;
+            // Alan 11/8/26 - Count the nodes an action will act on (getSelectedNodes), not distinct
+            // ids: an internal id is its support label, so two selected clades labelled "100"
+            // counted as one while Prune targeted both. The trim keeps the old side effect.
+            this._trimSelectionSetsToCurrentTree();
+            return this.getSelectedNodes().length;
         }
 
         // Alan 5/13/26 - Expose rendered, unpruned tip order so the Alignment Viewer can default to tree order.

@@ -584,6 +584,22 @@ function main() {
             ['ABCD', 'CD', 'EF', 'EFGH', 'GH']);
     });
 
+    test('selection-bulk', 'the count is the nodes acted on, even with repeated support labels', () => {
+        const { viewer, tree } = bulkViewer('(((A,B)100,(C,D)100)left,((E,F)ef,(G,H)gh)right)root;');
+        tree.traverse_and_compute((n) => {
+            const tips = viewer_tips(n);
+            if (tips === 'AB' || tips === 'CD') {
+                viewer.selectedIds.add('100');
+                viewer._syncCladeSelection(n, true);
+            }
+        });
+        assert.strictEqual(viewer.getSelectedNodes().length, 2);
+        assert.strictEqual(viewer.getSelectionCount(), 2);
+        viewer.selectionAction('all-internal');
+        assert.strictEqual(viewer.getSelectionCount(), viewer.getSelectedNodes().length);
+        assert.strictEqual(viewer.getSelectionCount(), 6);
+    });
+
     return keyboardTests();
 }
 
