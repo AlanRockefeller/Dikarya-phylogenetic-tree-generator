@@ -693,6 +693,44 @@ class TestCuratorLocalRecords(unittest.TestCase):
         observation_row = metrics["176918366"]
         self.assertNotIn("mycomap_dataset", observation_row)
 
+    # Alan 11/9/26 - Which name wins when a curator record and the observation
+    # it names disagree (both cases confirmed against the real observations).
+    def test_another_genus_on_the_observation_keeps_the_curators_name(self):
+        header = "Pholiotina 'rugosa PNW01' (error: as Hypholoma dispersum) iNat17859197 WA"
+        observation = ["30", "iNaturalist #17859197 Species Name: Hypholoma dispersum "
+                             "Location: Treefrog Loop Trail Washington US", "95.0",
+                       "90%/90%", "4 (0)", "88001", "17859197 - Hypholoma dispersum"]
+        own = ["12", header, "99.1 (99)", "95%/95%", "1 (0)", "df-47-72-9300",
+               "Danny Miller WC Annotations"]
+        for rows in ([own, observation], [observation]):  # on the page, then off it
+            metric = self._match(header, self._metrics(rows))
+            self.assertNotIn("Hypholoma", metric.get("species_name") or "")
+            self.assertNotIn("mycomap_location", metric)
+            self.assertEqual(
+                improve_mycomap_sequence_name(header, metric, "local",
+                                              mycomap_record_id=metric.get("mycomap_record_id", "")),
+                header)
+
+    def test_the_same_genus_takes_the_observations_current_name(self):
+        header = "Galerina smithii WA iNat162755648 (was PNW15)"
+        metric = self._match(header, self._metrics([
+            ["9", header, "99.5 (99)", "95%/95%", "0 (0)", "df-47-72-9400",
+             "Danny Miller WC Annotations"],
+            ["2", "iNaturalist #162755648 Species Name: Galerina laticeps "
+                  "Location: Middle Island New York US", "99.0", "95%/95%", "1 (0)",
+             "306130", "162755648 - Galerina laticeps"],
+        ]))
+        self.assertEqual(metric["species_name"], "Galerina laticeps")
+        self.assertEqual(
+            improve_mycomap_sequence_name(header, metric, "local"),
+            "iNat162755648 Galerina laticeps Middle Island New York US")
+
+    def test_a_curator_headers_first_word_is_never_kept_as_an_id(self):
+        header = "Pholiotina 'rugosa PNW01' iNat17859197 WA"
+        self.assertEqual(
+            improve_mycomap_sequence_name(header, {"species_name": "Hypholoma dispersum"}, "local"),
+            "iNat17859197 Hypholoma dispersum")
+
     def test_a_shared_description_is_not_used_to_match(self):
         header = "Russula sp. CA unlabelled"
         row = ["3", header, "99.0", "90%/90%", "0 (0)", "df-1", "Some Annotations"]

@@ -162,7 +162,13 @@ def _resolve_remote_record(reference, sequences, label):
     if len(matches) > 1:
         wanted_ric = _ric(label)
         if wanted_ric:
-            ric_matches = [row for row in matches if _ric(row.get("title")) == wanted_ric]
+            # Alan 11/9/26 - Many ONT titles carry no "ric=" ("F07--iNat248968282-1"),
+            # but every record has its RiC as a field; the iNaturalist copy of the
+            # same DNA has 0 there, so the lab record is the one that matches.
+            ric_matches = [
+                row for row in matches
+                if wanted_ric in (_ric(row.get("title")), str(row.get("ric") or "").strip())
+            ]
             if ric_matches:
                 matches = ric_matches
     if len(matches) != 1:

@@ -3884,7 +3884,10 @@ def improve_mycomap_sequence_name(current_name: str, metric: Optional[dict],
         if observation_ids:
             inat_token = f"iNat{observation_ids[0]}"
             species_token = species_name.split()[0] if species_name.split() else ''
-            if label_identifier.casefold() == species_token.casefold():
+            # Alan 11/9/26 - A curator header's first word is never an ID, even
+            # when it differs from the name used: keeping it produced
+            # "Pholiotina iNat17859197 Hypholoma dispersum".
+            if curator or label_identifier.casefold() == species_token.casefold():
                 label_identifier = inat_token
             elif label_identifier.casefold() != inat_token.casefold():
                 label_identifier = f"{label_identifier} {inat_token}"

@@ -131,3 +131,15 @@ def test_ambiguous_identical_records_without_ric_match_are_not_guessed(tmp_path)
         with pytest.raises(MycoMapSequenceLinkError, match="more than one") as caught:
             resolve_job_tip_url(tmp_path, tip)
     assert caught.value.status == 409
+
+
+def test_ric_field_picks_the_lab_record_when_its_title_has_no_ric(tmp_path):
+    # Alan 11/9/26 - Real shape (iNat248968282): an iNaturalist copy and the ONT
+    # record share the DNA, and the ONT title carries no "ric=".
+    tip = "iNat393666515 Lepiota Greenville Ohio US RiC 480"
+    _write_job(tmp_path, tip=tip)
+    with patch("app.services.mycomap_org_service.observation_sequences", return_value=[
+        {"id": "438094", "title": "iNaturalist #393666515", "ric": 0, "sequence": SEQUENCE},
+        {"id": "296872", "title": "F07--iNat393666515-1", "ric": 480, "sequence": SEQUENCE},
+    ]):
+        assert resolve_job_tip_url(tmp_path, tip) == "https://mycomap.org/sequences/296872"

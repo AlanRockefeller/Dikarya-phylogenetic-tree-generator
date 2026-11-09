@@ -612,17 +612,48 @@ def _mycomap_metric_for_sequence(seq, metrics_by_key):
         if related:
             break
 
+    genus_disagrees = (local and related is not None
+                       and _curator_genus_disagrees(seq, own or {}, related))
     if own is None:
+        if genus_disagrees:
+            # Off the page (only the top 100 rows are listed): still never
+            # relabel the record with the other genus.
+            related = {key: value for key, value in related.items()
+                       if key not in ('species_name', 'mycomap_location', 'display_name')}
         return related
     merged = dict(own)
     merged['own_row'] = True
     if ((own.get('species_from_label') or not own.get('species_name'))
             and related is not None and related is not own
-            and related.get('species_name') and not related.get('species_from_label')):
+            and related.get('species_name') and not related.get('species_from_label')
+            and not genus_disagrees):
         for field in ('species_name', 'mycomap_location', 'display_name'):
             if related.get(field):
                 merged[field] = related[field]
     return merged
+
+
+def _curator_genus_disagrees(seq, own, related):
+    """Return true when a curator record and the row it names differ on genus.
+
+    Alan 11/9/26 - Within one genus the observation's current MycoMap name
+    wins: curator annotations are a snapshot, and "Galerina smithii ...
+    iNat162755648" is now correctly Galerina laticeps. A different genus means
+    the sequence does not belong to that name -- "Pholiotina 'rugosa PNW01'
+    (error: as Hypholoma dispersum) iNat17859197" is a Pholiotina sequence
+    filed on a Hypholoma observation -- so the curator's name stands, and
+    nothing else is taken from that row either.
+    """
+    curator_name = str(own.get('species_name') or '') if own.get('species_from_label') else ''
+    curator_genus = (curator_name.split() or [''])[0]
+    if not curator_genus:
+        tokens = str(seq.get('name') or seq.get('_mycomap_original_name') or '').lstrip('>').split()
+        # Only a spelled-out genus; "P." could be any of several.
+        if tokens and re.fullmatch(r'[A-Z][a-z]{2,}', tokens[0]):
+            curator_genus = tokens[0]
+    related_genus = (str(related.get('species_name') or '').split() or [''])[0]
+    return bool(curator_genus and related_genus
+                and curator_genus.casefold() != related_genus.casefold())
 
 
 def _mycomap_sequence_location(seq, metric=None):
