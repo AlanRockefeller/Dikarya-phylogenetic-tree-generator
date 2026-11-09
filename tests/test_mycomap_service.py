@@ -558,7 +558,8 @@ class TestMycomapBlastMetrics(unittest.TestCase):
 
         improved = improve_mycomap_sequence_name(current, metric, "local")
 
-        self.assertEqual(improved, "KM248898 Hygrocybe minutula")
+        # The curator's "cf" is kept: it says the identification is uncertain.
+        self.assertEqual(improved, "KM248898 Hygrocybe cf minutula")
 
         # A herbarium barcode is accession-shaped too (NY + 8 digits). With no
         # voucher to say which is which, both are kept in header order, in
@@ -566,24 +567,24 @@ class TestMycomapBlastMetrics(unittest.TestCase):
         with_barcode = "Hygrocybe cf minutula NY00123456 KM248898"
         self.assertEqual(
             improve_mycomap_sequence_name(with_barcode, metric, "local"),
-            "NY00123456 KM248898 Hygrocybe minutula",
+            "NY00123456 KM248898 Hygrocybe cf minutula",
         )
         barcode_last = "Hygrocybe cf minutula KM248898 NY00123456"
         self.assertEqual(
             improve_mycomap_sequence_name(barcode_last, metric, "local"),
-            "KM248898 NY00123456 Hygrocybe minutula",
+            "KM248898 NY00123456 Hygrocybe cf minutula",
         )
         # A known voucher is never taken for the accession, wherever it sits.
         self.assertEqual(
             improve_mycomap_sequence_name(barcode_last, metric, "local",
                                           voucher="NY00123456"),
-            "KM248898 Hygrocybe minutula",
+            "KM248898 Hygrocybe cf minutula",
         )
         # A versioned and an unversioned spelling are one record.
         self.assertEqual(
             improve_mycomap_sequence_name(
                 "Hygrocybe cf minutula KM248898 KM248898.1", metric, "local"),
-            "KM248898 Hygrocybe minutula",
+            "KM248898 Hygrocybe cf minutula",
         )
 
     def test_improve_local_name_ignores_accessions_in_curator_notes(self):
@@ -606,13 +607,160 @@ class TestMycomapBlastMetrics(unittest.TestCase):
                 "MO67832 Vict Garry Oak (F18833 unseq'd)", metric, "local"),
             "HQ604846 F19990 Russula crenulata",
         )
-        # A holotype named only in a note must not label (and so type-mark) the tip.
+        # A holotype named only in a note must not label (and so type-mark) the
+        # tip; the UNITE accession outside the note is the identifier instead.
         metric = {"display_name": "Entoloma undulatosporum",
                   "species_name": "Entoloma undulatosporum", "mycomap_location": ""}
-        improved = improve_mycomap_sequence_name(
-            "Entoloma undulatosporum (match to dirty holotype PX412020) EU UDB0799647",
-            metric, "local")
-        self.assertNotIn("PX412020", improved)
+        self.assertEqual(
+            improve_mycomap_sequence_name(
+                "Entoloma undulatosporum (match to dirty holotype PX412020) EU UDB0799647",
+                metric, "local"),
+            "UDB0799647 Entoloma undulatosporum",
+        )
+        # Nothing to look up: MycoMap's own record ID, else no identifier at
+        # all -- and never the genus twice.
+        header = "Entoloma undulatosporum (match to dirty holotype PX412020) EU"
+        self.assertEqual(
+            improve_mycomap_sequence_name(header, metric, "local",
+                                          mycomap_record_id="df-47-71-8636"),
+            "MycoMap#df-47-71-8636 Entoloma undulatosporum",
+        )
+        self.assertEqual(improve_mycomap_sequence_name(header, metric, "local"),
+                         "Entoloma undulatosporum")
+        metric = {"display_name": "Pluteus tomentosulus",
+                  "species_name": "Pluteus tomentosulus", "mycomap_location": "Oregon US"}
+        self.assertEqual(
+            improve_mycomap_sequence_name("P. Pluteus tomentosulus Oregon US", metric, "local"),
+            "Pluteus tomentosulus Oregon US",
+        )
+
+
+class TestCuratorLocalRecords(unittest.TestCase):
+    """Curator-labelled local hits match their own results row (real row shapes)."""
+
+    LOCAL_HEADER = ["HitNumber", "Description", "Identity", "Query/Subject Cover",
+                    "Gap Openings", "Accession", "Source"]
+    NCBI_HEADER = ["HitNumber", "Description", "Identity", "Query/Subject Cover",
+                   "Gap Openings", "Accession"]
+
+    def _metrics(self, local_rows, ncbi_rows=()):
+        combined = {}
+        for rows in ([self.NCBI_HEADER, *ncbi_rows], [self.LOCAL_HEADER, *local_rows]):
+            for key, metric in parse_blast_metrics_table(rows).items():
+                combined.setdefault(key, metric)
+        return combined
+
+    def _match(self, header, metrics):
+        from app.api.routes import _mycomap_metric_for_sequence
+        return _mycomap_metric_for_sequence(
+            {"name": header, "_mycomap_original_name": header, "hit_source": "local"},
+            metrics)
+
+    def test_a_note_accession_no_longer_lends_its_row(self):
+        header = "Russula mendocinensis CA (1/0 ITS1 matchto TYPE CA KX812826) DQ367913"
+        metrics = self._metrics(
+            [["7", header, "97.1 (98)", "95%/90%", "3 (0)", "df-47-72-5001",
+              "Danny Miller WC Annotations"]],
+            [["1", "Russula mendocinensis TYPE Species Name: Russula mendocinensis",
+              "88.0", "60%/60%", "9 (1)", "KX812826"]])
+        metric = self._match(header, metrics)
+        self.assertTrue(metric["own_row"])
+        self.assertEqual(metric["identity"], 97.1)
+        self.assertEqual(metric["mycomap_record_id"], "df-47-72-5001")
+        self.assertEqual(metric["mycomap_dataset"], "Danny Miller WC Annotations")
+
+        # Off the page (only the top 100 rows are listed), the note is still
+        # not used to find a row, so the type's numbers are never borrowed.
+        self.assertIsNone(self._match(header, self._metrics([], [
+            ["1", "Russula mendocinensis TYPE Species Name: Russula mendocinensis",
+             "88.0", "60%/60%", "9 (1)", "KX812826"]])))
+
+    def test_name_and_location_come_from_the_named_observation(self):
+        header = "Hygrocybe 'minutula PNW24' WA iNat176918366"
+        metrics = self._metrics([
+            ["52", header, "96.52 (99)", "95%/95%", "2 (0)", "df-47-72-9128",
+             "Danny Miller WC Annotations"],
+            ["40", "iNaturalist #176918366 Species Name: Hygrocybe sp. 'minutula-PNW24' "
+                   "Location: Deming Washington US", "95.0", "90%/90%", "4 (0)",
+             "301122", "176918366 - Hygrocybe sp. 'minutula-PNW24'"],
+        ])
+        metric = self._match(header, metrics)
+        self.assertEqual(metric["identity"], 96.52)          # its own row's numbers
+        self.assertEqual(metric["species_name"], "Hygrocybe sp. 'minutula-PNW24'")
+        self.assertEqual(metric["mycomap_location"], "Deming Washington US")
+        self.assertEqual(metric["mycomap_record_id"], "df-47-72-9128")
+        # An observation's own Source cell is not a dataset name.
+        observation_row = metrics["176918366"]
+        self.assertNotIn("mycomap_dataset", observation_row)
+
+    def test_a_shared_description_is_not_used_to_match(self):
+        header = "Russula sp. CA unlabelled"
+        row = ["3", header, "99.0", "90%/90%", "0 (0)", "df-1", "Some Annotations"]
+        twin = ["4", header, "91.0", "90%/90%", "6 (0)", "df-2", "Some Annotations"]
+        self.assertIsNone(self._match(header, self._metrics([row, twin])))
+
+    def test_species_inference_keeps_a_qualifier(self):
+        from app.services.mycomap_service import _infer_species_name
+        self.assertEqual(_infer_species_name("Hygrocybe cf minutula QC (type NY) KM248898"),
+                         "Hygrocybe cf minutula")
+        self.assertEqual(_infer_species_name("Inocybe aff. lacera voucher X ITS"),
+                         "Inocybe aff. lacera")
+        self.assertEqual(_infer_species_name("Russula crenulata 24a"), "Russula crenulata")
+
+    def test_the_curators_qualifier_survives_mycomaps_name(self):
+        metric = {"species_name": "Hygrocybe minutula",
+                  "mycomap_location": "Petersham Massachusetts US"}
+        self.assertEqual(
+            improve_mycomap_sequence_name(
+                "Hygrocybe cf. minutula MA (1/0 PQ) (Peter 2083) iNat75529848", metric, "local"),
+            "iNat75529848 Hygrocybe cf. minutula Petersham Massachusetts US")
+        # Never added to a different epithet, nor to a machine-written header.
+        self.assertEqual(
+            improve_mycomap_sequence_name("Hygrocybe cf miniata KM248898", metric, "local"),
+            "KM248898 Hygrocybe minutula Petersham Massachusetts US")
+        self.assertEqual(
+            improve_mycomap_sequence_name("iNat75529848 Hygrocybe cf minutula MA", metric, "local"),
+            "iNat75529848 Hygrocybe minutula Petersham Massachusetts US")
+
+    def test_the_curators_type_status_is_kept(self):
+        metric = {"species_name": "Inocephalus furfuraceidiscus"}
+        self.assertEqual(
+            improve_mycomap_sequence_name(
+                "Inocephalus furfuraceidiscus HOLOTYPE ID AHS69078 (=E. undulatosporum)",
+                metric, "local", mycomap_record_id="df-47-71-8637"),
+            "MycoMap#df-47-71-8637 Inocephalus furfuraceidiscus HOLOTYPE")
+        # Inside a note "type" describes another record.
+        metric = {"species_name": "Hygrocybe minutula"}
+        self.assertEqual(
+            improve_mycomap_sequence_name("Hygrocybe cf minutula QC (type NY) KM248898",
+                                          metric, "local"),
+            "KM248898 Hygrocybe cf minutula")
+
+    def test_a_record_with_no_name_or_lookup_id_gets_mycomaps_id(self):
+        header = "Russula 38 SAT 13-286-04 (WA birch R. nitida atypical)"
+        metric = {"identity": 99.0}
+        self.assertEqual(
+            improve_mycomap_sequence_name(header, metric, "local",
+                                          mycomap_record_id="df-47-66-18048"),
+            f"MycoMap#df-47-66-18048 {header}")
+        # Anything a reader can open already identifies it.
+        for named in ("R. nitida UNITE unanimous KU205349",
+                      "Pholiotina gracilenta NZ iNat1351891"):
+            self.assertEqual(
+                improve_mycomap_sequence_name(named, metric, "local",
+                                              mycomap_record_id="df-1"),
+                named)
+
+    def test_saved_job_metadata_keeps_the_provenance(self):
+        from app.api.routes import _normalize_sequence_metadata
+        [row] = _normalize_sequence_metadata([{
+            "name": "UDB0799647 Entoloma undulatosporum", "source": "mycomap",
+            "hit_source": "local", "mycomap_record_id": "df-47-71-8636",
+            "mycomap_dataset": "Danny Miller WC Annotations"}])
+        self.assertEqual(row["mycomap_record_id"], "df-47-71-8636")
+        self.assertEqual(row["mycomap_dataset"], "Danny Miller WC Annotations")
+        [plain] = _normalize_sequence_metadata([{"name": "KM248898 Hygrocybe minutula"}])
+        self.assertNotIn("mycomap_dataset", plain)
 
 
 class TestMycomapBlastCreation(unittest.TestCase):

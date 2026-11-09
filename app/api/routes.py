@@ -321,6 +321,12 @@ def _normalize_sequence_metadata(raw_items):
             mycomap_sequence_id = 0
         if mycomap_sequence_id > 0:
             row["mycomap_sequence_id"] = mycomap_sequence_id
+        # Alan 11/9/26 - Provenance of a curator-labelled MycoMap record; stored
+        # only when present so ordinary rows stay as small as before.
+        for field, limit in (("mycomap_record_id", 100), ("mycomap_dataset", 300)):
+            value = " ".join(str(raw.get(field) or "").split())[:limit]
+            if value:
+                row[field] = value
         row["blast_metrics_available"] = bool(raw.get("blast_metrics_available")) or any(
             row[field] is not None
             for field in ("identity", "query_cover", "subject_cover")
@@ -564,15 +570,59 @@ def _extract_mycomap_query_tokens(url):
 
 
 def _mycomap_metric_for_sequence(seq, metrics_by_key):
-    """Return the MycoMap BLAST table metric associated with one FASTA record."""
-    from app.services.mycomap_service import build_blast_metric_keys
+    """Return the MycoMap BLAST table metric associated with one FASTA record.
 
-    for lookup_name in (seq.get('name', ''), seq.get('_mycomap_original_name', '')):
-        for key in build_blast_metric_keys(lookup_name):
+    Alan 11/9/26 - A local record takes its BLAST numbers from its OWN results
+    row (matched by exact description) when the page lists it. A curator label
+    is otherwise matched only through tokens outside its notes, never through
+    its genus word: "(... matchto TYPE CA KX812826) DQ367913" used to take the
+    type's identity and coverage. When the own row has no name badge, the
+    name and location come from the observation or GenBank row the label
+    names outside its notes, which describes the same specimen.
+    """
+    from app.services.mycomap_service import (
+        _strip_header_notes, build_blast_metric_keys, local_row_description_key,
+    )
+
+    names = (seq.get('name', ''), seq.get('_mycomap_original_name', ''))
+    local = seq.get('hit_source') == 'local'
+    own = None
+    if local:
+        for name in names:
+            key = local_row_description_key(name)
+            if key and key in metrics_by_key:
+                own = metrics_by_key[key]
+                break
+
+    related = None
+    for lookup_name in names:
+        text = str(lookup_name or '')
+        tokens = text.lstrip('>').split()
+        curator = local and bool(tokens) and not re.search(r'\d', tokens[0])
+        skip = set(build_blast_metric_keys(tokens[0])) if curator else set()
+        if curator:
+            text = _strip_header_notes(text)
+        for key in build_blast_metric_keys(text):
+            if key in skip:
+                continue
             metric = metrics_by_key.get(key)
             if metric:
-                return metric
-    return None
+                related = metric
+                break
+        if related:
+            break
+
+    if own is None:
+        return related
+    merged = dict(own)
+    merged['own_row'] = True
+    if ((own.get('species_from_label') or not own.get('species_name'))
+            and related is not None and related is not own
+            and related.get('species_name') and not related.get('species_from_label')):
+        for field in ('species_name', 'mycomap_location', 'display_name'):
+            if related.get(field):
+                merged[field] = related[field]
+    return merged
 
 
 def _mycomap_sequence_location(seq, metric=None):
@@ -2326,6 +2376,13 @@ def gather_mycomap_sequences_for_queue(url, include_ncbi=True, include_local=Tru
             )
             continue
         if metric:
+            # Alan 11/9/26 - MycoMap's record ID and the dataset a curator record
+            # came from are kept only from the record's own results row; another
+            # row's would describe a different record.
+            if metric.get('own_row'):
+                for field in ('mycomap_record_id', 'mycomap_dataset'):
+                    if metric.get(field):
+                        seq[field] = metric[field]
             seq['name'] = improve_mycomap_sequence_name(
                 seq.get('name', ''),
                 metric,
@@ -2333,6 +2390,7 @@ def gather_mycomap_sequences_for_queue(url, include_ncbi=True, include_local=Tru
                 accession=seq.get('accession', ''),
                 voucher=seq.get('voucher', ''),
                 location=seq.get('location', ''),
+                mycomap_record_id=seq.get('mycomap_record_id', ''),
             )
             if metric.get('species_name'):
                 seq['taxon'] = metric['species_name']

@@ -6591,6 +6591,9 @@
                 observation_id: seq.observation_id || '',
                 mushroom_observer_sequence_id: seq.mushroom_observer_sequence_id || null,
                 mycomap_sequence_id: seq.mycomap_sequence_id || null,
+                // Alan 11/9/26 - Carry a curator record's MycoMap ID and dataset so the viewer can show where it came from.
+                mycomap_record_id: seq.mycomap_record_id || '',
+                mycomap_dataset: seq.mycomap_dataset || '',
                 locus: seq.locus || '',
                 query_cover: seq.query_cover ?? null,
                 subject_cover: seq.subject_cover ?? null,

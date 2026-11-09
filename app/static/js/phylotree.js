@@ -11011,10 +11011,12 @@
     const normalized = typeof value === "string" ? value : getRecordLabelText(value);
     if (!normalized) return null;
 
+    // Alan 11/9/26 - "UDB0799647" is a UNITE accession, not a GenBank one, though
+    // it has the 3-letter shape; it gets its own UNITE link instead.
     const genbankPatterns = [
       /\b([A-Z]{1,2}_[0-9]{5,8}(?:\.[0-9]+)?)(?:_[0-9]+)?\b/,
       /\b([A-Z]{1,2}[0-9]{5,8}(?:\.[0-9]+)?)(?:_[0-9]+)?\b/,
-      /\b([A-Z]{3,4}[0-9]{6,9}(?:\.[0-9]+)?)(?:_[0-9]+)?\b/
+      /\b(?!UDB[0-9])([A-Z]{3,4}[0-9]{6,9}(?:\.[0-9]+)?)(?:_[0-9]+)?\b/
     ];
     for (const pattern of genbankPatterns) {
       const match = normalized.match(pattern);
@@ -11037,7 +11039,8 @@
   // its label. Offer its exact sequence page only when the saved provenance says
   // this tip came from MycoMap's local database; the server resolves old jobs by
   // matching their DNA and redirects new jobs by their saved sequence ID.
-  function extractMycomapSequenceTarget(node, sequenceMetadata, jobId) {
+  // Alan 11/9/26 - Shared by the MycoMap link and the tip menu's provenance line.
+  function findMycomapLocalRecord(node, sequenceMetadata) {
     const normalized = getRecordLabelText(node);
     if (!normalized) return null;
     const normalize = value => String(value || "")
@@ -11047,15 +11050,39 @@
     const records = Array.isArray(sequenceMetadata)
       ? sequenceMetadata
       : (Array.isArray(window.SEQUENCE_METRICS) ? window.SEQUENCE_METRICS : []);
-    const record = records.find(item => {
+    return records.find(item => {
       const hitSource = String(item?.hit_source || "").toLowerCase();
       return item &&
         String(item.source || "").toLowerCase() === "mycomap" &&
         ["local", "sequence_record"].includes(hitSource) &&
         [item.fasta_header, item.name].some(name => normalize(name) === normalized);
-    });
+    }) || null;
+  }
+
+  // Alan 11/9/26 - A curator-labelled MycoMap record says which dataset it came
+  // from ("Danny Miller WC Annotations", "UNITE Endemic V8.0"); too long for a
+  // tip label, so the tip menu shows it.
+  function mycomapRecordSourceText(node, sequenceMetadata) {
+    const record = findMycomapLocalRecord(node, sequenceMetadata);
+    const dataset = String(record?.mycomap_dataset || "").trim();
+    return dataset ? `MycoMap dataset: ${dataset}` : "";
+  }
+
+  function extractMycomapSequenceTarget(node, sequenceMetadata, jobId) {
+    const record = findMycomapLocalRecord(node, sequenceMetadata);
     const resolvedJobId = jobId === undefined ? window.JOB_ID : jobId;
     if (!record || !resolvedJobId) return null;
+    // Alan 11/9/26 - A curator record (MycoMap ID such as "df-47-72-9127") has no
+    // public sequence page, so the resolver can only find it through an
+    // observation in its label; without one the link would always fail.
+    const recordId = String(record.mycomap_record_id || "").trim();
+    if (recordId && !/^\d+$/.test(recordId) && !record.mycomap_sequence_id) {
+      const label = getRecordLabelText(node);
+      if (!extractINaturalistObservationNumber(label) &&
+          !/\bMO\s*#?\s*[0-9]{5,6}\b|mushroomobserver\.org\//i.test(label)) {
+        return null;
+      }
+    }
     // Alan 11/8/26 - Send the saved tip name, not the normalized one. Normalization
     // is for matching provenance; the resolver identifies the actual saved tip, so
     // preserve its direction marker and internal spaces.
@@ -11126,6 +11153,19 @@
           }
         };
       }
+    }
+
+    // Alan 11/9/26 - A UNITE accession ("UDB0799647") opens its UNITE record page.
+    const uniteMatch = normalized.match(/\b(UDB[0-9]{6,8})\b/);
+    if (uniteMatch) {
+      return {
+        kind: "unite",
+        id: uniteMatch[1],
+        label: "Open sequence in UNITE",
+        urls: {
+          primary: `https://unite.ut.ee/bl_forw.php?nimi=${uniteMatch[1]}`
+        }
+      };
     }
 
     // Alan 5/12/26 - Fall back to a GenBank accession only after checking for local record IDs.
@@ -11294,6 +11334,17 @@
         : [];
       // Alan 7/16/26 - Render every source represented in a tip label instead of stopping at the first match.
       const recordTargets = isLeafNode(node) ? getContextRecordTargets(node, selectedRecordNodes) : [];
+      // Alan 11/9/26 - Say which MycoMap dataset a curator record came from, above its links.
+      const sourceText = isLeafNode(node) ? mycomapRecordSourceText(node) : "";
+      if (sourceText) {
+        menu_object
+          .append("h6")
+          .attr("class", "phylotree-menu-header dropdown-header")
+          .text(sourceText);
+        if (!recordTargets.length) {
+          menu_object.append("div").attr("class", "phylotree-menu-divider dropdown-divider");
+        }
+      }
       // Alan 7/16/26 - Put all external source-record links at the top of sequence context menus.
       if (recordTargets.length) {
         recordTargets.forEach(recordTarget => appendRecordTargetMenu(menu_object, recordTarget));
@@ -15167,6 +15218,9 @@
   exports.extractObservationRecordReference = extractObservationRecordReference;
   // Alan 10/16/26 - Exported for the invariant harness that pins local-source gating.
   exports.extractMycomapSequenceTarget = extractMycomapSequenceTarget;
+  // Alan 11/9/26 - Exposed for the record-link tests (UNITE links, dataset line).
+  exports.mycomapRecordSourceText = mycomapRecordSourceText;
+  exports.extractRecordTargets = extractRecordTargets;
   exports.fitRootToTip = fitRootToTip;
   exports.getDistanceMatrix = getDistanceMatrix;
   exports.getNewick = getNewick;
